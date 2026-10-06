@@ -1,0 +1,12 @@
+HTTP 500 Internal Server Error
+Date: Sat, 03 Oct 2026 19:53:18 GMT
+Content-Type: application/json
+Alt-Svc: h3=":443"; ma=3600
+ga-traceid: c20ba21f0ebaa772952f647a3e4b829a
+Vary: Origin
+X-LOG-ID: 20261004035317a198ab79a3394380
+x-process-time: 1.497610
+X-APISIX-Upstream-Status: 500
+X-Request-ID: e29ce553-618e-43b6-a59a-7e922b332903
+Content-Length: 128
+Server: Python/3.12 aiohttp/3.13.5

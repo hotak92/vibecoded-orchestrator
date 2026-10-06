@@ -189,7 +189,7 @@ VCO_MISSING_LIB_NOTICE=""
 # reader appends its own. MUST MATCH `_lib/emit-context.ps1`'s
 # Get-VcoRequiredHookLibs / Get-VcoHookLibRole.
 vco_required_hook_libs() {
-    printf '%s\n' route-touched-path bash-write-targets code-extensions
+    printf '%s\n' route-touched-path bash-write-targets code-extensions inject-budget
 }
 
 # vco_hook_lib_role <lib-name-with-or-without-extension> — one clause naming
@@ -206,6 +206,8 @@ vco_hook_lib_role() {
             printf '%s' "recovering the paths a shell command wrote, so no CLI write is even looked at — a redirect, a heredoc, sed -i or patch into knowledge/ or docs/ now reaches Weaviate never" ;;
         code-extensions)
             printf '%s' "deciding which touched paths are code, so nothing is being queued for the end-of-turn code-graph drain and the code graph has stopped tracking this project" ;;
+        inject-budget)
+            printf '%s' "the injection wrappers' kill-switch fast path and per-turn budget probe, so VCO_INJECT_PROFILE=off no longer short-circuits before the spawn and every injection surface pays a full router run even while the user switched injection off" ;;
         *)
             printf '%s' "part of this project's shipped hook library, and the hook that needs it has stopped doing its job" ;;
     esac

@@ -30,12 +30,11 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from vco_lib import mcp_scan_rules
 from vco_lib.deferral_report import DeferralEntry, DeferralReport
@@ -250,27 +249,6 @@ def _build_python_mcp_entries(
     grpc_port = int(urls["weaviate_grpc_port"])
     mcp_root = install_root / "claude_mcp_servers"
     pythonpath = str(mcp_root)
-    # v0.2.91 WP-E item 1 — cwd-INDEPENDENT PYTHONPATH for the `-m`-invoked
-    # wrapper entries (mermaid / excalidraw).
-    #
-    # `pythonpath` above points INSIDE the `claude_mcp_servers` package, which
-    # is enough for the absolute-script entries (weaviate-kg / search import
-    # their siblings as top-level modules) but NOT for
-    # `python -m claude_mcp_servers.wrappers.<proxy>`: resolving that dotted
-    # name needs the package's PARENT (the install root) on sys.path. Until
-    # v0.2.91 the only thing supplying it was `python -m`'s implicit
-    # cwd-prepend, so the wrapper MCPs resolved ONLY when Claude Code happened
-    # to be launched from the orchestrator root. Every other project got
-    # `ModuleNotFoundError: No module named 'claude_mcp_servers'` (rc=1,
-    # instantly) — the long-reported mermaid/excalidraw "Failed to connect".
-    # `~/.claude.json` is global, so ONE bad value broke every non-root
-    # project.
-    #
-    # Both roots stay on the path (root FIRST) so the wrappers' `vco_lib`
-    # imports and any top-level `claude_mcp_servers`-relative import keep
-    # resolving. MUST stay in sync with the Rust builder
-    # mcp_registration.rs::build_default_mcp_entries (`wrapper_pythonpath`).
-    wrapper_pythonpath = os.pathsep.join((str(install_root), pythonpath))
     venv_python_str = str(venv_python)
 
     # weaviate-kg
@@ -298,22 +276,6 @@ def _build_python_mcp_entries(
         "env": weaviate_env,
     }
 
-    # search (v0.2.11+: needs no secrets; uses wrapper.sh on Unix)
-    search_server = mcp_root / "search_mcp" / "server.py"
-    search_wrapper = mcp_root / "search_mcp" / "wrapper.sh"
-    if platform.system().lower().startswith("win"):
-        search_cmd, search_args = venv_python_str, [str(search_server)]
-    else:
-        search_cmd, search_args = str(search_wrapper), []
-    search_env_raw = {"PYTHONPATH": pythonpath}
-    search_env, search_dropped = _filter_env_for_global_json(search_env_raw)
-    search_entry = {
-        "type": "stdio",
-        "command": search_cmd,
-        "args": search_args,
-        "env": search_env,
-    }
-
     # playwright (F-1, v0.2.73)
     # Browser automation via Microsoft's `@playwright/mcp`. The entry
     # mirrors EXACTLY how the MCP is launched everywhere else in the
@@ -337,55 +299,15 @@ def _build_python_mcp_entries(
     }
     playwright_dropped: list[str] = []
 
-    # mermaid (Phase 1.2 — diagrams plan)
-    # Wrapper MCP that proxies the pinned `claude-mermaid` npm package.
-    # Spawned as `<venv-python> -m claude_mcp_servers.wrappers.mermaid_proxy`
-    # — the wrapper itself spawns `npx` as a child once it's resolved the
-    # per-project tool allowlist. Mirrors the Rust path's mermaid entry
-    # in mcp_registration.rs::build_default_mcp_entries.
-    # v0.2.91 WP-E item 1: `wrapper_pythonpath` (root + package dir), NOT the
-    # package-internal `pythonpath` — see its definition above.
-    mermaid_env_raw = {"PYTHONPATH": wrapper_pythonpath}
-    mermaid_env, mermaid_dropped = _filter_env_for_global_json(mermaid_env_raw)
-    mermaid_entry = {
-        "type": "stdio",
-        "command": venv_python_str,
-        "args": [
-            "-m",
-            "claude_mcp_servers.wrappers.mermaid_proxy",
-        ],
-        "env": mermaid_env,
-    }
-
-    # excalidraw (Phase 2 — diagrams plan)
-    # Wrapper MCP that proxies the in-tree-vendored
-    # `excalidraw-mcp-server` (see
-    # vco_lib/excalidraw_mcp_fork/VENDORED.md — moved here from
-    # claude_mcp_servers/excalidraw_mcp_fork/ in v0.2.34). Spawned as
-    # `<venv-python> -m claude_mcp_servers.wrappers.excalidraw_proxy`
-    # — the wrapper itself spawns Node on the vendored entry point
-    # once it's resolved the per-project tool allowlist. Mirrors the
-    # Rust path's excalidraw entry in
-    # mcp_registration.rs::build_default_mcp_entries.
-    # v0.2.91 WP-E item 1: same cwd-independent PYTHONPATH as mermaid.
-    excalidraw_env_raw = {"PYTHONPATH": wrapper_pythonpath}
-    excalidraw_env, excalidraw_dropped = _filter_env_for_global_json(excalidraw_env_raw)
-    excalidraw_entry = {
-        "type": "stdio",
-        "command": venv_python_str,
-        "args": [
-            "-m",
-            "claude_mcp_servers.wrappers.excalidraw_proxy",
-        ],
-        "env": excalidraw_env,
-    }
+    # NOTE (v0.2.101): the `search` MCP was deleted outright, and the diagram
+    # wrapper MCPs (`mermaid` / `excalidraw`) were retired from default
+    # shipping — they no longer appear here. An install that already has those
+    # entries keeps them (they stay in [bundled].all_names / uninstall_scrub);
+    # only the default REGISTRATION stopped.
 
     entries = [
         ("weaviate-kg", weaviate_entry, weaviate_dropped),
-        ("search", search_entry, search_dropped),
         ("playwright", playwright_entry, playwright_dropped),
-        ("mermaid", mermaid_entry, mermaid_dropped),
-        ("excalidraw", excalidraw_entry, excalidraw_dropped),
     ]
     # WP-B4 drift guard: the builder's emit ORDER must equal the table's
     # [entries].default_names. The entry SHAPES (command/args/env, OS
@@ -420,6 +342,38 @@ def _python_fallback_write_mcp_entries(
 
     Returns (success_count, error_messages). Soft-fail per entry.
     """
+
+    def mutate(data: dict) -> int:
+        if "mcpServers" not in data or not isinstance(data.get("mcpServers"), dict):
+            data["mcpServers"] = {}
+        for name, entry, _dropped in entries:
+            data["mcpServers"][name] = entry
+        return len(entries)
+
+    success, errors = _locked_json_edit(claude_json_path, mutate)
+    if errors:
+        return (0, errors)
+    return (success, [])
+
+
+def _locked_json_edit(
+    claude_json_path: Path,
+    mutate: "Callable[[dict], Any]",
+) -> tuple[Any, list[str]]:
+    """Lock + read + ``mutate(data)`` + backup + atomic write — the ONE home
+    for the safe-edit discipline shared by the entry writer
+    (:func:`_python_fallback_write_mcp_entries`) and the entry remover
+    (:func:`remove_mcp_entries`).
+
+    Mirrors the Rust ``mcp_registration`` writer: advisory ``<path>.lock``
+    (create_new), read-or-empty, mutate, copy the pre-edit bytes to
+    ``<path>.bak``, then write atomically via
+    ``vco_lib.env_template._atomic_write_text`` (mkstemp + ``os.replace``,
+    tempfile unlinked on any exception).
+
+    Returns ``(mutate_result, errors)``. ``errors`` non-empty means NOTHING
+    was written (the caller must not treat the mutation as applied).
+    """
     # Ensure parent dir exists before lock + write. The fake_home pattern
     # in tests creates a path like tmp/fake_home/.claude.json where
     # `fake_home` doesn't exist yet; without this mkdir, os.open() on the
@@ -427,8 +381,7 @@ def _python_fallback_write_mcp_entries(
     try:
         claude_json_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        return (0, [f"create parent {claude_json_path.parent}: {exc}"])
-    # Acquire lock.
+        return (None, [f"create parent {claude_json_path.parent}: {exc}"])
     lock_path = claude_json_path.with_suffix(claude_json_path.suffix + ".lock")
     locked = False
     deadline = time.time() + 5.0
@@ -444,12 +397,8 @@ def _python_fallback_write_mcp_entries(
         except OSError:
             break
     if not locked:
-        return (0, [f"could not acquire lock {lock_path}"])
-
-    errors: list[str] = []
-    success = 0
+        return (None, [f"could not acquire lock {lock_path}"])
     try:
-        # Read existing (or empty).
         try:
             if claude_json_path.is_file():
                 raw = claude_json_path.read_text(encoding="utf-8")
@@ -457,15 +406,10 @@ def _python_fallback_write_mcp_entries(
             else:
                 data = {}
         except (OSError, json.JSONDecodeError) as exc:
-            return (0, [f"read {claude_json_path}: {exc}"])
+            return (None, [f"read {claude_json_path}: {exc}"])
         if not isinstance(data, dict):
-            return (0, [f"{claude_json_path} root is not a JSON object"])
-        if "mcpServers" not in data or not isinstance(data.get("mcpServers"), dict):
-            data["mcpServers"] = {}
-        # Merge entries.
-        for name, entry, _dropped in entries:
-            data["mcpServers"][name] = entry
-            success += 1
+            return (None, [f"{claude_json_path} root is not a JSON object"])
+        result = mutate(data)
         # Backup + atomic write.
         # v0.2.53 DEDUP-5 / CORRECT-1: route through
         # vco_lib.env_template._atomic_write_text which uses
@@ -473,7 +417,8 @@ def _python_fallback_write_mcp_entries(
         # exception. The inline pre-v0.2.53 recipe (tmp.write_text +
         # os.replace) left behind <path>.tmp on partial-write failures
         # (disk-full, write-mid-flush, sigterm). The new helper makes
-        # cleanup atomic.
+        # cleanup atomic. ONE home for this discipline: the entry writer and
+        # the scrubber both go through `_locked_json_edit`.
         try:
             if claude_json_path.is_file():
                 bak = claude_json_path.with_suffix(claude_json_path.suffix + ".bak")
@@ -481,13 +426,42 @@ def _python_fallback_write_mcp_entries(
             from vco_lib.env_template import _atomic_write_text
             _atomic_write_text(claude_json_path, json.dumps(data, indent=2))
         except OSError as exc:
-            return (0, [f"write {claude_json_path}: {exc}"])
-        return (success, errors)
+            return (None, [f"write {claude_json_path}: {exc}"])
+        return (result, [])
     finally:
         try:
             lock_path.unlink()
         except OSError:
             pass
+
+
+def remove_mcp_entries(
+    claude_json_path: Path,
+    names: "Iterable[str]",
+) -> tuple[list[str], list[str]]:
+    """Remove ``mcpServers`` entries by name from ``~/.claude.json``.
+
+    The removal half of the safe-edit discipline (``_locked_json_edit``): only
+    the named keys are deleted; every other key — other MCPs, `projects`,
+    unrelated top-level keys — is left untouched. A name that is not present is
+    a no-op for that name.
+
+    Returns ``(removed_names, errors)``.
+    """
+
+    def mutate(data: dict) -> list[str]:
+        servers = data.get("mcpServers")
+        if not isinstance(servers, dict):
+            return []
+        removed = [n for n in names if n in servers]
+        for n in removed:
+            del servers[n]
+        return removed
+
+    result, errors = _locked_json_edit(claude_json_path, mutate)
+    if errors:
+        return ([], errors)
+    return (list(result or []), [])
 
 
 def _scan_stale_mcp_entries(
@@ -1027,6 +1001,10 @@ def _detect_deprecated_mcp_entries(
 
     install_root_str = str(install_root.resolve())
     for name, matched_path, _entry, dep_info in deprecated:
+        # auto_scrub entries are REMOVED by the ordinary update
+        # (`auto_scrub_mcp_entries`), not surfaced for consent — no deferral.
+        if dep_info.get("auto_scrub", False):
+            continue
         removed_in = dep_info.get("removed_in", "unknown release")
         reason = dep_info.get("reason", "")
         opt_in = dep_info.get("opt_in_manifest", "")
@@ -1074,3 +1052,42 @@ def _detect_deprecated_mcp_entries(
                 ],
             )
         )
+
+
+def auto_scrub_mcp_entries(
+    install_root: Path,
+    claude_json: Path,
+) -> list[str]:
+    """Remove ``[deprecated.*]`` entries flagged ``auto_scrub = true`` from
+    ``~/.claude.json``.
+
+    Owner ruling (PLAN-V0300 item 15): the ordinary install/update REMOVES an
+    ``auto_scrub`` MCP's now-orphaned registration — no consent prompt, no
+    deferral — because the module it pointed at no longer exists (a leftover
+    entry guarantees a failing MCP subprocess every session). Only VCO-shaped
+    entries are removed: the same install_root-anchored gate as
+    :func:`_scan_deprecated_mcp_entries`, so a user's OWN MCP that happens to
+    share the name is left alone.
+
+    Idempotent: no shaped entry → no write at all. Removal goes through
+    :func:`remove_mcp_entries` (the same lock + backup + atomic-write
+    discipline as the entry writer).
+
+    Returns the removed names, in scan order (empty when nothing was removed).
+    """
+    auto = [
+        name
+        for name, info in _DEPRECATED_DEFAULT_MCPS.items()
+        if info.get("auto_scrub", False)
+    ]
+    if not auto:
+        return []
+    shaped = [
+        name
+        for name, *_rest in _scan_deprecated_mcp_entries(install_root, claude_json)
+        if name in auto
+    ]
+    if not shaped:
+        return []
+    removed, _errors = remove_mcp_entries(claude_json, shaped)
+    return removed

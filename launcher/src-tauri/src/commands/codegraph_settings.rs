@@ -103,8 +103,8 @@ pub async fn set_codegraph_floors(
     // result struct) so a projection hiccup can't roll back or hard-fail the
     // DB write. Log any accumulated problems for diagnosis.
     //
-    // F3 (v0.2.72): the refresh runs N serial Python subprocesses (30 s cap
-    // each) — route it through spawn_blocking so it doesn't park a tokio
+    // F3 (v0.2.72): the refresh runs N serial Python subprocesses (300 s cap
+    // each since v0.2.101) — route it through spawn_blocking so it doesn't park a tokio
     // worker for the duration. Join errors are soft-fail too (write landed).
     if let Err(e) = crate::commands::blocking::run_with_db_on_blocking_pool(
         app,
@@ -188,6 +188,7 @@ pub async fn get_project_codegraph_index_dot_claude(
 pub async fn set_project_codegraph_index_dot_claude(
     project_id: String,
     enabled: bool,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
     if project_id.is_empty() {
@@ -203,12 +204,30 @@ pub async fn set_project_codegraph_index_dot_claude(
     )?;
     // Per-project change → re-project just this project. Soft-fail: the DB
     // write already landed; a projection hiccup is a warning.
-    if let Err(e) =
-        crate::commands::projects_v2::refresh_project_env_with_db(&db, &project_id)
+    //
+    // F3: the re-projection is a Python subprocess (300 s cap), so it runs
+    // on the blocking pool, not a tokio worker. Join errors are soft-fail
+    // too (write landed).
+    if let Err(e) = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_project_codegraph_index_dot_claude env re-projection",
+        move |db| {
+            if let Err(e) =
+                crate::commands::projects_v2::refresh_project_env_with_db(db, &project_id)
+            {
+                tracing::warn!(
+                    "[vct] set_project_codegraph_index_dot_claude: env re-projection \
+                     warning for {project_id}: {e}"
+                );
+            }
+        },
+    )
+    .await
     {
         tracing::warn!(
-            "[vct] set_project_codegraph_index_dot_claude: env re-projection \
-             warning for {project_id}: {e}"
+            "[vct] warning: set_project_codegraph_index_dot_claude: {} \
+             (DB write already committed)",
+            e
         );
     }
     Ok(())

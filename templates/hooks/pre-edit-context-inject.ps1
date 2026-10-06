@@ -1,89 +1,47 @@
-﻿# OS-EXEMPT-PARITY: Windows-only fix 2026-05-08 — added hookSpecificOutput/additionalContext JSON envelope. The .sh sibling already emitted that envelope from earlier work; no .sh change needed in this commit.
-# parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full body parity
-# audit confirmed — every .sh-side dedup-correctness fix from PR #186 is
-# present in this .ps1 sibling:
-#   - "KG: <title> | ..." / "CODE: <full_name> | ..." header regex
-#     (`^(KG|CODE):\s+(.+)$`) in Filter-Seen (line ~236).
-#   - Blank/separator pass-through gate (`if ($line -match '\S')` at ~260)
-#     prevents empty system-reminder blocks when dedup suppresses all blocks.
-#   - Raw cache (pre-dedup): $KgRaw/$CodeRaw captured BEFORE Filter-Seen
-#     (lines ~288-289), written to $CacheFile so replays apply current
-#     seen-list dedup state rather than perma-suppressing nodes.
-#   - Cache replay re-runs Filter-Seen against current seen-list (line ~275),
-#     exits silently if everything is already seen.
-# Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
+# Pre-edit context injection hook -- THIN WRAPPER (v0.2.101 injection
+# redesign, PLAN-V02101 section C3). OS-PARITY: ports the .sh sibling.
+# Fires BEFORE the Edit tool executes.
+#
+#   stdin -> hook_context_router.py edit -> emit envelope
+#
+# The ROUTER owns the query and its discipline: the OLD semantic query
+# "<module-basename> <first 200 chars of new_string>" is REPLACED by
+# edit_enclosing_symbols(file_path, old_string) -> an EXACT code-graph
+# def+callers leg (structure, self-file callers excluded) + a KG leg keyed
+# on module+symbol+path topic, with the section 2.1 edit-profile floors
+# applied inside rl_kg_search --injection-profile, plus seen-store dedupe,
+# the per-turn budget and the RL retrieval event (task_type
+# pre_edit_kg_search via the router's --task-type; the wrapper's
+# VCO_RL_TASK_TYPE export is retired with the direct producer call).
+#
+# What this wrapper still owns: the PER-FILE REPLAY CACHE (router stdout
+# cached per edited file, TTL = VCO_QUERY_CACHE_TTL window, replayed through
+# CURRENT seen-state with NO router spawn), the state GC sweeps and the
+# Emit-AdditionalContext envelope.
+#
+# Never exit non-zero; missing venv/router -> silent no-op; kill switches
+# VCT_DISABLE_HOOKS and VCO_INJECT_PROFILE=off checked BEFORE any spawn.
+# MUST MATCH pre-edit-context-inject.sh.
+
 # Scrub sensitive env vars (this hook doesn't need credentials)
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
-# VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7).
-#   Delegates KG search to claude_mcp_servers/scripts/rl_kg_search.py and
-#   code-graph search to .claude/scripts/code-graph-query — both call the
-#   access-aware helpers (_kg_collections_to_search /
-#   code_graph_collections_to_query) in claude_mcp_servers/weaviate_mcp/
-#   server.py, which read VCT_KG_ACCESS_LIST + VCT_CODE_GRAPH_ACCESS_LIST.
-#   This hook does NOT query Weaviate directly. Env propagation is by
-#   subprocess inheritance (Start-Process / & inherit env by default).
-#   See tests/test_kg_access_list.py for the consumer contract.
-
-# pre-edit-context-inject.ps1
-# Pre-edit context injection — KG + code graph context for the file being edited.
-# Always exit 0 (never block the edit).
+# VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7). v0.2.101: the
+#   delegate is claude_mcp_servers/scripts/hook_context_router.py, which loads
+#   rl_kg_search.py / query_code_graph IN-PROCESS -- both access-aware via the
+#   weaviate_mcp server helpers (VCT_KG_ACCESS_LIST / VCT_CODE_GRAPH_ACCESS_LIST).
+#   This hook does NOT query Weaviate directly; env propagates by subprocess
+#   inheritance. See tests/test_kg_access_list.py for the consumer contract.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
-# v0.2.54 Track G (G-6): child spawns used a hardcoded `pwsh` (absent on
-# PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
-. "$PSScriptRoot/_lib/resolve-powershell.ps1"
-# Source emit-context.ps1 ONLY if the file exists. If the helper is
-# missing (partial install or just-after-clone before _lib/ is fully
-# populated), the hook still runs its dedup/state work. The
-# Emit-ContextJson wrapper tolerates a missing Emit-AdditionalContext
-# function via Get-Command. We deliberately do NOT swallow source
-# errors — a syntax error in an existing helper is a real bug.
 if (Test-Path "$PSScriptRoot/_lib/emit-context.ps1") {
     . "$PSScriptRoot/_lib/emit-context.ps1"
 }
 
-# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
-# Positional args ($args) and $env:CLAUDE_TOOL_NAME etc. are EMPTY —
-# verified empirically 2026-05-08 via stdin-capture diagnostic.
-$HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
-$ToolName = ""
-$ToolArgs = ""
-$SessionId = ""
-# WP-E (v0.2.92): also extract transcript_path + prompt_id. transcript_path is
-# a PATH ONLY -- threaded to the producer's -Transcript/--transcript flag below;
-# the file's CONTENTS are read in-process by the shared
-# vco_lib/transcript_context.py reader there, never in this script (R31
-# privacy discipline: thinking/output text must never reach argv, `ps`, or a
-# hook log). prompt_id scopes the query-cache key (query-cache.ps1) so two
-# turns issuing the same short trigger don't collide on one cache entry when
-# their enriched text differs. MUST MATCH pre-edit-context-inject.sh's parse
-# and pre-bash-context-inject.ps1's parse.
-$TranscriptPath = ""
-$PromptId = ""
-try {
-    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
-    if ($payload) {
-        if ($payload.tool_name)       { $ToolName = [string]$payload.tool_name }
-        if ($payload.tool_input)      { $ToolArgs = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
-        if ($payload.session_id)      { $SessionId = [string]$payload.session_id }
-        if ($payload.transcript_path) { $TranscriptPath = [string]$payload.transcript_path }
-        if ($payload.prompt_id)       { $PromptId = [string]$payload.prompt_id }
-    }
-} catch {
-    # Empty/malformed stdin — keep variables at defaults
-}
-
-if ($ToolName -ne "Edit") { exit 0 }
-
 $ScriptDir = $PSScriptRoot
-# v0.2.29: prefer canonical $CLAUDE_PROJECT_DIR (the active workspace
-# the launcher hands us). Fall back to SCRIPT_DIR/../.. for ad-hoc
-# invocations.
 $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
     $env:CLAUDE_PROJECT_DIR
 } else {
@@ -93,478 +51,186 @@ $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
 $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
+if (-not $PY) { exit 0 }
 
-# v0.2.70 Streams C+E: shared helpers (canonical session-id, unified seen-store,
-# code-graph retrieval). Sourced only if present (partial-install tolerance).
 $SessionIdLib = Join-Path $LibDir "session-id.ps1"
 if (Test-Path $SessionIdLib) { . $SessionIdLib }
+# The replay path filters through the SHARED seen-store (one home); the
+# router reads/writes the SAME files with the SAME key format.
 $SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
 if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
-$CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
-if (Test-Path $CodegraphLib) { . $CodegraphLib }
-# v0.2.95 (lane F10): the code-file extension test now has ONE home, shared
-# with pre-bash-context-inject.ps1 and _lib/route-touched-path.ps1.
-$CodeExtLib = Join-Path $LibDir "code-extensions.ps1"
-if (Test-Path $CodeExtLib) { . $CodeExtLib }
-# v0.2.77 Part 9 task 2: shared TTL result-cache used by the codegraph helper.
-$QueryCacheLib = Join-Path $LibDir "query-cache.ps1"
-if (Test-Path $QueryCacheLib) { . $QueryCacheLib }
-$script:ProjectRoot = $ProjectRoot
+# v0.2.101: the injection kill switch (VCO_INJECT_PROFILE=off).
+$InjectBudgetLib = Join-Path $LibDir "inject-budget.ps1"
+if (Test-Path $InjectBudgetLib) { . $InjectBudgetLib }
+if ((Get-Command Test-VcoInjectProfileOff -ErrorAction SilentlyContinue) -and (Test-VcoInjectProfileOff)) {
+    exit 0
+}
 
-# session_id from stdin JSON is the canonical per-conversation key.
-# v0.2.70 Stream E: route through the shared Get-VcoHookSessionId so the
-# parse+sanitise matches the other hooks. $SessionIdRaw preserves the
-# trustworthy-vs-untrustworthy distinction for the seen-store ("" / "default" ->
-# inject blind). The "default" coercion below keeps the cache/export paths
-# working (not cross-session-bleed sensitive).
+# Hook input arrives as JSON on stdin. The FULL payload is forwarded to the
+# router untouched; this parse extracts only the WRAPPER's fields (tool
+# guard, session id, edited file path). MUST MATCH the .sh sibling's parse.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$ToolName = ""
+$SessionId = ""
+$FilePath = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload) {
+        if ($payload.tool_name)  { $ToolName = [string]$payload.tool_name }
+        if ($payload.session_id) { $SessionId = [string]$payload.session_id }
+        if ($payload.tool_input -and $payload.tool_input.file_path) {
+            $FilePath = [string]$payload.tool_input.file_path
+        }
+    }
+} catch { }
+
+if ($ToolName -ne "Edit") { exit 0 }
+if (-not $FilePath) { exit 0 }
+
 if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
     $SessionId = Get-VcoHookSessionId -Stdin $HookStdin
 }
 $SessionIdRaw = $SessionId
 if (-not $SessionId) { $SessionId = "default" }
-
-# V52-J Edit 4 (2026-06-09): export VCT_SESSION_ID so child processes
-# (notably the rl_kg_search.py subprocess spawned below) inherit it.
-# Claude Code does NOT propagate CLAUDE_SESSION_ID to hook/MCP
-# subprocesses, but session_id IS available in the hook's stdin JSON.
-# The canonical telemetry emit path
-# (claude_mcp_servers/rl_client/telemetry_emit.py::resolve_session_id)
-# reads VCT_SESSION_ID as layer-2 of its 3-layer chain. Skip the
-# "default" sentinel — empty is preferable to a fake-key cohort.
-# Sibling: see templates/hooks/pre-edit-context-inject.sh for the bash
-# version of this block.
 if ($SessionId -and $SessionId -ne "default") {
     $env:VCT_SESSION_ID = $SessionId
 }
 
-$CacheBase = Join-Path $ProjectRoot ".claude/state/edit_cache_$SessionId"
-New-Item -ItemType Directory -Force -Path $CacheBase -ErrorAction SilentlyContinue | Out-Null
+# === Per-file replay cache (v0.2.101: stores the ROUTER's raw output) ===
+$StateDir = Join-Path $ProjectRoot ".claude/state"
+if (-not (Test-Path $StateDir)) {
+    New-Item -ItemType Directory -Path $StateDir -Force -ErrorAction SilentlyContinue | Out-Null
+}
+$CacheBase = Join-Path $StateDir "edit_cache_$SessionId"
+if (-not (Test-Path $CacheBase)) {
+    New-Item -ItemType Directory -Path $CacheBase -Force -ErrorAction SilentlyContinue | Out-Null
+}
 # v0.2.29 GC: prune per-session edit_cache_* directories older than 14 days.
-# Keeps .claude/state/ bounded across heavy use. Best-effort -- failures ignored.
-# HK-4 (v0.2.75) accepted-scatter: GC is per-hook (4 sites), not a shared
-# sweeper. Thresholds are uniform (14d here + the reads/snapshot sweeps;
-# bash_task_* is a deliberate 1d), so consolidation is optional and
-# deliberately SKIPPED to keep hooks single-file. MUST MATCH the .sh sibling.
-Get-ChildItem -Directory (Join-Path $ProjectRoot ".claude/state") -Filter "edit_cache_*" -ErrorAction SilentlyContinue |
+# HK-4 (v0.2.75) accepted-scatter: GC is intentionally per-hook, not a shared
+# sweeper. MUST MATCH the .sh sibling's note.
+Get-ChildItem -Directory $StateDir -Filter "edit_cache_*" -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-# P3 (v0.2.91): ALIGN the per-file replay-cache TTL with the shared
-# cross-surface result cache (_lib/query-cache.ps1, 900 s). Pre-v0.2.91 this was
-# a hardcoded 600 s against the query cache's 900 s, so an edit in the 600-900 s
-# window was a DOUBLE MISS: the per-file cache expired, the hook paid a fresh
-# interpreter start, and the producers then served the SAME blob back out of the
-# still-fresh shared query cache. One home for the value: the shared default plus
-# the same VCO_QUERY_CACHE_TTL override, literal fallback on a partial install.
-# MUST MATCH pre-edit-context-inject.sh (CACHE_TTL).
+# P3 (v0.2.91): TTL aligned with the shared query cache window.
 $CacheTtl = 900
 if ($env:VCO_QUERY_CACHE_TTL) {
-    try { $CacheTtl = [int]$env:VCO_QUERY_CACHE_TTL } catch { $CacheTtl = 900 }
-} elseif ($script:VcoQueryCacheTtlDefault) {
-    $CacheTtl = [int]$script:VcoQueryCacheTtlDefault
+    try { $parsedTtl = [int]$env:VCO_QUERY_CACHE_TTL; if ($parsedTtl -gt 0) { $CacheTtl = $parsedTtl } } catch { }
 }
-if ($CacheTtl -le 0) { $CacheTtl = 900 }
 
-# State lives in the project directory (not /tmp/) so it survives reboots and
-# is co-located with the session's other ephemeral state. Wiped by the
-# PostCompact hook when the LLM's context is trimmed (so the dedup window
-# matches the actual context window the LLM sees).
-$SeenDir = Join-Path $ProjectRoot ".claude/state"
-if (-not (Test-Path $SeenDir)) {
-    New-Item -ItemType Directory -Path $SeenDir -Force -ErrorAction SilentlyContinue | Out-Null
-}
-# v0.2.70 Stream E: unified per-session stores. SeenInjectFile (per-chunk KG /
-# per-entity CODE dedup) + SeenReadsFile (explicit-Read ledger). "" when the
-# session id is untrustworthy -> inject blind (no shared bucket). MUST MATCH the
-# .sh sibling. SeenNodesFile is the legacy back-compat name for the partial-
-# install fallback path.
+# Seen-store GC sweeps (14d) + replay-filter paths.
+Get-ChildItem -File $StateDir -Filter "seen_inject_*.txt" -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -File $StateDir -Filter "seen_kg_titles_*.txt" -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 $SeenInjectFile = ""
 $SeenReadsFile = ""
 if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
     $SeenInjectFile = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-    $SeenReadsFile  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-}
-$SeenNodesFile = if ($SeenInjectFile) { $SeenInjectFile } else { Join-Path $SeenDir "seen_inject_$SessionId.txt" }
-
-function Get-JsonField([string]$field) {
-    if (-not $PY -or -not $ToolArgs) { return "" }
-    try {
-        $code = "import sys, json`ntry:`n    d = json.loads(sys.stdin.read())`n    print(d.get('$field', ''))`nexcept Exception:`n    print('')"
-        $r = $ToolArgs | & $PY -c $code 2>$null
-        if ($r) { return $r.Trim() }
-    } catch { }
-    return ""
+    $SeenReadsFile = Get-VcoSeenStorePath -Kind "reads" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
 }
 
-$FilePath = Get-JsonField "file_path"
-$NewString = Get-JsonField "new_string"
-if (-not $FilePath) { exit 0 }
-
-# Cache key from file path (md5 via .NET).
+# === Cache key from the file path (.NET MD5; the .sh sibling uses hashlib) ===
 $md5 = [System.Security.Cryptography.MD5]::Create()
 $bytes = [System.Text.Encoding]::UTF8.GetBytes($FilePath)
-$hash = ($md5.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ""
-$CacheDir = $CacheBase
-$CacheFile = Join-Path $CacheDir $hash
-if (-not (Test-Path $CacheDir)) {
-    New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
-}
+$FileHash = (($md5.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join "")
+$CacheFile = Join-Path $CacheBase $FileHash
+$Basename = Split-Path $FilePath -Leaf
 
-# === Emit context as PreToolUse JSON envelope ===
-# Wraps Emit-AdditionalContext from _lib/emit-context.ps1 — the helper
-# gates on whitespace-only content so we don't surface empty
-# system-reminder blocks when dedup suppresses every result. Pre-2026-05-08
-# this hook printed plain stdout that never reached the LLM context on
-# Windows; the .sh sibling was fixed in PR #168 and the .ps1 fix landed
-# alongside the fork-readiness sweep for 0.1.7.
 function Emit-ContextJson([string]$ctx) {
-    # If the helper sourced (normal case), delegate. If it didn't (the
-    # `_lib/emit-context.ps1` file was missing at hook startup), fall
-    # back to a silent no-op rather than crashing on an undefined
-    # function. The hook's other work (dedup state, cache write)
-    # remains valid.
     if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
         Emit-AdditionalContext $ctx 'PreToolUse'
     }
 }
 
-# Dedup against this session's seen nodes.
-#
-# The KG/codegraph result blocks have the shape:
-#
-#   KG: <title> | <type> | score=<n.nn> | <body...>
-#   <body line 1>
-#   <body line 2>
-#   ...
-#
-# v0.2.70 Stream E: dedup is now the shared _lib/seen-store.ps1 helper
-# (Invoke-VcoFilterSeenBlocks), keyed PER-CHUNK for KG and PER-ENTITY for CODE,
-# plus reads-ledger source suppression. Filter-Seen delegates to it when present
-# and falls back to the legacy title-coarse inline logic only on a partial
-# install (missing helper).
-#
-# v0.2.77 Part 9 task 1: these functions are DEFINED HERE — before the cache
-# read + replay branch below — so a cache HIT can be served WITHOUT running the
-# two live searches. Pre-v0.2.77 they were defined after the searches, so the
-# replay branch sat after the searches had already run (audit: warm ≈ cold).
-# MUST MATCH pre-edit-context-inject.sh ordering.
-# NOT `$input`: that is PowerShell's automatic pipeline enumerator, which
-# shadows a declared [string]$input parameter -- every call returned "" and
-# this hook never injected on Windows (W5R-01 behavioural test, v0.2.100).
-function Filter-Seen([string]$Text) {
-    if (-not $Text) { return "" }
-    if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
-        return Invoke-VcoFilterSeenBlocks -InputText $Text -InjectFile $SeenInjectFile -ReadsFile $SeenReadsFile
-    }
-    return Filter-Seen-Legacy $Text
-}
-
-# Legacy fallback (pre-v0.2.70): title-coarse dedup, no reads-ledger consult.
-function Filter-Seen-Legacy([string]$Text) {
-    if (-not $Text) { return "" }
-    $filtered = New-Object System.Text.StringBuilder
-    if (-not (Test-Path $SeenNodesFile)) { New-Item -ItemType File -Path $SeenNodesFile -Force | Out-Null }
-    $seen = @{}
-    foreach ($l in Get-Content $SeenNodesFile -ErrorAction SilentlyContinue) { $seen[$l] = $true }
-
-    $currentTitle = ""
-    $currentBlock = New-Object System.Text.StringBuilder
-    $currentSkip = $false
-
-    $flushBlock = {
-        param($title, $block, $skip, $filteredRef, $seenRef, $seenFile)
-        if ($title -and -not $skip -and -not $seenRef.Value.ContainsKey($title)) {
-            [void]$filteredRef.Value.Append($block)
-            $seenRef.Value[$title] = $true
-            Add-Content -Path $seenFile -Value $title -ErrorAction SilentlyContinue
-        }
-    }
-
-    foreach ($line in $Text -split "`n") {
-        # Header line starts a new block. Format: "KG: <title> | ..." or
-        # "CODE: <full_name> | ..." — the first field after the prefix and
-        # before the next " | " is the dedup key.
-        if ($line -match '^(KG|CODE):\s+(.+)$') {
-            # Flush previous block.
-            & $flushBlock $currentTitle $currentBlock.ToString() $currentSkip ([ref]$filtered) ([ref]$seen) $SeenNodesFile
-            $rest = $Matches[2]
-            # Defensive: strip any accidentally-doubled "KG: " / "CODE: " that
-            # could slip in from a formatting transition (e.g. an old cache
-            # written before the producers added their own prefix).
-            if ($rest.StartsWith("KG: "))   { $rest = $rest.Substring(4) }
-            if ($rest.StartsWith("CODE: ")) { $rest = $rest.Substring(6) }
-            $currentTitle = ($rest -split ' \| ')[0]
-            # Cap to 200 chars defensively (some code-graph entity names can be long)
-            if ($currentTitle.Length -gt 200) { $currentTitle = $currentTitle.Substring(0, 200) }
-            $currentBlock = New-Object System.Text.StringBuilder
-            [void]$currentBlock.AppendLine($line)
-            # If already seen, mark the block so we drop it AND its body lines.
-            $currentSkip = $seen.ContainsKey($currentTitle)
-        } elseif ($currentTitle) {
-            # Body line for the current block — accumulate.
-            [void]$currentBlock.AppendLine($line)
-        } else {
-            # Pre-amble or stray line not part of any block — pass through
-            # only if it has non-whitespace content. Blank separators
-            # between fully-deduped blocks would otherwise leak through
-            # and surface an empty system-reminder block to the LLM.
-            if ($line -match '\S') {
-                [void]$filtered.AppendLine($line)
-            }
-        }
-    }
-    # Flush the final block.
-    & $flushBlock $currentTitle $currentBlock.ToString() $currentSkip ([ref]$filtered) ([ref]$seen) $SeenNodesFile
-
-    return $filtered.ToString()
-}
-
 # === Cache hit/miss observability (v0.2.77 Part 9 task 1) ===
-# Append a single-line JSON record so the once-dead cache can be verified in
-# the field. Size-guarded rotation (data preserved in .1 sibling). Best-effort.
-# MUST MATCH pre-edit-context-inject.sh::_cache_log.
-function Write-CacheLog([string]$status) {
-    $logFile = Join-Path $ProjectRoot ".claude/state/preedit_cache_log.jsonl"
-    $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+function Write-CacheLog([string]$Status) {
+    $log = Join-Path $StateDir "preedit_cache_log.jsonl"
     try {
-        if (Test-Path $logFile) {
-            if ((Get-Item $logFile).Length -gt 262144) {
-                Move-Item -Path $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
-            }
+        if (Test-Path -LiteralPath $log) {
+            $sz = (Get-Item -LiteralPath $log).Length
+            if ($sz -gt 262144) { Move-Item -LiteralPath $log "$log.1" -Force -ErrorAction SilentlyContinue }
         }
-        $line = '{"ts":"' + $ts + '","hook":"pre-edit","status":"' + $status + '","session":"' + $SessionId + '"}'
-        Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue
+        $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        Add-Content -LiteralPath $log -Value ('{"ts":"' + $ts + '","hook":"pre-edit","status":"' + $Status + '","session":"' + $SessionId + '"}') -ErrorAction SilentlyContinue
     } catch { }
 }
 
-# Check cache (10-min TTL) — uses .NET file mtime, no cross-OS stat issues.
-# Cache stores RAW per-result blocks (with KG:/CODE: headers) so dedup can
-# still apply on replay against the latest seen-list. Replay runs RIGHT BELOW
-# — before any search launches — so a hit never pays for a query.
+# === Cache replay (BEFORE any router spawn) ===
 $CacheHit = $false
 $CacheBlob = ""
-if (Test-Path $CacheFile) {
-    $mtime = (Get-Item $CacheFile).LastWriteTime
-    $age = ((Get-Date) - $mtime).TotalSeconds
-    if ($age -lt $CacheTtl) {
-        $CacheHit = $true
-        try { $CacheBlob = (Get-Content $CacheFile -Raw -ErrorAction Stop) } catch { }
-    }
+if (Test-Path -LiteralPath $CacheFile) {
+    try {
+        $age = ((Get-Date) - (Get-Item -LiteralPath $CacheFile).LastWriteTime).TotalSeconds
+        if ($age -lt $CacheTtl) {
+            $CacheHit = $true
+            $CacheBlob = Get-Content -LiteralPath $CacheFile -Raw -ErrorAction SilentlyContinue
+            if ($null -eq $CacheBlob) { $CacheBlob = "" }
+        }
+    } catch { }
 }
 
-# $Basename is needed by the cache-replay branch below (v0.2.77 Part 9 task 1),
-# which now runs BEFORE the project detection + live searches.
-$Basename = Split-Path $FilePath -Leaf
-
-# === Cache replay (BEFORE any live search) ===
-# If we have a fresh cache hit, dedup it against the current seen-list and emit
-# — WITHOUT running rl_kg_search.py / code-graph-query. If everything in the
-# cache is already seen, exit silently. The cache stores RAW per-result blocks
-# (KG:/CODE: headers). History: the cache layer landed in PR-38 (v0.2.12) but
-# the replay branch sat after the searches, so a warm edit paid the full
-# search cost (audit 2026-07-11: warm 1431 ms ≈ cold 1440 ms). v0.2.77 Part 9
-# moves it here so a warm edit is served from cache. MUST MATCH the .sh sibling.
 if ($CacheHit) {
     Write-CacheLog "hit"
-    $filteredCache = Filter-Seen $CacheBlob
-    $trimmed = ($filteredCache -replace '\s+', '')
-    if (-not $trimmed) { exit 0 }
-    $replayOut = [System.Text.StringBuilder]::new()
-    [void]$replayOut.AppendLine("[Pre-edit context for ${Basename}]:")
-    [void]$replayOut.AppendLine("")
-    [void]$replayOut.Append($filteredCache)
-    Emit-ContextJson $replayOut.ToString()
-    exit 0
+    # Replay through the CURRENT seen-state: the router recorded the blocks
+    # it emitted on the miss run, so a same-session replay filters to
+    # silence -- the same answer a fresh router run gives, with no spawn.
+    # After a /compact seen-store wipe the blocks re-eligibilise (the cache
+    # stores RAW pre-dedup output). A missing seen-store helper SKIPS the
+    # replay and falls through to a live router run rather than replaying
+    # undeduped. MUST MATCH the .sh sibling.
+    if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
+        # v0.2.101 pull-in 4: claim the replay slot per (session, file-hash)
+        # ATOMICALLY before the check-then-append filter (CreateNew = O_EXCL),
+        # so two near-simultaneous edits of one file cannot both inject. The
+        # loser exits silently (it would replay the SAME blob through the SAME
+        # store -- the winner's emit carries it all); the winner releases once
+        # its keys are recorded. Stale bound 15 s > the 10 s hook timeout. No
+        # claim in inject-blind mode (shared "default" cache dir); "undecided"
+        # fails OPEN. MUST MATCH the .sh sibling.
+        $ReplayClaim = ""
+        $ReplayClaimStaleS = 15
+        if ($SeenInjectFile -and (Get-Command Invoke-VcoSeenClaim -ErrorAction SilentlyContinue)) {
+            $ReplayClaim = "$CacheFile.claim"
+            $claimVerdict = Invoke-VcoSeenClaim -ClaimFile $ReplayClaim -StaleAfterSeconds $ReplayClaimStaleS
+            if ($claimVerdict -eq "held") { exit 0 }
+            if ($claimVerdict -ne "claimed") { $ReplayClaim = "" }
+        }
+        $filtered = Invoke-VcoFilterSeenBlocks -InputText $CacheBlob -InjectFile $SeenInjectFile -ReadsFile $SeenReadsFile
+        if ($ReplayClaim) { Remove-Item -LiteralPath $ReplayClaim -Force -ErrorAction SilentlyContinue }
+        if (($filtered -replace '\s+', '')) {
+            Emit-ContextJson "[Pre-edit context for ${Basename}]:`n`n$filtered"
+        }
+        exit 0
+    }
 }
 Write-CacheLog "miss"
 
-# Code-graph identity: ALWAYS the calling project (v0.2.100 W5R-03).
-# No --project override, ever: the CLI resolves the CALLING project
-# (CLAUDE_PROJECT_DIR -> hub binding prefix, which also holds its extra paths)
-# and fans out over that project's own VCT_CODE_GRAPH_ACCESS_LIST grants. The
-# old detect-project.ps1 sibling-by-folder-name heuristic searched a neighbour
-# folder's code graph with no grant and skipped the own prefix for extra
-# paths. MUST MATCH pre-edit-context-inject.sh.
-$CodeGraphProjectArg = @()
-
-$ModuleName = [System.IO.Path]::GetFileNameWithoutExtension($Basename)
-$NewSnippet = if ($NewString.Length -gt 200) { $NewString.Substring(0,200) } else { $NewString }
-$Query = "$ModuleName $NewSnippet".Trim()
-
-# Run searches sequentially (PowerShell parallel jobs add overhead worse than 5s budget).
-$KgTmp = New-TemporaryFile
-$CodeTmp = New-TemporaryFile
-
-# v0.2.46 post-adversarial: dot-source shared resolver. The previous
-# inline logic fell back to $ProjectRoot/.venv when $VCT_INSTALL_ROOT was
-# unset — that's the USER's project venv, which won't have weaviate-
-# client + vco_lib. Shared helper enforces canonical 3-tier order +
-# refuses to silently activate the user's venv. (PR-25 / v0.2.12
-# dual-layout history preserved in the helper's docstring.)
+# === Resolve venv + the router (orchestrator-root script, F3 discipline) ===
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
 $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-# Final fallback: if no venv resolved, leave $VenvPy as $null — the
-# (Test-Path $VenvPy) gate below skips the KG search subprocess and the
-# hook still exits 0 without blocking the edit.
-# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root - locate it
-# there (same roots as the venv), never under the project root. It still runs
-# with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's KG +
-# shared + granted collections apply. MUST MATCH the .sh sibling.
-$RlScript = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/rl_kg_search.py"
-# Unresolved -> the legacy (absent) project path: every Test-Path below then
-# reads "not installed" without binding an empty -Path.
-if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py" }
-# Pin the CALLING project's identity for the producer (a no-op whenever the
-# harness already set it): the script lives in the orchestrator root, so its
-# own location must never be what names the project.
+if (-not $VenvPy -or -not (Test-Path $VenvPy)) { exit 0 }
+$Router = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/hook_context_router.py"
+if (-not $Router) { $Router = Join-Path $ProjectRoot "claude_mcp_servers/scripts/hook_context_router.py" }
+if (-not (Test-Path $Router)) { exit 0 }
+# Pin the CALLING project's identity for the router + producers.
 $env:CLAUDE_PROJECT_DIR = $ProjectRoot
-# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
-# (rl_kg_search.py reads it; MUST MATCH the .sh sibling).
-$env:VCO_RL_TASK_TYPE = "pre_edit_kg_search"
 
-# v0.2.95 (lane F10): "is this a code file" is ONE decision with ONE home,
-# _lib/code-extensions.ps1. v0.2.70 Stream C kept it as a C-tier mirror here,
-# in pre-tool-use.ps1 and in post-file-edit.ps1 with a "MUST MATCH" comment;
-# a second consumer (the Bash-write routing) made that untenable.
-# A partial install without the helper is treated as NOT-code.
-# (v0.2.91 P2: the decision stays ABOVE the search launch so the merged
-# single-interpreter path knows up-front whether the code-graph leg is wanted.)
-$IsCode = $false
-if ((Get-Command Test-VcoIsCodeFile -ErrorAction SilentlyContinue) -and
-    (Test-VcoIsCodeFile $FilePath)) {
-    $IsCode = $true
-}
-$ProjArg = if ($CodeGraphProjectArg.Count -gt 0) { $CodeGraphProjectArg -join ' ' } else { "" }
+# === Run the router (single interpreter for both legs; inner budget
+# VCO_INJECT_BUDGET_S). The router applies gates + dedupe + budget. ===
+$Inject = ""
+try {
+    $Inject = ($HookStdin | & $VenvPy $Router "edit" 2>$null) -join "`n"
+} catch { $Inject = "" }
+if ($null -eq $Inject) { $Inject = "" }
 
-# === P2 (v0.2.91): ONE interpreter for both searches ========================
-# Pre-P2 this ran the two producers as two separate CPython processes, each
-# paying ~1.0 s of interpreter + import + client-connect for ~60 ms of real
-# retrieval work. The shared wrapper runs whichever legs MISSED their
-# (unchanged, per-leg) cache in a single process: same queries, same argv, same
-# per-leg output caps, byte-identical blocks. $Ok = $false asks for the legacy
-# path (driver absent on a partial install, no venv, no framing) — not an error.
-# MUST MATCH pre-edit-context-inject.sh.
-$DualDone = $false
-if (Get-Command Invoke-VcoDualSearchCached -ErrorAction SilentlyContinue) {
-    try {
-        # WP-E (v0.2.92): PromptId scopes the cache key; TranscriptPath threads
-        # to BOTH legs' -Transcript flag inside the driver. MUST MATCH the .sh
-        # sibling's dual-search call.
-        $dual = Invoke-VcoDualSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Query `
-            -KgLimit 1 -WantKg $true -WantCg $IsCode -CgProjectArg $ProjArg -CgLimit 2 `
-            -CgExcludeFile $FilePath -CgAnchor $FilePath -PromptId $PromptId -TranscriptPath $TranscriptPath
-        if ($dual.Ok) {
-            $DualDone = $true
-            if ($dual.Kg) { Set-Content -Path $KgTmp.FullName -Value $dual.Kg }
-            if ($IsCode -and $dual.Cg) { Set-Content -Path $CodeTmp.FullName -Value $dual.Cg }
-        }
-    } catch { }
+# === Only output if we found something ===
+if (($Inject -replace '\s+', '')) {
+    # Cache the RAW router output (section-9 discipline: never cache empty).
+    try { Set-Content -LiteralPath $CacheFile -Value $Inject -Encoding UTF8 } catch { }
+    Emit-ContextJson "[Pre-edit context for ${Basename}]:`n`n$Inject"
 }
 
-if (-not $DualDone -and $VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
-    try {
-        # v0.2.77 Part 9 task 2: route through the shared TTL result-cache
-        # wrapper so a repeat query is served from disk. Falls back to the
-        # direct call when the cache helper is absent (partial install).
-        if (Get-Command Invoke-VcoKgSearchCached -ErrorAction SilentlyContinue) {
-            # WP-E (v0.2.92): PromptId/TranscriptPath — same rationale as the
-            # dual-search leg above. MUST MATCH the .sh sibling.
-            $kgOut = Invoke-VcoKgSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Query -Limit 1 -PromptId $PromptId -TranscriptPath $TranscriptPath
-            if ($kgOut) { Set-Content -Path $KgTmp.FullName -Value $kgOut }
-        } elseif ($TranscriptPath) {
-            # --hook-format prepends "KG: " to each result header so dedup can match by title.
-            & $VenvPy $RlScript $Query --limit 1 --hook-format --transcript $TranscriptPath 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
-        } else {
-            # --hook-format prepends "KG: " to each result header so dedup can match by title.
-            & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
-        }
-    } catch { }
-}
-
-# Route through the shared code-graph helper when present (one home; pre-bash +
-# pre-tool-use Read/Grep use the same function); fall back to the inline
-# invocation only on a partial install.
-if (-not $DualDone -and $IsCode) {
-    # v0.2.72 P2: pass the edited file as -Anchor so the CLI's shared retrieval
-    # pipeline biases the rerank toward call-linked / same-module / shared-type
-    # code relative to the file being edited. MUST MATCH pre-edit-context-inject.sh.
-    if (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue) {
-        $projArg = if ($CodeGraphProjectArg.Count -gt 0) { $CodeGraphProjectArg -join ' ' } else { "" }
-        $out = Invoke-VcoCodegraphQueryBlock -Query $Query -ProjectArg $projArg -Limit 2 -ExcludePath $FilePath -Anchor $FilePath -PromptId $PromptId -TranscriptPath $TranscriptPath
-        if ($out) { Set-Content -Path $CodeTmp.FullName -Value $out }
-    } else {
-        $cgQueryPs1 = Join-Path $ProjectRoot ".claude/scripts/code-graph-query.ps1"
-        $cgQuerySh = Join-Path $ProjectRoot ".claude/scripts/code-graph-query"
-        try {
-            if (Test-Path $cgQueryPs1) {
-                $out = & $PsExe -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 --hook-format --anchor $FilePath 2>$null |
-                    Where-Object { $_ -notlike "*$FilePath*" } |
-                    Select-Object -First 20
-                $out | Set-Content -Path $CodeTmp.FullName
-            } elseif ((Test-Path $cgQuerySh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
-                $out = & bash $cgQuerySh search $Query @CodeGraphProjectArg --limit 2 --hook-format --anchor $FilePath 2>$null |
-                    Where-Object { $_ -notlike "*$FilePath*" } |
-                    Select-Object -First 20
-                $out | Set-Content -Path $CodeTmp.FullName
-            }
-        } catch { }
-    }
-}
-
-$KgResult = ""
-$CodeResult = ""
-try { $KgResult = (Get-Content -Path $KgTmp.FullName -Raw -ErrorAction Stop) } catch { }
-if ($IsCode) {
-    try { $CodeResult = (Get-Content -Path $CodeTmp.FullName -Raw -ErrorAction Stop) } catch { }
-}
-Remove-Item $KgTmp.FullName, $CodeTmp.FullName -Force -ErrorAction SilentlyContinue
-
-# Dedup against this session's seen nodes. Filter-Seen / Filter-Seen-Legacy are
-# DEFINED EARLIER (before the cache read + replay branch — v0.2.77 Part 9 task 1)
-# so a cache hit can replay without running the searches. The MISS path
-# continues here to dedup the freshly-produced $KgResult / $CodeResult.
-
-# Capture raw producer output (pre-dedup) for the cache. Caching post-dedup
-# would perma-suppress titles eligible to re-appear after a /compact wipe.
-$KgRaw   = $KgResult
-$CodeRaw = $CodeResult
-
-if ($KgResult)   { $KgResult   = Filter-Seen $KgResult }
-if ($CodeResult) { $CodeResult = Filter-Seen $CodeResult }
-
-$HasKg   = [bool]$KgResult
-$HasCode = [bool]$CodeResult
-
-# Build raw cache blob (used in both empty-output and emit branches).
-$rawCache = ""
-if ($KgRaw)   { $rawCache += $KgRaw + "`n" }
-if ($CodeRaw) { $rawCache += $CodeRaw + "`n" }
-
-if (-not $HasKg -and -not $HasCode) {
-    if ($rawCache) {
-        try { Set-Content -Path $CacheFile -Value $rawCache -Encoding UTF8 -NoNewline } catch { }
-    }
-    exit 0
-}
-
-# Per-result headers already carry "KG: " / "CODE: " prefixes from the
-# producers (--hook-format). Don't add an extra block-level label.
-$out = [System.Text.StringBuilder]::new()
-[void]$out.AppendLine("[Pre-edit context for ${Basename}]:")
-[void]$out.AppendLine("")
-if ($HasKg) {
-    [void]$out.Append($KgResult)
-    [void]$out.AppendLine("")
-}
-if ($HasCode) {
-    [void]$out.Append($CodeResult)
-    [void]$out.AppendLine("")
-}
-
-# Cache RAW per-result blocks (pre-dedup) so replays apply current dedup
-# state. Caching post-dedup would perma-suppress titles legitimately
-# re-eligible after a /compact wipe.
-if ($rawCache) {
-    try { Set-Content -Path $CacheFile -Value $rawCache -Encoding UTF8 -NoNewline } catch { }
-}
-Emit-ContextJson $out.ToString()
 exit 0

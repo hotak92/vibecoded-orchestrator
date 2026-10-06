@@ -939,7 +939,8 @@ mod tests {
         for id in ["vct-code-embedding", "vct-codegraph", "vct-hub-api", "vct-kg", "vct-session-state"] {
             assert!(ids.contains(&id), "{id} declares settings: {ids:?}");
         }
-        assert!(!ids.contains(&"vct-search"), "a module with no settings is not listed");
+        // v0.2.101 deleted the vct-search module + manifest; it must not appear.
+        assert!(!ids.contains(&"vct-search"), "the deleted vct-search module must not be listed");
         assert!(is_global(&hub_port()));
         let ctx = find_setting(&modules, "vct-session-state", "CONTEXT_STATE_MAX_LINES").unwrap();
         assert!(!is_global(ctx));

@@ -38,7 +38,12 @@ from tests.common.launcher_db_fixture import (  # noqa: E402
 )
 
 
-def _make_launcher_db(tmp_dir: Path, *, active: str | None = None) -> Path:
+def _make_launcher_db(
+    tmp_dir: Path,
+    *,
+    active: str | None = None,
+    default_text: str | None = None,
+) -> Path:
     """Create a launcher.db inside tmp_dir with app_state seeded.
 
     Lives at ``<tmp_dir>/.vct/launcher.db`` so the install.py path
@@ -50,12 +55,18 @@ def _make_launcher_db(tmp_dir: Path, *, active: str | None = None) -> Path:
     Migration 008 seeds ``orchestrator_root_kg_collection`` and nothing
     else, so ``active=None`` still means "``embedding.active_profile`` is
     absent" — the case these tests need.
+
+    ``default_text`` (v0.2.101) seeds ``app_state[default_text_embedding]``
+    — the hardware pick the active-embedding chain derives a profile from
+    when the canonical ``embedding.active_profile`` row is absent.
     """
     state_dir = tmp_dir / ".vct"
     state_dir.mkdir(parents=True, exist_ok=True)
     db_path = create_empty_launcher_db(state_dir / "launcher.db")
     if active is not None:
         set_app_state(db_path, "embedding.active_profile", active)
+    if default_text is not None:
+        set_app_state(db_path, "default_text_embedding", default_text)
     return db_path
 
 
@@ -294,6 +305,64 @@ class TestSoftFailWhenLauncherDbUnreachable(IsolatedEnvMixin, unittest.TestCase)
 
         result = _resolve_active_embedding()
         self.assertEqual(result, "qwen3")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Test 4b (v0.2.101): the hardware-pick derive leg + the ONE home
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestHardwarePickDeriveLeg(IsolatedEnvMixin, unittest.TestCase):
+    """When neither ``ACTIVE_EMBEDDING`` nor ``app_state[embedding.active_profile]``
+    is set, the chain derives the profile from ``app_state[default_text_embedding]``.
+
+    v0.2.101: this leg used to live only in ``EmbeddingService`` and was MISSING
+    from ``vco_lib.kg_context_triple.active_embedding_profile`` (the canonical
+    home), so the embedder and the recorded triple could disagree. It now lives
+    once, in the canonical home, and ``_resolve_active_embedding`` delegates.
+    """
+
+    _HARDWARE_ARCTIC = "snowflake-arctic-embed2:latest"
+
+    def test_derives_arctic_from_the_hardware_text_pick(self) -> None:
+        _make_launcher_db(self.tmp_path, active=None, default_text=self._HARDWARE_ARCTIC)
+        from vco_lib.embedding_service import _resolve_active_embedding
+        from vco_lib.kg_context_triple import active_embedding_profile
+
+        self.assertEqual(_resolve_active_embedding(), "arctic")
+        # ONE home: the embedder's resolver and the triple's writer agree.
+        self.assertEqual(active_embedding_profile(), "arctic")
+
+    def test_env_wins_over_the_derive(self) -> None:
+        _make_launcher_db(self.tmp_path, active=None, default_text=self._HARDWARE_ARCTIC)
+        os.environ["ACTIVE_EMBEDDING"] = "qwen3"
+        from vco_lib.embedding_service import _resolve_active_embedding
+
+        self.assertEqual(_resolve_active_embedding(), "qwen3")
+
+    def test_active_profile_row_wins_over_the_derive(self) -> None:
+        _make_launcher_db(self.tmp_path, active="openai", default_text=self._HARDWARE_ARCTIC)
+        from vco_lib.embedding_service import _resolve_active_embedding
+
+        self.assertEqual(_resolve_active_embedding(), "openai")
+
+    def test_unknown_text_model_derive_falls_through_to_qwen3(self) -> None:
+        _make_launcher_db(self.tmp_path, active=None, default_text="some-unknown:model")
+        from vco_lib.embedding_service import _resolve_active_embedding
+
+        self.assertEqual(_resolve_active_embedding(), "qwen3")
+
+    def test_resolver_delegates_to_the_canonical_home(self) -> None:
+        """RED-PROOF: point the canonical home at a sentinel — the resolver must
+        follow it. A private copy of the chain would ignore the patch and the
+        two could diverge again."""
+        from vco_lib import embedding_service
+        from vco_lib import kg_context_triple
+
+        with mock.patch.object(
+            kg_context_triple, "active_embedding_profile", lambda *a, **k: "sentinel"
+        ):
+            self.assertEqual(embedding_service._resolve_active_embedding(), "sentinel")
 
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -85,7 +85,7 @@ The audit log (`db.audit("secret_set", …)`) records `{key, scope, sensitive}` 
 **Grant a secret to another project, or pause it for one requester:**
 - The per-project SecretsPanel has a **"Cross-project access"** subsection. It lists **issued grants** (each `KEY → grantee`, with per-row **Pause** / **Resume** and **Revoke**) and **received grants** (read-only), plus a grant form (`KEY` + grantee-project dropdown + optional note).
 - **Grant**: pick a key you own, pick the grantee project, Save — the grantee can then resolve that key. Under the hood: `grant_secret` / `revoke_secret_grant_cmd`, with `list_grants_for_project` populating the lists.
-- **Pause / Resume**: pausing a `(key, requester)` pair makes the key resolve as inactive **for that one requester** without deleting the grant — the resolver returns `key_not_active` (exit 3 from `vct_secrets_resolve.sh`) for that project only. Resume re-activates it. Backed by `pause_secret_for_project` / `resume_secret_for_project`; the row's Pause/Resume state is read on load via `is_secret_paused_for_requester`.
+- **Pause / Resume**: pausing a `(key, requester)` pair makes the key resolve as inactive **for that one requester** without deleting the grant — the resolver returns `key_paused` when the key lives in one of the requester's own buckets (per-project, shared, global) or a module-declared slot and is paused for that project (exit 3 from `vct_secrets_resolve.sh`; pre-v0.2.101 hubs answered the undistinguished `key_not_active`). A **cross-project granted** key paused this way still answers `key_not_active` — the grant loop deliberately reports nothing about the owner's bucket, so a paused grant reads as "not active" rather than leaking that the owner's key exists. Resume re-activates it. Backed by `pause_secret_for_project` / `resume_secret_for_project`; the row's Pause/Resume state is read on load via `is_secret_paused_for_requester`.
 - This is the launcher surface for the cross-project grants and per-requester pauses that the resolver's permission matrix enforces — a secret resolves for a project only when it is active for that project as the requester.
 
 #### Field reference (SecretsTab columns)
@@ -140,20 +140,20 @@ For each `(agent, tool)` or `(agent, mcp_server)` pair the launcher follows this
 2. **Subject specificity**: rows with `subject=<agent_name>` take precedence over `subject=project` for the same kind+value.
 3. **Allowlist gating** (`allowed_tool`, `mcp_server`): if any allow row exists for the subject and that kind, the agent is restricted to those values. If no allow rows exist, the platform default applies.
 4. **`permission_mode`** sets the global behavior (`default` | `acceptEdits` | `dontAsk` | `bypassPermissions` | `plan`) — this is what controls "ask each time vs auto-accept".
-5. **`write_scope`** gets translated into an `Edit`/`Write` PreToolUse hook that rejects writes outside the listed globs. So a `write_scope=src/**` row on `subject=coder` means the `coder` agent's writes are limited to `src/**` regardless of any `Edit` allowlist.
+5. **`write_scope`** gets translated into an `Edit`/`Write` PreToolUse hook that rejects writes outside the listed globs. So a `write_scope=src/**` row on `subject=expert-coder` means the `expert-coder` agent's writes are limited to `src/**` regardless of any `Edit` allowlist.
 
 The `subject` field is free-form text. Two conventions:
 - **`project`** — applies to the whole project (every agent run inside it).
-- **`<agent_name>`** — applies to one agent specifically (e.g. `coder`, `planner`, `tester`). The form's placeholder `agent:planner or @global` is suggestive — the literal stored value is whatever you type.
+- **`<agent_name>`** — applies to one agent specifically (e.g. `expert-coder`, `planner`, `tester`). The form's placeholder `agent:planner or @global` is suggestive — the literal stored value is whatever you type.
 
 #### Common operations
 
 **See all permissions for the project:**
-- Open the **Permissions** tab. Rows are grouped by subject (sorted alphabetically) so you can see at a glance "what can `coder` do, what can `tester` do, what's project-wide".
+- Open the **Permissions** tab. Rows are grouped by subject (sorted alphabetically) so you can see at a glance "what can `expert-coder` do, what can `tester` do, what's project-wide".
 
 **Add a permission:**
 - Click **+ Add**.
-- Fill `Subject` (e.g. `coder` or `project`), pick `Kind` from the dropdown, fill `Value`, click **Add permission**.
+- Fill `Subject` (e.g. `expert-coder` or `project`), pick `Kind` from the dropdown, fill `Value`, click **Add permission**.
 - The form calls `add_project_permission(projectId, {subject, kind, value, config: {}})`. Duplicate `(subject, kind, value)` upserts (replaces config), it does not create a second row.
 
 **Delete a permission:**
@@ -172,7 +172,7 @@ The `subject` field is free-form text. Two conventions:
 
 | Column / field | DB column     | Allowed values / format                                                                                       |
 |----------------|---------------|---------------------------------------------------------------------------------------------------------------|
-| Subject        | `subject`     | Free-form. Use `project` for project-wide, or an agent name (e.g. `coder`, `planner`).                         |
+| Subject        | `subject`     | Free-form. Use `project` for project-wide, or an agent name (e.g. `expert-coder`, `planner`).                         |
 | Kind           | `kind`        | One of: `write_scope`, `allowed_tool`, `denied_tool`, `mcp_server`, `permission_mode`. Validated server-side. |
 | Value          | `value`       | Depends on kind — see the table below.                                                                         |
 | (hidden) config| `config_json` | Reserved for kind-specific extras (e.g. timeout, scope hints). Today the UI sends `{}`.                       |
@@ -197,7 +197,7 @@ The `subject` field is free-form text. Two conventions:
 - **Duplicate detection is on `(project_id, subject, kind, value)` exact match.** `Read` and `read` are NOT the same; tool names are case-sensitive and must match Claude Code's tool registry.
 - **MCP server allowlist is exclusive**: as soon as you add even one `mcp_server` row for a subject, all other servers are hidden from that subject. Don't add one `mcp_server` rule expecting it to mean "also allow this on top of the default".
 - **`subject=project` is not the same as no rows.** No rows = platform defaults. `subject=project, kind=allowed_tool, value=Read` = ONLY Read is allowed for everything in this project.
-- **Renaming an agent breaks its rules.** The subject is plain text — there's no FK to an agent record. If you rename `coder` → `developer` in AgentsTab, the old `subject=coder` rows still exist and apply to nothing. Delete them by hand.
+- **Renaming an agent breaks its rules.** The subject is plain text — there's no FK to an agent record. If you rename `expert-coder` → `developer` in AgentsTab, the old `subject=expert-coder` rows still exist and apply to nothing. Delete them by hand.
 - **No history**: deleting a permission does not soft-delete or audit-log under a dedicated label. The change-log captures it as a generic DB write. Don't expect a "who removed what" trail in this tab.
 
 ---
@@ -271,7 +271,7 @@ per-project `enabled` flag and a `source` label.
   frontmatter for `name`, `description`, `model`, inserts one row per
   file via `Db::register_project_agent(...)` with `source = "bundled"`.
 - The `agent_name` is taken from frontmatter `name:` if present,
-  otherwise from the file stem (e.g. `coder.md` → `coder`).
+  otherwise from the file stem (e.g. `expert-coder.md` → `expert-coder`).
 - Manual: the **+ Register** button (top-right of the tab) calls the
   `register_project_agent` Tauri command. This adds a registry row
   *without* creating a `.md` file — useful for tracking an agent

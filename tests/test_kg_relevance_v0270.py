@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import importlib
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -175,59 +174,37 @@ def _has_bash() -> bool:
 
 
 def test_d3_prebash_sources_shared_strip_no_inline() -> None:
-    """N-3 (one home): the hook must SOURCE _lib/command-noise-strip.sh and call
-    vco_strip_command_noise — NOT carry an inline `for t in cmd.split()` copy.
-    Same for the .ps1 sibling."""
-    body = (HOOKS / "pre-bash-context-inject.sh").read_text(encoding="utf-8")
-    assert "_lib/command-noise-strip.sh" in body and "vco_strip_command_noise" in body, (
-        "pre-bash.sh must source + call the shared noise-strip helper"
-    )
-    assert "for t in cmd.split()" not in body, (
-        "pre-bash.sh must NOT carry an inline copy of the noise-strip"
-    )
-    # The 500-char skip must still be present (not removed by D-3).
-    assert "THRESHOLD" in body and "CMD_LEN" in body
-    ps1 = (HOOKS / "pre-bash-context-inject.ps1").read_text(encoding="utf-8")
-    assert "command-noise-strip.ps1" in ps1 and "Get-VcoCommandNoiseStripped" in ps1, (
-        "pre-bash.ps1 must source + call the shared noise-strip helper"
-    )
-    assert "for t in cmd.split()" not in ps1, (
-        "pre-bash.ps1 must NOT carry an inline copy of the noise-strip"
-    )
-
-
-NOISE_STRIP_SH = REPO_ROOT / "templates" / "hooks" / "_lib" / "command-noise-strip.sh"
-NOISE_STRIP_PS1 = REPO_ROOT / "templates" / "hooks" / "_lib" / "command-noise-strip.ps1"
-
-
-def test_d3_noise_strip_ps1_sibling_exists() -> None:
-    assert NOISE_STRIP_SH.exists()
-    assert NOISE_STRIP_PS1.exists(), (
-        "command-noise-strip.ps1 MISSING — _lib/ is excluded from the parity "
-        "gate, so this must be hand-verified here."
-    )
-
-
-@pytest.mark.skipif(not _has_bash(), reason="bash required")
-def test_d3_strip_removes_flags_and_paths(tmp_path: Path) -> None:
-    """Drive the SHARED _lib helper function (not a re-inlined copy — N-3) and
-    assert it removes flags / path tokens / shell ops."""
-    py = shutil.which("python3") or "python3"
-
-    def strip(cmd: str) -> str:
-        script = (
-            f'export PY="{py}"\n'
-            f'. "{NOISE_STRIP_SH}"\n'
-            'vco_strip_command_noise "$1"\n'
+    """N-3 (one home), v0.2.101 RETARGET: the pre-bash wrapper no longer
+    BUILDS a query at all — command-text noise-stripping (and the 500-char
+    THRESHOLD it fed) were retired with §C1: the router classifies the
+    command and builds queries from target paths/symbols ONLY
+    (vco_lib/inject_intent.py — never from command text). The one-home
+    property this row guarded ("no inline strip copy in the hook") is now
+    the stronger "no query build in the hook at all"; the retired shell
+    strip lib awaits Wave-3 removal with its remaining consumers."""
+    for ext in (".sh", ".ps1"):
+        body = (HOOKS / f"pre-bash-context-inject{ext}").read_text(encoding="utf-8")
+        executable = "\n".join(
+            ln for ln in body.splitlines()
+            if not ln.lstrip().startswith(("#", "<#"))
         )
-        r = subprocess.run(["bash", "-c", script, "_", cmd], capture_output=True, text=True, timeout=10)
-        return r.stdout.strip()
+        assert "vco_strip_command_noise" not in executable, (
+            f"pre-bash{ext}: the noise-strip call must stay retired — the "
+            "router owns query building"
+        )
+        assert "Get-VcoCommandNoiseStripped" not in executable, (
+            f"pre-bash{ext}: the noise-strip call must stay retired"
+        )
+        assert "for t in cmd.split()" not in body, (
+            f"pre-bash{ext} must NOT carry an inline copy of the noise-strip"
+        )
+        assert "hook_context_router" in executable, (
+            f"pre-bash{ext} must drive the router (the query-building home)"
+        )
 
-    # bare cd /some/dir -> only "cd" survives (path stripped) -> low signal.
-    assert strip("cd /some/dir/project") == "cd"
-    # ls -la /tmp -> "ls" only.
-    assert strip("ls -la /tmp") == "ls"
-    # a code-file path keeps its BASENAME (meaningful signal).
-    assert "server.py" in strip("python claude_mcp_servers/weaviate_mcp/server.py")
-    # flags + bare-dot dropped; identifier kept.
-    assert strip("grep -rn migrate_collections .") == "grep migrate_collections"
+
+# v0.2.101 wave-2 review SF-2: _lib/command-noise-strip.{sh,ps1} were
+# RETIRED with their last caller (the pre-bash query build — queries are
+# built from targets/symbols now, never from command text). The D-3 rows
+# that drove the lib were retired with it; the wrapper-side retirement pin
+# (test_d3_prebash_sources_shared_strip_no_inline above) survives.

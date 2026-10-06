@@ -16,12 +16,21 @@
 # decision on both operating systems and a mirrored shell implementation
 # would drift (A>B>C: shared code beats shared config beats a mirror).
 #
+# v0.2.101 (PLAN-V02101 §3 WP-A1): the promotion this file was built for is
+# complete — the injection redesign's EDIT classifier
+# (vco_lib/inject_intent.py::classify_bash) is a SECOND Python consumer of
+# the same parser (extract_write_targets / prebash_query_parts /
+# strip_heredocs), imported in-process by hook_context_router.py. There is
+# still exactly ONE parser; nothing here needed to change for it.
+#
 # Contract:
 #   . _lib/bash-write-targets.sh
 #   vco_bash_write_init "<hooks_dir>" "<fallback_python>"
 #   vco_bash_write_prefilter "$COMMAND" || <skip: nothing was written>
 #   vco_bash_write_targets  "$COMMAND" "<project_root>" ["<scan_state>"]
-#   vco_bash_write_prebash  "$COMMAND" "<project_root>"
+# (v0.2.101 Wave-2 review SF-2: vco_bash_write_prebash was RETIRED — its last
+#  caller, the pre-bash query build, moved into the router, which uses the
+#  Python home directly: vco_lib.inject_intent imports prebash_query_parts.)
 
 # --- Idempotent double-source guard ---------------------------------------
 if [ -n "${_VCO_BASH_WRITE_TARGETS_SOURCED:-}" ]; then
@@ -151,18 +160,3 @@ vco_bash_write_targets() {
         "$_VCO_BWT_PY" "${args[@]}" 2>/dev/null || true
 }
 
-# vco_bash_write_prebash <command> <project_root>
-#
-# Two lines: the write TARGET the query should be built from (empty when
-# none is recoverable) and a content SNIPPET (empty unless the command
-# carries a heredoc body destined for knowledge/ or docs/ — see the Python
-# module for why other bodies are withheld). Existence is NOT required: the
-# file is about to be created.
-vco_bash_write_prebash() {
-    local cmd="${1:-}" root="${2:-}"
-    [ -n "$cmd" ] && [ -n "$root" ] && [ -n "$_VCO_BWT_PY" ] || return 0
-    printf '%s' "$cmd" | \
-        PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" \
-        "$_VCO_BWT_PY" -m vco_lib.bash_write_targets \
-            --project-root "$root" --format prebash 2>/dev/null || true
-}

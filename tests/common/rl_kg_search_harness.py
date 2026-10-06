@@ -91,14 +91,16 @@ class _Coll:
 
 
 class FakeEmbeddingService:
-    """``embed_text_all_configured`` with an optional delay (slow secondary)."""
+    """``embed_text_all_configured`` (document) / ``embed_text_query_all_configured``
+    (query, v0.2.101) with an optional delay (slow secondary)."""
 
     def __init__(self, delay_s: float = 0.0) -> None:
         self.delay_s = delay_s
         self.calls = 0
         self.include_active: list = []
+        self.query_tasks: list = []
 
-    def embed_text_all_configured(self, text: str, *, include_active: bool = True) -> dict:
+    def _slots(self, include_active: bool) -> dict:
         self.calls += 1
         self.include_active.append(include_active)
         if self.delay_s:
@@ -107,6 +109,19 @@ class FakeEmbeddingService:
         if include_active:
             out[ACTIVE_SLOT] = list(ACTIVE_VEC)
         return out
+
+    def embed_text_all_configured(
+        self, text: str, *, include_active: bool = True
+    ) -> dict:
+        return self._slots(include_active)
+
+    def embed_text_query_all_configured(
+        self, text: str, *, task: "str | None" = None, include_active: bool = True
+    ) -> dict:
+        # v0.2.101: the dual-RL-log twin uses the QUERY-side fan-out; record the
+        # task so the harness can assert it matches the retrieval's wording.
+        self.query_tasks.append(task)
+        return self._slots(include_active)
 
 
 def _fake_enrich(state: dict):
@@ -139,7 +154,9 @@ def install_fakes(srv, sp, *, cfg: dict, state: dict, patch) -> None:
     svc = FakeEmbeddingService(delay_s=float(cfg.get("embed_delay_s") or 0.0))
     state["svc"] = svc
 
-    async def _search_vector(_q):
+    async def _search_vector(_q, task=None):
+        # v0.2.101: the real ``_get_search_vector`` takes the per-use task
+        # (kg_search / hook_injection / …); the fake accepts and ignores it.
         return list(ACTIVE_VEC), ACTIVE_SLOT
 
     patch(srv, "get_weaviate_client", lambda *a, **k: FakeClient(queried))

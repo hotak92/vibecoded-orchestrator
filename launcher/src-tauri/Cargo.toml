@@ -18,7 +18,7 @@ members = ["vct-launcher-core", "vct-hub", "vct-updater"]
 # propagated from this same logical version by `scripts/bump-version.sh`
 # and verified by `scripts/pre-ship-check.sh`.
 [workspace.package]
-version = "0.2.100"
+version = "0.2.101"
 
 # v0.2.92 (WP-19): SINGLE source of truth for the `serde_json` feature set.
 #
@@ -247,7 +247,7 @@ dunce = "1"
 serial_test = "3"
 
 # Bug 31: libc statvfs for free-space probe (Unix only — Windows path
-# returns None, see free_bytes_at in commands/volumes.rs).
+# returns None, see free_bytes_at in commands/storage_ux.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

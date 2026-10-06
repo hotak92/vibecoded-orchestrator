@@ -207,6 +207,12 @@ pub struct RescanReport {
     pub hooks_inserted: usize,
     pub mcp_servers_inserted: usize,
     pub kg_access_rows_inserted: usize,
+    /// v0.2.101 (L3 review N-6): `bundled` rows the populate-time prune
+    /// deleted because their files are gone from both locations — retired
+    /// agents/skills, removed pack members. Surfaced so users see WHY rows
+    /// vanish after a catalogue retirement, not just that they did.
+    pub agents_pruned: usize,
+    pub skills_pruned: usize,
     pub warnings: Vec<String>,
 }
 
@@ -259,6 +265,8 @@ pub async fn rescan_project_from_filesystem(
         hooks_inserted: report.hooks_inserted,
         mcp_servers_inserted: report.mcp_servers_inserted,
         kg_access_rows_inserted: report.kg_access_rows_inserted,
+        agents_pruned: report.agents_pruned,
+        skills_pruned: report.skills_pruned,
         warnings: report.warnings,
     })
 }
@@ -540,8 +548,11 @@ pub async fn delete_project_permission(perm_id: i64, db: State<'_, Db>) -> Resul
 //     compatible: every project pre-0.2.x has zero rows and sees every
 //     server, same as before.
 //   * Row with `config.enabled = false` → disabled for this project. The
-//     env-writer emits the server_id into `.claude/settings.json`'s
-//     `disabledMcpjsonServers` array so Claude Code skips it.
+//     command mirrors the project's full disabled set into
+//     `~/.claude.json` `projects[<path>].disabledMcpServers` — the CHANNEL
+//     Claude Code honours for user-scope servers. (NOT the settings-file
+//     `disabledMcpjsonServers` key, which governs only servers defined in
+//     the project's own `.mcp.json` and is ignored in an untrusted folder.)
 //   * Row with `config.enabled = true`  → explicitly enabled (rare; the
 //     enabled command path DELETES instead of writing this state, so the
 //     row falls back to the default. Kept legible for future "explicit
@@ -621,9 +632,10 @@ pub async fn list_project_mcp_permissions(
 /// * `enabled = true`  → DELETE any explicit row so the (project, server)
 ///   pair falls back to the default-enabled state. No-op when there was
 ///   no row to begin with.
-/// * `enabled = false` → UPSERT a row with `config.enabled = false`. The
-///   env-writer reads this row's existence into the
-///   `.claude/settings.json` `disabledMcpjsonServers` array.
+/// * `enabled = false` → UPSERT a row with `config.enabled = false`. Either
+///   way, the project's full disabled set is mirrored into `~/.claude.json`
+///   `projects[<path>].disabledMcpServers` (see
+///   `set_project_mcp_permission_with_claude_json`).
 ///
 /// The DELETE-on-enable shape (rather than UPSERT-with-enabled=true)
 /// keeps the table small AND lets a future global-default flip from
@@ -635,19 +647,62 @@ pub async fn set_project_mcp_permission(
     enabled: bool,
     db: State<'_, Db>,
 ) -> Result<(), String> {
+    set_project_mcp_permission_with_claude_json(
+        &db,
+        &project_id,
+        &server_id,
+        enabled,
+        &crate::mcp_registration::user_claude_json(),
+    )
+}
+
+/// The COMPLETE set of MCP server ids the project has explicitly disabled
+/// (a `project_permissions` row with `config.enabled = false`). Recomputed
+/// on every toggle so the `~/.claude.json` opt-out list is always the exact
+/// desired state — a re-enable cannot leave a stale name behind.
+fn disabled_mcp_names(db: &Db, project_id: &str) -> Result<Vec<String>, String> {
+    Ok(db
+        .list_project_permissions(project_id)?
+        .into_iter()
+        .filter(|r| r.kind == "mcp_server" && r.subject == MCP_PERMISSION_SUBJECT)
+        .filter(|r| {
+            !r.config
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+        })
+        .map(|r| r.value)
+        .collect())
+}
+
+/// Testable core of [`set_project_mcp_permission`]: flips the launcher-DB row,
+/// then mirrors the project's full opt-out list into `~/.claude.json`
+/// (`projects[<path>].disabledMcpServers`) — the channel Claude Code actually
+/// honours for user-scope MCP servers. Without the mirror the toggle only
+/// moved a launcher-DB row that Claude Code never reads (the pre-v0.2.101
+/// false promise).
+///
+/// `claude_json` is a parameter so the DB-only tests can point at a temp file.
+fn set_project_mcp_permission_with_claude_json(
+    db: &Db,
+    project_id: &str,
+    server_id: &str,
+    enabled: bool,
+    claude_json: &Path,
+) -> Result<(), String> {
     if server_id.is_empty() {
         return Err("server_id must not be empty".to_string());
     }
     if enabled {
         db.delete_project_permission_by_key(
-            &project_id,
+            project_id,
             MCP_PERMISSION_SUBJECT,
             "mcp_server",
-            &server_id,
+            server_id,
         )?;
         db.audit(
             "project_mcp_permission_enable",
-            Some(&project_id),
+            Some(project_id),
             None,
             &serde_json::json!({ "server_id": server_id }),
         )?;
@@ -655,17 +710,30 @@ pub async fn set_project_mcp_permission(
         // Upsert a disabled row. `add_project_permission` is upsert by
         // (project_id, subject, kind, value).
         db.add_project_permission(
-            &project_id,
+            project_id,
             MCP_PERMISSION_SUBJECT,
             "mcp_server",
-            &server_id,
+            server_id,
             &serde_json::json!({ "enabled": false }),
         )?;
         db.audit(
             "project_mcp_permission_disable",
-            Some(&project_id),
+            Some(project_id),
             None,
             &serde_json::json!({ "server_id": server_id }),
+        )?;
+    }
+
+    // Mirror the resolved opt-out list into ~/.claude.json. A project that
+    // isn't registered yet (no `projects` row) has no folder to key the map
+    // on — skip the mirror (the DB row still drives the GUI's default-off
+    // display, and the next toggle after registration writes it).
+    if let Some(project) = db.get_project(project_id)? {
+        let disabled = disabled_mcp_names(db, project_id)?;
+        crate::mcp_registration::set_project_disabled_mcps(
+            claude_json,
+            Path::new(&project.folder_path),
+            &disabled,
         )?;
     }
     Ok(())
@@ -1149,7 +1217,9 @@ fn default_true() -> bool {
 }
 
 // v0.2.72 R2 (F5 residual) — set/delete_project_codegraph_binding now DO
-// re-project env. The pre-R2 audit note here documented a deliberate
+// re-project env (the delete command itself was retired in v0.2.101 Q4;
+// the projection contract below is what any future unbind surface must
+// keep). The pre-R2 audit note here documented a deliberate
 // no-op: `config_projection.py` derived CODE_GRAPH_PROJECT from the
 // sanitized project NAME only, so a refresh after a prefix change would
 // have rewritten `.claude/settings.json` byte-identically (inert —
@@ -1231,52 +1301,15 @@ pub async fn set_project_codegraph_binding(
     .await?
 }
 
-/// Free-function core of `delete_project_codegraph_binding` — DB delete
-/// + audit + R2 env re-projection (an unbind flips the projected
-/// CODE_GRAPH_PROJECT back to the name-derived prefix, so the MCP must
-/// be reloaded the same way a rebind is). Returns the refresh result so
-/// tests can observe that the projection ran.
-pub fn delete_project_codegraph_binding_with_db(
-    db: &Db,
-    project_id: &str,
-) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
-    db.delete_project_codegraph_binding(project_id)?;
-    db.audit(
-        "project_codegraph_binding_delete",
-        Some(project_id),
-        None,
-        &serde_json::json!({}),
-    )?;
-    Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
-}
-
-/// Remove a project's codegraph binding. Used by the launcher GUI when
-/// the user wants to unbind a project from its codegraph index (e.g.
-/// stop maintaining a code graph for a finished sub-project, or rebind
-/// to a different collection prefix). Does NOT delete the underlying
-/// Weaviate collection — that stays around so the user can re-bind
-/// without losing parsed entities.
-///
-/// Codegraph binding is single-keyed on project_id (no role concept,
-/// unlike KG which has primary/shared/archive), so this command takes
-/// only a project_id.
-///
-/// Idempotent: removing a non-existent project_id is a no-op.
-///
-/// F3 (v0.2.72): the R2 post-projection shells out to Python — run the
-/// sync core on the blocking pool.
-#[command]
-pub async fn delete_project_codegraph_binding(
-    project_id: String,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    crate::commands::blocking::run_with_db_on_blocking_pool(
-        app,
-        "delete_project_codegraph_binding",
-        move |db| delete_project_codegraph_binding_with_db(db, &project_id).map(|_| ()),
-    )
-    .await?
-}
+// v0.2.101 (Q4 retirement): the `delete_project_codegraph_binding` Tauri
+// command and its `_with_db` core were removed — the command never had a
+// frontend caller, and code-graph binding is single-keyed, so the
+// KgCodegraphTab `enabled` checkbox already stops use of a binding without
+// reverting to the derived default prefix. The DB method
+// (`Db::delete_project_codegraph_binding`) stays: it is the row-level
+// primitive the settings surface can build on if an explicit "reset to
+// default prefix" is ever wanted, and its own behaviour stays pinned by the
+// tests in `vct-launcher-core/src/db/project_state.rs`.
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 //
@@ -1794,10 +1827,12 @@ mod tests {
         assert_eq!(stored.collection_prefix, "Custom_Prefix");
     }
 
-    /// `delete_project_codegraph_binding_with_db` removes the row AND
-    /// re-projects. Proof of the refresh: the returned result carries the
-    /// access list only the refresh path (populate) computes — seeded
-    /// here so the value is deterministic.
+    /// v0.2.101 (Q4 retirement): the `delete_project_codegraph_binding`
+    /// Tauri command is gone; this test now pins the pieces any future
+    /// "reset to default prefix" surface would compose — the DB delete
+    /// removes the row, and the shared soft re-projection still runs and
+    /// computes the access list only the refresh path (populate) computes.
+    /// Seeded here so the value is deterministic.
     #[test]
     fn delete_codegraph_binding_removes_row_and_reprojects() {
         let db = make_db();
@@ -1807,8 +1842,10 @@ mod tests {
         db.kg_set_access("p-r2-unbind", "PeerProj_KnowledgeGraph", "read")
             .unwrap();
 
-        let result = delete_project_codegraph_binding_with_db(&db, "p-r2-unbind")
+        db.delete_project_codegraph_binding("p-r2-unbind")
             .expect("unbind must succeed");
+        let result =
+            crate::commands::projects_v2::reproject_env_soft(&db, "p-r2-unbind");
 
         assert!(
             db.get_project_codegraph_binding("p-r2-unbind")
@@ -2061,6 +2098,57 @@ mod tests {
         assert!(!perms[0].explicit, "row must be gone, not just flipped");
     }
 
+    /// v0.2.101: the per-project toggle must reach Claude Code. It writes the
+    /// project's FULL disabled set into
+    /// `~/.claude.json projects[<path>].disabledMcpServers` — the channel
+    /// Claude Code honours for user-scope servers. Red-proof: make the mirror
+    /// write `mcpServers` instead of `projects[…]` → the assertions fail.
+    #[test]
+    fn set_project_mcp_permission_mirrors_disabled_mcp_servers() {
+        let db = make_db();
+        let project_dir = scratch_project_dir();
+        db.insert_project(
+            "pm1",
+            "Mirror",
+            project_dir.to_string_lossy().as_ref(),
+            ProjectHost::Base,
+            &db.generate_unique_slug("Mirror").unwrap(),
+        )
+        .unwrap();
+        let tmp = std::env::temp_dir().join(format!("vct-mirror-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let claude_json = tmp.join(".claude.json");
+        let key = crate::mcp_registration::project_key_for_claude_json(&project_dir);
+
+        // Disable one server.
+        set_project_mcp_permission_with_claude_json(&db, "pm1", "playwright", false, &claude_json)
+            .unwrap();
+        let j1: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(
+            j1["projects"][&key]["disabledMcpServers"],
+            serde_json::json!(["playwright"]),
+            "disable must mirror the name into projects[<path>].disabledMcpServers: {j1}",
+        );
+
+        // Disable a second, then re-enable the first — the list is the exact
+        // desired set, so the re-enabled name is gone.
+        set_project_mcp_permission_with_claude_json(&db, "pm1", "weaviate-kg", false, &claude_json)
+            .unwrap();
+        set_project_mcp_permission_with_claude_json(&db, "pm1", "playwright", true, &claude_json)
+            .unwrap();
+        let j2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(
+            j2["projects"][&key]["disabledMcpServers"],
+            serde_json::json!(["weaviate-kg"]),
+            "re-enable must drop the name from the mirrored set: {j2}",
+        );
+
+        std::fs::remove_dir_all(&project_dir).ok();
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// Per-project isolation: disabling a server for project A does NOT
     /// affect project B's default state. Pin: the permission rows are
     /// scoped on `project_id`, not on the server_id alone.
@@ -2145,6 +2233,8 @@ mod tests {
             hooks_inserted: report.hooks_inserted,
             mcp_servers_inserted: report.mcp_servers_inserted,
             kg_access_rows_inserted: report.kg_access_rows_inserted,
+            agents_pruned: report.agents_pruned,
+            skills_pruned: report.skills_pruned,
             warnings: report.warnings,
         })
     }

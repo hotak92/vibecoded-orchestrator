@@ -31,6 +31,8 @@ top-level configuration code at import time).
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -179,8 +181,14 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
     KG_BASE_DIR — but content_hash comparison is by file content, so we can
     detect drift purely by hash comparison regardless of the stored path format
     as long as we match the key consistently).
+
+    ARCHIVED nodes are skipped (v0.2.101 item 3): the sync never stores a
+    hash for one, so leaving them in made `content_hash_diff` re-list every
+    archived node as changed on EVERY update. The predicate is the shared
+    `vco_lib.kg_node_status` home — the same rule the sync skips by.
     """
     from vco_lib.knowledge_residue import content_signature_excluding_updated
+    from vco_lib.kg_node_status import is_archived_content, is_archived_path
 
     def _sig(text: str) -> str:
         """Delegate to the vco_lib home of the storage-layer signature.
@@ -198,8 +206,13 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
     if not knowledge_root.exists():
         return result
     for md_file in knowledge_root.rglob("*.md"):
+        # Path leg first: an archived directory is skipped without a read.
+        if is_archived_path(md_file)[0]:
+            continue
         try:
             content = md_file.read_text(encoding="utf-8", errors="replace")
+            if is_archived_content(md_file, content)[0]:
+                continue
             result[str(md_file)] = _sig(content)
         except OSError:
             # Unreadable file — include with empty hash so the diff logic
@@ -208,12 +221,57 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
     return result
 
 
-def content_hash_diff(
+def archived_stored_removals(
     on_disk: "Mapping[str, str]",
     stored_hashes: "Mapping[str, str]",
     project_root: Path,
 ) -> "list[str]":
-    """The ``knowledge/`` files whose on-disk hash differs from Weaviate's.
+    """Stored rows whose file became ARCHIVED since its last sync (v0.2.101 S2).
+
+    Skipping archived files in the walk (item 3) removed them from the
+    changelist entirely, and ``_prune_stale_kg_rows`` cannot help — the file
+    still EXISTS on disk, it is only marked archived. Before item 3 the (buggy)
+    always-changed listing routed such a file into the per-file sync, where
+    ``sync_node``'s archived leg skipped the node AND deleted its prior row.
+
+    This restores exactly that routing, cheaply: the only files worth checking
+    are STORED paths the walk did not keep — a stored path present in *on_disk*
+    was walked and is therefore not archived, so it needs no second read, and a
+    stored path whose file is gone is the prune's business, not this one's.
+    The caller appends the result to the changelist; the sync's own archived
+    leg does the deleting (one home for "archived ⇒ no row").
+
+    PURE apart from the reads of the handful of files it must judge.
+    """
+    from vco_lib.kg_node_status import is_archived_content
+
+    kept = set(on_disk)
+    out: "list[str]" = []
+    for stored_path in stored_hashes:
+        candidate = Path(stored_path)
+        if str(candidate) in kept or stored_path in kept:
+            continue
+        if not candidate.is_absolute():
+            candidate = Path(project_root) / candidate
+        if candidate.suffix != ".md" or not candidate.is_file():
+            continue
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if is_archived_content(candidate, content)[0]:
+            out.append(str(candidate))
+    return sorted(out)
+
+
+def content_hash_diff(
+    on_disk: "Mapping[str, str]",
+    stored_hashes: "Mapping[str, str]",
+    project_root: Path,
+    *,
+    knowledge_root: "Optional[Path]" = None,
+) -> "list[str]":
+    """The ``knowledge/`` files the per-file sync must visit.
 
     PURE. v0.2.95 moved this loop out of ``install.py``'s leg (c) so it sits
     with the two helpers that produce its inputs —
@@ -223,6 +281,11 @@ def content_hash_diff(
     first, then by the project-relative form (``sync_knowledge_graph.py``
     writes ``file_path`` either way depending on ``KG_BASE_DIR``), and treat a
     missing or empty stored hash as changed.
+
+    *knowledge_root* is leg (c)'s input, not a fact about the comparison: when
+    given, newly-ARCHIVED files that still hold a stored row are appended (see
+    :func:`archived_stored_removals`) so the row is deleted. The comparison
+    itself stays exactly as it was.
     """
     diff_files: "list[str]" = []
     for file_path_str, disk_hash in on_disk.items():
@@ -235,6 +298,14 @@ def content_hash_diff(
                 pass
         if disk_hash != stored_hash:
             diff_files.append(file_path_str)
+    if knowledge_root is not None:
+        # v0.2.101 S2: archived-but-still-stored rows are REMOVALS. They cannot
+        # be in `on_disk` (the walk skips archived files) and the prune cannot
+        # see them (their file exists), so without this the row stays live.
+        diff_files.extend(
+            p for p in archived_stored_removals(on_disk, stored_hashes, project_root)
+            if p not in diff_files
+        )
     return diff_files
 
 
@@ -328,6 +399,13 @@ def _prune_stale_kg_rows(
     ``sync_knowledge_graph.py --all``.  The sync upserts every on-disk file
     but never deletes rows for files that were removed from disk — this step
     closes that gap.
+
+    v0.2.101 item 4: the seed may now be ENQUEUED to the detached driver and
+    still running. That does not weaken this step: it deletes only rows whose
+    stored ``file_path`` fails to resolve to an on-disk markdown file (all
+    four strategies in :func:`_path_resolves_on_disk`), which is independent
+    of embedding state — a pending seed can only ever have written rows for
+    files that DO exist.
 
     Args:
         collection_name: The Weaviate collection to prune (``KG_COLLECTION``).
@@ -1850,6 +1928,239 @@ def detect_legacy_shared_kg_class(deferral_report, *, log_event=None) -> None:
 SEED_OWED_WORK_CONDITION_ID = "kg_sync_failures_pending"
 
 
+#: v0.2.101 item 4: the SHARED-collection seed's owed-work condition. A
+#: distinct id from :data:`SEED_OWED_WORK_CONDITION_ID` because the work and
+#: the retry handler are distinct (a different target class), and the paired
+#: clear lives in the run that targets that class
+#: (``sync_knowledge_graph.py::_clear_shared_seed_deferral``).
+SHARED_SEED_OWED_CONDITION_ID = "kg_sync_shared_pending"
+
+#: The ONLY environment keys a detached seed driver inherits from the caller
+#: (v0.2.101 S1). ``SEED_CTX_*`` is the context the handler stamps after a
+#: proven seed; ``ACTIVE_EMBEDDING``/``EMBEDDING_MODEL`` are the embedding
+#: pair the child must embed with. Everything else — notably
+#: ``KG_COLLECTION``, which the shared seed legitimately sets for its own
+#: child — stays with the caller's process: the driver dispatches EVERY owed
+#: row, so a leaked target would silently misroute a per-project seed.
+_DRIVER_ENV_ALLOW: frozenset = frozenset({
+    "ACTIVE_EMBEDDING",
+    "EMBEDDING_MODEL",
+})
+
+
+@dataclass
+class SeedStepOutcome:
+    """What :func:`kg_seed_step` did (v0.2.101 item 4)."""
+
+    #: the seed went to the detached driver — the caller tells the user where
+    #: its log is (:attr:`log_glob`) and must NOT wait for anything
+    detached: bool = False
+    #: a FOREGROUND child executed, and whether it exited 0. Drives install.py's
+    #: context-triple persist (SEG-1) and the conservative KG prune.
+    ran: bool = False
+    exit_zero: bool = False
+    #: the detached driver's log glob, when one was spawned
+    log_glob: str = ""
+    #: non-fatal seed errors, appended to install.py's own soft-fail list
+    errors: list[str] = field(default_factory=list)
+
+
+def kg_seed_step(
+    *,
+    folder: Path,
+    venv_py: Path,
+    sync_kg: Path,
+    cmd_args: Sequence[str],
+    log_stem: str,
+    seed_env: MutableMapping[str, str],
+    enqueue: bool,
+    context: Sequence[str] = (),
+    shared_target: str = "",
+    label: str = "KG seed",
+    error_prefix: str = "",
+    hint: str = "",
+    make_deferral: Optional[Callable] = None,
+    run_child_logged: Optional[Callable] = None,
+) -> SeedStepOutcome:
+    """Run one KG seed now, or ENQUEUE it to the detached retry driver.
+
+    v0.2.101 item 4. install.py used to await BOTH whole-tree seeds
+    (``sync_knowledge_graph.py --all``) — the 10+ minute block on a CPU. This
+    owns the decision, the owed row and the foreground fallback so install.py
+    stays under its line ratchet (``tests/test_install_main_ratchet.py``).
+
+    * ``enqueue=True`` — emit the owed condition and hand the seed to
+      :func:`vco_lib.deferral_retry.spawn_detached`. The driver runs the
+      shipped ``--all`` (content-hash gated) and the condition's own paired
+      clear retires the row only on a fully successful run.
+    * ``enqueue=False`` — the small per-file DIFF, run in the foreground. The
+      driver can only run ``--all``, so re-walking a whole tree for a two-file
+      change would be slower than the diff it replaced.
+    * *shared_target* switches to the SHARED-collection seed: a different owed
+      condition (:data:`SHARED_SEED_OWED_CONDITION_ID`) and a different retry
+      handler, because it is a different target class.
+    * *context* is the install-resolved ``(active_embedding, kg_collection,
+      shared_kg_collection)`` triple the per-project driver stamps after a
+      proven seed.
+
+    Two orderings matter and are both enforced here (v0.2.101 B1/S1):
+
+    * the owed row is written to the ON-DISK ledger BEFORE the spawn (see
+      :func:`_write_enqueued_entry`) — the driver reads that ledger once and
+      exits, so a row that waited for install.py's finalize was usually
+      invisible to the driver it was written for;
+    * the DRIVER gets a WHITELISTED environment (the ``SEED_CTX_*`` context
+      plus the embedding pair), never the whole ``seed_env``. The shared seed's
+      ``seed_env`` carries ``KG_COLLECTION=<shared>``, and the driver dispatches
+      EVERY owed row — handing it that var made a per-project owed seed target
+      the shared collection (`retry_kg_seed` pins only the project root; its
+      child inherits the driver's env). The caller's mapping is never mutated
+      either, so the FOREGROUND fallback sees exactly what the caller passed.
+
+    A driver that cannot be launched falls back to the foreground run — a
+    failed spawn must NEVER leave the seed silently unwritten. The fallback is
+    the v0.2.96 one-drain ``run_child_logged``, so that path keeps the
+    pipe-deadlock guarantee.
+    """
+    import subprocess  # noqa: PLC0415
+
+    from vco_lib import deferral_retry as _dr  # noqa: PLC0415
+
+    out = SeedStepOutcome()
+    shared = bool(shared_target)
+    child_env = dict(seed_env)  # N4: never mutate the caller's mapping
+    if shared:
+        # The marker the CHILD reads to refuse recording the per-project context
+        # triple (kg_context_triple.SHARED_SEED_ENV): a shared-targeted pass is
+        # not a statement about the project's context, and the collection NAME
+        # cannot tell the two apart on the orchestrator root (kg == shared).
+        from vco_lib.kg_context_triple import SHARED_SEED_ENV  # noqa: PLC0415
+
+        child_env[SHARED_SEED_ENV] = "1"
+    if enqueue:
+        # S1: whitelist what travels to the DRIVER — `seed_env` may legitimately
+        # carry KG_COLLECTION (the shared seed's target), and the driver's child
+        # would inherit it for a PER-PROJECT owed row too.
+        driver_env = {k: v for k, v in child_env.items() if k in _DRIVER_ENV_ALLOW}
+        if shared:
+            driver_env[_dr.SEED_CTX_ENV_SHARED_KG_COLLECTION] = shared_target
+        elif len(context) == 3:
+            driver_env[_dr.SEED_CTX_ENV_ACTIVE_EMBEDDING] = context[0]
+            driver_env[_dr.SEED_CTX_ENV_KG_COLLECTION] = context[1]
+            driver_env[_dr.SEED_CTX_ENV_SHARED_KG_COLLECTION] = context[2]
+        out.log_glob = _dr.detached_log_glob() or ""
+        if make_deferral is not None:
+            emit = (emit_shared_seed_enqueued_deferral if shared
+                    else emit_seed_enqueued_deferral)
+            emit(folder, log_path=out.log_glob or None,
+                 collection=shared_target or (context[1] if len(context) == 3 else "")
+                 or "(unresolved)",
+                 make_deferral=make_deferral)
+        out.detached = _dr.spawn_detached(folder, extra_env=driver_env)
+        if out.detached:
+            print(f"  \u21b3 {label} continues in the background.")
+            if out.log_glob:
+                print(f"    background seed log: {out.log_glob}")
+            return out
+        print("  ! background seed driver could not be started — running the "
+              "seed now (blocking) ...", flush=True)
+    prefix = error_prefix or log_stem
+    try:
+        assert run_child_logged is not None
+        run_child_logged([str(venv_py), str(sync_kg), *[str(a) for a in cmd_args]],
+                         log_stem=log_stem, check=True, cwd=str(folder), env=child_env)
+        out.ran = True
+        out.exit_zero = True
+    except subprocess.CalledProcessError as exc:
+        out.ran = True
+        out.errors.append(f"{prefix} exit {exc.returncode}")
+        print(f"    ! {prefix} exited {exc.returncode} — re-run later"
+              + (f" with `{hint}`" if hint else ""))
+    except FileNotFoundError as exc:
+        out.errors.append(f"{prefix} FileNotFound: {exc}")
+        print(f"    ! {prefix} failed: {exc}")
+    return out
+
+
+def _write_enqueued_entry(folder: Path, condition_id: str, entry) -> bool:
+    """Persist an enqueued-seed row to the ON-DISK ledger, NOW (v0.2.101 B1).
+
+    The in-memory ``DeferralReport`` only reaches disk at install.py's
+    end-of-``main`` finalize, while the spawned driver reads the ledger from
+    disk ONCE and exits — so a row that waited for finalize was usually
+    invisible to the driver it was written for (the seed did not start until
+    the next session, and the "continues in the background" message was
+    false). ``deferral_emit.emit`` is the immediate, LOCKED writer the rest of
+    VCO already uses for out-of-band rows, so the driver sees the row on its
+    first read.
+
+    Disk-only is also what makes the row un-resurrectable: this run's finalize
+    MERGES foreign entries from disk (both ids are owned by the sync script,
+    not install.py), so a row the seed already cleared is not there to bring
+    back. Soft-fail: ledger I/O never changes a seed's outcome.
+    """
+    try:
+        from vco_lib.deferral_emit import emit  # noqa: PLC0415
+
+        return emit(Path(folder), entry)
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"  ! (deferral emit failed: {inner})", flush=True)
+        return False
+
+
+def emit_shared_seed_enqueued_deferral(
+    folder: Path,
+    *,
+    log_path: "str | None",
+    collection: str,
+    make_deferral: Callable,
+) -> bool:
+    """Record that the install ENQUEUED the SHARED-collection seed (item 4).
+
+    The sibling of :func:`emit_seed_enqueued_deferral` for the shared seed,
+    which install.py also used to await (``sync_knowledge_graph.py --all`` with
+    ``KG_COLLECTION=<shared>``). The owed row is what the detached driver picks
+    up; the script's own narrow clear retires it once a run that targeted the
+    shared class finishes with zero failures.
+
+    Soft-fail by contract: ledger bookkeeping must never change the outcome of
+    a seed. Written to disk immediately, exactly like its sibling.
+    """
+    log_hint = f"\n                tail -f {log_path}" if log_path else ""
+    try:
+        return _write_enqueued_entry(folder, SHARED_SEED_OWED_CONDITION_ID, make_deferral(
+            SHARED_SEED_OWED_CONDITION_ID,
+            title=(
+                f"Shared-KG seed ({collection}) continues in the background — "
+                "retry pending until it succeeds"
+            ),
+            detected=f"""
+                This install enqueued the seed of knowledge/ into the SHARED
+                collection `{collection}` instead of waiting for it, so the
+                embed runs in VCO's detached retry driver. Until that run
+                finishes with zero per-node failures, this project's nodes may
+                be missing from the shared knowledge graph other projects read.
+            """,
+            why_deferred="""
+                Blocking the install on this second seed made every update wait
+                on two embeds. It is idempotent and content-hash gated, so
+                running it in the background costs nothing user-visible: the
+                retry dispatcher re-runs `sync_knowledge_graph.py --all` against
+                the shared class and the entry clears only at the end of a
+                FULLY successful shared-targeted run (the script's own paired
+                clear, not the exit code).
+            """,
+            command_to_apply=f"""
+                # Watch the background seed, or run it in the foreground:
+                KG_COLLECTION={collection} python templates/scripts/sync_knowledge_graph.py --all{log_hint}
+            """,
+            severity="info",
+        ))
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"  ! (deferral emit failed: {inner})", flush=True)
+        return False
+
+
 def emit_context_change_incomplete_deferral(
     deferral_report,
     reason: str,
@@ -1923,6 +2234,65 @@ def emit_context_change_incomplete_deferral(
         ))
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"  ! (deferral emit failed: {inner})", flush=True)
+
+
+def emit_seed_enqueued_deferral(
+    folder: Path,
+    *,
+    log_path: "str | None",
+    collection: str,
+    make_deferral: Callable,
+) -> bool:
+    """Record that the install ENQUEUED the KG seed to the background (item 4).
+
+    v0.2.101: install.py no longer blocks on the per-project seed — it emits
+    this entry and spawns the detached retry driver, so the embed continues
+    after the install returns. The condition id is the SAME
+    :data:`SEED_OWED_WORK_CONDITION_ID` the sync's own failure path uses (the
+    owed work and the retry are identical; a second id would be a second name
+    for one condition), so the running seed's own paired clear retires this
+    entry at the end of a fully successful ``--all`` — the dispatcher's
+    ledger-re-read is what confirms it, exactly as for a retry.
+
+    Soft-fail by contract, like its sibling above: a ledger that cannot be
+    written must never change the outcome of a seed. *log_path* (the detached
+    driver's log) is named in ``command_to_apply`` so the user can watch it.
+    Written to disk immediately (see :func:`_write_enqueued_entry`) so the
+    driver the caller is about to spawn can actually see it.
+    """
+    log_hint = f"\n                tail -f {log_path}" if log_path else ""
+    try:
+        return _write_enqueued_entry(folder, SEED_OWED_WORK_CONDITION_ID, make_deferral(
+            SEED_OWED_WORK_CONDITION_ID,
+            title=(
+                "KG seed continues in the background — retry pending until it "
+                "succeeds"
+            ),
+            detected=f"""
+                This install enqueued the knowledge/ (and docs/) seed instead of
+                waiting for it: the embed can take many minutes on a CPU, so it
+                now runs in VCO's detached retry driver, seeded for the
+                `{collection}` collection. Until that run finishes with zero
+                per-node failures, some nodes may be missing from Weaviate.
+            """,
+            why_deferred="""
+                Blocking the install on the embed made every `--update` wait on
+                the KG seed. The seed is idempotent and content-hash gated, so
+                running it in the background costs nothing user-visible: the
+                retry dispatcher re-runs `sync_knowledge_graph.py --all` and the
+                entry clears only at the end of a FULLY successful tree sync
+                (the sync's own paired clear, not the exit code — its no-backend
+                path exits 0 too).
+            """,
+            command_to_apply=f"""
+                # Watch the background seed, or run it in the foreground:
+                python templates/scripts/sync_knowledge_graph.py --all{log_hint}
+            """,
+            severity="info",
+        ))
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"  ! (deferral emit failed: {inner})", flush=True)
+        return False
 
 
 # ---------------------------------------------------------------------------

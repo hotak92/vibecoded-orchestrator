@@ -23,6 +23,15 @@ export interface EffectiveHook {
   source_module: string | null;
   timeout_ms: number | null;
   state: HookState;
+  /**
+   * The `if` filters of the rules this row covers (v0.2.101). EMPTY for an
+   * ordinary hook. An `if` group — several settings.json entries sharing one
+   * (event, matcher, command) and differing only by their `if` filter —
+   * renders as ONE row carrying every rule here: the toggle acts on the
+   * group as a unit (the writer parks and restores all of its entries
+   * together), so per-rule checkboxes would each toggle everything anyway.
+   */
+  if_rules: string[];
 }
 
 export interface EffectiveHooksView {
@@ -140,6 +149,36 @@ export function timeoutSeconds(hook: EffectiveHook): number | null {
   return Math.round(hook.timeout_ms / 1000);
 }
 
+// ─── `if` groups (v0.2.101) ────────────────────────────────────────────────
+//
+// Several settings.json entries can share one (event, matcher, command) and
+// differ only by their `if` filter — the shipped Bash PreToolUse injection
+// group carries ten. The backend collapses them into ONE row carrying every
+// rule; these helpers shape what the row shows. The toggle is the GROUP's:
+// disabling parks all rules together, enabling restores every one
+// byte-identically.
+
+/** The badge next to the command: `3 if-rules`, or '' for an ordinary hook. */
+export function ifRulesLabel(hook: EffectiveHook): string {
+  const n = hook.if_rules?.length ?? 0;
+  if (n === 0) return '';
+  return `${n} if-rule${n === 1 ? '' : 's'}`;
+}
+
+/**
+ * The badge's hover text: every rule, one per line. Says plainly that the
+ * toggle acts on the whole group — the one fact a user needs before
+ * clicking a checkbox that looks like it belongs to a single command.
+ */
+export function ifRulesTooltip(hook: EffectiveHook): string {
+  const rules = hook.if_rules ?? [];
+  return [
+    `This command is registered ${rules.length === 1 ? 'once' : `${rules.length} times`}, once per \`if\` filter:`,
+    ...rules.map((r) => `• ${r}`),
+    'The toggle applies to every rule at once; enabling restores them all exactly.',
+  ].join('\n');
+}
+
 /**
  * Parse the "Timeout (s)" field.
  *
@@ -210,4 +249,180 @@ export function newHookCommandPlaceholder(os: HintOs): string {
   return os === 'windows'
     ? 'powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PROJECT_DIR}/.claude/hooks/my-hook.ps1"'
     : 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/my-hook.sh"';
+}
+
+// ─── async PostToolUse sub-hook toggles (v0.2.101 review SF-2) ───────────
+//
+// The merged async dispatcher (post-tool-use-async) replaced eight
+// individually-toggleable PostToolUse registrations with ONE row — parking
+// that row would stop all six sub-hooks at once. The per-sub-hook switch is
+// kept: a stem listed in VCO_ASYNC_DISABLED_HOOKS (<project>/.claude/env —
+// the SAME per-project knob file, channel and write command
+// (set_claude_env_value) the lean-ctx toggle below uses; never a second
+// store) is skipped by both dispatcher siblings. A disable that predates
+// the merge is carried into the key by the bundle update
+// (vco_lib.hook_retirements.carry_parked_async_disables), so turning a
+// sub-hook off before v0.2.101 keeps it off after.
+
+/** The `.claude/env` key this section owns. */
+export const ASYNC_DISABLED_KEY = 'VCO_ASYNC_DISABLED_HOOKS';
+
+/** The routed sub-hooks. MUST MATCH the dispatcher ROUTE_TABLEs
+ * (templates/hooks/post-tool-use-async.{sh,ps1}) — the vitest suite
+ * DERIVES the set from the shipped table, so a routing row without a
+ * toggle here (or a toggle without a row) is red. */
+export const ASYNC_SUBHOOK_STEMS: readonly string[] = [
+  'post-edit-outcome',
+  'kg-summary-generator',
+  'post-bash-context-record',
+  'post-git-commit-kg-sync',
+  'post-file-delete',
+  'kg-update-nudge',
+];
+
+/** One line per row: what turning the sub-hook off stops. */
+export const ASYNC_SUBHOOK_DESCRIPTIONS: Record<string, string> = {
+  'post-edit-outcome': 'Edit/Write outcome telemetry for the RL retrieval pipeline',
+  'kg-summary-generator': 'KG node summary refresh after knowledge edits and node writes',
+  'post-bash-context-record': 'Bash outcome telemetry paired with the pre-bash injection',
+  'post-git-commit-kg-sync': 'Background KG review agent after a git commit',
+  'post-file-delete': 'Diagram delete cascade (SQLite + sidecar + Weaviate)',
+  'kg-update-nudge': 'Per-tool-call work-unit bookkeeping behind the KG-write nudge',
+};
+
+/** Parse the env value: split on ',', trim, drop empties, de-dupe, keep
+ * order. Mirrors what both dispatcher siblings accept. */
+export function parseAsyncDisabled(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of raw.split(',')) {
+    const s = part.trim();
+    if (s && !seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/** Whether one stem is currently switched off (exact stem match — a
+ * `post-file` entry must never disable `post-file-delete`). */
+export function isAsyncSubhookDisabled(
+  raw: string | null | undefined,
+  stem: string,
+): boolean {
+  return parseAsyncDisabled(raw).includes(stem);
+}
+
+/** The value to persist after a toggle (`disabled` = switch the stem OFF).
+ * `null` removes the key entirely — the last re-enable must not leave an
+ * empty `VCO_ASYNC_DISABLED_HOOKS=` behind; an absent key is the file's
+ * "nothing disabled" state. Unknown stems (a hand edit) are preserved. */
+export function asyncDisabledValueAfterToggle(
+  raw: string | null | undefined,
+  stem: string,
+  disabled: boolean,
+): string | null {
+  const current = parseAsyncDisabled(raw);
+  const next = disabled
+    ? current.includes(stem)
+      ? current
+      : [...current, stem]
+    : current.filter((s) => s !== stem);
+  return next.length > 0 ? next.join(',') : null;
+}
+
+/** Whether the tab should offer the sub-hook toggles at all: only when the
+ * dispatcher registration is actually among the project's listed hooks (a
+ * not-yet-updated project still has the eight direct registrations and
+ * their own rows). */
+export function dispatcherRowPresent(hooks: EffectiveHook[]): boolean {
+  return hooks.some(
+    (h) => h.event === 'PostToolUse' && h.command.includes('post-tool-use-async'),
+  );
+}
+
+/** The copy under the section. */
+export const ASYNC_SUBHOOK_HINT =
+  'These background PostToolUse hooks are routed by the single async ' +
+  'post-tool-use-async dispatcher (one registration — a tool call no longer ' +
+  'grows your session transcript per hook). Turning one off adds its stem to ' +
+  'VCO_ASYNC_DISABLED_HOOKS in <project>/.claude/env and the dispatcher skips ' +
+  'it on every tool call. A disable you set before v0.2.101 was carried into ' +
+  'this key by the bundle update.';
+
+/** Confirmation copy after a successful toggle write. */
+export function asyncSubhookToastText(stem: string, disabled: boolean): string {
+  return disabled
+    ? `${stem} is now skipped by the async dispatcher`
+    : `${stem} runs again on matching tool calls`;
+}
+
+// ─── lean-ctx per-project toggle (PR-6 v0.2.11; copy fixed + control wired
+// in v0.2.101 alongside the allow-list inversion) ─────────────────────────
+//
+// Three logical states map to two on-disk states for
+// `<project>/.claude/env::VCO_LEAN_CTX_DEFAULT`:
+//   * 'default' → key absent (the hook treats absence as "on")
+//   * 'on'      → key present, value 'on'
+//   * 'off'     → key present, value 'off'
+// The logic lives here (not in the .svelte) so the mapping and the copy the
+// user reads are unit-testable — the v0.2.101 GUI audit found the toggle's
+// state + handlers had shipped in HooksTab.svelte with NO markup ever
+// rendering them (a delivered-nowhere control); the description below must
+// match the allow-list rule the hooks actually enforce.
+
+/** The `VCO_LEAN_CTX_DEFAULT` key this toggle owns. */
+export const LEAN_CTX_KEY = 'VCO_LEAN_CTX_DEFAULT';
+
+/** The toggle's three logical states. */
+export type LeanCtxChoice = 'default' | 'on' | 'off';
+
+export const LEAN_CTX_OPTIONS: Array<{ value: LeanCtxChoice; label: string }> = [
+  { value: 'default', label: 'Default (on)' },
+  { value: 'on', label: 'Per-project: on' },
+  { value: 'off', label: 'Per-project: off' },
+];
+
+/**
+ * What the user reads under the toggle. MUST describe the v0.2.101
+ * allow-list rule (compress only known-noisy commands; everything else
+ * raw; every compression lossless via the tee pointer) — not the retired
+ * "compress everything except exemptions" rule.
+ */
+export const LEAN_CTX_HINT =
+  'When on, the PreToolUse hook compresses ONLY allow-listed noisy commands ' +
+  '(package installs, image pulls, downloads, test/build runs); loops, pipes, git, ' +
+  'unknown and credential-bearing commands run raw. Every compressed run saves its ' +
+  'full raw output under .claude/state/lean-ctx-tee/ and prints a pointer to it, so ' +
+  'nothing is lost. Needs the lean-ctx binary — without one the hook does nothing.';
+
+/**
+ * Map the on-disk env value to a toggle state. Both hook siblings read the
+ * key case-insensitively (the .sh via a POSIX `[oO][fF][fF]` case-glob, the
+ * .ps1 via ToLowerInvariant — SF-3, v0.2.101 review), so this mapping is
+ * case-insensitive too. Any value other than the two the hooks read
+ * (including a manual edit or a missing key) renders as 'default': the user
+ * keeps the on-disk override until they actively move the toggle, which
+ * then writes cleanly.
+ */
+export function leanCtxChoiceFromEnvValue(v: string | null | undefined): LeanCtxChoice {
+  if (v === null || v === undefined) return 'default';
+  const lower = v.toLowerCase();
+  if (lower === 'off') return 'off';
+  if (lower === 'on') return 'on';
+  return 'default';
+}
+
+/** The env value to persist for a chosen state ('default' removes the key). */
+export function leanCtxEnvValueForChoice(c: LeanCtxChoice): string | null {
+  return c === 'default' ? null : c;
+}
+
+/** Confirmation copy after a successful toggle write. */
+export function leanCtxToastText(c: LeanCtxChoice): string {
+  return c === 'default'
+    ? 'Reverted to default (allow-listed compression on)'
+    : `Per-project compression set to ${c}`;
 }

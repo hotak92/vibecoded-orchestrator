@@ -203,22 +203,33 @@ class PrefixedInstallMigrationTests(unittest.TestCase):
         Keyed by (event, group): the template deliberately registers some
         scripts under SEVERAL matchers (pre-diagram-path-validation.sh on
         ``Write|Edit`` AND on the diagram MCP tools; kg-update-nudge.sh on
-        several events) — same identity in DIFFERENT groups is by design,
-        twice in the SAME group is the defect."""
+        several events) — same identity in DIFFERENT groups is by design.
+
+        v0.2.101 §C1 (PLAN-V02101) added a second by-design repeat: an `if`
+        field is exactly ONE permission rule with no OR, so a surface that
+        needs several trigger shapes registers ONE HANDLER PER RULE — the
+        Bash pre-bash-context-inject group carries nine of them
+        (Bash(cat *) … Bash(git diff*)). A single command MAY therefore match
+        several rules (``cat x | grep y`` matches two) and spawn the hook
+        twice per call; that is the documented cost of the zero-spawn
+        prefilter, and the HOOK tolerates it (its dedupe/budget state is
+        idempotent). What is still a defect — and what this row pins — is the
+        same identity twice in one group with the SAME `if` rule (or with it
+        absent): those entries can never be distinguished and always
+        double-fire together."""
         for event, groups in self.merged["hooks"].items():
             for group in groups:
-                cmds = [
-                    h["command"] for h in group.get("hooks", [])
+                pairs = [
+                    (vco_hook_script_identity(h["command"]), h.get("if"))
+                    for h in group.get("hooks", [])
                     if isinstance(h, dict) and isinstance(h.get("command"), str)
                 ]
-                idents = [
-                    i for i in (vco_hook_script_identity(c) for c in cmds)
-                    if i is not None
-                ]
+                pairs = [pr for pr in pairs if pr[0] is not None]
                 self.assertEqual(
-                    len(idents), len(set(idents)),
+                    len(pairs), len(set(pairs)),
                     f"{event}/{group.get('matcher')!r}: a hook identity is "
-                    f"registered more than once in the same group: {idents!r}",
+                    f"registered more than once for the SAME if-rule in one "
+                    f"group: {pairs!r}",
                 )
 
     def test_user_hook_and_user_keys_are_untouched(self) -> None:

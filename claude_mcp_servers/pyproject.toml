@@ -17,7 +17,7 @@
 # top-level module names below are what make the gateway runnable from a
 # service unit, whose working directory is not the checkout.
 #
-# NOT packaged here, deliberately: `search_mcp`, `rl_client`, `_lib`,
+# NOT packaged here, deliberately: `rl_client`, `_lib`,
 # `wrappers`, `code_embedding_service`. Every one of them is reached by an
 # explicit `sys.path` insert in the script that launches it (the MCP servers
 # are spawned by absolute path, not as installed modules), so they are already

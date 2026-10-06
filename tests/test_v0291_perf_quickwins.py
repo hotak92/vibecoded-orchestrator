@@ -37,6 +37,7 @@ from tests.common.child_env import child_env  # noqa: E402
 from tests.common.pre_edit_hook_sandbox import (  # noqa: E402
     build_sandbox,
     install_dual_driver,
+    install_router,
     invoke_hook,
     write_stub_producers,
 )
@@ -288,146 +289,55 @@ def test_dual_driver_legs_run_concurrently(tmp_path: Path):
     )
 
 
-def test_shell_wrapper_keeps_the_per_leg_cache_keys_unchanged():
-    """Cross-surface cache sharing depends on the merged path writing the SAME
-    keys the single-leg wrappers use ("kg"+query+limit /
-    "cg"+query+projectArg+limit+exclude+anchor). A different key shape here
-    would silently stop pre-bash / pre-tool-use from hitting these blobs."""
-    body = (LIB / "query-cache.sh").read_text(encoding="utf-8")
-    dual = body.split("vco_dual_search_cached() {", 1)[1]
-    assert 'vco_query_cache_key "kg" "$query" "$kg_limit"' in dual
-    assert (
-        'vco_query_cache_key "cg" "$query" "$cg_project_arg" "$cg_limit" "$cg_exclude" "$cg_anchor"'
-        in dual
-    )
-    # …and the single-leg wrappers still use the same shapes.
-    assert 'vco_query_cache_key "kg" "$query" "$limit"' in body
-    cg_body = (LIB / "codegraph-query.sh").read_text(encoding="utf-8")
-    assert (
-        'vco_query_cache_key "cg" "$query" "$project_arg" "$limit" "$exclude_path" "$anchor"'
-        in cg_body
-    )
+# v0.2.101 wave-2 review SF-2: the three shell-wrapper text pins that lived
+# here (per-leg cache keys / output caps / marker agreement inside
+# vco_dual_search_cached) were RETIRED with that function — it lost its last
+# caller (pre-edit) in the router rework. The marker contract survives where
+# the mechanism survives: hook_dual_search.py's driver-level tests above and
+# the router's run_legs import (tests/test_v02101_inject_gates.py).
 
 
-def test_shell_wrapper_keeps_the_per_leg_output_caps():
-    """head -40 (KG) / head -20 (CG) — the caps the two CLIs' callers applied."""
-    dual = (LIB / "query-cache.sh").read_text(encoding="utf-8").split(
-        "vco_dual_search_cached() {", 1
-    )[1]
-    assert "head -40" in dual and "head -20" in dual
+def test_p2_superseded_hook_no_longer_calls_the_dual_wrapper():
+    """v0.2.101 Wave 2 RETIREMENT pin (replaces the four hook-level P2
+    end-to-end tests): the pre-edit hook is a thin ROUTER wrapper — the
+    merged single-interpreter path it used to exercise via
+    `vco_dual_search_cached` is now the router's own architecture (it
+    imports `hook_dual_search.run_legs` and runs both producers in-process).
 
-
-def test_markers_agree_across_driver_and_both_shell_wrappers():
-    """A marker rename on one side would make that OS silently fall back to the
-    legacy path forever (or, worse, mis-split the two blocks)."""
-    py = DRIVER.read_text(encoding="utf-8")
-    assert 'KG_MARKER = "<<<VCO-DUAL:KG>>>"' in py
-    assert 'CG_MARKER = "<<<VCO-DUAL:CG>>>"' in py
-    sh = (LIB / "query-cache.sh").read_text(encoding="utf-8")
-    ps1 = (LIB / "query-cache.ps1").read_text(encoding="utf-8")
-    for marker in ("<<<VCO-DUAL:KG>>>", "<<<VCO-DUAL:CG>>>"):
-        assert marker in sh, f"{marker} missing from query-cache.sh"
-        assert marker in ps1, f"{marker} missing from query-cache.ps1"
-
-
-@_needs_bash
-def test_p2_hook_uses_the_merged_path_when_the_driver_is_present(tmp_path: Path):
-    """END-TO-END: with `hook_dual_search.py` installed, the pre-edit hook must
-    emit BOTH blocks through the merged path — and must NOT spawn the legacy
-    `code-graph-query` CLI (proved by a marker file the CLI stub touches).
-
-    RED-PROOF: on the pre-P2 tree there is no `vco_dual_search_cached`, so the
-    CLI marker is always created and this fails.
+    Superseded by:
+      * tests/test_v02101_router_surfaces.py — one hook run, BOTH stub
+        producers record through the single router process (bash/edit/write);
+      * tests/test_pre_edit_hook_dedup_regression.py — the wrapper's replay
+        cache + router end-to-end;
+      * the driver-level P2 tests ABOVE (markers, hook-format argv, leg
+        isolation, concurrency) — unchanged, they drive hook_dual_search.py
+        directly, which the router reuses.
+    The shell `vco_dual_search_cached` wrapper itself awaits the Wave-3
+    retirement of the legacy query-cache shell path (its last hook caller
+    left in this rework); until then it stays covered by the text pins above.
     """
-    env = build_sandbox(tmp_path)
-    write_stub_producers(
-        env,
-        kg_lines=["KG: Merged KG | concept | score=0.90 | FULL NODE:", "kg body"],
-        code_lines=["CODE: merged.cg.fn | CodeFunction | distance=0.10 |", "cg body"],
-    )
-    install_dual_driver(env)
-    marker = tmp_path / "legacy_cg_cli_ran"
-    target = str(tmp_path / "mod.py")  # code file → BOTH legs wanted
-    res = invoke_hook(
-        env, "mergedsess", target, extra_env={"VCO_TEST_CG_CLI_MARKER": str(marker)}
-    )
-    assert res.returncode == 0, res.stderr
-    assert "Merged KG" in res.stdout, res.stdout + res.stderr[-500:]
-    assert "merged.cg.fn" in res.stdout, res.stdout + res.stderr[-500:]
-    assert not marker.exists(), (
-        "the legacy code-graph-query CLI was spawned — the merged path did not "
-        "serve this miss"
-    )
-
-
-@_needs_bash
-def test_p2_hook_falls_back_when_the_driver_is_absent(tmp_path: Path):
-    """The partial-install / older-bundle path must still inject, via the legacy
-    two-process route (and it DOES spawn the CLI)."""
-    env = build_sandbox(tmp_path)
-    write_stub_producers(
-        env,
-        kg_lines=["KG: Fallback KG | concept | score=0.90 | FULL NODE:", "kg body"],
-        code_lines=["CODE: fallback.cg.fn | CodeFunction | distance=0.10 |", "cg body"],
-    )
-    # NO install_dual_driver() → vco_dual_search_cached signals fallback.
-    marker = tmp_path / "legacy_cg_cli_ran"
-    target = str(tmp_path / "mod.py")
-    res = invoke_hook(
-        env, "fallbacksess", target, extra_env={"VCO_TEST_CG_CLI_MARKER": str(marker)}
-    )
-    assert res.returncode == 0, res.stderr
-    assert "Fallback KG" in res.stdout, res.stdout + res.stderr[-500:]
-    assert "fallback.cg.fn" in res.stdout, res.stdout + res.stderr[-500:]
-    assert marker.exists(), "the legacy path must actually use the CLI"
-
-
-@_needs_bash
-def test_p2_merged_path_populates_both_per_leg_caches(tmp_path: Path):
-    """Cross-surface sharing: after a merged miss, BOTH per-leg cache entries
-    must exist under the SAME keys the single-leg wrappers would have written,
-    so a later pre-bash KG query / pre-tool-use code query still hits."""
-    env = build_sandbox(tmp_path)
-    write_stub_producers(
-        env,
-        kg_lines=["KG: Cached KG | concept | score=0.90 | FULL NODE:", "kg body"],
-        code_lines=["CODE: cached.cg.fn | CodeFunction | distance=0.10 |", "cg body"],
-    )
-    install_dual_driver(env)
-    target = str(tmp_path / "mod.py")
-    invoke_hook(env, "cachesess", target)
-
-    qc = env["state_dir"] / "query_cache"
-    entries = sorted(p.read_text(encoding="utf-8") for p in qc.iterdir())
-    assert len(entries) == 2, f"expected one cache entry per leg, got {len(entries)}"
-    joined = "\n".join(entries)
-    assert "KG: Cached KG" in joined
-    assert "CODE: cached.cg.fn" in joined
-
-    # Second edit of the SAME file in a FRESH session: both caches hit, so the
-    # producers must not run at all (proved by removing them).
-    (env["scripts_dir"] / "rl_kg_search.py").unlink()
-    marker = tmp_path / "legacy_cg_cli_ran"
-    res = invoke_hook(
-        env, "cachesess2", target, extra_env={"VCO_TEST_CG_CLI_MARKER": str(marker)}
-    )
-    assert "Cached KG" in res.stdout, res.stdout + res.stderr[-500:]
-    assert not marker.exists()
-
-
-def test_pre_edit_hooks_call_the_dual_wrapper_with_a_legacy_fallback():
-    """Both flavours must (a) try the merged path and (b) keep the legacy
-    two-call path reachable for a partial install / missing venv."""
     sh = (HOOKS / "pre-edit-context-inject.sh").read_text(encoding="utf-8")
-    assert "vco_dual_search_cached" in sh
-    assert 'if [[ "$DUAL_DONE" == "0" ]]; then' in sh
-    assert "vco_kg_search_cached" in sh, "legacy KG fallback removed"
-    assert "codegraph_query_block" in sh, "legacy CG fallback removed"
     ps1 = (HOOKS / "pre-edit-context-inject.ps1").read_text(encoding="utf-8")
-    assert "Invoke-VcoDualSearchCached" in ps1
-    assert "-not $DualDone" in ps1
-    assert "Invoke-VcoKgSearchCached" in ps1
-    assert "Invoke-VcoCodegraphQueryBlock" in ps1
+    for body, name, needles in (
+        (sh, "sh", ("vco_dual_search_cached", "vco_kg_search_cached",
+                    "codegraph_query_block")),
+        (ps1, "ps1", ("Invoke-VcoDualSearchCached", "Invoke-VcoKgSearchCached",
+                      "Invoke-VcoCodegraphQueryBlock")),
+    ):
+        executable = "\n".join(
+            ln for ln in body.splitlines()
+            if not ln.lstrip().startswith(("#", "<#"))
+        )
+        for needle in needles:
+            assert needle not in executable, (
+                f"pre-edit-context-inject.{name}: the legacy dual/producer "
+                f"call path ({needle}) must stay retired — the router owns "
+                "the producers now (double injection risk)"
+            )
+        assert ("hook_context_router.py" in executable), (
+            f"pre-edit-context-inject.{name} must run the router on an "
+            "executable line"
+        )
 
 
 # ==========================================================================
@@ -436,15 +346,22 @@ def test_pre_edit_hooks_call_the_dual_wrapper_with_a_legacy_fallback():
 
 
 def test_p3_ttl_is_derived_from_the_shared_default_not_hardcoded():
-    """RED-PROOF: the pre-P3 source carried a literal `CACHE_TTL=600`."""
+    """RED-PROOF: the pre-P3 source carried a literal `CACHE_TTL=600`.
+    v0.2.101 Wave 2: the wrapper no longer sources query-cache.sh; the
+    final-batch fix round also dropped the retired lib's
+    `_VCO_QUERY_CACHE_TTL_DEFAULT` middle rung — `VCO_QUERY_CACHE_TTL` is
+    the ONE override and the literal 900 default matches the window the
+    router's kgi/cgi cache uses."""
     sh = (HOOKS / "pre-edit-context-inject.sh").read_text(encoding="utf-8")
-    assert 'CACHE_TTL="${VCO_QUERY_CACHE_TTL:-${_VCO_QUERY_CACHE_TTL_DEFAULT:-900}}"' in sh
+    assert 'CACHE_TTL="${VCO_QUERY_CACHE_TTL:-900}"' in sh
+    assert "${_VCO_QUERY_CACHE_TTL_DEFAULT:-900}" not in sh
     assert "CACHE_TTL=600" not in sh
     ps1 = (HOOKS / "pre-edit-context-inject.ps1").read_text(encoding="utf-8")
     assert "$CacheTtl = 900" in ps1
     assert "$CacheTtl = 600" not in ps1
-    lib = (LIB / "query-cache.sh").read_text(encoding="utf-8")
-    assert "_VCO_QUERY_CACHE_TTL_DEFAULT=900" in lib
+    # (wave-3: _lib/query-cache.sh was retired with pre-tool-use §5 — the
+    # 900 s default's surviving homes are the router's Python cache and the
+    # VCO_QUERY_CACHE_TTL doc row.)
 
 
 @_needs_bash
@@ -467,6 +384,10 @@ def test_p3_double_miss_window_closed(tmp_path: Path):
         kg_lines=["KG: TTL Node | concept | score=0.85 | FULL NODE:", "ttl body"],
         code_lines=[],
     )
+    # v0.2.101: the miss path runs the REAL router (single interpreter,
+    # stub producers loaded in-process) — install it beside the driver.
+    install_dual_driver(env)
+    install_router(env)
     target = str(tmp_path / "notes.md")  # non-code → KG leg only
     first = invoke_hook(env, "ttlsess", target)
     assert "TTL Node" in first.stdout, first.stdout + first.stderr
@@ -1095,6 +1016,8 @@ def test_p4_injection_suppressed_after_an_explicit_retrieval(tmp_path: Path):
     hook then declines to re-inject the SAME chunk. RED-PROOF: this fails on the
     pre-P4 tree — nothing recorded explicit retrievals, so the block injected."""
     env = build_sandbox(tmp_path)
+    install_dual_driver(env)
+    install_router(env)
     kg_header = "KG: Explicit Node | concept | score=0.90 | FULL NODE:"
     kg_body = "the body the agent already fetched"
     write_stub_producers(env, kg_lines=[kg_header, kg_body], code_lines=[])

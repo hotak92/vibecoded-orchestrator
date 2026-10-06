@@ -205,13 +205,22 @@ pub struct UpdateProjectIdentityResult {
     pub warnings: Vec<String>,
 }
 
+///
+/// F3: the core's env re-projection is a Python subprocess (300 s cap), so
+/// the sync core runs on the blocking pool, not a tokio worker. The DB
+/// writes live inside the closure, so a join failure is propagated.
 #[command]
 pub async fn update_project_identity(
     project_id: String,
     req: UpdateProjectIdentityReq,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<UpdateProjectIdentityResult, String> {
-    update_project_identity_with_db(&db, &project_id, &req)
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "update_project_identity",
+        move |db| update_project_identity_with_db(db, &project_id, &req),
+    )
+    .await?
 }
 
 /// Inner helper. The Tauri command above is a thin wrapper; this is the
@@ -386,6 +395,7 @@ pub fn update_project_identity_with_db(
 #[command]
 pub async fn redetect_project_identity(
     project_id: String,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<UpdateProjectIdentityResult, String> {
     let row = db
@@ -417,7 +427,17 @@ pub async fn redetect_project_identity(
         kg_collection: new_kg,
         code_graph_project: new_cg,
     };
-    let res = update_project_identity_with_db(&db, &project_id, &identity_req);
+    // F3: the update core re-projects env (a Python subprocess, 300 s cap)
+    // — run it on the blocking pool, not a tokio worker. A join failure
+    // surfaces through the same `Err` arm as a failed update.
+    let pid = project_id.clone();
+    let res = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "redetect_project_identity",
+        move |db| update_project_identity_with_db(db, &pid, &identity_req),
+    )
+    .await
+    .and_then(|r| r);
     let mut update_result = match res {
         Ok(r) => r,
         Err(e) => {

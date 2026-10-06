@@ -287,6 +287,16 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
                 // [vct-print-contract] CLI output — see handle_cli_args() above.
                 eprintln!("[vct] db warning: {}", w);
             }
+            // v0.2.101: an auto_scrub deprecated MCP (search) whose module no
+            // longer ships was removed from ~/.claude.json. One line each;
+            // empty on an idempotent second run.
+            for name in &report.removed_deprecated {
+                // [vct-print-contract] CLI output — see handle_cli_args() above.
+                println!(
+                    "[vct]   removed obsolete MCP entry `{}` — that module no longer ships",
+                    name
+                );
+            }
             if report.all_succeeded() {
                 0
             } else {
@@ -1860,51 +1870,72 @@ pub fn run() {
                             // touched by a prior boot, the GUI, or
                             // install.py --update without the env
                             // files being regenerated yet.
-                            if let Ok(projects) = db.list_projects() {
-                                let mut regened = 0usize;
-                                for proj in &projects {
-                                    let folder = std::path::Path::new(
-                                        &proj.folder_path,
-                                    );
-                                    if !folder.is_dir() {
-                                        continue;
-                                    }
-                                    let env_path =
-                                        folder.join(".claude").join("env");
-                                    if !commands::project_env_settings::
-                                        should_regenerate_env_for_project(
-                                            db.inner(),
-                                            &proj.id,
-                                            &env_path,
-                                        )
-                                    {
-                                        continue;
-                                    }
-                                    match commands::projects_v2::
-                                        refresh_project_env_with_db(
-                                            db.inner(), &proj.id,
-                                        )
-                                    {
-                                        Ok(_) => {
-                                            regened += 1;
+                            //
+                            // F3 (v0.2.101): each regen is a Python
+                            // subprocess (300 s cap), so the loop runs on
+                            // the blocking pool instead of parking this
+                            // tokio worker. Awaited, so the reconcile
+                            // signal below still fires after it. Soft-fail
+                            // on a join error, like every step here.
+                            if let Err(e) =
+                                commands::blocking::run_with_db_on_blocking_pool(
+                                    adopt_handle.clone(),
+                                    "adopt-populated env regen",
+                                    |db| {
+                                        if let Ok(projects) = db.list_projects() {
+                                            let mut regened = 0usize;
+                                            for proj in &projects {
+                                                let folder = std::path::Path::new(
+                                                    &proj.folder_path,
+                                                );
+                                                if !folder.is_dir() {
+                                                    continue;
+                                                }
+                                                let env_path =
+                                                    folder.join(".claude").join("env");
+                                                if !commands::project_env_settings::
+                                                    should_regenerate_env_for_project(
+                                                        db,
+                                                        &proj.id,
+                                                        &env_path,
+                                                    )
+                                                {
+                                                    continue;
+                                                }
+                                                match commands::projects_v2::
+                                                    refresh_project_env_with_db(
+                                                        db, &proj.id,
+                                                    )
+                                                {
+                                                    Ok(_) => {
+                                                        regened += 1;
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "[vct] adopt-populated env \
+                                                             regen failed for {}: {}",
+                                                            proj.name, e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if regened > 0 {
+                                                tracing::info!(
+                                                    "[vct] adopt-populated: env \
+                                                     regenerated for {} project(s) \
+                                                     (binding newer than env file)",
+                                                    regened
+                                                );
+                                            }
                                         }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "[vct] adopt-populated env \
-                                                 regen failed for {}: {}",
-                                                proj.name, e
-                                            );
-                                        }
-                                    }
-                                }
-                                if regened > 0 {
-                                    tracing::info!(
-                                        "[vct] adopt-populated: env \
-                                         regenerated for {} project(s) \
-                                         (binding newer than env file)",
-                                        regened
-                                    );
-                                }
+                                    },
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "[vct] adopt-populated env regen: {}",
+                                    e
+                                );
                             }
                         }
                         Err(e) => {
@@ -2762,6 +2793,10 @@ pub fn run() {
             // 3 surfaces. Auto-invoked by access-matrix setters; FE may
             // also call directly after bulk edits.
             commands::projects_v2::refresh_project_env,
+            // v0.2.101 (owner ruling 2026-10-05, Q4): the confirm-gated
+            // Preferences "Re-render env for all projects" action, wrapping
+            // the same core the boot hook uses.
+            commands::projects_v2::refresh_all_projects_env,
             // v0.2.37 (Agent V37-E): bulk refresh for the install/update
             // boundary — re-renders `.claude/env` + `.claude/settings.json`
             // for every project so the canonical orchestrator-root
@@ -2849,7 +2884,6 @@ pub fn run() {
             // NEW-3 (2026-05-28): generic start for service/container modules
             // whose container_name is NULL (auto-start was skipped).
             commands::module_service::start_module_container,
-            commands::module_service::check_for_weights_update_now,
             commands::module_service::apply_weights_update,
             commands::module_service::get_rl_dashboard_state,
             // v0.2.32 (L7, Agent B): per-project text-embedding-source
@@ -3000,6 +3034,11 @@ pub fn run() {
             // installer_engine's run_install / run_upgrade — these
             // commands are for the GUI / dashboard manual paths.
             commands::module_db::apply_module_db_migrations,
+            // v0.2.101 (Q4): the module tile's "Re-apply DB migrations"
+            // repair action reads which modules' last apply reported
+            // errors from here (recorded by installer_engine, cleared by
+            // a clean apply).
+            commands::module_db::list_module_db_migration_failures,
             // Retrieval tuning (v0.2.22 Item #13 — 2026-05-20).
             // Global thresholds for score-driven retrieval verbosity
             // (KG tier cutoffs) + codegraph injection floor. Backed by
@@ -3058,6 +3097,7 @@ pub fn run() {
             commands::model_gateway::model_gateway_mode_get,
             commands::model_gateway::model_gateway_mode_set,
             commands::model_gateway::model_gateway_agents_gate,
+            commands::model_gateway::model_gateway_routing_guidance,
             commands::gateway_freshness::model_gateway_freshness,
             commands::gateway_freshness::model_gateway_restart_stale,
             commands::gateway_usage::model_gateway_usage_windows,
@@ -3071,11 +3111,19 @@ pub fn run() {
             commands::project_state_cmd::set_project_kg_binding,
             commands::project_state_cmd::delete_project_kg_binding,
             commands::project_state_cmd::set_project_codegraph_binding,
-            commands::project_state_cmd::delete_project_codegraph_binding,
+            // v0.2.101 (Q4 retirement): delete_project_codegraph_binding
+            // removed — never had a frontend caller; the KgCodegraphTab
+            // `enabled` checkbox already stops use of the binding.
             // Per-project MCP servers (migration 010 — Custom MCP tab feed).
             commands::project_state_cmd::list_project_mcp_servers,
             commands::project_state_cmd::set_project_mcp_server_enabled,
             commands::project_state_cmd::unregister_project_mcp_server,
+            // v0.2.101 catalogue plan §3.6: opt-in agent/skill packs.
+            // Listed + toggled from the project page's Packs tab; the
+            // toggle runs the ordinary bundle engine (--pack /
+            // --remove-pack) behind the per-folder single-flight turn.
+            commands::packs_cmd::list_project_packs,
+            commands::packs_cmd::set_project_pack_enabled,
             // Phase 1.1 — Diagrams (Mermaid + Excalidraw) registry,
             // snapshots, cross-project access grants, per-tool MCP
             // allowlists, and per-project module-active flags. Schema:
@@ -3093,15 +3141,13 @@ pub fn run() {
             commands::diagrams_cmd::delete_diagram_snapshot,
             commands::diagrams_cmd::diagram_grant_access,
             commands::diagrams_cmd::list_diagram_access,
-            commands::diagrams_cmd::set_project_mcp_tool_enabled,
-            commands::diagrams_cmd::list_project_mcp_tools,
-            // v0.2.34 Agent E (Phase 4 generalisation, 2026-05-25):
-            // PermissionsTab's "Customize" button populates the
-            // per-tool allowlist from manifest-shipped defaults (or
-            // the hardcoded fallback). Generalised so any MCP — not
-            // just diagrams — gets the same surface.
-            commands::diagrams_cmd::seed_project_mcp_tool_grants,
+            // v0.2.101: the per-tool MCP-grant commands
+            // (list_project_mcp_tools / set_project_mcp_tool_enabled /
+            // seed_project_mcp_tool_grants) were removed with the retired
+            // diagram wrapper MCPs' GUI surface. The DB layer + the hub's
+            // tool-grant route stay for existing wrapper registrations.
             commands::diagrams_cmd::set_project_module_enabled,
+            commands::diagrams_cmd::clear_project_module,
             // v0.2.49 Stream B: per-project enable toggle for global-
             // scope modules. Bare-bool surface, kept because it is
             // shipped IPC — but it cannot express PROVENANCE and has no
@@ -3313,11 +3359,11 @@ pub fn run() {
             //   SafetyReport (volumes, collections, services classification)
             //   and should run before clicking Install on a fresh path.
             commands::installer::preflight_install_safety_check,
-            commands::volumes::get_volumes_config,
-            commands::volumes::set_volumes_config_for_install,
-            commands::volumes::set_volumes_config_dry_run,
-            commands::volumes::migrate_volumes,
-            // PR-10A storage UX — separate surface from `volumes.rs`'s
+            commands::storage_ux::get_volumes_config,
+            commands::storage_ux::set_volumes_config_for_install,
+            commands::storage_ux::set_volumes_config_dry_run,
+            commands::storage_ux::migrate_volumes,
+            // PR-10A storage UX — volumes.rs merged into storage_ux.rs (v0.2.101 Q4b);
             // install-time picker. Owns Settings -> Storage. STRICT
             // allowlist enforced in storage_ux::is_recognized_legacy_volume.
             commands::storage_ux::get_storage_config,

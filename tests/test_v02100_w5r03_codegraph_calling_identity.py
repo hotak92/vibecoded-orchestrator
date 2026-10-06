@@ -19,16 +19,19 @@ prefix and fans out over the calling project's own grants:
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import stat
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from tests.common.pre_edit_hook_sandbox import build_sandbox, invoke_hook, write_stub_producers
+from tests.common.pre_edit_hook_sandbox import (
+    build_sandbox,
+    install_dual_driver,
+    install_router,
+    invoke_hook,
+    write_stub_producers,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 HOOKS = REPO / "templates" / "hooks"
@@ -57,65 +60,66 @@ def _sibling_file(tmp_path: Path) -> Path:
 
 @needs_bash
 def test_sh_pre_edit_never_overrides_the_project_for_a_sibling_file(tmp_path):
+    """W5R-03, router era: the code-graph leg's argv must carry NO --project
+    override and no folder-name-derived project ("Bar") — the producer
+    resolves the CALLING project itself (CLAUDE_PROJECT_DIR → hub). The
+    argv recorder is the sandbox CG module stub (the router pins its argv
+    through the hook_dual_search shim, recorded via VCO_TEST_CG_MARKER)."""
     env = build_sandbox(tmp_path)
-    write_stub_producers(env, kg_lines=[], code_lines=[])
-    cli = env["cg_dir"] / "code-graph-query"
-    cli.write_text(_ARGV_RECORDER, encoding="utf-8")
-    cli.chmod(cli.stat().st_mode | stat.S_IXUSR)
+    write_stub_producers(
+        env, kg_lines=[],
+        code_lines=["CODE: own.mod.f | CodeFunction | distance=0.2 |"],
+    )
+    install_dual_driver(env)
+    install_router(env)
     # Ship the REAL detect-project.sh where the old hook sourced it from, so a
     # regression to the folder-name heuristic actually fires in this sandbox.
     (env["install_root"] / "templates" / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy(REPO / "templates" / "scripts" / "detect-project.sh",
                 env["install_root"] / "templates" / "scripts" / "detect-project.sh")
-    argv_file = tmp_path / "argv.txt"
+    argv_file = tmp_path / "argv.jsonl"
     target = _sibling_file(tmp_path)  # a sibling of the sandbox project root
-    proc = invoke_hook(env, "sess-w5r03", str(target), extra_env={
-        "VCO_TEST_CG_ARGV": str(argv_file),
-        "CLAUDE_PROJECT_DIR": str(env["install_root"]),
-    })
+    proc = invoke_hook(env, "sess-w5r03", str(target), old_string="pass",
+                       extra_env={
+                           "VCO_TEST_CG_MARKER": str(argv_file),
+                           "CLAUDE_PROJECT_DIR": str(env["install_root"]),
+                       })
     assert proc.returncode == 0, proc.stderr
-    assert argv_file.is_file(), ("the code-graph leg did not run", proc.stdout, proc.stderr)
-    argv = argv_file.read_text("utf-8").splitlines()
-    assert "--project" not in argv and "Bar" not in argv, argv
+    assert argv_file.is_file(), ("the code-graph leg did not run", proc.stdout, proc.stderr[-800:])
+    argv = json.loads(argv_file.read_text("utf-8").splitlines()[0])
+    assert "--project" not in argv, argv
+    assert "Bar" not in argv, f"folder-name heuristic leaked into the argv: {argv}"
 
 
 @needs_pwsh
 def test_ps1_pre_edit_never_overrides_the_project_for_a_sibling_file(tmp_path):
     """The .ps1 heuristic was inert in practice (detect-project.ps1 run with
-    -File only DEFINES a function and prints nothing), so this guards the end
-    state on Windows rather than reproducing a live leak there."""
-    orch = tmp_path / "orch"
-    proj = tmp_path / "proj"
-    (proj / ".claude" / "state").mkdir(parents=True)
-    (proj / ".claude" / "scripts").mkdir(parents=True)
-    shutil.copytree(HOOKS, orch / "templates" / "hooks")
-    shutil.copytree(REPO / "templates" / "scripts", orch / "templates" / "scripts")
-    # Ship a REAL detect-project.ps1 where the old code looked for it, so a
-    # regression to the folder-name heuristic would actually fire here.
-    shutil.copy(REPO / "templates" / "scripts" / "detect-project.ps1",
-                proj / ".claude" / "scripts" / "detect-project.ps1")
-    cli = proj / ".claude" / "scripts" / "code-graph-query"
-    cli.write_text(_ARGV_RECORDER, encoding="utf-8")
-    cli.chmod(cli.stat().st_mode | stat.S_IXUSR)
-    target = _sibling_file(tmp_path)
-    argv_file = tmp_path / "argv.txt"
-    payload = {"tool_name": "Edit", "session_id": "sess-w5r03ps",
-               "tool_input": {"file_path": str(target), "new_string": "def widget(): return 1"}}
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("VCT_", "VCO_", "CLAUDE_"))}
-    env.update({
-        "CLAUDE_PROJECT_DIR": str(proj),
-        "HOME": str(tmp_path / "home"),
-        "WEAVIATE_URL": "http://127.0.0.1:9",
-        "VCO_TEST_CG_ARGV": str(argv_file),
-    })
-    proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(orch / "templates" / "hooks" / "pre-edit-context-inject.ps1")],
-        input=json.dumps(payload), capture_output=True, text=True, timeout=120, env=env,
+    -File only DEFINES a function and prints nothing), so this guarded the
+    END STATE on Windows rather than reproducing a live leak there.
+
+    v0.2.101 retarget: the .ps1 wrapper no longer calls any code-graph CLI —
+    it drives hook_context_router.py, whose producer argv is cross-OS Python
+    (the behavioural no---project pin is the .sh router test above; this row
+    keeps the Windows-side END-STATE guard as a source scan of the wrapper:
+    no project-override machinery, no direct producer call)."""
+    body = (HOOKS / "pre-edit-context-inject.ps1").read_text(encoding="utf-8-sig")
+    code = "\n".join(
+        ln for ln in body.splitlines()
+        if not ln.lstrip().startswith(("#", "<#"))
     )
-    assert proc.returncode == 0, proc.stderr
-    assert argv_file.is_file(), ("the code-graph leg did not run", proc.stdout, proc.stderr)
-    argv = argv_file.read_text("utf-8").splitlines()
-    assert "--project" not in argv and "Bar" not in argv, argv
+    assert "detect-project" not in code, "the folder-name heuristic crept back"
+    assert "--project" not in code, (
+        "the wrapper must never pass a project override — the producer "
+        "resolves the CALLING project (W5R-03)"
+    )
+    assert "CODE_GRAPH_PROJECT_ARG" not in code
+    assert "code-graph-query" not in code, (
+        "direct CG producer call crept back into the wrapper — the router "
+        "owns producer argv"
+    )
+    assert "hook_context_router.py" in code, (
+        "the .ps1 wrapper must drive the router"
+    )
 
 
 @pytest.mark.parametrize("hook", ["pre-edit-context-inject.sh", "pre-edit-context-inject.ps1"])

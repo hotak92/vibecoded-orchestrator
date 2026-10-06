@@ -331,12 +331,19 @@ clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = "v0.2.100 (AD-3, L1-F05): a VCO container name is held by a container another compose tool created (its labels name podman-compose vs docker-compose). Never recreated automatically; consent + data check needed. Emitted by `vco_lib.compose_recovery.deferral_entries` inside install.py step 5."
 
+[conditions.compose_network_unknown_project_refused]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.101 (NB-15 / FRR:50): compose refused a network while recovering a project whose name could not be determined, so the network's provenance could not be checked against it. Distinct from `compose_network_label_mismatch_attached`: that branch READS the network's labels and finds they name another tool; this branch reads NO label, because there is no project to compare them to. Refusal behaviour is unchanged — the network is never removed, and the row carries the inspect/ps/rm recipe. Emitted by `vco_lib.compose_recovery.heal_deferral_entry` inside install.py step 5."
+
 [conditions.compose_network_label_mismatch_attached]
 class = "action_required"
 owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-3, L1-F04/F22; wave-1 review W1R-01): compose refused a network labelled by a different compose tool and VCO left it alone because it could not PROVE removal safe — `ps -a --filter network=<n> -q` shows containers attached, OR the network's own labels do not name the compose project being recovered (`com.docker.compose.project` / `io.podman.compose.project`: hand-made, another project's, unreadable, or the project is unknown). The id keeps its v0.2.100 wave-1 name; the row's title/recipe cover both reasons. Emitted by `vco_lib.compose_recovery` inside install.py step 5."
+notes = "v0.2.100 (AD-3, L1-F04/F22; wave-1 review W1R-01; split v0.2.101 NB-15): compose refused a network labelled by a different compose tool and VCO left it alone because it could not PROVE removal safe — `ps -a --filter network=<n> -q` shows containers attached, OR the network's own labels do not name the compose project being recovered (`com.docker.compose.project` / `io.podman.compose.project`: hand-made, another project's, or unreadable). The 'project unknown' case this row used to cover moved to its own id `compose_network_unknown_project_refused` (NB-15). Emitted by `vco_lib.compose_recovery` inside install.py step 5."
 
 [conditions.container_storage_leftover_unsafe]
 class = "action_required"
@@ -351,6 +358,27 @@ owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = "v0.2.100 (AD-4): a service recreate was refused because the data location of the running container could not be positively matched to the effective compose config. Registered ahead of its emitter (WP-07, `vco_lib.data_identity`), which runs inside install.py step 5."
+
+[conditions.compose_gpu_device_missing]
+class = "action_required"
+owner = "vco_lib.gpu_verify"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.101 (plan items 1+5): a GPU was expected in the running \
+container (the GPU compose overlay was applied, or the host has an NVIDIA GPU \
+while the stack composed CPU-only), and `<runtime> inspect` shows the \
+container holds NO GPU device — the 2026-09-29 incident shape (an external \
+docker-compose provider silently dropped the podman CDI `devices:` spec; \
+Ollama then served every embedding on CPU for days with a green install). \
+The row's recipe recreates the stack with a CDI-capable compose tool \
+(podman-compose), regenerates the nvidia-ctk CDI spec and re-runs the \
+update. Emitted by `vco_lib.gpu_verify` from install.py step 5 \
+(`vco_lib.install_services_up`, after a successful compose-up and up front \
+when the only compose tool is a docker-compose delegate) and from the \
+GPU-safe wrappers' success path (`scripts/launch-claude-mcp-stack.{sh,ps1}` \
+via `python -m vco_lib.gpu_verify`); a probe that could not tell emits \
+NOTHING. Re-detected every install run and every wrapper boot on a GPU \
+host."""
 
 [conditions.ollama_not_ready_at_update]
 class = "auto_retryable"
@@ -424,6 +452,13 @@ owner = "vco_lib.bundle_leftovers"
 clear_probe = "bundle-reconciled"
 emit_surfaces = ["ledger"]
 notes = "v0.2.100 (AD-12, owner Q3, WP-15): project-bundle copies of infrastructure compose files were removed (modified copies backed up first). A completed action. Emitted by `bundle_leftovers.retire_compose_copies`; cleared by `_reconcile_bundle_deferrals` on the next update that removed nothing. NOT install.py-owned (F-W1-12), same reason as `bundle_leftover_removed`."
+
+[conditions.pack_removed]
+class = "informational_record"
+owner = "vco_lib.packs"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "v0.2.101 (catalogue plan §3.5): an opt-in agent/skill PACK was removed via `install-bundle --remove-pack <name>`. A completed action — unmodified members were deleted, edited members were backed up under `.claude/backups/bundle-adoptions/<ts>/` FIRST (never a silent delete; a backup failure leaves the file in place and warns instead). Emitted by `vco_lib.packs.remove_packs`; the paired resolution is `vco_lib.packs.note_packs_installed`, which calls `resolve_conditions(['pack_removed'])` when a later `--pack` install re-records a pack (the natural inverse: what a remove-pack emitted, a re-install clears). NOT install.py-owned: the root bundle runs inside an install.py run whose finalize would otherwise drop the row."
 
 [conditions.module_container_unlabelled]
 class = "informational_record"
@@ -673,6 +708,10 @@ class = "informational_record"
 owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
+notes = """v0.2.101: the search MCP and its producer (`_check_search_mcp_env_obsolete`) \
+were deleted outright. The condition stays registered so any entry written by an \
+older install still self-clears via `owned-drop-when-absent` (owner=install.py no \
+longer re-emits it). Nothing emits it any more."""
 
 [conditions.stale_mcp_json_shadow_quarantined]
 class = "informational_record"
@@ -756,7 +795,7 @@ clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger", "gui_badge"]
 notes = """v0.2.91 WP-D. Registration writes `command = "npx"` unconditionally, \
 so on a machine without npx every npx-based MCP (playwright by default, \
-mermaid when enabled) fails to spawn and Claude Code shows only "Failed to \
+the diagram wrappers on legacy installs that kept them) fails to spawn and Claude Code shows only "Failed to \
 connect". install.py DETECTED this since v0.2.51 and answered it with a \
 stdout line claiming the MCP "will lazy-install when first invoked" — false, \
 there is nothing to lazy-install into. The doctor phase now emits this \
@@ -1141,13 +1180,34 @@ which clears the stale parked row). Emitted by the bundle update; cleared by the
 probe once no hook is both parked and running (None — keep — when launcher.db \
 or settings.json cannot be read)."""
 
+[conditions.async_subhook_disable_carry_failed]
+class = "action_required"
+owner = "vco_lib.hook_retirements"
+clear_probe = "probe:py:async_subhook_disable_carry_still_owed"
+emit_surfaces = ["ledger"]
+notes = """v0.2.101 (re-review SF-A). The bundle update's carry of a parked \
+(user-disabled) retired async PostToolUse registration into \
+VCO_ASYNC_DISABLED_HOOKS (<project>/.claude/env) failed on the env-file \
+write/read — e.g. a permission bit, an immutable flag, or a directory where \
+the file should be. Until the key lands, the merged post-tool-use-async \
+dispatcher would run the sub-hook(s) the user had switched off. This row is \
+the user-visible record and the update-retry trail; the launcher's eager \
+prune gate keys on POSITIVE carry success (the classifier's carry_pending \
+answer, computed by the same owed rule as this condition's probe), so the \
+parked bytes — the only record of the choice — stay protected even if this \
+row itself could not be written (re-review-2 nit 3). \
+Emitted by the bundle update (vco_lib.hook_retirements.carry_parked_async_disables); \
+every later update retries the carry and closes the row on success; the probe \
+also closes it on the hand-fix path (the key already holds every parked stem) \
+and keeps it when launcher.db or the env file cannot be read (None — no verdict)."""
+
 [conditions.project_hooks_relative_paths]
 class = "action_required"
 owner = "vco_lib.hook_relative_paths"
 clear_probe = "probe:py:project_hooks_relative_paths_still_present"
 emit_surfaces = ["ledger"]
 notes = """v0.2.100 WP-17 (F-W1-16). A project's OWN hook command invokes a \
-`.claude/hooks/` script by a relative path, so it fails ("No such file or \
+`.claude/hooks/` or (v0.2.101, NB-13) `.claude/scripts/` script by a relative path, so it fails ("No such file or \
 directory", exit 127) whenever the session's cwd moves — on every call, each \
 failure written into the transcript. VCO's shipped hooks are anchored by the \
 bundle merge; the project's own are the user's configuration, so the bundle \
@@ -1215,6 +1275,27 @@ content-hash gated so the retry re-embeds only what never landed). The \
 paired clear is NARROW by design (decision #12 shape): only the end of a \
 FULLY successful `--all` tree sync resolves it — a clean file-list or \
 docs-only run proves nothing about the nodes an earlier run failed on."""
+
+[conditions.kg_sync_shared_pending]
+class = "auto_retryable"
+owner = "templates/scripts/sync_knowledge_graph.py"
+clear_probe = "paired-resolution"
+retry_action = "retry:py:kg_seed_shared"
+emit_surfaces = ["ledger"]
+notes = """v0.2.101 item 4: the install used to BLOCK on the SHARED-collection \
+seed (`sync_knowledge_graph.py --all` with `KG_COLLECTION=<shared>` in the \
+child env). It is now enqueued to the detached retry driver, so the owed work \
+needs its own row — the per-project seed's `kg_sync_failures_pending` is a \
+different target and a different handler. `retry:py:kg_seed_shared` re-runs the \
+same shipped script against the shared class (content-hash gated, so a retry \
+over an already-seeded collection re-embeds only what never landed). The \
+paired clear is NARROW and lives with the run that proves it: \
+`sync_knowledge_graph.py::_clear_shared_seed_deferral`, called only at the end \
+of a FULLY successful `--all` whose COLLECTION_NAME was the SHARED collection \
+— a normal project run targets its own class and deliberately clears nothing. \
+install.py is a second emitter of this id (the same shape as \
+`kg_sync_failures_pending`); the row's class, retry and clear are correct as \
+they stand."""
 
 [conditions.codegraph_embed_resync_pending]
 class = "auto_retryable"
@@ -1506,6 +1587,23 @@ launcher's hand-off state file, which the emit consumes, so the next --update \
 does not re-detect it and `InstallDeferralFlow.finalize()` drops it (the \
 `owned-drop-when-absent` one-shot-expiry shape, same as the Rust-emitted \
 `stale_unit_retired_` precedent)."""
+
+[conditions.first_run_setup_pending]
+class = "action_required"
+owner = "vco_lib.rendered_root_files"
+clear_probe = "probe:py:first_run_setup_sections_still_pending"
+emit_surfaces = ["ledger"]
+notes = """v0.2.101: the orchestrator-root CLAUDE.md still carries one or more \
+`<!-- BEGIN: SETUP-ONLY -->` blocks that the user has not acted on. Those blocks \
+live INSIDE the AUTO-rendered region of `templates/ORCHESTRATOR-CLAUDE.md.template`, \
+so the renderer (`vco_lib/rendered_root_files.render_entry`, install.py step 4c) \
+re-emits the row on every install/update while an un-acknowledged block is \
+rendered. Acting on the blocks and running \
+`python .claude/scripts/cleanup-setup-sections.py` records each block's content \
+hash in `.claude/state/setup-sections-ack.json` (atomic write); the renderer then \
+omits the acknowledged blocks, so the removal survives every future update, and \
+the row clears. A block whose content CHANGES in a later release has a new hash, \
+renders again, and re-arms the row."""
 
 [conditions.launcher_binary_stale]
 class = "action_required"

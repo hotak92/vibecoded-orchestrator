@@ -177,11 +177,23 @@ def _first_detected(prior: Optional[DeferralEntry], entry: DeferralEntry) -> Def
     """``entry`` carrying ``prior``'s ``detected_at`` when ``prior`` is the SAME
     condition (same ``condition_id`` and the same ``dismiss_fields`` — the
     registry's "what makes it the same state" values). A re-emission then
-    says since when the condition holds, not when it was last noticed."""
+    says since when the condition holds, not when it was last noticed.
+
+    The on-disk re-probe annotation (``probe_status``) is carried over too when
+    the caller-built ``entry`` leaves it unset: the re-probe pass stamps that
+    field on disk, but a caller rebuilding an entry from scratch knows nothing
+    about it. Without the carry-over a genuinely-unchanged re-emission compares
+    UNEQUAL to the on-disk entry (``prior == entry`` fails), so the ledger is
+    rewritten — dropping the annotation and churning the top-level
+    ``generated_at`` — and the next probe pass restores the same value: a pure
+    no-op write. The probe pass still refreshes the value later, so it can
+    never go stale."""
     if prior is None or prior.condition_id != entry.condition_id:
         return entry
     if dict(prior.dismiss_fields or {}) != dict(entry.dismiss_fields or {}):
         return entry
+    if entry.probe_status is None and prior.probe_status is not None:
+        entry = replace(entry, probe_status=prior.probe_status)
     return replace(entry, detected_at=prior.detected_at)
 
 

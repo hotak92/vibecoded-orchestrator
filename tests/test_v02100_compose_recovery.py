@@ -209,8 +209,16 @@ def test_network_without_positive_provenance_is_never_removed_leave_alone(run_kw
 def test_network_heal_without_a_known_project_refuses():
     run = NetRun(attached="")
     h = _net_heal(run, project=None)
-    assert not h.healed and h.deferral_cid == cr.CID_NETWORK_LABEL_ATTACHED
+    # NB-15: the unknown-project refusal carries its OWN condition id — it is
+    # NOT a label mismatch (no label is read when there is no project to check
+    # them against).
+    assert not h.healed and h.deferral_cid == cr.CID_NETWORK_UNKNOWN_PROJECT_REFUSED
     assert run.calls == [] and not run.removed
+    # The refusal still owes a ledger row (behaviour unchanged), now naming the
+    # distinct id.
+    rows = cr.deferral_entries(cr.UpResult(1, heals=[h]), manual_cmd="cd x && up")
+    assert [r.condition_id for r in rows] == [cr.CID_NETWORK_UNKNOWN_PROJECT_REFUSED]
+    assert "network rm infrastructure_default" in rows[0].command_to_apply
 
 
 def test_network_with_attached_containers_is_never_removed_and_ledgered():

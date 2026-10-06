@@ -309,21 +309,29 @@ def test_update_project_v2_calls_apply_post_bundle_steps() -> None:
         "update would NOT prune stale rows — silent data drift."
     )
 
-    # Ordering: apply_project_env_via_python (step 5) → helper → retry
+    # Ordering: env re-projection (step 5) → helper → retry
     # (step 6).
     #
     # Use a call-site-matching regex (not bare .find()) for each anchor
     # — the body contains comment references to all three names (e.g.
     # the helper's call-site comment block names retry_failed_module_installs
     # in passing). We want the offset of the actual CALL, not the comment.
-    env_call = re.search(r"apply_project_env_via_python\s*\(", body)
+    # (v0.2.101 pull-in R): the env re-projection moved onto the blocking
+    # pool behind the shared wrapper `apply_project_env_via_python_on_
+    # blocking_pool` — either spelling satisfies the ordering pin (the
+    # wrapper awaits the same underlying call before returning, so the
+    # commit-before-helper ordering it protects is unchanged).
+    env_call = re.search(
+        r"apply_project_env_via_python(?:_on_blocking_pool)?\s*\(", body
+    )
     helper_call = re.search(r"apply_post_bundle_steps\s*\(", body)
     retry_call = re.search(
         r"crate::commands::module_service::retry_failed_module_installs\s*\(",
         body,
     )
     assert env_call, (
-        "could not locate apply_project_env_via_python call site in update_project_v2"
+        "could not locate apply_project_env_via_python(_on_blocking_pool) "
+        "call site in update_project_v2"
     )
     assert helper_call, (
         "could not locate apply_post_bundle_steps call site in update_project_v2"

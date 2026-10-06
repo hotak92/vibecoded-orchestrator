@@ -79,6 +79,20 @@ export const REASON_BRIDGE_ERROR = 'bridge_error';
 export const REASON_BROKEN_INSTALL = 'broken_install';
 /** The one failure the card is QUIET about. */
 export const REASON_NOT_RUNNING = 'not_running';
+/** The running gateway serves older code than the checkout (`vco_lib.gateway_usage.REASON_OUTDATED`). */
+export const REASON_OUTDATED_GATEWAY = 'outdated_gateway';
+
+/**
+ * Show the "Restart gateway…" affordance? ONLY for an outdated gateway
+ * (v0.2.101, P299-A2) — the one usage failure a restart actually fixes.
+ * Every other failure (no token, unreachable, a broken install) would make
+ * the button a no-op at best, and at worst end live agent sessions for
+ * nothing: the restart it offers kills every chat routed through the
+ * gateway. One home so the card's markup and the tests read the same rule.
+ */
+export function restartOffered(result: UsageBridgeResult | null): boolean {
+  return !!result && !result.ok && result.reason === REASON_OUTDATED_GATEWAY;
+}
 
 function errorText(err: unknown): string {
   if (err instanceof Error) return err.message;

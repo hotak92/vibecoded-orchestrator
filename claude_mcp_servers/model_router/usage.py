@@ -261,6 +261,25 @@ def _as_count(value: Any) -> Optional[int]:
     return value if value >= 0 else None
 
 
+class UsageTotals(dict):
+    """The merged counts, plus WHICH of them the response actually reported.
+
+    A plain ``dict[str, int]`` to every existing consumer — :func:`build_record`
+    reads it with ``.get(name, 0)`` and the merged-view tests index it
+    directly, so an unseen field is still a real zero here and nothing that
+    reads this changes. ``reported`` is the one extra the access line needs:
+    :func:`access_extra` reads it to print ``-`` for the fields the response
+    never sent, because a vendor's default ``cache_c=0`` and a genuine
+    cache-creation of zero must not read as the same six characters (the
+    logging policy in :mod:`model_router.server`). The accumulator's ``_seen``
+    set is the only thing that observed the bytes, so it is carried here.
+    """
+
+    def __init__(self, values: "dict[str, int]", reported: "frozenset[str]") -> None:
+        super().__init__(values)
+        self.reported = reported
+
+
 class UsageAccumulator:
     """Merges the usage a response reports, whatever shape it reports it in.
 
@@ -427,9 +446,19 @@ class UsageAccumulator:
             field_name in self._seen for field_name in USAGE_FIELDS
         )
 
-    def totals(self) -> "dict[str, int]":
-        """The merged counts, with unseen fields at zero."""
-        return {name: self._values.get(name, 0) for name in USAGE_FIELDS}
+    def totals(self) -> "UsageTotals":
+        """The merged counts, with unseen fields at zero.
+
+        Returned as a :class:`UsageTotals`: still the plain
+        ``dict[str, int]`` every consumer has always read (unseen fields are
+        zero here), but carrying ``reported`` — the fields the response
+        actually stated — so :func:`access_extra` can dash the ones it never
+        sent instead of printing a default zero as if it were an observation.
+        """
+        return UsageTotals(
+            {name: self._values.get(name, 0) for name in USAGE_FIELDS},
+            frozenset(self._seen),
+        )
 
     @property
     def saw_anything(self) -> bool:
@@ -572,24 +601,40 @@ def access_extra(totals: Mapping[str, int], *, seen: bool) -> str:
 
     ``-`` for a field the response never reported, because a zero and a
     silence are different observations and the log is the place that has to
-    keep telling them apart. The whole group is dashes when the response
-    reported no usage at all (an error status relayed verbatim, a stream that
-    died before ``message_start``).
+    keep telling them apart. :meth:`UsageAccumulator.totals` says which fields
+    those are: the :class:`UsageTotals` it returns carries ``reported``, the
+    set of fields the response actually stated — INCLUDING an explicit zero,
+    which is a reading and is printed as ``0``. ``ctx`` is the sum of the
+    reported context fields only, and ``-`` when none of them was reported.
+
+    A plain mapping from a caller that has only numbers carries no per-field
+    provenance, so it falls back to the historical rule: a field counts as
+    reported when it is present and non-null, and an empty/``seen=False``
+    mapping dashes the whole group.
     """
+    reported = getattr(totals, "reported", None)
+    if reported is None:
+        reported = (
+            {name for name in USAGE_FIELDS if totals.get(name) is not None}
+            if seen
+            else frozenset()
+        )
+
     def show(name: str) -> str:
-        if not seen:
+        if name not in reported:
             return "-"
         value = totals.get(name)
         return "-" if value is None else str(value)
 
+    context_fields = (
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    )
     context = (
-        "-"
-        if not seen
-        else str(
-            totals.get("input_tokens", 0)
-            + totals.get("cache_creation_input_tokens", 0)
-            + totals.get("cache_read_input_tokens", 0)
-        )
+        str(sum(totals.get(name, 0) for name in context_fields))
+        if any(name in reported for name in context_fields)
+        else "-"
     )
     return (
         f"in={show('input_tokens')} "
@@ -601,7 +646,11 @@ def access_extra(totals: Mapping[str, int], *, seen: bool) -> str:
 
 
 # ── count_tokens: never worse than native ────────────────────────────────
-def count_tokens_estimate(payload: Optional[Mapping[str, Any]]) -> Optional[int]:
+def count_tokens_estimate(
+    payload: Optional[Mapping[str, Any]] = None,
+    *,
+    raw: Optional[bytes] = None,
+) -> Optional[int]:
     """A bytes/4 floor for the countable content of a request, or ``None``.
 
     ``None`` means "there is nothing to count" — no ``messages`` and no
@@ -610,10 +659,19 @@ def count_tokens_estimate(payload: Optional[Mapping[str, Any]]) -> Optional[int]
     cannot cost zero tokens, and an endpoint that says so is telling the
     client something the client's own fallback would have contradicted.
 
-    Only ``messages`` and ``system`` are measured. Tools, metadata and
-    sampling parameters do consume tokens upstream, but including them would
-    move this from "a floor the client already trusts" to "a competing
-    estimate", and the point is to be no worse than the client's own guess.
+    Two ways to measure the SAME floor, and the caller picks the cheap one.
+    ``raw`` is the request body EXACTLY as the client sent it, which the
+    request path already holds: ``len(raw) / ESTIMATE_BYTES_PER_TOKEN`` is
+    the floor without re-serialising the parsed conversation, so a streamed
+    multi-MB transcript is never ``json.dumps``-ed on the event loop for it.
+    It measures the WHOLE body — tools, model id, sampling params included —
+    and so is a slightly HIGHER floor than the ``messages`` + ``system``
+    serialisation below; that is the correct direction for a floor, and the
+    client's own fallback counts the whole request too. Without ``raw`` (the
+    unit-test and count-body path) only ``messages`` and ``system`` are
+    serialised explicitly, and tools, metadata and sampling parameters stay
+    out of it so this remains "a floor the client already trusts" rather than
+    a competing estimate.
     """
     if not isinstance(payload, Mapping):
         return None
@@ -624,11 +682,14 @@ def count_tokens_estimate(payload: Optional[Mapping[str, Any]]) -> Optional[int]
             countable[key] = value
     if not countable:
         return None
-    size = len(
-        json.dumps(countable, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8",
+    if raw is not None:
+        size = len(raw)
+    else:
+        size = len(
+            json.dumps(countable, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8",
+            )
         )
-    )
     return max(1, math.ceil(size / ESTIMATE_BYTES_PER_TOKEN))
 
 
@@ -773,6 +834,15 @@ class UsageLedger:
         self._dropped = 0
         self._rotation_warned = False
         self._last_by_session: "OrderedDict[str, UsageRecord]" = OrderedDict()
+        #: Last row per ``(session, agent)`` identity, for
+        #: :meth:`context_floor`. A SECOND index rather than a second scan:
+        #: the floor must match BOTH halves exactly, and the per-chat map
+        #: holds one row per chat (last submit wins, any agent), so it cannot
+        #: answer "this agent's row" once a sibling has written. LRU-capped
+        #: like the per-chat map, by the same count.
+        self._last_by_identity: (
+            "OrderedDict[tuple[str, Optional[str]], UsageRecord]"
+        ) = OrderedDict()
         self._pending: set = set()
 
     # ── paths ────────────────────────────────────────────────────────────
@@ -841,6 +911,11 @@ class UsageLedger:
             self._last_by_session[record.session] = record
             while len(self._last_by_session) > self._max_sessions:
                 self._last_by_session.popitem(last=False)
+            identity = (record.session, record.agent)
+            self._last_by_identity.pop(identity, None)
+            self._last_by_identity[identity] = record
+            while len(self._last_by_identity) > self._max_sessions:
+                self._last_by_identity.popitem(last=False)
 
     def _append(self, record: UsageRecord) -> None:
         target = self.path
@@ -941,6 +1016,40 @@ class UsageLedger:
             for key, record in items
             if only is None or key == only
         }
+
+    def context_floor(
+        self, *, session: Optional[str], agent: Optional[str],
+    ) -> Optional[int]:
+        """The ledger floor for exactly this identity, or ``None``.
+
+        A FLOOR, not a prediction: the matching record's ``context_after`` is
+        what the next turn carries at MINIMUM (last turn's input plus its
+        output), which is exactly the property the ``message_start`` usage
+        fill needs — a positive figure that is never an overestimate of the
+        conversation the request is continuing.
+
+        The match is EXACT on BOTH halves of the identity: the session AND
+        the agent, where ``None`` is a value like any other — a main-chat
+        request (``agent is None``) matches only a row that also carried no
+        agent. There is deliberately NO fallback: the per-chat map holds one
+        row per chat (last submit wins, whatever agent wrote it), so a
+        sibling subagent's newer turn would otherwise stand in for this one —
+        and a forked conversation's size is not a floor for the main chat. A
+        request with NO session has no conversation to key on, so it gets no
+        ledger floor at all and the caller's own estimate applies.
+
+        Cheap by construction: one ``(session, agent)`` lookup in the
+        LRU-bounded index — no scan of the map and no file read. ``None``
+        when nothing matches or the match is non-positive; the caller then
+        falls back to its own estimate rather than inventing a number here.
+        """
+        if session is None:
+            return None
+        with self._lock:
+            record = self._last_by_identity.get((session, agent))
+        if record is None or record.context_after <= 0:
+            return None
+        return record.context_after
 
     def health(self) -> "dict[str, Any]":
         """The ``/health`` block. Cached state only — never touches the disk."""

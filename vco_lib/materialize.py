@@ -294,6 +294,12 @@ def _hub_port(_ctx: MaterializeContext) -> Optional[str]:
     return str(resolve_hub_port())
 
 
+def _model_selection_grid(_ctx: MaterializeContext) -> Optional[str]:
+    from vco_lib.model_selection import render_grid
+
+    return render_grid()
+
+
 _BOOT_DOC = "boot unit (value from the unit spec, vco_lib/boot_service.py)"
 
 _KEYS: Tuple[Key, ...] = (
@@ -331,6 +337,11 @@ _KEYS: Tuple[Key, ...] = (
     Key("HUB_PORT", "The vct-hub port at render time (`$VCT_HUB_PORT` → "
         "`hub.port` → 7700); a snapshot — clients re-resolve that ladder at run "
         "time", _hub_port),
+    # ── model selection (vco_lib/model_selection.py) ─────────────────────
+    Key("MODEL_SELECTION_GRID", "The per-task model-selection table, rendered "
+        "with only the rows for the model providers reachable on this machine "
+        "at render time (a snapshot; no monitoring afterwards)",
+        _model_selection_grid),
     # ── boot units: declared here, valued by the spec ────────────────────
     Key("INSTALLED_AT_PATH", _BOOT_DOC),
     Key("WORKING_DIR", _BOOT_DOC, must_exist=True),

@@ -43,17 +43,16 @@ HOOK_SRC = REPO_ROOT / "templates" / "hooks" / "pre-edit-context-inject.sh"
 # REAL production helpers copied into the sandbox so the tests exercise the
 # shipped dedup / session-id / codegraph / query-cache code paths rather than
 # the partial-install fallbacks.
+# v0.2.101 Wave 2: the pre-edit hook is a thin ROUTER wrapper — the
+# codegraph-query / query-cache / code-extensions libs are no longer sourced
+# by it (the router owns querying, caching and the code-file decision), so
+# they left this list WITH their caller. inject-budget.sh joins (the kill
+# switch the wrapper checks before spawning).
 _REAL_LIBS = (
     "seen-store.sh",
     "session-id.sh",
-    "codegraph-query.sh",
-    "query-cache.sh",
     "resolve-vco-venv.sh",
-    # v0.2.95 (lane F10): "is this a code file" moved to ONE home. Without it
-    # the hook takes its conservative partial-install branch (NOT code) and
-    # the code-graph leg never launches — which is correct behaviour, but it
-    # is not the behaviour these sandboxes exist to exercise.
-    "code-extensions.sh",
+    "inject-budget.sh",
 )
 
 # Minimal emit_additional_context that wraps the context in the PreToolUse JSON
@@ -121,89 +120,85 @@ def write_stub_producers(env: dict, kg_lines: list, code_lines: list) -> None:
     """Install stub producers that emit the given lines ONLY with --hook-format.
 
     Mirroring the real producers' ``--hook-format`` gate matters: without it, a
-    hook that DROPPED the flag would still get prefixed stdout from the stub and
-    a dedup regression would falsely pass.
+    caller that DROPPED the flag would still get prefixed stdout from the stub
+    and a dedup regression would falsely pass.
 
-    Producer-invocation quirks:
-      - the KG producer is invoked through the venv Python, so the stub MUST be
-        a Python script (a bash shebang would be ignored and Python would try to
-        parse bash);
-      - the code-graph producer is invoked via a shell wrapper, so a bash script
-        with the execute bit is correct.
+    v0.2.101 Wave 2: the hook is a thin ROUTER wrapper — the router LOADS both
+    producers in-process (``hook_dual_search._load_cg_module`` + the pinned-argv
+    shim) and calls ``main()``, so both stubs are Python MODULES accepting the
+    router's argv (KG: ``query --limit N --hook-format --injection-profile P
+    --task-type T [--transcript …]``; CG: ``structure callers <sym>
+    --hook-format [--source-file …] [--exclude-file …] [--indexed-revision]``).
+    Each stub appends its pinned argv to its marker file (``VCO_TEST_KG_MARKER``
+    / ``VCO_TEST_CG_MARKER``) so tests can prove WHICH path ran and how often.
+    The legacy bash ``code-graph-query`` CLI stub is kept for suites that still
+    pin the shell ``codegraph_query_block`` helper directly.
     """
     rl = env["scripts_dir"] / "rl_kg_search.py"
-    cg = env["cg_dir"] / "code-graph-query"
     rl_lines_repr = ",\n        ".join(repr(line) for line in kg_lines) or "''"
-    # MODULE-SHAPED (v0.2.91): `async def main()` + a `__main__` guard, so the
-    # SAME stub serves BOTH the legacy path (spawned as a CLI) and the P2 merged
-    # path (imported by hook_dual_search.py and called as `main()`).
+    # The router pins each producer's argv through hook_dual_search's shim
+    # (NOT sys.argv), so the stubs capture it with a REMAINDER positional —
+    # the recorded argv is byte-for-byte what the router passed.
     rl.write_text(
         "#!/usr/bin/env python3\n"
-        "import sys, argparse, asyncio\n"
-        "async def main():\n"
-        "    # Mirror the real producer's argparse so --hook-format is accepted.\n"
-        "    # Without the flag, emit nothing (matches the real producer).\n"
-        "    ap = argparse.ArgumentParser()\n"
-        "    ap.add_argument('query')\n"
-        "    ap.add_argument('--limit', type=int, default=1)\n"
-        "    ap.add_argument('--hook-format', action='store_true')\n"
-        "    args = ap.parse_args()\n"
-        "    if not args.hook_format:\n"
-        "        return\n"
-        "    for _line in [\n        " + rl_lines_repr + ",\n    ]:\n"
-        "        print(_line)\n"
+        "import argparse, json, os\n"
+        "def main():\n"
+        "    ap = argparse.ArgumentParser(add_help=False)\n"
+        "    ap.add_argument('rest', nargs=argparse.REMAINDER)\n"
+        "    ns = ap.parse_args()\n"
+        "    marker = os.environ.get('VCO_TEST_KG_MARKER', '')\n"
+        "    if marker:\n"
+        "        with open(marker, 'a') as fh:\n"
+        "            fh.write(json.dumps(ns.rest) + '\\n')\n"
+        "    if '--hook-format' in ns.rest:\n"
+        "        for _line in [\n            " + rl_lines_repr + ",\n        ]:\n"
+        "            print(_line)\n"
+        "    return 0\n"
         "if __name__ == '__main__':\n"
-        "    asyncio.run(main())\n",
+        "    raise SystemExit(main())\n",
         encoding="utf-8",
     )
-    cg_lines_emit = "\n    ".join(f'printf "%s\\n" "{line}"' for line in code_lines)
-    cg.write_text(
-        "#!/usr/bin/env bash\n"
-        "# Mirror the real code-graph-query's --hook-format gate.\n"
-        '# Records its invocation so a test can prove which path ran.\n'
-        '[ -n "${VCO_TEST_CG_CLI_MARKER:-}" ] && : > "$VCO_TEST_CG_CLI_MARKER"\n'
-        "_has_hook_format=0\n"
-        'for a in "$@"; do\n'
-        '    if [ "$a" = "--hook-format" ]; then _has_hook_format=1; fi\n'
-        "done\n"
-        'if [ "$_has_hook_format" = "1" ]; then\n'
-        "    " + cg_lines_emit + "\n"
-        "fi\n",
-        encoding="utf-8",
-    )
-    # The merged path loads `query_code_graph.py` as a module from beside the
-    # CLI, mirroring the real installed layout.
+    # (v0.2.101 wave-2 SF-2: the legacy bash `code-graph-query` CLI stub was
+    # retired with codegraph_query_block — nothing spawns the CLI wrapper any
+    # more; the router loads the MODULE below.)
+    # The router loads `query_code_graph.py` as a MODULE from the project's
+    # .claude/scripts (mirroring the real installed layout). REMAINDER
+    # capture records the router's PINNED argv (not sys.argv).
     cg_py_lines = "\n        ".join(f"print({line!r})" for line in code_lines) or "pass"
     (env["cg_dir"] / "query_code_graph.py").write_text(
-        "import argparse\n"
+        "import argparse, json, os\n"
         "def main():\n"
-        "    ap = argparse.ArgumentParser()\n"
-        "    sub = ap.add_subparsers(dest='command')\n"
-        "    s = sub.add_parser('search')\n"
-        "    s.add_argument('query')\n"
-        "    s.add_argument('--limit', type=int, default=2)\n"
-        "    s.add_argument('--hook-format', action='store_true')\n"
-        "    s.add_argument('--project', default=None)\n"
-        "    s.add_argument('--anchor', default=None)\n"
-        "    s.add_argument('--exclude-file', default=None)\n"
-        "    a = ap.parse_args()\n"
-        "    if a.hook_format:\n"
+        "    ap = argparse.ArgumentParser(add_help=False)\n"
+        "    ap.add_argument('rest', nargs=argparse.REMAINDER)\n"
+        "    ns = ap.parse_args()\n"
+        "    marker = os.environ.get('VCO_TEST_CG_MARKER', '')\n"
+        "    if marker:\n"
+        "        with open(marker, 'a') as fh:\n"
+        "            fh.write(json.dumps(ns.rest) + '\\n')\n"
+        "    if '--hook-format' in ns.rest:\n"
         "        " + cg_py_lines + "\n"
         "    return 0\n",
         encoding="utf-8",
     )
     rl.chmod(rl.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    cg.chmod(cg.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def install_dual_driver(env: dict) -> Path:
-    """Copy the REAL ``hook_dual_search.py`` into the sandbox.
-
-    Without it, ``vco_dual_search_cached`` returns its fallback signal and the
-    hook uses the legacy two-process path — which is a valid state to test, but
-    NOT the merged one. Call this to exercise P2 end-to-end through the hook.
-    """
+    """Copy the REAL ``hook_dual_search.py`` into the sandbox (the router
+    imports its run_legs/_pin_argv/_load_cg_module mechanism from beside
+    itself). Historical name kept for existing callers."""
     src = REPO_ROOT / "claude_mcp_servers" / "scripts" / "hook_dual_search.py"
+    dest = env["scripts_dir"] / src.name
+    dest.write_bytes(src.read_bytes())
+    return dest
+
+
+def install_router(env: dict) -> Path:
+    """Copy the REAL ``hook_context_router.py`` into the sandbox's
+    orchestrator-root scripts dir (v0.2.101: the hook resolves and runs it
+    from $VCT_INSTALL_ROOT). Pair with ``invoke_hook``'s PYTHONPATH pin so
+    the router's ``vco_lib`` imports resolve from the checkout."""
+    src = REPO_ROOT / "claude_mcp_servers" / "scripts" / "hook_context_router.py"
     dest = env["scripts_dir"] / src.name
     dest.write_bytes(src.read_bytes())
     return dest
@@ -214,13 +209,25 @@ def invoke_hook(
     session_id: str,
     file_path: str,
     *,
+    old_string: str = "",
     extra_env: "dict | None" = None,
 ) -> subprocess.CompletedProcess:
-    """Call the hook with a synthetic Edit payload on stdin."""
+    """Call the hook with a synthetic Edit payload on stdin.
+
+    v0.2.101 Wave 2: PYTHONPATH pins the checkout so the router the hook
+    spawns resolves ``vco_lib`` from THIS tree (the sandbox's fake
+    orchestrator root has no vco_lib), and the kill-switch envs are scrubbed
+    so an ambient VCT_DISABLE_HOOKS/VCO_INJECT_PROFILE can't silently skip
+    the run. ``old_string`` feeds the router's enclosing-symbol extraction.
+    """
+    tool_input = {"file_path": file_path, "new_string": "def f(): pass\n"}
+    if old_string:
+        tool_input["old_string"] = old_string
     payload = {
         "tool_name": "Edit",
         "session_id": session_id,
-        "tool_input": {"file_path": file_path, "new_string": "def f(): pass\n"},
+        "cwd": str(env["install_root"]),
+        "tool_input": tool_input,
     }
     # v0.2.29 moved CACHE_BASE into `.claude/state/edit_cache_*`, so the legacy
     # `install_root/tmp/` is no longer created as a side effect — create it here
@@ -228,10 +235,16 @@ def invoke_hook(
     tmpdir = env["install_root"] / "tmp"
     tmpdir.mkdir(parents=True, exist_ok=True)
     proc_env = {
-        **os.environ,
+        k: v for k, v in os.environ.items()
+        if k not in ("VCT_DISABLE_HOOKS", "VCO_INJECT_PROFILE",
+                     "VCO_RL_TASK_TYPE", "VCT_VENV")
+    }
+    proc_env.update({
         "VCT_INSTALL_ROOT": str(env["install_root"]),
         "TMPDIR": str(tmpdir),
-    }
+        "PYTHONPATH": str(REPO_ROOT),
+        "RL_HUB_POST_DISABLED": "1",
+    })
     if extra_env:
         proc_env.update(extra_env)
     return subprocess.run(
@@ -239,6 +252,6 @@ def invoke_hook(
         input=json.dumps(payload),
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=60,
         env=proc_env,
     )

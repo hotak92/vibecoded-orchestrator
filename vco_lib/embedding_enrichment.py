@@ -1219,8 +1219,9 @@ def enrich_collections_for_slot_change(
         (`vco_lib.embedding_enrichment`, per object, UPDATE-only, idempotent)
         fills the new slot → the collection is fully valid → the next
         `install.py --update` still sees
-        `last_installed_active_embedding != current` (enrichment never wrote
-        that key; install.py is its only writer) and re-embeds every node from
+        `last_installed_active_embedding != current` (enrichment never writes
+        that key; its writers are install.py and, since v0.2.101, the root
+        tree's clean `--all` seed run via `vco_lib.kg_context_triple`) and re-embeds every node from
         scratch.
 
     So: on a pure slot change, run the SAME enrichment the GUI runs, and on a

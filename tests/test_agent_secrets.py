@@ -35,6 +35,7 @@ from vco_lib.agent_secrets import (  # noqa: E402
     HubUnreachable,
     ProjectNotFound,
     SecretNotFound,
+    SecretPaused,
     exec_with_secrets,
     get,
 )
@@ -221,6 +222,102 @@ def test_access_denied_surfaces_when_file_store_misses(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_secrets, "_hub_get", fake_hub_get)
     with pytest.raises(AccessDenied):
         get("gated_key", project="anything")
+
+
+# ─── v0.2.101 (Q7 / audit P3-1): key_paused — paused vs absent ─────────
+
+
+def test_hub_key_paused_maps_to_secret_paused_and_falls_back_to_file_store(
+    tmp_path, monkeypatch,
+):
+    """A hub `key_paused` (the key EXISTS, its active flag is off) keeps
+    the resolver chain's behaviour: the file store still answers — the
+    launcher's pause governs keychain slots, not ~/.vct-secrets."""
+    root = tmp_path / "store"
+    (root / "shared").mkdir(parents=True)
+    (root / "shared" / "paused_key").write_text("file-copy")
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(root))
+
+    def fake_hub_get(key, project):
+        raise SecretPaused(f"key {key!r} exists but is paused")
+
+    monkeypatch.setattr(agent_secrets, "_hub_get", fake_hub_get)
+    assert get("paused_key", project="anything") == "file-copy"
+
+
+def test_secret_paused_surfaces_when_file_store_misses(tmp_path, monkeypatch):
+    """Full-chain miss on a PAUSED key raises the DISTINCT SecretPaused
+    type — and it is an AccessDenied subclass, so every existing
+    `except AccessDenied` caller keeps catching it."""
+    root = tmp_path / "store"
+    (root / "shared").mkdir(parents=True)
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(root))
+
+    def fake_hub_get(key, project):
+        raise SecretPaused(f"key {key!r} exists but is paused")
+
+    monkeypatch.setattr(agent_secrets, "_hub_get", fake_hub_get)
+    with pytest.raises(SecretPaused):
+        get("paused_key", project="anything")
+    with pytest.raises(AccessDenied):
+        get("paused_key", project="anything")
+
+
+def test_hub_404_key_paused_code_parses_to_secret_paused(monkeypatch):
+    """The `_hub_get` 404 arm must branch on the CODE: `key_paused` →
+    SecretPaused (a pause is not an absence — a writer must not "fix" it
+    by storing a second copy), `key_not_active` stays AccessDenied."""
+
+    class FakeResp:
+        status_code = 404
+
+        def json(self):
+            return {"error": {"code": "key_paused", "message": "paused"}}
+
+    monkeypatch.setattr(
+        agent_secrets, "_get_with_401_retry", lambda *a, **kw: FakeResp()
+    )
+    monkeypatch.setattr(
+        agent_secrets, "_resolve_project_id", lambda p: "proj-1"
+    )
+    with pytest.raises(SecretPaused):
+        agent_secrets._hub_get("paused_key", "proj-1")
+    # And the absent case is unchanged: same status, other code.
+    class FakeRespAbsent(FakeResp):
+        def json(self):
+            return {"error": {"code": "key_not_active", "message": "nope"}}
+
+    monkeypatch.setattr(
+        agent_secrets, "_get_with_401_retry", lambda *a, **kw: FakeRespAbsent()
+    )
+    with pytest.raises(AccessDenied) as ei:
+        agent_secrets._hub_get("absent_key", "proj-1")
+    assert not isinstance(ei.value, SecretPaused)
+
+
+def test_lookup_stored_reports_paused_distinctly(tmp_path, monkeypatch):
+    """`lookup_stored` maps a hub `key_paused` (with no file-store copy)
+    to STORED_PAUSED — never STORED_ABSENT, so the .env migration refuses
+    to store over a deliberate pause. Absent and hub-down stay as they
+    were."""
+    root = tmp_path / "store"
+    (root / "shared").mkdir(parents=True)
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(root))
+
+    def paused(key, project):
+        raise SecretPaused(f"key {key!r} exists but is paused")
+
+    def absent(key, project):
+        raise SecretNotFound(f"key {key!r} not found")
+
+    monkeypatch.setattr(agent_secrets, "_hub_get", paused)
+    assert agent_secrets.lookup_stored("k", project="p") == (
+        agent_secrets.STORED_PAUSED, None,
+    )
+    monkeypatch.setattr(agent_secrets, "_hub_get", absent)
+    assert agent_secrets.lookup_stored("k", project="p") == (
+        agent_secrets.STORED_ABSENT, None,
+    )
 
 
 # ─── v0.2.77 L3-F3: 403 forbidden classification ────────────────────────

@@ -698,7 +698,7 @@ class TestSSotParityAcrossConsumers:
 # Invoke-VcoCodegraphQueryBlock invocation must literally forward
 # prompt_id/transcript. This is the "correct-but-undelivered" defect class
 # this release exists to remove: the shared function can be fully correct
-# (see tests/test_query_cache_v0277.py's unit-level coverage of
+# (see tests/test_v02101_query_cache_poison_fix.py's coverage of
 # codegraph_query_block itself) while a hook's call site silently drops the
 # new args, leaving the capability unreachable in practice. Mirrors the
 # existing --hook-format pin discipline in
@@ -726,16 +726,30 @@ def _non_comment_lines_containing(body: str, needle: str) -> list[tuple[int, str
 
 
 # (hook file, expected minimum count of real codegraph_query_block calls)
-_SH_CODEGRAPH_CALL_SITES = [
-    "templates/hooks/pre-tool-use.sh",
+# v0.2.101 Wave 2: the hook-level codegraph_query_block call sites are ALL
+# retired (pre-bash/pre-edit became thin router wrappers; pre-tool-use's
+# Read/Grep branches moved to the router hooks — pinned by
+# test_codegraph_hook_gates_v0270.py). The transcript/prompt_id forwarding
+# property moved WITH them: see TestHookCallSitesForwardTranscript below.
+_SH_CODEGRAPH_CALL_SITES: list[str] = []
+
+_PS1_CODEGRAPH_CALL_SITES: list[str] = []
+
+#: The router (the new ONE call site for injection-surface producers) and
+#: the thin wrappers that must hand it the FULL payload (transcript_path
+#: travels inside the stdin JSON — never argv, R31).
+_ROUTER_REL = "claude_mcp_servers/scripts/hook_context_router.py"
+
+_SH_WRAPPER_SITES = [
     "templates/hooks/pre-bash-context-inject.sh",
     "templates/hooks/pre-edit-context-inject.sh",
+    "templates/hooks/pre-write-context-inject.sh",
 ]
 
-_PS1_CODEGRAPH_CALL_SITES = [
-    "templates/hooks/pre-tool-use.ps1",
+_PS1_WRAPPER_SITES = [
     "templates/hooks/pre-bash-context-inject.ps1",
     "templates/hooks/pre-edit-context-inject.ps1",
+    "templates/hooks/pre-write-context-inject.ps1",
 ]
 
 # The KG-side wrappers are the OTHER half of the same capability and were
@@ -743,23 +757,24 @@ _PS1_CODEGRAPH_CALL_SITES = [
 # of them would leave KG retrieval unenriched with every test still green —
 # the same "correct-but-undelivered" shape the codegraph pins above exist to
 # catch. Same file set, same flags, one more function name each.
-_SH_KG_CALL_SITES = [
-    "templates/hooks/pre-tool-use.sh",
-    "templates/hooks/pre-bash-context-inject.sh",
-    "templates/hooks/pre-edit-context-inject.sh",
-]
+# v0.2.101 wave-3: ALL shell KG call sites are retired — pre-bash/pre-edit in
+# wave 2 (thin router wrappers) and pre-tool-use §5 in wave 3 (review nit-6,
+# the double-emission consolidation; _lib/query-cache.sh was deleted with it).
+# The transcript/prompt_id forwarding property lives entirely in the router
+# now — pinned below (literal) and BEHAVIOURALLY by
+# test_v02101_router_surfaces.py::test_kg_leg_receives_transcript_path.
+_SH_KG_CALL_SITES: list[str] = []
 
-_PS1_KG_CALL_SITES = [
-    "templates/hooks/pre-tool-use.ps1",
-    "templates/hooks/pre-bash-context-inject.ps1",
-    "templates/hooks/pre-edit-context-inject.ps1",
-]
+_PS1_KG_CALL_SITES: list[str] = []
 
 #: Shell wrappers that carry the KG leg. ``vco_dual_search_cached`` runs the
 #: KG + code-graph pair in one interpreter (pre-edit only), so it must forward
 #: the flags too or the merged fast path silently loses what the legacy
 #: two-process fallback keeps.
-_SH_KG_FUNCS = ("vco_kg_search_cached", "vco_dual_search_cached")
+# v0.2.101 wave-2 review SF-2: vco_dual_search_cached retired (zero live
+# callers after the pre-edit rework); vco_kg_search_cached survives in
+# pre-tool-use until the wave-3 consolidation.
+_SH_KG_FUNCS = ("vco_kg_search_cached",)
 _PS1_KG_FUNCS = ("Invoke-VcoKgSearchCached", "Invoke-VcoDualSearchCached")
 
 
@@ -791,79 +806,90 @@ def _logical_lines(body: str, continuation: str) -> list[tuple[int, str]]:
 
 
 class TestHookCallSitesForwardTranscript:
-    """WP-E coordinator condition 2: pin the flag at every real call site
-    so a future edit that silently drops $PROMPT_ID / $TRANSCRIPT_PATH (or
-    the .ps1 -PromptId / -TranscriptPath equivalents) fails a test instead
-    of shipping an unreachable capability.
+    """WP-E coordinator condition 2, v0.2.101 RETARGET: pin the flag at every
+    real call site so a future edit that silently drops transcript/prompt_id
+    forwarding fails a test instead of shipping an unreachable capability.
+
+    The code-graph call sites this class originally pinned are retired: the
+    injection surfaces' CG leg is now an EXACT structure lookup (no embedding
+    → nothing to enrich → deliberately no --transcript), and the KG leg's
+    forwarding moved into hook_context_router.py. The chain is now:
+
+      wrapper pipes the FULL hook payload (transcript_path INSIDE the JSON,
+      never argv — R31) → router resolves transcript_path/prompt_id →
+      KG argv carries ``--transcript <path>`` (literal-token discipline, the
+      same shape the original WP-E pin demanded) → the router's kgi/cgi cache
+      keys are prompt_id-scoped (cross-turn re-ask is a MISS, R31 cond. 4).
+
+    The behavioural end-to-end proof (stub producer records the argv) lives in
+    test_v02101_router_surfaces.py; these rows are the literal-token pins.
     """
 
-    @pytest.mark.parametrize("rel_path", _SH_CODEGRAPH_CALL_SITES)
-    def test_sh_hook_forwards_prompt_id_and_transcript_to_codegraph_query_block(
-        self, rel_path: str
-    ) -> None:
-        hook_path = _repo_root() / rel_path
-        body = hook_path.read_text(encoding="utf-8")
-        invocations = [
-            (i, line)
-            for i, line in _non_comment_lines_containing(body, "codegraph_query_block")
-            # Exclude the `command -v codegraph_query_block` availability
-            # probes and any other non-invocation mention (e.g. definition
-            # comments referencing the function name) — a real invocation
-            # opens with `codegraph_query_block "` (quoted first arg).
-            if 'codegraph_query_block "' in line
-        ]
-        assert invocations, (
-            f"{rel_path}: no real codegraph_query_block invocation found "
-            f"(only non-invocation mentions such as `command -v` probes)."
+    def test_router_threads_transcript_into_the_kg_argv(self) -> None:
+        body = (_repo_root() / _ROUTER_REL).read_text(encoding="utf-8")
+        assert '"--transcript", transcript_path' in body, (
+            "hook_context_router.py must append --transcript <path> to the KG "
+            "producer argv as a literal token — dropping it silently loses "
+            "query enrichment (R29/R30), the exact 'correct-but-undelivered' "
+            "defect class WP-E targeted."
         )
-        for i, line in invocations:
-            assert "$PROMPT_ID" in line, (
-                f"{rel_path}:{i + 1}: codegraph_query_block call is missing "
-                f"$PROMPT_ID — this silently drops cache-key scoping across "
-                f"turns (R31/coordinator condition 4):\n{line}"
-            )
-            assert "$TRANSCRIPT_PATH" in line, (
-                f"{rel_path}:{i + 1}: codegraph_query_block call is missing "
-                f"$TRANSCRIPT_PATH — this silently drops code-graph query "
-                f"enrichment (R29/R30), reproducing the exact "
-                f"'correct-but-undelivered' defect class this release "
-                f"targets:\n{line}"
+
+    def test_router_scopes_its_cache_keys_by_prompt_id(self) -> None:
+        body = (_repo_root() / _ROUTER_REL).read_text(encoding="utf-8")
+
+        def _call_text(start: int) -> str:
+            """The balanced-paren call text starting at `start` (the calls
+            span lines — a per-line scan would be vacuous)."""
+            depth = 0
+            for i in range(start, len(body)):
+                if body[i] == "(":
+                    depth += 1
+                elif body[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return body[start:i + 1]
+            return body[start:start + 300]
+
+        for namespace in ("kgi", "cgi"):
+            idx = body.find(f'cache_key("{namespace}"')
+            assert idx > 0, f"the router's {namespace} cache namespace went missing"
+            assert "prompt_id" in _call_text(idx), (
+                f"the {namespace} cache key must be prompt_id-scoped "
+                "(R31/coordinator condition 4): two turns issuing the same "
+                "short trigger embed differently and must not collide on one "
+                "cache entry"
             )
 
-    @pytest.mark.parametrize("rel_path", _PS1_CODEGRAPH_CALL_SITES)
-    def test_ps1_hook_forwards_prompt_id_and_transcript_to_invoke_codegraph_query_block(
-        self, rel_path: str
-    ) -> None:
-        hook_path = _repo_root() / rel_path
-        body = hook_path.read_text(encoding="utf-8")
-        invocations = [
-            (i, line)
-            for i, line in _non_comment_lines_containing(
-                body, "Invoke-VcoCodegraphQueryBlock"
-            )
-            # Exclude the `Get-Command Invoke-VcoCodegraphQueryBlock`
-            # availability probes — a real invocation assigns the result
-            # (`= Invoke-VcoCodegraphQueryBlock -Query ...`).
-            if "= Invoke-VcoCodegraphQueryBlock " in line
+    @pytest.mark.parametrize("rel_path", _SH_WRAPPER_SITES)
+    def test_sh_wrappers_pipe_the_full_payload_to_the_router(self, rel_path: str) -> None:
+        body = (_repo_root() / rel_path).read_text(encoding="utf-8")
+        executable = [
+            ln for ln in body.splitlines() if not ln.lstrip().startswith("#")
         ]
-        assert invocations, (
-            f"{rel_path}: no real Invoke-VcoCodegraphQueryBlock invocation "
-            f"found (only non-invocation mentions such as Get-Command probes)."
+        joined = "\n".join(executable)
+        assert '"$ROUTER"' in joined and '"$HOOK_STDIN"' in joined, (
+            f"{rel_path} must pipe the FULL stdin payload into the router — "
+            "transcript_path/prompt_id travel inside that JSON (R31: never argv)"
         )
-        for i, line in invocations:
-            assert "-PromptId $PromptId" in line, (
-                f"{rel_path}:{i + 1}: Invoke-VcoCodegraphQueryBlock call is "
-                f"missing -PromptId $PromptId — this silently drops "
-                f"cache-key scoping across turns (R31/coordinator "
-                f"condition 4):\n{line}"
-            )
-            assert "-TranscriptPath $TranscriptPath" in line, (
-                f"{rel_path}:{i + 1}: Invoke-VcoCodegraphQueryBlock call is "
-                f"missing -TranscriptPath $TranscriptPath — this silently "
-                f"drops code-graph query enrichment (R29/R30), reproducing "
-                f"the exact 'correct-but-undelivered' defect class this "
-                f"release targets:\n{line}"
-            )
+        assert "--transcript" not in joined, (
+            f"{rel_path} must not pass the transcript as a wrapper-level argv "
+            "flag — the router resolves it from the payload"
+        )
+
+    @pytest.mark.parametrize("rel_path", _PS1_WRAPPER_SITES)
+    def test_ps1_wrappers_pipe_the_full_payload_to_the_router(self, rel_path: str) -> None:
+        body = (_repo_root() / rel_path).read_text(encoding="utf-8-sig")
+        executable = [
+            ln for ln in body.splitlines()
+            if not ln.lstrip().startswith(("#", "<#"))
+        ]
+        joined = "\n".join(executable)
+        assert "$Router" in joined and "$HookStdin" in joined, (
+            f"{rel_path} must pipe the FULL stdin payload into the router (R31)"
+        )
+        assert "--transcript" not in joined, (
+            f"{rel_path} must not pass the transcript as a wrapper-level flag"
+        )
 
 
 class TestHookCallSitesForwardTranscriptToKgSearch:
@@ -892,7 +918,7 @@ class TestHookCallSitesForwardTranscriptToKgSearch:
                     invocations.append((i, line))
                     break
         assert invocations, (
-            f"{rel_path}: no real vco_kg_search_cached / vco_dual_search_cached "
+            f"{rel_path}: no real vco_kg_search_cached "
             f"invocation found (only non-invocation mentions such as "
             f"`command -v` probes)."
         )
@@ -944,32 +970,30 @@ class TestHookCallSitesForwardTranscriptToKgSearch:
             )
 
     def test_pin_sees_the_multi_line_dual_search_invocation(self) -> None:
-        """The pin must not pass by simply finding nothing to check.
-
-        ``vco_dual_search_cached`` / ``Invoke-VcoDualSearchCached`` are the
-        merged-fast-path calls and are the only ones spanning several physical
-        lines; a naive per-line scan would silently skip them and the
-        assertions above would then be vacuous for pre-edit.
+        """Anti-vacuity pin, v0.2.101 retarget: this row used to prove the
+        per-line scan above actually SAW pre-edit's multi-line
+        ``vco_dual_search_cached`` invocation. That call was retired from the
+        wrapper (the router's ``run_legs`` IS the merged path now), so the
+        anti-vacuity subject moved with it: the router must really build the
+        KG argv (multi-line list concatenation) with BOTH the profile flag and
+        the transcript append inside ``_run_legs`` — a scan that found
+        neither would mean the pins above are vacuous.
         """
         sh = (_repo_root() / "templates/hooks/pre-edit-context-inject.sh").read_text(
             encoding="utf-8"
         )
-        sh_hits = [
-            line
-            for _i, line in _logical_lines(sh, "\\")
-            if 'vco_dual_search_cached "' in line and not line.lstrip().startswith("#")
-        ]
-        assert sh_hits, "pre-edit-context-inject.sh: dual-search invocation not located"
-        assert all("$TRANSCRIPT_PATH" in line for line in sh_hits)
-
-        ps1 = (_repo_root() / "templates/hooks/pre-edit-context-inject.ps1").read_text(
-            encoding="utf-8"
+        assert "vco_dual_search_cached" not in sh, (
+            "the wrapper-level dual-search call must stay retired — the "
+            "router's run_legs is the merged path (double-injection risk)"
         )
-        ps1_hits = [
-            line
-            for _i, line in _logical_lines(ps1, "`")
-            if "= Invoke-VcoDualSearchCached " in line
-            and not line.lstrip().startswith("#")
-        ]
-        assert ps1_hits, "pre-edit-context-inject.ps1: dual-search invocation not located"
-        assert all("-TranscriptPath $TranscriptPath" in line for line in ps1_hits)
+        router = (_repo_root() / _ROUTER_REL).read_text(encoding="utf-8")
+        legs_idx = router.find("def _run_legs(")
+        assert legs_idx > 0, "hook_context_router.py: _run_legs not located"
+        legs_body = router[legs_idx:]
+        assert '"--injection-profile", plan.kg_profile' in legs_body, (
+            "the router's KG argv build went missing — the transcript pin "
+            "above would be vacuous"
+        )
+        assert '"--transcript", transcript_path' in legs_body, (
+            "the --transcript append must live INSIDE _run_legs' argv build"
+        )

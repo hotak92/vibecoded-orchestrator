@@ -12,7 +12,9 @@ specify which collection to search.
 Core Tools:
 - hybrid_search: Combined semantic + keyword across KG + docs (use this first)
 - semantic_graph_search: Semantic + WikiLink traversal (GraphRAG)
-- get_node_connections: Navigate WikiLink relationships
+  (node-connection lookup is served by semantic_graph_search's
+  connected-nodes traversal — it superseded the never-registered
+  get_node_connections helper, retired in v0.2.101)
 - store_knowledge_node: Persist knowledge nodes
 - search_code_graph: Find code entities by concept/purpose
 - query_code_structure: Query dependencies, callers, inheritance, interactions
@@ -1406,14 +1408,15 @@ def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
 mcp = FastMCP(
     "weaviate-kg",
     instructions=(
-        "Semantic knowledge graph and code graph. "
-        "ALWAYS call hybrid_search BEFORE using Grep or Read for conceptual, architectural, or pattern questions — "
-        "it searches semantic embeddings across KG + project docs and finds results that literal grep cannot. "
-        "Only fall back to Grep for exact literal strings (variable names, error messages). "
-        "Tool order: hybrid_search (concepts) → semantic_graph_search (relationships) → "
-        "search_code_graph (code by purpose) → query_code_structure (callers, deps, inheritance). "
-        "store_knowledge_node persists new knowledge (scope='project' default, scope='shared' for cross-project). "
-        "describe_excalidraw inspects .excalidraw diagram files that hybrid_search returns as diagram results."
+        "Semantic knowledge graph and code graph. Call hybrid_search BEFORE "
+        "Grep/Read for conceptual, architectural, or pattern questions — it "
+        "searches semantic embeddings across the KG + project docs; fall back "
+        "to Grep only for exact literal strings. Tool order: hybrid_search "
+        "(concepts) → semantic_graph_search (relationships) → "
+        "search_code_graph (code by purpose) → query_code_structure (callers, "
+        "deps, inheritance). store_knowledge_node persists new knowledge "
+        "(scope='project' default, 'shared' cross-project). describe_excalidraw "
+        "inspects .excalidraw files hybrid_search returns as diagrams."
     )
 )
 
@@ -2774,19 +2777,34 @@ def _fetch_node_chunks(
     cannot see simply shrink the window, which the caller reports as a
     PARTIAL view (no ``coverage: complete`` hint) rather than silently
     mis-assembling another node's chunks into this one.
+
+    v0.2.101 pull-in ③: ``title`` and ``file_path`` are word-TOKENIZED, so the
+    two ``Equal`` clauses only NARROW — title "Knowledge Graph" at
+    ``knowledge-graph.md`` token-matches "Orchestrator Knowledge Graph" at
+    ``orchestrator-knowledge-graph.md``, and that node's chunks were assembled
+    into this window. Rows are now confirmed in Python
+    (``vco_lib.weaviate_exact_match``): exact ``file_path``, same title token
+    sequence. The row bound is unchanged (``(total or max_chunks) + 1``) but
+    now counts CONFIRMED rows, paging past any sibling flood.
     """
     try:
+        import vco_lib.weaviate_exact_match as _wem
+
         chunk_filter = Filter.by_property("title").equal(title)
         if file_path:
             chunk_filter = chunk_filter & Filter.by_property("file_path").equal(
                 file_path
             )
-        objs = coll.query.fetch_objects(
-            filters=chunk_filter,
-            limit=(total or max_chunks) + 1,
+        objs = _wem.fetch_matching_rows(
+            coll,
+            chunk_filter,
+            _wem.exact_row_predicate(
+                paths={"file_path": file_path}, same_tokens={"title": title},
+            ),
+            max_matches=(total or max_chunks) + 1,
         )
         chunk_list: list[tuple[int, str]] = []
-        for obj in objs.objects:
+        for obj in objs:
             cn = obj.properties.get("chunk_num", 0) or 0
             chunk_list.append((cn, obj.properties.get("content", "") or ""))
         chunk_list.sort(key=lambda x: x[0])
@@ -3664,10 +3682,91 @@ def _kg_vocabulary():
                 exc,
             )
         return None
-    base = Path(KG_BASE_DIR) if KG_BASE_DIR else (
+    return load_vocabulary(_kg_vocabulary_base())
+
+
+def _kg_vocabulary_base() -> Path:
+    """The project root the OPEN vocabulary is read from AND auto-extended
+    into — the SAME root relative .md writes resolve to: KG_BASE_DIR →
+    CLAUDE_PROJECT_DIR chain → the server-inferred base. One home so
+    ``_kg_vocabulary`` (read) and the store path's ``extend_vocabulary``
+    (write, v0.2.101 P299-A3) can never target different trees."""
+    return Path(KG_BASE_DIR) if KG_BASE_DIR else (
         _resolve_project_root_for_deferral() or _SERVER_INFERRED_BASE
     )
-    return load_vocabulary(base)
+
+
+def _node_type_vocabulary_gate(node_type: object):
+    """v0.2.101 P299-A3 — the store path's node-type gate.
+
+    SAME shared decision as ``sync_knowledge_graph.sync_node`` and the
+    drift scanner's skip predicate (one home: ``vco_lib.kg_vocabulary``):
+
+    * INVALID (empty/malformed) → a refusal error string. The caller
+      returns it BEFORE any write (no Weaviate row, no .md file,
+      ``file_written`` honestly False) — garbage node types are never
+      stored and never silently accepted.
+    * EXTENDABLE (wellformed, undeclared) → the type is APPENDED to the
+      project's ``knowledge/VOCABULARY.md`` (open vocabulary — the
+      owner-directed auto-extend) and the node is stored normally.
+    * KNOWN → nothing.
+
+    Returns ``(refusal_error, extended_aliases, note)``. ``refusal_error``
+    is None unless the type is INVALID; ``note`` carries a loud soft-fail
+    line when the vocabulary append itself could not be written (the node
+    is still stored — a vocabulary write failure must never drop a node).
+
+    VERSION SKEW (kg_vocabulary unimportable, or older than the gate — the
+    only ImportError branch, same contract as ``_kg_vocabulary``): the gate
+    stays OFF and the historical accept-everything behaviour is preserved
+    (``_kg_vocabulary`` already warned once at module level).
+    """
+    try:
+        from vco_lib.kg_vocabulary import (
+            TYPE_EXTENDABLE,
+            TYPE_INVALID,
+            classify_node_type,
+            extend_vocabulary,
+        )
+    except ImportError:
+        return None, [], None
+
+    vocab = _kg_vocabulary()
+    if vocab is None:  # skew — import worked above but the loader degraded
+        return None, [], None
+
+    decision = classify_node_type(node_type, vocab)
+    if decision == TYPE_INVALID:
+        return (
+            f"invalid node_type {node_type!r}: must be a non-empty single "
+            f"token of letters/digits/'-'/'_' — an empty or malformed type "
+            f"is never stored. Use a declared type from "
+            f"knowledge/VOCABULARY.md (project, concept, tool, research, "
+            f"model, hardware, pattern, insight, guide, …), or ANY "
+            f"wellformed new one: an undeclared wellformed type is "
+            f"auto-declared in the vocabulary, not rejected.",
+            [],
+            None,
+        )
+    if decision == TYPE_EXTENDABLE:
+        result = extend_vocabulary(_kg_vocabulary_base(), [node_type])
+        note = None
+        if result.error:
+            note = (
+                f"could not auto-declare node type '{node_type}' in "
+                f"knowledge/VOCABULARY.md ({result.error}) — the node was "
+                f"stored anyway; declare the type manually to silence "
+                f"validation warnings"
+            )
+            logger.warning("weaviate-kg: %s", note)
+        elif result.added:
+            logger.info(
+                "weaviate-kg: auto-declared node type %r in %s (open "
+                "vocabulary — P299-A3)",
+                result.added[0], result.vocabulary_path,
+            )
+        return None, list(result.added), note
+    return None, [], None
 
 
 def _normalize_kg_file_path(file_path: str, node_type: str, title: str) -> tuple[str, list[str]]:
@@ -4831,7 +4930,20 @@ def _fetch_adjacent_chunks(coll, title: str, hit_num: int, total: int,
     lack a file_path (legacy rows; none measured live).
 
     Returns formatted result dicts with distance=None (exact neighbour fetch).
+
+    v0.2.101 pull-in ③: "exact" was not true — ``file_path`` and ``title`` are
+    word-TOKENIZED, so ``file_path Equal knowledge/concepts/knowledge-graph.md
+    AND chunk_num Equal 2`` also matched chunk 2 of
+    ``orchestrator-knowledge-graph.md``, and ``limit=1`` could return THAT row
+    as this node's neighbour. Both strategies now confirm rows in Python
+    (``vco_lib.weaviate_exact_match``): Strategy 1 keeps only the exact
+    ``file_path``; the Strategy 2 title fallback keeps only the same title
+    token sequence and, when this result has a path, rejects rows stamped
+    with a DIFFERENT path (another node) while still serving path-less legacy
+    rows (its reason to exist).
     """
+    import vco_lib.weaviate_exact_match as _wem
+
     target_nums = set()
     if hit_num > 1:
         target_nums.add(hit_num - 1)
@@ -4850,8 +4962,11 @@ def _fetch_adjacent_chunks(coll, title: str, hit_num: int, total: int,
                     Filter.by_property("file_path").equal(file_path)
                     & Filter.by_property("chunk_num").equal(target_num)
                 )
-                result = coll.query.fetch_objects(filters=prop_filter, limit=1)
-                for obj in result.objects:
+                obj = _wem.fetch_first_matching_row(
+                    coll, prop_filter,
+                    _wem.exact_row_predicate(paths={"file_path": file_path}),
+                )
+                if obj is not None:
                     neighbours.append(_format_obj(obj, collection_name, distance=None))
         except Exception:
             # file_path / chunk_num properties may not exist on this collection;
@@ -4866,11 +4981,17 @@ def _fetch_adjacent_chunks(coll, title: str, hit_num: int, total: int,
 
     # Strategy 2: Fallback -- title filter + content-prefix parsing (old objects)
     try:
-        all_objs = coll.query.fetch_objects(
-            filters=Filter.by_property("title").equal(title),
-            limit=total,
+        all_objs = _wem.fetch_matching_rows(
+            coll,
+            Filter.by_property("title").equal(title),
+            _wem.exact_row_predicate(
+                paths={"file_path": file_path},
+                same_tokens={"title": title},
+                missing_path_ok=True,
+            ),
+            max_matches=total or None,
         )
-        for obj in all_objs.objects:
+        for obj in all_objs:
             content = obj.properties.get("content", "")
             parsed = _parse_chunk_header(content)
             if parsed and parsed[0] in remaining:
@@ -5101,69 +5222,6 @@ _CODE_STRUCTURE_TELEMETRY_MAX_NODES = _rl_state._CODE_STRUCTURE_TELEMETRY_MAX_NO
 DUAL_RL_LOG_ENABLED_ENV = _rl_state.DUAL_RL_LOG_ENABLED_ENV
 
 
-async def search_single_collection(collection_name: str, query: str, limit: int, filters=None) -> list:
-    """
-    Search a collection and return formatted results.
-
-    For chunked nodes (content prefixed with '[chunk N/total]'), also fetches
-    the immediately preceding and following chunks so callers receive full
-    context without needing a second query.  Dedup is by (title, chunk_number).
-    """
-    try:
-        client = get_weaviate_client()
-        coll = client.collections.get(collection_name)
-
-        # Search with near_vector (Ollama embeddings) or near_text (Weaviate vectorizer)
-        if EMBEDDING_SOURCE == "weaviate":
-            nv_kwargs = dict(query=query, limit=limit, return_metadata=["distance"])
-            if filters:
-                nv_kwargs["filters"] = filters
-            response = coll.query.near_text(**nv_kwargs)
-        else:
-            vector, target_name = await _get_search_vector(query)
-            nv_kwargs = dict(near_vector=vector, limit=limit, return_metadata=["distance"])
-            if filters:
-                nv_kwargs["filters"] = filters
-            if target_name:
-                nv_kwargs["target_vector"] = target_name
-            response = coll.query.near_vector(**nv_kwargs)
-
-        # Primary hits
-        results: list[dict] = []
-        # W7: per-NODE chunk identity (see `_node_chunk_key`) — a
-        # (title, chunk_number) key drops a colliding node's whole result.
-        seen: set = set()
-
-        for obj in response.objects:
-            formatted = _format_obj(obj, collection_name, obj.metadata.distance)
-            key = _node_chunk_key(formatted)
-            if key not in seen:
-                seen.add(key)
-                results.append(formatted)
-
-        # Neighbour chunks for any chunked primary hits
-        neighbour_candidates: list[dict] = []
-        for r in list(results):
-            if r["chunk_number"] is not None:
-                neighbours = _fetch_adjacent_chunks(
-                    coll, r["title"], r["chunk_number"], r["total_chunks"],
-                    collection_name,
-                    file_path=r.get("file_path") or "",
-                )
-                neighbour_candidates.extend(neighbours)
-
-        for nb in neighbour_candidates:
-            key = _node_chunk_key(nb)
-            if key not in seen:
-                seen.add(key)
-                results.append(nb)
-
-        return results
-    except Exception as e:
-        logger.warning(f"Failed to search collection {collection_name}: {e}")
-        return []
-
-
 # V52-I Fix A (2026-06-09): per-collection cache of whether `valid_until`
 # property exists. The MCP fans hybrid_search / semantic_graph_search across
 # {project KG, shared KG, peer KGs, _Development, _Diagrams} but only the
@@ -5304,39 +5362,17 @@ async def semantic_graph_search(
     include_stale: bool = False,
 ) -> str:
     """
-    Semantic search with WikiLink graph traversal (GraphRAG). Finds concepts
-    related to the query AND their connected neighbors via typed WikiLinks
-    (uses, implements, extends, buildsOn, relatedTo).
+    Semantic search WITH WikiLink graph traversal (GraphRAG): concepts related
+    to the query plus connected neighbours via typed WikiLinks (uses,
+    implements, extends, buildsOn, relatedTo). For simple lookups use
+    hybrid_search.
 
-    Use when exploring how concepts relate to each other, tracing dependency
-    chains, or understanding the broader context around a topic. Returns both
-    primary matches and their graph neighbors.
+    Args: query (concept to explore); limit (max primary results, default 5);
+    depth (1 = primary only; 2 default+ = one hop of neighbours); detail
+    ("auto" default; neighbours always "summary"); include_stale (False
+    excludes superseded).
 
-    When to use: "what depends on X?", "what concepts are related to Y?",
-    "show me the network around Z". Best for exploring connections.
-    Example: semantic_graph_search("update deferral pattern") returns matching
-    nodes plus the concepts they link to via [[uses::...]] / [[buildsOn::...]].
-    When NOT to use: simple factual lookups — use hybrid_search instead.
-
-    Args:
-        query: Natural language query describing the concept to explore
-        limit: Max primary results (default: 5). Connected nodes are additional.
-        depth: 1 = primary matches only, no neighbor fetch. 2 (default) or
-               higher = also fetch the nodes WikiLinked from the primary
-               matches (one hop, up to 10 neighbors). Values above 2 behave
-               the same as 2.
-        detail: Verbosity tier per result (default "auto"). See hybrid_search
-            for the full tier semantics. Auto-mode applies per-result score
-            tiering to primary results. Connected nodes always render at the
-            "summary" tier regardless of this value — graph topology, not
-            relevance score, selected them, so they carry no score to tier on.
-        include_stale: Default False excludes nodes whose valid_until date has
-            passed. Pass True only when superseded knowledge is wanted.
-
-    Returns:
-        JSON with primary_results (direct matches) + connected_nodes (graph
-        neighbors discovered via WikiLink traversal). Each result carries title,
-        file_path, node_type, score, tier, and content at the chosen detail.
+    Returns: JSON — primary_results + connected_nodes, same fields as above.
     """
     # Loud-fail wrapper (2026-05-08 silent-zero antipattern fix v2).
     # Catches BOTH connection-time and query-time Weaviate failures.
@@ -5730,12 +5766,20 @@ async def _semantic_graph_search_body(
                 if handle is None:
                     continue
                 try:
-                    results = handle.query.fetch_objects(
-                        filters=Filter.by_property("title").equal(title),
-                        limit=1
+                    # v0.2.101 pull-in ③: `title` is word-TOKENIZED, so a
+                    # `limit=1` Equal could return a TOKEN-SUPERSET title
+                    # ([[Weaviate]] → "Weaviate Windows Ports Gotcha") as the
+                    # neighbour. The first row with the SAME title token
+                    # sequence wins (case / punctuation still ignored, as a
+                    # WikiLink needs).
+                    import vco_lib.weaviate_exact_match as _wem
+
+                    obj = _wem.fetch_first_matching_row(
+                        handle,
+                        Filter.by_property("title").equal(title),
+                        _wem.exact_row_predicate(same_tokens={"title": title}),
                     )
-                    if results.objects:
-                        obj = results.objects[0]
+                    if obj is not None:
                         formatted = _format_obj(obj, coll_name, distance=None)
                         # Per-collection chunk enrichment so adjacent chunks
                         # come from the right collection.
@@ -6146,59 +6190,18 @@ async def hybrid_search(
     include_stale: bool = False,
 ) -> str:
     """
-    Combined semantic + keyword search across KG and project docs.
-    Use this as the DEFAULT and FIRST search tool for any conceptual,
-    architectural, pattern, or knowledge query. Do NOT use Grep or Read for
-    conceptual questions — this tool searches semantic embeddings and finds
-    results that literal string matching cannot.
+    Combined semantic + keyword search over the project KG, shared KG and
+    project docs; the FIRST tool for conceptual/architectural questions.
+    Grep/Read only for exact literal strings.
 
-    Automatically searches project KG, shared KG, and project docs. No need
-    to specify collections — scoping is handled transparently via env vars.
-    Pass days=N to filter by recency.
+    Args: query (what to find); limit (default 5); node_type (optional; type
+    set is OPEN — knowledge/VOCABULARY.md); tags (without '#'); days (recency
+    filter); include_stale (False excludes superseded); detail ("auto" default,
+    else a tier name, "titles"…"full" —
+    knowledge/concepts/score-driven-retrieval-tiers.md).
 
-    When to use: asking "how does X work?", "what patterns exist for Y?",
-    "what was decided about Z?", or any question about concepts, architecture,
-    decisions, or project knowledge.
-    Example: hybrid_search("embedding model fallback strategy") finds nodes
-    about hardware-tiered embedding selection even if none contain that
-    exact phrase.
-
-    When NOT to use: searching for exact literal strings like variable names,
-    error messages, or specific file paths — use Grep for those instead. For
-    finding code entities by purpose, use search_code_graph; for exploring
-    how KG concepts link to each other, use semantic_graph_search.
-
-    Args:
-        query: Natural language query describing what you want to find
-        limit: Max results to return (default: 5)
-        node_type: Filter by type (built-ins: project, concept, tool, model,
-            hardware, research, pattern, insight, guide — the set is OPEN:
-            projects may declare additional types in knowledge/VOCABULARY.md)
-        tags: Filter by tags (e.g., ["AI", "python"])
-        days: If set, only return nodes updated in the last N days
-        include_stale: Default False excludes nodes whose valid_until date has
-            passed (superseded knowledge). Pass True only when you deliberately
-            need expired/superseded nodes (audits, history research).
-        detail: Verbosity tier per result. Default "auto" — selected per result by
-            relevance score (thresholds env-tunable via KG_TIER_*):
-              - score < 0.42  → discarded (noise)
-              - 0.42..0.55    → "summary" (LLM description, ~6 lines)
-              - 0.55..0.65    → "single_chunk" (matched chunk, ~2000 chars)
-              - 0.65..0.75    → "three_chunks" (matched + neighbours)
-              - >= 0.75       → "full" (whole node, up to 7 nearest chunks)
-            Explicit overrides apply uniformly to all results:
-              - "titles"        → title + file_path + node_type only
-              - "summary"       → LLM description / summary / 200-char content
-                                  ("descriptions" is an accepted alias)
-              - "single_chunk"  → matched chunk only
-              - "three_chunks"  → 3 chunks centred on hit
-              - "full"          → whole node (assembled from chunks when the node
-                                  is chunked; 300-char snippet for unchunked)
-
-    Returns:
-        JSON with deduplicated results ranked by combined semantic + keyword score.
-        Each result includes title, file_path, node_type, score (0..1), tier (the
-        verbosity actually applied), and content at the requested detail level.
+    Returns: JSON ranked by score — title, file_path, node_type, score, tier,
+    content.
     """
     # Loud-fail wrapper (2026-05-08 silent-zero antipattern fix v2).
     # Catches BOTH connection-time (get_weaviate_client raises
@@ -6685,32 +6688,14 @@ async def _hybrid_search_body(
 @mcp.tool()
 async def describe_excalidraw(file_path: str) -> str:
     """
-    Describe an Excalidraw scene by its text labels and element shape.
+    Describe an Excalidraw scene by its text labels and element shape — scene
+    name, all labels, and a count per element type, without the canvas. Use on
+    a `.excalidraw` file hybrid_search returned as a diagram
+    (`result_kind="diagram"`); `.mmd` diagrams are plain text — Read them.
 
-    Use this for .excalidraw files when ``hybrid_search`` returns a
-    diagram (``result_kind="diagram"``) you want to inspect — gives you
-    the scene name, all text labels, and a count of each element type
-    without needing to see the canvas. For .mmd (Mermaid) diagrams,
-    just ``Read(file_path)`` — those are plain text.
+    Args: file_path (absolute path to the `.excalidraw` file).
 
-    Args:
-        file_path: Absolute path to an ``.excalidraw`` file. Returned
-            by ``hybrid_search`` as the ``file_path`` field of a
-            diagram result.
-
-    Returns:
-        JSON with::
-
-            {
-                "success": true,
-                "scene_name": "Auth Flow" | null,
-                "text_labels": ["Login", "Submit", ...],
-                "element_counts": {"rectangle": 4, "text": 2, ...},
-                "file_path": "..."
-            }
-
-        On error (file missing, not JSON, not an .excalidraw file)
-        returns ``{"success": false, "error": "..."}``.
+    Returns: JSON — success, scene_name, text_labels, element_counts, file_path.
     """
     payload: dict = {
         "file_path": file_path,
@@ -6788,63 +6773,6 @@ async def describe_excalidraw(file_path: str) -> str:
     return _large_result(payload)
 
 
-def get_node_connections(
-    title: str
-) -> str:
-    """
-    Extract WikiLink relationships for a specific node.
-
-    Use for exploring specific node's connections and building knowledge maps.
-
-    Args:
-        title: Node title (exact match)
-
-    Returns:
-        JSON with typed connections (relationship_type, target_node)
-    """
-    client = get_weaviate_client()
-    coll = client.collections.get(KG_COLLECTION)
-
-    # Get node
-    results = coll.query.fetch_objects(
-        filters=Filter.by_property("title").equal(title),
-        limit=1
-    )
-
-    if not results.objects:
-        return json.dumps({
-            "success": False,
-            "error": f"Node '{title}' not found"
-        }, indent=2)
-
-    obj = results.objects[0]
-    content = obj.properties.get("content", "")
-
-    # Extract WikiLinks
-    wikilinks_raw = re.findall(r'\[\[([^\]]+)\]\]', content)
-
-    # Parse typed WikiLinks
-    connections = []
-    for link in wikilinks_raw:
-        if "::" in link:
-            rel_type, target = link.split("::", 1)
-            connections.append({"type": rel_type, "target": target})
-        else:
-            connections.append({"type": "relatedTo", "target": link})
-
-    logger.info(f"get_node_connections: {len(connections)} connections for '{title}'")
-    return json.dumps({
-        "success": True,
-        "node": {
-            "title": obj.properties.get("title", ""),
-            "node_type": obj.properties.get("node_type", ""),
-            "tags": obj.properties.get("tags", [])
-        },
-        "connections": connections,
-        "connection_count": len(connections)
-    }, indent=2)
-
-
 @mcp.tool()
 async def store_knowledge_node(
     title: str,
@@ -6856,51 +6784,19 @@ async def store_knowledge_node(
     scope: str = "project",
 ) -> str:
     """
-    Create or update a knowledge-graph node: writes the markdown file to the
-    project's knowledge/ folder AND upserts its embedding into Weaviate, so
-    the node is immediately findable via hybrid_search. Upsert semantics —
-    same file_path with identical content is skipped; changed content is
-    re-written and re-embedded.
+    Create or update a knowledge-graph node: writes the markdown file and
+    upserts its embedding, findable via hybrid_search. Upsert — identical
+    content is skipped, changed content re-embeds.
 
-    When to use: persisting a non-obvious learning, decision rationale,
-    architecture pattern, or gotcha so future sessions can retrieve it.
-    When NOT to use: if you can write files directly, prefer writing the
-    knowledge/**/*.md file yourself (a PostToolUse hook auto-syncs it to
-    Weaviate); this tool is the path for agents without file-write access.
+    Args: title + content (title unique per file); node_type (OPEN set —
+    knowledge/VOCABULARY.md; undeclared auto-declared); tags (without '#');
+    links (WikiLinks, "relationshipType::Target"); file_path (relative to
+    KG_BASE_DIR or absolute; omitted → derived); scope ("project" default |
+    "shared"; shared writes are REFUSED, not rerouted, when
+    SHARED_KG_WRITE_DISABLED=true).
 
-    Args:
-        title: Node title (unique per file)
-        content: Full markdown content
-        node_type: Type (built-ins: project, concept, tool, model, hardware,
-                   research, pattern, insight, guide — the set is OPEN: declare
-                   additional types in knowledge/VOCABULARY.md as a class
-                   heading with an alias, optionally with a `- **Folder**:`
-                   line to give the type its own knowledge/ subfolder)
-        tags: Tags without # (e.g., ["AI", "VRAM"])
-        links: Typed WikiLinks in "relationshipType::Target" format
-        file_path: Relative path from KG_BASE_DIR (e.g., "knowledge/concepts/VRAM_Management.md")
-                   OR absolute path (e.g., "/home/user/project/knowledge/concepts/VRAM_Management.md").
-                   Absolute paths work even when KG_BASE_DIR is not configured.
-                   If omitted, path is auto-derived from title and node_type.
-        scope: "project" (default) — writes to KG_COLLECTION (project-scoped).
-               "shared" — writes to SHARED_KG_COLLECTION (cross-project
-               knowledge, visible to every project on this machine); use for
-               patterns genuinely reusable beyond this project.
-               Falls back to KG_COLLECTION if SHARED_KG_COLLECTION is not configured.
-               scope="shared" returns an error (does NOT silently fall back to
-               the project KG) when SHARED_KG_WRITE_DISABLED=true for this
-               project — on that error, either keep the knowledge project-scoped
-               or ask the user to lift the gate.
-
-    Returns:
-        JSON with success status, file_written flag, and absolute_path of the
-        markdown file (check these to confirm where the node landed).
-
-        A ``warning`` field appears — on success AND on failure — when the
-        write came from a folder that is not registered with VCO. It names the
-        collection the write went to and the remedy (the launcher's Adopt
-        flow). Surface it to the user: it is the only signal that arrives
-        before a later read comes back empty.
+    Returns: JSON — success, file_written, absolute_path; a `warning` when the
+    folder is not registered.
     """
     # v0.2.95 R6: computed inside the try (it needs the resolved collection)
     # but declared HERE, because the failure payload must carry it too — the
@@ -6914,6 +6810,29 @@ async def store_knowledge_node(
         # CORRUPT another project's knowledge, strictly worse than a wrong read.
         # The reaper prevents the stale process; this is the per-call guard.
         _assert_workspace_unchanged("store_knowledge_node")
+
+        # ── v0.2.101 P299-A3: node-type vocabulary gate ──────────────────
+        # The SAME shared decision kg-sync's sync_node applies (one home:
+        # vco_lib.kg_vocabulary — the drift scanner mirrors it too). An
+        # INVALID (empty/malformed) type is refused HERE, before the client
+        # is even fetched: no Weaviate row and no .md file for it, ever. An
+        # UNDECLARED but wellformed type AUTO-EXTENDS the project's
+        # knowledge/VOCABULARY.md (open vocabulary — append-only) and the
+        # node proceeds; the extension rides along in the result JSON
+        # (`vocabulary_extended`) so the agent sees what was declared.
+        _type_refusal, vocabulary_extended, vocabulary_note = (
+            _node_type_vocabulary_gate(node_type)
+        )
+        if _type_refusal is not None:
+            logger.error("store_knowledge_node refused: %s", _type_refusal)
+            return json.dumps({
+                "status": "error",
+                "success": False,
+                "error": _type_refusal,
+                "scope": scope,
+                "file_written": False,
+            }, indent=2)
+
         client = get_weaviate_client()
         # Determine target collection based on scope
         target_collection_name = KG_COLLECTION
@@ -7201,7 +7120,9 @@ async def store_knowledge_node(
             rel_file_path = rel_file_path.replace("\\", "/")
 
         # Locate existing rows for THIS node (v0.2.73 D-1): scope the match to
-        # `title AND file_path`, mirroring sync_knowledge_graph.py's
+        # `title AND file_path` (since ⑧b below: to the EXACT `file_path`,
+        # title-agnostic — the path clause alone carried D-1's protection),
+        # mirroring sync_knowledge_graph.py's
         # `_delete_node_by_file_path` (the v0.2.70 P1 fix). Title is NOT unique
         # across the collection — an archived and an active node can share a
         # title at different file_paths — so a title-only delete silently
@@ -7211,23 +7132,54 @@ async def store_knowledge_node(
         # auto-derives one), fall back to the legacy title-only match (the
         # ratified C-7 fallback: better a title-only cleanup than deleting
         # nothing and accumulating duplicate rows).
-        _delete_filter = Filter.by_property("title").equal(title)
+        #
+        # v0.2.101 B3 — TRUTH REPAIR: this block used to describe the path
+        # filter as "an OR of two EXACT `.equal()` filters". It is not exact:
+        # `title` and `file_path` are TEXT with Weaviate's default `word`
+        # tokenization, so `Equal` matches every row whose token set CONTAINS
+        # the value's tokens. ANDing two tokenized predicates narrows but does
+        # not close the hole — title "Knowledge Graph" at
+        # `knowledge/concepts/knowledge-graph.md` is a token-subset of
+        # "Orchestrator Knowledge Graph" at `orchestrator-knowledge-graph.md`,
+        # and the delete below removed BOTH nodes' rows. The filter is now a
+        # NARROWING read only; the rows are confirmed in Python by
+        # `vco_lib.weaviate_exact_match` (the home kg-sync's upsert uses too):
+        # raw `file_path` equal to this node's path (either separator
+        # spelling — C-7), or, on the title-only fallback, a title with the
+        # SAME token sequence.
+        from vco_lib.weaviate_exact_match import (
+            fetch_matching_rows as _fetch_matching_rows,
+            is_exact_path as _is_exact_path,
+            is_same_title as _is_same_title,
+            path_narrowing_filter as _path_narrowing_filter,
+        )
+
+        #
+        # v0.2.101 pull-in ⑧b — RENAME ORPHANS: the narrowing read used to AND
+        # a `title` clause onto the path clause, so when a node's TITLE changed
+        # at the same path the old-title rows were never read back, never
+        # deleted, and sat beside the new rows as duplicates until a kg-sync
+        # (whose upsert keys on the exact path alone). `file_path` IS the
+        # node's identity — one file, one node — so with a path in hand the
+        # read narrows on the path ONLY and every row whose raw `file_path` is
+        # exactly this node's path is stale data for this upsert, whatever
+        # title it carries: a same-title row (the ordinary re-store) and an
+        # old-title row (the rename) alike. A token-superset SIBLING still
+        # never qualifies — `is_exact_path` rejects it, title or no title.
+        # The same identity rule as kg-sync's `_fetch_exact_path_rows` upsert.
         if rel_file_path:
-            # C-7: match BOTH the canonical POSIX spelling AND the backslash
-            # variant so a Windows-written old row (or any separator drift) is
-            # still reconciled. Use an OR of two EXACT `.equal()` filters (not
-            # `contains_any`, which is token-based and would not match a full
-            # path string exactly) — `.equal()` is the established exact-match
-            # pattern for file_path (sync_knowledge_graph.py uses it too).
-            _backslash_variant = rel_file_path.replace("/", "\\")
-            if _backslash_variant != rel_file_path:
-                _path_filter = Filter.any_of([
-                    Filter.by_property("file_path").equal(rel_file_path),
-                    Filter.by_property("file_path").equal(_backslash_variant),
-                ])
-            else:
-                _path_filter = Filter.by_property("file_path").equal(rel_file_path)
-            _delete_filter = _delete_filter & _path_filter
+            # C-7: narrow on BOTH the canonical POSIX spelling AND the
+            # backslash variant so a Windows-written old row (or any separator
+            # drift) is still reconciled.
+            _delete_filter = _path_narrowing_filter(Filter, rel_file_path)
+
+            def _is_this_node(props) -> bool:
+                return _is_exact_path(props.get("file_path"), rel_file_path)
+        else:
+            _delete_filter = Filter.by_property("title").equal(title)
+
+            def _is_this_node(props) -> bool:
+                return _is_same_title(props.get("title"), title)
         # v0.2.73 D-2: collect the stale row ids NOW (before any insert, so the
         # scoped filter can't match the fresh rows) but do NOT delete yet.
         # Pre-D-2 the delete ran here — BEFORE embeddings were fetched — so a
@@ -7239,27 +7191,17 @@ async def store_knowledge_node(
         # temporary duplicate rows (old + partial new), which the next
         # successful upsert or kg-sync cleans up — strictly better than data
         # loss.
-        # C-7: loop past limit=100 — a heavily-chunked node (or accumulated
-        # drift) can exceed 100 rows; a single fetch capped at 100 would leave
-        # the overflow stranded. Page until a short batch returns.
-        _stale_uuids = []
-        _fetch_offset = 0
-        _FETCH_PAGE = 100
-        while True:
-            _batch = collection.query.fetch_objects(
-                filters=_delete_filter,
-                limit=_FETCH_PAGE,
-                offset=_fetch_offset,
+        # C-7: page past limit=100 — a heavily-chunked node (or accumulated
+        # drift, or — B3 — token-superset siblings filling the narrowed read)
+        # can exceed 100 rows; the shared reader pages until a short batch
+        # returns, bounded at 50 pages = 5000 rows (far past any real node).
+        _stale_uuids = [
+            obj.uuid
+            for obj in _fetch_matching_rows(
+                collection, _delete_filter, _is_this_node,
+                page_size=100, max_pages=50,
             )
-            _batch_objs = _batch.objects
-            _stale_uuids.extend(obj.uuid for obj in _batch_objs)
-            if len(_batch_objs) < _FETCH_PAGE:
-                break
-            _fetch_offset += _FETCH_PAGE
-            # Defensive bound: never page forever (corrupt cursor / duplicate
-            # rows) — 50 pages = 5000 rows is far past any real node.
-            if _fetch_offset >= 50 * _FETCH_PAGE:
-                break
+        ]
 
         now = datetime.now(timezone.utc).isoformat()
 
@@ -7526,6 +7468,12 @@ async def store_knowledge_node(
             result["warning"] = unregistered_warning
         if path_adjustments:
             result["path_adjustments"] = path_adjustments
+        if vocabulary_extended:
+            # P299-A3: the auto-extend is NEVER silent — the agent sees
+            # which aliases this write declared in knowledge/VOCABULARY.md.
+            result["vocabulary_extended"] = vocabulary_extended
+        if vocabulary_note:
+            result["vocabulary_note"] = vocabulary_note
         if file_write_error:
             result["file_error"] = file_write_error
         elif md_path is not None and not file_written:
@@ -7575,56 +7523,18 @@ async def search_code_graph(
 ) -> str:
     """
     Find code entities (functions, classes, modules, APIs) by describing what
-    they do in natural language. Searches semantic embeddings of code, not
-    literal text — so "authentication middleware" finds auth-related functions
-    even if they don't contain those exact words.
+    they do (semantic). Use BEFORE Grep to find code by purpose; for exact
+    callers/deps use query_code_structure.
 
-    Use this BEFORE grep when looking for code by purpose or concept. Use Grep
-    only when you know the exact symbol name or string.
+    Args: query (what the code does); scope ("all" default | "code" |
+    "interaction" for APIs/cross-service calls); limit (default 8);
+    expand_hops (0 default; 1-2 follow call/interaction edges); layer
+    (lowercase values: api, service, data, ui, utility; an unpopulated
+    filter re-runs without it);
+    project (omit for workspace default, "" for all); detail ("auto" default,
+    else "titles"/"full" — knowledge/concepts/score-driven-retrieval-tiers.md).
 
-    When to use: "find the function that handles X", "where is Y implemented?",
-    "what code deals with Z?". Best for discovering code by intent.
-    Example: search_code_graph("retry logic for hub requests") surfaces
-    backoff/timeout helpers even when their names contain neither "retry"
-    nor "hub".
-    When NOT to use: searching for exact function/variable names — use Grep.
-    Once you know the entity's name, use query_code_structure for its exact
-    callers/dependencies.
-
-    Args:
-        query: Natural language description of the code you're looking for
-        scope: "all" (default) — all entity types; "code" — functions/classes/modules
-               only; "interaction" — service boundaries (APIs, cross-service calls) only
-        limit: Max results (default: 8).
-        expand_hops: 0 (default) — no expansion; 1 or 2 — follow call/interaction
-                     edges from seed nodes to discover related code
-        layer: Filter by architectural layer — lowercase values: api, service,
-               data, ui, utility (mixed-case input is lowercased before
-               matching). If the filter yields zero candidates (the `layer`
-               property is unpopulated on many indexes), the search re-runs
-               without it and the response carries a "note" explaining that.
-        project: Project name override. Omit to use the workspace default;
-                 pass "" (empty string) to search across all projects.
-        detail: Verbosity per result (default "auto"; any other value than the
-            three below is treated as "auto"):
-            - "auto"   → score-tiered per result via the code-calibrated gate
-                         (_CODE_TIER_THRESHOLDS, env-overridable CODE_TIER_*):
-                           score < min          → dropped (min derives from the
-                                                  post-rerank floor at call
-                                                  time, default 0.22)
-                           min..0.32            → "summary" (signature + doc)
-                           0.32..0.48           → "single_chunk" (matched chunk)
-                           0.48..0.62           → "three_chunks" (hit + neighbours)
-                           >= 0.62              → "full" (up to 7 chunks)
-                         A shared chunk budget degrades late results to
-                         cheaper tiers regardless of score.
-            - "titles" → metadata-only refs for every result (cheapest)
-            - "full"   → full details for every result (most expensive)
-
-    Returns:
-        JSON with code entities, each including file_path, score, tier (the
-        verbosity actually applied in auto mode), and tier-dependent content
-        (full_name/signature/doc/body chunks). Metadata refs for cheap tiers.
+    Returns: JSON code entities — file_path, score, tier, tier-dependent content.
     """
     _SCOPES: dict[str, list[str]] = {
         "all":         ["CodeFunction", "CodeClass", "CodeModule", "CodeAPI", "CodeInteraction"],
@@ -7697,7 +7607,7 @@ async def search_code_graph(
 
     try:
         # v0.2.73 C-5: embed the query via the CLI-mirrored path
-        # (svc.embed_code for ALL slots) so the MCP and CLI produce the
+        # (svc.embed_code_query for ALL slots) so the MCP and CLI produce the
         # SAME query vector on every ladder tier. Using the codesage-biased
         # get_code_embedding here broke CLI≡MCP on qwen3/jina slots.
         query_embedding = await get_code_query_embedding(query)
@@ -7992,6 +7902,18 @@ async def search_code_graph(
             """
             if not file_path or max_total <= 1:
                 return []
+            # v0.2.101 pull-in ③: `file_path` / `project` are word-TOKENIZED,
+            # so `file_path Equal src/run.py` also matched every row of
+            # `src/run_all.py`, `tests/src/run.py`, … — other files' entities
+            # were shown as this file's siblings (and could fill the 64-row
+            # read). The narrowing read is now confirmed in Python: exact
+            # `file_path`, same `project` token sequence.
+            import vco_lib.weaviate_exact_match as _wem
+
+            _sib_accept = _wem.exact_row_predicate(
+                paths={"file_path": file_path},
+                same_tokens={"project": effective_project},
+            )
             try:
                 fn_coll = client.collections.get(_project_collection("CodeFunction"))
                 cls_coll = client.collections.get(_project_collection("CodeClass"))
@@ -8004,8 +7926,10 @@ async def search_code_graph(
                     sib_filter = Filter.by_property("file_path").equal(file_path)
                     if effective_project:
                         sib_filter = sib_filter & Filter.by_property("project").equal(effective_project)
-                    sib_resp = coll_obj.query.fetch_objects(filters=sib_filter, limit=64)
-                    for obj in sib_resp.objects:
+                    sib_rows = _wem.fetch_matching_rows(
+                        coll_obj, sib_filter, _sib_accept, max_matches=64,
+                    )
+                    for obj in sib_rows:
                         sp = obj.properties or {}
                         if sp.get("full_name") == exclude_full_name:
                             continue
@@ -8051,6 +7975,21 @@ async def search_code_graph(
             """
             if not full_name or total <= 1 or max_chunks <= 1:
                 return []
+            # v0.2.101 pull-in ③: `full_name`, `project` and `file_path` are
+            # word-TOKENIZED, so `full_name Equal pkg.mod.run` also matched
+            # `pkg.mod.run_all` (and C-8's `file_path` clause matched token-
+            # superset paths) — a SIBLING entity's chunk could be assembled
+            # into this entity's window as if it were its own. Rows are now
+            # confirmed in Python: `full_name` read back from the winning row
+            # compared with `==` (any other spelling is another entity), exact
+            # `file_path`, same `project` token sequence.
+            import vco_lib.weaviate_exact_match as _wem
+
+            _chunk_accept = _wem.exact_row_predicate(
+                paths={"file_path": file_path},
+                values={"full_name": full_name},
+                same_tokens={"project": effective_project},
+            )
             collected: list[tuple[int, dict]] = []
             for base in ("CodeFunction", "CodeClass"):
                 try:
@@ -8060,8 +7999,11 @@ async def search_code_graph(
                         flt = flt & Filter.by_property("project").equal(effective_project)
                     if file_path:
                         flt = flt & Filter.by_property("file_path").equal(file_path)
-                    resp = coll_obj.query.fetch_objects(filters=flt, limit=max(total, max_chunks) + 4)
-                    for obj in resp.objects:
+                    rows = _wem.fetch_matching_rows(
+                        coll_obj, flt, _chunk_accept,
+                        max_matches=max(total, max_chunks) + 4,
+                    )
+                    for obj in rows:
                         cp = obj.properties or {}
                         cn = cp.get("chunk_num", 0) or 0
                         try:
@@ -8121,7 +8063,9 @@ async def search_code_graph(
                 # re-fetch with the references/properties needed for expansion.
                 # We re-query by full_name / path to get UUIDs reliably.
                 visited_full_names: set[str] = set()
-                expansion_queue: list[tuple[str, str, int]] = []  # (coll_name, identifier, hop)
+                # (coll_name, identifier, hop, uuid) — uuid is set for a
+                # callee reached through a `calls` edge (precise by-id fetch).
+                expansion_queue: list[tuple[str, str, int, str | None]] = []
 
                 for r in candidates:
                     coll_name, p = r["_c"], r["_p"]
@@ -8129,67 +8073,86 @@ async def search_code_graph(
                         fn = p.get("full_name", "")
                         if fn:
                             visited_full_names.add(fn)
-                            expansion_queue.append(("CodeFunction", fn, 0))
+                            expansion_queue.append(("CodeFunction", fn, 0, None))
                     elif coll_name == "CodeModule":
                         path_val = p.get("path") or p.get("file_path", "")
                         if path_val:
-                            expansion_queue.append(("CodeModule", path_val, 0))
+                            expansion_queue.append(("CodeModule", path_val, 0, None))
 
                 expanded_results: list[dict] = []
 
                 for hop in range(1, effective_hops + 1):
-                    next_queue: list[tuple[str, str, int]] = []
+                    next_queue: list[tuple[str, str, int, str | None]] = []
 
-                    for coll_name, identifier, _prev_hop in expansion_queue:
+                    for coll_name, identifier, _prev_hop, queued_uuid in expansion_queue:
                         if len(expanded_results) >= CODE_EXPANSION_LIMIT:
                             break
 
                         if coll_name == "CodeFunction":
-                            # 1. Follow outbound calls: fetch the function's `calls` text-array
+                            # v0.2.101 pull-in (owner ruling, live-confirmed):
+                            # `calls` is a cross-REFERENCE, not a text list —
+                            # the old `properties.get("calls")` was ALWAYS
+                            # empty, so call expansion never fired. Resolve
+                            # the canonical row ONCE (exact-then-fallback by
+                            # name, or by id for a callee reached through an
+                            # edge) with its `calls` edges; both steps below
+                            # use it. Step 2 used to re-fetch by a tokenized
+                            # `full_name` with `limit=1` (no project clause)
+                            # — it now uses the same canonical row, whose
+                            # uuid is the one interaction rows reference.
+                            fn_obj = None
                             try:
-                                fn_filter = Filter.by_property("full_name").equal(identifier)
-                                if effective_project:
-                                    fn_filter = fn_filter & Filter.by_property("project").equal(effective_project)
-                                fn_resp = func_coll.query.fetch_objects(
-                                    filters=fn_filter,
-                                    limit=1,
+                                fn_obj = _resolve_code_function(
+                                    func_coll, identifier, effective_project,
+                                    uuid=queued_uuid,
                                 )
-                                if fn_resp.objects:
-                                    fn_obj = fn_resp.objects[0]
-                                    called_names: list[str] = fn_obj.properties.get("calls") or []
-                                    for callee_name in called_names:
-                                        if callee_name in visited_full_names:
-                                            continue
-                                        if len(expanded_results) >= CODE_EXPANSION_LIMIT:
-                                            break
-                                        # Fetch the callee node
-                                        callee_resp = func_coll.query.fetch_objects(
-                                            filters=Filter.by_property("full_name").equal(callee_name),
-                                            limit=1,
-                                        )
-                                        if callee_resp.objects:
-                                            cp = callee_resp.objects[0].properties
-                                            expanded_results.append({
-                                                "collection": "CodeFunction",
-                                                "full_name": cp.get("full_name", callee_name),
-                                                "signature": cp.get("signature", ""),
-                                                "file_path": cp.get("file_path") or cp.get("path", ""),
-                                                "expanded": True,
-                                                "hop": hop,
-                                            })
-                                            visited_full_names.add(callee_name)
-                                            next_queue.append(("CodeFunction", callee_name, hop))
+                            except Exception as _e:
+                                logger.debug(f"expand hop {hop} CodeFunction resolve: {_e}")
+
+                            # 1. Follow outbound calls (resolved `calls` edges).
+                            try:
+                                for callee in _code_call_targets(fn_obj):
+                                    if len(expanded_results) >= CODE_EXPANSION_LIMIT:
+                                        break
+                                    cp = callee.properties or {}
+                                    callee_name = cp.get("full_name") or ""
+                                    if not callee_name or callee_name in visited_full_names:
+                                        continue
+                                    expanded_results.append({
+                                        "collection": "CodeFunction",
+                                        "full_name": callee_name,
+                                        "signature": cp.get("signature", ""),
+                                        "file_path": cp.get("file_path") or cp.get("path", ""),
+                                        "expanded": True,
+                                        "hop": hop,
+                                    })
+                                    visited_full_names.add(callee_name)
+                                    _cu = getattr(callee, "uuid", None)
+                                    next_queue.append((
+                                        "CodeFunction", callee_name, hop,
+                                        str(_cu) if _cu is not None else None,
+                                    ))
                             except Exception as _e:
                                 logger.debug(f"expand hop {hop} CodeFunction calls: {_e}")
 
                             # 2. Follow CodeInteraction edges where source_function → this function
                             try:
-                                fn_resp2 = func_coll.query.fetch_objects(
-                                    filters=Filter.by_property("full_name").equal(identifier),
-                                    limit=1,
-                                )
-                                if fn_resp2.objects:
-                                    src_uuid = str(fn_resp2.objects[0].uuid)
+                                # Availability never regresses (re-review
+                                # nit 1): the pre-fix step-2 re-fetch had NO
+                                # project clause, so a function whose stored
+                                # `project` differs from the effective one
+                                # still expanded its interactions. When the
+                                # project-scoped resolve above missed, retry
+                                # ONCE clause-less (same exact-then-fallback
+                                # read, `effective_project=""`). Step 1 keeps
+                                # its clause — it had one before the fix too.
+                                ix_fn_obj = fn_obj
+                                if ix_fn_obj is None and effective_project:
+                                    ix_fn_obj = _resolve_code_function(
+                                        func_coll, identifier, "", uuid=queued_uuid,
+                                    )
+                                if ix_fn_obj is not None:
+                                    src_uuid = str(ix_fn_obj.uuid)
                                     ix_resp = ix_coll.query.fetch_objects(
                                         filters=Filter.by_ref("source_function").by_id().equal(src_uuid),
                                         limit=20,
@@ -8220,12 +8183,17 @@ async def search_code_graph(
                             # Follow CodeInteraction edges where source_module → this module
                             try:
                                 mod_coll = client.collections.get(_project_collection("CodeModule"))
-                                mod_resp = mod_coll.query.fetch_objects(
-                                    filters=Filter.by_property("path").equal(identifier),
-                                    limit=1,
+                                # v0.2.101 pull-in: exact path first (a
+                                # tokenized `limit=1` could pick
+                                # `src/run_all.py` for `src/run.py`),
+                                # tolerant fallback on a miss. No project
+                                # clause, as before.
+                                mod_rows = _code_identity_rows(
+                                    mod_coll, "path", identifier, "",
+                                    tolerant_limit=1,
                                 )
-                                if mod_resp.objects:
-                                    src_uuid = str(mod_resp.objects[0].uuid)
+                                if mod_rows:
+                                    src_uuid = str(mod_rows[0].uuid)
                                     ix_resp = ix_coll.query.fetch_objects(
                                         filters=Filter.by_ref("source_module").by_id().equal(src_uuid),
                                         limit=20,
@@ -8377,6 +8345,87 @@ def _pick_canonical_chunk(objects: list):
         return min(objects, key=lambda o: (_cn(o) if _cn(o) is not None else 1 << 30))
     except Exception:  # noqa: BLE001
         return objects[0]
+
+
+def _code_identity_rows(
+    coll, prop: str, target: str, effective_project, *,
+    tolerant_limit: int, **fetch_kwargs,
+) -> list:
+    """The rows of the code entity named ``target`` on ``prop`` (``full_name``
+    for CodeFunction / CodeClass, ``path`` for CodeModule) — EXACT-THEN-FALLBACK.
+
+    v0.2.101 pull-in (owner ruling): ``full_name`` / ``path`` / ``project``
+    are word-TOKENIZED, so the ``Equal`` these lookups used matched every
+    token-superset entity as well (``a.run`` → ``a.run_all``), and a
+    ``limit=1`` / ``limit=8`` read could answer with the sibling. That same
+    tolerance is also what resolves a user-typed ``a::run`` or a bare
+    ``paths.py``, so it is kept as the FALLBACK, never dropped:
+    ``vco_lib.weaviate_exact_match.fetch_rows_exact_then_tolerant`` returns
+    only exact rows when any exist (``full_name`` by ``==``, ``path`` by the
+    separator-insensitive exact path, ``project`` by token sequence), and
+    otherwise the very read this site made before (``tolerant_limit`` rows).
+
+    The ONE home for these lookups in this module (``query_code_structure``,
+    the ``search_code_graph`` expansion and the CG-2 language probe).
+    ``effective_project`` empty → no project clause, as before.
+    """
+    import vco_lib.weaviate_exact_match as _wem
+
+    flt = Filter.by_property(prop).equal(target)
+    if effective_project:
+        flt = flt & Filter.by_property("project").equal(effective_project)
+    if prop in ("path", "file_path"):
+        accept = _wem.exact_row_predicate(
+            paths={prop: target}, same_tokens={"project": effective_project},
+        )
+    else:
+        accept = _wem.exact_row_predicate(
+            values={prop: target}, same_tokens={"project": effective_project},
+        )
+    return _wem.fetch_rows_exact_then_tolerant(
+        coll, flt, accept, tolerant_limit=tolerant_limit, **fetch_kwargs,
+    )
+
+
+def _resolve_code_function(func_coll, full_name: str, effective_project, *,
+                           uuid: str | None = None):
+    """The CANONICAL CodeFunction row for one function, with its ``calls``
+    cross-references resolved — or ``None``.
+
+    v0.2.101 pull-in (owner ruling, live-confirmed): ``calls`` is a
+    ReferenceProperty (analyze_code_graph.py writes it with
+    ``reference_add`` on the canonical chunk-0 uuid), NOT a text list. The
+    call-expansion and the ``path`` BFS read ``properties["calls"]`` — always
+    absent — so both answered empty on every live collection (91 of 300 rows
+    probed carry real ``calls`` edges). The edges are read here the way the
+    CLI's ``callers`` branch reads them: ``return_references`` +
+    :func:`_read_cross_reference` (the shared shape-safe reader).
+
+    ``uuid`` given (a callee reached through a ``calls`` edge — the edge
+    targets the canonical uuid) → a precise by-id fetch, no name lookup.
+    Otherwise (a seed name) → :func:`_code_identity_rows` exact-then-fallback,
+    then :func:`_pick_canonical_chunk` (the edges live on chunk 0).
+    """
+    refs = _code_return_references("calls")
+    if uuid:
+        obj = func_coll.query.fetch_object_by_id(uuid, return_references=refs)
+        if obj is not None:
+            return obj
+    if not full_name:
+        return None
+    return _pick_canonical_chunk(_code_identity_rows(
+        func_coll, "full_name", full_name, effective_project,
+        tolerant_limit=1, return_references=refs,
+    ))
+
+
+def _code_call_targets(fn_obj) -> list:
+    """The distinct functions ``fn_obj`` calls (resolved ``calls`` edges),
+    one per ``full_name`` — stored beacons can repeat (see
+    ``vco_lib.codegraph_references.dedup_ref_targets``)."""
+    if fn_obj is None:
+        return []
+    return _dedup_ref_targets(_read_cross_reference(fn_obj, "calls"), ("full_name",))
 
 
 def _dedup_objects_by_full_name(objects: list) -> list:
@@ -8555,12 +8604,12 @@ def _callgraph_target_language(
         def _lang_from(base: str, prop: str):
             try:
                 coll = client.collections.get(proj_coll(base))
-                flt = Filter.by_property(prop).equal(probe_name)
-                if effective_project:
-                    flt = flt & Filter.by_property("project").equal(effective_project)
-                resp = coll.query.fetch_objects(filters=flt, limit=1)
-                if resp.objects:
-                    lang = (resp.objects[0].properties or {}).get("language")
+                # v0.2.101 pull-in: exact entity first, tolerant fallback.
+                rows = _code_identity_rows(
+                    coll, prop, probe_name, effective_project, tolerant_limit=1,
+                )
+                if rows:
+                    lang = (rows[0].properties or {}).get("language")
                     return str(lang).strip().lower() if lang else None
             except Exception:  # noqa: BLE001 — probe best-effort
                 return None
@@ -8607,40 +8656,18 @@ def query_code_structure(
     project: str = None
 ) -> str:
     """
-    Query exact code structure and relationships using the code graph. Unlike
-    search_code_graph (semantic/fuzzy), this returns precise structural data:
-    what calls what, what depends on what, inheritance chains, call paths.
+    Exact code structure from the code graph (the graph, not semantic search).
+    Use when the entity name is known; find it by description via
+    search_code_graph.
 
-    Use this when you already know the entity name and want to understand its
-    relationships. Use search_code_graph first if you need to discover the
-    entity by description.
+    Args: query_type — "dependencies" (imports), "imports" (who imports this),
+    "callers", "methods", "extends", "interactions" (cross-service calls),
+    "path" (shortest call path, "src.func->dst.func", BFS ≤ 6),
+    "composes"/"composed_by", "type_users"; target (full_name for
+    functions/classes, path for modules, the arrow pair for "path"); project
+    (omit for workspace default, "" for all).
 
-    When to use: "what calls function X?", "what does module Y depend on?",
-    "find the call path from A to B", "what classes extend Z?".
-    Example: query_code_structure("callers", "auth.validate_token") lists
-    every function that calls validate_token.
-    When NOT to use: discovering code by concept — use search_code_graph.
-
-    Args:
-        query_type: The kind of structural query to run:
-            - "dependencies": what this module imports
-            - "imports": reverse of dependencies — who imports this module
-            - "callers": what functions call this function
-            - "methods": methods belonging to a class
-            - "extends": what classes this class inherits from
-            - "interactions": cross-service calls (HTTP, gRPC, etc.)
-            - "path": shortest call path between two functions (format:
-              "source.func->dest.func", BFS up to depth 6)
-            - "composes"/"composed_by": composition relationships
-            - "type_users": functions using a given type in annotations
-        target: The code entity to query (full_name for functions/classes,
-                file path for modules, arrow-separated pair for "path")
-        project: Optional project name filter. Omit for the workspace default;
-                 pass "" (empty string) to query across all projects.
-
-    Returns:
-        JSON with the structural query results (entity names, file paths,
-        relationship details).
+    Returns: JSON — structural results (names, file_path, relations).
     """
     try:
         client = get_weaviate_client()
@@ -8679,13 +8706,16 @@ def query_code_structure(
                 # OUTBOUND: resolve the module's own `imports` cross-reference
                 # to the modules IT imports. See _code_return_references /
                 # _read_cross_reference for the three-part v0.2.92 fix.
-                response = coll.query.fetch_objects(
-                    filters=with_project(Filter.by_property("path").equal(target)),
-                    limit=1,
+                # v0.2.101 pull-in: exact module path first (a tokenized
+                # `limit=1` could answer for `src/a_b.py` when asked for
+                # `src/a.py`), today's tolerant read on a miss.
+                module_rows = _code_identity_rows(
+                    coll, "path", target, effective_project,
+                    tolerant_limit=1,
                     return_references=_code_return_references("imports"),
                 )
 
-                if not response.objects:
+                if not module_rows:
                     return json.dumps({
                         "success": False,
                         "error": f"Module '{target}' not found"
@@ -8693,7 +8723,7 @@ def query_code_structure(
                     }, indent=2)
 
                 imports = _dedup_ref_targets(
-                    _read_cross_reference(response.objects[0], "imports"), ("path",)
+                    _read_cross_reference(module_rows[0], "imports"), ("path",)
                 )
                 results = [{"path": imp.properties.get("path"), "file_path": imp.properties.get("path", "")} for imp in imports]
 
@@ -8735,12 +8765,12 @@ def query_code_structure(
             # v0.2.72 (P3): a chunked class is N objects sharing full_name;
             # fetch a few and pick the CANONICAL (chunk_num==0) one, which
             # carries the methods list + canonical file_path.
-            response = coll.query.fetch_objects(
-                filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=8
-            )
-
-            canonical = _pick_canonical_chunk(response.objects)
+            # v0.2.101 pull-in: exact `full_name` first (a token-superset
+            # class `a.Foo_Bar` can no longer answer for `a.Foo`), tolerant
+            # fallback on a miss.
+            canonical = _pick_canonical_chunk(_code_identity_rows(
+                coll, "full_name", target, effective_project, tolerant_limit=8,
+            ))
             if canonical is None:
                 return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
 
@@ -8753,13 +8783,10 @@ def query_code_structure(
             coll = client.collections.get(_proj_coll("CodeClass"))
             # v0.2.72 (P3): pick the canonical chunk (chunk 0 holds the
             # `extends` references).
-            response = coll.query.fetch_objects(
-                filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=8,
+            canonical = _pick_canonical_chunk(_code_identity_rows(
+                coll, "full_name", target, effective_project, tolerant_limit=8,
                 return_references=_code_return_references("extends"),
-            )
-
-            canonical = _pick_canonical_chunk(response.objects)
+            ))
             if canonical is None:
                 return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
 
@@ -8812,12 +8839,9 @@ def query_code_structure(
             # function UUID (the analyzer captures chunk-0's UUID as func_uuid).
             # Resolve the target's canonical chunk so the source_function ref
             # filter matches.
-            func_resp = func_coll.query.fetch_objects(
-                filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=8
-            )
-
-            canonical_func = _pick_canonical_chunk(func_resp.objects)
+            canonical_func = _pick_canonical_chunk(_code_identity_rows(
+                func_coll, "full_name", target, effective_project, tolerant_limit=8,
+            ))
             if canonical_func is not None:
                 source_uuid = str(canonical_func.uuid)
                 ix_resp = interactions_coll.query.fetch_objects(
@@ -8826,17 +8850,16 @@ def query_code_structure(
                 )
             else:
                 mod_coll = client.collections.get(_proj_coll("CodeModule"))
-                mod_resp = mod_coll.query.fetch_objects(
-                    filters=with_project(Filter.by_property("path").equal(target)),
-                    limit=1
+                mod_rows = _code_identity_rows(
+                    mod_coll, "path", target, effective_project, tolerant_limit=1,
                 )
-                if not mod_resp.objects:
+                if not mod_rows:
                     return json.dumps({
                         "success": False,
                         "error": f"Function or module '{target}' not found"
                         + _code_structure_not_found_hint(query_type, target, effective_project)
                     }, indent=2)
-                source_uuid = str(mod_resp.objects[0].uuid)
+                source_uuid = str(mod_rows[0].uuid)
                 ix_resp = interactions_coll.query.fetch_objects(
                     filters=Filter.by_ref("source_module").by_id().equal(source_uuid),
                     limit=INTERACTIONS_LIMIT
@@ -8875,67 +8898,83 @@ def query_code_structure(
 
             func_coll = client.collections.get(_proj_coll("CodeFunction"))
 
-            # BFS state: queue of (current_full_name, path_so_far)
+            # BFS state: queue of (current_full_name, current_uuid, path_so_far)
             from collections import deque
-            bfs_queue: deque[tuple[str, list[dict]]] = deque()
+            bfs_queue: deque[tuple[str, str | None, list[dict]]] = deque()
 
-            # Seed: fetch source node to confirm it exists and get file_path
-            src_filter = Filter.by_property("full_name").equal(source_name)
-            if effective_project:
-                src_filter = src_filter & Filter.by_property("project").equal(effective_project)
-            src_resp = func_coll.query.fetch_objects(filters=src_filter, limit=1)
-            if not src_resp.objects:
+            # v0.2.101 pull-in (owner ruling, live-confirmed): this BFS read
+            # `properties["calls"]` as a text list, but `calls` is a
+            # cross-REFERENCE — the read was always empty, so `path` never got
+            # past the source. It now walks the resolved `calls` edges
+            # (`_resolve_code_function` + `_code_call_targets`): a callee's
+            # name AND file come off the edge target itself (uuid-precise —
+            # the two per-callee tokenized `full_name` lookups are gone), and
+            # the next hop is fetched by that uuid. The seed resolves
+            # exact-then-fallback by name. The destination matches by `==` or,
+            # tolerantly, by the same name token sequence (a typed `a::b`
+            # still meets `a.b`, as the tokenized lookup let it before).
+            import vco_lib.weaviate_exact_match as _wem
+
+            src_obj = _resolve_code_function(func_coll, source_name, effective_project)
+            if src_obj is None:
                 return json.dumps({
                     "success": False,
                     "error": f"Source function '{source_name}' not found"
                     + _code_structure_not_found_hint(query_type, source_name, effective_project)
                 }, indent=2)
 
-            src_file = src_resp.objects[0].properties.get("file_path") or src_resp.objects[0].properties.get("path", "")
-            bfs_queue.append((source_name, [{"full_name": source_name, "file_path": src_file, "hop": 0}]))
+            src_props = src_obj.properties or {}
+            src_file = src_props.get("file_path") or src_props.get("path", "")
+            # Queue entries: (full_name, uuid, path_so_far); the source's own
+            # object is reused for hop 0.
+            bfs_queue.append((
+                source_name, str(src_obj.uuid),
+                [{"full_name": source_name, "file_path": src_file, "hop": 0}],
+            ))
 
-            visited: set[str] = {source_name}
+            visited: set[str] = {str(src_obj.uuid)}
             found_path: list[dict] | None = None
             max_depth = 6
 
             while bfs_queue and found_path is None:
-                current_name, current_path = bfs_queue.popleft()
+                current_name, current_uuid, current_path = bfs_queue.popleft()
                 current_hop = len(current_path) - 1
 
                 if current_hop >= max_depth:
                     continue
 
-                # Fetch current node's outbound calls
-                cur_filter = Filter.by_property("full_name").equal(current_name)
-                if effective_project:
-                    cur_filter = cur_filter & Filter.by_property("project").equal(effective_project)
-                cur_resp = func_coll.query.fetch_objects(filters=cur_filter, limit=1)
-                if not cur_resp.objects:
+                # Fetch current node's outbound `calls` edges.
+                if current_hop == 0:
+                    cur_obj = src_obj
+                else:
+                    try:
+                        cur_obj = _resolve_code_function(
+                            func_coll, current_name, effective_project,
+                            uuid=current_uuid,
+                        )
+                    except Exception as _e:  # noqa: BLE001 — one dead hop never ends the walk
+                        logger.debug(f"path BFS: resolve {current_name} failed: {_e}")
+                        cur_obj = None
+                if cur_obj is None:
                     continue
 
-                calls_list: list[str] = cur_resp.objects[0].properties.get("calls") or []
-
-                for callee_name in calls_list:
-                    if callee_name == dest_name:
-                        # Found destination — fetch its file_path
-                        dest_filter = Filter.by_property("full_name").equal(dest_name)
-                        dest_resp = func_coll.query.fetch_objects(filters=dest_filter, limit=1)
-                        dest_file = ""
-                        if dest_resp.objects:
-                            dest_file = dest_resp.objects[0].properties.get("file_path") or dest_resp.objects[0].properties.get("path", "")
-                        found_path = current_path + [{"full_name": dest_name, "file_path": dest_file, "hop": current_hop + 1}]
+                for callee in _code_call_targets(cur_obj):
+                    cp = callee.properties or {}
+                    callee_name = cp.get("full_name") or ""
+                    if not callee_name:
+                        continue
+                    callee_file = cp.get("file_path") or cp.get("path", "")
+                    if _wem.is_same_title(callee_name, dest_name):
+                        found_path = current_path + [{"full_name": callee_name, "file_path": callee_file, "hop": current_hop + 1}]
                         break
 
-                    if callee_name not in visited:
-                        visited.add(callee_name)
-                        # Fetch callee file_path for path node
-                        callee_filter = Filter.by_property("full_name").equal(callee_name)
-                        callee_resp = func_coll.query.fetch_objects(filters=callee_filter, limit=1)
-                        callee_file = ""
-                        if callee_resp.objects:
-                            callee_file = callee_resp.objects[0].properties.get("file_path") or callee_resp.objects[0].properties.get("path", "")
+                    _cu = getattr(callee, "uuid", None)
+                    callee_key = str(_cu) if _cu is not None else callee_name
+                    if callee_key not in visited:
+                        visited.add(callee_key)
                         bfs_queue.append((
                             callee_name,
+                            str(_cu) if _cu is not None else None,
                             current_path + [{"full_name": callee_name, "file_path": callee_file, "hop": current_hop + 1}]
                         ))
 
@@ -8960,15 +8999,16 @@ def query_code_structure(
         elif query_type == "composes":
             # Find what classes a given class composes (has as field types).
             coll = client.collections.get(_proj_coll("CodeClass"))
-            response = coll.query.fetch_objects(
-                filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=1
-            )
+            # v0.2.101 pull-in: exact `full_name` first, tolerant fallback;
+            # among exact rows the canonical chunk answers.
+            composes_obj = _pick_canonical_chunk(_code_identity_rows(
+                coll, "full_name", target, effective_project, tolerant_limit=1,
+            ))
 
-            if not response.objects:
+            if composes_obj is None:
                 return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
 
-            composes = response.objects[0].properties.get("composes", []) or []
+            composes = composes_obj.properties.get("composes", []) or []
             results = [{"composed_class": name} for name in composes]
 
         elif query_type == "composed_by":

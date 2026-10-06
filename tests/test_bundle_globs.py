@@ -17,7 +17,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from vco_lib.bundle_globs import hook_globs, script_patterns  # noqa: E402
+from vco_lib.bundle_globs import (  # noqa: E402
+    hook_globs,
+    hook_lib_data_globs,
+    script_patterns,
+)
 
 # The ONE documented artefact under a bundle-globs-governed directory that no
 # ship pattern matches, on purpose. It is a launchd plist BODY, not a script:
@@ -97,7 +101,9 @@ def test_every_bundle_globbed_template_file_is_matched_by_a_ship_pattern():
 
     Scope is exactly the two directories `vco_lib.bundle_globs` governs:
     `templates/hooks/**` (recursive — top level plus `_lib/`) against
-    `hook_globs()`, and `templates/scripts/*` (non-recursive, matching
+    `hook_globs()` (plus `hook_lib_data_globs()` for `_lib/`, which since
+    v0.2.101 also carries the lean-ctx allow-list data file), and
+    `templates/scripts/*` (non-recursive, matching
     `project_init._enumerate_bundle_files`' own `scripts_src.glob(pat)`)
     against `script_patterns()`. `templates/agents/`, `templates/skills/`,
     `templates/knowledge/` and `templates/launchd/` ship by their own fixed
@@ -115,7 +121,14 @@ def test_every_bundle_globbed_template_file_is_matched_by_a_ship_pattern():
     hook_files = [p for p in sorted(hooks_root.rglob("*")) if p.is_file()]
     assert hook_files, "found no template hooks — the walk is pointed wrong"
     for path in hook_files:
-        if not any(fnmatch.fnmatch(path.name, g) for g in hook_globs()):
+        # v0.2.101: `_lib/` also carries shared DATA files the sibling hooks
+        # parse (lean-ctx-allowlist.txt) — shipped by hook_lib_data_globs().
+        # Top-level hooks stay script-only; a data file dropped there is
+        # still an unmatched artefact this walk reports.
+        globs = hook_globs()
+        if "_lib" in path.relative_to(hooks_root).parts:
+            globs = globs + hook_lib_data_globs()
+        if not any(fnmatch.fnmatch(path.name, g) for g in globs):
             unmatched.append(f"{path.relative_to(REPO_ROOT)}  (hook_globs)")
 
     scripts_root = REPO_ROOT / "templates" / "scripts"

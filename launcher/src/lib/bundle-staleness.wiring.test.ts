@@ -28,6 +28,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { parse } from 'svelte/compiler';
+// SF-5 (v0.2.101): `walk`/`isIdent` graduated to the ONE home in
+// test-support (they were copied across wiring test files).
+import { walk, isIdent } from './test-support/wiring-ast';
 
 type Node = Record<string, unknown>;
 
@@ -40,21 +43,6 @@ function load(rel: string): Node {
 
 const MODAL = load('components/UpdateAllProjectsModal.svelte');
 const PAGE = load('../routes/projects/+page.svelte');
-
-/** Every node in a subtree, depth-first. */
-function* walk(node: unknown): Generator<Node> {
-  if (node === null || typeof node !== 'object') return;
-  if (Array.isArray(node)) {
-    for (const child of node) yield* walk(child);
-    return;
-  }
-  const obj = node as Node;
-  if (typeof obj.type === 'string') yield obj;
-  for (const [k, v] of Object.entries(obj)) {
-    if (k === 'parent' || k === 'loc') continue;
-    yield* walk(v);
-  }
-}
 
 /** Every node in a subtree, each paired with its chain of ancestors. */
 function* walkWithAncestors(
@@ -74,10 +62,6 @@ function* walkWithAncestors(
     if (k === 'parent' || k === 'loc') continue;
     yield* walkWithAncestors(v, next);
   }
-}
-
-function isIdent(n: unknown, name: string): boolean {
-  return (n as Node | undefined)?.type === 'Identifier' && (n as Node).name === name;
 }
 
 /** `obj.prop` */
@@ -134,6 +118,25 @@ function literalArg(call: Node): unknown {
   const a = (call.arguments as Node[])[0];
   return a?.type === 'Literal' ? a.value : undefined;
 }
+
+// ─── UpdateAllProjectsModal: a skipped row says why (v0.2.101) ──────────
+
+describe('UpdateAllProjectsModal — skipped rows show their reason', () => {
+  it('renders r.skip_reason inside the per-project row loop', () => {
+    const rowLoop = [...walk(MODAL.fragment)].find(
+      (n) => n.type === 'EachBlock' && (n.context as Node | undefined)?.name === 'r',
+    );
+    expect(rowLoop, 'no `{#each … as r}` row loop found').toBeTruthy();
+    const shown = [...walk(rowLoop!.body)].some(
+      (n) =>
+        n.type === 'ExpressionTag' &&
+        (n.expression as Node).type === 'MemberExpression' &&
+        isIdent((n.expression as Node).object, 'r') &&
+        ((n.expression as Node).property as Node).name === 'skip_reason',
+    );
+    expect(shown, 'the row loop never renders {r.skip_reason}').toBe(true);
+  });
+});
 
 // ─── UpdateAllProjectsModal: reaching `done` always tells the host ──────
 

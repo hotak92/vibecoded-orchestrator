@@ -68,6 +68,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tests.common.launcher_db_fixture import connect, make_launcher_db  # noqa: E402
 from vco_lib import install_weaviate as iw  # noqa: E402
+from vco_lib import deferral_retry as dr  # noqa: E402
 from vco_lib import kg_metadata_repair_state as state  # noqa: E402
 import install  # noqa: E402
 
@@ -319,22 +320,16 @@ class RepairTriggerTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def _run_seed(
-        self, *, hashes, sync_returncode=0, update=True, sync_stamps=True,
-    ) -> "list[tuple]":
-        """Run the seed step; return every argv it spawned.
+    def _child(self, spawned, *, returncode=0, stamps=True, raise_on_nonzero=True):
+        """The real sync child, faked: it writes the per-project stamp file at
+        the end of a clean ``--all`` (the shape an exit code cannot show).
 
-        ``sync_stamps`` mirrors what the REAL subprocess does at the end of a
-        clean ``--all``: it writes the per-project stamp file
-        (``_record_metadata_repair_pass`` → ``kg_metadata_repair_state``).
-        Set it False for the shape an exit code cannot show — a repair that
-        aborted part-way, which is COUNTED rather than FAILED, so the run
-        still exits 0 and only the withheld file stamp records the truth.
+        ``raise_on_nonzero`` mirrors the two transports exactly: install.py's
+        ``run_child_logged(check=True)`` RAISES on a non-zero exit, while the
+        driver's runner returns the code to the handler instead.
         """
-        spawned: "list[tuple]" = []
-
         def _fake_run(cmd, **kwargs):
-            spawned.append(tuple(cmd))
+            spawned.append(tuple(str(c) for c in cmd))
 
             class _Ret:
                 returncode = 0
@@ -348,11 +343,29 @@ class RepairTriggerTests(unittest.TestCase):
                 )
                 return _Ret()
             if "sync_knowledge_graph.py" in str(cmd):
-                if sync_returncode:
-                    raise subprocess.CalledProcessError(sync_returncode, cmd)
-                if sync_stamps and "--all" in [str(a) for a in cmd]:
+                if returncode and raise_on_nonzero:
+                    raise subprocess.CalledProcessError(returncode, cmd)
+                if returncode == 0 and stamps and "--all" in [str(a) for a in cmd]:
                     state.write_stamp(self.tmp)
             return _Ret()
+
+        return _fake_run
+
+    def _run_seed(self, *, hashes, update=True) -> "tuple[list, list]":
+        """Drive install's seed step.
+
+        v0.2.101 item 4: the whole-tree seed is ENQUEUED, so "the pass runs"
+        now means "install hands the driver the work". Returns
+        ``(enqueues, spawned)``: each detached-seed spawn install made (its
+        ``extra_env`` is the context the driver inherits) and every child argv
+        install itself ran.
+        """
+        enqueues: "list[dict]" = []
+        spawned: "list[tuple]" = []
+
+        def _fake_spawn(folder, *, python="", extra_env=None):
+            enqueues.append({"folder": Path(folder), "env": dict(extra_env or {})})
+            return True
 
         buf = io.StringIO()
         with mock.patch.object(
@@ -366,17 +379,47 @@ class RepairTriggerTests(unittest.TestCase):
         ), mock.patch.object(
             install, "_prune_stale_kg_rows", lambda *a, **k: None
         ), mock.patch(
-            "subprocess.run", side_effect=_fake_run
+            "subprocess.run", side_effect=self._child(spawned)
         ), mock.patch.object(
-            # v0.2.96 WP-1: the sync child now spawns via run_child_logged;
-            # route it through the same fake (check-semantics preserved —
-            # the fake raises CalledProcessError exactly as the helper does).
-            install, "run_child_logged", side_effect=_fake_run
+            install, "run_child_logged", side_effect=self._child(spawned)
+        ), mock.patch(
+            # v0.2.101 item 4: the whole-tree seed leaves via the detached
+            # driver instead of run_child_logged.
+            "vco_lib.deferral_retry.spawn_detached", side_effect=_fake_spawn
         ), contextlib.redirect_stdout(buf):
             ns = argparse.Namespace()
             ns.update = update
             ns.skip_seed = False
             install._seed_weaviate(ns)
+        return enqueues, spawned
+
+    def _run_driver(self, *, enqueue, returncode=0, stamps=True) -> "list[tuple]":
+        """The detached driver's turn: run the ``--all`` child, then the REAL
+        ``retry_kg_seed`` handler (which projects the context triple AND the
+        one-time metadata-repair row).
+
+        ``condition_cleared`` is patched to mirror the ledger: the child's own
+        paired clear fires exactly when the ``--all`` finished with zero
+        per-node failures. The enqueue's ``extra_env`` is applied, exactly as
+        ``spawn_detached`` hands it to the real child.
+        """
+        spawned: "list[tuple]" = []
+
+        def _runner(argv, cwd):
+            # `_child` records the argv; do not record it twice. The driver's
+            # runner RETURNS the code (no check=), unlike install.py's helper.
+            self._child(spawned, returncode=returncode, stamps=stamps,
+                        raise_on_nonzero=False)(tuple(str(a) for a in argv))
+            return returncode
+
+        ctx = dr.RetryContext(
+            folder=self.tmp, condition_id=iw.SEED_OWED_WORK_CONDITION_ID,
+            backend_probe=lambda *a, **k: True, runner=_runner, python="python",
+        )
+        with mock.patch.dict(os.environ, enqueue["env"], clear=False), \
+                mock.patch.object(dr, "condition_cleared",
+                                  return_value=(returncode == 0)):
+            dr.retry_kg_seed(ctx)
         return spawned
 
     @staticmethod
@@ -396,13 +439,18 @@ class RepairTriggerTests(unittest.TestCase):
         self._build_db()  # no repair stamp: the pre-0.2.95 shape
         node = str(self.tmp / "knowledge" / "concepts" / "stale.md")
 
-        spawned = self._run_seed(hashes={node: "samehash"})
-
+        enqueues, _ = self._run_seed(hashes={node: "samehash"})
+        self.assertEqual(
+            len(enqueues), 1,
+            "an install that has not paid the one-time metadata-repair pass "
+            "must enqueue the whole-tree seed — with every hash equal, leg (c) "
+            "spawns nothing and the repair is unreachable",
+        )
+        spawned = self._run_driver(enqueue=enqueues[0])
         self.assertEqual(
             [c[-1] for c in self._kg_sync_argvs(spawned)], ["--all"],
-            "an install that has not paid the one-time metadata-repair pass "
-            "must spawn exactly one whole-tree sync — with every hash equal, "
-            "leg (c) spawns nothing and the repair is unreachable",
+            "and the driver must run the WHOLE-TREE pass (only a run that "
+            "visits every node can repair it)",
         )
 
     def test_a_clean_pass_records_itself(self):
@@ -410,7 +458,8 @@ class RepairTriggerTests(unittest.TestCase):
         self._build_db()
         node = str(self.tmp / "knowledge" / "concepts" / "stale.md")
 
-        self._run_seed(hashes={node: "samehash"})
+        enqueues, _ = self._run_seed(hashes={node: "samehash"})
+        self._run_driver(enqueue=enqueues[0])
 
         self.assertTrue(
             state.state_path(self.tmp).exists(),
@@ -433,28 +482,32 @@ class RepairTriggerTests(unittest.TestCase):
         })
         node = str(self.tmp / "knowledge" / "concepts" / "stale.md")
 
-        spawned = self._run_seed(hashes={node: "samehash"})
+        enqueues, spawned = self._run_seed(hashes={node: "samehash"})
 
         self.assertEqual(
-            self._kg_sync_argvs(spawned), [],
+            enqueues, [],
             "the pass is ONE-TIME: with the stamp recorded and every hash "
-            "matching, this update must spawn no sync at all",
+            "matching, this update must enqueue no seed at all",
         )
+        self.assertEqual(self._kg_sync_argvs(spawned), [])
 
     def test_the_two_runs_compose(self):
         """Run 1 repairs and stamps; run 2 — same tree — spawns nothing."""
         self._build_db()
         node = str(self.tmp / "knowledge" / "concepts" / "stale.md")
 
-        first = self._run_seed(hashes={node: "samehash"})
-        second = self._run_seed(hashes={node: "samehash"})
+        first, _ = self._run_seed(hashes={node: "samehash"})
+        self.assertEqual(len(first), 1, "run 1 enqueues the pass")
+        first_spawned = self._run_driver(enqueue=first[0])
+        self.assertEqual([c[-1] for c in self._kg_sync_argvs(first_spawned)], ["--all"])
 
-        self.assertEqual([c[-1] for c in self._kg_sync_argvs(first)], ["--all"])
+        second, second_children = self._run_seed(hashes={node: "samehash"})
         self.assertEqual(
-            self._kg_sync_argvs(second), [],
-            "the stamp written by run 1 is what run 2 reads; a gate that "
+            second, [],
+            "the stamp run 1's driver wrote is what run 2 reads; a gate that "
             "re-fires here would charge every future update a whole-tree walk",
         )
+        self.assertEqual(self._kg_sync_argvs(second_children), [])
 
     # ── (c) a failed pass is NOT recorded, so it retries ──────────────────
 
@@ -469,18 +522,23 @@ class RepairTriggerTests(unittest.TestCase):
         self._build_db()
         node = str(self.tmp / "knowledge" / "concepts" / "stale.md")
 
-        self._run_seed(hashes={node: "samehash"}, sync_returncode=1)
+        enqueues, _ = self._run_seed(hashes={node: "samehash"})
+        self._run_driver(enqueue=enqueues[0], returncode=1)
 
         self.assertIsNone(
             self._app_state().get(iw.KG_METADATA_REPAIR_STATE_KEY),
-            "a run that exited non-zero must NOT record the pass as done",
+            "a run that did not complete must NOT record the pass as done",
         )
 
-        retry = self._run_seed(hashes={node: "samehash"})
+        retry, _ = self._run_seed(hashes={node: "samehash"})
         self.assertEqual(
-            [c[-1] for c in self._kg_sync_argvs(retry)], ["--all"],
-            "withholding the stamp IS the retry — the next update must run "
-            "the pass again",
+            len(retry), 1,
+            "withholding the stamp IS the retry — the next update must "
+            "enqueue the pass again",
+        )
+        retry_spawned = self._run_driver(enqueue=retry[0])
+        self.assertEqual(
+            [c[-1] for c in self._kg_sync_argvs(retry_spawned)], ["--all"],
         )
         self.assertEqual(
             self._app_state().get(iw.KG_METADATA_REPAIR_STATE_KEY),
@@ -508,7 +566,8 @@ class RepairTriggerTests(unittest.TestCase):
         self._build_db()
         node = str(self.tmp / "knowledge" / "concepts" / "stale.md")
 
-        self._run_seed(hashes={node: "samehash"}, sync_stamps=False)
+        enqueues, _ = self._run_seed(hashes={node: "samehash"})
+        self._run_driver(enqueue=enqueues[0], stamps=False)
 
         self.assertFalse(
             state.state_path(self.tmp).exists(),
@@ -521,10 +580,13 @@ class RepairTriggerTests(unittest.TestCase):
             "wrote — two records of one fact that can disagree is the defect",
         )
 
-        retry = self._run_seed(hashes={node: "samehash"})
+        retry, _ = self._run_seed(hashes={node: "samehash"})
         self.assertEqual(
-            [c[-1] for c in self._kg_sync_argvs(retry)], ["--all"],
-            "withholding the app_state row IS the retry",
+            len(retry), 1, "withholding the app_state row IS the retry",
+        )
+        retry_spawned = self._run_driver(enqueue=retry[0])
+        self.assertEqual(
+            [c[-1] for c in self._kg_sync_argvs(retry_spawned)], ["--all"],
         )
         self.assertEqual(
             self._app_state().get(iw.KG_METADATA_REPAIR_STATE_KEY),
@@ -542,19 +604,22 @@ class RepairTriggerTests(unittest.TestCase):
         self._build_db()
         node = str(self.tmp / "knowledge" / "concepts" / "n.md")
 
-        fresh = self._run_seed(hashes={node: "samehash"}, update=False)
-        self.assertEqual([c[-1] for c in self._kg_sync_argvs(fresh)], ["--all"])
+        fresh, _ = self._run_seed(hashes={node: "samehash"}, update=False)
+        self.assertEqual(len(fresh), 1, "a fresh install enqueues the pass")
+        fresh_spawned = self._run_driver(enqueue=fresh[0])
+        self.assertEqual([c[-1] for c in self._kg_sync_argvs(fresh_spawned)], ["--all"])
         self.assertEqual(
             self._app_state().get(iw.KG_METADATA_REPAIR_STATE_KEY),
             iw.KG_METADATA_REPAIR_STAMP,
         )
 
-        later = self._run_seed(hashes={node: "samehash"})
+        later, later_children = self._run_seed(hashes={node: "samehash"})
         self.assertEqual(
-            self._kg_sync_argvs(later), [],
+            later, [],
             "the fresh install's own `--all` already visited every node — "
             "its first update must not walk the tree again",
         )
+        self.assertEqual(self._kg_sync_argvs(later_children), [])
 
     def test_skip_seed_records_nothing(self):
         """Nothing ran, so nothing may be retired."""

@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# packs.toml — the ONE committed table of opt-in agent/skill packs
+# (v0.2.101 catalogue plan §3.1). Parsed by `vco_lib/packs.py` (the one
+# home for pack behaviour); the launcher GUI reads it ONLY through
+# `python -m vco_lib.packs status --json` (Rust never mirrors the table).
+#
+# Shape:
+#   [pack.<name>]
+#   description = "<one line, shown in the launcher's Packs tab>"
+#   members = [ "<path relative to THIS file>", ... ]
+#
+# A member path is relative to this file and is either
+#   <pack>/agents/<name>.md            — one agent definition, or
+#   <pack>/skills/<name>/SKILL.md      — one skill directory (every
+#                                        companion file under the directory
+#                                        ships with it).
+# Every member MUST exist; no member in two packs; no member also shipped
+# by default (`templates/agents/free|module-gateway`, `templates/skills`) —
+# all three rules are validated loudly by `vco_lib.packs.load_packs` and
+# pinned by `tests/test_catalogue_packs.py`.
+#
+# Delivery: members install to the SAME destinations as default agents and
+# skills (`.claude/agents/<name>.md`, `.claude/skills/<name>/…`), so every
+# bundle rule (hash compare, adoption, skip-disabled, --skip-kind, orphan
+# handling) applies to them unchanged. A pack is recorded in the project
+# manifest's `packs` map; a plain `install-bundle --update` keeps recorded
+# packs current, `--remove-pack <name>` removes them (edited members are
+# backed up first, never silently deleted).
+
+[pack.dev-advisors]
+description = "Second-opinion advisors for development decisions"
+members = [
+  "dev-advisors/skills/accessibility-checker/SKILL.md",
+  "dev-advisors/skills/ai-rag-advisor/SKILL.md",
+  "dev-advisors/skills/architect/SKILL.md",
+  "dev-advisors/skills/debug-expert/SKILL.md",
+  "dev-advisors/skills/security-reviewer/SKILL.md",
+]
+
+[pack.devops-reliability]
+description = "Reliability and infrastructure review skills for production systems"
+members = [
+  "devops-reliability/skills/idempotency-keys/SKILL.md",
+  "devops-reliability/skills/k8s-manifest-reviewer/SKILL.md",
+  "devops-reliability/skills/slo-designer/SKILL.md",
+  "devops-reliability/skills/terraform-plan-reviewer/SKILL.md",
+  "devops-reliability/skills/webhook-receiver/SKILL.md",
+]
+
+[pack.ai-engineering]
+description = "Agents and skills for LLM/AI engineering work"
+members = [
+  "ai-engineering/agents/ai-llm-expert.md",
+  "ai-engineering/agents/ai-agentic-architect.md",
+  "ai-engineering/skills/structured-output-extraction/SKILL.md",
+  "ai-engineering/skills/workflow-cost-estimator/SKILL.md",
+]
+
+[pack.science]
+description = "Research agents and skills for scientific work — papers, experiments, statistics, HPC"
+members = [
+  "science/agents/discipline-expert.md",
+  "science/agents/experiment-designer.md",
+  "science/agents/paper-triage.md",
+  "science/skills/equation-check/SKILL.md",
+  "science/skills/hpc-submit/SKILL.md",
+  "science/skills/repro-audit/SKILL.md",
+  "science/skills/stats-consult/SKILL.md",
+]
+
+[pack.marketing-sales-product]
+description = "Business skills for SaaS marketing, sales, pricing and product decisions"
+members = [
+  "marketing-sales-product/skills/build-vs-buy-decision/SKILL.md",
+  "marketing-sales-product/skills/content-calendar-planner/SKILL.md",
+  "marketing-sales-product/skills/saas-metrics-health-check/SKILL.md",
+  "marketing-sales-product/skills/saas-pricing-strategist/SKILL.md",
+  "marketing-sales-product/skills/sales-call-prep/SKILL.md",
+  "marketing-sales-product/skills/seo-content-brief/SKILL.md",
+]
+
+[pack.consulting]
+description = "Agents and skills for consulting engagements — SOWs, due diligence, portfolio status"
+members = [
+  "consulting/agents/consulting-cto-portfolio-coordinator.md",
+  "consulting/agents/consulting-employee-impersonator.md",
+  "consulting/agents/consulting-sow-drafter.md",
+  "consulting/skills/consulting-due-diligence/SKILL.md",
+  "consulting/skills/consulting-incident-coordinator/SKILL.md",
+  "consulting/skills/consulting-portfolio-status/SKILL.md",
+]
+
+[pack.design-media]
+description = "Image, design-system and GUI/UX production skills"
+members = [
+  "design-media/skills/ai-image-prompting/SKILL.md",
+  "design-media/skills/batch-image-pipeline/SKILL.md",
+  "design-media/skills/design-system-auditor/SKILL.md",
+  "design-media/skills/gui-ux-expert/SKILL.md",
+  "design-media/skills/photoshop-scripting/SKILL.md",
+]
+
+[pack.design-ux]
+description = "UX architecture and GUI design agents"
+members = [
+  "design-ux/agents/gui-expert.md",
+  "design-ux/agents/enterprise-ux-architect.md",
+]
+
+[pack.gtm-marketing]
+description = "Go-to-market agents — brand, landing pages, outbound and launches"
+members = [
+  "gtm-marketing/agents/brand-identity-architect.md",
+  "gtm-marketing/agents/landing-page-critic.md",
+  "gtm-marketing/agents/outbound-sequence-writer.md",
+  "gtm-marketing/agents/inbox-triage-operator.md",
+  "gtm-marketing/agents/launch-orchestrator.md",
+]
+
+[pack.ops-sre]
+description = "Incident response, postmortem and automation agents for operations"
+members = [
+  "ops-sre/agents/sre-incident-responder.md",
+  "ops-sre/agents/postmortem-author.md",
+  "ops-sre/agents/automation-engineer.md",
+]
+
+[pack.migration]
+description = "Code-migration agent for framework and language upgrades"
+members = [
+  "migration/agents/code-migrator.md",
+]

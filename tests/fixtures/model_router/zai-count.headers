@@ -1,0 +1,11 @@
+HTTP 200 OK
+Date: Sat, 03 Oct 2026 19:51:09 GMT
+Content-Type: application/json
+Alt-Svc: h3=":443"; ma=3600
+ga-traceid: 04ef62da27cb7b03412101c8f4d2a6a4
+Vary: Access-Control-Request-Headers
+X-LOG-ID: 20261004035108a3265f5bf3254d77
+x-process-time: 0.229730
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Length: 58
+Server: Python/3.12 aiohttp/3.13.5

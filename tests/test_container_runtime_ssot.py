@@ -20,9 +20,9 @@ pairs) and their compose preference orders had drifted four ways. Now:
   via the SAME file.
 
 Red-proofed against the pre-merge tree (``/tmp/merge-lane/pre/3.5/``):
-scenario ``both_compose_forms_prefer_subcommand`` returned ``podman-compose``
-from the old ``install._get_compose_command`` (standalone-first) and
-``podman compose`` from the merged one — the divergence the fixture locks.
+scenario ``both_compose_forms_podman_pins_standalone`` (v0.2.101 plan item 1:
+podman pins the CDI-capable standalone tool; docker keeps the subcommand)
+locks the one order per runtime the R13 merge first unified.
 """
 from __future__ import annotations
 
@@ -414,10 +414,15 @@ def test_install_py_helpers_are_thin_calls_into_the_home():
     assert seen == names, f"missing helpers: {names - seen}"
 
 
-def test_compose_order_is_the_launchers(tmp_path: Path):
-    """Subcommand first, then standalone on PATH, then ~/.local/bin.
-    (install.py used to prefer standalone `podman-compose` — the four-way
-    split R13 closes.)"""
+def test_compose_order_is_one_tool_per_runtime(tmp_path: Path):
+    """v0.2.101 (plan item 1): ONE order per runtime, still in this one
+    home. Podman pins the deterministic standalone `podman-compose` (PATH,
+    then ~/.local/bin) BEFORE the delegating `podman compose` subcommand —
+    the subcommand picks its provider at run time and an external
+    docker-compose silently drops the GPU overlay's CDI `devices:` spec
+    (the 2026-09-29 incident; the wrapper's detect_runtime already
+    preferred the standalone tool, so this aligns every surface). Docker
+    keeps the subcommand first (the plugin IS the implementation)."""
     calls: list[list[str]] = []
 
     def run(argv, **_kw):
@@ -428,18 +433,32 @@ def test_compose_order_is_the_launchers(tmp_path: Path):
     (home / ".local" / "bin").mkdir(parents=True)
     local = home / ".local" / "bin" / "podman-compose"
     local.write_text("#!/bin/sh\n")
-    got = containers.compose_command("podman", which=lambda _n: None, run=run, home=home)
+    # ~/.local/bin standalone wins even though the subcommand probe would
+    # SUCCEED — and no probe runs at all.
+    got = containers.compose_command(
+        "podman", which=lambda _n: None, run=lambda *a, **k: _Result(0), home=home)
     assert got == ([str(local)], "standalone")
-    assert calls == [["podman", "compose", "version"]]
+    assert calls == []
 
+    # PATH standalone beats ~/.local/bin.
     got = containers.compose_command(
         "podman", which=lambda n: "/usr/bin/podman-compose" if n == "podman-compose" else None,
         run=run, home=home,
     )
     assert got == (["podman-compose"], "standalone")
 
-    got = containers.compose_command("podman", which=lambda _n: None, run=lambda *a, **k: _Result(0), home=home)
+    # No standalone anywhere → the subcommand.
+    got = containers.compose_command("podman", which=lambda _n: None,
+                                     run=lambda *a, **k: _Result(0),
+                                     home=tmp_path / "no-such-home")
     assert got == (["podman", "compose"], "subcommand")
+
+    # Docker is unchanged: the plugin subcommand first even when a
+    # standalone docker-compose exists.
+    got = containers.compose_command(
+        "docker", which=lambda n: "/usr/bin/docker-compose" if n == "docker-compose" else None,
+        run=lambda *a, **k: _Result(0), home=home)
+    assert got == (["docker", "compose"], "subcommand")
 
 
 def test_cli_exit_codes_follow_the_state(tmp_path: Path):

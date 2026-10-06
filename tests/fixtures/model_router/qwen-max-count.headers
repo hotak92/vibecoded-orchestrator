@@ -1,0 +1,13 @@
+HTTP 200 OK
+Content-Type: application/json; charset=utf-8
+grpc-encoding: identity
+grpc-accept-encoding: gzip
+x-envoy-upstream-service-time: 16
+Date: Sat, 03 Oct 2026 19:51:14 GMT
+Server: istio-envoy
+x-request-id: 31370dac-e45e-4ab9-8768-dda55358759f
+req-cost-time: 16
+req-arrive-time: 1791057074255
+resp-start-time: 1791057074272
+Vary: Accept-Encoding
+Content-Length: 48

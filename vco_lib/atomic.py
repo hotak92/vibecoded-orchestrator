@@ -48,6 +48,9 @@ Public surface:
 * :func:`exclusive_file_lock` — cross-platform exclusive file lock
   (``contextmanager``); best-effort no-lock on platforms without
   ``fcntl`` (Windows).
+* :func:`claim_once` — ``O_CREAT|O_EXCL`` "first concurrent run wins"
+  claim with a stale-takeover age (v0.2.101 N2); holds on Windows too and
+  outlives the winner's process.
 
 v0.2.53 landed the module with these three exports. v0.2.54 Track J
 completed the consolidation this paragraph used to queue: the sibling
@@ -698,3 +701,72 @@ def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -
             fh.close()
         except Exception:  # noqa: BLE001 — closing must never raise into caller
             pass
+
+
+def claim_once(path: Path, *, stale_after_s: float) -> Optional[bool]:
+    """Claim *path* ATOMICALLY by creating it with ``O_CREAT | O_EXCL``.
+
+    v0.2.101 (N2): the "first of N concurrent runs wins, the rest stand down"
+    primitive. ``O_CREAT|O_EXCL`` is atomic on POSIX and on Windows, so of two
+    processes racing for the same name exactly one creates it — unlike a
+    check-then-write (``exists()`` / ``find -mmin`` before writing), where both
+    can see "absent" and both proceed. Unlike :func:`exclusive_file_lock` it
+    needs no ``fcntl``, so it holds on Windows too, and the claim OUTLIVES the
+    winner's process: a straggler arriving after the winner exited still loses.
+
+    Returns:
+        ``True``  — this call created the claim: proceed.
+        ``False`` — a claim younger than *stale_after_s* already exists: another
+                    run got there first; stand down.
+        ``None``  — could not decide (the directory cannot be created, the
+                    filesystem refuses the create, the claim cannot be
+                    inspected). The CALLER picks the fail mode — this helper
+                    does not know whether a duplicate or a skipped run is the
+                    cheaper mistake for it.
+
+    A claim older than *stale_after_s* is a previous run's leftover: it is
+    removed and the create retried ONCE. That takeover is the one non-atomic
+    step (unlink-then-create): two racers that both find the SAME stale claim
+    can, in a microsecond interleaving, both proceed. Callers whose claim
+    names are unique per run never hit it; callers that reuse a name accept it
+    as the rare degradation to "no claim". The claim file holds the winner's
+    pid (diagnostic only — nothing reads it back).
+    """
+    import time  # noqa: PLC0415 — matches this module's deferred-import style
+
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:  # incl. FileExistsError for a FILE in the parent chain
+        return None
+    for attempt in (0, 1):
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if attempt:
+                return False
+            try:
+                age = time.time() - path.stat().st_mtime
+            except FileNotFoundError:
+                continue  # removed between our create and our stat: try again
+            except OSError:
+                return None
+            if age < stale_after_s:
+                return False
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+            continue
+        except OSError:
+            return None
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        except OSError:
+            pass  # the CREATE is the claim; its body is diagnostic only
+        finally:
+            os.close(fd)
+        return True
+    return False

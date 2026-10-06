@@ -52,9 +52,10 @@ forbidden string.
 
 RED-PROOF: written BEFORE the source fix, this test failed on the
 pre-fix tree naming ``README.md:307``, ``docs/TROUBLESHOOTING.md:951``,
-``VCThelpers/telemetry/consent.py:51`` and
-``templates/skills/gui-test/SKILL.md:36``; it passed once those four
-user-facing strings were repointed at 200-proven ``.com`` URLs.
+``VCThelpers/telemetry/consent.py:51`` and the then-shipped
+``templates/skills/gui-test/SKILL.md:36`` (that skill was retired in
+v0.2.101, so its string no longer exists to guard); it passed once those
+four user-facing strings were repointed at 200-proven ``.com`` URLs.
 """
 
 from __future__ import annotations

@@ -1,0 +1,482 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_template_origin": "vibecoded-orchestrator v0.1.0+ \u2014 copied by install.py",
+  "_comment": "Project-scoped Claude Code settings for VibeCoded Orchestrator-managed projects. Hooks fire by default \u2014 set VCT_DISABLE_HOOKS=1 in your shell to opt out per-shell, or remove blocks here for project-wide opt-out.",
+  "permissions": {
+    "allow": [
+      "Skill",
+      "Bash(pytest *)",
+      "Bash(python *)",
+      "Bash(pip install *)",
+      "Bash(cat *)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(ls *)",
+      "Bash(mkdir *)",
+      "Bash(mv *)",
+      "Bash(cp *)",
+      "Bash(git *)",
+      "mcp__weaviate-kg__*",
+      "mcp__search__*"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Write(./.env)",
+      "Write(./.env.*)",
+      "Bash(rm -rf /)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~)",
+      "Bash(rm -rf ~/)",
+      "Bash(rm -rf /home)",
+      "Bash(rm -rf /etc)",
+      "Bash(rm -rf /usr)",
+      "Bash(rm -rf /var)",
+      "Bash(dd if=* of=/dev/*)",
+      "Bash(mkfs*)",
+      "Bash(shred *)",
+      "Bash(curl * | bash*)",
+      "Bash(curl * | sh*)",
+      "Bash(wget * | bash*)",
+      "Bash(wget * | sh*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/check-no-fork-bomb.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/ensure-containers.sh\"",
+            "timeout": 15,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/verify-container-ports.sh\"",
+            "timeout": 30,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/ensure-code-embed-service.sh\"",
+            "timeout": 15,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-ensure-hub.sh\"",
+            "timeout": 5,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-kg-loader.sh\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-deferral-surface.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-retrieval-health.sh\"",
+            "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/embedding-failures-surface.sh\"",
+            "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/context-size-check.sh\"",
+            "timeout": 2
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/compact-context-reinject.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/kg-update-nudge.sh\"",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-compact-save.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-compact.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/user-prompt-submit-reminder.sh\"",
+            "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/diff-context-inject.sh\"",
+            "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/kg-update-nudge.sh\"",
+            "timeout": 4
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-skill-keyword-suggest.sh\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-start-suggest.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-start-kg-inject.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-start-isolation-check.sh\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-stop-reconcile.sh\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/worktree-guard.sh\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-vercel-token-guard.sh\" \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
+            "timeout": 2
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/lean-ctx-rewrite.sh\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 8
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-tool-use.sh\" \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-edit-context-inject.sh\"",
+            "timeout": 8,
+            "if": "Edit(*)"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-diagram-path-validation.sh\"",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__mermaid__.*|mcp__excalidraw__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-diagram-path-validation.sh\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "ConfigChange": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/config-change-audit.sh\"",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/notify-stop.sh\"",
+            "timeout": 5,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-drain-citations.sh\"",
+            "timeout": 30,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-codegraph-reminder.sh\"",
+            "timeout": 5,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-codegraph-drain.sh\"",
+            "timeout": 15,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-failure-notify.sh\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-file-edit.sh\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-edit-outcome.sh\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-bash-context-record.sh\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-bash-file-sync.sh\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-tool-security.sh\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/py-compile-check.sh\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/kg-summary-generator.sh\"",
+            "timeout": 5,
+            "async": true,
+            "if": "Edit(knowledge/**/*.md)"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/kg-summary-generator.sh\"",
+            "timeout": 5,
+            "async": true,
+            "if": "Write(knowledge/**/*.md)"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__weaviate-kg__store_knowledge_node",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/kg-summary-generator.sh\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git commit *)",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-git-commit-kg-sync.sh\"",
+            "timeout": 10,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-file-delete.sh\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/kg-update-nudge.sh\"",
+            "async": true,
+            "timeout": 3
+          }
+        ],
+        "matcher": "*"
+      },
+      {
+        "matcher": "mcp__weaviate-kg__hybrid_search|mcp__weaviate-kg__semantic_graph_search|mcp__weaviate-kg__search_code_graph",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-mcp-retrieval-record.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .claude/settings.json env to disable per-project (this is the canonical per-project env channel since v0.2.12 / PR-27; the pre-v0.2.12 .vscode/settings.json claude-code.env surface was removed because it didn't propagate to MCP subprocesses on Linux Claude Code 2.1.143). Lean-ctx output compression is delivered via the per-project PreToolUse hook .claude/hooks/lean-ctx-rewrite.sh (registered above). The legacy BASH_ENV shim approach (a wrapper re-sourced by every child shell, which could recurse into a fork-bomb) was disabled in v0.2.11; compression has been delivered by the PreToolUse hook alone since then."
+}

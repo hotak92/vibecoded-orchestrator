@@ -3,10 +3,26 @@
   import { toast } from '$lib/stores/toast';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import {
+    ASYNC_DISABLED_KEY,
+    ASYNC_SUBHOOK_DESCRIPTIONS,
+    ASYNC_SUBHOOK_HINT,
+    ASYNC_SUBHOOK_STEMS,
+    asyncDisabledValueAfterToggle,
+    asyncSubhookToastText,
     canToggle,
     detectHintOs,
+    dispatcherRowPresent,
     gitVisibilityNote,
     isChecked,
+    ifRulesLabel,
+    ifRulesTooltip,
+    isAsyncSubhookDisabled,
+    leanCtxChoiceFromEnvValue,
+    leanCtxEnvValueForChoice,
+    leanCtxToastText,
+    LEAN_CTX_HINT,
+    LEAN_CTX_KEY,
+    LEAN_CTX_OPTIONS,
     newHookCommandPlaceholder,
     parseTimeoutSeconds,
     registerBlockedReason,
@@ -17,6 +33,7 @@
     unregisterConfirmText,
     type EffectiveHook,
     type EffectiveHooksView,
+    type LeanCtxChoice,
   } from './hooks-view';
 
   let { projectId }: { projectId: string } = $props();
@@ -56,21 +73,57 @@
   ];
   const EVENT_OPTIONS = COMMON_EVENTS.map((e) => ({ value: e, label: e }));
 
-  // PR-6 (v0.2.11): per-project lean-ctx toggle. Three logical states map
-  // to two on-disk states for `<project>/.claude/env::VCO_LEAN_CTX_DEFAULT`:
-  //   * 'default' → key absent (the PR-1 hook treats absence as "on")
-  //   * 'on'      → key present, value 'on'
-  //   * 'off'     → key present, value 'off'
-  type LeanCtxChoice = 'default' | 'on' | 'off';
-  const LEAN_CTX_KEY = 'VCO_LEAN_CTX_DEFAULT';
-  const LEAN_CTX_OPTIONS: Array<{ value: LeanCtxChoice; label: string }> = [
-    { value: 'default', label: 'Default (on)' },
-    { value: 'on', label: 'Per-project: on' },
-    { value: 'off', label: 'Per-project: off' },
-  ];
+  // PR-6 (v0.2.11): per-project lean-ctx toggle. v0.2.101: the state mapping
+  // + user-facing copy moved to ./hooks-view (unit-tested there), and the
+  // control is actually RENDERED below — until then the state and handlers
+  // had shipped without any markup ever calling them (delivered-nowhere).
+  // The copy describes the v0.2.101 allow-list rule the hooks enforce.
   let leanCtxChoice = $state<LeanCtxChoice>('default');
   let leanCtxLoading = $state(true);
   let leanCtxSaving = $state(false);
+
+  // v0.2.101 (review SF-2): per-sub-hook toggles for the merged async
+  // PostToolUse dispatcher. Same file, channel and command as the lean-ctx
+  // knob (get/set_claude_env_value on <project>/.claude/env); the list
+  // semantics + copy live in ./hooks-view (unit-tested there), the section
+  // is rendered below and gated on the dispatcher registration existing.
+  let asyncDisabledRaw = $state<string | null>(null);
+  let asyncLoading = $state(true);
+  let asyncSaving = $state<string | null>(null);
+
+  async function loadAsyncDisables() {
+    asyncLoading = true;
+    try {
+      asyncDisabledRaw = await invoke<string | null>('get_claude_env_value', {
+        projectId,
+        key: ASYNC_DISABLED_KEY,
+      });
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      asyncLoading = false;
+    }
+  }
+
+  async function setAsyncSubhook(stem: string, disabled: boolean) {
+    const previous = asyncDisabledRaw;
+    const next = asyncDisabledValueAfterToggle(previous, stem, disabled);
+    asyncDisabledRaw = next; // optimistic
+    asyncSaving = stem;
+    try {
+      await invoke('set_claude_env_value', {
+        projectId,
+        key: ASYNC_DISABLED_KEY,
+        value: next,
+      });
+      toast.success(asyncSubhookToastText(stem, disabled));
+    } catch (e) {
+      asyncDisabledRaw = previous;
+      toast.error(e);
+    } finally {
+      asyncSaving = null;
+    }
+  }
 
   async function load() {
     loading = true;
@@ -94,6 +147,10 @@
     hooks_inserted: number;
     mcp_servers_inserted: number;
     kg_access_rows_inserted: number;
+    // v0.2.101 (L3 review N-6): optional-in-older-commands prune counts —
+    // this tab's toast doesn't use them, the field keeps the mirror honest.
+    agents_pruned?: number;
+    skills_pruned?: number;
     warnings: string[];
   };
 
@@ -131,13 +188,10 @@
         projectId,
         key: LEAN_CTX_KEY,
       });
-      if (v === null || v === undefined) leanCtxChoice = 'default';
-      else if (v === 'off') leanCtxChoice = 'off';
-      else if (v === 'on') leanCtxChoice = 'on';
-      // Any other value (manual edit) is rendered as "default" in the UI;
-      // the user keeps the on-disk override until they actively change the
-      // toggle, at which point we overwrite cleanly.
-      else leanCtxChoice = 'default';
+      // Any value the hook does not read (a manual edit, an absent key)
+      // renders as 'default'; the on-disk override survives until the user
+      // actively moves the toggle (mapping unit-tested in hooks-view).
+      leanCtxChoice = leanCtxChoiceFromEnvValue(v);
     } catch (e) {
       toast.error(e);
     } finally {
@@ -151,17 +205,12 @@
     const previous = leanCtxChoice;
     leanCtxChoice = next; // optimistic
     try {
-      const value = next === 'default' ? null : next;
       await invoke('set_claude_env_value', {
         projectId,
         key: LEAN_CTX_KEY,
-        value,
+        value: leanCtxEnvValueForChoice(next),
       });
-      toast.success(
-        next === 'default'
-          ? 'Reverted to default (compression on)'
-          : `Per-project compression set to ${next}`,
-      );
+      toast.success(leanCtxToastText(next));
     } catch (e) {
       leanCtxChoice = previous;
       toast.error(e);
@@ -254,7 +303,13 @@
 
   // Re-load on project switch. `$effect` fires on mount too, so there is no
   // separate `onMount` — a second load would only double the first render.
-  $effect(() => { if (projectId) void load(); });
+  $effect(() => {
+    if (projectId) {
+      void load();
+      void loadLeanCtx();
+      void loadAsyncDisables();
+    }
+  });
 </script>
 
 <section class="ps-tab">
@@ -265,6 +320,45 @@
   </header>
 
   <p class="ps-git-note">{gitVisibilityNote(settingsPath)}</p>
+
+  <div class="ps-lean-card" data-testid="lean-ctx-toggle">
+    <div class="ps-lean-row">
+      <span class="ps-lean-title">Bash output compression (lean-ctx)</span>
+      <!-- One-way `value`, NOT bind:value: Dropdown assigns the bindable
+           BEFORE firing onChange, so a two-way bind would update
+           leanCtxChoice first and setLeanCtx's equality guard would skip
+           the persist — a control that moves but writes nothing. -->
+      <Dropdown
+        options={LEAN_CTX_OPTIONS}
+        value={leanCtxChoice}
+        disabled={leanCtxLoading || leanCtxSaving}
+        ariaLabel="Per-project lean-ctx compression"
+        onChange={(v) => void setLeanCtx(v)} />
+      {#if leanCtxSaving}<span class="ps-lean-saving">Saving…</span>{/if}
+    </div>
+    <p class="ps-lean-hint">{LEAN_CTX_HINT}</p>
+  </div>
+
+  {#if view && dispatcherRowPresent(view.hooks)}
+    <div class="ps-lean-card" data-testid="async-subhook-toggles">
+      <div class="ps-lean-row">
+        <span class="ps-lean-title">Async PostToolUse sub-hooks (routed by the dispatcher)</span>
+        {#if asyncSaving}<span class="ps-lean-saving">Saving…</span>{/if}
+      </div>
+      {#each ASYNC_SUBHOOK_STEMS as stem (stem)}
+        <label class="ps-async-row">
+          <input
+            type="checkbox"
+            checked={!isAsyncSubhookDisabled(asyncDisabledRaw, stem)}
+            disabled={asyncLoading || asyncSaving !== null}
+            onchange={(e) => void setAsyncSubhook(stem, !(e.target as HTMLInputElement).checked)} />
+          <code>{stem}</code>
+          <span class="ps-async-note">{ASYNC_SUBHOOK_DESCRIPTIONS[stem]}</span>
+        </label>
+      {/each}
+      <p class="ps-lean-hint">{ASYNC_SUBHOOK_HINT}</p>
+    </div>
+  {/if}
 
   {#if view && !readable}
     <div class="ps-banner" role="alert">
@@ -318,7 +412,12 @@
           <tr class:ps-row-orphan={h.state === 'orphan'}>
             <td><code>{h.event}</code></td>
             <td><code>{h.matcher || 'every'}</code></td>
-            <td class="ps-cmd"><code>{h.command}</code></td>
+            <td class="ps-cmd">
+              <code>{h.command}</code>
+              {#if ifRulesLabel(h)}
+                <span class="ps-if-badge" title={ifRulesTooltip(h)}>{ifRulesLabel(h)}</span>
+              {/if}
+            </td>
             <td>{timeoutSeconds(h) === null ? '—' : `${timeoutSeconds(h)}s`}</td>
             <td><span class="ps-tag ps-tag-{h.source}">{h.source}</span></td>
             <td>
@@ -364,6 +463,17 @@
   }
   /* settings.json is usually VCS-tracked — say so before the user clicks. */
   .ps-git-note { color: #aaa; font-size: 11px; line-height: 1.5; margin: 0 0 12px; }
+  /* lean-ctx per-project compression toggle (v0.2.101: wired + accurate copy). */
+  .ps-lean-card {
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 6px; padding: 10px 12px; margin: 0 0 14px;
+  }
+  .ps-lean-row { display: flex; align-items: center; gap: 10px; }
+  .ps-lean-title { font-size: 12px; font-weight: 600; color: inherit; }
+  .ps-lean-saving { font-size: 11px; color: #888; }
+  .ps-lean-hint { color: #aaa; font-size: 11px; line-height: 1.5; margin: 8px 0 0; }
+  .ps-async-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; }
+  .ps-async-note { color: #aaa; font-size: 11px; }
   .ps-banner {
     display: flex; flex-direction: column; gap: 6px; align-items: flex-start;
     background: rgba(255,120,120,0.10); border: 1px solid rgba(255,120,120,0.35);
@@ -391,6 +501,13 @@
   .ps-table code { font-family: ui-monospace, monospace; font-size: 11px; }
   .ps-cmd { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ps-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(255,255,255,0.08); color: #ccc; }
+  /* v0.2.101 `if` groups: the badge marks a command registered once per
+     `if` filter — the row's toggle applies to the whole group. */
+  .ps-if-badge {
+    font-size: 10px; padding: 1px 6px; border-radius: 8px; margin-left: 6px;
+    background: rgba(123,95,255,0.15); color: #b9a7ff; cursor: help;
+    white-space: nowrap;
+  }
   .ps-tag-bundled { background: rgba(0,191,166,0.15); color: var(--color-teal); }
   .ps-tag-project { background: rgba(58,163,255,0.15); color: #6cf; }
   .ps-tag-paid-module { background: rgba(255,200,70,0.15); color: #fc6; }

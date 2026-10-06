@@ -236,6 +236,11 @@ class RoundTripThroughTheRealReaderTests(unittest.TestCase):
                     if src.get("source_note"):
                         entry[key] = src["source_note"]
                     continue
+                if key == "text_only":
+                    # The writer always states it; the seed lists it only on the
+                    # models that set it (absent = false, as both readers parse it).
+                    entry[key] = bool(src.get("text_only", False))
+                    continue
                 entry[key] = src[key]
             models[model_id] = entry
         doc: dict[str, object] = {}

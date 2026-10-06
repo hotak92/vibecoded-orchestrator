@@ -24,6 +24,12 @@ completed action — nothing is pending):
   tarball install (no git history) cannot prove anything, so the pass is a
   no-op with one log line.
 
+* :func:`retire_disabled_orphan` — v0.2.101 (catalogue plan §2.3): the
+  orphan pass's disabled-side arm. A retired agent/skill whose copy the
+  launcher's toggle moved to ``.claude/{agents,skills}.disabled/`` is backed
+  up (when edited) and removed there too — the disable choice does not make a
+  VCO file the user's, and the walk above never descends into ``.disabled``.
+
 * :func:`retire_compose_copies` — owner Q3: project bundles no longer ship
   copies of the orchestrator's compose files (the hooks resolve the compose
   directory from the orchestrator root). Every manifest-tracked
@@ -45,6 +51,7 @@ __all__ = [
     "is_compose_copy",
     "remove_vco_leftovers",
     "retire_compose_copies",
+    "retire_disabled_orphan",
     "run_leftover_policy",
 ]
 
@@ -54,11 +61,15 @@ COMPOSE_BUCKET = "infrastructure/"
 #: Managed `.claude/<kind>/` directories → the template directory (or, for
 #: agents, directories) their files came from. Agents list every directory a
 #: bundle agent has ever shipped from; ``mao/`` is absent on purpose (those
-#: are module-delivered, not bundle-delivered).
+#: are module-delivered, not bundle-delivered). ``specializations`` joined in
+#: v0.2.101 (catalogue plan §5 — plain-doc kind, recursive like skills).
+#: Pack members (``templates/packs/**``) install to the agents/skills kinds
+#: and are manifest-tracked, so they orphan-process, never leftover-process.
 _KIND_SOURCES: dict = {
     "hooks": ("templates/hooks",),
     "scripts": ("templates/scripts",),
     "skills": ("templates/skills",),
+    "specializations": ("templates/specializations",),
     "agents": ("templates/agents/free", "templates/agents/module-gateway",
                "templates/agents/_archive", "templates/agents"),
 }
@@ -119,7 +130,14 @@ def _historical_template_paths(root: Path) -> Optional[set]:
     rc, out, _err = _git_meta.run_git(
         root,
         ["log", "--all", "--format=", "--name-only", "--",
-         "templates/hooks", "templates/scripts", "templates/agents", "templates/skills"],
+         "templates/hooks", "templates/scripts", "templates/agents", "templates/skills",
+         # v0.2.101: the specialisations docs kind. `templates/packs` is NOT a
+         # pathspec: a pack member's template path embeds the pack name, which
+         # a dest_rel cannot derive, so `_retired_sources` could never consult
+         # it. Pack members are manifest-tracked (they retire through the
+         # orphan pass); an unmanifested hand-restored copy stays untouched —
+         # treated as the user's file, the safe outcome.
+         "templates/specializations"],
         timeout=30,
     )
     if rc != 0:
@@ -253,6 +271,59 @@ def remove_vco_leftovers(
               "Each was backed up before removal. Files that match nothing VCO "
               "ever shipped are treated as yours and were not touched.")
     return outcome
+
+
+def retire_disabled_orphan(
+    folder: Path,
+    prior_rel: str,
+    prior_entry: Optional[dict],
+    *,
+    backup_ts: Callable[[], str],
+    dry_run: bool = False,
+) -> list:
+    """v0.2.101 catalogue plan §2.3 — the disabled side of a retired orphan.
+
+    A manifest-tracked agent/skill that upstream retired may sit at its
+    DISABLED location (the launcher GUI's enable/disable toggle MOVES files
+    between ``.claude/{agents,skills}/`` and ``.claude/{agents,skills}.disabled/``).
+    The enabled side is already gone — that is why the orphan loop's case (a)
+    runs — and the leftover pass never walks ``.disabled`` locations, so
+    without this step the copy would linger forever (the gap §2.3 names). The
+    user's choice was DISABLE and the file was VCO's: backup-if-modified +
+    remove, the ``--remove-pack`` rule. Unmodified (manifest hash match) →
+    removed outright; edited (or untracked) → backed up under
+    ``.claude/backups/bundle-adoptions/<ts>/`` first; a backup failure leaves
+    the file in place (the ``_backup_and_remove`` contract). Symlinks are
+    never touched. Returns ``(dest_rel, backup_rel | None, detail)`` rows —
+    empty when there is no disabled-side copy (the ordinary case (a)).
+    """
+    from vco_lib.bundle_kinds import classify_bundle_op_kind, disabled_counterpart
+    from vco_lib.hashing import sha256_file
+
+    if classify_bundle_op_kind(prior_rel) is None:
+        return []
+    dis_rel = disabled_counterpart(prior_rel)
+    if dis_rel is None:
+        return []
+    target = Path(folder) / dis_rel
+    if target.is_symlink() or not target.is_file():
+        return []
+    prior_hash = (prior_entry or {}).get("sha256", "")
+    try:
+        modified = prior_hash == "" or sha256_file(target) != prior_hash
+    except OSError:
+        return []  # unreadable → default to safety: leave it alone
+    detail = ("retired VCO copy on the disabled side — your edits backed up, "
+              "then removed" if modified else
+              "retired VCO copy on the disabled side — removed")
+    if dry_run:
+        return [(dis_rel, None, detail)]
+    try:
+        backup_rel = _backup_and_remove(Path(folder), dis_rel, backup_ts(),
+                                        backup=modified)
+    except Exception:  # noqa: BLE001 — never remove without the promised copy
+        return []
+    return [(dis_rel, backup_rel, detail)]
 
 
 def retire_compose_copies(

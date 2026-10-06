@@ -136,17 +136,18 @@ def test_ratio_lookup_partial_matches_model_tags():
 
 
 def test_unmeasured_registered_model_gets_the_measured_floor():
-    """A registered-but-unmeasured model (bge-m3) gets the measured FLOOR
+    """A registered-but-unmeasured model (jina-code) gets the measured FLOOR
     (the smallest ratio measured across shipped models) — an unmeasured
     tokenizer is a genuine unknown and the conservative side under-fills."""
     from claude_mcp_servers.weaviate_mcp.chunking import MODEL_TOKEN_LIMITS
 
-    assert "bge-m3" in MODEL_TOKEN_LIMITS, "fixture model must be registered"
-    assert "bge-m3" not in _EMBED_BOUND_MIN_CHARS_PER_TOKEN
-    assert _min_chars_per_token_for("bge-m3") == 2.30
-    expected = max(int(MODEL_TOKEN_LIMITS["bge-m3"] * 2.30 * 0.75),
-                   _own_chunker_max("bge-m3"))
-    assert _char_budget_for_model("bge-m3") == expected
+    fixture = "jina-embeddings-v2-base-code"  # registered, but no measured ratio
+    assert fixture in MODEL_TOKEN_LIMITS, "fixture model must be registered"
+    assert fixture not in _EMBED_BOUND_MIN_CHARS_PER_TOKEN
+    assert _min_chars_per_token_for(fixture) == 2.30
+    expected = max(int(MODEL_TOKEN_LIMITS[fixture] * 2.30 * 0.75),
+                   _own_chunker_max(fixture))
+    assert _char_budget_for_model(fixture) == expected
 
 
 def test_unregistered_model_remains_unbounded():
@@ -861,13 +862,13 @@ class _RefusingCodeEmbedService:
     def is_reachable(self) -> bool:
         return True
 
-    def embed(self, text, is_query=False):
+    def embed(self, text, is_query=False, task=None):
         self.calls.append(len(text))
         if len(text) > self.limit:
             raise RuntimeError(self._OVER_WINDOW)
         return [0.1, 0.2, 0.3]
 
-    def embed_batch(self, texts, is_query=False):
+    def embed_batch(self, texts, is_query=False, task=None):
         self.batch_calls += 1
         if any(len(t) > self.limit for t in texts):
             # The real endpoint rejects the WHOLE batch on one bad item.
@@ -878,11 +879,11 @@ class _RefusingCodeEmbedService:
 class _AuthFailingCodeEmbedService(_RefusingCodeEmbedService):
     """Non-overflow control: the shrink must not swallow a real error."""
 
-    def embed(self, text, is_query=False):
+    def embed(self, text, is_query=False, task=None):
         self.calls.append(len(text))
         raise RuntimeError("CodeEmbed /embed returned HTTP 500: boom")
 
-    def embed_batch(self, texts, is_query=False):
+    def embed_batch(self, texts, is_query=False, task=None):
         self.batch_calls += 1
         raise RuntimeError("CodeEmbed /embed returned HTTP 500: boom")
 
@@ -1002,13 +1003,13 @@ def test_codeembed_service_batch_hard_failure_yields_the_sentinel(monkeypatch):
     empty-vector sentinel; the survivors keep their vectors — the Ollama
     batch twin's contract."""
     class _FailLongItems(_RefusingCodeEmbedService):
-        def embed(self, text, is_query=False):
+        def embed(self, text, is_query=False, task=None):
             self.calls.append(len(text))
             if len(text) > 1_000:
                 raise RuntimeError("CodeEmbed /embed returned HTTP 500: boom")
             return [0.1, 0.2, 0.3]
 
-        def embed_batch(self, texts, is_query=False):
+        def embed_batch(self, texts, is_query=False, task=None):
             self.batch_calls += 1
             if any(len(t) > 1_000 for t in texts):
                 raise RuntimeError("CodeEmbed /embed returned HTTP 500: boom")

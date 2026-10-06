@@ -318,7 +318,7 @@ Append-only JSONL at `~/.vct-secrets/audit.log` (mode 600). Each line: `{"ts":"�
 3. Exit 2 — no leak to environment
 
 ### Secrets never on argv or in `.env` files
-The `vct exec` model ensures secrets are injected as env vars at process exec time. The search MCP wrapper and git credential helper read secrets at runtime from the store, not from `~/.claude.json` or any checked-in file.
+The `vct exec` model ensures secrets are injected as env vars at process exec time. The git credential helper and the bundled hooks read secrets at runtime from the store, not from `~/.claude.json` or any checked-in file.
 
 ### `VCT_SECRETS_DIR` override
 Set this env var to relocate the secrets root. Default: `~/.vct-secrets`. Useful for testing and multi-user setups.
@@ -328,12 +328,13 @@ A file placed at the project root (one line = project name) used by `vct detect-
 
 ---
 
-## Search MCP Wrapper + Git Credential Helper
+## Git Credential Helper
 
-### Search MCP wrapper (`claude_mcp_servers/search_mcp/wrapper.sh`)
-**Interpreter resolution (post-`0541dcf7`)**: the wrapper probes, in order, `$SEARCH_MCP_PYTHON` → `$REPO_ROOT/claude_mcp_servers/.venv/bin/python` (the legacy pre-unification layout) → `$REPO_ROOT/.venv/bin/python` (canonical since the venv unification), and only then falls back to the legacy path for its error message. Before that fix it hardcoded the legacy path alone, so on a root-venv install the MCP simply never started — `claude mcp list` said "Failed to connect" with no visible cause. The lesson generalises beyond this wrapper: a layout fact copied into a script is an assumption frozen at authoring time, and nothing re-verified it when the layout moved. v0.2.91's doctor phase (`vco doctor`) exists to be the thing that re-verifies such assumptions after install — the same probe engine that catches an unresolvable `npx`, a stale launcher binary, and drifted npm pins.
-
-Two-stage `GITHUB_TOKEN` resolution as of v0.1.7: (1) env-first — `$GITHUB_TOKEN` already exported in the wrapper's environment (by the user or `vct exec`; the launcher writes no secret values into project files since v0.2.73); (2) resolver helper — `vct_secrets_resolve.sh <project_path> github_pat`, which calls the launcher's hub HTTP API (`GET /api/v1/projects/{id}/env?key=github_pat`). The legacy `~/.vct-secrets/shared/github_pat` file fallback (gated behind `VCT_LEGACY_FILE_FALLBACK=1`) was removed in the 0.1.7 fork-readiness sweep. Either way the token never appears in `~/.claude.json`.
+> The `search` MCP and its `claude_mcp_servers/search_mcp/wrapper.sh` were
+> deleted in v0.2.101. The wrapper's `GITHUB_TOKEN` resolution lived there;
+> the `github_pat` secret is now consumed only by the git credential helper
+> and the bundled hooks that talk to GitHub, through the same two-stage
+> env-first → resolver-helper path.
 
 ### `git-credential-vct` — GitHub credential helper
 At `tools/vct-secrets/git-credential-vct`. Registered via `git config --global credential.https://github.com.helper '!<path>'`. Only responds to the `get` operation (never stores). Resolution order for `github_pat`: (1) walk `$PWD` upward for `.vct-project` → use `projects/<name>/github_pat`; (2) fallback to `VCT_PROJECT_ROOT_PATTERN/<segment>/` heuristic; (3) `shared/github_pat`. Refuses to read files with perms other than 600 or 400.
@@ -402,7 +403,7 @@ Pinned floors: `mcp>=1.0`, `fastmcp>=0.1`, `weaviate-client>=4.9`, `aiohttp>=3.9
 `BOOTSTRAP.md` is the first file read by AI assistants opening the repo. Cleanly separates "you came from VCT Launcher" (Path A — services already running, nothing to do) from "you cloned from GitHub" (Path B — manual install steps).
 
 ### Troubleshooting table
-Documents six common failure modes with causes and fixes: `hybrid_search` returns nothing, hooks don't fire (`VCT_DISABLE_HOOKS=1`), search MCP GitHub errors, code-graph returns nothing (run analyze first), slow/missing Ollama models, container runtime not detected.
+Documents common failure modes with causes and fixes: `hybrid_search` returns nothing, hooks don't fire (`VCT_DISABLE_HOOKS=1`), GitHub auth errors, code-graph returns nothing (run analyze first), slow/missing Ollama models, container runtime not detected.
 
 ### vct-secrets manual setup snippet
 BOOTSTRAP.md shows the exact commands to set up `~/.vct-secrets/` manually (for Path B users): `mkdir -p`, `chmod 700`, `cp vct`, `chmod 755`, `echo "ghp_…" | vct set --project SHARED --key github_pat`.

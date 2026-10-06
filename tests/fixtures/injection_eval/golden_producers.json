@@ -1,0 +1,53 @@
+{
+  "_note": "v0.2.101 WP-E golden producer data for tests/injection_eval_replay.py. SYNTHETIC + SCRUBBED (Gate 21): a fictional 'auth/router/parser' project, no real project or person names, no transcript thinking/output text. Keys under 'after' are the EXACT query strings vco_lib.inject_intent + the router plan builders produce (KGLeg key = the plan's kg_query; CGLeg key = the symbol name). Keys under 'before' are the legacy shell-hook query shapes (pre-bash: raw capped command + extract_symbol(command); pre-edit: '<module> <new_string[:200]>'; pre-tool-use Grep: extract_symbol(pattern)). 'before' outputs are RECORDED baseline results modelling the legacy semantic search's near-miss/irrelevant hits (the ~5% useful baseline the redesign is measured against) — see the harness docstring for provenance.",
+  "revision": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+  "sources": {
+    "src/auth.py": "\"\"\"Authentication helpers.\"\"\"\n\nimport hashlib\n\n\ndef validate_token(token):\n    return bool(token) and _check_signature(token)\n\n\ndef parse_token(raw):\n    return raw.strip()\n\n\ndef _check_signature(token):\n    return hashlib.sha256(token.encode()).hexdigest()\n\n\nclass SessionStore:\n    def refresh_session(self, sid):\n        return sid\n",
+    "src/router.py": "\"\"\"HTTP routing.\"\"\"\n\nfrom src.auth import validate_token\n\n\ndef login_handler(request):\n    return validate_token(request.token)\n\n\ndef health_handler(request):\n    return \"ok\"\n",
+    "lib/parser.rs": "pub fn parse_header(input: &str) -> Header {\n    Header::default()\n}\n",
+    "docs/notes.md": "# Pipeline notes\n\nStages run in order; each stage retries at most twice.\n"
+  },
+  "entities": {
+    "validate_token": "src/auth.py",
+    "parse_token": "src/auth.py",
+    "SessionStore": "src/auth.py",
+    "login_handler": "src/router.py",
+    "health_handler": "src/router.py",
+    "parse_header": "lib/parser.rs"
+  },
+  "after": {
+    "kg": {
+      "auth src": "KG: Token validation pattern | src=src/auth.py\nJWT signature and expiry validation lives in validate_token; parse_token normalises the raw header.\n",
+      "notes docs": "KG: Notes on the pipeline | src=docs/notes.md\nThe queue pipeline notes describe stage ordering and the retry policy.\n",
+      "parser lib": "KG: Parser contract | src=lib/parser.rs\nparse_header returns a Header; callers must handle a malformed header.\n",
+      "router src": "KG: Request routing | src=src/router.py\nlogin_handler wires authentication into the request router.\n",
+      "auth src validate_token": "KG: Token expiry check | src=src/auth.py\nAdd an expiry guard before the signature check inside validate_token.\n",
+      "wire the new session store into the router": "KG: Session store wiring | src=src/session.py\nSessionStore.refresh_session is the entry point for session rotation.\n"
+    },
+    "cg": {
+      "validate_token": "CODE: src.auth.validate_token | function | def src/auth.py:6 | callers: login_handler, refresh_session\n",
+      "parse_token": "CODE: src.auth.parse_token | function | def src/auth.py:10 | callers: login_handler\n",
+      "_check_signature": "CODE: src.auth._check_signature | function | def src/auth.py:14 | callers: validate_token\n",
+      "SessionStore": "CODE: src.auth.SessionStore | class | def src/auth.py:18 | callers: widget_boot\n",
+      "login_handler": "CODE: src.router.login_handler | function | def src/router.py:6 | callers: main\n",
+      "health_handler": "CODE: src.router.health_handler | function | def src/router.py:11 | callers: main\n",
+      "parse_header": "CODE: lib.parser.parse_header | function | def lib/parser.rs:1 | callers: read_frame\n"
+    }
+  },
+  "before": {
+    "kg": {
+      "cat src/auth.py": "KG: Caching strategy | src=src/cache.py\nThe cache eviction policy uses an LRU with a size bound.\n",
+      "git show HEAD:src/auth.py": "KG: Caching strategy | src=src/cache.py\nThe cache eviction policy uses an LRU with a size bound.\n",
+      "cat lib/parser.rs": "KG: Build matrix | src=ci/build.py\nCross-platform build rows live in the matrix.\n",
+      "cat src/router.py": "KG: Logging conventions | src=src/log.py\nStructured logs carry a request id.\n"
+    },
+    "cg": {
+      "src/auth.py": "CODE: src.auth.parse_token | function | def src/auth.py:10 | callers: login_handler\n",
+      "lib/parser.rs": "CODE: lib.parser.read_frame | function | def lib/parser.rs:20 | callers: parse_header\n",
+      "validate_token": "CODE: src.auth.parse_token | function | def src/auth.py:10 | callers: login_handler\n",
+      "parse_header": "CODE: lib.parser.parse_header_len | function | def lib/parser.rs:9 | callers: none\n",
+      "src/router.py": "CODE: src.router.RequestParser | class | def src/router.py:20 | callers: none\n",
+      "health_handler": "CODE: src.router.health_handler_v1 | function | def src/router.py:30 | callers: none\n"
+    }
+  }
+}

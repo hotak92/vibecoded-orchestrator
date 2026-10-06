@@ -454,36 +454,16 @@ impl Db {
 // ═══════════════════════════════════════════════════════════════════════
 
 impl Db {
-    /// Enable or disable a specific tool of a specific MCP server for
-    /// a project. UPSERT on (project_id, mcp_name, tool_name) — calling
-    /// twice with the same args is idempotent and overwrites only the
-    /// `enabled` column.
-    ///
-    /// An absent row means "fall through to the default-allowlist
-    /// baked into `bundled_tool_defaults.toml`" — the wrapper MCP
-    /// implements that fallback, not this layer.
-    pub fn set_mcp_tool_enabled(
-        &self,
-        project_id: &str,
-        mcp_name: &str,
-        tool_name: &str,
-        enabled: bool,
-    ) -> Result<(), String> {
-        let guard = self.lock();
-        guard
-            .execute(
-                "INSERT INTO project_mcp_tool_grants
-                 (project_id, mcp_name, tool_name, enabled)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(project_id, mcp_name, tool_name)
-                 DO UPDATE SET enabled = excluded.enabled",
-                params![project_id, mcp_name, tool_name, enabled as i32],
-            )
-            .map_err(|e| format!("set_mcp_tool_enabled: {}", e))?;
-        Ok(())
-    }
-
     /// List every per-tool grant for a project's MCP server.
+    ///
+    /// v0.2.101 (owner ruling — remove dead GUI-side code): the WRITE side
+    /// (`set_mcp_tool_enabled`) was RETIRED. Its only production callers
+    /// were the per-tool-grant Tauri commands the wrapper-MCP permissions
+    /// UI used, and that UI is gone with the wrapper MCPs' default
+    /// registration; this READER stays because the hub's
+    /// `mcp_tool_grants_api` route serves it to wrapper MCPs that legacy
+    /// installs still run. Rows reach the table through history (written
+    /// before the retirement) or directly by the user.
     pub fn list_project_mcp_tools(
         &self,
         project_id: &str,
@@ -545,6 +525,35 @@ impl Db {
             )
             .map_err(|e| format!("set_project_module_enabled: {}", e))?;
         Ok(())
+    }
+
+    /// Delete a project's EXPLICIT module-flag row (v0.2.101, G1 follow-up).
+    ///
+    /// The inverse of [`set_project_module_enabled`]: with no row, the
+    /// module falls back to its default resolution — for `model_gateway`
+    /// the machine gateway signal
+    /// (`vco_lib.module_gated_delivery.gateway_agents_gate`), the same
+    /// "follows the machine" state the CLAUDE.md render already gives a
+    /// row-less project. Until this existed, a project the user had ever
+    /// toggled could never return to that state.
+    ///
+    /// `Ok(false)` when no row existed — an absent row is not an error
+    /// (same rule as `delete_chat_model_context`), and a double-click on
+    /// "Follow this machine" must not look like a failure.
+    pub fn clear_project_module(
+        &self,
+        project_id: &str,
+        module_name: &str,
+    ) -> Result<bool, String> {
+        let guard = self.lock();
+        let affected = guard
+            .execute(
+                "DELETE FROM project_modules
+                 WHERE project_id = ?1 AND module_name = ?2",
+                params![project_id, module_name],
+            )
+            .map_err(|e| format!("clear_project_module: {}", e))?;
+        Ok(affected > 0)
     }
 
     /// List every module-flag row for a project. Used by the launcher's
@@ -866,15 +875,34 @@ mod tests {
     }
 
     // ─── Per-tool MCP grants ────────────────────────────────────────────
+    //
+    // v0.2.101: the WRITE side (`Db::set_mcp_tool_enabled`) was retired
+    // with the per-tool-grant GUI (owner ruling). Tests seed
+    // `project_mcp_tool_grants` rows with the table's own UPSERT SQL —
+    // the same statement the retired writer issued — and pin the READER
+    // the hub route still serves.
+
+    fn seed_tool_grant(db: &Db, project: &str, mcp: &str, tool: &str, enabled: bool) {
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT INTO project_mcp_tool_grants
+                 (project_id, mcp_name, tool_name, enabled)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(project_id, mcp_name, tool_name)
+                 DO UPDATE SET enabled = excluded.enabled",
+                params![project, mcp, tool, enabled as i32],
+            )
+            .unwrap();
+    }
 
     #[test]
-    fn set_and_list_mcp_tool_grants() {
+    fn list_project_mcp_tools_reads_seeded_grant_rows() {
         let db = make_db_with_project("p1", "Acme");
-        db.set_mcp_tool_enabled("p1", "mermaid", "render", true).unwrap();
-        db.set_mcp_tool_enabled("p1", "mermaid", "export_png", false).unwrap();
+        seed_tool_grant(&db, "p1", "mermaid", "render", true);
+        seed_tool_grant(&db, "p1", "mermaid", "export_png", false);
         // Different MCP, same project.
-        db.set_mcp_tool_enabled("p1", "weaviate-kg", "store_knowledge_node", false)
-            .unwrap();
+        seed_tool_grant(&db, "p1", "weaviate-kg", "store_knowledge_node", false);
 
         let mermaid = db.list_project_mcp_tools("p1", "mermaid").unwrap();
         assert_eq!(mermaid.len(), 2);
@@ -891,7 +919,7 @@ mod tests {
         assert!(!wv[0].enabled);
 
         // UPSERT: flip render off.
-        db.set_mcp_tool_enabled("p1", "mermaid", "render", false).unwrap();
+        seed_tool_grant(&db, "p1", "mermaid", "render", false);
         let mermaid = db.list_project_mcp_tools("p1", "mermaid").unwrap();
         assert_eq!(mermaid.len(), 2, "still two rows, just one flipped");
         let by_name: std::collections::HashMap<_, _> = mermaid
@@ -920,6 +948,31 @@ mod tests {
         // Re-enable it (UPSERT path).
         db.set_project_module_enabled("p1", "diagrams", true).unwrap();
         assert!(db.is_module_active("p1", "diagrams").unwrap());
+    }
+
+    // ─── clear_project_module (v0.2.101, G1 follow-up) ──────────────────
+
+    #[test]
+    fn clear_project_module_deletes_only_the_named_row_and_reports_absence() {
+        let db = make_db_with_project("p1", "Acme");
+        db.set_project_module_enabled("p1", "model_gateway", false).unwrap();
+        db.set_project_module_enabled("p1", "diagrams", true).unwrap();
+
+        // ACT: the explicit choice goes away — the module's default
+        // resolution takes over again ("follows the machine").
+        assert!(db.clear_project_module("p1", "model_gateway").unwrap());
+        let modules = db.list_project_modules("p1").unwrap();
+        assert_eq!(
+            modules.iter().map(|m| m.module_name.as_str()).collect::<Vec<_>>(),
+            vec!["diagrams"],
+            "only the named (project, module) row is deleted"
+        );
+
+        // LEAVE-ALONE: clearing a row that is not there is Ok(false), not
+        // an error — and it still touches nothing else.
+        assert!(!db.clear_project_module("p1", "model_gateway").unwrap());
+        assert!(!db.clear_project_module("p-other", "diagrams").unwrap());
+        assert_eq!(db.list_project_modules("p1").unwrap().len(), 1);
     }
 
     #[test]
@@ -982,7 +1035,7 @@ mod tests {
         db.create_diagram_snapshot(d.id, "h1", b"v1", "manual", None)
             .unwrap();
         db.set_diagram_access("pA", "pB", "read").unwrap();
-        db.set_mcp_tool_enabled("pA", "mermaid", "render", true).unwrap();
+        seed_tool_grant(&db, "pA", "mermaid", "render", true);
         db.set_project_module_enabled("pA", "diagrams", true).unwrap();
 
         // Drop the parent project.
@@ -1036,7 +1089,7 @@ mod tests {
         db.create_diagram_snapshot(d.id, "h1", b"v1", "manual", None)
             .unwrap();
         db.set_diagram_access("pA", "pB", "read").unwrap();
-        db.set_mcp_tool_enabled("pA", "mermaid", "render", true).unwrap();
+        seed_tool_grant(&db, "pA", "mermaid", "render", true);
         db.set_project_module_enabled("pA", "diagrams", true).unwrap();
 
         {

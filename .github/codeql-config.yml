@@ -61,10 +61,5 @@ query-filters:
   - exclude:
       id: py/overly-permissive-file
 
-  # Alert #8: tests/test_search_mcp_only_papers.py L159 — `assert
-  # "openalex.org" in url`. This is a test assertion that verifies the
-  # mock URL points at the expected API host, NOT a production URL sanitizer.
-  # CodeQL's incomplete-url-substring-sanitization rule looks for string
-  # containment checks used as security gates; a test assertion is neither.
-  - exclude:
-      id: py/incomplete-url-substring-sanitization
+  # (Alert #8 exclusion for the deleted `tests/test_search_mcp_only_papers.py`
+  # was removed in v0.2.101 together with the search MCP and its test.)

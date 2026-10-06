@@ -436,6 +436,22 @@ class DoctorResolvers:
     #: when the gateway registry is not importable. Injected so the agent-id
     #: probe is driven from described definitions, no filesystem.
     agent_id_problems: Optional[Callable[[Path], Optional[list]]] = None
+    #: () -> :func:`vco_lib.kg_sync_recency.read_rows` payload (the
+    #: ``last_kg_sync_at`` app_state rows). Injected so the last-KG-sync probe
+    #: is driven from described rows, no launcher.db.
+    kg_sync_rows: Optional[Callable[[], dict]] = None
+
+    def resolve_kg_sync_rows(self) -> dict:
+        """The ``app_state`` rows behind the last-certified-KG-sync report.
+
+        Composes :func:`vco_lib.kg_sync_recency.read_rows` — the rows' ONE
+        reader (read-only, soft-fail).
+        """
+        if self.kg_sync_rows is not None:
+            return self.kg_sync_rows()
+        from vco_lib import kg_sync_recency  # noqa: PLC0415
+
+        return kg_sync_recency.read_rows()
 
     def resolve_agent_id_problems(self, folder: Path) -> Optional[list]:
         """Agent definitions naming a gateway model id the router does not know.
@@ -763,7 +779,9 @@ def probe_mcp_commands_spawnable(folder: Path, res: DoctorResolvers, ctx: dict) 
 
     * ``npx_resolvable`` — the ladder's verdict on npx itself, reported even
       when no entry needs it (it is the prerequisite VCO's own bundled
-      playwright/mermaid entries assume).
+      playwright entry assumes — and the legacy diagram wrappers on
+      pre-v0.2.101 installs that still have them, whose proxy spawns npx
+      as a child; fresh installs register no wrapper).
     * ``mcp_commands_spawnable`` — the per-entry verdict.
 
     The problem finding is ``defer``: installing Node.js is not something VCO
@@ -1206,7 +1224,7 @@ def probe_rl_telemetry_loss(folder: Path, res: DoctorResolvers, ctx: dict) -> li
     Standing rule: RL is optional, but its training logs are ALWAYS collected.
     Losses are recorded by their writers in the RL telemetry loss ledger
     (:mod:`vco_lib.rl_telemetry_loss`): a vct-hub POST that did not land
-    (``hub_post_failed``), a dual-log twin that was wanted but not produced
+    (``hub_post_failed``), deferred events that never reached the POST (``deferred_unsent``, v0.2.101), a dual-log twin that was wanted but not produced
     (``dual_skip``), or a twin written with fewer nodes than its primary
     (``dual_partial``, reported apart: no event was lost). This probe is that
     ledger's surface. Blind spot, stated in the summary: a hook search killed
@@ -3147,6 +3165,37 @@ def probe_last_update_run(folder: Path, res: DoctorResolvers, ctx: dict) -> list
     ]
 
 
+def probe_last_kg_sync(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """When was the orchestrator root's KG last CERTIFIED as synced? (v0.2.101 ⑥)
+
+    The reader of ``app_state["last_kg_sync_at"]``; the logic lives in
+    :mod:`vco_lib.kg_sync_recency`. Reported, never judged (the
+    :func:`probe_last_update_run` rule): ``ok`` with the stamp and its age, or
+    ``unknown`` when nothing is recorded. Root-only — the row is machine-global
+    and only the root's own certified sync writes it (SF-1), so under another
+    project it would describe a sync that project never had.
+    """
+    root = Path(folder)
+    try:
+        from vco_lib.paths import looks_like_orchestrator_root
+    except Exception:  # noqa: BLE001
+        return []
+    if not looks_like_orchestrator_root(root):
+        return []
+    from vco_lib import kg_sync_recency  # noqa: PLC0415
+
+    verdict = kg_sync_recency.describe(res.resolve_kg_sync_rows())
+    status = STATUS_OK if verdict["state"] == kg_sync_recency.STATE_RECORDED else STATUS_UNKNOWN
+    return [
+        Finding(
+            probe="last_kg_sync",
+            status=status,
+            summary=verdict["summary"],
+            detail=dict(verdict["detail"], state=verdict["state"]),
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Install completeness — does the completion marker rest on an installer run?
 # ---------------------------------------------------------------------------
@@ -4330,6 +4379,10 @@ PROBES: dict = {
     "vco_lib_editable": (probe_vco_lib_editable, (SCOPE_FULL,)),
     "source_currency": (probe_source_currency, (SCOPE_FULL,)),
     "last_update_run": (probe_last_update_run, (SCOPE_FULL,)),
+    # v0.2.101 ⑥: full-only, informational (the last_update_run reason) — the
+    # reader of `app_state["last_kg_sync_at"]`. No registered condition: an
+    # age is reported, not graded, so the boot counter must never point at it.
+    "last_kg_sync": (probe_last_kg_sync, (SCOPE_FULL,)),
     # v0.2.95 WP-2: full-only, for a COST reason this time (the v0.2.92
     # probes above are full-only for a promise reason — no registered
     # condition — which does not apply here: this one has a row in
@@ -4602,8 +4655,10 @@ def _npx_entry(finding: Finding):
         why_deferred=(
             "Installing Node.js changes the user's machine, so VCO "
             "never does it unattended. Until npx resolves, every MCP "
-            "registered as `npx` (playwright by default; mermaid when "
-            "enabled) fails to start — Claude Code shows only "
+            "registered as `npx` (playwright by default; the diagram "
+            "wrappers on legacy installs that still have them — the "
+            "wrappers are optional since v0.2.101 and absent on fresh "
+            "installs) fails to start — Claude Code shows only "
             "'Failed to connect', with no indication that the cause is "
             "a missing binary. This entry clears itself on the first "
             "install/update run that finds npx."

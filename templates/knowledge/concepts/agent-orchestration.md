@@ -68,7 +68,7 @@ Tasks triggered by events (file change, API call, task completion):
 ```python
 # Agent calls tool to communicate
 result = await delegate_task(
-    agent="coder",
+    agent="expert-coder",
     task="implement auth module",
     context={"spec": auth_spec, "files": existing_files}
 )
@@ -77,7 +77,7 @@ result = await delegate_task(
 **Message-based**:
 ```python
 await send_message(
-    recipient="coder",
+    recipient="expert-coder",
     content="Please implement auth per the attached spec",
     summary="Auth implementation request"
 )
@@ -85,7 +85,7 @@ await send_message(
 
 **Shared state** (blackboard):
 ```python
-blackboard.claim_task(task_id="auth-impl", agent="coder")
+blackboard.claim_task(task_id="auth-impl", agent="expert-coder")
 blackboard.update_task(task_id="auth-impl", status="completed", output=code)
 ```
 

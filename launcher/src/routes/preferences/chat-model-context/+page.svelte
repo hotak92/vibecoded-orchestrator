@@ -322,6 +322,7 @@
               <th class="num">Context</th>
               <th class="num">Max output</th>
               <th>Advertise 1M</th>
+              <th>Input</th>
               <th>Source</th>
               <th>Updated</th>
               <th></th>
@@ -331,7 +332,7 @@
             {#each rows as row (row.model_id)}
               {#if editing === row.model_id}
                 <tr class="editing-row">
-                  <td colspan="8">
+                  <td colspan="9">
                     {@render editorFields()}
                     <div class="actions">
                       <button class="btn btn-primary" onclick={save} disabled={busy}>
@@ -370,6 +371,16 @@
                       <span class="dim">—</span>
                     {/if}
                   </td>
+                  <td>
+                    {#if row.text_only}
+                      <span
+                        class="badge badge-teal"
+                        title="The vendor states this model takes text-only input — the gateway replaces image blocks with a text note"
+                      >text only</span>
+                    {:else}
+                      <span class="dim" title="Accepts image input; image blocks pass through untouched">image</span>
+                    {/if}
+                  </td>
                   <td class="src">
                     <a href={row.source} target="_blank" rel="noreferrer noopener">
                       {row.source}
@@ -399,7 +410,7 @@
                 </tr>
                 {#if row.source_note}
                   <tr class="note-row">
-                    <td colspan="8"><span class="dim">{row.source_note}</span></td>
+                    <td colspan="9"><span class="dim">{row.source_note}</span></td>
                   </tr>
                 {/if}
               {/if}
@@ -461,6 +472,17 @@
       <small class="field-hint">
         Only for models whose official page states a 1M window. Flagging a
         200K model here makes Claude Code under-report how full it is.
+      </small>
+    </label>
+
+    <label class="field field-check">
+      <input type="checkbox" bind:checked={draft.text_only} />
+      <span>Text-only input</span>
+      <small class="field-hint">
+        Check ONLY when the vendor's page states the model cannot see images.
+        The gateway then replaces image blocks routed to it with a short text
+        note instead of letting the request silently degrade. A wrongly
+        flagged vision model would drop images it could have used.
       </small>
     </label>
 

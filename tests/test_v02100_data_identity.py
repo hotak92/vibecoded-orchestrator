@@ -54,6 +54,19 @@ def _ollama_row(mount: Optional[dict] = None, **kw) -> se.EndpointRow:
     return se.EndpointRow(service="ollama", mode="vco_managed", port=11435, data_mount=mount, **kw)
 
 
+def _adopted_ollama_row(mount: Optional[dict] = None, **kw) -> se.EndpointRow:
+    """v0.2.101 item 2: the REAL-MACHINE shape — Ollama is ``adopted_container``.
+
+    The ``_ollama_row`` fixture above is ``vco_managed``, which hid the case
+    that matters: the guard's ``infrastructure/.env`` projection was gated on
+    ``vco_managed``, so an ADOPTED container's bind was never projected.
+    """
+    kw.setdefault("container_name", "vco_ollama")
+    kw.setdefault("source", "live_reconcile")
+    return se.EndpointRow(service="ollama", mode="adopted_container", port=11435,
+                          data_mount=mount, **kw)
+
+
 def _bind(path) -> dict:
     return {"kind": "bind", "source": str(path), "destination": OLLAMA_DEST}
 
@@ -165,6 +178,29 @@ def test_owners_ollama_on_a_bind_is_preserved_and_projected_never_the_default_vo
     # the compose render was read AFTER the knob landed, and said "bind"
     assert g.effective is not None and g.effective.mount == _bind(models)
     assert box.calls("up") == [] and box.calls("rm") == []
+
+
+def test_an_adopted_ollama_rows_bind_is_projected_too(world):
+    """v0.2.101 item 2: the guard projects an ADOPTED row's observed mount.
+
+    On a real machine Ollama is ``adopted_container`` with a host bind, so the
+    old ``vco_managed``-only gate meant ``VCT_OLLAMA_DATA_SOURCE`` never
+    reached ``infrastructure/.env`` — and the deferral's printed command, which
+    simply re-runs compose in the infra dir, then bound the EMPTY named volume.
+    """
+    root, infra, models, db = world
+    adopted = _adopted_ollama_row(_bind(models))
+    se.write_rows([adopted], db_path=db)
+    box = Box(infra, live=_live_bind(models))
+    g = _guard(box, infra, db, adopted)
+    assert g.verdict == di.PRESERVES, g.reason
+    env = box.env_file()
+    assert env["VCT_OLLAMA_DATA_SOURCE"] == str(models), (
+        "an adopted container's bind must reach infrastructure/.env"
+    )
+    assert "VCT_OLLAMA_VOLUME_NAME" not in env
+    # and the render the printed recipe would run mounts the real bind
+    assert g.effective is not None and g.effective.mount == _bind(models)
 
 
 def test_the_up_verb_removes_the_zombie_only_after_the_proof_and_composes_it_alone(world):

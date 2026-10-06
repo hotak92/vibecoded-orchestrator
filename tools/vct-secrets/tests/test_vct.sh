@@ -321,23 +321,26 @@ t_doctor_token_shape() {
 # writes hub.port + hub.token under an isolated VCT_STATE_DIR, and returns
 # the state dir. The caller sets the desired status via arg $2.
 _start_fake_hub() {
-    local status="$1" statedir="$2"
+    local status="$1" statedir="$2" body="${3:-}"
     command -v python3 >/dev/null 2>&1 || return 2  # skip if no python3
     mkdir -p "$statedir"
     local portfile="$statedir/.port"
-    python3 - "$status" "$portfile" <<'PYEOF' &
+    python3 - "$status" "$portfile" "$body" <<'PYEOF' &
 import http.server, sys, socket
-status = int(sys.argv[1]); portfile = sys.argv[2]
+status = int(sys.argv[1]); portfile = sys.argv[2]; body = sys.argv[3].encode()
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
 with open(portfile, "w") as f: f.write(str(port))
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
-        body = b'{"error":{"code":"forbidden"}}' if status != 200 else b'{"K":"v"}'
+        if body:
+            payload = body
+        else:
+            payload = b'{"error":{"code":"forbidden"}}' if status != 200 else b'{"K":"v"}'
         self.send_response(status)
         self.send_header("Content-Type","application/json")
-        self.send_header("Content-Length",str(len(body)))
-        self.end_headers(); self.wfile.write(body)
+        self.send_header("Content-Length",str(len(payload)))
+        self.end_headers(); self.wfile.write(payload)
 http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
 PYEOF
     echo $! > "$statedir/.hubpid"
@@ -409,6 +412,36 @@ t_die_miss_hit_points_at_resolver() {
     case "$err" in
         *vct_secrets_resolve.sh*) : ;;
         *) echo "    hit miss did not point at the resolver: $err"; return 1 ;;
+    esac
+}
+
+# --- Test (4b, v0.2.101 Q7/S1): a key_paused 404 must NOT suggest `vct set` -
+# The hub answered that the key EXISTS but is paused for this requester.
+# Recommending `vct set` here would plant a file-store copy over a
+# deliberate pause — the exact P3-1 defect class. The message must name
+# the pause and the resume remedy instead.
+t_die_miss_key_paused_withholds_vct_set() {
+    local sd="$TMP/hub404paused"
+    _start_fake_hub 404 "$sd" '{"error":{"code":"key_paused","message":"key SOMEKEY exists but is paused"}}'
+    local rc=$?
+    [ "$rc" -eq 2 ] && { echo "    (skipped: no python3)"; return 0; }
+    [ "$rc" -eq 0 ] || { echo "    fake hub failed to start"; return 1; }
+    local err
+    err=$(VCT_STATE_DIR="$sd" VCT_HUB_PORT="$(cat "$sd/hub.port")" \
+          "$VCT" get --project paused-miss-proj --key SOMEKEY 2>&1 >/dev/null)
+    _stop_fake_hub "$sd"
+    # Must NOT recommend `vct set` on a paused key.
+    case "$err" in
+        *"Fix: vct set"*) echo "    key_paused miss wrongly RECOMMENDED 'vct set': $err"; return 1 ;;
+    esac
+    # Must name the pause and point at the launcher's resume surface.
+    case "$err" in
+        *paused*) : ;;
+        *) echo "    key_paused miss did not name the pause: $err"; return 1 ;;
+    esac
+    case "$err" in
+        *[Ss]ecrets*panel*|*[Ss]ecrets*) : ;;
+        *) echo "    key_paused miss did not point at the resume remedy: $err"; return 1 ;;
     esac
 }
 
@@ -662,6 +695,7 @@ run_test "resolve prints source path (S-5)" t_resolve_path
 run_test "doctor github_pat shape check (S-3)" t_doctor_token_shape
 run_test "die_miss 403 withholds 'vct set' (4b)" t_die_miss_403_withholds_vct_set
 run_test "die_miss hit points at resolver (4b)"  t_die_miss_hit_points_at_resolver
+run_test "die_miss key_paused withholds 'vct set' (Q7/S1)" t_die_miss_key_paused_withholds_vct_set
 
 # v0.2.80 Part A/B/C — secret-shape guard + recover-blob + doctor taxonomy.
 # These run LAST: several set their own isolated VCT_SECRETS_DIR.

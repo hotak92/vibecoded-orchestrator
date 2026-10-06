@@ -269,6 +269,27 @@ rc=$?
 set -e
 assert_eq "$rc" "3" "test_vct_secrets_resolve_exits_3_when_key_not_active"
 
+# ── Test 4a (v0.2.101 Q7): 404 key_paused → exit 3, honest message ──────
+# The hub's exists-but-paused answer keeps the tier-1 exit contract (3)
+# and the chain semantics (fall through to store/.env), but the message
+# names the PAUSE so a full-chain miss is honest about why.
+cat >"$scratch/responses/GET_projects_p1_env_key=REALLY_PAUSED_KEY.json.status" <<'STATUS'
+404
+STATUS
+cat >"$scratch/responses/GET_projects_p1_env_key=REALLY_PAUSED_KEY.json" <<'JSON'
+{"error": {"code": "key_paused", "message": "key REALLY_PAUSED_KEY exists but is paused"}}
+JSON
+
+set +e
+paused_err=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 REALLY_PAUSED_KEY 2>&1 1>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "3" "test_vct_secrets_resolve_exits_3_when_key_paused"
+case "$paused_err" in
+    *"exists but is paused"*) assert_eq "0" "0" "test_vct_secrets_resolve_key_paused_msg_is_honest" ;;
+    *) assert_eq "1" "0" "test_vct_secrets_resolve_key_paused_msg_is_honest (got: $paused_err)" ;;
+esac
+
 # ── Test 4b (v0.2.77 L3-F3): 403 forbidden → exit 5, honest message ──────
 # A scoped-credential boundary refusal must classify distinctly (exit 5)
 # instead of the pre-fix "hub unreachable" (exit 1) mislabel. With no file
@@ -519,6 +540,24 @@ set -e
 assert_eq "$rc" "0" "test_chain_key_not_active_falls_to_file_store/exit_code"
 assert_eq "$out" "synthetic-paused-but-in-store" "test_chain_key_not_active_falls_to_file_store/value"
 rm -f "$VCT_SECRETS_DIR/shared/PAUSED_KEY"
+
+# ── Test 12b (v0.2.101 Q7): tier 2 — key_paused (hub up) also falls to
+# the store: a paused keychain slot must not strand an independent
+# file-store copy (the pause governs the keychain, not ~/.vct-secrets).
+cat >"$scratch/responses/GET_projects_p1_env_key=REALLY_PAUSED_KEY.json.status" <<'STATUS'
+404
+STATUS
+cat >"$scratch/responses/GET_projects_p1_env_key=REALLY_PAUSED_KEY.json" <<'JSON'
+{"error": {"code": "key_paused", "message": "key REALLY_PAUSED_KEY exists but is paused"}}
+JSON
+echo -n "store-copy-while-paused" >"$VCT_SECRETS_DIR/shared/REALLY_PAUSED_KEY"
+set +e
+out=$(VCT_HUB_PORT="$HUB_PORT" "$RESOLVER" p1 REALLY_PAUSED_KEY 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_chain_key_paused_falls_to_file_store/exit_code"
+assert_eq "$out" "store-copy-while-paused" "test_chain_key_paused_falls_to_file_store/value"
+rm -f "$VCT_SECRETS_DIR/shared/REALLY_PAUSED_KEY"
 
 # ── Test 13: tier 3 — project .env resolves when tiers 1+2 miss ────────
 proj_dir="$scratch/proj-with-dotenv"

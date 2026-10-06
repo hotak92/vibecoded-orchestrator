@@ -198,6 +198,82 @@ class TestAtomicWrite(unittest.TestCase):
         self.assertIn("VCO Update Deferred", content)
 
 
+class TestWriteIdempotenceAndBodyChange(unittest.TestCase):
+    """v0.2.101: an unchanged ledger must not be rewritten (its volatile
+    top-level ``generated_at`` must not churn), while a change to an entry's
+    FREE TEXT — even one that contains the literal ``generated_at:`` — must
+    still be written. The masking is anchored to the top-level field only
+    (NF-3)."""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.mkdtemp()
+        self.folder = Path(self._tmpdir)
+        self.md = self.folder / _DEFERRED_REL
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_unchanged_entries_keep_bytes(self) -> None:
+        from unittest.mock import patch
+
+        report = DeferralReport()
+        report.add_entry(_make_entry())
+        with patch("vco_lib.deferral_report._now_iso",
+                   return_value="2026-05-01T00:00:00Z"):
+            report.write(self.folder)
+        before = self.md.read_bytes()
+        # A second, equal report (a DIFFERENT top-level generated_at, clock
+        # pinned forward one second so a same-wall-clock-second false pass is
+        # impossible — v0.2.101 NF-3 nit) must not touch the file.
+        again = DeferralReport()
+        again.add_entry(_make_entry())
+        with patch("vco_lib.deferral_report._now_iso",
+                   return_value="2026-05-01T00:00:01Z"):
+            again.write(self.folder)
+        self.assertEqual(before, self.md.read_bytes(),
+                         "unchanged entries rewrote the ledger")
+
+    def test_nested_generated_at_is_not_masked(self) -> None:
+        """NF-3 nit: the JSON normaliser masks ONLY the top-level
+        ``generated_at``. A nested key at a deeper indent (a future per-entry
+        ``generated_at``) must survive — masking it would let a real change to
+        that field slip through as "unchanged"."""
+        import json
+        from vco_lib.deferral_report import _normalize_json_generated_at
+
+        text = json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-10-04T00:00:00Z",
+                "entries": [{"condition_id": "c", "generated_at": "KEEP-A"}],
+            },
+            indent=2,
+        )
+        out = _normalize_json_generated_at(text)
+        self.assertNotIn("2026-10-04T00:00:00Z", out)   # top-level masked
+        self.assertIn('"generated_at": "X"', out)
+        self.assertIn("KEEP-A", out)                    # nested untouched
+
+    def test_body_change_containing_generated_at_is_written(self) -> None:
+        # Both bodies carry the literal `generated_at:`; only the token after
+        # it differs. A normaliser that masks every occurrence would treat the
+        # two as equal (NF-3) and skip the write.
+        first = DeferralReport()
+        first.add_entry(_make_entry(detected="payload generated_at: ALPHA"))
+        first.write(self.folder)
+        before = self.md.read_bytes()
+
+        changed = DeferralReport()
+        changed.add_entry(_make_entry(detected="payload generated_at: BETA"))
+        changed.write(self.folder)
+
+        self.assertNotEqual(before, self.md.read_bytes(),
+                            "a body change containing `generated_at:` was masked")
+        self.assertIn("payload generated_at: BETA",
+                      self.md.read_text(encoding="utf-8"))
+
+
 class TestYamlFrontmatter(unittest.TestCase):
     """YAML frontmatter parses correctly."""
 

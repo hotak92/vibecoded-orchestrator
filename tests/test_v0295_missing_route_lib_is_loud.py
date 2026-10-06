@@ -114,6 +114,21 @@ def _bash_payload(project: Path) -> dict:
     }
 
 
+def _read_inject_payload(project: Path) -> dict:
+    """v0.2.101: the injection wrappers' driver — a PostToolUse Read of a code
+    file reaches read-context-inject.sh's inject-budget fast path."""
+    src = project / "src"
+    src.mkdir(exist_ok=True)
+    code = src / "widget.py"
+    code.write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    return {
+        "tool_name": "Read",
+        "session_id": "sess-1",
+        "tool_input": {"file_path": str(code)},
+        "tool_response": {"content": "def alpha():\n    return 1\n"},
+    }
+
+
 #: Which hook(s) each required library is on the critical path of, and the
 #: payload that reaches it. `bash-write-targets` is the Bash hook's parser, so
 #: the Edit hook cannot notice its absence — that asymmetry is the reason this
@@ -129,6 +144,14 @@ DRIVERS: dict[str, tuple[tuple[str, object], ...]] = {
     "code-extensions": (
         ("post-file-edit.sh", _edit_payload),
         ("post-bash-file-sync.sh", _bash_payload),
+    ),
+    # v0.2.101 risk-table mitigation: the injection kill-switch lib. Its
+    # absence degrades (the router re-checks the switch) rather than stops
+    # the pipeline — the notice says exactly that — but a half-applied bundle
+    # must still be VISIBLE, and the SessionStart probe row comes free via
+    # vco_required_hook_libs.
+    "inject-budget": (
+        ("read-context-inject.sh", _read_inject_payload),
     ),
 }
 

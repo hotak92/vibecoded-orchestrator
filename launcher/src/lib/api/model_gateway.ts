@@ -752,13 +752,98 @@ export async function setProjectRoutingGuidance(
   });
 }
 
-export async function projectHasRoutingGuidance(
+/**
+ * Clear a project's EXPLICIT routing-guidance choice — the way back to
+ * "follows this machine" (v0.2.101). Deletes the `project_modules` row (the
+ * generic module clear, the inverse of the toggle above); with no row, the
+ * machine gateway signal decides, exactly as it does for a project that was
+ * never toggled. `false` = no row existed (already following the machine).
+ */
+export async function clearProjectRoutingGuidance(
   projectId: string,
 ): Promise<boolean> {
-  return invoke<boolean>('is_project_module_active', {
+  return invoke<boolean>('clear_project_module', {
     projectId,
     moduleName: ROUTING_GUIDANCE_MODULE,
   });
+}
+
+// ─── Routing guidance: what the render actually does (v0.2.101, G1) ──────
+
+/**
+ * The tri-state the Services page's routing-guidance list SHOWS for one
+ * project — the same verdict the CLAUDE.md render follows, not the
+ * two-state `project_modules` row it was previously read from (which said
+ * "off" for every project without an explicit row on a gateway-configured
+ * machine, while the render drew the section).
+ *
+ * Mirror of `commands::model_gateway::RoutingGuidanceState`, which passes
+ * the Python gate's payload through — every decision is Python's.
+ */
+export interface RoutingGuidanceState {
+  /** `on` / `off` = an explicit per-project row; `follows_machine` = no
+   *  row, so the machine signal decides (the resolver's default). */
+  mode: 'on' | 'off' | 'follows_machine' | string;
+  /** Does the section render in this project's CLAUDE.md right now? */
+  renders: boolean;
+  /** Which way the machine decides when `mode === 'follows_machine'`:
+   *  `renders` / `hidden` / `unknown`. `null` for explicit rows. */
+  machine_decides: 'renders' | 'hidden' | 'unknown' | null;
+  reason: string;
+}
+
+/**
+ * The per-project verdicts for a WHOLE list, asked of the Python gate in
+ * ONE spawn through the `model_gateway_routing_guidance` command (same one
+ * home, `vco_lib.module_gated_delivery`, as every other gate question).
+ * Review S2: the machine signal is per-machine — only the per-project row
+ * varies — so one interpreter start answers for every project instead of
+ * one sequential spawn per project on every Services-page open. Keyed by
+ * the folder string exactly as it was passed in.
+ */
+export async function routingGuidanceAll(
+  folders: string[],
+): Promise<Record<string, RoutingGuidanceState>> {
+  return invoke<Record<string, RoutingGuidanceState>>(
+    'model_gateway_routing_guidance',
+    { folders },
+  );
+}
+
+/**
+ * One project's verdict — the single re-read after a toggle or a clear.
+ * Rides the SAME batched command with one folder rather than a second
+ * command shape that could drift from it.
+ */
+export async function routingGuidance(
+  folder: string,
+): Promise<RoutingGuidanceState> {
+  const map = await routingGuidanceAll([folder]);
+  const state = map[folder];
+  if (!state) {
+    throw new Error(
+      `the gate returned no verdict for ${folder} — the row stays "could not ask"`,
+    );
+  }
+  return state;
+}
+
+/**
+ * One caption line for a project in the routing-guidance list — the "say
+ * which way the machine currently decides" half of the tri-state. Returns
+ * `null` for explicit rows (the checkbox alone says everything) and for the
+ * could-not-ask case (the caller renders its own error line).
+ */
+export function describeRoutingGuidance(g: RoutingGuidanceState | null): string | null {
+  if (!g || g.mode !== 'follows_machine') return null;
+  switch (g.machine_decides) {
+    case 'renders':
+      return 'Follows this machine — the section currently renders (a gateway is configured here).';
+    case 'hidden':
+      return 'Follows this machine — currently hidden (no gateway configured here).';
+    default:
+      return 'Follows this machine — could not tell which way it decides right now.';
+  }
 }
 
 // ─── Presentation logic (pure — this is what the vitest covers) ───────────
@@ -971,6 +1056,11 @@ export interface AgentIdProblem {
 export interface GatewayAgentsGate {
   machine_signal: MachineGatewaySignal;
   gate: GatewayAgentsGateVerdict | null;
+  /** Present only with `folder`: whether the CLAUDE.md model-routing
+   *  section renders for that project — computed by the RENDER's own
+   *  mapping (`vco_lib.claude_md_sections.gateway_section_renders`), so a
+   *  consumer never re-derives it. */
+  claude_md_section?: { renders: boolean };
   /** `null` when the gateway package is not importable (nothing to check). */
   agent_id_problems: AgentIdProblem[] | null;
 }

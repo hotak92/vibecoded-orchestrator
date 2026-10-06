@@ -279,11 +279,14 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCT_LAUNCHER_PID": "install.py launcher-restart guard",
     "VCT_ORCHESTRATOR_ROOT_KG_COLLECTION": "install.py internal (root-clone KG binding)",
     "VCT_PREBASH_CMD_LEN": "pre-bash-context-inject hook -> embedded-python channel",
-    "VCT_PREBASH_QUERY": "pre-bash-context-inject hook -> embedded-python channel",
     "VCT_PREBASH_SESSION": "pre-bash-context-inject hook -> embedded-python channel",
-    "VCT_PREBASH_TASK_ID": "pre-bash-context-inject hook -> embedded-python channel",
     "VCT_PREBASH_TS_MS": "pre-bash-context-inject hook -> embedded-python channel",
-    "VCT_PROJECT_PATH": "per-project identity handed to the search MCP wrapper by VCO",
+    # (v0.2.101 Wave 2: VCT_PREBASH_QUERY / VCT_PREBASH_TASK_ID left this
+    # allowlist — the CONFIGURATION.md row for the VCT_PB_* family names them,
+    # so they are documented now and the stale-entry ratchet retired them.)
+    # (v0.2.101: VCT_PROJECT_PATH removed — its only shipped reader, the
+    # search MCP wrapper, was deleted; the hub still EMITS it as part of
+    # the stable /env response contract consumed by external module code.)
     "VCT_PROJECT_ROOT": "per-project root handed to embedded python by the pre-bash hook",
     "VCT_PYTHON": "python-interpreter handoff between bundled hooks and children",
     "VCT_REMOVE_DEPRECATED_MCPS": "install.py internal escape hatch (support tooling)",

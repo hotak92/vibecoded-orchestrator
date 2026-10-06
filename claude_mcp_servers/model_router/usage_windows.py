@@ -18,8 +18,10 @@ Anthropic  5h, weekly, weekly per model ``GET <upstream>/api/oauth/usage``
                                         headers on every relayed answer
 Z.ai       5h, weekly                   ``Vendor.quota_url`` (raw key, no
                                         scheme)
-QwenCloud  monthly credits, NO source   the gateway ledger's tokens for the
-                                        current month — tokens, never a %
+QwenCloud  none — no quota source       the gateway ledger's routed-token total
+                                        for the current month, COLLECTED into
+                                        the snapshot's ``tokens`` block and
+                                        never rendered (owner ruling 2026-09-28)
 ========== ============================ ======================================
 
 Four rules shape everything below.
@@ -28,8 +30,11 @@ Four rules shape everything below.
 its schema during 2026. A window that is missing, unparseable, older than
 :data:`STALE_AFTER_S` or past its own reset time reads ``percent: null`` with
 the reason beside it — never 0 % (reads "plenty left") and never 100 % (reads
-"blocked"). A vendor with no programmatic quota gets a token count LABELLED as
-tokens, never an invented percentage.
+"blocked"). A vendor with no programmatic quota has no window at all: the
+gateway's routed-token total for the month is COLLECTED into the snapshot's
+``tokens`` block (``?format=json`` carries it) and deliberately NOT rendered
+in the status line or the picker — it measures what this one gateway routed,
+not the account's plan usage (owner ruling 2026-09-28).
 
 **Never on a request path.** Nothing here is awaited by ``/v1/messages``. The
 passive header capture is a synchronous dict parse of headers the relay has

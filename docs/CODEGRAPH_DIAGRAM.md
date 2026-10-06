@@ -13,7 +13,7 @@
 
 **Phase 3 of the diagrams-integration plan** (maintainer-side internal notes). Status: pre-alpha — verify all output against the source before sharing.
 
-Turns a subgraph rooted at one code symbol into a Mermaid `flowchart TD`, writes it under `.claude/diagrams/codegraph/`, and indexes it so `hybrid_search` can find it later. Pairs with the `/codegraph-diagram` slash skill — same arguments, same output.
+Turns a subgraph rooted at one code symbol into a Mermaid `flowchart TD`, writes it under `.claude/diagrams/codegraph/`, and indexes it so `hybrid_search` can find it later. Run it as `vco codegraph-diagram` (see below).
 
 ## Quick start
 
@@ -78,9 +78,9 @@ Bumping `--max-nodes` past the default works but reproducibly produces diagrams 
 * **Project resolution**: same path as every other `vco` subcommand — launcher's vct-hub first, then `CODE_GRAPH_PROJECT` / `PROJECT_NAME` env vars, then bare (cross-tenant) query.
 * **Soft-fail**: indexer raises are demoted to warnings; the diagram still lands on disk and can be re-indexed via `vco rebuild-diagram-index` later. Weaviate connection failures abort with exit 2 and a clear stderr message.
 
-## Slash skill
+## Invoking it
 
-The same CLI is wrapped by the `/codegraph-diagram` slash skill (`.claude/skills/codegraph-diagram/SKILL.md` after install). Invoke it inside a Claude Code session — the skill calls the CLI with `--json`, reads back the resulting `.mmd`, and gives a short summary the user can read before opening the diagram in the launcher's DiagramsTab.
+Run `vco codegraph-diagram` directly from a shell (see Quick start). An earlier `/codegraph-diagram` slash skill wrapped the CLI for in-conversation use; that skill was retired in v0.2.101, so the CLI is the one entry point. To read a rendered diagram inside a Claude Code session, run the CLI (add `--json` for a machine-readable payload) and open the resulting `.mmd` from the launcher's DiagramsTab.
 
 ## See also
 

@@ -41,6 +41,11 @@ PS1_ONLY_LIB: frozenset[str] = frozenset({
     # FileStream; the bash hooks take the same lock by re-running under
     # `python -m vco_lib.service_lifecycle with-session-lock`.
     "session-lock.ps1",
+    # v0.2.101: the one-quote-pair rule for RAW .claude/env scans, dotted by
+    # lean-ctx-rewrite.ps1 and post-tool-use-async.ps1. No POSIX counterpart by
+    # design -- the .sh siblings SOURCE the file, so the shell already removes
+    # one quote pair. Mirrored in `.github/scripts/check_hook_parity.py`.
+    "strip-one-quote-pair.ps1",
 })
 
 

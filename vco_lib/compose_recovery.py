@@ -67,6 +67,7 @@ __all__ = [
     "heal_deferral_entry", "daemon_remedy", "compose_project_from_argv",
     "CID_SOCKET_HEAL_FAILED", "CID_PROVIDER_MISMATCH",
     "CID_NETWORK_LABEL_ATTACHED", "CID_STORAGE_LEFTOVER_UNSAFE",
+    "CID_NETWORK_UNKNOWN_PROJECT_REFUSED",
 ]
 
 RunFn = Callable[..., "subprocess.CompletedProcess[str]"]
@@ -87,6 +88,13 @@ CID_SOCKET_HEAL_FAILED = "compose_socket_heal_failed"
 CID_PROVIDER_MISMATCH = "compose_provider_mismatch"
 CID_NETWORK_LABEL_ATTACHED = "compose_network_label_mismatch_attached"
 CID_STORAGE_LEFTOVER_UNSAFE = "container_storage_leftover_unsafe"
+#: The refusal in :func:`_heal_network` when the compose project being recovered
+#: is UNKNOWN (NB-15/FRR:50) is a DIFFERENT reason than "the network's own
+#: labels name another tool": here nothing about the network is even inspected,
+#: because there is no project to check its provenance against. Sharing
+#: ``CID_NETWORK_LABEL_ATTACHED`` made the ledger name a label mismatch for a
+#: case that never read a label.
+CID_NETWORK_UNKNOWN_PROJECT_REFUSED = "compose_network_unknown_project_refused"
 
 #: Human label per cause (the renderer's "Cause:" line).
 CAUSE_LABELS = {
@@ -325,7 +333,7 @@ def _heal_network(net: str, runtime: str, run: RunFn, log: LogFn, *,
     if not project:
         return HealResult(False, [], f"network {net}: the compose project being recovered is "
                           "unknown, so its provenance cannot be checked — never removed",
-                          CID_NETWORK_LABEL_ATTACHED, details)
+                          CID_NETWORK_UNKNOWN_PROJECT_REFUSED, details)
     labels, why = _network_labels(net, runtime, run)
     if labels is None:
         return HealResult(False, [], f"{why} — provenance unknown, never removed",
@@ -693,6 +701,26 @@ def heal_deferral_entry(h: HealResult, *, manual_cmd: str,
                          "cause is outside what a restart can fix (systemd user session, "
                          "permissions, the machine VM).",
             command_to_apply=f"{_socket_recipe(h, _system)}\n# then re-run:\n{manual_cmd}",
+            severity="warning")
+    if h.deferral_cid == CID_NETWORK_UNKNOWN_PROJECT_REFUSED:
+        net = h.details.get("network") or "<network>"
+        rt = h.details.get("runtime") or "podman"
+        return DeferralEntry(
+            condition_id=CID_NETWORK_UNKNOWN_PROJECT_REFUSED,
+            title="Compose network left alone: the project being recovered is unknown",
+            detected=f"compose refused a network while recovering a project whose name could "
+                     f"not be determined, so the network's provenance could not be checked "
+                     f"against it: {h.reason}.",
+            why_deferred="VCO removes such a network only when its own labels prove compose "
+                         "created it for the project being recovered AND nothing is attached. "
+                         "With that project unknown there is nothing to check the network's "
+                         "labels against, so removing it could disconnect another project's "
+                         "services or discard options its owner set (subnet, DNS).",
+            command_to_apply=(f"{rt} network inspect {net} --format '{{{{json .Labels}}}}'\n"
+                              f"{rt} ps -a --filter network={net}\n"
+                              "# if it is yours and nothing you need is attached:\n"
+                              f"# {rt} network rm {net}\n"
+                              f"# then re-run:\n{manual_cmd}"),
             severity="warning")
     if h.deferral_cid == CID_NETWORK_LABEL_ATTACHED:
         net = h.details.get("network") or "<network>"

@@ -521,8 +521,14 @@ def _check_mcp_wrappers() -> _CheckResult:
             STATUS_FAIL,
             "mcpServers is not an object in ~/.claude.json",
         )
-    missing: list[str] = []
+    # v0.2.101 (owner ruling, PLAN-V0300 item 15): the wrapper MCPs are no
+    # longer registered on install — the Diagrams tab renders without them.
+    # An install that already has an entry KEEPS it, so ABSENT means "fresh
+    # install, by design" (never a failure and never a re-register remedy)
+    # while PRESENT still gets its module path verified.
+    absent: list[str] = []
     wrong_module: list[str] = []
+    verified: list[str] = []
     expected_modules = {
         "mermaid": "claude_mcp_servers.wrappers.mermaid_proxy",
         "excalidraw": "claude_mcp_servers.wrappers.excalidraw_proxy",
@@ -530,32 +536,37 @@ def _check_mcp_wrappers() -> _CheckResult:
     for name, module in expected_modules.items():
         entry = servers.get(name)
         if not isinstance(entry, Mapping):
-            missing.append(name)
+            absent.append(name)
             continue
         args = entry.get("args")
         if not isinstance(args, list) or module not in args:
             wrong_module.append(
                 f"{name}: expected -m {module} in args, got {args!r}"
             )
-    if missing:
-        return _CheckResult(
-            "mcp_wrappers",
-            STATUS_FAIL,
-            f"mcpServers missing entries: {missing}",
-            fix_hint="re-run install.py to re-register wrapper MCPs",
-        )
+        else:
+            verified.append(name)
     if wrong_module:
         return _CheckResult(
             "mcp_wrappers",
             STATUS_FAIL,
             "wrapper(s) point at unexpected module: " + "; ".join(wrong_module),
-            fix_hint="re-run install.py to fix the wrapper command line",
+            fix_hint=(
+                "edit the entry in ~/.claude.json (args must include "
+                "-m <module>) or delete it — registration is not re-added "
+                "since v0.2.101"
+            ),
         )
-    return _CheckResult(
-        "mcp_wrappers",
-        STATUS_OK,
-        "mermaid + excalidraw wrappers registered with correct module path",
-    )
+    if absent and not verified:
+        return _CheckResult(
+            "mcp_wrappers",
+            STATUS_OK,
+            "wrapper MCPs not registered — optional since v0.2.101; "
+            "the Diagrams tab does not need them",
+        )
+    detail = f"wrapper(s) registered with correct module path: {verified}"
+    if absent:
+        detail += f"; not registered (optional): {absent}"
+    return _CheckResult("mcp_wrappers", STATUS_OK, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +1135,15 @@ def _check_pretooluse_hooks(project_folder: Path) -> _CheckResult:
 
 # ---------------------------------------------------------------------------
 # Check 9: PostToolUse delete hook registered.
+#
+# Two shipped shapes count as registered (v0.2.101):
+#   * CURRENT — the single async `post-tool-use-async` dispatcher
+#     registration (any matcher; it routes Bash → post-file-delete — the
+#     routing row is pinned by
+#     tests/test_v02101_async_posttooluse_dispatcher.py).
+#   * LEGACY — a direct Bash-matcher `post-file-delete` registration, which
+#     a not-yet-updated install still carries (and which the next bundle
+#     update retires via vco_lib/hook_retirements.py).
 # ---------------------------------------------------------------------------
 
 
@@ -1148,12 +1168,19 @@ def _check_post_delete_hook(project_folder: Path) -> _CheckResult:
     for entry in post:
         if not isinstance(entry, Mapping):
             continue
-        if str(entry.get("matcher", "")) != "Bash":
-            continue
+        matcher = str(entry.get("matcher", ""))
         for hook in entry.get("hooks") or []:
             if not isinstance(hook, Mapping):
                 continue
-            if "post-file-delete" in str(hook.get("command", "")):
+            command = str(hook.get("command", ""))
+            if "post-tool-use-async" in command:
+                return _CheckResult(
+                    "post_delete_hook",
+                    STATUS_OK,
+                    "PostToolUse → post-tool-use-async dispatcher registered "
+                    "(routes Bash → post-file-delete)",
+                )
+            if matcher == "Bash" and "post-file-delete" in command:
                 return _CheckResult(
                     "post_delete_hook",
                     STATUS_OK,
@@ -1162,7 +1189,8 @@ def _check_post_delete_hook(project_folder: Path) -> _CheckResult:
     return _CheckResult(
         "post_delete_hook",
         STATUS_FAIL,
-        "no Bash-matcher hook pointing at post-file-delete",
+        "no post-tool-use-async dispatcher registration and no Bash-matcher "
+        "hook pointing at post-file-delete",
         fix_hint="re-run install.py to re-render the settings.json hooks block",
     )
 

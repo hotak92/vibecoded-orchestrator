@@ -331,7 +331,16 @@ Tags for project-specific knowledge (lowercase with hyphens):
 
 1. **Required fields**:
    - `title`: Must be present and non-empty
-   - `type`: Must be one of defined classes (project, concept, tool, model, hardware, research, pattern, insight, guide)
+   - `type`: Must be a wellformed single token (letters, digits, `-`, `_`).
+     The vocabulary is **open** (see "Declaring your own node types" above):
+     accepted values are the nine built-in classes (project, concept, tool,
+     model, hardware, research, pattern, insight, guide) plus every alias
+     declared in this file — and kg-sync / the weaviate-kg MCP
+     **auto-declare** an undeclared wellformed type here (append-only, under
+     an "Auto-extended node types" section) instead of rejecting the node.
+     An **empty or malformed** `type:` is invalid: the node fails the sync
+     loudly (named in the end-of-run "N of M items not synced" summary) and
+     is never stored.
    - `created`, `updated`: Must be valid ISO 8601 dates
    - `status`: Must be one of {active, archived, deprecated, idea}
 

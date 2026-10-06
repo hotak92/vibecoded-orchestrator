@@ -10,12 +10,17 @@ Per the maintainer ruling there is NO per-process timeout on the seed path;
 the only guard lives at chunk granularity inside the Python embed path
 (``VCT_EMBED_REQUEST_TIMEOUT_SECS`` in ``EmbeddingService``).
 
-This is a source-structure guard: it walks install.py's AST and asserts that
-EVERY seed spawn — ``subprocess.run(...)`` OR ``run_child_logged(...)``
-(v0.2.96 WP-1 moved both seed sites to the log-routing helper; it carries no
-timeout parameter at all) — whose first arg invokes ``sync_knowledge_graph.py``
-(via the ``sync_kg`` variable) does NOT pass a ``timeout=`` keyword. It would
-fail if a future edit re-introduced a per-process cap on the seed.
+This is a source-structure guard: it walks the AST and asserts that EVERY
+seed spawn — ``subprocess.run(...)`` OR ``run_child_logged(...)`` (v0.2.96
+WP-1 moved both seed sites to the log-routing helper; it carries no timeout
+parameter at all) — whose first arg invokes ``sync_knowledge_graph.py`` (via
+the ``sync_kg`` variable) does NOT pass a ``timeout=`` keyword. It would fail
+if a future edit re-introduced a per-process cap on the seed.
+
+v0.2.101 item 4: the seed step (both call sites) moved out of install.py into
+``vco_lib.install_weaviate.kg_seed_step`` (install.py is under a line
+ratchet), so the scan follows it — and now ALSO asserts install.py itself
+holds no seed spawn at all.
 """
 
 from __future__ import annotations
@@ -30,6 +35,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 INSTALL_PY = REPO_ROOT / "install.py"
+#: v0.2.101 item 4: the ONE home of the install seed step.
+INSTALL_WEAVIATE_PY = REPO_ROOT / "vco_lib" / "install_weaviate.py"
 
 
 def _is_seed_spawn_call(call: ast.Call) -> bool:
@@ -69,7 +76,7 @@ def _first_arg_references_sync_kg(call: ast.Call) -> bool:
 
 class SeedSubprocessNoProcessTimeoutTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tree = ast.parse(INSTALL_PY.read_text(encoding="utf-8"))
+        self.tree = ast.parse(INSTALL_WEAVIATE_PY.read_text(encoding="utf-8"))
 
     def _seed_run_calls(self) -> list[ast.Call]:
         calls: list[ast.Call] = []
@@ -83,17 +90,32 @@ class SeedSubprocessNoProcessTimeoutTests(unittest.TestCase):
         return calls
 
     def test_found_both_seed_call_sites(self):
-        # Sanity: the AST walk must find exactly the two seed call sites.
-        # If this drops to <2, the matcher drifted (e.g. the cmd-building
-        # expression changed) and the timeout assertion below would pass
-        # vacuously. If it grows, a new seed call site appeared and must
-        # also be timeout-free.
+        # Sanity: the AST walk must find the ONE seed call site (v0.2.101
+        # item 4 folded both install seed sites into
+        # vco_lib.install_weaviate.kg_seed_step). If this drops to 0 the
+        # matcher drifted (e.g. the cmd-building expression changed) and the
+        # timeout assertion below would pass vacuously; if it grows, a new
+        # seed call site appeared and must also be timeout-free.
         calls = self._seed_run_calls()
-        self.assertGreaterEqual(
+        self.assertEqual(
             len(calls),
-            2,
-            "expected at least the two sync_knowledge_graph.py seed "
-            "spawn call sites in install.py",
+            1,
+            "expected exactly ONE sync_knowledge_graph.py seed spawn call "
+            "site in vco_lib/install_weaviate.py",
+        )
+        # And install.py must hold none — an inline seed spawn is exactly the
+        # shape this guard exists to see.
+        install_tree = ast.parse(INSTALL_PY.read_text(encoding="utf-8"))
+        inline = [
+            n for n in ast.walk(install_tree)
+            if isinstance(n, ast.Call)
+            and _is_seed_spawn_call(n)
+            and _first_arg_references_sync_kg(n)
+        ]
+        self.assertEqual(
+            inline, [],
+            "install.py must not spawn the seed inline any more — "
+            "vco_lib.install_weaviate.kg_seed_step owns it",
         )
 
     def test_no_seed_call_passes_timeout(self):

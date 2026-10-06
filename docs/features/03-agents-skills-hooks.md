@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 44 bundled agents, 54 skills, and 46 hooks (44 event-registered in the default `.claude/settings.json`; 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. Neither is dead code; both run standalone). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 11 free agents, 6 skills, and 51 hooks (44 event-registered in the default `.claude/settings.json`; 5 more are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually — v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records; and 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. None is dead code; all run standalone). Alongside them: 8 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -8,120 +8,33 @@ For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-
 
 ## Bundled Agents (`templates/agents/free/`)
 
-Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 44 agents split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / bootstrap-refinement); the list below describes the most-used of them, not all 44 — `ls templates/agents/free/` is the complete set. The `project-migrator` agent was archived in v0.2.54 to `templates/agents/_archive/` — `install.py --add-project` and the launcher GUI's "+ Existing Project" tab now handle that flow automatically.
+Default agents install to a project's `.claude/agents/` on the bundle install (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`. v0.2.101 right-sized the catalogue to **11 default agents**: the topical specialists moved into opt-in packs (below), so a fresh install carries the general roles and a project adds the specialities it needs. `ls templates/agents/free/` is the complete set. The `project-migrator` agent was archived in v0.2.54 to `templates/agents/_archive/` — `install.py --add-project` and the launcher GUI's "+ Existing Project" tab now handle that flow automatically.
 
-**Every bundled agent declares `effort: medium`** (v0.2.97 — they all declared `high` in v0.2.96, and ten of them `xhigh` before that). Frontmatter effort *overrides* the session's level and cannot be overridden from the Agent tool, so the value a shipped agent pins is the value you get. `medium` is the shipped default; the few agents in genuinely hard-reasoning roles (deep research, incident response, adversarial review) are kept at `high`, which is the ceiling — `xhigh` and `max` are not used for subagents at all, both for the cost and because `xhigh` is rejected outright by models that do not expose extended thinking, making the agent fail to start rather than run more carefully. Raise it per-agent if you want it; the frontmatter still accepts `xhigh` and `max`, on a model you know supports them.
+**Every bundled agent declares `effort: medium`** (v0.2.97 — they all declared `high` in v0.2.96, and ten of them `xhigh` before that). Frontmatter effort *overrides* the session's level and cannot be overridden from the Agent tool, so the value a shipped agent pins is the value you get. `medium` is the shipped default for the whole default catalogue; the pack agents in genuinely hard-reasoning roles — `sre-incident-responder` (live-incident debugging) — are kept at `high`, which is the ceiling. `xhigh` and `max` are not used for subagents at all, both for the cost and because `xhigh` is rejected outright by models that do not expose extended thinking, making the agent fail to start rather than run more carefully. Raise it per-agent if you want it; the frontmatter still accepts `xhigh` and `max`, on a model you know supports them.
 
-**Gateway agents (machine-gated).** Bundled agents used to ship to every project unconditionally. `templates/agents/module-gateway/` holds **ten definitions**: the z.ai lane `glm-implementer`, `glm-reviewer`, `glm-planner` and `glm-flash-researcher`, plus the qwen-vendor lane `deepseek-implementer`, `qwen-implementer`, `qwen-flash-implementer`, `deepseek-researcher`, `qwen-flash-researcher` and `qwen-flash-sweeper`. Since v0.2.100 they follow the **machine**: every bundle update — a project's, and the orchestrator root's own — delivers them whenever the model gateway is set up on this machine (registered at login, running, or run before) **and** a VS Code panel points at it. A per-project switch (Services → Model gateway) overrides that either way: switched on, the project always receives them; switched off, it receives none and previously delivered copies are removed; toggling it runs the project's bundle update at once. If the installer cannot decide (launcher.db locked or unreadable, a settings file that does not parse), it adds nothing, removes nothing — previously delivered definitions are carried forward — and records `gated_delivery_unknown`; an explicit opt-out on a configured machine is recorded as `gated_delivery_skipped`. (Until v0.2.100 the only opener was that per-project switch, which nothing in the ordinary flow ever set, so the definitions reached no project.) The Services card also lists any agent definition — the project's or your own `~/.claude/agents` — whose `claude-gw/*` model id the gateway does not know, with the closest valid ids (`python -m vco_lib.module_gated_delivery check-agent-ids --folder <project>`). They are deliberately outside the 44 free-agent count, which measures `templates/agents/free/` alone. Spawn them by definition **name** with no model override — the Agent tool's model list cannot carry `claude-gw/*` ids, while an agent's own frontmatter can. (`glm-flash-reviewer` was retired in the same release: flash is kept for research and investigation, review moved to `glm-5.3`. An already-delivered copy is orphan-cleaned on the next bundle update if unmodified; an edited copy is kept on disk and simply no longer managed.) The qwen-vendor lane deliberately ships **no reviewer and no planner** definition: an implementation or research lane may be cheap, a verdict may not be — those two roles stay on the z.ai lane and the Anthropic tiers.
+**Gateway agents (machine-gated).** Bundled agents used to ship to every project unconditionally. `templates/agents/module-gateway/` holds **eight definitions**: the z.ai lane `glm-implementer`, `glm-reviewer`, `glm-planner` and `glm-flash-researcher`, plus the qwen-vendor lane `deepseek-implementer`, `qwen-implementer`, `deepseek-researcher` and `qwen-flash-sweeper`. (v0.2.101 folded `qwen-flash-researcher` into `deepseek-researcher` and `qwen-flash-implementer` into `qwen-flash-sweeper`; an already-delivered copy of either is orphan-cleaned on the next bundle update if unmodified, and kept on disk — no longer managed — if edited.) Since v0.2.100 they follow the **machine**: every bundle update — a project's, and the orchestrator root's own — delivers them whenever the model gateway is set up on this machine (registered at login, running, or run before) **and** a VS Code panel points at it. A per-project switch (Services → Model gateway) overrides that either way: switched on, the project always receives them; switched off, it receives none and previously delivered copies are removed; toggling it runs the project's bundle update at once. If the installer cannot decide (launcher.db locked or unreadable, a settings file that does not parse), it adds nothing, removes nothing — previously delivered definitions are carried forward — and records `gated_delivery_unknown`; an explicit opt-out on a configured machine is recorded as `gated_delivery_skipped`. (Until v0.2.100 the only opener was that per-project switch, which nothing in the ordinary flow ever set, so the definitions reached no project.) The Services card also lists any agent definition — the project's or your own `~/.claude/agents` — whose `claude-gw/*` model id the gateway does not know, with the closest valid ids (`python -m vco_lib.module_gated_delivery check-agent-ids --folder <project>`). They are deliberately outside the 11 free-agent count, which measures `templates/agents/free/` alone. Spawn them by definition **name** with no model override — the Agent tool's model list cannot carry `claude-gw/*` ids, while an agent's own frontmatter can. (`glm-flash-reviewer` was retired in the same release: flash is kept for research and investigation, review moved to `glm-5.3`. An already-delivered copy is orphan-cleaned on the next bundle update if unmodified; an edited copy is kept on disk and simply no longer managed.) The qwen-vendor lane deliberately ships **no reviewer and no planner** definition: an implementation or research lane may be cheap, a verdict may not be — those two roles stay on the z.ai lane and the Anthropic tiers.
 
-### `coder` (Sonnet, `isolation: worktree`)
-Writes code from a spec, following patterns from the KG. Runs in git worktree isolation by default.
+### Default agents (11)
 
-<details>
-<summary>Details</summary>
+- **`expert-coder`** (Opus, `isolation: worktree`) — implementation for features, refactors and fixes of any size; absorbs the former `coder`, `backend-specialist` and `api-integration-scaffolder` roles. Before backend or API-client work, read `.claude/specializations/fields/backend.md` / `fields/api-design.md`.
+- **`frontend-specialist`** (Sonnet) — React/Vue/Svelte components, forms, routing, client state.
+- **`code-explorer`** (Haiku) — read-heavy codebase research; can also write findings reports to `.claude/context/`, `docs/` or `knowledge/`.
+- **`web-explorer`** (Haiku) — read-only web / docs research; absorbs the former `deep-researcher` "deep mode" (decompose the question, recurse per sub-question, synthesise with provenance).
+- **`planner`** (Opus) — requirements analysis, architecture/design, and phased task breakdowns; absorbs the former `project-architect`.
+- **`tester`** (Sonnet) — pytest unit/integration/edge-case tests, failure investigation to root cause, and coverage review.
+- **`gui-tester`** (Sonnet) — automated GUI testing through the Playwright MCP (navigate, screenshot, click, type, evaluate).
+- **`doc-maintainer`** (Sonnet) — create, update and organise project docs and knowledge files; absorbs the former `doc-extractor`, `doc-organizer` and `project-organizer`.
+- **`kg-maintainer`** (Sonnet) — KG search, node creation/updates, duplicate and health checks; merges the former `kg-navigator`, `knowledge-curator` and `graph-health-checker`.
+- **`code-reviewer`** (Fable, read-only tools) — adversarial review of code, tests, security, architecture and docs-vs-code; returns findings with evidence and never edits.
+- **`agent-author`** (Sonnet) — writes and refines agent definitions, skill files and helper scripts; absorbs the former `helper-scripter` and `prompt-engineer`.
 
-Tools: Read, Write, Edit, Grep, Glob, Bash, plus the `weaviate-kg` MCP tools registered in `~/.claude.json`. Worktree isolation puts changes on a throwaway branch until reviewed — a half-finished implementation can't dirty the working directory.
+### Gateway agents (machine-gated)
 
-</details>
+The eight machine-gated definitions are described in the paragraph above (`templates/agents/module-gateway/`).
 
-### `planner` (Sonnet)
-Requirements analysis, architectural design, and task breakdown. Injects `task-breakdown` and `architect` skills.
+### Opt-in packs (`templates/packs/`)
 
-### `tester` (Sonnet)
-Test creation, verification, and bug investigation. Injects `code-review-expert` skill.
-
-### `code-explorer` (Haiku)
-Read-heavy research agent that can also write findings reports.
-
-<details>
-<summary>Details</summary>
-
-Tools: Read, Glob, Grep, Bash, Write, Edit. Unlike the built-in Explore agent (read-only), `code-explorer` can save findings to `.claude/context/`, `docs/`, or `knowledge/`. Use for audits, gap analyses, pattern inventories. Write scope is enforced by convention in the agent's system prompt rather than tool restriction. Haiku keeps cost low for scan-heavy tasks.
-
-</details>
-
-### `code-migrator` (Sonnet, `isolation: worktree`)
-Migrate code between languages, frameworks, or versions. Injects `architecture-consultant` skill.
-
-### `helper-scripter` (Haiku, `isolation: worktree`)
-Create hooks, scripts, agents, and skills. Self-improves the automation system.
-
-### `doc-extractor` (Sonnet)
-Pulls knowledge out of scattered docs and into KG nodes. Read-only on its sources by instruction, not enforcement: the agent's frontmatter declares no hook, and its tool list includes `Write`/`Edit` for the extraction reports it produces.
-
-### `doc-maintainer` (Sonnet)
-Keeps documentation current and prunes stale material — but always extracts to the KG before archival, so context isn't lost when files are removed.
-
-### `doc-organizer` (Sonnet)
-Detects/merges duplicates, moves loose files, archives old docs, maintains the doc tree. Does not write new documentation — only organizes what exists.
-
-### `graph-health-checker` (Haiku)
-Validates KG and code-graph integrity: orphaned nodes, broken links, missing metadata. Background maintenance trigger.
-
-### `knowledge-curator` (Haiku)
-Extracts WikiLink relationships from KG nodes and updates Weaviate cross-references. Background maintenance.
-
-### `kg-navigator` (Sonnet)
-Searches and explores the KG, surfaces relevant patterns before implementation, flags gaps. Read-only (Read, Grep, Bash only).
-
-### `code-graph-updater` (Haiku)
-Incremental code-graph updates when files change. Background maintenance trigger.
-
-### `gui-tester` (Sonnet, explicit model: `claude-sonnet-4-6`)
-Automated GUI testing through Playwright MCP: navigate, screenshot, click, type, evaluate. Produces structured reports on layout, functionality, and regressions.
-
-<details>
-<summary>Details</summary>
-
-Tools: restricted to Playwright MCP tools only (`mcp__playwright__browser_*`). Requires the Playwright MCP to be connected in `~/.claude.json`. Used for visual regression testing, frontend bug reproduction, and automated UI verification.
-
-</details>
-
-### `web-explorer` (Haiku)
-The web counterpart to `code-explorer`: searches, reads pages, cross-references with local files, writes a single markdown report.
-
-### `prompt-engineer` (Sonnet)
-Reviews and rewrites agent prompts using current Claude 4.x patterns.
-
-### `orchestrator-installer` (Opus)
-Diagnose and recover from a partially-failed install. Canonical install path: `bash first-install.sh` → `install.py`.
-
-### `project-bootstrapper` (Sonnet)
-Refine bootstrap docs (CLAUDE.md, ARCHITECTURE.md) after the launcher's "+ New/Existing Project" flow generates them.
-
----
-
-### `expert-coder` (Opus, `isolation: worktree`)
-Complex implementation work that needs cross-layer architectural reasoning, security analysis, or multi-layer debugging. Use sparingly — Sonnet handles most implementations fine and costs less.
-
-### `project-architect` (Sonnet)
-End-to-end project design: requirements, architecture, implementation plan. Injects `architect` + `architecture-consultant` skills.
-
-### `ai-agentic-architect` (Sonnet)
-Designs multi-agent systems and agentic workflows with coordination strategies. Injects `architect` + `task-breakdown` skills.
-
-### `project-coordinator` (Sonnet)
-Coordinates multi-agent workflows, tracks progress, manages blackboard task assignment.
-
-### `project-organizer` (Sonnet)
-Keeps the project tidy over time and captures cross-project patterns for reuse.
-
-### `backend-specialist` (Sonnet, `isolation: worktree`)
-APIs, services, databases, business logic. Injects `api-designer` + `database-advisor` skills.
-
-### `frontend-specialist` (Sonnet, `isolation: worktree`)
-React/Vue/Svelte components, forms, routing. Injects `react-patterns` + `accessibility-checker` skills.
-
-### `gui-expert` (Sonnet)
-Designs and implements Gradio web applications with WCAG 2.1 AA compliance.
-
-### `ai-llm-expert` (Sonnet)
-LLM integration work: prompt engineering, context management, multi-model routing, cost optimization. Injects `ai-prompting` + `ai-model-selector` skills.
-
-### `deep-researcher` (Sonnet)
-Multi-level web research: spawns recursive sub-agents to chase down branches without losing the parent thread.
-
----
+v0.2.101 moved the topical specialists out of the default catalogue into **eleven opt-in packs**, so an install carries only the roles it needs: `dev-advisors`, `devops-reliability`, `ai-engineering`, `science`, `marketing-sales-product`, `consulting`, `design-media`, `design-ux`, `gtm-marketing`, `ops-sre`, `migration`. A pack installs with `install-bundle --pack <name>` (or the launcher's Packs tab), records itself in the project manifest, and comes along on every later bundle update; `--remove-pack` backs a modified member up before removing it. Members are ordinary agent and skill definitions — e.g. `dev-advisors` carries the `architect`, `debug-expert`, `security-reviewer`, `accessibility-checker` and `ai-rag-advisor` skills; `ops-sre` carries the `sre-incident-responder`, `postmortem-author` and `automation-engineer` agents.
 
 ## Worktree Isolation
 
@@ -131,69 +44,28 @@ Agents with `isolation: worktree` run in a temporary git worktree (isolated bran
 
 ## Bundled Skills (`templates/skills/`)
 
-Skills are smaller and lighter than agents — they're injected into context as a single `SKILL.md` file rather than spawning a fresh process. Invoke directly via `/skill-name`, or list them in an agent's `skills:` frontmatter. Install to `~/.claude/skills/` via `install.py --with-skills` (default-on). 54 skills, organized across multiple model tiers (Opus for deep reasoning, Sonnet for implementation guidance, Haiku for quick checks).
+Skills are smaller and lighter than agents — they're injected into context as a single `SKILL.md` file rather than spawning a fresh process. Invoke directly via `/skill-name`. v0.2.101 right-sized the catalogue to **6 default skills**: the topical review/advisor skills moved into the opt-in packs, and several former skills now ship as reference docs under `.claude/specializations/`. (Agent `skills:` frontmatter was retired in the same release — specialist depth is read from the specialisation docs instead.)
 
-### Opus-tier skills (deep reasoning)
+### Default skills (6)
 
-**`architect`** — Design complex system architectures, evaluate tradeoffs, make critical technical decisions. (`templates/skills/architect/SKILL.md`)
+- **`context-compress`** — the `/compact` pipeline (what it saves and reinjects) plus `CONTEXT_STATE.md` inspection and maintenance. Absorbs the former `context` skill.
+- **`fix-issue`** — investigate and fix a GitHub issue or bug report: read, reproduce, root-cause, fix, add a regression test.
+- **`rc-native`** — run Claude Code Remote Control (claude.ai/code + mobile) as a detached native-auth server alongside the gateway panel.
+- **`task-breakdown`** — break a feature or epic into estimated tasks with a dependency graph and a risk assessment.
+- **`orchestrator-installer`** — diagnose a partially-failed VCO install and advise on `install.py` flags (re-assigned from an agent).
+- **`project-bootstrapper`** — a human-led second pass over the seeded CLAUDE.md / ARCHITECTURE.md / knowledge nodes (re-assigned from an agent).
 
-**`architecture-consultant`** — Cross-domain architecture decisions: technology selection, infrastructure design, long-term tradeoff analysis. (`templates/skills/architecture-consultant/SKILL.md`)
+### Pack skills
 
-**`code-review-expert`** — Deep code analysis: subtle bugs, security issues, performance problems, architectural concerns. (`templates/skills/code-review-expert/SKILL.md`)
+The packs carry the topical skills that used to ship by default — among them `security-reviewer`, `debug-expert`, `architect`, `accessibility-checker` and `ai-rag-advisor` (`dev-advisors`); `terraform-plan-reviewer`, `k8s-manifest-reviewer`, `slo-designer`, `idempotency-keys` and `webhook-receiver` (`devops-reliability`); `equation-check`, `hpc-submit`, `repro-audit` and `stats-consult` (`science`); `seo-content-brief` and `saas-pricing-strategist` (`marketing-sales-product`); `gui-ux-expert` and `design-system-auditor` (`design-media`); and the consulting / design / gtm / ops groups. Install the packs you need.
 
-**`debug-expert`** — Investigate complex bugs, intermittent failures, performance degradations across multiple components. (`templates/skills/debug-expert/SKILL.md`)
+### Specialisation docs (`.claude/specializations/`)
 
-**`security-reviewer`** — Cross-layer security analysis: frontend XSS/CSRF, backend injection, AI prompt injection, infrastructure. (`templates/skills/security-reviewer/SKILL.md`)
+Former specialist skills now ship as plain reference documents the agents read on demand, referenced by ONE line in the agent's body with the exact path (e.g. "Read `.claude/specializations/fields/backend.md` before starting backend-heavy work"):
 
-### Sonnet-tier skills
-
-**`ai-model-selector`** — Quick guidance on choosing AI models (LLM/VLM/Embedding) based on task, VRAM, cost, quality. (`templates/skills/ai-model-selector/SKILL.md`)
-
-**`ai-rag-advisor`** — RAG system design: chunking strategies, embedding selection, retrieval methods, vector DB choices. (`templates/skills/ai-rag-advisor/SKILL.md`)
-
-**`api-designer`** — API design guidance: REST vs GraphQL vs gRPC, endpoint patterns, auth strategies, versioning. (`templates/skills/api-designer/SKILL.md`)
-
-**`database-advisor`** — Database design, schema optimization, query performance, technology selection. (`templates/skills/database-advisor/SKILL.md`)
-
-**`deployment-advisor`** — Deployment strategy: platform selection, CI/CD pipeline design, environment config, monitoring. Includes example CI/CD workflows and platform comparison docs. (`templates/skills/deployment-advisor/SKILL.md`)
-
-**`explore-codebase`** — Systematic codebase onboarding: structure, architecture, key data models, entry points, auth patterns. Argument hint: `[project-path-or-question]`. (`templates/skills/explore-codebase/SKILL.md`)
-
-**`extract-docs`** — Systematically extract knowledge from scattered documentation to prevent catastrophic forgetting. Creates structured extraction reports with status tags. Argument hint: `[source-path-or-pattern]`. (`templates/skills/extract-docs/SKILL.md`)
-
-**`fix-issue`** — Investigate and fix a GitHub issue or bug: read, reproduce, root-cause, implement fix, add regression test. Argument hint: `[issue-url-or-description]`. (`templates/skills/fix-issue/SKILL.md`)
-
-**`gui-test`** — Automated visual testing with Playwright MCP across multiple reviewer perspectives. (`templates/skills/gui-test/SKILL.md`)
-
-**`gui-ux-expert`** — Quick GUI/UX/UI design consultations and recommendations. (`templates/skills/gui-ux-expert/SKILL.md`)
-
-**`interview`** — Interview the user via `AskUserQuestion` to discover requirements for a feature or task. Writes final spec to `SPEC.md`. Argument hint: `[feature-or-task-description]`. (`templates/skills/interview/SKILL.md`)
-
-**`kg-research`** — Research using ONLY knowledge graph semantic search — no file tools, forces KG-first approach. Argument hint: `[search-query]`. (`templates/skills/kg-research/SKILL.md`)
-
-**`performance-optimizer`** — Cross-domain performance analysis: frontend render, backend queries, AI model inference. Includes optimization checklist and pattern examples. (`templates/skills/performance-optimizer/SKILL.md`)
-
-**`react-patterns`** — React best practices: component patterns, state management selection, performance optimization, testing strategies. Includes component pattern, performance, and state management examples. (`templates/skills/react-patterns/SKILL.md`)
-
-**`task-breakdown`** — Break complex features into implementable tasks with estimates, dependencies, and risk matrix. Includes dependency patterns, estimation methods, and risk matrix examples. (`templates/skills/task-breakdown/SKILL.md`)
-
-**`tdd`** — Test-Driven Development workflow: write failing test first, implement to pass. Argument hint: `[feature-or-bug-description]`. (`templates/skills/tdd/SKILL.md`)
-
-**`workflow-maintain`** — Analyze project workflow setup and suggest/create needed automation for hooks, scripts, skills, agents. (`templates/skills/workflow-maintain/SKILL.md`)
-
-### Haiku-tier skills (cheap/fast)
-
-**`accessibility-checker`** — Quick A11y review: WCAG 2.1 checklist, screen reader compatibility, keyboard navigation, color contrast. Includes contrast check script and examples. (`templates/skills/accessibility-checker/SKILL.md`)
-
-**`ai-prompting`** — Prompt engineering tips and templates: few-shot, chain-of-thought, constraint specification, output formatting. (`templates/skills/ai-prompting/SKILL.md`)
-
-**`context`** — Efficient context state inspection, task lifecycle management, session tracking. (`templates/skills/context/SKILL.md`)
-
-**`context-compress`** — Guide for `/compact` with the pre-compact save pipeline. Documents what gets saved and reinjected. Argument hint: `[focus-topic]`. (`templates/skills/context-compress/SKILL.md`)
-
-**`doc-template`** — Documentation templates: README, API docs, ADRs, user guides. Includes README template. (`templates/skills/doc-template/SKILL.md`)
-
-**`hardware-calculator`** — Quick VRAM/RAM calculations, hardware recommendations, AI model feasibility checks. (`templates/skills/hardware-calculator/SKILL.md`)
+- `fields/` — `backend`, `api-design`, `database`, `deployment`, `frontend`, `prompt-engineering`
+- `review-kinds/` — `code`, `security`, `test`, `architecture-design`, `docs-vs-code`
+- `review-topics/` — `performance`, `frontend-ui-a11y`, `database-migrations`, `api-design`, `infra-ci`, `data-ml`
 
 ---
 
@@ -252,7 +124,7 @@ First prompt: creates a baseline snapshot. Subsequent prompts: diffs against sna
 </details>
 
 ### `pre-tool-use.sh` — PreToolUse `*` (all tools, blocking)
-Security enforcement + file backup + KG suggestion.
+Security enforcement + file backup.
 
 <details>
 <summary>Details</summary>
@@ -266,15 +138,70 @@ Exit 2 blocks the tool call. Exit 0 allows it. Security events logged to `.claud
 
 > **Retired (v0.2.77):** an earlier version of this hook also wrote every tool call to a `toucan_dataset.jsonl` "TOUCAN dataset" log. That collector had zero consumers (it was never wired into any RL training path — RL training telemetry lives in `launcher.db rl_events` plus the citation drain, both unaffected), so it was removed to save the per-tool-call I/O. No user action is needed; any existing `.claude/logs/toucan_dataset.jsonl` file is gitignored and inert, and can be deleted at leisure.
 
+> **Retired (v0.2.101):** the Read(code)/Grep(symbol) code-graph injection branches and the §5 "💡 Found N related patterns" Edit/Write KG suggestion. The injection redesign gave those surfaces dedicated router wrappers (`read-context-inject`, `grep-context-inject`, `pre-edit`/`pre-write-context-inject`) — the suggestion double-emitted on every Edit/Write alongside `pre-edit-context-inject` and had no score floor. This hook now spawns no KG/code-graph subprocess at all.
+
 </details>
 
+### Context injection architecture (v0.2.101)
+
+Every KG/code-graph injection surface is a THIN wrapper around one Python router — `claude_mcp_servers/scripts/hook_context_router.py`, with the pure decision core in `vco_lib/inject_intent.py` (no Weaviate imports, fully unit-tested). The wrapper pipes the hook's stdin JSON to `hook_context_router.py <surface>` and wraps whatever it prints in the `additionalContext` envelope; the router owns everything else:
+
+- **Queries come from targets, never from command/prose text.** A Bash command is classified READ / EDIT / SEARCH / MECHANICAL; queries are built from its target paths and clean symbols (`git show <rev>:<path>` keeps its revision pin). MECHANICAL commands (`ls`, builds, tests, `git status`…) spawn **no producer at all** — and the Bash registration is an `if`-filtered handler group, so most commands never even spawn the hook.
+- **Per-surface noise gates** (the §2.1 table, shipped as data in `inject_intent.py`): score floors per surface (0.65–0.75), titles-only rendering below 0.85, exact code-graph `structure callers` lookups (def + callers, ≤5 rows, symbol+file:line only — never bodies) instead of semantic code search, an indexed-revision stamp that silences the code-graph leg when the model reads a pinned old revision (`git show <old-rev>:file`), and a same-language identity check on exact-symbol matches.
+- **Bounds:** 2 500 chars per injection, a 6 000-char per-turn budget keyed by `prompt_id` (past it, blocks degrade to titles one-liners), the pre-existing per-session seen-store dedupe (same files/key format) and the `VCO_CG_INJECT_CAP` session cap.
+- **Cache:** a TTL cache under `.claude/state/query_cache/` (router namespaces `kgi`/`cgi`) that **never stores an empty result** — an empty blob is indistinguishable from a timed-out leg, and caching one used to poison the query for the whole TTL.
+- **RL continuity:** every router KG leg runs the real `rl_kg_search.py` with `--injection-profile <surface>` and the surface's `--task-type`, so retrieval events keep flowing, partitioned per surface; the Bash wrapper keeps the `bash_task_*` state file + `pre_bash` outcome event (now gated on the classification and carrying `intent`/`targets`/`symbols`, with one event per tool call even when a multi-match command fires several `if` rules).
+- **Kill switch:** `VCO_INJECT_PROFILE=off` (checked by the wrappers before spawning and re-checked by the router) disables all injection surfaces without touching the security hooks; `VCT_BASH_KG_THRESHOLD_CHARS` was retired with the threshold it tuned.
+
+The surfaces: `pre-bash-context-inject` (Bash), `pre-edit-context-inject` (Edit), `pre-write-context-inject` (Write), `grep-context-inject` (Grep), `agent-brief-kg-inject` (Agent|Task, PreToolUse `updatedInput`) and `read-context-inject` (Read, PostToolUse — the result surface, where the just-read content feeds the lookup).
+
 ### `pre-edit-context-inject.sh` — PreToolUse Edit (blocking)
-Inject KG + code graph context for the file being edited before the Edit executes.
+Inject gated KG + EXACT code-graph context for the symbol being edited, before the Edit executes.
 
 <details>
 <summary>Details</summary>
 
-Fires only for the `Edit` tool (not `Write` — new files have less prior context value). Runs KG semantic search on the file path and injects relevant nodes as additional context. Must complete within 8 seconds. Never exits 2 — always allows the edit to proceed. Cache warms after first run; subsequent calls for the same file are ~31ms.
+Fires only for the `Edit` tool (the Write surface has its own wrapper since v0.2.101). A thin router wrapper: `hook_context_router.py edit` extracts the ENCLOSING symbols of `old_string` (per-language def/class/fn/impl tables) and runs an exact `structure callers` lookup per symbol (self-file callers excluded), plus a KG leg keyed on module+symbol+path topic with the edit-profile floor (0.65; titles-only below 0.85). The pre-v0.2.101 semantic query (`"<module> <first 200 chars of new_string>"`) is retired — `new_string` content never becomes query text. The per-file replay cache is kept: a repeat edit within the TTL replays the cached router output through the CURRENT seen-state without any spawn. Must complete within the settings timeout (10 s; the router's inner budget is `VCO_INJECT_BUDGET_S`, default 6 s with a 4 s per-leg bound — ordered to leave startup+emit headroom under the harness timeout on slow hardware; a cold run that still overruns fails open to silence, which is the accepted contract for this bounded class). Never exits non-zero — always allows the edit to proceed.
+
+</details>
+
+### `pre-write-context-inject.sh` — PreToolUse Write (blocking, v0.2.101)
+The router's `write` surface for whole-file writes.
+
+<details>
+<summary>Details</summary>
+
+KG titles keyed on the module name + sibling directory (the path topic — never the file's content), floor 0.65. The code-graph leg runs only when the path REWRITES an existing file (its on-disk top-level symbols are looked up); a brand-new file's symbols are not indexed yet, so no CG query is made. Thin wrapper, kill-switch checked first, never exits non-zero.
+
+</details>
+
+### `read-context-inject.sh` — PostToolUse Read (v0.2.101)
+Context about what was just read — on the RESULT surface.
+
+<details>
+<summary>Details</summary>
+
+PostToolUse (not PreToolUse) per the hooks contract: the payload carries `tool_response`, so the lookup uses the content actually read (no disk re-read). Code files → the file's top-level symbols → exact def+callers (≤5 rows each) + KG titles keyed on the path/topic (floor 0.70); docs/knowledge files → KG titles only. This replaced the pre-tool-use Read branch, which ran under the `*` matcher's 3 s budget with a 4 s inner CLI bound — structurally unable to complete a cold query (measured 4.7–11.6 s), which is why the branch injected nothing in practice; this hook gets its own registration with timeout 10.
+
+</details>
+
+### `grep-context-inject.sh` — PreToolUse Grep (v0.2.101)
+Exact-symbol lookup for identifier greps.
+
+<details>
+<summary>Details</summary>
+
+Fires only when the Grep pattern passes the identifier gate (`vco_lib/inject_intent.pattern_gate`) AND a clean identifier is recoverable — regex fragments (`pub(crate)`) and bare words stay silent. Runs the exact `structure callers` leg only (no KG — a symbol grep is a code question). Replaced the pre-tool-use Grep branch.
+
+</details>
+
+### `agent-brief-kg-inject.sh` — PreToolUse `Agent|Task` (v0.2.101)
+KG context for a subagent's brief, injected parent-side.
+
+<details>
+<summary>Details</summary>
+
+Reads `tool_input.prompt` (falling back to `description` for the QUERY only), extracts the brief's `Task:` section (or the first sentence after any FIRST ACTION/effort preamble, ≤400 chars) and runs the KG leg only — floor 0.65, ≤3 nodes, ≤1 500 chars total, because the block lands in the subagent's FIRST prompt and is re-paid on every lane turn. Emission is a PreToolUse `updatedInput` envelope that round-trips EVERY original `tool_input` field and modifies only `prompt`; it never emits `permissionDecision` (which would auto-approve the dispatch). A briefless prompt leaves the input untouched. This is the successor of `subagent-start-kg-inject`'s KG half — SubagentStart payloads carry no prompt text, so that query could never fire; the V52-L.1 filesystem snapshot the SubagentStop reconciler needs was kept there.
 
 </details>
 
@@ -293,11 +220,18 @@ Also: reminds to update project expert when `CONTEXT_STATE.md` changes substanti
 
 </details>
 
-### `kg-summary-generator.sh` — PostToolUse Edit/Write(knowledge/**) + store_knowledge_node
-Spawns a background Haiku agent to generate/update summary descriptions for KG nodes after edits. Content-hash dedup: skips regeneration if node content unchanged. Summaries written to `knowledge/.node_formats.json`.
+### `post-tool-use-async.sh` — PostToolUse `*` (async dispatcher, v0.2.101)
+The ONE async PostToolUse registration. Reads the hook stdin once to a temp file, routes it by `tool_name` (plus a `git commit` command-prefix gate carrying the retired `if: Bash(git commit *)` key) to the five concern scripts below plus `kg-update-nudge`, runs the matched children concurrently, and **guarantees silence**: child stdout is discarded, child stderr / non-zero exits condense to one line per failure in `<VCO metrics dir>/post-tool-use-async.log`. Always exits 0.
 
-### `post-git-commit-kg-sync.sh` — PostToolUse Bash(git commit *)
-Spawn a background Haiku agent to review the commit diff and update relevant KG nodes and docs. Non-blocking. Guards with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside agent subprocesses.
+Why: pre-v0.2.101 the templates carried EIGHT async PostToolUse registrations across six scripts. One Bash tool call spawned up to 3 async processes, and every async run that spoke or died wrote a ~660 B `async_hook_response` attachment into the session transcript (measured: 700,330 records / 462 MB in one maintainer transcript). The merge makes it 1 registration and 0 records per successful tool call (≤1, and only if the dispatcher itself is killed). The routing table is one declaration mirrored byte-for-byte in the `.ps1` sibling and pinned by `tests/test_v02101_async_posttooluse_dispatcher.py` against the v0.2.101 retirement rows, so a sub-hook can never be routed on one OS only or dropped without a red test.
+
+**Per-sub-hook on/off (the toggle granularity the eight registrations had)**: a stem listed in `VCO_ASYNC_DISABLED_HOOKS` (`<project>/.claude/env`, comma-separated — the same per-project knob channel `VCO_LEAN_CTX_DEFAULT` uses) is skipped by both siblings. The launcher's Hooks tab renders the six sub-hooks as individual checkboxes writing that key through the existing `set_claude_env_value` command (no second store), gated on the dispatcher registration being present; the vitest suite derives the toggle list from the shipped route table, so a routing row without a toggle is red. A disable set BEFORE v0.2.101 (parked registration in launcher.db) is carried into the key by the next bundle update (`vco_lib.hook_retirements.carry_parked_async_disables`, with an auto-resolution trail row), and the launcher's eager prune keeps the parked bytes until that update has run — the merge never silently re-enables a sub-hook you had turned off. If the carry's env-file write itself fails (a read-only or immutably-flagged `.claude/env`, a directory in the way), the update records an `async_subhook_disable_carry_failed` deferral row for visibility and every later update retries the carry. The prune gate itself keys on POSITIVE evidence of carry success — the classifier's `carry_pending` answer is computed by the same `carry_still_owed` rule the deferral probe uses (dispatcher registered AND the key holds every parked stem; anything still owed or unreadable keeps the bytes) — so a disable stays protected even in the double-failure case where the ledger row could not be written either.
+
+### `kg-summary-generator.sh` — PostToolUse Edit/Write(knowledge/**) + store_knowledge_node (routed by `post-tool-use-async`)
+Spawns a background Haiku agent to generate/update summary descriptions for KG nodes after edits. Content-hash dedup: skips regeneration if node content unchanged. Summaries written to `knowledge/.node_formats.json`. Since v0.2.101 it is no longer registered directly (three registrations retired into the dispatcher); its own knowledge-path validation is the gate the retired `if:` keys used to pre-filter.
+
+### `post-git-commit-kg-sync.sh` — PostToolUse Bash(git commit *) (routed by `post-tool-use-async`)
+Spawn a background Haiku agent to review the commit diff and update relevant KG nodes and docs. Non-blocking. Guards with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside agent subprocesses. Since v0.2.101 the registration is the dispatcher's `git-commit-prefix` routing gate, which reproduces the retired `if: Bash(git commit *)` key.
 
 ### `post-tool-security.sh` — PostToolUse Edit|Write (background)
 Scan written files for accidentally included credentials. Non-blocking; alerts logged to `.claude/logs/credential_alerts.jsonl` with desktop notification.
@@ -336,8 +270,8 @@ Notifications are **coalesced** (v0.2.96): at most one per 5 minutes per `(proje
 
 If you are seeing that storm, `vco doctor` now reads Claude Code's `hasTrustDialogAccepted` flag for the folder: when it is false every headless `claude -p` fails "this workspace has not been trusted", including the ones VCO's own summary generators make. The probe names the state and the one-step recovery (run `claude` in the folder and accept the dialog); it never writes the flag, because that is the CLI's own decision to record.
 
-### `kg-update-nudge.sh` — UserPromptSubmit + Stop (background)
-Counts substantive work tokens since the last KG node write; nudges to write a KG node when the threshold (~150k tokens) is exceeded. Bypass with `KG_NUDGE_OFF=1`.
+### `kg-update-nudge.sh` — UserPromptSubmit + SessionStart(compact) (sync) + PostToolUse (routed by `post-tool-use-async`)
+Counts substantive work units since the last KG node write; nudges to write a KG node when the threshold (~175k work units, then every ~50k) is exceeded. The PostToolUse leg (counter bookkeeping / baseline resets) fires through the dispatcher since v0.2.101 — its former direct async registration is retired; the SYNC UserPromptSubmit and SessionStart(compact) registrations are event-scoped out of that retirement and unchanged. Bypass with `KG_NUDGE_OFF=1`.
 
 ### `verify-container-ports.sh` — SessionStart (startup, background)
 Verifies that the Weaviate / Ollama / code-embed container ports are bound and reachable. Non-blocking.
@@ -365,9 +299,9 @@ Ensure the `vct-hub` resolver service is running by invoking `vct-hub --start-if
 Counts running `lean-ctx` processes and warns if the threshold is exceeded. Backstop for the historical BASH_ENV lean-ctx fork-bomb pattern (now mitigated by design in v0.2.11+).
 
 ### `lean-ctx-rewrite.sh` — PreToolUse Bash
-Per-project lean-ctx PreToolUse hook for Bash tool calls. Wraps the user-issued command in `lean-ctx -c '...'` so output is compressed before it returns to Claude. Auto-detects `lean-ctx` commands and steps aside to prevent recursion.
+Per-project lean-ctx PreToolUse hook for Bash tool calls (v0.2.101: allow-list inversion). Compresses ONLY the single simple commands on the one committed allow-list `_lib/lean-ctx-allowlist.txt` — package installs, image pulls, downloads, test/build runners — which BOTH siblings parse (shared config, A>B>C tier B). Everything else runs raw: loops, pipes, chains, redirects, command substitution, `git` (never allow-listed — owner rule), unknown commands, and every credential-bearing command (SEC-RAW, kept because allow-listed installers/downloaders can carry credentials: `pip install --index-url https://user:pass@host/simple`, `curl -u`, `wget --password`, npm `_authToken` args). The pattern list stays a parity-pinned mirror (`tests/test_d11_trimb_lean_ctx_discovery_and_git_bypass.py`).
 
-It also steps aside for commands whose output is *evidence* rather than noise, keyed on the FINAL `&&`-segment so `git log && git commit` still runs its commit raw: `git commit` / `git push` (a hook-failed commit must not lose its stderr), the seven read-only inspection verbs `git show` / `diff` / `grep` / `log` / `blame` / `cat-file` / `ls-tree` (a reviewer reading a branch it has not checked out gets lossy output otherwise — `git ls-tree -r` measured -94%), and every credential-bearing command (SEC-RAW). Both siblings, `lean-ctx-rewrite.sh` and `.ps1`, share one verb list, parity-pinned by `tests/test_d11_trimb_lean_ctx_discovery_and_git_bypass.py`.
+An allow-listed command is rewritten to the lossless tee wrapper `_lib/lean-ctx-tee.sh` (`.ps1` sibling): it saves the FULL raw output to `<project>/.claude/state/lean-ctx-tee/<ts>.log` (TTL-swept, default 168 h; knob `VCO_LEAN_CTX_TEE_TTL_HOURS` in `.claude/env`, `0` = keep forever), prints the lean-ctx-compressed output, and ends with one pointer line `[lean-ctx-tee] N raw lines -> M shown; full output: <path>` — so compression never costs evidence: the model reads the tee file instead of re-running. The hook constructs the PreToolUse response itself (the pre-v0.2.101 delegation to lean-ctx's own rewrite handler, and with it the `permissionDecision` strip filter, is retired — the auto-approval field can no longer appear). Behavioural parity across the siblings is locked by `tests/test_v02101_lean_ctx_allowlist_tee.py`.
 
 ### `embedding-failures-surface.sh` — context injection
 Surfaces embedding-backend failure hints written by `vco_lib/embedding_service.py` to Claude. When no embedding backend is reachable, the service drops a hint file; this hook injects its contents so Claude can diagnose / recover.
@@ -375,13 +309,15 @@ Surfaces embedding-backend failure hints written by `vco_lib/embedding_service.p
 ### `pre-diagram-path-validation.sh` — PreToolUse (Write/Edit + Bash)
 Defense-in-depth guard for diagrams integration. Rejects `.mmd` / `.excalidraw` writes outside `.claude/diagrams/` to keep the diagram index consistent.
 
-### `post-file-delete.sh` — PostToolUse Bash
+### `post-file-delete.sh` — PostToolUse Bash (routed by `post-tool-use-async`)
 Detects deletes of `.mmd` / `.excalidraw` files under `.claude/diagrams/` and cascades the delete across SQLite + sidecar + Weaviate via `vco_lib.diagram_indexer drop <file>`. Matches `rm` / `unlink` / `mv` / PowerShell `Remove-Item` / `Move-Item`.
 
-### `pre-bash-context-inject.sh` — PreToolUse Bash (V52-M)
-KG context injection before `Bash` tool calls. Reads the proposed command, runs a `hybrid_search` for related concepts, and injects matches as `additionalContext`. PowerShell sibling at `templates/hooks/pre-bash-context-inject.ps1`. Propagates `session_id` to child processes so downstream invocations of `rl_kg_search.py` are attributable to the same session.
+### `pre-bash-context-inject.sh` — PreToolUse Bash (V52-M; router wrapper since v0.2.101)
+Classified, target-keyed context injection before `Bash` tool calls. PowerShell sibling at `templates/hooks/pre-bash-context-inject.ps1`. Propagates `session_id` to child processes so the router's `rl_kg_search.py` invocations are attributable to the same session.
 
-**v0.2.95 — query shape.** When the same write-target parser used by `post-bash-file-sync` recovers a target from the command, the query is built the way `pre-edit-context-inject.sh` builds it: module name from the basename plus a content snippet (the heredoc body, when the target is under `knowledge/`/`docs/` and carries no credential shape), and the written file is passed as `--anchor` / `--exclude-file` on the code-graph leg. With no recoverable target — the overwhelmingly common case — the query is byte-for-byte the pre-v0.2.95 noise-stripped command. The 500-char KG threshold and its `VCT_BASH_KG_THRESHOLD_CHARS` override are unchanged, and the code-graph branch still runs *before* that threshold.
+**v0.2.101 — classification replaces the threshold.** The hook is a thin wrapper around `hook_context_router.py bash` (see the architecture section above). The router classifies the command — READ (`cat`/`head`/`sed -n`/`git show|diff|log`), EDIT (`sed -i`, redirects, heredocs, write verbs), SEARCH (`grep`/`rg`/`git grep` with an identifier pattern) or MECHANICAL (everything else) — and builds queries ONLY from the command's target paths/symbols: a knowledge/docs heredoc write contributes its body snippet, a `git show <rev>:<path>` read keeps its revision pin (the code-graph leg stays silent when the graph's stamp does not match the rev), a SEARCH contributes its clean identifier to an exact `structure callers` lookup. MECHANICAL commands spawn no producer and inject nothing. The 500-char threshold and its `VCT_BASH_KG_THRESHOLD_CHARS` override are RETIRED (classification replaced them); the v0.2.95 noise-stripped-command query is retired with them (command text is never query text any more).
+
+**RL pairing (WP-D 2).** For every READ/EDIT/SEARCH command the wrapper still mints the `bash_task_<session>_<cmdhash>.json` state file (same md5[:16] pairing contract `post-bash-context-record` re-derives) and emits the `pre_bash` outcome event — now upstream of the old length gate (more events, on shorter commands) and carrying `intent` + extracted `targets`/`symbols` in both payloads. A multi-match command (`cat x | grep y` fires two `if`-rule handlers) emits exactly ONE event: the wrapper passes `--claim`, and the router takes an atomic `O_CREAT|O_EXCL` claim per call (`.claude/state/bash_claim_<session>_<cmdhash>[_<tool_use_id>]`) before any side effect — the duplicate spawn exits silently with no injection, no state file and no event. With a `tool_use_id` in the payload the claim is exactly one call; without it, an identical command within 60 s counts as the same call. The router's seen-store check-and-record is also one locked step per session (POSIX `flock`; Windows has no lock there).
 
 ### `post-bash-file-sync.sh` — PostToolUse Bash (v0.2.95)
 Gives a **CLI write** the same treatment an `Edit`/`Write` gets. `post-file-edit.sh` is registered on matcher `Edit|Write` only, so before v0.2.95 a `cat > knowledge/foo.md <<EOF`, a `sed -i` on a `docs/` page or a `cp` into a source tree reached Weaviate *never*. This hook parses the executed command for write targets (`vco_lib/bash_write_targets.py` — redirections, heredocs, `tee`, `sed -i`, `cp`/`mv`/`install` destinations, `touch`, `dd of=`, long `--output` flags; chains / wrapper verbs / `bash -c` come from the shared `vco_lib/bash_command_walk`) and feeds each one to the SAME routing home `post-file-edit.sh` uses, `_lib/route-touched-path.sh`. PowerShell sibling ships alongside.
@@ -395,12 +331,12 @@ Two costs are deliberately bounded:
 `knowledge/**` → `kg-sync` (KG collection), `docs/**.md` → `kg-sync` (development collection), `.claude/diagrams/*.{mmd,excalidraw}` → `vco_lib.diagram_indexer` (60 s throttle), code extensions → the per-turn code-graph drain queue — each gated by the Phase-8 access matrix and coalesced by the per-file debounce. Extracted from `post-file-edit.{sh,ps1}` when `post-bash-file-sync` became a second consumer; both hooks call it, neither re-implements it.
 
 ### `_lib/code-extensions.{sh,ps1}` — "is this a code file?" (v0.2.95)
-One home for the extension alternation the code graph acts on. `pre-edit-context-inject`, `pre-bash-context-inject` and the routing home read it; four remaining pairs (`pre-tool-use`, `code-graph-incremental`, `stop-codegraph-drain`, `_lib/command-noise-strip`) still spell it out for reasons recorded in `tests/test_v0295_code_extension_one_home.py`, which fails if any of them drifts from the home.
+One home for the extension alternation the code graph acts on. The routing home reads it; two remaining pairs (`code-graph-incremental`, `stop-codegraph-drain`) still spell it out for reasons recorded in `tests/test_v0295_code_extension_one_home.py`, which fails if any of them drifts from the home. (v0.2.101: the injection wrappers and `pre-tool-use` no longer make this decision in shell at all — the router's Python core does, via `vco_lib/inject_intent.language_for_path`, whose table is parity-pinned against the analyzer's dispatch table; the `codegraph-query` and `command-noise-strip` mirrors were retired with those libs.)
 
-### `post-bash-context-record.sh` — PostToolUse Bash (V52-M)
-Outcome recorder paired with `pre-bash-context-inject.sh`. Writes a `bash` event into the per-session learning log (exit code, elapsed time, stderr-tail). Used by the RL retrieval reranker training pipeline. PowerShell sibling ships alongside.
+### `post-bash-context-record.sh` — PostToolUse Bash (V52-M; routed by `post-tool-use-async`)
+Outcome recorder paired with `pre-bash-context-inject.sh`. Writes a `bash` event into the per-session learning log (exit code, elapsed time, stderr-tail). Used by the RL retrieval reranker training pipeline. The pairing contract is unchanged in v0.2.101 (same `bash_task_<session>_<cmdhash>.json` name/shape, joined on `task_id`); the state file gained additive `intent`/`targets`/`symbols` keys this recorder ignores. PowerShell sibling ships alongside.
 
-### `post-edit-outcome.sh` — PostToolUse Edit|Write (V52-M)
+### `post-edit-outcome.sh` — PostToolUse Edit|Write (V52-M; routed by `post-tool-use-async`)
 Outcome event recorder for file edits. Companion to the V52-M bash pair; mirrors the contract for edit-shaped tools. PowerShell sibling at `templates/hooks/post-edit-outcome.ps1`.
 
 ### V52-M cross-OS bug fixes (v0.2.53)
@@ -436,15 +372,14 @@ A hook's `.claude/settings.json` entry is merged by `_merge_hooks_for_bundle`, w
 
 `vco_lib/hook_retirements.py` closes it by declaring retired registrations as data (event, matcher, reason, retiring release, replacement). The bundle engine consults that table on every run, removes a matching inner hook, prunes an emptied group and writes one `record_auto_resolution` row per removal into `.claude/logs/auto-resolutions.jsonl`. Matching is deliberately narrow — a `.claude/hooks/` retiree by invoked-script identity, an inline one by whole-command equality — so a user command that merely *mentions* a retired path keeps running untouched.
 
+**v0.2.101 extended the table with a registration-only retirement**: the eight async PostToolUse registrations (six scripts, both OS extensions → twelve rows) merged into the single `post-tool-use-async` dispatcher registration. Unlike the v0.2.95/v0.2.73 rows the SCRIPTS STILL SHIP — the dispatcher routes to them — so only the registrations are scrubbed from an existing install's `settings.json` at the next bundle update, each removal recording the dispatcher as the replacement. The rows are event-scoped to PostToolUse, which keeps `kg-update-nudge`'s SYNC UserPromptSubmit + SessionStart(compact) registrations alive, AND `async_only`: they match only a registration that positively carries `"async": true`, so a user's own synchronous PostToolUse registration of one of the six scripts is theirs and survives every pass (scrub, parked re-enable, launcher prune classifier — no positive evidence, no removal). A launcher-parked copy of a retired async entry refuses re-enable through the one `insert_hook` gate, naming the dispatcher and the per-sub-hook switch (`hook_retired`); its parked bytes are carried into `VCO_ASYNC_DISABLED_HOOKS` at the next bundle update, and the eager prune may release them only on positive evidence that the carry landed — the classifier's `carry_pending` answer requires the dispatcher registration AND the owed computation (`carry_still_owed`, the deferral probe's own rule) answering "nothing owed"; a still-owed or unreadable state keeps the bytes (see the per-sub-hook on/off paragraph above).
+
 ---
 
 ## Composition Patterns
 
-### Agent → Skill injection
-The `skills:` list in agent frontmatter injects skill `SKILL.md` files into the agent's context window before it runs. This provides the agent with specialist knowledge and decision frameworks without changing its tool permissions. Example: `planner` injects `task-breakdown` (Sonnet) and `architect` (Opus) — Opus-level reasoning is available as a reference even though the planner itself runs on Sonnet.
-
-### Blackboard coordination
-The `project-coordinator` agent implements a blackboard pattern: agents volunteer for tasks from a shared `CONTEXT_STATE.md` rather than receiving delegated assignments. This pattern reduces inter-agent communication overhead and supports parallelism without a central scheduler: the shared file is the only coordination point, so no agent needs to know which others exist or wait on them.
+### Specialisation docs, not skill injection
+v0.2.101 retired agent `skills:` frontmatter in favour of on-demand specialisation docs: an agent's body names the exact `.claude/specializations/…` path to read before a specialist task, and reads it only when the agent runs — the depth is available as a reference without loading every skill into every context. Example: `expert-coder` points at `fields/backend.md` and `fields/api-design.md`; `code-reviewer` points at the `review-kinds/` and `review-topics/` docs matching the review it is running.
 
 ### Hook → Agent delegation
 Several hooks spawn background Claude Code agents for heavyweight tasks: `kg-summary-generator.sh` → Haiku agent to update KG summaries; `post-git-commit-kg-sync.sh` → Haiku agent to sync KG after commits. All delegating hooks guard with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside subprocesses.

@@ -198,18 +198,20 @@ Secrets never live in env files or JSON configs. They live in the OS keychain (m
 
 | Slot | Written by | Consumed by |
 |---|---|---|
-| `github_pat` | OnboardingWizard `register_github_pat` step OR Preferences → Secrets → Shared (this user) | `claude_mcp_servers/search_mcp/wrapper.sh` (exported as `GITHUB_TOKEN`), bundled hooks that need to talk to GitHub |
+| `github_pat` | OnboardingWizard `register_github_pat` step OR Preferences → Secrets → Shared (this user) | bundled hooks that need to talk to GitHub, and the `git-credential-vct` helper |
 | `openai_api_key` | OnboardingWizard OpenAI step OR Preferences → Secrets | `vco_lib/embedding_service.py` when `ACTIVE_EMBEDDING=openai` or as multi-slot fallback. Validated via `GET /v1/models/text-embedding-3-small` — no token consumption, no billing entry. |
 
 **Per-module / per-project secrets**: paid modules declare their own `bundled_secrets[]` in their manifest; the launcher's SecretsPanel surfaces a tab per scope. Per-project license keys, API tokens, and module-specific secrets are scoped by `project_id` and never leak across projects.
 
 **Resolver flow** (subprocess perspective):
 
-1. Wrapper script (`search_mcp/wrapper.sh` or equivalent) runs.
-2. Wrapper checks `$GITHUB_TOKEN` — if already exported in its environment (by you, or by `vct exec --secret github_pat=GITHUB_TOKEN`), use it directly. The launcher never writes secret values into project files (v0.2.73), so this is not populated for you.
+1. A consuming process (the `git-credential-vct` helper, or a bundled hook that talks to GitHub) runs.
+2. It checks `$GITHUB_TOKEN` — if already exported in its environment (by you, or by `vct exec --secret github_pat=GITHUB_TOKEN`), use it directly. The launcher never writes secret values into project files (v0.2.73), so this is not populated for you.
 3. Otherwise call `vct_secrets_resolve.sh <project_path> github_pat` → hub HTTP API at `GET /api/v1/projects/{id}/env?key=github_pat`.
 4. Hub resolves via SENTINEL_SHARED + `module_id=user`, applies the cross-launcher active-flag gate, returns the secret.
-5. Wrapper exports the value and `exec`s the real MCP server binary.
+5. The process uses the value and discards it.
+
+(Until v0.2.101 the `search` MCP's `wrapper.sh` was also a consumer; it was deleted with the MCP.)
 
 Don't put PATs or API keys in `~/.claude.json` `env:` blocks — Claude Code's env loader does not expand `${VAR}` (anthropics/claude-code#2065, #4276), so embedded secrets would land in argv and become visible to `ps`.
 
@@ -434,7 +436,7 @@ Your three ways out, in the order the message lists them: **start the pinned run
 
 Why two knobs and not one: compose classifies a short-syntax source as a **bind** when it starts with `/`, `./` or `~`, and as a **named volume** otherwise — and a named volume that is not declared under top-level `volumes:` is a hard error (`service refers to undefined volume`, docker compose v2; podman-compose likewise fails to parse). So "an existing volume name" can only enter through the declared volume's `name:` field. Both runtimes honour `${VAR:-default}` in both positions (verified on docker compose v2.40.3 and podman-compose 1.5.0 via side-effect-free `config` renders, 2026-09-23).
 
-**Who writes them: VCO, not you.** Since v0.2.97 `infrastructure/.env` is written from the `service_endpoints` rows by `vco_lib/compose_env.py::write_service_keys` — the port keys (`WEAVIATE_PORT`, `WEAVIATE_GRPC_PORT`, `OLLAMA_PORT`, `CODE_EMBED_PORT`) and the data-source knobs alike, for `vco_managed` rows only, inside one marker-delimited block that every row change rewrites. Never hand-edit the file: a line outside the block that assigns a key the rows state is superseded on the next write, because the row is the source of truth and compose must never see two assignments. The code_embed row stores the observed `/cache` mount (bind path or volume name) and projects it as `VCT_CODE_EMBED_CACHE_SOURCE` / `VCT_CODE_EMBED_VOLUME_NAME`; every recreate of the container verifies the mount before and after, and a mismatch refuses or rolls back — an existing model cache is never bypassed. To change a service's data source, change its row (`python -m vco_lib.service_endpoints adopt|move|hand-to-vco`, or the launcher's Services page): the mount identity travels with the row. When Ollama is not `vco_managed`, the same writer states `CODE_EMBED_OLLAMA_URL` so the code-embed container reaches it through the runtime's loopback alias (`host.containers.internal` on podman, `host.docker.internal:host-gateway` on docker) instead of the in-network name. On SELinux-enforcing hosts a swapped-in bind source needs the `:Z` flag — see [SELinux: bind-mount layouts need a `:Z` flag](TROUBLESHOOTING.md) in the troubleshooting guide.
+**Who writes them: VCO, not you.** Since v0.2.97 `infrastructure/.env` is written from the `service_endpoints` rows by `vco_lib/compose_env.py::write_service_keys` — the port keys (`WEAVIATE_PORT`, `WEAVIATE_GRPC_PORT`, `OLLAMA_PORT`, `CODE_EMBED_PORT`) for `vco_managed` rows, and the data-source knobs (`VCT_OLLAMA_DATA_SOURCE`, `VCT_CODE_EMBED_CACHE_SOURCE`, …) for every row that records an observed mount — adopted containers included, so a recreate outside `install.py` still binds the recorded data (v0.2.101) — inside one marker-delimited block that every row change rewrites. Never hand-edit the file: a line outside the block that assigns a key the rows state is superseded on the next write, because the row is the source of truth and compose must never see two assignments. The code_embed row stores the observed `/cache` mount (bind path or volume name) and projects it as `VCT_CODE_EMBED_CACHE_SOURCE` / `VCT_CODE_EMBED_VOLUME_NAME`; every recreate of the container verifies the mount before and after, and a mismatch refuses or rolls back — an existing model cache is never bypassed. To change a service's data source, change its row (`python -m vco_lib.service_endpoints adopt|move|hand-to-vco`, or the launcher's Services page): the mount identity travels with the row. When Ollama is not `vco_managed`, the same writer states `CODE_EMBED_OLLAMA_URL` so the code-embed container reaches it through the runtime's loopback alias (`host.containers.internal` on podman, `host.docker.internal:host-gateway` on docker) instead of the in-network name. On SELinux-enforcing hosts a swapped-in bind source needs the `:Z` flag — see [SELinux: bind-mount layouts need a `:Z` flag](TROUBLESHOOTING.md) in the troubleshooting guide.
 
 ## MCP Servers
 
@@ -444,18 +446,14 @@ MCP servers are registered in the user's `~/.claude.json`. Each launches via the
 - Command: `<install>/.venv/bin/python claude_mcp_servers/weaviate_mcp/server.py` (legacy installs: `claude_mcp_servers/.venv/bin/python`)
 - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_WRITE_DISABLED` (write gate; legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases), plus the EmbeddingService vars (`ACTIVE_EMBEDDING`, `CODE_EMBED_SERVICE_URL`, etc.). The OpenAI key is NOT among them — it is a secret-shaped key and never reaches this file; the embedding stack resolves it in-process from VCO's own shared slot (see the env table above).
 
-**search** — academic paper search via OpenAlex and arXiv.
-- Command (Unix): `claude_mcp_servers/search_mcp/wrapper.sh` — exports `GITHUB_TOKEN` from the keychain (env-first then resolver), then `exec`s the real server.
-- Command (Windows): `<install>/.venv/Scripts/python.exe claude_mcp_servers/search_mcp/server.py` (no wrapper; PowerShell resolver client handles the secret; legacy installs use `claude_mcp_servers/.venv/Scripts/python.exe`).
-- Env: `OPENALEX_EMAIL` (optional, gives polite-pool priority on OpenAlex API); `GITHUB_TOKEN` (resolved at wrapper startup from the `github_pat` shared keychain slot).
-- Tools: `search_papers` only. (Claude's built-in WebFetch covers ad-hoc web retrieval, so no general web-search tool is exposed.)
-
-**mermaid** and **excalidraw** — diagram describe/extract servers. Registered in `~/.claude.json` at install but **per-project default-disabled**: `claude mcp list` shows them Connected, yet their tools aren't callable until you opt in via the launcher's Diagrams tab.
+> **v0.2.101**: the `search` MCP (paper search) was deleted outright, and the `mermaid` / `excalidraw` diagram wrapper MCPs are no longer registered by default. An install that already has a diagram entry keeps it; a still-live `search` entry is **removed automatically by the ordinary install/update**, with one notice line (no consent prompt — the module is gone). Claude's built-in WebSearch / WebFetch cover web and academic retrieval.
 
 **playwright** — browser automation, enabled by default and invoked separately via `npx -y @playwright/mcp@latest`. `install.py` pre-caches it (opt out with `VCT_SKIP_PLAYWRIGHT=1`).
 - The entry stores the bare name `npx`, which Claude Code resolves from the spawn PATH at MCP-launch time. On a machine without Node.js there is nothing to resolve, so the MCP never starts — and pre-v0.2.91 nothing said so (the installer printed "the MCP will lazy-install when first invoked", which is impossible without npx). Since v0.2.91 the doctor phase probes it via `vco_lib/npx_resolver.py`, defers `npx_missing_mcp_unspawnable`, and the launcher's registration badge turns yellow with the same remediation.
 
-**Not MCPs**: Ollama runs as infrastructure only (Weaviate text embeddings + code-embedding service CPU fallback) — there is no Ollama MCP server; Claude's native reasoning, `Read` tool, and built-in vision cover analysis, document reading, and image tasks. The code-embedding FastAPI service on port 11440 is likewise backend infrastructure. `search_papers` calls OpenAlex and arXiv directly — no local search proxy runs in the default container stack.
+**Per-project enable/disable**: a per-project MCP toggle writes `~/.claude.json` `projects[<absolute project path>].disabledMcpServers` — the per-project opt-out list Claude Code honours for user-scope servers. (The settings-file `disabledMcpjsonServers` / `enabledMcpjsonServers` keys govern only servers defined in the project's own `.mcp.json`; they are not the channel for a user-scope entry.)
+
+**Not MCPs**: Ollama runs as infrastructure only (Weaviate text embeddings + code-embedding service CPU fallback) — there is no Ollama MCP server; Claude's native reasoning, `Read` tool, and built-in vision cover analysis, document reading, and image tasks. The code-embedding FastAPI service on port 11440 is likewise backend infrastructure. Web / academic retrieval uses Claude's built-in WebSearch / WebFetch — no local search proxy runs in the default container stack.
 
 **Stale MCP cleanup**: `install.py --rewrite-stale-mcps` detects deprecated MCP entries left over from older versions in `~/.claude.json` and offers consent-prompted auto-rewrite. Run after upgrading from an older install.
 
@@ -513,6 +511,17 @@ launcher spawns gets an environment without them — the list both sides strip i
 | `VCT_INSTALL_RELAUNCH_TOKEN` | A fresh random token per relaunch, also passed to the relaunched run as its last argument (`--vct-relaunch-token=<token>`, removed before the arguments are parsed). The environment reaches every descendant; the argument reaches only the run it was made for — so a match proves the other four were set for THIS run, not inherited from an older one through some other process. |
 | `VCT_INSTALL_PARENT_WAITS` | Windows only: the **pid** of the `install.py` waiting for this run. Windows cannot replace a process (`os.exec*` starts a new one and ends the caller with exit code 0 at once), so there the relaunch runs as a child and the parent exits with the child's exit code. The child uses the pid twice: a relaunched run that must rebuild the venv it runs from hands the run back to that parent (exit code `22083`, `0x5643`), which runs outside the venv and re-runs it once; and the child watches the parent, so when the parent is killed (the launcher cancelling a run) the run stops at once with exit code `22084` (`0x5644`) and one stderr line — what killing `install.py` does on Linux/macOS. Only the run stops: services it already started (hub, model gateway, updater, analyzer) keep running there too. If the watch cannot be set up, a stderr line says so and the run continues. |
 
+The three `VCT_KG_SEED_CTX_*` names below are **internal — do not set them** (v0.2.101). The install no longer waits
+for the knowledge-graph seed: it hands the whole-tree seed to the detached retry driver
+(`vco_lib/deferral_retry.py`) and these variables carry, in that driver's environment only, the embedding context the
+install resolved, so the driver records that context once the seed has actually succeeded.
+
+| Var | Meaning |
+|---|---|
+| `VCT_KG_SEED_CTX_ACTIVE_EMBEDDING` | The active embedding profile the install resolved for this seed. |
+| `VCT_KG_SEED_CTX_KG_COLLECTION` | The project knowledge-graph collection the seed writes. |
+| `VCT_KG_SEED_CTX_SHARED_KG_COLLECTION` | The shared knowledge-graph collection, for the shared seed. |
+
 ## Runtime env knobs
 
 Set these in the per-project `.claude/env` (shell-sourced) or `.claude/settings.json` `env` (propagates to MCP subprocesses), or export them for one shell. Unlike the table above they are read at use-time, not at install-time.
@@ -532,8 +541,14 @@ Set these in the per-project `.claude/env` (shell-sourced) or `.claude/settings.
 | `VCT_VSCODE_SETTINGS_FILES` | unset | `os.pathsep`-separated list of absolute `settings.json` paths that replaces the launcher's VS Code-variant discovery when flipping the editor panel to the model gateway (`vco_lib/vscode_settings.py`). Set it for portable installs, `--user-data-dir` setups, or any VS Code-family editor the variant table does not know by name. The launcher's Services page names this variable when discovery finds no target. |
 | `VCT_CODEGRAPH_FORCE_REWALK` | unset | Env form of `analyze_code_graph.py --force-rewalk`: bypasses ONLY the per-FILE staleness gate, so the next walk re-parses every file. The per-ENTITY content-hash gate still runs — a converged project re-walks but re-embeds nothing. VCO's own background extractor-generation resync sets it (env survives the two process hops to the analyzer, where a CLI flag would not); set it by hand to force a full re-walk, e.g. after an extractor bug shipped stale rows. |
 | `VCT_LAUNCHER_DB_PATH` | `<VCT_STATE_DIR or ~/.vct>/launcher.db` | Overrides the launcher-database location for every VCO-side reader (`vco_lib.paths.launcher_db_path`: install.py's config projection, `project_init`, the read-only `launcher_db_reader`). One canonical resolver since v0.2.54 — before that only the reader honoured it, so the reader and the writers could disagree about which DB they were looking at. Set it when the DB genuinely lives outside the state root; symlink `~/.vct` instead for whole-state relocation. |
-| `VCT_BASH_KG_THRESHOLD_CHARS` | `500` | Minimum length, in characters, of a proposed Bash command before `pre-bash-context-inject` runs a KG search on it and injects matches as additional context. Raise it to quiet the hook on medium-sized routine commands; lower it to enrich more often. |
-| `VCO_QUERY_CACHE_TTL` | `900` (15 min) | Seconds a warm query-cache entry under `.claude/state/` is replayed by `pre-edit-context-inject` instead of re-querying the KG / code graph. Empty results are cached too (sentinel file), so a symbol that returns nothing isn't re-queried within the TTL. Entries are GC'd at twice this age; any cache error falls back to a live query (best-effort, never breaks injection). |
+| `VCT_BASH_KG_THRESHOLD_CHARS` | — | **RETIRED in v0.2.101** (injection redesign §C1): `pre-bash-context-inject` no longer reads it. The 500-character length gate was replaced by INTENT CLASSIFICATION — only READ/EDIT/SEARCH-classified commands query and inject (queries are built from the command's target paths/symbols, never its text), and MECHANICAL commands (build/test/`git status`/`ls`/…) spawn nothing at any length. To quiet the injection surfaces entirely, use `VCO_INJECT_PROFILE=off` (below) or the launcher's per-project Hooks tab. |
+| `VCO_QUERY_CACHE_TTL` | `900` (15 min) | Seconds a warm query-cache entry under `.claude/state/query_cache/` is replayed instead of re-querying the KG / code graph. Two readers share the knob and the directory: the injection router's Python cache (`kgi`/`cgi` namespaces — `hook_context_router.py`) and the pre-edit wrapper's per-file replay cache. **Empty results are NEVER cached** (v0.2.101): an empty blob is indistinguishable from a leg killed by its inner timeout, and caching it used to suppress every retry of that query for the whole TTL; a leftover empty entry from an older version reads as a miss and is removed on first touch. Entries are GC'd at twice this age; any cache error falls back to a live query (best-effort, never breaks injection). (The pre-v0.2.101 shell cache library `_lib/query-cache.{sh,ps1}` was retired with its last callers.) |
+| `VCO_INJECT_PROFILE` | unset (injection surfaces on) | Kill switch for the v0.2.101 injection redesign: set to `off` (case-insensitive) and the context router (`hook_context_router.py`) plus the injection wrappers exit silently — no query, no injection, no RL retrieval event. Checked beside `VCT_DISABLE_HOOKS` (which remains the all-hooks switch). |
+| `VCO_INJECT_BUDGET_S` | `6` | Whole-run inner bound, in seconds, of the context router. Ordered under the 10 s injection-surface hook timeouts with headroom for interpreter/producer startup + emit on SLOW hardware (owner ruling 2026-10-06: this interactive class is deliberately bounded and silence-safe — a cold run that still overruns the harness timeout injects nothing and fails open; this knob is NOT a pattern for long-operation timeouts, which stay generous). A non-positive or unparseable value falls back to 6. |
+| `VCO_INJECT_LEG_TIMEOUT_S` | `4` | Per-leg join bound, in seconds, inside the router (KG and code-graph legs run concurrently; a leg still running at the bound is abandoned, its result treated as empty, and its late stdout writes fenced off by the `_PostLegStdout` guard). Falls back to 4 on a non-positive/unparseable value. |
+| `VCO_ROUTER_KG_SCRIPT` | sibling `rl_kg_search.py` | Internal, do not set in production: explicit path to the KG producer module the router loads (a test seam for stub producers). |
+| `VCO_CG_SCRIPT` | `<project>/.claude/scripts/query_code_graph.py`, else the checkout's `templates/scripts/query_code_graph.py` | Internal, do not set in production: explicit path to the code-graph producer module the router loads (a test seam for stub producers). |
+| `VCT_PB_STATE_FILE`, `VCT_PB_TASK_ID`, `VCT_PB_START_TS`, `VCT_PB_SESSION`, `VCT_PB_HASH`, `VCT_PB_LEN`, `VCT_PB_INTENT`, `VCT_PB_TARGETS`, `VCT_PB_SYMBOLS`, `VCT_PB_INTENT_FILE`, `VCT_PREBASH_INTENT`, `VCT_PREBASH_TARGETS`, `VCT_PREBASH_SYMBOLS` | unset | Internal, do not set: per-invocation hand-off variables `pre-bash-context-inject.{sh,ps1}` passes to its OWN embedded-Python children (the `bash_task_*.json` state writer and the backgrounded `pre_bash` outcome-event emit) so command text with quotes/newlines can never break the child's source. Same class as the pre-existing `VCT_PREBASH_QUERY`/`VCT_PREBASH_TASK_ID` family; scoped to one hook run, never read by anything else. The v0.2.101 additions (`*_INTENT`/`*_TARGETS`/`*_SYMBOLS`) carry the WP-D 2 classification into both payloads. |
 | `VCO_KG_SYNC_DEBOUNCE_SECONDS` | `5` | Quiet window, in seconds, that the kg-sync debounce waits after a `knowledge/**` edit before syncing. `0` disables debouncing — every edit syncs immediately (the pre-2026-06-18 behaviour). A non-numeric value falls back to 5. |
 | `VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS` | `120` | Per-project rate limit, in seconds, between end-of-turn code-graph drains (`stop-codegraph-drain`). A second Stop inside the window skips the drain. A non-numeric value falls back to 120. |
 | `VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS` | `600` | How often, in seconds, the Stop hook (`stop-codegraph-drain`) checks the project's enabled extra code-graph paths for a moved repo HEAD. A check spawns `python -m vco_lib.codegraph_extras_refresh` detached; it runs whether or not the turn edited any file. A non-numeric value falls back to 600. |
@@ -816,8 +831,10 @@ unreadable, `3` = `--fix` failed or contract idempotency broken.
 
 End-to-end verifier for the Diagrams Integration feature. Runs 13
 focused checks covering: project row in launcher DB, `project_modules`
-seed row, migration 022 applied, MCP wrappers registered in
-`~/.claude.json`, hub allowlist HTTP route alive, env projection
+seed row, migration 022 applied, MCP wrapper entries in `~/.claude.json`
+(absent = OK: the wrapper MCPs are optional since v0.2.101 and the
+Diagrams tab does not need them; a PRESENT entry still has its module
+path verified), hub allowlist HTTP route alive, env projection
 across the three surfaces, per-project Weaviate `<Project>_Diagrams`
 class present, `PreToolUse` + `PostToolUse` hooks registered, hook
 scripts on disk + executable, `vco_lib.diagram_indexer` /
@@ -841,13 +858,13 @@ verify-diagrams: demo (project_id=p-1)
   [OK]   project_row — project 'demo' (id=p-1)
   [OK]   project_modules_row — project_modules('diagrams', enabled=1) row present
   [OK]   migration_022 — migration 22 applied + all 6 tables present
-  [OK]   mcp_wrappers — mermaid + excalidraw wrappers registered with correct module path
+  [OK]   mcp_wrappers — wrapper MCPs not registered — optional since v0.2.101; the Diagrams tab does not need them
   [SKIP] hub_allowlist — --quick: hub HTTP probe skipped
   [FAIL] env_projection — 1 drift entries: DIAGRAMS_COLLECTION on .vscode/settings.json: expected 'Demo_Diagrams', got '<missing>'
          > fix: vco verify-env-projection p-1 --fix
   [SKIP] weaviate_diagrams_class — --quick: Weaviate connectivity check skipped
   [OK]   pretooluse_hooks — both PreToolUse entries (Write|Edit + MCP matchers) present
-  [OK]   post_delete_hook — PostToolUse Bash entry → post-file-delete registered
+  [OK]   post_delete_hook — PostToolUse → post-tool-use-async dispatcher registered (routes Bash → post-file-delete)
   [OK]   hook_scripts_on_disk — all 2 hook scripts present + executable
   [OK]   indexer_importable — key functions resolvable
   [OK]   path_validator — round-trip OK (good→None, bad→string)

@@ -467,7 +467,16 @@ pub async fn create_project_v2(
     // `apply_project_env_via_python`. `env_settings` is still populated
     // because the project-root `.env` below renders the launcher-resolved
     // service ports it carries.
-    if let Err(e) = apply_project_env_via_python(&row.id, folder, &db) {
+    //
+    // F3 (v0.2.101): on the blocking pool, not a tokio worker.
+    if let Err(e) = apply_project_env_via_python_on_blocking_pool(
+        app.clone(),
+        "create_project_v2 env projection",
+        &row.id,
+        folder,
+    )
+    .await
+    {
         // B10 (2026-05-01): surface env-write failures to the UI instead of
         // silent eprintln. Project creation still succeeds; the UI should show
         // a warning toast so the user knows manual env setup is required.
@@ -1750,7 +1759,11 @@ impl BundleMode {
 /// Cross-language pin: `vco_lib/self_install.py::root_bundle_argv` emits the
 /// SAME flag set for the root client (WP-1). The parity test
 /// `tests/test_v0285_install_parity.py` asserts the two stay in lockstep.
-fn build_bundle_argv(folder_str: &str, templates_str: &str, mode: BundleMode) -> Vec<String> {
+// v0.2.101 (L3 review SF-3): `pub(crate)` so `commands::packs_cmd` CALLS
+// this — the ONE owner of the install-bundle base argv — and appends the
+// pack flag instead of mirroring the base (a mirror would silently diverge
+// from every other bundle spawn on the next base change).
+pub(crate) fn build_bundle_argv(folder_str: &str, templates_str: &str, mode: BundleMode) -> Vec<String> {
     let mut argv: Vec<String> = vec![
         "-m".into(),
         "vco_lib.project_init".into(),
@@ -3081,7 +3094,15 @@ pub async fn update_project_v2(
     //    failure. The bundle update still succeeds because the
     //    manifest install + audit log + change_log entry have
     //    already landed — env writes are a best-effort step on top.
-    if let Err(e) = apply_project_env_via_python(&row.id, &folder, &db) {
+    //    F3 (v0.2.101): on the blocking pool, not a tokio worker.
+    if let Err(e) = apply_project_env_via_python_on_blocking_pool(
+        app.clone(),
+        "update_project_v2 env projection",
+        &row.id,
+        &folder,
+    )
+    .await
+    {
         let msg = format!(
             "post-bundle env refresh (apply_project_env_via_python) failed: {}. \
              Bundle update succeeded but .claude/env / .claude/settings.json \
@@ -3254,6 +3275,11 @@ pub struct UpdateAllProjectEntry {
     /// Per-project summary counts (None on hard failure / skip — there
     /// was no install run to count).
     pub summary: Option<UpdateSummary>,
+    /// v0.2.101 (12b): why a row was skipped WITHOUT an error — today only
+    /// the already-current orchestrator root. `None` on every other row.
+    /// The typed `summary` stays `None` for skips (no install ran to count).
+    #[serde(default)]
+    pub skip_reason: Option<String>,
 }
 
 /// Aggregate report returned by `update_all_projects`.
@@ -3359,10 +3385,65 @@ fn build_progress_finished(
     }
 }
 
+/// v0.2.101 (12b): the reason carried on the Update-all row for the
+/// orchestrator root when its bundle is already current.
+const ROOT_BUNDLE_CURRENT_SKIP_SUMMARY: &str =
+    "bundle already current — manifest matches the shipped files; nothing to update";
+
+/// Pure Update-all skip decision (v0.2.101, 12b): skip the row ONLY when it
+/// is the orchestrator root AND the staleness census positively reports
+/// that root's bundle `current`. Every other combination — not the root,
+/// `stale`, `unknown`, an undetermined/failed/timed-out probe, a row for a
+/// different folder — returns `false`, i.e. update exactly as before this
+/// gate existed. The census (ONE engine, state-keyed — R26/R27) is the only
+/// currentness oracle; there is deliberately NO version-string compare here.
+pub(crate) fn update_all_skips_root_row(
+    folder: &std::path::Path,
+    orchestrator_root: Option<&std::path::Path>,
+    census: Option<&crate::commands::bundle_staleness::BundleStalenessCensus>,
+) -> bool {
+    let Some(root) = orchestrator_root else {
+        return false;
+    };
+    if !is_orchestrator_root_folder(folder, root) {
+        return false;
+    }
+    let Some(census) = census else {
+        // The probe never ran, failed, or timed out: NOT proven current.
+        return false;
+    };
+    crate::commands::bundle_staleness::census_reports_folder_current(
+        census,
+        &folder.to_string_lossy(),
+    )
+}
+
+/// The Update-all row emitted for an already-current orchestrator root:
+/// `status: "skipped"` with the reason on `skip_reason`. Pure so the
+/// emitted shape is unit-testable without a Tauri runtime.
+fn root_current_skip_entry(project_id: &str, project_name: &str) -> UpdateAllProjectEntry {
+    UpdateAllProjectEntry {
+        project_id: project_id.to_string(),
+        project_name: project_name.to_string(),
+        status: "skipped".to_string(),
+        error: None,
+        warnings: Vec::new(),
+        summary: None,
+        skip_reason: Some(ROOT_BUNDLE_CURRENT_SKIP_SUMMARY.to_string()),
+    }
+}
+
 /// Iterate every registered project sequentially and run the same
 /// per-project update flow as `update_project_v2`. See the doc on the
 /// ─── 0.2.x backlog #4 ─── header for the design rationale (sequential,
 /// no rollback, per-project status reporting).
+///
+/// v0.2.101 (12b): the orchestrator ROOT row is skipped — counted in
+/// `total_skipped` with a `skip_reason` — when the staleness census
+/// reports its bundle already current; `stale`, `unknown` or any probe
+/// failure updates the root like any other project (see
+/// `update_all_skips_root_row`). The root's per-project Settings page
+/// "Update bundle" button always runs.
 ///
 /// Soft-fail discipline mirrors `update_project_v2`:
 ///   * Hard failures (project gone, folder missing) → `status="failed"`,
@@ -3405,6 +3486,11 @@ pub async fn update_all_projects(
     // >u32::MAX case rather than wrapping.
     let total: u32 = projects.len().min(u32::MAX as usize) as u32;
 
+    // v0.2.101 (12b): resolve the orchestrator root once for the root-skip
+    // gate. `None` (standalone binary, no clone discoverable) disables the
+    // gate — every row updates, as before.
+    let orchestrator_root = crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
+
     for (idx, row) in projects.iter().enumerate() {
         let index: u32 = (idx as u64).min(u32::MAX as u64) as u32 + 1;
 
@@ -3422,9 +3508,41 @@ pub async fn update_all_projects(
                 error: None,
                 warnings: Vec::new(),
                 summary: None,
+                skip_reason: None,
             });
             total_skipped += 1;
             continue;
+        }
+
+        // v0.2.101 (12b): the orchestrator root is skipped when the
+        // staleness census (ONE engine, state-keyed) positively reports its
+        // bundle current. The filtered probe runs ONLY when the root row is
+        // reached — one ~sub-second subprocess per run, not per row. Any
+        // non-`current` verdict, probe failure or timeout falls through to
+        // the ordinary update below (conservative: update when currentness
+        // could not be proven).
+        let row_folder = std::path::PathBuf::from(&row.folder_path);
+        if orchestrator_root
+            .as_deref()
+            .is_some_and(|r| is_orchestrator_root_folder(&row_folder, r))
+        {
+            let census =
+                crate::commands::bundle_staleness::run_census(&db, Some(&row_folder)).await;
+            if update_all_skips_root_row(&row_folder, orchestrator_root.as_deref(), Some(&census))
+            {
+                tracing::info!(
+                    "[vct] update all: skipping {} — census verdict current ({})",
+                    row.name,
+                    ROOT_BUNDLE_CURRENT_SKIP_SUMMARY
+                );
+                let _ = app.emit(
+                    UPDATE_ALL_PROGRESS_EVENT,
+                    build_progress_finished(&row.id, &row.name, index, total, "skipped", 0),
+                );
+                entries.push(root_current_skip_entry(&row.id, &row.name));
+                total_skipped += 1;
+                continue;
+            }
         }
 
         // Announce this project is starting BEFORE the (potentially
@@ -3456,6 +3574,7 @@ pub async fn update_all_projects(
                     error: None,
                     warnings: r.warnings,
                     summary: Some(r.summary),
+                    skip_reason: None,
                 });
                 total_succeeded += 1;
             }
@@ -3471,6 +3590,7 @@ pub async fn update_all_projects(
                     error: Some(e),
                     warnings: Vec::new(),
                     summary: None,
+                    skip_reason: None,
                 });
                 total_failed += 1;
                 if opts.stop_on_error {
@@ -3524,8 +3644,11 @@ pub async fn update_all_projects(
 ///     dependency).
 ///   * Spawns with `current_dir = folder` so any relative path in the
 ///     Python contract resolves against the project root.
-///   * 30s timeout — generous for user-driven actions (create / rename
-///     / refresh); the subprocess itself completes in ~150 ms.
+///   * 300s timeout (v0.2.101 owner timeout ruling, was 30s) — one runner
+///     shared by create / rename / refresh AND the all-projects re-render,
+///     which spawns one subprocess PER project: the cap must stay generous
+///     for the slowest machine, not this dev box. A single-project call
+///     completes in ~150 ms.
 ///     That includes a REFUSAL (v0.2.97): a `.claude/settings.json` that
 ///     exists but cannot be read as a JSON object is left byte-identical,
 ///     the child exits 4 with `settings_write_refused` naming the file and
@@ -3561,6 +3684,26 @@ fn build_config_projection_apply_args(
         args.push(root.to_string_lossy().to_string());
     }
     args
+}
+
+/// F3 (v0.2.101): the async-command form of [`apply_project_env_via_python`]
+/// — the ONE home for "re-render this project's env from an async command".
+/// The projection is a Python subprocess (300 s cap), so it runs on the
+/// blocking pool, never inline on a tokio worker. Returns the projection's
+/// own `Result`; a join failure / missing Db state is folded into the same
+/// `Err`, so each caller's existing soft-fail warning branch covers both.
+async fn apply_project_env_via_python_on_blocking_pool(
+    app: AppHandle,
+    context: &'static str,
+    project_id: &str,
+    folder: &Path,
+) -> Result<(), String> {
+    let (project_id, folder) = (project_id.to_string(), folder.to_path_buf());
+    crate::commands::blocking::run_with_db_on_blocking_pool(app, context, move |db| {
+        apply_project_env_via_python(&project_id, &folder, db)
+    })
+    .await
+    .and_then(|r| r)
 }
 
 fn apply_project_env_via_python(
@@ -3626,15 +3769,16 @@ fn apply_project_env_via_python(
     // (v0.2.97 review F13, same fix as the env-block verbs).
     cmd.current_dir(crate::services::vco_lib_bridge::vco_lib_cwd(Some(folder), folder));
 
-    // 30 s wall-clock cap through the ONE bounded runner (v0.2.100
-    // F-W4-05) — the happy path is ~150 ms; a hang past 30 s indicates a
-    // stuck DB open or a runaway Python process and is better surfaced than
-    // letting the user click sit indefinitely. Pipes are drained while the
-    // child runs, so a chatty child cannot deadlock on a full pipe.
+    // Wall-clock cap through the ONE bounded runner (v0.2.100 F-W4-05).
+    // The bound is `VCO_LIB_ENV_PROJECTION_TIMEOUT` (300 s, v0.2.101 owner
+    // ruling 2026-10-06 — generous for slow hardware; the reasoning, and
+    // its contrast with the 120 s short-verb cap, live at the constant).
+    // Pipes are drained while the child runs, so a chatty child cannot
+    // deadlock on a full pipe.
     let out = vct_launcher_core::process::output_bounded(
         &mut cmd,
         None,
-        std::time::Duration::from_secs(30),
+        crate::services::vco_lib_bridge::VCO_LIB_ENV_PROJECTION_TIMEOUT,
     )
     .map_err(|e| {
         format!(
@@ -3825,6 +3969,7 @@ pub(crate) use naming::*;
 pub async fn rename_project_v2(
     id: String,
     new_name: String,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
     // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
@@ -3900,14 +4045,40 @@ pub async fn rename_project_v2(
     // subprocesses resolve the renamed peer correctly. (The reverse
     // direction — grants where THIS project is the grantee — is covered by
     // this project's own env refresh below.) Soft-fail per grantee.
+    //
+    // F3: each re-projection is a Python subprocess (300 s cap), so the
+    // grantee loop runs on the blocking pool, not a tokio worker. A join
+    // failure is soft-fail too (the rename already committed) and is
+    // folded into `warnings`.
     if old_name.as_deref().is_some_and(|old| old != new_name) {
-        if let Ok(grants) = db.codegraph_list_grants_from(&id) {
-            for (grantee_id, _level) in grants {
-                if grantee_id == id {
-                    continue;
+        let renamed_id = id.clone();
+        match crate::commands::blocking::run_with_db_on_blocking_pool(
+            app.clone(),
+            "rename_project_v2 grantee env re-projection",
+            move |db| {
+                let mut grantee_warnings: Vec<String> = Vec::new();
+                if let Ok(grants) = db.codegraph_list_grants_from(&renamed_id) {
+                    for (grantee_id, _level) in grants {
+                        if grantee_id == renamed_id {
+                            continue;
+                        }
+                        let r = reproject_env_soft(db, &grantee_id);
+                        grantee_warnings.extend(r.warnings);
+                    }
                 }
-                let r = reproject_env_soft(&db, &grantee_id);
-                warnings.extend(r.warnings);
+                grantee_warnings
+            },
+        )
+        .await
+        {
+            Ok(w) => warnings.extend(w),
+            Err(e) => {
+                let msg = format!(
+                    "rename grantee env re-projection: {} (rename already committed)",
+                    e
+                );
+                tracing::warn!("[vct] warning: {}", msg);
+                warnings.push(msg);
             }
         }
     }
@@ -3931,7 +4102,18 @@ pub async fn rename_project_v2(
     // Phase 0.B Part 2 (2026-05-25): canonical env writes go through
     // `apply_project_env_via_python` → Python contract (the Rust writer
     // it replaced was retired in v0.2.97).
-    if let Err(e) = apply_project_env_via_python(&id, folder, &db) {
+    //
+    // F3: the projection is a Python subprocess (300 s cap), so it runs on
+    // the blocking pool, not a tokio worker. A join failure surfaces as the
+    // same soft-fail warning as a projection failure.
+    if let Err(e) = apply_project_env_via_python_on_blocking_pool(
+        app,
+        "rename_project_v2 env re-projection",
+        &id,
+        folder,
+    )
+    .await
+    {
         let msg = format!(
             "rename env refresh (apply_project_env_via_python) failed: {}. \
              KG routing for the renamed project may be stale until manual repair.",
@@ -4077,6 +4259,7 @@ fn dotenv_kg_drift_warning(
 pub async fn set_shared_kg_write_disabled(
     project_id: String,
     write_disabled: bool,
+    app: AppHandle,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
     let row = db
@@ -4113,7 +4296,16 @@ pub async fn set_shared_kg_write_disabled(
     // toggle without needing the pre-PR-2 Rust `env_settings` override.
     let mut warnings: Vec<String> = Vec::new();
     let folder = Path::new(&row.folder_path);
-    if let Err(e) = apply_project_env_via_python(&project_id, folder, &db) {
+    // F3 (v0.2.101): on the blocking pool, not a tokio worker; a join
+    // failure lands in the same warning branch.
+    if let Err(e) = apply_project_env_via_python_on_blocking_pool(
+        app,
+        "set_shared_kg_write_disabled env re-projection",
+        &project_id,
+        folder,
+    )
+    .await
+    {
         let msg = format!(
             "shared-KG write-disabled env refresh failed: {}. \
              Toggle persisted to DB but env files may be stale.",
@@ -4177,6 +4369,7 @@ pub async fn get_shared_kg_write_disabled_cmd(
 pub async fn set_shared_kg_read_disabled(
     project_id: String,
     read_disabled: bool,
+    app: AppHandle,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
     let row = db
@@ -4195,7 +4388,16 @@ pub async fn set_shared_kg_read_disabled(
     // pattern as `set_shared_kg_write_disabled`.
     let mut warnings: Vec<String> = Vec::new();
     let folder = Path::new(&row.folder_path);
-    if let Err(e) = apply_project_env_via_python(&project_id, folder, &db) {
+    // F3 (v0.2.101): on the blocking pool, not a tokio worker; a join
+    // failure lands in the same warning branch.
+    if let Err(e) = apply_project_env_via_python_on_blocking_pool(
+        app,
+        "set_shared_kg_read_disabled env re-projection",
+        &project_id,
+        folder,
+    )
+    .await
+    {
         let msg = format!(
             "shared-KG read-disabled env refresh failed: {}. \
              Toggle persisted to DB but env files may be stale.",
@@ -4236,12 +4438,14 @@ pub async fn set_shared_kg_read_disabled(
 /// VCT_KG_ACCESS_LIST=Foo,Bar" feedback).
 ///
 /// The per-project "Re-render this project's env" button on the project's
-/// Settings tab calls this. There is deliberately NO all-projects button
-/// (owner ruling, v0.2.100: re-rendering every project at once is too risky
-/// to hand to users); `refresh_all_projects_env_with_db` stays as the
-/// internal core for the boot hook and the gate paths.
+/// Settings tab calls this. The all-projects variant exists again as of
+/// v0.2.101 (owner ruling 2026-10-05, Q4 — reversing the v0.2.100
+/// retirement): `refresh_all_projects_env` is a Preferences affordance,
+/// confirm-gated in the GUI, wrapping the same `refresh_all_projects_env_with_db`
+/// core the boot hook and the gate paths use.
 ///
-/// The projection runs a Python subprocess (30 s cap), so it goes through
+/// The projection runs a Python subprocess (300 s cap — generously sized for
+/// slow third-party hardware, owner ruling 2026-10-06), so it goes through
 /// the blocking pool, not a tokio worker (F3).
 #[command]
 pub async fn refresh_project_env(
@@ -4358,10 +4562,11 @@ pub fn reproject_env_soft(db: &Db, project_id: &str) -> RefreshProjectEnvResult 
 ///   * The `app_state` write trigger (`app_state_cmd.rs`), which carries the
 ///     RL logging / online-training global switches into every project.
 ///
-/// Deliberately NOT a Tauri command: a manual "re-render every project"
-/// button was retired in v0.2.100 (owner: doing it for all projects is a
-/// risky operation users should not be offered). The per-project repair is
-/// `refresh_project_env`.
+/// Exposed again as a Tauri command in v0.2.101 (owner ruling 2026-10-05,
+/// Q4): the v0.2.100 retirement of the manual "re-render every project"
+/// button was reversed — Preferences now offers a confirm-gated
+/// "Re-render env for all projects" action wrapping this core. The
+/// per-project repair remains `refresh_project_env`.
 ///
 /// Soft-fail per project: one project's hiccup MUST NOT prevent the
 /// others from refreshing. Returns a per-project status map (the
@@ -4418,6 +4623,24 @@ pub struct RefreshAllProjectsEnvResult {
     /// Errors outside the per-project loop (e.g. `list_projects`
     /// itself failed).
     pub global_warnings: Vec<String>,
+}
+
+/// v0.2.101 (owner ruling 2026-10-05, Q4): the GUI's "Re-render env for
+/// all projects" Preferences action. Confirm-gated on the frontend; the
+/// backend trusts the click exactly as much as the boot hook's own call —
+/// same core, same soft-fail-per-project contract, report surfaced back so
+/// the toast can name what failed. Runs N serial Python subprocesses, so it
+/// goes through the blocking pool (F3), like every other caller.
+#[command]
+pub async fn refresh_all_projects_env(
+    app: tauri::AppHandle,
+) -> Result<RefreshAllProjectsEnvResult, String> {
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "refresh_all_projects_env",
+        move |db| refresh_all_projects_env_with_db(db),
+    )
+    .await
 }
 
 #[command]
@@ -5938,14 +6161,25 @@ pub(crate) fn update_should_skip_root_autobuild(
     }
     match orchestrator_root {
         None => false,
-        Some(root) => {
-            let canon_root = root.canonicalize().unwrap_or(root);
-            let canon_folder = folder
-                .canonicalize()
-                .unwrap_or_else(|_| folder.to_path_buf());
-            canon_root == canon_folder
-        }
+        Some(root) => is_orchestrator_root_folder(folder, &root),
     }
+}
+
+/// Canonicalising same-folder test behind `update_should_skip_root_autobuild`
+/// and the v0.2.101 (12b) Update-all root gate: both sides canonicalize
+/// before compare so symlinked clones match. A side that cannot be
+/// canonicalized compares as itself (the callers fail open / conservative).
+pub(crate) fn is_orchestrator_root_folder(
+    folder: &std::path::Path,
+    orchestrator_root: &std::path::Path,
+) -> bool {
+    let canon_root = orchestrator_root
+        .canonicalize()
+        .unwrap_or_else(|_| orchestrator_root.to_path_buf());
+    let canon_folder = folder
+        .canonicalize()
+        .unwrap_or_else(|_| folder.to_path_buf());
+    canon_root == canon_folder
 }
 
 #[cfg(test)]
@@ -6026,6 +6260,139 @@ mod tests {
     fn root_autobuild_skip_fails_open_when_root_unresolvable() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!update_should_skip_root_autobuild(tmp.path(), None, false));
+    }
+
+    // ─── v0.2.101 (12b): Update-all skips an already-current root ────────
+
+    use crate::commands::bundle_staleness::{
+        BundleStalenessCensus, BundleStalenessProject, BundleStalenessSummary,
+    };
+
+    /// A determined single-row census carrying the given verdict.
+    fn synthetic_census(folder: &str, verdict: &str) -> BundleStalenessCensus {
+        BundleStalenessCensus {
+            determined: true,
+            error: None,
+            registry: Some("launcher.db".to_string()),
+            running_version: None,
+            projects: vec![BundleStalenessProject {
+                id: "root-1".to_string(),
+                name: "Root".to_string(),
+                folder: folder.to_string(),
+                verdict: verdict.to_string(),
+                reason: String::new(),
+                changed_files: Vec::new(),
+                user_modified: 0,
+            }],
+            summary: Some(BundleStalenessSummary::default()),
+            remedy_gui: None,
+            remedy_cli: None,
+        }
+    }
+
+    /// The pure decision truth table: skip = is_root && verdict == "current".
+    /// Every other cell of the table — stale, unknown, a failed/timed-out
+    /// probe (`None` or `undetermined`), a non-root folder, an unresolvable
+    /// orchestrator root — must UPDATE (i.e. return `false`).
+    #[test]
+    fn update_all_skip_decision_truth_table() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().to_path_buf();
+        let other_dir = tempfile::tempdir().unwrap();
+        let root_str = root_dir.path().to_string_lossy().to_string();
+
+        let current = synthetic_census(&root_str, "current");
+        let stale = synthetic_census(&root_str, "stale");
+        let unknown = synthetic_census(&root_str, "unknown");
+        let undetermined = BundleStalenessCensus::undetermined("probe timed out");
+        // A `current` row for a DIFFERENT folder must not grant this folder
+        // a skip (a loosely-matching --project filter leaks nothing).
+        let other_folder_current = synthetic_census("/p/elsewhere", "current");
+
+        // The ONE skip cell.
+        assert!(
+            update_all_skips_root_row(root_dir.path(), Some(&root), Some(&current)),
+            "root + current → skip"
+        );
+        // Everything else updates as before the gate existed.
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), Some(&root), Some(&stale)),
+            "root + stale → update"
+        );
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), Some(&root), Some(&unknown)),
+            "root + unknown → update"
+        );
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), Some(&root), Some(&undetermined)),
+            "root + undetermined probe → update"
+        );
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), Some(&root), None),
+            "root + probe never ran → update"
+        );
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), Some(&root), Some(&other_folder_current)),
+            "root + current verdict for ANOTHER folder → update"
+        );
+        assert!(
+            !update_all_skips_root_row(other_dir.path(), Some(&root), Some(&current)),
+            "not the root → update (even when current)"
+        );
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), None, Some(&current)),
+            "unresolvable orchestrator root → update"
+        );
+    }
+
+    /// The emitted row for an already-current root: `status: "skipped"`,
+    /// no error, and the reason carried on `skip_reason` (the typed
+    /// `summary` stays `None` — no install ran to count).
+    #[test]
+    fn root_current_skip_entry_is_skipped_with_a_reason() {
+        let e = root_current_skip_entry("root-1", "Orchestrator root");
+        assert_eq!(e.status, "skipped");
+        assert!(e.error.is_none());
+        assert!(e.summary.is_none());
+        let reason = e.skip_reason.expect("the row carries its skip reason");
+        assert!(
+            reason.contains("already current") && reason.contains("nothing to update"),
+            "reason must say what was decided: {}",
+            reason
+        );
+    }
+
+    /// `update_all_projects` cannot be driven from a unit test (it needs a
+    /// Tauri `AppHandle`), so — following the F6 `fn_marker` pattern above —
+    /// we pin the load-bearing source invariant: the root-skip gate must
+    /// appear BEFORE the `update_project_v2` call and short-circuit with
+    /// `continue`, so a skipped root never reaches the per-project update.
+    #[test]
+    fn update_all_short_circuits_the_root_before_calling_update_project_v2() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/commands/projects_v2.rs");
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let fn_marker = "pub async fn update_all_projects(";
+        let start = body
+            .find(fn_marker)
+            .expect("update_all_projects must exist; if you renamed it, update this test");
+        let window_end = (start + 12000).min(body.len());
+        let window = &body[start..window_end];
+        let gate = window
+            .find("update_all_skips_root_row(")
+            .expect("the root-skip decision must be called inside update_all_projects");
+        let update_call = window
+            .find("update_project_v2(row.id.clone()")
+            .expect("the per-project update call must exist in update_all_projects");
+        assert!(
+            gate < update_call,
+            "the root-skip gate must run BEFORE the per-project update call"
+        );
+        assert!(
+            window[gate..update_call].contains("continue"),
+            "a skipped root must short-circuit with `continue` before the update call"
+        );
     }
 
     // ─── v0.2.71 Piece 5b: kg-sync spawn gate (skip-when-unchanged) ─────
@@ -9822,6 +10189,7 @@ SHARED_KG_OPT_OUT=false\n"),
                     error: None,
                     warnings: Vec::new(),
                     summary: None,
+                    skip_reason: None,
                 });
                 total_skipped += 1;
                 continue;
@@ -9861,6 +10229,7 @@ SHARED_KG_OPT_OUT=false\n"),
                         error: None,
                         warnings: r.warnings,
                         summary: Some(r.summary),
+                        skip_reason: None,
                     });
                     total_succeeded += 1;
                 }
@@ -9872,6 +10241,7 @@ SHARED_KG_OPT_OUT=false\n"),
                         error: Some(e),
                         warnings: Vec::new(),
                         summary: None,
+                        skip_reason: None,
                     });
                     total_failed += 1;
                     if opts.stop_on_error {

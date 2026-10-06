@@ -132,9 +132,10 @@ class CliRendersClaudeMdTests(unittest.TestCase):
 
             claude_md = (folder / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertNotIn("## Diagrams (Mermaid + Excalidraw)", claude_md)
-            # The KG-First Search Policy section (which precedes the
-            # conditional block in the template) must still be present.
-            self.assertIn("KG-First Search Policy", claude_md)
+            # The search-policy section (which precedes the conditional
+            # block in the template) must still be present. Renamed from
+            # "KG-First Search Policy" in the 2026-10 instruction-file pass.
+            self.assertIn("Search before you answer project questions", claude_md)
             # The VCO-Managed Files section (which follows) too.
             self.assertIn("VCO-Managed Files", claude_md)
 

@@ -466,7 +466,12 @@ class TallyAndDetailsTests(_SyncTestBase):
         # archived = 2.
         self.assertIn("📚 Found 2 markdown files in knowledge/", out)
         # Details block names both non-synced paths with reasons.
-        self.assertIn("📋 2 not-synced item(s) this run (--all): "
+        # v0.2.101 P299-A3: the line IS the owner-directed "N of M … not
+        # synced: <reasons>" summary — M (3) is the total the run
+        # CONSIDERED (1 synced + the 2 skips named here). GLM wave-2 nit 4:
+        # the noun is "items" — M honestly includes the excluded meta file
+        # (a non-node), and the breakdown names that category.
+        self.assertIn("📋 2 of 3 items not synced this run (--all): "
                       "1 archived-skipped, 1 excluded-skipped", out)
         self.assertIn("knowledge/archive/old.md — archived node:", out)
         self.assertIn("knowledge/TAG_HIERARCHY.md — excluded meta file", out)

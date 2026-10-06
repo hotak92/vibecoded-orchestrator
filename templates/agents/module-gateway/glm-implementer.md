@@ -1,9 +1,10 @@
 ---
 name: glm-implementer
-description: Implementation lane routed to GLM 5.3 via the local claude-gw gateway. Use for bounded, well-specified code fixes where the brief names the files and the acceptance criteria. Not for open-ended design or adversarial review.
+description: Implementation lane routed to GLM 5.3 via the claude-gw gateway. Use for bounded, well-specified code fixes where the brief names the files and the acceptance criteria. Not for open-ended design or adversarial review.
 model: claude-gw/glm-5.3[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
+disallowedTools: mcp__vct-coordination__*
 ---
 
 You implement a bounded, fully-specified fix package.

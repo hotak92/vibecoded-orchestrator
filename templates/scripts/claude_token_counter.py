@@ -111,11 +111,9 @@ READ_TOOL_NAMES = {"Read", "ctx_read"}
 # tools per CLAUDE.md). Excluded: store_knowledge_node (it's the reset trigger).
 WEB_TOOL_NAMES = {
     "WebSearch", "WebFetch",
-    # search MCP: only `search_papers` survives v0.2.11 (web_search,
-    # search_code, fetch_page were dropped — see PR-14a). The removed
-    # names are no longer in this set; if they appear in an old log
-    # replay, they fall through to the default tool-category bucket.
-    "mcp__search__search_papers",
+    # v0.2.101: the search MCP (search_papers) was deleted, so its tool no
+    # longer appears. A log replay that still names it falls through to the
+    # default tool-category bucket.
     "mcp__weaviate-kg__hybrid_search",
     "mcp__weaviate-kg__semantic_graph_search",
     "mcp__weaviate-kg__search_code_graph",

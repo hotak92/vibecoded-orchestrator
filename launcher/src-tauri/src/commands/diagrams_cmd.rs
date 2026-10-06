@@ -25,8 +25,7 @@ use sha2::{Digest, Sha256};
 use serde::Deserialize;
 use tauri::{command, State};
 
-use crate::db::diagrams::{AccessRow, DiagramRow, SnapshotRow, ToolGrant};
-use crate::db::mcp_tool_defaults::McpToolDefault;
+use crate::db::diagrams::{AccessRow, DiagramRow, SnapshotRow};
 use crate::db::Db;
 use vct_launcher_core::process::CommandExt as _;
 
@@ -54,15 +53,6 @@ pub async fn list_diagram_access(
     db: State<'_, Db>,
 ) -> Result<Vec<AccessRow>, String> {
     db.list_diagram_access(&project_id)
-}
-
-#[command]
-pub async fn list_project_mcp_tools(
-    project_id: String,
-    mcp_name: String,
-    db: State<'_, Db>,
-) -> Result<Vec<ToolGrant>, String> {
-    db.list_project_mcp_tools(&project_id, &mcp_name)
 }
 
 // ─── Diagram registry mutations ─────────────────────────────────────────
@@ -433,144 +423,39 @@ pub fn diagram_grant_access_with_db(
     Ok(crate::commands::projects_v2::reproject_env_soft(db, grantee_id))
 }
 
+/// F3: the grantee re-projection is a Python subprocess (300 s cap), so the
+/// sync core runs on the blocking pool, not a tokio worker. The DB write
+/// lives inside the closure, so a join failure is propagated.
 #[command]
 pub async fn diagram_grant_access(
     grantor_id: String,
     grantee_id: String,
     level: String,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    diagram_grant_access_with_db(&db, &grantor_id, &grantee_id, &level).map(|_| ())
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "diagram_grant_access",
+        move |db| diagram_grant_access_with_db(db, &grantor_id, &grantee_id, &level),
+    )
+    .await?
+    .map(|_| ())
 }
 
-// ─── Per-tool MCP grants ────────────────────────────────────────────────
+// ─── (v0.2.101) Per-tool MCP-grant Tauri commands REMOVED ───────────────
 //
-// Despite living in `diagrams_cmd.rs` for historical reasons (Phase 1.1
-// shipped these alongside the diagrams DB schema), these commands are
-// MCP-NAME-AGNOSTIC: every caller passes `mcp_name` as a String, and
-// the underlying `project_mcp_tool_grants` table is keyed on
-// `(project_id, mcp_name, tool_name)`. v0.2.34 Agent E (Phase 4
-// generalisation, 2026-05-25) consciously kept them here — moving the
-// file would churn `lib.rs::invoke_handler!` registrations without a
-// concrete benefit.
-
-#[command]
-pub async fn set_project_mcp_tool_enabled(
-    project_id: String,
-    mcp_name: String,
-    tool_name: String,
-    enabled: bool,
-    db: State<'_, Db>,
-) -> Result<(), String> {
-    db.set_mcp_tool_enabled(&project_id, &mcp_name, &tool_name, enabled)?;
-    db.audit(
-        "mcp_tool_grant_set",
-        Some(&project_id),
-        None,
-        &serde_json::json!({
-            "mcp": mcp_name,
-            "tool": tool_name,
-            "enabled": enabled,
-        }),
-    )?;
-    Ok(())
-}
-
-/// v0.2.34 (Agent E — Phase 4 generalisation, 2026-05-25): pre-populate
-/// `project_mcp_tool_grants` for a project from the manifest-shipped
-/// defaults (or the hardcoded fallback for orchestrator-bundled MCPs).
-///
-/// Called by `PermissionsTab.svelte`'s "Customize" button: the user
-/// wants to bring an MCP's per-tool toggles under explicit project
-/// control, starting from whatever the wrapper's default state happens
-/// to be. After this command runs, every default tool has a matching
-/// row in `project_mcp_tool_grants` with `enabled = default_enabled`,
-/// which the UI then lets the user toggle individually.
-///
-/// Idempotent: re-running it is safe — `set_mcp_tool_enabled` does
-/// `INSERT OR UPDATE`, so existing rows get overwritten with the
-/// default (callers explicitly want this — "reset to defaults" is a
-/// valid second-Customize click).
-///
-/// Returns the full set of rows that now exist for `(project_id,
-/// mcp_name)` so the UI doesn't need a follow-up `list_project_mcp_tools`
-/// round-trip.
-#[command]
-pub async fn seed_project_mcp_tool_grants(
-    project_id: String,
-    mcp_name: String,
-    db: State<'_, Db>,
-) -> Result<Vec<ToolGrant>, String> {
-    // Resolve defaults: prefer module-shipped (DB), fall back to the
-    // hardcoded list (mermaid / excalidraw). Empty result is a valid
-    // outcome — the UI shows the "no tools to customize" state.
-    let defaults: Vec<McpToolDefault> = db.list_mcp_tool_defaults(&mcp_name)?;
-    let entries: Vec<(String, bool)> = if defaults.is_empty() {
-        fallback_default_allowlist(&mcp_name)
-    } else {
-        defaults
-            .into_iter()
-            .map(|d| (d.tool_name, d.default_enabled))
-            .collect()
-    };
-
-    if entries.is_empty() {
-        // Nothing to seed — return the current (likely empty) row set
-        // verbatim. The UI's Customize button bails out gracefully.
-        return db.list_project_mcp_tools(&project_id, &mcp_name);
-    }
-
-    for (tool_name, default_enabled) in &entries {
-        db.set_mcp_tool_enabled(&project_id, &mcp_name, tool_name, *default_enabled)?;
-    }
-    db.audit(
-        "mcp_tool_grants_seeded",
-        Some(&project_id),
-        None,
-        &serde_json::json!({
-            "mcp": mcp_name,
-            "tool_count": entries.len(),
-        }),
-    )?;
-    db.list_project_mcp_tools(&project_id, &mcp_name)
-}
-
-/// Hardcoded fallback per-tool allowlist for orchestrator-bundled
-/// MCPs. Mirrors `vct-hub::mcp_tool_grants_api::_default_allowlist_for`
-/// — the two lists MUST stay in sync. We can't share the constants
-/// directly because `vct-hub` lives in a separate crate; the diff
-/// between them is caught by the integration test below
-/// (`fallback_default_allowlist_matches_hub_constants`).
-fn fallback_default_allowlist(mcp_name: &str) -> Vec<(String, bool)> {
-    match mcp_name {
-        "mermaid" => vec![
-            ("export_png".to_string(), false),
-            ("list_themes".to_string(), false),
-            ("render".to_string(), true),
-            ("save_diagram".to_string(), true),
-            ("validate_syntax".to_string(), true),
-        ],
-        "excalidraw" => vec![
-            ("align_elements".to_string(), true),
-            ("batch_create_elements".to_string(), true),
-            ("create_element".to_string(), true),
-            ("create_from_mermaid".to_string(), false),
-            ("create_view".to_string(), true),
-            ("delete_element".to_string(), true),
-            ("distribute_elements".to_string(), true),
-            ("export_scene".to_string(), false),
-            ("get_resource".to_string(), true),
-            ("group_elements".to_string(), false),
-            ("lock_elements".to_string(), false),
-            ("query_elements".to_string(), true),
-            ("read_me".to_string(), true),
-            ("ungroup_elements".to_string(), false),
-            ("unlock_elements".to_string(), false),
-            ("update_element".to_string(), true),
-        ],
-        _ => Vec::new(),
-    }
-}
+// `list_project_mcp_tools` / `set_project_mcp_tool_enabled` /
+// `seed_project_mcp_tool_grants` existed for the mermaid/excalidraw wrapper
+// MCPs' per-tool allowlist UI (PermissionsTab). VCO no longer registers
+// those MCPs by default, so the UI is gone and these commands are uncalled.
+//
+// The DB READERS (`Db::list_project_mcp_tools` / `list_mcp_tool_defaults`)
+// and the hub's `mcp_tool_grants_api` route STAY: the wrapper modules still
+// ship, and an install that already has the entry keeps working — the hub
+// route filters its `tools/list` with the same defaults. The DB WRITE side
+// (`Db::set_mcp_tool_enabled`) was retired with them (v0.2.101, owner
+// ruling: no production caller remained once the GUI went). Only VCO-side
+// write surfaces were removed.
 
 // ─── Project modules ────────────────────────────────────────────────────
 
@@ -612,6 +497,44 @@ pub async fn set_project_module_enabled(
     schedule_bundle_update_for_project(&db, &project_id, spawn_bundle_update);
 
     Ok(())
+}
+
+/// Clear a project's EXPLICIT module choice — the way back to "follows the
+/// machine" (v0.2.101, G1 follow-up).
+///
+/// The inverse of [`set_project_module_enabled`], same shape: the row is
+/// deleted (nothing is remembered of the previous choice), then the same
+/// two side effects a flip triggers run, because a cleared row changes
+/// what the bundle DELIVERS exactly like a flip — with no row, the module
+/// falls back to its default resolution (for `model_gateway`, the machine
+/// gateway signal). `Ok(false)` when no row existed: the state is already
+/// the default one, so neither the re-render nor the bundle update has
+/// anything to do, and a double-click must not look like a failure.
+#[command]
+pub async fn clear_project_module(
+    project_id: String,
+    module_name: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    let cleared = db.clear_project_module(&project_id, &module_name)?;
+    if !cleared {
+        return Ok(false);
+    }
+    db.audit(
+        "project_module_cleared",
+        Some(&project_id),
+        None,
+        &serde_json::json!({
+            "module": module_name,
+            "cleared": true,
+        }),
+    )?;
+    // Same reasoning as `set_project_module_enabled`: the CLAUDE.md
+    // conditional block and the bundle delivery both read the row (or its
+    // absence), so both must re-run. Soft-fail throughout.
+    spawn_re_render_claude_md(&db, &project_id);
+    schedule_bundle_update_for_project(&db, &project_id, spawn_bundle_update);
+    Ok(true)
 }
 
 /// Resolve `project_id`'s folder and hand it to `run`. Split from the spawn
@@ -1941,14 +1864,12 @@ mod tests {
         assert_eq!(fs::read(&abs_path).unwrap(), original_content);
     }
 
-    // ─── v0.2.34 Agent E (Phase 4 generalisation) tests ──────────────
+    // ─── diagram-name/URL guards + DB-level tool-grant reconcile ──────
     //
-    // The Tauri commands themselves need a Tauri runtime to invoke, so
-    // we exercise the pure logic surface (`fallback_default_allowlist`)
-    // + the underlying DB layer the commands wrap. End-to-end behaviour
-    // through the #[command] macros is covered by the launcher's
-    // integration tests + the hub-side tests in
-    // `mcp_tool_grants_api.rs`.
+    // v0.2.101 removed the per-tool-grant Tauri commands (GUI gone with the
+    // retired diagram MCPs); the DB-level reconcile below still exercises the
+    // generic `module_mcp_tool_defaults` / `project_mcp_tool_grants` layer
+    // that `commands::modules` and the hub route use.
 
     #[test]
     fn open_diagrams_editor_name_guard_matches_frontend_rule() {
@@ -1988,95 +1909,6 @@ mod tests {
     }
 
     #[test]
-    fn fallback_default_allowlist_returns_mermaid_set() {
-        let list = fallback_default_allowlist("mermaid");
-        let names: Vec<&str> = list.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"render"));
-        assert!(names.contains(&"save_diagram"));
-        // render must be on; export_png off.
-        let render_on = list
-            .iter()
-            .find(|(n, _)| n == "render")
-            .map(|(_, en)| *en)
-            .unwrap();
-        assert!(render_on);
-        let export_off = list
-            .iter()
-            .find(|(n, _)| n == "export_png")
-            .map(|(_, en)| *en)
-            .unwrap();
-        assert!(!export_off);
-    }
-
-    #[test]
-    fn fallback_default_allowlist_returns_empty_for_unknown_mcp() {
-        // Generalisation contract: an unknown (non-bundled) MCP returns
-        // an empty list rather than panicking. The caller — the
-        // seed_project_mcp_tool_grants command — bails out gracefully
-        // when defaults are empty (no rows are inserted; the UI shows
-        // "no tools to customize").
-        let list = fallback_default_allowlist("vendor-x-mcp");
-        assert!(list.is_empty());
-        let list = fallback_default_allowlist("");
-        assert!(list.is_empty());
-    }
-
-    #[test]
-    fn seed_logic_prefers_module_defaults_over_fallback() {
-        // Build a fresh Db, register module-shipped defaults for a NEW
-        // mcp_name (no fallback exists), then verify the seed code
-        // path reads from `module_mcp_tool_defaults` and inserts rows
-        // into `project_mcp_tool_grants` accordingly.
-        let dir = tempfile::tempdir().unwrap();
-        let db = make_db_with_project("p1", "Acme", dir.path());
-        db.reconcile_mcp_tool_defaults(
-            "vendor-reranker",
-            "vendor-mcp-x",
-            &[
-                ("rerank".to_string(), true, None),
-                ("debug".to_string(), false, None),
-            ],
-            10,
-        )
-        .unwrap();
-
-        // Simulate what `seed_project_mcp_tool_grants` does internally
-        // (the #[command] surface needs a Tauri State to invoke).
-        let defaults = db.list_mcp_tool_defaults("vendor-reranker").unwrap();
-        assert_eq!(defaults.len(), 2);
-        for d in &defaults {
-            db.set_mcp_tool_enabled("p1", &d.mcp_name, &d.tool_name, d.default_enabled)
-                .unwrap();
-        }
-        let listed = db.list_project_mcp_tools("p1", "vendor-reranker").unwrap();
-        assert_eq!(listed.len(), 2);
-        // Sorted alphabetically by tool_name.
-        assert_eq!(listed[0].tool_name, "debug");
-        assert!(!listed[0].enabled);
-        assert_eq!(listed[1].tool_name, "rerank");
-        assert!(listed[1].enabled);
-    }
-
-    #[test]
-    fn seed_logic_falls_back_to_hardcoded_when_no_module_defaults() {
-        // For a bundled MCP without any `module_mcp_tool_defaults` rows,
-        // seeding should populate the project's grant table from the
-        // hardcoded fallback. Mermaid is the canonical case.
-        let dir = tempfile::tempdir().unwrap();
-        let db = make_db_with_project("p1", "Acme", dir.path());
-        // No defaults registered — the DB is empty for "mermaid".
-        let defaults = db.list_mcp_tool_defaults("mermaid").unwrap();
-        assert!(defaults.is_empty());
-
-        let fallback = fallback_default_allowlist("mermaid");
-        for (name, en) in &fallback {
-            db.set_mcp_tool_enabled("p1", "mermaid", name, *en).unwrap();
-        }
-        let listed = db.list_project_mcp_tools("p1", "mermaid").unwrap();
-        assert_eq!(listed.len(), fallback.len());
-    }
-
-    #[test]
     fn reconcile_module_update_drops_removed_tools_keeps_overrides() {
         // v0.2.7 of a module ships [tool_a, tool_b]; the user disables
         // tool_b via the Permissions tab (writes to
@@ -2099,9 +1931,22 @@ mod tests {
             10,
         )
         .unwrap();
-        // User disables tool_b.
-        db.set_mcp_tool_enabled("p1", "fancy-mcp", "tool_b", false)
-            .unwrap();
+        // User disabled tool_b (the per-tool WRITE path was retired with
+        // its GUI in v0.2.101; seed the row the way it historically
+        // landed — the reader under test is what must keep working).
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO project_mcp_tool_grants
+                     (project_id, mcp_name, tool_name, enabled)
+                     VALUES (?1, ?2, ?3, 0)
+                     ON CONFLICT(project_id, mcp_name, tool_name)
+                     DO UPDATE SET enabled = excluded.enabled",
+                    rusqlite::params!["p1", "fancy-mcp", "tool_b"],
+                )
+                .unwrap();
+        }
         // Module updates: tool_b removed.
         db.reconcile_mcp_tool_defaults(
             "fancy-mcp",

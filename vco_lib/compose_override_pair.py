@@ -25,7 +25,8 @@ def classify_pair(legacy_path: Path, canonical_path: Path) -> str:
 
     Returns one of:
       * ``"identical"``     — byte-for-byte identical. The v0.2.54 C-RT-5 mirror
-        (``volumes.rs`` writes the SAME body to BOTH names by design) so this is
+        (the Rust override writer writes the SAME body to BOTH names by
+        design — ``storage_ux.rs`` since the v0.2.101 Q4b merge) so this is
         the SANCTIONED pair. B-F2(i): suppress the deferral, KEEP BOTH FILES.
       * ``"semantic_equal"`` — bytes differ but ``yaml.safe_load`` of each parses
         cleanly AND compares equal (comment/whitespace drift only). B-F2(ii):
@@ -74,8 +75,8 @@ def classify_pair(legacy_path: Path, canonical_path: Path) -> str:
 def managed_override_header(path: Path) -> Optional[str]:
     """The first line of ``path`` when it is a VCO-GENERATED override (it
     carries the marker every VCO override generator writes —
-    ``service_adoption._OVERRIDE_MANAGED_MARKER``, the Rust ``storage_ux.rs`` /
-    ``volumes.rs`` headers), else ``None``. Unreadable → ``None``."""
+    ``service_adoption._OVERRIDE_MANAGED_MARKER``, the Rust ``storage_ux.rs``
+    headers), else ``None``. Unreadable → ``None``."""
     from vco_lib.service_adoption import _OVERRIDE_MANAGED_MARKER
 
     try:

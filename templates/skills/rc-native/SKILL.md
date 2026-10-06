@@ -1,6 +1,6 @@
 ---
 name: rc-native
-description: Start/manage Claude Code Remote Control (claude.ai/code + mobile app) as a detached native-auth background server on this machine. AUTO-STARTS the backend on every invocation (idempotent). Use when the user wants Remote Control, phone access to their sessions, or asks about /remote-control failing with "Remote Control initialization failed". If this project's VS Code panel is pointed at the VCO model gateway, Remote Control can never initialize there (endpoint-gated) — this skill runs the native-auth server alongside the panel instead.
+description: Runs Claude Code Remote Control (claude.ai/code + mobile) as a detached native-auth server, auto-started on invocation. Use for Remote Control or phone access, or when /remote-control fails with "initialization failed" behind a gateway.
 short_desc: "rc-native: detached native-auth Remote Control server alongside the gateway panel"
 keywords: [remote-control, "remote control", rc-native, claude.ai, "phone access", "mobile app", "/remote-control", "Remote Control initialization failed", endpoint gate, native auth]
 argument-hint: "[start|status|url|stop|logs]"

@@ -7,6 +7,9 @@
   import Toast from '$lib/components/Toast.svelte';
   import AgentsTab from '$lib/project-state/AgentsTab.svelte';
   import SkillsTab from '$lib/project-state/SkillsTab.svelte';
+  // v0.2.101 (catalogue plan §3.6): opt-in agent/skill packs. Sits right
+  // after Skills — the three tabs are one "what is installed" story.
+  import PacksTab from '$lib/project-state/PacksTab.svelte';
   import HooksTab from '$lib/project-state/HooksTab.svelte';
   import PermissionsTab from '$lib/project-state/PermissionsTab.svelte';
   import SecretsTab from '$lib/project-state/SecretsTab.svelte';
@@ -83,7 +86,7 @@
   // when the active project's host is `orchestrator_root`. Pinned to
   // the end of the tab strip so it doesn't shift existing tab indices
   // for muscle-memory users on normal projects.
-  let activeTab = $state<'identity' | 'agents' | 'skills' | 'hooks' | 'permissions' | 'access' | 'secrets' | 'kg' | 'diagrams' | 'settings' | 'orchestrator_core'>('agents');
+  let activeTab = $state<'identity' | 'agents' | 'skills' | 'packs' | 'hooks' | 'permissions' | 'access' | 'secrets' | 'kg' | 'diagrams' | 'settings' | 'orchestrator_core'>('agents');
 
   // v0.2.23 F2: the orchestrator-root project is treated as a special
   // project — same tab template, plus one extra "Orchestrator core"
@@ -307,6 +310,9 @@
     { id: 'identity', label: 'Identity' },
     { id: 'agents', label: 'Agents' },
     { id: 'skills', label: 'Skills' },
+    // v0.2.101: Packs — the opt-in catalogue members (install/remove
+    // through the ordinary bundle engine; members show in Agents/Skills).
+    { id: 'packs', label: 'Packs' },
     { id: 'hooks', label: 'Hooks' },
     { id: 'permissions', label: 'Permissions' },
     { id: 'access', label: 'Cross-project access' },
@@ -443,6 +449,8 @@
       <AgentsTab projectId={project.id} />
     {:else if activeTab === 'skills'}
       <SkillsTab projectId={project.id} />
+    {:else if activeTab === 'packs'}
+      <PacksTab projectId={project.id} />
     {:else if activeTab === 'hooks'}
       <HooksTab projectId={project.id} />
     {:else if activeTab === 'permissions'}

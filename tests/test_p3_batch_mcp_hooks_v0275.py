@@ -16,9 +16,10 @@ Six small items land together:
   (f) HK-4  — accepted-scatter comments at the 4 GC sites.
 
 Some items are exercised behaviourally (KG-5 gate, NEW-4 semaphore, KG-4
-regen); the structural ones (C-7 filter shape, HK-2 deletion, HK-4 comments)
-are pinned by source assertions where a full Weaviate round-trip isn't
-warranted.
+regen); the structural ones (C-7 write normalization, HK-2 deletion, HK-4
+comments) are pinned by source assertions where a full Weaviate round-trip
+isn't warranted. The C-7 delete (both spellings, paging) is behavioural since
+v0.2.101 — see tests/test_v02101_kg_exact_path_delete.py.
 """
 from __future__ import annotations
 
@@ -49,19 +50,18 @@ class TestC7DeleteFilterShape:
             "C-7 must normalize stored spelling to POSIX at write"
         )
 
-    def test_delete_matches_both_spellings(self):
-        src = SERVER_PY.read_text(encoding="utf-8")
-        # OR of two exact .equal() filters over posix + backslash variants.
-        assert "Filter.any_of([" in src, "C-7 delete must OR the two spellings"
-        assert '_backslash_variant = rel_file_path.replace("/", "\\\\")' in src
-
-    def test_delete_pages_past_100(self):
-        src = SERVER_PY.read_text(encoding="utf-8")
-        # A paging loop (offset advance) replaces the single limit=100 fetch.
-        assert "_fetch_offset" in src and "offset=_fetch_offset" in src, (
-            "C-7 delete must page past limit=100"
-        )
-        assert "_FETCH_PAGE = 100" in src
+    # v0.2.101 B3: the two source pins that stood here ("Filter.any_of([" /
+    # "_backslash_variant = ..." and "_fetch_offset" / "_FETCH_PAGE = 100")
+    # are SUPERSEDED by a behavioural test. The delete's candidate read moved
+    # to the shared `vco_lib.weaviate_exact_match` home (the tokenized filter
+    # only narrows; rows are confirmed in Python), so the pinned spellings no
+    # longer exist — and a source pin could not have caught B3 anyway. What
+    # they claimed (both spellings replaced, paging past 100) is now proven
+    # end-to-end by
+    # tests/test_v02101_kg_exact_path_delete.py::
+    #     test_mcp_store_replaces_both_spellings_and_pages_past_100
+    # (150 old rows across both spellings replaced, token-superset sibling
+    # kept).
 
     def test_title_only_fallback_retained_with_pointer(self):
         src = SERVER_PY.read_text(encoding="utf-8")

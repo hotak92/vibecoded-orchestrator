@@ -1,12 +1,13 @@
 //! PR-10A — User-configurable container-volume storage UX.
 //!
-//! This module is the post-0.2.10 successor to `volumes.rs`'s install-time
-//! Bug 31 picker. The split is intentional:
+//! v0.2.101 (owner ruling Q4b, census S5): `volumes.rs` was merged INTO
+//! this module — two storage-config systems in two files was one concern
+//! in two homes. This file now owns both halves:
 //!
-//!   - `volumes.rs` owns the install-time auto-detection + the destructive
-//!     `migrate_volumes` pipeline that exists ONLY to move an already-running
-//!     deployment between paths.
-//!   - `storage_ux.rs` (this file) owns the user-facing Settings → Storage
+//!   - the install-time auto-detection + the destructive `migrate_volumes`
+//!     pipeline that exists ONLY to move an already-running deployment
+//!     between paths (the merged volumes.rs sections below);
+//!   - the user-facing Settings → Storage
 //!     surface that:
 //!       1. Reads / writes `~/.vct/storage.toml` (separate from
 //!          `launcher.toml`'s Bug 31 mapping — different lifecycle, different
@@ -64,9 +65,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use tauri::command;
+use tauri::{command, AppHandle, Emitter};
 use vct_launcher_core::process::CommandExt as _;
 use vct_launcher_core::services::container_runtime::{self, RuntimePinSource};
+
+use super::installer::ExistingVolume;
 
 // ---------------------------------------------------------------------------
 // Strict legacy-volume allowlist
@@ -271,13 +274,13 @@ fn compose_override_path() -> Result<PathBuf, String> {
 }
 
 /// v0.2.54 (C-RT-5): the Docker-Compose auto-load sibling. Docker
-/// Compose auto-loads `docker-compose.override.yml` (and `volumes.rs`'s
+/// Compose auto-loads `docker-compose.override.yml` (and the volumes half's
 /// Bug-31 path historically wrote ONLY that name while this module
 /// wrote ONLY `compose.override.yaml`) — two generators, two filenames,
 /// divergent bodies. Which volume aliases applied depended on which
 /// compose binary ran; a runtime switch could re-point Weaviate/Ollama
 /// at fresh empty volumes. Fix: every write here mirrors the SAME body
-/// to BOTH names (volumes.rs does the same in the other direction).
+/// to BOTH names (the volumes half does the same in the other direction).
 fn compose_override_sibling_path() -> Result<PathBuf, String> {
     let root = super::installer::find_local_repo_root()?;
     Ok(root.join("infrastructure").join("docker-compose.override.yml"))
@@ -609,7 +612,7 @@ async fn mountpoint_on_owning_runtime(
 /// What `<runtime> volume inspect <name>` established — tri-state, because
 /// "no such volume" and "the inspect failed" are different answers (R7b
 /// F25(b)). The ONE parser of that command's output: `inspect_volume` below
-/// and `commands::volumes::existing_volumes_owned_by` go through it.
+/// and `existing_volumes_owned_by` (the merged volumes.rs half) go through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VolumeProbe {
     Found { mountpoint: String, driver: String },
@@ -1000,6 +1003,1183 @@ pub fn set_storage_config_from_cli(
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// volumes.rs — MERGED INTO THIS MODULE (v0.2.101, owner ruling Q4b/S5).
+// One concern, one home: both storage-config systems (the Preferences
+// Storage card and the install-time volume-location picker + the
+// destructive migrate_volumes pipeline) live here now. The section
+// boundaries below are historical, not architectural.
+// ─────────────────────────────────────────────────────────────────────
+
+
+// ---------------------------------------------------------------------------
+// Migration progress event
+// ---------------------------------------------------------------------------
+
+/// Phase-level progress events for `migrate_volumes`. The frontend
+/// subscribes via `listen('volumes://migrate-progress', ...)` and renders
+/// a real progress bar instead of the static "Migrating..." text.
+///
+/// Reviewer A + B round-2: "Migrating..." with no feedback is a UX cliff
+/// for users with multi-GB Weaviate volumes that can take 5+ minutes to
+/// `cp -a`. Emitting at phase boundaries (no rsync-style byte tracking,
+/// since `cp -a` doesn't expose progress) is the smallest fix that
+/// removes the dead-loading-spinner failure mode.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigratePhase {
+    StoppingContainers,
+    /// `volume_role` is "weaviate" / "ollama" / "code_embed" — frontend
+    /// can show "Copying weaviate..." dynamically.
+    CopyingVolume { volume_role: String, index: u32, total: u32 },
+    WritingOverride,
+    StartingContainers,
+    WaitingForHealth,
+    RemovingLegacyVolumes,
+    Done,
+    /// Emitted before the function returns Err — frontend shows the
+    /// rollback message instead of the success state.
+    RollingBack { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrateProgress {
+    pub phase: MigratePhase,
+    pub message: String,
+}
+
+const MIGRATE_EVENT: &str = "volumes://migrate-progress";
+
+fn emit_phase(app: &AppHandle, phase: MigratePhase, message: &str) {
+    let _ = app.emit(
+        MIGRATE_EVENT,
+        MigrateProgress { phase, message: message.into() },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// Persisted launcher config. Lives at `~/.vct/launcher.toml`.
+///
+/// Fields are flattened toml — no nested tables — so the file stays
+/// trivially hand-editable when the launcher is offline.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LauncherConfig {
+    /// One of:
+    ///   - `"default"`  — runtime default location (no override generated)
+    ///   - `"detected"` — existing volumes found; reuse them as-is
+    ///   - `"<path>"`   — absolute path to a custom volumes folder
+    #[serde(default)]
+    pub volumes_path: String,
+
+    /// When `volumes_path == "detected"`, this records the historical
+    /// volume name → mountpoint mapping so the Settings panel can
+    /// display them without re-probing. Empty otherwise.
+    #[serde(default)]
+    pub legacy_mapping: Vec<LegacyVolumeMapping>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyVolumeMapping {
+    /// Name as Podman/Docker knows it (e.g. `weaviate_claude`).
+    pub volume_name: String,
+    /// Filesystem path the runtime bind-mounts inside the container.
+    pub mountpoint: String,
+    /// Logical role: which compose service this volume serves.
+    /// One of `"weaviate"` | `"ollama"` | `"code_embed"`.
+    pub role: String,
+}
+
+/// Front-end-facing config wrapping the persisted state with computed
+/// human-friendly fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumesConfig {
+    pub volumes_path: String,
+    /// `"default"` | `"detected"` | `"custom"` — computed from `volumes_path`.
+    pub mode: String,
+    pub legacy_mapping: Vec<LegacyVolumeMapping>,
+    /// Human-readable size, e.g. "21.1 GB". `None` when sizes weren't
+    /// probed (e.g. runtime not installed).
+    pub total_size_human: Option<String>,
+    /// Per-volume sizes (filled when we could `du` the mountpoints).
+    pub volumes: Vec<VolumeWithSize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeWithSize {
+    pub name: String,
+    pub mountpoint: String,
+    pub size_bytes: Option<u64>,
+    pub size_human: Option<String>,
+    pub role: String,
+}
+
+/// Result of a dry-run migration request. The frontend shows this in a
+/// confirm dialog before the user clicks "Migrate".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationPlan {
+    pub from_mode: String, // "default" | "detected" | "custom"
+    pub to_path: String,
+    pub volumes_to_copy: Vec<VolumeWithSize>,
+    pub total_bytes: u64,
+    pub total_human: String,
+    /// Estimated duration in seconds, very rough (assumes 100 MB/s SSD).
+    pub estimated_seconds: u64,
+    /// Free space currently available at `to_path` (or its parent if it
+    /// doesn't yet exist). `None` if we couldn't statvfs.
+    pub free_bytes_at_target: Option<u64>,
+    /// True when free_bytes_at_target < total_bytes * 1.10 (10% headroom).
+    pub insufficient_free_space: bool,
+    /// User-facing warnings (legacy volumes will be removed after copy
+    /// succeeds, etc.).
+    pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
+pub fn launcher_config_path() -> PathBuf {
+    // Bug 14: route through VCT_STATE_DIR so dev launcher's volume-config
+    // doesn't clobber the production launcher.toml.
+    crate::paths::vct_root_dir().join("launcher.toml")
+}
+
+/// Find the orchestrator repo root by walking up from this binary's
+/// CWD-equivalent. We piggyback on the installer's resolver because
+/// `infrastructure/docker-compose.yml` is the file we have to overlay.
+fn orchestrator_root() -> Result<PathBuf, String> {
+    super::installer::find_local_repo_root()
+}
+
+// v0.2.101 (Q4b merge dedup): this half used to carry its OWN
+// `compose_override_path` / `compose_override_sibling_path` /
+// `write_compose_override` trio (primary/sibling filenames swapped but
+// otherwise identical — both wrote BOTH auto-load names since C-RT-5).
+// One concern, one home: the single trio near the top of this file now
+// serves both halves; only `remove_compose_override` below is unique to
+// this half.
+
+// ---------------------------------------------------------------------------
+// LauncherConfig persistence (atomic temp+rename)
+// ---------------------------------------------------------------------------
+
+pub fn read_launcher_config() -> LauncherConfig {
+    let path = launcher_config_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(_) => return LauncherConfig::default(),
+    };
+    toml::from_str(&raw).unwrap_or_default()
+}
+
+pub fn write_launcher_config(cfg: &LauncherConfig) -> Result<(), String> {
+    let path = launcher_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {}", parent.display(), e))?;
+    }
+    let body = toml::to_string_pretty(cfg)
+        .map_err(|e| format!("serialize launcher.toml: {}", e))?;
+    let mut tmp = path.clone();
+    tmp.set_extension("toml.tmp");
+    std::fs::write(&tmp, &body).map_err(|e| format!("write tmp {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| format!("rename {} -> {}: {}", tmp.display(), path.display(), e))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Volume name → role mapping
+// ---------------------------------------------------------------------------
+
+pub fn volume_role(name: &str) -> &'static str {
+    if name.starts_with("weaviate") {
+        "weaviate"
+    } else if name.starts_with("ollama") {
+        "ollama"
+    } else if name == "code_embed_cache" || name == "vct_code_embed" {
+        "code_embed"
+    } else {
+        "unknown"
+    }
+}
+
+/// Canonical volume name expected by `infrastructure/docker-compose.yml`
+/// for a given role.
+fn canonical_for_role(role: &str) -> Option<&'static str> {
+    match role {
+        "weaviate" => Some("weaviate_data"),
+        "ollama" => Some("ollama_data"),
+        "code_embed" => Some("code_embed_cache"),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Custom-path validation (Bug 31 onboarding picker)
+// ---------------------------------------------------------------------------
+
+/// Validate a user-supplied custom volumes path.
+///
+/// Rules:
+///   - non-empty
+///   - absolute
+///   - parent exists and is writable (we'll create the leaf if missing)
+///   - NOT inside the runtime's default volume tree
+///     (`$HOME/.local/share/containers/storage` for podman) — that path
+///     is managed by the container runtime; bind-mounting it leads to
+///     recursive containment and breaks volume management.
+pub fn validate_custom_volumes_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("custom volumes path cannot be empty".into());
+    }
+    let p = PathBuf::from(trimmed);
+    if !p.is_absolute() {
+        return Err(format!("custom volumes path must be absolute: {}", p.display()));
+    }
+    // Forbid placing volumes inside the runtime-managed tree.
+    if let Some(home) = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()) {
+        let podman_managed = home.join(".local/share/containers/storage");
+        if p.starts_with(&podman_managed) {
+            return Err(format!(
+                "path {} is inside Podman's managed storage tree ({}). \
+                 Pick a folder outside that tree.",
+                p.display(),
+                podman_managed.display()
+            ));
+        }
+        let docker_managed = home.join(".local/share/docker");
+        if p.starts_with(&docker_managed) {
+            return Err(format!(
+                "path {} is inside Docker's managed storage tree.",
+                p.display()
+            ));
+        }
+    }
+    // We don't require the leaf to exist (it will be created), but the
+    // parent must exist + be a directory + writable. Refuse to silently
+    // create the entire ancestry — the user might have typo'd.
+    let parent = p.parent().ok_or("custom path has no parent")?;
+    if !parent.exists() {
+        return Err(format!(
+            "parent directory does not exist: {}. Create it first.",
+            parent.display()
+        ));
+    }
+    if !parent.is_dir() {
+        return Err(format!("parent is not a directory: {}", parent.display()));
+    }
+    // Writable test — try creating a temp marker.
+    let probe = parent.join(format!(".vct-volumes-write-probe-{}", std::process::id()));
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+        }
+        Err(e) => {
+            return Err(format!("parent not writable ({}): {}", parent.display(), e));
+        }
+    }
+    Ok(p)
+}
+
+// ---------------------------------------------------------------------------
+// docker-compose.override.yml generation
+// ---------------------------------------------------------------------------
+
+/// Generate the override-yml body. Two shapes:
+///
+///   - `OverrideShape::CustomBindMounts(path)` — bind-mount each canonical
+///     volume name at `<path>/<role>`. Used for fresh installs picking a
+///     custom path.
+///   - `OverrideShape::ExternalLegacy(map)` — alias each canonical volume
+///     name to an existing legacy named volume via `external: true`.
+///     Used when historical volumes are detected (Bug 31).
+pub enum OverrideShape {
+    CustomBindMounts(PathBuf),
+    ExternalLegacy(Vec<(String, String)>), // (canonical_role, legacy_volume_name)
+}
+
+pub fn generate_override_yaml(shape: &OverrideShape) -> String {
+    match shape {
+        OverrideShape::CustomBindMounts(path) => {
+            // Use ${VCT_VOLUMES_PATH} so the .env file controls the actual
+            // path; lets users move between machines without rewriting yaml.
+            format!(
+                "# Auto-generated by VCT Launcher (Bug 31). Edits will be overwritten\n\
+                 # the next time the user changes the volume location via Settings.\n\
+                 #\n\
+                 # Bind-mounts the three orchestrator volumes at subfolders of\n\
+                 # ${{VCT_VOLUMES_PATH}} = {root}\n\
+                 \n\
+                 services: {{}}\n\
+                 \n\
+                 volumes:\n\
+                   weaviate_data:\n\
+                     driver: local\n\
+                     driver_opts:\n\
+                       type: none\n\
+                       o: bind\n\
+                       device: ${{VCT_VOLUMES_PATH}}/weaviate\n\
+                   ollama_data:\n\
+                     driver: local\n\
+                     driver_opts:\n\
+                       type: none\n\
+                       o: bind\n\
+                       device: ${{VCT_VOLUMES_PATH}}/ollama\n\
+                   code_embed_cache:\n\
+                     driver: local\n\
+                     driver_opts:\n\
+                       type: none\n\
+                       o: bind\n\
+                       device: ${{VCT_VOLUMES_PATH}}/code_embed\n",
+                root = path.display()
+            )
+        }
+        OverrideShape::ExternalLegacy(map) => {
+            let mut out = String::from(
+                "# Auto-generated by VCT Launcher (Bug 31). Edits will be overwritten\n\
+                 # the next time the user changes the volume location via Settings.\n\
+                 #\n\
+                 # Existing volumes were detected on this machine — alias them as\n\
+                 # external: true so compose reuses the historical volume data.\n\
+                 \n\
+                 services: {}\n\
+                 \n\
+                 volumes:\n",
+            );
+            for (canonical, legacy) in map {
+                out.push_str(&format!(
+                    "  {canonical}:\n    external: true\n    name: {legacy}\n",
+                ));
+            }
+            out
+        }
+    }
+}
+
+pub fn remove_compose_override() -> Result<(), String> {
+    // v0.2.54 (C-RT-5): remove BOTH auto-load names — leaving the
+    // sibling behind would resurrect stale aliases for one engine.
+    for path in [compose_override_path()?, compose_override_sibling_path()?] {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("remove {}: {}", path.display(), e))?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Size probing (du -sb fallback to walk)
+// ---------------------------------------------------------------------------
+
+// v0.2.100 F-W4-09: the byte rendering lives in core (one home).
+use vct_launcher_core::units::human_bytes;
+
+/// Best-effort recursive size walk. Returns None on permission errors.
+fn dir_size_bytes(path: &Path) -> Option<u64> {
+    if !path.exists() {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_dir() {
+        return Some(meta.len());
+    }
+    let mut total: u64 = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let p = entry.path();
+            let m = match std::fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if m.is_dir() {
+                stack.push(p);
+            } else {
+                total = total.saturating_add(m.len());
+            }
+        }
+    }
+    Some(total)
+}
+
+// ---------------------------------------------------------------------------
+// Free-space probe
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn free_bytes_at(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Probe the path itself if it exists, else its parent.
+    let probe = if path.exists() { path } else { path.parent()? };
+    let cpath = CString::new(probe.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is FFI; we pass a valid C string and an MaybeUninit
+    // statvfs struct of the right size.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    // We deliberately use f_bavail (not f_bfree) — f_bavail subtracts
+    // ext4's reserved blocks (default 5% of total, root-only). Rootless
+    // Podman runs as the unprivileged user and writes through the user's
+    // quota, so reserved blocks ARE unusable. This matches `df -h`'s
+    // "Available" column, which is the authoritative number for the
+    // rootless-container use case.
+    //
+    // GNOME's "Files" / Disks app reports f_bfree (free including reserved)
+    // — that is misleadingly optimistic for our context: a 2 TB volume can
+    // show ~100 GB more free in GNOME than the rootless Podman runtime
+    // can actually write. If a user reports a discrepancy ("Files says
+    // 243 GB, launcher says 143 GB") the launcher is correct; do not
+    // "fix" by switching to f_bfree.
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn free_bytes_at(_path: &Path) -> Option<u64> {
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Which runtime owns the volumes (v0.2.97 owner ruling "Honour the pin")
+// ---------------------------------------------------------------------------
+
+/// The orchestrator volumes under the runtime storage commands drive
+/// (`storage_ux::storage_runtime`, the shared pin-first detector) — or a
+/// REFUSAL when they exist only under the other runtime.
+///
+/// Pre-v0.2.97 this file listed volumes under whichever runtime answered
+/// first (podman, then docker) and ran `compose stop` / `volume rm` under a
+/// separate podman-first PATH probe — both ignoring `VCT_CONTAINER_RUNTIME`.
+/// On a docker-pinned machine with a leftover podman copy, that inspected
+/// and migrated the podman copy. podman and docker keep separate volumes, so
+/// a volume only the other runtime has is refused, never adopted.
+///
+/// R7b F4: PER VOLUME. This used to ask the other runtime only when the
+/// chosen one had NO orchestrator volume at all, so with docker owning
+/// `ollama_data` and `weaviate_data` only under podman, a migration moved
+/// `ollama_data` and said nothing about `weaviate_data` (compose would then
+/// create an empty one). Now every name in `ORCHESTRATOR_VOLUME_NAMES` is
+/// checked, and any the chosen runtime lacks but the other one HAS is
+/// refused by name. A failed inspect under the chosen runtime is an error,
+/// not "absent" (R7b F25(b)); under the other runtime it is not ownership.
+async fn existing_volumes_owned_by(
+    rt: &super::storage_ux::StorageRuntime,
+    action: &str,
+) -> Result<Vec<ExistingVolume>, String> {
+    use super::storage_ux::{probe_volume, VolumeProbe};
+    use vct_launcher_core::services::container_runtime::{check_runtime_owns, other_runtime};
+    let other = other_runtime(&rt.name);
+    let mut owned: Vec<ExistingVolume> = Vec::new();
+    let mut only_elsewhere: Vec<String> = Vec::new();
+    for name in super::installer::ORCHESTRATOR_VOLUME_NAMES {
+        match probe_volume(&rt.name, name).await {
+            VolumeProbe::Found { mountpoint, driver } => {
+                owned.push(ExistingVolume { name: name.to_string(), mountpoint, driver });
+            }
+            VolumeProbe::Unknown(why) => {
+                return Err(format!(
+                    "could not tell whether {} holds the orchestrator volume `{name}` ({why}); \
+                     refusing to {action} the volumes until `{} volume inspect {name}` answers",
+                    rt.name, rt.name
+                ));
+            }
+            VolumeProbe::Missing => {
+                if matches!(probe_volume(other, name).await, VolumeProbe::Found { .. }) {
+                    only_elsewhere.push(format!("`{name}`"));
+                }
+            }
+        }
+    }
+    check_runtime_owns(
+        action,
+        &format!("the orchestrator volume(s) {}", only_elsewhere.join(", ")),
+        &rt.name,
+        rt.pin,
+        false,
+        !only_elsewhere.is_empty(),
+    )?;
+    Ok(owned)
+}
+
+/// [`existing_volumes_owned_by`] for the read-only and install-time
+/// commands. No usable runtime → an empty list, as before (a machine before
+/// its first install has none); the only error is the ownership refusal.
+pub(crate) async fn existing_volumes_on_storage_runtime(
+    action: &str,
+) -> Result<Vec<ExistingVolume>, String> {
+    let install_root = super::installer::find_local_repo_root().ok();
+    existing_volumes_on_storage_runtime_at(install_root.as_deref(), action).await
+}
+
+/// [`existing_volumes_on_storage_runtime`] with the install root passed in
+/// (tests point it at a temp dir, so no machine's `runtime.txt` leaks in).
+pub(crate) async fn existing_volumes_on_storage_runtime_at(
+    install_root: Option<&Path>,
+    action: &str,
+) -> Result<Vec<ExistingVolume>, String> {
+    match super::storage_ux::storage_runtime_at(install_root).await {
+        Ok(rt) => existing_volumes_owned_by(&rt, action).await,
+        Err(e) => {
+            tracing::info!("[volumes] no usable container runtime ({e}); no existing volumes");
+            Ok(Vec::new())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands
+// ---------------------------------------------------------------------------
+
+/// Read the current volume configuration. Reads `launcher.toml`, probes
+/// existing volumes, and computes per-volume sizes.
+#[command]
+pub async fn get_volumes_config() -> Result<VolumesConfig, String> {
+    let cfg = read_launcher_config();
+    let existing = existing_volumes_on_storage_runtime("inspect").await?;
+
+    // Compute per-volume sizes by `du`-walking each mountpoint.
+    let mut volumes: Vec<VolumeWithSize> = Vec::new();
+    let mut total: u64 = 0;
+    let mut have_any_size = false;
+    for ev in &existing {
+        let mount = PathBuf::from(&ev.mountpoint);
+        let size = dir_size_bytes(&mount);
+        if let Some(s) = size {
+            total = total.saturating_add(s);
+            have_any_size = true;
+        }
+        volumes.push(VolumeWithSize {
+            name: ev.name.clone(),
+            mountpoint: ev.mountpoint.clone(),
+            size_bytes: size,
+            size_human: size.map(human_bytes),
+            role: volume_role(&ev.name).to_string(),
+        });
+    }
+
+    // Mode classification — purely from the persisted toml.
+    let mode = match cfg.volumes_path.as_str() {
+        "" | "default" => "default".to_string(),
+        "detected" => "detected".to_string(),
+        _ => "custom".to_string(),
+    };
+
+    Ok(VolumesConfig {
+        volumes_path: cfg.volumes_path.clone(),
+        mode,
+        legacy_mapping: cfg.legacy_mapping.clone(),
+        total_size_human: if have_any_size {
+            Some(human_bytes(total))
+        } else {
+            None
+        },
+        volumes,
+    })
+}
+
+/// Persist a chosen volumes configuration AT INSTALL TIME (i.e. before
+/// any container has touched the new path). Onboarding step 3 calls this
+/// after the user clicks "Install" and a custom path was selected.
+///
+/// Behavior:
+///   - If existing volumes are detected: ALWAYS sets mode="detected" and
+///     records the legacy mapping. The `path` argument is ignored (per
+///     Bug 32 contract — no override generated).
+///   - Else if `path == "default"` or empty: mode="default", no override.
+///   - Else: validates the custom path, generates the bind-mount override,
+///     writes launcher.toml.
+#[command]
+pub async fn set_volumes_config_for_install(
+    path: String,
+) -> Result<VolumesConfig, String> {
+    // Read existing first — if anything is found, we go down the
+    // "detected" branch regardless of what the caller passed.
+    let existing = existing_volumes_on_storage_runtime("adopt").await?;
+    if !existing.is_empty() {
+        let mut mapping: Vec<LegacyVolumeMapping> = Vec::new();
+        for ev in &existing {
+            mapping.push(LegacyVolumeMapping {
+                volume_name: ev.name.clone(),
+                mountpoint: ev.mountpoint.clone(),
+                role: volume_role(&ev.name).to_string(),
+            });
+        }
+        // If any of the detected volumes are HISTORICAL (not canonical),
+        // generate an external-alias override so compose picks them up
+        // by name. Canonical volumes need no override.
+        let mut external_pairs: Vec<(String, String)> = Vec::new();
+        let canonical = ["weaviate_data", "ollama_data", "code_embed_cache"];
+        for ev in &existing {
+            if canonical.contains(&ev.name.as_str()) {
+                continue;
+            }
+            let role = volume_role(&ev.name);
+            if let Some(can) = canonical_for_role(role) {
+                external_pairs.push((can.to_string(), ev.name.clone()));
+            }
+        }
+        if !external_pairs.is_empty() {
+            let body = generate_override_yaml(&OverrideShape::ExternalLegacy(external_pairs));
+            write_compose_override(&body)?;
+        } else {
+            // All detected volumes are canonical — no override needed.
+            // Make sure we don't have a stale one lying around.
+            remove_compose_override()?;
+        }
+        let cfg = LauncherConfig {
+            volumes_path: "detected".to_string(),
+            legacy_mapping: mapping,
+        };
+        write_launcher_config(&cfg)?;
+        return get_volumes_config().await;
+    }
+
+    // Fresh install — honor the user's choice.
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "default" {
+        // Default: no override, no custom path recorded.
+        remove_compose_override()?;
+        let cfg = LauncherConfig {
+            volumes_path: "default".to_string(),
+            legacy_mapping: Vec::new(),
+        };
+        write_launcher_config(&cfg)?;
+        return get_volumes_config().await;
+    }
+
+    let validated = validate_custom_volumes_path(trimmed)?;
+    // Create the leaf folder + the three role subfolders so podman doesn't
+    // refuse to bind-mount missing dirs.
+    for sub in &["weaviate", "ollama", "code_embed"] {
+        let p = validated.join(sub);
+        std::fs::create_dir_all(&p)
+            .map_err(|e| format!("create {}: {}", p.display(), e))?;
+    }
+    let body = generate_override_yaml(&OverrideShape::CustomBindMounts(validated.clone()));
+    write_compose_override(&body)?;
+
+    // Also write VCT_VOLUMES_PATH into infrastructure/.env so compose
+    // resolves the ${VCT_VOLUMES_PATH} placeholder.
+    write_volumes_env_var(&validated)?;
+
+    let cfg = LauncherConfig {
+        volumes_path: validated.to_string_lossy().to_string(),
+        legacy_mapping: Vec::new(),
+    };
+    write_launcher_config(&cfg)?;
+    get_volumes_config().await
+}
+
+/// Append/update `VCT_VOLUMES_PATH=<path>` in `infrastructure/.env` (or
+/// create the file). Other env keys are preserved. v0.2.97 (review R5 F40):
+/// through the ONE writer of that file, `vco_lib.compose_env`
+/// (`services::vco_lib_bridge::set_infrastructure_env_key`) — this was a
+/// second, Rust read-modify-write of it.
+fn write_volumes_env_var(path: &Path) -> Result<(), String> {
+    let root = orchestrator_root()?;
+    crate::services::vco_lib_bridge::set_infrastructure_env_key(
+        Some(&root),
+        &root.join("infrastructure"),
+        "VCT_VOLUMES_PATH",
+        &path.display().to_string(),
+    )
+    .map(|_| ())
+}
+
+/// Build a migration plan WITHOUT touching anything. Frontend renders
+/// this in the confirm dialog before the user clicks "Migrate".
+#[command]
+pub async fn set_volumes_config_dry_run(path: String) -> Result<MigrationPlan, String> {
+    let cfg = read_launcher_config();
+    let existing = existing_volumes_on_storage_runtime("plan a migration of").await?;
+
+    let target = if path.trim() == "default" || path.trim().is_empty() {
+        // Migrating BACK to default: target path is the runtime default.
+        // We surface this as "default" mode in the plan; cp -a still has
+        // to move data into the runtime-managed tree, which means the
+        // user needs to opt in explicitly.
+        directories::UserDirs::new()
+            .map(|d| d.home_dir().join(".local/share/containers/storage/volumes"))
+            .ok_or("could not resolve home dir")?
+    } else {
+        validate_custom_volumes_path(path.trim())?
+    };
+
+    let mut volumes: Vec<VolumeWithSize> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for ev in &existing {
+        let mount = PathBuf::from(&ev.mountpoint);
+        let size = dir_size_bytes(&mount);
+        if let Some(s) = size {
+            total_bytes = total_bytes.saturating_add(s);
+        }
+        volumes.push(VolumeWithSize {
+            name: ev.name.clone(),
+            mountpoint: ev.mountpoint.clone(),
+            size_bytes: size,
+            size_human: size.map(human_bytes),
+            role: volume_role(&ev.name).to_string(),
+        });
+    }
+
+    // 100 MB/s assumption for ETA. Round up.
+    let estimated_seconds = (total_bytes / (100 * 1024 * 1024)).max(1);
+
+    let free = free_bytes_at(&target);
+    let insufficient = match free {
+        Some(f) => f < total_bytes.saturating_mul(110) / 100,
+        None => false,
+    };
+
+    let mut warnings: Vec<String> = Vec::new();
+    if !existing.is_empty() {
+        warnings.push(format!(
+            "Migration will copy {} from {} existing volumes to {}, then remove the original volumes ONLY after the new bind-mounts come up healthy.",
+            human_bytes(total_bytes),
+            existing.len(),
+            target.display(),
+        ));
+    } else {
+        warnings.push("No existing orchestrator volumes detected — nothing to migrate. Use the install flow's volume picker for fresh setups.".into());
+    }
+    if insufficient {
+        warnings.push(format!(
+            "Insufficient free space at target: {} available vs {} required (need 10% headroom).",
+            free.map(human_bytes).unwrap_or_else(|| "?".into()),
+            human_bytes(total_bytes.saturating_mul(110) / 100),
+        ));
+    }
+
+    let from_mode = match cfg.volumes_path.as_str() {
+        "" | "default" => "default".to_string(),
+        "detected" => "detected".to_string(),
+        _ => "custom".to_string(),
+    };
+
+    Ok(MigrationPlan {
+        from_mode,
+        to_path: target.to_string_lossy().to_string(),
+        volumes_to_copy: volumes,
+        total_bytes,
+        total_human: human_bytes(total_bytes),
+        estimated_seconds,
+        free_bytes_at_target: free,
+        insufficient_free_space: insufficient,
+        warnings,
+    })
+}
+
+/// Migrate volumes from their current location to `path`. ONLY callable
+/// from the Settings UI with `confirmed=true`. Performs the unsafe
+/// `volume rm` of legacy volumes ONLY after new bind-mounts are verified
+/// healthy via HTTP probes. On any failure between `down` and verified
+/// `up -d`, the override file is removed and old volumes are left
+/// untouched.
+///
+/// This is the ONLY function in the launcher that calls
+/// `podman/docker volume rm`. The non-destructive audit guard
+/// `test_no_destructive_subprocess_calls_in_install_path` is scoped to
+/// install-path files and explicitly excludes this module.
+///
+/// Implementation note: this command performs blocking subprocess work
+/// (compose down, cp -a, compose up -d) which can take minutes. Frontend
+/// must show a progress indicator. We intentionally do NOT background
+/// the work — the user explicitly requested migration; failure here
+/// must be reported synchronously so the rollback path is taken.
+#[command]
+pub async fn migrate_volumes(
+    app: AppHandle,
+    path: String,
+    confirmed: bool,
+) -> Result<(), String> {
+    if !confirmed {
+        return Err("migration requires confirmed=true".into());
+    }
+
+    // Volume migration is Linux-only for v0.1.0. The pipeline shells out
+    // to POSIX `cp -a` (line ~838) and assumes podman/docker host bind-mount
+    // semantics that differ on Windows (Docker Desktop) and macOS. The
+    // launcher still detects volumes on those OSes (read-only) but the
+    // destructive migration path is gated. Cross-OS migration is on the
+    // post-launch backlog — see Stage 8 audit (2026-04-26).
+    if cfg!(target_os = "windows") || cfg!(target_os = "macos") {
+        return Err(
+            "volume migration is currently Linux-only; on Windows/macOS \
+             move volumes manually via Docker Desktop / Podman Desktop. \
+             Tracked: github.com/hotak92/vibecoded-orchestrator/issues (cross-OS volume migration)"
+                .into(),
+        );
+    }
+
+    // Build a fresh plan and re-validate; the dry-run might have been
+    // computed minutes ago and the disk situation could have changed.
+    let _plan = set_volumes_config_dry_run(path.clone()).await?;
+    let target = validate_custom_volumes_path(path.trim())?;
+
+    // The shared pin-first runtime (v0.2.97 owner ruling "Honour the pin"),
+    // and only the volumes THAT runtime owns — refused before anything stops
+    // when they exist only under the other one.
+    let storage = super::storage_ux::storage_runtime().await?;
+    let existing = existing_volumes_owned_by(&storage, "migrate").await?;
+    let runtime = storage.name;
+    if existing.is_empty() {
+        return Err("no existing volumes to migrate".into());
+    }
+
+    // 1. Stop services. NOTE: NO `--volumes` flag — this only stops
+    //    containers, leaves volumes intact.
+    emit_phase(&app, MigratePhase::StoppingContainers, "Stopping containers");
+    let compose_dir = orchestrator_root()?.join("infrastructure");
+    let compose_status = tokio::process::Command::new(&runtime).silent()
+        .args(["compose", "stop"])
+        .current_dir(&compose_dir)
+        .status()
+        .await
+        .map_err(|e| format!("compose stop spawn: {}", e))?;
+    if !compose_status.success() {
+        emit_phase(
+            &app,
+            MigratePhase::RollingBack { reason: "compose stop failed".into() },
+            "Rolling back",
+        );
+        return Err(format!("compose stop failed (status {})", compose_status));
+    }
+
+    // 2. cp -a each volume's mountpoint to <target>/<role>.
+    let total = existing.len() as u32;
+    for (i, ev) in existing.iter().enumerate() {
+        let role = volume_role(&ev.name);
+        emit_phase(
+            &app,
+            MigratePhase::CopyingVolume {
+                volume_role: role.into(),
+                index: (i as u32) + 1,
+                total,
+            },
+            &format!("Copying {} ({}/{})", role, i + 1, total),
+        );
+        let dest = target.join(role);
+        if let Err(e) = std::fs::create_dir_all(&dest) {
+            emit_phase(
+                &app,
+                MigratePhase::RollingBack { reason: format!("create dest: {}", e) },
+                "Rolling back",
+            );
+            // Failure BEFORE we changed anything substantive — try to
+            // bring services back up with the old volumes and bail.
+            let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
+            return Err(format!(
+                "create dest {}: {} (rolled back; old volumes intact)",
+                dest.display(),
+                e
+            ));
+        }
+        let cp_status = tokio::process::Command::new("cp").silent()
+            .args(["-a", &ev.mountpoint, dest.to_str().unwrap_or("")])
+            .status()
+            .await;
+        match cp_status {
+            Ok(s) if s.success() => {}
+            other => {
+                emit_phase(
+                    &app,
+                    MigratePhase::RollingBack { reason: format!("cp -a failed: {:?}", other) },
+                    "Rolling back",
+                );
+                // Rollback: remove the override (if we wrote one yet —
+                // we haven't at this point), and bring services up with
+                // old volumes.
+                let _ = remove_compose_override();
+                let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
+                return Err(format!(
+                    "cp -a {} -> {} failed: {:?} (rolled back; old volumes intact)",
+                    ev.mountpoint,
+                    dest.display(),
+                    other
+                ));
+            }
+        }
+    }
+
+    // 3. Write the bind-mount override + .env entry.
+    emit_phase(&app, MigratePhase::WritingOverride, "Writing compose override");
+    let body = generate_override_yaml(&OverrideShape::CustomBindMounts(target.clone()));
+    if let Err(e) = write_compose_override(&body) {
+        emit_phase(&app, MigratePhase::RollingBack { reason: e.clone() }, "Rolling back");
+        let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
+        return Err(format!("{} (rolled back; old volumes intact)", e));
+    }
+    if let Err(e) = write_volumes_env_var(&target) {
+        emit_phase(&app, MigratePhase::RollingBack { reason: e.clone() }, "Rolling back");
+        let _ = remove_compose_override();
+        let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
+        return Err(format!("{} (rolled back; old volumes intact)", e));
+    }
+
+    // 4. compose up -d. If it fails, ditch the override + .env entry
+    //    and restart with old volumes.
+    emit_phase(&app, MigratePhase::StartingContainers, "Starting containers");
+    let up_status = tokio::process::Command::new(&runtime).silent()
+        .args(["compose", "up", "-d"])
+        .current_dir(&compose_dir)
+        .status()
+        .await;
+    let up_ok = matches!(&up_status, Ok(s) if s.success());
+    if !up_ok {
+        emit_phase(
+            &app,
+            MigratePhase::RollingBack { reason: format!("compose up failed: {:?}", up_status) },
+            "Rolling back",
+        );
+        let _ = remove_compose_override();
+        let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
+        return Err(format!(
+            "compose up -d with new bind-mounts failed: {:?} (rolled back; old volumes intact)",
+            up_status
+        ));
+    }
+
+    // 5. Verify health by probing the standard endpoints, for up to
+    //    MIGRATE_HEALTH_WAIT with a progress event every
+    //    MIGRATE_HEALTH_PROGRESS_EVERY (v0.2.101 review S7 — it was a flat
+    //    60 s, a dev-machine ceiling under which a slow disk could never
+    //    finish a migration). A genuine failure still rolls back.
+    if let Err(reason) = migrate_health_step(
+        &healthy_probe_targets(),
+        MIGRATE_HEALTH_WAIT,
+        MIGRATE_HEALTH_POLL,
+        MIGRATE_HEALTH_PROGRESS_EVERY,
+        &mut |phase, message| emit_phase(&app, phase, message),
+    )
+    .await
+    {
+        let _ = remove_compose_override();
+        let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
+        return Err(format!(
+            "{} on the new bind-mounts (rolled back; old volumes intact)",
+            reason
+        ));
+    }
+
+    // 6. New bind-mounts verified healthy. NOW we may safely remove the
+    //    legacy volumes — they're no longer referenced.
+    emit_phase(&app, MigratePhase::RemovingLegacyVolumes, "Cleaning up legacy volumes");
+    for ev in &existing {
+        // Skip canonical names: those are the same names we just bound,
+        // not "legacy" — removing them would point compose's volume
+        // declaration at nothing. Only remove historical names.
+        let canonical = ["weaviate_data", "ollama_data", "code_embed_cache"];
+        if canonical.contains(&ev.name.as_str()) {
+            continue;
+        }
+        let _ = tokio::process::Command::new(&runtime).silent()
+            .args(["volume", "rm", &ev.name])
+            .status()
+            .await;
+    }
+
+    // 7. Persist the new config.
+    let cfg = LauncherConfig {
+        volumes_path: target.to_string_lossy().to_string(),
+        legacy_mapping: Vec::new(),
+    };
+    write_launcher_config(&cfg)?;
+    emit_phase(&app, MigratePhase::Done, "Migration complete");
+    Ok(())
+}
+
+/// Tries to `compose up -d` again after a migration step failed. Best
+/// effort — used during rollback so even if it fails the user knows
+/// what to do (run `podman-compose up -d` themselves).
+async fn restart_services_for_rollback(runtime: &str, compose_dir: &Path) -> Result<(), String> {
+    let status = tokio::process::Command::new(runtime).silent()
+        .args(["compose", "up", "-d"])
+        .current_dir(compose_dir)
+        .status()
+        .await
+        .map_err(|e| format!("rollback compose up spawn: {}", e))?;
+    if !status.success() {
+        return Err(format!("rollback compose up status: {}", status));
+    }
+    Ok(())
+}
+
+// ── Step 5: the post-switch health wait (v0.2.101 review S7) ─────────────
+
+/// How long `migrate_volumes` waits for Weaviate and Ollama to answer after
+/// `compose up -d` on the new bind-mounts, before it rolls back.
+///
+/// It was a flat 60 s — a ceiling set by a fast dev machine. Weaviate loads
+/// every shard of its data folder before `/v1/meta` answers, so a large data
+/// folder that was just `cp -a`'d to a slow disk (a USB drive, a network
+/// mount, a cold HDD) can legitimately take many minutes; under 60 s that
+/// machine rolled back every attempt and could NEVER migrate (the owner's
+/// timeout rule: shipped timeouts are sized for the slowest legitimate
+/// machine, not the developer's). 30 min is a bound for a GENUINE failure
+/// (a service that crash-loops on its new mount), not a performance
+/// estimate; the wait ends the moment both services answer, and the user
+/// sees a progress line every [`MIGRATE_HEALTH_PROGRESS_EVERY`] naming what
+/// is still pending, so a long wait is never a silent spinner.
+const MIGRATE_HEALTH_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Interval between probe rounds during the health wait.
+const MIGRATE_HEALTH_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the health wait re-emits its `WaitingForHealth` progress line.
+const MIGRATE_HEALTH_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One service the health wait probes: the name its progress line uses and
+/// the health URL it polls.
+struct HealthTarget {
+    label: &'static str,
+    url: String,
+}
+
+/// Weaviate and Ollama at their `service_endpoints` rows (v0.2.97) — the
+/// literals 8081 / 11435 it used before timed out on a machine whose
+/// services live elsewhere.
+fn healthy_probe_targets() -> Vec<HealthTarget> {
+    use vct_launcher_core::services::service_endpoints::{machine_row_from_disk, CoreService};
+    use vct_launcher_core::services::service_status::health_url;
+    [(CoreService::Weaviate, "Weaviate"), (CoreService::Ollama, "Ollama")]
+        .into_iter()
+        .map(|(s, label)| HealthTarget {
+            label,
+            url: health_url(s, machine_row_from_disk(s).as_ref()),
+        })
+        .collect()
+}
+
+/// The health URLs the wait polls (derived from [`healthy_probe_targets`]).
+#[cfg(test)]
+fn healthy_probe_urls() -> Vec<String> {
+    healthy_probe_targets().into_iter().map(|t| t.url).collect()
+}
+
+/// How a health wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum HealthWaitOutcome {
+    /// Every target answered 2xx (a redirect is never followed — `probe_http`).
+    Healthy,
+    /// The bound elapsed; these targets had still not answered.
+    TimedOut { pending: Vec<&'static str> },
+    /// A target's URL cannot even be probed (no client can be built for it).
+    /// Permanent — waiting longer cannot fix it — so the wait stops at once.
+    Unprobeable(String),
+}
+
+/// The labels of the targets that do not answer 2xx right now.
+async fn pending_health_targets(targets: &[HealthTarget]) -> Result<Vec<&'static str>, String> {
+    let mut pending = Vec::new();
+    for t in targets {
+        let client = vct_launcher_core::services::loopback_http::client_for(
+            &t.url,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|e| format!("{} health URL {}: {}", t.label, t.url, e))?;
+        match client.get(t.url.as_str()).send().await {
+            Ok(r) if vct_launcher_core::services::probe_http::answered(r.status()) => {}
+            _ => pending.push(t.label),
+        }
+    }
+    Ok(pending)
+}
+
+/// Poll `targets` every `poll` until all answer or `timeout` elapses,
+/// calling `on_progress` with a "still waiting" line every `progress_every`
+/// while any target is pending.
+async fn wait_for_health(
+    targets: &[HealthTarget],
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+    progress_every: std::time::Duration,
+    on_progress: &mut impl FnMut(&str),
+) -> HealthWaitOutcome {
+    use vct_launcher_core::units::human_duration_secs;
+    let started = std::time::Instant::now();
+    let deadline = started + timeout;
+    let mut last_progress = started;
+    loop {
+        let pending = match pending_health_targets(targets).await {
+            Ok(p) => p,
+            Err(e) => return HealthWaitOutcome::Unprobeable(e),
+        };
+        if pending.is_empty() {
+            return HealthWaitOutcome::Healthy;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return HealthWaitOutcome::TimedOut { pending };
+        }
+        if now.duration_since(last_progress) >= progress_every {
+            last_progress = now;
+            on_progress(&format!(
+                "Waiting for services to come up — {} not answering yet ({} of up to {}; \
+                 a large data folder on a slow disk can take several minutes)",
+                pending.join(" and "),
+                human_duration_secs(now.duration_since(started).as_secs()),
+                human_duration_secs(timeout.as_secs()),
+            ));
+        }
+        tokio::time::sleep(poll.min(deadline - now)).await;
+    }
+}
+
+/// Step 5 of `migrate_volumes`, minus the rollback itself: emit the
+/// `WaitingForHealth` phase (once up front, then as periodic progress), wait,
+/// and on failure emit `RollingBack` and return the reason. `Ok(())` means
+/// the new bind-mounts are healthy and the legacy volumes may be removed.
+/// The caller performs the rollback on `Err`, so the override cleanup stays
+/// visible at its one call site.
+async fn migrate_health_step(
+    targets: &[HealthTarget],
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+    progress_every: std::time::Duration,
+    emit: &mut impl FnMut(MigratePhase, &str),
+) -> Result<(), String> {
+    use vct_launcher_core::units::human_duration_secs;
+    emit(
+        MigratePhase::WaitingForHealth,
+        &format!(
+            "Waiting for services to come up (up to {})",
+            human_duration_secs(timeout.as_secs())
+        ),
+    );
+    let outcome = wait_for_health(targets, timeout, poll, progress_every, &mut |message| {
+        emit(MigratePhase::WaitingForHealth, message)
+    })
+    .await;
+    let reason = match outcome {
+        HealthWaitOutcome::Healthy => return Ok(()),
+        HealthWaitOutcome::TimedOut { pending } => format!(
+            "{} did not come up healthy within {}",
+            pending.join(" and "),
+            human_duration_secs(timeout.as_secs())
+        ),
+        HealthWaitOutcome::Unprobeable(e) => format!("health probe unusable: {}", e),
+    };
+    emit(MigratePhase::RollingBack { reason: reason.clone() }, "Rolling back");
+    Err(reason)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod cli_helper_tests {
     use super::*;
@@ -1120,38 +2300,11 @@ pub struct MigrationOutcome {
     pub deferral_emitted: bool,
 }
 
-fn dir_size_bytes(path: &Path) -> u64 {
-    if !path.exists() {
-        return 0;
-    }
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return 0,
-    };
-    if !meta.is_dir() {
-        return meta.len();
-    }
-    let mut total: u64 = 0;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let m = match std::fs::symlink_metadata(&p) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if m.is_dir() {
-                stack.push(p);
-            } else {
-                total = total.saturating_add(m.len());
-            }
-        }
-    }
-    total
+// v0.2.101 (Q4b merge dedup): this used to be a SECOND recursive size
+// walker identical to the `dir_size_bytes` above except for collapsing
+// misses to 0. One walker, one home; the lossy spelling is a wrapper.
+fn dir_size_bytes_lossy(path: &Path) -> u64 {
+    dir_size_bytes(path).unwrap_or(0)
 }
 
 /// Copy `source` (a bind directory) into the host-side mountpoint of a
@@ -1247,7 +2400,7 @@ pub async fn migrate_to_named_volume(
         .status()
         .await
         .map_err(|e| format!("cp -a spawn: {e}"))?;
-    let copied = dir_size_bytes(&source);
+    let copied = dir_size_bytes_lossy(&source);
 
     if !status.success() {
         let cmd = format!("cp -a '{}/.' '{}'", source.display(), mountpoint);
@@ -1358,7 +2511,7 @@ pub async fn migrate_to_bind_path(
         .status()
         .await
         .map_err(|e| format!("cp -a spawn: {e}"))?;
-    let copied = dir_size_bytes(Path::new(&mountpoint));
+    let copied = dir_size_bytes_lossy(Path::new(&mountpoint));
 
     if !status.success() {
         let cmd = format!("cp -a '{}/.' '{}'", mountpoint, target.display());
@@ -1401,7 +2554,7 @@ pub async fn migrate_to_bind_path(
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Test support shared with `commands::volumes`: fake `podman`/`docker`
+/// Test support for both halves of this module: fake `podman`/`docker`
 /// scripts on a per-thread injected lookup PATH, so the shared runtime
 /// detector and the volume probes can be driven without a real runtime and
 /// without touching the process `PATH`.
@@ -2216,5 +3369,720 @@ mod tests {
             resolved.ends_with(".vct"),
             "expected default ~/.vct fallback, got {resolved:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod volumes_tests {
+    use super::*;
+
+    // ----- v0.2.97 owner ruling "Honour the pin" ---------------------------
+
+    #[cfg(unix)]
+    use crate::commands::storage_ux::fake_runtime_support::{fake_runtime, with_fake_runtimes};
+    #[cfg(unix)]
+    use crate::commands::storage_ux::StorageRuntime;
+    #[cfg(unix)]
+    use vct_launcher_core::services::container_runtime::RuntimePinSource;
+
+    /// docker is pinned but the orchestrator volumes exist only under podman:
+    /// the migration is REFUSED (naming both runtimes and the fix) instead of
+    /// the pre-v0.2.97 behaviour — list podman's volumes, then drive podman.
+    #[cfg(unix)]
+    #[test]
+    fn volumes_only_the_other_runtime_owns_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data", "ollama_data"]);
+        fake_runtime(dir.path(), "docker", &[]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let err = with_fake_runtimes(dir.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"))
+            .unwrap_err();
+        for needle in [
+            "refusing to migrate the orchestrator volume(s) `weaviate_data`, `ollama_data`",
+            "exists only under podman",
+            "VCT_CONTAINER_RUNTIME=docker",
+            "set VCT_CONTAINER_RUNTIME=podman",
+        ] {
+            assert!(err.contains(needle), "{needle:?} missing from {err:?}");
+        }
+    }
+
+    /// R7b F4 — the MIXED case: docker (pinned) owns `ollama_data`,
+    /// `weaviate_data` exists only under podman. The refusal is per volume:
+    /// it names `weaviate_data` and only it. Before, docker owning ANY
+    /// orchestrator volume meant podman was never asked, and the migration
+    /// went ahead without `weaviate_data`.
+    #[cfg(unix)]
+    #[test]
+    fn a_volume_only_the_other_runtime_owns_is_refused_even_beside_owned_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &["ollama_data"]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let err = with_fake_runtimes(dir.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"))
+            .unwrap_err();
+        assert!(
+            err.contains("refusing to migrate the orchestrator volume(s) `weaviate_data`:"),
+            "{err}"
+        );
+        assert!(!err.contains("`ollama_data`"), "a volume docker owns was named: {err}");
+    }
+
+    /// Leave-alone: the runtime VCO drives owns the volumes → exactly its
+    /// copies, even when the other runtime also has some; nobody has any →
+    /// an empty list, not a refusal.
+    #[cfg(unix)]
+    #[test]
+    fn volumes_the_chosen_runtime_owns_are_used() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &["weaviate_data", "ollama_data"]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let found = with_fake_runtimes(dir.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"))
+            .unwrap();
+        let mounts: Vec<&str> = found.iter().map(|v| v.mountpoint.as_str()).collect();
+        assert_eq!(mounts, ["/fake/docker/weaviate_data", "/fake/docker/ollama_data"]);
+
+        let empty = tempfile::tempdir().unwrap();
+        fake_runtime(empty.path(), "podman", &[]);
+        fake_runtime(empty.path(), "docker", &[]);
+        let none = with_fake_runtimes(empty.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"));
+        assert!(none.unwrap().is_empty());
+    }
+
+    /// The read-only commands go through the pin: with docker pinned they
+    /// list docker's volumes, not podman's; unpinned they still list
+    /// podman's first; a recorded `runtime.txt` pins like the env does. The
+    /// install root is a temp dir, so this machine's own `runtime.txt` (a
+    /// developer checkout may have one) cannot change the answer.
+    #[cfg(unix)]
+    #[test]
+    fn listing_follows_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &["weaviate_data"]);
+        let root = tempfile::tempdir().unwrap();
+        use crate::commands::storage_ux::fake_runtime_support::use_checkout_vco_lib;
+        use_checkout_vco_lib(root.path());
+        let list = |pin: Option<&str>| {
+            with_fake_runtimes(dir.path(), pin, async {
+                // The verdict cache keys (root, mode, purpose) — no pin — so
+                // each ask must not replay the previous one's answer.
+                vct_launcher_core::services::runtime_verdict::invalidate();
+                existing_volumes_on_storage_runtime_at(Some(root.path()), "inspect").await
+            })
+            .unwrap()
+        };
+        assert_eq!(list(Some("docker"))[0].mountpoint, "/fake/docker/weaviate_data");
+        assert_eq!(list(None)[0].mountpoint, "/fake/podman/weaviate_data");
+
+        std::fs::create_dir_all(root.path().join("state/install")).unwrap();
+        std::fs::write(root.path().join("state/install/runtime.txt"), "docker\n").unwrap();
+        assert_eq!(list(None)[0].mountpoint, "/fake/docker/weaviate_data");
+    }
+
+    /// Replace every Python triple-quoted docstring (both """ and ''')
+    /// with whitespace of the same length. Used by the source-level
+    /// `volume rm` audit so docstrings explaining the command's
+    /// semantics don't false-positive as actual invocations.
+    fn strip_python_docstrings(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let bytes = src.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let three_double = i + 3 <= bytes.len() && &bytes[i..i + 3] == b"\"\"\"";
+            let three_single = i + 3 <= bytes.len() && &bytes[i..i + 3] == b"'''";
+            if three_double || three_single {
+                let marker: &[u8] = if three_double { b"\"\"\"" } else { b"'''" };
+                // Find closing marker.
+                let start = i + 3;
+                let mut j = start;
+                while j + 3 <= bytes.len() {
+                    if &bytes[j..j + 3] == marker {
+                        break;
+                    }
+                    j += 1;
+                }
+                // Replace from i..end with spaces (preserve newlines).
+                let end = (j + 3).min(bytes.len());
+                for k in i..end {
+                    if bytes[k] == b'\n' {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                }
+                i = end;
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn launcher_config_roundtrip_with_detected_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        // Override config path via the env-aware helper would require
+        // refactoring; instead we test serialization round-trip directly,
+        // which is what `read_launcher_config` does internally.
+        // Sample mountpoints only round-tripped through TOML — not opened —
+        // but pick host-appropriate placeholders so the strings aren't
+        // ambiguous on Windows.
+        let (mp_weav, mp_oll): (String, String) = if cfg!(windows) {
+            (
+                r"C:\Users\example\podman_volumes\weaviate_claude".to_string(),
+                r"C:\Users\example\podman_volumes\ollama_claude".to_string(),
+            )
+        } else {
+            (
+                "/home/example/podman_volumes/weaviate_claude".to_string(),
+                "/home/example/podman_volumes/ollama_claude".to_string(),
+            )
+        };
+        let cfg = LauncherConfig {
+            volumes_path: "detected".to_string(),
+            legacy_mapping: vec![
+                LegacyVolumeMapping {
+                    volume_name: "weaviate_claude".to_string(),
+                    mountpoint: mp_weav,
+                    role: "weaviate".to_string(),
+                },
+                LegacyVolumeMapping {
+                    volume_name: "ollama_claude".to_string(),
+                    mountpoint: mp_oll,
+                    role: "ollama".to_string(),
+                },
+            ],
+        };
+        let body = toml::to_string_pretty(&cfg).unwrap();
+        let decoded: LauncherConfig = toml::from_str(&body).unwrap();
+        assert_eq!(decoded.volumes_path, "detected");
+        assert_eq!(decoded.legacy_mapping.len(), 2);
+        assert_eq!(decoded.legacy_mapping[0].volume_name, "weaviate_claude");
+        assert_eq!(decoded.legacy_mapping[0].role, "weaviate");
+        // Persist+reload via real disk path under a tempdir so we cover
+        // the atomic-write helpers too.
+        let cfg_path = dir.path().join(".vct").join("launcher.toml");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(&cfg_path, &body).unwrap();
+        let raw = std::fs::read_to_string(&cfg_path).unwrap();
+        let decoded2: LauncherConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(decoded2.legacy_mapping[1].volume_name, "ollama_claude");
+    }
+
+    #[test]
+    fn override_yaml_for_custom_bind_mounts_has_three_canonical_volumes() {
+        let path = PathBuf::from("/mnt/big-disk/vct-volumes");
+        let body = generate_override_yaml(&OverrideShape::CustomBindMounts(path));
+        // All three canonical volumes named.
+        assert!(body.contains("weaviate_data:"));
+        assert!(body.contains("ollama_data:"));
+        assert!(body.contains("code_embed_cache:"));
+        // Each one has type: none + o: bind (named volume bind-mount idiom).
+        assert_eq!(body.matches("type: none").count(), 3);
+        assert_eq!(body.matches("o: bind").count(), 3);
+        // Uses ${VCT_VOLUMES_PATH} so .env controls the actual path.
+        assert!(body.contains("${VCT_VOLUMES_PATH}/weaviate"));
+        assert!(body.contains("${VCT_VOLUMES_PATH}/ollama"));
+        assert!(body.contains("${VCT_VOLUMES_PATH}/code_embed"));
+        // Comment marker so users + maintainers know this file is
+        // launcher-managed.
+        assert!(body.contains("Auto-generated by VCT Launcher"));
+    }
+
+    #[test]
+    fn override_yaml_for_external_legacy_uses_external_true() {
+        let map = vec![
+            ("weaviate_data".to_string(), "weaviate_claude".to_string()),
+            ("ollama_data".to_string(), "ollama_legacy".to_string()),
+        ];
+        let body = generate_override_yaml(&OverrideShape::ExternalLegacy(map));
+        // Every canonical name aliased via external: true + name: <legacy>.
+        assert!(body.contains("weaviate_data:"));
+        assert!(body.contains("    external: true"));
+        assert!(body.contains("    name: weaviate_claude"));
+        assert!(body.contains("ollama_data:"));
+        assert!(body.contains("    name: ollama_legacy"));
+        // No bind-mount directives — would conflict with external: true.
+        assert!(!body.contains("type: none"));
+        assert!(!body.contains("o: bind"));
+    }
+
+    #[test]
+    fn validate_custom_path_rejects_relative() {
+        let err = validate_custom_volumes_path("relative/path").unwrap_err();
+        assert!(err.contains("absolute"), "got: {}", err);
+    }
+
+    #[test]
+    fn validate_custom_path_rejects_inside_podman_managed_tree() {
+        let home = directories::UserDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_path_buf();
+        let inside = home.join(".local/share/containers/storage/my-stuff");
+        let err = validate_custom_volumes_path(inside.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("Podman") || err.contains("managed storage"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_custom_path_rejects_empty() {
+        let err = validate_custom_volumes_path("").unwrap_err();
+        assert!(err.contains("empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn validate_custom_path_rejects_nonexistent_parent() {
+        let err = validate_custom_volumes_path("/this/does/not/exist/vct").unwrap_err();
+        assert!(
+            err.contains("does not exist") || err.contains("not a directory"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_custom_path_accepts_writable_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pass <tempdir>/vct-volumes — leaf doesn't have to exist, parent does.
+        let p = dir.path().join("vct-volumes");
+        let validated = validate_custom_volumes_path(p.to_str().unwrap()).unwrap();
+        assert_eq!(validated, p);
+    }
+
+    #[test]
+    fn volume_role_classifies_known_names() {
+        assert_eq!(volume_role("weaviate_data"), "weaviate");
+        assert_eq!(volume_role("weaviate_claude"), "weaviate");
+        assert_eq!(volume_role("weaviate_legacy"), "weaviate");
+        assert_eq!(volume_role("ollama_data"), "ollama");
+        assert_eq!(volume_role("ollama_claude"), "ollama");
+        assert_eq!(volume_role("code_embed_cache"), "code_embed");
+        assert_eq!(volume_role("vct_code_embed"), "code_embed");
+        assert_eq!(volume_role("random_garbage"), "unknown");
+    }
+
+    /// Bug 31: when existing volumes are detected, the override-yml is
+    /// generated as `external: true` (legacy alias) and no bind-mount
+    /// shape is emitted. The bind-mount shape would conflict with the
+    /// already-existing named volumes.
+    #[test]
+    fn external_legacy_shape_does_not_emit_bind_mount_keys() {
+        let body = generate_override_yaml(&OverrideShape::ExternalLegacy(vec![(
+            "weaviate_data".into(),
+            "weaviate_claude".into(),
+        )]));
+        for forbidden in ["device:", "type: none", "o: bind", "driver_opts:"] {
+            assert!(
+                !body.contains(forbidden),
+                "ExternalLegacy override must not contain '{}': {}",
+                forbidden,
+                body
+            );
+        }
+    }
+
+    /// Bug 31 + Bug 32 #4: only the migrate-volumes function may invoke
+    /// `volume rm`. Source-level audit: scan the install-path files +
+    /// projects_v2.rs + this storage module itself, and assert that any
+    /// occurrence of `volume rm` outside this module's `migrate_volumes`
+    /// fails the test. Production scan only — test code can mention the
+    /// forbidden literal for documentation.
+    #[test]
+    fn volume_rm_only_callable_from_migrate_volumes() {
+        let repo_root = super::super::installer::find_local_repo_root().expect("repo root");
+        let volumes_rs = repo_root.join("launcher/src-tauri/src/commands/storage_ux.rs");
+        let install_py = repo_root.join("install.py");
+        let install_sh = repo_root.join("install.sh");
+        let installer_rs = repo_root.join("launcher/src-tauri/src/commands/installer.rs");
+
+        // 1. install-path files MUST NOT invoke `volume rm`. We scan
+        //    for actual subprocess-call shapes, not raw substrings: a
+        //    docstring/comment that uses the words "volume rm" for
+        //    documentation purposes is fine — what matters is whether
+        //    the runtime actually executes it. Forbidden shapes:
+        //      "volume", "rm"   — Rust Command::args slice (e.g.
+        //                          ["podman", "volume", "rm", ...])
+        //      "volume rm"      — a single Bash/sh-quoted command line
+        //                          (e.g. `podman volume rm ...` after
+        //                          a shebang or eval)
+        //      However, plain prose in docstrings is OK. We approximate
+        //      "subprocess call" by looking for the literal `volume rm`
+        //      OUTSIDE Python triple-quoted strings and Rust /// doc
+        //      comments — both are non-executing forms.
+        for path in [&install_py, &install_sh, &installer_rs] {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
+            let production = &content[..scan_end];
+            // Strip Python triple-quoted docstrings (both """ and ''') —
+            // they're prose, not executable code.
+            let no_pydocs = strip_python_docstrings(production);
+            // Strip line-comments (Rust // and Python/shell #).
+            let stripped: String = no_pydocs
+                .lines()
+                .map(|line| {
+                    let cut = line.find("//").or_else(|| line.find('#')).unwrap_or(line.len());
+                    &line[..cut]
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !stripped.contains("volume rm") && !stripped.contains("\"volume\", \"rm\""),
+                "FORBIDDEN: 'volume rm' invocation found in {} — \
+                 only migrate_volumes may invoke it",
+                path.display()
+            );
+        }
+
+        // 2. this module may mention `volume rm` — but ONLY inside
+        //    migrate_volumes. Find the function body and check the rest
+        //    of the file is clean.
+        let content = std::fs::read_to_string(&volumes_rs).expect("storage_ux.rs");
+        let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
+        let production = &content[..scan_end];
+        let fn_start = production
+            .find("pub async fn migrate_volumes(")
+            .expect("migrate_volumes defined");
+        // Walk braces from `{` after the signature to find the matching close.
+        let body_open = fn_start + production[fn_start..].find('{').expect("body open") + 1;
+        let mut depth = 1usize;
+        let mut idx = body_open;
+        for ch in production[body_open..].chars() {
+            idx += ch.len_utf8();
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let migrate_body = &production[body_open..idx];
+        let outside_migrate =
+            production[..fn_start].to_string() + &production[idx..];
+        // Strip comments outside the function so doc-comments mentioning
+        // the forbidden form don't fail the audit.
+        let stripped_outside: String = outside_migrate
+            .lines()
+            .map(|line| {
+                let cut = line.find("//").or_else(|| line.find('#')).unwrap_or(line.len());
+                &line[..cut]
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !stripped_outside.contains("\"volume\", \"rm\"")
+                && !stripped_outside.contains("volume rm"),
+            "FORBIDDEN: 'volume rm' outside migrate_volumes in this module"
+        );
+        // Sanity: migrate_volumes IS the function that calls it.
+        assert!(
+            migrate_body.contains("\"volume\", \"rm\""),
+            "expected migrate_volumes to invoke `volume rm` (it's the destructive cleanup step)"
+        );
+    }
+
+    /// Bug 31 dry-run: simulates a migration plan without mutating
+    /// anything. We can't easily inject fake volumes (the detector
+    /// shells out to podman/docker) but we CAN verify the returned plan
+    /// reports a sensible `from_mode` based on launcher.toml and
+    /// validates the target path. Anything that would mutate the
+    /// filesystem should NOT happen during this call.
+    #[test]
+    fn dry_run_validates_target_path_without_mutating() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("vct-volumes-dryrun");
+
+        // Pre-condition: dir doesn't yet exist; dry-run must not create it.
+        assert!(!target.exists());
+
+        // The dry run resolves the storage runtime itself (repo root, the
+        // thread's PATH) — under stubs both runtimes answer with no volumes,
+        // so the plan is deterministic instead of probing this host's
+        // daemons. The cache is invalidated first: another test may have
+        // cached a verdict for the repo-root key.
+        use crate::commands::storage_ux::fake_runtime_support::{fake_runtime, with_fake_runtimes};
+        let stubs = tempfile::tempdir().unwrap();
+        fake_runtime(stubs.path(), "podman", &[]);
+        fake_runtime(stubs.path(), "docker", &[]);
+        let plan = with_fake_runtimes(stubs.path(), None, async {
+            vct_launcher_core::services::runtime_verdict::invalidate();
+            set_volumes_config_dry_run(target.to_string_lossy().to_string()).await
+        })
+        .expect("dry run returns plan");
+        assert!(plan.to_path.contains("vct-volumes-dryrun"));
+        assert!(plan.warnings.iter().any(|w| !w.is_empty()));
+
+        // CRITICAL: dry-run must NOT have created the target dir.
+        assert!(
+            !target.exists(),
+            "dry-run created target dir — this is supposed to be read-only!"
+        );
+    }
+
+    /// Bug 31: rollback semantics. We can't fully integration-test the
+    /// migration without containers + sudo, so we test the STATIC
+    /// guarantee instead: the migration code path always cleans up the
+    /// override file before returning Err. Concretely: the source must
+    /// have a `remove_compose_override()` call on every error branch
+    /// after the override has been written.
+    #[test]
+    fn migration_error_branches_clean_up_override_file() {
+        let repo_root = super::super::installer::find_local_repo_root().expect("repo root");
+        let volumes_rs = repo_root.join("launcher/src-tauri/src/commands/storage_ux.rs");
+        let content = std::fs::read_to_string(&volumes_rs).expect("read storage_ux.rs");
+
+        let fn_start = content
+            .find("pub async fn migrate_volumes(")
+            .expect("migrate_volumes defined");
+        let body_open = fn_start + content[fn_start..].find('{').expect("body open") + 1;
+        // Find matching close brace.
+        let mut depth = 1usize;
+        let mut idx = body_open;
+        for ch in content[body_open..].chars() {
+            idx += ch.len_utf8();
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let migrate_body = &content[body_open..idx];
+
+        // Find the line that writes the override (`write_compose_override(&body)`).
+        let write_idx = migrate_body
+            .find("write_compose_override(&body)")
+            .expect("expected override write inside migrate_volumes");
+        let after_write = &migrate_body[write_idx..];
+
+        // Every `return Err(` past the write site must be preceded
+        // (within ~12 lines back) by either `remove_compose_override`
+        // OR be guarded by a check that compose up succeeded. We do a
+        // simpler pass: count Err returns past the write that appear
+        // WITHOUT a preceding remove_compose_override call.
+        let mut suspicious = 0usize;
+        for (rel, _) in after_write.match_indices("return Err(") {
+            let abs = write_idx + rel;
+            // Look back 1500 bytes for a remove_compose_override call.
+            let lookback_start = abs.saturating_sub(1500);
+            let lookback = &migrate_body[lookback_start..abs];
+            if !lookback.contains("remove_compose_override") {
+                // The very last Err in the function may legitimately be
+                // a final-success-path failure (write_launcher_config),
+                // which happens AFTER volume rm cleanup — no override
+                // to roll back at that point. Filter that one out by
+                // checking if "volume", "rm" appears between lookback
+                // and the err.
+                if !lookback.contains("\"volume\", \"rm\"") {
+                    suspicious += 1;
+                }
+            }
+        }
+        assert_eq!(
+            suspicious, 0,
+            "found {} `return Err(...)` past the override-write without rollback cleanup",
+            suspicious
+        );
+    }
+
+    /// SE-4 red-proof (6): `wait_for_health` (over `healthy_probe_targets`) polls Weaviate and Ollama
+    /// where their `service_endpoints` ROWS say — here two live mocks on
+    /// non-default ports. Red against the literal 8081 / 11435 it polled
+    /// before (nothing answers there in a harness; it would time out).
+    #[tokio::test]
+    async fn wait_until_healthy_probes_the_rows() {
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        async fn mock(path: &'static str) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let app = axum::Router::new().route(path, axum::routing::get(|| async { "{}" }));
+                let _ = axum::serve(listener, app).await;
+            });
+            port
+        }
+        let weaviate_port = mock("/v1/meta").await;
+        let ollama_port = mock("/api/tags").await;
+        let db = crate::db::Db::open().unwrap();
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let mut w = ServiceEndpointRow::new("weaviate", EndpointMode::VcoManaged, "127.0.0.1", weaviate_port);
+        w.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&w).unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::VcoManaged,
+            "127.0.0.1",
+            ollama_port,
+        ))
+        .unwrap();
+        assert_eq!(
+            healthy_probe_urls(),
+            vec![
+                format!("http://127.0.0.1:{}/v1/meta", weaviate_port),
+                format!("http://127.0.0.1:{}/api/tags", ollama_port),
+            ]
+        );
+        assert_eq!(
+            wait_for_health(
+                &healthy_probe_targets(),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(60),
+                &mut |_| {},
+            )
+            .await,
+            HealthWaitOutcome::Healthy,
+            "both rows' endpoints answer"
+        );
+    }
+
+    // ── v0.2.101 review S7: the post-switch health wait ──────────────────
+
+    /// A mock health endpoint that answers 503 to its first `slow_for`
+    /// requests and 200 afterwards — Weaviate still loading its shards.
+    async fn slow_then_healthy(slow_for: usize) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v1/meta",
+                axum::routing::get(move || {
+                    let hits = hits.clone();
+                    async move {
+                        if hits.fetch_add(1, Ordering::SeqCst) < slow_for {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            axum::http::StatusCode::OK
+                        }
+                    }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}/v1/meta", port)
+    }
+
+    fn phase_name(p: &MigratePhase) -> &'static str {
+        match p {
+            MigratePhase::WaitingForHealth => "waiting_for_health",
+            MigratePhase::RollingBack { .. } => "rolling_back",
+            _ => "other",
+        }
+    }
+
+    /// The bound itself is pinned: the owner's timeout rule puts it at no
+    /// less than 15 min. (Red-proof mutation: restore the old 60 s and this
+    /// fails.) A progress line must also fire well inside it, and more than
+    /// once per minute, so a long wait is never a silent spinner.
+    #[test]
+    fn migrate_health_wait_is_sized_for_slow_disks_and_reports_progress() {
+        assert!(
+            MIGRATE_HEALTH_WAIT >= std::time::Duration::from_secs(15 * 60),
+            "the post-switch health wait must not be a dev-machine ceiling: {:?}",
+            MIGRATE_HEALTH_WAIT
+        );
+        assert!(MIGRATE_HEALTH_PROGRESS_EVERY < std::time::Duration::from_secs(60));
+        assert!(MIGRATE_HEALTH_POLL < MIGRATE_HEALTH_PROGRESS_EVERY);
+    }
+
+    /// A service that is slow to come up but DOES come up is waited for: no
+    /// rollback, and the event sequence is the up-front waiting phase, then
+    /// progress lines naming the pending service, then nothing else (the
+    /// caller goes on to remove the legacy volumes). (Red-proof: with the
+    /// bound below the service's slow period — the old flat cap's shape —
+    /// the sibling test shows the same service rolls back.)
+    #[tokio::test]
+    async fn a_slow_then_healthy_service_is_waited_for_without_rollback() {
+        let url = slow_then_healthy(8).await;
+        let targets = [HealthTarget { label: "Weaviate", url }];
+        let mut events: Vec<(&'static str, String)> = Vec::new();
+        let result = migrate_health_step(
+            &targets,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::ZERO,
+            &mut |phase, message| events.push((phase_name(&phase), message.to_string())),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()), "a service that comes up must not be rolled back");
+        assert!(
+            events.iter().all(|(p, _)| *p == "waiting_for_health"),
+            "only waiting events — no rollback: {:?}",
+            events
+        );
+        assert_eq!(
+            events[0].1, "Waiting for services to come up (up to 30s)",
+            "the up-front line names the bound"
+        );
+        let progress: Vec<&String> = events[1..].iter().map(|(_, m)| m).collect();
+        assert!(!progress.is_empty(), "the wait reported progress while pending");
+        assert!(
+            progress.iter().all(|m| m.contains("Weaviate not answering yet")
+                && m.contains("of up to 30s")),
+            "every progress line names the pending service and the bound: {:?}",
+            progress
+        );
+    }
+
+    /// A service that never comes up within the bound still rolls back —
+    /// the safety net survives the longer wait — and the last event is the
+    /// `RollingBack` phase carrying the pending service.
+    #[tokio::test]
+    async fn a_service_that_never_answers_still_rolls_back() {
+        let url = slow_then_healthy(usize::MAX).await;
+        let targets = [HealthTarget { label: "Weaviate", url }];
+        let mut events: Vec<(&'static str, String)> = Vec::new();
+        let result = migrate_health_step(
+            &targets,
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(60),
+            &mut |phase, message| events.push((phase_name(&phase), message.to_string())),
+        )
+        .await;
+
+        let reason = result.expect_err("an unhealthy service must roll back");
+        assert!(reason.contains("Weaviate did not come up healthy within"), "got: {}", reason);
+        assert_eq!(events.first().map(|e| e.0), Some("waiting_for_health"));
+        assert_eq!(events.last().map(|e| e.0), Some("rolling_back"));
+    }
+
+    /// The old shape, reproduced: the same slow service under a bound
+    /// SHORTER than its slow period rolls back. Paired with the test above,
+    /// this is the observable difference the longer bound makes.
+    #[tokio::test]
+    async fn the_same_slow_service_rolls_back_under_a_bound_shorter_than_its_startup() {
+        let url = slow_then_healthy(1_000).await;
+        let targets = [HealthTarget { label: "Weaviate", url }];
+        let result = migrate_health_step(
+            &targets,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(60),
+            &mut |_, _| {},
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

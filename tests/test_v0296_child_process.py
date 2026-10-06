@@ -52,6 +52,8 @@ from tests.common.child_env import child_env  # noqa: E402
 from vco_lib.child_process import run_child_logged  # noqa: E402
 
 INSTALL_PY = REPO_ROOT / "install.py"
+#: v0.2.101 item 4: the install seed spawns live in this ONE helper now.
+INSTALL_WEAVIATE_PY = REPO_ROOT / "vco_lib" / "install_weaviate.py"
 
 
 class _FakeStdout:
@@ -291,8 +293,8 @@ def _references_sync_kg(call: ast.Call) -> bool:
     )
 
 
-def test_install_seed_spawn_sites_use_run_child_logged():
-    tree = ast.parse(INSTALL_PY.read_text(encoding="utf-8"))
+def _seed_spawn_sites(tree: ast.AST) -> "tuple[List[ast.Call], List[ast.Call]]":
+    """``(run_child_logged calls, subprocess.run calls)`` that spawn the sync."""
     helper_calls: List[ast.Call] = []
     legacy_runs: List[ast.Call] = []
     for node in ast.walk(tree):
@@ -308,22 +310,40 @@ def test_install_seed_spawn_sites_use_run_child_logged():
             and func.value.id == "subprocess"
         ):
             legacy_runs.append(node)
+    return helper_calls, legacy_runs
 
-    assert len(helper_calls) == 2, (
-        "WP-1 owns EXACTLY the per-project sync and the shared-KG seed; "
-        f"found {len(helper_calls)} run_child_logged seed spawns"
+
+def test_install_seed_spawn_sites_use_run_child_logged():
+    """v0.2.101 item 4: BOTH install seed spawns moved into the ONE helper.
+
+    The guarantee this test has always carried is unchanged — every
+    sync_knowledge_graph spawn goes through WP-1's one-drain
+    ``run_child_logged`` and never an inherited-stdio ``subprocess.run`` — but
+    the site moved out of install.py (line ratchet) and into
+    ``vco_lib.install_weaviate.kg_seed_step``. So install.py must now hold NO
+    seed spawn, and the helper must hold exactly one. The two call sites'
+    ``log_stem`` values are pinned behaviourally by
+    ``tests/test_install_ci10_seed_diff_gate.py`` and
+    ``tests/test_v02101_seed_and_data_keys.py``.
+    """
+    helper_calls, legacy_runs = _seed_spawn_sites(
+        ast.parse(INSTALL_PY.read_text(encoding="utf-8")))
+    assert (helper_calls, legacy_runs) == ([], []), (
+        "install.py must contain no sync_knowledge_graph spawn at all — "
+        "vco_lib.install_weaviate.kg_seed_step owns the seed step now"
+    )
+
+    helper_calls, legacy_runs = _seed_spawn_sites(
+        ast.parse(INSTALL_WEAVIATE_PY.read_text(encoding="utf-8")))
+    assert len(helper_calls) == 1, (
+        "WP-1 owns the seed spawn; found "
+        f"{len(helper_calls)} run_child_logged seed spawns in kg_seed_step"
     )
     assert legacy_runs == [], (
         "an inherited-stdio subprocess.run spawn of sync_knowledge_graph "
         "survived WP-1 — that is the deadlock class this work package "
         "exists to remove"
     )
-    stems = set()
-    for call in helper_calls:
-        for kw in call.keywords:
-            if kw.arg == "log_stem" and isinstance(kw.value, ast.Constant):
-                stems.add(kw.value.value)
-    assert stems == {"kg-sync", "shared-kg-seed"}
 
 
 def test_failure_paths_name_the_log_file(tmp_path, monkeypatch, capsys):

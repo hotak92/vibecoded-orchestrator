@@ -81,6 +81,13 @@ pub struct PopulateReport {
     /// is_user_added flag is computed from the bundled-name allowlist
     /// in `crate::db::project_mcp_servers::BUNDLED_MCP_NAMES`.
     pub mcp_servers_inserted: usize,
+    /// v0.2.101 (catalogue plan §7.4): `bundled`-source rows DELETED by the
+    /// populate-time prune because the item's file exists in NEITHER the
+    /// enabled NOR the disabled location (retired agents/skills, removed
+    /// pack members). User/project/paid-module rows are never pruned.
+    pub agents_pruned: usize,
+    /// Skills mirror of `agents_pruned`.
+    pub skills_pruned: usize,
     /// Soft errors, one entry per row that could not be inserted. The
     /// caller logs these but does NOT fail the project creation.
     pub warnings: Vec<String>,
@@ -319,7 +326,11 @@ fn populate_agents(
         Ok(it) => it,
         Err(_) => {
             // Missing dir is fine — bundled installs always have it but
-            // a custom project might not.
+            // a custom project might not. Still prune: a project whose
+            // `.claude/agents/` was deleted wholesale must not keep
+            // phantom rows (the prune's disabled-side/file_path checks
+            // protect anything still live).
+            prune_bundled_agent_rows(project_id, folder_path, db, report);
             return;
         }
     };
@@ -435,6 +446,176 @@ fn populate_agents(
             report.agents_inserted += 1;
         }
     }
+
+    // v0.2.101 §7.4: after upserting, drop `bundled` rows whose files are
+    // gone from BOTH locations (retired agents, removed pack members).
+    prune_bundled_agent_rows(project_id, folder_path, db, report);
+}
+
+// ─── Bundled-row prune (v0.2.101 catalogue plan §7.4) ──────────────────
+//
+// Retired agents/skills (and removed pack members) leave the templates
+// tree; `install-bundle --update` deletes their unmodified files from the
+// project. Without a prune here, their `project_agents`/`project_skills`
+// rows linger forever as phantom GUI rows — populate only ever UPSERTs.
+//
+// Rule (deliberately conservative in the KEEP direction): delete a row of
+// source `bundled` ONLY when the item's file exists in NEITHER the enabled
+// NOR the disabled location AND the row's recorded `file_path` (which may
+// name a stem that differs from `agent_name` when frontmatter `name:`
+// overrode the file stem) no longer exists either. Leave-alone cases:
+//   * a DISABLED item — its file sits in `.disabled/`; the row (enabled=0)
+//     must survive or the user's disable choice loses its DB side;
+//   * a user-authored / project / paid-module row (`source != "bundled"`)
+//     — never VCO's to delete, even with a missing file;
+//   * an item present in BOTH locations (corrupt state, warned above) —
+//     files exist, so the row stays for the manual cleanup.
+// Pack members re-delivered by `install-bundle --pack` re-register as
+// ordinary `bundled` rows on the next populate after the files land.
+
+/// Is any live location for this row present on disk? Returns TRUE when
+/// the row must be KEPT (`!live` ⇒ prunable). Pure decision over the row's
+/// liveness evidence, split out so the leave-alone cases are unit-testable
+/// without a DB (L3 review SF-1: the earlier name `bundled_row_is_stale`
+/// said the opposite of what the body answers — a maintenance trap).
+///
+/// Evidence checked, all keep-direction:
+///   * the enabled + disabled locations for the row's OWN name, both kinds
+///     (the stem alone does not say which KIND the row is — an agent `foo`
+///     and a skill `foo` can coexist; checking both only widens the
+///     keep-set);
+///   * the recorded `file_path` itself;
+///   * SF-2 hardening: stems DERIVED from `file_path` (the agent file stem,
+///     and the skill directory name = its parent) checked at their enabled +
+///     disabled locations too. Covers a row whose frontmatter `name:` ≠ file
+///     stem whose file was moved to `.disabled/` out-of-band while
+///     `file_path` still points at the old enabled path (the FS-disable
+///     move never rewrites `file_path`) — previously all checks missed and
+///     the row was deleted while its file lived on the disabled side.
+fn bundled_row_is_live(row_name: &str, file_path: Option<&str>, folder_path: &Path) -> bool {
+    let live = any_live_location(folder_path, row_name);
+    if let Some(fp) = file_path {
+        if Path::new(fp).exists() {
+            return true;
+        }
+        for stem in file_path_derived_stems(fp) {
+            if any_live_location(folder_path, &stem) {
+                return true;
+            }
+        }
+    }
+    live
+}
+
+/// Any enabled/disabled location (both kinds) exists for `name`?
+fn any_live_location(folder_path: &Path, name: &str) -> bool {
+    let (enabled, disabled) = resolve_kind_paths(folder_path, name, AgentOrSkill::Agent);
+    let (skill_enabled, skill_disabled) = resolve_kind_paths(folder_path, name, AgentOrSkill::Skill);
+    enabled.exists() || disabled.exists() || skill_enabled.exists() || skill_disabled.exists()
+}
+
+/// Stems derivable from a recorded `file_path`: the file stem (an agent
+/// `.md`) and the parent directory name (a skill dir, whose file is
+/// `<dir>/SKILL.md`). Pure.
+fn file_path_derived_stems(file_path: &str) -> Vec<String> {
+    let p = Path::new(file_path);
+    let mut stems = Vec::new();
+    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+        stems.push(stem.to_string());
+    }
+    if let Some(dir) = p
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|s| s.to_str())
+    {
+        stems.push(dir.to_string());
+    }
+    stems
+}
+
+/// Agents + skills share the prune body; `list`/`unregister` are injected
+/// because the two tables have different accessors.
+fn prune_bundled_rows<FList, FUnreg>(
+    project_id: &str,
+    folder_path: &Path,
+    report: &mut PopulateReport,
+    list: FList,
+    unregister: FUnreg,
+    count_pruned: fn(&mut PopulateReport, usize),
+) where
+    FList: FnOnce(&str) -> Result<Vec<(String, String, Option<String>)>, String>,
+    FUnreg: Fn(&str, &str) -> Result<(), String>,
+{
+    let rows = match list(project_id) {
+        Ok(rows) => rows,
+        Err(e) => {
+            report
+                .warnings
+                .push(format!("prune: listing bundled rows failed: {}", e));
+            return;
+        }
+    };
+    let mut pruned = 0usize;
+    for (name, source, file_path) in rows {
+        if source != "bundled" {
+            continue; // user / project / paid-module rows are never pruned
+        }
+        if bundled_row_is_live(&name, file_path.as_deref(), folder_path) {
+            continue; // a live location (or a file_path-derived one) exists
+        }
+        // Unregister is idempotent: a missing row is 0 rows affected.
+        match unregister(project_id, &name) {
+            Ok(_) => pruned += 1,
+            Err(e) => report
+                .warnings
+                .push(format!("prune: unregister {} failed: {}", name, e)),
+        }
+    }
+    count_pruned(report, pruned);
+}
+
+fn prune_bundled_agent_rows(
+    project_id: &str,
+    folder_path: &Path,
+    db: &Db,
+    report: &mut PopulateReport,
+) {
+    prune_bundled_rows(
+        project_id,
+        folder_path,
+        report,
+        |pid| {
+            db.list_project_agents(pid).map(|rows| {
+                rows.into_iter()
+                    .map(|a| (a.agent_name, a.source, a.file_path))
+                    .collect()
+            })
+        },
+        |pid, name| db.unregister_project_agent(pid, name),
+        |report, n| report.agents_pruned += n,
+    );
+}
+
+fn prune_bundled_skill_rows(
+    project_id: &str,
+    folder_path: &Path,
+    db: &Db,
+    report: &mut PopulateReport,
+) {
+    prune_bundled_rows(
+        project_id,
+        folder_path,
+        report,
+        |pid| {
+            db.list_project_skills(pid).map(|rows| {
+                rows.into_iter()
+                    .map(|s| (s.skill_name, s.source, s.file_path))
+                    .collect()
+            })
+        },
+        |pid, name| db.unregister_project_skill(pid, name),
+        |report, n| report.skills_pruned += n,
+    );
 }
 
 // ─── Skills ────────────────────────────────────────────────────────────
@@ -449,7 +630,12 @@ fn populate_skills(
     let skills_dir = claude_dir.join("skills");
     let entries = match std::fs::read_dir(&skills_dir) {
         Ok(it) => it,
-        Err(_) => return,
+        Err(_) => {
+            // Mirror of the agents path: a missing skills dir still prunes
+            // (nothing live can be lost — see prune_bundled_skill_rows).
+            prune_bundled_skill_rows(project_id, folder_path, db, report);
+            return;
+        }
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -535,6 +721,9 @@ fn populate_skills(
             report.skills_inserted += 1;
         }
     }
+
+    // v0.2.101 §7.4: skills mirror of the agents prune.
+    prune_bundled_skill_rows(project_id, folder_path, db, report);
 }
 
 // ─── Hooks ─────────────────────────────────────────────────────────────
@@ -1237,9 +1426,10 @@ mod tests {
 
     #[test]
     fn frontmatter_parses_canonical_keys() {
-        let raw = "---\nname: coder\ndescription: writes code\nmodel: sonnet\ntools: Read, Write\n---\n# body\n";
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        let raw = "---\nname: example-agent\ndescription: writes code\nmodel: sonnet\ntools: Read, Write\n---\n# body\n";
         let fm = parse_frontmatter(raw);
-        assert_eq!(fm.get("name").map(String::as_str), Some("coder"));
+        assert_eq!(fm.get("name").map(String::as_str), Some("example-agent"));
         assert_eq!(fm.get("description").map(String::as_str), Some("writes code"));
         assert_eq!(fm.get("model").map(String::as_str), Some("sonnet"));
         // tools is filtered out (not a recognised key).
@@ -1260,9 +1450,10 @@ mod tests {
     #[test]
     fn frontmatter_skips_nested_mappings() {
         // Mirrors a real-world agent file with mcpServers nested config.
-        let raw = "---\nname: coder\nmodel: sonnet\nmcpServers:\n  orchestrator-tools:\n    command: /bin/python\n---\n";
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        let raw = "---\nname: example-agent\nmodel: sonnet\nmcpServers:\n  orchestrator-tools:\n    command: /bin/python\n---\n";
         let fm = parse_frontmatter(raw);
-        assert_eq!(fm.get("name").map(String::as_str), Some("coder"));
+        assert_eq!(fm.get("name").map(String::as_str), Some("example-agent"));
         assert_eq!(fm.get("model").map(String::as_str), Some("sonnet"));
         // mcpServers is filtered + nested keys are skipped (start with whitespace).
         assert!(!fm.contains_key("mcpServers"));
@@ -1283,11 +1474,12 @@ mod tests {
         let claude = folder.join(".claude");
         let agents_dir = claude.join("agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
         write_agent_file(
             &agents_dir,
-            "coder.md",
-            "name: coder\ndescription: writes code\nmodel: sonnet",
-            "# Coder",
+            "example-agent.md",
+            "name: example-agent\ndescription: writes code\nmodel: sonnet",
+            "# Example agent",
         );
         write_agent_file(
             &agents_dir,
@@ -1306,17 +1498,17 @@ mod tests {
         let rows = db.list_project_agents("p1").unwrap();
         assert_eq!(rows.len(), 2);
         let names: Vec<&str> = rows.iter().map(|a| a.agent_name.as_str()).collect();
-        assert!(names.contains(&"coder"));
+        assert!(names.contains(&"example-agent"));
         assert!(names.contains(&"tester"));
-        let coder = rows.iter().find(|a| a.agent_name == "coder").unwrap();
-        assert_eq!(coder.model.as_deref(), Some("sonnet"));
-        assert_eq!(coder.source, "bundled");
-        assert!(coder.enabled);
-        assert!(coder
+        let example_agent = rows.iter().find(|a| a.agent_name == "example-agent").unwrap();
+        assert_eq!(example_agent.model.as_deref(), Some("sonnet"));
+        assert_eq!(example_agent.source, "bundled");
+        assert!(example_agent.enabled);
+        assert!(example_agent
             .file_path
             .as_deref()
             .unwrap_or("")
-            .ends_with("coder.md"));
+            .ends_with("example-agent.md"));
 
         std::fs::remove_dir_all(&folder).ok();
     }
@@ -1351,11 +1543,12 @@ mod tests {
         let folder = scratch_dir("agents-readme-skip");
         let agents_dir = folder.join(".claude/agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
         write_agent_file(
             &agents_dir,
-            "coder.md",
-            "name: coder\nmodel: sonnet",
-            "# Coder",
+            "example-agent.md",
+            "name: example-agent\nmodel: sonnet",
+            "# Example agent",
         );
         // README.md sibling — documents the directory, NOT an agent.
         std::fs::write(
@@ -1367,14 +1560,14 @@ mod tests {
         let db = make_db_with_project("p1", "P");
         let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
 
-        // Only `coder` is registered, NOT README.
+        // Only `example-agent` is registered, NOT README.
         assert_eq!(
             report.agents_inserted, 1,
             "README.md must not count as an inserted agent"
         );
         let rows = db.list_project_agents("p1").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].agent_name, "coder");
+        assert_eq!(rows[0].agent_name, "example-agent");
         assert!(
             !rows.iter().any(|a| a.agent_name.eq_ignore_ascii_case("readme")),
             "README must not appear in the agents list"
@@ -1392,11 +1585,12 @@ mod tests {
         let folder = scratch_dir("agents-readme-case");
         let agents_dir = folder.join(".claude/agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
         write_agent_file(
             &agents_dir,
-            "coder.md",
-            "name: coder\nmodel: sonnet",
-            "# Coder",
+            "example-agent.md",
+            "name: example-agent\nmodel: sonnet",
+            "# Example agent",
         );
         // Some Linux filesystems will keep BOTH if the OS is
         // case-sensitive — write a single file with mixed case that
@@ -1421,7 +1615,8 @@ mod tests {
         let folder = scratch_dir("agents-index-skip");
         let agents_dir = folder.join(".claude/agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
-        write_agent_file(&agents_dir, "coder.md", "name: coder\nmodel: sonnet", "");
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        write_agent_file(&agents_dir, "example-agent.md", "name: example-agent\nmodel: sonnet", "");
         std::fs::write(agents_dir.join("index.md"), "# index").unwrap();
         std::fs::write(agents_dir.join("TEMPLATE.md"), "# template").unwrap();
 
@@ -1431,7 +1626,7 @@ mod tests {
         assert_eq!(report.agents_inserted, 1);
         let rows = db.list_project_agents("p1").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].agent_name, "coder");
+        assert_eq!(rows[0].agent_name, "example-agent");
 
         std::fs::remove_dir_all(&folder).ok();
     }
@@ -1473,7 +1668,8 @@ mod tests {
         let folder = scratch_dir("agents-readme-cleanup");
         let agents_dir = folder.join(".claude/agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
-        write_agent_file(&agents_dir, "coder.md", "name: coder\nmodel: sonnet", "");
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        write_agent_file(&agents_dir, "example-agent.md", "name: example-agent\nmodel: sonnet", "");
         std::fs::write(agents_dir.join("README.md"), "# Docs").unwrap();
 
         let db = make_db_with_project("p1", "P");
@@ -1498,15 +1694,320 @@ mod tests {
             .iter()
             .any(|a| a.agent_name == "README"));
 
-        // Run populate — it should DELETE the phantom row AND register coder.
+        // Run populate — it should DELETE the phantom row AND register example-agent.
         let _ = populate_project_state_from_filesystem("p1", "P", &folder, &db);
         let rows = db.list_project_agents("p1").unwrap();
         assert!(
             !rows.iter().any(|a| a.agent_name.eq_ignore_ascii_case("readme")),
             "legacy README row must be cleaned up after populate"
         );
-        assert!(rows.iter().any(|a| a.agent_name == "coder"));
+        assert!(rows.iter().any(|a| a.agent_name == "example-agent"));
 
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    // ─── v0.2.101 §7.4: bundled-row prune (retired items vanish) ────
+    //
+    // Populate used to UPSERT only: an agent whose file a bundle update
+    // deleted (retirement, --remove-pack) kept its row forever as a
+    // phantom GUI listing. The prune deletes source='bundled' rows whose
+    // files are gone from BOTH locations — and NOTHING else.
+
+    /// ACT: bundled agent row + file deleted from disk → re-populate
+    /// removes the row.
+    #[test]
+    fn prune_removes_bundled_agent_row_whose_file_vanished() {
+        let folder = scratch_dir("prune-agent-gone");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(
+            &agents_dir,
+            "retired-agent.md",
+            "name: retired-agent\nmodel: sonnet",
+            "",
+        );
+        write_agent_file(&agents_dir, "keeper.md", "name: keeper\nmodel: sonnet", "");
+
+        let db = make_db_with_project("p1", "P");
+        populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        assert_eq!(db.list_project_agents("p1").unwrap().len(), 2);
+
+        // The bundle update deletes the retired agent's file.
+        std::fs::remove_file(agents_dir.join("retired-agent.md")).unwrap();
+
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        let rows = db.list_project_agents("p1").unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the retired agent's row must be pruned, got: {:?}",
+            rows.iter().map(|a| &a.agent_name).collect::<Vec<_>>()
+        );
+        assert_eq!(rows[0].agent_name, "keeper");
+        assert_eq!(report.agents_pruned, 1);
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// LEAVE-ALONE: a user-source row with a missing file is NEVER pruned
+    /// (user/project/paid-module rows are the user's, not VCO's).
+    #[test]
+    fn prune_keeps_user_source_row_with_missing_file() {
+        let folder = scratch_dir("prune-user-row");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(&agents_dir, "keeper.md", "name: keeper\nmodel: sonnet", "");
+
+        let db = make_db_with_project("p1", "P");
+        // A user-authored agent registered with NO file on disk (the GUI
+        // Register form creates exactly this shape).
+        db.register_project_agent(
+            "p1",
+            "my-own-agent",
+            "user",
+            None,
+            None,
+            None,
+            &serde_json::json!({"description": ""}),
+        )
+        .unwrap();
+
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        assert_eq!(report.agents_pruned, 0);
+        let rows = db.list_project_agents("p1").unwrap();
+        assert!(
+            rows.iter().any(|a| a.agent_name == "my-own-agent"),
+            "user rows must survive the prune: {:?}",
+            rows.iter().map(|a| &a.agent_name).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// LEAVE-ALONE: a bundled row whose item the user DISABLED — the file
+    /// now lives in `agents.disabled/` and the row (enabled=0) must
+    /// survive, or the user's disable choice loses its DB side.
+    #[test]
+    fn prune_keeps_bundled_row_of_disabled_item() {
+        let folder = scratch_dir("prune-disabled");
+        let agents_dir = folder.join(".claude/agents");
+        let disabled_dir = folder.join(".claude/agents.disabled");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::create_dir_all(&disabled_dir).unwrap();
+        write_agent_file(&agents_dir, "foo.md", "name: foo\nmodel: sonnet", "");
+
+        let db = make_db_with_project("p1", "P");
+        populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        // The user disables foo via the GUI: file moves to .disabled/, row
+        // stays with enabled=0.
+        db.set_project_agent_enabled("p1", "foo", false).unwrap();
+        std::fs::rename(agents_dir.join("foo.md"), disabled_dir.join("foo.md")).unwrap();
+
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        assert_eq!(report.agents_pruned, 0);
+        let rows = db.list_project_agents("p1").unwrap();
+        let foo = rows.iter().find(|a| a.agent_name == "foo").expect("row kept");
+        assert!(!foo.enabled, "the disable toggle must survive re-populate");
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// LEAVE-ALONE (frontmatter-name divergence): a bundled agent whose
+    /// `name:` differs from its file stem is kept while its FILE exists,
+    /// via the row's recorded `file_path` (the name-derived paths would
+    /// find nothing).
+    #[test]
+    fn prune_keeps_agent_whose_frontmatter_name_differs_from_stem() {
+        let folder = scratch_dir("prune-fm-name");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(
+            &agents_dir,
+            "file-stem.md",
+            "name: frontmatter-name\nmodel: sonnet",
+            "",
+        );
+
+        let db = make_db_with_project("p1", "P");
+        populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        // Row is keyed `frontmatter-name`; the file is `file-stem.md`.
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        assert_eq!(report.agents_pruned, 0);
+        assert!(
+            db.list_project_agents("p1")
+                .unwrap()
+                .iter()
+                .any(|a| a.agent_name == "frontmatter-name"),
+            "a live agent with a divergent frontmatter name must not be pruned"
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// ACT (skills mirror): bundled skill row + skill dir deleted → row
+    /// pruned; a disabled skill dir keeps its row.
+    #[test]
+    fn prune_removes_bundled_skill_row_whose_dir_vanished() {
+        let folder = scratch_dir("prune-skill-gone");
+        let skills_dir = folder.join(".claude/skills");
+        let disabled_dir = folder.join(".claude/skills.disabled");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::create_dir_all(&disabled_dir).unwrap();
+        write_skill_dir(&skills_dir, "retired-skill", "name: retired-skill");
+        write_skill_dir(&skills_dir, "disabled-skill", "name: disabled-skill");
+        write_skill_dir(&disabled_dir, "disabled-skill", "name: disabled-skill");
+
+        let db = make_db_with_project("p1", "P");
+        populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        assert_eq!(db.list_project_skills("p1").unwrap().len(), 1);
+        // Register the disabled skill's row the way the GUI flow does.
+        db.register_project_skill(
+            "p1",
+            "disabled-skill",
+            "bundled",
+            None,
+            None,
+            Some(
+                &disabled_dir
+                    .join("disabled-skill")
+                    .join("SKILL.md")
+                    .to_string_lossy(),
+            ),
+            &serde_json::json!({"description": ""}),
+        )
+        .unwrap();
+
+        // The bundle update removes the retired skill (enabled side only).
+        std::fs::remove_dir_all(skills_dir.join("retired-skill")).unwrap();
+
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        assert_eq!(report.skills_pruned, 1);
+        let rows = db.list_project_skills("p1").unwrap();
+        assert_eq!(rows.len(), 1, "only the disabled skill's row remains");
+        assert_eq!(rows[0].skill_name, "disabled-skill");
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// A wholesale-deleted `.claude/agents/` dir still prunes (the
+    /// read_dir-failure arm must not skip the prune).
+    #[test]
+    fn prune_runs_even_when_agents_dir_is_missing() {
+        let folder = scratch_dir("prune-dir-gone");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(&agents_dir, "foo.md", "name: foo\nmodel: sonnet", "");
+
+        let db = make_db_with_project("p1", "P");
+        populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        assert_eq!(db.list_project_agents("p1").unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&agents_dir).unwrap();
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        assert_eq!(report.agents_pruned, 1);
+        assert!(db.list_project_agents("p1").unwrap().is_empty());
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    // ─── bundled_row_is_live: the pure prune decision, direct (SF-1) ───
+    //
+    // The doc promises the leave-alone cases are testable without a DB —
+    // these drive the decision function itself (TRUE = keep, FALSE =
+    // prunable), so an accidental inversion of the predicate fails HERE
+    // before it can hide behind a DB-mediated test.
+
+    #[test]
+    fn live_decision_false_when_nothing_exists() {
+        let folder = scratch_dir("live-nothing");
+        std::fs::create_dir_all(folder.join(".claude/agents")).unwrap();
+        assert!(!bundled_row_is_live("ghost", None, &folder));
+        assert!(!bundled_row_is_live(
+            "ghost",
+            Some(&folder.join(".claude/agents/ghost.md").to_string_lossy()),
+            &folder
+        ));
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn live_decision_true_for_enabled_location() {
+        let folder = scratch_dir("live-enabled");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(&agents_dir, "foo.md", "name: foo\nmodel: sonnet", "");
+        assert!(bundled_row_is_live("foo", None, &folder));
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// The disabled side alone keeps the row (the user's disable choice
+    /// must not lose its DB side).
+    #[test]
+    fn live_decision_true_for_disabled_location_only() {
+        let folder = scratch_dir("live-disabled");
+        let disabled_dir = folder.join(".claude/agents.disabled");
+        std::fs::create_dir_all(&disabled_dir).unwrap();
+        write_agent_file(&disabled_dir, "foo.md", "name: foo\nmodel: sonnet", "");
+        assert!(bundled_row_is_live("foo", None, &folder));
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// A live recorded `file_path` keeps the row even when the row's NAME
+    /// derives nothing (frontmatter `name:` ≠ file stem).
+    #[test]
+    fn live_decision_true_via_recorded_file_path() {
+        let folder = scratch_dir("live-filepath");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(&agents_dir, "file-stem.md", "name: frontmatter-name\nmodel: sonnet", "");
+        let fp = agents_dir.join("file-stem.md").to_string_lossy().to_string();
+        assert!(bundled_row_is_live("frontmatter-name", Some(&fp), &folder));
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// SF-2: a divergent-name row whose file was moved to `.disabled/`
+    /// out-of-band, with `file_path` still pointing at the (now gone)
+    /// enabled path — the file_path-DERIVED stem must keep the row.
+    #[test]
+    fn live_decision_true_via_file_path_derived_disabled_stem() {
+        let folder = scratch_dir("live-derived-disabled");
+        let agents_dir = folder.join(".claude/agents");
+        let disabled_dir = folder.join(".claude/agents.disabled");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::create_dir_all(&disabled_dir).unwrap();
+        // The file USED to live here (that's what file_path recorded)…
+        let stale_enabled = agents_dir.join("file-stem.md").to_string_lossy().to_string();
+        // …but an out-of-band move put it on the disabled side under its
+        // stem, and the row is keyed by its frontmatter name.
+        write_agent_file(&disabled_dir, "file-stem.md", "name: frontmatter-name\nmodel: sonnet", "");
+        assert!(
+            bundled_row_is_live("frontmatter-name", Some(&stale_enabled), &folder),
+            "the file_path-derived stem (file-stem) must find the disabled-side copy"
+        );
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// SF-2 skills arm: a skill row keyed by frontmatter `name:` whose dir
+    /// lives (disabled side) under the stem recorded in `file_path`'s
+    /// PARENT directory name.
+    #[test]
+    fn live_decision_true_via_file_path_parent_dir_for_skills() {
+        let folder = scratch_dir("live-derived-skill");
+        let disabled_skills = folder.join(".claude/skills.disabled");
+        std::fs::create_dir_all(disabled_skills.join("dir-stem")).unwrap();
+        std::fs::write(
+            disabled_skills.join("dir-stem").join("SKILL.md"),
+            "---\nname: fm-skill\n---\n# x\n",
+        )
+        .unwrap();
+        let stale_fp = folder
+            .join(".claude")
+            .join("skills")
+            .join("dir-stem")
+            .join("SKILL.md")
+            .to_string_lossy()
+            .to_string();
+        assert!(bundled_row_is_live("fm-skill", Some(&stale_fp), &folder));
         std::fs::remove_dir_all(&folder).ok();
     }
 
@@ -1601,11 +2102,13 @@ mod tests {
         std::fs::create_dir_all(&agents_dir).unwrap();
         // The exact shape from production: model + effort + tools (the
         // last two MUST not interfere with the model extraction).
+        // Neutral fixture name (`code-graph-updater` was a real agent
+        // retired in v0.2.101 — a synthetic row must not read as one).
         write_agent_file(
             &agents_dir,
-            "code-graph-updater.md",
-            "name: code-graph-updater\ndescription: graph updates\ntools: Read, Bash, Grep, Glob\nmodel: haiku\neffort: high",
-            "# CGU",
+            "example-agent.md",
+            "name: example-agent\ndescription: example fixture\ntools: Read, Bash, Grep, Glob\nmodel: haiku\neffort: high",
+            "# Example",
         );
 
         let db = make_db_with_project("p1", "P");
@@ -1621,7 +2124,7 @@ mod tests {
 
         // The row's model is Some("haiku") — survives the upsert.
         let rows = db.list_project_agents("p1").unwrap();
-        assert_eq!(rows[0].agent_name, "code-graph-updater");
+        assert_eq!(rows[0].agent_name, "example-agent");
         assert_eq!(rows[0].model.as_deref(), Some("haiku"));
 
         // Pin the IPC contract — serialize the row exactly as the Tauri
@@ -1652,7 +2155,8 @@ mod tests {
         let skills_dir = folder.join(".claude/skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
         write_skill_dir(&skills_dir, "architect", "name: architect\ndescription: design");
-        write_skill_dir(&skills_dir, "tdd", "name: tdd\ndescription: test-first");
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        write_skill_dir(&skills_dir, "example-skill", "name: example-skill\ndescription: test-first");
         // Dir without SKILL.md must be ignored.
         std::fs::create_dir_all(skills_dir.join("not-a-skill")).unwrap();
 
@@ -1665,7 +2169,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let names: Vec<&str> = rows.iter().map(|s| s.skill_name.as_str()).collect();
         assert!(names.contains(&"architect"));
-        assert!(names.contains(&"tdd"));
+        assert!(names.contains(&"example-skill"));
 
         std::fs::remove_dir_all(&folder).ok();
     }
@@ -1800,7 +2304,8 @@ mod tests {
             let folder = scratch_dir("disable-skill-fresh");
             let skills_dir = folder.join(".claude/skills");
             std::fs::create_dir_all(&skills_dir).unwrap();
-            write_skill_dir(&skills_dir, "tdd", "name: tdd\nmodel: sonnet");
+            // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+            write_skill_dir(&skills_dir, "example-skill", "name: example-skill\nmodel: sonnet");
 
             let db = make_db_with_project("p1", "P");
             let report =
@@ -1809,7 +2314,7 @@ mod tests {
             assert_eq!(report.skills_inserted, 1);
             let rows = db.list_project_skills("p1").unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].skill_name, "tdd");
+            assert_eq!(rows[0].skill_name, "example-skill");
 
             std::fs::remove_dir_all(&folder).ok();
         }
@@ -1821,7 +2326,8 @@ mod tests {
             let disabled_dir = folder.join(".claude/skills.disabled");
             std::fs::create_dir_all(&skills_dir).unwrap();
             std::fs::create_dir_all(&disabled_dir).unwrap();
-            write_skill_dir(&disabled_dir, "tdd", "name: tdd\nmodel: sonnet");
+            // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+            write_skill_dir(&disabled_dir, "example-skill", "name: example-skill\nmodel: sonnet");
 
             let db = make_db_with_project("p1", "P");
             let report =
@@ -1830,11 +2336,11 @@ mod tests {
             assert_eq!(report.skills_inserted, 0);
             assert_eq!(db.list_project_skills("p1").unwrap().len(), 0);
             assert!(
-                disabled_dir.join("tdd").join("SKILL.md").exists(),
+                disabled_dir.join("example-skill").join("SKILL.md").exists(),
                 "populate must not touch the .disabled/ skill dir"
             );
             assert!(
-                !skills_dir.join("tdd").exists(),
+                !skills_dir.join("example-skill").exists(),
                 "populate must never resurrect a skill dir into skills/"
             );
 
@@ -1848,8 +2354,10 @@ mod tests {
             let disabled_dir = folder.join(".claude/skills.disabled");
             std::fs::create_dir_all(&skills_dir).unwrap();
             std::fs::create_dir_all(&disabled_dir).unwrap();
-            write_skill_dir(&skills_dir, "tdd", "name: tdd\nmodel: sonnet");
-            write_skill_dir(&disabled_dir, "tdd", "name: tdd\nmodel: sonnet");
+            // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+            write_skill_dir(&skills_dir, "example-skill", "name: example-skill\nmodel: sonnet");
+            // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+            write_skill_dir(&disabled_dir, "example-skill", "name: example-skill\nmodel: sonnet");
 
             let db = make_db_with_project("p1", "P");
             let report =
@@ -1857,14 +2365,14 @@ mod tests {
 
             assert_eq!(report.skills_inserted, 0);
             assert!(db.list_project_skills("p1").unwrap().is_empty());
-            assert!(skills_dir.join("tdd").join("SKILL.md").exists());
-            assert!(disabled_dir.join("tdd").join("SKILL.md").exists());
+            assert!(skills_dir.join("example-skill").join("SKILL.md").exists());
+            assert!(disabled_dir.join("example-skill").join("SKILL.md").exists());
             assert!(
                 report.warnings.iter().any(|w|
-                    w.contains("tdd")
+                    w.contains("example-skill")
                         && w.contains("skills.disabled/")
                 ),
-                "expected both-locations warning for skill tdd, got: {:?}",
+                "expected both-locations warning for skill example-skill, got: {:?}",
                 report.warnings
             );
 
@@ -2191,11 +2699,12 @@ mod tests {
         let folder = scratch_dir("idem");
         let agents_dir = folder.join(".claude/agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
         write_agent_file(
             &agents_dir,
-            "coder.md",
-            "name: coder\nmodel: sonnet",
-            "# coder",
+            "example-agent.md",
+            "name: example-agent\nmodel: sonnet",
+            "# example-agent",
         );
         let skills_dir = folder.join(".claude/skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
@@ -2231,12 +2740,13 @@ mod tests {
         let folder = scratch_dir("preserve-agent");
         let agents_dir = folder.join(".claude/agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
-        write_agent_file(&agents_dir, "coder.md", "name: coder\nmodel: sonnet", "");
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        write_agent_file(&agents_dir, "example-agent.md", "name: example-agent\nmodel: sonnet", "");
 
         let db = make_db_with_project("p1", "P");
         populate_project_state_from_filesystem("p1", "P", &folder, &db);
         // User disables it via the GUI.
-        db.set_project_agent_enabled("p1", "coder", false).unwrap();
+        db.set_project_agent_enabled("p1", "example-agent", false).unwrap();
         // Re-run populate (e.g. user re-onboards the project).
         populate_project_state_from_filesystem("p1", "P", &folder, &db);
 
@@ -2254,11 +2764,12 @@ mod tests {
         let folder = scratch_dir("preserve-skill");
         let skills_dir = folder.join(".claude/skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
-        write_skill_dir(&skills_dir, "tdd", "name: tdd");
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        write_skill_dir(&skills_dir, "example-skill", "name: example-skill");
 
         let db = make_db_with_project("p1", "P");
         populate_project_state_from_filesystem("p1", "P", &folder, &db);
-        db.set_project_skill_enabled("p1", "tdd", false).unwrap();
+        db.set_project_skill_enabled("p1", "example-skill", false).unwrap();
         populate_project_state_from_filesystem("p1", "P", &folder, &db);
 
         let skills = db.list_project_skills("p1").unwrap();
@@ -2328,10 +2839,9 @@ mod tests {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::create_dir_all(&skills_dir).unwrap();
 
-        // 5 agents — we'll disable 3, leave 2 enabled. Names mirror real
-        // bundled agent files (coder.md, planner.md, tester.md, reviewer.md,
-        // architect.md ship in templates/agents/).
-        for n in &["coder", "planner", "tester", "reviewer", "architect"] {
+        // 5 agents — we'll disable 3, leave 2 enabled.
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        for n in &["example-agent", "planner", "tester", "reviewer", "architect"] {
             write_agent_file(
                 &agents_dir,
                 &format!("{}.md", n),
@@ -2339,9 +2849,9 @@ mod tests {
                 "# body",
             );
         }
-        // 4 skills — we'll disable 2, leave 2 enabled. Names mirror real
-        // bundled skills (tdd, architect, fix-issue, context).
-        for n in &["tdd", "architect", "fix-issue", "context"] {
+        // 4 skills — we'll disable 2, leave 2 enabled.
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        for n in &["example-skill", "architect", "fix-issue", "context"] {
             write_skill_dir(&skills_dir, n, &format!("name: {}\nmodel: sonnet", n));
         }
         // 3 hooks — we'll disable 1, leave 2 enabled. The matcher+command
@@ -2378,8 +2888,8 @@ mod tests {
         assert_eq!(r1.hooks_inserted, 3, "baseline: 3 hooks seeded");
 
         // User disables 3 agents, 2 skills, 1 hook via the GUI / DB.
-        const DISABLED_AGENTS: [&str; 3] = ["coder", "tester", "architect"];
-        const DISABLED_SKILLS: [&str; 2] = ["tdd", "context"];
+        const DISABLED_AGENTS: [&str; 3] = ["example-agent", "tester", "architect"];
+        const DISABLED_SKILLS: [&str; 2] = ["example-skill", "context"];
         for a in &DISABLED_AGENTS {
             db.set_project_agent_enabled("p1", a, false).unwrap();
         }
@@ -2840,7 +3350,8 @@ mod tests {
                 "# body",
             );
         }
-        for n in &["architect", "tdd", "context", "fix-issue"] {
+        // Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        for n in &["architect", "example-skill", "context", "fix-issue"] {
             write_skill_dir(&skills_dir, n, &format!("name: {}\nmodel: sonnet", n));
         }
         std::fs::write(

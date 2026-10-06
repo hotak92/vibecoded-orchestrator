@@ -1970,13 +1970,17 @@ pub(crate) async fn run_install_py_update(
 // ─── v0.2.96 WP-8 (register issue 4, GUI half): the update stall watchdog ──
 //
 // Watches install.py's stdout for progress. install.py emits its own
-// `[VCO-EVENT]` lines only BETWEEN phases — while it blocks on the seed
-// child it prints nothing, and the producer there is the CHILD:
+// `[VCO-EVENT]` lines only BETWEEN phases, and since v0.2.101 the whole-tree
+// KG seed no longer blocks it at all — `kg_seed_step` DETACHES the seed
+// (`vco_lib.deferral_retry.spawn_detached`: own log file, no pipe, never
+// waited on) and returns in seconds, so install.py's stdout keeps moving
+// through the phases that follow. Only the small per-file diffs still run
+// inline, and there the producer of mid-seed ticks is the CHILD:
 // sync_knowledge_graph.py emits throttled `[VCO-EVENT] kg-sync …` ticks
 // (gated on VCO_PROGRESS_STREAM, which this pipeline threads through
 // install.py's env into the seed child) and the WP-1 relay
 // (`vco_lib/child_process.py`) forwards them onto install.py's stdout.
-// With that producer in place a healthy update produces stdout lines
+// With those producers in place a healthy update produces stdout lines
 // even mid-seed, so N minutes of total silence means the user is looking
 // at a modal that may never move again (the 2026-09-20 "stuck at
 // Seeding" class, now deadlock-free but still potentially slow).

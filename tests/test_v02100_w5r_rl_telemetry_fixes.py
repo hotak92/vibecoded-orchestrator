@@ -446,14 +446,33 @@ def test_events_and_ids_carry_the_task_type(world):
     assert state["emitted"][0]["task_id"].startswith("pre_tool_use_")
 
 
+# v0.2.101: the router loads this producer IN-PROCESS with a PINNED argparse
+# (hook_dual_search._pin_argv), so sys.argv does NOT carry the producer's
+# flags — the stub must parse them the same way the real rl_kg_search does.
+# The VCO_RL_TASK_TYPE env fallback covered the legacy direct-spawn hooks;
+# the last of them (pre-tool-use §5) was retired in wave-3, so every live
+# task-type now travels as the router's --task-type argv (the env fallback
+# remains in resolve_task_type as documented behaviour).
 _TT_PRODUCER = (
-    "import os, sys\n"
-    "tt = os.environ.get('VCO_RL_TASK_TYPE', '')\n"
-    "if '--task-type' in sys.argv: tt = sys.argv[sys.argv.index('--task-type') + 1]\n"
-    "print('KG: probe tt=' + tt + ' | concept | score=0.90 | FULL NODE:')\n"
-    "print('body')\n"
-    "print('KG: probe2 tt=' + tt + ' | concept | score=0.80 | FULL NODE:')\n"
-    "print('body2')\n"
+    "import argparse, os\n"
+    "\n"
+    "def main(argv=None):\n"
+    "    ap = argparse.ArgumentParser()\n"
+    "    ap.add_argument('query')\n"
+    "    ap.add_argument('--limit', type=int, default=3)\n"
+    "    ap.add_argument('--hook-format', action='store_true')\n"
+    "    ap.add_argument('--injection-profile')\n"
+    "    ap.add_argument('--task-type')\n"
+    "    ap.add_argument('--transcript')\n"
+    "    a = ap.parse_args(argv)\n"
+    "    tt = a.task_type or os.environ.get('VCO_RL_TASK_TYPE', '')\n"
+    "    print('KG: probe tt=' + tt + ' | concept | score=0.90 | FULL NODE:')\n"
+    "    print('body')\n"
+    "    print('KG: probe2 tt=' + tt + ' | concept | score=0.80 | FULL NODE:')\n"
+    "    print('body2')\n"
+    "\n"
+    "if __name__ == '__main__':\n"
+    "    main()\n"
 )
 
 
@@ -470,10 +489,18 @@ def _tt_rig(tmp_path):
     target = proj / "notes.md"
     target.write_text("x\n")
     env = {k: v for k, v in os.environ.items()
-           if k not in ("VCT_DISABLE_HOOKS", "VCT_ORCHESTRATOR_ROOT", "VCO_RL_TASK_TYPE")}
+           if k not in ("VCT_DISABLE_HOOKS", "VCT_ORCHESTRATOR_ROOT", "VCO_RL_TASK_TYPE",
+                        "VCO_INJECT_PROFILE")}
     env.update({"CLAUDE_PROJECT_DIR": str(proj), "VCT_INSTALL_ROOT": str(orch),
-                "VCT_STATE_DIR": str(tmp_path / "vctstate"), "VCT_BASH_KG_THRESHOLD_CHARS": "10",
-                "HOME": str(tmp_path / "home")})
+                "VCT_STATE_DIR": str(tmp_path / "vctstate"),
+                "HOME": str(tmp_path / "home"),
+                # v0.2.101: the injection wrappers are thin router drivers —
+                # the REAL router resolves from this checkout while the KG
+                # producer stays this rig's stub. (VCT_INSTALL_ROOT above
+                # still wins for the legacy rows' rl_kg_search resolution,
+                # so pre-tool-use is untouched.)
+                "VCT_ORCHESTRATOR_ROOT": str(REPO_ROOT),
+                "VCO_ROUTER_KG_SCRIPT": str(orch / "claude_mcp_servers/scripts/rl_kg_search.py")})
     return orch, proj, target, env
 
 
@@ -481,15 +508,25 @@ _HOOK_CASES = [
     ("pre-edit-context-inject", "pre_edit_kg_search",
      lambda t: {"tool_name": "Edit", "session_id": "s-tt1",
                 "tool_input": {"file_path": str(t), "new_string": "widget reranker notes\n"}}),
+    # v0.2.101 §C1: the trigger must be READ-classified now — a MECHANICAL
+    # command (pytest/build/test) spawns no producer at all by design.
     ("pre-bash-context-inject", "pre_bash_kg_search",
      lambda t: {"tool_name": "Bash", "session_id": "s-tt2",
-                "tool_input": {"command": "python -m pytest tests/test_widget_reranker.py"}}),
-    ("pre-tool-use", "pre_tool_use_kg_search",
-     lambda t: {"tool_name": "Edit", "session_id": "s-tt3",
-                "tool_input": {"file_path": str(t), "old_string": "x", "new_string": "y"}}),
-    ("subagent-start-kg-inject", "subagent_kg_search",
-     lambda t: {"prompt": "implement the widget reranker", "session_id": "s-tt4",
-                "agent_id": "a1", "agent_type": "@agent-coder"}),
+                "tool_input": {"command": "cat tests/test_widget_reranker.py"}}),
+    # v0.2.101 wave-3 (review nit-6): the pre-tool-use row was RETIRED with
+    # its §5 KG-suggestion branch — Edit/Write KG context is the pre-edit/
+    # pre-write router wrappers' one home now (their task types are pinned by
+    # the two rows above). pre_tool_use_kg_search STAYS registered in
+    # KNOWN_TASK_TYPES: the historical RL corpus keeps its partition label.
+    # v0.2.101 §C4/§C5: subagent-start-kg-inject's KG half was RETIRED (the
+    # SubagentStart payload carries no prompt — the old query could never
+    # fire). Its successor surface is the agent-brief PreToolUse hook; the
+    # task_type now travels as the router's --task-type argv (read by this
+    # stub from sys.argv, below) instead of a hook-exported VCO_RL_TASK_TYPE.
+    ("agent-brief-kg-inject", "agent_brief_kg_search",
+     lambda t: {"tool_name": "Agent", "session_id": "s-tt4", "prompt_id": "p-tt4",
+                "tool_input": {"prompt": "Task: implement the widget reranker",
+                               "description": "coder lane", "model": "m"}}),
 ]
 
 
@@ -505,6 +542,11 @@ def test_each_hook_tags_its_own_task_type(tmp_path, shell, hook, expected, paylo
             else ["pwsh", "-NoProfile", "-File", str(HOOKS / f"{hook}.ps1")])
     if hook == "pre-tool-use":
         argv += ["Edit", ""]
+    if hook == "agent-brief-kg-inject":
+        # Thin router wrapper: the REAL router comes from this checkout; the
+        # stub producer above stays the rig's own (VCO_ROUTER_KG_SCRIPT seam).
+        env["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
+        env["VCO_ROUTER_KG_SCRIPT"] = str(orch / "claude_mcp_servers/scripts/rl_kg_search.py")
     proc = subprocess.run(argv, input=json.dumps(payload(target)), capture_output=True,
                           text=True, env=env, cwd=str(orch), timeout=120)
     assert proc.returncode == 0, proc.stderr[-1500:]

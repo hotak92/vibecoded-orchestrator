@@ -139,6 +139,10 @@ class McpScanRulesParityTests(unittest.TestCase):
             self.assertEqual(
                 registry[name]["opt_in_manifest"], info.get("opt_in_manifest", "")
             )
+            self.assertEqual(
+                registry[name]["auto_scrub"], bool(info.get("auto_scrub", False)),
+                f"{name}: auto_scrub drifted from the table",
+            )
 
     def test_builder_emit_order_matches_table_entry_names(self) -> None:
         """The Python entry BUILDER emits entries in the table's

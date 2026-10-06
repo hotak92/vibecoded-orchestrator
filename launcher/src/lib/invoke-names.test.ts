@@ -19,28 +19,12 @@
 
 import { describe, expect, it } from 'vitest';
 import { loadFrontend, loadRust, sourceFile, type SourceFile } from './test-support/source-census';
+// SF-5 (v0.2.101): the shared extractor's ONE home is test-support; this
+// file re-exports it so existing importers keep working.
+import { registeredCommands } from './test-support/wiring-ast';
+export { registeredCommands };
 
 // ─── extraction ────────────────────────────────────────────────────────────
-
-/** Command names in the `generate_handler![ … ]` list of lib.rs. `#[cfg]`
- *  attributes are skipped; the name is the last path segment. */
-export function registeredCommands(lib: SourceFile): string[] {
-  const k = lib.code.search(/\bgenerate_handler!\s*\[/);
-  if (k < 0) return [];
-  const open = lib.code.indexOf('[', k);
-  let depth = 0;
-  let end = open;
-  for (; end < lib.code.length; end++) {
-    if (lib.code[end] === '[') depth++;
-    else if (lib.code[end] === ']' && --depth === 0) break;
-  }
-  const body = lib.code.slice(open + 1, end).replace(/#\[[^\]]*\]/g, ' ');
-  return body
-    .split(',')
-    .map((s) => s.trim())
-    .filter((s) => s !== '')
-    .map((s) => s.split('::').pop()!.trim());
-}
 
 export interface InvokeSite {
   file: string;
@@ -126,7 +110,6 @@ type NotInvokedClass = 'rust-only' | 'tray' | 'owner-deferred' | 'uncalled-findi
 // until then. NOT an open finding — but it is not silent either: each carries
 // the owner's words and the release, and the census still fails the moment it
 // gains a caller (the entry must then be removed).
-const OWNER_RL = 'owner: kept for when RL work resumes (v0.2.102+)';
 const OWNER_0102 = 'owner-deferred to v0.2.102';
 const OWNER_030 = 'owner-deferred to v0.3.0';
 // `rust-only` / `tray` entries name the Rust file that calls the command fn
@@ -154,9 +137,9 @@ const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string; c
     reason: 'tray.rs reads the cached status to label the tray update item',
     caller: 'src/tray.rs',
   },
-  apply_module_db_migrations: { class: 'owner-deferred', reason: OWNER_RL },
-  check_for_weights_update_now: { class: 'owner-deferred', reason: OWNER_RL },
-  delete_project_codegraph_binding: { class: 'owner-deferred', reason: OWNER_0102 },
+  // v0.2.101 Q4: apply_module_db_migrations left this table — it is now
+  // invoked by the module tile's "Re-apply DB migrations" repair action
+  // (ModuleCatalog), gated on the recorded last-apply failure state.
   diagram_grant_access: { class: 'owner-deferred', reason: OWNER_0102 },
   list_diagram_access: { class: 'owner-deferred', reason: OWNER_0102 },
   migrate_to_bind_path: { class: 'owner-deferred', reason: OWNER_0102 },
@@ -164,7 +147,14 @@ const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string; c
   perform_hard_cut: { class: 'owner-deferred', reason: OWNER_030 },
   preflight_install_safety_check: { class: 'owner-deferred', reason: OWNER_0102 },
   read_install_log: { class: 'owner-deferred', reason: OWNER_0102 },
-  restart_rl_container: { class: 'owner-deferred', reason: OWNER_RL },
+  // v0.2.101 Q4: retired commands are GONE from generate_handler!, so they
+  // cannot be listed here (the stale-entry assertion would fail):
+  // check_for_weights_update_now, delete_project_codegraph_binding (and
+  // get_diagrams_token + the all-projects env wrapper went in v0.2.100).
+  restart_rl_container: {
+    class: 'owner-deferred',
+    reason: 'owner 2026-10-05: kept unwired for future RL module enablement ("we need to enable the module later on"); a generic module Restart on the tile would subsume it (v0.2.102+)',
+  },
   set_project_mcp_server_enabled: { class: 'owner-deferred', reason: OWNER_0102 },
   unregister_project_mcp_server: { class: 'owner-deferred', reason: OWNER_0102 },
 };

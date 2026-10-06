@@ -344,6 +344,21 @@ from vco_lib import progress_event as _progress_event  # noqa: E402 — same imp
 # for `connect_v4`.
 from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 — same import-order constraint as the group above
 from vco_lib.containers import runtime_command_hint as _runtime_command_hint  # noqa: E402 — same import-order constraint as the group above
+# v0.2.101 (item 3): the archived-node predicate has ONE home. The seed's
+# change check (vco_lib.install_weaviate) must skip exactly what this script
+# skips — otherwise archived nodes (which never get a stored content_hash) are
+# re-listed as "changed" on every update. Import, not a second copy.
+from vco_lib.kg_node_status import is_archived_node as _is_archived_node_shared  # noqa: E402 — same import-order constraint as the group above
+# v0.2.101 B3: `file_path` / `title` are word-TOKENIZED, so a Weaviate `Equal`
+# returns token-superset rows of OTHER nodes. Every read here that deletes,
+# judges, or picks rows narrows with the filter and confirms in Python through
+# this one home (shared with the MCP `store_knowledge_node`).
+from vco_lib.weaviate_exact_match import (  # noqa: E402 — same import-order constraint as the group above
+    fetch_exact_path_rows as _fetch_exact_path_rows,
+    fetch_matching_rows as _fetch_matching_rows,
+    is_same_title as _is_same_title,
+    path_narrowing_filter as _path_narrowing_filter,
+)
 
 # Try to import query logger.
 #
@@ -769,13 +784,17 @@ def _stored_plan_matches_current(
 
     # Multi-chunk plan with a matching row COUNT — the boundaries must
     # match too. Second fetch pulls just this entry's chunk contents.
-    fetched = collection.query.fetch_objects(
-        filters=_file_path_filter(canonical_fp),
-        limit=100,
-        return_properties=["chunk_num", "content"],
+    # v0.2.101 B3: through the exact-path reader — the tokenized filter alone
+    # also returns token-superset siblings' chunks, which would make the count
+    # below never match (a needless re-chunk of an up-to-date entry).
+    fetched_rows = _fetch_exact_path_rows(
+        collection,
+        _file_path_filter(canonical_fp),
+        canonical_fp,
+        return_properties=["chunk_num", "content", "file_path"],
     )
     numbered: List[Tuple[int, str]] = []
-    for obj in fetched.objects:
+    for obj in fetched_rows:
         props = obj.properties or {}
         num = props.get("chunk_num")
         if not isinstance(num, int) or isinstance(num, bool):
@@ -1659,9 +1678,19 @@ def validate_node_against_vocabulary(node_data: Dict, file_path: Path) -> List[s
     warnings = []
 
     # 1. Type validation (open vocabulary: built-ins + VOCABULARY.md aliases)
+    # v0.2.101 P299-A3: membership is CASE-INSENSITIVE — the declaration
+    # parser lowercases every alias, so `Concept` and `concept` are the same
+    # type. The shared gate (vco_lib.kg_vocabulary.classify_node_type)
+    # classifies case-insensitively; a case-sensitive compare here warned on
+    # a type the gate called known. This validator stays warn-only (it is
+    # also the migrate_to_vocabulary.py report path); the ACT/FAIL decision
+    # lives in sync_node's `_apply_vocabulary_type_gate`.
     valid_types = _load_vocabulary_node_types()
     node_type = node_data.get("node_type", "")
-    if node_type not in valid_types:
+    node_type_key = (
+        node_type.strip().lower() if isinstance(node_type, str) else ""
+    )
+    if node_type_key not in valid_types:
         warnings.append(
             f"Node type '{node_type}' not declared (known: {', '.join(sorted(valid_types))}). "
             f"Declare custom types in knowledge/VOCABULARY.md as a class heading with (alias: `{node_type}`)"
@@ -1720,6 +1749,142 @@ def validate_node_against_vocabulary(node_data: Dict, file_path: Path) -> List[s
             warnings.append("external_links is not valid JSON")
 
     return warnings
+
+
+def _invalid_type_reason(node_type: object) -> str:
+    """The ONE refusal message for an invalid frontmatter `type:` — shared
+    by the pre-write precheck and the post-parse gate so the two can never
+    teach different things."""
+    return (
+        f"invalid node type {node_type!r} — a frontmatter `type:` must be "
+        f"a non-empty single token of letters/digits/'-'/'_'; empty or "
+        f"malformed types are never stored (fix the frontmatter, then "
+        f"re-sync; an UNDECLARED but wellformed type is fine — it is "
+        f"auto-declared in knowledge/VOCABULARY.md)"
+    )
+
+
+def _invalid_type_precheck(
+    content: str, file_path: Path, rel_path: str
+) -> "Optional[SyncOutcome]":
+    """GLM wave-2 review nit 3 (v0.2.101 P299-A3) — refuse an INVALID
+    frontmatter `type:` BEFORE ``_update_frontmatter_timestamp`` runs.
+
+    The gate proper (``_apply_vocabulary_type_gate``) sits after the parse,
+    which is after the timestamp step's file write — so a permanently
+    invalid node (one that can never sync until its frontmatter is fixed)
+    could still get its ``updated:`` field rewritten by the pass that
+    refuses it. This precheck runs the SAME shared decision
+    (``vco_lib.kg_vocabulary.classify_node_type``) on the raw frontmatter,
+    ahead of ANY file side effect, and returns the FAILED outcome for the
+    invalid half only; the extendable half (auto-extend + report line)
+    stays in the post-parse gate, which is where the parsed node lives.
+
+    Archived precedence is preserved: a frontmatter-archived node is
+    deliberately not indexed, so its type never matters — the precheck
+    stands aside (via the shared ``_is_archived_node`` predicate) and the
+    normal frontmatter-archive skip handles it, exactly as before.
+
+    VERSION SKEW: same contract as the gate — ImportError ⇒ ``None`` (the
+    historical warn-only path), never a refusal this install cannot back.
+    """
+    frontmatter, _body = parse_frontmatter(content)
+    if not isinstance(frontmatter, dict) or 'type' not in frontmatter:
+        return None  # folder-derived type — historical warn-only path
+    if _is_archived_node(file_path, frontmatter=frontmatter)[0]:
+        return None  # archived wins: deliberately not indexed, type moot
+    try:
+        from vco_lib.kg_vocabulary import (
+            TYPE_INVALID,
+            classify_node_type,
+            load_vocabulary,
+        )
+    except ImportError:
+        return None  # version skew — warn-only legacy path
+    node_type = frontmatter['type']
+    if classify_node_type(node_type, load_vocabulary(PROJECT_ROOT)) != TYPE_INVALID:
+        return None
+    reason = _invalid_type_reason(node_type)
+    print(f"❌ {rel_path}: {reason}")
+    return SyncOutcome(OUTCOME_FAILED, rel_path, reason)
+
+
+def _apply_vocabulary_type_gate(
+    node_data: Dict, rel_path: str
+) -> "Optional[SyncOutcome]":
+    """v0.2.101 P299-A3 — the node-type vocabulary gate for ONE parsed node.
+
+    ONE home for the decision: ``vco_lib.kg_vocabulary`` — the SAME rule the
+    MCP ``store_knowledge_node`` path applies and ``kg_sync_drift``'s skip
+    predicate mirrors (parity pinned by
+    ``tests/test_v02101_kg_vocabulary_autoextend.py``).
+
+    * unknown-but-wellformed frontmatter ``type:`` → the type is APPENDED to
+      ``knowledge/VOCABULARY.md`` (``extend_vocabulary`` — open vocabulary:
+      the 2026-09 incident rejected 169 of 546 nodes for undeclared types)
+      with a visible report line, and the node syncs normally;
+    * empty/malformed frontmatter ``type:`` → INVALID: returns a FAILED
+      outcome (named in the run's not-synced summary) — never stored, never
+      silently skipped;
+    * folder-derived types (no frontmatter ``type:`` key) keep the historical
+      warn-only path in ``validate_node_against_vocabulary`` — auto-declaring
+      folder names would pollute the vocabulary with "concepts"/"general"
+      nobody declared, and a folder name with odd characters must not FAIL a
+      node whose author never wrote a ``type:`` line;
+    * VERSION SKEW (this bundled script newer than the install's vco_lib —
+      the only ImportError branch, same contract as
+      ``_load_vocabulary_node_types``): historical warn-only behaviour, never
+      extend, never fail.
+
+    Returns the FAILED ``SyncOutcome`` for an invalid type, else ``None``
+    (side effects: the vocabulary append + its report line).
+    """
+    global _VOCABULARY_TYPES_CACHE
+    if not node_data.get("type_from_frontmatter"):
+        return None
+    node_type = node_data.get("node_type")
+    try:
+        from vco_lib.kg_vocabulary import (
+            TYPE_EXTENDABLE,
+            TYPE_INVALID,
+            classify_node_type,
+            extend_vocabulary,
+            load_vocabulary,
+        )
+    except ImportError:
+        return None  # version skew — warn-only legacy path (see docstring)
+
+    decision = classify_node_type(node_type, load_vocabulary(PROJECT_ROOT))
+    if decision == TYPE_INVALID:
+        # Backstop: `_invalid_type_precheck` already refuses these BEFORE the
+        # timestamp side effect (nit 3); this branch only fires if the two
+        # ever disagree, and keeps the gate self-contained. ONE message home.
+        reason = _invalid_type_reason(node_type)
+        print(f"❌ {rel_path}: {reason}")
+        return SyncOutcome(OUTCOME_FAILED, rel_path, reason)
+    if decision == TYPE_EXTENDABLE:
+        result = extend_vocabulary(PROJECT_ROOT, [node_type])
+        if result.added:
+            # The file just grew — drop this script's resolved-types cache so
+            # the validator below (and every later node in this run) sees the
+            # declaration instead of re-warning on a type now declared.
+            _VOCABULARY_TYPES_CACHE = None
+            print(
+                f"📖 Auto-declared node type '{result.added[0]}' in "
+                f"knowledge/VOCABULARY.md (open vocabulary — the node syncs "
+                f"normally)"
+            )
+        if result.error:
+            # Soft-fail, LOUD: the node still syncs (a vocabulary write
+            # failure must never drop a node — that is the very defect this
+            # gate closes), and the next run retries the append.
+            print(
+                f"⚠️  Could not extend knowledge/VOCABULARY.md "
+                f"({result.error}) — syncing the node anyway; declare "
+                f"`(alias: {str(node_type).strip().lower()})` manually to "
+                f"silence the type warning"
+            )
+    return None
 
 
 def parse_markdown_node(content: str, file_path: Path) -> Dict:
@@ -1813,9 +1978,11 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
     # directory)
     if frontmatter and 'type' in frontmatter:
         node_type = frontmatter['type']
+        type_from_frontmatter = True
     else:
         rel_path = file_path.relative_to(KNOWLEDGE_ROOT)
         node_type = str(rel_path.parts[0]) if len(rel_path.parts) > 1 else "general"
+        type_from_frontmatter = False
 
     # Temporal metadata from frontmatter
     temporal_data = {}
@@ -1932,6 +2099,14 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
     # an explicit key list, so this never reaches the collection schema.
     if frontmatter and 'scope' in frontmatter:
         result["scope"] = frontmatter['scope']
+
+    # v0.2.101 P299-A3: where node_type came from. The vocabulary gate in
+    # `sync_node` auto-extends / fails ONLY a frontmatter-declared `type:` —
+    # a folder-derived value keeps the historical warn-only path (auto-
+    # declaring folder names like "concepts"/"general" would pollute the
+    # vocabulary with types nobody declared). Same key-list contract as
+    # `scope` above: NOT a Weaviate property.
+    result["type_from_frontmatter"] = type_from_frontmatter
 
     # Add temporal metadata if present
     result.update(temporal_data)
@@ -3040,10 +3215,17 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # slot is populated. `include_vector=True` returns `obj.vector` as
         # a dict keyed by slot name for named-vector collections.
         _vectors_requested = True
+        # v0.2.101 B3: `existing` is the EXACT-path row list (or None). The
+        # tokenized filter only narrows the read; `_fetch_exact_path_rows`
+        # keeps the rows whose raw `file_path` names THIS doc, so the gate
+        # below judges — and the delete further down removes — this doc's
+        # rows only, never a token-superset sibling's (`docs/README.md` ⊂
+        # `docs/setup/README.md`).
         try:
-            existing = coll.query.fetch_objects(
-                filters=_file_path_filter(doc_data["file_path"]),
-                limit=100,
+            existing = _fetch_exact_path_rows(
+                coll,
+                _file_path_filter(doc_data["file_path"]),
+                doc_data["file_path"],
                 return_properties=_base_return_props,
                 include_vector=True,
             )
@@ -3063,9 +3245,10 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             print(f"   (fetch_objects(include_vector=True) failed: "
                   f"{fetch_err}; falling back to hash-only check)")
             try:
-                existing = coll.query.fetch_objects(
-                    filters=_file_path_filter(doc_data["file_path"]),
-                    limit=100,
+                existing = _fetch_exact_path_rows(
+                    coll,
+                    _file_path_filter(doc_data["file_path"]),
+                    doc_data["file_path"],
                     return_properties=_base_return_props,
                 )
             except Exception:
@@ -3097,12 +3280,12 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # an aborted embedding-model change leaves behind — and it is why
         # `last_installed_active_embedding` had no repair path on the KG
         # side (see install.py's leg-(b) gate).
-        if existing is not None and existing.objects:
+        if existing:
             try:
                 existing_hashes: List[str] = []
                 existing_total_chunks: List[int] = []
                 existing_file_paths: List[str] = []
-                for obj in existing.objects:
+                for obj in existing:
                     props = obj.properties or {}
                     existing_hashes.append(props.get("content_hash", "") or "")
                     tc = props.get("total_chunks", 0)
@@ -3133,11 +3316,13 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 )
                 # v0.2.92 WP-B1 (D13): skip only when no found row
                 # reports a NON-canonical (legacy backslash) file_path —
-                # same rule as sync_node's fast path. A row not reporting
-                # a file_path at all cannot be judged and keeps the
-                # pre-v0.2.92 skip semantics (conservative default).
+                # same rule as sync_node's fast path. v0.2.101 B3: every
+                # row here was CONFIRMED to name this doc (exact-path
+                # reader), so a row without a file_path never reaches this
+                # gate; the only non-canonical value left is a legacy
+                # separator spelling, which must re-write to heal.
                 shapes_ok = all(
-                    fp in ("", doc_data["file_path"]) for fp in existing_file_paths
+                    fp == doc_data["file_path"] for fp in existing_file_paths
                 )
                 # v0.2.95 WP-5: ONE home for this decision — the same
                 # `_active_slot_gate_ok` `sync_node` now calls. The inline
@@ -3150,7 +3335,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 slots_ok = _active_slot_gate_ok(
                     coll,
                     DEV_COLLECTION_NAME,
-                    existing.objects,
+                    existing,
                     active_slot,
                     vectors_requested=_vectors_requested,
                 )
@@ -3207,7 +3392,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # versions and re-embed. The `content_hash` written below means
         # the NEXT re-sync will hit the fast path.
         if existing is not None:
-            for obj in existing.objects:
+            for obj in existing:
                 coll.data.delete_by_id(obj.uuid)
 
         source_id = str(uuid.uuid4())
@@ -3322,18 +3507,23 @@ def _delete_doc_by_file_path(server: WeaviateMCPServer, file_path_value: str) ->
 
     Mirror of :func:`_delete_node_by_file_path` for the development
     collection. ``file_path`` is unique per doc, so this never collides
-    with an active sibling the way the title-scoped delete did.
+    with an active sibling the way the title-scoped delete did — PROVIDED
+    the match is exact: v0.2.101 B3 confirms each row's raw ``file_path``
+    in Python (``_fetch_exact_path_rows``), because the tokenized filter
+    alone also returns token-superset siblings' rows.
     """
     if not DEV_COLLECTION_NAME:
         return 0
     try:
         coll = server.client.collections.get(DEV_COLLECTION_NAME)
-        existing = coll.query.fetch_objects(
-            filters=_file_path_filter(file_path_value),
-            limit=100,
+        existing = _fetch_exact_path_rows(
+            coll,
+            _file_path_filter(file_path_value),
+            file_path_value,
+            return_properties=["file_path"],
         )
         n = 0
-        for obj in existing.objects:
+        for obj in existing:
             coll.data.delete_by_id(obj.uuid)
             n += 1
         return n
@@ -3368,6 +3558,28 @@ def sync_all_docs(server: WeaviateMCPServer) -> "SyncTally":
         f"synced docs: {total} nodes ({tally.succeeded} ok, "
         f"{tally.failed} failed, {tally.skipped} skipped)")
     return tally
+
+
+def _title_target_row(collection, title: str, **fetch_kwargs):
+    """The first chunk-1 row whose ``title`` names *title* — or ``None``.
+
+    ``title`` is word-tokenized, so ``Filter...equal(title)`` is a NARROWING
+    read that also returns every title CONTAINING the link's tokens. The row
+    is confirmed in Python with ``is_same_title`` (same token sequence — the
+    case/punctuation insensitivity a WikiLink relies on, minus the superset
+    matches). One home for the two WikiLink-target lookups below.
+    """
+    if not title:
+        return None
+    rows = _fetch_matching_rows(
+        collection,
+        Filter.by_property("title").equal(title)
+        & Filter.by_property("chunk_num").equal(1),  # first chunk has full metadata
+        lambda props: _is_same_title(props.get("title"), title),
+        max_matches=1,
+        **fetch_kwargs,
+    )
+    return rows[0] if rows else None
 
 
 def infer_tags_from_typed_links(
@@ -3413,18 +3625,21 @@ def infer_tags_from_typed_links(
             relation = link.get("relation_type", "")
             target_title = link.get("target_title", "")
 
-            # Query target node
-            results = collection.query.fetch_objects(
-                filters=Filter.by_property("title").equal(target_title) &
-                       Filter.by_property("chunk_num").equal(1),
-                limit=1,
-                return_properties=["tags", "node_type"]
+            # Query target node.
+            # v0.2.101 B3 follow-up: `title` is word-TOKENIZED, so `Equal`
+            # matches every title CONTAINING the link's tokens, and the old
+            # `limit=1` took whichever came first — `[[uses::Weaviate]]`
+            # inherited the tags of e.g. "Weaviate Windows Ports Gotcha".
+            # The filter now only narrows; `_title_target_row` keeps the first
+            # row whose title has the SAME token sequence as the link.
+            target_row = _title_target_row(
+                collection, target_title,
+                return_properties=["tags", "node_type", "title"],
             )
-
-            if not results.objects:
+            if target_row is None:
                 continue
 
-            target_props = results.objects[0].properties
+            target_props = target_row.properties or {}
             target_tags = target_props.get("tags", [])
 
             # Rule 1: Inherit capability tags from used/implemented tools
@@ -3481,14 +3696,12 @@ def resolve_wikilinks_to_uuids(
         for link_title in wikilinks:
             # Query for nodes with matching title (case-insensitive)
             # Note: For chunked nodes, we want the parent node, not chunks
-            results = collection.query.fetch_objects(
-                filters=Filter.by_property("title").equal(link_title) &
-                       Filter.by_property("chunk_num").equal(1),  # Get first chunk (has full metadata)
-                limit=1
-            )
-
-            if results.objects:
-                uuids.append(str(results.objects[0].uuid))
+            # v0.2.101 B3 follow-up: exact token-sequence title match (see
+            # `_title_target_row`) — the tokenized `Equal` + `limit=1` pointed
+            # a cross-reference at whichever CONTAINING title came first.
+            target_row = _title_target_row(collection, link_title)
+            if target_row is not None:
+                uuids.append(str(target_row.uuid))
 
         return uuids
 
@@ -3533,25 +3746,30 @@ def _relative_file_path(file_path: Path) -> str:
 
 
 def _file_path_filter(canonical: str):
-    """Weaviate filter matching ``file_path`` rows for *canonical* — BOTH
+    """NARROWING read filter for *canonical*'s ``file_path`` rows — BOTH
     spellings when a legacy backslash variant exists.
 
     v0.2.92 WP-B1 transition rule (state-keyed, not version-keyed): rows
     written by a pre-canonical Windows sync carry ``knowledge\\concepts\\
-    foo.md``. A POSIX-only exact filter would MISS them, so the delete
-    that accompanies every re-write would leave them behind and the
-    insert would add a duplicate set — the exact defect this closes.
-    Mirrors server.py's C-7 delete filter (OR of two EXACT ``.equal()``
-    predicates — never ``contains_any``, which is token-based) so the
-    sync script and the MCP delete with the same semantics.
+    foo.md``; the filter asks for both spellings so the upsert's delete
+    reaches them instead of leaving a duplicate set behind.
+
+    v0.2.101 B3 — TRUTH REPAIR: this docstring used to call the filter an
+    "OR of two EXACT ``.equal()`` predicates". It is not exact.
+    ``file_path`` is ``TEXT`` with Weaviate's default ``word`` tokenization,
+    so ``Equal`` matches every row whose token set CONTAINS the path's tokens
+    — ``knowledge/concepts/knowledge-graph.md`` also returns the rows of
+    ``orchestrator-knowledge-graph.md`` and ``orchestrator-code-graph.md``.
+    Every caller deleted that whole set, wiping active siblings. So this is
+    a candidate-selection filter ONLY: every reader passes it to
+    ``_fetch_exact_path_rows``, which keeps the rows whose RAW ``file_path``
+    names *canonical* (compared in Python) before anything is judged or
+    deleted. Built by the one shared home
+    (``vco_lib.weaviate_exact_match.path_narrowing_filter``) that the MCP
+    ``store_knowledge_node`` also uses; the module-level ``Filter`` is
+    passed in so tests can swap it for an in-memory fake.
     """
-    backslash_variant = canonical.replace("/", "\\")
-    if backslash_variant != canonical:
-        return Filter.any_of([
-            Filter.by_property("file_path").equal(canonical),
-            Filter.by_property("file_path").equal(backslash_variant),
-        ])
-    return Filter.by_property("file_path").equal(canonical)
+    return _path_narrowing_filter(Filter, canonical)
 
 
 def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -> int:
@@ -3568,15 +3786,26 @@ def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -
     Returns the number of objects deleted. Silent (returns 0) when the
     collection is missing or the connection is down — sync must not block
     on best-effort cleanup.
+
+    v0.2.101 B3: "unique per node" holds only for an EXACT match. The
+    tokenized ``file_path`` filter also returns token-superset siblings
+    (archiving ``concepts/knowledge-graph.md`` used to delete the rows of the
+    active ``concepts/orchestrator-knowledge-graph.md``), so the rows are
+    confirmed in Python by ``_fetch_exact_path_rows`` before any delete.
+    Callers: the two archived-node branches of ``sync_node``, the project →
+    shared migration delete (``_finish_shared_scope_write``) and the
+    v0.2.101 archived-removal routing — all go through this function.
     """
     try:
         coll = server.client.collections.get(COLLECTION_NAME)
-        existing = coll.query.fetch_objects(
-            filters=_file_path_filter(file_path_value),
-            limit=100,
+        existing = _fetch_exact_path_rows(
+            coll,
+            _file_path_filter(file_path_value),
+            file_path_value,
+            return_properties=["file_path"],
         )
         n = 0
-        for obj in existing.objects:
+        for obj in existing:
             coll.data.delete_by_id(obj.uuid)
             n += 1
         return n
@@ -3742,11 +3971,15 @@ def _notice_leftover_shared_rows(server: "WeaviateMCPServer", fp_value: str) -> 
         return
     try:
         coll = server.client.collections.get(SHARED_COLLECTION_NAME)
-        existing = coll.query.fetch_objects(
-            filters=_file_path_filter(fp_value),
-            limit=100,
+        # v0.2.101 B3: count only rows that name THIS file_path exactly —
+        # the tokenized filter alone would also count siblings' rows.
+        existing = _fetch_exact_path_rows(
+            coll,
+            _file_path_filter(fp_value),
+            fp_value,
+            return_properties=["file_path"],
         )
-        n = len(existing.objects)
+        n = len(existing)
         if n:
             print(
                 f"   ℹ️  {n} row(s) for '{fp_value}' remain in shared "
@@ -3795,18 +4028,11 @@ def _is_archived_node(file_path: Path, frontmatter: dict | None = None) -> tuple
     upstream skipping is the cleaner default: it keeps the index lean and
     avoids paying embedding cost for content that won't surface.
     """
-    parts = file_path.parts
-    # Exact segment match for `archive`, `.archive`, `_archive` — NOT a
-    # substring match (would catch `architecture/`, `archived-notes/`).
-    _ARCHIVE_DIR_SEGMENTS = {"archive", ".archive", "_archive"}
-    archive_hit = next((p for p in parts if p in _ARCHIVE_DIR_SEGMENTS), None)
-    if archive_hit is not None:
-        return True, f"path contains {archive_hit!r} segment ({file_path})"
-    if frontmatter is not None:
-        status = (frontmatter.get("status") or "").strip().lower()
-        if status in ("archived", "deprecated", "superseded"):
-            return True, f"frontmatter status={status!r}"
-    return False, ""
+    # v0.2.101 (item 3): ONE predicate, shared with the seed's change check.
+    # The rule (path segments / frontmatter status) lives in
+    # `vco_lib.kg_node_status`; this name stays so the skip/delete call-sites
+    # and their tests are untouched.
+    return _is_archived_node_shared(file_path, frontmatter)
 
 
 # NEW-11 (2026-05-28): normalize typed_links to list-of-objects before any
@@ -3941,6 +4167,19 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
 
         # Read, auto-update `updated:` timestamp, write back, then parse
         content = file_path.read_text(encoding='utf-8')
+
+        # v0.2.101 nit 3 (GLM wave-2 review): refuse an INVALID frontmatter
+        # `type:` BEFORE the timestamp write below — a node that can never
+        # sync must not get its `updated:` bumped by the run that refuses it
+        # (no file side effect at all for a refused node).
+        _precheck_failure = _invalid_type_precheck(
+            content, file_path, _relative_file_path(file_path)
+        )
+        if _precheck_failure is not None:
+            # NOT dead: consumed by the finally-block ToolUsageLogger row.
+            error_msg = _precheck_failure.reason
+            return _precheck_failure
+
         content = _update_frontmatter_timestamp(file_path, content)
         node_data = parse_markdown_node(content, file_path)
 
@@ -4048,6 +4287,24 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         if targets_shared:
             print(f"   ↪ scope: shared → routing to '{target_collection_name}'")
 
+        # ── v0.2.101 P299-A3: node-type vocabulary gate ──────────────────
+        # The ACT/FAIL decision (shared home: vco_lib.kg_vocabulary — the
+        # MCP store path and the drift scanner apply the SAME rule): an
+        # undeclared wellformed `type:` AUTO-EXTENDS knowledge/VOCABULARY.md
+        # and syncs; an empty/malformed one FAILS loudly into this run's
+        # not-synced summary. Runs BEFORE the warn-only validation below (an
+        # auto-declared type no longer warns) and BEFORE any Weaviate
+        # query/write for this node.
+        _gate_failure = _apply_vocabulary_type_gate(
+            node_data, _relative_file_path(file_path)
+        )
+        if _gate_failure is not None:
+            # NOT dead: consumed by the finally-block ToolUsageLogger row
+            # (success=error_msg is None) — the same contract the scope
+            # refusals above follow.
+            error_msg = _gate_failure.reason
+            return _gate_failure
+
         # Validate against vocabulary (report warnings, don't block sync)
         validation_warnings = validate_node_against_vocabulary(node_data, file_path)
         if validation_warnings:
@@ -4101,9 +4358,17 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
 
         # Query for existing nodes with same file_path — BOTH spellings
         # (v0.2.92 WP-B1 / D13): a legacy Windows-written row carries the
-        # backslash variant; an exact POSIX-only filter would miss it, the
-        # delete below would skip it, and the insert would duplicate it.
+        # backslash variant; a POSIX-only filter would miss it, the delete
+        # below would skip it, and the insert would duplicate it.
+        #
+        # v0.2.101 B3: `where_filter` is a NARROWING read only — `file_path`
+        # is word-tokenized, so it also returns token-superset siblings
+        # (`concepts/knowledge-graph.md` → `orchestrator-code-graph.md`'s
+        # rows). Each rung below reads through `_fetch_exact_path_rows`, so
+        # `existing_rows` holds THIS node's rows only: the embed-skip gate
+        # judges them and the delete-and-re-embed removes them, nothing else.
         where_filter = _file_path_filter(node_data["file_path"])
+        _canonical_fp = node_data["file_path"]
         # v0.2.95 WP-5: request VECTORS too, so the embed-skip gate below can
         # see whether the ACTIVE named-vector slot is actually populated.
         # Until now this fetch omitted `include_vector`, which is why a node
@@ -4161,18 +4426,16 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         _vectors_requested = True
         _metadata_props_available = True
         try:
-            existing = collection.query.fetch_objects(
-                filters=where_filter,
-                limit=100,
+            existing_rows = _fetch_exact_path_rows(
+                collection, where_filter, _canonical_fp,
                 return_properties=_base_return_props + _repairable_ask,
                 include_vector=True,
             )
         except Exception as _meta_fetch_err:  # noqa: BLE001 — older client / legacy schema
             _metadata_props_available = False
             try:
-                existing = collection.query.fetch_objects(
-                    filters=where_filter,
-                    limit=100,
+                existing_rows = _fetch_exact_path_rows(
+                    collection, where_filter, _canonical_fp,
                     return_properties=_base_return_props,
                     include_vector=True,
                 )
@@ -4180,9 +4443,8 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 print(f"   (fetch_objects(include_vector=True) failed: "
                       f"{_vec_fetch_err}; falling back to hash-only check)")
                 _vectors_requested = False
-                existing = collection.query.fetch_objects(
-                    filters=where_filter,
-                    limit=100,
+                existing_rows = _fetch_exact_path_rows(
+                    collection, where_filter, _canonical_fp,
                     return_properties=_base_return_props,
                 )
 
@@ -4207,7 +4469,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             existing_hashes: List[str] = []
             existing_total_chunks: List[int] = []
             existing_file_paths: List[str] = []
-            for obj in existing.objects:
+            for obj in existing_rows:
                 props = obj.properties or {}
                 existing_hashes.append(props.get("content_hash", "") or "")
                 # total_chunks may be int OR (legacy) missing/None.
@@ -4237,13 +4499,13 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             # row reports a NON-canonical (legacy backslash) spelling — a
             # legacy-shaped row reached through the dual-shape filter must
             # NOT be preserved by the fast path; it falls through to
-            # delete-and-rewrite so the row shape itself heals. A row that
-            # does not report a file_path at all (older clients / fixtures
-            # that ignore return_properties) cannot be judged and keeps
-            # the pre-v0.2.92 skip semantics (conservative default: no
-            # new re-embed on unverifiable data).
+            # delete-and-rewrite so the row shape itself heals.
+            # v0.2.101 B3: every row here was CONFIRMED to name this node
+            # (exact-path reader), so a row that reports no file_path never
+            # reaches this gate any more; the only non-canonical value left
+            # is a legacy separator spelling of this same path.
             shapes_canonical = all(
-                fp in ("", node_data["file_path"]) for fp in existing_file_paths
+                fp == node_data["file_path"] for fp in existing_file_paths
             )
             # v0.2.92 chunk-plan transition repair: a revision crossing is
             # pending when the deferral ledger carries
@@ -4280,7 +4542,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 _slots_ok = _active_slot_gate_ok(
                     collection,
                     target_collection_name,
-                    existing.objects,
+                    existing_rows,
                     _active_slot_for_gate,
                     vectors_requested=_vectors_requested,
                 )
@@ -4340,7 +4602,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 try:
                     _, _repair_err = _repair_stale_metadata(
                         collection,
-                        existing.objects,
+                        existing_rows,
                         node_data,
                         metadata_props_available=_metadata_props_available,
                     )
@@ -4365,7 +4627,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             print(f"   (embed-skip check failed: {skip_err}; re-embedding)")
 
         deleted_count = 0
-        for obj in existing.objects:
+        for obj in existing_rows:  # exact-path rows only (v0.2.101 B3)
             collection.data.delete_by_id(obj.uuid)
             deleted_count += 1
 
@@ -4817,7 +5079,7 @@ def _details_log_path() -> "Optional[Path]":
 
 
 def _print_run_details(*tallies: "SyncTally", run_kind: str) -> None:
-    """End-of-run honesty block (v0.2.92 WP-B1 / D12).
+    """End-of-run honesty block (v0.2.92 WP-B1 / D12; v0.2.101 P299-A3).
 
     Names every path that did NOT end in a real sync — failures with their
     reason, and every skip category with its reason — instead of letting
@@ -4825,6 +5087,20 @@ def _print_run_details(*tallies: "SyncTally", run_kind: str) -> None:
     ``_DETAILS_PRINT_CAP`` stdout lines; the complete list is written to
     the run log under ``<vct_root>/logs/`` (soft-fail: if the log can't be
     written, the bounded stdout block still prints).
+
+    v0.2.101 (P299-A3): this line IS the owner-directed
+    ``N of M … not synced: <reasons>`` summary — N of the M items the run
+    CONSIDERED, with counts per reason category (the per-path lines below
+    carry each item's exact reason). It deliberately extends THIS mechanism
+    instead of adding a second summary printer (one concern, one home).
+    GLM wave-2 review nit 4: the noun is ``items``, not ``nodes`` — M is
+    every considered outcome, which INCLUDES excluded non-nodes (meta
+    files like VOCABULARY.md/TAG_HIERARCHY.md, out-of-root targets), and
+    N counts their records too; the breakdown names that category
+    explicitly (``K excluded-skipped``), so the denominator stays honest.
+    The ``📊 … S succeeded, F failed, K skipped`` fragment parsed by the
+    launcher (kg_sync.rs::parse_summary_line) is a DIFFERENT line and
+    stays untouched.
 
     ``tallies`` may be empty (nothing to report → no output at all).
     """
@@ -4841,7 +5117,11 @@ def _print_run_details(*tallies: "SyncTally", run_kind: str) -> None:
             OUTCOME_FRONTMATTER_SKIPPED, OUTCOME_EXCLUDED_SKIPPED,
         ) if counts.get(c)
     )
-    print(f"📋 {len(records)} not-synced item(s) this run ({run_kind}): {breakdown}")
+    considered = sum(t.total for t in tallies)
+    print(
+        f"📋 {len(records)} of {considered} items not synced this run "
+        f"({run_kind}): {breakdown}"
+    )
 
     log_path = None
     try:
@@ -5281,8 +5561,15 @@ def _run_check_drift() -> None:
     print(
         f"   scanned={report.scanned} archived_skipped={report.archived_skipped} "
         f"excluded_skipped={report.excluded_skipped} "
-        f"shared_scope_skipped={report.shared_scope_skipped}"
+        f"shared_scope_skipped={report.shared_scope_skipped} "
+        f"invalid_type_skipped={report.invalid_type_skipped}"
     )
+    if report.invalid_type_skipped:
+        print(
+            "   ⚠️  invalid-type node(s) skipped — a frontmatter `type:` that "
+            "is empty/malformed can never sync (kg-sync FAILS it loudly); "
+            "fix the frontmatter, then re-run `.claude/scripts/kg-sync --all`."
+        )
     if report.missing:
         print(f"   missing from Weaviate ({len(report.missing)}):")
         for p in report.missing:
@@ -5612,6 +5899,14 @@ def main():
                 # only a FULLY successful --all proves the failed nodes
                 # from an earlier run actually landed.
                 _clear_sync_failures_deferral(PROJECT_ROOT)
+                # v0.2.101 item 4: and, when THIS run targeted the shared
+                # collection, it retires the shared-seed entry install.py
+                # enqueued. Narrow by construction — a normal project run has
+                # COLLECTION_NAME != SHARED_COLLECTION_NAME and clears nothing;
+                # the orchestrator root (where the two names ARE equal) never
+                # enqueues this row at all.
+                if _targets_shared_collection():
+                    _clear_shared_seed_deferral(PROJECT_ROOT)
                 # v0.2.94: and it retires the DRIFT entry `--check-drift` wrote.
                 #
                 # The launcher's bundle-update gate now runs `--check-drift`
@@ -5684,6 +5979,13 @@ def main():
                 # run resolved a REAL collection — is the helper's; see it.)
                 if _METADATA_REPAIR_FAILED_COUNT == 0:
                     _record_metadata_repair_pass(PROJECT_ROOT)
+                # v0.2.101 (caller-audit Gap 4/5/6): the run that walked the
+                # whole tree records WHAT it walked it against. ONE rule in ONE
+                # place, so every seeding entry point converges — install's
+                # foreground seed, the detached driver (install-spawned OR
+                # session-start), the launcher's Sync button, migrate-collections
+                # and a hand-run `kg-sync --all` all run THIS script.
+                _record_context_triple(total_fail)
             else:
                 # v0.2.92 D17: record the per-node failures as owed,
                 # auto-retryable work — pre-fix, failed nodes were counted
@@ -5801,6 +6103,14 @@ _SYNC_NO_BACKEND_CID = "kg_sync_no_embedding_backend"
 #: project once the backend answers. Named once, same discipline.
 _SYNC_FAILURES_CID = "kg_sync_failures_pending"
 
+#: v0.2.101 item 4: owed-work condition for the SHARED-collection seed that
+#: install.py enqueues (it used to block on it). Registered in
+#: ``vco_lib/deferral_conditions.toml`` as ``auto_retryable`` with
+#: ``retry_action = "retry:py:kg_seed_shared"``. The paired clear is HERE —
+#: the run that targets the shared class is the only thing that proves the
+#: shared seed landed, so the clear lives with that run. Named once.
+_SYNC_SHARED_CID = "kg_sync_shared_pending"
+
 
 def _clear_sync_deferral_no_backend(install_root: Path) -> None:
     """Resolve ``kg_sync_no_embedding_backend`` after a SUCCESSFUL tree sync.
@@ -5917,6 +6227,79 @@ def _clear_sync_failures_deferral(install_root: Path) -> None:
         from vco_lib.deferral_emit import resolve_conditions
 
         resolve_conditions(install_root, (_SYNC_FAILURES_CID,))
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (deferral clear failed: {inner})", file=sys.stderr)
+
+
+def _record_context_triple(failures: int) -> None:
+    """Record the context this whole-tree run embedded against (v0.2.101).
+
+    Called from the ``--all`` success path, and *failures* is the run's REAL
+    per-node failure count — passed in rather than assumed zero, so the RULE in
+    ``vco_lib.kg_context_triple.certified_from_run`` refuses a failing run by
+    itself. (Placement inside the ``total_fail == 0`` branch is a second guard,
+    not the only one: a call moved out of the branch must not record.) The rest
+    of the rule: whole-tree, a POSITIVELY RESOLVED collection (a run that fell
+    back to the literal ``"KnowledgeGraph"`` proved a pass over a class nobody
+    reads), the tree being the ORCHESTRATOR ROOT's, and no shared-target marker.
+
+    The profile comes from this process's own env / launcher.db tier
+    (``active_embedding_profile``), so a child spawned by the launcher or by hand
+    records the same value an install-spawned one does.
+
+    Soft-fail: bookkeeping must never change a sync's exit code.
+    """
+    try:
+        import os as _os
+
+        from vco_lib.kg_context_triple import SHARED_SEED_ENV, record_from_run
+        from vco_lib.orchestrator_identity import is_orchestrator_clone
+
+        record_from_run(
+            whole_tree=True,
+            failures=failures,
+            kg_collection_resolved=_KG_COLLECTION_RESOLVED,
+            # SF-1: the row is machine-global and install.py compares it for the
+            # ROOT's seed — a registered project's own `--all` must leave it be.
+            orchestrator_root=is_orchestrator_clone(PROJECT_ROOT),
+            # A shared-targeted pass says nothing about the per-project context.
+            shared_targeted=_os.environ.get(SHARED_SEED_ENV) == "1",
+            kg_collection=COLLECTION_NAME,
+            shared_kg_collection=SHARED_COLLECTION_NAME,
+        )
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (context-triple record failed: {inner})", file=sys.stderr)
+
+
+def _targets_shared_collection() -> bool:
+    """Did THIS run seed the SHARED class rather than the project's own?
+
+    v0.2.101 item 4 — the gate on ``_clear_shared_seed_deferral``. True only
+    when a shared class is configured AND the run's effective target IS that
+    class (which is what ``KG_COLLECTION=<shared>`` in the child env produces).
+    A normal project run targets its own class and must clear nothing.
+    """
+    return bool(SHARED_COLLECTION_NAME) and COLLECTION_NAME == SHARED_COLLECTION_NAME
+
+
+def _clear_shared_seed_deferral(install_root: Path) -> None:
+    """Resolve ``kg_sync_shared_pending`` after a successful SHARED-collection
+    tree sync (v0.2.101 item 4).
+
+    install.py enqueues the shared seed instead of blocking on it, so the owed
+    work needs a paired resolution — and THIS run is the only thing that proves
+    it: the entry says "the project's knowledge/ has not been pushed into the
+    shared class yet", and only an ``--all`` run that TARGETED that class with
+    ZERO failures retires it. A normal project run does not target the shared
+    class, so it deliberately does not clear (the same narrow-clear shape as
+    ``_clear_sync_failures_deferral``).
+
+    Soft-fail: the sync's exit code must never depend on ledger bookkeeping.
+    """
+    try:
+        from vco_lib.deferral_emit import resolve_conditions
+
+        resolve_conditions(install_root, (_SYNC_SHARED_CID,))
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"   (deferral clear failed: {inner})", file=sys.stderr)
 

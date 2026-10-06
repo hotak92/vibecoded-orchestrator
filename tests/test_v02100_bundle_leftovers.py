@@ -50,6 +50,8 @@ _GIT_ENV = {
 }
 
 OLD_AGENT = b"---\nname: old-helper\n---\n# Old helper\nPlain body, no placeholders.\n"
+OLD_SKILL = b"---\nname: old-skill\n---\n# Old skill\nPlain body, no placeholders.\n"
+OLD_SPEC = b"# Old field\nA plain specialisation doc, no placeholders.\n"
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -69,9 +71,18 @@ def _make_templates(root: Path) -> None:
     (t / "scripts" / "__pycache__").mkdir()
     (t / "scripts" / "__pycache__" / "junk.py").write_text("junk\n", encoding="utf-8")
     (t / "agents" / "free").mkdir(parents=True)
-    (t / "agents" / "free" / "coder.md").write_text(
-        "# Coder\nAt {{ORCHESTRATOR_ROOT}}\n", encoding="utf-8")
+    # Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+    (t / "agents" / "free" / "example-agent.md").write_text(
+        "# Example agent\nAt {{ORCHESTRATOR_ROOT}}\n", encoding="utf-8")
     (t / "agents" / "free" / "old-helper.md").write_bytes(OLD_AGENT)
+    # v0.2.101 §9.3: a prior-shipped SKILL directory and a SPECIALIZATIONS doc
+    # (the new plain-copy kind) — both retired in a later commit and proved by
+    # git-history byte-match in the leftover pass. No placeholders, so the
+    # installed bytes equal the retired template blob exactly.
+    (t / "skills" / "old-skill").mkdir(parents=True)
+    (t / "skills" / "old-skill" / "SKILL.md").write_bytes(OLD_SKILL)
+    (t / "specializations" / "fields").mkdir(parents=True)
+    (t / "specializations" / "fields" / "old-field.md").write_bytes(OLD_SPEC)
     settings = json.dumps({"permissions": {"allow": ["Bash"]}, "hooks": {}})
     (t / "settings.json.linux.template").write_text(settings, encoding="utf-8")
     (t / "settings.json.windows.template").write_text(settings, encoding="utf-8")
@@ -101,6 +112,19 @@ class _Base(unittest.TestCase):
         _git(self.orch, "mv", "templates/agents/free/old-helper.md",
              "templates/agents/_archive/old-helper.md")
         _git(self.orch, "commit", "-q", "-m", "archive old-helper")
+
+    def _git_rm(self, *rels: str) -> None:
+        """Retire template paths (git history keeps the shipped blob, so the
+        leftover pass can still byte-match a hand-restored copy)."""
+        _git(self.orch, "rm", "-q", *rels)
+        _git(self.orch, "commit", "-q", "-m", f"retire {rels}")
+
+    def _drop_manifest_entries(self, *rels: str) -> None:
+        mpath = self.proj / ".claude/.vco-manifest.json"
+        manifest = json.loads(mpath.read_text())
+        for rel in rels:
+            manifest["files"].pop(rel, None)
+        mpath.write_text(json.dumps(manifest))
 
     def _install(self, folder=None, **kw):
         return project_init.install_project_bundle(
@@ -132,6 +156,54 @@ class LeftoverPolicyTests(_Base):
         self.assertIn("v0.0.1", row.detected)
         self.assertIn("backup:", row.detected)
         self.assertTrue(any("retired VCO file" in n for n in result.get("notes", [])))
+
+    def test_retired_hook_lib_file_is_removed_from_an_installed_project(self):
+        """v0.2.101 wave-3 (injection redesign SF-2): four `_lib` helpers
+        (codegraph-query, command-noise-strip, query-cache ×2 flavours) were
+        DELETED from templates/hooks/_lib/ — installed projects carry copies
+        under `.claude/hooks/_lib/`, and nothing sources them any more. This
+        pins the delivery chain for that shape on the fixture stand-in
+        (`_lib/x.sh`, shipped by _make_templates): a manifest-tracked _lib
+        file whose template path was retired must NOT survive the next
+        bundle update as an inert orphan.
+
+        The retirement pins in test_codegraph_hook_gates_v0270.py only prove
+        the TEMPLATES absence; this row proves the installed-project side.
+        """
+        self._install(update_mode=False)
+        lib = self.proj / ".claude" / "hooks" / "_lib" / "x.sh"
+        self.assertTrue(lib.is_file(), "fixture precondition: the lib shipped")
+        manifest = json.loads((self.proj / ".claude/.vco-manifest.json").read_text())
+        tracked = ".claude/hooks/_lib/x.sh" in manifest["files"]
+
+        self._git_rm("templates/hooks/_lib/x.sh")
+        result = self._install(update_mode=True)
+
+        self.assertFalse(lib.exists(), (
+            "a retired _lib file survived the update as an inert orphan "
+            f"(manifest-tracked before update: {tracked}); result keys: "
+            f"{ {k: v for k, v in result.items() if 'leftover' in k or 'orphan' in k} }"
+        ))
+
+    def test_hand_restored_retired_hook_lib_file_is_leftover_removed(self):
+        """The pre-manifest / hand-restored shape for a `_lib` file: on disk
+        with VCO's exact retired bytes, NOT in the manifest → the leftover
+        pass byte-matches it against git history, backs it up and removes it
+        (same contract the agents/skills rows pin, proving the hooks kind
+        walks the `_lib/` subdirectory)."""
+        self._install(update_mode=False)
+        lib = self.proj / ".claude" / "hooks" / "_lib" / "x.sh"
+        shipped_bytes = lib.read_bytes()
+        self._drop_manifest_entries(".claude/hooks/_lib/x.sh")
+        self._git_rm("templates/hooks/_lib/x.sh")
+
+        result = self._install(update_mode=True)
+
+        self.assertFalse(lib.exists())
+        self.assertIn(".claude/hooks/_lib/x.sh", result["leftovers_removed"])
+        backups = list((self.proj / ".claude/backups/bundle-adoptions").rglob("x.sh"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), shipped_bytes)
 
     def test_user_files_with_vco_like_names_are_untouched_and_unreported(self):
         self._install(update_mode=False)
@@ -176,6 +248,57 @@ class LeftoverPolicyTests(_Base):
         self._install(update_mode=True)
         self.assertIn("bundle_leftover_removed", self._ledger())
         self._install(update_mode=True)
+        self.assertNotIn("bundle_leftover_removed", self._ledger())
+
+
+class RetiredSkillAndSpecializationLeftoverTests(_Base):
+    """v0.2.101 §9.3: a prior-shipped SKILL directory and a retired
+    SPECIALIZATIONS doc (the new plain-copy kind, `_KIND_SOURCES`) follow the
+    SAME leftover rule as a retired agent — an outside-the-manifest copy is
+    backed up + removed on a git-history byte-match, a user-modified copy is
+    untouched and unreported."""
+
+    SKILL_REL = ".claude/skills/old-skill/SKILL.md"
+    SPEC_REL = ".claude/specializations/fields/old-field.md"
+
+    def test_retired_skill_and_spec_outside_manifest_removed_with_backup(self):
+        self._install(update_mode=False)
+        skill = self.proj / self.SKILL_REL
+        spec = self.proj / self.SPEC_REL
+        self.assertTrue(skill.is_file() and spec.is_file())
+        # Pre-manifest / hand-restored shape: on disk, NOT in the manifest.
+        self._drop_manifest_entries(self.SKILL_REL, self.SPEC_REL)
+        self._git_rm("templates/skills/old-skill/SKILL.md",
+                     "templates/specializations/fields/old-field.md")
+
+        result = self._install(update_mode=True)
+
+        self.assertFalse(skill.exists())
+        self.assertFalse(spec.exists())
+        self.assertEqual(set(result["leftovers_removed"]),
+                         {self.SKILL_REL, self.SPEC_REL})
+        backups = {b.name for b in
+                   (self.proj / ".claude/backups/bundle-adoptions").rglob("*")
+                   if b.is_file()}
+        self.assertEqual(backups, {"SKILL.md", "old-field.md"})
+        row = self._ledger()["bundle_leftover_removed"]
+        self.assertIn("old-skill/SKILL.md", row.detected)
+        self.assertIn("old-field.md", row.detected)
+        # The emptied skill directory is pruned, not left behind.
+        self.assertFalse((self.proj / ".claude/skills/old-skill").exists())
+
+    def test_user_modified_retired_spec_is_untouched_and_unreported(self):
+        self._install(update_mode=False)
+        spec = self.proj / self.SPEC_REL
+        self._drop_manifest_entries(self.SPEC_REL)
+        spec.write_bytes(OLD_SPEC + b"my own notes\n")
+        self._git_rm("templates/specializations/fields/old-field.md")
+
+        result = self._install(update_mode=True)
+
+        self.assertTrue(spec.exists())
+        self.assertEqual(spec.read_bytes(), OLD_SPEC + b"my own notes\n")
+        self.assertNotIn("leftovers_removed", result)
         self.assertNotIn("bundle_leftover_removed", self._ledger())
 
 

@@ -32,6 +32,12 @@ WHAT THESE TESTS PIN.
 5. Idempotency + state-keying (ruling R26): a second run removes nothing and
    changes nothing, and the match never depends on which release the project
    came from.
+6. v0.2.101 (AsyncDispatcherRetirementTests): the eight async PostToolUse
+   registrations merged into the single ``post-tool-use-async`` dispatcher.
+   The rows are EVENT-SCOPED — the scripts still ship (the dispatcher routes
+   to them) and ``kg-update-nudge``'s SYNC UserPromptSubmit /
+   SessionStart(compact) registrations must survive the same scrub that
+   removes its PostToolUse one.
 """
 from __future__ import annotations
 
@@ -298,6 +304,169 @@ class MergeRemovalTests(unittest.TestCase):
         }
         merged = project_init._merge_hooks_for_bundle(dict(user_hooks), {})
         self.assertEqual(merged, user_hooks)
+
+
+# ── v0.2.101: the eight async PostToolUse registrations merged into ONE ────
+#
+# Provenance: the anchored forms shipped in templates/settings.json.*.template
+# from v0.2.97 through v0.2.100 (plus the pre-v0.2.97 relative and
+# guard-prefixed spellings an older install may still hold). Unlike the
+# retirements above, these SCRIPTS STILL SHIP — the single
+# `post-tool-use-async.{sh,ps1}` dispatcher registration routes to them; what
+# is retired is the individual async REGISTRATIONS (each one cost a process
+# spawn per tool call and wrote a ~660 B async_hook_response transcript
+# record whenever it spoke or died).
+ASYNC_V02101_STEMS = (
+    "post-edit-outcome",
+    "post-bash-context-record",
+    "kg-summary-generator",
+    "post-git-commit-kg-sync",
+    "post-file-delete",
+    "kg-update-nudge",
+)
+
+
+#: The pre-v0.2.97 settings-level guard prefix (spelled exactly as shipped;
+#: `normalize_command` strips it so both eras of a registration match).
+OLD_GUARD = '[ -n "$VCT_DISABLE_HOOKS" ] || '
+
+
+def _anchored_sh(stem: str) -> str:
+    return f'bash "${{CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/{stem}.sh"'
+
+
+def _anchored_ps1(stem: str) -> str:
+    return (
+        "powershell -NoProfile -ExecutionPolicy Bypass -File "
+        f'"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/{stem}.ps1"'
+    )
+
+
+class AsyncDispatcherRetirementTests(unittest.TestCase):
+    """The v0.2.101 rows: act on every shipped spelling, leave the SYNC
+    twins of the same scripts alone (event-scoped rows)."""
+
+    def test_every_merged_script_matches_in_every_shipped_spelling(self):
+        for stem in ASYNC_V02101_STEMS:
+            spellings = (
+                f"bash .claude/hooks/{stem}.sh",           # pre-v0.2.97 relative
+                _anchored_sh(stem),                          # v0.2.97+ linux
+                OLD_GUARD + _anchored_sh(stem),              # guard-prefixed era
+                _anchored_ps1(stem),                         # windows
+            )
+            for cmd in spellings:
+                with self.subTest(cmd=cmd[:64]):
+                    identity = project_init._vco_hook_script_identity(cmd)
+                    match = hr.match_retired_registration(
+                        "PostToolUse", cmd, hook_identity=identity,
+                        is_async=True,  # SF-3: the rows are async-only
+                    )
+                    self.assertIsNotNone(match)
+                    self.assertEqual(match.retired_in, "v0.2.101")
+                    self.assertTrue(match.async_only)
+                    self.assertIn("post-tool-use-async", match.replacement)
+                    self.assertIn(stem, match.replacement)
+
+    def test_a_sync_registration_of_the_same_scripts_never_matches(self):
+        """SF-3 act half of the leave-alone: without POSITIVE async
+        evidence (False or unknown) the rows do not match — a user's own
+        synchronous PostToolUse registration of a shipped script is
+        theirs, and every caller (scrub, insert refusal, prune
+        classifier) takes this same answer."""
+        for stem in ASYNC_V02101_STEMS:
+            cmd = _anchored_sh(stem)
+            identity = project_init._vco_hook_script_identity(cmd)
+            for is_async in (False, None):
+                with self.subTest(stem=stem, is_async=is_async):
+                    self.assertIsNone(hr.match_retired_registration(
+                        "PostToolUse", cmd, hook_identity=identity,
+                        is_async=is_async,
+                    ))
+
+    def test_the_same_scripts_under_other_events_are_left_alone(self):
+        """Event-scoping is the whole safety story for kg-update-nudge: its
+        SYNC UserPromptSubmit + SessionStart(compact) registrations must
+        never match a PostToolUse-scoped row."""
+        for event in ("UserPromptSubmit", "SessionStart", "Stop"):
+            for stem in ASYNC_V02101_STEMS:
+                cmd = _anchored_sh(stem)
+                identity = project_init._vco_hook_script_identity(cmd)
+                with self.subTest(event=event, stem=stem):
+                    self.assertIsNone(
+                        hr.match_retired_registration(
+                            event, cmd, hook_identity=identity,
+                        )
+                    )
+
+    def test_merge_scrubs_the_legacy_async_block_and_keeps_sync_twins(self):
+        """ACT + LEAVE-ALONE in one realistic v0.2.100-era hooks block:
+        every legacy async PostToolUse entry goes (in whatever spelling it
+        is held), the sync registrations — including the nudge's twins
+        under other events — stay byte-for-byte, and each removal is
+        recorded naming the dispatcher."""
+        user_hooks = {
+            "SessionStart": [
+                {"matcher": "compact", "hooks": [
+                    {"type": "command", "command": _anchored_sh("kg-update-nudge"),
+                     "timeout": 4},
+                ]},
+            ],
+            "UserPromptSubmit": [
+                {"hooks": [
+                    {"type": "command",
+                     "command": _anchored_sh("user-prompt-submit-reminder"),
+                     "timeout": 2},
+                    {"type": "command", "command": _anchored_sh("kg-update-nudge"),
+                     "timeout": 4},
+                ]},
+            ],
+            "PostToolUse": [
+                {"matcher": "Edit|Write", "hooks": [
+                    {"type": "command", "command": _anchored_sh("post-file-edit"),
+                     "timeout": 5},
+                ]},
+                {"matcher": "Edit|Write", "hooks": [
+                    {"type": "command", "command": _anchored_sh("post-edit-outcome"),
+                     "timeout": 5, "async": True},
+                ]},
+                {"matcher": "Bash", "hooks": [
+                    {"type": "command",
+                     "command": "bash .claude/hooks/post-git-commit-kg-sync.sh",
+                     "timeout": 10, "async": True},
+                    {"type": "command", "command": _anchored_sh("post-file-delete"),
+                     "timeout": 5, "async": True},
+                ]},
+                {"matcher": "*", "hooks": [
+                    {"type": "command",
+                     "command": OLD_GUARD + _anchored_sh("kg-update-nudge"),
+                     "async": True, "timeout": 3},
+                ]},
+            ],
+        }
+        removed: list = []
+        merged = project_init._merge_hooks_for_bundle(
+            user_hooks, {}, retired_removed=removed,
+        )
+        # ACT: only the sync post-file-edit registration survives.
+        self.assertEqual(_cmds(merged, "PostToolUse"), [_anchored_sh("post-file-edit")])
+        # LEAVE-ALONE: the sync twins are untouched.
+        self.assertIn(_anchored_sh("kg-update-nudge"), _cmds(merged, "UserPromptSubmit"))
+        self.assertIn(_anchored_sh("user-prompt-submit-reminder"),
+                      _cmds(merged, "UserPromptSubmit"))
+        self.assertIn(_anchored_sh("kg-update-nudge"), _cmds(merged, "SessionStart"))
+        # One removal record per retired registration, naming the dispatcher.
+        self.assertEqual(len(removed), 4)
+        for r in removed:
+            self.assertEqual(r["event"], "PostToolUse")
+            self.assertEqual(r["retirement"].retired_in, "v0.2.101")
+            self.assertIn("post-tool-use-async", r["retirement"].audit_replacement)
+        # Idempotent: a second pass removes nothing and changes nothing.
+        removed2: list = []
+        twice = project_init._merge_hooks_for_bundle(
+            merged, {}, retired_removed=removed2,
+        )
+        self.assertEqual(twice, merged)
+        self.assertEqual(removed2, [])
 
 
 class BundleEngineDeliveryTests(unittest.TestCase):

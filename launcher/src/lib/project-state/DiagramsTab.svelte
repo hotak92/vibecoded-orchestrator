@@ -841,7 +841,7 @@
   <header class="ps-tab-header">
     <h3>Diagrams</h3>
     {#if moduleActive !== null}
-      <label class="ps-module-toggle" title="When disabled, diagrams MCP is not registered for this project and Claude cannot save new diagrams here.">
+      <label class="ps-module-toggle" title="When disabled, the diagrams section is removed from this project's CLAUDE.md and this tab is hidden. Existing diagram files on disk are preserved.">
         <input
           type="checkbox"
           checked={moduleActive}
@@ -860,10 +860,10 @@
     <div class="ps-disabled-state">
       <p class="ps-empty">Diagrams module disabled for this project.</p>
       <p class="ps-empty-hint">
-        Re-enable above to register the Mermaid / Excalidraw MCPs, list
-        diagrams, and use the embedded preview. Disabled state preserves
-        any diagrams that already exist on disk — they just don't appear
-        in this tab and Claude can't author new ones via the MCP.
+        Re-enable above to list diagrams and use the embedded preview, and
+        to restore the diagrams section in this project's CLAUDE.md. Disabled
+        state preserves any diagrams that already exist on disk — they just
+        don't appear in this tab.
       </p>
     </div>
   {:else}

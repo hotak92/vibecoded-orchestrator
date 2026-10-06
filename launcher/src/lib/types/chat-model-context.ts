@@ -23,6 +23,9 @@ export interface ChatModelContextRow {
   max_output: number;
   /** Advertise this id to Claude Code as `<id>[1m]`. */
   window_1m: boolean;
+  /** The vendor states this model takes TEXT-ONLY input — it cannot see an
+   *  image block; the gateway replaces image blocks with a text note. */
+  text_only: boolean;
   /** The official page these numbers were read from. Never empty. */
   source: string;
   /** Optional caveat that travels with the citation. */
@@ -40,6 +43,7 @@ export interface ChatModelContextInput {
   context_window: number;
   max_output: number;
   window_1m: boolean;
+  text_only: boolean;
   source: string;
   source_note: string;
 }
@@ -55,12 +59,25 @@ export interface ExportReport {
   error: string | null;
 }
 
-/** What a reseed did. Four counters so the `user_edited` guard is visible. */
+/** What a reseed did. Five counters so the `user_edited` guard — and the
+ *  retire of machine-seeded rows the converged seed no longer ships
+ *  (v0.2.101, NB-02) — are visible. Field-for-field mirror of
+ *  `db::chat_model_context::ReseedOutcome`, pinned by
+ *  `chat-model-context.wiring.test.ts`. */
 export interface ReseedOutcome {
   inserted: number;
   updated: number;
   unchanged: number;
   preserved_user_edits: number;
+  /** Machine-seeded rows (`user_edited = 0`) the converged seed no longer
+   *  ships, deleted by this very reseed — unnamed in the toast, their
+   *  disappearance would be unexplained (review SF-1). */
+  retired: number;
+  /** Per-row record of every row the pass WROTE — `[model_id, action]`
+   *  with action "inserted" / "updated" / "retired" (v0.2.101, Q6/G1: the
+   *  model-picker provenance log; the backend logs one line per entry,
+   *  the GUI does not render it). Empty on a steady-state converge. */
+  written: [string, string][];
 }
 
 /** Every mutating command returns its own result AND the export outcome. */

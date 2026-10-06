@@ -84,8 +84,9 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
+from vco_lib import kg_context_triple
 from vco_lib.intfile import read_int_line
 
 # v0.2.96 (WP-3): the image-freshness verdict token the dispatch-side image
@@ -98,6 +99,41 @@ from vco_lib.code_embed_image import STALE as _IMAGE_STALE
 #: user — a retry that failed three times is not transient.
 MAX_ATTEMPTS = 3
 
+#: v0.2.101 SF-1: how many LEDGER PASSES one driver makes before exiting.
+#: install.py enqueues the per-project seed and — seconds later, at step 7d —
+#: the shared seed, spawning a driver at each site. The second driver is
+#: blocked by the first's per-folder pidfile lock (and the first read the
+#: ledger before the second row existed), so the FIRST driver must pick the
+#: later row up itself or the shared seed waits for the next session while the
+#: install prints that it continues now. A pass that finds nothing NEW to do
+#: ends the loop, so this bound is only reached while work keeps arriving or
+#: stays permanently blocked — never a spin.
+MAX_SETTLE_PASSES = 3
+
+#: v0.2.101 (item 4): install.py no longer BLOCKS on the per-project KG seed.
+#: It enqueues the owed work as ``kg_sync_failures_pending`` (whose registry
+#: row declares ``retry_action = "retry:py:kg_seed"``) and spawns this driver
+#: detached, so the embed runs in the background. This env channel carries the
+#: context the enqueue resolved; the PER-PROJECT handler uses
+#: :data:`SEED_CTX_ENV_KG_COLLECTION` to pin the child's target (Gap 3), and
+#: :func:`stamp_metadata_repair_from_child` uses it as its third precondition.
+#: A driver spawned any other way (the session-start hook) carries none of
+#: these — which no longer costs the context triple anything, because the CHILD
+#: records that itself (see below).
+SEED_CTX_ENV_ACTIVE_EMBEDDING = "VCT_KG_SEED_CTX_ACTIVE_EMBEDDING"
+SEED_CTX_ENV_KG_COLLECTION = "VCT_KG_SEED_CTX_KG_COLLECTION"
+SEED_CTX_ENV_SHARED_KG_COLLECTION = "VCT_KG_SEED_CTX_SHARED_KG_COLLECTION"
+
+#: The marker a SHARED-seed child carries (see that module): it refuses to
+#: record the per-project context triple. Re-exported so the shared handler
+#: and the child cannot disagree about the name.
+#:
+#: NOTE: the four ``app_state`` KEY names are NOT re-exported here any more
+#: (v0.2.101 nit): this module has no reader of them, the only consumers were
+#: tests, and a re-export kept "for the readers" that do not exist is the
+#: false-promise shape. Tests import them from :mod:`vco_lib.kg_context_triple`.
+SHARED_SEED_ENV = kg_context_triple.SHARED_SEED_ENV
+
 #: Attempt trail. Sits beside auto-resolutions.jsonl in the user-owned,
 #: git-ignored logs dir.
 ATTEMPTS_FILENAME = "deferral-retries.jsonl"
@@ -106,10 +142,27 @@ ATTEMPTS_FILENAME = "deferral-retries.jsonl"
 #: second apart must not run two KG seeds over the same tree.
 PIDFILE_NAME = "deferral-retry.pid"
 
-#: A held lock older than this is treated as abandoned even when its pid still
-#: looks alive (pid reuse, or a child wedged forever). A KG seed over a large
-#: tree is minutes; six hours cannot be a live one.
-PIDFILE_STALE_SECONDS = 6 * 3600
+#: A held lock whose LAST HEARTBEAT is older than this is treated as abandoned
+#: even when its pid still looks alive — a driver wedged inside one handler.
+#:
+#: v0.2.101 (S2): the age is NOT "time since the driver started". The driver
+#: touches its pidfile before every handler and between settle passes
+#: (:func:`_heartbeat_lock`), so the bound covers ONE handler's silence. Since
+#: v0.2.101 item 4 the driver also runs the full install-time seeds, and one
+#: pass — ``kg_seed`` + ``kg_seed_shared`` + ``code_graph_walk`` +
+#: ``codegraph_resync``, up to :data:`MAX_SETTLE_PASSES` times — legitimately
+#: runs for many hours on a slow machine: a full KG sync alone can take well
+#: over an hour on a big KG and a slow CPU (owner ruling 2026-10-06: shipped
+#: timeouts are VERY long by design), and a code-graph walk over a wide
+#: codebase is similar. Twenty-four hours without a single handler finishing
+#: cannot be a live seed.
+#:
+#: Pid REUSE is not this bound's job any more: the pidfile records the
+#: holder's process start token and :func:`_lock_is_held` compares it
+#: (:func:`vco_lib.deferral_probes.process_identity_matches`), so a crashed
+#: driver whose pid number was handed to another process is taken over at
+#: once. The age bound only backs that up where the identity cannot be read.
+PIDFILE_STALE_SECONDS = 24 * 3600
 
 #: Result states.
 STARTED = "started"       # attempt recorded BEFORE the handler ran
@@ -423,6 +476,70 @@ def _analyzer_script(folder: Path) -> Optional[Path]:
     return None
 
 
+def seed_context_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[dict]:
+    """The install-resolved context triple carried in a spawned driver's env.
+
+    ``None`` when no ACTIVE_EMBEDDING was carried — a driver spawned by the
+    session-start hook (not by an install) must never stamp the triple, and an
+    install that never resolved one must not stamp an empty context over a real
+    one. See :data:`SEED_CTX_ENV_ACTIVE_EMBEDDING`.
+    """
+    source = os.environ if env is None else env
+    active = (source.get(SEED_CTX_ENV_ACTIVE_EMBEDDING) or "").strip()
+    if not active:
+        return None
+    return {
+        "active_embedding": active,
+        "kg_collection": (source.get(SEED_CTX_ENV_KG_COLLECTION) or "").strip(),
+        "shared_kg_collection": (
+            source.get(SEED_CTX_ENV_SHARED_KG_COLLECTION) or ""
+        ).strip(),
+    }
+
+
+def stamp_metadata_repair_from_child(folder: Path) -> bool:
+    """Project install.py's ``app_state`` metadata-repair row (v0.2.101 item 4).
+
+    The whole-tree pass is ENQUEUED now, so install.py never observes its exit
+    and cannot project the row itself. This is the same move the context triple
+    made: the handler records it, on the same proof (the child's own paired
+    clear), through the SAME writer install.py uses —
+    :func:`vco_lib.install_weaviate.stamp_kg_metadata_repair` — so the two
+    paths cannot disagree about what the row means.
+
+    Two preconditions ride along, both install.py's own:
+
+    * a CARRIED context naming a collection — install.py's third precondition
+      (``_sync_all and bool(current_kg_collection)``): the whole-tree run must
+      have targeted the project's CONFIGURED collection, not the script's
+      literal ``KnowledgeGraph`` fallback. No carried context ⇒ no proof.
+    * ``repair_owed(folder) is False`` — inside the writer. This is what makes
+      the row a PROJECTION rather than a second opinion: a repair that aborts
+      part-way is COUNTED, not FAILED, so the run still exits 0 and the child
+      withholds its file stamp. The exit code (and the paired clear with it)
+      cannot see that; the file stamp can.
+
+    Returns True when the row was written. Soft-fail: bookkeeping never fails
+    the retry (mirrors install.py's own ``_write_app_state_key``).
+    """
+    context = seed_context_from_env()
+    if not context or not context.get("kg_collection"):
+        return False
+    try:
+        from vco_lib.install_weaviate import stamp_kg_metadata_repair
+        from vco_lib.launcher_db_writer import write_app_state_key
+        from vco_lib.paths import launcher_db_path
+
+        return stamp_kg_metadata_repair(
+            True, True,
+            lambda key, value: write_app_state_key(launcher_db_path(), key, value),
+            project_root=folder,
+        )
+    except Exception as exc:  # noqa: BLE001 — bookkeeping is best-effort
+        trail(f"metadata-repair stamp failed (non-fatal): {exc}")
+        return False
+
+
 def retry_kg_seed(ctx: RetryContext) -> RetryResult:
     """Re-run the owed KG seed for ``folder``.
 
@@ -434,23 +551,134 @@ def retry_kg_seed(ctx: RetryContext) -> RetryResult:
     :data:`RETRIED` here means only "the child exited 0" — the script's SKIP
     path exits 0 as well. :func:`dispatch` downgrades it to
     :data:`INCONCLUSIVE` unless the child's own clear removed the condition.
+
+    v0.2.101: this handler does NOT write the context triple. The CHILD does,
+    on its own clean whole-tree success path, and only when the tree it walked
+    is the ORCHESTRATOR ROOT's (``vco_lib.kg_context_triple`` documents why:
+    the row is machine-global and install.py's comparison is the root's, so a
+    registered project's ``--all`` — install-spawned, session-start-spawned, the
+    launcher's Sync, a hand-run — must leave it untouched). That is also why a
+    session-start driver converges exactly like an install-spawned one: neither
+    needs anything carried.
+
+    What this handler still owns is the metadata-repair PROJECTION and the
+    child's TARGET pin (Gap 3).
     """
     script = _sync_script(ctx.folder)
     if script is None:
         return RetryResult(ctx.condition_id, SKIPPED, "no sync_knowledge_graph.py found")
     env_root = str(ctx.folder)
-    prev = os.environ.get("KG_SYNC_PROJECT_ROOT")
+    # v0.2.101 (caller-audit Gap 3): pin the child's TARGET from the context the
+    # enqueue carried. Without it the child resolves its class through the hub
+    # alone, and in a hub-down window `_resolve_collections` falls back to the
+    # literal "KnowledgeGraph" — a walk into a class nobody reads. The hub still
+    # WINS when it answers (`cfg.kg_collection or os.getenv(...)`), so this is
+    # strictly a fallback, and it is what the foreground path always had (the
+    # install's own shell env). S1 keeps the DRIVER base env free of it; the
+    # carried value is the only way in.
+    carried = seed_context_from_env() or {}
+    _pinned = ("KG_SYNC_PROJECT_ROOT", "KG_COLLECTION")
+    prev = {key: os.environ.get(key) for key in _pinned}
     os.environ["KG_SYNC_PROJECT_ROOT"] = env_root
+    if carried.get("kg_collection"):
+        os.environ["KG_COLLECTION"] = carried["kg_collection"]
     try:
         rc = ctx.run([ctx.interpreter(), str(script), "--all"])
     finally:
-        if prev is None:
-            os.environ.pop("KG_SYNC_PROJECT_ROOT", None)
-        else:
-            os.environ["KG_SYNC_PROJECT_ROOT"] = prev
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     if rc == 0:
+        if condition_cleared(ctx.folder, ctx.condition_id) is True:
+            # v0.2.101 (caller-audit Gap 4/5/6): the CONTEXT TRIPLE is no
+            # longer written here — the child that walked the tree recorded it
+            # on its own success path (``vco_lib.kg_context_triple``), which is
+            # why a session-start driver converges exactly like an
+            # install-spawned one, and why the launcher's Sync / migrate /
+            # hand-run paths do too. What stays is the metadata-repair
+            # PROJECTION: not a context claim, but a reading of the child's own
+            # file stamp.
+            stamp_metadata_repair_from_child(ctx.folder)
         return RetryResult(ctx.condition_id, RETRIED, "kg sync --all completed")
     return RetryResult(ctx.condition_id, FAILED, f"kg sync --all exited {rc}")
+
+
+def _shared_collection_for(folder: Path, env: Optional[Mapping[str, str]] = None) -> str:
+    """The shared KG collection ``folder`` should be seeded into, or ``""``.
+
+    Precedence: the context an install spawn CARRIED
+    (:data:`SEED_CTX_ENV_SHARED_KG_COLLECTION`) — it is what the install
+    resolved and what the owed row was queued for — then the project's OWN
+    declared ``SHARED_KG_COLLECTION`` in ``.claude/settings.json`` ``env`` (the
+    canonical per-project channel), so a driver started by the session-start
+    hook retries the same work with no install env to inherit.
+    """
+    source = os.environ if env is None else env
+    carried = (source.get(SEED_CTX_ENV_SHARED_KG_COLLECTION) or "").strip()
+    if carried:
+        return carried
+    try:
+        data = json.loads((folder / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        value = (data.get("env") or {}).get("SHARED_KG_COLLECTION") or ""
+        return str(value).strip()
+    except Exception:  # noqa: BLE001 — unreadable config ⇒ nothing to target
+        return ""
+
+
+def retry_kg_seed_shared(ctx: RetryContext) -> RetryResult:
+    """Re-run the owed SHARED-collection seed for ``folder``.
+
+    v0.2.101 item 4: install.py used to BLOCK on this seed (the same
+    ``sync_knowledge_graph.py --all``, pointed at the shared class with
+    ``KG_COLLECTION=<shared>`` in the child env). It is now enqueued instead,
+    so the owed work needs this handler.
+
+    It writes NO context record, and it makes sure the CHILD cannot either:
+    the child env carries :data:`SHARED_SEED_ENV`, which is the guard
+    ``vco_lib.kg_context_triple`` reads (a shared-targeted pass is not a
+    statement about the project's own context — and the collection NAME cannot
+    tell the two apart on the orchestrator root, where ``KG_COLLECTION ==
+    SHARED_KG_COLLECTION`` by design). The paired clear is the script's own
+    narrow one (``_clear_shared_seed_deferral``): only a fully successful
+    ``--all`` that TARGETED the shared class retires the row, which is exactly
+    what :func:`condition_cleared` re-reads.
+
+    Returns :data:`SKIPPED` when this folder has no shared collection
+    configured — there is genuinely nothing to seed, and the row is then the
+    user's to dismiss (matching the pre-v0.2.91 disposition for a condition
+    that cannot resolve itself).
+    """
+    script = _sync_script(ctx.folder)
+    if script is None:
+        return RetryResult(ctx.condition_id, SKIPPED, "no sync_knowledge_graph.py found")
+    target = _shared_collection_for(ctx.folder)
+    if not target:
+        return RetryResult(
+            ctx.condition_id, SKIPPED,
+            "no SHARED_KG_COLLECTION is configured for this folder — nothing "
+            "to seed into",
+        )
+    keys = ("KG_COLLECTION", "KG_BASE_DIR", "KG_SYNC_PROJECT_ROOT", SHARED_SEED_ENV)
+    prev = {k: os.environ.get(k) for k in keys}
+    os.environ["KG_COLLECTION"] = target
+    os.environ["KG_BASE_DIR"] = str(ctx.folder)
+    os.environ["KG_SYNC_PROJECT_ROOT"] = str(ctx.folder)
+    # The child must not record the PER-PROJECT context triple: this run is
+    # about the shared class (see kg_context_triple.SHARED_SEED_ENV).
+    os.environ[SHARED_SEED_ENV] = "1"
+    try:
+        rc = ctx.run([ctx.interpreter(), str(script), "--all"])
+    finally:
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    if rc == 0:
+        return RetryResult(ctx.condition_id, RETRIED, "shared kg sync --all completed")
+    return RetryResult(ctx.condition_id, FAILED, f"shared kg sync --all exited {rc}")
 
 
 def retry_code_graph_walk(ctx: RetryContext) -> RetryResult:
@@ -622,6 +850,11 @@ class Handler:
 #: here fails ``tests/test_v0291_retry_dispatch.py``.
 HANDLERS: dict[str, Handler] = {
     "kg_seed": Handler(retry_kg_seed, TEXT_BACKEND),
+    # v0.2.101 item 4: install.py enqueues the SHARED-collection seed too
+    # (it used to block on it). Same shipped child, different target
+    # collection — a distinct handler keeps each retry unambiguous about
+    # which class it is filling.
+    "kg_seed_shared": Handler(retry_kg_seed_shared, TEXT_BACKEND),
     # WP-3 review MAJOR-1: `code_graph_walk`'s handler does a BARE analyzer
     # walk that never enters the resync driver, so the driver-side verdict
     # gate cannot see it — without this flag, a stale-but-UP service passes
@@ -956,8 +1189,9 @@ def _read_pidfile(path: Path) -> Optional[int]:
     a recorded 0 is not a process any more than a missing file is.
 
     Two readings changed with the shared reader, both narrowing and neither
-    reachable from this module's own writer (``_acquire_lock`` writes exactly
-    ``f"{os.getpid()}"``): a LEADING blank line now reads as ``None`` where
+    reachable from this module's own writer (``_acquire_lock`` writes the pid
+    as the FIRST line, then the start token — :func:`_read_pidfile_token`
+    reads that second line): a LEADING blank line now reads as ``None`` where
     strip-then-split tolerated it, and non-UTF-8 bytes read as ``None``
     rather than raising through ``read_text``. A pidfile of either shape was
     not written by us and is better treated as absent than as a lock.
@@ -965,19 +1199,43 @@ def _read_pidfile(path: Path) -> Optional[int]:
     return read_int_line(path, minimum=1)
 
 
+def _read_pidfile_token(path: Path) -> Optional[str]:
+    """The holder's process start token (second line), or ``None``. Never raises.
+
+    v0.2.101 (S2): written by :func:`_acquire_lock` from
+    :func:`vco_lib.deferral_probes.process_start_token`. A pidfile written by
+    an older driver has only the pid line, and reads as ``None`` here — the
+    identity check is then skipped and the age bound alone applies, exactly
+    as before.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    token = lines[1].strip() if len(lines) > 1 else ""
+    return token or None
+
+
 def _lock_is_held(path: Path) -> bool:
     """Is another driver provably running for this folder?
 
-    Stale-tolerant in BOTH directions:
+    Stale-tolerant in every direction that can be proven:
 
     * a pidfile whose pid is provably gone is stale — take over;
-    * a pidfile older than :data:`PIDFILE_STALE_SECONDS` is abandoned even if
-      its pid looks alive (pid reuse, or a wedged child), because no legitimate
-      retry runs that long — take over.
+    * a pidfile whose pid is alive but names a DIFFERENT process than the one
+      that wrote it (the recorded start token no longer matches — pid reuse)
+      is stale — take over;
+    * a pidfile whose last heartbeat is older than
+      :data:`PIDFILE_STALE_SECONDS` is abandoned even if its pid looks alive
+      (a driver wedged inside one handler) — take over. The holder touches the
+      file before every handler and between settle passes
+      (:func:`_heartbeat_lock`), so a long multi-handler pass that keeps making
+      progress never ages out.
 
-    Otherwise (alive pid, or a liveness probe that could not tell) the lock is
-    treated as HELD: declining to start a second seed is the conservative
-    branch, and the age bound above keeps that from becoming permanent.
+    Otherwise (alive pid with a matching or unreadable identity, or a liveness
+    probe that could not tell) the lock is treated as HELD: declining to start
+    a second seed is the conservative branch, and the age bound above keeps
+    that from becoming permanent.
     """
     pid = _read_pidfile(path)
     if pid is None:
@@ -991,15 +1249,24 @@ def _lock_is_held(path: Path) -> bool:
     if pid == os.getpid():
         return False
     try:
-        from vco_lib.deferral_probes import pid_is_alive
+        from vco_lib.deferral_probes import pid_is_alive, process_identity_matches
 
-        return pid_is_alive(pid)
+        if not pid_is_alive(pid):
+            return False
+        # False = the pid was provably handed to another process. None (no
+        # token recorded, or the process cannot be inspected) stays HELD.
+        return process_identity_matches(pid, _read_pidfile_token(path)) is not False
     except Exception:  # noqa: BLE001 — cannot tell ⇒ assume held
         return True
 
 
 def _acquire_lock(folder: Path) -> Optional[Path]:
     """Claim the per-folder driver lock, or ``None`` when it is held.
+
+    The file holds ``<pid>\n<process start token>\n`` — the token is what lets
+    a later reader tell this driver from a process that inherited its pid
+    number (:func:`_lock_is_held`). The first line alone is what every pid
+    reader (:func:`_read_pidfile`, an older driver mid-update) parses.
 
     Deliberately NOT an atomic ``O_EXCL`` create: the loser of a true race must
     not be left holding a stale file it never wrote, and the two writers we are
@@ -1011,14 +1278,41 @@ def _acquire_lock(folder: Path) -> Optional[Path]:
     if _lock_is_held(path):
         return None
     try:
+        from vco_lib.deferral_probes import process_start_token
+
+        token = process_start_token(os.getpid()) or ""
+    except Exception:  # noqa: BLE001 — no token ⇒ age bound only
+        token = ""
+    try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        path.write_text(
+            f"{os.getpid()}\n{token}\n" if token else f"{os.getpid()}\n",
+            encoding="utf-8",
+        )
     except OSError:
         # Cannot write the lock ⇒ cannot serialise. The caller proceeds
         # unlocked rather than silently skipping owed work: handlers are
         # idempotent, and a read-only `.claude/state` must not disable retries.
         return None
     return path
+
+
+def _heartbeat_lock(folder: Path) -> None:
+    """Refresh this driver's pidfile mtime — "still making progress". Never raises.
+
+    v0.2.101 (S2): called before every handler and between settle passes, so
+    :data:`PIDFILE_STALE_SECONDS` measures the silence of ONE handler, not the
+    length of the whole run. Touches the file ONLY while it names this process:
+    a driver running unlocked (``single_instance=False``, or a lock it could
+    not write) must never refresh another driver's claim — that would keep a
+    dead holder's file looking live.
+    """
+    path = pidfile_path(folder)
+    try:
+        if _read_pidfile(path) == os.getpid():
+            os.utime(path, None)
+    except OSError:
+        pass
 
 
 def _release_lock(path: Optional[Path]) -> None:
@@ -1094,15 +1388,53 @@ def _dispatch_locked(
     python: str,
 ) -> list[RetryResult]:
     explicit = condition_ids is not None
-    cids = list(condition_ids) if explicit else owed_condition_ids(folder)
-    trail(
-        f"ledger read at {folder}: "
-        + (
-            f"{len(cids)} owed retryable condition(s): {', '.join(cids)}"
-            if cids
-            else "no retryable condition owed (nothing to dispatch)"
+    results: list[RetryResult] = []
+    #: cids THIS driver has already dispatched. A second pass must never
+    #: re-attempt one: each dispatch burns an attempt, and one session of a
+    #: down backend must not eat the cap three times over.
+    attempted: "set[str]" = set()
+    for _pass in range(1 if explicit else MAX_SETTLE_PASSES):
+        # S2 heartbeat: a new settle pass is progress (see PIDFILE_STALE_SECONDS).
+        _heartbeat_lock(folder)
+        cids = [
+            cid for cid in (
+                list(condition_ids) if explicit else owed_condition_ids(folder)
+            ) if cid not in attempted
+        ]
+        trail(
+            f"ledger read at {folder}: "
+            + (
+                f"{len(cids)} owed retryable condition(s): {', '.join(cids)}"
+                if cids
+                else "no retryable condition owed (nothing to dispatch)"
+            )
         )
-    )
+        if not cids:
+            break
+        attempted.update(cids)
+        results.extend(
+            _dispatch_pass(folder, cids=cids, backend_probe=backend_probe,
+                           runner=runner, python=python)
+        )
+        # SF-1: a row written WHILE we ran (install.py's second enqueue) is
+        # picked up here — this driver holds the lock, and the driver spawned
+        # for that row is blocked by it.
+        if explicit or not [
+            cid for cid in owed_condition_ids(folder) if cid not in attempted
+        ]:
+            break
+    return results
+
+
+def _dispatch_pass(
+    folder: Path,
+    *,
+    cids: "Sequence[str]",
+    backend_probe: Optional[Callable[[Path, str], Optional[bool]]],
+    runner: Optional[Callable[[Sequence[str], Path], int]],
+    python: str,
+) -> list[RetryResult]:
+    """One ledger pass: every cid in *cids*, in order (see :func:`dispatch`)."""
     results: list[RetryResult] = []
     #: backend kind → tri-state, probed at most once per kind per pass.
     probed: dict[str, Optional[bool]] = {}
@@ -1188,6 +1520,9 @@ def _dispatch_locked(
         # Recorded BEFORE the handler runs: a crash must still consume its
         # attempt, or the cap can never engage on a handler that always dies.
         record_attempt(folder, RetryResult(cid, STARTED, f"handler {name}"))
+        # S2 heartbeat: the staleness bound covers ONE handler's silence, so
+        # a pass of several hours-long seeds never ages this driver out.
+        _heartbeat_lock(folder)
         result = handler.run(ctx)
         if result.status == RETRIED:
             cleared = condition_cleared(folder, cid)
@@ -1225,6 +1560,19 @@ def _log_path_for_stamp(stamp: str) -> Optional[Path]:
         return None
 
 
+def detached_log_glob() -> Optional[str]:
+    """The glob a freshly-spawned driver's log matches, for install output.
+
+    v0.2.101 item 4: the install tells the user the seed continues in the
+    background and where to watch it. The exact filename carries a timestamp
+    chosen inside :func:`spawn_detached`, so the caller names the glob
+    (``<vct_root_dir>/logs/deferral-retry-*.log``). ``None`` when the logs dir
+    cannot be resolved.
+    """
+    path = _log_path_for_stamp("*")
+    return str(path) if path is not None else None
+
+
 def _record_resolution(folder: Path, condition_id: str, detail: str) -> None:
     """Record the auto-resolution the CHILD performed. Soft-fail.
 
@@ -1252,17 +1600,47 @@ def _record_resolution(folder: Path, condition_id: str, detail: str) -> None:
 #: destructor ResourceWarning) — the codegraph-resync driver's precedent.
 _DETACHED_CHILDREN: list = []
 
+#: v0.2.101 N-1: environment keys a detached driver must NOT inherit from the
+#: caller. Each names a KG target, and the driver dispatches EVERY owed row —
+#: a caller whose shell exported another project's ``KG_COLLECTION`` (or a
+#: stale ``KG_BASE_DIR``/``KG_SYNC_PROJECT_ROOT``) would otherwise misroute a
+#: per-project seed. The handlers pin the root they own and resolve the target
+#: from ``--folder``; ``install_weaviate._DRIVER_ENV_ALLOW`` then decides what
+#: may be added back per handler.
+_DRIVER_ENV_STRIP: frozenset = frozenset({
+    "KG_COLLECTION",
+    "SHARED_KG_COLLECTION",
+    "KG_BASE_DIR",
+    "KG_SYNC_PROJECT_ROOT",
+})
 
-def spawn_detached(folder: Path, *, python: str = "") -> bool:
+
+def spawn_detached(
+    folder: Path, *, python: str = "", extra_env: Optional[Mapping[str, str]] = None
+) -> bool:
     """Spawn ``python -m vco_lib.deferral_retry --folder <folder>`` detached.
 
     Used by the session-start hook: the hook must return in milliseconds, and
     a KG seed can take minutes. Returns True when the child was launched (NOT
     when the retry succeeded — nobody waits for that).
 
+    *extra_env* overlays the child's environment (v0.2.101 item 4): install.py
+    passes the ACTIVE_EMBEDDING / EMBEDDING_MODEL pair the seed must embed with
+    plus the context triple this driver stamps after a proven seed. Overlaid
+    AFTER :func:`vco_lib.install_companions.detached_child_env`, so the caller's
+    values win over anything the scrub left behind.
+
     Child stdout/stderr go to ``<vct_root_dir>/logs/deferral-retry-*.log`` so a
     driver that dies mid-run leaves a record (the R-5 lesson: DEVNULL is how a
     walk dies at 40% with no trace anywhere).
+
+    The driver's BASE environment is the caller's own minus
+    :data:`_DRIVER_ENV_STRIP` (v0.2.101 N-1): an install run from a shell that
+    sourced another project's ``.claude/env`` would otherwise hand every seed
+    child a foreign ``KG_COLLECTION``/``SHARED_KG_COLLECTION``/``KG_BASE_DIR``.
+    Those are exactly the vars ``install_weaviate._DRIVER_ENV_ALLOW`` exists to
+    control, and the handlers resolve the project's own config from
+    ``--folder`` instead.
     """
     from vco_lib.python_exe import resolve_or_current
 
@@ -1293,13 +1671,18 @@ def spawn_detached(folder: Path, *, python: str = "") -> bool:
     child_out = log_handle if log_handle is not None else subprocess.DEVNULL
     from vco_lib.install_companions import detached_child_env
 
+    base_env = {
+        k: v for k, v in detached_child_env().items() if k not in _DRIVER_ENV_STRIP
+    }
     kwargs = {
         "cwd": str(folder),
         "stdout": child_out,
         "stderr": child_out,
         "stdin": subprocess.DEVNULL,
-        "env": detached_child_env(),  # outlives the caller: no relaunch record
+        "env": base_env,  # outlives the caller: no relaunch record
     }
+    if extra_env:
+        kwargs["env"] = {**kwargs["env"], **{k: str(v) for k, v in extra_env.items()}}
     if os.name == "posix":
         kwargs["start_new_session"] = True
     try:

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from vco_lib import settings_refusal
+from vco_lib.mcp_scan_rules import retired_settings_allow_patterns
 from vco_lib.parked_hooks import ParkedHooksState
 from vco_lib.settings_merge import smart_merge_settings
 
@@ -94,6 +95,12 @@ def merge_settings_template(
     merged = smart_merge_settings(
         existing, template_data, retired_removed=retired_removed,
         parked=parked, kept_out=kept_out,
+        # v0.2.101: the settings-merge arm of the MCP retirement scrub —
+        # same one-home rule table (mcp_scan_rules.toml) the ~/.claude.json
+        # registration scrub reads. Only the merge path can carry it: the
+        # create path starts from the template, which no longer ships the
+        # retired pattern.
+        retired_allow=retired_settings_allow_patterns(),
     )
     if merged == existing:
         if not dry_run:  # nothing is owed any more: a recorded refusal is over

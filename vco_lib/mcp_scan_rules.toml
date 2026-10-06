@@ -144,13 +144,12 @@ secret_shaped_needles = [
 # NOT the same as [bundled].all_names below: this is the narrower set the
 # entry BUILDER produces. code-embedding / ollama / vct-coordination are
 # orchestrator-shipped (bundled) but NOT builder-composed, so they are in
-# all_names but NOT here.
+# all_names but NOT here. As of v0.2.101 `search` (module deleted), `mermaid`
+# and `excalidraw` (registration retired; an existing install keeps its entry)
+# are also bundled-but-not-builder-composed.
 default_names = [
     "weaviate-kg",
-    "search",
     "playwright",
-    "mermaid",
-    "excalidraw",
 ]
 
 # ── Full orchestrator-shipped MCP name set ─────────────────────────────────
@@ -171,12 +170,16 @@ all_names = [
     "weaviate-kg",
 ]
 
-# Bundled MCPs that ship DEFAULT-DISABLED per project (user opts in via the
-# launcher GUI). Every name here MUST also be in all_names. Keep narrow.
-default_disabled = [
-    "excalidraw",
-    "mermaid",
-]
+# Bundled MCPs that ship DEFAULT-DISABLED per project. Every name here MUST
+# also be in all_names. Keep narrow.
+#
+# EMPTY as of v0.2.101: the only two members were the diagram wrappers
+# (`excalidraw`, `mermaid`), which no longer ship as default registrations —
+# see [entries].default_names and [bundled].all_names. They stay in
+# all_names/uninstall_scrub_names so an install that already has the entry
+# keeps it (classified as bundled, scrubbed only on uninstall), but no
+# fresh registration path seeds them, so nothing ships default-disabled.
+default_disabled = []
 
 # ── Uninstall scrub set ────────────────────────────────────────────────────
 # The MCP names install.py's uninstaller removes from the user's GLOBAL
@@ -247,6 +250,16 @@ uninstall_scrub_shape_gated = [
 #                     `every_referenced_module_id_is_an_embedded_manifest`
 #                     (vct-launcher-core) and
 #                     tests/test_v0297_r6_manifest_references.py fail otherwise.
+#   auto_scrub      — OPTIONAL bool (default false). When true, the ordinary
+#                     install/update REMOVES this entry from the user's
+#                     ~/.claude.json automatically (a VCO-shaped entry inside
+#                     install_root only) via the existing registration/scrub
+#                     writers, prints one notice line, and is idempotent — no
+#                     consent prompt, no deferral. Use it for an MCP whose
+#                     module was DELETED (leaving the entry registered means a
+#                     broken MCP subprocess every session). The default
+#                     (false) keeps the consent-gated
+#                     `--remove-deprecated-mcps` path.
 #
 # [deprecated.ollama] has NO opt_in_manifest, by evidence: the manifest it
 # used to name (`vct-ollama.json`) was deleted in v0.2.11 together with the
@@ -260,3 +273,25 @@ uninstall_scrub_shape_gated = [
 [deprecated.ollama]
 removed_in = "v0.2.11"
 reason = "Ollama MCP server dropped from default install (PR-14a). The tools it exposed (chat / read_document / read_image) are redundant with Claude's native capabilities. Ollama remains as embedding infrastructure (Weaviate vectorizers); only the MCP tool-surface was removed."
+
+# v0.2.101: the paper-search MCP and its `search_mcp/` server were deleted
+# outright (owner ruling 2026-10-04). No `opt_in_manifest` — the module
+# manifest (`vct-search.json`) was deleted in the same change, so there is
+# nothing to opt back into; academic retrieval is covered by Claude's native
+# WebSearch/WebFetch. The table entry exists so `_detect_deprecated_mcp_entries`
+# surfaces a still-live `search` entry in an existing install's ~/.claude.json
+# and tells the user once (consent-gated removal via `--remove-deprecated-mcps`).
+[deprecated.search]
+removed_in = "v0.2.101"
+reason = "Paper-search MCP (`search_papers`, OpenAlex + arXiv) removed from VCO. The server module, its bundled manifest, and its registration were deleted; Claude's built-in WebSearch/WebFetch cover the capability. The module no longer exists, so the ordinary update REMOVES the now-orphaned entry automatically (auto_scrub=true) — a leftover entry would fail to spawn on every session."
+# Owner ruling (PLAN-V0300 item 15): delete now + scrub — the update removes an
+# existing `search` registration and tells the user once, no consent prompt.
+auto_scrub = true
+# The SAME retirement also covers the permissions allow entry the deleted MCP
+# left in every existing project's `.claude/settings.json`: the bundle update's
+# settings merge (vco_lib.settings_merge, fed by this table via
+# `mcp_scan_rules.retired_settings_allow_patterns`) drops these exact
+# `permissions.allow` strings. ONE rule home for the retirement — this table —
+# with no second scrub mechanism. Python-only consumer (the Rust side merges no
+# project settings.json), so the field is not mirrored into a Rust struct.
+settings_allow_patterns = ["mcp__search__*"]

@@ -15,6 +15,7 @@ import {
   createFreshnessController,
   INITIAL_FRESHNESS_STATE,
   type FreshnessState,
+  type GatewayFreshnessReport,
   type KeyValueStore,
 } from '$lib/gateway-freshness';
 
@@ -40,6 +41,15 @@ function createGatewayFreshnessStore() {
     async check(): Promise<void> {
       if (!tauriAvailable()) return;
       await controller.check();
+    },
+    /**
+     * The user-initiated ask (v0.2.101, P299-A2): fresh check, stored
+     * dismissal ignored, modal only for a proven-stale gateway. Browser mode
+     * returns `null` — there is no gateway to ask about.
+     */
+    async offer(): Promise<GatewayFreshnessReport | null> {
+      if (!tauriAvailable()) return null;
+      return controller.offer();
     },
     continueRestart: controller.continueRestart,
     dismiss: controller.dismiss,

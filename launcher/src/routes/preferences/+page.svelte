@@ -22,7 +22,8 @@
     APP_STATE_KEY_ACTIVE_EMBEDDING,
     OLLAMA_URL,
   } from '$lib/preferences/loaders';
-  import { selectedProject } from '$lib/stores/projects';
+  import { get } from 'svelte/store';
+  import { projects, selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
   // Profile section relocated from the now-deleted user-icon Settings
@@ -55,6 +56,7 @@
     DEFAULT_MODULE_UPDATE_AUTO_CHECK,
   } from '$lib/module-update-autocheck';
   import { setModuleUpdateAutoCheckEnabled } from '$lib/api/module_updates';
+  import { refreshAllProjectsEnvAction } from '$lib/project-state/all-projects-env';
   import type {
     EmbeddingCatalog,
     ModelChoice,
@@ -1613,6 +1615,34 @@
     }
   }
 
+  // ── Project environment (v0.2.101, owner ruling 2026-10-05 Q4) ────────
+  // The all-projects env re-render, back as a confirm-gated Preferences
+  // action (the v0.2.100 "no all-projects button" ruling was reversed).
+  // Logic + copy live in `$lib/project-state/all-projects-env` so the
+  // confirm-gating is unit-tested; this is markup + wiring only.
+  let allProjectsEnvBusy = $state(false);
+
+  async function reRenderAllProjectsEnv() {
+    allProjectsEnvBusy = true;
+    try {
+      // Count at click time (review nit 6): the projects store does NOT
+      // self-load and Preferences never triggers the Projects page's load,
+      // so refresh it (one list invoke, ms-scale) — the dialog then names
+      // "N project(s)" instead of the generic "every project" fallback.
+      await projects.load();
+      await refreshAllProjectsEnvAction(
+        {
+          confirm: (m: string) => confirm(m),
+          invoke,
+          toast,
+        },
+        get(projects).projects.length,
+      );
+    } finally {
+      allProjectsEnvBusy = false;
+    }
+  }
+
   // ── Shared services live status (v0.2.23 F2 wave 2b, relocated) ───────
   // Read-only probe of the per-machine Weaviate / Ollama / code_embed
   // instances every orchestrator install reuses (per-install isolation
@@ -1805,7 +1835,7 @@
   // is a two-step flow: dry-run plan → user confirms → backend copies,
   // verifies health, removes legacy volumes. Phase progress streams via
   // `volumes://migrate-progress` events from the Rust side (see
-  // commands/volumes.rs::MigratePhase).
+  // commands/storage_ux.rs::MigratePhase).
   interface VolumeWithSize {
     name: string;
     mountpoint: string;
@@ -3458,6 +3488,33 @@
           disabled={moduleUpdateAutoCheckBusy}
           onchange={toggleModuleUpdateAutoCheck}
         />
+      </div>
+    </section>
+
+    <!-- v0.2.101 (owner ruling 2026-10-05, Q4): the all-projects env
+         re-render, confirm-gated. The per-project repair stays on each
+         project's Settings tab; this is the machine-wide backfill for
+         "every project's .claude/env is stale" situations. -->
+    <section class="pr-section" aria-labelledby="pr-allenv-title">
+      <h2 class="pr-section-title" id="pr-allenv-title">Project environment</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Re-render env for all projects</strong>
+          <span class="pr-onboarding-hint">
+            Rewrites every project's .claude/env and the env block of
+            .claude/settings.json from the launcher's current settings. Asks
+            for confirmation first; can take a while (one subprocess per
+            project).
+          </span>
+        </div>
+        <button
+          class="pr-btn"
+          data-testid="re-render-all-projects-env"
+          onclick={() => void reRenderAllProjectsEnv()}
+          disabled={allProjectsEnvBusy}
+        >
+          {allProjectsEnvBusy ? 'Re-rendering…' : 'Re-render env for all projects'}
+        </button>
       </div>
     </section>
 

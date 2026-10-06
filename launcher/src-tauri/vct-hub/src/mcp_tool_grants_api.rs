@@ -288,6 +288,21 @@ mod tests {
         LauncherDbHandle(Arc::new(db))
     }
 
+    /// Seed a per-project tool-grant row the way the retired GUI writer
+    /// (v0.2.101) used to — the route under test only READS the table.
+    fn seed_tool_grant(db: &Db, project: &str, mcp: &str, tool: &str, enabled: bool) {
+        db.lock()
+            .execute(
+                "INSERT INTO project_mcp_tool_grants
+                 (project_id, mcp_name, tool_name, enabled)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(project_id, mcp_name, tool_name)
+                 DO UPDATE SET enabled = excluded.enabled",
+                rusqlite::params![project, mcp, tool, enabled as i32],
+            )
+            .unwrap();
+    }
+
     /// Bind on a random port, spawn the router, return the base URL.
     /// Same shape `auth.rs` and `modules_api.rs` tests use; avoids a
     /// `tower` dev-dep just for `tower::oneshot`.
@@ -595,10 +610,7 @@ mod tests {
                 100,
             )
             .unwrap();
-        state
-            .0
-            .set_mcp_tool_enabled("p1", "code-reranker", "rerank", false)
-            .unwrap();
+        seed_tool_grant(&state.0, "p1", "code-reranker", "rerank", false);
         let base = spawn_router(state).await;
         let client = reqwest::Client::new();
         let resp = client
@@ -625,10 +637,7 @@ mod tests {
         // — the user's row in `project_mcp_tool_grants` is the
         // source of truth.
         let state = make_db_with_project("p1");
-        state
-            .0
-            .set_mcp_tool_enabled("p1", "code-reranker", "experimental_x", true)
-            .unwrap();
+        seed_tool_grant(&state.0, "p1", "code-reranker", "experimental_x", true);
         let base = spawn_router(state).await;
         let client = reqwest::Client::new();
         let resp = client

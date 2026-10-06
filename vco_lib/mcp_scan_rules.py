@@ -172,16 +172,33 @@ def uninstall_scrub_shape_gated_mcp_names(path: Path | None = None) -> tuple[str
     return tuple(_rules(path)["bundled"]["uninstall_scrub_shape_gated"])
 
 
-def deprecated_default_mcps(path: Path | None = None) -> dict[str, dict[str, str]]:
+def deprecated_default_mcps(path: Path | None = None) -> dict[str, dict[str, object]]:
     """Registry of MCPs dropped from the default install set, keyed by MCP
     name. Each value carries ``removed_in`` / ``reason`` / ``opt_in_manifest``
-    (``opt_in_manifest`` defaults to "" when absent)."""
+    (``opt_in_manifest`` defaults to "" when absent) and ``auto_scrub`` (a
+    bool, default False — true means the ordinary update removes the entry
+    automatically instead of prompting)."""
     raw = _rules(path).get("deprecated", {})
-    out: dict[str, dict[str, str]] = {}
+    out: dict[str, dict[str, object]] = {}
     for name, info in raw.items():
         out[name] = {
             "removed_in": info.get("removed_in", ""),
             "reason": info.get("reason", ""),
             "opt_in_manifest": info.get("opt_in_manifest", ""),
+            "auto_scrub": bool(info.get("auto_scrub", False)),
         }
     return out
+
+
+def retired_settings_allow_patterns(path: Path | None = None) -> tuple[str, ...]:
+    """Exact ``permissions.allow`` strings a retired MCP left in existing
+    projects' ``.claude/settings.json`` — the bundle update's settings merge
+    drops them (one rule home: the ``settings_allow_patterns`` field of each
+    ``[deprecated.*]`` table; the registration scrub itself lives in
+    ``install_mcp.auto_scrub_mcp_entries``)."""
+    patterns: list[str] = []
+    for info in _rules(path).get("deprecated", {}).values():
+        for pat in info.get("settings_allow_patterns", []):
+            if pat not in patterns:
+                patterns.append(pat)
+    return tuple(patterns)

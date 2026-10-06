@@ -7,7 +7,12 @@
 //!    audit. Resolves the module's manifest + install dir from the
 //!    launcher catalog, runs the apply pass, returns the structured
 //!    report to the GUI. Used by the dashboard's "Repair module DB"
-//!    surface for when the install-time apply soft-failed.
+//!    surface for when the install-time apply soft-failed. Since v0.2.101
+//!    (owner ruling Q4) that surface is REAL: the module tile shows
+//!    "Re-apply DB migrations" only for modules whose last apply reported
+//!    errors — the state recorded here (`MIGRATION_FAILURES_KEY`, written
+//!    by the installer engine on soft-fail and cleared by a clean apply)
+//!    and read through `list_module_db_migration_failures`.
 //!
 //! 2. [`get_or_issue_module_token`] — the ONE launcher-side issuer of the
 //!    per-(module, project) shared secret used as a bearer token for the
@@ -28,6 +33,7 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::db::module_db_migrations::{
@@ -75,7 +81,102 @@ pub async fn apply_module_db_migrations(
     // bounded (a few small SQL files), and the manual-repair surface
     // isn't latency-sensitive (user clicked a button).
     let report = core_apply(db.inner(), &module_id, &install_dir, &manifest)?;
+    // v0.2.101 (Q4): keep the recorded failure state in step with what
+    // just happened, so the module tile's "Re-apply DB migrations"
+    // button disappears the moment a re-apply succeeds (and a failing
+    // re-apply refreshes the recorded detail).
+    if report.ok() {
+        clear_migration_failure(db.inner(), &module_id);
+    } else {
+        record_migration_failure(db.inner(), &module_id, &format!("{:?}", report.errors));
+    }
     Ok(report)
+}
+
+// ─── Last-apply failure state (v0.2.101, owner ruling Q4) ─────────────────
+//
+// The install/update engine soft-fails a module's DB-migration apply (the
+// module is already installed; the migration is just pending) and emits
+// `module://db-migration-failed`. That event is transient — it reaches the
+// shell-notification store of a RUNNING launcher and nothing else — so the
+// repair affordance the owner asked for ("Re-apply DB migrations" on the
+// module tile, shown only when the last apply reported errors) needs the
+// failure recorded somewhere the GUI can read on catalog load. One
+// `app_state` row holds the whole map: module ids are safe JSON keys and a
+// single row cannot disagree with itself.
+
+/// `app_state` key holding the JSON map `{module_id: detail}` of modules
+/// whose last DB-migration apply reported errors.
+pub const MIGRATION_FAILURES_KEY: &str = "module_db_migration_failures";
+
+/// One recorded failure, as the GUI reads it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModuleDbMigrationFailure {
+    pub module_id: String,
+    pub detail: String,
+}
+
+fn read_failure_map(db: &Db) -> std::collections::BTreeMap<String, String> {
+    db.app_state_get(MIGRATION_FAILURES_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn write_failure_map(
+    db: &Db,
+    map: &std::collections::BTreeMap<String, String>,
+) {
+    if map.is_empty() {
+        // An empty map removes the row entirely: `list_...` then reports
+        // "no failures" from the ABSENT key, not from a `{}` nobody wrote.
+        // `delete_like` with the bare key: SQL LIKE treats `_` as a
+        // single-char wildcard, but the only keys it could over-match are
+        // ones differing from ours solely in those positions — nothing
+        // else in app_state lives in that namespace.
+        let _ = db.app_state_delete_like_nonpanicking(MIGRATION_FAILURES_KEY);
+        return;
+    }
+    match serde_json::to_string(map) {
+        Ok(json) => {
+            if let Err(e) = db.app_state_set_nonpanicking(MIGRATION_FAILURES_KEY, &json) {
+                tracing::warn!(
+                    "[module_db] could not record migration failure state: {}",
+                    e
+                );
+            }
+        }
+        Err(e) => tracing::warn!("[module_db] could not serialise failure state: {}", e),
+    }
+}
+
+/// Record (or overwrite) the failure detail for `module_id`. Soft-fail: a
+/// recording hiccup is logged and never breaks the caller — the event the
+/// installer engine emits alongside it still reaches the user.
+pub fn record_migration_failure(db: &Db, module_id: &str, detail: &str) {
+    let mut map = read_failure_map(db);
+    map.insert(module_id.to_string(), detail.to_string());
+    write_failure_map(db, &map);
+}
+
+/// Clear the recorded failure for `module_id` (a clean re-apply). A no-op
+/// when nothing was recorded.
+pub fn clear_migration_failure(db: &Db, module_id: &str) {
+    let mut map = read_failure_map(db);
+    if map.remove(module_id).is_some() {
+        write_failure_map(db, &map);
+    }
+}
+
+/// The GUI's read for the module-tile repair affordance: every module
+/// whose last apply reported errors, with the recorded detail.
+#[tauri::command]
+pub fn list_module_db_migration_failures(db: State<'_, Db>) -> Result<Vec<ModuleDbMigrationFailure>, String> {
+    Ok(read_failure_map(db.inner())
+        .into_iter()
+        .map(|(module_id, detail)| ModuleDbMigrationFailure { module_id, detail })
+        .collect())
 }
 
 /// Margin (ms) below the token's `expires_at` at which a cached token is
@@ -226,5 +327,52 @@ mod tests {
         let a = get_or_issue_module_token(&db, "m", "p1").unwrap();
         let b = get_or_issue_module_token(&db, "m", "p2").unwrap();
         assert_ne!(a, b);
+    }
+
+    // ─── v0.2.101 (Q4): last-apply failure state ─────────────────────────
+
+    fn recorded(db: &Db) -> Vec<ModuleDbMigrationFailure> {
+        read_failure_map(db)
+            .into_iter()
+            .map(|(module_id, detail)| ModuleDbMigrationFailure { module_id, detail })
+            .collect()
+    }
+
+    /// Act: a recorded failure is readable back with its detail, and a
+    /// second record for the same module OVERWRITES (the map holds one
+    /// row per module — the LAST apply, not every apply).
+    #[test]
+    fn record_then_read_back_and_overwrite() {
+        let db = Db::open_in_memory().unwrap();
+        record_migration_failure(&db, "vct-rl-reranker", "m2 failed");
+        record_migration_failure(&db, "vct-rl-reranker", "m3 failed now");
+        let rows = recorded(&db);
+        assert_eq!(rows.len(), 1, "one row per module, not one per failure");
+        assert_eq!(rows[0].module_id, "vct-rl-reranker");
+        assert_eq!(rows[0].detail, "m3 failed now", "the LAST detail wins");
+    }
+
+    /// Act + leave-alone: a clean re-apply clears the module's row (and
+    /// the whole app_state row once no module remains); clearing an
+    /// unrecorded module is a no-op that writes nothing.
+    #[test]
+    fn clear_removes_the_row_and_noops_when_absent() {
+        let db = Db::open_in_memory().unwrap();
+        record_migration_failure(&db, "a", "x");
+        record_migration_failure(&db, "b", "y");
+        clear_migration_failure(&db, "a");
+        let rows = recorded(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].module_id, "b");
+        clear_migration_failure(&db, "b");
+        assert!(recorded(&db).is_empty(), "the map empties with the last row");
+        assert!(
+            db.app_state_get(MIGRATION_FAILURES_KEY).unwrap().is_none(),
+            "an empty map removes the app_state row entirely"
+        );
+        // Leave-alone: clearing something never recorded must not create
+        // the row (a write here would resurrect an empty map key).
+        clear_migration_failure(&db, "never-recorded");
+        assert!(db.app_state_get(MIGRATION_FAILURES_KEY).unwrap().is_none());
     }
 }

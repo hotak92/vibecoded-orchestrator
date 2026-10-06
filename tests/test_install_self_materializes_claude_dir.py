@@ -32,6 +32,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -192,6 +193,12 @@ class DelegatedIsIdempotentTest(unittest.TestCase):
                 return out
 
             first = _snap()
+            # Advance past a whole-second boundary so the ledger's volatile
+            # `generated_at` (second granularity) is GUARANTEED to differ if a
+            # no-op re-run rewrites the file — a deterministic red for the
+            # "unchanged entries must not churn the ledger" contract, instead
+            # of the ~1-in-3 flake it used to be.
+            time.sleep(1.1)
             proc2 = _run_bundle_into(proj, "--update")
             self.assertEqual(proc2.returncode, 0, proc2.stderr[-400:])
             second = _snap()

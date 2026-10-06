@@ -1,61 +1,70 @@
-# Templates — Agents and Skills
+# Templates — Agents, Skills, Packs, Specialisations
 
-This directory holds the agents and skills that `install.py` copies into a user's `.claude/agents/` and `.claude/skills/` at install time. Contents here are *templates*, not active agents — they're populated into your project's `.claude/` so Claude Code picks them up.
+This directory holds what `install.py` / `python -m vco_lib.project_init install-bundle` copies into a user's `.claude/` at install time: default agents (`agents/free/`), module-gated gateway agents (`agents/module-gateway/`), default skills (`skills/`), opt-in packs (`packs/`), and specialisation reference docs (`specializations/`). Contents here are *templates*, not active definitions — they're populated into your project's `.claude/` so Claude Code picks them up.
 
-## Bundled agents — `agents/free/` (44 agents)
+## Default agents — `agents/free/` (11 agents)
 
-All bundled agents are free and installed by default. They cover the base orchestrator workflow plus specialist + coordinator roles: coding, testing, planning, docs, knowledge graph, code graph, migration, bootstrapping, multi-agent design, and language/framework expertise.
+Installed by default in every project. ONE definition per agent: the dispatcher may run any of them on a different Claude tier via the Agent-tool `model` parameter (each body names its sanctioned alternates in a "Model guidance" line). No agent carries a `skills:` frontmatter block — specialisation depth lives in `specializations/` docs referenced by path.
 
-| Agent | Role |
+| Agent | Model | Role |
+|---|---|---|
+| `expert-coder` | opus | Implementation and debugging: features, refactors, fixes, backend/API work |
+| `frontend-specialist` | sonnet | React/Vue/Svelte UI implementation with a11y + real async states |
+| `code-explorer` | haiku | Read-heavy codebase research that saves its report to disk |
+| `web-explorer` | haiku | Web/local-docs research (SURVEY + DEEP modes) saved as a report |
+| `planner` | opus | Requirements → architecture → phased, testable implementation plans |
+| `tester` | sonnet | Writes/runs tests, root-causes failures, reviews coverage |
+| `gui-tester` | sonnet | Playwright-driven GUI testing with screenshots + structured report |
+| `doc-maintainer` | sonnet | Doc extraction, organization, and the archive-before-forget pipeline |
+| `kg-maintainer` | sonnet | KG search, node writing, duplicate + health repair |
+| `code-reviewer` | fable | Adversarial read-only review; findings with `file:line` evidence |
+| `agent-author` | sonnet | Agent/skill definitions and helper scripts |
+
+## Gateway agents — `agents/module-gateway/` (8 agents)
+
+Delivered ONLY when the model gateway is configured on the machine (tri-state module gate); they pin `claude-gw/*` model ids in frontmatter and are dispatched by name with no model override. The z.ai lane: `glm-implementer`, `glm-reviewer`, `glm-planner`, `glm-flash-researcher`. The qwen-vendor lane: `deepseek-implementer`, `qwen-implementer`, `deepseek-researcher`, `qwen-flash-sweeper`. There is deliberately no reviewer and no planner on the qwen vendor.
+
+## Default skills — `skills/` (6 skills)
+
+Short-form guidance invoked via `/skill-name` or auto-loaded by description match:
+
+| Skill | Role |
 |---|---|
-| `coder` | Implementation |
-| `tester` | Test creation + bug investigation |
-| `planner` | Requirements + task breakdown |
-| `helper-scripter` | Scaffolds scripts, hooks, skills |
-| `doc-extractor` | Read-only knowledge extraction |
-| `doc-maintainer` | Doc updates with archival pipeline |
-| `doc-organizer` | Folder hygiene, duplicate prevention |
-| `kg-navigator` | KG read-only exploration |
-| `knowledge-curator` | KG node writes + cross-references |
-| `graph-health-checker` | KG + code graph integrity |
-| `code-graph-updater` | Incremental code graph sync |
-| `code-migrator` | Language/framework migration |
-| `prompt-engineer` | Review + optimize agent prompts |
-| `orchestrator-installer` | Diagnose + recover partially-failed installs |
-| `project-bootstrapper` | Refine bootstrap docs after `--add-project` |
-| `ai-agentic-architect` | Designs multi-agent workflows |
-| `project-coordinator` | Coordinates running agents |
-| `project-architect` | End-to-end design |
-| `project-organizer` | Cross-agent project health |
-| `expert-coder` | Opus-powered implementation for complex features |
-| `ai-llm-expert` | LLM integration specialist |
-| `backend-specialist` | Server/API/database |
-| `frontend-specialist` | React/Vue/UI |
-| `gui-expert` | Gradio + GUI/UX |
-| `deep-researcher` | Recursive sub-agent research |
-| `code-explorer` | Read-only code exploration |
-| `gui-tester` | GUI testing |
-| `web-explorer` | Web research |
-| `api-integration-scaffolder` | Typed API clients from specs/docs |
-| `automation-engineer` | End-to-end automation workflow design |
-| `brand-identity-architect` | Visual brand identity systems |
-| `consulting-cto-portfolio-coordinator` | Multi-client consulting portfolio status |
-| `consulting-employee-impersonator` | Employee-archetype roleplay output |
-| `consulting-sow-drafter` | Statement-of-Work / proposal drafting |
-| `discipline-expert` | Cross-disciplinary scientific consultation |
-| `enterprise-ux-architect` | IA + interaction design for complex enterprise tools |
-| `experiment-designer` | Experiment design from a hypothesis |
-| `inbox-triage-operator` | Multi-channel inbox triage + reply drafting |
-| `landing-page-critic` | SaaS landing-page evaluation |
-| `launch-orchestrator` | Multi-channel release launch content |
-| `outbound-sequence-writer` | Cold outreach sequence drafting |
-| `paper-triage` | PDF folder triage into structured claims table |
-| `postmortem-author` | Blameless post-mortem drafting |
-| `sre-incident-responder` | Live production incident triage |
+| `context-compress` | /compact pipeline guidance + CONTEXT_STATE.md inspection/maintenance |
+| `fix-issue` | Structured GitHub-issue/bug investigation → fix + regression test |
+| `orchestrator-installer` | Diagnose partially-failed VCO installs; install.py flag advice |
+| `project-bootstrapper` | Human-led second pass on a project's seeded bootstrap docs |
+| `rc-native` | Remote Control as a detached native-auth server alongside the gateway panel |
+| `task-breakdown` | Feature → 1–2 h tasks with estimates, dependency graph, risks |
 
-### Skills — `skills/` (54 skills)
+## Opt-in packs — `packs/` (11 packs: 19 agents + 30 skills)
 
-All shipped in free tier. Short-form guidance documents invoked via `/skill-name`. Organized alphabetically: `accessibility-checker`, `ai-image-prompting`, `ai-model-selector`, `ai-prompting`, `ai-rag-advisor`, `api-designer`, `architect`, `architecture-consultant`, `batch-image-pipeline`, `build-vs-buy-decision`, `code-review-expert`, `codegraph-diagram`, `consulting-due-diligence`, `consulting-incident-coordinator`, `consulting-portfolio-status`, `content-calendar-planner`, `context`, `context-compress`, `database-advisor`, `debug-expert`, `deployment-advisor`, `design-system-auditor`, `doc-template`, `equation-check`, `explore-codebase`, `extract-docs`, `fix-issue`, `gui-test`, `gui-ux-expert`, `hardware-calculator`, `hpc-submit`, `idempotency-keys`, `interview`, `k8s-manifest-reviewer`, `kg-research`, `performance-optimizer`, `photoshop-scripting`, `react-patterns`, `repro-audit`, `saas-metrics-health-check`, `saas-pricing-strategist`, `sales-call-prep`, `security-reviewer`, `seo-content-brief`, `slo-designer`, `stats-consult`, `structured-output-extraction`, `task-breakdown`, `tdd`, `terraform-plan-reviewer`, `webhook-receiver`, `workflow-cost-estimator`, `workflow-maintain`.
+NOT installed by default. `packs/packs.toml` is the ONE committed table defining every pack and its members (parsed by `vco_lib/packs.py`). Install into a project with `python -m vco_lib.project_init install-bundle --folder <project> --update --pack <name>` (or the launcher's Packs tab); remove with `--remove-pack <name>` (user-modified members are backed up before removal, never silently deleted). Once installed, a pack stays current through ordinary bundle updates.
+
+| Pack | Agents | Skills |
+|---|---|---|
+| `dev-advisors` | — | accessibility-checker, ai-rag-advisor, architect, debug-expert, security-reviewer |
+| `devops-reliability` | — | idempotency-keys, k8s-manifest-reviewer, slo-designer, terraform-plan-reviewer, webhook-receiver |
+| `ai-engineering` | ai-llm-expert, ai-agentic-architect | structured-output-extraction, workflow-cost-estimator |
+| `science` | discipline-expert, experiment-designer, paper-triage | equation-check, hpc-submit, repro-audit, stats-consult |
+| `marketing-sales-product` | — | build-vs-buy-decision, content-calendar-planner, saas-metrics-health-check, saas-pricing-strategist, sales-call-prep, seo-content-brief |
+| `consulting` | consulting-cto-portfolio-coordinator, consulting-employee-impersonator, consulting-sow-drafter | consulting-due-diligence, consulting-incident-coordinator, consulting-portfolio-status |
+| `design-media` | — | ai-image-prompting, batch-image-pipeline, design-system-auditor, gui-ux-expert, photoshop-scripting |
+| `design-ux` | gui-expert, enterprise-ux-architect | — |
+| `gtm-marketing` | brand-identity-architect, landing-page-critic, outbound-sequence-writer, inbox-triage-operator, launch-orchestrator | — |
+| `ops-sre` | sre-incident-responder, postmortem-author, automation-engineer | — |
+| `migration` | code-migrator | — |
+
+Pack members install to the SAME locations as default agents/skills (`.claude/agents/<name>.md`, `.claude/skills/<name>/`), so enable/disable, adoption, and update semantics are identical.
+
+## Specialisation docs — `specializations/` (17 docs)
+
+Plain reference docs installed to `<project>/.claude/specializations/` — the depth that used to bloat agent prompts, now referenced by ONE line in the agent/skill body that needs it:
+
+- `fields/` — backend, api-design, database, deployment, frontend, prompt-engineering
+- `review-kinds/` — code, security, test, architecture-design, docs-vs-code (read by `code-reviewer` per review kind)
+- `review-topics/` — performance, frontend-ui-a11y, database-migrations, api-design, infra-ci, data-ml
+- `languages/` — ships only when a doc exists (no empty placeholders); agents reference it conditionally
 
 ## Other paid modules (not agents)
 
@@ -91,6 +100,7 @@ until a clean render clears it.
 | `{{OLLAMA_URL}}` | Ollama URL from this machine's endpoint row | agents, skills, project templates, `rendered_root_files.toml` entries |
 | `{{CODE_EMBED_URL}}` | Code-embedding service URL from this machine's endpoint row | agents, skills, project templates, `rendered_root_files.toml` entries |
 | `{{HUB_PORT}}` | The vct-hub port at render time (`$VCT_HUB_PORT` → `hub.port` → 7700); a snapshot — clients re-resolve that ladder at run time | agents, skills, project templates, `rendered_root_files.toml` entries |
+| `{{MODEL_SELECTION_GRID}}` | The per-task model-selection table, rendered with only the rows for the model providers reachable on this machine at render time (a snapshot; no monitoring afterwards) | agents, skills, project templates, `rendered_root_files.toml` entries |
 | `{{INSTALLED_AT_PATH}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
 | `{{WORKING_DIR}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
 | `{{WRAPPER_SCRIPT}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
@@ -112,10 +122,12 @@ Keep placeholders in templates — do NOT hard-code paths, ports or URLs.
 ## Install flags
 
 ```bash
-python install.py                      # 44 bundled agents + all skills (default)
+python install.py                      # 11 default agents + 6 default skills (+ 8 gateway agents when the model gateway is configured)
 python install.py --no-agents          # skip agent installation
 python install.py --no-skills          # skip skill installation
 ```
+
+Per-project bundles (and opt-in packs) go through `python -m vco_lib.project_init install-bundle --folder <project> [--update] [--pack <name>] [--remove-pack <name>] [--skip-kind agents|skills|specializations]`.
 
 Reinstalls preserve any agents/skills already present — you won't lose customizations.
 

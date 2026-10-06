@@ -3,23 +3,21 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
-# VCO-CENTRALIZED-KG: read-side delegator on the KG-suggestion path (PR #171 / 0.1.7).
-#   The "KG search suggestion" branch (Edit/Write only, see section 5
-#   below) calls .claude/scripts/kg-search; that wrapper invokes
-#   search_knowledge.py which honors VCT_KG_ACCESS_LIST through the
-#   shared helper. Other branches (SSRF guard, shell-injection scan,
-#   Build Anchor, file backup, tool logging) do not touch KG/codegraph.
-#   Env propagation: $(...) subshells inherit env. No centralization
-#   needed in this hook itself.
+# VCO-CENTRALIZED-KG: NOT a KG consumer (v0.2.101 wave-3). The former §5
+#   KG-suggestion path was retired (double emission with the pre-edit/pre-
+#   write router wrappers — review nit-6); every remaining branch (SSRF
+#   guard, shell-injection scan, Build Anchor, file backup, tool logging)
+#   is KG/codegraph-free. Marker kept (the centralization audit classifies
+#   every hook); classification: no KG access.
 
-# Pre-tool-use hook — Security enforcement + KG suggestion
+# Pre-tool-use hook — Security enforcement (KG suggestion RETIRED, v0.2.101)
 # Triggers: Before all tool uses
 # Actions:
 #   1. SSRF guard (WebFetch / fetch_page to private IPs)
 #   2. Shell injection scan (network-fetch-to-shell patterns)
 #   3. Build Anchor Protocol: track reads, block unread Write/Edit
 #   4. File backup before Write/Edit on existing files
-#   5. KG search suggestion before Edit/Write
+#   5. (retired — the pre-edit/pre-write router wrappers own edit-time KG)
 #
 # v0.2.77 9-bis: the per-tool-call TOUCAN dataset writer
 # (.claude/logs/toucan_dataset.jsonl) was RETIRED here — it was a
@@ -32,7 +30,7 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Source emit-context.sh ONLY if the file exists. If the helper is
 # missing (partial install or just-after-clone before _lib/ is fully
 # populated), the hook still runs its other branches (logging,
-# security guards). The KG-suggestion branch below checks
+# security guards). The broken-install notices check
 # `command -v emit_additional_context` before calling it.
 # We deliberately do NOT trail with `|| true`: a syntax error inside
 # an existing helper is a real bug we want surfaced.
@@ -85,20 +83,17 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# v0.2.70 Streams C+E: shared helpers for canonical session-id, the unified
-# seen-store dedup, and the code-graph retrieval used by the NEW Read(code) +
-# Grep(symbol) injection branches below. Sourced only if present (partial-install
-# tolerance); the new branches no-op gracefully when a helper is missing.
+# v0.2.70 Streams C+E: shared helpers for canonical session-id and the
+# unified seen-store dedup (the reads ledgers written in the Read branch
+# below; v0.2.101 §C2/§C6 retired this hook's code-graph INJECTION branches
+# — read-context-inject / grep-context-inject are their homes now). Sourced
+# only if present (partial-install tolerance).
 # shellcheck source=_lib/session-id.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
 # shellcheck source=_lib/seen-store.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
-# shellcheck source=_lib/codegraph-query.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
-# v0.2.77 Part 9 task 2: shared TTL result-cache used by codegraph_query_block.
-# Sourced only if present (partial-install tolerance).
-# shellcheck source=_lib/query-cache.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/query-cache.sh" ] && . "$SCRIPT_DIR/_lib/query-cache.sh"
+# (v0.2.101 wave-3: the query-cache.sh sourcing was retired with §5 — its
+# last caller. The lib itself was deleted; the router owns caching now.)
 # v0.2.29: prefer Claude Code's canonical $CLAUDE_PROJECT_DIR (the active
 # workspace the launcher hands us — source of truth for per-project hooks).
 # Fall back to SCRIPT_DIR/../.. for ad-hoc invocations (manual runs, tests)
@@ -139,15 +134,12 @@ SESSION_ID_FROM_STDIN=""
 # v0.2.77 9-bis. Empty string when the field is absent (parent context).
 AGENT_ID=""
 AGENT_TYPE=""
-# WP-E (v0.2.92): transcript_path + prompt_id, same two fields threaded
-# through pre-bash-context-inject.sh / pre-edit-context-inject.sh's stdin
-# parses. transcript_path is a PATH ONLY (never read here in bash — see
-# Section 5 below, which passes it straight through to rl_kg_search.py's
-# --transcript flag; the shared vco_lib/transcript_context.py reader does
-# every byte of the actual reading, in-process, per R31). prompt_id scopes
-# the query-cache key (query-cache.sh) so two turns issuing the same short
-# trigger don't collide on one cache entry when their enriched text
-# differs. MUST MATCH the two sibling hooks' parses.
+# WP-E (v0.2.92): transcript_path + prompt_id ride the shared single-decode
+# prelude. v0.2.101 wave-3: this hook no longer CONSUMES them (§5 retired —
+# the router wrappers resolve both from the payload themselves); the fields
+# stay in the decoder so its NUL protocol is byte-identical across siblings.
+# transcript_path remains a PATH ONLY everywhere (R31). MUST MATCH the
+# sibling hooks' parses.
 TRANSCRIPT_PATH=""
 PROMPT_ID=""
 _PTU_IDX=0
@@ -243,9 +235,8 @@ if [[ "$TOOL_NAME" == "WebFetch" ]]; then
     if [[ -n "$URL" ]]; then
         # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
         # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both
-        # removed in v0.2.11 (see PR-14a). Search MCP now exposes only
-        # `search_papers` which uses OpenAlex+arXiv HTTP directly — its
-        # outbound HTTP doesn't go through this WebFetch SSRF guard.
+        # removed in v0.2.11 (see PR-14a); the search MCP itself was deleted
+        # in v0.2.101, so nothing else reaches the network outside WebFetch.
         # v0.2.100: the decision is `python -m vco_lib.ssrf_url` (one
         # implementation for every OS; its docstring is the contract), run
         # once through _lib/ssrf-allowlist.sh. The allowed pairs are DERIVED
@@ -346,74 +337,21 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
     fi
 fi
 
-# === v0.2.70 Stream C: shared code-graph injection for Read(code)/Grep(symbol).
-# One concern, one home — both surfaces call this. Queries the shared
-# _lib/codegraph-query.sh helper, dedups through the shared _lib/seen-store.sh,
-# emits via the PreToolUse JSON envelope. Soft-fails to nothing.
-#   $1 query        — the codegraph search query (module name / symbol)
-#   $2 exclude_path — path to grep -v out (self-reference); "" if none
-#   $3 label        — header label for the injected block
-#   $4 anchor       — optional file path / symbol forwarded as --anchor so the
-#                     CLI's shared pipeline biases the rerank toward
-#                     call-linked / same-module / shared-type code (v0.2.72 P2)
-_cg_inject() {
-    local _q="$1" _excl="$2" _label="$3" _anchor="${4:-}"
-    command -v codegraph_query_block >/dev/null 2>&1 || return 0
-    [ -n "$_q" ] || return 0
+# === v0.2.70 Stream C — RETIRED (v0.2.101 §C2/§C6) ============================
+# The shared code-graph injection helper and its two call
+# surfaces — Read(code) and Grep(symbol) — were REMOVED. Their home is the
+# router-backed hooks read-context-inject.{sh,ps1} (PostToolUse Read) and
+# grep-context-inject.{sh,ps1} (PreToolUse Grep): exact-symbol lookups,
+# §2.1 gates, seen-store dedupe and the per-turn budget all live in
+# claude_mcp_servers/scripts/hook_context_router.py + vco_lib/inject_intent.
+# This hook keeps ONLY the PreToolUse concerns that must stay here: the
+# security guards, the Build-Anchor reads ledger and the unified
+# seen_reads ledger (both written above), and file backup. (The §5
+# Edit/Write KG suggestion was retired in wave-3 — review nit-6.)
 
-    # v0.2.72 P6: per-session inject VOLUME cap. The seen-store dedups by
-    # IDENTITY (same entity is not re-injected) but a long session navigating
-    # many DISTINCT entities still injects unboundedly. Bound the TOTAL number
-    # of EMITTED injections per session_id (VCO_CG_INJECT_CAP, default 40).
-    #
-    # Two-part contract so the cap counts REAL injections (not query attempts
-    # that dedup to nothing): (1) a read-only capped-check short-circuits BEFORE
-    # the heavier codegraph subprocess once the cap is hit — emitting a ONE-LINE
-    # note EXACTLY ONCE; (2) the counter is incremented ONLY on an actual emit
-    # (bottom of the function). Soft-fail OPEN throughout: an unkeyable session
-    # (untrustworthy id) or any counter error runs UNCAPPED — a broken cap must
-    # never break injection.
-    local _cnt=""
-    if command -v vco_cg_inject_count_path >/dev/null 2>&1; then
-        _cnt="$(vco_cg_inject_count_path "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-    fi
-    if [ -n "$_cnt" ] && command -v vco_cg_inject_capped >/dev/null 2>&1 \
-        && vco_cg_inject_capped "$_cnt"; then
-        # Cap reached — stop injecting. Emit the one-line note once per session.
-        if command -v vco_cg_inject_note_once >/dev/null 2>&1 \
-            && command -v emit_additional_context >/dev/null 2>&1 \
-            && vco_cg_inject_note_once "$SESSION_ID_RAW" "$PROJECT_ROOT"; then
-            emit_additional_context "[codegraph injection cap reached for this session]" PreToolUse
-        fi
-        return 0
-    fi
 
-    local _raw
-    _raw="$(codegraph_query_block "$_q" "" 2 "$_excl" "$_anchor" "$PROMPT_ID" "$TRANSCRIPT_PATH" 2>/dev/null || true)"
-    [ -n "$_raw" ] || return 0
-    local _inj="" _rd=""
-    if command -v vco_seen_store_path >/dev/null 2>&1; then
-        _inj="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-        _rd="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-    fi
-    if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
-        _raw="$(vco_filter_seen_blocks "$_raw" "$_inj" "$_rd")"
-    fi
-    case "$_raw" in
-        *[![:space:]]*)
-            if command -v emit_additional_context >/dev/null 2>&1; then
-                emit_additional_context "[${_label}]:"$'\n'$'\n'"$_raw" PreToolUse
-                # Count this REAL injection toward the per-session cap. Only
-                # reached on a non-empty post-dedup block that actually emits.
-                if [ -n "$_cnt" ] && command -v vco_cg_inject_record >/dev/null 2>&1; then
-                    vco_cg_inject_record "$_cnt"
-                fi
-            fi
-            ;;
-    esac
-}
-
-# === 3. BUILD ANCHOR PROTOCOL: Track reads + v0.2.70 code-file inject ===
+# === 3. BUILD ANCHOR PROTOCOL: Track reads (the Read(code) code-graph inject
+# moved to read-context-inject.sh, v0.2.101 §C2) ===
 if [[ "$TOOL_NAME" == "Read" ]]; then
     FILE_PATH=$(_get_field "file_path")
     if [[ -n "$FILE_PATH" ]]; then
@@ -440,43 +378,23 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
             fi
         fi
 
-        # v0.2.70 Stream C Surface 1 (Read): for a CODE file, inject its
-        # entity/callers/deps summary so opening a source file surfaces the
-        # code-graph context (was previously injected only on Edit). Gated on
-        # the SAME IS_CODE regex as pre-edit:283 / post-file-edit:440 (MUST
-        # MATCH those siblings). Self-exclude uses the repo-relative path so it
-        # matches the producer's repo-relative CODE: src shape.
-        if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
-            _RD_Q="$(basename "$FILE_PATH")"; _RD_Q="${_RD_Q%.*}"
-            _cg_inject "$_RD_Q" "$_REL_FP" "Code-graph context for $(basename "$FILE_PATH")" "$_REL_FP"
-        fi
+        # v0.2.101 injection redesign (§C2): the Read(code) code-graph
+        # injection branch that used to live here was REMOVED — its home is
+        # now the PostToolUse(Read) hook read-context-inject.sh (one
+        # concern, one home; the kickoff probe measured the old branch as
+        # always-killed by its 3 s settings timeout, so it never injected).
+        # The ledger writes ABOVE stay: they must happen PreToolUse so
+        # same-turn Write-anchor checks and seen-store suppression see them.
     fi
     exit 0
 fi
 
-# === v0.2.70 Stream C Surface 4: Grep on a code SYMBOL → inject codegraph.
-# A symbol-shaped Grep pattern is a strong "the model is navigating code" signal.
-# Gated by the shared codegraph_pattern_gate (snake / CamelCase / name( / keyword
-# id); a bare-word pattern like "TODO" does NOT fire. EXCLUDES nothing extra —
-# Grep is already a code-navigation tool. diagram/web/secrets/Read-of-noncode/
-# weaviate-kg never reach this branch (different tool names).
-if [[ "$TOOL_NAME" == "Grep" ]]; then
-    # Use codegraph_pattern_gate (identifier shape: snake/CamelCase/name(/keyword
-    # id) — fires on `def authenticate`, `OrderManager`, `migrate_collections`;
-    # NOT on bare `TODO` / `hello` / `foo.bar`). Same gate the pre-bash tool
-    # branch uses (one home).
-    if command -v codegraph_pattern_gate >/dev/null 2>&1; then
-        GREP_PATTERN=$(_get_field "pattern")
-        if [ -n "$GREP_PATTERN" ] && codegraph_pattern_gate "$GREP_PATTERN"; then
-            _GREP_SYM="$GREP_PATTERN"
-            if command -v codegraph_extract_symbol >/dev/null 2>&1; then
-                _GREP_SYM="$(codegraph_extract_symbol "$GREP_PATTERN")"
-            fi
-            _cg_inject "$_GREP_SYM" "" "Code-graph context for symbol: ${_GREP_SYM}" "$_GREP_SYM"
-        fi
-    fi
-    exit 0
-fi
+# === v0.2.70 Stream C Surface 4 (Grep) — RETIRED (v0.2.101 §C6) ============
+# The Grep(symbol) code-graph injection branch was REMOVED: grep-context-
+# inject.{sh,ps1} (PreToolUse(Grep), router surface `grep`) is its one home
+# now — identifier gating in vco_lib.inject_intent, EXACT structure def+
+# callers lookup, no KG leg. A Grep call falls through to the Write/Edit
+# gate below (no-op for Grep) and exits 0 at the end of the hook.
 
 # === 4. BUILD ANCHOR PROTOCOL + FILE BACKUP: Write/Edit checks ===
 if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
@@ -533,136 +451,20 @@ if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
     fi
 fi
 
-# === 5. KG SEARCH SUGGESTION (Edit/Write only) ===
-if [[ "$TOOL_NAME" != "Edit" ]] && [[ "$TOOL_NAME" != "Write" ]]; then
-    exit 0
-fi
-
-# WP-E (v0.2.92) REVIVAL: this branch originally gated on a topic-keyword
-# regex (CONCEPTS) scanned out of the hook payload's `user_message` field.
-# That field NEVER ARRIVES in the real Claude Code v2.1.x PreToolUse
-# payload — `d.get('user_message', '')` in the single-decode prelude above
-# is always '' on a live install — so `$CONCEPTS` was always empty and this
-# entire branch has been dead code since it was written: the
-# `[ -n "$CONCEPTS" ]` gate never passed.
-#
-# DECISION (plan requirement — documented here + in the WP-E report):
-# the keyword-substring pre-filter is DROPPED, not revived verbatim, in
-# favour of the existing MATCH_COUNT-based threshold below. Rationale:
-#   1. It duplicated gating this branch already had — MATCH_COUNT -ge 2
-#      below already requires two-plus REAL KG matches before a suggestion
-#      surfaces. A second, cruder pre-filter (a fixed 17-word vocabulary)
-#      added no precision, only false negatives for any topic outside that
-#      list.
-#   2. R30's enrichment pipeline (vco_lib/query_enrichment.py, reached via
-#      rl_kg_search.py's --transcript flag) is now the ONE mechanism this
-#      repo uses to turn "recent text" into a properly-budgeted embeddable
-#      query. A second, hand-rolled bash gate second-guessing that
-#      pipeline before it even runs is exactly the two-mechanisms problem
-#      R31 exists to prevent.
-# The trigger passed to rl_kg_search.py below is built ONLY from tool-call
-# metadata (tool name + edited file's basename) — never conversation text,
-# so nothing privacy-sensitive is composed in this shell. Being short, it
-# sits well under query_enrichment.py's default 24-token threshold, so
-# build_query() fills the rest of the embedding budget by walking backward
-# through the transcript (last user prompt, then recent assistant
-# chat/thinking) — this IS "read the last user prompt from the transcript
-# via the shared reader" (plan §3 WP-E item 4), just composed in-process by
-# the shared component rather than assembled here in bash (R31:
-# TRANSCRIPT_PATH is a PATH, never text — the file's CONTENTS are read
-# in-process by vco_lib/transcript_context.py, never in this shell).
-_KG5_FILE=$(_get_field "file_path")
-if [ -n "$_KG5_FILE" ]; then
-    TRIGGER="${TOOL_NAME}: $(basename "$_KG5_FILE")"
-else
-    TRIGGER="$TOOL_NAME"
-fi
-
-# V52-J (v0.2.52): switched from kg-search → rl_kg_search.py so this
-# hook shares the canonical chokepoint with the pre-edit-context-
-# inject hook + the MCP hybrid_search tool. Same Weaviate fan-out,
-# same RL rerank, same v3 retrieval-event emit. Pre-V52-J this branch
-# called kg-search (search_knowledge.py CLI), which until Edit B
-# produced zero telemetry — switching here closes the redundancy at
-# the same time as Edit B closes the silent hole.
-#
-# rl_kg_search.py --hook-format emits headers of the shape
-#   "KG: <title> | <node_type> | score=<n.nn> | <body...>"
-# Title (not file_path) is what we surface to the user since it's
-# the human-readable identifier; the pre-edit hook's dedup logic
-# also keys on title.
-#
-# Venv resolution mirrors pre-edit-context-inject.sh — uses the
-# shared _lib/resolve-vco-venv.sh helper so we never accidentally
-# activate the USER's project venv (which lacks weaviate-client).
-# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
-. "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
-resolve_vco_venv_python "$SCRIPT_DIR"
-VENV="${VCO_VENV_PYTHON:-}"
-# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root — locate it
-# there (same roots as the venv above), never under $PROJECT_ROOT. It still
-# runs with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's
-# KG + shared + granted collections apply (see resolve_vco_orchestrator_script).
-resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/rl_kg_search.py"
-# Unresolved -> the legacy (absent) project path, so every existence check
-# below reads "not installed" exactly as before.
-RL_SCRIPT="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py}"
-# Pin the CALLING project's identity for the producer (a no-op whenever the
-# harness already set it): the script lives in the orchestrator root, so its
-# own location must never be what names the project.
-export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
-# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
-# (rl_kg_search.py reads it; MUST MATCH the .ps1 sibling).
-export VCO_RL_TASK_TYPE="pre_tool_use_kg_search"
-
-MATCHES=""
-MATCH_COUNT=0
-if [ -n "$VENV" ] && [ -f "$RL_SCRIPT" ]; then
-    # Extract only the per-result HEADER lines (start with "KG: " and
-    # carry the " | " separator) — strips body chunks that would
-    # otherwise inflate the suggestion. Filter out the "no-results"
-    # sentinel rl_kg_search emits when nothing matched.
-    #
-    # WP-E (v0.2.92): route through the shared TTL cache (query-cache.sh)
-    # when available so repeat Edit/Write calls within the same turn
-    # (same PROMPT_ID, same tool+file trigger, same TRANSCRIPT_PATH) reuse
-    # one live search instead of paying an embed+Weaviate round trip per
-    # edit — PROMPT_ID scopes the key so a DIFFERENT turn issuing the same
-    # trigger does not collide with this turn's enriched result. Falls
-    # back to a direct call (with --transcript appended only when
-    # non-empty, preserving pre-WP-E argv on older Claude Code builds that
-    # never send transcript_path) when the cache helper isn't sourced.
-    if command -v vco_kg_search_cached >/dev/null 2>&1; then
-        MATCHES=$(VCT_SESSION_ID="$SESSION_ID" vco_kg_search_cached "$VENV" "$RL_SCRIPT" "$TRIGGER" 3 "$PROMPT_ID" "$TRANSCRIPT_PATH" 2>/dev/null \
-            | grep "^KG: " \
-            | grep -v "^KG: no-results" \
-            | head -3 || echo "")
-    elif [ -n "$TRANSCRIPT_PATH" ]; then
-        MATCHES=$(VCT_SESSION_ID="$SESSION_ID" "$VENV" "$RL_SCRIPT" "$TRIGGER" --limit 3 --hook-format --transcript "$TRANSCRIPT_PATH" 2>/dev/null \
-            | grep "^KG: " \
-            | grep -v "^KG: no-results" \
-            | head -3 || echo "")
-    else
-        MATCHES=$(VCT_SESSION_ID="$SESSION_ID" "$VENV" "$RL_SCRIPT" "$TRIGGER" --limit 3 --hook-format 2>/dev/null \
-            | grep "^KG: " \
-            | grep -v "^KG: no-results" \
-            | head -3 || echo "")
-    fi
-    MATCH_COUNT=$(printf '%s\n' "$MATCHES" | grep -c "^KG: " 2>/dev/null || echo "0")
-fi
-
-if [ "$MATCH_COUNT" -ge 2 ]; then
-    # PreToolUse hooks must wrap LLM-bound stdout in
-    # `hookSpecificOutput.additionalContext` — plain stdout is silently
-    # discarded by Claude Code's hook runner. Pre-fork-sweep this
-    # branch printed plaintext that never reached the LLM. Same fix
-    # class as pre-edit-context-inject (PR #168). The shared helper
-    # in _lib/emit-context.sh handles the JSON envelope, the 10k char
-    # cap, and (defense-in-depth) the whitespace-only-content guard.
-    SUGGESTION_TEXT=$(printf '\n💡 Found %s related patterns for: %s\n%s\n\n   Search more: '\''Search knowledge graph for [concept]'\''\n' "$MATCH_COUNT" "$TRIGGER" "$(echo "$MATCHES" | sed 's/^/   /')")
-    # Defense: if the helper failed to load, skip emission rather
-    # than crash. Other branches of this hook are unaffected.
-    if command -v emit_additional_context >/dev/null 2>&1; then
-        emit_additional_context "$SUGGESTION_TEXT" PreToolUse
-    fi
-fi
+# === 5. KG SEARCH SUGGESTION — RETIRED (v0.2.101 wave-3, review nit-6) =====
+# This branch emitted a "💡 Found N related patterns" KG suggestion on every
+# Edit/Write — the SAME tool calls pre-edit-context-inject /
+# pre-write-context-inject inject gated, deduped, budgeted KG + code-graph
+# context for: two context emissions per edit, and the suggestion path had
+# no score floor at all (the survey's precision complaint). The injection
+# redesign made those wrappers (via hook_context_router.py) the ONE home for
+# edit-time KG context — PLAN-V02101 §2.1 Edit/Write rows: floor 0.65,
+# titles-only below 0.85, exact def+callers on the code-graph leg, seen-store
+# dedupe + per-turn budget. Retiring this branch also retired the last shell
+# caller of _lib/query-cache.sh, deleted with it (the router keeps its own
+# Python cache in the same state dir under the disjoint kgi/cgi namespaces;
+# the §9 never-cache-empty contract lives there and is pinned by
+# tests/test_v02101_query_cache_poison_fix.py). The pre_tool_use_kg_search
+# task type stays registered in rl_kg_search's KNOWN_TASK_TYPES — the
+# historical RL corpus keeps its partition label.
+exit 0

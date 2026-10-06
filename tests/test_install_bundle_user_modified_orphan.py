@@ -690,5 +690,93 @@ class KnowledgeRetirementTests(unittest.TestCase):
         self.assertTrue((proj / Path(rel)).exists())
 
 
+class DisabledSideRetirementTests(unittest.TestCase):
+    """v0.2.101 catalogue plan §2.3 — a retired agent/skill the launcher's
+    toggle moved to ``.claude/agents.disabled/`` must not linger forever.
+
+    The enabled-side copy is already gone (the toggle MOVED it), so the orphan
+    loop's case (a) runs; the leftover pass never walks ``.disabled``. Without
+    the §2.3 fix the disabled copy would survive every update. The fix retires
+    it there under the ``--remove-pack`` rule: unmodified → removed; edited →
+    backed up first, then removed. The disable choice does not make a VCO file
+    the user's.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vct-l1-disabled-retire-"))
+        self.orch = self.tmp / "orchestrator"
+        self.proj = self.tmp / "project"
+        self.orch.mkdir()
+        self.proj.mkdir()
+        _make_fake_orchestrator(self.orch)
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False)
+        self.assertEqual(result["errors"], [], result)
+        self.agent = self.proj / ".claude" / "agents" / "example-agent.md"
+        self.assertTrue(self.agent.is_file())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def _disable_agent(self) -> Path:
+        """Simulate the launcher's enable/disable toggle (a file MOVE)."""
+        dis = self.proj / ".claude" / "agents.disabled" / "example-agent.md"
+        dis.parent.mkdir(parents=True, exist_ok=True)
+        self.agent.rename(dis)
+        return dis
+
+    def _retire_from_orchestrator(self) -> None:
+        (self.orch / "templates" / "agents" / "free" / "example-agent.md").unlink()
+
+    def test_retired_disabled_agent_unmodified_is_removed_no_backup(self):
+        dis = self._disable_agent()
+        pre_bytes = dis.read_bytes()
+        self._retire_from_orchestrator()
+
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True)
+
+        self.assertFalse(dis.exists(), "disabled-side retired copy removed")
+        dis_rel = str(Path(".claude/agents.disabled/example-agent.md"))
+        self.assertIn(dis_rel, result["actions"]["orphan-deleted"])
+        # Unmodified (hash matches manifest) → no backup of VCO's own bytes.
+        backups = [b for b in (self.proj / ".claude/backups/bundle-adoptions").rglob("example-agent.md")] \
+            if (self.proj / ".claude/backups/bundle-adoptions").exists() else []
+        self.assertFalse(backups, backups)
+        # Sanity: the bytes really were the shipped ones (premise held).
+        self.assertIn(b"Example agent", pre_bytes)
+
+    def test_retired_disabled_agent_edited_is_backed_up_then_removed(self):
+        dis = self._disable_agent()
+        edited = dis.read_text(encoding="utf-8") + "\n# MY DISABLED NOTES\n"
+        dis.write_text(edited, encoding="utf-8")
+        self._retire_from_orchestrator()
+
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True)
+
+        self.assertFalse(dis.exists(), "edited disabled copy removed after backup")
+        backups = [b for b in
+                   (self.proj / ".claude/backups/bundle-adoptions").rglob("example-agent.md")]
+        self.assertEqual(len(backups), 1, backups)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), edited)
+        self.assertIn(str(Path(".claude/agents.disabled/example-agent.md")),
+                      result["actions"]["orphan-deleted"])
+
+    def test_still_shipped_disabled_agent_is_never_retired(self):
+        # Leave-alone inverse: a DISABLED agent whose template still ships is
+        # NOT an orphan (it is skip-disabled, the FS-disable contract) — the
+        # §2.3 fix must only touch copies upstream actually retired.
+        dis = self._disable_agent()
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True)
+        self.assertTrue(dis.exists(), "a still-shipped disabled agent survives")
+        self.assertNotIn(str(Path(".claude/agents.disabled/example-agent.md")),
+                         result["actions"]["orphan-deleted"])
+        # And it was NOT resurrected on the enabled side (skip-disabled).
+        self.assertFalse(self.agent.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

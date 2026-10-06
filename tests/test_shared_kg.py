@@ -22,6 +22,8 @@ from __future__ import annotations
 import importlib
 import json
 import os
+
+import pytest
 import sys
 import unittest
 from pathlib import Path
@@ -55,6 +57,36 @@ def _fresh_server(env_overrides: dict[str, str]):
     for k, v in env_overrides.items():
         os.environ[k] = v
     return importlib.import_module("weaviate_mcp.server")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_module_env():
+    """Undo, after EVERY test in this file, what its overrides wrote.
+
+    ``_fresh_server`` applies its overrides to the REAL process env — it must,
+    because some lookups read it at runtime rather than at import — and
+    ``_clear_shared_env`` only POPS three keys. So the value of any other key a
+    test set (``KG_BASE_DIR``, ``KG_COLLECTION``, ``SHARED_KG_NODE_FORMATS``,
+    the sidecar paths …) stayed in the shared pytest process for the rest of the
+    session. Concretely: ``SidecarPerCollectionTests`` left
+    ``KG_BASE_DIR=<repo>/tests/_tmp_shared_kg/project`` — a path its tearDown
+    DELETES — and the KG sync script resolves its project root from
+    ``KG_BASE_DIR`` at import, so a later suite
+    (``test_v02101_seed_and_data_keys``) loaded a script pinned to a vanished
+    tmp tree and its root-scoped assertions failed only in the full-suite order
+    (v0.2.101).
+
+    Restoring the WHOLE environment (not a key list) is deliberate: the set of
+    keys these helpers may write is open, and a list would drift out of date the
+    way this one did. Autouse fixtures apply to ``unittest.TestCase`` tests too,
+    which is why this is a fixture rather than another tearDown.
+    """
+    snapshot = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(snapshot)
 
 
 def _clear_shared_env() -> None:

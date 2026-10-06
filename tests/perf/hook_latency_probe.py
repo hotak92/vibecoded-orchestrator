@@ -230,6 +230,17 @@ def _pct(samples: list[float], q: float) -> float:
     return ordered[k]
 
 
+def _one_call(payload: dict, tag: str) -> dict:
+    """A distinct ``tool_use_id`` per sample, as the harness sends per call.
+
+    v0.2.101 N2: the bash context hook runs once per tool CALL (the router's
+    ``--claim``); re-sending one identical payload would make every sample
+    after the first a duplicate that exits early, timing the stand-down path
+    instead of the hook.
+    """
+    return dict(payload, tool_use_id=f"toolu_probe_{tag}")
+
+
 def run_probe(runs: int, only: str | None, timeout: float) -> list[dict]:
     results: list[dict] = []
     for hook_name, event, kind in PROBES:
@@ -246,9 +257,9 @@ def run_probe(runs: int, only: str | None, timeout: float) -> list[dict]:
             _skeleton(tmp)
             payload = _build_payload(kind, tmp)
             # Warmup (discarded): pay interpreter/FS cold-start once.
-            _time_one(hook_path, payload, tmp, timeout)
-            for _ in range(runs):
-                ms = _time_one(hook_path, payload, tmp, timeout)
+            _time_one(hook_path, _one_call(payload, "warmup"), tmp, timeout)
+            for i in range(runs):
+                ms = _time_one(hook_path, _one_call(payload, str(i)), tmp, timeout)
                 if ms is not None:
                     samples.append(ms)
         finally:

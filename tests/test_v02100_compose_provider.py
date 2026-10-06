@@ -101,9 +101,16 @@ def test_no_evidence_at_all_is_unknown_not_a_guess(tmp_path):
 
 
 def test_detect_resolves_the_compose_command_itself_when_not_given(tmp_path):
+    """v0.2.101 (plan item 1): compose_command — the ONE order — pins the
+    standalone `podman-compose` on podman hosts when it exists, and detect
+    inherits that (the engine follows the tool that will actually run)."""
     run = _version_run(out="Docker Compose version v2\n", err=BANNER_DC)
     p = cp.detect("podman", run=run, which=lambda n: "/usr/bin/" + n, env={}, home=tmp_path)
-    assert p.argv == ("podman", "compose") and p.engine == cp.ENGINE_DOCKER_COMPOSE
+    assert p.argv == ("podman-compose",) and p.engine == cp.ENGINE_PODMAN_COMPOSE
+    # Without a standalone, the delegating subcommand is resolved and its
+    # provider named from the banner.
+    p2 = cp.detect("podman", run=run, which=lambda _n: None, env={}, home=tmp_path)
+    assert p2.argv == ("podman", "compose") and p2.engine == cp.ENGINE_DOCKER_COMPOSE
 
 
 def test_no_compose_at_all_is_none(tmp_path):

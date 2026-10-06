@@ -87,6 +87,14 @@ pub struct ChatModelContextRow {
     pub max_output: i64,
     /// `true` → the gateway advertises this id as `<id>[1m]`.
     pub window_1m: bool,
+    /// `true` → the vendor's page states this model takes TEXT-ONLY input:
+    /// it cannot see an image block. The gateway replaces image blocks
+    /// routed to a flagged model with a short text note instead of letting
+    /// the request silently degrade (v0.2.101 parity gap 7); the pane badges
+    /// it "text only" so the routing choice is visible BEFORE a chat fails.
+    /// Conservative default `false` — the gateway reader's own direction for
+    /// an absent key: an unflagged model keeps its image blocks untouched.
+    pub text_only: bool,
     /// The citation: the official vendor page these numbers were read from.
     /// Never empty (SQL `CHECK` + [`ChatModelContextInput::validated`]).
     pub source: String,
@@ -112,6 +120,11 @@ pub struct ChatModelContextInput {
     /// Negative is refused by [`validated`](Self::validated).
     pub max_output: i64,
     pub window_1m: bool,
+    /// `#[serde(default)]` (false) so a GUI payload that predates the field
+    /// is accepted rather than failing deserialisation — the same tolerance
+    /// the gateway's reader gives an absent key.
+    #[serde(default)]
+    pub text_only: bool,
     pub source: String,
     /// Optional; `""` when absent. `#[serde(default)]` so a GUI payload that
     /// omits it is accepted rather than failing deserialisation.
@@ -199,6 +212,7 @@ impl ChatModelContextInput {
             context_window: self.context_window,
             max_output: self.max_output,
             window_1m: self.window_1m,
+            text_only: self.text_only,
             source,
             source_note: self.source_note.trim().to_string(),
         })
@@ -213,6 +227,7 @@ impl ChatModelContextInput {
             && self.context_window == row.context_window
             && self.max_output == row.max_output
             && self.window_1m == row.window_1m
+            && self.text_only == row.text_only
             && self.source == row.source
             && self.source_note == row.source_note
     }
@@ -222,7 +237,7 @@ impl ChatModelContextInput {
 /// pane reports it to the user, and "3 updated, 2 of your edits preserved" is
 /// the sentence that makes the `user_edited` guard visible instead of
 /// folklore.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReseedOutcome {
     /// Shipped rows that were absent (a new vendor model, or a row the user
     /// had deleted — "Reseed from shipped defaults" restores both).
@@ -233,6 +248,24 @@ pub struct ReseedOutcome {
     pub unchanged: usize,
     /// Rows with `user_edited = 1`: LEFT ALONE, byte-identical.
     pub preserved_user_edits: usize,
+    /// Machine-seeded rows (`user_edited = 0`) the converged seed no longer
+    /// ships, retired by the converge (v0.2.101, NB-02). The instance that
+    /// motivated the counter: `glm-5.2`, owner-retired in v0.2.100 — the
+    /// seed stopped listing it, but the seed converge only ever merged, so
+    /// every existing install kept a dead row the model-context pane and the
+    /// exported JSON still listed while the gateway refused the id.
+    pub retired: usize,
+    /// Per-row record of every row this pass WROTE — `(model_id, action)`
+    /// with action `"inserted"` / `"updated"` / `"retired"` (v0.2.101,
+    /// Q6/G1: the model-picker provenance log; a retire is a write — it
+    /// deletes a row the picker advertised — so it is recorded here and
+    /// logged in the same line shape as every other write, not in a line
+    /// of its own). Unwritten rows are NOT listed: a
+    /// steady-state boot converges an unchanged table and records nothing,
+    /// so the log lines the commands layer derives from this stay quiet
+    /// until a row actually appears or changes — which is exactly the
+    /// moment the next duplicate picker row needs to be traceable from.
+    pub written: Vec<(String, String)>,
 }
 
 // ─── Timestamps ───────────────────────────────────────────────────────────
@@ -261,12 +294,13 @@ fn row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChatModelContextRow> 
         source_note: r.get(6)?,
         user_edited: r.get::<_, i64>(7)? != 0,
         updated_at: r.get(8)?,
+        text_only: r.get::<_, i64>(9)? != 0,
     })
 }
 
 const SELECT_COLUMNS: &str = "model_id, vendor, context_window, max_output, \
                               window_1m, source, source_note, user_edited, \
-                              updated_at";
+                              updated_at, text_only";
 
 impl Db {
     /// Every row, ordered by `model_id`. That order is the export's order
@@ -321,6 +355,7 @@ impl Db {
             context_window: input.context_window,
             max_output: input.max_output,
             window_1m: input.window_1m,
+            text_only: input.text_only,
             source: input.source,
             source_note: input.source_note,
             user_edited,
@@ -345,13 +380,14 @@ impl Db {
                 .execute(
                     "INSERT INTO chat_model_context
                         (model_id, vendor, context_window, max_output, window_1m,
-                         source, source_note, user_edited, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                         source, source_note, user_edited, updated_at, text_only)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                      ON CONFLICT(model_id) DO UPDATE SET
                         vendor         = excluded.vendor,
                         context_window = excluded.context_window,
                         max_output     = excluded.max_output,
                         window_1m      = excluded.window_1m,
+                        text_only      = excluded.text_only,
                         source         = excluded.source,
                         source_note    = excluded.source_note,
                         user_edited    = excluded.user_edited,
@@ -366,6 +402,7 @@ impl Db {
                         row.source_note,
                         i64::from(row.user_edited),
                         row.updated_at,
+                        i64::from(row.text_only),
                     ],
                 )
                 .map_err(|e| format!("upsert_chat_model_context: {}", e))?;
@@ -461,8 +498,11 @@ impl Db {
     ///     explicit "Reseed from shipped defaults" clears tombstones, and a
     ///     deliberate click may.
     ///
-    /// Rows in the table that the shipped seed does not mention are never
-    /// removed: converge adds and refreshes, it does not prune.
+    /// Rows in the table that the shipped seed does not mention are retired
+    /// when — and only when — no human hand wrote them (`user_edited = 0`):
+    /// converge adds, refreshes and retires stale seeded rows, but never
+    /// prunes a user's own (see [`retire_rows_absent_from_seed`] for the
+    /// exact predicate).
     pub fn converge_chat_model_context_seed(
         &self,
         rows: &[ChatModelContextInput],
@@ -527,6 +567,10 @@ impl Db {
 /// written not at all (so `updated_at` keeps meaning "when this row last
 /// changed"); present with `user_edited = 1` → LEFT ALONE ENTIRELY.
 ///
+/// After the per-row merge, rows the seed does NOT mention are retired when
+/// they are machine-written — [`retire_rows_absent_from_seed`], shared by
+/// both callers for the same reason this whole function is.
+///
 /// `restore_deleted` is the ONLY difference between the two callers: when it
 /// is `true` (the reseed button — a deliberate click) an absent row is
 /// inserted and its delete tombstone cleared; when it is `false` (the
@@ -583,7 +627,8 @@ fn converge_rows(
                         source         = ?6,
                         source_note    = ?7,
                         user_edited    = 0,
-                        updated_at     = ?8
+                        updated_at     = ?8,
+                        text_only      = ?9
                      WHERE model_id = ?1",
                     params![
                         row.model_id,
@@ -594,10 +639,14 @@ fn converge_rows(
                         row.source,
                         row.source_note,
                         now,
+                        i64::from(row.text_only),
                     ],
                 )
                 .map_err(|e| format!("converge update {}: {}", row.model_id, e))?;
                 outcome.updated += 1;
+                outcome
+                    .written
+                    .push((row.model_id.clone(), "updated".to_string()));
             }
             None => {
                 if restore_deleted {
@@ -610,8 +659,8 @@ fn converge_rows(
                 tx.execute(
                     "INSERT INTO chat_model_context
                         (model_id, vendor, context_window, max_output, window_1m,
-                         source, source_note, user_edited, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+                         source, source_note, user_edited, updated_at, text_only)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9)",
                     params![
                         row.model_id,
                         row.vendor,
@@ -621,14 +670,100 @@ fn converge_rows(
                         row.source,
                         row.source_note,
                         now,
+                        i64::from(row.text_only),
                     ],
                 )
                 .map_err(|e| format!("converge insert {}: {}", row.model_id, e))?;
                 outcome.inserted += 1;
+                outcome
+                    .written
+                    .push((row.model_id.clone(), "inserted".to_string()));
             }
         }
     }
+    retire_rows_absent_from_seed(tx, rows, &mut outcome)?;
     Ok(outcome)
+}
+
+/// Retire rows the converged seed no longer ships (v0.2.101, NB-02).
+///
+/// PREDICATE — a row is RETIRED exactly when BOTH hold:
+///
+///   * `user_edited = 0`. A human edit is never deleted by any automatic
+///     path, per row, ever — the same guard the merge half applies. The only
+///     writer of a `user_edited = 0` row is a previous seed converge, so
+///     this arm names rows that are machine-written and nothing else.
+///   * the id is absent from the seed being converged — the one shipped
+///     catalog surface this layer holds. The gateway's other catalog
+///     surfaces (`model_router/vendors.py`: `static_ids`, `verified_ids`,
+///     `retired_ids`) are Python-side data with no Rust reader, and this
+///     module deliberately does no file I/O, so a seed-absent machine row is
+///     the strongest "appears in no shipped catalog surface" test available
+///     here — and it is exactly right: such a row was written by an OLDER
+///     seed and dropped from the shipped set, which is a model the vendor
+///     no longer serves.
+///
+/// There is deliberately NO second hardcoded tombstone list here. The
+/// gateway's tombstone set for retired ids lives in
+/// `claude_mcp_servers/model_router/vendors.py` (`retired_ids`, today
+/// `("glm-5.2",)` on both routes); duplicating those ids in Rust would be a
+/// (C)-tier mirror without the parity test that would keep it honest — the
+/// seed-absent predicate reaches the same rows from data this layer already
+/// holds. When a model is retired from the shipped seed, this pass retires
+/// it from every existing table on the next boot; if a future release
+/// re-ships an id, the merge half re-inserts it (a retire writes NO
+/// `chat_model_context_tombstone` row — that table is the user's delete
+/// marker and must stay exactly that).
+///
+/// Every retired row is recorded in `outcome.written` as
+/// `(model_id, "retired")`, and the commands layer turns that record into
+/// the ONE model-picker provenance line shape every writer uses
+/// (`[vct] model-picker row: model=<id> source=<source> action=retired`,
+/// `commands::chat_model_context::model_picker_row_provenance_line`) — with
+/// the source of the pass that retired it (`gateway-catalog-sync` on boot,
+/// `reseed-import` on the button), which this layer cannot know. Until
+/// review S3 this function logged its own differently-shaped line, so a
+/// grep for the provenance shape missed every retire. The retire COUNT also
+/// surfaces elsewhere — the boot summary line
+/// (`commands::chat_model_context::converge_summary_line`, which also
+/// carries the "re-add it by hand" hint) and the reseed toast after
+/// "Reseed from shipped defaults" — but neither names the retired IDS; the
+/// per-row provenance line is where a user learns which row went, which no
+/// pane shows (a removed row simply disappears).
+fn retire_rows_absent_from_seed(
+    tx: &rusqlite::Transaction<'_>,
+    seed: &[ChatModelContextInput],
+    outcome: &mut ReseedOutcome,
+) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare("SELECT model_id FROM chat_model_context WHERE user_edited = 0")
+        .map_err(|e| format!("retire scan prepare: {}", e))?;
+    let machine_rows: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("retire scan: {}", e))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("retire scan collect: {}", e))?;
+    drop(stmt);
+    for model_id in machine_rows {
+        if seed.iter().any(|row| row.model_id == model_id) {
+            continue;
+        }
+        // The `user_edited = 0` re-check is defensive: the scan and the
+        // delete share one transaction, but the guard costs nothing and a
+        // future edit that moves this off the scanned set must not be able
+        // to turn it into a delete of a user's row.
+        let deleted = tx
+            .execute(
+                "DELETE FROM chat_model_context WHERE model_id = ?1 AND user_edited = 0",
+                params![model_id],
+            )
+            .map_err(|e| format!("retire delete {}: {}", model_id, e))?;
+        if deleted > 0 {
+            outcome.retired += 1;
+            outcome.written.push((model_id, "retired".to_string()));
+        }
+    }
+    Ok(())
 }
 
 // ─── Export document ──────────────────────────────────────────────────────
@@ -645,6 +780,7 @@ fn converge_rows(
 ///  "source": "launcher.db",
 ///  "models": {"<full-model-id>": {"vendor": "...", "context_window": 0,
 ///                                 "max_output": 0, "window_1m": false,
+///                                 "text_only": false,
 ///                                 "source": "...", "source_note": "..."}}}
 /// ```
 ///
@@ -675,6 +811,11 @@ pub fn export_document(
         );
         entry.insert("max_output".into(), serde_json::Value::from(row.max_output));
         entry.insert("window_1m".into(), serde_json::Value::from(row.window_1m));
+        // The image-capability flag always travels (never omitted, even for
+        // false): the gateway's reader defaults an ABSENT key to false too,
+        // but an explicit value is what makes this export a complete answer
+        // to "can this model see images?" — same treatment as `window_1m`.
+        entry.insert("text_only".into(), serde_json::Value::from(row.text_only));
         entry.insert("source".into(), serde_json::Value::from(row.source.clone()));
         if !row.source_note.is_empty() {
             entry.insert(
@@ -789,6 +930,15 @@ pub fn parse_document(payload: &serde_json::Value) -> Result<Vec<ChatModelContex
                 .get("window_1m")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            // The image-capability flag (v0.2.101). Absent → false, the SAME
+            // direction the gateway's reader defaults a missing key
+            // (context_table.py: `bool(raw.get("text_only"))`): the shipped
+            // seed states it only on the rows the vendor page decides, and
+            // an unflagged model keeps its image blocks untouched.
+            text_only: entry
+                .get("text_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             source: text("source"),
             source_note: text("source_note"),
         };
@@ -820,6 +970,7 @@ mod tests {
             context_window: 200_000,
             max_output: 128_000,
             window_1m: false,
+            text_only: false,
             source: "https://docs.z.ai/guides/llm/glm-5.1".into(),
             source_note: String::new(),
         }
@@ -960,10 +1111,14 @@ mod tests {
         assert_eq!(created.max_output, 0);
 
         assert_eq!(
-            db.converge_chat_model_context_seed(&[ChatModelContextInput {
-                max_output: 0,
-                ..input("deepseek-v4-pro")
-            }])
+            db.converge_chat_model_context_seed(&[
+                // The pre-upserted row travels IN the seed so this test stays
+                // about the unstated marker, not the retire pass: a
+                // machine-written seed-absent row would (correctly, v0.2.101)
+                // be retired here and shrink the listing below.
+                ChatModelContextInput { max_output: 0, ..input("qwen3.8-max") },
+                ChatModelContextInput { max_output: 0, ..input("deepseek-v4-pro") },
+            ])
             .unwrap()
             .inserted,
             1,
@@ -1156,7 +1311,8 @@ mod tests {
         let outcome = db.converge_chat_model_context_seed(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0 },
+            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0, retired: 0,
+                written: vec![("glm-5.1".into(), "updated".into())] },
             "an untouched row with stale values is REFRESHED, not skipped"
         );
         let row = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
@@ -1186,7 +1342,8 @@ mod tests {
         let outcome = db.converge_chat_model_context_seed(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1 }
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1, retired: 0,
+                written: Vec::new() }
         );
 
         // BYTE-IDENTICAL: context_window, max_output, window_1m, source,
@@ -1219,7 +1376,8 @@ mod tests {
         let outcome = db.converge_chat_model_context_seed(&[input("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 0, unchanged: 1, preserved_user_edits: 0 },
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 1, preserved_user_edits: 0, retired: 0,
+                written: Vec::new() },
             "an identical row is counted, not written"
         );
         assert_eq!(
@@ -1396,7 +1554,8 @@ mod tests {
         let outcome = db.reseed_chat_model_context(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0 }
+            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0, retired: 0,
+                written: vec![("glm-5.1".into(), "updated".into())] }
         );
         let row = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
         assert_eq!(row.context_window, 1_000_000);
@@ -1423,7 +1582,8 @@ mod tests {
         let outcome = db.reseed_chat_model_context(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1 }
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1, retired: 0,
+                written: Vec::new() }
         );
 
         let after = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
@@ -1445,13 +1605,57 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 1, updated: 0, unchanged: 1, preserved_user_edits: 0 },
+            ReseedOutcome { inserted: 1, updated: 0, unchanged: 1, preserved_user_edits: 0, retired: 0,
+                written: vec![("glm-5.3".into(), "inserted".into())] },
             "a new vendor model arrives; the identical row is not rewritten"
         );
     }
 
+    /// v0.2.101 (Q6/G1): the provenance record. A converge that inserts,
+    /// updates and leaves alone must record EXACTLY the two rows it wrote
+    /// with their actions — the unchanged row must NOT appear (a
+    /// steady-state boot stays quiet) and the record is what the commands
+    /// layer turns into the model-picker provenance log lines.
+    /// (Red-proof mutation: drop either `written.push` in `converge_rows`
+    /// and this fails.)
     #[test]
-    fn reseed_never_prunes_a_row_the_shipped_seed_does_not_mention() {
+    fn converge_records_exactly_the_rows_it_wrote() {
+        let db = make_db();
+        db.upsert_chat_model_context(input("glm-5.1"), false).unwrap();
+
+        let outcome = db
+            .converge_chat_model_context_seed(&[
+                one_m("glm-5.1"),      // present, stale → updated
+                input("glm-5.3"),      // absent → inserted
+                input("glm-5.2"),      // absent → inserted
+            ])
+            .unwrap();
+
+        assert_eq!(
+            outcome.written,
+            vec![
+                ("glm-5.1".to_string(), "updated".to_string()),
+                ("glm-5.3".to_string(), "inserted".to_string()),
+                ("glm-5.2".to_string(), "inserted".to_string()),
+            ],
+            "written records each row that landed, in seed order, with its action"
+        );
+
+        // Steady state: converging the SAME seed again writes nothing and
+        // records nothing — the provenance log stays silent on a boot that
+        // changed no row.
+        let again = db
+            .converge_chat_model_context_seed(&[
+                one_m("glm-5.1"),
+                input("glm-5.3"),
+                input("glm-5.2"),
+            ])
+            .unwrap();
+        assert!(again.written.is_empty(), "an unchanged table records nothing");
+    }
+
+    #[test]
+    fn reseed_never_prunes_a_user_edited_row_the_seed_does_not_mention() {
         let db = make_db();
         db.upsert_chat_model_context(
             ChatModelContextInput {
@@ -1467,7 +1671,143 @@ mod tests {
 
         assert!(
             db.get_chat_model_context("kimi-k2").unwrap().is_some(),
-            "reseed adds and refreshes; it does not prune the user's own rows"
+            "reseed adds, refreshes and retires stale SEEDED rows; a row a \
+             human wrote is never one of them"
+        );
+    }
+
+    // ── retire: stale seeded rows (v0.2.101, NB-02) ───────────────────────
+    //
+    // The defect this section pins: the seed converge only ever MERGED, so a
+    // model retired from the shipped seed (glm-5.2, owner ruling v0.2.100)
+    // stayed in every existing table — a row the pane listed and the export
+    // served while the gateway refused the id on every route.
+
+    /// The NB-02 shape exactly: an existing table holding the retired row a
+    /// pre-v0.2.100 seed wrote (plain, `user_edited = 0`), the same retired
+    /// id re-added BY HAND (`user_edited = 1`), and a current-seed row.
+    /// After the converge: the machine-written retired row is GONE, the
+    /// hand-added one is KEPT, the seed row is kept, and the outcome counts
+    /// exactly one retirement.
+    #[test]
+    fn converge_retires_a_stale_seeded_row_but_never_a_user_edited_one() {
+        let db = make_db();
+        // The retired row exactly as an earlier boot seeded it.
+        db.upsert_chat_model_context(one_m("glm-5.2"), false).unwrap();
+        // The user's OWN glm-5.2 row (they re-added it by hand): a human
+        // hand wrote it, so no automatic path may remove it.
+        db.upsert_chat_model_context(
+            ChatModelContextInput {
+                context_window: 555_555,
+                source: "my own measurement".into(),
+                ..one_m("glm-5.2")
+            },
+            true,
+        )
+        .unwrap();
+        // A row the current seed still ships.
+        db.upsert_chat_model_context(input("glm-5.1"), false).unwrap();
+        let seed = vec![input("glm-5.1"), one_m("glm-5.3")];
+
+        let outcome = db.converge_chat_model_context_seed(&seed).unwrap();
+
+        assert_eq!(outcome.retired, 0, "glm-5.2 is user_edited now, not stale");
+        assert!(
+            db.get_chat_model_context("glm-5.2")
+                .unwrap()
+                .expect("the user's row must survive every automatic path")
+                .user_edited,
+            "the hand-re-added row keeps its user-edited guard"
+        );
+
+        // The actual stale shape: a SECOND table (an install where nobody
+        // touched the row) holding the machine-written glm-5.2.
+        let db2 = make_db();
+        db2.upsert_chat_model_context(one_m("glm-5.2"), false).unwrap();
+        db2.upsert_chat_model_context(input("glm-5.1"), false).unwrap();
+
+        let outcome2 = db2.converge_chat_model_context_seed(&seed).unwrap();
+
+        assert_eq!(outcome2.retired, 1, "exactly the stale seeded row");
+        // The retire is a WRITE and is recorded as one, so the commands
+        // layer logs it in the same provenance line shape as every other
+        // write (review S3). (Red-proof mutation: drop the
+        // `written.push((model_id, "retired"))` in
+        // `retire_rows_absent_from_seed` and this fails.)
+        assert_eq!(
+            outcome2.written,
+            vec![
+                ("glm-5.3".to_string(), "inserted".to_string()),
+                ("glm-5.2".to_string(), "retired".to_string()),
+            ],
+            "the retired row is recorded alongside the rows the pass inserted"
+        );
+        assert!(
+            db2.get_chat_model_context("glm-5.2").unwrap().is_none(),
+            "the machine-written glm-5.2 row is retired, not refreshed"
+        );
+        assert!(
+            db2.get_chat_model_context("glm-5.1").unwrap().is_some(),
+            "a row the seed still ships is kept"
+        );
+        assert!(
+            db2.get_chat_model_context("glm-5.3").unwrap().is_some(),
+            "the newly shipped row landed"
+        );
+        assert_eq!(db2.list_chat_model_context().unwrap().len(), 2);
+
+        // The next boot is a no-op retire: nothing left to remove, no
+        // counter creep.
+        let again = db2.converge_chat_model_context_seed(&seed).unwrap();
+        assert_eq!(again.retired, 0, "a retired row does not linger anywhere");
+    }
+
+    /// The retire writes NO delete tombstone — that table is the user's
+    /// delete marker ("do not reseed this id"), and a model retired from the
+    /// seed must come BACK automatically if a future release re-ships it.
+    #[test]
+    fn a_retired_stale_row_leaves_no_delete_tombstone_behind() {
+        let db = make_db();
+        db.upsert_chat_model_context(one_m("glm-5.2"), false).unwrap();
+
+        db.converge_chat_model_context_seed(&[input("glm-5.1")])
+            .unwrap();
+
+        assert!(
+            db.list_chat_model_context_tombstones()
+                .unwrap()
+                .is_empty(),
+            "the retire is not the user's delete; it must not block a future \
+             seed that re-ships the id"
+        );
+
+        // And indeed: a future seed re-shipping the id re-inserts it through
+        // the ordinary boot converge, no button press needed.
+        let outcome = db
+            .converge_chat_model_context_seed(&[input("glm-5.1"), one_m("glm-5.2")])
+            .unwrap();
+        assert_eq!(outcome.inserted, 1);
+        assert!(db.get_chat_model_context("glm-5.2").unwrap().is_some());
+    }
+
+    /// "Reseed from shipped defaults" applies the same retire: the button's
+    /// label promises the shipped set, and a stale machine row is not part
+    /// of it. (A user's own row is exempt — pinned by the test above.)
+    #[test]
+    fn reseed_retires_a_stale_seeded_row_too() {
+        let db = make_db();
+        db.upsert_chat_model_context(one_m("glm-5.2"), false).unwrap();
+
+        let outcome = db.reseed_chat_model_context(&[input("glm-5.1")]).unwrap();
+
+        assert_eq!(outcome.retired, 1);
+        assert!(db.get_chat_model_context("glm-5.2").unwrap().is_none());
+        assert!(
+            outcome
+                .written
+                .contains(&("glm-5.2".to_string(), "retired".to_string())),
+            "the reseed's retire is recorded for the provenance log too; got {:?}",
+            outcome.written
         );
     }
 
@@ -1491,6 +1831,7 @@ mod tests {
             context_window: if window_1m { 1_000_000 } else { 200_000 },
             max_output: 128_000,
             window_1m,
+            text_only: false,
             source: "https://docs.z.ai/guides/llm/x".into(),
             source_note: note.into(),
             user_edited: false,
@@ -1675,6 +2016,113 @@ mod tests {
         assert_eq!(
             parsed[0].max_output, 0,
             "0 round-trips through export → parse; nothing invents a figure"
+        );
+    }
+
+    // ── text_only (v0.2.101 — the image-capability flag) ────────────────
+    //
+    // Pre-fix, the launcher's seed mirror silently DROPPED the field: the
+    // pane could not show it, a reseed could not carry it, and the export
+    // could not publish it. These three pin the whole chain — parse reads
+    // it, converge carries it (including over rows that predate the column),
+    // export ships it.
+
+    #[test]
+    fn export_carries_the_image_capability_flag_on_every_row() {
+        let text_only_model = ChatModelContextRow {
+            text_only: true,
+            ..row("glm-5.3", false, "text_only=true: vendor page states verbatim")
+        };
+        let doc = export_document(&[text_only_model, row("glm-5.3-flash", false, "")], &[], "t");
+        assert_eq!(
+            doc["models"]["glm-5.3"]["text_only"],
+            serde_json::json!(true),
+            "a flagged row exports the flag"
+        );
+        // Always present, even when false — same treatment as `window_1m`,
+        // so the export is a complete answer to "can this model see images?"
+        assert_eq!(
+            doc["models"]["glm-5.3-flash"]["text_only"],
+            serde_json::json!(false),
+            "an unflagged row carries an explicit false, never an absent key"
+        );
+    }
+
+    #[test]
+    fn parse_document_reads_the_image_capability_flag_and_defaults_absent_to_false() {
+        // The shipped seed states `text_only` only on the rows the vendor
+        // page decides; absent must mean false — the SAME direction the
+        // gateway's reader defaults a missing key (`bool(raw.get(...))`).
+        let doc = serde_json::json!({
+            "schema_version": 1,
+            "models": {
+                "glm-5.3": {
+                    "vendor": "zai", "context_window": 200000, "max_output": 128000,
+                    "window_1m": false, "text_only": true,
+                    "source": "https://docs.z.ai/guides/llm/glm-5.3"
+                },
+                "glm-4.5-air": {
+                    "vendor": "zai", "context_window": 200000, "max_output": 128000,
+                    "window_1m": false,
+                    "source": "https://docs.z.ai/guides/llm/glm-4.5-air"
+                }
+            }
+        });
+        let parsed = parse_document(&doc).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed.iter().find(|r| r.model_id == "glm-5.3").unwrap().text_only,
+            true,
+            "a stated flag is READ, not dropped on the floor"
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|r| r.model_id == "glm-4.5-air")
+                .unwrap()
+                .text_only,
+            false,
+            "an absent flag defaults to false (the gateway reader's direction)"
+        );
+    }
+
+    #[test]
+    fn converge_carries_text_only_and_pre_column_rows_converge_without_loss() {
+        // The upgrade shape: a table whose rows predate the `text_only`
+        // column (migration 048 backfilled them to 0 = false) converges
+        // against a seed that now states the flag — the pre-fix mirror
+        // dropped the field, so this exact converge was a silent no-op.
+        let db = make_db();
+        // Row 1: shipped-shaped, pre-column (text_only = false by backfill).
+        db.upsert_chat_model_context(input("glm-5.3"), false).unwrap();
+        // Row 2: a user edit — must stay untouched, flag included.
+        let mut edited = input("glm-5.2");
+        edited.source = "internal wiki".into();
+        db.upsert_chat_model_context(edited.clone(), true).unwrap();
+
+        // The shipped seed now states text_only on glm-5.3; every OTHER
+        // field of that row is unchanged.
+        let mut flagged = input("glm-5.3");
+        flagged.text_only = true;
+        let mut flagged_edit = edited.clone();
+        flagged_edit.text_only = true;
+
+        let outcome = db
+            .converge_chat_model_context_seed(&[flagged, flagged_edit])
+            .unwrap();
+        assert_eq!(
+            (outcome.inserted, outcome.updated, outcome.preserved_user_edits),
+            (0, 1, 1),
+            "the flagged row is an UPDATE (only the flag changed), the user \
+             edit is preserved"
+        );
+        let rows = db.list_chat_model_context().unwrap();
+        let glm53 = rows.iter().find(|r| r.model_id == "glm-5.3").unwrap();
+        assert!(glm53.text_only, "the converge WROTE the flag");
+        let glm52 = rows.iter().find(|r| r.model_id == "glm-5.2").unwrap();
+        assert!(
+            !glm52.text_only && glm52.user_edited && glm52.source == "internal wiki",
+            "the user-edited row is byte-identical to what they wrote"
         );
     }
 

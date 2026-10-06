@@ -76,13 +76,33 @@ def _built_entries() -> dict[str, dict]:
     ``venv_python`` is the running interpreter: the spawned child is then the
     same interpreter pytest runs under, so the test needs no venv discovery
     and cannot silently probe a different Python than it asserts about.
+
+    v0.2.101: the diagram wrappers RETIRED from default registration, so the
+    builder no longer composes their entries. An install that already has them
+    keeps them (owner ruling), and the cwd-independence of that entry is still
+    a live contract — so reconstruct the exact legacy shape here and keep the
+    guard. The reconstruction mirrors what `build_default_mcp_entries` /
+    `_build_python_mcp_entries` emitted through v0.2.100.
     """
     # v0.2.100 WP-18B: the builder takes the rows' URL map (default rows here).
     from vco_lib.service_endpoints import urls_from_rows
     entries = install_mcp._build_python_mcp_entries(
         REPO_ROOT, Path(sys.executable), urls_from_rows({}),
     )
-    return {name: entry for name, entry, _ in entries}
+    built = {name: entry for name, entry, _ in entries}
+    root = str(REPO_ROOT)
+    pkg = str(REPO_ROOT / "claude_mcp_servers")
+    for name, dotted, _upstream in _WRAPPERS:
+        built.setdefault(
+            name,
+            {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": ["-m", dotted],
+                "env": {"PYTHONPATH": os.pathsep.join((root, pkg))},
+            },
+        )
+    return built
 
 
 def _child_env(entry: dict) -> dict[str, str]:

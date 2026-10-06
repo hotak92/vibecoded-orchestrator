@@ -31,7 +31,10 @@ it on the three code paths a proxy has.
 Streaming gets the same treatment through :class:`SseIdRewriter`, because the
 ids arrive in ``content_block_start`` events and a streamed turn is the normal
 case for Claude Code — a normaliser that only handled buffered JSON would fix
-nothing in the field.
+nothing in the field. The same rewriter carries one more stream-level repair,
+the ``message_start`` ``input_tokens`` floor for vendors measured to
+under-report it — also caller-supplied data (an integer estimate), so this
+module stays a mechanism and never a policy.
 
 Vendor-neutral: nothing here names a vendor, a model or an endpoint.
 """
@@ -47,7 +50,11 @@ from typing import Any, Iterator, MutableMapping, Optional
 from vco_lib.transcript_repair import (
     RepairStats,
     TranscriptRepairer,
+    final_assistant_turn_needs_thinking,
+    mark_thinking_signature,
     restore_ids,
+    thinking_enabled,
+    unmark_thinking_signatures,
 )
 
 logger = logging.getLogger(__name__)
@@ -159,10 +166,23 @@ class BoundedIdMap(MutableMapping[str, str]):
 def normalise_vendor_response(
     payload: Any, id_map: MutableMapping[str, str],
 ) -> tuple[Any, RepairStats]:
-    """Rewrite a vendor's buffered ``/v1/messages`` response in place-by-copy."""
+    """Rewrite a vendor's buffered ``/v1/messages`` response in place-by-copy.
+
+    ``mark_thinking=True``: a ``thinking`` block's signature is prefixed with
+    the gateway marker on the way out, so the signature the CLIENT stores is
+    unambiguously vendor-origin and a later first-party request can strip the
+    block by its marker rather than by a shape guess (item c). The vendor
+    branch reverses it with :func:`unmark_thinking_signatures` before
+    forwarding, so the vendor still gets its own bytes. ``strip_vendor_origin``
+    is deliberately OFF here — this is the response leg back to the client, not
+    a first-party request, and the vendor's own thinking is valid on its own
+    route.
+    """
     if not isinstance(payload, dict):
         return payload, RepairStats()
-    repairer = TranscriptRepairer(id_map=id_map, strip_nonportable=True)
+    repairer = TranscriptRepairer(
+        id_map=id_map, strip_nonportable=True, mark_thinking=True,
+    )
     # A Messages response IS the assistant turn, so the role is not in doubt
     # — and it decides whether a ``tool_result`` block may stay.
     content, changed = repairer.repair_content(
@@ -190,6 +210,17 @@ def sanitise_for_anthropic(payload: Any) -> tuple[Any, RepairStats]:
     ``id_map=None``: this direction is one-way. Nothing downstream will ever
     ask us to turn a normalised id back into the vendor id it came from, and
     remembering them would be a leak with no reader.
+
+    ``strip_vendor_origin=True`` also strips vendor ``thinking`` blocks (item
+    c): a vendor signature replayed here is HTTP 400 ``"Invalid `signature` in
+    `thinking` block"``. One edge case needs a payload-level fix rather than a
+    block-level one — when stripping leaves the FINAL assistant turn of a tool
+    loop without its required leading thinking block while the request enables
+    thinking, Anthropic rejects the whole request. The least invasive VALID
+    request is this one sent WITHOUT ``thinking``: a single turn answers
+    without extended thinking rather than the append-only transcript wedging
+    the session on a 400 forever. Only fired when THIS pass stripped a
+    thinking block, so a request the gateway did not touch is never reshaped.
     """
     if not isinstance(payload, dict):
         return payload, RepairStats()
@@ -197,10 +228,19 @@ def sanitise_for_anthropic(payload: Any) -> tuple[Any, RepairStats]:
         id_map=None, strip_nonportable=True, strip_vendor_origin=True,
     )
     messages, changed = repairer.repair_messages(payload.get("messages"))
-    if not changed:
+    drop_thinking = bool(
+        repairer.stats.thinking_blocks_stripped
+        and thinking_enabled(payload)
+        and final_assistant_turn_needs_thinking(messages)
+    )
+    if not changed and not drop_thinking:
         return payload, repairer.stats
     patched = dict(payload)
-    patched["messages"] = messages
+    if changed:
+        patched["messages"] = messages
+    if drop_thinking:
+        patched.pop("thinking", None)
+        repairer.stats.thinking_param_dropped = True
     return patched, repairer.stats
 
 
@@ -270,7 +310,7 @@ _UNCHANGED = _Unchanged()
 class SseIdRewriter:
     """Streaming counterpart of :func:`normalise_vendor_response`.
 
-    Feed it upstream bytes, write what it returns. Three properties matter and
+    Feed it upstream bytes, write what it returns. Four properties matter and
     each has a test:
 
     * **an event that needs no change is re-emitted VERBATIM** — the original
@@ -282,7 +322,16 @@ class SseIdRewriter:
       blocks are renumbered, and every later ``content_block_delta`` /
       ``content_block_stop`` follows the same map;
     * **events for a dropped block are suppressed**, not emitted against a
-      block the client never opened.
+      block the client never opened;
+    * **a deficient ``message_start`` ``input_tokens`` is lifted to a
+      floor** when — and only when — the caller hands in a positive
+      ``message_start_usage`` estimate, which is the caller's data-driven
+      decision (``vendors.py``'s ``partial_message_start_usage`` flag decides
+      it per vendor; this module stays vendor-neutral). An event reporting at
+      or above the floor is truthful and passes through verbatim, so a vendor
+      that starts answering honestly one day cannot be double-counted by a
+      stale flag: the splice fires on the measured deficiency, not on the
+      flag alone.
     """
 
     def __init__(
@@ -290,6 +339,7 @@ class SseIdRewriter:
         *,
         id_map: Optional[MutableMapping[str, str]] = None,
         strip_nonportable: bool = True,
+        message_start_usage: Optional[int] = None,
     ) -> None:
         self._repairer = TranscriptRepairer(
             id_map=id_map, strip_nonportable=strip_nonportable,
@@ -299,6 +349,16 @@ class SseIdRewriter:
         self._dropped_indexes: set[int] = set()
         self._next_index = 0
         self._passthrough = False
+        #: Block indexes whose ``signature_delta`` has already been marked
+        #: (item c). A signature CAN arrive in more than one delta; marking
+        #: only the first keeps the client's concatenation a single
+        #: ``vct_<full>`` rather than ``vct_<c1>vct_<c2>``, which would
+        #: un-mark to a corrupted signature and fail on replay.
+        self._signature_marked: set[int] = set()
+        #: Positive ``input_tokens`` floor for a ``message_start`` that
+        #: under-reports it (zero or partial). ``None`` (the default)
+        #: disables the splice entirely.
+        self._message_start_usage = message_start_usage
 
     @property
     def stats(self) -> RepairStats:
@@ -410,8 +470,14 @@ class SseIdRewriter:
     def _reserialise(
         lines: list[bytes], data_positions: list[int], payload: dict,
     ) -> bytes:
-        # A rewritten SSE event must not be LONGER than the one the
-        # upstream sent, or the relay inflates every stream it touches.
+        # The rewritten ``data:`` line is re-serialised COMPACTLY (no
+        # whitespace), which is what keeps an id-only rewrite from inflating
+        # the stream. There is no length ENFORCEMENT, and one rewrite can
+        # grow the event by a few bytes: the ``message_start`` usage splice
+        # below replaces the vendor's ``input_tokens`` figure with a floor
+        # whose digits may be more numerous. That is fine — the relay is
+        # chunked and no downstream reader, the client included, depends on a
+        # per-event byte count.
         body = json.dumps(payload, **COMPACT_JSON).encode("utf-8")
         first = data_positions[0]
         # Keep THIS line's own ending, whatever it is: in a CRLF stream every
@@ -436,9 +502,108 @@ class SseIdRewriter:
         kind = payload.get("type")
         if kind == "content_block_start":
             return self._on_block_start(payload)
-        if kind in ("content_block_delta", "content_block_stop"):
+        if kind == "content_block_delta":
+            return self._on_content_block_delta(payload)
+        if kind == "content_block_stop":
             return self._on_indexed(payload)
+        if kind == "message_start":
+            return self._on_message_start(payload)
         return _UNCHANGED
+
+    def _on_content_block_delta(self, payload: dict) -> Any:
+        """Index remap PLUS the vendor thinking-signature mark (item c).
+
+        A streamed ``thinking`` block carries its signature in a
+        ``signature_delta`` (the ``content_block_start`` opens it with
+        ``signature:""``), so the mark is applied HERE rather than in
+        ``repair_content`` — marking the start block's empty signature too
+        would concatenate into a double marker. Only the FIRST
+        ``signature_delta`` of a block is marked (see ``_signature_marked``).
+        The mark is what lets a later first-party request recognise the block
+        as vendor-origin by its marker instead of by its shape; the vendor
+        branch strips it back off before forwarding.
+        """
+        original_index = payload.get("index")
+        if isinstance(original_index, int) and original_index in self._dropped_indexes:
+            return None
+        patched: Optional[dict] = None
+        if isinstance(original_index, int):
+            mapped = self._index_map.get(original_index, original_index)
+            if mapped != original_index:
+                patched = dict(payload)
+                patched["index"] = mapped
+        delta = payload.get("delta")
+        if (
+            isinstance(delta, dict)
+            and delta.get("type") == "signature_delta"
+            and isinstance(original_index, int)
+            and original_index not in self._signature_marked
+        ):
+            signature = delta.get("signature")
+            marked = mark_thinking_signature(signature)
+            if isinstance(signature, str):
+                self._signature_marked.add(original_index)
+            if marked != signature:
+                if patched is None:
+                    patched = dict(payload)
+                new_delta = dict(delta)
+                new_delta["signature"] = marked
+                patched["delta"] = new_delta
+        return patched if patched is not None else _UNCHANGED
+
+    def _on_message_start(self, payload: dict) -> Any:
+        """Lift a deficient ``message_start`` ``input_tokens`` to the floor.
+
+        FLOOR semantics: the caller's estimate is a lower bound on the
+        context this turn carries, so the reported figure is replaced only
+        when it is BELOW the floor — a vendor that reports at or above the
+        floor told the truth and the event passes through verbatim. That is
+        what makes a stale flag free: a vendor that fixes its endpoint one
+        day starts exceeding the floor and stops being touched. The two
+        measured deficiencies this covers (2026-10-03 live captures): z.ai
+        reports ``input_tokens: 0``; the qwen endpoint reports a small
+        positive that under-reads the final ``message_delta`` figure.
+
+        Only ``input_tokens`` is patched. The cache fields stay as the vendor
+        wrote them — the ledger's merge rule is "a later zero never
+        overwrites an earlier positive", so an estimate planted in
+        ``cache_read_input_tokens`` here could NEVER be corrected by the
+        vendor's real zero in ``message_delta`` and would poison the ledger.
+        A lifted ``input_tokens`` has the opposite property: the real
+        positive in ``message_delta`` replaces it, last-positive-wins, so the
+        ledger still records the vendor's own final figures.
+        """
+        estimate = self._message_start_usage
+        if not isinstance(estimate, int) or estimate <= 0:
+            return _UNCHANGED
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return _UNCHANGED
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            return _UNCHANGED
+        if "input_tokens" in usage:
+            reported = usage["input_tokens"]
+            # ``bool`` is an ``int`` in Python; a usage block carrying ``true``
+            # where a count belongs is a shape this splice does not understand
+            # and therefore does not touch — the module's zero-versus-silence
+            # discipline, applied to a type.
+            if isinstance(reported, bool) or not isinstance(reported, int):
+                return _UNCHANGED
+        else:
+            # An ABSENT field reads as 0: a flagged vendor's number is not
+            # trusted anyway, and every capture this was built from carried
+            # the field.
+            reported = 0
+        if reported >= estimate:
+            return _UNCHANGED
+        patched = dict(payload)
+        patched_message = dict(message)
+        patched_usage = dict(usage)
+        patched_usage["input_tokens"] = estimate
+        patched_message["usage"] = patched_usage
+        patched["message"] = patched_message
+        return patched
 
     def _on_block_start(self, payload: dict) -> Any:
         original_index = payload.get("index")
@@ -491,4 +656,8 @@ __all__ = [
     "restore_vendor_ids",
     "sanitise_for_anthropic",
     "split_sse_frames",
+    # Re-exported from the SSOT so server.py imports every request/response
+    # rewrite seam from this one adapter: the vendor branch strips the
+    # gateway's thinking-signature marker before forwarding (item c).
+    "unmark_thinking_signatures",
 ]

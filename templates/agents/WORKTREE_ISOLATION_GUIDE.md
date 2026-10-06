@@ -20,17 +20,18 @@ With `isolation: worktree`, mistakes are contained to the worktree branch. You r
 ## Which agents typically have it
 
 Enable on agents that write source code:
-- `coder` — general code implementation
-- `backend-specialist` — API/service/DB code
+- `expert-coder` — general code implementation (incl. backend/API work)
 - `frontend-specialist` — React/UI components
-- `code-migrator` — cross-language rewrites
-- `helper-scripter` — hooks/scripts/automation
+- `code-migrator` (migration pack) — cross-language rewrites
+- `agent-author` — hooks/scripts/automation, agent/skill definitions
+- `sre-incident-responder`, `postmortem-author` (ops-sre pack) — long-form artifacts drafted from live-incident state
 
 NOT enabled (read-only or advisory agents):
-- `planner`, `project-architect`, `project-coordinator` — planning only
+- `planner` — planning only
+- `code-reviewer`, `code-explorer` — read-only research/review
 - `tester` — writes tests but low risk (tests go in tests/)
-- `doc-maintainer`, `doc-organizer` — documentation
-- `kg-navigator`, `knowledge-curator` — knowledge graph read/write to isolated state
+- `doc-maintainer` — documentation
+- `kg-maintainer` — knowledge graph read/write to isolated state
 
 ## When to add isolation to new agents
 
@@ -41,7 +42,7 @@ Add `isolation: worktree` to any agent that:
 - Has a name ending in `-specialist`, `-coder`, `-migrator`, or `-writer`
 
 Do NOT add to agents that:
-- Only read files (Explore, kg-navigator)
+- Only read files (Explore, code-explorer)
 - Only output text/analysis to the conversation
 - Only write to isolated state directories (e.g., `state/`, `knowledge/`)
 

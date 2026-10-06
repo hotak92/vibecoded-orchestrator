@@ -85,6 +85,29 @@ DEV_COLL = "W3Tag_Development"
 ACTIVE_SLOT = "qwen3_embed"
 
 
+@pytest.fixture(autouse=True)
+def _restore_process_env():
+    """Snapshot os.environ around EVERY test in this file.
+
+    `_load_sync_module` below configures the loaded module by writing ~12
+    env vars DIRECTLY (os.environ[...] = ...). Without this fixture those
+    writes leak for the rest of the pytest process and poison any LATER
+    module that reads env at import time — observed: loading the sync
+    script in tests/test_v02101_seed_and_data_keys.py AFTER this file ran
+    produced a module whose context-triple gate refused (wrong PROJECT_ROOT
+    from the leaked KG_BASE_DIR), failing that test's `recorded == 1`
+    assertion. Invisible in alphabetical CI order (that file sorts first);
+    any ad-hoc selection exposes it. Restore the whole mapping per test so
+    the leak cannot recur regardless of which loader variant runs.
+    """
+    snapshot = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(snapshot)
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # Part 0 — the ONE home's own semantics
 # ═════════════════════════════════════════════════════════════════════════

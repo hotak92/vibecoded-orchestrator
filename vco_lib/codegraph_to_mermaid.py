@@ -14,9 +14,9 @@ source string. Two deliverables:
      caches, embedding-service lookup, hub resolver) which is irrelevant to a
      "fetch + render" pipeline and would force a hub round-trip per CLI call.
   2. A thin CLI in ``vco_lib/cli/codegraph_diagram.py`` that exposes it as
-     ``vco codegraph-diagram <symbol>``.
-  3. A slash skill ``.claude/skills/codegraph-diagram/SKILL.md`` that wraps the
-     CLI for in-conversation use.
+     ``vco codegraph-diagram <symbol>`` — the one entry point (an earlier
+     ``.claude/skills/codegraph-diagram/SKILL.md`` slash-skill wrapper was
+     retired in v0.2.101; the CLI stayed).
 
 Heuristics
 ----------
@@ -24,7 +24,7 @@ Heuristics
   (functions are the most common subjects of a codegraph question), then
   ``CodeClass.full_name``, then ``CodeModule.path``. If none match,
   ``fetch_subgraph`` returns ``seed_found=False`` and an empty subgraph
-  rather than raising — callers (CLI, skill) can format the rejection
+  rather than raising — the caller (the CLI) can format the rejection
   message themselves.
 * **BFS depth**: capped at 3 hops. Beyond that the auto-layout flat-line
   pile-up makes Mermaid unreadable.

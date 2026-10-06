@@ -18,10 +18,11 @@ This module covers:
      SIGHUP (signal-attribute probe — works on every OS).
   2. A real Python subprocess that imports the helper exits cleanly
      within ~3 s of receiving SIGHUP (POSIX only — skipped on Windows).
-  3. Both ``weaviate_mcp/server.py`` and ``search_mcp/server.py`` import
-     and register the helper at module-import time (static grep, runs
-     everywhere). This is the regression safeguard: future refactors of
-     either MCP can't quietly drop the SIGHUP wiring.
+  3. The in-tree Python MCP server (``weaviate_mcp/server.py`` — the only one
+     left after v0.2.101 deleted ``search_mcp``) imports and registers the
+     helper at module-import time (static grep, runs everywhere). This is the
+     regression safeguard: a future refactor can't quietly drop the SIGHUP
+     wiring.
 """
 from __future__ import annotations
 
@@ -180,13 +181,13 @@ class McpServersWireSighupHandlerTest(unittest.TestCase):
     that function would silently break the env-reload UX. Static grep
     catches that at test time.
 
-    v0.2.81 re-anchor: search_mcp now RESOLVES the handler through the
-    shared ``_lib.bootstrap.import_lib_member`` helper (loud-fail on a
-    missing shipped ``_lib``) instead of the direct
-    ``from _lib.sighup_handler import ...`` line, so the resolution marker
-    is now per-server. The INTENT is unchanged (the handler is wired +
-    called); the assertion just accepts EITHER resolution mechanism.
-    weaviate_mcp still uses the direct import — its marker is unchanged.
+    v0.2.81 re-anchor: the handler is RESOLVED either through the direct
+    ``from _lib.sighup_handler import ...`` line or through the shared
+    ``_lib.bootstrap.import_lib_member`` helper (loud-fail on a missing
+    shipped ``_lib``), so the resolution marker is per-server. The INTENT is
+    unchanged (the handler is wired + called); the assertion accepts EITHER
+    resolution mechanism. (The search MCP, which used the helper form, was
+    deleted in v0.2.101; weaviate_mcp uses the direct import.)
     """
 
     # The call marker is invariant across both servers.
@@ -226,8 +227,9 @@ class McpServersWireSighupHandlerTest(unittest.TestCase):
     def test_weaviate_mcp_wires_handler(self) -> None:
         self._assert_wires_handler(MCP_DIR / "weaviate_mcp" / "server.py")
 
-    def test_search_mcp_wires_handler(self) -> None:
-        self._assert_wires_handler(MCP_DIR / "search_mcp" / "server.py")
+    # v0.2.101: the search MCP was deleted, so its wiring test is gone.
+    # `code_embedding_service` and `model_router` are not MCP servers spawned
+    # by Claude Code; weaviate-kg is the only in-tree Python MCP left.
 
 
 if __name__ == "__main__":

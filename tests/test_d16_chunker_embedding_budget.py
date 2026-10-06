@@ -187,10 +187,10 @@ class TestUnknownModelUnderFills:
 
     def test_known_small_window_models_keep_their_own_tier(self) -> None:
         # The conservative unknown default never widens a KNOWN model's own
-        # tighter tier: granite (512 ctx) keeps xsmall, byte-identical.
+        # tighter tier: arctic (4 096 ctx) keeps medium, byte-identical.
         assert chunking.chunking_preset_for_model(
-            "granite-embedding:278m-fp16"
-        ) == chunking.CHUNKING_PRESETS["xsmall_context"]
+            "snowflake-arctic-embed2:latest"
+        ) == chunking.CHUNKING_PRESETS["medium_context"]
 
     def test_singleton_multi_matches_single_model_resolver_for_unknown(self) -> None:
         """The documented singleton contract (``for_models([x]) ==
@@ -327,7 +327,7 @@ class TestR39PolicyCeiling:
     def test_capacity_still_clamps_downward_below_policy(self) -> None:
         # R39: where the window legitimately enters, it clamps DOWNWARD
         # only — a model whose window budget is below the policy keeps the
-        # tighter value (granite 512 -> 460; every tier except qwen3's
+        # tighter value (arctic 4 096 → 3 686; every tier except qwen3's
         # xlarge is unchanged by the policy).
         ceiling = chunking.CHUNK_TOKEN_POLICY_CEILING
         for model, num_ctx in chunking.MODEL_TOKEN_LIMITS.items():

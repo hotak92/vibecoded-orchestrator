@@ -1982,7 +1982,7 @@ MERGE_BLOCK_END = "<!-- /vct-merge-pending -->"
 # Note (PR-31 / v0.2.12): ``CLAUDE.md`` was removed from this whitelist.
 # The root CLAUDE.md is orchestrator-self development docs, not a user-
 # project scaffold. User projects render their CLAUDE.md from
-# ``templates/CLAUDE.md.template`` via the project-bootstrapper. The
+# ``templates/CLAUDE.md.template`` via the project-bootstrapper skill. The
 # ``DEFAULT_PRESERVE_LIST`` constant above still includes ``CLAUDE.md``
 # — that is the existing-user-CLAUDE.md preservation concern on
 # update, separate from the whitelist concern this section governs.
@@ -3772,15 +3772,14 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     _run_machine_migrations(_lightweight_deferral)  # after venv triage (v0.2.97)
 
     # PR-14b (v0.2.11 MCP simplification): SearXNG no longer ships in the
-    # default compose stack; Ollama MCP is dropped from the default install;
-    # SEARXNG_URL + GITHUB_TOKEN are no longer needed in the search MCP env.
+    # default compose stack; Ollama MCP is dropped from the default install.
     # Surface deferral notices so existing users know to clean up manually.
+    # (v0.2.101: the search-MCP env-remnant check was deleted with the MCP.)
     if not getattr(args, "suppress_mcp_deprecation_warnings", False):
         # v0.2.83 (WP-B3): searxng-remnant producer RETIRED (harmful `rm -r`
         # advice for users running their own searxng); ID self-clears — see
         # the note in _INSTALL_OWNED_CONDITION_IDS.
         _check_ollama_mcp_remnants(_lightweight_deferral)
-        _check_search_mcp_env_obsolete(_lightweight_deferral)
     _materialize_boot_service(PROJECT_ROOT, None, args,
                               deferral_report=_lightweight_deferral)
     _rerender_model_gateway_boot_service(args)
@@ -5632,8 +5631,8 @@ def main() -> int:
     parser.add_argument("--suppress-mcp-deprecation-warnings", action="store_true",
                         default=False,
                         help="Suppress v0.2.11 MCP-simplification deprecation notices "
-                             "(SearXNG removed from default stack, Ollama MCP removed, "
-                             "search MCP env simplified). Use after you have manually "
+                             "(SearXNG removed from default stack, Ollama MCP removed). "
+                             "Use after you have manually "
                              "cleaned up these remnants.")
     parser.add_argument("--skip-mcp-registration", action="store_true",
                         default=False,
@@ -6394,14 +6393,13 @@ def main() -> int:
     _write_install_manifest(sysinfo, args, install_method="install.py")
 
     # PR-14b (v0.2.11 MCP simplification): Ollama MCP dropped from the default
-    # install; SEARXNG_URL + GITHUB_TOKEN no longer needed in the search MCP
-    # env. Surface deferral notices so existing users know to clean up.
-    # Soft-fail: each helper catches its own errors; install completes even if
-    # both checks fail. (v0.2.83 WP-B3: the searxng-remnant check was RETIRED —
+    # install. Surface deferral notices so existing users know to clean up.
+    # (v0.2.101: the search-MCP env-remnant check was deleted with the MCP.)
+    # Soft-fail: the helper catches its own errors; install completes even if
+    # it fails. (v0.2.83 WP-B3: the searxng-remnant check was RETIRED —
     # see the note in _INSTALL_OWNED_CONDITION_IDS.)
     if not getattr(args, "suppress_mcp_deprecation_warnings", False):
         _check_ollama_mcp_remnants(_deferral_report)
-        _check_search_mcp_env_obsolete(_deferral_report)
 
     # v0.2.89 FIX 2: on --update, quarantine an orphan `.mcp.json` weaviate-kg
     # block that shadows the migrated settings.json (soft-fails on ambiguity).
@@ -6517,6 +6515,8 @@ def main() -> int:
                     "remove_deprecated_mcps", "error",
                     f"unexpected exception: {exc}",
                 )
+
+        _auto_scrub_removed_mcp_entries(PROJECT_ROOT)  # v0.2.101; soft-fails inside
 
     # v0.2.21 Step 8: deploy vct-hub binary alongside vct-launcher and
     # start it idempotently. The launcher binary has already been
@@ -8735,7 +8735,7 @@ def _print_selinux_bind_mount_hint() -> None:
         access).
 
     We don't auto-rewrite compose files here because the launcher's
-    volume migration (commands/volumes.rs) owns the bind-mount override
+    volume migration (commands/storage_ux.rs) owns the bind-mount override
     surface; rewriting from install.py would race with launcher edits.
     Instead we print a clear pointer so the user can re-run the volume
     migration with SELinux awareness.
@@ -10076,27 +10076,24 @@ def _read_active_embedding_from_app_state() -> "str | None":
 def _resolve_active_embedding_for_install() -> "str | None":
     """v0.2.52 V52-AJ: resolve the install-time active embedding profile.
 
-    Resolution chain (matches ``EmbeddingService._resolve_active_embedding``):
+    v0.2.101: this is a THIN CALL over the ONE home,
+    :func:`vco_lib.kg_context_triple.active_embedding_profile_or_none` — the
+    chain is ``ACTIVE_EMBEDDING`` env → ``app_state[embedding.active_profile]``
+    → ``app_state[default_text_embedding]`` mapped to its profile (the
+    hardware-pick derive) → ``None``. ``EmbeddingService._resolve_active_embedding``
+    delegates to the same chain and appends the ``"qwen3"`` default.
 
-      1. ``os.environ[ACTIVE_EMBEDDING]`` — explicit user override.
-      2. ``launcher.db app_state[embedding.active_profile]`` — what the
-         launcher's GUI / install.py preset chooser wrote.
-      3. ``None`` — caller falls back to ``"qwen3"`` default (no
-         destructive resolution here; the None sentinel lets callers
-         distinguish "use default" from "explicit qwen3").
-
-    Returned value (when not None) is lowercased + stripped.
-
-    The chain intentionally mirrors the EmbeddingService side so both
-    code paths arrive at the same answer for any given (env, db) pair.
+    The ``None`` sentinel is install.py's, deliberately: callers distinguish
+    "nothing is configured, use the qwen3 default" from "qwen3 was explicitly
+    chosen" (``current_active_embedding = ... or "qwen3"`` attests it). What
+    the copy this replaced got WRONG was the chain itself: it stopped at
+    ``embedding.active_profile``, so on a hardware-pick-only box install.py
+    resolved ``None`` → qwen3 while the embedder resolved (say) arctic — the
+    recorded context and the work disagreed.
     """
-    env_value = os.environ.get("ACTIVE_EMBEDDING", "").strip().lower()
-    if env_value:
-        return env_value
-    db_value = _read_active_embedding_from_app_state()
-    if db_value:
-        return db_value.lower()
-    return None
+    from vco_lib.kg_context_triple import active_embedding_profile_or_none
+
+    return active_embedding_profile_or_none(db_path=_discover_app_state_db_path())
 
 
 # v0.2.61 (stale-embedding reconcile): the active_embedding profile slot
@@ -11944,11 +11941,14 @@ def _get_compose_command(container_cmd: str) -> list[str]:
     """Return the compose command as a list of args.
 
     v0.2.92 (§3.5): thin call into :func:`vco_lib.containers.
-    compose_command`, which holds the ONE preference order — the
-    launcher's: `<runtime> compose` (subcommand) first, then the standalone
-    `<runtime>-compose` (PATH or ~/.local/bin). Pre-merge this function
-    preferred standalone `podman-compose` while `ensure-containers.sh`
-    and the launcher preferred the subcommand — the split-brain R13 closes.
+    compose_command`, which holds the ONE preference order. v0.2.101
+    (plan item 1) split that order by runtime: podman prefers the
+    standalone `podman-compose` (PATH or ~/.local/bin — the deterministic
+    tool that keeps the GPU overlay's CDI `devices:` spec; a delegating
+    `podman compose` can flip to an external docker-compose that drops
+    it), docker keeps the subcommand first. Pre-merge this function and
+    the wrapper disagreed — the split-brain R13 stays closed because the
+    wrapper's detect_runtime already preferred standalone podman-compose.
     Last-resort fallback is unchanged: `[<runtime>, "compose"]`, so the
     user sees compose's own error rather than "no runtime".
     """
@@ -13362,6 +13362,7 @@ def _seed_weaviate_shared_kg_only(
     orphan_candidate_kg: "Optional[str]" = None,
     rebind_deferred: bool = False,
     rebind_deferred_rationale: str = "",
+    deferral_report: "DeferralReport | None" = None,
 ) -> "list[str]":
     """Run the shared-KG seed step only (no per-project KG sync).
 
@@ -13531,19 +13532,19 @@ def _seed_weaviate_shared_kg_only(
     # per-embed-REQUEST timeout, which now lives inside EmbeddingService's
     # adapters (VCT_EMBED_REQUEST_TIMEOUT_SECS) — a genuinely-wedged embedder
     # fails fast per chunk; a slow-but-progressing one runs to completion.
-    try:
-        run_child_logged(
-            [str(venv_py), str(sync_kg), "--all"],
-            log_stem="shared-kg-seed", check=True,
-            cwd=str(PROJECT_ROOT), env=seed_env,
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"    ! shared KG seed exited {e.returncode} — re-run later with "
-              f"`KG_COLLECTION={current_shared_kg} kg-sync --all`")
-        seed_errors.append(f"shared-kg exit {e.returncode}")
-    except FileNotFoundError as e:
-        print(f"    ! shared KG seed failed: {e}")
-        seed_errors.append(f"shared-kg FileNotFound: {e}")
+    #
+    # v0.2.101 item 4: the second whole-tree seed is enqueued too, under its
+    # own condition (a different target class + retry handler).
+    _shared = _install_weaviate.kg_seed_step(
+        folder=PROJECT_ROOT, venv_py=venv_py, sync_kg=sync_kg, cmd_args=["--all"],
+        log_stem="shared-kg-seed", seed_env=seed_env, enqueue=True,
+        shared_target=current_shared_kg,
+        label=f"shared seed ({current_shared_kg})", error_prefix="shared-kg",
+        hint=f"KG_COLLECTION={current_shared_kg} kg-sync --all",
+        make_deferral=_make_deferral,
+        run_child_logged=run_child_logged,
+    )
+    seed_errors.extend(_shared.errors)
     return seed_errors
 
 
@@ -14028,11 +14029,11 @@ def _seed_weaviate_impl(
             )
 
             diff_files = _install_weaviate.content_hash_diff(
-                on_disk, stored_hashes, PROJECT_ROOT,
+                on_disk, stored_hashes, PROJECT_ROOT, knowledge_root=knowledge_root,
             )
 
             total_files = len(on_disk)
-            _nodes_skipped = total_files - len(diff_files)
+            _nodes_skipped = max(total_files - len(diff_files), 0)
 
             if not diff_files:
                 # All hashes match → skip sync entirely.
@@ -14070,6 +14071,7 @@ def _seed_weaviate_impl(
                     orphan_candidate_kg=_pre_resolution_kg,
                     rebind_deferred=_rebind_deferred,
                     rebind_deferred_rationale=_rebind_deferred_rationale,
+                    deferral_report=deferral_report,
                 )
                 _log_install_event("7c/10", "ok", "CI-10: diff-gate skip complete")
                 return
@@ -14125,6 +14127,7 @@ def _seed_weaviate_impl(
     # different and what had to land first for the amendment to be safe.
     sync_subprocess_ran = False
     sync_exit_zero = False
+    seed_detached = False  # handed to the driver (v0.2.101 item 4)
     if sync_kg.exists():
         if _sync_all:
             cmd_args = ["--all"]
@@ -14156,33 +14159,19 @@ def _seed_weaviate_impl(
         # NEW non-leaking channel, which outranks any inherited KG_BASE_DIR.
         seed_env = _subprocess_env_with_embedding()
         seed_env["KG_SYNC_PROJECT_ROOT"] = str(PROJECT_ROOT)
-        try:
-            run_child_logged(
-                [str(venv_py), str(sync_kg)] + cmd_args,
-                log_stem="kg-sync", check=True, cwd=str(PROJECT_ROOT), env=seed_env,
-            )
-            # Subprocess executed AND exited 0 — clean sync.
-            sync_subprocess_ran = True
-            sync_exit_zero = True
-        except subprocess.CalledProcessError as e:
-            # Subprocess EXECUTED but exited non-zero — e.g. 1/2590 nodes failed
-            # (oversize chunk, transient embed error). The other 2589 WERE
-            # embedded against current_active_embedding, so the collection now
-            # reflects the current context. We record seed_errors (so the KG
-            # PRUNE below stays conservatively skipped) but STILL mark the
-            # subprocess as having run — the context-persist keys off this, not
-            # off seed_errors. The next --update's content-hash diff re-picks-up
-            # only the failed node(s) (their Weaviate content_hash won't match
-            # on-disk), re-embedding them alone in seconds. (SEG-1 fix.)
-            print(f"    ! kg/docs sync exited {e.returncode} — re-run later with `kg-sync --all`")
-            seed_errors.append(f"kg-sync exit {e.returncode}")
-            sync_subprocess_ran = True
-        except FileNotFoundError as e:
-            # Subprocess FAILED TO LAUNCH (venv python / script path bad) —
-            # nothing was embedded. Leave sync_subprocess_ran False so we do
-            # NOT record a false "collection embedded against current context".
-            print(f"    ! kg/docs sync failed: {e}")
-            seed_errors.append(f"kg-sync FileNotFound: {e}")
+        # v0.2.101: enqueued (see `install_weaviate.kg_seed_step`) — decision + fallback there.
+        _seed = _install_weaviate.kg_seed_step(
+            folder=PROJECT_ROOT, venv_py=venv_py, sync_kg=sync_kg, cmd_args=cmd_args,
+            log_stem="kg-sync", seed_env=seed_env, enqueue=_sync_all,
+            context=(current_active_embedding, current_kg_collection, current_shared_kg),
+            label="full seed (knowledge/ + docs/)",
+            error_prefix="kg-sync", hint="kg-sync --all",
+            make_deferral=_make_deferral,
+            run_child_logged=run_child_logged,
+        )
+        seed_detached, sync_subprocess_ran, sync_exit_zero = (
+            _seed.detached, _seed.ran, _seed.exit_zero)
+        seed_errors.extend(_seed.errors)
     else:
         # Sync script missing — the subprocess never ran, nothing embedded.
         # sync_subprocess_ran stays False → context triple is NOT persisted.
@@ -14242,7 +14231,9 @@ def _seed_weaviate_impl(
     # carve-out: they record "an attempt happened at T, embedding N/K" — true of
     # an incomplete run too — withholding them would hide the attempt itself.
     _context_change_incomplete = _context_change_run and not sync_exit_zero
-    if sync_subprocess_ran and not _context_change_incomplete:
+    # Whole-tree (`--all`) shapes belong to the child (vco_lib.kg_context_triple);
+    # this is SEG-1's PARTIAL-run rule — see that module's docstring.
+    if sync_subprocess_ran and not _context_change_incomplete and not _sync_all:
         _write_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, current_active_embedding)
         _write_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION, current_kg_collection)
         _write_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, current_shared_kg)
@@ -14260,7 +14251,9 @@ def _seed_weaviate_impl(
     # collection may retire the metadata-repair pass — and `project_root` makes
     # this record a PROJECTION of the file stamp that run wrote, not a 2nd one.
     _install_weaviate.stamp_kg_metadata_repair(_sync_all and bool(current_kg_collection), sync_exit_zero, _write_app_state_key, project_root=PROJECT_ROOT)
-    if _context_change_incomplete:
+    # v0.2.101 item 4: nothing ran here when the seed was enqueued — the
+    # owed-work entry above already covers it.
+    if _context_change_incomplete and not seed_detached:
         _install_weaviate.emit_context_change_incomplete_deferral(
             deferral_report, _context_change_reason,
             make_deferral=_make_deferral,
@@ -14274,6 +14267,9 @@ def _seed_weaviate_impl(
     # on disk at all are always safe to remove regardless of the partial-sync
     # changelist. The _sync_all gate caused the 192 orphan accumulation on
     # the maintainer install's KG (v0.2.43 post-update audit).
+    #
+    # v0.2.101 item 4: an ENQUEUED (not completed) seed does not weaken this —
+    # see `_prune_stale_kg_rows`'s own note. It stays on.
     if not seed_errors and current_kg_collection:
         _prune_stale_kg_rows(current_kg_collection, weaviate_url)
 
@@ -14306,6 +14302,7 @@ def _seed_weaviate_impl(
         orphan_candidate_kg=_pre_resolution_kg,
         rebind_deferred=_rebind_deferred,
         rebind_deferred_rationale=_rebind_deferred_rationale,
+        deferral_report=deferral_report,
     )
     seed_errors.extend(shared_errors)
 
@@ -16634,96 +16631,6 @@ def _check_ollama_mcp_remnants(
         )
 
 
-def _check_search_mcp_env_obsolete(
-    deferral_report: "DeferralReport",
-) -> None:
-    """Emit a deferral when obsolete env vars remain in the search MCP entry.
-
-    In v0.2.11 the search MCP was simplified to ``search_papers`` only.
-    ``SEARXNG_URL`` (no longer needed — SearXNG dropped) and
-    ``GITHUB_TOKEN`` (no longer needed — GitHub code search removed) are
-    now obsolete in ``mcpServers.search.env``.
-
-    Reads ``_user_home_for_install() / ".claude.json"`` if it exists.
-    Soft-fail throughout — missing or malformed JSON is logged and skipped.
-
-    Uses :func:`_user_home_for_install` (introduced by PR-16) so that
-    pytest fixtures can redirect the lookup via ``VCT_USER_HOME_OVERRIDE``
-    without touching the real user home.
-
-    Args:
-        deferral_report: Run-scoped :class:`DeferralReport` to append the
-            entry to when obsolete keys are found.
-    """
-    claude_json = _user_home_for_install() / ".claude.json"
-    if not claude_json.is_file():
-        return
-    try:
-        data = json.loads(claude_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        _log_install_event(
-            "search_mcp_env_check", "warn",
-            f"could not read {claude_json}: {exc}",
-        )
-        return
-    try:
-        if not isinstance(data, dict):
-            return
-        search_env = (
-            data.get("mcpServers", {})
-            .get("search", {})
-            .get("env", {})
-        )
-        if not isinstance(search_env, dict):
-            return
-
-        obsolete_keys = [
-            k for k in ("SEARXNG_URL", "GITHUB_TOKEN")
-            if k in search_env
-        ]
-        if not obsolete_keys:
-            return
-
-        keys_str = ", ".join(f"`{k}`" for k in obsolete_keys)
-        deferral_report.add_entry(
-            DeferralEntry(
-                condition_id="search_mcp_simplified",
-                title="Obsolete env vars in search MCP entry in ~/.claude.json",
-                detected=(
-                    f"The following env vars in `mcpServers.search.env` of "
-                    f"{claude_json} are no longer used by the search MCP "
-                    f"in v0.2.11: {keys_str}. "
-                    "The search MCP now provides only `search_papers` "
-                    "(OpenAlex + arXiv)."
-                ),
-                why_deferred=(
-                    "Automatic removal of ~/.claude.json env vars would "
-                    "silently break setups where users forward these "
-                    "variables for other purposes. Manual review required."
-                ),
-                command_to_apply=(
-                    f"# Remove obsolete env vars from mcpServers.search.env "
-                    f"in {claude_json}:\n"
-                    + "\n".join(
-                        f"# Delete the `\"{k}\": \"...\"` line from "
-                        "`mcpServers.search.env`."
-                        for k in obsolete_keys
-                    )
-                    + "\n# Only `OPENALEX_EMAIL` is needed going forward."
-                ),
-                severity="info",
-                kg_node_refs=[
-                    "knowledge/concepts/orchestrator-mcp-servers.md",
-                ],
-            )
-        )
-    except Exception as exc:  # noqa: BLE001 — soft-fail
-        _log_install_event(
-            "search_mcp_env_check", "warn",
-            f"could not check search MCP env remnants: {exc}",
-        )
-
-
 # ---------------------------------------------------------------------------
 # v0.2.89 FIX 2 — orphan legacy `.mcp.json` that shadows the migrated
 # `.claude/settings.json`. Real logic (detect predicate + backup/quarantine)
@@ -16826,6 +16733,7 @@ from vco_lib.install_mcp import (  # noqa: E402
     _python_fallback_write_mcp_entries,
     _scan_deprecated_mcp_entries,
     _scan_stale_mcp_entries,
+    auto_scrub_mcp_entries as _auto_scrub_mcp_entries,
     uninstall_scrub_mcp_names as _uninstall_scrub_mcp_names,
 )
 
@@ -19607,6 +19515,45 @@ def _rewrite_stale_mcp_entries(
 #   still requires the explicit --remove-deprecated-mcps flag.
 
 
+def _auto_scrub_removed_mcp_entries(
+    install_root: Path,
+    output_fn=print,
+) -> list[str]:
+    """v0.2.101: remove ``auto_scrub`` deprecated MCP entries from
+    ``~/.claude.json`` on the ordinary install/update and print one notice
+    line per removed entry.
+
+    Owner ruling (PLAN-V0300 item 15): ``search`` was DELETED, so its
+    now-orphaned registration is removed automatically — no consent prompt —
+    because the module it pointed at no longer exists (a leftover entry
+    guarantees a failing MCP subprocess every session). ``mermaid`` /
+    ``excalidraw`` are NOT auto-scrubbed (owner: users keep those). Idempotent
+    and soft-fail: no entry → no write, no print.
+
+    Returns the removed names.
+    """
+    try:
+        claude_json = _user_home_for_install() / ".claude.json"
+        removed = _auto_scrub_mcp_entries(install_root, claude_json)
+    except Exception as exc:  # noqa: BLE001 — soft-fail: the install always completes
+        _log_install_event(
+            "auto_scrub_mcp", "warn",
+            f"auto-scrub of removed MCP entries failed: {exc}",
+        )
+        return []
+    for name in removed:
+        output_fn(
+            f"  Removed obsolete MCP entry `{name}` from {claude_json} "
+            f"— that module no longer ships."
+        )
+    if removed:
+        _log_install_event(
+            "auto_scrub_mcp", "ok",
+            f"removed obsolete MCP entries: {', '.join(removed)}",
+        )
+    return removed
+
+
 def _remove_deprecated_mcp_entries(
     install_root: Path,
     deferral_report: "DeferralReport",
@@ -19642,6 +19589,9 @@ def _remove_deprecated_mcp_entries(
     """
     claude_json = _user_home_for_install() / ".claude.json"
     deprecated = _scan_deprecated_mcp_entries(install_root, claude_json)
+    # auto_scrub entries are removed by the ordinary update
+    # (`_auto_scrub_removed_mcp_entries`) — never offered for consent.
+    deprecated = [d for d in deprecated if not d[3].get("auto_scrub", False)]
     if not deprecated:
         return
 
@@ -21934,7 +21884,8 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     #
     # Defense-in-depth: this uninstaller does NOT shell out to remove
     # container volumes. Per the launcher's `volume_rm_only_callable_from_migrate_volumes`
-    # audit (volumes.rs), only `migrate_volumes` is allowed to invoke
+    # audit (commands/storage_ux.rs — moved there from volumes.rs in
+    # v0.2.101), only `migrate_volumes` is allowed to invoke
     # `<runtime> volume rm ...`. Instead, we delegate volume cleanup to
     # `compose down --volumes`, which is also forbidden in the install
     # path — so we PRINT the exact commands the user can run themselves.

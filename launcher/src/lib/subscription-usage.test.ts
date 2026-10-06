@@ -16,6 +16,7 @@ import {
   fetchUsage,
   INITIAL_CARD_STATE,
   nextPollMs,
+  restartOffered,
   settle,
   unknownLabel,
   USAGE_POLL_MS,
@@ -67,6 +68,26 @@ describe('cardVisible', () => {
     ]) {
       expect(cardVisible({ ok: false, reason, message: 'm' }), reason).toBe(true);
     }
+  });
+});
+
+describe('restartOffered (v0.2.101, P299-A2)', () => {
+  it('offers a restart ONLY for an outdated gateway — every other failure gets no button', () => {
+    // (Red-proof mutation: widen the condition — e.g. `result != null` — and
+    // the non-outdated reasons below fail: a restart fixes none of them, and
+    // the button it would show kills live agent sessions for nothing.)
+    expect(restartOffered({ ok: false, reason: 'outdated_gateway', message: 'm' })).toBe(true);
+    for (const reason of [
+      'broken_install',
+      'bridge_error',
+      'no_token',
+      'unreachable',
+      'not_running',
+    ]) {
+      expect(restartOffered({ ok: false, reason, message: 'm' }), reason).toBe(false);
+    }
+    expect(restartOffered({ ok: true, port: 1, snapshot: snapshot([]) })).toBe(false);
+    expect(restartOffered(null)).toBe(false);
   });
 });
 

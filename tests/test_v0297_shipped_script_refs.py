@@ -63,11 +63,6 @@ _ALLOWLIST: dict[str, str] = {
     # inventing a script).
     "start-rl-server.sh": "provided by the paid RL module when installed; guarded no-op otherwise",
     "start-rl-server.ps1": "provided by the paid RL module when installed; guarded no-op otherwise",
-    # C9 (verified NOT a finding): workflow-maintain's "Doc Check Script"
-    # automation CREATES this script on demand in the user's project
-    # (templates/skills/workflow-maintain/SKILL.md, "Creates: doc-check
-    # script") — it is a product of running the skill, not a shipped file.
-    "doc-check": "generated on demand by the workflow-maintain skill in the user's project",
     # Generic path-shape illustrations in shipped-script comments
     # (".claude/scripts/X → .claude → project" in sync_knowledge_graph.py,
     # "<root>/.claude/scripts/foo.py" in analyze_code_graph.py) — they
@@ -156,11 +151,6 @@ _ILLUSTRATIVE = (
     # project KG -- report citations ("Following pattern from ..."),
     # example Source lines, or example prompts.  They are not promises
     # that a specific curated node ships.
-    "authentication-patterns.md",
-    "authentication.md",
-    "blackboard-coordination.md",
-    "caching-strategies.md",
-    "caching-strategy.md",
     "color-management-for-designers.md",
     "design-tokens-architecture.md",
     "email-deliverability-2026.md",
@@ -168,22 +158,7 @@ _ILLUSTRATIVE = (
     "hypothesis-testing-decision-tree.md",
     "icp-and-buyer-persona-framework.md",
     "information-density-heuristics.md",
-    "jwt-tokens.md",
-    "mcts-llm-planning.md",
     "north-star-metric-selection.md",
-    "oauth2-auth.md",
-    "password-security.md",
-    "python-error-handling.md",
-    "rate-limiting.md",
-    "redis-caching-pattern.md",
-    "rlm-context-loading.md",
-    "secret-management.md",
-    "unified-pattern.md",
-    "vlm-consensus-pattern.md",
-    "vlm-consensus.md",
-    "vlm-patterns.md",
-    "vram-management-strategy.md",
-    "vram-management.md",
     "workflow-engine-tradeoffs-2026.md",
 )
 
@@ -191,9 +166,6 @@ _PLACEHOLDER = (
     # Pure placeholders in examples ("e.g. knowledge/concepts/foo.md").
     "foo.md",
     "my-pattern.md",
-    "node.md",
-    "old-approach.md",
-    "unused-pattern.md",
 )
 
 _KNOWLEDGE_ALLOWLIST: dict[str, str] = {

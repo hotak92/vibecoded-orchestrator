@@ -72,11 +72,22 @@ class TestModelTokenLimits:
     def test_openai_text_3_small_at_8191(self) -> None:
         assert MODEL_TOKEN_LIMITS["text-embedding-3-small"] == 8_191
 
-    def test_new_models_have_entries(self) -> None:
-        # NEW in v0.2.47 RL-7.5: bge-m3, embeddinggemma, granite-embedding.
-        assert MODEL_TOKEN_LIMITS["bge-m3:latest"] == 8_192
-        assert MODEL_TOKEN_LIMITS["embeddinggemma:300m-bf16"] == 2_048
-        assert MODEL_TOKEN_LIMITS["granite-embedding:278m-fp16"] == 512
+    def test_removed_non_vco_models_are_absent(self) -> None:
+        # v0.2.101: bge-m3, embeddinggemma and granite-embedding are NOT VCO
+        # models (no preset / launcher selector / pull plan / model plan ever
+        # named them). Their MODEL_TOKEN_LIMITS rows were removed — this pins
+        # the removal so a future re-add is a deliberate, tested act.
+        for removed in (
+            "bge-m3:latest",
+            "bge-m3",
+            "embeddinggemma:300m-bf16",
+            "embeddinggemma",
+            "granite-embedding:278m-fp16",
+            "granite-embedding",
+        ):
+            assert removed not in MODEL_TOKEN_LIMITS, (
+                f"{removed} is not a VCO model and must not be registered"
+            )
 
 
 # ----------------------------------------------------------------------
@@ -106,14 +117,11 @@ class TestChunkingPresets:
     @pytest.mark.parametrize(
         "model_name,expected_preset_name",
         [
-            ("granite-embedding:278m-fp16", "xsmall_context"),
-            ("embeddinggemma:300m-bf16", "small_context"),
             ("jina-embeddings-v2-base-code", "small_context"),
             ("unclemusclez/jina-embeddings-v2-base-code:latest", "small_context"),
             ("snowflake-arctic-embed2:latest", "medium_context"),
             ("snowflake-arctic-embed2", "medium_context"),
             ("text-embedding-3-small", "large_context"),
-            ("bge-m3:latest", "large_context"),
             # Unknown model UNDER-fills to the tightest general tier (D16,
             # v0.2.92) — the old large_context guess could over-fill an unknown
             # model whose real window is smaller than the 8k-class tier assumes.

@@ -107,7 +107,7 @@ class TestCompositePaths:
         syn = _make(tmp_path, "Linux")
         op = next(o for o in _bundle_ops(monkeypatch)
                   if isinstance(o.transform, materialize.Transform)
-                  and o.dest_rel.endswith("coder.md"))
+                  and o.dest_rel.endswith("expert-coder.md"))
         mutated = op.source_abs.read_bytes() + f"\nInterpreter: {DEAD}\n".encode()
         data, result = op.transform.render(mutated, materialize.LazyContext(syn.context))
         violations = _violations({op.dest_rel: (data.decode("utf-8"), result)})

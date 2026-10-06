@@ -83,6 +83,12 @@ PS1_ONLY_LIB = frozenset({
     # `python -m vco_lib.service_lifecycle with-session-lock` (a shell cannot
     # hold a lock its children do not inherit) — no shell code to mirror.
     "session-lock.ps1",
+    # v0.2.101: the one-quote-pair rule for RAW `.claude/env` scans, dotted by
+    # both `lean-ctx-rewrite.ps1` and `post-tool-use-async.ps1`. No POSIX `.sh`
+    # helper to mirror — the `.sh` siblings SOURCE the file, so the shell
+    # already removes one quote pair. Must also be listed in the ratchet
+    # test's PS1_ONLY_LIB (tests/test_v0292_sibling_parity_blind_spots.py).
+    "strip-one-quote-pair.ps1",
 })
 MAGIC_COMMENT_PREFIX = "# OS-EXEMPT-PARITY:"
 MAGIC_COMMENT_LINE_LIMIT = 5

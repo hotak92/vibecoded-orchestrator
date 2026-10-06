@@ -55,6 +55,15 @@ OWN_PS1 = "powershell -NoProfile -File .claude/hooks/win-guard.ps1"
 OWN_ARG_ONLY = "bash wrapper.sh --target .claude/hooks/my-guard.sh"
 OWN_INLINE = "python3 -m py_compile \"$CLAUDE_TOOL_ARG_FILE_PATH\""
 
+# v0.2.101 (NB-13): `.claude/scripts/` invocations are project-own commands too.
+# Their identity is the PROJECT-RELATIVE path (basenames collide across the
+# script subfolders; scripts may be extension-less).
+OWN_SCRIPT = "bash .claude/scripts/kg-sync --all"
+OWN_SCRIPT_DOT = "bash ./.claude/scripts/lib/vct_project_config.sh"
+OWN_SCRIPT_PS1 = "powershell -NoProfile -File .claude/scripts/win-guard.ps1"
+OWN_SCRIPT_ARG_ONLY = "bash wrapper.sh --target .claude/scripts/not-invoked.sh"
+OWN_SCRIPT_ANCHORED = 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/scripts/kg-sync"'
+
 
 # ─── the detector ───────────────────────────────────────────────────────
 
@@ -68,6 +77,13 @@ OWN_INLINE = "python3 -m py_compile \"$CLAUDE_TOOL_ARG_FILE_PATH\""
     (OWN_ARG_ONLY, []),
     (OWN_INLINE, []),
     (None, []),
+    # .claude/scripts/ — identity is the project-relative path (v0.2.101 NB-13).
+    (OWN_SCRIPT, [".claude/scripts/kg-sync"]),
+    (OWN_SCRIPT_DOT, [".claude/scripts/lib/vct_project_config.sh"]),
+    (OWN_SCRIPT_PS1, [".claude/scripts/win-guard.ps1"]),
+    ('bash .claude/scripts/kg-search "q"', [".claude/scripts/kg-search"]),
+    (OWN_SCRIPT_ANCHORED, []),
+    (OWN_SCRIPT_ARG_ONLY, []),
 ])
 def test_relative_scripts(command, expected):
     assert relative_scripts(command) == expected
@@ -194,6 +210,48 @@ def test_anchor_rewrites_exactly_the_relative_invocations(tmp_path):
     assert anchor_relative_hooks(project)["changed"] == {}
 
 
+def test_find_reports_the_anchored_script_rewrite():
+    """A relative `.claude/scripts/` invocation is detected and offered the
+    anchored form — identity is the project-relative path, argument-position
+    paths and already-anchored forms are left alone (v0.2.101 NB-13)."""
+    block = {"PreToolUse": [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": OWN_SCRIPT},
+        {"type": "command", "command": OWN_SCRIPT_ARG_ONLY},
+        {"type": "command", "command": OWN_SCRIPT_ANCHORED},
+    ]}]}
+    assert find_relative_hook_commands(block) == [{
+        "event": "PreToolUse", "matcher": "Bash", "command": OWN_SCRIPT,
+        "anchored": 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/scripts/kg-sync" --all',
+    }]
+
+
+def test_anchor_rewrites_relative_script_invocations(tmp_path):
+    """The rewrite applies to `.claude/scripts/` invocations too, in the
+    per-OS form (.sh / extension-less → `:-.` fallback; .ps1 → exact
+    placeholder), through the one settings writer."""
+    project = tmp_path / "proj"
+    (project / ".claude").mkdir(parents=True)
+    settings = _write_settings(
+        project,
+        [OWN_SCRIPT, OWN_SCRIPT_DOT, OWN_SCRIPT_PS1, OWN_SCRIPT_ARG_ONLY, OWN_RELATIVE],
+    )
+    assert relative_hooks_still_present(project) is True
+    outcome = anchor_relative_hooks(project)
+    assert outcome["refused"] == {}
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    got = [h["command"] for h in data["hooks"]["PreToolUse"][0]["hooks"]]
+    assert got == [
+        'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/scripts/kg-sync" --all',
+        'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/scripts/lib/vct_project_config.sh"',
+        'powershell -NoProfile -File "${CLAUDE_PROJECT_DIR}/.claude/scripts/win-guard.ps1"',
+        OWN_SCRIPT_ARG_ONLY,
+        'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/my-guard.sh"',
+    ]
+    assert relative_hooks_still_present(project) is False
+    # Idempotent: a second run changes nothing.
+    assert anchor_relative_hooks(project)["changed"] == {}
+
+
 def test_the_anchored_command_runs_from_a_subdirectory(tmp_path):
     """The point of the rewrite: the relative form fails after a `cd`, the
     anchored one does not."""
@@ -249,3 +307,18 @@ def test_registry_row_and_probe_are_wired():
     probe = spec.clear_probe.split(":")[-1]
     assert deferral_probes.PROBES[probe] is deferral_probes.project_hooks_relative_paths_still_present
     assert hook_relative_paths.CID == CID
+
+
+def test_hook_command_key_treats_script_spellings_as_one_registration():
+    """The shared ``only=None`` anchoring path — ``hook_command_key``, the key
+    the launcher's Hooks tab keys rows by and :func:`hooks_settings._locate`
+    matches older spellings with — recognises a relative and an anchored
+    ``.claude/scripts/`` invocation as ONE registration, so a hook this feature
+    rewrote is still locatable from its older DB row. Two DIFFERENT commands
+    running one script stay distinct (v0.2.101 NB-13)."""
+    from vco_lib.hook_retirements import hook_command_key
+
+    relative = "bash .claude/scripts/kg-sync --all"
+    anchored = 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/scripts/kg-sync" --all'
+    assert hook_command_key(relative) == hook_command_key(anchored)
+    assert hook_command_key(relative) != hook_command_key("bash .claude/scripts/kg-sync")

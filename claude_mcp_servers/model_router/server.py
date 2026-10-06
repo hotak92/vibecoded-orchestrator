@@ -188,6 +188,7 @@ from .usage import (
     note_count_substitution,
     read_identity,
 )
+from .effort import translate_effort
 from .tool_ids import (
     COMPACT_JSON,
     JSON_BUFFER_LIMIT_BYTES,
@@ -197,6 +198,7 @@ from .tool_ids import (
     normalise_vendor_response,
     restore_vendor_ids,
     sanitise_for_anthropic,
+    unmark_thinking_signatures,
 )
 from .vendors import (
     ANTHROPIC_FAMILY,
@@ -1086,9 +1088,13 @@ class RequestFacts:
     parent_agent: Optional[str]
     #: This request is :data:`COUNT_TOKENS_PATH`.
     count_tokens: bool
-    #: The gateway's own bytes/4 floor over the client's ``messages`` +
-    #: ``system``, for the vendor zero-guard. ``None`` when there is nothing
-    #: to count, or when the body was never parsed (the over-buffer path).
+    #: The gateway's own bytes/4 floor over the request's body bytes.
+    #: Two readers, one value: the vendor ``count_tokens`` zero-guard, and the
+    #: ``message_start`` ``input_tokens`` floor for a vendor flagged
+    #: ``partial_message_start_usage`` (streamed requests only — a
+    #: non-streamed body carries its real usage natively). ``None`` when there
+    #: is nothing to count, when the body was never parsed (the over-buffer
+    #: path), or when this request has no reader for it.
     count_estimate: Optional[int]
 
 
@@ -1165,6 +1171,42 @@ def _submit_usage(
     except RuntimeError:  # pragma: no cover — handlers always have a loop
         loop = None
     gateway.usage.submit(record, loop=loop)
+
+
+def _message_start_usage_estimate(
+    gateway: "Gateway", facts: Optional[RequestFacts],
+) -> Optional[int]:
+    """A positive ``input_tokens`` floor for a vendor that under-reports it.
+
+    Read by the SSE rewriter's ``message_start`` splice on a vendor flagged
+    ``partial_message_start_usage`` (data, ``vendors.py``). Two sources, both
+    FLOORS rather than guesses, and the larger one wins:
+
+    * the ledger's last real input+cache total for this request's own
+      identity (:meth:`model_router.usage.UsageLedger.context_floor` —
+      the row matching BOTH the request's session and its agent, so a
+      sibling subagent's turn never stands in for the main chat). Its
+      ``context_after`` is what this turn carries at minimum;
+    * the request's own bytes/4 floor (``count_estimate``), which covers the
+      growth since that row — the new user turn and tool results — and a
+      chat whose first turn has no ledger row yet.
+
+    ``None`` when neither has anything to say, and then the rewriter leaves
+    the vendor's event untouched: the splice must lift to a measured floor or
+    not at all, never to an invented number, and "not at all" is today's
+    behaviour — so a failure here can never be worse than the status quo.
+    """
+    if facts is None:
+        return None
+    candidates: list[int] = []
+    floor = gateway.usage.context_floor(
+        session=facts.session, agent=facts.agent,
+    )
+    if floor is not None and floor > 0:
+        candidates.append(floor)
+    if facts.count_estimate is not None and facts.count_estimate > 0:
+        candidates.append(facts.count_estimate)
+    return max(candidates) if candidates else None
 
 
 def _log_safe(value: object) -> str:
@@ -1251,6 +1293,89 @@ def _images_field(payload: Any) -> str:
         return f"images={_count_image_blocks(payload.get('messages'))}"
     except Exception:  # noqa: BLE001 — a diagnostic must never cost a chat
         return IMAGES_UNCOUNTED
+
+
+# ── item (f): text-only models get a text note where an image block was ──────
+#: The text block that REPLACES an image when the routed model is text-only
+#: (``chat_model_context.seed.json``'s ``text_only`` flag). ``{model}`` is the
+#: bare forwarded id. Short and honest: it tells the model an image was there
+#: and was dropped for a named reason, instead of letting it answer as though
+#: nothing were attached — the silent degrade the live ``zai-image.body``
+#: capture shows (glm-5.3: "I cannot see images from URLs").
+TEXT_ONLY_IMAGE_NOTE = (
+    "[image omitted — {model} is a text-only model and cannot see images]"
+)
+
+
+def _replace_image_blocks(blocks: Any, note: str) -> tuple[Any, int]:
+    """Replace every ``type == "image"`` block with a text ``note``.
+
+    Mirrors :func:`_count_image_blocks`'s traversal exactly — walking into any
+    nested ``content`` list, because a subagent that read an image file puts
+    the block inside a ``tool_result``'s own ``content[]``, not at the top of a
+    message. Returns ``(blocks, replaced_count)``; the input is returned
+    UNCHANGED (same object) when nothing was replaced, so an image-free
+    request is never re-serialised.
+    """
+    if not isinstance(blocks, list):
+        return blocks, 0
+    count = 0
+    out: list[Any] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            out.append(block)
+            continue
+        if block.get("type") == "image":
+            out.append({"type": "text", "text": note})
+            count += 1
+            continue
+        new_block = block
+        if "content" in block:
+            new_content, nested = _replace_image_blocks(block["content"], note)
+            if nested:
+                new_block = dict(block)
+                new_block["content"] = new_content
+                count += nested
+        out.append(new_block)
+    return (out, count) if count else (blocks, 0)
+
+
+def _strip_images_for_text_only(payload: Any, model_id: str) -> tuple[Any, int]:
+    """Replace image blocks in ``payload['messages']`` for a text-only model.
+
+    Returns ``(payload, replaced_count)``; ``payload`` is the same object when
+    there was nothing to replace. The caller decides whether the model is
+    text-only (from the catalog row) — this is the mechanism, not the policy.
+    """
+    if not isinstance(payload, dict):
+        return payload, 0
+    note = TEXT_ONLY_IMAGE_NOTE.format(model=model_id)
+    messages, count = _replace_image_blocks(payload.get("messages"), note)
+    if not count:
+        return payload, 0
+    patched = dict(payload)
+    patched["messages"] = messages
+    return patched, count
+
+
+def _apply_text_only_images(
+    payload: Any, gateway: "Gateway", model_id: str,
+) -> tuple[Any, int]:
+    """Replace image blocks IFF ``model_id`` is a text-only model.
+
+    One guarded call covers both the capability lookup and the rewrite, so a
+    defect in either abandons the whole step and the client's own bytes go on
+    unchanged (:func:`_guarded`). ``text_only`` is a property of the MODEL,
+    resolved from the shipped seed via
+    :meth:`model_router.context_table.ContextTable.is_text_only` — so the one
+    ``glm-5.3`` row answers for both the z.ai and the qwen route that serve it,
+    and neither a launcher export that predates the field nor a per-vendor
+    window override can silently reset it (review S3). Returns
+    ``(payload, replaced_count)``.
+    """
+    if not gateway.context.current().is_text_only(model_id):
+        return payload, 0
+    return _strip_images_for_text_only(payload, model_id)
 
 
 def _access_line(
@@ -1774,11 +1899,24 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         agent=agent,
         parent_agent=parent_agent,
         count_tokens=is_count_tokens,
-        # Only a VENDOR count_tokens can need it, and computing it otherwise
-        # would serialise a whole conversation for an answer nobody reads.
+        # Only two vendor-routed shapes can need it — a count_tokens call
+        # (the zero-guard) and a STREAMED request to a vendor measured to
+        # under-report its message_start usage (the floor splice) — and
+        # computing it otherwise would run for an answer nobody reads. The
+        # floor is read off the request's OWN body bytes (``raw``, already in
+        # hand), not a fresh ``json.dumps`` of the parsed conversation: one
+        # computation per request, nothing per streamed event.
         count_estimate=(
-            count_tokens_estimate(payload)
-            if is_count_tokens and not decision.is_anthropic
+            count_tokens_estimate(payload, raw=raw)
+            if not decision.is_anthropic
+            and (
+                is_count_tokens
+                or (
+                    stream_requested
+                    and decision.vendor is not None
+                    and decision.vendor.partial_message_start_usage
+                )
+            )
             else None
         ),
     )
@@ -1793,6 +1931,12 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     #: line in ``note`` rather than being logged separately, so one request
     #: still means one line.
     rewrite_failed = False
+    #: Per-transform access-line counters (items a/f). Each rides in ``note``
+    #: so an operator can see WHICH request-shaping fired without the gateway
+    #: logging any body. Zero/False on the first-party route and on the
+    #: over-buffer path, where the vendor transforms do not run.
+    effort_translated = False
+    text_only_images_omitted = 0
     if decision.is_anthropic:
         oauth = gateway.oauth.read()
         if oauth.token is None:
@@ -1827,17 +1971,28 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 rewrite_failed = True
             else:
                 forward_payload, repair = repaired
-                if repair.changed:
+                if repair.changed or repair.thinking_param_dropped:
                     mutated = True
                     logger.info(
-                        "model-gateway: repaired inherited tool blocks before "
-                        "the first-party route (%s) at message index(es) %s",
+                        "model-gateway: repaired inherited tool/thinking "
+                        "blocks before the first-party route (%s) at message "
+                        "index(es) %s",
                         repair.summary(),
                         ", ".join(str(i) for i in repair.touched_indexes) or "-",
                     )
     else:
         vendor = decision.vendor
         assert vendor is not None  # noqa: S101 — guaranteed by Route
+
+        # Anthropic server tools (``web_search_*`` and friends) are forwarded
+        # to the vendor UNCHANGED, and the vendor's own answer — including any
+        # error — is relayed verbatim. Live evidence 2026-10-04 overturns the
+        # parity audit's hand-built probe: Claude Code's WebSearch sub-request,
+        # sent by real agents on the z.ai and qwen routes, is answered 200 with
+        # genuine search-result blocks by the agent's own vendor model. A
+        # gateway refusal or strip here would break a working feature, so the
+        # gateway stays out of the request's ``tools`` entirely.
+
         key_result = await gateway.keys.aresolve(vendor)
         if not key_result.key:
             log_local(503, "vendor_key_unavailable")
@@ -1860,11 +2015,71 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 if restored:
                     mutated = True
 
+            # item (c): hand the vendor back its OWN thinking signatures too —
+            # strip the gateway marker the response seam added, so the vendor
+            # sees its own bytes and never our prefix.
+            unmarked_pair = _guarded(
+                unmark_thinking_signatures,
+                forward_payload,
+                what="vendor thinking-signature restoration",
+            )
+            if unmarked_pair is _ABANDON:
+                rewrite_failed = True
+            else:
+                forward_payload, unmarked = unmarked_pair
+                if unmarked:
+                    mutated = True
+
+            # item (a): translate an effort value THIS (vendor, model) rejects
+            # (e.g. medium on qwen-route glm-5.3, a live 400). Accepted values
+            # are left byte-identical; a route with no policy is untouched.
+            effort_pair = _guarded(
+                translate_effort,
+                forward_payload,
+                vendor.vendor_id,
+                decision.forward_model,
+                what="effort translation",
+            )
+            if effort_pair is _ABANDON:
+                rewrite_failed = True
+            else:
+                forward_payload, effort_changed = effort_pair
+                if effort_changed:
+                    mutated = True
+                    effort_translated = True
+
+            # item (f): a text-only model gets a short text note where each
+            # image block was, instead of silently ignoring the image.
+            images_pair = _guarded(
+                _apply_text_only_images,
+                forward_payload,
+                gateway,
+                decision.forward_model,
+                what="text-only image replacement",
+            )
+            if images_pair is _ABANDON:
+                rewrite_failed = True
+            else:
+                forward_payload, omitted = images_pair
+                if omitted:
+                    mutated = True
+                    text_only_images_omitted = omitted
+
     headers["Content-Type"] = "application/json"
     headers.setdefault("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
 
     body: "bytes | AsyncIterator[bytes]"
     note = "note=rewrite_failed" if rewrite_failed else ""
+    # Per-transform notes (items a/f). Each says a request-shaping fired,
+    # with the count where one is meaningful, and none of them logs a body
+    # byte. Assembled here so they ride EVERY access line this request writes.
+    if effort_translated:
+        note = f"{note} note=effort_translated".strip()
+    if text_only_images_omitted:
+        note = (
+            f"{note} "
+            f"note=text_only_images_omitted={text_only_images_omitted}".strip()
+        )
     if unparseable:
         # Byte for byte, headers and all. The upstream is the only party that
         # can say whether these bytes are a request.
@@ -2244,11 +2459,25 @@ async def _proxy(
                     accumulator=accumulator,
                 )
 
-            rewriter = (
-                SseIdRewriter(id_map=gateway.id_map(vendor))
-                if vendor is not None and is_stream
-                else None
-            )
+            rewriter = None
+            if vendor is not None and is_stream:
+                # A vendor flagged ``partial_message_start_usage`` (data,
+                # ``vendors.py``) gets a positive floor estimate for its
+                # ``message_start`` ``input_tokens``. Guarded like every
+                # optional pass: a failure to estimate relays the vendor's
+                # event untouched, which is today's behaviour — the splice
+                # can degrade to the status quo and never below it.
+                fill: Optional[int] = None
+                if vendor.partial_message_start_usage:
+                    guarded_fill = _guarded(
+                        _message_start_usage_estimate, gateway, facts,
+                        what="message_start usage estimate",
+                    )
+                    fill = None if guarded_fill is _ABANDON else guarded_fill
+                rewriter = SseIdRewriter(
+                    id_map=gateway.id_map(vendor),
+                    message_start_usage=fill,
+                )
 
             response = web.StreamResponse(status=upstream.status, headers=relay)
             # The relayed Content-Type header carries the type; we only choose

@@ -6,18 +6,16 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
-# VCO-CENTRALIZED-KG: read-side delegator on the KG-suggestion path (PR #171 / 0.1.7).
-#   The "KG search suggestion" branch (Edit/Write only, see section 5
-#   below) calls .claude/scripts/kg-search.ps1 (or kg-search via bash);
-#   that wrapper invokes search_knowledge.py which honors
-#   VCT_KG_ACCESS_LIST through the shared helper. Other branches (SSRF
-#   guard, shell-injection scan, Build Anchor, file backup, tool logging)
-#   do not touch KG/codegraph. Env propagation: & / Start-Process
-#   inherit env by default. No centralization needed in this hook itself.
+# VCO-CENTRALIZED-KG: NOT a KG consumer (v0.2.101 wave-3). The former
+#   section-5 KG-suggestion path was retired (double emission with the
+#   pre-edit/pre-write router wrappers -- review nit-6); every remaining
+#   branch (SSRF guard, shell-injection scan, Build Anchor, file backup,
+#   tool logging) is KG/codegraph-free. Marker kept (the centralization
+#   audit classifies every hook); classification: no KG access.
 
 # pre-tool-use.ps1
 # Pre-tool-use hook: SSRF guard, shell injection scan, Build Anchor
-# Protocol, file backup, KG search suggestion.
+# Protocol, file backup. (KG search suggestion RETIRED, v0.2.101 wave-3.)
 #
 # v0.2.77 9-bis: the per-tool-call TOUCAN dataset writer
 # (.claude/logs/toucan_dataset.jsonl) was RETIRED here — a write-only
@@ -64,15 +62,12 @@ $SessionIdFromStdin = ""
 # v0.2.77 9-bis. Empty string when absent (parent context).
 $AgentId = ""
 $AgentType = ""
-# WP-E (v0.2.92): also extract transcript_path + prompt_id, same two fields
-# pre-edit-context-inject.ps1 pulls from the same stdin payload shape.
-# transcript_path is a PATH ONLY — it is threaded straight through to
-# rl_kg_search.py's --transcript flag in Section 5 below; the shared
-# vco_lib/transcript_context.py reader does every byte of the actual
-# reading, in-process, per R31. Never logged, never echoed. prompt_id
-# scopes the query-cache key (query-cache.ps1) so two turns issuing the
-# same short trigger don't collide on one cache entry when their enriched
-# text differs. MUST MATCH pre-tool-use.sh's NUL-delimited parse.
+# WP-E (v0.2.92): transcript_path + prompt_id ride the shared parse.
+# v0.2.101 wave-3: this hook no longer CONSUMES them (section 5 retired --
+# the router wrappers resolve both from the payload themselves); the fields
+# stay in the parse so the sibling contract is unchanged. transcript_path
+# remains a PATH ONLY everywhere (R31). MUST MATCH pre-tool-use.sh's
+# NUL-delimited parse.
 $TranscriptPath = ""
 $PromptId = ""
 try {
@@ -105,17 +100,16 @@ $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 
-# v0.2.70 Streams C+E: shared helpers (canonical session-id, unified seen-store,
-# code-graph retrieval for the NEW Read(code)+Grep(symbol) branches).
+# v0.2.70 Streams C+E: shared helpers (canonical session-id, unified seen-store
+# for the reads ledgers written in the Read branch below; v0.2.101 §C2/§C6
+# retired this hook's code-graph INJECTION branches — read-context-inject /
+# grep-context-inject are their homes now).
 $SessionIdLib = Join-Path $LibDir "session-id.ps1"
 if (Test-Path $SessionIdLib) { . $SessionIdLib }
 $SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
 if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
-$CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
-if (Test-Path $CodegraphLib) { . $CodegraphLib }
-# v0.2.77 Part 9 task 2: shared TTL result-cache used by the codegraph helper.
-$QueryCacheLib = Join-Path $LibDir "query-cache.ps1"
-if (Test-Path $QueryCacheLib) { . $QueryCacheLib }
+# (v0.2.101 wave-3: the query-cache.ps1 sourcing was retired with section 5 --
+# its last caller. The lib itself was deleted; the router owns caching now.)
 $script:ProjectRoot = $ProjectRoot
 
 # v0.2.70 Stream E: unify session-id (parse+sanitise) with the other hooks.
@@ -185,7 +179,7 @@ function Get-Field([string]$field) {
 # loudly, instead of skipping itself. Every time it goes to stderr for the
 # human; once per session (a sentinel under .claude/state) it is queued in
 # $script:VcoModelNotice, which the hook emits as its ONE additionalContext
-# envelope where the Bash branch exits (Section 5's tool gate) -- PreToolUse
+# envelope at the hook's exit (the retired section-5 gate's successor) -- PreToolUse
 # stderr on exit 0 is not shown to the model, and a second envelope on stdout
 # would break the hook's JSON contract.
 # MUST MATCH pre-tool-use.sh's _vco_report_no_python.
@@ -218,9 +212,8 @@ if ($ToolName -eq "WebFetch") {
     if ($url) {
         # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
         # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both
-        # removed in v0.2.11 (see PR-14a). Search MCP now exposes only
-        # `search_papers` which uses OpenAlex+arXiv HTTP directly — its
-        # outbound HTTP doesn't go through this WebFetch SSRF guard.
+        # removed in v0.2.11 (see PR-14a); the search MCP itself was deleted
+        # in v0.2.101, so nothing else reaches the network outside WebFetch.
         # v0.2.100: the decision is `python -m vco_lib.ssrf_url` (one
         # implementation for every OS; its docstring is the contract), run
         # once through _lib/ssrf-allowlist.ps1. MUST MATCH the .sh sibling.
@@ -312,58 +305,20 @@ if ($ToolName -eq "Bash") {
     }
 }
 
-# === v0.2.70 Stream C: shared code-graph injection for Read(code)/Grep(symbol).
-# One home for both surfaces. MUST MATCH pre-tool-use.sh _cg_inject.
-# $anchor (v0.2.72 P2): optional file path / symbol forwarded as -Anchor so the
-# CLI's shared pipeline biases the rerank toward call-linked code.
-function Invoke-CgInject([string]$q, [string]$excl, [string]$label, [string]$anchor = "") {
-    if (-not (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue)) { return }
-    if (-not $q) { return }
+# === v0.2.70 Stream C — RETIRED (v0.2.101 §C2/§C6) ============================
+# The shared code-graph injection helper (Invoke-CgInject) and its two call
+# surfaces — Read(code) and Grep(symbol) — were REMOVED. Their home is the
+# router-backed hooks read-context-inject.ps1 (PostToolUse Read) and
+# grep-context-inject.ps1 (PreToolUse Grep): exact-symbol lookups, gates,
+# seen-store dedupe and the per-turn budget all live in
+# claude_mcp_servers/scripts/hook_context_router.py + vco_lib/inject_intent.
+# This hook keeps ONLY the PreToolUse concerns that must stay here: the
+# security guards, the Build-Anchor reads ledger and the unified seen_reads
+# ledger (both written below), file backup, and the §5 Edit/Write KG
+# suggestion. MUST MATCH pre-tool-use.sh.
 
-    # v0.2.72 P6: per-session inject VOLUME cap. The seen-store dedups by
-    # IDENTITY but a long session navigating many DISTINCT entities still
-    # injects unboundedly. Bound the TOTAL EMITTED injections per session_id
-    # (VCO_CG_INJECT_CAP, default 40). Read-only capped-check short-circuits
-    # BEFORE the codegraph query (one-line note emitted once); the counter is
-    # incremented ONLY on a real emit. Soft-fail OPEN: unkeyable session / any
-    # counter error runs UNCAPPED. MUST MATCH pre-tool-use.sh _cg_inject.
-    $cnt = ""
-    if (Get-Command Get-VcoCgInjectCountPath -ErrorAction SilentlyContinue) {
-        $cnt = Get-VcoCgInjectCountPath -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-    }
-    if ($cnt -and (Get-Command Test-VcoCgInjectCapped -ErrorAction SilentlyContinue) `
-        -and (Test-VcoCgInjectCapped -CountFile $cnt)) {
-        if ((Get-Command Test-VcoCgInjectNoteOnce -ErrorAction SilentlyContinue) `
-            -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) `
-            -and (Test-VcoCgInjectNoteOnce -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot)) {
-            Emit-AdditionalContext "[codegraph injection cap reached for this session]" 'PreToolUse'
-        }
-        return
-    }
-
-    $raw = Invoke-VcoCodegraphQueryBlock -Query $q -ProjectArg "" -Limit 2 -ExcludePath $excl -Anchor $anchor -PromptId $PromptId -TranscriptPath $TranscriptPath
-    if (-not $raw) { return }
-    $inj = ""
-    $rd = ""
-    if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-        $inj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-        $rd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-    }
-    if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
-        $raw = Invoke-VcoFilterSeenBlocks -InputText $raw -InjectFile $inj -ReadsFile $rd
-    }
-    if (($raw -replace '\s+', '')) {
-        if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
-            Emit-AdditionalContext "[${label}]:`n`n$raw" 'PreToolUse'
-            # Count this REAL injection toward the per-session cap.
-            if ($cnt -and (Get-Command Add-VcoCgInjectRecord -ErrorAction SilentlyContinue)) {
-                Add-VcoCgInjectRecord -CountFile $cnt
-            }
-        }
-    }
-}
-
-# === 3. BUILD ANCHOR PROTOCOL: track reads + v0.2.70 code-file inject ===
+# === 3. BUILD ANCHOR PROTOCOL: track reads (the Read(code) code-graph inject
+# moved to read-context-inject.ps1, v0.2.101 §C2) ===
 if ($ToolName -eq "Read") {
     $filePath = Get-Field "file_path"
     if ($filePath) {
@@ -386,31 +341,23 @@ if ($ToolName -eq "Read") {
                 try { Add-Content -Path $unifiedReads -Value $relFp -ErrorAction Stop } catch { }
             }
         }
-        # v0.2.70 Stream C Surface 1 (Read): code file -> inject callers/deps.
-        # MUST MATCH the IS_CODE regex in pre-edit + post-file-edit. Self-exclude
-        # uses the repo-relative path so it matches the producer CODE: src shape.
-        if ($filePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
-            $rdQ = [System.IO.Path]::GetFileNameWithoutExtension((Split-Path $filePath -Leaf))
-            Invoke-CgInject $rdQ $relFp "Code-graph context for $(Split-Path $filePath -Leaf)" $relFp
-        }
+        # v0.2.101 injection redesign (§C2): the Read(code) code-graph
+        # injection branch that used to live here was REMOVED — its home is
+        # now the PostToolUse(Read) hook read-context-inject.ps1 (one
+        # concern, one home; the kickoff probe measured the old branch as
+        # always-killed by its 3 s settings timeout, so it never injected).
+        # The ledger writes ABOVE stay: they must happen PreToolUse so
+        # same-turn Write-anchor checks and seen-store suppression see them.
+        # MUST MATCH pre-tool-use.sh.
     }
     exit 0
 }
 
-# === v0.2.70 Stream C Surface 4: Grep on a code SYMBOL -> inject codegraph.
-if ($ToolName -eq "Grep") {
-    if (Get-Command Test-VcoCodegraphPatternGate -ErrorAction SilentlyContinue) {
-        $grepPattern = Get-Field "pattern"
-        if ($grepPattern -and (Test-VcoCodegraphPatternGate -Pattern $grepPattern)) {
-            $grepSym = $grepPattern
-            if (Get-Command Get-VcoCodegraphSymbol -ErrorAction SilentlyContinue) {
-                $grepSym = Get-VcoCodegraphSymbol -Text $grepPattern
-            }
-            Invoke-CgInject $grepSym "" "Code-graph context for symbol: $grepSym" $grepSym
-        }
-    }
-    exit 0
-}
+# === v0.2.70 Stream C Surface 4 (Grep) — RETIRED (v0.2.101 §C6) ============
+# The Grep(symbol) code-graph injection branch was REMOVED: grep-context-
+# inject.ps1 (PreToolUse(Grep), router surface `grep`) is its one home now.
+# A Grep call falls through to the Write/Edit gate below (no-op for Grep)
+# and exits at the §5 tool-name gate. MUST MATCH pre-tool-use.sh.
 
 # === 4. BUILD ANCHOR + FILE BACKUP: Write/Edit checks ===
 if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
@@ -468,151 +415,24 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
     }
 }
 
-# === 5. KG SEARCH SUGGESTION (Edit/Write only) ===
-if ($ToolName -ne "Edit" -and $ToolName -ne "Write") {
-    # v0.2.100 WP-17: the Bash branch's queued broken-install notice leaves
-    # in this tool call's one envelope.
-    if ($script:VcoModelNotice -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
-        Emit-AdditionalContext $script:VcoModelNotice 'PreToolUse'
-    }
-    exit 0
-}
+# === 5. KG SEARCH SUGGESTION -- RETIRED (v0.2.101 wave-3, review nit-6) ====
+# This branch emitted a "Found N related patterns" KG suggestion on every
+# Edit/Write -- the SAME tool calls pre-edit-context-inject.ps1 /
+# pre-write-context-inject.ps1 inject gated, deduped, budgeted KG + code-graph
+# context for: two context emissions per edit, no score floor on the
+# suggestion path. The injection redesign made those wrappers (via
+# hook_context_router.py) the ONE home for edit-time KG context (PLAN-V02101
+# section 2.1 Edit/Write rows). Retiring this branch also retired the last
+# shell caller of _lib/query-cache.ps1, deleted with it (the router keeps its
+# own Python cache under the disjoint kgi/cgi namespaces). The
+# pre_tool_use_kg_search task type stays registered in rl_kg_search's
+# KNOWN_TASK_TYPES for the historical RL corpus.
+# MUST MATCH pre-tool-use.sh's retirement tombstone.
 
-# WP-E (v0.2.92) REVIVAL: this branch originally gated on a topic-keyword
-# regex scanned out of $UserMessage (populated from the hook payload's
-# `user_message` field). That field NEVER ARRIVES in the real Claude Code
-# v2.1.x PreToolUse payload, so $UserMessage is always "" on a live
-# install and this branch has been dead code since it was written — the
-# regex match count was always 0.
-#
-# DECISION (MUST MATCH pre-tool-use.sh's Section 5 — documented there in
-# full + in the WP-E report): the keyword-substring pre-filter is DROPPED,
-# not revived verbatim, in favour of the existing match-count threshold
-# below. Rationale: (1) it duplicated gating this branch already had — the
-# `-ge 2` threshold already requires two-plus REAL KG matches before a
-# suggestion surfaces; a second, cruder pre-filter (a fixed 17-word
-# vocabulary) added no precision, only false negatives outside that list.
-# (2) R30's enrichment pipeline (vco_lib/query_enrichment.py, reached via
-# rl_kg_search.py's --transcript flag) is now the ONE mechanism this repo
-# uses to turn "recent text" into a properly-budgeted embeddable query. A
-# second, hand-rolled gate second-guessing that pipeline before it even
-# runs is exactly the two-mechanisms problem R31 exists to prevent.
-#
-# $Trigger is built ONLY from tool-call metadata (tool name + edited
-# file's basename) — never conversation text, so nothing privacy-sensitive
-# is composed in this script. Being short, it sits well under
-# query_enrichment.py's default 24-token threshold, so build_query() fills
-# the rest of the embedding budget by walking backward through the
-# transcript (last user prompt, then recent assistant chat/thinking) —
-# composed in-process by the shared component (R31: TranscriptPath is a
-# PATH, never text).
-$_kg5File = Get-Field "file_path"
-if ($_kg5File) {
-    $Trigger = "$($ToolName): $(Split-Path $_kg5File -Leaf)"
-} else {
-    $Trigger = $ToolName
-}
-
-# V52-J (v0.2.52): switched from kg-search → rl_kg_search.py so this
-# hook shares the canonical chokepoint with the pre-edit-context-inject
-# hook + the MCP hybrid_search tool. Same Weaviate fan-out, same RL
-# rerank, same v3 retrieval-event emit. Pre-V52-J this branch called
-# kg-search (search_knowledge.py CLI), which until Edit B produced zero
-# telemetry — switching here closes the redundancy at the same time as
-# Edit B closes the silent hole.
-#
-# rl_kg_search.py --hook-format emits headers of the shape
-#   "KG: <title> | <node_type> | score=<n.nn> | <body...>"
-# Title (not file_path) is what we surface; the pre-edit hook's dedup
-# logic also keys on title.
-#
-# Venv resolution mirrors pre-edit-context-inject.ps1 — uses the shared
-# _lib/resolve-vco-venv.ps1 helper so we never accidentally activate the
-# USER's project venv (which lacks weaviate-client).
-. (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
-$VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root - locate it
-# there (same roots as the venv), never under the project root. It still runs
-# with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's KG +
-# shared + granted collections apply. MUST MATCH the .sh sibling.
-$RlScript = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/rl_kg_search.py"
-# Unresolved -> the legacy (absent) project path: every Test-Path below then
-# reads "not installed" without binding an empty -Path.
-if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py" }
-# Pin the CALLING project's identity for the producer (a no-op whenever the
-# harness already set it): the script lives in the orchestrator root, so its
-# own location must never be what names the project.
-$env:CLAUDE_PROJECT_DIR = $ProjectRoot
-# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
-# (rl_kg_search.py reads it; MUST MATCH the .sh sibling).
-$env:VCO_RL_TASK_TYPE = "pre_tool_use_kg_search"
-$matchOutput = ""
-if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
-    try {
-        # VCT_SESSION_ID is set into the subprocess env so the canonical
-        # 3-layer session_id resolution in telemetry_emit sees the same
-        # session as the rest of the hook chain, instead of falling
-        # through to the empty CLAUDE_SESSION_ID.
-        $prevSessionEnv = $env:VCT_SESSION_ID
-        try {
-            $env:VCT_SESSION_ID = $SessionId
-            # WP-E (v0.2.92): route through the shared TTL cache
-            # (query-cache.ps1) when available so repeat Edit/Write calls
-            # within the same turn reuse one live search; PromptId scopes
-            # the key so a different turn with the same trigger doesn't
-            # collide with this turn's enriched result. Falls back to a
-            # direct call (with --transcript appended only when non-empty)
-            # when the cache helper isn't sourced. MUST MATCH
-            # pre-tool-use.sh's mirrored branch.
-            if (Get-Command Invoke-VcoKgSearchCached -ErrorAction SilentlyContinue) {
-                $rawText = Invoke-VcoKgSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Trigger -Limit 3 -PromptId $PromptId -TranscriptPath $TranscriptPath
-                $rawOutput = if ($rawText) { $rawText -split "`n" } else { @() }
-            } elseif ($TranscriptPath) {
-                $rawOutput = & $VenvPy $RlScript $Trigger --limit 3 --hook-format --transcript $TranscriptPath 2>$null
-            } else {
-                $rawOutput = & $VenvPy $RlScript $Trigger --limit 3 --hook-format 2>$null
-            }
-        } finally {
-            if ($null -eq $prevSessionEnv) {
-                Remove-Item Env:VCT_SESSION_ID -ErrorAction SilentlyContinue
-            } else {
-                $env:VCT_SESSION_ID = $prevSessionEnv
-            }
-        }
-        # Extract only the per-result HEADER lines (start with "KG: " and
-        # carry the " | " separator) — strips body chunks. Filter out the
-        # "no-results" sentinel rl_kg_search emits when nothing matched.
-        $matchOutput = $rawOutput |
-            Where-Object { $_ -like 'KG: *' } |
-            Where-Object { $_ -notlike 'KG: no-results*' } |
-            Select-Object -First 3
-    } catch { }
-}
-
-if ($matchOutput) {
-    $arr = @($matchOutput)
-    if ($arr.Count -ge 2) {
-        # PreToolUse hooks must wrap LLM-bound stdout in
-        # `hookSpecificOutput.additionalContext` — plain stdout is silently
-        # discarded by Claude Code's hook runner. Pre-fork-sweep this
-        # branch printed plaintext that never reached the LLM on either
-        # OS. Same fix class as pre-edit-context-inject (PR #168). The
-        # shared helper in _lib/emit-context.ps1 handles the JSON envelope,
-        # the 10k char cap, and (defense-in-depth) the whitespace-only-
-        # content guard.
-        $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.AppendLine("")
-        [void]$sb.AppendLine("Found $($arr.Count) related patterns for: $Trigger")
-        foreach ($m in $arr) { [void]$sb.AppendLine("   $m") }
-        [void]$sb.AppendLine("")
-        [void]$sb.AppendLine("   Search more: 'Search knowledge graph for [concept]'")
-        [void]$sb.AppendLine("")
-        # Defense: if the helper failed to load (file missing at hook
-        # startup), skip emission rather than crash. Other branches of
-        # this hook are unaffected.
-        if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
-            Emit-AdditionalContext $sb.ToString() 'PreToolUse'
-        }
-    }
+# v0.2.100 WP-17 (kept from the retired section-5 tool gate): the Bash
+# branch's queued broken-install notice leaves in this tool call's one
+# envelope.
+if ($script:VcoModelNotice -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
+    Emit-AdditionalContext $script:VcoModelNotice 'PreToolUse'
 }
 exit 0

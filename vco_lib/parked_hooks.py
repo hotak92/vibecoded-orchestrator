@@ -65,8 +65,11 @@ separators). Two commands are the same hook when they invoke the same
 supersede pass already uses), or, for an inline command, when they are equal
 after :func:`vco_lib.hook_retirements.normalize_command` (which strips that
 guard prefix). The matcher must match too, because the template ships some
-scripts under several matchers in one event (``kg-summary-generator.sh`` under
-``Edit``, ``Write`` and a store tool) and disabling one of them must not keep
+scripts under several matchers in one event (``pre-diagram-path-validation.sh``
+under ``Write|Edit`` and the diagram MCP matchers; until v0.2.101 also
+``kg-summary-generator.sh`` under ``Edit``, ``Write`` and a store tool — those
+three async registrations merged into the ``post-tool-use-async`` dispatcher)
+and disabling one of them must not keep
 the others out. If the template has since CHANGED the matcher, the parked row
 still matches as long as the template ships that hook under exactly one
 matcher in the event — otherwise it is ambiguous which one the user meant, and
@@ -92,7 +95,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 from vco_lib.hook_relative_paths import emit_relative_hooks_deferral
-from vco_lib.hook_retirements import normalize_command, vco_hook_script_identity
+from vco_lib.hook_retirements import (
+    carry_parked_async_disables, normalize_command, vco_hook_script_identity,
+)
 from vco_lib.hooks_settings import normalize_matcher
 from vco_lib.jsonc_edit import load_object
 
@@ -118,11 +123,21 @@ KEPT_OUT_UNREADABLE = "parked_state_unreadable"
 
 @dataclass(frozen=True)
 class ParkedHook:
-    """One parked row's natural key — the same key the launcher uses."""
+    """One parked row's natural key — the same key the launcher uses.
+
+    ``is_async`` (v0.2.101) is the parked entry blob's ``item.async`` flag:
+    ``True``/``False`` when the blob is parseable and says, ``None`` when
+    the key is absent or the blob is unreadable. It exists because the
+    async-only retirement rows (the v0.2.101 dispatcher merge) must match
+    ONLY registrations that positively carried ``"async": true`` — the
+    blob's shape stays owned here, in Python; the launcher's Rust side
+    hands the blob over opaquely and never parses it.
+    """
 
     event: str
     matcher: str
     command: str
+    is_async: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -252,7 +267,8 @@ def read_parked_hooks(
                 readable=True, source="not_registered", db_path=str(target),
             )
         rows = conn.execute(
-            "SELECT event, matcher, command FROM project_hooks"
+            "SELECT event, matcher, command, disabled_entry_json"
+            " FROM project_hooks"
             " WHERE project_id = ? AND disabled_entry_json IS NOT NULL"
             " ORDER BY event, matcher, id",
             (project_id,),
@@ -266,10 +282,37 @@ def read_parked_hooks(
             pass
     return ParkedHooksState(
         readable=True,
-        hooks=tuple(ParkedHook(str(e), str(m or ""), str(c)) for e, m, c in rows),
+        hooks=tuple(
+            ParkedHook(str(e), str(m or ""), str(c), _blob_is_async(blob))
+            for e, m, c, blob in rows
+        ),
         source="launcher_db",
         db_path=str(target),
     )
+
+
+def _blob_is_async(blob: Any) -> Optional[bool]:
+    """The parked entry blob's ``item.async`` flag, or ``None``.
+
+    Best-effort by design: an unparseable or key-less blob answers ``None``
+    ("no positive async evidence"), which is exactly what the async-only
+    retirement rows refuse to match — a conservative default on a
+    best-effort path. The blob schema is ``vco_lib.hooks_settings``'
+    parked-entry shape (``{"schema": 1, ..., "item": {...}}``).
+    """
+    import json
+
+    try:
+        data = json.loads(blob) if isinstance(blob, (str, bytes)) else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    item = data.get("item")
+    if not isinstance(item, dict):
+        return None
+    flag = item.get("async")
+    return None if flag is None else bool(flag)
 
 
 def _describe(records: Sequence[dict], limit: int = 8) -> str:
@@ -288,6 +331,7 @@ def report_parked_hooks(
     settings_action: str,
     dry_run: bool,
     log: Callable[..., Any],
+    log_auto: Optional[Callable[..., Any]] = None,
 ) -> None:
     """Put the outcome where the user sees it: the result envelope, the
     install log, and — whenever the rule ran on an answer it could not read —
@@ -300,11 +344,24 @@ def report_parked_hooks(
     the settings hooks, so it also records the project's OWN hooks that invoke
     a ``.claude/hooks/`` script by a relative path — OFFERED an anchored
     rewrite, never rewritten (:mod:`vco_lib.hook_relative_paths`).
+
+    v0.2.101 (review SF-2): this step is the bundle flow's ONE parked-state
+    policy home, so the merge migration lives here too — a parked
+    (user-disabled) registration retired by the async dispatcher merge is
+    carried into the per-project sub-hook disable key
+    (:func:`vco_lib.hook_retirements.carry_parked_async_disables`; envelope
+    on both paths, write + audit row on a real run only). Kept out of
+    ``project_init``, which is under a line-count ratchet that (correctly)
+    refuses further growth.
     """
     if not dry_run:
         emit_relative_hooks_deferral(folder, log=log)
     if not dry_run and state.readable:
         emit_conflict_deferral(folder, state, log=log)
+    carried = carry_parked_async_disables(
+        folder, state, dry_run=dry_run, log_auto=log_auto, log=log)
+    if carried:
+        result["carried_async_subhook_disables"] = carried
     if kept_out:
         result["parked_hooks_kept_out"] = [dict(r) for r in kept_out]
     parked = [r for r in kept_out if r.get("reason") == KEPT_OUT_PARKED]

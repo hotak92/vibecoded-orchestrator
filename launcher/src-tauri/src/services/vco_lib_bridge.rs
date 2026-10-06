@@ -54,6 +54,10 @@
 //!     unregister's `.claude/env` + JSON env-block routing-key strip);
 //!   * `vco_lib.env_projection_check` — [`read_settings_env_blocks`];
 //!   * `vco_lib.hooks_settings` — [`list_settings_hooks`];
+//!   * `vco_lib.packs` — [`packs_status`] (v0.2.101: the packs catalogue
+//!     read behind the launcher's Packs tab; the pack TOGGLE is not a
+//!     bridge verb — it shells the ordinary `install-bundle` engine, see
+//!     `commands::packs_cmd`);
 //!   * `vco_lib.env_template` — [`apply_project_env_template`],
 //!     [`write_project_env_reference`], [`strip_project_env_keys`],
 //!     [`repair_project_env_kg`], [`sentinel_project_env_keys`] (the project
@@ -145,9 +149,46 @@ pub fn resolve_orchestrator_root(db: &Db) -> Option<std::path::PathBuf> {
     crate::commands::installer::resolve_orchestrator_root(db)
 }
 
-/// Wall-clock cap for one env-block spawn: a single small JSON
-/// read-modify-write that takes ~150 ms. Past this the child is stuck.
-const ENV_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Wall-clock cap for ONE short `python -m vco_lib.<verb>` spawn — the
+/// cold-start verb class: a fresh interpreter, the `vco_lib` import, one
+/// small file read or read-modify-write, one JSON reply. Every
+/// [`run_vco_lib_json`] verb shares it — the settings env-block edits and
+/// strips, `unregister_env`, the `env_projection_check` read, the settings
+/// hooks reader, the project `.env` template verbs and the infrastructure
+/// `.env` key write — and so does [`packs_status`]. (Longer verbs carry
+/// their own bound: [`VCO_LIB_ENV_PROJECTION_TIMEOUT`], the bundle backup,
+/// the service-endpoint verbs.)
+///
+/// The happy path is ~150 ms; almost all of it is interpreter + import
+/// start-up, and that is exactly the part a third-party machine can stretch
+/// by orders of magnitude — an antivirus scanning every `.pyc` on first
+/// import, a cold page cache, a slow or network-mounted disk. Before
+/// v0.2.101 these verbs were capped at 30 s, the same dev-machine ceiling
+/// the env projection was lifted from (review N4: one policy for the class,
+/// one constant, not one per call site).
+///
+/// Why 120 s, not the projection's 300 s
+/// ([`VCO_LIB_ENV_PROJECTION_TIMEOUT`]): these verbs are INTERACTIVE — a
+/// GUI read or a single-file edit a user is looking at — and several run
+/// in loops or inline, so the cap is also the longest a genuinely stuck
+/// child can hold the user before an actionable error. 120 s is ~800× the
+/// happy path (ample room for a cold, AV-scanned start) while still
+/// surfacing a wedged child within a minute or two. The projection is a
+/// whole-project re-render whose kill leaves a project half-applied, and it
+/// runs off the async runtime (F3), so it buys the longer bound.
+pub(crate) const VCO_LIB_SHORT_VERB_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wall-clock cap for one `python -m vco_lib.config_projection apply` — the
+/// per-project env re-render (`projects_v2::refresh_project_env_with_db`,
+/// which every all-projects refresh runs once per project). v0.2.101 owner
+/// ruling 2026-10-06: generous for slow hardware — the happy path is
+/// ~150 ms, but a third-party machine with a slow disk, AV-scanned Python
+/// startup or a cold page cache must not have a legitimate apply killed;
+/// 300 s is 2000× the happy path and still surfaces a genuinely stuck
+/// process within one user's patience. Lives beside
+/// [`VCO_LIB_SHORT_VERB_TIMEOUT`] so the two policies for `-m vco_lib`
+/// spawns are read, and changed, together.
+pub(crate) const VCO_LIB_ENV_PROJECTION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The stdin request `python -m vco_lib.config_projection write-env-block`
 /// reads: the values to set, and the full key set the caller owns (an owned
@@ -407,6 +448,58 @@ pub fn list_settings_hooks(
 /// The launcher-resolved service ports a project `.env`'s managed block
 /// renders (`ProjectEnvSettings`: app_state overrides / adopted services),
 /// forwarded to the Python resolver, whose own defaults are the stock ports.
+/// v0.2.101 (catalogue plan §3.6): the packs catalogue for one project —
+/// `python -m vco_lib.packs status --folder <path> --json`. The ONE home of
+/// this spawn (moved out of `commands::packs_cmd` per the L3 review's
+/// one-home rule for `-m vco_lib` verbs). Python is the SSOT — it reads
+/// `templates/packs/packs.toml` + the project manifest's `packs` map; Rust
+/// parses only the JSON. Returns the WHOLE `ok: true` reply
+/// (`{"ok": true, "packs": […]}`); the packs-specific shaping into
+/// `commands::packs_cmd::PackInfo` lives with the command, in the pure
+/// `parse_packs_status_reply` (the committed cross-lane fixture is
+/// `tests/fixtures/packs_status_contract.json` — lane L1's Python emitter
+/// tests against the same file). A refusal or crash is `Err` carrying the
+/// child's own message, prefixed "packs status".
+pub fn packs_status(root: &Path, project_folder: &Path) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.packs")
+        .arg("status")
+        .arg("--folder")
+        .arg(project_folder)
+        .arg("--json");
+    reinject_minimal_env(&mut cmd);
+    cmd.current_dir(root);
+    let done = match vct_launcher_core::process::output_bounded(
+        &mut cmd,
+        None,
+        // One committed toml + the project manifest — a short cold-start
+        // verb like the rest (review N4).
+        VCO_LIB_SHORT_VERB_TIMEOUT,
+    ) {
+        Ok(done) => done,
+        Err(vct_launcher_core::process::BoundedError::Spawn(e)) => {
+            return Err(format!(
+                "packs status: spawn failed (python={}): {}",
+                python.display(),
+                e
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::TimedOut { after, stderr, .. }) => {
+            return Err(format!(
+                "packs status: timed out after {} s. stderr: {}",
+                after.as_secs(),
+                String::from_utf8_lossy(&stderr).trim()
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::Wait(e)) => {
+            return Err(format!("packs status: wait failed: {}", e))
+        }
+    };
+    parse_ok_reply_named("packs status", &done.stdout, &done.stderr)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvTemplatePorts {
     pub weaviate: u16,
@@ -836,7 +929,7 @@ pub(crate) fn test_checkout_root() -> std::path::PathBuf {
 }
 
 /// Spawn `cmd`, feed `body` on stdin, collect stdout/stderr, bound by
-/// [`ENV_BLOCK_TIMEOUT`], and parse the one-JSON-object reply.
+/// [`VCO_LIB_SHORT_VERB_TIMEOUT`], and parse the one-JSON-object reply.
 ///
 /// Both output pipes are drained on their own threads WHILE the child runs
 /// (v0.2.97 review F11): reading them only after exit let a child that wrote
@@ -869,7 +962,15 @@ fn run_vco_lib_json<T>(
     body: &str,
     parse: impl FnOnce(&[u8], &[u8]) -> Result<T, String>,
 ) -> Result<T, String> {
-    run_vco_lib_json_with_timeout(cmd, python, root, project_folder, body, ENV_BLOCK_TIMEOUT, parse)
+    run_vco_lib_json_with_timeout(
+        cmd,
+        python,
+        root,
+        project_folder,
+        body,
+        VCO_LIB_SHORT_VERB_TIMEOUT,
+        parse,
+    )
 }
 
 /// [`run_vco_lib_json`] with the wall-clock cap as an argument (the
@@ -972,12 +1073,18 @@ fn list_at(reply: &serde_json::Value, field: &str) -> Vec<String> {
 /// the whole object; anything else → `Err` with the child's own message (a
 /// refusal names the file and why), or the raw output when it is not that
 /// shape (a crash before the emit is reported, never degraded).
-pub fn parse_ok_reply(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
+///
+/// v0.2.101 (L3 review N-1): the messages name the CALLING verb via `what`
+/// so a packs-status failure does not read as a settings-editor failure in
+/// the user-facing toast. `parse_ok_reply` keeps the historical
+/// "settings editor" wording for every pre-existing caller.
+pub fn parse_ok_reply_named(what: &str, stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
     let out = String::from_utf8_lossy(stdout);
     let err = String::from_utf8_lossy(stderr);
     let parsed: serde_json::Value = serde_json::from_str(out.trim()).map_err(|e| {
         format!(
-            "settings editor produced unreadable output ({}). stdout: {} stderr: {}",
+            "{} produced unreadable output ({}). stdout: {} stderr: {}",
+            what,
             e,
             out.trim(),
             err.trim()
@@ -990,13 +1097,33 @@ pub fn parse_ok_reply(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value,
     let message = parsed
         .get("message")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("the settings editor refused the write");
+        .unwrap_or("the child refused the write");
     Err(format!("{} ({})", message, code))
+}
+
+/// [`parse_ok_reply_named`] with the historical "settings editor" context —
+/// the wording every pre-existing caller's tests assert on.
+pub fn parse_ok_reply(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
+    parse_ok_reply_named("settings editor", stdout, stderr)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review N4: ONE policy for the cold-start `-m vco_lib` verb class.
+    /// Pinned so neither the 30 s dev-machine ceiling (red against the old
+    /// `ENV_BLOCK_TIMEOUT` / `PACKS_STATUS_TIMEOUT`) nor a drift past the
+    /// projection's own bound can come back unnoticed.
+    #[test]
+    fn short_vco_lib_verbs_share_one_generous_interactive_cap() {
+        assert_eq!(VCO_LIB_SHORT_VERB_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(VCO_LIB_ENV_PROJECTION_TIMEOUT, Duration::from_secs(300));
+        assert!(
+            VCO_LIB_SHORT_VERB_TIMEOUT < VCO_LIB_ENV_PROJECTION_TIMEOUT,
+            "an interactive read must not outwait a whole-project re-render"
+        );
+    }
 
     /// `reinject_minimal_env` must DROP a key that is not on the
     /// allowlist. We assert on the built `Command`'s `get_envs()` view

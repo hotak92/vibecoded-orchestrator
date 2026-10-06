@@ -288,6 +288,31 @@ def test_live_404_key_not_active_still_exit_3(tmp_path, secrets_dir):
     assert cp.returncode == 3, f"stderr={cp.stderr}"
 
 
+def test_live_404_key_paused_exit_3_honest_message(tmp_path, secrets_dir):
+    """v0.2.101 (Q7 / audit P3-1): the hub's exists-but-paused answer keeps
+    the tier-1 exit contract (3) and the chain semantics, but the message
+    names the PAUSE — mirrors the bash sibling's Test 4a."""
+    body = '{"error": {"code": "key_paused", "message": "key REALLY_PAUSED_KEY exists but is paused"}}'
+    with _fake_hub(404, body) as port:
+        cp = _run_resolver_live(tmp_path, "p1", "REALLY_PAUSED_KEY", secrets_dir, port)
+    assert cp.returncode == 3, f"stderr={cp.stderr}"
+    assert "exists but is paused" in cp.stderr, f"stderr={cp.stderr}"
+
+
+def test_live_404_key_paused_falls_to_file_store(tmp_path, secrets_dir):
+    """A paused keychain slot must not strand an independent file-store
+    copy — the pause governs the keychain, not ~/.vct-secrets (parity
+    with the bash sibling's key_not_active fallthrough tests)."""
+    (secrets_dir / "shared" / "REALLY_PAUSED_KEY").write_text(
+        "store-copy-while-paused", encoding="utf-8"
+    )
+    body = '{"error": {"code": "key_paused", "message": "paused"}}'
+    with _fake_hub(404, body) as port:
+        cp = _run_resolver_live(tmp_path, "p1", "REALLY_PAUSED_KEY", secrets_dir, port)
+    assert cp.returncode == 0, f"stderr={cp.stderr}"
+    assert cp.stdout == "store-copy-while-paused"
+
+
 # ─── v0.2.91 WP-D item 4: stale-env hub-token fallback (live hub) ────────
 #
 # The bash sibling's e2e cases live in tests/test_vct_secrets_resolve.sh;

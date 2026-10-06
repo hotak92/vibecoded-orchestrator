@@ -5,12 +5,17 @@ aggregation.
 
 Two volume fixes, tested here by driving the REAL bash helpers/hooks:
 
-  1. Per-session inject cap (seen-store.sh): a marathon session that navigates
-     many DISTINCT code entities injects a fresh block for each — unboundedly.
-     The cap bounds the TOTAL EMITTED injections per session_id
-     (VCO_CG_INJECT_CAP, default 40): once hit, `_cg_inject` stops and emits a
-     one-line cap note ONCE. A different session_id gets a fresh count.
-     Soft-fail OPEN: an unkeyable session runs uncapped.
+  1. Per-session inject cap (seen-store.sh counter): a marathon session that
+     navigates many DISTINCT code entities injects a fresh block for each —
+     unboundedly. The cap bounds the TOTAL EMITTED injections per session_id
+     (VCO_CG_INJECT_CAP, default 40). v0.2.101 §C6: the Grep injection moved
+     from pre-tool-use.sh's retired `_cg_inject` branch to the router-backed
+     grep-context-inject.sh — the SAME counter file is enforced router-side
+     (hook_context_router.py _cg_capped/_cg_record), with one BEHAVIOUR
+     change: past the cap the router is SILENT (the old one-line cap note was
+     a property of the retired shell branch and is retired with it). A
+     different session_id gets a fresh count. Soft-fail OPEN: an unkeyable
+     session runs uncapped.
 
   2. Reminder aggregation: the "code file was just edited -> update
      CONTEXT_STATE / capture KG" nudge fired on EVERY Edit (~15x/turn).
@@ -195,99 +200,119 @@ def test_note_once_fires_exactly_once(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# END-TO-END: drive the REAL pre-tool-use.sh Grep branch N+1 times and assert
-# the (N+1)th injection is suppressed + the cap note appears; a DIFFERENT
-# session_id is not suppressed (fresh count).
+# END-TO-END (v0.2.101 §C6 repoint): drive the REAL grep-context-inject.sh
+# (router surface `grep`) N+1 times and assert the (N+1th) injection is
+# suppressed + the counter records exactly N; a DIFFERENT session_id is not
+# suppressed (fresh count). The CG producer is stubbed through the router's
+# VCO_CG_SCRIPT seam (in-process, pinned argv) — the same enforcement point
+# production uses.
 # --------------------------------------------------------------------------
-def _sandbox_pretooluse(tmp_path: Path) -> Path:
-    """Build a project root with a stub code-graph-query CLI + the _lib helpers
-    the hook sources, returning the project root."""
+import sys  # noqa: E402 — sandbox venv symlink
+
+_ROUTER_GREP_HOOK = HOOKS / "grep-context-inject.sh"
+
+_CG_STUB = (
+    "import argparse, os\n"
+    "\n"
+    "def main(argv=None):\n"
+    "    ap = argparse.ArgumentParser()\n"
+    "    ap.add_argument('subcommand')\n"
+    "    ap.add_argument('kind')\n"
+    "    ap.add_argument('target')\n"
+    "    ap.add_argument('--hook-format', action='store_true')\n"
+    "    ap.add_argument('--source-file')\n"
+    "    ap.add_argument('--exclude-file')\n"
+    "    ap.add_argument('--indexed-revision', action='store_true')\n"
+    "    a = ap.parse_args(argv)\n"
+    "    marker = os.environ.get('VCO_CAP_STUB_MARKER')\n"
+    "    if marker:\n"
+    "        with open(marker, 'a', encoding='utf-8') as fh:\n"
+    "            fh.write('x')\n"
+    "    sym = a.target\n"
+    "    print(f'CODE: stub.{sym} | CodeFunction | def src/{sym}.py:1 | callers: [other]')\n"
+)
+
+
+def _router_grep_sandbox(tmp_path: Path) -> tuple[Path, Path]:
+    """Project root with a fake VCO venv (VCT_INSTALL_ROOT) + the counting CG
+    stub; the REAL router comes from VCT_ORCHESTRATOR_ROOT (this checkout)."""
     proot = tmp_path / "proj"
-    (proot / "templates" / "hooks" / "_lib").mkdir(parents=True)
     (proot / ".claude" / "state").mkdir(parents=True)
-    (proot / ".claude" / "scripts").mkdir(parents=True)
-    for lib in ("session-id.sh", "seen-store.sh", "codegraph-query.sh"):
-        (proot / "templates" / "hooks" / "_lib" / lib).write_bytes(
-            (LIB_DIR / lib).read_bytes()
-        )
-    (proot / "templates" / "hooks" / "_lib" / "stderr-cap.sh").write_text("# noop\n", encoding="utf-8")
-    (proot / "templates" / "hooks" / "_lib" / "find-python.sh").write_text(
-        'PY="$(command -v python3)"\n', encoding="utf-8"
-    )
-    # emit_additional_context prints a stable marker + the payload so the test
-    # can count emissions and detect the cap note.
-    (proot / "templates" / "hooks" / "_lib" / "emit-context.sh").write_text(
-        'emit_additional_context() { printf "EMIT<<%s>>\\n" "$1"; }\n',
-        encoding="utf-8",
-    )
-    hook = proot / "templates" / "hooks" / "pre-tool-use.sh"
-    hook.write_bytes((HOOKS / "pre-tool-use.sh").read_bytes())
-
-    # Stub CLI: always returns a UNIQUE CODE block per query so identity-dedup
-    # never suppresses (isolating the VOLUME cap as the only limiter).
-    cli = proot / ".claude" / "scripts" / "code-graph-query"
-    cli.write_text(
-        "#!/usr/bin/env bash\n"
-        "# args: search <query> --limit N --hook-format\n"
-        'q="$2"\n'
-        'printf "CODE: stub.%s | CodeFunction | distance=0.10 | src=src/%s.py\\n  body for %s\\n\\n" "$q" "$q" "$q"\n',
-        encoding="utf-8",
-    )
-    cli.chmod(0o755)
-    return proot
+    vb = proot / ".venv" / "bin"
+    vb.mkdir(parents=True)
+    os.symlink(sys.executable, vb / "python")
+    stub = proot / "stub_cg.py"
+    stub.write_text(_CG_STUB, encoding="utf-8")
+    return proot, stub
 
 
-def _drive_grep(proot: Path, sid: str, symbol: str) -> str:
-    """Run pre-tool-use.sh with a Grep payload; return combined stdout."""
-    payload = {"tool_name": "Grep", "session_id": sid, "tool_input": {"pattern": symbol}}
-    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(proot), "VCO_CG_INJECT_CAP": "3"}
-    r = subprocess.run(
-        ["bash", str(proot / "templates" / "hooks" / "pre-tool-use.sh")],
-        input=json.dumps(payload), capture_output=True, text=True, timeout=30,
+def _drive_router_grep(proot: Path, stub: Path, sid: str, symbol: str,
+                       cap: str = "40", marker: Path | None = None) -> str:
+    payload = {"tool_name": "Grep", "session_id": sid,
+               "tool_input": {"pattern": symbol}}
+    env = {**os.environ,
+           "CLAUDE_PROJECT_DIR": str(proot),
+           "VCT_INSTALL_ROOT": str(proot),
+           "VCT_ORCHESTRATOR_ROOT": str(REPO_ROOT),
+           "VCO_CG_SCRIPT": str(stub),
+           "VCO_CG_INJECT_CAP": cap}
+    if marker is not None:
+        env["VCO_CAP_STUB_MARKER"] = str(marker)
+    env.pop("VCT_DISABLE_HOOKS", None)
+    env.pop("VCO_INJECT_PROFILE", None)
+    return subprocess.run(
+        ["bash", str(_ROUTER_GREP_HOOK)],
+        input=json.dumps(payload), capture_output=True, text=True, timeout=60,
         env=env, cwd=str(proot),
-    )
-    return r.stdout
+    ).stdout
 
 
-def test_pretooluse_grep_injection_capped_per_session(tmp_path: Path) -> None:
-    proot = _sandbox_pretooluse(tmp_path)
+def _count(marker: Path) -> int:
+    return len(marker.read_text("utf-8")) if marker.exists() else 0
+
+
+def test_grep_injection_capped_per_session(tmp_path: Path) -> None:
+    proot, stub = _router_grep_sandbox(tmp_path)
     sid = "capsess"
-    # cap=3: three distinct symbols each inject; the 4th is suppressed + gets
-    # the cap note. Use snake_case symbols so codegraph_pattern_gate fires.
-    outs = [_drive_grep(proot, sid, f"widget_fn_{i}") for i in range(4)]
-    injected = [o for o in outs[:3] if "EMIT<<[Code-graph context for symbol:" in o]
+    # cap=3: three distinct symbols each inject; the 4th is suppressed.
+    outs = [_drive_router_grep(proot, stub, sid, f"widget_fn_{i}", cap="3")
+            for i in range(4)]
+    injected = [o for o in outs[:3] if "CODE: stub.widget_fn_" in o]
     assert len(injected) == 3, f"first 3 must inject; got {outs[:3]!r}"
-    assert "EMIT<<[Code-graph context for symbol:" not in outs[3], (
+    assert "CODE: stub." not in outs[3], (
         "the 4th injection (past cap=3) must be SUPPRESSED"
     )
-    assert "codegraph injection cap reached for this session" in outs[3], (
-        "the cap note must be emitted on the first suppressed call"
+    assert "additionalContext" not in outs[3], (
+        "v0.2.101: past the cap the router is SILENT — the old one-line cap "
+        "note was a property of pre-tool-use.sh's retired Grep branch"
     )
-    # The counter file reflects exactly 3 recorded injections.
+    # The counter file reflects exactly 3 recorded injections (SAME file the
+    # retired shell branch used — the cap survived the surface move).
     cnt = proot / ".claude" / "state" / f"seen_cginject_count_{sid}.txt"
     assert cnt.read_text().strip() == "3"
 
 
-def test_pretooluse_cap_note_emitted_once(tmp_path: Path) -> None:
-    proot = _sandbox_pretooluse(tmp_path)
+def test_grep_cap_suppression_is_silent_every_time(tmp_path: Path) -> None:
+    """The retired branch emitted a one-line cap note EXACTLY ONCE; the
+    router's past-cap behaviour is silence on EVERY capped call. This row
+    pins that new contract (and its difference from the old one)."""
+    proot, stub = _router_grep_sandbox(tmp_path)
     sid = "onceSess"
-    # 3 fills + 2 past-cap calls: the cap note appears on exactly ONE of them.
-    _ = [_drive_grep(proot, sid, f"fn_{i}") for i in range(3)]
-    past1 = _drive_grep(proot, sid, "fn_over_a")
-    past2 = _drive_grep(proot, sid, "fn_over_b")
-    note = "codegraph injection cap reached for this session"
-    assert (note in past1) != (note in past2), (
-        "the cap note must be emitted EXACTLY ONCE across repeated capped calls"
+    _ = [_drive_router_grep(proot, stub, sid, f"fn_{i}", cap="3") for i in range(3)]
+    past1 = _drive_router_grep(proot, stub, sid, "fn_over_a", cap="3")
+    past2 = _drive_router_grep(proot, stub, sid, "fn_over_b", cap="3")
+    assert past1.strip() == "" and past2.strip() == "", (
+        "past-cap calls must emit nothing at all (silence, not a note)"
     )
 
 
-def test_pretooluse_different_session_fresh_count(tmp_path: Path) -> None:
-    proot = _sandbox_pretooluse(tmp_path)
+def test_grep_different_session_fresh_count(tmp_path: Path) -> None:
+    proot, stub = _router_grep_sandbox(tmp_path)
     # Fill session A to the cap.
-    _ = [_drive_grep(proot, "sessA", f"a_fn_{i}") for i in range(4)]
+    _ = [_drive_router_grep(proot, stub, "sessA", f"a_fn_{i}", cap="3") for i in range(4)]
     # Session B starts fresh -> its FIRST injection is NOT suppressed.
-    out_b = _drive_grep(proot, "sessB", "b_fn_0")
-    assert "EMIT<<[Code-graph context for symbol:" in out_b, (
+    out_b = _drive_router_grep(proot, stub, "sessB", "b_fn_0", cap="3")
+    assert "CODE: stub.b_fn_0" in out_b, (
         "a different session_id must have a FRESH count (not inherit A's cap)"
     )
 
@@ -381,104 +406,49 @@ def test_stop_hook_noop_without_accumulator(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# v0.2.77 Part 9 task 4: query-cost accounting. A CAP-suppressed injection must
-# NOT pay for a live code-graph query it then discards — the cap short-circuits
-# BEFORE codegraph_query_block is invoked. This test uses a COUNTING CLI to
-# prove the capped call issues ZERO additional CLI invocations.
+# v0.2.77 Part 9 task 4 (repointed §C6): query-cost accounting. A
+# CAP-suppressed injection must NOT pay for a live CG query it then discards —
+# the router short-circuits BEFORE the leg runs. The counting stub proves the
+# capped call issues ZERO additional producer invocations.
 # --------------------------------------------------------------------------
-def _sandbox_counting_cli(tmp_path: Path, marker: Path) -> Path:
-    """Like _sandbox_pretooluse but the stub CLI appends to `marker` on every
-    invocation and the query-cache lib is present (production shape)."""
-    proot = tmp_path / "proj"
-    (proot / "templates" / "hooks" / "_lib").mkdir(parents=True)
-    (proot / ".claude" / "state").mkdir(parents=True)
-    (proot / ".claude" / "scripts").mkdir(parents=True)
-    for lib in ("session-id.sh", "seen-store.sh", "codegraph-query.sh", "query-cache.sh"):
-        (proot / "templates" / "hooks" / "_lib" / lib).write_bytes(
-            (LIB_DIR / lib).read_bytes()
-        )
-    (proot / "templates" / "hooks" / "_lib" / "stderr-cap.sh").write_text("# noop\n", encoding="utf-8")
-    (proot / "templates" / "hooks" / "_lib" / "find-python.sh").write_text(
-        'PY="$(command -v python3)"\n', encoding="utf-8"
-    )
-    (proot / "templates" / "hooks" / "_lib" / "emit-context.sh").write_text(
-        'emit_additional_context() { printf "EMIT<<%s>>\\n" "$1"; }\n', encoding="utf-8"
-    )
-    (proot / "templates" / "hooks" / "pre-tool-use.sh").write_bytes(
-        (HOOKS / "pre-tool-use.sh").read_bytes()
-    )
-    cli = proot / ".claude" / "scripts" / "code-graph-query"
-    cli.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf x >> "{marker}"\n'
-        'q="$2"\n'
-        'printf "CODE: stub.%s | CodeFunction | distance=0.10 | src=src/%s.py\\n  body for %s\\n\\n" "$q" "$q" "$q"\n',
-        encoding="utf-8",
-    )
-    cli.chmod(0o755)
-    return proot
-
-
 def test_capped_injection_issues_no_live_query(tmp_path: Path) -> None:
-    """Cap=3: the first 3 DISTINCT symbols each run the CLI (3 calls); the 4th
-    (past-cap) call is suppressed BEFORE the query — so the CLI count stays at
-    3, proving the capped path pays nothing for a discarded query."""
+    """Cap=3: the first 3 DISTINCT symbols each run the producer (3 calls);
+    the 4th (past-cap) call is suppressed BEFORE the query — the marker stays
+    at 3, proving the capped path pays nothing for a discarded query."""
     marker = tmp_path / "cli_calls"
-    proot = _sandbox_counting_cli(tmp_path, marker)
-    sid = "cap-cost-sess"
+    proot, stub = _router_grep_sandbox(tmp_path)
 
-    def _grep(symbol: str) -> str:
-        payload = {"tool_name": "Grep", "session_id": sid, "tool_input": {"pattern": symbol}}
-        env = {**os.environ, "CLAUDE_PROJECT_DIR": str(proot), "VCO_CG_INJECT_CAP": "3"}
-        return subprocess.run(
-            ["bash", str(proot / "templates" / "hooks" / "pre-tool-use.sh")],
-            input=json.dumps(payload), capture_output=True, text=True, timeout=30,
-            env=env, cwd=str(proot),
-        ).stdout
-
-    # 3 distinct symbols fill the cap; each runs the CLI once.
     for i in range(3):
-        _grep(f"cost_fn_{i}")
-    calls_at_cap = len(marker.read_text("utf-8")) if marker.exists() else 0
-    assert calls_at_cap == 3, f"first 3 distinct symbols should each query once; got {calls_at_cap}"
+        _drive_router_grep(proot, stub, "cap-cost-sess", f"cost_fn_{i}",
+                           cap="3", marker=marker)
+    assert _count(marker) == 3, (
+        f"first 3 distinct symbols should each query once; got {_count(marker)}")
 
-    # 4th DISTINCT symbol is past the cap → suppressed BEFORE the query.
-    out4 = _grep("cost_fn_over")
-    calls_after = len(marker.read_text("utf-8")) if marker.exists() else 0
-    assert calls_after == 3, (
+    out4 = _drive_router_grep(proot, stub, "cap-cost-sess", "cost_fn_over",
+                              cap="3", marker=marker)
+    assert _count(marker) == 3, (
         "the capped (4th) injection must NOT issue a live query — the cap "
-        f"short-circuits before codegraph_query_block; CLI ran {calls_after} times "
+        f"short-circuits before the CG leg; producer ran {_count(marker)} times "
         "(expected 3, no extra call for the discarded injection)."
     )
-    assert "codegraph injection cap reached" in out4, (
-        "the capped call should still emit the one-shot cap note"
-    )
+    assert out4.strip() == "", "the capped call must emit nothing"
 
 
 def test_repeat_symbol_served_from_cache_not_requeried(tmp_path: Path) -> None:
     """task 2 + task 4: re-Grepping the SAME symbol within TTL is served from
-    the shared cache — the CLI is NOT re-invoked, so a dedup-suppressed repeat
-    pays nothing for a live query."""
+    the router's shared query cache — the producer is NOT re-invoked, so a
+    dedup-suppressed repeat pays nothing for a live query."""
     marker = tmp_path / "cli_calls"
-    proot = _sandbox_counting_cli(tmp_path, marker)
-    sid = "cache-repeat-sess"
+    proot, stub = _router_grep_sandbox(tmp_path)
 
-    def _grep(symbol: str) -> str:
-        payload = {"tool_name": "Grep", "session_id": sid, "tool_input": {"pattern": symbol}}
-        env = {**os.environ, "CLAUDE_PROJECT_DIR": str(proot), "VCO_CG_INJECT_CAP": "40"}
-        return subprocess.run(
-            ["bash", str(proot / "templates" / "hooks" / "pre-tool-use.sh")],
-            input=json.dumps(payload), capture_output=True, text=True, timeout=30,
-            env=env, cwd=str(proot),
-        ).stdout
-
-    _grep("repeat_sym")
-    first = len(marker.read_text("utf-8")) if marker.exists() else 0
-    assert first == 1, f"first query should run the CLI once; got {first}"
-    # Same symbol again → served from the shared query-cache, no new CLI call.
-    _grep("repeat_sym")
-    second = len(marker.read_text("utf-8")) if marker.exists() else 0
-    assert second == 1, (
+    _drive_router_grep(proot, stub, "cache-repeat-sess", "repeat_sym",
+                       marker=marker)
+    assert _count(marker) == 1, (
+        f"first query should run the producer once; got {_count(marker)}")
+    # Same symbol again → served from the router's query cache, no re-query.
+    _drive_router_grep(proot, stub, "cache-repeat-sess", "repeat_sym",
+                       marker=marker)
+    assert _count(marker) == 1, (
         f"repeat identical symbol must be served from cache (no re-query); "
-        f"CLI ran {second} times (expected 1)."
+        f"producer ran {_count(marker)} times (expected 1)."
     )

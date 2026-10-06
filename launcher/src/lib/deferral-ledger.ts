@@ -285,6 +285,11 @@ export const AUTO_RETRY_BACKED_CONDITIONS: ReadonlySet<string> = new Set([
   // nodes owed. `retry:py:kg_seed` re-runs `sync_knowledge_graph.py --all`,
   // so the GUI's retry claim is true for this row.
   'kg_sync_failures_pending',
+  // v0.2.101: the SHARED-collection seed an install used to block on is now
+  // enqueued. `retry:py:kg_seed_shared` re-runs the same shipped
+  // `sync_knowledge_graph.py --all` against the shared class, so the GUI's
+  // retry claim is true for this row too.
+  'kg_sync_shared_pending',
   // v0.2.94: the post-sync `.node_formats.json` refresh failed or timed
   // out (non-root projects used to hit a root-only path and exit 2
   // silently). `retry:py:kg_seed` re-runs `sync_knowledge_graph.py --all`,

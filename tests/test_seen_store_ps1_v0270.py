@@ -77,8 +77,10 @@ def test_ascii_declaring_lib_ps1_are_pure_ascii() -> None:
             offenders[f.name] = bad[:5]
     # The three v0.2.70 files declare the invariant — guard against a future
     # rename/removal silently shrinking coverage to nothing.
-    for expected in ("seen-store.ps1", "codegraph-query.ps1",
-                     "command-noise-strip.ps1"):
+    # v0.2.101 wave-2 SF-2: codegraph-query.ps1 and command-noise-strip.ps1
+    # were RETIRED (files deleted with their last callers) — seen-store.ps1
+    # is the surviving declarer of the trio.
+    for expected in ("seen-store.ps1",):
         assert expected in checked, (
             f"{expected} must declare 'Plain ASCII only' in its header so this "
             f"guard covers it; declaring files = {checked}"

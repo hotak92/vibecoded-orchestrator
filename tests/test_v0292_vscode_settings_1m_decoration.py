@@ -112,7 +112,8 @@ def test_non_1m_and_claude_ids_are_untouched_against_the_shipped_seed():
     assert seed is not None, "the shipped seed must always be loadable"
     # glm-5.1 is 200K in the seed — the version-key vindication row.
     assert vs.decorate_1m("claude-gw/glm-5.1", seed) == "claude-gw/glm-5.1"
-    # Claude ids are deliberately absent from the table: the client knows
+    # Older Claude families (4.x) are deliberately absent from the table (only
+    # the four first-party Claude 5 rows ship): the client knows
     # their windows natively, and decorating one would be a substitution.
     assert vs.decorate_1m("claude-sonnet-4-5", seed) == "claude-sonnet-4-5"
     assert vs.decorate_1m("claude-gw/claude-opus-4-5", seed) == "claude-gw/claude-opus-4-5"

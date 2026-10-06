@@ -24,7 +24,13 @@ Environment variables:
                           (keep resident for the process lifetime). Default: 300.
                           gpu backend only — the ollama backend holds no in-process weights.
   OLLAMA_URL              Ollama API URL (default: http://localhost:11435)
-  CODE_EMBED_INSTRUCTION  Query instruction prefix (default: "" — CodeSage needs none)
+  CODE_EMBED_INSTRUCTION  OVERRIDE for the query-side instruction prefix.
+                          Default "" — when unset, the service resolves the
+                          LOADED model's prefix from the shared table
+                          (weaviate_mcp/chunking.py::MODEL_QUERY_PREFIXES),
+                          applied only to requests that send is_query=true.
+                          CodeSage/jina need none, so "" is the shipped
+                          result either way.
   CODE_EMBED_MAX_SEQ_LEN  Sets the served max_seq_length window (default: the
                           model snapshot's sentence_bert_config.json — 1024
                           for codesage-large-v2, NOT the 2048 in config.json).
@@ -51,7 +57,7 @@ Usage:
   CODE_EMBED_BACKEND=ollama CODE_EMBED_MODEL=qwen3-embedding:0.6b python -m ...
 
 API:
-  POST /embed  {"texts": [...], "is_query": false}  → {"embeddings": [[...], ...], "dim": N}
+  POST /embed  {"texts": [...], "is_query": false, "task": null}  → {"embeddings": [[...], ...], "dim": N}
   GET  /health  → {"status": "ok", "backend": "...", "model": "...", "dim": N,
                    "source_sha": "<sha256 of the source files in this image>"}
 """
@@ -211,6 +217,51 @@ else:
     sys.exit(1)
 
 
+def _shared_query_prefix(model_name: str, task: "str | None" = None) -> "str | None":
+    """Query prefix for ``model_name`` from the SHARED table, or None.
+
+    v0.2.101: the per-model query-prefix table lives ONCE, beside
+    ``MODEL_TOKEN_LIMITS`` in ``claude_mcp_servers/weaviate_mcp/chunking.py``
+    (A>B>C rule A — one implementation, not a mirror). The service imports it
+    when the orchestrator packages are on ``sys.path`` (the HOST process) and
+    uses the table's OWN code-side default task (``QUERY_TASK_DEFAULT_CODE``)
+    when the caller names none, so the task wording cannot drift.
+
+    ``None`` means "table unavailable" — the minimal CONTAINER image, whose
+    Dockerfiles COPY only ``requirements.txt`` + ``image_source.py`` +
+    ``server.py`` and cannot reach ``chunking.py`` by design. That is NOT a
+    silent fallback: the caller then uses ``CODE_EMBED_INSTRUCTION`` or none,
+    and the shipped container models (codesage, jina) need no prefix at all.
+    """
+    for mod_name in (
+        "weaviate_mcp.chunking",
+        "claude_mcp_servers.weaviate_mcp.chunking",
+    ):
+        try:
+            module = importlib.import_module(mod_name)
+            task_key = task or getattr(module, "QUERY_TASK_DEFAULT_CODE", "code_nl")
+            return module.query_prefix_for_model(model_name, task_key)
+        except Exception:  # noqa: BLE001 — next candidate, else None
+            continue
+    return None
+
+
+def _resolve_query_instruction(model_name: str, task: "str | None" = None) -> str:
+    """The query instruction the service applies when a caller sends
+    ``is_query=True``.
+
+    Priority (ONE chain, no second table):
+      1. ``CODE_EMBED_INSTRUCTION`` env — explicit operator override.
+      2. The shared per-model table (``chunking.MODEL_QUERY_PREFIXES``) for the
+         loaded model, worded for ``task`` (default: the code-side wording).
+      3. ``""`` — table unavailable (container image) and no override set.
+    """
+    if INSTRUCTION:
+        return INSTRUCTION
+    prefix = _shared_query_prefix(model_name, task)
+    return prefix or ""
+
+
 # ---------------------------------------------------------------------------
 # Backend: GPU (sentence-transformers)
 # ---------------------------------------------------------------------------
@@ -290,7 +341,9 @@ def _gpu_token_count(model, text: str) -> int:
     return len(ids)
 
 
-def _refuse_over_window(model, texts: list[str], is_query: bool) -> None:
+def _refuse_over_window(
+    model, texts: list[str], is_query: bool, instruction: str | None = None
+) -> None:
     """W1 (wiring audit, 2026-09-05): REFUSE over-window input instead of
     letting sentence-transformers truncate it silently.
 
@@ -302,6 +355,11 @@ def _refuse_over_window(model, texts: list[str], is_query: bool) -> None:
     ``truncate: false`` gives on the Ollama side: a hard refusal the caller
     can catch.
 
+    ``instruction`` is the resolved query prefix; when ``None`` it is resolved
+    for the LOADED model at the code default task (a direct caller that pins
+    nothing). It must equal what ``_embed_gpu`` actually prepends, or the
+    window check would count a different string than the one encoded.
+
     The message deliberately carries the phrase ``input length exceeds the
     context length`` — the SAME shape ``_is_context_overflow_error``
     (``vco_lib.embedding_service``) recognises on Ollama refusals, matched
@@ -309,10 +367,12 @@ def _refuse_over_window(model, texts: list[str], is_query: bool) -> None:
     CodeEmbedAdapter raises. One home, one behaviour: do not invent a
     second phrasing, and do not widen the detector to match a new one.
     """
+    if instruction is None:
+        instruction = _resolve_query_instruction(MODEL_NAME)
     window = int(model.max_seq_length)
     for i, text in enumerate(texts):
-        if is_query and INSTRUCTION:
-            text = INSTRUCTION + text
+        if is_query and instruction:
+            text = instruction + text
         n = _gpu_token_count(model, text)
         if n > window:
             raise HTTPException(
@@ -325,10 +385,13 @@ def _refuse_over_window(model, texts: list[str], is_query: bool) -> None:
             )
 
 
-def _embed_gpu(texts: list[str], is_query: bool = False) -> list[list[float]]:
+def _embed_gpu(
+    texts: list[str], is_query: bool = False, task: str | None = None
+) -> list[list[float]]:
     model = _load_gpu_model()
-    _refuse_over_window(model, texts, is_query)
-    prompt = INSTRUCTION if is_query and INSTRUCTION else None
+    instruction = _resolve_query_instruction(MODEL_NAME, task)
+    _refuse_over_window(model, texts, is_query, instruction)
+    prompt = instruction if is_query and instruction else None
     embeddings = model.encode(
         texts,
         prompt=prompt,
@@ -347,13 +410,16 @@ def _dim_gpu() -> int:
 # ---------------------------------------------------------------------------
 # Backend: Ollama
 # ---------------------------------------------------------------------------
-def _embed_ollama(texts: list[str], is_query: bool = False) -> list[list[float]]:
+def _embed_ollama(
+    texts: list[str], is_query: bool = False, task: str | None = None
+) -> list[list[float]]:
     import requests
 
+    instruction = _resolve_query_instruction(MODEL_NAME, task)
     results = []
     for text in texts:
-        if is_query and INSTRUCTION:
-            text = INSTRUCTION + text
+        if is_query and instruction:
+            text = instruction + text
         # v0.2.92 R40: num_ctx was UNSET, so this leg inherited Ollama's 2048
         # default regardless of the model's real window. Resolved from the one
         # home (chunking.MODEL_TOKEN_LIMITS) so the window we REQUEST and the
@@ -392,10 +458,12 @@ def _dim_ollama() -> int:
 # ---------------------------------------------------------------------------
 # Unified interface
 # ---------------------------------------------------------------------------
-def embed(texts: list[str], is_query: bool = False) -> list[list[float]]:
+def embed(
+    texts: list[str], is_query: bool = False, task: str | None = None
+) -> list[list[float]]:
     if BACKEND == "gpu":
-        return _embed_gpu(texts, is_query)
-    return _embed_ollama(texts, is_query)
+        return _embed_gpu(texts, is_query, task)
+    return _embed_ollama(texts, is_query, task)
 
 
 def get_dim() -> int:
@@ -593,6 +661,10 @@ app = FastAPI(title="Code Embedding Service", version="1.0.0")
 class EmbedRequest(BaseModel):
     texts: list[str]
     is_query: bool = False
+    # v0.2.101: the retrieval task key (chunking.QUERY_TASKS) so the service can
+    # pick the right query instruction wording for its loaded model. Only
+    # meaningful with is_query=True; None → the code-side default wording.
+    task: str | None = None
 
 
 class EmbedResponse(BaseModel):
@@ -634,7 +706,9 @@ async def embed_endpoint(req: EmbedRequest):
                 # Run sync inference in thread pool to avoid blocking the event
                 # loop, but the lock ensures only one inference runs at a time.
                 loop = asyncio.get_event_loop()
-                vecs = await loop.run_in_executor(None, embed, req.texts, req.is_query)
+                vecs = await loop.run_in_executor(
+                    None, embed, req.texts, req.is_query, req.task
+                )
             elapsed = time.time() - t0
     finally:
         _in_flight -= 1

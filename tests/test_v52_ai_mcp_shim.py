@@ -107,12 +107,6 @@ class MCPServerGateIntegrationTests(unittest.TestCase):
             "weaviate-kg MCP",
         )
 
-    def test_search_mcp_calls_gate(self) -> None:
-        self._assert_server_calls_gate(
-            "claude_mcp_servers/search_mcp/server.py",
-            "search MCP",
-        )
-
     def test_code_embedding_service_calls_gate(self) -> None:
         self._assert_server_calls_gate(
             "claude_mcp_servers/code_embedding_service/server.py",

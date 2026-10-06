@@ -28,6 +28,7 @@ import type {
   ChatModelContextRow,
   ChatModelContextStatus,
   ExportReport,
+  ReseedOutcome,
 } from '$lib/types/chat-model-context';
 
 /** All rows, ordered by `model_id`. */
@@ -87,6 +88,10 @@ export interface ChatModelContextDraft {
   context_window: string;
   max_output: string;
   window_1m: boolean;
+  /** The image-capability flag — a checkbox like `window_1m`, so a user
+   *  EDIT of a flagged row cannot silently drop the flag (a draft that
+   *  lost it would re-save the row as image-capable). */
+  text_only: boolean;
   source: string;
   source_note: string;
 }
@@ -100,6 +105,7 @@ export function draftFromRow(row: ChatModelContextRow): ChatModelContextDraft {
     // as a BLANK field, never as a "0" that reads like a real token count.
     max_output: row.max_output > 0 ? String(row.max_output) : '',
     window_1m: row.window_1m,
+    text_only: row.text_only,
     source: row.source,
     source_note: row.source_note,
   };
@@ -112,6 +118,7 @@ export function emptyDraft(): ChatModelContextDraft {
     context_window: '',
     max_output: '',
     window_1m: false,
+    text_only: false,
     source: '',
     source_note: '',
   };
@@ -241,6 +248,7 @@ export function validateDraft(
       context_window: contextWindow as number,
       max_output: maxOutput as number,
       window_1m: draft.window_1m,
+      text_only: draft.text_only,
       source,
       source_note: draft.source_note.trim(),
     },
@@ -251,17 +259,17 @@ export function validateDraft(
  * One-line summary of a reseed, for a toast.
  *
  * Names the preserved edits explicitly, because "nothing happened to your
- * row" is the part of the guarantee a user cannot otherwise see.
+ * row" is the part of the guarantee a user cannot otherwise see — and, since
+ * v0.2.101 (review SF-1), the RETIRED rows too, because a row deleted by
+ * this very click (a machine-seeded id the converged seed no longer ships,
+ * e.g. `glm-5.2`) is otherwise unexplained in the only surface that
+ * summarizes the action.
  */
-export function describeReseed(o: {
-  inserted: number;
-  updated: number;
-  unchanged: number;
-  preserved_user_edits: number;
-}): string {
+export function describeReseed(o: ReseedOutcome): string {
   const parts: string[] = [];
   if (o.inserted > 0) parts.push(`${o.inserted} added`);
   if (o.updated > 0) parts.push(`${o.updated} refreshed`);
+  if (o.retired > 0) parts.push(`${o.retired} retired`);
   if (o.unchanged > 0) parts.push(`${o.unchanged} already current`);
   if (o.preserved_user_edits > 0) {
     parts.push(

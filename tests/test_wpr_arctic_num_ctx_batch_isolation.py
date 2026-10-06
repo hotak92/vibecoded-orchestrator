@@ -5,8 +5,8 @@
 Root cause: ``EmbeddingService.embed_text_batch`` (and the Ollama code fallback in
 ``embed_code_batch``) handed the FULL object content to Ollama ``/api/embed`` for
 the ACTIVE model with no per-object bounded sub-window — only the SECONDARY path
-bounded. For a small-num_ctx ACTIVE model (arctic 4 096, granite, embeddinggemma,
-bge-m3) on a corpus whose chunks were sized for qwen3 (10 240), an over-window
+bounded. For a small-num_ctx ACTIVE model (arctic 4 096, jina 2 048) on a corpus
+whose chunks were sized for qwen3 (10 240), an over-window
 item 400'd, and Ollama's ``/api/embed`` rejects the ENTIRE batch of 100 if ANY
 single input overflows → 100 % failure, 0 enriched (observed live: 1 011/1 011).
 

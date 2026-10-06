@@ -454,16 +454,40 @@ def test_default_model_offered_by_the_gui_is_first_party():
 
 
 def test_template_never_makes_flash_a_default():
-    """Flash is documented (it is not inferior enough to hide) but gated.
+    """Flash ships documented and gated — never a DEFAULT.
 
-    The ruling's conditional did not fire, so flash appears — behind a
-    verifier, and explicitly excluded from unsupervised edits. What is
-    forbidden is it being a DEFAULT anywhere.
+    The per-task flash guardrails live in the rendered model-selection grid
+    ({{MODEL_SELECTION_GRID}}), the single home for per-task routing: the
+    template keeps the placeholder (plus the GLM routing rule and the window
+    capacity table that name flash), and rendering the grid with the z.ai
+    provider reachable must carry the guardrails themselves. What is
+    forbidden is flash being a DEFAULT anywhere.
     """
+    from vco_lib import model_selection
+
     text = TEMPLATE.read_text(encoding="utf-8")
     assert "glm-5.3-flash" in text, "flash is documented, with guardrails"
-    assert "behind a verifier" in text
+    assert "{{MODEL_SELECTION_GRID}}" in text, (
+        "the per-task guardrails now ship in the model-selection grid; the "
+        "placeholder must be present in the gateway block"
+    )
     assert "not the flash variant" in text
+
+    # Render the grid with the z.ai provider reachable — the injectable
+    # `providers` set bypasses the key probe exactly as in
+    # tests/test_model_selection_grid.py. The flash row (and so the flash note)
+    # renders only when z.ai is reachable.
+    grid = model_selection.render_grid(providers=frozenset({"anthropic", "zai"}))
+    for guardrail in (
+        "behind a verifier",
+        "retries help it, more effort does not",
+        "shared-component extractions",
+        "unsupervised writes to a green test suite",
+    ):
+        assert guardrail in grid, (
+            f"flash guardrail {guardrail!r} is missing from the rendered "
+            "model-selection grid"
+        )
 
 
 def test_the_fabricated_swebench_figure_is_not_propagated():
@@ -586,9 +610,7 @@ def test_shipped_gateway_agents_pin_to_the_router_namespace():
         "glm-flash-researcher.md": ("zai", "glm-5.3-flash"),
         "deepseek-implementer.md": ("qwen", "deepseek-v4.1-flash"),
         "qwen-implementer.md": ("qwen", "qwen3.8-max"),
-        "qwen-flash-implementer.md": ("qwen", "qwen3.8-flash"),
         "deepseek-researcher.md": ("qwen", "deepseek-v4.1-flash"),
-        "qwen-flash-researcher.md": ("qwen", "qwen3.8-flash"),
         "qwen-flash-sweeper.md": ("qwen", "qwen3.8-flash"),
     }
 

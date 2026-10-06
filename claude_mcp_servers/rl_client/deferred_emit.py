@@ -94,24 +94,38 @@ def _writer_factory_for(item: DeferredEmit):
     return _factory
 
 
-def emit_now(items: Sequence[DeferredEmit], *, emit=None) -> int:
-    """Send every item in order (primary first). Soft-fail per item; returns
-    the number that reported success. ``emit`` defaults to
-    ``telemetry_emit.emit_rl_event`` (``search_pipeline`` passes its own
-    binding, so there is one emitter per process to observe)."""
+def emit_each(items: Sequence[DeferredEmit], *, emit=None) -> list:
+    """Send every item in order (primary first); return one success flag per
+    item, positionally. Soft-fail per item; telemetry never raises into a
+    search. ``emit`` defaults to ``telemetry_emit.emit_rl_event``.
+
+    A flag is True when the emitter HANDLED the event — which includes a hub
+    POST that was ATTEMPTED and failed (``emit_rl_event`` returns True for that
+    case; ``hub_writer`` records the failure per event). False means the emitter
+    never reached the POST (no writer, a validation error, a raise) — the only
+    case with no per-event ledger line of its own.
+    """
     from .telemetry_emit import EmitValidationError, emit_rl_event
 
     send = emit or emit_rl_event
-    ok = 0
+    results = []
     for item in items:
         try:
-            if send(item.event, writer_factory=_writer_factory_for(item)):
-                ok += 1
+            results.append(bool(send(item.event, writer_factory=_writer_factory_for(item))))
         except EmitValidationError as exc:
             logger.debug("deferred emit: validation failed (%s)", exc)
+            results.append(False)
         except Exception as exc:  # noqa: BLE001 — telemetry never raises into a search
             logger.debug("deferred emit: raised (%s)", exc)
-    return ok
+            results.append(False)
+    return results
+
+
+def emit_now(items: Sequence[DeferredEmit], *, emit=None) -> int:
+    """Send every item in order (primary first). Soft-fail per item; returns
+    the number that reported success (see :func:`emit_each` for the per-item
+    contract)."""
+    return sum(emit_each(items, emit=emit))
 
 
 def _can_detach() -> bool:
@@ -196,16 +210,23 @@ def hand_off(items: Sequence[DeferredEmit], *, emit=None) -> str:
     return "inline"
 
 
+def _safe_unlink(path: Any) -> None:
+    """Remove ``path`` if present; never raise. One home for the child's
+    payload cleanup (the try/finally in :func:`_child_main` and the ``atexit``
+    backstop both call it)."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _load(path: str) -> list:
     from .telemetry_emit import RetrievalEvent
 
-    try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    # NB-04: read WITHOUT unlinking — the payload must outlive the emit so a
+    # crash between load and POST can still be recorded (and, per NB-05, so the
+    # ``finally`` in the caller can be the one true cleanup site).
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     out = []
     for raw in data.get("items") or []:
         ev = RetrievalEvent(**raw["event"])
@@ -213,11 +234,61 @@ def _load(path: str) -> list:
     return out
 
 
+def _record_unsent(
+    items: Optional[Sequence["DeferredEmit"]], results: Optional[Sequence[bool]] = None
+) -> None:
+    """NB-04: ONE loss-ledger line for the events the child never sent.
+
+    Only the items the emitter returned False for have no per-event ledger
+    line of their own: an event whose POST was ATTEMPTED and failed is already
+    recorded per event by ``hub_writer`` with its own reason
+    (``emit_rl_event`` reports True for it), so it is NOT re-counted here. The
+    line is kind ``deferred_unsent``—not ``hub_post_failed``—because no POST
+    was ever attempted for these events.
+
+    ``results`` is :func:`emit_each`'s per-item flags. ``None`` (a loader crash
+    before any emit) means the whole batch is unknown, so all of it is
+    reported. Never raises (a loss record must not become a second failure).
+    """
+    try:
+        from vco_lib.rl_telemetry_loss import KIND_DEFERRED_UNSENT, record_loss
+    except Exception as exc:  # noqa: BLE001 — a broken import must not crash the child
+        logger.debug("deferred emit child: loss ledger unavailable (%s)", exc)
+        return
+    detail: dict = {}
+    if items is not None:
+        flags = list(results) if results is not None else []
+        flags += [False] * max(0, len(items) - len(flags))
+        unsent = [
+            getattr(getattr(i, "event", None), "task_id", "?")
+            for i, ok in zip(items, flags)
+            if not ok
+        ]
+        detail = {"unsent": len(unsent), "task_ids": ",".join(unsent)}
+    try:
+        record_loss(KIND_DEFERRED_UNSENT, "deferred_emit_not_sent", **detail)
+    except Exception as exc:  # noqa: BLE001 — the loss record must not raise
+        logger.debug("deferred emit child: could not record loss (%s)", exc)
+
+
 def _child_main(argv: Sequence[str]) -> int:
     if len(argv) != 1:
         return 2
-    emit_now(_load(argv[0]))
-    return 0
+    path = argv[0]
+    items: Optional[list] = None
+    results: Optional[list] = None
+    try:
+        items = _load(path)              # NB-04: load first, DO NOT unlink yet
+        results = emit_each(items)       # NB-04: emit before the payload is removed
+        if not all(results):
+            _record_unsent(items, results)
+        return 0
+    except Exception as exc:  # noqa: BLE001 — a crash must still be recorded + cleaned up
+        logger.debug("deferred emit child: events not fully sent (%s)", exc)
+        _record_unsent(items, results)
+        return 1
+    finally:
+        _safe_unlink(path)               # NB-05: the payload never outlives the child
 
 
 if __name__ == "__main__":
@@ -225,6 +296,14 @@ if __name__ == "__main__":
     # with the two roots the package imports from (never the caller's cwd,
     # which is a user project that could shadow a module name).
     sys.path[:1] = [str(_ORCH_ROOT), str(_MCP_DIR)]
+    # NB-05 best-effort backstop: register the payload cleanup BEFORE the
+    # package import, so a crash during that import (or any exit path that
+    # bypasses the try/finally) still removes the 0600 temp file. Idempotent
+    # with the ``finally`` in :func:`_child_main`.
+    if len(sys.argv) == 2:
+        import atexit
+
+        atexit.register(_safe_unlink, sys.argv[1])
     from claude_mcp_servers.rl_client.deferred_emit import _child_main as _main
 
     raise SystemExit(_main(sys.argv[1:]))

@@ -626,9 +626,11 @@
                 {:else if badge === 'unset'}
                   <!-- Only reachable once BOTH tier-2 legs are known ABSENT.
                        The resolvers fall through to the file store on
-                       `key_not_active`, so a paused key with a file copy
-                       still resolves and badges as the store that serves
-                       it — this branch is the case where nothing does. -->
+                       `key_not_active` (and, since v0.2.101, on the
+                       distinct `key_paused`), so a paused key with a file
+                       copy still resolves and badges as the store that
+                       serves it — this branch is the case where nothing
+                       does. -->
                   <span class="badge badge-inactive" title="Value preserved in the keychain, and readers are gated until you Reactivate. No file-store copy serves this key either, so every consumer currently sees it as unset.">unset</span>
                 {:else if badge === 'shared-opted-out'}
                   <!-- The value is there; this project has opted out of the

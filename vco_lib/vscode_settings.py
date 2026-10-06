@@ -294,8 +294,8 @@ from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
 
 # `pyright: ignore` here and at the two `model_router.config` imports below is
-# a TOOLING gap, not a runtime one: `pyrightconfig.json` analyses `vco_lib`,
-# `weaviate_mcp` and `search_mcp`, and has no `extraPaths` entry putting
+# a TOOLING gap, not a runtime one: `pyrightconfig.json` analyses `vco_lib` +
+# `weaviate_mcp`, and has no `extraPaths` entry putting
 # `claude_mcp_servers/` on the analysis path — so `model_router` is invisible
 # to the checker while resolving perfectly at runtime (`install.py` runs
 # `pip install -e claude_mcp_servers/`, and `tests/test_vscode_settings.py`

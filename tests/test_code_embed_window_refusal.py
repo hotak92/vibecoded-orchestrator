@@ -117,7 +117,13 @@ def test_query_instruction_counts_toward_the_window():
 
 
 class monkeypatched_instruction:
-    """Context manager pinning the service module's INSTRUCTION constant."""
+    """Context manager pinning the service's query-instruction OVERRIDE.
+
+    v0.2.101: the applied instruction is resolved per request — the
+    ``CODE_EMBED_INSTRUCTION`` override (``INSTRUCTION``) first, else the
+    shared per-model table for the loaded model/task. Patching ``INSTRUCTION``
+    is therefore the seam the window guard reads.
+    """
 
     def __init__(self, value: str):
         self.value = value

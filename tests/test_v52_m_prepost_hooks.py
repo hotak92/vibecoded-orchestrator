@@ -5,10 +5,13 @@
 V52-M adds three new hooks:
 
   - templates/hooks/pre-bash-context-inject.{sh,ps1}
-    PreToolUse(Bash). Fires when command length > 500 chars. Mints a
-    task_id, writes a state file at .claude/state/bash_task_<sess>_<hash>.json,
-    runs rl_kg_search.py with the command as query, injects results as
-    additionalContext.
+    PreToolUse(Bash). v0.2.101: a THIN WRAPPER around
+    hook_context_router.py — the 500-char threshold was RETIRED (§C1,
+    classification replaces it). For every READ/EDIT/SEARCH-classified
+    command it mints a task_id, writes a state file at
+    .claude/state/bash_task_<sess>_<hash>.json (now carrying intent/
+    targets/symbols) and emits the pre_bash outcome event; MECHANICAL
+    commands get nothing. Injection is the router's envelope.
 
   - templates/hooks/post-bash-context-record.{sh,ps1}
     PostToolUse(Bash). Re-derives cmd_hash from stdin, reads the state
@@ -33,12 +36,15 @@ These tests cover:
   - task_id pairing via state file
   - Cross-language parity: OUTCOME_EVENT_TYPES (Python) matches
     allowed_event_types (Rust source string-grep)
-  - settings.json registers the three new hooks
+  - settings.json wiring — dispatcher-era (v0.2.101): pre-bash-context-
+    inject stays a DIRECT PreToolUse registration; the two post-* outcome
+    producers fire THROUGH the single async post-tool-use-async
+    dispatcher's routing table (the eight individual async PostToolUse
+    registrations were merged to kill transcript bloat)
 """
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -52,6 +58,8 @@ HOOK_NAMES = [
     "pre-bash-context-inject",
     "post-bash-context-record",
     "post-edit-outcome",
+    # v0.2.101 §C3: the Write surface's own thin wrapper (new this cycle).
+    "pre-write-context-inject",
 ]
 
 HOOK_DIR = REPO_ROOT / "templates" / "hooks"
@@ -111,72 +119,65 @@ class BashSyntaxCheck(unittest.TestCase):
                 )
 
 
-class ThresholdLogicPreBash(unittest.TestCase):
-    """The pre-bash-context-inject hook fires only when command length >500.
+class ClassificationGatePreBash(unittest.TestCase):
+    """The pre-bash pairing gate is the router's INTENT classification.
 
-    Spec (user-locked Q6 2026-06-09): fixed 500-char threshold with
-    VCT_BASH_KG_THRESHOLD_CHARS env override.
+    v0.2.101 §C1 (owner-approved): the user-locked Q6 500-char threshold
+    (VCT_BASH_KG_THRESHOLD_CHARS) is RETIRED — READ/EDIT/SEARCH-classified
+    commands get the state file + pre_bash outcome event regardless of
+    length (MORE events, richer labels — WP-D 2); MECHANICAL commands get
+    nothing regardless of length. The end-to-end RL pins live in
+    tests/test_v02101_rl_continuity.py; this class keeps the v52m-side
+    pairing-contract rows (state name/shape) on the classification gate.
     """
 
     def setUp(self) -> None:
-        self.hook = HOOK_DIR / "pre-bash-context-inject.sh"
-        self.tmp = tempfile.mkdtemp(prefix="v52m_threshold_")
-        self.state_dir = Path(self.tmp) / ".claude" / "state"
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-
-    def tearDown(self) -> None:
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _run_hook(self, command: str, threshold_env: str | None = None) -> tuple[int, str, str]:
-        """Invoke the hook with a synthesized stdin JSON payload."""
         bash = shutil.which("bash")
         if not bash:
             self.skipTest("bash not on PATH")
-        stdin_payload = json.dumps({
-            "tool_name": "Bash",
-            "session_id": "test_session_v52m",
-            "tool_input": {"command": command},
-        })
-        env = os.environ.copy()
-        env["CLAUDE_PROJECT_DIR"] = self.tmp
-        env["VCT_DISABLE_HOOKS"] = ""  # explicit unset
-        if "VCT_DISABLE_HOOKS" in env and not env["VCT_DISABLE_HOOKS"]:
-            del env["VCT_DISABLE_HOOKS"]
-        if threshold_env is not None:
-            env["VCT_BASH_KG_THRESHOLD_CHARS"] = threshold_env
-        result = subprocess.run(
-            [bash, str(self.hook)],
-            input=stdin_payload,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=15,
-        )
-        return result.returncode, result.stdout, result.stderr
+        from tests.test_v02101_router_surfaces import Rig
 
-    def test_short_command_does_not_create_state_file(self) -> None:
-        """100-char command (well below 500) → no state file written."""
-        cmd = "echo " + ("x" * 50)  # ~55 chars total
-        rc, out, err = self._run_hook(cmd)
-        self.assertEqual(rc, 0)
-        state_files = list(self.state_dir.glob("bash_task_*.json"))
-        self.assertEqual(
-            state_files, [],
-            "short command (<500 chars) must NOT write a state file; "
-            f"found: {state_files}",
+        self._tmpd = tempfile.TemporaryDirectory(prefix="v52m_classgate_")
+        self.addCleanup(self._tmpd.cleanup)
+        self.rig = Rig(Path(self._tmpd.name))
+        self.state_dir = self.rig.proj / ".claude" / "state"
+
+    def _run_hook(self, command: str, session: str = "test_session_v52m"):
+        from tests.test_v02101_router_surfaces import _bash_payload
+
+        return self.rig.run(
+            "pre-bash-context-inject",
+            _bash_payload(command, session=session, cwd=str(self.rig.proj)),
         )
 
-    def test_long_command_creates_state_file(self) -> None:
-        """600-char command (>500) → state file written with task_id + start_ts_ms."""
-        cmd = "echo " + ("x" * 600)  # 605 chars total
-        rc, out, err = self._run_hook(cmd)
-        self.assertEqual(rc, 0)
-        state_files = list(self.state_dir.glob("bash_task_test_session_v52m_*.json"))
+    def test_mechanical_command_does_not_create_state_file(self) -> None:
+        """The OLD short-command row, restated for the new gate: `echo` is
+        MECHANICAL at ANY length → no state file."""
+        cmd = "echo " + ("x" * 50)
+        r = self._run_hook(cmd)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(list(self.state_dir.glob("bash_task_*.json")), [])
+
+    def test_long_mechanical_command_still_creates_no_state(self) -> None:
+        """The threshold is gone: a 600-char `echo` is still MECHANICAL —
+        length no longer buys a pairing event (the survey's noise class)."""
+        cmd = "echo " + ("x" * 600)
+        r = self._run_hook(cmd)
+        self.assertEqual(r.returncode, 0)
         self.assertEqual(
-            len(state_files), 1,
-            f"long command (>500 chars) must write exactly one state file; "
-            f"found: {state_files}",
+            list(self.state_dir.glob("bash_task_*.json")), [],
+            "a long MECHANICAL command must NOT write a state file",
         )
+
+    def test_classified_command_creates_state_with_pairing_fields(self) -> None:
+        """A SHORT classified command (far under the old 500-char gate) now
+        gets the full pairing treatment — the recall side of §C1."""
+        cmd = "grep -rn vco_seen_add templates/"
+        r = self._run_hook(cmd)
+        self.assertEqual(r.returncode, 0)
+        state_files = list(
+            self.state_dir.glob("bash_task_test_session_v52m_*.json"))
+        self.assertEqual(len(state_files), 1, f"found: {state_files}")
         state = json.loads(state_files[0].read_text())
         self.assertIn("task_id", state)
         self.assertTrue(state["task_id"].startswith("pre_bash_"))
@@ -184,47 +185,37 @@ class ThresholdLogicPreBash(unittest.TestCase):
         self.assertIsInstance(state["start_ts_ms"], int)
         self.assertGreater(state["start_ts_ms"], 0)
         self.assertEqual(state["session_id"], "test_session_v52m")
-        self.assertGreaterEqual(state["cmd_len"], 600)
+        self.assertEqual(state["cmd_len"], len(cmd))
+        # v0.2.101 WP-D 2 additions (additive — post-bash pairing unchanged)
+        self.assertEqual(state["intent"], "SEARCH")
+        self.assertIn("vco_seen_add", state["symbols"])
+        # the pairing hash is still md5(command)[:16]
+        import hashlib
+        want = hashlib.md5(cmd.encode()).hexdigest()[:16]
+        self.assertEqual(state["cmd_hash"], want)
+        self.assertTrue(state_files[0].name.endswith(f"_{want}.json"))
 
-    def test_env_override_lowers_threshold(self) -> None:
-        """Setting VCT_BASH_KG_THRESHOLD_CHARS=10 fires on a 50-char command."""
-        cmd = "echo " + ("x" * 50)
-        rc, out, err = self._run_hook(cmd, threshold_env="10")
-        self.assertEqual(rc, 0)
-        state_files = list(self.state_dir.glob("bash_task_*.json"))
-        self.assertEqual(
-            len(state_files), 1,
-            "override threshold=10 must let a 55-char command create state",
-        )
-
-    def test_env_override_raises_threshold(self) -> None:
-        """Setting VCT_BASH_KG_THRESHOLD_CHARS=10000 silences a 600-char command."""
-        cmd = "echo " + ("x" * 600)
-        rc, out, err = self._run_hook(cmd, threshold_env="10000")
-        self.assertEqual(rc, 0)
-        state_files = list(self.state_dir.glob("bash_task_*.json"))
-        self.assertEqual(
-            state_files, [],
-            "override threshold=10000 must suppress a 605-char command",
-        )
+    def test_threshold_knob_is_retired(self) -> None:
+        """VCT_BASH_KG_THRESHOLD_CHARS must not be READ by the hook any more
+        (a documented knob that changes nothing is the same defect one layer
+        down — the docs row was retired with it)."""
+        for ext in (".sh", ".ps1"):
+            body = (HOOK_DIR / f"pre-bash-context-inject{ext}").read_text(
+                encoding="utf-8")
+            executable = [
+                ln for ln in body.splitlines()
+                if not ln.lstrip().startswith(("#", "<#"))
+            ]
+            self.assertNotIn("VCT_BASH_KG_THRESHOLD_CHARS", "\n".join(executable),
+                             f"the threshold knob crept back into the {ext} wrapper")
 
     def test_non_bash_tool_is_skipped(self) -> None:
         """A tool_name other than Bash must short-circuit before any work."""
-        bash = shutil.which("bash")
-        if not bash:
-            self.skipTest("bash not on PATH")
-        stdin_payload = json.dumps({
+        result = self.rig.run("pre-bash-context-inject", {
             "tool_name": "Edit",  # NOT Bash
             "session_id": "test_session",
             "tool_input": {"command": "x" * 1000},
         })
-        env = os.environ.copy()
-        env["CLAUDE_PROJECT_DIR"] = self.tmp
-        result = subprocess.run(
-            [bash, str(self.hook)],
-            input=stdin_payload, capture_output=True, text=True,
-            env=env, timeout=10,
-        )
         self.assertEqual(result.returncode, 0)
         state_files = list(self.state_dir.glob("bash_task_*.json"))
         self.assertEqual(
@@ -234,21 +225,14 @@ class ThresholdLogicPreBash(unittest.TestCase):
 
     def test_disable_hooks_short_circuits(self) -> None:
         """VCT_DISABLE_HOOKS=1 disables the hook entirely."""
-        bash = shutil.which("bash")
-        if not bash:
-            self.skipTest("bash not on PATH")
-        stdin_payload = json.dumps({
-            "tool_name": "Bash",
-            "session_id": "test_session",
-            "tool_input": {"command": "x" * 1000},
-        })
-        env = os.environ.copy()
-        env["CLAUDE_PROJECT_DIR"] = self.tmp
-        env["VCT_DISABLE_HOOKS"] = "1"
-        result = subprocess.run(
-            [bash, str(self.hook)],
-            input=stdin_payload, capture_output=True, text=True,
-            env=env, timeout=10,
+        result = self.rig.run(
+            "pre-bash-context-inject",
+            {
+                "tool_name": "Bash",
+                "session_id": "test_session",
+                "tool_input": {"command": "grep -rn vco_seen_add templates/"},
+            },
+            env_overrides={"VCT_DISABLE_HOOKS": "1"},
         )
         self.assertEqual(result.returncode, 0)
         state_files = list(self.state_dir.glob("bash_task_*.json"))
@@ -256,6 +240,8 @@ class ThresholdLogicPreBash(unittest.TestCase):
             state_files, [],
             "VCT_DISABLE_HOOKS=1 must fully short-circuit pre-bash",
         )
+        self.assertEqual(self.rig.kg_records(), [])
+        self.assertEqual(self.rig.cg_records(), [])
 
 
 class TaskIdPairingViaStateFile(unittest.TestCase):
@@ -373,27 +359,94 @@ class OutcomeEmitModuleSurface(unittest.TestCase):
 
 
 class SettingsTemplatesRegisterNewHooks(unittest.TestCase):
-    """templates/settings.json.{linux,windows}.template must register the
-    three new hooks at the correct PreToolUse / PostToolUse positions.
+    """The V52-M hooks must be wired on both OSes — dispatcher-era form.
+
+    v0.2.101 UPDATE (promise kept, mechanism moved): the two PostToolUse
+    outcome producers (``post-bash-context-record``, ``post-edit-outcome``)
+    are no longer REGISTERED individually — the eight async PostToolUse
+    registrations merged into ONE async dispatcher registration
+    (``post-tool-use-async.{sh,ps1}``, matcher ``*``) that routes by
+    tool_name to the same unchanged scripts, killing the per-tool-call
+    ``async_hook_response`` transcript bloat. The RL outcome-event pair
+    (pre_bash producer → bash_outcome / edit_outcome recorder, allowed
+    event types pinned in OutcomeEventTypeParity above and in
+    ``launcher/src-tauri/vct-hub/src/rl_events_api.rs``) therefore still
+    fires on every Bash / Edit / Write — THROUGH the dispatcher. These
+    tests assert the dispatcher-era wiring; the full derived routing
+    coverage (every retired stem must have a route row) lives in
+    ``tests/test_v02101_async_posttooluse_dispatcher.py``.
+    ``pre-bash-context-inject`` remains a DIRECT PreToolUse registration
+    (it injects additionalContext in-turn; it was never async).
     """
 
+    #: The dispatcher's routing-table rows for the V52-M outcome pair
+    #: (line fingerprints — the table is the one declaration both
+    #: siblings mirror byte-for-byte).
+    DISPATCHER_ROWS_SH = (
+        "Bash|post-bash-context-record|-",
+        "Edit|post-edit-outcome|-",
+        "Write|post-edit-outcome|-",
+    )
+    DISPATCHER_ROWS_PS1 = DISPATCHER_ROWS_SH  # table is extension-less
+
+    def _dispatcher_text(self, ext: str) -> str:
+        p = REPO_ROOT / "templates" / "hooks" / f"post-tool-use-async.{ext}"
+        self.assertTrue(p.is_file(), f"missing dispatcher: {p}")
+        return p.read_text(encoding="utf-8", errors="replace")
+
+    def _async_posttooluse(self, template: str) -> list:
+        p = REPO_ROOT / "templates" / f"settings.json.{template}.template"
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+        return [
+            (group.get("matcher", ""), h)
+            for group in cfg["hooks"]["PostToolUse"]
+            for h in group.get("hooks", [])
+            if h.get("async")
+        ]
+
     def test_linux_template_registers_three_hooks(self) -> None:
+        """pre-bash DIRECTLY; the two post-* outcome producers THROUGH the
+        dispatcher's routing table (dispatcher-era form of this pin)."""
         p = REPO_ROOT / "templates" / "settings.json.linux.template"
         self.assertTrue(p.is_file(), f"missing: {p}")
         text = p.read_text(encoding="utf-8")
         self.assertIn(".claude/hooks/pre-bash-context-inject.sh", text)
-        self.assertIn(".claude/hooks/post-bash-context-record.sh", text)
-        self.assertIn(".claude/hooks/post-edit-outcome.sh", text)
+        self.assertIn(".claude/hooks/post-tool-use-async.sh", text)
+        dispatcher = self._dispatcher_text("sh")
+        # The producers are wired through the dispatcher's route table.
+        for row in self.DISPATCHER_ROWS_SH:
+            self.assertIn(row, dispatcher,
+                          f"dispatcher route row missing: {row}")
+        # And NOT registered directly under PostToolUse any more (a direct
+        # registration beside the dispatcher would double-fire the event).
+        for group_matcher, h in self._posttooluse_all("linux"):
+            self.assertNotIn("post-bash-context-record.sh", h.get("command", ""))
+            self.assertNotIn("post-edit-outcome.sh", h.get("command", ""))
         # Validate JSON well-formedness
         json.loads(text)
+
+    def _posttooluse_all(self, template: str) -> list:
+        p = REPO_ROOT / "templates" / f"settings.json.{template}.template"
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+        return [
+            (group.get("matcher", ""), h)
+            for group in cfg["hooks"]["PostToolUse"]
+            for h in group.get("hooks", [])
+        ]
 
     def test_windows_template_registers_three_hooks(self) -> None:
         p = REPO_ROOT / "templates" / "settings.json.windows.template"
         self.assertTrue(p.is_file(), f"missing: {p}")
         text = p.read_text(encoding="utf-8")
         self.assertIn("pre-bash-context-inject.ps1", text)
-        self.assertIn("post-bash-context-record.ps1", text)
-        self.assertIn("post-edit-outcome.ps1", text)
+        self.assertIn("post-tool-use-async.ps1", text)
+        dispatcher = self._dispatcher_text("ps1")
+        for row in self.DISPATCHER_ROWS_PS1:
+            self.assertIn(row, dispatcher,
+                          f".ps1 dispatcher route row missing: {row}")
+        for _matcher, h in self._posttooluse_all("windows"):
+            self.assertNotIn("post-bash-context-record.ps1", h.get("command", ""))
+            self.assertNotIn("post-edit-outcome.ps1", h.get("command", ""))
         json.loads(text)
 
     def test_pre_bash_hook_runs_on_bash_matcher(self) -> None:
@@ -412,36 +465,31 @@ class SettingsTemplatesRegisterNewHooks(unittest.TestCase):
         )
 
     def test_post_bash_hook_runs_on_bash_matcher(self) -> None:
-        """Post-bash recorder must be PostToolUse, matcher=Bash."""
-        p = REPO_ROOT / "templates" / "settings.json.linux.template"
-        cfg = json.loads(p.read_text(encoding="utf-8"))
-        hooks = cfg["hooks"]["PostToolUse"]
-        registered = []
-        for group in hooks:
-            for h in group.get("hooks", []):
-                if "post-bash-context-record.sh" in h.get("command", ""):
-                    registered.append(group.get("matcher", ""))
-        self.assertIn(
-            "Bash", registered,
-            "post-bash-context-record.sh must be registered under PostToolUse matcher=Bash",
+        """Dispatcher-era form: the async PostToolUse registration is the
+        dispatcher on matcher ``*`` (it fires for Bash too), and its route
+        table sends Bash to post-bash-context-record."""
+        async_regs = self._async_posttooluse("linux")
+        self.assertEqual(
+            len(async_regs), 1,
+            "PostToolUse must carry exactly ONE async registration (the "
+            f"merged dispatcher); found {async_regs}",
         )
+        matcher, hook = async_regs[0]
+        self.assertEqual(matcher, "*")
+        self.assertIn("post-tool-use-async.sh", hook.get("command", ""))
+        self.assertIn("Bash|post-bash-context-record|-", self._dispatcher_text("sh"),
+                      "the bash_outcome producer must be routed for Bash")
 
     def test_post_edit_outcome_runs_on_edit_or_write(self) -> None:
-        """Post-edit-outcome must be PostToolUse with Edit|Write matcher."""
-        p = REPO_ROOT / "templates" / "settings.json.linux.template"
-        cfg = json.loads(p.read_text(encoding="utf-8"))
-        hooks = cfg["hooks"]["PostToolUse"]
-        registered = []
-        for group in hooks:
-            for h in group.get("hooks", []):
-                if "post-edit-outcome.sh" in h.get("command", ""):
-                    registered.append(group.get("matcher", ""))
-        # Accept either "Edit|Write" or two separate Edit/Write registrations
-        self.assertTrue(
-            any("Edit" in m and "Write" in m for m in registered) or
-            ("Edit" in registered and "Write" in registered),
-            f"post-edit-outcome.sh must run on Edit|Write; found matchers: {registered}",
-        )
+        """Dispatcher-era form: the route table fires post-edit-outcome for
+        BOTH Edit and Write (the retired registration's Edit|Write matcher).
+        """
+        dispatcher = self._dispatcher_text("sh")
+        self.assertIn("Edit|post-edit-outcome|-", dispatcher)
+        self.assertIn("Write|post-edit-outcome|-", dispatcher)
+        ps1 = self._dispatcher_text("ps1")
+        self.assertIn("Edit|post-edit-outcome|-", ps1)
+        self.assertIn("Write|post-edit-outcome|-", ps1)
 
 
 class HookEnvAndSecurityHygiene(unittest.TestCase):

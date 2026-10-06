@@ -424,6 +424,11 @@ async fn run_install_inner(
                         install_dir_for_log.display(),
                         report.errors,
                     );
+                    crate::commands::module_db::record_migration_failure(
+                        db,
+                        &manifest.id,
+                        &format!("{:?}", report.errors),
+                    );
                     let _ = app.emit(
                         "module://db-migration-failed",
                         serde_json::json!({
@@ -434,12 +439,15 @@ async fn run_install_inner(
                             "skipped": report.skipped,
                         }),
                     );
-                } else if !report.applied.is_empty() {
-                    tracing::info!(
-                        "[installer_engine] run_install[{}]: applied {} DB migration(s)",
-                        module_id_for_log,
-                        report.applied.len(),
-                    );
+                } else {
+                    crate::commands::module_db::clear_migration_failure(db, &manifest.id);
+                    if !report.applied.is_empty() {
+                        tracing::info!(
+                            "[installer_engine] run_install[{}]: applied {} DB migration(s)",
+                            module_id_for_log,
+                            report.applied.len(),
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -450,6 +458,11 @@ async fn run_install_inner(
                 tracing::warn!(
                     "[installer_engine] run_install[{}]: apply_module_db_migrations errored: {}",
                     module_id_for_log, e
+                );
+                crate::commands::module_db::record_migration_failure(
+                    db,
+                    &manifest.id,
+                    &format!("apply errored: {}", e),
                 );
                 let _ = app.emit(
                     "module://db-migration-failed",
@@ -2255,6 +2268,11 @@ async fn run_upgrade_inner(
                         "[installer_engine] run_upgrade[{}]: module DB migration(s) failed: {:?}",
                         module_id_for_log, report.errors,
                     );
+                    crate::commands::module_db::record_migration_failure(
+                        db,
+                        &manifest.id,
+                        &format!("{:?}", report.errors),
+                    );
                     let _ = app.emit(
                         "module://db-migration-failed",
                         serde_json::json!({
@@ -2266,17 +2284,25 @@ async fn run_upgrade_inner(
                             "operation": "upgrade",
                         }),
                     );
-                } else if !report.applied.is_empty() {
-                    tracing::info!(
-                        "[installer_engine] run_upgrade[{}]: applied {} DB migration(s)",
-                        module_id_for_log, report.applied.len(),
-                    );
+                } else {
+                    crate::commands::module_db::clear_migration_failure(db, &manifest.id);
+                    if !report.applied.is_empty() {
+                        tracing::info!(
+                            "[installer_engine] run_upgrade[{}]: applied {} DB migration(s)",
+                            module_id_for_log, report.applied.len(),
+                        );
+                    }
                 }
             }
             Err(e) => {
                 tracing::warn!(
                     "[installer_engine] run_upgrade[{}]: apply_module_db_migrations errored: {}",
                     module_id_for_log, e
+                );
+                crate::commands::module_db::record_migration_failure(
+                    db,
+                    &manifest.id,
+                    &format!("apply errored: {}", e),
                 );
                 let _ = app.emit(
                     "module://db-migration-failed",

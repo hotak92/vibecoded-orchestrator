@@ -53,7 +53,7 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, cast
 
 # NEW-8 / B3 (v0.2.53) — symlink-blocking defense used by
@@ -3286,10 +3286,18 @@ def _write_bootstrap_deferral(
 #         "reason": "preserve|skip-existing",  # update-mode vs first-install.
 #       },
 #     },
+#     "packs": {                        # v0.2.101 (catalogue plan §3.2):
+#                                       # opt-in packs installed here. A plain
+#                                       # `--update` enumerates every recorded
+#                                       # pack, keeping members current.
+#       "<pack-name>": {"installed_at": "ISO-8601"},
+#     },
 #   }
 #
 # Schema-version compatibility: readers default `preserved_files` to `{}` when
-# absent (v1 manifests). No migration step is required — the next install run
+# absent (v1 manifests) and `packs` to `{}` when absent (pre-v0.2.101). Both
+# are ADDITIVE keys — schema_version stays 2 (the `dismissals` precedent:
+# readers default when absent, no migration step). The next install run
 # upgrades the file in place by writing schema_version=2.
 # ---------------------------------------------------------------------------
 
@@ -3356,13 +3364,17 @@ BUNDLE_RESULT_TOP_KEYS: frozenset[str] = frozenset({
 })
 
 # v0.2.85 PLAN-v0285 D6: the set of `--skip-kind` values accepted by the CLI and
-# the `skip_kinds` param. `agents`/`skills`/`hooks`/`scripts` are enumeration
-# KINDS (a file's kind is derived from its `.claude/<bucket>/` dest_rel prefix by
-# `_bundle_op_kind`); `settings` is NOT an op but the separate settings-merge
-# step, so it is handled specially (skipping it leaves `settings_action == ""`).
-BUNDLE_SKIP_KINDS: frozenset[str] = frozenset({
-    "agents", "skills", "hooks", "scripts", "settings",
-})
+# the `skip_kinds` param. v0.2.101 (catalogue plan §5): the KIND vocabulary —
+# this set, its enumerated-FILE subset (`FILE_KINDS`, which adds
+# `specializations` and drops the settings-merge step), and the dest_rel→kind
+# classifiers — moved to ONE home, `vco_lib.bundle_kinds` (this module is
+# line-ratchet-capped and `vco_lib.packs` is the classifiers' second consumer).
+# The names stay HERE as aliases (this module's call-sites and tests use them),
+# the same pattern as `_MANIFEST_REL` above.
+from vco_lib import bundle_kinds as _bundle_kinds  # noqa: E402
+
+BUNDLE_SKIP_KINDS: frozenset[str] = _bundle_kinds.BUNDLE_SKIP_KINDS
+_BUNDLE_FILE_KINDS: frozenset[str] = _bundle_kinds.FILE_KINDS
 
 # v0.2.84 PLAN-v0284 D7 (P5/R2): shipped-file adoption backups. When an update
 # ADOPTS a divergent bundle file, the CURRENT bytes are first copied here (one
@@ -3377,173 +3389,36 @@ _ADOPT_BACKUPS_REL = Path(".claude") / "backups" / "bundle-adoptions"
 
 
 # ---------------------------------------------------------------------------
-# NEW-7 / B1 (v0.2.53) — bundle-update resume sentinel.
-#
-# Mirrors the v0.2.51 orchestrator-self pattern
-# (`launcher/src-tauri/src/commands/installer.rs::write_update_resume_sentinel`)
-# but scoped to per-project bundle updates rather than the
-# orchestrator-self update. Same recovery shape: a JSON file lands on
-# disk BEFORE any FS mutation; we delete it after the manifest write
-# succeeds. If the run is killed mid-pass (Cmd-C, OOM, power loss), the
-# sentinel survives and the next session-start detects it + prompts the
-# user to resume (or warns them to re-run `install-bundle --update`).
-#
-# Without this, a mid-update interrupt leaves the manifest stale + files
-# partially overwritten. The next `--update` run sees a manifest
-# pointing at OLD shipped hashes for files we've already updated →
-# `_file_action` returns `("preserve", ...)` for them → user-modified
-# false-flagging → user-visible "5 files preserved" toast for files
-# the user never touched.
-#
-# Audit:
-# `.claude/context/audits/project-bundle-install-audit-2026-06-10.md`
-# §6.6 / B1.
+# NEW-7 / B1 (v0.2.53) — bundle-update resume sentinel. The mechanism +
+# rationale live in ONE home, `vco_lib.bundle_sentinel` (v0.2.101 forced
+# extraction — this module is line-ratchet-capped). Aliases, not definitions:
+# the historical names stay because this module's call-sites and
+# `tests/test_project_bundle_resume_sentinel.py` use them.
 # ---------------------------------------------------------------------------
-
-_BUNDLE_UPDATE_SENTINEL_REL = Path(".claude") / "state" / "bundle-update-resume-needed.json"
-_BUNDLE_UPDATE_SENTINEL_SCHEMA = 1
-
-
-def _bundle_sentinel_path(folder: Path) -> Path:
-    """Absolute path to the bundle-update sentinel for ``folder``."""
-    return folder / _BUNDLE_UPDATE_SENTINEL_REL
+from vco_lib.bundle_sentinel import (  # noqa: E402
+    bundle_sentinel_path as _bundle_sentinel_path,
+    clear_bundle_update_resume_sentinel,
+    read_bundle_update_resume_sentinel,
+    write_bundle_update_resume_sentinel,
+)
 
 
-def read_bundle_update_resume_sentinel(folder: Path) -> Optional[dict]:
-    """Read the bundle-update resume sentinel, if any.
-
-    Returns ``None`` when:
-      * the file is absent, or
-      * the file is malformed JSON, or
-      * the schema_version is unknown.
-
-    Caller treats any None outcome as "no resume pending" so a broken
-    sentinel never wedges the next install.
-    """
-    path = _bundle_sentinel_path(folder)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("schema") != _BUNDLE_UPDATE_SENTINEL_SCHEMA:
-        return None
-    return payload
-
-
-def write_bundle_update_resume_sentinel(
-    folder: Path,
-    *,
-    operation: str = "install-bundle-update",
-    orchestrator_root: Optional[Path] = None,
-    vco_version: str = "unknown",
-    redirect_sink: Optional[list] = None,
-) -> bool:
-    """Atomic-write the bundle-update resume sentinel.
-
-    Best-effort: any I/O failure logs to stderr + returns False rather
-    than raising. The bundle install MUST proceed even when sentinel
-    write fails (sentinel is a recovery aid, not a hard requirement).
-
-    v0.2.70 (Bug B / B-1): the sentinel lives under `.claude/state/`, so when
-    `.claude` is a symlink VCO refused to write through, the write redirects to
-    a `.vco-new` sibling. When `redirect_sink` (a list) is provided, an
-    `(original_target, vco_new)` pair is appended to it on redirect so the
-    caller can fold it into the consolidated symlink deferral. Default `None`
-    keeps the `bool`-return contract unchanged for all other callers.
-    """
-    payload = {
-        "schema": _BUNDLE_UPDATE_SENTINEL_SCHEMA,
-        "operation": operation,
-        "folder": str(folder),
-        "orchestrator_root": str(orchestrator_root) if orchestrator_root else "",
-        "vco_version": vco_version,
-        "written_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "pid": os.getpid(),
-    }
-    target = _bundle_sentinel_path(folder)
-    parent = target.parent
-    try:
-        parent.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        sys.stderr.write(
-            f"[vct] bundle-update sentinel: mkdir {parent} failed: {e} — "
-            f"skipping sentinel write\n"
-        )
-        return False
-    # Tempfile + rename for atomicity. _write_file_atomic already does
-    # this for arbitrary bytes; reuse it.
-    try:
-        body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-        _redirect = _write_file_atomic(target, body)
-        if _redirect is not None and redirect_sink is not None:
-            redirect_sink.append((target, _redirect))
-    except OSError as e:
-        sys.stderr.write(
-            f"[vct] bundle-update sentinel: write {target} failed: {e}\n"
-        )
-        return False
-    return True
-
-
-def clear_bundle_update_resume_sentinel(folder: Path) -> bool:
-    """Best-effort: delete the bundle-update sentinel. Returns True on
-    success or when the file was already absent; False on any other
-    error. The caller never blocks on this — failing to delete a stale
-    sentinel just leaves a warning surface for the next session."""
-    target = _bundle_sentinel_path(folder)
-    try:
-        target.unlink()
-        return True
-    except FileNotFoundError:
-        return True
-    except OSError as e:
-        sys.stderr.write(
-            f"[vct] bundle-update sentinel: unlink {target} failed: {e}\n"
-        )
-        return False
-
-
-# Placeholder substitutions applied to agent .md files. Skill .md files use
-# the same map.
+# Placeholder substitutions applied to agent/skill .md bodies.
 #
-# PR-2 portability (2026-05-06):
+# v0.2.100 WP-18 / v0.2.101: the map is NOT written here — it is a view of
+# `vco_lib.materialize.path_subs`, the ONE path vocabulary (registry-wide
+# names, per-key docs, YAML-aware escaping, unknown placeholders warned about
+# + recorded instead of passed silently) shared with the rewire renderer and
+# the moved-clone heal. See `vco_lib/materialize.py`'s Key registry for what
+# `{{ORCHESTRATOR_ROOT}}` / `{{VCT_ORCHESTRATOR_ROOT}}` / `{{PROJECT_ROOT}}`
+# resolve to and why (PR-2 portability, 2026-05-06).
 #
-# `{{ORCHESTRATOR_ROOT}}` resolves to an ABSOLUTE PATH at install time.
-# This is necessary because Claude Code's agent .md frontmatter parses
-# YAML mcpServers `command:` fields straight to `execvp()` — shell-style
-# `${VAR}` expansion does NOT happen there, so an agent-scoped MCP server
-# can only be spawned through a baked absolute path (`{{VENV_PYTHON}}` for
-# the interpreter, v0.2.100). No shipped agent declares one today — the
-# `orchestrator-tools` block that did named a server that never existed and
-# was removed with the owner's approval (v0.2.100 WP-18). Trade-off of any
-# baked path: moving the orchestrator clone leaves it stale until
-# `install-bundle --update` is rerun (which the launcher triggers on rename
-# and adoption). The manifest-driven hash compare in
-# `_file_action` already heals stale baked paths when the prior-shipped
-# hash matches the installed file (i.e. user hasn't customised it).
-#
-# `{{VCT_ORCHESTRATOR_ROOT}}` resolves to the LITERAL string
-# `${VCT_ORCHESTRATOR_ROOT}` so it can be expanded by shell or by Python
-# `os.environ` lookups at run time. Use this placeholder in agent .md
-# bodies, hook scripts, or any context where a runtime-relocatable path
-# is acceptable.
-#
-# `{{PROJECT_ROOT}}` (added 2026-05-07, follow-up #9) resolves to the
-# project folder being installed into — the directory containing
-# `.claude/`, `CLAUDE.md`, the user's source. Use this for agent .md
-# bodies that need to reference project-relative paths cleanly without
-# hardcoding the full absolute path. `project_root` is None on
-# orchestrator self-install (where there's no separate project folder);
-# in that case `{{PROJECT_ROOT}}` resolves to the orchestrator root
-# itself, since the orchestrator IS its own project at install time.
-#
-# v0.2.100 WP-18: the map is no longer written here. It is a view of
-# `vco_lib.materialize.path_subs` — the ONE path vocabulary the rewire
-# renderer and the moved-clone heal share — and agents/skills now render
-# through `vco_lib.materialize` (registry-wide names, YAML-aware escaping,
-# unknown placeholders warned about + recorded instead of passed silently).
+# The one project_init-specific fact: `{{ORCHESTRATOR_ROOT}}` bakes an
+# ABSOLUTE path (agent-frontmatter `command:` fields go straight to execvp,
+# no shell expansion), so moving the clone leaves it stale until
+# `install-bundle --update` reruns — which `_file_action`'s manifest-driven
+# hash compare already heals for un-customised files (and the moved-clone
+# heal covers the rest).
 def _agent_subs(
     orchestrator_root: Path,
     project_root: Path | None = None,
@@ -3584,28 +3459,14 @@ def _settings_template_path(orchestrator_root: Path) -> Path:
 # call site (this module's import graph is already heavy).
 
 
-def _file_sha256(path: Path) -> str:
-    """SHA256 of a file, or "" when it is missing.
-
-    Delegates to ``vco_lib.hashing.sha256_file`` — this was a duplicate of it
-    (v0.2.92). The "" is the only real difference and stays LOCAL: callers here
-    read it as "no installed copy to compare", while the shared helper keeps
-    raising for everyone else.
-    """
-    from vco_lib.hashing import sha256_file
-
-    if not path.exists() or not path.is_file():
-        return ""
-    try:
-        return sha256_file(path)
-    except OSError:
-        return ""
-
-
-def _bytes_sha256(data: bytes) -> str:
-    """SHA256 hex digest of an in-memory byte string."""
-    import hashlib
-    return hashlib.sha256(data).hexdigest()
+# v0.2.101: the two hash helpers moved to ONE home, `vco_lib.hashing`
+# (`sha256_file_or_empty` = the ""-on-missing file variant; `sha256_bytes` was
+# already `_bytes_sha256`'s exact twin). Aliases, not definitions — this
+# module is line-ratchet-capped and the call-sites/tests use the private names.
+from vco_lib.hashing import (  # noqa: E402
+    sha256_bytes as _bytes_sha256,
+    sha256_file_or_empty as _file_sha256,
+)
 
 
 def _read_manifest(folder: Path) -> dict:
@@ -3613,13 +3474,15 @@ def _read_manifest(folder: Path) -> dict:
     `{"schema_version": ..., "files": {}, "preserved_files": {}}` on
     missing / unparseable file so callers can treat it uniformly.
 
-    Forward-compat: v1 manifests (no `preserved_files` key) read back with
-    an empty dict for that section — no migration needed."""
+    Forward-compat: v1 manifests (no `preserved_files` key) and pre-v0.2.101
+    manifests (no `packs` key) read back with an empty dict for those
+    sections — no migration needed."""
     target = folder / _MANIFEST_REL
     empty = {
         "schema_version": _MANIFEST_SCHEMA_VERSION,
         "files": {},
         "preserved_files": {},
+        "packs": {},
     }
     if not target.exists():
         return dict(empty)
@@ -3632,6 +3495,10 @@ def _read_manifest(folder: Path) -> dict:
         # preserved_files added in schema v2; default to empty for v1 readers.
         if "preserved_files" not in data or not isinstance(data["preserved_files"], dict):
             data["preserved_files"] = {}
+        # packs added in v0.2.101 (catalogue plan §3.2) as an ADDITIVE key —
+        # schema_version stays 2, matching the `dismissals` precedent.
+        if not isinstance(data.get("packs"), dict):
+            data["packs"] = {}
         return data
     except Exception:
         # Corrupt manifest — treat as missing to avoid blocking the install.
@@ -3722,7 +3589,7 @@ def _enumerate_bundle_files(
 
     Layout:
       .claude/hooks/<name>.{sh,ps1}        from templates/hooks/  (skip _lib)
-      .claude/hooks/_lib/<name>.{sh,ps1}   from templates/hooks/_lib/  (always overwrite)
+      .claude/hooks/_lib/<name>.{sh,ps1,txt} from templates/hooks/_lib/ (always overwrite)
       .claude/scripts/<rel>                from templates/scripts/<rel>  (recursive, all flavours)
       .claude/agents/<name>.md             from templates/agents/free/  (with substitutions)
       .claude/agents/<name>.md             from templates/agents/module-gateway/
@@ -3730,7 +3597,13 @@ def _enumerate_bundle_files(
                                            DELIVER — v0.2.100 AD-7; each gated
                                            verdict is appended to `gate_outcomes`)
       .claude/skills/<rel>                 from templates/skills/<rel>  (recursive; .md substituted)
+      .claude/specializations/<rel>        from templates/specializations/<rel>
+                                           (recursive PLAIN copy, no substitution —
+                                           v0.2.101 catalogue plan §5)
     Settings template handled separately (smart-merge, not a plain copy).
+    Opt-in PACK members (templates/packs/**) are NOT enumerated here — the
+    engine adds them per the manifest's `packs` map + `--pack` args via
+    `vco_lib.packs.iter_pack_ops` (one home for pack behaviour).
     Compose files are NOT shipped (v0.2.100 owner Q3); earlier copies are
     retired by ``vco_lib.bundle_leftovers.retire_compose_copies``.
     """
@@ -3755,10 +3628,10 @@ def _enumerate_bundle_files(
                     always_overwrite=False,
                 ))
 
-    # Hooks _lib (always overwrite — not user-customisable). Both flavours.
-    lib_src = hooks_src / "_lib"
+    from vco_lib.bundle_globs import hook_lib_data_globs as _lib_data_globs
+    lib_src = hooks_src / "_lib"  # _lib: always overwrite (not user-customisable); both script flavours PLUS shared data files (v0.2.101: the lean-ctx allow-list .txt both rewrite siblings parse)
     if lib_src.exists():
-        for glob in hook_globs:
+        for glob in tuple(hook_globs) + _lib_data_globs():
             for lib_file in sorted(lib_src.glob(glob)):
                 ops.append(_BundleFileOp(
                     dest_rel=str(Path(".claude") / "hooks" / "_lib" / lib_file.name),
@@ -3883,6 +3756,26 @@ def _enumerate_bundle_files(
                     transform=_apply_subs(dest_rel) if f.suffix == ".md" else None,
                     always_overwrite=False,
                 ))
+
+    # Specialisations (v0.2.101 catalogue plan §5): PLAIN recursive copy to
+    # `.claude/specializations/<rel>` — no substitution (these are the field /
+    # review docs agents reference by exact path, not agent/skill bodies). A
+    # kind of its own so `--skip-kind specializations` exists and the orphan /
+    # leftover machinery inherits automatically (`bundle_op_kind` classifies it).
+    specs_src = templates / "specializations"
+    if specs_src.exists():
+        for f in sorted(specs_src.rglob("*")):
+            if f.is_dir() or "__pycache__" in f.relative_to(specs_src).parts:
+                continue
+            dest_rel = str(Path(".claude") / "specializations"
+                           / f.relative_to(specs_src))
+            ops.append(_BundleFileOp(
+                dest_rel=dest_rel,
+                source_abs=f,
+                source_rel=str(f.relative_to(orchestrator_root)),
+                transform=None,
+                always_overwrite=False,
+            ))
 
     # v0.2.21 Step 8f: `.vscode/tasks.json` — VS Code folderOpen task
     # that starts vct-hub when the project is opened. Belt-and-braces
@@ -4236,99 +4129,14 @@ def _stale_orchestrator_root_heal_match(
     )
 
 
-def _agent_or_skill_already_present(
-    project_dir: Path, name: str, kind: str,
-) -> bool:
-    """Return True if the agent/skill is already installed at either the
-    enabled or disabled location, so install-bundle should skip copying.
-
-    Mirrors `resolve_kind_paths()` in the Rust launcher-core
-    (`vct-launcher-core::db::project_state`). `kind` is 'agent' or
-    'skill'. Used by `_file_action` to honour the FS-disable contract:
-    a user-disabled file (moved to `.claude/{agents,skills}.disabled/`
-    by the launcher GUI) must NOT be resurrected by a bundle update.
-
-    Path math is intentionally pure (no I/O beyond `.exists()`) so the
-    helper is cheap to call once per bundle op.
-    """
-    claude = project_dir / ".claude"
-    if kind == "agent":
-        # Agents are individual .md files.
-        leaf = f"{name}.md"
-        return (
-            (claude / "agents" / leaf).exists()
-            or (claude / "agents.disabled" / leaf).exists()
-        )
-    if kind == "skill":
-        # Skills are whole directories — the name IS the leaf.
-        return (
-            (claude / "skills" / name).exists()
-            or (claude / "skills.disabled" / name).exists()
-        )
-    return False
-
-
-def _classify_bundle_op_kind(dest_rel: str) -> Optional[tuple[str, str]]:
-    """If `dest_rel` is an agent .md or skill file/dir, return the
-    (kind, name) tuple suitable for `_agent_or_skill_already_present`.
-
-    Returns None for hooks, scripts, settings, infra — anything not
-    subject to the FS-disable rule.
-
-    Cross-OS: `_BundleFileOp.dest_rel` is built via `str(Path(...))`
-    whose separator depends on the host OS (`/` on POSIX, `\\` on
-    Windows). Normalise both flavours via `pathlib.PurePosixPath`
-    after a backslash-to-slash swap so the classifier works uniformly
-    regardless of where the bundle was enumerated.
-    """
-    # PurePosixPath alone treats `\\` as a literal character, so a
-    # Windows-shaped dest_rel ('.claude\\agents\\foo.md') would not split
-    # into the expected parts. Normalise to `/` first.
-    normalised = dest_rel.replace("\\", "/")
-    parts = PurePosixPath(normalised).parts
-    # All FS-disable-relevant ops live under .claude/<bucket>/...
-    if len(parts) < 3 or parts[0] != ".claude":
-        return None
-    bucket = parts[1]
-    if bucket == "agents" and len(parts) == 3 and parts[2].endswith(".md"):
-        # `.claude/agents/<name>.md` — name is the stem (sans `.md`).
-        return ("agent", parts[2][:-3])
-    if bucket == "skills" and len(parts) >= 3:
-        # Skills are recursive; every shipped file lives under
-        # `.claude/skills/<name>/...`. Skip the whole skill when its
-        # directory has a `.disabled/` counterpart.
-        return ("skill", parts[2])
-    return None
-
-
-def _bundle_op_kind(dest_rel: str) -> Optional[str]:
-    """Map a bundle `dest_rel` to its enumeration KIND for `--skip-kind`
-    (v0.2.85 PLAN-v0285 D6).
-
-    Returns one of `"hooks"`, `"scripts"`, `"agents"`, `"skills"`, or None
-    (for anything not covered by a skip-kind — curated/per-project knowledge
-    nodes, `.vscode/tasks.json`, etc.).
-
-    `hooks` INCLUDES `.claude/hooks/_lib/...` (the always-overwrite lib files
-    ship as part of the hooks kind). `settings` is deliberately absent: the
-    settings.json smart-merge is NOT an enumerated op, so it is skipped at the
-    merge call-site, not here.
-
-    Cross-OS: `dest_rel` carries the host separator (`\\` on Windows). Normalize
-    via the shared `to_posix_rel` helper before the prefix test — the same
-    discipline the knowledge-retirement branch and `_classify_bundle_op_kind`
-    already use.
-    """
-    normalized = to_posix_rel(dest_rel)
-    if normalized.startswith(".claude/hooks/"):
-        return "hooks"
-    if normalized.startswith(".claude/scripts/"):
-        return "scripts"
-    if normalized.startswith(".claude/agents/"):
-        return "agents"
-    if normalized.startswith(".claude/skills/"):
-        return "skills"
-    return None
+# v0.2.101 (catalogue plan): the KIND classifiers moved to ONE home,
+# `vco_lib.bundle_kinds` (this module is line-ratchet-capped; `vco_lib.packs`
+# is the path math's second consumer). Aliases, not definitions — the private
+# names stay because this module's call-sites (`_file_action`) and the
+# FS-disable contract tests use them.
+_agent_or_skill_already_present = _bundle_kinds.agent_or_skill_already_present
+_classify_bundle_op_kind = _bundle_kinds.classify_bundle_op_kind
+_bundle_op_kind = _bundle_kinds.bundle_op_kind
 
 
 def _file_action(
@@ -9346,6 +9154,8 @@ def install_project_bundle(
     log_event: Optional[Callable[..., None]] = None,
     safe_add: bool = False,
     skip_kinds: frozenset[str] = frozenset(),
+    packs: Iterable[str] = (),
+    remove_packs: Iterable[str] = (),
     _classification_only: bool = False,
 ) -> dict:
     """Install (or update) the per-project Claude bundle in `folder`.
@@ -9380,15 +9190,28 @@ def install_project_bundle(
             (those files are rarely committed).
         skip_kinds: v0.2.85 PLAN-v0285 D6 — a set of enumeration KINDS to skip
             entirely (subset of ``BUNDLE_SKIP_KINDS``:
-            ``{agents, skills, hooks, scripts, settings}``). A skipped kind is
-            (1) excluded from enumeration (its ops are never written), (2)
-            excluded from orphan processing (a prior manifest entry of that kind
-            is NEVER orphan-deleted / orphan-retired), and (3) its prior manifest
-            entries are carried forward VERBATIM into the new manifest — so a
-            skipped-hooks run never DELETES the user's installed hooks. Default
-            (empty frozenset) is byte-identical to the historical behaviour. Used
-            by install.py's WP-1 delegated call to map the legacy
-            ``--skip-materialize-claude-dir`` flag (→ skip hooks/scripts/settings).
+            ``{agents, skills, hooks, scripts, settings, specializations}``).
+            A skipped kind is (1) excluded from enumeration (its ops are never
+            written), (2) excluded from orphan processing (a prior manifest
+            entry of that kind is NEVER orphan-deleted / orphan-retired), and
+            (3) its prior manifest entries are carried forward VERBATIM into
+            the new manifest — so a skipped-hooks run never DELETES the user's
+            installed hooks. Default (empty frozenset) is byte-identical to the
+            historical behaviour. Used by install.py's WP-1 delegated call to
+            map the legacy ``--skip-materialize-claude-dir`` flag (→ skip
+            hooks/scripts/settings). Pack member ops classify as ordinary
+            agents/skills, so ``--skip-kind`` covers them too.
+        packs: v0.2.101 catalogue plan §3.3 — opt-in pack names to install
+            (``--pack``). The run enumerates every pack in the manifest's
+            ``packs`` map ∪ these names (``vco_lib.packs`` is the one home);
+            a newly installed pack is recorded in the manifest so a plain
+            later ``--update`` keeps its members current.
+        remove_packs: v0.2.101 catalogue plan §3.5 — pack names to remove
+            (``--remove-pack``). Members are deleted (edited copies backed up
+            under ``.claude/backups/bundle-adoptions/<ts>/`` FIRST — never a
+            silent delete; a backup failure leaves the file in place +
+            warns); the pack record + member entries leave the manifest and
+            one ``pack_removed`` informational ledger row is emitted.
         _classification_only: v0.2.92 WP-D INTERNAL seam — set by the
             bundle-staleness census and the post-install self-check, which
             re-run the engine in dry-run purely to CLASSIFY files. Skips the
@@ -9426,6 +9249,12 @@ def install_project_bundle(
         # v0.2.85 D6: the sorted list of kinds skipped this run (additive; only
         # present when non-empty, so the default-run envelope is unchanged).
         "skip_kinds": [<kind>...],          # absent when skip_kinds is empty
+        # v0.2.101 catalogue plan §3: pack names recorded in the manifest THIS
+        # run (`packs_installed`) / dropped from it (`packs_removed`). Both
+        # additive — present only when non-empty, so a no-pack run's envelope
+        # is byte-identical to the historical shape.
+        "packs_installed": [<name>...],     # absent when no pack was installed
+        "packs_removed": [<name>...],       # absent when no pack was removed
         "settings_action": "created"|"merged"|"unchanged"|"unchanged (...)"|"" ,
         "manifest_written": bool,
         "vco_version": str,
@@ -9628,10 +9457,81 @@ def install_project_bundle(
         rerender_command=_mz.bundle_rerender_command(folder, orchestrator_root),
         surface="bundle",
     )
+
+    # v0.2.101 catalogue plan §3: opt-in PACKS — one home, `vco_lib.packs`.
+    # Effective set = recorded (manifest `packs` map) ∪ requested (`--pack`)
+    # − removed (`--remove-pack`), so a plain `--update` keeps installed packs
+    # current (§3.4) and the staleness census (an engine dry-run) sees them.
+    # The table is read ONLY when packs are involved; a broken table is a loud
+    # error (errors[] → exit 1), never a silent skip, and it also pins the
+    # orphan pass below: recorded pack members are carried forward rather
+    # than orphan-deleted on a run that could not read the table.
+    from vco_lib import packs as _packs
+    packs = frozenset(packs)
+    remove_packs = frozenset(remove_packs)
+    _manifest_packs: dict = manifest.get("packs") or {}
+    _pack_table: dict = {}
+    _pack_table_error = False
+    if _manifest_packs or packs or remove_packs:
+        try:
+            _pack_table = _packs.load_packs(orchestrator_root)
+        except _packs.PacksTableError as _exc:
+            _pack_table_error = True
+            result["errors"].append({"path": _packs.PACKS_TABLE_REL,
+                                     "error": str(_exc)})
+    _unknown_packs = sorted((packs | remove_packs) - set(_pack_table))
+    if _unknown_packs and not _pack_table_error:
+        result["errors"].append({
+            "path": _packs.PACKS_TABLE_REL,
+            "error": f"unknown pack(s): {', '.join(_unknown_packs)} "
+                     f"(known: {', '.join(sorted(_pack_table)) or 'none'})"})
+
+    def _backup_ts() -> str:
+        nonlocal _adopt_backup_ts
+        if _adopt_backup_ts is None:
+            _adopt_backup_ts = _adopt_backup_timestamp()
+        return _adopt_backup_ts
+
+    # §3.5: `--remove-pack` runs BEFORE enumeration (it mutates the manifest's
+    # file entries, so removed members never reach the orphan pass).
+    _pack_removal = _packs.remove_packs(
+        folder, orchestrator_root, manifest, remove_packs, _pack_table,
+        skip_kinds=skip_kinds, dry_run=dry_run, backup_ts=_backup_ts)
+    for _pw in _pack_removal.warnings:
+        result["warnings"].append(_pw)
+    for _prel, _perr in _pack_removal.errors:
+        result["warnings"].append(
+            f"could not remove {_prel} ({_perr}); left in place")
+    if _pack_removal.removed:
+        _pbacked = sum(1 for _r, _b, _d in _pack_removal.removed if _b)
+        result.setdefault("notes", []).append(
+            f"{len(_pack_removal.removed)} pack member file(s) "
+            + ("would be removed (dry run)" if dry_run else "removed")
+            + (f"; {_pbacked} backed up under .claude/backups/bundle-adoptions/"
+               if _pbacked else ""))
+    if _pack_removal.packs_dropped:
+        result["packs_removed"] = sorted(_pack_removal.packs_dropped)
+    _log("4.bundle.packs", "start",
+         f"packs: recorded={sorted(_manifest_packs)} requested={sorted(packs)} "
+         f"removing={sorted(remove_packs)}",
+         data={"recorded": sorted(_manifest_packs),
+               "requested": sorted(packs), "removing": sorted(remove_packs)})
+
     ops = _enumerate_bundle_files(orchestrator_root, project_root=folder,
                                   gate_outcomes=_gate_outcomes,
                                   sink=_materialize_sink,
                                   project_name=project_name)
+    # §3.2: pack member ops join the enumeration with default-shaped dest_rels
+    # (`.claude/agents|skills/...`), so kind classification, skip-disabled,
+    # `--skip-kind` and the orphan machinery all apply to them unchanged.
+    # A recorded pack the table no longer knows is NOT enumerated — its
+    # members orphan-process per §3.4 (unmodified copies leave the project).
+    _effective_packs = [n for n in _packs.effective_packs(
+        _manifest_packs, packs, remove_packs) if n in _pack_table]
+    if _effective_packs:
+        ops.extend(_packs.iter_pack_ops(
+            orchestrator_root, folder, _effective_packs,
+            project_name=project_name, sink=_materialize_sink))
     # Review R18-09: every label this release still SHIPS (before the
     # skip-kinds filter — a kind skipped this run is still shipped, and its
     # rows stay true). The settle below resolves a bundle row whose file is
@@ -9646,7 +9546,7 @@ def install_project_bundle(
     # manifest carry-forward) live in the orphan loop — WITHOUT them the orphan
     # loop would see the still-tracked-but-not-re-shipped entries as orphans and
     # DELETE the user's installed files (the exact hazard PIN-S1 pins).
-    _op_kinds_to_skip = skip_kinds & {"agents", "skills", "hooks", "scripts"}
+    _op_kinds_to_skip = skip_kinds & _BUNDLE_FILE_KINDS
     if _op_kinds_to_skip:
         ops = [op for op in ops
                if _bundle_op_kind(op.dest_rel) not in _op_kinds_to_skip]
@@ -9953,6 +9853,18 @@ def install_project_bundle(
             if not is_root_target:
                 compose_prior[prior_rel] = prior_entry
             continue
+        # v0.2.101 catalogue plan §3.4 (data safety): a pack member whose table
+        # could NOT be read this run (`_pack_table_error`) was never enumerated,
+        # so its absence from `seen_in_ops` means "we couldn't ask", NOT "the
+        # pack retired it". Carry the entry forward VERBATIM — same posture as
+        # the skip-kind and unknown-gate branches — so a broken/missing
+        # `packs.toml` can never orphan-delete an installed pack's members.
+        # (A pack genuinely removed from a READABLE table enumerates normally;
+        # a member retired upstream orphan-processes per §3.4.)
+        if _pack_table_error and str((prior_entry or {}).get("source", "")).replace(
+                "\\", "/").startswith("templates/packs/"):
+            new_files[prior_rel] = prior_entry
+            continue
         # v0.2.85 PLAN-v0285 D6 LEGS 2+3 (exclude from orphan processing +
         # carry manifest entry forward VERBATIM): a prior manifest entry whose
         # KIND was skipped this run is NOT an orphan — LEG 1 deliberately dropped
@@ -10003,7 +9915,23 @@ def install_project_bundle(
         prior_hash = (prior_entry or {}).get("sha256", "")
         target_path = folder / prior_rel
         if not target_path.exists():
-            # Case (a) — already gone; just don't carry forward.
+            # Case (a) — the enabled-side copy is already gone; don't carry the
+            # entry forward. v0.2.101 §2.3: a retired agent/skill the launcher's
+            # toggle moved to `.claude/{agents,skills}.disabled/` would otherwise
+            # linger forever (this pass never descends into `.disabled`, and the
+            # leftover walk skips it too). Retire the disabled-side copy here —
+            # backup-if-edited + remove, the `--remove-pack` rule — so a retired
+            # item fully leaves the project. The disable choice does not make a
+            # VCO file the user's. Reported under `orphan-deleted` (it IS an
+            # orphan removal); the backup path is logged for discoverability.
+            for _dis_rel, _dis_bk, _dis_detail in _bl.retire_disabled_orphan(
+                    folder, prior_rel, prior_entry, backup_ts=_backup_ts,
+                    dry_run=dry_run):
+                orphan_deleted.append(_dis_rel)
+                _log("4.bundle.orphan.disabled", "info",
+                     f"{_dis_rel}: {_dis_detail}"
+                     + (f"; backup: {_dis_bk}" if _dis_bk else ""),
+                     data={"path": _dis_rel, "backup": _dis_bk})
             continue
         try:
             installed_hash = _file_sha256(target_path)
@@ -10089,13 +10017,9 @@ def install_project_bundle(
              data={"count": len(knowledge_retired)})
 
     # v0.2.100 WP-15: the leftovers policy (compose copies; retired VCO files
-    # outside the manifest) — one home, `vco_lib.bundle_leftovers`.
-    def _backup_ts() -> str:
-        nonlocal _adopt_backup_ts
-        if _adopt_backup_ts is None:
-            _adopt_backup_ts = _adopt_backup_timestamp()
-        return _adopt_backup_ts
-
+    # outside the manifest) — one home, `vco_lib.bundle_leftovers`. `_backup_ts`
+    # (the per-run adoption timestamp closure) is defined once, above, where the
+    # pack-removal pass first needs it.
     _leftover_outcomes = _bl.run_leftover_policy(
         folder, orchestrator_root, result, new_files,
         compose_prior=compose_prior, known_rels=set(prior_files) | seen_in_ops,
@@ -10256,7 +10180,7 @@ def install_project_bundle(
                 result["warnings"].append(f"settings.json: {settings_action} — newly "
                                           "shipped hooks NOT added; see UPDATE_DEFERRED.md")
             report_parked_hooks(folder, result, parked, kept_out, dry_run=dry_run,
-                                settings_action=settings_action, log=_log)
+                                settings_action=settings_action, log=_log, log_auto=_log_auto)
             if retired_removed:
                 # Envelope on BOTH paths (dry-run reports what it WOULD
                 # remove); audit rows only after a real write.
@@ -10549,6 +10473,23 @@ def install_project_bundle(
                  data={"error": err})
             result["warnings"].append(f"rl_client_setup failed: {err}")
 
+    # v0.2.101 catalogue plan §3.3: the manifest `packs` map after this run —
+    # removals already applied by the remove pass above; now fold in the packs
+    # requested via `--pack` that the table knows. A previously-recorded pack
+    # keeps its original `installed_at`; a newly-recorded one stamps now. The
+    # envelope's `packs_installed` reports every requested-and-known pack (the
+    # GUI's toggle is idempotent). `note_packs_installed` is the paired
+    # resolution of a prior `pack_removed` row (its registry clear_probe).
+    _final_packs: dict = dict(manifest.get("packs") or {})
+    _packs_installed = sorted((packs - remove_packs) & set(_pack_table))
+    if _packs_installed:
+        result["packs_installed"] = _packs_installed
+        _now_pack = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for _pn in _packs_installed:
+            _final_packs.setdefault(_pn, {"installed_at": _now_pack})
+        if not dry_run:
+            _packs.note_packs_installed(folder, _packs_installed)
+
     # Manifest write (always after a successful pass — even dry-run skips).
     if not dry_run:
         try:
@@ -10569,7 +10510,21 @@ def install_project_bundle(
                 # (item 5 of deferral-ux-polish sprint). See the schema
                 # docstring above the constants for the per-entry shape.
                 "preserved_files": dict(sorted(new_preserved.items())),
+                # v0.2.101 catalogue plan §3.2: additive `packs` map (a plain
+                # `--update` enumerates every recorded pack, keeping members
+                # current). Sorted for a deterministic, diffable payload.
+                "packs": {k: _final_packs[k] for k in sorted(_final_packs)},
             }
+            # v0.2.101: the additive `dismissals` memory (one home:
+            # vco_lib.deferral_dismissal, written by `dismiss-deferral`)
+            # SURVIVES the engine's fresh-payload write. It was silently
+            # dropped by every bundle update before this — a dismissed nudge
+            # (e.g. template_review_pending) re-fired on the next run, and an
+            # environmental dismissal re-emitted forever. Same additive-key
+            # family as `packs`: readers default it, writers carry it.
+            from vco_lib.deferral_dismissal import DISMISSALS_KEY as _DISM_KEY
+            if isinstance(manifest.get(_DISM_KEY), dict):
+                manifest_payload[_DISM_KEY] = manifest[_DISM_KEY]
             _write_manifest_atomic(folder, manifest_payload)
             result["manifest_written"] = True
 
@@ -13656,7 +13611,7 @@ def format_bundle_result_lines(result: dict) -> list[str]:
 def _cmd_install_bundle(args: argparse.Namespace) -> int:
     """`install-bundle --folder <path> [--orchestrator-root <path>]
     [--update] [--force] [--dry-run] [--project-folder <path>]
-    [--skip-kind KIND ...] --json`
+    [--skip-kind KIND ...] [--pack NAME ...] [--remove-pack NAME ...] --json`
 
     Copies `templates/` into the user project folder (no compose files since
     v0.2.100 — earlier copies are retired by `vco_lib.bundle_leftovers`).
@@ -13697,6 +13652,10 @@ def _cmd_install_bundle(args: argparse.Namespace) -> int:
         # (empty when the flag is absent); coerce to the frozenset the function
         # expects. Choices are enforced by argparse so no validation needed here.
         skip_kinds=frozenset(getattr(args, "skip_kind", None) or ()),
+        # v0.2.101 §3: repeatable --pack / --remove-pack (same append shape;
+        # the lazy PackChoices container enforced the names at parse time).
+        packs=frozenset(getattr(args, "pack", None) or ()),
+        remove_packs=frozenset(getattr(args, "remove_pack", None) or ()),
     )
     if args.json:
         print(json.dumps(result))
@@ -14923,7 +14882,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p_bundle.add_argument(
         "--skip-kind", action="append", dest="skip_kind", default=None,
         choices=sorted(BUNDLE_SKIP_KINDS),
-        metavar="{agents,skills,hooks,scripts,settings}",
+        metavar="{" + ",".join(sorted(BUNDLE_SKIP_KINDS)) + "}",
         help=(
             "v0.2.85: skip an entire install KIND (repeatable). A skipped kind "
             "is excluded from enumeration AND orphan processing, and its prior "
@@ -14931,6 +14890,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "installed files are NEVER deleted). Used by install.py to map the "
             "legacy --skip-materialize-claude-dir flag (→ hooks scripts "
             "settings)."
+        ),
+    )
+    # v0.2.101 catalogue plan §3.2: opt-in packs. `choices` is the lazy
+    # `PackChoices` container — the table is read only when a pack flag is
+    # actually present, and a broken table refuses every name LOUDLY (reason
+    # to stderr) rather than bricking the other subcommands at parser build.
+    from vco_lib.packs import PackChoices as _PackChoices
+    _pack_choices = _PackChoices()
+    p_bundle.add_argument(
+        "--pack", action="append", dest="pack", default=None,
+        choices=_pack_choices, metavar="NAME",
+        help=(
+            "v0.2.101: install an opt-in agent/skill PACK (repeatable). The "
+            "pack's members ship to the ordinary .claude/agents|skills/ "
+            "destinations and are recorded in the manifest's `packs` map, so a "
+            "plain later --update keeps them current. Choices come from "
+            "templates/packs/packs.toml."
+        ),
+    )
+    p_bundle.add_argument(
+        "--remove-pack", action="append", dest="remove_pack", default=None,
+        choices=_pack_choices, metavar="NAME",
+        help=(
+            "v0.2.101: remove an installed PACK (repeatable). Unmodified "
+            "members are deleted; members you edited are backed up under "
+            ".claude/backups/bundle-adoptions/<ts>/ FIRST — never a silent "
+            "delete. The pack record + member entries leave the manifest."
         ),
     )
     p_bundle.add_argument(

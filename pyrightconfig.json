@@ -57,7 +57,6 @@
         "vco_lib",
         "install.py",
         "claude_mcp_servers/weaviate_mcp",
-        "claude_mcp_servers/search_mcp",
         "claude_mcp_servers/model_router",
         ".github/scripts"
     ],

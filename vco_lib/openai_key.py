@@ -42,6 +42,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -404,9 +405,10 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     is removed when its value EQUALS what VCO's stores hold (keychain or
     file store; constant-time compare). When nothing is stored yet, the value
     is first copied into the FILE STORE — never the keychain, whose row may
-    be paused rather than empty (the hub answers both the same way) — and
-    removed once the copy reads back equal. Otherwise it stays and the
-    status says why.
+    be paused rather than empty — and removed once the copy reads back
+    equal. A key the hub reports PAUSED (v0.2.101 ``key_paused``) is never
+    copied: a pause is a deliberate owner decision, and a file-store copy
+    would shadow it. Otherwise it stays and the status says why.
 
     The value is read with the ONE line grammar (``envfile.parse_env_line``:
     ``export``, one quote pair, CRLF) — what a reader of the line gets.
@@ -415,7 +417,8 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     line), ``migrated`` (removed; detail = where the value now lives),
     ``left_differs`` (the store holds another value), ``left_unverified``
     (it could not be stored or read back), ``left_unparsed`` (the value is
-    not one clean token). Never a value.
+    not one clean token), ``left_paused`` (the stored key is paused —
+    nothing was stored; detail = the remedy). Never a value.
     """
     from vco_lib import agent_secrets
     from vco_lib.env_template import remove_line_under
@@ -438,6 +441,26 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
             )
             return False
         state, stored = agent_secrets.lookup_stored(OPENAI_SECRET_NAME, project=str(root))
+        if state == agent_secrets.STORED_PAUSED:
+            # v0.2.101 (Q7 / audit P3-1): the key EXISTS but is paused. A
+            # pause is a deliberate owner decision — storing a file-store
+            # copy here would shadow it (and tier 2 would then serve every
+            # project without a `.no-shared-fallback` marker). Skip, say so
+            # once on stderr (no value), and leave the line in place.
+            print(
+                "openai_api_key: the stored key is paused in the launcher — "
+                "the .env line was left in place; resume the key in "
+                "Preferences → Secrets or remove the line by hand",
+                file=sys.stderr,
+            )
+            outcome.update(
+                status="left_paused",
+                detail=(
+                    "the stored key is paused in the launcher — resume it in "
+                    "Preferences → Secrets, or remove the .env line by hand"
+                ),
+            )
+            return False
         if stored is None:
             try:
                 store_openai_api_key(value, keychain=False)

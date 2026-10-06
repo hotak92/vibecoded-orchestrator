@@ -3598,106 +3598,69 @@ mod tests {
         }
     }
 
-    // ─── Bundled manifest schema regression tests (0.1.7 fork-readiness) ──
+    // ─── Bundled manifest schema regression tests ────────────────────────
     //
-    // The bundled manifests under `launcher/bundled_manifests/` declare the
-    // secret keys that the launcher's hub `/projects/{id}/env` endpoint
-    // exposes to bundled MCP wrappers (e.g. `claude_mcp_servers/search_mcp/
-    // wrapper.sh`). Pre-0.1.7 the search MCP manifest declared
-    // `GITHUB_TOKEN` (uppercase, scope=global), but the wrapper queries the
-    // resolver for `github_pat` (lowercase, scope=shared). That mismatch
-    // meant the resolver always returned `key_not_active`, so the wrapper
-    // fell through to its `VCT_LEGACY_FILE_FALLBACK=1` path on every call.
+    // Every bundled manifest under `launcher/bundled_manifests/` must parse
+    // as a valid `ModuleManifest`, and every key it names in
+    // `runtime.env_from_secrets` must have a matching `secrets[].key`
+    // declaration — a mismatch means launcher-managed runtime injection would
+    // read a keychain entry nothing writes (silent breakage).
     //
-    // These tests pin:
-    //   * The bundled `vct-search.json` parses as a valid `ModuleManifest`.
-    //   * The `github_pat` secret is declared with `scope: "shared"` —
-    //     matching what `wrapper.sh` queries and what
-    //     `commands/installer.rs::register_github_pat` migrates to the
-    //     OS keychain. The legacy `~/.vct-secrets/shared/github_pat`
-    //     file path is read as a fallback during the one-time keychain
-    //     migration (gated by APP_STATE_KEY_GITHUB_PAT_MIGRATED, landed
-    //     in 0.2.0). Post-migration the keychain entry is the source of
-    //     truth; the file lingers as documentation of past state.
-    //   * `runtime.env_from_secrets` references `github_pat` (not the
-    //     legacy `GITHUB_TOKEN`), so when launcher-managed runtime
-    //     injection lands it picks up the right keychain entry.
-    //
-    // If any of these assertions fail, the resolver path will silently
-    // 404 again — same regression we just fixed.
-    fn bundled_search_manifest_path() -> std::path::PathBuf {
+    // v0.2.101 deleted `vct-search.json` with the search MCP; these tests are
+    // now generic over the tree rather than pinned to that one file.
+    fn bundled_manifest_paths() -> Vec<std::path::PathBuf> {
         // CARGO_MANIFEST_DIR is /<repo>/launcher/src-tauri at compile time.
-        // The bundled manifest tree lives at /<repo>/launcher/bundled_manifests.
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("bundled_manifests")
-            .join("vct-search.json")
-    }
-
-    #[test]
-    fn bundled_search_manifest_parses_cleanly() {
-        let path = bundled_search_manifest_path();
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
-        let parsed = ModuleManifest::from_json(&raw)
-            .unwrap_or_else(|e| panic!("vct-search.json failed to parse: {}", e));
-        assert_eq!(parsed.id, "vct-search");
-    }
-
-    #[test]
-    fn bundled_search_manifest_does_not_declare_github_pat_post_v0_2_11() {
-        // PR-14a (v0.2.11) dropped `search_code` from the search MCP
-        // (redundant with Claude's native WebSearch + site:github.com).
-        // PR-14b removed `github_pat` from vct-search.json's secrets
-        // list because no surviving search-MCP tool needs it.
-        //
-        // Regression guard: if a future PR re-introduces a `github_pat`
-        // secret declaration in vct-search.json (or the uppercase
-        // legacy `GITHUB_TOKEN` shape), fail loudly — the search MCP
-        // no longer has a GitHub-querying tool that would consume it,
-        // so the secret would be requested from the user for nothing.
-        //
-        // (`github_pat` is still legitimately requested by the
-        // OnboardingWizard `register_github_pat` flow for git-push
-        // auth + other modules; this test only asserts that the
-        // search MCP doesn't claim it.)
-        let path = bundled_search_manifest_path();
-        let raw = std::fs::read_to_string(&path).expect("read vct-search.json");
-        let parsed = ModuleManifest::from_json(&raw).expect("parse vct-search.json");
-
+            .join("bundled_manifests");
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {}", dir.display(), e))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        paths.sort();
         assert!(
-            !parsed.secrets.iter().any(|s| s.key == "github_pat"),
-            "vct-search.json must NOT declare a `github_pat` secret in v0.2.11+ \
-             (search_code tool dropped — no consumer left). If you re-added a \
-             GitHub-querying tool, document why this guard is being inverted."
+            !paths.is_empty(),
+            "no bundled manifests found under {}",
+            dir.display(),
         );
-        assert!(
-            !parsed.secrets.iter().any(|s| s.key == "GITHUB_TOKEN"),
-            "vct-search.json must NOT re-declare GITHUB_TOKEN (legacy uppercase) — \
-             search MCP no longer queries GitHub at all in v0.2.11+."
-        );
+        paths
     }
 
     #[test]
-    fn bundled_search_manifest_runtime_env_matches_secret_keys() {
-        let path = bundled_search_manifest_path();
-        let raw = std::fs::read_to_string(&path).expect("read vct-search.json");
-        let parsed = ModuleManifest::from_json(&raw).expect("parse vct-search.json");
-
-        // Every key in `runtime.env_from_secrets` must correspond to an
-        // actual `secrets[].key` declaration. Mismatches mean the
-        // launcher-managed runtime would try to inject from a keychain
-        // entry that nothing writes to — silent breakage.
-        let declared: std::collections::HashSet<&str> =
-            parsed.secrets.iter().map(|s| s.key.as_str()).collect();
-        for env_key in &parsed.runtime.env_from_secrets {
+    fn every_bundled_manifest_parses_cleanly() {
+        for path in bundled_manifest_paths() {
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+            let parsed = ModuleManifest::from_json(&raw)
+                .unwrap_or_else(|e| panic!("{} failed to parse: {}", path.display(), e));
             assert!(
-                declared.contains(env_key.as_str()),
-                "runtime.env_from_secrets references {:?} but no matching `secrets[].key` is declared. \
-                 Declared keys: {:?}",
-                env_key,
-                declared,
+                !parsed.id.is_empty(),
+                "{} parsed with an empty id",
+                path.display(),
             );
+        }
+    }
+
+    #[test]
+    fn every_bundled_manifest_runtime_env_matches_secret_keys() {
+        for path in bundled_manifest_paths() {
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+            let parsed = ModuleManifest::from_json(&raw)
+                .unwrap_or_else(|e| panic!("{} failed to parse: {}", path.display(), e));
+            let declared: std::collections::HashSet<&str> =
+                parsed.secrets.iter().map(|s| s.key.as_str()).collect();
+            for env_key in &parsed.runtime.env_from_secrets {
+                assert!(
+                    declared.contains(env_key.as_str()),
+                    "{}: runtime.env_from_secrets references {:?} but no matching \
+                     `secrets[].key` is declared. Declared keys: {:?}",
+                    path.display(),
+                    env_key,
+                    declared,
+                );
+            }
         }
     }
 

@@ -115,7 +115,7 @@ silently propagated into the target. Specifically:
 
 - `tools/vct-secrets/foo.token` (matched by `*.token` in source's
   `.gitignore` but copied verbatim) — REAL leak risk
-- `.claude/agents/coder.md`, `.claude/skills/...`,
+- `.claude/agents/expert-coder.md`, `.claude/skills/...`,
   `.claude/logs/2026-05-06_tool_usage.jsonl` — per-machine artifacts
   copied as-if they were source
 - `infrastructure/docker-compose.override.yml` — per-machine volume

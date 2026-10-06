@@ -44,6 +44,24 @@ def hook_globs() -> tuple[str, ...]:
     return ("*.sh", "*.ps1")
 
 
+def hook_lib_data_globs() -> tuple[str, ...]:
+    """Data-file globs shipped from ``templates/hooks/_lib/`` alongside the
+    ``.sh``/``.ps1`` helper flavours.
+
+    v0.2.101: the lean-ctx allow-list inversion made
+    ``templates/hooks/_lib/lean-ctx-allowlist.txt`` a load-bearing SHARED
+    config that both ``lean-ctx-rewrite.sh`` and ``.ps1`` PARSE at runtime
+    (A>B>C tier B — one committed rule table, not per-language mirrors). If
+    that ``.txt`` doesn't ship into ``<project>/.claude/hooks/_lib/``, both
+    hooks silently no-op (allow-list absent → every command runs raw), so
+    compression would quietly never activate on any install. The ``_lib``
+    copy loop in ``project_init._enumerate_bundle_files`` globs
+    ``hook_globs() + hook_lib_data_globs()``; the top-level ``hooks/`` loop
+    is unaffected (it ships registered hooks, which are always ``.sh``/``.ps1``).
+    """
+    return ("*.txt",)
+
+
 def script_patterns() -> tuple[str, ...]:
     """Glob patterns for `templates/scripts/` files shipped to `.claude/scripts/`.
 

@@ -133,8 +133,8 @@ class AdoptionLeaveAloneTests(unittest.TestCase):
     def test_disabled_agent_companion_skipped_not_adopted(self):
         """An agent disabled via `.claude/agents.disabled/<name>.md` ⇒
         skip-disabled; it is never adopted/backed up (the user's disable choice
-        survives). The shared fixture ships `coder.md`, so we use a distinct
-        agent name to isolate the disabled-companion classification."""
+        survives). The shared fixture ships `example-agent.md`, so we use a
+        distinct agent name to isolate the disabled-companion classification."""
         # Ship a second agent so it enters the op set with a clean slate.
         agents = self.orch / "templates" / "agents" / "free"
         agents.mkdir(parents=True, exist_ok=True)

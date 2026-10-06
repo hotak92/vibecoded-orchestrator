@@ -82,3 +82,22 @@ except Exception:
     fi
     vco_hook_sanitize_session_id "$parsed"
 }
+
+# vco_hook_fast_session_id <hook-stdin-json>
+# v0.2.101 (wave-2 review nit-7): the PRE-python session-id extraction the
+# router wrappers share — one home instead of three inline copies. Pattern-
+# based (grep+sed over the raw payload, allow-list [A-Za-z0-9_-]) so it runs
+# BEFORE any venv/JSON-parser resolution, and INDEPENDENTLY of the lib whose
+# absence it may be about to report (the broken-install notice in
+# emit-context.sh needs a session key even when _lib/inject-budget is the
+# missing file — that dependency cycle is why this lives HERE, not there).
+# A hostile or missing id yields "" — consumers sanitize for real anyway
+# (vco_hook_sanitize_session_id / the router's sanitize_session_id).
+# MUST MATCH session-id.ps1's Get-VcoHookFastSessionId (parity-pinned by
+# tests/test_v02101_inject_gates.py).
+vco_hook_fast_session_id() {
+    printf '%s' "${1:-}" \
+        | grep -Eo '"session_id"[[:space:]]*:[[:space:]]*"[A-Za-z0-9_-]+"' \
+        | head -n 1 \
+        | sed 's/.*"\([A-Za-z0-9_-]*\)"$/\1/'
+}

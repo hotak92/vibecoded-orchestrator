@@ -21,6 +21,10 @@ collected. Two ways a log can go missing were invisible until now:
   running, connection refused, timeout, a 4xx/5xx). The writer is soft-fail by
   design, and the connection-level cases used to be logged at DEBUG only, so
   the loss could not be measured.
+* ``deferred_unsent`` — a deferred-emit child loaded events but never sent
+  them (v0.2.101 NB-04: a loader/emit crash, a writer that raised, a validation
+  failure). Recorded apart from ``hub_post_failed`` because no POST was ever
+  attempted for these events, so nothing else names them.
 
 Every such loss appends ONE JSON line to
 ``<vct_root>/metrics/rl_telemetry_loss.jsonl`` (the shared metrics home, beside
@@ -54,6 +58,13 @@ KIND_HUB_POST_FAILED = "hub_post_failed"
 #: for the other slot (``missing`` / ``nodes`` in the record). Not an event
 #: loss — a partial one — so :func:`summarize` counts it apart (W5R-08).
 KIND_DUAL_PARTIAL = "dual_partial"
+#: A deferred-emit child (``claude_mcp_servers/rl_client/deferred_emit``)
+#: loaded events but never sent them — a loader/emit crash, a writer that
+#: raised, a validation failure (v0.2.101 NB-04). This is the ONLY deferred
+#: case with no per-event line of its own: an event whose POST was ATTEMPTED
+#: and failed is recorded per event under :data:`KIND_HUB_POST_FAILED`
+#: instead, so the two never count the same event twice.
+KIND_DEFERRED_UNSENT = "deferred_unsent"
 
 #: Once the ledger passes ``_MAX_BYTES`` it is cut to its newest
 #: ``_KEEP_LINES`` lines (through the repo's one rotation home,
@@ -194,6 +205,7 @@ def _reset_warned_for_test() -> None:
 
 
 __all__ = [
+    "KIND_DEFERRED_UNSENT",
     "KIND_DUAL_PARTIAL",
     "KIND_DUAL_SKIP",
     "KIND_HUB_POST_FAILED",

@@ -195,8 +195,11 @@ class TokenCounter:
 #     — and every part of a split one — had roughly half its text never
 #     influence its vector, with no warning and no tag.
 #   * text-embedding-3-small: 8k (OpenAI documented 8191 cap).
-#   * bge-m3:latest, embeddinggemma:300m-bf16, granite-embedding:278m-fp16:
-#     NEW entries — verified via `ollama show` 2026-06-04.
+#
+# bge-m3, embeddinggemma and granite-embedding were REMOVED in v0.2.101:
+# they are not VCO models (never chosen, never named by a preset, launcher
+# selector, pull plan or model plan — they only leaked in because they exist
+# on the maintainer's machine), so their rows were dead selectable-surface.
 #
 # To raise any of these: bump the value here AND ensure the embedding adapter
 # sends the new `num_ctx` to Ollama (see vco_lib/embedding_providers/ollama.py).
@@ -264,12 +267,6 @@ MODEL_TOKEN_LIMITS: dict[str, int] = {
     "qwen3-embedding:0.6b": 10_240,               # was 8_192; bump to 10k (model arch supports 32k)
     "qwen3-embedding": 10_240,
     "text-embedding-3-small": 8_191,              # OpenAI documented cap
-    "bge-m3:latest": 8_192,                       # NEW (verified via ollama show)
-    "bge-m3": 8_192,
-    "embeddinggemma:300m-bf16": 2_048,            # NEW (Modelfile pins num_ctx=2048)
-    "embeddinggemma": 2_048,
-    "granite-embedding:278m-fp16": 512,           # NEW (small model, 512 architectural cap)
-    "granite-embedding": 512,
     # Code embedding models
     "unclemusclez/jina-embeddings-v2-base-code:latest": 2_048,  # was 8_192; v2 trained at 512
     "jina-embeddings-v2-base-code": 2_048,
@@ -278,6 +275,124 @@ MODEL_TOKEN_LIMITS: dict[str, int] = {
     "codesage/codesage-large-v2": 1_024,
     "codesage-large-v2": 1_024,
 }
+
+# ─── Query-side instruction prefixes (v0.2.101) ───────────────────────────
+# The ONE home for the query/document asymmetry several embedding models
+# need: a short instruction prepended to SEARCH QUERIES ONLY. DOCUMENTS stay
+# unprefixed, so every stored vector is byte-identical and nothing is
+# re-embedded. Retrieval quality on qwen3-embedding drops ~1–5% without its
+# instruction.
+#
+# Each value is the model's OWN sentence-transformers ``prompts["query"]``
+# string, RE-CHECKED 2026-10-04 by fetching the model card / ST config
+# (huggingface.co/<model>/raw/main/config_sentence_transformers.json):
+#   * Qwen/Qwen3-Embedding-0.6B →
+#       {"prompts": {"query": "Instruct: Given a web search query, retrieve
+#        relevant passages that answer the query\nQuery:", "document": ""}}
+#     → TEMPLATED here on the text after "Instruct: "; sentence-transformers
+#       joins it to the text with NO space after "Query:".
+#   * Snowflake/snowflake-arctic-embed-l-v2.0 (== the embed2 alias VCO serves)
+#     → {"prompts": {"query": "query: "}} (exact, TRAILING SPACE).
+#   * jinaai/jina-embeddings-v2-base-code → no config_sentence_transformers
+#     .json (HTTP 404) → no prefix.
+#   * codesage/codesage-large-v2 → no ST prompt config → no prefix (the card
+#     requires the tokenizer's EOS, which the tokenizer appends itself).
+#   * text-embedding-3-small → symmetric OpenAI API → no prefix.
+#
+# ``{task}`` is substituted with the per-use sentence from QUERY_TASKS. An
+# EMPTY string is a deliberate "this model needs none" — an unknown model
+# that partial-matches nothing also resolves to "" (never inject text a
+# model was not trained with).
+MODEL_QUERY_PREFIXES: dict[str, str] = {
+    # qwen3 (the default KG/docs model) — templated instruction.
+    "qwen3-embedding": "Instruct: {task}\nQuery:",
+    "qwen3_embedding": "Instruct: {task}\nQuery:",
+    # snowflake-arctic-embed2 — literal ST prompt (trailing space matters).
+    "snowflake-arctic-embed2": "query: ",
+    "snowflake-arctic-embed-l-v2": "query: ",
+    "arctic-embed2": "query: ",
+    # Models verified instruction-free — listed EXPLICITLY so "VCO ships
+    # these" is readable and a future model cannot inherit a prefix by an
+    # accidental partial match.
+    "jina-embeddings-v2-base-code": "",
+    "unclemusclez/jina-embeddings-v2-base-code": "",
+    "codesage": "",
+    "text-embedding-3-small": "",
+}
+
+# Task sentences for the templated qwen3 instruction. English, per the model
+# card ("instructions in English"). One entry per USE so the retrieval task
+# the model is told to solve matches the actual query:
+#   kg_search       — KG / documentation retrieval (hybrid_search, kg-search)
+#   hook_injection  — the pre-edit/pre-bash hook's context query
+#   code_nl         — natural-language → code (search_code_graph, CLI)
+#   code_similarity — code → code ("find similar")
+QUERY_TASKS: dict[str, str] = {
+    "kg_search": (
+        "Given a knowledge-graph or documentation search query, retrieve "
+        "relevant passages that answer the query"
+    ),
+    "hook_injection": (
+        "Given the current code-editing context, retrieve relevant project "
+        "knowledge that helps with it"
+    ),
+    "code_nl": (
+        "Given a natural language description of code, retrieve relevant "
+        "code that matches it"
+    ),
+    "code_similarity": (
+        "Given a code snippet, retrieve relevant code similar to it"
+    ),
+}
+
+#: Default task key when a caller names none (KG/docs search).
+QUERY_TASK_DEFAULT: str = "kg_search"
+
+#: Default task key for the CODE side (the code-embed service + code queries).
+QUERY_TASK_DEFAULT_CODE: str = "code_nl"
+
+#: Task key for code → code ("find similar") queries. READER: the code-graph
+#: CLI's ``similar`` subcommand (``templates/scripts/query_code_graph.py::
+#: find_similar``), which embeds the reference entity's body as a query in the
+#: code space with this wording. Kept as a constant so the key lives once.
+QUERY_TASK_CODE_SIMILARITY: str = "code_similarity"
+
+
+def query_prefix_for_model(model_name: str, task: "str | None" = None) -> str:
+    """Return the QUERY-side instruction prefix for ``model_name`` ('' = none).
+
+    ``task`` is a QUERY_TASKS key (unknown/None → ``QUERY_TASK_DEFAULT``); it
+    is only substituted into TEMPLATED prefixes (qwen3), and ignored by
+    literal / empty ones.
+
+    Match rule (CHOSEN, not incidental — v0.2.101 review N-4): the SAME
+    partial-match rule as ``_num_ctx_for_model`` — exact, then ``key in
+    model_name``, then ``model_name in key``. The both-ways rule is what lets a
+    bare tag (``"arctic"``) or a tagged variant (``"qwen3-embedding:0.6b"``)
+    resolve to its base entry, and keeping it identical to the num_ctx
+    resolver means the window and the prefix for one model can never disagree.
+    The accepted cost of inheriting it: a pathological name that is itself a
+    SUBSTRING of a table key (e.g. ``"q"`` ⊂ ``"qwen3-embedding"``) would pick
+    up that key's prefix. Real embedding-model ids are never that short, and
+    the instruction-free models are listed EXPLICITLY with ``""`` so a partial
+    match can only ever select a real model's value — never invent one. An
+    unmatched model returns ``""`` — conservative: never prepend an
+    instruction to a model whose card did not ask for one.
+    """
+    template = MODEL_QUERY_PREFIXES.get(model_name)
+    if template is None:
+        for key, val in MODEL_QUERY_PREFIXES.items():
+            if key in model_name or model_name in key:
+                template = val
+                break
+    if not template:
+        return ""
+    if "{task}" in template:
+        task_sentence = QUERY_TASKS.get(
+            task or QUERY_TASK_DEFAULT, QUERY_TASKS[QUERY_TASK_DEFAULT]
+        )
+        return template.format(task=task_sentence)
+    return template
 
 # Chunker revision sentinel. Bumped whenever MODEL_TOKEN_LIMITS or
 # CHUNKING_PRESETS change in a way that produces different chunk
@@ -377,11 +492,11 @@ _CHUNKER_REVISION: str = "v0.2.92.1"
 # without spilling into a hard truncate.
 #
 # v0.2.47 RL-7.5 tunings (user-locked 2026-06-04):
-#   * xsmall_context: (170, 400, 330)        ~512  num_ctx (granite-embedding)
-#   * small_context:  (550, 1600, 1100)      ~2k   num_ctx (jina, codesage, embeddinggemma;
+#   * xsmall_context: (170, 400, 330)        ~512  num_ctx (smallest model class)
+#   * small_context:  (550, 1600, 1100)      ~2k   num_ctx (jina, codesage;
 #                                                codesage @ 1 024 num_ctx clamps to (550, 921, 921))
 #   * medium_context: (1100, 3200, 2500)     ~4k   num_ctx (arctic2)
-#   * large_context:  (2200, 6400, 4600)     ~8k   num_ctx (openai, bge-m3)
+#   * large_context:  (2200, 6400, 4600)     ~8k   num_ctx (openai)
 #   * xlarge_context: (4600, 13500, 9500)    ~16k+ num_ctx (qwen3-embedding @ 10k)
 #
 # v0.2.92 (D16 + R39): these are the RAW tier shapes; what the resolvers

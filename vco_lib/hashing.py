@@ -42,6 +42,22 @@ def sha256_file(path: Path, chunk_size: int = 65536) -> str:
     return h.hexdigest()
 
 
+def sha256_file_or_empty(path: Path) -> str:
+    """``sha256_file`` that returns ``""`` when the file is missing/unreadable.
+
+    The bundle engine's compare helper: callers read ``""`` as "no installed
+    copy to compare", while :func:`sha256_file` keeps raising for everyone
+    else. Extracted from ``vco_lib.project_init._file_sha256`` (v0.2.101 — the
+    engine module is line-ratchet-capped and this is a hashing concern).
+    """
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        return sha256_file(path)
+    except OSError:
+        return ""
+
+
 def sha256_bytes(data: bytes) -> str:
     """Return the hex SHA-256 digest of ``data``."""
     return hashlib.sha256(data).hexdigest()

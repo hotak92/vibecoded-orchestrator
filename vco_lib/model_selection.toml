@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# The per-task model-selection grid, rendered into the shipped CLAUDE.md
+# templates as {{MODEL_SELECTION_GRID}} by vco_lib/model_selection.py.
+#
+# The content (scores, `*`/`†` markers, row order, reach-via agents, notes)
+# is copied from the maintainer's "Model selection — which model for which
+# task" grid (2026-10-03, re-scored at medium effort the same day). Scores
+# are copied EXACTLY and are pinned by tests/test_model_selection_grid.py —
+# edit both together.
+#
+# `reach_via` names only agents that SHIP in templates/agents/: the gateway
+# rows name the templates/agents/module-gateway/*.md agents that pin that
+# model, the Claude rows name the `model:` value to dispatch with.
+#
+# `providers` names who can SERVE the row: "anthropic" rows always render;
+# a vendor row renders when the model gateway can resolve that vendor's key
+# at render time (vco_lib/model_selection.py). GLM-5.3 is served by BOTH
+# vendors (z.ai's own endpoint and the QwenCloud Token Plan both list it);
+# GLM-5.3-Flash by z.ai only; the DeepSeek and Qwen rows by the qwen vendor
+# only.
+#
+# A score is "1".."10" within this set, AT MEDIUM EFFORT. "*" marks an
+# assumed score (no benchmark and fewer than 3 comparison reports), "†"
+# (the `dagger` flag) marks a model with only xhigh/max benchmark results
+# (no medium/high data) — weaker evidence — and "—" marks a column the
+# model cannot do at all (text-only).
+
+format_version = 1
+
+# Table columns, in order. Pinned against the source grid by the test.
+columns = [
+  "Code", "Debug", "Review", "Plan", "Bulk", "Tools", "Instr", "LongCtx",
+  "Docs", "Vision", "Cost",
+]
+
+# The rendered section intro (2-3 lines).
+intro = [
+  "Delegate to subagents and **always name the model** — the gateway agents below pin it in their own file, so dispatch them without a `model` param; for the Claude rows, name the model on the Agent call (`model: opus` and so on).",
+  "Scores are 1–10 within this set, **at medium effort** (what this setup runs), from effort-matched benchmarks, vendor model cards and head-to-head user comparisons. **`*`** = assumed (no benchmark and fewer than 3 comparison reports); **`†`** = this model has only xhigh/max benchmark results (no medium/high data) — weaker evidence.",
+  "Only the rows for model providers reachable on this machine at render time are listed — add a vendor key in the launcher's Secrets panel and re-run the update to add its rows.",
+]
+
+# The column legend, rendered after the table.
+column_legend = "Columns: Code = agentic multi-file implementation · Debug = debugging & hard reasoning · Review = code review / critique · Plan = planning & architecture · Bulk = mechanical sweeps / classification · Tools = tool calls & terminal work · Instr = instruction following / format · LongCtx = long-context retrieval · Docs = writing & research synthesis · Vision = image input (— = text-only) · Cost = cheapness × speed at medium effort (10 = cheapest/fastest)."
+
+# Notes that are NOT tied to one model: the grid's own evidence-quality and
+# maintenance caveats. They render whenever the grid renders (after the
+# per-model notes, inside the same "What changes the pick:" list).
+general_notes = [
+  "No benchmark measures code review for these versions; that column leans on user comparison reports.",
+  "Re-check a row when that model's minor version changes — scores are tied to the exact versions above.",
+]
+
+[[row]]
+id = "opus"
+model = "Opus 5.5"
+reach_via = "model: opus"
+providers = ["anthropic"]
+scores = ["10", "10", "9", "9", "5", "10", "8*", "10", "9", "10", "4"]
+
+[[row]]
+id = "fable"
+model = "Fable 5.1"
+reach_via = "model: fable"
+providers = ["anthropic"]
+scores = ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"]
+
+[[row]]
+id = "glm-5.3"
+model = "GLM-5.3"
+dagger = true
+reach_via = "glm-implementer / glm-reviewer / glm-planner"
+providers = ["zai", "qwen"]
+scores = ["7", "6", "7", "6", "6", "6", "7*", "7", "7", "—", "8"]
+
+[[row]]
+id = "deepseek-v4.1-flash"
+model = "DeepSeek V4.1 Flash"
+reach_via = "deepseek-researcher / deepseek-implementer"
+providers = ["qwen"]
+scores = ["7", "6", "6", "6", "9", "6", "7*", "8", "6", "7", "10"]
+
+[[row]]
+id = "sonnet"
+model = "Sonnet 5.5"
+reach_via = "model: sonnet"
+providers = ["anthropic"]
+scores = ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"]
+
+[[row]]
+id = "qwen3.8-max"
+model = "Qwen3.8-Max"
+dagger = true
+reach_via = "qwen-implementer"
+providers = ["qwen"]
+scores = ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"]
+
+[[row]]
+id = "glm-5.3-flash"
+model = "GLM-5.3-Flash"
+dagger = true
+reach_via = "glm-flash-researcher"
+providers = ["zai"]
+scores = ["5", "5", "5", "5", "8", "5", "6*", "7", "6*", "8", "8"]
+
+[[row]]
+id = "qwen3.8-flash"
+model = "Qwen3.8-Flash"
+dagger = true
+reach_via = "qwen-flash-sweeper"
+providers = ["qwen"]
+scores = ["5*", "4", "4*", "4*", "7", "4", "8*", "7", "5*", "7", "9"]
+
+[[row]]
+id = "haiku"
+model = "Haiku 4.5"
+reach_via = "model: haiku"
+providers = ["anthropic"]
+scores = ["2", "2", "2*", "2", "5", "3", "5", "5", "2*", "4", "7"]
+
+# Per-model notes, rendered (in file order) only when at least one of
+# `models` rendered. `models` entries are row `id`s. The source grid's one
+# combined GLM bullet is split per model here so the Flash guidance never
+# renders for a table that lacks the Flash row.
+[[note]]
+models = ["opus"]
+text = "**Opus 5.5** leads at medium on almost every axis and costs less per task than Fable 5.1 (≈$1.3 vs ≈$3.0); keep Fable for final reviews, plans and the hardest debugging."
+
+[[note]]
+models = ["sonnet"]
+text = "**Sonnet 5.5** is the most effort-sensitive model: near Opus at max, but at medium it trails GLM-5.3 and DeepSeek V4.1 Flash on coding. Not a default choice."
+
+[[note]]
+models = ["deepseek-v4.1-flash"]
+text = "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s to first token) and cheapest per task: default for research, surveys, bulk and bounded implementation. Users report fragile tool calls / loops on long runs — keep tasks bounded."
+
+[[note]]
+models = ["glm-5.3"]
+text = "**GLM-5.3** — the non-Claude model users route review/audit to; text-only."
+
+[[note]]
+models = ["glm-5.3-flash"]
+text = "**GLM-5.3-Flash** suits bulk / first-pass work behind a verifier — tests, a diff review or a stronger second pass; retries help it, more effort does not (longer runs helped it only 46% of the time, below chance). Keep it off shared-component extractions, where one un-migrated call-site leaves the suite green while defeating the change, and never give it unsupervised writes to a green test suite (it broke a passing baseline test in 6.9% of rollouts)."
+
+[[note]]
+models = ["qwen3.8-max"]
+text = "**Qwen3.8-Max** — best prose and literal instruction-following, but it defaults to xhigh effort (≈$5.4 per task there) and users report it leaves work half-done and skips tests unless asked: state \"add tests and run them\"."

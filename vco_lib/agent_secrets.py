@@ -93,6 +93,7 @@ __all__ = [
     "lookup_stored",
     "ProjectNotFound",
     "SecretNotFound",
+    "SecretPaused",
     "exec_with_secrets",
     "get",
 ]
@@ -134,16 +135,37 @@ class KeychainLocked(ResolverError):
 class AccessDenied(ResolverError):
     """The hub knows of no ACTIVE binding of this key for this project.
 
-    Hub error code ``key_not_active``: the secret is paused in the
-    launcher GUI, or no installed module / shared slot declares it for
-    this project. The hub response does not distinguish the two cases
-    (live-verified 2026-06-11), so :func:`get` still consults the file
-    store on this error — the launcher gate governs keychain-managed
-    slots, not the independent ``~/.vct-secrets`` file store. This
-    exception surfaces only when the file store AND the project
-    ``.env`` (tier 3) ALSO have no copy (or fallback is disabled). Fix
-    in the launcher's SecretsPanel, ``vct set``, or the project's own
-    ``.env``.
+    Hub error code ``key_not_active``: no installed module / shared slot
+    declares the key for this project, it is not granted, or (pre-v0.2.101
+    hubs only) it is paused — a hub that old cannot distinguish the cases.
+    :func:`get` still consults the file store on this error — the launcher
+    gate governs keychain-managed slots, not the independent
+    ``~/.vct-secrets`` file store. This exception surfaces only when the
+    file store AND the project ``.env`` (tier 3) ALSO have no copy (or
+    fallback is disabled). Fix in the launcher's SecretsPanel, ``vct set``,
+    or the project's own ``.env``.
+    """
+
+
+class SecretPaused(AccessDenied):
+    """The key EXISTS but is paused for this requester (v0.2.101).
+
+    Hub error code ``key_paused`` (404 — same status as ``key_not_active``,
+    distinct code): the key is declared in a bucket that would serve this
+    requester, and the per-(scope, key, requester) active flag is off. The
+    hub names neither the value nor the scope, and neither does this
+    exception.
+
+    A SUBCLASS of :class:`AccessDenied` so every existing
+    ``except AccessDenied`` caller keeps catching it unchanged; the
+    distinct type exists for the callers that must NOT treat a pause as
+    an absence — :func:`vco_lib.openai_key.migrate_dotenv_openai_key`
+    must not re-copy a paused key into the shared file store (audit
+    P3-1). :func:`get` still consults the file store (tier 2) and the
+    project ``.env`` (tier 3) on this error, exactly as for
+    ``key_not_active``: those stores are independent of the launcher's
+    active flag, so the resolver chain's behaviour is unchanged — only
+    the classification of a full-chain miss is sharper.
     """
 
 
@@ -411,6 +433,18 @@ def _hub_get(key: str, project: Optional[str]) -> str:
             code = None
         if code == "project_not_found":
             raise ProjectNotFound(f"project {pid} not found in launcher.db")
+        if code == "key_paused":
+            # v0.2.101 (Q7 / audit P3-1): the key exists but its
+            # per-(scope, key, requester) active flag is off. Distinct from
+            # key_not_active so writers can refuse to "fix" a pause by
+            # storing a second copy. Still a 404 — same family as
+            # key_not_active, and a 403 on this route means the
+            # scoped-token boundary, not a pause.
+            raise SecretPaused(
+                f"key {key!r} exists but is paused for project {pid} "
+                "(resume it in the launcher's Secrets panel; the value is "
+                "not served while paused)"
+            )
         if code == "key_not_active":
             raise AccessDenied(
                 f"key {key!r} not active for project {pid} "
@@ -463,8 +497,14 @@ def get(
     Raises:
         SecretNotFound: key resolves nowhere (all tiers consulted).
         AccessDenied: the hub has no active binding for the key
-            (paused / undeclared — the hub doesn't distinguish) AND
-            tiers 2 + 3 have no copy either (or fallback is disabled).
+            (undeclared / not granted; pre-v0.2.101 hubs also answer this
+            for a pause) AND tiers 2 + 3 have no copy either (or fallback
+            is disabled).
+        SecretPaused: subclass of :class:`AccessDenied` — the key EXISTS
+            but is paused for this requester (v0.2.101 ``key_paused``) AND
+            tiers 2 + 3 have no copy either. Same fallthrough semantics;
+            raised as the distinct type so callers can tell a deliberate
+            pause from an absence.
         HubUnreachable: hub down AND fallback disabled.
         ProjectNotFound: project unknown AND fallback disabled.
         Forbidden: hub refused the bearer on /env (403 — scoped-token
@@ -513,11 +553,16 @@ def get(
         KeychainLocked,
     ) as exc:
         # AccessDenied (key_not_active) intentionally falls through to
-        # the file store: the hub can't tell "explicitly paused" from
-        # "never declared" (live-verified 2026-06-11), and hard-failing
-        # here would strand every user-managed file-store key whenever
-        # the launcher is running. The launcher gate governs keychain
-        # slots; ~/.vct-secrets is an independent store.
+        # the file store: an undeclared key and — pre-v0.2.101 hubs — a
+        # paused one read the same here, and hard-failing would strand
+        # every user-managed file-store key whenever the launcher is
+        # running. v0.2.101: SecretPaused (key_paused, the distinct
+        # exists-but-paused answer) falls through TOO, deliberately —
+        # the file store and the project .env are independent of the
+        # launcher's active flag, so the resolver chain's behaviour is
+        # byte-identical; only the classification of a full-chain miss
+        # is sharper. The launcher gate governs keychain slots;
+        # ~/.vct-secrets is an independent store.
         #
         # v0.2.77 L3-F3: Forbidden (403) ALSO falls through to the file
         # store — for SECRETS the file store is a legitimate independent
@@ -590,10 +635,13 @@ def get(
 STORED_KEYCHAIN = "keychain"      # tier 1 answered with a value
 STORED_FILE = "file_store"        # tier 2 held it
 STORED_ABSENT = "absent"          # the hub answered "not stored" and tier 2 missed
+STORED_PAUSED = "paused"          # the hub answered key_paused: the key EXISTS but
+                                  # its active flag is off (v0.2.101) and tier 2
+                                  # missed — a writer must NOT store a copy
 STORED_HUB_DOWN = "hub_down"      # the hub could not be asked (or knows no such
                                   # project) and tier 2 missed
 STORED_UNKNOWN = "unknown"        # the hub refused / could not read the keychain
-                                  # (paused key, 403, locked) and tier 2 missed
+                                  # (403, locked) and tier 2 missed
 
 
 def lookup_stored(key: str, *, project: Optional[str] = None) -> tuple[str, Optional[str]]:
@@ -604,13 +652,17 @@ def lookup_stored(key: str, *, project: Optional[str] = None) -> tuple[str, Opti
 
     ``value`` is set only for :data:`STORED_KEYCHAIN` / :data:`STORED_FILE`.
     The miss states tell a writer what it may do: ``absent`` (the hub
-    answered — nothing stored there), ``hub_down`` (no hub answer), and
-    ``unknown`` (the hub answered but could not say — a paused key reads
-    the same as an undeclared one, so it must not be overwritten). Never
-    raises; the value is never logged."""
+    answered — nothing stored there), ``paused`` (the hub answered
+    :data:`STORED_PAUSED` — the key exists but is paused, so storing a
+    copy would shadow a deliberate pause), ``hub_down`` (no hub answer),
+    and ``unknown`` (the hub answered but could not say — a 403 or locked
+    keychain reads the same as an undeclared one, so it must not be
+    overwritten). Never raises; the value is never logged."""
     state = STORED_UNKNOWN
     try:
         return STORED_KEYCHAIN, _hub_get(key, project)
+    except SecretPaused:
+        state = STORED_PAUSED
     except SecretNotFound:
         state = STORED_ABSENT
     except (HubUnreachable, ProjectNotFound):

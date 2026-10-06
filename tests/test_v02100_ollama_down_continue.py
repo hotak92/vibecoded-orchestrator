@@ -152,6 +152,20 @@ def down_env(monkeypatch):
     monkeypatch.setitem(install._SERVICE_ENDPOINTS, "rows",
                         {"ollama": _row(mode="adopted_container", name="their_ollama")})
     monkeypatch.setitem(install._SERVICE_ENDPOINTS, "weaviate_pending", False)
+    # FIX AT THE SOURCE (v0.2.101 lane 2A follow-up; the leak is documented
+    # in test_install_ci10_seed_diff_gate.py::_isolate_service_endpoints):
+    # the down path makes INSTALL'S OWN code set `ollama_owed` inside the
+    # module-global dict, and no monkeypatch tracks a key the test did not
+    # set itself — so this file used to leak the flag into every later test
+    # in the process, and any sibling calling `install._seed_weaviate`
+    # short-circuited ("Skipping the KG seed: Ollama is down"). Measured:
+    # 8 reds in a full affected-batch run (test_v0244_adversarial_fixes,
+    # test_v0244_prune_runs_on_partial_sync, RepairTriggerTests ×6), all
+    # green standalone. The setitem pre-binds the key so monkeypatch
+    # records the prior state (ABSENT included) and deletes it at teardown;
+    # the down path then overwrites the value with True, which is exactly
+    # what the test asserts below.
+    monkeypatch.setitem(install._SERVICE_ENDPOINTS, "ollama_owed", False)
     planned = []
     monkeypatch.setattr(install._embedding_pull_plan, "plan_for_install",
                         lambda *a, **k: planned.append(1) or PullPlan(embedding=(QWEN,), inference=()))

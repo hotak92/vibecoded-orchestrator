@@ -970,6 +970,109 @@ pub fn resolve_active_user_secret_pairs_for_requester_with_degraded(
     (out, degraded)
 }
 
+/// v0.2.101 (Q7 / audit P3-1): does `key` EXIST in one of the requester's
+/// user-declared buckets yet resolve as INACTIVE for `requester_project_id`?
+///
+/// This is the "paused vs absent" discriminator the hub's keyed `/env` miss
+/// branch calls so it can answer `key_paused` instead of `key_not_active`.
+/// Bucket table and order MUST MATCH
+/// [`resolve_active_user_secret_pairs_for_requester_with_degraded`]:
+/// per_project → shared → global, first bucket CONTAINING the key decides
+/// (the same shadowing rule resolution uses), each gated on
+/// [`is_secret_active_cross_launcher_for_requester`] so the classification
+/// agrees with what resolution would actually serve (sibling launchers'
+/// pause opinions included; an own-DB read error denies, exactly like the
+/// serving gate).
+///
+/// Semantics:
+///   * key declared in a bucket AND inactive for this requester → `true`
+///     (the flag is the ONLY reason it did not resolve — an active key with
+///     an empty/missing keychain value is NOT paused, and returns `false`
+///     so the hub keeps the honest `key_not_active` "nothing servable").
+///   * first-bucket-wins shadowing, exactly as resolution serves it: the
+///     FIRST bucket that declares the key decides, even when a later
+///     bucket also declares it (review N1) — so a key declared ACTIVE in
+///     per_project and PAUSED in shared answers "not paused" (resuming the
+///     shared copy would still be shadowed by the per-project one).
+///   * GAP-2 mirror: when the requester set `shared_secrets_read_disabled`,
+///     the shared bucket is not consulted at all — a policy-wide opt-out is
+///     not a pause, and the miss must keep the historical classification.
+///     per_project and global are ALWAYS consulted (review B1: the global
+///     leg must run in the default, shared-enabled case too, matching
+///     `resolve_active_user_secret_pairs_for_requester_with_degraded`,
+///     which consults global unconditionally).
+///   * key declared nowhere → `false` (genuinely absent / not granted).
+///
+/// Privacy: only the REQUESTER's own buckets are enumerated — never another
+/// project's per-project bucket (a key merely granted, or not even that,
+/// stays `key_not_active`) — and the answer is a bare boolean: no value, no
+/// scope, no keychain read ever happens here.
+pub fn user_secret_paused_for_requester(
+    own_db: &Db,
+    project_id: &str,
+    requester_project_id: &str,
+    key: &str,
+) -> bool {
+    /// `None` — the bucket does not declare the key; the walk continues.
+    /// `Some(paused)` — the bucket declares the key, so IT decides (the
+    /// first-bucket-wins rule above).
+    fn bucket_decision(
+        own_db: &Db,
+        declared: &[String],
+        key: &str,
+        scope_str: &str,
+        slot_project_id: &str,
+        requester_project_id: &str,
+    ) -> Option<bool> {
+        if !declared.iter().any(|k| k == key) {
+            return None;
+        }
+        Some(!is_secret_active_cross_launcher_for_requester(
+            own_db,
+            scope_str,
+            slot_project_id,
+            "user",
+            key,
+            requester_project_id,
+        ))
+    }
+
+    if let Some(paused) = bucket_decision(
+        own_db,
+        &own_db.list_user_secret_keys_for_project(project_id),
+        key,
+        "per_project",
+        project_id,
+        requester_project_id,
+    ) {
+        return paused;
+    }
+    if !crate::db::secret_scope_policy::shared_secrets_read_disabled(
+        own_db,
+        requester_project_id,
+    ) {
+        if let Some(paused) = bucket_decision(
+            own_db,
+            &own_db.list_shared_user_secret_keys(),
+            key,
+            "shared",
+            crate::secrets::SENTINEL_SHARED,
+            requester_project_id,
+        ) {
+            return paused;
+        }
+    }
+    bucket_decision(
+        own_db,
+        &own_db.list_global_user_secret_keys(),
+        key,
+        "global",
+        crate::secrets::SENTINEL_GLOBAL,
+        requester_project_id,
+    )
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,6 +1130,89 @@ mod tests {
         assert_eq!(other, vec!["OTHER_PROJECT_KEY".to_string()]);
         let none = db.list_user_secret_keys_for_project("p_nonexistent");
         assert!(none.is_empty());
+    }
+
+    /// v0.2.101 (Q7): `user_secret_paused_for_requester` — the paused-vs-
+    /// absent discriminator the hub's keyed `/env` miss branch calls.
+    #[test]
+    fn user_secret_paused_for_requester_distinguishes_paused_from_absent() {
+        let db = Db::open_in_memory().unwrap();
+        // Declared per-project key, paused for its own requester → paused.
+        db.mark_secret_inactive_for_requester("per_project", "p1", "user", "K", "p1")
+            .unwrap();
+        assert!(user_secret_paused_for_requester(&db, "p1", "p1", "K"));
+        // Never declared → not paused (genuinely absent).
+        assert!(!user_secret_paused_for_requester(&db, "p1", "p1", "NEVER_DECLARED"));
+        // Declared and ACTIVE (an empty keychain value, not a pause) → not
+        // paused — the hub keeps the honest key_not_active.
+        db.mark_secret_active("per_project", "p1", "user", "ACTIVE_KEY").unwrap();
+        assert!(!user_secret_paused_for_requester(&db, "p1", "p1", "ACTIVE_KEY"));
+    }
+
+    /// v0.2.101 (Q7): a SHARED key paused for ONE requester is paused for
+    /// that requester only — the per-(secret × requester) contract.
+    #[test]
+    fn user_secret_paused_for_requester_honours_per_requester_shared_pause() {
+        let db = Db::open_in_memory().unwrap();
+        db.mark_secret_active("shared", "_user_shared_", "user", "SHARED_K").unwrap();
+        db.mark_secret_inactive_for_requester(
+            "shared", "_user_shared_", "user", "SHARED_K", "pB",
+        )
+        .unwrap();
+        assert!(user_secret_paused_for_requester(&db, "pB", "pB", "SHARED_K"));
+        assert!(!user_secret_paused_for_requester(&db, "pA", "pA", "SHARED_K"));
+    }
+
+    /// v0.2.101 (Q7): another project's per-project key is invisible here —
+    /// no existence leak across the project boundary.
+    #[test]
+    fn user_secret_paused_for_requester_never_sees_another_projects_bucket() {
+        let db = Db::open_in_memory().unwrap();
+        db.mark_secret_inactive_for_requester("per_project", "pOther", "user", "K", "pOther")
+            .unwrap();
+        assert!(!user_secret_paused_for_requester(&db, "p1", "p1", "K"));
+    }
+
+    /// v0.2.101 (Q7, review B1): the GLOBAL user bucket (SecretsPanel
+    /// "Global (this machine)") is consulted in the DEFAULT case too —
+    /// shared reads enabled must not shadow the global leg. A global key
+    /// paused for this requester classifies as paused.
+    #[test]
+    fn user_secret_paused_for_requester_consults_the_global_bucket_by_default() {
+        let db = Db::open_in_memory().unwrap();
+        db.mark_secret_active("global", "_global_", "user", "GLOBAL_K").unwrap();
+        db.mark_secret_inactive_for_requester("global", "_global_", "user", "GLOBAL_K", "p1")
+            .unwrap();
+        // Shared reads ENABLED (the default — no policy row) and the key is
+        // not declared in shared: the walk must fall through to global.
+        assert!(user_secret_paused_for_requester(&db, "p1", "p1", "GLOBAL_K"));
+        // And for a requester it was NOT paused for, global says active.
+        assert!(!user_secret_paused_for_requester(&db, "p2", "p2", "GLOBAL_K"));
+    }
+
+    /// v0.2.101 (Q7, review N1): first-bucket-wins shadowing, matching the
+    /// serving resolution — the first bucket CONTAINING the key decides,
+    /// even when a later bucket holds a pause.
+    #[test]
+    fn user_secret_paused_for_requester_first_declared_bucket_decides() {
+        let db = Db::open_in_memory().unwrap();
+        // per_project declares the key (active — e.g. an empty keychain
+        // value), shared ALSO declares it paused: per_project decides →
+        // NOT paused (resuming the shared copy would still be shadowed).
+        db.mark_secret_active("per_project", "p1", "user", "SHADOWED_K").unwrap();
+        db.mark_secret_inactive_for_requester(
+            "shared", "_user_shared_", "user", "SHADOWED_K", "p1",
+        )
+        .unwrap();
+        assert!(!user_secret_paused_for_requester(&db, "p1", "p1", "SHADOWED_K"));
+        // Mirror: shared declares it ACTIVE, global declares it PAUSED —
+        // shared decides → not paused.
+        db.mark_secret_active("shared", "_user_shared_", "user", "SHADOW_BY_SHARED").unwrap();
+        db.mark_secret_inactive_for_requester(
+            "global", "_global_", "user", "SHADOW_BY_SHARED", "p1",
+        )
+        .unwrap();
+        assert!(!user_secret_paused_for_requester(&db, "p1", "p1", "SHADOW_BY_SHARED"));
     }
 
     /// Order invariant: keys come back ASCII-sorted so env-surface diffs

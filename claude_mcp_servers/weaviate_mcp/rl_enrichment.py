@@ -3053,16 +3053,26 @@ async def _resolve_dual_rl_log_inputs(
     *,
     embed_budget_s: "float | None" = None,
     task_type: str = "",
+    query_task: "str | None" = None,
 ) -> "dict | None":
     """Resolve the OTHER-slot inputs for the dual-log fan-out (v0.2.71 Sweep-C).
 
     Returns a dict ``{other_slot, other_source, other_dim, other_model,
     other_query_emb}`` when dual-log is on AND a single distinct OTHER text slot
     is resolvable, else None (caller does the bare single-log path). The OTHER
-    slot is whatever ``embed_text_all_configured(query)`` returns that is NOT the
-    active slot — so the second query vector comes from the SAME canonical embed
-    fan-out the dual-WRITE path uses (no third embed implementation). The other
-    slot's (source, model, dim) is derived via the EmbeddingService slot maps.
+    slot is whatever ``embed_text_query_all_configured(query)`` returns that is
+    NOT the active slot — the QUERY-side fan-out (v0.2.101), so each slot's
+    vector carries THAT model's query prefix. Before v0.2.101 this used the
+    DOCUMENT fan-out, so the logged ``other_query_emb`` was unprefixed while a
+    retrieval in that slot is prefixed — RL training data diverged from
+    inference (caller audit Gap 1). The other slot's (source, model, dim) is
+    derived via the EmbeddingService slot maps.
+
+    ``query_task`` (v0.2.101) is the ``chunking.QUERY_TASKS`` key of the search
+    that produced this event (``kg_search`` for the MCP/CLI tools,
+    ``hook_injection`` for the pre-edit/pre-bash hooks); ``None`` →
+    ``QUERY_TASK_DEFAULT``. It must match the task the retrieval vector used so
+    the twin is the same vector a retrieval in that slot would log.
 
     Soft-fail: any resolver error → None (no dual-log this call), never raises.
 
@@ -3103,12 +3113,21 @@ async def _resolve_dual_rl_log_inputs(
         if svc is None:
             _record_dual_skip("no_embedding_service", task_type)
             return None
-        # embed_text_all_configured returns the secondary slots (only when
-        # dual-write is on — already guaranteed by the gate). W5R-07: the
-        # caller already holds the ACTIVE vector, so the active slot is NOT
-        # re-embedded (include_active=False) — on the 1 s hook budget that
-        # second active embed was pure waste.
-        _embed = functools.partial(svc.embed_text_all_configured, include_active=False)
+        # v0.2.101 (caller audit Gap 1): the QUERY-side fan-out, so each
+        # secondary slot's vector carries THAT model's query prefix + the same
+        # task wording as the search that produced this event. The document
+        # fan-out used here before logged an unprefixed twin query while
+        # retrieval is prefixed — training data diverged from inference.
+        # W5R-07: the caller already holds the ACTIVE vector, so the active
+        # slot is NOT re-embedded (include_active=False) — on the 1 s hook
+        # budget that second active embed was pure waste.
+        from claude_mcp_servers.weaviate_mcp.chunking import QUERY_TASK_DEFAULT
+
+        _embed = functools.partial(
+            svc.embed_text_query_all_configured,
+            include_active=False,
+            task=query_task or QUERY_TASK_DEFAULT,
+        )
         if embed_budget_s is None:
             slots = await asyncio.to_thread(_embed, query)
         else:
@@ -3236,6 +3255,7 @@ async def resolve_and_enrich_dual(
     embed_budget_s: "float | None" = None,
     backfill_other: bool = True,
     task_type: str = "",
+    query_task: "str | None" = None,
 ) -> "dict | None":
     """THE one home for "resolve the dual-RL-log inputs, then enrich" (v0.2.100 F1).
 
@@ -3255,13 +3275,23 @@ async def resolve_and_enrich_dual(
     Returns the dual-inputs dict (thread it into ``RerankRequest`` via
     ``search_pipeline.dual_log_request_fields``) or None for the single-log path.
 
+    ``query_task`` (v0.2.101) is the ``chunking.QUERY_TASKS`` key of THIS
+    search — it must match the task the retrieval query vector used, so the
+    twin query vector equals what a retrieval in that slot would produce. The
+    MCP/CLI tools default to ``kg_search`` (matching ``_get_search_vector``'s
+    default); the hook passes ``hook_injection``.
+
     Hook/CLI callers pass ``embed_budget_s`` (≈1 s) and ``backfill_other=False``:
     the lazy other-slot backfill re-embeds whole nodes and must never run on a
     latency-bounded hook. Enrichment failure is soft (DEBUG) — it never breaks
     the user-facing search.
     """
     dual = await server._resolve_dual_rl_log_inputs(
-        query, active_slot, embed_budget_s=embed_budget_s, task_type=task_type
+        query,
+        active_slot,
+        embed_budget_s=embed_budget_s,
+        task_type=task_type,
+        query_task=query_task,
     )
     try:
         server._rl_enrich_nodes_with_linked_embs(

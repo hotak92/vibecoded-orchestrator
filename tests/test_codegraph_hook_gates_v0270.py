@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""v0.2.70 Stream C2 — code-graph hook gate + shared-helper tests.
+"""v0.2.70 Stream C2 — code-graph hook gate retirement pins + shared helpers.
 
-The pre-bash code-symbol gate is the #1 risk of Stream C: too loose blows the
-latency budget on routine ls/cd/git; too tight re-creates the zero-injection
-bug. These tests drive the REAL `_lib/codegraph-query.sh` gate functions through
-bash and pin the positive AND negative cases (esp. the named negatives:
-`git log a.b.c`, `grep foo.bar`, bare dotted path, cd, ls).
+v0.2.101 Wave 2: the shell gate FUNCTIONS this file used to drive
+(`codegraph_bash_gate` / `codegraph_pattern_gate` / `codegraph_extract_symbol`
+in `_lib/codegraph-query.sh`) are RETIRED with their last legacy callers —
+the one home is `vco_lib/inject_intent.py`, driven by
+`hook_context_router.py`. The original positive/negative corpora (incl. the
+named risk cases: `git log a.b.c`, `grep foo.bar`, bare dotted path, cd, ls)
+live on against that one home in
+`tests/test_v02101_inject_intent_classifier.py` and
+`tests/test_p1e_codegraph_extract_symbol.py`.
 
-Also asserts the four code-graph surfaces all route through the SHARED helper
-(no inline duplication) and that the shared seen-store is consulted.
+What remains here: the RETIREMENT pins (no injection hook sources the shell
+gate lib; the pre-bash threshold/gate and the pre-tool-use Read/Grep
+branches cannot creep back), the post-file-edit resync delegation, the floor
+mirror note and the G5 analyzer worktree guard.
 """
 from __future__ import annotations
 
@@ -26,7 +32,6 @@ from tests.conftest import resolve_analyzer_python  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_DIR = REPO_ROOT / "templates" / "hooks" / "_lib"
-CG_SH = LIB_DIR / "codegraph-query.sh"
 HOOKS = REPO_ROOT / "templates" / "hooks"
 
 
@@ -72,138 +77,127 @@ def _drop_test_collections(class_names) -> None:
 pytestmark = pytest.mark.skipif(not _has_bash(), reason="bash required")
 
 
-def _gate(fn: str, arg: str) -> bool:
-    """Run a gate function from codegraph-query.sh; return True iff it fires (0)."""
-    # v0.2.84 (review T-2): prefer the venv-resolved interpreter, but these gate
-    # functions are PURE BASH (they never invoke `$PY`), so a plain system python3
-    # is a fine fallback — no weaviate needed, no skip.
-    py = resolve_analyzer_python() or shutil.which("python3") or "python3"
-    script = (
-        f'export PY="{py}"\n'
-        f'. "{CG_SH}"\n'
-        f'if {fn} {_q(arg)}; then echo FIRE; else echo SKIP; fi\n'
-    )
-    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
-    return "FIRE" in r.stdout
-
-
-def _q(s: str) -> str:
-    """Single-quote a bash argument safely."""
-    return "'" + s.replace("'", "'\\''") + "'"
-
-
 # --------------------------------------------------------------------------
-# codegraph_bash_gate — pre-bash surface (POSITIVES)
-# --------------------------------------------------------------------------
-@pytest.mark.parametrize("cmd", [
-    'grep -rn "migrate_collections" .',
-    'rg "OrderManager"',
-    'grep "def authenticate"',
-    'cat src/foo.py',
-    'rg foo_bar src/',
-])
-def test_bash_gate_fires_on_code_commands(cmd) -> None:
-    assert _gate("codegraph_bash_gate", cmd), f"gate should FIRE on: {cmd}"
-
-
-# --------------------------------------------------------------------------
-# codegraph_bash_gate — pre-bash surface (NEGATIVES — the named risk cases)
-# --------------------------------------------------------------------------
-@pytest.mark.parametrize("cmd", [
-    'ls -la',
-    'cd /tmp',
-    'git status',
-    'git log a.b.c',     # dotted ref, NOT a C file — must NOT fire
-    'cat notes.txt',
-    'grep foo.bar',      # dotted, but not an identifier — must NOT fire
-    'grep "TODO"',       # bare all-caps word — must NOT fire
-    'python -m pytest',
-    'echo hello',
-    'curl http://localhost',
-])
-def test_bash_gate_skips_routine_commands(cmd) -> None:
-    assert not _gate("codegraph_bash_gate", cmd), f"gate must SKIP on: {cmd}"
-
-
-# --------------------------------------------------------------------------
-# codegraph_pattern_gate — Grep surface
-# --------------------------------------------------------------------------
-@pytest.mark.parametrize("pat", [
-    'def authenticate',
-    'OrderManager',
-    'migrate_collections',
-    'foo(',
-])
-def test_pattern_gate_fires_on_symbols(pat) -> None:
-    assert _gate("codegraph_pattern_gate", pat), f"pattern gate should FIRE on: {pat}"
-
-
-@pytest.mark.parametrize("pat", [
-    'TODO',
-    'hello',
-    'foo.bar',
-])
-def test_pattern_gate_skips_non_symbols(pat) -> None:
-    assert not _gate("codegraph_pattern_gate", pat), f"pattern gate must SKIP on: {pat}"
-
-
-# --------------------------------------------------------------------------
-# codegraph_extract_symbol — query isolation
-# --------------------------------------------------------------------------
-def test_extract_symbol_isolates_token() -> None:
-    # v0.2.84 (review T-2): pure-bash extract fn (never uses `$PY`); venv-resolved
-    # interpreter preferred, system python3 an acceptable fallback (no weaviate).
-    py = resolve_analyzer_python() or shutil.which("python3") or "python3"
-    script = (
-        f'export PY="{py}"\n. "{CG_SH}"\n'
-        'echo "[$(codegraph_extract_symbol \'grep -rn "migrate_collections" .\')]"\n'
-        'echo "[$(codegraph_extract_symbol \'rg "OrderManager" src/\')]"\n'
-    )
-    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
-    assert "[migrate_collections]" in r.stdout, r.stdout
-    assert "[OrderManager]" in r.stdout, r.stdout
-
-
-# --------------------------------------------------------------------------
-# Shared-helper extraction (no duplication; all surfaces source it)
+# Gate retirement pins (v0.2.101 Wave 2) — the shell gate corpus tests that
+# lived here were retired WITH the gate functions; see the module docstring
+# for where the corpora live on.
 # --------------------------------------------------------------------------
 def test_surfaces_source_the_shared_codegraph_helper() -> None:
-    """pre-edit, pre-bash, pre-tool-use must SOURCE _lib/codegraph-query.sh —
-    no inline `code-graph-query search` outside the helper (except the
-    partial-install fallback branch)."""
-    for name in ("pre-edit-context-inject.sh", "pre-bash-context-inject.sh", "pre-tool-use.sh"):
+    """v0.2.01 injection redesign: NO injection hook sources
+    _lib/codegraph-query.sh any more — identifier/pattern gating, symbol
+    extraction and the exact-symbol lookups live in vco_lib/inject_intent,
+    driven by claude_mcp_servers/scripts/hook_context_router.py (one home).
+    This row pins the retirement for all three former consumers so a shell
+    side-gate cannot creep back beside the Python classifier (the class of
+    wrong-shape bug the P1e history documents). Behavioural pins:
+    test_v02101_pretool_use_read_branch_removed.py (Read/Grep branches),
+    test_v02101_router_surfaces.py + test_v02101_edit_query_rework.py
+    (bash/edit/write wrappers)."""
+    for name in ("pre-edit-context-inject.sh", "pre-bash-context-inject.sh",
+                 "pre-tool-use.sh"):
         body = (HOOKS / name).read_text(encoding="utf-8")
-        assert "_lib/codegraph-query.sh" in body, (
-            f"{name} must source _lib/codegraph-query.sh"
+        assert '. "$SCRIPT_DIR/_lib/codegraph-query.sh"' not in body, (
+            f"{name} must not source _lib/codegraph-query.sh — the router owns "
+            "code-graph querying now"
         )
 
 
 def test_surfaces_source_the_shared_seen_store() -> None:
-    """All injectors must source _lib/seen-store.sh so no surface bypasses
-    dedup."""
-    for name in ("pre-edit-context-inject.sh", "pre-bash-context-inject.sh", "pre-tool-use.sh"):
+    """Injectors that dedupe SHELL-SIDE must source _lib/seen-store.sh so no
+    surface bypasses dedup. v0.2.101: pre-bash-context-inject.sh became a thin
+    router wrapper — its dedupe is the ROUTER's (same seen-store files,
+    enforced in claude_mcp_servers/scripts/hook_context_router.py and pinned
+    by tests/test_v02101_inject_gates.py::TestSeenStoreParity) — so it no
+    longer sources the lib here. pre-tool-use keeps it for the reads ledger."""
+    for name in ("pre-edit-context-inject.sh", "pre-tool-use.sh"):
         body = (HOOKS / name).read_text(encoding="utf-8")
         assert "_lib/seen-store.sh" in body, f"{name} must source _lib/seen-store.sh"
 
 
 def test_prebash_codegraph_branch_gated_before_threshold() -> None:
-    """The pre-bash codegraph branch must run BEFORE the 500-char KG threshold
-    gate (so a short symbol command still injects codegraph)."""
+    """v0.2.101 §C1 RETIRED both mechanisms this row used to order: the
+    500-char threshold (VCT_BASH_KG_THRESHOLD_CHARS) and the inline
+    codegraph_bash_gate branch. pre-bash-context-inject.sh is now a thin
+    router wrapper — intent classification (READ/EDIT/SEARCH/MECHANICAL)
+    replaces the threshold, and the router's exact-symbol CG leg replaces the
+    gate (behavioural pins: tests/test_v02101_router_surfaces.py and
+    tests/test_v02101_inject_intent_classifier.py). This row pins the
+    retirement so the dead gates cannot creep back beside the classifier."""
     body = (HOOKS / "pre-bash-context-inject.sh").read_text(encoding="utf-8")
-    idx_gate = body.find("codegraph_bash_gate")
-    idx_threshold = body.find("Threshold gate")
-    assert idx_gate != -1 and idx_threshold != -1
-    assert idx_gate < idx_threshold, (
-        "the codegraph_bash_gate branch must precede the KG threshold gate"
-    )
+    assert "VCT_BASH_KG_THRESHOLD_CHARS=" not in body.replace(
+        "VCT_BASH_KG_THRESHOLD_CHARS — classification replaces it", ""), (
+        "the 500-char threshold knob must stay retired (classification owns the gate)")
+    assert "codegraph_bash_gate " not in body, (
+        "the inline codegraph_bash_gate branch must stay retired")
+
+
+def test_dead_injection_libs_stay_retired() -> None:
+    """v0.2.101 wave-2 review SF-2 (owner rule: retire dead shipped code
+    NOW, never wave-flag it): four helpers lost their last callers in the
+    router rework and are deleted, not parked —
+
+      * _lib/codegraph-query.{sh,ps1}   (whole lib: query_block + cli locator;
+        its header still claimed three sourcing hooks — a false promise)
+      * _lib/command-noise-strip.{sh,ps1} (the pre-bash query build was the
+        only consumer; queries come from targets/symbols now)
+      * vco_dual_search_cached / Invoke-VcoDualSearchCached (pre-edit was the
+        last caller; hook_dual_search.py itself LIVES — the router imports
+        its run_legs mechanism)
+      * vco_bash_write_prebash / Get-VcoBashWritePreBash (inject_intent uses
+        the Python prebash_query_parts directly; the shell delegator had
+        zero callers, tests included)
+
+    This row pins the absence so a partial re-add (or a bundle round-trip
+    resurrecting one flavour) goes red."""
+    lib = HOOKS / "_lib"
+    for name in ("codegraph-query.sh", "codegraph-query.ps1",
+                 "command-noise-strip.sh", "command-noise-strip.ps1",
+                 # wave-3 (review nit-6): pre-tool-use §5 was the last
+                 # consumer of the shell query cache — retired with it. The
+                 # §9 never-cache-empty contract lives in the router's
+                 # Python cache (test_v02101_query_cache_poison_fix.py).
+                 "query-cache.sh", "query-cache.ps1"):
+        assert not (lib / name).exists(), (
+            f"{name} must stay retired (zero live callers since v0.2.101)"
+        )
+    for name, dead, comment_prefix in (
+        ("bash-write-targets.sh", "vco_bash_write_prebash", "#"),
+        ("bash-write-targets.ps1", "Get-VcoBashWritePreBash", "#"),
+    ):
+        body = (lib / name).read_text(encoding="utf-8-sig")
+        # Executable lines only — the retirement NOTES name the functions on
+        # purpose (a tombstone comment is documentation, not a caller).
+        executable = "\n".join(
+            ln for ln in body.splitlines()
+            if not ln.lstrip().startswith((comment_prefix, "<#"))
+        )
+        assert dead not in executable, (
+            f"{name}: {dead} must stay retired — zero live callers"
+        )
+    # The router's in-process mechanism is the survivor: hook_dual_search.py
+    # must still exist (run_legs is the merged path now).
+    assert (REPO_ROOT / "claude_mcp_servers" / "scripts"
+            / "hook_dual_search.py").exists()
 
 
 def test_pretooluse_has_read_and_grep_codegraph_branches() -> None:
+    """v0.2.101 §C2/§C6: pre-tool-use's Read(code) and Grep(symbol) code-graph
+    injection branches are RETIRED — grep-context-inject.{sh,ps1} (router
+    surface `grep`) and read-context-inject.{sh,ps1} (PostToolUse Read) are
+    their one homes. This row pins the RETIREMENT so the dead branch cannot
+    creep back alongside the router hooks (double injection); the behavioural
+    proof (stub CLI never spawned, no envelope) lives in
+    tests/test_v02101_pretool_use_read_branch_removed.py."""
     body = (HOOKS / "pre-tool-use.sh").read_text(encoding="utf-8")
-    # Read(code) branch injects codegraph.
-    assert "_cg_inject" in body, "pre-tool-use must define the shared _cg_inject"
-    assert 'TOOL_NAME" == "Grep"' in body, "pre-tool-use must add a Grep branch"
-    assert "codegraph_pattern_gate" in body, "Grep branch must use codegraph_pattern_gate"
+    assert "_cg_inject" not in body, (
+        "the shared _cg_inject helper must stay retired — its callers are gone"
+    )
+    assert 'TOOL_NAME" == "Grep"' not in body, (
+        "the Grep injection branch must stay retired (grep-context-inject owns it)"
+    )
+    assert "codegraph_pattern_gate" not in body, (
+        "the identifier gate moved to vco_lib/inject_intent (router surface `grep`)"
+    )
 
 
 def test_post_file_edit_resync_fires_on_code_edit() -> None:

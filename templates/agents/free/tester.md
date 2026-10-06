@@ -1,18 +1,21 @@
 ---
 name: tester
-description: Writes and runs pytest unit, integration, edge-case, and security tests; verifies behavior against the spec; investigates test failures to root cause; and reviews coverage for gaps. Use proactively after code changes that need test coverage, when a test is failing or flaky, or to harden an under-tested module. Not for writing the feature code itself (use the coder agent) or pure code review with no tests (use the code-review-expert skill).
-short_desc: writes pytest, integration tests, coverage review
+description: Writes and runs unit, integration, edge-case and security tests; root-causes failing or flaky tests; reviews coverage gaps. Use proactively after code changes that need coverage. Not feature code (expert-coder) or review (code-reviewer).
+short_desc: writes tests, investigates failures, coverage review
 keywords: [pytest, "test coverage", "unit test", "integration test", "edge case", "regression test", "flaky test", "failing test first", "write tests", "add tests", "test suite", "coverage gap"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: medium
-skills:
-  - code-review-expert
+disallowedTools: mcp__vct-coordination__*
 ---
 
 # Testing Agent
 
 Create comprehensive tests, analyze failures, verify behavior matches specifications.
+
+**Model guidance**: `sonnet` by default; dispatch on `haiku` for mechanical test sweeps, or `opus` for root-causing a genuinely hard flake.
+
+**Review depth**: when the task is reviewing tests themselves (not writing them), read `.claude/specializations/review-kinds/test.md` first.
 
 ## Core Responsibilities
 
@@ -395,7 +398,7 @@ Glob "tests/**/conftest.py"
 
 ### Step 1: Receive Handoff
 
-Coder agent provides:
+The implementation lane (e.g. `expert-coder`) provides:
 - Files changed
 - What to test
 - Known issues (if any)
@@ -598,7 +601,7 @@ pytest tests/test_pricing.py::test_minimum_price_enforced -vv -s
 
 **If implementation is wrong**:
 - Document the issue clearly
-- Suggest fix to coder or fix directly (if simple)
+- Suggest the fix to the requester (or the implementation lane) or fix directly (if simple)
 - Re-run tests after fix
 
 **If spec is unclear**:

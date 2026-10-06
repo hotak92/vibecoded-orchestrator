@@ -63,11 +63,6 @@ def _make_pseudo_install_root(tmp_path: Path) -> Path:
     if not _IS_WINDOWS:
         (venv_bin / py_name).chmod(0o755)
     (root / "claude_mcp_servers" / "weaviate_mcp").mkdir(parents=True)
-    (root / "claude_mcp_servers" / "search_mcp").mkdir(parents=True)
-    if not _IS_WINDOWS:
-        wrapper = root / "claude_mcp_servers" / "search_mcp" / "wrapper.sh"
-        wrapper.write_text("#!/usr/bin/env bash\nexit 0\n")
-        wrapper.chmod(0o755)
     return root
 
 
@@ -253,14 +248,10 @@ class BuildEntriesTests(unittest.TestCase):
             # Critical: ollama MCP was deprecated in v0.2.11 (see
             # install.py:_check_ollama_mcp_remnants). Must NOT be in the
             # bundled list. vct-coordination is Pro-tier and also excluded.
-            # Phase 1.2 (diagrams plan): mermaid wrapper appended.
-            # Phase 2 (diagrams plan): excalidraw wrapper appended.
-            # F-1 (v0.2.73): playwright appended — docs + GUI catalog promised
-            # a default-enabled playwright MCP but no install path wrote it.
-            self.assertEqual(
-                names,
-                ["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"],
-            )
+            # F-1 (v0.2.73): playwright appended. v0.2.101 retired the
+            # diagram wrappers from default registration and deleted the
+            # `search` MCP, so the builder emits exactly these two.
+            self.assertEqual(names, ["weaviate-kg", "playwright"])
 
     def test_playwright_entry_shape(self):
         """F-1 (v0.2.73): playwright registration must match the shipped
@@ -278,38 +269,6 @@ class BuildEntriesTests(unittest.TestCase):
             self.assertEqual(entry["args"], ["-y", "@playwright/mcp@latest"])
             self.assertEqual(entry["env"], {})
             self.assertEqual(dropped, [])
-
-    def test_wrapper_entries_pythonpath_includes_install_root(self):
-        """v0.2.91 WP-E item 1 — the `-m`-invoked wrapper entries must carry
-        BOTH the install root and the package dir on PYTHONPATH.
-
-        `python -m claude_mcp_servers.wrappers.<proxy>` resolves the dotted
-        name from sys.path, so the package's PARENT must be there. Before
-        v0.2.91 only the package-INTERNAL dir was on PYTHONPATH and the only
-        thing making the entries work was `python -m`'s implicit cwd-prepend
-        — i.e. they resolved ONLY when the Claude Code session's cwd happened
-        to be the orchestrator root. `~/.claude.json` is global, so that one
-        value broke the wrapper MCPs for every other project.
-        """
-        with tempfile.TemporaryDirectory() as td:
-            root = _make_pseudo_install_root(Path(td))
-            py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
-            by_name = {n: e for n, e, _ in entries}
-            expected = os.pathsep.join((str(root), str(root / "claude_mcp_servers")))
-            for name in ("mermaid", "excalidraw"):
-                self.assertEqual(
-                    by_name[name]["env"]["PYTHONPATH"],
-                    expected,
-                    f"{name} PYTHONPATH must be <root>{os.pathsep}<root>/claude_mcp_servers "
-                    f"so `python -m` resolves the package from ANY cwd",
-                )
-            # The absolute-script entries keep the package-internal path:
-            # their imports are top-level siblings, not a dotted package name.
-            self.assertEqual(
-                by_name["weaviate-kg"]["env"]["PYTHONPATH"],
-                str(root / "claude_mcp_servers"),
-            )
 
     def test_weaviate_entry_shape(self):
         with tempfile.TemporaryDirectory() as td:
@@ -346,34 +305,8 @@ class BuildEntriesTests(unittest.TestCase):
             self.assertNotIn("EMBEDDING_MODEL", entry["env"])
             self.assertNotIn("RL_SERVER_URL", entry["env"])
 
-    def test_search_entry_uses_wrapper_on_unix(self):
-        """Search MCP must invoke wrapper.sh on Unix (per handoff spec)."""
-        if _IS_WINDOWS:
-            self.skipTest("Unix-only path")
-        with tempfile.TemporaryDirectory() as td:
-            root = _make_pseudo_install_root(Path(td))
-            py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
-            name, entry, _ = entries[1]
-            self.assertEqual(name, "search")
-            self.assertTrue(entry["command"].endswith("wrapper.sh"))
-            self.assertEqual(entry["args"], [])
-            self.assertEqual(entries[2][0], "playwright",
-                             "playwright must sit between search and mermaid "
-                             "(mirror of the Rust builder order)")
-
-    def test_search_entry_uses_python_on_windows(self):
-        """On Windows, no wrapper.sh exists, so python is invoked directly."""
-        if not _IS_WINDOWS:
-            self.skipTest("Windows-only path")
-        with tempfile.TemporaryDirectory() as td:
-            root = _make_pseudo_install_root(Path(td))
-            py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
-            name, entry, _ = entries[1]
-            self.assertEqual(name, "search")
-            self.assertEqual(entry["command"], str(py))
-            self.assertEqual(len(entry["args"]), 1)
+    # v0.2.101: the `search` MCP (wrapper.sh on Unix / python on Windows) was
+    # deleted, so its two builder-shape tests are gone.
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -392,30 +325,15 @@ class PythonFallbackWriterTests(unittest.TestCase):
             target = Path(td) / "fake_home" / ".claude.json"
             self.assertFalse(target.exists())
             success, errors = install._python_fallback_write_mcp_entries(target, entries)
-            # Phase 1.2 + Phase 2 (diagrams plan): mermaid + excalidraw
-            # wrappers appended; F-1 (v0.2.73): playwright → 5 entries.
-            self.assertEqual(success, 5)
+            # v0.2.101: exactly weaviate-kg + playwright.
+            self.assertEqual(success, 2)
             self.assertEqual(errors, [])
             data = json.loads(target.read_text(encoding="utf-8"))
             self.assertIn("weaviate-kg", data["mcpServers"])
-            self.assertIn("search", data["mcpServers"])
             self.assertIn("playwright", data["mcpServers"])
-            self.assertIn("mermaid", data["mcpServers"])
-            self.assertIn("excalidraw", data["mcpServers"])
-            # Mermaid points at the wrapper module, NOT direct npx — the
-            # wrapper spawns npx as its own child.
-            self.assertEqual(
-                data["mcpServers"]["mermaid"]["args"][:2],
-                ["-m", "claude_mcp_servers.wrappers.mermaid_proxy"],
-            )
-            # Excalidraw points at the wrapper module, NOT direct node —
-            # the wrapper spawns Node on the vendored fork as its child.
-            self.assertEqual(
-                data["mcpServers"]["excalidraw"]["args"][:2],
-                ["-m", "claude_mcp_servers.wrappers.excalidraw_proxy"],
-            )
-            # Ollama MUST NOT be written.
-            self.assertNotIn("ollama", data["mcpServers"])
+            # Retired defaults MUST NOT be written.
+            for retired in ("search", "mermaid", "excalidraw", "ollama"):
+                self.assertNotIn(retired, data["mcpServers"])
 
     def test_preserves_existing_keys(self):
         """Pre-existing user MCPs + top-level keys MUST survive the merge."""
@@ -435,8 +353,8 @@ class PythonFallbackWriterTests(unittest.TestCase):
             }
             target.write_text(json.dumps(existing, indent=2), encoding="utf-8")
             success, errors = install._python_fallback_write_mcp_entries(target, entries)
-            # Phase 1.2 + Phase 2 (both wrappers) + F-1 playwright → 5 entries.
-            self.assertEqual(success, 5)
+            # v0.2.101: two entries (weaviate-kg + playwright).
+            self.assertEqual(success, 2)
             data = json.loads(target.read_text(encoding="utf-8"))
             # User's pre-existing MCP survives.
             self.assertEqual(
@@ -447,10 +365,7 @@ class PythonFallbackWriterTests(unittest.TestCase):
             self.assertEqual(data["permissions"]["allow"], ["Read", "Edit"])
             # Orchestrator MCPs were added.
             self.assertIn("weaviate-kg", data["mcpServers"])
-            self.assertIn("search", data["mcpServers"])
             self.assertIn("playwright", data["mcpServers"])
-            self.assertIn("mermaid", data["mcpServers"])
-            self.assertIn("excalidraw", data["mcpServers"])
 
     def test_no_secrets_in_written_entries(self):
         """End-to-end: a candidate env with GITHUB_TOKEN never reaches disk."""
@@ -539,7 +454,7 @@ class RegisterMcpsOrchestrationTests(unittest.TestCase):
             )
             data = json.loads(target.read_text(encoding="utf-8"))
             self.assertIn("weaviate-kg", data["mcpServers"])
-            self.assertIn("search", data["mcpServers"])
+            self.assertIn("playwright", data["mcpServers"])
             self.assertNotIn("ollama", data["mcpServers"])
 
             # Deferral emitted because Python fallback was used (informational).

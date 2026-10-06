@@ -394,7 +394,7 @@ fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
 /// whitelist. The root CLAUDE.md is the orchestrator-self's own
 /// development documentation, not a per-project scaffold. User
 /// projects render CLAUDE.md from `templates/CLAUDE.md.template` via
-/// the project-bootstrapper. `DEFAULT_PRESERVE_LIST` (below) still
+/// the project-bootstrapper skill. `DEFAULT_PRESERVE_LIST` (below) still
 /// includes `CLAUDE.md` because that's the user-edits-on-update
 /// concern, not the whitelist-copy concern this constant governs.
 ///
@@ -2328,7 +2328,7 @@ pub const ORCHESTRATOR_VOLUME_NAMES: &[&str] = &[
 ];
 
 /// Read-only volume detection for the install preflight — the SAME answer the
-/// install's next step (`volumes::set_volumes_config_for_install`) acts on:
+/// install's next step (`storage_ux::set_volumes_config_for_install`) acts on:
 /// the orchestrator volumes under the runtime storage commands drive
 /// (`storage_ux::storage_runtime`, the shared pin-first, daemon-aware
 /// detector), or the ownership REFUSAL when some exist only under the other
@@ -2348,7 +2348,7 @@ async fn detect_existing_volumes() -> (Vec<ExistingVolume>, Option<String>) {
 /// [`detect_existing_volumes`] with the install root (where
 /// `state/install/runtime.txt` lives) passed in — tests use a temp dir.
 async fn detect_existing_volumes_at(install_root: Option<&Path>) -> (Vec<ExistingVolume>, Option<String>) {
-    match super::volumes::existing_volumes_on_storage_runtime_at(install_root, "adopt").await {
+    match super::storage_ux::existing_volumes_on_storage_runtime_at(install_root, "adopt").await {
         Ok(found) => (found, None),
         Err(refusal) => (Vec::new(), Some(refusal)),
     }
@@ -2867,6 +2867,14 @@ pub async fn install_orchestrator(
             for w in &report.db_warnings {
                 tracing::warn!("[vct] install_orchestrator: db warning: {}", w);
             }
+            // v0.2.101: an auto_scrub deprecated MCP (search) was removed from
+            // ~/.claude.json — its module no longer ships.
+            for name in &report.removed_deprecated {
+                tracing::info!(
+                    "[vct] install_orchestrator: removed obsolete MCP entry `{}` (module no longer ships)",
+                    name
+                );
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -3288,6 +3296,13 @@ async fn run_install_orchestrator_lightweight(
                         o.error.as_deref().unwrap_or("unknown")
                     );
                 }
+            }
+            // v0.2.101: an auto_scrub deprecated MCP (search) was removed.
+            for name in &report.removed_deprecated {
+                tracing::info!(
+                    "[vct] lightweight: removed obsolete MCP entry `{}` (module no longer ships)",
+                    name
+                );
             }
         }
         Err(e) => {
@@ -8323,17 +8338,36 @@ pub fn get_github_pat_preview(db: State<'_, Db>) -> Option<String> {
 /// silently overwrote any pre-existing keychain value.)
 pub const GITHUB_PAT_REPLACE_GUARD: &str = "EXISTS_DIFFERENT:";
 
+/// Register (or replace) the machine's GitHub PAT.
+///
+/// F3 (v0.2.101): `async` + the whole sync core on the blocking pool. As a
+/// plain `fn` command Tauri ran it on the MAIN thread, so the keychain I/O
+/// and — worse — the every-project env re-projection (one Python
+/// subprocess per project, 300 s cap each) could freeze the launcher UI.
+/// The keychain write lives inside the closure, so a join failure is
+/// propagated as `Err`.
 #[command]
-pub fn register_github_pat(
+pub async fn register_github_pat(
     token: String,
     force: Option<bool>,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "register_github_pat",
+        move |db| register_github_pat_with_db(db, &token, force.unwrap_or(false)),
+    )
+    .await?
+}
+
+/// Free-function core of [`register_github_pat`] — testable without a Tauri
+/// runtime. Blocking (keychain + per-project Python re-projection): call it
+/// from the blocking pool, never from an async worker or the main thread.
+pub fn register_github_pat_with_db(db: &Db, token: &str, force: bool) -> Result<(), String> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
         return Err("token cannot be empty".into());
     }
-    let force = force.unwrap_or(false);
 
     // 1a. Run the `installer → user` module_id consolidation FIRST.
     //     Idempotent + self-gated. This collapses any pre-2026-05-10
@@ -8343,7 +8377,7 @@ pub fn register_github_pat(
     //     the wizard later edits via the SecretsPanel "Shared" tab.
     //     Errors are swallowed: the caller's token write below is the
     //     source-of-truth path; the migration is best-effort cleanup.
-    match migrate_github_pat_installer_to_user_module_id(&db) {
+    match migrate_github_pat_installer_to_user_module_id(db) {
         Ok(report) => {
             if !report.warnings.is_empty() {
                 tracing::warn!(
@@ -8365,7 +8399,7 @@ pub fn register_github_pat(
     //     overwrite with the user's new token. We intentionally swallow
     //     migration errors here — the caller's token write is the
     //     source-of-truth path, and the migration is best-effort cleanup.
-    match migrate_github_pat_file_to_keychain(&db) {
+    match migrate_github_pat_file_to_keychain(db) {
         Ok(report) => {
             if !report.warnings.is_empty() {
                 tracing::warn!(
@@ -8444,7 +8478,7 @@ pub fn register_github_pat(
     if let Ok(rows) = db.list_projects() {
         for row in rows {
             if let Err(e) = crate::commands::projects_v2::refresh_project_env_with_db(
-                &db, &row.id,
+                db, &row.id,
             ) {
                 tracing::error!(
                     "[vct] register_github_pat: env-refresh for project {} failed: {}",
@@ -8457,8 +8491,27 @@ pub fn register_github_pat(
     Ok(())
 }
 
+/// Remove the machine's GitHub PAT from the keychain and re-project every
+/// project's env.
+///
+/// F3 (v0.2.101): `async` + the whole sync core on the blocking pool, for
+/// the same reason as [`register_github_pat`] — as a plain `fn` command it
+/// ran the keychain delete and the every-project re-projection on the
+/// launcher's MAIN thread. The core itself never returns `Err` (every step
+/// is soft-fail, as before); only a join failure / missing Db state does.
 #[command]
-pub fn clear_github_pat(db: State<'_, Db>) -> Result<(), String> {
+pub async fn clear_github_pat(app: tauri::AppHandle) -> Result<(), String> {
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "clear_github_pat",
+        clear_github_pat_with_db,
+    )
+    .await?
+}
+
+/// Free-function core of [`clear_github_pat`] — testable without a Tauri
+/// runtime. Blocking: call it from the blocking pool.
+pub fn clear_github_pat_with_db(db: &Db) -> Result<(), String> {
     // Remove the keychain entry first (idempotent — `secrets::delete`
     // treats `NoEntry` as success).
     let scope = SecretScope::Shared {
@@ -8493,7 +8546,7 @@ pub fn clear_github_pat(db: State<'_, Db>) -> Result<(), String> {
     if let Ok(rows) = db.list_projects() {
         for row in rows {
             if let Err(e) = crate::commands::projects_v2::refresh_project_env_with_db(
-                &db, &row.id,
+                db, &row.id,
             ) {
                 tracing::error!(
                     "[vct] clear_github_pat: env-refresh for project {} failed: {}",
@@ -8857,18 +8910,28 @@ mod tests {
     // frozen 50% bar instead of the current sub-step).
 
     #[test]
-    fn test_step_label_seeding_weaviate_is_long_running_phase() {
-        // 7c/10 is the Weaviate KG seed step — the longest one in
-        // --update by far (minutes). User must see this label or
-        // they'll think the install hung at 50%.
+    fn test_step_label_seeding_weaviate_names_the_background_seed() {
+        // 7c/10 is the Weaviate KG seed step. Since v0.2.101 the seed is
+        // DETACHED: install.py only enqueues it and returns within seconds
+        // (vco_lib/install_weaviate.kg_seed_step), and the owed work is
+        // surfaced through the deferral ledger rows this step emits, whose
+        // remedy names the background seed log. The label must say the seed
+        // continues in the background — the pre-v0.2.101 "can take a few
+        // minutes" described a block this step no longer performs.
         let label = installer_step_to_user_label("7c/10", "all seed sub-steps completed");
         assert!(
             label.contains("Seeding Weaviate") || label.contains("KG"),
             "7c/10 must surface a Weaviate-seed-related label; got: {label}"
         );
         assert!(
-            label.contains("few minutes") || label.contains("minute"),
-            "long-running phases should warn the user about duration; got: {label}"
+            label.contains("background"),
+            "the seed is detached since v0.2.101; the label must say it \
+             continues in the background; got: {label}"
+        );
+        assert!(
+            !label.contains("minute"),
+            "the enqueue completes in seconds; a duration promise is stale; \
+             got: {label}"
         );
     }
 
@@ -12944,6 +13007,73 @@ MemAvailable:   23456789 kB
                 keychain_value_legacy!(home).is_none(),
                 "file→keychain migration must NOT write to the legacy installer slot",
             );
+
+            delete_keychain();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// F3 (v0.2.101): the `register_github_pat` core keeps the command's
+        /// first error — an empty/whitespace token is refused before any
+        /// keychain or env work (so no keychain backend is needed here).
+        #[test]
+        fn register_github_pat_core_rejects_empty_token() {
+            let db = make_db();
+            assert_eq!(
+                register_github_pat_with_db(&db, "   ", false),
+                Err("token cannot be empty".to_string()),
+            );
+        }
+
+        /// F3 (v0.2.101): the REAL cores behind the now-async commands (the
+        /// wrappers only move them onto the blocking pool). Pins, through the
+        /// cores rather than a replica of their steps: register writes the
+        /// keychain; the replace guard still returns the sentinel `Err`;
+        /// `force` replaces; clear removes and returns `Ok`; and a registered
+        /// project whose env re-projection cannot succeed (phantom folder)
+        /// stays soft-fail — neither command turns it into an `Err`.
+        #[test]
+        fn github_pat_cores_round_trip_with_soft_fail_reprojection() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            let db = make_db();
+            db.insert_project(
+                "p-pat-phantom",
+                "PatPhantom",
+                "/nonexistent/pat-phantom",
+                crate::db::models::ProjectHost::Base,
+                "patphantom",
+            )
+            .expect("insert project");
+            clean_keychain!(home);
+
+            let first = format!("ghp_first_{}", uuid::Uuid::new_v4().simple());
+            if let Err(e) = register_github_pat_with_db(&db, &first, false) {
+                if is_keychain_unavailable_err(&e) {
+                    eprintln!("[skip] Secret Service unavailable under load ({e})");
+                    std::fs::remove_dir_all(&home).ok();
+                    return;
+                }
+                panic!("register core must succeed despite the phantom project: {e}");
+            }
+            assert_eq!(keychain_value!(home).as_deref(), Some(first.as_str()));
+
+            let second = format!("ghp_second_{}", uuid::Uuid::new_v4().simple());
+            let guarded = register_github_pat_with_db(&db, &second, false)
+                .expect_err("a different existing token must trip the replace guard");
+            assert!(
+                guarded.starts_with(GITHUB_PAT_REPLACE_GUARD),
+                "guard error must carry the sentinel the GUI matches on; got: {guarded}",
+            );
+            assert_eq!(keychain_value!(home).as_deref(), Some(first.as_str()));
+
+            register_github_pat_with_db(&db, &second, true).expect("force replaces");
+            assert_eq!(keychain_value!(home).as_deref(), Some(second.as_str()));
+
+            assert_eq!(clear_github_pat_with_db(&db), Ok(()));
+            assert_eq!(keychain_value!(home), None);
 
             delete_keychain();
             std::fs::remove_dir_all(&home).ok();

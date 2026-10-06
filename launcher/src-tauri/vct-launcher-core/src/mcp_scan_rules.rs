@@ -134,6 +134,14 @@ pub struct DeprecatedMcp {
     /// (`bundled_manifests::tests::every_referenced_module_id_is_an_embedded_manifest`).
     #[serde(default)]
     pub opt_in_manifest: Option<String>,
+    /// True when the ordinary install/update REMOVES this entry from the
+    /// user's `~/.claude.json` automatically (a VCO-shaped entry inside
+    /// install_root), instead of the consent-gated `--remove-deprecated-mcps`
+    /// path. Default false. Read by `mcp_registration::
+    /// register_default_orchestrator_mcps` (Rust) and
+    /// `install_mcp.auto_scrub_mcp_entries` (Python).
+    #[serde(default)]
+    pub auto_scrub: bool,
 }
 
 // ── Wire schema (serde) ────────────────────────────────────────────────────
@@ -288,7 +296,7 @@ mod tests {
         );
         assert_eq!(
             r.default_mcp_entry_names,
-            vec!["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"],
+            vec!["weaviate-kg", "playwright"],
         );
     }
 
@@ -312,7 +320,9 @@ mod tests {
                 "weaviate-kg",
             ],
         );
-        assert_eq!(r.bundled_mcp_default_disabled, vec!["excalidraw", "mermaid"]);
+        // v0.2.101: the diagram MCPs were the only default-disabled members and
+        // were retired, so the list is now empty.
+        assert!(r.bundled_mcp_default_disabled.is_empty());
         // Accessors return the same slices.
         assert_eq!(bundled_mcp_names(), r.bundled_mcp_names.as_slice());
         assert_eq!(
@@ -340,6 +350,19 @@ mod tests {
         // installed were deleted in v0.2.11 (review R6 F50 — the pointer named
         // a file that never shipped alongside this key).
         assert_eq!(ollama.opt_in_manifest, None);
+        assert!(
+            !ollama.auto_scrub,
+            "ollama stays consent-gated (--remove-deprecated-mcps)"
+        );
+        let search = d
+            .get("search")
+            .expect("[deprecated.search] must be in the embedded table");
+        assert_eq!(search.removed_in, "v0.2.101");
+        assert!(
+            search.auto_scrub,
+            "search is DELETED (owner: delete now + scrub) — its orphaned entry \
+             must be removed by the ordinary update, not left to a consent prompt"
+        );
         // Every deprecated name must be a name the orchestrator once shipped
         // — otherwise the retire pass would badge a row it does not own.
         for name in d.keys() {

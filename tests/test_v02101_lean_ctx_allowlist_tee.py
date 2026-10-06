@@ -1,0 +1,1379 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+"""v0.2.101: lean-ctx allow-list inversion + lossless tee/pointer.
+
+Owner ruling 2026-10-03 (PLAN-V0300 item 12): KEEP lean-ctx, but
+
+  1. the rewrite hooks compress ONLY commands on one committed allow-list
+     (``templates/hooks/_lib/lean-ctx-allowlist.txt`` — a single rule table
+     both siblings PARSE, A>B>C tier B). Loops, pipes, redirects, ``git``,
+     unknown commands and anything credential-bearing run RAW. The old
+     exemption machinery (TRIM-b git commit/push step-aside, TRIM-r
+     read-only git verbs, delegation to the upstream rewrite handler) is
+     retired — the allow-list subsumes it.
+  2. every compressed run is LOSSLESS: the rewritten command is a wrapper
+     (``_lib/lean-ctx-tee.sh`` / ``.ps1``) that tees the full raw output to
+     ``<project>/.claude/state/lean-ctx-tee/<ts>-<pid>-<ck>.log`` and ends
+     the compressed output with one pointer line. TTL sweep (default 168 h,
+     knob ``VCO_LEAN_CTX_TEE_TTL_HOURS`` from ``.claude/env``; 0 = keep
+     forever) deletes stale ``.log``/``.cmd`` files on every wrapped run.
+
+SEC-RAW is KEPT because allow-listed commands can carry credentials
+(``pip install --index-url https://user:pass@host/simple``, ``curl -u``,
+``wget --password``, npm registry ``_authToken`` args, secret-shaped env
+prefixes) — extended with a URL-userinfo and an ``_authToken=`` pattern.
+
+Behavioural cases run the SAME table against both siblings (the repo's
+hook-parity pattern); .ps1 arms are pwsh-gated.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SH_HOOK = REPO_ROOT / "templates" / "hooks" / "lean-ctx-rewrite.sh"
+PS1_HOOK = REPO_ROOT / "templates" / "hooks" / "lean-ctx-rewrite.ps1"
+TEE_SH = REPO_ROOT / "templates" / "hooks" / "_lib" / "lean-ctx-tee.sh"
+TEE_PS1 = REPO_ROOT / "templates" / "hooks" / "_lib" / "lean-ctx-tee.ps1"
+ALLOWLIST = REPO_ROOT / "templates" / "hooks" / "_lib" / "lean-ctx-allowlist.txt"
+ORCH_TEMPLATE = REPO_ROOT / "templates" / "ORCHESTRATOR-CLAUDE.md.template"
+CHANGELOG = REPO_ROOT / "CHANGELOG.md"
+# The ONE PowerShell home for the env-file quote rule (shared by
+# lean-ctx-rewrite.ps1 and post-tool-use-async.ps1).
+ONE_QUOTE_PAIR_HELPER = (
+    REPO_ROOT / "templates" / "hooks" / "_lib" / "strip-one-quote-pair.ps1"
+)
+DISPATCHER_PS1 = REPO_ROOT / "templates" / "hooks" / "post-tool-use-async.ps1"
+
+_HAS_PWSH = sys.platform != "win32" and subprocess.run(
+    ["which", "pwsh"], capture_output=True).returncode == 0
+
+# ─── case tables (identical for both siblings) ───────────────────────────
+
+WRAP_CASES = [
+    "npm install",
+    "npm ci",
+    "pnpm add foo",
+    "yarn install",
+    "pip install requests",
+    "pip3 install -e .",
+    "python3 -m pip install pytest",
+    ".venv/bin/python -m pytest tests -q",
+    "PYTHONPATH=$PWD pytest tests",
+    "CI=1 uv pip install -r reqs.txt",
+    "cargo install ripgrep",
+    "docker pull alpine",
+    "podman pull docker.io/library/alpine",
+    "podman-compose pull",
+    "docker compose build",
+    "wget https://example.test/f.tar.gz",
+    "curl -sS https://example.test/health",
+    "pytest tests -q",
+    "cargo build --workspace",
+    "cargo test",
+    "cargo clippy",
+    "tsc --noEmit",
+    "vitest run",
+    "npx vitest run",
+    "npm run build",
+    "npm test",
+    "pnpm build",
+    "yarn test",
+]
+
+RAW_CASES = [
+    # unknown commands
+    "ls -la",
+    "echo hello",
+    "cat file.txt",
+    "mytool run --flag",
+    # git — every verb, by allow-list omission (TRIM-b/TRIM-r retired)
+    "git status",
+    "git commit -m x",
+    "git push origin main",
+    "git show HEAD",
+    "git ls-tree -r HEAD --name-only",
+    "git log && git commit -m y",
+    # pipes / chains / loops / redirects
+    "npm install | tail -5",
+    "npm install && curl -s https://x.test",
+    "for f in *.py; do echo $f; done",
+    "npm install > log.txt",
+    "npm install\necho done",
+    "echo $(npm install)",
+    # allow-list is prefix-anchored on whole tokens
+    "npm",
+    "npm uninstall foo",
+    "npm installx",
+    "cargo run",
+    # credentials (SEC-RAW kept — allow-listed commands can carry them)
+    "pip install --index-url https://user:secret123@pypi.test/simple pkg",
+    'curl -s -H "Authorization: Bearer ATATTfaketok12345" https://x.test/',
+    "curl -s -u user@example.test:ATATTfaketok12345 https://x.test/",
+    "npm install --//registry.npmjs.org/:_authToken=abc12345",
+    "wget --password hunter2 https://x.test/f",
+    "MY_API_KEY=abc123 pip install requests",
+    "vct exec --secret k=ENV -- npm install",
+    ".claude/scripts/vct_secrets_resolve.sh . github_pat",
+    # per-call lean-ctx forms step aside (no double-wrap)
+    'lean-ctx bypass "npm install"',
+    'lean-ctx -c "npm install"',
+]
+
+
+def _payload(cmd: str, **extra_tool_input) -> str:
+    tool_input = {"command": cmd}
+    tool_input.update(extra_tool_input)
+    return json.dumps(
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+         "tool_input": tool_input}
+    )
+
+
+def _make_fake_lean_ctx(bin_dir: Path, *, failing: bool = False) -> Path:
+    """A fake lean-ctx: logs argv to $FAKE_ARGV_LOG (when set), consumes
+    stdin, prints a marker (ok flavour) or exits 1 (failing flavour)."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "lean-ctx"
+    body = "#!/usr/bin/env bash\n"
+    body += 'if [ -n "${FAKE_ARGV_LOG:-}" ]; then printf \'%s\\n\' "$*" >> "$FAKE_ARGV_LOG"; fi\n'
+    body += "cat > /dev/null\n"
+    body += "exit 1\n" if failing else "printf 'COMPRESSED-BY-FAKE\\n'\n"
+    fake.write_text(body, encoding="utf-8")
+    fake.chmod(0o755)
+    return fake
+
+
+def _run_sh_hook(cmd: str, tmp_path: Path, *, env_file: str | None = None,
+                 extra_tool_input: dict | None = None,
+                 extra_env: dict | None = None,
+                 project_dir: str | None = None):
+    home = tmp_path / "home"
+    _make_fake_lean_ctx(home / ".cargo" / "bin")
+    env = dict(os.environ)
+    env.pop("VCT_DISABLE_HOOKS", None)
+    # tests/conftest.py pins CLAUDE_PROJECT_DIR to a suite-wide scratch
+    # project; these tests stage their OWN project cwd, so the pin must not
+    # leak in (the explicit-project_dir arm below sets it deliberately).
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    env["HOME"] = str(home)
+    env["PATH"] = "/usr/bin:/bin"
+    env["FAKE_ARGV_LOG"] = str(home / "argv.log")
+    if project_dir is not None:
+        env["CLAUDE_PROJECT_DIR"] = project_dir
+    if extra_env:
+        env.update(extra_env)
+    proj = tmp_path / "proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    if env_file is not None:
+        (proj / ".claude").mkdir(exist_ok=True)
+        (proj / ".claude" / "env").write_text(env_file, encoding="utf-8")
+    return subprocess.run(
+        ["bash", str(SH_HOOK)],
+        input=_payload(cmd, **(extra_tool_input or {})),
+        capture_output=True, text=True, cwd=proj, env=env, timeout=30,
+    )
+
+
+def _run_ps1_hook(cmd: str, tmp_path: Path, *, env_file: str | None = None,
+                  extra_tool_input: dict | None = None,
+                  project_dir: str | None = None):
+    bin_dir = tmp_path / "fakebin"
+    _make_fake_lean_ctx(bin_dir)
+    env = dict(os.environ)
+    env.pop("VCT_DISABLE_HOOKS", None)
+    # See _run_sh_hook: the conftest scratch-project pin must not leak in.
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    if project_dir is not None:
+        env["CLAUDE_PROJECT_DIR"] = project_dir
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["FAKE_ARGV_LOG"] = str(tmp_path / "argv.log")
+    proj = tmp_path / "proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    if env_file is not None:
+        (proj / ".claude").mkdir(exist_ok=True)
+        (proj / ".claude" / "env").write_text(env_file, encoding="utf-8")
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+        input=_payload(cmd, **(extra_tool_input or {})),
+        capture_output=True, text=True, cwd=proj, env=env, timeout=60,
+    )
+
+
+def _rawdir(proj: Path) -> Path:
+    return proj / ".claude" / "state" / "lean-ctx-tee"
+
+
+# ─── .sh hook behaviour ──────────────────────────────────────────────────
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="bash hook; .ps1 behavioural cases are pwsh-gated below.",
+)
+
+
+class TestShAllowListGate:
+    @pytest.mark.parametrize("cmd", WRAP_CASES)
+    def test_allow_listed_command_wrapped(self, cmd, tmp_path):
+        res = _run_sh_hook(cmd, tmp_path)
+        assert res.returncode == 0, res.stderr
+        out = res.stdout.strip()
+        assert out, f"allow-listed command must be wrapped: {cmd}"
+        data = json.loads(out)
+        hso = data["hookSpecificOutput"]
+        assert hso["hookEventName"] == "PreToolUse"
+        assert "permissionDecision" not in hso, (
+            "the hook constructs the response itself; an auto-approval "
+            "field must never appear (D-3 invariant, now structural)"
+        )
+        wrapped = hso["updatedInput"]["command"]
+        assert wrapped.startswith("bash "), wrapped
+        assert "_lib/lean-ctx-tee.sh" in wrapped, wrapped
+        # the original command text reaches the wrapper via a cmd file
+        cmdfiles = list(_rawdir(tmp_path / "proj").glob("*.cmd"))
+        assert len(cmdfiles) == 1, "exactly one cmd file must be written"
+        assert cmdfiles[0].read_text(encoding="utf-8") == cmd
+
+    @pytest.mark.parametrize("cmd", RAW_CASES)
+    def test_everything_else_runs_raw(self, cmd, tmp_path):
+        res = _run_sh_hook(cmd, tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            f"non-allow-listed command must run raw, got rewrite: {cmd}"
+        )
+        assert not _rawdir(tmp_path / "proj").exists() or \
+            not list(_rawdir(tmp_path / "proj").glob("*.cmd")), (
+            f"no cmd file may be written for a raw command: {cmd}"
+        )
+
+    def test_wrapped_command_ends_with_default_ttl(self, tmp_path):
+        res = _run_sh_hook("npm install", tmp_path)
+        wrapped = json.loads(res.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert wrapped.rstrip().split()[-1].strip("'") == "168", wrapped
+
+    def test_ttl_knob_read_from_claude_env(self, tmp_path):
+        res = _run_sh_hook("npm install", tmp_path,
+                           env_file="VCO_LEAN_CTX_TEE_TTL_HOURS=24\n")
+        wrapped = json.loads(res.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert wrapped.rstrip().split()[-1].strip("'") == "24", wrapped
+
+    def test_ttl_knob_invalid_falls_back_to_default(self, tmp_path):
+        res = _run_sh_hook("npm install", tmp_path,
+                           env_file="VCO_LEAN_CTX_TEE_TTL_HOURS=abc\n")
+        wrapped = json.loads(res.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert wrapped.rstrip().split()[-1].strip("'") == "168", wrapped
+
+    def test_default_off_disables_wrapping(self, tmp_path):
+        res = _run_sh_hook("npm install", tmp_path,
+                           env_file="VCO_LEAN_CTX_DEFAULT=off\n")
+        assert res.stdout.strip() == ""
+
+    @pytest.mark.parametrize("val", ["Off", "OFF", "oFf"])
+    def test_default_off_is_case_insensitive(self, val, tmp_path):
+        """SF-3: `Off` in .claude/env (a hand edit) must disable compression
+        on POSIX too — the .ps1 sibling and the launcher GUI mapping both
+        compare case-insensitively; a case-sensitive .sh gate renders a
+        launcher toggle that lies."""
+        res = _run_sh_hook("npm install", tmp_path,
+                           env_file=f"VCO_LEAN_CTX_DEFAULT={val}\n")
+        assert res.stdout.strip() == "", (
+            f"VCO_LEAN_CTX_DEFAULT={val} must disable compression"
+        )
+
+    def test_disable_hooks_short_circuits(self, tmp_path):
+        res = _run_sh_hook("npm install", tmp_path,
+                           extra_env={"VCT_DISABLE_HOOKS": "1"})
+        assert res.stdout.strip() == ""
+
+    def test_other_tool_input_fields_preserved(self, tmp_path):
+        res = _run_sh_hook(
+            "npm install", tmp_path,
+            extra_tool_input={"description": "Install deps",
+                              "run_in_background": True})
+        ui = json.loads(res.stdout)["hookSpecificOutput"]["updatedInput"]
+        assert ui["description"] == "Install deps"
+        assert ui["run_in_background"] is True
+
+    def test_hook_never_invokes_the_binary_at_rewrite_time(self, tmp_path):
+        """The pre-v0.2.101 delegation to the upstream rewrite handler is
+        retired: the hook decides via the allow-list and constructs the
+        response itself. The fake binary logs every invocation — the log
+        must stay empty (only the wrapper, at tool-execution time, runs it).
+        """
+        res = _run_sh_hook("npm install", tmp_path)
+        assert res.stdout.strip(), "wrap expected"
+        argv_log = tmp_path / "home" / "argv.log"
+        assert not argv_log.exists(), (
+            f"the hook itself must not invoke lean-ctx: {argv_log.read_text()}"
+        )
+
+    def test_claude_project_dir_governs_tee_location(self, tmp_path):
+        """Production path: Claude Code sets CLAUDE_PROJECT_DIR — the tee
+        state dir resolves under it, not under an incidental cwd."""
+        proj = tmp_path / "proj"
+        res = _run_sh_hook("npm install", tmp_path, project_dir=str(proj))
+        assert res.stdout.strip(), "wrap expected"
+        assert len(list(_rawdir(proj).glob("*.cmd"))) == 1
+
+    def test_hook_creates_private_dir_and_cmdfile(self, tmp_path):
+        """SF-1: the hook-side tee dir is 0700 and the .cmd file 0600 at
+        birth (no world-readable window for the command text)."""
+        res = _run_sh_hook("npm install", tmp_path)
+        assert res.stdout.strip(), "wrap expected"
+        rawdir = _rawdir(tmp_path / "proj")
+        assert stat.S_IMODE(rawdir.stat().st_mode) == 0o700
+        (cf,) = rawdir.glob("*.cmd")
+        assert stat.S_IMODE(cf.stat().st_mode) == 0o600
+
+    def test_binary_absent_everywhere_clean_noop(self, tmp_path):
+        home = tmp_path / "home"
+        (home / "proj").mkdir(parents=True)
+        env = dict(os.environ)
+        env.pop("VCT_DISABLE_HOOKS", None)
+        env["HOME"] = str(home)
+        env["PATH"] = "/usr/bin:/bin"
+        res = subprocess.run(
+            ["bash", str(SH_HOOK)], input=_payload("npm install"),
+            capture_output=True, text=True, cwd=home / "proj", env=env,
+            timeout=30,
+        )
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == ""
+
+
+# ─── wrapper behaviour (.sh) ─────────────────────────────────────────────
+
+def _run_wrapper_sh(cmd_text: str, tmp_path: Path, *, ttl: str = "168",
+                    failing: bool = False):
+    bin_dir = tmp_path / "fakebin"
+    fake = _make_fake_lean_ctx(bin_dir, failing=failing)
+    rawdir = tmp_path / "raw"
+    rawdir.mkdir(parents=True, exist_ok=True)
+    cmdfile = rawdir / "run.cmd"
+    cmdfile.write_text(cmd_text, encoding="utf-8")
+    env = dict(os.environ)
+    env["PATH"] = "/usr/bin:/bin"
+    return subprocess.run(
+        ["bash", str(TEE_SH), str(fake), str(rawdir), str(cmdfile), ttl],
+        capture_output=True, text=True, cwd=tmp_path, env=env, timeout=60,
+    )
+
+
+_POINTER_RE = re.compile(
+    r"\[lean-ctx-tee\] (\d+) raw lines -> (\d+) shown; full output: (\S+)")
+
+
+class TestTeeWrapperSh:
+    def test_compressed_run_writes_raw_file_and_pointer(self, tmp_path):
+        res = _run_wrapper_sh("seq 1 120", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert "COMPRESSED-BY-FAKE" in res.stdout
+        logs = list((tmp_path / "raw").glob("*.log"))
+        assert len(logs) == 1, "the full raw output must be teed to a .log"
+        assert logs[0].read_text(encoding="utf-8").splitlines() == [
+            str(i) for i in range(1, 121)]
+        m = _POINTER_RE.search(res.stdout)
+        assert m, f"pointer line missing: {res.stdout!r}"
+        assert m.group(1) == "120"
+        assert m.group(3) == str(logs[0]), "pointer must name the tee file"
+        # the pointer is the LAST line of the compressed output
+        assert res.stdout.rstrip("\n").splitlines()[-1].startswith(
+            "[lean-ctx-tee]")
+
+    def test_exit_code_propagates(self, tmp_path):
+        res = _run_wrapper_sh("echo out; exit 3", tmp_path)
+        assert res.returncode == 3
+        logs = list((tmp_path / "raw").glob("*.log"))
+        assert "out" in logs[0].read_text(encoding="utf-8")
+
+    def test_compressor_failure_falls_back_to_raw_output(self, tmp_path):
+        """Never lose output: when lean-ctx fails, the raw text is printed
+        and the pointer still names the tee file."""
+        res = _run_wrapper_sh("seq 1 120", tmp_path, failing=True)
+        assert res.returncode == 0, res.stderr
+        assert "COMPRESSED-BY-FAKE" not in res.stdout
+        for probe in ("1", "60", "120"):
+            assert re.search(rf"^{probe}$", res.stdout, re.M), (
+                f"raw fallback output missing line {probe!r}"
+            )
+        assert _POINTER_RE.search(res.stdout)
+
+    def test_empty_output_still_gets_pointer(self, tmp_path):
+        res = _run_wrapper_sh("true", tmp_path)
+        assert res.returncode == 0, res.stderr
+        logs = list((tmp_path / "raw").glob("*.log"))
+        assert len(logs) == 1
+        assert logs[0].read_text(encoding="utf-8") == ""
+        m = _POINTER_RE.search(res.stdout)
+        assert m and m.group(1) == "0"
+
+    def test_unwritable_rawdir_runs_command_raw(self, tmp_path):
+        """Leave-alone arm: no state dir -> no tee -> no compression; the
+        command runs directly and its output passes through untouched."""
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        fake = _make_fake_lean_ctx(tmp_path / "fakebin")
+        cmdfile = tmp_path / "run.cmd"
+        cmdfile.write_text("seq 1 5", encoding="utf-8")
+        res = subprocess.run(
+            ["bash", str(TEE_SH), str(fake), str(blocker / "sub"),
+             str(cmdfile), "168"],
+            capture_output=True, text=True, cwd=tmp_path, timeout=60,
+        )
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.split() == ["1", "2", "3", "4", "5"]
+        assert "[lean-ctx-tee]" not in res.stdout
+
+    def test_missing_cmdfile_fails_loudly(self, tmp_path):
+        fake = _make_fake_lean_ctx(tmp_path / "fakebin")
+        res = subprocess.run(
+            ["bash", str(TEE_SH), str(fake), str(tmp_path / "raw"),
+             str(tmp_path / "nope.cmd"), "168"],
+            capture_output=True, text=True, cwd=tmp_path, timeout=30,
+        )
+        assert res.returncode != 0
+        assert "nope.cmd" in res.stderr
+
+    def test_ttl_sweep_deletes_stale_files(self, tmp_path):
+        rawdir = tmp_path / "raw"
+        rawdir.mkdir()
+        old_log = rawdir / "old.log"
+        old_cmd = rawdir / "old.cmd"
+        fresh_log = rawdir / "fresh.log"
+        for f in (old_log, old_cmd, fresh_log):
+            f.write_text("x", encoding="utf-8")
+        ten_days_ago = time.time() - 10 * 86400
+        os.utime(old_log, (ten_days_ago, ten_days_ago))
+        os.utime(old_cmd, (ten_days_ago, ten_days_ago))
+        res = _run_wrapper_sh("true", tmp_path, ttl="168")
+        assert res.returncode == 0, res.stderr
+        assert not old_log.exists(), "stale .log must be swept at TTL 168h"
+        assert not old_cmd.exists(), "stale .cmd must be swept at TTL 168h"
+        assert fresh_log.exists(), "fresh files must survive the sweep"
+
+    def test_ttl_zero_keeps_everything(self, tmp_path):
+        rawdir = tmp_path / "raw"
+        rawdir.mkdir()
+        old_log = rawdir / "old.log"
+        old_log.write_text("x", encoding="utf-8")
+        ten_days_ago = time.time() - 10 * 86400
+        os.utime(old_log, (ten_days_ago, ten_days_ago))
+        res = _run_wrapper_sh("true", tmp_path, ttl="0")
+        assert res.returncode == 0, res.stderr
+        assert old_log.exists(), "TTL 0 = keep forever (no sweep)"
+
+    def test_tee_artifacts_are_private(self, tmp_path):
+        """SF-1: raw output of allow-listed curl/wget/test runs can carry
+        credentials (SEC-RAW guards the COMMAND text, not the output), so
+        the tee dir must be 0700 and the .log 0600 — even when the dir
+        pre-existed world-traversable."""
+        res = _run_wrapper_sh("seq 1 5", tmp_path)
+        assert res.returncode == 0, res.stderr
+        rawdir = tmp_path / "raw"
+        assert stat.S_IMODE(rawdir.stat().st_mode) == 0o700, (
+            "tee dir must be tightened to 0700"
+        )
+        (log,) = rawdir.glob("*.log")
+        assert stat.S_IMODE(log.stat().st_mode) == 0o600, (
+            "tee .log must be 0600 (raw output can contain credentials)"
+        )
+
+    # 17M two-byte chars = 34,000,000 BYTES but only 17,000,000 CHARS —
+    # the size gate must count BYTES on both siblings (N-2).
+    BIG_CMD = "python3 -c \"import sys; sys.stdout.write(chr(233) * 17000000)\""
+
+    def test_oversized_output_counts_bytes_pointer_only(self, tmp_path):
+        res = _run_wrapper_sh(self.BIG_CMD, tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert "too large" in res.stdout, res.stdout[:200]
+        m = re.search(r"too large to echo \((\d+) bytes\)", res.stdout)
+        assert m and int(m.group(1)) >= 34_000_000, (
+            f"the size arm must report BYTES (>= 34 MB): {res.stdout[:200]}"
+        )
+        assert len(res.stdout) < 5000, "oversized output must not be echoed"
+        (log,) = (tmp_path / "raw").glob("*.log")
+        assert log.stat().st_size == 34_000_000
+
+
+# ─── static pins: shared data + retired machinery ────────────────────────
+
+class TestSharedDataAndRetirements:
+    def test_allowlist_file_is_the_single_source(self):
+        assert ALLOWLIST.is_file()
+        sh = SH_HOOK.read_text(encoding="utf-8")
+        ps1 = PS1_HOOK.read_text(encoding="utf-8-sig")
+        for src in (sh, ps1):
+            assert "_lib/lean-ctx-allowlist.txt" in src or \
+                "_lib\\lean-ctx-allowlist.txt" in src or \
+                "lean-ctx-allowlist.txt" in src, (
+                "both siblings must read the one committed allow-list file"
+            )
+            assert "MUST MATCH" in src
+
+    def test_allowlist_seeds_progress_noise_and_test_build_runners(self):
+        entries = [
+            ln.split("#", 1)[0].strip()
+            for ln in ALLOWLIST.read_text(encoding="utf-8").splitlines()
+        ]
+        entries = [e for e in entries if e]
+        for expected in ("npm install", "pip install", "docker pull",
+                         "wget", "curl", "pytest", "cargo build",
+                         "cargo test", "vitest", "tsc"):
+            assert expected in entries, f"missing allow-list entry: {expected}"
+
+    def test_git_is_not_allow_listed(self):
+        for ln in ALLOWLIST.read_text(encoding="utf-8").splitlines():
+            entry = ln.split("#", 1)[0].strip()
+            assert not entry.startswith("git "), (
+                "git must never be allow-listed (owner rule)"
+            )
+
+    def test_upstream_rewrite_delegation_retired(self):
+        """The hooks construct updatedInput themselves; the delegation to
+        lean-ctx's own rewrite handler (and its permissionDecision strip)
+        is gone — the string must not survive anywhere in either sibling."""
+        for hook in (SH_HOOK, PS1_HOOK):
+            src = hook.read_text(encoding="utf-8-sig")
+            assert "hook rewrite" not in src, (
+                f"{hook.name} still references the retired delegation"
+            )
+
+    def test_trim_machinery_retired(self):
+        for hook in (SH_HOOK, PS1_HOOK):
+            src = hook.read_text(encoding="utf-8-sig")
+            assert "GIT-READONLY-VERBS" not in src, (
+                f"{hook.name}: TRIM-r verb list must be retired"
+            )
+
+    def test_sec_raw_kept_and_parity_pinned(self):
+        """SEC-RAW stays (allow-listed installers/downloaders can carry
+        credentials); the pattern block remains between the same markers in
+        both siblings, byte-identical (extraction, not a source scan)."""
+        def extract(src: str, quote: str) -> list[str]:
+            begin = src.index("SEC-RAW-PATTERNS-BEGIN")
+            end = src.index("SEC-RAW-PATTERNS-END")
+            out = []
+            for line in src[begin:end].splitlines():
+                line = line.strip().rstrip(",")
+                if quote == '"' and line.startswith('r"') and line.endswith('"'):
+                    out.append(line[2:-1])
+                elif quote == "'" and line.startswith("'") and line.endswith("'"):
+                    out.append(line[1:-1])
+            return out
+
+        sh_patterns = extract(SH_HOOK.read_text(encoding="utf-8"), '"')
+        ps1_patterns = extract(PS1_HOOK.read_text(encoding="utf-8-sig"), "'")
+        assert sh_patterns, "sh SEC-RAW block missing or unparsed"
+        assert sh_patterns == ps1_patterns, "SEC-RAW lists diverged"
+        import re as _re
+        for p in sh_patterns:
+            _re.compile(p)
+        # the v0.2.101 additions are present
+        joined = "\n".join(sh_patterns)
+        assert "://" in joined and "@" in joined, (
+            "URL-userinfo credential pattern missing"
+        )
+        assert "auth" in joined.lower(), "_authToken pattern missing"
+
+
+class TestBundleShipping:
+    def test_lib_data_files_enumerate_into_the_bundle(self, tmp_path):
+        """The allow-list + wrapper must SHIP: the bundle engine's _lib loop
+        covers the data glob, not just .sh/.ps1 flavours."""
+        sys.path.insert(0, str(REPO_ROOT))
+        from vco_lib.project_init import _enumerate_bundle_files
+
+        orch = tmp_path / "orch"
+        lib = orch / "templates" / "hooks" / "_lib"
+        lib.mkdir(parents=True)
+        (orch / "templates" / "hooks" / "lean-ctx-rewrite.sh").write_text(
+            "#!/usr/bin/env bash\n", encoding="utf-8")
+        (orch / "templates" / "hooks" / "lean-ctx-rewrite.ps1").write_text(
+            "#\n", encoding="utf-8")
+        for name in ("lean-ctx-allowlist.txt", "lean-ctx-tee.sh",
+                     "lean-ctx-tee.ps1"):
+            (lib / name).write_text("x\n", encoding="utf-8")
+
+        ops = _enumerate_bundle_files(orch, tmp_path / "proj")
+        by_dest = {op.dest_rel: op for op in ops}
+        for name in ("lean-ctx-allowlist.txt", "lean-ctx-tee.sh",
+                     "lean-ctx-tee.ps1"):
+            dest = str(Path(".claude") / "hooks" / "_lib" / name)
+            assert dest in by_dest, f"_lib/{name} must ship in the bundle"
+            assert by_dest[dest].always_overwrite, (
+                f"_lib/{name} must be always-overwrite (not user-customisable)"
+            )
+
+    def test_hook_lib_data_glob_declared(self):
+        sys.path.insert(0, str(REPO_ROOT))
+        from vco_lib.bundle_globs import hook_lib_data_globs
+        assert "*.txt" in hook_lib_data_globs()
+
+
+class TestStateDirExclusions:
+    """SF-1 confirmation pins: the tee dir sits in the two exclusion regimes
+    the review asked to have named. (KG/docs sync needs no pin: the routing
+    home `_lib/route-touched-path.sh` only routes knowledge/**, docs/**.md,
+    diagrams and code extensions — `.claude/state/**` matches no route.)"""
+
+    def test_git_exclude_covers_the_whole_claude_tree(self):
+        sys.path.insert(0, str(REPO_ROOT))
+        from vco_lib.git_exclude import VCO_EXCLUSIVE_TOPLEVEL
+        assert VCO_EXCLUSIVE_TOPLEVEL[".claude"] == "/.claude/", (
+            "bundle add/update writes /.claude/ to .git/info/exclude — the "
+            "tee dir must stay inside that exclusion"
+        )
+
+    def test_tee_paths_are_codegraph_purgeable(self):
+        sys.path.insert(0, str(REPO_ROOT))
+        from vco_lib.codegraph_row_classify import classify_row
+        verdict = classify_row(
+            {"file_path": ".claude/state/lean-ctx-tee/20260101T000000Z-1-ab.log"},
+            None,
+        )
+        assert verdict == "purgeable", (
+            f"tee paths must classify transient (got {verdict!r}) — the "
+            "code graph never indexes .claude/state/"
+        )
+
+
+# ─── pwsh-gated .ps1 parity ──────────────────────────────────────────────
+
+def _make_failing_chmod_shim(shim_dir: Path) -> Path:
+    """A `chmod` that always fails, first on PATH — simulates a POSIX host
+    where dir/file privacy cannot be established (NF-4)."""
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    shim = shim_dir / "chmod"
+    shim.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    shim.chmod(0o755)
+    return shim_dir
+
+
+@pytest.mark.skipif(not _HAS_PWSH, reason="pwsh not installed")
+class TestPs1HookParity:
+    @pytest.mark.parametrize("cmd", WRAP_CASES)
+    def test_allow_listed_command_wrapped(self, cmd, tmp_path):
+        res = _run_ps1_hook(cmd, tmp_path)
+        assert res.returncode == 0, res.stderr
+        out = res.stdout.strip()
+        assert out, f"ps1: allow-listed command must be wrapped: {cmd}"
+        data = json.loads(out)
+        hso = data["hookSpecificOutput"]
+        assert "permissionDecision" not in json.dumps(hso)
+        wrapped = hso["updatedInput"]["command"]
+        assert "lean-ctx-tee.ps1" in wrapped, wrapped
+        cmdfiles = list(_rawdir(tmp_path / "proj").glob("*.cmd"))
+        assert len(cmdfiles) == 1
+        assert cmdfiles[0].read_text(encoding="utf-8") == cmd
+
+    @pytest.mark.parametrize("cmd", RAW_CASES)
+    def test_everything_else_runs_raw(self, cmd, tmp_path):
+        res = _run_ps1_hook(cmd, tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            f"ps1: non-allow-listed command must run raw: {cmd}"
+        )
+
+    def test_ttl_knob_and_default(self, tmp_path):
+        res = _run_ps1_hook("npm install", tmp_path)
+        wrapped = json.loads(
+            res.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert wrapped.rstrip().endswith("'168'"), wrapped
+        res = _run_ps1_hook("npm install", tmp_path,
+                            env_file="VCO_LEAN_CTX_TEE_TTL_HOURS=24\n")
+        wrapped = json.loads(
+            res.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert wrapped.rstrip().endswith("'24'"), wrapped
+
+    def test_default_off_disables_wrapping(self, tmp_path):
+        res = _run_ps1_hook("npm install", tmp_path,
+                            env_file="VCO_LEAN_CTX_DEFAULT=off\n")
+        assert res.stdout.strip() == ""
+
+    def test_other_tool_input_fields_preserved(self, tmp_path):
+        res = _run_ps1_hook(
+            "npm install", tmp_path,
+            extra_tool_input={"description": "Install deps"})
+        ui = json.loads(res.stdout)["hookSpecificOutput"]["updatedInput"]
+        assert ui["description"] == "Install deps"
+
+    def test_hook_never_invokes_the_binary_at_rewrite_time(self, tmp_path):
+        res = _run_ps1_hook("npm install", tmp_path)
+        assert res.stdout.strip(), "wrap expected"
+        argv_log = tmp_path / "argv.log"
+        assert not argv_log.exists()
+
+    def test_claude_project_dir_governs_tee_location(self, tmp_path):
+        proj = tmp_path / "proj"
+        res = _run_ps1_hook("npm install", tmp_path, project_dir=str(proj))
+        assert res.stdout.strip(), "wrap expected"
+        assert len(list(_rawdir(proj).glob("*.cmd"))) == 1
+
+    @pytest.mark.parametrize("val", ["Off", "OFF"])
+    def test_default_off_is_case_insensitive(self, val, tmp_path):
+        """SF-3 parity: the .ps1 already lowercased; pinned so the pair
+        stays symmetric with the .sh case-glob."""
+        res = _run_ps1_hook("npm install", tmp_path,
+                            env_file=f"VCO_LEAN_CTX_DEFAULT={val}\n")
+        assert res.stdout.strip() == ""
+
+    def test_hook_creates_private_dir_and_cmdfile(self, tmp_path):
+        """SF-1 parity: on POSIX hosts (pwsh) the .ps1 hook tightens the
+        tee dir to 0700 and the .cmd file to 0600; on native Windows the
+        tee wrapper applies owner-only ACLs instead (S5 — see
+        TestTeePs1WindowsOwnerOnlyAcl below)."""
+        res = _run_ps1_hook("npm install", tmp_path)
+        assert res.stdout.strip(), "wrap expected"
+        rawdir = _rawdir(tmp_path / "proj")
+        assert stat.S_IMODE(rawdir.stat().st_mode) == 0o700
+        (cf,) = rawdir.glob("*.cmd")
+        assert stat.S_IMODE(cf.stat().st_mode) == 0o600
+
+    def test_chmod_failure_fails_closed_with_no_default_perm_artifact(self, tmp_path):
+        """NF-4: when dir privacy cannot be ESTABLISHED (chmod fails on a
+        POSIX host), the hook must fail closed — no rewrite, and never a
+        cmd file sitting at default permissions. The .sh sibling gets this
+        from os.chmod raising into the nothing() arm; the .ps1 must match.
+        Red against the pre-NF-4 code, which chmod-ed best-effort AFTER a
+        default-permission create and wrapped regardless."""
+        shim = _make_failing_chmod_shim(tmp_path / "shim")
+        bin_dir = tmp_path / "fakebin"
+        _make_fake_lean_ctx(bin_dir)
+        env = dict(os.environ)
+        env.pop("VCT_DISABLE_HOOKS", None)
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["PATH"] = f"{shim}{os.pathsep}{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        proj = tmp_path / "proj"
+        proj.mkdir(parents=True, exist_ok=True)
+        res = subprocess.run(
+            ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+            input=_payload("npm install"), capture_output=True, text=True,
+            cwd=proj, env=env, timeout=60,
+        )
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            "unprovable dir privacy must fail closed (raw), not wrap"
+        )
+        rawdir = _rawdir(proj)
+        for f in (rawdir.glob("*") if rawdir.exists() else []):
+            assert stat.S_IMODE(f.stat().st_mode) == 0o600, (
+                f"no artifact may hold command text at default perms: {f}"
+            )
+
+
+@pytest.mark.skipif(not _HAS_PWSH, reason="pwsh not installed")
+class TestTeeWrapperPs1:
+    def _run(self, cmd_text: str, tmp_path: Path, *, ttl: str = "168",
+             failing: bool = False):
+        bin_dir = tmp_path / "fakebin"
+        fake = _make_fake_lean_ctx(bin_dir, failing=failing)
+        rawdir = tmp_path / "raw"
+        rawdir.mkdir(parents=True, exist_ok=True)
+        cmdfile = rawdir / "run.cmd"
+        cmdfile.write_text(cmd_text, encoding="utf-8")
+        env = dict(os.environ)
+        return subprocess.run(
+            ["pwsh", "-NoProfile", "-File", str(TEE_PS1),
+             str(fake), str(rawdir), str(cmdfile), ttl],
+            capture_output=True, text=True, cwd=tmp_path, env=env,
+            timeout=120,
+        )
+
+    def test_compressed_run_writes_raw_file_and_pointer(self, tmp_path):
+        res = self._run("seq 1 120", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert "COMPRESSED-BY-FAKE" in res.stdout
+        logs = list((tmp_path / "raw").glob("*.log"))
+        assert len(logs) == 1
+        assert logs[0].read_text(encoding="utf-8").split() == [
+            str(i) for i in range(1, 121)]
+        m = _POINTER_RE.search(res.stdout)
+        assert m, f"ps1 pointer line missing: {res.stdout!r}"
+        assert m.group(1) == "120"
+        assert m.group(3) == str(logs[0])
+
+    def test_exit_code_propagates_with_tee_and_pointer(self, tmp_path):
+        """N-1: an in-process ScriptBlock let a command-text `exit N` kill
+        the WHOLE wrapper before the tee write — the .sh sibling (child
+        `bash -c`) never had that hole. The wrapper must run the command in
+        a child process so `exit 3` still tees, points, and exits 3."""
+        res = self._run("exit 3", tmp_path)
+        assert res.returncode == 3
+        logs = list((tmp_path / "raw").glob("*.log"))
+        assert len(logs) == 1, (
+            "tee must survive a command-text `exit N` (child-process run)"
+        )
+        assert _POINTER_RE.search(res.stdout), (
+            f"pointer must survive a command-text `exit N`: {res.stdout!r}"
+        )
+
+    def test_native_exit_code_propagates(self, tmp_path):
+        res = self._run("bash -c 'exit 4'", tmp_path)
+        assert res.returncode == 4
+        assert len(list((tmp_path / "raw").glob("*.log"))) == 1
+
+    def test_compressor_failure_falls_back_to_raw_output(self, tmp_path):
+        res = self._run("seq 1 120", tmp_path, failing=True)
+        assert res.returncode == 0, res.stderr
+        assert "COMPRESSED-BY-FAKE" not in res.stdout
+        assert re.search(r"^60$", res.stdout, re.M), "raw fallback missing"
+        assert _POINTER_RE.search(res.stdout)
+
+    def test_tee_artifacts_are_private(self, tmp_path):
+        """SF-1 parity (pwsh-on-POSIX arm): dir 0700, .log 0600."""
+        res = self._run("seq 1 5", tmp_path)
+        assert res.returncode == 0, res.stderr
+        rawdir = tmp_path / "raw"
+        assert stat.S_IMODE(rawdir.stat().st_mode) == 0o700
+        (log,) = rawdir.glob("*.log")
+        assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+    def test_unwritable_rawdir_runs_command_raw(self, tmp_path):
+        """Parity with the .sh leave-alone arm: no state dir -> no tee ->
+        no compression; the command output passes through UNTOUCHED (a
+        `$null = Invoke-TeeCommand` regression would swallow it)."""
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        fake = _make_fake_lean_ctx(tmp_path / "fakebin")
+        cmdfile = tmp_path / "run.cmd"
+        cmdfile.write_text("seq 1 5", encoding="utf-8")
+        res = subprocess.run(
+            ["pwsh", "-NoProfile", "-File", str(TEE_PS1),
+             str(fake), str(blocker / "sub"), str(cmdfile), "168"],
+            capture_output=True, text=True, cwd=tmp_path, timeout=120,
+        )
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.split() == ["1", "2", "3", "4", "5"]
+        assert "[lean-ctx-tee]" not in res.stdout
+
+    def test_log_private_even_when_chmod_fails(self, tmp_path):
+        """NF-4 parity with the .sh `( umask 077; : >file )` birth: on a
+        POSIX host the .log must be 0600 FROM BIRTH — no dependency on a
+        working chmod, no default-permission window. Red against the
+        pre-NF-4 code (WriteAllText-empty at 0644, then best-effort
+        chmod)."""
+        shim = _make_failing_chmod_shim(tmp_path / "shim")
+        fake = _make_fake_lean_ctx(tmp_path / "fakebin")
+        rawdir = tmp_path / "raw"
+        rawdir.mkdir()
+        cmdfile = rawdir / "run.cmd"
+        cmdfile.write_text("seq 1 5", encoding="utf-8")
+        env = dict(os.environ)
+        env["PATH"] = f"{shim}{os.pathsep}{env.get('PATH', '')}"
+        res = subprocess.run(
+            ["pwsh", "-NoProfile", "-File", str(TEE_PS1),
+             str(fake), str(rawdir), str(cmdfile), "168"],
+            capture_output=True, text=True, cwd=tmp_path, env=env,
+            timeout=120,
+        )
+        assert res.returncode == 0, res.stderr
+        assert "COMPRESSED-BY-FAKE" in res.stdout
+        assert _POINTER_RE.search(res.stdout)
+        (log,) = rawdir.glob("*.log")
+        assert stat.S_IMODE(log.stat().st_mode) == 0o600, (
+            "tee .log must be born 0600 without relying on chmod"
+        )
+
+    def test_oversized_output_counts_bytes_pointer_only(self, tmp_path):
+        """N-2: the 32 MiB gate must count BYTES (UTF-8), not .NET string
+        CHARS — 17M two-byte chars are 34 MB and must trip the gate."""
+        big = "python3 -c \"import sys; sys.stdout.write(chr(233) * 17000000)\""
+        res = self._run(big, tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert "too large" in res.stdout, res.stdout[:200]
+        # >= bound, not byte-exact: the PS pipeline capture normalizes a
+        # trailing newline (+1 byte vs the .sh byte-exact tee) - the
+        # documented cosmetic N-2 divergence. The gate counting CHARS
+        # (17,000,001) instead of BYTES would never trip at all.
+        m = re.search(r"too large to echo \((\d+) bytes\)", res.stdout)
+        assert m and int(m.group(1)) >= 34_000_000, (
+            f"the size arm must report BYTES (>= 34 MB): {res.stdout[:200]}"
+        )
+        assert len(res.stdout) < 5000, "oversized output must not be echoed"
+        (log,) = (tmp_path / "raw").glob("*.log")
+        assert log.stat().st_size >= 34_000_000
+
+    def test_ttl_sweep_deletes_stale_files(self, tmp_path):
+        rawdir = tmp_path / "raw"
+        rawdir.mkdir()
+        old_log = rawdir / "old.log"
+        old_log.write_text("x", encoding="utf-8")
+        ten_days_ago = time.time() - 10 * 86400
+        os.utime(old_log, (ten_days_ago, ten_days_ago))
+        res = self._run("true", tmp_path, ttl="168")
+        assert res.returncode == 0, res.stderr
+        assert not old_log.exists(), "ps1: stale .log must be swept"
+
+    def test_ttl_zero_keeps_everything(self, tmp_path):
+        rawdir = tmp_path / "raw"
+        rawdir.mkdir()
+        old_log = rawdir / "old.log"
+        old_log.write_text("x", encoding="utf-8")
+        ten_days_ago = time.time() - 10 * 86400
+        os.utime(old_log, (ten_days_ago, ten_days_ago))
+        res = self._run("true", tmp_path, ttl="0")
+        assert res.returncode == 0, res.stderr
+        assert old_log.exists(), "ps1: TTL 0 = keep forever"
+
+
+# ─── .claude/env knob parsing: one-quote-pair rule parity ────────────────
+#
+# The .sh sibling SOURCES .claude/env, so the shell removes one quote pair
+# (`VCO_LEAN_CTX_DEFAULT="off"` and `='off'` both arrive as `off`). The .ps1
+# sibling SCANS the raw line, so it must strip exactly ONE surrounding
+# quote pair — single or double, only when the first and last chars are the
+# SAME char — the canonical rule of vco_lib/envfile._strip_one_quote_pair,
+# whose PowerShell home is the SHARED helper
+# templates/hooks/_lib/strip-one-quote-pair.ps1 (dotted by lean-ctx-rewrite.ps1
+# and post-tool-use-async.ps1; the POSIX siblings need no helper — they SOURCE
+# the file).
+# The old Windows code used `.Trim('"').Trim("'")`, which strips ALL leading/
+# trailing quote chars of EITHER kind: a well-formed pair already read as
+# `off` there, but an UNBALANCED / mixed pair (`="off'`) over-stripped to
+# `off` on Windows while the .sh (bad shell quoting → keeps a quote char)
+# kept compressing. These arms pin the strict rule on BOTH siblings; the
+# .ps1 unbalanced arm is the one red against the pre-fix `.Trim()` code.
+
+_OFF_VALUES = ['"off"', "'off'", "off"]
+_UNBALANCED_OFF = 'VCO_LEAN_CTX_DEFAULT="off\'\n'
+
+
+class TestEnvKnobQuoteParsingSh:
+    @pytest.mark.parametrize("val", _OFF_VALUES)
+    def test_quoted_or_bare_off_disables(self, val, tmp_path):
+        res = _run_sh_hook("npm install", tmp_path,
+                           env_file=f"VCO_LEAN_CTX_DEFAULT={val}\n")
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            f"VCO_LEAN_CTX_DEFAULT={val} must disable compression"
+        )
+
+    def test_unbalanced_quote_pair_is_not_off(self, tmp_path):
+        """`="off'` is not a matching pair: sourcing yields `off'` (≠ off),
+        so compression stays ON — the strict one-pair rule."""
+        res = _run_sh_hook("npm install", tmp_path, env_file=_UNBALANCED_OFF)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            "a non-matching quote pair must not read as `off`"
+        )
+
+    def test_stdin_consuming_env_line_does_not_eat_payload(self, tmp_path):
+        """`</dev/null` guard (review N-A): a user-editable .claude/env that
+        runs `read` must not consume the PreToolUse payload before the hook
+        reads it below, or an allow-listed command silently runs raw. Red
+        against the pre-fix hook, which sourced without `</dev/null`."""
+        res = _run_sh_hook(
+            "npm install", tmp_path,
+            env_file="read _LC_DRAIN\nVCO_LEAN_CTX_TEE_TTL_HOURS=24\n")
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            "a `read` line in .claude/env must not swallow the hook payload"
+        )
+
+
+@pytest.mark.skipif(not _HAS_PWSH, reason="pwsh not installed")
+class TestEnvKnobQuoteParsingPs1:
+    @pytest.mark.parametrize("val", _OFF_VALUES)
+    def test_quoted_or_bare_off_disables(self, val, tmp_path):
+        res = _run_ps1_hook("npm install", tmp_path,
+                            env_file=f"VCO_LEAN_CTX_DEFAULT={val}\n")
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            f"ps1: VCO_LEAN_CTX_DEFAULT={val} must disable compression"
+        )
+
+    def test_unbalanced_quote_pair_is_not_off(self, tmp_path):
+        """RED against the pre-fix `.Trim('"').Trim("'")`, which over-stripped
+        the mixed pair to `off` and disabled compression; the strict
+        one-pair rule (matching .sh source semantics +
+        vco_lib/envfile._strip_one_quote_pair) keeps compression ON. This is
+        the arm that discriminates the two rules."""
+        res = _run_ps1_hook("npm install", tmp_path, env_file=_UNBALANCED_OFF)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            "ps1: a non-matching quote pair must not read as `off`"
+        )
+
+    def test_ttl_one_quote_pair_stripped(self, tmp_path):
+        res = _run_ps1_hook("npm install", tmp_path,
+                            env_file='VCO_LEAN_CTX_TEE_TTL_HOURS="24"\n')
+        wrapped = json.loads(
+            res.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert wrapped.rstrip().endswith("'24'"), wrapped
+
+
+# ─── the one-quote-pair rule's SHARED PowerShell home ────────────────────
+#
+# Extracted (v0.2.101) so the rule lives in exactly ONE place, dotted by
+# both PowerShell consumers; the POSIX siblings need no helper because they
+# SOURCE .claude/env and the shell already removes one quote pair.
+
+
+@pytest.mark.skipif(not _HAS_PWSH, reason="pwsh not installed")
+class TestOneQuotePairSharedHelper:
+    """Direct unit test of the shared helper, independent of either hook, so
+    a regression in the ONE home reds here before reaching a consumer."""
+
+    def _run(self, raw: str, tmp_path: Path) -> str:
+        script = (
+            ". '" + str(ONE_QUOTE_PAIR_HELPER).replace("'", "''") + "'; "
+            "$raw = [Console]::In.ReadToEnd(); "
+            "[Console]::Out.Write((Strip-OneQuotePair $raw))"
+        )
+        res = subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", script],
+            input=raw, capture_output=True, text=True, cwd=tmp_path,
+            timeout=60,
+        )
+        assert res.returncode == 0, res.stderr
+        return res.stdout
+
+    @pytest.mark.parametrize("raw,expected", [
+        ('"off"', "off"),
+        ("'off'", "off"),
+        ("off", "off"),
+        ('"on"', "on"),
+        ('""', ""),
+        ("''", ""),
+        # non-matching / unbalanced pairs are left EXACTLY as-is
+        ("\"off'", "\"off'"),
+        ("'off\"", "'off\""),
+        ('"off', '"off'),
+        ('off"', 'off"'),
+        ("'", "'"),
+        ("", ""),
+    ])
+    def test_rule_matrix(self, raw, expected, tmp_path):
+        assert self._run(raw, tmp_path) == expected
+
+
+class TestOneQuotePairSingleHome:
+    """The rule lives in ONE place: both PowerShell consumers dot the shared
+    helper and carry no inline copy."""
+
+    def test_helper_defines_the_rule(self):
+        body = ONE_QUOTE_PAIR_HELPER.read_text(encoding="utf-8-sig")
+        assert "function Strip-OneQuotePair" in body, (
+            "the shared home must define the function"
+        )
+        assert "Substring(1, " in body, "the rule body must live here"
+
+    def test_both_ps1_consumers_dot_the_shared_helper(self):
+        for hook in (PS1_HOOK, DISPATCHER_PS1):
+            src = hook.read_text(encoding="utf-8-sig")
+            assert "strip-one-quote-pair.ps1" in src, (
+                f"{hook.name} must dot the shared one-quote-pair helper"
+            )
+
+    def test_no_inline_copy_of_the_rule_remains(self):
+        for hook in (PS1_HOOK, DISPATCHER_PS1):
+            src = hook.read_text(encoding="utf-8-sig")
+            assert "$q0 = " not in src, (
+                f"{hook.name} still holds an inline copy of the quote rule"
+            )
+            assert ".Substring(1, " not in src, (
+                f"{hook.name} still holds the inline Substring strip"
+            )
+
+
+# ─── S5: Windows owner-only ACL on the tee dir/files (one home: the lib) ──
+#
+# The CHANGELOG promises "on Windows the hook skips compression if it cannot
+# make them private". The mechanism lives ONCE in lean-ctx-tee.ps1 between the
+# S5-ACL-BEGIN/END markers: New-OwnerOnlyAcl builds a protected DACL
+# (inheritance disabled, no inherited rules kept, one FullControl allow rule
+# for the current user's SID) and Set-OwnerOnlyAcl applies it, converting ANY
+# failure into $false so the caller takes an EXISTING pass-through arm:
+#   - dir call site  -> the "no state dir" arm (no tee at all),
+#   - file call site -> the `$born = $false` arm (no tee, uncompressed).
+# Native Windows enforcement cannot run on a Linux CI host, but the failure
+# half of the .NET ACL stack CAN: WindowsIdentity::GetCurrent() and the
+# FileSecurity/DirectorySecurity constructors throw there, exactly like a
+# Set-Acl failure on an ACL-less Windows filesystem. So the tests extract the
+# marked block (unit level, with the platform gate patched and Set-Acl /
+# New-OwnerOnlyAcl overridden as probe functions) and run PATCHED COPIES of
+# the whole lib (end-to-end level) to genuinely exercise both skip arms.
+# Red-proof (recorded in the fix report): mutating either call site back to
+# `$dirOk = $true` / `$born = $true` flips the corresponding end-to-end arm
+# from pass-through back to compressed output, failing its test.
+
+_ACL_GATE_LINE = (
+    "if ([System.Environment]::OSVersion.Platform -ne "
+    "[System.PlatformID]::Win32NT) { return $true }"
+)
+_BIRTH_PLATFORM_LINE = (
+    "if ([System.Environment]::OSVersion.Platform -ne "
+    "[System.PlatformID]::Win32NT) {\n"
+)
+
+
+def _acl_block() -> str:
+    """Extract the marked one-home block (functions + contract comment)."""
+    src = TEE_PS1.read_text(encoding="utf-8-sig")
+    begin = src.index("# S5-ACL-BEGIN")
+    end = src.index("# S5-ACL-END")
+    block = src[begin:end]
+    assert "function New-OwnerOnlyAcl" in block
+    assert "function Set-OwnerOnlyAcl" in block
+    assert _ACL_GATE_LINE in block
+    return block
+
+
+def _force_win32(block: str) -> str:
+    """Patch the platform gate so the Windows body runs on a Linux host."""
+    assert block.count(_ACL_GATE_LINE) == 1
+    return block.replace(_ACL_GATE_LINE, "if ($false) { return $true }")
+
+
+def _write_patched_lib(tmp_path: Path, *, gate: str,
+                       force_windows_birth: bool = False) -> Path:
+    """A whole-lib copy with Set-OwnerOnlyAcl's platform gate replaced (and
+    optionally the birth branch forced down the Win32NT path) so the real
+    body runs — and throws — on Linux, exactly like a Set-Acl failure on an
+    ACL-less Windows filesystem."""
+    src = TEE_PS1.read_text(encoding="utf-8-sig")
+    assert src.count(_ACL_GATE_LINE) == 1
+    patched = src.replace(_ACL_GATE_LINE, gate)
+    if force_windows_birth:
+        assert patched.count(_BIRTH_PLATFORM_LINE) == 1
+        patched = patched.replace(_BIRTH_PLATFORM_LINE, "if ($false) {\n")
+    lib = tmp_path / "lean-ctx-tee-s5patched.ps1"
+    lib.write_text(patched, encoding="utf-8")
+    return lib
+
+
+def _run_lib(lib: Path, cmd_text: str, tmp_path: Path):
+    """Run a (possibly patched) tee lib end-to-end, fake lean-ctx first."""
+    fake = _make_fake_lean_ctx(tmp_path / "fakebin")
+    rawdir = tmp_path / "raw"
+    rawdir.mkdir(parents=True, exist_ok=True)
+    cmdfile = rawdir / "run.cmd"
+    cmdfile.write_text(cmd_text, encoding="utf-8")
+    env = dict(os.environ)
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(lib),
+         str(fake), str(rawdir), str(cmdfile), "168"],
+        capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120,
+    )
+
+
+def _run_harness(harness_src: str, tmp_path: Path, target: Path):
+    """Run an extracted-block harness; returns (CompletedProcess, marker)."""
+    harness = tmp_path / "s5-harness.ps1"
+    harness.write_text(harness_src, encoding="utf-8")
+    marker = tmp_path / "acl-marker"
+    env = dict(os.environ)
+    env["ACL_MARKER"] = str(marker)
+    env["ACL_PATH"] = str(target)
+    res = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        capture_output=True, text=True, cwd=tmp_path, env=env, timeout=60,
+    )
+    return res, marker
+
+
+# Set-Acl as a probe FUNCTION: PowerShell resolves functions before cmdlets,
+# so the override captures every call the extracted block would make to the
+# real cmdlet (which cannot succeed on Linux anyway).
+_SET_ACL_PROBE = (
+    "function Set-Acl { param($LiteralPath, $AclObject, $ErrorAction)\n"
+    "    Set-Content -LiteralPath $env:ACL_MARKER -Value "
+    '("$LiteralPath|$($null -ne $AclObject)|$($AclObject.Dir)")\n'
+    "}\n"
+)
+_STUB_NEW_ACL = (
+    "function New-OwnerOnlyAcl([switch]$Directory) {\n"
+    "    return [pscustomobject]@{ Dir = [bool]$Directory }\n"
+    "}\n"
+)
+
+
+@pytest.mark.skipif(not _HAS_PWSH, reason="pwsh not installed")
+class TestTeePs1WindowsOwnerOnlyAcl:
+    def test_non_win32_takes_no_acl_path(self, tmp_path):
+        """(c) On a non-Win32 host Set-OwnerOnlyAcl is a $true no-op and NO
+        ACL call is attempted — the probe Set-Acl override must never fire
+        (marker absent), and the POSIX chmod/umask path governs privacy."""
+        target = tmp_path / "target"
+        target.mkdir()
+        harness = (
+            _acl_block() + "\n" + _SET_ACL_PROBE
+            + "[Console]::Out.Write([string](Set-OwnerOnlyAcl $env:ACL_PATH"
+              " -Directory))\n"
+        )
+        res, marker = _run_harness(harness, tmp_path, target)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "True", (
+            "the non-Win32 early return must be a silent $true no-op"
+        )
+        assert not marker.exists(), (
+            "no ACL call may be attempted off Win32NT"
+        )
+
+    def test_win32_success_path_applies_acl_and_returns_true(self, tmp_path):
+        """(a) With the gate forced (Windows stand-in) and the two
+        Windows-only primitives stubbed, the orchestration runs to success:
+        Set-Acl is invoked ONCE with the target path and a non-null ACL
+        object built by New-OwnerOnlyAcl, and the function returns $true —
+        compression proceeds normally."""
+        target = tmp_path / "target"
+        target.mkdir()
+        harness = (
+            _force_win32(_acl_block()) + "\n" + _STUB_NEW_ACL + _SET_ACL_PROBE
+            + "[Console]::Out.Write([string](Set-OwnerOnlyAcl $env:ACL_PATH"
+              " -Directory))\n"
+        )
+        res, marker = _run_harness(harness, tmp_path, target)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "True"
+        assert marker.exists(), "Set-Acl must be invoked on the Win32 path"
+        recorded = marker.read_text(encoding="utf-8").strip()
+        path, has_acl, is_dir = recorded.split("|")
+        assert path == str(target)
+        assert has_acl == "True", "a non-null ACL object must be applied"
+        assert is_dir == "True", "-Directory must reach New-OwnerOnlyAcl"
+
+    def test_acl_failure_returns_false_silently(self, tmp_path):
+        """Unit level of the skip promise: with the gate forced and NO
+        stubs, the real body throws on Linux (WindowsIdentity/FileSecurity
+        are Windows-only — the same $false the catch produces for a Set-Acl
+        failure on an ACL-less Windows filesystem), and the function reports
+        $false with ZERO stdout/stderr noise (conservative-arm contract)."""
+        target = tmp_path / "target"
+        target.mkdir()
+        harness = (
+            _force_win32(_acl_block()) + "\n"
+            + "[Console]::Out.Write([string](Set-OwnerOnlyAcl $env:ACL_PATH"
+              " -Directory))\n"
+        )
+        res, marker = _run_harness(harness, tmp_path, target)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "False"
+        assert res.stderr.strip() == "", (
+            "an ACL failure must be silent (no stderr noise, ever)"
+        )
+        assert not marker.exists()
+
+    def test_dir_acl_failure_takes_no_state_dir_arm(self, tmp_path):
+        """(b1) END-TO-END skip arm: dir ACL cannot be established -> the
+        EXISTING 'no state dir' pass-through arm fires — raw output, no
+        pointer, no tee file, exit code preserved, stderr silent. Red if the
+        `$dirOk = Set-OwnerOnlyAcl $RawDir -Directory` call site is removed
+        (the patched lib then compresses)."""
+        lib = _write_patched_lib(tmp_path, gate="if ($false) { return $true }")
+        res = _run_lib(lib, "seq 1 5", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stderr.strip() == "", "ACL failure must be silent"
+        assert res.stdout.split() == ["1", "2", "3", "4", "5"], (
+            f"uncompressed pass-through expected, got: {res.stdout!r}"
+        )
+        assert "[lean-ctx-tee]" not in res.stdout
+        assert "COMPRESSED-BY-FAKE" not in res.stdout
+        assert not list((tmp_path / "raw").glob("*.log")), (
+            "no tee file may exist when the dir cannot be made private"
+        )
+
+    def test_file_acl_failure_takes_born_false_arm(self, tmp_path):
+        """(b2) END-TO-END skip arm at the FILE call site: dir ACL succeeds
+        (gate patched to honor -Directory) but the file ACL fails -> the
+        EXISTING `$born = $false` arm fires: raw pass-through, no pointer,
+        and the just-created .log stays EMPTY (no output was ever written to
+        a file that could not be made private). Red if
+        `$born = Set-OwnerOnlyAcl $raw` is mutated back to `$born = $true`."""
+        lib = _write_patched_lib(
+            tmp_path, gate="if ($Directory) { return $true }",
+            force_windows_birth=True)
+        res = _run_lib(lib, "seq 1 5", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stderr.strip() == "", "ACL failure must be silent"
+        assert res.stdout.split() == ["1", "2", "3", "4", "5"], (
+            f"uncompressed pass-through expected, got: {res.stdout!r}"
+        )
+        assert "[lean-ctx-tee]" not in res.stdout
+        assert "COMPRESSED-BY-FAKE" not in res.stdout
+        logs = list((tmp_path / "raw").glob("*.log"))
+        assert len(logs) == 1, "the birth-create ran before the ACL failed"
+        assert logs[0].stat().st_size == 0, (
+            "no output may be written to a tee file that is not private"
+        )
+
+    def test_unpatched_lib_still_compresses_on_posix(self, tmp_path):
+        """The gate is real: on this (non-Win32) host the UNPATCHED lib must
+        keep compressing — the ACL additions are no-ops here, so a passing
+        run is also the (c)-arm's end-to-end evidence (had the lib attempted
+        an ACL on POSIX, it would have failed and passed through raw)."""
+        res = _run_lib(TEE_PS1, "seq 1 5", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert "COMPRESSED-BY-FAKE" in res.stdout
+        assert _POINTER_RE.search(res.stdout)
+        (log,) = (tmp_path / "raw").glob("*.log")
+        assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+
+class TestS5OneHomeAndPromiseTexts:
+    """Static pins: the idiom's ONE home, the wired call sites, and the
+    retired 'profile ACLs' claim. The behavioural proof that the call sites
+    FIRE lives in TestTeePs1WindowsOwnerOnlyAcl above (mutating either one
+    reds an end-to-end arm)."""
+
+    def test_acl_idiom_defined_once_in_the_lib(self):
+        lib = TEE_PS1.read_text(encoding="utf-8-sig")
+        assert lib.count("function New-OwnerOnlyAcl") == 1
+        assert lib.count("function Set-OwnerOnlyAcl") == 1
+        assert lib.count("SetAccessRuleProtection($true, $false)") == 1
+        # the owner-only ingredients: inheritance disabled + current user's
+        # SID + FullControl allow, applied via Set-Acl -ErrorAction Stop
+        assert "WindowsIdentity]::GetCurrent().User" in lib
+        assert "FileSystemRights]::FullControl" in lib
+        assert "AccessControlType]::Allow" in lib
+        assert "Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop" \
+            in lib
+        # never SHELL OUT to icacls (a second process + quoting hazard) —
+        # the word may appear in comments explaining why it is avoided
+        code_lines = [ln for ln in lib.splitlines()
+                      if not ln.lstrip().startswith("#")]
+        assert not any("icacls" in ln for ln in code_lines)
+
+    def test_no_second_home_of_the_idiom(self):
+        for other in (PS1_HOOK, TEE_SH, SH_HOOK):
+            src = other.read_text(encoding="utf-8-sig")
+            assert "SetAccessRuleProtection" not in src, other.name
+            assert "function Set-OwnerOnlyAcl" not in src, other.name
+            assert "function New-OwnerOnlyAcl" not in src, other.name
+
+    def test_both_enforcement_points_wired(self):
+        lib = TEE_PS1.read_text(encoding="utf-8-sig")
+        assert lib.count("$dirOk = Set-OwnerOnlyAcl $RawDir -Directory") == 1
+        assert lib.count("$born = Set-OwnerOnlyAcl $raw") == 1
+
+    def test_profile_acl_claim_retired_everywhere(self):
+        for f in (TEE_PS1, PS1_HOOK, SH_HOOK, TEE_SH, ORCH_TEMPLATE,
+                  CHANGELOG):
+            src = f.read_text(encoding="utf-8-sig")
+            assert "profile ACLs are the equivalent" not in src, f
+            assert "user-profile ACLs are the equivalent" not in src, f
+
+    def test_promise_texts_name_the_real_mechanism(self):
+        tpl = ORCH_TEMPLATE.read_text(encoding="utf-8-sig")
+        assert "owner-only ACL" in tpl
+        assert "skips compression" in tpl
+        ch = CHANGELOG.read_text(encoding="utf-8-sig")
+        # The FIRST VERSIONED block (the release being cut) — the entry
+        # moved out of [Unreleased] at tag time, so anchor on the version
+        # header, not the (now empty) Unreleased section.
+        first_versioned = ch.split("## [", 3)[2]
+        assert "owner-only ACL" in first_versioned
+        assert "skips compression if it cannot make them private" in first_versioned
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

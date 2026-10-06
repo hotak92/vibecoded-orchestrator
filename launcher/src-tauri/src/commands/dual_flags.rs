@@ -277,7 +277,24 @@ pub async fn set_dual_flag_for_project(
     let flag = DualFlag::from_wire(&flag)?;
     db.set_dual_flag_for_project(&project_id, flag, value)?;
     // Soft-fail: warnings ride along, the DB write is never rolled back.
-    let _ = crate::commands::projects_v2::reproject_env_soft(&db, &project_id);
+    // F3: the re-projection is a Python subprocess (300 s cap), so it runs
+    // on the blocking pool, not a tokio worker. A join failure is soft-fail
+    // too — the DB write above already committed.
+    let pid = project_id.clone();
+    if let Err(e) = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app.clone(),
+        "set_dual_flag_for_project env re-projection",
+        move |db| {
+            let _ = crate::commands::projects_v2::reproject_env_soft(db, &pid);
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            "[vct] warning: set_dual_flag_for_project: {} (DB write already committed)",
+            e
+        );
+    }
     // Return the RESOLVED state so the panel re-renders from the truth
     // (the coherence cascade may have moved a second flag) — and decide the
     // ensure from that same resolved state, never from the request (W3R-16).
@@ -334,6 +351,12 @@ pub fn set_dual_flag_global_default_with_db(
 /// Applies the log⟹write cascade at the global tier, then re-projects every
 /// registered project's env so inheriting projects pick the change up now
 /// rather than at some later refresh.
+///
+/// F3 / v0.2.101 review S6: the re-projection is N serial Python
+/// subprocesses (up to 300 s EACH since v0.2.101), so the whole sync core
+/// runs on the blocking pool — inline, a wedged child parked a tokio worker
+/// for N × 300 s and starved unrelated commands. The DB write lives inside
+/// the closure, so a join failure is propagated, not swallowed.
 #[command]
 pub async fn set_dual_flag_global_default(
     flag: String,
@@ -342,7 +365,12 @@ pub async fn set_dual_flag_global_default(
     db: State<'_, Db>,
 ) -> Result<DualFlagGlobalWriteResult, String> {
     let flag = DualFlag::from_wire(&flag)?;
-    let mut result = set_dual_flag_global_default_with_db(&db, flag, value)?;
+    let mut result = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app.clone(),
+        "set_dual_flag_global_default",
+        move |db| set_dual_flag_global_default_with_db(db, flag, value),
+    )
+    .await??;
     if value {
         result.model_ensure_started = start_model_ensure(&db, app, None);
     }

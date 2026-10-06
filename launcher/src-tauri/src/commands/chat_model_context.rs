@@ -227,6 +227,43 @@ pub fn export_now(db: &Db) -> ExportReport {
 
 // ─── Boot ─────────────────────────────────────────────────────────────────
 
+/// The one-line boot summary of a converge, or `None` for a boot that wrote
+/// nothing (a quiet boot stays quiet — no line, so `unchanged`-only runs do
+/// not spam the log on every launch).
+///
+/// A RETIRE-ONLY converge is not quiet (v0.2.101, review nit 3): a row
+/// vanished from the table and no pane shows a per-row trace (the reseed
+/// toast carries the count, the retire log lines in the core module name
+/// the ids). Extracted as a pure function so the fire/quiet boundary is
+/// testable without a tracing subscriber.
+fn converge_summary_line(path: &Path, outcome: &ReseedOutcome) -> Option<String> {
+    if outcome.inserted == 0 && outcome.updated == 0 && outcome.retired == 0 {
+        return None;
+    }
+    // The retired IDS are named by the per-row provenance lines
+    // (`action=retired`); this summary carries the hint those lines do not,
+    // so a user who still wants a retired id knows how to keep it.
+    let retire_hint = if outcome.retired > 0 {
+        " (a retired row was machine-seeded and is absent from the shipped \
+         seed, so the gateway refuses it on every route; re-add it in the \
+         model-context pane to keep it listed — a hand-added row is never \
+         retired)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "[vct] chat-model context: converged with {}: {} new, {} refreshed, \
+         {} retired, {} unchanged, {} user edit(s) preserved{}",
+        path.display(),
+        outcome.inserted,
+        outcome.updated,
+        outcome.retired,
+        outcome.unchanged,
+        outcome.preserved_user_edits,
+        retire_hint
+    ))
+}
+
 /// Boot converge + export, called once from `lib.rs::run`.
 ///
 /// The converge brings the table in step with the shipped seed per row —
@@ -251,16 +288,9 @@ pub fn seed_and_export_on_boot(db: &Db) {
     match load_seed_rows(db) {
         Ok(Some((path, rows))) => match db.converge_chat_model_context_seed(&rows) {
             Ok(outcome) => {
-                if outcome.inserted > 0 || outcome.updated > 0 {
-                    tracing::info!(
-                        "[vct] chat-model context: converged with {}: {} new, {} \
-                         refreshed, {} unchanged, {} user edit(s) preserved",
-                        path.display(),
-                        outcome.inserted,
-                        outcome.updated,
-                        outcome.unchanged,
-                        outcome.preserved_user_edits
-                    );
+                log_written_rows(PROVENANCE_SOURCE_CATALOG_SYNC, &outcome);
+                if let Some(line) = converge_summary_line(&path, &outcome) {
+                    tracing::info!("{}", line);
                 }
             }
             Err(e) => tracing::warn!("[vct] chat-model context: seeding failed: {}", e),
@@ -454,6 +484,74 @@ pub async fn chat_model_context_status(
 // keeping the logic in the command body would leave the export-on-mutation
 // promise backed by nothing but a code reading.
 
+// ─── v0.2.101 (Q6 / G1): the model-row provenance log ─────────────────────
+//
+// The owner saw a duplicate row in Claude Code's /model picker at each new
+// Claude release (P300 G1 ≡ P299-A6b) and the producer was untraceable
+// because no layer records WHERE a picker-shaping row came from. These
+// table rows are that shape's persistent state: the gateway reads the
+// exported table and advertises `window_1m` rows as `<id>[1m]`, so every
+// writer of a row — and every remover of one — is a candidate producer of
+// the next picker change. ONE log-line shape, ONE home (this module — the
+// layer that owns every write path), emitted to the launcher's tracing log:
+//
+//     [vct] model-picker row: model=<id> source=<source> action=<action>
+//
+// The four sources are the four writers below:
+//   * `gateway-catalog-sync` — the boot converge of the shipped gateway
+//     catalog seed (`seed_and_export_on_boot`);
+//   * `gui-add`             — the Preferences pane's row editor
+//     (`upsert_and_export`);
+//   * `gui-delete`          — the Preferences pane's delete button
+//     (`delete_and_export`);
+//   * `reseed-import`       — the "Reseed from shipped defaults" import
+//     (`reseed_and_export`).
+// The actions:
+//   * `upsert`    — `gui-add` wrote the row (insert or edit);
+//   * `inserted` / `updated` — a converge/reseed pass wrote a shipped row;
+//   * `retired`   — a converge/reseed pass removed a machine-seeded row the
+//     shipped seed no longer lists (attributed to the pass that did it:
+//     `gateway-catalog-sync` on boot, `reseed-import` on the button). Before
+//     review S3 a retire logged a differently-shaped line from the DB layer,
+//     so grepping this shape missed every retire;
+//   * `delete`    — `gui-delete` removed the row (and wrote its tombstone);
+//   * `tombstone` — `gui-delete` matched no row but still wrote the delete
+//     tombstone, which stops every later boot converge from inserting that
+//     id — a picker-shaping write with no row change, so it logs too.
+// Only rows actually WRITTEN log (a steady-state boot converges an
+// unchanged table and stays silent), so the log names exactly the row
+// appearances, changes and removals a picker-trace needs.
+
+/// Provenance source ids — see the module block above.
+pub const PROVENANCE_SOURCE_CATALOG_SYNC: &str = "gateway-catalog-sync";
+pub const PROVENANCE_SOURCE_GUI_ADD: &str = "gui-add";
+pub const PROVENANCE_SOURCE_GUI_DELETE: &str = "gui-delete";
+pub const PROVENANCE_SOURCE_RESEED_IMPORT: &str = "reseed-import";
+
+/// The ONE log-line shape (pure, so tests pin the format itself).
+pub fn model_picker_row_provenance_line(
+    source: &str,
+    model_id: &str,
+    action: &str,
+) -> String {
+    format!("[vct] model-picker row: model={model_id} source={source} action={action}")
+}
+
+fn log_model_picker_row_provenance(source: &str, model_id: &str, action: &str) {
+    tracing::info!(
+        "{}",
+        model_picker_row_provenance_line(source, model_id, action)
+    );
+}
+
+/// Log one line per row a converge/reseed pass actually wrote (the
+/// `written` record the DB layer returns; empty on a steady-state boot).
+fn log_written_rows(source: &str, outcome: &ReseedOutcome) {
+    for (model_id, action) in &outcome.written {
+        log_model_picker_row_provenance(source, model_id, action);
+    }
+}
+
 /// Insert or update one row FROM THE GUI, so `user_edited = 1` — which is
 /// what protects it from every automatic path that re-applies the shipped
 /// rows (the boot converge and "Reseed from shipped defaults" alike) — then
@@ -463,6 +561,7 @@ pub fn upsert_and_export(
     input: ChatModelContextInput,
 ) -> Result<ChatModelContextMutation, String> {
     let row = db.upsert_chat_model_context(input, true)?;
+    log_model_picker_row_provenance(PROVENANCE_SOURCE_GUI_ADD, &row.model_id, "upsert");
     Ok(ChatModelContextMutation {
         row: Some(row),
         deleted: false,
@@ -474,8 +573,19 @@ pub fn upsert_and_export(
 /// Delete one row, then re-export. A missing row is `deleted: false`, not an
 /// error — but it still re-exports, so a stale file left by an earlier failed
 /// export converges on the next attempt.
+///
+/// Logs its provenance line like every other writer (review S3): `delete`
+/// when a row went, `tombstone` when none matched but the delete tombstone
+/// was still written (it suppresses the id on every later boot converge).
+/// A failed delete logs nothing — nothing was written.
 pub fn delete_and_export(db: &Db, model_id: &str) -> Result<ChatModelContextMutation, String> {
-    let deleted = db.delete_chat_model_context(model_id.trim())?;
+    let model_id = model_id.trim();
+    let deleted = db.delete_chat_model_context(model_id)?;
+    log_model_picker_row_provenance(
+        PROVENANCE_SOURCE_GUI_DELETE,
+        model_id,
+        if deleted { "delete" } else { "tombstone" },
+    );
     Ok(ChatModelContextMutation {
         row: None,
         deleted,
@@ -504,6 +614,7 @@ pub fn reseed_and_export(db: &Db) -> Result<ChatModelContextMutation, String> {
         }
     };
     let outcome = db.reseed_chat_model_context(&rows)?;
+    log_written_rows(PROVENANCE_SOURCE_RESEED_IMPORT, &outcome);
     Ok(ChatModelContextMutation {
         row: None,
         deleted: false,
@@ -562,9 +673,57 @@ mod tests {
             context_window: 200_000,
             max_output: 128_000,
             window_1m: false,
+            text_only: false,
             source: "https://docs.z.ai/guides/llm/glm-5.1".into(),
             source_note: String::new(),
         }
+    }
+
+    /// Capture every tracing event `f` emits (message field only), so the
+    /// provenance-emission tests assert REAL output rather than a code
+    /// reading. Same shape as `upstream_fetch.rs`'s CaptureLogs.
+    #[cfg(unix)]
+    fn capture_tracing(f: impl FnOnce()) -> Vec<String> {
+        struct MessageOf(String);
+        impl tracing::field::Visit for MessageOf {
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        struct CaptureLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl tracing::Subscriber for CaptureLogs {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(
+                &self,
+                _: &tracing::span::Id,
+                _: &tracing::span::Id,
+            ) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut m = MessageOf(String::new());
+                event.record(&mut m);
+                self.0.lock().unwrap().push(m.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _sub = tracing::subscriber::set_default(CaptureLogs(logs.clone()));
+        f();
+        let out = logs.lock().unwrap().clone();
+        out
     }
 
     /// A directory `resolve_orchestrator_root` accepts as a clone (install.py
@@ -782,6 +941,72 @@ mod tests {
         // The row is still in the DB — the export failure did not roll it back.
         assert_eq!(db.list_chat_model_context().unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── boot summary (v0.2.101, review nit 3) ────────────────────────────
+
+    /// A RETIRE-ONLY converge is not a quiet boot: the row vanished, no pane
+    /// shows it, and the summary line is the only trace. It must fire and
+    /// must carry the retired count.
+    #[test]
+    fn the_boot_summary_fires_on_a_retire_only_converge_and_names_the_count() {
+        let line = converge_summary_line(
+            Path::new("/clone/claude_mcp_servers/model_router/chat_model_context.seed.json"),
+            &ReseedOutcome {
+                inserted: 0,
+                updated: 0,
+                unchanged: 20,
+                preserved_user_edits: 1,
+                retired: 1,
+                written: Vec::new(),
+            },
+        )
+        .expect("a retire-only converge must produce a summary line");
+        assert!(line.contains("1 retired"), "got: {}", line);
+        assert!(line.contains("converged with /clone"), "got: {}", line);
+        assert!(line.contains("1 user edit(s) preserved"), "got: {}", line);
+        // The retired IDS are in the per-row provenance lines; the summary
+        // carries the hint those lines do not.
+        assert!(line.contains("re-add it in the model-context pane"), "got: {}", line);
+    }
+
+    /// A boot that wrote nothing stays quiet — the unchanged/preserved
+    /// counters alone never produce a line, or every launch would log.
+    #[test]
+    fn the_boot_summary_stays_quiet_when_nothing_was_written() {
+        assert!(converge_summary_line(
+            Path::new("/clone/seed.json"),
+            &ReseedOutcome {
+                inserted: 0,
+                updated: 0,
+                unchanged: 21,
+                preserved_user_edits: 0,
+                retired: 0,
+                written: Vec::new(),
+            }
+        )
+        .is_none());
+    }
+
+    /// The pre-existing half: a converge that only inserted or refreshed
+    /// still fires (the condition is ANY of the three write kinds).
+    #[test]
+    fn the_boot_summary_fires_on_writes_without_retires_too() {
+        for outcome in [
+            ReseedOutcome { inserted: 2, updated: 0, unchanged: 0, preserved_user_edits: 0, retired: 0, written: Vec::new() },
+            ReseedOutcome { inserted: 0, updated: 1, unchanged: 3, preserved_user_edits: 0, retired: 0, written: Vec::new() },
+        ] {
+            let line = converge_summary_line(Path::new("/s"), &outcome);
+            assert!(
+                line.is_some(),
+                "a converge that wrote must not be silenced: {:?}",
+                outcome
+            );
+            assert!(
+                !line.unwrap().contains("re-add"),
+                "the retire hint appears only when something was retired"
+            );
+        }
     }
 
     // ── every mutation re-exports (R16 item 4) ───────────────────────────
@@ -1002,7 +1227,16 @@ mod tests {
             let row = by_id(id);
             assert_eq!(row.vendor, "anthropic", "{}", id);
             assert!(row.window_1m && row.context_window == 1_000_000, "{}", id);
-            assert!(row.source.starts_with("https://docs.anthropic.com"), "{}", id);
+            // Anthropic's docs moved to platform.claude.com (the old
+            // docs.anthropic.com host redirects there); the rows cite real
+            // pages on it. Must match `OFFICIAL_DOC_PREFIX["anthropic"]` in
+            // tests/test_model_router_context_table.py.
+            assert!(
+                row.source.starts_with("https://platform.claude.com/"),
+                "{}: {}",
+                id,
+                row.source
+            );
         }
         // The v0.2.98-corrected qwen Token-Plan rows: vendor `qwen`, the
         // vendor's PER-MODEL figures from the cited page — 1M window with
@@ -1196,6 +1430,7 @@ mod tests {
                 context_window: 200_000,
                 max_output: 0,
                 window_1m: false,
+                text_only: false,
                 source: "https://docs.qwencloud.com/".into(),
                 source_note: String::new(),
             },
@@ -1407,5 +1642,311 @@ mod tests {
         let err = load_seed_rows(&db).expect_err("uncited seed row must fail");
         assert!(err.contains("source citation is required"), "got: {}", err);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── v0.2.101 (Q6/G1): the model-picker provenance log ────────────────
+
+    /// ONE log-line shape, and every one of the four write paths can
+    /// produce it with its own source id and the row's identity. The line
+    /// is what the next duplicate picker row gets traced through, so the
+    /// format itself is pinned here.
+    #[test]
+    fn provenance_line_has_one_shape_for_all_four_sources() {
+        for source in [
+            PROVENANCE_SOURCE_CATALOG_SYNC,
+            PROVENANCE_SOURCE_GUI_ADD,
+            PROVENANCE_SOURCE_GUI_DELETE,
+            PROVENANCE_SOURCE_RESEED_IMPORT,
+        ] {
+            let line = model_picker_row_provenance_line(source, "glm-5.3", "inserted");
+            assert_eq!(
+                line,
+                format!("[vct] model-picker row: model=glm-5.3 source={} action=inserted", source),
+                "one shape, parameterised only by source"
+            );
+        }
+        // The four sources are four DISTINCT ids — collapsing two of them
+        // would make the log untraceable exactly when it is needed.
+        let ids = [
+            PROVENANCE_SOURCE_CATALOG_SYNC,
+            PROVENANCE_SOURCE_GUI_ADD,
+            PROVENANCE_SOURCE_GUI_DELETE,
+            PROVENANCE_SOURCE_RESEED_IMPORT,
+        ];
+        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), 4);
+    }
+
+    /// The GUI-delete path logs the row it removed — and, when no row
+    /// matched, the tombstone it still wrote (that tombstone suppresses the
+    /// id on every later boot converge, a picker-shaping write). Review S3:
+    /// before this, a delete left no provenance line at all. (Red-proof
+    /// mutation: drop the `log_model_picker_row_provenance` call in
+    /// `delete_and_export` and both assertions fail.)
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn gui_delete_path_emits_provenance_for_the_removed_row() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-delete");
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+        let db = make_db();
+        db.upsert_chat_model_context(input("glm-5.1"), true).unwrap();
+
+        let logs = capture_tracing(|| {
+            assert!(delete_and_export(&db, " glm-5.1 ").expect("delete").deleted);
+            assert!(!delete_and_export(&db, "not-there").expect("delete").deleted);
+        });
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            logs.iter().any(|l| l
+                == &model_picker_row_provenance_line(
+                    PROVENANCE_SOURCE_GUI_DELETE,
+                    "glm-5.1",
+                    "delete"
+                )),
+            "a GUI delete must emit the provenance line with the TRIMMED id; got: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter().any(|l| l
+                == &model_picker_row_provenance_line(
+                    PROVENANCE_SOURCE_GUI_DELETE,
+                    "not-there",
+                    "tombstone"
+                )),
+            "a no-match delete still wrote a tombstone and must say so; got: {:?}",
+            logs
+        );
+    }
+
+    /// A seed-absent machine row retired by the BOOT converge logs in the
+    /// one provenance shape, attributed to the boot catalog sync — and no
+    /// line of any OTHER shape names it (review S3: the DB layer used to log
+    /// its own "[vct] chat-model context: retired …" line, which a grep for
+    /// the provenance shape missed). (Red-proof mutations: drop the
+    /// `written.push((model_id, "retired"))` in the DB layer's retire, or
+    /// restore its own `tracing::info!` line — each fails one assertion.)
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn boot_converge_retire_emits_the_provenance_shape_only() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-retire-boot");
+        let clone = clone_with_one_seed_model(&dir);
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        // A machine-written row the shipped seed (glm-5.3 only) no longer lists.
+        db.upsert_chat_model_context(input("glm-5.2"), false).unwrap();
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+
+        let logs = capture_tracing(|| seed_and_export_on_boot(&db));
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(db.get_chat_model_context("glm-5.2").unwrap().is_none());
+        assert!(
+            logs.iter().any(|l| l
+                == &model_picker_row_provenance_line(
+                    PROVENANCE_SOURCE_CATALOG_SYNC,
+                    "glm-5.2",
+                    "retired"
+                )),
+            "the boot retire must log the provenance line; got: {:?}",
+            logs
+        );
+        let other_shape: Vec<&String> = logs
+            .iter()
+            .filter(|l| l.contains("glm-5.2") && !l.starts_with("[vct] model-picker row: "))
+            .collect();
+        assert!(
+            other_shape.is_empty(),
+            "no second line shape may name the retired row: {:?}",
+            other_shape
+        );
+        // The boot summary still carries the count and the re-add hint.
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("1 retired") && l.contains("re-add it in the model-context pane")),
+            "the boot summary keeps the retire count and the hint; got: {:?}",
+            logs
+        );
+    }
+
+    /// The reseed button's retire is attributed to `reseed-import`.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn reseed_retire_emits_provenance_with_the_reseed_source() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-retire-reseed");
+        let clone = clone_with_one_seed_model(&dir);
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        db.upsert_chat_model_context(input("glm-5.2"), false).unwrap();
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+
+        let logs = capture_tracing(|| {
+            reseed_and_export(&db).expect("reseed with a pinned seed clone");
+        });
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            logs.iter().any(|l| l
+                == &model_picker_row_provenance_line(
+                    PROVENANCE_SOURCE_RESEED_IMPORT,
+                    "glm-5.2",
+                    "retired"
+                )),
+            "the reseed retire must log the provenance line; got: {:?}",
+            logs
+        );
+    }
+
+    /// The GUI-add path logs the row it just wrote (identity + action).
+    /// Real capture of the tracing output (same CaptureLogs shape as
+    /// `upstream_fetch.rs` tests) — this is the emission proof, not a
+    /// code reading.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn gui_add_path_emits_provenance_for_the_written_row() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-gui");
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+        let db = make_db();
+
+        let logs = capture_tracing(|| {
+            let mutation = upsert_and_export(&db, input("glm-5.3")).expect("upsert");
+            assert_eq!(mutation.row.as_ref().unwrap().model_id, "glm-5.3");
+        });
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            logs.iter().any(|l| l.contains("model=glm-5.3")
+                && l.contains("source=gui-add")
+                && l.contains("action=upsert")),
+            "the gui-add insertion path must emit its provenance line; got: {:?}",
+            logs
+        );
+    }
+
+    /// A clone fixture whose seed carries one citable model — the shape the
+    /// catalog-sync and reseed-import emission tests share.
+    #[cfg(unix)]
+    fn clone_with_one_seed_model(dir: &Path) -> PathBuf {
+        let clone = dir.join("clone");
+        let seed_dir = clone.join("claude_mcp_servers").join("model_router");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap();
+        std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
+        std::fs::create_dir_all(clone.join("state")).unwrap();
+        std::fs::write(
+            clone.join("state").join("install-manifest.json"),
+            r#"{"installed": true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            seed_dir.join("chat_model_context.seed.json"),
+            r#"{"schema_version": 1, "models": {
+                 "glm-5.3": {"vendor": "zai", "context_window": 200000,
+                             "max_output": 128000, "window_1m": false,
+                             "source": "https://docs.z.ai/guides/llm/glm-5.3"}}}"#,
+        )
+        .unwrap();
+        clone
+    }
+
+    /// The boot converge (the gateway catalog seed syncing into the table)
+    /// emits one provenance line per row it wrote.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn catalog_sync_path_emits_provenance_on_boot_converge() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-boot");
+        let clone = clone_with_one_seed_model(&dir);
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+
+        let logs = capture_tracing(|| seed_and_export_on_boot(&db));
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("model=glm-5.3") && l.contains("source=gateway-catalog-sync")),
+            "the boot catalog-sync path must emit its provenance line; got: {:?}",
+            logs
+        );
+    }
+
+    /// The "Reseed from shipped defaults" import emits the same line shape
+    /// with its own source id.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn reseed_import_path_emits_provenance() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-reseed");
+        let clone = clone_with_one_seed_model(&dir);
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+
+        let logs = capture_tracing(|| {
+            reseed_and_export(&db).expect("reseed with a pinned seed clone");
+        });
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("model=glm-5.3") && l.contains("source=reseed-import")),
+            "the reseed-import path must emit its provenance line; got: {:?}",
+            logs
+        );
+    }
+
+    /// The converge/reseed paths derive their lines from the `written`
+    /// record the DB layer returns — one line per entry, none for an
+    /// empty record (the quiet steady-state boot).
+    #[test]
+    fn written_rows_derive_one_line_each() {
+        let outcome = ReseedOutcome {
+            inserted: 1,
+            updated: 1,
+            unchanged: 0,
+            preserved_user_edits: 0,
+            retired: 0,
+            written: vec![
+                ("glm-5.3".to_string(), "inserted".to_string()),
+                ("glm-5.1".to_string(), "updated".to_string()),
+            ],
+        };
+        let lines: Vec<String> = outcome
+            .written
+            .iter()
+            .map(|(id, action)| {
+                model_picker_row_provenance_line(PROVENANCE_SOURCE_CATALOG_SYNC, id, action)
+            })
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("model=glm-5.3"));
+        assert!(lines[0].contains("action=inserted"));
+        assert!(lines[1].contains("model=glm-5.1"));
+        assert!(lines[1].contains("action=updated"));
+
+        let quiet = ReseedOutcome::default();
+        assert!(quiet.written.is_empty());
     }
 }

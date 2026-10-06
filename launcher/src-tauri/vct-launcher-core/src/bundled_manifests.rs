@@ -29,7 +29,6 @@ pub const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
     ("vct-codegraph.json", include_str!("../../../bundled_manifests/vct-codegraph.json")),
     ("vct-hub-api.json", include_str!("../../../bundled_manifests/vct-hub-api.json")),
     ("vct-kg.json", include_str!("../../../bundled_manifests/vct-kg.json")),
-    ("vct-search.json", include_str!("../../../bundled_manifests/vct-search.json")),
     ("vct-session-state.json", include_str!("../../../bundled_manifests/vct-session-state.json")),
 ];
 
@@ -369,7 +368,7 @@ mod tests {
 
         let dead = format!(".vct-kg.json.tmp.{}", DEAD_PID);
         std::fs::write(dir.join(&dead), "partial").unwrap();
-        let old = format!(".vct-search.json.tmp.{}", me);
+        let old = format!(".vct-session-state.json.tmp.{}", me);
         let old_file = std::fs::File::create(dir.join(&old)).unwrap();
         old_file
             .set_modified(std::time::SystemTime::now() - ORPHAN_TMP_MAX_AGE - std::time::Duration::from_secs(60))

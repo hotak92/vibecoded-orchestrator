@@ -105,11 +105,26 @@ if [ ! -f "$METRICS_FILE" ]; then
     fi
 fi
 
-# Pass INPUT (untrusted JSON payload) via env var — payload containing """,
-# backslashes, or shell metacharacters can no longer break the Python parser.
-# Other substitutions (FIRST_THRESHOLD/INTERVAL/etc.) are under our control
-# and stay direct for readability. Audit fix 2026-05-07.
-KG_NUDGE_INPUT="$INPUT" "$PY" <<PYTHON_EOF || true
+# Pass INPUT (untrusted JSON payload) via a temp file whose PATH rides the
+# env var. The payload must never be interpolated into the Python source
+# (quotes/backslashes/metacharacters would break the parser — audit fix
+# 2026-05-07, which moved it INTO an env var), but an env var is itself
+# size-capped: ONE string passed at exec is limited to MAX_ARG_STRLEN
+# (128 KB on Linux), so a large PostToolUse payload made the exec fail with
+# E2BIG — bash printed "<hook>: line N: <python>: Argument list too long",
+# `|| true` swallowed the failure, and the harness recorded that stderr as
+# an async_hook_response transcript attachment (271 records measured on one
+# machine: driver (a) of the v0.2.101 transcript-bloat fix). The temp file
+# keeps the 2026-05-07 property (Python reads the payload as DATA, never as
+# source) without the size ceiling. mktemp creates it 0600; TMPDIR is
+# honoured by mktemp itself. Sibling: kg-update-nudge.ps1 does the same
+# (Windows caps an env var at 32,767 chars). Other substitutions
+# (FIRST_THRESHOLD/INTERVAL/etc.) are under our control and stay direct for
+# readability.
+_KGN_INPUT_FILE="$(mktemp 2>/dev/null)" || exit 0
+printf '%s' "$INPUT" >"$_KGN_INPUT_FILE" || { rm -f "$_KGN_INPUT_FILE"; exit 0; }
+trap 'rm -f "$_KGN_INPUT_FILE"' EXIT
+KG_NUDGE_INPUT_FILE="$_KGN_INPUT_FILE" "$PY" <<PYTHON_EOF || true
 import json
 import os
 import sys
@@ -117,7 +132,17 @@ import fcntl
 import tempfile
 from datetime import datetime, timezone
 
-INPUT = os.environ.get("KG_NUDGE_INPUT", "")
+# v0.2.101 E2BIG fix: the payload rides a temp FILE (path via env), not the
+# env var itself — a single env string caps at MAX_ARG_STRLEN (128 KB) and a
+# fat PostToolUse payload used to fail the exec ("Argument list too long").
+INPUT = ""
+_kgn_in = os.environ.get("KG_NUDGE_INPUT_FILE", "")
+if _kgn_in:
+    try:
+        with open(_kgn_in, "r", encoding="utf-8", errors="replace") as _kgn_f:
+            INPUT = _kgn_f.read()
+    except OSError:
+        INPUT = ""
 FIRST_THRESHOLD = $FIRST_THRESHOLD
 INTERVAL = $INTERVAL
 METRICS_FILE = "$METRICS_FILE"

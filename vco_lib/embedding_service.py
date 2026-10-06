@@ -76,6 +76,7 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -1066,6 +1067,110 @@ def _resolve_arctic_secondary() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# ── P299-B4 (v0.2.101): secondary-slot circuit breaker ────────────────────────
+#
+# A missing secondary model (e.g. ``snowflake-arctic-embed2`` not pulled) makes
+# every secondary fan-out attempt raise, and the pre-breaker code CALLED the
+# dead backend and logged a fresh warning on every embed — hours of identical
+# 404s in one sync, and a WAN round trip per embed for the OpenAI secondaries
+# (P299 §5; V0299-OUTAGE-INVESTIGATION §5). The breaker SKIPS the call once the
+# slot is known to be down.
+#
+# Correctness is UNCHANGED, by design: an OPEN breaker omits the slot from the
+# returned dict exactly as a failure does, so callers, the ``truncated_slots``
+# record and the stored-vector semantics need no change (the slot is optional /
+# opt-in, so skipping it can never reduce active-slot functionality). The
+# ACTIVE slot is NEVER routed through the breaker — a primary-backend outage is
+# never quietened or skipped.
+#
+# State machine, per slot, per instance (``_SecondarySlotBreaker``):
+#   * CLOSED    — the attempt runs. Success drops the state (fresh count next
+#                 time). A failure bumps the consecutive-failure count; below
+#                 the threshold the per-call warning is kept (an isolated
+#                 failure stays visible).
+#   * OPEN      — tripped at the threshold (ONE consolidated warning naming the
+#                 remedy). The backend is NOT called; the slot is omitted.
+#   * HALF-OPEN — after a cool-down the breaker lets ONE probe through, so a
+#                 slot that recovers is picked back up WITHOUT a process
+#                 restart. (Pure skip-for-process-life could never earn the
+#                 success that closes it.) Success CLOSES the breaker; a failed
+#                 probe RE-OPENS it and restarts the cool-down.
+#
+# Half-open trigger: ``HALF_OPEN_SKIPS`` skipped calls OR ``HALF_OPEN_SECS``
+# seconds since opening, whichever comes first. Both legs are needed: a busy
+# sync reaches the call count in seconds, while an idle process needs the clock
+# leg. The cool-down is deliberately short (60 s, not the origin's ~10 min)
+# because a localhost probe is free and the RL-corpus standing rule favours
+# quick recovery; corpus loss is bounded by one probe interval.
+#
+# N = 3 mirrors the watchdog's conservative give-up threshold
+# (``infra_watchdog.rs::MAX_CONSECUTIVE_FAILURES``): three consecutive failures
+# is a persistent fault, not a blip. A slot that keeps failing re-reports its
+# running count every ``REPORT_EVERY`` suppressed calls, so the log stays honest
+# about how long the outage has run (a one-shot line could not tell 4 failures
+# from 40 000).
+SECONDARY_BREAKER_THRESHOLD = 3
+SECONDARY_BREAKER_HALF_OPEN_SKIPS = 100
+SECONDARY_BREAKER_HALF_OPEN_SECS = 60.0
+SECONDARY_BREAKER_REPORT_EVERY = 500
+
+# The remedy named in the consolidated warning — what to check / pull /
+# configure to bring the slot back. The origin asked for the remedy inline
+# ("pull the model or disable DUAL_EMBEDDING_ARCTIC_SECONDARY"); ONE home here
+# so every slot names a concrete action and the trip line can never drift from
+# the fix.
+_SECONDARY_SLOT_REMEDIES: dict[str, str] = {
+    "qwen3_embed": (
+        "check Ollama is running and pull the model "
+        "(`ollama pull qwen3-embedding:0.6b`)"
+    ),
+    "arctic2_embed": (
+        "pull the model (`ollama pull snowflake-arctic-embed2`) or disable "
+        "`DUAL_EMBEDDING_ARCTIC_SECONDARY`"
+    ),
+    "openai_text_embed": (
+        "check the OpenAI key / rate limit, or disable the secondary fan-out "
+        "with `DUAL_EMBEDDING_WRITE_ALL_SLOTS=false`"
+    ),
+    "codesage_embed": (
+        "check the code-embed service (`CODE_EMBED_SERVICE_URL`), or leave the "
+        "code graph on its active embedder"
+    ),
+    "openai_code_embed": (
+        "check the OpenAI key / rate limit, or disable the secondary fan-out "
+        "with `DUAL_EMBEDDING_WRITE_ALL_SLOTS=false`"
+    ),
+}
+_SECONDARY_SLOT_REMEDY_DEFAULT = (
+    "check the slot's backend and its model / credentials, or disable its "
+    "secondary fan-out"
+)
+
+
+@dataclass
+class _SecondarySlotBreaker:
+    """Per-slot circuit-breaker state (see the P299-B4 block above).
+
+    ``failures`` counts consecutive failed ATTEMPTS (drives the trip and a
+    probe-fail re-open). ``skipped`` counts calls skipped while OPEN (cumulative
+    for the outage, so the running count shown in the log only grows).
+    ``skips_since_probe`` is the count-leg trigger for the half-open probe;
+    ``opened_at`` is a monotonic timestamp for the time-leg trigger (both reset
+    per cool-down). ``probing`` is set while a probe is in flight so a
+    concurrent call keeps skipping. ``last_report_count`` is the
+    ``failures + skipped`` value of the last emitted line (drives the periodic
+    re-report).
+    """
+
+    failures: int = 0
+    skipped: int = 0
+    skips_since_probe: int = 0
+    open: bool = False
+    probing: bool = False
+    opened_at: float = 0.0
+    last_report_count: int = 0
+
+
 # ── WP-O rework (2026-07-22, no-functionality-loss rule) ──────────────────────
 #
 # STANDING RULE: the ACTIVE slot's chunk fidelity must NEVER drop below the
@@ -1131,8 +1236,8 @@ def _resolve_arctic_secondary() -> bool:
 # chunker sizes chunk boundaries; this table bounds what is HANDED to a
 # secondary embedder, and the two must not be coupled.
 #
-# Unmeasured-but-registered models (bge-m3, text-embedding-3-small, …) get the
-# measured FLOOR (the smallest ratio measured across the shipped models): an
+# Unmeasured-but-registered models (e.g. text-embedding-3-small, jina-code) get
+# the measured FLOOR (the smallest ratio measured across the shipped models): an
 # unmeasured tokenizer is a genuine unknown, and under-filling a window is a
 # fidelity cost while over-filling it is the silent truncation this bound
 # exists to prevent.
@@ -1393,8 +1498,8 @@ def _bounded_for_model(
         ACTIVE slot stays full-fidelity on this bound.
       * ACTIVE-slot batch embed (WP-R): prevents the Ollama ``/api/embed`` HTTP
         400 ("input exceeds context length") + whole-batch rejection that a
-        small-num_ctx ACTIVE model (arctic 4 096, granite, embeddinggemma, …)
-        hit on a corpus whose chunks were sized for a larger model. Without this
+        small-num_ctx ACTIVE model (e.g. arctic 4 096, jina 2 048) hit on a
+        corpus whose chunks were sized for a larger model. Without this
         bound, ONE oversized item 400'd the entire batch of 100 → 0 enriched.
     """
     num_ctx = _num_ctx_for_secondary(model_id)
@@ -1654,7 +1759,7 @@ def resolve_active_text_model_id() -> str:
 
       1. ``EMBEDDING_MODEL`` env (non-empty) — the explicit per-project override
          (config_projection / install.py subprocess thread). A custom-model
-         install (e.g. ``embeddinggemma:300m-bf16`` num_ctx 2 048) reaches here.
+         install (e.g. ``jina-embeddings-v2-base-code`` num_ctx 2 048) reaches here.
       2. ``OPENAI_EMBEDDING_MODEL`` when the active profile is ``openai``.
       3. ``_model_id_for_active(active)`` — derive from the resolved profile.
 
@@ -1783,61 +1888,32 @@ def configured_text_models() -> "list[str]":
 def _resolve_active_embedding() -> str:
     """Return the active embedding profile (lowercased, stripped).
 
-    Resolution chain (each step short-circuits if non-empty):
+    Thin delegate to the ONE home, ``vco_lib.kg_context_triple.
+    active_embedding_profile`` (v0.2.101). That home owns the WHOLE chain —
+    ``ACTIVE_EMBEDDING`` env → ``launcher.db app_state[embedding.active_profile]``
+    → the hardware-pick derive (``app_state[default_text_embedding]`` →
+    profile) → the ``qwen3`` floor — so the profile EmbeddingService embeds
+    with and the profile recorded in the context triple can never disagree.
 
-      1. ``os.environ["ACTIVE_EMBEDDING"]`` — explicit env / install.py
-         subprocess thread. This env is the PROJECTION of the per-project
-         cascade (config_projection.py writes it from the sticky user pick
-         / global default), so a deliberate per-project choice already
-         reaches here via the projected ``.claude/{settings.json,env}``.
-      2. ``launcher.db app_state[embedding.active_profile]`` — the
-         machine-global default the Identity tab + install.py's preset
-         selection wrote.
-      3. ``launcher.db app_state[default_text_embedding]`` mapped to its
-         profile — the hardware-pick derive (v0.2.71 T-B-emb), mirroring
-         the cascade's machine-global leg so an env-less fallback agrees
-         with the launcher / projection resolvers.
-      4. ``"qwen3"`` — final fallback (free-tier install without launcher,
-         or the launcher never booted post-install).
+    Kept under this name because call sites and tests reference it (the only
+    production caller is :func:`resolve_active_text_model_id`).
 
-    All inputs are normalised with ``.strip().lower()``. Empty strings
-    are treated as "absent" and skipped in favour of the next step.
+    History: before v0.2.101 this held a PRIVATE copy of the chain, and the
+    canonical home LACKED the hardware-pick leg — so on an install whose only
+    ``app_state`` row was ``default_text_embedding`` the two answered
+    differently (``arctic`` here, ``qwen3`` there). The leg now lives once, in
+    the canonical home; the behaviour of this function is UNCHANGED
+    (env → active_profile → hardware-pick derive → ``qwen3``), including the
+    empty/invalid handling (empty strings are 'absent'; any DB failure
+    soft-fails to the default).
 
     Returns:
         A non-empty lowercase string identifying the active embedding
         profile (typically ``"qwen3"``, ``"arctic"``, ``"openai"``).
     """
-    env_value = os.environ.get("ACTIVE_EMBEDDING", "").strip().lower()
-    if env_value:
-        return env_value
-    try:
-        # Imported lazily to avoid a hard dependency on launcher_db_reader
-        # for callers that don't touch this resolution path.
-        from vco_lib.launcher_db_reader import (
-            profile_for_text_model,
-            read_app_state_active_embedding,
-            read_app_state_default_text_embedding,
-        )
+    from vco_lib.kg_context_triple import active_embedding_profile
 
-        db_value = read_app_state_active_embedding()
-        if db_value:
-            return db_value.strip().lower()
-        # v0.2.71 T-B-emb: mirror the cascade's machine-global leg — when the
-        # canonical `embedding.active_profile` key is unset, derive from the
-        # hardware pick (`app_state[default_text_embedding]`) before the qwen3
-        # floor. Keeps this env-less fallback consistent with
-        # project_env_settings.rs::global_active_embedding +
-        # config_projection.py::_global_active_embedding (the projected env is
-        # still the primary surface; this only fires when no env was projected).
-        derived = profile_for_text_model(read_app_state_default_text_embedding())
-        if derived:
-            return derived.strip().lower()
-    except Exception:
-        # Soft-fail: every read path in launcher_db_reader already
-        # swallows exceptions, but defense-in-depth against an
-        # ImportError on a partial install or sqlite-disabled build.
-        pass
-    return "qwen3"
+    return active_embedding_profile()
 
 
 def _model_id_for_active(active: str) -> str:
@@ -2012,6 +2088,20 @@ class EmbeddingService:
         # ``truncated_slots`` chunk property and derives the secondary-only
         # view from it (see the WP-O block above).
         self._last_truncated_slots: dict[str, bool] = {}
+        # P299-B4 (v0.2.101): per-slot circuit-breaker state for the OPTIONAL
+        # SECONDARY fan-out slots (text: qwen3/openai/arctic; code:
+        # codesage/openai). An OPEN breaker SKIPS the failing backend until a
+        # half-open probe; the ACTIVE slot is not tracked here — its error path
+        # is unchanged. See the ``SECONDARY_BREAKER_*`` block above and
+        # ``_SecondarySlotBreaker``.
+        self._secondary_breakers: dict[str, _SecondarySlotBreaker] = {}
+        # Serialises the breaker state machine. A re-entrant lock (not a plain
+        # ``Lock``) because ``_note_secondary_embed_skipped`` /
+        # ``..._failure`` call ``_emit_secondary_breaker_report`` while already
+        # holding it. Cheap, and closes the check-then-set race on ``probing``
+        # (else N concurrent calls could each grant a probe). Never raises — a
+        # bookkeeping error inside the guarded body fails OPEN at the caller.
+        self._secondary_breaker_lock = threading.RLock()
         # v0.2.100: set by ``for_project`` when the configured CodeSage
         # backend is down (no silent switch) — code embeds raise it.
         self._code_backend_error: Optional[NoEmbeddingBackendError] = None
@@ -2542,6 +2632,90 @@ class EmbeddingService:
         self._memo_put(self._embed_memo_code, key, vec)
         return vec
 
+    # ---- query-side embed (v0.2.101) ----------------------------------
+    #
+    # Documents embed through ``embed_text`` / ``embed_code`` (UNPREFIXED, so
+    # every stored vector is unchanged and nothing is re-embedded). SEARCH
+    # QUERIES embed through the two methods below, which apply the active
+    # model's query-side instruction. The prefix is the ONE table in
+    # ``chunking.MODEL_QUERY_PREFIXES`` (re-checked against each model card);
+    # ``task`` selects the per-use sentence (``QUERY_TASKS``).
+
+    def embed_text_query(self, text: str, task: "str | None" = None) -> list[float]:
+        """Embed a SEARCH QUERY via the active text backend, PREFIXED.
+
+        Applies the active model's query-side instruction from the one table
+        (``chunking.MODEL_QUERY_PREFIXES``); a model that needs none (or an
+        unknown model) resolves to an empty prefix and this is byte-identical
+        to ``embed_text``. Queries are keyed in the memo under a distinct
+        namespace so a query and a document with the same text cannot collide.
+
+        Raises:
+            RuntimeError: If the active backend is unreachable or errors.
+        """
+        from claude_mcp_servers.weaviate_mcp.chunking import query_prefix_for_model
+
+        prefix = query_prefix_for_model(self.text_model_id, task)
+        if not prefix:
+            return self.embed_text(text)
+        prefixed = prefix + text
+        key = _memo_key("query:" + prefixed)
+        cached = self._embed_memo_text.get(key)
+        if cached is not None:
+            return cached
+        vec = self._retry_once_on_503(self._embed_text_via_active, prefixed)
+        self._memo_put(self._embed_memo_text, key, vec)
+        return vec
+
+    def embed_code_query(self, code: str, task: "str | None" = None) -> list[float]:
+        """Embed a SEARCH QUERY into the active code space, PREFIXED.
+
+        Two routes, ONE rule (no double prefix):
+          * CODE-EMBED SERVICE (``codesage_embed`` / ``jina_embed`` reachable):
+            the SERVICE resolves its own loaded model's prefix from the SAME
+            table, so the client sends the RAW query with ``is_query=True``
+            and the task key (``QUERY_TASKS``) — never prepending anything
+            itself. The service applies the wording for that task.
+          * OpenAI / Ollama legs: no service is involved, so the CLIENT
+            prepends the resolved prefix here (with the same task).
+
+        ``task`` defaults to the code wording (``QUERY_TASK_DEFAULT_CODE`` —
+        ``code_nl``); code→code callers pass ``"code_similarity"``.
+
+        The per-call truncation record resets like ``embed_code``; a query is
+        not persisted, so nothing is tagged from it. Memoised under a distinct
+        namespace (query vs document never collide).
+        """
+        from claude_mcp_servers.weaviate_mcp.chunking import query_prefix_for_model
+        from claude_mcp_servers.weaviate_mcp.chunking import (
+            QUERY_TASK_DEFAULT_CODE as _CODE_TASK,
+        )
+
+        task = task or _CODE_TASK
+        self._last_truncated_slots = {}
+        # Service leg: hand the RAW query through with is_query=True + the task
+        # key. The SERVICE owns the prefix here (no client-side prepend).
+        if (
+            "openai" not in self._code_slot
+            and self._code_slot in ("codesage_embed", "jina_embed")
+        ):
+            self._raise_if_code_backend_down()
+            if self.codeembed.is_reachable():
+                key = _memo_key("query:" + task + ":" + code)
+                cached = self._embed_memo_code.get(key)
+                if cached is not None:
+                    return cached
+                vec = self._retry_once_on_503(
+                    self._embed_code_via_active, code, True, task
+                )
+                self._memo_put(self._embed_memo_code, key, vec)
+                return vec
+        # OpenAI / Ollama leg (+ the service-down fallback): client prefix.
+        prefix = query_prefix_for_model(self.code_model_id, task)
+        if not prefix:
+            return self.embed_code(code)
+        return self.embed_code(prefix + code)
+
     def _memo_put(
         self, memo: dict[str, list[float]], key: str, vec: list[float]
     ) -> None:
@@ -2564,7 +2738,7 @@ class EmbeddingService:
         WP-O sub-window rule), and a whole-batch ``/api/embed`` failure is
         ISOLATED to a per-item retry so one oversized item can never fail the
         batch. Root cause this closes: a small-num_ctx ACTIVE model (arctic
-        4 096, granite, embeddinggemma, bge-m3, …) on a corpus whose chunks were
+        4 096, jina 2 048, …) on a corpus whose chunks were
         sized for a larger model (qwen3 10 240) 400'd on any over-window item,
         and Ollama's ``/api/embed`` rejects the ENTIRE batch of 100 if ANY single
         input overflows → 100 % failure, 0 enriched (observed: 1 011/1 011 failed
@@ -2831,7 +3005,13 @@ class EmbeddingService:
     def embed_text_all_configured(
         self, text: str, *, include_active: bool = True
     ) -> dict[str, list[float]]:
-        """Embed ``text`` into the configured text slot(s).
+        """Embed ``text`` into the configured text slot(s) as a DOCUMENT.
+
+        v0.2.101: every slot's vector is UNPREFIXED, so stored vectors stay
+        byte-identical. For a SEARCH QUERY use
+        :meth:`embed_text_query_all_configured`, which applies each slot
+        model's query prefix (shared table) — the two share ONE implementation
+        (``_embed_text_all_configured``).
 
         ``include_active=False`` (v0.2.100 W5R-07) skips the ACTIVE slot and
         returns the secondaries only — for a caller that already holds the
@@ -2861,6 +3041,53 @@ class EmbeddingService:
         rate limited), it's omitted from the returned dict and a log
         line is emitted. The caller can choose to retry just those.
         """
+        return self._embed_text_all_configured(
+            text, include_active=include_active, task=None
+        )
+
+    def embed_text_query_all_configured(
+        self,
+        text: str,
+        *,
+        task: "str | None" = None,
+        include_active: bool = True,
+    ) -> dict[str, list[float]]:
+        """Embed a SEARCH QUERY into the configured text slot(s), PREFIXED.
+
+        The query-side twin of :meth:`embed_text_all_configured`: the SAME
+        slot fan-out (active + secondaries under the same gates), but each
+        slot's vector is the QUERY embedding for THAT slot's model — the
+        shared ``chunking.MODEL_QUERY_PREFIXES`` prefix for ``task`` prepended
+        client-side (ONE prefix home; no second table).
+
+        Why it exists (v0.2.101 caller audit, Gap 1): the dual-RL-log twin used
+        the DOCUMENT fan-out, so its logged ``other_query_emb`` was unprefixed
+        while a retrieval in that slot now uses the prefixed query vector — RL
+        training data would diverge from inference. The twin now uses THIS
+        method, so the logged vector equals the vector the slot's retrieval
+        would produce.
+
+        ``task`` (a ``chunking.QUERY_TASKS`` key) defaults to
+        ``QUERY_TASK_DEFAULT`` (KG/docs search) — matching
+        ``_get_search_vector``'s default; the hook path passes
+        ``hook_injection``.
+        """
+        from claude_mcp_servers.weaviate_mcp.chunking import QUERY_TASK_DEFAULT
+
+        return self._embed_text_all_configured(
+            text,
+            include_active=include_active,
+            task=task or QUERY_TASK_DEFAULT,
+        )
+
+    def _embed_text_all_configured(
+        self, text: str, *, include_active: bool, task: "str | None"
+    ) -> dict[str, list[float]]:
+        """Shared fan-out impl for the document / query variants above.
+
+        ``task is None`` → DOCUMENT (every slot UNPREFIXED). Otherwise → QUERY:
+        each slot's model prefix for ``task`` is prepended before its embed.
+        """
         result: dict[str, list[float]] = {}
         # ONE per-call record of every slot embedded from a bounded leading
         # sub-window — the SECONDARY legs (chunk exceeded that model's num_ctx)
@@ -2873,6 +3100,19 @@ class EmbeddingService:
         # persisted like the secondaries' (v0.2.92 m-R6-1) — no longer a
         # WARNING-log-only fact.
         self._last_truncated_slots = {}
+
+        is_query = task is not None
+
+        def _q(model_id: str, body: str) -> str:
+            """Apply ``model_id``'s query prefix (QUERY mode) or the identity."""
+            if not is_query:
+                return body
+            from claude_mcp_servers.weaviate_mcp.chunking import (
+                query_prefix_for_model,
+            )
+
+            return query_prefix_for_model(model_id, task) + body
+
         # Active backend — ALWAYS written (this is the slot reads target), from the
         # FULL text. Active-slot fidelity is never reduced by the secondary fan-out
         # (no-functionality-loss rule): chunk boundaries already follow the
@@ -2883,7 +3123,12 @@ class EmbeddingService:
         # ``last_active_truncated`` — a leading-window vector, never no vector.
         if include_active:
             try:
-                result[self._text_slot] = self._embed_text_via_active(text)
+                if is_query:
+                    # QUERY mode: the active slot uses the SAME query method a
+                    # retrieval would (prefix + memo), never the document leg.
+                    result[self._text_slot] = self.embed_text_query(text, task)
+                else:
+                    result[self._text_slot] = self._embed_text_via_active(text)
             except Exception as exc:
                 logger.warning("Active text backend failed: %s", exc)
 
@@ -2895,25 +3140,32 @@ class EmbeddingService:
         # qwen3 fallback if not already the active slot. qwen3's num_ctx (10 240)
         # is the WIDEST text tier, so a chunk sized to a tighter active model never
         # exceeds it — but bound defensively anyway (a custom active model could be
-        # wider, e.g. bge-m3-vs-nothing edge cases) so the same tagged-degradation
+        # wider) so the same tagged-degradation
         # contract holds for every secondary.
         if self._text_slot != "qwen3_embed" and self.ollama.is_reachable():
-            try:
-                # Attempt at the secondary budget, then shrink on a LENGTH
-                # refusal until the runner accepts (round-3 BLOCKER-B:
-                # truncate=false makes an over-window chunk a hard 400, so an
-                # unhandled refusal loses the vector entirely).
-                result["qwen3_embed"], trunc = _embed_secondary_with_refusal_retry(
-                    self.ollama, DEFAULT_TEXT_MODEL, text
-                )
-                if trunc:
-                    self._last_truncated_slots["qwen3_embed"] = True
-                    logger.info(
-                        "qwen3 secondary embedded from a bounded sub-window "
-                        "(chunk exceeded qwen3 num_ctx); slot tagged truncated"
+            if self._secondary_breaker_should_skip("qwen3_embed"):
+                self._note_secondary_embed_skipped("qwen3_embed")
+            else:
+                try:
+                    # Attempt at the secondary budget, then shrink on a LENGTH
+                    # refusal until the runner accepts (round-3 BLOCKER-B:
+                    # truncate=false makes an over-window chunk a hard 400, so an
+                    # unhandled refusal loses the vector entirely).
+                    result["qwen3_embed"], trunc = _embed_secondary_with_refusal_retry(
+                        self.ollama, DEFAULT_TEXT_MODEL, _q(DEFAULT_TEXT_MODEL, text)
                     )
-            except Exception as exc:
-                logger.warning("qwen3 fallback embedding failed: %s", exc)
+                    if trunc:
+                        self._last_truncated_slots["qwen3_embed"] = True
+                        logger.info(
+                            "qwen3 secondary embedded from a bounded sub-window "
+                            "(chunk exceeded qwen3 num_ctx); slot tagged truncated"
+                        )
+                except Exception as exc:
+                    self._note_secondary_embed_failure(
+                        "qwen3_embed", "qwen3 fallback", exc
+                    )
+                else:
+                    self._note_secondary_embed_success("qwen3_embed")
         # Arctic SECONDARY slot (WP-O) — opt-in via DUAL_EMBEDDING_ARCTIC_SECONDARY,
         # only when arctic isn't already the active slot and Ollama is up. This is
         # what lets a qwen3-active install collect the arctic RL corpus without an
@@ -2934,24 +3186,33 @@ class EmbeddingService:
             and _resolve_arctic_secondary()
             and self.ollama.is_reachable()
         ):
-            try:
-                # Attempt at the secondary budget, then shrink on a LENGTH
-                # refusal until the runner accepts (round-3 BLOCKER-B).
-                result["arctic2_embed"], trunc = _embed_secondary_with_refusal_retry(
-                    self.ollama, ARCTIC_SECONDARY_MODEL, text
-                )
-                if trunc:
-                    self._last_truncated_slots["arctic2_embed"] = True
-                    logger.info(
-                        "arctic secondary embedded from a bounded sub-window "
-                        "(chunk %d chars exceeded arctic num_ctx); slot tagged "
-                        "truncated (active slot unaffected)", len(text)
+            if self._secondary_breaker_should_skip("arctic2_embed"):
+                self._note_secondary_embed_skipped("arctic2_embed")
+            else:
+                try:
+                    # Attempt at the secondary budget, then shrink on a LENGTH
+                    # refusal until the runner accepts (round-3 BLOCKER-B).
+                    result["arctic2_embed"], trunc = _embed_secondary_with_refusal_retry(
+                        self.ollama, ARCTIC_SECONDARY_MODEL, _q(ARCTIC_SECONDARY_MODEL, text)
                     )
-            except Exception as exc:
-                logger.warning("arctic secondary embedding failed: %s", exc)
+                    if trunc:
+                        self._last_truncated_slots["arctic2_embed"] = True
+                        logger.info(
+                            "arctic secondary embedded from a bounded sub-window "
+                            "(chunk %d chars exceeded arctic num_ctx); slot tagged "
+                            "truncated (active slot unaffected)", len(text)
+                        )
+                except Exception as exc:
+                    self._note_secondary_embed_failure(
+                        "arctic2_embed", "arctic secondary", exc
+                    )
+                else:
+                    self._note_secondary_embed_success("arctic2_embed")
         # OpenAI if not already and key configured + valid
         if "openai" not in self._text_slot and self.openai_api_key:
-            if self.openai.validate().valid:
+            if self._secondary_breaker_should_skip("openai_text_embed"):
+                self._note_secondary_embed_skipped("openai_text_embed")
+            elif self.openai.validate().valid:
                 try:
                     # OPENAI_EMBEDDING_MODEL canonically holds the raw API
                     # name (back-compat with env-driven installs), but a
@@ -2988,7 +3249,7 @@ class EmbeddingService:
                     # than silently half-embedded. The bound is what keeps that
                     # rare; it is not a guarantee.
                     sub, trunc = _bounded_for_secondary(
-                        text, openai_model, full_coverage=False
+                        _q(openai_model, text), openai_model, full_coverage=False
                     )
                     result["openai_text_embed"] = self.openai.embed(
                         openai_model, sub
@@ -3000,7 +3261,11 @@ class EmbeddingService:
                             "(chunk exceeded openai num_ctx); slot tagged truncated"
                         )
                 except Exception as exc:
-                    logger.warning("OpenAI fallback embedding failed: %s", exc)
+                    self._note_secondary_embed_failure(
+                        "openai_text_embed", "OpenAI fallback", exc
+                    )
+                else:
+                    self._note_secondary_embed_success("openai_text_embed")
         return result
 
     def embed_text_all_configured_tagged(
@@ -3064,27 +3329,36 @@ class EmbeddingService:
             self._code_slot not in ("codesage_embed", "jina_embed")
             and self.codeembed.is_reachable()
         ):
-            try:
-                # W1 (2026-09-05): shrink on the service's over-window
-                # refusal and TAG it, like every secondary leg. Without this
-                # the service's new 400 refusal would DROP the slot where
-                # the gpu backend used to silently half-embed it — a
-                # refusal with no catcher is strictly worse than the silent
-                # truncation it replaces.
-                vec, trunc = self._embed_codeembed_one_bounded(code)
-                result["codesage_embed"] = vec
-                if trunc:
-                    self._last_truncated_slots["codesage_embed"] = True
-                    logger.info(
-                        "codesage secondary embedded from a bounded sub-window "
-                        "(entity exceeded the served window); slot tagged "
-                        "truncated"
+            if self._secondary_breaker_should_skip("codesage_embed"):
+                self._note_secondary_embed_skipped("codesage_embed")
+            else:
+                try:
+                    # W1 (2026-09-05): shrink on the service's over-window
+                    # refusal and TAG it, like every secondary leg. Without this
+                    # the service's new 400 refusal would DROP the slot where
+                    # the gpu backend used to silently half-embed it — a
+                    # refusal with no catcher is strictly worse than the silent
+                    # truncation it replaces.
+                    vec, trunc = self._embed_codeembed_one_bounded(code)
+                    result["codesage_embed"] = vec
+                    if trunc:
+                        self._last_truncated_slots["codesage_embed"] = True
+                        logger.info(
+                            "codesage secondary embedded from a bounded sub-window "
+                            "(entity exceeded the served window); slot tagged "
+                            "truncated"
+                        )
+                except Exception as exc:
+                    self._note_secondary_embed_failure(
+                        "codesage_embed", "CodeEmbed fallback", exc
                     )
-            except Exception as exc:
-                logger.warning("CodeEmbed fallback embedding failed: %s", exc)
+                else:
+                    self._note_secondary_embed_success("codesage_embed")
         # OpenAI — same prefix-strip defense as embed_text_all_configured
         if "openai" not in self._code_slot and self.openai_api_key:
-            if self.openai.validate().valid:
+            if self._secondary_breaker_should_skip("openai_code_embed"):
+                self._note_secondary_embed_skipped("openai_code_embed")
+            elif self.openai.validate().valid:
                 try:
                     openai_model = _to_openai_api_model(
                         os.environ.get(
@@ -3095,8 +3369,144 @@ class EmbeddingService:
                         openai_model, code
                     )
                 except Exception as exc:
-                    logger.warning("OpenAI code fallback embedding failed: %s", exc)
+                    self._note_secondary_embed_failure(
+                        "openai_code_embed", "OpenAI code fallback", exc
+                    )
+                else:
+                    self._note_secondary_embed_success("openai_code_embed")
         return result
+
+    # ---- secondary-slot circuit breaker (P299-B4, v0.2.101) --------------
+
+    def _secondary_breaker_should_skip(self, slot: str) -> bool:
+        """True iff the breaker is OPEN and this call must be SKIPPED.
+
+        Called before each OPTIONAL-secondary attempt. On the half-open trigger
+        (``HALF_OPEN_SKIPS`` skipped calls OR ``HALF_OPEN_SECS`` since opening) a
+        single probe is allowed through — returns False and marks ``probing`` so
+        a concurrent call keeps skipping. A probe that has been "in flight"
+        longer than the cool-down is treated as LOST: ``probing`` is cleared and
+        a fresh probe is granted, so a stranded probe can never skip the slot
+        for the process life. That is the SF-N1 fix — a ``BaseException``
+        (``asyncio.CancelledError`` / ``KeyboardInterrupt`` / ``SystemExit``)
+        escaping the call-site's ``except Exception`` arm runs neither breaker
+        note, leaving ``probing`` set. Never raises: any bookkeeping error fails
+        OPEN (returns False → the attempt proceeds), so the breaker can only
+        ever reduce outage cost, never block a healthy embed.
+        """
+        try:
+            with self._secondary_breaker_lock:
+                st = self._secondary_breakers.get(slot)
+                if st is None or not st.open:
+                    return False
+                if st.probing and (
+                    time.monotonic() - st.opened_at
+                ) < SECONDARY_BREAKER_HALF_OPEN_SECS:
+                    st.skipped += 1
+                    st.skips_since_probe += 1
+                    return True  # a live probe is in flight — keep skipping
+                # No probe, or a probe stranded past the cool-down: fall through
+                # and let the trigger (aged clock) grant a fresh one.
+                st.probing = False
+                st.skips_since_probe += 1
+                if (
+                    st.skips_since_probe >= SECONDARY_BREAKER_HALF_OPEN_SKIPS
+                    or (time.monotonic() - st.opened_at)
+                    >= SECONDARY_BREAKER_HALF_OPEN_SECS
+                ):
+                    st.probing = True
+                    st.skips_since_probe = 0
+                    st.opened_at = time.monotonic()
+                    return False  # let ONE probe through
+                st.skipped += 1
+                return True
+        except Exception:  # noqa: BLE001 — bookkeeping must never block an embed
+            return False
+
+    def _note_secondary_embed_skipped(self, slot: str) -> None:
+        """Record a SKIPPED secondary call (breaker open). Omit the slot.
+
+        Emits the periodic re-report every ``REPORT_EVERY`` suppressed calls so
+        a long outage stays visible with a GROWING count (a one-shot line could
+        not tell 4 suppressed calls from 40 000). Never raises.
+        """
+        try:
+            with self._secondary_breaker_lock:
+                st = self._secondary_breakers.get(slot)
+                if st is None:
+                    return
+                count = st.failures + st.skipped
+                if count - st.last_report_count >= SECONDARY_BREAKER_REPORT_EVERY:
+                    self._emit_secondary_breaker_report(slot, st)
+        except Exception:  # noqa: BLE001 — the breaker must never fail the caller
+            pass
+
+    def _note_secondary_embed_failure(
+        self, slot: str, leg_label: str, exc: Exception
+    ) -> None:
+        """Record a failed secondary embed ATTEMPT at a bounded log cadence.
+
+        Below ``SECONDARY_BREAKER_THRESHOLD`` this is the existing per-call
+        warning (an isolated failure stays visible). At the threshold it TRIPS
+        the breaker (the next calls are SKIPPED) and emits ONE consolidated
+        warning naming the remedy. A failed half-open probe simply re-opens it —
+        the periodic re-report covers the "still failing" cadence. Never raises
+        into the caller.
+        """
+        try:
+            with self._secondary_breaker_lock:
+                st = self._secondary_breakers.get(slot)
+                if st is None:
+                    st = _SecondarySlotBreaker()
+                    self._secondary_breakers[slot] = st
+                first_trip = not st.open
+                st.failures += 1
+                st.probing = False
+                if st.failures < SECONDARY_BREAKER_THRESHOLD:
+                    logger.warning("%s embedding failed: %s", leg_label, exc)
+                    return
+                # Trip / re-open: skip the backend until the next half-open probe.
+                st.open = True
+                st.skips_since_probe = 0
+                st.opened_at = time.monotonic()
+                if first_trip:
+                    self._emit_secondary_breaker_report(slot, st)
+        except Exception:  # noqa: BLE001 — the breaker must never fail the caller
+            pass
+
+    def _emit_secondary_breaker_report(
+        self, slot: str, st: _SecondarySlotBreaker
+    ) -> None:
+        """Emit the ONE consolidated breaker line (trip + periodic re-report).
+
+        Names the slot, the running count of suppressed calls and the concrete
+        remedy for that slot. Kept in ONE home so the trip line and the
+        re-report can never drift. Runs under the breaker lock (re-entrant) so
+        the decision and the ``last_report_count`` stamp cannot be torn.
+        """
+        with self._secondary_breaker_lock:
+            count = st.failures + st.skipped
+            st.last_report_count = count
+            logger.warning(
+                "secondary slot %s failing: suppressed after %d failures "
+                "(count=%d); %s",
+                slot,
+                SECONDARY_BREAKER_THRESHOLD,
+                count,
+                _SECONDARY_SLOT_REMEDIES.get(slot, _SECONDARY_SLOT_REMEDY_DEFAULT),
+            )
+
+    def _note_secondary_embed_success(self, slot: str) -> None:
+        """Close the breaker for ``slot`` after a successful embed.
+
+        Drops the state entirely, so the next failure starts a fresh count and a
+        NEW outage is announced again. Never raises.
+        """
+        try:
+            with self._secondary_breaker_lock:
+                self._secondary_breakers.pop(slot, None)
+        except Exception:  # noqa: BLE001 — the breaker must never fail the caller
+            pass
 
     # ---- internal dispatch -------------------------------------------
 
@@ -3162,8 +3572,17 @@ class EmbeddingService:
         if self._code_backend_error is not None and not self.codeembed.is_reachable():
             raise self._code_backend_error
 
-    def _embed_code_via_active(self, code: str) -> list[float]:
+    def _embed_code_via_active(
+        self, code: str, is_query: bool = False, task: str | None = None
+    ) -> list[float]:
         """Route a single code embed to the configured backend.
+
+        ``is_query`` / ``task`` (v0.2.101) are forwarded to the CodeEmbed
+        SERVICE only — the service then applies its loaded model's query-side
+        instruction for that task (``chunking.MODEL_QUERY_PREFIXES`` +
+        ``QUERY_TASKS``). The OpenAI/Ollama legs ignore both (the caller
+        ``embed_code_query`` applies the prefix itself before calling here).
+        Defaults keep every document/backfill caller byte-identical.
 
         For codesage_embed / jina_embed slots, prefer the FastAPI service
         when reachable; fall back to Ollama otherwise. OpenAI path applies
@@ -3221,7 +3640,9 @@ class EmbeddingService:
                 # Records under the ACTIVE CODE slot exactly like the
                 # Ollama leg below (assign, never latch).
                 vec, sent = _embed_shrinking_on_overflow(
-                    lambda candidate: self.codeembed.embed(candidate),
+                    lambda candidate: self.codeembed.embed(
+                        candidate, is_query=is_query, task=task
+                    ),
                     code,
                     model_id=self.code_model_id,
                     on_shrink=_warn,

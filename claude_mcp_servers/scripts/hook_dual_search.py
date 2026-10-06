@@ -41,11 +41,17 @@ stdout verbatim:
                                         --hook-format [--project P]
                                         [--exclude-file F] [--anchor A]``)
 
-so the emitted blocks are byte-identical to the two-process path. The caller
-(``_lib/query-cache.sh::vco_dual_search_cached``) applies the SAME per-leg output
-caps (``head -40`` for KG, ``head -20`` for CG) and the SAME per-leg cache keys as
-before, so cross-surface cache sharing with pre-bash / pre-tool-use is unchanged.
-Verified by golden-output diff against the two-CLI path.
+so the emitted blocks are byte-identical to the two-process path.
+
+v0.2.101 wave-3 status: the shell caller this driver was built for
+(``_lib/query-cache.sh::vco_dual_search_cached``) was RETIRED with the
+injection-wrapper rework — production now imports this module instead:
+``hook_context_router.py`` runs its legs through :func:`run_legs` (same
+thread-routed capture, per-leg soft-fail, bounded joins) and calls the
+producers with the injection-profile argv. The CLI form below (markers +
+argv contract) is RETAINED as the driver-level golden surface the
+``test_v0291_perf_quickwins.py`` rows exercise — it has no production
+spawner any more, and this note is its documented role.
 
 Output framing
 --------------
@@ -85,9 +91,12 @@ import os
 import sys
 import threading
 from pathlib import Path
+from typing import Callable, Dict
 
-# MUST MATCH templates/hooks/_lib/query-cache.{sh,ps1} — the caller splits the
-# stream on these exact lines.
+# The CLI form's output framing. Historical note: the shell splitter these
+# markers were "MUST MATCH"-locked to (_lib/query-cache.{sh,ps1}) was retired
+# in v0.2.101 wave-3 — the markers now serve the driver-level golden tests
+# only (test_v0291_perf_quickwins.py), which pin both sides of the framing.
 KG_MARKER = "<<<VCO-DUAL:KG>>>"
 CG_MARKER = "<<<VCO-DUAL:CG>>>"
 
@@ -174,10 +183,138 @@ def _run_leg(proxy: _ThreadRoutedStdout, fn) -> str:
     return buf.getvalue()
 
 
+class _PostLegStdout:
+    """The abandoned-leg write fence (GLM review SF-1, v0.2.101).
+
+    Installed INSTEAD of the real stdout when :func:`run_legs` returns with a
+    leg still running. ``print`` resolves ``sys.stdout`` at CALL time, so a
+    daemon thread that outlives the join deadline and later calls ``print``
+    hits whatever stream is installed then — with the bare real stdout that
+    write lands in the router's injection text (worst case: corrupting the
+    agent envelope's JSON). This fence drops writes whose
+    ``threading.current_thread()`` is one of the abandoned Thread OBJECTS and
+    passes every other write through unchanged.
+
+    Keyed on thread OBJECTS, never idents: CPython recycles ``get_ident()``
+    values after a thread dies, so an ident-keyed fence could swallow a later
+    legitimate thread's output. The fence holds the abandoned threads alive
+    as references until process exit — they are daemons, so exit still kills
+    them; nothing else observes the difference.
+
+    Known bound (re-review nit-4, accepted): the fence covers the abandoned
+    leg THREAD only — a helper thread the leg spawned INSIDE itself would
+    pass through. Theoretical for these producers (neither leg spawns
+    printing threads), and during leg execution such writes already fell
+    through to the real stdout by design (``_ThreadRoutedStdout``'s
+    documented fallback), so the fence does not widen any existing hole.
+    """
+
+    def __init__(self, fallback, abandoned) -> None:
+        self._fallback = fallback
+        self._abandoned = frozenset(abandoned)
+
+    def _dropped(self) -> bool:
+        return threading.current_thread() in self._abandoned
+
+    def write(self, s):  # noqa: D102
+        if self._dropped():
+            return len(s)
+        return self._fallback.write(s)
+
+    def writelines(self, lines):  # noqa: D102
+        for line in lines:
+            self.write(line)
+
+    def flush(self):  # noqa: D102
+        if self._dropped():
+            return
+        try:
+            self._fallback.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def isatty(self):  # noqa: D102
+        return False
+
+    @property
+    def encoding(self):  # noqa: D102
+        return getattr(self._fallback, "encoding", "utf-8")
+
+    @property
+    def errors(self):  # noqa: D102
+        return getattr(self._fallback, "errors", None)
+
+
+def run_legs(
+    legs: "Dict[str, Callable[[], None]]",
+    leg_timeout_s: "float | None" = None,
+) -> "Dict[str, str]":
+    """Run named zero-arg callables CONCURRENTLY; return name → captured stdout.
+
+    v0.2.101 WP-A3: this is the reusable half of the driver — the router
+    (``hook_context_router.py``) runs the SAME mechanism in-process instead of
+    spawning this file, so the thread-routed-stdout capture, the per-leg
+    soft-fail and the concurrency live in ONE home. ``main()`` below is a
+    caller of this function; its marker/argv/cap contracts are unchanged.
+
+    ``leg_timeout_s`` bounds the JOIN, not the legs: a leg still running at
+    the deadline is abandoned (daemon thread — it dies with the process) and
+    its result stays "". An abandoned leg that prints LATER is fenced by
+    :class:`_PostLegStdout`: when any leg was abandoned, ``sys.stdout`` is
+    left set to a pass-through that DROPS the abandoned threads' writes, so
+    they can never interleave into the caller's subsequent output. With no
+    timeout (the legacy ``main()`` path) every leg is joined, no fence is
+    needed, and the real stdout is restored exactly as before.
+    """
+    real_stdout = sys.stdout
+    proxy = _ThreadRoutedStdout(real_stdout)
+    results: "dict[str, str]" = {name: "" for name in legs}
+
+    def _worker(name: str, fn) -> None:
+        results[name] = _run_leg(proxy, fn)
+
+    threads = [
+        threading.Thread(target=_worker, args=(name, fn), name=f"vco-{name}", daemon=True)
+        for name, fn in legs.items()
+    ]
+
+    import time
+
+    sys.stdout = proxy
+    try:
+        for t in threads:
+            t.start()
+        if leg_timeout_s is None:
+            for t in threads:
+                t.join()
+        else:
+            deadline = time.monotonic() + leg_timeout_s
+            for t in threads:
+                remaining = deadline - time.monotonic()
+                t.join(max(0.0, remaining))
+    finally:
+        abandoned = [t for t in threads if t.is_alive()]
+        if abandoned:
+            # SF-1 fence: keep a guarded stream installed so late writes from
+            # the abandoned daemon threads are dropped instead of hitting the
+            # caller's real stdout during its emit window.
+            sys.stdout = _PostLegStdout(real_stdout, abandoned)
+        else:
+            sys.stdout = real_stdout
+    return results
+
+
 def _load_cg_module(cg_script: Path):
     """Import ``query_code_graph.py`` from an explicit path (it ships into a
-    project as ``.claude/scripts/query_code_graph.py``, outside any package)."""
-    spec = importlib.util.spec_from_file_location("_vco_query_code_graph", cg_script)
+    project as ``.claude/scripts/query_code_graph.py``, outside any package).
+
+    The synthetic module name derives from the script STEM (GLM review nit-1):
+    the router loads BOTH ``rl_kg_search.py`` and ``query_code_graph.py``
+    through this helper, and the old fixed name made the second load silently
+    overwrite the first's ``sys.modules`` entry. For query_code_graph.py the
+    derived name is the historical one (``_vco_query_code_graph``), so
+    nothing observable changes for the legacy driver path."""
+    spec = importlib.util.spec_from_file_location(f"_vco_{cg_script.stem}", cg_script)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load {cg_script}")
     mod = importlib.util.module_from_spec(spec)
@@ -327,35 +464,25 @@ def main(argv: "list[str] | None" = None) -> int:
 
     # ── 2. Run the legs CONCURRENTLY (they are I/O-bound: HTTP to Weaviate /
     #      Ollama / the embed service, so they overlap the way the two
-    #      background subprocesses used to) ─────────────────────────────────
-    real_stdout = sys.stdout
-    proxy = _ThreadRoutedStdout(real_stdout)
-    results: "dict[str, str]" = {"kg": "", "cg": ""}
-
-    def _kg_worker() -> None:
-        import asyncio
-
-        # asyncio.run() in a worker thread creates + owns its own event loop;
-        # it installs no signal handlers, so a non-main thread is fine.
-        results["kg"] = _run_leg(proxy, lambda: asyncio.run(kg_mod.main()))
-
-    def _cg_worker() -> None:
-        results["cg"] = _run_leg(proxy, cg_mod.main)
-
-    threads = []
+    #      background subprocesses used to). v0.2.101: the orchestration
+    #      lives in run_legs (the router reuses it); this call site keeps the
+    #      exact leg set and the "kg"/"cg" result keys. ────────────────────
+    legs: "Dict[str, Callable[[], None]]" = {}
     if want_kg:
-        threads.append(threading.Thread(target=_kg_worker, name="vco-kg", daemon=True))
-    if want_cg:
-        threads.append(threading.Thread(target=_cg_worker, name="vco-cg", daemon=True))
+        def _kg_leg(mod=kg_mod) -> None:
+            import asyncio
 
-    sys.stdout = proxy
-    try:
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-    finally:
-        sys.stdout = real_stdout
+            # asyncio.run() in a worker thread creates + owns its own event
+            # loop; it installs no signal handlers, so a non-main thread is
+            # fine.
+            asyncio.run(mod.main())
+
+        legs["kg"] = _kg_leg
+    if want_cg:
+        legs["cg"] = cg_mod.main
+
+    results: "dict[str, str]" = {"kg": "", "cg": ""}
+    results.update(run_legs(legs))
 
     # ── 3. Emit in FIXED order (KG then CG), regardless of finish order ─────
     if args.kg_limit > 0:

@@ -101,7 +101,7 @@ def test_adoption_update_json_stdout_parses_REGRESSION_PIN(project: Path) -> Non
     """
     _assert_stdout_is_pure_json(_run_bundle(project))
 
-    drifted = project / ".claude" / "agents" / "coder.md"
+    drifted = project / ".claude" / "agents" / "expert-coder.md"
     assert drifted.is_file(), "premise: the bundle ships this agent"
     drifted.write_text(
         drifted.read_text() + "\n# drifted bytes (stale shipped version shape)\n"

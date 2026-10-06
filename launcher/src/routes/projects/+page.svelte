@@ -11,6 +11,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { projects, selectedProject } from '$lib/stores/projects';
+  import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
   import { invoke, tauriAvailable } from '$lib/tauri';
   import Toast from '$lib/components/Toast.svelte';
@@ -80,10 +81,12 @@
   // So the census is re-taken after EVERY action that changes a bundle:
   // page mount, an orchestrator update completing (the moment the gap is
   // created), "Update all" finishing (success, partial or failed), the
-  // Refresh button, a project added or removed from any surface, and a new
-  // project's background bundle install finishing. A per-project "Update
-  // bundle" runs on /project/[id]/settings, a different route: coming back
-  // here re-mounts this page and the mount census covers it.
+  // Refresh button, a project added or removed from any surface, a new
+  // project's background bundle install finishing, and — since v0.2.101 —
+  // a per-row Update on this page finishing (see `runRowUpdate`). A
+  // per-project "Update bundle" on /project/[id]/settings is still a
+  // different route: coming back here re-mounts this page and the mount
+  // census covers it.
   //
   // Every trigger — and the rule that an OLDER census response never
   // overwrites a newer one — lives in `createCensusController`, where each
@@ -137,9 +140,54 @@
   const attention = $derived(needsAttentionCount(census));
   const censusSummary = $derived(summaryLine(census));
 
+  // v0.2.101 (PLAN-V02101-PULL-IN §7, owner ruling 2026-10-05 — P299-C3):
+  // a card click routes into the project's SETTINGS page. Before the
+  // v0.2.99-era rework this is where users landed from the card; the
+  // rework left them on the project overview and the settings surface —
+  // with the bundle Update button, rename, repoint and unregister — was
+  // two clicks away. `/project/[id]/settings` is the standalone route
+  // that renders the same SettingsTab the overview's Settings tab does.
   function open(id: string) {
     projects.select(id);
-    goto(`/project/${id}`);
+    goto(`/project/${id}/settings`);
+  }
+
+  // ─── Per-row bundle update (v0.2.101, P299-C4) ─────────────────────────
+  //
+  // The per-project Update row action, rebuilt on the ONE existing engine:
+  // `projects.update(id)` in the store — the same call the per-project
+  // Settings page's "Update bundle" button makes, which invokes
+  // `update_project_v2` (projects_v2.rs → the single `run_install_bundle_core`
+  // spawn, serialized per project folder by `single_flight::bundle_engine_turn`).
+  // No direct invoke here on purpose: the store owns the summary toast,
+  // the warning-severity routing and the store-row refresh, and a second
+  // call-site would fork that logic.
+  //
+  // Busy state: `updatingId` is the page's one running-row marker. While an
+  // update runs, every row's Update button AND the header "Update all" are
+  // disabled — consistent with the existing flows (SettingsTab locks its
+  // button while in flight; UpdateAllProjectsModal blocks the page behind a
+  // non-dismissable overlay while it runs). The engine is 5–15 s, so the
+  // button itself shows the busy label.
+  let updatingId = $state<string | null>(null);
+
+  async function runRowUpdate(id: string) {
+    if (updatingId !== null) return;
+    updatingId = id;
+    try {
+      await projects.update(id);
+    } catch (e) {
+      // Hard env failure (project not in DB, folder gone) — the invoke
+      // threw. Soft-fail conditions flow through result.warnings and are
+      // toasted by the store; this mirrors SettingsTab's catch.
+      toast.error(`Update bundle failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      updatingId = null;
+      // A row Update changes bundle state exactly like "Update all" does,
+      // so the census is re-taken — the trigger list in the comment above
+      // the controller is the promise, and this action is now on it.
+      void censusCtl.refresh();
+    }
   }
 </script>
 
@@ -162,11 +210,13 @@
     </button>
     <!-- 0.2.x backlog #4: power-user "Update all" button. Sequential
          iteration; the modal shows per-project status. Disabled when
-         no projects are registered (nothing to update). -->
+         no projects are registered (nothing to update), and — v0.2.101 —
+         while a per-row Update is in flight (one engine turn at a time
+         from this page; the row button shows the busy state). -->
     <button
       class="pl-update-all"
       onclick={() => (updateAllOpen = true)}
-      disabled={store.loading || store.projects.length === 0}
+      disabled={store.loading || store.projects.length === 0 || updatingId !== null}
       title="Re-run bundle install on every registered project, sequentially"
     >
       ⟳ Update all
@@ -237,10 +287,10 @@
   {:else}
     <div class="pl-grid">
       {#each store.projects as p (p.id)}
-        <!-- The chip lives in the grid CELL rather than inside ProjectCard
-             so the card component keeps a single responsibility (and so
-             every other ProjectCard call-site is unaffected). Negative
-             top margin + the cell's flex column make it read as a footer
+        <!-- The chip AND the row actions live in the grid CELL rather than
+             inside ProjectCard so the card component keeps a single
+             responsibility (and so every other ProjectCard call-site is
+             unaffected). The cell's flex column makes them read as a footer
              strip attached to the card. -->
         <div class="pl-cell">
           <ProjectCard
@@ -251,6 +301,32 @@
           />
           <div class="pl-cell-chips">
             <BundleStalenessChip {census} projectId={p.id} />
+            <!-- v0.2.101 (P299-C4): per-project Update row action, back
+                 beside "Update all" + the per-project settings button.
+                 Same engine as the Settings page's "Update bundle"
+                 (projects.update → update_project_v2 → the single
+                 run_install_bundle_core spawn, per-folder single-flight).
+                 Outside the card's clickable div, so these clicks never
+                 trigger the card's settings route. -->
+            <span class="pl-cell-actions">
+              <button
+                class="pl-row-update"
+                data-testid="project-row-update"
+                onclick={() => runRowUpdate(p.id)}
+                disabled={updatingId !== null || updateAllOpen}
+                title="Re-run install-bundle --update for this project (the same engine its Settings page uses)"
+              >
+                {updatingId === p.id ? 'Updating…' : '⟳ Update'}
+              </button>
+              <button
+                class="pl-row-settings"
+                data-testid="project-row-settings"
+                onclick={() => open(p.id)}
+                title="Open this project's settings page"
+              >
+                ⚙ Settings
+              </button>
+            </span>
           </div>
         </div>
       {/each}
@@ -345,8 +421,43 @@
   .pl-cell { display: flex; flex-direction: column; }
   .pl-cell-chips {
     display: flex;
+    align-items: center;
     gap: 6px;
     padding: 6px 16px 0;
+  }
+  /* v0.2.101 (P299-C4): per-row actions pushed to the right end of the
+     footer strip; the staleness chip keeps the left side. Update wears the
+     same teal accent as the header "Update all" (it is the same operation,
+     scoped to one row); Settings stays neutral chrome. */
+  .pl-cell-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 6px;
+  }
+  .pl-row-update, .pl-row-settings {
+    padding: 2px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: inherit;
+  }
+  .pl-row-update {
+    border-color: rgba(0, 191, 166, 0.3);
+    color: rgb(0, 191, 166);
+  }
+  .pl-row-update:hover:not(:disabled) {
+    background: rgba(0, 191, 166, 0.08);
+    border-color: rgba(0, 191, 166, 0.6);
+  }
+  .pl-row-settings:hover {
+    background: rgba(255, 255, 255, 0.1);
+  }
+  .pl-row-update:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    color: var(--color-mid, #aaa);
   }
 
   .pl-grid {

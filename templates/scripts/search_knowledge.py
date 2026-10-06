@@ -599,10 +599,16 @@ def get_embedding(text: str) -> list:
     openai based on env). Falls back to a direct Ollama call on the
     legacy qwen3-embedding model if EmbeddingService isn't available
     (kept for forward-compat with installs that haven't migrated).
+
+    v0.2.101: this embeds a SEARCH QUERY (the CLI's retrieval query), so it
+    routes through ``embed_text_query`` which applies the active model's
+    query-side instruction. The fallback below stays UNPREFIXED — a
+    half-migrated install's degraded path (the prefix needs the resolved
+    model from the table).
     """
     svc = _get_or_create_embedding_service()
     if svc is not None:
-        return svc.embed_text(text)
+        return svc.embed_text_query(text)
     # Legacy fallback: direct Ollama call. Only reached when vco_lib
     # isn't importable (HAS_EMBEDDING_SERVICE=False) — that case
     # indicates a half-migrated install, NOT a normal operating state.

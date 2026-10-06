@@ -134,6 +134,60 @@ vco_seen_add() {
     printf '%s\n' "$key" >> "$file" 2>/dev/null || true
 }
 
+# vco_seen_claim <claim_file> <stale_after_s>
+# v0.2.101 (pull-in ④): the "first of N concurrent runs wins" primitive for the
+# shell injectors, PORTABLE — no flock (absent on macOS). The create runs under
+# `set -o noclobber`, which bash implements as open(O_CREAT|O_EXCL) for a file
+# that does not exist yet (redir.c noclobber_open, bash 3.2 onward — so macOS's
+# stock bash too): of two processes racing for the same name exactly one
+# creates it. Unlike vco_seen_has + vco_seen_add (check, then write) there is no
+# window in which both can see "absent".
+#
+# Return codes (the caller picks the fail mode, as with claim_once):
+#   0 — this call created the claim: proceed;
+#   1 — a claim younger than <stale_after_s> exists: another run holds it,
+#       stand down;
+#   2 — could not decide (no path, the directory cannot be created, the create
+#       fails for a reason other than "exists").
+# A claim OLDER than <stale_after_s> is a dead run's leftover: it is removed and
+# the create retried ONCE (the one non-atomic step, as in claim_once). The claim
+# file holds the winner's pid — diagnostic only, nothing reads it back.
+#
+# MUST MATCH seen-store.ps1's Invoke-VcoSeenClaim and vco_lib/atomic.py's
+# claim_once (same three outcomes, same single stale takeover). A mirror rather
+# than a `python -m` call on purpose: the caller is the pre-edit REPLAY path,
+# whose whole point is answering without spawning the venv interpreter.
+vco_seen_claim() {
+    local claim="$1" stale="${2:-60}"
+    [ -n "$claim" ] || return 2
+    case "$stale" in ''|*[!0-9]*) stale=60 ;; esac
+    case "$claim" in
+        */*) mkdir -p "${claim%/*}" 2>/dev/null || return 2 ;;
+    esac
+    local attempt mtime age
+    for attempt in 0 1; do
+        if ( set -o noclobber; printf '%s\n' "$$" > "$claim" ) 2>/dev/null; then
+            return 0
+        fi
+        if [ ! -e "$claim" ]; then
+            # Not "exists": either the holder released it between our create
+            # and this test (retry once), or the create genuinely fails.
+            [ "$attempt" = 0 ] && continue
+            return 2
+        fi
+        [ "$attempt" = 1 ] && return 1
+        mtime=$(stat -c '%Y' "$claim" 2>/dev/null || stat -f '%m' "$claim" 2>/dev/null || echo "")
+        if [ -z "$mtime" ] && [ -n "${PY:-}" ]; then
+            mtime=$("$PY" -c "import os,sys; print(int(os.path.getmtime(sys.argv[1])))" "$claim" 2>/dev/null || echo "")
+        fi
+        case "$mtime" in ''|*[!0-9]*) return 1 ;; esac  # cannot age it: treat as held
+        age=$(( $(date +%s) - mtime ))
+        [ "$age" -lt "$stale" ] && return 1
+        rm -f "$claim" 2>/dev/null || return 2
+    done
+    return 1
+}
+
 # vco_seen_src_matches <reads_file> <src> [project_root]
 # P4 (v0.2.91): rule-(b) comparison WITH PATH-FORM NORMALIZATION.
 #

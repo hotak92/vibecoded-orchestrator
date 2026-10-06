@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from vco_lib import legacy_claude_md, materialize, project_init  # noqa: E402
 from vco_lib import project_templates as pt  # noqa: E402
+from vco_lib import setup_sections as ss  # noqa: E402
 from vco_lib.deferral_report import MANAGED_REGION_OPEN, DeferralReport  # noqa: E402
 
 CID = pt.USER_SECTION_REVIEW_CID
@@ -41,7 +42,10 @@ class TestTheReferenceData:
             assert hashlib.sha256(e["body"].encode("utf-8")).hexdigest() == e["sha256"]
             assert e["version"] == e["tags"][0]
         assert entries[0]["version"] == "v0.2.33"
-        assert "v0.2.99" in entries[-1]["tags"]
+        assert any("v0.2.99" in e["tags"] for e in entries)
+        # Regenerated after each release tag (`python -m vco_lib.legacy_claude_md
+        # --regenerate`, NB-08): the newest entry is the newest released template.
+        assert entries[-1]["version"] == "v0.2.100"
 
     def test_entries_are_the_tagged_bytes(self):
         """Where the release tags are available (a git checkout), every entry is
@@ -123,7 +127,14 @@ class TestNeverUpdatedPreSplitProject:
         assert CID not in _cids(project)
         assert text.count(MANAGED_REGION_OPEN) == 1
         assert text.count("## Project Overview") == 1
-        assert pt.managed_body(text).lstrip("-\n").startswith("## VCO Paths")
+        # v0.2.101 (12a): a FRESH managed body opens with the SETUP-ONLY
+        # scoping block (unacknowledged on a first render); behind it the
+        # body must still start with the template's first managed section —
+        # the intent of the original assertion, minus the new block.
+        body = pt.managed_body(text)
+        assert ss.find_blocks(body), "the fresh render carries the scoping block"
+        cleaned, _removed = ss.strip_blocks(body, lambda _b: True)
+        assert cleaned.lstrip("-\n").startswith("## VCO Paths")
         assert text.endswith("\n## Added below\nmine\n")
 
     def test_an_edited_old_render_takes_the_edited_route(self, tmp_path):
@@ -225,8 +236,12 @@ class TestEditedMigrationDoesNotDuplicateVcoSections:
             assert mine in user, mine
         assert text.endswith("\n## Added below\nmine\n")
         # The unedited VCO sections exist once — in the managed region.
-        for vco in ("## KG-First Search Policy", "## VCO-Managed Files",
-                    "## KG / Context / Memory / Plans are LOAD-BEARING"):
+        # (Heading names follow the current template: the search-policy and
+        # persistence sections were renamed in the 2026-10 instruction-file
+        # pass — same rules, de-duplicated homes.)
+        for vco in ("## Search before you answer project questions",
+                    "## VCO-Managed Files",
+                    "## Persistence layers: KG, context, memory, plans"):
             assert vco not in user, vco
             assert text.count(vco) == 1 and vco in managed
         assert "## SESSION START (always)" in user, "the EDITED VCO section is kept"

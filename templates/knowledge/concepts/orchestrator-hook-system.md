@@ -3,7 +3,7 @@ title: Orchestrator Hook System
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, hooks, automation, workflow]
 created: 2026-04-27T18:30:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-10-06T09:00:00Z
 status: active
 ---
 
@@ -129,7 +129,7 @@ Context nearing limit
 ### SubagentStart
 
 **subagent-start-suggest.sh** / **subagent-start-kg-inject.sh**
-- Suggest relevant capabilities and inject KG context into a freshly-spawned subagent.
+- Suggest relevant capabilities; keep the V52-L.1 filesystem snapshot the SubagentStop reconciler diffs against. (v0.2.101: the KG-injection half was retired — a SubagentStart payload carries no prompt text, so its query could never fire. KG context for subagents is injected PARENT-side by `agent-brief-kg-inject.sh` below.)
 
 ### SubagentStop (blocking)
 
@@ -139,11 +139,11 @@ Context nearing limit
 ### PreToolUse
 
 **pre-tool-use.sh** (matcher: `*`)
-- Hosts the security layers (SSRF guard, shell-injection scan, Build Anchor + file backup) plus the pre-Edit/Write KG suggestion. See [[Orchestrator Security]].
+- Hosts the security layers (SSRF guard, shell-injection scan, Build Anchor + file backup). See [[Orchestrator Security]]. (v0.2.101: its Read/Grep code-graph branches and the pre-Edit/Write KG suggestion were retired — the dedicated router wrappers below own injection now, so this hook spawns no KG/code-graph subprocess.)
 - Historical note (v0.2.77 9-bis): this hook previously wrote every tool call to a `.claude/logs/toucan_dataset.jsonl` "TOUCAN dataset" log. That collector had zero consumers (never wired into RL training — RL training data lives in `launcher.db rl_events` + the citation drain), so it was retired to drop the per-tool-call I/O.
 
 **SSRF guard** (inside `pre-tool-use.sh`, matcher: `*`, acts on `WebFetch`)
-- Inspects `WebFetch` target URLs and blocks private/internal addresses unless whitelisted (Weaviate 8081, Ollama 11435, code-embed 11440, Gradio 7860). `search_papers` reaches its APIs directly and is not routed through this guard.
+- Inspects `WebFetch` target URLs and blocks private/internal addresses unless whitelisted (Weaviate 8081, Ollama 11435, code-embed 11440, Gradio 7860).
 
 **Shell injection scan** (inside `pre-tool-use.sh`, acts on `Bash`)
 - Blocks fetch-piped-to-shell patterns (`curl|sh`, `eval $(curl …)`, `base64 -d | sh`), then delegates to `bash_security.py` (a flat list of ~24 regex rules covering disk-destroy, credential exfil, secret-file reads, world-writable chmod, remote installs, reverse shells, etc.).
@@ -152,15 +152,11 @@ Context nearing limit
 - Blocks Bash commands that would echo or leak a Vercel deploy token.
 
 **lean-ctx-rewrite.sh / lean-ctx-rewrite.ps1** (matcher: `Bash`)
-- Rewrites Bash commands for token compression via `lean-ctx`. Scrubs sensitive environment variables before delegating to the lean-ctx subprocess; graceful no-op when lean-ctx is not installed; symmetric `bypass` support for raw output per call.
+- Compresses ONLY the single simple commands on the shared allow-list `_lib/lean-ctx-allowlist.txt` (package installs, image pulls, downloads, test/build runners) — everything else runs raw: loops, pipes, chains, redirects, `git`, unknown commands, and credential-bearing commands (SEC-RAW). An allow-listed command is rewritten to the `_lib/lean-ctx-tee.{sh,ps1}` wrapper, which tees the FULL raw output to `.claude/state/lean-ctx-tee/<ts>.log` (TTL-swept, default 168 h) and ends the compressed output with a pointer line naming that file — compression is lossless (v0.2.101). Scrubs sensitive environment variables before any subprocess; graceful no-op when lean-ctx is not installed; commands starting with `lean-ctx` step aside (per-call `bypass`, no double-wrap).
 
-**pre-bash-context-inject.sh** (matcher: `Bash`)
-- Injects relevant KG context ahead of a Bash command when the command's intent maps to known patterns.
-
-**pre-edit-context-inject.sh** (matcher: `Edit`)
-- Before editing a file, runs KG search for the filename/concept and code-graph search for related functions.
-- Injects search results as context. Cold (cache-miss) ~1.3s; warm (cache-hit) ~0.1s via the 10-min TTL per-file cache. v0.2.77 Part 9 moved the cache-replay branch ahead of the search launch so a warm hit is served from cache without re-paying the ~1.3s Weaviate+embed round-trip (the pre-fix cache was dead — it launched+awaited the searches before the replay branch, so warm ≈ cold). A cross-surface shared TTL result-cache (query-cache.sh) additionally serves repeat queries across pre-edit/pre-bash/pre-tool-use.
-- Session-level dedup via a seen-nodes file prevents repeating the same nodes; resets on compaction.
+**Context injection wrappers (v0.2.101 redesign)** — `pre-bash-context-inject.sh` (matcher: `Bash`, an `if`-filtered handler group so non-candidate commands spawn nothing), `pre-edit-context-inject.sh` (`Edit`), `pre-write-context-inject.sh` (`Write`), `grep-context-inject.sh` (`Grep`), `agent-brief-kg-inject.sh` (`Agent|Task`), and PostToolUse `read-context-inject.sh` (`Read`).
+- All six are THIN wrappers around one Python router (`claude_mcp_servers/scripts/hook_context_router.py`; pure decision core in `vco_lib/inject_intent.py`): the wrapper pipes the hook payload to `hook_context_router.py <surface>` and envelopes whatever it prints. The router classifies Bash commands (READ/EDIT/SEARCH/MECHANICAL — mechanical spawns no producer), builds queries ONLY from target paths/symbols (never command or `new_string` text), applies the per-surface score-floor/tier table (titles-only below 0.85, floors 0.65–0.75), runs exact code-graph `structure callers` lookups instead of semantic code search (with an indexed-revision stamp that silences the leg on pinned `git show <rev>` reads, and a same-language identity check), dedupes through the shared seen-store files, enforces a 2 500-char per-injection cap and a 6 000-char per-turn budget (`prompt_id`-keyed), and caches under `.claude/state/query_cache/` (`kgi`/`cgi` namespaces) where an EMPTY result is never cached. Kill switch: `VCO_INJECT_PROFILE=off`. The retired `VCT_BASH_KG_THRESHOLD_CHARS` threshold was replaced by the classification.
+- `agent-brief-kg-inject` emits a PreToolUse `updatedInput` envelope (every original field echoed, only `prompt` extended, never a `permissionDecision`); `pre-edit` keeps its per-file replay cache (router output replays through current seen-state with no spawn). RL continuity: KG legs carry `--injection-profile` + per-surface `--task-type`; the pre-bash wrapper keeps the `bash_task_*` state file + `pre_bash` outcome event for classified commands (intent/targets/symbols in the payload; one event per tool call even when several `if` rules match).
 
 **pre-diagram-path-validation.sh** (matcher: `Write|Edit` and `mcp__mermaid__.*|mcp__excalidraw__.*`)
 - Validates that diagram outputs land in an indexed path before the write proceeds.
@@ -174,8 +170,11 @@ Context nearing limit
   - code files → appended to the per-session code-graph queue in `.claude/state/`, drained at end-of-turn by the `Stop` hook `stop-codegraph-drain.sh` (ONE analyzer pass per canonical root, rate-limited). `code-graph-incremental.sh` is NOT called by it — that hook ships unregistered and uninvoked, for standalone use.
 - Runs duplicate detection periodically.
 
-**post-edit-outcome.sh** (matcher: `Edit|Write`)
-- Records the edit outcome for retrieval-quality telemetry.
+**post-tool-use-async.sh** (matcher: `*`, async — the ONE async PostToolUse registration, v0.2.101)
+- Dispatcher for every background PostToolUse concern. Reads the hook payload once, routes it by `tool_name` to the unchanged per-concern scripts and runs them concurrently, guaranteeing silence: child stdout is discarded and child stderr / non-zero exits condense to one line per failure in `<VCO metrics dir>/post-tool-use-async.log`, so a tool call can no longer write up to three `async_hook_response` transcript records (measured pre-fix: 700k records / 462 MB in one transcript).
+- Routes: `Edit|Write` → **post-edit-outcome.sh** (edit-outcome telemetry for the RL retrieval pipeline) + **kg-summary-generator.sh** (background summary refresh of `knowledge/.node_formats.json` for knowledge-path edits — its own path validation is the gate; see [[KG-Summary Three-Tier Generation Pipeline]] for backend selection); `Bash` → **post-bash-context-record.sh** (bash-outcome telemetry) + **post-file-delete.sh** (diagram-delete cascade) + **post-git-commit-kg-sync.sh** (commit-review agent, behind a `git commit` command-prefix gate reproducing the retired `if: Bash(git commit *)` key); `mcp__weaviate-kg__store_knowledge_node` → **kg-summary-generator.sh**; every tool → **kg-update-nudge.sh** (work-unit bookkeeping so the next-prompt nudge fires at the right threshold).
+- Per-sub-hook on/off survives the merge: a stem listed in `VCO_ASYNC_DISABLED_HOOKS` (`<project>/.claude/env`, comma-separated — the lean-ctx knob's own channel, written by the launcher Hooks tab's sub-hook checkboxes via `set_claude_env_value`) is skipped by both siblings, and a disable parked before the merge is carried into that key by the bundle update (a failed carry write defers as `async_subhook_disable_carry_failed` and keeps the parked bytes protected until it lands).
+- Pre-v0.2.101 these six scripts held eight individual async registrations; those are declared retired (event-scoped to PostToolUse, async-only) in `vco_lib/hook_retirements.py`, so an existing install loses them at the next bundle update while the nudge's SYNC UserPromptSubmit / SessionStart(compact) registrations survive.
 
 **py_compile** (inline `python3 -c`, matcher: `Write`)
 - Compile-checks a Python file immediately after it is written, surfacing syntax errors.
@@ -183,23 +182,10 @@ Context nearing limit
 **post-tool-security.sh** (matcher: `Edit|Write`)
 - Scans written file content for credential patterns. Logs findings to `.claude/logs/security-scan.jsonl`. Non-blocking — informational only.
 
-**sync_knowledge_graph.py + kg-summary-generator.sh** (matcher: `Edit|Write`)
-- Syncs an edited knowledge node to Weaviate and spawns a background summary job to refresh `knowledge/.node_formats.json`.
-- See [[KG-Summary Three-Tier Generation Pipeline]] for backend selection (claude CLI → Ollama → API → skip).
-
-**kg-summary-generator.sh** (matcher: `mcp__weaviate-kg__store_knowledge_node`)
-- Refreshes the sidecar summary when a node is written through the MCP tool rather than a file edit.
-
 **post-bash-file-sync.sh** (matcher: `Bash`)
 - Closes the CLI half of the sync gap: a file written from a shell command (`cat > knowledge/x.md <<EOF`, a heredoc, `sed -i` on a docs page, `cp` into a source tree) never reached Weaviate, because `post-file-edit.sh` is registered on `Edit|Write` only.
 - The command is parsed for the paths it wrote, and each one goes through the SAME routing home (`_lib/route-touched-path.sh`) that the Edit/Write hook uses, so a CLI write syncs identically. A pure-shell prefilter rejects the routine commands (`ls`, `git status`, a redirect to `/dev/null`) with no subprocess at all.
 - Writes an interpreter performs from its own source text (`python - <<EOF`, `patch`, `git checkout --`) cannot be recovered from the command string; for `knowledge/` and `docs/` those are caught by a bounded, watermarked mtime scan of those two directories.
-
-**post-bash-context-record.sh** (matcher: `Bash`)
-- Records Bash context for later retrieval; **post-git-commit-kg-sync.sh** + **post-file-delete.sh** also fire on `Bash` to sync KG on commit and prune deleted-file entries.
-
-**kg-update-nudge.sh** (matcher: `*`)
-- Tracks accumulated work units across all tool use so the next-prompt nudge fires at the right threshold.
 
 ### ConfigChange
 
@@ -223,7 +209,7 @@ The source-of-truth for all hook scripts is `templates/hooks/*.sh` (and their `.
 
 ## Python Environment (venv) Resolution
 
-The hooks that call Python helpers (`code-graph-incremental.sh`, `kg-summary-generator.sh`, `pre-edit-context-inject.sh`) need a Python interpreter from the orchestrator venv. The resolution order is:
+The hooks that call Python helpers (`code-graph-incremental.sh`, `kg-summary-generator.sh`, the injection wrappers' `hook_context_router.py` spawn) need a Python interpreter from the orchestrator venv. The resolution order is:
 
 1. `$VCT_PYTHON` / `$VCT_VENV` — explicit override (highest priority).
 2. `$REPO_ROOT/.venv/bin/python` — top-level venv layout (installs where `install.py` creates `.venv` at the install root).

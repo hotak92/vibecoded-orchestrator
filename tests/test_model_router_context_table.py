@@ -31,6 +31,12 @@ from pathlib import Path
 
 from model_router import context_table as ct
 
+#: The shipped project template whose model-routing note describes this table
+#: to the reader of a rendered ``CLAUDE.md``. The prose and the seed must tell
+#: the same story — a reader told the Claude rows are absent cannot reconcile
+#: that with the four first-party rows below.
+TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "CLAUDE.md.template"
+
 #: The nine subscription-vendor rows the shipped seed must carry.
 EXPECTED_VENDOR_SEED_IDS = {
     "glm-5.3", "glm-5.3-flash", "glm-5.1", "glm-5",
@@ -84,10 +90,19 @@ EXPECTED_1M_IDS = (
 
 #: Official documentation host per vendor id. A citation anywhere else is
 #: not a vendor page.
+#:
+#: ``anthropic`` moved to ``platform.claude.com``: the four Claude rows used to
+#: cite the bare ``https://docs.anthropic.com`` host (a citation that names no
+#: page), and that host now redirects to ``platform.claude.com``. The rows cite
+#: the real per-model pages there — ``claude-fable-5``/``claude-opus-5``/
+#: ``claude-sonnet-5`` their own ``.../models/<id>/overview`` pages, and
+#: ``claude-fable-5-1`` the ``.../about-claude/models/overview`` index page
+#: because it has no page of its own (its note says so). This prefix is what
+#: keeps a reverted bare-domain citation failing.
 OFFICIAL_DOC_PREFIX = {
     "zai": "https://docs.z.ai/",
     "qwen": "https://docs.qwencloud.com/",
-    "anthropic": "https://docs.anthropic.com",
+    "anthropic": "https://platform.claude.com/",
 }
 
 
@@ -232,6 +247,30 @@ class SeedTests(unittest.TestCase):
                 self.assertEqual(row.vendor, ANTHROPIC_FAMILY.family_id)
                 self.assertTrue(row.window_1m)
                 self.assertEqual(row.context_window, 1_000_000)
+
+    def test_template_routing_note_matches_the_shipped_rows(self) -> None:
+        """The template's routing note must not call the Claude rows absent,
+        because the seed ships four first-party ones.
+
+        The false sentence ("Claude models are deliberately absent from that
+        table") predated the rows: it was written when the table carried only
+        vendor rows, and it survived v0.2.95/v0.2.96, which added the four
+        ``anthropic`` rows and the two consumers that read them
+        (``decorate_1m``'s ``[1m]`` hint and the gateway catalog companion).
+        A rendered ``CLAUDE.md`` must tell its reader what the data says, so
+        the absence claim is pinned out and the truth pinned in.
+        """
+        text = TEMPLATE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn(
+            "Claude models are deliberately absent", text,
+            "the template still claims the Claude rows are absent while the "
+            "seed ships four first-party ones; the prose must follow the data",
+        )
+        self.assertIn(
+            "first-party", text,
+            "the note must positively state the first-party rows ARE in the "
+            "table, not merely drop the false sentence",
+        )
 
     def test_claude_rows_add_a_1m_companion_to_the_gateway_catalog(self) -> None:
         """A first-party 1M row publishes its ``[1m]`` spelling, and under

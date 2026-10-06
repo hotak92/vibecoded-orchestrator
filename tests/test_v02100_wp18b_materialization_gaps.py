@@ -3,9 +3,13 @@
 """v0.2.100 WP-18B — the template-materialization gap fixes outside the core
 renderer (survey ``V02100-TEMPLATE-MATERIALIZATION-SURVEY`` gaps (b), (e)).
 
-1. The 7 agents' ``orchestrator-tools`` mcpServers block (a server that never
+1. The v0.2.99 ``orchestrator-tools`` mcpServers block (a server that never
    existed, through ``claude_mcp_servers/.venv``) is gone — and an UPDATING
    user's installed copy of the old render is replaced by the bundle update.
+   v0.2.101 narrowed the checked set to the three agent templates from that
+   release that still ship as default agents (``tester``, ``planner``,
+   ``expert-coder``): the other four were merged away or moved into packs, so
+   their old copies are handled by the orphan/leftover path, not this gate.
 2. The Python MCP-registration fallback carries the rows' URLs (host + scheme
    + port), pinned to the Rust registrar by a shared case table; a stale
    ``http://localhost:<port>`` entry is corrected by the next registration.
@@ -37,9 +41,13 @@ AGENTS = REPO / "templates" / "agents" / "free"
 HOOKS = REPO / "templates" / "hooks"
 SCRIPTS = REPO / "templates" / "scripts"
 
-SEVEN_AGENTS = (
-    "coder", "tester", "planner", "expert-coder", "project-architect",
-    "ai-agentic-architect", "consulting-cto-portfolio-coordinator",
+#: The v0.2.99 templates that carried the dead ``orchestrator-tools`` block
+#: AND still ship as default agents in v0.2.101. The other four (``coder``,
+#: ``project-architect``, ``ai-agentic-architect``,
+#: ``consulting-cto-portfolio-coordinator``) were merged away or moved into
+#: packs, so no default-agent file exists to check any more.
+V0299_SHIPPED_AGENTS = (
+    "tester", "planner", "expert-coder",
 )
 
 
@@ -51,7 +59,7 @@ def _frontmatter(text: str) -> str:
 # ─── 1. agents ──────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("name", SEVEN_AGENTS)
+@pytest.mark.parametrize("name", V0299_SHIPPED_AGENTS)
 def test_agent_declares_no_nonexistent_mcp_server(name: str) -> None:
     text = (AGENTS / f"{name}.md").read_text(encoding="utf-8")
     fm = _frontmatter(text)
@@ -83,7 +91,7 @@ def _write_orch(root: Path, *, old: bool) -> None:
     dest = root / "templates" / "agents" / "free"
     dest.mkdir(parents=True, exist_ok=True)
     old_fm = json.loads((FIXTURES / "wp18b_v0299_agent_frontmatter.json").read_text())["frontmatter"]
-    for name in SEVEN_AGENTS:
+    for name in V0299_SHIPPED_AGENTS:
         cur = (AGENTS / f"{name}.md").read_text(encoding="utf-8")
         body = cur[len(_frontmatter(cur)):]
         text = (old_fm[name] + body) if old else cur
@@ -108,7 +116,7 @@ def test_update_replaces_the_v0299_agent_render(tmp_path: Path) -> None:
     _write_orch(orch, old=True)
     project_init.install_project_bundle(project, orchestrator_root=orch, update_mode=False)
     agents = project / ".claude" / "agents"
-    for name in SEVEN_AGENTS:
+    for name in V0299_SHIPPED_AGENTS:
         assert "orchestrator-tools" in (agents / f"{name}.md").read_text(encoding="utf-8")
     # One copy the user edited after install.
     edited = agents / "tester.md"
@@ -117,13 +125,13 @@ def test_update_replaces_the_v0299_agent_render(tmp_path: Path) -> None:
     _write_orch(orch, old=False)  # the clone is updated in place
     result = project_init.install_project_bundle(project, orchestrator_root=orch, update_mode=True)
 
-    for name in SEVEN_AGENTS:
+    for name in V0299_SHIPPED_AGENTS:
         text = (agents / f"{name}.md").read_text(encoding="utf-8")
         assert "orchestrator-tools" not in text, name
         assert "claude_mcp_servers/.venv" not in text, name
         assert text == (orch / "templates" / "agents" / "free" / f"{name}.md").read_text(encoding="utf-8")
     actions = result["actions"]
-    for name in SEVEN_AGENTS:
+    for name in V0299_SHIPPED_AGENTS:
         rel = str(Path(".claude") / "agents" / f"{name}.md")
         assert rel not in actions["preserve"], name
         if name == "tester":
@@ -495,6 +503,6 @@ def test_changed_files_are_bundle_managed() -> None:
         ".claude/scripts/query_code_graph.py", ".claude/scripts/vct_project_config.sh",
         ".claude/scripts/vct_project_config.ps1", ".claude/scripts/sync_knowledge_graph.py",
         ".claude/scripts/analyze_code_graph.py",
-        *(f".claude/agents/{n}.md" for n in SEVEN_AGENTS),
+        *(f".claude/agents/{n}.md" for n in V0299_SHIPPED_AGENTS),
     ):
         assert rel in dests, rel

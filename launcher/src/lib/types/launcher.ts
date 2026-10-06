@@ -243,7 +243,8 @@ export interface UpdateAllOptions {
  *   - "failed":    hard failure (project missing on disk / folder gone).
  *     `error` carries the explanatory message.
  *   - "skipped":   `stop_on_error=true` halted iteration before reaching
- *     this project. `error` is null, `summary` is null.
+ *     this project, or the orchestrator root's bundle was already current
+ *     (`skip_reason` says which). `error` is null, `summary` is null.
  */
 export interface UpdateAllProjectEntry {
   project_id: string;
@@ -252,6 +253,8 @@ export interface UpdateAllProjectEntry {
   error: string | null;
   warnings: string[];
   summary: UpdateSummary | null;
+  /** Why a `skipped` row was skipped, when the backend knows (v0.2.101). */
+  skip_reason?: string | null;
 }
 
 /**

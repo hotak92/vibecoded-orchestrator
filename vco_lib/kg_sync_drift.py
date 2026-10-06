@@ -82,15 +82,25 @@ One-home reuse (this module invents nothing new):
   :func:`surface_drift` for why an unregistered condition must never claim
   ``auto_retryable`` it cannot back up with a real dispatcher handler.
 
-Exclusions this module MUST mirror (parity-tested against the source file —
-see ``tests/test_v0292_kg_sync_drift.py``):
+Exclusions this module MUST mirror (parity-tested — see
+``tests/test_v0292_kg_sync_drift.py``):
 
 * ``TAG_HIERARCHY.md`` / ``VOCABULARY.md`` are never synced at all (schema/
   reference docs, not searchable content) — MUST MATCH
   ``sync_knowledge_graph.py::sync_all_nodes``'s ``EXCLUDED_FILES``.
 * Archived nodes (path segment ``archive`` / ``.archive`` / ``_archive``, or
   frontmatter ``status: archived|deprecated|superseded``) are deliberately
-  absent from Weaviate — MUST MATCH ``sync_knowledge_graph.py::_is_archived_node``.
+  absent from Weaviate. v0.2.101 item 3: this rule has ONE home,
+  :mod:`vco_lib.kg_node_status` — CALLED from here, no longer mirrored.
+* Invalid-type nodes (v0.2.101 P299-A3): a frontmatter ``type:`` that is
+  empty/malformed is FAILED loudly by ``sync_node`` (and refused by the MCP
+  store path), so it can never reach Weaviate — :func:`node_type_invalid`
+  skips it here via the SAME shared decision
+  (:func:`vco_lib.kg_vocabulary.is_wellformed_type`), counted in
+  ``invalid_type_skipped``. Reporting such a node as "missing" would be a
+  permanent phantom whose printed remedy (re-run kg-sync) could never
+  clear it. An UNDECLARED-but-wellformed type is NOT skipped: it syncs
+  (the vocabulary auto-extends), so it stays checkable like any other.
 """
 from __future__ import annotations
 
@@ -104,19 +114,28 @@ from vco_lib.knowledge_residue import (
     content_signature_excluding_updated,
     weaviate_reachable,
 )
+from vco_lib.kg_node_status import (
+    ARCHIVE_DIR_SEGMENTS,
+    ARCHIVED_STATUS_VALUES,
+    is_archived_content,
+    is_archived_path as _shared_is_archived_path,
+)
 from vco_lib.kg_sync import batch_query_content_hashes
+from vco_lib.kg_vocabulary import is_wellformed_type
 
 #: MUST MATCH sync_knowledge_graph.py::sync_all_nodes's EXCLUDED_FILES —
 #: schema/reference docs that are never synced, checked by basename only.
 EXCLUDED_SYNC_BASENAMES: frozenset = frozenset({"TAG_HIERARCHY.md", "VOCABULARY.md"})
 
-#: MUST MATCH sync_knowledge_graph.py::_is_archived_node's
-#: _ARCHIVE_DIR_SEGMENTS — exact path-segment match, never substring (so
-#: `architecture/` and `archived-notes/` are NOT caught).
-ARCHIVE_DIR_SEGMENTS: frozenset = frozenset({"archive", ".archive", "_archive"})
-
-#: MUST MATCH sync_knowledge_graph.py::_is_archived_node's status check.
-ARCHIVED_STATUS_VALUES: frozenset = frozenset({"archived", "deprecated", "superseded"})
+#: v0.2.101 item 3: the archived predicate has ONE home —
+#: :mod:`vco_lib.kg_node_status`, which ``sync_knowledge_graph.py``'s
+#: ``_is_archived_node`` and the seed's on-disk change check
+#: (``vco_lib.install_weaviate``) both use. This module used to carry its own
+#: C-leg mirror (importing the sync script is not viable here — module-level
+#: hub resolution + a ``weaviate`` import); the mirror is RETIRED so the
+#: consumers cannot drift. Both names are RE-EXPORTED for existing importers.
+ARCHIVE_DIR_SEGMENTS: frozenset = ARCHIVE_DIR_SEGMENTS
+ARCHIVED_STATUS_VALUES: frozenset = ARCHIVED_STATUS_VALUES
 
 #: Deferral condition ids this module owns.
 CID_DRIFT = "kg_sync_drift_detected"
@@ -133,12 +152,16 @@ CID_UNBOUND = "kg_binding_missing"
 # sync_knowledge_graph.py directly is not viable here — that module resolves
 # the hub, filters warnings, and imports `weaviate` as module-level side
 # effects, none of which a read-only drift scan should trigger. The mirrored
-# logic is intentionally tiny and pinned by a source-scan parity test.)
+# logic is intentionally tiny and pinned by a parity test.)
+#
+# v0.2.101 item 3: the ARCHIVED predicate is no longer mirrored — it moved to
+# ``vco_lib.kg_node_status`` and is CALLED from here. What remains mirrored is
+# ``node_scope`` (pinned by ``tests/test_v0292_kg_sync_drift.py``).
 # ---------------------------------------------------------------------------
 
 def is_archived_path(rel_parts: tuple) -> bool:
-    """Path-segment leg of the archived check. Exact segment match only."""
-    return any(p in ARCHIVE_DIR_SEGMENTS for p in rel_parts)
+    """Path-segment leg of the archived check — the SHARED home's rule."""
+    return _shared_is_archived_path(Path(*rel_parts))[0]
 
 
 def _frontmatter_field(content: str, key: str) -> Optional[str]:
@@ -146,9 +169,8 @@ def _frontmatter_field(content: str, key: str) -> Optional[str]:
 
     Returns None on missing frontmatter, a missing key, unparseable YAML, or
     a non-string value — every case defaults to "cannot tell", which is the
-    safe direction for both callers (``status`` absent ⇒ not archived by
-    status; ``scope`` absent ⇒ "project", matching ``_node_scope``'s own
-    default).
+    safe direction for its one remaining caller (``scope`` absent ⇒
+    "project", matching ``_node_scope``'s own default).
     """
     if not content.strip().startswith("---"):
         return None
@@ -166,14 +188,10 @@ def _frontmatter_field(content: str, key: str) -> Optional[str]:
 
 
 def is_archived_node(rel_parts: tuple, content: str) -> bool:
-    """Full archived check (path OR frontmatter status) — mirrors
-    ``_is_archived_node`` (reason string dropped; callers only need bool)."""
-    if is_archived_path(rel_parts):
-        return True
-    status = _frontmatter_field(content, "status")
-    if status is not None and status.strip().lower() in ARCHIVED_STATUS_VALUES:
-        return True
-    return False
+    """Full archived check (path OR frontmatter status) — delegates to
+    :func:`vco_lib.kg_node_status.is_archived_content` (reason string dropped;
+    callers only need bool)."""
+    return is_archived_content(Path(*rel_parts), content)[0]
 
 
 def node_scope(content: str) -> str:
@@ -183,6 +201,52 @@ def node_scope(content: str) -> str:
     if raw is not None and raw.strip().lower() == "shared":
         return "shared"
     return "project"
+
+
+def _frontmatter_type_declared(content: str) -> "tuple[bool, object]":
+    """``(present, raw_value)`` for a frontmatter-declared ``type:`` key.
+
+    Mirrors ``sync_knowledge_graph.parse_frontmatter``'s shape exactly:
+    no block / unparseable YAML / non-mapping ⇒ a block exists but declares
+    nothing (``present=False`` — sync folder-derives the type there and
+    NEVER fails it), and ``_normalise_frontmatter``'s nested ``metadata:``
+    promotion (top-level key wins; ``metadata.type`` is the fallback).
+    """
+    if not content.strip().startswith("---"):
+        return False, None
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return False, None
+    try:
+        fm = yaml.safe_load(parts[1])
+    except yaml.YAMLError:
+        return False, None
+    if not isinstance(fm, dict):
+        return False, None
+    if "type" in fm:
+        return True, fm["type"]
+    nested = fm.get("metadata")
+    if isinstance(nested, dict) and "type" in nested:
+        return True, nested["type"]
+    return False, None
+
+
+def node_type_invalid(content: str) -> bool:
+    """v0.2.101 P299-A3 — the drift scanner's invalid-type skip predicate.
+
+    True ONLY when the node DECLARES a frontmatter ``type:`` whose value is
+    INVALID per :func:`vco_lib.kg_vocabulary.is_wellformed_type` — the exact
+    set ``sync_knowledge_graph.sync_node``'s vocabulary gate fails loudly
+    (and the MCP store path refuses). Such a node can never reach Weaviate
+    until its frontmatter is fixed, so reporting it as drift would be a
+    PERMANENT phantom (and its remedy — "run kg-sync --all" — could never
+    clear it). An absent ``type:`` key ⇒ False: sync folder-derives a type
+    and never fails on it, so the node stays checkable. Same shared home as
+    every other leg of the gate — parity pinned by
+    ``tests/test_v02101_kg_vocabulary_autoextend.py``.
+    """
+    present, raw = _frontmatter_type_declared(content)
+    return present and not is_wellformed_type(raw)
 
 
 def _row_path_shapes(rel_posix: str) -> tuple:
@@ -213,6 +277,12 @@ class DriftReport:
     archived_skipped: int = 0
     excluded_skipped: int = 0
     shared_scope_skipped: int = 0
+    #: v0.2.101 P299-A3: nodes whose frontmatter ``type:`` is INVALID
+    #: (empty/malformed). kg-sync FAILS these loudly, so they can never
+    #: reach Weaviate — counted here instead of being reported as missing
+    #: (see :func:`node_type_invalid`; shared decision with the sync/store
+    #: gates via :mod:`vco_lib.kg_vocabulary`).
+    invalid_type_skipped: int = 0
     missing: tuple = field(default_factory=tuple)
     stale: tuple = field(default_factory=tuple)
     detail: str = ""
@@ -328,10 +398,19 @@ def scan_drift(
     shared_nodes: list = []       # (rel_posix, computed_hash)
     archived_skipped = 0
     shared_scope_skipped = 0
+    invalid_type_skipped = 0
 
     for rel_posix, rel_parts, content in candidates:
         if is_archived_node(rel_parts, content):
             archived_skipped += 1
+            continue
+        if node_type_invalid(content):
+            # v0.2.101 P299-A3: kg-sync FAILS this node loudly (invalid
+            # frontmatter `type:` — the shared gate in vco_lib.kg_vocabulary),
+            # so it can never become a Weaviate row. Counting it as
+            # "missing" would be a permanent phantom drift entry whose
+            # printed remedy (re-run kg-sync) could never clear it.
+            invalid_type_skipped += 1
             continue
         computed_hash = content_signature_excluding_updated(content)
         if node_scope(content) == "shared":
@@ -350,6 +429,7 @@ def scan_drift(
             archived_skipped=archived_skipped,
             excluded_skipped=excluded_skipped,
             shared_scope_skipped=shared_scope_skipped,
+            invalid_type_skipped=invalid_type_skipped,
             detail="no non-archived, checkable nodes on disk",
         )
 
@@ -360,6 +440,7 @@ def scan_drift(
             archived_skipped=archived_skipped,
             excluded_skipped=excluded_skipped,
             shared_scope_skipped=shared_scope_skipped,
+            invalid_type_skipped=invalid_type_skipped,
             detail=f"Weaviate unreachable at {weaviate_url!r} — drift could not be determined",
         )
 
@@ -396,6 +477,7 @@ def scan_drift(
             archived_skipped=archived_skipped,
             excluded_skipped=excluded_skipped,
             shared_scope_skipped=shared_scope_skipped,
+            invalid_type_skipped=invalid_type_skipped,
             detail="the Weaviate hash query failed — drift could not be determined",
         )
 
@@ -424,12 +506,21 @@ def scan_drift(
         if status == "drift"
         else f"{len(checkable)} node(s) verified in sync"
     )
+    if invalid_type_skipped:
+        # Loud, never silent: these nodes need a frontmatter fix, not a
+        # re-sync — say so in the very line the CLI prints.
+        detail += (
+            f"; {invalid_type_skipped} invalid-type node(s) skipped "
+            f"(empty/malformed frontmatter `type:` — kg-sync fails them "
+            f"loudly; fix the frontmatter)"
+        )
     return DriftReport(
         status=status,
         scanned=len(candidates),
         archived_skipped=archived_skipped,
         excluded_skipped=excluded_skipped,
         shared_scope_skipped=shared_scope_skipped,
+        invalid_type_skipped=invalid_type_skipped,
         missing=tuple(sorted(missing)),
         stale=tuple(sorted(stale)),
         detail=detail,

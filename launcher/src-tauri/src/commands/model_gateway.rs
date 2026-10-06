@@ -1591,9 +1591,12 @@ pub async fn model_gateway_check() -> Result<String, String> {
 /// machine, and does this project get the gateway agent definitions?":
 /// `python -m vco_lib.module_gated_delivery status --json [--folder <f>]`.
 /// Split out so the argv shape is unit-testable without a Python.
+/// Folder strings go on the argv VERBATIM (nit 6, same rule as
+/// [`routing_guidance_args`]): only a folder empty after trimming is skipped;
+/// the bytes that remain are never altered.
 fn agents_gate_args(folder: Option<&str>) -> Vec<String> {
     let mut args = vec!["status".to_string(), "--json".to_string()];
-    if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
+    if let Some(f) = folder.filter(|f| !f.trim().is_empty()) {
         args.push("--folder".to_string());
         args.push(f.to_string());
     }
@@ -1631,6 +1634,192 @@ pub async fn model_gateway_agents_gate(
     })
     .await
     .map_err(|e| format!("agents-gate task failed: {}", e))?
+}
+
+/// What the Services page's "Model-routing guidance" toggle must SHOW for
+/// one project (v0.2.101, GUI gap G1): the tri-state the render actually
+/// follows, not the two-state `project_modules` row it was previously read
+/// from. Pre-fix, a gateway-configured machine rendered the section in
+/// every project without an explicit row while the toggle showed — and the
+/// copy said — "off by default".
+///
+/// The DECISION is Python's (rule A): every field except the mode wording
+/// is passed through from `python -m vco_lib.module_gated_delivery status
+/// --json --folder <f>`, including `claude_md_section.renders`, which the
+/// render's own mapping (`vco_lib.claude_md_sections.gateway_section_renders`)
+/// computes. [`map_routing_guidance`] only restates that payload as the
+/// three states the GUI draws.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RoutingGuidanceState {
+    /// `on` / `off` = this project carries an EXPLICIT `project_modules`
+    /// row; `follows_machine` = no explicit row, so the machine signal
+    /// decides (the resolver's own default).
+    pub mode: String,
+    /// Does the section render in this project's CLAUDE.md right now?
+    /// Python's answer, verbatim.
+    pub renders: bool,
+    /// Which way the machine decides, when `mode == follows_machine`:
+    /// `renders` / `hidden` / `unknown`. `null` for explicit rows.
+    pub machine_decides: Option<String>,
+    /// The gate's own one-line reason, passed through.
+    pub reason: String,
+}
+
+/// Pure mapping from the Python status payload to the GUI tri-state.
+///
+/// Unit-tested with fixture payloads (no Python needed): explicit on,
+/// explicit off, no row with the machine configured, no row with it not
+/// configured, and the could-not-ask cases.
+pub(crate) fn map_routing_guidance(
+    payload: &serde_json::Value,
+) -> Result<RoutingGuidanceState, String> {
+    let gate = payload
+        .get("gate")
+        .filter(|g| !g.is_null())
+        .ok_or("no gate verdict in the status payload — was --folder passed?")?;
+    let renders = payload
+        .pointer("/claude_md_section/renders")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            // Pins the Python pairing: the payload must carry the render's
+            // own answer, so this side can never re-derive it.
+            "the status payload does not say whether the CLAUDE.md section \
+             renders — update vco_lib.module_gated_delivery's status payload"
+                .to_string()
+        })?;
+    let state = gate.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    let signal = gate.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+    let reason = gate
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if signal == "project_row" {
+        // An explicit row exists; its state is the user's own choice. Only
+        // DELIVER and SKIP are produced for `project_row` by the gate.
+        let mode = if state == "deliver" { "on" } else { "off" };
+        return Ok(RoutingGuidanceState {
+            mode: mode.to_string(),
+            renders,
+            machine_decides: None,
+            reason,
+        });
+    }
+    // No explicit row (or the row could not be read): the machine decides.
+    // `renders` still comes from Python, so `unknown` here only labels the
+    // machine line — the render answer stays exact.
+    let machine_decides = match state {
+        "deliver" => "renders",
+        "skip" => "hidden",
+        _ => "unknown",
+    };
+    Ok(RoutingGuidanceState {
+        mode: "follows_machine".to_string(),
+        renders,
+        machine_decides: Some(machine_decides.to_string()),
+        reason,
+    })
+}
+
+/// The folders that name anything, WITHOUT altering them: entries that are
+/// empty after trimming are dropped, but every string that remains is sent
+/// — and keyed in the answer — VERBATIM. NF-2 (re-review of N-3): trimming
+/// here would echo a trimmed key back while the GUI looks up by the raw
+/// `folder_path`, so a whitespace-padded DB row would sit at "could not
+/// ask" forever — the same class N-3 fixed for slashes and `.` segments.
+pub(crate) fn keep_named_folders(folders: &[String]) -> Vec<String> {
+    folders
+        .iter()
+        .filter(|f| !f.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
+/// The argv tail for the BATCHED ask: `status --json --folder a --folder b
+/// …` — ONE interpreter start answers for every project (review S2: one
+/// Python spawn per project on every Services-page open was a serial
+/// startup cost the DB read it replaced never had). Split out so the argv
+/// shape is unit-testable without a Python, like [`agents_gate_args`].
+/// Folder strings go on the argv VERBATIM (see [`keep_named_folders`]):
+/// only entries that are empty after trimming are skipped.
+pub(crate) fn routing_guidance_args(folders: &[String]) -> Vec<String> {
+    let mut args = vec!["status".to_string(), "--json".to_string()];
+    for f in keep_named_folders(folders) {
+        args.push("--folder".to_string());
+        args.push(f);
+    }
+    args
+}
+
+/// Map the batched status payload (`folders` → per-folder `{gate,
+/// claude_md_section}`) to one GUI tri-state per folder. Reuses
+/// [`map_routing_guidance`] per entry; a missing or non-object `folders`
+/// key is an error naming it (pins the Python pairing, same as the single
+/// mapping).
+pub(crate) fn map_routing_guidance_batch(
+    payload: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<String, RoutingGuidanceState>, String> {
+    let folders = payload
+        .get("folders")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            "the status payload carries no `folders` map — update \
+             vco_lib.module_gated_delivery's status payload"
+                .to_string()
+        })?;
+    let mut out = std::collections::BTreeMap::new();
+    for (folder, entry) in folders {
+        let mini = serde_json::json!({
+            "gate": entry.get("gate").cloned().unwrap_or(serde_json::Value::Null),
+            "claude_md_section": entry
+                .get("claude_md_section")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        });
+        out.insert(folder.clone(), map_routing_guidance(&mini)?);
+    }
+    Ok(out)
+}
+
+/// The per-project verdicts for the Services page's routing-guidance list,
+/// for EVERY project in one Python spawn. Same bridge as
+/// [`model_gateway_agents_gate`]; the machine signal is per-machine, only
+/// the per-project row varies, so one call answers for the whole list.
+#[command]
+pub async fn model_gateway_routing_guidance(
+    folders: Vec<String>,
+) -> Result<std::collections::BTreeMap<String, RoutingGuidanceState>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Originals, not trimmed copies (NF-2): the answer is keyed by the
+        // exact strings sent, and the GUI looks up by the raw `folder_path`.
+        let folders = keep_named_folders(&folders);
+        if folders.is_empty() {
+            return Err("at least one project folder is required".to_string());
+        }
+        let python = python_or_err()?;
+        let root = crate::commands::installer::find_local_repo_root().ok();
+        let mut cmd =
+            python_module_command(&python, "vco_lib.module_gated_delivery", root.as_deref());
+        for a in routing_guidance_args(&folders) {
+            cmd.arg(a);
+        }
+        let (code, stdout, stderr) =
+            run_to_completion(cmd, "vco_lib.module_gated_delivery")?;
+        let payload: serde_json::Value = serde_json::from_str(stdout.trim())
+            .map_err(|e| {
+                format!(
+                    "vco_lib.module_gated_delivery exited {} and did not \
+                     return JSON ({}): {}",
+                    code,
+                    e,
+                    stderr.trim()
+                )
+            })?;
+        map_routing_guidance_batch(&payload)
+    })
+    .await
+    .map_err(|e| format!("routing-guidance task failed: {}", e))?
 }
 
 // ─── VS Code panel wiring ─────────────────────────────────────────────────
@@ -1830,6 +2019,204 @@ mod tests {
         assert_eq!(
             agents_gate_args(Some("/p/x")),
             vec!["status", "--json", "--folder", "/p/x"]
+        );
+        // Nit 6 (NF-2 latent residual): a folder non-empty after trimming is
+        // sent VERBATIM, exactly like [`routing_guidance_args`] — only a
+        // whitespace-only folder is dropped, never the surrounding bytes.
+        assert_eq!(
+            agents_gate_args(Some(" /p/x ")),
+            vec!["status", "--json", "--folder", " /p/x "]
+        );
+    }
+
+    // ─── G1 (v0.2.101): the routing-guidance tri-state the Services page
+    // shows. Fixtures mirror `python -m vco_lib.module_gated_delivery
+    // status --json --folder <f>`'s payload shape.
+
+    fn status_payload_fixture(
+        state: &str,
+        signal: &str,
+        renders: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "machine_signal": {"configured": null, "reason": "fixture"},
+            "gate": {"state": state, "signal": signal,
+                     "reason": "fixture reason",
+                     "machine_configured": null},
+            "claude_md_section": {"renders": renders},
+            "agent_id_problems": []
+        })
+    }
+
+    #[test]
+    fn routing_guidance_maps_an_explicit_on_row() {
+        let s = map_routing_guidance(&status_payload_fixture(
+            "deliver", "project_row", true,
+        ))
+        .expect("explicit on maps");
+        assert_eq!(s.mode, "on");
+        assert!(s.renders);
+        assert_eq!(s.machine_decides, None, "an explicit row is not the machine's call");
+        assert_eq!(s.reason, "fixture reason");
+    }
+
+    #[test]
+    fn routing_guidance_maps_an_explicit_off_row() {
+        let s = map_routing_guidance(&status_payload_fixture(
+            "skip", "project_row", false,
+        ))
+        .expect("explicit off maps");
+        assert_eq!(s.mode, "off");
+        assert!(!s.renders);
+        assert_eq!(s.machine_decides, None);
+    }
+
+    #[test]
+    fn routing_guidance_maps_no_row_with_the_machine_configured() {
+        // The exact case the pre-fix toggle got WRONG: no explicit row on a
+        // gateway-configured machine → the section RENDERS while the
+        // checkbox showed (and the copy said) off.
+        let s = map_routing_guidance(&status_payload_fixture(
+            "deliver", "machine", true,
+        ))
+        .expect("no-row/configured maps");
+        assert_eq!(s.mode, "follows_machine");
+        assert!(s.renders);
+        assert_eq!(s.machine_decides.as_deref(), Some("renders"));
+    }
+
+    #[test]
+    fn routing_guidance_maps_no_row_with_no_gateway_on_the_machine() {
+        let s = map_routing_guidance(&status_payload_fixture(
+            "skip", "machine", false,
+        ))
+        .expect("no-row/not-configured maps");
+        assert_eq!(s.mode, "follows_machine");
+        assert!(!s.renders);
+        assert_eq!(s.machine_decides.as_deref(), Some("hidden"));
+    }
+
+    #[test]
+    fn routing_guidance_keeps_the_could_not_ask_states_honest() {
+        // UNKNOWN renders (the render never hides text on a could-not-ask),
+        // and the machine line says "unknown" — the render answer itself
+        // still comes from Python, never re-derived here.
+        let s = map_routing_guidance(&status_payload_fixture(
+            "unknown", "launcher_db", true,
+        ))
+        .expect("unknown maps");
+        assert_eq!(s.mode, "follows_machine");
+        assert!(s.renders);
+        assert_eq!(s.machine_decides.as_deref(), Some("unknown"));
+
+        let s = map_routing_guidance(&status_payload_fixture(
+            "unknown", "machine", true,
+        ))
+        .expect("machine-unknown maps");
+        assert_eq!(s.machine_decides.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn routing_guidance_refuses_payloads_without_the_render_answer() {
+        // Pins the Python pairing: if `claude_md_section.renders` ever
+        // disappears from the status payload, this side errors loudly
+        // rather than re-deriving the mapping from `gate.state`.
+        let mut payload = status_payload_fixture("deliver", "machine", true);
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("claude_md_section");
+        let err = map_routing_guidance(&payload).expect_err("must refuse");
+        assert!(
+            err.contains("claude_md_section") || err.contains("renders"),
+            "the error must name what is missing; got: {err}"
+        );
+
+        let no_gate = serde_json::json!({"machine_signal": {"configured": true}});
+        let err = map_routing_guidance(&no_gate).expect_err("must refuse");
+        assert!(err.contains("gate"), "the error must name the gate; got: {err}");
+    }
+
+    // ─── S2 (v0.2.101 review): one spawn answers for EVERY project ──────
+
+    #[test]
+    fn routing_guidance_args_carry_every_folder_in_one_invocation() {
+        assert_eq!(
+            routing_guidance_args(&["/p/a".into(), "/p/b".into()]),
+            vec!["status", "--json", "--folder", "/p/a", "--folder", "/p/b"]
+        );
+        // Whitespace-only entries are dropped, not passed as empty folders.
+        assert_eq!(
+            routing_guidance_args(&["  ".into(), "/p/a".into(), "".into()]),
+            vec!["status", "--json", "--folder", "/p/a"]
+        );
+        assert_eq!(routing_guidance_args(&[]), vec!["status", "--json"]);
+    }
+
+    #[test]
+    fn routing_guidance_sends_folder_strings_verbatim_not_trimmed() {
+        // NF-2 (re-review of N-3): a folder the DB stores with surrounding
+        // whitespace must reach Python — and be echoed back as a map key —
+        // EXACTLY as stored. Trimming here would defeat the N-3 echo one
+        // layer up: the GUI looks up by the raw `folder_path` and a trimmed
+        // key would miss every time ("could not ask" forever).
+        assert_eq!(
+            routing_guidance_args(&[" /p/a ".into(), "\t/p/b\n".into()]),
+            vec!["status", "--json", "--folder", " /p/a ", "--folder", "\t/p/b\n"],
+        );
+        // The filter the command itself applies keeps the same rule:
+        // drop only what is empty after trimming, keep the original bytes.
+        assert_eq!(
+            keep_named_folders(&[" /p/a ".into(), "  ".into(), "".into(), "/p/b".into()]),
+            vec![" /p/a ", "/p/b"]
+        );
+    }
+
+    #[test]
+    fn batch_mapping_returns_one_state_per_folder() {
+        let explicit = status_payload_fixture("skip", "project_row", false);
+        let follows = status_payload_fixture("deliver", "machine", true);
+        let payload = serde_json::json!({
+            "machine_signal": {"configured": true, "reason": "fixture"},
+            "gate": null,
+            "folders": {
+                "/p/a": {
+                    "gate": explicit["gate"],
+                    "claude_md_section": explicit["claude_md_section"],
+                },
+                "/p/b": {
+                    "gate": follows["gate"],
+                    "claude_md_section": follows["claude_md_section"],
+                },
+            }
+        });
+        let map = map_routing_guidance_batch(&payload).expect("batch maps");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["/p/a"].mode, "off");
+        assert!(!map["/p/a"].renders);
+        assert_eq!(map["/p/b"].mode, "follows_machine");
+        assert_eq!(map["/p/b"].machine_decides.as_deref(), Some("renders"));
+    }
+
+    #[test]
+    fn batch_mapping_refuses_a_payload_without_the_folders_map() {
+        let err = map_routing_guidance_batch(&serde_json::json!({
+            "machine_signal": {"configured": true}
+        }))
+        .expect_err("must refuse");
+        assert!(
+            err.contains("folders"),
+            "the error must name the folders map; got: {err}"
+        );
+        // An entry missing its render answer is refused per folder, exactly
+        // like the single mapping — never silently defaulted.
+        let err = map_routing_guidance_batch(&serde_json::json!({
+            "folders": {"/p/a": {"gate": null}}
+        }))
+        .expect_err("must refuse");
+        assert!(
+            err.contains("claude_md_section") || err.contains("renders") || err.contains("gate"),
+            "the error must name what the entry is missing; got: {err}"
         );
     }
 

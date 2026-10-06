@@ -47,8 +47,9 @@ def make_fake_orchestrator(root: Path, *, with_compose_pair: bool = True) -> Non
 
     agents = root / "templates" / "agents" / "free"
     agents.mkdir(parents=True)
-    (agents / "coder.md").write_text(
-        "# Coder\nOrchestrator at {{ORCHESTRATOR_ROOT}}\n", encoding="utf-8",
+    # Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+    (agents / "example-agent.md").write_text(
+        "# Example agent\nOrchestrator at {{ORCHESTRATOR_ROOT}}\n", encoding="utf-8",
     )
 
     settings = {"permissions": {"allow": ["Bash"]}, "hooks": {}}

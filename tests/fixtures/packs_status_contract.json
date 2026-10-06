@@ -1,0 +1,55 @@
+{
+  "$comment": [
+    "ONE committed contract for the packs status bridge (v0.2.101 catalogue plan §3.6, L3 review SF-6).",
+    "Lane L3's Rust parser (launcher/src-tauri/src/commands/packs_cmd.rs::parse_packs_status_reply,",
+    "fed by services/vco_lib_bridge.rs::packs_status) and lane L1's Python emitter",
+    "(python -m vco_lib.packs status --folder <path> --json) both test against THIS file, so a field",
+    "rename on either side fails a suite instead of breaking the Packs tab at runtime.",
+    "",
+    "Contract:",
+    "  status_reply   — {\"ok\": true, \"packs\": [{\"name\": str, \"description\": str,",
+    "                   \"members\": [str], \"installed\": bool}, ...]}. `members` are the pack's",
+    "                   agent file stems + skill directory names; `installed` is true iff the pack",
+    "                   is recorded in the project's .claude/.vco-manifest.json `packs` map.",
+    "                   `description` and `members` and `installed` may be omitted by the emitter",
+    "                   (Rust defaults: \"\", [], false); `name` is required.",
+    "  refusal_reply  — {\"ok\": false, \"error\": str, \"message\": str} → a loud error, never a",
+    "                   degraded listing."
+  ],
+  "status_reply": {
+    "ok": true,
+    "packs": [
+      {
+        "name": "dev-advisors",
+        "description": "Second-opinion advisors for development decisions",
+        "members": [
+          "accessibility-checker",
+          "ai-rag-advisor",
+          "architect",
+          "debug-expert",
+          "security-reviewer"
+        ],
+        "installed": false
+      },
+      {
+        "name": "ai-engineering",
+        "description": "Agents and skills for LLM/AI engineering work",
+        "members": [
+          "ai-llm-expert",
+          "ai-agentic-architect",
+          "structured-output-extraction",
+          "workflow-cost-estimator"
+        ],
+        "installed": true
+      },
+      {
+        "name": "migration"
+      }
+    ]
+  },
+  "refusal_reply": {
+    "ok": false,
+    "error": "packs_table_unreadable",
+    "message": "templates/packs/packs.toml is missing or unparseable — the install is broken; re-run the orchestrator update"
+  }
+}

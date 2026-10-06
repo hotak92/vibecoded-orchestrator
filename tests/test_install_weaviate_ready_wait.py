@@ -149,15 +149,21 @@ class SlowEmbedSeparationInvariantTest(unittest.TestCase):
     def test_seed_subprocess_has_no_timeout_kwarg(self) -> None:
         import inspect
 
-        src = inspect.getsource(install._seed_weaviate_impl)
-        # Guard against the pin going vacuous if the subprocess call is
-        # refactored away entirely. v0.2.96 WP-1 relocated the re-embed
-        # subprocess to run_child_logged (vco_lib.child_process) — which
-        # has no timeout parameter at all — so the pin follows the call.
+        # v0.2.101 item 4: v0.2.96 WP-1 relocated the re-embed subprocess to
+        # run_child_logged (vco_lib.child_process) — which has no timeout
+        # parameter at all — and item 4 then moved the whole seed step out of
+        # install.py (line ratchet) into
+        # vco_lib.install_weaviate.kg_seed_step. The pin follows the call, as
+        # its own message instructs. install.py must hold no seed spawn either.
+        src = inspect.getsource(install._install_weaviate.kg_seed_step)
         self.assertIn(
             "run_child_logged(", src,
-            "_seed_weaviate_impl no longer calls run_child_logged directly — "
+            "kg_seed_step no longer calls run_child_logged directly — "
             "relocate this pin to wherever the re-embed subprocess moved",
+        )
+        self.assertNotIn(
+            "run_child_logged(", inspect.getsource(install._seed_weaviate_impl),
+            "install.py must not spawn the seed inline any more (item 4)",
         )
         self.assertNotIn(
             "timeout=", src,

@@ -113,6 +113,40 @@ def test_step_1_reruns_when_the_interpreter_changed(tmp_path):
     assert not skipped and "running it again" in out and events == []
 
 
+def test_step_1_verified_skip_is_built_from_the_real_emitters_ok_event(tmp_path):
+    """NB-11 (FRR:46): the ``ok`` event ``_check_python_version`` actually
+    writes carries ``version``, so a log produced by THIS install.py resumes
+    step 1 as "verified, skipped" instead of "unrecorded → changed".
+
+    The fixture above hand-builds the ``1/10`` ok event, so it proves the
+    VERIFIER reads a version but not that the EMITTER records one — delete the
+    emitter's ``data={"version": …}`` and every test above still passes. This
+    drives the real emitter and feeds its own bytes to the verifier."""
+    events: list[dict] = []
+
+    def _capture(step, phase, detail="", data=None, **_k):
+        rec = {"ts": datetime.now(timezone.utc).isoformat(), "actor": "install.py",
+               "step": step, "phase": phase, "detail": detail}
+        if data:
+            rec["data"] = data
+        events.append(rec)
+
+    fake = type("V", (), {"major": V.major, "minor": V.minor, "micro": V.micro})()
+    with mock.patch.object(install.sys, "version_info", fake), \
+         mock.patch.object(install, "_log_install_event", side_effect=_capture), \
+         redirect_stdout(io.StringIO()):
+        install._check_python_version()
+
+    ok = [e for e in events if e["step"] == "1/10" and e["phase"] == "ok"]
+    assert ok, events
+    assert ok[0].get("data", {}).get("version") == PY, ok[0]
+
+    log = tmp_path / "install.jsonl"
+    log.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+    skipped, out, _evs = _skip(ir.load_session(log), "1/10", ir.python_verifier())
+    assert skipped and "verified, skipped" in out
+
+
 # ── step 3: the venv interpreter runs ───────────────────────────────────────
 
 
