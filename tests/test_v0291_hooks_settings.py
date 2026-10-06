@@ -254,6 +254,157 @@ class DisableTests(_TempProject):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# `if`-rule groups (v0.2.101) — several entries sharing one command,
+# differing only by their `if` filter
+# ═══════════════════════════════════════════════════════════════════════
+
+_IF_RULES = ("Bash(cat *)", "Bash(grep *)", "Bash(rg *)")
+_IF_COMMAND = 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh"'
+
+
+def _if_group_settings() -> dict:
+    """The realistic fixture plus the v0.2.101 shape: a PreToolUse/Bash
+    group whose three entries share one command and differ only by `if`
+    (the shipped template's injection group, scaled down to 3 rules)."""
+    data = _realistic_settings()
+    data["hooks"]["PreToolUse"] = [
+        {
+            "matcher": "Bash",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": _IF_COMMAND,
+                    "timeout": 10,
+                    "if": rule,
+                }
+                for rule in _IF_RULES
+            ],
+        }
+    ]
+    return data
+
+
+class IfGroupTests(_TempProject):
+    """Parking is `if`-aware: the group is disabled as ONE unit and restored
+    byte-identically, and rows parked by older builds (single `item`, no
+    `items`) keep restoring exactly as they did."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.original_text = _write(self.settings, _if_group_settings())
+
+    def _group(self) -> list:
+        return self.read()["hooks"]["PreToolUse"][0]["hooks"]
+
+    def test_disable_parks_the_whole_group_as_one_entry(self) -> None:
+        doc = hs.load_settings(self.settings)
+        parked = hs.remove_hook(doc, "PreToolUse", "Bash", _IF_COMMAND)
+        hs.write_settings(doc)
+
+        self.assertNotIn("PreToolUse", self.read()["hooks"])
+        # The parked blob is a GROUP park: `items` (one per-rule record,
+        # ascending) and deliberately no `item` — an older build handed
+        # this blob refuses instead of restoring one rule of three.
+        self.assertNotIn("item", parked)
+        self.assertEqual(
+            [rec["hook_index"] for rec in parked["items"]], [0, 1, 2]
+        )
+        self.assertEqual(
+            [rec["item"]["if"] for rec in parked["items"]], list(_IF_RULES)
+        )
+        self.assertTrue(parked["group_removed"])
+        self.assertEqual(parked["group_extra"], {"matcher": "Bash"})
+
+    def test_disable_enable_round_trip_is_byte_identical(self) -> None:
+        doc = hs.load_settings(self.settings)
+        parked = hs.remove_hook(doc, "PreToolUse", "Bash", _IF_COMMAND)
+        hs.write_settings(doc)
+        self.assertNotEqual(self.raw(), self.original_text)
+
+        doc2 = hs.load_settings(self.settings)
+        self.assertTrue(hs.insert_hook(doc2, parked))
+        hs.write_settings(doc2)
+        self.assertEqual(
+            self.raw(), self.original_text, "re-enable must restore every rule"
+        )
+
+    def test_double_enable_changes_nothing(self) -> None:
+        doc = hs.load_settings(self.settings)
+        parked = hs.remove_hook(doc, "PreToolUse", "Bash", _IF_COMMAND)
+        hs.write_settings(doc)
+        doc2 = hs.load_settings(self.settings)
+        hs.insert_hook(doc2, parked)
+        hs.write_settings(doc2)
+        restored = self.raw()
+        self.assertFalse(hs.insert_hook(hs.load_settings(self.settings), parked))
+        self.assertEqual(self.raw(), restored)
+
+    def test_enable_adds_only_the_missing_rules(self) -> None:
+        """A partial hand-restore (the user re-added ONE rule) must not
+        duplicate it — the restore keys each rule on its `if` filter."""
+        doc = hs.load_settings(self.settings)
+        parked = hs.remove_hook(doc, "PreToolUse", "Bash", _IF_COMMAND)
+        hs.write_settings(doc)
+
+        doc2 = hs.load_settings(self.settings)
+        # The user re-added the SECOND rule by hand, exactly as parked.
+        hand = dict(parked["items"][1]["item"])
+        parked_single = {
+            "schema": 1,
+            "event": "PreToolUse",
+            "matcher": "Bash",
+            "group_index": 0,
+            "hook_index": 0,
+            "item": hand,
+            "group_removed": False,
+            "group_extra": {},
+        }
+        self.assertTrue(hs.insert_hook(doc2, parked_single))
+        hs.write_settings(doc2)
+        self.assertEqual(
+            [h.get("if") for h in self._group()], [_IF_RULES[1]]
+        )
+
+        # Now the group re-enable: only the two missing rules come back.
+        doc3 = hs.load_settings(self.settings)
+        self.assertTrue(hs.insert_hook(doc3, parked))
+        hs.write_settings(doc3)
+        self.assertEqual(
+            [h.get("if") for h in self._group()], list(_IF_RULES),
+            "the hand-restored rule must not be duplicated",
+        )
+
+    def test_old_shape_parked_row_still_restores_exactly_one_rule(self) -> None:
+        """Back-compat: a row parked by a v0.2.100- build (single `item`
+        carrying an `if`, no `items` key) restores exactly that one rule —
+        not the whole group, not nothing."""
+        # The v0.2.100 world: the file still holds rules 0 and 2; rule 1
+        # was parked as a single-item blob.
+        data = _if_group_settings()
+        rule1 = data["hooks"]["PreToolUse"][0]["hooks"].pop(1)
+        _write(self.settings, data)
+        doc = hs.load_settings(self.settings)
+        self.assertEqual(
+            [h.get("if") for h in self._group()], [_IF_RULES[0], _IF_RULES[2]]
+        )
+
+        old_shape = {
+            "schema": 1,
+            "event": "PreToolUse",
+            "matcher": "Bash",
+            "group_index": 0,
+            "hook_index": 1,
+            "item": rule1,
+            "group_removed": False,
+            "group_extra": {},
+        }
+        self.assertTrue(hs.insert_hook(doc, old_shape))
+        hs.write_settings(doc)
+        self.assertEqual(self.raw(), self.original_text)
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # enable — restore the parked entry
 # ═══════════════════════════════════════════════════════════════════════
 

@@ -23,6 +23,15 @@ export interface EffectiveHook {
   source_module: string | null;
   timeout_ms: number | null;
   state: HookState;
+  /**
+   * The `if` filters of the rules this row covers (v0.2.101). EMPTY for an
+   * ordinary hook. An `if` group — several settings.json entries sharing one
+   * (event, matcher, command) and differing only by their `if` filter —
+   * renders as ONE row carrying every rule here: the toggle acts on the
+   * group as a unit (the writer parks and restores all of its entries
+   * together), so per-rule checkboxes would each toggle everything anyway.
+   */
+  if_rules: string[];
 }
 
 export interface EffectiveHooksView {
@@ -138,6 +147,36 @@ export function gitVisibilityNote(settingsPath: string): string {
 export function timeoutSeconds(hook: EffectiveHook): number | null {
   if (hook.timeout_ms === null || hook.timeout_ms === undefined) return null;
   return Math.round(hook.timeout_ms / 1000);
+}
+
+// ─── `if` groups (v0.2.101) ────────────────────────────────────────────────
+//
+// Several settings.json entries can share one (event, matcher, command) and
+// differ only by their `if` filter — the shipped Bash PreToolUse injection
+// group carries ten. The backend collapses them into ONE row carrying every
+// rule; these helpers shape what the row shows. The toggle is the GROUP's:
+// disabling parks all rules together, enabling restores every one
+// byte-identically.
+
+/** The badge next to the command: `3 if-rules`, or '' for an ordinary hook. */
+export function ifRulesLabel(hook: EffectiveHook): string {
+  const n = hook.if_rules?.length ?? 0;
+  if (n === 0) return '';
+  return `${n} if-rule${n === 1 ? '' : 's'}`;
+}
+
+/**
+ * The badge's hover text: every rule, one per line. Says plainly that the
+ * toggle acts on the whole group — the one fact a user needs before
+ * clicking a checkbox that looks like it belongs to a single command.
+ */
+export function ifRulesTooltip(hook: EffectiveHook): string {
+  const rules = hook.if_rules ?? [];
+  return [
+    `This command is registered ${rules.length === 1 ? 'once' : `${rules.length} times`}, once per \`if\` filter:`,
+    ...rules.map((r) => `• ${r}`),
+    'The toggle applies to every rule at once; enabling restores them all exactly.',
+  ].join('\n');
 }
 
 /**

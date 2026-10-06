@@ -48,6 +48,11 @@ Operations
     item — plus its matcher, its position, and (when the whole group had
     to go) the group's other keys — is returned as a *parked entry* that
     the caller stores verbatim in the DB row so re-enable can restore it.
+    When the natural key (event, matcher, command) matches SEVERAL items
+    in one group — the ``if``-rule group v0.2.101 ships (ten rules that
+    differ only by their ``if`` filter) — ALL of them are parked as ONE
+    entry (``items``) and removed together, so the group is toggled as a
+    unit and re-enable restores every rule byte-identically.
 
 ``enable``
     Restore a parked entry into its block, at its recorded position when
@@ -794,6 +799,14 @@ def _refuse_symlinked_target(path: Path) -> None:
 #: just without the ordinal restoration. Bumping would have made those
 #: older entries un-restorable ("refusing to guess"), i.e. traded a
 #: cosmetic gap for real data loss.
+#:
+#: Still ``1`` after the v0.2.101 ``if``-group change, same reasoning:
+#: a group park carries ``items`` (a list of per-rule records) INSTEAD of
+#: ``item``, and the read side treats ``items`` as optional — a row parked
+#: by an older build has no ``items`` and restores exactly as it did
+#: before. The converse is a loud refusal by design: an OLD build handed
+#: a group park finds no ``item`` and refuses with ``parked_entry_invalid``
+#: rather than restoring one rule of ten and silently dropping nine.
 PARKED_SCHEMA_VERSION = 1
 
 
@@ -873,12 +886,18 @@ def list_hooks(doc: SettingsDoc) -> Tuple[List[Dict[str, Any]], List[str]]:
                     )
                     continue
                 timeout = item.get("timeout")
+                if_rule = item.get("if")
                 entries.append(
                     {
                         "event": event,
                         "matcher": matcher,
                         "command": command,
                         "timeout_seconds": timeout if isinstance(timeout, int) else None,
+                        # v0.2.101: the entry's `if` filter (None when it has
+                        # none). Several entries under one (event, matcher,
+                        # command) key differ ONLY by this — the Hooks tab
+                        # renders them as one toggleable row.
+                        "if": if_rule if isinstance(if_rule, str) else None,
                         "group_index": g_idx,
                         "hook_index": h_idx,
                         "item": item,
@@ -887,8 +906,29 @@ def list_hooks(doc: SettingsDoc) -> Tuple[List[Dict[str, Any]], List[str]]:
     return entries, skipped
 
 
+#: Sentinel for "match any ``if`` filter" — distinct from ``None``, which
+#: is a MEANINGFUL ``if`` value ("the item has no ``if`` key"). Callers
+#: that predate the v0.2.101 ``if``-group change pass nothing and get the
+#: historical, ``if``-blind behaviour.
+_ANY_IF = object()
+
+
+def _if_matches(item: Dict[str, Any], if_rule: Any) -> bool:
+    """Whether ``item``'s ``if`` key equals ``if_rule``.
+
+    Only called with a real ``if_rule`` (never the :data:`_ANY_IF`
+    sentinel): the value must be a string or ``None`` and must equal the
+    item's ``if`` (also normalised to string-or-``None``), so an if-less
+    entry and a ``"Bash(cat *)"`` entry never compare equal.
+    """
+    actual = item.get("if")
+    return (actual if isinstance(actual, str) else None) == (
+        if_rule if isinstance(if_rule, str) else None
+    )
+
+
 def _locate(
-    doc: SettingsDoc, event: str, matcher: str, command: str
+    doc: SettingsDoc, event: str, matcher: str, command: str, if_rule: Any = _ANY_IF
 ) -> Optional[Tuple[int, int]]:
     """Return ``(group_index, hook_index)`` of the first inner item
     matching the natural key, or ``None``.
@@ -899,7 +939,12 @@ def _locate(
     ``.claude/hooks/`` form a launcher DB mirror row still holds vs the
     ``${CLAUDE_PROJECT_DIR}``-anchored form a bundle update wrote, or the
     pre-v0.2.97 guard prefix). More than one such item is ambiguous and
-    matches nothing."""
+    matches nothing.
+
+    ``if_rule`` (v0.2.101): pass a string or ``None`` to require the item's
+    ``if`` filter to equal it — the identity of one rule inside an ``if``
+    group. Unset (the sentinel) matches any ``if``, the pre-v0.2.101
+    behaviour every existing caller relies on."""
     hooks = doc.data.get("hooks")
     if not isinstance(hooks, dict):
         return None
@@ -914,11 +959,16 @@ def _locate(
         if not isinstance(inner, list):
             continue
         for h_idx, item in enumerate(inner):
-            other = item.get("command") if isinstance(item, dict) else None
+            if not isinstance(item, dict):
+                continue
+            other = item.get("command")
             if other == command:
+                if if_rule is not _ANY_IF and not _if_matches(item, if_rule):
+                    continue
                 return g_idx, h_idx
             if isinstance(other, str) and other:
-                candidates.append((g_idx, h_idx, other))
+                if if_rule is _ANY_IF or _if_matches(item, if_rule):
+                    candidates.append((g_idx, h_idx, other))
     if not isinstance(command, str) or not command or not candidates:
         return None
     from vco_lib.hook_retirements import hook_command_key  # noqa: PLC0415 — import cycle
@@ -943,9 +993,46 @@ def remove_hook(
     (``group_key_index`` / ``event_index`` / ``hooks_key_index``), so the
     restore puts each one back where it was instead of appending it.
 
+    v0.2.101, ``if`` groups: the natural key (event, matcher, command) is
+    no longer unique — a group may legitimately carry SEVERAL items with
+    the SAME command that differ only by their ``if`` filter (the shipped
+    Bash PreToolUse injection group carries ten). When that is the shape
+    on disk, the WHOLE set inside the first matching group is removed and
+    parked as one entry carrying ``items`` (one per-rule record) instead
+    of ``item`` — the launcher's Hooks tab toggles the set as ONE row, and
+    re-enable restores every rule byte-identically. Removing the items
+    one at a time is exactly what cannot work here: after the first
+    removal the survivors still answer to the same key, so a later
+    enable's idempotency check would see "already present" and restore
+    nothing. Copies of the command in OTHER same-matcher groups (a
+    user's hand-built shape) are left alone: they are indistinguishable
+    from this group's items by any key the DB stores, and guessing would
+    restructure the file.
+
     Raises:
         HooksSettingsError: ``not_found`` when no such entry exists.
     """
+    hooks_block = doc.data.get("hooks")
+    if isinstance(hooks_block, dict):
+        groups = hooks_block.get(event)
+        if isinstance(groups, list):
+            for g_idx, group in enumerate(groups):
+                if not isinstance(group, dict) or normalize_matcher(group) != matcher:
+                    continue
+                inner = group.get("hooks")
+                if not isinstance(inner, list):
+                    continue
+                positions = [
+                    (h_idx, item)
+                    for h_idx, item in enumerate(inner)
+                    if isinstance(item, dict) and item.get("command") == command
+                ]
+                if len(positions) >= 2:
+                    return _remove_if_group(doc, event, matcher, g_idx, positions)
+                # Zero or one exact copy in this group — keep walking; a
+                # lone copy falls through to the historical `_locate`
+                # path below, which resolves across groups (fuzzy
+                # spellings included).
     located = _locate(doc, event, matcher, command)
     if located is None:
         raise HooksSettingsError(
@@ -998,11 +1085,76 @@ def remove_hook(
     }
 
 
+def _remove_if_group(
+    doc: SettingsDoc,
+    event: str,
+    matcher: str,
+    g_idx: int,
+    positions: List[Tuple[int, Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Remove every ``if``-rule item parked as one group entry.
+
+    ``positions`` is the ascending ``(hook_index, item)`` list of the
+    group's items carrying the same command. They are popped in DESCENDING
+    index order so each recorded index stays valid as the list shrinks;
+    the parked entry stores them ASCENDING (restore order), each with its
+    own ``hook_index``, under ``items`` — and deliberately WITHOUT an
+    ``item`` key, so an older build handed this blob refuses with
+    ``parked_entry_invalid`` instead of restoring one rule of the group
+    and silently dropping the rest.
+    """
+    hooks_block = doc.data["hooks"]
+    groups = hooks_block[event]
+    group = groups[g_idx]
+    inner = group["hooks"]
+    for h_idx, _item in sorted(positions, key=lambda p: p[0], reverse=True):
+        inner.pop(h_idx)
+
+    group_removed = False
+    group_extra: Dict[str, Any] = {}
+    group_key_index: Optional[int] = None
+    event_index: Optional[int] = None
+    hooks_key_index: Optional[int] = None
+    if not inner:
+        group_extra = {k: v for k, v in group.items() if k != "hooks"}
+        group_key_index = list(group.keys()).index("hooks")
+        groups.pop(g_idx)
+        group_removed = True
+        if not groups:
+            event_index = list(hooks_block.keys()).index(event)
+            del hooks_block[event]
+            if not hooks_block:
+                hooks_key_index = list(doc.data.keys()).index("hooks")
+                del doc.data["hooks"]
+
+    return {
+        "schema": PARKED_SCHEMA_VERSION,
+        "event": event,
+        "matcher": matcher,
+        "group_index": g_idx,
+        # The FIRST rule's index — same meaning as a single park's
+        # `hook_index`, and what a human reading the blob sees first.
+        "hook_index": positions[0][0],
+        "items": [
+            {"hook_index": h_idx, "item": item} for h_idx, item in positions
+        ],
+        "group_removed": group_removed,
+        "group_extra": group_extra,
+        "group_key_index": group_key_index,
+        "event_index": event_index,
+        "hooks_key_index": hooks_key_index,
+    }
+
+
 def _hook_present_in_another_form(
-    doc: SettingsDoc, event: str, matcher: str, command: str
+    doc: SettingsDoc, event: str, matcher: str, command: str, if_rule: Any = _ANY_IF
 ) -> bool:
     """True when ``event`` / ``matcher`` already registers the same hook as
-    ``command`` under a different command string."""
+    ``command`` under a different command string.
+
+    ``if_rule`` (v0.2.101): pass a string or ``None`` to also require the
+    ``if`` filter to match — one rule of an ``if`` group, not the group's
+    other rules."""
     # Lazy: `parked_hooks` imports this module (see the retirement import in
     # `insert_hook` for the same cycle).
     from vco_lib.parked_hooks import same_hook_command
@@ -1013,10 +1165,64 @@ def _hook_present_in_another_form(
         if not isinstance(group, dict) or normalize_matcher(group) != matcher:
             continue
         for item in group.get("hooks") or []:
-            other = item.get("command") if isinstance(item, dict) else None
-            if isinstance(other, str) and other and same_hook_command(other, command):
+            if not isinstance(item, dict):
+                continue
+            other = item.get("command")
+            if (
+                isinstance(other, str)
+                and other
+                and same_hook_command(other, command)
+                and (if_rule is _ANY_IF or _if_matches(item, if_rule))
+            ):
                 return True
     return False
+
+
+def _parked_restore_records(
+    parked: Dict[str, Any],
+) -> List[Tuple[Any, Dict[str, Any]]]:
+    """The ``(hook_index, item)`` records a parked entry restores.
+
+    v0.2.101: a GROUP park (an ``if``-rule group disabled as one unit)
+    carries ``items`` — one ``{"hook_index", "item"}`` record per rule —
+    and deliberately no ``item``. A row parked by an older build carries
+    ``item`` only. Both shapes come back as a record list, so
+    :func:`insert_hook` has ONE restore path.
+    """
+    raw_items = parked.get("items")
+    if isinstance(raw_items, list) and raw_items:
+        records: List[Tuple[Any, Dict[str, Any]]] = []
+        for rec in raw_items:
+            if not isinstance(rec, dict) or not isinstance(rec.get("item"), dict):
+                raise HooksSettingsError(
+                    "parked_entry_invalid",
+                    "parked group entry has a record without an object `item`.",
+                )
+            h = rec.get("hook_index")
+            records.append(
+                (h if isinstance(h, int) and not isinstance(h, bool) else None, rec["item"])
+            )
+        return records
+    item = parked.get("item")
+    if not isinstance(item, dict):
+        raise HooksSettingsError(
+            "parked_entry_invalid",
+            "parked entry is missing a string `event` or an object `item`.",
+        )
+    h = parked.get("hook_index")
+    return [(h, item)]
+
+
+def _parked_command_of(records: List[Tuple[Any, Dict[str, Any]]]) -> Optional[str]:
+    """The command a parked entry's records restore — the FIRST record's,
+    when it is a string. A group park's records all share one command
+    (that is what makes them a group); a non-string command means "not
+    usable for group matching", returned as ``None``."""
+    for _h_idx, item in records:
+        command = item.get("command")
+        if isinstance(command, str) and command:
+            return command
+    return None
 
 
 def insert_hook(
@@ -1048,6 +1254,15 @@ def insert_hook(
     ``hooks``, the event, the whole ``hooks`` block) returns at its
     recorded ordinal rather than at the end.
 
+    v0.2.101, ``if`` groups: a group park (``items``) restores every rule
+    at its own recorded index, in ascending order, into the one target
+    group — the mirror image of the all-at-once removal, so the file
+    comes back byte-identically. Each rule's identity is
+    (event, matcher, command, ``if``): the presence check for idempotency
+    AND the restore both key on the ``if`` value, so restoring a group
+    beside nine surviving rules of the same command adds only the missing
+    one instead of duplicating all ten.
+
     Idempotent: if an entry with the same natural key
     (event, matcher, command) is already present anywhere in the event — or
     (v0.2.97) the same hook in another command form under the same matcher —
@@ -1072,21 +1287,28 @@ def insert_hook(
             f"{PARKED_SCHEMA_VERSION}; refusing to guess how to restore it.",
         )
     event = parked.get("event")
-    item = parked.get("item")
-    if not isinstance(event, str) or not event or not isinstance(item, dict):
+    if not isinstance(event, str) or not event:
         raise HooksSettingsError(
             "parked_entry_invalid",
             "parked entry is missing a string `event` or an object `item`.",
         )
+    records = _parked_restore_records(parked)
     raw_matcher = parked.get("matcher")
     matcher = raw_matcher if isinstance(raw_matcher, str) else ""
-    command = item.get("command")
-    if anchor_scripts is not None and isinstance(command, str) and command:
-        anchored = anchor_hook_command(command, only=anchor_scripts)
-        if anchored != command:
-            item = dict(item)
-            item["command"] = anchored
-            command = anchored
+
+    # Per-rule preprocessing: anchor shipped scripts, then the retirement
+    # check. Both operate on the COMMAND, so a group park runs them once
+    # per rule — with copies, never mutating the caller's parked bytes.
+    restores: List[Tuple[Any, Dict[str, Any], Any]] = []
+    for h_idx, item in records:
+        item = dict(item)
+        command = item.get("command")
+        if anchor_scripts is not None and isinstance(command, str) and command:
+            anchored = anchor_hook_command(command, only=anchor_scripts)
+            if anchored != command:
+                item["command"] = anchored
+                command = anchored
+        restores.append((h_idx, item, command))
 
     # F7 (v0.2.95). A parked entry OUTLIVES the thing it restores.
     #
@@ -1108,14 +1330,16 @@ def insert_hook(
     # Refusal, not silent removal: the parked bytes are the user's, and a
     # click that produces nothing with no reason is the placebo this whole
     # subsystem was built to end. The message names the replacement.
-    if isinstance(command, str) and command:
+    from vco_lib.hook_retirements import (
+        match_retired_registration,
+        vco_hook_script_identity,
+    )
+
+    for _h_idx, item, command in restores:
+        if not (isinstance(command, str) and command):
+            continue
         # Imported lazily: `hook_retirements` imports `invoked_script_tokens`
         # from THIS module, so a module-level import here would be a cycle.
-        from vco_lib.hook_retirements import (
-            match_retired_registration,
-            vco_hook_script_identity,
-        )
-
         # v0.2.101 (review SF-3): the parked blob carries the registration's
         # `async` flag — hand it over, because the async-only retirement rows
         # (the dispatcher merge) refuse to match without positive evidence.
@@ -1135,26 +1359,35 @@ def insert_hook(
                 f"{retired.audit_replacement}. Nothing was written.",
             )
 
-    # Idempotency FIRST, before any structural edit: the natural key is
-    # (event, matcher, command), so a double-click — or a re-enable after
-    # the user put the line back by hand in a sibling group with the same
-    # matcher — must change nothing at all. Checking event-wide (the same
-    # `_locate` `register_hook` uses, one convention) rather than only
-    # inside the target group is what makes the `False` return provably
-    # non-mutating and keeps the restore from adding a duplicate
-    # invocation to a different group.
-    if isinstance(command, str) and _locate(doc, event, matcher, command) is not None:
-        return False
-    # v0.2.97: the same hook in ANOTHER command form (the pre-v0.2.97
-    # `[ -n "$VCT_DISABLE_HOOKS" ] || ` guard, an older path separator) counts
-    # as present too. A parked legacy entry whose hook an older bundle update
-    # re-added in the current form is exactly this case, and restoring the
-    # parked bytes beside it would run the hook twice — and the next update
-    # would supersede BOTH copies to the same command. Same identity rule as
-    # the bundle merge (`vco_lib.parked_hooks.same_hook_command`).
-    if isinstance(command, str) and command and _hook_present_in_another_form(
-        doc, event, matcher, command
-    ):
+    # Idempotency FIRST, before any structural edit: the natural key of a
+    # rule is (event, matcher, command, `if`), so a double-click — or a
+    # re-enable after the user put the line back by hand in a sibling
+    # group with the same matcher — must change nothing at all. Checking
+    # event-wide (the same `_locate` convention `register_hook` uses)
+    # rather than only inside the target group is what makes the `False`
+    # return provably non-mutating and keeps the restore from adding a
+    # duplicate invocation to a different group. Rules already present
+    # are skipped INDIVIDUALLY, so a partial restore (the user re-added
+    # one rule of a parked group by hand) adds only the missing ones.
+    missing: List[Tuple[Any, Dict[str, Any], Any]] = []
+    for h_idx, item, command in restores:
+        if isinstance(command, str) and command:
+            if_rule = item.get("if")
+            if_rule = if_rule if isinstance(if_rule, str) else None
+            if _locate(doc, event, matcher, command, if_rule) is not None:
+                continue
+            # v0.2.97: the same hook in ANOTHER command form (the
+            # pre-v0.2.97 `[ -n "$VCT_DISABLE_HOOKS" ] || ` guard, an older
+            # path separator) counts as present too. A parked legacy entry
+            # whose hook an older bundle update re-added in the current form
+            # is exactly this case, and restoring the parked bytes beside it
+            # would run the hook twice — and the next update would supersede
+            # BOTH copies to the same command. Same identity rule as the
+            # bundle merge (`vco_lib.parked_hooks.same_hook_command`).
+            if _hook_present_in_another_form(doc, event, matcher, command, if_rule):
+                continue
+        missing.append((h_idx, item, command))
+    if not missing:
         return False
 
     hooks = doc.data.get("hooks")
@@ -1196,6 +1429,29 @@ def insert_hook(
                 if isinstance(group, dict) and normalize_matcher(group) == matcher:
                     target = group
                     break
+    elif isinstance(parked.get("items"), list) and parked.get("items"):
+        # v0.2.101 exception, GROUP parks only: the disable removed the
+        # group, but a same-matcher group out there ALREADY carries the
+        # parked command — the user hand-restored one or more rules into
+        # it. Reuse THAT group so the missing rules join their siblings
+        # instead of founding a second same-matcher group beside it. In
+        # the plain round trip no such group exists (the shipped
+        # template's sibling Bash groups carry DIFFERENT commands), so
+        # the faithful recreation below still runs and the file comes
+        # back byte-identically.
+        wanted = _parked_command_of(records)
+        for group in groups:
+            if not isinstance(group, dict) or normalize_matcher(group) != matcher:
+                continue
+            inner_scan = group.get("hooks")
+            if not isinstance(inner_scan, list):
+                continue
+            if any(
+                isinstance(it, dict) and it.get("command") == wanted
+                for it in inner_scan
+            ):
+                target = group
+                break
 
     if target is None:
         extra = parked.get("group_extra")
@@ -1215,9 +1471,13 @@ def insert_hook(
             "hooks_block_malformed", f"`hooks.{event}[].hooks` is not an array."
         )
 
-    h_idx = parked.get("hook_index")
-    at = h_idx if isinstance(h_idx, int) and 0 <= h_idx <= len(inner) else len(inner)
-    inner.insert(at, item)
+    for h_idx, item, _command in missing:
+        at = (
+            h_idx
+            if isinstance(h_idx, int) and 0 <= h_idx <= len(inner)
+            else len(inner)
+        )
+        inner.insert(at, item)
     return True
 
 

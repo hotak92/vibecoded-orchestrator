@@ -22,6 +22,8 @@ import {
   dispatcherRowPresent,
   gitVisibilityNote,
   isChecked,
+  ifRulesLabel,
+  ifRulesTooltip,
   isAsyncSubhookDisabled,
   leanCtxChoiceFromEnvValue,
   leanCtxEnvValueForChoice,
@@ -54,6 +56,7 @@ function hook(overrides: Partial<EffectiveHook> = {}): EffectiveHook {
     source_module: null,
     timeout_ms: 30000,
     state: 'active',
+    if_rules: [],
     ...overrides,
   };
 }
@@ -519,6 +522,48 @@ describe('async sub-hook toggles — HooksTab wiring (structural)', () => {
     expect(svelte).toMatch(/dispatcherRowPresent\(view\.hooks\)/);
     expect(svelte).toContain('ASYNC_SUBHOOK_HINT');
     expect(svelte).toContain('ASYNC_SUBHOOK_STEMS');
+  });
+});
+
+describe('`if` groups — the row badge (v0.2.101)', () => {
+  it('labels a group with its rule count, singular for one rule', () => {
+    expect(ifRulesLabel(hook({ if_rules: [] }))).toBe('');
+    expect(ifRulesLabel(hook({ if_rules: ['Edit(*)'] }))).toBe('1 if-rule');
+    expect(
+      ifRulesLabel(hook({ if_rules: ['Bash(cat *)', 'Bash(grep *)', 'Bash(rg *)'] })),
+    ).toBe('3 if-rules');
+  });
+
+  it('lists every rule and says the toggle applies to all of them', () => {
+    const text = ifRulesTooltip(
+      hook({ if_rules: ['Bash(cat *)', 'Bash(grep *)'] }),
+    );
+    expect(text).toContain('2 times');
+    expect(text).toContain('• Bash(cat *)');
+    expect(text).toContain('• Bash(grep *)');
+    expect(text).toContain('every rule at once');
+  });
+
+  it('tolerates a backend that omits the field', () => {
+    const legacy = hook();
+    delete (legacy as Partial<EffectiveHook>).if_rules;
+    expect(ifRulesLabel(legacy)).toBe('');
+    expect(ifRulesTooltip(legacy)).toContain('once');
+  });
+});
+
+describe('`if` groups — HooksTab wiring (structural)', () => {
+  // Same delivered-nowhere guard its siblings use: the badge must RENDER,
+  // not merely exist as a helper — the GUI audit rule (wired + tested).
+  const svelte = readFileSync(
+    new URL('./HooksTab.svelte', import.meta.url),
+    'utf-8',
+  );
+
+  it('renders the badge with the shared label and tooltip helpers', () => {
+    expect(svelte).toMatch(/ifRulesLabel\(h\)/);
+    expect(svelte).toMatch(/ifRulesTooltip\(h\)/);
+    expect(svelte).toContain('ps-if-badge');
   });
 });
 

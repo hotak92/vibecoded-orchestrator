@@ -97,6 +97,13 @@ pub struct EffectiveHook {
     pub source_module: Option<String>,
     pub timeout_ms: Option<i64>,
     pub state: HookState,
+    /// The `if` filters of the rules this row covers, in file order
+    /// (v0.2.101). EMPTY for an ordinary hook. An `if` group — several
+    /// settings.json entries sharing one (event, matcher, command) and
+    /// differing only by their `if` filter — renders as ONE row carrying
+    /// every rule here, because the toggle acts on the group as a unit:
+    /// the writer parks and restores all of its entries together.
+    pub if_rules: Vec<String>,
 }
 
 /// What the Hooks tab renders. Carries the honesty flags alongside the rows.
@@ -322,6 +329,47 @@ pub(crate) async fn run_vco_lib_json(
     Err(HooksCliError { code, message })
 }
 
+/// The `if` filters inside a parked entry's bytes, for DISPLAY on the row
+/// (v0.2.101).
+///
+/// Read-only, and deliberately so: the parked blob stays opaque for storage
+/// and restore — it is handed back to the Python writer verbatim, and
+/// nothing here may reshape it. This only reads what a group park holds so
+/// a disabled `if` group can keep showing its rule count. A group park
+/// carries `items` (one record per rule); a row parked by an older build
+/// carries a single `item`, whose one `if` (if any) is shown the same way.
+/// An unreadable blob renders as no rules — a display miss, never an error
+/// the user has to act on.
+fn parked_if_rules(parked_json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<JsonValue>(parked_json) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |rule: &str| {
+        if !out.iter().any(|r| r == rule) {
+            out.push(rule.to_string());
+        }
+    };
+    if let Some(items) = v.get("items").and_then(JsonValue::as_array) {
+        for rec in items {
+            if let Some(rule) = rec
+                .get("item")
+                .and_then(|i| i.get("if"))
+                .and_then(JsonValue::as_str)
+            {
+                push(rule);
+            }
+        }
+    } else if let Some(rule) = v
+        .get("item")
+        .and_then(|i| i.get("if"))
+        .and_then(JsonValue::as_str)
+    {
+        push(rule);
+    }
+    out
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Read
 // ═══════════════════════════════════════════════════════════════════════
@@ -411,13 +459,31 @@ pub async fn effective_hooks_view(
             if event.is_empty() || command.is_empty() {
                 continue;
             }
+            let if_rule = entry
+                .get("if")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string);
+            // v0.2.101: an `if` group's rules all answer to the same
+            // natural key, so they collapse into ONE row here — the row
+            // the toggle acts on (the writer parks/restores the group as
+            // a unit). Rendering one row per rule would show N identical
+            // keys and N checkboxes that each toggle everything anyway.
+            let key = (event.to_string(), matcher.to_string(), key_of(command));
+            if let Some(pos) = active_keys.iter().position(|k| k == &key) {
+                if let Some(rule) = if_rule {
+                    if !hooks[pos].if_rules.contains(&rule) {
+                        hooks[pos].if_rules.push(rule);
+                    }
+                }
+                continue;
+            }
             let row = meta(event, matcher, command);
             let timeout_ms = entry
                 .get("timeout_seconds")
                 .and_then(JsonValue::as_i64)
                 .map(|s| s.saturating_mul(1000))
                 .or_else(|| row.as_ref().and_then(|r| r.timeout_ms));
-            active_keys.push((event.to_string(), matcher.to_string(), key_of(command)));
+            active_keys.push(key);
             hooks.push(EffectiveHook {
                 id: row.as_ref().map(|r| r.id),
                 event: event.to_string(),
@@ -430,6 +496,7 @@ pub async fn effective_hooks_view(
                 source_module: row.as_ref().and_then(|r| r.source_module.clone()),
                 timeout_ms,
                 state: HookState::Active,
+                if_rules: if_rule.into_iter().collect(),
             });
         }
     }
@@ -450,6 +517,7 @@ pub async fn effective_hooks_view(
         if active_keys.contains(&key) {
             continue;
         }
+        let if_rules = parked_if_rules(&p.disabled_entry_json);
         hooks.push(EffectiveHook {
             id: Some(p.id),
             event: p.event,
@@ -459,6 +527,7 @@ pub async fn effective_hooks_view(
             source_module: p.source_module,
             timeout_ms: p.timeout_ms,
             state: HookState::Disabled,
+            if_rules,
         });
     }
 
@@ -488,6 +557,7 @@ pub async fn effective_hooks_view(
             source_module: row.source_module.clone(),
             timeout_ms: row.timeout_ms,
             state: HookState::Orphan,
+            if_rules: Vec::new(),
         });
     }
 
@@ -2187,5 +2257,101 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 1, "one row, not one per source of truth");
         assert_eq!(rows[0].state, HookState::Active, "the FILE decides");
+    }
+
+    // ─── v0.2.101: `if` groups — one command, several `if` rules ──────
+
+    const IF_GROUP_COMMAND: &str =
+        r#"bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh""#;
+
+    const IF_GROUP_SETTINGS: &str = r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(cat *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(grep *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(rg *)"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+    /// The shipped shape (scaled to three rules): every rule answers to the
+    /// same natural key, so the tab must render ONE row carrying the rules —
+    /// not three identical rows with three checkboxes that each toggle the
+    /// whole group anyway (and whose duplicate row keys would collide in the
+    /// Svelte `{#each}` keyed block).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_if_group_renders_as_one_row_carrying_its_rules() {
+        let f = Fixture::with_settings(IF_GROUP_SETTINGS);
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        let rows: Vec<_> = view
+            .hooks
+            .iter()
+            .filter(|h| h.command == IF_GROUP_COMMAND)
+            .collect();
+        assert_eq!(rows.len(), 1, "one row for the whole if-group");
+        assert_eq!(rows[0].state, HookState::Active);
+        assert_eq!(
+            rows[0].if_rules,
+            vec![
+                "Bash(cat *)".to_string(),
+                "Bash(grep *)".to_string(),
+                "Bash(rg *)".to_string(),
+            ],
+            "the row carries every rule's `if` filter, in file order"
+        );
+    }
+
+    /// The round trip the defect was found on: disabling the row parks ALL
+    /// the group's rules as one entry, and re-enable restores every rule
+    /// byte-identically. Pre-fix, the writer removed only the FIRST rule and
+    /// the later enable's idempotency check saw the surviving rules as "the
+    /// hook is already present", restoring nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_if_group_disables_and_re_enables_as_one_unit() {
+        let f = Fixture::with_settings(IF_GROUP_SETTINGS);
+        let before = f.raw();
+
+        disable_hook(&f.db, &f.pid, "PreToolUse", "Bash", IF_GROUP_COMMAND)
+            .await
+            .expect("disable must succeed");
+        assert!(
+            f.commands_under("PreToolUse").is_empty(),
+            "the whole group is gone, not just the first rule"
+        );
+
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        let row = view
+            .hooks
+            .iter()
+            .find(|h| h.command == IF_GROUP_COMMAND)
+            .expect("the parked group still renders");
+        assert_eq!(row.state, HookState::Disabled);
+        assert_eq!(row.if_rules.len(), 3, "the parked row keeps its rules");
+
+        enable_hook(&f.db, &f.pid, "PreToolUse", "Bash", IF_GROUP_COMMAND)
+            .await
+            .expect("enable must succeed");
+        assert_eq!(f.raw(), before, "every rule restored byte-identically");
     }
 }

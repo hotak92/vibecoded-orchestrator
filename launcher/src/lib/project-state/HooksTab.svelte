@@ -14,6 +14,8 @@
     dispatcherRowPresent,
     gitVisibilityNote,
     isChecked,
+    ifRulesLabel,
+    ifRulesTooltip,
     isAsyncSubhookDisabled,
     leanCtxChoiceFromEnvValue,
     leanCtxEnvValueForChoice,
@@ -410,7 +412,12 @@
           <tr class:ps-row-orphan={h.state === 'orphan'}>
             <td><code>{h.event}</code></td>
             <td><code>{h.matcher || 'every'}</code></td>
-            <td class="ps-cmd"><code>{h.command}</code></td>
+            <td class="ps-cmd">
+              <code>{h.command}</code>
+              {#if ifRulesLabel(h)}
+                <span class="ps-if-badge" title={ifRulesTooltip(h)}>{ifRulesLabel(h)}</span>
+              {/if}
+            </td>
             <td>{timeoutSeconds(h) === null ? '—' : `${timeoutSeconds(h)}s`}</td>
             <td><span class="ps-tag ps-tag-{h.source}">{h.source}</span></td>
             <td>
@@ -494,6 +501,13 @@
   .ps-table code { font-family: ui-monospace, monospace; font-size: 11px; }
   .ps-cmd { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ps-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(255,255,255,0.08); color: #ccc; }
+  /* v0.2.101 `if` groups: the badge marks a command registered once per
+     `if` filter — the row's toggle applies to the whole group. */
+  .ps-if-badge {
+    font-size: 10px; padding: 1px 6px; border-radius: 8px; margin-left: 6px;
+    background: rgba(123,95,255,0.15); color: #b9a7ff; cursor: help;
+    white-space: nowrap;
+  }
   .ps-tag-bundled { background: rgba(0,191,166,0.15); color: var(--color-teal); }
   .ps-tag-project { background: rgba(58,163,255,0.15); color: #6cf; }
   .ps-tag-paid-module { background: rgba(255,200,70,0.15); color: #fc6; }
