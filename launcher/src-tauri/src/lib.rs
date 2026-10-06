@@ -1870,51 +1870,72 @@ pub fn run() {
                             // touched by a prior boot, the GUI, or
                             // install.py --update without the env
                             // files being regenerated yet.
-                            if let Ok(projects) = db.list_projects() {
-                                let mut regened = 0usize;
-                                for proj in &projects {
-                                    let folder = std::path::Path::new(
-                                        &proj.folder_path,
-                                    );
-                                    if !folder.is_dir() {
-                                        continue;
-                                    }
-                                    let env_path =
-                                        folder.join(".claude").join("env");
-                                    if !commands::project_env_settings::
-                                        should_regenerate_env_for_project(
-                                            db.inner(),
-                                            &proj.id,
-                                            &env_path,
-                                        )
-                                    {
-                                        continue;
-                                    }
-                                    match commands::projects_v2::
-                                        refresh_project_env_with_db(
-                                            db.inner(), &proj.id,
-                                        )
-                                    {
-                                        Ok(_) => {
-                                            regened += 1;
+                            //
+                            // F3 (v0.2.101): each regen is a Python
+                            // subprocess (300 s cap), so the loop runs on
+                            // the blocking pool instead of parking this
+                            // tokio worker. Awaited, so the reconcile
+                            // signal below still fires after it. Soft-fail
+                            // on a join error, like every step here.
+                            if let Err(e) =
+                                commands::blocking::run_with_db_on_blocking_pool(
+                                    adopt_handle.clone(),
+                                    "adopt-populated env regen",
+                                    |db| {
+                                        if let Ok(projects) = db.list_projects() {
+                                            let mut regened = 0usize;
+                                            for proj in &projects {
+                                                let folder = std::path::Path::new(
+                                                    &proj.folder_path,
+                                                );
+                                                if !folder.is_dir() {
+                                                    continue;
+                                                }
+                                                let env_path =
+                                                    folder.join(".claude").join("env");
+                                                if !commands::project_env_settings::
+                                                    should_regenerate_env_for_project(
+                                                        db,
+                                                        &proj.id,
+                                                        &env_path,
+                                                    )
+                                                {
+                                                    continue;
+                                                }
+                                                match commands::projects_v2::
+                                                    refresh_project_env_with_db(
+                                                        db, &proj.id,
+                                                    )
+                                                {
+                                                    Ok(_) => {
+                                                        regened += 1;
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "[vct] adopt-populated env \
+                                                             regen failed for {}: {}",
+                                                            proj.name, e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if regened > 0 {
+                                                tracing::info!(
+                                                    "[vct] adopt-populated: env \
+                                                     regenerated for {} project(s) \
+                                                     (binding newer than env file)",
+                                                    regened
+                                                );
+                                            }
                                         }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "[vct] adopt-populated env \
-                                                 regen failed for {}: {}",
-                                                proj.name, e
-                                            );
-                                        }
-                                    }
-                                }
-                                if regened > 0 {
-                                    tracing::info!(
-                                        "[vct] adopt-populated: env \
-                                         regenerated for {} project(s) \
-                                         (binding newer than env file)",
-                                        regened
-                                    );
-                                }
+                                    },
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "[vct] adopt-populated env regen: {}",
+                                    e
+                                );
                             }
                         }
                         Err(e) => {

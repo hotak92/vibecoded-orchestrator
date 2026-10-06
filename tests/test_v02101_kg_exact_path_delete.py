@@ -26,6 +26,7 @@ In-memory fakes only — no Weaviate, no Ollama, no fixture-class writes.
 
 from __future__ import annotations
 
+import itertools
 import re
 from types import SimpleNamespace
 
@@ -147,8 +148,14 @@ class _PagingColl:
         return SimpleNamespace(objects=hits[offset:offset + limit])
 
 
+_ROW_SEQ = itertools.count(1)
+
+
 def _row(fp, **props):
-    return SimpleNamespace(uuid=f"u-{id(props)}-{fp}", properties={"file_path": fp, **props})
+    # A UNIQUE uuid per row: the shared reader de-duplicates by UUID (v0.2.101
+    # ⑧a), and the former ``id(props)`` key was recycled once a kwargs dict
+    # was garbage-collected, so distinct fake rows could share a UUID.
+    return SimpleNamespace(uuid=f"u-{next(_ROW_SEQ)}-{fp}", properties={"file_path": fp, **props})
 
 
 def test_fetch_exact_path_rows_pages_past_sibling_flood():

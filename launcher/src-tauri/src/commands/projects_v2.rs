@@ -467,7 +467,16 @@ pub async fn create_project_v2(
     // `apply_project_env_via_python`. `env_settings` is still populated
     // because the project-root `.env` below renders the launcher-resolved
     // service ports it carries.
-    if let Err(e) = apply_project_env_via_python(&row.id, folder, &db) {
+    //
+    // F3 (v0.2.101): on the blocking pool, not a tokio worker.
+    if let Err(e) = apply_project_env_via_python_on_blocking_pool(
+        app.clone(),
+        "create_project_v2 env projection",
+        &row.id,
+        folder,
+    )
+    .await
+    {
         // B10 (2026-05-01): surface env-write failures to the UI instead of
         // silent eprintln. Project creation still succeeds; the UI should show
         // a warning toast so the user knows manual env setup is required.
@@ -3085,7 +3094,15 @@ pub async fn update_project_v2(
     //    failure. The bundle update still succeeds because the
     //    manifest install + audit log + change_log entry have
     //    already landed — env writes are a best-effort step on top.
-    if let Err(e) = apply_project_env_via_python(&row.id, &folder, &db) {
+    //    F3 (v0.2.101): on the blocking pool, not a tokio worker.
+    if let Err(e) = apply_project_env_via_python_on_blocking_pool(
+        app.clone(),
+        "update_project_v2 env projection",
+        &row.id,
+        &folder,
+    )
+    .await
+    {
         let msg = format!(
             "post-bundle env refresh (apply_project_env_via_python) failed: {}. \
              Bundle update succeeded but .claude/env / .claude/settings.json \
@@ -3669,6 +3686,26 @@ fn build_config_projection_apply_args(
     args
 }
 
+/// F3 (v0.2.101): the async-command form of [`apply_project_env_via_python`]
+/// — the ONE home for "re-render this project's env from an async command".
+/// The projection is a Python subprocess (300 s cap), so it runs on the
+/// blocking pool, never inline on a tokio worker. Returns the projection's
+/// own `Result`; a join failure / missing Db state is folded into the same
+/// `Err`, so each caller's existing soft-fail warning branch covers both.
+async fn apply_project_env_via_python_on_blocking_pool(
+    app: AppHandle,
+    context: &'static str,
+    project_id: &str,
+    folder: &Path,
+) -> Result<(), String> {
+    let (project_id, folder) = (project_id.to_string(), folder.to_path_buf());
+    crate::commands::blocking::run_with_db_on_blocking_pool(app, context, move |db| {
+        apply_project_env_via_python(&project_id, &folder, db)
+    })
+    .await
+    .and_then(|r| r)
+}
+
 fn apply_project_env_via_python(
     project_id: &str,
     folder: &Path,
@@ -3932,6 +3969,7 @@ pub(crate) use naming::*;
 pub async fn rename_project_v2(
     id: String,
     new_name: String,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
     // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
@@ -4007,14 +4045,40 @@ pub async fn rename_project_v2(
     // subprocesses resolve the renamed peer correctly. (The reverse
     // direction — grants where THIS project is the grantee — is covered by
     // this project's own env refresh below.) Soft-fail per grantee.
+    //
+    // F3: each re-projection is a Python subprocess (300 s cap), so the
+    // grantee loop runs on the blocking pool, not a tokio worker. A join
+    // failure is soft-fail too (the rename already committed) and is
+    // folded into `warnings`.
     if old_name.as_deref().is_some_and(|old| old != new_name) {
-        if let Ok(grants) = db.codegraph_list_grants_from(&id) {
-            for (grantee_id, _level) in grants {
-                if grantee_id == id {
-                    continue;
+        let renamed_id = id.clone();
+        match crate::commands::blocking::run_with_db_on_blocking_pool(
+            app.clone(),
+            "rename_project_v2 grantee env re-projection",
+            move |db| {
+                let mut grantee_warnings: Vec<String> = Vec::new();
+                if let Ok(grants) = db.codegraph_list_grants_from(&renamed_id) {
+                    for (grantee_id, _level) in grants {
+                        if grantee_id == renamed_id {
+                            continue;
+                        }
+                        let r = reproject_env_soft(db, &grantee_id);
+                        grantee_warnings.extend(r.warnings);
+                    }
                 }
-                let r = reproject_env_soft(&db, &grantee_id);
-                warnings.extend(r.warnings);
+                grantee_warnings
+            },
+        )
+        .await
+        {
+            Ok(w) => warnings.extend(w),
+            Err(e) => {
+                let msg = format!(
+                    "rename grantee env re-projection: {} (rename already committed)",
+                    e
+                );
+                tracing::warn!("[vct] warning: {}", msg);
+                warnings.push(msg);
             }
         }
     }
@@ -4038,7 +4102,18 @@ pub async fn rename_project_v2(
     // Phase 0.B Part 2 (2026-05-25): canonical env writes go through
     // `apply_project_env_via_python` → Python contract (the Rust writer
     // it replaced was retired in v0.2.97).
-    if let Err(e) = apply_project_env_via_python(&id, folder, &db) {
+    //
+    // F3: the projection is a Python subprocess (300 s cap), so it runs on
+    // the blocking pool, not a tokio worker. A join failure surfaces as the
+    // same soft-fail warning as a projection failure.
+    if let Err(e) = apply_project_env_via_python_on_blocking_pool(
+        app,
+        "rename_project_v2 env re-projection",
+        &id,
+        folder,
+    )
+    .await
+    {
         let msg = format!(
             "rename env refresh (apply_project_env_via_python) failed: {}. \
              KG routing for the renamed project may be stale until manual repair.",
@@ -4184,6 +4259,7 @@ fn dotenv_kg_drift_warning(
 pub async fn set_shared_kg_write_disabled(
     project_id: String,
     write_disabled: bool,
+    app: AppHandle,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
     let row = db
@@ -4220,7 +4296,16 @@ pub async fn set_shared_kg_write_disabled(
     // toggle without needing the pre-PR-2 Rust `env_settings` override.
     let mut warnings: Vec<String> = Vec::new();
     let folder = Path::new(&row.folder_path);
-    if let Err(e) = apply_project_env_via_python(&project_id, folder, &db) {
+    // F3 (v0.2.101): on the blocking pool, not a tokio worker; a join
+    // failure lands in the same warning branch.
+    if let Err(e) = apply_project_env_via_python_on_blocking_pool(
+        app,
+        "set_shared_kg_write_disabled env re-projection",
+        &project_id,
+        folder,
+    )
+    .await
+    {
         let msg = format!(
             "shared-KG write-disabled env refresh failed: {}. \
              Toggle persisted to DB but env files may be stale.",
@@ -4284,6 +4369,7 @@ pub async fn get_shared_kg_write_disabled_cmd(
 pub async fn set_shared_kg_read_disabled(
     project_id: String,
     read_disabled: bool,
+    app: AppHandle,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
     let row = db
@@ -4302,7 +4388,16 @@ pub async fn set_shared_kg_read_disabled(
     // pattern as `set_shared_kg_write_disabled`.
     let mut warnings: Vec<String> = Vec::new();
     let folder = Path::new(&row.folder_path);
-    if let Err(e) = apply_project_env_via_python(&project_id, folder, &db) {
+    // F3 (v0.2.101): on the blocking pool, not a tokio worker; a join
+    // failure lands in the same warning branch.
+    if let Err(e) = apply_project_env_via_python_on_blocking_pool(
+        app,
+        "set_shared_kg_read_disabled env re-projection",
+        &project_id,
+        folder,
+    )
+    .await
+    {
         let msg = format!(
             "shared-KG read-disabled env refresh failed: {}. \
              Toggle persisted to DB but env files may be stale.",

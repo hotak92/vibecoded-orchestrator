@@ -76,6 +76,7 @@ pub struct CodegraphGrantReq {
 #[command]
 pub async fn codegraph_grant_access(
     req: CodegraphGrantReq,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
     // Both projects must exist.
@@ -106,10 +107,25 @@ pub async fn codegraph_grant_access(
     // is keyed on grantee → which projects this grantee can read), so a
     // running Claude Code session in the grantee's terminal picks up
     // VCT_CODE_GRAPH_ACCESS_LIST without a restart. Soft-fail.
-    let _ = crate::commands::projects_v2::refresh_project_env_with_db(
-        &db,
-        &req.grantee_project_id,
-    );
+    //
+    // F3: the re-projection is a Python subprocess (300 s cap), so it runs
+    // on the blocking pool, not a tokio worker. A join failure is soft-fail
+    // too — the grant row above already committed.
+    let grantee_id = req.grantee_project_id.clone();
+    if let Err(e) = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "codegraph_grant_access env re-projection",
+        move |db| {
+            let _ = crate::commands::projects_v2::refresh_project_env_with_db(db, &grantee_id);
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            "[vct] warning: codegraph_grant_access: {} (grant already committed)",
+            e
+        );
+    }
     Ok(())
 }
 

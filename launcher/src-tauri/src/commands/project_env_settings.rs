@@ -370,13 +370,23 @@ pub fn set_project_active_embedding_with_db(
 /// (F5, v0.2.72) — callers no longer need a follow-up
 /// `refresh_project_env` invoke (a duplicate one is a harmless idempotent
 /// no-op: the watcher diff-guard hash-matches and skips the reload).
+///
+/// F3: the re-projection is a Python subprocess (300 s cap), so the sync
+/// core runs on the blocking pool, not a tokio worker. The DB write lives
+/// inside the closure, so a join failure is propagated.
 #[tauri::command]
 pub async fn set_project_active_embedding(
     project_id: String,
     profile: String,
-    db: tauri::State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    set_project_active_embedding_with_db(&db, &project_id, &profile).map(|_| ())
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_project_active_embedding",
+        move |db| set_project_active_embedding_with_db(db, &project_id, &profile),
+    )
+    .await?
+    .map(|_| ())
 }
 
 /// Resolved per-project active-embedding profile + its provenance, for the

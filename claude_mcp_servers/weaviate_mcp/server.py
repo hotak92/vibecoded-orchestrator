@@ -12,7 +12,9 @@ specify which collection to search.
 Core Tools:
 - hybrid_search: Combined semantic + keyword across KG + docs (use this first)
 - semantic_graph_search: Semantic + WikiLink traversal (GraphRAG)
-- get_node_connections: Navigate WikiLink relationships
+  (node-connection lookup is served by semantic_graph_search's
+  connected-nodes traversal — it superseded the never-registered
+  get_node_connections helper, retired in v0.2.101)
 - store_knowledge_node: Persist knowledge nodes
 - search_code_graph: Find code entities by concept/purpose
 - query_code_structure: Query dependencies, callers, inheritance, interactions
@@ -2775,19 +2777,34 @@ def _fetch_node_chunks(
     cannot see simply shrink the window, which the caller reports as a
     PARTIAL view (no ``coverage: complete`` hint) rather than silently
     mis-assembling another node's chunks into this one.
+
+    v0.2.101 pull-in ③: ``title`` and ``file_path`` are word-TOKENIZED, so the
+    two ``Equal`` clauses only NARROW — title "Knowledge Graph" at
+    ``knowledge-graph.md`` token-matches "Orchestrator Knowledge Graph" at
+    ``orchestrator-knowledge-graph.md``, and that node's chunks were assembled
+    into this window. Rows are now confirmed in Python
+    (``vco_lib.weaviate_exact_match``): exact ``file_path``, same title token
+    sequence. The row bound is unchanged (``(total or max_chunks) + 1``) but
+    now counts CONFIRMED rows, paging past any sibling flood.
     """
     try:
+        import vco_lib.weaviate_exact_match as _wem
+
         chunk_filter = Filter.by_property("title").equal(title)
         if file_path:
             chunk_filter = chunk_filter & Filter.by_property("file_path").equal(
                 file_path
             )
-        objs = coll.query.fetch_objects(
-            filters=chunk_filter,
-            limit=(total or max_chunks) + 1,
+        objs = _wem.fetch_matching_rows(
+            coll,
+            chunk_filter,
+            _wem.exact_row_predicate(
+                paths={"file_path": file_path}, same_tokens={"title": title},
+            ),
+            max_matches=(total or max_chunks) + 1,
         )
         chunk_list: list[tuple[int, str]] = []
-        for obj in objs.objects:
+        for obj in objs:
             cn = obj.properties.get("chunk_num", 0) or 0
             chunk_list.append((cn, obj.properties.get("content", "") or ""))
         chunk_list.sort(key=lambda x: x[0])
@@ -4913,7 +4930,20 @@ def _fetch_adjacent_chunks(coll, title: str, hit_num: int, total: int,
     lack a file_path (legacy rows; none measured live).
 
     Returns formatted result dicts with distance=None (exact neighbour fetch).
+
+    v0.2.101 pull-in ③: "exact" was not true — ``file_path`` and ``title`` are
+    word-TOKENIZED, so ``file_path Equal knowledge/concepts/knowledge-graph.md
+    AND chunk_num Equal 2`` also matched chunk 2 of
+    ``orchestrator-knowledge-graph.md``, and ``limit=1`` could return THAT row
+    as this node's neighbour. Both strategies now confirm rows in Python
+    (``vco_lib.weaviate_exact_match``): Strategy 1 keeps only the exact
+    ``file_path``; the Strategy 2 title fallback keeps only the same title
+    token sequence and, when this result has a path, rejects rows stamped
+    with a DIFFERENT path (another node) while still serving path-less legacy
+    rows (its reason to exist).
     """
+    import vco_lib.weaviate_exact_match as _wem
+
     target_nums = set()
     if hit_num > 1:
         target_nums.add(hit_num - 1)
@@ -4932,8 +4962,11 @@ def _fetch_adjacent_chunks(coll, title: str, hit_num: int, total: int,
                     Filter.by_property("file_path").equal(file_path)
                     & Filter.by_property("chunk_num").equal(target_num)
                 )
-                result = coll.query.fetch_objects(filters=prop_filter, limit=1)
-                for obj in result.objects:
+                obj = _wem.fetch_first_matching_row(
+                    coll, prop_filter,
+                    _wem.exact_row_predicate(paths={"file_path": file_path}),
+                )
+                if obj is not None:
                     neighbours.append(_format_obj(obj, collection_name, distance=None))
         except Exception:
             # file_path / chunk_num properties may not exist on this collection;
@@ -4948,11 +4981,17 @@ def _fetch_adjacent_chunks(coll, title: str, hit_num: int, total: int,
 
     # Strategy 2: Fallback -- title filter + content-prefix parsing (old objects)
     try:
-        all_objs = coll.query.fetch_objects(
-            filters=Filter.by_property("title").equal(title),
-            limit=total,
+        all_objs = _wem.fetch_matching_rows(
+            coll,
+            Filter.by_property("title").equal(title),
+            _wem.exact_row_predicate(
+                paths={"file_path": file_path},
+                same_tokens={"title": title},
+                missing_path_ok=True,
+            ),
+            max_matches=total or None,
         )
-        for obj in all_objs.objects:
+        for obj in all_objs:
             content = obj.properties.get("content", "")
             parsed = _parse_chunk_header(content)
             if parsed and parsed[0] in remaining:
@@ -5727,12 +5766,20 @@ async def _semantic_graph_search_body(
                 if handle is None:
                     continue
                 try:
-                    results = handle.query.fetch_objects(
-                        filters=Filter.by_property("title").equal(title),
-                        limit=1
+                    # v0.2.101 pull-in ③: `title` is word-TOKENIZED, so a
+                    # `limit=1` Equal could return a TOKEN-SUPERSET title
+                    # ([[Weaviate]] → "Weaviate Windows Ports Gotcha") as the
+                    # neighbour. The first row with the SAME title token
+                    # sequence wins (case / punctuation still ignored, as a
+                    # WikiLink needs).
+                    import vco_lib.weaviate_exact_match as _wem
+
+                    obj = _wem.fetch_first_matching_row(
+                        handle,
+                        Filter.by_property("title").equal(title),
+                        _wem.exact_row_predicate(same_tokens={"title": title}),
                     )
-                    if results.objects:
-                        obj = results.objects[0]
+                    if obj is not None:
                         formatted = _format_obj(obj, coll_name, distance=None)
                         # Per-collection chunk enrichment so adjacent chunks
                         # come from the right collection.
@@ -6726,63 +6773,6 @@ async def describe_excalidraw(file_path: str) -> str:
     return _large_result(payload)
 
 
-def get_node_connections(
-    title: str
-) -> str:
-    """
-    Extract WikiLink relationships for a specific node.
-
-    Use for exploring specific node's connections and building knowledge maps.
-
-    Args:
-        title: Node title (exact match)
-
-    Returns:
-        JSON with typed connections (relationship_type, target_node)
-    """
-    client = get_weaviate_client()
-    coll = client.collections.get(KG_COLLECTION)
-
-    # Get node
-    results = coll.query.fetch_objects(
-        filters=Filter.by_property("title").equal(title),
-        limit=1
-    )
-
-    if not results.objects:
-        return json.dumps({
-            "success": False,
-            "error": f"Node '{title}' not found"
-        }, indent=2)
-
-    obj = results.objects[0]
-    content = obj.properties.get("content", "")
-
-    # Extract WikiLinks
-    wikilinks_raw = re.findall(r'\[\[([^\]]+)\]\]', content)
-
-    # Parse typed WikiLinks
-    connections = []
-    for link in wikilinks_raw:
-        if "::" in link:
-            rel_type, target = link.split("::", 1)
-            connections.append({"type": rel_type, "target": target})
-        else:
-            connections.append({"type": "relatedTo", "target": link})
-
-    logger.info(f"get_node_connections: {len(connections)} connections for '{title}'")
-    return json.dumps({
-        "success": True,
-        "node": {
-            "title": obj.properties.get("title", ""),
-            "node_type": obj.properties.get("node_type", ""),
-            "tags": obj.properties.get("tags", [])
-        },
-        "connections": connections,
-        "connection_count": len(connections)
-    }, indent=2)
-
-
 @mcp.tool()
 async def store_knowledge_node(
     title: str,
@@ -7130,7 +7120,9 @@ async def store_knowledge_node(
             rel_file_path = rel_file_path.replace("\\", "/")
 
         # Locate existing rows for THIS node (v0.2.73 D-1): scope the match to
-        # `title AND file_path`, mirroring sync_knowledge_graph.py's
+        # `title AND file_path` (since ⑧b below: to the EXACT `file_path`,
+        # title-agnostic — the path clause alone carried D-1's protection),
+        # mirroring sync_knowledge_graph.py's
         # `_delete_node_by_file_path` (the v0.2.70 P1 fix). Title is NOT unique
         # across the collection — an archived and an active node can share a
         # title at different file_paths — so a title-only delete silently
@@ -7162,18 +7154,30 @@ async def store_knowledge_node(
             path_narrowing_filter as _path_narrowing_filter,
         )
 
-        _delete_filter = Filter.by_property("title").equal(title)
+        #
+        # v0.2.101 pull-in ⑧b — RENAME ORPHANS: the narrowing read used to AND
+        # a `title` clause onto the path clause, so when a node's TITLE changed
+        # at the same path the old-title rows were never read back, never
+        # deleted, and sat beside the new rows as duplicates until a kg-sync
+        # (whose upsert keys on the exact path alone). `file_path` IS the
+        # node's identity — one file, one node — so with a path in hand the
+        # read narrows on the path ONLY and every row whose raw `file_path` is
+        # exactly this node's path is stale data for this upsert, whatever
+        # title it carries: a same-title row (the ordinary re-store) and an
+        # old-title row (the rename) alike. A token-superset SIBLING still
+        # never qualifies — `is_exact_path` rejects it, title or no title.
+        # The same identity rule as kg-sync's `_fetch_exact_path_rows` upsert.
         if rel_file_path:
             # C-7: narrow on BOTH the canonical POSIX spelling AND the
             # backslash variant so a Windows-written old row (or any separator
             # drift) is still reconciled.
-            _delete_filter = _delete_filter & _path_narrowing_filter(
-                Filter, rel_file_path
-            )
+            _delete_filter = _path_narrowing_filter(Filter, rel_file_path)
 
             def _is_this_node(props) -> bool:
                 return _is_exact_path(props.get("file_path"), rel_file_path)
         else:
+            _delete_filter = Filter.by_property("title").equal(title)
+
             def _is_this_node(props) -> bool:
                 return _is_same_title(props.get("title"), title)
         # v0.2.73 D-2: collect the stale row ids NOW (before any insert, so the
@@ -7898,6 +7902,18 @@ async def search_code_graph(
             """
             if not file_path or max_total <= 1:
                 return []
+            # v0.2.101 pull-in ③: `file_path` / `project` are word-TOKENIZED,
+            # so `file_path Equal src/run.py` also matched every row of
+            # `src/run_all.py`, `tests/src/run.py`, … — other files' entities
+            # were shown as this file's siblings (and could fill the 64-row
+            # read). The narrowing read is now confirmed in Python: exact
+            # `file_path`, same `project` token sequence.
+            import vco_lib.weaviate_exact_match as _wem
+
+            _sib_accept = _wem.exact_row_predicate(
+                paths={"file_path": file_path},
+                same_tokens={"project": effective_project},
+            )
             try:
                 fn_coll = client.collections.get(_project_collection("CodeFunction"))
                 cls_coll = client.collections.get(_project_collection("CodeClass"))
@@ -7910,8 +7926,10 @@ async def search_code_graph(
                     sib_filter = Filter.by_property("file_path").equal(file_path)
                     if effective_project:
                         sib_filter = sib_filter & Filter.by_property("project").equal(effective_project)
-                    sib_resp = coll_obj.query.fetch_objects(filters=sib_filter, limit=64)
-                    for obj in sib_resp.objects:
+                    sib_rows = _wem.fetch_matching_rows(
+                        coll_obj, sib_filter, _sib_accept, max_matches=64,
+                    )
+                    for obj in sib_rows:
                         sp = obj.properties or {}
                         if sp.get("full_name") == exclude_full_name:
                             continue
@@ -7957,6 +7975,21 @@ async def search_code_graph(
             """
             if not full_name or total <= 1 or max_chunks <= 1:
                 return []
+            # v0.2.101 pull-in ③: `full_name`, `project` and `file_path` are
+            # word-TOKENIZED, so `full_name Equal pkg.mod.run` also matched
+            # `pkg.mod.run_all` (and C-8's `file_path` clause matched token-
+            # superset paths) — a SIBLING entity's chunk could be assembled
+            # into this entity's window as if it were its own. Rows are now
+            # confirmed in Python: `full_name` read back from the winning row
+            # compared with `==` (any other spelling is another entity), exact
+            # `file_path`, same `project` token sequence.
+            import vco_lib.weaviate_exact_match as _wem
+
+            _chunk_accept = _wem.exact_row_predicate(
+                paths={"file_path": file_path},
+                values={"full_name": full_name},
+                same_tokens={"project": effective_project},
+            )
             collected: list[tuple[int, dict]] = []
             for base in ("CodeFunction", "CodeClass"):
                 try:
@@ -7966,8 +7999,11 @@ async def search_code_graph(
                         flt = flt & Filter.by_property("project").equal(effective_project)
                     if file_path:
                         flt = flt & Filter.by_property("file_path").equal(file_path)
-                    resp = coll_obj.query.fetch_objects(filters=flt, limit=max(total, max_chunks) + 4)
-                    for obj in resp.objects:
+                    rows = _wem.fetch_matching_rows(
+                        coll_obj, flt, _chunk_accept,
+                        max_matches=max(total, max_chunks) + 4,
+                    )
+                    for obj in rows:
                         cp = obj.properties or {}
                         cn = cp.get("chunk_num", 0) or 0
                         try:
@@ -8027,7 +8063,9 @@ async def search_code_graph(
                 # re-fetch with the references/properties needed for expansion.
                 # We re-query by full_name / path to get UUIDs reliably.
                 visited_full_names: set[str] = set()
-                expansion_queue: list[tuple[str, str, int]] = []  # (coll_name, identifier, hop)
+                # (coll_name, identifier, hop, uuid) — uuid is set for a
+                # callee reached through a `calls` edge (precise by-id fetch).
+                expansion_queue: list[tuple[str, str, int, str | None]] = []
 
                 for r in candidates:
                     coll_name, p = r["_c"], r["_p"]
@@ -8035,67 +8073,86 @@ async def search_code_graph(
                         fn = p.get("full_name", "")
                         if fn:
                             visited_full_names.add(fn)
-                            expansion_queue.append(("CodeFunction", fn, 0))
+                            expansion_queue.append(("CodeFunction", fn, 0, None))
                     elif coll_name == "CodeModule":
                         path_val = p.get("path") or p.get("file_path", "")
                         if path_val:
-                            expansion_queue.append(("CodeModule", path_val, 0))
+                            expansion_queue.append(("CodeModule", path_val, 0, None))
 
                 expanded_results: list[dict] = []
 
                 for hop in range(1, effective_hops + 1):
-                    next_queue: list[tuple[str, str, int]] = []
+                    next_queue: list[tuple[str, str, int, str | None]] = []
 
-                    for coll_name, identifier, _prev_hop in expansion_queue:
+                    for coll_name, identifier, _prev_hop, queued_uuid in expansion_queue:
                         if len(expanded_results) >= CODE_EXPANSION_LIMIT:
                             break
 
                         if coll_name == "CodeFunction":
-                            # 1. Follow outbound calls: fetch the function's `calls` text-array
+                            # v0.2.101 pull-in (owner ruling, live-confirmed):
+                            # `calls` is a cross-REFERENCE, not a text list —
+                            # the old `properties.get("calls")` was ALWAYS
+                            # empty, so call expansion never fired. Resolve
+                            # the canonical row ONCE (exact-then-fallback by
+                            # name, or by id for a callee reached through an
+                            # edge) with its `calls` edges; both steps below
+                            # use it. Step 2 used to re-fetch by a tokenized
+                            # `full_name` with `limit=1` (no project clause)
+                            # — it now uses the same canonical row, whose
+                            # uuid is the one interaction rows reference.
+                            fn_obj = None
                             try:
-                                fn_filter = Filter.by_property("full_name").equal(identifier)
-                                if effective_project:
-                                    fn_filter = fn_filter & Filter.by_property("project").equal(effective_project)
-                                fn_resp = func_coll.query.fetch_objects(
-                                    filters=fn_filter,
-                                    limit=1,
+                                fn_obj = _resolve_code_function(
+                                    func_coll, identifier, effective_project,
+                                    uuid=queued_uuid,
                                 )
-                                if fn_resp.objects:
-                                    fn_obj = fn_resp.objects[0]
-                                    called_names: list[str] = fn_obj.properties.get("calls") or []
-                                    for callee_name in called_names:
-                                        if callee_name in visited_full_names:
-                                            continue
-                                        if len(expanded_results) >= CODE_EXPANSION_LIMIT:
-                                            break
-                                        # Fetch the callee node
-                                        callee_resp = func_coll.query.fetch_objects(
-                                            filters=Filter.by_property("full_name").equal(callee_name),
-                                            limit=1,
-                                        )
-                                        if callee_resp.objects:
-                                            cp = callee_resp.objects[0].properties
-                                            expanded_results.append({
-                                                "collection": "CodeFunction",
-                                                "full_name": cp.get("full_name", callee_name),
-                                                "signature": cp.get("signature", ""),
-                                                "file_path": cp.get("file_path") or cp.get("path", ""),
-                                                "expanded": True,
-                                                "hop": hop,
-                                            })
-                                            visited_full_names.add(callee_name)
-                                            next_queue.append(("CodeFunction", callee_name, hop))
+                            except Exception as _e:
+                                logger.debug(f"expand hop {hop} CodeFunction resolve: {_e}")
+
+                            # 1. Follow outbound calls (resolved `calls` edges).
+                            try:
+                                for callee in _code_call_targets(fn_obj):
+                                    if len(expanded_results) >= CODE_EXPANSION_LIMIT:
+                                        break
+                                    cp = callee.properties or {}
+                                    callee_name = cp.get("full_name") or ""
+                                    if not callee_name or callee_name in visited_full_names:
+                                        continue
+                                    expanded_results.append({
+                                        "collection": "CodeFunction",
+                                        "full_name": callee_name,
+                                        "signature": cp.get("signature", ""),
+                                        "file_path": cp.get("file_path") or cp.get("path", ""),
+                                        "expanded": True,
+                                        "hop": hop,
+                                    })
+                                    visited_full_names.add(callee_name)
+                                    _cu = getattr(callee, "uuid", None)
+                                    next_queue.append((
+                                        "CodeFunction", callee_name, hop,
+                                        str(_cu) if _cu is not None else None,
+                                    ))
                             except Exception as _e:
                                 logger.debug(f"expand hop {hop} CodeFunction calls: {_e}")
 
                             # 2. Follow CodeInteraction edges where source_function → this function
                             try:
-                                fn_resp2 = func_coll.query.fetch_objects(
-                                    filters=Filter.by_property("full_name").equal(identifier),
-                                    limit=1,
-                                )
-                                if fn_resp2.objects:
-                                    src_uuid = str(fn_resp2.objects[0].uuid)
+                                # Availability never regresses (re-review
+                                # nit 1): the pre-fix step-2 re-fetch had NO
+                                # project clause, so a function whose stored
+                                # `project` differs from the effective one
+                                # still expanded its interactions. When the
+                                # project-scoped resolve above missed, retry
+                                # ONCE clause-less (same exact-then-fallback
+                                # read, `effective_project=""`). Step 1 keeps
+                                # its clause — it had one before the fix too.
+                                ix_fn_obj = fn_obj
+                                if ix_fn_obj is None and effective_project:
+                                    ix_fn_obj = _resolve_code_function(
+                                        func_coll, identifier, "", uuid=queued_uuid,
+                                    )
+                                if ix_fn_obj is not None:
+                                    src_uuid = str(ix_fn_obj.uuid)
                                     ix_resp = ix_coll.query.fetch_objects(
                                         filters=Filter.by_ref("source_function").by_id().equal(src_uuid),
                                         limit=20,
@@ -8126,12 +8183,17 @@ async def search_code_graph(
                             # Follow CodeInteraction edges where source_module → this module
                             try:
                                 mod_coll = client.collections.get(_project_collection("CodeModule"))
-                                mod_resp = mod_coll.query.fetch_objects(
-                                    filters=Filter.by_property("path").equal(identifier),
-                                    limit=1,
+                                # v0.2.101 pull-in: exact path first (a
+                                # tokenized `limit=1` could pick
+                                # `src/run_all.py` for `src/run.py`),
+                                # tolerant fallback on a miss. No project
+                                # clause, as before.
+                                mod_rows = _code_identity_rows(
+                                    mod_coll, "path", identifier, "",
+                                    tolerant_limit=1,
                                 )
-                                if mod_resp.objects:
-                                    src_uuid = str(mod_resp.objects[0].uuid)
+                                if mod_rows:
+                                    src_uuid = str(mod_rows[0].uuid)
                                     ix_resp = ix_coll.query.fetch_objects(
                                         filters=Filter.by_ref("source_module").by_id().equal(src_uuid),
                                         limit=20,
@@ -8283,6 +8345,87 @@ def _pick_canonical_chunk(objects: list):
         return min(objects, key=lambda o: (_cn(o) if _cn(o) is not None else 1 << 30))
     except Exception:  # noqa: BLE001
         return objects[0]
+
+
+def _code_identity_rows(
+    coll, prop: str, target: str, effective_project, *,
+    tolerant_limit: int, **fetch_kwargs,
+) -> list:
+    """The rows of the code entity named ``target`` on ``prop`` (``full_name``
+    for CodeFunction / CodeClass, ``path`` for CodeModule) — EXACT-THEN-FALLBACK.
+
+    v0.2.101 pull-in (owner ruling): ``full_name`` / ``path`` / ``project``
+    are word-TOKENIZED, so the ``Equal`` these lookups used matched every
+    token-superset entity as well (``a.run`` → ``a.run_all``), and a
+    ``limit=1`` / ``limit=8`` read could answer with the sibling. That same
+    tolerance is also what resolves a user-typed ``a::run`` or a bare
+    ``paths.py``, so it is kept as the FALLBACK, never dropped:
+    ``vco_lib.weaviate_exact_match.fetch_rows_exact_then_tolerant`` returns
+    only exact rows when any exist (``full_name`` by ``==``, ``path`` by the
+    separator-insensitive exact path, ``project`` by token sequence), and
+    otherwise the very read this site made before (``tolerant_limit`` rows).
+
+    The ONE home for these lookups in this module (``query_code_structure``,
+    the ``search_code_graph`` expansion and the CG-2 language probe).
+    ``effective_project`` empty → no project clause, as before.
+    """
+    import vco_lib.weaviate_exact_match as _wem
+
+    flt = Filter.by_property(prop).equal(target)
+    if effective_project:
+        flt = flt & Filter.by_property("project").equal(effective_project)
+    if prop in ("path", "file_path"):
+        accept = _wem.exact_row_predicate(
+            paths={prop: target}, same_tokens={"project": effective_project},
+        )
+    else:
+        accept = _wem.exact_row_predicate(
+            values={prop: target}, same_tokens={"project": effective_project},
+        )
+    return _wem.fetch_rows_exact_then_tolerant(
+        coll, flt, accept, tolerant_limit=tolerant_limit, **fetch_kwargs,
+    )
+
+
+def _resolve_code_function(func_coll, full_name: str, effective_project, *,
+                           uuid: str | None = None):
+    """The CANONICAL CodeFunction row for one function, with its ``calls``
+    cross-references resolved — or ``None``.
+
+    v0.2.101 pull-in (owner ruling, live-confirmed): ``calls`` is a
+    ReferenceProperty (analyze_code_graph.py writes it with
+    ``reference_add`` on the canonical chunk-0 uuid), NOT a text list. The
+    call-expansion and the ``path`` BFS read ``properties["calls"]`` — always
+    absent — so both answered empty on every live collection (91 of 300 rows
+    probed carry real ``calls`` edges). The edges are read here the way the
+    CLI's ``callers`` branch reads them: ``return_references`` +
+    :func:`_read_cross_reference` (the shared shape-safe reader).
+
+    ``uuid`` given (a callee reached through a ``calls`` edge — the edge
+    targets the canonical uuid) → a precise by-id fetch, no name lookup.
+    Otherwise (a seed name) → :func:`_code_identity_rows` exact-then-fallback,
+    then :func:`_pick_canonical_chunk` (the edges live on chunk 0).
+    """
+    refs = _code_return_references("calls")
+    if uuid:
+        obj = func_coll.query.fetch_object_by_id(uuid, return_references=refs)
+        if obj is not None:
+            return obj
+    if not full_name:
+        return None
+    return _pick_canonical_chunk(_code_identity_rows(
+        func_coll, "full_name", full_name, effective_project,
+        tolerant_limit=1, return_references=refs,
+    ))
+
+
+def _code_call_targets(fn_obj) -> list:
+    """The distinct functions ``fn_obj`` calls (resolved ``calls`` edges),
+    one per ``full_name`` — stored beacons can repeat (see
+    ``vco_lib.codegraph_references.dedup_ref_targets``)."""
+    if fn_obj is None:
+        return []
+    return _dedup_ref_targets(_read_cross_reference(fn_obj, "calls"), ("full_name",))
 
 
 def _dedup_objects_by_full_name(objects: list) -> list:
@@ -8461,12 +8604,12 @@ def _callgraph_target_language(
         def _lang_from(base: str, prop: str):
             try:
                 coll = client.collections.get(proj_coll(base))
-                flt = Filter.by_property(prop).equal(probe_name)
-                if effective_project:
-                    flt = flt & Filter.by_property("project").equal(effective_project)
-                resp = coll.query.fetch_objects(filters=flt, limit=1)
-                if resp.objects:
-                    lang = (resp.objects[0].properties or {}).get("language")
+                # v0.2.101 pull-in: exact entity first, tolerant fallback.
+                rows = _code_identity_rows(
+                    coll, prop, probe_name, effective_project, tolerant_limit=1,
+                )
+                if rows:
+                    lang = (rows[0].properties or {}).get("language")
                     return str(lang).strip().lower() if lang else None
             except Exception:  # noqa: BLE001 — probe best-effort
                 return None
@@ -8563,13 +8706,16 @@ def query_code_structure(
                 # OUTBOUND: resolve the module's own `imports` cross-reference
                 # to the modules IT imports. See _code_return_references /
                 # _read_cross_reference for the three-part v0.2.92 fix.
-                response = coll.query.fetch_objects(
-                    filters=with_project(Filter.by_property("path").equal(target)),
-                    limit=1,
+                # v0.2.101 pull-in: exact module path first (a tokenized
+                # `limit=1` could answer for `src/a_b.py` when asked for
+                # `src/a.py`), today's tolerant read on a miss.
+                module_rows = _code_identity_rows(
+                    coll, "path", target, effective_project,
+                    tolerant_limit=1,
                     return_references=_code_return_references("imports"),
                 )
 
-                if not response.objects:
+                if not module_rows:
                     return json.dumps({
                         "success": False,
                         "error": f"Module '{target}' not found"
@@ -8577,7 +8723,7 @@ def query_code_structure(
                     }, indent=2)
 
                 imports = _dedup_ref_targets(
-                    _read_cross_reference(response.objects[0], "imports"), ("path",)
+                    _read_cross_reference(module_rows[0], "imports"), ("path",)
                 )
                 results = [{"path": imp.properties.get("path"), "file_path": imp.properties.get("path", "")} for imp in imports]
 
@@ -8619,12 +8765,12 @@ def query_code_structure(
             # v0.2.72 (P3): a chunked class is N objects sharing full_name;
             # fetch a few and pick the CANONICAL (chunk_num==0) one, which
             # carries the methods list + canonical file_path.
-            response = coll.query.fetch_objects(
-                filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=8
-            )
-
-            canonical = _pick_canonical_chunk(response.objects)
+            # v0.2.101 pull-in: exact `full_name` first (a token-superset
+            # class `a.Foo_Bar` can no longer answer for `a.Foo`), tolerant
+            # fallback on a miss.
+            canonical = _pick_canonical_chunk(_code_identity_rows(
+                coll, "full_name", target, effective_project, tolerant_limit=8,
+            ))
             if canonical is None:
                 return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
 
@@ -8637,13 +8783,10 @@ def query_code_structure(
             coll = client.collections.get(_proj_coll("CodeClass"))
             # v0.2.72 (P3): pick the canonical chunk (chunk 0 holds the
             # `extends` references).
-            response = coll.query.fetch_objects(
-                filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=8,
+            canonical = _pick_canonical_chunk(_code_identity_rows(
+                coll, "full_name", target, effective_project, tolerant_limit=8,
                 return_references=_code_return_references("extends"),
-            )
-
-            canonical = _pick_canonical_chunk(response.objects)
+            ))
             if canonical is None:
                 return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
 
@@ -8696,12 +8839,9 @@ def query_code_structure(
             # function UUID (the analyzer captures chunk-0's UUID as func_uuid).
             # Resolve the target's canonical chunk so the source_function ref
             # filter matches.
-            func_resp = func_coll.query.fetch_objects(
-                filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=8
-            )
-
-            canonical_func = _pick_canonical_chunk(func_resp.objects)
+            canonical_func = _pick_canonical_chunk(_code_identity_rows(
+                func_coll, "full_name", target, effective_project, tolerant_limit=8,
+            ))
             if canonical_func is not None:
                 source_uuid = str(canonical_func.uuid)
                 ix_resp = interactions_coll.query.fetch_objects(
@@ -8710,17 +8850,16 @@ def query_code_structure(
                 )
             else:
                 mod_coll = client.collections.get(_proj_coll("CodeModule"))
-                mod_resp = mod_coll.query.fetch_objects(
-                    filters=with_project(Filter.by_property("path").equal(target)),
-                    limit=1
+                mod_rows = _code_identity_rows(
+                    mod_coll, "path", target, effective_project, tolerant_limit=1,
                 )
-                if not mod_resp.objects:
+                if not mod_rows:
                     return json.dumps({
                         "success": False,
                         "error": f"Function or module '{target}' not found"
                         + _code_structure_not_found_hint(query_type, target, effective_project)
                     }, indent=2)
-                source_uuid = str(mod_resp.objects[0].uuid)
+                source_uuid = str(mod_rows[0].uuid)
                 ix_resp = interactions_coll.query.fetch_objects(
                     filters=Filter.by_ref("source_module").by_id().equal(source_uuid),
                     limit=INTERACTIONS_LIMIT
@@ -8759,67 +8898,83 @@ def query_code_structure(
 
             func_coll = client.collections.get(_proj_coll("CodeFunction"))
 
-            # BFS state: queue of (current_full_name, path_so_far)
+            # BFS state: queue of (current_full_name, current_uuid, path_so_far)
             from collections import deque
-            bfs_queue: deque[tuple[str, list[dict]]] = deque()
+            bfs_queue: deque[tuple[str, str | None, list[dict]]] = deque()
 
-            # Seed: fetch source node to confirm it exists and get file_path
-            src_filter = Filter.by_property("full_name").equal(source_name)
-            if effective_project:
-                src_filter = src_filter & Filter.by_property("project").equal(effective_project)
-            src_resp = func_coll.query.fetch_objects(filters=src_filter, limit=1)
-            if not src_resp.objects:
+            # v0.2.101 pull-in (owner ruling, live-confirmed): this BFS read
+            # `properties["calls"]` as a text list, but `calls` is a
+            # cross-REFERENCE — the read was always empty, so `path` never got
+            # past the source. It now walks the resolved `calls` edges
+            # (`_resolve_code_function` + `_code_call_targets`): a callee's
+            # name AND file come off the edge target itself (uuid-precise —
+            # the two per-callee tokenized `full_name` lookups are gone), and
+            # the next hop is fetched by that uuid. The seed resolves
+            # exact-then-fallback by name. The destination matches by `==` or,
+            # tolerantly, by the same name token sequence (a typed `a::b`
+            # still meets `a.b`, as the tokenized lookup let it before).
+            import vco_lib.weaviate_exact_match as _wem
+
+            src_obj = _resolve_code_function(func_coll, source_name, effective_project)
+            if src_obj is None:
                 return json.dumps({
                     "success": False,
                     "error": f"Source function '{source_name}' not found"
                     + _code_structure_not_found_hint(query_type, source_name, effective_project)
                 }, indent=2)
 
-            src_file = src_resp.objects[0].properties.get("file_path") or src_resp.objects[0].properties.get("path", "")
-            bfs_queue.append((source_name, [{"full_name": source_name, "file_path": src_file, "hop": 0}]))
+            src_props = src_obj.properties or {}
+            src_file = src_props.get("file_path") or src_props.get("path", "")
+            # Queue entries: (full_name, uuid, path_so_far); the source's own
+            # object is reused for hop 0.
+            bfs_queue.append((
+                source_name, str(src_obj.uuid),
+                [{"full_name": source_name, "file_path": src_file, "hop": 0}],
+            ))
 
-            visited: set[str] = {source_name}
+            visited: set[str] = {str(src_obj.uuid)}
             found_path: list[dict] | None = None
             max_depth = 6
 
             while bfs_queue and found_path is None:
-                current_name, current_path = bfs_queue.popleft()
+                current_name, current_uuid, current_path = bfs_queue.popleft()
                 current_hop = len(current_path) - 1
 
                 if current_hop >= max_depth:
                     continue
 
-                # Fetch current node's outbound calls
-                cur_filter = Filter.by_property("full_name").equal(current_name)
-                if effective_project:
-                    cur_filter = cur_filter & Filter.by_property("project").equal(effective_project)
-                cur_resp = func_coll.query.fetch_objects(filters=cur_filter, limit=1)
-                if not cur_resp.objects:
+                # Fetch current node's outbound `calls` edges.
+                if current_hop == 0:
+                    cur_obj = src_obj
+                else:
+                    try:
+                        cur_obj = _resolve_code_function(
+                            func_coll, current_name, effective_project,
+                            uuid=current_uuid,
+                        )
+                    except Exception as _e:  # noqa: BLE001 — one dead hop never ends the walk
+                        logger.debug(f"path BFS: resolve {current_name} failed: {_e}")
+                        cur_obj = None
+                if cur_obj is None:
                     continue
 
-                calls_list: list[str] = cur_resp.objects[0].properties.get("calls") or []
-
-                for callee_name in calls_list:
-                    if callee_name == dest_name:
-                        # Found destination — fetch its file_path
-                        dest_filter = Filter.by_property("full_name").equal(dest_name)
-                        dest_resp = func_coll.query.fetch_objects(filters=dest_filter, limit=1)
-                        dest_file = ""
-                        if dest_resp.objects:
-                            dest_file = dest_resp.objects[0].properties.get("file_path") or dest_resp.objects[0].properties.get("path", "")
-                        found_path = current_path + [{"full_name": dest_name, "file_path": dest_file, "hop": current_hop + 1}]
+                for callee in _code_call_targets(cur_obj):
+                    cp = callee.properties or {}
+                    callee_name = cp.get("full_name") or ""
+                    if not callee_name:
+                        continue
+                    callee_file = cp.get("file_path") or cp.get("path", "")
+                    if _wem.is_same_title(callee_name, dest_name):
+                        found_path = current_path + [{"full_name": callee_name, "file_path": callee_file, "hop": current_hop + 1}]
                         break
 
-                    if callee_name not in visited:
-                        visited.add(callee_name)
-                        # Fetch callee file_path for path node
-                        callee_filter = Filter.by_property("full_name").equal(callee_name)
-                        callee_resp = func_coll.query.fetch_objects(filters=callee_filter, limit=1)
-                        callee_file = ""
-                        if callee_resp.objects:
-                            callee_file = callee_resp.objects[0].properties.get("file_path") or callee_resp.objects[0].properties.get("path", "")
+                    _cu = getattr(callee, "uuid", None)
+                    callee_key = str(_cu) if _cu is not None else callee_name
+                    if callee_key not in visited:
+                        visited.add(callee_key)
                         bfs_queue.append((
                             callee_name,
+                            str(_cu) if _cu is not None else None,
                             current_path + [{"full_name": callee_name, "file_path": callee_file, "hop": current_hop + 1}]
                         ))
 
@@ -8844,15 +8999,16 @@ def query_code_structure(
         elif query_type == "composes":
             # Find what classes a given class composes (has as field types).
             coll = client.collections.get(_proj_coll("CodeClass"))
-            response = coll.query.fetch_objects(
-                filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=1
-            )
+            # v0.2.101 pull-in: exact `full_name` first, tolerant fallback;
+            # among exact rows the canonical chunk answers.
+            composes_obj = _pick_canonical_chunk(_code_identity_rows(
+                coll, "full_name", target, effective_project, tolerant_limit=1,
+            ))
 
-            if not response.objects:
+            if composes_obj is None:
                 return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
 
-            composes = response.objects[0].properties.get("composes", []) or []
+            composes = composes_obj.properties.get("composes", []) or []
             results = [{"composed_class": name} for name in composes]
 
         elif query_type == "composed_by":

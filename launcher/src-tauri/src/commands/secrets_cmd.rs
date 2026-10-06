@@ -214,6 +214,40 @@ fn refresh_env_after_user_secret_change(
     }
 }
 
+/// F3: async-side tail shared by the secret-write commands — run
+/// [`refresh_env_after_user_secret_change`] on the blocking pool. The
+/// re-projection is a Python subprocess per project (300 s cap each), so
+/// inline it parked a tokio worker. Soft-fail on join error / missing Db
+/// state, same contract as the refresh itself: the keychain change has
+/// already committed, so a projection hiccup is logged, never propagated.
+/// Non-user buckets return before any task is spawned (the sync helper
+/// would no-op for them anyway).
+async fn refresh_env_after_user_secret_change_blocking(
+    app: tauri::AppHandle,
+    project_id: &str,
+    scope: &str,
+    module_id: &str,
+    op: &'static str,
+) {
+    if !is_user_emit_bucket(scope, module_id) {
+        return;
+    }
+    let (project_id, scope, module_id) =
+        (project_id.to_string(), scope.to_string(), module_id.to_string());
+    if let Err(e) = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "secret-change env re-projection",
+        move |db| refresh_env_after_user_secret_change(db, &project_id, &scope, &module_id, op),
+    )
+    .await
+    {
+        tracing::warn!(
+            "[vct] warning: env-file refresh after {}: {} (keychain change already committed)",
+            op, e
+        );
+    }
+}
+
 /// Sentinel project_id used by the GUI when scope is global / shared.
 ///
 /// These scopes don't tie a secret to a specific project; the frontend
@@ -293,6 +327,7 @@ pub async fn set_secret_v2(
     value: String,
     validation_regex: Option<String>,
     sensitive: bool,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
     // Validate value against the manifest regex if provided.
@@ -349,7 +384,8 @@ pub async fn set_secret_v2(
     // ordering doesn't depend on an env-file write race. Soft-fail
     // (eprintln only) — the secret has already committed to the
     // keychain.
-    refresh_env_after_user_secret_change(&db, &project_id, &scope, &module_id, "set_secret_v2");
+    refresh_env_after_user_secret_change_blocking(app, &project_id, &scope, &module_id, "set_secret_v2")
+        .await;
     Ok(())
 }
 
@@ -368,6 +404,7 @@ pub async fn clear_secret_v2(
     module_id: String,
     scope: String,
     key: String,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
     enforce_scope_invariants(&scope, &project_id, &db)?;
@@ -387,7 +424,8 @@ pub async fn clear_secret_v2(
     // `.vscode/settings.json` claude-code.env, and the BEGIN/END block
     // of `.claude/env`. The keychain value is intentionally preserved
     // (Lifecycle B) so reactivate is one-click.
-    refresh_env_after_user_secret_change(&db, &project_id, &scope, &module_id, "clear_secret_v2");
+    refresh_env_after_user_secret_change_blocking(app, &project_id, &scope, &module_id, "clear_secret_v2")
+        .await;
     Ok(())
 }
 
@@ -407,6 +445,7 @@ pub async fn reactivate_secret_v2(
     module_id: String,
     scope: String,
     key: String,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
     enforce_scope_invariants(&scope, &project_id, &db)?;
@@ -421,7 +460,14 @@ pub async fn reactivate_secret_v2(
     // so it returns to the env surfaces. Same refresh pattern as set /
     // clear — the writer reads the active flag + keychain value and
     // composes the surfaces from scratch.
-    refresh_env_after_user_secret_change(&db, &project_id, &scope, &module_id, "reactivate_secret_v2");
+    refresh_env_after_user_secret_change_blocking(
+        app,
+        &project_id,
+        &scope,
+        &module_id,
+        "reactivate_secret_v2",
+    )
+    .await;
     Ok(())
 }
 
@@ -437,6 +483,7 @@ pub async fn remove_secret_v2(
     module_id: String,
     scope: String,
     key: String,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
     enforce_scope_invariants(&scope, &project_id, &db)?;
@@ -469,13 +516,14 @@ pub async fn remove_secret_v2(
     // user-bucket predicate so the existing code path for non-user-bucket
     // secrets stays byte-identical to pre-Subagent-G.
     if is_user_emit_bucket(&scope, &module_id) {
-        refresh_env_after_user_secret_change(
-            &db,
+        refresh_env_after_user_secret_change_blocking(
+            app,
             &project_id,
             &scope,
             &module_id,
             "remove_secret_v2",
-        );
+        )
+        .await;
         // Now the row's done its job in the strip set — forget it.
         db.forget_secret_active_state(&scope, &project_id, &module_id, &key)?;
     } else {
@@ -3988,6 +4036,7 @@ fn build_migration_outcome(hub: &HubMigrateResponse) -> MigrateEnvSecretsResult 
 #[command]
 pub async fn migrate_env_secrets_from_dotenv(
     project_id: String,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<MigrateEnvSecretsResult, String> {
     // 1. Resolve the project root from the launcher DB.
@@ -4061,13 +4110,14 @@ pub async fn migrate_env_secrets_from_dotenv(
     //    env surfaces so the freshly-scoped secrets appear immediately —
     //    same soft-fail contract as the manual add-form's post-write refresh.
     if result.scope == "per_project" && !result.migrated.is_empty() {
-        refresh_env_after_user_secret_change(
-            &db,
+        refresh_env_after_user_secret_change_blocking(
+            app,
             &project_id,
             "per_project",
             "user",
             "migrate_env_secrets_from_dotenv",
-        );
+        )
+        .await;
     }
 
     Ok(result)
@@ -4118,6 +4168,7 @@ pub async fn get_shared_secrets_read_disabled_cmd(
 pub async fn set_shared_secrets_read_disabled(
     project_id: String,
     read_disabled: bool,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<SharedSecretsToggleResult, String> {
     let row = db
@@ -4138,7 +4189,20 @@ pub async fn set_shared_secrets_read_disabled(
     // 2. Refresh env surfaces so shared keys are emitted/stripped now. The
     //    gate lives in the core resolver, so the writer re-reads the flag on
     //    this refresh — same soft-fail contract as the KG toggle.
-    if let Err(e) = crate::commands::projects_v2::refresh_project_env_with_db(&db, &project_id) {
+    //
+    //    F3: the re-projection is a Python subprocess (300 s cap), so it
+    //    runs on the blocking pool, not a tokio worker. A join failure is
+    //    soft-fail too (the toggle already persisted) and is folded into
+    //    `warnings` like a refresh failure.
+    let pid = project_id.clone();
+    let refresh = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_shared_secrets_read_disabled env re-projection",
+        move |db| crate::commands::projects_v2::refresh_project_env_with_db(db, &pid),
+    )
+    .await
+    .and_then(|r| r);
+    if let Err(e) = refresh {
         let msg = format!(
             "shared-secrets read-disabled env refresh failed: {}. Toggle \
              persisted to DB but env files may be stale until the next refresh.",

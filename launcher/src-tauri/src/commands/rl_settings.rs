@@ -282,13 +282,23 @@ pub fn set_dual_embedding_write_all_slots_with_db(
 /// log into). We therefore cascade: disabling the prerequisite also
 /// disables the dependent flag. Enabling has no cascade (the dependent
 /// stays whatever it was).
+///
+/// F3: the re-projection is a Python subprocess (300 s cap), so the sync
+/// core runs on the blocking pool, not a tokio worker. The DB write lives
+/// inside the closure, so a join failure is propagated.
 #[command]
 pub async fn set_dual_embedding_write_all_slots(
     project_id: String,
     value: bool,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    set_dual_embedding_write_all_slots_with_db(&db, &project_id, value).map(|_| ())
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_dual_embedding_write_all_slots",
+        move |db| set_dual_embedding_write_all_slots_with_db(db, &project_id, value),
+    )
+    .await?
+    .map(|_| ())
 }
 
 /// Read the EFFECTIVE "write embeddings to ALL named-vector slots" flag.
@@ -351,13 +361,23 @@ pub fn set_dual_rl_log_enabled_with_db(
 /// Dependency: dual-logs ⟹ dual-write. Turning this ON force-enables
 /// `dual_embedding_write_all_slots` (the prerequisite) so the two flags
 /// stay coherent regardless of GUI state. Turning it OFF has no cascade.
+///
+/// F3: the re-projection is a Python subprocess (300 s cap), so the sync
+/// core runs on the blocking pool, not a tokio worker. The DB write lives
+/// inside the closure, so a join failure is propagated.
 #[command]
 pub async fn set_dual_rl_log_enabled(
     project_id: String,
     value: bool,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    set_dual_rl_log_enabled_with_db(&db, &project_id, value).map(|_| ())
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_dual_rl_log_enabled",
+        move |db| set_dual_rl_log_enabled_with_db(db, &project_id, value),
+    )
+    .await?
+    .map(|_| ())
 }
 
 /// Read the EFFECTIVE "also log RL events under the secondary embedding
@@ -400,13 +420,23 @@ pub fn set_dual_embedding_arctic_secondary_with_db(
 /// "dual_embedding_arctic_secondary")`. Default OFF when no row exists.
 ///
 /// Independent of the other two dual-write flags — no cascade either way.
+///
+/// F3: the re-projection is a Python subprocess (300 s cap), so the sync
+/// core runs on the blocking pool, not a tokio worker. The DB write lives
+/// inside the closure, so a join failure is propagated.
 #[command]
 pub async fn set_dual_embedding_arctic_secondary(
     project_id: String,
     value: bool,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    set_dual_embedding_arctic_secondary_with_db(&db, &project_id, value).map(|_| ())
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_dual_embedding_arctic_secondary",
+        move |db| set_dual_embedding_arctic_secondary_with_db(db, &project_id, value),
+    )
+    .await?
+    .map(|_| ())
 }
 
 /// Read the EFFECTIVE "also write embeddings into a secondary arctic slot"

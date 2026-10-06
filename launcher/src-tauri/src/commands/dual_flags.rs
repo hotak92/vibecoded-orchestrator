@@ -277,7 +277,24 @@ pub async fn set_dual_flag_for_project(
     let flag = DualFlag::from_wire(&flag)?;
     db.set_dual_flag_for_project(&project_id, flag, value)?;
     // Soft-fail: warnings ride along, the DB write is never rolled back.
-    let _ = crate::commands::projects_v2::reproject_env_soft(&db, &project_id);
+    // F3: the re-projection is a Python subprocess (300 s cap), so it runs
+    // on the blocking pool, not a tokio worker. A join failure is soft-fail
+    // too — the DB write above already committed.
+    let pid = project_id.clone();
+    if let Err(e) = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app.clone(),
+        "set_dual_flag_for_project env re-projection",
+        move |db| {
+            let _ = crate::commands::projects_v2::reproject_env_soft(db, &pid);
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            "[vct] warning: set_dual_flag_for_project: {} (DB write already committed)",
+            e
+        );
+    }
     // Return the RESOLVED state so the panel re-renders from the truth
     // (the coherence cascade may have moved a second flag) — and decide the
     // ensure from that same resolved state, never from the request (W3R-16).

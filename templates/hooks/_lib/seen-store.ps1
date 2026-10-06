@@ -91,6 +91,56 @@ function Add-VcoSeen {
     try { Add-Content -LiteralPath $File -Value $Key -ErrorAction Stop } catch { }
 }
 
+# Invoke-VcoSeenClaim <ClaimFile> <StaleAfterSeconds>
+# v0.2.101 (pull-in 4): the "first of N concurrent runs wins" primitive for the
+# shell injectors. [System.IO.File]::Open with FileMode.CreateNew is
+# O_CREAT|O_EXCL on Unix and CREATE_NEW on Windows: of two processes racing for
+# the same name exactly one creates it -- no check-then-write window.
+# Returns "claimed" (proceed), "held" (a claim younger than StaleAfterSeconds
+# exists: another run holds it, stand down) or "undecided" (no path, the
+# directory cannot be created, the create fails for a reason other than
+# "exists"; the CALLER picks the fail mode). A claim older than
+# StaleAfterSeconds is a dead run's leftover: removed and the create retried
+# ONCE. The body is the winner's pid -- diagnostic only.
+# MUST MATCH seen-store.sh's vco_seen_claim and vco_lib/atomic.py's claim_once.
+function Invoke-VcoSeenClaim {
+    param([string]$ClaimFile, [int]$StaleAfterSeconds = 60)
+    if ([string]::IsNullOrEmpty($ClaimFile)) { return "undecided" }
+    if ($StaleAfterSeconds -le 0) { $StaleAfterSeconds = 60 }
+    try {
+        $dir = Split-Path -Parent $ClaimFile
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+        }
+    } catch { return "undecided" }
+    foreach ($attempt in 0, 1) {
+        $created = $false
+        try {
+            $fs = [System.IO.File]::Open($ClaimFile, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $created = $true
+            try {
+                $b = [System.Text.Encoding]::ASCII.GetBytes("$PID`n")
+                $fs.Write($b, 0, $b.Length)
+            } catch { } finally { $fs.Dispose() }
+        } catch { $created = $false }
+        if ($created) { return "claimed" }
+        if (-not (Test-Path -LiteralPath $ClaimFile)) {
+            # Released between our create and this test (retry once), or the
+            # create genuinely fails.
+            if ($attempt -eq 0) { continue }
+            return "undecided"
+        }
+        if ($attempt -eq 1) { return "held" }
+        try {
+            $age = ((Get-Date) - (Get-Item -LiteralPath $ClaimFile -ErrorAction Stop).LastWriteTime).TotalSeconds
+        } catch { return "held" }  # cannot age it: treat as held (the .sh sibling's rule)
+        if ($age -lt $StaleAfterSeconds) { return "held" }
+        try { Remove-Item -LiteralPath $ClaimFile -Force -ErrorAction Stop } catch { return "undecided" }
+    }
+    return "held"
+}
+
 # Test-VcoSeenSrcMatches <ReadsFile> <Src> [ProjectRoot]
 # P4 (v0.2.91): rule-(b) comparison WITH PATH-FORM NORMALIZATION.
 # The ledger holds REPO-RELATIVE paths, but a producer's "| src=" trailer can be

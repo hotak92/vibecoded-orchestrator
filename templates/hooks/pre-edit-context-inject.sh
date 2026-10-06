@@ -229,7 +229,26 @@ if [[ "$CACHE_HIT" == "1" ]]; then
     # seen-store helper (partial install) SKIPS the replay and falls
     # through to a live router run rather than replaying undeduped.
     if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
+        # v0.2.101 ④: the filter is check-then-append — claim the replay per
+        # (session, file-hash) atomically first (vco_seen_claim: noclobber =
+        # O_EXCL, portable). Loser exits silently (same blob, same store: a
+        # duplicate suppressed, never a block lost); winner releases after
+        # recording. Stale bound 15 s > the 10 s hook timeout. No claim when
+        # inject-blind (shared "default" dir); undecided fails OPEN.
+        # MUST MATCH pre-edit-context-inject.ps1.
+        REPLAY_CLAIM=""
+        REPLAY_CLAIM_STALE_S=15
+        if [ -n "$SEEN_INJECT_FILE" ] && command -v vco_seen_claim >/dev/null 2>&1; then
+            REPLAY_CLAIM="${CACHE_FILE}.claim"
+            vco_seen_claim "$REPLAY_CLAIM" "$REPLAY_CLAIM_STALE_S"
+            case $? in
+                0) ;;
+                1) exit 0 ;;
+                *) REPLAY_CLAIM="" ;;
+            esac
+        fi
         FILTERED_CACHE=$(vco_filter_seen_blocks "$CACHE_BLOB" "$SEEN_INJECT_FILE" "$SEEN_READS_FILE")
+        [ -n "$REPLAY_CLAIM" ] && rm -f "$REPLAY_CLAIM" 2>/dev/null
         case "$FILTERED_CACHE" in
             *[![:space:]]*)
                 REPLAY_OUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'"${FILTERED_CACHE}"

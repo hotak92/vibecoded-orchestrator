@@ -182,7 +182,24 @@ if ($CacheHit) {
     # replay and falls through to a live router run rather than replaying
     # undeduped. MUST MATCH the .sh sibling.
     if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
+        # v0.2.101 pull-in 4: claim the replay slot per (session, file-hash)
+        # ATOMICALLY before the check-then-append filter (CreateNew = O_EXCL),
+        # so two near-simultaneous edits of one file cannot both inject. The
+        # loser exits silently (it would replay the SAME blob through the SAME
+        # store -- the winner's emit carries it all); the winner releases once
+        # its keys are recorded. Stale bound 15 s > the 10 s hook timeout. No
+        # claim in inject-blind mode (shared "default" cache dir); "undecided"
+        # fails OPEN. MUST MATCH the .sh sibling.
+        $ReplayClaim = ""
+        $ReplayClaimStaleS = 15
+        if ($SeenInjectFile -and (Get-Command Invoke-VcoSeenClaim -ErrorAction SilentlyContinue)) {
+            $ReplayClaim = "$CacheFile.claim"
+            $claimVerdict = Invoke-VcoSeenClaim -ClaimFile $ReplayClaim -StaleAfterSeconds $ReplayClaimStaleS
+            if ($claimVerdict -eq "held") { exit 0 }
+            if ($claimVerdict -ne "claimed") { $ReplayClaim = "" }
+        }
         $filtered = Invoke-VcoFilterSeenBlocks -InputText $CacheBlob -InjectFile $SeenInjectFile -ReadsFile $SeenReadsFile
+        if ($ReplayClaim) { Remove-Item -LiteralPath $ReplayClaim -Force -ErrorAction SilentlyContinue }
         if (($filtered -replace '\s+', '')) {
             Emit-ContextJson "[Pre-edit context for ${Basename}]:`n`n$filtered"
         }

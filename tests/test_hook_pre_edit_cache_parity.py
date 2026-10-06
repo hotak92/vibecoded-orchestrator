@@ -230,8 +230,15 @@ def test_pre_edit_sh_cache_replay_silent_when_everything_seen() -> None:
     # is acceptable; the goal is to assert SOMETHING checks for the
     # whitespace-only case in the cache-replay branch.
     cache_hit_idx = body.find('"$CACHE_HIT" == "1"')
-    # Look within ~30 lines of the CACHE_HIT branch for the whitespace check.
-    snippet = body[cache_hit_idx:cache_hit_idx + 2000] if cache_hit_idx > 0 else ""
+    # Look from the CACHE_HIT branch to the END of the cache-replay section.
+    # (P2 re-review nit 1: a fixed +2000 window left only ~271 chars of
+    # headroom and already broke once when a comment grew — scan generously
+    # to the next section boundary instead of a brittle char count.)
+    if cache_hit_idx > 0:
+        nxt = body.find("# ---", cache_hit_idx + 1)
+        snippet = body[cache_hit_idx:nxt if nxt > 0 else len(body)]
+    else:
+        snippet = ""
     has_whitespace_check = (
         "*[![:space:]]*" in snippet
         or "[^[:space:]]" in snippet

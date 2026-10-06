@@ -33,6 +33,12 @@ by ``templates/scripts/sync_knowledge_graph.py``,
 ``claude_mcp_servers/weaviate_mcp/server.py`` (``store_knowledge_node``) and
 ``vco_lib/diagram_indexer.py`` (the ``<Project>_Diagrams`` delete/upsert).
 
+v0.2.101 pull-in ③ extends the same rule to the MCP's READ-ONLY lookups
+(chunk windows, neighbour chunks, WikiLink targets, code-entity chunks and
+same-file siblings) through :func:`exact_row_predicate` and
+:func:`fetch_first_matching_row` — there a tokenized over-match served a
+SIBLING's row or chunk as the asked-for one (wrong context, not data loss).
+
 The structural alternative — ``tokenization: field`` on ``file_path`` — is a
 destructive schema migration (re-create + re-ingest) and needs the owner's
 consent; this module is the non-destructive fix and stays correct after such a
@@ -59,6 +65,9 @@ __all__ = [
     "is_same_title",
     "fetch_matching_rows",
     "fetch_exact_path_rows",
+    "exact_row_predicate",
+    "fetch_first_matching_row",
+    "fetch_rows_exact_then_tolerant",
 ]
 
 #: Rows per narrowing-read page. A tokenized read over-fetches siblings, so a
@@ -163,8 +172,16 @@ def fetch_matching_rows(
     ``offset`` is passed only from the second page on, so a first read is
     byte-identical to the pre-paging call. Exceptions from ``fetch_objects``
     PROPAGATE: callers keep their own fallback ladders.
+
+    Rows are DE-DUPLICATED by UUID (v0.2.101 ⑧a): offset paging is not a
+    snapshot — a concurrent insert/delete shifts the window between two page
+    reads, so the same row can come back on both sides of a page boundary.
+    A repeat is skipped before the predicate runs, so it can neither appear
+    twice in the result nor count twice towards *max_matches*. A row with no
+    readable UUID is never treated as a repeat (nothing to compare on).
     """
     rows: list = []
+    seen: set = set()
     offset = 0
     for _ in range(max_pages):
         kwargs = dict(fetch_kwargs, filters=narrow_filter, limit=page_size)
@@ -173,6 +190,12 @@ def fetch_matching_rows(
         result = coll.query.fetch_objects(**kwargs)
         objs = list(getattr(result, "objects", None) or [])
         for obj in objs:
+            uid = getattr(obj, "uuid", None)
+            if uid is not None:
+                key = str(uid)
+                if key in seen:
+                    continue
+                seen.add(key)
             props = getattr(obj, "properties", None) or {}
             try:
                 hit = bool(accept(props))
@@ -216,3 +239,136 @@ def fetch_exact_path_rows(
         lambda props: is_exact_path(props.get(prop), canonical),
         **fetch_kwargs,
     )
+
+
+# ─── READ sites (v0.2.101 pull-in ③) ──────────────────────────────────────
+#
+# The same tokenized ``Equal`` also feeds READ-ONLY lookups: a node's chunk
+# window, its N±1 neighbour chunk, a WikiLink target, a code entity's chunks
+# and its same-file siblings. There the over-match is not data loss but WRONG
+# CONTEXT — with ``limit=1`` a sibling's row can be returned AS the asked-for
+# node, and a chunk window can interleave another file's chunks. The read
+# sites compose several identity clauses (``title`` AND ``file_path``,
+# ``full_name`` AND ``project`` AND ``file_path``), each ANDed only when the
+# caller has a value, so they share one predicate builder rather than each
+# hand-rolling a lambda.
+
+
+def exact_row_predicate(
+    *,
+    paths: Optional[Mapping[str, Any]] = None,
+    values: Optional[Mapping[str, Any]] = None,
+    same_tokens: Optional[Mapping[str, Any]] = None,
+    missing_path_ok: bool = False,
+) -> Callable[[Mapping[str, Any]], bool]:
+    """Build the *accept* predicate for :func:`fetch_matching_rows` from the
+    identity a read site narrowed on.
+
+    * ``paths`` — ``{prop: canonical}``: :func:`is_exact_path` (separator-
+      insensitive exact path).
+    * ``values`` — ``{prop: wanted}``: Python ``==`` on the raw value (for an
+      identity read back from the row itself, e.g. a code entity's
+      ``full_name``, where any other spelling IS another entity).
+    * ``same_tokens`` — ``{prop: wanted}``: :func:`is_same_title` — the token
+      SEQUENCE must be equal. This keeps the case / punctuation insensitivity
+      the tokenized ``Equal`` already gave (a WikiLink ``[[uses::weaviate]]``,
+      a lower-cased project name) while rejecting token SUPERSETS.
+
+    A clause whose wanted value is empty / ``None`` is SKIPPED — mirroring the
+    read sites, which AND a narrowing clause only when they have a value.
+
+    ``missing_path_ok``: a row whose path property is absent / empty passes the
+    ``paths`` clauses (a legacy row written before the path was stamped — the
+    title-fallback reads keep serving those), while a row carrying a DIFFERENT
+    path is still rejected (that is another node).
+    """
+    want_paths = {k: v for k, v in (paths or {}).items() if v}
+    want_values = {k: v for k, v in (values or {}).items() if v not in (None, "")}
+    want_tokens = {k: v for k, v in (same_tokens or {}).items() if v}
+
+    def _accept(props: Mapping[str, Any]) -> bool:
+        for prop, canonical in want_paths.items():
+            raw = props.get(prop)
+            if missing_path_ok and (raw is None or (isinstance(raw, str) and not raw.strip())):
+                continue
+            # Resolved through the module global at call time, so a test that
+            # swaps ``is_exact_path`` reaches every read site too.
+            if not is_exact_path(raw, canonical):
+                return False
+        for prop, wanted in want_values.items():
+            if props.get(prop) != wanted:
+                return False
+        for prop, wanted in want_tokens.items():
+            if not is_same_title(props.get(prop), wanted):
+                return False
+        return True
+
+    return _accept
+
+
+def fetch_first_matching_row(
+    coll: Any,
+    narrow_filter: Any,
+    accept: Callable[[Mapping[str, Any]], bool],
+    **fetch_kwargs: Any,
+) -> Any:
+    """The first row of a narrowing read that *accept* confirms, or ``None``.
+
+    The replacement for ``fetch_objects(filters=<tokenized Equal>, limit=1)``:
+    that call returned WHATEVER row the over-matching filter yielded first —
+    possibly a sibling's. Pages past a sibling flood like
+    :func:`fetch_matching_rows` and stops at the first confirmed row.
+    """
+    rows = fetch_matching_rows(
+        coll, narrow_filter, accept, max_matches=1, **fetch_kwargs
+    )
+    return rows[0] if rows else None
+
+
+def fetch_rows_exact_then_tolerant(
+    coll: Any,
+    narrow_filter: Any,
+    accept: Callable[[Mapping[str, Any]], bool],
+    *,
+    tolerant_limit: int,
+    max_matches: Optional[int] = None,
+    **fetch_kwargs: Any,
+) -> list:
+    """EXACT-THEN-FALLBACK read for a lookup that RESOLVES a name (owner ruling,
+    v0.2.101 pull-in).
+
+    Some lookups resolve a USER-TYPED target (``query_code_structure``'s
+    ``auth.validate_token`` / ``src/a.py``) or a name the caller cannot
+    canonicalise. For those the word tokenization was doing real work: it
+    makes ``auth::validate_token`` find ``auth.validate_token`` and a bare
+    ``paths.py`` find ``vco_lib/paths.py``. A strict exact-only read would
+    turn every such lookup into "not found" — an availability regression.
+
+    So the rule is two-step:
+
+    1. **Exact first** — :func:`fetch_matching_rows` with *accept*: when any
+       row is confirmed, ONLY confirmed rows are returned, so a token-superset
+       sibling (``auth.validate_token_v2``) can never displace the exact
+       entity.
+    2. **Tolerant fallback** — on an exact miss, the SAME call the site made
+       before this fix: ``fetch_objects(filters=narrow_filter,
+       limit=tolerant_limit, **fetch_kwargs)``, rows returned unfiltered. A
+       lookup that found something before still finds the same thing.
+
+    Exactness wins whenever it is available; availability never regresses.
+    Exceptions from either read PROPAGATE (the call sites keep their own
+    soft-fail ladders). The fallback costs one extra read and only on a miss.
+    """
+    rows = fetch_matching_rows(
+        coll, narrow_filter, accept, max_matches=max_matches, **fetch_kwargs
+    )
+    if rows:
+        return rows
+    logger.debug(
+        "weaviate exact-match: no exact row on %s; tolerant fallback (limit=%d)",
+        getattr(coll, "name", "?"), tolerant_limit,
+    )
+    result = coll.query.fetch_objects(
+        filters=narrow_filter, limit=tolerant_limit, **fetch_kwargs
+    )
+    return list(getattr(result, "objects", None) or [])

@@ -423,14 +423,23 @@ pub fn diagram_grant_access_with_db(
     Ok(crate::commands::projects_v2::reproject_env_soft(db, grantee_id))
 }
 
+/// F3: the grantee re-projection is a Python subprocess (300 s cap), so the
+/// sync core runs on the blocking pool, not a tokio worker. The DB write
+/// lives inside the closure, so a join failure is propagated.
 #[command]
 pub async fn diagram_grant_access(
     grantor_id: String,
     grantee_id: String,
     level: String,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    diagram_grant_access_with_db(&db, &grantor_id, &grantee_id, &level).map(|_| ())
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "diagram_grant_access",
+        move |db| diagram_grant_access_with_db(db, &grantor_id, &grantee_id, &level),
+    )
+    .await?
+    .map(|_| ())
 }
 
 // ─── (v0.2.101) Per-tool MCP-grant Tauri commands REMOVED ───────────────
