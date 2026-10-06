@@ -6,7 +6,7 @@
 
 **VCT Launcher** — cross-platform desktop app (Tauri 2 + SvelteKit) for project management, module installs, secrets, the knowledge graph viewer, and Claude Code configuration. Writes per-project env files that the rest of the system reads at startup.
 
-**VibeCoded Orchestrator (VCO)** — a workflow engine for Claude Code. Two MCP servers register in `~/.claude.json` on install: `weaviate-kg` (semantic + graph search) and `playwright` (browser automation, invoked via `npx -y @playwright/mcp@latest`), both enabled per project by default. (v0.2.101 removed the `search` paper MCP and stopped registering the `mermaid`/`excalidraw` diagram wrappers by default.) A per-project toggle in the launcher's Permissions tab writes `~/.claude.json` `projects[<project>].disabledMcpServers` — the channel Claude Code honours for user-scope servers. Backed by a Weaviate knowledge graph, an AST-extracted code graph, 11 free agents, 6 skills, and 47 hooks. Gives Claude Code persistent memory, free local inference, and a place to put automation that would otherwise live in shell aliases.
+**VibeCoded Orchestrator (VCO)** — a workflow engine for Claude Code. Two MCP servers register in `~/.claude.json` on install: `weaviate-kg` (semantic + graph search) and `playwright` (browser automation, invoked via `npx -y @playwright/mcp@latest`), both enabled per project by default. (v0.2.101 removed the `search` paper MCP and stopped registering the `mermaid`/`excalidraw` diagram wrappers by default.) A per-project toggle in the launcher's Permissions tab writes `~/.claude.json` `projects[<project>].disabledMcpServers` — the channel Claude Code honours for user-scope servers. Backed by a Weaviate knowledge graph, an AST-extracted code graph, 11 free agents, 6 skills, and 51 hooks. Gives Claude Code persistent memory, free local inference, and a place to put automation that would otherwise live in shell aliases.
 
 **vct-secrets** — zero-dependency Bash CLI (`tools/vct-secrets/vct`) for keeping API keys and tokens out of `.env` files, git history, and shell history. Handles per-project scoping, `exec`-time injection, and an append-only audit log.
 
@@ -27,7 +27,7 @@ ONE bundle engine, manifest-driven updates), see
 |---|---|
 | [01-launcher.md](01-launcher.md) | Tauri 2 + SvelteKit desktop app: projects, modules, secrets, licensing, full Tauri command enumeration (~110), hub API routes, audit, CLI |
 | [02-mcps-and-agents.md](02-mcps-and-agents.md) | Two MCP servers in `~/.claude.json` (`weaviate-kg` + `playwright` via npx, both enabled per project), per-project opt-out channel, code-embed service, KG/code-graph scripts |
-| [03-agents-skills-hooks.md](03-agents-skills-hooks.md) | 11 free agents, 6 skills, 47 hooks, composition patterns |
+| [03-agents-skills-hooks.md](03-agents-skills-hooks.md) | 11 free agents, 6 skills, 51 hooks, composition patterns |
 | [04-knowledge-and-code-graph.md](04-knowledge-and-code-graph.md) | KG node format, Weaviate collections, code graph analysis, embeddings, maintenance scripts |
 | [05-install-and-secrets.md](05-install-and-secrets.md) | Installers, container lifecycle, vct-secrets CLI, secrets architecture, infrastructure compose |
 | [06-license-and-commercial.md](06-license-and-commercial.md) | Tier model, license validator, Vault-token + LS-variant admin paths, Lemon Squeezy integration, telemetry, AGPL compliance, CLA |

@@ -1,391 +1,195 @@
 #!/usr/bin/env bash
-# Parity note (v0.2.54 Track G G-6): the .ps1 sibling now resolves its
-# child-spawn PowerShell binary via _lib/resolve-powershell.ps1 (pwsh ->
-# powershell fallback for PS 5.1-only machines). No bash-side logic
-# change is needed - bash hooks never spawn PowerShell.
-# Pre-edit context injection hook
-# Fires BEFORE Edit tool executes — injects KG + code graph context for the file being edited
-# Output goes to stdout → becomes additionalContext the LLM sees before executing the edit
+# Pre-edit context injection hook — THIN WRAPPER (v0.2.101 injection
+# redesign, PLAN-V02101 §C3). Fires BEFORE the Edit tool executes.
 #
-# Constraints:
-#   - Must complete in <3 seconds (timeout in settings.json)
-#   - Only fires for Edit (not Write — new files have less context value)
-#   - Never exit 2 (that would block the edit). Always exit 0.
-#   - If searches fail or return empty → exit 0 silently
+#   stdin → hook_context_router.py edit → emit envelope
+#
+# The ROUTER owns the query and its discipline: the OLD semantic query
+# `"<module-basename> <first 200 chars of new_string>"` is REPLACED by
+# `edit_enclosing_symbols(file_path, old_string)` → an EXACT code-graph
+# def+callers leg (structure, self-file callers excluded) + a KG leg keyed
+# on module+symbol+path topic, with the §2.1 edit-profile floors
+# (0.65 / titles-only below 0.85 / three_chunks above) applied inside
+# rl_kg_search --injection-profile, plus seen-store dedupe, the per-turn
+# budget and the RL retrieval event (task_type pre_edit_kg_search, passed
+# by the router as --task-type; the wrapper's VCO_RL_TASK_TYPE export is
+# retired with the direct producer call).
+#
+# What this wrapper still owns:
+#   * the PER-FILE REPLAY CACHE (§C3 "keep its per-file replay cache, GC"):
+#     the router's stdout is cached per edited file (TTL = the shared
+#     VCO_QUERY_CACHE_TTL window, 900 s) and a fresh hit replays through the
+#     CURRENT seen-state (vco_filter_seen_blocks) WITHOUT spawning the
+#     router at all — the v0.2.77 warm-edit win, preserved. The cache stores
+#     the router's RAW block output (pre-replay-dedup), so a /compact wipe
+#     of the seen-store re-eligibilises the blocks exactly as before.
+#     Soundness note: the router records the blocks it emitted in the
+#     seen-store, so a replay of the SAME output filters to silence — the
+#     same answer a fresh router run would give, at ~0 spawn cost.
+#   * the VCO_HOOK_TRACE diagnostic gate, the state GC sweeps and the
+#     emit_additional_context envelope.
+#
+# Constraints: never exit 2 (would block the edit); always exit 0; missing
+# venv/router → silent no-op; kill switches VCT_DISABLE_HOOKS and
+# VCO_INJECT_PROFILE=off checked BEFORE any spawn.
+# MUST MATCH pre-edit-context-inject.ps1.
 
 # Scrub sensitive env vars (this hook doesn't need credentials)
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
+# VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7). v0.2.101: the
+#   delegate is claude_mcp_servers/scripts/hook_context_router.py, which loads
+#   rl_kg_search.py / query_code_graph IN-PROCESS — both call the access-aware
+#   helpers (_kg_collections_to_search / code_graph_collections_to_query) in
+#   claude_mcp_servers/weaviate_mcp/server.py, which read VCT_KG_ACCESS_LIST +
+#   VCT_CODE_GRAPH_ACCESS_LIST. This hook does NOT query Weaviate directly.
+#   Env propagation is by subprocess inheritance (no `env -i`, no
+#   `unset VCT_KG_ACCESS_LIST`). See tests/test_kg_access_list.py for the
+#   consumer contract.
+
 # v0.2.21 Step 25b (in-session dedup investigation): opt-in `set -x`
 # trace mode. When VCO_HOOK_TRACE=1, write the full execution trace
-# to .claude/logs/preedit-trace-<session>-<ts>.log so the dedup
-# codepath can be inspected post-mortem. Off by default (the trace
-# is verbose and would clutter normal hook runs). Enable per-shell
-# via `export VCO_HOOK_TRACE=1` in the Claude Code shell that's
-# experiencing the dedup miss.
+# to a tmp log so the dedup codepath can be inspected post-mortem.
+# Off by default. Enable per-shell via `export VCO_HOOK_TRACE=1`.
 if [ "${VCO_HOOK_TRACE:-0}" = "1" ]; then
     _TRACE_FILE="${TMPDIR:-/tmp}/preedit-trace-$(date +%s%N)-$$.log"
     exec 2>>"$_TRACE_FILE"
     set -x
     echo "==== preedit hook trace start: $(date -u +%Y-%m-%dT%H:%M:%SZ) pwd=$(pwd) ====" >&2
-    # Print the trace path on stdout so the operator can find it. Note:
-    # PreToolUse hook stdout is discarded by the harness unless JSON-
-    # shaped under `hookSpecificOutput.additionalContext`. The trace
-    # path goes to stderr instead via the redirected fd 2.
     echo "[vct] preedit trace: $_TRACE_FILE" >&2
 fi
 
-# VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7).
-#   Delegates KG search to claude_mcp_servers/scripts/rl_kg_search.py and
-#   code-graph search to .claude/scripts/code-graph-query — both call the
-#   access-aware helpers (_kg_collections_to_search /
-#   code_graph_collections_to_query) in claude_mcp_servers/weaviate_mcp/
-#   server.py, which read VCT_KG_ACCESS_LIST + VCT_CODE_GRAPH_ACCESS_LIST.
-#   This hook does NOT query Weaviate directly. Env propagation is by
-#   subprocess inheritance (no `env -i`, no `unset VCT_KG_ACCESS_LIST`).
-#   See tests/test_kg_access_list.py for the consumer contract.
-
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
-# Source emit-context.sh ONLY if it exists. If the helper is missing
-# (partial install, just-after-clone before _lib/ is fully populated),
-# the conditional simply skips the source — the hook then runs without
-# `emit_additional_context` defined; the wrapper `_emit_context_json`
-# below tolerates this via `command -v`. We deliberately do NOT use
-# `|| true` after the source: a syntax error inside an existing helper
-# is a real bug we want surfaced, not silently swallowed.
 if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ]; then
     . "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# v0.2.29: prefer canonical $CLAUDE_PROJECT_DIR (the active workspace
-# the launcher hands us — source of truth for per-project hooks). Fall
-# back to SCRIPT_DIR/../.. for ad-hoc invocations (manual runs, tests)
-# that don't set the env var.
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
-# Resolve a Python interpreter portably (python3 → python → py). Must run
-# BEFORE the stdin-parsing step below — bare `python3` is missing on
-# Windows (only python.exe / py exist) and would silently fail there.
-# See audit F4 + F6.
 # shellcheck source=_lib/find-python.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
-[ -z "${PY:-}" ] && exit 0  # No Python — silent no-op (KG/codegraph injection skipped)
+[ -z "${PY:-}" ] && exit 0
 
-# v0.2.70 Stream E: unified per-session dedup. Source the shared seen-store
-# (one home for the inject-dedup that used to be inline _filter_seen here) and
-# the canonical session-id parse (so pre-edit / pre-bash / pre-tool-use / post-
-# compact all key off the SAME sanitised id). Both are sourced ONLY if present
-# (partial install tolerance) — the code below falls back to the legacy inline
-# path when the helpers are missing.
+# The replay path filters through the SHARED seen-store (one home); the
+# router reads/writes the SAME files with the SAME key format (parity-pinned
+# in tests/test_v02101_inject_gates.py).
 # shellcheck source=_lib/session-id.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
 # shellcheck source=_lib/seen-store.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
-# shellcheck source=_lib/codegraph-query.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
-# v0.2.95 (lane F10): the code-file extension test now has ONE home, shared
-# with pre-bash-context-inject.sh and _lib/route-touched-path.sh.
-# shellcheck source=_lib/code-extensions.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/code-extensions.sh" ] && . "$SCRIPT_DIR/_lib/code-extensions.sh"
-# v0.2.77 Part 9 task 2: shared TTL result-cache used by codegraph_query_block
-# (and the KG-search wrapper). Sourced only if present (partial-install
-# tolerance) — the query helpers no-op the cache gracefully when it's missing.
-# shellcheck source=_lib/query-cache.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/query-cache.sh" ] && . "$SCRIPT_DIR/_lib/query-cache.sh"
+# v0.2.101: the injection kill switch (VCO_INJECT_PROFILE=off).
+# shellcheck source=_lib/inject-budget.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/inject-budget.sh" ] && . "$SCRIPT_DIR/_lib/inject-budget.sh"
 
-# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
-# Positional args ($1/$2) are EMPTY because $CLAUDE_TOOL_NAME etc. don't
-# exist as env vars — settings.json substitutes them to "". Verified
-# empirically 2026-05-08 via stdin-capture diagnostic.
+if command -v vco_inject_profile_off >/dev/null 2>&1 && vco_inject_profile_off; then
+    exit 0
+fi
+
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec. The FULL
+# payload is forwarded to the router untouched (it resolves session_id /
+# prompt_id / transcript_path / cwd / tool_input itself — the Edit
+# old_string/new_string never travel through argv, R31 privacy discipline).
+# This parse extracts only the WRAPPER's fields: tool guard, session id and
+# the edited file path (cache key + header).
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-# Parse all fields we need in a single Python invocation (avoids re-parsing the
-# JSON 3+ times). Outputs five lines: tool_name, session_id, tool_input as JSON,
-# transcript_path, prompt_id.
-# WP-E (v0.2.92): transcript_path is a PATH ONLY — threaded to the producer's
-# --transcript flag below; the file's CONTENTS are read in-process by the
-# shared vco_lib/transcript_context.py reader there, never in this shell (R31
-# privacy discipline: thinking/output text must never reach argv, `ps`, or a
-# hook log). prompt_id scopes the query-cache key (query-cache.sh) so two
-# turns issuing the same short trigger don't collide on one cache entry when
-# their enriched text differs. MUST MATCH pre-bash-context-inject.sh's parse.
 _PARSED=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
     print(d.get('tool_name', ''))
     print(d.get('session_id', ''))
-    print(json.dumps(d.get('tool_input', {})))
-    print(d.get('transcript_path', ''))
-    print(d.get('prompt_id', ''))
+    print((d.get('tool_input') or {}).get('file_path', ''))
 except Exception:
     print('')
     print('')
-    print('{}')
     print('')
-    print('')
-" 2>/dev/null || printf '\n\n{}\n\n\n')
+" 2>/dev/null || printf '\n\n\n')
 TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '1p')
 SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
-TOOL_ARGS=$(printf '%s' "$_PARSED" | sed -n '3p')
-TRANSCRIPT_PATH=$(printf '%s' "$_PARSED" | sed -n '4p')
-PROMPT_ID=$(printf '%s' "$_PARSED" | sed -n '5p')
+FILE_PATH=$(printf '%s' "$_PARSED" | sed -n '3p')
 
-# Only fire for Edit tool
+# Only fire for Edit tool (the Write surface has its own wrapper:
+# pre-write-context-inject.sh)
 if [[ "$TOOL_NAME" != "Edit" ]]; then
     exit 0
 fi
+[[ -z "$FILE_PATH" ]] && exit 0
 
-# session_id from stdin JSON is the canonical per-conversation key.
-# v0.2.70 Stream E: route through the shared vco_hook_session_id so the
-# parse+sanitise is identical across pre-edit / pre-bash / pre-tool-use /
-# post-compact (was 3 divergent fallback policies). The helper returns the
-# sanitised id, "default" for a hostile id, or "" for a missing/malformed
-# payload. The seen-store treats BOTH ""/"default" as inject-blind (no shared
-# bucket); the cache/export uses below keep the legacy "default" fallback since
-# they are not cross-session-bleed sensitive (cache is also file-hash keyed).
+# v0.2.70 Stream E: canonical session id. SESSION_ID_RAW keeps the
+# trustworthy-vs-untrustworthy distinction for the seen-store replay filter
+# ("" / "default" → inject blind, no shared bucket).
 if command -v vco_hook_session_id >/dev/null 2>&1; then
     SESSION_ID="$(vco_hook_session_id "$HOOK_STDIN")"
 fi
-# Preserve the dedup-relevant value BEFORE the "default" coercion so the
-# seen-store can distinguish "trustworthy id" from "fall back to default".
 SESSION_ID_RAW="$SESSION_ID"
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 
 # V52-J Edit 4 (2026-06-09): export VCT_SESSION_ID so child processes
-# (notably the rl_kg_search.py subprocess spawned below) inherit it.
-# Claude Code does NOT propagate CLAUDE_SESSION_ID to hook/MCP
-# subprocesses, but the session_id IS available in the hook's stdin
-# JSON. The canonical telemetry emit path
-# (claude_mcp_servers/rl_client/telemetry_emit.py::resolve_session_id)
-# reads VCT_SESSION_ID as layer-2 of its 3-layer chain. Without this
-# export, every CLI-emitted retrieval event from a hook-triggered
-# search would have session_id="" — which is exactly the v0.2.51
-# bug rl-logging-audit-report-2026-05-23 finding #2 pinned at 99.6%.
-# Skip the "default" sentinel — we'd rather have empty than fake-key.
+# inherit the session attribution (the router's KG leg reads it as layer-2
+# of the telemetry 3-layer chain — the export discipline of WP-D 1).
+# Skip the "default" sentinel — rather empty than a fake-key cohort.
 if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "default" ]; then
     export VCT_SESSION_ID="$SESSION_ID"
 fi
-CACHE_BASE="$PROJECT_ROOT/.claude/state/edit_cache_${SESSION_ID}"
-mkdir -p "$CACHE_BASE" 2>/dev/null || true
+
+# === Per-file replay cache (v0.2.101: stores the ROUTER's raw output) ======
+CACHE_DIR="$PROJECT_ROOT/.claude/state/edit_cache_${SESSION_ID}"
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
 # v0.2.29 GC: prune per-session edit_cache_* directories older than 14 days.
-# `find -mtime +14` is portable across GNU/BSD find. Best-effort — failure
-# ignored. Keeps .claude/state/ bounded across heavy use.
-# HK-4 (v0.2.75) accepted-scatter: GC is intentionally per-hook (4 sites), not
-# a shared sweeper. Thresholds are now UNIFORM (14d here + the reads/snapshot
-# sweeps; bash_task_* is a deliberate 1d), so consolidation is OPTIONAL and
-# deliberately SKIPPED — a shared sweeper would add a sourcing dependency and
-# break the single-file-hook discipline. Each hook GCs its own state files.
+# HK-4 (v0.2.75) accepted-scatter: GC is intentionally per-hook (4 sites),
+# not a shared sweeper — a shared sweeper would add a sourcing dependency
+# and break the single-file-hook discipline. Each hook GCs its own state.
 find "$PROJECT_ROOT/.claude/state" -maxdepth 1 -type d -name "edit_cache_*" -mtime +14 -exec rm -rf {} + 2>/dev/null || true
-# P3 (v0.2.91): the per-file replay-cache TTL is ALIGNED with the shared
-# cross-surface result cache (_lib/query-cache.sh, 900 s). Pre-v0.2.91 this was
-# a hardcoded 600 s while the query cache used 900 s, so an edit landing in the
-# 600–900 s window was a DOUBLE MISS: the per-file cache expired → the hook paid
-# a fresh CPython start to launch the producers → which then served the SAME
-# blob back out of the still-fresh shared query cache. Same content, ~1.4 s of
-# interpreter tax for nothing. One home for the value: the shared default plus
-# the same VCO_QUERY_CACHE_TTL override, with a literal fallback for a partial
-# install where _lib/query-cache.sh was not sourced.
-# Staleness note: a replay can now be up to 5 min older — the SAME staleness
-# class the 900 s cache already accepts on every other surface, and dedup still
-# applies CURRENT seen-state on replay (the cache stores raw pre-dedup blocks).
+# P3 (v0.2.91): TTL aligned with the shared query cache (900 s default,
+# VCO_QUERY_CACHE_TTL override) — the router's own kgi/cgi cache uses the
+# same window, so the replay cache never outlives the semantics it replays.
+# The _VCO_QUERY_CACHE_TTL_DEFAULT middle rung stays in the expression for
+# alignment with _lib/query-cache.sh should a caller ever source it; unset,
+# it expands to empty and the literal 900 governs (same value as the
+# router's default window).
 CACHE_TTL="${VCO_QUERY_CACHE_TTL:-${_VCO_QUERY_CACHE_TTL_DEFAULT:-900}}"
 case "$CACHE_TTL" in ''|*[!0-9]*) CACHE_TTL=900 ;; esac
 [ "$CACHE_TTL" -gt 0 ] 2>/dev/null || CACHE_TTL=900
 
-# === Dedup tracking: skip KG/codegraph nodes already injected this session ===
-# State lives in the project directory (not /tmp/) so it survives reboots and
-# is co-located with the session's other ephemeral state. The .claude/state/
-# directory is gitignored (line 104 of the orchestrator's .gitignore), so no
-# project-tree noise in git status / IDE file trees. Wiped by the PostCompact
-# hook when the LLM's context is trimmed (so the dedup window matches the
-# actual context window the LLM sees). v0.2.29 GC prunes ≥14d-old session
-# files so the directory stays bounded across heavy use.
+# Seen-store GC sweeps (14d) — the stores themselves are the router's and
+# the shell libs' shared property; the sweeps historically live here.
 SEEN_DIR="$PROJECT_ROOT/.claude/state"
 mkdir -p "$SEEN_DIR" 2>/dev/null
-# v0.2.70 Stream E: unified per-session stores via _lib/seen-store.sh.
-#   SEEN_INJECT_FILE — the inject-dedup store (per-chunk KG / per-entity CODE).
-#   SEEN_READS_FILE  — the explicit-Read ledger pre-tool-use writes; consulted
-#                      here so a source the model already Read isn't re-injected.
-# When the session id is untrustworthy ("" / "default"), the helper returns an
-# EMPTY path → vco_filter_seen_blocks then dedups NOTHING (inject blind) rather
-# than write a cross-session-bleeding shared bucket.
-SEEN_INJECT_FILE=""
-SEEN_READS_FILE=""
-if command -v vco_seen_store_path >/dev/null 2>&1; then
-    # Use the RAW (pre-"default"-coercion) id so a missing/hostile id resolves
-    # to an EMPTY path → inject blind, never a shared "default" bucket.
-    SEEN_INJECT_FILE="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-    SEEN_READS_FILE="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-fi
-# Back-compat: when the helper is absent (partial install) fall back to the
-# legacy single inject store so dedup still works on the legacy code path.
-SEEN_NODES_FILE="${SEEN_INJECT_FILE:-$SEEN_DIR/seen_inject_${SESSION_ID}.txt}"
-# v0.2.29 GC: prune session files older than 14 days. `find -mtime +14`
-# is portable across GNU/BSD find. Best-effort — failure ignored. Cover both
-# the new (seen_inject_*) and the legacy (seen_kg_titles_*) names so old files
-# from a pre-v0.2.70 session still age out.
 find "$SEEN_DIR" -maxdepth 1 -type f -name "seen_inject_*.txt" -mtime +14 -delete 2>/dev/null || true
 find "$SEEN_DIR" -maxdepth 1 -type f -name "seen_kg_titles_*.txt" -mtime +14 -delete 2>/dev/null || true
 
-# === Extract fields from TOOL_ARGS JSON ===
-_extract_field() {
-    local field="$1"
-    [ -z "${PY:-}" ] && { echo ""; return; }
-    "$PY" -c "
-import sys, json
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('$field', ''))
-except Exception:
-    print('')
-" <<< "$TOOL_ARGS" 2>/dev/null || echo ""
-}
-
-FILE_PATH=$(_extract_field "file_path")
-NEW_STRING=$(_extract_field "new_string")
-
-# Need at least a file path to proceed
-if [[ -z "$FILE_PATH" ]]; then
-    exit 0
+SEEN_INJECT_FILE=""
+SEEN_READS_FILE=""
+if command -v vco_seen_store_path >/dev/null 2>&1; then
+    SEEN_INJECT_FILE="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+    SEEN_READS_FILE="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
 fi
 
-# === Build cache key from file path ===
-# Use Python's hashlib for portability — `md5sum` is GNU-only and absent
-# on macOS (which has `md5 -q` instead) and minimal Linux installs.
-# Without this, every Mac install would compute an empty FILE_HASH and
-# every file would share the same cache key, corrupting the per-file
-# cache. Falls back to a sanitized FILE_PATH if Python is unavailable
-# (degrades to "no caching across paths" but stays correct).
+# === Cache key from the file path (md5; portable fallback) ===
 if [ -n "${PY:-}" ]; then
     FILE_HASH=$(printf '%s' "$FILE_PATH" | "$PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" 2>/dev/null)
 fi
 if [ -z "${FILE_HASH:-}" ]; then
-    # Sanitize path → safe filename (no slashes). Last-resort fallback.
     FILE_HASH=$(printf '%s' "$FILE_PATH" | tr '/' '_' | tr ' ' '_' | head -c 100)
 fi
-CACHE_DIR="$CACHE_BASE"
 CACHE_FILE="$CACHE_DIR/$FILE_HASH"
-
-mkdir -p "$CACHE_DIR" 2>/dev/null || true
-
-# BASENAME is needed by the cache-replay branch below (v0.2.77 Part 9 task 1),
-# which now runs BEFORE the live search + query build. Compute it up here.
 BASENAME=$(basename "$FILE_PATH")
 
 # === Helper: emit context as PreToolUse JSON envelope ===
-# Wraps emit_additional_context from _lib/emit-context.sh — the helper
-# also gates on whitespace-only content so we don't surface empty
-# system-reminder blocks when dedup suppresses every result. Pre-2026-05-08
-# this hook printed plain stdout that never reached the LLM context, so
-# all the KG/codegraph injection work was effectively dead. Confirmed by
-# checking that no `[Pre-edit context for ...]` system-reminders ever
-# appeared in real Edit-tool transcripts.
 _emit_context_json() {
-    # If the helper sourced (normal case), delegate. If it didn't (the
-    # `_lib/emit-context.sh` file was missing at hook startup), fall
-    # back to a silent no-op rather than crashing on an undefined
-    # function under `set -e` / `set -u` discipline. The hook's other
-    # work (dedup state, cache write) remains valid.
     if command -v emit_additional_context >/dev/null 2>&1; then
         emit_additional_context "$1" PreToolUse
     fi
 }
 
-# === Dedup: filter out nodes already injected this session ===
-# (v0.2.77 Part 9 task 1) These functions are DEFINED HERE — before the cache
-# read + replay branch below — so a cache HIT can be served WITHOUT launching
-# the two live searches. Pre-v0.2.77 the functions were defined after the
-# searches, forcing the replay branch to sit after a `wait` on both searches:
-# a "warm" edit paid the full ~1.4 s search cost and then threw the fresh
-# results away. Moving the defs + replay up makes a hit ~80 ms (dedup + emit).
-#
-# The KG/codegraph result blocks emitted by rl_kg_search.py and
-# query_code_graph have the shape:
-#
-#   KG: <title> | <type> | score=<n.nn> | <body...>
-#   <body line 1>
-#   <body line 2>
-#   ...
-#   (blank line separates blocks)
-#
-# v0.2.70 Stream E: dedup is now the shared _lib/seen-store.sh helper
-# (vco_filter_seen_blocks), keyed PER-CHUNK for KG ("<title>#<sha1(body)>" so a
-# NEW chunk of a seen node still injects) and PER-ENTITY for CODE, and it ALSO
-# suppresses a block whose source path the model already Read explicitly
-# (reads-ledger). _filter_seen is now a thin delegator: it calls the shared
-# helper when present, and falls back to the legacy title-keyed inline logic
-# only on a partial install where _lib/seen-store.sh is missing.
-_filter_seen() {
-    local input="$1"
-    if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
-        vco_filter_seen_blocks "$input" "$SEEN_INJECT_FILE" "$SEEN_READS_FILE"
-        return 0
-    fi
-    _filter_seen_legacy "$input"
-}
-
-# Legacy fallback (pre-v0.2.70): title-coarse dedup against a single store, no
-# reads-ledger consult. Kept only for the missing-helper case so a partial
-# install still dedups (just coarser). Bash-3.2 safe (no assoc arrays).
-_filter_seen_legacy() {
-    local input="$1"
-    local filtered=""
-    touch "$SEEN_NODES_FILE"
-
-    local current_title=""
-    local current_block=""
-    local current_skip=0
-
-    _flush_block() {
-        if [ -n "$current_title" ] && [ "$current_skip" = "0" ] \
-            && ! grep -Fxq -- "$current_title" "$SEEN_NODES_FILE"; then
-            filtered="${filtered}${current_block}"
-            echo "$current_title" >> "$SEEN_NODES_FILE"
-        fi
-        current_title=""
-        current_block=""
-        current_skip=0
-    }
-
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^(KG|CODE):\ (.+)$ ]]; then
-            _flush_block
-            local rest="${BASH_REMATCH[2]}"
-            rest="${rest#KG: }"
-            rest="${rest#CODE: }"
-            current_title="${rest%% | *}"
-            current_title="${current_title:0:200}"
-            current_block="${line}"$'\n'
-            if grep -Fxq -- "$current_title" "$SEEN_NODES_FILE"; then
-                current_skip=1
-            fi
-        elif [ -n "$current_title" ]; then
-            current_block="${current_block}${line}"$'\n'
-        else
-            if [[ "$line" =~ [^[:space:]] ]]; then
-                filtered="${filtered}${line}"$'\n'
-            fi
-        fi
-    done <<< "$input"
-    _flush_block
-
-    echo "$filtered"
-}
-
 # === Cache hit/miss observability (v0.2.77 Part 9 task 1) ===
-# Append a single-line JSON record so the once-dead cache can be verified in
-# the field. Bounded via find-mtime GC of the log alongside the other state
-# GC below. Best-effort; never blocks the edit.
 _cache_log() {
-    # $1 = hit|miss ; write to a per-project state file, capped by rotation.
     local _status="$1"
     local _log="$PROJECT_ROOT/.claude/state/preedit_cache_log.jsonl"
     local _ts
     _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')"
-    # Size guard: rotate at ~256 KB (data preserved in .1 sibling), so the log
-    # never grows unbounded. Rotation keeps the previous window — not a drop.
     if [ -f "$_log" ]; then
         local _sz
         _sz=$(wc -c < "$_log" 2>/dev/null || echo 0)
@@ -397,15 +201,8 @@ _cache_log() {
         "$_ts" "$_status" "$SESSION_ID" >> "$_log" 2>/dev/null || true
 }
 
-# === Check cache (10 min TTL) ===
-# Cross-OS mtime: `stat -c %Y` is GNU coreutils (Linux); `stat -f %m` is BSD
-# (macOS). Try GNU first, fall back to BSD; final fallback is Python
-# (find-python.sh has already resolved $PY). Without this, every macOS
-# install treats the cache as expired. See audit finding F4.
-#
-# Cache stores RAW per-result blocks (with KG:/CODE: headers) so dedup can
-# still apply on replay against the latest seen-list. The replay branch is
-# RIGHT BELOW — before any search launches — so a hit never pays for a query.
+# === Cache replay (BEFORE any router spawn) ===
+# Cross-OS mtime: GNU `stat -c %Y` first, BSD `stat -f %m`, Python fallback.
 CACHE_HIT=0
 CACHE_BLOB=""
 if [[ -f "$CACHE_FILE" ]]; then
@@ -423,254 +220,62 @@ if [[ -f "$CACHE_FILE" ]]; then
     fi
 fi
 
-# === Cache replay (BEFORE any live search) ===
-# If we have a fresh cache hit, dedup the cached blob against the current
-# seen-list and emit — WITHOUT launching rl_kg_search.py / code-graph-query.
-# If everything in the cache is already seen, exit silently. The cache stores
-# RAW per-result blocks (KG:/CODE: headers) so dedup state stays accurate
-# across replays (a node seen since the cache was written gets filtered out
-# here, rather than being baked into the cache and perma-suppressed after a
-# /compact wipe).
-#
-# History: the cache layer was ported to .sh in PR-38 (v0.2.12) but the replay
-# branch was positioned AFTER the search launch+wait, so it never saved the
-# search cost (audit 2026-07-11: warm 1431 ms ≈ cold 1440 ms). v0.2.77 Part 9
-# moves it here so a warm edit is served from cache in ~80 ms.
 if [[ "$CACHE_HIT" == "1" ]]; then
     _cache_log hit
-    FILTERED_CACHE=$(_filter_seen "$CACHE_BLOB")
-    # Whitespace-only filtered output → everything was already seen; silent exit.
-    case "$FILTERED_CACHE" in
-        *[![:space:]]*)
-            REPLAY_OUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'"${FILTERED_CACHE}"
-            _emit_context_json "$REPLAY_OUT"
-            exit 0
-            ;;
-        *)
-            exit 0
-            ;;
-    esac
+    # Replay through the CURRENT seen-state. The router recorded the blocks
+    # it emitted on the miss run, so a same-session replay filters to
+    # silence — the same answer a fresh router run gives, with no spawn.
+    # After a /compact seen-store wipe the blocks re-eligibilise (the cache
+    # stores RAW pre-dedup output — the v0.2.77 invariant). A missing
+    # seen-store helper (partial install) SKIPS the replay and falls
+    # through to a live router run rather than replaying undeduped.
+    if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
+        FILTERED_CACHE=$(vco_filter_seen_blocks "$CACHE_BLOB" "$SEEN_INJECT_FILE" "$SEEN_READS_FILE")
+        case "$FILTERED_CACHE" in
+            *[![:space:]]*)
+                REPLAY_OUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'"${FILTERED_CACHE}"
+                _emit_context_json "$REPLAY_OUT"
+                exit 0
+                ;;
+            *)
+                exit 0
+                ;;
+        esac
+    fi
 fi
 _cache_log miss
 
-# === Code-graph identity: ALWAYS the calling project (v0.2.100 W5R-03) ===
-# No --project override, ever. The CLI resolves the CALLING project
-# (CLAUDE_PROJECT_DIR -> hub binding prefix, which also holds its extra paths)
-# and fans out over that project's own VCT_CODE_GRAPH_ACCESS_LIST grants. The
-# old detect-project.sh sibling-by-folder-name heuristic searched a neighbour
-# folder's code graph with no grant (cross-tenant leak) and skipped the
-# project's own prefix for files under its extra paths. A file in a GRANTED
-# peer is still covered: the grant puts that peer in the fan-out.
-# MUST MATCH pre-edit-context-inject.ps1.
-CODE_GRAPH_PROJECT_ARG=""
-
-# === Build search query ===
-# BASENAME already computed above (needed by the cache-replay branch).
-MODULE_NAME="${BASENAME%.*}"  # strip extension (e.g. retrieval_rl.py → retrieval_rl)
-
-# First 200 chars of new_string as semantic signal
-NEW_STRING_SNIPPET="${NEW_STRING:0:200}"
-
-QUERY="$MODULE_NAME $NEW_STRING_SNIPPET"
-
-# === Run searches in parallel to stay within 5s timeout ===
-KG_TMP=$(mktemp)
-CODE_TMP=$(mktemp)
-# v0.2.46 post-adversarial: source shared resolver. The previous inline
-# logic fell back to $PROJECT_ROOT/.venv when $VCT_INSTALL_ROOT was unset
-# — that's the USER's project venv, which won't have weaviate-client +
-# vco_lib, so the KG search subprocess would crash with ImportError. The
-# shared helper enforces the canonical precedence and refuses to silently
-# activate the user's venv. (PR-25 / v0.2.12 dual-layout history preserved
-# in the helper's docstring.)
-# Final fallback: if no venv resolved, the rl_kg_search subprocess below
-# will short-circuit (writes empty KG_TMP) and the hook still exits 0
-# without blocking the edit. Don't hard-fail.
+# === Resolve venv + the router (orchestrator-root script, F3 discipline) ===
 # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
 . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
 resolve_vco_venv_python "$SCRIPT_DIR"
 VENV="${VCO_VENV_PYTHON:-}"
-# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root — locate it
-# there (same roots as the venv above), never under $PROJECT_ROOT. It still
-# runs with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's
-# KG + shared + granted collections apply (see resolve_vco_orchestrator_script).
-resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/rl_kg_search.py"
-# Unresolved -> the legacy (absent) project path, so every existence check
-# below reads "not installed" exactly as before.
-RL_SCRIPT="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py}"
-# Pin the CALLING project's identity for the producer (a no-op whenever the
-# harness already set it): the script lives in the orchestrator root, so its
-# own location must never be what names the project.
-export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
-# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
-# (rl_kg_search.py reads it; MUST MATCH the .ps1 sibling).
-export VCO_RL_TASK_TYPE="pre_edit_kg_search"
-
-# KG search with RL reranking — same pipeline as weaviate MCP (Weaviate → RL server → top-k)
-# Falls back to raw Weaviate order if RL server is unreachable.
-# Returns score field; if score >= 0.6 we provide full node content below.
-# v0.2.21 audit fix: pass --hook-format so each result is prefixed with
-# "KG: <title>" and the dedup logic below (_filter_seen) recognises it.
-# Pre-fix the hook captured untagged human output, so _filter_seen could
-# never dedup KG injections across Edits within a session.
-# v0.2.77 Part 9 task 2: route through the shared TTL result-cache wrapper so a
-# repeat query (this file re-edited, or the same module queried elsewhere) is
-# served from disk (~ms) instead of re-paying the ~1.3 s round-trip. Falls back
-# to the direct call when the cache helper is absent (partial install).
-# Code graph search — only for code files (not markdown, yaml, etc.)
-# Uses auto-detected project so edits in sibling repos query the right collections.
-# v0.2.95 (lane F10): "is this a code file" is ONE decision with ONE home,
-# _lib/code-extensions.sh. v0.2.70 Stream C kept it as a C-tier mirror here,
-# in pre-tool-use.sh and in post-file-edit.sh with a "MUST MATCH" comment;
-# a second consumer (the Bash-write routing) made that untenable, so the
-# alternation moved to the helper and this reads it.
-# A partial install without the helper is treated as NOT-code: skipping the
-# code-graph leg costs one un-enriched edit, while an empty regex would
-# match EVERY path.
-# (v0.2.91 P2: the decision stays ABOVE the search launch so the merged
-# single-interpreter path knows up-front whether the code-graph leg is wanted.)
-IS_CODE=0
-if command -v vco_is_code_file >/dev/null 2>&1 && vco_is_code_file "$FILE_PATH"; then
-    IS_CODE=1
-fi
-
-# === P2 (v0.2.91): ONE interpreter for both searches =========================
-# Pre-P2 this launched TWO background subprocesses — two full CPython starts,
-# each paying ~1.0 s of interpreter + `import weaviate` + client-connect for
-# ~60 ms of actual retrieval work (2026-08-27 perf audit: 1.50 s miss, 3 ms
-# Weaviate + 58 ms embed). The shared wrapper runs whichever legs MISSED their
-# (unchanged, per-leg) cache in a single process: same queries, same argv, same
-# per-leg output caps, byte-identical blocks. It returns non-zero ONLY to ask
-# for the legacy path (driver absent on a partial install, no venv, or a driver
-# that produced no framing) — never as an error.
-DUAL_DONE=0
-if command -v vco_dual_search_cached >/dev/null 2>&1; then
-    _DUAL_CG_OUT=""
-    [[ "$IS_CODE" == "1" ]] && _DUAL_CG_OUT="$CODE_TMP"
-    # WP-E (v0.2.92): prompt_id ($11) scopes the cache key; transcript_path
-    # ($12) threads to BOTH legs' --transcript flag inside the driver.
-    if vco_dual_search_cached \
-        "$KG_TMP" "$_DUAL_CG_OUT" "$VENV" \
-        "$RL_SCRIPT" \
-        "$QUERY" 1 "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH" \
-        "$PROMPT_ID" "$TRANSCRIPT_PATH"; then
-        DUAL_DONE=1
-    fi
-fi
-
-if [[ "$DUAL_DONE" == "0" ]]; then
-    # --- Legacy two-process path (unchanged) -------------------------------
-    # KG search with RL reranking — same pipeline as weaviate MCP.
-    # WP-E (v0.2.92): prompt_id/transcript_path as $5/$6 — same rationale as
-    # the dual-search leg above.
-    if command -v vco_kg_search_cached >/dev/null 2>&1; then
-        ( vco_kg_search_cached "$VENV" "$RL_SCRIPT" "$QUERY" 1 "$PROMPT_ID" "$TRANSCRIPT_PATH" > "$KG_TMP" 2>/dev/null ) &
-        KG_PID=$!
-    elif [ -n "$TRANSCRIPT_PATH" ]; then
-        ("$VENV" "$RL_SCRIPT" "$QUERY" --limit 1 --hook-format --transcript "$TRANSCRIPT_PATH" 2>/dev/null \
-            | head -40 > "$KG_TMP") &
-        KG_PID=$!
-    else
-        ("$VENV" "$RL_SCRIPT" "$QUERY" --limit 1 --hook-format 2>/dev/null \
-            | head -40 > "$KG_TMP") &
-        KG_PID=$!
-    fi
-
-    if [[ "$IS_CODE" == "1" ]]; then
-        # v0.2.70 Stream C: route the codegraph query through the shared
-        # _lib/codegraph-query.sh helper (one home; pre-bash + pre-tool-use
-        # Read/Grep use the SAME function) when present. The helper soft-fails to
-        # empty when code-graph-query is absent. Falls back to the legacy inline
-        # call only on a partial install. --hook-format gives
-        # "CODE: <full_name> | ..." headers the seen-store recognises. Empty
-        # result → "CODE: no-results | ..." sentinel.
-        # v0.2.72 P2: pass the edited file as --anchor (5th arg) so the CLI's
-        # shared retrieval pipeline biases the rerank toward call-linked /
-        # same-module / shared-type code relative to the file being edited.
-        if command -v codegraph_query_block >/dev/null 2>&1; then
-            ( codegraph_query_block "$QUERY" "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH" "$PROMPT_ID" "$TRANSCRIPT_PATH" > "$CODE_TMP" 2>/dev/null ) &
-            CODE_PID=$!
-        else
-            ("$PROJECT_ROOT/.claude/scripts/code-graph-query" search "$QUERY" $CODE_GRAPH_PROJECT_ARG --limit 2 --hook-format --anchor "$FILE_PATH" 2>/dev/null \
-                | grep -v "$FILE_PATH" | head -20 > "$CODE_TMP") &
-            CODE_PID=$!
-        fi
-    fi
-
-    # Wait for searches (5s budget, leave 0.5s for formatting + output).
-    # NOTE (audit F7, P3): Git Bash on Windows occasionally hangs on this
-    # `wait <pid>` pattern due to signal-handling differences vs upstream bash.
-    # If you hit this, set VCT_DISABLE_HOOKS=1 in your shell to opt out — the
-    # only feature lost is the pre-edit context cache (a search-speed
-    # optimisation, not correctness).
-    wait "$KG_PID" 2>/dev/null || true
-    if [[ "$IS_CODE" == "1" ]]; then
-        wait "$CODE_PID" 2>/dev/null || true
-    fi
-fi
-
-KG_RESULT=$(cat "$KG_TMP" 2>/dev/null || true)
-CODE_RESULT=""
-if [[ "$IS_CODE" == "1" ]]; then
-    CODE_RESULT=$(cat "$CODE_TMP" 2>/dev/null || true)
-fi
-
-rm -f "$KG_TMP" "$CODE_TMP"
-
-# === Dedup: filter out nodes already injected this session ===
-# _filter_seen / _filter_seen_legacy are DEFINED EARLIER (before the cache
-# read + replay branch — v0.2.77 Part 9 task 1) so a cache hit can replay
-# without launching the searches. The MISS path continues here to dedup the
-# freshly-produced KG_RESULT / CODE_RESULT.
-
-# Capture raw producer output (pre-dedup) for the cache. Caching post-dedup
-# would perma-suppress titles seen at write-time but eligible to re-appear
-# after a /compact wipe.
-KG_RAW="$KG_RESULT"
-CODE_RAW="$CODE_RESULT"
-
-if [[ -n "$KG_RESULT" ]]; then
-    KG_RESULT=$(_filter_seen "$KG_RESULT")
-fi
-if [[ -n "$CODE_RESULT" ]]; then
-    CODE_RESULT=$(_filter_seen "$CODE_RESULT")
-fi
-
-# === Only output if we found something after dedup ===
-HAS_KG=$([[ -n "$KG_RESULT" ]] && echo "1" || echo "0")
-HAS_CODE=$([[ -n "$CODE_RESULT" ]] && echo "1" || echo "0")
-
-if [[ "$HAS_KG" == "0" ]] && [[ "$HAS_CODE" == "0" ]]; then
-    # Still cache raw (pre-dedup) results so a later edit of the same file
-    # within the TTL window can replay them through current dedup state.
-    RAW_CACHE=""
-    [[ -n "$KG_RAW" ]] && RAW_CACHE+="${KG_RAW}"$'\n'
-    [[ -n "$CODE_RAW" ]] && RAW_CACHE+="${CODE_RAW}"$'\n'
-    [[ -n "$RAW_CACHE" ]] && echo "$RAW_CACHE" > "$CACHE_FILE" 2>/dev/null || true
+if [ -z "$VENV" ] || [ ! -f "$VENV" ]; then
     exit 0
 fi
-
-# === Format output ===
-# Per-result headers already carry "KG: " / "CODE: " prefixes from the
-# producers (--hook-format). Don't add an extra block-level label.
-OUTPUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'
-
-if [[ "$HAS_KG" == "1" ]]; then
-    OUTPUT+="${KG_RESULT}"$'\n'
+resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/hook_context_router.py"
+ROUTER="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/hook_context_router.py}"
+if [ ! -f "$ROUTER" ]; then
+    exit 0
 fi
+# Pin the CALLING project's identity for the router + producers.
+export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
 
-if [[ "$HAS_CODE" == "1" ]]; then
-    OUTPUT+="${CODE_RESULT}"$'\n'
-fi
+# === Run the router (single interpreter for both legs; inner budget
+# VCO_INJECT_BUDGET_S). The router applies gates + dedupe + budget and
+# emits the final blocks (or nothing). ===
+INJECT=$(printf '%s' "$HOOK_STDIN" | "$VENV" "$ROUTER" edit 2>/dev/null || true)
 
-# === Cache RAW per-result blocks (pre-dedup) so replays apply current
-# dedup state. Caching post-dedup output would perma-suppress titles
-# legitimately re-eligible after a /compact wipe.
-RAW_CACHE=""
-[[ -n "$KG_RAW" ]] && RAW_CACHE+="${KG_RAW}"$'\n'
-[[ -n "$CODE_RAW" ]] && RAW_CACHE+="${CODE_RAW}"$'\n'
-[[ -n "$RAW_CACHE" ]] && echo "$RAW_CACHE" > "$CACHE_FILE" 2>/dev/null || true
-
-_emit_context_json "$OUTPUT"
+# === Only output if we found something ===
+case "$INJECT" in
+    *[![:space:]]*)
+        # Cache the RAW router output (pre-replay-dedup) so a later edit of
+        # the same file within the TTL replays through CURRENT seen state.
+        # §9 discipline: an EMPTY result is never cached.
+        printf '%s\n' "$INJECT" > "$CACHE_FILE" 2>/dev/null || true
+        OUTPUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'"${INJECT}"
+        _emit_context_json "$OUTPUT"
+        ;;
+esac
 
 exit 0

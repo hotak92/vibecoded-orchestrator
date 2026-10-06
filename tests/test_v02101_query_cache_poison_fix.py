@@ -4,7 +4,7 @@
 an empty or timed-out result.
 
 RED on the base tree: today `vco_query_cache_put` stores empty blobs and
-`codegraph_query_block` caches the output of a killed CLI (probe evidence:
+the (since-retired) `codegraph_query_block` cached a killed CLI's output (probe evidence:
 a 0-byte entry served a fast EMPTY hit for 900 s after a `timeout 4` kill —
 reviews/V02101-INJECTION-KICKOFF-PROBES-2026-10-05.md, Cause 1b).
 
@@ -29,7 +29,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_DIR = REPO_ROOT / "templates" / "hooks" / "_lib"
 QC_SH = LIB_DIR / "query-cache.sh"
 QC_PS1 = LIB_DIR / "query-cache.ps1"
-CG_SH = LIB_DIR / "codegraph-query.sh"
 
 
 def _has_bash() -> bool:
@@ -46,7 +45,6 @@ def _run(snippet: str, tmp_path: Path, project_root: Path | None = None) -> subp
         f'export PY="{py}"\n'
         f'export PROJECT_ROOT="{root}"\n'
         f'. "{QC_SH}"\n'
-        f'. "{CG_SH}"\n'
         f"{snippet}\n"
     )
     return subprocess.run(
@@ -97,48 +95,6 @@ def test_empty_cache_entry_is_a_miss_and_self_heals(tmp_path: Path) -> None:
     assert "REMOVED" in r.stdout, r.stdout
 
 
-def test_codegraph_query_block_empty_cli_result_not_cached(tmp_path: Path) -> None:
-    """Probe Cause 1b: the CLI returns nothing (killed / no hits) — no cache
-    entry may be written, so the NEXT identical query retries live."""
-    proj = tmp_path / "proj"
-    (proj / ".claude" / "state").mkdir(parents=True)
-    marker = tmp_path / "cli_calls"
-    _make_stub_cli(proj, f'printf x >> "{marker}"\nexit 0\n')
-    r = _run(
-        'codegraph_query_block "emptyq" "" 2 "" "emptyq" >/dev/null\n'
-        'codegraph_query_block "emptyq" "" 2 "" "emptyq" >/dev/null\n'
-        'D="$(vco_query_cache_dir)"\n'
-        'ls "$D" | wc -l',
-        tmp_path, proj,
-    )
-    assert r.returncode == 0, r.stderr
-    calls = marker.read_text("utf-8") if marker.exists() else ""
-    assert len(calls) == 2, (
-        f"an EMPTY result must NOT be cached; the CLI must run again "
-        f"(ran {len(calls)} times, expected 2)")
-    assert r.stdout.strip().splitlines()[-1] == "0", "no cache entries may exist"
-
-
-def test_codegraph_query_block_failed_cli_not_cached(tmp_path: Path) -> None:
-    """A timed-out/killed leg (exit 124) or an errored leg (exit 1) may have
-    emitted PARTIAL output — it must never reach the cache."""
-    proj = tmp_path / "proj"
-    (proj / ".claude" / "state").mkdir(parents=True)
-    _make_stub_cli(
-        proj,
-        'echo "CODE: partial.fn | CodeFunction | distance=0.1"\nexit 124\n',
-    )
-    r = _run(
-        'codegraph_query_block "partialq" "" 2 "" "partialq" >/dev/null\n'
-        'D="$(vco_query_cache_dir)"\n'
-        'ls "$D" | wc -l',
-        tmp_path, proj,
-    )
-    assert r.returncode == 0, r.stderr
-    assert r.stdout.strip().splitlines()[-1] == "0", (
-        "a non-zero CLI exit (timeout/kill) must not poison the cache key")
-
-
 # --- LEAVE-ALONE: the non-empty contract is unchanged ------------------------
 
 
@@ -152,28 +108,6 @@ def test_nonempty_roundtrip_unchanged(tmp_path: Path) -> None:
     )
     assert r.returncode == 0, r.stderr
     assert f"HIT[{blob}]" in r.stdout, r.stdout
-
-
-def test_nonempty_hit_still_serves_once(tmp_path: Path) -> None:
-    """The load-bearing latency win is untouched: a genuine non-empty result
-    is cached and the second identical call does NOT re-launch the CLI."""
-    proj = tmp_path / "proj"
-    (proj / ".claude" / "state").mkdir(parents=True)
-    marker = tmp_path / "cli_calls"
-    _make_stub_cli(
-        proj,
-        f'printf x >> "{marker}"\n'
-        'echo "CODE: sample.func | CodeFunction | distance=0.20 | src=src/x.py"\n',
-    )
-    r = _run(
-        'codegraph_query_block "sample.func" "" 2 "" "sample.func" >/dev/null\n'
-        'codegraph_query_block "sample.func" "" 2 "" "sample.func" >/dev/null\n'
-        'echo done',
-        tmp_path, proj,
-    )
-    assert r.returncode == 0, r.stderr
-    calls = marker.read_text("utf-8") if marker.exists() else ""
-    assert len(calls) == 1, f"non-empty result must still cache; CLI ran {len(calls)}×"
 
 
 def test_stale_entry_still_a_miss(tmp_path: Path) -> None:
@@ -257,29 +191,3 @@ class TestPs1Parity:
         )
         assert r.returncode == 0, r.stderr
         assert "HIT[CODE: mod.fn | CodeFunction | distance=0.2]" in r.stdout, r.stdout
-
-    def test_query_block_timeout_not_cached(self, tmp_path: Path) -> None:
-        """Invoke-VcoCodegraphQueryBlock: a job that exceeds the inner 4 s
-        bound is killed — its (empty) output must not be cached. Uses a 6 s
-        stub, so this test costs ~4 s."""
-        proj = tmp_path
-        (proj / ".claude" / "scripts").mkdir(parents=True, exist_ok=True)
-        (proj / ".claude" / "state").mkdir(parents=True, exist_ok=True)
-        cli = proj / ".claude" / "scripts" / "code-graph-query"
-        cli.write_text("#!/usr/bin/env bash\nsleep 6\n", encoding="utf-8")
-        cli.chmod(0o755)
-        cg_ps1 = LIB_DIR / "codegraph-query.ps1"
-        script = (
-            f'$env:CLAUDE_PROJECT_DIR = "{proj}"\n'
-            f'. "{QC_PS1}"\n'
-            f'. "{cg_ps1}"\n'
-            '$null = Invoke-VcoCodegraphQueryBlock -Query "slowq" -Limit 2\n'
-            '$D = Get-VcoQueryCacheDir\n'
-            "@((Get-ChildItem -LiteralPath $D -File | Measure-Object).Count)"
-        )
-        r = subprocess.run(["pwsh", "-NoProfile", "-Command", script],
-                           capture_output=True, text=True, timeout=120,
-                           cwd=str(tmp_path))
-        assert r.returncode == 0, r.stderr
-        assert r.stdout.strip().splitlines()[-1] == "0", (
-            "a timed-out code-graph leg must not poison the cache key")

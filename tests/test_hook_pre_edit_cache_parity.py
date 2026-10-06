@@ -149,35 +149,30 @@ def test_pre_edit_sh_compares_age_against_ttl() -> None:
 
 
 def test_pre_edit_sh_cache_replay_runs_dedup() -> None:
-    """Parity with .ps1's `if ($CacheHit) { $filteredCache = Filter-Seen ...}`:
-    the .sh cache-hit branch must call _filter_seen on $CACHE_BLOB so
-    titles seen since the cache was written get suppressed on replay.
-    """
+    """Parity with .ps1's `if ($CacheHit) { Invoke-VcoFilterSeenBlocks ...}`:
+    the .sh cache-hit branch must run the SHARED seen-store filter on
+    $CACHE_BLOB so titles seen since the cache was written get suppressed
+    on replay. v0.2.101: the hook's inline _filter_seen delegator was
+    retired with the wrapper rework — the replay calls the one home
+    (vco_filter_seen_blocks from _lib/seen-store.sh) directly, which the
+    hook must therefore SOURCE before the branch runs."""
     body = _read("pre-edit-context-inject", ".sh")
     cache_hit_idx = body.find('"$CACHE_HIT" == "1"')
-    filter_call_after = body.find('_filter_seen "$CACHE_BLOB"')
+    filter_call_after = body.find('vco_filter_seen_blocks "$CACHE_BLOB"')
+    source_idx = body.find('_lib/seen-store.sh')
     assert cache_hit_idx > 0, (
         "pre-edit-context-inject.sh missing CACHE_HIT == 1 branch — "
         "cache layer not ported."
     )
     assert filter_call_after > 0, (
-        "pre-edit-context-inject.sh cache-replay branch must call "
-        '_filter_seen on $CACHE_BLOB — dedup state would be ignored on '
-        "cache hits and already-seen nodes would re-leak to the LLM."
+        "pre-edit-context-inject.sh cache-replay branch must call the "
+        'shared vco_filter_seen_blocks on $CACHE_BLOB — dedup state would '
+        "be ignored on cache hits and already-seen nodes would re-leak."
     )
-    assert cache_hit_idx < filter_call_after or _filter_seen_defined_before(body, cache_hit_idx), (
-        "pre-edit-context-inject.sh: CACHE_HIT branch must come AFTER "
-        "_filter_seen is defined (the function is referenced inside the "
-        "branch)."
+    assert 0 < source_idx < cache_hit_idx, (
+        "the seen-store lib must be sourced BEFORE the cache-hit branch "
+        "that calls vco_filter_seen_blocks."
     )
-
-
-def _filter_seen_defined_before(body: str, idx: int) -> bool:
-    """True if the `_filter_seen()` function definition appears before
-    character offset `idx` in the body. Used to confirm the cache-replay
-    branch can call the function.
-    """
-    return body.find("_filter_seen() {") < idx and body.find("_filter_seen() {") > 0
 
 
 def test_pre_edit_sh_filter_seen_is_block_atomic() -> None:
@@ -186,31 +181,30 @@ def test_pre_edit_sh_filter_seen_is_block_atomic() -> None:
     block (if title is seen) or emit the WHOLE block (if not).
     Line-by-line filtering would leak orphan body fragments.
 
-    Asserts the .sh _filter_seen function uses the block accumulator
-    pattern (current_title / current_block / _flush_block) rather than
-    a simpler line-by-line filter.
-
-    The cache-replay branch added in PR-38 reuses this same function
-    on $CACHE_BLOB, so cached blocks stay atomic across replays.
-    """
+    v0.2.101 retarget: the block accumulator no longer lives in the hook —
+    the wrapper replay calls the SHARED home (_lib/seen-store.sh's
+    vco_filter_seen_blocks) and the router's Python filter mirrors it
+    (byte-compatible keys, pinned by
+    tests/test_v02101_inject_gates.py::TestSeenStoreParity). This row now
+    pins the block-atomic pattern in that shared home, which BOTH the
+    replay path and (via the parity pin) the router path must keep."""
     body = _read("pre-edit-context-inject", ".sh")
-    assert 'current_title=""' in body, (
-        "pre-edit-context-inject.sh _filter_seen must use a "
-        "current_title accumulator — line-by-line filtering would leak "
-        "orphan body fragments."
+    assert "_lib/seen-store.sh" in body, (
+        "the wrapper must source the shared seen-store home for its replay "
+        "filter"
     )
-    assert 'current_block=""' in body, (
-        "pre-edit-context-inject.sh _filter_seen must use a "
-        "current_block accumulator — blocks must be flushed atomically."
+    lib = (Path(__file__).resolve().parent.parent / "templates" / "hooks"
+           / "_lib" / "seen-store.sh").read_text(encoding="utf-8")
+    assert 'cur_first=""' in lib and 'cur_block=""' in lib, (
+        "seen-store.sh must use title/block accumulators — line-by-line "
+        "filtering would leak orphan body fragments."
     )
-    assert "_flush_block()" in body, (
-        "pre-edit-context-inject.sh _filter_seen must use a _flush_block "
-        "helper — blocks must be flushed atomically at boundaries."
+    assert "_vco_flush()" in lib, (
+        "seen-store.sh must flush blocks atomically at boundaries."
     )
-    # The header-line regex must match the .ps1 sibling (KG|CODE):
-    assert "^(KG|CODE):" in body, (
-        "pre-edit-context-inject.sh _filter_seen missing the (KG|CODE): "
-        "header regex — block boundary detection broken."
+    assert "^(KG|CODE):" in lib, (
+        "seen-store.sh missing the (KG|CODE): header regex — block "
+        "boundary detection broken."
     )
 
 
@@ -245,25 +239,30 @@ def test_pre_edit_sh_cache_replay_silent_when_everything_seen() -> None:
 
 
 def test_pre_edit_sh_writes_raw_cache_at_end_of_live_path() -> None:
-    """The cache file must store RAW per-result blocks (pre-dedup) so
-    replays apply CURRENT seen-list state. Caching post-dedup would
-    perma-suppress titles legitimately re-eligible after /compact.
-    """
+    """The cache file must store the RAW router output (pre-REPLAY-dedup)
+    so replays apply CURRENT seen-list state — caching what the replay
+    already filtered would perma-suppress titles legitimately re-eligible
+    after /compact. v0.2.101 shape: ONE write site at the end of the miss
+    path (`printf … "$INJECT" > "$CACHE_FILE"`), gated on non-whitespace
+    output so an EMPTY result is never cached (§9 discipline — the old
+    dual write site existed because the pre-router hook had to reassemble
+    KG_RAW/CODE_RAW itself; the router's stdout IS the raw blob now)."""
     body = _read("pre-edit-context-inject", ".sh")
-    assert 'KG_RAW="$KG_RESULT"' in body, (
-        "pre-edit-context-inject.sh missing KG_RAW capture (pre-dedup) — "
-        "cache would store post-dedup output and perma-suppress titles."
+    assert '"$INJECT" > "$CACHE_FILE"' in body, (
+        "pre-edit-context-inject.sh must cache the router's RAW stdout — "
+        "the replay path depends on pre-dedup content."
     )
-    assert 'CODE_RAW="$CODE_RESULT"' in body, (
-        "pre-edit-context-inject.sh missing CODE_RAW capture (pre-dedup)."
+    miss_idx = body.find('"$VENV" "$ROUTER" edit')
+    write_idx = body.find('"$INJECT" > "$CACHE_FILE"')
+    assert 0 < miss_idx < write_idx, (
+        "the cache write must sit at the END of the live (miss) path, "
+        "after the router run."
     )
-    # The cache write itself (`echo "$RAW_CACHE" > "$CACHE_FILE"`) must be
-    # present in BOTH the empty-output branch and the emit branch.
-    write_count = body.count('"$RAW_CACHE" > "$CACHE_FILE"')
-    assert write_count >= 2, (
-        "pre-edit-context-inject.sh must write RAW_CACHE to CACHE_FILE in "
-        "both the empty-output exit-early branch AND the emit branch — "
-        f"found {write_count} sites, need 2."
+    # §9: the write is inside the non-whitespace branch (empty is never cached).
+    case_idx = body.rfind("*[![:space:]]*)", 0, write_idx)
+    assert case_idx > miss_idx, (
+        "the cache write must be gated on non-whitespace router output — "
+        "an empty result must never be cached (§9)."
     )
 
 

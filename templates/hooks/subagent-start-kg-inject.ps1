@@ -1,20 +1,17 @@
-﻿# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #
-# subagent-start-kg-inject.ps1 — Windows sibling of subagent-start-kg-inject.sh.
-# SubagentStart hook that retrieves KG context for the subagent's launch
-# prompt and emits it as `additionalContext`. See the .sh sibling for
-# the full rationale.
+# subagent-start-kg-inject.ps1 -- Windows sibling of
+# subagent-start-kg-inject.sh. SubagentStart hook: V52-L.1 filesystem
+# snapshot ONLY (v0.2.101 injection redesign, PLAN-V02101 section C5).
 #
-# V52-L.2 Fix 3 (v0.2.52). Mirrors pre-edit-context-inject.ps1's shape:
-# delegates the actual search to rl_kg_search.py (canonical RL-aware
-# retrieval chokepoint), wraps results in the SubagentStart JSON envelope.
-#
-# Constraints:
-# - Must complete in <5s (timeout in settings.json bumped from 2s to 5s
-#   because hybrid_search cold-path can take 1.5-2.5s).
-# - Never throws / never exits non-zero (would block subagent start).
-# - Silent no-op when search empty or rl_kg_search.py unavailable.
+# The KG-injection half that queried rl_kg_search.py on the payload's
+# prompt|task|description field was RETIRED -- superseded by the parent-side
+# PreToolUse(Agent|Task) hook agent-brief-kg-inject.{sh,ps1} (the
+# SubagentStart payload carries only agent_id + agent_type, so the old
+# query could never fire). The snapshot below stays: the SubagentStop
+# reconciler diffs against it. Full rationale in the .sh sibling. MUST
+# MATCH it.
 
 # Scrub sensitive env vars before any subprocess spawning.
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
@@ -24,194 +21,34 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 $ScriptDir = $PSScriptRoot
 
-$StderrCap = Join-Path $ScriptDir "_lib/stderr-cap.ps1"
-if (Test-Path $StderrCap) { . $StderrCap }
-
-$EmitHelper = Join-Path $ScriptDir "_lib/emit-context.ps1"
-if (Test-Path $EmitHelper) { . $EmitHelper }
-
-# V52-L.1: source the snapshot helper. SubagentStop reconciler will
-# diff against this snapshot to identify files modified by the subagent.
+# V52-L.1: source the snapshot helper (optional -- partial install
+# tolerance; the reconciler degrades to logging-only when absent).
 $SnapshotHelper = Join-Path $ScriptDir "_lib/snapshot.ps1"
 if (Test-Path $SnapshotHelper) { . $SnapshotHelper }
-
-# v0.2.77 Part 9 task 5: shared TTL result-cache so spawn N>1 with the same
-# prompt is served from cache (MUST MATCH subagent-start-kg-inject.sh).
-# $script:ProjectRoot (which the cache dir resolver reads) is set AFTER
-# $ProjectRoot is computed below.
-$QueryCacheHelper = Join-Path $ScriptDir "_lib/query-cache.ps1"
-if (Test-Path $QueryCacheHelper) { . $QueryCacheHelper }
-
-$FindPy = Join-Path $ScriptDir "_lib/find-python.ps1"
-if (Test-Path $FindPy) { . $FindPy }
-if (-not $PY) {
-    foreach ($candidate in @('python3', 'python', 'py')) {
-        $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
-        if ($cmd) { $PY = $cmd.Source; break }
-    }
-}
-if (-not $PY) { exit 0 }
 
 $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
     $env:CLAUDE_PROJECT_DIR
 } else {
     (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 }
-# task 5: expose to the query-cache dir resolver.
-$script:ProjectRoot = $ProjectRoot
 
-# Parse SubagentStart payload from stdin: prompt (with synonyms),
-# session_id, agent_id, agent_type. Field-synonym set matches the
-# shared subagent-start-suggest.sh hook so both hooks behave
-# identically on whatever wire format Claude Code emits on this build.
+# Parse the SubagentStart payload: agent identity ONLY (no prompt/task
+# text -- that is why the retired KG half could never fire).
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 if (-not $HookStdin) { exit 0 }
 
-$Prompt = ""
-$SessionId = ""
 $AgentId = ""
-$AgentType = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
-    if ($payload) {
-        if ($payload.prompt)      { $Prompt = [string]$payload.prompt }
-        elseif ($payload.task)        { $Prompt = [string]$payload.task }
-        elseif ($payload.description) { $Prompt = [string]$payload.description }
-        if ($payload.session_id) { $SessionId = [string]$payload.session_id }
-        if ($payload.agent_id)   { $AgentId   = [string]$payload.agent_id }
-        if ($payload.agent_type) { $AgentType = [string]$payload.agent_type }
-    }
+    if ($payload -and $payload.agent_id) { $AgentId = [string]$payload.agent_id }
 } catch {
-    # Empty/malformed stdin — keep variables at defaults
+    # Empty/malformed stdin -- keep the default
 }
 
-if (-not $Prompt) {
-    # Still take a snapshot before the early exit — see .sh sibling
-    # rationale. Empty prompts still produce subagents that can modify
-    # files; the reconciler needs the baseline.
-    if ($AgentId -and (Get-Command Take-Snapshot -ErrorAction SilentlyContinue)) {
-        try { Take-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot | Out-Null } catch {}
-    }
-    exit 0
-}
-
-# V52-L.1: take a filesystem snapshot BEFORE the rest of the hook
-# runs. SubagentStop reconciler diffs against this snapshot to find
-# files modified by the subagent. Soft-fail.
+# Take the filesystem snapshot. Soft-fail. MUST MATCH the .sh sibling.
 if ($AgentId -and (Get-Command Take-Snapshot -ErrorAction SilentlyContinue)) {
     try { Take-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot | Out-Null } catch {}
-}
-
-# Export session / agent context so rl_kg_search.py's emit path
-# attributes the retrieval event to this subagent. Mirrors the .sh
-# sibling.
-if ($SessionId) { $Env:VCT_SESSION_ID = $SessionId }
-if ($AgentId)   { $Env:VCT_AGENT_ID   = $AgentId }
-if ($AgentType) { $Env:VCT_AGENT_TYPE = $AgentType }
-
-# Cap prompt to 400 chars for the query — see .sh sibling.
-#
-# WP-E (v0.2.92) query enrichment: deliberately NOT applied here — a decision,
-# not an omission. The 400-char prompt is far above the short-trigger
-# threshold enrichment requires, the SubagentStart payload carries no
-# transcript_path to forward, and the only transcript in reach is the
-# PARENT's, which a subagent is deliberately isolated from. Full rationale in
-# the .sh sibling; MUST MATCH it.
-$Query = if ($Prompt.Length -gt 400) { $Prompt.Substring(0, 400) } else { $Prompt }
-
-# Resolve VCO venv via the shared helper.
-$ResolveVenv = Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1"
-$Venv = ""
-if (Test-Path $ResolveVenv) {
-    . $ResolveVenv
-    # v0.2.100: Resolve-VcoVenvPython RETURNS the interpreter (it sets no
-    # variable). This used to read a never-set $script:VCO_VENV_PYTHON, so the
-    # venv never resolved and this hook exited before searching on Windows.
-    $resolvedVenv = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-    if ($resolvedVenv) { $Venv = $resolvedVenv }
-}
-
-$RlScript = ""
-if (Get-Command Resolve-VcoOrchestratorScript -ErrorAction SilentlyContinue) {
-    # v0.2.100 F3: the KG producer ships ONLY in the orchestrator root - locate it
-    # there (same roots as the venv), never under the project root. It still runs
-    # with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's KG +
-    # shared + granted collections apply. MUST MATCH the .sh sibling.
-    $RlScript = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/rl_kg_search.py"
-    # Unresolved -> the legacy (absent) project path: every Test-Path below then
-    # reads "not installed" without binding an empty -Path.
-    if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py" }
-    # Pin the CALLING project's identity for the producer (a no-op whenever the
-    # harness already set it): the script lives in the orchestrator root, so its
-    # own location must never be what names the project.
-    $env:CLAUDE_PROJECT_DIR = $ProjectRoot
-    # v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
-    # (rl_kg_search.py reads it; MUST MATCH the .sh sibling).
-    $env:VCO_RL_TASK_TYPE = "subagent_kg_search"
-}
-
-# Bail silently if the venv didn't resolve or the script is missing.
-if (-not $Venv -or -not $RlScript -or -not (Test-Path $RlScript)) { exit 0 }
-
-# Run the search with --hook-format. Limit to 3 matches to stay under
-# the additionalContext cap.
-#
-# v0.2.77 Part 9 task 5: serve from the shared TTL cache when available so a
-# repeat spawn with the same prompt replays the cached RAW output (~ms) instead
-# of re-running the ~3.8 s search. Cache the RAW (pre-filter) output so the
-# identical post-filtering below applies to a hit exactly as to a live result.
-# MUST MATCH subagent-start-kg-inject.sh.
-# NOT `$Matches`: that is PowerShell's automatic variable, overwritten by every
-# -match below — the injection used to render as "System.Collections.Hashtable"
-# (latent until v0.2.100, because the venv never resolved on this path).
-$KgMatches = ""
-try {
-    $rawOut = $null
-    $sakgKey = ""
-    if (Get-Command Get-VcoQueryCacheKey -ErrorAction SilentlyContinue) {
-        $sakgKey = Get-VcoQueryCacheKey "kg-subagent" $Query "3"
-    }
-    $served = $false
-    if ($sakgKey -and (Get-Command Get-VcoQueryCache -ErrorAction SilentlyContinue)) {
-        $qc = Get-VcoQueryCache $sakgKey
-        if ($qc.Hit) { $rawOut = $qc.Value; $served = $true }
-    }
-    if (-not $served) {
-        $rawOut = (& $Venv $RlScript $Query --limit 3 --hook-format 2>$null) -join "`n"
-        if ($sakgKey -and (Get-Command Set-VcoQueryCache -ErrorAction SilentlyContinue)) {
-            Set-VcoQueryCache $sakgKey ([string]$rawOut)
-        }
-    }
-    if ($rawOut) {
-        # Filter out the no-results sentinel; keep the first 60 lines so
-        # we don't blow past the emit-context.ps1 cap with verbose
-        # bodies. Match the .sh sibling's 60-line cap.
-        $lines = @($rawOut -split "`r?`n" | Where-Object { $_ -notmatch '^KG: no-results' } | Select-Object -First 60)
-        $KgMatches = ($lines -join "`n").TrimEnd()
-    }
-} catch { }
-
-# Whitespace-only / empty match: silent exit.
-if (-not $KgMatches -or -not ($KgMatches -match '\S')) { exit 0 }
-
-# Format the additionalContext block.
-$HeaderLabel = if ($AgentType) { $AgentType } else { "subagent" }
-$Output = "[KG context for $HeaderLabel task]:`n`n$KgMatches`n"
-
-if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
-    Emit-AdditionalContext $Output SubagentStart
-} else {
-    # Inline fallback envelope (same JSON shape).
-    try {
-        $envelope = @{
-            hookSpecificOutput = @{
-                hookEventName     = "SubagentStart"
-                additionalContext = $Output
-            }
-        }
-        $envelope | ConvertTo-Json -Compress -Depth 5 | Write-Output
-    } catch { }
 }
 
 exit 0

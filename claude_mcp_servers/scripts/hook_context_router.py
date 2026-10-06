@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -815,7 +816,13 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                 _hds._pin_argv(kg_mod, argv)
 
                 def _kg_leg(mod=kg_mod) -> None:
-                    asyncio.run(mod.main())
+                    # rl_kg_search.main is async; the VCO_ROUTER_KG_SCRIPT
+                    # test seam may point at a SYNC stub producer — accept
+                    # both (the documented producer contract is "a main()
+                    # whose argv is pinned", not "an async main").
+                    result = mod.main()
+                    if inspect.iscoroutine(result):
+                        asyncio.run(result)
 
                 legs["kg"] = _kg_leg
             except BaseException as exc:  # noqa: BLE001 — never block the tool
@@ -970,8 +977,10 @@ def _main(argv: List[str]) -> int:
     # router pays it ONCE (single interpreter, shared weaviate import), but
     # the plan's 6/4 defaults still lost cold multi-symbol runs (measured
     # 11 s wall on a 2-symbol `git show HEAD:` READ). 8/6 fits the cold
-    # path inside the Wave-2 settings timeout 10 (§C1 group uses 8; the
-    # Read/Agent surfaces get 10) — WP-E must confirm p95 against these.
+    # path inside the Wave-2 settings timeouts — which ALL sit at 10 since
+    # the wave-2 GLM review's SF-1 (an 8 s harness timeout equal to this
+    # budget re-created the §9 always-killed root cause: startup + 8 s > 8 s)
+    # — WP-E must confirm p95 against these.
     deadline = time.monotonic() + _env_float("VCO_INJECT_BUDGET_S", 8.0)
     kg_text, cg_text = _run_legs(plan, sid, prompt_id, project_root,
                                  transcript_path, deadline)

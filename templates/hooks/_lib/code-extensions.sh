@@ -10,11 +10,16 @@
 # further consumer (the Bash-write routing), which is the point at which
 # the project's A>B>C rule requires ONE home instead of another copy.
 #
+# v0.2.101 injection redesign: the injection wrappers (pre-edit/pre-bash/
+# pre-write) and pre-tool-use's Read/Grep branches no longer make this
+# decision in SHELL at all — the router's Python core does, via
+# vco_lib/inject_intent.language_for_path (EXT_TO_LANG, parity-pinned
+# against the analyzer's dispatch table). The codegraph-query and
+# command-noise-strip mirrors were retired with those code paths.
+#
 # Consumers that source this file use `$VCO_CODE_EXT_RE` /
-# `vco_is_code_file`. The remaining mirrors (pre-tool-use,
-# code-graph-incremental, stop-codegraph-drain, command-noise-strip —
-# the last embeds the pattern in an inline Python regex, a different
-# language) are pinned to this literal by
+# `vco_is_code_file`. The remaining mirrors (code-graph-incremental,
+# stop-codegraph-drain) are pinned to this literal by
 # tests/test_v0295_code_extension_one_home.py, so a drift is a RED test
 # rather than a silent divergence.
 #

@@ -46,6 +46,11 @@ vco_inject_profile_off() {
     [ "$v" = "off" ]
 }
 
+# (The pre-python session-id extraction the router wrappers share —
+# vco_hook_fast_session_id — lives in _lib/session-id.sh, NOT here: the
+# broken-install notice needs it precisely when THIS lib is the missing
+# file. Wave-2 review nit-7.)
+
 # vco_inject_budget_path <session_id> <prompt_id> [project_root]
 # Echo the per-turn budget counter file, or EMPTY when enforcement must fail
 # open (see the header). root defaults to $PROJECT_ROOT / $CLAUDE_PROJECT_DIR.

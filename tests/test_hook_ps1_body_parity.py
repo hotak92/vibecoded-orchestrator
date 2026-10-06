@@ -137,31 +137,42 @@ def test_kg_update_nudge_ps1_has_transcript_escape_hatch() -> None:
 
 
 def test_pre_edit_context_inject_ps1_has_dedup_filter() -> None:
-    """The Filter-Seen function dedupes KG/codegraph blocks by title.
-    Asserts the function exists and uses the "KG:|CODE:" header regex
-    that PR #186 introduced for hook-format compatibility.
-    """
+    """Session-level dedup of injected KG/codegraph blocks.
+
+    v0.2.101 retarget: the hook-local `Filter-Seen` function was retired
+    with the wrapper rework — the replay path calls the SHARED home
+    (Invoke-VcoFilterSeenBlocks from _lib/seen-store.ps1, which carries the
+    PR #186 "KG:|CODE:" header regex), and the router's Python filter is
+    byte-compatible with it (pinned by
+    tests/test_v02101_inject_gates.py::TestSeenStoreParity)."""
     body = _read("pre-edit-context-inject", ".ps1")
-    assert "function Filter-Seen" in body, (
-        "pre-edit-context-inject.ps1 missing Filter-Seen function — "
-        "session-level dedup of injected KG/codegraph nodes broken."
+    assert "seen-store.ps1" in body, (
+        "pre-edit-context-inject.ps1 must source the shared seen-store home"
     )
-    # The PR #186 regex: ^(KG|CODE):\s+(.+)$
-    assert "(KG|CODE):" in body, (
-        "pre-edit-context-inject.ps1 missing the (KG|CODE): header regex "
-        "— hook-format dedup won't match producer output."
+    assert "Invoke-VcoFilterSeenBlocks" in body, (
+        "pre-edit-context-inject.ps1 replay path must call the shared "
+        "seen-store filter — session-level dedup would otherwise break."
+    )
+    lib = _read("_lib/seen-store", ".ps1")
+    assert "(KG|CODE):" in lib, (
+        "seen-store.ps1 missing the (KG|CODE): header regex — hook-format "
+        "dedup won't match producer output."
     )
 
 
 def test_pre_edit_context_inject_ps1_caches_raw_pre_dedup() -> None:
-    """PR #186 fix #3: cache stores RAW per-result blocks (pre-dedup) so
-    replays apply CURRENT seen-list state. Caching post-dedup output
+    """PR #186 fix #3: cache stores RAW blocks (pre-REPLAY-dedup) so
+    replays apply CURRENT seen-list state. Caching replay-filtered output
     would perma-suppress titles eligible to re-appear after /compact.
-    """
+
+    v0.2.101 shape: the router's raw stdout ($Inject — assembled from the
+    producer blocks, deduped for THIS turn but never replay-filtered) is
+    what lands in $CacheFile; the old $KgRaw/$CodeRaw reassembly died with
+    the wrapper-side producer calls."""
     body = _read("pre-edit-context-inject", ".ps1")
-    assert "$KgRaw" in body and "$CodeRaw" in body, (
-        "pre-edit-context-inject.ps1 missing $KgRaw/$CodeRaw raw-cache "
-        "captures — replays won't apply current dedup state."
+    assert "Set-Content -LiteralPath $CacheFile -Value $Inject" in body, (
+        "pre-edit-context-inject.ps1 must cache the RAW router output — "
+        "replays won't apply current dedup state otherwise."
     )
 
 
@@ -170,16 +181,20 @@ def test_pre_edit_context_inject_ps1_cache_replay_runs_dedup() -> None:
     already-shown titles stay suppressed across edits within the TTL.
     """
     body = _read("pre-edit-context-inject", ".ps1")
-    # Find the CacheHit branch and look for Filter-Seen invocation inside it.
+    # Find the CacheHit branch and look for the shared filter invocation.
     cache_hit_idx = body.find("$CacheHit")
-    filter_call_after_cache = body.find("Filter-Seen $CacheBlob")
+    filter_call_after_cache = body.find(
+        "Invoke-VcoFilterSeenBlocks -InputText $CacheBlob")
     assert cache_hit_idx > 0, (
         "pre-edit-context-inject.ps1 missing $CacheHit branch."
     )
     assert filter_call_after_cache > 0, (
-        "pre-edit-context-inject.ps1 cache-replay branch must call "
-        "Filter-Seen on the cached blob — dedup state would otherwise "
-        "be ignored on cache hits."
+        "pre-edit-context-inject.ps1 cache-replay branch must call the "
+        "shared Invoke-VcoFilterSeenBlocks on the cached blob — dedup "
+        "state would otherwise be ignored on cache hits."
+    )
+    assert cache_hit_idx < filter_call_after_cache, (
+        "the replay filter call must sit INSIDE (after) the $CacheHit branch."
     )
 
 
@@ -188,12 +203,20 @@ def test_pre_edit_context_inject_ps1_filters_whitespace_only_pre_amble() -> None
     through the `else` branch, otherwise HAS_KG reads whitespace as
     truthy and an empty system-reminder block surfaces to the LLM.
     """
+    # v0.2.101 retarget: the '\S' else-branch gate lives in the SHARED
+    # seen-store home now; the wrapper's own guard is the whitespace-only
+    # check around the replay emission (`-replace '\s+'`).
     body = _read("pre-edit-context-inject", ".ps1")
-    # The fix is `if ($line -match '\S')` inside the else branch.
-    assert "-match '\\S'" in body or "-match \"\\S\"" in body, (
-        "pre-edit-context-inject.ps1 Filter-Seen must gate the else-branch "
-        "pass-through on '\\S' (non-whitespace) — otherwise blank "
-        "separators leak through and trigger empty system-reminder blocks."
+    assert "($filtered -replace '\\s+', '')" in body, (
+        "pre-edit-context-inject.ps1 replay branch must gate emission on "
+        "non-whitespace filtered output — otherwise an empty "
+        "system-reminder block surfaces to the LLM."
+    )
+    lib = _read("_lib/seen-store", ".ps1")
+    assert "-match '\\S'" in lib or "-match \"\\S\"" in lib, (
+        "seen-store.ps1 must gate the else-branch pass-through on '\\S' "
+        "(non-whitespace) — blank separators would leak through and "
+        "trigger empty system-reminder blocks."
     )
 
 

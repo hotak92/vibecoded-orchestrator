@@ -393,6 +393,53 @@ class TestInjectBudgetLib:
             "_lib/, so this must be hand-verified here."
         )
 
+    def test_fast_sid_helper_one_home(self, tmp_path: Path) -> None:
+        """Review nit-7: the pre-python session-id extraction the three
+        router wrappers need (read/grep/agent-brief, for the missing-lib
+        notice) had three inline copies — one home in _lib/session-id.sh
+        (NOT inject-budget: the notice must work precisely when
+        inject-budget is the missing lib — the cycle that put the helper
+        there first broke test_v0295_missing_route_lib_is_loud)."""
+        sid_lib = HOOKS_LIB / "session-id.sh"
+        py = shutil.which("python3") or "python3"
+        script = (
+            f'export PY="{py}"\n'
+            f'. "{sid_lib}"\n'
+            'vco_hook_fast_session_id \'{"session_id": "abc-123_XY", "x": 1}\'\n'
+            'echo "|"\n'
+            'vco_hook_fast_session_id \'{"session_id": "hostile id!"}\'\n'
+            'echo "|"\n'
+            'vco_hook_fast_session_id \'not json\'\n'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True,
+                           text=True, timeout=60, cwd=str(tmp_path))
+        assert r.returncode == 0, r.stderr
+        parts = r.stdout.split("|")
+        assert parts[0].strip() == "abc-123_XY"
+        assert parts[1].strip() == ""   # hostile → empty (the sanitizer decides)
+        assert parts[2].strip() == ""   # unparseable → empty
+
+    def test_fast_sid_wrappers_use_the_helper(self) -> None:
+        """The three wrappers must call the helper (via session-id), not
+        carry inline copies — and must NOT depend on inject-budget for it."""
+        for name in ("read-context-inject.sh", "grep-context-inject.sh",
+                     "agent-brief-kg-inject.sh"):
+            body = (REPO_ROOT / "templates" / "hooks" / name).read_text(
+                encoding="utf-8")
+            executable = "\n".join(
+                ln for ln in body.splitlines()
+                if not ln.lstrip().startswith("#")
+            )
+            assert "vco_hook_fast_session_id" in executable, (
+                f"{name} must call the one-home fast-sid helper"
+            )
+            assert "_lib/session-id.sh" in executable, (
+                f"{name} must source session-id.sh for the helper"
+            )
+            assert "grep -Eo '\"session_id\"'" not in executable, (
+                f"{name} still carries an inline session-id extraction copy"
+            )
+
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh required")
 class TestInjectBudgetPs1:

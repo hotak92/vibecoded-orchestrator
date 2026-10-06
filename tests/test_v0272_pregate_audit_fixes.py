@@ -43,8 +43,6 @@ from __future__ import annotations
 
 import ast
 import importlib.util
-import shutil
-import subprocess
 import sys
 import types
 from pathlib import Path
@@ -56,7 +54,6 @@ _REPO_ROOT = _THIS_DIR.parent
 _CLI_PATH = _REPO_ROOT / "templates" / "scripts" / "query_code_graph.py"
 _ANALYZER_PATH = _REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 _SERVER_PATH = _REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
-_CG_QUERY_SH = _REPO_ROOT / "templates" / "hooks" / "_lib" / "codegraph-query.sh"
 
 sys.path.insert(0, str(_REPO_ROOT / "claude_mcp_servers"))
 sys.path.insert(0, str(_REPO_ROOT))
@@ -505,48 +502,13 @@ def test_b2_no_exclude_keeps_everything(cli_mod, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# B2 — hook lib passes --exclude-file and no longer decapitates blocks.
+# B2 — hook lib exclude forwarding: RETIRED (v0.2.101 wave-2 review SF-2)
+# with codegraph_query_block itself (zero live callers after the router
+# rework). The property lives on where the mechanism lives: the CLI's
+# --exclude-file cull (rows above, driving query_code_graph directly) and
+# the router's edit-surface --exclude-file argv
+# (tests/test_v02101_edit_query_rework.py).
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
-def test_b2_hook_lib_forwards_exclude_file_no_grep_decapitation(tmp_path):
-    """The stub CLI records its argv and emits a block whose BODY mentions the
-    excluded path. Pre-fix, the helper's line-wise grep -v stripped those body
-    lines (and any header line containing the path); post-fix the exclusion is
-    the CLI's job and the raw block passes through intact."""
-    proot = tmp_path / "proj"
-    scripts = proot / ".claude" / "scripts"
-    scripts.mkdir(parents=True)
-    cli = scripts / "code-graph-query"
-    argv_log = proot / "argv.log"
-    cli.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" > "{argv_log}"\n'
-        'printf "CODE: other.fn | CodeFunction | distance=0.30 | src=src/other.py\\n"\n'
-        'printf "  Body:\\n"\n'
-        'printf "  reads src/edited.py at startup\\n"\n'
-        'printf "\\n"\n',
-        encoding="utf-8",
-    )
-    cli.chmod(0o755)
-
-    script = (
-        f'export PROJECT_ROOT="{proot}"\n'
-        f'. "{_CG_QUERY_SH}"\n'
-        'codegraph_query_block "sym_query" "" 2 "src/edited.py" "src/edited.py"\n'
-    )
-    res = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                         timeout=30, cwd=str(tmp_path))
-    assert res.returncode == 0, res.stderr
-    argv = argv_log.read_text(encoding="utf-8")
-    assert "--exclude-file src/edited.py" in argv, (
-        "the hook lib must forward the exclusion to the CLI"
-    )
-    # The body line mentioning the excluded path is NOT stripped any more —
-    # no orphaned-block decapitation.
-    assert "reads src/edited.py at startup" in res.stdout
-    assert "CODE: other.fn" in res.stdout
 
 
 # ---------------------------------------------------------------------------

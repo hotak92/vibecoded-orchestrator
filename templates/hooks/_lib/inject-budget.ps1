@@ -33,6 +33,11 @@ function Test-VcoInjectProfileOff {
     return ($v.ToLowerInvariant() -eq "off")
 }
 
+# (The pre-python session-id extraction the router wrappers share --
+# Get-VcoHookFastSessionId -- lives in _lib/session-id.ps1, NOT here: the
+# broken-install notice needs it precisely when THIS lib is the missing
+# file. Wave-2 review nit-7.)
+
 function Test-VcoInjectStateComponent {
     param([string]$Value)
     if (-not $Value) { return $false }

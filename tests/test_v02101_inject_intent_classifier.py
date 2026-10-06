@@ -14,16 +14,15 @@ Covers (PLAN-V02101 §WP-F row 1 + §3 WP-A):
     stripped; <= 5).
   * `agent_task_section` (`Task:` line of the shipped handoff format;
     preamble skip; 400-char cap; empty prompt -> "").
-  * Cross-language parity of the PORTED gates (`pattern_gate`,
-    `bash_gate`, `extract_symbol`) against the legacy shell regexes in
-    `templates/hooks/_lib/codegraph-query.sh` — the shell copies stay the
-    legacy hooks' code path until Wave 2 retires them, so drift between
-    the Python one-home and the shell interim copies is a finding
-    (plan §3 WP-A1 "if the port drifts, that is a finding").
+  * The PORTED gates (`pattern_gate`, `extract_symbol`) against the legacy
+    corpora. v0.2.101 Wave 2 retired the shell copies from
+    `templates/hooks/_lib/codegraph-query.{sh,ps1}` WITH their last legacy
+    callers, so `vco_lib/inject_intent.py` is now the ONLY implementation
+    (the interim shell-parity battery was retired with its shell side; the
+    extractor corpus lives on in test_p1e_codegraph_extract_symbol.py).
 """
 from __future__ import annotations
 
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -38,7 +37,6 @@ from vco_lib.inject_intent import (  # noqa: E402
     INTENT_READ,
     INTENT_SEARCH,
     agent_task_section,
-    bash_gate,
     classify_bash,
     clean_identifier,
     edit_enclosing_symbols,
@@ -377,23 +375,6 @@ class TestPatternGatePort:
         assert pattern_gate(p) is False
 
 
-class TestBashGatePort:
-    @pytest.mark.parametrize(
-        "cmd",
-        ["grep -rn vco_seen_add templates/", "cat src/main.rs", "rg VcoQueryCache"],
-    )
-    def test_positives(self, cmd: str) -> None:
-        assert bash_gate(cmd) is True
-
-    @pytest.mark.parametrize(
-        "cmd",
-        ["ls", "cd /tmp", "git status", "git log a.b.c", "cat notes.txt",
-         "grep foo.bar f", 'grep "TODO" f'],
-    )
-    def test_negatives(self, cmd: str) -> None:
-        assert bash_gate(cmd) is False
-
-
 class TestExtractSymbolPort:
     def test_extracts_first_symbol(self) -> None:
         assert extract_symbol("grep -rn vco_query_cache_put templates/") == "vco_query_cache_put"
@@ -434,80 +415,14 @@ class TestCleanIdentifier:
         assert clean_identifier(tok) == want
 
 
-# --- Shell/Python parity (interim mirror locked until Wave 2 retirement) ----
-
-_CG_SH = REPO_ROOT / "templates" / "hooks" / "_lib" / "codegraph-query.sh"
-
-# Corpus for the ported gates. Deliberately glob-free: the shell extractor
-# word-splits UNQUOTED `$text`, so a glob that matches files in the cwd would
-# expand there but not in Python (a known, accepted shell-side artefact).
-_PARITY_CORPUS = [
-    "grep -rn vco_query_cache_put templates/",
-    "rg 'VcoQueryCache' src",
-    "cat src/main.rs",
-    "ls",
-    "cd /tmp",
-    "git status",
-    "git log a.b.c",
-    "cat notes.txt",
-    "grep foo.bar f",
-    'grep "TODO" f',
-    "tail -f /var/log/app.log",
-    "LEAN_CTX_OFF=1 run_thing",
-    "git diff abc123..HEAD",
-    "sed -n '1,40p' notes.txt",
-    "grep -e extract_write_targets vco_lib/",
-]
-
-
-def _has_bash() -> bool:
-    return shutil.which("bash") is not None
-
-
-@pytest.mark.skipif(not _has_bash(), reason="bash required")
-class TestShellParity:
-    """The Python port and the legacy shell gates must agree on every corpus
-    command until Wave 2 retires the shell copies (plan §3 WP-A1: drift is a
-    finding)."""
-
-    def _run_shell(self, snippet: str) -> subprocess.CompletedProcess:
-        script = f'. "{_CG_SH}"\n{snippet}\n'
-        return subprocess.run(
-            ["bash", "-c", script], capture_output=True, text=True,
-            timeout=30, cwd="/",
-        )
-
-    def test_bash_gate_parity(self) -> None:
-        for cmd in _PARITY_CORPUS:
-            r = self._run_shell(
-                "codegraph_bash_gate \"$1\" && echo FIRE || echo SKIP",
-            ) if False else subprocess.run(
-                ["bash", "-c", f'. "{_CG_SH}"; codegraph_bash_gate "$0" && echo FIRE || echo SKIP', cmd],
-                capture_output=True, text=True, timeout=30, cwd="/",
-            )
-            shell_fires = r.stdout.strip() == "FIRE"
-            assert bash_gate(cmd) == shell_fires, f"bash_gate drift on {cmd!r}"
-
-    def test_extract_symbol_parity(self) -> None:
-        for cmd in _PARITY_CORPUS:
-            r = subprocess.run(
-                ["bash", "-c", f'. "{_CG_SH}"; codegraph_extract_symbol "$0"', cmd],
-                capture_output=True, text=True, timeout=30, cwd="/",
-            )
-            assert extract_symbol(cmd) == r.stdout.strip(), (
-                f"extract_symbol drift on {cmd!r}"
-            )
-
-    def test_pattern_gate_parity(self) -> None:
-        for pat in ["vco_seen_add", "VcoQueryCache", "TODO", "hello", "classify_bash(",
-                    "def authenticate", "a.b.c", ""]:
-            r = subprocess.run(
-                ["bash", "-c", f'. "{_CG_SH}"; codegraph_pattern_gate "$0" && echo FIRE || echo SKIP', pat],
-                capture_output=True, text=True, timeout=30, cwd="/",
-            )
-            assert pattern_gate(pat) == (r.stdout.strip() == "FIRE"), (
-                f"pattern_gate drift on {pat!r}"
-            )
+# --- Shell-gate retirement (v0.2.101 Wave 2) --------------------------------
+# The shell/Python parity battery that lived here was retired WITH its shell
+# side: Wave 2 deleted codegraph_bash_gate / codegraph_pattern_gate /
+# codegraph_extract_symbol from _lib/codegraph-query.{sh,ps1} together with
+# their last legacy callers (the pre-bash/pre-edit rewires + the pre-tool-use
+# branch removal). vco_lib/inject_intent.py is now the ONLY implementation;
+# the extractor corpus lives on in tests/test_p1e_codegraph_extract_symbol.py
+# (retargeted to the Python one-home) and the gate corpora above.
 
 
 # --- A2: symbol extraction ---------------------------------------------------

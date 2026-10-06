@@ -2,84 +2,61 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #
-# subagent-start-kg-inject.sh — SubagentStart hook that retrieves KG
-# context for the subagent's launch prompt and emits it as
-# `additionalContext`. Mirrors `pre-edit-context-inject.sh`'s shape: it
-# delegates the actual search to `claude_mcp_servers/scripts/
-# rl_kg_search.py` (the canonical RL-aware retrieval chokepoint), then
-# wraps the formatted matches in the SubagentStart JSON envelope so the
-# freshly-spawned subagent's initial context includes the relevant KG
-# nodes.
+# subagent-start-kg-inject.sh — SubagentStart hook: V52-L.1 filesystem
+# snapshot ONLY (v0.2.101 injection redesign, PLAN-V02101 §C5).
 #
-# Why this hook exists:
-# - V52-L.2 Fix 3 (v0.2.52). Per A5 audit, SubagentStart hooks fire when
-#   the parent spawns a Task/Agent subagent. The subagent inherits the
-#   parent's user-level instructions but NOT the parent's session-state
-#   KG retrievals. Without a hook like this, every subagent starts cold:
-#   it has to either be told explicitly which KG nodes to consult, or
-#   rediscover the relevant patterns from scratch — wasting tokens and
-#   often missing patterns the parent already had in-context.
-# - Mirrors `subagent-start-suggest.sh` (which surfaces matching
-#   AGENTS/SKILLS) but for KG concepts. The two are complementary: the
-#   suggest hook says "use these tools", this hook says "here's the
-#   prior art".
+# WHAT THIS HOOK DOES: take a filesystem snapshot at subagent start so the
+# SubagentStop reconciler (subagent-stop-reconcile.sh) can diff against it
+# and identify files the subagent modified. The SubagentStop hook depends
+# on this snapshot — do not remove it.
+#
+# WHAT IT NO LONGER DOES (v0.2.101): the KG-injection half that queried
+# rl_kg_search.py on the payload's prompt|task|description field was
+# RETIRED — superseded by the parent-side PreToolUse(Agent|Task) hook
+# agent-brief-kg-inject.{sh,ps1}. The SubagentStart payload carries ONLY
+# agent_id + agent_type (official hooks docs, re-verified 2026-10-04), so
+# the old query could never fire: broken by design, not by configuration.
+# The KG context a subagent needs now arrives inside its own first prompt
+# (the brief), keyed on the brief's TASK section — see
+# claude_mcp_servers/scripts/hook_context_router.py (surface `agent`).
+#
+# The FILENAME is deliberately kept (the §C5 fallback): renaming a shipped
+# hook strands every installed copy that other tests and the reconciler's
+# docs reference by name; the bundle update would delete the old file and
+# create the new one, but the rename buys nothing that the honest header
+# above does not already buy.
 #
 # Constraints:
-# - Must complete in <5 seconds (timeout in settings.json is 5s — bumped
-#   from the standard 2s for SubagentStart because hybrid_search cold-
-#   path takes 1.5-2.5s and we want a comfortable margin).
 # - Never exit non-zero (would block subagent start). Always exit 0.
-# - When the search returns empty or rl_kg_search.py is unavailable,
-#   silent no-op.
-#
-# VCO-CENTRALIZED-KG: read-side delegator. Calls
-# claude_mcp_servers/scripts/rl_kg_search.py, which honors
-# VCT_KG_ACCESS_LIST through the shared helper in
-# claude_mcp_servers/weaviate_mcp/server.py. No direct Weaviate access
-# from this hook.
+# - The snapshot is synchronous (a backgrounded snapshot would race the
+#   subagent's own first edits); soft-fail when the helper is missing
+#   (partial install) — the reconciler degrades to logging-only.
 
 # Scrub sensitive env vars before any subprocess spawning
+# (list MUST MATCH _lib/scrub-env.sh; enforced by the scrub parity gate).
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
-if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ]; then
-    . "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
-fi
-# shellcheck source=_lib/find-python.sh disable=SC1091
-. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
-[ -z "${PY:-}" ] && exit 0
 
-# V52-L.1: source the snapshot helper so we can capture the
-# filesystem state at SubagentStart. The SubagentStop reconciler will
-# diff against this snapshot to identify files the subagent modified.
-# Optional — when the helper is missing (partial install), the
-# SubagentStop reconciler degrades to logging-only.
+# V52-L.1: source the snapshot helper. Optional — when the helper is
+# missing (partial install), the SubagentStop reconciler degrades to
+# logging-only.
 if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/snapshot.sh" ]; then
     # shellcheck source=_lib/snapshot.sh disable=SC1091
     . "$(dirname "${BASH_SOURCE[0]}")/_lib/snapshot.sh"
 fi
 
-# v0.2.77 Part 9 task 5: shared TTL result-cache so spawn N>1 with the same
-# prompt is served from the cached KG result (~ms) instead of re-paying the
-# ~3.8 s/spawn search (1793 spawns ~= 113 min in one fleet session — audit
-# 2026-07-11). Every spawn STILL receives the injection, just from cache. The
-# cache TTL self-refreshes and knowledge/ edits invalidate via the post-file-edit
-# KG-sync path bumping the underlying nodes (the query key is the prompt, so a
-# genuinely different task still misses + queries live). Sourced only if present.
-if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/query-cache.sh" ]; then
-    # shellcheck source=_lib/query-cache.sh disable=SC1091
-    . "$(dirname "${BASH_SOURCE[0]}")/_lib/query-cache.sh"
-fi
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
-# Parse SubagentStart payload: prompt (with synonyms), session_id, and
-# agent identity. The shared subagent-start-suggest.sh hook uses the
-# same field-synonym set (prompt / task / description); replicate it
-# here so both hooks behave identically on whatever wire format Claude
-# Code happens to emit on this build.
+# Parse the SubagentStart payload: agent identity. The payload carries
+# session_id + agent_id + agent_type ONLY (no prompt/task text — that is
+# why the KG half this hook used to have could never fire).
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 [ -z "$HOOK_STDIN" ] && exit 0
 
@@ -91,152 +68,21 @@ except Exception:
     sys.exit(0)
 if not isinstance(d, dict):
     sys.exit(0)
-prompt = d.get('prompt') or d.get('task') or d.get('description') or ''
-session_id = d.get('session_id') or ''
 agent_id = d.get('agent_id') or ''
-agent_type = d.get('agent_type') or ''
-sys.stdout.write(str(session_id) + '\n')
-sys.stdout.write(str(agent_id) + '\n')
-sys.stdout.write(str(agent_type) + '\n')
-sys.stdout.write(str(prompt))
-" 2>/dev/null || printf '\n\n\n')
+sys.stdout.write(str(agent_id))
+" 2>/dev/null || printf '')
 
-SESSION_ID="$(printf '%s' "$PARSED" | sed -n '1p')"
-AGENT_ID="$(printf '%s' "$PARSED" | sed -n '2p')"
-AGENT_TYPE="$(printf '%s' "$PARSED" | sed -n '3p')"
-PROMPT="$(printf '%s' "$PARSED" | tail -n +4)"
+AGENT_ID="$PARSED"
 
-# V52-L.1: take a filesystem snapshot BEFORE the empty-prompt
-# short-circuit. The snapshot is needed for the SubagentStop reconciler
-# regardless of whether we end up injecting KG context (empty prompts
-# still produce subagents that can modify files). Soft-fail: if the
+# Take the filesystem snapshot BEFORE anything else. Soft-fail: if the
 # snapshot helper is missing or take_snapshot returns non-zero, the
-# SubagentStop reconciler will fall back to logging-only mode.
+# SubagentStop reconciler falls back to logging-only mode.
 if [ -n "$AGENT_ID" ] && command -v take_snapshot >/dev/null 2>&1; then
     # Run in a subshell so any state leakage / `set -e` from sourced
-    # helpers cannot escape into the rest of the hook. Backgrounding is
-    # tempting (parallelize with the KG search below) but would create a
-    # snapshot-vs-edit race if the subagent starts modifying files
-    # before take_snapshot has finished hashing them. Synchronous wins.
+    # helpers cannot escape into the rest of the hook. Synchronous (not
+    # backgrounded) so the snapshot cannot race the subagent's first
+    # edits. MUST MATCH the .ps1 sibling.
     (take_snapshot "$AGENT_ID" "$PROJECT_ROOT" >/dev/null 2>&1) || true
-fi
-
-[ -z "$PROMPT" ] && exit 0
-
-# Export session/agent context so rl_kg_search.py's emit path attributes
-# the retrieval event to this subagent. Mirrors V52-J Edit 4 in
-# pre-edit-context-inject.sh: VCT_SESSION_ID is layer-2 of the canonical
-# 3-layer session-id resolver; VCT_AGENT_ID / VCT_AGENT_TYPE are picked
-# up by the same telemetry_emit chain for v0.2.52+ agent attribution.
-[ -n "$SESSION_ID" ]  && export VCT_SESSION_ID="$SESSION_ID"
-[ -n "$AGENT_ID" ]    && export VCT_AGENT_ID="$AGENT_ID"
-[ -n "$AGENT_TYPE" ]  && export VCT_AGENT_TYPE="$AGENT_TYPE"
-
-# Cap prompt to 400 chars for the query — rl_kg_search.py's RL reranker
-# embeds the query; a 50K-char subagent prompt would just slow the
-# embedding step without improving recall. 400 chars is enough to
-# capture the task description while staying well under the embedder's
-# small_context bucket (≤512 tokens for arctic1).
-#
-# WP-E (v0.2.92) query enrichment: this hook deliberately does NOT pass
-# --transcript, and that is a decision, not an omission. Three reasons, any
-# one sufficient: (1) enrichment only fires for a SHORT trigger (default 24
-# tokens, vco_lib/query_enrichment.py) and a 400-char task prompt is ~100 —
-# it would decline on every call, so the flag would be dead argv; (2) the
-# SubagentStart payload carries no transcript_path at all (see the parse
-# block above: prompt / session_id / agent_id / agent_type), so there is
-# nothing to forward; (3) the transcript that DOES exist is the PARENT's,
-# and a subagent is deliberately isolated from the parent's conversation —
-# enriching with it would widen what the subagent sees, not sharpen its
-# query. Revisit only if all three change. MUST MATCH the .ps1 sibling.
-QUERY="${PROMPT:0:400}"
-
-# Resolve VCO venv — the rl_kg_search.py module needs weaviate-client +
-# vco_lib, which live in the orchestrator's MCP venv, not the user's
-# project venv. The shared resolver enforces this distinction.
-# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
-. "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
-resolve_vco_venv_python "$SCRIPT_DIR"
-VENV="${VCO_VENV_PYTHON:-}"
-# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root — locate it
-# there (same roots as the venv above), never under $PROJECT_ROOT. It still
-# runs with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's
-# KG + shared + granted collections apply (see resolve_vco_orchestrator_script).
-resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/rl_kg_search.py"
-# Unresolved -> the legacy (absent) project path, so every existence check
-# below reads "not installed" exactly as before.
-RL_SCRIPT="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py}"
-# Pin the CALLING project's identity for the producer (a no-op whenever the
-# harness already set it): the script lives in the orchestrator root, so its
-# own location must never be what names the project.
-export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
-# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
-# (rl_kg_search.py reads it; MUST MATCH the .ps1 sibling).
-export VCO_RL_TASK_TYPE="subagent_kg_search"
-
-# Bail silently if the venv didn't resolve or the script is missing —
-# this hook is best-effort context injection, never blocking.
-if [ -z "$VENV" ] || [ ! -f "$RL_SCRIPT" ]; then
-    exit 0
-fi
-
-# Run the search with --hook-format. Each result block is prefixed with
-# "KG: <title> | <type> | score=<n.nn> | <body>". Limit to 3 matches —
-# more would push past the SubagentStart additionalContext cap (10 KB
-# in emit-context.sh) and dilute the signal.
-#
-# v0.2.77 Part 9 task 5: serve from the shared TTL cache when available. The
-# cache key namespaces on the "kg-subagent" surface + prompt + limit so a repeat
-# spawn with the same task prompt replays the cached RAW output (~ms) instead of
-# re-running the ~3.8 s search. The RAW (pre-grep/pre-head) block is cached so
-# the identical post-filtering below applies to a cache hit exactly as to a live
-# result — the injection is byte-identical, just faster. Falls back to the direct
-# call when the cache helper is absent (partial install).
-_SAKG_RAW=""
-_SAKG_KEY=""
-if command -v vco_query_cache_key >/dev/null 2>&1; then
-    _SAKG_KEY="$(vco_query_cache_key "kg-subagent" "$QUERY" 3)"
-fi
-if [ -n "$_SAKG_KEY" ] && command -v vco_query_cache_get >/dev/null 2>&1 \
-        && _SAKG_RAW="$(vco_query_cache_get "$_SAKG_KEY")"; then
-    : # cache hit — _SAKG_RAW holds the cached RAW producer output (maybe empty)
-else
-    _SAKG_RAW="$("$VENV" "$RL_SCRIPT" "$QUERY" --limit 3 --hook-format 2>/dev/null || true)"
-    if [ -n "$_SAKG_KEY" ] && command -v vco_query_cache_put >/dev/null 2>&1; then
-        vco_query_cache_put "$_SAKG_KEY" "$_SAKG_RAW"
-    fi
-fi
-# Apply the SAME post-filtering to cache hits and live results (identical output).
-MATCHES=$(printf '%s\n' "$_SAKG_RAW" \
-    | grep -v "^KG: no-results" \
-    | head -60 || echo "")
-
-# Whitespace-only / empty match: silent exit (nothing useful to inject).
-case "$MATCHES" in
-    *[![:space:]]*) ;;
-    *) exit 0 ;;
-esac
-
-# Format the additionalContext block. Mirror the pre-edit hook's shape
-# so the subagent sees a familiar `[KG context for ...]:` header it can
-# parse the same way as Edit-tool retrievals.
-HEADER_LABEL="${AGENT_TYPE:-subagent}"
-OUTPUT="[KG context for ${HEADER_LABEL} task]:"$'\n'$'\n'"${MATCHES}"$'\n'
-
-if command -v emit_additional_context >/dev/null 2>&1; then
-    emit_additional_context "$OUTPUT" SubagentStart
-else
-    # Inline fallback envelope when _lib/emit-context.sh is missing
-    # (partial install). Same JSON shape as emit_additional_context.
-    "$PY" -c "
-import json, sys
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'SubagentStart',
-        'additionalContext': sys.stdin.read(),
-    }
-}))
-" <<< "$OUTPUT" 2>/dev/null || true
 fi
 
 exit 0

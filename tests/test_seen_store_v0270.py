@@ -23,8 +23,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_DIR = REPO_ROOT / "templates" / "hooks" / "_lib"
 SEEN_SH = LIB_DIR / "seen-store.sh"
 SEEN_PS1 = LIB_DIR / "seen-store.ps1"
-CG_SH = LIB_DIR / "codegraph-query.sh"
-CG_PS1 = LIB_DIR / "codegraph-query.ps1"
 
 
 def _has_bash() -> bool:
@@ -58,20 +56,12 @@ def test_seen_store_ps1_sibling_exists() -> None:
     )
 
 
-def test_codegraph_query_ps1_sibling_exists() -> None:
-    assert CG_SH.exists(), "codegraph-query.sh missing"
-    assert CG_PS1.exists(), (
-        "codegraph-query.ps1 sibling MISSING — _lib/ is excluded from the "
-        "parity gate; this assertion is the guard."
-    )
-
-
 def test_lib_helpers_have_must_match_comments() -> None:
-    """The 5 cross-language must-match pairs are documented in the .sh files."""
+    """The cross-language must-match pairs are documented in the .sh files.
+    (v0.2.101 wave-2 SF-2: the codegraph-query pair was retired with its
+    lib — zero live callers after the router rework.)"""
     seen = SEEN_SH.read_text(encoding="utf-8")
-    cg = CG_SH.read_text(encoding="utf-8")
     assert "MUST MATCH" in seen and "seen-store.ps1" in seen
-    assert "MUST MATCH" in cg and "codegraph-query.ps1" in cg
 
 
 # --------------------------------------------------------------------------
@@ -206,7 +196,7 @@ def test_pretooluse_writes_repo_relative_to_unified_reads(tmp_path: Path) -> Non
     (proot / "templates" / "hooks" / "_lib").mkdir(parents=True)
     (proot / ".claude" / "state").mkdir(parents=True)
     (proot / ".claude" / "scripts").mkdir(parents=True)
-    for lib in ("session-id.sh", "seen-store.sh", "codegraph-query.sh"):
+    for lib in ("session-id.sh", "seen-store.sh"):
         (proot / "templates" / "hooks" / "_lib" / lib).write_bytes((LIB_DIR / lib).read_bytes())
     # Minimal _lib shims the hook sources unconditionally.
     (proot / "templates" / "hooks" / "_lib" / "stderr-cap.sh").write_text("# noop\n", encoding="utf-8")

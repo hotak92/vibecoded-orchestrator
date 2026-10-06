@@ -1,27 +1,51 @@
 #!/usr/bin/env bash
-# Pre-bash context injection hook (V52-M, v0.2.52)
-# Fires BEFORE Bash tool executes — when the command is >500 chars
-# (configurable via VCT_BASH_KG_THRESHOLD_CHARS), injects KG context
-# using the command itself as the query.
+# Pre-bash context injection hook — THIN WRAPPER (v0.2.101 injection redesign,
+# PLAN-V02101 §C1). Fires BEFORE the Bash tool executes.
 #
-# Output goes to stdout as a PreToolUse JSON envelope →
-# additionalContext the LLM sees before the bash runs.
+#   stdin → hook_context_router.py bash --intent-out <state> → emit envelope
 #
-# Pairs with post-bash-context-record.sh via a state file in
-# .claude/state/bash_task_<session>_<cmdhash>.json containing
-# {task_id, start_ts_ms, query, cmd_hash}. The post-hook reads this
-# file, emits the bash_outcome event with the SAME task_id (so
-# offline RL training can pair retrieval → outcome), then deletes it.
+# The ROUTER (claude_mcp_servers/scripts/hook_context_router.py) owns every
+# retrieval decision: intent classification (READ / EDIT / SEARCH /
+# MECHANICAL — MECHANICAL spawns no producer and injects nothing), query
+# building from target paths/symbols (NEVER from command text), the §2.1
+# noise gates, seen-store dedupe, the per-turn budget, the query cache and
+# the RL retrieval events (via rl_kg_search --injection-profile --task-type).
 #
-# Constraints:
-#   - Must complete in <3 seconds (timeout in settings.json)
-#   - Below threshold → silent skip (no KG noise on `ls` / `cd` / `git status`)
-#   - Never exit non-zero (would block the bash). Always exit 0.
-#   - If searches fail or return empty → exit 0 silently
+# What this wrapper still owns (WP-D 2):
+#   * the bash_task_<session>_<cmdhash>.json state file + the pre_bash
+#     outcome event — now for every READ/EDIT/SEARCH-classified command
+#     (UPSTREAM of the old 500-char gate: MORE events, richer labels), with
+#     intent/targets/symbols added to both payloads (additive keys —
+#     post-bash-context-record.sh pairing is UNCHANGED: same file name,
+#     same task_id join).
+#   * the emit_additional_context envelope around the router's text.
+#
+# RETIRED here (v0.2.101, owner-approved §C1): the 500-char threshold
+# (VCT_BASH_KG_THRESHOLD_CHARS — classification replaces it; the knob no
+# longer exists), the noise-strip query build, the inline code-graph bash
+# gate branch (the whole _lib/codegraph-query lib was retired with this, its
+# last caller), and the wrapper-side KG search/dedup (the router does both —
+# dedupe through the SAME seen-store files, format unchanged).
+#
+# Kill switches: VCT_DISABLE_HOOKS (all hooks) and VCO_INJECT_PROFILE=off
+# (injection surfaces only, via _lib/inject-budget.sh) — both checked BEFORE
+# any spawn. A missing venv / router is a silent no-op (soft-fail: a broken
+# install never blocks the user's Bash; the state file needs the router's
+# classification, so it is not written in that case either).
+#
+# Constraints: never exit non-zero (would block the bash). Always exit 0.
+# MUST MATCH pre-bash-context-inject.ps1.
 
 # Scrub sensitive env vars (this hook doesn't need credentials)
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7). v0.2.101: the
+#   delegate is claude_mcp_servers/scripts/hook_context_router.py (KG +
+#   code-graph legs loaded in-process, both access-aware via the weaviate_mcp
+#   server helpers reading VCT_KG_ACCESS_LIST / VCT_CODE_GRAPH_ACCESS_LIST).
+#   This hook does NOT query Weaviate directly; env propagates by subprocess
+#   inheritance. See tests/test_kg_access_list.py for the consumer contract.
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ]; then
@@ -35,326 +59,142 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 [ -z "${PY:-}" ] && exit 0
 
-# v0.2.70 Streams C+D+E: shared helpers for canonical session-id, the unified
-# seen-store dedup (pre-bash injected KG BLIND before this), and the gated
-# code-graph branch added below. Sourced only if present (partial-install
-# tolerance); the new logic no-ops gracefully when a helper is missing.
+# Canonical session-id (the router re-sanitizes from the payload itself; this
+# is for the STATE FILE name, which post-bash-context-record re-derives).
 # shellcheck source=_lib/session-id.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
-# shellcheck source=_lib/seen-store.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
-# shellcheck source=_lib/codegraph-query.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
-# v0.2.77 Part 9 task 2: shared TTL result-cache (codegraph_query_block + the
-# KG-search wrapper below). Sourced only if present (partial-install tolerance).
-# shellcheck source=_lib/query-cache.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/query-cache.sh" ] && . "$SCRIPT_DIR/_lib/query-cache.sh"
-# shellcheck source=_lib/command-noise-strip.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/command-noise-strip.sh" ] && . "$SCRIPT_DIR/_lib/command-noise-strip.sh"
-# v0.2.95 (lane F10): the write-target parser (shared with
-# post-bash-file-sync.sh) and the ONE home for the code-file extension test
-# (shared with pre-edit-context-inject.sh). Sourced only if present
-# (partial-install tolerance); without them this hook keeps its pre-v0.2.95
-# behaviour exactly.
-# shellcheck source=_lib/bash-write-targets.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/bash-write-targets.sh" ] && . "$SCRIPT_DIR/_lib/bash-write-targets.sh"
-# shellcheck source=_lib/code-extensions.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/code-extensions.sh" ] && . "$SCRIPT_DIR/_lib/code-extensions.sh"
+# v0.2.101: the injection kill switch (VCO_INJECT_PROFILE=off).
+# shellcheck source=_lib/inject-budget.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/inject-budget.sh" ] && . "$SCRIPT_DIR/_lib/inject-budget.sh"
 
-# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+if command -v vco_inject_profile_off >/dev/null 2>&1 && vco_inject_profile_off; then
+    exit 0
+fi
+
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec. The FULL
+# payload is forwarded to the router untouched (it resolves session_id /
+# prompt_id / transcript_path / cwd / tool_input itself — query text never
+# travels through argv, R31 privacy discipline). This parse extracts only
+# what the WRAPPER needs: the tool guard, the session id and the command
+# (for the pairing hash). transcript_path stays a PATH the router threads to
+# the producers; its contents are never read in this shell.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-# WP-E (v0.2.92): also extract transcript_path + prompt_id in the SAME parse
-# (avoids a second stdin read/JSON decode). transcript_path is a PATH only —
-# it is threaded to the producer's --transcript flag below and the file's
-# CONTENTS are read in-process by the shared vco_lib/transcript_context.py
-# reader there, never in this shell (R31 privacy discipline: thinking/output
-# text must never reach argv, `ps`, or a hook log). prompt_id scopes the
-# query-cache key (query-cache.sh) so two turns issuing the same short
-# trigger don't collide on one cache entry when their enriched text differs.
 _PARSED=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
     print(d.get('tool_name', ''))
     print(d.get('session_id', ''))
-    print(json.dumps(d.get('tool_input', {})))
-    print(d.get('transcript_path', ''))
-    print(d.get('prompt_id', ''))
+    print((d.get('tool_input') or {}).get('command', ''))
 except Exception:
     print('')
     print('')
-    print('{}')
     print('')
-    print('')
-" 2>/dev/null || printf '\n\n{}\n\n\n')
+" 2>/dev/null || printf '\n\n\n')
 TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '1p')
 SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
-TOOL_ARGS=$(printf '%s' "$_PARSED" | sed -n '3p')
-TRANSCRIPT_PATH=$(printf '%s' "$_PARSED" | sed -n '4p')
-PROMPT_ID=$(printf '%s' "$_PARSED" | sed -n '5p')
+COMMAND=$(printf '%s' "$_PARSED" | sed -n '3p')
 
 # Only fire for Bash tool
 if [[ "$TOOL_NAME" != "Bash" ]]; then
     exit 0
 fi
+[ -z "$COMMAND" ] && exit 0
 
-# v0.2.70 Stream E: unify session-id via the shared helper (parse+sanitise),
-# matching pre-edit / pre-tool-use / post-compact. SESSION_ID_RAW preserves the
-# trustworthy-vs-untrustworthy distinction for the seen-store ("" / "default" →
-# inject blind, no shared bucket). SESSION_ID keeps the "default" coercion for
-# the bash-task pairing file path (not cross-session-bleed sensitive).
+# v0.2.70 Stream E session discipline (unchanged): canonical sanitised id;
+# "default" coercion kept for the pairing-file path (not cross-session-bleed
+# sensitive — the router owns the bleed-guarded dedupe stores).
 if command -v vco_hook_session_id >/dev/null 2>&1; then
     SESSION_ID="$(vco_hook_session_id "$HOOK_STDIN")"
 fi
-SESSION_ID_RAW="$SESSION_ID"
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 
-# V52-M: propagate session_id to child processes (rl_kg_search.py reads
-# VCT_SESSION_ID as layer-2 of its 3-layer chain). Skip the "default"
-# sentinel — we'd rather have empty than a fake-key cohort.
+# V52-M: propagate session_id to child processes (the router's KG leg reads
+# VCT_SESSION_ID as layer-2 of the telemetry 3-layer chain). Skip the
+# "default" sentinel — we'd rather have empty than a fake-key cohort.
 if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "default" ]; then
     export VCT_SESSION_ID="$SESSION_ID"
 fi
 
-# Extract the bash command from tool_input.command
-COMMAND=$(printf '%s' "$TOOL_ARGS" | "$PY" -c "
-import sys, json
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('command', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-
-[ -z "$COMMAND" ] && exit 0
-
-# === v0.2.95 (lane F10): does this command WRITE a file? ===================
-# Owner, 2026-09-16: "the query to KG/CodeGraph should be structured as it
-# would be if the operation was performed through write/edit tools".
-# pre-edit-context-inject.sh builds its query from the FILE — module name
-# from the basename + a content snippet — and anchors the code-graph leg on
-# that path. This hook used the raw first 500 chars of the COMMAND, which
-# for `cat > knowledge/retrieval-tiers.md <<EOF` is mostly shell syntax.
-#
-# So: when the shared parser recovers a write TARGET from the command, the
-# query below is built the pre-edit way from that path. When it does not
-# (the overwhelmingly common case — `ls`, `git`, `pytest`), every line
-# below behaves exactly as it did before v0.2.95.
-#
-# The prefilter is pure bash and short-circuits with ZERO subprocess for
-# routine commands, so the steady-state cost is one string scan.
-WRITE_TARGET=""
-WRITE_SNIPPET=""
-WRITE_MODULE=""
-if command -v vco_bash_write_prefilter >/dev/null 2>&1 \
-    && vco_bash_write_prefilter "$COMMAND"; then
-    vco_bash_write_init "$SCRIPT_DIR" "$PY"
-    _WT_OUT="$(vco_bash_write_prebash "$COMMAND" "$PROJECT_ROOT")"
-    WRITE_TARGET=$(printf '%s' "$_WT_OUT" | sed -n '1p')
-    WRITE_SNIPPET=$(printf '%s' "$_WT_OUT" | sed -n '2p')
-fi
-if [ -n "$WRITE_TARGET" ]; then
-    _WT_BASENAME="${WRITE_TARGET##*/}"
-    WRITE_MODULE="${_WT_BASENAME%.*}"   # retrieval_rl.py -> retrieval_rl
-fi
-
-# === v0.2.70 Stream C Surface 2: gated code-graph injection on Bash ===
-# Runs on EVERY Bash call BEFORE the (KG-only) 500-char threshold gate, because
-# a short `grep -rn "migrate_collections"` should surface codegraph even though
-# it's well under 500 chars. The gate (codegraph_bash_gate) is pure-bash and
-# short-circuits with ZERO subprocess for routine ls/cd/git/cat/etc — the
-# steady-state cost on a non-code command is one regex chain (~us). Only when the
-# command genuinely navigates code do we spawn the (timeout-bounded) helper.
-# Output is deduped through the SAME shared seen-store as pre-edit/pre-tool-use.
-_CG_SYM=""
-_CG_ANCHOR=""
-_CG_EXCLUDE=""
-_CG_HEADER=""
-if [ -n "$WRITE_TARGET" ] \
-    && command -v vco_is_code_file >/dev/null 2>&1 \
-    && vco_is_code_file "$WRITE_TARGET"; then
-    # v0.2.95 (lane F10): the pre-edit shape — module name + content
-    # snippet as the query, the written file as BOTH the --anchor (bias the
-    # rerank toward call-linked code) and the exclude (don't hand back the
-    # file the command is rewriting). Byte-for-byte the argument shape
-    # pre-edit-context-inject.sh passes for an Edit of the same file.
-    _CG_SYM="$WRITE_MODULE"
-    [ -n "$WRITE_SNIPPET" ] && _CG_SYM="$WRITE_MODULE $WRITE_SNIPPET"
-    _CG_ANCHOR="$WRITE_TARGET"
-    _CG_EXCLUDE="$WRITE_TARGET"
-    _CG_HEADER="Code-graph context for ${WRITE_TARGET##*/}"
-elif command -v codegraph_bash_gate >/dev/null 2>&1 && codegraph_bash_gate "$COMMAND"; then
-    _CG_SYM="$COMMAND"
-    if command -v codegraph_extract_symbol >/dev/null 2>&1; then
-        _CG_SYM="$(codegraph_extract_symbol "$COMMAND")"
-    fi
-    # v0.2.72 P2: the extracted symbol doubles as the --anchor (5th arg) so the
-    # CLI's shared pipeline biases the rerank toward code call-linked to it.
-    _CG_ANCHOR="$_CG_SYM"
-    _CG_HEADER="Code-graph context for symbol: ${_CG_SYM}"
-fi
-# P1e (v0.2.75): codegraph_extract_symbol returns EMPTY when no discrete
-# code symbol is isolable (env-assignment / path-only / regex fragment /
-# `git diff sha..HEAD` etc.). An empty symbol means NO injection — a
-# garbage whole-command query is worse than none. Skip explicitly here
-# (codegraph_query_block also guards on empty query, but the explicit skip
-# keeps the no-injection contract obvious).
-if [ -n "$_CG_SYM" ] && command -v codegraph_query_block >/dev/null 2>&1; then
-    _CG_RAW="$(codegraph_query_block "$_CG_SYM" "" 2 "$_CG_EXCLUDE" "$_CG_ANCHOR" "$PROMPT_ID" "$TRANSCRIPT_PATH" 2>/dev/null || true)"
-    if [ -n "$_CG_RAW" ]; then
-        _CGB_INJECT=""
-        _CGB_READS=""
-        if command -v vco_seen_store_path >/dev/null 2>&1; then
-            _CGB_INJECT="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-            _CGB_READS="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-        fi
-        if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
-            _CG_RAW="$(vco_filter_seen_blocks "$_CG_RAW" "$_CGB_INJECT" "$_CGB_READS")"
-        fi
-        case "$_CG_RAW" in
-            *[![:space:]]*)
-                if command -v emit_additional_context >/dev/null 2>&1; then
-                    emit_additional_context "[${_CG_HEADER}]:"$'\n'$'\n'"$_CG_RAW" PreToolUse
-                fi
-                ;;
-        esac
-    fi
-fi
-
-# === Threshold gate ===
-# User-locked answer to Q6 (2026-06-09): fixed 500 chars threshold,
-# with VCT_BASH_KG_THRESHOLD_CHARS env override for power users who
-# want to tune the noise/value ratio for their workflow.
-THRESHOLD="${VCT_BASH_KG_THRESHOLD_CHARS:-500}"
-CMD_LEN=${#COMMAND}
-if [ "$CMD_LEN" -lt "$THRESHOLD" ]; then
-    exit 0
-fi
-
-# === Compute deterministic cmd hash for state-file pairing ===
-# md5 of the command — stable enough that post-bash can re-derive it
-# from the same stdin and find our state file. Python hashlib for
-# portability (md5sum is GNU-only).
+# === Deterministic cmd hash for state-file pairing (UNCHANGED contract) ===
+# md5 of the command, first 16 hex chars — post-bash-context-record.sh
+# re-derives the SAME path from its own stdin (tests/test_v52_m_prepost_hooks.py
+# pins the parity). Python hashlib for portability (md5sum is GNU-only).
 CMD_HASH=$(printf '%s' "$COMMAND" | "$PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest()[:16])" 2>/dev/null)
 if [ -z "$CMD_HASH" ]; then
     # Fallback: sanitized prefix (no slashes); degrades to weaker pairing
     CMD_HASH=$(printf '%s' "$COMMAND" | tr '/' '_' | tr -cd '[:alnum:]_' | head -c 32)
 fi
+CMD_LEN=${#COMMAND}
 
-# === Write pre-bash state file for post-bash to pair with ===
 STATE_DIR="$PROJECT_ROOT/.claude/state"
 mkdir -p "$STATE_DIR" 2>/dev/null || true
-STATE_FILE="$STATE_DIR/bash_task_${SESSION_ID}_${CMD_HASH}.json"
+# The router's classification handoff (WP-D 2): written by --intent-out,
+# read below, then removed. Named like the state file so the 1d GC covers it.
+INTENT_FILE="$STATE_DIR/bash_intent_${SESSION_ID}_${CMD_HASH}.json"
 
-# Generate task_id; same hex8 shape as rl_kg_search.py's pre_edit_* keys.
-TASK_ID="pre_bash_$("$PY" -c "import uuid; print(uuid.uuid4().hex[:8])" 2>/dev/null)"
-[ "$TASK_ID" = "pre_bash_" ] && TASK_ID="pre_bash_${CMD_HASH:0:8}"  # fallback
-
-START_TS_MS=$("$PY" -c "import time; print(int(time.time()*1000))" 2>/dev/null || echo 0)
-
-# Use Python to write JSON (avoid shell-escaping issues with command containing quotes/newlines)
-"$PY" -c "
-import json, sys, os
-state = {
-    'task_id': '$TASK_ID',
-    'start_ts_ms': $START_TS_MS,
-    'session_id': '$SESSION_ID',
-    'cmd_hash': '$CMD_HASH',
-    'cmd_len': $CMD_LEN,
-}
-try:
-    with open('$STATE_FILE', 'w') as f:
-        json.dump(state, f)
-except Exception:
-    pass
-" 2>/dev/null || true
-
-# v0.2.29 GC: prune state files older than 1 day. bash sessions are
-# short; stale state files are evidence of a post-hook that never
-# fired (crashes, kills, hung commands) — safe to drop.
-# HK-4 (v0.2.75) accepted-scatter: one of 4 per-hook GC sweeps. This one uses
-# a DELIBERATE 1d threshold (bash task state is short-lived) vs the 14d used
-# by the reads/cache/snapshot sweeps — so it could NOT share a single uniform
-# sweeper even if we consolidated. Kept per-hook; consolidation SKIPPED. See
-# pre-edit-context-inject.sh.
-find "$STATE_DIR" -maxdepth 1 -type f -name "bash_task_*.json" -mtime +1 -delete 2>/dev/null || true
-
-# === Resolve venv for rl_kg_search.py subprocess ===
+# === Resolve venv + the router (orchestrator-root script, v0.2.100 F3 discipline) ===
 # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
 . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
 resolve_vco_venv_python "$SCRIPT_DIR"
 VENV="${VCO_VENV_PYTHON:-}"
-# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root — locate it
-# there (same roots as the venv above), never under $PROJECT_ROOT. It still
-# runs with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's
-# KG + shared + granted collections apply (see resolve_vco_orchestrator_script).
-resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/rl_kg_search.py"
-# Unresolved -> the legacy (absent) project path, so every existence check
-# below reads "not installed" exactly as before.
-RL_SCRIPT="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py}"
-# Pin the CALLING project's identity for the producer (a no-op whenever the
-# harness already set it): the script lives in the orchestrator root, so its
-# own location must never be what names the project.
+if [ -z "$VENV" ] || [ ! -f "$VENV" ]; then
+    # No VCO venv = broken/absent install: the router cannot run, and the
+    # state file's intent gate depends on it — silent no-op (soft-fail).
+    exit 0
+fi
+resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/hook_context_router.py"
+ROUTER="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/hook_context_router.py}"
+if [ ! -f "$ROUTER" ]; then
+    exit 0
+fi
+# Pin the CALLING project's identity for the router + producers (a no-op
+# whenever the harness already set it): the script lives in the orchestrator
+# root, so its own location must never be what names the project.
 export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
-# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
-# (rl_kg_search.py reads it; MUST MATCH the .ps1 sibling).
-export VCO_RL_TASK_TYPE="pre_bash_kg_search"
 
-# === Run KG search using command as query ===
-# Truncate the query to ~500 chars so the embedding model isn't fed
-# multi-kilobyte input (qwen3-embedding:0.6b needs num_ctx=8192 but
-# longer queries dilute the semantic signal). The pre-edit hook caps
-# new_string at 200 chars for the same reason; bash commands tend to
-# have richer structure so we allow more headroom.
-#
-# v0.2.70 Stream D-3 (command-noise strip): the KG query is built from the raw
-# bash command, which is mostly flags and paths. The noise-strip logic lives in
-# the shared _lib/command-noise-strip.sh (ONE bash home — no inline copy here,
-# none in the test). vco_strip_command_noise drops flags, paths (keeping a code-
-# file basename), shell operators + bare cwd dots, so a bare `cd /some/dir` or
-# `ls -la` yields little query signal instead of injecting directory-keyword KG.
-# Falls back to the raw (capped) command if the strip leaves nothing OR the
-# helper is missing (partial install).
-QUERY_RAW=$(printf '%s' "$COMMAND" | head -c 500)
-if command -v vco_strip_command_noise >/dev/null 2>&1; then
-    QUERY="$(vco_strip_command_noise "$QUERY_RAW")"
-else
-    QUERY="$QUERY_RAW"
-fi
-# Strip fallback: if noise-removal emptied the query, use the raw command so a
-# genuinely identifier-only long command still searches.
-[ -z "$QUERY" ] && QUERY="$QUERY_RAW"
+# === Run the router (single interpreter; inner budget VCO_INJECT_BUDGET_S) ===
+INJECT=$(printf '%s' "$HOOK_STDIN" | "$VENV" "$ROUTER" bash --intent-out "$INTENT_FILE" 2>/dev/null || true)
 
-# v0.2.95 (lane F10): when the command WRITES a file, structure the query the
-# way pre-edit-context-inject.sh does — "<module-name> <content snippet>" —
-# instead of leading with command text. The heredoc body is the closest
-# analogue of pre-edit's `new_string` snippet; when there is none (a `sed -i`,
-# a `cp`) the noise-stripped command keeps its role as the content signal,
-# prefixed by the module name. No write target => this block is inert and the
-# query is byte-for-byte what it was before.
-if [ -n "$WRITE_TARGET" ]; then
-    if [ -n "$WRITE_SNIPPET" ]; then
-        QUERY="$WRITE_MODULE $WRITE_SNIPPET"
-    else
-        QUERY="$WRITE_MODULE $QUERY"
-    fi
-fi
+# === Read the classification back (WP-D 2 gate for state + outcome) ===
+_INT_PARSED=$(VCT_PB_INTENT_FILE="$INTENT_FILE" "$PY" -c "
+import json, os
+try:
+    with open(os.environ.get('VCT_PB_INTENT_FILE', ''), encoding='utf-8') as fh:
+        d = json.load(fh)
+except Exception:
+    d = {}
+print(d.get('intent', '') or '')
+print(json.dumps(d.get('targets', []) or []))
+print(json.dumps(d.get('symbols', []) or []))
+" 2>/dev/null || printf '\n[]\n[]')
+INTENT=$(printf '%s' "$_INT_PARSED" | sed -n '1p')
+TARGETS_JSON=$(printf '%s' "$_INT_PARSED" | sed -n '2p')
+SYMBOLS_JSON=$(printf '%s' "$_INT_PARSED" | sed -n '3p')
+rm -f "$INTENT_FILE" 2>/dev/null || true
+
+# v0.2.29 GC (HK-4 accepted-scatter, deliberate 1d threshold — unchanged
+# `-mtime +1` semantics): prune stale pairing state AND the intent handoffs.
+find "$STATE_DIR" -maxdepth 1 -type f -name "bash_task_*.json" -mtime +1 -delete 2>/dev/null || true
+find "$STATE_DIR" -maxdepth 1 -type f -name "bash_intent_*.json" -mtime +1 -delete 2>/dev/null || true
 
 # === F-LOG (v0.2.70): emit the pre_bash pairing event ===
-# The pre_bash event_type was declared in outcome_emit.OUTCOME_EVENT_TYPES but
-# NEVER written — only the state file above was, so the offline trainer logged
-# 0 pre_bash rows and (pre_bash, bash_outcome) training pairs were
-# unconstructable. Emit it now with the SAME task_id post-bash will reuse, so
-# the pair is JOINable by task_id. The query snippet is passed via env (not
-# string-interpolated into the python source) so a command containing quotes/
-# newlines can't break the emit. Soft-fail; backgrounded so it never delays the
-# user's bash command.
-if [ -n "$VENV" ] && [ -f "$VENV" ]; then
+# SAME task_id post-bash-context-record reuses, so the (pre_bash,
+# bash_outcome) pair stays JOINable. v0.2.101 WP-D 2: intent + extracted
+# targets/symbols join the payload (richer training labels). Query snippet
+# + payload travel via env, never string-interpolated into the python
+# source. Soft-fail; backgrounded so it never delays the user's command.
+# Kept as a function at top-level indent so the child-env block matches the
+# pre-v0.2.101 shape the v0.2.94 root-handoff pin asserts.
+_emit_prebash_outcome() {
     ( VCT_PREBASH_QUERY=$(printf '%s' "$COMMAND" | head -c 120) \
       VCT_PREBASH_TASK_ID="$TASK_ID" \
       VCT_PREBASH_CMD_LEN="$CMD_LEN" \
       VCT_PREBASH_TS_MS="$START_TS_MS" \
       VCT_PREBASH_SESSION="$SESSION_ID" \
+      VCT_PREBASH_INTENT="$INTENT" \
+      VCT_PREBASH_TARGETS="$TARGETS_JSON" \
+      VCT_PREBASH_SYMBOLS="$SYMBOLS_JSON" \
       VCT_PROJECT_ROOT="$PROJECT_ROOT" \
       "$VENV" -c "
 import os
@@ -379,6 +219,13 @@ def _int(name):
         return int(os.environ.get(name, '0') or '0')
     except (TypeError, ValueError):
         return 0
+def _list(name):
+    import json as _json
+    try:
+        v = _json.loads(os.environ.get(name, '[]') or '[]')
+        return v if isinstance(v, list) else []
+    except Exception:
+        return []
 try:
     from claude_mcp_servers.rl_client.outcome_emit import emit_outcome_event
     emit_outcome_event(
@@ -389,6 +236,9 @@ try:
             'cmd_len': _int('VCT_PREBASH_CMD_LEN'),
             'query': os.environ.get('VCT_PREBASH_QUERY', ''),
             'ts_ms': _int('VCT_PREBASH_TS_MS'),
+            'intent': os.environ.get('VCT_PREBASH_INTENT', ''),
+            'targets': _list('VCT_PREBASH_TARGETS'),
+            'symbols': _list('VCT_PREBASH_SYMBOLS'),
         },
         session_id=os.environ.get('VCT_PREBASH_SESSION', ''),
         project_id=project_id,
@@ -396,66 +246,88 @@ try:
 except Exception:
     pass
 " >/dev/null 2>&1 ) &
-fi
-
-KG_TMP=$(mktemp)
-if [ -n "$VENV" ] && [ -f "$RL_SCRIPT" ]; then
-    # v0.2.77 Part 9 task 2: route through the shared TTL result-cache wrapper
-    # so a repeat command-derived query is served from disk (~ms) instead of
-    # re-paying the ~1.3 s round-trip. Falls back to the direct call when the
-    # cache helper is absent (partial install).
-    if command -v vco_kg_search_cached >/dev/null 2>&1; then
-        # WP-E (v0.2.92): prompt_id scopes the cache key; transcript_path
-        # threads to the producer's --transcript flag (path only — see the
-        # parse block above for the privacy rationale).
-        ( vco_kg_search_cached "$VENV" "$RL_SCRIPT" "$QUERY" 1 "$PROMPT_ID" "$TRANSCRIPT_PATH" > "$KG_TMP" 2>/dev/null ) &
-        KG_PID=$!
-    else
-        _FALLBACK_ARGS=("$QUERY" --limit 1 --hook-format)
-        [ -n "$TRANSCRIPT_PATH" ] && _FALLBACK_ARGS+=(--transcript "$TRANSCRIPT_PATH")
-        ("$VENV" "$RL_SCRIPT" "${_FALLBACK_ARGS[@]}" 2>/dev/null \
-            | head -40 > "$KG_TMP") &
-        KG_PID=$!
-    fi
-    wait "$KG_PID" 2>/dev/null || true
-fi
-
-KG_RESULT=$(cat "$KG_TMP" 2>/dev/null || true)
-rm -f "$KG_TMP"
-
-# === v0.2.70 Stream E: dedup the KG result through the shared seen-store ===
-# Before this, pre-bash injected KG BLIND — re-providing nodes pre-edit had
-# already shown (and vice-versa). Now both injectors consult the SAME
-# seen_inject_<sid>.txt (per-chunk KG keys) + reads ledger. Untrustworthy
-# session id → helper returns empty store path → inject blind (no shared bucket).
-if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
-    _PB_INJECT=""
-    _PB_READS=""
-    if command -v vco_seen_store_path >/dev/null 2>&1; then
-        _PB_INJECT="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-        _PB_READS="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-    fi
-    KG_RESULT="$(vco_filter_seen_blocks "$KG_RESULT" "$_PB_INJECT" "$_PB_READS")"
-fi
-
-# === Helper: emit context as PreToolUse JSON envelope ===
-_emit_context_json() {
-    if command -v emit_additional_context >/dev/null 2>&1; then
-        emit_additional_context "$1" PreToolUse
-    fi
 }
 
-# === Only output if we found something ===
-case "$KG_RESULT" in
-    *[![:space:]]*)
-        # First line of the command for the header (truncate long pipelines)
-        FIRST_LINE=$(printf '%s' "$COMMAND" | head -1 | head -c 80)
-        OUTPUT="[Pre-bash context for: ${FIRST_LINE}]:"$'\n'$'\n'"${KG_RESULT}"$'\n'
-        _emit_context_json "$OUTPUT"
+# === State file + pre_bash outcome event: READ/EDIT/SEARCH only ===
+# MECHANICAL commands get NO pairing state and NO outcome event (WP-D 2:
+# the intent gate replaces the 500-char gate — more events than before on
+# short classified commands, none on routine noise).
+case "$INTENT" in
+    READ|EDIT|SEARCH)
+        STATE_FILE="$STATE_DIR/bash_task_${SESSION_ID}_${CMD_HASH}.json"
+        # Wave-2 review nit-5: the §C1 if-group fires ONE handler per matching
+        # rule, so a multi-match command (`cat x | grep y`) spawns this hook
+        # TWICE for ONE tool call. The injection side is idempotent (the
+        # router's seen-store + query cache); the pairing side must be too —
+        # a FRESH (<60 s) unpaired state file means a sibling spawn already
+        # paired this call, so skip the rewrite and the second pre_bash event
+        # (the old shape emitted an orphan with a distinct task_id). A
+        # genuinely re-run command pairs + deletes its file via
+        # post-bash-context-record before the re-run, so it emits fresh; a
+        # file older than 60 s (crashed/long run) is overwritten as before.
+        if [ -n "$(find "$STATE_FILE" -mmin -1 2>/dev/null)" ]; then
+            :
+        else
+        # task_id: same hex8 shape as rl_kg_search.py's pre_bash_* keys.
+        TASK_ID="pre_bash_$("$PY" -c "import uuid; print(uuid.uuid4().hex[:8])" 2>/dev/null)"
+        [ "$TASK_ID" = "pre_bash_" ] && TASK_ID="pre_bash_${CMD_HASH:0:8}"  # fallback
+        START_TS_MS=$("$PY" -c "import time; print(int(time.time()*1000))" 2>/dev/null || echo 0)
+
+        # JSON written by Python (env-passed fields — a command with quotes/
+        # newlines can never break the emit). Same core fields as before
+        # (post-bash pairing) + the WP-D 2 additions.
+        VCT_PB_STATE_FILE="$STATE_FILE" \
+        VCT_PB_TASK_ID="$TASK_ID" \
+        VCT_PB_START_TS="$START_TS_MS" \
+        VCT_PB_SESSION="$SESSION_ID" \
+        VCT_PB_HASH="$CMD_HASH" \
+        VCT_PB_LEN="$CMD_LEN" \
+        VCT_PB_INTENT="$INTENT" \
+        VCT_PB_TARGETS="$TARGETS_JSON" \
+        VCT_PB_SYMBOLS="$SYMBOLS_JSON" \
+        "$PY" -c "
+import json, os
+def _int(name):
+    try:
+        return int(os.environ.get(name, '0') or '0')
+    except (TypeError, ValueError):
+        return 0
+def _list(name):
+    try:
+        v = json.loads(os.environ.get(name, '[]') or '[]')
+        return v if isinstance(v, list) else []
+    except Exception:
+        return []
+state = {
+    'task_id': os.environ.get('VCT_PB_TASK_ID', ''),
+    'start_ts_ms': _int('VCT_PB_START_TS'),
+    'session_id': os.environ.get('VCT_PB_SESSION', ''),
+    'cmd_hash': os.environ.get('VCT_PB_HASH', ''),
+    'cmd_len': _int('VCT_PB_LEN'),
+    'intent': os.environ.get('VCT_PB_INTENT', ''),
+    'targets': _list('VCT_PB_TARGETS'),
+    'symbols': _list('VCT_PB_SYMBOLS'),
+}
+try:
+    with open(os.environ.get('VCT_PB_STATE_FILE', ''), 'w') as f:
+        json.dump(state, f)
+except Exception:
+    pass
+" 2>/dev/null || true
+
+        _emit_prebash_outcome
+        fi
         ;;
-    *)
-        # Empty KG result — still keep the state file (post-bash can
-        # emit a degraded-mode bash_outcome) but don't inject anything.
+esac
+
+# === Emit the router's injection text (if any) ===
+case "$INJECT" in
+    *[![:space:]]*)
+        if command -v emit_additional_context >/dev/null 2>&1; then
+            # First line of the command for the header (truncate long pipelines)
+            FIRST_LINE=$(printf '%s' "$COMMAND" | head -1 | head -c 80)
+            emit_additional_context "[Pre-bash context for: ${FIRST_LINE}]:"$'\n'$'\n'"${INJECT}" PreToolUse
+        fi
         ;;
 esac
 

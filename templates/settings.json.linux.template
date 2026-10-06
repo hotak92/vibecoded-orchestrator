@@ -238,7 +238,62 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
-            "timeout": 8
+            "timeout": 10,
+            "if": "Bash(cat *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(head *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(tail *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(sed *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(grep *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(rg *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(git show*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(git grep*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(git diff*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(git log*)"
           }
         ]
       },
@@ -258,8 +313,39 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-edit-context-inject.sh\"",
-            "timeout": 8,
+            "timeout": 10,
             "if": "Edit(*)"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-write-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Write(*)"
+          }
+        ]
+      },
+      {
+        "matcher": "Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/grep-context-inject.sh\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-brief-kg-inject.sh\"",
+            "timeout": 10
           }
         ]
       },
@@ -375,6 +461,16 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/py-compile-check.sh\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/read-context-inject.sh\"",
             "timeout": 10
           }
         ]

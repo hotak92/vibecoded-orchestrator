@@ -128,7 +128,7 @@ function Emit-AdditionalContext {
 # Basenames, no extension — each reader appends its own.
 # MUST MATCH `_lib/emit-context.sh`'s vco_required_hook_libs / vco_hook_lib_role.
 function Get-VcoRequiredHookLibs {
-    return @("route-touched-path", "bash-write-targets", "code-extensions")
+    return @("route-touched-path", "bash-write-targets", "code-extensions", "inject-budget")
 }
 
 # One clause naming what the file is the one home FOR and what stops without
@@ -146,6 +146,9 @@ function Get-VcoHookLibRole {
         }
         "code-extensions" {
             return "deciding which touched paths are code, so nothing is being queued for the end-of-turn code-graph drain and the code graph has stopped tracking this project"
+        }
+        "inject-budget" {
+            return "the injection wrappers' kill-switch fast path and per-turn budget probe, so VCO_INJECT_PROFILE=off no longer short-circuits before the spawn and every injection surface pays a full router run even while the user switched injection off"
         }
         default {
             return "part of this project's shipped hook library, and the hook that needs it has stopped doing its job"

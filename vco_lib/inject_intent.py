@@ -15,13 +15,13 @@ What lives here
   classifier NEVER uses command text as an embedding query (owner rule,
   plan-v0300 lines 118-123): the query is always built from the target
   path/symbols.
-* **A1 gate ports** — :func:`pattern_gate`, :func:`bash_gate`,
-  :func:`extract_symbol` are the Python port of
-  ``templates/hooks/_lib/codegraph-query.sh``'s gates. This module is the
-  ONE HOME; the shell/PowerShell copies remain ONLY as the legacy hooks'
-  code path until Wave 2 retires them with their callers, and
-  ``tests/test_v02101_inject_intent_classifier.py`` pins them against each
-  other (drift is a finding — plan §3 WP-A1).
+* **A1 gate ports** — :func:`pattern_gate` and :func:`extract_symbol` are
+  the Python port of the retired shell gates
+  (``templates/hooks/_lib/codegraph-query.{sh,ps1}``). Wave 2 deleted the
+  shell copies together with their last legacy callers (the pre-bash /
+  pre-edit rewires + the pre-tool-use branch removal), so this module is
+  the ONLY implementation — no parity partner, no mirror. The P1e extractor
+  corpus lives on in ``tests/test_p1e_codegraph_extract_symbol.py``.
 * **A1 EDIT parser reuse** — write targets / heredoc snippets come from
   :mod:`vco_lib.bash_write_targets` (already the one home the
   ``_lib/bash-write-targets.{sh,ps1}`` delegators call). No second parser.
@@ -248,17 +248,13 @@ def _search_pattern(tokens: Sequence[str]) -> str:
     return ""
 
 
-# --- A1 gate ports (ONE HOME; shell copies are interim, parity-pinned) -------
-# MUST MATCH (until Wave 2 retires them with their callers):
-#   templates/hooks/_lib/codegraph-query.sh  codegraph_pattern_gate /
-#                                            codegraph_bash_gate /
-#                                            codegraph_extract_symbol
-#   templates/hooks/_lib/codegraph-query.ps1 Test-VcoCodegraphPatternGate /
-#                                            Test-VcoCodegraphBashGate /
-#                                            Get-VcoCodegraphSymbol
-# tests/test_v02101_inject_intent_classifier.py::TestShellParity drives both
-# sides over one corpus — if you change a rule HERE, change it THERE in the
-# same cycle or the parity test goes red (that is the design).
+# --- A1 gate ports (ONE HOME — the shell copies were retired in Wave 2) ------
+# History: these were ported from templates/hooks/_lib/codegraph-query.{sh,ps1}
+# (codegraph_pattern_gate / codegraph_extract_symbol), which kept interim
+# copies for the legacy hooks until Wave 2 deleted them WITH their last
+# callers. No cross-language mirror remains; the port fidelity is pinned by
+# the corpus tests (test_v02101_inject_intent_classifier.py,
+# test_p1e_codegraph_extract_symbol.py).
 
 _PATTERN_SNAKE_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+")
 _PATTERN_CAMEL_RE = re.compile(r"[A-Z][a-z]+[A-Z]")
@@ -280,25 +276,6 @@ def pattern_gate(p: str) -> bool:
     if _PATTERN_CALL_RE.search(p):
         return True
     if _PATTERN_KEYWORD_RE.search(p):
-        return True
-    return False
-
-
-_BASH_GATE_CODE_FILE_RE = re.compile(
-    r"(^|[\s/])[A-Za-z0-9_-]+\."
-    r"(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto)"
-    r"([^A-Za-z0-9]|$)"
-)
-_BASH_GATE_TOOL_RE = re.compile(r"(^|[\s|])(grep|rg|ag|ack)(\s|$)")
-
-
-def bash_gate(command: str) -> bool:
-    """Port of ``codegraph_bash_gate`` (the legacy pre-bash prefilter)."""
-    if not command:
-        return False
-    if _BASH_GATE_CODE_FILE_RE.search(command):
-        return True
-    if _BASH_GATE_TOOL_RE.search(command) and pattern_gate(command):
         return True
     return False
 

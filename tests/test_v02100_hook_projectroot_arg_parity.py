@@ -123,9 +123,11 @@ def test_powershell_helper_set_is_derived_and_non_trivial():
     names = _ps_helpers_needing_root()
     # The four that 9be49441 broke must be in the derived set, or the scan
     # below proves nothing about them.
+    # v0.2.101 wave-2 SF-2: Get-VcoBashWritePreBash retired (zero callers —
+    # the router uses the Python prebash_query_parts home directly).
     for must in ("Get-VcoSeenStorePath", "Get-VcoCgInjectCountPath",
                  "Test-VcoCgInjectNoteOnce", "ConvertTo-VcoRepoRelative",
-                 "Take-Snapshot", "Get-VcoBashWritePreBash"):
+                 "Take-Snapshot"):
         assert must in names, (must, sorted(names))
 
 
@@ -208,11 +210,29 @@ def test_every_shell_call_passes_project_root():
 # Behavioural: the real pre-edit .ps1 dedupes across two edits of one session
 # --------------------------------------------------------------------------
 
+# v0.2.101 Wave 2: dual-shaped stub — MODULE mode (the router loads it via
+# hook_dual_search._load_cg_module and calls main() with the pinned argv)
+# and CLI mode (any legacy direct spawn). Same output either way.
 _STUB = (
-    "import sys\n"
-    "if '--hook-format' in sys.argv:\n"
+    "import argparse, os, sys\n"
+    "def _emit():\n"
     "    print('KG: Sample Node B | concept | score=0.85 | src=knowledge/b.md | FULL NODE:')\n"
     "    print('body content')\n"
+    "def main():\n"
+    "    ap = argparse.ArgumentParser()\n"
+    "    ap.add_argument('query')\n"
+    "    ap.add_argument('--limit', type=int, default=1)\n"
+    "    ap.add_argument('--hook-format', action='store_true')\n"
+    "    ap.add_argument('--injection-profile', default=None)\n"
+    "    ap.add_argument('--task-type', default=None)\n"
+    "    ap.add_argument('--transcript', default=None)\n"
+    "    a = ap.parse_args()\n"
+    "    if a.hook_format:\n"
+    "        _emit()\n"
+    "    return 0\n"
+    "if __name__ == '__main__':\n"
+    "    if '--hook-format' in sys.argv:\n"
+    "        _emit()\n"
 )
 
 
@@ -223,6 +243,13 @@ def _ps_sandbox(tmp_path: Path):
     shutil.copytree(HOOKS, orch / "templates" / "hooks")
     (orch / "claude_mcp_servers" / "scripts").mkdir(parents=True)
     (orch / "claude_mcp_servers" / "scripts" / "rl_kg_search.py").write_text(_STUB, encoding="utf-8")
+    # v0.2.101: the pre-edit wrapper resolves hook_context_router.py from
+    # $VCT_INSTALL_ROOT — ship the REAL router + its dual-search mechanism
+    # into the sandbox (the router's vco_lib imports resolve via the
+    # PYTHONPATH pin in _run_pre_edit).
+    for name in ("hook_context_router.py", "hook_dual_search.py"):
+        src = REPO / "claude_mcp_servers" / "scripts" / name
+        (orch / "claude_mcp_servers" / "scripts" / name).write_bytes(src.read_bytes())
     venv_bin = orch / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     os.symlink(shutil.which("python3") or sys.executable, venv_bin / "python")
@@ -241,6 +268,8 @@ def _run_pre_edit(orch: Path, proj: Path, file_name: str, tmp_path: Path):
         "CLAUDE_PROJECT_DIR": str(proj),
         "HOME": str(tmp_path / "home"),
         "WEAVIATE_URL": "http://127.0.0.1:9",
+        "PYTHONPATH": str(REPO),
+        "RL_HUB_POST_DISABLED": "1",
     })
     return subprocess.run(
         ["pwsh", "-NoProfile", "-File",
@@ -268,28 +297,11 @@ def test_pre_edit_ps1_second_edit_in_session_is_deduped(tmp_path):
     )
 
 
-@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not installed")
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX stub CLI")
-def test_ps1_codegraph_helper_forwards_the_transcript(tmp_path):
-    """Every .ps1 caller passes -TranscriptPath; the helper's parameter is
-    $Transcript. A plain function silently drops an unknown named argument into
-    $args, so before the alias the transcript never reached the CLI on Windows
-    (the .sh sibling always forwarded it)."""
-    proj = tmp_path / "proj"
-    scripts = proj / ".claude" / "scripts"
-    scripts.mkdir(parents=True)
-    argv_file = tmp_path / "argv.txt"
-    cli = scripts / "code-graph-query"
-    cli.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{argv_file}"\n', encoding="utf-8")
-    cli.chmod(0o755)
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("VCT_", "VCO_"))}
-    env.update({"CLAUDE_PROJECT_DIR": str(proj), "HOME": str(tmp_path / "home")})
-    proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command",
-         f'. "{LIB}/codegraph-query.ps1"; '
-         'Invoke-VcoCodegraphQueryBlock -Query "widget" -Limit 2 -TranscriptPath "/t/x.jsonl" | Out-Null'],
-        capture_output=True, text=True, timeout=120, env=env,
-    )
-    assert proc.returncode == 0, proc.stderr
-    argv = argv_file.read_text("utf-8").splitlines()
-    assert "--transcript" in argv and "/t/x.jsonl" in argv, argv
+# v0.2.101 wave-2 review SF-2: test_ps1_codegraph_helper_forwards_the_transcript
+# was RETIRED with its subject — Invoke-VcoCodegraphQueryBlock and its lib
+# (_lib/codegraph-query.ps1) lost their last callers in the router rework.
+# The transcript-as-PATH forwarding property is pinned where the mechanism
+# lives now: test_v0292_query_enrichment.py (router literal pins) and
+# test_v02101_router_surfaces.py (behavioural --transcript argv pin).
+
+

@@ -55,11 +55,17 @@ def _orch_and_project(tmp_path: Path):
 
 
 def _identity_producer(orch: Path) -> None:
-    """Stub producer that reports the identity it was run with."""
+    """Stub producer that reports the identity it was run with.
+
+    v0.2.101 Wave 2: the pre-bash/pre-edit rows drive the REAL router
+    (VCT_ORCHESTRATOR_ROOT → this checkout) with THIS stub as the router's
+    KG producer (VCO_ROUTER_KG_SCRIPT, see _hook_env) — so the identity
+    probe covers the wrapper AND the router's producer env propagation."""
     rl = orch / RL_REL
     rl.write_text(
         "#!/usr/bin/env python3\n"
         "import os, sys\n"
+        "sys.stdin.read()\n"
         "print('KG: identity cpd=' + os.environ.get('CLAUDE_PROJECT_DIR', '') + "
         "' kg=' + os.environ.get('KG_COLLECTION', '') + ' | concept | score=0.90 | FULL NODE:')\n"
         "print('body')\n",
@@ -127,25 +133,38 @@ def test_powershell_locator_matches_the_shell_one(tmp_path):
 def _hook_env(orch: Path, proj: Path) -> dict:
     env = os.environ.copy()
     env.pop("VCT_DISABLE_HOOKS", None)
-    env.pop("VCT_ORCHESTRATOR_ROOT", None)
+    env.pop("VCO_INJECT_PROFILE", None)
     env["CLAUDE_PROJECT_DIR"] = str(proj)
     env["VCT_INSTALL_ROOT"] = str(orch)
     env["KG_COLLECTION"] = "ProjA_KnowledgeGraph"
     env["VCT_STATE_DIR"] = str(proj.parent / "vctstate")  # cold result caches
-    env["VCT_BASH_KG_THRESHOLD_CHARS"] = "10"  # let a short command reach the KG leg
+    # v0.2.101 injection redesign: every injection wrapper is a thin driver for
+    # claude_mcp_servers/scripts/hook_context_router.py. The REAL router
+    # resolves from this checkout (VCT_ORCHESTRATOR_ROOT) while the KG producer
+    # stays the sandbox stub (VCO_ROUTER_KG_SCRIPT) — so these rows still probe
+    # the same seam as before: which project identity does the producer the
+    # hook launches actually see? (The retired 500-char threshold knob
+    # VCT_BASH_KG_THRESHOLD_CHARS is gone — intent classification owns the
+    # gate now, so the trigger commands below are READ-classified.)
+    env["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
+    env["VCO_ROUTER_KG_SCRIPT"] = str(orch / RL_REL)
     return env
 
 
 @needs_bash
 def test_subagent_hook_runs_the_root_script_with_the_project_identity(tmp_path):
+    """v0.2.101 §C4/§C5 repoint: the SubagentStart KG half was retired (its
+    payload carries no prompt); the agent-brief PreToolUse hook is the
+    successor surface, so the identity assertion drives THAT hook."""
     orch, proj = _orch_and_project(tmp_path)
     _identity_producer(orch)
-    payload = {"prompt": "implement the widget reranker", "session_id": "s-f3",
-               "agent_id": "a1", "agent_type": "@agent-coder"}
+    payload = {"tool_name": "Agent", "session_id": "s-f3", "prompt_id": "p-f3",
+               "tool_input": {"prompt": "Task: implement the widget reranker",
+                              "description": "coder lane", "model": "m"}}
     proc = subprocess.run(
-        ["bash", str(HOOKS / "subagent-start-kg-inject.sh")],
+        ["bash", str(HOOKS / "agent-brief-kg-inject.sh")],
         input=json.dumps(payload), capture_output=True, text=True,
-        env=_hook_env(orch, proj), cwd=str(orch), timeout=30,
+        env=_hook_env(orch, proj), cwd=str(orch), timeout=60,
     )
     assert proc.returncode == 0, proc.stderr
     assert f"cpd={proj}" in proc.stdout, proc.stdout
@@ -157,7 +176,7 @@ def test_pre_bash_hook_runs_the_root_script_with_the_project_identity(tmp_path):
     orch, proj = _orch_and_project(tmp_path)
     _identity_producer(orch)
     payload = {"tool_name": "Bash", "session_id": "s-f3b",
-               "tool_input": {"command": "python -m pytest tests/test_widget_reranker.py"}}
+               "tool_input": {"command": "cat tests/test_widget_reranker.py"}}
     proc = subprocess.run(
         ["bash", str(HOOKS / "pre-bash-context-inject.sh")],
         input=json.dumps(payload), capture_output=True, text=True,
@@ -169,14 +188,16 @@ def test_pre_bash_hook_runs_the_root_script_with_the_project_identity(tmp_path):
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not installed")
 def test_subagent_hook_ps1_runs_the_root_script_with_the_project_identity(tmp_path):
+    """v0.2.101 §C4/§C5 repoint — .ps1 sibling of the row above."""
     orch, proj = _orch_and_project(tmp_path)
     _identity_producer(orch)
-    payload = {"prompt": "implement the widget reranker ps", "session_id": "s-f3p",
-               "agent_id": "a2", "agent_type": "@agent-coder"}
+    payload = {"tool_name": "Agent", "session_id": "s-f3p", "prompt_id": "p-f3p",
+               "tool_input": {"prompt": "Task: implement the widget reranker ps",
+                              "description": "coder lane", "model": "m"}}
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(HOOKS / "subagent-start-kg-inject.ps1")],
+        ["pwsh", "-NoProfile", "-File", str(HOOKS / "agent-brief-kg-inject.ps1")],
         input=json.dumps(payload), capture_output=True, text=True,
-        env=_hook_env(orch, proj), cwd=str(orch), timeout=60,
+        env=_hook_env(orch, proj), cwd=str(orch), timeout=120,
     )
     assert proc.returncode == 0, proc.stderr
     assert f"cpd={proj}" in proc.stdout, (proc.stdout, proc.stderr[-1500:])

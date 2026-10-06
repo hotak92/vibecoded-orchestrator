@@ -12,10 +12,12 @@
 # repeat queries from disk (~ms) across ALL surfaces and files, keyed on the
 # query itself.
 #
-# One home (CLAUDE.md "search before add"): the single cache implementation.
-# Invoke-VcoCodegraphQueryBlock and the KG-search wrappers call
-# Get-VcoQueryCache / Set-VcoQueryCache. MUST MATCH
-# templates/hooks/_lib/query-cache.sh.
+# One home (CLAUDE.md "search before add"): the single SHELL cache
+# implementation. Invoke-VcoKgSearchCached (pre-tool-use.ps1's Edit/Write KG
+# suggestion path) calls Get-VcoQueryCache / Set-VcoQueryCache; the injection
+# router keeps its OWN Python cache in the SAME directory with the SAME key
+# algorithm under the disjoint "kgi"/"cgi" namespaces (hook_context_router.py).
+# MUST MATCH templates/hooks/_lib/query-cache.sh.
 #
 # Semantics (identical to the .sh sibling):
 #   - Stores the RAW producer block (pre-dedup); callers dedup per-session
@@ -175,141 +177,10 @@ function Invoke-VcoKgSearchCached {
     return $out
 }
 
-# --- P2 (v0.2.91): ONE interpreter for the KG + code-graph pair -------------
-#
-# Invoke-VcoDualSearchCached -- run whichever of the two pre-edit searches MISSED
-# their (unchanged, per-leg) cache in a SINGLE CPython process via
-# claude_mcp_servers/scripts/hook_dual_search.py. Pre-P2 the pre-edit hook paid
-# two full interpreter starts (~1.0 s each of import + client connect) for ~60 ms
-# of real retrieval work. MUST MATCH query-cache.sh vco_dual_search_cached:
-# the per-leg cache KEYS ("kg"+query+limit / "cg"+query+projectArg+limit+
-# exclude+anchor), the per-leg output CAPS (40 / 20 lines) and the marker
-# framing must agree cross-OS or the two OSes cache and split differently.
-#
-# Returns a hashtable @{ Ok=$bool; Kg=$string; Cg=$string }. Ok=$false means
-# "fall back to the legacy two-call path" (driver absent, no venv, or no framing
-# in the output) -- it is NOT an error signal.
-#
-# ACCEPTED WORST CASE (v0.2.91 wave-4 NIT-5, mirrors query-cache.sh): a hung
-# driver plus the subsequent LEGACY re-run of the same leg can exceed the
-# pre-edit hook's 8 s settings.json budget, and the harness kills the hook
-# mid-run. The consequence is FAIL-OPEN -- no injection for that one Edit,
-# nothing written, nothing corrupted; the next Edit is served from cache or
-# retries cleanly. Suppressing the legacy fallback instead would silently drop a
-# leg's injection on every driver hiccup: a worse, quieter failure.
-function Invoke-VcoDualSearchCached {
-    param(
-        [string]$VenvPy,
-        [string]$RlScript,
-        [string]$Query,
-        [int]$KgLimit = 1,
-        [bool]$WantKg = $true,
-        [bool]$WantCg = $false,
-        [string]$CgProjectArg = "",
-        [int]$CgLimit = 2,
-        [string]$CgExcludeFile = "",
-        [string]$CgAnchor = "",
-        [string]$PromptId = "",
-        [string]$TranscriptPath = ""
-    )
-    $fallback = @{ Ok = $false; Kg = ""; Cg = "" }
-    if (-not $Query) { return @{ Ok = $true; Kg = ""; Cg = "" } }
-    if (-not $WantKg -and -not $WantCg) { return @{ Ok = $true; Kg = ""; Cg = "" } }
-    if (-not $VenvPy -or -not (Test-Path -LiteralPath $VenvPy)) { return $fallback }
 
-    # 1. Per-leg cache probe (identical keys to the single-leg wrappers).
-    # PromptId joins BOTH keys (WP-E, v0.2.92) -- same rationale as
-    # Invoke-VcoKgSearchCached: the query text here is always the raw
-    # trigger, never the enriched text, so two different turns issuing the
-    # same short trigger must not collide on one cache entry.
-    $kgKey = ""; $cgKey = ""
-    if (Get-Command Get-VcoQueryCacheKey -ErrorAction SilentlyContinue) {
-        if ($WantKg) { $kgKey = Get-VcoQueryCacheKey "kg" $Query "$KgLimit" $PromptId }
-        if ($WantCg) { $cgKey = Get-VcoQueryCacheKey "cg" $Query $CgProjectArg "$CgLimit" $CgExcludeFile $CgAnchor $PromptId }
-    }
-    $kgOut = ""; $cgOut = ""
-    $needKg = $WantKg; $needCg = $WantCg
-    if ($kgKey -and (Get-Command Get-VcoQueryCache -ErrorAction SilentlyContinue)) {
-        $qc = Get-VcoQueryCache $kgKey
-        if ($qc.Hit) { $kgOut = $qc.Value; $needKg = $false }
-    }
-    if ($cgKey -and (Get-Command Get-VcoQueryCache -ErrorAction SilentlyContinue)) {
-        $qc = Get-VcoQueryCache $cgKey
-        if ($qc.Hit) { $cgOut = $qc.Value; $needCg = $false }
-    }
-    if (-not $needKg -and -not $needCg) {
-        return @{ Ok = $true; Kg = $kgOut; Cg = $cgOut }
-    }
-
-    # 2. Resolve the driver; degrade to the legacy path when absent.
-    $driver = Join-Path (Split-Path -Parent $RlScript) "hook_dual_search.py"
-    if (-not (Test-Path -LiteralPath $driver)) { return $fallback }
-    if ($needKg -and -not (Test-Path -LiteralPath $RlScript)) {
-        # KG producer genuinely absent (non-orchestrator project) -- that leg has
-        # no result, which is the pre-P2 behaviour too.
-        $needKg = $false; $kgOut = ""
-    }
-    $cgScript = ""
-    if ($needCg) {
-        $cli = ""
-        if (Get-Command Get-VcoCodegraphCli -ErrorAction SilentlyContinue) { $cli = Get-VcoCodegraphCli }
-        if ($cli) {
-            $cand = Join-Path (Split-Path -Parent $cli) "query_code_graph.py"
-            if (Test-Path -LiteralPath $cand) { $cgScript = $cand }
-        }
-        if (-not $cgScript) { $needCg = $false; $cgOut = "" }
-    }
-    if (-not $needKg -and -not $needCg) {
-        return @{ Ok = $true; Kg = $kgOut; Cg = $cgOut }
-    }
-
-    # 3. ONE interpreter for whichever legs actually missed.
-    $cliArgs = @("--query", $Query)
-    if ($needKg) { $cliArgs += @("--kg-limit", "$KgLimit") }
-    if ($needCg) {
-        $cliArgs += @("--cg-limit", "$CgLimit", "--cg-script", $cgScript)
-        if ($CgProjectArg -like "--project *") {
-            $cliArgs += @("--cg-project", $CgProjectArg.Substring("--project ".Length))
-        }
-        if ($CgExcludeFile) { $cliArgs += @("--cg-exclude-file", $CgExcludeFile) }
-        if ($CgAnchor) { $cliArgs += @("--cg-anchor", $CgAnchor) }
-    }
-    # WP-E (v0.2.92): one --transcript flag threads to BOTH legs inside
-    # hook_dual_search.py. Omitted entirely when empty so a caller without a
-    # TranscriptPath reproduces today's argv exactly.
-    if ($TranscriptPath) { $cliArgs += @("--transcript", $TranscriptPath) }
-
-    $lines = @()
-    try {
-        $lines = @(& $VenvPy $driver @cliArgs 2>$null)
-    } catch { return $fallback }
-
-    # 4. Split on the markers, cap per leg, cache per leg.
-    $kgMarker = "<<<VCO-DUAL:KG>>>"
-    $cgMarker = "<<<VCO-DUAL:CG>>>"
-    if ($needKg -and ($lines -notcontains $kgMarker)) { return $fallback }
-    if ($needCg -and ($lines -notcontains $cgMarker)) { return $fallback }
-
-    $kgLines = @(); $cgLines = @(); $cur = ""
-    foreach ($line in $lines) {
-        if ($line -eq $kgMarker) { $cur = "kg"; continue }
-        if ($line -eq $cgMarker) { $cur = "cg"; continue }
-        if ($cur -eq "kg") { $kgLines += $line }
-        elseif ($cur -eq "cg") { $cgLines += $line }
-    }
-    if ($needKg) {
-        $kgOut = (($kgLines | Select-Object -First 40) -join "`n")
-        if ($null -eq $kgOut) { $kgOut = "" }
-        if ($kgKey -and (Get-Command Set-VcoQueryCache -ErrorAction SilentlyContinue)) {
-            Set-VcoQueryCache $kgKey $kgOut
-        }
-    }
-    if ($needCg) {
-        $cgOut = (($cgLines | Select-Object -First 20) -join "`n")
-        if ($null -eq $cgOut) { $cgOut = "" }
-        if ($cgKey -and (Get-Command Set-VcoQueryCache -ErrorAction SilentlyContinue)) {
-            Set-VcoQueryCache $cgKey $cgOut
-        }
-    }
-    return @{ Ok = $true; Kg = $kgOut; Cg = $cgOut }
-}
+# v0.2.101 Wave-2 review SF-2: Invoke-VcoDualSearchCached was RETIRED here --
+# its last caller (pre-edit-context-inject.ps1) became a thin router wrapper.
+# The merged mechanism lives on in hook_dual_search.py (run_legs), imported
+# in-process by hook_context_router.py. Remaining: the TTL primitives
+# (section 9: empty is NEVER cached) and Invoke-VcoKgSearchCached (still
+# called by pre-tool-use.ps1). MUST MATCH query-cache.sh.

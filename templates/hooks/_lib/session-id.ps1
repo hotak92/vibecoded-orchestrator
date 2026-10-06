@@ -66,3 +66,16 @@ function Get-VcoHookSessionId {
     }
     return Get-VcoSanitizedSessionId -Raw $parsed
 }
+
+# Get-VcoHookFastSessionId <HookStdin>
+# v0.2.101 (wave-2 review nit-7): the pre-python session-id extraction the
+# router wrappers share -- one home instead of three inline copies. Lives
+# HERE (not in inject-budget) because the broken-install notice needs a
+# session key even when inject-budget.ps1 is itself the missing file.
+# Hostile/missing id -> "". MUST MATCH session-id.sh vco_hook_fast_session_id.
+function Get-VcoHookFastSessionId {
+    param([string]$HookStdin)
+    if (-not $HookStdin) { return "" }
+    if ($HookStdin -match '"session_id"\s*:\s*"([A-Za-z0-9_-]+)"') { return $Matches[1] }
+    return ""
+}

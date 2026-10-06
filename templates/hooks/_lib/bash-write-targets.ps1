@@ -146,14 +146,7 @@ function Get-VcoBashWriteTargets {
              Where-Object { $_ -and $_.ToString().Trim() })
 }
 
-# Get-VcoBashWritePreBash <Command> <ProjectRoot>
-# Two entries: the write TARGET to build the query from (may be empty) and
-# a content SNIPPET (may be empty). Existence is NOT required -- the file
-# is about to be created.
-function Get-VcoBashWritePreBash {
-    param([string]$Command, [string]$ProjectRoot)
-    $lines = @(Invoke-VcoBashWriteParser -Command $Command -ProjectRoot $ProjectRoot -ExtraArgs @('--format', 'prebash'))
-    $target = if ($lines.Count -ge 1 -and $null -ne $lines[0]) { [string]$lines[0] } else { "" }
-    $snippet = if ($lines.Count -ge 2 -and $null -ne $lines[1]) { [string]$lines[1] } else { "" }
-    return @($target.Trim(), $snippet.Trim())
-}
+# v0.2.101 Wave-2 review SF-2: Get-VcoBashWritePreBash was RETIRED -- its
+# last caller (the pre-bash query build) moved into the router, which uses
+# the Python home directly (vco_lib.inject_intent imports prebash_query_parts).
+# MUST MATCH bash-write-targets.sh.

@@ -5,10 +5,13 @@
 V52-M adds three new hooks:
 
   - templates/hooks/pre-bash-context-inject.{sh,ps1}
-    PreToolUse(Bash). Fires when command length > 500 chars. Mints a
-    task_id, writes a state file at .claude/state/bash_task_<sess>_<hash>.json,
-    runs rl_kg_search.py with the command as query, injects results as
-    additionalContext.
+    PreToolUse(Bash). v0.2.101: a THIN WRAPPER around
+    hook_context_router.py — the 500-char threshold was RETIRED (§C1,
+    classification replaces it). For every READ/EDIT/SEARCH-classified
+    command it mints a task_id, writes a state file at
+    .claude/state/bash_task_<sess>_<hash>.json (now carrying intent/
+    targets/symbols) and emits the pre_bash outcome event; MECHANICAL
+    commands get nothing. Injection is the router's envelope.
 
   - templates/hooks/post-bash-context-record.{sh,ps1}
     PostToolUse(Bash). Re-derives cmd_hash from stdin, reads the state
@@ -42,7 +45,6 @@ These tests cover:
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -56,6 +58,8 @@ HOOK_NAMES = [
     "pre-bash-context-inject",
     "post-bash-context-record",
     "post-edit-outcome",
+    # v0.2.101 §C3: the Write surface's own thin wrapper (new this cycle).
+    "pre-write-context-inject",
 ]
 
 HOOK_DIR = REPO_ROOT / "templates" / "hooks"
@@ -115,72 +119,65 @@ class BashSyntaxCheck(unittest.TestCase):
                 )
 
 
-class ThresholdLogicPreBash(unittest.TestCase):
-    """The pre-bash-context-inject hook fires only when command length >500.
+class ClassificationGatePreBash(unittest.TestCase):
+    """The pre-bash pairing gate is the router's INTENT classification.
 
-    Spec (user-locked Q6 2026-06-09): fixed 500-char threshold with
-    VCT_BASH_KG_THRESHOLD_CHARS env override.
+    v0.2.101 §C1 (owner-approved): the user-locked Q6 500-char threshold
+    (VCT_BASH_KG_THRESHOLD_CHARS) is RETIRED — READ/EDIT/SEARCH-classified
+    commands get the state file + pre_bash outcome event regardless of
+    length (MORE events, richer labels — WP-D 2); MECHANICAL commands get
+    nothing regardless of length. The end-to-end RL pins live in
+    tests/test_v02101_rl_continuity.py; this class keeps the v52m-side
+    pairing-contract rows (state name/shape) on the classification gate.
     """
 
     def setUp(self) -> None:
-        self.hook = HOOK_DIR / "pre-bash-context-inject.sh"
-        self.tmp = tempfile.mkdtemp(prefix="v52m_threshold_")
-        self.state_dir = Path(self.tmp) / ".claude" / "state"
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-
-    def tearDown(self) -> None:
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _run_hook(self, command: str, threshold_env: str | None = None) -> tuple[int, str, str]:
-        """Invoke the hook with a synthesized stdin JSON payload."""
         bash = shutil.which("bash")
         if not bash:
             self.skipTest("bash not on PATH")
-        stdin_payload = json.dumps({
-            "tool_name": "Bash",
-            "session_id": "test_session_v52m",
-            "tool_input": {"command": command},
-        })
-        env = os.environ.copy()
-        env["CLAUDE_PROJECT_DIR"] = self.tmp
-        env["VCT_DISABLE_HOOKS"] = ""  # explicit unset
-        if "VCT_DISABLE_HOOKS" in env and not env["VCT_DISABLE_HOOKS"]:
-            del env["VCT_DISABLE_HOOKS"]
-        if threshold_env is not None:
-            env["VCT_BASH_KG_THRESHOLD_CHARS"] = threshold_env
-        result = subprocess.run(
-            [bash, str(self.hook)],
-            input=stdin_payload,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=15,
-        )
-        return result.returncode, result.stdout, result.stderr
+        from tests.test_v02101_router_surfaces import Rig
 
-    def test_short_command_does_not_create_state_file(self) -> None:
-        """100-char command (well below 500) → no state file written."""
-        cmd = "echo " + ("x" * 50)  # ~55 chars total
-        rc, out, err = self._run_hook(cmd)
-        self.assertEqual(rc, 0)
-        state_files = list(self.state_dir.glob("bash_task_*.json"))
-        self.assertEqual(
-            state_files, [],
-            "short command (<500 chars) must NOT write a state file; "
-            f"found: {state_files}",
+        self._tmpd = tempfile.TemporaryDirectory(prefix="v52m_classgate_")
+        self.addCleanup(self._tmpd.cleanup)
+        self.rig = Rig(Path(self._tmpd.name))
+        self.state_dir = self.rig.proj / ".claude" / "state"
+
+    def _run_hook(self, command: str, session: str = "test_session_v52m"):
+        from tests.test_v02101_router_surfaces import _bash_payload
+
+        return self.rig.run(
+            "pre-bash-context-inject",
+            _bash_payload(command, session=session, cwd=str(self.rig.proj)),
         )
 
-    def test_long_command_creates_state_file(self) -> None:
-        """600-char command (>500) → state file written with task_id + start_ts_ms."""
-        cmd = "echo " + ("x" * 600)  # 605 chars total
-        rc, out, err = self._run_hook(cmd)
-        self.assertEqual(rc, 0)
-        state_files = list(self.state_dir.glob("bash_task_test_session_v52m_*.json"))
+    def test_mechanical_command_does_not_create_state_file(self) -> None:
+        """The OLD short-command row, restated for the new gate: `echo` is
+        MECHANICAL at ANY length → no state file."""
+        cmd = "echo " + ("x" * 50)
+        r = self._run_hook(cmd)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(list(self.state_dir.glob("bash_task_*.json")), [])
+
+    def test_long_mechanical_command_still_creates_no_state(self) -> None:
+        """The threshold is gone: a 600-char `echo` is still MECHANICAL —
+        length no longer buys a pairing event (the survey's noise class)."""
+        cmd = "echo " + ("x" * 600)
+        r = self._run_hook(cmd)
+        self.assertEqual(r.returncode, 0)
         self.assertEqual(
-            len(state_files), 1,
-            f"long command (>500 chars) must write exactly one state file; "
-            f"found: {state_files}",
+            list(self.state_dir.glob("bash_task_*.json")), [],
+            "a long MECHANICAL command must NOT write a state file",
         )
+
+    def test_classified_command_creates_state_with_pairing_fields(self) -> None:
+        """A SHORT classified command (far under the old 500-char gate) now
+        gets the full pairing treatment — the recall side of §C1."""
+        cmd = "grep -rn vco_seen_add templates/"
+        r = self._run_hook(cmd)
+        self.assertEqual(r.returncode, 0)
+        state_files = list(
+            self.state_dir.glob("bash_task_test_session_v52m_*.json"))
+        self.assertEqual(len(state_files), 1, f"found: {state_files}")
         state = json.loads(state_files[0].read_text())
         self.assertIn("task_id", state)
         self.assertTrue(state["task_id"].startswith("pre_bash_"))
@@ -188,47 +185,37 @@ class ThresholdLogicPreBash(unittest.TestCase):
         self.assertIsInstance(state["start_ts_ms"], int)
         self.assertGreater(state["start_ts_ms"], 0)
         self.assertEqual(state["session_id"], "test_session_v52m")
-        self.assertGreaterEqual(state["cmd_len"], 600)
+        self.assertEqual(state["cmd_len"], len(cmd))
+        # v0.2.101 WP-D 2 additions (additive — post-bash pairing unchanged)
+        self.assertEqual(state["intent"], "SEARCH")
+        self.assertIn("vco_seen_add", state["symbols"])
+        # the pairing hash is still md5(command)[:16]
+        import hashlib
+        want = hashlib.md5(cmd.encode()).hexdigest()[:16]
+        self.assertEqual(state["cmd_hash"], want)
+        self.assertTrue(state_files[0].name.endswith(f"_{want}.json"))
 
-    def test_env_override_lowers_threshold(self) -> None:
-        """Setting VCT_BASH_KG_THRESHOLD_CHARS=10 fires on a 50-char command."""
-        cmd = "echo " + ("x" * 50)
-        rc, out, err = self._run_hook(cmd, threshold_env="10")
-        self.assertEqual(rc, 0)
-        state_files = list(self.state_dir.glob("bash_task_*.json"))
-        self.assertEqual(
-            len(state_files), 1,
-            "override threshold=10 must let a 55-char command create state",
-        )
-
-    def test_env_override_raises_threshold(self) -> None:
-        """Setting VCT_BASH_KG_THRESHOLD_CHARS=10000 silences a 600-char command."""
-        cmd = "echo " + ("x" * 600)
-        rc, out, err = self._run_hook(cmd, threshold_env="10000")
-        self.assertEqual(rc, 0)
-        state_files = list(self.state_dir.glob("bash_task_*.json"))
-        self.assertEqual(
-            state_files, [],
-            "override threshold=10000 must suppress a 605-char command",
-        )
+    def test_threshold_knob_is_retired(self) -> None:
+        """VCT_BASH_KG_THRESHOLD_CHARS must not be READ by the hook any more
+        (a documented knob that changes nothing is the same defect one layer
+        down — the docs row was retired with it)."""
+        for ext in (".sh", ".ps1"):
+            body = (HOOK_DIR / f"pre-bash-context-inject{ext}").read_text(
+                encoding="utf-8")
+            executable = [
+                ln for ln in body.splitlines()
+                if not ln.lstrip().startswith(("#", "<#"))
+            ]
+            self.assertNotIn("VCT_BASH_KG_THRESHOLD_CHARS", "\n".join(executable),
+                             f"the threshold knob crept back into the {ext} wrapper")
 
     def test_non_bash_tool_is_skipped(self) -> None:
         """A tool_name other than Bash must short-circuit before any work."""
-        bash = shutil.which("bash")
-        if not bash:
-            self.skipTest("bash not on PATH")
-        stdin_payload = json.dumps({
+        result = self.rig.run("pre-bash-context-inject", {
             "tool_name": "Edit",  # NOT Bash
             "session_id": "test_session",
             "tool_input": {"command": "x" * 1000},
         })
-        env = os.environ.copy()
-        env["CLAUDE_PROJECT_DIR"] = self.tmp
-        result = subprocess.run(
-            [bash, str(self.hook)],
-            input=stdin_payload, capture_output=True, text=True,
-            env=env, timeout=10,
-        )
         self.assertEqual(result.returncode, 0)
         state_files = list(self.state_dir.glob("bash_task_*.json"))
         self.assertEqual(
@@ -238,21 +225,14 @@ class ThresholdLogicPreBash(unittest.TestCase):
 
     def test_disable_hooks_short_circuits(self) -> None:
         """VCT_DISABLE_HOOKS=1 disables the hook entirely."""
-        bash = shutil.which("bash")
-        if not bash:
-            self.skipTest("bash not on PATH")
-        stdin_payload = json.dumps({
-            "tool_name": "Bash",
-            "session_id": "test_session",
-            "tool_input": {"command": "x" * 1000},
-        })
-        env = os.environ.copy()
-        env["CLAUDE_PROJECT_DIR"] = self.tmp
-        env["VCT_DISABLE_HOOKS"] = "1"
-        result = subprocess.run(
-            [bash, str(self.hook)],
-            input=stdin_payload, capture_output=True, text=True,
-            env=env, timeout=10,
+        result = self.rig.run(
+            "pre-bash-context-inject",
+            {
+                "tool_name": "Bash",
+                "session_id": "test_session",
+                "tool_input": {"command": "grep -rn vco_seen_add templates/"},
+            },
+            env_overrides={"VCT_DISABLE_HOOKS": "1"},
         )
         self.assertEqual(result.returncode, 0)
         state_files = list(self.state_dir.glob("bash_task_*.json"))
@@ -260,6 +240,8 @@ class ThresholdLogicPreBash(unittest.TestCase):
             state_files, [],
             "VCT_DISABLE_HOOKS=1 must fully short-circuit pre-bash",
         )
+        self.assertEqual(self.rig.kg_records(), [])
+        self.assertEqual(self.rig.cg_records(), [])
 
 
 class TaskIdPairingViaStateFile(unittest.TestCase):

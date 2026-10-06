@@ -33,16 +33,21 @@ HOME_PS1 = HOOKS / "_lib" / "code-extensions.ps1"
 #: migrated in this lane. Each is pinned to the home's literal below, so a
 #: drift is a RED test rather than a silent divergence.
 REMAINING_MIRRORS: dict[str, str] = {
-    "pre-tool-use.sh": "security hook; migration deferred to keep this lane's blast radius bounded",
-    "pre-tool-use.ps1": "sibling of the above",
+    # v0.2.101 Wave 2: the pre-tool-use.{sh,ps1} mirrors were RETIRED with
+    # their Read/Grep code-graph branches (the router hooks own those
+    # surfaces now — pinned by test_codegraph_hook_gates_v0270.py's
+    # retirement rows and test_v02101_pretool_use_read_branch_removed.py),
+    # and the codegraph-query / command-noise-strip mirrors were retired
+    # WITH those libs (wave-2 review SF-2).
     "code-graph-incremental.sh": "standalone entry point, not sourced by the context hooks",
     "code-graph-incremental.ps1": "sibling of the above",
     "stop-codegraph-drain.sh": "Stop-hook entry point, not sourced by the context hooks",
     "stop-codegraph-drain.ps1": "sibling of the above",
-    "_lib/command-noise-strip.sh": "the alternation lives inside an inline PYTHON regex, a third language",
-    "_lib/command-noise-strip.ps1": "sibling of the above",
-    "_lib/codegraph-query.sh": "already a _lib variable (_CGQ_SOURCE_EXT_RE); reading the home would make a partial install match every path",
-    "_lib/codegraph-query.ps1": "sibling of the above",
+    # v0.2.101 Wave 2: the _lib/codegraph-query.{sh,ps1} mirrors (_CGQ_SOURCE_EXT_RE)
+    # were RETIRED with the shell gates they served — the extension decision
+    # for injection surfaces now lives in vco_lib/inject_intent.EXT_TO_LANG
+    # (Python one-home, parity-pinned against the analyzer's dispatch table
+    # by tests/test_v02101_structure_hook_format.py::TestExtLangOneHome).
 }
 
 _ALTERNATION = re.compile(
@@ -71,8 +76,6 @@ def test_the_two_homes_agree() -> None:
 
 
 @pytest.mark.parametrize("consumer", [
-    "pre-edit-context-inject.sh",
-    "pre-bash-context-inject.sh",
     "_lib/route-touched-path.sh",
 ])
 def test_migrated_consumers_read_the_home_and_carry_no_literal(consumer: str) -> None:
@@ -87,8 +90,6 @@ def test_migrated_consumers_read_the_home_and_carry_no_literal(consumer: str) ->
 
 
 @pytest.mark.parametrize("consumer", [
-    "pre-edit-context-inject.ps1",
-    "pre-bash-context-inject.ps1",
     "_lib/route-touched-path.ps1",
 ])
 def test_migrated_ps1_consumers_read_the_home(consumer: str) -> None:
@@ -98,6 +99,36 @@ def test_migrated_ps1_consumers_read_the_home(consumer: str) -> None:
     )
     assert not _ALTERNATION.search(body), (
         f"{consumer} still carries its own extension alternation"
+    )
+
+
+@pytest.mark.parametrize("wrapper", [
+    "pre-edit-context-inject.sh",
+    "pre-bash-context-inject.sh",
+    "pre-write-context-inject.sh",
+    "pre-edit-context-inject.ps1",
+    "pre-bash-context-inject.ps1",
+    "pre-write-context-inject.ps1",
+])
+def test_injection_wrappers_carry_no_code_file_decision(wrapper: str) -> None:
+    """v0.2.101 Wave 2: pre-edit/pre-bash became thin router wrappers — the
+    "is this a code file" decision left the shell entirely (the router's
+    Python core makes it via vco_lib/inject_intent.language_for_path, whose
+    EXT_TO_LANG table is parity-pinned against the analyzer by
+    tests/test_v02101_structure_hook_format.py). The wrappers must carry
+    NEITHER a literal alternation NOR a vco_is_code_file call: a shell-side
+    decision beside the Python one is exactly the mirror-drift class this
+    file exists to prevent."""
+    body = (HOOKS / wrapper).read_text(encoding="utf-8-sig")
+    assert not _ALTERNATION.search(body), (
+        f"{wrapper} carries its own extension alternation"
+    )
+    executable = "\n".join(
+        ln for ln in body.splitlines()
+        if not ln.lstrip().startswith(("#", "<#"))
+    )
+    assert "vco_is_code_file" not in executable and "Test-VcoIsCodeFile" not in executable, (
+        f"{wrapper} must not re-derive the code-file decision — the router owns it"
     )
 
 

@@ -279,6 +279,13 @@ def test_centralization_marker_present_on_kg_touching_hooks() -> None:
         "post-git-commit-kg-sync",
         "pre-tool-use",
         "session-start-kg-loader",
+        # v0.2.101 injection redesign: both are KG-touching read-side
+        # delegators (through hook_context_router.py) — pre-write is NEW
+        # this cycle, pre-bash was re-scoped onto the same delegation and
+        # carries the marker now, so both join the audited set per this
+        # test's own "add new KG hooks here AND carry the marker" contract.
+        "pre-bash-context-inject",
+        "pre-write-context-inject",
     }
 
     missing: list[str] = []

@@ -85,18 +85,18 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# v0.2.70 Streams C+E: shared helpers for canonical session-id, the unified
-# seen-store dedup, and the code-graph retrieval used by the NEW Read(code) +
-# Grep(symbol) injection branches below. Sourced only if present (partial-install
-# tolerance); the new branches no-op gracefully when a helper is missing.
+# v0.2.70 Streams C+E: shared helpers for canonical session-id and the
+# unified seen-store dedup (the reads ledgers written in the Read branch
+# below; v0.2.101 §C2/§C6 retired this hook's code-graph INJECTION branches
+# — read-context-inject / grep-context-inject are their homes now). Sourced
+# only if present (partial-install tolerance).
 # shellcheck source=_lib/session-id.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
 # shellcheck source=_lib/seen-store.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
-# shellcheck source=_lib/codegraph-query.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
-# v0.2.77 Part 9 task 2: shared TTL result-cache used by codegraph_query_block.
-# Sourced only if present (partial-install tolerance).
+# v0.2.77 Part 9 task 2: shared TTL result-cache used by the §5 KG-search
+# wrapper below (vco_kg_search_cached). Sourced only if present
+# (partial-install tolerance).
 # shellcheck source=_lib/query-cache.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/query-cache.sh" ] && . "$SCRIPT_DIR/_lib/query-cache.sh"
 # v0.2.29: prefer Claude Code's canonical $CLAUDE_PROJECT_DIR (the active
@@ -345,74 +345,21 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
     fi
 fi
 
-# === v0.2.70 Stream C: shared code-graph injection for Read(code)/Grep(symbol).
-# One concern, one home — both surfaces call this. Queries the shared
-# _lib/codegraph-query.sh helper, dedups through the shared _lib/seen-store.sh,
-# emits via the PreToolUse JSON envelope. Soft-fails to nothing.
-#   $1 query        — the codegraph search query (module name / symbol)
-#   $2 exclude_path — path to grep -v out (self-reference); "" if none
-#   $3 label        — header label for the injected block
-#   $4 anchor       — optional file path / symbol forwarded as --anchor so the
-#                     CLI's shared pipeline biases the rerank toward
-#                     call-linked / same-module / shared-type code (v0.2.72 P2)
-_cg_inject() {
-    local _q="$1" _excl="$2" _label="$3" _anchor="${4:-}"
-    command -v codegraph_query_block >/dev/null 2>&1 || return 0
-    [ -n "$_q" ] || return 0
+# === v0.2.70 Stream C — RETIRED (v0.2.101 §C2/§C6) ============================
+# The shared code-graph injection helper and its two call
+# surfaces — Read(code) and Grep(symbol) — were REMOVED. Their home is the
+# router-backed hooks read-context-inject.{sh,ps1} (PostToolUse Read) and
+# grep-context-inject.{sh,ps1} (PreToolUse Grep): exact-symbol lookups,
+# §2.1 gates, seen-store dedupe and the per-turn budget all live in
+# claude_mcp_servers/scripts/hook_context_router.py + vco_lib/inject_intent.
+# This hook keeps ONLY the PreToolUse concerns that must stay here: the
+# security guards, the Build-Anchor reads ledger and the unified
+# seen_reads ledger (both written above), file backup, and the §5
+# Edit/Write KG suggestion.
 
-    # v0.2.72 P6: per-session inject VOLUME cap. The seen-store dedups by
-    # IDENTITY (same entity is not re-injected) but a long session navigating
-    # many DISTINCT entities still injects unboundedly. Bound the TOTAL number
-    # of EMITTED injections per session_id (VCO_CG_INJECT_CAP, default 40).
-    #
-    # Two-part contract so the cap counts REAL injections (not query attempts
-    # that dedup to nothing): (1) a read-only capped-check short-circuits BEFORE
-    # the heavier codegraph subprocess once the cap is hit — emitting a ONE-LINE
-    # note EXACTLY ONCE; (2) the counter is incremented ONLY on an actual emit
-    # (bottom of the function). Soft-fail OPEN throughout: an unkeyable session
-    # (untrustworthy id) or any counter error runs UNCAPPED — a broken cap must
-    # never break injection.
-    local _cnt=""
-    if command -v vco_cg_inject_count_path >/dev/null 2>&1; then
-        _cnt="$(vco_cg_inject_count_path "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-    fi
-    if [ -n "$_cnt" ] && command -v vco_cg_inject_capped >/dev/null 2>&1 \
-        && vco_cg_inject_capped "$_cnt"; then
-        # Cap reached — stop injecting. Emit the one-line note once per session.
-        if command -v vco_cg_inject_note_once >/dev/null 2>&1 \
-            && command -v emit_additional_context >/dev/null 2>&1 \
-            && vco_cg_inject_note_once "$SESSION_ID_RAW" "$PROJECT_ROOT"; then
-            emit_additional_context "[codegraph injection cap reached for this session]" PreToolUse
-        fi
-        return 0
-    fi
 
-    local _raw
-    _raw="$(codegraph_query_block "$_q" "" 2 "$_excl" "$_anchor" "$PROMPT_ID" "$TRANSCRIPT_PATH" 2>/dev/null || true)"
-    [ -n "$_raw" ] || return 0
-    local _inj="" _rd=""
-    if command -v vco_seen_store_path >/dev/null 2>&1; then
-        _inj="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-        _rd="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-    fi
-    if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
-        _raw="$(vco_filter_seen_blocks "$_raw" "$_inj" "$_rd")"
-    fi
-    case "$_raw" in
-        *[![:space:]]*)
-            if command -v emit_additional_context >/dev/null 2>&1; then
-                emit_additional_context "[${_label}]:"$'\n'$'\n'"$_raw" PreToolUse
-                # Count this REAL injection toward the per-session cap. Only
-                # reached on a non-empty post-dedup block that actually emits.
-                if [ -n "$_cnt" ] && command -v vco_cg_inject_record >/dev/null 2>&1; then
-                    vco_cg_inject_record "$_cnt"
-                fi
-            fi
-            ;;
-    esac
-}
-
-# === 3. BUILD ANCHOR PROTOCOL: Track reads + v0.2.70 code-file inject ===
+# === 3. BUILD ANCHOR PROTOCOL: Track reads (the Read(code) code-graph inject
+# moved to read-context-inject.sh, v0.2.101 §C2) ===
 if [[ "$TOOL_NAME" == "Read" ]]; then
     FILE_PATH=$(_get_field "file_path")
     if [[ -n "$FILE_PATH" ]]; then
@@ -439,43 +386,23 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
             fi
         fi
 
-        # v0.2.70 Stream C Surface 1 (Read): for a CODE file, inject its
-        # entity/callers/deps summary so opening a source file surfaces the
-        # code-graph context (was previously injected only on Edit). Gated on
-        # the SAME IS_CODE regex as pre-edit:283 / post-file-edit:440 (MUST
-        # MATCH those siblings). Self-exclude uses the repo-relative path so it
-        # matches the producer's repo-relative CODE: src shape.
-        if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
-            _RD_Q="$(basename "$FILE_PATH")"; _RD_Q="${_RD_Q%.*}"
-            _cg_inject "$_RD_Q" "$_REL_FP" "Code-graph context for $(basename "$FILE_PATH")" "$_REL_FP"
-        fi
+        # v0.2.101 injection redesign (§C2): the Read(code) code-graph
+        # injection branch that used to live here was REMOVED — its home is
+        # now the PostToolUse(Read) hook read-context-inject.sh (one
+        # concern, one home; the kickoff probe measured the old branch as
+        # always-killed by its 3 s settings timeout, so it never injected).
+        # The ledger writes ABOVE stay: they must happen PreToolUse so
+        # same-turn Write-anchor checks and seen-store suppression see them.
     fi
     exit 0
 fi
 
-# === v0.2.70 Stream C Surface 4: Grep on a code SYMBOL → inject codegraph.
-# A symbol-shaped Grep pattern is a strong "the model is navigating code" signal.
-# Gated by the shared codegraph_pattern_gate (snake / CamelCase / name( / keyword
-# id); a bare-word pattern like "TODO" does NOT fire. EXCLUDES nothing extra —
-# Grep is already a code-navigation tool. diagram/web/secrets/Read-of-noncode/
-# weaviate-kg never reach this branch (different tool names).
-if [[ "$TOOL_NAME" == "Grep" ]]; then
-    # Use codegraph_pattern_gate (identifier shape: snake/CamelCase/name(/keyword
-    # id) — fires on `def authenticate`, `OrderManager`, `migrate_collections`;
-    # NOT on bare `TODO` / `hello` / `foo.bar`). Same gate the pre-bash tool
-    # branch uses (one home).
-    if command -v codegraph_pattern_gate >/dev/null 2>&1; then
-        GREP_PATTERN=$(_get_field "pattern")
-        if [ -n "$GREP_PATTERN" ] && codegraph_pattern_gate "$GREP_PATTERN"; then
-            _GREP_SYM="$GREP_PATTERN"
-            if command -v codegraph_extract_symbol >/dev/null 2>&1; then
-                _GREP_SYM="$(codegraph_extract_symbol "$GREP_PATTERN")"
-            fi
-            _cg_inject "$_GREP_SYM" "" "Code-graph context for symbol: ${_GREP_SYM}" "$_GREP_SYM"
-        fi
-    fi
-    exit 0
-fi
+# === v0.2.70 Stream C Surface 4 (Grep) — RETIRED (v0.2.101 §C6) ============
+# The Grep(symbol) code-graph injection branch was REMOVED: grep-context-
+# inject.{sh,ps1} (PreToolUse(Grep), router surface `grep`) is its one home
+# now — identifier gating in vco_lib.inject_intent, EXACT structure def+
+# callers lookup, no KG leg. A Grep call falls through to the Write/Edit
+# gate below (no-op for Grep) and exits at the §5 tool-name gate.
 
 # === 4. BUILD ANCHOR PROTOCOL + FILE BACKUP: Write/Edit checks ===
 if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
