@@ -126,7 +126,7 @@ container). Real bug was the probe URL choice; recoveries were unnecessary.
 
 **Fix**: `/v1/meta` at all 5 launcher detection sites
 (`commands/lifecycle.rs::canonical_services` + `services_already_running`,
-`tray.rs::probe_services`, `commands/volumes.rs::wait_until_healthy`,
+`tray.rs::probe_services`, `commands/storage_ux.rs::wait_until_healthy`,
 `hub/cli_api.rs` services-running check). PR
 `fix/launcher-detection-correctness` (#141, commit `c94602b`).
 

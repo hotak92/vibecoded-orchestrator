@@ -557,11 +557,11 @@
   },
   "knowledge/concepts/safe-install.md": {
     "title": "Safe-Install — Content-Based Service Detection",
-    "description": "Safe-Install probes backing services (Weaviate, Ollama, code-embed) by fingerprinting HTTP responses to classify them as not running, vct-managed, foreign, or incompatible—enabling safe coexistence without relying on container names. Detection runs in `vco_lib/service_detection.py` by sending probes to ports 8081, 11435, and 11440 and inspecting responses for service markers: vct-prefixed collections for Weaviate, API tags for Ollama, and /health responses for code-embed. Each state triggers appropriate handling: vct-managed services are auto-adopted, foreign Ollama is adopted unattended with a record, foreign Weaviate prompts interactively, and incompatible services raise errors. This matters because it allows the orchestrator to safely coexist with foreign services on canonical ports without conflicts or modifications to existing infrastructure.",
-    "summary": "Install.py fingerprints HTTP response content (not container names) from canonical ports—inspecting schema for vct collections, API tags, and health endpoints—to classify backing services (Weaviate, Ollama, code-embed) as not running / vct-managed / foreign / incompatible, enabling safe coexistence via the `--on-conflict` flag (alt-port / adopt / abort). This content-based detection allows the orchestrator to run alongside foreign services without modifying them, with logic in `service_detection.py` and `service_reconcile.py`.",
-    "generated_at": "2026-09-25T00:28:01.803559+00:00",
-    "backend": "cli",
-    "content_hash": "2f0666e0909fb511",
+    "description": "Safe-Install is a content-based service detection mechanism that allows an orchestrator to safely coexist with existing services on canonical ports by inspecting response fingerprints rather than container names. The system probes specific endpoints for Weaviate, Ollama, and code-embed to classify services into four states: not running, vct-managed, foreign, or incompatible. Implementation relies on HTTP requests to schema or health endpoints, where decisions to start, auto-adopt, or defer adoption are driven by the presence of specific data markers or schema prefixes. This approach matters because it enables unattended deployment in shared environments without disrupting foreign services or requiring manual intervention for every port conflict.",
+    "summary": "Safe-Install detects backing services like Weaviate, Ollama, and code-embed by fingerprinting HTTP response content (e.g., schema prefixes, model tags) on canonical ports rather than inspecting container names. This content-based approach allows the orchestrator to coexist with foreign services on the same ports without modification, automatically adopting VCO-managed instances or deferring adoption of foreign ones unless explicitly configured via the `--on-conflict` flag.",
+    "generated_at": "2026-10-06T03:22:09.350669+00:00",
+    "backend": "ollama",
+    "content_hash": "a5fad1d098747257",
     "total_chunks": 1
   },
   "knowledge/concepts/saga-pattern-distributed-workflows.md": {

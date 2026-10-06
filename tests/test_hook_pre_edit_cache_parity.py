@@ -68,10 +68,21 @@ def test_pre_edit_sh_defines_cache_file_path() -> None:
     # VCO_QUERY_CACHE_TTL override, so the two caches can never drift into the
     # 600-900 s "double miss" window again. RED-PROOF: this assertion fails on
     # the pre-P3 source (which carried `CACHE_TTL=600`).
-    assert 'CACHE_TTL="${VCO_QUERY_CACHE_TTL:-${_VCO_QUERY_CACHE_TTL_DEFAULT:-900}}"' in body, (
+    # (v0.2.101) the retired _lib/query-cache.sh's
+    # _VCO_QUERY_CACHE_TTL_DEFAULT middle rung is gone with the lib:
+    # VCO_QUERY_CACHE_TTL is the ONE override (this replay cache + the router).
+    assert 'CACHE_TTL="${VCO_QUERY_CACHE_TTL:-900}"' in body, (
         "pre-edit-context-inject.sh must derive CACHE_TTL from the shared "
-        "query-cache default (_VCO_QUERY_CACHE_TTL_DEFAULT, 900 s) — a "
-        "hardcoded 600 re-opens the P3 double-miss window."
+        "query-cache default (900 s) with VCO_QUERY_CACHE_TTL as the one "
+        "override — a hardcoded 600 re-opens the P3 double-miss window."
+    )
+    # The RUNG must be gone from the expression — a prose retirement note
+    # naming the old marker is fine (established style); a second default
+    # source is not.
+    assert "${_VCO_QUERY_CACHE_TTL_DEFAULT:-900}" not in body, (
+        "pre-edit-context-inject.sh still carries the retired "
+        "_VCO_QUERY_CACHE_TTL_DEFAULT middle rung — its reader "
+        "(_lib/query-cache.sh) was deleted in v0.2.101."
     )
     assert "CACHE_TTL=600" not in body, (
         "pre-edit-context-inject.sh still carries the pre-P3 hardcoded "

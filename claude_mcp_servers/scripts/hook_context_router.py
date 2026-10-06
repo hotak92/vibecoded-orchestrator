@@ -39,9 +39,11 @@ Mechanism (one interpreter, one home):
 * budget  — per-injection 2 500-char soft cap + per-turn 6 000 chars keyed by
   ``prompt_id`` (``.claude/state/inject_budget_<sid>_<pid>``; past budget the
   blocks degrade to titles one-liners; missing prompt_id fails OPEN);
-* cache   — the shared ``.claude/state/query_cache/`` dir with the shell's
-  sha1(0x1f-joined) key algorithm under the router-owned namespaces
-  (``kgi``/``cgi``) so profile-gated blocks can never be served to the legacy
+* cache   — the shared ``.claude/state/query_cache/`` dir; the key algorithm
+  (sha1 over the args joined with 0x1f) is ROUTER-OWNED since the v0.2.101
+  retirement of ``_lib/query-cache.{sh,ps1}`` — the ``kgi``/``cgi``
+  namespace split is the guard that must hold, so profile-gated blocks can
+  never be served to the legacy
   surfaces' keys (and vice-versa). Empty results are NEVER cached (§9).
 
 Kill switch: ``VCO_INJECT_PROFILE=off`` → exit 0 silently (checked first,
@@ -57,7 +59,10 @@ Env seams (tests + Wave 2):
   the smallest shipped surface timeout; injection is the deliberately
   bounded, silence-safe class per the 2026-10-06 owner ruling);
 * ``VCO_INJECT_LEG_TIMEOUT_S`` (default 4) — per-leg join bound;
-* ``VCO_QUERY_CACHE_TTL`` (default 900) — shared with the shell cache;
+* ``VCO_QUERY_CACHE_TTL`` (default 900) — the router's cache window; the
+  knob's OTHER reader is the pre-edit wrapper's replay cache
+  (pre-edit-context-inject), aligned so the replay never outlives the
+  semantics it replays;
 * ``VCO_CG_INJECT_CAP`` (default 40) — the seen-store's per-session
   code-graph inject cap (SAME counter file, ``seen_cginject_count_<sid>.txt``).
 
@@ -179,11 +184,14 @@ def _resolve_project_root(payload: Dict) -> str:
     return cwd or os.getcwd()
 
 
-# --- query cache (router namespaces; same dir+algorithm as the shell lib) -----
-# MUST MATCH _lib/query-cache.{sh,ps1}: sha1 over the args joined with 0x1f
-# (each arg FOLLOWED by the separator — printf '%s\x1f' "$@"), stored under
-# .claude/state/query_cache/, TTL VCO_QUERY_CACHE_TTL default 900. The
-# namespaces ("kgi"/"cgi") are router-owned: profile-gated blocks must never
+# --- query cache (router-owned namespaces) -----------------------------------
+# Key algorithm: sha1 over the args joined with 0x1f (each arg FOLLOWED by
+# the separator — printf '%s\x1f' "$@"), stored under
+# .claude/state/query_cache/, TTL VCO_QUERY_CACHE_TTL default 900 (the same
+# knob the pre-edit wrapper's replay cache reads). Since the v0.2.101
+# retirement of _lib/query-cache.{sh,ps1} this algorithm has ONE owner: this
+# file. The namespaces ("kgi"/"cgi") are the guard that must hold:
+# profile-gated blocks must never
 # be served under the legacy surfaces' keys. §9: an EMPTY result is NEVER
 # written, and an empty stored file reads as a miss (self-heal).
 

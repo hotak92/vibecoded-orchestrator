@@ -247,7 +247,7 @@ dunce = "1"
 serial_test = "3"
 
 # Bug 31: libc statvfs for free-space probe (Unix only — Windows path
-# returns None, see free_bytes_at in commands/volumes.rs).
+# returns None, see free_bytes_at in commands/storage_ux.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

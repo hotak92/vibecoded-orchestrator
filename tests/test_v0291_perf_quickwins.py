@@ -347,12 +347,14 @@ def test_p2_superseded_hook_no_longer_calls_the_dual_wrapper():
 
 def test_p3_ttl_is_derived_from_the_shared_default_not_hardcoded():
     """RED-PROOF: the pre-P3 source carried a literal `CACHE_TTL=600`.
-    v0.2.101 Wave 2: the wrapper no longer sources query-cache.sh, but the
-    aligned derivation expression is KEPT verbatim — an unset
-    `_VCO_QUERY_CACHE_TTL_DEFAULT` expands to empty and the literal 900
-    governs, the same window the router's kgi/cgi cache uses."""
+    v0.2.101 Wave 2: the wrapper no longer sources query-cache.sh; the
+    final-batch fix round also dropped the retired lib's
+    `_VCO_QUERY_CACHE_TTL_DEFAULT` middle rung — `VCO_QUERY_CACHE_TTL` is
+    the ONE override and the literal 900 default matches the window the
+    router's kgi/cgi cache uses."""
     sh = (HOOKS / "pre-edit-context-inject.sh").read_text(encoding="utf-8")
-    assert 'CACHE_TTL="${VCO_QUERY_CACHE_TTL:-${_VCO_QUERY_CACHE_TTL_DEFAULT:-900}}"' in sh
+    assert 'CACHE_TTL="${VCO_QUERY_CACHE_TTL:-900}"' in sh
+    assert "${_VCO_QUERY_CACHE_TTL_DEFAULT:-900}" not in sh
     assert "CACHE_TTL=600" not in sh
     ps1 = (HOOKS / "pre-edit-context-inject.ps1").read_text(encoding="utf-8")
     assert "$CacheTtl = 900" in ps1

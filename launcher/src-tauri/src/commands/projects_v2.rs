@@ -3627,8 +3627,11 @@ pub async fn update_all_projects(
 ///     dependency).
 ///   * Spawns with `current_dir = folder` so any relative path in the
 ///     Python contract resolves against the project root.
-///   * 30s timeout — generous for user-driven actions (create / rename
-///     / refresh); the subprocess itself completes in ~150 ms.
+///   * 300s timeout (v0.2.101 owner timeout ruling, was 30s) — one runner
+///     shared by create / rename / refresh AND the all-projects re-render,
+///     which spawns one subprocess PER project: the cap must stay generous
+///     for the slowest machine, not this dev box. A single-project call
+///     completes in ~150 ms.
 ///     That includes a REFUSAL (v0.2.97): a `.claude/settings.json` that
 ///     exists but cannot be read as a JSON object is left byte-identical,
 ///     the child exits 4 with `settings_write_refused` naming the file and

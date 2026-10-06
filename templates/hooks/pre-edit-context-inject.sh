@@ -145,11 +145,10 @@ find "$PROJECT_ROOT/.claude/state" -maxdepth 1 -type d -name "edit_cache_*" -mti
 # P3 (v0.2.91): TTL aligned with the shared query cache (900 s default,
 # VCO_QUERY_CACHE_TTL override) — the router's own kgi/cgi cache uses the
 # same window, so the replay cache never outlives the semantics it replays.
-# The _VCO_QUERY_CACHE_TTL_DEFAULT middle rung stays in the expression for
-# alignment with _lib/query-cache.sh should a caller ever source it; unset,
-# it expands to empty and the literal 900 governs (same value as the
-# router's default window).
-CACHE_TTL="${VCO_QUERY_CACHE_TTL:-${_VCO_QUERY_CACHE_TTL_DEFAULT:-900}}"
+# (v0.2.101) the retired _lib/query-cache.sh's _VCO_QUERY_CACHE_TTL_DEFAULT
+# middle rung is gone with the lib: VCO_QUERY_CACHE_TTL is the ONE override,
+# read by this replay cache and the router — no marker without a reader.
+CACHE_TTL="${VCO_QUERY_CACHE_TTL:-900}"
 case "$CACHE_TTL" in ''|*[!0-9]*) CACHE_TTL=900 ;; esac
 [ "$CACHE_TTL" -gt 0 ] 2>/dev/null || CACHE_TTL=900
 

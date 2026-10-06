@@ -22,7 +22,8 @@
     APP_STATE_KEY_ACTIVE_EMBEDDING,
     OLLAMA_URL,
   } from '$lib/preferences/loaders';
-  import { selectedProject } from '$lib/stores/projects';
+  import { get } from 'svelte/store';
+  import { projects, selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
   // Profile section relocated from the now-deleted user-icon Settings
@@ -1624,13 +1625,18 @@
   async function reRenderAllProjectsEnv() {
     allProjectsEnvBusy = true;
     try {
+      // Count at click time (review nit 6): the projects store does NOT
+      // self-load and Preferences never triggers the Projects page's load,
+      // so refresh it (one list invoke, ms-scale) — the dialog then names
+      // "N project(s)" instead of the generic "every project" fallback.
+      await projects.load();
       await refreshAllProjectsEnvAction(
         {
           confirm: (m: string) => confirm(m),
           invoke,
           toast,
         },
-        0,
+        get(projects).projects.length,
       );
     } finally {
       allProjectsEnvBusy = false;
@@ -1829,7 +1835,7 @@
   // is a two-step flow: dry-run plan → user confirms → backend copies,
   // verifies health, removes legacy volumes. Phase progress streams via
   // `volumes://migrate-progress` events from the Rust side (see
-  // commands/volumes.rs::MigratePhase).
+  // commands/storage_ux.rs::MigratePhase).
   interface VolumeWithSize {
     name: string;
     mountpoint: string;

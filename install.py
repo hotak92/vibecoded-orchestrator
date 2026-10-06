@@ -8735,7 +8735,7 @@ def _print_selinux_bind_mount_hint() -> None:
         access).
 
     We don't auto-rewrite compose files here because the launcher's
-    volume migration (commands/volumes.rs) owns the bind-mount override
+    volume migration (commands/storage_ux.rs) owns the bind-mount override
     surface; rewriting from install.py would race with launcher edits.
     Instead we print a clear pointer so the user can re-run the volume
     migration with SELinux awareness.
@@ -21884,7 +21884,8 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     #
     # Defense-in-depth: this uninstaller does NOT shell out to remove
     # container volumes. Per the launcher's `volume_rm_only_callable_from_migrate_volumes`
-    # audit (volumes.rs), only `migrate_volumes` is allowed to invoke
+    # audit (commands/storage_ux.rs — moved there from volumes.rs in
+    # v0.2.101), only `migrate_volumes` is allowed to invoke
     # `<runtime> volume rm ...`. Instead, we delegate volume cleanup to
     # `compose down --volumes`, which is also forbidden in the install
     # path — so we PRINT the exact commands the user can run themselves.
