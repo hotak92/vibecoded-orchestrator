@@ -55,6 +55,7 @@
     DEFAULT_MODULE_UPDATE_AUTO_CHECK,
   } from '$lib/module-update-autocheck';
   import { setModuleUpdateAutoCheckEnabled } from '$lib/api/module_updates';
+  import { refreshAllProjectsEnvAction } from '$lib/project-state/all-projects-env';
   import type {
     EmbeddingCatalog,
     ModelChoice,
@@ -1610,6 +1611,29 @@
       target.checked = moduleUpdateAutoCheck;
     } finally {
       moduleUpdateAutoCheckBusy = false;
+    }
+  }
+
+  // ── Project environment (v0.2.101, owner ruling 2026-10-05 Q4) ────────
+  // The all-projects env re-render, back as a confirm-gated Preferences
+  // action (the v0.2.100 "no all-projects button" ruling was reversed).
+  // Logic + copy live in `$lib/project-state/all-projects-env` so the
+  // confirm-gating is unit-tested; this is markup + wiring only.
+  let allProjectsEnvBusy = $state(false);
+
+  async function reRenderAllProjectsEnv() {
+    allProjectsEnvBusy = true;
+    try {
+      await refreshAllProjectsEnvAction(
+        {
+          confirm: (m: string) => confirm(m),
+          invoke,
+          toast,
+        },
+        0,
+      );
+    } finally {
+      allProjectsEnvBusy = false;
     }
   }
 
@@ -3458,6 +3482,33 @@
           disabled={moduleUpdateAutoCheckBusy}
           onchange={toggleModuleUpdateAutoCheck}
         />
+      </div>
+    </section>
+
+    <!-- v0.2.101 (owner ruling 2026-10-05, Q4): the all-projects env
+         re-render, confirm-gated. The per-project repair stays on each
+         project's Settings tab; this is the machine-wide backfill for
+         "every project's .claude/env is stale" situations. -->
+    <section class="pr-section" aria-labelledby="pr-allenv-title">
+      <h2 class="pr-section-title" id="pr-allenv-title">Project environment</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Re-render env for all projects</strong>
+          <span class="pr-onboarding-hint">
+            Rewrites every project's .claude/env and the env block of
+            .claude/settings.json from the launcher's current settings. Asks
+            for confirmation first; can take a while (one subprocess per
+            project).
+          </span>
+        </div>
+        <button
+          class="pr-btn"
+          data-testid="re-render-all-projects-env"
+          onclick={() => void reRenderAllProjectsEnv()}
+          disabled={allProjectsEnvBusy}
+        >
+          {allProjectsEnvBusy ? 'Re-rendering…' : 'Re-render env for all projects'}
+        </button>
       </div>
     </section>
 

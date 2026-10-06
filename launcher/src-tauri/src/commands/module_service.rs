@@ -1890,24 +1890,11 @@ pub async fn signal_rotate_weights(
     Ok(())
 }
 
-/// Tauri command: manual poll wrapper. Caller (Stream D's button) passes
-/// the license_key + machine_id_hash from the licensing module.
-#[command]
-pub async fn check_for_weights_update_now(
-    project_id: String,
-    license_key: String,
-    machine_id_hash: String,
-    db: State<'_, Db>,
-) -> Result<LatestVersionResponse, String> {
-    check_weights_update(
-        &db,
-        &project_id,
-        &license_key,
-        &machine_id_hash,
-        DEFAULT_RL_LATEST_VERSION_ENDPOINT,
-    )
-    .await
-}
+// v0.2.101 (Q4 retirement): the `check_for_weights_update_now` Tauri command
+// was removed — it never had a caller (its doc named "Stream D's button",
+// which was never built) and it took `license_key` + `machine_id_hash` as
+// IPC args, crossing a key into the webview for nothing. The daily poll
+// (`check_weights_update`, called from the poll loop below) covers the flow.
 
 // ─── Phase 4A: fine-tune-after-download flow ─────────────────────────────
 

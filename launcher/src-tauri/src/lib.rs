@@ -2772,6 +2772,10 @@ pub fn run() {
             // 3 surfaces. Auto-invoked by access-matrix setters; FE may
             // also call directly after bulk edits.
             commands::projects_v2::refresh_project_env,
+            // v0.2.101 (owner ruling 2026-10-05, Q4): the confirm-gated
+            // Preferences "Re-render env for all projects" action, wrapping
+            // the same core the boot hook uses.
+            commands::projects_v2::refresh_all_projects_env,
             // v0.2.37 (Agent V37-E): bulk refresh for the install/update
             // boundary — re-renders `.claude/env` + `.claude/settings.json`
             // for every project so the canonical orchestrator-root
@@ -2859,7 +2863,6 @@ pub fn run() {
             // NEW-3 (2026-05-28): generic start for service/container modules
             // whose container_name is NULL (auto-start was skipped).
             commands::module_service::start_module_container,
-            commands::module_service::check_for_weights_update_now,
             commands::module_service::apply_weights_update,
             commands::module_service::get_rl_dashboard_state,
             // v0.2.32 (L7, Agent B): per-project text-embedding-source
@@ -3010,6 +3013,11 @@ pub fn run() {
             // installer_engine's run_install / run_upgrade — these
             // commands are for the GUI / dashboard manual paths.
             commands::module_db::apply_module_db_migrations,
+            // v0.2.101 (Q4): the module tile's "Re-apply DB migrations"
+            // repair action reads which modules' last apply reported
+            // errors from here (recorded by installer_engine, cleared by
+            // a clean apply).
+            commands::module_db::list_module_db_migration_failures,
             // Retrieval tuning (v0.2.22 Item #13 — 2026-05-20).
             // Global thresholds for score-driven retrieval verbosity
             // (KG tier cutoffs) + codegraph injection floor. Backed by
@@ -3082,7 +3090,9 @@ pub fn run() {
             commands::project_state_cmd::set_project_kg_binding,
             commands::project_state_cmd::delete_project_kg_binding,
             commands::project_state_cmd::set_project_codegraph_binding,
-            commands::project_state_cmd::delete_project_codegraph_binding,
+            // v0.2.101 (Q4 retirement): delete_project_codegraph_binding
+            // removed — never had a frontend caller; the KgCodegraphTab
+            // `enabled` checkbox already stops use of the binding.
             // Per-project MCP servers (migration 010 — Custom MCP tab feed).
             commands::project_state_cmd::list_project_mcp_servers,
             commands::project_state_cmd::set_project_mcp_server_enabled,
@@ -3328,11 +3338,11 @@ pub fn run() {
             //   SafetyReport (volumes, collections, services classification)
             //   and should run before clicking Install on a fresh path.
             commands::installer::preflight_install_safety_check,
-            commands::volumes::get_volumes_config,
-            commands::volumes::set_volumes_config_for_install,
-            commands::volumes::set_volumes_config_dry_run,
-            commands::volumes::migrate_volumes,
-            // PR-10A storage UX — separate surface from `volumes.rs`'s
+            commands::storage_ux::get_volumes_config,
+            commands::storage_ux::set_volumes_config_for_install,
+            commands::storage_ux::set_volumes_config_dry_run,
+            commands::storage_ux::migrate_volumes,
+            // PR-10A storage UX — volumes.rs merged into storage_ux.rs (v0.2.101 Q4b);
             // install-time picker. Owns Settings -> Storage. STRICT
             // allowlist enforced in storage_ux::is_recognized_legacy_volume.
             commands::storage_ux::get_storage_config,

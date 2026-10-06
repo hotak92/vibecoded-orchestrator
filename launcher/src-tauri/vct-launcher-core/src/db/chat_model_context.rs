@@ -237,7 +237,7 @@ impl ChatModelContextInput {
 /// pane reports it to the user, and "3 updated, 2 of your edits preserved" is
 /// the sentence that makes the `user_edited` guard visible instead of
 /// folklore.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReseedOutcome {
     /// Shipped rows that were absent (a new vendor model, or a row the user
     /// had deleted — "Reseed from shipped defaults" restores both).
@@ -255,6 +255,14 @@ pub struct ReseedOutcome {
     /// every existing install kept a dead row the model-context pane and the
     /// exported JSON still listed while the gateway refused the id.
     pub retired: usize,
+    /// Per-row record of every row this pass WROTE — `(model_id, action)`
+    /// with action `"inserted"` / `"updated"` (v0.2.101, Q6/G1: the
+    /// model-picker provenance log). Unwritten rows are NOT listed: a
+    /// steady-state boot converges an unchanged table and records nothing,
+    /// so the log lines the commands layer derives from this stay quiet
+    /// until a row actually appears or changes — which is exactly the
+    /// moment the next duplicate picker row needs to be traceable from.
+    pub written: Vec<(String, String)>,
 }
 
 // ─── Timestamps ───────────────────────────────────────────────────────────
@@ -633,6 +641,9 @@ fn converge_rows(
                 )
                 .map_err(|e| format!("converge update {}: {}", row.model_id, e))?;
                 outcome.updated += 1;
+                outcome
+                    .written
+                    .push((row.model_id.clone(), "updated".to_string()));
             }
             None => {
                 if restore_deleted {
@@ -661,6 +672,9 @@ fn converge_rows(
                 )
                 .map_err(|e| format!("converge insert {}: {}", row.model_id, e))?;
                 outcome.inserted += 1;
+                outcome
+                    .written
+                    .push((row.model_id.clone(), "inserted".to_string()));
             }
         }
     }
@@ -1291,7 +1305,8 @@ mod tests {
         let outcome = db.converge_chat_model_context_seed(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0, retired: 0 },
+            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0, retired: 0,
+                written: vec![("glm-5.1".into(), "updated".into())] },
             "an untouched row with stale values is REFRESHED, not skipped"
         );
         let row = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
@@ -1321,7 +1336,8 @@ mod tests {
         let outcome = db.converge_chat_model_context_seed(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1, retired: 0 }
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1, retired: 0,
+                written: Vec::new() }
         );
 
         // BYTE-IDENTICAL: context_window, max_output, window_1m, source,
@@ -1354,7 +1370,8 @@ mod tests {
         let outcome = db.converge_chat_model_context_seed(&[input("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 0, unchanged: 1, preserved_user_edits: 0, retired: 0 },
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 1, preserved_user_edits: 0, retired: 0,
+                written: Vec::new() },
             "an identical row is counted, not written"
         );
         assert_eq!(
@@ -1531,7 +1548,8 @@ mod tests {
         let outcome = db.reseed_chat_model_context(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0, retired: 0 }
+            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0, retired: 0,
+                written: vec![("glm-5.1".into(), "updated".into())] }
         );
         let row = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
         assert_eq!(row.context_window, 1_000_000);
@@ -1558,7 +1576,8 @@ mod tests {
         let outcome = db.reseed_chat_model_context(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1, retired: 0 }
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1, retired: 0,
+                written: Vec::new() }
         );
 
         let after = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
@@ -1580,9 +1599,53 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 1, updated: 0, unchanged: 1, preserved_user_edits: 0, retired: 0 },
+            ReseedOutcome { inserted: 1, updated: 0, unchanged: 1, preserved_user_edits: 0, retired: 0,
+                written: vec![("glm-5.3".into(), "inserted".into())] },
             "a new vendor model arrives; the identical row is not rewritten"
         );
+    }
+
+    /// v0.2.101 (Q6/G1): the provenance record. A converge that inserts,
+    /// updates and leaves alone must record EXACTLY the two rows it wrote
+    /// with their actions — the unchanged row must NOT appear (a
+    /// steady-state boot stays quiet) and the record is what the commands
+    /// layer turns into the model-picker provenance log lines.
+    /// (Red-proof mutation: drop either `written.push` in `converge_rows`
+    /// and this fails.)
+    #[test]
+    fn converge_records_exactly_the_rows_it_wrote() {
+        let db = make_db();
+        db.upsert_chat_model_context(input("glm-5.1"), false).unwrap();
+
+        let outcome = db
+            .converge_chat_model_context_seed(&[
+                one_m("glm-5.1"),      // present, stale → updated
+                input("glm-5.3"),      // absent → inserted
+                input("glm-5.2"),      // absent → inserted
+            ])
+            .unwrap();
+
+        assert_eq!(
+            outcome.written,
+            vec![
+                ("glm-5.1".to_string(), "updated".to_string()),
+                ("glm-5.3".to_string(), "inserted".to_string()),
+                ("glm-5.2".to_string(), "inserted".to_string()),
+            ],
+            "written records each row that landed, in seed order, with its action"
+        );
+
+        // Steady state: converging the SAME seed again writes nothing and
+        // records nothing — the provenance log stays silent on a boot that
+        // changed no row.
+        let again = db
+            .converge_chat_model_context_seed(&[
+                one_m("glm-5.1"),
+                input("glm-5.3"),
+                input("glm-5.2"),
+            ])
+            .unwrap();
+        assert!(again.written.is_empty(), "an unchanged table records nothing");
     }
 
     #[test]

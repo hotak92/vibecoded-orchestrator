@@ -41,11 +41,17 @@ stdout verbatim:
                                         --hook-format [--project P]
                                         [--exclude-file F] [--anchor A]``)
 
-so the emitted blocks are byte-identical to the two-process path. The caller
-(``_lib/query-cache.sh::vco_dual_search_cached``) applies the SAME per-leg output
-caps (``head -40`` for KG, ``head -20`` for CG) and the SAME per-leg cache keys as
-before, so cross-surface cache sharing with pre-bash / pre-tool-use is unchanged.
-Verified by golden-output diff against the two-CLI path.
+so the emitted blocks are byte-identical to the two-process path.
+
+v0.2.101 wave-3 status: the shell caller this driver was built for
+(``_lib/query-cache.sh::vco_dual_search_cached``) was RETIRED with the
+injection-wrapper rework — production now imports this module instead:
+``hook_context_router.py`` runs its legs through :func:`run_legs` (same
+thread-routed capture, per-leg soft-fail, bounded joins) and calls the
+producers with the injection-profile argv. The CLI form below (markers +
+argv contract) is RETAINED as the driver-level golden surface the
+``test_v0291_perf_quickwins.py`` rows exercise — it has no production
+spawner any more, and this note is its documented role.
 
 Output framing
 --------------
@@ -87,8 +93,10 @@ import threading
 from pathlib import Path
 from typing import Callable, Dict
 
-# MUST MATCH templates/hooks/_lib/query-cache.{sh,ps1} — the caller splits the
-# stream on these exact lines.
+# The CLI form's output framing. Historical note: the shell splitter these
+# markers were "MUST MATCH"-locked to (_lib/query-cache.{sh,ps1}) was retired
+# in v0.2.101 wave-3 — the markers now serve the driver-level golden tests
+# only (test_v0291_perf_quickwins.py), which pin both sides of the framing.
 KG_MARKER = "<<<VCO-DUAL:KG>>>"
 CG_MARKER = "<<<VCO-DUAL:CG>>>"
 

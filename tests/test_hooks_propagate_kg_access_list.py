@@ -71,11 +71,9 @@ ACCESS_VARS = ("VCT_KG_ACCESS_LIST", "VCT_CODE_GRAPH_ACCESS_LIST")
 # delegation path within ~1.5s wall-clock with VCT_DISABLE_HOOKS unset. We
 # only run the dynamic test against this subset to keep test latency
 # predictable — the static test already covers all 32 files.
-DYNAMIC_TEST_HOOKS = [
-    # pre-tool-use.sh fires on every tool call; the KG-suggestion branch
-    # spawns kg-search when concept keywords show up in the user message.
-    "pre-tool-use.sh",
-]
+# v0.2.101 wave-3: the dynamic-probe subject (pre-tool-use §5) was retired;
+# see the retirement note at the bottom of this file.
+DYNAMIC_TEST_HOOKS: list[str] = []
 
 
 def _hook_files(suffix: str) -> list[Path]:
@@ -309,112 +307,14 @@ def test_centralization_marker_present_on_kg_touching_hooks() -> None:
     )
 
 
-# --- Dynamic check -----------------------------------------------------
-
-
-@pytest.mark.parametrize("hook_name", DYNAMIC_TEST_HOOKS)
-def test_sh_hook_propagates_access_vars_to_subprocess(
-    hook_name: str, tmp_path: Path
-) -> None:
-    """Run a hook with VCT_KG_ACCESS_LIST set; assert the kg-search stub
-    sees the var in its env.
-
-    This is a sanity probe — the static test above covers all hooks; this
-    one exercises the actual subprocess inheritance path on a real
-    invocation. Uses a stubbed ``kg-search`` wrapper that records its env
-    and exits, so we don't need a real Weaviate.
-    """
-    if sys.platform.startswith("win"):
-        pytest.skip("dynamic .sh test runs on POSIX shells only")
-
-    hook_path = REPO_ROOT / ".claude" / "hooks" / hook_name
-    if not hook_path.exists():
-        pytest.skip(f"{hook_path} not present")
-
-    # Build a fake project layout under tmp_path that the hook will see
-    # as PROJECT_ROOT (its `cd $SCRIPT_DIR/../..` resolution).
-    project_root = tmp_path / "fake-project"
-    (project_root / ".claude" / "hooks").mkdir(parents=True)
-    (project_root / ".claude" / "scripts").mkdir(parents=True)
-    (project_root / ".claude" / "logs").mkdir(parents=True)
-    (project_root / ".claude" / "hooks" / "_lib").mkdir(parents=True)
-
-    # Symlink the real hook's _lib helpers into the fake hooks dir so
-    # `. _lib/stderr-cap.sh` works.
-    real_lib = REPO_ROOT / ".claude" / "hooks" / "_lib"
-    fake_lib = project_root / ".claude" / "hooks" / "_lib"
-    for f in real_lib.iterdir():
-        if f.is_file():
-            (fake_lib / f.name).symlink_to(f)
-    # Symlink the hook itself so its $SCRIPT_DIR/../.. resolves to project_root.
-    fake_hook = project_root / ".claude" / "hooks" / hook_name
-    fake_hook.symlink_to(hook_path)
-
-    # Recorder kg-search stub: writes its env to a file and exits.
-    env_dump = tmp_path / "stub_env.txt"
-    stub_path = project_root / ".claude" / "scripts" / "kg-search"
-    stub_path.write_text(
-        "#!/usr/bin/env bash\n"
-        f'env > "{env_dump}"\n'
-        "echo 'knowledge/concepts/stub.md'\n"
-        "echo 'knowledge/concepts/stub2.md'\n"
-        "exit 0\n"
-    )
-    stub_path.chmod(0o755)
-
-    # Stub kg-search via PATH override is harder than just placing the
-    # file at the path the hook resolves: $PROJECT_ROOT/.claude/scripts/kg-search.
-    # The hook resolves PROJECT_ROOT via $SCRIPT_DIR/../.. — done above by
-    # symlinking the hook through project_root.
-
-    # Build the JSON payload that triggers the KG-suggestion path:
-    # tool_name=Edit, user_message contains a concept keyword.
-    payload = (
-        '{"tool_name": "Edit", '
-        '"tool_input": {"file_path": "/tmp/anything.py"}, '
-        '"user_message": "let us improve the authentication caching pattern", '
-        '"session_id": "test-session"}'
-    )
-
-    env = {
-        "VCT_KG_ACCESS_LIST": "Beta,Gamma",
-        "VCT_CODE_GRAPH_ACCESS_LIST": "Beta,Gamma",
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": str(tmp_path),
-        "TMPDIR": str(tmp_path),
-        # IMPORTANT: do NOT set VCT_DISABLE_HOOKS — we want the hook to run.
-    }
-
-    result = subprocess.run(
-        ["bash", str(fake_hook)],
-        input=payload,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        cwd=str(project_root),
-    )
-
-    # Assert the hook didn't crash (exit 2 means it blocked the tool call,
-    # which only happens for SSRF / shell injection / build anchor — none
-    # apply here).
-    assert result.returncode == 0, (
-        f"Hook returned non-zero ({result.returncode}).\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
-
-    # Assert the stub recorded our access-list vars in its env.
-    if not env_dump.exists():
-        pytest.fail(
-            f"Stub kg-search was never invoked — the hook may have skipped the "
-            f"KG-suggestion branch. stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    dumped = env_dump.read_text()
-
-    assert "VCT_KG_ACCESS_LIST=Beta,Gamma" in dumped, (
-        f"VCT_KG_ACCESS_LIST not in subprocess env. Stub env was:\n{dumped}"
-    )
-    assert "VCT_CODE_GRAPH_ACCESS_LIST=Beta,Gamma" in dumped, (
-        f"VCT_CODE_GRAPH_ACCESS_LIST not in subprocess env. Stub env was:\n{dumped}"
-    )
+# --- Dynamic check — RETIRED (v0.2.101 wave-3, review nit-6) ---------------
+# The dynamic probe drove pre-tool-use.sh's §5 KG-suggestion branch and
+# asserted the kg-search child saw VCT_KG_ACCESS_LIST /
+# VCT_CODE_GRAPH_ACCESS_LIST. §5 was retired (double emission with the
+# pre-edit/pre-write router wrappers), so pre-tool-use spawns NO KG child
+# any more. The propagation property lives where the spawn lives now:
+# the injection wrappers export nothing and scrub nothing, so the router
+# and its in-process producers inherit the access lists from the hook env —
+# pinned end-to-end by tests/test_v02100_hook_kg_project_identity.py
+# (real router + identity-stub producer through the real hooks) and by the
+# static no-strip scans above.

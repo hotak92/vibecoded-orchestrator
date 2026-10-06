@@ -449,8 +449,10 @@ def test_events_and_ids_carry_the_task_type(world):
 # v0.2.101: the router loads this producer IN-PROCESS with a PINNED argparse
 # (hook_dual_search._pin_argv), so sys.argv does NOT carry the producer's
 # flags — the stub must parse them the same way the real rl_kg_search does.
-# The VCO_RL_TASK_TYPE env fallback covers the legacy direct-spawn hooks
-# (pre-tool-use §5) that still export it.
+# The VCO_RL_TASK_TYPE env fallback covered the legacy direct-spawn hooks;
+# the last of them (pre-tool-use §5) was retired in wave-3, so every live
+# task-type now travels as the router's --task-type argv (the env fallback
+# remains in resolve_task_type as documented behaviour).
 _TT_PRODUCER = (
     "import argparse, os\n"
     "\n"
@@ -511,9 +513,11 @@ _HOOK_CASES = [
     ("pre-bash-context-inject", "pre_bash_kg_search",
      lambda t: {"tool_name": "Bash", "session_id": "s-tt2",
                 "tool_input": {"command": "cat tests/test_widget_reranker.py"}}),
-    ("pre-tool-use", "pre_tool_use_kg_search",
-     lambda t: {"tool_name": "Edit", "session_id": "s-tt3",
-                "tool_input": {"file_path": str(t), "old_string": "x", "new_string": "y"}}),
+    # v0.2.101 wave-3 (review nit-6): the pre-tool-use row was RETIRED with
+    # its §5 KG-suggestion branch — Edit/Write KG context is the pre-edit/
+    # pre-write router wrappers' one home now (their task types are pinned by
+    # the two rows above). pre_tool_use_kg_search STAYS registered in
+    # KNOWN_TASK_TYPES: the historical RL corpus keeps its partition label.
     # v0.2.101 §C4/§C5: subagent-start-kg-inject's KG half was RETIRED (the
     # SubagentStart payload carries no prompt — the old query could never
     # fire). Its successor surface is the agent-brief PreToolUse hook; the

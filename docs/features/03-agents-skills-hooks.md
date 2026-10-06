@@ -124,7 +124,7 @@ First prompt: creates a baseline snapshot. Subsequent prompts: diffs against sna
 </details>
 
 ### `pre-tool-use.sh` — PreToolUse `*` (all tools, blocking)
-Security enforcement + file backup + KG suggestion.
+Security enforcement + file backup.
 
 <details>
 <summary>Details</summary>
@@ -138,15 +138,70 @@ Exit 2 blocks the tool call. Exit 0 allows it. Security events logged to `.claud
 
 > **Retired (v0.2.77):** an earlier version of this hook also wrote every tool call to a `toucan_dataset.jsonl` "TOUCAN dataset" log. That collector had zero consumers (it was never wired into any RL training path — RL training telemetry lives in `launcher.db rl_events` plus the citation drain, both unaffected), so it was removed to save the per-tool-call I/O. No user action is needed; any existing `.claude/logs/toucan_dataset.jsonl` file is gitignored and inert, and can be deleted at leisure.
 
+> **Retired (v0.2.101):** the Read(code)/Grep(symbol) code-graph injection branches and the §5 "💡 Found N related patterns" Edit/Write KG suggestion. The injection redesign gave those surfaces dedicated router wrappers (`read-context-inject`, `grep-context-inject`, `pre-edit`/`pre-write-context-inject`) — the suggestion double-emitted on every Edit/Write alongside `pre-edit-context-inject` and had no score floor. This hook now spawns no KG/code-graph subprocess at all.
+
 </details>
 
+### Context injection architecture (v0.2.101)
+
+Every KG/code-graph injection surface is a THIN wrapper around one Python router — `claude_mcp_servers/scripts/hook_context_router.py`, with the pure decision core in `vco_lib/inject_intent.py` (no Weaviate imports, fully unit-tested). The wrapper pipes the hook's stdin JSON to `hook_context_router.py <surface>` and wraps whatever it prints in the `additionalContext` envelope; the router owns everything else:
+
+- **Queries come from targets, never from command/prose text.** A Bash command is classified READ / EDIT / SEARCH / MECHANICAL; queries are built from its target paths and clean symbols (`git show <rev>:<path>` keeps its revision pin). MECHANICAL commands (`ls`, builds, tests, `git status`…) spawn **no producer at all** — and the Bash registration is an `if`-filtered handler group, so most commands never even spawn the hook.
+- **Per-surface noise gates** (the §2.1 table, shipped as data in `inject_intent.py`): score floors per surface (0.65–0.75), titles-only rendering below 0.85, exact code-graph `structure callers` lookups (def + callers, ≤5 rows, symbol+file:line only — never bodies) instead of semantic code search, an indexed-revision stamp that silences the code-graph leg when the model reads a pinned old revision (`git show <old-rev>:file`), and a same-language identity check on exact-symbol matches.
+- **Bounds:** 2 500 chars per injection, a 6 000-char per-turn budget keyed by `prompt_id` (past it, blocks degrade to titles one-liners), the pre-existing per-session seen-store dedupe (same files/key format) and the `VCO_CG_INJECT_CAP` session cap.
+- **Cache:** a TTL cache under `.claude/state/query_cache/` (router namespaces `kgi`/`cgi`) that **never stores an empty result** — an empty blob is indistinguishable from a timed-out leg, and caching one used to poison the query for the whole TTL.
+- **RL continuity:** every router KG leg runs the real `rl_kg_search.py` with `--injection-profile <surface>` and the surface's `--task-type`, so retrieval events keep flowing, partitioned per surface; the Bash wrapper keeps the `bash_task_*` state file + `pre_bash` outcome event (now gated on the classification and carrying `intent`/`targets`/`symbols`, with one event per tool call even when a multi-match command fires several `if` rules).
+- **Kill switch:** `VCO_INJECT_PROFILE=off` (checked by the wrappers before spawning and re-checked by the router) disables all injection surfaces without touching the security hooks; `VCT_BASH_KG_THRESHOLD_CHARS` was retired with the threshold it tuned.
+
+The surfaces: `pre-bash-context-inject` (Bash), `pre-edit-context-inject` (Edit), `pre-write-context-inject` (Write), `grep-context-inject` (Grep), `agent-brief-kg-inject` (Agent|Task, PreToolUse `updatedInput`) and `read-context-inject` (Read, PostToolUse — the result surface, where the just-read content feeds the lookup).
+
 ### `pre-edit-context-inject.sh` — PreToolUse Edit (blocking)
-Inject KG + code graph context for the file being edited before the Edit executes.
+Inject gated KG + EXACT code-graph context for the symbol being edited, before the Edit executes.
 
 <details>
 <summary>Details</summary>
 
-Fires only for the `Edit` tool (not `Write` — new files have less prior context value). Runs KG semantic search on the file path and injects relevant nodes as additional context. Must complete within 8 seconds. Never exits 2 — always allows the edit to proceed. Cache warms after first run; subsequent calls for the same file are ~31ms.
+Fires only for the `Edit` tool (the Write surface has its own wrapper since v0.2.101). A thin router wrapper: `hook_context_router.py edit` extracts the ENCLOSING symbols of `old_string` (per-language def/class/fn/impl tables) and runs an exact `structure callers` lookup per symbol (self-file callers excluded), plus a KG leg keyed on module+symbol+path topic with the edit-profile floor (0.65; titles-only below 0.85). The pre-v0.2.101 semantic query (`"<module> <first 200 chars of new_string>"`) is retired — `new_string` content never becomes query text. The per-file replay cache is kept: a repeat edit within the TTL replays the cached router output through the CURRENT seen-state without any spawn. Must complete within the settings timeout (10 s; the router's inner budget is `VCO_INJECT_BUDGET_S`, default 6 s with a 4 s per-leg bound — ordered to leave startup+emit headroom under the harness timeout on slow hardware; a cold run that still overruns fails open to silence, which is the accepted contract for this bounded class). Never exits non-zero — always allows the edit to proceed.
+
+</details>
+
+### `pre-write-context-inject.sh` — PreToolUse Write (blocking, v0.2.101)
+The router's `write` surface for whole-file writes.
+
+<details>
+<summary>Details</summary>
+
+KG titles keyed on the module name + sibling directory (the path topic — never the file's content), floor 0.65. The code-graph leg runs only when the path REWRITES an existing file (its on-disk top-level symbols are looked up); a brand-new file's symbols are not indexed yet, so no CG query is made. Thin wrapper, kill-switch checked first, never exits non-zero.
+
+</details>
+
+### `read-context-inject.sh` — PostToolUse Read (v0.2.101)
+Context about what was just read — on the RESULT surface.
+
+<details>
+<summary>Details</summary>
+
+PostToolUse (not PreToolUse) per the hooks contract: the payload carries `tool_response`, so the lookup uses the content actually read (no disk re-read). Code files → the file's top-level symbols → exact def+callers (≤5 rows each) + KG titles keyed on the path/topic (floor 0.70); docs/knowledge files → KG titles only. This replaced the pre-tool-use Read branch, which ran under the `*` matcher's 3 s budget with a 4 s inner CLI bound — structurally unable to complete a cold query (measured 4.7–11.6 s), which is why the branch injected nothing in practice; this hook gets its own registration with timeout 10.
+
+</details>
+
+### `grep-context-inject.sh` — PreToolUse Grep (v0.2.101)
+Exact-symbol lookup for identifier greps.
+
+<details>
+<summary>Details</summary>
+
+Fires only when the Grep pattern passes the identifier gate (`vco_lib/inject_intent.pattern_gate`) AND a clean identifier is recoverable — regex fragments (`pub(crate)`) and bare words stay silent. Runs the exact `structure callers` leg only (no KG — a symbol grep is a code question). Replaced the pre-tool-use Grep branch.
+
+</details>
+
+### `agent-brief-kg-inject.sh` — PreToolUse `Agent|Task` (v0.2.101)
+KG context for a subagent's brief, injected parent-side.
+
+<details>
+<summary>Details</summary>
+
+Reads `tool_input.prompt` (falling back to `description` for the QUERY only), extracts the brief's `Task:` section (or the first sentence after any FIRST ACTION/effort preamble, ≤400 chars) and runs the KG leg only — floor 0.65, ≤3 nodes, ≤1 500 chars total, because the block lands in the subagent's FIRST prompt and is re-paid on every lane turn. Emission is a PreToolUse `updatedInput` envelope that round-trips EVERY original `tool_input` field and modifies only `prompt`; it never emits `permissionDecision` (which would auto-approve the dispatch). A briefless prompt leaves the input untouched. This is the successor of `subagent-start-kg-inject`'s KG half — SubagentStart payloads carry no prompt text, so that query could never fire; the V52-L.1 filesystem snapshot the SubagentStop reconciler needs was kept there.
 
 </details>
 
@@ -257,10 +312,12 @@ Defense-in-depth guard for diagrams integration. Rejects `.mmd` / `.excalidraw` 
 ### `post-file-delete.sh` — PostToolUse Bash (routed by `post-tool-use-async`)
 Detects deletes of `.mmd` / `.excalidraw` files under `.claude/diagrams/` and cascades the delete across SQLite + sidecar + Weaviate via `vco_lib.diagram_indexer drop <file>`. Matches `rm` / `unlink` / `mv` / PowerShell `Remove-Item` / `Move-Item`.
 
-### `pre-bash-context-inject.sh` — PreToolUse Bash (V52-M)
-KG context injection before `Bash` tool calls. Reads the proposed command, runs a `hybrid_search` for related concepts, and injects matches as `additionalContext`. PowerShell sibling at `templates/hooks/pre-bash-context-inject.ps1`. Propagates `session_id` to child processes so downstream invocations of `rl_kg_search.py` are attributable to the same session.
+### `pre-bash-context-inject.sh` — PreToolUse Bash (V52-M; router wrapper since v0.2.101)
+Classified, target-keyed context injection before `Bash` tool calls. PowerShell sibling at `templates/hooks/pre-bash-context-inject.ps1`. Propagates `session_id` to child processes so the router's `rl_kg_search.py` invocations are attributable to the same session.
 
-**v0.2.95 — query shape.** When the same write-target parser used by `post-bash-file-sync` recovers a target from the command, the query is built the way `pre-edit-context-inject.sh` builds it: module name from the basename plus a content snippet (the heredoc body, when the target is under `knowledge/`/`docs/` and carries no credential shape), and the written file is passed as `--anchor` / `--exclude-file` on the code-graph leg. With no recoverable target — the overwhelmingly common case — the query is byte-for-byte the pre-v0.2.95 noise-stripped command. The 500-char KG threshold and its `VCT_BASH_KG_THRESHOLD_CHARS` override are unchanged, and the code-graph branch still runs *before* that threshold.
+**v0.2.101 — classification replaces the threshold.** The hook is a thin wrapper around `hook_context_router.py bash` (see the architecture section above). The router classifies the command — READ (`cat`/`head`/`sed -n`/`git show|diff|log`), EDIT (`sed -i`, redirects, heredocs, write verbs), SEARCH (`grep`/`rg`/`git grep` with an identifier pattern) or MECHANICAL (everything else) — and builds queries ONLY from the command's target paths/symbols: a knowledge/docs heredoc write contributes its body snippet, a `git show <rev>:<path>` read keeps its revision pin (the code-graph leg stays silent when the graph's stamp does not match the rev), a SEARCH contributes its clean identifier to an exact `structure callers` lookup. MECHANICAL commands spawn no producer and inject nothing. The 500-char threshold and its `VCT_BASH_KG_THRESHOLD_CHARS` override are RETIRED (classification replaced them); the v0.2.95 noise-stripped-command query is retired with them (command text is never query text any more).
+
+**RL pairing (WP-D 2).** For every READ/EDIT/SEARCH command the wrapper still mints the `bash_task_<session>_<cmdhash>.json` state file (same md5[:16] pairing contract `post-bash-context-record` re-derives) and emits the `pre_bash` outcome event — now upstream of the old length gate (more events, on shorter commands) and carrying `intent` + extracted `targets`/`symbols` in both payloads. A multi-match command (`cat x | grep y` fires two `if`-rule handlers) emits exactly ONE event: a fresh (<60 s) unpaired state file means a sibling spawn already paired the call.
 
 ### `post-bash-file-sync.sh` — PostToolUse Bash (v0.2.95)
 Gives a **CLI write** the same treatment an `Edit`/`Write` gets. `post-file-edit.sh` is registered on matcher `Edit|Write` only, so before v0.2.95 a `cat > knowledge/foo.md <<EOF`, a `sed -i` on a `docs/` page or a `cp` into a source tree reached Weaviate *never*. This hook parses the executed command for write targets (`vco_lib/bash_write_targets.py` — redirections, heredocs, `tee`, `sed -i`, `cp`/`mv`/`install` destinations, `touch`, `dd of=`, long `--output` flags; chains / wrapper verbs / `bash -c` come from the shared `vco_lib/bash_command_walk`) and feeds each one to the SAME routing home `post-file-edit.sh` uses, `_lib/route-touched-path.sh`. PowerShell sibling ships alongside.
@@ -274,10 +331,10 @@ Two costs are deliberately bounded:
 `knowledge/**` → `kg-sync` (KG collection), `docs/**.md` → `kg-sync` (development collection), `.claude/diagrams/*.{mmd,excalidraw}` → `vco_lib.diagram_indexer` (60 s throttle), code extensions → the per-turn code-graph drain queue — each gated by the Phase-8 access matrix and coalesced by the per-file debounce. Extracted from `post-file-edit.{sh,ps1}` when `post-bash-file-sync` became a second consumer; both hooks call it, neither re-implements it.
 
 ### `_lib/code-extensions.{sh,ps1}` — "is this a code file?" (v0.2.95)
-One home for the extension alternation the code graph acts on. `pre-edit-context-inject`, `pre-bash-context-inject` and the routing home read it; four remaining pairs (`pre-tool-use`, `code-graph-incremental`, `stop-codegraph-drain`, `_lib/command-noise-strip`) still spell it out for reasons recorded in `tests/test_v0295_code_extension_one_home.py`, which fails if any of them drifts from the home.
+One home for the extension alternation the code graph acts on. The routing home reads it; two remaining pairs (`code-graph-incremental`, `stop-codegraph-drain`) still spell it out for reasons recorded in `tests/test_v0295_code_extension_one_home.py`, which fails if any of them drifts from the home. (v0.2.101: the injection wrappers and `pre-tool-use` no longer make this decision in shell at all — the router's Python core does, via `vco_lib/inject_intent.language_for_path`, whose table is parity-pinned against the analyzer's dispatch table; the `codegraph-query` and `command-noise-strip` mirrors were retired with those libs.)
 
 ### `post-bash-context-record.sh` — PostToolUse Bash (V52-M; routed by `post-tool-use-async`)
-Outcome recorder paired with `pre-bash-context-inject.sh`. Writes a `bash` event into the per-session learning log (exit code, elapsed time, stderr-tail). Used by the RL retrieval reranker training pipeline. PowerShell sibling ships alongside.
+Outcome recorder paired with `pre-bash-context-inject.sh`. Writes a `bash` event into the per-session learning log (exit code, elapsed time, stderr-tail). Used by the RL retrieval reranker training pipeline. The pairing contract is unchanged in v0.2.101 (same `bash_task_<session>_<cmdhash>.json` name/shape, joined on `task_id`); the state file gained additive `intent`/`targets`/`symbols` keys this recorder ignores. PowerShell sibling ships alongside.
 
 ### `post-edit-outcome.sh` — PostToolUse Edit|Write (V52-M; routed by `post-tool-use-async`)
 Outcome event recorder for file edits. Companion to the V52-M bash pair; mirrors the contract for edit-shaped tools. PowerShell sibling at `templates/hooks/post-edit-outcome.ps1`.

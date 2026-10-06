@@ -396,10 +396,17 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `diff-context-inject.sh` — section-level diffs of `CONTEXT_STATE.md` (70–90% token savings after the first prompt).
 
 **PreToolUse**:
-- `pre-tool-use.sh` — SSRF guard + shell-injection scan + Build Anchor / file backup + pre-Edit KG suggestion (matcher: `*`).
-- `pre-edit-context-inject.sh` — KG + code-graph search before `Edit`; a warm cache hit replays without re-running the query (matcher: `Edit`).
+- `pre-tool-use.sh` — SSRF guard + shell-injection scan + Build Anchor / file backup (matcher: `*`). Its former pre-Edit KG suggestion was retired in v0.2.101 — the injection wrappers below are the one home for edit-time KG context.
+- `pre-edit-context-inject.sh` — before `Edit`: the context router injects score-gated KG titles plus the EXACT code-graph def+callers of the edited symbol (matcher: `Edit`; a warm per-file replay cache serves repeat edits without a router spawn).
+- `pre-write-context-inject.sh` — the same router surface for `Write` (matcher: `Write`; KG keyed on the module name + sibling dir, code-graph leg only when rewriting an existing file).
+- `pre-bash-context-inject.sh` — before `Bash`: the router CLASSIFIES the command (READ/EDIT/SEARCH → queries built from its target paths/symbols; MECHANICAL → no query, no injection, no spawn of any producer) and keeps the `pre_bash` RL pairing state/event for classified commands (matcher: `Bash`, registered as an `if`-filtered handler group so routine commands spawn no hook process at all). The pre-v0.2.101 500-char threshold (`VCT_BASH_KG_THRESHOLD_CHARS`) is retired — classification replaced it.
+- `grep-context-inject.sh` — `Grep` whose pattern is a code identifier → exact def+callers, no KG leg (matcher: `Grep`).
+- `agent-brief-kg-inject.sh` — appends a small (≤1 500-char) KG context block to a subagent brief through `updatedInput`; it never emits `permissionDecision` (matcher: `Agent|Task`).
+
+All injection surfaces are thin wrappers around ONE Python router (`claude_mcp_servers/scripts/hook_context_router.py` + the pure classifier in `vco_lib/inject_intent.py`): per-surface score floors, titles-only formatting below 0.85, per-injection (2 500-char) and per-turn (6 000-char) budgets, per-session dedupe through the shared seen-store, a TTL query cache that NEVER stores empty results, and the `VCO_INJECT_PROFILE=off` kill switch (beside `VCT_DISABLE_HOOKS`).
 
 **PostToolUse**:
+- `read-context-inject.sh` — after `Read`: the router injects KG titles keyed on the document's path/topic and, for code files, the exact def+callers of the file's top-level symbols from the content just read (matcher: `Read`; synchronous — the result content is what feeds the lookup, and PostToolUse is the documented surface for context about a result).
 - `post-file-edit.sh` — auto-sync on file edits: `knowledge/` → KG, `docs/` → development collection, code files → code-graph queue; duplicate detection every 10 edits (matcher: `Edit|Write`).
 - `post-bash-file-sync.sh` — the same routing for a file written from the CLI (`cat > knowledge/x.md`, a heredoc, `sed -i` on a docs page): the command is parsed for the paths it wrote and each one goes through the one routing home (matcher: `Bash`).
 - `py-compile-check.sh` — syntax check on Python writes (matcher: `Write`; the hook filters by extension internally).

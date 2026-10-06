@@ -73,6 +73,11 @@ export interface ReseedOutcome {
    *  ships, deleted by this very reseed — unnamed in the toast, their
    *  disappearance would be unexplained (review SF-1). */
   retired: number;
+  /** Per-row record of every row the pass WROTE — `[model_id, action]`
+   *  with action "inserted" / "updated" (v0.2.101, Q6/G1: the
+   *  model-picker provenance log; the backend logs one line per entry,
+   *  the GUI does not render it). Empty on a steady-state converge. */
+  written: [string, string][];
 }
 
 /** Every mutating command returns its own result AND the export outcome. */

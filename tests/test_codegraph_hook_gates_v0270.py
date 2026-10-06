@@ -151,13 +151,16 @@ def test_dead_injection_libs_stay_retired() -> None:
     resurrecting one flavour) goes red."""
     lib = HOOKS / "_lib"
     for name in ("codegraph-query.sh", "codegraph-query.ps1",
-                 "command-noise-strip.sh", "command-noise-strip.ps1"):
+                 "command-noise-strip.sh", "command-noise-strip.ps1",
+                 # wave-3 (review nit-6): pre-tool-use §5 was the last
+                 # consumer of the shell query cache — retired with it. The
+                 # §9 never-cache-empty contract lives in the router's
+                 # Python cache (test_v02101_query_cache_poison_fix.py).
+                 "query-cache.sh", "query-cache.ps1"):
         assert not (lib / name).exists(), (
             f"{name} must stay retired (zero live callers since v0.2.101)"
         )
     for name, dead, comment_prefix in (
-        ("query-cache.sh", "vco_dual_search_cached", "#"),
-        ("query-cache.ps1", "Invoke-VcoDualSearchCached", "#"),
         ("bash-write-targets.sh", "vco_bash_write_prebash", "#"),
         ("bash-write-targets.ps1", "Get-VcoBashWritePreBash", "#"),
     ):

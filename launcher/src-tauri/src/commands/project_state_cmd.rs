@@ -1217,7 +1217,9 @@ fn default_true() -> bool {
 }
 
 // v0.2.72 R2 (F5 residual) — set/delete_project_codegraph_binding now DO
-// re-project env. The pre-R2 audit note here documented a deliberate
+// re-project env (the delete command itself was retired in v0.2.101 Q4;
+// the projection contract below is what any future unbind surface must
+// keep). The pre-R2 audit note here documented a deliberate
 // no-op: `config_projection.py` derived CODE_GRAPH_PROJECT from the
 // sanitized project NAME only, so a refresh after a prefix change would
 // have rewritten `.claude/settings.json` byte-identically (inert —
@@ -1299,52 +1301,15 @@ pub async fn set_project_codegraph_binding(
     .await?
 }
 
-/// Free-function core of `delete_project_codegraph_binding` — DB delete
-/// + audit + R2 env re-projection (an unbind flips the projected
-/// CODE_GRAPH_PROJECT back to the name-derived prefix, so the MCP must
-/// be reloaded the same way a rebind is). Returns the refresh result so
-/// tests can observe that the projection ran.
-pub fn delete_project_codegraph_binding_with_db(
-    db: &Db,
-    project_id: &str,
-) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
-    db.delete_project_codegraph_binding(project_id)?;
-    db.audit(
-        "project_codegraph_binding_delete",
-        Some(project_id),
-        None,
-        &serde_json::json!({}),
-    )?;
-    Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
-}
-
-/// Remove a project's codegraph binding. Used by the launcher GUI when
-/// the user wants to unbind a project from its codegraph index (e.g.
-/// stop maintaining a code graph for a finished sub-project, or rebind
-/// to a different collection prefix). Does NOT delete the underlying
-/// Weaviate collection — that stays around so the user can re-bind
-/// without losing parsed entities.
-///
-/// Codegraph binding is single-keyed on project_id (no role concept,
-/// unlike KG which has primary/shared/archive), so this command takes
-/// only a project_id.
-///
-/// Idempotent: removing a non-existent project_id is a no-op.
-///
-/// F3 (v0.2.72): the R2 post-projection shells out to Python — run the
-/// sync core on the blocking pool.
-#[command]
-pub async fn delete_project_codegraph_binding(
-    project_id: String,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    crate::commands::blocking::run_with_db_on_blocking_pool(
-        app,
-        "delete_project_codegraph_binding",
-        move |db| delete_project_codegraph_binding_with_db(db, &project_id).map(|_| ()),
-    )
-    .await?
-}
+// v0.2.101 (Q4 retirement): the `delete_project_codegraph_binding` Tauri
+// command and its `_with_db` core were removed — the command never had a
+// frontend caller, and code-graph binding is single-keyed, so the
+// KgCodegraphTab `enabled` checkbox already stops use of a binding without
+// reverting to the derived default prefix. The DB method
+// (`Db::delete_project_codegraph_binding`) stays: it is the row-level
+// primitive the settings surface can build on if an explicit "reset to
+// default prefix" is ever wanted, and its own behaviour stays pinned by the
+// tests in `vct-launcher-core/src/db/project_state.rs`.
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 //
@@ -1862,10 +1827,12 @@ mod tests {
         assert_eq!(stored.collection_prefix, "Custom_Prefix");
     }
 
-    /// `delete_project_codegraph_binding_with_db` removes the row AND
-    /// re-projects. Proof of the refresh: the returned result carries the
-    /// access list only the refresh path (populate) computes — seeded
-    /// here so the value is deterministic.
+    /// v0.2.101 (Q4 retirement): the `delete_project_codegraph_binding`
+    /// Tauri command is gone; this test now pins the pieces any future
+    /// "reset to default prefix" surface would compose — the DB delete
+    /// removes the row, and the shared soft re-projection still runs and
+    /// computes the access list only the refresh path (populate) computes.
+    /// Seeded here so the value is deterministic.
     #[test]
     fn delete_codegraph_binding_removes_row_and_reprojects() {
         let db = make_db();
@@ -1875,8 +1842,10 @@ mod tests {
         db.kg_set_access("p-r2-unbind", "PeerProj_KnowledgeGraph", "read")
             .unwrap();
 
-        let result = delete_project_codegraph_binding_with_db(&db, "p-r2-unbind")
+        db.delete_project_codegraph_binding("p-r2-unbind")
             .expect("unbind must succeed");
+        let result =
+            crate::commands::projects_v2::reproject_env_soft(&db, "p-r2-unbind");
 
         assert!(
             db.get_project_codegraph_binding("p-r2-unbind")

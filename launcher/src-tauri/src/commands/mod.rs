@@ -296,7 +296,6 @@ pub mod update_pipeline;
 // user (`{kind, message, …}`, never empty, never "Update failed:"-prefixed).
 pub mod update_failure;
 pub mod update_run;
-pub mod volumes;
 // v0.2.71 Track T-WT (modes extended v0.2.91): GUI-only per-project worktree-repo mode
 // backing the subagent-git modal. NOT hub-resolved (config_api.rs untouched);
 // the harness spawn pathway VCO would need to consume it cannot be

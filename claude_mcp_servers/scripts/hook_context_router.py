@@ -53,8 +53,10 @@ Env seams (tests + Wave 2):
 * ``VCO_CG_SCRIPT`` — path to ``query_code_graph.py`` (default:
   ``$CLAUDE_PROJECT_DIR/.claude/scripts/query_code_graph.py``, else this
   checkout's ``templates/scripts/query_code_graph.py``);
-* ``VCO_INJECT_BUDGET_S`` (default 8) — whole-run inner bound;
-* ``VCO_INJECT_LEG_TIMEOUT_S`` (default 6) — per-leg join bound;
+* ``VCO_INJECT_BUDGET_S`` (default 6) — whole-run inner bound (fits under
+  the smallest shipped surface timeout; injection is the deliberately
+  bounded, silence-safe class per the 2026-10-06 owner ruling);
+* ``VCO_INJECT_LEG_TIMEOUT_S`` (default 4) — per-leg join bound;
 * ``VCO_QUERY_CACHE_TTL`` (default 900) — shared with the shell cache;
 * ``VCO_CG_INJECT_CAP`` (default 40) — the seen-store's per-session
   code-graph inject cap (SAME counter file, ``seen_cginject_count_<sid>.txt``).
@@ -84,7 +86,6 @@ for _p in (str(_ORCH_ROOT), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from vco_lib.bash_write_targets import strip_heredocs  # noqa: E402
 from vco_lib.inject_intent import (  # noqa: E402
     BUDGET_GC_AGE_S,
     CG_SESSION_CAP_DEFAULT,
@@ -121,12 +122,10 @@ _BASH_PROFILE_BY_INTENT = {
     INTENT_SEARCH: "bash_search",
 }
 
-#: GLM re-review SF: a token with a trailing dotted extension is a FILENAME,
-#: not a symbol — `notes.txt` / `app.log` / `README.md` must never become a
-#: structure-callers key. (`language_for_path` already skips SOURCE files —
-#: those are looked up through `file_pub_symbols` instead — this catches the
-#: non-source remainder the old guard let through.)
-_DOT_EXT_RE = re.compile(r"\.[A-Za-z0-9]+$")
+# (Wave-3: the dotted-extension FILENAME guard and the command-text symbol
+# recovery moved INTO the classifier — inject_intent._recover_clean_symbol /
+# _DOT_EXT_TOKEN_RE — one home, so the READ demotion rule can see what was
+# recovered. The router keeps only the disk-based file_pub_symbols fallback.)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -514,13 +513,16 @@ class _Plan:
 
 
 def _resolve_rev(rev: str, cwd: str) -> str:
-    """``git rev-parse --verify <rev>^{commit}`` — "" when unresolvable."""
+    """``git rev-parse --verify <rev>^{commit}`` — "" when unresolvable.
+    Timeout 5 s: a local git metadata call (milliseconds when healthy) sized
+    with headroom for slow storage, per the 2026-10-06 owner ruling on
+    shipped timeouts — generous for the operation's real cost class."""
     if not rev or not cwd:
         return ""
     try:
         r = subprocess.run(
             ["git", "-C", cwd, "rev-parse", "--verify", f"{rev}^{{commit}}"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -552,47 +554,21 @@ def _bash_plan(payload: Dict, cwd: str) -> _Plan:
     policy = cg_policy(profile)
     if policy.enabled:
         symbols: List[str] = list(bi.symbols)
-        # GLM re-review SF: recovery scans the HEREDOC-STRIPPED command —
-        # body prose is data, never command shape (strip_heredocs' whole
-        # rationale; the old raw scan spawned a CG leg from `cat <<EOF …
-        # authenticate_user … EOF`).
-        scan_text = strip_heredocs(command)[0]
-        if bi.intent == INTENT_READ and not symbols:
-            # A clean symbol recovered from the command text, else the
-            # target's own top-level symbols ("only if a clean symbol is
-            # recovered; else silent" — recovery from the TARGET is the
-            # owner-rule shape: never from command prose). FILE-shaped tokens
-            # are skipped — a filename is not a structure-callers key (the
-            # file_pub_symbols branch below is the file's lookup): any `/`,
-            # any source extension, and (re-review SF) any dotted extension
-            # at all (`notes.txt`, `app.log`, `README.md`).
-            for tok in re.findall(r"\S+", scan_text):
-                if "/" in tok or language_for_path(tok) or _DOT_EXT_RE.search(tok):
-                    continue
-                cleaned = clean_identifier(extract_symbol(tok))
-                if cleaned:
-                    symbols.append(cleaned)
-                    break
-        if bi.intent == INTENT_READ and not symbols:
+        # Wave-3: command-text symbol recovery moved INTO the classifier
+        # (inject_intent._recover_clean_symbol — one home, so the READ
+        # demotion rule can see what was recovered). What remains here is
+        # the disk-dependent fallback: a source-file target's own top-level
+        # symbols ("only if a clean symbol is recovered; else silent" —
+        # recovery from the TARGET is the owner-rule shape: never from
+        # command prose).
+        if bi.intent in (INTENT_READ, INTENT_EDIT) and not symbols:
+            cap = 2 if bi.intent == INTENT_READ else 3
             for t in bi.targets:
                 abs_t = t if os.path.isabs(t) else os.path.join(cwd, t) if cwd else t
                 if language_for_path(abs_t) and os.path.isfile(abs_t):
-                    symbols.extend(file_pub_symbols(abs_t)[:2])
+                    symbols.extend(file_pub_symbols(abs_t)[:cap])
                     if symbols:
                         break
-        if bi.intent == INTENT_EDIT and not symbols:
-            cleaned = clean_identifier(extract_symbol(scan_text))
-            if cleaned and _DOT_EXT_RE.search(cleaned):
-                cleaned = ""  # a filename, not a symbol (re-review SF)
-            if cleaned:
-                symbols.append(cleaned)
-            else:
-                for t in bi.targets:
-                    abs_t = t if os.path.isabs(t) else os.path.join(cwd, t) if cwd else t
-                    if language_for_path(abs_t) and os.path.isfile(abs_t):
-                        symbols.extend(file_pub_symbols(abs_t)[:3])
-                        if symbols:
-                            break
         if policy.require_clean_symbol:
             symbols = [s for s in symbols if clean_identifier(s)]
         source_file = bi.targets[0] if bi.targets else ""
@@ -849,7 +825,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
 
     if legs:
         remaining = deadline - time.monotonic()
-        leg_timeout = min(_env_float("VCO_INJECT_LEG_TIMEOUT_S", 6.0),
+        leg_timeout = min(_env_float("VCO_INJECT_LEG_TIMEOUT_S", 4.0),
                           max(remaining, 0.1))
         results = _hds.run_legs(legs, leg_timeout_s=leg_timeout)
         if kg_key:
@@ -972,16 +948,21 @@ def _main(argv: List[str]) -> int:
     used = _budget_used(budget_path)
     over_budget = used >= PER_TURN_BUDGET_CHARS
 
-    # Inner bounds (env-tunable). v0.2.101 GLM-review round: the kickoff
-    # probe measured the producer cold start at 4.7-11.6 s PER PROCESS; the
-    # router pays it ONCE (single interpreter, shared weaviate import), but
-    # the plan's 6/4 defaults still lost cold multi-symbol runs (measured
-    # 11 s wall on a 2-symbol `git show HEAD:` READ). 8/6 fits the cold
-    # path inside the Wave-2 settings timeouts — which ALL sit at 10 since
-    # the wave-2 GLM review's SF-1 (an 8 s harness timeout equal to this
-    # budget re-created the §9 always-killed root cause: startup + 8 s > 8 s)
-    # — WP-E must confirm p95 against these.
-    deadline = time.monotonic() + _env_float("VCO_INJECT_BUDGET_S", 8.0)
+    # Inner bounds (env-tunable). OWNER RULING 2026-10-06: interactive
+    # per-tool-call injection is the DELIBERATELY-BOUNDED, silence-safe
+    # class (all its settings timeouts sit at 10 s since the wave-2 review's
+    # SF-1) — but the ORDERING must hold with headroom: budget + startup +
+    # emit must fit under the harness timeout on SLOW hardware too, or the
+    # hook is killed mid-run and the injection is lost (the §9 always-killed
+    # root cause). The plan-faithful 6/4 defaults leave ~4 s for interpreter
+    # startup + producer imports + emit under the 10 s registrations (an
+    # earlier 8/6 pairing left only ~2 s — measured cold producer imports of
+    # 4.7-11.6 s on THIS high-end machine say 2 s is not enough headroom for
+    # third-party hardware). A cold run that still exceeds the harness
+    # timeout fails OPEN to silence — accepted for this bounded class, and
+    # never a licence to tighten the LONG-operation timeouts elsewhere
+    # (kg-sync / code-graph analysis / install / seed stay generous).
+    deadline = time.monotonic() + _env_float("VCO_INJECT_BUDGET_S", 6.0)
     kg_text, cg_text = _run_legs(plan, sid, prompt_id, project_root,
                                  transcript_path, deadline)
     _write_intent_out()

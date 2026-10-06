@@ -2328,7 +2328,7 @@ pub const ORCHESTRATOR_VOLUME_NAMES: &[&str] = &[
 ];
 
 /// Read-only volume detection for the install preflight — the SAME answer the
-/// install's next step (`volumes::set_volumes_config_for_install`) acts on:
+/// install's next step (`storage_ux::set_volumes_config_for_install`) acts on:
 /// the orchestrator volumes under the runtime storage commands drive
 /// (`storage_ux::storage_runtime`, the shared pin-first, daemon-aware
 /// detector), or the ownership REFUSAL when some exist only under the other
@@ -2348,7 +2348,7 @@ async fn detect_existing_volumes() -> (Vec<ExistingVolume>, Option<String>) {
 /// [`detect_existing_volumes`] with the install root (where
 /// `state/install/runtime.txt` lives) passed in — tests use a temp dir.
 async fn detect_existing_volumes_at(install_root: Option<&Path>) -> (Vec<ExistingVolume>, Option<String>) {
-    match super::volumes::existing_volumes_on_storage_runtime_at(install_root, "adopt").await {
+    match super::storage_ux::existing_volumes_on_storage_runtime_at(install_root, "adopt").await {
         Ok(found) => (found, None),
         Err(refusal) => (Vec::new(), Some(refusal)),
     }

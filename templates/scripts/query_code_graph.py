@@ -1979,9 +1979,12 @@ def compute_indexed_revision(project_root: str) -> str:
     if not project_root:
         return "unknown"
     try:
+        # timeout 5 s: a local git metadata call (milliseconds when healthy),
+        # sized with headroom for slow storage per the 2026-10-06 owner
+        # ruling on shipped timeouts.
         r = subprocess.run(
             ["git", "-C", project_root, "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
         return "unknown"

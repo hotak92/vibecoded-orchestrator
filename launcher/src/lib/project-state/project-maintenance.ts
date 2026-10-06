@@ -5,9 +5,9 @@
 // Tauri/DOM singletons (they are injected) so the confirmation and the
 // act / leave-alone behaviour are unit-testable without a component runner.
 //
-// There is deliberately NO "all projects" variant: re-rendering every
-// project's env in one click is too risky to offer users (owner ruling,
-// v0.2.100). The all-projects core stays internal to the launcher.
+// The all-projects variant lives in `all-projects-env.ts` (Preferences
+// surface): the v0.2.100 "no all-projects button" ruling was reversed by
+// the owner on 2026-10-05 (v0.2.101 Q4) — it is confirm-gated there.
 
 export interface RefreshProjectEnvResult {
   kg_access_list: string[];

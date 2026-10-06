@@ -276,6 +276,7 @@ pub fn seed_and_export_on_boot(db: &Db) {
     match load_seed_rows(db) {
         Ok(Some((path, rows))) => match db.converge_chat_model_context_seed(&rows) {
             Ok(outcome) => {
+                log_written_rows(PROVENANCE_SOURCE_CATALOG_SYNC, &outcome);
                 if let Some(line) = converge_summary_line(&path, &outcome) {
                     tracing::info!("{}", line);
                 }
@@ -471,6 +472,59 @@ pub async fn chat_model_context_status(
 // keeping the logic in the command body would leave the export-on-mutation
 // promise backed by nothing but a code reading.
 
+// ─── v0.2.101 (Q6 / G1): the model-row provenance log ─────────────────────
+//
+// The owner saw a duplicate row in Claude Code's /model picker at each new
+// Claude release (P300 G1 ≡ P299-A6b) and the producer was untraceable
+// because no layer records WHERE a picker-shaping row came from. These
+// table rows are that shape's persistent state: the gateway reads the
+// exported table and advertises `window_1m` rows as `<id>[1m]`, so every
+// writer of a row is a candidate producer of the next duplicate. ONE
+// log-line shape, ONE home (this module — the layer that owns all three
+// insertion paths), emitted to the launcher's tracing log:
+//
+//     [vct] model-picker row: model=<id> source=<source> action=<action>
+//
+// The three sources are the three writers below:
+//   * `gateway-catalog-sync` — the boot converge of the shipped gateway
+//     catalog seed (`seed_and_export_on_boot`);
+//   * `gui-add`             — the Preferences pane's row editor
+//     (`upsert_and_export`);
+//   * `reseed-import`       — the "Reseed from shipped defaults" import
+//     (`reseed_and_export`).
+// Only rows actually WRITTEN log (a steady-state boot converges an
+// unchanged table and stays silent), so the log names exactly the row
+// appearances and changes a duplicate-trace needs.
+
+/// Provenance source ids — see the module block above.
+pub const PROVENANCE_SOURCE_CATALOG_SYNC: &str = "gateway-catalog-sync";
+pub const PROVENANCE_SOURCE_GUI_ADD: &str = "gui-add";
+pub const PROVENANCE_SOURCE_RESEED_IMPORT: &str = "reseed-import";
+
+/// The ONE log-line shape (pure, so tests pin the format itself).
+pub fn model_picker_row_provenance_line(
+    source: &str,
+    model_id: &str,
+    action: &str,
+) -> String {
+    format!("[vct] model-picker row: model={model_id} source={source} action={action}")
+}
+
+fn log_model_picker_row_provenance(source: &str, model_id: &str, action: &str) {
+    tracing::info!(
+        "{}",
+        model_picker_row_provenance_line(source, model_id, action)
+    );
+}
+
+/// Log one line per row a converge/reseed pass actually wrote (the
+/// `written` record the DB layer returns; empty on a steady-state boot).
+fn log_written_rows(source: &str, outcome: &ReseedOutcome) {
+    for (model_id, action) in &outcome.written {
+        log_model_picker_row_provenance(source, model_id, action);
+    }
+}
+
 /// Insert or update one row FROM THE GUI, so `user_edited = 1` — which is
 /// what protects it from every automatic path that re-applies the shipped
 /// rows (the boot converge and "Reseed from shipped defaults" alike) — then
@@ -480,6 +534,7 @@ pub fn upsert_and_export(
     input: ChatModelContextInput,
 ) -> Result<ChatModelContextMutation, String> {
     let row = db.upsert_chat_model_context(input, true)?;
+    log_model_picker_row_provenance(PROVENANCE_SOURCE_GUI_ADD, &row.model_id, "upsert");
     Ok(ChatModelContextMutation {
         row: Some(row),
         deleted: false,
@@ -521,6 +576,7 @@ pub fn reseed_and_export(db: &Db) -> Result<ChatModelContextMutation, String> {
         }
     };
     let outcome = db.reseed_chat_model_context(&rows)?;
+    log_written_rows(PROVENANCE_SOURCE_RESEED_IMPORT, &outcome);
     Ok(ChatModelContextMutation {
         row: None,
         deleted: false,
@@ -583,6 +639,53 @@ mod tests {
             source: "https://docs.z.ai/guides/llm/glm-5.1".into(),
             source_note: String::new(),
         }
+    }
+
+    /// Capture every tracing event `f` emits (message field only), so the
+    /// provenance-emission tests assert REAL output rather than a code
+    /// reading. Same shape as `upstream_fetch.rs`'s CaptureLogs.
+    #[cfg(unix)]
+    fn capture_tracing(f: impl FnOnce()) -> Vec<String> {
+        struct MessageOf(String);
+        impl tracing::field::Visit for MessageOf {
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        struct CaptureLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl tracing::Subscriber for CaptureLogs {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(
+                &self,
+                _: &tracing::span::Id,
+                _: &tracing::span::Id,
+            ) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut m = MessageOf(String::new());
+                event.record(&mut m);
+                self.0.lock().unwrap().push(m.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _sub = tracing::subscriber::set_default(CaptureLogs(logs.clone()));
+        f();
+        let out = logs.lock().unwrap().clone();
+        out
     }
 
     /// A directory `resolve_orchestrator_root` accepts as a clone (install.py
@@ -817,6 +920,7 @@ mod tests {
                 unchanged: 20,
                 preserved_user_edits: 1,
                 retired: 1,
+                written: Vec::new(),
             },
         )
         .expect("a retire-only converge must produce a summary line");
@@ -837,6 +941,7 @@ mod tests {
                 unchanged: 21,
                 preserved_user_edits: 0,
                 retired: 0,
+                written: Vec::new(),
             }
         )
         .is_none());
@@ -847,8 +952,8 @@ mod tests {
     #[test]
     fn the_boot_summary_fires_on_writes_without_retires_too() {
         for outcome in [
-            ReseedOutcome { inserted: 2, updated: 0, unchanged: 0, preserved_user_edits: 0, retired: 0 },
-            ReseedOutcome { inserted: 0, updated: 1, unchanged: 3, preserved_user_edits: 0, retired: 0 },
+            ReseedOutcome { inserted: 2, updated: 0, unchanged: 0, preserved_user_edits: 0, retired: 0, written: Vec::new() },
+            ReseedOutcome { inserted: 0, updated: 1, unchanged: 3, preserved_user_edits: 0, retired: 0, written: Vec::new() },
         ] {
             assert!(
                 converge_summary_line(Path::new("/s"), &outcome).is_some(),
@@ -1482,5 +1587,178 @@ mod tests {
         let err = load_seed_rows(&db).expect_err("uncited seed row must fail");
         assert!(err.contains("source citation is required"), "got: {}", err);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── v0.2.101 (Q6/G1): the model-picker provenance log ────────────────
+
+    /// ONE log-line shape, and every one of the three insertion paths can
+    /// produce it with its own source id and the row's identity. The line
+    /// is what the next duplicate picker row gets traced through, so the
+    /// format itself is pinned here.
+    #[test]
+    fn provenance_line_has_one_shape_for_all_three_sources() {
+        for source in [
+            PROVENANCE_SOURCE_CATALOG_SYNC,
+            PROVENANCE_SOURCE_GUI_ADD,
+            PROVENANCE_SOURCE_RESEED_IMPORT,
+        ] {
+            let line = model_picker_row_provenance_line(source, "glm-5.3", "inserted");
+            assert_eq!(
+                line,
+                format!("[vct] model-picker row: model=glm-5.3 source={} action=inserted", source),
+                "one shape, parameterised only by source"
+            );
+        }
+        // The three sources are three DISTINCT ids — collapsing two of them
+        // would make the log untraceable exactly when it is needed.
+        let ids = [
+            PROVENANCE_SOURCE_CATALOG_SYNC,
+            PROVENANCE_SOURCE_GUI_ADD,
+            PROVENANCE_SOURCE_RESEED_IMPORT,
+        ];
+        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+    }
+
+    /// The GUI-add path logs the row it just wrote (identity + action).
+    /// Real capture of the tracing output (same CaptureLogs shape as
+    /// `upstream_fetch.rs` tests) — this is the emission proof, not a
+    /// code reading.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn gui_add_path_emits_provenance_for_the_written_row() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-gui");
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+        let db = make_db();
+
+        let logs = capture_tracing(|| {
+            let mutation = upsert_and_export(&db, input("glm-5.3")).expect("upsert");
+            assert_eq!(mutation.row.as_ref().unwrap().model_id, "glm-5.3");
+        });
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            logs.iter().any(|l| l.contains("model=glm-5.3")
+                && l.contains("source=gui-add")
+                && l.contains("action=upsert")),
+            "the gui-add insertion path must emit its provenance line; got: {:?}",
+            logs
+        );
+    }
+
+    /// A clone fixture whose seed carries one citable model — the shape the
+    /// catalog-sync and reseed-import emission tests share.
+    #[cfg(unix)]
+    fn clone_with_one_seed_model(dir: &Path) -> PathBuf {
+        let clone = dir.join("clone");
+        let seed_dir = clone.join("claude_mcp_servers").join("model_router");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap();
+        std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
+        std::fs::create_dir_all(clone.join("state")).unwrap();
+        std::fs::write(
+            clone.join("state").join("install-manifest.json"),
+            r#"{"installed": true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            seed_dir.join("chat_model_context.seed.json"),
+            r#"{"schema_version": 1, "models": {
+                 "glm-5.3": {"vendor": "zai", "context_window": 200000,
+                             "max_output": 128000, "window_1m": false,
+                             "source": "https://docs.z.ai/guides/llm/glm-5.3"}}}"#,
+        )
+        .unwrap();
+        clone
+    }
+
+    /// The boot converge (the gateway catalog seed syncing into the table)
+    /// emits one provenance line per row it wrote.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn catalog_sync_path_emits_provenance_on_boot_converge() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-boot");
+        let clone = clone_with_one_seed_model(&dir);
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+
+        let logs = capture_tracing(|| seed_and_export_on_boot(&db));
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("model=glm-5.3") && l.contains("source=gateway-catalog-sync")),
+            "the boot catalog-sync path must emit its provenance line; got: {:?}",
+            logs
+        );
+    }
+
+    /// The "Reseed from shipped defaults" import emits the same line shape
+    /// with its own source id.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn reseed_import_path_emits_provenance() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-reseed");
+        let clone = clone_with_one_seed_model(&dir);
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+
+        let logs = capture_tracing(|| {
+            reseed_and_export(&db).expect("reseed with a pinned seed clone");
+        });
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("model=glm-5.3") && l.contains("source=reseed-import")),
+            "the reseed-import path must emit its provenance line; got: {:?}",
+            logs
+        );
+    }
+
+    /// The converge/reseed paths derive their lines from the `written`
+    /// record the DB layer returns — one line per entry, none for an
+    /// empty record (the quiet steady-state boot).
+    #[test]
+    fn written_rows_derive_one_line_each() {
+        let outcome = ReseedOutcome {
+            inserted: 1,
+            updated: 1,
+            unchanged: 0,
+            preserved_user_edits: 0,
+            retired: 0,
+            written: vec![
+                ("glm-5.3".to_string(), "inserted".to_string()),
+                ("glm-5.1".to_string(), "updated".to_string()),
+            ],
+        };
+        let lines: Vec<String> = outcome
+            .written
+            .iter()
+            .map(|(id, action)| {
+                model_picker_row_provenance_line(PROVENANCE_SOURCE_CATALOG_SYNC, id, action)
+            })
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("model=glm-5.3"));
+        assert!(lines[0].contains("action=inserted"));
+        assert!(lines[1].contains("model=glm-5.1"));
+        assert!(lines[1].contains("action=updated"));
+
+        let quiet = ReseedOutcome::default();
+        assert!(quiet.written.is_empty());
     }
 }

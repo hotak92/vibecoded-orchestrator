@@ -94,14 +94,56 @@ class TestClassifyRead:
             "sed -n '1,40p' notes.txt",  # survey "sed dump" — READ, weak surface
             "less README.md",
             "diff a.py b.py",
-            "git diff",
             "git diff HEAD~1 -- templates/hooks/pre-tool-use.sh",
-            "git log --oneline -5",
-            "git show HEAD",
+            "git show HEAD:src/main.rs",
         ],
     )
     def test_read(self, cmd: str) -> None:
         assert _intent(cmd) == INTENT_READ
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # Wave-3 measurement-driven demotion: a READ with NOTHING
+            # queryable (no target, no symbol, no rev pin) is MECHANICAL —
+            # 87% of a 37 683-command live corpus matched an §C1 if-rule,
+            # dominated by pipeline-consumer segments (`| tail -5`) that
+            # would otherwise emit unpairable pre_bash outcome events.
+            "git diff",
+            "git log --oneline -5",
+            "git show HEAD",
+            "tail -5",
+            "head -20",
+            "pytest tests/ | tail -5",
+            "cargo build --release 2>&1 | head -40",
+        ],
+    )
+    def test_targetless_read_demotes_to_mechanical(self, cmd: str) -> None:
+        assert _intent(cmd) == INTENT_MECHANICAL
+
+    def test_pipeline_with_a_real_read_target_stays_read(self) -> None:
+        assert _intent("cat src/main.rs | head -20") == INTENT_READ
+
+    def test_clean_symbol_in_command_keeps_read_alive(self) -> None:
+        """A target-less READ with a CLEAN symbol in the command text is
+        still queryable (exact def+callers) — the demotion must not fire.
+        The recovery lives in the classifier (one home) so the demotion
+        decision can see it."""
+        bi = classify_bash("tail -n 5 deploy_log")
+        assert bi.intent == INTENT_READ
+        assert "deploy_log" in bi.symbols
+
+    def test_git_rev_tokens_are_never_symbols(self) -> None:
+        """`HEAD`/`main`-shaped rev tokens are git arguments, not code
+        symbols — a bare `git show HEAD` must stay MECHANICAL."""
+        assert _intent("git show HEAD") == INTENT_MECHANICAL
+        bi = classify_bash("git show HEAD:src/main.rs")
+        assert bi.symbols == ()  # the rev:path pin is the recovery, not "HEAD"
+
+    def test_bare_words_are_not_recovered_as_symbols(self) -> None:
+        """Only identifier-SHAPED tokens (the extract_symbol gate) are
+        recovered — a prose word must not become an exact-lookup key."""
+        assert _intent("tail -n 5 notes") == INTENT_MECHANICAL
 
     def test_read_targets_named_paths(self) -> None:
         bi = classify_bash("git diff HEAD~1 -- templates/hooks/pre-tool-use.sh")
@@ -131,8 +173,9 @@ class TestClassifyRead:
         assert any("lib.rs" in t for t in bi.targets)
 
     def test_env_assignment_prefix_sees_through(self) -> None:
-        bi = classify_bash("GIT_PAGER=cat git diff")
+        bi = classify_bash("GIT_PAGER=cat git diff HEAD~1 -- src/main.rs")
         assert bi.intent == INTENT_READ
+        assert any("main.rs" in t for t in bi.targets)
 
 
 class TestClassifyEdit:

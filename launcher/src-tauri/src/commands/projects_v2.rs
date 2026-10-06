@@ -3729,15 +3729,18 @@ fn apply_project_env_via_python(
     // (v0.2.97 review F13, same fix as the env-block verbs).
     cmd.current_dir(crate::services::vco_lib_bridge::vco_lib_cwd(Some(folder), folder));
 
-    // 30 s wall-clock cap through the ONE bounded runner (v0.2.100
-    // F-W4-05) — the happy path is ~150 ms; a hang past 30 s indicates a
-    // stuck DB open or a runaway Python process and is better surfaced than
-    // letting the user click sit indefinitely. Pipes are drained while the
-    // child runs, so a chatty child cannot deadlock on a full pipe.
+    // Wall-clock cap through the ONE bounded runner (v0.2.100 F-W4-05;
+    // v0.2.101 owner ruling 2026-10-06: generous for slow hardware — the
+    // happy path is ~150 ms here, but a third-party machine with a slow
+    // disk, AV-scanned Python startup or a cold page cache must not have a
+    // legitimate apply killed; 300 s is 2000× the happy path and still
+    // surfaces a genuinely stuck process within one user's patience).
+    // Pipes are drained while the child runs, so a chatty child cannot
+    // deadlock on a full pipe.
     let out = vct_launcher_core::process::output_bounded(
         &mut cmd,
         None,
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(300),
     )
     .map_err(|e| {
         format!(
@@ -4339,12 +4342,14 @@ pub async fn set_shared_kg_read_disabled(
 /// VCT_KG_ACCESS_LIST=Foo,Bar" feedback).
 ///
 /// The per-project "Re-render this project's env" button on the project's
-/// Settings tab calls this. There is deliberately NO all-projects button
-/// (owner ruling, v0.2.100: re-rendering every project at once is too risky
-/// to hand to users); `refresh_all_projects_env_with_db` stays as the
-/// internal core for the boot hook and the gate paths.
+/// Settings tab calls this. The all-projects variant exists again as of
+/// v0.2.101 (owner ruling 2026-10-05, Q4 — reversing the v0.2.100
+/// retirement): `refresh_all_projects_env` is a Preferences affordance,
+/// confirm-gated in the GUI, wrapping the same `refresh_all_projects_env_with_db`
+/// core the boot hook and the gate paths use.
 ///
-/// The projection runs a Python subprocess (30 s cap), so it goes through
+/// The projection runs a Python subprocess (300 s cap — generously sized for
+/// slow third-party hardware, owner ruling 2026-10-06), so it goes through
 /// the blocking pool, not a tokio worker (F3).
 #[command]
 pub async fn refresh_project_env(
@@ -4461,10 +4466,11 @@ pub fn reproject_env_soft(db: &Db, project_id: &str) -> RefreshProjectEnvResult 
 ///   * The `app_state` write trigger (`app_state_cmd.rs`), which carries the
 ///     RL logging / online-training global switches into every project.
 ///
-/// Deliberately NOT a Tauri command: a manual "re-render every project"
-/// button was retired in v0.2.100 (owner: doing it for all projects is a
-/// risky operation users should not be offered). The per-project repair is
-/// `refresh_project_env`.
+/// Exposed again as a Tauri command in v0.2.101 (owner ruling 2026-10-05,
+/// Q4): the v0.2.100 retirement of the manual "re-render every project"
+/// button was reversed — Preferences now offers a confirm-gated
+/// "Re-render env for all projects" action wrapping this core. The
+/// per-project repair remains `refresh_project_env`.
 ///
 /// Soft-fail per project: one project's hiccup MUST NOT prevent the
 /// others from refreshing. Returns a per-project status map (the
@@ -4521,6 +4527,24 @@ pub struct RefreshAllProjectsEnvResult {
     /// Errors outside the per-project loop (e.g. `list_projects`
     /// itself failed).
     pub global_warnings: Vec<String>,
+}
+
+/// v0.2.101 (owner ruling 2026-10-05, Q4): the GUI's "Re-render env for
+/// all projects" Preferences action. Confirm-gated on the frontend; the
+/// backend trusts the click exactly as much as the boot hook's own call —
+/// same core, same soft-fail-per-project contract, report surfaced back so
+/// the toast can name what failed. Runs N serial Python subprocesses, so it
+/// goes through the blocking pool (F3), like every other caller.
+#[command]
+pub async fn refresh_all_projects_env(
+    app: tauri::AppHandle,
+) -> Result<RefreshAllProjectsEnvResult, String> {
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "refresh_all_projects_env",
+        move |db| refresh_all_projects_env_with_db(db),
+    )
+    .await
 }
 
 #[command]

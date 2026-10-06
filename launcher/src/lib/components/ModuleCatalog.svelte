@@ -19,6 +19,11 @@
   import { license } from '$lib/stores/license';
   import { toast } from '$lib/stores/toast';
   import type { ModuleCatalogEntry } from '$lib/types/launcher';
+  // v0.2.101 (Q4): the module tile's DB-migration repair action.
+  import {
+    loadModuleDbMigrationFailures,
+    reapplyModuleDbMigrationsAction,
+  } from '$lib/module-db-repair';
   import { getColorRgb, type BrandColor } from '$lib/color-rgb';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import DeprecationBanner from '$lib/components/DeprecationBanner.svelte';
@@ -234,6 +239,8 @@
       await modules.loadInstalled(project.id);
     }
     await loadEnableStates();
+    // v0.2.101 (Q4): which tiles owe a DB-migration repair.
+    void loadDbMigrationFailures();
     // The host-wide panel (/preferences/modules) writes the SAME cascade and
     // fires this event. Without the listener a tile left open in another view
     // would keep showing a provenance line that is no longer true.
@@ -358,6 +365,38 @@
     const handle = setInterval(() => void loadHealth(), HEALTH_REFRESH_MS);
     return () => clearInterval(handle);
   });
+
+  // v0.2.101 (owner ruling Q4): modules whose last DB-migration apply
+  // reported errors — recorded by the install/update engine, cleared by a
+  // clean apply. Read once per catalog mount and after every repair click;
+  // the tile's "Re-apply DB migrations" button renders ONLY for ids in
+  // this map. A failed read keeps the last map (repair stays reachable;
+  // the record is the source, not the network).
+  let dbMigrationFailures = $state<Map<string, string>>(new Map());
+  let reapplyingMigrationsId = $state<string | null>(null);
+  async function loadDbMigrationFailures() {
+    try {
+      dbMigrationFailures = await loadModuleDbMigrationFailures({ invoke });
+    } catch (e) {
+      console.warn('list_module_db_migration_failures failed', e);
+    }
+  }
+  async function handleReapplyDbMigrations(m: ModuleCatalogEntry) {
+    reapplyingMigrationsId = m.id;
+    try {
+      const outcome = await reapplyModuleDbMigrationsAction(
+        { invoke, toast },
+        m.id,
+      );
+      if (outcome === 'ok') {
+        // The backend cleared the record on the clean apply; re-read so
+        // the button disappears without a catalog reload.
+        await loadDbMigrationFailures();
+      }
+    } finally {
+      reapplyingMigrationsId = null;
+    }
+  }
 
   $effect(() => {
     const handle = setInterval(() => {
@@ -1154,6 +1193,22 @@
                   aria-label="Update {m.name} from version {display.install_row.module_version} to version {m.version}"
                 >
                   Update v{display.install_row.module_version} → v{m.version}
+                </button>
+              {/if}
+              <!-- v0.2.101 (owner ruling Q4): DB-migration repair. Rendered
+                   ONLY when this module's last apply reported errors (the
+                   recorded state the install/update engine writes on a
+                   soft-failed apply); a clean re-apply clears the record and
+                   the button disappears on the next read. -->
+              {#if dbMigrationFailures.has(m.id)}
+                <button
+                  class="btn-3d btn-3d-ghost btn-3d-sm"
+                  data-testid="reapply-db-migrations"
+                  onclick={() => void handleReapplyDbMigrations(m)}
+                  disabled={reapplyingMigrationsId === m.id}
+                  title={`The last DB-migration apply reported errors: ${dbMigrationFailures.get(m.id) ?? 'unknown'}`}
+                >
+                  {reapplyingMigrationsId === m.id ? 'Re-applying…' : 'Re-apply DB migrations'}
                 </button>
               {/if}
               <!-- NEW-3 (2026-05-28): "Start" button — defence-in-depth for

@@ -698,7 +698,7 @@ class TestSSotParityAcrossConsumers:
 # Invoke-VcoCodegraphQueryBlock invocation must literally forward
 # prompt_id/transcript. This is the "correct-but-undelivered" defect class
 # this release exists to remove: the shared function can be fully correct
-# (see tests/test_query_cache_v0277.py's unit-level coverage of
+# (see tests/test_v02101_query_cache_poison_fix.py's coverage of
 # codegraph_query_block itself) while a hook's call site silently drops the
 # new args, leaving the capability unreachable in practice. Mirrors the
 # existing --hook-format pin discipline in
@@ -757,18 +757,15 @@ _PS1_WRAPPER_SITES = [
 # of them would leave KG retrieval unenriched with every test still green —
 # the same "correct-but-undelivered" shape the codegraph pins above exist to
 # catch. Same file set, same flags, one more function name each.
-# v0.2.101 Wave 2: pre-bash/pre-edit retired their direct vco_kg_search_cached
-# calls (the router's KG leg forwards --transcript / prompt_id-scoped cache
-# keys instead — pinned below and BEHAVIOURALLY by
-# test_v02101_router_surfaces.py::test_kg_leg_receives_transcript_path).
-# pre-tool-use keeps its direct call until its own rewire lands.
-_SH_KG_CALL_SITES = [
-    "templates/hooks/pre-tool-use.sh",
-]
+# v0.2.101 wave-3: ALL shell KG call sites are retired — pre-bash/pre-edit in
+# wave 2 (thin router wrappers) and pre-tool-use §5 in wave 3 (review nit-6,
+# the double-emission consolidation; _lib/query-cache.sh was deleted with it).
+# The transcript/prompt_id forwarding property lives entirely in the router
+# now — pinned below (literal) and BEHAVIOURALLY by
+# test_v02101_router_surfaces.py::test_kg_leg_receives_transcript_path.
+_SH_KG_CALL_SITES: list[str] = []
 
-_PS1_KG_CALL_SITES = [
-    "templates/hooks/pre-tool-use.ps1",
-]
+_PS1_KG_CALL_SITES: list[str] = []
 
 #: Shell wrappers that carry the KG leg. ``vco_dual_search_cached`` runs the
 #: KG + code-graph pair in one interpreter (pre-edit only), so it must forward

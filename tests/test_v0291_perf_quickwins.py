@@ -357,8 +357,9 @@ def test_p3_ttl_is_derived_from_the_shared_default_not_hardcoded():
     ps1 = (HOOKS / "pre-edit-context-inject.ps1").read_text(encoding="utf-8")
     assert "$CacheTtl = 900" in ps1
     assert "$CacheTtl = 600" not in ps1
-    lib = (LIB / "query-cache.sh").read_text(encoding="utf-8")
-    assert "_VCO_QUERY_CACHE_TTL_DEFAULT=900" in lib
+    # (wave-3: _lib/query-cache.sh was retired with pre-tool-use §5 — the
+    # 900 s default's surviving homes are the router's Python cache and the
+    # VCO_QUERY_CACHE_TTL doc row.)
 
 
 @_needs_bash

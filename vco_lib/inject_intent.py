@@ -211,6 +211,32 @@ def _split_rev_path(tok: str) -> Optional[Tuple[str, str]]:
     return rev, path
 
 
+#: A token with a trailing dotted extension is a FILENAME, not a symbol
+#: (`notes.txt`, `app.log`) — the same guard the router's recovery used
+#: before this moved into the classifier (wave-3, review of the demotion).
+_DOT_EXT_TOKEN_RE = re.compile(r"\.[A-Za-z0-9]+$")
+
+
+def _recover_clean_symbol(tokens: Sequence[str]) -> str:
+    """The first identifier-SHAPED clean symbol among the tokens, or "".
+
+    Recovery runs through ``extract_symbol``'s shape gate per token (bare
+    prose words are NOT recovered — only snake_case / CamelCase / dotted /
+    call-shaped / source-path tokens qualify), then ``clean_identifier``
+    (regex fragments like ``pub(crate)`` still fail). FILE-shaped tokens are
+    skipped: a filename is a target (the file_pub_symbols lookup is its
+    query path), never a structure-callers key. Git rev tokens never reach
+    this helper — git segments are classified separately.
+    """
+    for tok in tokens:
+        if "/" in tok or language_for_path(tok) or _DOT_EXT_TOKEN_RE.search(tok):
+            continue
+        cand = clean_identifier(extract_symbol(tok))
+        if cand:
+            return cand
+    return ""
+
+
 def _search_pattern(tokens: Sequence[str]) -> str:
     """The PATTERN of a search segment (tokens start at the search verb).
 
@@ -406,7 +432,11 @@ def _classify_segment(tokens: List[str],
             for t in extract_write_targets(seg_text, project_root=cwd or None,
                                            require_exists=False)
         ]
-        return INTENT_EDIT, targets, [], []
+        # A clean symbol mentioned by the edit itself (e.g. a `sed -i`
+        # expression naming a function) is the exact-lookup key; recovery
+        # lives HERE (one home) so the demotion rule below can see it.
+        recovered = _recover_clean_symbol(tokens)
+        return INTENT_EDIT, targets, [recovered] if recovered else [], []
 
     if verb == "git" and len(tokens) > 1:
         sub = tokens[1].lower()
@@ -443,7 +473,8 @@ def _classify_segment(tokens: List[str],
         # `sed -i` never reaches here (edit shape caught it); sed/awk dumps
         # are READs (the survey's "sed dump" corpus — weak surface, 0.75 floor).
         targets = [t for t in tokens[1:] if _path_like(t)]
-        return INTENT_READ, targets, [], []
+        recovered = _recover_clean_symbol(tokens)
+        return INTENT_READ, targets, [recovered] if recovered else [], []
 
     return INTENT_MECHANICAL, [], [], []
 
@@ -496,6 +527,14 @@ def classify_bash(command: str, cwd: str = "") -> BashIntent:
     like ``see foo > bar`` must not read as a redirect — the
     ``bash_write_targets.strip_heredocs`` rationale). Unparseable quoting →
     MECHANICAL (conservative: no injection, no query).
+
+    READ/EDIT segments also carry the first CLEAN SYMBOL recovered from
+    their tokens (:func:`_recover_clean_symbol` — identifier-shaped tokens
+    only; filenames and git rev tokens never qualify). A READ with NOTHING
+    queryable — no target, no symbol, no ``git show <rev>:<path>`` pin —
+    demotes to MECHANICAL (wave-3, measurement-driven: pipeline-consumer
+    segments like ``| tail -5`` used to flood the RL corpus with unpairable
+    ``pre_bash`` outcome events; see the comment at the demotion site).
     """
     if not command or not command.strip():
         return BashIntent()
@@ -539,6 +578,24 @@ def classify_bash(command: str, cwd: str = "") -> BashIntent:
         _target, snippet = prebash_query_parts(command, project_root=cwd or None)
         if snippet and not _SECRETISH_RE.search(snippet):
             write_snippet = snippet
+
+    # Wave-3 measurement-driven refinement: a READ with NOTHING queryable
+    # (no target path, no clean symbol, no revision pin) degrades to
+    # MECHANICAL. Live after-measurements on a 37 683-command transcript
+    # corpus showed 87% of real commands match an §C1 if-rule — dominated by
+    # pipeline-consumer segments (`| head -5`, `| tail -20`) that classify as
+    # target-less READs: no query can be built (the §2.1 READ row keys on the
+    # target path), so the only effect of keeping the READ label was a
+    # pre_bash outcome event with no retrieval to pair with (WP-D's join
+    # contract) on nearly every bash call. EDIT (write shape implies a
+    # target) and SEARCH (a symbol is the gate) are untouched.
+    if (
+        intent == INTENT_READ
+        and not targets
+        and not symbols
+        and not rev_paths
+    ):
+        intent = INTENT_MECHANICAL
 
     return BashIntent(
         intent=intent,

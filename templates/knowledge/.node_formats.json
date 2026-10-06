@@ -354,11 +354,11 @@
   },
   "knowledge/concepts/orchestrator-hook-system.md": {
     "title": "Orchestrator Hook System",
-    "description": "The Orchestrator Hook System functions as the orchestrator's nervous system by intercepting specific lifecycle events like session starts, tool usage, and file edits to automate workflows, enforce security, and preserve context. Technically implemented as shell scripts registered in `.claude/settings.json`, these hooks bind to approximately 20 distinct events and can be configured as blocking operations that abort tasks or non-blocking background processes. The architecture routes execution through stages such as pre-tool security scans, post-tool knowledge graph synchronization, and context reinjection following compaction events. This system matters because it transforms Claude Code into a robust autonomous engine capable of quality gating, credential scrubbing, and seamless state management without manual intervention.",
-    "summary": "The Orchestrator Hook System functions as an automated workflow engine by intercepting ~20 Claude Code lifecycle events via shell scripts registered in `.claude/settings.json` to enforce security, sync knowledge graphs, and preserve context. Blocking hooks can abort operations, while non-blocking hooks execute in the background, with specific implementations like `compact-context-reinject.sh` managing Lost-In-The-Middle ordering by reinjecting critical state, recent commits, and pre-compaction snapshots.",
-    "generated_at": "2026-10-05T10:51:34.054312+00:00",
+    "description": "The Orchestrator Hook System functions as the orchestrator's nervous system by intercepting specific lifecycle events like session starts and tool usage to automate workflows, enforce security, and preserve context. Implemented as shell scripts registered in `.claude/settings.json`, these hooks bind to events such as `PreToolUse` and `PostToolUse` to perform actions ranging from credential scrubbing to automatic knowledge-graph synchronization. The architecture supports both blocking hooks that abort operations and non-blocking background tasks, with a dedicated compaction path that saves state before context pruning and reinjects it afterward. This system matters because it transforms Claude Code into a robust autonomous engine capable of handling quality gates, developer experience improvements, and continuous state management without manual intervention.",
+    "summary": "The Orchestrator Hook System intercepts ~20 lifecycle events via shell scripts registered in `.claude/settings.json` to enforce security, sync knowledge graphs to Weaviate, and preserve context during compaction. Blocking hooks can abort operations, while non-blocking hooks execute in the background to manage services like Weaviate and Ollama without delaying the initial prompt.",
+    "generated_at": "2026-10-06T02:27:12.219301+00:00",
     "backend": "ollama",
-    "content_hash": "7eb7c1cdb28e8e3a",
+    "content_hash": "75f851aa6b3f554c",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-knowledge-graph.md": {

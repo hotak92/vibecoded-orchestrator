@@ -299,7 +299,7 @@ A user with several VCT projects shouldn't end up with one Weaviate per project.
 ### Shared Services Detection
 Before spawning new containers, the installer (via `vco_lib/service_detection.py`) probes Weaviate, Ollama and code-embed — VCO ports and the upstream defaults — and content-fingerprints what answers. A service holding VCO data is adopted; a third-party candidate goes through the adoption choice. → See [05-install-and-secrets.md](05-install-and-secrets.md#shared-service-reuse) for the full detection flow.
 
-### Volume Configuration Commands (`volumes.rs`)
+### Volume Configuration Commands (`storage_ux.rs`)
 Four Tauri commands govern volume layout: `get_volumes_config` (current bind-mount paths or named-volume mode), `set_volumes_config_for_install` (persist new paths and write the compose override), `set_volumes_config_dry_run` (preview the override without writing), `migrate_volumes` (the only function permitted to call `podman volume rm` / `docker volume rm`).
 
 ### Volume Migration Flow (`migrate_volumes`)

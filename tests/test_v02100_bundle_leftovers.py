@@ -157,6 +157,54 @@ class LeftoverPolicyTests(_Base):
         self.assertIn("backup:", row.detected)
         self.assertTrue(any("retired VCO file" in n for n in result.get("notes", [])))
 
+    def test_retired_hook_lib_file_is_removed_from_an_installed_project(self):
+        """v0.2.101 wave-3 (injection redesign SF-2): four `_lib` helpers
+        (codegraph-query, command-noise-strip, query-cache ×2 flavours) were
+        DELETED from templates/hooks/_lib/ — installed projects carry copies
+        under `.claude/hooks/_lib/`, and nothing sources them any more. This
+        pins the delivery chain for that shape on the fixture stand-in
+        (`_lib/x.sh`, shipped by _make_templates): a manifest-tracked _lib
+        file whose template path was retired must NOT survive the next
+        bundle update as an inert orphan.
+
+        The retirement pins in test_codegraph_hook_gates_v0270.py only prove
+        the TEMPLATES absence; this row proves the installed-project side.
+        """
+        self._install(update_mode=False)
+        lib = self.proj / ".claude" / "hooks" / "_lib" / "x.sh"
+        self.assertTrue(lib.is_file(), "fixture precondition: the lib shipped")
+        manifest = json.loads((self.proj / ".claude/.vco-manifest.json").read_text())
+        tracked = ".claude/hooks/_lib/x.sh" in manifest["files"]
+
+        self._git_rm("templates/hooks/_lib/x.sh")
+        result = self._install(update_mode=True)
+
+        self.assertFalse(lib.exists(), (
+            "a retired _lib file survived the update as an inert orphan "
+            f"(manifest-tracked before update: {tracked}); result keys: "
+            f"{ {k: v for k, v in result.items() if 'leftover' in k or 'orphan' in k} }"
+        ))
+
+    def test_hand_restored_retired_hook_lib_file_is_leftover_removed(self):
+        """The pre-manifest / hand-restored shape for a `_lib` file: on disk
+        with VCO's exact retired bytes, NOT in the manifest → the leftover
+        pass byte-matches it against git history, backs it up and removes it
+        (same contract the agents/skills rows pin, proving the hooks kind
+        walks the `_lib/` subdirectory)."""
+        self._install(update_mode=False)
+        lib = self.proj / ".claude" / "hooks" / "_lib" / "x.sh"
+        shipped_bytes = lib.read_bytes()
+        self._drop_manifest_entries(".claude/hooks/_lib/x.sh")
+        self._git_rm("templates/hooks/_lib/x.sh")
+
+        result = self._install(update_mode=True)
+
+        self.assertFalse(lib.exists())
+        self.assertIn(".claude/hooks/_lib/x.sh", result["leftovers_removed"])
+        backups = list((self.proj / ".claude/backups/bundle-adoptions").rglob("x.sh"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), shipped_bytes)
+
     def test_user_files_with_vco_like_names_are_untouched_and_unreported(self):
         self._install(update_mode=False)
         self._archive_old_helper()

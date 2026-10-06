@@ -7,7 +7,8 @@
 //! `refresh_all_projects_env_with_db` (and the single-project
 //! `refresh_project_env_with_db` it wraps per project) shells out to
 //! `python -m vco_lib.config_projection` — N serial subprocesses with a
-//! 30 s cap EACH. Several async Tauri commands used to call it directly on
+//! a generous cap EACH (300 s since v0.2.101 — owner ruling: never time out
+//! legitimate slow work on third-party hardware). Several async Tauri commands used to call it directly on
 //! the runtime, parking a tokio worker for potentially minutes on a large
 //! project list and starving unrelated commands. This helper is the ONE
 //! home for the fix: resolve the Tauri-managed [`Db`] INSIDE a

@@ -328,13 +328,13 @@ describe('draft helpers', () => {
 describe('summaries', () => {
   it('names the preserved user edits, which is the invisible half of reseed', () => {
     expect(
-      describeReseed({ inserted: 1, updated: 2, unchanged: 3, preserved_user_edits: 1, retired: 0 }),
+      describeReseed({ inserted: 1, updated: 2, unchanged: 3, preserved_user_edits: 1, retired: 0, written: [] }),
     ).toBe('1 added, 2 refreshed, 3 already current, 1 of your edit kept.');
     expect(
-      describeReseed({ inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 2, retired: 0 }),
+      describeReseed({ inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 2, retired: 0, written: [] }),
     ).toBe('2 of your edits kept.');
     expect(
-      describeReseed({ inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 0, retired: 0 }),
+      describeReseed({ inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 0, retired: 0, written: [] }),
     ).toBe('Nothing to reseed.');
   });
 
@@ -343,10 +343,10 @@ describe('summaries', () => {
     // both assertions below fail — the retire-only reseed would say
     // "Nothing to reseed." while having deleted a row.)
     expect(
-      describeReseed({ inserted: 0, updated: 0, unchanged: 12, preserved_user_edits: 0, retired: 1 }),
+      describeReseed({ inserted: 0, updated: 0, unchanged: 12, preserved_user_edits: 0, retired: 1, written: [] }),
     ).toBe('1 retired, 12 already current.');
     expect(
-      describeReseed({ inserted: 1, updated: 2, unchanged: 3, preserved_user_edits: 1, retired: 2 }),
+      describeReseed({ inserted: 1, updated: 2, unchanged: 3, preserved_user_edits: 1, retired: 2, written: [] }),
     ).toBe('1 added, 2 refreshed, 2 retired, 3 already current, 1 of your edit kept.');
   });
 
