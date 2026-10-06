@@ -1952,19 +1952,26 @@ pub async fn migrate_volumes(
         ));
     }
 
-    // 5. Verify health by probing the standard endpoints. Give services
-    //    up to 60 seconds to come back online.
-    emit_phase(&app, MigratePhase::WaitingForHealth, "Waiting for services to come up");
-    let healthy = wait_until_healthy(60).await;
-    if !healthy {
-        emit_phase(
-            &app,
-            MigratePhase::RollingBack { reason: "services unhealthy after 60s".into() },
-            "Rolling back",
-        );
+    // 5. Verify health by probing the standard endpoints, for up to
+    //    MIGRATE_HEALTH_WAIT with a progress event every
+    //    MIGRATE_HEALTH_PROGRESS_EVERY (v0.2.101 review S7 — it was a flat
+    //    60 s, a dev-machine ceiling under which a slow disk could never
+    //    finish a migration). A genuine failure still rolls back.
+    if let Err(reason) = migrate_health_step(
+        &healthy_probe_targets(),
+        MIGRATE_HEALTH_WAIT,
+        MIGRATE_HEALTH_POLL,
+        MIGRATE_HEALTH_PROGRESS_EVERY,
+        &mut |phase, message| emit_phase(&app, phase, message),
+    )
+    .await
+    {
         let _ = remove_compose_override();
         let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
-        return Err("services did not come up healthy within 60s on new bind-mounts (rolled back; old volumes intact)".into());
+        return Err(format!(
+            "{} on the new bind-mounts (rolled back; old volumes intact)",
+            reason
+        ));
     }
 
     // 6. New bind-mounts verified healthy. NOW we may safely remove the
@@ -2010,51 +2017,163 @@ async fn restart_services_for_rollback(runtime: &str, compose_dir: &Path) -> Res
     Ok(())
 }
 
-/// The health URLs [`wait_until_healthy`] polls: Weaviate's and Ollama's
-/// at their `service_endpoints` rows (v0.2.97) — the literals 8081 / 11435
-/// it used before timed out on a machine whose services live elsewhere.
-fn healthy_probe_urls() -> Vec<String> {
+// ── Step 5: the post-switch health wait (v0.2.101 review S7) ─────────────
+
+/// How long `migrate_volumes` waits for Weaviate and Ollama to answer after
+/// `compose up -d` on the new bind-mounts, before it rolls back.
+///
+/// It was a flat 60 s — a ceiling set by a fast dev machine. Weaviate loads
+/// every shard of its data folder before `/v1/meta` answers, so a large data
+/// folder that was just `cp -a`'d to a slow disk (a USB drive, a network
+/// mount, a cold HDD) can legitimately take many minutes; under 60 s that
+/// machine rolled back every attempt and could NEVER migrate (the owner's
+/// timeout rule: shipped timeouts are sized for the slowest legitimate
+/// machine, not the developer's). 30 min is a bound for a GENUINE failure
+/// (a service that crash-loops on its new mount), not a performance
+/// estimate; the wait ends the moment both services answer, and the user
+/// sees a progress line every [`MIGRATE_HEALTH_PROGRESS_EVERY`] naming what
+/// is still pending, so a long wait is never a silent spinner.
+const MIGRATE_HEALTH_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Interval between probe rounds during the health wait.
+const MIGRATE_HEALTH_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the health wait re-emits its `WaitingForHealth` progress line.
+const MIGRATE_HEALTH_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One service the health wait probes: the name its progress line uses and
+/// the health URL it polls.
+struct HealthTarget {
+    label: &'static str,
+    url: String,
+}
+
+/// Weaviate and Ollama at their `service_endpoints` rows (v0.2.97) — the
+/// literals 8081 / 11435 it used before timed out on a machine whose
+/// services live elsewhere.
+fn healthy_probe_targets() -> Vec<HealthTarget> {
     use vct_launcher_core::services::service_endpoints::{machine_row_from_disk, CoreService};
     use vct_launcher_core::services::service_status::health_url;
-    [CoreService::Weaviate, CoreService::Ollama]
+    [(CoreService::Weaviate, "Weaviate"), (CoreService::Ollama, "Ollama")]
         .into_iter()
-        .map(|s| health_url(s, machine_row_from_disk(s).as_ref()))
+        .map(|(s, label)| HealthTarget {
+            label,
+            url: health_url(s, machine_row_from_disk(s).as_ref()),
+        })
         .collect()
 }
 
-/// HTTP-probe Weaviate and Ollama in a tight loop until they both respond
-/// 2xx (a redirect is never followed — `probe_http`), or `timeout_secs`
-/// elapses.
-async fn wait_until_healthy(timeout_secs: u64) -> bool {
-    let urls = healthy_probe_urls();
-    wait_until_urls_healthy(&urls, timeout_secs).await
+/// The health URLs the wait polls (derived from [`healthy_probe_targets`]).
+#[cfg(test)]
+fn healthy_probe_urls() -> Vec<String> {
+    healthy_probe_targets().into_iter().map(|t| t.url).collect()
 }
 
-/// [`wait_until_healthy`] over explicit `urls` (the test seam).
-async fn wait_until_urls_healthy(urls: &[String], timeout_secs: u64) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    // /v1/meta is the right liveness probe for Weaviate (see
-    // `service_status::health_path`).
-    while std::time::Instant::now() < deadline {
-        let mut all_ok = true;
-        for u in urls {
-            let Ok(client) = vct_launcher_core::services::loopback_http::client_for(u, std::time::Duration::from_secs(2)) else {
-                return false;
-            };
-            match client.get(u.as_str()).send().await {
-                Ok(r) if vct_launcher_core::services::probe_http::answered(r.status()) => {}
-                _ => {
-                    all_ok = false;
-                    break;
-                }
-            }
+/// How a health wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum HealthWaitOutcome {
+    /// Every target answered 2xx (a redirect is never followed — `probe_http`).
+    Healthy,
+    /// The bound elapsed; these targets had still not answered.
+    TimedOut { pending: Vec<&'static str> },
+    /// A target's URL cannot even be probed (no client can be built for it).
+    /// Permanent — waiting longer cannot fix it — so the wait stops at once.
+    Unprobeable(String),
+}
+
+/// The labels of the targets that do not answer 2xx right now.
+async fn pending_health_targets(targets: &[HealthTarget]) -> Result<Vec<&'static str>, String> {
+    let mut pending = Vec::new();
+    for t in targets {
+        let client = vct_launcher_core::services::loopback_http::client_for(
+            &t.url,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|e| format!("{} health URL {}: {}", t.label, t.url, e))?;
+        match client.get(t.url.as_str()).send().await {
+            Ok(r) if vct_launcher_core::services::probe_http::answered(r.status()) => {}
+            _ => pending.push(t.label),
         }
-        if all_ok {
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    false
+    Ok(pending)
+}
+
+/// Poll `targets` every `poll` until all answer or `timeout` elapses,
+/// calling `on_progress` with a "still waiting" line every `progress_every`
+/// while any target is pending.
+async fn wait_for_health(
+    targets: &[HealthTarget],
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+    progress_every: std::time::Duration,
+    on_progress: &mut impl FnMut(&str),
+) -> HealthWaitOutcome {
+    use vct_launcher_core::units::human_duration_secs;
+    let started = std::time::Instant::now();
+    let deadline = started + timeout;
+    let mut last_progress = started;
+    loop {
+        let pending = match pending_health_targets(targets).await {
+            Ok(p) => p,
+            Err(e) => return HealthWaitOutcome::Unprobeable(e),
+        };
+        if pending.is_empty() {
+            return HealthWaitOutcome::Healthy;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return HealthWaitOutcome::TimedOut { pending };
+        }
+        if now.duration_since(last_progress) >= progress_every {
+            last_progress = now;
+            on_progress(&format!(
+                "Waiting for services to come up — {} not answering yet ({} of up to {}; \
+                 a large data folder on a slow disk can take several minutes)",
+                pending.join(" and "),
+                human_duration_secs(now.duration_since(started).as_secs()),
+                human_duration_secs(timeout.as_secs()),
+            ));
+        }
+        tokio::time::sleep(poll.min(deadline - now)).await;
+    }
+}
+
+/// Step 5 of `migrate_volumes`, minus the rollback itself: emit the
+/// `WaitingForHealth` phase (once up front, then as periodic progress), wait,
+/// and on failure emit `RollingBack` and return the reason. `Ok(())` means
+/// the new bind-mounts are healthy and the legacy volumes may be removed.
+/// The caller performs the rollback on `Err`, so the override cleanup stays
+/// visible at its one call site.
+async fn migrate_health_step(
+    targets: &[HealthTarget],
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+    progress_every: std::time::Duration,
+    emit: &mut impl FnMut(MigratePhase, &str),
+) -> Result<(), String> {
+    use vct_launcher_core::units::human_duration_secs;
+    emit(
+        MigratePhase::WaitingForHealth,
+        &format!(
+            "Waiting for services to come up (up to {})",
+            human_duration_secs(timeout.as_secs())
+        ),
+    );
+    let outcome = wait_for_health(targets, timeout, poll, progress_every, &mut |message| {
+        emit(MigratePhase::WaitingForHealth, message)
+    })
+    .await;
+    let reason = match outcome {
+        HealthWaitOutcome::Healthy => return Ok(()),
+        HealthWaitOutcome::TimedOut { pending } => format!(
+            "{} did not come up healthy within {}",
+            pending.join(" and "),
+            human_duration_secs(timeout.as_secs())
+        ),
+        HealthWaitOutcome::Unprobeable(e) => format!("health probe unusable: {}", e),
+    };
+    emit(MigratePhase::RollingBack { reason: reason.clone() }, "Rolling back");
+    Err(reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -3783,7 +3902,7 @@ mod volumes_tests {
         );
     }
 
-    /// SE-4 red-proof (6): `wait_until_healthy` polls Weaviate and Ollama
+    /// SE-4 red-proof (6): `wait_for_health` (over `healthy_probe_targets`) polls Weaviate and Ollama
     /// where their `service_endpoints` ROWS say — here two live mocks on
     /// non-default ports. Red against the literal 8081 / 11435 it polled
     /// before (nothing answers there in a harness; it would time out).
@@ -3820,6 +3939,150 @@ mod volumes_tests {
                 format!("http://127.0.0.1:{}/api/tags", ollama_port),
             ]
         );
-        assert!(wait_until_healthy(5).await, "both rows' endpoints answer");
+        assert_eq!(
+            wait_for_health(
+                &healthy_probe_targets(),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(60),
+                &mut |_| {},
+            )
+            .await,
+            HealthWaitOutcome::Healthy,
+            "both rows' endpoints answer"
+        );
+    }
+
+    // ── v0.2.101 review S7: the post-switch health wait ──────────────────
+
+    /// A mock health endpoint that answers 503 to its first `slow_for`
+    /// requests and 200 afterwards — Weaviate still loading its shards.
+    async fn slow_then_healthy(slow_for: usize) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v1/meta",
+                axum::routing::get(move || {
+                    let hits = hits.clone();
+                    async move {
+                        if hits.fetch_add(1, Ordering::SeqCst) < slow_for {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            axum::http::StatusCode::OK
+                        }
+                    }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{}/v1/meta", port)
+    }
+
+    fn phase_name(p: &MigratePhase) -> &'static str {
+        match p {
+            MigratePhase::WaitingForHealth => "waiting_for_health",
+            MigratePhase::RollingBack { .. } => "rolling_back",
+            _ => "other",
+        }
+    }
+
+    /// The bound itself is pinned: the owner's timeout rule puts it at no
+    /// less than 15 min. (Red-proof mutation: restore the old 60 s and this
+    /// fails.) A progress line must also fire well inside it, and more than
+    /// once per minute, so a long wait is never a silent spinner.
+    #[test]
+    fn migrate_health_wait_is_sized_for_slow_disks_and_reports_progress() {
+        assert!(
+            MIGRATE_HEALTH_WAIT >= std::time::Duration::from_secs(15 * 60),
+            "the post-switch health wait must not be a dev-machine ceiling: {:?}",
+            MIGRATE_HEALTH_WAIT
+        );
+        assert!(MIGRATE_HEALTH_PROGRESS_EVERY < std::time::Duration::from_secs(60));
+        assert!(MIGRATE_HEALTH_POLL < MIGRATE_HEALTH_PROGRESS_EVERY);
+    }
+
+    /// A service that is slow to come up but DOES come up is waited for: no
+    /// rollback, and the event sequence is the up-front waiting phase, then
+    /// progress lines naming the pending service, then nothing else (the
+    /// caller goes on to remove the legacy volumes). (Red-proof: with the
+    /// bound below the service's slow period — the old flat cap's shape —
+    /// the sibling test shows the same service rolls back.)
+    #[tokio::test]
+    async fn a_slow_then_healthy_service_is_waited_for_without_rollback() {
+        let url = slow_then_healthy(8).await;
+        let targets = [HealthTarget { label: "Weaviate", url }];
+        let mut events: Vec<(&'static str, String)> = Vec::new();
+        let result = migrate_health_step(
+            &targets,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::ZERO,
+            &mut |phase, message| events.push((phase_name(&phase), message.to_string())),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()), "a service that comes up must not be rolled back");
+        assert!(
+            events.iter().all(|(p, _)| *p == "waiting_for_health"),
+            "only waiting events — no rollback: {:?}",
+            events
+        );
+        assert_eq!(
+            events[0].1, "Waiting for services to come up (up to 30s)",
+            "the up-front line names the bound"
+        );
+        let progress: Vec<&String> = events[1..].iter().map(|(_, m)| m).collect();
+        assert!(!progress.is_empty(), "the wait reported progress while pending");
+        assert!(
+            progress.iter().all(|m| m.contains("Weaviate not answering yet")
+                && m.contains("of up to 30s")),
+            "every progress line names the pending service and the bound: {:?}",
+            progress
+        );
+    }
+
+    /// A service that never comes up within the bound still rolls back —
+    /// the safety net survives the longer wait — and the last event is the
+    /// `RollingBack` phase carrying the pending service.
+    #[tokio::test]
+    async fn a_service_that_never_answers_still_rolls_back() {
+        let url = slow_then_healthy(usize::MAX).await;
+        let targets = [HealthTarget { label: "Weaviate", url }];
+        let mut events: Vec<(&'static str, String)> = Vec::new();
+        let result = migrate_health_step(
+            &targets,
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(60),
+            &mut |phase, message| events.push((phase_name(&phase), message.to_string())),
+        )
+        .await;
+
+        let reason = result.expect_err("an unhealthy service must roll back");
+        assert!(reason.contains("Weaviate did not come up healthy within"), "got: {}", reason);
+        assert_eq!(events.first().map(|e| e.0), Some("waiting_for_health"));
+        assert_eq!(events.last().map(|e| e.0), Some("rolling_back"));
+    }
+
+    /// The old shape, reproduced: the same slow service under a bound
+    /// SHORTER than its slow period rolls back. Paired with the test above,
+    /// this is the observable difference the longer bound makes.
+    #[tokio::test]
+    async fn the_same_slow_service_rolls_back_under_a_bound_shorter_than_its_startup() {
+        let url = slow_then_healthy(1_000).await;
+        let targets = [HealthTarget { label: "Weaviate", url }];
+        let result = migrate_health_step(
+            &targets,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(60),
+            &mut |_, _| {},
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

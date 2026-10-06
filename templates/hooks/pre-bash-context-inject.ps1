@@ -2,7 +2,7 @@
 # redesign, PLAN-V02101 section C1). OS-PARITY: ports the .sh sibling.
 # Fires BEFORE the Bash tool executes.
 #
-#   stdin -> hook_context_router.py bash --intent-out <state> -> emit envelope
+#   stdin -> hook_context_router.py bash --intent-out <state> --claim -> emit envelope
 #
 # The ROUTER owns every retrieval decision: intent classification
 # (READ/EDIT/SEARCH/MECHANICAL -- MECHANICAL spawns no producer and injects
@@ -17,6 +17,14 @@
 # with intent/targets/symbols added to both payloads (additive keys;
 # post-bash-context-record pairing UNCHANGED) -- and the Emit-AdditionalContext
 # envelope around the router's text.
+#
+# One run per tool call (v0.2.101 N2): the section-C1 if-group spawns this
+# wrapper once per MATCHING rule, so a multi-match command runs it twice,
+# concurrently, for ONE call. --claim makes the router take an
+# O_CREAT|O_EXCL claim per call before any side effect; the losing spawn's
+# router exits 0 with no output and no intent file, so this wrapper injects
+# nothing, writes no state and emits no event for it -- silently, because it
+# is a duplicate of a run already in flight, not a failure.
 #
 # RETIRED here (v0.2.101, owner-approved section C1): the 500-char threshold
 # (VCT_BASH_KG_THRESHOLD_CHARS -- classification replaces it; the knob no
@@ -114,8 +122,11 @@ if (-not (Test-Path $StateDir)) {
     New-Item -ItemType Directory -Path $StateDir -Force -ErrorAction SilentlyContinue | Out-Null
 }
 # The router's classification handoff (WP-D 2). Named like the state file so
-# the 1d GC covers it. MUST MATCH the .sh sibling.
-$IntentFile = Join-Path $StateDir "bash_intent_${SessionId}_${CmdHash}.json"
+# the 1d GC covers it. MUST MATCH the .sh sibling. Per SPAWN ($PID, v0.2.101
+# N2): the two spawns of one multi-match call share session + hash, and a
+# shared name let the winner's intent reach the loser (or the loser's delete
+# remove it before the winner read it).
+$IntentFile = Join-Path $StateDir "bash_intent_${SessionId}_${CmdHash}_${PID}.json"
 
 # === Resolve venv + the router (orchestrator-root script, F3 discipline) ===
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
@@ -130,7 +141,7 @@ $env:CLAUDE_PROJECT_DIR = $ProjectRoot
 # === Run the router (single interpreter; inner budget VCO_INJECT_BUDGET_S) ===
 $Inject = ""
 try {
-    $Inject = ($HookStdin | & $VenvPy $Router "bash" "--intent-out" $IntentFile 2>$null) -join "`n"
+    $Inject = ($HookStdin | & $VenvPy $Router "bash" "--intent-out" $IntentFile "--claim" 2>$null) -join "`n"
 } catch { $Inject = "" }
 if ($null -eq $Inject) { $Inject = "" }
 
@@ -171,18 +182,10 @@ Get-ChildItem -File $StateDir -Filter "bash_intent_*.json" -ErrorAction Silently
 # === State file + pre_bash outcome event: READ/EDIT/SEARCH only ===
 if ($Intent -eq "READ" -or $Intent -eq "EDIT" -or $Intent -eq "SEARCH") {
     $StateFile = Join-Path $StateDir "bash_task_${SessionId}_${CmdHash}.json"
-    # Wave-2 review nit-5: the section-C1 if-group fires ONE handler per
-    # matching rule, so a multi-match command spawns this hook TWICE for ONE
-    # tool call. The injection side is idempotent (router seen-store + cache);
-    # the pairing side must be too -- a FRESH (<60 s) unpaired state file
-    # means a sibling spawn already paired this call: skip the rewrite and
-    # the second pre_bash event (the old shape emitted an orphan with a
-    # distinct task_id). MUST MATCH the .sh sibling's find -mmin -1 guard.
-    $stateFresh = $false
-    if (Test-Path -LiteralPath $StateFile) {
-        try { $stateFresh = ((Get-Item -LiteralPath $StateFile).LastWriteTime -gt (Get-Date).AddSeconds(-60)) } catch { }
-    }
-    if (-not $stateFresh) {
+    # Multi-match double spawns (wave-2 review nit-5) cannot reach here twice:
+    # only the spawn that won the router's --claim gets an intent (v0.2.101
+    # N2 -- the pre-N2 "fresh state file" guard here was a check-then-write
+    # that two cold spawns could both pass). MUST MATCH the .sh sibling.
     $TaskHex = ([guid]::NewGuid().ToString("N")).Substring(0, 8)
     $TaskId = "pre_bash_$TaskHex"
     $StartTsMs = [long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -258,7 +261,6 @@ except Exception:
     pass
 "@
     try { & $VenvPy -c $preBashPy *> $null } catch { }
-    }
 }
 
 # === Emit the router's injection text (if any) ===

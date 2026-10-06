@@ -385,6 +385,15 @@ class SyncDocEmbedSkipTests(unittest.TestCase):
                     "fetch_objects() got an unexpected keyword "
                     "'include_vector' (simulating old client)"
                 )
+            # v0.2.101 B3: sync_doc now keeps only rows whose RAW
+            # `file_path` names the doc being synced (the tokenized filter
+            # only narrows). A real row reached by that filter always
+            # carries `file_path`, so the fixture rows are stamped with the
+            # doc's own canonical path — they ARE this doc's rows. A fixture
+            # that sets `file_path` explicitly keeps its value.
+            for obj in existing_result.objects:
+                if "file_path" not in obj.properties:
+                    obj.properties["file_path"] = self._doc_fp
             return existing_result
 
         coll.query.fetch_objects = _fetch_objects
@@ -399,6 +408,7 @@ class SyncDocEmbedSkipTests(unittest.TestCase):
         """Write a docs/ file inside `tmpdir` and return its path."""
         doc = tmpdir / "test_doc.md"
         doc.write_text(content, encoding="utf-8")
+        self._doc_fp = self._mod._relative_file_path(doc)
         return doc
 
     def _set_dev_collection(self, name: str = "Foo_Development") -> None:

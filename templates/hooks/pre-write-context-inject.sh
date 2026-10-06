@@ -17,7 +17,7 @@
 # ~ms; a second wrapper cache layer would only add staleness.
 #
 # Registration: PreToolUse(Write), beside the Edit entry, timeout 10
-# (SF-1: above the router's 8 s inner budget)
+# (SF-1: above the router's 6 s inner budget)
 # (settings templates are owned by the Wave-2 HOOKS-READ-AGENT lane).
 #
 # Constraints: never exit non-zero (would block the write); always exit 0;

@@ -51,6 +51,7 @@ from pathlib import Path
 
 from vco_lib.atomic import atomic_write_json
 from vco_lib.weaviate_helpers import weaviate_url_default
+from vco_lib.weaviate_exact_match import fetch_exact_path_rows, path_narrowing_filter
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -621,11 +622,14 @@ def _weaviate_delete_by_file_path(
     deleted_any = False
     try:
         collection = client.collections.get(collection_name)
-        existing = collection.query.fetch_objects(
-            filters=Filter.by_property("file_path").equal(file_path),
-            limit=50,  # safety; should normally be 1
+        # v0.2.101 B3: `file_path` is word-tokenized, so `Equal` also
+        # returns token-superset siblings (`auth.mmd` → `auth-flow.mmd`).
+        # The filter only narrows; the exact-path rows are confirmed in
+        # Python by the shared home before anything is deleted.
+        existing = fetch_exact_path_rows(
+            collection, path_narrowing_filter(Filter, file_path), file_path,
         )
-        for obj in existing.objects:
+        for obj in existing:
             collection.data.delete_by_id(obj.uuid)
             deleted_any = True
     finally:
@@ -977,11 +981,11 @@ def _weaviate_upsert(
         }
 
         # Delete-then-insert (mirrors store_knowledge_node semantics).
-        existing = collection.query.fetch_objects(
-            filters=Filter.by_property("file_path").equal(row.file_path),
-            limit=10,
+        # v0.2.101 B3: exact-path rows only — see `_weaviate_delete_by_file_path`.
+        existing = fetch_exact_path_rows(
+            collection, path_narrowing_filter(Filter, row.file_path), row.file_path,
         )
-        for obj in existing.objects:
+        for obj in existing:
             collection.data.delete_by_id(obj.uuid)
 
         collection.data.insert(properties=properties)

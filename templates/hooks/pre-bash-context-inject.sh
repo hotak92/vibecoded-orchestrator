@@ -2,7 +2,7 @@
 # Pre-bash context injection hook — THIN WRAPPER (v0.2.101 injection redesign,
 # PLAN-V02101 §C1). Fires BEFORE the Bash tool executes.
 #
-#   stdin → hook_context_router.py bash --intent-out <state> → emit envelope
+#   stdin → hook_context_router.py bash --intent-out <state> --claim → emit envelope
 #
 # The ROUTER (claude_mcp_servers/scripts/hook_context_router.py) owns every
 # retrieval decision: intent classification (READ / EDIT / SEARCH /
@@ -19,6 +19,14 @@
 #     post-bash-context-record.sh pairing is UNCHANGED: same file name,
 #     same task_id join).
 #   * the emit_additional_context envelope around the router's text.
+#
+# One run per tool call (v0.2.101 N2): the §C1 if-group spawns this wrapper
+# once per MATCHING rule, so a multi-match command (`cat x | grep y`) runs it
+# twice, concurrently, for ONE call. `--claim` makes the router take an
+# O_CREAT|O_EXCL claim per call before any side effect; the losing spawn's
+# router exits 0 with no output and no intent file, so this wrapper injects
+# nothing, writes no state and emits no event for it — silently, because it
+# is a duplicate of a run already in flight, not a failure.
 #
 # RETIRED here (v0.2.101, owner-approved §C1): the 500-char threshold
 # (VCT_BASH_KG_THRESHOLD_CHARS — classification replaces it; the knob no
@@ -131,7 +139,10 @@ STATE_DIR="$PROJECT_ROOT/.claude/state"
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 # The router's classification handoff (WP-D 2): written by --intent-out,
 # read below, then removed. Named like the state file so the 1d GC covers it.
-INTENT_FILE="$STATE_DIR/bash_intent_${SESSION_ID}_${CMD_HASH}.json"
+# Per SPAWN ($$, v0.2.101 N2): the two spawns of one multi-match call share
+# session + hash, and a shared name let the winner's intent reach the loser
+# (or the loser's rm delete it before the winner read it).
+INTENT_FILE="$STATE_DIR/bash_intent_${SESSION_ID}_${CMD_HASH}_$$.json"
 
 # === Resolve venv + the router (orchestrator-root script, v0.2.100 F3 discipline) ===
 # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
@@ -154,7 +165,7 @@ fi
 export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
 
 # === Run the router (single interpreter; inner budget VCO_INJECT_BUDGET_S) ===
-INJECT=$(printf '%s' "$HOOK_STDIN" | "$VENV" "$ROUTER" bash --intent-out "$INTENT_FILE" 2>/dev/null || true)
+INJECT=$(printf '%s' "$HOOK_STDIN" | "$VENV" "$ROUTER" bash --intent-out "$INTENT_FILE" --claim 2>/dev/null || true)
 
 # === Read the classification back (WP-D 2 gate for state + outcome) ===
 _INT_PARSED=$(VCT_PB_INTENT_FILE="$INTENT_FILE" "$PY" -c "
@@ -255,19 +266,10 @@ except Exception:
 case "$INTENT" in
     READ|EDIT|SEARCH)
         STATE_FILE="$STATE_DIR/bash_task_${SESSION_ID}_${CMD_HASH}.json"
-        # Wave-2 review nit-5: the §C1 if-group fires ONE handler per matching
-        # rule, so a multi-match command (`cat x | grep y`) spawns this hook
-        # TWICE for ONE tool call. The injection side is idempotent (the
-        # router's seen-store + query cache); the pairing side must be too —
-        # a FRESH (<60 s) unpaired state file means a sibling spawn already
-        # paired this call, so skip the rewrite and the second pre_bash event
-        # (the old shape emitted an orphan with a distinct task_id). A
-        # genuinely re-run command pairs + deletes its file via
-        # post-bash-context-record before the re-run, so it emits fresh; a
-        # file older than 60 s (crashed/long run) is overwritten as before.
-        if [ -n "$(find "$STATE_FILE" -mmin -1 2>/dev/null)" ]; then
-            :
-        else
+        # Multi-match double spawns (wave-2 review nit-5) cannot reach here
+        # twice: only the spawn that won the router's --claim gets an intent
+        # (v0.2.101 N2 — the pre-N2 `find -mmin -1` guard on this file was a
+        # check-then-write that two cold spawns could both pass).
         # task_id: same hex8 shape as rl_kg_search.py's pre_bash_* keys.
         TASK_ID="pre_bash_$("$PY" -c "import uuid; print(uuid.uuid4().hex[:8])" 2>/dev/null)"
         [ "$TASK_ID" = "pre_bash_" ] && TASK_ID="pre_bash_${CMD_HASH:0:8}"  # fallback
@@ -316,7 +318,6 @@ except Exception:
 " 2>/dev/null || true
 
         _emit_prebash_outcome
-        fi
         ;;
 esac
 

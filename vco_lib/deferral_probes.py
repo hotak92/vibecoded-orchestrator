@@ -671,6 +671,76 @@ def pid_is_alive(pid: int) -> bool:
         return True  # uncertain → conservative
 
 
+def process_start_token(pid: int) -> Optional[str]:
+    """An opaque token naming the process INSTANCE running as *pid*, or ``None``.
+
+    v0.2.101 (S2): the companion of :func:`pid_is_alive` for pid-file owners
+    that must tell "the process that wrote this file" from "a newer process
+    that was handed the same pid number" (pid reuse). Record the token when
+    the file is written, compare it later with :func:`process_identity_matches`.
+
+    Two token kinds, chosen so neither drifts while the process lives:
+
+    * ``proc:<ticks>`` (Linux) — field 22 of ``/proc/<pid>/stat``, the start
+      time in clock ticks since boot. Wall-clock based start times are NOT
+      used here: psutil derives them from ``/proc/stat`` ``btime``, which the
+      kernel recomputes from the current wall clock, so an NTP step after the
+      claim would shift a live holder's start time and read as pid reuse.
+    * ``wall:<seconds>`` (Windows / macOS) — the creation timestamp the OS
+      stored when the process started (``GetProcessTimes`` / ``p_starttime``),
+      via :func:`vco_lib.update_lock.process_start_time` — the existing home
+      for that cross-OS probe (psutil, with a ctypes fallback on Windows).
+
+    ``None`` when the process cannot be inspected (gone, no permission, no
+    psutil on macOS). Never raises.
+    """
+    if pid <= 0:
+        return None
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+            # comm may hold spaces/parens: the fields after the LAST ')' are
+            # fixed — state is field 3, so starttime (field 22) is index 19.
+            return f"proc:{int(raw.rsplit(')', 1)[1].split()[19])}"
+        except (OSError, ValueError, IndexError):
+            return None
+    try:
+        from vco_lib.update_lock import process_start_time
+
+        started = process_start_time(pid)
+    except Exception:  # noqa: BLE001 — cannot tell
+        return None
+    return None if started is None else f"wall:{started:.3f}"
+
+
+def process_identity_matches(pid: int, recorded: Optional[str]) -> Optional[bool]:
+    """Is *pid* still the process whose :func:`process_start_token` was *recorded*?
+
+    ``True``  — same instance; ``False`` — the pid now names a DIFFERENT
+    process (it was reused); ``None`` — cannot tell (nothing recorded, the
+    process cannot be inspected, or the token kinds differ). Callers that
+    guard against a second concurrent run treat ``None`` as "still the same"
+    — the conservative direction, matching :func:`pid_is_alive`.
+    """
+    if not recorded:
+        return None
+    current = process_start_token(pid)
+    if current is None:
+        return None
+    rec_kind, _, rec_val = recorded.partition(":")
+    cur_kind, _, cur_val = current.partition(":")
+    if rec_kind != cur_kind:
+        return None
+    if rec_kind == "proc":
+        return rec_val == cur_val
+    try:
+        # A stored creation timestamp is exact; the tolerance only absorbs
+        # float formatting between two readers.
+        return abs(float(rec_val) - float(cur_val)) <= 1.0
+    except ValueError:
+        return None
+
+
 def kg_binding_evidence_still_mismatched(ctx: ProbeContext) -> Optional[bool]:
     """``kg_binding_evidence_mismatch`` — is a project's data still outside its binding?
 
@@ -1747,6 +1817,8 @@ __all__ = [
     "launcher_dist_still_dirty",
     "orchestrator_sidecars_still_present",
     "pid_is_alive",
+    "process_identity_matches",
+    "process_start_token",
     "record_probe_resolution",
     "registry_probe_name",
     "resolvable_condition_ids",

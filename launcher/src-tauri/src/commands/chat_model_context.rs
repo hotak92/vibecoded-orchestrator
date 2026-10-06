@@ -240,15 +240,27 @@ fn converge_summary_line(path: &Path, outcome: &ReseedOutcome) -> Option<String>
     if outcome.inserted == 0 && outcome.updated == 0 && outcome.retired == 0 {
         return None;
     }
+    // The retired IDS are named by the per-row provenance lines
+    // (`action=retired`); this summary carries the hint those lines do not,
+    // so a user who still wants a retired id knows how to keep it.
+    let retire_hint = if outcome.retired > 0 {
+        " (a retired row was machine-seeded and is absent from the shipped \
+         seed, so the gateway refuses it on every route; re-add it in the \
+         model-context pane to keep it listed — a hand-added row is never \
+         retired)"
+    } else {
+        ""
+    };
     Some(format!(
         "[vct] chat-model context: converged with {}: {} new, {} refreshed, \
-         {} retired, {} unchanged, {} user edit(s) preserved",
+         {} retired, {} unchanged, {} user edit(s) preserved{}",
         path.display(),
         outcome.inserted,
         outcome.updated,
         outcome.retired,
         outcome.unchanged,
-        outcome.preserved_user_edits
+        outcome.preserved_user_edits,
+        retire_hint
     ))
 }
 
@@ -479,26 +491,41 @@ pub async fn chat_model_context_status(
 // because no layer records WHERE a picker-shaping row came from. These
 // table rows are that shape's persistent state: the gateway reads the
 // exported table and advertises `window_1m` rows as `<id>[1m]`, so every
-// writer of a row is a candidate producer of the next duplicate. ONE
-// log-line shape, ONE home (this module — the layer that owns all three
-// insertion paths), emitted to the launcher's tracing log:
+// writer of a row — and every remover of one — is a candidate producer of
+// the next picker change. ONE log-line shape, ONE home (this module — the
+// layer that owns every write path), emitted to the launcher's tracing log:
 //
 //     [vct] model-picker row: model=<id> source=<source> action=<action>
 //
-// The three sources are the three writers below:
+// The four sources are the four writers below:
 //   * `gateway-catalog-sync` — the boot converge of the shipped gateway
 //     catalog seed (`seed_and_export_on_boot`);
 //   * `gui-add`             — the Preferences pane's row editor
 //     (`upsert_and_export`);
+//   * `gui-delete`          — the Preferences pane's delete button
+//     (`delete_and_export`);
 //   * `reseed-import`       — the "Reseed from shipped defaults" import
 //     (`reseed_and_export`).
+// The actions:
+//   * `upsert`    — `gui-add` wrote the row (insert or edit);
+//   * `inserted` / `updated` — a converge/reseed pass wrote a shipped row;
+//   * `retired`   — a converge/reseed pass removed a machine-seeded row the
+//     shipped seed no longer lists (attributed to the pass that did it:
+//     `gateway-catalog-sync` on boot, `reseed-import` on the button). Before
+//     review S3 a retire logged a differently-shaped line from the DB layer,
+//     so grepping this shape missed every retire;
+//   * `delete`    — `gui-delete` removed the row (and wrote its tombstone);
+//   * `tombstone` — `gui-delete` matched no row but still wrote the delete
+//     tombstone, which stops every later boot converge from inserting that
+//     id — a picker-shaping write with no row change, so it logs too.
 // Only rows actually WRITTEN log (a steady-state boot converges an
 // unchanged table and stays silent), so the log names exactly the row
-// appearances and changes a duplicate-trace needs.
+// appearances, changes and removals a picker-trace needs.
 
 /// Provenance source ids — see the module block above.
 pub const PROVENANCE_SOURCE_CATALOG_SYNC: &str = "gateway-catalog-sync";
 pub const PROVENANCE_SOURCE_GUI_ADD: &str = "gui-add";
+pub const PROVENANCE_SOURCE_GUI_DELETE: &str = "gui-delete";
 pub const PROVENANCE_SOURCE_RESEED_IMPORT: &str = "reseed-import";
 
 /// The ONE log-line shape (pure, so tests pin the format itself).
@@ -546,8 +573,19 @@ pub fn upsert_and_export(
 /// Delete one row, then re-export. A missing row is `deleted: false`, not an
 /// error — but it still re-exports, so a stale file left by an earlier failed
 /// export converges on the next attempt.
+///
+/// Logs its provenance line like every other writer (review S3): `delete`
+/// when a row went, `tombstone` when none matched but the delete tombstone
+/// was still written (it suppresses the id on every later boot converge).
+/// A failed delete logs nothing — nothing was written.
 pub fn delete_and_export(db: &Db, model_id: &str) -> Result<ChatModelContextMutation, String> {
-    let deleted = db.delete_chat_model_context(model_id.trim())?;
+    let model_id = model_id.trim();
+    let deleted = db.delete_chat_model_context(model_id)?;
+    log_model_picker_row_provenance(
+        PROVENANCE_SOURCE_GUI_DELETE,
+        model_id,
+        if deleted { "delete" } else { "tombstone" },
+    );
     Ok(ChatModelContextMutation {
         row: None,
         deleted,
@@ -927,6 +965,9 @@ mod tests {
         assert!(line.contains("1 retired"), "got: {}", line);
         assert!(line.contains("converged with /clone"), "got: {}", line);
         assert!(line.contains("1 user edit(s) preserved"), "got: {}", line);
+        // The retired IDS are in the per-row provenance lines; the summary
+        // carries the hint those lines do not.
+        assert!(line.contains("re-add it in the model-context pane"), "got: {}", line);
     }
 
     /// A boot that wrote nothing stays quiet — the unchanged/preserved
@@ -955,10 +996,15 @@ mod tests {
             ReseedOutcome { inserted: 2, updated: 0, unchanged: 0, preserved_user_edits: 0, retired: 0, written: Vec::new() },
             ReseedOutcome { inserted: 0, updated: 1, unchanged: 3, preserved_user_edits: 0, retired: 0, written: Vec::new() },
         ] {
+            let line = converge_summary_line(Path::new("/s"), &outcome);
             assert!(
-                converge_summary_line(Path::new("/s"), &outcome).is_some(),
+                line.is_some(),
                 "a converge that wrote must not be silenced: {:?}",
                 outcome
+            );
+            assert!(
+                !line.unwrap().contains("re-add"),
+                "the retire hint appears only when something was retired"
             );
         }
     }
@@ -1181,7 +1227,16 @@ mod tests {
             let row = by_id(id);
             assert_eq!(row.vendor, "anthropic", "{}", id);
             assert!(row.window_1m && row.context_window == 1_000_000, "{}", id);
-            assert!(row.source.starts_with("https://docs.anthropic.com"), "{}", id);
+            // Anthropic's docs moved to platform.claude.com (the old
+            // docs.anthropic.com host redirects there); the rows cite real
+            // pages on it. Must match `OFFICIAL_DOC_PREFIX["anthropic"]` in
+            // tests/test_model_router_context_table.py.
+            assert!(
+                row.source.starts_with("https://platform.claude.com/"),
+                "{}: {}",
+                id,
+                row.source
+            );
         }
         // The v0.2.98-corrected qwen Token-Plan rows: vendor `qwen`, the
         // vendor's PER-MODEL figures from the cited page — 1M window with
@@ -1591,15 +1646,16 @@ mod tests {
 
     // ── v0.2.101 (Q6/G1): the model-picker provenance log ────────────────
 
-    /// ONE log-line shape, and every one of the three insertion paths can
+    /// ONE log-line shape, and every one of the four write paths can
     /// produce it with its own source id and the row's identity. The line
     /// is what the next duplicate picker row gets traced through, so the
     /// format itself is pinned here.
     #[test]
-    fn provenance_line_has_one_shape_for_all_three_sources() {
+    fn provenance_line_has_one_shape_for_all_four_sources() {
         for source in [
             PROVENANCE_SOURCE_CATALOG_SYNC,
             PROVENANCE_SOURCE_GUI_ADD,
+            PROVENANCE_SOURCE_GUI_DELETE,
             PROVENANCE_SOURCE_RESEED_IMPORT,
         ] {
             let line = model_picker_row_provenance_line(source, "glm-5.3", "inserted");
@@ -1609,14 +1665,146 @@ mod tests {
                 "one shape, parameterised only by source"
             );
         }
-        // The three sources are three DISTINCT ids — collapsing two of them
+        // The four sources are four DISTINCT ids — collapsing two of them
         // would make the log untraceable exactly when it is needed.
         let ids = [
             PROVENANCE_SOURCE_CATALOG_SYNC,
             PROVENANCE_SOURCE_GUI_ADD,
+            PROVENANCE_SOURCE_GUI_DELETE,
             PROVENANCE_SOURCE_RESEED_IMPORT,
         ];
-        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), 4);
+    }
+
+    /// The GUI-delete path logs the row it removed — and, when no row
+    /// matched, the tombstone it still wrote (that tombstone suppresses the
+    /// id on every later boot converge, a picker-shaping write). Review S3:
+    /// before this, a delete left no provenance line at all. (Red-proof
+    /// mutation: drop the `log_model_picker_row_provenance` call in
+    /// `delete_and_export` and both assertions fail.)
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn gui_delete_path_emits_provenance_for_the_removed_row() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-delete");
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+        let db = make_db();
+        db.upsert_chat_model_context(input("glm-5.1"), true).unwrap();
+
+        let logs = capture_tracing(|| {
+            assert!(delete_and_export(&db, " glm-5.1 ").expect("delete").deleted);
+            assert!(!delete_and_export(&db, "not-there").expect("delete").deleted);
+        });
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            logs.iter().any(|l| l
+                == &model_picker_row_provenance_line(
+                    PROVENANCE_SOURCE_GUI_DELETE,
+                    "glm-5.1",
+                    "delete"
+                )),
+            "a GUI delete must emit the provenance line with the TRIMMED id; got: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter().any(|l| l
+                == &model_picker_row_provenance_line(
+                    PROVENANCE_SOURCE_GUI_DELETE,
+                    "not-there",
+                    "tombstone"
+                )),
+            "a no-match delete still wrote a tombstone and must say so; got: {:?}",
+            logs
+        );
+    }
+
+    /// A seed-absent machine row retired by the BOOT converge logs in the
+    /// one provenance shape, attributed to the boot catalog sync — and no
+    /// line of any OTHER shape names it (review S3: the DB layer used to log
+    /// its own "[vct] chat-model context: retired …" line, which a grep for
+    /// the provenance shape missed). (Red-proof mutations: drop the
+    /// `written.push((model_id, "retired"))` in the DB layer's retire, or
+    /// restore its own `tracing::info!` line — each fails one assertion.)
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn boot_converge_retire_emits_the_provenance_shape_only() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-retire-boot");
+        let clone = clone_with_one_seed_model(&dir);
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        // A machine-written row the shipped seed (glm-5.3 only) no longer lists.
+        db.upsert_chat_model_context(input("glm-5.2"), false).unwrap();
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+
+        let logs = capture_tracing(|| seed_and_export_on_boot(&db));
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(db.get_chat_model_context("glm-5.2").unwrap().is_none());
+        assert!(
+            logs.iter().any(|l| l
+                == &model_picker_row_provenance_line(
+                    PROVENANCE_SOURCE_CATALOG_SYNC,
+                    "glm-5.2",
+                    "retired"
+                )),
+            "the boot retire must log the provenance line; got: {:?}",
+            logs
+        );
+        let other_shape: Vec<&String> = logs
+            .iter()
+            .filter(|l| l.contains("glm-5.2") && !l.starts_with("[vct] model-picker row: "))
+            .collect();
+        assert!(
+            other_shape.is_empty(),
+            "no second line shape may name the retired row: {:?}",
+            other_shape
+        );
+        // The boot summary still carries the count and the re-add hint.
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("1 retired") && l.contains("re-add it in the model-context pane")),
+            "the boot summary keeps the retire count and the hint; got: {:?}",
+            logs
+        );
+    }
+
+    /// The reseed button's retire is attributed to `reseed-import`.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn reseed_retire_emits_provenance_with_the_reseed_source() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("prov-retire-reseed");
+        let clone = clone_with_one_seed_model(&dir);
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        db.upsert_chat_model_context(input("glm-5.2"), false).unwrap();
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+
+        let logs = capture_tracing(|| {
+            reseed_and_export(&db).expect("reseed with a pinned seed clone");
+        });
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            logs.iter().any(|l| l
+                == &model_picker_row_provenance_line(
+                    PROVENANCE_SOURCE_RESEED_IMPORT,
+                    "glm-5.2",
+                    "retired"
+                )),
+            "the reseed retire must log the provenance line; got: {:?}",
+            logs
+        );
     }
 
     /// The GUI-add path logs the row it just wrote (identity + action).

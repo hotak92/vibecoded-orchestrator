@@ -92,6 +92,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Iterable, Mapping, Optional, Union
 
+from vco_lib.atomic import LockTimeout, exclusive_file_lock
+
 __all__ = [
     "BUILTIN_NODE_TYPES",
     "BUILTIN_KNOWLEDGE_SUBFOLDERS",
@@ -528,6 +530,39 @@ def extend_vocabulary(
     no-op.
     """
     vocab_path = Path(project_root) / "knowledge" / "VOCABULARY.md"
+    # N3 (Opus branch review 2026-10-06): the parse-classify-append below
+    # is a read-modify-write over user data that now runs CONCURRENTLY
+    # (detached install seeds beside live store_knowledge_node calls and
+    # per-edit syncs). Two unlocked writers can both append the AUTO
+    # section header or duplicate ``co:`` headings, and on a missing file
+    # one ``write_text`` can clobber the other's new file. Serialize on
+    # the shared lock home (vco_lib.atomic.exclusive_file_lock — the same
+    # sidecar-flock idiom the router's counters use). Bounded wait: a
+    # timeout soft-fails exactly like an OSError below (the caller
+    # reports loudly and carries on; the next sync re-declares —
+    # self-healing by design, same as the pre-lock failure modes).
+    try:
+        with exclusive_file_lock(
+            vocab_path.parent / ".vocabulary.lock", timeout_s=5.0
+        ):
+            return _extend_vocabulary_locked(vocab_path, project_root, new_types)
+    except (OSError, LockTimeout) as exc:
+        return VocabularyExtension(
+            vocabulary_path=str(vocab_path),
+            error=f"{exc.__class__.__name__}: {exc}",
+        )
+
+
+def _extend_vocabulary_locked(
+    vocab_path: Path,
+    project_root: Union[str, Path],
+    new_types: Iterable[object],
+) -> VocabularyExtension:
+    """The parse-classify-append body of :func:`extend_vocabulary`.
+
+    Caller holds the vocabulary lock (or is a single-process test); never
+    raises — same soft-fail contract as the public wrapper.
+    """
     # Fresh parse (no cache) so a same-process second call sees the first
     # call's append even on a coarse-mtime filesystem.
     vocab = load_vocabulary(project_root, use_cache=False)

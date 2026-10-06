@@ -5,19 +5,21 @@ registrations for the Wave-2 surfaces.
 
 Asserts, on BOTH ``templates/settings.json.{linux,windows}.template``:
 
-* the Bash PreToolUse entry is the §C1 ``if``-filtered group (nine rules,
-  one handler per rule, ``timeout`` 8) — a non-matching MECHANICAL command
-  spawns nothing (probe-verified 2026-10-05,
-  ``reviews/V02101-INJECTION-KICKOFF-PROBES-2026-10-05.md``);
+* the Bash PreToolUse entry is the §C1 ``if``-filtered group (one handler
+  per rule, ``timeout`` 10) — a non-matching MECHANICAL command spawns
+  nothing (probe-verified 2026-10-05,
+  ``reviews/V02101-INJECTION-KICKOFF-PROBES-2026-10-05.md``) — and its rule
+  set is EXACTLY the classifier's READ/SEARCH verb tables
+  (:class:`TestIfRulesMatchClassifier`, review S1);
 * Read gets a NEW PostToolUse registration (``read-context-inject``, no
-  ``if`` — §C2) with ``timeout`` 10, ABOVE the router's 8 s inner budget
-  (the kickoff probe's root cause was a 3 s settings timeout under a 4 s
+  ``if`` — §C2) with ``timeout`` 10, ABOVE the router's 6 s inner budget
+  (``VCO_INJECT_BUDGET_S``; the kickoff probe's root cause was a 3 s settings timeout under a 4 s
   inner bound under a 4.7-11.6 s cold CLI);
 * Grep gets a NEW PreToolUse registration (``grep-context-inject``, §C6 —
   no ``if``: a pattern shape is not a path glob);
 * Agent|Task gets a NEW PreToolUse registration (``agent-brief-kg-inject`,
   §C4) with ``timeout`` 10 (the measured 12 s manual run vs the old 5 s
-  SubagentStart timeout; the router still cuts the search at its 8 s
+  SubagentStart timeout; the router still cuts the search at its 6 s
   inner budget and the query cache makes retries ~ms);
 * Write gets a NEW PreToolUse registration beside Edit
   (``pre-write-context-inject``, §C3), ``if: "Write(*)"`` mirroring the
@@ -42,7 +44,10 @@ WINDOWS = TEMPLATES / "settings.json.windows.template"
 #: rule, ``Bash(git log*)``, is the wave-2 GLM review's SF-3: the classifier
 #: reads ``git log`` as READ, but without the rule that branch was
 #: unreachable from the bash surface and long ``git log`` commands lost
-#: their pre_bash outcome events.
+#: their pre_bash outcome events. The last eleven are the v0.2.101 Opus
+#: branch review's S1: every remaining verb of the classifier's READ/SEARCH
+#: tables (less/more/diff/bat/nl/awk, ag/ack/egrep/fgrep, git blame) — the
+#: set equality with the classifier is pinned by TestIfRulesMatchClassifier.
 C1_IF_RULES = [
     "Bash(cat *)",
     "Bash(head *)",
@@ -54,6 +59,17 @@ C1_IF_RULES = [
     "Bash(git grep*)",
     "Bash(git diff*)",
     "Bash(git log*)",
+    "Bash(less *)",
+    "Bash(more *)",
+    "Bash(diff *)",
+    "Bash(bat *)",
+    "Bash(nl *)",
+    "Bash(awk *)",
+    "Bash(ag *)",
+    "Bash(ack *)",
+    "Bash(egrep *)",
+    "Bash(fgrep *)",
+    "Bash(git blame*)",
 ]
 
 
@@ -100,14 +116,17 @@ class TestSettingsRegistrations:
         assert [h.get("if") for h in hooks] == C1_IF_RULES, (
             "the §C1 if-rules must be one handler per rule, in plan order")
         for h in hooks:
-            # SF-1 (wave-2 GLM review): 10, not 8 — the router's inner budget
-            # default is ALSO 8 s, so an 8 s harness timeout re-created the §9
-            # root cause (cold run = startup + 8 s > 8 s → harness kill →
-            # silently lost injection + lost state/RL-event writes). Every
-            # injection surface now sits ABOVE the router's own bound: the
-            # ROUTER decides when to stop, never the harness.
+            # SF-1 (wave-2 GLM review): 10, not 8 — at review time the
+            # router's inner budget default was ALSO 8 s, so an 8 s harness
+            # timeout re-created the §9 root cause (cold run = startup +
+            # budget > timeout → harness kill → silently lost injection +
+            # lost state/RL-event writes). The budget is now 6 s
+            # (VCO_INJECT_BUDGET_S) and every injection surface sits ABOVE
+            # it with startup headroom: the ROUTER decides when to stop,
+            # never the harness.
             assert h.get("timeout") == 10, (
-                "the §C1 group must sit ABOVE the router's 8 s inner budget")
+                "the §C1 group must sit ABOVE the router's 6 s inner budget "
+                "plus interpreter startup")
             assert h.get("type") == "command"
             assert "pre-bash-context-inject" in h["command"]
             # The zero-spawn prefilter is the point: an `if`-less handler
@@ -134,7 +153,7 @@ class TestSettingsRegistrations:
         assert g.get("matcher") == "Read"
         (h,) = g["hooks"]
         assert h.get("timeout") == 10, (
-            "Read must sit ABOVE the router's 8 s inner budget (kickoff probe: "
+            "Read must sit ABOVE the router's 6 s inner budget (kickoff probe: "
             "the 3 s timeout was the zero-injection root cause)")
         assert not h.get("if"), "§C2: no if — code-vs-docs is a content decision"
 
@@ -146,7 +165,7 @@ class TestSettingsRegistrations:
         assert g is not None, "Grep PreToolUse group missing (§C6)"
         assert g.get("matcher") == "Grep"
         (h,) = g["hooks"]
-        assert h.get("timeout") == 10, "SF-1: above the router's 8 s inner budget"
+        assert h.get("timeout") == 10, "SF-1: above the router's 6 s inner budget"
         assert not h.get("if"), "§C6: no if — a pattern shape is not a path glob"
 
     # --- §C4: Agent|Task on PreToolUse ------------------------------------
@@ -158,7 +177,7 @@ class TestSettingsRegistrations:
         assert g.get("matcher") == "Agent|Task"
         (h,) = g["hooks"]
         assert h.get("timeout") == 10, (
-            "§C4: timeout 10 — above the router's 8 s inner budget")
+            "§C4: timeout 10 — above the router's 6 s inner budget")
 
     # --- §C3: Write beside Edit -------------------------------------------
 
@@ -168,7 +187,7 @@ class TestSettingsRegistrations:
         assert g is not None, "Write PreToolUse group missing (§C3)"
         assert g.get("matcher") == "Write"
         (h,) = g["hooks"]
-        assert h.get("timeout") == 10, "SF-1: above the router's 8 s inner budget"
+        assert h.get("timeout") == 10, "SF-1: above the router's 6 s inner budget"
         assert h.get("if") == "Write(*)", (
             "the Write entry mirrors the Edit entry's if: Edit(*) shape")
 
@@ -182,14 +201,16 @@ class TestSettingsRegistrations:
         assert g is not None
         (h,) = g["hooks"]
         assert h.get("timeout") == 10, (
-            "an 8 s timeout sits AT the router's 8 s inner budget — cold runs "
-            "get harness-killed and silently lose injections (§9 root cause)")
+            "an 8 s timeout leaves no startup headroom over the router's 6 s "
+            "inner budget — cold runs get harness-killed and silently lose "
+            "injections (§9 root cause)")
 
     def test_every_injection_surface_sits_above_the_router_budget(self, tpl: Path) -> None:
         """The ladder invariant, stated once for ALL injection surfaces: every
         registration that spawns the router must carry a timeout strictly
-        greater than the router's VCO_INJECT_BUDGET_S default of 8 — the
-        router bounds itself; the harness must never be the killer."""
+        greater than the router's VCO_INJECT_BUDGET_S default (6, read from
+        the router source below) — the router bounds itself; the harness must
+        never be the killer."""
         router = (REPO_ROOT / "claude_mcp_servers" / "scripts" /
                   "hook_context_router.py").read_text(encoding="utf-8")
         m = re.search(
@@ -245,6 +266,69 @@ class TestSettingsRegistrations:
         for g in _groups(doc, "SubagentStart"):
             names.extend(_hook_basenames(g))
         assert any("subagent-start-kg-inject" in n for n in names)
+
+
+def _bash_group_rules(doc: dict) -> list[str]:
+    """The `if` rules of the pre-bash-context-inject Bash group(s), in order."""
+    return [h.get("if") for g in _groups(doc, "PreToolUse")
+            if g.get("matcher") == "Bash"
+            for h in g.get("hooks", [])
+            if "pre-bash-context-inject" in h.get("command", "")]
+
+
+def _classifier_rule_set() -> set[str]:
+    """The rule set the classifier's verb tables imply — the ONE source.
+
+    A plain verb ``v`` → ``Bash(v *)`` (the space is the word boundary:
+    ``Bash(ag *)`` must not match ``agent``); a git subcommand ``s`` →
+    ``Bash(git s*)`` (the §C1 git-rule family, probe-verified incl. double
+    spaces between ``git`` and the subcommand)."""
+    from vco_lib import inject_intent as ii
+    plain = ii._READ_VERBS | ii._SEARCH_VERBS
+    git = ii._GIT_READ_SUBS | ii._GIT_SEARCH_SUBS
+    return {f"Bash({v} *)" for v in plain} | {f"Bash(git {s}*)" for s in git}
+
+
+@pytest.mark.parametrize("tpl", [LINUX, WINDOWS], ids=["linux", "windows"])
+class TestIfRulesMatchClassifier:
+    """v0.2.101 Opus branch review S1 — two tables for one concern.
+
+    The harness spawns pre-bash-context-inject ONLY for a command matching
+    one of the group's `if` rules, so the rule list IS the reachable part of
+    the classifier. A classifier verb without a rule is a dead branch on a
+    fresh install (``git blame`` / ``ag`` classified READ/SEARCH but never
+    spawned); a rule without a verb spawns a hook that can only answer
+    MECHANICAL. JSON cannot import Python, so this is the cross-language
+    rule (C) lock: data in ``vco_lib/inject_intent.py`` (with a must-match
+    comment), the templates pinned to it in BOTH directions."""
+
+    def test_rule_set_equals_classifier_verb_tables(self, tpl: Path) -> None:
+        rules = _bash_group_rules(_load(tpl))
+        assert len(rules) == len(set(rules)), f"duplicate if rules: {rules}"
+        expected = _classifier_rule_set()
+        missing = sorted(expected - set(rules))
+        extra = sorted(set(rules) - expected)
+        assert not missing, (
+            f"classifier verbs with NO if rule (dead branch on fresh "
+            f"installs): {missing}")
+        assert not extra, (
+            f"if rules with NO classifier verb (spawn that can only answer "
+            f"MECHANICAL): {extra}")
+
+    def test_every_rule_reaches_a_live_classifier_branch(self, tpl: Path) -> None:
+        """Behavioural half: a representative command for each rule
+        classifies READ or SEARCH — the rule names a branch that answers."""
+        from vco_lib.inject_intent import classify_bash
+        for rule in _bash_group_rules(_load(tpl)):
+            m = re.fullmatch(r"Bash\((git \w+|\w+)\*?(?: \*)?\)", rule)
+            assert m, f"unexpected rule shape {rule!r}"
+            verb = m.group(1)
+            sample = (f"{verb} build_parser" if verb in
+                      ("grep", "rg", "ag", "ack", "egrep", "fgrep", "git grep")
+                      else f"{verb} vco_lib/packs.py")
+            intent = classify_bash(sample).intent
+            assert intent in ("READ", "SEARCH"), (
+                f"{rule!r}: sample {sample!r} classifies {intent!r}")
 
 
 class TestLinuxWindowsParity:

@@ -256,8 +256,11 @@ pub struct ReseedOutcome {
     /// exported JSON still listed while the gateway refused the id.
     pub retired: usize,
     /// Per-row record of every row this pass WROTE — `(model_id, action)`
-    /// with action `"inserted"` / `"updated"` (v0.2.101, Q6/G1: the
-    /// model-picker provenance log). Unwritten rows are NOT listed: a
+    /// with action `"inserted"` / `"updated"` / `"retired"` (v0.2.101,
+    /// Q6/G1: the model-picker provenance log; a retire is a write — it
+    /// deletes a row the picker advertised — so it is recorded here and
+    /// logged in the same line shape as every other write, not in a line
+    /// of its own). Unwritten rows are NOT listed: a
     /// steady-state boot converges an unchanged table and records nothing,
     /// so the log lines the commands layer derives from this stay quiet
     /// until a row actually appears or changes — which is exactly the
@@ -712,12 +715,21 @@ fn converge_rows(
 /// `chat_model_context_tombstone` row — that table is the user's delete
 /// marker and must stay exactly that).
 ///
-/// One `tracing::info!` line per retired row. The retire COUNT also
+/// Every retired row is recorded in `outcome.written` as
+/// `(model_id, "retired")`, and the commands layer turns that record into
+/// the ONE model-picker provenance line shape every writer uses
+/// (`[vct] model-picker row: model=<id> source=<source> action=retired`,
+/// `commands::chat_model_context::model_picker_row_provenance_line`) — with
+/// the source of the pass that retired it (`gateway-catalog-sync` on boot,
+/// `reseed-import` on the button), which this layer cannot know. Until
+/// review S3 this function logged its own differently-shaped line, so a
+/// grep for the provenance shape missed every retire. The retire COUNT also
 /// surfaces elsewhere — the boot summary line
-/// (`commands::chat_model_context::converge_summary_line`) and the reseed
-/// toast after "Reseed from shipped defaults" both carry it — but neither
-/// names the retired IDS; this per-row line is where a user learns which
-/// row went, which no pane shows (a removed row simply disappears).
+/// (`commands::chat_model_context::converge_summary_line`, which also
+/// carries the "re-add it by hand" hint) and the reseed toast after
+/// "Reseed from shipped defaults" — but neither names the retired IDS; the
+/// per-row provenance line is where a user learns which row went, which no
+/// pane shows (a removed row simply disappears).
 fn retire_rows_absent_from_seed(
     tx: &rusqlite::Transaction<'_>,
     seed: &[ChatModelContextInput],
@@ -748,13 +760,7 @@ fn retire_rows_absent_from_seed(
             .map_err(|e| format!("retire delete {}: {}", model_id, e))?;
         if deleted > 0 {
             outcome.retired += 1;
-            tracing::info!(
-                "[vct] chat-model context: retired `{}` — machine-seeded and \
-                 absent from the shipped seed, so the gateway refuses it on \
-                 every route. Re-add it in the model-context pane if you \
-                 still want it listed (a hand-added row is never retired).",
-                model_id
-            );
+            outcome.written.push((model_id, "retired".to_string()));
         }
     }
     Ok(())
@@ -1723,6 +1729,19 @@ mod tests {
         let outcome2 = db2.converge_chat_model_context_seed(&seed).unwrap();
 
         assert_eq!(outcome2.retired, 1, "exactly the stale seeded row");
+        // The retire is a WRITE and is recorded as one, so the commands
+        // layer logs it in the same provenance line shape as every other
+        // write (review S3). (Red-proof mutation: drop the
+        // `written.push((model_id, "retired"))` in
+        // `retire_rows_absent_from_seed` and this fails.)
+        assert_eq!(
+            outcome2.written,
+            vec![
+                ("glm-5.3".to_string(), "inserted".to_string()),
+                ("glm-5.2".to_string(), "retired".to_string()),
+            ],
+            "the retired row is recorded alongside the rows the pass inserted"
+        );
         assert!(
             db2.get_chat_model_context("glm-5.2").unwrap().is_none(),
             "the machine-written glm-5.2 row is retired, not refreshed"
@@ -1783,6 +1802,13 @@ mod tests {
 
         assert_eq!(outcome.retired, 1);
         assert!(db.get_chat_model_context("glm-5.2").unwrap().is_none());
+        assert!(
+            outcome
+                .written
+                .contains(&("glm-5.2".to_string(), "retired".to_string())),
+            "the reseed's retire is recorded for the provenance log too; got {:?}",
+            outcome.written
+        );
     }
 
     #[test]

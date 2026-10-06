@@ -27,7 +27,7 @@
 #
 # Constraints:
 # - Registered PostToolUse(Read), timeout 10 in settings.json.template —
-#   ABOVE the router's 8 s inner budget so the router, not the harness,
+#   ABOVE the router's 6 s inner budget so the router, not the harness,
 #   is what bounds a cold run.
 # - No `if` filter (§C2): Read frequency is modest and the code-vs-docs
 #   split is a content decision, not a path glob.

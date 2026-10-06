@@ -55,9 +55,11 @@ it cannot be read.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from vco_lib.hook_retirements import (
+    match_prior_shipped_shape,
     scrub_retired_registrations,
     vco_hook_script_identity,
 )
@@ -165,6 +167,24 @@ def merge_hooks_block(
     is, by definition, no longer in the template. ``retired_removed`` collects
     one record per removal for the caller's audit trail.
 
+    v0.2.101 (review B2 — reshaped registrations): a user inner hook EQUAL to
+    a shape VCO shipped and has since reshaped
+    (``hook_retirements.PRIOR_SHIPPED_SHAPES``: same event, matcher, script,
+    and exactly the shipped non-command keys) is REPLACED, in place, by the
+    current template's registrations of that script under that matcher —
+    e.g. the v0.2.100 single if-less ``pre-bash-context-inject`` handler
+    becomes the v0.2.101 ``if``-filtered group. This is the one exception to
+    user-wins on ``timeout``/``if``, and it is safe for the same reason the
+    retired scrub is: a registration byte-equal to a shipped shape is VCO's,
+    not a user edit. Anything that differs (a changed timeout, an added key,
+    a different matcher or command) is preserved exactly as before. Template
+    handlers the user's same matcher already carries verbatim are not
+    duplicated. Each reshape is reported through ``retired_removed`` (its
+    record's ``retirement`` is the shape row). Without this, the supersede
+    pass below marks the old entry "already current" (same command string)
+    and the append pass skips every template handler of the group — upgraded
+    installs would never receive the new shape.
+
     v0.2.70 (Stream G — supersede-not-stack): historically this was APPEND-ONLY
     by exact command-STRING identity, so when a VCO-shipped hook's command form
     changed (e.g. a path-separator fix `...\\hooks\\x.ps1` -> `.../hooks/x.ps1`,
@@ -270,6 +290,26 @@ def merge_hooks_block(
         present_idents: set[tuple[str, str]] = set()
         present_cmds: set[tuple[str, str]] = set()
 
+        # v0.2.101 (B2): the template's inner hooks per (matcher, identity),
+        # in template order — what a prior shipped shape is reshaped INTO —
+        # and the exact inner hooks the user already carries per matcher, so
+        # a reshape never duplicates a handler that is already there.
+        template_hooks_for: dict[tuple[str, str], list[dict]] = {}
+        for t_entry in t_entries:
+            if not isinstance(t_entry, dict):
+                continue
+            t_matcher = normalize_matcher(t_entry)
+            for h in t_entry.get("hooks", []):
+                if isinstance(h, dict) and isinstance(h.get("command"), str):
+                    ident = vco_hook_script_identity(h["command"])
+                    if ident:
+                        template_hooks_for.setdefault((t_matcher, ident), []).append(h)
+        present_hooks: set[tuple[str, str]] = {
+            (normalize_matcher(entry), _hook_fingerprint(h))
+            for entry in u_entries if isinstance(entry, dict)
+            for h in entry.get("hooks", []) if isinstance(h, dict)
+        }
+
         merged_entries: list = []
         superseded_identities: set[str] = set()
         for entry in u_entries:
@@ -286,6 +326,26 @@ def merge_hooks_block(
                 cmd = h["command"]
                 ident = vco_hook_script_identity(cmd)
                 present_cmds.add((u_matcher, cmd))
+                reshaped = _reshape_prior_shipped(
+                    event, u_matcher, h, ident, template_hooks_for, present_hooks,
+                )
+                if reshaped is not None and ident is not None:
+                    shape, replacement = reshaped
+                    new_hooks.extend(replacement)
+                    for t_h in replacement:
+                        present_cmds.add((u_matcher, t_h["command"]))
+                    superseded_identities.add(ident)
+                    present_idents.add((u_matcher, ident))
+                    # Re-review N-a: skip the audit record when the
+                    # replacement is EMPTY — a duplicate prior-shape entry
+                    # whose group already landed delivers nothing, and a
+                    # record for it would be a second envelope row for one
+                    # actual change. The first entry's record (the one that
+                    # delivered the group) is the audit trail.
+                    if retired_removed is not None and replacement:
+                        retired_removed.append(
+                            {"event": event, "command": cmd, "retirement": shape})
+                    continue
                 # CONSERVATIVE: only supersede when the identity is a VCO hook
                 # the template ships AND the string actually differs (stale
                 # form). A user's own hook (ident None, or ident not in the
@@ -370,6 +430,50 @@ def merge_hooks_block(
 
         out[event] = merged_entries
     return out
+
+
+def _hook_fingerprint(hook: dict) -> str:
+    """Exact-equality key for one inner hook dict (key order ignored)."""
+    return json.dumps(hook, sort_keys=True, default=str)
+
+
+def _reshape_prior_shipped(
+    event: str, matcher: str, hook: dict, ident: Optional[str],
+    template_hooks_for: dict, present_hooks: set,
+) -> Optional[tuple[Any, list]]:
+    """v0.2.101 (B2): ``(shape_row, replacement_hooks)`` when ``hook`` is a
+    prior shipped shape the CURRENT template reshaped, else ``None``.
+
+    ``None`` — and the caller's pre-v0.2.101 handling — whenever the reshape
+    cannot be positively justified: no row matches; the template no longer
+    ships the script under this matcher (nothing to reshape into); or the
+    template's registration IS this shape already (a supersede, not a
+    reshape). The replacement is copies of the template's handlers minus
+    any the user's same matcher already carries verbatim; ``present_hooks``
+    is updated so a second prior-shape duplicate collapses instead of
+    inserting the group twice.
+    """
+    if not ident:
+        return None
+    shape = match_prior_shipped_shape(event, matcher, hook)
+    if shape is None:
+        return None
+    template_hooks = template_hooks_for.get((matcher, ident)) or []
+    if not template_hooks:
+        return None
+    if len(template_hooks) == 1:
+        only = template_hooks[0]
+        if {k: v for k, v in only.items() if k != "command"} == \
+                {k: v for k, v in hook.items() if k != "command"}:
+            return None
+    replacement: list = []
+    for t_h in template_hooks:
+        key = (matcher, _hook_fingerprint(t_h))
+        if key in present_hooks:
+            continue
+        present_hooks.add(key)
+        replacement.append(dict(t_h))
+    return shape, replacement
 
 
 def _without_kept_out(event: str, t_entries: Any, keep_out: Any) -> list:

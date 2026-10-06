@@ -684,7 +684,7 @@ read_key_hub_env() {
                     return 2
                     ;;
                 key_not_active)
-                    err "key $key not active for project $pid (paused for this project, or not declared by any installed module)"
+                    err "key $key not active for project $pid (not declared by any installed module, or not granted to this project; a paused key answers the distinct key_paused code)"
                     return 3
                     ;;
                 key_paused)

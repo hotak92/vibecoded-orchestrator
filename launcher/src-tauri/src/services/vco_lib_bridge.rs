@@ -149,9 +149,46 @@ pub fn resolve_orchestrator_root(db: &Db) -> Option<std::path::PathBuf> {
     crate::commands::installer::resolve_orchestrator_root(db)
 }
 
-/// Wall-clock cap for one env-block spawn: a single small JSON
-/// read-modify-write that takes ~150 ms. Past this the child is stuck.
-const ENV_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Wall-clock cap for ONE short `python -m vco_lib.<verb>` spawn — the
+/// cold-start verb class: a fresh interpreter, the `vco_lib` import, one
+/// small file read or read-modify-write, one JSON reply. Every
+/// [`run_vco_lib_json`] verb shares it — the settings env-block edits and
+/// strips, `unregister_env`, the `env_projection_check` read, the settings
+/// hooks reader, the project `.env` template verbs and the infrastructure
+/// `.env` key write — and so does [`packs_status`]. (Longer verbs carry
+/// their own bound: [`VCO_LIB_ENV_PROJECTION_TIMEOUT`], the bundle backup,
+/// the service-endpoint verbs.)
+///
+/// The happy path is ~150 ms; almost all of it is interpreter + import
+/// start-up, and that is exactly the part a third-party machine can stretch
+/// by orders of magnitude — an antivirus scanning every `.pyc` on first
+/// import, a cold page cache, a slow or network-mounted disk. Before
+/// v0.2.101 these verbs were capped at 30 s, the same dev-machine ceiling
+/// the env projection was lifted from (review N4: one policy for the class,
+/// one constant, not one per call site).
+///
+/// Why 120 s, not the projection's 300 s
+/// ([`VCO_LIB_ENV_PROJECTION_TIMEOUT`]): these verbs are INTERACTIVE — a
+/// GUI read or a single-file edit a user is looking at — and several run
+/// in loops or inline, so the cap is also the longest a genuinely stuck
+/// child can hold the user before an actionable error. 120 s is ~800× the
+/// happy path (ample room for a cold, AV-scanned start) while still
+/// surfacing a wedged child within a minute or two. The projection is a
+/// whole-project re-render whose kill leaves a project half-applied, and it
+/// runs off the async runtime (F3), so it buys the longer bound.
+pub(crate) const VCO_LIB_SHORT_VERB_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wall-clock cap for one `python -m vco_lib.config_projection apply` — the
+/// per-project env re-render (`projects_v2::refresh_project_env_with_db`,
+/// which every all-projects refresh runs once per project). v0.2.101 owner
+/// ruling 2026-10-06: generous for slow hardware — the happy path is
+/// ~150 ms, but a third-party machine with a slow disk, AV-scanned Python
+/// startup or a cold page cache must not have a legitimate apply killed;
+/// 300 s is 2000× the happy path and still surfaces a genuinely stuck
+/// process within one user's patience. Lives beside
+/// [`VCO_LIB_SHORT_VERB_TIMEOUT`] so the two policies for `-m vco_lib`
+/// spawns are read, and changed, together.
+pub(crate) const VCO_LIB_ENV_PROJECTION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The stdin request `python -m vco_lib.config_projection write-env-block`
 /// reads: the values to set, and the full key set the caller owns (an owned
@@ -411,11 +448,6 @@ pub fn list_settings_hooks(
 /// The launcher-resolved service ports a project `.env`'s managed block
 /// renders (`ProjectEnvSettings`: app_state overrides / adopted services),
 /// forwarded to the Python resolver, whose own defaults are the stock ports.
-/// Wall-clock cap for one `vco_lib.packs status` spawn: the verb reads one
-/// committed toml + the project manifest — a fraction of a second. Past
-/// this the child is stuck.
-const PACKS_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// v0.2.101 (catalogue plan §3.6): the packs catalogue for one project —
 /// `python -m vco_lib.packs status --folder <path> --json`. The ONE home of
 /// this spawn (moved out of `commands::packs_cmd` per the L3 review's
@@ -442,7 +474,9 @@ pub fn packs_status(root: &Path, project_folder: &Path) -> Result<serde_json::Va
     let done = match vct_launcher_core::process::output_bounded(
         &mut cmd,
         None,
-        PACKS_STATUS_TIMEOUT,
+        // One committed toml + the project manifest — a short cold-start
+        // verb like the rest (review N4).
+        VCO_LIB_SHORT_VERB_TIMEOUT,
     ) {
         Ok(done) => done,
         Err(vct_launcher_core::process::BoundedError::Spawn(e)) => {
@@ -895,7 +929,7 @@ pub(crate) fn test_checkout_root() -> std::path::PathBuf {
 }
 
 /// Spawn `cmd`, feed `body` on stdin, collect stdout/stderr, bound by
-/// [`ENV_BLOCK_TIMEOUT`], and parse the one-JSON-object reply.
+/// [`VCO_LIB_SHORT_VERB_TIMEOUT`], and parse the one-JSON-object reply.
 ///
 /// Both output pipes are drained on their own threads WHILE the child runs
 /// (v0.2.97 review F11): reading them only after exit let a child that wrote
@@ -928,7 +962,15 @@ fn run_vco_lib_json<T>(
     body: &str,
     parse: impl FnOnce(&[u8], &[u8]) -> Result<T, String>,
 ) -> Result<T, String> {
-    run_vco_lib_json_with_timeout(cmd, python, root, project_folder, body, ENV_BLOCK_TIMEOUT, parse)
+    run_vco_lib_json_with_timeout(
+        cmd,
+        python,
+        root,
+        project_folder,
+        body,
+        VCO_LIB_SHORT_VERB_TIMEOUT,
+        parse,
+    )
 }
 
 /// [`run_vco_lib_json`] with the wall-clock cap as an argument (the
@@ -1068,6 +1110,20 @@ pub fn parse_ok_reply(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review N4: ONE policy for the cold-start `-m vco_lib` verb class.
+    /// Pinned so neither the 30 s dev-machine ceiling (red against the old
+    /// `ENV_BLOCK_TIMEOUT` / `PACKS_STATUS_TIMEOUT`) nor a drift past the
+    /// projection's own bound can come back unnoticed.
+    #[test]
+    fn short_vco_lib_verbs_share_one_generous_interactive_cap() {
+        assert_eq!(VCO_LIB_SHORT_VERB_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(VCO_LIB_ENV_PROJECTION_TIMEOUT, Duration::from_secs(300));
+        assert!(
+            VCO_LIB_SHORT_VERB_TIMEOUT < VCO_LIB_ENV_PROJECTION_TIMEOUT,
+            "an interactive read must not outwait a whole-project re-render"
+        );
+    }
 
     /// `reinject_minimal_env` must DROP a key that is not on the
     /// allowlist. We assert on the built `Command`'s `get_envs()` view

@@ -349,6 +349,16 @@ from vco_lib.containers import runtime_command_hint as _runtime_command_hint  # 
 # skips — otherwise archived nodes (which never get a stored content_hash) are
 # re-listed as "changed" on every update. Import, not a second copy.
 from vco_lib.kg_node_status import is_archived_node as _is_archived_node_shared  # noqa: E402 — same import-order constraint as the group above
+# v0.2.101 B3: `file_path` / `title` are word-TOKENIZED, so a Weaviate `Equal`
+# returns token-superset rows of OTHER nodes. Every read here that deletes,
+# judges, or picks rows narrows with the filter and confirms in Python through
+# this one home (shared with the MCP `store_knowledge_node`).
+from vco_lib.weaviate_exact_match import (  # noqa: E402 — same import-order constraint as the group above
+    fetch_exact_path_rows as _fetch_exact_path_rows,
+    fetch_matching_rows as _fetch_matching_rows,
+    is_same_title as _is_same_title,
+    path_narrowing_filter as _path_narrowing_filter,
+)
 
 # Try to import query logger.
 #
@@ -774,13 +784,17 @@ def _stored_plan_matches_current(
 
     # Multi-chunk plan with a matching row COUNT — the boundaries must
     # match too. Second fetch pulls just this entry's chunk contents.
-    fetched = collection.query.fetch_objects(
-        filters=_file_path_filter(canonical_fp),
-        limit=100,
-        return_properties=["chunk_num", "content"],
+    # v0.2.101 B3: through the exact-path reader — the tokenized filter alone
+    # also returns token-superset siblings' chunks, which would make the count
+    # below never match (a needless re-chunk of an up-to-date entry).
+    fetched_rows = _fetch_exact_path_rows(
+        collection,
+        _file_path_filter(canonical_fp),
+        canonical_fp,
+        return_properties=["chunk_num", "content", "file_path"],
     )
     numbered: List[Tuple[int, str]] = []
-    for obj in fetched.objects:
+    for obj in fetched_rows:
         props = obj.properties or {}
         num = props.get("chunk_num")
         if not isinstance(num, int) or isinstance(num, bool):
@@ -3201,10 +3215,17 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # slot is populated. `include_vector=True` returns `obj.vector` as
         # a dict keyed by slot name for named-vector collections.
         _vectors_requested = True
+        # v0.2.101 B3: `existing` is the EXACT-path row list (or None). The
+        # tokenized filter only narrows the read; `_fetch_exact_path_rows`
+        # keeps the rows whose raw `file_path` names THIS doc, so the gate
+        # below judges — and the delete further down removes — this doc's
+        # rows only, never a token-superset sibling's (`docs/README.md` ⊂
+        # `docs/setup/README.md`).
         try:
-            existing = coll.query.fetch_objects(
-                filters=_file_path_filter(doc_data["file_path"]),
-                limit=100,
+            existing = _fetch_exact_path_rows(
+                coll,
+                _file_path_filter(doc_data["file_path"]),
+                doc_data["file_path"],
                 return_properties=_base_return_props,
                 include_vector=True,
             )
@@ -3224,9 +3245,10 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             print(f"   (fetch_objects(include_vector=True) failed: "
                   f"{fetch_err}; falling back to hash-only check)")
             try:
-                existing = coll.query.fetch_objects(
-                    filters=_file_path_filter(doc_data["file_path"]),
-                    limit=100,
+                existing = _fetch_exact_path_rows(
+                    coll,
+                    _file_path_filter(doc_data["file_path"]),
+                    doc_data["file_path"],
                     return_properties=_base_return_props,
                 )
             except Exception:
@@ -3258,12 +3280,12 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # an aborted embedding-model change leaves behind — and it is why
         # `last_installed_active_embedding` had no repair path on the KG
         # side (see install.py's leg-(b) gate).
-        if existing is not None and existing.objects:
+        if existing:
             try:
                 existing_hashes: List[str] = []
                 existing_total_chunks: List[int] = []
                 existing_file_paths: List[str] = []
-                for obj in existing.objects:
+                for obj in existing:
                     props = obj.properties or {}
                     existing_hashes.append(props.get("content_hash", "") or "")
                     tc = props.get("total_chunks", 0)
@@ -3294,11 +3316,13 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 )
                 # v0.2.92 WP-B1 (D13): skip only when no found row
                 # reports a NON-canonical (legacy backslash) file_path —
-                # same rule as sync_node's fast path. A row not reporting
-                # a file_path at all cannot be judged and keeps the
-                # pre-v0.2.92 skip semantics (conservative default).
+                # same rule as sync_node's fast path. v0.2.101 B3: every
+                # row here was CONFIRMED to name this doc (exact-path
+                # reader), so a row without a file_path never reaches this
+                # gate; the only non-canonical value left is a legacy
+                # separator spelling, which must re-write to heal.
                 shapes_ok = all(
-                    fp in ("", doc_data["file_path"]) for fp in existing_file_paths
+                    fp == doc_data["file_path"] for fp in existing_file_paths
                 )
                 # v0.2.95 WP-5: ONE home for this decision — the same
                 # `_active_slot_gate_ok` `sync_node` now calls. The inline
@@ -3311,7 +3335,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 slots_ok = _active_slot_gate_ok(
                     coll,
                     DEV_COLLECTION_NAME,
-                    existing.objects,
+                    existing,
                     active_slot,
                     vectors_requested=_vectors_requested,
                 )
@@ -3368,7 +3392,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         # versions and re-embed. The `content_hash` written below means
         # the NEXT re-sync will hit the fast path.
         if existing is not None:
-            for obj in existing.objects:
+            for obj in existing:
                 coll.data.delete_by_id(obj.uuid)
 
         source_id = str(uuid.uuid4())
@@ -3483,18 +3507,23 @@ def _delete_doc_by_file_path(server: WeaviateMCPServer, file_path_value: str) ->
 
     Mirror of :func:`_delete_node_by_file_path` for the development
     collection. ``file_path`` is unique per doc, so this never collides
-    with an active sibling the way the title-scoped delete did.
+    with an active sibling the way the title-scoped delete did — PROVIDED
+    the match is exact: v0.2.101 B3 confirms each row's raw ``file_path``
+    in Python (``_fetch_exact_path_rows``), because the tokenized filter
+    alone also returns token-superset siblings' rows.
     """
     if not DEV_COLLECTION_NAME:
         return 0
     try:
         coll = server.client.collections.get(DEV_COLLECTION_NAME)
-        existing = coll.query.fetch_objects(
-            filters=_file_path_filter(file_path_value),
-            limit=100,
+        existing = _fetch_exact_path_rows(
+            coll,
+            _file_path_filter(file_path_value),
+            file_path_value,
+            return_properties=["file_path"],
         )
         n = 0
-        for obj in existing.objects:
+        for obj in existing:
             coll.data.delete_by_id(obj.uuid)
             n += 1
         return n
@@ -3529,6 +3558,28 @@ def sync_all_docs(server: WeaviateMCPServer) -> "SyncTally":
         f"synced docs: {total} nodes ({tally.succeeded} ok, "
         f"{tally.failed} failed, {tally.skipped} skipped)")
     return tally
+
+
+def _title_target_row(collection, title: str, **fetch_kwargs):
+    """The first chunk-1 row whose ``title`` names *title* — or ``None``.
+
+    ``title`` is word-tokenized, so ``Filter...equal(title)`` is a NARROWING
+    read that also returns every title CONTAINING the link's tokens. The row
+    is confirmed in Python with ``is_same_title`` (same token sequence — the
+    case/punctuation insensitivity a WikiLink relies on, minus the superset
+    matches). One home for the two WikiLink-target lookups below.
+    """
+    if not title:
+        return None
+    rows = _fetch_matching_rows(
+        collection,
+        Filter.by_property("title").equal(title)
+        & Filter.by_property("chunk_num").equal(1),  # first chunk has full metadata
+        lambda props: _is_same_title(props.get("title"), title),
+        max_matches=1,
+        **fetch_kwargs,
+    )
+    return rows[0] if rows else None
 
 
 def infer_tags_from_typed_links(
@@ -3574,18 +3625,21 @@ def infer_tags_from_typed_links(
             relation = link.get("relation_type", "")
             target_title = link.get("target_title", "")
 
-            # Query target node
-            results = collection.query.fetch_objects(
-                filters=Filter.by_property("title").equal(target_title) &
-                       Filter.by_property("chunk_num").equal(1),
-                limit=1,
-                return_properties=["tags", "node_type"]
+            # Query target node.
+            # v0.2.101 B3 follow-up: `title` is word-TOKENIZED, so `Equal`
+            # matches every title CONTAINING the link's tokens, and the old
+            # `limit=1` took whichever came first — `[[uses::Weaviate]]`
+            # inherited the tags of e.g. "Weaviate Windows Ports Gotcha".
+            # The filter now only narrows; `_title_target_row` keeps the first
+            # row whose title has the SAME token sequence as the link.
+            target_row = _title_target_row(
+                collection, target_title,
+                return_properties=["tags", "node_type", "title"],
             )
-
-            if not results.objects:
+            if target_row is None:
                 continue
 
-            target_props = results.objects[0].properties
+            target_props = target_row.properties or {}
             target_tags = target_props.get("tags", [])
 
             # Rule 1: Inherit capability tags from used/implemented tools
@@ -3642,14 +3696,12 @@ def resolve_wikilinks_to_uuids(
         for link_title in wikilinks:
             # Query for nodes with matching title (case-insensitive)
             # Note: For chunked nodes, we want the parent node, not chunks
-            results = collection.query.fetch_objects(
-                filters=Filter.by_property("title").equal(link_title) &
-                       Filter.by_property("chunk_num").equal(1),  # Get first chunk (has full metadata)
-                limit=1
-            )
-
-            if results.objects:
-                uuids.append(str(results.objects[0].uuid))
+            # v0.2.101 B3 follow-up: exact token-sequence title match (see
+            # `_title_target_row`) — the tokenized `Equal` + `limit=1` pointed
+            # a cross-reference at whichever CONTAINING title came first.
+            target_row = _title_target_row(collection, link_title)
+            if target_row is not None:
+                uuids.append(str(target_row.uuid))
 
         return uuids
 
@@ -3694,25 +3746,30 @@ def _relative_file_path(file_path: Path) -> str:
 
 
 def _file_path_filter(canonical: str):
-    """Weaviate filter matching ``file_path`` rows for *canonical* — BOTH
+    """NARROWING read filter for *canonical*'s ``file_path`` rows — BOTH
     spellings when a legacy backslash variant exists.
 
     v0.2.92 WP-B1 transition rule (state-keyed, not version-keyed): rows
     written by a pre-canonical Windows sync carry ``knowledge\\concepts\\
-    foo.md``. A POSIX-only exact filter would MISS them, so the delete
-    that accompanies every re-write would leave them behind and the
-    insert would add a duplicate set — the exact defect this closes.
-    Mirrors server.py's C-7 delete filter (OR of two EXACT ``.equal()``
-    predicates — never ``contains_any``, which is token-based) so the
-    sync script and the MCP delete with the same semantics.
+    foo.md``; the filter asks for both spellings so the upsert's delete
+    reaches them instead of leaving a duplicate set behind.
+
+    v0.2.101 B3 — TRUTH REPAIR: this docstring used to call the filter an
+    "OR of two EXACT ``.equal()`` predicates". It is not exact.
+    ``file_path`` is ``TEXT`` with Weaviate's default ``word`` tokenization,
+    so ``Equal`` matches every row whose token set CONTAINS the path's tokens
+    — ``knowledge/concepts/knowledge-graph.md`` also returns the rows of
+    ``orchestrator-knowledge-graph.md`` and ``orchestrator-code-graph.md``.
+    Every caller deleted that whole set, wiping active siblings. So this is
+    a candidate-selection filter ONLY: every reader passes it to
+    ``_fetch_exact_path_rows``, which keeps the rows whose RAW ``file_path``
+    names *canonical* (compared in Python) before anything is judged or
+    deleted. Built by the one shared home
+    (``vco_lib.weaviate_exact_match.path_narrowing_filter``) that the MCP
+    ``store_knowledge_node`` also uses; the module-level ``Filter`` is
+    passed in so tests can swap it for an in-memory fake.
     """
-    backslash_variant = canonical.replace("/", "\\")
-    if backslash_variant != canonical:
-        return Filter.any_of([
-            Filter.by_property("file_path").equal(canonical),
-            Filter.by_property("file_path").equal(backslash_variant),
-        ])
-    return Filter.by_property("file_path").equal(canonical)
+    return _path_narrowing_filter(Filter, canonical)
 
 
 def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -> int:
@@ -3729,15 +3786,26 @@ def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -
     Returns the number of objects deleted. Silent (returns 0) when the
     collection is missing or the connection is down — sync must not block
     on best-effort cleanup.
+
+    v0.2.101 B3: "unique per node" holds only for an EXACT match. The
+    tokenized ``file_path`` filter also returns token-superset siblings
+    (archiving ``concepts/knowledge-graph.md`` used to delete the rows of the
+    active ``concepts/orchestrator-knowledge-graph.md``), so the rows are
+    confirmed in Python by ``_fetch_exact_path_rows`` before any delete.
+    Callers: the two archived-node branches of ``sync_node``, the project →
+    shared migration delete (``_finish_shared_scope_write``) and the
+    v0.2.101 archived-removal routing — all go through this function.
     """
     try:
         coll = server.client.collections.get(COLLECTION_NAME)
-        existing = coll.query.fetch_objects(
-            filters=_file_path_filter(file_path_value),
-            limit=100,
+        existing = _fetch_exact_path_rows(
+            coll,
+            _file_path_filter(file_path_value),
+            file_path_value,
+            return_properties=["file_path"],
         )
         n = 0
-        for obj in existing.objects:
+        for obj in existing:
             coll.data.delete_by_id(obj.uuid)
             n += 1
         return n
@@ -3903,11 +3971,15 @@ def _notice_leftover_shared_rows(server: "WeaviateMCPServer", fp_value: str) -> 
         return
     try:
         coll = server.client.collections.get(SHARED_COLLECTION_NAME)
-        existing = coll.query.fetch_objects(
-            filters=_file_path_filter(fp_value),
-            limit=100,
+        # v0.2.101 B3: count only rows that name THIS file_path exactly —
+        # the tokenized filter alone would also count siblings' rows.
+        existing = _fetch_exact_path_rows(
+            coll,
+            _file_path_filter(fp_value),
+            fp_value,
+            return_properties=["file_path"],
         )
-        n = len(existing.objects)
+        n = len(existing)
         if n:
             print(
                 f"   ℹ️  {n} row(s) for '{fp_value}' remain in shared "
@@ -4286,9 +4358,17 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
 
         # Query for existing nodes with same file_path — BOTH spellings
         # (v0.2.92 WP-B1 / D13): a legacy Windows-written row carries the
-        # backslash variant; an exact POSIX-only filter would miss it, the
-        # delete below would skip it, and the insert would duplicate it.
+        # backslash variant; a POSIX-only filter would miss it, the delete
+        # below would skip it, and the insert would duplicate it.
+        #
+        # v0.2.101 B3: `where_filter` is a NARROWING read only — `file_path`
+        # is word-tokenized, so it also returns token-superset siblings
+        # (`concepts/knowledge-graph.md` → `orchestrator-code-graph.md`'s
+        # rows). Each rung below reads through `_fetch_exact_path_rows`, so
+        # `existing_rows` holds THIS node's rows only: the embed-skip gate
+        # judges them and the delete-and-re-embed removes them, nothing else.
         where_filter = _file_path_filter(node_data["file_path"])
+        _canonical_fp = node_data["file_path"]
         # v0.2.95 WP-5: request VECTORS too, so the embed-skip gate below can
         # see whether the ACTIVE named-vector slot is actually populated.
         # Until now this fetch omitted `include_vector`, which is why a node
@@ -4346,18 +4426,16 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         _vectors_requested = True
         _metadata_props_available = True
         try:
-            existing = collection.query.fetch_objects(
-                filters=where_filter,
-                limit=100,
+            existing_rows = _fetch_exact_path_rows(
+                collection, where_filter, _canonical_fp,
                 return_properties=_base_return_props + _repairable_ask,
                 include_vector=True,
             )
         except Exception as _meta_fetch_err:  # noqa: BLE001 — older client / legacy schema
             _metadata_props_available = False
             try:
-                existing = collection.query.fetch_objects(
-                    filters=where_filter,
-                    limit=100,
+                existing_rows = _fetch_exact_path_rows(
+                    collection, where_filter, _canonical_fp,
                     return_properties=_base_return_props,
                     include_vector=True,
                 )
@@ -4365,9 +4443,8 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 print(f"   (fetch_objects(include_vector=True) failed: "
                       f"{_vec_fetch_err}; falling back to hash-only check)")
                 _vectors_requested = False
-                existing = collection.query.fetch_objects(
-                    filters=where_filter,
-                    limit=100,
+                existing_rows = _fetch_exact_path_rows(
+                    collection, where_filter, _canonical_fp,
                     return_properties=_base_return_props,
                 )
 
@@ -4392,7 +4469,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             existing_hashes: List[str] = []
             existing_total_chunks: List[int] = []
             existing_file_paths: List[str] = []
-            for obj in existing.objects:
+            for obj in existing_rows:
                 props = obj.properties or {}
                 existing_hashes.append(props.get("content_hash", "") or "")
                 # total_chunks may be int OR (legacy) missing/None.
@@ -4422,13 +4499,13 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             # row reports a NON-canonical (legacy backslash) spelling — a
             # legacy-shaped row reached through the dual-shape filter must
             # NOT be preserved by the fast path; it falls through to
-            # delete-and-rewrite so the row shape itself heals. A row that
-            # does not report a file_path at all (older clients / fixtures
-            # that ignore return_properties) cannot be judged and keeps
-            # the pre-v0.2.92 skip semantics (conservative default: no
-            # new re-embed on unverifiable data).
+            # delete-and-rewrite so the row shape itself heals.
+            # v0.2.101 B3: every row here was CONFIRMED to name this node
+            # (exact-path reader), so a row that reports no file_path never
+            # reaches this gate any more; the only non-canonical value left
+            # is a legacy separator spelling of this same path.
             shapes_canonical = all(
-                fp in ("", node_data["file_path"]) for fp in existing_file_paths
+                fp == node_data["file_path"] for fp in existing_file_paths
             )
             # v0.2.92 chunk-plan transition repair: a revision crossing is
             # pending when the deferral ledger carries
@@ -4465,7 +4542,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 _slots_ok = _active_slot_gate_ok(
                     collection,
                     target_collection_name,
-                    existing.objects,
+                    existing_rows,
                     _active_slot_for_gate,
                     vectors_requested=_vectors_requested,
                 )
@@ -4525,7 +4602,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 try:
                     _, _repair_err = _repair_stale_metadata(
                         collection,
-                        existing.objects,
+                        existing_rows,
                         node_data,
                         metadata_props_available=_metadata_props_available,
                     )
@@ -4550,7 +4627,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             print(f"   (embed-skip check failed: {skip_err}; re-embedding)")
 
         deleted_count = 0
-        for obj in existing.objects:
+        for obj in existing_rows:  # exact-path rows only (v0.2.101 B3)
             collection.data.delete_by_id(obj.uuid)
             deleted_count += 1
 

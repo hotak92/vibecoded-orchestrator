@@ -139,12 +139,23 @@ pub fn set_logging_level_with_db(db: &Db, level: &str) -> Result<LoggingLevelSta
 }
 
 /// Persist the machine-global diagnostic log level.
+///
+/// F3 / v0.2.101 review S6 (same class, found tracing the callers of
+/// `refresh_all_projects_env_with_db`): the core re-projects EVERY project
+/// — N serial Python subprocesses, up to 300 s each — so it runs on the
+/// blocking pool instead of parking a tokio worker. The app_state write
+/// lives inside the closure, so a join failure is propagated.
 #[command]
 pub async fn set_logging_level(
     level: String,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<LoggingLevelState, String> {
-    set_logging_level_with_db(&db, &level)
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_logging_level",
+        move |db| set_logging_level_with_db(db, &level),
+    )
+    .await?
 }
 
 #[cfg(test)]

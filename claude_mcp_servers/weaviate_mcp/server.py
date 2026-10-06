@@ -7140,23 +7140,42 @@ async def store_knowledge_node(
         # auto-derives one), fall back to the legacy title-only match (the
         # ratified C-7 fallback: better a title-only cleanup than deleting
         # nothing and accumulating duplicate rows).
+        #
+        # v0.2.101 B3 — TRUTH REPAIR: this block used to describe the path
+        # filter as "an OR of two EXACT `.equal()` filters". It is not exact:
+        # `title` and `file_path` are TEXT with Weaviate's default `word`
+        # tokenization, so `Equal` matches every row whose token set CONTAINS
+        # the value's tokens. ANDing two tokenized predicates narrows but does
+        # not close the hole — title "Knowledge Graph" at
+        # `knowledge/concepts/knowledge-graph.md` is a token-subset of
+        # "Orchestrator Knowledge Graph" at `orchestrator-knowledge-graph.md`,
+        # and the delete below removed BOTH nodes' rows. The filter is now a
+        # NARROWING read only; the rows are confirmed in Python by
+        # `vco_lib.weaviate_exact_match` (the home kg-sync's upsert uses too):
+        # raw `file_path` equal to this node's path (either separator
+        # spelling — C-7), or, on the title-only fallback, a title with the
+        # SAME token sequence.
+        from vco_lib.weaviate_exact_match import (
+            fetch_matching_rows as _fetch_matching_rows,
+            is_exact_path as _is_exact_path,
+            is_same_title as _is_same_title,
+            path_narrowing_filter as _path_narrowing_filter,
+        )
+
         _delete_filter = Filter.by_property("title").equal(title)
         if rel_file_path:
-            # C-7: match BOTH the canonical POSIX spelling AND the backslash
-            # variant so a Windows-written old row (or any separator drift) is
-            # still reconciled. Use an OR of two EXACT `.equal()` filters (not
-            # `contains_any`, which is token-based and would not match a full
-            # path string exactly) — `.equal()` is the established exact-match
-            # pattern for file_path (sync_knowledge_graph.py uses it too).
-            _backslash_variant = rel_file_path.replace("/", "\\")
-            if _backslash_variant != rel_file_path:
-                _path_filter = Filter.any_of([
-                    Filter.by_property("file_path").equal(rel_file_path),
-                    Filter.by_property("file_path").equal(_backslash_variant),
-                ])
-            else:
-                _path_filter = Filter.by_property("file_path").equal(rel_file_path)
-            _delete_filter = _delete_filter & _path_filter
+            # C-7: narrow on BOTH the canonical POSIX spelling AND the
+            # backslash variant so a Windows-written old row (or any separator
+            # drift) is still reconciled.
+            _delete_filter = _delete_filter & _path_narrowing_filter(
+                Filter, rel_file_path
+            )
+
+            def _is_this_node(props) -> bool:
+                return _is_exact_path(props.get("file_path"), rel_file_path)
+        else:
+            def _is_this_node(props) -> bool:
+                return _is_same_title(props.get("title"), title)
         # v0.2.73 D-2: collect the stale row ids NOW (before any insert, so the
         # scoped filter can't match the fresh rows) but do NOT delete yet.
         # Pre-D-2 the delete ran here — BEFORE embeddings were fetched — so a
@@ -7168,27 +7187,17 @@ async def store_knowledge_node(
         # temporary duplicate rows (old + partial new), which the next
         # successful upsert or kg-sync cleans up — strictly better than data
         # loss.
-        # C-7: loop past limit=100 — a heavily-chunked node (or accumulated
-        # drift) can exceed 100 rows; a single fetch capped at 100 would leave
-        # the overflow stranded. Page until a short batch returns.
-        _stale_uuids = []
-        _fetch_offset = 0
-        _FETCH_PAGE = 100
-        while True:
-            _batch = collection.query.fetch_objects(
-                filters=_delete_filter,
-                limit=_FETCH_PAGE,
-                offset=_fetch_offset,
+        # C-7: page past limit=100 — a heavily-chunked node (or accumulated
+        # drift, or — B3 — token-superset siblings filling the narrowed read)
+        # can exceed 100 rows; the shared reader pages until a short batch
+        # returns, bounded at 50 pages = 5000 rows (far past any real node).
+        _stale_uuids = [
+            obj.uuid
+            for obj in _fetch_matching_rows(
+                collection, _delete_filter, _is_this_node,
+                page_size=100, max_pages=50,
             )
-            _batch_objs = _batch.objects
-            _stale_uuids.extend(obj.uuid for obj in _batch_objs)
-            if len(_batch_objs) < _FETCH_PAGE:
-                break
-            _fetch_offset += _FETCH_PAGE
-            # Defensive bound: never page forever (corrupt cursor / duplicate
-            # rows) — 50 pages = 5000 rows is far past any real node.
-            if _fetch_offset >= 50 * _FETCH_PAGE:
-                break
+        ]
 
         now = datetime.now(timezone.utc).isoformat()
 

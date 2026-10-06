@@ -580,7 +580,7 @@ function Read-KeyHubEnv {
                     return @{ ExitCode = 2 }
                 }
                 "key_not_active" {
-                    Write-Err "key $Key not active for project $pid_ (paused for this project, or not declared by any installed module)"
+                    Write-Err "key $Key not active for project $pid_ (not declared by any installed module, or not granted to this project; a paused key answers the distinct key_paused code)"
                     return @{ ExitCode = 3 }
                 }
                 "key_paused" {

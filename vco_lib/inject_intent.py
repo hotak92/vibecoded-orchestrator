@@ -116,12 +116,22 @@ class BashIntent:
 
 
 # Verb tables (the §2.1 / plan-v0300 seed list; deliberately explicit).
+#
+# MUST MATCH the Bash ``if``-rule group of pre-bash-context-inject in BOTH
+# templates/settings.json.{linux,windows}.template (one handler per verb:
+# ``Bash(<verb> *)``, ``Bash(git <sub>*)``). The harness spawns the hook only
+# for a command matching a rule, so a verb here without a rule is a dead
+# classifier branch on every install (v0.2.101 review S1), and a rule without
+# a verb spawns a hook that can only answer MECHANICAL. Locked both ways by
+# tests/test_v02101_settings_if_filters.py::TestIfRulesMatchClassifier.
 _READ_VERBS = frozenset({
     "cat", "head", "tail", "less", "more", "diff", "bat", "nl", "sed", "awk",
 })
 _SEARCH_VERBS = frozenset({"grep", "rg", "ag", "ack", "egrep", "fgrep"})
 #: git subcommands that READ (targets = the named paths)
 _GIT_READ_SUBS = frozenset({"show", "diff", "log", "blame"})
+#: git subcommands that SEARCH (classified like a ``grep`` on the rest)
+_GIT_SEARCH_SUBS = frozenset({"grep"})
 
 _SINK_NOISE = _REDIRECT_NOISE  # one home: the bash_write_targets strip list
 
@@ -440,7 +450,7 @@ def _classify_segment(tokens: List[str],
 
     if verb == "git" and len(tokens) > 1:
         sub = tokens[1].lower()
-        if sub == "grep":
+        if sub in _GIT_SEARCH_SUBS:
             return _classify_search(tokens[1:], cwd)
         if sub in _GIT_READ_SUBS:
             targets: List[str] = []

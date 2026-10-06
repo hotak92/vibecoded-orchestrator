@@ -22,7 +22,7 @@
 #
 # Constraints:
 # - Registered PreToolUse(Grep), timeout 10 in settings.json.template —
-#   ABOVE the router's 8 s inner budget (SF-1: an equal timeout gets
+#   ABOVE the router's 6 s inner budget (SF-1: an equal timeout gets
 #   cold runs harness-killed; the router must be what bounds itself).
 # - No `if` filter (§C6): a pattern's shape is not a path glob.
 # - Never exit non-zero (would block the Grep). Empty/failed retrieval →

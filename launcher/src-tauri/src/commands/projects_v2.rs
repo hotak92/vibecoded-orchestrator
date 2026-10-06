@@ -3732,18 +3732,16 @@ fn apply_project_env_via_python(
     // (v0.2.97 review F13, same fix as the env-block verbs).
     cmd.current_dir(crate::services::vco_lib_bridge::vco_lib_cwd(Some(folder), folder));
 
-    // Wall-clock cap through the ONE bounded runner (v0.2.100 F-W4-05;
-    // v0.2.101 owner ruling 2026-10-06: generous for slow hardware — the
-    // happy path is ~150 ms here, but a third-party machine with a slow
-    // disk, AV-scanned Python startup or a cold page cache must not have a
-    // legitimate apply killed; 300 s is 2000× the happy path and still
-    // surfaces a genuinely stuck process within one user's patience).
+    // Wall-clock cap through the ONE bounded runner (v0.2.100 F-W4-05).
+    // The bound is `VCO_LIB_ENV_PROJECTION_TIMEOUT` (300 s, v0.2.101 owner
+    // ruling 2026-10-06 — generous for slow hardware; the reasoning, and
+    // its contrast with the 120 s short-verb cap, live at the constant).
     // Pipes are drained while the child runs, so a chatty child cannot
     // deadlock on a full pipe.
     let out = vct_launcher_core::process::output_bounded(
         &mut cmd,
         None,
-        std::time::Duration::from_secs(300),
+        crate::services::vco_lib_bridge::VCO_LIB_ENV_PROJECTION_TIMEOUT,
     )
     .map_err(|e| {
         format!(

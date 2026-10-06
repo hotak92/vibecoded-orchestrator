@@ -5,7 +5,7 @@
 
 Usage (the thin .sh/.ps1 wrappers of Wave 2 call exactly this)::
 
-    hook_context_router.py <surface> [--intent-out FILE]   # hook JSON on stdin
+    hook_context_router.py <surface> [--intent-out FILE] [--claim]   # hook JSON on stdin
 
     surfaces: bash | read | write | edit | grep | agent
 
@@ -70,6 +70,13 @@ Env seams (tests + Wave 2):
 BashIntent; other surfaces: their resolved plan) — the Wave-2 pre-bash
 wrapper's ``pre_bash`` outcome-event seam (WP-D 2: intent + targets in the
 payload). Best-effort: an unwritable path never fails the run.
+
+``--claim`` (bash surface only, v0.2.101 N2) — one run per tool call: an
+``O_CREAT|O_EXCL`` claim (:func:`claim_bash_call`) taken before any side
+effect; the duplicate spawn a multi-match ``if`` group starts for the same
+call exits 0 silently. The seen-store filter is additionally serialized per
+session (:func:`filter_seen_blocks`) for near-simultaneous completions from
+DIFFERENT calls.
 """
 from __future__ import annotations
 
@@ -324,10 +331,66 @@ def _src_matches(reads_file: str, src: str, project_root: str) -> bool:
     return False
 
 
+#: v0.2.101 N2: how long a router waits for a concurrent sibling to finish
+#: its seen-store read-check-append. The holder's critical section is a few
+#: file reads and appends (milliseconds) and a killed holder releases the
+#: flock with its process, so expiring this means a holder genuinely stuck
+#: mid-filter — see :func:`filter_seen_blocks` for why that injects nothing.
+SEEN_LOCK_TIMEOUT_S = 1.0
+
+
 def filter_seen_blocks(text: str, inject_file: str, reads_file: str,
                        project_root: str = "") -> str:
     """Mirror of vco_filter_seen_blocks. Parses the KG:/CODE: block stream,
-    suppresses already-seen / already-Read blocks, records emitted keys."""
+    suppresses already-seen / already-Read blocks, records emitted keys.
+
+    v0.2.101 N2: the check ("is this key in the store?") and the write
+    ("record it") are one critical section under an exclusive lock on the
+    ``<inject_file>.lock`` sidecar (:func:`vco_lib.atomic.exclusive_file_lock`,
+    the same idiom as the budget and CG-cap counters). Unlocked, two routers
+    finishing near-simultaneously for one session both read "unseen" and both
+    inject the same block.
+
+    Fail modes, chosen per cause:
+
+    * **lock wait expires** (``LockTimeout``) → inject NOTHING. Contention IS
+      the double-inject condition: another router for this session is inside
+      the filter right now, and proceeding unlocked would re-create exactly
+      the duplicate this lock exists to stop. Silence is this hook class's
+      documented safe failure (the router's contract: a retrieval failure is
+      silence), and the blocks stay unrecorded, so a later call can still
+      inject them.
+    * **lock file cannot be created/opened** (``OSError``) → run unlocked, the
+      pre-N2 behaviour. Nothing is contending — the state dir is unusable, and
+      then the seen-store append fails too, so dedupe is already off; refusing
+      would silence injection for a broken state dir rather than for a race.
+    * **no ``fcntl``** (Windows) → :func:`exclusive_file_lock` degrades to no
+      mutual exclusion, its documented posture; the residual window there is
+      the cross-SURFACE near-simultaneous case only — the commonest double
+      fire (one multi-match Bash call spawning the wrapper twice) is stopped
+      upstream by the bash surface's ``O_EXCL`` claim (``--claim``), which
+      holds on every OS.
+    """
+    if not inject_file:
+        return _filter_seen_blocks_unlocked(text, inject_file, reads_file, project_root)
+    import contextlib
+
+    from vco_lib.atomic import LockTimeout, exclusive_file_lock
+
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(exclusive_file_lock(
+                Path(inject_file + ".lock"), timeout_s=SEEN_LOCK_TIMEOUT_S))
+        except LockTimeout:  # before OSError: LockTimeout IS an OSError
+            return ""
+        except OSError:
+            pass  # cannot lock at all → the unlocked pre-N2 behaviour
+        return _filter_seen_blocks_unlocked(text, inject_file, reads_file, project_root)
+
+
+def _filter_seen_blocks_unlocked(text: str, inject_file: str, reads_file: str,
+                                 project_root: str = "") -> str:
+    """The filter body — callers go through :func:`filter_seen_blocks`."""
     dedup_on = bool(inject_file)
     if dedup_on:
         try:
@@ -888,6 +951,87 @@ def _emit_agent(tool_input: Dict, prompt: str, kg_text: str) -> str:
     }, ensure_ascii=False)
 
 
+# --- bash double-fire claim (v0.2.101 N2) -------------------------------------
+# The §C1 settings group registers the bash wrapper once per matching `if`
+# rule, so ONE multi-match tool call (`cat x | grep y`) spawns it TWICE,
+# concurrently, with the same payload. Before N2 both spawns ran the legs,
+# both could inject the same block, and the wrapper's pairing dedupe
+# (`find -mmin -1` on the state file, BEFORE either spawn wrote it) let two
+# cold spawns both write state and both emit a `pre_bash` event — an orphan
+# RL event. `--claim` makes the FIRST spawn the only one: an `O_CREAT|O_EXCL`
+# claim per tool call, taken before anything with a side effect.
+
+#: A claim younger than this belongs to a sibling spawn of the SAME call. It
+#: only bounds the fallback key (no `tool_use_id` in the payload), where a
+#: genuine re-run of the identical command inside the window is treated as
+#: the same call — the window the pre-N2 `find -mmin -1` guard already used.
+BASH_CLAIM_TTL_S = 60.0
+
+#: Claims are one tiny file per Bash call; older than this they are garbage.
+#: Far above the TTL so the GC never races a live takeover decision.
+_BASH_CLAIM_GC_AGE_S = 3600.0
+_BASH_CLAIM_GC_MAX = 200
+
+
+def bash_claim_path(payload: Dict, project_root: str) -> str:
+    """``.claude/state/bash_claim_<sid>_<md5(cmd)[:16]>[_<tool_use_id>]``, or "".
+
+    Both sibling spawns receive the same payload, so they derive the same
+    name. ``tool_use_id`` (present in current harness payloads) makes the key
+    exactly one tool call — a re-run of the same command is a new id and is
+    never suppressed; without it the key falls back to (session, command)
+    bounded by :data:`BASH_CLAIM_TTL_S`. The md5 prefix is the same shape as
+    the wrapper's pairing hash (naming only — nothing joins on it).
+    """
+    if not project_root:
+        return ""
+    command = str((payload.get("tool_input") or {}).get("command") or "")
+    if not command:
+        return ""
+    sid = sanitize_session_id(str(payload.get("session_id") or "")) or "default"
+    digest = hashlib.md5(command.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+    tuid = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("tool_use_id") or ""))[:64]
+    name = f"bash_claim_{sid}_{digest}" + (f"_{tuid}" if tuid else "")
+    return os.path.join(project_root, ".claude", "state", name)
+
+
+def _bash_claim_gc(state_dir: Path) -> None:
+    """Bounded best-effort sweep of old claims (never raises)."""
+    try:
+        cutoff = time.time() - _BASH_CLAIM_GC_AGE_S
+        for f in list(state_dir.glob("bash_claim_*"))[:_BASH_CLAIM_GC_MAX]:
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def claim_bash_call(payload: Dict, project_root: str) -> bool:
+    """True → this spawn proceeds; False → a sibling spawn owns this call.
+
+    Losing is NOT an error: the loser is a duplicate of a run already in
+    flight, so it exits 0 with empty stdout and writes no intent file — the
+    wrapper then has nothing to inject, no state to write, no event to emit.
+    Any output from it could only be a second copy of the winner's.
+
+    Undecidable (``claim_once`` → None: unwritable state dir) proceeds — the
+    pre-N2 behaviour. A state dir that cannot take a claim cannot take the
+    pairing file either, so the worst case is a duplicate injection; refusing
+    would silence every Bash injection for a broken state dir.
+    """
+    path = bash_claim_path(payload, project_root)
+    if not path:
+        return True
+    from vco_lib.atomic import claim_once
+
+    claim = Path(path)
+    _bash_claim_gc(claim.parent)
+    return claim_once(claim, stale_after_s=BASH_CLAIM_TTL_S) is not False
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -919,12 +1063,18 @@ def _main(argv: List[str]) -> int:
     except (json.JSONDecodeError, UnicodeDecodeError):
         payload = {}
 
+    project_root = _resolve_project_root(payload)
+    # N2: a duplicate spawn of ONE multi-match Bash call stands down here,
+    # before the legs, the RL retrieval events, the seen-store, the budget
+    # and the intent file — silently (see claim_bash_call).
+    if surface == "bash" and "--claim" in argv and not claim_bash_call(payload, project_root):
+        return 0
+
     sid = sanitize_session_id(str(payload.get("session_id") or ""))
     prompt_raw = str(payload.get("prompt_id") or "")
     prompt_id = prompt_raw if re.fullmatch(r"[A-Za-z0-9_-]+", prompt_raw) else ""
     transcript_path = str(payload.get("transcript_path") or "")
     cwd = str(payload.get("cwd") or "") or os.getcwd()
-    project_root = _resolve_project_root(payload)
 
     # VCT_SESSION_ID export discipline (pre-edit-context-inject.sh:156-169):
     # the RL telemetry's 3-layer session chain reads it from the env; skip

@@ -26,19 +26,18 @@ This test pins both invariants:
   patterns, including a check that the secret-scrub list (which IS
   expected to call ``unset``) does not accidentally include the access
   matrix vars.
-* **Dynamic check** — a representative hook (``pre-tool-use.sh`` /
-  ``pre-tool-use.ps1``, which is the on-by-default path that calls
-  ``kg-search``) is invoked with ``VCT_KG_ACCESS_LIST=Beta,Gamma`` set
-  and a stubbed ``kg-search`` script; the stub records its received env
-  and the test asserts the access-list var arrived intact.
+* **Dynamic check** — RETIRED in v0.2.101 wave-3 together with its only
+  subject (pre-tool-use's KG delegation, §5). The live-env-propagation
+  property now lives in
+  ``tests/test_v02100_hook_kg_project_identity.py``, which drives the
+  hooks that still reach Weaviate with a project-scoped identity.
 
 Static check is the load-bearing one — it covers all 16 .sh + .ps1
-hooks, and it's deterministic. The dynamic check is a belt-and-braces
-sanity probe on the most-fired hook in normal operation.
+hooks, and it's deterministic.
 
 Cross-OS
 --------
-We run the bash dynamic check on the .sh side. The .ps1 side is
+The .ps1 side is
 covered by static analysis only on this CI host (no powershell
 runner). The ``check_hook_parity.py`` gate ensures both shells are
 modified together when either changes, so a hook that breaks the
@@ -46,10 +45,7 @@ contract on one side and not the other can't be merged.
 """
 from __future__ import annotations
 
-import os
 import re
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -66,14 +62,6 @@ HOOKS_DIRS = [
 
 # Env-var names the hooks must NOT strip from the inherited environment.
 ACCESS_VARS = ("VCT_KG_ACCESS_LIST", "VCT_CODE_GRAPH_ACCESS_LIST")
-
-# Subset of hooks whose bash side is fast to invoke and reaches the KG-search
-# delegation path within ~1.5s wall-clock with VCT_DISABLE_HOOKS unset. We
-# only run the dynamic test against this subset to keep test latency
-# predictable — the static test already covers all 32 files.
-# v0.2.101 wave-3: the dynamic-probe subject (pre-tool-use §5) was retired;
-# see the retirement note at the bottom of this file.
-DYNAMIC_TEST_HOOKS: list[str] = []
 
 
 def _hook_files(suffix: str) -> list[Path]:

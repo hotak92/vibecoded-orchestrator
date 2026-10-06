@@ -869,6 +869,7 @@ pub struct CollectionAccessModeReq {
 #[command]
 pub async fn kg_set_collection_access_mode(
     req: CollectionAccessModeReq,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
     if !matches!(
@@ -974,13 +975,36 @@ pub async fn kg_set_collection_access_mode(
     // P1-D (2026-05-08): refresh env files for every affected project so
     // running sessions pick up the new VCT_KG_ACCESS_LIST without a
     // restart. The mode setter modifies every other project's row, so
-    // we refresh all projects (small bounded set in practice; access
-    // matrix changes are rare). Soft-fail per project; one bad write
+    // we refresh all projects. Soft-fail per project; one bad write
     // does not abort the remaining refreshes.
-    if let Ok(all) = db.list_projects() {
-        for p in all {
-            let _ = crate::commands::projects_v2::refresh_project_env_with_db(&db, &p.id);
-        }
+    //
+    // v0.2.101 review S6 (found tracing the callers of the all-projects
+    // re-projection): this used to be a hand-rolled inline loop over
+    // `refresh_project_env_with_db` — a second copy of
+    // `refresh_all_projects_env_with_db` minus its phantom-folder skip, run
+    // on a tokio worker for N × (up to 300 s) subprocesses. It now calls the
+    // one core, on the blocking pool (F3). The access rows above have
+    // already committed, so a join failure is logged, never propagated.
+    if let Err(e) = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "kg_set_collection_access_mode env re-projection",
+        |db| {
+            let report = crate::commands::projects_v2::refresh_all_projects_env_with_db(db);
+            if !report.global_warnings.is_empty() || !report.failed.is_empty() {
+                tracing::warn!(
+                    "[vct] kg_set_collection_access_mode: env re-projection warnings: \
+                     global={:?} failed={:?}",
+                    report.global_warnings, report.failed
+                );
+            }
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            "[vct] warning: kg_set_collection_access_mode: {} (access rows already committed)",
+            e
+        );
     }
     Ok(())
 }

@@ -78,6 +78,25 @@ registration into the per-project ``DISABLED_STEMS_ENV_KEY``), and the
 ``match`` CLI's ``carry_pending`` answer, with which the launcher's eager
 prune holds a carry-pending row's bytes until the project's update has run
 (``commands/project_hooks_settings.rs::parked_rows_to_prune``).
+
+v0.2.101 (review B2) — RESHAPED registrations, a sibling table
+(:data:`PRIOR_SHIPPED_SHAPES`). A hook whose SCRIPT still ships but whose
+REGISTRATION SHAPE changed (a timeout raise, one if-less handler split into
+an ``if``-filtered group) is invisible to both the scrub above (the identity
+is still shipped) and the supersede pass (it rewrites the command string
+only; ``timeout``/``if`` are user-wins). Without a declaration, every
+upgraded install keeps the old shape forever and fresh and upgraded
+installs behave differently. Each row is a shape VCO provably shipped —
+event, matcher, script, and the EXACT inner-hook keys besides ``command``;
+``settings_merge.merge_hooks_block`` replaces a user registration equal to a
+row with the CURRENT template's registrations of that script under that
+matcher. A registration that differs in any key is a user edit and is left
+alone. Deliberately NOT part of :data:`RETIRED_REGISTRATIONS`: the scrub,
+the parked re-enable refusal and the launcher's prune classifier must keep
+treating these scripts as live (a parked prior-shape row re-enables
+verbatim and the next update reshapes it). Reshapes report through the same
+``retired_removed`` audit trail (a row exposes the attributes the envelope
+and audit emitters read).
 """
 
 from __future__ import annotations
@@ -451,6 +470,152 @@ def match_retired_registration(
         elif entry.kind == KIND_COMMAND:
             if normalized and normalized == entry.target:
                 return entry
+    return None
+
+
+# ── RESHAPED registrations (v0.2.101, review B2) ───────────────────────────
+#
+# See the module docstring's last paragraph for why this is a SIBLING table
+# rather than more RETIRED_REGISTRATIONS rows.
+
+
+@dataclass(frozen=True)
+class PriorShippedShape:
+    """One registration SHAPE VCO shipped and has since reshaped, as DATA.
+
+    Attributes:
+        event: the settings.json hook event (``PreToolUse``, …).
+        matcher: the group ``matcher`` VCO shipped it under, verbatim
+            (``normalize_matcher`` form: absent == ``""``).
+        target: the hook script BASENAME — the value
+            :func:`vco_hook_script_identity` returns.
+        command_key: :func:`hook_command_key` of the command. Every spelling
+            VCO shipped for one script (the pre-v0.2.97 guard-prefixed and
+            relative forms, the pre-v0.2.69 backslash ``.ps1`` path, the
+            anchored form) collapses to ONE key, so one row covers every
+            era of the same registration — and a command the user changed
+            (an extra flag, a wrapper) does not.
+        fields: the inner-hook keys OTHER than ``command``, exactly as
+            shipped (``type``, ``timeout``, ``if``, ``async`` …), as sorted
+            ``(key, value)`` pairs. Matching is dict EQUALITY: a user who
+            changed the timeout or added a key made the registration theirs.
+        shipped: the releases that shipped this shape (audit prose).
+        retired_in: the release whose template replaced it.
+        reason: why the shape changed, for the audit row.
+        replacement: what the merge installs instead, for the audit row.
+    """
+
+    event: str
+    matcher: str
+    target: str
+    command_key: str
+    fields: Tuple[Tuple[str, Any], ...]
+    shipped: str
+    retired_in: str
+    reason: str
+    replacement: str
+
+    @property
+    def audit_replacement(self) -> str:
+        """Same contract as :attr:`RetiredRegistration.audit_replacement` —
+        the envelope/audit emitters read reshape records through it."""
+        return self.replacement
+
+    def matches(self, event: str, matcher: str, hook: Any) -> bool:
+        """True when ``hook`` (an inner-hook dict under ``matcher`` in
+        ``event``) IS this shipped shape. Never raises."""
+        if event != self.event or matcher != self.matcher:
+            return False
+        if not isinstance(hook, dict):
+            return False
+        cmd = hook.get("command")
+        if not isinstance(cmd, str) or not cmd:
+            return False
+        if vco_hook_script_identity(cmd) != self.target:
+            return False
+        if hook_command_key(cmd) != self.command_key:
+            return False
+        rest = {k: v for k, v in hook.items() if k != "command"}
+        return rest == dict(self.fields)
+
+
+def _v02101_reshape_rows() -> Tuple[PriorShippedShape, ...]:
+    """The two v0.2.101 reshapes, per OS flavour (captured from the
+    v0.2.52–v0.2.100 tagged templates: these key sets never changed across
+    those 49 releases; only the command spelling did, which
+    ``command_key`` absorbs).
+
+      * ``pre-bash-context-inject`` — matcher ``Bash``, ``{type, timeout 8}``,
+        no ``if``: one handler that spawned on EVERY Bash call. v0.2.101
+        ships it as an ``if``-filtered group (one handler per READ/SEARCH
+        verb rule, timeout 10) so routine commands spawn nothing.
+      * ``pre-edit-context-inject`` — matcher ``Edit``,
+        ``{type, timeout 8, if Edit(*)}``. v0.2.101 raises the timeout to 10
+        (above the router's inner budget, so the router — not the harness —
+        decides when to stop).
+    """
+    rows = []
+    flavours = (
+        ("sh", 'bash "${{CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/{script}"'),
+        ("ps1", 'powershell -NoProfile -ExecutionPolicy Bypass -File '
+                '"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/{script}"'),
+    )
+    for ext, cmd_fmt in flavours:
+        bash_script = f"pre-bash-context-inject.{ext}"
+        edit_script = f"pre-edit-context-inject.{ext}"
+        rows.append(PriorShippedShape(
+            event="PreToolUse", matcher="Bash", target=bash_script,
+            command_key=hook_command_key(cmd_fmt.format(script=bash_script)),
+            fields=(("timeout", 8), ("type", "command")),
+            shipped="v0.2.52–v0.2.100",
+            retired_in="v0.2.101",
+            reason=(
+                "the single if-less Bash handler spawned the hook on EVERY "
+                "Bash command; v0.2.101 registers it as an if-filtered "
+                "handler group so commands the classifier cannot use spawn "
+                "no hook process at all"
+            ),
+            replacement=(
+                f"the current template's if-filtered {bash_script} handler "
+                f"group (matcher Bash, one handler per read/search verb rule)"
+            ),
+        ))
+        rows.append(PriorShippedShape(
+            event="PreToolUse", matcher="Edit", target=edit_script,
+            command_key=hook_command_key(cmd_fmt.format(script=edit_script)),
+            fields=(("if", "Edit(*)"), ("timeout", 8), ("type", "command")),
+            shipped="v0.2.52–v0.2.100",
+            retired_in="v0.2.101",
+            reason=(
+                "an 8 s harness timeout is not above the context router's "
+                "own inner budget plus interpreter startup, so cold runs "
+                "were killed by the harness and silently lost their "
+                "injection"
+            ),
+            replacement=(
+                f"the current template's {edit_script} registration "
+                f"(matcher Edit, same if rule, raised timeout)"
+            ),
+        ))
+    return tuple(rows)
+
+
+#: The table. One row per (event, matcher, script) shape VCO shipped and
+#: has since reshaped. ``tests/test_v02101_settings_reshape.py`` pins every
+#: row to BOTH settings templates: the template must still ship the script
+#: under the row's matcher (else the row is dead), and its shape must differ
+#: from the row (else there is nothing to reshape).
+PRIOR_SHIPPED_SHAPES: Tuple[PriorShippedShape, ...] = _v02101_reshape_rows()
+
+
+def match_prior_shipped_shape(
+    event: str, matcher: str, hook: Any,
+) -> Optional[PriorShippedShape]:
+    """The :data:`PRIOR_SHIPPED_SHAPES` row ``hook`` equals, or ``None``.
+    ``matcher`` is the group's ``normalize_matcher`` value. Never raises."""
+    for row in PRIOR_SHIPPED_SHAPES:
+        if row.matches(event, matcher, hook):
+            return row
     return None
 
 
@@ -1213,6 +1378,8 @@ __all__ = [
     "DISABLED_STEMS_ENV_KEY",
     "KIND_COMMAND",
     "KIND_HOOK_SCRIPT",
+    "PRIOR_SHIPPED_SHAPES",
+    "PriorShippedShape",
     "RETIRED_REGISTRATIONS",
     "RetiredRegistration",
     "build_parser",
@@ -1220,6 +1387,7 @@ __all__ = [
     "emit_removal_audit_rows",
     "hook_command_key",
     "main",
+    "match_prior_shipped_shape",
     "match_retired_registration",
     "normalize_command",
     "removal_envelope_rows",

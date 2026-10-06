@@ -23,7 +23,7 @@
 #
 # Constraints:
 # - Registered PreToolUse(Agent|Task), timeout 10 in settings.json.template
-#   (§C4: above the router's 8 s inner budget; the measured manual run was
+#   (§C4: above the router's 6 s inner budget; the measured manual run was
 #   12 s cold, ~ms warm via the query cache).
 # - Never exit non-zero (would block the dispatch). Empty/failed retrieval
 #   → no output at all → the Agent input is untouched.

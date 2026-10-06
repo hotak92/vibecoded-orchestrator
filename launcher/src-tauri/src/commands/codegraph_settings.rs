@@ -103,8 +103,8 @@ pub async fn set_codegraph_floors(
     // result struct) so a projection hiccup can't roll back or hard-fail the
     // DB write. Log any accumulated problems for diagnosis.
     //
-    // F3 (v0.2.72): the refresh runs N serial Python subprocesses (30 s cap
-    // each) — route it through spawn_blocking so it doesn't park a tokio
+    // F3 (v0.2.72): the refresh runs N serial Python subprocesses (300 s cap
+    // each since v0.2.101) — route it through spawn_blocking so it doesn't park a tokio
     // worker for the duration. Join errors are soft-fail too (write landed).
     if let Err(e) = crate::commands::blocking::run_with_db_on_blocking_pool(
         app,

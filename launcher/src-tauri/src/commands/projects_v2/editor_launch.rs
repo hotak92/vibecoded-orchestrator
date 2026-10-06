@@ -44,7 +44,8 @@ pub(crate) fn launch_in_terminal_with_cli(folder: &str) -> Result<(), String> {
     if !which_on_path("claude") {
         return Err(
             "Claude Code CLI not found on PATH. Install from \
-             https://docs.anthropic.com/en/docs/claude-code, or open in VS Code instead."
+             https://code.claude.com/docs (the docs home; see the install \
+             guide), or open in VS Code instead."
                 .into(),
         );
     }

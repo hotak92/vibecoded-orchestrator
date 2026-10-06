@@ -142,10 +142,27 @@ ATTEMPTS_FILENAME = "deferral-retries.jsonl"
 #: second apart must not run two KG seeds over the same tree.
 PIDFILE_NAME = "deferral-retry.pid"
 
-#: A held lock older than this is treated as abandoned even when its pid still
-#: looks alive (pid reuse, or a child wedged forever). A KG seed over a large
-#: tree is minutes; six hours cannot be a live one.
-PIDFILE_STALE_SECONDS = 6 * 3600
+#: A held lock whose LAST HEARTBEAT is older than this is treated as abandoned
+#: even when its pid still looks alive — a driver wedged inside one handler.
+#:
+#: v0.2.101 (S2): the age is NOT "time since the driver started". The driver
+#: touches its pidfile before every handler and between settle passes
+#: (:func:`_heartbeat_lock`), so the bound covers ONE handler's silence. Since
+#: v0.2.101 item 4 the driver also runs the full install-time seeds, and one
+#: pass — ``kg_seed`` + ``kg_seed_shared`` + ``code_graph_walk`` +
+#: ``codegraph_resync``, up to :data:`MAX_SETTLE_PASSES` times — legitimately
+#: runs for many hours on a slow machine: a full KG sync alone can take well
+#: over an hour on a big KG and a slow CPU (owner ruling 2026-10-06: shipped
+#: timeouts are VERY long by design), and a code-graph walk over a wide
+#: codebase is similar. Twenty-four hours without a single handler finishing
+#: cannot be a live seed.
+#:
+#: Pid REUSE is not this bound's job any more: the pidfile records the
+#: holder's process start token and :func:`_lock_is_held` compares it
+#: (:func:`vco_lib.deferral_probes.process_identity_matches`), so a crashed
+#: driver whose pid number was handed to another process is taken over at
+#: once. The age bound only backs that up where the identity cannot be read.
+PIDFILE_STALE_SECONDS = 24 * 3600
 
 #: Result states.
 STARTED = "started"       # attempt recorded BEFORE the handler ran
@@ -1172,8 +1189,9 @@ def _read_pidfile(path: Path) -> Optional[int]:
     a recorded 0 is not a process any more than a missing file is.
 
     Two readings changed with the shared reader, both narrowing and neither
-    reachable from this module's own writer (``_acquire_lock`` writes exactly
-    ``f"{os.getpid()}"``): a LEADING blank line now reads as ``None`` where
+    reachable from this module's own writer (``_acquire_lock`` writes the pid
+    as the FIRST line, then the start token — :func:`_read_pidfile_token`
+    reads that second line): a LEADING blank line now reads as ``None`` where
     strip-then-split tolerated it, and non-UTF-8 bytes read as ``None``
     rather than raising through ``read_text``. A pidfile of either shape was
     not written by us and is better treated as absent than as a lock.
@@ -1181,19 +1199,43 @@ def _read_pidfile(path: Path) -> Optional[int]:
     return read_int_line(path, minimum=1)
 
 
+def _read_pidfile_token(path: Path) -> Optional[str]:
+    """The holder's process start token (second line), or ``None``. Never raises.
+
+    v0.2.101 (S2): written by :func:`_acquire_lock` from
+    :func:`vco_lib.deferral_probes.process_start_token`. A pidfile written by
+    an older driver has only the pid line, and reads as ``None`` here — the
+    identity check is then skipped and the age bound alone applies, exactly
+    as before.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    token = lines[1].strip() if len(lines) > 1 else ""
+    return token or None
+
+
 def _lock_is_held(path: Path) -> bool:
     """Is another driver provably running for this folder?
 
-    Stale-tolerant in BOTH directions:
+    Stale-tolerant in every direction that can be proven:
 
     * a pidfile whose pid is provably gone is stale — take over;
-    * a pidfile older than :data:`PIDFILE_STALE_SECONDS` is abandoned even if
-      its pid looks alive (pid reuse, or a wedged child), because no legitimate
-      retry runs that long — take over.
+    * a pidfile whose pid is alive but names a DIFFERENT process than the one
+      that wrote it (the recorded start token no longer matches — pid reuse)
+      is stale — take over;
+    * a pidfile whose last heartbeat is older than
+      :data:`PIDFILE_STALE_SECONDS` is abandoned even if its pid looks alive
+      (a driver wedged inside one handler) — take over. The holder touches the
+      file before every handler and between settle passes
+      (:func:`_heartbeat_lock`), so a long multi-handler pass that keeps making
+      progress never ages out.
 
-    Otherwise (alive pid, or a liveness probe that could not tell) the lock is
-    treated as HELD: declining to start a second seed is the conservative
-    branch, and the age bound above keeps that from becoming permanent.
+    Otherwise (alive pid with a matching or unreadable identity, or a liveness
+    probe that could not tell) the lock is treated as HELD: declining to start
+    a second seed is the conservative branch, and the age bound above keeps
+    that from becoming permanent.
     """
     pid = _read_pidfile(path)
     if pid is None:
@@ -1207,15 +1249,24 @@ def _lock_is_held(path: Path) -> bool:
     if pid == os.getpid():
         return False
     try:
-        from vco_lib.deferral_probes import pid_is_alive
+        from vco_lib.deferral_probes import pid_is_alive, process_identity_matches
 
-        return pid_is_alive(pid)
+        if not pid_is_alive(pid):
+            return False
+        # False = the pid was provably handed to another process. None (no
+        # token recorded, or the process cannot be inspected) stays HELD.
+        return process_identity_matches(pid, _read_pidfile_token(path)) is not False
     except Exception:  # noqa: BLE001 — cannot tell ⇒ assume held
         return True
 
 
 def _acquire_lock(folder: Path) -> Optional[Path]:
     """Claim the per-folder driver lock, or ``None`` when it is held.
+
+    The file holds ``<pid>\n<process start token>\n`` — the token is what lets
+    a later reader tell this driver from a process that inherited its pid
+    number (:func:`_lock_is_held`). The first line alone is what every pid
+    reader (:func:`_read_pidfile`, an older driver mid-update) parses.
 
     Deliberately NOT an atomic ``O_EXCL`` create: the loser of a true race must
     not be left holding a stale file it never wrote, and the two writers we are
@@ -1227,14 +1278,41 @@ def _acquire_lock(folder: Path) -> Optional[Path]:
     if _lock_is_held(path):
         return None
     try:
+        from vco_lib.deferral_probes import process_start_token
+
+        token = process_start_token(os.getpid()) or ""
+    except Exception:  # noqa: BLE001 — no token ⇒ age bound only
+        token = ""
+    try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        path.write_text(
+            f"{os.getpid()}\n{token}\n" if token else f"{os.getpid()}\n",
+            encoding="utf-8",
+        )
     except OSError:
         # Cannot write the lock ⇒ cannot serialise. The caller proceeds
         # unlocked rather than silently skipping owed work: handlers are
         # idempotent, and a read-only `.claude/state` must not disable retries.
         return None
     return path
+
+
+def _heartbeat_lock(folder: Path) -> None:
+    """Refresh this driver's pidfile mtime — "still making progress". Never raises.
+
+    v0.2.101 (S2): called before every handler and between settle passes, so
+    :data:`PIDFILE_STALE_SECONDS` measures the silence of ONE handler, not the
+    length of the whole run. Touches the file ONLY while it names this process:
+    a driver running unlocked (``single_instance=False``, or a lock it could
+    not write) must never refresh another driver's claim — that would keep a
+    dead holder's file looking live.
+    """
+    path = pidfile_path(folder)
+    try:
+        if _read_pidfile(path) == os.getpid():
+            os.utime(path, None)
+    except OSError:
+        pass
 
 
 def _release_lock(path: Optional[Path]) -> None:
@@ -1316,6 +1394,8 @@ def _dispatch_locked(
     #: down backend must not eat the cap three times over.
     attempted: "set[str]" = set()
     for _pass in range(1 if explicit else MAX_SETTLE_PASSES):
+        # S2 heartbeat: a new settle pass is progress (see PIDFILE_STALE_SECONDS).
+        _heartbeat_lock(folder)
         cids = [
             cid for cid in (
                 list(condition_ids) if explicit else owed_condition_ids(folder)
@@ -1440,6 +1520,9 @@ def _dispatch_pass(
         # Recorded BEFORE the handler runs: a crash must still consume its
         # attempt, or the cap can never engage on a handler that always dies.
         record_attempt(folder, RetryResult(cid, STARTED, f"handler {name}"))
+        # S2 heartbeat: the staleness bound covers ONE handler's silence, so
+        # a pass of several hours-long seeds never ages this driver out.
+        _heartbeat_lock(folder)
         result = handler.run(ctx)
         if result.status == RETRIED:
             cleared = condition_cleared(folder, cid)

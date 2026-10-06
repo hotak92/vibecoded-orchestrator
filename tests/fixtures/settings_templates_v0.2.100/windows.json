@@ -16,7 +16,8 @@
       "Bash(mv *)",
       "Bash(cp *)",
       "Bash(git *)",
-      "mcp__weaviate-kg__*"
+      "mcp__weaviate-kg__*",
+      "mcp__search__*"
     ],
     "deny": [
       "Read(./.env)",
@@ -238,128 +239,7 @@
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(cat *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(head *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(tail *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(sed *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(grep *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(rg *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(git show*)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(git grep*)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(git diff*)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(git log*)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(less *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(more *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(diff *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(bat *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(nl *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(awk *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(ag *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(ack *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(egrep *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(fgrep *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Bash(git blame*)"
+            "timeout": 8
           }
         ]
       },
@@ -379,39 +259,8 @@
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-edit-context-inject.ps1\"",
-            "timeout": 10,
+            "timeout": 8,
             "if": "Edit(*)"
-          }
-        ]
-      },
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-write-context-inject.ps1\"",
-            "timeout": 10,
-            "if": "Write(*)"
-          }
-        ]
-      },
-      {
-        "matcher": "Grep",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/grep-context-inject.ps1\"",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Agent|Task",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-brief-kg-inject.ps1\"",
-            "timeout": 10
           }
         ]
       },
@@ -502,6 +351,28 @@
         ]
       },
       {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-edit-outcome.ps1\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-bash-context-record.ps1\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {
@@ -532,25 +403,68 @@
         ]
       },
       {
-        "matcher": "Read",
+        "matcher": "Edit",
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/read-context-inject.ps1\"",
-            "timeout": 10
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-summary-generator.ps1\"",
+            "timeout": 5,
+            "async": true,
+            "if": "Edit(knowledge/**/*.md)"
           }
         ]
       },
       {
-        "matcher": "*",
+        "matcher": "Write",
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-tool-use-async.ps1\"",
-            "timeout": 15,
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-summary-generator.ps1\"",
+            "timeout": 5,
+            "async": true,
+            "if": "Write(knowledge/**/*.md)"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__weaviate-kg__store_knowledge_node",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-summary-generator.ps1\"",
+            "timeout": 5,
             "async": true
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git commit *)",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-git-commit-kg-sync.ps1\"",
+            "timeout": 10,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-file-delete.ps1\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-update-nudge.ps1\"",
+            "async": true,
+            "timeout": 3
+          }
+        ],
+        "matcher": "*"
       },
       {
         "matcher": "mcp__weaviate-kg__hybrid_search|mcp__weaviate-kg__semantic_graph_search|mcp__weaviate-kg__search_code_graph",
