@@ -1204,9 +1204,10 @@ mod tests {
 
         assert_eq!(
             rows.len(),
-            22,
+            24,
             "the cited GLM rows of handoff §7 minus glm-5.2 (owner-retired in \
-             v0.2.100), the four Claude 5 rows, the eight v0.2.96 qwen \
+             v0.2.100), the four Claude 5 rows plus the two 5.5 rows \
+             (v0.2.102, owner-confirmed 2026-10-07), the eight v0.2.96 qwen \
              Token-Plan rows, and the v0.2.102 Kimi Code k3 row"
         );
         // The Kimi Code k3 row (owner ruling 2026-10-07: K3 only, at its
@@ -1244,7 +1245,17 @@ mod tests {
         });
         // The first-party rows: vendor `anthropic`, 1M, cited to Anthropic's
         // docs. They exist for the settings writer's [1m] decoration only.
-        for id in ["claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-sonnet-5"] {
+        // The 5.5 generation (v0.2.102) cites the models-overview index
+        // page — no per-model page exists for it (the claude-fable-5-1
+        // convention); figures confirmed by the owner 2026-10-07.
+        for id in [
+            "claude-fable-5-1",
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+        ] {
             let row = by_id(id);
             assert_eq!(row.vendor, "anthropic", "{}", id);
             assert!(row.window_1m && row.context_window == 1_000_000, "{}", id);
@@ -1270,9 +1281,25 @@ mod tests {
             rows.iter().filter(|r| r.vendor == "qwen").collect();
         assert_eq!(qwen.len(), 8, "the eight Token-Plan rows; no PAYG row exists");
         for row in &qwen {
+            // v0.2.102 (S16-10): qwen3.8-max carries the endpoint's REAL
+            // Claude Code ceiling — 983,616, live-verified by the vendor's
+            // own 400 "Range of input length should be [1, 983616]" and
+            // matching the vendor's CLAUDE_CODE_MAX_CONTEXT_TOKENS. Still
+            // window_1m (983,616 is far above the 200K default); the
+            // gateway's context guard and overflow translation enforce the
+            // delta. The other seven rows keep the cited page's per-model
+            // 1M: only qwen3.8-max is live-verified against the endpoint
+            // config value.
+            let expected_window = if row.model_id == "qwen3.8-max" {
+                983_616
+            } else {
+                1_000_000
+            };
             assert_eq!(
-                row.context_window, 1_000_000,
-                "{}: the vendor's per-model window, not the client default",
+                row.context_window, expected_window,
+                "{}: the vendor's per-model window (or, for qwen3.8-max, \
+                 the live-verified endpoint ceiling), never the client \
+                 default",
                 row.model_id
             );
             assert!(

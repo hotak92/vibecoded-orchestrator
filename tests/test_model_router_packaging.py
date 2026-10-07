@@ -412,10 +412,10 @@ class FreshVenvInstallTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         # 9 GLM rows + the 4 Claude 5 family rows added in v0.2.93 + the 8
-        # Token-Plan rows added in v0.2.96 + the Kimi Code k3 row added in
-        # v0.2.102 (the installed copy must carry the SAME seed the checkout
-        # ships).
-        self.assertEqual(completed.stdout.strip(), "22")
+        # Token-Plan rows added in v0.2.96 + the Kimi Code k3 row and the 2
+        # Claude 5.5 rows added in v0.2.102 (the installed copy must carry
+        # the SAME seed the checkout ships).
+        self.assertEqual(completed.stdout.strip(), "24")
 
     def test_the_console_script_is_installed_and_executable(self) -> None:
         """A declared entry point that produces no runnable file is a promise."""

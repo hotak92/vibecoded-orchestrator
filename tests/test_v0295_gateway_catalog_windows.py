@@ -725,13 +725,40 @@ class ShippedDataInvariantTests(unittest.TestCase):
         )
 
     def test_every_advertised_1m_row_really_resolves_to_1m(self) -> None:
-        """A suffix on a row that is not 1M would make the client budget five
-        times the context the model has — the inverse of the defect the
-        suffix exists to fix, and the more dangerous direction."""
+        """A suffix on a row that is not 1M-CLASS would make the client budget
+        five times the context the model has — the inverse of the defect the
+        suffix exists to fix, and the more dangerous direction.
+
+        Since v0.2.102 "1M-class" is not literally 1,000,000: a row whose
+        cited REAL ceiling sits just under 1M (qwen3.8-max, live-verified
+        983,616 — the vendor's own Claude Code ceiling for the endpoint)
+        still earns the companion, because the client budgeting 1M for it is
+        right to within one small turn, and the gateway's context guard plus
+        overflow translation handle the delta. What can NEVER carry the
+        suffix is a window at or below the client's 200K default — that is
+        the fivefold overstatement, and it fails here."""
+        seed = load_seed()
         for row in self.catalog.entries:
-            if row.id.endswith(ONE_M_SUFFIX):
-                with self.subTest(model=row.id):
-                    self.assertIn("1M context", row.description)
+            if not row.id.endswith(ONE_M_SUFFIX):
+                continue
+            with self.subTest(model=row.id):
+                seed_row = seed.lookup_id(row.id)
+                if seed_row is None:
+                    self.assertIn(
+                        "1M context", row.description,
+                        "an untabulated [1m] row must resolve to a full 1M",
+                    )
+                    continue
+                self.assertTrue(
+                    seed_row.window_1m,
+                    f"{row.id}: the companion is published but the seed row "
+                    "does not flag it",
+                )
+                self.assertGreater(
+                    seed_row.context_window, cat.CLIENT_DEFAULT_WINDOW,
+                    f"{row.id}: a [1m] companion on a default-window model "
+                    "overstates its context fivefold",
+                )
 
     def test_every_1m_model_in_the_shipped_data_is_advertised_as_one(self) -> None:
         """The other direction: a 1M model with no ``[1m]`` row anywhere is a

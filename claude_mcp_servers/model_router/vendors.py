@@ -37,6 +37,7 @@ Two things intentionally live here rather than in ``routing.py``:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -58,6 +59,38 @@ DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 #: The beta header the Claude OAuth route requires. Verified live: without it
 #: an OAuth bearer is rejected; with it the request returns HTTP 200.
 OAUTH_BETA = "oauth-2025-04-20"
+
+#: How the vendor's OWN maximum is read out of a matched context-overflow
+#: message. QwenCloud's refusal states the accepted input range,
+#: ``"Range of input length should be [1, 983616]"`` (live 400, 2026-10-06),
+#: so the second number of the bracketed pair IS the ceiling the client needs
+#: to see. Kept beside :attr:`Vendor.context_overflow_markers` because the
+#: marker finds the message and this reads it — one home for the pair, so a
+#: new vendor's shape lands in the same place its markers do.
+CONTEXT_OVERFLOW_MAX_RE = re.compile(r"\[\s*1\s*,\s*(\d+)\s*\]")
+
+
+def context_overflow_maximum(
+    vendor: "Vendor", body: bytes,
+) -> Optional[int]:
+    """The vendor's real context ceiling out of its NATIVE overflow refusal.
+
+    ``None`` when this body is not one of ``vendor``'s context-overflow
+    refusals (no marker matched, or the range did not parse) — absence means
+    "relay the vendor's own answer untouched", never "guess a ceiling". The
+    detection lives here, data-driven off the row, so a new vendor's shape is
+    a registry change and not a handler edit.
+    """
+    if not vendor.context_overflow_markers:
+        return None
+    text = body.decode("utf-8", "replace")
+    if not any(marker in text for marker in vendor.context_overflow_markers):
+        return None
+    match = CONTEXT_OVERFLOW_MAX_RE.search(text)
+    if match is None:
+        return None
+    maximum = int(match.group(1))
+    return maximum if maximum > 0 else None
 
 
 @dataclass(frozen=True)
@@ -250,6 +283,19 @@ class Vendor:
     short_name: str = ""
     partial_message_start_usage: bool = False
     forward_verified_only: bool = False
+    #: Substrings identifying this vendor's NATIVE context-overflow refusal,
+    #: whatever envelope it arrives in (JSON body, SSE ``event: error``). A
+    #: vendor answers this shape when a request is larger than the model's
+    #: REAL window — the case where the client, budgeting the 1M it assumes
+    #: for any ``[1m]`` id, never compacted and is now stuck retrying a
+    #: request the vendor will always refuse. :func:`server`'s translation
+    #: reads these markers through :func:`context_overflow_maximum` and
+    #: re-emits the refusal as Anthropic's ``prompt is too long`` envelope,
+    #: which the client recognises and recovers from by compacting. EMPTY for
+    #: a vendor whose overflow shape is not documented or captured — an empty
+    #: tuple means "relay verbatim", the behaviour every unlisted vendor had
+    #: before the translation existed.
+    context_overflow_markers: tuple[str, ...] = ()
 
 
 ANTHROPIC_FAMILY = AnthropicFamily(
@@ -381,6 +427,18 @@ VENDORS: Mapping[str, Vendor] = {
         # and no quota headers (probed 2026-09-23), so usage shows the
         # gateway ledger's tokens for the month instead of a percentage.
         short_name="Qwen",
+        # The NATIVE context-overflow refusal, live-captured 2026-10-06 (the
+        # S16-10 incident): a qwen3.8-max subagent past the endpoint's real
+        # ceiling answered HTTP 400 ``InvalidParameter`` with
+        # ``"Range of input length should be [1, 983616]"`` — a shape Claude
+        # Code's error classifier does NOT map to "prompt too long", so its
+        # reactive compaction never fired and the agent was stuck (it had
+        # budgeted 1M for the ``[1m]`` id and the vendor caps at 983,616).
+        # Only the code and message fragments above are from the record; the
+        # envelope around them (``error.code``/``error.message``) is the
+        # compatible-mode shape. Matched on the MESSAGE substring so the
+        # envelope can vary without re-learning the shape.
+        context_overflow_markers=("Range of input length should be",),
         # Live capture 2026-10-03 (parity audit gap 3; fixtures
         # tests/fixtures/model_router/qwen-deepseek-stream.body,
         # qwen-max-stream.body): message_start reports a small non-zero
@@ -733,12 +791,14 @@ __all__ = [
     "ANTHROPIC_FAMILY",
     "AnthropicFamily",
     "CLAUDE_ID_MARKERS",
+    "CONTEXT_OVERFLOW_MAX_RE",
     "DEFAULT_ANTHROPIC_VERSION",
     "GATEWAY_NAMESPACE",
     "OAUTH_BETA",
     "RegistryError",
     "VENDORS",
     "Vendor",
+    "context_overflow_maximum",
     "validate_registry",
     "vendor_display_name",
 ]

@@ -422,6 +422,32 @@ class ContextTable:
         if row is not None and row.context_window > 0:
             return AssumedWindow(row.context_window, ASSUMED_FROM_TABLE)
 
+        best = self.older_sibling_floor(model_id)
+        if best is not None:
+            return AssumedWindow(
+                best.context_window, ASSUMED_FROM_FAMILY, best.model_id,
+            )
+        return AssumedWindow(UNKNOWN_FAMILY_WINDOW, ASSUMED_FLOOR)
+
+    def older_sibling_floor(self, model_id: str) -> Optional[ModelContext]:
+        """The highest-window STRICTLY-OLDER sibling of ``model_id``'s family.
+
+        The table-only family floor, extracted from :meth:`assume_window`
+        because a second caller now needs the same scan: the usage ledger's
+        ``window_actual`` (:func:`model_router.server._actual_window`) feeds
+        this row to :func:`model_router.catalog.resolve_window` as the family
+        floor, so a first-party id the seed has not tabulated yet (a model
+        that shipped after the last seed edit) inherits its predecessor's
+        window exactly as the picker's own floor rule would give it — without
+        building a catalog, which must never happen on the request path.
+
+        Same restrictions as :meth:`assume_window`'s step 2, because they are
+        that step: same family stem, strictly older version, a positive
+        window, tombstoned rows excluded (via :meth:`_known_rows`), and — when
+        the id carries a vendor namespace — only that vendor's rows.
+        ``None`` when no sibling qualifies.
+        """
+        parts = parse_model_id(model_id)
         vendor, _remainder = split_namespace(model_id, VENDORS)
         vendor_id = vendor.vendor_id if vendor is not None else None
         best: Optional[ModelContext] = None
@@ -443,11 +469,7 @@ class ContextTable:
                 )
             ):
                 best = candidate
-        if best is not None:
-            return AssumedWindow(
-                best.context_window, ASSUMED_FROM_FAMILY, best.model_id,
-            )
-        return AssumedWindow(UNKNOWN_FAMILY_WINDOW, ASSUMED_FLOOR)
+        return best
 
     def _known_rows(self) -> tuple[ModelContext, ...]:
         """Every row a lookup could answer with: export first, seed behind it.

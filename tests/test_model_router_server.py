@@ -107,7 +107,11 @@ class _Upstream:
         ]
 
     def app(self) -> web.Application:
-        app = web.Application()
+        # ``client_max_size=0`` (unbounded), matching the gateway under test:
+        # the context-guard tests relay multi-MB bodies through this stub,
+        # and aiohttp's 1 MiB default would answer them 413 before the test
+        # ever saw the gateway's own decision.
+        app = web.Application(client_max_size=0)
         app.router.add_get("/v1/models", self._models)
         app.router.add_post("/v1/messages", self._messages)
         app.router.add_post("/v1/messages/count_tokens", self._messages)

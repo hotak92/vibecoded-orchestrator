@@ -360,6 +360,26 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(plain.pct_client, 50.0)
         self.assertEqual(suffixed.pct_client, 10.0)
 
+    def test_the_clients_own_1m_beta_budgets_1m_without_the_suffix(self) -> None:
+        """Claude Code resolves the ``[1m]`` suffix itself and signals the
+        window with the ``anthropic-beta`` header instead — the ledger must
+        read that spelling too, or every ordinary 1M turn is recorded against
+        a 200K budget (v0.2.102: a live row showed context_after 791K on a
+        "200K" window)."""
+        beta_only = U.build_record(
+            session="s", agent=None, parent_agent=None,
+            requested="claude-opus-5", route="anthropic",
+            forward="claude-opus-5", stream=True, status=200,
+            totals={name: 0 for name in U.USAGE_FIELDS},
+            usage_complete=True, window_actual=None, window_source="unknown",
+            one_m_client=True,
+        )
+        self.assertEqual(beta_only.window_client, U.CLIENT_WINDOW_1M)
+        # Without either signal the plain 200K arithmetic still holds — the
+        # flag only WIDENS, so the two detections cannot contradict.
+        plain = self._record("claude-opus-5", input_tokens=1)
+        self.assertEqual(plain.window_client, U.CLIENT_WINDOW_DEFAULT)
+
     def test_an_unknown_actual_window_reports_null_not_zero(self) -> None:
         """0% would read as "plenty of room", which is the one wrong answer
         that costs the user something."""
@@ -912,6 +932,88 @@ class UsageThroughTheGatewayTests(GatewayTestBase):
         self.assertEqual(row["requested"], "claude-gw/glm-5.3[1m]")
         self.assertEqual(row["window_client"], 1_000_000)
         self.assertEqual(row["input_tokens"], 2048)
+
+    async def test_the_clients_1m_beta_header_budgets_1m_on_every_route(self) -> None:
+        """The header spelling of the same request: no suffix anywhere, the
+        window signalled by ``anthropic-beta`` — which the client sends for
+        vendor ids exactly as for first-party ones, so both routes must read
+        it. Without suffix and without beta the budget stays 200K."""
+        for chat, model, extra in (
+            # vendor route, client's own beta
+            ("chat-P", "claude-gw/glm-5.3", {"anthropic-beta": "context-1m-2025-08-07"}),
+            # first-party route, client's own beta
+            ("chat-Q", "claude-opus-5", {"anthropic-beta": "context-1m-2025-08-07"}),
+        ):
+            self.vendor_up.stream_chunks = [VENDOR_STREAM]
+            self.anthropic_up.stream_chunks = [ANTHROPIC_STREAM]
+            resp = await self.client.post(
+                "/v1/messages", headers=self.chat(chat, **extra),
+                json={"model": model, "messages": [], "stream": True},
+            )
+            await resp.read()
+            row = (await self.rows())[-1]
+            self.assertEqual(
+                row["window_client"], 1_000_000,
+                f"{model}: the client's own beta must budget 1M",
+            )
+
+        # Neither signal: the plain 200K budget, so the beta detection is a
+        # detection and not an always-1M default.
+        self.vendor_up.stream_chunks = [VENDOR_STREAM]
+        resp = await self.client.post(
+            "/v1/messages", headers=self.chat("chat-R"),
+            json={"model": "claude-gw/glm-5.3", "messages": [], "stream": True},
+        )
+        await resp.read()
+        row = (await self.rows())[-1]
+        self.assertEqual(row["window_client"], 200_000)
+        self.assertEqual(row["pct_client"], round(row["context_after"] * 100.0 / 200_000, 1))
+
+    async def test_the_gateway_added_beta_is_not_read_as_the_clients_choice(self) -> None:
+        """The suffix makes the GATEWAY add ``context-1m`` upstream; the row
+        must key on the client's own signal (the suffix here) and the tokens
+        are untouched either way — one detection, no double count."""
+        self.anthropic_up.stream_chunks = [ANTHROPIC_STREAM]
+        resp = await self.client.post(
+            "/v1/messages", headers=self.chat("chat-S"),
+            json={"model": "claude-opus-5[1m]", "messages": [], "stream": True},
+        )
+        await resp.read()
+        row = (await self.rows())[-1]
+        self.assertEqual(row["window_client"], 1_000_000)
+        self.assertEqual(row["input_tokens"], 1200)
+        self.assertEqual(row["output_tokens"], 450)
+        self.assertEqual(row["pct_client"], round(row["context_after"] * 100.0 / 1_000_000, 1))
+
+    async def test_an_untabulated_first_party_id_inherits_its_familys_window(self) -> None:
+        """``window_actual`` for a Claude id the seed has no row for: the
+        table-only family floor answers — the picker's own inheritance rule,
+        without a catalog fetch — instead of the ``null`` every such row read
+        before v0.2.102. ``claude-opus-5-6`` is the untabulated case since
+        the 5.5 generation gained rows of its own."""
+        self.anthropic_up.stream_chunks = [ANTHROPIC_STREAM]
+        resp = await self.client.post(
+            "/v1/messages", headers=self.chat("chat-U"),
+            json={"model": "claude-opus-5-6", "messages": [], "stream": True},
+        )
+        await resp.read()
+        row = (await self.rows())[-1]
+        # Two 1M older siblings tie; the deterministic tie-break names the
+        # lower id, so the floor's model_id is claude-opus-5.
+        self.assertEqual(row["window_source"], "inherited:claude-opus-5")
+        self.assertEqual(row["window_actual"], 1_000_000)
+        self.assertIsNotNone(row["pct_actual"])
+
+        # A TABULATED 5.5 id answers from its own row, not the floor.
+        self.anthropic_up.stream_chunks = [ANTHROPIC_STREAM]
+        resp = await self.client.post(
+            "/v1/messages", headers=self.chat("chat-U2"),
+            json={"model": "claude-opus-5-5", "messages": [], "stream": True},
+        )
+        await resp.read()
+        row = (await self.rows())[-1]
+        self.assertEqual(row["window_source"], "table")
+        self.assertEqual(row["window_actual"], 1_000_000)
 
     async def test_the_actual_window_comes_from_the_catalog_resolver(self) -> None:
         """A table row answers; a model nobody tabulated reads unknown rather

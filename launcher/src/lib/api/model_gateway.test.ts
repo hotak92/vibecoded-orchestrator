@@ -649,9 +649,9 @@ describe('describeAgentDelivery keeps the tri-state', () => {
 });
 
 describe('describeHeldVendors restates the per-vendor key leg (v0.2.102)', () => {
-  const g = (vendor_keys: unknown) => ({
+  const g = (vendor_keys: unknown, configured: boolean | null = true) => ({
     machine_signal: {
-      configured: true,
+      configured,
       registration: 'running',
       panel: 'pointed',
       reason: 'r',
@@ -661,6 +661,13 @@ describe('describeHeldVendors restates the per-vendor key leg (v0.2.102)', () =>
     agent_id_problems: null,
     vendor_keys,
   }) as Parameters<typeof describeHeldVendors>[0];
+  const heldKeys = {
+    kimi: {
+      resolves: false,
+      reason: "no 'kimi' vendor key resolved",
+      definitions: ['kimi-implementer', 'kimi-reviewer'],
+    },
+  };
   it('a vendor whose key does not resolve names its held definitions', () => {
     const line = describeHeldVendors(
       g({
@@ -688,6 +695,18 @@ describe('describeHeldVendors restates the per-vendor key leg (v0.2.102)', () =>
     expect(describeHeldVendors(g(undefined))).toBeNull();
     expect(describeHeldVendors(g(null))).toBeNull();
     expect(describeHeldVendors(null)).toBeNull();
+  });
+  it('a machine whose gate is closed (configured !== true) → no line, however many keys are held', () => {
+    // The module gate holds back EVERY definition on such a machine,
+    // regardless of keys, so the line's remedy ("add the key and update
+    // the bundle") would never be honoured — describeAgentDelivery owns
+    // saying the gate is closed.
+    expect(describeHeldVendors(g(heldKeys, false))).toBeNull();
+    expect(describeHeldVendors(g(heldKeys, null))).toBeNull();
+    // The open gate still names the held vendor (the regression arm).
+    expect(describeHeldVendors(g(heldKeys, true))?.label).toBe(
+      'agent definitions held back: kimi',
+    );
   });
 });
 

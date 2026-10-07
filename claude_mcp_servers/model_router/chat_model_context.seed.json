@@ -74,12 +74,12 @@
     },
     "qwen3.8-max": {
       "vendor": "qwen",
-      "context_window": 1000000,
+      "context_window": 983616,
       "max_output": 128000,
       "window_1m": true,
       "text_only": false,
       "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
-      "source_note": "Window and output are the vendor's PER-MODEL figures on the cited page. The 200000 this row carried until v0.2.98 came from the Claude Code integration page's sentence about the CLIENT's default window, which is not a per-model spec; that citation is gone. The vendor writes output as '128k'/'64k' without expanding it — its DeepSeek '384k' expands to 393,216 (= 384*1024) — so the decimal readings are the non-overstating choice. The same vendor's Claude Code config for this endpoint sets CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616 (1,000,000 - 16,384) with no stated rationale, but VCO writes no such knob (docs/CONFIGURATION.md, 'Panel mode'), so the 1M here is the documented model window. (Qwen3.8 table.) text_only=false: QwenCloud's Vision page (developer-guides/multimodal/vision) uses qwen3.8-max throughout its image_url / video / MultiModalConversation examples, so it accepts image input; image blocks are forwarded untouched."
+      "source_note": "Window 983616 is the endpoint's REAL Claude Code ceiling, not the page's architectural 1M: the vendor's own Claude Code config for this endpoint sets CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616 (1,000,000 - 16,384), and a live request above it (2026-10-06, 983,981 ledger tokens) was refused HTTP 400 InvalidParameter with 'Range of input length should be [1, 983616]'. Figure history, so a future editor does not 'correct' the row backwards: until v0.2.98 this row read 200000 — the Claude Code integration page's sentence about the CLIENT's default window, which is not a per-model spec; v0.2.98 moved it to the vendor's per-model 1M on the cited page; v0.2.102 (S16-10) moved it to the live-verified ceiling above. window_1m stays true: 983,616 is far above the 200K the client would otherwise budget, so it still earns the [1m] companion, and the gateway's context guard plus the overflow translation enforce the 16,384 the client over-budgets. VCO itself writes no CLAUDE_CODE_MAX_CONTEXT_TOKENS knob (docs/CONFIGURATION.md, 'Panel mode'). The other QwenCloud rows keep the cited page's 1M: the config value is stated for the endpoint as a whole but only this model is live-verified against it, and the guard protects the rest. max_output 128000 and text_only=false unchanged (Qwen3.8 table; Vision page uses qwen3.8-max throughout its image_url / video examples, so it accepts image input)."
     },
     "qwen3.8-flash": {
       "vendor": "qwen",
@@ -173,6 +173,22 @@
       "window_1m": true,
       "source": "https://platform.claude.com/docs/en/models/opus-5/overview.md",
       "source_note": "First-party row; its own per-model page is cited. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
+    },
+    "claude-opus-5-5": {
+      "vendor": "anthropic",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "source_note": "Citation is the Anthropic models-OVERVIEW index page on platform.claude.com: no per-model page for this model is published, so the index page is cited and named as such (the same convention as claude-fable-5-1). The 1M window / 128K output figures are its 5.0 sibling's (claude-opus-5 / claude-sonnet-5, own per-model pages) and were confirmed for the 5.5 generation by the owner, 2026-10-07. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
+    },
+    "claude-sonnet-5-5": {
+      "vendor": "anthropic",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "source_note": "Citation is the Anthropic models-OVERVIEW index page on platform.claude.com: no per-model page for this model is published, so the index page is cited and named as such (the same convention as claude-fable-5-1). The 1M window / 128K output figures are its 5.0 sibling's (claude-opus-5 / claude-sonnet-5, own per-model pages) and were confirmed for the 5.5 generation by the owner, 2026-10-07. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
     },
     "claude-sonnet-5": {
       "vendor": "anthropic",
