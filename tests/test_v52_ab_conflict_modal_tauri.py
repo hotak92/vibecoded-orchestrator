@@ -279,10 +279,19 @@ class RustTauriCommandsTests(unittest.TestCase):
             self._function_body(git_cmd, "pub(crate) fn git_network_command("),
             "git_network_command must apply .silent()",
         )
+        # v0.2.102 W2-C (NB-R5): run_git resolves the program ONCE per attempt and
+        # builds through `run_git_command_with(program, …)`, which uses the
+        # network constructor (`.silent()` + kill_on_drop for the timeout).
         self.assertIn(
-            "git_command()",
-            self._function_body(git_cmd, "fn run_git_command("),
-            "run_git_command must build its command through git_command()",
+            "git_network_command(program)",
+            self._function_body(git_cmd, "fn run_git_command_with("),
+            "run_git_command_with must build its command through "
+            "git_network_command() (which applies .silent())",
+        )
+        self.assertIn(
+            "run_git_with(&git_program()",
+            self._function_body(git_cmd, "pub(crate) async fn run_git("),
+            "run_git must resolve the program through git_program()",
         )
         # v0.2.100 WP-05: the raw runners build through `raw_git_command`
         # (adds kill_on_drop for network verbs), which calls git_command().
@@ -296,7 +305,10 @@ class RustTauriCommandsTests(unittest.TestCase):
             self.assertTrue(
                 "git_command()" in body or "run_git_command(" in body
                 or "raw_git_command(" in body
-                or "git_network_command(" in body,  # WP-05: silent + kill_on_drop
+                or "git_network_command(" in body  # WP-05: silent + kill_on_drop
+                # v0.2.102 NB-R5: run_git -> run_git_with -> run_git_command_with
+                # -> git_network_command (asserted above).
+                or "run_git_with(" in body,
                 f"{runner} must build its command through git_command()",
             )
         self.assertNotIn(
