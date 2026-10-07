@@ -11782,7 +11782,8 @@ MemAvailable:   23456789 kB
         // `migrate_github_pat_audit_log_records_file_removed_false` with a bare
         // `assert!(report.migrated)`. Root cause: every keychain op runs on ONE
         // worker thread with a 10s caller-side bound (`KEYCHAIN_OP_TIMEOUT` in
-        // vct-launcher-core::secrets) and fast-fails with `WorkerStuck` while a
+        // vct-launcher-core::secrets_worker, re-exported by `secrets`) and
+        // fast-fails with `WorkerStuck` while a
         // prior op is wedged — under load a delete or set can fail there. The
         // old `delete_keychain()` swallowed delete errors (`let _ =`), so a
         // failed CLEANUP delete left residue that the NEXT test's migration
