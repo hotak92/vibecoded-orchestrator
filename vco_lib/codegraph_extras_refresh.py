@@ -32,6 +32,16 @@ the turn. For each ENABLED extra path of the calling project it:
 Every decision is one line in ``<project>/.claude/logs/codegraph_extras_refresh.log``
 (size-capped). Exit status is always 0.
 
+v0.2.102 S16-7 adds two more entries (same module, same CLI):
+``--queued`` drains the per-extra edit queues
+(``codegraph_drain_extra_<md5>_<sid>.txt``) the routing hooks fill when a
+code file under an ENABLED extra path is written — a scoped
+``--only-files-from`` analyzer run with the extra's own collection args, so
+an extra-path edit is re-indexed as promptly as a primary-root one;
+``--list-enabled-extra-paths`` prints the membership list the hooks cache
+under ``.claude/state/codegraph_extra_paths_cache.txt`` (refreshed on a TTL
+or when launcher.db changes — never a per-edit DB read).
+
 Rust counterparts (MUST MATCH, both assert
 ``tests/fixtures/codegraph_extra_sync_argv.json``):
 ``vct_launcher_core::db::codegraph_extras::{extra_path_sync_args,
@@ -228,6 +238,240 @@ def record_indexed(project_id: str, path: str, commit: str, res: AnalyzerResult)
     return False, f"hub answered {resp.status_code}: {resp.text[:200]}"
 
 
+# ── v0.2.102 S16-7: the membership list + the per-edit queued drain ────────
+
+
+def list_enabled_extra_paths(project_root: str, *, resolve: Optional[Callable] = None) -> list[str]:
+    """Absolute paths of the project's ENABLED extra code-graph paths.
+
+    This is the membership list the edit-routing hooks
+    (``templates/hooks/_lib/route-touched-path.{sh,ps1}``) cache under
+    ``.claude/state/codegraph_extra_paths_cache.txt`` — they refresh the cache
+    through the ``--list-enabled-extra-paths`` CLI rather than resolving per
+    edit. Raises whatever the resolver raises (hub down / project
+    unregistered): the caller keeps its stale cache on a failure exit.
+    """
+    if resolve is None:
+        from vco_lib import project_config
+
+        resolve = project_config.resolve
+    cfg = resolve(project_root)
+    return [e.path for e in getattr(cfg, "code_graph_extra_paths", ()) if getattr(e, "enabled", False)]
+
+
+def refresh_queued(
+    project_root: str,
+    analyzer: str,
+    python: str,
+    state_dir: Path,
+    log: Callable[[str], None],
+    *,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    deps: Optional[Deps] = None,
+) -> dict[str, str]:
+    """Drain the per-extra edit queues (``codegraph_drain_extra_<md5>_<sid>.txt``).
+
+    v0.2.102 S16-7: a Write/Edit/Bash-written code file under an ENABLED extra
+    path is queued by the routing hooks for a prompt re-index; the Stop hook
+    spawns this entry (``--queued``) DETACHED. Each queued path is analyzed
+    with the extra's OWN collection args (:func:`build_extra_sync_argv`, the
+    one argv builder) in scoped ``--only-files-from`` mode — never under the
+    primary root's collection.
+
+    Throttle intent kept: the commit-stamp path's per-path ``--min-interval``
+    protects the analyzer from repeated FULL walks; a queued scoped drain is
+    cheap, so NEITHER the 120 s primary-drain window NOR the per-path extras
+    throttle applies here. The per-path ``codegraph_drain_root_<md5>.lock``
+    DOES apply (it serialises every analyzer run over the same checkout);
+    when held, the lines are put back on the queue for a later drain.
+
+    The commit is deliberately NOT recorded: an ``--only-files-from`` walk
+    does not run the deleted-file prune an incremental ``--since-commit``
+    pass would, so ``last_indexed_commit`` stays owned by the commit-stamp
+    path (:func:`refresh_extras`) and the panel's staleness badge. Returns
+    ``{path: outcome}``. Never raises.
+    """
+    if deps is None:
+        from vco_lib import project_config
+
+        deps = Deps(resolve=project_config.resolve)
+    outcomes: dict[str, str] = {}
+    try:
+        cfg = deps.resolve(project_root)
+    except Exception as exc:  # noqa: BLE001 — hub down/unregistered: queues persist
+        log(f"queued: skip project={project_root}: config unavailable ({exc})")
+        return outcomes
+    prefix = getattr(cfg, "code_graph_collection_prefix", "")
+    extras = [e for e in getattr(cfg, "code_graph_extra_paths", ()) if getattr(e, "enabled", False)]
+    if not prefix:
+        log(f"queued: skip project={project_root}: no code-graph prefix")
+        return outcomes
+
+    for extra in extras:
+        path = extra.path
+        key = path_key(path)
+        try:
+            queues = sorted(state_dir.glob(f"codegraph_drain_extra_{key}_*.txt"))
+        except OSError:
+            queues = []
+        if not queues:
+            continue
+        # Consume every session's queue for this extra by atomic rename, so a
+        # concurrent append starts a fresh queue (same contract as the
+        # primary drain's consume step).
+        asides: list[Path] = []
+        lines: list[str] = []
+        for q in queues:
+            aside = q.with_name(f"{q.name}.draining.{os.getpid()}")
+            try:
+                q.rename(aside)
+            except OSError:
+                continue
+            asides.append(aside)
+            try:
+                lines.extend(aside.read_text(encoding="utf-8").splitlines())
+            except OSError:
+                pass
+        # Dedup (first-seen order) + keep only files provably under THIS extra
+        # path; drop transient scratch the same way the primary drain does.
+        prefix_slash = path.rstrip("/") + "/"
+        seen: set[str] = set()
+        files: list[str] = []
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln in seen:
+                continue
+            seen.add(ln)
+            if not ln.startswith(prefix_slash):
+                continue
+            if "/.claude/state/" in ln:
+                continue
+            files.append(ln)
+        if not files:
+            outcomes[path] = "empty"
+            for a in asides:
+                try:
+                    a.unlink()
+                except OSError:
+                    pass
+            continue
+
+        lock = state_dir / f"codegraph_drain_root_{key}.lock"
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            lock.mkdir()
+        except FileExistsError:
+            outcomes[path] = "busy"
+            _restore_extra_queue(state_dir, key, files)
+            log(f"queued: busy path={path}: another analyzer run holds the lock; queue restored")
+            continue
+        except OSError as exc:
+            outcomes[path] = "lock_error"
+            _restore_extra_queue(state_dir, key, files)
+            log(f"queued: skip path={path}: cannot create lock ({exc}); queue restored")
+            continue
+        list_file = state_dir / f"codegraph_drain_extra-files-{key}.txt"
+        try:
+            try:
+                (lock / "pid").write_text(str(os.getpid()), encoding="utf-8")
+                list_file.write_text("\n".join(files) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            argv = build_extra_sync_argv(path, prefix, False, None) + [
+                "--only-files-from", str(list_file),
+            ]
+            log(f"queued: drain path={path} prefix={prefix} files={len(files)}")
+            res = deps.run_analyzer(python, analyzer, argv, timeout)
+            if not res.ok:
+                outcomes[path] = "analyzer_failed"
+                _restore_extra_queue(state_dir, key, files)
+                log(f"queued: FAILED path={path}: {res.reason}; queue restored, commit not recorded")
+                continue
+            outcomes[path] = "drained"
+            log(
+                f"queued: done path={path} files={res.files_analyzed} "
+                f"entities={res.entities_indexed} ms={res.duration_ms} "
+                "(commit not recorded: the commit-stamp refresh owns last_indexed_commit)"
+            )
+        finally:
+            for a in asides:
+                try:
+                    a.unlink()
+                except OSError:
+                    pass
+            try:
+                list_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                (lock / "pid").unlink(missing_ok=True)
+                lock.rmdir()
+            except OSError:
+                pass
+
+    # ── GC (v0.2.102 fix-round L-A4) ───────────────────────────────────────
+    # A queue written just before its extra was disabled/removed in the
+    # launcher is never consumed by the loop above (which iterates CURRENT
+    # enabled extras) and would sit under .claude/state/ forever, retriggering
+    # the Stop-hook spawn on every turn. Remove those orphans and say so in
+    # the log. Safety rails:
+    #   * reached ONLY when the hub config resolved (an unreachable hub
+    #     returns above, before any deletion);
+    #   * a queue whose key belongs to a CURRENTLY-ENABLED extra is never
+    #     touched (a `_restored` retry file included);
+    #   * names that are not per-extra queues (the transient
+    #     `codegraph_drain_extra-files-<key>.txt` analyzer input, anything
+    #     unparsable) are left alone — except the pre-fix-round-2 legacy
+    #     transient `codegraph_drain_extra_list_<key>.txt`, which is GC'd so
+    #     a killed mid-drain leftover stops triggering no-op Stop spawns.
+    enabled_keys = {path_key(e.path) for e in extras}
+    try:
+        strays = sorted(state_dir.glob("codegraph_drain_extra_*.txt"))
+    except OSError:
+        strays = []
+    prefix_len = len("codegraph_drain_extra_")
+    for stray in strays:
+        name = stray.name
+        if name.startswith("codegraph_drain_extra_list_"):
+            try:
+                stray.unlink()
+                log(f"queued: gc stale analyzer input {name} (legacy transient name)")
+            except OSError:
+                pass
+            continue
+        key = name[prefix_len:prefix_len + 32]
+        is_queue = (
+            len(key) == 32
+            and all(c in "0123456789abcdef" for c in key)
+            and len(name) > prefix_len + 32
+            and name[prefix_len + 32] == "_"
+        )
+        if not is_queue or key in enabled_keys:
+            continue
+        try:
+            stray.unlink()
+            log(f"queued: gc orphan queue={name} (extra removed or disabled)")
+        except OSError:
+            pass
+    return outcomes
+
+
+def _restore_extra_queue(state_dir: Path, key: str, files: list[str]) -> None:
+    """Put undrained lines back on a per-extra queue (busy / analyzer failure).
+
+    Uses the ``_restored`` session slot — the drain globs
+    ``codegraph_drain_extra_<key>_*.txt``, so the next Stop picks them up.
+    """
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with (state_dir / f"codegraph_drain_extra_{key}_restored.txt").open(
+            "a", encoding="utf-8"
+        ) as fh:
+            fh.write("\n".join(files) + "\n")
+    except OSError:
+        pass
+
+
 # ── The driver ───────────────────────────────────────────────────────────
 
 
@@ -335,15 +579,50 @@ def refresh_extras(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m vco_lib.codegraph_extras_refresh")
     ap.add_argument("--project-root", required=True)
-    ap.add_argument("--analyzer", required=True)
+    # Optional only because --list-enabled-extra-paths never runs the analyzer;
+    # the two run modes validate its presence below.
+    ap.add_argument("--analyzer", default=None)
     ap.add_argument("--state-dir", default=None)
     ap.add_argument("--min-interval", type=int, default=None)
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    ap.add_argument(
+        "--queued", action="store_true",
+        help="v0.2.102 S16-7: drain the per-extra edit queues "
+             "(codegraph_drain_extra_<md5>_<sid>.txt) instead of the commit-stamp check",
+    )
+    ap.add_argument(
+        "--list-enabled-extra-paths", action="store_true",
+        help="print the project's ENABLED extra paths (one per line) for the "
+             "routing hooks' membership cache, then exit; exits 3 when the "
+             "config cannot be resolved so the caller keeps its stale cache",
+    )
     args = ap.parse_args(argv)
 
     root = Path(args.project_root)
+
+    if args.list_enabled_extra_paths:
+        try:
+            for p in list_enabled_extra_paths(str(root)):
+                print(p)
+        except Exception as exc:  # noqa: BLE001 — caller keeps its stale cache
+            print(f"list-enabled-extra-paths: config unavailable: {exc}", file=sys.stderr)
+            return 3
+        return 0
+
+    if not args.analyzer:
+        ap.error("--analyzer is required unless --list-enabled-extra-paths is given")
+
     state_dir = Path(args.state_dir) if args.state_dir else root / ".claude" / "state"
     log = RunLog(root / ".claude" / "logs" / LOG_NAME)
+    if args.queued:
+        try:
+            refresh_queued(
+                str(root), args.analyzer, sys.executable, state_dir, log,
+                timeout=args.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 — detached child: log, never raise
+            log(f"queued: ERROR unexpected: {exc!r}")
+        return 0
     min_interval = args.min_interval
     if min_interval is None:
         raw = os.environ.get("VCO_CODEGRAPH_EXTRAS_MIN_INTERVAL_SECONDS", "")

@@ -357,6 +357,167 @@ if ((`$null -eq `$lvl) -or ((([string]`$lvl).Trim()) -eq 'write')) { $SyncExpr }
 }
 
 
+# --- v0.2.102 S16-7: enabled-extra-path membership (cached list, option B) ---
+# MUST MATCH _lib/route-touched-path.sh's block of the same name. A code file
+# under an ENABLED extra code-graph path goes to a PER-EXTRA queue
+# (codegraph_drain_extra_<md5(extra)>_<session>.txt), never the primary
+# queue; the Stop hook drains it via `vco_lib.codegraph_extras_refresh
+# --queued`. The membership decision is computed by Python (the hub /config
+# resolver) and cached as a plain table both shells read -- option B of the
+# A>B>C rule, because this runs PER EDIT and the list changes only on a
+# launcher-GUI extras toggle.
+#   cache : .claude/state/codegraph_extra_paths_cache.txt (one path per line)
+#   stale : missing, older than VCO_CODEGRAPH_EXTRAS_LIST_TTL_SECONDS
+#           (default 300), or older than launcher.db
+# A failed refresh keeps the stale cache; no cache at all -> nothing routes
+# to the extra queues (the commit-stamp refresh at Stop still re-indexes).
+$script:VcoRouteExtrasCacheName = "codegraph_extra_paths_cache.txt"
+
+function Get-VcoRouteExtrasDbPath {
+    if ($Env:VCT_LAUNCHER_DB_PATH) { return $Env:VCT_LAUNCHER_DB_PATH }
+    $stateRoot = $null
+    if ($Env:VCT_STATE_DIR) { $stateRoot = $Env:VCT_STATE_DIR }
+    elseif ($Env:USERPROFILE) { $stateRoot = Join-Path $Env:USERPROFILE ".vct" }
+    elseif ($Env:HOME) { $stateRoot = Join-Path $Env:HOME ".vct" }
+    if (-not $stateRoot) { return "" }
+    return (Join-Path $stateRoot "launcher.db")
+}
+
+# $true when the cache is STALE (missing / TTL-expired / older than
+# launcher.db), $false when fresh. Soft-fail biases to "stale".
+function Test-VcoRouteExtrasCacheStale {
+    param([string]$Cache)
+    if (-not (Test-Path -LiteralPath $Cache)) { return $true }
+    $ttl = 300
+    if ($Env:VCO_CODEGRAPH_EXTRAS_LIST_TTL_SECONDS -match '^\d+$') {
+        $ttl = [int]$Env:VCO_CODEGRAPH_EXTRAS_LIST_TTL_SECONDS
+    }
+    try { $cacheItem = Get-Item -LiteralPath $Cache -ErrorAction Stop } catch { return $true }
+    $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [DateTimeOffset]::new($cacheItem.LastWriteTimeUtc).ToUnixTimeSeconds()
+    if ($age -ge $ttl) { return $true }
+    $db = Get-VcoRouteExtrasDbPath
+    if (Test-Path -LiteralPath $db) {
+        try {
+            $dbItem = Get-Item -LiteralPath $db -ErrorAction Stop
+            if ($dbItem.LastWriteTimeUtc -gt $cacheItem.LastWriteTimeUtc) { return $true }
+        } catch { }
+    }
+    return $false
+}
+
+# Best-effort cache rewrite through the ONE Python lister. Never throws: a
+# non-zero CLI exit (hub down / unregistered) leaves any previous cache.
+function Update-VcoRouteExtrasCache {
+    param([string]$Cache)
+    $venvPy = Resolve-VcoVenvPython -ScriptDir $script:VcoRouteHooksDir
+    if (-not $venvPy) { return }
+    $tmp = "$Cache.tmp.$PID"
+    try {
+        $out = & $venvPy -m vco_lib.codegraph_extras_refresh `
+            --list-enabled-extra-paths --project-root $script:VcoRouteProjectRoot 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Set-Content -LiteralPath $tmp -Value ($out -join "`n") -Encoding utf8 -ErrorAction Stop
+            Move-Item -LiteralPath $tmp -Destination $Cache -Force -ErrorAction Stop
+        } else {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Resolve symlinks component-by-component (the .sh sibling's `cd -P`
+# equivalent, v0.2.102 L-A2): registration canonicalises extras via
+# dunce::canonicalize, but the touched path arrives as the editor wrote it;
+# an edit through a symlinked directory must still prefix-match. Pure .NET,
+# no subprocess; on any failure returns the input unchanged.
+function Resolve-VcoRoutePhysicalPath {
+    param([string]$Path)
+    try {
+        $dir = [System.IO.Path]::GetDirectoryName($Path)
+        if (-not $dir) { return $Path }
+        $leaf = [System.IO.Path]::GetFileName($Path)
+        $root = [System.IO.Path]::GetPathRoot($dir)
+        if (-not $root) { return $Path }
+        $cur = $root
+        $rel = $dir.Substring($root.Length)
+        foreach ($seg in $rel.Split([System.IO.Path]::DirectorySeparatorChar, [StringSplitOptions]::RemoveEmptyEntries)) {
+            $cur = Join-Path $cur $seg
+            $di = [System.IO.DirectoryInfo]::new($cur)
+            if ($di.LinkTarget) {
+                $t = $di.ResolveLinkTarget($true)
+                if ($t) { $cur = $t.FullName }
+            }
+        }
+        return (Join-Path $cur $leaf)
+    } catch { return $Path }
+}
+
+# Route a code edit under an ENABLED extra path to its per-extra drain queue:
+# appends the PHYSICAL path to codegraph_drain_extra_<md5(extra)>_<session>.txt
+# and returns that queue path; returns $null (caller then uses the primary
+# queue) when the edit is not under any enabled extra.
+#
+# v0.2.102 fix-round (M-A1) precedence, MUST MATCH route-touched-path.sh:
+#   1. PRIMARY-ROOT CONTAINMENT WINS -- an edit inside the project root always
+#      goes to the primary queue, even when a registered extra is an ANCESTOR
+#      of the root (registration rejects ancestor extras too, but a pre-fix
+#      row can still be on disk).
+#   2. Among extras the LONGEST matching prefix wins -- nested extras route to
+#      the inner one regardless of cache order.
+#   3. Matching is on the SYMLINK-RESOLVED path; trailing separators on the
+#      cache line are ignored for the match but the RAW line is hashed (the
+#      queue name must equal vco_lib.path_key(row.path), trailing slash and
+#      all, or the Python drain's glob never finds it).
+function Add-VcoRouteExtraQueue {
+    param([string]$Path, [string]$SessionId)
+    $stateDir = Join-Path (Join-Path $script:VcoRouteProjectRoot ".claude") "state"
+
+    # 1. Primary-root containment wins -- checked on the resolved path so a
+    # symlinked route INTO the root also lands in the primary queue.
+    $resolved = Resolve-VcoRoutePhysicalPath -Path $Path
+    $projSep = $script:VcoRouteProjectRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if ($resolved.StartsWith($projSep, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+
+    $cache = Join-Path $stateDir $script:VcoRouteExtrasCacheName
+    if (Test-VcoRouteExtrasCacheStale -Cache $cache) {
+        if (-not (Test-Path -LiteralPath $stateDir)) {
+            New-Item -ItemType Directory -Path $stateDir -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        Update-VcoRouteExtrasCache -Cache $cache
+    }
+    if (-not (Test-Path -LiteralPath $cache)) { return $null }
+    $lines = @()
+    try { $lines = @(Get-Content -LiteralPath $cache -ErrorAction Stop) } catch { return $null }
+    # 2. Longest matching prefix wins.
+    $bestRaw = $null
+    $bestLen = 0
+    foreach ($ep in $lines) {
+        $ep = ([string]$ep).TrimEnd("`r")
+        if (-not $ep) { continue }
+        # 3. Trailing separators ignored for the MATCH; the raw line is hashed.
+        $epSep = $ep.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+        if ($epSep.Length -eq 1) { continue }  # the line was all separators
+        if ($resolved.StartsWith($epSep, [StringComparison]::OrdinalIgnoreCase)) {
+            if ($epSep.Length -gt $bestLen) { $bestLen = $epSep.Length; $bestRaw = $ep }
+        }
+    }
+    if (-not $bestRaw) { return $null }
+    # MD5 of the RAW extra path -- the SAME key vco_lib.path_key() computes,
+    # so the queue name matches the Python drain's glob.
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    try {
+        $digest = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($bestRaw))
+        $hash = -join ($digest | ForEach-Object { $_.ToString('x2') })
+    } finally {
+        $md5.Dispose()
+    }
+    $queue = Join-Path $stateDir ("codegraph_drain_extra_{0}_{1}.txt" -f $hash, $SessionId)
+    try { Add-Content -LiteralPath $queue -Value $resolved -ErrorAction SilentlyContinue } catch { }
+    return $queue
+}
+
+
 # Invoke-VcoRouteTouchedPath: the whole routing decision for ONE file.
 # Idempotent per file per debounce window; safe to call in a loop.
 function Invoke-VcoRouteTouchedPath {
@@ -697,8 +858,20 @@ try {
                 }
                 $accum = Join-Path $stateDir ("edit_reminder_{0}.txt" -f $SessionId)
                 Add-Content -LiteralPath $accum -Value $Path -ErrorAction Stop
-                $cgQueue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionId)
-                Add-Content -LiteralPath $cgQueue -Value $Path -ErrorAction SilentlyContinue
+                # v0.2.102 S16-7: a code file under an ENABLED extra code-graph
+                # path goes to the PER-EXTRA queue instead -- a path outside
+                # the primary root must never be analyzed under the primary's
+                # collection. Drained by stop-codegraph-drain.ps1 through
+                # `vco_lib.codegraph_extras_refresh --queued`. MUST MATCH the
+                # .sh sibling. Add-VcoRouteExtraQueue appends the RESOLVED path
+                # itself and returns the queue it used; $null -> primary queue.
+                # Precedence (M-A1): primary-root containment wins, then
+                # longest extra prefix.
+                $extraQueue = Add-VcoRouteExtraQueue -Path $Path -SessionId $SessionId
+                if (-not $extraQueue) {
+                    $cgQueue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionId)
+                    Add-Content -LiteralPath $cgQueue -Value $Path -ErrorAction SilentlyContinue
+                }
             } catch { }
         }
     }

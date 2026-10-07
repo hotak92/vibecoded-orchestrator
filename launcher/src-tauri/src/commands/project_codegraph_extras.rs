@@ -331,8 +331,18 @@ fn basename_of(path: &str) -> String {
 /// Reject a path that overlaps with the project's own folder_path:
 ///   * exact match
 ///   * sub-path of folder_path
+///   * ANCESTOR of folder_path (v0.2.102 M-A1)
 ///
 /// Returns the user-facing error string when overlap detected.
+///
+/// The ancestor arm: an extra that CONTAINS the project root would hijack
+/// every primary-root edit into the extra queue / wrong argv shape
+/// (`--as-extra-path` with the parent as repo root) and double-walk the
+/// whole tree. Routing gives primary-root containment precedence, and this
+/// validator is the registration-side home of the same rule — the launcher's
+/// GUI Add flow (`add_project_codegraph_extra_path`, the ONLY registration
+/// path — the frontend calls this command via `invoke`) runs it, so GUI and
+/// any future caller stay consistent.
 fn reject_self_overlap(extra: &str, folder_path: &str) -> Result<(), String> {
     let extra_norm = extra.trim_end_matches('/');
     // Normalise folder_path to forward slashes too (Windows DB rows
@@ -358,6 +368,22 @@ fn reject_self_overlap(extra: &str, folder_path: &str) -> Result<(), String> {
         return Err(format!(
             "the path '{}' is INSIDE this project's own folder ('{}') — it's already \
              covered by the main codegraph analysis",
+            extra, folder_path
+        ));
+    }
+
+    // Ancestor check (v0.2.102 M-A1): the mirror image — folder_path INSIDE
+    // the extra. Same `/`-boundary rule so `/opt/foobar` is not shadowed by
+    // an `/opt/foo` extra.
+    let extra_with_sep = format!("{}/", extra_norm);
+    if folder_norm
+        .to_ascii_lowercase()
+        .starts_with(&extra_with_sep.to_ascii_lowercase())
+    {
+        return Err(format!(
+            "the path '{}' CONTAINS this project's own folder ('{}') — every primary \
+             edit would be drained with the extra's argv instead of the primary \
+             codegraph's; register a sibling subtree instead",
             extra, folder_path
         ));
     }
@@ -671,23 +697,25 @@ pub async fn sync_project_codegraph_extra_path(
     );
 
     let started = std::time::Instant::now();
-    let report = run_analyzer_with_stream(
-        &project.folder_path,
-        &project_id,
-        &label,
-        &args,
-        &app,
+    // v0.2.102 NB-H6: the HEAD is read BEFORE the analyzer runs — a commit
+    // landing mid-walk must NOT be stamped as indexed (its files were never
+    // walked). The ordering lives in the one injectable seam below so a unit
+    // test can pin it.
+    let head_path = row.path.clone();
+    let (report, sha) = analyze_with_pre_read_stamp(
+        || run_analyzer_with_stream(&project.folder_path, &project_id, &label, &args, &app),
+        move || git_head_sha(&head_path),
     )
     .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     // Record through the ONE writer shared with the hub route
     // (`record_codegraph_extra_indexed`): last_indexed_* on the row, the
-    // V52-Z `code_graph_builds` upsert, and the audit row. SHA: best-effort;
-    // `None` for a non-git extra path (clears any prior value). A row that
-    // vanished mid-run is not resurrected — the sync outcome still returns
-    // (the entities are already in Weaviate; only bookkeeping is skipped).
-    let sha = git_head_sha(&row.path);
+    // V52-Z `code_graph_builds` upsert, and the audit row. SHA: the
+    // PRE-analyze HEAD (NB-H6); `None` for a non-git extra path (clears any
+    // prior value). A row that vanished mid-run is not resurrected — the
+    // sync outcome still returns (the entities are already in Weaviate;
+    // only bookkeeping is skipped).
     let entities_indexed = report.modules + report.classes + report.functions + report.apis;
     if let Err(e) = db.record_codegraph_extra_indexed(
         &project_id,
@@ -778,21 +806,29 @@ pub async fn reindex_project_codegraph_after_extras_change(
     }
 
     let started = std::time::Instant::now();
-    let report = run_analyzer_with_stream(
-        &project.folder_path,
-        &project_id,
-        &project.name,
-        &args,
-        &app,
+    // v0.2.102 fix-round (NB-H6, reindex arm): every extra's HEAD is read
+    // BEFORE the multi-root analyze — the pre-fix loop below read them AFTER,
+    // so a commit landing mid-walk was stamped as indexed although its files
+    // were never walked. Same injectable seam as the single-path Sync.
+    let head_paths: Vec<String> = extras.iter().map(|e| e.path.clone()).collect();
+    let (report, pre_heads) = analyze_with_pre_read_stamp(
+        || run_analyzer_with_stream(
+            &project.folder_path,
+            &project_id,
+            &project.name,
+            &args,
+            &app,
+        ),
+        move || head_paths.iter().map(|p| git_head_sha(p)).collect::<Vec<Option<String>>>(),
     )
     .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     // After a successful reindex, refresh each extra's last_indexed_*
-    // so subsequent incremental runs have an accurate baseline.
+    // so subsequent incremental runs have an accurate baseline. The commit
+    // stamped is the PRE-analyze HEAD (NB-H6).
     let now = chrono::Utc::now().timestamp_millis();
-    for e in &extras {
-        let sha = git_head_sha(&e.path);
+    for (e, sha) in extras.iter().zip(pre_heads.iter()) {
         let _ = db.update_codegraph_extra_last_indexed(
             &project_id,
             &e.path,
@@ -931,6 +967,36 @@ struct AnalyzerFinalReport {
     pub functions: u64,
     #[serde(default)]
     pub apis: u64,
+}
+
+/// v0.2.102 NB-H6 — run the analyzer and return the commit stamp(s) to
+/// record, with the HEAD read(s) BEFORE the analyze.
+///
+/// Reading `git rev-parse HEAD` AFTER the walk stamps a commit that landed
+/// mid-run as "indexed" although its files were never walked — the row then
+/// looks current and neither the incremental `--since-commit` path nor the
+/// panel's stale badge ever revisits those files. The stamp must be the
+/// PRE-analyze HEAD: if HEAD moved during the walk, the post-walk comparison
+/// (`extra_path_is_stale`) still sees the delta and the next sync walks it.
+///
+/// The stamp type is generic: the single-path Sync uses `Option<String>`;
+/// `reindex_project_codegraph_after_extras_change` collects one
+/// `Option<String>` per extra (`Vec<Option<String>>`) before its multi-root
+/// analyze (same mid-walk race, fix-round 2). Both legs are injectable so a
+/// unit test can advance "HEAD" mid-run and pin the ordering. `read_head`
+/// is called exactly once, before `run_analyzer` is awaited.
+async fn analyze_with_pre_read_stamp<Run, Fut, ReadHead, Stamp>(
+    run_analyzer: Run,
+    read_head: ReadHead,
+) -> Result<(AnalyzerFinalReport, Stamp), String>
+where
+    Run: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<AnalyzerFinalReport, String>>,
+    ReadHead: FnOnce() -> Stamp,
+{
+    let stamp = read_head();
+    let report = run_analyzer().await?;
+    Ok((report, stamp))
 }
 
 /// Resolve `python` to use for the analyzer. Mirrors
@@ -1436,6 +1502,110 @@ mod tests {
             h.await.unwrap();
         }
         assert_eq!(counter.load(Ordering::SeqCst), n);
+    }
+
+    // ─── v0.2.102 NB-H6: the stamped commit is the PRE-analyze HEAD ──────
+
+    #[tokio::test]
+    async fn analyze_with_pre_read_stamp_reads_head_before_the_analyze() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // "HEAD" advances mid-run: the first read (pre-analyze) is `aaa…`,
+        // every later read is `bbb…` (a commit landed during the walk). The
+        // stamp must be the PRE-analyze value — the post-walk stale check
+        // (`extra_path_is_stale`) then still sees `bbb…` as unindexed.
+        let head_reads = AtomicUsize::new(0);
+        let events = std::sync::Mutex::new(Vec::new());
+        let (report, sha) = analyze_with_pre_read_stamp(
+            || async {
+                events.lock().unwrap().push("analyze");
+                Ok(AnalyzerFinalReport {
+                    files_analyzed: 3,
+                    modules: 1,
+                    classes: 1,
+                    functions: 2,
+                    apis: 0,
+                })
+            },
+            || {
+                events.lock().unwrap().push("read_head");
+                match head_reads.fetch_add(1, Ordering::SeqCst) {
+                    0 => Some("a".repeat(40)),
+                    _ => Some("b".repeat(40)),
+                }
+            },
+        )
+        .await
+        .expect("analyzer ok");
+        assert_eq!(sha.as_deref(), Some("a".repeat(40).as_str()),
+            "the stamp must be the PRE-analyze HEAD, not a commit that landed mid-run");
+        assert_eq!(head_reads.load(Ordering::SeqCst), 1,
+            "HEAD is read exactly once — before the analyze, never again after it");
+        assert_eq!(events.lock().unwrap().as_slice(), ["read_head", "analyze"],
+            "the read must precede the analyzer run");
+        assert_eq!(report.files_analyzed, 3);
+    }
+
+    #[tokio::test]
+    async fn analyze_with_pre_read_stamp_propagates_analyzer_failure() {
+        let (report, sha) = match analyze_with_pre_read_stamp(
+            || async { Err::<AnalyzerFinalReport, String>("analyzer exited 1".to_string()) },
+            || Some("c".repeat(40)),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                assert!(e.contains("analyzer exited 1"));
+                return;
+            }
+        };
+        panic!("analyzer failure must propagate, got ({report:?}, {sha:?})");
+    }
+
+    #[tokio::test]
+    async fn analyze_with_pre_read_stamp_collects_every_stamp_before_the_analyze() {
+        // The reindex arm's shape (fix-round 2, NB-H6): ONE read_head call
+        // collects a stamp per extra BEFORE the multi-root analyze; a commit
+        // landing mid-walk must surface in NONE of the stamps.
+        let events = std::sync::Mutex::new(Vec::new());
+        let (report, stamps) = analyze_with_pre_read_stamp(
+            || async {
+                events.lock().unwrap().push("analyze");
+                Ok(AnalyzerFinalReport::default())
+            },
+            || {
+                events.lock().unwrap().push("read_head");
+                vec![Some("a".repeat(40)), None, Some("b".repeat(40))]
+            },
+        )
+        .await
+        .expect("analyzer ok");
+        assert_eq!(events.lock().unwrap().as_slice(), ["read_head", "analyze"],
+            "every extra's HEAD must be collected before the analyze starts");
+        assert_eq!(stamps,
+            vec![Some("a".repeat(40)), None, Some("b".repeat(40))],
+            "the stamps are the PRE-analyze reads, verbatim and in extras order");
+        let _ = report;
+    }
+
+    // ─── reject_self_overlap: ancestor arm (v0.2.102 M-A1) ───────────────
+
+    #[test]
+    fn reject_self_overlap_rejects_ancestor_of_project_root() {
+        // An extra that CONTAINS the project root would hijack every primary
+        // edit into the extra queue / wrong argv shape. Registration must
+        // refuse it — the GUI's Add flow reaches this validator through
+        // `add_project_codegraph_extra_path`, the only registration path.
+        let err = reject_self_overlap("/opt/work", "/opt/work/app").unwrap_err();
+        assert!(err.contains("CONTAINS"), "got: {}", err);
+        let err = reject_self_overlap("/opt", "/opt/work/app").unwrap_err();
+        assert!(err.contains("CONTAINS"), "got: {}", err);
+        // Same boundary rule as the sub-path arm: /opt/work2 is NOT an
+        // ancestor of /opt/work/app.
+        reject_self_overlap("/opt/work2", "/opt/work/app").unwrap();
+        // Case-insensitive, mirroring the existing arms.
+        let err = reject_self_overlap("/OPT/WORK", "/opt/work/app").unwrap_err();
+        assert!(err.contains("CONTAINS"), "got: {}", err);
     }
 
     // ─── from_row / display_label ───────────────────────────────────────
