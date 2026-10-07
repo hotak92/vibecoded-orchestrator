@@ -129,11 +129,42 @@ if (Test-Path -LiteralPath $stateDir -PathType Container) {
             $extrasLog = Join-Path $extrasLogDir "codegraph_extras_refresh.log"
             $q = { param($v) "'" + ($v -replace "'","''") + "'" }
             # The child's own output/errors land in the same log the module
-            # writes, so a broken refresh is never silent.
+            # writes, so a broken refresh is never silent. PowerShell single
+            # quotes are LITERAL ('' escapes a quote), so paths with $ or
+            # backticks cannot re-parse here -- the .sh sibling's NB-H5 class
+            # does not exist on this surface.
             $extrasInner = "& " + (& $q $script:python) + " -m vco_lib.codegraph_extras_refresh --project-root " + (& $q $ProjectRoot) +
                 " --analyzer " + (& $q $script:analyzer) + " --state-dir " + (& $q $stateDir) + " *>> " + (& $q $extrasLog)
             Start-VcoDetachedPwsh -Command $extrasInner -PowerShellExe $PsExe
         }
+    }
+}
+
+# --- EXTRA EDIT QUEUES: drain on Stop (v0.2.102 S16-7) ---
+# MUST MATCH the .sh block of the same name: route-touched-path queues a code
+# edit under an ENABLED extra path to codegraph_drain_extra_<md5>_<sid>.txt
+# (never the primary queue). Drain those queues through
+# `vco_lib.codegraph_extras_refresh --queued` (scoped --only-files-from with
+# the extra's OWN --project prefix). Deliberately OUTSIDE both throttles (the
+# 120 s primary rate limit below, the 600 s commit-stamp interval above):
+# those protect the analyzer from repeated FULL walks; a queued scoped drain
+# is cheap, so a queued extra is drained on every Stop. The per-path root
+# lock inside refresh_queued still serialises runs over the same checkout.
+$extraQueues = @(Get-ChildItem -LiteralPath $stateDir -Filter 'codegraph_drain_extra_*_*.txt' -File -ErrorAction SilentlyContinue |
+    # Skip the pre-fix-round-2 TRANSIENT analyzer input
+    # (codegraph_drain_extra_list_<md5>.txt): a process killed mid-drain could
+    # leak one, and it is not a queue (v0.2.102 I-A5). The current transient
+    # name (codegraph_drain_extra-files-<md5>.txt) does not match the filter.
+    Where-Object { $_.Name -notlike 'codegraph_drain_extra_list_*' })
+if ($extraQueues.Count -gt 0) {
+    if ((Resolve-DrainRuntime) -eq 0) {
+        $extrasLogDir = Join-Path (Join-Path $ProjectRoot ".claude") "logs"
+        try { New-Item -ItemType Directory -Path $extrasLogDir -Force -ErrorAction Stop | Out-Null } catch { }
+        $extrasLog = Join-Path $extrasLogDir "codegraph_extras_refresh.log"
+        $q2 = { param($v) "'" + ($v -replace "'","''") + "'" }
+        $queuedInner = "& " + (& $q2 $script:python) + " -m vco_lib.codegraph_extras_refresh --queued --project-root " + (& $q2 $ProjectRoot) +
+            " --analyzer " + (& $q2 $script:analyzer) + " --state-dir " + (& $q2 $stateDir) + " *>> " + (& $q2 $extrasLog)
+        Start-VcoDetachedPwsh -Command $queuedInner -PowerShellExe $PsExe
     }
 }
 

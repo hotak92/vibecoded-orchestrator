@@ -63,6 +63,24 @@
       ]
     }
   ],
+  "queued_cases": [
+    {
+      "_comment": "v0.2.102 S16-7: the per-edit queued drain (refresh_queued / --queued) runs the analyzer with the extra's OWN collection args in scoped --only-files-from mode: build_extra_sync_argv(path, prefix, False, None) + ['--only-files-from', <list file>]. The analyzer rejects --incremental combined with --only-files-from, so the queued argv never carries it; the commit is NOT recorded by the queued drain (the commit-stamp path owns last_indexed_commit).",
+      "name": "queued drain over edited files",
+      "path": "/srv/clone",
+      "prefix": "Acme",
+      "list_file": "/proj/.claude/state/codegraph_drain_extra-files-<md5(path)>.txt",
+      "argv": [
+        "/srv/clone",
+        "--project",
+        "Acme",
+        "--json-progress",
+        "--as-extra-path",
+        "--only-files-from",
+        "/proj/.claude/state/codegraph_drain_extra-files-<md5(path)>.txt"
+      ]
+    }
+  ],
   "stale_cases": [
     {
       "head": "aaa",

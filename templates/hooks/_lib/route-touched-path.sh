@@ -16,7 +16,9 @@
 #   knowledge/**             -> .claude/scripts/kg-sync           (KG_COLLECTION)
 #   docs/**.md               -> .claude/scripts/kg-sync           (DEVELOPMENT_COLLECTION)
 #   .claude/diagrams/*.mmd|.excalidraw -> vco_lib.diagram_indexer (throttled 60 s)
-#   <code extension>         -> the per-turn code-graph drain queue
+#   <code extension>         -> the per-turn code-graph drain queue, OR the
+#                               per-EXTRA queue when the path sits under an
+#                               enabled extra code-graph path (v0.2.102 S16-7)
 # ...each gated by the Phase-8 access matrix and coalesced by the
 # per-file debounce, which is why "route", "gate" and "debounce" are one
 # concern and live in one file.
@@ -224,6 +226,184 @@ _kg_build_gated_sync_cmd() {
 }
 
 # ===========================================================================
+# v0.2.102 S16-7: enabled-extra-path membership (cached list, option B)
+# ===========================================================================
+# A code file under an ENABLED extra code-graph path (launcher → project →
+# Codegraph → "Extra codegraph paths") must be queued for re-index as
+# promptly as a primary-root file — but into a PER-EXTRA queue
+# (codegraph_drain_extra_<md5(extra)>_<session>.txt), never the primary
+# queue: a path outside the primary root must never be analyzed under the
+# primary's collection. The Stop hook (stop-codegraph-drain.sh) drains those
+# queues through `python -m vco_lib.codegraph_extras_refresh --queued`.
+#
+# The membership DECISION is computed by Python (the hub /config resolver is
+# the one reader of the extras rows) and cached as a plain table both shells
+# read — option B of the A>B>C rule, chosen because this runs PER EDIT: a
+# hub resolve (or even a Python spawn) per keystroke is too costly, and the
+# list changes only when the user toggles extras in the launcher GUI.
+#   cache : .claude/state/codegraph_extra_paths_cache.txt (one path per line)
+#   stale : missing, older than VCO_CODEGRAPH_EXTRAS_LIST_TTL_SECONDS
+#           (default 300), or older than launcher.db (an extras add / remove /
+#           toggle takes effect within seconds, not at TTL expiry)
+#   refresh: "$venv_py" -m vco_lib.codegraph_extras_refresh \
+#              --list-enabled-extra-paths --project-root <root>
+# A failed refresh (no venv, hub down — the CLI exits non-zero) keeps the
+# stale cache; with no cache at all nothing routes to the extra queues (the
+# commit-stamp refresh at Stop still re-indexes stale extras — soft-fail).
+# MUST MATCH route-touched-path.ps1.
+_VCO_ROUTE_EXTRAS_CACHE_NAME="codegraph_extra_paths_cache.txt"
+
+_vco_route_extras_db_path() {
+    if [ -n "${VCT_LAUNCHER_DB_PATH:-}" ]; then
+        printf '%s' "$VCT_LAUNCHER_DB_PATH"
+    else
+        printf '%s' "${VCT_STATE_DIR:-$HOME/.vct}/launcher.db"
+    fi
+}
+
+# Returns 0 when the cache is STALE (missing / TTL-expired / older than
+# launcher.db), 1 when fresh. Soft-fail biases to "stale": a spurious refresh
+# costs one Python spawn; a never-refreshing cache silently misroutes.
+_vco_route_extras_cache_stale() {
+    local cache="$1"
+    [ -f "$cache" ] || return 0
+    local ttl="${VCO_CODEGRAPH_EXTRAS_LIST_TTL_SECONDS:-300}"
+    case "$ttl" in ''|*[!0-9]*) ttl=300 ;; esac
+    local now cache_mtime db_mtime
+    now=$(date +%s 2>/dev/null || echo 0)
+    cache_mtime=$(stat -c %Y "$cache" 2>/dev/null || stat -f %m "$cache" 2>/dev/null || echo 0)
+    case "$cache_mtime" in ''|*[!0-9]*) return 0 ;; esac
+    if [ $(( now - cache_mtime )) -ge "$ttl" ]; then
+        return 0
+    fi
+    local db
+    db="$(_vco_route_extras_db_path)"
+    if [ -f "$db" ]; then
+        db_mtime=$(stat -c %Y "$db" 2>/dev/null || stat -f %m "$db" 2>/dev/null || echo 0)
+        case "$db_mtime" in ''|*[!0-9]*) db_mtime=0 ;; esac
+        if [ "$db_mtime" -gt "$cache_mtime" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Best-effort cache rewrite through the ONE Python lister. Never fails the
+# caller: a non-zero CLI exit (hub down / project unregistered) removes the
+# temp file and leaves any previous cache in place.
+_vco_route_refresh_extras_cache() {
+    local cache="$1"
+    VCO_VENV_PYTHON=""
+    if [ -f "$_VCO_ROUTE_HOOKS_DIR/_lib/resolve-vco-venv.sh" ]; then
+        # shellcheck source=resolve-vco-venv.sh disable=SC1091
+        . "$_VCO_ROUTE_HOOKS_DIR/_lib/resolve-vco-venv.sh"
+        resolve_vco_venv_python "$_VCO_ROUTE_HOOKS_DIR" 2>/dev/null || true
+    fi
+    [ -n "${VCO_VENV_PYTHON:-}" ] || return 0
+    local tmp="$cache.tmp.$$"
+    if "$VCO_VENV_PYTHON" -m vco_lib.codegraph_extras_refresh \
+            --list-enabled-extra-paths --project-root "$_VCO_ROUTE_PROJECT_ROOT" \
+            </dev/null >"$tmp" 2>/dev/null; then
+        mv "$tmp" "$cache" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Resolve symlinks in $1's DIRECTORY portion with the `cd -P` builtin — no
+# subprocess, so this costs nothing per edit (v0.2.102 L-A2: registration
+# canonicalises extras via dunce::canonicalize, but the touched path arrives
+# as the editor wrote it; an edit through a symlinked directory must still
+# prefix-match). On any failure (deleted dir, no slash) echoes the input.
+_vco_route_resolve_physical() {
+    local p="$1" d b rd
+    case "$p" in
+        */*) ;;
+        *) printf '%s' "$p"; return 0 ;;
+    esac
+    d="${p%/*}"
+    b="${p##*/}"
+    rd=$(cd "$d" 2>/dev/null && pwd -P) || rd=""
+    if [ -z "$rd" ]; then
+        printf '%s' "$p"
+    elif [ "$rd" = "/" ]; then
+        printf '/%s' "$b"
+    else
+        printf '%s/%s' "$rd" "$b"
+    fi
+    return 0
+}
+
+# Route a code edit under an ENABLED extra path to its per-extra drain queue:
+# appends the PHYSICAL path to codegraph_drain_extra_<md5(extra)>_<session>.txt
+# and echoes that queue path; echoes nothing (caller then uses the primary
+# queue) when the edit is not under any enabled extra. $1 = absolute touched
+# path, $2 = session id.
+#
+# v0.2.102 fix-round (M-A1) precedence, MUST MATCH route-touched-path.ps1:
+#   1. PRIMARY-ROOT CONTAINMENT WINS — an edit inside the project root always
+#      goes to the primary queue, even when a registered extra is an ANCESTOR
+#      of the root (registration rejects ancestor extras too, but a pre-fix
+#      row can still be on disk).
+#   2. Among extras the LONGEST matching prefix wins — nested extras route to
+#      the inner one regardless of cache order.
+#   3. Matching is on the SYMLINK-RESOLVED path; trailing separators on the
+#      cache line are ignored for the match but the RAW line is hashed (the
+#      queue name must equal vco_lib.path_key(row.path), trailing slash and
+#      all, or the Python drain's glob never finds it).
+_vco_route_extra_enqueue() {
+    local touched="$1" session_id="$2"
+    local state_dir="$_VCO_ROUTE_PROJECT_ROOT/.claude/state"
+    local cache="$state_dir/$_VCO_ROUTE_EXTRAS_CACHE_NAME"
+
+    # 1. Primary-root containment wins — checked on the resolved path so a
+    # symlinked route INTO the root also lands in the primary queue.
+    local resolved
+    resolved="$(_vco_route_resolve_physical "$touched")"
+    case "$resolved" in
+        "$_VCO_ROUTE_PROJECT_ROOT"/*) return 0 ;;
+    esac
+
+    if _vco_route_extras_cache_stale "$cache"; then
+        mkdir -p "$state_dir" 2>/dev/null || true
+        _vco_route_refresh_extras_cache "$cache"
+    fi
+    [ -f "$cache" ] || return 0
+    # 2. Longest matching prefix wins.
+    local _ep _epm _best="" _best_raw=""
+    while IFS= read -r _ep; do
+        # A CRLF cache (a refresh written by a Windows-side Python, read back
+        # under WSL/Git-bash) must not poison the prefix match or the hash.
+        _ep="${_ep%$'\r'}"
+        [ -n "$_ep" ] || continue
+        # 3. Trailing separators are ignored for the MATCH (the .ps1 sibling's
+        # TrimEnd); the raw line is kept for the hash.
+        _epm="$_ep"
+        while [ "${_epm%/}" != "$_epm" ]; do _epm="${_epm%/}"; done
+        [ -n "$_epm" ] || continue
+        case "$resolved" in
+            "$_epm"/*)
+                if [ ${#_epm} -gt ${#_best} ]; then
+                    _best="$_epm"
+                    _best_raw="$_ep"
+                fi
+                ;;
+        esac
+    done < "$cache"
+    [ -n "$_best" ] || return 0
+    # md5 of the RAW extra path — the SAME key vco_lib's path_key() computes,
+    # so the queue name matches what the Python drain globs for. Unkeyable
+    # (no python) → no extra routing.
+    local _hash
+    _hash=$(printf '%s' "$_best_raw" | "$_VCO_ROUTE_PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" 2>/dev/null || echo "")
+    [ -n "$_hash" ] || return 0
+    printf '%s\n' "$resolved" >> "$state_dir/codegraph_drain_extra_${_hash}_${session_id}.txt" 2>/dev/null || return 0
+    printf '%s\n' "$state_dir/codegraph_drain_extra_${_hash}_${session_id}.txt"
+    return 0
+}
+
+# ===========================================================================
 # vco_route_init <hooks_dir> <project_root> <python>
 # ===========================================================================
 # Resolves everything the routing needs ONCE per hook fire: the debounce
@@ -386,8 +566,22 @@ vco_route_touched_path() {
             # and must PERSIST the union of edited paths across turns inside
             # the window (it clears the queue only when it actually runs the
             # analyzer). A distinct file avoids a two-consumer race.
-            local _CG_DRAIN_QUEUE="$PROJECT_ROOT/.claude/state/codegraph_drain_${session_id}.txt"
-            printf '%s\n' "$touched" >> "$_CG_DRAIN_QUEUE" 2>/dev/null || true
+            #
+            # v0.2.102 S16-7: a code file under an ENABLED extra code-graph
+            # path goes to the PER-EXTRA queue instead — a path outside the
+            # primary root must never be analyzed under the primary's
+            # collection. The extra queue is drained by the same Stop hook
+            # through `vco_lib.codegraph_extras_refresh --queued` (scoped
+            # --only-files-from, the extra's own --project prefix).
+            # _vco_route_extra_enqueue appends the RESOLVED path itself and
+            # echoes the queue it used; empty → primary queue. Precedence
+            # (M-A1): primary-root containment wins, then longest extra prefix.
+            local _EXTRA_QUEUE
+            _EXTRA_QUEUE="$(_vco_route_extra_enqueue "$touched" "$session_id")"
+            if [ -z "$_EXTRA_QUEUE" ]; then
+                local _CG_DRAIN_QUEUE="$PROJECT_ROOT/.claude/state/codegraph_drain_${session_id}.txt"
+                printf '%s\n' "$touched" >> "$_CG_DRAIN_QUEUE" 2>/dev/null || true
+            fi
         fi
     fi
 }
