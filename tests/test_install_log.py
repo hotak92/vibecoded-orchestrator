@@ -28,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import install  # type: ignore  # noqa: E402
+from vco_lib import install_resume as ir  # noqa: E402
 
 
 def _iso_offset(seconds: int = 0) -> str:
@@ -282,30 +283,34 @@ class LoadResumeStateTests(unittest.TestCase):
 
 
 class ShouldSkipStepTests(unittest.TestCase):
+    """NB-10 (v0.2.102): `_RESUME_STATE` is gone — the phases live ONLY on the
+    live `_RESUME_SESSION`, which is what these tests now swap (the same
+    pattern `tests/test_v02100_install_resume.py` uses)."""
 
     def test_no_resume_returns_false_even_with_ok(self):
         orig_enabled = install._RESUME_ENABLED
-        orig_state = install._RESUME_STATE
+        orig_session = install._RESUME_SESSION
         install._RESUME_ENABLED = False
-        install._RESUME_STATE = {"3/10": "ok", "4/10": "ok"}
+        install._RESUME_SESSION = ir.Session(
+            enabled=False, phases={"3/10": "ok", "4/10": "ok"})
         try:
             self.assertFalse(install._should_skip_step("3/10"))
             self.assertFalse(install._should_skip_step("4/10"))
         finally:
             install._RESUME_ENABLED = orig_enabled
-            install._RESUME_STATE = orig_state
+            install._RESUME_SESSION = orig_session
 
     def test_skip_only_for_ok_or_skip(self):
         orig_enabled = install._RESUME_ENABLED
-        orig_state = install._RESUME_STATE
+        orig_session = install._RESUME_SESSION
         install._RESUME_ENABLED = True
-        install._RESUME_STATE = {
+        install._RESUME_SESSION = ir.Session(enabled=True, phases={
             "3/10": "ok",
             "4/10": "skip",
             "5/10": "error",
             "6/10": "warn",
             "7/10": "start",
-        }
+        })
         try:
             self.assertTrue(install._should_skip_step("3/10"))
             self.assertTrue(install._should_skip_step("4/10"))
@@ -315,7 +320,7 @@ class ShouldSkipStepTests(unittest.TestCase):
             self.assertFalse(install._should_skip_step("8/10"))  # not in state
         finally:
             install._RESUME_ENABLED = orig_enabled
-            install._RESUME_STATE = orig_state
+            install._RESUME_SESSION = orig_session
 
 
 if __name__ == "__main__":

@@ -504,8 +504,12 @@ class SystemInfo(NamedTuple):
 # Resume state (vco_lib.install_resume), loaded at the start of main(): the
 # last session's per-step phases + recorded data. Only "ok"/"skip" steps are
 # candidates, and each skip also needs its side-effect verifier to pass.
+# NB-10 (v0.2.102): the session is the ONE holder of the phases — the
+# import-time `_RESUME_STATE = _RESUME_SESSION.phases` alias is gone. It
+# snapshot the empty dict at import, so any reader that ran before main()
+# reloaded the session (tests, helpers) answered from stale state. Every
+# reader now goes through `_RESUME_SESSION` (reassigned, never copied).
 _RESUME_SESSION = _install_resume.Session()
-_RESUME_STATE: dict[str, str] = _RESUME_SESSION.phases
 _RESUME_ENABLED: bool = True
 
 # In-memory buffer for events emitted BEFORE Step 8 creates state/logs/.
@@ -1726,8 +1730,12 @@ def _load_resume_state() -> dict[str, str]:
 
 def _should_skip_step(step: str) -> bool:
     """True iff resume is enabled AND the log says ``step`` completed (ok/skip).
-    A HINT only: :func:`_resume_verified` adds the side-effect verifier."""
-    return _install_resume.Session(enabled=_RESUME_ENABLED, phases=_RESUME_STATE).completed(step)
+    A HINT only: :func:`_resume_verified` adds the side-effect verifier.
+    NB-10: reads the LIVE ``_RESUME_SESSION`` (main() replaces it whole; its
+    ``enabled`` flag already carries ``_RESUME_ENABLED``), never a copy of its
+    phases — a copy taken at import would answer from the empty pre-main dict.
+    """
+    return _RESUME_SESSION.completed(step)
 
 
 def _resume_verified(step: str, label: str, verify) -> bool:
@@ -5861,10 +5869,9 @@ def main() -> int:
     # individual step functions can consult _should_skip_step(). The log
     # is at state/logs/install.jsonl — only present once Step 8 has run
     # at least once (i.e. on second+ install attempts on this checkout).
-    global _RESUME_ENABLED, _RESUME_STATE, _RESUME_SESSION
+    global _RESUME_ENABLED, _RESUME_SESSION
     _RESUME_ENABLED = not args.no_resume
     _RESUME_SESSION = _install_resume.load_session(_install_log_path(), enabled=_RESUME_ENABLED)
-    _RESUME_STATE = _RESUME_SESSION.phases
 
     print()
     print("=" * 62)
