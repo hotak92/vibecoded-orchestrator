@@ -324,16 +324,19 @@ def test_current_revision_rows_not_owed_and_never_purged(classify_fn, repo_root)
         {"embed_revision": 1, "file_path": "src/live.py"},
         repo_root, current_revision=1,
     ) == "not_owed"
-    # Even pathless / ignored rows at the CURRENT revision are left alone
-    # (conservative: they don't block convergence; never delete converged).
+    # Pathless rows at the CURRENT revision are left alone (conservative:
+    # they don't block convergence; never delete converged).
     assert classify_fn(
         {"embed_revision": 1, "file_path": ""},
         repo_root, current_revision=1,
     ) == "not_owed"
+    # v0.2.102 (W1-C S5, review ruling): an IGNORED row is purgeable at ANY
+    # revision — no walk re-stamps it, and at the current revision it used to
+    # survive (and answer searches) forever.
     assert classify_fn(
         {"embed_revision": 1, "file_path": "target/generated.py"},
         repo_root, current_revision=1,
-    ) == "not_owed"
+    ) == "purgeable"
 
 
 def test_extra_path_rows_not_owed(classify_fn, repo_root):

@@ -47,8 +47,10 @@ PER-KIND ``extras`` INVENTORY (enumerated from the pre-P2f call-sites)
       ``returns``, ``proxy_target``
 * INTERACTION (CodeInteraction — distinct property set + a distinct
   reference shape ``source_module`` / ``source_function``, all via extras):
-    - ``source_project``, ``interaction_type``, ``direction``, ``protocol``,
-      ``endpoint``, ``raw_target``, ``confidence``, ``description``
+    - ``source_project``, ``project`` (v0.2.102 — the key every
+      ``project``-scoped reader filters on), ``interaction_type``,
+      ``direction``, ``protocol``, ``endpoint``, ``raw_target``,
+      ``confidence``, ``description``
 """
 from __future__ import annotations
 

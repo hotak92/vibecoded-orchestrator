@@ -111,7 +111,14 @@ DEVELOPMENT_COLLECTION_SCHEMA_VERSION = 2
 #: NEW rows; this edge removes the already-indexed garbage on update,
 #: algorithmically. Idempotent (re-run purges zero); disk reclaim is the
 #: Weaviate-side compaction that follows the deletes (2 GiB segment cap).
-CODEGRAPH_COLLECTION_SCHEMA_VERSION = 7
+#: v8: v0.2.102 S16-4/S16-5 — ``project`` (TEXT) on CodeInteraction, the one
+#: code-graph class born without it (every ``project``-scoped reader — search's
+#: self filter, the identity sweep, the stale + deleted-file prunes — failed on
+#: it or skipped it). ADDITIVE + data-preserving:
+#: ``migrations/codegraph_collection/7_to_8.py`` add_property's it and
+#: backfills the rows lacking a value with the prefix identity (per-row PATCH,
+#: resumable; NO drop, NO re-embed, no vector touched).
+CODEGRAPH_COLLECTION_SCHEMA_VERSION = 8
 
 # ===========================================================================
 # Layer 2 — KG node content schema (USER-CURATED — upgrade in place on bump)

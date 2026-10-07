@@ -4329,6 +4329,77 @@ def _extract_failing_collection(exc_msg: str) -> Optional[str]:
     return None
 
 
+# v0.2.102 (S16-5): a missing PROPERTY is not a missing CLASS. Both raise a
+# schema-class error and the fan-out used to file both under
+# `degraded.failed_collections.schema_missing`, which reads as "this collection
+# does not exist" — so a class that existed but lacked one queried property
+# (`<prefix>_CodeInteraction` had no `project`) was reported as absent and the
+# real gap took a code dive to find. The fan-out now records the property name
+# and `_schema_degraded` files it under `property_missing: {collection: prop}`.
+_MISSING_PROPERTY_RE = re.compile(
+    r"no such prop(?:erty)?(?:\s+with\s+name)?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+
+
+def _missing_property_name(exc_msg: str) -> Optional[str]:
+    """The property a Weaviate "no such prop" error names, or None (the error is
+    some other schema failure — a missing class, an index — or names nothing)."""
+    match = _MISSING_PROPERTY_RE.search(exc_msg or "")
+    return match.group(1) if match else None
+
+
+def _note_schema_failure(
+    failed_schema: list, missing_props: dict, coll_name: str, exc: Exception,
+) -> None:
+    """Record one collection's schema-class failure for the fan-out aggregate;
+    a missing-property failure also records WHICH property (S16-5)."""
+    failed_schema.append(coll_name)
+    prop = _missing_property_name(str(exc))
+    if prop:
+        missing_props[coll_name] = prop
+
+
+def _schema_degraded(failed_schema: list, missing_props: dict) -> dict:
+    """The schema part of `degraded.failed_collections`: `schema_missing` lists
+    the collections whose failure was NOT a missing property; `property_missing`
+    maps each collection that exists but lacks a queried property to it."""
+    out: dict = {}
+    classes = [c for c in failed_schema if c not in missing_props]
+    if classes:
+        out["schema_missing"] = classes
+    props = {c: missing_props[c] for c in failed_schema if c in missing_props}
+    if props:
+        out["property_missing"] = props
+    return out
+
+
+def _schema_failure_mode(
+    scope: str, failed_schema: list, missing_props: dict, failed_other: list = (),
+) -> Optional[str]:
+    """The telemetry ``failure_mode`` for a fan-out's schema-class failures
+    (v0.2.102 W1-C S3 — the RL log used to file a missing PROPERTY under
+    ``*_schema_missing`` too, so the corpus could not tell the two apart).
+
+    ``scope="all"`` (nothing searched): ``all_collections_failed`` when any
+    generic failure is present, else ``all_collections_property_missing`` when
+    EVERY failure was a missing property, else ``all_collections_schema_missing``.
+    ``scope="partial"``: ``None`` without schema failures; else
+    ``partial_fan_out_property_missing`` when every schema failure was a
+    missing property, else ``partial_fan_out_schema_missing`` (a missing class
+    present — the more severe signal wins; the per-collection split lives in
+    the response's ``degraded`` note).
+    """
+    only_props = bool(failed_schema) and all(c in missing_props for c in failed_schema)
+    if scope == "all":
+        if failed_other:
+            return "all_collections_failed"
+        return "all_collections_property_missing" if only_props else "all_collections_schema_missing"
+    if not failed_schema:
+        return None
+    return "partial_fan_out_property_missing" if only_props else "partial_fan_out_schema_missing"
+
+
 def _resolve_schema_class_name(token: str) -> Optional[str]:
     """Map a collection token to its EXACT schema class name, or None.
 
@@ -5480,6 +5551,7 @@ async def _semantic_graph_search_body(
     all_formatted: list[dict] = []
     raw_primary: list[tuple[object, str]] = []
     failed_collections_schema: list[str] = []
+    missing_props: dict[str, str] = {}  # S16-5: coll → missing property
     # R7 (v0.2.76): mirror of the hybrid_search fix — record generic
     # per-collection failures instead of dropping them (all-generic-fail must
     # raise, partial must surface in the `degraded` key).
@@ -5546,7 +5618,7 @@ async def _semantic_graph_search_body(
                     "semantic_graph_search: skipping collection '%s' (schema error: %s)",
                     coll_name, classified,
                 )
-                failed_collections_schema.append(coll_name)
+                _note_schema_failure(failed_collections_schema, missing_props, coll_name, exc)
                 continue
             # R7 (v0.2.76): record the generic failure — do not silently drop.
             logger.warning(f"semantic_graph_search: error searching {coll_name}: {exc}")
@@ -5602,10 +5674,9 @@ async def _semantic_graph_search_body(
             failure_task_id = str(uuid.uuid4())
             await _rl_cache_and_rerank(
                 failure_task_id, query, [], limit,
-                failure_mode=(
-                    "all_collections_schema_missing"
-                    if not failed_collections_other
-                    else "all_collections_failed"
+                failure_mode=_schema_failure_mode(
+                    "all", failed_collections_schema, missing_props,
+                    failed_collections_other,
                 ),
                 failed_collections=_all_failed,
             )
@@ -5692,8 +5763,8 @@ async def _semantic_graph_search_body(
     # v0.2.24: propagate partial-fan-out schema failures so telemetry
     # records which collections were unavailable.
     task_id = str(uuid.uuid4())
-    _partial_failure_mode = (
-        "partial_fan_out_schema_missing" if failed_collections_schema else None
+    _partial_failure_mode = _schema_failure_mode(
+        "partial", failed_collections_schema, missing_props,
     )
     primary_results = await _rl_cache_and_rerank(
         task_id, query, all_formatted, limit,
@@ -5832,9 +5903,7 @@ async def _semantic_graph_search_body(
     }
     # R7 (v0.2.76): partial coverage → surface which collections failed.
     if failed_collections_schema or failed_collections_other:
-        _degraded: dict = {}
-        if failed_collections_schema:
-            _degraded["schema_missing"] = failed_collections_schema
+        _degraded: dict = _schema_degraded(failed_collections_schema, missing_props)
         if failed_collections_other:
             _degraded["errors"] = {n: r for n, r in failed_collections_other}
         _sgs_response["degraded"] = {"failed_collections": _degraded}
@@ -6341,6 +6410,7 @@ async def _hybrid_search_body(
     # to the Weaviate instance as a whole, not one collection.
     merged: dict = {}
     failed_collections_schema: list[str] = []
+    missing_props: dict[str, str] = {}  # S16-5: coll → missing property
     # R7 (v0.2.76): generic (non-schema, non-unreachable, non-auth) per-collection
     # failures. Pre-fix these were only logger.warning'd and DROPPED — if EVERY
     # collection failed with a generic error the tool returned a clean success
@@ -6405,7 +6475,7 @@ async def _hybrid_search_body(
                 "hybrid_search: skipping collection '%s' (schema error: %s)",
                 coll_name, classified,
             )
-            failed_collections_schema.append(coll_name)
+            _note_schema_failure(failed_collections_schema, missing_props, coll_name, e)
             continue
         # R7 (v0.2.76): a generic (non-schema) failure. RECORD it — do not
         # silently drop. All-generic-fail must raise (below), and a partial
@@ -6430,10 +6500,9 @@ async def _hybrid_search_body(
             failure_task_id = str(uuid.uuid4())
             await _rl_cache_and_rerank(
                 failure_task_id, query, [], limit,
-                failure_mode=(
-                    "all_collections_schema_missing"
-                    if not failed_collections_other
-                    else "all_collections_failed"
+                failure_mode=_schema_failure_mode(
+                    "all", failed_collections_schema, missing_props,
+                    failed_collections_other,
                 ),
                 failed_collections=_all_failed,
             )
@@ -6524,8 +6593,8 @@ async def _hybrid_search_body(
     # fan-out so the telemetry event records WHICH collections failed
     # (helps diagnose hardcoded-default-vs-actual-Weaviate drift).
     task_id = str(uuid.uuid4())
-    _partial_failure_mode = (
-        "partial_fan_out_schema_missing" if failed_collections_schema else None
+    _partial_failure_mode = _schema_failure_mode(
+        "partial", failed_collections_schema, missing_props,
     )
     results = await _rl_cache_and_rerank(
         task_id, query, all_results, limit,
@@ -6651,9 +6720,7 @@ async def _hybrid_search_body(
     # partial coverage so the caller SEES it rather than trusting an
     # apparently-complete result set. Only present when there was a failure.
     if failed_collections_schema or failed_collections_other:
-        degraded: dict = {}
-        if failed_collections_schema:
-            degraded["schema_missing"] = failed_collections_schema
+        degraded: dict = _schema_degraded(failed_collections_schema, missing_props)
         if failed_collections_other:
             degraded["errors"] = {
                 n: reason for n, reason in failed_collections_other
@@ -7630,12 +7697,14 @@ async def search_code_graph(
         # layer-retry) gather's classification for the aggregate signal.
         _cg_successful_collections: list[str] = []
         _cg_failed_schema: list[str] = []
+        _cg_missing_props: dict[str, str] = {}  # S16-5: coll → missing property
         _cg_failed_other: list[tuple[str, str]] = []
 
         def _gather_candidates(apply_layer: bool) -> list[dict]:
             gathered: list[dict] = []
             _cg_successful_collections.clear()
             _cg_failed_schema.clear()
+            _cg_missing_props.clear()
             _cg_failed_other.clear()
             for coll_name in collections:
                 try:
@@ -7742,7 +7811,9 @@ async def search_code_graph(
                     if isinstance(_classified, (WeaviateUnreachable, WeaviateAuthError)):
                         raise
                     if isinstance(_classified, WeaviateSchemaError):
-                        _cg_failed_schema.append(coll_name)
+                        _note_schema_failure(
+                            _cg_failed_schema, _cg_missing_props, coll_name, e,
+                        )
                     else:
                         _cg_failed_other.append((coll_name, str(e)))
             return gathered
@@ -7792,6 +7863,12 @@ async def search_code_graph(
                 + "; ".join(f"{n}: {r}" for n, r in _cg_failed_other)
                 if _cg_failed_other else ""
             )
+            # v0.2.102 (S16-5): a class that EXISTS but lacks a queried
+            # property is not "absent" — name the property.
+            if _cg_missing_props:
+                _other_detail += "; present but missing a queried property: " + "; ".join(
+                    f"{n} (no '{p}')" for n, p in _cg_missing_props.items()
+                )
             _remediation = (
                 " Next steps: (1) if this is a PEER grant, the "
                 "VCT_CODE_GRAPH_ACCESS_LIST entry must be the grantor's project "
@@ -7819,6 +7896,8 @@ async def search_code_graph(
                     "results": [],
                     "error": _err_msg,
                     "collections_missing": _all_failed_names,
+                    **({"property_missing": dict(_cg_missing_props)}
+                       if _cg_missing_props else {}),
                 },
                 indent=2,
             )
@@ -8248,9 +8327,7 @@ async def search_code_graph(
         # note so they are VISIBLE rather than silently dropped (mirrors
         # semantic_graph_search's degraded.schema_missing annotation).
         if _cg_failed_schema or _cg_failed_other:
-            _degraded: dict = {}
-            if _cg_failed_schema:
-                _degraded["schema_missing"] = _cg_failed_schema
+            _degraded: dict = _schema_degraded(_cg_failed_schema, _cg_missing_props)
             if _cg_failed_other:
                 _degraded["errors"] = {n: r for n, r in _cg_failed_other}
             response_payload["degraded"] = {"failed_collections": _degraded}

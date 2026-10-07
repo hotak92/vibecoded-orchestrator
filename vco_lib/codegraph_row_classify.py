@@ -270,7 +270,8 @@ def classify_row(
       ``.claude/state/`` scratch (purgeable regardless of revision — 6_to_7
       purge semantics), pathless rows in file-anchored collections, rows
       whose path falls in the ignore set (walk-excluded whether or not the
-      file still exists), and deleted-file orphans (stored path gone from
+      file still exists — regardless of revision since v0.2.102), and
+      deleted-file orphans (stored path gone from
       disk / escaping the root).
 
     ``reachable_fn`` optionally injects a memoized reachability predicate
@@ -297,6 +298,15 @@ def classify_row(
         src = str(p.get("project_source") or "").strip()
         if src and src not in primary_sources:
             return "not_owed"
+    # 2b. Ignore-set rows — the walk never descends there (whether or not the
+    #    file still exists), so NO walk re-stamps them and none should serve
+    #    search. v0.2.102 (W1-C S5): checked BEFORE the converged rule — a
+    #    denylisted row at the CURRENT revision used to classify not_owed and
+    #    survive (and answer queries) forever. Derived, regenerable data: if a
+    #    future ignore-set change re-includes the path, the next walk simply
+    #    re-creates it.
+    if raw_path and path_is_ignored(raw_path, index_dot_claude=index_dot_claude):
+        return "purgeable"
     # 3. Converged rows — never touch, never count.
     rev = p.get("embed_revision")
     try:
@@ -309,12 +319,8 @@ def classify_row(
     #    survives without the file anchor.
     if not raw_path:
         return "purgeable"
-    # 5. Ignore-set rows — the walk never descends there (whether or not
-    #    the file still exists), so a stale row under an ignored dir can
-    #    never re-stamp. Derived, regenerable data: if a future ignore-set
-    #    change re-includes the path, the next walk simply re-creates it.
-    if path_is_ignored(raw_path, index_dot_claude=index_dot_claude):
-        return "purgeable"
+    # 5. (moved to 2b in v0.2.102 — ignore-set rows are purgeable at ANY
+    #    revision.)
     # 6. Deleted-file orphans — nothing re-walks a file that no longer
     #    exists (D1 orphan-clear semantics, kept). Skipped entirely when no
     #    root/predicate is available (fail-open toward "owed").

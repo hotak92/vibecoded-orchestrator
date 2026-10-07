@@ -418,6 +418,7 @@ try:
     # alias — its `classify_row` (embed decision SKIP/STAMP/EMBED) is DISTINCT
     # from codegraph_row_classify.classify_row (prune owed/not_owed/purgeable).
     from vco_lib import codegraph_guards as _guards
+    from vco_lib.kg_vector_slot import collection_vector_slots as _collection_vector_slots
     # v0.2.94: the ONE connect factory + URL resolver, and the guarded create.
     from vco_lib import weaviate_helpers as _wh
     from vco_lib.fixture_class_guard import guarded_collection_create
@@ -457,8 +458,12 @@ try:
     # `_analyze_<lang>_file` method below is a one-line delegator through
     # `_codegraph_lang.EXTRACTORS[<lang_dispatch key>]`. Shared extractor
     # helpers live in vco_lib/codegraph_lang/_shared (imported by the
-    # language modules directly; nothing in THIS file uses them anymore).
+    # language modules directly) — except the S16-3 policy-skip prune, whose
+    # skip fires there and whose end-of-walk flush is the analyzer's.
     from vco_lib import codegraph_lang as _codegraph_lang
+    from vco_lib.codegraph_lang._shared import (
+        prune_policy_skipped_files as _prune_policy_skipped_files,
+    )
     # v0.2.77 5c task 5: the pure stale-file union helper lives in vco_lib so
     # the analyzer monolith stays flat (P2f ratchet). `_union_stale_into_changed`
     # is a thin shim over it.
@@ -469,6 +474,7 @@ try:
         # reconcile that closes the entity-orphan convergence gap.
         delete_file_rows_exact as _delete_file_rows_exact_impl,
         primary_sources_for as _primary_sources_for,
+        _narrow_filter_for_paths,
         reconcile_walked_file_rows as _reconcile_walked_file_rows,
         open_walked_file_scope as _open_scope,
         commit_walked_file_scope as _commit_scope,
@@ -482,6 +488,10 @@ try:
     # so the analyzer monolith stays flat (P2f ratchet). `_prune_collection`
     # is a thin shim over it.
     from vco_lib.codegraph_prune import prune_collection as _prune_collection_impl
+    from vco_lib.codegraph_schema import (  # v0.2.102: one ensure loop + backfill
+        backfill_missing_property as _backfill_missing_property,
+        ensure_analyzer_properties as _ensure_analyzer_properties,
+    )
     from vco_lib.codegraph_deleted_files import (  # v0.2.100: deleted-file prune
         FILE_ANCHORED_COLLECTIONS as _FILE_ANCHORED_COLLECTIONS, PruneReport as _PruneReport,
         prune_file_rows as _prune_file_rows, prune_git_deleted_files as _prune_git_deleted_files,
@@ -1452,8 +1462,8 @@ class CodeGraphAnalyzer:
         # row was actually (re)written (`_create_or_update_module` — the
         # universal write choke-point every extractor funnels through).
         # `discovered − walked` = files present on disk that were SKIPPED
-        # (unchanged / minified / parse-failure) — their rows must be
-        # PRESERVED by the prune, not deleted. Populated only when
+        # (unchanged / parse-failure) — their rows must be PRESERVED by the
+        # prune (minified skips: pruned on purpose, S16-3). Populated only when
         # `_track_visited` is True (same gate as `visited_uuids`).
         self._prune_discovered_paths: Set[str] = set()
         self._prune_walked_paths: Set[str] = set()
@@ -1939,6 +1949,8 @@ class CodeGraphAnalyzer:
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="source_project", data_type=DataType.TEXT, description="Project that initiates the call", skip_vectorization=True),
+                        # v0.2.102 (S16-4): `project`, as the other four classes — the key every scoped reader filters on.
+                        Property(name="project", data_type=DataType.TEXT, description="Project name", skip_vectorization=True),
                         Property(name="interaction_type", data_type=DataType.TEXT, description="http | grpc | mq | websocket", skip_vectorization=True),
                         Property(name="direction", data_type=DataType.TEXT, description="outbound | inbound | pubsub", skip_vectorization=True),
                         Property(name="protocol", data_type=DataType.TEXT, description="GET/POST/... | kafka | rabbitmq | grpc | ws", skip_vectorization=True),
@@ -2044,6 +2056,7 @@ class CodeGraphAnalyzer:
         # suspenders with migrations/codegraph_collection/5_to_6.py.
         self._ensure_is_test_property()
         self._ensure_n_callers_property()
+        self._ensure_interaction_project_property()  # v0.2.102 S16-4
 
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
@@ -2722,14 +2735,30 @@ class CodeGraphAnalyzer:
     def _read_existing_object_fingerprint(
         self, collection, det_uuid: str, want_total_chunks: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Thin seam over ``guards.read_object_fingerprint`` (v0.2.82) — the
-        point-read body lives in vco_lib now; this is the analyzer-side seam its
-        two callers share. See the guard helper for the full contract.
+        """Thin seam over ``guards.read_object_fingerprint`` (v0.2.82) — the ONE
+        point-read every skip/stamp decision uses (embed precheck, write skip,
+        chunk fan-out). v0.2.102 (P299-B5): when the class DECLARES the active
+        code slot, the same read also fetches that slot's vector, and a
+        positively-empty slot reads as `_EMBED_REVISION_VECTORLESS` — so a
+        hash-matching row with no vector re-embeds instead of being skipped
+        forever. Slot undeclared / schema unreadable / payload unjudgeable →
+        no veto (an un-addable slot must not force a re-embed every run).
         """
-        return _guards.read_object_fingerprint(
+        slot = None
+        if DUAL_EMBEDDING_ENABLED:
+            cache = self.__dict__.setdefault("_declared_slots", {})
+            name = getattr(collection, "name", None) or id(collection)
+            if name not in cache:
+                cache[name] = _collection_vector_slots(collection) or ()
+            slot = _active_code_vector_slot()
+            slot = slot if slot in cache[name] else None
+        fp = _guards.read_object_fingerprint(
             collection, det_uuid, _EMBED_REVISION_PROP,
-            want_total_chunks=want_total_chunks,
+            want_total_chunks=want_total_chunks, vector_slot=slot,
         )
+        if fp is not None and fp.get("vector_present") is False:
+            fp["embed_revision"] = _EMBED_REVISION_VECTORLESS
+        return fp
 
     def _fingerprint_matches(
         self, stored_hash: str, stored_rev: Any, content_hash: str,
@@ -3049,68 +3078,37 @@ class CodeGraphAnalyzer:
                 # caller-preset value, mirroring the other stamp sites).
                 if not props.get("content_hash"):
                     props["content_hash"] = content_hash
-                # Cheap point-read of the existing stored hash + embed_revision.
-                # Any failure is a fall-through to write (fail-safe), NOT a skip.
-                try:
-                    query = getattr(collection, "query", None)
-                    fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
-                    if callable(fetch_by_id):
-                        # F3: for chunkable collections also read the stored
-                        # total_chunks so the shrink detector below can run.
-                        # NOT requested for Module/API/Interaction — their
-                        # schemas don't carry chunk props and an unknown
-                        # return_property would error the read into the
-                        # fail-safe write path (re-introducing tombstones).
-                        _read_props = ["content_hash", _EMBED_REVISION_PROP]
-                        if _is_chunkable:
-                            _read_props.append("total_chunks")
-                        existing = fetch_by_id(
-                            det_uuid,
-                            return_properties=_read_props,
-                        )
-                        # fetch_object_by_id returns None when absent.
-                        if existing is not None:
-                            existing_props = getattr(existing, "properties", None) or {}
-                            stored_hash = existing_props.get("content_hash") or ""
-                            # F3 shrink detector — canonical (chunk 0 / legacy
-                            # None) writes only, so the per-chunk fan-out
-                            # doesn't re-trigger it N times.
-                            if _is_chunkable and props.get("chunk_num") in (0, None):
-                                try:
-                                    _stored_total = int(
-                                        existing_props.get("total_chunks") or 1
-                                    )
-                                except (TypeError, ValueError):
-                                    _stored_total = 1
-                                try:
-                                    _new_total = int(props.get("total_chunks") or 1)
-                                except (TypeError, ValueError):
-                                    _new_total = 1
-                                if _stored_total > _new_total >= 1:
-                                    stale_chunk_min = _new_total
-                            # v0.2.72 (P7): FINGERPRINT GATE. Skip ONLY when BOTH
-                            # (a) the content is byte-identical (content_hash
-                            # matches) AND (b) the stored row was embedded under
-                            # the CURRENT revision. A NULL / mismatched
-                            # embed_revision (pre-migration row, or a row written
-                            # before the P3 chunking bump) FORCES a re-embed even
-                            # when the body text is unchanged — that is exactly
-                            # the ~7-9% over-budget-entity case P7 targets. This
-                            # is fail-safe: any uncertainty falls through to
-                            # write, never to a wrong skip.
-                            stored_rev = existing_props.get(_EMBED_REVISION_PROP)
-                            revision_current = stored_rev == CODEGRAPH_EMBED_REVISION
-                            if (
-                                stored_hash
-                                and stored_hash == content_hash
-                                and revision_current
-                            ):
-                                skip_replace = True
-                except Exception:  # noqa: BLE001
-                    # Read error / unsupported client / mocked collection →
-                    # fall through to the unconditional write. Never skip on
-                    # uncertainty.
-                    skip_replace = False
+                # Cheap point-read of the existing stored hash + embed_revision
+                # through the ONE fingerprint seam (v0.2.102: it also vetoes the
+                # skip when the active vector slot is positively empty — P299-B5;
+                # this was an inline copy of the read that could not). `None`
+                # (absent / unreadable / mocked) → write (fail-safe), never skip.
+                # F3: chunkable collections also read `total_chunks` for the
+                # shrink detector (Module/API/Interaction schemas lack it).
+                fp = CodeGraphAnalyzer._read_existing_object_fingerprint(
+                    self, collection, det_uuid, want_total_chunks=_is_chunkable,
+                )  # class-bound: stub-safe (light analyzer stubs bind this method)
+                if fp is not None:
+                    # F3 shrink detector — canonical (chunk 0 / legacy None)
+                    # writes only, so the per-chunk fan-out doesn't re-trigger.
+                    if _is_chunkable and props.get("chunk_num") in (0, None):
+                        _stored_total = fp.get("total_chunks") or 1
+                        try:
+                            _new_total = int(props.get("total_chunks") or 1)
+                        except (TypeError, ValueError):
+                            _new_total = 1
+                        if _stored_total > _new_total >= 1:
+                            stale_chunk_min = _new_total
+                    # v0.2.72 (P7): FINGERPRINT GATE. Skip ONLY when the content
+                    # is byte-identical AND the row was embedded under the
+                    # CURRENT revision (a vectorless row reads as revision 0).
+                    # Any uncertainty falls through to write, never a wrong skip.
+                    if (
+                        fp["content_hash"]
+                        and fp["content_hash"] == content_hash
+                        and fp["embed_revision"] == CODEGRAPH_EMBED_REVISION
+                    ):
+                        skip_replace = True
 
         # F3: the entity shrank — delete the stale tail rows. Runs on BOTH the
         # skip and write paths (the cleanup itself soft-fails; see helper).
@@ -3346,204 +3344,48 @@ class CodeGraphAnalyzer:
                 )
 
     # ------------------------------------------------------------------
-    # P2d (v0.2.75): the four `_ensure_*` helpers below (chunk props,
-    # embed_revision, is_test, n_callers) are the analyzer-side mirrors of
-    # the property specs in `vco_lib/codegraph_schema.py` — the ONE shared
-    # home also consumed by the migration edges (4_to_5.py / 5_to_6.py).
-    # This template must run standalone at user sites, so the helpers stay
-    # inline here; `tests/test_codegraph_schema_parity.py` asserts their
-    # ensured (class, prop, type) set is EQUAL to the shared table.
-    # NEW PROPS: add to vco_lib/codegraph_schema.py FIRST, then mirror the
-    # helper here + the new migration edge (the parity test is the lock).
+    # P2d (v0.2.75) / v0.2.102: the `_ensure_*` helpers below (chunk props,
+    # embed_revision, is_test, n_callers, CodeInteraction.project) delegate to
+    # ONE soft-fail loop over the spec table in `vco_lib/codegraph_schema.py`,
+    # the home the migration edges (4_to_5 / 5_to_6 / 7_to_8) also use.
+    # Additive add_property only (no re-index, no data loss); idempotent.
+    # `tests/test_codegraph_schema_parity.py` is the lock: the helpers must
+    # jointly ensure exactly the table. NEW PROPS: add to the table FIRST.
     # ------------------------------------------------------------------
 
     def _ensure_chunk_props_property(self):
-        """v0.2.72 (P3) schema migration: add `chunk_num` + `total_chunks`
-        (both INT) to CodeFunction + CodeClass so pre-v0.2.72 installs gain the
-        properties on the next analyze run and the chunk fan-out can stamp them.
-
-        Only Function + Class get the properties — they are the only chunkable
-        entities (Module summaries + API descriptions + Interactions fit the
-        budget). Pre-migration rows have NULL chunk_num; the read-path
-        (`_format_obj`, `_collapse_to_one_per_node`) normalises absent/0 to
-        "single chunk 1 of 1", so old rows behave as single-chunk entities
-        until re-analyzed.
-
-        Back-compat: adding a property to an existing Weaviate class is a
-        non-destructive metadata operation (no re-index, no data loss).
-        Idempotent — an already-present property is skipped silently. Soft-fail
-        per (collection, property). Mirrors `_ensure_file_path_property`.
-        """
-        collections = [
-            ("CodeFunction", self.functions_collection),
-            ("CodeClass",    self.classes_collection),
-        ]
-        new_props = [
-            ("chunk_num", "0-indexed chunk number within this entity (0 for single-chunk)"),
-            ("total_chunks", "Total chunks this entity was split into (1 for single-chunk)"),
-        ]
-        for label, coll in collections:
-            if coll is None:
-                continue
-            try:
-                config = coll.config.get()
-                existing_props = {p.name for p in config.properties}
-            except Exception as e:
-                logger.debug(f"v0.2.72 chunk-props migration: config read on {label} skipped: {e}")
-                continue
-            for prop_name, desc in new_props:
-                if prop_name in existing_props:
-                    continue
-                try:
-                    coll.config.add_property(
-                        Property(
-                            name=prop_name,
-                            data_type=DataType.INT,
-                            description=desc,
-                            skip_vectorization=True,
-                        )
-                    )
-                    print(f"   Added {prop_name} property to {label} schema (v0.2.72)")
-                except Exception as e:
-                    logger.debug(
-                        f"v0.2.72 {prop_name} migration on {label} skipped: {e}"
-                    )
+        """v0.2.72 (P3): `chunk_num` + `total_chunks` (INT) on CodeFunction +
+        CodeClass, the only chunkable entities. NULL on pre-migration rows is
+        read as "single chunk 1 of 1" until re-analyzed."""
+        _ensure_analyzer_properties(self, ("chunk_num", "total_chunks"))
 
     def _ensure_embed_revision_property(self):
-        """v0.2.72 (P7) schema migration: add `embed_revision` (INT) to the
-        5 code collections so pre-P7 installs gain the property on the next
-        analyze run and `_write_one_object` can stamp + read it for the
-        revision-gated forced resync.
-
-        WHY all 5 (not just Function/Class): the fingerprint gate lives in the
-        shared `_write_one_object` write path, which handles EVERY collection.
-        Stamping `embed_revision` uniformly keeps the gate's point-read simple
-        (one property name, one meaning) and lets a FUTURE revision bump that
-        affects Module/API/Interaction embeddings reuse the same machinery
-        without another migration. Today only Function/Class chunk, so only
-        their over-budget rows will actually mismatch and re-embed under
-        revision 1 — the others stamp the revision on their next ordinary write
-        and thereafter match.
-
-        Pre-migration rows have NULL `embed_revision` → the gate treats them as
-        "revision unknown" → FORCED re-embed (fail-safe), after which they carry
-        the current revision and go stable. Adding a property is a
-        non-destructive metadata operation (no re-index, no data loss).
-        Idempotent — an already-present property is skipped silently. Soft-fail
-        per collection. Mirrors `_ensure_content_hash_property` exactly.
-        """
-        collections = [
-            ("CodeModule",      self.modules_collection),
-            ("CodeClass",       self.classes_collection),
-            ("CodeFunction",    self.functions_collection),
-            ("CodeAPI",         self.apis_collection),
-            ("CodeInteraction", self.interactions_collection),
-        ]
-        desc = (
-            "Embedding-generation revision this row's vector(s) were produced "
-            "under (P7 revision-gated forced resync; see CODEGRAPH_EMBED_REVISION)"
-        )
-        for label, coll in collections:
-            if coll is None:
-                continue
-            try:
-                config = coll.config.get()
-                existing_props = {p.name for p in config.properties}
-                if _EMBED_REVISION_PROP in existing_props:
-                    continue
-                coll.config.add_property(
-                    Property(
-                        name=_EMBED_REVISION_PROP,
-                        data_type=DataType.INT,
-                        description=desc,
-                        skip_vectorization=True,
-                    )
-                )
-                print(f"   Added {_EMBED_REVISION_PROP} property to {label} schema (v0.2.72 P7)")
-            except Exception as e:
-                # Soft-fail. A 422 here doesn't break analysis — the revision
-                # gate just sees NULL for this collection until the next
-                # successful migration (which errs toward re-embed, never a
-                # wrong skip).
-                logger.debug(
-                    f"v0.2.72 P7 {_EMBED_REVISION_PROP} migration on {label} skipped: {e}"
-                )
+        """v0.2.72 (P7): `embed_revision` (INT) on all 5 code collections — the
+        fingerprint gate in the shared write path handles every collection.
+        NULL → "revision unknown" → re-embed (fail-safe), then stable."""
+        _ensure_analyzer_properties(self, (_EMBED_REVISION_PROP,))
 
     def _ensure_is_test_property(self):
-        """v0.2.73 (M1) schema migration: add `is_test` (BOOL) to the three
-        file-anchored collections (CodeFunction/CodeClass/CodeModule).
-
-        Stamped by `_dedup_insert` from the pure path heuristic
-        (`is_test_path`); consumed by the retrieval rerank penalty. NULL on
-        pre-migration rows → the consumer derives from the stored
-        file_path/path at query time (fail-safe: no path → not penalized);
-        the backfill pass (`codegraph_resync.backfill_codegraph_metadata`)
-        populates existing rows without touching vectors. Belt-and-suspenders
-        with `migrations/codegraph_collection/5_to_6.py` (same-author rule).
-        Additive, idempotent, soft-fail per collection — mirrors
-        `_ensure_content_hash_property`.
-        """
-        collections = [
-            ("CodeModule",   self.modules_collection),
-            ("CodeClass",    self.classes_collection),
-            ("CodeFunction", self.functions_collection),
-        ]
-        desc = (
-            "True when the source file is a test/spec/fixture "
-            "(path heuristic; retrieval downweight)"
-        )
-        for label, coll in collections:
-            if coll is None:
-                continue
-            try:
-                config = coll.config.get()
-                existing_props = {p.name for p in config.properties}
-                if "is_test" in existing_props:
-                    continue
-                coll.config.add_property(
-                    Property(
-                        name="is_test",
-                        data_type=DataType.BOOL,
-                        description=desc,
-                        skip_vectorization=True,
-                    )
-                )
-                print(f"   Added is_test property to {label} schema (v0.2.73 M1)")
-            except Exception as e:
-                logger.debug(f"v0.2.73 is_test migration on {label} skipped: {e}")
+        """v0.2.73 (M1): `is_test` (BOOL) on CodeModule/CodeClass/CodeFunction
+        (path heuristic; retrieval downweight). Belt-and-suspenders with
+        migrations/codegraph_collection/5_to_6.py."""
+        _ensure_analyzer_properties(self, ("is_test",))
 
     def _ensure_n_callers_property(self):
-        """v0.2.73 (M4) schema migration: add `n_callers` (INT) to
-        CodeFunction only.
+        """v0.2.73 (M4): `n_callers` (INT) on CodeFunction only (render-time
+        context; NULL = unknown, never a fake zero)."""
+        _ensure_analyzer_properties(self, ("n_callers",))
 
-        Accumulated by `create_cross_references` from resolved inbound call
-        edges (Python-resolved, project-internal — honest-coverage note in
-        the property description). Render-time context only, NOT a rerank
-        signal this release. NULL = unknown/leaf (the renderer omits the
-        line; no fake zeros). Additive, idempotent, soft-fail.
-        """
-        coll = self.functions_collection
-        if coll is None:
+    def _ensure_interaction_project_property(self):
+        """v0.2.102 (S16-4): `project` on CodeInteraction; when THIS call adds it,
+        backfill rows lacking it (resumable, soft-fail; the 7_to_8 edge too)."""
+        if "CodeInteraction.project" not in _ensure_analyzer_properties(self, ("project",)):
             return
-        try:
-            config = coll.config.get()
-            existing_props = {p.name for p in config.properties}
-            if "n_callers" in existing_props:
-                return
-            coll.config.add_property(
-                Property(
-                    name="n_callers",
-                    data_type=DataType.INT,
-                    description=(
-                        "Inbound call count (Python-resolved, "
-                        "project-internal; render-time context)"
-                    ),
-                    skip_vectorization=True,
-                )
-            )
-            print("   Added n_callers property to CodeFunction schema (v0.2.73 M4)")
-        except Exception as e:
-            logger.debug(f"v0.2.73 n_callers migration skipped: {e}")
+        done, failed = _backfill_missing_property(
+            self.interactions_collection, "project", getattr(self, "project_name", "") or "")
+        print(f"   Backfilled project on {done} CodeInteraction row(s)"
+              + (f" ({failed} failed — the 7_to_8 edge finishes them on the next update)"
+                 if failed else ""))
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
@@ -3682,6 +3524,7 @@ class CodeGraphAnalyzer:
         # so a stale value from a prior analyze_repository call in the same
         # process must never leak into this run's stats.
         self._prune_failures = 0
+        self._policy_skipped = {}  # S16-3: per-run policy-skip record (flushed per walk)
         # v0.2.100 (--as-extra-path): repo_path IS an extra path → only rows PROVABLY
         # stamped with it are ever judged/deleted (source_is_owned strict).
         self._strict_source = bool(as_extra_path)
@@ -4014,6 +3857,10 @@ class CodeGraphAnalyzer:
                     # write leaves a lying module row behind.
                     self._invalidate_module_row(f, source_root)
 
+        # v0.2.102 (S16-3): rows of files skipped as minified/generated this
+        # walk are out of the graph by policy — prune them (one narrowed scan).
+        self._prune_policy_skipped_files()
+
         # Clear the per-language context now that the dispatch loop is
         # done (Plan C). The prune pass below doesn't depend on it.
         self._current_language = ""
@@ -4208,10 +4055,11 @@ class CodeGraphAnalyzer:
             per_collection_visited.setdefault(coll_name, set()).add(uid)
 
         # v0.2.82 — preserve set: files the dispatcher discovered on disk but
-        # whose extraction never wrote a module row (unchanged-skip / minified
-        # / parse-failure). Their rows are ALIVE, just not re-walked; deleting
+        # whose extraction never wrote a module row (unchanged-skip /
+        # parse-failure). Their rows are ALIVE, just not re-walked; deleting
         # them is the 2026-07-15 whole-graph-wipe incident. Rows anchored to
-        # these paths are preserved by `_prune_collection`.
+        # these paths are preserved by `_prune_collection` (a minified skip's
+        # rows were already pruned by the S16-3 end-of-walk policy prune).
         preserve_paths: Set[str] = (
             getattr(self, "_prune_discovered_paths", set())
             - getattr(self, "_prune_walked_paths", set())
@@ -4694,6 +4542,9 @@ class CodeGraphAnalyzer:
                     # CodeInteraction's whole property set + the identity key
                     # (keyed on the source token, which is not a stored prop).
                     "source_project": self.project_name,
+                    # v0.2.102 (S16-4): the `project` every scoped reader keys
+                    # on (outside the content hash → no re-write of a matched row).
+                    "project": self.project_name,
                     "interaction_type": ix["interaction_type"],
                     "direction": ix.get("direction", "outbound"),
                     "protocol": ix["protocol"],
@@ -5144,6 +4995,25 @@ class CodeGraphAnalyzer:
         if deleted:
             print(f"   🗑️  pruned {deleted} object(s) for deleted file {rel_path}")
         return deleted
+
+    def _note_policy_skipped_file(self, rel_path: str) -> None:
+        """S16-3: record a policy-skipped (minified) file under its walk source."""
+        skipped = self.__dict__.setdefault("_policy_skipped", {})
+        skipped.setdefault(getattr(self, "_current_source", "") or "", set()).add(rel_path)
+
+    def _prune_policy_skipped_files(self) -> None:
+        """S16-3: shim over `_shared.prune_policy_skipped_files` (failures → partial)."""
+        skipped, self._policy_skipped = getattr(self, "_policy_skipped", {}), {}
+        if not skipped:
+            return
+        raw_root = getattr(self, "_analyze_repo_root_raw", None)
+        _, failures = _prune_policy_skipped_files(
+            [(getattr(self, a, None), p) for a, p in _FILE_ANCHORED_COLLECTIONS],
+            skipped, project=self.project_name or "",
+            primary_sources=_primary_sources_for(Path(raw_root)) if raw_root else None,
+            deleter=_delete_file_rows_exact, narrow=_narrow_filter_for_paths,
+            strict=bool(getattr(self, "_strict_source", False)))
+        self._prune_failures = getattr(self, "_prune_failures", 0) + failures
 
     def _prune_git_deleted(self, source_root: Path, since_commit: Optional[str]) -> None:
         """``--incremental``: remove the rows of files deleted / renamed away in

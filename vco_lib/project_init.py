@@ -6078,6 +6078,7 @@ def _trigger_extractor_generation_reindex(
         update re-triggers (no stamp is written).
     """
     from vco_lib import codegraph_extractor_generation as _ceg
+    from vco_lib.codegraph_resync import bundle_update_audit_step as _cg_audit_step
 
     project_name = _resolve_codegraph_project_name(folder)
     if not project_name:
@@ -6107,7 +6108,6 @@ def _trigger_extractor_generation_reindex(
               "project": project_name})
 
     if outcome.status == "launched":
-        result.setdefault("extractor_reindex", {})
         result["extractor_reindex"] = {
             "status": outcome.status, "reason": outcome.reason,
             "generation": outcome.generation, "pid": outcome.pid,
@@ -6149,11 +6149,13 @@ def _trigger_extractor_generation_reindex(
             f"{outcome.message}"
         )
     else:
-        result.setdefault("extractor_reindex", {})
         result["extractor_reindex"] = {
             "status": outcome.status, "reason": outcome.reason,
             "generation": outcome.generation,
         }
+
+    if outcome.status != "launched":  # W1-C r4: one-time audits (a launched re-index runs them)
+        _cg_audit_step(Path(folder), project_name, index_dot_claude=bool(is_root_target), log=log)
 
 
 def current_chunker_revision() -> str:

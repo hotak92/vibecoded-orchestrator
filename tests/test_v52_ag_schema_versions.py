@@ -104,7 +104,9 @@ def test_canonical_version_helper() -> None:
     # v0.2.73 READ-amp: one-time purge of .claude/state transient-scratch rows the
     # pre-fix walk wrongly indexed → bumped 6→7 with migrations/codegraph_collection/
     # 6_to_7.py (targeted delete_by_id; NO drop, NO re-embed, survivors untouched).
-    assert sv.canonical_version("codegraph_collection") == 7
+    # v0.2.102 S16-4: `project` on CodeInteraction → bumped 7→8 with
+    # migrations/codegraph_collection/7_to_8.py (add_property + backfill only).
+    assert sv.canonical_version("codegraph_collection") == 8
     assert sv.canonical_version("rl_events_payload_shape") == 3
     with pytest.raises(KeyError):
         sv.canonical_version("not_a_real_artifact_type")

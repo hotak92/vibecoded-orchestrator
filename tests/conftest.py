@@ -643,11 +643,18 @@ def _redirect_user_state_dir(request):
     install_root_keys = {"VCT_INSTALL_ROOT": str(_REPO_ROOT)}
     # W-TOOL-DIRS: unconditional, like W-INSTALL-ROOT (see the block above).
     install_root_keys[TOOL_SEARCH_DIRS_ENV] = ""
+    # W1-C (v0.2.102 R5): bound the resync-driver slot queue wait so a wedged
+    # slot holder in a test degrades to run-anyway in seconds instead of the
+    # 6 h production default (which would surface as an apparent hang). A
+    # test that cares about the wait sets its own value after this fixture —
+    # monkeypatch.setenv runs later and wins.
+    resync_keys = {"VCO_RESYNC_DRIVER_WAIT_S": "5"}
     self_isolated = (
         request.node.fspath.basename in _SELF_ISOLATED_STATE_DIR_FILES
     )
     prev = {
-        k: os.environ.get(k) for k in (*keys, *claude_keys, *install_root_keys)
+        k: os.environ.get(k)
+        for k in (*keys, *claude_keys, *install_root_keys, *resync_keys)
     }
     if self_isolated:
         # Stand aside DETERMINISTICALLY (pop, don't restore the ambient value)
@@ -662,6 +669,7 @@ def _redirect_user_state_dir(request):
         _seed_unroutable_service_endpoints(_VCO_STATE_REDIRECT)
     os.environ.update(claude_keys)
     os.environ.update(install_root_keys)
+    os.environ.update(resync_keys)
     try:
         yield
     finally:

@@ -703,6 +703,66 @@ def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -
             pass
 
 
+@contextlib.contextmanager
+def machine_slot(
+    slot_dir: Path,
+    *,
+    slots: int,
+    wait_s: float,
+    poll_s: float = 5.0,
+    on_wait: Optional[Any] = None,
+) -> Iterator[Optional[int]]:
+    """Hold ONE of ``slots`` machine-wide slots under ``slot_dir`` for the block
+    — a counting semaphore built from :func:`exclusive_file_lock` (v0.2.102
+    W1-C), one lock file per slot (``slot-<i>.lock``).
+
+    Queue, never drop:
+    * each poll tries every slot non-blocking, and the first free one is held
+      for the block;
+    * when all are busy, ``on_wait(waited_s)`` is called once (the caller logs
+      a line) and the take retries every ``poll_s``;
+    * after ``wait_s`` the block runs ANYWAY, yielding ``None``. A wedged
+      holder must never stop work forever; the bound only caps how long
+      fairness is honoured.
+
+    A slot is released when the block exits. Because ``flock`` belongs to the
+    open file description, it is also released when the holder process exits
+    or crashes; nothing is left to clean up.
+
+    Best-effort exactly like :func:`exclusive_file_lock`: where ``flock`` does
+    not exist (Windows, or a filesystem without it) the first slot "succeeds"
+    without exclusion, so the block runs unbounded, as it did before.
+    """
+    import time  # noqa: PLC0415
+
+    n = max(1, int(slots))
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    started = time.monotonic()
+    announced = False
+    while True:
+        for i in range(n):
+            cm = exclusive_file_lock(Path(slot_dir) / f"slot-{i}.lock", timeout_s=0)
+            try:
+                cm.__enter__()
+            except LockTimeout:
+                continue
+            try:
+                yield i
+            finally:
+                cm.__exit__(None, None, None)
+            return
+        if not announced and on_wait is not None:
+            announced = True
+            try:
+                on_wait(time.monotonic() - started)
+            except Exception:  # noqa: BLE001 — a log hook never blocks the queue
+                pass
+        if time.monotonic() >= deadline:
+            yield None
+            return
+        time.sleep(max(0.05, float(poll_s)))
+
+
 def claim_once(path: Path, *, stale_after_s: float) -> Optional[bool]:
     """Claim *path* ATOMICALLY by creating it with ``O_CREAT | O_EXCL``.
 

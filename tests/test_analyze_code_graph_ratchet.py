@@ -111,7 +111,12 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # guard added lines too; answered by moving `_filter_changed_files` into the
 # same module (it shares the diff-range rule with the deleted-file pass) —
 # net 7196 -> 7157.
-_ANALYZER_LINES_MAX = 7157
+# v0.2.102 (W1-C): the minified-skip prune, the vector-aware fingerprint and
+# CodeInteraction.project added call sites; answered by moving the four P2d
+# `_ensure_*` loop bodies behind `vco_lib.codegraph_schema.ensure_analyzer_
+# properties` and routing `_write_one_object`'s inline point-read through the
+# one fingerprint seam — net 7157 -> 7027 (after the review round), re-pinned DOWNWARD.
+_ANALYZER_LINES_MAX = 7027
 
 
 def _measure() -> int:

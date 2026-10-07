@@ -136,6 +136,7 @@ def read_object_fingerprint(
     det_uuid: str,
     embed_revision_prop: str,
     want_total_chunks: bool = False,
+    vector_slot: Optional[str] = None,
 ) -> Optional[dict]:
     """Point-read an object's tombstone-skip fingerprint by UUID (I/O helper).
 
@@ -150,6 +151,13 @@ def read_object_fingerprint(
     ``total_chunks`` (valid only for chunkable Function/Class collections;
     Module/API/Interaction schemas lack it and an unknown return_property errors
     the read).
+
+    v0.2.102 (P299-B5): ``vector_slot`` (a named-vector slot the caller has
+    confirmed the class DECLARES) adds ``include_vector=[vector_slot]`` to the
+    SAME fetch and a ``"vector_present"`` key to the result: ``False`` only when
+    the slot positively came back empty/missing, ``True`` when it holds a
+    vector, ``None`` when the payload could not be judged. Omitted (default) →
+    the read and the returned dict are exactly the pre-.102 ones.
     """
     try:
         query = getattr(collection, "query", None)
@@ -159,7 +167,12 @@ def read_object_fingerprint(
         read_props = ["content_hash", embed_revision_prop]
         if want_total_chunks:
             read_props.append("total_chunks")
-        existing = fetch_by_id(det_uuid, return_properties=read_props)
+        if vector_slot:
+            existing = fetch_by_id(
+                det_uuid, return_properties=read_props, include_vector=[vector_slot],
+            )
+        else:
+            existing = fetch_by_id(det_uuid, return_properties=read_props)
         if existing is None:
             return None
         existing_props = getattr(existing, "properties", None) or {}
@@ -169,12 +182,35 @@ def read_object_fingerprint(
                 total_chunks = int(existing_props.get("total_chunks") or 1)
             except (TypeError, ValueError):
                 total_chunks = 1
-        return {
+        fingerprint = {
             "content_hash": existing_props.get("content_hash") or "",
             "embed_revision": existing_props.get(embed_revision_prop),
             "total_chunks": total_chunks,
         }
+        if vector_slot:
+            fingerprint["vector_present"] = slot_vector_present(
+                getattr(existing, "vector", None), vector_slot,
+            )
+        return fingerprint
     except Exception:  # noqa: BLE001 — any read failure → unknown → write
+        return None
+
+
+def slot_vector_present(vector_field: Any, slot: str) -> Optional[bool]:
+    """PURE: does a fetched object's ``vector`` payload hold a vector in ``slot``?
+
+    ``True`` = populated; ``False`` = positively empty (the slot is missing from
+    a named-vector dict, or maps to ``[]`` / ``None`` — weaviate's shape for a
+    declared-but-never-written slot); ``None`` = cannot judge (no dict at all —
+    an older client or a double that drops vectors). Callers treat ``None`` as
+    "no veto" so an unjudgeable read never forces a re-embed.
+    """
+    if not isinstance(vector_field, dict):
+        return None
+    vec = vector_field.get(slot)
+    try:
+        return bool(vec) and len(vec) > 0
+    except Exception:  # noqa: BLE001 — unreadable payload → cannot judge
         return None
 
 

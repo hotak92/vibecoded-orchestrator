@@ -12,9 +12,12 @@ write, the visited set stays empty, and the prune deleted two projects'
 entire code graphs (two field projects: 1,876 objects → 0 and 436 → 0).
 
 The fix threads a ``preserve_paths`` set (files the dispatcher DISCOVERED on
-disk but did not re-walk — unchanged-skip / minified-skip / parse failure)
-into the per-collection prune: rows anchored to those files are alive, not
-stale, and are exempt from deletion.
+disk but did not re-walk — unchanged-skip / parse failure) into the
+per-collection prune: rows anchored to those files are alive, not stale, and
+are exempt from deletion. (A minified-skipped file is in the set too, but since
+v0.2.102 S16-3 its rows are pruned on purpose at the end of the walk — the skip
+is a policy ruling that the file is out of the graph — so there is nothing left
+to exempt.)
 
 Extracted from the analyzer monolith (P2f line-count ratchet:
 ``tests/test_analyze_code_graph_ratchet.py``) — the analyzer keeps a thin
@@ -52,10 +55,11 @@ def prune_collection(
 
     v0.2.82 (2026-07-15 wipe incident): ``preserve_paths`` is the set of
     repo-relative POSIX paths the dispatcher discovered on disk but did
-    NOT re-walk this run (per-file unchanged-skip, minified-skip, parse
-    failure). Rows anchored to those files are ALIVE — nothing visited
-    them only because the walk short-circuited — so they are exempt from
-    deletion. Anchor property is ``path`` for CodeModule and ``file_path``
+    NOT re-walk this run (per-file unchanged-skip, parse failure). Rows
+    anchored to those files are ALIVE — nothing visited them only because
+    the walk short-circuited — so they are exempt from deletion. (Minified
+    skips also land here, but their rows are pruned deliberately by the
+    analyzer's end-of-walk policy prune — v0.2.102 S16-3.) Anchor property is ``path`` for CodeModule and ``file_path``
     for the other collections; when the collection's schema lacks the
     anchor (legacy pre-migration classes) OR a row has no anchor value,
     the row is DELETED only when ``preserve_paths`` is empty (i.e. a

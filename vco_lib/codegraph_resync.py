@@ -184,7 +184,11 @@ from vco_lib.log_setup import configure_logging  # noqa: E402 — grouped with t
 from vco_lib.codegraph_guards import (  # noqa: E402 — grouped with the notes above
     classify_stale_kind as _guards_classify_stale_kind,
     is_row_revision_stale as _guards_is_row_revision_stale,
+    slot_vector_present as _slot_vector_present,
 )
+
+from vco_lib.kg_vector_slot import collection_vector_slots as _collection_vector_slots  # noqa: E402
+from vco_lib import codegraph_one_time_audits as _audits  # noqa: E402
 
 #: Backwards-compat alias (pre-v0.2.75 module-local name).
 _path_reachable_on_disk = path_reachable_on_disk
@@ -438,54 +442,99 @@ def prune_ignored_rows(
 
     ``client`` may be injected (tests); otherwise a connection is built from
     ``weaviate_url`` / ``$WEAVIATE_URL`` / localhost:8081 and closed on exit.
+    Thin wrapper over :func:`prune_ignored_rows_report` (which also reports
+    failures/completeness for the one-time audit ledger).
     """
-    counts: dict = {}
-    if not project_name:
-        return counts
+    return prune_ignored_rows_report(
+        project_name, client=client, index_dot_claude=index_dot_claude,
+        weaviate_url=weaviate_url, grpc_port=grpc_port,
+    )["counts"]
 
+
+def ignore_set_key(index_dot_claude: bool) -> str:
+    """The one-time ignored-path purge's ledger key (W1-C S5): a fingerprint of
+    the CURRENT ignore set (path parts + skip suffixes) plus the project's
+    ``index_dot_claude`` choice. A change to either makes the purge owed again —
+    rows of a newly-ignored directory are exactly as unreachable as the old ones.
+    """
+    from vco_lib.hashing import sha256_text
+
+    payload = "|".join(sorted(CODEGRAPH_IGNORE_PARTS)) + "#" + "|".join(
+        sorted(CODEGRAPH_SKIP_SUFFIXES)
+    )
+    return f"{sha256_text(payload)[:16]}:dotclaude={int(bool(index_dot_claude))}"
+
+
+def prune_ignored_rows_report(
+    project_name: str,
+    *,
+    client=None,
+    index_dot_claude: bool = True,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> dict:
+    """The ignore-set purge, with an honest report:
+    ``{"counts": {coll: deleted}, "failures": N, "complete": bool}``.
+
+    v0.2.102 (W1-C S5): the per-row decision is
+    ``codegraph_row_classify.path_is_ignored``, the same predicate the walk and
+    the classifier use. The delete goes through the ONE tokenization-safe
+    primitive, :func:`delete_file_rows_exact`: the raw stored path is read
+    back, the predicate is applied in Python, and ``delete_by_id`` runs only
+    on confirmed matches. A sibling whose path merely shares a token with an
+    ignored directory (``lib/my_vendor_tools/x.py`` next to ``vendor/``) is
+    never touched. Before .102 the purge collected UUIDs the same way but
+    deleted them through ``delete_many``, and its failures were invisible.
+
+    ``complete`` is False when the prefix, client or any collection could not
+    be read. ``failures`` counts per-row delete failures, plus one per
+    collection whose scan raised. The one-time ledger is recorded only when
+    ``complete`` is True and ``failures`` is 0. Resumable: a re-run finds only
+    the rows still present.
+    """
+    report: dict = {"counts": {}, "failures": 0, "complete": False}
+    if not project_name:
+        return report
     with _probe_client(client, weaviate_url, grpc_port) as client:
         if client is None:
-            return counts
-        try:
-            from weaviate.classes.query import Filter
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("codegraph prune: weaviate Filter unavailable: %s", exc)
-            return counts
-
+            return report
         prefix = _collection_prefix(project_name)
         if prefix is None:
             # Conservative default: no positive prefix confirmation → do
             # nothing rather than guess a delete target.
-            return counts
+            return report
+        complete = True
+
+        def _ignored(raw_path, _props):
+            return _path_is_ignored(raw_path, index_dot_claude=index_dot_claude)
+
         for base in _CODEGRAPH_BASES:
             coll_name = f"{prefix}_{base}"
             coll, status = _open_collection(client, coll_name, "prune")
+            if status == _COLL_ABSENT:
+                continue  # nothing stored
             if status != _COLL_OK:
-                continue  # absent: nothing stored; error: already logged
+                complete = False
+                continue  # error: already logged
             try:
-                path_prop = _PRUNE_PATH_PROP.get(base, "file_path")
-                to_delete: list = []
-                for obj in coll.iterator(return_properties=[path_prop]):
-                    p = getattr(obj, "properties", None) or {}
-                    fp = p.get(path_prop) or ""
-                    if _path_is_ignored(fp, index_dot_claude=index_dot_claude):
-                        to_delete.append(obj.uuid)
-                deleted = 0
-                for i in range(0, len(to_delete), 100):
-                    batch = to_delete[i:i + 100]
-                    coll.data.delete_many(
-                        where=Filter.by_id().contains_any(batch)
-                    )
-                    deleted += len(batch)
-                if deleted:
-                    logger.info(
-                        "codegraph prune: %s — deleted %d ignore-set row(s)",
-                        coll_name, deleted,
-                    )
-                counts[coll_name] = deleted
+                deleted, failures = delete_file_rows_exact(
+                    coll, _PRUNE_PATH_PROP.get(base, "file_path"), _ignored,
+                    log_prefix="ignore-set purge",
+                )
             except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
                 logger.warning("codegraph prune: %s failed: %s", coll_name, exc)
-        return counts
+                report["failures"] += 1
+                complete = False
+                continue
+            if deleted:
+                logger.info(
+                    "codegraph prune: %s — deleted %d ignore-set row(s)",
+                    coll_name, deleted,
+                )
+            report["counts"][coll_name] = deleted
+            report["failures"] += failures
+        report["complete"] = complete
+        return report
 
 
 #: Exact substring identifying orchestrator transient-scratch rows — the
@@ -1347,6 +1396,7 @@ def demote_current_revision_rows(
     client=None,
     weaviate_url: Optional[str] = None,
     grpc_port: Optional[int] = None,
+    vector_slot: Optional[str] = None,
 ) -> Optional[dict]:
     """M-2 HEAL: demote every row AT the current revision to the vectorless
     sentinel (``embed_revision=0``) so the EXISTING revision gate forces
@@ -1372,6 +1422,16 @@ def demote_current_revision_rows(
     in ``failed`` (the driver keeps the marker owed when ``failed > 0`` —
     clearing it over un-demoted rows would silently under-heal).  Never
     raises.
+
+    v0.2.102 (W1-C S4) — ``vector_slot``: the vectorless-row audit's mode.
+    The cursor also fetches that slot's vector (``include_vector=[slot]``) and
+    demotes ONLY current-revision rows whose slot is positively empty
+    (``codegraph_guards.slot_vector_present is False``). Every other row —
+    vector present, or a payload that cannot be judged — is left alone. A
+    class that does not declare the slot is skipped, because a re-embed cannot
+    add a slot. Those rows are invisible to the revision-based census and to
+    the per-file gate; once demoted, both see them, and the walk's
+    vector-aware fingerprint re-embeds them.
     """
     if not project_name:
         return None
@@ -1392,8 +1452,13 @@ def demote_current_revision_rows(
                 continue
             if status == _COLL_ERROR:
                 return None
+            iter_kwargs: dict = {"return_properties": ["embed_revision"]}
+            if vector_slot:
+                if vector_slot not in (_collection_vector_slots(coll) or ()):
+                    continue  # undeclared slot: nothing a re-embed could fill
+                iter_kwargs["include_vector"] = [vector_slot]
             try:
-                for obj in coll.iterator(return_properties=["embed_revision"]):
+                for obj in coll.iterator(**iter_kwargs):
                     props = getattr(obj, "properties", None) or {}
                     # Already-stale rows (NULL / 0 / older) re-embed on any
                     # walk — demoting them would be a pointless write.
@@ -1401,6 +1466,10 @@ def demote_current_revision_rows(
                         props.get("embed_revision"), int(current_revision)
                     ):
                         continue
+                    if vector_slot and _slot_vector_present(
+                        getattr(obj, "vector", None), vector_slot,
+                    ) is not False:
+                        continue  # vector present / unjudgeable → leave alone
                     try:
                         coll.data.update(
                             uuid=str(obj.uuid),
@@ -3006,6 +3075,167 @@ def _maybe_run_exposure_heal(repo_root: Path, project_name: str) -> bool:
     return True
 
 
+def _active_code_slot() -> Optional[str]:
+    """The named-vector slot the configured code model writes to — the slot the
+    analyzer will embed into on this machine (``EmbeddingService.for_project``
+    resolves it exactly as the analyzer's own service does). ``None`` when it
+    cannot be resolved (no backend reachable / import failure): the caller then
+    does not audit — never guesses a slot to judge rows against."""
+    try:
+        from vco_lib.embedding_service import EmbeddingService
+
+        svc = EmbeddingService.for_project()
+        try:
+            return svc.code_vector_slot or None
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as exc:  # noqa: BLE001 — unresolvable → no audit
+        logger.info("codegraph resync: active code slot unresolvable: %s", exc)
+        return None
+
+
+def vectorless_audit_owed(project_name: str, current_revision: int) -> bool:
+    """Spawn-gate side of the S4 audit: owed unless it already completed for
+    this project at ``current_revision`` (the slot half of the key is checked
+    by the driver, which can resolve the active slot; a slot switch at an
+    unchanged revision is caught on the next spawn for any reason)."""
+    key = _audits.recorded_key(_audits.AUDIT_VECTORLESS, project_name)
+    return not (key or "").endswith(f"@{int(current_revision)}")
+
+
+def _one_time_audits_owed(
+    project_name: str, analyzer: Optional[Path], index_dot_claude: bool,
+) -> list:
+    """Names of the W1-C one-time audits still owed for ``project_name``
+    (spawn-gate view). Never raises; an error reads as "nothing owed" for that
+    audit rather than forcing a spawn on every update."""
+    owed: list = []
+    try:
+        if vectorless_audit_owed(project_name, _resolve_embed_revision(analyzer)):
+            owed.append(_audits.AUDIT_VECTORLESS)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("codegraph resync: vectorless-audit gate read failed: %s", exc)
+    try:
+        if _audits.audit_owed(_audits.AUDIT_IGNORED_PATHS, project_name,
+                              ignore_set_key(index_dot_claude)):
+            owed.append(_audits.AUDIT_IGNORED_PATHS)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("codegraph resync: ignore-purge gate read failed: %s", exc)
+    return owed
+
+
+def spawn_one_time_audits_if_owed(
+    repo_root: Path,
+    project_name: str,
+    *,
+    index_dot_claude: bool,
+    python_exe: Optional[str] = None,
+    spawn=None,
+) -> "Optional[ResyncTriggerResult]":
+    """Per-project bundle-update entry for the W1-C one-time audits (round 4).
+
+    The audits run only inside the resync driver, and on update a CONVERGED,
+    extractor-current project never reached a driver: the bundle path spawned
+    only when an extractor re-index was owed (with ``check_owed=False``). This
+    launches the ordinary owed-checked spawn exactly when
+    :func:`_one_time_audits_owed` says this project still owes one. That is
+    the SAME check the spawn gate itself uses, so the two cannot disagree.
+    Inside the spawn, the gate re-derives the decision; a project with real
+    stale rows simply spawns for those too.
+
+    Returns ``None`` when nothing is owed (no spawn, no probe, no I/O beyond
+    the ledger read), else the spawn's :class:`ResyncTriggerResult`. Never
+    raises.
+    """
+    try:
+        owed = _one_time_audits_owed(
+            project_name, _resolve_analyzer(Path(repo_root)), index_dot_claude,
+        )
+        if not owed:
+            return None
+        return (spawn or spawn_background_resync)(
+            Path(repo_root), project_name, python_exe=python_exe,
+            check_owed=True, index_dot_claude=index_dot_claude,
+        )
+    except Exception as exc:  # noqa: BLE001 — an update never fails on this
+        logger.warning("codegraph resync: one-time audit spawn raised: %s", exc)
+        return ResyncTriggerResult(status="failed", message=f"audit spawn raised: {exc}")
+
+
+def bundle_update_audit_step(
+    folder: Path, project_name: str, *, index_dot_claude: bool, log,
+) -> "Optional[ResyncTriggerResult]":
+    """The per-project bundle update's audit step (``project_init`` keeps a
+    3-line shim — it is a mega-file under a size ratchet). Spawns via
+    :func:`spawn_one_time_audits_if_owed`, logs the outcome under phase
+    ``4.bundle.codegraph_audits``, and emits the spawn's deferral when the
+    code-embed service was down (the ONE locked emitter). Never raises."""
+    audit = spawn_one_time_audits_if_owed(
+        Path(folder), project_name, index_dot_claude=index_dot_claude,
+    )
+    if audit is None:
+        return None
+    try:
+        log("4.bundle.codegraph_audits",
+            "ok" if audit.status in ("launched", "not_owed") else "warn",
+            audit.message, data={"status": audit.status, "project": project_name})
+        if audit.status == "deferred" and audit.deferral is not None:
+            from vco_lib import deferral_emit as _de
+
+            _de.emit(Path(folder), audit.deferral)  # type: ignore[arg-type]  # object-typed field, always a DeferralEntry when deferred
+    except Exception as exc:  # noqa: BLE001 — a log/deferral write never blocks an update
+        logger.warning("codegraph resync: audit-step bookkeeping failed: %s", exc)
+    return audit
+
+
+def _maybe_run_vectorless_audit(
+    project_name: str, *, analyzer_path: Optional[Path] = None,
+    slot_resolver=None, client=None,
+) -> Optional[dict]:
+    """W1-C S4: the ONE-TIME (per project × active slot × embed revision)
+    audit for current-revision rows that hold no vector in the active slot.
+
+    Such rows are invisible to everything else. The census and the per-file
+    gate judge revision and hash, not vectors, and Weaviate cannot filter on
+    "vector missing". So this audit cursor-scans the three walk-convergeable
+    classes, fetching only that slot's vector, through the existing M-2 demote
+    (``demote_current_revision_rows(vector_slot=...)``). It demotes exactly
+    those rows to revision 0. The census then counts them, the stale-file set
+    re-walks their files, and the walk's vector-aware fingerprint re-embeds
+    them.
+
+    Recorded in the one-time ledger only after a run with zero failures.
+    Resumable: a re-run skips rows already demoted. Returns the demote result
+    (``None`` when not run or undeterminable). Never raises.
+    """
+    revision = _resolve_embed_revision(analyzer_path)
+    slot = (slot_resolver or _active_code_slot)()
+    if not slot:
+        return None
+    key = f"{slot}@{revision}"
+    if not _audits.audit_owed(_audits.AUDIT_VECTORLESS, project_name, key):
+        return None
+    result = demote_current_revision_rows(
+        project_name, current_revision=revision, vector_slot=slot, client=client,
+    )
+    if result is None:
+        print("[resync-driver] vectorless audit: undeterminable — retried next resync",
+              flush=True)
+        return None
+    print(
+        f"[resync-driver] vectorless audit ({key}): demoted {result['demoted']} "
+        f"current-revision row(s) with no vector in the active slot "
+        f"(failures: {result['failed']})",
+        flush=True,
+    )
+    if not result["failed"]:
+        _audits.record_audit(_audits.AUDIT_VECTORLESS, project_name, key)
+    return result
+
+
 def spawn_code_summary_after_walk(
     project_name: str,
     repo_root: Path,
@@ -3066,7 +3296,119 @@ def spawn_code_summary_after_walk(
                 pass
 
 
+#: Machine-wide cap on concurrently RUNNING resync drivers (v0.2.102 W1-C).
+#: Every detached driver walks a whole project and embeds through the one GPU /
+#: Weaviate, and nothing bounded them across projects: an "Update all" over N
+#: projects owed a re-index, or a deferral-retry wave, ran N walks at once.
+#: Drivers beyond the cap QUEUE for a slot. They are never dropped, and after
+#: the generous wait bound a driver runs anyway (with a log line), so a wedged
+#: holder cannot stall the queue forever. The slot is released on exit or
+#: crash (flock semantics); see ``vco_lib.atomic.machine_slot``.
+#:   VCO_RESYNC_DRIVER_SLOTS   — slots (default 2; minimum 1)
+#:   VCO_RESYNC_DRIVER_WAIT_S  — max queue wait in seconds (default 21600 = 6 h)
+_DRIVER_SLOTS_ENV = "VCO_RESYNC_DRIVER_SLOTS"
+_DRIVER_WAIT_ENV = "VCO_RESYNC_DRIVER_WAIT_S"
+_DRIVER_SLOTS_DEFAULT = 2
+_DRIVER_WAIT_DEFAULT_S = 6 * 3600.0
+
+
+def _env_number(name: str, default: float, minimum: float) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _driver_slot_dir() -> Path:
+    from vco_lib.paths import vct_root_dir
+
+    return vct_root_dir() / "state" / "resync-driver-slots"
+
+
+def _driver_claim_lock_path(project_name: str) -> Path:
+    """Per-project single-flight claim file (v0.2.102 W1-C R5): keyed by the
+    project's canonical code-graph prefix (a sanitized project name when the
+    prefix cannot be resolved), under the same VCT state dir the machine slots
+    use. flock semantics — the claim dies with the holder process, so a
+    crashed driver leaves nothing to clean up.
+    """
+    key = _collection_prefix(project_name)
+    if not key:
+        key = re.sub(
+            r"[^A-Za-z0-9_.-]+", "_", (project_name or "").strip()
+        ) or "project"
+    return _driver_slot_dir().parent / "resync-driver-claims" / f"{key}.lock"
+
+
 def run_resync_and_verify(
+    project_name: str,
+    repo_root: Path,
+    analyzer_path: Path,
+    *,
+    prune_stale: bool = False,
+    force_rewalk: bool = False,
+    index_dot_claude: bool = True,
+    log_path: "Path | str | None" = None,
+) -> int:
+    """R-7 driver entry: takes one of the machine-wide driver slots (queueing
+    for one when all are busy), then runs :func:`_run_resync_and_verify_slotted`.
+
+    v0.2.102 (W1-C R5) per-project single-flight: BEFORE queueing for a machine
+    slot the driver takes a non-blocking per-project claim
+    (:func:`_driver_claim_lock_path`). A second driver for the SAME project —
+    e.g. install.py's root trigger and the root's own bundle-update audit step
+    on one update — logs one line and returns 0; the one-time audits' own
+    ledger stays unrecorded, so the next update/retry re-spawns them (same
+    contract as the exposure heal). Caveat: the deferral-retry driver treats
+    exit 0 as resolved, so a skipped run clears the retry entry while the
+    audits remain owed — acceptable, the bundle-update audit step re-spawns on
+    the next update. Ordering is always project-claim THEN machine slot
+    (uniform across drivers, so no deadlock). On Windows / filesystems without
+    flock the claim degrades to no exclusion (both drivers run), exactly like
+    the slots themselves.
+    """
+    from vco_lib.atomic import LockTimeout, exclusive_file_lock, machine_slot
+
+    claim = exclusive_file_lock(_driver_claim_lock_path(project_name), timeout_s=0)
+    try:
+        claim.__enter__()
+    except LockTimeout:
+        print(
+            f"[resync-driver] {project_name}: another resync for {project_name} "
+            f"is already running — skipping",
+            flush=True,
+        )
+        return 0
+    try:
+        slots = int(_env_number(_DRIVER_SLOTS_ENV, _DRIVER_SLOTS_DEFAULT, 1))
+        wait_s = _env_number(_DRIVER_WAIT_ENV, _DRIVER_WAIT_DEFAULT_S, 0)
+
+        def _on_wait(_waited: float) -> None:
+            print(
+                f"[resync-driver] {project_name}: all {slots} resync-driver slot(s) "
+                f"are busy — queued (waits up to {wait_s / 3600:.1f} h; "
+                f"{_DRIVER_SLOTS_ENV} raises the cap)",
+                flush=True,
+            )
+
+        with machine_slot(_driver_slot_dir(), slots=slots, wait_s=wait_s,
+                          on_wait=_on_wait) as slot:
+            if slot is None:
+                print(
+                    f"[resync-driver] {project_name}: no slot freed within "
+                    f"{wait_s:.0f}s — running anyway (queue, never drop)",
+                    flush=True,
+                )
+            return _run_resync_and_verify_slotted(
+                project_name, repo_root, analyzer_path,
+                prune_stale=prune_stale, force_rewalk=force_rewalk,
+                index_dot_claude=index_dot_claude, log_path=log_path,
+            )
+    finally:
+        claim.__exit__(None, None, None)
+
+
+def _run_resync_and_verify_slotted(
     project_name: str,
     repo_root: Path,
     analyzer_path: Path,
@@ -3173,6 +3515,15 @@ def run_resync_and_verify(
         exposure_heal_ok = _maybe_run_exposure_heal(Path(repo_root), project_name)
     except Exception as exc:  # noqa: BLE001 — heal must never block the walk
         print(f"[resync-driver] exposure heal raised (soft-fail): {exc}",
+              flush=True)
+
+    # v0.2.102 (W1-C S4): the one-time vectorless-row audit — BEFORE the
+    # pre-walk owed probe, so the rows it demotes are counted as owed work
+    # this walk then re-embeds. Soft-fail: never blocks the walk.
+    try:
+        _maybe_run_vectorless_audit(project_name, analyzer_path=Path(analyzer_path))
+    except Exception as exc:  # noqa: BLE001 — audit must never block the walk
+        print(f"[resync-driver] vectorless audit raised (soft-fail): {exc}",
               flush=True)
 
     # v0.2.84 (D4/P1): pre-analyze identity sweep. Mirrors the Rust pre-build
@@ -3383,6 +3734,13 @@ def run_resync_and_verify(
     return 0
 
 
+#: Code-graph classes whose rows the identity engine cannot migrate (identity
+#: key unreconstructable from stored props) — excluded from the probe's
+#: positive count. MUST MATCH ``codegraph_vector_copy._identity_key_for_row``
+#: (the bases for which it always returns ``None``).
+_IDENTITY_UNMIGRATABLE_BASES = frozenset({"CodeInteraction"})
+
+
 def _probe_stale_identity_count(
     client, prefix: str, canonical: str,
 ) -> Optional[int]:
@@ -3394,7 +3752,9 @@ def _probe_stale_identity_count(
     "converged". ``0`` means every class positively reported zero stale rows.
 
     Soft-fail per class: an aggregate error on one class does not poison the
-    others (it contributes ``undeterminable``, not ``0``).
+    others (it contributes ``undeterminable``, not ``0``) — EXCEPT when that
+    class positively lacks the ``project`` property (v0.2.102 S16-4): then the
+    probe returns ``None`` so the caller runs the sweep, which adds it.
     """
     try:
         from weaviate.classes.query import Filter
@@ -3403,6 +3763,13 @@ def _probe_stale_identity_count(
         return None
     any_determinable = False
     total = 0
+    # v0.2.102 (S16-4): a class that LACKS `project` cannot be probed at all
+    # (the filter errors). Reading that as "this class is undeterminable" let
+    # the other four classes' zeros return 0 — so the sweep, whose
+    # property-aware ensure exists precisely for this class, never ran. A
+    # positively project-less class makes the whole probe undeterminable
+    # (None) → the caller runs the sweep → the sweep ensures + backfills.
+    lacks_identity_property = False
     for base in _CODEGRAPH_BASES:
         coll_name = f"{prefix}_{base}"
         coll, status = _open_collection(client, coll_name, "identity sweep probe")
@@ -3412,6 +3779,21 @@ def _probe_stale_identity_count(
             continue
         if status == _COLL_ERROR:
             continue  # undeterminable for this class; `any_determinable` unset
+        if base in _IDENTITY_UNMIGRATABLE_BASES:
+            # The engine LEAVES these rows (their identity key is not
+            # reconstructable — `codegraph_vector_copy._identity_key_for_row`),
+            # so a stale-identity row here would keep the probe positive and
+            # re-run a sweep that can never move it, on every update. They
+            # converge when their file re-walks. Only the property's ABSENCE
+            # matters here: it is what the sweep can fix (W1-C review nit).
+            try:
+                if "project" not in {p.name for p in coll.config.get().properties}:
+                    lacks_identity_property = True
+                else:
+                    any_determinable = True
+            except Exception:  # noqa: BLE001 — schema unreadable → undeterminable
+                pass
+            continue
         try:
             flt = Filter.by_property("project").not_equal(canonical)
             agg = coll.aggregate.over_all(filters=flt, total_count=True)
@@ -3423,7 +3805,14 @@ def _probe_stale_identity_count(
             logger.debug(
                 "identity sweep probe: aggregate %s failed: %s", coll_name, exc
             )
+            try:
+                if "project" not in {p.name for p in coll.config.get().properties}:
+                    lacks_identity_property = True
+            except Exception:  # noqa: BLE001 — schema unreadable → stays undeterminable
+                pass
             continue
+    if lacks_identity_property:
+        return None
     return total if any_determinable else None
 
 
@@ -3731,13 +4120,25 @@ def spawn_background_resync(
                     logger.warning(
                         "codegraph resync: exposure-marker read failed: %s", exc
                     )
-                if not owed_bump:
+                # v0.2.102 (W1-C S4/S5): the two one-time audits override
+                # the short-circuit the same way, until each is recorded for
+                # this project under its current key. Soft-fail: an unreadable
+                # ledger reads as "owed" (both repairs are idempotent).
+                audit_owed = _one_time_audits_owed(
+                    project_name, analyzer, index_dot_claude,
+                )
+                if not owed_bump and not audit_owed:
                     return ResyncTriggerResult(
                         status="not_owed",
                         message=(
                             f"no resync owed for {project_name} — all rows at the "
                             "current embed revision"
                         ),
+                    )
+                if audit_owed:
+                    logger.info(
+                        "codegraph resync: one-time audit owed (%s) — spawning "
+                        "despite zero revision-stale rows", ", ".join(audit_owed),
                     )
                 logger.info(
                     "codegraph resync: truncation-exposure bump owed — "
@@ -4127,12 +4528,19 @@ def _main(argv: Optional[list] = None) -> int:
 
     if args.prune_ignored:
         configure_logging()
-        counts = prune_ignored_rows(
+        report = prune_ignored_rows_report(
             args.project, index_dot_claude=args.index_dot_claude,
         )
+        counts = report["counts"]
         total = sum(counts.values()) if counts else 0
-        logger.info("codegraph prune complete: %d row(s) deleted (%s)",
-                    total, counts)
+        logger.info("codegraph prune complete: %d row(s) deleted (%s; failures=%d)",
+                    total, counts, report["failures"])
+        # W1-C S5: the one-time ledger entry — only for a complete, clean pass.
+        if report["complete"] and not report["failures"]:
+            _audits.record_audit(
+                _audits.AUDIT_IGNORED_PATHS, args.project,
+                ignore_set_key(args.index_dot_claude),
+            )
     elif args.run_resync:
         configure_logging()
         if not args.repo_root or not args.analyzer:
