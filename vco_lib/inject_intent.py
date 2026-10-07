@@ -11,10 +11,14 @@ What lives here
 ---------------
 * **A1 Bash intent classification** — :func:`classify_bash` maps a Bash tool
   command to READ / EDIT / SEARCH / MECHANICAL plus its target paths,
-  symbols, write snippet and ``git show <rev>:<path>`` revision pins. The
+  symbols, write snippet, ``git show <rev>:<path>`` revision pins and the
+  write KIND (in-place ≈ Edit, overwrite ≈ Write; v0.2.102 S16-8). The
   classifier NEVER uses command text as an embedding query (owner rule,
   plan-v0300 lines 118-123): the query is always built from the target
-  path/symbols.
+  path/symbols. :func:`search_symbol_for_pattern` is the ONE home for the
+  "which exact symbol does this search pattern name" decision — the bash
+  SEARCH segment and the Grep tool surface both call it (S16-8 R2), and
+  ``cd <dir> &&`` prefixes re-root later relative targets (S16-8 R4).
 * **A1 gate ports** — :func:`pattern_gate` and :func:`extract_symbol` are
   the Python port of the retired shell gates
   (``templates/hooks/_lib/codegraph-query.{sh,ps1}``). Wave 2 deleted the
@@ -49,6 +53,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -104,6 +109,13 @@ class BashIntent:
     #: compares <rev> against the code graph's indexed-revision stamp and
     #: stays SILENT on mismatch (wave-4 caveat (a))
     rev_paths: Tuple[Tuple[str, str], ...] = ()
+    #: WHICH write shape an EDIT carries (v0.2.102 S16-8 R5): "inplace"
+    #: (sed/perl/ruby -i — the Edit tool's equivalent) or "overwrite"
+    #: (tee / redirect / cp — the Write tool's equivalent). "" for
+    #: non-EDIT intents. The router keys the KG query on it: in-place
+    #: mirrors the Edit surface's topic+symbols, overwrite the Write
+    #: surface's topic-only.
+    write_kind: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -112,6 +124,7 @@ class BashIntent:
             "symbols": list(self.symbols),
             "write_snippet": self.write_snippet,
             "rev_paths": [list(p) for p in self.rev_paths],
+            "write_kind": self.write_kind,
         }
 
 
@@ -132,6 +145,20 @@ _SEARCH_VERBS = frozenset({"grep", "rg", "ag", "ack", "egrep", "fgrep"})
 _GIT_READ_SUBS = frozenset({"show", "diff", "log", "blame"})
 #: git subcommands that SEARCH (classified like a ``grep`` on the rest)
 _GIT_SEARCH_SUBS = frozenset({"grep"})
+#: v0.2.102 (S16-8 production wiring): write/chain verbs whose
+#: classifier branches the settings templates light up with ``if`` rules of
+#: their own — same lock as the tables above, both directions.
+#: ``perl``/``ruby`` reach the grouped in-place-edit shape
+#: (``_INPLACE_WRITE_ALT``, R1); ``tee``/``cp``/``mv`` are the overwrite
+#: shapes ``_INTENT_WRITE_VERB_RE`` has always classified EDIT — the rules
+#: cover the command-STARTING forms a prefix-glob ``if`` rule can match
+#: (``cat f | tee x`` already fires via ``Bash(cat *)``). ``cd`` itself
+#: classifies MECHANICAL — a cheap spawn that usually injects nothing —
+#: and the rule exists to deliver ``cd dir && cat f`` to the R4 re-rooting.
+#: ``touch``/``dd`` also classify EDIT but ship NO rule: a file they
+#: produce carries no content to key a retrieval query on.
+_EDIT_RULE_VERBS = frozenset({"perl", "ruby", "tee", "cp", "mv"})
+_CHAIN_RULE_VERBS = frozenset({"cd"})
 
 _SINK_NOISE = _REDIRECT_NOISE  # one home: the bash_write_targets strip list
 
@@ -152,11 +179,28 @@ def _strip_sinks(command: str) -> str:
 # must not classify `cargo build --output x` as an EDIT injection trigger
 # (plan §2.1: build/test = MECHANICAL, no spawn). Not a mirror drift: two
 # different questions, each with its own pinned vocabulary.
+#
+# v0.2.102 S16-8 R1: the in-place alternation accepts GROUPED flag clusters
+# — `perl -pi -e` / `sed -ni` / `ruby -pi` are the canonical in-place shapes,
+# and the pre-R1 table knew only the SPLIT `perl -i` form, so the grouped
+# shape fell through to MECHANICAL and produced no retrieval keys at all.
+# The trailing ``[\s.]`` covers `-i.bak`. One alternation, two consumers:
+# the write-shape gate below and the write-kind detector (the router keys
+# the KG query on the shape — an in-place edit mirrors the Edit tool's
+# topic+symbols query, an overwrite the Write tool's topic-only query).
+_INPLACE_WRITE_ALT = (
+    r"(?:sed|perl|ruby)\s+"
+    r"(?:--in-place(?:[\s=]|$)|-[A-Za-z]*i[A-Za-z]*(?=[\s.]|$))"
+)
 _INTENT_WRITE_VERB_RE = re.compile(
     r"(?:^|[\s;&|(])(?:tee|cp|mv|touch|dd)(?:\s|$)"
-    r"|sed\s+-i|sed\s+--in-place|perl\s+-i|ruby\s+-i"
+    r"|(?:^|[\s;&|(])" + _INPLACE_WRITE_ALT +
     r"|Set-Content|Add-Content|Out-File|Tee-Object"
 )
+#: WHICH write shape a segment carries ("" = not a write). Distinct from the
+#: gate above: the gate answers "is this an EDIT?", this answers "which tool
+#: surface is it equivalent to?" (in-place ≈ Edit, everything else ≈ Write).
+_INPLACE_WRITE_RE = re.compile(r"(?:^|[\s;&|(])" + _INPLACE_WRITE_ALT)
 
 
 def _edit_shape(text: str) -> bool:
@@ -424,34 +468,49 @@ def _peel_launcher_verbs(tokens: List[str]) -> List[str]:
     return out
 
 
-def _classify_segment(tokens: List[str],
-                      cwd: str) -> Tuple[str, List[str], List[str], List[Tuple[str, str]]]:
-    """(intent, targets, symbols, rev_paths) for ONE chain segment.
-    ``tokens`` are already env-stripped and wrapper-peeled."""
+def _classify_segment(tokens: List[str], cwd: str,
+                      base_dir: str = "") -> Tuple[str, List[str], List[str], List[Tuple[str, str]], str]:
+    """(intent, targets, symbols, rev_paths, write_kind) for ONE chain
+    segment. ``tokens`` are already env-stripped and wrapper-peeled.
+    ``base_dir`` is the directory the chain has MOVED to by this segment
+    (the session cwd unless a `cd` prefix was tracked — v0.2.102 S16-8
+    R4); relative targets are re-rooted on it so they name the file the
+    command actually touches."""
     tokens = _peel_launcher_verbs(tokens)
     if not tokens:
-        return INTENT_MECHANICAL, [], [], []
-    seg_text = " ".join(tokens)
+        return INTENT_MECHANICAL, [], [], [], ""
+    # shlex.join, NOT " ".join: the write-target parser RE-tokenises this
+    # text, and a plain join drops the quoting of multi-word tokens — a
+    # spaced sed expression (`sed -i 's/x = 1/x = 2/' f`) re-parsed as three
+    # fake targets ('=', '1/x', '2') that poisoned the KG topic key
+    # (v0.2.102 S16-8 R6). shlex.join round-trips: re-tokenising it yields
+    # exactly `tokens` again.
+    seg_text = shlex.join(tokens)
     verb = os.path.basename(tokens[0]).lower()
 
     # EDIT first: a redirect/write-verb outranks the verb's own class
     # (`cat > f <<EOF` is a WRITE, not a READ — survey wrong-trigger corpus).
     if _edit_shape(seg_text):
+        # R4: the write-target parser resolves relative candidates against
+        # the directory the chain moved to (containment behaviour is
+        # unchanged: an escaping `../` candidate is dropped by either root).
         targets = [
             os.path.relpath(t, cwd) if cwd and t.startswith(cwd + os.sep) else t
-            for t in extract_write_targets(seg_text, project_root=cwd or None,
+            for t in extract_write_targets(seg_text,
+                                           project_root=(base_dir or cwd) or None,
                                            require_exists=False)
         ]
         # A clean symbol mentioned by the edit itself (e.g. a `sed -i`
         # expression naming a function) is the exact-lookup key; recovery
         # lives HERE (one home) so the demotion rule below can see it.
         recovered = _recover_clean_symbol(tokens)
-        return INTENT_EDIT, targets, [recovered] if recovered else [], []
+        kind = "inplace" if _INPLACE_WRITE_RE.search(seg_text) else "overwrite"
+        return INTENT_EDIT, targets, [recovered] if recovered else [], [], kind
 
     if verb == "git" and len(tokens) > 1:
         sub = tokens[1].lower()
         if sub in _GIT_SEARCH_SUBS:
-            return _classify_search(tokens[1:], cwd)
+            return _classify_search(tokens[1:], cwd, base_dir)
         if sub in _GIT_READ_SUBS:
             targets: List[str] = []
             rev_paths: List[Tuple[str, str]] = []
@@ -467,26 +526,28 @@ def _classify_segment(tokens: List[str],
                     # Re-review nit-3: EVERY git read subcommand can carry a
                     # `<rev>:<path>` blob pin (`git diff HEAD~2:f` included) —
                     # the token becomes a pin + its clean path, never a
-                    # polluted target.
+                    # polluted target. The pin's path is REPO-relative (git
+                    # resolves it from the repository root regardless of the
+                    # shell's cwd), so it is deliberately NOT rebased.
                     rev_paths.append(rp)
                     targets.append(rp[1])
                     continue
                 if _path_like(tok):
-                    targets.append(tok)
-            return INTENT_READ, targets, [], rev_paths
-        return INTENT_MECHANICAL, [], [], []
+                    targets.append(_rebase_target(tok, base_dir, cwd))
+            return INTENT_READ, targets, [], rev_paths, ""
+        return INTENT_MECHANICAL, [], [], [], ""
 
     if verb in _SEARCH_VERBS:
-        return _classify_search(tokens, cwd)
+        return _classify_search(tokens, cwd, base_dir)
 
     if verb in _READ_VERBS:
         # `sed -i` never reaches here (edit shape caught it); sed/awk dumps
         # are READs (the survey's "sed dump" corpus — weak surface, 0.75 floor).
-        targets = [t for t in tokens[1:] if _path_like(t)]
+        targets = [_rebase_target(t, base_dir, cwd) for t in tokens[1:] if _path_like(t)]
         recovered = _recover_clean_symbol(tokens)
-        return INTENT_READ, targets, [recovered] if recovered else [], []
+        return INTENT_READ, targets, [recovered] if recovered else [], [], ""
 
-    return INTENT_MECHANICAL, [], [], []
+    return INTENT_MECHANICAL, [], [], [], ""
 
 
 #: the code keywords `pattern_gate`'s fourth rule knows — when a multi-word
@@ -495,17 +556,24 @@ def _classify_segment(tokens: List[str],
 _KEYWORD_PREFIXES = frozenset({"def", "class", "fn", "function", "func"})
 
 
-def _classify_search(tokens: Sequence[str], cwd: str) -> Tuple[str, List[str], List[str], List[Tuple[str, str]]]:
-    """SEARCH iff the PATTERN passes the identifier gate AND a CLEAN
+def search_symbol_for_pattern(pattern: str) -> str:
+    """The exact-lookup symbol a SEARCH pattern yields, or "".
+
+    ONE HOME (v0.2.102 S16-8 R2) for the bash SEARCH segment
+    (:func:`_classify_search`) and the Grep tool surface (the router's
+    ``_grep_plan``) — the same pattern must produce the same key on both.
+    Before R2 the SF-3 multi-word retry below was bash-only, so
+    ``Grep(pattern='def foo')`` produced NO key where
+    ``grep -n 'def foo' f`` produced ``foo``.
+
+    The decision: the pattern passes the identifier gate AND a CLEAN
     identifier is recoverable (exact-lookup only — a semantic query on a
     regex fragment is the ``pub(crate)`` noise class the redesign kills).
-
     SF-3: for a multi-word pattern the leading code keyword is stripped and
     the words are retried individually — ``def authenticate`` yields
-    ``authenticate`` instead of falling through to MECHANICAL."""
-    pattern = _search_pattern(list(tokens))
+    ``authenticate`` instead of falling through to ""."""
     if not pattern or not pattern_gate(pattern):
-        return INTENT_MECHANICAL, [], [], []
+        return ""
     sym = clean_identifier(extract_symbol(pattern)) or clean_identifier(pattern)
     if not sym and re.search(r"\s", pattern):
         words = pattern.split()
@@ -513,8 +581,8 @@ def _classify_search(tokens: Sequence[str], cwd: str) -> Tuple[str, List[str], L
             words = words[1:]
         for w in words:
             # A bare keyword word is never the symbol (`pub(crate) fn` must
-            # stay MECHANICAL — "fn" is the regex fragment's own keyword, not
-            # an identifier; the survey's wrong-query class).
+            # stay "" — "fn" is the regex fragment's own keyword, not an
+            # identifier; the survey's wrong-query class).
             if w.lower() in _KEYWORD_PREFIXES:
                 continue
             cand = clean_identifier(extract_symbol(w)) or clean_identifier(w)
@@ -523,10 +591,47 @@ def _classify_search(tokens: Sequence[str], cwd: str) -> Tuple[str, List[str], L
             if cand and len(cand) >= 2 and cand.strip("_"):
                 sym = cand
                 break
+    return sym
+
+
+def _classify_search(tokens: Sequence[str], cwd: str,
+                     base_dir: str = "") -> Tuple[str, List[str], List[str], List[Tuple[str, str]], str]:
+    pattern = _search_pattern(list(tokens))
+    sym = search_symbol_for_pattern(pattern)
     if not sym:
-        return INTENT_MECHANICAL, [], [], []
-    targets = [t for t in tokens[1:] if _path_like(t)]
-    return INTENT_SEARCH, targets, [sym], []
+        return INTENT_MECHANICAL, [], [], [], ""
+    targets = [_rebase_target(t, base_dir, cwd) for t in tokens[1:] if _path_like(t)]
+    return INTENT_SEARCH, targets, [sym], [], ""
+
+
+def _rebase_target(t: str, base_dir: str, cwd: str) -> str:
+    """Re-root a RELATIVE target named from a `cd`-shifted directory
+    (v0.2.102 S16-8 R4). The router resolves targets against the SESSION
+    cwd, so after ``cd sub && cat f`` the bare ``f`` names the WRONG file.
+    Absolute targets pass through; an untracked base ("" — no `cd` seen, or
+    an unresolvable one) keeps the target exactly as written."""
+    if not base_dir or base_dir == cwd or os.path.isabs(t):
+        return t
+    abs_t = os.path.normpath(os.path.join(base_dir, t))
+    if cwd and abs_t.startswith(cwd.rstrip(os.sep) + os.sep):
+        return os.path.relpath(abs_t, cwd)
+    return abs_t
+
+
+def _resolve_cd_dir(seg: List[str], base: str) -> Optional[str]:
+    """The directory a ``cd <dir>`` segment lands in, or None when it cannot
+    be tracked (no argument → HOME, ``cd -``, a ``$VAR`` / ``~`` destination,
+    extra arguments). None is STICKY in the caller: once the chain's
+    location is unknown, later targets stay as written rather than being
+    re-rooted on a guess."""
+    if len(seg) != 2:
+        return None
+    dest = seg[1]
+    if dest == "-" or dest.startswith(("$", "~")):
+        return None
+    if os.path.isabs(dest):
+        return os.path.normpath(dest)
+    return os.path.normpath(os.path.join(base, dest)) if base else dest
 
 
 def classify_bash(command: str, cwd: str = "") -> BashIntent:
@@ -565,9 +670,18 @@ def classify_bash(command: str, cwd: str = "") -> BashIntent:
     targets: List[str] = []
     symbols: List[str] = []
     rev_paths: List[Tuple[str, str]] = []
+    write_kind = ""
+    # v0.2.102 S16-8 R4: the directory the chain has moved to (the session
+    # cwd until a `cd` segment moves it). None = UNKNOWN (an unresolvable
+    # cd was seen — sticky): later relative targets stay as written rather
+    # than being re-rooted on a guess.
+    seg_cwd: Optional[str] = cwd or ""
     for seg in segments:
         seg = peel_wrapper_verbs(strip_env_assignments(seg))
-        s_intent, s_targets, s_symbols, s_revs = _classify_segment(seg, cwd)
+        if seg and os.path.basename(seg[0]).lower() == "cd" and seg_cwd is not None:
+            seg_cwd = _resolve_cd_dir(seg, seg_cwd)
+        s_intent, s_targets, s_symbols, s_revs, s_kind = _classify_segment(
+            seg, cwd, seg_cwd or "")
         if _INTENT_STRENGTH[s_intent] > _INTENT_STRENGTH[intent]:
             intent = s_intent
         for t in s_targets:
@@ -579,6 +693,8 @@ def classify_bash(command: str, cwd: str = "") -> BashIntent:
         for rp in s_revs:
             if rp not in rev_paths:
                 rev_paths.append(rp)
+        if s_intent == INTENT_EDIT and not write_kind:
+            write_kind = s_kind
 
     write_snippet = ""
     if intent == INTENT_EDIT:
@@ -613,6 +729,7 @@ def classify_bash(command: str, cwd: str = "") -> BashIntent:
         symbols=tuple(symbols[:6]),
         write_snippet=write_snippet,
         rev_paths=tuple(rev_paths[:4]),
+        write_kind=write_kind if intent == INTENT_EDIT else "",
     )
 
 
@@ -1099,13 +1216,20 @@ def budget_state_path(session_id: str, prompt_id: str, project_root: str) -> Opt
 def kg_query_for_targets(targets: Sequence[str], cwd: str = "") -> str:
     """KG query text for a set of file targets: the topic of the path
     (module stem + parent dir), NEVER command text (owner rule). "" when no
-    usable target."""
+    usable target.
+
+    v0.2.102 S16-8 R7: a RELATIVE target (every bash command that names a
+    bare filename) is resolved against ``cwd`` before the parent-dir word is
+    taken — otherwise its topic was the stem alone (``app``) while the
+    equivalent Read/Edit/Write, whose paths are absolute, queries
+    ``app <parent-dir>`` for the SAME file (an asymmetric retrieval key)."""
     for t in targets:
-        base = os.path.basename(t)
+        full = t if os.path.isabs(t) or not cwd else os.path.normpath(os.path.join(cwd, t))
+        base = os.path.basename(full)
         stem, _ext = os.path.splitext(base)
         if not stem or stem.startswith("."):
             continue
-        parent = os.path.basename(os.path.dirname(t.rstrip("/\\")))
+        parent = os.path.basename(os.path.dirname(full.rstrip("/\\")))
         stem_words = re.split(r"[_\-.]+", stem)
         parts = [w for w in stem_words if w]
         if parent and parent not in ("", ".", ".."):

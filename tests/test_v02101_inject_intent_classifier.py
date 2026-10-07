@@ -23,6 +23,7 @@ Covers (PLAN-V02101 §WP-F row 1 + §3 WP-A):
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -43,6 +44,7 @@ from vco_lib.inject_intent import (  # noqa: E402
     extract_symbol,
     file_pub_symbols,
     pattern_gate,
+    search_symbol_for_pattern,
 )
 
 
@@ -177,6 +179,40 @@ class TestClassifyRead:
         assert bi.intent == INTENT_READ
         assert any("main.rs" in t for t in bi.targets)
 
+    def test_cd_chain_rebases_relative_targets(self, tmp_path: Path) -> None:
+        """v0.2.102 S16-8 R4: a `cd <dir> &&` prefix re-roots the RELATIVE
+        targets of every later segment — the router resolves targets against
+        the session cwd, so an unrebased `cat only.py` after `cd sub` names
+        the WRONG file (no parent-dir topic word, no CG symbols)."""
+        (tmp_path / "sub").mkdir()
+        bi = classify_bash("cd sub && cat only.py", str(tmp_path))
+        assert bi.intent == INTENT_READ
+        assert any(
+            t.endswith(os.path.join("sub", "only.py")) for t in bi.targets
+        ), bi.targets
+
+    def test_cd_absolute_prefix_rebases(self) -> None:
+        bi = classify_bash("cd /repo && cat src/lib.rs")
+        assert bi.intent == INTENT_READ
+        assert any(t.endswith(os.path.join("repo", "src", "lib.rs")) for t in bi.targets)
+
+    def test_cd_chain_rebases_edit_targets(self, tmp_path: Path) -> None:
+        """R4 on the EDIT side: the write-target parser must resolve against
+        the cd'd directory too, not the session cwd."""
+        bi = classify_bash("cd sub && sed -i 's/a/b/' app.py", str(tmp_path))
+        assert bi.intent == INTENT_EDIT
+        assert any(
+            t.endswith(os.path.join("sub", "app.py")) for t in bi.targets
+        ), bi.targets
+
+    def test_cd_unresolvable_keeps_targets_as_written(self, tmp_path: Path) -> None:
+        """Conservative: `cd -` / a variable destination cannot be tracked —
+        later targets stay AS WRITTEN (the pre-R4 behaviour) rather than
+        being re-rooted on a guess."""
+        bi = classify_bash('cd "$D" && cat only.py', str(tmp_path))
+        assert bi.intent == INTENT_READ
+        assert any(t == "only.py" for t in bi.targets), bi.targets
+
 
 class TestClassifyEdit:
     def test_sed_in_place(self, tmp_path: Path) -> None:
@@ -229,6 +265,56 @@ class TestClassifyEdit:
         `cargo test 2>&1 | tail -5` must stay READ/MECHANICAL, never EDIT."""
         assert _intent("cargo test 2>&1 | tail -5") != INTENT_EDIT
         assert _intent("grep foo bar.py > /dev/null") != INTENT_EDIT
+
+    def test_perl_grouped_in_place(self, tmp_path: Path) -> None:
+        """v0.2.102 S16-8 R1: `perl -pi -e` is THE grouped in-place edit
+        shape — as much an EDIT as `sed -i` (the intent write-verb regex
+        previously knew only the split `perl -i` form, so the grouped shape
+        fell through to MECHANICAL)."""
+        bi = classify_bash("perl -pi -e 's/foo/bar/' app.py", str(tmp_path))
+        assert bi.intent == INTENT_EDIT
+        assert any("app.py" in t for t in bi.targets)
+
+    def test_perl_split_in_place(self, tmp_path: Path) -> None:
+        bi = classify_bash("perl -i -pe 's/foo/bar/' app.py", str(tmp_path))
+        assert bi.intent == INTENT_EDIT
+
+    def test_sed_grouped_in_place(self, tmp_path: Path) -> None:
+        bi = classify_bash("sed -ni 's/foo/bar/' app.py", str(tmp_path))
+        assert bi.intent == INTENT_EDIT
+
+    def test_ruby_grouped_in_place(self, tmp_path: Path) -> None:
+        bi = classify_bash('ruby -pi -e \'sub(/a/, "b")\' app.rb', str(tmp_path))
+        assert bi.intent == INTENT_EDIT
+
+    def test_write_kind_in_place_vs_overwrite(self, tmp_path: Path) -> None:
+        """v0.2.102 S16-8 R5: the KG key shape depends on the write KIND —
+        an in-place edit mirrors the Edit tool (topic + symbols), an
+        overwrite the Write tool (topic only). The classifier is the one
+        home for the distinction."""
+        assert classify_bash("sed -i 's/a/b/' app.py", str(tmp_path)).write_kind == "inplace"
+        assert classify_bash("perl -pi -e 's/a/b/' app.py", str(tmp_path)).write_kind == "inplace"
+        assert classify_bash("echo x > out.txt", str(tmp_path)).write_kind == "overwrite"
+        assert classify_bash("cp a b", str(tmp_path)).write_kind == "overwrite"
+        assert classify_bash("echo x | tee out.txt", str(tmp_path)).write_kind == "overwrite"
+        assert classify_bash("cat app.py", str(tmp_path)).write_kind == ""
+
+    def test_non_inplace_interpreter_flag_is_not_edit(self) -> None:
+        """Leave-alone: `perl -ne 'print'` / `perl -lane` carry no in-place
+        flag — they READ, they must not become EDITs."""
+        assert _intent("perl -ne 'print' app.py") != INTENT_EDIT
+        assert _intent("perl -lane 'print $F[0]' app.py") != INTENT_EDIT
+
+    def test_spaced_sed_expression_does_not_poison_targets(self, tmp_path: Path) -> None:
+        """v0.2.102 S16-8 R6: the segment text is RE-tokenised by the
+        write-target parser — a plain `" ".join` dropped the quoting, so a
+        spaced expression ('s/x = 1/x = 2/') re-parsed as three FAKE targets
+        ('=', '1/x', '2') that poisoned the KG topic key (the real file was
+        still there, but the topic came from the FIRST target — '=')."""
+        bi = classify_bash("sed -i 's/x = 1/x = 2/' mod.py", str(tmp_path))
+        assert bi.intent == INTENT_EDIT
+        assert any("mod.py" in t for t in bi.targets)
+        assert all("=" not in t for t in bi.targets), bi.targets
 
 
 class TestClassifySearch:
@@ -356,6 +442,29 @@ class TestKeywordTightening:
         bi = classify_bash("grep -rn 'def ab' src/")
         assert bi.intent == INTENT_SEARCH
         assert "ab" in bi.symbols
+
+
+class TestSearchSymbolForPattern:
+    """v0.2.102 S16-8 R2: the ONE HOME the bash SEARCH segment
+    (``_classify_search``) and the Grep tool surface (the router's
+    ``_grep_plan``) both call — same pattern in, same symbol out."""
+
+    @pytest.mark.parametrize(
+        ("pattern", "want"),
+        [
+            ("validate_token", "validate_token"),
+            ("def foo", "foo"),
+            ("class Foo", "Foo"),
+            ("pub(crate) fn", ""),   # regex fragment — never an exact key
+            ("def _", ""),           # junk-rescue bound
+            ("class A", ""),         # junk-rescue bound
+            ("def ", ""),            # keyword with no identifier behind it
+            ("", ""),
+            ("hello", ""),           # bare prose word — never an identifier
+        ],
+    )
+    def test_symbol(self, pattern: str, want: str) -> None:
+        assert search_symbol_for_pattern(pattern) == want
 
 
 class TestDiffRevPins:

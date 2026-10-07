@@ -113,13 +113,13 @@ from vco_lib.inject_intent import (  # noqa: E402
     classify_bash,
     clean_identifier,
     edit_enclosing_symbols,
-    extract_symbol,
     file_pub_symbols,
     kg_gate,
     kg_query_for_targets,
     language_for_path,
     pattern_gate,
     sanitize_session_id,
+    search_symbol_for_pattern,
     task_type_for,
     titles_one_liner,
 )
@@ -610,28 +610,26 @@ def _bash_plan(payload: Dict, cwd: str) -> _Plan:
         return plan  # no query, no injection, no RL retrieval event
     profile = _BASH_PROFILE_BY_INTENT[bi.intent]
 
-    # KG leg (none on SEARCH — §2.1)
-    if kg_gate(profile) is not None:
-        if bi.write_snippet:
-            query = bi.write_snippet[:200]
-        else:
-            query = kg_query_for_targets(bi.targets, cwd)
-        if query:
-            plan.kg_query = query
-            plan.kg_profile = profile
-            plan.kg_limit = _kg_limit(profile)
-
-    # CG leg — exact symbols only (§2.1 "exact def+callers")
+    # CG symbol recovery runs BEFORE the KG leg: the in-place EDIT surface's
+    # KG query folds the same symbols in (the Edit tool's shape — v0.2.102
+    # S16-8 R5).
     policy = cg_policy(profile)
+    symbols: List[str] = []
     if policy.enabled:
-        symbols: List[str] = list(bi.symbols)
+        symbols = list(bi.symbols)
         # Wave-3: command-text symbol recovery moved INTO the classifier
         # (inject_intent._recover_clean_symbol — one home, so the READ
         # demotion rule can see what was recovered). What remains here is
         # the disk-dependent fallback: a source-file target's own top-level
         # symbols ("only if a clean symbol is recovered; else silent" —
         # recovery from the TARGET is the owner-rule shape: never from
-        # command prose).
+        # command prose). The READ fallback's 2-symbol cap is the §2.1
+        # WEAK-surface taper (bash_read: 0.75 floor, titles-only below
+        # 0.85, single_chunk above — the table's smallest surface): v0.2.102
+        # S16-8 measured full alignment with the Read surface's 5 on the
+        # replay corpus — precision 0.625 → 0.556 for NO recall gain
+        # (0.857), so the taper stays and the prefix relation is pinned in
+        # tests/test_v02102_bash_injection_parity.py instead.
         if bi.intent in (INTENT_READ, INTENT_EDIT) and not symbols:
             cap = 2 if bi.intent == INTENT_READ else 3
             for t in bi.targets:
@@ -642,6 +640,29 @@ def _bash_plan(payload: Dict, cwd: str) -> _Plan:
                         break
         if policy.require_clean_symbol:
             symbols = [s for s in symbols if clean_identifier(s)]
+
+    # KG leg (none on SEARCH — §2.1)
+    if kg_gate(profile) is not None:
+        if bi.write_snippet:
+            query = bi.write_snippet[:200]
+        else:
+            topic = kg_query_for_targets(bi.targets, cwd)
+            if bi.intent == INTENT_EDIT and bi.write_kind == "inplace":
+                # v0.2.102 S16-8 R5: an in-place edit (sed -i / perl -pi)
+                # mirrors the Edit tool's KG query — "<topic> <symbols>".
+                # Overwrite shapes (tee / redirect / cp) keep the Write
+                # tool's topic-only key.
+                parts = [p for p in (topic, " ".join(symbols[:3])) if p]
+                query = " ".join(parts)[:200]
+            else:
+                query = topic
+        if query:
+            plan.kg_query = query
+            plan.kg_profile = profile
+            plan.kg_limit = _kg_limit(profile)
+
+    # CG leg — exact symbols only (§2.1 "exact def+callers")
+    if policy.enabled:
         source_file = bi.targets[0] if bi.targets else ""
         plan.cg_symbols = [(s, source_file) for s in symbols[:3]]
         if plan.cg_symbols:
@@ -739,9 +760,12 @@ def _grep_plan(payload: Dict, cwd: str) -> _Plan:
     tool_input = payload.get("tool_input") or {}
     pattern = str(tool_input.get("pattern") or "")
     plan.intent_out = {"surface": "grep", "pattern_is_identifier": bool(pattern_gate(pattern))}
-    if not pattern or not pattern_gate(pattern):
-        return plan
-    sym = clean_identifier(extract_symbol(pattern)) or clean_identifier(pattern)
+    # v0.2.102 S16-8 R2: the symbol decision is the classifier's ONE HOME
+    # (search_symbol_for_pattern) — the bash SEARCH segment and this surface
+    # answer the same question. Before R2 the SF-3 multi-word retry was
+    # bash-only, so Grep(pattern='def foo') produced NO key where
+    # `grep -n 'def foo' f` produced 'foo'.
+    sym = search_symbol_for_pattern(pattern)
     if not sym:
         return plan  # a regex fragment is not an exact-lookup key (pub(crate) class)
     plan.intent_out["symbol"] = sym

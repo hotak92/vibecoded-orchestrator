@@ -77,6 +77,11 @@ def _env(tmp_path: Path, *, no_python: bool) -> dict:
     env.update(HOME=str(tmp_path / "home"), VCT_STATE_DIR=str(tmp_path / "state"))
     if no_python:
         env["PATH"] = _no_python_path(tmp_path)
+        # v0.2.102 NB-H2: "no Python ANYWHERE" must also defeat find-python's
+        # NEW orchestrator-venv probe — its clone-relative tier cannot be
+        # unset away when the checkout under test carries its own .venv
+        # (CI creates exactly that), so the lib's documented opt-out is set.
+        env["VCO_FIND_PYTHON_PATH_ONLY"] = "1"
     return env
 
 

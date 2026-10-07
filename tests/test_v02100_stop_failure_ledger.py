@@ -74,6 +74,13 @@ def _env(home: Path, project: Path, **extra: str) -> dict:
         CLAUDE_PROJECT_DIR=str(project),
         # No desktop toast from a test run.
         VCO_STOP_FAILURE_NOTIFY="0",
+        # v0.2.102 NB-H2: this suite's PATH scenarios (the no-python dir, the
+        # crashing-python shim) must drive the interpreter resolution.
+        # find-python now probes the orchestrator venv FIRST — and CI both
+        # exports VCT_VENV and creates a checkout .venv, either of which
+        # would hijack the shim arms — so the lib's documented opt-out pins
+        # the pre-NB-H2 PATH-only behaviour for every run here.
+        VCO_FIND_PYTHON_PATH_ONLY="1",
     )
     env.update(extra)
     return env
