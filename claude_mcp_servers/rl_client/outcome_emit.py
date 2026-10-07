@@ -112,7 +112,7 @@ def emit_outcome_event(
     # verbatim — the offline trainer reads it back via the hub GET API.
     inner = {
         "event": event_type,
-        "schema_version": _SCHEMA_VERSION,
+        "schema_version": _schema_version(),
         "ts": _now_iso(),
         "task_id": task_id,
         "task_type": task_type,
@@ -121,7 +121,7 @@ def emit_outcome_event(
     }
     envelope = {
         "event_type": event_type,
-        "schema_version": _SCHEMA_VERSION,
+        "schema_version": _schema_version(),
         "ts_ms": int(time.time() * 1000),
         "project_id": project_id,
         "project_name": project_name,
@@ -143,7 +143,20 @@ def emit_outcome_event(
 
 # ---- helpers --------------------------------------------------------------
 
-_SCHEMA_VERSION = 3  # v3 hub envelope — matches RLDataLogger.SCHEMA_VERSION
+# W3R-8 (v0.2.102): read from the ONE home, never mirrored. This used to be a
+# local ``_SCHEMA_VERSION = 3`` constant whose comment claimed it matched
+# ``RLDataLogger.SCHEMA_VERSION`` — it did not (rl_logger had moved to 4), so
+# every ``pre_bash`` / ``bash_outcome`` / ``edit_outcome`` row was stamped a
+# schema behind the retrieval/citation rows and would fail any reader-side
+# ``schema_version >= 4`` gate (the repo's own truncation gate,
+# ``rl_logger._EM_TRUNCATION_SINCE_SCHEMA``, is exactly such a gate). The
+# import stays INSIDE the function: a hook subprocess imports this module
+# with a minimal sys.path, so module-level ``claude_mcp_servers`` imports are
+# contractually forbidden (test_v52_m_prepost_hooks pins that surface).
+def _schema_version() -> int:
+    from claude_mcp_servers.rl_client.rl_logger import RLDataLogger
+
+    return RLDataLogger.SCHEMA_VERSION
 
 
 def _now_iso() -> str:

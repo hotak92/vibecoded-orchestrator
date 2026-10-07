@@ -90,6 +90,72 @@ def resolve_task_type(arg: "str | None") -> str:
     return DEFAULT_TASK_TYPE
 
 
+def stage_no_results_event(
+    args,
+    task_type: str,
+    vector,
+    deferred_events: tuple,
+    *,
+    embedding_source: str,
+    embedding_model: str,
+    embedding_dim: int,
+) -> tuple:
+    """Build the degraded retrieval event for a ZERO-RESULT search (W3R-6,
+    v0.2.102).
+
+    Pre-fix the hook-KG path returned early on empty results with NO event,
+    so "no event" was indistinguishable from "no search" — censoring the
+    query-distribution + failure-rate signal (the MCP ``hybrid_search`` path
+    has always emitted a degraded ``failure_mode`` event on total failure).
+    The event (``nodes=[]``, ``failure_mode="no_results"``) goes through the
+    same consumer gate (``_retrieval_emit_has_consumer`` — local logging off
+    AND no upload consent ⇒ no event) and the same emit machinery as a
+    populated search; ``emit_rl_event`` treats that shape as the SKIPPED
+    validation tier and writes it.
+
+    Hook path: returns ``deferred_events`` with the event appended — the
+    caller's ``finally`` hands it off AFTER stdout is flushed, so the hook
+    never waits on the POST. CLI path: emits inline (interactive; the
+    populated path emits inline there too). Returns the input unchanged on
+    any error — telemetry never breaks a search that found nothing.
+    """
+    try:
+        from claude_mcp_servers.rl_client.search_pipeline import (
+            _retrieval_emit_has_consumer,
+        )
+
+        if not _retrieval_emit_has_consumer():
+            return deferred_events
+        import uuid as _uuid
+
+        from claude_mcp_servers.rl_client.deferred_emit import DeferredEmit
+        from claude_mcp_servers.rl_client.telemetry_emit import (
+            RetrievalEvent,
+            emit_rl_event,
+            resolve_session_id,
+        )
+
+        ev = RetrievalEvent(
+            query=args.query,
+            query_emb=list(vector) if vector else None,
+            embedding_source=embedding_source,
+            embedding_dim=embedding_dim,
+            embedding_model=embedding_model,
+            nodes=[],
+            task_id=f"{task_type.removesuffix('_kg_search')}_{_uuid.uuid4().hex[:8]}",
+            task_type=task_type,
+            session_id=resolve_session_id(""),
+            failure_mode="no_results",
+        )
+        if getattr(args, "hook_format", False):
+            return tuple(deferred_events) + (DeferredEmit(ev),)
+        emit_rl_event(ev)
+        return deferred_events
+    except Exception as exc:  # noqa: BLE001 — telemetry never breaks a search
+        print(f"rl_kg_search: no-results event not emitted ({exc})", file=sys.stderr)
+        return deferred_events
+
+
 async def embed_hook_query(text: str):
     """Embed the hook's retrieval query through the MCP QUERY-side method.
 
@@ -340,6 +406,15 @@ async def main():
             # v0.2.101 WP-B1: injection-profile mode stays SILENT on empty
             # (the router reads silence as "nothing above the floor"; a
             # no-results line would be injected noise).
+            # W3R-6 (v0.2.102): the USER-FACING silence stays — but a degraded
+            # retrieval event (failure_mode="no_results") is now emitted so
+            # "no event" is no longer indistinguishable from "no search".
+            deferred_events = stage_no_results_event(
+                args, task_type, vector, deferred_events,
+                embedding_source=EMBEDDING_SOURCE,
+                embedding_model=EMBEDDING_MODEL,
+                embedding_dim=_embedding_dim_for(EMBEDDING_MODEL),
+            )
             if args.hook_format and gate is None:
                 print(f"KG: no-results | query='{args.query}' | limit={args.limit}")
             return

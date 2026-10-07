@@ -30,6 +30,12 @@ POST is recorded in the loss ledger exactly as before.
 
 ``VCO_RL_EMIT_INLINE=1`` sends inline (after the output) instead of detaching —
 a diagnostic switch for debugging the hub write path in the foreground.
+
+A child killed between spawn and send (SIGKILL/OOM) never ran its cleanup: its
+payload would sit in the temp dir forever and its events would be lost with no
+ledger line. The next :func:`hand_off` reaps ``vco-rl-emit-*.json`` payloads
+older than ``VCO_RL_EMIT_ORPHAN_TTL_S`` (default 900 s), recording each as
+``deferred_unsent``/``orphaned_payload`` (v0.2.102 W3R-11).
 """
 from __future__ import annotations
 
@@ -40,6 +46,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -53,6 +60,66 @@ _MCP_DIR = _THIS.parent.parent
 _ORCH_ROOT = _MCP_DIR.parent
 
 INLINE_ENV = "VCO_RL_EMIT_INLINE"
+
+#: W3R-11 (v0.2.102): max age of an abandoned ``vco-rl-emit-*.json`` payload
+#: before the next :func:`hand_off` reaps it. A child killed by SIGKILL/OOM
+#: between spawn and ``_child_main`` never ran its cleanup, so its payload
+#: (and events) would otherwise sit in the temp dir forever, invisible. The
+#: default is GENEROUS so a merely slow-to-start child (cold box, loaded
+#: scheduler) is never mistaken for a dead one — a reaped-but-alive child
+#: would double-record the loss (its own ``_load`` then fails and records
+#: ``deferred_unsent`` too).
+ORPHAN_TTL_ENV = "VCO_RL_EMIT_ORPHAN_TTL_S"
+_ORPHAN_TTL_DEFAULT_S = 900.0
+
+
+def _orphan_ttl_s() -> float:
+    try:
+        return float(os.environ.get(ORPHAN_TTL_ENV, "") or _ORPHAN_TTL_DEFAULT_S)
+    except (TypeError, ValueError):
+        return _ORPHAN_TTL_DEFAULT_S
+
+
+def _reap_orphaned_payloads(
+    *, now: "float | None" = None, tmp_dir: "str | Path | None" = None
+) -> int:
+    """Reap stale ``vco-rl-emit-*.json`` payloads whose child never ran (W3R-11).
+
+    Each stale payload gets ONE ``deferred_unsent``/``orphaned_payload``
+    loss-ledger line (with the event count when the payload is parseable) and
+    is deleted, so an event batch lost to a SIGKILLed child is no longer
+    invisible. Young payloads (a child may still be mid-send) are never
+    touched. Returns the number reaped. Never raises — this runs on
+    :func:`hand_off`, a hook teardown path.
+    """
+    try:
+        cutoff = (time.time() if now is None else now) - _orphan_ttl_s()
+        directory = Path(tmp_dir) if tmp_dir is not None else Path(tempfile.gettempdir())
+        reaped = 0
+        for p in sorted(directory.glob("vco-rl-emit-*.json")):
+            try:
+                if p.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            detail: dict = {}
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                detail["unsent"] = len(data.get("items") or [])
+            except Exception:  # noqa: BLE001 — unparseable payload: count unknown
+                pass
+            try:
+                from vco_lib.rl_telemetry_loss import KIND_DEFERRED_UNSENT, record_loss
+
+                record_loss(KIND_DEFERRED_UNSENT, "orphaned_payload", **detail)
+            except Exception as exc:  # noqa: BLE001 — a loss record never raises
+                logger.debug("deferred emit: could not record orphaned payload (%s)", exc)
+            _safe_unlink(p)
+            reaped += 1
+        return reaped
+    except Exception as exc:  # noqa: BLE001 — reaping must never break a hand-off
+        logger.debug("deferred emit: orphan reaper failed (%s)", exc)
+        return 0
 
 
 @dataclass(frozen=True)
@@ -149,12 +216,26 @@ def _resolve_writer_params(item: DeferredEmit) -> Optional[dict]:
 def _serialize(items: Sequence[DeferredEmit]) -> str:
     """The child's batch: each event plus the writer identity resolved HERE.
     An item whose writer cannot be resolved is dropped (``emit_rl_event``
-    would have skipped it for the same reason)."""
+    would have skipped it for the same reason) — and, since v0.2.102 (W3R-5),
+    the drop is ledgered as ``writer_unavailable``/``serialize_drop``: the
+    event never reaches the child, so without a line here nothing would ever
+    name it."""
     batch = []
     for i in items:
         params = _resolve_writer_params(i)
         if params is None:
             logger.debug("deferred emit: no writer for %s; skipped", getattr(i.event, "task_id", "?"))
+            try:
+                from vco_lib.rl_telemetry_loss import KIND_WRITER_UNAVAILABLE, record_loss
+
+                record_loss(
+                    KIND_WRITER_UNAVAILABLE,
+                    "serialize_drop",
+                    task_id=getattr(i.event, "task_id", None),
+                    task_type=getattr(i.event, "task_type", None),
+                )
+            except Exception as exc:  # noqa: BLE001 — a loss record never raises
+                logger.debug("deferred emit: could not record serialize drop (%s)", exc)
             continue
         batch.append({"event": dataclasses.asdict(i.event), "writer": params})
     return json.dumps({"items": batch}, separators=(",", ":"))
@@ -200,13 +281,22 @@ def hand_off(items: Sequence[DeferredEmit], *, emit=None) -> str:
     items = [i for i in (items or ()) if i is not None]
     if not items:
         return "none"
+    _reap_orphaned_payloads()
     if _can_detach():
         try:
             _spawn_child(_serialize(items))
             return "detached"
         except Exception as exc:  # noqa: BLE001 — fall back to inline, never drop
             logger.debug("deferred emit: detached child unavailable (%s); sending inline", exc)
-    emit_now(items, emit=emit)
+    # W3R-5 (v0.2.102): the inline fallback used to DISCARD the per-item
+    # results — an item the emitter never sent (validation failure, a raise)
+    # left no ledger line on this path (``_record_unsent`` existed only in the
+    # child). Record them exactly as the child would. Items whose failure was
+    # an unavailable writer are skipped by ``_record_unsent``'s probe —
+    # ``emit_rl_event`` already ledgered those as ``writer_unavailable``.
+    results = emit_each(items, emit=emit)
+    if not all(results):
+        _record_unsent(items, results)
     return "inline"
 
 
@@ -234,6 +324,26 @@ def _load(path: str) -> list:
     return out
 
 
+def _writer_unavailable(item: "DeferredEmit") -> bool:
+    """Best-effort probe: would this item's emit fail for an UNAVAILABLE
+    writer? Used by :func:`_record_unsent` to skip items ``emit_rl_event``
+    already ledgered as ``writer_unavailable`` (v0.2.102 W3R-5) — the
+    ``deferred_unsent`` line must never count the same event twice. On probe
+    error assume UNAVAILABLE (skip): the emit-side record is the safer bet,
+    and an occasional missed re-count beats a double count of every event on
+    a broken install.
+    """
+    try:
+        factory = _writer_factory_for(item)
+        if factory is None:
+            from .telemetry_emit import _default_writer_factory
+
+            factory = _default_writer_factory
+        return factory() is None
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _record_unsent(
     items: Optional[Sequence["DeferredEmit"]], results: Optional[Sequence[bool]] = None
 ) -> None:
@@ -244,7 +354,10 @@ def _record_unsent(
     recorded per event by ``hub_writer`` with its own reason
     (``emit_rl_event`` reports True for it), so it is NOT re-counted here. The
     line is kind ``deferred_unsent``—not ``hub_post_failed``—because no POST
-    was ever attempted for these events.
+    was ever attempted for these events. Likewise (W3R-5): an event whose
+    emit failed for an UNAVAILABLE WRITER is already ledgered by
+    ``emit_rl_event`` under ``writer_unavailable``, so it is filtered out
+    here too.
 
     ``results`` is :func:`emit_each`'s per-item flags. ``None`` (a loader crash
     before any emit) means the whole batch is unknown, so all of it is
@@ -262,8 +375,10 @@ def _record_unsent(
         unsent = [
             getattr(getattr(i, "event", None), "task_id", "?")
             for i, ok in zip(items, flags)
-            if not ok
+            if not ok and not _writer_unavailable(i)
         ]
+        if not unsent:
+            return
         detail = {"unsent": len(unsent), "task_ids": ",".join(unsent)}
     try:
         record_loss(KIND_DEFERRED_UNSENT, "deferred_emit_not_sent", **detail)
