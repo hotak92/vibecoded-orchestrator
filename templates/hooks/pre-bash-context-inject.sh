@@ -94,14 +94,17 @@ try:
     print(d.get('tool_name', ''))
     print(d.get('session_id', ''))
     print((d.get('tool_input') or {}).get('command', ''))
+    print(d.get('tool_use_id', ''))
 except Exception:
     print('')
     print('')
     print('')
-" 2>/dev/null || printf '\n\n\n')
+    print('')
+" 2>/dev/null || printf '\n\n\n\n')
 TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '1p')
 SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
 COMMAND=$(printf '%s' "$_PARSED" | sed -n '3p')
+TOOL_USE_ID_RAW=$(printf '%s' "$_PARSED" | sed -n '4p')
 
 # Only fire for Bash tool
 if [[ "$TOOL_NAME" != "Bash" ]]; then
@@ -134,6 +137,14 @@ if [ -z "$CMD_HASH" ]; then
     CMD_HASH=$(printf '%s' "$COMMAND" | tr '/' '_' | tr -cd '[:alnum:]_' | head -c 32)
 fi
 CMD_LEN=${#COMMAND}
+
+# v0.2.102 W3R-3: the pairing state is keyed by the CALL, not the command.
+# Two concurrent identical Bash calls (distinct tool_use_ids) used to share
+# one bash_task_<session>_<cmdhash>.json — the second pre-bash overwrote
+# the first's pairing and the trainer saw duplicate outcomes for one task.
+# Same sanitize ladder as the router's bash_claim_path ([A-Za-z0-9_-], 64).
+# MUST MATCH the .ps1 sibling and post-bash-context-record.sh.
+TUID=$(printf '%s' "$TOOL_USE_ID_RAW" | tr -cd 'A-Za-z0-9_-' | head -c 64)
 
 STATE_DIR="$PROJECT_ROOT/.claude/state"
 mkdir -p "$STATE_DIR" 2>/dev/null || true
@@ -266,6 +277,14 @@ except Exception:
 case "$INTENT" in
     READ|EDIT|SEARCH)
         STATE_FILE="$STATE_DIR/bash_task_${SESSION_ID}_${CMD_HASH}.json"
+        # v0.2.102 W3R-3: when the harness names the call (tool_use_id —
+        # current payloads always do), the pairing file is PER CALL so
+        # concurrent identical commands never collide; post-bash derives the
+        # same suffix. No tool_use_id → the legacy hash-only name (the
+        # router's claim TTL already dedupes the double-spawn case there).
+        if [ -n "$TUID" ]; then
+            STATE_FILE="$STATE_DIR/bash_task_${SESSION_ID}_${CMD_HASH}_${TUID}.json"
+        fi
         # Multi-match double spawns (wave-2 review nit-5) cannot reach here
         # twice: only the spawn that won the router's --claim gets an intent
         # (v0.2.101 N2 — the pre-N2 `find -mmin -1` guard on this file was a
@@ -287,6 +306,7 @@ case "$INTENT" in
         VCT_PB_INTENT="$INTENT" \
         VCT_PB_TARGETS="$TARGETS_JSON" \
         VCT_PB_SYMBOLS="$SYMBOLS_JSON" \
+        VCT_PB_TUID="$TUID" \
         "$PY" -c "
 import json, os
 def _int(name):
@@ -309,6 +329,9 @@ state = {
     'intent': os.environ.get('VCT_PB_INTENT', ''),
     'targets': _list('VCT_PB_TARGETS'),
     'symbols': _list('VCT_PB_SYMBOLS'),
+    # W3R-3 additive key (empty on tool_use_id-less payloads — old readers
+    # ignore unknown/empty keys, the legacy name already covers them).
+    'tool_use_id': os.environ.get('VCT_PB_TUID', ''),
 }
 try:
     with open(os.environ.get('VCT_PB_STATE_FILE', ''), 'w') as f:

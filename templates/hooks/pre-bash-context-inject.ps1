@@ -83,6 +83,7 @@ try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $ToolName = ""
 $SessionId = ""
 $Command = ""
+$ToolUseId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
@@ -91,6 +92,7 @@ try {
         if ($payload.tool_input -and $payload.tool_input.command) {
             $Command = [string]$payload.tool_input.command
         }
+        if ($payload.tool_use_id) { $ToolUseId = [string]$payload.tool_use_id }
     }
 } catch { }
 
@@ -116,6 +118,13 @@ if (-not $CmdHash) {
     if ($CmdHash.Length -gt 32) { $CmdHash = $CmdHash.Substring(0, 32) }
 }
 $CmdLen = $Command.Length
+
+# v0.2.102 W3R-3: the pairing state is keyed by the CALL, not the command
+# (two concurrent identical calls, distinct tool_use_ids, used to share one
+# state file). Same sanitize ladder as the router's bash_claim_path. MUST
+# MATCH the .sh sibling and post-bash-context-record.ps1.
+$Tuid = ($ToolUseId -replace '[^A-Za-z0-9_-]', '')
+if ($Tuid.Length -gt 64) { $Tuid = $Tuid.Substring(0, 64) }
 
 $StateDir = Join-Path $ProjectRoot ".claude/state"
 if (-not (Test-Path $StateDir)) {
@@ -182,6 +191,11 @@ Get-ChildItem -File $StateDir -Filter "bash_intent_*.json" -ErrorAction Silently
 # === State file + pre_bash outcome event: READ/EDIT/SEARCH only ===
 if ($Intent -eq "READ" -or $Intent -eq "EDIT" -or $Intent -eq "SEARCH") {
     $StateFile = Join-Path $StateDir "bash_task_${SessionId}_${CmdHash}.json"
+    # v0.2.102 W3R-3: per-CALL pairing when the harness names the call
+    # (post-bash derives the same suffix); legacy hash-only name otherwise.
+    if ($Tuid) {
+        $StateFile = Join-Path $StateDir "bash_task_${SessionId}_${CmdHash}_${Tuid}.json"
+    }
     # Multi-match double spawns (wave-2 review nit-5) cannot reach here twice:
     # only the spawn that won the router's --claim gets an intent (v0.2.101
     # N2 -- the pre-N2 "fresh state file" guard here was a check-then-write
@@ -199,6 +213,8 @@ if ($Intent -eq "READ" -or $Intent -eq "EDIT" -or $Intent -eq "SEARCH") {
         intent = $Intent
         targets = @()
         symbols = @()
+        # W3R-3 additive key (empty when the payload carried no tool_use_id).
+        tool_use_id = $Tuid
     }
     try { $state.targets = @($TargetsJson | ConvertFrom-Json) } catch { }
     try { $state.symbols = @($SymbolsJson | ConvertFrom-Json) } catch { }

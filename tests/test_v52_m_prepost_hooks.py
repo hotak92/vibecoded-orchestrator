@@ -286,7 +286,11 @@ class TaskIdPairingViaStateFile(unittest.TestCase):
 
     def test_state_file_path_template_matches(self) -> None:
         """Both hooks must construct the same state file path:
-        `.claude/state/bash_task_<session>_<cmdhash>.json`.
+        `.claude/state/bash_task_<session>_<cmdhash>.json` (legacy, no
+        tool_use_id) and, since v0.2.102 W3R-3, the per-CALL form
+        `.claude/state/bash_task_<session>_<cmdhash>_<tuid>.json` when the
+        payload names the call — concurrent identical commands must not
+        share one pairing file.
         """
         for name in ("pre-bash-context-inject", "post-bash-context-record"):
             p_sh = HOOK_DIR / f"{name}.sh"
@@ -295,11 +299,19 @@ class TaskIdPairingViaStateFile(unittest.TestCase):
                 "bash_task_${SESSION_ID}_${CMD_HASH}.json", text_sh,
                 f"{p_sh}: state file path template drift",
             )
+            self.assertIn(
+                "bash_task_${SESSION_ID}_${CMD_HASH}_${TUID}.json", text_sh,
+                f"{p_sh}: per-call (W3R-3) state file path template drift",
+            )
             p_ps = HOOK_DIR / f"{name}.ps1"
             text_ps = p_ps.read_text(encoding="utf-8")
             self.assertIn(
                 'bash_task_${SessionId}_${CmdHash}.json', text_ps,
                 f"{p_ps}: state file path template drift (PS1)",
+            )
+            self.assertIn(
+                'bash_task_${SessionId}_${CmdHash}_${Tuid}.json', text_ps,
+                f"{p_ps}: per-call (W3R-3) state file path template drift (PS1)",
             )
 
 
