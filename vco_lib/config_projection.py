@@ -254,29 +254,15 @@ from vco_lib.launcher_db_reader import (
 _CANONICAL_KEYS: tuple[str, ...] = (
     "KG_COLLECTION",
     "DEVELOPMENT_COLLECTION",
-    # DIAGRAMS_COLLECTION (Phase 1.5 — Diagrams Integration, fix/a1-
-    # indexing-pipeline 2026-05-25). Paired with KG_COLLECTION via the
-    # canonical sanitized-basename + "_Diagrams" suffix (see the
-    # ``derive_project_collection_names`` rule in vco_lib.project_init).
-    # Consumed by:
-    #   * `vco_lib.diagram_indexer::index_diagram` for the Weaviate
-    #     upsert target (Phase 1.5.A indexer hot path).
-    #   * `claude_mcp_servers/weaviate_mcp/server.py::DIAGRAMS_COLLECTION`
-    #     for hybrid_search fan-out into diagram results (Phase 1.5.C).
-    # The Rust ``CANONICAL_INSTALL_ENV_KEYS`` constant
-    # (launcher/src-tauri/src/commands/projects_v2.rs L3087) does NOT
-    # yet include this key — adding it there is a separate Rust-side PR.
-    # The Rust env writer never emitted DIAGRAMS_COLLECTION (it was
-    # retired in v0.2.97; only this Python contract writes the key).
-    # That's deliberate: the Python ``vco_lib.config_projection apply``
-    # CLI is the canonical writer per the Option-A interop strategy
-    # documented at the top of this module; production callers that
-    # need DIAGRAMS_COLLECTION on disk subprocess into the Python CLI.
-    # The byte-identical parity test
-    # (tests/test_config_projection_byte_identical.py) feeds a bundle
-    # that doesn't include DIAGRAMS_COLLECTION, so its assertions are
-    # unaffected by this addition.
-    "DIAGRAMS_COLLECTION",
+    # DIAGRAMS_COLLECTION — REMOVED in v0.2.102 with the diagrams
+    # integrations (owner ruling 2026-10-07): nothing reads it anymore and
+    # the projection stops writing it (it no longer lands in the managed
+    # env block). A copy a pre-v0.2.102 writer left OUTSIDE the managed
+    # block is a user-area key — preserved and inert, per the leave-user-
+    # data-alone rule. The `_Diagrams` collection-NAME derivation itself
+    # is kept (resolve_project_collection_names /
+    # _derive_dev_diagrams_from_kg) so existing user collections keep
+    # being recognised by the migrate / drop paths.
     "SHARED_KG_COLLECTION",
     "SHARED_KG_WRITE_DISABLED",
     "SHARED_KG_OPT_OUT",
@@ -388,15 +374,12 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     "VCT_PROJECT_ID",
     "VCT_KG_ACCESS_LIST",
     "VCT_CODE_GRAPH_ACCESS_LIST",
-    # Diagrams cross-project visibility (v0.2.34, A7). Previously the MCP
-    # piggybacked on ``VCT_KG_ACCESS_LIST`` — wrong granularity: granting
-    # KG access leaked diagram visibility, and granting diagram-only
-    # access never reached the MCP. This key is sourced from the
-    # ``diagram_access`` SQLite table (joined to ``projects.name`` on
-    # the grantor side) and consumed by ``weaviate_mcp/server.py::
-    # _diagrams_peer_collections`` with no fallback to the KG list.
-    # Conditionally emitted: omitted when no peers granted diagram read.
-    "VCT_DIAGRAMS_ACCESS_LIST",
+    # VCT_DIAGRAMS_ACCESS_LIST — REMOVED in v0.2.102 with the diagrams
+    # integrations (its only consumer, the weaviate MCP's diagrams
+    # fan-out, is gone). Same posture as DIAGRAMS_COLLECTION above: no
+    # longer written; an existing user-area copy is inert and preserved.
+    # The launcher's ``diagram_access`` TABLE is user data and is never
+    # touched.
     "GITHUB_TOKEN",
     # A-8 (v0.2.73): KG_BASE_DIR — the project's folder path. Previously
     # Rust-only (emitted "always" by the legacy Rust env writer's
@@ -585,10 +568,12 @@ def _fetch_project_row(conn: sqlite3.Connection, project_id: str) -> _DbProjectR
 
 # ─── Public project-row helpers (Phase 0.B Part 2) ──────────────────────
 #
-# These two functions are the canonical lookup primitives used by the
-# diagrams CLIs (``vco rebuild-diagram-index`` and ``vco verify-diagrams
-# --all``). They read the ``projects`` table via :func:`_open_db_read_only`
-# so the launcher remains the only writer of its own DB.
+# These two functions are the canonical lookup primitives for reading the
+# launcher's ``projects`` table from Python (introduced for the diagram CLIs,
+# removed in v0.2.102; still used by ``vco verify-env-projection --all``,
+# the install-time Weaviate seeding and the apply fan-out below). They read
+# the ``projects`` table via :func:`_open_db_read_only` so the launcher
+# remains the only writer of its own DB.
 #
 # Resolution semantics:
 #   * ``resolve_project_folder`` accepts either a project id (UUID) or a
@@ -626,8 +611,8 @@ def resolve_project_folder(
         The absolute folder path as a :class:`pathlib.Path`.
 
     Raises:
-        LookupError: when neither id nor slug matches. The diagrams CLIs
-            translate this to ``EXIT_ENV_PROBLEM`` (exit code 2).
+        LookupError: when neither id nor slug matches. Callers translate
+            this to ``EXIT_ENV_PROBLEM`` (exit code 2).
         DbUnreachable: when the launcher DB is missing or unopenable.
             Distinct from LookupError so callers can distinguish "no
             launcher installed" from "project not registered".
@@ -675,14 +660,11 @@ def list_registered_projects(
     """Return every registered project as ``{id, name, slug, folder_path}``.
 
     Sorted by ``name`` for deterministic ``--all`` iteration order. Used
-    by:
+    by the ``--all`` fans-out (``vco verify-env-projection --all``, the
+    install-time Weaviate seeding, the apply fan-out).
 
-      * ``vco rebuild-diagram-index --all``
-      * ``vco verify-diagrams --all``
-
-    Each dict also carries a ``folder`` alias for ``folder_path`` so the
-    rebuild CLI's existing consumer (``project.get("folder")``) keeps
-    working without modification.
+    Each dict also carries a ``folder`` alias for ``folder_path``
+    (historical back-compat from the removed rebuild-diagram-index CLI).
 
     Args:
         db_path: Optional override of the launcher DB location. Defaults
@@ -727,8 +709,8 @@ def list_registered_projects(
                     "name": str(row["name"]),
                     "slug": str(row["slug"]),
                     "folder_path": folder_path,
-                    # Back-compat alias for rebuild_diagram_index.py's
-                    # consumer that pre-dated the canonical spec.
+                    # Historical back-compat alias (the removed
+                    # rebuild_diagram_index.py consumer).
                     "folder": folder_path,
                 }
             )
@@ -1147,8 +1129,9 @@ def _fetch_kg_bindings(
 def _is_missing_table_error(exc: sqlite3.Error) -> bool:
     """True when ``exc`` says a table this DB was queried for does not exist.
 
-    ONE home for the ``"no such table" in str(exc).lower()`` test that three
-    resolvers in this module used to inline (``_fetch_diagram_access_list``,
+    ONE home for the ``"no such table" in str(exc).lower()`` test that
+    resolvers in this module used to inline (historically
+    ``_fetch_diagram_access_list`` — removed in v0.2.102 — and
     ``_fetch_user_secret_known_keys``, and now
     :func:`probe_codegraph_binding_prefix`). Extracted rather than copied a
     third time.
@@ -1438,11 +1421,9 @@ def _fetch_code_graph_access_list(
     filter never matches → silent zero peer results. Emitting the NAME
     makes writer/reader prefix + filter agree for ANY project name.
 
-    This converges on the sibling ``_fetch_diagram_access_list`` in this
-    module, which already does ``SELECT p.name`` for the identical
-    writer/reader-parity reason (fixed in ``70381fa9`` for diagrams five
-    days after this resolver was born slug-based in ``8170b0bf`` — an
-    unreconciled omission, now closed).
+    Names, not slugs, for the writer/reader-parity reason fixed in
+    ``70381fa9`` (the collection-prefix derivation is keyed on the project
+    NAME, sanitised).
 
     Blank names are filtered (defensive against malformed DB rows;
     mirrors the diagrams resolver's ``if r["name"]`` guard).
@@ -1454,65 +1435,6 @@ def _fetch_code_graph_access_list(
         "WHERE ca.grantee_project_id = ? AND ca.access_level = 'read'",
         (project_id,),
     )
-    return sorted({str(r["name"]) for r in cur.fetchall() if r["name"]})
-
-
-def _fetch_diagram_access_list(
-    conn: sqlite3.Connection, project_id: str
-) -> list[str]:
-    """Resolve the ``VCT_DIAGRAMS_ACCESS_LIST`` value.
-
-    Joins ``diagram_access`` to ``projects`` on the grantor side, pulling
-    the grantor's display ``name``. The MCP consumer
-    (``weaviate_mcp/server.py::_diagrams_peer_collections``) sanitises
-    each name through ``_sanitize_collection_prefix`` and appends
-    ``_Diagrams`` to derive the canonical Weaviate class name.
-
-    Why ``p.name`` and not ``p.slug``: the diagrams collection-prefix
-    derivation is keyed on the project NAME (sanitised) — same rule the
-    launcher's ``project_diagrams`` indexer uses when it writes
-    ``<SanitizedName>_Diagrams`` rows into Weaviate. Switching to slugs
-    would create a prefix mismatch between writer and reader.
-    ``VCT_CODE_GRAPH_ACCESS_LIST`` carries NAMES for the same reason
-    (converged 2026-07-14, GAP-CG-1) — the two access-list resolvers
-    now agree on the identity form.
-
-    Excludes self by construction — the ``diagram_access`` schema's
-    grantor/grantee pair is always cross-project (no self-grants).
-    Empty / blank names are filtered (defensive against malformed DB
-    rows; mirrors ``_fetch_kg_access_list``'s defensive prefix check).
-
-    SQL uses parameterised ``?`` — no string concat. Same prepared-
-    statement discipline as the sibling resolvers in this module.
-
-    Phase 1.5.C (2026-05-24) had the MCP piggyback on
-    ``VCT_KG_ACCESS_LIST`` as a temporary simplification. v0.2.34 A7
-    splits the two: the MCP now reads ``VCT_DIAGRAMS_ACCESS_LIST``
-    exclusively (no KG fallback), and this resolver is the single
-    legal writer of that env var.
-    """
-    cur = conn.cursor()
-    # Defensive: pre-migration-022 DBs lack the `diagram_access` table.
-    # Phase 0.D's test fixtures + any partial-install scenario where
-    # migration 022 hasn't run yet must still resolve env without
-    # crashing. Empty list is the right "no grants" fallback semantically.
-    try:
-        cur.execute(
-            "SELECT p.name FROM diagram_access da "
-            "JOIN projects p ON p.id = da.grantor_project_id "
-            "WHERE da.grantee_project_id = ? AND da.access_level = 'read' "
-            "ORDER BY p.name",
-            (project_id,),
-        )
-    except sqlite3.OperationalError as exc:
-        # v0.2.92 W18: routed through the ONE home. Behaviour unchanged —
-        # missing table is a true "no grants"; every other error still raises.
-        if _is_missing_table_error(exc):
-            return []
-        raise
-    # Use a set for dedup, sort for deterministic output (matches the
-    # ORDER BY in the SQL but defends against the case where two
-    # grantors share a name — sort+dedup keeps the env var stable).
     return sorted({str(r["name"]) for r in cur.fetchall() if r["name"]})
 
 
@@ -2021,9 +1943,12 @@ def project_env_from_db(
         # so a `primary` override carries through; the non-`_KnowledgeGraph`
         # fallback (custom-rename primary) uses the SLUG-based sanitizer to
         # byte-match the hub. Both dev + diagrams share the one derivation.
-        dev_collection, diagrams_collection = _derive_dev_diagrams_from_kg(
+        dev_collection, _diagrams = _derive_dev_diagrams_from_kg(
             kg_collection, proj.slug
         )
+        # v0.2.102: the diagrams half of the derivation is still computed
+        # (one rule, one home) but no longer PROJECTED — DIAGRAMS_COLLECTION
+        # left the canonical key set with the diagrams integrations.
 
         # Access lists.
         kg_access = _fetch_kg_access_list(
@@ -2034,11 +1959,9 @@ def project_env_from_db(
             shared_kg=shared_kg,
         )
         code_graph_access = _fetch_code_graph_access_list(conn, project_id)
-        # v0.2.34 A7: independent diagrams access matrix. Previously the
-        # MCP fell back to VCT_KG_ACCESS_LIST, which had the wrong
-        # granularity (granting KG leaked diagrams; granting only
-        # diagrams was invisible to the MCP). See `_fetch_diagram_access_list`.
-        diagram_access = _fetch_diagram_access_list(conn, project_id)
+        # v0.2.102: the diagrams access matrix is no longer projected (the
+        # MCP's diagrams fan-out, its only consumer, is gone). The
+        # ``diagram_access`` launcher-DB table itself is untouched user data.
 
         # Module settings — orchestrator-core scope.
         shared_kg_write_disabled = _fetch_module_setting_bool(
@@ -2258,7 +2181,6 @@ def project_env_from_db(
 
     _set("KG_COLLECTION", kg_collection)
     _set("DEVELOPMENT_COLLECTION", dev_collection)
-    _set("DIAGRAMS_COLLECTION", diagrams_collection)
     _set("SHARED_KG_COLLECTION", shared_kg)
     # v0.2.49 SB1: emit VCT_PROJECT_ID so hooks + the MCP server can
     # identify this project against the hub's access-matrix endpoint.
@@ -2397,13 +2319,6 @@ def project_env_from_db(
         _set("VCT_KG_ACCESS_LIST", ",".join(kg_access))
     if code_graph_access:
         _set("VCT_CODE_GRAPH_ACCESS_LIST", ",".join(code_graph_access))
-    if diagram_access:
-        # v0.2.34 A7. CSV of grantor project NAMES (not slugs); the MCP
-        # sanitises + appends `_Diagrams`. Conditionally emitted: omitted
-        # when no peers granted diagram read — matches the access-list
-        # omit semantics used for VCT_KG_ACCESS_LIST and
-        # VCT_CODE_GRAPH_ACCESS_LIST (signal-to-remove on apply).
-        _set("VCT_DIAGRAMS_ACCESS_LIST", ",".join(diagram_access))
 
     # GITHUB_TOKEN is never resolved here, by design: since v0.2.73 VCO
     # writes no secret value into a project (consumers resolve the PAT at

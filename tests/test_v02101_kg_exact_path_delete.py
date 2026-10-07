@@ -402,28 +402,3 @@ class _DiagColl:
         self.rows.pop(uid, None)
 
 
-@pytest.mark.parametrize("mutated", [False, True], ids=["shipped", "red-proof"])
-def test_diagram_delete_spares_token_superset_diagram(mutate_exact_check, mutated):
-    from unittest import mock
-
-    from vco_lib import diagram_indexer as di
-
-    short = ".claude/diagrams/auth.mmd"
-    longer = ".claude/diagrams/auth-flow.mmd"
-    coll = _DiagColl([
-        SimpleNamespace(uuid="a", properties={"file_path": short}),
-        SimpleNamespace(uuid="b", properties={"file_path": longer}),
-    ])
-    client = SimpleNamespace(
-        collections=SimpleNamespace(get=lambda _name: coll), close=lambda: None,
-    )
-    if mutated:
-        mutate_exact_check()
-    with mock.patch("weaviate.connect_to_custom", return_value=client), \
-            mock.patch("weaviate.classes.query.Filter", _TokFilter):
-        assert di._weaviate_delete_by_file_path(
-            short, weaviate_url="http://localhost:8081",
-            collection_name="Proj_Diagrams",
-        )
-    remaining = sorted(r.properties["file_path"] for r in coll.rows.values())
-    assert remaining == ([] if mutated else [longer])

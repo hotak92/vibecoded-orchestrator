@@ -226,8 +226,11 @@ def derive_project_diagrams_name(project_name: str) -> str:
     project name string.
 
     Mirrors the naming convention of the KG / Development collections —
-    `<sanitized>_Diagrams`. Used by `vco_lib.diagram_indexer` (Phase
-    1.5) when upserting Mermaid + Excalidraw entries into Weaviate.
+    `<sanitized>_Diagrams`. v0.2.102: the diagrams integrations (the
+    indexer that consumed this) were removed; the derivation is KEPT so
+    existing `<Project>_Diagrams` user collections keep being recognised
+    (D-protection — the migrate / rename / orphan paths still derive the
+    name).
     """
     return f"{sanitize_for_weaviate_class(project_name)}_Diagrams"
 
@@ -428,14 +431,15 @@ def derive_project_code_prefix(project_name: str) -> str:
     underscores). Consolidated here so the drop-collections / migrate /
     orphan-detector paths all agree on the code prefix.
 
-    Delegates to the shared sanitizer in ``codegraph_to_mermaid`` (itself a
-    thin wrapper over ``canonical_class_prefix`` with the legacy-fallback
-    that never raises), so a single home owns the rule. Returns "" only when
-    the sanitizer yields an empty/unusable string.
+    Delegates to the shared sanitizer in ``codegraph_naming``
+    (``sanitize_collection_prefix``, itself a thin wrapper over
+    ``canonical_class_prefix`` with the legacy-fallback that never raises),
+    so a single home owns the rule. Returns "" only when the sanitizer
+    yields an empty/unusable string.
     """
     try:
-        from vco_lib.codegraph_to_mermaid import _sanitize_collection_prefix
-        return _sanitize_collection_prefix(project_name or "") or ""
+        from vco_lib.codegraph_naming import sanitize_collection_prefix
+        return sanitize_collection_prefix(project_name or "") or ""
     except Exception:
         # Last-resort: never raise into a caller building a drop plan.
         return ""
@@ -2940,18 +2944,11 @@ def bootstrap_collections(
         targets.append(
             (derived["development_collection"], development_class_definition),
         )
-        # Phase 1.5 — Diagrams collection (fix/a1-indexing-pipeline
-        # 2026-05-25). Auto-paired with the KG collection on every
-        # bootstrap so `vco_lib.diagram_indexer::_weaviate_upsert` has a
-        # class to write into the first time the user saves a .mmd /
-        # .excalidraw file (otherwise upsert fails with "no such class"
-        # — Bug-3 of the wiring audit). The class is also unconditionally
-        # bootstrapped on every existing project's next session because
-        # the existence check + POST-on-absent path below makes the
-        # bootstrap idempotent.
-        targets.append(
-            (derived["diagrams_collection"], diagrams_class_definition),
-        )
+        # v0.2.102: the Diagrams collection is NO LONGER bootstrapped —
+        # the diagrams integrations were removed (owner ruling 2026-10-07).
+        # Existing `<Project>_Diagrams` collections on user machines are
+        # untouched (still recognised by the migration / naming paths
+        # below); nothing writes into them anymore.
     # Shared KG: always created when missing (per coordinator: shared KG is
     # READ by every project regardless of per-project opt-out, so creation
     # is unconditional). The opt-out toggle is purely a write-gate enforced
@@ -3195,18 +3192,16 @@ def _write_bootstrap_deferral(
         cmd_lines[-1] += " --kg-only"
 
     # Compose the list of expected collections for the deferral message.
-    # In kg_only mode we skip Dev and Diagrams (matching the bootstrap
-    # target tuple); otherwise list all three per-project collections
-    # plus the shared KG. fix/a1-indexing-pipeline (2026-05-25): added
-    # `<Project>_Diagrams` so users see all collections that didn't get
-    # created and can plan the re-run accordingly.
+    # In kg_only mode we skip Dev (matching the bootstrap target tuple);
+    # otherwise list the two per-project collections plus the shared KG.
+    # (v0.2.102: `<Project>_Diagrams` dropped from the list — the diagrams
+    # bootstrap was removed with the diagrams integrations.)
     if kg_only:
         _collections_human = f"{derived['kg_collection']}, {_SHARED_KG_NAME}"
     else:
         _collections_human = (
             f"{derived['kg_collection']}, "
             f"{derived['development_collection']}, "
-            f"{derived['diagrams_collection']}, "
             f"{_SHARED_KG_NAME}"
         )
     entry = DeferralEntry(
@@ -12094,7 +12089,8 @@ def _apply_standalone_env(
     # binding-first; this path only ever runs when they can't.
     kg_collection = f"{sanitized}_KnowledgeGraph"
     dev_collection = f"{sanitized}_Development"
-    diagrams_collection = f"{sanitized}_Diagrams"
+    # (the `<sanitized>_Diagrams` sibling was scaffolded here until v0.2.102,
+    # when the diagrams integrations were removed; it is no longer projected)
     # v0.2.92 F-12(a): resolve the shared-KG name instead of hardcoding the
     # generic literal. The literal is VCO's LAST-RESORT default, not a fact
     # about this machine — and on an adopt-and-route install (where the
@@ -12117,7 +12113,11 @@ def _apply_standalone_env(
         "CODE_GRAPH_PROJECT": code_graph_project,
         "KG_COLLECTION": kg_collection,
         "DEVELOPMENT_COLLECTION": dev_collection,
-        "DIAGRAMS_COLLECTION": diagrams_collection,
+        # v0.2.102: DIAGRAMS_COLLECTION is no longer scaffolded — it left
+        # the canonical key set with the diagrams integrations, and the
+        # apply drops keys the bundle does not carry from the managed
+        # block. (The diagrams collection NAME derivation above still runs
+        # so existing `_Diagrams` user collections stay recognisable.)
         "SHARED_KG_COLLECTION": shared_kg,
         "SHARED_KG_WRITE_DISABLED": "false",
         "SHARED_KG_OPT_OUT": "false",

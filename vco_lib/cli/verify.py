@@ -3,8 +3,8 @@
 """``vco verify-pins`` and ``vco verify-env-projection`` — Phase 0 acceptance.
 
 These two subcommands implement the acceptance criteria for Phase 0 of
-the diagrams-integration plan (``.claude/context/plans/
-diagrams-integration-excalidraw-mermaid-2026-05-24.md`` §3 Phase 0):
+the (historical) 2026-05-24 diagrams plan; the machinery is generic and
+outlived it (the diagram pins are gone since v0.2.102):
 
 * ``verify-pins`` — confirms the npm packages enumerated in
   ``bundled_mcp_versions.toml`` are installed at exactly the pinned
@@ -124,7 +124,7 @@ def _load_bundled_versions() -> Mapping[str, Any]:
 
         from vco_lib.bundled_versions import load_bundled_versions
         manifest = load_bundled_versions()
-        # Returns a Mapping keyed by package_key (e.g. ``mermaid_mcp``),
+        # Returns a Mapping keyed by package_key,
         # each value exposing at least ``.package`` (str) and ``.version``
         # (str). Implementation may also surface ``.sha256``; we don't read
         # it here.
@@ -292,8 +292,8 @@ def _resolve_project_folder(project_id: str) -> Path:
 class _PinRow:
     """Single row in the verify-pins comparison table."""
 
-    key: str           # manifest key, e.g. ``mermaid_mcp``
-    package: str       # npm package name, e.g. ``claude-mermaid``
+    key: str           # manifest key
+    package: str       # npm package name
     pinned: str        # version from manifest
     installed: Optional[str]  # version from ``npm view``, None if missing
     status: str        # ``match`` | ``drift`` | ``missing`` | ``npm-not-available``
@@ -362,7 +362,7 @@ def _npm_pin_section(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     """The npm pin rows out of a bundled-versions document.
 
     v0.2.91 WP-D. ``load_bundled_versions()`` returns the WHOLE document
-    (``{"npm": {"mermaid_mcp": …}, "chromium": {…}}``), but
+    (``{"npm": {…}, "chromium": {…}}``), but
     :func:`_collect_pin_rows` wants the per-key pin map. Passing the document
     straight through produced two phantom rows keyed ``npm`` and ``chromium``
     with ``<missing-package-for-…>`` placeholders, classified as DRIFT — so
@@ -374,11 +374,23 @@ def _npm_pin_section(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     them agreed with reality (the v0.2.46 lesson). Both shapes are accepted
     here: a document with an ``npm`` table yields that table, a flat map is
     returned unchanged.
+
+    v0.2.102: the ``npm`` table may be legitimately ABSENT (the four
+    diagram pins were removed with the diagrams integrations, leaving only
+    ``[chromium]``). A document WITHOUT an ``npm`` table must yield ``{}`` —
+    returning the document itself would reintroduce the exact phantom-row
+    defect this helper exists to prevent (``chromium`` classified as a
+    drifted pin). A mapping is a FLAT PIN MAP iff every value carries a
+    ``package`` key; anything else without an ``npm`` table is a document
+    with no pins.
     """
     npm = manifest.get("npm")
     if isinstance(npm, Mapping):
         return npm
-    return manifest
+    values = [v for v in manifest.values() if isinstance(v, Mapping)]
+    if values and all("package" in v for v in values):
+        return manifest  # flat pin map (the pre-WP-D stub shape)
+    return {}
 
 
 def _collect_pin_rows(

@@ -55,8 +55,8 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"
 
 # v0.2.95 (lane F10): the ROUTING — knowledge/ -> kg-sync, docs/ -> the
-# development collection, .claude/diagrams/ -> the indexer, code files ->
-# the end-of-turn code-graph drain queue — plus the Phase-8 access gate and
+# development collection, code files -> the end-of-turn code-graph drain
+# queue — plus the Phase-8 access gate and
 # the per-file debounce now live in _lib/route-touched-path.sh, because a
 # SECOND hook needs exactly the same decision: post-bash-file-sync.sh, which
 # gives a CLI write (`cat > knowledge/foo.md <<EOF`, `sed -i`, `cp`) the
@@ -155,7 +155,7 @@ sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 
 [ -z "$EDITED_FILE" ] && exit 0
 
-# === Routing: knowledge/ + docs/ + diagrams + the code-graph drain queue ===
+# === Routing: knowledge/ + docs/ + the code-graph drain queue ===
 # ONE home — _lib/route-touched-path.sh — shared with post-bash-file-sync.sh
 # so a CLI write routes identically to an Edit/Write. vco_route_init resolves
 # the debounce helper, the code-extension helper, VCT_PROJECT_ID and the

@@ -201,7 +201,7 @@ vco_hook_lib_role() {
     base="${base%.ps1}"
     case "$base" in
         route-touched-path)
-            printf '%s' "routing a touched path to kg-sync (knowledge/), the development collection (docs/), the diagram indexer and the code-graph queue, so every Edit, Write and CLI write is being parsed and then dropped" ;;
+            printf '%s' "routing a touched path to kg-sync (knowledge/), the development collection (docs/) and the code-graph queue, so every Edit, Write and CLI write is being parsed and then dropped" ;;
         bash-write-targets)
             printf '%s' "recovering the paths a shell command wrote, so no CLI write is even looked at — a redirect, a heredoc, sed -i or patch into knowledge/ or docs/ now reaches Weaviate never" ;;
         code-extensions)

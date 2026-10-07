@@ -15,7 +15,6 @@
 # WHAT "ROUTING" MEANS HERE, exactly:
 #   knowledge/**             -> .claude/scripts/kg-sync           (KG_COLLECTION)
 #   docs/**.md               -> .claude/scripts/kg-sync           (DEVELOPMENT_COLLECTION)
-#   .claude/diagrams/*.mmd|.excalidraw -> vco_lib.diagram_indexer (throttled 60 s)
 #   <code extension>         -> the per-turn code-graph drain queue, OR the
 #                               per-EXTRA queue when the path sits under an
 #                               enabled extra code-graph path (v0.2.102 S16-7)
@@ -518,9 +517,6 @@ vco_route_touched_path() {
         _kg_debounce_schedule "$PROJECT_ROOT" "$touched" "$PY" "$PROJECT_ROOT" "$_DOCS_SYNC_CMD" "docs"
     fi
 
-    # 2b. Auto-index diagrams (Phase 1.5 — Mermaid + Excalidraw).
-    _vco_route_diagram "$touched"
-
     # 3. Code file changes: end-of-turn batched code graph drain + reminder.
     # v0.2.73 (FIX-B): the per-edit code-graph sync is REMOVED. The edited
     # path is APPENDED to a per-turn drain queue (+ the reminder accumulator),
@@ -653,70 +649,6 @@ Run \`.claude/scripts/kg-duplicates\` for detail, or ignore if these are intenti
     fi
 }
 
-# --- .claude/diagrams/ side effects ---------------------------------------
-# Fires on any change under .claude/diagrams/. Throttled to 60 s per file to
-# avoid re-indexing during rapid in-editor save bursts. Sidecar `.meta.json`
-# writes are NOT re-indexed (would infinite-loop).
-_vco_route_diagram() {
-    local touched="$1"
-    local PROJECT_ROOT="$_VCO_ROUTE_PROJECT_ROOT"
-    local PY="$_VCO_ROUTE_PY"
-    local SCRIPT_DIR="$_VCO_ROUTE_HOOKS_DIR"
-    local DIAGRAMS_DIR="$PROJECT_ROOT/.claude/diagrams"
-
-    [[ "$touched" == "$DIAGRAMS_DIR"/* ]] || return 0
-    [[ "$touched" != *.meta.json ]] || return 0
-    [[ "$touched" == *.mmd || "$touched" == *.excalidraw ]] || return 0
-
-    # 60 s per-file throttle. bash 3.2 compatible (no associative arrays),
-    # file-as-set semantics.
-    local THROTTLE_DIR="$PROJECT_ROOT/.claude/state"
-    mkdir -p "$THROTTLE_DIR" 2>/dev/null || true
-    # Hash the path (md5 via Python — portable). Avoids slashes in the key.
-    local DIAGRAM_HASH
-    DIAGRAM_HASH=$(printf '%s' "$touched" \
-        | "$PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" \
-        2>/dev/null || echo "_")
-    local THROTTLE_FILE="$THROTTLE_DIR/diagram_idx_${DIAGRAM_HASH}.ts"
-    local NOW_TS LAST_TS=0
-    NOW_TS=$(date +%s)
-    if [ -f "$THROTTLE_FILE" ]; then
-        LAST_TS=$(cat "$THROTTLE_FILE" 2>/dev/null || echo 0)
-        case "$LAST_TS" in
-            ''|*[!0-9]*) LAST_TS=0 ;;
-        esac
-    fi
-    local AGE=$(( NOW_TS - LAST_TS ))
-    [ "$AGE" -ge 60 ] || return 0
-    echo "$NOW_TS" > "$THROTTLE_FILE" 2>/dev/null || true
-
-    # Resolve venv-Python so `import vco_lib.diagram_indexer` works. The
-    # shared resolver NEVER falls back to $PROJECT_ROOT/.venv (the user's
-    # venv, which won't have weaviate-client + vco_lib). When no VCO venv
-    # is resolvable we degrade to $PY so the indexer's import-time error
-    # surfaces as a real ImportError rather than running the wrong
-    # interpreter.
-    # shellcheck source=resolve-vco-venv.sh disable=SC1091
-    . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
-    resolve_vco_venv_python "$SCRIPT_DIR"
-    local _DIAG_VENV="${VCO_VENV_PYTHON:-$PY}"
-
-    # Pass --diagrams-collection when DIAGRAMS_COLLECTION is set in the env.
-    # Without this kwarg the indexer's Weaviate upsert silently skips even
-    # though SQLite + sidecar still happen. Older projects without the key
-    # get the legacy sidecar-only behaviour automatically.
-    local _DIAG_ARGS=( -m vco_lib.diagram_indexer index "$touched" )
-    if [ -n "${DIAGRAMS_COLLECTION:-}" ]; then
-        _DIAG_ARGS+=( --diagrams-collection "$DIAGRAMS_COLLECTION" )
-    fi
-
-    # Index + snapshot in a SERIAL background chain. R2 (code review
-    # 2026-05-25): in PARALLEL the snapshot CLI's `project_diagrams WHERE
-    # project_id=? AND file_path=?` lookup could run before the indexer
-    # UPSERT'd the row → first-version content lost forever.
-    (
-        "$_DIAG_VENV" "${_DIAG_ARGS[@]}" >/dev/null 2>&1 || true
-        "$_DIAG_VENV" -m vco_lib.diagram_indexer snapshot create \
-            "$touched" --quiet >/dev/null 2>&1 || true
-    ) &
-}
+# --- .claude/diagrams/ side effects: REMOVED v0.2.102 ----------------------
+# The diagram auto-index leg (Phase 1.5, vco_lib.diagram_indexer) was
+# removed with the diagrams integrations (owner ruling 2026-10-07).

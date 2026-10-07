@@ -544,12 +544,13 @@ def test_the_section_is_the_only_difference_it_makes():
     `template_review_pending` deferral. Gating the whole section means
     projects that do not opt in see no churn at all.
     """
-    off = render({"diagrams"})
+    off = render(set())
     assert "Model routing" not in off
-    # The blocks are adjacent, not nested: dropping ours must not disturb the
-    # diagrams block's own rendering.
-    assert "## Diagrams (Mermaid + Excalidraw)" in render({"diagrams"})
-    assert "## Diagrams (Mermaid + Excalidraw)" not in render(set())
+    # v0.2.102: the diagrams conditional section was removed with the
+    # diagrams integrations, so `model_gateway` is the ONLY conditional
+    # block left — a render with the (historical) `diagrams` id is
+    # byte-identical to an empty module set.
+    assert render({"diagrams"}) == off
 
 
 def test_the_conditional_blocks_are_not_nested():

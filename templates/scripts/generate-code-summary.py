@@ -472,8 +472,8 @@ def build_entry(row: dict, collection: str, *, one_liner: str, summary: str,
 # ──────────────────────────────────────────────────────────────────────
 def _collection_prefix(project_name: str) -> "str | None":
     """Project name → Weaviate class prefix via the ENDORSED SSOT wrapper
-    (``codegraph_to_mermaid._sanitize_collection_prefix`` →
-    ``project_naming.canonical_class_prefix``). No new sanitizer copy —
+    (``codegraph_naming.sanitize_collection_prefix`` →
+    ``canonical_class_prefix``). No new sanitizer copy —
     mirrors ``vco_lib.codegraph_resync._collection_prefix``. ``None`` when
     unresolvable (the caller then does NOTHING — never guess a prefix)."""
     env_root = os.getenv("VCT_ORCHESTRATOR_ROOT", "").strip()
@@ -481,8 +481,8 @@ def _collection_prefix(project_name: str) -> "str | None":
         if root and (Path(root) / "vco_lib").is_dir() and root not in sys.path:
             sys.path.insert(0, root)
     try:
-        from vco_lib.codegraph_to_mermaid import (  # type: ignore
-            _sanitize_collection_prefix as _sanitize,
+        from vco_lib.codegraph_naming import (  # type: ignore
+            sanitize_collection_prefix as _sanitize,
         )
     except Exception as exc:  # noqa: BLE001 — partial install
         log(f"  code-summary: prefix resolver unavailable: {exc}")

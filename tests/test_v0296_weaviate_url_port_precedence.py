@@ -720,83 +720,6 @@ class TestShippedCallers(unittest.TestCase):
                         sys.modules.pop("query_code_graph", None)
 
 
-class TestDiagramIndexerResolvesTheInstance(unittest.TestCase):
-    """6e — ``diagram_indexer``'s two Weaviate seams resolve through the home.
-
-    Both used to read ``os.environ.get("WEAVIATE_URL")`` alone: ``None``
-    when unset (a silent "skipped" that read as success) and blind to
-    ``WEAVIATE_PORT``. Pinned behaviourally at the seam both sites share —
-    ``_validate_weaviate_url`` is replaced with a recorder that stops the
-    function before any client is built, so what is asserted is the URL
-    the function actually resolved, never a source text.
-    """
-
-    def _recorded_url(self, call):
-        from vco_lib import diagram_indexer as di
-
-        seen: "dict[str, str]" = {}
-
-        class _Stop(Exception):
-            pass
-
-        def _rec(url):
-            seen["url"] = url
-            raise _Stop
-
-        with mock.patch.object(di, "_validate_weaviate_url", _rec):
-            with self.assertRaises(_Stop):
-                call(di)
-        return seen.get("url")
-
-    def test_delete_targets_the_env_resolved_instance(self):
-        with _PortEnv():
-            url = self._recorded_url(
-                lambda di: di._weaviate_delete_by_file_path(
-                    "some/diagram.mmd",
-                    weaviate_url=None,
-                    collection_name="Acme_Diagrams",
-                )
-            )
-        self.assertEqual(
-            url, SENTINEL_URL,
-            "diagram_indexer delete ignored WEAVIATE_PORT — it must resolve "
-            "through vco_lib.weaviate_helpers.weaviate_url_default",
-        )
-
-    def test_upsert_targets_the_env_resolved_instance(self):
-        from vco_lib import diagram_indexer as di
-
-        row = di.DiagramRow(
-            project_id="acme",
-            diagram_name="d",
-            diagram_type="mermaid",
-            file_path="some/diagram.mmd",
-            category_path="x",
-            enabled=1,
-            inferred_title=None,
-            diagram_kind=None,
-            content_text=None,
-            node_count=None,
-            edge_count=None,
-            chat_id=None,
-            linked_session_summary=None,
-            config_json=None,
-            created_at=0,
-            updated_at=0,
-        )
-        with _PortEnv():
-            url = self._recorded_url(
-                lambda di: di._weaviate_upsert(
-                    row, weaviate_url=None, collection_name="Acme_Diagrams",
-                )
-            )
-        self.assertEqual(
-            url, SENTINEL_URL,
-            "diagram_indexer upsert ignored WEAVIATE_PORT — it must resolve "
-            "through vco_lib.weaviate_helpers.weaviate_url_default",
-        )
-
-
 class TestParameterDefaultsConsultTheEnvironment(unittest.TestCase):
     """``vco_lib`` entry points whose default bypassed the environment.
 
@@ -1032,43 +955,6 @@ class TestParameterDefaultsConsultTheEnvironment(unittest.TestCase):
             f"instance: {urls!r}. Both the stale-row READ and the batch "
             "DELETE must resolve through _weaviate_url_default().",
         )
-
-    def test_verify_diagrams_probe_targets_the_env_resolved_instance(self):
-        """``vco doctor``-adjacent check found by the completeness scan.
-
-        Not in the inventory this lane was handed. It read ``WEAVIATE_URL``
-        alone, so on an install relocated via ``WEAVIATE_PORT`` it probed
-        whatever answered on 8081 and reported the project's Diagrams class
-        MISSING — a FAIL verdict against a healthy install.
-        """
-        from vco_lib.cli import verify_diagrams as vd
-
-        seen: "dict[str, object]" = {}
-
-        class _FakeWeaviate:
-            @staticmethod
-            def connect_to_custom(**kw):
-                seen.update(kw)
-                raise RuntimeError("no network in this suite — args captured")
-
-            @staticmethod
-            def connect_to_local(**kw):
-                seen.update(kw)
-                raise RuntimeError("no network in this suite — args captured")
-
-        with _PortEnv():
-            with mock.patch.dict(sys.modules, {"weaviate": _FakeWeaviate}):
-                res = vd._check_weaviate_class("Demo", fix=False, quick=False)
-        self.assertTrue(
-            seen,
-            "verify_diagrams never attempted a connection "
-            f"(result was {res.status!r}: {res.detail!r})",
-        )
-        self.assertEqual(
-            seen.get("http_port"), int(SENTINEL_PORT),
-            f"verify_diagrams ignored WEAVIATE_PORT: connected with {seen!r}",
-        )
-        self.assertEqual(seen.get("http_host"), "localhost")
 
     def test_kg_sync_drift_cli_default_follows_the_env(self):
         """The argparse default is built inside ``main()``, so it CAN call the

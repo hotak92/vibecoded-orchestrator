@@ -94,7 +94,12 @@ def test_python_dev_suffix_swaps_from_binding_not_display_name(tmp_path: Path) -
         "from the display name (P2 regression was "
         "VibeCodedOrchestrator_Development)"
     )
-    assert env["DIAGRAMS_COLLECTION"] == "VCODev_Diagrams"
+    # v0.2.102: the diagrams half of the ONE rule still derives (kept for
+    # recognising existing `_Diagrams` user collections) but is no longer
+    # projected — pinned through the recognition resolver.
+    assert "DIAGRAMS_COLLECTION" not in env
+    from vco_lib.config_projection import resolve_project_collection_names as _r
+    assert _r("root", db_path=db)["diagrams_collection"] == "VCODev_Diagrams"
 
 
 def test_python_dev_slug_fallback_for_non_canonical_primary(tmp_path: Path) -> None:
@@ -117,7 +122,9 @@ def test_python_dev_slug_fallback_for_non_canonical_primary(tmp_path: Path) -> N
     env = project_env_from_db("p-weird", db_path=db)["canonical_env"]
     assert env["KG_COLLECTION"] == "WeirdName_Custom"
     assert env["DEVELOPMENT_COLLECTION"] == "Weirdproject_Development"
-    assert env["DIAGRAMS_COLLECTION"] == "Weirdproject_Diagrams"
+    assert "DIAGRAMS_COLLECTION" not in env
+    from vco_lib.config_projection import resolve_project_collection_names as _r
+    assert _r("p-weird", db_path=db)["diagrams_collection"] == "Weirdproject_Diagrams"
 
 
 def test_python_dev_canonical_suffix_swap(tmp_path: Path) -> None:
@@ -136,7 +143,9 @@ def test_python_dev_canonical_suffix_swap(tmp_path: Path) -> None:
     )
     env = project_env_from_db("p-acme", db_path=db)["canonical_env"]
     assert env["DEVELOPMENT_COLLECTION"] == "Acme_Development"
-    assert env["DIAGRAMS_COLLECTION"] == "Acme_Diagrams"
+    assert "DIAGRAMS_COLLECTION" not in env
+    from vco_lib.config_projection import resolve_project_collection_names as _r
+    assert _r("p-acme", db_path=db)["diagrams_collection"] == "Acme_Diagrams"
 
 
 # ─── NON-ROOT first-class parity (amendment A3) ───
@@ -164,7 +173,9 @@ def test_non_root_project_uses_same_one_rule(tmp_path: Path) -> None:
     env = project_env_from_db("client-001", db_path=db)["canonical_env"]
     assert env["KG_COLLECTION"] == "ClientApp_KnowledgeGraph"
     assert env["DEVELOPMENT_COLLECTION"] == "ClientApp_Development"
-    assert env["DIAGRAMS_COLLECTION"] == "ClientApp_Diagrams"
+    assert "DIAGRAMS_COLLECTION" not in env
+    from vco_lib.config_projection import resolve_project_collection_names as _r
+    assert _r("client-001", db_path=db)["diagrams_collection"] == "ClientApp_Diagrams"
 
     # And the non-canonical fallback for a non-root, custom-rename project.
     db2 = tmp_path / "launcher2.db"

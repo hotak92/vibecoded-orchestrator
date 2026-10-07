@@ -69,10 +69,8 @@ ACCESS_MIRRORS = {
 MESSAGE_MIRRORS = [
     REPO_ROOT / "vco_lib" / "project_config.py",
     REPO_ROOT / "vco_lib" / "access_resolver.py",
-    REPO_ROOT / "vco_lib" / "cli" / "verify_diagrams.py",
     REPO_ROOT / "vco_lib" / "codegraph_resync.py",
     REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py",
-    REPO_ROOT / "claude_mcp_servers" / "wrappers" / "_base.py",
     SCRIPTS / "vct_secrets_resolve.sh",
     SCRIPTS / "vct_secrets_resolve.ps1",
     SCRIPTS / "vct_project_config.sh",
@@ -582,9 +580,8 @@ ADOPT_GATE_MIRRORS = {
          "status_code == 404"],
     REPO_ROOT / "vco_lib" / "access_resolver.py":
         ["def _retry_answer_is_definitive", "attempt.code == 404"],
-    REPO_ROOT / "claude_mcp_servers" / "wrappers" / "_base.py":
-        ["def _retry_answer_is_definitive", "200 <= status < 300",
-         "status == 404"],
+    # (claude_mcp_servers/wrappers/_base.py carried a mirror until v0.2.102,
+    # when the wrapper package was deleted with the diagrams integrations.)
     REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py":
         ["def _retry_answer_is_definitive", "200 <= status < 300",
          "status == 404"],

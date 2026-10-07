@@ -86,12 +86,13 @@ class BundledVersionsParityTests(unittest.TestCase):
         self.assertEqual(produced, independent)
 
     def test_npm_keys_match_phase_0_plan(self) -> None:
-        """The four npm keys named in the Phase-0 plan must be present.
-        If a future bump adds keys, append here (single point of edit)."""
+        """v0.2.102: the four diagram npm keys were REMOVED with the
+        diagrams integrations — the npm table is legitimately EMPTY now.
+        If a future bump adds keys, update the expected set here AND the
+        Rust unit test's vec![...] (single point of edit)."""
         parsed = _independent_parse(self.text)
         actual = set(parsed.get("npm", {}).keys())
-        expected = {"mermaid_mcp", "excalidraw_mcp",
-                    "mermaid_lib", "excalidraw_lib"}
+        expected: set[str] = set()
         self.assertEqual(actual, expected)
 
     def test_each_npm_entry_shape_is_tight(self) -> None:

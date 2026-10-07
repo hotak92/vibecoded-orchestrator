@@ -13,7 +13,7 @@ per ladder:
 
 * ``expect`` — a CLIENT's ladder (env pin → file → 7700): the Python reader
   ``vco_lib.hub_ensure.resolve_hub_port`` and its callers
-  (``vco verify-diagrams`` since R7b F3), every sh / ps1 client below, and
+  every sh / ps1 client below, and
   ``vct-cli`` (its own Rust test runs the same file).
 * ``expect_running`` — DESCRIBING the running hub (file → env → 7700):
   ``hub_ensure.running_hub_port`` (``install.py --bootstrap --json``, R7b F7)
@@ -127,18 +127,6 @@ def test_python_strict_file_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     state = _state(tmp_path, case["file_port"])
     _set_env_port(monkeypatch, case["env_port"])
     assert hub_ensure.read_hub_port_file(state) == case["expect_file"]
-
-
-@pytest.mark.parametrize("case", TABLE, ids=_IDS)
-def test_verify_diagrams_hub_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case) -> None:
-    """R7b F3(a): ``vco verify-diagrams`` check 5 used ``$VCT_HUB_PORT`` else
-    7700 and never read ``hub.port``."""
-    from vco_lib.cli import verify_diagrams
-
-    state = _state(tmp_path, case["file_port"])
-    _set_env_port(monkeypatch, case["env_port"])
-    monkeypatch.setenv("VCT_STATE_DIR", str(state))
-    assert verify_diagrams._vct_hub_base_url() == f"http://127.0.0.1:{case['expect']}"
 
 
 @pytest.mark.parametrize("case", TABLE, ids=_IDS)

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Loader for ``bundled_mcp_versions.toml`` (Phase 0 of the
-diagrams-integration plan, 2026-05-24).
+"""Loader for ``bundled_mcp_versions.toml`` (introduced by the
+2026-05-24 diagrams plan; the diagram pins were removed in v0.2.102).
 
 This module is the Python side of the cross-language pinning-manifest
 loader. The Rust side lives at
@@ -87,13 +87,13 @@ def load_bundled_versions(path: Path | None = None) -> dict[str, dict[str, str]]
 
             {
               "npm": {
-                "mermaid_mcp":     {"package": "...", "version": "...", "shasum": "..."},
-                "excalidraw_mcp":  {...},
-                "mermaid_lib":     {...},
-                "excalidraw_lib":  {...},
+                "<key>": {"package": "...", "version": "...", "shasum": "..."},
               },
               "chromium": {"reuse_playwright": True},
             }
+
+        (The npm table is currently EMPTY — the four diagram pins were
+        removed in v0.2.102 with the diagrams integrations.)
 
         Unknown sections and extra keys are preserved (forward-compat).
 
@@ -111,7 +111,7 @@ def load_bundled_versions(path: Path | None = None) -> dict[str, dict[str, str]]
         raise RuntimeError(
             f"Could not read bundled-versions manifest at {target}: {e}. "
             f"This file pins the exact versions of external npm packages "
-            f"(claude-mermaid, @excalidraw/excalidraw, ...) installed by "
+            f"installed by "
             f"install.py. If you cloned the orchestrator repo correctly "
             f"the file should be present; otherwise re-fetch from "
             f"https://github.com/hotak92/vibecoded-orchestrator."

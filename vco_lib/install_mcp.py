@@ -299,11 +299,12 @@ def _build_python_mcp_entries(
     }
     playwright_dropped: list[str] = []
 
-    # NOTE (v0.2.101): the `search` MCP was deleted outright, and the diagram
-    # wrapper MCPs (`mermaid` / `excalidraw`) were retired from default
-    # shipping — they no longer appear here. An install that already has those
-    # entries keeps them (they stay in [bundled].all_names / uninstall_scrub);
-    # only the default REGISTRATION stopped.
+    # NOTE (v0.2.101 → v0.2.102): the `search` MCP was deleted outright in
+    # v0.2.101, and the diagram wrapper MCPs (`mermaid` / `excalidraw`) —
+    # registration retired in v0.2.101, modules deleted in v0.2.102 — no
+    # longer appear here. A VCO-shaped leftover entry is auto-scrubbed by the
+    # ordinary update (the [deprecated.*] rows in mcp_scan_rules.toml); the
+    # names stay in [bundled].all_names / uninstall_scrub for classification.
 
     entries = [
         ("weaviate-kg", weaviate_entry, weaviate_dropped),

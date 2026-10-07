@@ -48,7 +48,7 @@ existing single-home helpers:
   ``collection_naming::derive_sibling_collection`` by parity tests. Re-deriving
   here would break that pin.
 * :func:`vco_lib.codegraph_naming.sanitize_for_weaviate_class` (the KG basename
-  SSOT) and ``codegraph_to_mermaid._sanitize_collection_prefix`` (the endorsed
+  SSOT) and ``codegraph_naming.sanitize_collection_prefix`` (the endorsed
   never-raising wrapper over the code-prefix SSOT ``canonical_class_prefix`` —
   the same one ``project_init.derive_project_code_prefix`` delegates to), used
   only for the no-binding-row fallbacks.
@@ -125,14 +125,14 @@ def _code_prefix(name: str) -> str:
     """Never-raising code-graph prefix for ``name``.
 
     Delegates to the endorsed wrapper the analyzer + binding writer already
-    use (``codegraph_to_mermaid._sanitize_collection_prefix`` over the
+    use (``codegraph_naming.sanitize_collection_prefix`` over the
     underscore-PRESERVING ``canonical_class_prefix`` SSOT) — the identical
     delegation ``project_init.derive_project_code_prefix`` performs. Returns
     ``""`` when no usable prefix can be derived.
     """
     try:
-        from vco_lib.codegraph_to_mermaid import _sanitize_collection_prefix
-        return _sanitize_collection_prefix(name or "") or ""
+        from vco_lib.codegraph_naming import sanitize_collection_prefix
+        return sanitize_collection_prefix(name or "") or ""
     except Exception:  # noqa: BLE001 — a name helper must never break a caller
         return ""
 

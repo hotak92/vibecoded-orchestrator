@@ -1289,8 +1289,8 @@ def _atomic_write_text(path: Path, content: str) -> None:
     Thin delegate to :func:`vco_lib.atomic.atomic_write_text` (v0.2.54
     Track J closed the consolidation that :mod:`vco_lib.atomic`'s
     module docstring queued when it landed in v0.2.53 — this module,
-    ``config_projection``, ``deferral_report`` and
-    ``cli/codegraph_diagram`` each carried their own copy of the
+    ``config_projection`` and ``deferral_report`` (and the removed
+    ``cli/codegraph_diagram``) each carried their own copy of the
     mkstemp + fsync + ``os.replace`` recipe).
 
     The name is kept because install.py's ``.claude.json`` write site

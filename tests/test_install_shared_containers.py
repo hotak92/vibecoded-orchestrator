@@ -266,11 +266,12 @@ class EnsureCollectionsTests(unittest.TestCase):
         finally:
             server.shutdown()
 
-    def test_creates_diagrams_collection(self):
-        """fix/a1-indexing-pipeline (2026-05-25): Step 7b also bootstraps
-        the per-project Diagrams collection so `diagram_indexer._weaviate_upsert`
-        has a class to write to on the first .mmd / .excalidraw save
-        (Bug-3 of the wiring audit)."""
+    def test_no_longer_creates_a_diagrams_collection(self):
+        """v0.2.102: the diagrams bootstrap was removed with the diagrams
+        integrations (owner ruling 2026-10-07) — even a stale
+        DIAGRAMS_COLLECTION env var (left on an existing install) must not
+        make Step 7b create the class. Existing `_Diagrams` collections on
+        user machines are untouched data."""
         server, port, _ = _start_server()
         try:
             _Handler.schema = {"classes": []}
@@ -284,14 +285,9 @@ class EnsureCollectionsTests(unittest.TestCase):
             ):
                 install._ensure_collections({})
             posted_classes = [p.get("class") for p in _Handler.posted]
-            self.assertIn("TestDiagrams", posted_classes)
-            # Diagrams schema carries the canonical property surface.
-            diag = next(p for p in _Handler.posted
-                        if p.get("class") == "TestDiagrams")
-            prop_names = {p["name"] for p in diag["properties"]}
-            for required in ("title", "content", "path_tags",
-                             "diagram_kind", "file_path"):
-                self.assertIn(required, prop_names)
+            self.assertNotIn("TestDiagrams", posted_classes)
+            self.assertIn("TestKG", posted_classes)
+            self.assertIn("TestDev", posted_classes)
         finally:
             server.shutdown()
 

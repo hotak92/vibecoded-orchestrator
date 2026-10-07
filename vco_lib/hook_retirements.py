@@ -217,20 +217,22 @@ class RetiredRegistration:
         return self.replacement or "nothing (the capability was removed)"
 
 
-#: The six scripts whose ASYNC PostToolUse registrations merged into the
-#: single ``post-tool-use-async`` dispatcher in v0.2.101 (the scripts keep
-#: shipping; the dispatcher routes to them). ONE list, three consumers: the
-#: retirement rows below, :func:`carry_parked_async_disables`, and — by
-#: derivation through the routing-table parity test — the dispatchers'
-#: ROUTE_TABLEs (tests/test_v02101_async_posttooluse_dispatcher.py pins the
-#: row set and the table stems to each other, so this list cannot drift
-#: from what the dispatcher actually routes).
+#: The five scripts whose ASYNC PostToolUse registrations merged into the
+#: single ``post-tool-use-async`` dispatcher in v0.2.101 and still ship (the
+#: dispatcher routes to them). ONE list, three consumers: the retirement
+#: rows below, :func:`carry_parked_async_disables`, and — by derivation
+#: through the routing-table parity test — the dispatchers' ROUTE_TABLEs
+#: (tests/test_v02101_async_posttooluse_dispatcher.py pins the row set and
+#: the table stems to each other, so this list cannot drift from what the
+#: dispatcher actually routes). ``post-file-delete`` was a sixth member until
+#: v0.2.102 deleted the script with the diagrams integrations — it keeps its
+#: OWN retirement rows below (retired_in ``v0.2.102``), which the parity
+#: test's ``retired_in == "v0.2.101"`` filter deliberately excludes.
 _ASYNC_MERGED_STEMS_V02101: Tuple[str, ...] = (
     "post-edit-outcome",
     "post-bash-context-record",
     "kg-summary-generator",
     "post-git-commit-kg-sync",
-    "post-file-delete",
     "kg-update-nudge",
 )
 
@@ -414,6 +416,85 @@ RETIRED_REGISTRATIONS: Tuple[RetiredRegistration, ...] = (
         )
         for stem in _ASYNC_MERGED_STEMS_V02101
         for ext in ("sh", "ps1")
+    ),
+    # ── the diagrams hooks, removed in v0.2.102 ────────────────────────────
+    #
+    # Owner ruling 2026-10-07: VCO drops the mermaid + excalidraw
+    # integrations entirely. Both hook SCRIPTS below are deleted from
+    # `templates/hooks/` in the same change, so the manifest reconcile
+    # removes the FILE from every project on the next bundle update —
+    # these rows remove the stale REGISTRATIONS that would otherwise be
+    # preserved forever as "the user's own hook" (the exact field failure
+    # mode this module was built for; see the docstring).
+    #
+    #   * `pre-diagram-path-validation` — a SYNC PreToolUse hook (two
+    #     registrations per template: matchers `Write|Edit` and
+    #     `mcp__mermaid__.*|mcp__excalidraw__.*`) that gated writes to
+    #     `.claude/diagrams/` paths. Not async_only: VCO shipped it only
+    #     as a synchronous registration, but a user's own variant under
+    #     another event is untouched by the event-scoped match anyway.
+    #   * `post-file-delete` — the diagram-delete cascade. Its whole
+    #     purpose was dropping `.mmd` / `.excalidraw` deletes across
+    #     SQLite + sidecar + Weaviate via `vco_lib.diagram_indexer`
+    #     (verified: no non-diagram behaviour to preserve). ASYNC-ONLY
+    #     (SF-3 shape): VCO shipped it under PostToolUse exclusively as
+    #     an async registration (pre-v0.2.101 directly, v0.2.101+ as a
+    #     dispatcher route), so only a positively-async registration
+    #     matches. The v0.2.101 dispatcher keeps shipping and simply no
+    #     longer routes to this stem.
+    RetiredRegistration(
+        event="PreToolUse",
+        kind=KIND_HOOK_SCRIPT,
+        target="pre-diagram-path-validation.sh",
+        reason=(
+            "the diagrams integrations (mermaid + excalidraw) were removed "
+            "in v0.2.102; the script no longer ships, so the registration "
+            "invokes a file the bundle update deletes"
+        ),
+        retired_in="v0.2.102",
+        replacement="",
+    ),
+    RetiredRegistration(
+        event="PreToolUse",
+        kind=KIND_HOOK_SCRIPT,
+        target="pre-diagram-path-validation.ps1",
+        reason=(
+            "the diagrams integrations (mermaid + excalidraw) were removed "
+            "in v0.2.102; the script no longer ships, so the registration "
+            "invokes a file the bundle update deletes"
+        ),
+        retired_in="v0.2.102",
+        replacement="",
+    ),
+    RetiredRegistration(
+        event="PostToolUse",
+        kind=KIND_HOOK_SCRIPT,
+        target="post-file-delete.sh",
+        reason=(
+            "the diagram-delete cascade hook was removed in v0.2.102 with "
+            "the diagrams integrations (async_only: a synchronous "
+            "registration of this script is the user's own and is never "
+            "matched); the script no longer ships and the dispatcher no "
+            "longer routes to it"
+        ),
+        retired_in="v0.2.102",
+        replacement="",
+        async_only=True,
+    ),
+    RetiredRegistration(
+        event="PostToolUse",
+        kind=KIND_HOOK_SCRIPT,
+        target="post-file-delete.ps1",
+        reason=(
+            "the diagram-delete cascade hook was removed in v0.2.102 with "
+            "the diagrams integrations (async_only: a synchronous "
+            "registration of this script is the user's own and is never "
+            "matched); the script no longer ships and the dispatcher no "
+            "longer routes to it"
+        ),
+        retired_in="v0.2.102",
+        replacement="",
+        async_only=True,
     ),
 )
 

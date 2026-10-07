@@ -114,11 +114,11 @@ _UNTABLED_STEMS_SNAPSHOT = frozenset({
     "ACMEWidgetKnowledgeGraph", "ACMEWidgetOld", "ACMEWidgetry",
     "ACMEWidgetShell", "ACMEWidgetTeam", "Actual", "AgapeTest",
     "Alphabet", "AlphaBeta", "AmbientProject", "Anything", "ArcAgi",
-    "B", "Bazquux", "Big", "Bystander", "C", "Canon",
+    "B", "Bazquux", "Big", "Bystander", "Canon",
     "CanonicalShared", "ClaudeOrchestrator", "Client_b_portal", "ClientA",
     "ClientAlpha", "ClientApp", "CsRoute", "Cur", "Decoy", "Demo",
-    "Demo_project", "Drifted", "Dst", "E2EProject", "Empty", "EnvOnly",
-    "EnvProj", "EnvSaid", "Existing", "ExplicitOverride", "ExplicitProj",
+    "Demo_project", "Drifted", "Dst", "Empty", "EnvOnly",
+    "EnvSaid", "Existing",
     "Fallback", "Foo_Bar", "ForkBrand", "Fresh", "FreshCreate", "FromDb",
     "FromEnv", "G", "Ghost_Prefix", "GhostA", "GhostB", "Gone",
     "GuardPrefix", "Hub", "Hub_Shared", "HubSaid", "ImageDataset", "Kept",
@@ -613,28 +613,6 @@ def test_sync_lets_a_real_target_through(monkeypatch, sync_mod):
     sync_mod._refuse_fixture_shaped_targets()  # must not raise or exit
 
 
-def _diagram_row():
-    from vco_lib.diagram_indexer import DiagramRow
-
-    return DiagramRow(
-        project_id="p1",
-        diagram_name="x",
-        diagram_type="mermaid",
-        file_path="docs/diagrams/x.mmd",
-        category_path="docs/diagrams",
-        enabled=1,
-        inferred_title="X",
-        diagram_kind="graph",
-        content_text="graph TD;",
-        node_count=1,
-        edge_count=0,
-        chat_id=None,
-        linked_session_summary=None,
-        config_json=None,
-        created_at=0,
-        updated_at=0,
-    )
-
 
 @pytest.fixture(scope="module")
 def analyzer_mod() -> types.ModuleType:
@@ -766,65 +744,6 @@ def test_project_init_creates_a_real_projects_class(monkeypatch):
 # here would be the duplication this repo's own rule forbids.
 
 
-def test_diagram_upsert_refuses_a_fixture_collection(monkeypatch, caplog):
-    """The diagram indexer's ONE write seam.
-
-    Live evidence for this seam specifically: an empty `Foo_Diagrams` class on
-    the maintainer's Weaviate — the incident's shape caught one step earlier,
-    at creation, with nothing written yet.
-    """
-    from vco_lib import diagram_indexer
-
-    monkeypatch.delenv(fcg.ALLOW_FIXTURE_WRITES_ENV, raising=False)
-
-    def _explode(**kwargs):  # pragma: no cover - must never be reached
-        raise AssertionError("the indexer connected to a fixture-named class")
-
-    import weaviate  # type: ignore
-
-    monkeypatch.setattr(weaviate, "connect_to_custom", _explode)
-
-    with caplog.at_level("ERROR"):
-        wrote = diagram_indexer._weaviate_upsert(
-            _diagram_row(),
-            weaviate_url="http://localhost:8081",
-            collection_name="Foo_Diagrams",
-        )
-    assert wrote is False
-    # Refused, not silently skipped: the log names the class and the escape.
-    assert any(
-        "Foo_Diagrams" in r.message and fcg.ALLOW_FIXTURE_WRITES_ENV in r.message
-        for r in caplog.records
-    ), [r.message for r in caplog.records]
-
-
-def test_diagram_upsert_reaches_the_client_for_a_real_collection(monkeypatch):
-    """The leave-alone half: a real project's diagrams still index."""
-    from vco_lib import diagram_indexer
-
-    monkeypatch.delenv(fcg.ALLOW_FIXTURE_WRITES_ENV, raising=False)
-    reached: list[str] = []
-
-    def _connect(**kwargs):
-        reached.append("connected")
-        raise RuntimeError("stop here — past the guard is all we assert")
-
-    import weaviate  # type: ignore
-
-    monkeypatch.setattr(weaviate, "connect_to_custom", _connect)
-
-    with pytest.raises(RuntimeError):
-        diagram_indexer._weaviate_upsert(
-            _diagram_row(),
-            weaviate_url="http://localhost:8081",
-            collection_name="VCODev_Diagrams",
-        )
-    assert reached == ["connected"]
-
-
-# ---------------------------------------------------------------------------
-# 6. The doctor: a fixture-shaped ghost reads DIFFERENTLY from a leftover
-# ---------------------------------------------------------------------------
 
 
 def _unclaimed(*pairs):

@@ -779,9 +779,7 @@ def probe_mcp_commands_spawnable(folder: Path, res: DoctorResolvers, ctx: dict) 
 
     * ``npx_resolvable`` — the ladder's verdict on npx itself, reported even
       when no entry needs it (it is the prerequisite VCO's own bundled
-      playwright entry assumes — and the legacy diagram wrappers on
-      pre-v0.2.101 installs that still have them, whose proxy spawns npx
-      as a child; fresh installs register no wrapper).
+      playwright entry assumes).
     * ``mcp_commands_spawnable`` — the per-entry verdict.
 
     The problem finding is ``defer``: installing Node.js is not something VCO
@@ -1383,8 +1381,8 @@ def probe_npm_pins(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Findin
         ]
     # DRIFT (installed at the wrong version) is a problem. MISSING is not:
     # a bundled npm package can be legitimately absent from the global store
-    # (an opt-out env var at install time, a `file:` pin installed elsewhere,
-    # a default-disabled diagram MCP the user never enabled). Reporting those
+    # (an opt-out env var at install time, a `file:` pin installed
+    # elsewhere). Reporting those
     # as problems would make the doctor cry wolf on a healthy machine — and a
     # report that cries wolf is one nobody reads, which is the failure this
     # whole work package exists to end.
@@ -4655,10 +4653,8 @@ def _npx_entry(finding: Finding):
         why_deferred=(
             "Installing Node.js changes the user's machine, so VCO "
             "never does it unattended. Until npx resolves, every MCP "
-            "registered as `npx` (playwright by default; the diagram "
-            "wrappers on legacy installs that still have them — the "
-            "wrappers are optional since v0.2.101 and absent on fresh "
-            "installs) fails to start — Claude Code shows only "
+            "registered as `npx` (playwright by default) fails to "
+            "start — Claude Code shows only "
             "'Failed to connect', with no indication that the cause is "
             "a missing binary. This entry clears itself on the first "
             "install/update run that finds npx."

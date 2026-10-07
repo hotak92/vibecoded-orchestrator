@@ -305,8 +305,8 @@ _PRUNE_PATH_PROP: dict = {
 
 def _collection_prefix(project_name: str) -> Optional[str]:
     """Project name → Weaviate class prefix, via the ENDORSED vco_lib wrapper
-    (``codegraph_to_mermaid._sanitize_collection_prefix`` → SSOT
-    ``project_naming.canonical_class_prefix``). No 5th sanitizer copy here —
+    (``codegraph_naming.sanitize_collection_prefix`` → SSOT
+    ``canonical_class_prefix``). No 5th sanitizer copy here —
     tests/test_canonical_class_prefix_parity.py guards against that.
 
     Returns ``None`` when the wrapper is unimportable or the name is unusable
@@ -314,8 +314,8 @@ def _collection_prefix(project_name: str) -> Optional[str]:
     prefix and delete from the wrong collections).
     """
     try:
-        from vco_lib.codegraph_to_mermaid import (
-            _sanitize_collection_prefix as _sanitize,
+        from vco_lib.codegraph_naming import (
+            sanitize_collection_prefix as _sanitize,
         )
     except Exception as exc:  # noqa: BLE001 — script-mode / partial install
         logger.warning("codegraph prune: prefix resolver unavailable: %s", exc)
@@ -2602,9 +2602,9 @@ def _record_unconverged_deferral(
 #
 # MUST MATCH the SSOT `vco_lib/project_config.py::_stale_env_token_fallback`
 # and the mirrors in `vco_lib/access_resolver.py`,
-# `vco_lib/cli/verify_diagrams.py`,
 # `claude_mcp_servers/weaviate_mcp/server.py`,
-# `claude_mcp_servers/wrappers/_base.py`,
+# (the removed `vco_lib/cli/verify_diagrams.py` and
+# `claude_mcp_servers/wrappers/_base.py` carried copies until v0.2.102),
 # `templates/scripts/vct_access_check.{sh,ps1}`,
 # `vct_secrets_resolve.{sh,ps1}`, `vct_project_config.{sh,ps1}`,
 # `launcher/tools/vct-cli/src/main.rs` and `tools/vct-secrets/vct`.

@@ -72,16 +72,19 @@ class RetirementRegistryTests(unittest.TestCase):
     def test_default_disabled_is_empty_after_diagram_retirement(self) -> None:
         self.assertEqual(tuple(mcp_scan_rules.default_disabled_mcp_names()), ())
 
-    def test_only_search_is_deprecated_not_the_diagram_mcps(self) -> None:
-        """Owner: the update must NOT remove the diagram MCPs. Deprecation is
-        the mechanism that prompts removal, so they must NOT be in it."""
+    def test_search_and_the_diagram_mcps_are_deprecated(self) -> None:
+        """v0.2.101 deprecated `search` (auto-scrubbed); v0.2.102 (owner
+        ruling 2026-10-07) added the diagram MCPs with the same posture —
+        their modules are deleted, so their rows carry auto_scrub too."""
         deprecated = install_mcp._DEPRECATED_DEFAULT_MCPS
         self.assertIn("search", deprecated)
         self.assertEqual(deprecated["search"]["removed_in"], "v0.2.101")
         # No opt-in manifest: the vct-search module manifest was deleted too.
         self.assertEqual(deprecated["search"].get("opt_in_manifest", ""), "")
-        for keep in ("mermaid", "excalidraw"):
-            self.assertNotIn(keep, deprecated, f"{keep} must NOT be deprecated (owner keeps it)")
+        for dropped in ("mermaid", "excalidraw"):
+            self.assertIn(dropped, deprecated)
+            self.assertEqual(deprecated[dropped]["removed_in"], "v0.2.102")
+            self.assertIs(deprecated[dropped]["auto_scrub"], True)
 
 
 class SearchMcpRemovalTests(unittest.TestCase):
@@ -137,9 +140,10 @@ class SearchMcpRemovalTests(unittest.TestCase):
             found = install_mcp._scan_deprecated_mcp_entries(root, claude_json)
         self.assertEqual(found, [])
 
-    def test_diagram_mcp_entries_are_never_surfaced_for_removal(self) -> None:
-        """An existing VCO-shaped mermaid/excalidraw entry must survive the
-        update: the scan must not classify it as deprecated."""
+    def test_diagram_mcp_entries_are_surfaced_for_removal(self) -> None:
+        """v0.2.102: an existing VCO-shaped mermaid/excalidraw entry IS
+        classified as deprecated — the modules are deleted, and the
+        auto-scrub removes these entries on the ordinary update."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "install"
             (root / "claude_mcp_servers" / "wrappers").mkdir(parents=True)
@@ -162,7 +166,7 @@ class SearchMcpRemovalTests(unittest.TestCase):
                 encoding="utf-8",
             )
             found = install_mcp._scan_deprecated_mcp_entries(root, claude_json)
-        self.assertEqual(found, [])
+        self.assertEqual({name for name, *_rest in found}, {"mermaid", "excalidraw"})
 
 
 class AutoScrubTests(unittest.TestCase):
@@ -217,7 +221,10 @@ class AutoScrubTests(unittest.TestCase):
             self.assertEqual(install_mcp.auto_scrub_mcp_entries(root, claude_json), [])
             self.assertEqual(claude_json.read_bytes(), before)
 
-    def test_auto_scrub_leaves_diagram_entries_untouched(self) -> None:
+    def test_auto_scrub_removes_diagram_entries(self) -> None:
+        """v0.2.102: same posture as `search` — VCO-shaped diagram entries
+        are removed by the ordinary update (a user's OWN same-name entry
+        outside install_root survives — pinned by the sibling test below)."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "install"
             (root / "claude_mcp_servers" / "wrappers").mkdir(parents=True)
@@ -239,10 +246,12 @@ class AutoScrubTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            self.assertEqual(install_mcp.auto_scrub_mcp_entries(root, claude_json), [])
+            self.assertEqual(
+                install_mcp.auto_scrub_mcp_entries(root, claude_json),
+                ["mermaid", "excalidraw"],
+            )
             data = json.loads(claude_json.read_text(encoding="utf-8"))
-            self.assertIn("mermaid", data["mcpServers"])
-            self.assertIn("excalidraw", data["mcpServers"])
+            self.assertEqual(data["mcpServers"], {})
 
     def test_auto_scrub_leaves_a_users_own_search_entry(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -403,10 +412,10 @@ class RetiredAllowEntryScrubTests(unittest.TestCase):
                 f"{name} still grants the deleted search MCP's tools",
             )
 
-    def test_rule_table_declares_the_retired_allow_pattern(self) -> None:
+    def test_rule_table_declares_the_retired_allow_patterns(self) -> None:
         self.assertEqual(
             mcp_scan_rules.retired_settings_allow_patterns(),
-            ("mcp__search__*",),
+            ("mcp__search__*", "mcp__mermaid__*", "mcp__excalidraw__*"),
         )
 
     def test_bundle_update_drops_the_retired_allow_entry(self) -> None:

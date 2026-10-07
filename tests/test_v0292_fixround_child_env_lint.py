@@ -81,7 +81,6 @@ _ALLOWLIST: dict[str, int] = {
     "tests/test_model_router_cli.py": 1,
     "tests/test_model_router_packaging.py": 6,
     "tests/test_pr2_templates_portability.py": 2,
-    "tests/test_pre_diagram_path_validation.py": 1,
     "tests/test_v0249_install_singleton_lock.py": 1,
     "tests/test_v0254_secrets_surface.py": 2,
     "tests/test_v0284_json_stdout_contract.py": 1,

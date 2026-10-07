@@ -89,7 +89,10 @@ def _extract_assignment(path: Path, variable: str) -> str:
     [
         # v0.2.95 (lane F10): the diagram-throttle stamp moved with the
         # rest of the routing into the ONE home both write hooks call.
-        ("_lib/route-touched-path.ps1", "nowTs"),
+        # v0.2.102: the route-touched-path `nowTs` stamp was removed with
+        # the diagrams integrations (the diagram throttle is gone); the
+        # debounce's `nowEpoch` reap stamp still pins the Unix-epoch
+        # discipline this file exists for.
         ("_lib/kg-sync-debounce.ps1", "nowEpoch"),
         # v0.2.92 final sweep: the three telemetry hooks write MILLISECONDS
         # ($*TsMs) into the same JSONL their .sh siblings write

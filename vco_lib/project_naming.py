@@ -15,9 +15,10 @@ classes named by BOTH rules — see the module docstring of
 
 DEDUP-6 (v0.2.53) downstream callers that now route through this
 function:
-  * ``vco_lib.codegraph_to_mermaid._sanitize_collection_prefix``
-    (thin wrapper that catches ``ValueError`` for malformed inputs and
-    falls back to the legacy regex behaviour).
+  * ``vco_lib.codegraph_naming.sanitize_collection_prefix`` (thin wrapper
+    that catches ``ValueError`` for malformed inputs and falls back to the
+    legacy regex behaviour; hosted in the one naming home since v0.2.102,
+    when the mermaid exporter that used to carry it was deleted).
   * ``templates/scripts/analyze_code_graph.py`` (already used this).
 
 Single source of truth, callable from both Python and Rust (Rust calls the
@@ -79,7 +80,7 @@ implementation by `tests/test_project_naming_parity.py` +
 # ``sanitize_for_weaviate_class``). This module re-exports it so the
 # historical import path ``from vco_lib.project_naming import
 # canonical_class_prefix`` keeps working for existing callers (the migration
-# edges, the analyzer template's bootstrap, codegraph_to_mermaid, the schema
+# edges, the analyzer template's bootstrap, codegraph_naming, the schema
 # migration runner, the weaviate MCP, and the parity tests). New code should
 # import from ``vco_lib.codegraph_naming`` directly. See that module's
 # docstring for the full rules-and-rationale write-up (unchanged behaviour).

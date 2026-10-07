@@ -166,10 +166,10 @@ def test_from_db_minimal_project(tmp_path: Path) -> None:
     assert env["CODE_GRAPH_PROJECT"] == "MyApp"
     assert env["KG_COLLECTION"] == "MyApp_KnowledgeGraph"
     assert env["DEVELOPMENT_COLLECTION"] == "MyApp_Development"
-    # Phase 1.5 — diagrams paired with KG via the suffix-swap rule
-    # (`<basename>_Diagrams`), matching the canonical naming in
-    # `vco_lib.project_init.derive_project_collection_names`.
-    assert env["DIAGRAMS_COLLECTION"] == "MyApp_Diagrams"
+    # v0.2.102 — DIAGRAMS_COLLECTION is no longer projected (the diagrams
+    # integrations were removed); the key left the canonical set, so an
+    # apply drops a stale value a pre-v0.2.102 writer left behind.
+    assert "DIAGRAMS_COLLECTION" not in env
     assert env["SHARED_KG_COLLECTION"] == "VibeCodedOrchestrator_KnowledgeGraph"
     assert env["SHARED_KG_WRITE_DISABLED"] == "false"
     assert env["SHARED_KG_OPT_OUT"] == "false"
@@ -183,7 +183,8 @@ def test_from_db_minimal_project(tmp_path: Path) -> None:
     # Conditional keys are absent (no peers granted).
     assert "VCT_KG_ACCESS_LIST" not in env
     assert "VCT_CODE_GRAPH_ACCESS_LIST" not in env
-    # v0.2.34 A7 — diagrams access is independent; no peers ⇒ no key.
+    # v0.2.34 A7 → v0.2.102: the diagrams access key is retired with the
+    # diagrams integrations; it is never emitted.
     assert "VCT_DIAGRAMS_ACCESS_LIST" not in env
     # v0.2.95: the three portability keys are NO LONGER conditional on the
     # caller. When no root is passed the projection resolves the clone from
@@ -239,10 +240,9 @@ def test_from_db_with_kg_bindings(tmp_path: Path) -> None:
     # v0.2.84 D1: archive-role priority gone → dev = slug-fallback (primary
     # is non-canonical). Was "MyDev" (dead archive binding) pre-0.2.84.
     assert env["DEVELOPMENT_COLLECTION"] == "Demo_project_Development"
-    # v0.2.84 D1: diagrams fallback converges on the SLUG-based sanitizer
-    # (was the name-derived "X_Diagrams" pre-0.2.84). Both dev and diagrams
-    # now share the one non-canonical fallback.
-    assert env["DIAGRAMS_COLLECTION"] == "Demo_project_Diagrams"
+    # v0.2.102: the diagrams half of the D1 derivation still runs (one
+    # rule, one home) but is no longer PROJECTED.
+    assert "DIAGRAMS_COLLECTION" not in env
 
 
 # ─── v0.2.72 R1 (F5 residual) — shared-KG app_state override ─────────────
@@ -684,8 +684,15 @@ def test_from_db_diagrams_suffix_swap_from_canonical_kg(tmp_path: Path) -> None:
     )
     env = project_env_from_db("x", db_path=db)["canonical_env"]
     assert env["KG_COLLECTION"] == "Renamed_KnowledgeGraph"
-    # Suffix swap honoured: Renamed_KnowledgeGraph → Renamed_Diagrams.
-    assert env["DIAGRAMS_COLLECTION"] == "Renamed_Diagrams"
+    # v0.2.102: the suffix-swap derivation itself is KEPT (existing
+    # `_Diagrams` user collections must stay recognisable to the
+    # migrate/rename paths) — pinned through resolve_collection_names,
+    # the recognition surface; the env projection no longer emits it.
+    assert "DIAGRAMS_COLLECTION" not in env
+    from vco_lib.config_projection import resolve_project_collection_names
+    names = resolve_project_collection_names("x", db_path=db)
+    assert names["kg_collection"] == "Renamed_KnowledgeGraph"
+    assert names["diagrams_collection"] == "Renamed_Diagrams"
 
 
 def test_from_db_kg_access_list_strips_self_and_shared(tmp_path: Path) -> None:
@@ -890,42 +897,12 @@ def test_reproject_all_db_unreachable_raises(tmp_path: Path) -> None:
         )
 
 
-def test_from_db_diagram_access_list_emits_grantor_names(tmp_path: Path) -> None:
-    """v0.2.34 A7: ``VCT_DIAGRAMS_ACCESS_LIST`` carries grantor project
-    NAMES (display names). Since GAP-CG-1 (2026-07-14)
-    ``VCT_CODE_GRAPH_ACCESS_LIST`` carries NAMES too — the two
-    access-list resolvers now agree on the identity form."""
-    db = tmp_path / "launcher.db"
-    proj = tmp_path / "p"
-    proj.mkdir()
-    _make_launcher_db(
-        db, project_id="grantee", project_name="Grantee",
-        project_folder=str(proj), project_slug="grantee",
-        extra_projects=[
-            ("a", "Alpha Project", "/tmp/a", "alpha"),
-            ("b", "Beta", "/tmp/b", "beta"),
-        ],
-        diagram_access=[
-            ("a", "read"),
-            ("b", "read"),
-        ],
-    )
-    env = project_env_from_db("grantee", db_path=db)["canonical_env"]
-    # Note: names sorted alphabetically; the MCP-side sanitiser handles
-    # the space in "Alpha Project" by replacing it with `_`.
-    assert env["VCT_DIAGRAMS_ACCESS_LIST"] == "Alpha Project,Beta"
 
-
-def test_from_db_diagram_access_independent_of_kg_access(tmp_path: Path) -> None:
-    """KG-only grants must NOT populate ``VCT_DIAGRAMS_ACCESS_LIST``;
-    diagram-only grants must NOT populate ``VCT_KG_ACCESS_LIST``.
-
-    This is the v0.2.34 A7 bug-fix regression guard. Pre-A7 the MCP fell
-    back to VCT_KG_ACCESS_LIST when VCT_DIAGRAMS_ACCESS_LIST was unset,
-    which meant (1) granting KG access leaked diagram visibility and
-    (2) granting only diagram access was invisible to the MCP because
-    no KG row existed to piggyback on. The split contract here makes
-    each surface track its own access matrix."""
+def test_from_db_diagram_access_key_is_retired(tmp_path: Path) -> None:
+    """v0.2.102: ``VCT_DIAGRAMS_ACCESS_LIST`` is retired with the diagrams
+    integrations — its only consumer (the MCP's diagrams fan-out) is gone,
+    so the projection never emits it, whatever the ``diagram_access``
+    table holds (the table itself is untouched user data)."""
     db = tmp_path / "launcher.db"
     proj = tmp_path / "p"
     proj.mkdir()
@@ -942,81 +919,23 @@ def test_from_db_diagram_access_independent_of_kg_access(tmp_path: Path) -> None
     env = project_env_from_db("x", db_path=db)["canonical_env"]
     assert env["VCT_KG_ACCESS_LIST"] == "Peer"
     assert "VCT_DIAGRAMS_ACCESS_LIST" not in env
+    assert "DIAGRAMS_COLLECTION" not in env
 
 
-def test_from_db_diagram_only_grant_populates_only_diagrams_list(
-    tmp_path: Path,
-) -> None:
-    """Diagram-only grant: VCT_DIAGRAMS_ACCESS_LIST populated, KG list
-    absent. Pre-v0.2.34 A7 this case was completely invisible to the
-    MCP (it would not surface the peer)."""
-    db = tmp_path / "launcher.db"
-    proj = tmp_path / "p"
-    proj.mkdir()
-    _make_launcher_db(
-        db, project_id="x", project_name="X", project_folder=str(proj),
-        extra_projects=[("a", "Alpha", "/tmp/a", "alpha")],
-        diagram_access=[("a", "read")],
-    )
-    env = project_env_from_db("x", db_path=db)["canonical_env"]
-    assert env["VCT_DIAGRAMS_ACCESS_LIST"] == "Alpha"
-    assert "VCT_KG_ACCESS_LIST" not in env
 
 
-def test_from_db_diagram_and_kg_grants_populate_both(tmp_path: Path) -> None:
-    """Both grants present → both env keys present, independently."""
-    db = tmp_path / "launcher.db"
-    proj = tmp_path / "p"
-    proj.mkdir()
-    _make_launcher_db(
-        db, project_id="x", project_name="X", project_folder=str(proj),
-        kg_bindings={
-            "primary": "X_KnowledgeGraph",
-            "shared": "VibeCodedOrchestrator_KnowledgeGraph",
-            "archive": "X_Development",
-        },
-        extra_projects=[("a", "Alpha", "/tmp/a", "alpha")],
-        kg_access=[("Foo_KnowledgeGraph", "read")],
-        diagram_access=[("a", "read")],
-    )
-    env = project_env_from_db("x", db_path=db)["canonical_env"]
-    assert env["VCT_KG_ACCESS_LIST"] == "Foo"
-    assert env["VCT_DIAGRAMS_ACCESS_LIST"] == "Alpha"
 
-
-def test_from_db_diagram_access_level_none_filtered(tmp_path: Path) -> None:
-    """``access_level='none'`` rows must not appear in the env var
-    (mirrors the kg_access_list filtering rule)."""
-    db = tmp_path / "launcher.db"
-    proj = tmp_path / "p"
-    proj.mkdir()
-    _make_launcher_db(
-        db, project_id="x", project_name="X", project_folder=str(proj),
-        extra_projects=[
-            ("a", "Alpha", "/tmp/a", "alpha"),
-            ("b", "Beta", "/tmp/b", "beta"),
-        ],
-        diagram_access=[
-            ("a", "read"),
-            ("b", "none"),
-        ],
-    )
-    env = project_env_from_db("x", db_path=db)["canonical_env"]
-    assert env["VCT_DIAGRAMS_ACCESS_LIST"] == "Alpha"
-    assert "Beta" not in env["VCT_DIAGRAMS_ACCESS_LIST"]
-
-
-def test_apply_diagrams_access_list_signal_to_remove(tmp_path: Path) -> None:
-    """A canonical key absent from the bundle but present in the existing
-    surface is DELETED (signal-to-remove semantics). The diagrams list
-    needs the same behaviour as the KG list so a grant-revoke flow
-    actually wipes the env var."""
+def test_apply_never_writes_the_retired_diagrams_access_list(tmp_path: Path) -> None:
+    """v0.2.102 — ``VCT_DIAGRAMS_ACCESS_LIST`` left the canonical set with
+    the diagrams integrations. The apply no longer writes it, and a copy a
+    pre-v0.2.102 writer left in the USER area of a surface is preserved
+    (inert — nothing reads it), exactly like any other user key."""
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir()
     settings_path.write_text(json.dumps({
         "env": {
             "KG_COLLECTION": "TestKG",
-            "VCT_DIAGRAMS_ACCESS_LIST": "OldPeer1,OldPeer2",  # stale
+            "VCT_DIAGRAMS_ACCESS_LIST": "OldPeer1,OldPeer2",  # stale, user-area
             "OPENAI_API_BASE": "preserved",
         },
     }))
@@ -1025,7 +944,8 @@ def test_apply_diagrams_access_list_signal_to_remove(tmp_path: Path) -> None:
     apply_project_env(bundle, surfaces=["claude_settings_json"])
 
     data = json.loads(settings_path.read_text())
-    assert "VCT_DIAGRAMS_ACCESS_LIST" not in data["env"]
+    # Preserved as a user key (leave user data alone), never rewritten:
+    assert data["env"]["VCT_DIAGRAMS_ACCESS_LIST"] == "OldPeer1,OldPeer2"
     assert data["env"]["OPENAI_API_BASE"] == "preserved"
 
 
@@ -1312,25 +1232,30 @@ def test_apply_unknown_surface_raises(tmp_path: Path) -> None:
         apply_project_env(bundle, surfaces=["bogus"])
 
 
-def test_apply_writes_diagrams_collection_to_surfaces(tmp_path: Path) -> None:
-    """Phase 1.5 — fix/a1-indexing-pipeline 2026-05-25.
+def test_apply_stops_writing_diagrams_collection(tmp_path: Path) -> None:
+    """v0.2.102 — DIAGRAMS_COLLECTION left the canonical key set with the
+    diagrams integrations. The apply writes NEITHER surface with it, and
+    the .claude/env MANAGED block no longer carries it; a stale copy in
+    the user area is preserved (inert)."""
+    settings_path = tmp_path / ".claude" / "settings.json"
+    settings_path.parent.mkdir()
+    settings_path.write_text(json.dumps({
+        "env": {"KG_COLLECTION": "TestKG",
+                "DIAGRAMS_COLLECTION": "TestProj_Diagrams"},  # stale, user-area
+    }))
 
-    DIAGRAMS_COLLECTION must land in both the settings.json env block
-    and .claude/env so the indexer hook (which reads the env var) and
-    the MCP server (which reads via the hub, which then falls back to
-    the env var) both see the canonical name."""
-    bundle = _bundle(tmp_path, DIAGRAMS_COLLECTION="TestProj_Diagrams")
+    bundle = _bundle(tmp_path)  # no DIAGRAMS_COLLECTION in bundle
     apply_project_env(
         bundle, surfaces=["claude_settings_json", "claude_env"],
     )
 
-    settings = json.loads(
-        (tmp_path / ".claude" / "settings.json").read_text()
-    )
+    settings = json.loads(settings_path.read_text())
+    # User-area copy preserved (never rewritten by VCO):
     assert settings["env"]["DIAGRAMS_COLLECTION"] == "TestProj_Diagrams"
-
+    assert settings["env"]["KG_COLLECTION"] == "TestKG"
     env_text = (tmp_path / ".claude" / "env").read_text()
-    assert 'export DIAGRAMS_COLLECTION="TestProj_Diagrams"' in env_text
+    managed = env_text.split("# vco-managed-begin")[1].split("# vco-managed-end")[0]
+    assert "DIAGRAMS_COLLECTION" not in managed
 
 
 def test_apply_returns_audit_report(tmp_path: Path) -> None:
@@ -1455,15 +1380,13 @@ def test_canonical_keys_includes_expected() -> None:
     assert "VCT_KG_ACCESS_LIST" in keys
     assert "VCT_CODE_GRAPH_ACCESS_LIST" in keys
     assert "SHARED_KG_WRITE_DISABLED" in keys
-    # v0.2.34 A7 — diagrams cross-project access list.
-    assert "VCT_DIAGRAMS_ACCESS_LIST" in keys
+    # v0.2.102 — the diagrams keys LEFT the canonical set (retired with
+    # the diagrams integrations; signal-to-remove on the next apply).
+    assert "VCT_DIAGRAMS_ACCESS_LIST" not in keys
     # Foundational keys.
     for k in ("KG_COLLECTION", "PROJECT_NAME", "ACTIVE_EMBEDDING"):
         assert k in keys
-    # Phase 1.5 — fix/a1-indexing-pipeline 2026-05-25.
-    # DIAGRAMS_COLLECTION must be canonical so the indexer + MCP server
-    # both see the same value via the standard env-projection pipeline.
-    assert "DIAGRAMS_COLLECTION" in keys
+    assert "DIAGRAMS_COLLECTION" not in keys
 
 
 def test_canonical_keys_returns_fresh_set() -> None:

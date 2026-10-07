@@ -144,8 +144,9 @@ secret_shaped_needles = [
 # NOT the same as [bundled].all_names below: this is the narrower set the
 # entry BUILDER produces. code-embedding / ollama / vct-coordination are
 # orchestrator-shipped (bundled) but NOT builder-composed, so they are in
-# all_names but NOT here. As of v0.2.101 `search` (module deleted), `mermaid`
-# and `excalidraw` (registration retired; an existing install keeps its entry)
+# all_names but NOT here. As of v0.2.101 `search` (module deleted) and, as of
+# v0.2.102, `mermaid` and `excalidraw` (modules deleted with the diagrams
+# runtime; a VCO-shaped leftover entry is auto-scrubbed on the next update)
 # are also bundled-but-not-builder-composed.
 default_names = [
     "weaviate-kg",
@@ -174,11 +175,12 @@ all_names = [
 # also be in all_names. Keep narrow.
 #
 # EMPTY as of v0.2.101: the only two members were the diagram wrappers
-# (`excalidraw`, `mermaid`), which no longer ship as default registrations —
-# see [entries].default_names and [bundled].all_names. They stay in
-# all_names/uninstall_scrub_names so an install that already has the entry
-# keeps it (classified as bundled, scrubbed only on uninstall), but no
-# fresh registration path seeds them, so nothing ships default-disabled.
+# (`excalidraw`, `mermaid`), whose registration was retired in v0.2.101 and
+# whose modules were deleted outright in v0.2.102 — see [entries].default_names
+# and [bundled].all_names. They stay in all_names/uninstall_scrub_names (and
+# the [deprecated.*] rows below auto-scrub a VCO-shaped leftover entry on the
+# next update), but no fresh registration path seeds them, so nothing ships
+# default-disabled.
 default_disabled = []
 
 # ── Uninstall scrub set ────────────────────────────────────────────────────
@@ -295,3 +297,27 @@ auto_scrub = true
 # with no second scrub mechanism. Python-only consumer (the Rust side merges no
 # project settings.json), so the field is not mirrored into a Rust struct.
 settings_allow_patterns = ["mcp__search__*"]
+
+# v0.2.102 (owner ruling 2026-10-07): BOTH diagram integrations were dropped
+# entirely — the mermaid wrapper proxied the npm `claude-mermaid` package, the
+# excalidraw wrapper proxied the vendored fork (`vco_lib/excalidraw_mcp_fork/`,
+# deleted in the same change), and neither module exists anymore. Same
+# auto_scrub posture as `search` above: a leftover VCO-shaped entry guarantees
+# a failing MCP subprocess every session, so the ordinary update removes it
+# (shape-gated — a user's OWN third-party mermaid/excalidraw MCP is left
+# alone) and drops the `mcp__<name>__*` permissions the entries left in every
+# existing project's `.claude/settings.json`. The user's diagram DATA is
+# untouched: `_Diagrams` Weaviate collections and the launcher's diagram DB
+# tables are never dropped, and the naming/recognition code that identifies
+# them stays.
+[deprecated.mermaid]
+removed_in = "v0.2.102"
+reason = "Mermaid diagram MCP wrapper removed from VCO (diagrams integrations dropped, owner ruling 2026-10-07). The wrapper script and the npm pin it proxied were deleted, so a leftover registration fails to spawn on every session. The ordinary update REMOVES this entry automatically (auto_scrub=true, VCO-shaped entries only). Existing .mmd files and _Diagrams collections are untouched user data."
+auto_scrub = true
+settings_allow_patterns = ["mcp__mermaid__*"]
+
+[deprecated.excalidraw]
+removed_in = "v0.2.102"
+reason = "Excalidraw diagram MCP wrapper removed from VCO (diagrams integrations dropped, owner ruling 2026-10-07). The wrapper script and the vendored excalidraw MCP fork it proxied were deleted, so a leftover registration fails to spawn on every session. The ordinary update REMOVES this entry automatically (auto_scrub=true, VCO-shaped entries only). Existing .excalidraw files and _Diagrams collections are untouched user data."
+auto_scrub = true
+settings_allow_patterns = ["mcp__excalidraw__*"]

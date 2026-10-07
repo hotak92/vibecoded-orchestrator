@@ -59,9 +59,11 @@ def _run_cli(args: list[str], *, env_extra: dict | None = None) -> subprocess.Co
 class CliRendersClaudeMdTests(unittest.TestCase):
     """End-to-end: `re-render-claude-md` writes a sensible CLAUDE.md."""
 
-    def test_default_modules_active_diagrams_section_present(self):
-        # With the stub fallback (no DB), diagrams is default-on, so the
-        # rendered CLAUDE.md must contain the Diagrams section.
+    def test_default_modules_active_no_diagrams_section(self):
+        # With the stub fallback (no DB), diagrams is default-on — the
+        # verdict still answers the id (machinery kept, v0.2.102) — but no
+        # shipped section is gated on it any more, so the rendered
+        # CLAUDE.md must NOT contain a Diagrams section.
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td)
             result = _run_cli([
@@ -77,10 +79,13 @@ class CliRendersClaudeMdTests(unittest.TestCase):
             )
             payload = json.loads(result.stdout)
             self.assertTrue(payload["ok"])
-            self.assertIn("diagrams", payload["active_modules"])
+            # v0.2.102: active_modules is DOC-DRIVEN — with no diagrams
+            # section left in the template, the id no longer appears even
+            # though the verdict machinery still answers it.
+            self.assertNotIn("diagrams", payload["active_modules"])
 
             claude_md = (folder / "CLAUDE.md").read_text(encoding="utf-8")
-            self.assertIn("## Diagrams (Mermaid + Excalidraw)", claude_md)
+            self.assertNotIn("## Diagrams", claude_md)
             # Conditional tag lines must NOT leak into the rendered file.
             self.assertNotIn("{{#if_module_active", claude_md)
             self.assertNotIn("{{/if_module_active", claude_md)
@@ -139,58 +144,12 @@ class CliRendersClaudeMdTests(unittest.TestCase):
             # The VCO-Managed Files section (which follows) too.
             self.assertIn("VCO-Managed Files", claude_md)
 
-    def test_active_vs_inactive_outputs_differ(self):
-        # Render both ways and confirm they differ in a meaningful way.
-        with tempfile.TemporaryDirectory() as td:
-            folder_a = Path(td) / "active"
-            folder_a.mkdir()
-            folder_i = Path(td) / "inactive"
-            folder_i.mkdir()
-
-            state_dir = Path(td) / "vct-state"
-            state_dir.mkdir()
-            db = state_dir / "launcher.db"
-            conn = sqlite3.connect(str(db))
-            conn.execute(
-                "CREATE TABLE project_modules "
-                "(project_id TEXT, module_name TEXT, enabled INTEGER)"
-            )
-            conn.execute(
-                "INSERT INTO project_modules VALUES (?, ?, ?)",
-                ("inactive-project", "diagrams", 0),
-            )
-            conn.commit()
-            conn.close()
-
-            # Active: uses default-on stub fallback (project_id with no
-            # rows → defaults).
-            res_a = _run_cli([
-                "re-render-claude-md",
-                "--folder", str(folder_a),
-                "--project-name", "P",
-                "--orchestrator-root", str(REPO_ROOT),
-                "--project-id", "active-project",
-                "--db-path", str(db),
-                "--json",
-            ])
-            self.assertEqual(res_a.returncode, 0)
-
-            res_i = _run_cli([
-                "re-render-claude-md",
-                "--folder", str(folder_i),
-                "--project-name", "P",
-                "--orchestrator-root", str(REPO_ROOT),
-                "--project-id", "inactive-project",
-                "--db-path", str(db),
-                "--json",
-            ])
-            self.assertEqual(res_i.returncode, 0)
-
-            text_a = (folder_a / "CLAUDE.md").read_text(encoding="utf-8")
-            text_i = (folder_i / "CLAUDE.md").read_text(encoding="utf-8")
-            self.assertNotEqual(text_a, text_i)
-            self.assertIn("Diagrams", text_a)
-            self.assertNotIn("Diagrams (Mermaid + Excalidraw)", text_i)
+    # v0.2.102: ``test_active_vs_inactive_outputs_differ`` was removed —
+    # its vehicle was the diagrams conditional section, which no longer
+    # ships. With no shipped section gated on the ``diagrams`` module id,
+    # an active and an inactive render produce identical CLAUDE.md bytes;
+    # the active/inactive machinery itself is still pinned by
+    # ``test_module_inactive_via_db_diagrams_section_absent`` above.
 
     def test_user_content_below_managed_region_preserved_on_re_render(self):
         # Render once, append user content, re-render with a different
