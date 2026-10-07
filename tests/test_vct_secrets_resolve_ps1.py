@@ -256,6 +256,18 @@ def test_live_503_keychain_error_exits_6(tmp_path, secrets_dir):
     assert "unreadable" in cp.stderr.lower()
 
 
+def test_live_503_keychain_unavailable_exits_6_says_retry(tmp_path, secrets_dir):
+    """v0.2.102: a 503 keychain_unavailable (a keychain op timed out on the
+    hub) → exit 6 with a "temporarily unavailable — retry" message, not the
+    unlock advice of keychain_locked/keychain_error."""
+    body = '{"error": {"code": "keychain_unavailable", "message": "timed out"}}'
+    with _fake_hub(503, body) as port:
+        cp = _run_resolver_live(tmp_path, "p1", "BUSY_KEY", secrets_dir, port)
+    assert cp.returncode == 6, f"stderr={cp.stderr}"
+    low = cp.stderr.lower()
+    assert "temporarily unavailable" in low and "retry" in low
+
+
 def test_live_503_keychain_locked_falls_to_file_store(tmp_path, secrets_dir):
     """The keychain is independent of ~/.vct-secrets — a locked keychain must
     NOT strand a file-store copy (exit 0, value returned)."""

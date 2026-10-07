@@ -20,8 +20,9 @@
 # 401 / key_not_active (undeclared or not granted) / key_paused (v0.2.101:
 # the key EXISTS but is paused for this requester — the file store is an
 # independent store, so the chain behaviour is the same) / 403 forbidden /
-# 503 keychain_locked | keychain_error (the OS keychain is
-# locked/unreadable — the file store never depended on it, so a locked
+# 503 keychain_locked | keychain_error | keychain_unavailable (the OS
+# keychain is locked/unreadable/temporarily unavailable — the file store
+# never depended on it, so a locked
 # keychain must not strand a file-store key); tier 2 → 3 on file
 # absent/unreadable. All-miss → non-zero exit preserving the tier-1
 # exit-code contract below (exit 3 `key_not_active`/`key_paused` is only
@@ -46,7 +47,8 @@
 #                   6=keychain locked/unreadable (hub 503 keychain_locked
 #                   or keychain_error — the OS keychain is locked or a
 #                   per-key read failed; unlock the login keychain or open
-#                   the launcher).
+#                   the launcher — or v0.2.102 keychain_unavailable — a
+#                   keychain op timed out; retry in a few seconds).
 #                   Non-zero codes mean the key ALSO missed the file
 #                   store and the project `.env`.
 #
@@ -747,6 +749,14 @@ read_key_hub_env() {
                     err "hub could not read the OS keychain for $key (project $pid): a per-key keychain read failed (the key may exist but is currently unreadable) — unlock the login keychain or open the launcher to restore secret resolution."
                     return 6
                     ;;
+                keychain_unavailable)
+                    # v0.2.102: TEMPORARY — a keychain op timed out / the hub's
+                    # keychain worker is stuck. Nothing to unlock: retry after
+                    # the hub's Retry-After. Same exit 6 (keychain unreadable
+                    # family, exit-code contract unchanged), distinct message.
+                    err "hub could not read the OS keychain for $key (project $pid): the keychain is temporarily unavailable (a keychain operation timed out) — retry in a few seconds."
+                    return 6
+                    ;;
                 *)
                     err "hub returned status 503 (code $code503); body=$body"
                     return 1
@@ -1105,7 +1115,8 @@ Exit codes (non-zero = key ALSO missed the file store + project .env):
   3  key not active for this project
   4  key not found in hub response
   5  forbidden (hub refused the token on /env; scoped token required)
-  6  keychain locked/unreadable (hub 503; unlock login keychain / open launcher)
+  6  keychain locked/unreadable (hub 503; unlock login keychain / open launcher),
+     or temporarily unavailable (hub 503 keychain_unavailable; retry shortly)
 EOF
         exit 64
     fi

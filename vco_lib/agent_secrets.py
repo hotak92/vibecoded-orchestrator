@@ -90,6 +90,7 @@ __all__ = [
     "Forbidden",
     "HubUnreachable",
     "KeychainLocked",
+    "KeychainUnavailable",
     "lookup_stored",
     "ProjectNotFound",
     "SecretNotFound",
@@ -129,6 +130,20 @@ class KeychainLocked(ResolverError):
     ``.env`` key. This is honest, not a silent downgrade — the final
     all-miss message names both the locked-keychain state and the
     file-store miss.
+    """
+
+
+class KeychainUnavailable(KeychainLocked):
+    """The hub's OS keychain was TEMPORARILY unavailable (503
+    ``keychain_unavailable``, sent with ``Retry-After``) — v0.2.102.
+
+    A keychain operation timed out or the hub's keychain worker is stuck on
+    an unresponsive Secret Service. Unlike ``keychain_locked`` there is
+    nothing for the user to unlock: the remedy is to retry after the hub's
+    ``Retry-After`` seconds. A SUBCLASS of :class:`KeychainLocked` so every
+    existing ``except KeychainLocked`` caller keeps catching it, and
+    :func:`get` falls through to the file store and project ``.env`` on it
+    exactly as for ``KeychainLocked``.
     """
 
 
@@ -407,6 +422,16 @@ def _hub_get(key: str, project: Optional[str]) -> str:
                 code = (err.get("error") or {}).get("code")
         except ValueError:
             code = None
+        if code == "keychain_unavailable":
+            # v0.2.102: temporary — a keychain op timed out / the hub's
+            # worker is stuck. Retry, nothing to unlock.
+            retry_after = (getattr(resp, "headers", None) or {}).get("Retry-After") or "a few"
+            raise KeychainUnavailable(
+                f"hub could not read the OS keychain for {key!r} "
+                f"(project={pid}, code='keychain_unavailable'): the keychain is "
+                f"temporarily unavailable (a keychain operation timed out) — "
+                f"retry in {retry_after} seconds"
+            )
         if code in ("keychain_locked", "keychain_error"):
             locked = code == "keychain_locked"
             raise KeychainLocked(
@@ -599,6 +624,15 @@ def get(
 
     if isinstance(hub_error, AccessDenied):
         raise hub_error
+    if isinstance(hub_error, KeychainUnavailable):
+        # v0.2.102: temporary unavailability — say "retry", not "unlock".
+        raise KeychainUnavailable(
+            f"hub keychain temporarily unavailable; key {key!r} also absent "
+            f"from file store ({tier2_desc()}) and project .env "
+            f"({tier3_desc()}) (tiers 2+3 checked={allow_file_fallback}) — "
+            "retry shortly. "
+            f"Underlying hub state: {hub_error}"
+        ) from hub_error
     if isinstance(hub_error, KeychainLocked):
         # v0.2.82 WP-4a: the keychain was unreadable AND the file store +
         # project .env also missed (or fallback was disabled). Surface the

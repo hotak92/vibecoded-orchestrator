@@ -21,7 +21,8 @@
 # 401 / key_not_active (undeclared or not granted) / key_paused (v0.2.101:
 # the key EXISTS but is paused for this requester -- the file store is an
 # independent store, so the chain behaviour is the same) / 403 forbidden /
-# 503 keychain_locked | keychain_error (the OS keychain is locked/unreadable -- the file store
+# 503 keychain_locked | keychain_error | keychain_unavailable (the OS keychain is
+# locked/unreadable/temporarily unavailable -- the file store
 # never depended on it, so a locked keychain must not strand a file-store
 # key); tier 2 -> 3 on file absent/unreadable. All-miss -> non-zero exit
 # preserving the tier-1 exit-code contract below (exit 3
@@ -44,7 +45,9 @@
 #         4  key not found in hub response
 #         5  forbidden (hub refused the token on /env; scoped token required)
 #         6  keychain locked/unreadable (hub 503 keychain_locked or
-#            keychain_error; unlock the login keychain or open the launcher)
+#            keychain_error; unlock the login keychain or open the launcher),
+#            or temporarily unavailable (v0.2.102 keychain_unavailable;
+#            retry in a few seconds)
 #       Non-zero codes mean the key ALSO missed the file store and the
 #       project `.env`.
 #
@@ -637,6 +640,14 @@ function Read-KeyHubEnv {
                 }
                 "keychain_error" {
                     Write-Err "hub could not read the OS keychain for $Key (project $pid_): a per-key keychain read failed (the key may exist but is currently unreadable) — unlock the login keychain or open the launcher to restore secret resolution."
+                    return @{ ExitCode = 6 }
+                }
+                "keychain_unavailable" {
+                    # v0.2.102: TEMPORARY -- a keychain op timed out / the hub's
+                    # keychain worker is stuck. Nothing to unlock: retry after
+                    # the hub's Retry-After. Same exit 6, distinct message.
+                    # Mirrors the .sh `keychain_unavailable)` arm.
+                    Write-Err "hub could not read the OS keychain for $Key (project $pid_): the keychain is temporarily unavailable (a keychain operation timed out) — retry in a few seconds."
                     return @{ ExitCode = 6 }
                 }
                 Default {

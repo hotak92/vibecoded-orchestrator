@@ -42,6 +42,21 @@ Every sanctioned resolver walks the SAME chain, in this order:
    same tier-1 exit 3 from `vct_secrets_resolve.sh`): the pause is a
    deliberate owner decision, so never "fix" it by storing a second
    copy — resume it in the launcher instead.
+   When the hub cannot read the keychain it answers **503**, never a
+   404, with one of three codes: `keychain_locked` (the login keychain
+   is locked — unlock it), `keychain_error` (a per-key read failed),
+   or `keychain_unavailable` (v0.2.102: a keychain operation timed out
+   or the hub's keychain worker is stuck on an unresponsive Secret
+   Service — nothing to unlock, retry after the `Retry-After` seconds
+   the response carries). All three are tier-1 exit 6 from
+   `vct_secrets_resolve.sh` / `.ps1` (each with its own message) and
+   `KeychainLocked` from `vco_lib.agent_secrets` (`keychain_unavailable`
+   as its subclass `KeychainUnavailable`); the chain still falls
+   through to tiers 2 and 3. A full-env response that hit one of them
+   carries `X-VCT-Secrets-Degraded: keychain_error` or
+   `keychain_unavailable`. A temporarily unavailable keychain says
+   nothing about whether the key exists, so `vct get` withholds its
+   `vct set` hint on it.
    Hub discovery: `$VCT_HUB_PORT` / `$VCT_HUB_TOKEN` env →
    `<vct_root>/hub.port` + `hub.token` → defaults (a PROVABLY-stale
    `$VCT_HUB_TOKEN` is retried once against the on-disk token — see

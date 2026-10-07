@@ -22,7 +22,7 @@ import logging
 import unittest
 from pathlib import Path
 
-from model_router.secrets import NEGATIVE_TTL_CAP_S, VendorKeyResolver
+from model_router.secrets import NEGATIVE_TTL_CAP_S, TRANSIENT_RETRY_S, VendorKeyResolver
 from model_router.vendors import VENDORS, Vendor
 
 
@@ -495,6 +495,95 @@ class ServeStaleTests(unittest.TestCase):
         self.assertEqual(result.key, FAKE_KEY)
         self.assertNotIn(FAKE_KEY, "\n".join(captured.output))
         self.assertNotIn(FAKE_KEY, repr(result))
+
+
+class KeychainUnavailableTests(unittest.TestCase):
+    """v0.2.102: the hub's 503 ``keychain_unavailable`` (a keychain operation
+    timed out — the key may exist) is TRANSIENT for the gateway: not cached
+    as "missing" for 30 s, not reported as "no key found", and it never
+    erases a last-known-good key. Uses the resolver's REAL exception type."""
+
+    @staticmethod
+    def _unavailable(key, project=None):
+        from vco_lib.agent_secrets import KeychainUnavailable
+
+        raise KeychainUnavailable(f"hub keychain temporarily unavailable for {key!r}")
+
+    def test_total_unavailability_is_transient_not_no_key_found(self) -> None:
+        result = VendorKeyResolver(getter=self._unavailable).resolve(ACME)
+        self.assertIsNone(result.key)
+        self.assertTrue(result.transient)
+        message = result.problem or ""
+        self.assertIn("temporarily unavailable", message)
+        self.assertIn("retrying", message)
+        self.assertNotIn("no key found", message)
+        self.assertNotIn("vct set", message, "a busy keychain is not a missing key")
+
+    def test_unavailability_is_retried_after_seconds_not_the_negative_ttl(self) -> None:
+        calls: list[str] = []
+        clock = _Clock()
+
+        def getter(key, project=None):
+            calls.append(key)
+            self._unavailable(key)
+
+        resolver = VendorKeyResolver(getter=getter, ttl_s=3600, clock=clock)
+        resolver.resolve(ACME)
+        first = len(calls)
+        resolver.resolve(ACME)
+        self.assertEqual(len(calls), first, "a burst inside the retry window shares one answer")
+        clock.now += TRANSIENT_RETRY_S + 0.5
+        self.assertLess(TRANSIENT_RETRY_S + 0.5, NEGATIVE_TTL_CAP_S)
+        resolver.resolve(ACME)
+        self.assertGreater(len(calls), first, "transient failures are re-asked within seconds")
+
+    def test_unavailable_first_name_then_absent_second_is_still_transient(self) -> None:
+        def getter(key, project=None):
+            if key == "acme_primary_key":
+                self._unavailable(key)
+            raise LookupError("absent")
+
+        result = VendorKeyResolver(getter=getter).resolve(ACME)
+        self.assertTrue(result.transient)
+        self.assertIn("temporarily unavailable", result.problem or "")
+
+    def test_unavailable_first_name_does_not_block_a_second_name_that_resolves(self) -> None:
+        def getter(key, project=None):
+            if key == "acme_primary_key":
+                self._unavailable(key)
+            return FAKE_KEY
+
+        result = VendorKeyResolver(getter=getter).resolve(ACME)
+        self.assertEqual(result.state, "resolved")
+        self.assertEqual(result.resolved_from, "acme_legacy_key")
+
+    def test_last_known_good_key_is_served_through_unavailability(self) -> None:
+        state = {"ok": True}
+        clock = _Clock()
+
+        def getter(key, project=None):
+            if state["ok"]:
+                return FAKE_KEY
+            self._unavailable(key)
+
+        resolver = VendorKeyResolver(getter=getter, ttl_s=300, clock=clock)
+        self.assertEqual(resolver.resolve(ACME).state, "resolved")
+        state["ok"] = False
+        clock.now += 301
+        served = resolver.resolve(ACME)
+        self.assertEqual(served.state, "stale")
+        self.assertEqual(served.key, FAKE_KEY)
+
+    def test_transient_logs_once_and_never_as_a_miss(self) -> None:
+        clock = _Clock()
+        resolver = VendorKeyResolver(getter=self._unavailable, ttl_s=3600, clock=clock)
+        with self.assertLogs("model_router.secrets", level="WARNING") as logs:
+            resolver.resolve(ACME)
+            clock.now += TRANSIENT_RETRY_S + 1
+            resolver.resolve(ACME)
+        text = "\n".join(logs.output)
+        self.assertEqual(text.count("temporarily unavailable"), 1)
+        self.assertNotIn("no key for vendor", text)
 
 
 class NoValueLeakTests(unittest.TestCase):

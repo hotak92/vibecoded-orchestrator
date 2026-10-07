@@ -108,7 +108,7 @@ def test_vct_can_read_and_resolve(vct_env):
 
 
 @contextlib.contextmanager
-def _stub_hub(state_dir, *, has_key: bool):
+def _stub_hub(state_dir, *, has_key: bool, unavailable: bool = False):
     """Spin a localhost stub of vct-hub's GET /projects/{id}/env?key=... and
     write hub.port + hub.token under `state_dir` so `vct` discovers it.
 
@@ -129,6 +129,14 @@ def _stub_hub(state_dir, *, has_key: bool):
             if "Bearer " not in (self.headers.get("Authorization") or ""):
                 self.send_response(401)
                 self.end_headers()
+                return
+            if unavailable and "/env" in self.path:
+                body = b'{"error":{"code":"keychain_unavailable","message":"timed out"}}'
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", "2")
+                self.end_headers()
+                self.wfile.write(body)
                 return
             if has_key and "/env" in self.path:
                 body = b'{"MYGUIKEY": "kept-in-keychain"}'
@@ -186,6 +194,21 @@ def test_vct_get_miss_unchanged_when_hub_lacks_key(vct_env, tmp_path):
     assert cp.returncode == 2, cp.stderr
     assert "Fix: vct set" in cp.stderr, cp.stderr
     assert "vct_secrets_resolve.sh" not in cp.stderr
+
+
+def test_vct_get_miss_when_hub_keychain_unavailable_withholds_vct_set(vct_env, tmp_path):
+    """v0.2.102: the hub answers 503 keychain_unavailable (a keychain op timed
+    out) — the key state is UNKNOWN, so the miss message says to retry and
+    must NOT suggest `vct set` (it would fork a divergent copy)."""
+    state_dir = tmp_path / "vct-state"
+    env = dict(vct_env)
+    env["VCT_STATE_DIR"] = str(state_dir)
+    env.pop("VCT_HUB_PORT", None)  # stub hub.port must win over the conftest pin
+    with _stub_hub(state_dir, has_key=False, unavailable=True):
+        cp = _vct(env, "get", "--project", "myproj", "--key", "BUSYKEY", "--trusted")
+    assert cp.returncode == 2, cp.stderr
+    assert "temporarily unavailable" in cp.stderr, cp.stderr
+    assert "Fix: vct set" not in cp.stderr, cp.stderr
 
 
 def test_vct_get_miss_unchanged_when_hub_down(vct_env, tmp_path):

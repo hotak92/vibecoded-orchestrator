@@ -772,6 +772,9 @@ struct ProjectEnvQuery {
 /// store / `key_not_active`) exactly as pre-v0.2.82. See
 /// `vct_launcher_core::secrets::keychain_backend_available` (memoized;
 /// test-overridable via `TestBackendAvailabilityGuard`).
+/// v0.2.102: `Retry-After` (seconds) sent with a 503 `keychain_unavailable`.
+const KEYCHAIN_UNAVAILABLE_RETRY_AFTER_SECS: &str = "2";
+
 fn mark_keychain_degraded(flag: &mut bool) {
     if vct_launcher_core::secrets::keychain_backend_available() {
         *flag = true;
@@ -822,6 +825,25 @@ async fn project_env(
         Err(e) => return db_error_response("get project (env)", e),
     };
 
+    // v0.2.84 (D8.2): open ONE memory-only read-through secret session for the
+    // WHOLE request. Every `secrets::get_with_context` call below — the module
+    // loop, the orchestrator-bundled loop, the user-bucket resolver (in
+    // `db::secret_active`), and the cross-project grants loop — runs on this
+    // same thread with NO `.await` between them, so they all share this
+    // thread-local memo transparently: a key that appears in more than one loop
+    // (e.g. a shared `github_pat` declared bundled AND present in the user
+    // bucket) hits the OS keychain exactly ONCE per request instead of once per
+    // occurrence. Under `Update all projects` this collapses the per-project ×
+    // per-key daemon fan-out that reproduced the P7 gnome-keyring SIGTRAP. The
+    // session is torn down (memo dropped, nothing persisted) when `_secret_session`
+    // drops at the end of the handler. Must NOT be held across an `.await` —
+    // this handler has none in the resolution region (verified).
+    //
+    // v0.2.102: opened BEFORE the lock probe below, so that probe's answer is
+    // kept in the session and reused by every Background read of this request
+    // (each read used to run its own probe job on the keychain worker).
+    let _secret_session = vct_launcher_core::secrets::SecretReadSession::new();
+
     // v0.2.82 (WP-4a / G5): probe the OS keychain lock state ONCE per request
     // (Background context — this is a hook/MCP resolution path, never a user
     // click). A LOCKED store cannot honestly report which keys exist: a partial
@@ -840,20 +862,6 @@ async fn project_env(
         );
     }
 
-    // v0.2.84 (D8.2): open ONE memory-only read-through secret session for the
-    // WHOLE request. Every `secrets::get_with_context` call below — the module
-    // loop, the orchestrator-bundled loop, the user-bucket resolver (in
-    // `db::secret_active`), and the cross-project grants loop — runs on this
-    // same thread with NO `.await` between them, so they all share this
-    // thread-local memo transparently: a key that appears in more than one loop
-    // (e.g. a shared `github_pat` declared bundled AND present in the user
-    // bucket) hits the OS keychain exactly ONCE per request instead of once per
-    // occurrence. Under `Update all projects` this collapses the per-project ×
-    // per-key daemon fan-out that reproduced the P7 gnome-keyring SIGTRAP. The
-    // session is torn down (memo dropped, nothing persisted) when `_secret_session`
-    // drops at the end of the handler. Must NOT be held across an `.await` —
-    // this handler has none in the resolution region (verified).
-    let _secret_session = vct_launcher_core::secrets::SecretReadSession::new();
     // Per-key non-lock keychain errors set this flag (never silently omit a
     // key). Surfaced as `keychain_error` (503) on a `?key=` miss and as the
     // v0.2.82 CI fix: the degraded marker below is availability-gated via
@@ -861,6 +869,19 @@ async fn project_env(
     // no-backend-host (headless CI/server) distinction.
     // additive `X-VCT-Secrets-Degraded` header on a full-env response.
     let mut keychain_degraded = false;
+
+    // v0.2.102: a `?key=` lookup resolves ONLY that key. It used to build the
+    // whole env (every module, bundled, user and granted secret — ~28 keychain
+    // reads) and filter at the end, so one single-key lookup cost seconds of
+    // keychain-worker time. First-wins order is unchanged: each loop below
+    // just skips every other key name.
+    let only_key: Option<String> = q
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string);
+    let wanted = |k: &str| only_key.as_deref().is_none_or(|w| w == k);
 
     let mut env = serde_json::Map::new();
     env.insert("VCT_PROJECT_ID".into(), serde_json::Value::String(project.id.clone()));
@@ -963,6 +984,9 @@ async fn project_env(
         // never through this route).
         let bundled = bundled_ids.contains(&manifest.id.as_str());
         for s in &manifest.settings {
+            if !wanted(&s.key) {
+                continue;
+            }
             let value = if bundled {
                 h.0.get_setting(&project.id, &manifest.id, &s.key).ok().flatten()
             } else {
@@ -1016,6 +1040,9 @@ async fn project_env(
             continue;
         }
         for s in &manifest.secrets {
+            if !wanted(&s.key) {
+                continue;
+            }
             // Slot-exclusive skip (v0.2.98) — see `slot_exclusive_keys`
             // for the full rule. Deliberately NOT inside
             // `resolve_module_secret`: containers and spawns keep their
@@ -1076,6 +1103,9 @@ async fn project_env(
     // declaration takes precedence — the user explicitly opted into it).
     if let Some(orch_manifest) = orch_manifest.as_ref() {
         for bs in &orch_manifest.bundled_secrets {
+            if !wanted(&bs.key) {
+                continue;
+            }
             // Skip if an installed module already populated this key. Pins
             // installed-module-wins so the orchestrator's bundled
             // declarations are a default, not an override.
@@ -1204,10 +1234,11 @@ async fn project_env(
     // error hit while resolving user secrets so we surface it honestly rather
     // than silently dropping a key.
     let (user_pairs, user_degraded) =
-        vct_launcher_core::db::secret_active::resolve_active_user_secret_pairs_for_requester_with_degraded(
+        vct_launcher_core::db::secret_active::resolve_active_user_secret_pairs_for_requester_with_degraded_for_key(
             &h.0,
             &project.id,
             &project.id,
+            only_key.as_deref(),
         );
     if user_degraded {
         mark_keychain_degraded(&mut keychain_degraded);
@@ -1258,6 +1289,9 @@ async fn project_env(
     // are an opt-in contract; grants are an additive sharing surface.
     if let Ok(grants) = h.0.list_grants_by_grantee(&project.id) {
         for g in &grants {
+            if !wanted(&g.key) {
+                continue;
+            }
             if env.contains_key(&g.key) {
                 continue;
             }
@@ -1340,6 +1374,27 @@ async fn project_env(
             // keychain read errored. Return 503 `keychain_error` so the caller
             // distinguishes "genuinely not authorized here" (404) from "we
             // could not read the keychain" (503, retry/unlock).
+            // v0.2.102: the keychain was UNAVAILABLE during this request (op
+            // timed out / backend stuck) — retryable, and distinct from a read
+            // that errored. `Retry-After` tells callers when to ask again.
+            None if vct_launcher_core::secrets::SecretReadSession::saw_unavailable() => {
+                let mut resp = error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "keychain_unavailable",
+                    format!(
+                        "key {:?} could not be resolved for project {}: the OS keychain \
+                         is temporarily unavailable (a keychain operation timed out) — \
+                         retry in a few seconds",
+                        want, project.id
+                    ),
+                )
+                .into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static(KEYCHAIN_UNAVAILABLE_RETRY_AFTER_SECS),
+                );
+                resp
+            }
             None if keychain_degraded => error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "keychain_error",
@@ -1409,7 +1464,13 @@ async fn project_env(
     // to a keychain fault rather than genuine absence.
     let mut resp = Json(serde_json::Value::Object(env)).into_response();
     if keychain_degraded {
-        if let Ok(hv) = axum::http::HeaderValue::from_str("keychain_error") {
+        // v0.2.102: name the unavailability class when that was the cause.
+        let class = if vct_launcher_core::secrets::SecretReadSession::saw_unavailable() {
+            "keychain_unavailable"
+        } else {
+            "keychain_error"
+        };
+        if let Ok(hv) = axum::http::HeaderValue::from_str(class) {
             resp.headers_mut()
                 .insert("X-VCT-Secrets-Degraded", hv);
         }
@@ -1580,9 +1641,11 @@ mod tests {
     // skipped in CI headless env"]`, which is the SUPERSEDING mechanism:
     // it declares the requirement instead of silently turning an explicit
     // `--ignored` run on a headless host into a green no-op. The capability
-    // itself is not lost — the shared probe still lives in
-    // `vct_launcher_core::secrets` and production code calls it
-    // (`commands/installer.rs`). Deleted rather than `#[allow(dead_code)]`d,
+    // itself is not lost — the write/delete canary probe still lives in
+    // `vct_launcher_core::secrets` as a TEST-ONLY helper (its one caller is
+    // `commands/installer.rs`'s test module); production availability checks
+    // use the read-only D-Bus backend check since v0.2.102. Deleted rather
+    // than `#[allow(dead_code)]`d,
     // so `cargo check --all-targets` is clean rather than muted.
 
     /// PR-3 Commit 3 canary: the hub's per-subprocess secret resolver MUST
@@ -3812,5 +3875,128 @@ mod tests {
         assert_eq!(row.status, "running", "walk B's row survives untouched");
         assert_eq!(row.pid, Some(9002), "walk B's pid never overwritten");
         assert_eq!(row.files_analyzed, 0);
+    }
+    /// v0.2.102 T8 — an UNAVAILABLE keychain (op timed out / worker stuck) on a
+    /// `?key=` miss answers 503 `keychain_unavailable` with `Retry-After`, never
+    /// 404 `key_not_active` (red-first: pre-v0.2.102 the hub had no such code,
+    /// and its poisoned "no backend" memo turned the miss into
+    /// `key_not_active`). The presence probe is fixed, but the memo POLICY runs.
+    #[tokio::test]
+    async fn hub_env_unavailable_keychain_returns_503_keychain_unavailable() {
+        let _lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false));
+        let _presence = vct_launcher_core::secrets::TestBackendPresenceGuard::new(
+            vct_launcher_core::secrets::BackendPresence::Present,
+        );
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "un-proj", "Unavailable Project", "/tmp/un-proj");
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "un-proj" },
+            "user",
+            "UNAVAILABLE_KEY",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "un-proj", "user", "UNAVAILABLE_KEY")
+            .unwrap();
+        vct_launcher_core::secrets::for_tests::make_next_get_unavailable("UNAVAILABLE_KEY");
+
+        let resp = reqwest::get(format!("{}/projects/un-proj/env?key=UNAVAILABLE_KEY", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 503, "unavailable ?key= must be 503");
+        assert_eq!(
+            resp.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some(KEYCHAIN_UNAVAILABLE_RETRY_AFTER_SECS),
+            "503 keychain_unavailable must carry Retry-After"
+        );
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("keychain_unavailable"),
+            "envelope: {body}"
+        );
+        assert!(
+            !body.to_string().contains("synthetic-not-a-real-secret"),
+            "no value in the envelope"
+        );
+    }
+
+    /// v0.2.102 T8b — the full-env form names the unavailability class in the
+    /// additive degraded header.
+    #[tokio::test]
+    async fn hub_env_unavailable_full_env_header_names_class() {
+        let _lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false));
+        let _presence = vct_launcher_core::secrets::TestBackendPresenceGuard::new(
+            vct_launcher_core::secrets::BackendPresence::Present,
+        );
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "un-proj2", "Unavailable Project 2", "/tmp/un-proj2");
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "un-proj2" },
+            "user",
+            "UNAVAILABLE_KEY2",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "un-proj2", "user", "UNAVAILABLE_KEY2")
+            .unwrap();
+        vct_launcher_core::secrets::for_tests::make_next_get_unavailable("UNAVAILABLE_KEY2");
+
+        let resp = reqwest::get(format!("{}/projects/un-proj2/env", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("X-VCT-Secrets-Degraded")
+                .and_then(|v| v.to_str().ok()),
+            Some("keychain_unavailable")
+        );
+    }
+
+    /// v0.2.102 T9 — `?key=` reads ONLY that key (red-first: pre-v0.2.102 it
+    /// resolved every secret and filtered at the end). Key B is armed to fail
+    /// as unavailable; a lookup of an undeclared key A must not read B (404,
+    /// not 503), and B's armed failure must still be pending for B's own
+    /// lookup afterwards.
+    #[tokio::test]
+    async fn hub_env_single_key_lookup_reads_only_that_key() {
+        let _lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false));
+        let _presence = vct_launcher_core::secrets::TestBackendPresenceGuard::new(
+            vct_launcher_core::secrets::BackendPresence::Present,
+        );
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "one-proj", "Single Key Project", "/tmp/one-proj");
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "one-proj" },
+            "user",
+            "OTHER_KEY_B",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "one-proj", "user", "OTHER_KEY_B")
+            .unwrap();
+        vct_launcher_core::secrets::for_tests::make_next_get_unavailable("OTHER_KEY_B");
+
+        let resp = reqwest::get(format!("{}/projects/one-proj/env?key=UNDECLARED_KEY_A", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 404, "a lookup of A must not read (and fail on) B");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("key_not_active")
+        );
+
+        let resp = reqwest::get(format!("{}/projects/one-proj/env?key=OTHER_KEY_B", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 503, "B's armed failure was untouched by the A lookup");
     }
 }

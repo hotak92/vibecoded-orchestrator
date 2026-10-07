@@ -74,6 +74,23 @@ NEGATIVE_TTL_CAP_S = 30
 #: neither ``os`` nor ``subprocess``.
 DEFAULT_SERVE_STALE_MAX_AGE_S = 6 * 3600
 
+#: How long a TRANSIENT failure (the hub answered 503 ``keychain_unavailable``:
+#: a keychain operation timed out, the key may well exist) is cached before the
+#: next request asks again. Matches the hub's ``Retry-After``. Deliberately not
+#: ``NEGATIVE_TTL_CAP_S``: that cap is for "no such key", and holding a busy
+#: keychain's answer for 30 s is what kept a brand-new key unservable (v0.2.102).
+TRANSIENT_RETRY_S = 2
+
+#: Class name of ``vco_lib.agent_secrets.KeychainUnavailable``. Matched by name
+#: across the exception's MRO rather than imported: the resolver is imported
+#: lazily (``_default_getter``) and tests inject their own getters.
+_KEYCHAIN_UNAVAILABLE_TYPE = "KeychainUnavailable"
+
+
+def _is_keychain_unavailable(exc: BaseException) -> bool:
+    """Is ``exc`` the resolver's TRANSIENT keychain-unavailability error?"""
+    return any(c.__name__ == _KEYCHAIN_UNAVAILABLE_TYPE for c in type(exc).__mro__)
+
 SecretGetter = Callable[..., str]
 
 #: Maps a project PATH (or id) to the hub's project id. Raises on every
@@ -107,6 +124,10 @@ class KeyResult:
     state: str = "missing"
     #: Which declared key name answered. Names are not secrets.
     resolved_from: Optional[str] = None
+    #: v0.2.102: the failure was TRANSIENT — the OS keychain was temporarily
+    #: unavailable (hub 503 ``keychain_unavailable``), so this is NOT a "no key"
+    #: answer. Cached for ``TRANSIENT_RETRY_S`` only, and never logged as a miss.
+    transient: bool = False
 
     def __repr__(self) -> str:  # pragma: no cover - exercised via assertions
         # Never let a value reach a traceback, a pytest diff or a log record
@@ -274,6 +295,8 @@ class VendorKeyResolver:
         #: storm rebuilt as a WARN storm, which is what issue 12 set out to
         #: stop.
         self._no_key_logged: set[str] = set()
+        #: v0.2.102: vendors whose TRANSIENT keychain-unavailable line was logged.
+        self._transient_logged: set[str] = set()
         self._serve_stale_max_age_s = max(1, int(serve_stale_max_age_s))
         self._scope_prober = scope_prober
         #: Resolves the DEFAULT scope when nothing is pinned. Memoized on
@@ -536,12 +559,14 @@ class VendorKeyResolver:
             self._serving_stale.clear()
             self._past_stale_bound.clear()
             self._no_key_logged.clear()
+            self._transient_logged.clear()
         else:
             self._cache.pop(vendor_id, None)
             self._last_good.pop(vendor_id, None)
             self._serving_stale.discard(vendor_id)
             self._past_stale_bound.discard(vendor_id)
             self._no_key_logged.discard(vendor_id)
+            self._transient_logged.discard(vendor_id)
 
     def _serve_stale(
         self, vendor: Vendor, now: float, *, fresh: KeyResult
@@ -618,6 +643,7 @@ class VendorKeyResolver:
         self._serving_stale.discard(vendor_id)
         self._past_stale_bound.discard(vendor_id)
         self._no_key_logged.discard(vendor_id)
+        self._transient_logged.discard(vendor_id)
         if recovered:
             logger.info(
                 "model-gateway: vendor %s key resolves again%s",
@@ -631,7 +657,12 @@ class VendorKeyResolver:
         now = self._clock()
         entry = self._cache.get(vendor.vendor_id)
         if entry is not None:
-            ttl = self._ttl_s if entry.result.key else min(self._ttl_s, NEGATIVE_TTL_CAP_S)
+            if entry.result.key:
+                ttl = self._ttl_s
+            elif entry.result.transient:
+                ttl = min(self._ttl_s, TRANSIENT_RETRY_S)
+            else:
+                ttl = min(self._ttl_s, NEGATIVE_TTL_CAP_S)
             if now - entry.fetched_at < ttl:
                 if entry.result.key:
                     return KeyResult(
@@ -706,10 +737,17 @@ class VendorKeyResolver:
         # keys in the same request answer from two different scopes.
         scope_arg = self.effective_project
         failures: list[str] = []
+        unavailable: list[str] = []
         for key_name in vendor.secret_keys:
             try:
                 value = getter(key_name, project=scope_arg)
             except Exception as exc:  # noqa: BLE001 — every resolver error is a miss
+                if _is_keychain_unavailable(exc):
+                    # v0.2.102: NOT a miss — the keychain could not be read
+                    # right now. The next name is still tried (it may live in
+                    # the file store), but a total failure is reported as
+                    # transient below, never as "no key found".
+                    unavailable.append(key_name)
                 # agent_secrets raises a family of typed errors (not found,
                 # access denied, hub unreachable, keychain locked). All of them
                 # mean "no key from this name"; the TYPE is preserved in the
@@ -732,6 +770,9 @@ class VendorKeyResolver:
                     resolved_from=key_name,
                 )
             failures.append(f"{key_name}: resolved but empty")
+
+        if unavailable:
+            return self._transient_result(vendor, unavailable, failures)
 
         scope = self.describe_scope()
         # The scope is diagnosed only HERE, on the miss: a resolution that
@@ -775,6 +816,32 @@ class VendorKeyResolver:
             )
         return KeyResult(problem=problem)
 
+    def _transient_result(
+        self, vendor: Vendor, unavailable: list[str], failures: list[str]
+    ) -> KeyResult:
+        """The answer for "the OS keychain was temporarily unavailable" (hub 503
+        ``keychain_unavailable``) — a retryable condition, not a missing key.
+        Logged once per vendor until it resolves again, like the miss line."""
+        if vendor.vendor_id not in self._transient_logged:
+            self._transient_logged.add(vendor.vendor_id)
+            logger.warning(
+                "model-gateway: vendor %s key: OS keychain temporarily unavailable "
+                "(a keychain operation timed out on the hub); retrying every %ds. "
+                "Said once per vendor until it resolves again.",
+                vendor.vendor_id,
+                TRANSIENT_RETRY_S,
+            )
+        return KeyResult(
+            problem=(
+                f"vendor {vendor.vendor_id!r} key: the OS keychain is temporarily "
+                f"unavailable — retrying (asked for "
+                f"{', '.join(repr(k) for k in unavailable)}; the hub's keychain "
+                "operation timed out, so the key may well exist). Retry the "
+                f"request in a few seconds. Resolver detail: {'; '.join(failures)}"
+            ),
+            transient=True,
+        )
+
 
 __all__ = [
     "DEFAULT_SERVE_STALE_MAX_AGE_S",
@@ -785,5 +852,6 @@ __all__ = [
     "ScopeProber",
     "ScopeStatus",
     "SecretGetter",
+    "TRANSIENT_RETRY_S",
     "VendorKeyResolver",
 ]

@@ -353,6 +353,27 @@ case "$unreadable_err" in
     *) assert_eq "1" "0" "test_vct_secrets_resolve_keychain_error_msg_is_honest (got: $unreadable_err)" ;;
 esac
 
+# ── Test 4d2 (v0.2.102): 503 keychain_unavailable → exit 6, "retry" msg ──
+# A keychain op timed out on the hub: same exit-6 family, but the message
+# says the keychain is TEMPORARILY unavailable and to retry — nothing to
+# unlock.
+cat >"$scratch/responses/GET_projects_p1_env_key=BUSY_KEY.json.status" <<'STATUS'
+503
+STATUS
+cat >"$scratch/responses/GET_projects_p1_env_key=BUSY_KEY.json" <<'JSON'
+{"error": {"code": "keychain_unavailable", "message": "timed out"}}
+JSON
+
+set +e
+busy_err=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 BUSY_KEY 2>&1 1>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "6" "test_vct_secrets_resolve_exits_6_when_keychain_unavailable"
+case "$busy_err" in
+    *"temporarily unavailable"*"retry"*) assert_eq "0" "0" "test_vct_secrets_resolve_keychain_unavailable_msg_says_retry" ;;
+    *) assert_eq "1" "0" "test_vct_secrets_resolve_keychain_unavailable_msg_says_retry (got: $busy_err)" ;;
+esac
+
 # ── Test 4e (v0.2.82 WP-4a): 503 keychain_locked still falls to store ───
 # The keychain is an INDEPENDENT store from ~/.vct-secrets, so a locked
 # keychain must NOT strand a file-store copy — tier 2 still answers (exit 0).

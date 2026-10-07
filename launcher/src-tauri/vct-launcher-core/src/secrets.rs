@@ -426,6 +426,15 @@ struct MemoEntry {
 #[derive(Default)]
 struct SessionState {
     memo: std::collections::HashMap<(String, String), MemoEntry>,
+    /// v0.2.102: set when a read in this session failed because the keychain
+    /// was UNAVAILABLE (worker busy / op timed out / backend stuck) rather
+    /// than erroring — lets the hub answer `keychain_unavailable` (retry)
+    /// instead of `keychain_error`, and never a `key_not_active` miss. A
+    /// boolean only: no key name, no value.
+    unavailable: bool,
+    /// v0.2.102: the request's one definite lock-probe answer, reused by every
+    /// Background read in the session.
+    lock_probe: Option<Option<bool>>,
 }
 
 thread_local! {
@@ -474,6 +483,13 @@ impl SecretReadSession {
         }
     }
 
+    /// v0.2.102: did any read in THIS thread's active session fail because the
+    /// keychain was unavailable (busy / timed out / stuck)? `false` when no
+    /// session is active.
+    pub fn saw_unavailable() -> bool {
+        SECRET_SESSION.with(|cell| cell.borrow().as_ref().is_some_and(|s| s.unavailable))
+    }
+
     /// Test-only: how many distinct `(service, key)` entries this thread's
     /// active session has memoized. `None` when no session is active.
     #[cfg(any(test, debug_assertions))]
@@ -497,6 +513,33 @@ impl Drop for SecretReadSession {
             *cell.borrow_mut() = self.prev.take();
         });
     }
+}
+
+/// Record that a read in the active session hit keychain UNAVAILABILITY. No-op
+/// without an active session.
+fn session_note_unavailable() {
+    SECRET_SESSION.with(|cell| {
+        if let Some(session) = cell.borrow_mut().as_mut() {
+            session.unavailable = true;
+        }
+    });
+}
+
+/// The active session's stored lock-probe answer, if any (`None` = no session
+/// or not probed yet).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn session_lock_probe_get() -> Option<Option<bool>> {
+    SECRET_SESSION.with(|cell| cell.borrow().as_ref().and_then(|s| s.lock_probe))
+}
+
+/// Remember the request's lock-probe answer. No-op without a session.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn session_lock_probe_put(answer: Option<bool>) {
+    SECRET_SESSION.with(|cell| {
+        if let Some(session) = cell.borrow_mut().as_mut() {
+            session.lock_probe = Some(answer);
+        }
+    });
 }
 
 /// Look up `(service, key)` in the active session's memo, if any. Returns
@@ -694,11 +737,60 @@ pub fn probe_default_collection_locked() -> Option<bool> {
     if for_tests::mock_is_active() {
         return Some(false);
     }
+    // v0.2.102: inside a `SecretReadSession` (one hub `/env` request) the lock
+    // state is probed ONCE and reused by every read of that request. Before,
+    // each Background read ran its own probe as a separate worker job — one
+    // probe per KEY, ahead of the per-request memo — half of the worker load
+    // behind the hub keychain storm. Outside a session nothing changes.
+    if let Some(answer) = session_lock_probe_get() {
+        return answer;
+    }
     // Run the D-Bus property read on the bounded-timeout worker: a wedged
     // Secret Service must not hang the probe. A timeout / worker-stuck →
-    // UNKNOWN (None), the conservative "proceed as today" default.
-    run_keychain_with_timeout(probe_default_collection_locked_blocking).unwrap_or(None)
+    // UNKNOWN (None), the conservative "proceed as today" default; only a
+    // definite answer is kept for the rest of the request.
+    let answer =
+        run_keychain_with_timeout(probe_default_collection_locked_blocking).unwrap_or(None);
+    if answer.is_some() {
+        session_lock_probe_put(answer);
+    }
+    answer
 }
+
+/// Test-only: replace the probe's D-Bus BODY (not the whole probe, unlike
+/// `TestProbeGuard`) so the session reuse and the worker path still run.
+#[cfg(all(target_os = "linux", any(test, debug_assertions)))]
+static TEST_PROBE_BODY_OVERRIDE: std::sync::Mutex<Option<Option<bool>>> =
+    std::sync::Mutex::new(None);
+
+/// RAII guard for [`TEST_PROBE_BODY_OVERRIDE`].
+#[cfg(all(target_os = "linux", any(test, debug_assertions)))]
+pub struct TestProbeBodyGuard {
+    prev: Option<Option<bool>>,
+}
+
+#[cfg(all(target_os = "linux", any(test, debug_assertions)))]
+impl TestProbeBodyGuard {
+    pub fn new(answer: Option<bool>) -> Self {
+        let mut slot = TEST_PROBE_BODY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = *slot;
+        *slot = Some(answer);
+        Self { prev }
+    }
+}
+
+#[cfg(all(target_os = "linux", any(test, debug_assertions)))]
+impl Drop for TestProbeBodyGuard {
+    fn drop(&mut self) {
+        *TEST_PROBE_BODY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) = self.prev;
+    }
+}
+
+/// Test-only: number of REAL lock probes run (probes that reached the
+/// worker). Lets a test prove N Background reads cost one probe, not N.
+#[cfg(any(test, debug_assertions))]
+pub static LOCK_PROBE_RUNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// The blocking body of the Linux lock probe (runs on the worker thread).
 /// Separated so the timeout wrapper stays thin and the D-Bus calls are all in
@@ -715,6 +807,15 @@ pub fn probe_default_collection_locked() -> Option<bool> {
 /// before.
 #[cfg(target_os = "linux")]
 fn probe_default_collection_locked_blocking() -> Option<bool> {
+    #[cfg(any(test, debug_assertions))]
+    LOCK_PROBE_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(any(test, debug_assertions))]
+    if let Some(forced) = *TEST_PROBE_BODY_OVERRIDE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+    {
+        return forced;
+    }
     // Preferred path: reuse the shared session. `Ok(Some/None)` is a definite
     // answer / UNKNOWN; `Err(_)` (shared connect or D-Bus failure) drops through
     // to the ephemeral fallback below.
@@ -1606,7 +1707,9 @@ mod cross_process_pace {
 /// wedged two processes indefinitely. What actually bounds the worker is the
 /// acquire deadline inside `cross_process_pace` (30s) plus, on Linux, the
 /// Secret-Service prompt bound (`SHARED_MAX_PROMPT_TIMEOUT_SECS`, 120s). The
-/// caller-side timeout only bounds the caller.
+/// caller-side timeout only bounds the caller. (v0.2.102: a job that does
+/// overrun no longer blocks the PROCESS — the next submission starts a fresh
+/// worker; see `submit_keychain_job`.)
 #[inline]
 fn with_cross_process_pace<T>(op: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
@@ -1651,47 +1754,66 @@ fn retry_with_backoff<T>(mut f: impl FnMut() -> keyring::Result<T>) -> keyring::
     Err(last_err.expect("loop runs at least once"))
 }
 
-// ─── Bounded-timeout execution primitive (v0.2.76 A4) ─────────────────────────
+// ─── Bounded keychain worker (v0.2.76 A4; busy-vs-stuck + recycle v0.2.102) ────
 //
 // The pacing/backoff layers above serialize and retry keychain calls, but the
-// underlying `keyring` op (`Entry::new` D-Bus negotiation, `set_password`,
-// `get_password`, `delete_credential`) can block UNBOUNDEDLY when the OS Secret
-// Service is slow or wedged (observed live: gnome-keyring hanging a keychain
-// call for 13+ minutes at ~0% CPU). A blocked op hangs whatever called it — the
-// hub `/env` value read, a launcher GUI keychain command, or a test — with no
-// timeout anywhere in the stack.
+// underlying op (`KeychainEntry::new` D-Bus negotiation, set / get / delete)
+// can block for a long time when the OS Secret Service is slow or wedged
+// (observed live: gnome-keyring hanging a call for 13+ minutes at ~0% CPU).
+// Every keychain op therefore runs on a dedicated worker thread fed by a
+// channel, and the caller waits on a result channel with a deadline.
 //
-// This primitive wraps keychain execution in a bounded timeout, running the op
-// on ONE dedicated long-lived worker thread fed by a request channel. Design
-// points:
+// v0.2.102 (hub keychain "wedge", 2026-10-07):
 //
-//   * ONE worker thread (not thread-per-op): a timed-out op leaves its job
-//     stuck ON THE WORKER; we do NOT spawn a fresh thread per call (that would
-//     leak one abandoned thread per timeout). Instead, while the worker is
-//     stuck the NEXT op fails FAST with a distinct "keychain worker stuck"
-//     error until the wedged op returns and the worker drains.
+//   * BUSY IS NOT STUCK. The pre-v0.2.102 admission check failed every caller
+//     FAST with "keychain worker stuck" whenever the worker was running ANY
+//     job. A healthy job holds the worker for ~150ms (the pacing gap), so two
+//     overlapping hub `/env` requests made one of them fail every key in ~1ms
+//     each — 17k+ "stuck" lines a day against a healthy Secret Service. Now a
+//     caller arriving while the worker is busy simply QUEUES and waits for its
+//     result, up to `KEYCHAIN_OP_TIMEOUT`.
+//   * A GENUINELY HUNG OP NO LONGER POISONS THE PROCESS. A job running longer
+//     than its stuck threshold (`KEYCHAIN_OP_TIMEOUT` for Background ops,
+//     `KEYCHAIN_INTERACTIVE_STUCK_AFTER` for ops that may sit on a user unlock
+//     prompt) makes the next submission abandon that worker — it exits once its
+//     op returns and its queue drains — and start a fresh one. Only ONE
+//     abandoned worker may be outstanding: while it is still hung, a second
+//     hang is reported as `WorkerStuck` instead of spawning yet another
+//     thread, so a permanent hang cannot leak threads. The replacement never
+//     waits on the persistent Secret-Service connection the hung op holds
+//     (`secrets_ss_connection::with_connection` falls back to a private
+//     session when the shared one stays held).
 //   * The timeout wraps OUTSIDE pacing/backoff (v0.2.72 P9 semantics
 //     unchanged) — the job closure IS the full retry_with_backoff call.
-//   * On timeout the caller gets an `Err`; every caller already handles `Err`
-//     (hub /env → key not served; GUI set → error toast; never a panic).
+//   * Every failure's `Display` is one of the deterministic strings
+//     [`is_keychain_unavailable_detail`] recognises, so consumers classify it
+//     as keychain UNAVAILABILITY (retry later) — never as a missing key.
 
-/// Per-op keychain timeout. Generous: a healthy Secret Service answers in
-/// milliseconds; the pacing + backoff worst case is ~1.45s, so 10s leaves
-/// ample headroom for a slow-but-alive daemon while still bounding a wedged
-/// one. A wedged daemon crosses this and the op fails loudly instead of
-/// hanging forever.
+/// Per-op keychain timeout: how long a caller waits for its result (queue wait
+/// included), and the stuck threshold for a Background op. A healthy Secret
+/// Service answers in milliseconds and the pacing + backoff worst case is
+/// ~1.45s, so 10s leaves ample headroom.
 const KEYCHAIN_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Error returned when a keychain op could not complete within the bound.
+/// Stuck threshold for an op that may legitimately wait on a human at an
+/// unlock prompt (Interactive set/get/delete, the canary probe). Exceeds the
+/// shared connection's 120s prompt bound so a person typing a passphrase is
+/// never treated as a hang (pinned by
+/// `interactive_stuck_threshold_outlasts_prompt_bound`).
+const KEYCHAIN_INTERACTIVE_STUCK_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(150);
+
+/// Error returned when a keychain op could not complete. Every variant means
+/// "the keychain is temporarily UNAVAILABLE", never "the key is absent".
 #[derive(Debug)]
 pub enum KeychainTimeout {
-    /// This op itself exceeded `KEYCHAIN_OP_TIMEOUT`.
+    /// No result within `KEYCHAIN_OP_TIMEOUT` (queue wait included).
     TimedOut,
-    /// A PRIOR op is still stuck on the worker (the Secret Service has not
-    /// unwedged); this op failed fast rather than queue behind it.
+    /// The running op is past its stuck threshold and an earlier abandoned
+    /// worker is still hung too, so no replacement can be started.
     WorkerStuck,
-    /// The worker thread/channel is unavailable (should not happen in
-    /// practice; treated conservatively as a failure).
+    /// The worker thread/channel is unavailable (spawn failure, or the job was
+    /// dropped). Treated conservatively as a failure.
     WorkerUnavailable,
 }
 
@@ -1702,11 +1824,11 @@ impl std::fmt::Display for KeychainTimeout {
                 f,
                 "keychain operation timed out — Secret Service unresponsive \
                  (exceeded {}s)",
-                KEYCHAIN_OP_TIMEOUT.as_secs()
+                current_keychain_timeout().as_secs()
             ),
             KeychainTimeout::WorkerStuck => write!(
                 f,
-                "keychain worker stuck — a prior keychain operation is still \
+                "keychain worker stuck — prior keychain operations are still \
                  blocked on an unresponsive Secret Service; try again once it \
                  recovers"
             ),
@@ -1717,78 +1839,175 @@ impl std::fmt::Display for KeychainTimeout {
     }
 }
 
+/// THE one predicate recognising a keychain-UNAVAILABILITY error detail — the
+/// deterministic `Display` strings of [`KeychainTimeout`], which `set_raw` /
+/// `get_with_context` / `delete_with_context` embed verbatim in their error
+/// details. No other error source produces these substrings, so a match is
+/// positive identification. Consumers: the hub's degraded classification and
+/// log level, `db::secret_active`, and (via `for_tests`) every
+/// keychain-touching test that skips on a slow daemon.
+pub fn is_keychain_unavailable_detail(e: &str) -> bool {
+    e.contains("keychain operation timed out")
+        || e.contains("keychain worker stuck")
+        || e.contains("keychain worker unavailable")
+}
+
 type KeychainJob = Box<dyn FnOnce() + Send + 'static>;
 
-/// Lazily-started worker: owns the single thread that actually touches the OS
-/// keychain. `in_flight` > 0 means a job is currently executing (possibly
-/// wedged); a new caller checks it to fast-fail rather than queue behind a
-/// stuck op.
-struct KeychainWorker {
-    tx: std::sync::mpsc::Sender<KeychainJob>,
-    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+struct QueuedJob {
+    run: KeychainJob,
+    stuck_after: std::time::Duration,
 }
 
-fn keychain_worker() -> &'static KeychainWorker {
-    use std::sync::OnceLock;
-    static WORKER: OnceLock<KeychainWorker> = OnceLock::new();
-    WORKER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<KeychainJob>();
-        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let worker_in_flight = in_flight.clone();
-        // Detached; lives for the process. A wedged op parks THIS thread (not a
-        // fresh one per call) until the daemon unwedges, then it drains the
-        // queue.
-        std::thread::Builder::new()
-            .name("vct-keychain-worker".into())
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    worker_in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    job();
-                    worker_in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            })
-            .expect("spawn keychain worker thread");
-        KeychainWorker { tx, in_flight }
-    })
+type RunningSlot = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, std::time::Duration)>>>;
+
+/// The live worker. `running` is `Some((start, stuck_after))` while a job
+/// executes; `abandoned` is set when a submission gives up on it.
+struct WorkerHandle {
+    tx: std::sync::mpsc::Sender<QueuedJob>,
+    running: RunningSlot,
+    abandoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Run a keychain op with a bounded timeout on the shared worker thread.
-///
-/// `f` is the full op INCLUDING pacing/backoff — the timeout wraps outside
-/// them (A4d). Returns `Ok(f())` when it completes within
-/// `KEYCHAIN_OP_TIMEOUT`; `Err(WorkerStuck)` immediately if a prior op is
-/// still blocked; `Err(TimedOut)` if this op exceeds the bound.
+static KEYCHAIN_WORKER: std::sync::Mutex<Option<WorkerHandle>> = std::sync::Mutex::new(None);
+/// `true` while an abandoned (hung) worker has not yet returned.
+static ABANDONED_WORKER_OUTSTANDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn spawn_keychain_worker() -> Option<WorkerHandle> {
+    use std::sync::atomic::Ordering;
+    let (tx, rx) = std::sync::mpsc::channel::<QueuedJob>();
+    let running: RunningSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let w_running = running.clone();
+    let w_abandoned = abandoned.clone();
+    let spawned = std::thread::Builder::new()
+        .name("vct-keychain-worker".into())
+        .spawn(move || {
+            // Runs until its sender is gone AND the queue is drained: the live
+            // worker's sender lives in KEYCHAIN_WORKER; an abandoned worker's
+            // sender was dropped at abandonment, so it finishes its (hung) op,
+            // runs what was already queued behind it, then exits.
+            while let Ok(job) = rx.recv() {
+                *w_running.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((std::time::Instant::now(), job.stuck_after));
+                // A panicking op must not kill the worker with `running` left
+                // set (that would read as a hang); its caller sees the dropped
+                // result channel as `WorkerUnavailable`.
+                let run = job.run;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+                *w_running.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
+            if w_abandoned.load(Ordering::SeqCst) {
+                ABANDONED_WORKER_OUTSTANDING.store(false, Ordering::SeqCst);
+                tracing::info!("[vct-secrets] the abandoned keychain worker's op returned; it exited");
+            }
+        });
+    match spawned {
+        Ok(_) => Some(WorkerHandle { tx, running, abandoned }),
+        Err(e) => {
+            tracing::warn!(error = %e, "[vct-secrets] could not spawn the keychain worker thread");
+            None
+        }
+    }
+}
+
+/// Hand `job` to the worker: replace a hung worker first if needed.
+fn submit_keychain_job(job: QueuedJob) -> Result<(), KeychainTimeout> {
+    use std::sync::atomic::Ordering;
+    let mut slot = KEYCHAIN_WORKER.lock().unwrap_or_else(|p| p.into_inner());
+    let hung_for = slot.as_ref().and_then(|h| {
+        let running = h.running.lock().unwrap_or_else(|p| p.into_inner());
+        running.and_then(|(start, stuck_after)| {
+            let age = start.elapsed();
+            (age >= stuck_after).then_some(age)
+        })
+    });
+    if let Some(age) = hung_for {
+        if ABANDONED_WORKER_OUTSTANDING.swap(true, Ordering::SeqCst) {
+            // An earlier abandoned worker is still hung as well: the backend is
+            // unresponsive. Do not spawn another thread.
+            return Err(KeychainTimeout::WorkerStuck);
+        }
+        if let Some(old) = slot.take() {
+            old.abandoned.store(true, Ordering::SeqCst);
+            tracing::warn!(
+                op_age_secs = age.as_secs(),
+                "[vct-secrets] keychain op hung past its stuck threshold — starting a \
+                 fresh keychain worker (the hung op finishes on its own thread)"
+            );
+            // `old` drops here → its sender closes, so it exits once drained.
+        }
+    }
+    if slot.is_none() {
+        *slot = spawn_keychain_worker();
+    }
+    let Some(handle) = slot.as_ref() else {
+        return Err(KeychainTimeout::WorkerUnavailable);
+    };
+    if handle.tx.send(job).is_err() {
+        // The worker thread is gone (should not happen — it only exits when its
+        // sender is dropped). Forget it so the next op respawns.
+        *slot = None;
+        return Err(KeychainTimeout::WorkerUnavailable);
+    }
+    Ok(())
+}
+
+/// Run a Background keychain op on the shared worker. See
+/// [`run_keychain_with_timeout_ctx`].
 pub(crate) fn run_keychain_with_timeout<T, F>(f: F) -> Result<T, KeychainTimeout>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    use std::sync::atomic::Ordering;
+    run_keychain_with_timeout_ctx(CallContext::Background, f)
+}
 
-    let worker = keychain_worker();
-    // Fast-fail if the worker is already busy on a (possibly wedged) prior op.
-    // Single-worker means a queued job would otherwise inherit the prior op's
-    // stall; failing fast keeps callers responsive until the daemon recovers.
-    if worker.in_flight.load(Ordering::SeqCst) > 0 {
-        return Err(KeychainTimeout::WorkerStuck);
-    }
+/// Run a keychain op on the shared worker with a bounded wait.
+///
+/// `f` is the full op INCLUDING pacing/backoff — the timeout wraps outside
+/// them (A4d). A busy worker means "wait in line", never an error. `ctx` only
+/// selects the stuck threshold used to decide whether a still-running op is
+/// hung (an Interactive op may sit on a user prompt). Returns `Ok(f())` on
+/// completion within `KEYCHAIN_OP_TIMEOUT`; `Err(TimedOut)` otherwise (the op
+/// is not cancelled — it completes on the worker and its result is dropped);
+/// `Err(WorkerStuck)` when the backend is unresponsive past one replacement.
+pub(crate) fn run_keychain_with_timeout_ctx<T, F>(
+    ctx: CallContext,
+    f: F,
+) -> Result<T, KeychainTimeout>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let op_timeout = current_keychain_timeout();
+    let stuck_after = match ctx {
+        CallContext::Background => op_timeout,
+        CallContext::Interactive => KEYCHAIN_INTERACTIVE_STUCK_AFTER.max(op_timeout),
+    };
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<T>(1);
-    let job: KeychainJob = Box::new(move || {
-        let value = f();
-        // Ignore send error: if the caller already timed out and dropped the
-        // receiver, the result is simply discarded.
-        let _ = result_tx.send(value);
-    });
-    if worker.tx.send(job).is_err() {
-        return Err(KeychainTimeout::WorkerUnavailable);
-    }
-    match result_rx.recv_timeout(current_keychain_timeout()) {
+    submit_keychain_job(QueuedJob {
+        run: Box::new(move || {
+            // Ignore send error: a caller that already gave up dropped the
+            // receiver, and the result is simply discarded.
+            let _ = result_tx.send(f());
+        }),
+        stuck_after,
+    })?;
+    match result_rx.recv_timeout(op_timeout) {
         Ok(value) => Ok(value),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(KeychainTimeout::TimedOut),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(KeychainTimeout::WorkerUnavailable)
         }
     }
+}
+
+/// Test/diagnostic: is an abandoned (hung) keychain worker still outstanding?
+#[cfg(any(test, debug_assertions))]
+pub fn abandoned_keychain_worker_outstanding() -> bool {
+    ABANDONED_WORKER_OUTSTANDING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -1837,14 +2056,19 @@ impl Drop for TestKeychainTimeoutGuard {
     }
 }
 
-/// ONE shared public probe: is the OS keychain backend reachable *and
+/// ONE shared probe for TESTS: is the OS keychain backend reachable *and
 /// responsive*? Writes + deletes a canary under a private namespace, bounded
 /// by the same timeout primitive (a wedged Secret Service → `false`, the
 /// conservative default). Replaces the three duplicated `keyring_available()`
-/// test copies (installer.rs / openai_cmd.rs / vct-hub modules_api.rs) and is
-/// safe to call from any crate that depends on vct-launcher-core.
+/// test copies (installer.rs / openai_cmd.rs / vct-hub modules_api.rs).
+///
+/// v0.2.102: this is NOT a production policy input any more. It WRITES to the
+/// keychain and it answers `false` whenever the worker is merely busy — which
+/// is how the hub's memoized "backend available" flag got pinned to `false`
+/// for a whole process (every degraded read then answered `key_not_active`).
+/// Production asks [`keychain_backend_available`], which is read-only.
 pub fn keyring_probe_available() -> bool {
-    run_keychain_with_timeout(|| {
+    run_keychain_with_timeout_ctx(CallContext::Interactive, || {
         // v0.3.0 (WP-K): the probe uses the SAME `KeychainEntry` primitive as
         // the real ops, so on Linux it exercises the persistent Secret-Service
         // connection (and reflects its reachability) rather than opening a
@@ -1862,16 +2086,21 @@ pub fn keyring_probe_available() -> bool {
     .unwrap_or(false)
 }
 
-// ─── Backend availability (v0.2.82 CI fix) ───────────────────────────────
+// ─── Backend availability (v0.2.82 CI fix; read-only + definite-only v0.2.102) ─
 //
-// "keychain_degraded" (hub /env → 503 `keychain_error`) means a keychain
-// that NORMALLY WORKS failed a read. On hosts with NO Secret Service
-// backend at all (headless CI, servers), every keychain read errors by
-// construction — that is not degradation, it is the pre-v0.2.82
-// no-keychain reality: consumers must fall through to the legacy miss path
-// (file store / `key_not_active`). Memoized once per process: backend
-// availability is a property of the host session, not of individual reads
-// (a daemon that dies mid-run is real degradation and stays reported).
+// "keychain_degraded" (hub /env → 503) means a keychain that NORMALLY WORKS
+// failed a read. On hosts with NO Secret Service backend at all (headless CI,
+// servers), every keychain read errors by construction — that is not
+// degradation, it is the pre-v0.2.82 no-keychain reality: consumers must fall
+// through to the legacy miss path (file store / `key_not_active`).
+//
+// v0.2.102: the answer comes from a READ-ONLY session-bus question (is
+// `org.freedesktop.secrets` owned or activatable?) — never a canary write, and
+// never routed through the keychain worker, so a busy worker cannot answer it.
+// Only a DEFINITE "no backend" is memoized for the process; "present" and
+// "could not tell" are re-asked each time and both count as available — the
+// conservative direction, because wrongly claiming "no backend" turns an
+// honest 503 into a false `key_not_active`.
 
 #[cfg(any(test, debug_assertions))]
 static TEST_BACKEND_AVAILABILITY_OVERRIDE: std::sync::Mutex<Option<bool>> =
@@ -1908,9 +2137,8 @@ impl Drop for TestBackendAvailabilityGuard {
     }
 }
 
-/// Whether this host has a WORKING keychain backend at all (memoized).
-/// See the module-section comment above for the degraded-vs-no-backend
-/// distinction this powers.
+/// Whether this host has a WORKING keychain backend at all. Read-only; only a
+/// definite "no backend" is memoized (see the section comment above).
 pub fn keychain_backend_available() -> bool {
     #[cfg(any(test, debug_assertions))]
     {
@@ -1921,8 +2149,122 @@ pub fn keychain_backend_available() -> bool {
             return v;
         }
     }
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(keyring_probe_available)
+    #[cfg(any(test, debug_assertions))]
+    {
+        let forced = *TEST_BACKEND_PRESENCE_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(presence) = forced {
+            // Policy exercised against a fixed probe answer, private memo.
+            return backend_availability_decision(&std::sync::OnceLock::new(), || presence);
+        }
+    }
+    static DEFINITELY_ABSENT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if DEFINITELY_ABSENT.get().is_some() {
+        return false;
+    }
+    backend_availability_decision(&DEFINITELY_ABSENT, backend_presence)
+}
+
+#[cfg(any(test, debug_assertions))]
+static TEST_BACKEND_PRESENCE_OVERRIDE: std::sync::Mutex<Option<BackendPresence>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only RAII guard fixing the read-only presence probe's answer (unlike
+/// [`TestBackendAvailabilityGuard`], the memo POLICY still runs).
+#[cfg(any(test, debug_assertions))]
+pub struct TestBackendPresenceGuard {
+    prev: Option<BackendPresence>,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl TestBackendPresenceGuard {
+    pub fn new(presence: BackendPresence) -> Self {
+        let mut slot = TEST_BACKEND_PRESENCE_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = *slot;
+        *slot = Some(presence);
+        Self { prev }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for TestBackendPresenceGuard {
+    fn drop(&mut self) {
+        *TEST_BACKEND_PRESENCE_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = self.prev;
+    }
+}
+
+/// Outcome of the read-only backend-presence question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendPresence {
+    /// The Secret Service name is owned or activatable on the session bus.
+    Present,
+    /// Definitely no backend: no session bus, or the bus answered and the name
+    /// is neither owned nor activatable.
+    Absent,
+    /// The question could not be answered (bus call failed / timed out).
+    Unknown,
+}
+
+/// The memo policy, separated from the probe so it is unit-testable: only
+/// `Absent` is recorded; `Present` and `Unknown` answer `true` unrecorded.
+pub fn backend_availability_decision(
+    memo: &std::sync::OnceLock<()>,
+    probe: impl FnOnce() -> BackendPresence,
+) -> bool {
+    match probe() {
+        BackendPresence::Absent => {
+            let _ = memo.set(());
+            false
+        }
+        BackendPresence::Present | BackendPresence::Unknown => true,
+    }
+}
+
+/// Read-only probe: ask the session bus whether `org.freedesktop.secrets` is
+/// owned (running) or activatable (starts on demand). Two plain bus-daemon
+/// method calls with a 2s timeout each — the Secret Service itself is never
+/// contacted, nothing is written, nothing can prompt.
+#[cfg(target_os = "linux")]
+fn backend_presence() -> BackendPresence {
+    use dbus::blocking::Connection;
+    const NAME: &str = "org.freedesktop.secrets";
+    let conn = match Connection::new_session() {
+        Ok(c) => c,
+        // No session bus at all (headless CI / server): definitely no backend.
+        Err(_) => return BackendPresence::Absent,
+    };
+    let bus = conn.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        std::time::Duration::from_secs(2),
+    );
+    let owned: Result<(bool,), dbus::Error> =
+        bus.method_call("org.freedesktop.DBus", "NameHasOwner", (NAME,));
+    let owned = match owned {
+        Ok((o,)) => o,
+        Err(_) => return BackendPresence::Unknown,
+    };
+    if owned {
+        return BackendPresence::Present;
+    }
+    let activatable: Result<(Vec<String>,), dbus::Error> =
+        bus.method_call("org.freedesktop.DBus", "ListActivatableNames", ());
+    match activatable {
+        Ok((names,)) if names.iter().any(|n| n == NAME) => BackendPresence::Present,
+        Ok(_) => BackendPresence::Absent,
+        Err(_) => BackendPresence::Unknown,
+    }
+}
+
+/// macOS / Windows always have their native keychain backend.
+#[cfg(not(target_os = "linux"))]
+fn backend_presence() -> BackendPresence {
+    BackendPresence::Present
 }
 
 // ─── Write chokepoint (v0.2.80 A4) ────────────────────────────────────────
@@ -2060,7 +2402,7 @@ fn set_raw(
     let service = scope.service_name(module_id);
     let key = key.to_string();
     let value = value.to_string();
-    run_keychain_with_timeout(move || {
+    run_keychain_with_timeout_ctx(ctx, move || {
         with_cross_process_pace(|| {
             // v0.2.72 (P9): build the entry INSIDE the closure so construction
             // shares the same paced_call + backoff as the op. v0.3.0 (WP-K): on
@@ -2165,7 +2507,14 @@ pub fn get_with_context(
     note_entry_construction();
     #[cfg(any(test, debug_assertions))]
     if let Some(result) = for_tests::mock_get(scope, module_id, key) {
-        let outcome = result.map_err(KeychainError::Other)?;
+        // v0.2.102: a mock error carrying an unavailability detail is
+        // classified exactly like the real worker path's (session flag set).
+        let outcome = result.map_err(|e| {
+            if is_keychain_unavailable_detail(&e) {
+                session_note_unavailable();
+            }
+            KeychainError::Other(e)
+        })?;
         // v0.2.84 (review F2): fire the mid-read hook AFTER the value has been
         // read but BEFORE the memo store — the exact TOCTOU window. A test
         // installs a hook that performs a concurrent `set`/`delete` (bumping the
@@ -2190,7 +2539,7 @@ pub fn get_with_context(
     let outcome = {
         let service = service.clone();
         let key = key.to_string();
-        run_keychain_with_timeout(move || {
+        run_keychain_with_timeout_ctx(ctx, move || {
             with_cross_process_pace(|| {
                 // v0.2.72 (P9): build the entry INSIDE the closure. v0.3.0
                 // (WP-K): `KeychainEntry` = persistent connection on Linux.
@@ -2201,7 +2550,13 @@ pub fn get_with_context(
                 }
             })
         })
-        .map_err(|to| KeychainError::Other(format!("keyring get: {}", to)))?
+        .map_err(|to| {
+            // v0.2.102: tell the active request session the keychain was
+            // UNAVAILABLE (busy / timed out / stuck) — the hub answers
+            // `keychain_unavailable` for it, never a miss.
+            session_note_unavailable();
+            KeychainError::Other(format!("keyring get: {}", to))
+        })?
         .map_err(KeychainError::Other)?
     };
     // v0.2.84 (review F2): mid-read hook, real-keychain path — same TOCTOU
@@ -2260,7 +2615,7 @@ pub fn delete_with_context(
     // worker. NoEntry (already gone) is treated as success INSIDE the job.
     let service = scope.service_name(module_id);
     let key = key.to_string();
-    run_keychain_with_timeout(move || {
+    run_keychain_with_timeout_ctx(ctx, move || {
         with_cross_process_pace(|| {
             // v0.2.72 (P9): build the entry INSIDE the closure. v0.3.0 (WP-K):
             // `KeychainEntry` = persistent connection on Linux.
@@ -2701,9 +3056,8 @@ pub mod for_tests {
     /// `commands::secrets_cmd` / `commands::dashboard` real-keychain
     /// tests, `vct-hub::modules_api` resolver tests.
     pub fn is_keychain_unavailable_err(e: &str) -> bool {
-        e.contains("keychain operation timed out")
-            || e.contains("keychain worker stuck")
-            || e.contains("keychain worker unavailable")
+        // v0.2.102: delegates to the production predicate (one home).
+        super::is_keychain_unavailable_detail(e)
     }
 
     // ─── Hermetic keychain namespace (2026-09-17) ────────────────────────
@@ -2856,6 +3210,12 @@ pub mod for_tests {
         static MOCK_FAIL_GET_KEYS: RefCell<HashSet<String>> =
             RefCell::new(HashSet::new());
 
+        // v0.2.102: keys whose next mock `get` fails as keychain
+        // UNAVAILABILITY (op timed out) — the hub `/env` `keychain_unavailable`
+        // (503) path. One-shot, consumed on fire.
+        static MOCK_UNAVAILABLE_GET_KEYS: RefCell<HashSet<String>> =
+            RefCell::new(HashSet::new());
+
         // v0.2.84 (review F2): a one-shot callback fired by `get_with_context`
         // in the TOCTOU window between its pre-read generation snapshot and the
         // memo store. A test installs a hook that performs a concurrent
@@ -2921,6 +3281,7 @@ pub mod for_tests {
         });
         MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
         MOCK_FAIL_GET_KEYS.with(|cell| cell.borrow_mut().clear());
+        MOCK_UNAVAILABLE_GET_KEYS.with(|cell| cell.borrow_mut().clear());
         // v0.2.84 (F2): drop any un-fired mid-read hook so it never leaks into
         // a subsequent mock session on this thread.
         MID_READ_HOOK.with(|cell| *cell.borrow_mut() = None);
@@ -2940,8 +3301,18 @@ pub mod for_tests {
         });
         MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
         MOCK_FAIL_GET_KEYS.with(|cell| cell.borrow_mut().clear());
+        MOCK_UNAVAILABLE_GET_KEYS.with(|cell| cell.borrow_mut().clear());
         // v0.2.84 (F2): also drop any pending mid-read hook.
         MID_READ_HOOK.with(|cell| *cell.borrow_mut() = None);
+    }
+
+    /// v0.2.102: register `key` so the **next** mock `secrets::get` targeting it
+    /// fails exactly as a real read does when the keychain is UNAVAILABLE (the
+    /// same `KeychainTimeout::TimedOut` detail, the same session flag). One-shot.
+    pub fn make_next_get_unavailable(key: &str) {
+        MOCK_UNAVAILABLE_GET_KEYS.with(|cell| {
+            cell.borrow_mut().insert(key.to_string());
+        });
     }
 
     /// Register `key` to make the **next** `secrets::get` (any context) targeting
@@ -3085,6 +3456,11 @@ pub mod for_tests {
             slot.as_ref().map(|map| {
                 // v0.2.82: injected one-shot read failure (models a transient
                 // daemon error mid-request, NOT a miss). Consumed on fire.
+                let unavailable =
+                    MOCK_UNAVAILABLE_GET_KEYS.with(|fc| fc.borrow_mut().remove(key));
+                if unavailable {
+                    return Err(format!("keyring get: {}", super::KeychainTimeout::TimedOut));
+                }
                 let should_fail = MOCK_FAIL_GET_KEYS.with(|fc| fc.borrow_mut().remove(key));
                 if should_fail {
                     return Err(format!(
@@ -3804,83 +4180,244 @@ mod tests {
         assert!(matches!(out, Ok(42)), "fast op must pass through: {:?}", out);
     }
 
-    /// ACT: a deliberately-blocking op times out within the (shortened) bound
-    /// and returns `TimedOut`; the NEXT op fast-fails `WorkerStuck` while the
-    /// prior job is still parked on the worker. Then the blocking op is
-    /// released so the worker drains (no cross-test pollution).
+    /// Blocking test op: parks until `release` fires (models a hung Secret
+    /// Service call) and returns `v`.
+    fn parked_op(
+        release: std::sync::mpsc::Receiver<()>,
+        v: i32,
+    ) -> impl FnOnce() -> i32 + Send + 'static {
+        let release = std::sync::Mutex::new(release);
+        move || {
+            let _ = release.lock().unwrap().recv();
+            v
+        }
+    }
+
+    /// Poll (bounded) until no abandoned worker is outstanding and a fresh op
+    /// passes — leaves the global worker clean for the next test.
+    fn wait_worker_recovered() {
+        for _ in 0..400 {
+            if !abandoned_keychain_worker_outstanding()
+                && run_keychain_with_timeout(|| ()).is_ok()
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("keychain worker did not recover");
+    }
+
+    /// v0.2.102 T1 — BUSY IS NOT STUCK (red-first: the pre-v0.2.102 admission
+    /// failed every caller that arrived while ANY job ran with `WorkerStuck`).
+    /// Eight concurrent callers, each op holding the worker ~30ms (the shape of
+    /// a paced healthy read): every one must succeed, in line.
     #[test]
-    fn keychain_timeout_blocks_then_worker_stuck_then_recovers() {
+    fn concurrent_healthy_callers_all_succeed() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    run_keychain_with_timeout(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        i
+                    })
+                })
+            })
+            .collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            let out = h.join().expect("caller thread");
+            assert!(
+                matches!(out, Ok(v) if v == i),
+                "concurrent caller {i} must wait its turn and succeed, got {out:?}"
+            );
+        }
+    }
+
+    /// v0.2.102 T2 — a GENUINELY hung op does not poison the process
+    /// (red-first: pre-v0.2.102 the next op failed `WorkerStuck` until the
+    /// hung op returned — possibly never). The hung op times out; the next op
+    /// starts a fresh worker and succeeds while the hung one is still parked.
+    #[test]
+    fn hung_op_starts_fresh_worker_and_next_op_succeeds() {
         let _lock = test_serialize::keychain_serialize_lock();
         let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(100));
-
-        // The blocking op parks on this channel until the test releases it.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let release_rx = std::sync::Mutex::new(release_rx);
 
-        let blocked = run_keychain_with_timeout(move || {
-            // Block until released — models a wedged Secret Service call.
-            let _ = release_rx.lock().unwrap().recv();
-            7
-        });
+        let blocked = run_keychain_with_timeout(parked_op(release_rx, 7));
         assert!(
             matches!(blocked, Err(KeychainTimeout::TimedOut)),
-            "blocking op must time out: {:?}",
-            blocked
+            "the hung op must time out: {blocked:?}"
         );
-
-        // The worker is still parked on the prior job → the next op fast-fails.
-        let stuck = run_keychain_with_timeout(|| 1);
+        // The caller's 100ms wait starts at submission, a hair before the job
+        // starts running; let the job's own age cross the threshold too.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let next = run_keychain_with_timeout(|| 99);
         assert!(
-            matches!(stuck, Err(KeychainTimeout::WorkerStuck)),
-            "a queued op must fast-fail while the worker is stuck: {:?}",
-            stuck
+            matches!(next, Ok(99)),
+            "the next op must run on a FRESH worker, not inherit the hang: {next:?}"
+        );
+        assert!(
+            abandoned_keychain_worker_outstanding(),
+            "the hung worker is abandoned (still parked), not reused"
         );
 
-        // Release the parked job; the worker drains and recovers.
         release_tx.send(()).unwrap();
-        // Poll until the worker is idle again (in_flight back to 0), then a
-        // fresh op must pass through. Bounded loop so a regression can't hang.
-        let mut recovered = false;
-        for _ in 0..200 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            if let Ok(v) = run_keychain_with_timeout(|| 99) {
-                assert_eq!(v, 99);
-                recovered = true;
-                break;
-            }
-        }
-        assert!(recovered, "worker must recover after the wedged op drains");
+        wait_worker_recovered();
+    }
+
+    /// v0.2.102 T3 — bounded: while one abandoned worker is still hung, a
+    /// SECOND hang is reported as `WorkerStuck` instead of spawning thread
+    /// after thread. Releasing both lets the process recover fully.
+    #[test]
+    fn second_hang_while_first_still_hung_reports_stuck_without_new_thread() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(100));
+        let (tx1, rx1) = std::sync::mpsc::channel::<()>();
+        let (tx2, rx2) = std::sync::mpsc::channel::<()>();
+
+        assert!(matches!(
+            run_keychain_with_timeout(parked_op(rx1, 1)),
+            Err(KeychainTimeout::TimedOut)
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Starts worker #2 (worker #1 abandoned), which then hangs as well.
+        assert!(matches!(
+            run_keychain_with_timeout(parked_op(rx2, 2)),
+            Err(KeychainTimeout::TimedOut)
+        ));
+        // Same as above: let the second hung job's age pass the threshold.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let third = run_keychain_with_timeout(|| 3);
+        assert!(
+            matches!(third, Err(KeychainTimeout::WorkerStuck)),
+            "a second hang while the first abandoned worker is still hung must be \
+             reported, not answered with yet another thread: {third:?}"
+        );
+        let detail = format!("keyring get: {}", KeychainTimeout::WorkerStuck);
+        assert!(is_keychain_unavailable_detail(&detail));
+
+        tx1.send(()).unwrap();
+        tx2.send(()).unwrap();
+        wait_worker_recovered();
     }
 
     /// The shared probe returns `false` (conservative default) when the
-    /// underlying op would exceed the bound — proven here by driving the
-    /// timeout primitive with a blocking closure under a short bound. (The
-    /// real `keyring_probe_available` uses the same primitive; we don't touch
-    /// the OS keychain in unit tests.)
+    /// underlying op exceeds the bound — driven by a blocking closure under a
+    /// short bound through the same primitive (no OS keychain touched).
     #[test]
     fn keychain_probe_timeout_is_false() {
         let _lock = test_serialize::keychain_serialize_lock();
         let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(80));
-
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = std::sync::Mutex::new(release_rx);
-
-        // Same shape as keyring_probe_available's body: op → bool, timeout → false.
         let probe = run_keychain_with_timeout(move || {
             let _ = release_rx.lock().unwrap().recv();
             true
         })
         .unwrap_or(false);
         assert!(!probe, "a probe that exceeds the bound must be false");
-
-        // Drain so the worker recovers for later tests.
         release_tx.send(()).unwrap();
-        for _ in 0..200 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            if run_keychain_with_timeout(|| ()).is_ok() {
-                break;
+        wait_worker_recovered();
+    }
+
+    /// v0.2.102 — an Interactive op may sit on a user unlock prompt for the
+    /// shared connection's prompt bound; it must never be treated as hung
+    /// before that bound expires.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_stuck_threshold_outlasts_prompt_bound() {
+        assert!(
+            KEYCHAIN_INTERACTIVE_STUCK_AFTER.as_secs()
+                > crate::secrets_ss_connection::SHARED_MAX_PROMPT_TIMEOUT_SECS,
+            "the Interactive stuck threshold must exceed the prompt bound"
+        );
+        assert!(KEYCHAIN_INTERACTIVE_STUCK_AFTER > KEYCHAIN_OP_TIMEOUT);
+    }
+
+    /// v0.2.102 T5 — the "has a keychain backend" memo records ONLY a definite
+    /// absence (red-first: pre-v0.2.102 a busy worker made the probe answer
+    /// `false`, memoized for the process, so every degraded read thereafter
+    /// answered `key_not_active`). Unknown and Present answer `true`, unmemoized.
+    #[test]
+    fn backend_availability_memoizes_only_definite_absence() {
+        let memo = std::sync::OnceLock::new();
+        assert!(backend_availability_decision(&memo, || BackendPresence::Unknown));
+        assert!(memo.get().is_none(), "a transient/unknown answer must never be memoized");
+        assert!(backend_availability_decision(&memo, || BackendPresence::Present));
+        assert!(memo.get().is_none(), "presence is re-asked, never pinned");
+        assert!(!backend_availability_decision(&memo, || BackendPresence::Absent));
+        assert!(memo.get().is_some(), "a definite absence is memoized");
+    }
+
+    /// v0.2.102 T5b — the backend check never touches the keychain worker or
+    /// writes a canary: it answers while the worker is parked on a hung op
+    /// (red-first: pre-v0.2.102 it went through the busy worker and got
+    /// `false`). With the presence probe overridden to Present, a hung worker
+    /// must not change the answer.
+    #[test]
+    fn backend_available_is_independent_of_a_busy_worker() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(100));
+        let _presence = TestBackendPresenceGuard::new(BackendPresence::Present);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::thread::spawn(move || run_keychain_with_timeout(parked_op(release_rx, 0)));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            keychain_backend_available(),
+            "a busy/hung worker must not make the host look keychain-less"
+        );
+        let _ = parked.join();
+        release_tx.send(()).unwrap();
+        wait_worker_recovered();
+    }
+
+    /// v0.2.102 T7 — inside one `SecretReadSession` (one hub request) the lock
+    /// state is probed ONCE, however many Background reads follow (red-first:
+    /// pre-v0.2.102 every read ran its own probe job). Outside a session each
+    /// call still probes (unchanged behaviour).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lock_state_probed_once_per_session() {
+        use std::sync::atomic::Ordering;
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _body = TestProbeBodyGuard::new(Some(false));
+        let base = LOCK_PROBE_RUNS.load(Ordering::SeqCst);
+        {
+            let _session = SecretReadSession::new();
+            for _ in 0..5 {
+                assert_eq!(probe_default_collection_locked(), Some(false));
             }
         }
+        assert_eq!(
+            LOCK_PROBE_RUNS.load(Ordering::SeqCst) - base,
+            1,
+            "five reads in one session must cost ONE lock probe"
+        );
+        let base = LOCK_PROBE_RUNS.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            assert_eq!(probe_default_collection_locked(), Some(false));
+        }
+        assert_eq!(LOCK_PROBE_RUNS.load(Ordering::SeqCst) - base, 3);
+    }
+
+    /// v0.2.102 — a mock read failing as UNAVAILABILITY flags the active
+    /// session (the hub turns that into 503 `keychain_unavailable`); an
+    /// ordinary read error does not.
+    #[test]
+    fn unavailable_read_flags_the_session_but_plain_error_does_not() {
+        let _g = for_tests::MockGuard::new();
+        {
+            let _session = SecretReadSession::new();
+            for_tests::fail_next_get("plain");
+            assert!(get_with_context(SecretScope::Global, "m", "plain", CallContext::Background).is_err());
+            assert!(!SecretReadSession::saw_unavailable());
+            for_tests::make_next_get_unavailable("busy");
+            let err = get_with_context(SecretScope::Global, "m", "busy", CallContext::Background)
+                .unwrap_err();
+            assert!(is_keychain_unavailable_detail(&err.to_string()));
+            assert!(SecretReadSession::saw_unavailable());
+        }
+        assert!(!SecretReadSession::saw_unavailable(), "no session → false");
     }
 
     /// K-2 STRUCTURAL PIN: the Background lock probe must route through the
