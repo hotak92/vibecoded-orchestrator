@@ -97,49 +97,94 @@ Write-Host "[launcher] post-install-launcher.ps1 (install root: $RepoRoot)"
 # ---------------------------------------------------------------------------
 # Locate the launcher binary
 # ---------------------------------------------------------------------------
-# First-match-wins probe. The CANONICAL binary the shortcut must point at is
-# launcher\dist\windows-x64\vct-launcher.exe — that is the exact binary the
-# launcher's own in-app restart (restart.rs::resolve_target_binary) ALWAYS
-# relaunches from, and the one install.py / _stage_built_binary_into_dist keep
-# fresh + version-stamped on every install/update. So dist (and the packaged
-# system-install slots) MUST be probed BEFORE the launcher\src-tauri\target\*
-# build artifacts. Otherwise a stale dev-build leftover (e.g. a months-old
-# target\debug\vct-launcher-temp.exe) wins the probe and the .lnk diverges from
-# what the app itself runs — the user opens an OLD binary with the old icon
-# while the launcher restarts into the fresh dist binary.
-#
-# This mirrors the bash sibling's metadata-first ordering (find_binary probes
-# the dist candidate before the hardcoded target/ ones). The target\release\
-# entries remain only as a fallback for an un-staged source checkout — a normal
-# install stages those into dist above, so they win only when dist is absent.
+# Selection rule (v0.2.102 S16-6 + M2) — ONE rule, stated identically in
+# scripts/post-install-launcher.sh (Step 2); keep the two headers in sync:
+#   1. The dist binary launcher\dist\windows-x64\vct-launcher.exe wins when
+#      it exists. That is the exact binary the launcher's own in-app restart
+#      (restart.rs::resolve_target_binary) ALWAYS relaunches from, and the
+#      one install.py / _stage_built_binary_into_dist keep fresh +
+#      version-stamped on every install/update — so the .lnk must point at
+#      it unless something is genuinely newer.
+#      (We don't re-run the staleness/source-hash check here —
+#      first-install.bat / install.py already ran it before invoking us.)
+#   2. A locally built binary (launcher\src-tauri\target\...) wins ONLY
+#      when it is NEWER than the dist binary (LastWriteTimeUtc) — or when
+#      no dist binary exists. A stale dev-build leftover (e.g. a
+#      months-old target\debug\vct-launcher-temp.exe) must never capture
+#      the .lnk while a fresh dist binary sits beside it.
+#   3. The chosen candidate and WHY are logged on one line.
+#   4. Packaged system installs (%LOCALAPPDATA%) are the last resort — the
+#      same tier the bash sibling's candidates_system holds.
 #
 # (v0.2.62: pre-fix the probe listed target\* before dist, so a stale
-# target\debug\vct-launcher-temp.exe on a dirty tree captured both shortcuts.)
-#
-# We don't do the staleness check here — first-install.bat / install.py
-# already ran it before invoking us; if a binary exists at this point
-# it's considered usable.
+# target\debug\vct-launcher-temp.exe on a dirty tree captured both shortcuts.
+# v0.2.102: the ordering became the shared mtime rule above instead of
+# first-match-wins.)
 
-$candidates = @(
-    # Canonical staged binary — matches restart.rs + the bash find_binary order.
+function Select-LauncherBinary {
+    <#
+        The Step-2 selection rule (see the header above). Returns the chosen
+        path, or $null when no candidate exists. The one-line reason goes to
+        the console (rule 3).
+    #>
+    param(
+        [string]$DistBin,
+        [string[]]$SystemBins,
+        [string[]]$LocalBins
+    )
+
+    $dist = if (Test-Path -Path $DistBin -PathType Leaf) { Get-Item -LiteralPath $DistBin } else { $null }
+    $local = $null
+    foreach ($c in $LocalBins) {
+        if (Test-Path -Path $c -PathType Leaf) {
+            $local = Get-Item -LiteralPath $c
+            break
+        }
+    }
+
+    if ($null -ne $dist) {
+        if ($null -ne $local -and $local.LastWriteTimeUtc -gt $dist.LastWriteTimeUtc) {
+            Write-Host "[launcher] Selected $($local.FullName) (local build is newer than the dist binary)"
+            return $local.FullName
+        }
+        Write-Host "[launcher] Selected $($dist.FullName) (bundled dist binary)"
+        return $dist.FullName
+    }
+    if ($null -ne $local) {
+        Write-Host "[launcher] Selected $($local.FullName) (no fresh bundled dist binary available)"
+        return $local.FullName
+    }
+    foreach ($s in $SystemBins) {
+        if (Test-Path -Path $s -PathType Leaf) {
+            Write-Host "[launcher] Selected $s (system install)"
+            return $s
+        }
+    }
+    return $null
+}
+
+$probedList = @(
     (Join-Path $RepoRoot 'launcher\dist\windows-x64\vct-launcher.exe'),
-    # Packaged system-install locations.
-    (Join-Path $env:LOCALAPPDATA 'Programs\VCT Launcher\vct-launcher.exe'),
-    (Join-Path $env:LOCALAPPDATA 'vct-launcher\vct-launcher.exe'),
-    # Contributor local builds (fallback — staged into dist on a real install).
     (Join-Path $RepoRoot 'launcher\src-tauri\target\release\vct-launcher.exe'),
     (Join-Path $RepoRoot 'launcher\src-tauri\target\release\vct-launcher-temp.exe'),
     (Join-Path $RepoRoot 'launcher\src-tauri\target\release\launcher.exe'),
-    (Join-Path $RepoRoot 'launcher\src-tauri\target\debug\vct-launcher-temp.exe')
+    (Join-Path $RepoRoot 'launcher\src-tauri\target\debug\vct-launcher-temp.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\VCT Launcher\vct-launcher.exe'),
+    (Join-Path $env:LOCALAPPDATA 'vct-launcher\vct-launcher.exe')
 )
 
-$LauncherBin = $null
-foreach ($cand in $candidates) {
-    if (Test-Path -Path $cand -PathType Leaf) {
-        $LauncherBin = $cand
-        break
-    }
-}
+$LauncherBin = Select-LauncherBinary `
+    -DistBin (Join-Path $RepoRoot 'launcher\dist\windows-x64\vct-launcher.exe') `
+    -SystemBins @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\VCT Launcher\vct-launcher.exe'),
+        (Join-Path $env:LOCALAPPDATA 'vct-launcher\vct-launcher.exe')
+    ) `
+    -LocalBins @(
+        (Join-Path $RepoRoot 'launcher\src-tauri\target\release\vct-launcher.exe'),
+        (Join-Path $RepoRoot 'launcher\src-tauri\target\release\vct-launcher-temp.exe'),
+        (Join-Path $RepoRoot 'launcher\src-tauri\target\release\launcher.exe'),
+        (Join-Path $RepoRoot 'launcher\src-tauri\target\debug\vct-launcher-temp.exe')
+    )
 
 if ([string]::IsNullOrEmpty($LauncherBin)) {
     # Soft-fail: log + exit 1. install.py logs the rc as non-fatal so
@@ -147,7 +192,7 @@ if ([string]::IsNullOrEmpty($LauncherBin)) {
     # find_binary fails.
     Write-Host "[launcher] No launcher binary found under $RepoRoot — skipping shortcut refresh." -ForegroundColor Yellow
     Write-Host "[launcher] Probed:"
-    foreach ($c in $candidates) { Write-Host "             $c" }
+    foreach ($c in $probedList) { Write-Host "             $c" }
     exit 1
 }
 

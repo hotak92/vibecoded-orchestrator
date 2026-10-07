@@ -148,13 +148,32 @@ fn containment_key(p: &str) -> String {
 /// Is `exe` located under `root` (or equal to it)? String-level so the
 /// Windows verbatim / UNC shapes are decidable on every host. MUST match the
 /// `containment` rows of `tests/fixtures/install_root_cases.json`.
+///
+/// v0.2.102 NB-R1: both sides are CANONICALISED first
+/// (`std::fs::canonicalize`, falling back to the raw string key when that
+/// fails — a nonexistent path, or one this process cannot resolve) so a
+/// symlinked root (POSIX) or a `subst` drive / 8.3 short name / junction
+/// (Windows) cannot make a contained exe read as OUTSIDE and refuse a
+/// legitimate self-update. The fixture rows use literal strings, and
+/// canonicalisation only ever resolves paths that exist, so those rows are
+/// unaffected.
 pub fn exe_is_inside(root: &Path, exe: &Path) -> bool {
-    let r = containment_key(&root.to_string_lossy());
-    let e = containment_key(&exe.to_string_lossy());
+    let r = canonical_containment_key(root);
+    let e = canonical_containment_key(exe);
     if r.is_empty() {
         return false;
     }
     e == r || e.starts_with(&format!("{}/", r.trim_end_matches('/')))
+}
+
+/// [`containment_key`] of `p`'s canonical form when `p` can be resolved,
+/// else of the raw string (see the NB-R1 note on [`exe_is_inside`]).
+fn canonical_containment_key(p: &Path) -> String {
+    containment_key(
+        &std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy(),
+    )
 }
 
 // ─── resolver ────────────────────────────────────────────────────────────
@@ -568,6 +587,85 @@ mod tests {
         assert_eq!(strip_windows_verbatim_prefix(r"\\?\C:\vco"), r"C:\vco");
         assert_eq!(strip_windows_verbatim_prefix(r"\\?\UNC\srv\share"), r"\\srv\share");
         assert_eq!(strip_windows_verbatim_prefix("/opt/vco"), "/opt/vco");
+    }
+
+    // ── v0.2.102 NB-R1: containment survives path indirection ──────────
+
+    /// A symlinked root must not hide a contained exe: the launcher binary
+    /// resolves through `$REPO_ROOT/launcher/dist/...` on plenty of installs
+    /// where the root itself is reached over a symlink. Pre-fix the raw
+    /// string keys differed and the exe read as OUTSIDE (self-update
+    /// refused). ACT half of the decision.
+    #[cfg(unix)]
+    #[test]
+    fn exe_under_a_symlinked_root_is_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("clone");
+        let exe = real.join("launcher").join("dist").join("linux-x64").join("vct-launcher");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        let link = tmp.path().join("link-to-clone");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            exe_is_inside(&link, &exe),
+            "a symlinked root must canonicalise before the containment comparison"
+        );
+        // The reverse shape too: the exe reached THROUGH the symlink, root
+        // named directly.
+        let exe_via_link = link.join("launcher").join("dist").join("linux-x64").join("vct-launcher");
+        assert!(exe_is_inside(&real, &exe_via_link));
+    }
+
+    /// LEAVE-ALONE half: an exe genuinely outside the clone stays outside,
+    /// symlinked root or not.
+    #[cfg(unix)]
+    #[test]
+    fn exe_outside_a_symlinked_root_stays_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("clone");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link-to-clone");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let exe = tmp.path().join("tmpbin").join("vct-launcher");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        assert!(!exe_is_inside(&link, &exe));
+        assert!(!exe_is_inside(&real, &exe));
+    }
+
+    /// Windows junction twin of the symlink test (compile/run on Windows
+    /// only — no CI job runs `cargo test` there today; see the
+    /// verification-status note in `vct-launcher-core/src/process.rs` for
+    /// the same caveat on another guard). A junction is the shape a `subst`
+    /// drive or a mapped network root produces.
+    #[cfg(windows)]
+    #[test]
+    fn exe_behind_a_junction_is_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("clone");
+        let exe = real.join("launcher").join("dist").join("windows-x64").join("vct-launcher.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"MZ").unwrap();
+        let junction = tmp.path().join("link-to-clone");
+        let st = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &junction.to_string_lossy(),
+                &real.to_string_lossy(),
+            ])
+            .status()
+            .expect("spawn cmd for mklink /J");
+        assert!(st.success(), "mklink /J failed (junction creation requires no elevation)");
+        assert!(
+            exe_is_inside(&junction, &exe),
+            "a junction root must canonicalise before the containment comparison"
+        );
+        let outside = tmp.path().join("tmpbin").join("vct-launcher.exe");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"MZ").unwrap();
+        assert!(!exe_is_inside(&junction, &outside));
     }
 
     // ── store-level behaviour (standby / cache write) ──────────────────

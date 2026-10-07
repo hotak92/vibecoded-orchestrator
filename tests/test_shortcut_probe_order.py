@@ -23,7 +23,13 @@ The invariant these tests pin:
   * The canonical dist binary (`launcher\\dist\\windows-x64\\vct-launcher.exe`)
     — the exact path `restart.rs` and `_stage_built_binary_into_dist` treat as
     authoritative — must be probed before ANY `target\\` candidate in the
-    post-install `.ps1` (no staleness check there; dist is freshly staged).
+    post-install `.ps1`. Since v0.2.102 (S16-6 + M2) the .ps1 selects via
+    `Select-LauncherBinary` (dist passed as `-DistBin`, local builds as
+    `-LocalBins`, a local build winning only when strictly newer by mtime —
+    pinned behaviourally by `tests/test_v02102_shortcut_discovery.py` where
+    pwsh exists); the static assertion here pins the source-level shape on
+    runners without pwsh: the `-DistBin` parameter and the dist-first
+    `$probedList` order.
   * In `first-install.bat` (which keeps a contributor's `target\\release\\`
     build ahead of the bundled dist binary on purpose), the *debug* candidate
     is demoted below dist: a debug build must never outrank the dist binary.
@@ -58,7 +64,12 @@ def _first_index(lines: list[str], needle: str) -> int:
 
 
 def _ps1_candidate_block(text: str) -> list[str]:
-    """Return the lines of the `$candidates = @( ... )` array, in order.
+    """Return the lines of the `$probedList = @( ... )` array, in order.
+
+    v0.2.102: the old first-match-wins `$candidates` block became the
+    `Select-LauncherBinary` call; `$probedList` is its miss-message echo and
+    keeps the canonical order (dist, then every `target\\` artifact, then the
+    packaged system installs).
 
     Line-based (not a single regex): each candidate is a `(Join-Path ...)`
     expression whose own `)` would terminate a non-greedy match prematurely,
@@ -68,23 +79,34 @@ def _ps1_candidate_block(text: str) -> list[str]:
     lines = text.splitlines()
     start = None
     for i, line in enumerate(lines):
-        if re.search(r"\$candidates\s*=\s*@\(", line):
+        if re.search(r"\$probedList\s*=\s*@\(", line):
             start = i + 1
             break
     assert start is not None, (
-        "could not locate the $candidates = @( ... ) block in post-install-launcher.ps1"
+        "could not locate the $probedList = @( ... ) block in post-install-launcher.ps1"
     )
     block: list[str] = []
     for line in lines[start:]:
         if line.strip() == ")":
             return block
         block.append(line)
-    raise AssertionError("unterminated $candidates = @( ... ) block")
+    raise AssertionError("unterminated $probedList = @( ... ) block")
 
 
 @pytest.mark.skipif(not PS1.exists(), reason="post-install-launcher.ps1 missing")
 def test_ps1_probes_dist_before_any_target() -> None:
-    block = _ps1_candidate_block(PS1.read_text(encoding="utf-8"))
+    text = PS1.read_text(encoding="utf-8")
+    block = _ps1_candidate_block(text)
+
+    # The v0.2.102 selection surface itself must exist: dist is a dedicated
+    # parameter, never one entry among the local build artifacts.
+    assert "function Select-LauncherBinary" in text, (
+        "post-install-launcher.ps1 lost Select-LauncherBinary — the v0.2.102 "
+        "selection rule (dist first, local wins only by mtime) must keep one home"
+    )
+    assert re.search(r"-DistBin \(Join-Path \$RepoRoot 'launcher\\dist\\windows-x64\\vct-launcher\.exe'\)", text), (
+        "the -DistBin parameter must be the canonical dist path"
+    )
 
     dist_idx = _first_index(block, DIST)
     debug_idx = _first_index(block, DEBUG_TEMP)
