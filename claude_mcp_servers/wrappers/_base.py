@@ -80,11 +80,12 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypeAlias
 
 import aiohttp
 
@@ -271,9 +272,23 @@ class WrapperMCP:
     async def run(self) -> None:
         """Spawn the upstream and pump stdio.
 
-        Runs forever until the upstream exits or our parent stdin
-        closes (Claude disconnected). Clean shutdown: closes the
-        upstream subprocess and the aiohttp session before returning.
+        Runs forever until the upstream exits, our parent stdin closes
+        (Claude disconnected), or we receive SIGTERM. Clean shutdown on
+        every one of those paths: terminates the upstream subprocess
+        (SIGTERM, then SIGKILL after 3 s) and closes the aiohttp session
+        before returning.
+
+        SIGTERM forwarding (POSIX): a SIGTERM to the wrapper — e.g. the
+        launcher's pre-update MCP kill sweep, which matches
+        ``python -m claude_mcp_servers.wrappers.*`` but not the upstream
+        it hosts — would otherwise take Python's default action and kill
+        the wrapper WITHOUT running the reaping ``finally`` below,
+        orphaning the upstream (which then only exits if it notices stdin
+        EOF). The handler installed here cancels this coroutine instead,
+        so the ``finally`` terminates the upstream, and ``run`` returns
+        normally. Windows has no SIGTERM to deliver (the sweep tree-kills
+        there), and ``add_signal_handler`` is unavailable on its event
+        loop, so the handler is skipped.
         """
         proc = await asyncio.create_subprocess_exec(
             *self.upstream_argv,
@@ -287,41 +302,90 @@ class WrapperMCP:
             self.mcp_name, proc.pid, self.upstream_argv,
         )
 
-        # Three concurrent pumps: stdin→upstream, upstream→stdout, stderr→stderr.
-        # gather() returns when ALL exit; we cancel siblings on first exit
-        # so a half-broken upstream tears down cleanly.
-        try:
-            done, pending = await asyncio.wait(
-                {
-                    asyncio.create_task(self._pump_client_to_upstream(proc)),
-                    asyncio.create_task(self._pump_upstream_to_client(proc)),
-                    asyncio.create_task(self._pump_stderr(proc)),
-                },
-                return_when=asyncio.FIRST_COMPLETED,
+        sigterm_received = False
+        # Set once the reaping ``finally`` starts. The handler stays installed
+        # through the reap (removed only at its end) so a SECOND SIGTERM cannot
+        # take the default action mid-reap and orphan the upstream; while
+        # reaping it only records the signal — cancelling would interrupt the
+        # reap's own awaits.
+        reaping = False
+        loop = asyncio.get_running_loop()
+        run_task = asyncio.current_task()
+
+        def _on_sigterm() -> None:
+            nonlocal sigterm_received
+            if reaping or sigterm_received:
+                sigterm_received = True
+                logger.info(
+                    "wrapper(%s): SIGTERM while already terminating upstream "
+                    "pid=%s — reap in progress",
+                    self.mcp_name, proc.pid,
+                )
+                return
+            sigterm_received = True
+            logger.info(
+                "wrapper(%s): SIGTERM — terminating upstream pid=%s",
+                self.mcp_name, proc.pid,
             )
+            if run_task is not None:
+                run_task.cancel()
+
+        sigterm_installed = False
+        try:
+            loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+            sigterm_installed = True
+        except (NotImplementedError, AttributeError, RuntimeError, ValueError):
+            # Windows event loops have no add_signal_handler (and no
+            # SIGTERM delivery); a non-main thread cannot install one.
+            pass
+
+        # Three concurrent pumps: stdin→upstream, upstream→stdout, stderr→stderr.
+        # We cancel siblings on first exit so a half-broken upstream tears
+        # down cleanly; on SIGTERM all three are cancelled.
+        pumps = {
+            asyncio.create_task(self._pump_client_to_upstream(proc)),
+            asyncio.create_task(self._pump_upstream_to_client(proc)),
+            asyncio.create_task(self._pump_stderr(proc)),
+        }
+        try:
+            try:
+                await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                if not sigterm_received:
+                    raise
+                # The cancellation was OUR SIGTERM handler's: consume it so
+                # the draining and reaping awaits below run uninterrupted.
+                if run_task is not None:
+                    run_task.uncancel()
+            pending = [t for t in pumps if not t.done()]
             for t in pending:
                 t.cancel()
             # Drain any remaining cancellations cleanly.
             await asyncio.gather(*pending, return_exceptions=True)
         finally:
-            # Reap the upstream subprocess.
-            if proc.returncode is None:
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=3.0)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-            if self._http_session is not None:
-                await self._http_session.close()
-                self._http_session = None
-            logger.info(
-                "wrapper(%s): upstream exited rc=%s",
-                self.mcp_name, proc.returncode,
-            )
+            reaping = True
+            try:
+                # Reap the upstream subprocess.
+                if proc.returncode is None:
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=3.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                if self._http_session is not None:
+                    await self._http_session.close()
+                    self._http_session = None
+                logger.info(
+                    "wrapper(%s): upstream exited rc=%s",
+                    self.mcp_name, proc.returncode,
+                )
+            finally:
+                if sigterm_installed:
+                    loop.remove_signal_handler(signal.SIGTERM)
 
     # ─── Stdio pumps ─────────────────────────────────────────────────
 
@@ -979,7 +1043,7 @@ class _ThreadedStdinReader:
 # Type alias for the union — the caller treats both as "a thing with
 # an async readline returning bytes". Either backend's interface is
 # minimal enough that a Protocol/ABC would be overkill.
-_StdinReader = "_StreamReaderWrapper | _ThreadedStdinReader"
+_StdinReader: TypeAlias = "_StreamReaderWrapper | _ThreadedStdinReader"
 
 
 __all__ = [
