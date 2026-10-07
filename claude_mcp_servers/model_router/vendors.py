@@ -787,12 +787,75 @@ def vendor_display_name(vendor: Vendor) -> str:
     return trimmed or vendor.vendor_id
 
 
+@dataclass(frozen=True)
+class FallbackRung:
+    """One edge of the owner's model-fallback ladder (OD-9, v0.2.102 A4/F2).
+
+    A rung names WHERE a qualifying quota refusal escalates TO, never the
+    condition (the trigger lives in ``model_router.server`` beside the quota
+    classifier it reads). Data, like every vendor fact, so the ladder is a
+    table edit rather than a code change.
+
+    Attributes:
+        from_vendor_id: the route being left. ``""`` names the FIRST-PARTY
+            Claude route, whose rung is keyed on a model MARKER rather than an
+            exact id (any haiku-slot id), because the client spells that slot
+            with whatever generation it ships.
+        from_model: the exact model id of the route being left (matched
+            case-insensitively); on the first-party rung, a SUBSTRING marker
+            matched against the forwarded id.
+        to_vendor_id: the registry key of the rung's upstream.
+        to_model_id: the bare id the rung forwards. MUST be an id its vendor
+            row is known to serve (``verified_ids``/``static_ids``) — a
+            fallback to an id the router would refuse is a ladder that ends in
+            a local 400 instead of an answer.
+    """
+
+    from_vendor_id: str
+    from_model: str
+    to_vendor_id: str
+    to_model_id: str
+
+
+#: The owner's fallback ladder (OD-9, 2026-10-07): a Claude haiku-slot request
+#: whose first-party answer is a qualifying 429 escalates to glm-5.3-flash on
+#: the z.ai subscription; a z.ai quota verdict on that rung escalates to
+#: qwen3.8-flash on QwenCloud — the vendor→vendor edge walked only by an
+#: attempt that ARRIVED at its rung by fallback (batch-6 B-1, coordinator
+#: 2026-10-07; a user-picked vendor model keeps its own refusal). The last
+#: rung has no entry, so its refusal IS
+#: the client's answer — the ladder never fabricates a success. Read by
+#: :func:`model_router.routing.fallback_route`, the vendor-neutral half; the
+#: trigger (which refusals qualify) is OD-9, implemented in
+#: ``model_router.server``. The haiku slot is where the incident bit
+#: (P299:106/:406): a first-party 429 rendered as a bare "Claude API Error"
+#: toast and the session sat idle while two healthy subscriptions served
+#: nothing. Ollama and OpenAI routes are untouched — none ship, and the ladder
+#: adds none.
+FALLBACK_LADDER: tuple[FallbackRung, ...] = (
+    FallbackRung(
+        from_vendor_id="",
+        from_model="haiku",
+        to_vendor_id="zai",
+        to_model_id="glm-5.3-flash",
+    ),
+    FallbackRung(
+        from_vendor_id="zai",
+        from_model="glm-5.3-flash",
+        to_vendor_id="qwen",
+        to_model_id="qwen3.8-flash",
+    ),
+)
+
+
 __all__ = [
     "ANTHROPIC_FAMILY",
     "AnthropicFamily",
     "CLAUDE_ID_MARKERS",
     "CONTEXT_OVERFLOW_MAX_RE",
     "DEFAULT_ANTHROPIC_VERSION",
+    "FALLBACK_LADDER",
+    "FallbackRung",
     "GATEWAY_NAMESPACE",
     "OAUTH_BETA",
     "RegistryError",

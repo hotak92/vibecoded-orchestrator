@@ -52,7 +52,12 @@ Every vendor measured either ignores it (z.ai: probe-identical at 512 and 8192
 — ``zai-budget-{512,8192}.body``) or deprecates it in favour of
 ``output_config.effort`` (QwenCloud, DeepSeek). None REJECTS it, so there is
 no failure to prevent and no honest integer→integer mapping to apply; the
-gateway leaves it exactly as the client sent it.
+gateway leaves it exactly as the client sent it. The OTHER per-row thinking
+knob, ``thinking.clear_thinking`` (v0.2.102 A8), is a different mechanism
+with a different home: a cited per-row SEED field read by
+:meth:`model_router.context_table.ContextTable.clear_thinking` and applied in
+``server.py`` (:func:`model_router.server._apply_clear_thinking`) — it shapes
+the param, it does not translate a value.
 
 Vendor-doc backing (re-checked 2026-10-03/04; the URL is cited per row):
 
