@@ -43,17 +43,21 @@ from __future__ import annotations
 #: orphan-cleaned on the next bundle update (modified copies are kept).
 #:
 #: v0.2.102: the kimi-vendor block (Kimi K3, `claude-gw/kimi/k3[1m]`) adds an
-#: implementer and a reviewer — ten definitions. Every gated definition also
-#: passes the per-vendor key leg (`module_gated_delivery.select_gateway_agents`);
-#: the suite's conftest answers "every key resolves" unless a test says
-#: otherwise.
+#: implementer and a reviewer, and the owner effort rulings add the
+#: high-effort siblings `glm-implementer-high` (z.ai) and
+#: `qwen-implementer-high` (qwen vendor, run by QwenCloud at its xhigh tier)
+#: — twelve definitions. Every gated definition also passes the per-vendor
+#: key leg (`module_gated_delivery.select_gateway_agents`); the suite's
+#: conftest answers "every key resolves" unless a test says otherwise.
 MODULE_GATEWAY_AGENT_FILES: tuple[str, ...] = (
     "glm-implementer.md",
+    "glm-implementer-high.md",
     "glm-reviewer.md",
     "glm-planner.md",
     "glm-flash-researcher.md",
     "deepseek-implementer.md",
     "qwen-implementer.md",
+    "qwen-implementer-high.md",
     "deepseek-researcher.md",
     "qwen-flash-sweeper.md",
     "kimi-implementer.md",

@@ -39,6 +39,14 @@ VALID_EFFORTS = {"low", "medium", "high"}
 # roles only).  Keyed by frontmatter `name`, value = reason it stays at high.
 AGENTS_ALLOWED_HIGH: dict[str, str] = {
     "sre-incident-responder": "live-incident debugging under time pressure",
+    # Owner effort rulings 2026-10-07 (v0.2.102)
+    "glm-implementer-high": (
+        "the high-effort sibling for the most difficult bounded implementations"
+    ),
+    "qwen-implementer-high": (
+        "high-effort sibling for reviews and the most difficult implementations"
+    ),
+    "glm-reviewer": "THE substantive review lane on real diffs (owner 2026-10-07)",
 }
 
 # Skills deliberately kept at the `high` ceiling.  Keyed by skill dir name.

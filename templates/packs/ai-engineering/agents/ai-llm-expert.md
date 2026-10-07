@@ -6,6 +6,7 @@ keywords: ["prompt caching", "context window", "multi-model routing", "optimize 
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: medium
+isolation: worktree
 disallowedTools: mcp__vct-coordination__*
 ---
 

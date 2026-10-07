@@ -605,11 +605,13 @@ def test_shipped_gateway_agents_pin_to_the_router_namespace():
     # existed in this test turns red instead of shipping a dead id.
     lanes = {
         "glm-implementer.md": ("zai", "glm-5.3"),
+        "glm-implementer-high.md": ("zai", "glm-5.3"),
         "glm-reviewer.md": ("zai", "glm-5.3"),
         "glm-planner.md": ("zai", "glm-5.3"),
         "glm-flash-researcher.md": ("zai", "glm-5.3-flash"),
         "deepseek-implementer.md": ("qwen", "deepseek-v4.1-flash"),
         "qwen-implementer.md": ("qwen", "qwen3.8-max"),
+        "qwen-implementer-high.md": ("qwen", "qwen3.8-max"),
         "deepseek-researcher.md": ("qwen", "deepseek-v4.1-flash"),
         "qwen-flash-sweeper.md": ("qwen", "qwen3.8-flash"),
         "kimi-implementer.md": ("kimi", "k3"),

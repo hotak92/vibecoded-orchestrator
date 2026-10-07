@@ -19,7 +19,7 @@ and the REAL bundle engine:
 * a retired definition is orphan-removed on a decisive run (F-W1-18) and
   carried forward on an undecidable one;
 * the machine signal's own legs (registration x panel, tri-state);
-* the shipped set is EXACTLY the owner's ten, and every ``model:`` id is one
+* the shipped set is EXACTLY the owner's twelve, and every ``model:`` id is one
   the gateway registry routes and knows (F-W1-11a / F-W1-17);
 * the hand-written-definition check names the closest valid ids.
 
@@ -65,11 +65,13 @@ UUID = "0f1e2d3c-4b5a-6978-8976-a5b4c3d2e1f0"
 #: ``deepseek-researcher`` and ``qwen-flash-implementer`` into
 #: ``qwen-flash-sweeper``): z.ai implementer/reviewer/planner/flash-researcher
 #: and the four qwen-provider lanes. NO flash reviewer on either provider.
-#: v0.2.102 adds the kimi-vendor implementer + reviewer: ten.
+#: v0.2.102 adds the kimi-vendor implementer + reviewer, and the owner effort
+#: rulings (2026-10-07) the high-effort implementer siblings: twelve.
 OWNER_SHIPPED_SET = frozenset({
-    "glm-implementer.md", "glm-reviewer.md", "glm-planner.md",
+    "glm-implementer.md", "glm-implementer-high.md",
+    "glm-reviewer.md", "glm-planner.md",
     "glm-flash-researcher.md",
-    "qwen-implementer.md",
+    "qwen-implementer.md", "qwen-implementer-high.md",
     "qwen-flash-sweeper.md",
     "deepseek-implementer.md", "deepseek-researcher.md",
     "kimi-implementer.md", "kimi-reviewer.md",
@@ -256,7 +258,7 @@ class GateVerdictTableTests(_Env):
 
 
 class BundleDeliveryTests(_Env):
-    def test_configured_machine_no_row_delivers_all_ten_to_a_project(self) -> None:
+    def test_configured_machine_no_row_delivers_all_twelve_to_a_project(self) -> None:
         self.db()
         with _patch_signal(True):
             self.install()
@@ -659,11 +661,11 @@ class VendorKeyLegTests(_Env):
 
 
 class ShippedDefinitionContractTests(unittest.TestCase):
-    def test_the_shipped_set_is_exactly_the_owners_ten(self) -> None:
+    def test_the_shipped_set_is_exactly_the_owners_twelve(self) -> None:
         shipped = {p.name for p in GATED_SRC.iterdir() if p.is_file()}
         self.assertEqual(shipped, OWNER_SHIPPED_SET,
                          "templates/agents/module-gateway/ must hold exactly the "
-                         "owner's ten definitions (no flash reviewer, no strays)")
+                         "owner's twelve definitions (no flash reviewer, no strays)")
         self.assertEqual(set(MODULE_GATEWAY_AGENT_FILES), OWNER_SHIPPED_SET)
 
     def test_every_model_id_routes_and_is_known_to_the_registry(self) -> None:

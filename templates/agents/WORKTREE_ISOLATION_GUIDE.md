@@ -25,13 +25,28 @@ Enable on agents that write source code:
 - `code-migrator` (migration pack) — cross-language rewrites
 - `agent-author` — hooks/scripts/automation, agent/skill definitions
 - `sre-incident-responder`, `postmortem-author` (ops-sre pack) — long-form artifacts drafted from live-incident state
+- `gui-expert` (design-ux pack) — designs AND implements Gradio applications
+- `ai-llm-expert` (ai-engineering pack) — designs AND implements production LLM integrations
+- `glm-implementer`, `glm-implementer-high`, `qwen-implementer`, `qwen-implementer-high`, `deepseek-implementer`, `kimi-implementer` (gateway module) — bounded, fully-specified code-fix lanes
+- `qwen-flash-sweeper` (gateway module) — fully-specified mechanical edits across named files
 
-NOT enabled (read-only or advisory agents):
+NOT enabled (read-only or advisory agents). By rule: an agent whose only writes are report, spec or artifact documents — never source or config — is exempt; this list names every current exemption, and the frontmatter test in `tests/test_v02100_shipped_frontmatter_parses.py` holds the same set over write-capable agents (read-only agents such as `code-reviewer` have no Write/Edit tools and need no exemption):
 - `planner` — planning only
-- `code-reviewer`, `code-explorer` — read-only research/review
+- `code-reviewer`, `code-explorer` — read-only research/review (`code-explorer` writes only its report file)
 - `tester` — writes tests but low risk (tests go in tests/)
 - `doc-maintainer` — documentation
 - `kg-maintainer` — knowledge graph read/write to isolated state
+- `web-explorer` — research that ends in one written report
+- `gui-tester` — screenshots and structured reports, no source edits
+- `deepseek-researcher`, `glm-flash-researcher` (gateway module) — report-only research lanes
+- `glm-planner` (gateway module) — planning/report-only lane
+- `glm-reviewer`, `kimi-reviewer` (gateway module) — review/report-only lanes
+- `ai-agentic-architect` (ai-engineering pack) — multi-agent design documents, never execution
+- `automation-engineer` (ops-sre pack) — one implementation-ready spec document
+- `consulting-cto-portfolio-coordinator`, `consulting-employee-impersonator`, `consulting-sow-drafter` (consulting pack) — documents and drafts
+- `enterprise-ux-architect` (design-ux pack) — design deliverables
+- `brand-identity-architect`, `inbox-triage-operator`, `landing-page-critic`, `launch-orchestrator`, `outbound-sequence-writer` (gtm-marketing pack) — reports and copy artifacts
+- `discipline-expert`, `experiment-designer`, `paper-triage` (science pack) — consultation and report documents
 
 ## When to add isolation to new agents
 

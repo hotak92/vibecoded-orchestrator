@@ -47,11 +47,13 @@ FREE_AGENTS = {
 }
 
 # ── Plan §1.2: the 8 kept gateway agents (2 retired by merge), plus the two
-# kimi-vendor lanes added in v0.2.102. ─────────────────────────
+# kimi-vendor lanes added in v0.2.102 and the two high-effort implementer
+# siblings (owner effort rulings 2026-10-07). ─────────────────────────
 GATEWAY_AGENTS = {
     "deepseek-implementer", "deepseek-researcher", "glm-flash-researcher",
-    "glm-implementer", "glm-planner", "glm-reviewer", "qwen-flash-sweeper",
-    "qwen-implementer", "kimi-implementer", "kimi-reviewer",
+    "glm-implementer", "glm-implementer-high", "glm-planner", "glm-reviewer",
+    "qwen-flash-sweeper", "qwen-implementer", "qwen-implementer-high",
+    "kimi-implementer", "kimi-reviewer",
 }
 
 # ── Plan §1.3: the 6 kept default skills. ──────────────────────────────────

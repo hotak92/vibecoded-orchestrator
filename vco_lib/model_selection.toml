@@ -71,7 +71,7 @@ scores = ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"]
 id = "glm-5.3"
 model = "GLM-5.3"
 dagger = true
-reach_via = "glm-implementer / glm-reviewer / glm-planner"
+reach_via = "glm-implementer / glm-implementer-high / glm-reviewer / glm-planner"
 providers = ["zai", "qwen"]
 scores = ["7", "6", "7", "6", "6", "6", "7*", "7", "7", "—", "8"]
 
@@ -109,7 +109,7 @@ scores = ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"]
 id = "qwen3.8-max"
 model = "Qwen3.8-Max"
 dagger = true
-reach_via = "qwen-implementer"
+reach_via = "qwen-implementer / qwen-implementer-high"
 providers = ["qwen"]
 scores = ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"]
 
