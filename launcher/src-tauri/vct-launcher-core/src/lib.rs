@@ -84,6 +84,12 @@ pub mod rl_scoring_lock;
 // re-exports it from here. See `secret_value_shape.rs` header.
 pub mod secret_value_shape;
 pub mod secrets;
+// v0.2.102 (review N2): the keychain pacing + bounded-worker machinery,
+// extracted wholesale from `secrets` (pure move, no behaviour change).
+// `pub(crate)`: only `secrets` (same crate) reaches it — external code keeps
+// using the guarded `secrets::*` chokepoint, and `secrets` re-exports the
+// items its callers already name. See `secrets_worker.rs` header.
+pub(crate) mod secrets_worker;
 // v0.3.0: tier-2 file-store (`$VCT_SECRETS_DIR`, default `~/.vct-secrets`)
 // location + presence probes. The ONE home for the launcher's knowledge of
 // the store the sanctioned resolvers fall back to when the keychain misses;

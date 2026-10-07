@@ -181,7 +181,7 @@ static CONNECTION: Mutex<Option<SecretService>> = Mutex::new(None);
 /// from `new_proxy`. A prompt therefore parked the single keychain worker
 /// thread for what is, operationally, forever — and because the worker holds
 /// the cross-process pace flock across the op, that parked worker also wedged
-/// every OTHER VCO process (see `secrets.rs::cross_process_pace`). This bound
+/// every OTHER VCO process (see `secrets_worker.rs::cross_process_pace`). This bound
 /// makes the holder's own worker recover on its own.
 ///
 /// Why 120s and not something tight: the timeout must never be the reason a
@@ -306,7 +306,7 @@ fn run_reusing_connection<C, T>(
 /// v0.2.102: the shared slot is taken with a BOUNDED wait
 /// (`SHARED_CONNECTION_WAIT`). In normal operation exactly one keychain worker
 /// exists, so the slot is uncontended. It stays held only when a HUNG op on an
-/// abandoned worker still owns it (`secrets::submit_keychain_job` started a
+/// abandoned worker still owns it (`secrets_worker::submit_keychain_job` started a
 /// replacement worker); the replacement then runs its op on a private,
 /// short-lived session instead of inheriting the hang.
 fn with_connection<T>(

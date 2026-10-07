@@ -21,6 +21,7 @@ import asyncio
 import logging
 import unittest
 from pathlib import Path
+from typing import NoReturn
 
 from model_router.secrets import NEGATIVE_TTL_CAP_S, TRANSIENT_RETRY_S, VendorKeyResolver
 from model_router.vendors import VENDORS, Vendor
@@ -119,8 +120,8 @@ class ResolutionChainTests(unittest.TestCase):
         keychain holds QWEN_API_KEY (the vendor docs' own env spelling)
         and nothing under the canonical lowercase name."""
 
-        def getter(key, project=None):
-            return FAKE_KEY if key == "QWEN_API_KEY" else None
+        def getter(key: str, project: str | None = None) -> str:
+            return FAKE_KEY if key == "QWEN_API_KEY" else ""
 
         result = VendorKeyResolver(getter=getter).resolve(VENDORS["qwen"])
         self.assertEqual(result.state, "resolved")
@@ -435,9 +436,9 @@ class ServeStaleTests(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def getter(key, project=None):
+        def getter(key: str, project: str | None = None) -> str:
             calls["n"] += 1
-            return None
+            return ""
 
         clock = _Clock()
         resolver = VendorKeyResolver(getter=getter, ttl_s=1, clock=clock)
@@ -461,8 +462,8 @@ class ServeStaleTests(unittest.TestCase):
 
         state = {"ok": False}
 
-        def getter(key, project=None):
-            return FAKE_KEY if state["ok"] else None
+        def getter(key: str, project: str | None = None) -> str:
+            return FAKE_KEY if state["ok"] else ""
 
         clock = _Clock()
         resolver = VendorKeyResolver(getter=getter, ttl_s=1, clock=clock)
@@ -504,7 +505,7 @@ class KeychainUnavailableTests(unittest.TestCase):
     erases a last-known-good key. Uses the resolver's REAL exception type."""
 
     @staticmethod
-    def _unavailable(key, project=None):
+    def _unavailable(key: str, project: str | None = None) -> NoReturn:
         from vco_lib.agent_secrets import KeychainUnavailable
 
         raise KeychainUnavailable(f"hub keychain temporarily unavailable for {key!r}")
@@ -523,7 +524,7 @@ class KeychainUnavailableTests(unittest.TestCase):
         calls: list[str] = []
         clock = _Clock()
 
-        def getter(key, project=None):
+        def getter(key: str, project: str | None = None) -> str:
             calls.append(key)
             self._unavailable(key)
 
@@ -561,7 +562,7 @@ class KeychainUnavailableTests(unittest.TestCase):
         state = {"ok": True}
         clock = _Clock()
 
-        def getter(key, project=None):
+        def getter(key: str, project: str | None = None) -> str:
             if state["ok"]:
                 return FAKE_KEY
             self._unavailable(key)
