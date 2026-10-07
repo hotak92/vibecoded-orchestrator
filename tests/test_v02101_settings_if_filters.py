@@ -48,6 +48,22 @@ WINDOWS = TEMPLATES / "settings.json.windows.template"
 #: branch review's S1: every remaining verb of the classifier's READ/SEARCH
 #: tables (less/more/diff/bat/nl/awk, ag/ack/egrep/fgrep, git blame) — the
 #: set equality with the classifier is pinned by TestIfRulesMatchClassifier.
+#: v0.2.102 (S16-8 production wiring): the write/chain-side rules the
+#: classifier's new branches need. ``perl``/``ruby`` are the grouped
+#: in-place-edit shapes (R1), ``tee``/``cp``/``mv`` the overwrite shapes the
+#: classifier has always classified EDIT, and ``cd`` exists for the R4
+#: chain re-rooting — ``cd dir && cat f`` starts with ``cd``, so without
+#: the rule the read behind it never reached the classifier either.
+#: Appended after the 21 read/search rules, brief order.
+V02102_RULES = [
+    "Bash(perl *)",
+    "Bash(ruby *)",
+    "Bash(cd *)",
+    "Bash(tee *)",
+    "Bash(cp *)",
+    "Bash(mv *)",
+]
+
 C1_IF_RULES = [
     "Bash(cat *)",
     "Bash(head *)",
@@ -113,7 +129,7 @@ class TestSettingsRegistrations:
                   and any("pre-bash-context-inject" in h for h in _hook_basenames(g))]
         assert len(groups) == 1, "exactly one Bash group hosts pre-bash-context-inject"
         hooks = groups[0]["hooks"]
-        assert [h.get("if") for h in hooks] == C1_IF_RULES, (
+        assert [h.get("if") for h in hooks] == C1_IF_RULES + V02102_RULES, (
             "the §C1 if-rules must be one handler per rule, in plan order")
         for h in hooks:
             # SF-1 (wave-2 GLM review): 10, not 8 — at review time the
@@ -142,7 +158,7 @@ class TestSettingsRegistrations:
                 continue
             for h in g["hooks"]:
                 if "pre-bash-context-inject" in h.get("command", ""):
-                    assert h.get("if") in C1_IF_RULES
+                    assert h.get("if") in C1_IF_RULES + V02102_RULES
 
     # --- §C2: Read on PostToolUse -----------------------------------------
 
@@ -284,7 +300,8 @@ def _classifier_rule_set() -> set[str]:
     ``Bash(git s*)`` (the §C1 git-rule family, probe-verified incl. double
     spaces between ``git`` and the subcommand)."""
     from vco_lib import inject_intent as ii
-    plain = ii._READ_VERBS | ii._SEARCH_VERBS
+    plain = (ii._READ_VERBS | ii._SEARCH_VERBS
+             | ii._EDIT_RULE_VERBS | ii._CHAIN_RULE_VERBS)
     git = ii._GIT_READ_SUBS | ii._GIT_SEARCH_SUBS
     return {f"Bash({v} *)" for v in plain} | {f"Bash(git {s}*)" for s in git}
 
@@ -317,18 +334,45 @@ class TestIfRulesMatchClassifier:
 
     def test_every_rule_reaches_a_live_classifier_branch(self, tpl: Path) -> None:
         """Behavioural half: a representative command for each rule
-        classifies READ or SEARCH — the rule names a branch that answers."""
+        classifies READ, SEARCH or EDIT — the rule names a branch that
+        answers (v0.2.102: the write-side rules answer EDIT, and ``cd``
+        answers through the chain it unlocks)."""
         from vco_lib.inject_intent import classify_bash
+        edit_samples = {
+            "perl": 'perl -pi -e "s/a/b/" vco_lib/packs.py',
+            "ruby": "ruby -pi -e g vco_lib/packs.py",
+            "tee": "tee vco_lib/packs.py",
+            "cp": "cp vco_lib/packs.py /tmp/packs.py",
+            "mv": "mv vco_lib/packs.py /tmp/packs.py",
+        }
         for rule in _bash_group_rules(_load(tpl)):
             m = re.fullmatch(r"Bash\((git \w+|\w+)\*?(?: \*)?\)", rule)
             assert m, f"unexpected rule shape {rule!r}"
             verb = m.group(1)
-            sample = (f"{verb} build_parser" if verb in
-                      ("grep", "rg", "ag", "ack", "egrep", "fgrep", "git grep")
-                      else f"{verb} vco_lib/packs.py")
+            if verb in edit_samples:
+                sample, want = edit_samples[verb], ("EDIT",)
+            elif verb == "cd":
+                # `cd` ALONE is MECHANICAL (pinned below) — the rule buys the
+                # chain: `cd dir && cat f` re-roots and classifies READ.
+                sample, want = "cd vco_lib && cat packs.py", ("READ",)
+            else:
+                sample = (f"{verb} build_parser" if verb in
+                          ("grep", "rg", "ag", "ack", "egrep", "fgrep",
+                           "git grep")
+                          else f"{verb} vco_lib/packs.py")
+                want = ("READ", "SEARCH")
             intent = classify_bash(sample).intent
-            assert intent in ("READ", "SEARCH"), (
+            assert intent in want, (
                 f"{rule!r}: sample {sample!r} classifies {intent!r}")
+
+
+def test_cd_rule_stays_cheap_cd_alone_is_mechanical() -> None:
+    """The ``Bash(cd *)`` rule must not turn navigation into injection:
+    ``cd /tmp && ls`` has no read/edit/search segment, classifies
+    MECHANICAL and produces no query, no producer spawn, no RL event —
+    the router's contract for MECHANICAL commands."""
+    from vco_lib.inject_intent import classify_bash
+    assert classify_bash("cd /tmp && ls").intent == "MECHANICAL"
 
 
 class TestLinuxWindowsParity:

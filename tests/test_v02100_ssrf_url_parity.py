@@ -68,6 +68,17 @@ def _env(tmp_path: Path, extra: dict, *, python: str | None = sys.executable) ->
     env.update({"HOME": str(tmp_path / "home"), "VCT_STATE_DIR": str(tmp_path / "state")})
     if python:
         env["VCT_VENV"] = python
+    if python is None or python != sys.executable:
+        # v0.2.102 NB-H2: find-python now probes the orchestrator venv BEFORE
+        # PATH. Two arms of this suite need the pre-NB-H2 PATH-only split,
+        # via the lib's documented opt-out: the no-Python arms (python=None —
+        # the probe's clone-relative tier cannot be unset away when the
+        # checkout under test carries its own .venv, which CI creates), and
+        # the fake-interpreter arms (VCT_VENV pins the SSRF VERDICT leg's
+        # interpreter only — the hook's own payload decode must keep a real
+        # PATH interpreter, or the fake's silence empties every field and
+        # the WebFetch branch is never reached).
+        env["VCO_FIND_PYTHON_PATH_ONLY"] = "1"
     env.update(extra)
     return env
 

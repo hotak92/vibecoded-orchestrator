@@ -232,6 +232,20 @@ except Exception:
 # === 1. SSRF GUARD ===
 if [[ "$TOOL_NAME" == "WebFetch" ]]; then
     URL=$(_get_field "url")
+    if [[ -z "$URL" ]]; then
+        # v0.2.102 NB-H1 (FRR:64): an empty URL here means the payload's url
+        # field could not be extracted (malformed tool_input, a parser
+        # error) — a WebFetch the guard cannot judge went out UNGUARDED
+        # before this arm. A security guard that cannot read its input fails
+        # CLOSED, the same contract as the no-Python arm above. Non-WebFetch
+        # tools are unaffected (this branch is WebFetch-only).
+        {
+            echo "🔒 SSRF guard: the WebFetch payload's 'url' field could not be extracted (malformed payload or a parser error), so the call cannot be checked and is blocked."
+            echo "   Retry; if it persists this is a broken VCO install — re-run the orchestrator's update (\`python install.py --update\` in the orchestrator root, or the launcher's Update)."
+        } >&2
+        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"\",\"reason\":\"url_extraction_failed\"}" >> "$SECURITY_LOG" 2>/dev/null || true
+        exit 2
+    fi
     if [[ -n "$URL" ]]; then
         # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
         # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both

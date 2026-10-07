@@ -185,6 +185,20 @@ def merge_hooks_block(
     and the append pass skips every template handler of the group — upgraded
     installs would never receive the new shape.
 
+    v0.2.102 (S16-8 follow-up — a GROWN if-group): every rule of an
+    if-filtered group shares ONE command string, so the append pass's
+    bare-command dedupe (``existing_cmds``) marked the whole group
+    "handled" as soon as ONE rule was present — a template that grows the
+    group (v0.2.101's 21 read/search rules + the 6 write/chain rules)
+    never delivered the new rules to an already-reshaped file. For an
+    if-bearing template handler the append pass therefore dedupes on the
+    RULE identity — ``(matcher, command, if)`` — instead of the command
+    string: a rule the user's matcher already carries under that command
+    is handled whatever its other keys (a user-tuned timeout is theirs, no
+    shipped twin is appended beside it), and a rule that is genuinely new
+    is appended. Non-if registrations keep the exact pre-v0.2.102
+    behaviour.
+
     v0.2.70 (Stream G — supersede-not-stack): historically this was APPEND-ONLY
     by exact command-STRING identity, so when a VCO-shipped hook's command form
     changed (e.g. a path-separator fix `...\\hooks\\x.ps1` -> `.../hooks/x.ps1`,
@@ -309,6 +323,18 @@ def merge_hooks_block(
             for entry in u_entries if isinstance(entry, dict)
             for h in entry.get("hooks", []) if isinstance(h, dict)
         }
+        # v0.2.102: the template's if-RULES per (matcher, command) — the
+        # group identity the append pass dedupes a grown if-group by.
+        template_if_rules: dict[tuple[str, str], set[str]] = {}
+        for t_entry in t_entries:
+            if not isinstance(t_entry, dict):
+                continue
+            t_matcher = normalize_matcher(t_entry)
+            for h in t_entry.get("hooks", []):
+                if (isinstance(h, dict) and isinstance(h.get("command"), str)
+                        and isinstance(h.get("if"), str)):
+                    template_if_rules.setdefault(
+                        (t_matcher, h["command"]), set()).add(h["if"])
 
         merged_entries: list = []
         superseded_identities: set[str] = set()
@@ -369,6 +395,19 @@ def merge_hooks_block(
             new_entry["hooks"] = new_hooks
             merged_entries.append(new_entry)
 
+        # v0.2.102: the (matcher, command, if) rules the user's file already
+        # carries AFTER the supersede/reshape pass above — computed from
+        # ``merged_entries`` so a group a reshape just delivered also counts
+        # (the append pass must not duplicate it rule by rule).
+        present_if_rules: set[tuple[str, str, str]] = {
+            (normalize_matcher(entry), h["command"], h["if"])
+            for entry in merged_entries if isinstance(entry, dict)
+            for h in entry.get("hooks", [])
+            if isinstance(h, dict)
+            and isinstance(h.get("command"), str)
+            and isinstance(h.get("if"), str)
+        }
+
         # Second pass: APPEND genuinely-new template hooks at PER-COMMAND
         # (inner-hook) granularity. A template command is "handled" (so it
         # must NOT be re-appended) when EITHER its exact string is already
@@ -399,7 +438,22 @@ def merge_hooks_block(
         # uses. A script the template ships under ONE matcher keeps the
         # event-wide rule, so a user who regrouped it under their own matcher
         # does not get a second, duplicate invocation.
-        def _cmd_handled(c: str, t_matcher: str) -> bool:
+        def _cmd_handled(c: str, t_matcher: str, t_hook: Optional[dict] = None) -> bool:
+            # v0.2.102: an if-bearing registration's identity is its RULE —
+            # (matcher, command, if) — not the bare command string every
+            # rule of the group shares. Per-rule dedupe applies ONLY when
+            # the user's matcher already carries (at least one rule of) the
+            # shipped group under the same command: a user carrying some
+            # rules is a partially-updated shipped group and gains the rest;
+            # a user whose same-command registration is NOT a shipped rule
+            # (an if-less handler, their own filter, another matcher, a
+            # custom command spelling) keeps the exact pre-v0.2.102
+            # behaviour — the group is theirs and nothing is appended.
+            # See the docstring's v0.2.102 note.
+            if isinstance(t_hook, dict) and isinstance(t_hook.get("if"), str):
+                group_rules = template_if_rules.get((t_matcher, c), set())
+                if any((t_matcher, c, r) in present_if_rules for r in group_rules):
+                    return (t_matcher, c, t_hook["if"]) in present_if_rules
             ident = vco_hook_script_identity(c)
             if ident is not None and len(template_matchers.get(ident, ())) > 1:
                 return (t_matcher, ident) in present_idents or (t_matcher, c) in present_cmds
@@ -419,7 +473,7 @@ def merge_hooks_block(
                 for h in t_entry.get("hooks", [])
                 if isinstance(h, dict)
                 and h.get("command")
-                and not _cmd_handled(h["command"], normalize_matcher(t_entry))
+                and not _cmd_handled(h["command"], normalize_matcher(t_entry), h)
                 and not _keep_out(event, t_entry, h["command"])
             ]
             if not new_inner:

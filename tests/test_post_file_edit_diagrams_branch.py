@@ -194,6 +194,14 @@ def test_diagram_edit_creates_throttle_and_invokes_indexer(tmp_path: Path):
     env = os.environ.copy()
     env["VCT_DISABLE_HOOKS"] = ""
     env["VCT_INSTALL_ROOT"] = str(project)
+    # v0.2.102 NB-H2: find-python.sh now probes the orchestrator venv FIRST —
+    # with VCT_INSTALL_ROOT pointed at the stub, the stub would become $PY
+    # for the hook's PAYLOAD PARSE too (it emits no parse protocol, so every
+    # field would come back empty and nothing would route). The lib's
+    # documented opt-out keeps $PY on the real PATH interpreter; the
+    # diagrams branch's own resolve-vco-venv call still finds the stub for
+    # the indexer leg, which is all this test means to stub.
+    env["VCO_FIND_PYTHON_PATH_ONLY"] = "1"
     # Hermetic: clear VCT_VENV so resolve-vco-venv.sh tier 1 doesn't hijack the
     # per-test stub venv (VCT_INSTALL_ROOT/.venv). An ambient VCT_VENV (e.g. from
     # pre-ship-check) would otherwise run the REAL diagram_indexer instead of the
@@ -319,6 +327,14 @@ def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
     env = os.environ.copy()
     env["VCT_DISABLE_HOOKS"] = ""
     env["VCT_INSTALL_ROOT"] = str(project)
+    # v0.2.102 NB-H2: find-python.sh now probes the orchestrator venv FIRST —
+    # with VCT_INSTALL_ROOT pointed at the stub, the stub would become $PY
+    # for the hook's PAYLOAD PARSE too (it emits no parse protocol, so every
+    # field would come back empty and nothing would route). The lib's
+    # documented opt-out keeps $PY on the real PATH interpreter; the
+    # diagrams branch's own resolve-vco-venv call still finds the stub for
+    # the indexer leg, which is all this test means to stub.
+    env["VCO_FIND_PYTHON_PATH_ONLY"] = "1"
     # Hermetic: clear VCT_VENV so resolve-vco-venv.sh tier 1 doesn't hijack the
     # per-test stub venv (VCT_INSTALL_ROOT/.venv). An ambient VCT_VENV (e.g. from
     # pre-ship-check) would otherwise run the REAL diagram_indexer instead of the

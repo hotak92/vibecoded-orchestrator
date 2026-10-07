@@ -209,6 +209,18 @@ if ($ToolName -eq "WebFetch") {
     if ($payload -and $payload.tool_input -and $null -ne $payload.tool_input.url) {
         $url = ([string]$payload.tool_input.url).Trim()
     }
+    if (-not $url) {
+        # v0.2.102 NB-H1 (FRR:64): an empty URL here means the payload's url
+        # field could not be extracted (malformed tool_input, a parser
+        # error) — a WebFetch the guard cannot judge went out UNGUARDED
+        # before this arm. A security guard that cannot read its input fails
+        # CLOSED (the no-Python arm's contract). MUST MATCH the .sh sibling.
+        # Non-WebFetch tools are unaffected (this branch is WebFetch-only).
+        [Console]::Error.WriteLine("SSRF guard: the WebFetch payload's 'url' field could not be extracted (malformed payload or a parser error), so the call cannot be checked and is blocked.")
+        [Console]::Error.WriteLine("   Retry; if it persists this is a broken VCO install - re-run the orchestrator's update (``python install.py --update`` in the orchestrator root, or the launcher's Update).")
+        Write-SecurityLine "{""timestamp"":""$ts"",""event"":""ssrf_blocked"",""url"":"""",""reason"":""url_extraction_failed""}"
+        exit 2
+    }
     if ($url) {
         # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
         # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both
