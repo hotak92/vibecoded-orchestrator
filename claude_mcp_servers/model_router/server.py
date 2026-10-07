@@ -127,6 +127,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -172,12 +173,19 @@ from .quota import (
     CLASS_EXHAUSTED,
     CLIENT_QUOTA_STATUS,
     QUOTA_STATUSES,
+    _find_reset_value,
+    _reset_distance_s,
     classify_quota,
     find_reset_hint,
     quota_error_body,
     quota_evidence_fields,
 )
-from .routing import Route, RouteError, route as route_model
+from .routing import (
+    Route,
+    RouteError,
+    fallback_route,
+    route as route_model,
+)
 from .secrets import VendorKeyResolver
 from .source_identity import source_sha as _package_source_sha
 from .usage_windows import (
@@ -346,6 +354,73 @@ _AUTH_BODY_LIMIT_BYTES = 64 * 1024
 #: has: the two bound different decisions, and the day one moves is not the
 #: day the other does.
 _VENDOR_ERROR_BODY_LIMIT_BYTES = 64 * 1024
+
+#: The fallback ladder's retry-after threshold, in seconds (OD-9): a 429 that
+#: carries ``retry-after`` at or below this is retried ONCE on the same rung
+#: before the ladder falls back; one without a retry-after, or with a
+#: quota-exhausted body, falls back immediately. Above the threshold the
+#: window is too long to hold a chat request for, so it falls back too — the
+#: reading of OD-9 that keeps the ladder what it is for (chat continuity),
+#: recorded here rather than in the ruling. Env-tunable because the right
+#: wait is a per-workload judgement, like the context guard's margin.
+FALLBACK_RETRY_AFTER_MAX_DEFAULT_S = 30
+
+#: The env var that overrides :data:`FALLBACK_RETRY_AFTER_MAX_DEFAULT_S`.
+FALLBACK_RETRY_AFTER_MAX_ENV = "VCT_GATEWAY_FALLBACK_RETRY_AFTER_MAX_S"
+
+
+def fallback_retry_after_max_s() -> float:
+    """The ladder's retry-after threshold, in seconds. Never raises.
+
+    An unset, non-numeric or non-positive value answers the default — a typo
+    in the knob must not disable the same-rung retry (which a ``0`` would:
+    every short rate limit would fall straight through to the next vendor).
+    """
+    raw = (os.environ.get(FALLBACK_RETRY_AFTER_MAX_ENV) or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return FALLBACK_RETRY_AFTER_MAX_DEFAULT_S
+    return value if value > 0 else FALLBACK_RETRY_AFTER_MAX_DEFAULT_S
+
+
+#: The two answers :func:`_ladder_verdict` can give.
+LADDER_FALLBACK = "fallback"
+LADDER_RETRY = "retry"
+
+
+def _ladder_verdict(
+    status: int,
+    body: bytes,
+    headers: "Mapping[str, str] | None",
+) -> "tuple[str, Optional[float]]":
+    """OD-9's trigger, as one decision for a quota-status answer.
+
+    Returns ``(LADDER_FALLBACK, None)`` or ``(LADDER_RETRY, delay_s)``. The
+    owner's rule (2026-10-07): fall back when the answer is a 429 WITHOUT a
+    readable ``retry-after``, or with a quota-exhausted body; on a 429 WITH
+    ``retry-after`` <= :func:`fallback_retry_after_max_s`, retry the same
+    rung once and fall back if it refuses again (the "once" is the caller's
+    recursion bound, not this function's). A window LONGER than the threshold
+    also falls back — waiting it out is what the ladder exists to spare the
+    chat. The evidence reading is :mod:`model_router.quota`'s, through the
+    same helpers ``_quota_response`` uses, so the ladder and the substituted
+    quota message can never disagree about what a vendor said. 402 is a
+    balance condition and classifies exhausted, so it falls back with the
+    rest.
+    """
+    if classify_quota(status, body, headers) == CLASS_EXHAUSTED:
+        return LADDER_FALLBACK, None
+    distance = _reset_distance_s(_find_reset_value(body, headers))
+    # ``0 <=`` on purpose (batch-6 B-2): a ``retry-after: 0`` means "retry
+    # immediately" — a free same-rung retry — and must not be read as
+    # no-retry-after, which would spend the next rung's quota where the same
+    # vendor offered to serve a moment later. A NEGATIVE distance (a reset
+    # epoch already in the past) still falls back: it is not a delay the
+    # vendor quoted for a retry.
+    if distance is None or not 0 <= distance <= fallback_retry_after_max_s():
+        return LADDER_FALLBACK, None
+    return LADDER_RETRY, distance
 
 
 #: What a GATEWAY-side 502 carries. Anthropic's SDKs read ``x-should-retry``
@@ -1208,6 +1283,7 @@ def _submit_usage(
     totals: Mapping[str, int],
     usage_complete: bool,
     request_bytes: int = 0,
+    fallback_from: str = "",
 ) -> None:
     """Write one ledger row for a finished request, or decline to.
 
@@ -1237,6 +1313,7 @@ def _submit_usage(
         window_source=window_source,
         one_m_client=facts.one_m_client,
         request_bytes=request_bytes,
+        fallback_from=fallback_from,
     )
     try:
         loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
@@ -1761,6 +1838,37 @@ def _apply_text_only_images(
     return _strip_images_for_text_only(payload, model_id)
 
 
+def _apply_clear_thinking(
+    payload: Any, gateway: "Gateway", model_id: str,
+) -> "tuple[Any, bool]":
+    """Set ``thinking.clear_thinking`` IFF a cited seed row carries the field.
+
+    v0.2.102 item A8 (OD-10): the value comes from the shipped seed row —
+    :meth:`model_router.context_table.ContextTable.clear_thinking`, the same
+    carry discipline as ``text_only`` — and ``None`` (the default, a row the
+    seed does not flag) means NOT SENT. The field is only ever MERGED into a
+    ``thinking`` param the request already carries: adding a ``thinking``
+    param to a request that had none would turn a plain completion into a
+    thinking one (and trip every validator that comes with that), which is a
+    different request, not a shaping of it. Returns ``(payload, changed)``.
+    """
+    if not isinstance(payload, dict):
+        return payload, False
+    value = gateway.context.current().clear_thinking(model_id)
+    if value is None:
+        return payload, False
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict):
+        return payload, False
+    if thinking.get("clear_thinking") == value:
+        return payload, False
+    new_thinking = dict(thinking)
+    new_thinking["clear_thinking"] = value
+    new_payload = dict(payload)
+    new_payload["thinking"] = new_thinking
+    return new_payload, True
+
+
 def _access_line(
     *,
     requested: str,
@@ -2079,6 +2187,177 @@ async def _stream_after(
         yield chunk
 
 
+def _ladder_escalation(
+    *,
+    request: web.Request,
+    gateway: "Gateway",
+    decision: Route,
+    payload: Optional[dict],
+    requested_model: str,
+    stream_requested: bool,
+    started: float,
+    images: str,
+    facts: Optional[RequestFacts],
+    fallback_from: str = "",
+) -> "Optional[Callable[[str], Awaitable[Optional[web.StreamResponse]]]]":
+    """The OD-9 escalation for one rung, as a callable the proxy can invoke.
+
+    Returns ``None`` when this route has no next rung
+    (:func:`model_router.routing.fallback_route`), the body was never parsed
+    (an unparseable or over-buffer request cannot be re-shaped for a different
+    model, so the ladder stands down and the refusal is relayed), or — batch-6
+    B-1, coordinator 2026-10-07 — the route is a VENDOR route the request did
+    not arrive at by fallback (``fallback_from`` empty): the vendor→vendor
+    edges belong to the ladder's own chain, never to a model the user picked.
+    The returned
+    callable takes the failed rung's quota EVIDENCE (``quota_evidence_fields``
+    plus the upstream status, as one string) and answers the NEXT rung's
+    response, or ``None`` when the rung could not be served at all — no vendor
+    key, or the context guard refuses the request for the rung's model — in
+    which case the caller falls back to its own refusal path. Never raises
+    past ``_guarded``: a shaping failure sends the UNshaped bytes on rather
+    than failing the rung.
+
+    The escalation re-runs the SAME vendor shaping the ordinary path runs
+    (id restoration, thinking-signature restoration, effort translation,
+    ``clear_thinking``, text-only images, context guard) against the RUNG's
+    model — a fallback request is a full request, not a patched relay — and
+    it carries ITS OWN escalation for the rung after it, so the ladder is
+    walked to its end or not at all. R15: the escalated attempt's access
+    line and ledger row both say it was a fallback (``fallback_from`` names
+    the rung that was left; ``forward`` names the model that answered), so no
+    remap is ever silent.
+    """
+    next_decision = fallback_route(decision, vendors=gateway.vendors)
+    if next_decision is None or payload is None:
+        return None
+    if facts is not None and facts.count_tokens:
+        # A count_tokens call is a question about the conversation, not a
+        # turn in it (the same exemption the context guard makes): spending
+        # another vendor's quota to answer one is a cost with no reader.
+        return None
+    if decision.vendor is not None and not fallback_from:
+        # Batch-6 B-1 (coordinator, 2026-10-07): the vendor→vendor edges are
+        # the LADDER's, not a general proxy. A vendor route is armed only
+        # when the attempt ARRIVED there by fallback (``fallback_from`` is
+        # the rung it escaped); a user who PICKED this vendor model made a
+        # deliberate capability/cost choice, and its refusal is relayed for
+        # the client's own retry to own. The first-party haiku-slot entry
+        # edge above stays route-keyed, so the ladder's chain is walked in
+        # full for the slot it exists for.
+        return None
+    vendor = next_decision.vendor
+    assert vendor is not None  # noqa: S101 — guaranteed by fallback_route
+    from_label = f"{_route_label(decision)}:{decision.forward_model}"
+
+    async def escalate(evidence: str) -> "Optional[web.StreamResponse]":
+        key_result = await gateway.keys.aresolve(vendor)
+        if not key_result.key:
+            logger.info(
+                "model-gateway: fallback ladder cannot use %s %s for %s: no "
+                "vendor key resolved (%s); relaying the original refusal",
+                vendor.vendor_id, next_decision.forward_model,
+                _log_safe(requested_model), key_result.problem or "-",
+            )
+            return None
+        shaped = dict(payload)
+        shaped["model"] = next_decision.forward_model
+        headers = gateway.forward_headers(request)
+        headers[vendor.auth_header] = f"{vendor.auth_scheme}{key_result.key}"
+        headers["Content-Type"] = "application/json"
+        headers.setdefault("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
+        # The same guarded passes the ordinary vendor path runs, against the
+        # RUNG's model and id map. Each degrades to "send the client's bytes"
+        # on failure — a fallback that shapes worse than the main path would
+        # be a fallback that fails differently, not better.
+        restored = _guarded(
+            restore_vendor_ids, shaped, gateway.id_map(vendor),
+            what="fallback vendor id restoration",
+        )
+        if restored is not _ABANDON:
+            shaped, _changed = restored
+        unmarked = _guarded(
+            unmark_thinking_signatures, shaped,
+            what="fallback thinking-signature restoration",
+        )
+        if unmarked is not _ABANDON:
+            shaped, _changed = unmarked
+        effort = _guarded(
+            translate_effort, shaped, vendor.vendor_id,
+            next_decision.forward_model, what="fallback effort translation",
+        )
+        if effort is not _ABANDON:
+            shaped, _changed = effort
+        cleared = _guarded(
+            _apply_clear_thinking, shaped, gateway,
+            next_decision.forward_model, what="fallback clear_thinking shaping",
+        )
+        if cleared is not _ABANDON:
+            shaped, _changed = cleared
+        images_pair = _guarded(
+            _apply_text_only_images, shaped, gateway,
+            next_decision.forward_model,
+            what="fallback text-only image replacement",
+        )
+        if images_pair is not _ABANDON:
+            shaped, _changed = images_pair
+        # The guard judges the request against the RUNG's real window, before
+        # the rung is called — the same pre-emption the ordinary path gives
+        # every vendor request. A refusal here means the rung cannot serve
+        # this conversation at its size; the caller relays the ORIGINAL
+        # refusal rather than swapping one dead end for another.
+        raw = json.dumps(shaped, **COMPACT_JSON).encode("utf-8")
+        guard = _context_guard(
+            gateway, next_decision, next_decision.forward_model, shaped, raw,
+            facts,
+        )
+        if guard is not None:
+            logger.info(
+                "model-gateway: fallback ladder skipped %s %s for %s: the "
+                "context guard refuses the request at that model's window",
+                vendor.vendor_id, next_decision.forward_model,
+                _log_safe(requested_model),
+            )
+            return None
+        url = f"{next_decision.upstream}{_canonical_path(request)}"
+        if request.query_string:
+            url = f"{url}?{request.query_string}"
+        return await _proxy(
+            request,
+            gateway,
+            next_decision,
+            url,
+            headers,
+            raw,
+            requested_model=requested_model,
+            stream_requested=stream_requested,
+            started=started,
+            note=(
+                f"note=model_fallback fallback_from={from_label} {evidence}"
+            ).strip(),
+            images=images,
+            facts=facts,
+            allow_oauth_retry=False,
+            ladder_escalate=_ladder_escalation(
+                request=request,
+                gateway=gateway,
+                decision=next_decision,
+                payload=shaped,
+                requested_model=requested_model,
+                stream_requested=stream_requested,
+                started=started,
+                images=images,
+                facts=facts,
+                # The rung attempt DID arrive by fallback — this is what arms
+                # its own next edge (B-1): the chain continues from here.
+                fallback_from=from_label,
+            ),
+            fallback_from=from_label,
+        )
+
+    return escalate
+
+
 async def messages_handler(request: web.Request) -> web.StreamResponse:
     """Proxy ``/v1/messages`` and ``/v1/messages/count_tokens``.
 
@@ -2338,6 +2617,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     #: over-buffer path, where the vendor transforms do not run.
     effort_translated = False
     text_only_images_omitted = 0
+    clear_thinking_applied = False
     if decision.is_anthropic:
         oauth = gateway.oauth.read()
         if oauth.token is None:
@@ -2478,6 +2758,24 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                     mutated = True
                     text_only_images_omitted = omitted
 
+            # item (g) (A8, OD-10): a cited seed row's clear_thinking value
+            # rides the request's own thinking param. Only rows that carry
+            # the field; a request without a thinking param is untouched.
+            clear_pair = _guarded(
+                _apply_clear_thinking,
+                forward_payload,
+                gateway,
+                decision.forward_model,
+                what="clear_thinking shaping",
+            )
+            if clear_pair is _ABANDON:
+                rewrite_failed = True
+            else:
+                forward_payload, clear_changed = clear_pair
+                if clear_changed:
+                    mutated = True
+                    clear_thinking_applied = True
+
     headers["Content-Type"] = "application/json"
     headers.setdefault("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
 
@@ -2488,6 +2786,8 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     # byte. Assembled here so they ride EVERY access line this request writes.
     if effort_translated:
         note = f"{note} note=effort_translated".strip()
+    if clear_thinking_applied:
+        note = f"{note} note=clear_thinking_applied".strip()
     if text_only_images_omitted:
         note = (
             f"{note} "
@@ -2539,6 +2839,21 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     if request.query_string:
         url = f"{url}?{request.query_string}"
 
+    # The fallback ladder (OD-9): armed only for a route with a next rung AND
+    # a parsed body the escalation can re-shape. ``None`` for every ordinary
+    # request, so the proxy's ladder branch is unreachable and behaviour is
+    # byte-for-byte what it was.
+    ladder_hook = _ladder_escalation(
+        request=request,
+        gateway=gateway,
+        decision=decision,
+        payload=payload,
+        requested_model=str(requested_model),
+        stream_requested=stream_requested,
+        started=started,
+        images=images_field,
+        facts=facts,
+    )
     return await _proxy(
         request,
         gateway,
@@ -2552,6 +2867,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         note=note,
         images=images_field,
         facts=facts,
+        ladder_escalate=ladder_hook,
     )
 
 
@@ -2599,6 +2915,9 @@ async def _proxy(
     allow_oauth_retry: bool = True,
     allow_quota_reprobe: bool = True,
     facts: Optional[RequestFacts] = None,
+    ladder_escalate: Optional[Callable[[str], Awaitable[Optional[web.StreamResponse]]]] = None,
+    fallback_from: str = "",
+    allow_ladder_retry: bool = True,
 ) -> web.StreamResponse:
     """Forward one request upstream and relay the answer.
 
@@ -2620,6 +2939,18 @@ async def _proxy(
     bounds: each retried call clears its own, so a genuinely dead login, and
     a vendor that answers "exhausted" to every attempt alike, answer the
     client instead of looping.
+
+    A third, bounded recovery exists beside those two: the owner's fallback
+    ladder (OD-9, ``ladder_escalate``). On a quota-status answer for a route
+    that has a next rung, with the body still in hand as bytes, the ladder
+    branch (:func:`_ladder_quota_branch`) retries the same rung once on a
+    short ``retry-after`` and otherwise escalates to the rung
+    :func:`model_router.routing.fallback_route` names — every escalation
+    visible in the access line and the ledger (``fallback_from``), and the
+    last rung's refusal passed to the client unchanged. The entry edge is the
+    first-party haiku slot; a vendor→vendor edge is armed only for an attempt
+    that reached its rung BY fallback (batch-6 B-1), so a vendor model the
+    user picked is never rerouted.
 
     On a stream, the SSE rewriter's held tail is flushed after the last
     upstream chunk — except on the client-disconnect path, where it is
@@ -2718,6 +3049,9 @@ async def _proxy(
                         and not (facts is not None and facts.binary_body)
                         else 0
                     ),
+                    # R15: the rung this request escaped, when the ladder
+                    # served it — empty (never omitted) on ordinary rows.
+                    fallback_from=fallback_from,
                 ),
                 what="usage ledger",
             )
@@ -2800,6 +3134,9 @@ async def _proxy(
                         # the client but vanished from the usage record.
                         facts=facts,
                         allow_oauth_retry=False,
+                        ladder_escalate=ladder_escalate,
+                        fallback_from=fallback_from,
+                        allow_ladder_retry=allow_ladder_retry,
                     )
             vendor = decision.vendor
             # WP-6 review MAJOR-1, refined by the no-discovery-vendor
@@ -2817,6 +3154,47 @@ async def _proxy(
                 )
             if vendor is not None and 200 <= upstream.status < 300:
                 gateway.note_vendor_success(vendor.vendor_id)
+            if (
+                ladder_escalate is not None
+                and isinstance(body, (bytes, bytearray))
+                and upstream.status in QUOTA_STATUSES
+            ):
+                # The owner's fallback ladder (OD-9). Armed only for a route
+                # with a next rung and a body that can be re-sent; the branch
+                # owns the response because deciding means reading the body.
+                # ``allow_ladder_retry`` is the same-rung retry's recursion
+                # bound, cleared in the retry below exactly as the oauth and
+                # quota bounds are.
+                async def _ladder_retry(evidence: str) -> web.StreamResponse:
+                    return await _proxy(
+                        request,
+                        gateway,
+                        decision,
+                        url,
+                        headers,
+                        body,
+                        requested_model=requested_model,
+                        stream_requested=stream_requested,
+                        started=started,
+                        note=f"{note} note=ladder_retry {evidence}".strip(),
+                        images=images,
+                        facts=facts,
+                        allow_oauth_retry=False,
+                        allow_quota_reprobe=False,
+                        ladder_escalate=ladder_escalate,
+                        fallback_from=fallback_from,
+                        allow_ladder_retry=False,
+                    )
+
+                return await _ladder_quota_branch(
+                    upstream,
+                    gateway,
+                    decision,
+                    access,
+                    stream_requested=stream_requested,
+                    escalate=ladder_escalate,
+                    retry=_ladder_retry if allow_ladder_retry else None,
+                )
             if vendor is not None and upstream.status in QUOTA_STATUSES:
                 return await _quota_response(
                     upstream,
@@ -2842,6 +3220,7 @@ async def _proxy(
                             note=note,
                             images=images,
                             facts=facts,
+                            fallback_from=fallback_from,
                         )
                         if allow_quota_reprobe
                         and isinstance(body, (bytes, bytearray))
@@ -3320,6 +3699,8 @@ async def _quota_response(
     stream_requested: bool,
     access: Callable[..., None],
     reprobe: Optional[Callable[[str], Awaitable[web.StreamResponse]]] = None,
+    *,
+    raw: Optional[bytes] = None,
 ) -> web.StreamResponse:
     """Replace a vendor's quota refusal with one that names the vendor.
 
@@ -3361,11 +3742,13 @@ async def _quota_response(
     The retried attempt writes the access line (with ``note=quota_reprobe``),
     so the caller must not also write one: one client request, one line.
     """
-    # A PEEK, deliberately, and the one place ``read(n)``'s real semantics
-    # (what has ARRIVED, trimmed to n — see :func:`_buffer_bounded`) are
-    # harmless: this body is never relayed, so a short read costs at most a
-    # reset hint that was still in flight.
-    raw = await upstream.content.read(_QUOTA_BODY_PEEK_BYTES)
+    # A PEEK via the ONE shared home (:func:`_peek_quota_body`); ``raw`` lets
+    # a caller that already read the body (the fallback ladder's branch,
+    # which had to read it to decide) hand it over — reading a consumed
+    # stream back would answer empty and silently downgrade the
+    # classification below.
+    if raw is None:
+        raw = await _peek_quota_body(upstream)
     logger.debug(
         "model-gateway: %s quota refusal HTTP %d body=%s",
         vendor.vendor_id, upstream.status,
@@ -3430,6 +3813,108 @@ async def _quota_response(
     )
 
 
+async def _peek_quota_body(upstream: aiohttp.ClientResponse) -> bytes:
+    """The ONE bounded quota-body read, shared by every reader that mines a
+    refusal for evidence (:func:`_quota_response`, :func:`_ladder_quota_branch`).
+
+    A PEEK, deliberately, and the one place ``read(n)``'s real semantics (what
+    has ARRIVED, trimmed to n — see :func:`_buffer_bounded`) are harmless:
+    these bodies are mined and logged, not relayed whole (the first-party
+    ladder terminal relays what it read — bounded, and the rarer case by far),
+    so a short read costs at most a hint that was still in flight. Kept as
+    ONE home so the "no unbounded read of a discarded body" asymmetry stays
+    checkable (``tests/test_v0294_gateway_relay_buffer.py``).
+    """
+    return await upstream.content.read(_QUOTA_BODY_PEEK_BYTES)
+
+
+async def _ladder_quota_branch(
+    upstream: aiohttp.ClientResponse,
+    gateway: "Gateway",
+    decision: Route,
+    access: Callable[..., None],
+    *,
+    stream_requested: bool,
+    escalate: Callable[[str], Awaitable[Optional[web.StreamResponse]]],
+    retry: Optional[Callable[[str], Awaitable[web.StreamResponse]]],
+) -> web.StreamResponse:
+    """Own a quota-status answer on a fallback-ladder-armed attempt (OD-9).
+
+    Entered only when the caller armed the ladder AND holds the body as bytes
+    (a streamed body cannot be re-sent, so its refusal goes to the client,
+    exactly like the quota re-probe's own bound). This branch therefore OWNS
+    the response: it reads the body to decide, and a body read is a body
+    consumed.
+
+    The order of its three outcomes is OD-9 verbatim:
+
+    * a rate-limited 429 with ``retry-after`` within the threshold and a
+      retry still available → sleep the STATED delay, then re-send the same
+      bytes to the same rung (the caller's ``retry`` carries the recursion
+      bound; the second refusal comes back here with ``retry=None`` and
+      falls through);
+    * otherwise → escalate to the next rung (``escalate``), which answers the
+      next rung's response or ``None`` when it could not be served;
+    * neither possible → the rung's OWN refusal, unchanged: the vendor quota
+      envelope via :func:`_quota_response` (no re-probe — this request's
+      recovery budget already went to the escalation attempt that failed, and
+      a second same-rung send after that would be a third upstream request
+      for one client turn), or — on the first-party route, which has no
+      vendor to name — the original status and body relayed as read. Never a
+      fabricated success.
+
+    One access line per client request still holds: a retry or escalation
+    writes the line that answers, carrying the verdict it repaired on its
+    ``note`` (the ``quota_reprobe`` discipline); only the terminal case where
+    this branch answers writes its own.
+    """
+    raw = await _peek_quota_body(upstream)
+    classification = classify_quota(upstream.status, raw, upstream.headers)
+    evidence = " ".join(
+        part
+        for part in (
+            f"upstream_status={upstream.status}",
+            f"quota_class={classification}",
+            quota_evidence_fields(raw, upstream.headers),
+        )
+        if part
+    )
+    action, delay = _ladder_verdict(upstream.status, raw, upstream.headers)
+    if action == LADDER_RETRY and retry is not None and delay is not None:
+        # The vendor said when it will serve again and the window is short;
+        # the sleep is the STATED delay (never longer than the threshold the
+        # verdict already applied) so the retry is not spent against a limit
+        # that is still in force.
+        await asyncio.sleep(delay)
+        return await retry(evidence)
+    escalated = await escalate(evidence)
+    if escalated is not None:
+        return escalated
+    if decision.vendor is not None:
+        return await _quota_response(
+            upstream, decision.vendor, stream_requested, access, raw=raw,
+        )
+    # First-party terminal: the original refusal, relayed as read. The peek
+    # is bounded, so an error body longer than the bound truncates — logged,
+    # and rarer than the case it serves (the ladder ended because the next
+    # rung had no key, and the honest answer is the one the upstream gave).
+    logger.info(
+        "model-gateway: fallback ladder exhausted at the first-party rung "
+        "(%s); relaying the original refusal %s",
+        _log_safe(decision.forward_model), evidence,
+    )
+    access(
+        upstream.status,
+        stream=stream_requested,
+        extra=f"note=ladder_exhausted {evidence}".strip(),
+    )
+    return web.Response(
+        status=upstream.status,
+        body=raw,
+        headers=gateway.relay_headers(upstream),
+    )
+
+
 def _quota_reprobe(
     request: web.Request,
     gateway: Gateway,
@@ -3444,6 +3929,7 @@ def _quota_reprobe(
     note: str,
     images: str = IMAGES_UNCOUNTED,
     facts: Optional[RequestFacts] = None,
+    fallback_from: str = "",
 ) -> Callable[[str], Awaitable[web.StreamResponse]]:
     """A single re-send of a request whose quota refusal is being re-checked.
 
@@ -3476,7 +3962,13 @@ def _quota_reprobe(
     attempt: it is the evidence :func:`_submit_usage` counts FROM, so a
     re-probe that SUCCEEDS is a real turn for the user and must land in the
     usage ledger. Dropping it here made the repair invisible — the request
-    answered, and the record said nothing happened.
+    answered, and the record said nothing happened. ``fallback_from`` rides
+    along for the same reason (batch-7 B-1R): the re-probe is reachable from
+    a fallback-ladder rung (the LAST rung has no escalation, so its exhausted
+    verdict takes the shipped re-probe), and a re-probe that succeeds there
+    is still the remapped request — without the field its ledger row would
+    say an ordinary qwen turn answered, the one place a fallback could land
+    invisible (R15).
     """
     async def resend(first_verdict: str) -> web.StreamResponse:
         return await _proxy(
@@ -3494,6 +3986,7 @@ def _quota_reprobe(
             facts=facts,
             allow_oauth_retry=False,
             allow_quota_reprobe=False,
+            fallback_from=fallback_from,
         )
 
     return resend

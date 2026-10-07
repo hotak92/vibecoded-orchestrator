@@ -215,6 +215,10 @@ class QuotaPeekIsDeliberateTests(unittest.TestCase):
     reset hint and logs it at DEBUG — so a short read costs at most a hint
     that was in a later chunk. This pins the asymmetry so a future sweep does
     not "fix" it into an unbounded read of a body that is thrown away.
+    v0.2.102 (A4/F2): the fallback ladder's quota branch mines refusals the
+    same way, so the one read moved into ``_peek_quota_body`` and BOTH readers
+    route through it — the pin still asserts exactly ONE read site, in that
+    one home.
     """
 
     def test_only_the_quota_peek_still_calls_read(self) -> None:
@@ -224,7 +228,7 @@ class QuotaPeekIsDeliberateTests(unittest.TestCase):
             if "upstream.content.read(" in line
         ]
         self.assertEqual(
-            calls, ["raw = await upstream.content.read(_QUOTA_BODY_PEEK_BYTES)"],
+            calls, ["return await upstream.content.read(_QUOTA_BODY_PEEK_BYTES)"],
             "a relayed body must be accumulated, not read() once",
         )
 

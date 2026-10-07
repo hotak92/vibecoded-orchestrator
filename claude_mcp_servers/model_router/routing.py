@@ -51,6 +51,8 @@ from typing import Collection, Mapping, Optional
 
 from .vendors import (
     ANTHROPIC_FAMILY,
+    FALLBACK_LADDER,
+    FallbackRung,
     VENDORS,
     AnthropicFamily,
     CLAUDE_ID_MARKERS,
@@ -455,12 +457,77 @@ def advertised_id(vendor: Vendor, model_id: str, one_m: bool) -> str:
     return with_1m(namespaced) if one_m else namespaced
 
 
+def fallback_route(
+    decision: Route,
+    vendors: Mapping[str, Vendor] = VENDORS,
+    ladder: "tuple[FallbackRung, ...]" = FALLBACK_LADDER,
+) -> Optional[Route]:
+    """The NEXT rung of the fallback ladder for this route, or ``None``.
+
+    Pure data lookup — the ladder table lives in :mod:`model_router.vendors`
+    (like every vendor fact) and this function names no vendor, so the
+    vendor-neutral-source guarantee holds. It answers WHERE, never WHETHER:
+    the trigger (which upstream refusals qualify) is the owner's OD-9 rule and
+    is decided by the caller, beside the quota evidence it reads — and so is
+    the SCOPE (batch-6 B-1): ``server._ladder_escalation`` arms a
+    vendor→vendor edge only for an attempt that reached its rung BY fallback,
+    so a vendor model the user picked keeps its own refusal. A route with
+    no next rung answers ``None``, and the caller relays the ORIGINAL refusal
+    — the ladder never turns an error into a different model unasked, and
+    never fabricates a success.
+
+    Matching: a first-party rung (``from_vendor_id == ""``) matches its
+    ``from_model`` as a case-insensitive SUBSTRING of the forwarded id, so the
+    whole haiku-slot family (any generation the client spells) is one entry; a
+    vendor rung matches its ``from_model`` as the exact id. The returned
+    :class:`Route` is built straight from the target row — a ladder rung names
+    an id the row is known to serve (see :class:`~model_router.vendors.
+    FallbackRung`), so no known-ids judgement is re-run and a target missing
+    from the caller's registry answers ``None`` rather than a half-route.
+    """
+    if decision.is_anthropic:
+        lowered = decision.forward_model.lower()
+        for rung in ladder:
+            if rung.from_vendor_id == "" and rung.from_model.lower() in lowered:
+                return _rung_route(rung, vendors)
+        return None
+    for rung in ladder:
+        if (
+            rung.from_vendor_id == decision.family_id
+            and rung.from_model.lower() == decision.forward_model.lower()
+        ):
+            return _rung_route(rung, vendors)
+    return None
+
+
+def _rung_route(
+    rung: FallbackRung, vendors: Mapping[str, Vendor],
+) -> Optional[Route]:
+    """The rung's target as a :class:`Route`, or ``None`` when absent.
+
+    ``None`` (not an error) when the registry the CALLER holds has no such
+    row: a test or embedder registry without the target vendor simply has no
+    ladder, and the caller's original refusal stands.
+    """
+    vendor = vendors.get(rung.to_vendor_id)
+    if vendor is None:
+        return None
+    return Route(
+        upstream=vendor.upstream,
+        forward_model=rung.to_model_id,
+        vendor=vendor,
+        family_id=vendor.vendor_id,
+        is_anthropic=False,
+    )
+
+
 __all__ = [
     "MAX_SUGGESTIONS",
     "ONE_M_SUFFIX",
     "Route",
     "RouteError",
     "advertised_id",
+    "fallback_route",
     "has_claude_marker",
     "route",
     "split_namespace",

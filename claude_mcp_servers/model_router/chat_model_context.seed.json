@@ -19,8 +19,9 @@
       "max_output": 128000,
       "window_1m": true,
       "text_only": false,
+      "clear_thinking": false,
       "source": "https://docs.z.ai/guides/vlm/glm-5.3-flash",
-      "source_note": "Documented under /guides/vlm/ (the /guides/llm/ path 308-redirects there). text_only=false: the VLM page states 'Native multimodal input supporting images, videos, and files' — GLM-5.3-Flash SEES images, so image blocks are forwarded untouched (unlike glm-5.3)."
+      "source_note": "Documented under /guides/vlm/ (the /guides/llm/ path 308-redirects there). text_only=false: the VLM page states 'Native multimodal input supporting images, videos, and files' — GLM-5.3-Flash SEES images, so image blocks are forwarded untouched (unlike glm-5.3). clear_thinking=false (v0.2.102 A8, OD-10, P299:149): requests that carry a thinking param get thinking.clear_thinking=false, per the z.ai thinking guide (https://docs.z.ai/guides/capabilities/thinking — the same page effort.py cites); the field is sent ONLY on rows that carry it (default absent = not sent) and only when the request already has a thinking param."
     },
     "glm-5.1": {
       "vendor": "zai",

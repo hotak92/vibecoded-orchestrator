@@ -558,6 +558,14 @@ class UsageRecord:
     #: the same record rather than a parallel store so the calibration, the
     #: floor and the row can never disagree about which turn they describe.
     request_bytes: int = 0
+    #: v0.2.102 (A4/F2, OD-9): the rung this request ESCAPED, when the owner's
+    #: fallback ladder served it — ``"<route label>:<forward model>"`` of the
+    #: route whose qualifying refusal triggered the fallback. R15: no hidden
+    #: remaps — ``requested`` stays the id the client asked for, ``forward``
+    #: names the model that actually answered, and this field says the two
+    #: differ because of a fallback (and from where). Empty on every ordinary
+    #: row, so its absence means "no fallback", never "unknown".
+    fallback_from: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
@@ -602,6 +610,7 @@ def build_record(
     now: Optional[datetime] = None,
     one_m_client: bool = False,
     request_bytes: int = 0,
+    fallback_from: str = "",
 ) -> UsageRecord:
     """Assemble one row. Pure — no clock unless the caller declines to pass one.
 
@@ -642,6 +651,7 @@ def build_record(
         pct_actual=_pct(context_after, window_actual),
         usage_complete=usage_complete,
         request_bytes=max(0, int(request_bytes)),
+        fallback_from=str(fallback_from or ""),
     )
 
 
