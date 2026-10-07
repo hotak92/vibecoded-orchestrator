@@ -518,12 +518,16 @@ def _rl_human_turn_after(messages: list[dict], start_msg_idx: int) -> bool:
     return False
 
 def _rl_delete_own_pending_file(task_id: str) -> None:
-    """F-QUEUE: delete THIS retrieval's pending file when the MCP monitor fires.
+    """F-QUEUE: delete THIS retrieval's pending file when the MCP monitor's
+    citation write has LANDED.
 
     The MCP path stages a pending file (as a backstop) AND keeps in-memory ctx;
     when the monitor fires successfully it deletes its own file so the Stop-hook
     drain only processes survivors (orphans = monitor never fired → drain
-    recovers them). Soft-fail — a missing file is the common, fine case.
+    recovers them). W3R-1 (v0.2.102): the delete moved AFTER the token gate and
+    is skipped when the write did not land — a sub-gate force_flush or a failed
+    write leaves the file for the drain instead of losing the citation.
+    Soft-fail — a missing file is the common, fine case.
     """
     try:
         from claude_mcp_servers.rl_client.citation_pending import (
@@ -735,10 +739,6 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                 # a complete answer. We still pop the cache to free the slot.
                 ctx = held_ctx or server._rl_node_content_cache.get(task_id)
                 server._rl_node_content_cache.pop(task_id, None)
-                # F-QUEUE: the MCP monitor deletes its OWN pending file on fire
-                # so the Stop-hook drain only processes survivors (no double
-                # write). Soft-fail — a missing file is fine.
-                server._rl_delete_own_pending_file(task_id)
                 # F-LOG: persist answer-window length + the fire reason so the
                 # "≥25k tokens" distribution and monitor lifecycle are auditable
                 # from stored data (pre-F-LOG both were un-observable).
@@ -763,17 +763,45 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                                 "RL monitor %s: citation write raised (%s); continuing",
                                 task_id[:8], exc,
                             )
+                        # F-QUEUE (v0.2.102 W3R-1): the MCP monitor deletes its
+                        # OWN pending file only once the citation write has
+                        # LANDED, so the Stop-hook drain only processes
+                        # survivors (no double write). Pre-W3R-1 the delete ran
+                        # BEFORE the token gate below, so a sub-gate fire (a
+                        # force_flush on a short window) discarded the pending
+                        # file and skipped with a DEBUG line — the citation was
+                        # permanently lost with no ledger line and no drain
+                        # recovery. A failed/soft-failed write likewise KEEPS
+                        # the file now: the drain retries it at session end.
+                        if citation_result is not None:
+                            server._rl_delete_own_pending_file(task_id)
+                        else:
+                            server.logger.info(
+                                "RL monitor %s: citation write did not land; "
+                                "pending file left for the Stop-hook drain",
+                                task_id[:8],
+                            )
                     else:
                         # F-B observability: ctx genuinely unavailable (never
                         # staged) — make the skip visible instead of silent.
+                        # The pending file is KEPT (W3R-1), so the drain can
+                        # still anchor the answer by timestamp (G5) — this
+                        # "deferred to the drain" line is literally true.
                         server.logger.info(
                             "RL monitor %s: gate met but ctx unavailable; "
                             "citation deferred to Stop-hook drain",
                             task_id[:8],
                         )
                 else:
-                    server.logger.debug(
-                        "RL monitor %s: answer too short (%d tokens < %d); skip citation",
+                    # W3R-1: a sub-gate fire (force_flush on a short window)
+                    # KEEPS the pending file: the Stop-hook drain re-anchors
+                    # the answer by timestamp and applies its own floors
+                    # (25k / terminal_floor / soft_terminal), so the retrieval
+                    # is labeled at session end instead of never. INFO, not
+                    # DEBUG — this used to be the silent-loss path.
+                    server.logger.info(
+                        "RL monitor %s: answer below citation gate (%d tokens < %d); "
+                        "pending file left for the Stop-hook drain",
                         task_id[:8], answer_token_count, server._RL_MIN_ANSWER_TOKENS_FOR_CITATION,
                     )
 
@@ -1786,6 +1814,250 @@ def _stage_code_citation_pending(
         server.logger.debug("_stage_code_citation_pending failed (%s)", exc)
         return None
 
+# ---------------------------------------------------------------------------
+# W3R-9 (v0.2.102): the telemetry writer's project identity must be STABLE.
+#
+# Pre-fix, a transient hub-config miss in the long-lived MCP process made
+# ``_get_rl_telemetry_writer_for`` fall back to the env display name with
+# ``project_id=None`` — and the writer cache then PINNED that identity for
+# the rest of the process. Live rows showed the split: a project's DISPLAY
+# name (project_id NULL) beside its SLUG (project_id set), written by the
+# same install on the same days. Those rows are stranded from every
+# project_id-keyed cohort partition.
+#
+# The fix, in precedence order (no silent identity change — each fallback is
+# logged):
+#   1. hub-resolved config (unchanged), which is ALSO remembered — in this
+#     process and on disk keyed by project root;
+#   2. the LAST RESOLVED identity for the SAME project root (this process
+#     first, then the cross-process cache) — an MCP process serves exactly
+#     one project, so a transient miss must stamp what a resolved call would,
+#     and a process that serves several roots never stamps ANOTHER root's
+#     identity (the in-process memory is keyed by root, like the disk cache);
+#   3. the env display-name fallback (unchanged), now logged at WARNING once
+#     per process because it stamps project_id=NULL.
+#
+# A stale cached ``project_id`` whose project row was deleted fails the
+# rl_events FK at insert time; the hub answers 422 ``unknown_project_id`` and
+# the writer side DROPS that cached identity (in-process, on disk, and the
+# writer cache) and re-resolves on the next emit, so a deleted-and-
+# re-registered project does not lose events for the rest of the TTL
+# (batch-8 review follow-up). The TTL bounds only the case where the hub
+# never answers at all; the entry is refreshed on every successful resolve.
+#
+# Hermeticity: the whole mechanism is OFF when ``VCT_DISABLE_HUB_RESOLVER``
+# is set — the same flag that makes ``_try_resolve_project_config`` return
+# None for test fixtures. That flag's contract is "pure env-fallback
+# behavior", and a remembered hub identity would break it (a cache entry
+# written by one test would steer every later test resolving under the same
+# project root in the shared session state dir).
+_LAST_GOOD_BY_ROOT: "dict[str, dict]" = {}
+_IDENTITY_FALLBACK_WARNED = False
+_IDENTITY_CACHE_NAME = "rl_project_identity_cache.json"
+IDENTITY_CACHE_TTL_ENV = "VCO_RL_IDENTITY_CACHE_TTL_S"
+_IDENTITY_CACHE_TTL_DEFAULT_S = 30.0 * 86400.0
+
+
+def _identity_cache_disabled() -> bool:
+    return bool(os.environ.get("VCT_DISABLE_HUB_RESOLVER"))
+
+
+def _identity_cache_ttl_s() -> float:
+    try:
+        return float(
+            os.environ.get(IDENTITY_CACHE_TTL_ENV, "") or _IDENTITY_CACHE_TTL_DEFAULT_S
+        )
+    except (TypeError, ValueError):
+        return _IDENTITY_CACHE_TTL_DEFAULT_S
+
+
+def _identity_cache_path():
+    """``<vct_root>/rl_project_identity_cache.json`` (machine-level state)."""
+    from vco_lib.paths import vct_root_dir
+
+    return vct_root_dir() / _IDENTITY_CACHE_NAME
+
+
+def _identity_from_cfg(cfg) -> dict:
+    """Project tag + id from a resolved ProjectConfig, in the canonical order
+    (slug → code-graph project → display name)."""
+    return {
+        "project": (
+            getattr(cfg, "project_slug", "")
+            or getattr(cfg, "code_graph_project", "")
+            or getattr(cfg, "project_display_name", "")
+            or ""
+        ),
+        "project_id": getattr(cfg, "project_id", None),
+    }
+
+
+def _remember_project_identity(cfg) -> None:
+    """Remember a hub-resolved identity in-process AND on disk (keyed by the
+    project root), so a later transient resolve miss — in this process or a
+    future hook/CLI process — reuses it instead of splitting the cohort.
+    Best-effort; never raises."""
+    import json as _json
+    import time as _time
+
+    if _identity_cache_disabled():
+        return
+    ident = _identity_from_cfg(cfg)
+    if not ident["project"]:
+        return
+    try:
+        root, _kind = server._resolution_context()
+    except Exception:  # noqa: BLE001 — no root, no key; nothing to key the memory by
+        return
+    key = str(root)
+    if _LAST_GOOD_BY_ROOT.get(key) == ident:
+        return  # already remembered this identity for this root in this process
+    _LAST_GOOD_BY_ROOT[key] = ident
+    try:
+        from vco_lib.atomic import atomic_write_json, exclusive_file_lock
+
+        path = _identity_cache_path()
+        with exclusive_file_lock(path.with_name(path.name + ".lock"), timeout_s=1.0):
+            state: dict = {}
+            try:
+                raw = _json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    state = raw
+            except (OSError, ValueError):
+                state = {}
+            state.setdefault("roots", {})[key] = {
+                **ident,
+                "ts_ms": int(_time.time() * 1000),
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(path, state)
+    except Exception as exc:  # noqa: BLE001 — the cache is a hint, never a failure
+        server.logger.debug("RL identity cache write failed (%s)", exc)
+
+
+def _cached_project_identity() -> "dict | None":
+    """The last RESOLVED identity for THIS project root — this process first,
+    then the cross-process cache — or None. Freshness-bounded by
+    ``VCO_RL_IDENTITY_CACHE_TTL_S`` (default 30 days)."""
+    import json as _json
+    import time as _time
+
+    if _identity_cache_disabled():
+        return None
+    try:
+        root, _kind = server._resolution_context()
+    except Exception:  # noqa: BLE001
+        return None
+    key = str(root)
+    in_process = _LAST_GOOD_BY_ROOT.get(key)
+    if in_process is not None:
+        return in_process
+    try:
+        entry = (
+            _json.loads(_identity_cache_path().read_text(encoding="utf-8"))
+            .get("roots", {})
+            .get(key)
+        )
+        if not isinstance(entry, dict) or not entry.get("project"):
+            return None
+        ts_ms = entry.get("ts_ms")
+        if not isinstance(ts_ms, (int, float)):
+            return None
+        age_s = _time.time() - float(ts_ms) / 1000.0
+        if age_s > _identity_cache_ttl_s():
+            return None
+        ident = {"project": entry["project"], "project_id": entry.get("project_id")}
+        _LAST_GOOD_BY_ROOT[key] = ident
+        server.logger.info(
+            "RL telemetry: hub config unresolved; reusing the last resolved "
+            "project identity for this root (project=%r, %.0f h old) — set "
+            "%s to tune the freshness bound",
+            ident["project"], age_s / 3600.0, IDENTITY_CACHE_TTL_ENV,
+        )
+        return ident
+    except Exception:  # noqa: BLE001 — no cache, no identity
+        return None
+
+
+def invalidate_project_identity(project_id: str) -> None:
+    """Drop every cached writer identity carrying ``project_id`` (batch-8
+    review follow-up to W3R-9).
+
+    Called by ``rl_client.hub_writer`` when the hub REJECTS an event with 422
+    ``unknown_project_id`` — the rl_events FK fired, so the cached id's
+    project row is gone (project deleted / re-registered). The stale identity
+    is removed from all three caches (in-process last-good, the on-disk cache,
+    the writer cache), so the NEXT emit re-resolves the project config from
+    the hub — which is up, it just answered — and stamps the fresh identity
+    instead of losing events for the rest of the cache TTL. Never raises.
+    """
+    if not project_id:
+        return
+    # ``server`` goes through the lazy proxy — attribute access IMPORTS the
+    # whole server module when none is loaded. In a light hook/child process
+    # that is a heavy side effect on a telemetry failure path, and with no
+    # server loaded there is no writer cache to evict anyway — so resolve the
+    # loaded-check ONCE, up front, and gate every ``server.`` touch on it.
+    _main_file = (getattr(_sys.modules.get("__main__"), "__file__", "") or "").replace(
+        "\\", "/"
+    )
+    _server_loaded = _main_file.endswith("weaviate_mcp/server.py") or any(
+        name in _sys.modules for name in _SERVER_MOD_NAMES
+    )
+    try:
+        doomed_roots = [
+            root for root, ident in _LAST_GOOD_BY_ROOT.items()
+            if ident.get("project_id") == project_id
+        ]
+        for root in doomed_roots:
+            _LAST_GOOD_BY_ROOT.pop(root, None)
+        if _server_loaded:
+            doomed_keys = [
+                key for key, w in server._rl_telemetry_writers.items()
+                if getattr(w, "_project_id", None) == project_id
+            ]
+            for key in doomed_keys:
+                server._rl_telemetry_writers.pop(key, None)
+        import json as _json
+
+        from vco_lib.atomic import atomic_write_json, exclusive_file_lock
+
+        path = _identity_cache_path()
+        if path.exists():
+            with exclusive_file_lock(path.with_name(path.name + ".lock"), timeout_s=1.0):
+                try:
+                    state = _json.loads(path.read_text(encoding="utf-8"))
+                    if not isinstance(state, dict):
+                        state = {}
+                except (OSError, ValueError):
+                    state = {}
+                roots = state.get("roots") or {}
+                for root in [r for r, e in roots.items()
+                             if isinstance(e, dict) and e.get("project_id") == project_id]:
+                    roots.pop(root, None)
+                atomic_write_json(path, state)
+        if _server_loaded:
+            _log = server.logger
+        else:
+            import logging as _logging
+
+            _log = _logging.getLogger(__name__)
+        _log.warning(
+            "RL telemetry: hub rejected project_id=%r as unknown (project "
+            "deleted or re-registered) — dropped the cached identity; the "
+            "next event re-resolves the project config",
+            project_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — invalidation must never break a write path
+        _log = server.logger if _server_loaded else None
+        if _log is None:
+            import logging as _logging
+
+            _log = _logging.getLogger(__name__)
+        _log.debug("RL identity invalidation failed (%s)", exc)
+
+
+
 def _get_rl_telemetry_writer_for(
     embedding_source: str,
     *,
@@ -1850,14 +2122,28 @@ def _get_rl_telemetry_writer_for(
     # uses as the cohort key — so cohort analysis at training time can
     # join cleanly.
     project = ""
+    project_id = None
     _cfg_for_telemetry = server._try_resolve_project_config()
     if _cfg_for_telemetry is not None:
+        # W3R-9: a successful resolve is remembered (in-process + on disk) so
+        # a later TRANSIENT miss reuses this exact identity instead of
+        # stamping the env display name with project_id=NULL.
+        _remember_project_identity(_cfg_for_telemetry)
         project = (
             _cfg_for_telemetry.project_slug
             or _cfg_for_telemetry.code_graph_project
             or _cfg_for_telemetry.project_display_name
             or ""
         )
+        project_id = _cfg_for_telemetry.project_id
+    else:
+        # W3R-9: transient hub-config miss — reuse the LAST RESOLVED identity
+        # for this project root (an MCP process serves exactly one project),
+        # never a different one.
+        _ident = _cached_project_identity()
+        if _ident is not None:
+            project = _ident["project"]
+            project_id = _ident.get("project_id")
     if not project:
         # Env-fallback path also canonicalizes via sanitize_for_weaviate_class
         # so multi-workspace setups (same project opened with different env
@@ -1869,6 +2155,18 @@ def _get_rl_telemetry_writer_for(
                 project = sanitize_for_weaviate_class(raw_name)
             except Exception:
                 project = raw_name
+        if project:
+            # W3R-9: this fallback stamps project_id=NULL — visible, not silent.
+            global _IDENTITY_FALLBACK_WARNED
+            if not _IDENTITY_FALLBACK_WARNED:
+                _IDENTITY_FALLBACK_WARNED = True
+                server.logger.warning(
+                    "RL telemetry writer: hub project config unresolved and no "
+                    "remembered identity for this project root — events will be "
+                    "stamped project=%r with project_id=NULL until the hub "
+                    "resolves (they will not join the project_id cohort)",
+                    project,
+                )
 
     # ---- look up / construct the writer for this key ----
     key = (project, emb_source)
@@ -1881,11 +2179,7 @@ def _get_rl_telemetry_writer_for(
     # docstring for the pre-v0.2.52 baseline).
     writer = RLTelemetryWriter(
         project=project,
-        project_id=(
-            _cfg_for_telemetry.project_id
-            if _cfg_for_telemetry is not None
-            else None
-        ),
+        project_id=project_id,
         embedding_source=emb_source,
         embedding_dim=emb_dim,
         embedding_model=emb_model,
@@ -1963,9 +2257,14 @@ def _reset_rl_telemetry_writers() -> None:
     JSONL on every write via context manager — so clearing the dict is
     sufficient teardown. This helper exists so test fixtures can isolate
     state between tests and so any future shutdown hook has a single
-    canonical reset path.
+    canonical reset path. Also clears the W3R-9 remembered project identity
+    (in-process last-good + the fallback-warning latch) so tests can
+    re-exercise the resolve-miss paths.
     """
+    global _IDENTITY_FALLBACK_WARNED, _LAST_GOOD_BY_ROOT
     server._rl_telemetry_writers.clear()
+    _LAST_GOOD_BY_ROOT.clear()
+    _IDENTITY_FALLBACK_WARNED = False
 
 def _rl_pack_linked_embs_for_node(
     node: dict,

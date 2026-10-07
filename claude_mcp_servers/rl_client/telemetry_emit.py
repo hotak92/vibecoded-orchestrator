@@ -181,9 +181,14 @@ def emit_rl_event(
         writer = writer_factory()
     except Exception as exc:
         logger.debug("emit_rl_event: writer factory raised (%s); skipping", exc)
+        # W3R-5 (v0.2.102): a writer that cannot be CONSTRUCTED means the
+        # event is dropped before any POST — ledger it (a broken install is
+        # exactly when this fires and exactly when visibility matters).
+        _record_writer_unavailable(ev, "writer_factory_raised")
         return False
     if writer is None:
         logger.debug("emit_rl_event: no writer available; skipping")
+        _record_writer_unavailable(ev, "writer_unavailable")
         return False
 
     # ---- session_id resolution ----
@@ -217,6 +222,28 @@ def emit_rl_event(
     return True
 
 
+def _record_writer_unavailable(ev: "RetrievalEvent", reason: str) -> None:
+    """Ledger a writer-unavailable drop (W3R-5). Never raises — a loss record
+    must not become a second failure on a path that is already losing one.
+
+    This is the ONE home for the ``writer_unavailable`` kind on the emit path.
+    ``deferred_emit._record_unsent`` re-probes writer availability for its
+    unsent items and SKIPS the ones this function already ledgered, so an
+    event is never counted under both kinds.
+    """
+    try:
+        from vco_lib.rl_telemetry_loss import KIND_WRITER_UNAVAILABLE, record_loss
+
+        record_loss(
+            KIND_WRITER_UNAVAILABLE,
+            reason,
+            task_id=ev.task_id,
+            task_type=ev.task_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("emit_rl_event: could not record writer-unavailable loss (%s)", exc)
+
+
 def _default_writer_factory():
     """Resolve the project's cached writer via server's existing cache.
 
@@ -236,8 +263,14 @@ def _default_writer_factory():
 def new_task_id() -> str:
     """Convenience for callers that don't have an upstream task_id.
 
-    UUID4 chosen for uniqueness without coordination; the writer
-    enforces ``task_id`` uniqueness at the DB layer so collisions surface
-    immediately if any caller hardcodes a value.
+    UUID4 chosen for uniqueness without coordination. Note the actual
+    dedupe contract (v0.2.102 W3R-7): the hub refuses an EXACT re-POST of
+    the same ``(task_id, event_type, ts_ms)`` row (insert-time existence
+    check in ``Db::insert_rl_event`` — no schema migration, existing
+    duplicates untouched), so an accidental double-send of one serialized
+    event is idempotent. ``task_id`` ALONE is deliberately NOT unique:
+    retrieval/citation pairs and the dual-log twin share one by design, so
+    distinct events still need distinct ``(event_type, ts_ms)`` or distinct
+    task_ids — which is what this UUID4 provides.
     """
     return uuid.uuid4().hex

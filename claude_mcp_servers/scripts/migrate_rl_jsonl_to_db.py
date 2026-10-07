@@ -41,10 +41,18 @@ Idempotency
 -----------
 The script renames the source file as its last action. Re-runs find no
 source file → no-op. Crashes between POST and rename cause re-POSTs of
-already-inserted events; the hub's ``rl_events`` table has
-``(task_id, event_type, ts_ms)`` UNIQUE — duplicates raise the hub-side
-INSERT, hub returns 4xx, this script counts them as ``already_inserted``
-and continues. End state is the same.
+already-inserted events; since v0.2.102 (W3R-7) the hub deduplicates an
+EXACT re-POST at insert time — ``Db::insert_rl_event`` checks for an
+existing ``(task_id, event_type, ts_ms)`` row before inserting and returns
+the existing row's id with HTTP 200, so the re-POST is an idempotent no-op
+counted as ``posted`` (the row is in the DB; the end state is the same).
+No UNIQUE constraint was added: existing user DBs may already carry
+duplicate rows, which would make a new unique index fail — the existence
+check needs no migration and rewrites no data. (Pre-W3R-7 this section
+claimed a ``(task_id, event_type, ts_ms)`` UNIQUE constraint did the
+dedupe; that constraint never existed, and re-POSTs double-inserted.)
+``task_id`` alone is deliberately NOT deduplicated: retrieval/citation
+pairs and dual-log twins share one task_id by design.
 
 Soft-fail
 ---------
@@ -320,10 +328,12 @@ def _process_file(
         if post_rl_event(body):
             posted += 1
         else:
-            # post_rl_event returns False for ANY non-2xx including the
-            # idempotent re-run case (duplicate task_id). The hub logs the
-            # exact status code at debug; we count without distinguishing
-            # because the user-facing outcome is the same: row is in DB.
+            # Since v0.2.102 (W3R-7) an exact re-POST of an already-inserted
+            # (task_id, event_type, ts_ms) row is deduplicated hub-side and
+            # returns 200 — counted as ``posted`` above, because the row is
+            # in the DB. A False here is a REAL failure (hub down, timeout,
+            # a 4xx/5xx rejection) and is recorded in the RL loss ledger by
+            # hub_writer.
             errors += 1
             if len(reasons) < 50:
                 reasons.append(f"line {lineno}: hub POST failed")
