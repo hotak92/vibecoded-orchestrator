@@ -165,9 +165,21 @@ class Glm52RetiredTests(unittest.TestCase):
                 self.assertIsInstance(decision, RouteError)
 
     def test_both_rows_retire_it_and_neither_declares_it(self) -> None:
-        for vendor in VENDORS.values():
+        # The two rows that SERVE glm (z.ai's own endpoint and the Token
+        # Plan). A vendor that never listed a glm id (kimi, v0.2.102) has
+        # nothing to retire; it is checked for not declaring it below.
+        for vendor in (VENDORS["zai"], VENDORS["qwen"]):
             with self.subTest(vendor=vendor.vendor_id):
                 self.assertIn("glm-5.2", vendor.retired_ids)
+                for declared in (
+                    *vendor.static_ids, *vendor.verified_ids,
+                    *vendor.catalog_hide_ids,
+                ):
+                    self.assertNotEqual(declared, "glm-5.2")
+
+    def test_no_other_row_declares_it(self) -> None:
+        for vendor in VENDORS.values():
+            with self.subTest(vendor=vendor.vendor_id):
                 for declared in (
                     *vendor.static_ids, *vendor.verified_ids,
                     *vendor.catalog_hide_ids,

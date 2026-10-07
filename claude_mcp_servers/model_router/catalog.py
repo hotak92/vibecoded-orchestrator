@@ -100,6 +100,12 @@ from .vendors import (
 
 logger = logging.getLogger(__name__)
 
+#: The request header a client's identity travels in. Relayed onto the vendor
+#: model-list fetch a client's ``/v1/models`` triggers (see
+#: :meth:`CatalogService.union`); the server reads the client's value under
+#: the same name.
+USER_AGENT_HEADER = "User-Agent"
+
 #: Shipped snapshot, beside this module (so it travels inside the wheel).
 STATIC_CATALOG_PATH = Path(__file__).resolve().parent / "static_catalog.json"
 
@@ -1162,7 +1168,15 @@ class CatalogService:
                 CatalogEntry(
                     id=model_id,
                     display_name=str(row.get("display_name") or model_id),
-                    max_input_tokens=cls._upstream_int(row.get("max_input_tokens")),
+                    # Anthropic's list names the window ``max_input_tokens``;
+                    # an OpenAI-style list (one vendor row's) names it
+                    # ``context_length``. Same quantity, the publisher's own
+                    # figure — read the second only when the first is absent,
+                    # and still BELOW a cited table row (``resolve_window``).
+                    max_input_tokens=(
+                        cls._upstream_int(row.get("max_input_tokens"))
+                        or cls._upstream_int(row.get("context_length"))
+                    ),
                     max_tokens=cls._upstream_int(row.get("max_tokens")),
                     created_at=(
                         created_at.strip()
@@ -1203,7 +1217,9 @@ class CatalogService:
         self._cache[self._anthropic.family_id] = result
         return result
 
-    async def _vendor_entries(self, vendor: Vendor) -> _FamilyCache:
+    async def _vendor_entries(
+        self, vendor: Vendor, user_agent: Optional[str] = None,
+    ) -> _FamilyCache:
         cached = self._fresh(vendor.vendor_id)
         if cached is not None:
             return cached
@@ -1230,13 +1246,21 @@ class CatalogService:
             else:
                 # Not None here: the no-discovery branch above returned.
                 url = f"{vendor.upstream}{vendor.catalog_path}"
-            payload = await self._fetch_json(
-                url,
-                {
-                    vendor.auth_header: f"{vendor.auth_scheme}{key}",
-                    "anthropic-version": DEFAULT_ANTHROPIC_VERSION,
-                },
-            )
+            headers = {
+                vendor.auth_header: f"{vendor.auth_scheme}{key}",
+                "anthropic-version": DEFAULT_ANTHROPIC_VERSION,
+            }
+            if user_agent:
+                # The CLIENT's user-agent, relayed — never one this process
+                # makes up. The fetch exists because a client asked for the
+                # picker, so it goes out as that client, exactly like the
+                # /v1/messages relay. Load-bearing for a vendor whose edge
+                # refuses library user-agents (see that vendor's row in
+                # ``vendors.py``); without a client value the HTTP library's
+                # default goes out and such a vendor falls back to its
+                # declared list.
+                headers[USER_AGENT_HEADER] = user_agent
+            payload = await self._fetch_json(url, headers)
         entries = self._parse_models(payload)
         if entries and vendor.catalog_exclude_prefixes:
             entries = _exclude_by_prefix(
@@ -1273,6 +1297,7 @@ class CatalogService:
         table: ContextTable,
         catalog_filter: str = DEFAULT_CATALOG_FILTER,
         window_rows: str = DEFAULT_WINDOW_ROWS,
+        user_agent: Optional[str] = None,
     ) -> CatalogUnion:
         """Build the picker list.
 
@@ -1312,6 +1337,12 @@ class CatalogService:
         publishes everything, which is the escape hatch for anyone who needs
         a previous version and the reason the filter is a knob rather than a
         rule.
+
+        ``user_agent`` is the user-agent of the client request that asked for
+        the picker. Each VENDOR model-list fetch this call makes carries it
+        (a cache hit makes none), so the gateway's own fetch reaches the
+        vendor as the client it is acting for. ``None`` sends no header and
+        leaves the HTTP library's default in place.
         """
         sources: dict[str, str] = {}
         entries: list[CatalogEntry] = []
@@ -1330,7 +1361,7 @@ class CatalogService:
         vendors = list(self._vendors.values())
         first, *vendor_families = await asyncio.gather(
             self._anthropic_entries(),
-            *(self._vendor_entries(vendor) for vendor in vendors),
+            *(self._vendor_entries(vendor, user_agent) for vendor in vendors),
         )
 
         sources[self._anthropic.family_id] = first.source
@@ -1489,6 +1520,7 @@ __all__ = [
     "CatalogUnion",
     "FamilyFloor",
     "JsonFetcher",
+    "USER_AGENT_HEADER",
     "WindowResolution",
     "describe_row",
     "resolve_family_windows",

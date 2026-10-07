@@ -71,6 +71,10 @@ Vendor-doc backing (re-checked 2026-10-03/04; the URL is cited per row):
   https://docs.z.ai/guides/capabilities/thinking
   (``medium`` is NOT in the documented set but was ACCEPTED live — HTTP 200 —
   so it is recorded as accepted and never rewritten.)
+* Kimi Code (k3): low/high/max; the vendor maps
+  ``medium``→``high`` and ``xhigh``→``max`` itself and 400s only on values
+  outside its documented list (read 2026-10-07, not yet probed live).
+  https://www.kimi.com/code/docs/kimi-code/models.html
 """
 
 from __future__ import annotations
@@ -199,6 +203,30 @@ EFFORT_POLICIES: Mapping[tuple[str, str], EffortPolicy] = {
             "As glm-5.3 on z.ai: medium ACCEPTED live -> HTTP 200 (fixture "
             "medium-zai-flash.body). reasoning_effort is a GLM-5.2+ feature "
             "(z.ai thinking guide); nothing is rewritten."
+        ),
+    ),
+    # ── Kimi Code route (doc-only, read 2026-10-07; no live capture yet) ──
+    # The vendor documents an effort mapping for third-party tools that
+    # ACCEPTS every value Claude Code sends and collapses two of them itself
+    # ("ultra / max / xhigh → max", "high / medium → high",
+    # "low / minimum / light → low"; "其它未知取值 → HTTP 400"). So nothing is
+    # rejected and nothing is rewritten — the collapses are recorded as data.
+    # Only k3 is offered (owner ruling 2026-10-07, see the kimi vendor row),
+    # so only it carries a row. The live /v1/models probe (2026-10-07) agrees:
+    # think_efforts valid low/high/max, default_effort high.
+    ("kimi", "k3"): EffortPolicy(
+        accepted=frozenset({"low", "medium", "high", "xhigh", "max"}),
+        translate={},
+        collapses={"medium": "high", "xhigh": "max"},
+        doc_url="https://www.kimi.com/code/docs/kimi-code/models.html",
+        note=(
+            "Kimi models page, 'effort 映射' table: low/high/max are the "
+            "model's levels (k3 default high); medium collapses to high and "
+            "xhigh to max vendor-side; only values outside the documented "
+            "list return HTTP 400, and Claude Code sends none of those. The "
+            "live /v1/models probe (2026-10-07) confirms the levels and the "
+            "high default; that medium/xhigh are ACCEPTED on /v1/messages is "
+            "documented, not yet probed live."
         ),
     ),
 }

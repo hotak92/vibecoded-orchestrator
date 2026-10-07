@@ -2,13 +2,18 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Vendor registry — the ONLY module in this package that names a vendor.
 
-The shipped scope is deliberately narrow: exactly the routes that have been
-proven end-to-end on a live machine — the Claude OAuth passthrough, the
-Z.ai/GLM subscription route, and the QwenCloud Token Plan route (owner order
+The shipped scope is deliberately narrow: the routes that have been proven
+end-to-end on a live machine — the Claude OAuth passthrough, the Z.ai/GLM
+subscription route, and the QwenCloud Token Plan route (owner order
 2026-09-21; the pay-as-you-go QwenCloud endpoint is deliberately absent until
-its model list is extracted and proven — see the ``qwen`` row). Kimi and
-OpenRouter are NOT shipped, not even as disabled rows: a disabled row is
-untested code shipped as config.
+its model list is extracted and proven — see the ``qwen`` row) — and the Kimi
+Code subscription route (owner order 2026-10-07, K3 only). That last row was
+written from the vendor's docs and then probed live the same day (endpoint,
+auth, model list); every field cites its source, and the row says in place
+which claim still waits on a live probe (the model echo). OpenRouter, the
+Moonshot pay-as-you-go platform and the mainland-China Kimi endpoint are NOT
+shipped, not even as disabled rows: a disabled row is untested code shipped
+as config.
 
 What IS the deliverable is the SHAPE. Adding a vendor must be a row in
 :data:`VENDORS`, never a code change. ``tests/test_model_router_routing.py``
@@ -122,8 +127,8 @@ class Vendor:
             blank entry would drop the entire live list.
         auth_header / auth_scheme: how the resolved key is presented.
         docs_url: cited in user-facing copy about this vendor.
-        alias_trap: True when the vendor's endpoint is DOCUMENTED to answer
-            ``claude-*`` names with its own model. Purely informational —
+        alias_trap: True when the vendor's endpoint is DOCUMENTED or MEASURED
+            to answer ``claude-*`` names with its own model. Purely informational —
             the honest-naming guard in :func:`model_router.routing.route`
             applies to every vendor unconditionally, because a vendor that has
             not documented an alias table can still add one tomorrow.
@@ -196,6 +201,18 @@ class Vendor:
             relayed byte-identically, and a flagged row whose event already
             reports at least the floor is too — the splice fires on the
             measured deficiency, not on the flag alone.
+        forward_verified_only: True when this vendor's endpoint was MEASURED
+            to answer ANY model name with HTTP 200 and to echo the requested
+            name back in the response's ``model`` field — a wildcard alias, so
+            neither a 200 nor the echo says which model answered. For such a
+            row the router forwards ONLY ``verified_ids`` (see
+            :func:`model_router.routing._vendor_route`): every other id —
+            even one the vendor's own list carries, and even one inside a
+            ``bare_id_prefixes`` family — is refused locally like an unknown
+            id, and only verified ids are offered as suggestions. Without the
+            flag ``verified_ids`` narrows the PICKER only (the zai shape, whose
+            endpoint 400s a nonsense name). :func:`validate_registry` requires
+            a non-empty ``verified_ids`` on a flagged row.
     """
 
     vendor_id: str
@@ -229,6 +246,7 @@ class Vendor:
     quota_url: Optional[str] = None
     short_name: str = ""
     partial_message_start_usage: bool = False
+    forward_verified_only: bool = False
 
 
 ANTHROPIC_FAMILY = AnthropicFamily(
@@ -370,6 +388,122 @@ VENDORS: Mapping[str, Vendor] = {
         # exceeds the floor is relayed byte-identically.
         partial_message_start_usage=True,
     ),
+    # Kimi Code — the Kimi membership's coding subscription (owner order
+    # 2026-10-07). Docs read 2026-10-07; the pages:
+    #   overview   https://www.kimi.com/code/docs/
+    #   models     https://www.kimi.com/code/docs/kimi-code/models.html
+    #   Claude Code https://www.kimi.com/code/docs/third-party-tools/claude-code.html
+    #   errors     https://www.kimi.com/code/docs/kimi-code/error-reference.html
+    #   membership https://www.kimi.com/code/docs/kimi-code/membership.html
+    # LIVE-PROBED 2026-10-07 with the owner's key (coordinator probe): the
+    # messages endpoint, both auth headers, the model list, a Cloudflare
+    # user-agent gate and a wildcard alias — each noted at its field below.
+    "kimi": Vendor(
+        vendor_id="kimi",
+        display_suffix=" · Kimi Code subscription",
+        display_name="Kimi Code",
+        # Extends the shared namespace like the qwen row, so every panel rule
+        # keyed on ``claude-gw/`` holds and the longest-match resolution keeps
+        # the shorter namespace from shadowing it.
+        namespace="claude-gw/kimi/",
+        # The INTERNATIONAL Anthropic-compatible base (overview + models
+        # pages: "Anthropic 兼容 ... 海外 https://api.kimi.ai/coding/"); the
+        # gateway appends ``/v1/messages`` exactly as Claude Code does ("会自动
+        # 拼接后续路径"), giving the documented example endpoint
+        # ``.../coding/v1/messages`` (live 200, 2026-10-07, Anthropic-shaped
+        # answers incl. ``thinking`` blocks). Trailing slash dropped because
+        # the forwarded path starts with one. The mainland-China base
+        # (api.kimi.com, also live 200) is a different storefront and is not
+        # shipped.
+        #
+        # USER-AGENT GATE (live 2026-10-07): the endpoint sits behind a
+        # Cloudflare rule that answers 403 "error code: 1010" to a library
+        # user-agent (Python-urllib) and 200 to Claude Code's
+        # ``claude-cli/...`` one. The gateway therefore relays the CLIENT's
+        # own user-agent — on /v1/messages (the generic header relay) and on
+        # the model-list fetch a client's /v1/models triggers
+        # (``CatalogService.union(user_agent=...)``). It never invents one:
+        # the vendor's terms make tampering with the client identity a
+        # violation ("篡改客户端标识（User-Agent）将被视为违规", overview page).
+        upstream="https://api.kimi.ai/coding",
+        # ``KIMI_API_KEY`` is the name the owner's launcher keychain holds
+        # (shared scope, 2026-10-07) and the Kimi Code CLI's own credential
+        # name; ``kimi_api_key`` is the lowercase canonical spelling of the
+        # zai/qwen rows — the same two-name pattern. ``MOONSHOT_API_KEY`` is
+        # deliberately NOT tried: that name belongs to the Moonshot open
+        # platform's pay-as-you-go key, which the FAQ says is a DIFFERENT key
+        # for a different base URL
+        # (https://www.kimi.com/code/docs/kimi-code/faq.html, "注意区分平台"),
+        # so resolving it would send a platform key to the coding endpoint —
+        # or borrow a project's own platform key for VCO's use.
+        secret_keys=("kimi_api_key", "KIMI_API_KEY"),
+        # ``k3`` typeable without the namespace. Any other ``k3…`` id lands
+        # on this row and is refused there with ``claude-gw/kimi/k3`` as the
+        # suggestion (``forward_verified_only``) — rather than falling
+        # through to the generic unknown-model refusal.
+        bare_id_prefixes=("k3",),
+        # ``GET <upstream>/v1/models`` answers an OpenAI-style
+        # ``{"data": [...]}`` list (live 200, 2026-10-07) — the envelope the
+        # catalog already parses — so the row rides the ordinary LIVE path.
+        # Its ``context_length`` is read as the publisher's window
+        # (``CatalogService._parse_models``), below the cited seed row for k3
+        # — which states the same 1048576 the live list reports (live
+        # /v1/models probe 2026-10-07). ``supports_image_in`` (true for k3)
+        # and ``think_efforts`` (low/high/max, default high) are not read;
+        # the seed row and effort.py record them.
+        catalog_path="/v1/models",
+        # Claude Code is told to set ANTHROPIC_API_KEY (Claude Code page,
+        # step 3), which it sends as ``X-Api-Key``. Live 2026-10-07: the
+        # endpoint accepts BOTH ``x-api-key`` and ``Authorization: Bearer``;
+        # the gateway uses the one the vendor's own Claude Code setup uses.
+        auth_header="x-api-key",
+        auth_scheme="",
+        docs_url="https://www.kimi.com/code/docs/third-party-tools/claude-code.html",
+        # A WILDCARD ALIAS, measured live 2026-10-07 (coordinator probe with
+        # the owner's key): POST /v1/messages with model ``nonsense-model-xyz``
+        # and with ``claude-sonnet-5-5`` both answered HTTP 200, and the
+        # response's ``model`` field ECHOED whatever was requested. (The docs
+        # claim otherwise — Claude Code page: a Claude default name "报模型不
+        # 存在错误"; error reference: 401 "Your model id does not exist" — the
+        # live endpoint does not behave that way.) So a 200 and the echo are
+        # NOT evidence of which model answered, and server.py's model-echo
+        # counter (model_echo_mismatches) can never fire for this vendor: it
+        # must not be credited as verification here. The defence is the
+        # router's: ``forward_verified_only`` below forwards only the
+        # verified id and refuses everything else locally; the honest-naming
+        # guard additionally refuses any Claude-marked id, as for every
+        # vendor. One further DOCUMENTED substitution the gateway cannot
+        # see: with thinking turned OFF the vendor answers k3 requests with
+        # K2.8 Preview without thinking ("关闭 thinking 后路由到 K2.8 Preview
+        # 无思考版"); the live list reports k3's thinking as "only" (always
+        # on), which suggests the off switch does not apply to k3 — UNVERIFIED.
+        alias_trap=True,
+        forward_verified_only=True,
+        # OWNER RULING 2026-10-07: the gateway offers K3 ONLY ("only need
+        # K3"). The vendor serves four ids (models page, "共 4 个模型 ID"; the
+        # live list carries the same four). ``k3`` is the one offered and
+        # the one forwarded; ``k3-256k`` (the same model at a 256K window,
+        # "K3 的 256K 上下文版本"), ``kimi-for-coding`` (K2.8 Preview) and
+        # ``kimi-for-coding-highspeed`` (K2.7 Code HighSpeed) are WITHHELD
+        # from the picker (reported in ``_vct_catalog_hidden``; the
+        # VCT_MODEL_GATEWAY_CATALOG=all knob does not bring them back) and
+        # REFUSED by the router (``forward_verified_only``). "Verified" here
+        # means the owner's scope ruling plus the vendor's own list and docs
+        # naming k3 as K3 — it cannot mean "answered as itself", because this
+        # endpoint echoes any name (see alias_trap).
+        verified_ids=("k3",),
+        # No static_ids: a standard-discovery row's keyless / fetch-failed
+        # fallback is the shipped snapshot (``static_catalog.json``, family
+        # ``kimi``: the ids the live list carried on 2026-10-07), served
+        # under the ``static`` source and narrowed by verified_ids like a
+        # live answer.
+        # No quota_url: the vendor documents no programmatic quota — usage is
+        # read in the console or with the Kimi Code CLI's /usage
+        # (membership page) — so usage falls back to the gateway ledger.
+        short_name="Kimi",
+        # partial_message_start_usage stays False: the flag is a claim about
+        # MEASURED streaming behaviour and no Kimi stream has been captured.
+    ),
 }
 
 
@@ -472,6 +606,11 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                     "or a failed fetch, the picker would show nothing for "
                     "this vendor",
                 )
+        if vendor.forward_verified_only and not vendor.verified_ids:
+            raise RegistryError(
+                f"vendor {key!r}: forward_verified_only is set but "
+                "verified_ids is empty — the router would refuse every id",
+            )
         if vendor.quota_url is not None and not vendor.quota_url.startswith(
             ("http://", "https://"),
         ):

@@ -184,9 +184,15 @@ def _known_ids(
     server's catalog last read from the vendor's own model list. Data only;
     no vendor is named here.
     """
-    ids = {*vendor.static_ids, *vendor.verified_ids, *vendor.catalog_hide_ids}
-    if extra is not None:
-        ids.update(extra.get(vendor.vendor_id, ()))
+    if vendor.forward_verified_only:
+        # A row whose endpoint answers ANY name (see the field's docstring)
+        # is known to serve exactly what it verified: neither its own model
+        # list nor a declared/hidden id makes another id safe to forward.
+        ids = set(vendor.verified_ids)
+    else:
+        ids = {*vendor.static_ids, *vendor.verified_ids, *vendor.catalog_hide_ids}
+        if extra is not None:
+            ids.update(extra.get(vendor.vendor_id, ()))
     retired = {i.strip().lower() for i in vendor.retired_ids}
     return frozenset(
         i.strip().lower() for i in ids
@@ -265,7 +271,10 @@ def _vendor_route(
     id>`` (a nested namespace segment missing) went to the default vendor, failed there,
     and surfaced as a chat failure with the vendor's unrelated message. A row
     that declares neither a family nor a model list cannot be judged and is
-    routed as before.
+    routed as before. For a ``forward_verified_only`` row (v0.2.102) the
+    judgement is stricter still: only ``verified_ids`` count as known and the
+    family prefix vouches for nothing, because that row's endpoint answers
+    every name with HTTP 200.
     """
     remainder = strip_1m(raw_remainder).strip()
     if not remainder:
@@ -296,10 +305,16 @@ def _vendor_route(
         )
     known = _known_ids(vendor, known_ids)
     judgeable = bool(known or vendor.bare_id_prefixes)
+    # A ``forward_verified_only`` row's family prefix vouches for nothing:
+    # its endpoint answers any name with 200, so an id is forwarded only
+    # when it is one of the row's verified ids.
+    family_vouches = (
+        not vendor.forward_verified_only and _owns_family(vendor, remainder)
+    )
     if (
         judgeable
         and remainder.lower() not in known
-        and not _owns_family(vendor, remainder)
+        and not family_vouches
     ):
         return _unknown_for_vendor(
             vendor, raw_id or raw_remainder, remainder,

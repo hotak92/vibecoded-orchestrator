@@ -76,17 +76,19 @@ class VendorNeutralityTests(unittest.TestCase):
     def test_registry_is_valid(self) -> None:
         vendors.validate_registry()
 
-    def test_shipped_scope_is_exactly_two_vendors(self) -> None:
-        """Narrow on purpose: only routes proven end-to-end ship.
+    def test_shipped_scope_is_exactly_three_vendors(self) -> None:
+        """Narrow on purpose: every shipped row is owner-ordered.
 
         A disabled row would be untested code shipped as configuration, so
-        vendors that have never made a live call are absent entirely rather
-        than present-and-off. The subscription route and the Token-Plan route
-        are both owner-ordered (2026-09-21) and both proven; the Token-Plan
-        vendor's pay-as-you-go sibling is deliberately absent until its model
-        list is extracted and proven.
+        vendors nobody ordered are absent entirely rather than present-and-off.
+        The subscription route and the Token-Plan route are both owner-ordered
+        (2026-09-21) and both proven live; the Token-Plan vendor's
+        pay-as-you-go sibling is deliberately absent until its model list is
+        extracted and proven. The Kimi Code route is owner-ordered
+        (2026-10-07) on documentation evidence, ahead of its first key — its
+        row names, field by field, what still waits on a live probe.
         """
-        self.assertEqual(sorted(vendors.VENDORS), ["qwen", "zai"])
+        self.assertEqual(sorted(vendors.VENDORS), ["kimi", "qwen", "zai"])
 
     def test_vendor_neutral_modules_carry_no_vendor_literal(self) -> None:
         for name in VENDOR_NEUTRAL_MODULES:

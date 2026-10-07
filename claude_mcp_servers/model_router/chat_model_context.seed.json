@@ -141,6 +141,15 @@
       "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
       "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024. Present on the subscription's live compatible-model list (probe 2026-09-22), which the previously cited integration page predates. text_only=false: the QwenCloud DeepSeek page states verbatim 'deepseek-v4.1-flash has native visual understanding and accepts both text and image input, returning text. All other DeepSeek models accept text input only.' — so this model SEES images and its blocks are forwarded untouched."
     },
+    "k3": {
+      "vendor": "kimi",
+      "context_window": 1048576,
+      "max_output": 0,
+      "window_1m": true,
+      "text_only": false,
+      "source": "https://www.kimi.com/code/docs/kimi-code/models.html",
+      "source_note": "Window: the vendor's per-model table gives k3 1048576 (read 2026-10-07), and the live /v1/models probe 2026-10-07 (owner's key) reports context_length 1048576 for k3 — so the row is 1M with the [1m] companion, like every other 1M model (owner: K3 = 1M). PLAN CAVEAT, from the same docs: the per-plan table on the Claude Code page (https://www.kimi.com/code/docs/third-party-tools/claude-code.html) caps k3 at 262144 on Plus/Moderato and unlocks 1048576 on Pro-and-above, and the error reference documents HTTP 401 'Your current plan supports only k3 up to 256K context' for a Plus request past 256K. A Plus subscriber whose sessions hit that 401 lowers this row to 262144 with window_1m false in the launcher (Preferences -> Chat model context; the export wins per row). max_output 0 = not stated (neither the docs nor the live list carry an output figure). text_only=false: the models page lists k3's 多模态输入 as '支持图片、视频' and the live list reports supports_image_in true."
+    },
     "claude-fable-5-1": {
       "vendor": "anthropic",
       "context_window": 1000000,

@@ -27,6 +27,15 @@
         { "id": "glm-4.5" },
         { "id": "glm-4.5-air" }
       ]
+    },
+    "kimi": {
+      "_comment": "Kimi Code ids observed in a live /v1/models response under the owner's Kimi Code key (coordinator probe 2026-10-07; the vendor's models page lists the same four). Only k3 is ever published or routed: the kimi row's verified_ids withholds the other three from the picker and its forward_verified_only refuses them by name (owner ruling 2026-10-07, K3 only; the endpoint answers any model name with 200).",
+      "models": [
+        { "id": "k3" },
+        { "id": "k3-256k" },
+        { "id": "kimi-for-coding" },
+        { "id": "kimi-for-coding-highspeed" }
+      ]
     }
   }
 }

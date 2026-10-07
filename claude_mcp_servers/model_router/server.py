@@ -146,6 +146,7 @@ from aiohttp import web
 from . import __version__
 from .auth import OAuthReader, host_token_stamp, token_matches
 from .catalog import (
+    USER_AGENT_HEADER,
     CatalogEntry,
     CatalogService,
     resolve_window,
@@ -1027,6 +1028,11 @@ async def models_handler(request: web.Request) -> web.Response:
         table=table,
         catalog_filter=gateway.config.catalog_filter,
         window_rows=gateway.config.window_rows,
+        # The picker fetch goes out as the client that asked for it — the
+        # same identity the /v1/messages relay forwards. A vendor whose edge
+        # refuses library user-agents (the kimi row) answers its list only
+        # to that; it is relayed, never invented.
+        user_agent=request.headers.get(USER_AGENT_HEADER) or None,
     )
     entries = catalog.entries
     if usage_labels:

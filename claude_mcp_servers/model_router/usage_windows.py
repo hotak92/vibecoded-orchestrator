@@ -22,6 +22,9 @@ QwenCloud  none — no quota source       the gateway ledger's routed-token tota
                                         for the current month, COLLECTED into
                                         the snapshot's ``tokens`` block and
                                         never rendered (owner ruling 2026-09-28)
+Kimi Code  none — no quota source       as QwenCloud: the vendor documents no
+                                        programmatic quota (console and its
+                                        own CLI's ``/usage`` only)
 ========== ============================ ======================================
 
 Four rules shape everything below.
