@@ -231,6 +231,32 @@ UPSTREAM_CONNECT_TIMEOUT_S = 30
 #: two meanings.
 REWRITE_BUFFER_LIMIT_BYTES = 32 * 1024 * 1024
 
+#: The context guard's default safety margin, in tokens. The guard refuses a
+#: vendor-routed request whose ESTIMATED input exceeds ``context_window -
+#: margin`` with Anthropic's ``prompt is too long`` envelope, so the client
+#: compacts instead of retrying a request the vendor will always refuse (the
+#: 2026-10-06 incident: 983,981 tokens against qwen3.8-max's real 983,616
+#: ceiling, agent stuck). The margin exists because the guard's estimate is a
+#: FLOOR-biased figure (the previous turn's vendor-reported context, else a
+#: bytes/4 body estimate), not a token count: 8192 is one small turn of
+#: headroom. Env-tunable through :data:`CONTEXT_GUARD_MARGIN_ENV` because the
+#: right headroom is a per-workload judgement, not a constant the gateway can
+#: measure. Documented in ``docs/CONFIGURATION.md`` (gateway section).
+CONTEXT_GUARD_MARGIN_DEFAULT = 8192
+
+#: The env var that overrides :data:`CONTEXT_GUARD_MARGIN_DEFAULT`.
+CONTEXT_GUARD_MARGIN_ENV = "VCT_GATEWAY_CONTEXT_GUARD_MARGIN"
+
+
+def context_guard_margin() -> int:
+    """The context guard's margin, in tokens. Never raises.
+
+    An unset, non-numeric or non-positive value answers the default — the
+    knob is a tuning surface, and a typo in it must not turn the guard off
+    (``0`` would refuse at exactly the ceiling) or into an always-fire trap.
+    """
+    return _env_int(CONTEXT_GUARD_MARGIN_ENV, CONTEXT_GUARD_MARGIN_DEFAULT)
+
 _TOKEN_BASENAME = "model-gateway.token"
 _PID_BASENAME = "model-gateway.pid"
 _PORT_BASENAME = "model-gateway.port"
@@ -662,11 +688,14 @@ __all__ = [
     "FALLBACK_PORT_RANGE",
     "DEFAULT_UPSTREAM_IDLE_TIMEOUT_S",
     "REWRITE_BUFFER_LIMIT_BYTES",
+    "CONTEXT_GUARD_MARGIN_DEFAULT",
+    "CONTEXT_GUARD_MARGIN_ENV",
     "UPSTREAM_CONNECT_TIMEOUT_S",
     "SERVICE_NAME",
     "LAST_PORT_BASENAME",
     "GatewayConfig",
     "HostNotLoopbackError",
+    "context_guard_margin",
     "credentials_path",
     "explicit_port",
     "export_path",

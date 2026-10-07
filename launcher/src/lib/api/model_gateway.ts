@@ -1125,12 +1125,23 @@ export function describeAgentDelivery(
  * One line for the card when a vendor's key does not resolve: which gateway
  * agent definitions that holds back (v0.2.102). The decision is Python's
  * (`select_gateway_agents`); this only restates `vendor_keys`. `null` when
- * nothing is held (or the payload predates the field) — no line, no noise.
+ * nothing is held (or the payload predates the field) — no line, no noise —
+ * and `null` unless the machine-level gate itself is open
+ * (`machine_signal.configured === true`): on a machine where it is not, the
+ * gate holds every definition back regardless of keys, so the line's remedy
+ * ("add the key, update the bundle") would never be honoured.
  */
 export function describeHeldVendors(
   g: GatewayAgentsGate | null,
 ): StatusLine | null {
-  const keys = g?.vendor_keys;
+  // Only when the machine-level gate is OPEN (`machine_signal.configured ===
+  // true`). On a machine where it is not, the module gate holds back ALL
+  // gateway definitions regardless of any key, so the remedy below ("add the
+  // key and update the bundle") would be advice the gate never honours;
+  // `describeAgentDelivery` is the line that says the gate is closed. Null
+  // also on a payload without the field (pre-v0.2.102), as before.
+  if (g?.machine_signal?.configured !== true) return null;
+  const keys = g.vendor_keys;
   if (!keys) return null;
   const held = Object.entries(keys)
     .filter(([, v]) => !v.resolves)

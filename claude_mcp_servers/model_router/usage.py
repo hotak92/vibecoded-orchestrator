@@ -90,7 +90,11 @@ USAGE_FIELDS: tuple[str, ...] = (
 #: The window the CLIENT budgets against, keyed on the id it requested. Claude
 #: Code reads nothing else from a gateway's catalog to size its context bar:
 #: an ``[1m]`` suffix means one million, anything else behind a custom base URL
-#: means two hundred thousand. Both are the CLIENT's arithmetic, which is why
+#: means two hundred thousand. On ordinary traffic the client resolves the
+#: suffix itself and signals the window with the ``anthropic-beta`` header
+#: instead (a ``context-1m`` token) — that half of the detection is threaded
+#: into :func:`build_record` as ``one_m_client``, since a pure function of the
+#: id cannot see a header. Both are the CLIENT's arithmetic, which is why
 #: they are constants here and not a lookup — a record that reported the real
 #: window only could not answer "why did compaction fire at 20%?".
 CLIENT_WINDOW_1M = 1_000_000
@@ -148,6 +152,29 @@ USAGE_BODY_LIMIT_BYTES = 8 * 1024 * 1024
 #: which is why the substituted figure is LABELLED
 #: (:data:`COUNT_SOURCE_ESTIMATE`) rather than passed off as a vendor count.
 ESTIMATE_BYTES_PER_TOKEN = 4
+
+#: How much smaller a body must be than the last guard-REFUSED body for the
+#: same identity before the guard resumes refusing (v0.2.102, review batch-2
+#: MEDIUM-2). A reactive-compaction request carries ≈ the refused body — the
+#: same history, the same density — so a guard that kept refusing it would
+#: block its own recovery path. When the previous request for the identity
+#: was refused by the guard and this body has NOT shrunk by at least
+#: ``1 - GUARD_STAND_DOWN_FRACTION`` (5%), the guard stands down once and
+#: lets the vendor answer; the overflow translation is the net. Read through
+#: :meth:`UsageLedger.guard_stands_down`.
+GUARD_STAND_DOWN_FRACTION = 0.95
+
+#: The sane band a calibrated tokens-per-byte ratio is clamped to (v0.2.102
+#: context guard). The calibration — the previous accepted turn's
+#: vendor-reported input tokens over that turn's request-body bytes — is a
+#: DENSITY, and a density measured on one turn can be skewed by a body that
+#: was mostly tools, or mostly base64, or mostly cache. The band keeps a
+#: skewed measurement from becoming an absurd estimate: English text sits
+#: near 0.25 (:data:`ESTIMATE_BYTES_PER_TOKEN`), token-dense code can run
+#: higher, and nothing real lives outside 0.15-0.5. Read through
+#: :meth:`UsageLedger.token_ratio`.
+TOKEN_RATIO_MIN = 0.15
+TOKEN_RATIO_MAX = 0.5
 
 #: The ``count_tokens`` provenance label. Present on a VENDOR answer only —
 #: the first-party route is relayed verbatim, because adding a field to an
@@ -485,9 +512,14 @@ class UsageRecord:
     disagree about the same request.
 
     Two windows, deliberately, and they answer different questions.
-    ``window_client`` is what the CLIENT budgeted — keyed purely on the id it
-    asked for, so it is 1M exactly when that id carried ``[1m]``.
-    ``window_actual`` is what the model really has, per
+    ``window_client`` is what the CLIENT budgeted, detected EITHER from the id
+    it asked for (an ``[1m]`` suffix, :func:`client_window`) OR from the
+    ``anthropic-beta`` header it sent (a ``context-1m`` token — the spelling
+    Claude Code actually uses on ordinary traffic, since it resolves the
+    suffix itself and signals the window with the header; see
+    :mod:`model_router.routing`'s docstring). The header half is threaded in
+    as ``one_m_client`` by the caller, because this module never sees a
+    request. ``window_actual`` is what the model really has, per
     :func:`model_router.catalog.resolve_window`. When they disagree the client
     is compacting at the wrong point, and ``pct_client`` versus ``pct_actual``
     is that disagreement in one line.
@@ -519,6 +551,13 @@ class UsageRecord:
     pct_client: Optional[float]
     pct_actual: Optional[float]
     usage_complete: bool
+    #: The request's own body size in BYTES (0 when the body was a consumed
+    #: stream and could not be measured). Paired with ``context_tokens`` it
+    #: is the context guard's CALIBRATION — how token-dense this chat's
+    #: bodies are — read through :meth:`UsageLedger.token_ratio`. It rides
+    #: the same record rather than a parallel store so the calibration, the
+    #: floor and the row can never disagree about which turn they describe.
+    request_bytes: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
@@ -561,8 +600,17 @@ def build_record(
     window_actual: Optional[int],
     window_source: str,
     now: Optional[datetime] = None,
+    one_m_client: bool = False,
+    request_bytes: int = 0,
 ) -> UsageRecord:
-    """Assemble one row. Pure — no clock unless the caller declines to pass one."""
+    """Assemble one row. Pure — no clock unless the caller declines to pass one.
+
+    ``one_m_client`` is the half of the client-window detection this module
+    cannot derive from ``requested``: the INCOMING request's ``anthropic-beta``
+    header carried a ``context-1m`` token. It only ever WIDENS the window to
+    :data:`CLIENT_WINDOW_1M` — :func:`client_window` still answers the
+    suffix half — so the two detections are one OR and cannot contradict.
+    """
     moment = now or datetime.now(timezone.utc)
     input_tokens = int(totals.get("input_tokens", 0))
     cache_creation = int(totals.get("cache_creation_input_tokens", 0))
@@ -570,7 +618,7 @@ def build_record(
     output_tokens = int(totals.get("output_tokens", 0))
     context_tokens = input_tokens + cache_creation + cache_read
     context_after = context_tokens + output_tokens
-    window_c = client_window(requested)
+    window_c = CLIENT_WINDOW_1M if one_m_client else client_window(requested)
     return UsageRecord(
         ts=moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
         session=session,
@@ -593,6 +641,7 @@ def build_record(
         pct_client=_pct(context_after, window_c),
         pct_actual=_pct(context_after, window_actual),
         usage_complete=usage_complete,
+        request_bytes=max(0, int(request_bytes)),
     )
 
 
@@ -843,6 +892,13 @@ class UsageLedger:
         self._last_by_identity: (
             "OrderedDict[tuple[str, Optional[str]], UsageRecord]"
         ) = OrderedDict()
+        #: Last guard-refused body size per identity, for the guard's
+        #: stand-down (:meth:`guard_stands_down`). Bounded by the SAME
+        #: ``max_sessions`` LRU cap as the row maps — a daemon that outlives
+        #: its chats must not grow an unbounded refusal memory either.
+        self._guard_refusals: (
+            "OrderedDict[tuple[str, Optional[str]], int]"
+        ) = OrderedDict()
         self._pending: set = set()
 
     # ── paths ────────────────────────────────────────────────────────────
@@ -1051,6 +1107,80 @@ class UsageLedger:
             return None
         return record.context_after
 
+    def token_ratio(
+        self, *, session: Optional[str], agent: Optional[str],
+    ) -> Optional[float]:
+        """This identity's tokens-per-byte calibration, or ``None``.
+
+        The previous accepted turn's vendor-reported ``context_tokens``
+        divided by that turn's ``request_bytes``, clamped to the
+        :data:`TOKEN_RATIO_MIN`/:data:`TOKEN_RATIO_MAX` band. The context
+        guard multiplies it by the CURRENT request's own body size to
+        estimate that request — a DENSITY, not an absolute, so a compaction
+        (whose request body shrinks with the conversation) shrinks the
+        estimate on the very next request, which an absolute floor
+        (``context_after``) cannot do: it only ever rises, because a refused
+        request writes no record. Exact identity match, same rule as
+        :meth:`context_floor`; ``None`` when nothing calibrated exists, and
+        the caller falls back to its own estimate rather than guessing here.
+        """
+        if session is None:
+            return None
+        with self._lock:
+            record = self._last_by_identity.get((session, agent))
+        if record is None or record.request_bytes <= 0:
+            return None
+        if record.context_tokens <= 0:
+            return None
+        ratio = record.context_tokens / record.request_bytes
+        return min(max(ratio, TOKEN_RATIO_MIN), TOKEN_RATIO_MAX)
+
+    def note_guard_refusal(
+        self, *, session: Optional[str], agent: Optional[str],
+        body_bytes: int,
+    ) -> None:
+        """Record that the context guard REFUSED a body of this size.
+
+        The guard's stand-down evidence: the NEXT request for this identity
+        is compared against this size (:meth:`guard_stands_down`). Last
+        refusal wins, LRU-bounded like the row maps.
+        """
+        if session is None:
+            return
+        with self._lock:
+            self._guard_refusals.pop((session, agent), None)
+            self._guard_refusals[(session, agent)] = max(0, int(body_bytes))
+            while len(self._guard_refusals) > self._max_sessions:
+                self._guard_refusals.popitem(last=False)
+
+    def guard_stands_down(
+        self, *, session: Optional[str], agent: Optional[str],
+        body_bytes: int,
+    ) -> bool:
+        """Should the guard stand down for this body? CONSUMES the evidence.
+
+        True when the PREVIOUS request for this identity was refused by the
+        guard and this body is not at least
+        ``1 - :data:`GUARD_STAND_DOWN_FRACTION`` smaller — the shape of the
+        client's reactive compaction, which carries ≈ the refused history.
+        Standing down forwards the request to the vendor, whose own overflow
+        refusal is then translated into the envelope the client recovers
+        from; a guard that refused its own recovery request would brick the
+        session it exists to save (review batch-2 MEDIUM-2).
+
+        The evidence is consumed either way, so "previous request" always
+        means the immediately preceding one: a stand-down forwards, and a
+        genuinely smaller body has simply moved on — a NEW refusal re-notes
+        itself.
+        """
+        if session is None or body_bytes <= 0:
+            return False
+        with self._lock:
+            refused_bytes = self._guard_refusals.pop((session, agent), None)
+        if refused_bytes is None or refused_bytes <= 0:
+            return False
+        return body_bytes >= refused_bytes * GUARD_STAND_DOWN_FRACTION
+
     def health(self) -> "dict[str, Any]":
         """The ``/health`` block. Cached state only — never touches the disk."""
         target = self.path
@@ -1105,6 +1235,7 @@ __all__ = [
     "CLIENT_WINDOW_1M",
     "CLIENT_WINDOW_DEFAULT",
     "COUNT_SOURCE_ESTIMATE",
+    "GUARD_STAND_DOWN_FRACTION",
     "COUNT_SOURCE_FIELD",
     "COUNT_SOURCE_VENDOR",
     "LEDGER_BASENAME",
@@ -1114,6 +1245,8 @@ __all__ = [
     "LEDGER_SESSIONS",
     "PARENT_AGENT_HEADER",
     "SESSION_HEADER",
+    "TOKEN_RATIO_MAX",
+    "TOKEN_RATIO_MIN",
     "USAGE_BODY_LIMIT_BYTES",
     "USAGE_FIELDS",
     "UsageAccumulator",

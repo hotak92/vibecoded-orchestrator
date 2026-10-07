@@ -68,9 +68,13 @@ EXPECTED_KIMI_SEED_IDS = {"k3"}
 #: ``context_window`` — since v0.2.95 a first-party id is published verbatim
 #: AND, when its resolved window is 1M, with an ``[1m]`` companion (pinned
 #: below). An earlier version of this note said the gateway never read these
-#: rows; that was true when it was written and is not true now.
+#: rows; that was true when it was written and is not true now. The 5.5
+#: generation (v0.2.102, owner-confirmed 2026-10-07) carries its 5.0
+#: siblings' figures and cites the models-overview index page — no per-model
+#: page exists for it, the claude-fable-5-1 convention.
 EXPECTED_CLAUDE_SEED_IDS = {
     "claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-sonnet-5",
+    "claude-opus-5-5", "claude-sonnet-5-5",
 }
 
 #: The seed, and nothing else.
@@ -153,13 +157,40 @@ class SeedTests(unittest.TestCase):
         self.assertEqual(flagged, EXPECTED_1M_IDS)
 
     def test_window_1m_agrees_with_context_window(self) -> None:
+        """Two one-sided rules since v0.2.102, not equality.
+
+        Equality held while the flag was redundant — every window was either
+        the 200K default or a full 1M. qwen3.8-max broke that: its REAL
+        ceiling is the live-verified 983,616 (a request above it is refused),
+        and the flag must stay true because what it buys the client —
+        "budget ~1M, not 200K" — is still the right budget at 983,616. The
+        two failures the equality check existed for are still failures:
+
+        * a 1M flag on a window at or below the client's 200K default — the
+          5x overstatement, the reason the check exists;
+        * a flag left OFF on a full 1M window — the understatement that
+          hides the ``[1m]`` row the user is paying for.
+
+        Between the default and 1M is curation territory: the flag says "the
+          real ceiling sits just under 1M", and the row's citation says how
+          far under.
+        """
         for model_id, row in self.seed.rows.items():
             with self.subTest(model=model_id):
-                self.assertEqual(
-                    row.window_1m, row.context_window >= 1_000_000,
-                    f"{model_id}: window_1m={row.window_1m} but "
-                    f"context_window={row.context_window}",
-                )
+                if row.window_1m:
+                    self.assertGreater(
+                        row.context_window, 200_000,
+                        f"{model_id}: window_1m=true but context_window="
+                        f"{row.context_window} — a 1M flag on a "
+                        "default-window model overstates it fivefold",
+                    )
+                else:
+                    self.assertLess(
+                        row.context_window, 1_000_000,
+                        f"{model_id}: window_1m=false but context_window="
+                        f"{row.context_window} — a full 1M window whose "
+                        "flag hides the [1m] companion",
+                    )
 
     def test_adjacent_versions_differ_which_is_why_keys_are_exact(self) -> None:
         """The concrete case the exact-key rule exists for."""
@@ -209,7 +240,18 @@ class SeedTests(unittest.TestCase):
         silent return to 200K now fails here instead of in a user's session.
         """
         expected = {
-            "qwen3.8-max": (1_000_000, 128_000),
+            # v0.2.102 (S16-10): the REAL Claude Code ceiling on this
+            # endpoint, not the page's architectural 1M — live-verified
+            # 2026-10-06 by a 400 "Range of input length should be
+            # [1, 983616]" at 983,981 ledger tokens, matching the vendor's
+            # own CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616. window_1m stays
+            # true (the row still earns the [1m] companion; 983,616 is far
+            # above the 200K default), and the gateway's context guard plus
+            # the overflow translation enforce the 16,384-token delta.
+            "qwen3.8-max": (983_616, 128_000),
+            # The other rows keep the cited page's 1M: the vendor-wide
+            # config value is stated for the endpoint, but only qwen3.8-max
+            # is live-verified against it. The guard protects the rest.
             "qwen3.8-flash": (1_000_000, 128_000),
             "qwen3.7-max": (1_000_000, 64_000),
             "qwen3.7-plus": (1_000_000, 64_000),

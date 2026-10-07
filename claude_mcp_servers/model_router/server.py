@@ -149,6 +149,7 @@ from .catalog import (
     USER_AGENT_HEADER,
     CatalogEntry,
     CatalogService,
+    FamilyFloor,
     resolve_window,
     to_models_response,
     with_usage_labels,
@@ -158,8 +159,14 @@ from .config import (
     SERVICE_NAME,
     UPSTREAM_CONNECT_TIMEOUT_S,
     GatewayConfig,
+    context_guard_margin,
 )
-from .context_table import ContextTableLoader
+from .context_table import (
+    ContextTable,
+    ContextTableLoader,
+    ModelContext,
+    load_seed,
+)
 from .fileperms import OwnerOnlyState
 from .quota import (
     CLASS_EXHAUSTED,
@@ -180,6 +187,7 @@ from .usage_windows import (
     session_fetcher,
 )
 from .usage import (
+    ESTIMATE_BYTES_PER_TOKEN,
     UsageAccumulator,
     UsageLedger,
     access_extra,
@@ -188,6 +196,17 @@ from .usage import (
     guard_count_tokens,
     note_count_substitution,
     read_identity,
+)
+from .vendors import (
+    ANTHROPIC_FAMILY,
+    DEFAULT_ANTHROPIC_VERSION,
+    OAUTH_BETA,
+    VENDORS,
+    AnthropicFamily,
+    Vendor,
+    context_overflow_maximum,
+    validate_registry,
+    vendor_display_name,
 )
 from .effort import translate_effort
 from .tool_ids import (
@@ -200,16 +219,6 @@ from .tool_ids import (
     restore_vendor_ids,
     sanitise_for_anthropic,
     unmark_thinking_signatures,
-)
-from .vendors import (
-    ANTHROPIC_FAMILY,
-    DEFAULT_ANTHROPIC_VERSION,
-    OAUTH_BETA,
-    VENDORS,
-    AnthropicFamily,
-    Vendor,
-    validate_registry,
-    vendor_display_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -278,6 +287,13 @@ _STREAM_CHUNK_HINT = "event-stream"
 #: carried the suffix and the client did not send the header itself.
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
 
+#: The prefix every spelling of the 1M beta shares, including future-dated
+#: ones. How the client's OWN request for the window is recognised — both on
+#: the forward path (does the gateway need to add the header?) and on the
+#: ledger path (did the client BUDGET 1M this turn?), so the two never drift
+#: into two different spellings of the same question.
+CONTEXT_1M_BETA_MARKER = "context-1m"
+
 #: Passed to aiohttp as the application's ``client_max_size``. Zero is
 #: aiohttp's "no limit" (``web_request.BaseRequest.read`` guards the size
 #: check with ``if self._client_max_size:``), and no limit is the correct
@@ -322,6 +338,14 @@ _QUOTA_BODY_PEEK_BYTES = 64 * 1024
 #: discarded but streamed verbatim past the bound; the limit bounds memory,
 #: not the relay).
 _AUTH_BODY_LIMIT_BYTES = 64 * 1024
+
+#: Same hold-and-relay bound, for a vendor 4xx body that may need
+#: TRANSLATING (a native context-overflow refusal on a streamed answer —
+#: see :func:`_vendor_stream_error_response`). Its own constant rather than
+#: a share of :data:`_AUTH_BODY_LIMIT_BYTES` for the same reason that one
+#: has: the two bound different decisions, and the day one moves is not the
+#: day the other does.
+_VENDOR_ERROR_BODY_LIMIT_BYTES = 64 * 1024
 
 
 #: What a GATEWAY-side 502 carries. Anthropic's SDKs read ``x-should-retry``
@@ -1108,6 +1132,21 @@ class RequestFacts:
     #: is nothing to count, when the body was never parsed (the over-buffer
     #: path), or when this request has no reader for it.
     count_estimate: Optional[int]
+    #: The client budgeted the 1M window this turn: the requested id carried
+    #: the ``[1m]`` suffix OR the request's OWN ``anthropic-beta`` header (as
+    #: the client sent it, before the gateway adds anything) carried a
+    #: ``context-1m`` token. Read off the INCOMING headers, not the forwarded
+    #: ones — the gateway's own :data:`CONTEXT_1M_BETA` addition must never
+    #: count as the client's choice. Carried because ``requested`` alone
+    #: cannot answer it: Claude Code strips the suffix itself and signals the
+    #: window with the header, on every route, first-party and vendor alike.
+    one_m_client: bool = False
+    #: The parsed body carries image/document (base64) blocks. The context
+    #: guard's density calibration is a text property; a body like this is
+    #: estimated UNCALIBRATED and is not recorded as a calibration sample
+    #: (:func:`_carries_binary_blocks`, review batch-2 MEDIUM-1). ``False``
+    #: when the body was not parsed — the ordinary text path.
+    binary_body: bool = False
 
 
 def _route_label(decision: Route) -> str:
@@ -1126,16 +1165,34 @@ def _actual_window(
     the picker.
 
     The entry is SYNTHETIC — id only — which confines the answer to the
-    resolver's first two steps: the tombstone check and the table. That is
-    deliberate. The upstream and family-floor steps need a built catalog, and
-    building one can fetch two upstreams; a request path that could do that
-    would put a vendor's outage inside every user turn. A model the table does
-    not name therefore reads ``unknown`` and the row's ``pct_actual`` is
-    ``null``, which is the honest answer rather than a guessed one.
+    table steps: the tombstone check, the exact row, and (v0.2.102) the
+    family floor, supplied TABLE-ONLY through
+    :meth:`model_router.context_table.ContextTable.older_sibling_floor`. That
+    closes the first-party gap this function shipped with: a brand-new Claude
+    id the seed has not tabulated yet read ``unknown`` here — ``null``
+    ``window_actual`` on every one of its rows — while the picker, whose floor
+    is built over a fetched catalog, advertised the inherited window. The
+    floor here reads the SAME table the resolver already holds, so it still
+    fetches nothing. Only the upstream step stays out of reach, deliberately:
+    it needs a built catalog, and building one can fetch two upstreams; a
+    request path that could do that would put a vendor's outage inside every
+    user turn. A model the table knows nothing about AT ALL therefore still
+    reads ``unknown`` and the row's ``pct_actual`` is ``null``, which is the
+    honest answer rather than a guessed one.
     """
     table = gateway.context.current()
     entry = CatalogEntry(id=requested, display_name=requested)
-    resolution = resolve_window(entry, table=table, family_floor=None)
+    floor_row = table.older_sibling_floor(requested)
+    family_floor = (
+        FamilyFloor(
+            model_id=floor_row.model_id,
+            window=floor_row.context_window,
+            max_output=floor_row.max_output or None,
+        )
+        if floor_row is not None
+        else None
+    )
+    resolution = resolve_window(entry, table=table, family_floor=family_floor)
     return resolution.window, resolution.source
 
 
@@ -1150,6 +1207,7 @@ def _submit_usage(
     stream: bool,
     totals: Mapping[str, int],
     usage_complete: bool,
+    request_bytes: int = 0,
 ) -> None:
     """Write one ledger row for a finished request, or decline to.
 
@@ -1177,6 +1235,8 @@ def _submit_usage(
         usage_complete=usage_complete,
         window_actual=window_actual,
         window_source=window_source,
+        one_m_client=facts.one_m_client,
+        request_bytes=request_bytes,
     )
     try:
         loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
@@ -1221,6 +1281,280 @@ def _message_start_usage_estimate(
     return max(candidates) if candidates else None
 
 
+def _prompt_too_long_error(used: int, maximum: int, note: str) -> web.Response:
+    """Anthropic's prompt-too-long refusal, HTTP 400, verbatim in shape.
+
+    This exact envelope — ``invalid_request_error`` with the message
+    ``prompt is too long: N tokens > M maximum`` — is what Claude Code's
+    error classifier maps to its ``prompt_too_long`` class and answers with a
+    REACTIVE compaction (once per turn). A vendor's native overflow error
+    does not match the class, which is how a subagent ran to 983,981 tokens
+    against a 983,616 ceiling and then retried the same request forever
+    (2026-10-06): no compaction, no way out. Both the guard and the vendor
+    overflow translation answer through THIS one builder so the shape cannot
+    drift between them.
+
+    ``note`` is appended AFTER ``maximum`` and must stay free of the
+    ``N tokens > M`` shape — the client parses the message with a regex that
+    stops at the second number, so anything after ``maximum`` is commentary.
+    """
+    return _json_error(
+        400,
+        "invalid_request_error",
+        f"prompt is too long: {used} tokens > {maximum} maximum {note}",
+    )
+
+
+def _context_guard_estimate(
+    gateway: "Gateway",
+    facts: Optional[RequestFacts],
+    payload: Optional[dict],
+    raw: bytes,
+) -> "tuple[Optional[int], bool]":
+    """THIS request's estimated input tokens, and whether it is calibrated.
+
+    The estimate must describe the request on the wire, not the chat's
+    history: the previous turn's vendor-reported ``context_after`` is an
+    ABSOLUTE that only ever rises (a refused request writes no record), so
+    keying the guard on it deadlocks a session the moment one turn crosses
+    the ceiling — it refuses the post-compaction request and the compaction
+    request itself, forever (review CRITICAL-1, probe-verified). What the
+    ledger DOES provide honestly is a DENSITY: the last accepted turn's
+    vendor-reported input tokens over that turn's own body bytes
+    (:meth:`model_router.usage.UsageLedger.token_ratio`, clamped to a sane
+    band, stored beside the floor in the same record — no parallel tracker).
+    This request's estimate is its OWN body size times that ratio, so a
+    compaction — whose request body shrinks with the conversation — shrinks
+    the estimate on the very next request and the guard is self-correcting.
+
+    Returns ``(estimate, calibrated)``. Uncalibrated — no ledger row, no
+    measurable body, OR a body carrying image/document blocks
+    (:attr:`RequestFacts.binary_body`: base64 bytes are ~1000× denser than
+    the text the ratio was measured on, so a text calibration applied to a
+    vision request is a false refusal by construction, review batch-2
+    MEDIUM-1) — falls back to the bytes/4 floor
+    (:func:`model_router.usage.count_tokens_estimate`; on the over-buffer
+    path the whole body's length over the same divisor) and the caller
+    applies a LOOSER threshold — the fallback over-estimates, and the
+    vendor-overflow translation is the safety net for what it lets through.
+    ``(None, False)`` when nothing can be said: forward.
+    """
+    body_bytes = len(raw) if raw else 0
+    if (
+        facts is not None
+        and body_bytes > 0
+        and not facts.binary_body
+    ):
+        ratio = gateway.usage.token_ratio(
+            session=facts.session, agent=facts.agent,
+        )
+        if ratio is not None:
+            return int(body_bytes * ratio), True
+    estimate = count_tokens_estimate(payload, raw=raw)
+    if estimate is None and raw:
+        return (
+            max(
+                1,
+                (len(raw) + ESTIMATE_BYTES_PER_TOKEN - 1)
+                // ESTIMATE_BYTES_PER_TOKEN,
+            ),
+            False,
+        )
+    return estimate, False
+
+
+#: Log-once topic for the guard's table-vs-seed note (see
+#: :func:`_note_guard_table_override`).
+LOG_ONCE_GUARD_TABLE_OVERRIDE = "guard_table_override"
+
+#: The shipped seed, read once for :func:`_note_guard_table_override`. The
+#: seed is a static file that ships with the process, so caching it is a
+#: property of the install, not of any request.
+_SEED_TABLE: Optional[ContextTable] = None
+
+
+def _note_guard_table_override(
+    gateway: "Gateway", requested_model: str, row: ModelContext,
+) -> None:
+    """Say ONCE when the active table's guard window differs from the seed's.
+
+    The guard reads ``gateway.context.current()`` — the ACTIVE table — and
+    on an upgraded install the launcher's exported table (Preferences →
+    Chat model context) can still carry a pre-v0.2.102 figure for a model
+    the seed has since corrected (qwen3.8-max: an export with 1,000,000
+    guards at 991,808 where the shipped seed says 975,424). The export wins
+    per row BY DESIGN and the converge pass will refresh it on the next
+    launcher boot; this note only makes the state visible, once per model
+    per process, naming both values. It changes nothing.
+    """
+    global _SEED_TABLE
+    from .catalog import _log_once  # noqa: PLC0415 — same deliberate lazy import as usage.py
+
+    if _SEED_TABLE is None:
+        _SEED_TABLE = load_seed()
+    seed_row = _SEED_TABLE.lookup_id(requested_model)
+    if seed_row is None or seed_row.context_window == row.context_window:
+        return
+    _log_once(
+        LOG_ONCE_GUARD_TABLE_OVERRIDE,
+        requested_model.lower(),
+        logging.INFO,
+        "model-gateway: context guard: the active chat-model context table "
+        "gives %s a window of %d, but the shipped seed says %d — the "
+        "launcher's exported table (Preferences -> Chat model context) wins "
+        "per row, so the guard is using %d. Correct the row in the launcher "
+        "to change this.",
+        requested_model, row.context_window, seed_row.context_window,
+        row.context_window,
+        logger_=logger,
+    )
+
+
+def _context_guard(
+    gateway: "Gateway",
+    decision: Route,
+    requested_model: str,
+    payload: Optional[dict],
+    raw: bytes,
+    facts: Optional[RequestFacts],
+) -> Optional[web.Response]:
+    """Refuse, BEFORE the vendor is called, a request that cannot fit.
+
+    Vendor-routed only, and only for a model whose REAL window the context
+    table cites: the client budgets 1,000,000 tokens for any ``[1m]`` id, a
+    vendor's real ceiling can be lower (qwen3.8-max: 983,616), and the delta
+    is invisible until the vendor refuses it in a shape the client cannot
+    recover from. The first-party route is NEVER guarded — the upstream
+    answers natively with this very envelope. ``count_tokens`` calls are
+    exempt too: they are questions about the conversation, not turns in it,
+    and refusing one would break the client's own context probing rather
+    than save a request.
+
+    The refusal IS the recovery: the exact prompt-too-long envelope, so the
+    client compacts this turn instead of spending it on a vendor 400 it will
+    replay unchanged. The bias is toward FORWARDING, because the
+    vendor-overflow translation (:func:`_translate_context_overflow`) is the
+    safety net for what the guard lets through: a CALIBRATED estimate (this
+    body's size times the chat's measured tokens-per-byte) is refused past
+    ``window − margin``; an UNCALIBRATED one (bytes/4, which over-estimates
+    on code) only past the RAW window. A body carrying image/document
+    (base64) blocks is NOT JUDGED AT ALL — every estimate the guard can make
+    for it is a text arithmetic that over-states base64 by orders of
+    magnitude, so on a 200K-window model a single screenshot would be
+    falsely refused and compaction cannot shrink an image to fix it (review
+    batch-3 MEDIUM-R; "when in doubt, forward"). And the guard STANDS DOWN
+    for a body that follows a guard refusal without meaningfully shrinking —
+    the shape of the client's reactive compaction, whose body carries ≈ the
+    refused history; refusing it would block this very recovery path (review
+    batch-2 MEDIUM-2). Returns ``None`` to forward, response to refuse.
+    """
+    vendor = decision.vendor
+    if vendor is None or decision.is_anthropic:
+        return None
+    if facts is not None and facts.count_tokens:
+        return None
+    row = gateway.context.current().lookup_id(requested_model)
+    if row is None or row.context_window <= 0:
+        return None
+    _note_guard_table_override(gateway, requested_model, row)
+    if facts is not None and facts.binary_body:
+        # Not judged: see the docstring. Checked BEFORE the stand-down so an
+        # intervening image turn does not consume a text refusal's evidence.
+        return None
+    body_bytes = len(raw) if raw else 0
+    if facts is not None and body_bytes > 0:
+        if gateway.usage.guard_stands_down(
+            session=facts.session, agent=facts.agent, body_bytes=body_bytes,
+        ):
+            logger.info(
+                "model-gateway: context guard stood down for %s on %s: the "
+                "previous request for this chat was refused and this body "
+                "has not shrunk — forwarding, likely the client's compaction "
+                "or a retry; a vendor overflow refusal will be translated",
+                _log_safe(requested_model), _log_safe(vendor.vendor_id),
+            )
+            return None
+    estimate, calibrated = _context_guard_estimate(
+        gateway, facts, payload, raw,
+    )
+    if estimate is None:
+        return None
+    margin = context_guard_margin()
+    ceiling = row.context_window - margin if calibrated else row.context_window
+    if estimate <= ceiling:
+        return None
+    if facts is not None:
+        gateway.usage.note_guard_refusal(
+            session=facts.session, agent=facts.agent, body_bytes=body_bytes,
+        )
+    logger.warning(
+        "model-gateway: context guard refused %s on %s: estimated %d input "
+        "tokens (%s) against a cited window of %d, threshold %d — answering "
+        "prompt_too_long so the client compacts; a vendor refusal that "
+        "still comes back is translated",
+        _log_safe(requested_model), _log_safe(vendor.vendor_id),
+        estimate,
+        "calibrated: this body's bytes x the chat's token density"
+        if calibrated else "uncalibrated bytes/4 floor",
+        row.context_window, ceiling,
+    )
+    return _prompt_too_long_error(
+        estimate, ceiling,
+        f"(gateway guard: {vendor.short_name or vendor.vendor_id} serves "
+        f"{_log_safe(decision.forward_model)} at a real ceiling of "
+        f"{row.context_window} tokens — compact now)",
+    )
+
+
+def _translate_context_overflow(
+    vendor: Vendor,
+    body: bytes,
+    *,
+    gateway: "Gateway",
+    facts: Optional[RequestFacts],
+) -> Optional[web.Response]:
+    """Re-emit a vendor's native context-overflow refusal as prompt-too-long.
+
+    The second half of the incident's fix, for the requests the guard's
+    estimate let through: the vendor DID refuse, in its own words
+    (QwenCloud: ``"Range of input length should be [1, 983616]"``), and that
+    shape is not one Claude Code maps to ``prompt_too_long`` — so without
+    this translation the client retries a request the vendor will always
+    refuse. Detection and the ceiling figure come from the vendor row
+    (:func:`model_router.vendors.context_overflow_maximum`) — a shape this
+    module never spells inline. ``None`` means "not an overflow refusal":
+    the caller relays the vendor's own answer verbatim, the behaviour every
+    unlisted vendor keeps.
+
+    ``N tokens`` is the BEST known estimate — the previous turn's
+    vendor-reported ``context_after`` for this ``(session, agent)`` when the
+    ledger has one, else the vendor's own ceiling, which is at least a true
+    sentence about the request ("at least this big") and always parses.
+    """
+    maximum = context_overflow_maximum(vendor, body)
+    if maximum is None:
+        return None
+    used: Optional[int] = None
+    if facts is not None:
+        used = gateway.usage.context_floor(
+            session=facts.session, agent=facts.agent,
+        )
+    if used is None or used <= 0:
+        used = maximum
+    logger.warning(
+        "model-gateway: translated %s's native context-overflow refusal "
+        "(ceiling %d per the vendor's own message) into the prompt-too-long "
+        "envelope so the client compacts",
+        _log_safe(vendor.vendor_id), maximum,
+    )
+    return _prompt_too_long_error(
+        used, maximum,
+        f"(gateway: {vendor.short_name or vendor.vendor_id} refused the "
+        f"context size; this model's real ceiling is {maximum} tokens — "
+        "compact now)",
+    )
+
+
 def _log_safe(value: object) -> str:
     """``value`` rendered so it can never be more than part of ONE log line.
 
@@ -1260,8 +1594,9 @@ def _log_safe(value: object) -> str:
 IMAGES_UNCOUNTED = "images=?"
 
 
-def _count_image_blocks(blocks: Any) -> int:
-    """Count ``type == "image"`` blocks, walking into every nested ``content``.
+def _count_blocks_of_type(blocks: Any, types: tuple[str, ...]) -> int:
+    """Count blocks whose ``type`` is in ``types``, walking every nested
+    ``content``.
 
     A subagent that read an image file does not put the block at the top of a
     message: it arrives inside a ``tool_result`` block's own ``content[]``
@@ -1276,11 +1611,47 @@ def _count_image_blocks(blocks: Any) -> int:
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "image":
+        if block.get("type") in types:
             total += 1
         if "content" in block:
-            total += _count_image_blocks(block["content"])
+            total += _count_blocks_of_type(block["content"], types)
     return total
+
+
+def _count_image_blocks(blocks: Any) -> int:
+    """Count ``type == "image"`` blocks (the access line's ``images=N``)."""
+    return _count_blocks_of_type(blocks, ("image",))
+
+
+#: Content-block types whose payload is base64/binary rather than text — a
+#: handful of bytes of base64 per token, where a text body carries ~2-4. The
+#: context guard's density calibration is a TEXT property, so a body carrying
+#: any of these is estimated UNCALIBRATED and never used to calibrate
+#: (review batch-2 MEDIUM-1: a text-calibrated density applied to a vision
+#: request over-estimates its tokens by orders of magnitude and refuses a
+#: request the vendor would serve).
+BINARY_BLOCK_TYPES = ("image", "document")
+
+
+def _carries_binary_blocks(payload: Any) -> bool:
+    """Whether the parsed request carries image/document (base64) blocks.
+
+    ``False`` on anything but a positive count — this feeds a forwarding
+    decision, and it must fail toward the ordinary text path; the
+    vendor-overflow translation remains the net for whatever the raw-window
+    rule lets through. Nested blocks are walked by the shared counter
+    (:func:`_count_blocks_of_type`), so a ``tool_result``-nested screenshot
+    counts too.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return False
+        return (
+            _count_blocks_of_type(payload.get("messages"), BINARY_BLOCK_TYPES)
+            > 0
+        )
+    except Exception:  # noqa: BLE001 — see _images_field: never cost a chat
+        return False
 
 
 def _images_field(payload: Any) -> str:
@@ -1937,6 +2308,18 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             )
             else None
         ),
+        # The client's OWN 1M signal, read off the INCOMING headers: the
+        # suffix half the router already caught, plus the beta header the
+        # client sends on ordinary traffic (it resolves the suffix itself).
+        # Both spellings, every route — a vendor id is budgeted against the
+        # same client arithmetic.
+        one_m_client=(
+            decision.one_m_requested
+            or CONTEXT_1M_BETA_MARKER in request.headers.get(
+                "anthropic-beta", "",
+            )
+        ),
+        binary_body=_carries_binary_blocks(payload),
     )
 
     headers = gateway.forward_headers(request)
@@ -1967,7 +2350,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         # The 1M window is a beta header, not a model name (routing strips the
         # suffix). Every beta the client sent is kept; this only ADDS, and only
         # when the client did not already ask for the window itself.
-        if decision.one_m_requested and "context-1m" not in beta:
+        if decision.one_m_requested and CONTEXT_1M_BETA_MARKER not in beta:
             beta = f"{beta},{CONTEXT_1M_BETA}" if beta else CONTEXT_1M_BETA
         if beta:
             headers["anthropic-beta"] = beta
@@ -2001,6 +2384,18 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     else:
         vendor = decision.vendor
         assert vendor is not None  # noqa: S101 — guaranteed by Route
+
+        # The context guard, BEFORE the vendor is called: a request the
+        # table says cannot fit the model's real window is refused here, in
+        # the envelope the client can recover from by compacting, instead of
+        # becoming a vendor 400 it would retry unchanged (see
+        # :func:`_context_guard` for the incident).
+        guard = _context_guard(
+            gateway, decision, requested_model, payload, raw, facts,
+        )
+        if guard is not None:
+            log_local(400, "context_guard")
+            return guard
 
         # Anthropic server tools (``web_search_*`` and friends) are forwarded
         # to the vendor UNCHANGED, and the vendor's own answer — including any
@@ -2308,6 +2703,21 @@ async def _proxy(
                     stream=stream,
                     totals=totals,
                     usage_complete=complete,
+                    # The body's own size, for the context guard's
+                    # tokens-per-byte calibration (UsageRecord.request_bytes).
+                    # Zero when it cannot be measured (the over-buffer path,
+                    # where the body is a consumed iterator) AND when the
+                    # body carried image/document blocks — base64 bytes are
+                    # not a text-density sample, and a turn that carried them
+                    # must not calibrate later text turns (batch-2 MEDIUM-1).
+                    # Either way the guard then runs uncalibrated for that
+                    # chat.
+                    request_bytes=(
+                        len(body)
+                        if isinstance(body, (bytes, bytearray))
+                        and not (facts is not None and facts.binary_body)
+                        else 0
+                    ),
                 ),
                 what="usage ledger",
             )
@@ -2475,6 +2885,22 @@ async def _proxy(
                     decision=decision,
                     facts=facts,
                     accumulator=accumulator,
+                )
+
+            # A streamed vendor 4xx may be a native context-overflow refusal
+            # wearing an ``event: error`` body. Reading it to find out means
+            # owning the response, so this branch (vendors with a DECLARED
+            # overflow shape only) translates when it is one and relays the
+            # vendor's own bytes verbatim when it is not — the same
+            # own-the-response shape the 401/403 branch below uses.
+            if (
+                vendor is not None
+                and is_stream
+                and 400 <= upstream.status < 500
+                and vendor.context_overflow_markers
+            ):
+                return await _vendor_stream_error_response(
+                    request, gateway, vendor, upstream, access, facts=facts,
                 )
 
             rewriter = None
@@ -2759,6 +3185,73 @@ def _auth_rejection_is_key_level(status: int, raw: bytes) -> bool:
     return "access_denied" not in (code, error_type)
 
 
+async def _vendor_stream_error_response(
+    request: web.Request,
+    gateway: "Gateway",
+    vendor: Vendor,
+    upstream: aiohttp.ClientResponse,
+    access: Callable[..., None],
+    *,
+    facts: Optional[RequestFacts] = None,
+) -> web.StreamResponse:
+    """A streamed vendor 4xx: translated if it is a context overflow, else
+    the vendor's own bytes verbatim.
+
+    An SSE ``event: error`` body cannot be classified without reading it,
+    and an aiohttp ``StreamReader`` cannot be un-read — so this branch owns
+    the response end to end, the same shape
+    :func:`_auth_rejection_response` uses for 401/403. Reached only for a
+    vendor that DECLARES an overflow shape
+    (:attr:`Vendor.context_overflow_markers`); every other vendor's streamed
+    4xx takes the ordinary relay below, byte for byte as before.
+
+    Past :data:`_VENDOR_ERROR_BODY_LIMIT_BYTES` the held bytes are written
+    and the remainder streamed verbatim: the bound is on what is HELD, not
+    on the relay, and a body that large is not an error envelope anyone
+    recognises anyway.
+    """
+    relay = gateway.relay_headers(upstream)
+    raw, overflowed = await _buffer_bounded(
+        upstream.content, _VENDOR_ERROR_BODY_LIMIT_BYTES,
+    )
+    translated = (
+        None if overflowed else _translate_context_overflow(
+            vendor, raw, gateway=gateway, facts=facts,
+        )
+    )
+    if translated is not None:
+        access(
+            400,
+            stream=True,
+            extra=(
+                f"bytes={len(raw)} note=context_overflow "
+                f"upstream_status={upstream.status}"
+            ),
+        )
+        return translated
+    if overflowed:
+        logger.warning(
+            "model-gateway: %s streamed error exceeds %d bytes; relayed "
+            "verbatim without overflow translation",
+            vendor.vendor_id, _VENDOR_ERROR_BODY_LIMIT_BYTES,
+        )
+    response = web.StreamResponse(status=upstream.status, headers=relay)
+    response.enable_chunked_encoding()
+    await response.prepare(request)
+    total = len(raw)
+    await response.write(raw)
+    async for chunk in upstream.content.iter_any():
+        await response.write(chunk)
+        total += len(chunk)
+    await response.write_eof()
+    access(
+        upstream.status,
+        stream=True,
+        extra=f"bytes={total} note=vendor_error_relayed",
+    )
+    return response
+
+
 async def _auth_rejection_response(
     request: web.Request,
     gateway: "Gateway",
@@ -2830,9 +3323,11 @@ async def _quota_response(
 ) -> web.StreamResponse:
     """Replace a vendor's quota refusal with one that names the vendor.
 
-    The ONE documented exception to relaying a vendor's ERROR verbatim, and
-    the only place a status is rewritten (see :mod:`model_router.quota` for
-    the incident). The upstream body is read —
+    ONE of the two documented exceptions to relaying a vendor's ERROR
+    verbatim (the other is the context-overflow translation,
+    :func:`_translate_context_overflow`, which swaps a native "input too
+    long" shape for the prompt-too-long envelope the client recovers from).
+    The upstream body is read —
     bounded — for a reset hint and then logged at DEBUG, so support can still
     see the vendor's own words without them reaching a user who would read
     them as an Anthropic limit.
@@ -3087,6 +3582,27 @@ async def _relay_vendor_json(
         await response.write_eof()
         access(upstream.status, stream=False, extra=f"bytes={total}")
         return response
+
+    # A native context-overflow refusal is TRANSLATED before anything else
+    # touches the body: the vendor's own envelope is not one the client can
+    # recover from, and no id normalisation or usage read of a refusal
+    # matters once the answer is being replaced. Vendors without a declared
+    # overflow shape (:attr:`Vendor.context_overflow_markers`) never enter
+    # the branch — their 4xx bodies relay exactly as before.
+    if 400 <= upstream.status < 500 and vendor.context_overflow_markers:
+        translated = _translate_context_overflow(
+            vendor, raw, gateway=gateway, facts=facts,
+        )
+        if translated is not None:
+            access(
+                400,
+                stream=False,
+                extra=(
+                    f"bytes={len(raw)} note=context_overflow "
+                    f"upstream_status={upstream.status}"
+                ),
+            )
+            return translated
 
     out = raw
     try:
