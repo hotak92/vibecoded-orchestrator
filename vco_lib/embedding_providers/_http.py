@@ -41,9 +41,11 @@ chunk's failure and moves on, instead of hanging the whole process.
 
 Why this does NOT kill a slow-but-progressing chunk
 ---------------------------------------------------
-The deadline is the SAME generous value the scalar timeout used (180s default,
-~6x the observed ~30s/chunk arctic-on-CPU boundary, raisable via
-``VCT_EMBED_REQUEST_TIMEOUT_SECS``). A chunk that *completes* under the
+The deadline is the SAME generous value the scalar timeout used (default 660s
+since v0.2.102 r2 — it must EXCEED the CodeEmbed server's queue wait
+(``CODE_EMBED_QUEUE_WAIT_SECS``, 600s default; see ``vco_lib/retry_after.py``),
+and remains far above the observed ~30s/chunk arctic-on-CPU boundary; raisable
+via ``VCT_EMBED_REQUEST_TIMEOUT_SECS``). A chunk that *completes* under the
 deadline returns its real response before the future deadline elapses — it is
 never aborted. Only a request that makes no forward progress past the deadline
 (the dribble/hung-socket wedge) is failed. The original scalar
@@ -114,8 +116,8 @@ def bounded_post(
         url: Target URL.
         timeout: Total wall-clock deadline in seconds for the entire request.
             Must be positive (callers resolve it from
-            ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` / the 180s default, both
-            guaranteed positive).
+            ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` / the shipped default — 660s
+            since v0.2.102 r2 — both guaranteed positive).
         **post_kwargs: Forwarded verbatim to ``session.post`` (``json=``,
             ``headers=``, ``data=``, ...). A caller-supplied ``timeout`` in
             ``post_kwargs`` is ignored in favour of the explicit ``timeout``

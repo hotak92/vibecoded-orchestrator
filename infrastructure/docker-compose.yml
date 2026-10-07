@@ -257,6 +257,25 @@ services:
       # Compose auto-reads `.env` from its --env-file / project directory;
       # ensure-containers passes the root `.env` (see ensure-containers.sh).
       CODE_EMBED_MAX_CONCURRENT: "${CODE_EMBED_MAX_CONCURRENT:-4}"
+      # v0.2.102: idle-unload + reload/queue knobs. The defaults here MUST stay
+      # in step with server.py's resolvers (pinned by
+      # tests/test_v02102_code_embed_unload_reload.py).
+      # Idle seconds before the GPU weights (~7.25 GB CodeSage) are unloaded to
+      # free VRAM; the next request lazy-reloads. 0 = keep resident.
+      CODE_EMBED_IDLE_UNLOAD_SECS: "${CODE_EMBED_IDLE_UNLOAD_SECS:-300}"
+      # CUDA-OOM load-retry budget: retries × backoff ≈ total wait before a
+      # 503 + Retry-After (default 12 × 30 s ≈ 6 min — VRAM held by another
+      # process, e.g. Ollama's 5-min keep-alive, releases on a minutes scale).
+      CODE_EMBED_LOAD_OOM_RETRIES: "${CODE_EMBED_LOAD_OOM_RETRIES:-12}"
+      CODE_EMBED_LOAD_OOM_BACKOFF_SECS: "${CODE_EMBED_LOAD_OOM_BACKOFF_SECS:-30}"
+      # An idle-unload that frees less VRAM than this floor counts as failed:
+      # the model is KEPT loaded (never an un-freed copy + a second copy).
+      CODE_EMBED_UNLOAD_FREED_MIN_MB: "${CODE_EMBED_UNLOAD_FREED_MIN_MB:-64}"
+      # Over-capacity requests QUEUE (FIFO, none dropped — owner rule) for up to
+      # this many seconds before a 503 + Retry-After. Clients must use a
+      # request timeout ABOVE this (bundled clients: 660 s — see
+      # vco_lib/retry_after.py::CODE_EMBED_CLIENT_TIMEOUT_SECS).
+      CODE_EMBED_QUEUE_WAIT_SECS: "${CODE_EMBED_QUEUE_WAIT_SECS:-600}"
       # CPU-fallback (CODE_EMBED_BACKEND=ollama) Ollama endpoint.
       # server.py defaults OLLAMA_URL to http://localhost:11435, but inside
       # this container `localhost` is the container ITSELF, not the Ollama

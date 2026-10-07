@@ -36,10 +36,37 @@ from typing import Any
 import requests
 
 from vco_lib.embedding_providers._http import bounded_post
+from vco_lib.retry_after import CODE_EMBED_CLIENT_TIMEOUT_SECS, parse_retry_after
 
 # Maximum batch size in one HTTP call. The server enforces 256, we use
 # the same constant so callers can chunk preemptively.
 MAX_BATCH_SIZE = 256
+
+
+class CodeEmbedHTTPError(RuntimeError):
+    """Non-2xx response from the CodeEmbed service, carrying the HTTP status
+    and the server's ``Retry-After`` (when present) as structured attributes.
+
+    v0.2.102 r2: the service's 503s (queue-wait bound exceeded, CUDA-OOM load
+    budget exhausted, inference OOM) all carry ``Retry-After``; the retry layers
+    (``EmbeddingService._retry_once_on_503`` and the weaviate-MCP inline
+    fallback) read it through the ONE shared helper ``vco_lib.retry_after``
+    instead of re-parsing message substrings. Subclasses ``RuntimeError`` and
+    the message keeps the long-standing phrase contract
+    ``CodeEmbed /embed returned HTTP {status}: {body}`` —
+    ``vco_lib.embedding_service._is_context_overflow_error`` matches the 400
+    over-window refusal THROUGH this exact wrapper, so do not change the format.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        status_code: "int | None" = None,
+        retry_after: "float | None" = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
 
 
 class CodeEmbedAdapter:
@@ -51,20 +78,26 @@ class CodeEmbedAdapter:
         session: Injected ``requests.Session`` for connection pooling.
             The caller owns ``close()``.
         timeout: TOTAL per-request wall-clock deadline in seconds. Default
-            120s when constructed bare; EmbeddingService threads the resolved
-            ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` value in. v0.2.70 FIX A: the
-            ``/embed`` POST goes through :func:`bounded_post` so the deadline
-            bounds the whole request (one batch ≤ MAX_BATCH_SIZE = the embed
-            unit), catching a wedged service instead of the inter-byte read gap
-            a scalar ``requests`` timeout gives. Health GETs keep the plain
-            clamped scalar probe.
+            :data:`CODE_EMBED_CLIENT_TIMEOUT_SECS` (660 s) when constructed
+            bare; EmbeddingService threads the resolved
+            ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` value in. v0.2.102 r2: the
+            default MUST exceed the server's queue wait
+            (``CODE_EMBED_QUEUE_WAIT_SECS``, default 600 s) — the service now
+            QUEUES over-capacity requests instead of shedding them, and a
+            client deadline shorter than the queue bound would abort a request
+            the server is still legitimately holding (a drop by another name).
+            v0.2.70 FIX A: the ``/embed`` POST goes through :func:`bounded_post`
+            so the deadline bounds the whole request (one batch ≤
+            MAX_BATCH_SIZE = the embed unit), catching a wedged service instead
+            of the inter-byte read gap a scalar ``requests`` timeout gives.
+            Health GETs keep the plain clamped scalar probe.
     """
 
     def __init__(
         self,
         base_url: str,
         session: requests.Session,
-        timeout: float = 120.0,
+        timeout: float = CODE_EMBED_CLIENT_TIMEOUT_SECS,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.session = session
@@ -203,9 +236,14 @@ class CodeEmbedAdapter:
             raise RuntimeError(f"CodeEmbed /embed network error: {exc}") from exc
 
         if response.status_code != 200:
-            raise RuntimeError(
+            raise CodeEmbedHTTPError(
                 f"CodeEmbed /embed returned HTTP {response.status_code}: "
-                f"{response.text[:500]}"
+                f"{response.text[:500]}",
+                status_code=response.status_code,
+                # v0.2.102 r2: surface the server's Retry-After (503 = queue
+                # bound exceeded / GPU busy) so the retry layers honour it
+                # instead of guessing a schedule.
+                retry_after=parse_retry_after(response.headers.get("Retry-After")),
             )
 
         try:

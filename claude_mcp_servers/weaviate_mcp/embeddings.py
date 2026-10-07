@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 
 import aiohttp
 
@@ -695,30 +696,109 @@ async def get_code_embedding(text: str) -> list[float] | None:
     return await server._inline_code_embed_http(text)
 
 
-async def _inline_code_embed_http(text: str) -> list[float] | None:
+async def _inline_code_embed_http(
+    text: str, tolerance_secs: float | None = None
+) -> list[float] | None:
     """Direct CodeEmbed HTTP call (pre-v0.2.18 fallback path).
 
     Shared by ``get_code_embedding`` (codesage backfill) and
-    ``get_code_query_embedding`` (svc-None fallback) so the raw-HTTP
+    ``get_code_query_embedding`` (svc-None / non-503 fallback) so the raw-HTTP
     fallback has ONE home.
+
+    v0.2.102 r2: honours the service's 503 + Retry-After contract through the
+    ONE shared retry helper (:mod:`vco_lib.retry_after` — the SAME module
+    ``EmbeddingService._retry_once_on_503`` uses; no second copy of the
+    policy). A 503 (the server's queue wait was exceeded, or its CUDA-OOM load
+    budget is exhausted / cooling down) is retried until the tolerance elapses
+    instead of surfacing "Failed to generate query embedding" on the first
+    shot. A non-503 HTTP status and any connection error still return None
+    immediately (the service is down or refuses the input — retrying changes
+    nothing). The per-request timeout MUST exceed the server's queue wait
+    (``CODE_EMBED_QUEUE_WAIT_SECS``, default 600 s) — one home:
+    ``CODE_EMBED_CLIENT_TIMEOUT_SECS`` (660 s).
+
+    v0.2.102 r3: ``tolerance_secs`` lets the caller pick WHICH tolerance —
+    batch callers (``get_code_embedding``, the analyzer / backfill gather)
+    pass nothing and get ``VCO_EMBED_503_TOLERANCE_SECS`` (default 420 s);
+    the INTERACTIVE query path passes the interactive bound
+    (``VCO_EMBED_503_INTERACTIVE_TOLERANCE_SECS``, default 90 s) so a
+    persistently-503 backend fails the tool call fast instead of blocking
+    the user's turn for minutes.
     """
     from . import server
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{server.CODE_EMBED_SERVICE_URL}/api/embeddings",
-                json={"model": "", "prompt": text},
-                timeout=aiohttp.ClientTimeout(total=60)
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data["embedding"]
-                else:
-                    server.logger.error("Code embedding service failed: HTTP %s", response.status)
-                    return None
-    except Exception as e:
-        server.logger.error("Code embedding service error: %s", e)
-        return None
+    # vco_lib import is a hard requirement of the whole MCP process (the
+    # loud-fail discipline — server.py itself imports vco_lib.embedding_service);
+    # deliberately OUTSIDE the try below so a broken install is never masked as
+    # a None embedding.
+    from vco_lib.retry_after import (
+        CODE_EMBED_CLIENT_TIMEOUT_SECS,
+        DEFAULT_503_FALLBACK_BACKOFFS,
+        compute_503_delay,
+        parse_retry_after,
+        resolve_503_delay_scale,
+        resolve_503_tolerance,
+    )
+
+    scale = resolve_503_delay_scale()
+    legacy_bounded = scale == 0.0
+    tolerance = (
+        resolve_503_tolerance() if tolerance_secs is None else tolerance_secs
+    )
+    deadline = time.monotonic() + tolerance
+    attempt = 0
+    while True:
+        attempt += 1
+        retry_after: "float | None" = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{server.CODE_EMBED_SERVICE_URL}/api/embeddings",
+                    json={"model": "", "prompt": text},
+                    timeout=aiohttp.ClientTimeout(total=CODE_EMBED_CLIENT_TIMEOUT_SECS)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data["embedding"]
+                    if response.status != 503:
+                        server.logger.error(
+                            "Code embedding service failed: HTTP %s", response.status
+                        )
+                        return None
+                    retry_after = parse_retry_after(
+                        response.headers.get("Retry-After")
+                    )
+                    server.logger.info(
+                        "Code embedding service returned 503 (queued past the "
+                        "wait bound / GPU busy?): attempt %d, Retry-After=%s",
+                        attempt, retry_after,
+                    )
+        except Exception as e:
+            server.logger.error("Code embedding service error: %s", e)
+            return None
+        # 503 → bounded retry on the shared policy (same helper + knobs as
+        # EmbeddingService._retry_once_on_503).
+        if legacy_bounded:
+            if attempt > len(DEFAULT_503_FALLBACK_BACKOFFS):
+                server.logger.error(
+                    "Code embedding service still 503 after %d attempts "
+                    "(zero-delay mode); giving up",
+                    attempt,
+                )
+                return None
+            delay = 0.0
+        else:
+            if time.monotonic() >= deadline:
+                server.logger.error(
+                    "Code embedding service still 503 after %.0fs of retries; "
+                    "giving up",
+                    tolerance,
+                )
+                return None
+            delay = compute_503_delay(
+                attempt, retry_after, DEFAULT_503_FALLBACK_BACKOFFS, scale
+            )
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
 async def get_code_query_embedding(text: str, task: str | None = None) -> list[float] | None:
@@ -739,19 +819,62 @@ async def get_code_query_embedding(text: str, task: str | None = None) -> list[f
     Documents still embed through ``embed_code`` (unprefixed).
 
     MUST MATCH ``templates/scripts/query_code_graph.py::generate_code_embedding``.
+
+    v0.2.102 r3 — the INTERACTIVE tolerance. This is the path a
+    ``search_code_graph`` / ``query_code_structure`` tool call waits on, so it
+    must NOT inherit the 420 s batch tolerance (round-2 regression: a
+    persistently-503 service blocked the caller's turn for up to ~840 s — the
+    svc leg's 420 s plus a SECOND full tolerance in the inline fallback). Two
+    rules, per the re-review's fix:
+
+    * the svc leg runs under the interactive bound
+      (``VCO_EMBED_503_INTERACTIVE_TOLERANCE_SECS``, default 90 s, clamped to
+      the batch tolerance) via the context override — the PRODUCTION retry
+      loop inside ``embed_code_query`` resolves its tolerance per call, so no
+      parameter needs threading through the batch call sites;
+    * the inline fallback runs ONLY for NON-503 unavailability (svc not
+      constructed, backend down, connection refused) — never as a second full
+      retry after the first leg already proved the backend persistently
+      503ing. Tolerance exhaustion returns None immediately (the tool's
+      "Failed to generate query embedding" degrade path).
     """
     from . import server
+    # vco_lib import is a hard requirement of the whole MCP process (the
+    # loud-fail discipline) — deliberately OUTSIDE any try below.
+    from vco_lib.retry_after import (
+        is_503_error,
+        reset_503_tolerance_override,
+        resolve_503_interactive_tolerance,
+        set_503_tolerance_override,
+    )
+
+    tolerance = resolve_503_interactive_tolerance()
     svc = server._get_embedding_service()
     if svc is not None:
+        token = set_503_tolerance_override(tolerance)
         try:
             return await asyncio.to_thread(svc.embed_code_query, text, task)
         except Exception as e:
+            if is_503_error(e):
+                # Tolerance EXHAUSTION, not unavailability: the first leg just
+                # proved the backend persistently 503ing — handing it a second
+                # full tolerance (the old svc→inline chain) is the double-
+                # tolerance defect. Fail fast instead.
+                server.logger.error(
+                    "embed_code_query still 503 after the interactive bound "
+                    "(%.0fs); giving up without the inline fallback",
+                    tolerance,
+                )
+                return None
             server.logger.warning(
                 "EmbeddingService.embed_code_query failed (%s); falling back to inline CodeEmbed call",
                 e,
             )
-    # Legacy fallback (svc unavailable): direct CodeEmbed HTTP call.
-    return await server._inline_code_embed_http(text)
+        finally:
+            reset_503_tolerance_override(token)
+    # Legacy fallback (svc unavailable / non-503 unavailability): direct
+    # CodeEmbed HTTP call — at the INTERACTIVE tolerance, not a second batch one.
+    return await server._inline_code_embed_http(text, tolerance_secs=tolerance)
 
 
 def _active_code_query_slot() -> str:

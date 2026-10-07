@@ -2199,10 +2199,20 @@ class EmbedRequestTimeoutResolutionTests(unittest.TestCase):
                 DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
             )
 
-    def test_default_is_180(self):
-        # The default must be generous (~6x the ~30s/chunk arctic-on-CPU
-        # boundary) so a slow re-embed never trips it.
-        self.assertEqual(DEFAULT_EMBED_REQUEST_TIMEOUT_SECS, 180.0)
+    def test_default_exceeds_the_code_embed_server_queue_wait(self):
+        # RETARGETED (v0.2.102 r2; was test_default_is_180). The CodeEmbed
+        # service now QUEUES over-capacity requests up to its
+        # CODE_EMBED_QUEUE_WAIT_SECS bound (server default 600 s) instead of
+        # shedding them, so the client deadline MUST exceed that bound — a
+        # shorter timeout would abort a request the server is still
+        # legitimately holding (a drop by another name). One home for the
+        # floor: vco_lib.retry_after.CODE_EMBED_CLIENT_TIMEOUT_SECS.
+        from vco_lib.retry_after import CODE_EMBED_CLIENT_TIMEOUT_SECS
+
+        self.assertEqual(
+            DEFAULT_EMBED_REQUEST_TIMEOUT_SECS, CODE_EMBED_CLIENT_TIMEOUT_SECS
+        )
+        self.assertGreater(DEFAULT_EMBED_REQUEST_TIMEOUT_SECS, 600.0)
 
     def test_env_override_honoured(self):
         with patch.dict(os.environ, {EMBED_REQUEST_TIMEOUT_ENV: "42"}):
@@ -2548,7 +2558,8 @@ class SubprocessEnvThreadsRequestTimeoutTests(unittest.TestCase):
     per-chunk bound, never a process kill). For that override to reach the
     ``sync_knowledge_graph.py`` subprocess, install.py must thread the env var
     through when it is set in the install shell. When unset, the subprocess
-    falls back to the 180s default — so install.py must NOT inject a value.
+    falls back to the shipped default (660s since v0.2.102 r2) — so install.py
+    must NOT inject a value.
     """
 
     def _load_install_module(self):

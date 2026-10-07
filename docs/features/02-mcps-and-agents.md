@@ -168,7 +168,7 @@ Two backends: `gpu` (default, sentence-transformers on CUDA/CPU) and `ollama` (d
 
 The `ensure-code-embed-service.sh` SessionStart hook auto-starts this container if it exists. CPU-only users can leave the `code_embed` service commented out in `compose.yaml` — the MCP falls back to Ollama code embeddings automatically.
 
-Environment vars: `CODE_EMBED_BACKEND`, `CODE_EMBED_MODEL`, `CODE_EMBED_DEVICE`, `CODE_EMBED_DTYPE` (bfloat16 default), `CODE_EMBED_PORT`, `CODE_EMBED_BATCH_SIZE` (32 default), `CODE_EMBED_MAX_CONCURRENT` (4 default).
+Environment vars: `CODE_EMBED_BACKEND`, `CODE_EMBED_MODEL`, `CODE_EMBED_DEVICE`, `CODE_EMBED_DTYPE` (bfloat16 default), `CODE_EMBED_PORT`, `CODE_EMBED_BATCH_SIZE` (32 default), `CODE_EMBED_MAX_CONCURRENT` (4 default — concurrent execution slots; requests beyond them QUEUE FIFO rather than being shed), `CODE_EMBED_QUEUE_WAIT_SECS` (600 default — the queue-wait bound; past it a request gets 503 + `Retry-After`, and client request timeouts must exceed it), `CODE_EMBED_IDLE_UNLOAD_SECS` (300 default — idle window before the GPU weights are unloaded to free VRAM; 0 keeps them resident; the unload measures the freed bytes and keeps the model loaded if a live reference pins it), `CODE_EMBED_LOAD_OOM_RETRIES` / `CODE_EMBED_LOAD_OOM_BACKOFF_SECS` (12 / 30 defaults — a ~6-min CUDA-OOM model-load retry budget, then 503 + `Retry-After` with a fail-fast cooldown shared by queued loaders), `CODE_EMBED_UNLOAD_FREED_MIN_MB` (64 default — freed-VRAM floor for the unload check). Every knob is plumbed through `infrastructure/docker-compose.yml` as `${VAR:-default}`; the per-knob contract lives in the service's `server.py` module docstring and `docs/CONFIGURATION.md` §Embedding configuration.
 
 </details>
 

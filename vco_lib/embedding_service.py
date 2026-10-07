@@ -74,7 +74,6 @@ import argparse
 import json
 import logging
 import os
-import random
 import sys
 import threading
 import time
@@ -102,6 +101,15 @@ from vco_lib.embedding_selection import (
     model_id_for_active as _model_id_for_active_shared,
 )
 from vco_lib.paths import claude_metrics_dir
+from vco_lib.retry_after import (
+    CODE_EMBED_CLIENT_TIMEOUT_SECS,
+    DEFAULT_503_FALLBACK_BACKOFFS,
+    compute_503_delay,
+    error_retry_after,
+    is_503_error,
+    resolve_503_delay_scale,
+    resolve_503_tolerance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,14 +125,28 @@ logger = logging.getLogger(__name__)
 # last delay a persistent 503 re-raises and the fail-safe vectorless-degrade
 # path takes over exactly as before).
 #
-# Schedule: retries at 2s, 5s, 10s after the initial try (total ~17s of sleep
-# < the 20s/object budget), each with a small +jitter to de-synchronise many
-# concurrent objects hammering the service in lock-step. Module-level so the
-# constants are visible + tunable in ONE place; the first delay is overridable
-# via VCO_EMBED_503_RETRY_DELAY (back-compat with the C-9 knob — it SCALES the
-# whole schedule proportionally so a "0" in tests makes every delay 0).
-_EMBED_503_RETRY_BACKOFFS: "tuple[float, ...]" = (2.0, 5.0, 10.0)
-# Jitter added to each delay: uniform [0, delay * _EMBED_503_JITTER_FRAC].
+# Schedule: retries at 2s, 5s, 10s after the initial try, each with a small
+# +jitter to de-synchronise many concurrent objects hammering the service in
+# lock-step. Module-level so the constants are visible + tunable in ONE place;
+# the first delay is overridable via VCO_EMBED_503_RETRY_DELAY (back-compat
+# with the C-9 knob — it SCALES the whole schedule proportionally so a "0" in
+# tests makes every delay 0).
+#
+# v0.2.102 r2: the schedule is now the FALLBACK for a 503 that carries no
+# Retry-After; when the server sends one (its queue wait was exceeded, or its
+# CUDA-OOM load budget is exhausted / cooling down) the retry waits the
+# server's OWN number, and retries continue until VCO_EMBED_503_TOLERANCE_SECS
+# (default 420 s ≥ the server's default 12 × 30 s = 360 s load-OOM budget)
+# instead of a fixed ~17 s total. The service QUEUES requests now (owner rule:
+# concurrent users wait, none are dropped), so a 503 means "GPU recovering"
+# and deserves minutes of patience — this supersedes the old "~17 s < the
+# 20 s/object budget" sizing. The canonical tuple lives in vco_lib.retry_after
+# (the weaviate-MCP inline fallback retries on the SAME numbers through the
+# same helper — one home; this name stays as the alias existing call sites and
+# tests import).
+_EMBED_503_RETRY_BACKOFFS: "tuple[float, ...]" = DEFAULT_503_FALLBACK_BACKOFFS
+# Jitter added to schedule-derived delays (NOT to a server-provided
+# Retry-After, which is honoured verbatim): uniform [0, delay * frac].
 _EMBED_503_JITTER_FRAC = 0.25
 
 __all__ = [
@@ -911,13 +933,20 @@ def _shared_service_base_url(explicit: "str | None" = None) -> str:
 # (hung socket, dead container holding the connection) fails within the
 # cap instead of hanging forever; a slow-but-progressing one — where each
 # chunk completes under the cap — runs to completion no matter how many
-# chunks there are. Default 180s is ~6x the observed ~30s/chunk boundary
-# for arctic-on-CPU, so legitimate chunks never trip it. Override via
-# ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` when hardware is unusually slow (or
-# to tighten it on fast machines). Applies to every embed backend
-# (Ollama / CodeEmbed / OpenAI) — the value is threaded into each adapter
-# at construction.
-DEFAULT_EMBED_REQUEST_TIMEOUT_SECS = 180.0
+# chunks there are. Override via ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` when
+# hardware is unusually slow (or to tighten it on fast machines). Applies
+# to every embed backend (Ollama / CodeEmbed / OpenAI) — the value is
+# threaded into each adapter at construction.
+#
+# v0.2.102 r2: raised from 180 s. The CodeEmbed service now QUEUES
+# over-capacity requests (owner rule: none dropped) up to its
+# ``CODE_EMBED_QUEUE_WAIT_SECS`` bound (server default 600 s), and a client
+# deadline BELOW the server's queue bound would abort requests the server is
+# still legitimately holding — a drop by another name. The client-side floor
+# lives in ONE home: ``vco_lib.retry_after.CODE_EMBED_CLIENT_TIMEOUT_SECS``
+# (660 s = queue bound + margin); the old "~6x the 30 s/chunk arctic-on-CPU
+# boundary" sizing stays satisfied an order of magnitude over.
+DEFAULT_EMBED_REQUEST_TIMEOUT_SECS = CODE_EMBED_CLIENT_TIMEOUT_SECS
 EMBED_REQUEST_TIMEOUT_ENV = "VCT_EMBED_REQUEST_TIMEOUT_SECS"
 
 
@@ -1978,7 +2007,9 @@ class EmbeddingService:
         session: requests.Session | None = None,
         # v0.2.69 FIX 3: per-embed-request timeout (seconds). Defaults to
         # None, which resolves to VCT_EMBED_REQUEST_TIMEOUT_SECS (or the
-        # 180s default). Threaded into every real adapter so a wedged
+        # shipped default — 660s since v0.2.102 r2, which must EXCEED the
+        # CodeEmbed server's 600s queue wait; see vco_lib/retry_after.py).
+        # Threaded into every real adapter so a wedged
         # embedder fails at chunk granularity rather than hanging forever.
         # Tests can pass an explicit value to make the cap small + assertable.
         embed_request_timeout: float | None = None,
@@ -2522,67 +2553,74 @@ class EmbeddingService:
     # ---- single-item embed --------------------------------------------
 
     def _retry_once_on_503(self, fn, *args):
-        """Retry a provider embed on HTTP 503 with a BOUNDED exponential
-        backoff before letting the failure propagate (v0.2.77 5c task 4;
-        supersedes the v0.2.73 C-9 single-retry).
+        """Retry a provider embed on HTTP 503, HONOURING the server's
+        Retry-After within a total tolerance (v0.2.102 r2; supersedes the
+        v0.2.77 5c fixed schedule as the primary driver, which itself
+        superseded the v0.2.73 C-9 single retry).
 
-        The code-embed FastAPI service sheds with 503 when its in-flight
-        semaphore is saturated (an update-all burst) OR while a model
-        (re)loads. A single retry (C-9) was not enough to ride out the 5c
-        incident's saturation window, so the embed chain still failed and the
-        analyzer degraded the object to VECTORLESS (embed_revision=0). This
-        method now retries on the module-level ``_EMBED_503_RETRY_BACKOFFS``
-        schedule (2s, 5s, 10s + jitter — total ~17s < the 20s/object budget)
-        so a transient burst is absorbed. It does NOT mask a genuinely-down
-        backend: the schedule is finite; after the last delay a persistent 503
-        re-raises and the caller's fail-safe (vectorless degrade) takes over
-        exactly as before. Non-503 errors re-raise IMMEDIATELY (no behaviour
-        change — only 503 is transient-retryable).
+        The code-embed service now QUEUES over-capacity requests (owner rule:
+        none dropped) and emits 503 + ``Retry-After`` only when its queue wait
+        bound was exceeded or the GPU is occupied (its CUDA-OOM load budget is
+        exhausted / cooling down, or an inference OOMed). This method honours
+        that header through the ONE shared helper (:mod:`vco_lib.retry_after` —
+        the same module the weaviate-MCP inline fallback uses; no second copy
+        of the policy) and keeps retrying until ``VCO_EMBED_503_TOLERANCE_SECS``
+        (default 420 s) of wall time has elapsed — AT LEAST as long as the
+        server's default load-OOM budget (12 × 30 s = 360 s), so a retrying
+        caller rides out one full server-side recovery instead of giving up
+        mid-budget and degrading the object to VECTORLESS. An error with no
+        Retry-After falls back to the v0.2.77 schedule
+        (``_EMBED_503_RETRY_BACKOFFS`` + jitter, last entry repeating).
 
-        The name is kept (many call sites reference it) even though it now
-        retries up to ``len(_EMBED_503_RETRY_BACKOFFS)`` times.
+        It does NOT mask a genuinely-down backend: the tolerance is finite; a
+        persistent 503 re-raises once it is spent and the caller's fail-safe
+        (vectorless degrade) takes over exactly as before. Non-503 errors
+        re-raise IMMEDIATELY (only 503 is transient-retryable).
 
-        ``VCO_EMBED_503_RETRY_DELAY`` (seconds, default from the schedule)
-        SCALES the whole schedule proportionally for back-compat with the C-9
-        knob: a value of ``0`` makes every delay 0 (used by tests). Malformed
-        → schedule used unscaled (a knob must not be a kill switch).
+        The name is kept (many call sites reference it).
+
+        ``VCO_EMBED_503_RETRY_DELAY`` still SCALES every computed delay
+        proportionally for back-compat with the C-9 knob (a value of ``0``
+        makes every delay 0). A scale of exactly 0 keeps the LEGACY bounded
+        behaviour — ``len(_EMBED_503_RETRY_BACKOFFS)`` retries, zero delays,
+        Retry-After ignored — which is what keeps test harnesses fast and
+        finite. Malformed → delays used unscaled (a knob must not be a kill
+        switch).
         """
-        # Resolve the optional scale override once. When set, it replaces the
-        # FIRST backoff and scales the rest by the same ratio; "0" → all zero.
-        scale: "float | None" = None
-        raw = os.getenv("VCO_EMBED_503_RETRY_DELAY")
-        if raw is not None:
-            try:
-                first = float(raw)
-                if first < 0:
-                    first = 0.0
-                base = _EMBED_503_RETRY_BACKOFFS[0] or 1.0
-                scale = first / base
-            except (TypeError, ValueError):
-                scale = None  # malformed → use the schedule unscaled
+        scale = resolve_503_delay_scale(
+            base=_EMBED_503_RETRY_BACKOFFS[0] or 1.0
+        )
+        legacy_bounded = scale == 0.0
+        deadline = time.monotonic() + resolve_503_tolerance()
 
         last_exc: "Exception | None" = None
-        # attempt 0 = initial try; attempts 1..N = one per scheduled backoff.
-        for attempt in range(len(_EMBED_503_RETRY_BACKOFFS) + 1):
+        attempt = 0  # failed attempts so far (attempt 0 = the initial try)
+        while True:
             try:
                 return fn(*args)
             except Exception as exc:  # noqa: BLE001 — inspect, then re-raise
-                if "503" not in str(exc):
+                if not is_503_error(exc):
                     raise
                 last_exc = exc
-                if attempt >= len(_EMBED_503_RETRY_BACKOFFS):
-                    break  # schedule exhausted → re-raise below
-                delay = _EMBED_503_RETRY_BACKOFFS[attempt]
-                if scale is not None:
-                    delay *= scale
-                # Jitter de-syncs many concurrent objects retrying in lock-step
-                # (each hammering the same saturated service on the same beat).
-                if delay > 0:
-                    delay += random.uniform(0.0, delay * _EMBED_503_JITTER_FRAC)
+                attempt += 1
+                if legacy_bounded:
+                    if attempt > len(_EMBED_503_RETRY_BACKOFFS):
+                        break  # legacy schedule exhausted → re-raise below
+                    delay = 0.0  # zero-delay mode never sleeps
+                else:
+                    if time.monotonic() >= deadline:
+                        break  # tolerance spent → re-raise below
+                    delay = compute_503_delay(
+                        attempt,
+                        error_retry_after(exc),
+                        _EMBED_503_RETRY_BACKOFFS,
+                        scale,
+                        _EMBED_503_JITTER_FRAC,
+                    )
                 logger.info(
-                    "Embed backend returned 503 (saturated / model loading?): "
-                    "%s — retry %d/%d after %.1fs",
-                    exc, attempt + 1, len(_EMBED_503_RETRY_BACKOFFS), delay,
+                    "Embed backend returned 503 (queued past the wait bound / "
+                    "GPU busy?): %s — retry %d after %.1fs",
+                    exc, attempt, delay,
                 )
                 if delay > 0:
                     time.sleep(delay)
