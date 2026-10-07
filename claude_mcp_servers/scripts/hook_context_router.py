@@ -340,9 +340,18 @@ SEEN_LOCK_TIMEOUT_S = 1.0
 
 
 def filter_seen_blocks(text: str, inject_file: str, reads_file: str,
-                       project_root: str = "") -> str:
+                       project_root: str = "",
+                       suppressed_out: Optional[List[str]] = None) -> str:
     """Mirror of vco_filter_seen_blocks. Parses the KG:/CODE: block stream,
     suppresses already-seen / already-Read blocks, records emitted keys.
+
+    ``suppressed_out`` (v0.2.102 W3R-10, Python-only seam — the filtered
+    OUTPUT is byte-identical, so the shell parity contract is unchanged):
+    an optional list that receives the dedup key of every SUPPRESSED block
+    (the capped first header field — the node title / code full_name). It
+    stays EMPTY when the whole call is silenced by lock contention (the
+    blocks were neither shown nor recorded), so a caller can tell "all
+    suppressed" apart from "decided nothing".
 
     v0.2.101 N2: the check ("is this key in the store?") and the write
     ("record it") are one critical section under an exclusive lock on the
@@ -372,7 +381,8 @@ def filter_seen_blocks(text: str, inject_file: str, reads_file: str,
       holds on every OS.
     """
     if not inject_file:
-        return _filter_seen_blocks_unlocked(text, inject_file, reads_file, project_root)
+        return _filter_seen_blocks_unlocked(text, inject_file, reads_file,
+                                            project_root, suppressed_out)
     import contextlib
 
     from vco_lib.atomic import LockTimeout, exclusive_file_lock
@@ -382,14 +392,16 @@ def filter_seen_blocks(text: str, inject_file: str, reads_file: str,
             stack.enter_context(exclusive_file_lock(
                 Path(inject_file + ".lock"), timeout_s=SEEN_LOCK_TIMEOUT_S))
         except LockTimeout:  # before OSError: LockTimeout IS an OSError
-            return ""
+            return ""  # suppressed_out stays empty — nothing was DECIDED
         except OSError:
             pass  # cannot lock at all → the unlocked pre-N2 behaviour
-        return _filter_seen_blocks_unlocked(text, inject_file, reads_file, project_root)
+        return _filter_seen_blocks_unlocked(text, inject_file, reads_file,
+                                            project_root, suppressed_out)
 
 
 def _filter_seen_blocks_unlocked(text: str, inject_file: str, reads_file: str,
-                                 project_root: str = "") -> str:
+                                 project_root: str = "",
+                                 suppressed_out: Optional[List[str]] = None) -> str:
     """The filter body — callers go through :func:`filter_seen_blocks`."""
     dedup_on = bool(inject_file)
     if dedup_on:
@@ -432,6 +444,8 @@ def _filter_seen_blocks_unlocked(text: str, inject_file: str, reads_file: str,
                         fh.write(key + "\n")
                 except OSError:
                     pass
+        elif suppressed_out is not None:
+            suppressed_out.append(cur_first)  # W3R-10: the post-decision record
         cur_prefix, cur_first, cur_src = "", "", ""
         cur_block, cur_body = [], []
 
@@ -975,6 +989,147 @@ def _emit_agent(tool_input: Dict, prompt: str, kg_text: str) -> str:
     }, ensure_ascii=False)
 
 
+# --- W3R-10: the staged citation ctx must match what reached the transcript --
+
+
+def _block_titles(text: str) -> List[str]:
+    """Capped first header fields (node title / code full_name) of every
+    KG:/CODE: block in a leg-output stream — the identity the pending
+    citation ctx's node ``title`` is matched against."""
+    titles: List[str] = []
+    for line in text.splitlines():
+        m = _HEADER_RE.match(line)
+        if m:
+            titles.append(cap_key_field(m.group(2).split(" | ", 1)[0]))
+    return titles
+
+
+#: W3R-10/batch-8: the run id of the router run currently in flight in
+#: THIS process (set by :func:`main`, cleared on its exit). Empty outside
+#: a run — the staged-ctx wrapper is then a pure passthrough, so importing
+#: this module into a LONGER-LIVED process (tests do; the replay harness
+#: calls ``main()`` in-process) can never change ``citation_pending``'s
+#: behaviour for anyone else.
+_CURRENT_RUN_ID = ""
+
+
+def _install_staged_ctx_run_id_wrapper() -> None:
+    """Wrap ``citation_pending.stage_pending`` to stamp ``router_run_id``.
+
+    The staging happens inside the KG leg's producer
+    (``search_pipeline._populate_citation_cache`` →
+    ``citation_pending.stage_pending``), which imports ``stage_pending``
+    LAZILY at call time — so wrapping the attribute on the
+    ``citation_pending`` module BEFORE the legs run is the one supported
+    interception point (no producer file is touched). While a run is in
+    flight (``_CURRENT_RUN_ID`` set by :func:`main`), every ctx this
+    process stages carries ``ctx["router_run_id"]``, which
+    :func:`_amend_pending_citations` requires before it will amend a file:
+    a session + mtime window alone cannot tell a sibling concurrent
+    router's freshly staged ctx (same session, nodes it DID show) from
+    this run's own — the batch-8 review's MEDIUM. Outside a run the
+    wrapper changes NOTHING (ctx passed through untouched). Soft-fail: an
+    unpatchable staging path simply leaves files unstamped, and unstamped
+    files are never amended (the pre-fix behaviour for them).
+    """
+    try:
+        import claude_mcp_servers.rl_client.citation_pending as _cp
+    except Exception:  # noqa: BLE001 — never break the run for the stamp
+        return
+    if getattr(_cp.stage_pending, "_vco_router_run_stamped", False):
+        return  # installed already (idempotent per process)
+    _original = _cp.stage_pending
+
+    def _stage_with_run_id(**kwargs):
+        rid = _CURRENT_RUN_ID
+        if not rid:
+            return _original(**kwargs)  # no run in flight: untouched
+        ctx = kwargs.get("ctx")
+        ctx = dict(ctx) if isinstance(ctx, dict) else {}
+        ctx["router_run_id"] = rid
+        kwargs["ctx"] = ctx
+        return _original(**kwargs)
+
+    _stage_with_run_id._vco_router_run_stamped = True  # type: ignore[attr-defined]
+    _cp.stage_pending = _stage_with_run_id
+
+
+def _amend_pending_citations(project_root: str, sid: str,
+                             suppressed_titles: List[str],
+                             run_id: str) -> None:
+    """Drop never-shown nodes from the pending citation ctx this run staged.
+
+    W3R-10 (v0.2.102): the RL retrieval event + the citation pending file
+    are produced INSIDE the KG leg — before this router's seen-store
+    suppression and full-suppression exits decide. A repeat query whose
+    blocks are all already-seen therefore staged a ctx whose nodes the
+    model never saw, and the Stop-hook drain would compute citation labels
+    for them (systematic label noise on the repeat cohort). This is the
+    router-side half: after the decision, remove the suppressed nodes from
+    the ctx (the titles still shown — budget degradation keeps the header —
+    stay), record what was dropped, and delete a ctx left with no nodes
+    (nothing shown → nothing citable). Soft-fail everywhere; never raises.
+
+    Scope guard (batch-8 MEDIUM): ONLY pending files whose ctx carries
+    THIS run's ``router_run_id`` stamp (:func:`_stamp_staged_ctx_with_run_id`)
+    AND whose payload ``session_id`` matches are touched — earlier runs'
+    files, unstamped files and sibling concurrent routers' files (same
+    session, their own run id) own their own ctx.
+    """
+    if not suppressed_titles or not sid or sid == "default" or not project_root:
+        return
+    if not run_id:
+        return
+    supp = set(suppressed_titles)
+    try:
+        d = Path(project_root) / ".claude" / "state" / "rl_pending"
+        files = list(d.glob("*.json"))
+    except OSError:
+        return
+    from vco_lib.atomic import atomic_write_json
+
+    for f in files:
+        try:
+            payload = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("session_id") != sid:
+            continue
+        ctx = payload.get("ctx")
+        if not isinstance(ctx, dict) or ctx.get("router_run_id") != run_id:
+            continue
+        removed: List[str] = []
+        for key in ("nodes", "other_nodes"):
+            nodes = ctx.get(key)
+            if not isinstance(nodes, list):
+                continue
+            keep = []
+            for n in nodes:
+                if isinstance(n, dict) and \
+                        cap_key_field(str(n.get("title", ""))) in supp:
+                    removed.append(str(n.get("title", "")))
+                else:
+                    keep.append(n)
+            ctx[key] = keep
+        if not removed:
+            continue
+        prev = ctx.get("router_suppressed_titles")
+        merged = sorted(set((prev if isinstance(prev, list) else []) + removed))
+        ctx["router_suppressed_titles"] = merged
+        if not ctx.get("nodes"):
+            # No shown node left → the drain could only compute labels for
+            # never-shown context. The staged ctx is dead; remove it.
+            try:
+                f.unlink()
+            except OSError:
+                pass
+            continue
+        try:
+            atomic_write_json(f, payload, indent=None, fsync=False)
+        except OSError:
+            pass
+
+
 # --- bash double-fire claim (v0.2.101 N2) -------------------------------------
 # The §C1 settings group registers the bash wrapper once per matching `if`
 # rule, so ONE multi-match tool call (`cat x | grep y`) spawns it TWICE,
@@ -1020,7 +1175,37 @@ def bash_claim_path(payload: Dict, project_root: str) -> str:
 
 
 def _bash_claim_gc(state_dir: Path) -> None:
-    """Bounded best-effort sweep of old claims (never raises)."""
+    """Bounded best-effort sweep of old claims (never raises).
+
+    L3 cost note (OD-18, S2N2 re-review): the sweep is one ``glob`` of the
+    flat ``.claude/state`` dir capped at ``_BASH_CLAIM_GC_MAX`` (200)
+    one-file ``stat`` calls — single-digit milliseconds on spinning disks,
+    no index needed because claims are one tiny file per Bash call and the
+    1 h GC age sits far above the 60 s TTL, so the GC never races a live
+    takeover decision.
+
+    OD-18 separation invariant — EPHEMERAL vs DURABLE state in this dir:
+
+    * EPHEMERAL (this GC and the wrappers' 1-day ``find`` GC may delete):
+      ``bash_claim_*`` (this sweep), ``bash_task_*`` / ``bash_intent_*``
+      (one-shot pairing + classification handoffs, both re-derivable and
+      expired by the wrapper's ``-mtime +1`` sweep).
+    * DURABLE (NO claim/pairing GC may EVER touch): the per-session
+      seen-store ``seen_inject_<sid>.txt`` / ``seen_reads_<sid>.txt`` /
+      ``seen_cginject_count_<sid>.txt`` (the record of what was already
+      injected/Read — survives across turns and reboots by design), the
+      ``rl_pending/`` citation queue (TTL-swept by its own owner) and the
+      ``inject_budget_*`` / ``query_cache`` state. The globs here are the
+      guard: they match ``bash_claim_*`` ONLY, so the durable stores are
+      unreachable from this sweep by construction.
+
+    Root cause of the double fire (OD-18 "fix the cause"): the §C1 settings
+    group registers the bash wrapper once per matching ``if`` rule
+    (``settings.json.*.template``), so ONE multi-match command spawns it
+    once per MATCHING RULE — concurrently, same payload. The per-call
+    ``O_EXCL`` claim (:func:`claim_bash_call`) is the cross-rule dedupe;
+    this GC only reclaims the claim files that mechanism leaves behind.
+    """
     try:
         cutoff = time.time() - _BASH_CLAIM_GC_AGE_S
         for f in list(state_dir.glob("bash_claim_*"))[:_BASH_CLAIM_GC_MAX]:
@@ -1057,13 +1242,22 @@ def claim_bash_call(payload: Dict, project_root: str) -> bool:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    global _CURRENT_RUN_ID
     argv = list(sys.argv[1:] if argv is None else argv)
+    # W3R-10/batch-8: give THIS run an id and let the staged-ctx wrapper
+    # stamp it (passthrough outside a run — see _CURRENT_RUN_ID). Cleared
+    # on every exit so an in-process caller (tests, embedders) is never
+    # left with a stale stamp on later stage_pending calls.
+    _CURRENT_RUN_ID = f"router_{os.getpid()}_{time.time_ns()}"
+    _install_staged_ctx_run_id_wrapper()
     try:
         return _main(argv)
     except BaseException as exc:  # noqa: BLE001 — exit 0 ALWAYS; a retrieval
         # failure is silence, never a blocked tool call.
         print(f"[hook_context_router] soft-fail: {exc!r}", file=sys.stderr)
         return 0
+    finally:
+        _CURRENT_RUN_ID = ""
 
 
 def _main(argv: List[str]) -> int:
@@ -1145,6 +1339,17 @@ def _main(argv: List[str]) -> int:
     # never a licence to tighten the LONG-operation timeouts elsewhere
     # (kg-sync / code-graph analysis / install / seed stay generous).
     deadline = time.monotonic() + _env_float("VCO_INJECT_BUDGET_S", 6.0)
+    # W3R-10: the citation pending files the legs stage during THIS run are
+    # amended after the suppression decisions below — the pre-legs snapshot
+    # bounds which files this run owns (new or re-staged since).
+    # W3R-10 (batch-8): main() set this run's id and installed the
+    # staged-ctx wrapper, so every citation ctx THIS run stages carries it
+    # and the post-decision amendment below owns ONLY its own files — a
+    # session + mtime window could not tell a sibling concurrent router's
+    # freshly staged ctx in the same session from this run's own. A DIRECT
+    # _main() call (no main()) has no run id → no stamp → no amendment
+    # (safe no-op; the production path is main()).
+    router_run_id = _CURRENT_RUN_ID
     kg_text, cg_text = _run_legs(plan, sid, prompt_id, project_root,
                                  transcript_path, deadline)
     _write_intent_out()
@@ -1169,8 +1374,14 @@ def _main(argv: List[str]) -> int:
 
     inject_file = seen_store_path("inject", sid, project_root)
     reads_file = seen_store_path("reads", sid, project_root)
-    filtered = filter_seen_blocks(combined, inject_file, reads_file, project_root)
+    suppressed: List[str] = []  # W3R-10: titles the filter dropped (never shown)
+    filtered = filter_seen_blocks(combined, inject_file, reads_file,
+                                  project_root, suppressed_out=suppressed)
     if not filtered.strip():
+        # `suppressed` non-empty = every block was already seen/Read (all
+        # dropped by decision). Lock contention ALSO returns "" but leaves
+        # `suppressed` empty — nothing was decided, so nothing is amended.
+        _amend_pending_citations(project_root, sid, suppressed, router_run_id)
         return 0
 
     # Per-injection soft cap + per-turn budget (degrade, never drop: past
@@ -1189,6 +1400,11 @@ def _main(argv: List[str]) -> int:
 
     final = "\n".join(out_blocks)
     if not final.strip():
+        # Everything degraded away past the budget — no node title reached
+        # the transcript (the budget loop keeps headers, so this is rare,
+        # but the staged ctx must not outlive the truth).
+        _amend_pending_citations(project_root, sid,
+                                 _block_titles(combined), router_run_id)
         return 0
 
     if cg_text and any(b.startswith("CODE:") for b in out_blocks):
@@ -1202,6 +1418,9 @@ def _main(argv: List[str]) -> int:
         # field to append to; the router never synthesizes a field that did
         # not exist in the tool input.
         if "prompt" not in tool_input:
+            # No envelope is emitted — NOTHING reached the transcript.
+            _amend_pending_citations(project_root, sid,
+                                     _block_titles(combined), router_run_id)
             return 0
         prompt = str(tool_input.get("prompt") or "")
         # The agent brief's own bound (≤1 500 chars) was applied inside the
@@ -1210,6 +1429,10 @@ def _main(argv: List[str]) -> int:
         print(_emit_agent(tool_input, prompt, final))
         return 0
 
+    # W3R-10 normal path: the filter's suppressed titles never reached the
+    # transcript (budget degradation keeps every block's header, so the
+    # remaining blocks' titles WERE shown).
+    _amend_pending_citations(project_root, sid, suppressed, router_run_id)
     print(final)
     return 0
 
