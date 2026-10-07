@@ -9,16 +9,21 @@ generator (``generate-code-summary.py``) does not clone ~450 lines of ladder
 logic (the M-2 "one concern, one home" extraction). Both generators are thin
 callers of this module; ``generate-kg-summary.py``'s behaviour is unchanged.
 
-Four-tier model selection (in order):
+Five-tier model selection (in order) — the ladder is BY DESIGN (three real
+tiers + a legacy one + the silent skip); nothing here is a defect finding:
   1. `claude` CLI on PATH      → best quality, requires CLI install (Max sub or API key)
                                  v0.2.23 C10: gated by a smoke-test, not just --version,
                                  so an installed-but-unauthenticated CLI doesn't get picked.
   2. Ollama (local, FREE)      → http://localhost:11435, no extra dep beyond what
                                  the orchestrator already requires for embeddings
-  3. OpenAI API (opt-in)       → gated by `kg_summary_openai_consent` app_state key
+  3. OpenAI API (opt-in)       → gated twice: an OpenAI key in VCO's shared slot
+                                 AND `kg_summary_openai_consent` app_state key
                                  (default false). Set via launcher Preferences → KG
                                  Summaries. Bypass via `--force-api`. Costs apply.
-  4. ANTHROPIC_API_KEY direct  → legacy opt-in fallback. Cost warning logged.
+  4. ANTHROPIC_API_KEY direct  → LEGACY opt-in fallback (kept by design): reached
+                                 only when the env key is set AND tiers 1-3 were
+                                 unavailable or consent-gated. Costs $$ per call —
+                                 a cost warning is logged when the tier is selected.
   5. Silent skip               → friendly log line; the caller exits 0.
 
 Env overrides (shared knobs — the ``KG_SUMMARY_*`` names stay canonical for

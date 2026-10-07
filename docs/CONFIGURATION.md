@@ -730,7 +730,7 @@ Auto-generated 2-3 sentence summaries for every KG node, written to `knowledge/.
 1. `claude` CLI on PATH — optional, used only for KG-node summarization when present.
 2. Ollama at `http://localhost:11435` — automatic fallback; works for any VCO user since Ollama is already required for embeddings. Default model `qwen3.5:9b` (16+ GB VRAM) or `gemma4:e4b` for low-VRAM hosts.
 3. OpenAI — opt-in, and gated twice: it needs a key in VCO's own shared slot (`openai_api_key`; **not** `$OPENAI_API_KEY`, v0.2.98) **and** consent (`kg_summary_openai_consent` in launcher Preferences → KG Summaries, or the operator flag `--force-api`). Costs $$ per generation.
-4. `ANTHROPIC_API_KEY` direct — opt-in fallback; costs $$ per generation.
+4. `ANTHROPIC_API_KEY` direct — **legacy** opt-in fallback (kept by design): reached only when the env key is set and the tiers above were unavailable or consent-gated. Costs $$ per generation — a cost warning is logged when this tier is selected.
 5. Silent skip — friendly log line, exits 0.
 
 Force a specific backend with `KG_SUMMARY_BACKEND=cli|ollama|openai|api|skip` (`api` = Anthropic direct, `openai` = OpenAI). Override Ollama generation params with `KG_SUMMARY_OLLAMA_OPTIONS='{"temperature": 0.5, "num_ctx": 32768}'` (JSON object passed through to the Ollama API).

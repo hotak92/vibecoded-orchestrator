@@ -100,8 +100,16 @@ _IS_WINDOWS = os.name == "nt"
 
 # Win32 constants (winnt.h / winerror.h / tlhelp32.h).
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+#: WaitForSingleObject needs SYNCHRONIZE on the handle — a query-limited-only
+#: handle makes the wait return WAIT_FAILED for live AND exited processes
+#: (batch-6 review C-1), which would collapse the 259 disambiguation.
+_SYNCHRONIZE = 0x00100000
 _STILL_ACTIVE = 259
 _ERROR_ACCESS_DENIED = 5
+#: WaitForSingleObject return values (winbase.h) — the 259 disambiguator.
+_WAIT_OBJECT_0 = 0x0000
+_WAIT_TIMEOUT = 0x0102
+_WAIT_FAILED = 0xFFFFFFFF
 _ERROR_INVALID_PARAMETER = 87
 _TH32CS_SNAPPROCESS = 0x00000002
 #: FILETIME epoch (1601-01-01) → Unix epoch, in seconds.
@@ -117,6 +125,8 @@ def _kernel32():
     k32.OpenProcess.restype = wintypes.HANDLE
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
     k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
     k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(ctypes.c_ulonglong)] * 4
     k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
@@ -130,7 +140,11 @@ def _win_pid_alive(pid: int) -> Optional[bool]:
         from ctypes import wintypes
 
         k32 = _kernel32()
-        handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        # SYNCHRONIZE | QUERY_LIMITED: the wait below requires SYNCHRONIZE;
+        # a denial lands in the ACCESS_DENIED arm below (alive — the
+        # conservative answer for a process we may not probe).
+        handle = k32.OpenProcess(
+            _SYNCHRONIZE | _PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             err = ctypes.get_last_error()  # type: ignore[attr-defined]
             if err == _ERROR_INVALID_PARAMETER:
@@ -142,9 +156,22 @@ def _win_pid_alive(pid: int) -> Optional[bool]:
             code = wintypes.DWORD()
             if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
                 return None
-            # A process that EXITED with code 259 reads as alive — the one
-            # documented ambiguity of this API; it errs toward refusing.
-            return code.value == _STILL_ACTIVE
+            if code.value != _STILL_ACTIVE:
+                return False  # a real exit code: the process is gone
+            # 259 is ALSO what a live process reports — the one documented
+            # ambiguity of GetExitCodeProcess. Disambiguate with a zero-timeout
+            # wait on the same handle: WAIT_TIMEOUT ⇒ the object is not yet
+            # signalled ⇒ alive; WAIT_OBJECT_0 ⇒ it exited (with code 259) and
+            # its handle is signalled. Any OTHER wait result (WAIT_FAILED, an
+            # aborted wait) cannot distinguish the two, so fall back to the
+            # BASE behaviour — treat 259 as ALIVE. decide() maps None to
+            # PROCEED-with-warning, so an unknowable 259 must NOT become None:
+            # that would let a second update through while the holder runs,
+            # the exact case this lock exists to refuse.
+            wait = k32.WaitForSingleObject(handle, 0)
+            if wait == _WAIT_OBJECT_0:
+                return False
+            return True
         finally:
             k32.CloseHandle(handle)
     except Exception:  # noqa: BLE001 — unknowable, never a crash
