@@ -19,7 +19,7 @@
 # at render time (vco_lib/model_selection.py). GLM-5.3 is served by BOTH
 # vendors (z.ai's own endpoint and the QwenCloud Token Plan both list it);
 # GLM-5.3-Flash by z.ai only; the DeepSeek and Qwen rows by the qwen vendor
-# only.
+# only; Kimi K3 by the kimi vendor (Kimi Code) only.
 #
 # A score is "1".."10" within this set, AT MEDIUM EFFORT. "*" marks an
 # assumed score (no benchmark and fewer than 3 comparison reports), "†"
@@ -74,6 +74,22 @@ dagger = true
 reach_via = "glm-implementer / glm-reviewer / glm-planner"
 providers = ["zai", "qwen"]
 scores = ["7", "6", "7", "6", "6", "6", "7*", "7", "7", "—", "8"]
+
+# Kimi K3 (v0.2.102) is NOT from the maintainer's grid: it was scored from
+# public evidence read 2026-10-07 — Moonshot's model card and Kimi Code docs,
+# Superconductor's custom SWE-bench, Friendli's GLM-5.3 head-to-head, and
+# Artificial Analysis figures (speed, verbosity, hallucination rate).
+# Every published K3 number is at effort max (hence the dagger); VCO runs
+# medium, which Kimi Code maps to high. `*` = no benchmark and fewer than 3
+# reports (Review: no review benchmark or review report exists; Plan and
+# Instr: one user report each).
+[[row]]
+id = "kimi-k3"
+model = "Kimi K3"
+dagger = true
+reach_via = "kimi-implementer / kimi-reviewer"
+providers = ["kimi"]
+scores = ["7", "6", "6*", "6*", "3", "7", "7*", "8", "8", "8", "3"]
 
 [[row]]
 id = "deepseek-v4.1-flash"
@@ -139,6 +155,10 @@ text = "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s to first token
 [[note]]
 models = ["glm-5.3"]
 text = "**GLM-5.3** — the non-Claude model users route review/audit to; text-only."
+
+[[note]]
+models = ["kimi-k3"]
+text = "**Kimi K3** — near-frontier code quality on real repos and strong long-context retrieval, but the slowest and most verbose lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about twice the median output tokens), so queue its work and review it later. It always reasons; it can repeat the same tool call or stop on reasoning with no answer, and it guesses confidently when unsure (51% hallucination rate on uncertain questions), so demand quoted evidence in its reviews."
 
 [[note]]
 models = ["glm-5.3-flash"]

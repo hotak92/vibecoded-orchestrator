@@ -2096,3 +2096,28 @@ def _disable_resync_spawn_in_tests(request):
             os.environ.pop(key, None)
         else:
             os.environ[key] = prev
+
+
+# ── Gateway vendor keys (v0.2.102 per-vendor agent leg) ─────────────────────
+# `vco_lib.module_gated_delivery.select_gateway_agents` asks the gateway's own
+# key resolver whether each vendor's key resolves before it delivers that
+# vendor's agent definitions. Left alone, every bundle-delivery test would
+# consult THIS machine's hub / keychain / file store — non-hermetic, and the
+# verdict would depend on which keys the developer happens to hold. The
+# default here answers "every vendor key resolves", which keeps every
+# pre-existing delivery test meaning what it meant before the leg existed;
+# the tests that pin the leg itself pass `vendor_probe=` or patch
+# `_default_vendor_probe` (monkeypatch/mock run after this fixture, so they win).
+@pytest.fixture(autouse=True)
+def _gateway_vendor_keys_all_resolve():
+    try:
+        from vco_lib import module_gated_delivery as _mgd
+    except Exception:  # noqa: BLE001 — a suite without vco_lib has no leg to pin
+        yield
+        return
+    saved = _mgd._default_vendor_probe
+    _mgd._default_vendor_probe = lambda: (lambda _vendor_id: True)
+    try:
+        yield
+    finally:
+        _mgd._default_vendor_probe = saved

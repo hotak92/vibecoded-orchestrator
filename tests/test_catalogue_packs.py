@@ -46,11 +46,12 @@ FREE_AGENTS = {
     "planner", "tester", "web-explorer",
 }
 
-# ── Plan §1.2: the 8 kept gateway agents (2 retired by merge). ─────────────
+# ── Plan §1.2: the 8 kept gateway agents (2 retired by merge), plus the two
+# kimi-vendor lanes added in v0.2.102. ─────────────────────────
 GATEWAY_AGENTS = {
     "deepseek-implementer", "deepseek-researcher", "glm-flash-researcher",
     "glm-implementer", "glm-planner", "glm-reviewer", "qwen-flash-sweeper",
-    "qwen-implementer",
+    "qwen-implementer", "kimi-implementer", "kimi-reviewer",
 }
 
 # ── Plan §1.3: the 6 kept default skills. ──────────────────────────────────
@@ -194,7 +195,7 @@ class DefaultCatalogueTests(unittest.TestCase):
     def test_free_agents_are_the_eleven_kept(self):
         self.assertEqual(_stems(REPO_ROOT / "templates/agents/free"), FREE_AGENTS)
 
-    def test_gateway_agents_are_the_eight_kept(self):
+    def test_gateway_agents_are_the_ten_kept(self):
         self.assertEqual(
             _stems(REPO_ROOT / "templates/agents/module-gateway"), GATEWAY_AGENTS)
 
@@ -309,8 +310,8 @@ class DescriptionBudgetTests(unittest.TestCase):
     """
 
     def test_scan_covers_exactly_the_default_catalogue(self):
-        # Non-vacuity pin: the budget measures exactly the 25 default
-        # definitions — the 11 free agents + 8 gateway agents + 6 skills
+        # Non-vacuity pin: the budget measures exactly the 27 default
+        # definitions — the 11 free agents + 10 gateway agents + 6 skills
         # pinned above — and nothing else (packs excluded by construction).
         rel = {
             p.relative_to(REPO_ROOT / "templates").as_posix()

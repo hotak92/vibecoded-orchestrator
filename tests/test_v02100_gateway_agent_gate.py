@@ -19,7 +19,7 @@ and the REAL bundle engine:
 * a retired definition is orphan-removed on a decisive run (F-W1-18) and
   carried forward on an undecidable one;
 * the machine signal's own legs (registration x panel, tri-state);
-* the shipped set is EXACTLY the owner's eight, and every ``model:`` id is one
+* the shipped set is EXACTLY the owner's ten, and every ``model:`` id is one
   the gateway registry routes and knows (F-W1-11a / F-W1-17);
 * the hand-written-definition check names the closest valid ids.
 
@@ -65,12 +65,14 @@ UUID = "0f1e2d3c-4b5a-6978-8976-a5b4c3d2e1f0"
 #: ``deepseek-researcher`` and ``qwen-flash-implementer`` into
 #: ``qwen-flash-sweeper``): z.ai implementer/reviewer/planner/flash-researcher
 #: and the four qwen-provider lanes. NO flash reviewer on either provider.
+#: v0.2.102 adds the kimi-vendor implementer + reviewer: ten.
 OWNER_SHIPPED_SET = frozenset({
     "glm-implementer.md", "glm-reviewer.md", "glm-planner.md",
     "glm-flash-researcher.md",
     "qwen-implementer.md",
     "qwen-flash-sweeper.md",
     "deepseek-implementer.md", "deepseek-researcher.md",
+    "kimi-implementer.md", "kimi-reviewer.md",
 })
 
 
@@ -254,7 +256,7 @@ class GateVerdictTableTests(_Env):
 
 
 class BundleDeliveryTests(_Env):
-    def test_configured_machine_no_row_delivers_all_eight_to_a_project(self) -> None:
+    def test_configured_machine_no_row_delivers_all_ten_to_a_project(self) -> None:
         self.db()
         with _patch_signal(True):
             self.install()
@@ -521,16 +523,147 @@ class MachineSignalTests(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# v0.2.102 — the per-vendor key leg (select_gateway_agents)
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: The kimi-vendor definitions — derived from their frontmatter
+#: through the router, so a definition re-pointed at another vendor moves.
+KIMI_FILES = frozenset(
+    n for n in OWNER_SHIPPED_SET if mgd.definition_vendor(GATED_SRC / n) == "kimi")
+ZAI_QWEN_FILES = frozenset(OWNER_SHIPPED_SET - KIMI_FILES)
+
+
+def _patch_vendors(reachable: set[str]):
+    """Replace the default vendor probe: only ``reachable`` vendors resolve."""
+    return mock.patch.object(
+        mgd, "_default_vendor_probe",
+        lambda: (lambda vendor_id: vendor_id in reachable))
+
+
+class VendorKeyLegTests(_Env):
+    def test_the_kimi_definitions_route_to_the_kimi_vendor(self) -> None:
+        self.assertEqual(KIMI_FILES, {"kimi-implementer.md", "kimi-reviewer.md"})
+        self.assertEqual(
+            {mgd.definition_vendor(GATED_SRC / n) for n in ZAI_QWEN_FILES},
+            {"zai", "qwen"})
+
+    def test_kimi_key_resolves_kimi_definitions_are_delivered(self) -> None:
+        self.db()
+        with _patch_signal(True), _patch_vendors({"zai", "qwen", "kimi"}):
+            self.install()
+        self.assertEqual(self.delivered(), set(MODULE_GATEWAY_AGENT_FILES))
+        for name in KIMI_FILES:
+            self.assertEqual(
+                (self.proj / ".claude" / "agents" / name).read_bytes(),
+                (GATED_SRC / name).read_bytes(), name)
+
+    def test_no_kimi_key_kimi_definitions_are_absent_and_nothing_is_recorded(self) -> None:
+        self.db()
+        lines: list[str] = []
+
+        def log_event(step, phase, detail="", **_kw):
+            if step == "4.bundle.gated":
+                lines.append(detail)
+
+        with _patch_signal(True), _patch_vendors({"zai", "qwen"}):
+            project_init.install_project_bundle(
+                self.proj, orchestrator_root=self.orch, update_mode=False,
+                log_event=log_event)
+        self.assertEqual(self.delivered(), set(ZAI_QWEN_FILES))
+        for name in KIMI_FILES:
+            self.assertFalse((self.proj / ".claude" / "agents" / name).exists())
+        # A user without a kimi key has nothing to fix: a log line, no deferral.
+        report = DeferralReport.read(self.proj)
+        self.assertFalse(report.has_condition(mgd.CID_UNKNOWN))
+        self.assertFalse(report.has_condition(mgd.CID_SKIPPED))
+        self.assertTrue(any("HELD" in ln and "kimi" in ln for ln in lines), lines)
+
+    def test_a_key_miss_on_update_carries_an_earlier_delivery_forward(self) -> None:
+        """The resolver cannot tell "hub stopped" from "no key", so a miss
+        never deletes a definition an earlier run delivered."""
+        self.db()
+        with _patch_signal(True), _patch_vendors({"zai", "qwen", "kimi"}):
+            self.install()
+        before = {k: v for k, v in self.manifest_files().items()
+                  if Path(k).name in KIMI_FILES}
+        self.assertEqual(len(before), len(KIMI_FILES))
+        with _patch_signal(True), _patch_vendors(set()):
+            result = self.install(update=True)
+        self.assertEqual(self.delivered(), set(MODULE_GATEWAY_AGENT_FILES))
+        after = self.manifest_files()
+        for rel, entry in before.items():
+            self.assertEqual(after.get(rel), entry, rel)
+        self.assertEqual(
+            [p for p in result["actions"]["orphan-deleted"] if "agents" in p], [])
+
+    def test_an_explicit_opt_out_still_removes_kimi_definitions(self) -> None:
+        """The vendor leg never overrides the module gate's decisive SKIP."""
+        self.db()
+        with _patch_signal(True), _patch_vendors({"zai", "qwen", "kimi"}):
+            self.install()
+        self.db(enabled=0)
+        with _patch_signal(True), _patch_vendors({"zai", "qwen", "kimi"}):
+            self.install(update=True)
+        self.assertEqual(self.delivered(), set())
+
+    def test_a_skip_or_unknown_gate_never_probes_a_key(self) -> None:
+        def probe(_vendor_id: str) -> bool:
+            raise AssertionError("a key was probed for an undelivered bucket")
+
+        for state in (mgd.GateState.SKIP, mgd.GateState.UNKNOWN):
+            files, held = mgd.select_gateway_agents(
+                GATED_SRC, mgd.GateVerdict(state, mgd.SIGNAL_MACHINE, "t"),
+                vendor_probe=probe)
+            self.assertEqual((files, held), ([], []), state)
+
+    def test_a_raising_probe_holds_only_that_vendor(self) -> None:
+        def probe(vendor_id: str) -> bool:
+            if vendor_id == "kimi":
+                raise RuntimeError("secret-value-must-not-leak")
+            return True
+
+        verdict = mgd.GateVerdict(mgd.GateState.DELIVER, mgd.SIGNAL_MACHINE, "t")
+        files, held = mgd.select_gateway_agents(GATED_SRC, verdict, vendor_probe=probe)
+        self.assertEqual({f.name for f in files}, set(ZAI_QWEN_FILES))
+        self.assertEqual(
+            {Path(prefix).name for prefix, _v in held}, set(KIMI_FILES))
+        for _prefix, v in held:
+            self.assertIs(v.state, mgd.GateState.UNKNOWN)
+            self.assertEqual(v.signal, mgd.SIGNAL_VENDOR_KEY)
+            self.assertIn("RuntimeError", v.reason)
+            self.assertNotIn("secret-value-must-not-leak", v.reason)
+
+    def test_gateway_package_missing_holds_every_definition(self) -> None:
+        verdict = mgd.GateVerdict(mgd.GateState.DELIVER, mgd.SIGNAL_MACHINE, "t")
+        with mock.patch.dict(sys.modules, {"model_router": None,
+                                           "model_router.routing": None}):
+            files, held = mgd.select_gateway_agents(
+                GATED_SRC, verdict, vendor_probe=lambda _v: True)
+        self.assertEqual(files, [])
+        self.assertEqual({Path(p).name for p, _v in held}, set(OWNER_SHIPPED_SET))
+
+    def test_the_status_payload_names_the_held_vendor_and_its_definitions(self) -> None:
+        payload = mgd.vendor_keys_payload(
+            GATED_SRC, vendor_probe=lambda v: v != "kimi")
+        assert payload is not None
+        self.assertEqual(set(payload), {"zai", "qwen", "kimi"})
+        self.assertFalse(payload["kimi"]["resolves"])
+        self.assertEqual(payload["kimi"]["definitions"],
+                         sorted(Path(n).stem for n in KIMI_FILES))
+        self.assertTrue(payload["zai"]["resolves"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # The shipped set, and every id it names (contract)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 class ShippedDefinitionContractTests(unittest.TestCase):
-    def test_the_shipped_set_is_exactly_the_owners_eight(self) -> None:
+    def test_the_shipped_set_is_exactly_the_owners_ten(self) -> None:
         shipped = {p.name for p in GATED_SRC.iterdir() if p.is_file()}
         self.assertEqual(shipped, OWNER_SHIPPED_SET,
                          "templates/agents/module-gateway/ must hold exactly the "
-                         "owner's eight definitions (no flash reviewer, no strays)")
+                         "owner's ten definitions (no flash reviewer, no strays)")
         self.assertEqual(set(MODULE_GATEWAY_AGENT_FILES), OWNER_SHIPPED_SET)
 
     def test_every_model_id_routes_and_is_known_to_the_registry(self) -> None:

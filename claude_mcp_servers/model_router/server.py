@@ -991,7 +991,11 @@ async def usage_windows_handler(request: web.Request) -> web.Response:
         _log_unauthorised(gateway, request, started=started)
         return _unauthorised()
     windows = gateway.usage_windows
-    windows.request_refresh()
+    windows.request_refresh(
+        # The reading client's own user-agent, relayed — a quota vendor
+        # whose edge gates on it (the kimi row) is asked as this client.
+        request.headers.get(USER_AGENT_HEADER) or None,
+    )
     snapshot = windows.snapshot()
     if request.query.get("format") == "line":
         return web.Response(text=render_line(snapshot), content_type="text/plain")
@@ -1021,18 +1025,20 @@ async def models_handler(request: web.Request) -> web.Response:
         _log_unauthorised(gateway, request, started=started)
         return _unauthorised()
     usage_labels = gateway.config.picker_usage == PICKER_USAGE_ON
+    # The picker fetch goes out as the client that asked for it — the
+    # same identity the /v1/messages relay forwards. A vendor whose edge
+    # refuses library user-agents (the kimi row) answers its list only
+    # to that; it is relayed, never invented. The usage refresh scheduled
+    # by the same request relays it too, for the same reason.
+    client_user_agent = request.headers.get(USER_AGENT_HEADER) or None
     if usage_labels:
-        gateway.usage_windows.request_refresh()
+        gateway.usage_windows.request_refresh(client_user_agent)
     table = gateway.context.current()
     catalog = await gateway.catalog.union(
         table=table,
         catalog_filter=gateway.config.catalog_filter,
         window_rows=gateway.config.window_rows,
-        # The picker fetch goes out as the client that asked for it — the
-        # same identity the /v1/messages relay forwards. A vendor whose edge
-        # refuses library user-agents (the kimi row) answers its list only
-        # to that; it is relayed, never invented.
-        user_agent=request.headers.get(USER_AGENT_HEADER) or None,
+        user_agent=client_user_agent,
     )
     entries = catalog.entries
     if usage_labels:
@@ -1746,8 +1752,14 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     # "Warm while chats flow" (owner, 2026-09-23): a synchronous O(1) signal
     # that may schedule ONE background usage refresh per interval. Nothing is
     # awaited here, and a defect in it is guarded like every optional pass —
-    # it can never delay, fail or alter this request.
-    _guarded(gateway.usage_windows.note_activity, what="usage-window activity signal")
+    # it can never delay, fail or alter this request. The client's own
+    # user-agent rides along, relayed: a quota vendor whose edge gates on it
+    # (the kimi row) is asked as the client whose chat scheduled the refresh.
+    _guarded(
+        gateway.usage_windows.note_activity,
+        request.headers.get(USER_AGENT_HEADER) or None,
+        what="usage-window activity signal",
+    )
 
     buffer_limit = gateway.config.rewrite_buffer_bytes
     raw, over_buffer = await _buffer_bounded(request.content, buffer_limit)

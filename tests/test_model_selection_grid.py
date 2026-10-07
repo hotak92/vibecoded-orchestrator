@@ -32,6 +32,9 @@ EXPECTED_SCORES = {
     "opus": ["10", "10", "9", "9", "5", "10", "8*", "10", "9", "10", "4"],
     "fable": ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"],
     "glm-5.3": ["7", "6", "7", "6", "6", "6", "7*", "7", "7", "—", "8"],
+    # v0.2.102: scored from cited evidence, not the maintainer's
+    # grid — see the comment above the row in model_selection.toml.
+    "kimi-k3": ["7", "6", "6*", "6*", "3", "7", "7*", "8", "8", "8", "3"],
     "deepseek-v4.1-flash": ["7", "6", "6", "6", "9", "6", "7*", "8", "6", "7", "10"],
     "sonnet": ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"],
     "qwen3.8-max": ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"],
@@ -41,7 +44,8 @@ EXPECTED_SCORES = {
 }
 
 #: Rows carrying the `†` marker (only xhigh/max benchmark results).
-EXPECTED_DAGGERS = {"glm-5.3", "qwen3.8-max", "glm-5.3-flash", "qwen3.8-flash"}
+EXPECTED_DAGGERS = {"glm-5.3", "kimi-k3", "qwen3.8-max", "glm-5.3-flash",
+                    "qwen3.8-flash"}
 
 EXPECTED_COLUMNS = ["Code", "Debug", "Review", "Plan", "Bulk", "Tools",
                     "Instr", "LongCtx", "Docs", "Vision", "Cost"]
@@ -62,6 +66,14 @@ EXPECTED_NOTES = {
                            "— keep tasks bounded.",
     "glm-5.3": "**GLM-5.3** — the non-Claude model users route review/audit to; "
                "text-only.",
+    "kimi-k3": "**Kimi K3** — near-frontier code quality on real repos and "
+               "strong long-context retrieval, but the slowest and most verbose "
+               "lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about "
+               "twice the median output tokens), so queue its work and review it "
+               "later. It always reasons; it can repeat the same tool call or stop "
+               "on reasoning with no answer, and it guesses confidently when unsure "
+               "(51% hallucination rate on uncertain questions), so demand quoted "
+               "evidence in its reviews.",
     "glm-5.3-flash": "**GLM-5.3-Flash** suits bulk / first-pass work behind a "
                      "verifier — tests, a diff review or a stronger second pass; "
                      "retries help it, more effort does not (longer runs helped "
@@ -127,9 +139,22 @@ class TestProviderFilter:
         assert "GLM-5.3-Flash" not in md
         assert "best prose and literal instruction-following" in md
 
-    def test_both_keys_render_every_row(self):
+    def test_kimi_key_adds_the_kimi_row_only(self):
+        md = model_selection.render_grid(providers=frozenset({"anthropic", "kimi"}))
+        assert _rows_rendered(md) == set(CLAUDE_ROWS) | {"Kimi K3 †"}
+        assert "slowest and most verbose lane" in md
+        assert "GLM-5.3" not in md.split("Columns:")[0].split("|---|")[1]
+        assert "fragile tool calls" not in md
+
+    def test_no_kimi_key_keeps_the_kimi_row_and_note_out(self):
         md = model_selection.render_grid(
             providers=frozenset({"anthropic", "zai", "qwen"}))
+        assert "Kimi K3" not in md
+        assert "slowest and most verbose lane" not in md
+
+    def test_both_keys_render_every_row(self):
+        md = model_selection.render_grid(
+            providers=frozenset({"anthropic", "zai", "qwen", "kimi"}))
         all_models = {f"{r.model} †" if r.dagger else r.model
                       for r in model_selection.load_grid().rows}
         assert _rows_rendered(md) == all_models
@@ -143,7 +168,7 @@ class TestSoftFail:
         providers = model_selection.reachable_providers(key_probe=boom)
         assert providers == model_selection.ALWAYS_PROVIDERS
         err = capsys.readouterr().err
-        assert "RuntimeError" in err and err.count("\n") == 2  # one line per vendor
+        assert "RuntimeError" in err and err.count("\n") == 3  # one line per vendor
         # The warning names only the exception TYPE: an exception message could
         # one day carry a resolved key value, which must never reach a message.
         assert "hub exploded" not in err
@@ -192,6 +217,7 @@ class TestGridData:
             frozenset({"anthropic", "zai"}),
             frozenset({"anthropic", "qwen"}),
             frozenset({"anthropic", "zai", "qwen"}),
+            frozenset({"anthropic", "kimi"}),
         ):
             md = model_selection.render_grid(providers=providers)
             assert "What changes the pick:" in md

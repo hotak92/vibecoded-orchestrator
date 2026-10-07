@@ -34,6 +34,7 @@ import {
   gatewayPanelReady,
   gatewayIsConfigured,
   describeAgentDelivery,
+  describeHeldVendors,
   getModelGatewayStatus,
   inspectVSCodeTarget,
   listVSCodeTargets,
@@ -644,6 +645,49 @@ describe('describeAgentDelivery keeps the tri-state', () => {
   });
   it('no payload → no line', () => {
     expect(describeAgentDelivery(null)).toBeNull();
+  });
+});
+
+describe('describeHeldVendors restates the per-vendor key leg (v0.2.102)', () => {
+  const g = (vendor_keys: unknown) => ({
+    machine_signal: {
+      configured: true,
+      registration: 'running',
+      panel: 'pointed',
+      reason: 'r',
+      panel_paths: [],
+    },
+    gate: null,
+    agent_id_problems: null,
+    vendor_keys,
+  }) as Parameters<typeof describeHeldVendors>[0];
+  it('a vendor whose key does not resolve names its held definitions', () => {
+    const line = describeHeldVendors(
+      g({
+        zai: { resolves: true, reason: 'key resolves', definitions: ['glm-reviewer'] },
+        kimi: {
+          resolves: false,
+          reason: "no 'kimi' vendor key resolved",
+          definitions: ['kimi-implementer', 'kimi-reviewer'],
+        },
+      }),
+    );
+    expect(line?.tone).toBe('warn');
+    expect(line?.label).toBe('agent definitions held back: kimi');
+    expect(line?.detail).toContain('kimi-implementer, kimi-reviewer');
+    expect(line?.detail).not.toContain('glm-reviewer');
+  });
+  it('every key resolves → no line', () => {
+    expect(
+      describeHeldVendors(
+        g({ kimi: { resolves: true, reason: 'key resolves', definitions: ['kimi-reviewer'] } }),
+      ),
+    ).toBeNull();
+  });
+  it('a pre-v0.2.102 payload (no field) or a null field → no line', () => {
+    expect(describeHeldVendors(g(undefined))).toBeNull();
+    expect(describeHeldVendors(g(null))).toBeNull();
+    expect(describeHeldVendors(null)).toBeNull();
   });
 });
 

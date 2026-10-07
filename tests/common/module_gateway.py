@@ -41,6 +41,12 @@ from __future__ import annotations
 #: `qwen-flash-implementer` into `qwen-flash-sweeper` (its
 #: mechanical-edits brief). The set is now eight; the retired files are
 #: orphan-cleaned on the next bundle update (modified copies are kept).
+#:
+#: v0.2.102: the kimi-vendor block (Kimi K3, `claude-gw/kimi/k3[1m]`) adds an
+#: implementer and a reviewer — ten definitions. Every gated definition also
+#: passes the per-vendor key leg (`module_gated_delivery.select_gateway_agents`);
+#: the suite's conftest answers "every key resolves" unless a test says
+#: otherwise.
 MODULE_GATEWAY_AGENT_FILES: tuple[str, ...] = (
     "glm-implementer.md",
     "glm-reviewer.md",
@@ -50,4 +56,6 @@ MODULE_GATEWAY_AGENT_FILES: tuple[str, ...] = (
     "qwen-implementer.md",
     "deepseek-researcher.md",
     "qwen-flash-sweeper.md",
+    "kimi-implementer.md",
+    "kimi-reviewer.md",
 )

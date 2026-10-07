@@ -65,6 +65,10 @@ What each verdict does to the bundle (``project_init.install_project_bundle``):
   deletes what an earlier run delivered — and records
   ``gated_delivery_unknown``.
 
+v0.2.102: inside a DELIVER, each definition also passes a per-VENDOR leg —
+it ships only when its vendor's key resolves (:func:`select_gateway_agents`;
+a miss holds it back and carries an earlier copy forward, never deletes).
+
 The CLAUDE.md routing section (``{{#if_module_active model_gateway}}``) stays
 opt-in on the row alone: advice text is a per-project choice, the agent
 definitions follow the machine.
@@ -305,6 +309,9 @@ class GateState(str, Enum):
 SIGNAL_PROJECT_ROW = "project_row"
 SIGNAL_MACHINE = "machine"
 SIGNAL_LAUNCHER_DB = "launcher_db"
+#: The per-VENDOR leg (v0.2.102, :func:`select_gateway_agents`): one
+#: definition held back because its vendor's key did not resolve.
+SIGNAL_VENDOR_KEY = "vendor_key"
 
 
 @dataclass(frozen=True)
@@ -403,6 +410,148 @@ def gateway_agents_gate(
     )
 
 
+# ---------------------------------------------------------------------------
+# The per-vendor leg (v0.2.102)
+# ---------------------------------------------------------------------------
+#
+# The module gate above answers "does this project get gateway agents at
+# all". It cannot answer "can this machine reach the model a definition
+# names": a machine with only a z.ai key used to receive the qwen-vendor and
+# kimi definitions too, every dispatch of which fails on a missing key. The
+# model-selection grid already renders a vendor's rows only when its key
+# resolves (``vco_lib.model_selection``); this leg applies the SAME probe
+# (:func:`vco_lib.model_selection.vendor_key_probe`) to the definitions.
+#
+# =====================================  ====================================
+# vendor key at bundle time              effect on that definition
+# =====================================  ====================================
+# resolves                               delivered (ordinary manifest logic)
+# does not resolve / probe failed /      NOT added; a copy delivered by an
+# gateway package not importable         earlier run is CARRIED FORWARD
+# =====================================  ====================================
+#
+# Why a miss never deletes: the gateway's resolver folds "hub unreachable"
+# into the same miss as "no such key" (an orchestrator update stops vct-hub
+# by design, and the OS-keychain tier is reachable only through it), so a
+# miss is not a positively confirmed absence. Removal stays with the module
+# gate (a project switched off) and the retired-definition orphan logic.
+# A held definition is a log line, never a deferral: a user without a kimi
+# key has nothing to fix.
+
+#: What a vendor probe answers: True = that vendor's key resolves.
+VendorProbe = Callable[[str], bool]
+
+
+def _default_vendor_probe() -> VendorProbe:
+    """The gateway's own key resolution, through the grid's ONE probe."""
+    from vco_lib.model_selection import vendor_key_probe
+
+    return vendor_key_probe()
+
+
+def definition_vendor(path: Path) -> Optional[str]:
+    """The gateway vendor id a definition's ``model:`` routes to, or None.
+
+    None for a definition that names no ``claude-gw/`` id (nothing to probe).
+    Raises ``ImportError`` when the gateway package is not importable — the
+    caller decides what "cannot tell" means.
+    """
+    from vco_lib.vscode_settings import GATEWAY_ID_PREFIX
+
+    model = _frontmatter_model(path)
+    if not model or not model.startswith(GATEWAY_ID_PREFIX):
+        return None
+    from model_router.routing import (  # pyright: ignore[reportMissingImports]
+        split_namespace,
+    )
+
+    vendor, _rest = split_namespace(model)
+    return vendor.vendor_id if vendor is not None else None
+
+
+def vendor_reachability(
+    vendor_ids: Iterable[str],
+    *,
+    vendor_probe: Optional[VendorProbe] = None,
+) -> dict[str, tuple[bool, str]]:
+    """``{vendor_id: (key_resolves, reason)}`` — one probe per vendor.
+
+    Soft-fail: a probe that cannot be built or raises answers ``False`` for
+    the vendor(s) concerned, with the exception TYPE in the reason (never its
+    message — a resolver message must not be able to carry a value).
+    """
+    wanted = sorted(set(vendor_ids))
+    if not wanted:
+        return {}
+    probe = vendor_probe
+    if probe is None:
+        try:
+            probe = _default_vendor_probe()
+        except Exception as exc:  # noqa: BLE001 — reported, never fatal
+            reason = f"model gateway not importable ({type(exc).__name__})"
+            return {v: (False, reason) for v in wanted}
+    out: dict[str, tuple[bool, str]] = {}
+    for vendor_id in wanted:
+        try:
+            ok = bool(probe(vendor_id))
+            out[vendor_id] = (ok, "key resolves" if ok else
+                              f"no {vendor_id!r} vendor key resolved")
+        except Exception as exc:  # noqa: BLE001 — one vendor, one answer
+            out[vendor_id] = (False, f"key resolution for {vendor_id!r} failed "
+                                     f"({type(exc).__name__})")
+    return out
+
+
+def select_gateway_agents(
+    src_dir: Path,
+    verdict: GateVerdict,
+    *,
+    vendor_probe: Optional[VendorProbe] = None,
+) -> tuple[list[Path], list[GateOutcome]]:
+    """The gated definitions to deliver, and the held ones' carry-forward
+    outcomes (see the table above).
+
+    Only consulted when the module gate DELIVERs — a SKIP or UNKNOWN verdict
+    already decided the whole bucket, and no key is probed for it. Each held
+    definition yields one ``(source path, UNKNOWN verdict with
+    SIGNAL_VENDOR_KEY)`` outcome, so :func:`carries_forward` keeps an earlier
+    delivery of exactly that file and :func:`record_gate_outcomes` logs it
+    without a deferral.
+    """
+    if not verdict.delivers:
+        return [], []
+    files = sorted(Path(src_dir).glob("*.md"))
+    try:
+        vendor_of = {f: definition_vendor(f) for f in files}
+    except ImportError as exc:
+        reason = f"model gateway not importable ({type(exc).__name__})"
+        return [], [_held(f, "?", reason) for f in files]
+    reach = vendor_reachability(
+        (v for v in vendor_of.values() if v is not None),
+        vendor_probe=vendor_probe,
+    )
+    deliver: list[Path] = []
+    held: list[GateOutcome] = []
+    for f in files:
+        vendor_id = vendor_of[f]
+        if vendor_id is None or reach[vendor_id][0]:
+            deliver.append(f)
+        else:
+            held.append(_held(f, vendor_id, reach[vendor_id][1]))
+    return deliver, held
+
+
+def _held(path: Path, vendor_id: str, reason: str) -> GateOutcome:
+    return (
+        f"{GATEWAY_AGENTS_SOURCE_PREFIX}{path.name}",
+        GateVerdict(
+            GateState.UNKNOWN, SIGNAL_VENDOR_KEY,
+            f"{path.stem} held back (vendor {vendor_id!r}): {reason}; a copy "
+            "delivered earlier is kept",
+        ),
+    )
+
+
 def module_gateway_agents_active(target_folder: Path) -> bool:
     """True iff :func:`gateway_agents_gate` says DELIVER for ``target_folder``.
 
@@ -498,13 +647,19 @@ def record_gate_outcomes(
 
     Per verdict: UNKNOWN → ``gated_delivery_unknown``; SKIP on a machine whose
     gateway IS configured → ``gated_delivery_skipped``; anything else → both
-    resolved. Returns the condition ids emitted. Soft-fail throughout
+    resolved; a per-vendor HELD outcome (``SIGNAL_VENDOR_KEY``) → a log line
+    only. Returns the condition ids emitted. Soft-fail throughout
     (deferral I/O is best-effort and never aborts a bundle run); ``dry_run``
     writes nothing.
     """
     emit: list[Any] = []
     log_lines: list[str] = []
     for prefix, verdict in outcomes:
+        if verdict.signal == SIGNAL_VENDOR_KEY:
+            # The per-vendor leg: a log line only — a user without that
+            # vendor's key has nothing to fix (see select_gateway_agents).
+            log_lines.append(f"gated definition {prefix}: HELD — {verdict.reason}")
+            continue
         if verdict.state is GateState.UNKNOWN:
             emit.append(_entry_for(verdict, folder))
             log_lines.append(
@@ -625,8 +780,8 @@ def agent_definition_dirs(folder: Optional[Path]) -> list[Path]:
 def status_payload(
     folders: Optional[Sequence[Path | str]] = None,
 ) -> dict[str, Any]:
-    """``{"machine_signal", "gate", "agent_id_problems", "folders"?}``. Reads
-    only.
+    """``{"machine_signal", "gate", "agent_id_problems", "vendor_keys",
+    "folders"?}``. Reads only. ``vendor_keys`` is :func:`vendor_keys_payload`.
 
     ``agent_id_problems`` lists definitions (the projects' and the user's)
     naming a gateway model id the router does not know — ``None`` when the
@@ -691,6 +846,7 @@ def status_payload(
         "machine_signal": signal.to_dict(),
         "gate": None,
         "agent_id_problems": problems,
+        "vendor_keys": vendor_keys_payload(),
     }
     if len(entries) == 1:
         only = by_folder[entries[0][0]]
@@ -699,6 +855,44 @@ def status_payload(
     if by_folder:
         payload["folders"] = by_folder
     return payload
+
+
+#: The shipped gated definitions, beside this package in the checkout (the
+#: orchestrator runs from its own clone, ``pip install -e``).
+SHIPPED_GATEWAY_AGENTS = (
+    Path(__file__).resolve().parent.parent / "templates" / "agents"
+    / GATEWAY_AGENTS_DIR
+)
+
+
+def vendor_keys_payload(
+    src_dir: Optional[Path] = None,
+    *,
+    vendor_probe: Optional[VendorProbe] = None,
+) -> Optional[dict[str, Any]]:
+    """Per vendor named by the shipped definitions: does its key resolve, and
+    which definitions does that hold back — the per-vendor leg as the
+    Services card shows it. ``None`` when the gateway package is not
+    importable (no vendor can be named). Reads only; values never leave the
+    probe (booleans and key-free reasons only)."""
+    files = sorted(Path(src_dir or SHIPPED_GATEWAY_AGENTS).glob("*.md"))
+    try:
+        vendor_of = {f: definition_vendor(f) for f in files}
+    except ImportError:
+        return None
+    reach = vendor_reachability(
+        (v for v in vendor_of.values() if v is not None),
+        vendor_probe=vendor_probe,
+    )
+    return {
+        vendor_id: {
+            "resolves": ok,
+            "reason": reason,
+            "definitions": sorted(f.stem for f, v in vendor_of.items()
+                                  if v == vendor_id),
+        }
+        for vendor_id, (ok, reason) in reach.items()
+    }
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -754,6 +948,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for path, entry in (payload.get("folders") or {}).items():
                 g = entry["gate"]
                 print(f"gate [{path}]: {g['state']} ({g['signal']}) — {g['reason']}")
+        for vendor_id, vk in sorted((payload.get("vendor_keys") or {}).items()):
+            state = "delivered" if vk["resolves"] else "held back"
+            print(f"vendor {vendor_id}: {state} ({vk['reason']}) — "
+                  + ", ".join(vk["definitions"]))
     return 0
 
 

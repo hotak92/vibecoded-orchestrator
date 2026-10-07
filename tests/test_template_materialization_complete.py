@@ -334,7 +334,7 @@ class TestEveryShippedTemplateRenders:
                 ET.fromstring(text.encode("utf-8"))
                 parsed += 1
         # The floor is DERIVED from the catalogue this bundle ships: the 11
-        # default free agents + 8 machine-gated gateway agents + 6 default
+        # default free agents + 10 machine-gated gateway agents + 6 default
         # skills (all frontmatter-bearing), plus the boot units counted above.
         # Opt-in packs are NOT part of the default bundle render, so they are
         # not in this count. A count below the default catalogue means renders

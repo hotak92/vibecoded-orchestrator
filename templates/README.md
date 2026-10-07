@@ -22,7 +22,7 @@ Installed by default in every project. ONE definition per agent: the dispatcher 
 
 ## Gateway agents — `agents/module-gateway/` (8 agents)
 
-Delivered ONLY when the model gateway is configured on the machine (tri-state module gate); they pin `claude-gw/*` model ids in frontmatter and are dispatched by name with no model override. The z.ai lane: `glm-implementer`, `glm-reviewer`, `glm-planner`, `glm-flash-researcher`. The qwen-vendor lane: `deepseek-implementer`, `qwen-implementer`, `deepseek-researcher`, `qwen-flash-sweeper`. There is deliberately no reviewer and no planner on the qwen vendor.
+Delivered ONLY when the model gateway is configured on the machine (tri-state module gate); they pin `claude-gw/*` model ids in frontmatter and are dispatched by name with no model override. The z.ai lane: `glm-implementer`, `glm-reviewer`, `glm-planner`, `glm-flash-researcher`. The qwen-vendor lane: `deepseek-implementer`, `qwen-implementer`, `deepseek-researcher`, `qwen-flash-sweeper`. There is deliberately no reviewer and no planner on the qwen vendor. The kimi-vendor lane (Kimi K3): `kimi-implementer`, `kimi-reviewer`. Each lane is delivered only when its vendor's key resolves at bundle time; a lane whose key is missing is held back (an earlier copy is kept, never deleted).
 
 ## Default skills — `skills/` (6 skills)
 

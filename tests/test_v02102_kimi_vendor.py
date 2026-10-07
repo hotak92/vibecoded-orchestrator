@@ -13,8 +13,17 @@ Owner order 2026-10-07, narrowed the same day to K3 only. What is pinned:
   ``k3`` family, or present on the vendor's own live list;
 * the wire: the vendor key goes out as ``x-api-key`` with no scheme, the
   host token never leaves, and the CLIENT's user-agent is relayed — on
-  ``/v1/messages`` and on the model-list fetch a client's ``/v1/models``
-  triggers (the vendor's edge 403s library user-agents, live 2026-10-07);
+  ``/v1/messages``, on the model-list fetch a client's ``/v1/models``
+  triggers, and on the quota fetch a refresh signal schedules (the
+  vendor's edge 403s library user-agents, live 2026-10-07);
+* the usage windows: the subscription's own quota endpoint
+  (``GET /coding/v1/usages``, live probe 2026-10-07 with the owner's key —
+  body saved verbatim as ``tests/fixtures/model_router/kimi-usages.json``)
+  yields a 5h window derived from ``limits[].detail`` used/limit (its
+  ``usages.limit_5h.used_ratio`` DISAGREED with that row in the probe and
+  is deliberately not read) and monthly windows from
+  ``usages.*.used_ratio``; the fetch speaks the kimi quota dialect
+  (``x-api-key`` + the relayed client UA) while Z.ai keeps its own;
 * the catalog: the live list publishes only ``k3[1m]`` (everything else
   withheld and reported), the keyless fallback (the shipped snapshot,
   narrowed the same way) is ``k3``, an OpenAI-style
@@ -35,14 +44,19 @@ import asyncio
 import json
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
 from model_router import catalog as cat
 from model_router import routing
+from model_router import usage_windows as uw
 from model_router.catalog import SOURCE_LIVE, SOURCE_STATIC
 from model_router.context_table import ContextTable, load_seed
 from model_router.effort import EFFORT_VALUES, effort_policy, translate_effort
 from model_router.routing import RouteError
 from model_router.secrets import VendorKeyResolver
+from model_router.usage_windows import UsageWindows, parse_kimi_usages
 from model_router.vendors import (
     ANTHROPIC_FAMILY,
     GATEWAY_NAMESPACE,
@@ -55,6 +69,10 @@ from tests.test_model_router_server import (  # noqa: E402 — shared base
     HOST_TOKEN,
     GatewayTestBase,
     _Upstream,
+)
+from tests.test_model_router_usage_windows import (  # noqa: E402 — shared fakes
+    ZAI_PAYLOAD_2026,
+    _FakeFetch,
 )
 
 KIMI = VENDORS["kimi"]
@@ -111,8 +129,11 @@ class RegistryRowTests(unittest.TestCase):
         self.assertEqual(KIMI.catalog_path, "/v1/models")
         self.assertIsNone(KIMI.catalog_url)
 
-    def test_no_quota_url_and_no_unmeasured_stream_flag(self) -> None:
-        self.assertIsNone(KIMI.quota_url)
+    def test_the_quota_url_is_the_probed_usages_endpoint(self) -> None:
+        """Live probe 2026-10-07 with the owner's key: the endpoint answered
+        200 to ``x-api-key`` + a client user-agent + anthropic-version; the
+        body is the kimi-usages fixture."""
+        self.assertEqual(KIMI.quota_url, "https://api.kimi.ai/coding/v1/usages")
         self.assertFalse(KIMI.partial_message_start_usage)
 
 
@@ -443,6 +464,177 @@ class EffortTests(unittest.TestCase):
                     out, changed = translate_effort(payload, "kimi", model_id)
                     self.assertFalse(changed)
                     self.assertIs(out, payload)
+
+
+# ── W1-K3: the usage windows ─────────────────────────────────────────────
+#: The probe body, verbatim. LIVE 2026-10-07, coordinator probe with the
+#: owner's key: ``GET https://api.kimi.ai/coding/v1/usages``, headers
+#: ``x-api-key`` (raw), ``user-agent: claude-cli/...`` (the edge 403s
+#: library user-agents with "error code: 1010") and
+#: ``anthropic-version: 2023-06-01`` -> HTTP 200 with this JSON.
+KIMI_USAGES = json.loads(
+    (Path(__file__).parent / "fixtures" / "model_router" / "kimi-usages.json")
+    .read_text(encoding="utf-8"),
+)
+
+#: Before the probe's own 5h reset, so a parsed reading is not yet
+#: "past its reset time".
+KIMI_NOW = datetime(2026, 10, 7, 4, 0, tzinfo=timezone.utc).timestamp()
+
+
+class KimiUsageParsingTests(unittest.TestCase):
+    def _by_id(self, payload) -> dict:
+        _plan, windows = parse_kimi_usages(payload, now=KIMI_NOW)
+        return {w.id: w for w in windows}
+
+    def test_the_probed_body_parses(self) -> None:
+        # Order and labels: 5h first and spelt like Z.ai's, the two monthly
+        # windows after it, so every existing renderer treats them alike.
+        _plan, ordered = parse_kimi_usages(KIMI_USAGES, now=KIMI_NOW)
+        self.assertEqual(
+            [(w.id, w.label) for w in ordered],
+            [("5h", "5h"), ("monthly", "mo"), ("monthly_code", "mo-code")],
+        )
+        windows = self._by_id(KIMI_USAGES)
+        # The 5h percent comes from limits[].detail used/limit — STRINGS.
+        self.assertEqual(windows["5h"].percent, 9.0)
+        self.assertEqual(
+            windows["5h"].resets_at,
+            datetime(2026, 10, 7, 5, 13, 9, 844464, tzinfo=timezone.utc).timestamp(),
+        )
+        # The monthly windows come from usages.*.used_ratio (a fraction).
+        self.assertEqual(windows["monthly"].percent, 0.29)
+        self.assertEqual(
+            windows["monthly"].resets_at,
+            datetime(2026, 11, 8, tzinfo=timezone.utc).timestamp(),
+        )
+        # A GENUINE zero reading, not a missing one: used_ratio 0 is present
+        # and parses, so it is 0.0 — unknown is reserved for absence.
+        self.assertEqual(windows["monthly_code"].percent, 0.0)
+        self.assertEqual(windows["5h"].source, "kimi_usages")
+
+    def test_the_disagreeing_5h_ratio_is_deliberately_not_read(self) -> None:
+        """In the probe usages.limit_5h.used_ratio (0) disagreed with
+        limits[0].detail (9/100 used). The detail row wins; a payload whose
+        ratio says something else must not move the 5h percent."""
+        payload = json.loads(json.dumps(KIMI_USAGES))
+        payload["usages"]["limit_5h"]["used_ratio"] = 0.75
+        self.assertEqual(self._by_id(payload)["5h"].percent, 9.0)
+
+    def test_malformed_bodies_are_unknown_never_raised(self) -> None:
+        for payload in (
+            None, "nonsense", 7, {},
+            {"limits": "not-a-list", "usages": 4},
+            # The right window shape but unparseable numbers.
+            {"limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                         "detail": {"used": "nine", "limit": "100",
+                                    "resetTime": "2026-10-07T05:13:09.844464Z"}}]},
+            # A zero limit cannot yield a percent.
+            {"limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                         "detail": {"used": "9", "limit": "0"}}]},
+            # A different window (duration 60, or another time unit) is not
+            # the 5h one.
+            {"limits": [{"window": {"duration": 60, "timeUnit": "TIME_UNIT_MINUTE"},
+                         "detail": {"used": "1", "limit": "2"}}]},
+            {"limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_HOUR"},
+                         "detail": {"used": "1", "limit": "2"}}]},
+            {"usages": {"limit_month_total": {"used_ratio": "half"}},
+             "limits": [{"window": None, "detail": None}]},
+            {"usages": {"limit_month_total": "not-a-block"}},
+            {"usages": {"limit_month_total": {"used_ratio": -0.5}}},
+        ):
+            with self.subTest(payload=payload):
+                _plan, windows = parse_kimi_usages(payload, now=KIMI_NOW)
+                self.assertEqual([w.percent for w in windows], [None, None, None])
+                self.assertEqual({w.unknown_reason for w in windows},
+                                 {uw.UNKNOWN_NOT_REPORTED})
+
+
+class KimiQuotaDialectTests(unittest.IsolatedAsyncioTestCase):
+    """The quota FETCH: x-api-key + the relayed client UA, Z.ai untouched."""
+
+    def _make(self, vendors, fetch) -> UsageWindows:
+        async def vendor_key(_vendor):
+            return "vendor-key"
+
+        return UsageWindows(
+            anthropic_upstream="https://anthropic.example/",
+            vendors=vendors,
+            oauth_token=lambda: None,
+            vendor_key=vendor_key,
+            fetch=fetch,
+            ledger_path=lambda: None,
+            clock=lambda: KIMI_NOW,
+            rng=lambda: 0.5,
+        )
+
+    async def _run(self, service, user_agent: Optional[str] = CLIENT_UA):
+        self.assertTrue(service.note_activity(user_agent))
+        while service.refreshing:
+            await asyncio.sleep(0)
+        return service.snapshot()
+
+    @staticmethod
+    def _vendor(snap, vendor_id) -> dict:
+        return next(v for v in snap["vendors"] if v["id"] == vendor_id)
+
+    async def test_the_quota_fetch_sends_x_api_key_and_the_clients_ua(self) -> None:
+        quota_url = KIMI.quota_url
+        assert quota_url is not None  # noqa: S101 — pinned by RegistryRowTests
+        fetch = _FakeFetch({quota_url: (200, KIMI_USAGES)})
+        snap = await self._run(self._make({"kimi": KIMI}, fetch))
+        self.assertEqual(len(fetch.calls), 1)  # no anthropic fetch: no token
+        url, headers = fetch.calls[0]
+        self.assertEqual(url, quota_url)
+        self.assertEqual(headers.get("x-api-key"), "vendor-key")
+        self.assertEqual(headers.get("User-Agent"), CLIENT_UA)
+        self.assertIn("anthropic-version", headers)
+        self.assertNotIn("Authorization", headers)
+        kimi = self._vendor(snap, "kimi")
+        self.assertEqual(kimi["state"], "ok")
+        by_id = {w["id"]: w for w in kimi["windows"]}
+        self.assertEqual(by_id["5h"]["percent"], 9.0)
+        self.assertEqual(by_id["monthly"]["percent"], 0.29)
+        # A quota vendor gets windows, not the ledger-token fallback.
+        self.assertNotIn("tokens", kimi)
+
+    async def test_without_a_client_ua_none_is_invented(self) -> None:
+        """The vendor's terms forbid passing the gateway off as a client.
+        With no client UA on record the fetch goes without one; the edge's
+        403 to a library UA reads as an honest unknown, never a guess."""
+        quota_url = KIMI.quota_url
+        assert quota_url is not None  # noqa: S101 — pinned by RegistryRowTests
+        fetch = _FakeFetch({quota_url: (403, None)})
+        snap = await self._run(self._make({"kimi": KIMI}, fetch), user_agent=None)
+        headers = fetch.calls[0][1]
+        self.assertNotIn("User-Agent", headers)
+        kimi = self._vendor(snap, "kimi")
+        self.assertEqual(kimi["state"], "unknown")
+        self.assertIn("HTTP 403", kimi["problem"])
+        self.assertEqual(kimi["windows"], [])
+
+    async def test_zai_still_speaks_its_own_dialect(self) -> None:
+        """Leave-alone: the zai row keeps the RAW Authorization key, no
+        scheme, no relayed user-agent, and the Z.ai parser."""
+        zai = replace(VENDORS["zai"], quota_url="https://quota.example/limit")
+        fetch = _FakeFetch({"https://quota.example/limit": (200, ZAI_PAYLOAD_2026)})
+        snap = await self._run(self._make({"zai": zai}, fetch))
+        self.assertEqual(
+            fetch.calls[0][1],
+            {"Authorization": "vendor-key", "Accept-Language": "en-US,en"},
+        )
+        zai_snap = self._vendor(snap, "zai")
+        self.assertEqual(zai_snap["state"], "ok")
+        self.assertEqual(zai_snap["plan"], "pro")
+        by_id = {w["id"]: w for w in zai_snap["windows"]}
+        # The reading PARSED through the Z.ai parser (its source and the
+        # plan only that parser yields). The fixture's resets lie in
+        # September 2026, before this class's fixed October clock, so the
+        # snapshot ages both to unknown — reset_passed, the module's rule,
+        # not a parse failure.
+        self.assertEqual(by_id["5h"]["source"], "zai_quota")
+        self.assertEqual(by_id["5h"]["unknown_reason"], "reset_passed")
+        self.assertEqual(by_id["weekly"]["unknown_reason"], "reset_passed")
 
 
 if __name__ == "__main__":

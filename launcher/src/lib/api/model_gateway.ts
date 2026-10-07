@@ -1063,6 +1063,18 @@ export interface GatewayAgentsGate {
   claude_md_section?: { renders: boolean };
   /** `null` when the gateway package is not importable (nothing to check). */
   agent_id_problems: AgentIdProblem[] | null;
+  /** v0.2.102 per-vendor key leg (`vendor_keys_payload`): per vendor named
+   *  by the shipped definitions, does its key resolve, and which definitions
+   *  it holds back. `null` when the gateway package is not importable;
+   *  absent from a pre-v0.2.102 payload. */
+  vendor_keys?: Record<string, VendorKeyStatus> | null;
+}
+
+/** One vendor's row in `vendor_keys`. Booleans and key-free reasons only. */
+export interface VendorKeyStatus {
+  resolves: boolean;
+  reason: string;
+  definitions: string[];
 }
 
 /**
@@ -1106,6 +1118,31 @@ export function describeAgentDelivery(
     tone: 'unknown',
     label: 'agent definitions: could not tell',
     detail: `${ms.reason}. Previously delivered definitions are kept until this can be decided.`,
+  };
+}
+
+/**
+ * One line for the card when a vendor's key does not resolve: which gateway
+ * agent definitions that holds back (v0.2.102). The decision is Python's
+ * (`select_gateway_agents`); this only restates `vendor_keys`. `null` when
+ * nothing is held (or the payload predates the field) — no line, no noise.
+ */
+export function describeHeldVendors(
+  g: GatewayAgentsGate | null,
+): StatusLine | null {
+  const keys = g?.vendor_keys;
+  if (!keys) return null;
+  const held = Object.entries(keys)
+    .filter(([, v]) => !v.resolves)
+    .sort(([a], [b]) => a.localeCompare(b));
+  if (held.length === 0) return null;
+  const parts = held.map(
+    ([vendor, v]) => `${vendor} (${v.definitions.join(', ')}): ${v.reason}`,
+  );
+  return {
+    tone: 'warn',
+    label: `agent definitions held back: ${held.map(([vendor]) => vendor).join(', ')}`,
+    detail: `${parts.join('; ')}. Add the vendor key in the Secrets panel and update the bundle to deliver them; copies delivered earlier are kept.`,
   };
 }
 

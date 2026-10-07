@@ -37,8 +37,8 @@ def _frontmatter(path: Path) -> str | None:
 def test_the_scan_finds_the_shipped_catalogue() -> None:
     """The parametrized tests skip a file with no frontmatter, so they pass
     vacuously when the globs match nothing. Pin the scan against the catalogue
-    it must cover: the 11 default free agents + 8 machine-gated gateway agents
-    + 6 default skills, plus every member of the opt-in packs. A moved
+    it must cover: the 11 default free agents + 10 machine-gated gateway agents
+    (8 until v0.2.102 added the kimi pair) + 6 default skills, plus every member of the opt-in packs. A moved
     directory or a narrowed glob shrinks FILES and fails HERE rather than
     silently skipping every definition."""
     default = (
@@ -50,9 +50,9 @@ def test_the_scan_finds_the_shipped_catalogue() -> None:
         len(list(REPO.glob("templates/packs/*/agents/*.md")))
         + len(list(REPO.glob("templates/packs/*/skills/*/SKILL.md")))
     )
-    assert default == 25, (
-        f"the default catalogue is {default} definitions, expected 25 "
-        "(11 free agents + 8 gateway agents + 6 skills)"
+    assert default == 27, (
+        f"the default catalogue is {default} definitions, expected 27 "
+        "(11 free agents + 10 gateway agents + 6 skills)"
     )
     assert pack_members >= 45, (
         f"the pack tree carries only {pack_members} members; templates/packs/ "

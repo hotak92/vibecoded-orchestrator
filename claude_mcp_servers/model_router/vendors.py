@@ -161,14 +161,17 @@ class Vendor:
             offer an id that answers as something else.
         quota_url: ABSOLUTE URL of the vendor's subscription-quota endpoint,
             or ``None`` when the vendor publishes no programmatic quota. Read
-            by :mod:`model_router.usage_windows`, which speaks exactly ONE
-            shape — Z.ai's monitor JSON (``data.limits[]`` with ``unit`` /
-            ``number`` / ``percentage`` / ``nextResetTime``), key presented
-            RAW in ``Authorization`` with no scheme. UNDOCUMENTED by the
-            vendor; it is parsed defensively and every miss reads "unknown".
-            A row with ``None`` gets the honest fallback instead: the
-            gateway's own ledger tokens for the current month, labelled as
-            tokens, never as a percentage.
+            by :mod:`model_router.usage_windows`, which knows one dialect per
+            vendor id (its ``_QUOTA_DIALECTS`` table): Z.ai's monitor JSON
+            (``data.limits[]`` with ``unit`` / ``number`` / ``percentage`` /
+            ``nextResetTime``), key presented RAW in ``Authorization`` with
+            no scheme; Kimi's usages JSON (``limits[].detail`` for the 5h
+            window, ``usages.*.used_ratio`` for the monthly ones), key as
+            ``x-api-key`` plus the relayed client user-agent. Both
+            UNDOCUMENTED by the vendor; both parsed defensively and every
+            miss reads "unknown". A row with ``None`` gets the honest
+            fallback instead: the gateway's own ledger tokens for the
+            current month, labelled as tokens, never as a percentage.
         short_name: the compact label the usage status line and the
             launcher's usage card print for this vendor (``GLM``, ``Qwen``).
             Falls back to :func:`vendor_display_name` when empty.
@@ -497,9 +500,15 @@ VENDORS: Mapping[str, Vendor] = {
         # ``kimi``: the ids the live list carried on 2026-10-07), served
         # under the ``static`` source and narrowed by verified_ids like a
         # live answer.
-        # No quota_url: the vendor documents no programmatic quota — usage is
-        # read in the console or with the Kimi Code CLI's /usage
-        # (membership page) — so usage falls back to the gateway ledger.
+        # LIVE-PROBED 2026-10-07 with the owner's key (coordinator probe):
+        # ``GET https://api.kimi.ai/coding/v1/usages`` answered HTTP 200 with
+        # ``x-api-key`` (raw), a client user-agent — the SAME Cloudflare gate
+        # as the messages endpoint; a library UA gets 403 "error code: 1010"
+        # — and ``anthropic-version``. The body is saved verbatim as
+        # tests/fixtures/model_router/kimi-usages.json and read by
+        # model_router.usage_windows.parse_kimi_usages. Undocumented by the
+        # vendor, parsed defensively like every other quota source.
+        quota_url="https://api.kimi.ai/coding/v1/usages",
         short_name="Kimi",
         # partial_message_start_usage stays False: the flag is a claim about
         # MEASURED streaming behaviour and no Kimi stream has been captured.

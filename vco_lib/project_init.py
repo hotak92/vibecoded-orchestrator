@@ -3720,17 +3720,17 @@ def _enumerate_bundle_files(
     # `free/`. v0.2.100 AD-7: a TRI-STATE gate on the machine signal (explicit
     # per-project row wins); the verdict goes to `gate_outcomes` so the orphan
     # loop carries an UNKNOWN bucket forward and the run records every skip.
-    # The table and rationale live in `vco_lib.module_gated_delivery`. Root
-    # installs (`project_root is None`) go through the same gate.
+    # The tables (incl. the v0.2.102 per-vendor key leg) live in
+    # `vco_lib.module_gated_delivery`; root installs go through the same gate.
     from vco_lib import module_gated_delivery as _mgd
     gateway_agents_src = templates / "agents" / _mgd.GATEWAY_AGENTS_DIR
     if gateway_agents_src.exists():
         verdict = _mgd.gateway_agents_gate(
             orchestrator_root if project_root is None else project_root)
+        gw_files, gw_held = _mgd.select_gateway_agents(gateway_agents_src, verdict)
         if gate_outcomes is not None:
-            gate_outcomes.append((_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict))
-        for agent_file in (sorted(gateway_agents_src.glob("*.md"))
-                           if verdict.delivers else ()):
+            gate_outcomes += [(_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict), *gw_held]
+        for agent_file in gw_files:
             _gw_dest = str(Path(".claude") / "agents" / agent_file.name)
             ops.append(_BundleFileOp(
                 dest_rel=_gw_dest,

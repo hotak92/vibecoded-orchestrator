@@ -49,6 +49,7 @@
     describeSupervision,
     describeUsageLedger,
     describeAgentDelivery,
+    describeHeldVendors,
     describeRoutingGuidance,
     gatewayIsConfigured,
     gatewayPanelReady,
@@ -185,6 +186,7 @@
   let agentsGate = $state<GatewayAgentsGate | null>(null);
   let agentsGateError = $state<string | null>(null);
   const agentDelivery = $derived(describeAgentDelivery(agentsGate));
+  const heldVendors = $derived(describeHeldVendors(agentsGate));
 
   async function refreshAgentsGate() {
     try {
@@ -1094,6 +1096,11 @@
       </p>
     {:else if agentsGateError}
       <p class="muted small">Agent definitions: could not ask ({agentsGateError}).</p>
+    {/if}
+    {#if heldVendors}
+      <p class="muted small" data-testid="gw-agent-held-vendors">
+        <strong>{heldVendors.label}</strong> — {heldVendors.detail}
+      </p>
     {/if}
     {#if agentsGate?.agent_id_problems?.length}
       <div class="banner warn" data-testid="gw-agent-id-problems">
