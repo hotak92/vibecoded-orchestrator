@@ -624,7 +624,7 @@ naming the model that actually ANSWERED that identity's last turn — with the f
 routing ladder served it — which the launcher's usage card renders as a "Who answered" list. That list exists because
 the VS Code agents panel shows the session model for every background lane (a harness bug,
 anthropics/claude-code#93324): the gateway's ledger is the only place the answering model is recorded. Related: for
-first-party 1M-native models (`claude-opus-5-5`, `claude-sonnet-5-5`) the client sends no `[1m]` suffix and no
+first-party 1M-native models (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`) the client sends no `[1m]` suffix and no
 `context-1m` beta, so the ledger derives `window_client` for those routes from the chat-model context table instead of
 defaulting every row to 200K.
 

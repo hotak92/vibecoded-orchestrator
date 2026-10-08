@@ -61,7 +61,8 @@ Monthly cost = Cost per call × calls per day × 30
 
 | Model | $/M input | $/M output | Cached input* |
 |---|---|---|---|
-| Claude Haiku | $1.00 | $5.00 | reads ~0.1x (≈90% discount) |
+| Claude Haiku 5.5 | $0.10 | $0.50 | reads ~0.1x (≈90% discount) |
+| Claude Haiku 4.5 (legacy) | $1.00 | $5.00 | reads ~0.1x (≈90% discount) |
 | Claude Sonnet | $3.00 | $15.00 | reads ~0.1x (≈90% discount) |
 | Claude Opus | $5.00 | $25.00 | reads ~0.1x (≈90% discount) |
 | GPT-4o | $2.50 | $10.00 | discounted 50% |

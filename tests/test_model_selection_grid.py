@@ -24,23 +24,25 @@ import pytest
 
 from vco_lib import materialize, model_selection
 
-#: The source grid (medium-effort re-score, 2026-10-03), transcribed
-#: verbatim: row id -> the 11 column scores, in the source's row ORDER.
+#: The source grid (medium-effort re-score, 2026-10-03; owner-approved
+#: revision 2026-10-08: Haiku 5.5 replaces Haiku 4.5, GLM-5.3 Review 8,
+#: DeepSeek V4.1 Flash Docs 7), transcribed verbatim: row id -> the 11
+#: column scores, in the source's row ORDER.
 #: Columns: Code, Debug, Review, Plan, Bulk, Tools, Instr, LongCtx, Docs,
 #: Vision, Cost.
 EXPECTED_SCORES = {
     "opus": ["10", "10", "9", "9", "5", "10", "8*", "10", "9", "10", "4"],
     "fable": ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"],
-    "glm-5.3": ["7", "6", "7", "6", "6", "6", "7*", "7", "7", "—", "8"],
+    "glm-5.3": ["7", "6", "8", "6", "6", "6", "7*", "7", "7", "—", "8"],
     # v0.2.102: scored from cited evidence, not the maintainer's
     # grid — see the comment above the row in model_selection.toml.
     "kimi-k3": ["7", "6", "6*", "6*", "3", "7", "7*", "8", "8", "8", "3"],
-    "deepseek-v4.1-flash": ["7", "6", "6", "6", "9", "6", "7*", "8", "6", "7", "10"],
+    "deepseek-v4.1-flash": ["7", "6", "6", "6", "9", "6", "7*", "8", "7", "7", "10"],
     "sonnet": ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"],
     "qwen3.8-max": ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"],
     "glm-5.3-flash": ["5", "5", "5", "5", "8", "5", "6*", "7", "6*", "8", "8"],
     "qwen3.8-flash": ["5*", "4", "4*", "4*", "7", "4", "8*", "7", "5*", "7", "9"],
-    "haiku": ["2", "2", "2*", "2", "5", "3", "5", "5", "2*", "4", "7"],
+    "haiku": ["4", "4", "3*", "3", "8", "5", "6*", "7", "4*", "6", "9"],
 }
 
 #: Rows carrying the `†` marker (only xhigh/max benchmark results).
@@ -51,43 +53,59 @@ EXPECTED_COLUMNS = ["Code", "Debug", "Review", "Plan", "Bulk", "Tools",
                     "Instr", "LongCtx", "Docs", "Vision", "Cost"]
 
 #: The "What changes the pick:" bullets that belong to ONE model, transcribed
-#: verbatim (row id -> note text), in the source's order.
-EXPECTED_NOTES = {
-    "opus": "**Opus 5.5** leads at medium on almost every axis and costs less "
-            "per task than Fable 5.1 (≈$1.3 vs ≈$3.0); keep Fable for final "
-            "reviews, plans and the hardest debugging.",
-    "sonnet": "**Sonnet 5.5** is the most effort-sensitive model: near Opus at "
-              "max, but at medium it trails GLM-5.3 and DeepSeek V4.1 Flash on "
-              "coding. Not a default choice.",
-    "deepseek-v4.1-flash": "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s "
-                           "to first token) and cheapest per task: default for "
-                           "research, surveys, bulk and bounded implementation. "
-                           "Users report fragile tool calls / loops on long runs "
-                           "— keep tasks bounded.",
-    "glm-5.3": "**GLM-5.3** — the non-Claude model users route review/audit to; "
-               "text-only.",
-    "kimi-k3": "**Kimi K3** — near-frontier code quality on real repos and "
-               "strong long-context retrieval, but the slowest and most verbose "
-               "lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about "
-               "twice the median output tokens), so queue its work and review it "
-               "later. It always reasons; it can repeat the same tool call or stop "
-               "on reasoning with no answer, and it guesses confidently when unsure "
-               "(51% hallucination rate on uncertain questions), so demand quoted "
-               "evidence in its reviews.",
-    "glm-5.3-flash": "**GLM-5.3-Flash** suits bulk / first-pass work behind a "
-                     "verifier — tests, a diff review or a stronger second pass; "
-                     "retries help it, more effort does not (longer runs helped "
-                     "it only 46% of the time, below chance). Keep it off "
-                     "shared-component extractions, where one un-migrated "
-                     "call-site leaves the suite green while defeating the "
-                     "change, and never give it unsupervised writes to a green "
-                     "test suite (it broke a passing baseline test in 6.9% of "
-                     "rollouts).",
-    "qwen3.8-max": "**Qwen3.8-Max** — best prose and literal instruction-"
-                   "following, but it defaults to xhigh effort (≈$5.4 per task "
-                   "there) and users report it leaves work half-done and skips "
-                   "tests unless asked: state \"add tests and run them\".",
-}
+#: verbatim as (row id, note text) pairs, in the source's order. A list, not
+#: a dict: one row may carry more than one bullet (GLM-5.3 has a reviewer and
+#: an implementer bullet since the 2026-10-08 revision).
+EXPECTED_NOTES = [
+    ("opus", "**Opus 5.5** leads at medium on almost every axis and costs less "
+             "per task than Fable 5.1 (≈$1.3 vs ≈$3.0); keep Fable for final "
+             "reviews, plans and the hardest debugging."),
+    ("sonnet", "**Sonnet 5.5** is the most effort-sensitive model: near Opus at "
+               "max, but at medium it trails GLM-5.3 and DeepSeek V4.1 Flash on "
+               "coding. Not a default choice."),
+    ("haiku", "**Haiku 5.5** — the fastest and cheapest Claude (≈165 tok/s, "
+              "≈$0.05 per task at medium) with a 1M window: good for bulk, "
+              "classification, extraction and routing. Its headline vendor "
+              "scores are at effort max; at medium it sits below the flash-tier "
+              "vendor lanes on code, so keep coding, planning and review on "
+              "larger models."),
+    ("deepseek-v4.1-flash", "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s "
+                            "to first token) and cheapest per task: default for "
+                            "research, surveys, bulk and bounded implementation. "
+                            "Users report fragile tool calls / loops on long runs "
+                            "— keep tasks bounded."),
+    ("glm-5.3", "**GLM-5.3** — the non-Claude model users route review/audit to; "
+                "text-only."),
+    ("glm-5.3", "**GLM-5.3 as implementer** — strong on bounded lanes whose brief "
+                "names the files and the acceptance criteria. Its recurring "
+                "misses are \"every call-site\" coverage claims (check them with "
+                "an independent grep), line-count / ASCII gates, and stray "
+                "working-tree edits while proving a test red — name each in the "
+                "brief."),
+    ("kimi-k3", "**Kimi K3** — near-frontier code quality on real repos and "
+                "strong long-context retrieval, but the slowest and most verbose "
+                "lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about "
+                "twice the median output tokens), so queue its work and review it "
+                "later. Its measured subscription budget is ≈ one substantial lane "
+                "per 5h window and ≈1–2% of the month per lane, so give it small, "
+                "bounded lanes or audits. It always reasons; it can repeat the same "
+                "tool call or stop on reasoning with no answer, and it guesses "
+                "confidently when unsure (51% hallucination rate on uncertain "
+                "questions), so demand quoted evidence in its reviews."),
+    ("glm-5.3-flash", "**GLM-5.3-Flash** suits bulk / first-pass work behind a "
+                      "verifier — tests, a diff review or a stronger second pass; "
+                      "retries help it, more effort does not (longer runs helped "
+                      "it only 46% of the time, below chance). Keep it off "
+                      "shared-component extractions, where one un-migrated "
+                      "call-site leaves the suite green while defeating the "
+                      "change, and never give it unsupervised writes to a green "
+                      "test suite (it broke a passing baseline test in 6.9% of "
+                      "rollouts)."),
+    ("qwen3.8-max", "**Qwen3.8-Max** — best prose and literal instruction-"
+                    "following, but it defaults to xhigh effort (≈$5.4 per task "
+                    "there) and users report it leaves work half-done and skips "
+                    "tests unless asked: state \"add tests and run them\"."),
+]
 
 #: The model-INDEPENDENT caveats — rendered for every grid, whatever the
 #: reachable providers.
@@ -98,7 +116,7 @@ EXPECTED_GENERAL_NOTES = [
     "to the exact versions above.",
 ]
 
-CLAUDE_ROWS = ("Opus 5.5", "Fable 5.1", "Sonnet 5.5", "Haiku 4.5")
+CLAUDE_ROWS = ("Opus 5.5", "Fable 5.1", "Sonnet 5.5", "Haiku 5.5")
 
 
 def _rows_rendered(markdown: str) -> set[str]:
@@ -115,7 +133,11 @@ class TestProviderFilter:
         # (The Sonnet note NAMES GLM/DeepSeek in prose, so the row/note
         # fragments below are the discriminators, not bare model names.)
         assert "leads at medium on almost every axis" in md
+        assert "fastest and cheapest Claude" in md   # Haiku 5.5 note
+        assert "| Haiku 5.5 (`model: haiku`) | 4 | 4 | 3* |" in md
+        assert "Haiku 4.5" not in md
         assert "6.9% of rollouts" not in md          # GLM-5.3-Flash note
+        assert "GLM-5.3 as implementer" not in md    # GLM-5.3 note
         assert "fragile tool calls" not in md        # DeepSeek note
         assert "best prose" not in md                # Qwen3.8-Max note
         assert "GLM-5.3-Flash" not in md and "Qwen3.8" not in md
@@ -124,6 +146,7 @@ class TestProviderFilter:
         md = model_selection.render_grid(providers=frozenset({"anthropic", "zai"}))
         assert _rows_rendered(md) == set(CLAUDE_ROWS) | {"GLM-5.3 †", "GLM-5.3-Flash †"}
         assert "the non-Claude model users route review/audit to" in md
+        assert "GLM-5.3 as implementer" in md
         assert "6.9% of rollouts" in md
         assert "DeepSeek V4.1 Flash (`" not in md and "Qwen3.8" not in md
         assert "fragile tool calls" not in md
@@ -206,7 +229,7 @@ class TestGridData:
         regeneration cannot silently drop a guardrail or a caveat."""
         grid = model_selection.load_grid()
         assert [(list(n.models), n.text) for n in grid.notes] == [
-            ([rid], text) for rid, text in EXPECTED_NOTES.items()
+            ([rid], text) for rid, text in EXPECTED_NOTES
         ]
         assert list(grid.general_notes) == EXPECTED_GENERAL_NOTES
 

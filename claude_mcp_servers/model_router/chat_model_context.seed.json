@@ -191,6 +191,14 @@
       "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
       "source_note": "Citation is the Anthropic models-OVERVIEW index page on platform.claude.com: no per-model page for this model is published, so the index page is cited and named as such (the same convention as claude-fable-5-1). The 1M window / 128K output figures are its 5.0 sibling's (claude-opus-5 / claude-sonnet-5, own per-model pages) and were confirmed for the 5.5 generation by the owner, 2026-10-07. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
     },
+    "claude-haiku-5-5": {
+      "vendor": "anthropic",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "source_note": "Citation is the Anthropic models-OVERVIEW index page on platform.claude.com, which states this model's row directly (read 2026-10-08): API id and alias claude-haiku-5-5, 1M context window, 128K max output, adaptive thinking with default effort medium. No per-model page is published, so the index page is cited and named as such (the claude-fable-5-1 convention). Its predecessor claude-haiku-4-5-20251001 (200K, now legacy) deliberately has NO row: the client knows that window natively. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
+    },
     "claude-sonnet-5": {
       "vendor": "anthropic",
       "context_window": 1000000,

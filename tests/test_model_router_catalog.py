@@ -1182,9 +1182,11 @@ class CatalogHideIdsTests(unittest.TestCase):
         union = self._union(("qwen3.8-max", "glm-5.3"))
         published = {e.id for e in union.entries}
         # Spelled as the picker advertises them: a 1M model shows its
-        # ``[1m]`` row by default, the 200K one shows its plain row.
+        # ``[1m]`` row by default. (The legacy 200K Haiku 4.5 is withheld by
+        # the latest filter as Haiku 5.5's older sibling, not by the hide
+        # list; its plain-row case is pinned in WindowRowsTests.)
         for first_party in (
-            "claude-opus-5[1m]", "claude-sonnet-5[1m]", "claude-haiku-4-5-20251001",
+            "claude-opus-5[1m]", "claude-sonnet-5[1m]", "claude-haiku-5-5[1m]",
         ):
             self.assertIn(first_party, published,
                           "a vendor hide list must never reach first party")
@@ -1250,9 +1252,14 @@ class WindowRowsTests(unittest.TestCase):
 
     def test_a_non_1m_first_party_row_is_untouched(self):
         """The knob withholds a SECOND spelling. A model that never had one
-        must keep the only row it has."""
-        published = {e.id for e in self._union().entries}
+        must keep the only row it has. (Under the default latest filter the
+        200K legacy Haiku 4.5 is withheld as Haiku 5.5's older sibling, so
+        the knob is observed with every id published.)"""
+        published = {
+            e.id for e in self._union(catalog_filter=cat.CATALOG_FILTER_ALL).entries
+        }
         self.assertIn("claude-haiku-4-5-20251001", published)
+        self.assertNotIn("claude-haiku-4-5-20251001[1m]", published)
 
     def test_vendor_rows_are_inert_to_the_knob(self):
         one_row = {e.id for e in self._union().entries}

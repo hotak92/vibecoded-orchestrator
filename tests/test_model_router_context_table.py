@@ -34,7 +34,7 @@ from model_router import context_table as ct
 #: The shipped project template whose model-routing note describes this table
 #: to the reader of a rendered ``CLAUDE.md``. The prose and the seed must tell
 #: the same story — a reader told the Claude rows are absent cannot reconcile
-#: that with the four first-party rows below.
+#: that with the first-party rows below.
 TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "CLAUDE.md.template"
 
 #: The nine subscription-vendor rows the shipped seed must carry.
@@ -71,10 +71,13 @@ EXPECTED_KIMI_SEED_IDS = {"k3"}
 #: rows; that was true when it was written and is not true now. The 5.5
 #: generation (v0.2.102, owner-confirmed 2026-10-07) carries its 5.0
 #: siblings' figures and cites the models-overview index page — no per-model
-#: page exists for it, the claude-fable-5-1 convention.
+#: page exists for it, the claude-fable-5-1 convention. ``claude-haiku-5-5``
+#: (v0.2.102, 2026-10-08) is the current Haiku: the models-overview page
+#: states its 1M window / 128K output directly. Its legacy predecessor
+#: ``claude-haiku-4-5-20251001`` (200K) keeps NO row — the older-family rule.
 EXPECTED_CLAUDE_SEED_IDS = {
     "claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-sonnet-5",
-    "claude-opus-5-5", "claude-sonnet-5-5",
+    "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
 }
 
 #: The seed, and nothing else.
@@ -300,7 +303,7 @@ class SeedTests(unittest.TestCase):
 
     def test_template_routing_note_matches_the_shipped_rows(self) -> None:
         """The template's routing note must not call the Claude rows absent,
-        because the seed ships four first-party ones.
+        because the seed ships the first-party ones.
 
         The false sentence ("Claude models are deliberately absent from that
         table") predated the rows: it was written when the table carried only
@@ -314,7 +317,7 @@ class SeedTests(unittest.TestCase):
         self.assertNotIn(
             "Claude models are deliberately absent", text,
             "the template still claims the Claude rows are absent while the "
-            "seed ships four first-party ones; the prose must follow the data",
+            "seed ships first-party ones; the prose must follow the data",
         )
         self.assertIn(
             "first-party", text,

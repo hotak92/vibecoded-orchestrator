@@ -150,6 +150,19 @@ class OneRowPerModelTests(unittest.TestCase):
         ids = [entry.id for entry in catalog.entries]
         self.assertEqual(ids, ["claude-haiku-4-5-20251001"])
 
+    def test_the_current_haiku_is_the_one_haiku_row(self) -> None:
+        """Haiku 5.5 (1M per the models overview) publishes only its
+        ``[1m]`` row, and as the family's latest it is the picker's ONE
+        haiku: the legacy Haiku 4.5 beside it is withheld as an older
+        sibling (hidden, still routable by name) — never re-spelled with a
+        ``[1m]`` it does not have."""
+        catalog = self._union(["claude-haiku-5-5", "claude-haiku-4-5-20251001"])
+        ids = sorted(entry.id for entry in catalog.entries)
+        self.assertEqual(ids, ["claude-haiku-5-5[1m]"])
+        self.assertIn("claude-haiku-5-5", catalog.hidden)
+        self.assertIn("claude-haiku-4-5-20251001", catalog.hidden)
+        self.assertNotIn("claude-haiku-4-5-20251001[1m]", catalog.hidden)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # X1 — window_client for first-party ids derives from the context table
@@ -197,6 +210,18 @@ class ClientWindowDerivationTests(GatewayTestBase):
         row = await self._post_and_row("claude-opus-5-5")
         self.assertEqual(row["window_client"], CLIENT_WINDOW_1M)
         self.assertEqual(row["requested"], "claude-opus-5-5")
+
+    async def test_haiku_5_5_without_any_signal_records_1m(self) -> None:
+        """Haiku 5.5 is 1M-native like the other 5.5 models, so the client
+        budgets 1M with no suffix and no beta; the seed's
+        ``claude-haiku-5-5`` row answers for that budget."""
+        row = await self._post_and_row("claude-haiku-5-5")
+        self.assertEqual(row["window_client"], CLIENT_WINDOW_1M)
+
+    async def test_the_legacy_haiku_keeps_the_200k_client_window(self) -> None:
+        """Haiku 4.5 (200K, legacy) has no row, so nothing widens it."""
+        row = await self._post_and_row("claude-haiku-4-5-20251001")
+        self.assertEqual(row["window_client"], CLIENT_WINDOW_DEFAULT)
 
     async def test_a_first_party_id_the_table_does_not_name_keeps_200k(self) -> None:
         """No table row → the client's documented default for an id it does
@@ -549,12 +574,12 @@ class AgentRowTests(unittest.TestCase):
             ledger = UsageLedger(Path(tmp) / "ledger.jsonl")
             ledger.submit(_record(
                 "s1", "agent-bbb", "glm-5.3-flash",
-                fallback_from="anthropic:claude-haiku-4-5",
+                fallback_from="anthropic:claude-haiku-5-5",
             ))
             rows = ledger.agent_rows()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["model"], "glm-5.3-flash")
-        self.assertEqual(rows[0]["fallback_from"], "anthropic:claude-haiku-4-5")
+        self.assertEqual(rows[0]["fallback_from"], "anthropic:claude-haiku-5-5")
 
 
 class AgentAttributionRouteTests(GatewayTestBase):

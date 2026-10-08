@@ -133,9 +133,10 @@ model id, each with its vendor citation) is the source of truth: `glm-5.3`
 and `glm-5.3-flash` are 1M/128K; `glm-5.1`, `glm-5`, `glm-5-turbo`,
 `glm-4.7` and `glm-4.6` are 200K/128K; `glm-4.5` and `glm-4.5-air` are 128K/96K.
 So `glm-5.3` has **five times** the window of `glm-5.1` — which is exactly why a
-`glm-5*` wildcard is forbidden. Four **first-party** Claude 5 rows ARE in that
-table (`claude-fable-5-1`, `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`,
-all 1M): they are what lets the client's own `[1m]` hint be appended to a slot
+`glm-5*` wildcard is forbidden. The **first-party** Claude 5 and 5.5 rows ARE in
+that table (`claude-fable-5-1`, `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`,
+`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, all 1M): they are
+what lets the client's own `[1m]` hint be appended to a slot
 naming one of them, and lets the gateway publish its `[1m]` companion. Older
 Claude families are deliberately absent: the client already knows their windows
 natively, and a row for them could only introduce drift.

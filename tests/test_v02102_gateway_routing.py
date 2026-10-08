@@ -56,7 +56,7 @@ from tests.test_model_router_server import FAKE_VENDOR_KEY, GatewayTestBase, _Up
 
 LOGGER = "model_router.server"
 
-HAIKU = "claude-haiku-4-5"
+HAIKU = "claude-haiku-5-5"
 ZAI_GLM = "claude-gw/glm-5.3"
 ZAI_FLASH = "claude-gw/glm-5.3-flash"
 QWEN_FLASH = "claude-gw/qwen/qwen3.8-flash"
@@ -133,7 +133,7 @@ class FallbackRouteTests(unittest.TestCase):
 
     def test_any_haiku_generation_is_the_slot(self) -> None:
         # A substring marker, so the generation the client spells is one rung.
-        for model in ("claude-haiku-4-5", "claude-haiku-9", "haiku-3"):
+        for model in ("claude-haiku-5-5", "claude-haiku-4-5", "claude-haiku-9", "haiku-3"):
             self.assertIsNotNone(
                 routing.fallback_route(_first_party(model)), model,
             )
@@ -332,7 +332,7 @@ class FallbackLadderTests(LadderTestBase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["requested"], HAIKU)
         self.assertEqual(rows[0]["forward"], "glm-5.3-flash")
-        self.assertIn("anthropic:claude-haiku-4-5", rows[0]["fallback_from"])
+        self.assertIn(f"anthropic:{HAIKU}", rows[0]["fallback_from"])
 
     async def test_the_escalated_attempt_is_visible_on_the_access_line(self) -> None:
         self.refuse(self.anthropic_up)
@@ -344,7 +344,7 @@ class FallbackLadderTests(LadderTestBase):
         self.assertEqual(resp.status, 200)
         joined = "\n".join(cm.output)
         self.assertIn("note=model_fallback", joined)
-        self.assertIn("fallback_from=anthropic:claude-haiku-4-5", joined)
+        self.assertIn(f"fallback_from=anthropic:{HAIKU}", joined)
 
     async def test_a_transient_429_with_short_retry_after_retries_once(self) -> None:
         """OD-9's leave-alone: a short window is waited out on the SAME rung —
@@ -709,8 +709,8 @@ class UsageFallbackFieldTests(unittest.TestCase):
         return build_record(**kwargs)
 
     def test_a_fallback_row_carries_the_rung_it_escaped(self) -> None:
-        record = self._record(fallback_from="anthropic:claude-haiku-4-5")
-        self.assertEqual(record.fallback_from, "anthropic:claude-haiku-4-5")
+        record = self._record(fallback_from=f"anthropic:{HAIKU}")
+        self.assertEqual(record.fallback_from, f"anthropic:{HAIKU}")
         self.assertIn('"fallback_from"', record.to_json())
 
     def test_an_ordinary_row_carries_the_empty_default(self) -> None:
