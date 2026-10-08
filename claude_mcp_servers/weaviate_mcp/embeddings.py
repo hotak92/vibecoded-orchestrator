@@ -601,7 +601,15 @@ async def _get_search_vector(
     if scheme == "code":
         if server.ACTIVE_EMBEDDING in ("codesage", "qwen3"):
             # Use new CodeSage model (default for code)
-            vec = await server.get_code_embedding(text)
+            # Review E2 (v0.2.102): this branch is reached only on the
+            # DEGRADED path (EmbeddingService unavailable/failed) and serves
+            # an INTERACTIVE query — the inline CodeEmbed fallback must run
+            # at the interactive tolerance, never the 420 s batch one.
+            from vco_lib.retry_after import resolve_503_interactive_tolerance
+
+            vec = await server.get_code_embedding(
+                text, tolerance_secs=resolve_503_interactive_tolerance()
+            )
             target = "codesage_embed"
         else:
             # Legacy: Jina via Ollama
@@ -634,7 +642,9 @@ async def count_tokens_async(text: str) -> int:
     return TokenCounter.count_tokens(text)
 
 
-async def get_code_embedding(text: str) -> list[float] | None:
+async def get_code_embedding(
+    text: str, tolerance_secs: float | None = None
+) -> list[float] | None:
     """Get a CodeSage-space code embedding.
 
     This helper is the CODESAGE-SPECIFIC provider used by the
@@ -665,7 +675,7 @@ async def get_code_embedding(text: str) -> list[float] | None:
                 "EmbeddingService.embed_code failed (%s); falling back to inline CodeEmbed call",
                 e,
             )
-    return await server._inline_code_embed_http(text)
+    return await server._inline_code_embed_http(text, tolerance_secs=tolerance_secs)
 
 
 async def _inline_code_embed_http(

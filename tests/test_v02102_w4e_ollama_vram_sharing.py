@@ -563,5 +563,160 @@ def test_resync_and_vector_copy_route_through_shared_connect(monkeypatch):
     assert out_copy is sentinel, "vector_copy must connect via the shared factory"
 
 
+# ── Review fixes (E1 / E2 / E3) ───────────────────────────────────────────
+
+
+def _bare_connection(cls):
+    """A ``ConnectionSync``/``ConnectionAsync`` built with ``object.__new__``
+    — no init side effects. The ``connect()`` path under test only reads the
+    attributes set here; every network-touching method is replaced by the
+    per-test mock (the mocked server: meta REST fetch, REST session open,
+    gRPC channel open, gRPC health ping). NO network is touched."""
+    conn = object.__new__(cls)
+    conn._connected = False
+    conn._auth = None
+    conn.embedded_db = None
+    conn._skip_init_checks = False
+    conn._grpc_max_msg_size = 100
+    # __del__ touches these; set them so GC of the mocked object stays quiet
+    conn._client = None
+    conn._grpc_channel = None
+    return conn
+
+
+def test_pypi_check_noop_survives_sync_connect_path():
+    """E1 (sync leg — non-regression pin, green before AND after): the
+    patched ``_check_package_version`` keeps the ORIGINAL's sync result
+    shape. ``ConnectionSync.connect`` runs it through ``executor.result``,
+    which asserts the value is NOT an Awaitable — ``None`` passes."""
+    import vco_lib.weaviate_helpers as wh
+    from weaviate.connect import v4 as v4mod
+
+    assert wh.disable_weaviate_client_pypi_check() is True
+
+    conn = _bare_connection(v4mod.ConnectionSync)
+    conn._open_connections_rest = lambda *a, **k: None
+    conn.get_meta = lambda check_is_connected=True: {"version": "1.28.0"}
+    conn.open_connection_grpc = lambda colour: None
+    conn._ping_grpc = lambda colour: None
+    conn.connect()
+    assert conn._connected is True
+
+
+def test_pypi_check_noop_survives_async_connect_path():
+    """E1 (async leg — RED on the pre-fix tree): ``ConnectionAsync.connect``
+    runs the patched method through ``executor.aresult``, which ASSERTS the
+    return value IS an Awaitable. A no-op returning a bare ``None`` failed
+    the assert, ``connect`` set ``_connected = False`` and re-raised — every
+    async connect with ``skip_init_checks=False`` crashed after the patch."""
+    import vco_lib.weaviate_helpers as wh
+    from weaviate.connect import v4 as v4mod
+
+    assert wh.disable_weaviate_client_pypi_check() is True
+
+    async def _none() -> None:
+        return None
+
+    async def _meta():
+        return {"version": "1.28.0"}
+
+    conn = _bare_connection(v4mod.ConnectionAsync)
+    conn._open_connections_rest = lambda *a, **k: _none()
+    conn.get_meta = lambda check_is_connected=True: _meta()
+    conn.open_connection_grpc = lambda colour: None
+    conn._ping_grpc = lambda colour: _none()
+    asyncio.run(conn.connect())
+    assert conn._connected is True
+
+
+def test_get_search_vector_legacy_code_fallback_uses_interactive_tolerance(
+    monkeypatch,
+):
+    """E2: ``_get_search_vector``'s legacy code branch is an INTERACTIVE
+    query path reached only on the degraded (svc-unavailable) leg — its
+    inline CodeEmbed call must run at the interactive tolerance, never the
+    420 s batch one (a hard-down service must not stall the tool call for
+    minutes)."""
+    from weaviate_mcp import server
+    from weaviate_mcp.embeddings import _get_search_vector
+    from vco_lib.retry_after import resolve_503_interactive_tolerance
+
+    captured: dict = {}
+
+    async def _fake_inline(text, tolerance_secs=None):  # noqa: ARG001
+        captured["tolerance_secs"] = tolerance_secs
+        return [0.7]
+
+    monkeypatch.setattr(server, "_get_embedding_service", lambda: None)
+    monkeypatch.setattr(server, "_inline_code_embed_http", _fake_inline)
+    monkeypatch.setattr(server, "ACTIVE_EMBEDDING", "codesage")
+    vec, target = asyncio.run(_get_search_vector("hello", "code", "code-nl"))
+    assert vec == [0.7] and target == "codesage_embed"
+    assert captured["tolerance_secs"] == resolve_503_interactive_tolerance(), (
+        "the legacy interactive code fallback must pass the INTERACTIVE "
+        "tolerance, not the 420 s batch default"
+    )
+
+
+def test_canonical_env_targets_carry_max_queue():
+    """E3: the adoption/reconcile canonical table agrees with the compose
+    surface (both compose files pin ``OLLAMA_MAX_QUEUE: "1000"``)."""
+    from vco_lib import service_adoption
+
+    targets = service_adoption.CANONICAL_ENV_TARGETS.get("ollama", {})
+    assert targets.get("OLLAMA_KEEP_ALIVE") == "10m"
+    assert targets.get("OLLAMA_MAX_QUEUE") == "1000"
+    # the reconcile loop visits only BEHAVIOR_CRITICAL_ENV_KEYS — the queue
+    # cap must be among them or the canonical value is never written
+    assert "OLLAMA_MAX_QUEUE" in service_adoption.BEHAVIOR_CRITICAL_ENV_KEYS
+
+
+def test_reconcile_writes_max_queue_fragment_when_installer_lacks_it():
+    """E3: an ADOPTED (foreign) Ollama reconciled while the installer's
+    effective config lacks MAX_QUEUE (e.g. an older infrastructure tree)
+    gets the canonical 1000 as an override fragment — the reconcile surface
+    and the compose surface agree."""
+    from vco_lib.service_adoption import (
+        LiveServiceState,
+        MountSpec,
+        reconcile_service,
+    )
+
+    live = LiveServiceState(
+        mounts=(MountSpec("volume", "ollama_foreign", "/root/.ollama", ""),),
+        env={"OLLAMA_KEEP_ALIVE": "30s"},  # no MAX_QUEUE → Ollama's default 512
+    )
+    cfg_service = {
+        "environment": {"OLLAMA_KEEP_ALIVE": "10m"},  # no MAX_QUEUE here
+        "volumes": ["ollama_data:/root/.ollama"],
+    }
+    fragments, refusals = reconcile_service("ollama", live, cfg_service, {})
+    assert not refusals
+    assert fragments["environment"].get("OLLAMA_MAX_QUEUE") == "1000"
+    # keep-alive needs NO fragment: the installer's effective value already
+    # equals the canonical target (fragment rule: only write on a difference)
+    assert "OLLAMA_KEEP_ALIVE" not in fragments["environment"]
+
+
+def test_config_drift_flags_adopted_ollama_on_default_queue():
+    """E3: the update-path drift detector flags an adopted Ollama container
+    still on Ollama's default queue cap (env key absent → 512)."""
+    from vco_lib import service_reconcile
+    from vco_lib.service_detection import ContainerInfo
+
+    container = ContainerInfo(
+        name="vco_ollama", image="ollama/ollama:0.5.7", state="running",
+        env={"OLLAMA_KEEP_ALIVE": "10m"},  # drift-fixed on keep-alive only
+    )
+    drift = service_reconcile.config_drift(
+        "ollama", container, _REPO_ROOT
+    )
+    assert "OLLAMA_MAX_QUEUE" in drift, (
+        "an adopted container without the 1000 queue cap must be flagged"
+    )
+    assert drift["OLLAMA_MAX_QUEUE"] == (None, "1000")
+    assert "OLLAMA_KEEP_ALIVE" not in drift  # already at the canonical value
+
+
 if __name__ == "__main__":
     unittest.main()

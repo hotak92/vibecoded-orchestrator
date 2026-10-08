@@ -611,7 +611,21 @@ def disable_weaviate_client_pypi_check() -> bool:
         if conn is None or not hasattr(conn, "_check_package_version"):
             return False
 
-        def _no_pypi_check(self, colour):  # noqa: ANN001, ARG001
+        def _no_pypi_check(self, colour):  # noqa: ANN001
+            # Match the ORIGINAL's sync/async result SHAPE (review E1,
+            # v0.2.102): weaviate-client 4.x's ``connect`` runs the return
+            # value through ``executor.result`` (sync — asserts NOT an
+            # Awaitable) or ``executor.aresult`` (async — ASSERTS it IS an
+            # Awaitable). A bare ``None`` crashes every async connect with
+            # ``skip_init_checks=False``; the original returns a coroutine
+            # on the async leg (``weaviate/connect/v4.py``:
+            # ``_check_package_version``), so the no-op must too.
+            if colour == "async":
+
+                async def _done() -> None:
+                    return None  # best-effort warning skipped — see docstring
+
+                return _done()
             return None  # best-effort warning skipped — see docstring
 
         conn._check_package_version = _no_pypi_check  # type: ignore[method-assign]

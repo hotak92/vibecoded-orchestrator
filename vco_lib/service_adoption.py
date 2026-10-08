@@ -167,6 +167,12 @@ WEAVIATE_RECLAIM_ENV_KEYS: tuple[str, ...] = (
 )
 BEHAVIOR_CRITICAL_ENV_KEYS: tuple[str, ...] = (
     "OLLAMA_KEEP_ALIVE",
+    # v0.2.102 W4-E review E3: the queue cap is behaviour-critical too —
+    # Ollama's default 512 answers a shared-model project burst with 503
+    # (owner floor: never below 1000). Without it here the reconcile loop
+    # never visits the key, and the drift detector never flags an adopted
+    # container still on the 512 default.
+    "OLLAMA_MAX_QUEUE",
     "OLLAMA_FLASH_ATTENTION",
     "OLLAMA_KV_CACHE_TYPE",
     "CODE_EMBED_BACKEND",
@@ -193,8 +199,11 @@ BEHAVIOR_CRITICAL_ENV_KEYS: tuple[str, ...] = (
 CANONICAL_ENV_TARGETS: dict[str, dict[str, str]] = {
     # v0.2.102 W4-E: 24h → 10m (owner ruling 2026-10-08 — the 24h pin held
     # 8.3 GB of VRAM idle after one KG search; 10m releases idle VRAM while
-    # consecutive calls still share the resident model).
-    "ollama": {"OLLAMA_KEEP_ALIVE": "10m"},
+    # consecutive calls still share the resident model). Review E3 adds
+    # OLLAMA_MAX_QUEUE so this table agrees with the compose surface
+    # (both compose files pin "1000" — owner: never lower) and the drift
+    # detector flags an adopted container on Ollama's 512 default.
+    "ollama": {"OLLAMA_KEEP_ALIVE": "10m", "OLLAMA_MAX_QUEUE": "1000"},
 }
 
 #: Marker both override generators use (storage_ux.rs

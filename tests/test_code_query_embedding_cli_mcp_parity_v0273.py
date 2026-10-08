@@ -173,7 +173,9 @@ class CodeQueryEmbeddingParityTests(unittest.TestCase):
         fake = _FakeService("qwen3_embed")
         self.server._cached_embed_service = fake
 
-        async def _fake_http(text):
+        async def _fake_http(text, tolerance_secs=None):  # noqa: ARG001
+            # tolerance_secs: W4-E review E2 threaded the interactive
+            # tolerance through get_code_embedding to the inline fallback.
             return [999.0]
 
         orig = self.server._inline_code_embed_http
