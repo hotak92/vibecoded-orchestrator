@@ -187,6 +187,14 @@ except Exception:
 
 def get_weaviate_client():
     """Get Weaviate client"""
+    # v0.2.102 W4-E: no PyPI version lookup on connect. Function-local and
+    # guarded like the rest of this file's vco_lib use — the module must
+    # stay importable without vco_lib (see the MIRROR note above).
+    try:
+        from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+        disable_weaviate_client_pypi_check()
+    except Exception:
+        pass
     http_host = WEAVIATE_URL.replace("http://", "").replace("https://", "").split(":")[0]
     http_port = int(WEAVIATE_URL.split(":")[-1]) if ":" in WEAVIATE_URL else 8081
 

@@ -335,19 +335,16 @@ def _build_client(weaviate_url: Optional[str] = None,
     One home for the connection recipe (extracted from ``prune_ignored_rows``
     when ``count_stale_rows`` became the second caller). The caller owns
     closing the returned client.
+
+    v0.2.102 W4-E: routes through ``weaviate_helpers.connect_v4`` (the ONE
+    factory) instead of a hand-rolled ``connect_to_custom`` — the hand-rolled
+    call did not skip the client's init checks, so every resync connect made
+    a GET to pypi.org for the client's own version check.
     """
     try:
-        import weaviate  # local import — soft-fail when not installed
-
-        from vco_lib.weaviate_helpers import weaviate_url_default
-        url = weaviate_url or weaviate_url_default()
-        m = re.match(r"^https?://([^:/]+)(?::(\d+))?", url)
-        host = m.group(1) if m else "localhost"
-        http_port = int(m.group(2)) if (m and m.group(2)) else 8081
-        gport = int(grpc_port or os.environ.get("GRPC_PORT") or 50052)
-        return weaviate.connect_to_custom(
-            http_host=host, http_port=http_port, http_secure=False,
-            grpc_host=host, grpc_port=gport, grpc_secure=False,
+        from vco_lib.weaviate_helpers import connect_v4, weaviate_url_default
+        return connect_v4(
+            weaviate_url or weaviate_url_default(), grpc_port=grpc_port
         )
     except Exception as exc:  # noqa: BLE001 — no Weaviate → caller degrades
         logger.warning("codegraph resync: Weaviate unavailable: %s", exc)

@@ -196,6 +196,23 @@ WEAVIATE_URL = weaviate_url_default()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 
+
+def _with_generate_keep_alive(body: dict) -> dict:
+    """Add the shared Ollama keep_alive to a GENERATE body (v0.2.102 W4-E).
+
+    One home: ``vco_lib.embedding_providers.ollama._with_keep_alive``
+    (default "10m", ``VCO_OLLAMA_KEEP_ALIVE`` overrides, empty = omit).
+    Guarded import with an identical-behaviour fallback so the standalone
+    (vco_lib-less) run keeps working; the literal MUST match
+    ``_KEEP_ALIVE_DEFAULT`` in that module.
+    """
+    try:
+        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
+        return _ka(body)
+    except Exception:
+        return {**body, "keep_alive": "10m"}
+
+
 DOCUMENTS_ROOT = PROJECT_ROOT / "documents"
 KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
 
@@ -428,7 +445,7 @@ Summary:"""
 
         response = requests.post(
             f"{OLLAMA_URL}/api/generate",
-            json={
+            json=_with_generate_keep_alive({
                 "model": "qwen3.5:9b",
                 "prompt": prompt,
                 "stream": False,
@@ -436,7 +453,7 @@ Summary:"""
                     "temperature": 0.3,
                     "num_predict": 150
                 }
-            },
+            }),
             timeout=30
         )
 

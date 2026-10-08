@@ -169,11 +169,18 @@ services:
       # context injection doesn't re-pay the ~1.9 s model reload after any idle
       # gap (measured in the hook-latency audit 2026-07-11). The 30s default
       # meant any pause > 30s evicted qwen3-embedding; the next injection then
-      # stalled ~1.9 s reloading it. "24h" pins it for the working day. The
-      # per-request keep_alive the embedding clients now send (VCO_OLLAMA_KEEP_ALIVE,
-      # default 24h) is the primary fix; this server-side default is the backstop
-      # for any Ollama path that doesn't carry the request-level field.
-      OLLAMA_KEEP_ALIVE: "24h"
+      # stalled ~1.9 s reloading it. v0.2.102 W4-E (owner ruling 2026-10-08,
+      # after a live 8.3 GB-idle measurement): "24h" → "10m" — idle VRAM is
+      # released after 10 minutes, consecutive calls in a session still share
+      # the resident model. The per-request keep_alive the embedding clients
+      # send (VCO_OLLAMA_KEEP_ALIVE, default 10m) is the primary fix; this
+      # server-side default is the backstop for any Ollama path that doesn't
+      # carry the request-level field.
+      OLLAMA_KEEP_ALIVE: "10m"
+      # v0.2.102 W4-E: projects SHARE one model copy and queue on it; the
+      # default queue cap of 512 503-drops the excess. 1000 (owner: never
+      # lower — kg-sync on a big project). Applies on container recreate.
+      OLLAMA_MAX_QUEUE: "1000"
       OLLAMA_ORIGINS: "*"
       OLLAMA_FLASH_ATTENTION: "1"
       OLLAMA_KV_CACHE_TYPE: "q8_0"

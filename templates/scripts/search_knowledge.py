@@ -187,6 +187,31 @@ def _num_ctx_for_model(model: str) -> int:
         return NUM_CTX_FALLBACK
 
 
+def _fallback_embed_request_body(model: str, text: str) -> dict:
+    """Body for the inline Ollama fallback leg (v0.2.102 W4-E).
+
+    Routed through the ONE shared builder
+    (``vco_lib.embedding_providers.ollama.embed_request_body``) whenever the
+    orchestrator packages are importable — identical load options per model
+    as the canonical adapter (one runner, never a second copy) plus the
+    shared keep_alive policy. Falls back to the standalone shape
+    (SSOT-resolved num_ctx via ``_num_ctx_for_model``, ``truncate: False``,
+    v0.2.92 R40/R45) when vco_lib is absent — never raises.
+    """
+    try:
+        from vco_lib.embedding_providers.ollama import embed_request_body
+        return embed_request_body(model, prompt=text)
+    except Exception:
+        return {
+            "model": model,
+            "prompt": text,
+            "options": {"num_ctx": _num_ctx_for_model(model)},
+            # v0.2.92 R40: never let Ollama truncate silently — a loud 400
+            # the caller raises beats a 200 that dropped the query tail.
+            "truncate": False,
+        }
+
+
 def _max_query_tokens() -> int:
     """Resolve the query-token cap for the currently-active text model.
 
@@ -511,7 +536,21 @@ except Exception:
 
 
 def get_weaviate_client():
-    """Get Weaviate client"""
+    """Get Weaviate client.
+
+    v0.2.102 W4-E: connects through the ONE shared factory
+    (``vco_lib.weaviate_helpers.connect_v4``) when available — it disables
+    the weaviate-client PyPI version lookup (a GET to pypi.org on every
+    connect this script otherwise made). The hand-rolled call below is the
+    documented standalone fallback for a vco_lib-less half-install and MUST
+    match the factory's parameters (scheme-derived http_secure, GRPC_PORT).
+    """
+    try:
+        from vco_lib.weaviate_helpers import connect_v4
+
+        return connect_v4(WEAVIATE_URL, grpc_port=GRPC_PORT, http_secure=False)
+    except Exception:
+        pass
     http_host = WEAVIATE_URL.replace("http://", "").replace("https://", "").split(":")[0]
     http_port = int(WEAVIATE_URL.split(":")[-1]) if ":" in WEAVIATE_URL else 8081
 
@@ -630,17 +669,12 @@ def get_embedding(text: str) -> list:
     # sys.path); it MUST MATCH chunking.MODEL_TOKEN_LIMITS for the default
     # model.
     fallback_model = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
-    _fallback_num_ctx = _num_ctx_for_model(fallback_model)
     response = requests.post(
         f"{OLLAMA_URL}/api/embeddings",
-        json={
-            "model": fallback_model,
-            "prompt": text,
-            "options": {"num_ctx": _fallback_num_ctx},
-            # v0.2.92 R40: never let Ollama truncate silently — a loud 400
-            # the caller raises beats a 200 that dropped the query tail.
-            "truncate": False,
-        }
+        # v0.2.102 W4-E: ONE shared body builder — identical load options per
+        # model as the canonical adapter (one runner, never a second copy)
+        # and the shared keep_alive policy.
+        json=_fallback_embed_request_body(fallback_model, text),
     )
 
     if response.status_code != 200:

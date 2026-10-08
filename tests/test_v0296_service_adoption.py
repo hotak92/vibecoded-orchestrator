@@ -20,7 +20,7 @@ services.toml):
 
 * mount/env identity matrix + the m-5 pins — the ollama BIND survives
   byte-for-byte as a bind (never a named volume), ``OLLAMA_KEEP_ALIVE``
-  reconciles to the canonical ``24h`` (NOT the foreign home's ``30s``), the
+  reconciles to the canonical ``10m`` (NOT the foreign home's ``30s``; 24h until v0.2.102 W4-E), the
   live-only ``OLLAMA_FLASH_ATTENTION`` is carried, healthchecks are
   reconstructed, the model-router network leg + alias is preserved;
 * named-volume replacement attempt = hard refusal, on BOTH gates: the
@@ -175,7 +175,7 @@ OWNING_COMPOSE_GPU = OWNING_COMPOSE.replace(
 )
 
 #: The legacy home's override: the 0.2.77 hook-latency fix TRAP — 30s, where
-#: VCO's own fix (and CANONICAL_ENV_TARGETS) says 24h.
+#: VCO's own fix (and CANONICAL_ENV_TARGETS) says 10m (24h until v0.2.102 W4-E).
 OWNING_OVERRIDE = """\
 services:
   ollama:
@@ -609,8 +609,8 @@ class ReconcileFragmentsTests(_LiveCase):
         oll = plans["ollama"].override_fragments
         self.assertIn(f"{OLLAMA_BIND}:/root/.ollama:Z", oll["mounts"])
         self.assertEqual(oll["volume_aliases"], {})
-        # KEEP_ALIVE canonical 24h — NOT the foreign home's 30s
-        self.assertEqual(oll["environment"].get("OLLAMA_KEEP_ALIVE"), "24h")
+        # KEEP_ALIVE canonical 10m — NOT the foreign home's 30s
+        self.assertEqual(oll["environment"].get("OLLAMA_KEEP_ALIVE"), "10m")
         # live-only key the installer does not set is carried (floor)
         self.assertEqual(oll["environment"].get("OLLAMA_FLASH_ATTENTION"), "1")
         # code_embed: differently-named external volume → alias, no bind
@@ -739,8 +739,9 @@ class AdoptionFlowTests(_TempCase):
         self.assertEqual(svcs["ollama"]["volumes"],
                          [f"{OLLAMA_BIND}:/root/.ollama:Z"])
         # the canonical fix value, not the foreign home's 30s
+        # v0.2.102 W4-E: canonical 10m (was 24h)
         self.assertEqual(svcs["ollama"]["environment"]["OLLAMA_KEEP_ALIVE"],
-                         "24h")
+                         "10m")
         self.assertEqual(
             svcs["ollama"]["environment"]["OLLAMA_FLASH_ATTENTION"], "1")
         # identical-volume service gets NO volumes stanza

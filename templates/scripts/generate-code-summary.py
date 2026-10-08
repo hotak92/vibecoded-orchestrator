@@ -520,6 +520,13 @@ def _connect_weaviate():
         import weaviate
         from urllib.parse import urlparse
 
+        # v0.2.102 W4-E: no PyPI version lookup on connect (one home:
+        # weaviate_helpers.disable_weaviate_client_pypi_check; guarded).
+        try:
+            from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+            disable_weaviate_client_pypi_check()
+        except Exception:
+            pass
         url = urlparse(weaviate_url_default())
         return weaviate.connect_to_local(
             host=url.hostname or "localhost",

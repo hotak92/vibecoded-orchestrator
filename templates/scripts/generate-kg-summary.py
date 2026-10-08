@@ -319,6 +319,13 @@ def get_chunks_from_weaviate(title: str, file_path: str = "") -> list[tuple[int,
         weaviate_host = weaviate_url.hostname or "localhost"
         weaviate_port = weaviate_url.port or 8081
         weaviate_grpc = int(os.getenv("GRPC_PORT", "50052"))
+        # v0.2.102 W4-E: no PyPI version lookup on connect (one home:
+        # weaviate_helpers.disable_weaviate_client_pypi_check; guarded).
+        try:
+            from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+            disable_weaviate_client_pypi_check()
+        except Exception:
+            pass
         client = weaviate.connect_to_local(host=weaviate_host, port=weaviate_port, grpc_port=weaviate_grpc)
         coll = client.collections.get(kg_collection)
         chunk_filter = Filter.by_property("title").equal(title)

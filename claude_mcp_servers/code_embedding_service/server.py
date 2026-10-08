@@ -701,20 +701,19 @@ def _embed_ollama(
     for text in texts:
         if is_query and instruction:
             text = instruction + text
-        # v0.2.92 R40: num_ctx was UNSET, so this leg inherited Ollama's 2048
-        # default regardless of the model's real window. Resolved from the one
-        # home (chunking.MODEL_TOKEN_LIMITS) so the window we REQUEST and the
-        # chunk sizes we PRODUCE cannot drift apart — when they do, Ollama
-        # truncates the tail and still answers 200.
-        from vco_lib.embedding_providers.ollama import _num_ctx_for_model
+        # v0.2.102 W4-E: the body comes from the ONE shared builder
+        # (vco_lib.embedding_providers.ollama.embed_request_body — the same
+        # home the canonical adapter uses), so this Ollama tier sends the
+        # IDENTICAL load options per model as every other VCO caller and
+        # Ollama never loads a second runner of the same model. The builder
+        # also carries keep_alive (v0.2.77 task 6, default 10m since W4-E)
+        # and resolve num_ctx from the one table (chunking.MODEL_TOKEN_LIMITS
+        # — v0.2.92 R40: unset meant Ollama's 2048 default and silent tail
+        # truncation with a 200 response).
+        from vco_lib.embedding_providers.ollama import embed_request_body
         resp = requests.post(
             f"{OLLAMA_URL}/api/embeddings",
-            json={
-                "model": MODEL_NAME,
-                "prompt": text,
-                "options": {"num_ctx": _num_ctx_for_model(MODEL_NAME)},
-                "truncate": False,  # v0.2.92: refuse, never silently drop the tail
-            },
+            json=embed_request_body(MODEL_NAME, prompt=text),
             timeout=30,
         )
         if resp.status_code != 200:
