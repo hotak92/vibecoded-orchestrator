@@ -488,9 +488,12 @@ fn terminate_process(proc: &sysinfo::Process) {
 ///     ([`is_mcp_server_argv`] matches `node …/.bin/playwright-mcp`), so the
 ///     sweep signals it directly.
 ///   * The python wrapper MCPs (`-m claude_mcp_servers.wrappers.*`) install a
-///     SIGTERM handler that terminates and reaps the upstream they host
-///     (`claude_mcp_servers/wrappers/_base.py`, `WrapperMCP.run`), so e.g. the
-///     excalidraw node server — not itself matched — goes down with them.
+///     SIGTERM handler that terminates and reaps the upstream they host,
+///     so e.g. the excalidraw node server — not itself matched — goes down
+///     with them. (v0.2.102: the wrappers are deleted, but a machine
+///     updating FROM ≤v0.2.101 can still have those processes running —
+///     they remain sweep targets precisely so the update can delete the
+///     files underneath them.)
 /// - **Windows**: `taskkill /PID <pid> /T /F` — the process AND its child
 ///   tree, forced. Windows has no SIGTERM to forward, so killing only the
 ///   `npm exec` / `cmd /c` host leaves its node child running and holding the
@@ -966,7 +969,8 @@ fn argv_executes_mcp(argv: &[&str], depth: u8) -> bool {
 /// real-process tests.
 ///
 /// Out of scope, as before this change: the excalidraw MCP's node server
-/// (`node …/vco_lib/excalidraw_mcp_fork/dist/mcp/index.bundled.js`) — its
+/// (`node …/vco_lib/excalidraw_mcp_fork/dist/mcp/index.bundled.js` — a
+/// pre-v0.2.102 shape; the fork is deleted now) — its
 /// `-m claude_mcp_servers.wrappers.excalidraw_proxy` parent IS matched.
 pub fn is_mcp_server_argv<S: AsRef<str>>(argv: &[S]) -> bool {
     let argv: Vec<&str> = argv.iter().map(AsRef::as_ref).collect();
@@ -1663,7 +1667,11 @@ mod tests {
     }
 
     /// Real MCP server launches — every one must match. Includes the shapes
-    /// running on a dev machine today and what VCO registers.
+    /// running on a dev machine today and what VCO registers. The
+    /// `wrappers.*` rows are pre-v0.2.102 shapes (the wrappers are deleted)
+    /// kept on purpose: a machine updating from ≤v0.2.101 can still have
+    /// those processes alive, and the sweep must match them to free the
+    /// files the update deletes.
     const MCP_SERVER_SHAPES: &[&[&str]] = &[
         &["/home/x/.venv/bin/python", "/home/x/claude_mcp_servers/weaviate_mcp/server.py"],
         &["/home/x/.venv/bin/python", "/home/x/claude_mcp_servers/vct_coordination_mcp/server.py"],
@@ -1739,8 +1747,9 @@ mod tests {
 
     #[test]
     fn mcp_server_argv_excalidraw_node_server_stays_out_of_scope() {
-        // Behaviour kept from before v0.2.102: the excalidraw node server was
-        // never a sweep target (no pattern in its argv); its python proxy is.
+        // Behaviour kept after v0.2.102 deleted the fork: the excalidraw
+        // node server was never a sweep target (no pattern in its argv);
+        // its python proxy is.
         assert!(!is_mcp_server_argv(&words(
             "/home/x/.local/bin/node /home/x/VCO/vco_lib/excalidraw_mcp_fork/dist/mcp/index.bundled.js"
         )));

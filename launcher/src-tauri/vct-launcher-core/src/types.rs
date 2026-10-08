@@ -191,7 +191,8 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
         // infrastructure (Weaviate vectorizers) is unchanged; it continues
         // to run as a container service. The `search` (paper-search) MCP was
         // deleted outright in v0.2.101; the `mermaid`/`excalidraw` diagram
-        // wrappers were retired from default registration in the same release.
+        // wrappers were retired from default registration in the same release
+        // and deleted outright in v0.2.102 (diagrams dropped).
         // See docs/features/02-mcps-and-agents.md.
         // NOTE: `code-embed` (CodeSage-Large-v2 container at port 11440) is
         // NOT an MCP — it's a backend HTTP service consumed by `weaviate-kg`
@@ -218,10 +219,10 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
         // NOTE (v0.2.101): the `mermaid` / `excalidraw` diagram wrapper MCPs
         // were removed from this catalog. Their default registration was
         // retired (mcp_registration.rs / install_mcp.py) and the Permissions
-        // tab no longer ships toggle cards for them; an install that already
-        // has the entries keeps them. The launcher's Diagrams tab never used
-        // these MCPs (it renders Mermaid in the webview and lists diagrams via
-        // Tauri commands), so it is unaffected.
+        // tab no longer ships toggle cards for them. v0.2.102: the wrappers
+        // themselves were deleted (diagrams dropped, owner ruling
+        // 2026-10-07) and leftover VCO-shaped entries are auto-scrubbed on
+        // update — no install keeps them.
     ]
 }
 

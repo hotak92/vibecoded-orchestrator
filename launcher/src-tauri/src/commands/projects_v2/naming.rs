@@ -22,8 +22,10 @@ use std::path::Path;
 /// MUST MATCH the Python KG (underscore-DROPPING) sanitizer
 /// `vco_lib.codegraph_naming.sanitize_for_weaviate_class` (the ONE naming home;
 /// re-exported from `vco_lib.project_init`). Both derive the `KG_COLLECTION` /
-/// `DEVELOPMENT_COLLECTION` / `DIAGRAMS_COLLECTION` basename that lands in
-/// `.claude/env` + `.claude/settings.json`, so a drift on a real project name
+/// `DEVELOPMENT_COLLECTION` basename that lands in
+/// `.claude/env` + `.claude/settings.json` (until v0.2.102 also
+/// `DIAGRAMS_COLLECTION`, dropped with the diagrams integrations), so a drift
+/// on a real project name
 /// would make the launcher and the Python re-projection compute different
 /// collections for the same project. Cross-language parity is pinned against the
 /// shared fixture `tests/fixtures/kg_sanitizer_parity.json` by the

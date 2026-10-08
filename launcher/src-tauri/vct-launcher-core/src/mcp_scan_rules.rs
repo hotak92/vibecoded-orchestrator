@@ -363,6 +363,25 @@ mod tests {
             "search is DELETED (owner: delete now + scrub) — its orphaned entry \
              must be removed by the ordinary update, not left to a consent prompt"
         );
+        // v0.2.102 (owner ruling 2026-10-07, diagrams dropped): the two
+        // diagram wrappers joined the auto_scrub set — their modules are
+        // deleted, so a leftover VCO-shaped entry guarantees a failing
+        // subprocess every session.
+        for name in ["mermaid", "excalidraw"] {
+            let row = d
+                .get(name)
+                .unwrap_or_else(|| panic!("[deprecated.{name}] must be in the embedded table"));
+            assert_eq!(row.removed_in, "v0.2.102", "{name}");
+            assert!(
+                row.auto_scrub,
+                "{name} is DELETED with the diagrams integrations — its leftover \
+                 entry must be scrubbed by the ordinary update"
+            );
+            assert!(
+                !row.reason.is_empty(),
+                "{name}: the reason is rendered verbatim into the retirement badge"
+            );
+        }
         // Every deprecated name must be a name the orchestrator once shipped
         // — otherwise the retire pass would badge a row it does not own.
         for name in d.keys() {

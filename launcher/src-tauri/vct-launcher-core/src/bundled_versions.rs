@@ -227,15 +227,17 @@ mod tests {
         let map = &*BUNDLED_NPM;
         let mut keys: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
         keys.sort();
-        assert_eq!(
-            keys,
-            vec![
-                "excalidraw_lib",
-                "excalidraw_mcp",
-                "mermaid_lib",
-                "mermaid_mcp",
-            ],
-        );
+        // v0.2.102 (diagrams dropped): the four diagram pins
+        // (excalidraw_lib / excalidraw_mcp / mermaid_lib / mermaid_mcp)
+        // were the ONLY npm pins — the [npm] table is now legitimately
+        // empty ([chromium] is a separate top-level table, not an npm pin).
+        // The empty `vec![]` literal is load-bearing:
+        // `tests/test_bundled_versions_parity.py::
+        // test_rust_unit_test_pins_same_key_set` greps it. The type
+        // anchor sits on the binding (an unanchored `vec![]` does not
+        // infer through the assert macro).
+        let expected: Vec<&str> = vec![];
+        assert_eq!(keys, expected);
     }
 
     #[test]

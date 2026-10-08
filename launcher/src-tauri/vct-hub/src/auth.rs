@@ -104,9 +104,10 @@ use crate::modules_api::LauncherDbHandle;
 use crate::project_tokens::{self, ProjectTokenRegistry};
 // v0.2.54 Track I: the token primitives (CSPRNG generation, 0o600
 // persistence, constant-time compare, Bearer parsing) moved to
-// `vct_launcher_core::services::boot_token` so the launcher's diagrams
-// local server (diagrams.token) shares the SAME implementation instead
-// of growing a drifting copy. This module keeps its public API
+// `vct_launcher_core::services::boot_token` so every local HTTP
+// surface shares the SAME implementation instead of growing drifting
+// copies (the first consumer was the v0.2.102-deleted diagrams local
+// server's diagrams.token). This module keeps its public API
 // (generate_token, write_token_file, TOKEN_BYTES, the middleware) and
 // delegates the primitives.
 use vct_launcher_core::services::boot_token;

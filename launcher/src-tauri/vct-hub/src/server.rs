@@ -256,11 +256,12 @@ pub async fn start_hub_server() -> Result<u16, String> {
             cli_api::router().with_state(launcher_state.clone()),
         )
         // Phase 1.2: per-project MCP tool-grant resolver. Mounted
-        // INSIDE the hub-wide auth layer (the wrappers send the
+        // INSIDE the hub-wide auth layer (callers send the
         // standard hub.token bearer). Read-only. (v0.2.101 removed the
         // Tauri write commands + the PermissionsTab editor with the retired
-        // diagram wrapper MCPs; existing wrapper registrations still read
-        // their grants through this route.)
+        // diagram wrapper MCPs; v0.2.102 deleted the wrappers themselves —
+        // the route stays as the generic per-tool grant surface for any
+        // module-shipped MCP with a `tool_allowlist`.)
         .nest(
             "/api/v1",
             mcp_tool_grants_api::router().with_state(launcher_state.clone()),

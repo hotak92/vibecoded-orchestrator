@@ -3124,30 +3124,18 @@ pub fn run() {
             // --remove-pack) behind the per-folder single-flight turn.
             commands::packs_cmd::list_project_packs,
             commands::packs_cmd::set_project_pack_enabled,
-            // Phase 1.1 — Diagrams (Mermaid + Excalidraw) registry,
-            // snapshots, cross-project access grants, per-tool MCP
-            // allowlists, and per-project module-active flags. Schema:
-            // migration 021. Sibling agents (1.2 wrapper MCP, 1.3
-            // DiagramsTab, 1.5 indexer) consume these EXACT command
-            // names; renaming would break their stubs at merge time.
-            commands::diagrams_cmd::list_project_diagrams,
-            commands::diagrams_cmd::register_project_diagram,
-            commands::diagrams_cmd::create_starter_diagram_file,
-            commands::diagrams_cmd::unregister_project_diagram,
-            commands::diagrams_cmd::set_project_diagram_enabled,
-            commands::diagrams_cmd::list_diagram_snapshots,
-            commands::diagrams_cmd::create_diagram_snapshot,
-            commands::diagrams_cmd::restore_diagram_snapshot,
-            commands::diagrams_cmd::delete_diagram_snapshot,
-            commands::diagrams_cmd::diagram_grant_access,
-            commands::diagrams_cmd::list_diagram_access,
-            // v0.2.101: the per-tool MCP-grant commands
-            // (list_project_mcp_tools / set_project_mcp_tool_enabled /
-            // seed_project_mcp_tool_grants) were removed with the retired
-            // diagram wrapper MCPs' GUI surface. The DB layer + the hub's
-            // tool-grant route stay for existing wrapper registrations.
-            commands::diagrams_cmd::set_project_module_enabled,
-            commands::diagrams_cmd::clear_project_module,
+            // v0.2.102 (owner ruling 2026-10-07): the diagrams integrations
+            // were dropped entirely. Every diagram command formerly
+            // registered here (registry/snapshots/access grants, starter
+            // file, read/write/resolve path helpers, the watcher
+            // subscription, the two editor-open commands) is deleted with
+            // `commands/diagrams_cmd.rs` + `diagram_watcher.rs` +
+            // `diagrams_local_server.rs`, the Diagrams tab and the
+            // vendored editors. The launcher DB tables (migration 022/023)
+            // stay — user data is never dropped. The GENERIC
+            // `project_modules` machinery moved to `module_enabled.rs`:
+            commands::module_enabled::set_project_module_enabled,
+            commands::module_enabled::clear_project_module,
             // v0.2.49 Stream B: per-project enable toggle for global-
             // scope modules. Bare-bool surface, kept because it is
             // shipped IPC — but it cannot express PROVENANCE and has no
@@ -3178,35 +3166,15 @@ pub fn run() {
             commands::module_enabled::rl_events_count,
             // v0.2.100 W5R-02: the RL scoring lock every RL scoring control renders.
             commands::module_enabled::rl_scoring_lock,
-            // Phase 1.5.7 wire-up: DiagramsTab calls
-            // `is_project_module_active` on mount to decide whether to
-            // render the diagrams UI or the "module disabled" overlay.
-            // Missing → tab silently treats every project as inactive.
-            commands::diagrams_cmd::is_project_module_active,
-            // v0.2.34 Agent D — four commands the DiagramsTab invokes for
-            // its core load/save/open/live-push paths. Pre-v0.2.34 each
-            // call threw "command not found" and the frontend silently
-            // degraded (empty preview, 5s polling fallback). See
-            // `.claude/context/plans/diagrams-frontend-wiring-handoff-2026-05-25.md`.
-            commands::diagrams_cmd::read_project_diagram_source,
-            commands::diagrams_cmd::write_text_file,
-            commands::diagrams_cmd::resolve_project_path,
-            commands::diagram_watcher::subscribe_to_diagram_changes,
-            // v0.2.36 Agent R — opens a vendored Mermaid/Excalidraw
-            // editor in the user's default browser via the launcher's
-            // local diagrams-editor HTTP server (lazy-started). Replaces
-            // the embedded Excalidraw editor (broken on Wayland +
-            // webkit2gtk) and ships a self-hosted visual Mermaid editor
-            // alongside the existing text-only one.
-            commands::diagrams_cmd::open_diagrams_editor,
-            commands::diagrams_cmd::open_diagram_editor_for_path,
+            // Generic `project_modules` active-flag read (moved from
+            // diagrams_cmd.rs in v0.2.102). No frontend caller remains
+            // after the Diagrams tab went — the invoke census records it
+            // as an open finding for the owner.
+            commands::module_enabled::is_project_module_active,
             // PR-6 (v0.2.11): per-project .claude/env key reader+writer
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,
             commands::claude_env::set_claude_env_value,
-            // C8 wire-up (2026-05-25): read-only process env lookup, with
-            // a credential-name blocklist. DiagramsTab calls this for the
-            // Wayland-fallback decision (XDG_SESSION_TYPE).
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,
