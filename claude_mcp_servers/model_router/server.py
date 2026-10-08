@@ -1109,7 +1109,11 @@ async def usage_windows_handler(request: web.Request) -> web.Response:
     snapshot = windows.snapshot()
     if request.query.get("format") == "line":
         return web.Response(text=render_line(snapshot), content_type="text/plain")
-    snapshot["agents"] = gateway.usage.agent_rows()
+    try:
+        snapshot["agents"] = gateway.usage.agent_rows()
+    except Exception as exc:  # a monitor read must never fail the route
+        logger.warning("usage/windows: agent attribution rows unavailable: %s", exc)
+        snapshot["agents"] = []
     return web.json_response(snapshot)
 
 

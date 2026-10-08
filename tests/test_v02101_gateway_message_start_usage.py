@@ -548,6 +548,8 @@ class FixtureStreamTests(FlaggedVendorTestBase):
             if (
                 payload_o is not None
                 and payload_o.get("type") == "message_delta"
+                and _completed_usage(payload_o.get("usage") or {})
+                != (payload_o.get("usage") or {})
             ):
                 continue
             delta = payload_o.get("delta") if payload_o is not None else None

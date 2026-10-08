@@ -588,6 +588,22 @@ class AgentAttributionRouteTests(GatewayTestBase):
         self.assertEqual(mine[0]["session"], "chat-g3")
         self.assertEqual(mine[0]["route"], "vendor:zai")
 
+    async def test_a_failing_attribution_read_never_fails_the_route(self) -> None:
+        # The agents block is a monitor projection: if building it raises, the
+        # route still answers 200 with the windows snapshot and an empty list.
+        from model_router.server import APP_KEY
+
+        gateway = self.client.server.app[APP_KEY]
+
+        def boom():
+            raise RuntimeError("attribution store unreadable")
+
+        gateway.usage.agent_rows = boom
+        resp = await self.client.get("/usage/windows", headers=self.auth())
+        self.assertEqual(resp.status, 200)
+        data = await resp.json()
+        self.assertEqual(data.get("agents"), [])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
