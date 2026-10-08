@@ -9136,7 +9136,7 @@ async def nl_code_query(
         project: Optional project name filter (same as query_code_structure)
     """
     _CLAUDE_MODEL_MAP = {
-        "claude/haiku": "claude-haiku-4-5-20251001",
+        "claude/haiku": "claude-haiku-5-5",
         "claude/sonnet": "claude-sonnet-4-6",
         "claude/opus": "claude-opus-4-6",
     }
@@ -9159,7 +9159,7 @@ async def nl_code_query(
 
     try:
         if model.startswith("claude/"):
-            anthropic_model = _CLAUDE_MODEL_MAP.get(model, "claude-haiku-4-5-20251001")
+            anthropic_model = _CLAUDE_MODEL_MAP.get(model, "claude-haiku-5-5")
             if not ANTHROPIC_API_KEY:
                 return json.dumps({
                     "success": False,

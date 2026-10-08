@@ -1204,10 +1204,11 @@ mod tests {
 
         assert_eq!(
             rows.len(),
-            24,
+            25,
             "the cited GLM rows of handoff §7 minus glm-5.2 (owner-retired in \
-             v0.2.100), the four Claude 5 rows plus the two 5.5 rows \
-             (v0.2.102, owner-confirmed 2026-10-07), the eight v0.2.96 qwen \
+             v0.2.100), the four Claude 5 rows plus the three 5.5 rows \
+             (v0.2.102: Opus/Sonnet owner-confirmed 2026-10-07, Haiku read \
+             from the models overview 2026-10-08), the eight v0.2.96 qwen \
              Token-Plan rows, and the v0.2.102 Kimi Code k3 row"
         );
         // The Kimi Code k3 row (owner ruling 2026-10-07: K3 only, at its
@@ -1247,7 +1248,9 @@ mod tests {
         // docs. They exist for the settings writer's [1m] decoration only.
         // The 5.5 generation (v0.2.102) cites the models-overview index
         // page — no per-model page exists for it (the claude-fable-5-1
-        // convention); figures confirmed by the owner 2026-10-07.
+        // convention); figures confirmed by the owner 2026-10-07. Haiku 5.5
+        // (2026-10-08) is the current Haiku; the legacy Haiku 4.5 (200K)
+        // keeps no row, so the launcher table never decorates it.
         for id in [
             "claude-fable-5-1",
             "claude-fable-5",
@@ -1255,6 +1258,7 @@ mod tests {
             "claude-sonnet-5",
             "claude-opus-5-5",
             "claude-sonnet-5-5",
+            "claude-haiku-5-5",
         ] {
             let row = by_id(id);
             assert_eq!(row.vendor, "anthropic", "{}", id);

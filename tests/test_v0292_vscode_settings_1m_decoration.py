@@ -113,10 +113,14 @@ def test_non_1m_and_claude_ids_are_untouched_against_the_shipped_seed():
     # glm-5.1 is 200K in the seed — the version-key vindication row.
     assert vs.decorate_1m("claude-gw/glm-5.1", seed) == "claude-gw/glm-5.1"
     # Older Claude families (4.x) are deliberately absent from the table (only
-    # the four first-party Claude 5 rows ship): the client knows
+    # the first-party Claude 5 / 5.5 rows ship): the client knows
     # their windows natively, and decorating one would be a substitution.
     assert vs.decorate_1m("claude-sonnet-4-5", seed) == "claude-sonnet-4-5"
     assert vs.decorate_1m("claude-gw/claude-opus-4-5", seed) == "claude-gw/claude-opus-4-5"
+    # The legacy Haiku keeps its plain id; the current Haiku 5.5 is 1M.
+    assert (vs.decorate_1m("claude-haiku-4-5-20251001", seed)
+            == "claude-haiku-4-5-20251001")
+    assert vs.decorate_1m("claude-haiku-5-5", seed) == "claude-haiku-5-5[1m]"
     # Unknown vendors keep the conservative default (honest absence).
     assert vs.decorate_1m("kimi-k2-6", seed) == "kimi-k2-6"
     # The true arm, against the same real table.

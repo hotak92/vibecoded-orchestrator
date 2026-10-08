@@ -45,6 +45,11 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11435")
 # Use 9B+ models only (quality matters for summaries)
 MODEL_CANDIDATES = ["qwen3.5:9b", "granite4:7b"]
 
+# The model `--provider haiku` sends to the Anthropic API — the current Haiku
+# (Haiku 4.5 is legacy since Haiku 5.5). One home: call_haiku() sends it and
+# main() records it as the run's model, so the two can never disagree.
+HAIKU_MODEL = "claude-haiku-5-5"
+
 # Knowledge base root (two levels up from this script, overridable via --knowledge-dir)
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
@@ -180,7 +185,7 @@ def call_haiku(prompt: str, max_tokens: int) -> str:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-haiku-4-5-20251001",
+                "model": HAIKU_MODEL,
                 "max_tokens": max_tokens,
                 "temperature": 0.3,
                 "messages": [{"role": "user", "content": prompt}],
@@ -708,7 +713,7 @@ def main() -> None:
         if not os.environ.get("ANTHROPIC_API_KEY"):
             print("ERROR: ANTHROPIC_API_KEY not set. Required for --provider haiku.", file=sys.stderr)
             sys.exit(1)
-        model = "claude-haiku-4-5"
+        model = HAIKU_MODEL
         print("Using provider: Haiku (API)")
     else:
         available = get_available_models()

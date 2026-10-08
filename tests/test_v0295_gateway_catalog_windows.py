@@ -89,7 +89,8 @@ class ModelIdParsingTests(unittest.TestCase):
         ("claude-opus-4-8", "claude-opus", (4, 8), None, False),
         ("claude-3-7-sonnet-20250219", "claude-sonnet", (3, 7), "20250219", False),
         ("claude-haiku-4-5-20251001", "claude-haiku", (4, 5), "20251001", False),
-        ("glm-5.3", "glm", (5, 3), None, False),
+        ("claude-haiku-5-5", "claude-haiku", (5, 5), None, False),
+        ("glm-5.3","glm", (5, 3), None, False),
         ("glm-5.3-flash", "glm-flash", (5, 3), None, False),
         ("glm-5-turbo", "glm-turbo", (5,), None, False),
         ("glm-4.5-air", "glm-air", (4, 5), None, False),
@@ -811,8 +812,11 @@ class ShippedDataInvariantTests(unittest.TestCase):
 
         Every 1M first-party model appears ONCE, as its ``[1m]`` row: the
         ``window_rows`` default withholds the plain spelling (which is listed
-        among the hidden ids below, not dropped). The 200K haiku row, having
-        no second spelling to choose between, is untouched by that knob.
+        among the hidden ids below, not dropped). Since Haiku 5.5 joined the
+        static snapshot (v0.2.102) the haiku family's latest is that 1M
+        model, so it too publishes only its ``[1m]`` row; the legacy 200K
+        ``claude-haiku-4-5-20251001`` is an older same-family sibling,
+        withheld by the latest filter (hidden, still routable by name).
 
         The Token-Plan rows come from the declared fallback in this fixture
         (the injected fetch answers nothing, so the row's nine declared
@@ -831,7 +835,7 @@ class ShippedDataInvariantTests(unittest.TestCase):
             [row.id for row in latest.entries],
             [
                 f"claude-fable-5-1{ONE_M_SUFFIX}",
-                "claude-haiku-4-5-20251001",
+                f"claude-haiku-5-5{ONE_M_SUFFIX}",
                 f"claude-opus-5{ONE_M_SUFFIX}",
                 f"claude-sonnet-5{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3{ONE_M_SUFFIX}",
@@ -869,6 +873,9 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 f"claude-gw/qwen/qwen3.6-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.7-max{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.7-plus{ONE_M_SUFFIX}",
+                # The legacy Haiku (older sibling of claude-haiku-5-5) and
+                # the current Haiku's plain spelling (window_rows default).
+                "claude-haiku-4-5-20251001", "claude-haiku-5-5",
                 "claude-opus-4-8", "claude-opus-5",
                 "claude-sonnet-4-6", "claude-sonnet-5",
             ],
