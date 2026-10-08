@@ -16,14 +16,13 @@
 # ONE HOME, NOT A SECOND COPY
 # ---------------------------
 # The routing itself — knowledge/ → kg-sync, docs/ → the development
-# collection, .claude/diagrams/ → the indexer, code files → the
-# end-of-turn code-graph drain queue, each access-gated and debounced —
+# collection, code files → the end-of-turn code-graph drain queue, each
+# access-gated and debounced —
 # lives in _lib/route-touched-path.sh and is called by BOTH this hook and
 # post-file-edit.sh. Nothing about the routing is re-implemented here.
 #
 # WHAT THIS HOOK ADDS: turning a command STRING into the list of paths it
-# wrote. That parse is vco_lib/bash_write_targets.py (the write-side
-# sibling of vco_lib/diagram_delete_parser, sharing
+# wrote. That parse is vco_lib/bash_write_targets.py (sharing
 # vco_lib/bash_command_walk for chains / wrappers / env prefixes /
 # `bash -c`). It recognises redirections, heredocs, tee, `sed -i`,
 # cp/mv/install destinations, touch, `dd of=`, and long `--output` flags.

@@ -356,7 +356,6 @@ supabase/.temp/
 # beyond the release they describe.
 /docs/v0.2.33-l0-deploy.md
 /docs/codeql-triage-v*.md
-/docs/EXCALIDRAW_WAYLAND_TEST.md
 /docs/MAINTAINER_GUIDE.md
 /docs/MIGRATION-0.2.0.md
 

@@ -67,13 +67,15 @@ BLOCKLIST=(
 #
 # WHY `repo_scan` AND NOT ANOTHER CONTEXT — this passes over VENDORED bundles
 # and COMPILED BINARIES, the most false-positive-hostile haystack there is, so
-# it uses the most precision-biased context. Two collisions are proven present
-# in this repo and both live under a `dist/` path this script scans:
-#   * a Slovak locale chunk name `sk-SK-<hash>-<hash>` in the vendored
-#     Excalidraw bundle, which a loose `sk-` tail matches;
-#   * an `AKIA` + 16-upper-alnum run occurring BY CHANCE inside that bundle's
-#     base64 WASM/font payload.
-# That is why `repo_scan` narrows the `sk-` tail and omits the AWS / JWT /
+# it uses the most precision-biased context. Two collisions were proven present
+# in this repo while the vendored Excalidraw bundle (removed in v0.2.102 with
+# the diagrams integration) still shipped, and both lived under a `dist/` path
+# this script scans:
+#   * a Slovak locale chunk name `sk-SK-<hash>-<hash>` in that bundle, which a
+#     loose `sk-` tail matches;
+#   * an `AKIA` + 16-upper-alnum run occurring BY CHANCE inside its base64
+#     WASM/font payload.
+# They are why `repo_scan` narrows the `sk-` tail and omits the AWS / JWT /
 # Atlassian shapes that the file-content scanners do carry. A false positive
 # here fires on every commit and teaches people to ignore this script, which is
 # how a real alert gets missed. Do not "unify" these with the content-scan

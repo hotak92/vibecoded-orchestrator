@@ -10,7 +10,10 @@ just quietly does not happen:
 1. **A ``Start-Job`` child is torn down when the host process exits.** Hooks
    exit in milliseconds; the work they detach takes seconds.  The
    duplicate-scan branch of ``post-file-edit.ps1`` shipped this bug and it was
-   fixed earlier in this cycle; ``post-file-edit.ps1``'s *diagram* branch —
+   (v0.2.102: the diagram-branch tests were removed with the diagrams
+   integrations — the detached-spawn machinery itself, ``Start-VcoDetachedPwsh``,
+   is still pinned below by its own direct tests;) historically
+   ``post-file-edit.ps1``'s *diagram* branch —
    the index → snapshot pair — had the identical defect one branch over, so
    diagram indexing and snapshotting never completed on Windows.
 2. **``-WindowStyle`` is rejected by non-Windows PowerShell editions.**  The
@@ -198,121 +201,8 @@ def _await_lines(marker: Path, count: int, timeout: float = MARKER_TIMEOUT_S) ->
 # ---------------------------------------------------------------------------
 
 
-def test_diagram_index_and_snapshot_outlive_the_hook(tmp_path):
-    """The whole point: the child must still be alive after the hook returns.
-
-    The shim sleeps 1.5 s before writing anything, and the hook exits within
-    milliseconds.  Under the previous ``Start-Job`` implementation the job's
-    child is reaped with the host runspace, so NEITHER marker line is ever
-    written — which is exactly what shipped.
-    """
-    exe = _require_pwsh()
-    project = _stage_project(tmp_path)
-    marker = tmp_path / "diag-argv.txt"
-    venv = _stage_shim_venv(tmp_path, marker)
-    diagram = project / ".claude" / "diagrams" / "flow.mmd"
-
-    started = time.monotonic()
-    result = _run_hook(exe, project, diagram, venv)
-    elapsed = time.monotonic() - started
-    assert result.returncode == 0, result.stderr
-
-    # The hook must NOT have blocked on the child. Measured, not raced: the
-    # pair would cost at least 2 x SHIM_DELAY_S if it ran inline.
-    assert elapsed < SHIM_DELAY_S, (
-        f"the hook took {elapsed:.1f}s — it waited for the diagram child, "
-        "but this spawn is fire-and-forget"
-    )
-
-    lines = _await_lines(marker, 2)
-    assert len(lines) == 2, (
-        "the detached diagram child did not complete both CLIs after the hook "
-        f"exited (a torn-down Start-Job writes nothing).\nlines={lines!r}\n"
-        f"hook stdout={result.stdout!r}\nhook stderr={result.stderr!r}"
-    )
-    assert "vco_lib.diagram_indexer" in lines[0], f"unexpected first call: {lines[0]!r}"
-    assert str(diagram) in lines[0], f"the indexer was not given the edited file: {lines[0]!r}"
 
 
-def test_the_index_runs_before_the_snapshot(tmp_path):
-    """Sequencing is load-bearing, and a detached spawn must not lose it.
-
-    ``snapshot create`` queries ``project_diagrams WHERE file_path=?``.  Run
-    before the indexer's UPSERT commits, it finds no row and the file's first
-    version is lost forever (the R2 finding of 2026-05-25).  Two parallel
-    ``Start-Process`` calls would satisfy "both ran" while reintroducing that
-    loss, so assert the ORDER, not just the count.
-    """
-    exe = _require_pwsh()
-    project = _stage_project(tmp_path)
-    marker = tmp_path / "diag-argv.txt"
-    venv = _stage_shim_venv(tmp_path, marker)
-    diagram = project / ".claude" / "diagrams" / "flow.mmd"
-
-    result = _run_hook(exe, project, diagram, venv)
-    assert result.returncode == 0, result.stderr
-
-    lines = _await_lines(marker, 2)
-    assert len(lines) == 2, f"both CLIs did not run: {lines!r}"
-    assert " index " in f" {lines[0]} ", f"first call was not the indexer: {lines[0]!r}"
-    assert "snapshot create" in lines[1], f"second call was not the snapshot: {lines[1]!r}"
-    # The shim sleeps; only a SEQUENTIAL child can produce a deterministic
-    # order, so a parallel-spawn regression flips or interleaves these.
-
-
-def test_the_diagrams_collection_kwarg_is_forwarded(tmp_path):
-    """The indexer's Weaviate upsert silently skips without this kwarg.
-
-    Bug-1 of the 2026-05-25 wiring audit.  Re-quoting the argv into an
-    EncodedCommand child is exactly where an argument gets dropped, so pin it.
-    """
-    exe = _require_pwsh()
-    project = _stage_project(tmp_path)
-    marker = tmp_path / "diag-argv.txt"
-    venv = _stage_shim_venv(tmp_path, marker)
-    diagram = project / ".claude" / "diagrams" / "flow.mmd"
-
-    result = _run_hook(
-        exe, project, diagram, venv,
-        extra_env={"DIAGRAMS_COLLECTION": "TestProj_Diagrams"},
-    )
-    assert result.returncode == 0, result.stderr
-
-    lines = _await_lines(marker, 2)
-    assert lines, f"no diagram child ran: stderr={result.stderr!r}"
-    assert "--diagrams-collection TestProj_Diagrams" in lines[0], (
-        f"the collection kwarg was lost in the child command: {lines[0]!r}"
-    )
-
-
-def test_a_path_with_a_quote_and_a_space_survives_the_encoded_command(tmp_path):
-    """Re-quoting argv into a child command string is where paths break.
-
-    The pair is emitted as an ``-EncodedCommand`` PowerShell expression, so
-    every path is embedded in a single-quoted literal and must be
-    quote-doubled. A folder like ``it's here`` is the shape that finds a
-    missing escape — and the failure would be silent (a child that dies on a
-    parse error writes nothing, exactly like the Start-Job bug).
-    """
-    exe = _require_pwsh()
-    awkward = tmp_path / "it's a dir"
-    awkward.mkdir()
-    project = _stage_project(awkward)
-    marker = tmp_path / "diag-argv.txt"
-    venv = _stage_shim_venv(tmp_path, marker)
-    diagram = project / ".claude" / "diagrams" / "flow.mmd"
-
-    result = _run_hook(exe, project, diagram, venv)
-    assert result.returncode == 0, result.stderr
-
-    lines = _await_lines(marker, 2)
-    assert len(lines) == 2, (
-        "the detached child did not run both CLIs from a path containing a "
-        f"single quote.\nlines={lines!r}\nhook stderr={result.stderr!r}"
-    )
-    assert str(diagram) in lines[0], (
-        f"the quoted path was mangled in the child command: {lines[0]!r}"
-    )
 
 
 def test_a_throttled_edit_launches_nothing(tmp_path):

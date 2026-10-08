@@ -954,9 +954,11 @@ pub fn reproject_after_kg_binding_change(
 /// collection-ensure around it.
 ///
 /// F5 (v0.2.72): `config_projection.py` resolves KG_COLLECTION /
-/// SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION (and the derived
-/// DIAGRAMS_COLLECTION) from `project_kg_bindings` rows — all
-/// `MCP_RELEVANT_ENV_KEYS` members. Re-projecting after the write is
+/// SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION from
+/// `project_kg_bindings` rows — all `MCP_RELEVANT_ENV_KEYS` members.
+/// (Until v0.2.102 it also derived DIAGRAMS_COLLECTION; that key left
+/// the projection when the diagrams integrations were dropped.)
+/// Re-projecting after the write is
 /// what lets the settings watcher's diff-guard fire the guarded MCP
 /// reload for a rebind. Soft-fail: projection warnings ride in the
 /// returned result; the binding write is never rolled back.

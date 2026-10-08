@@ -18,9 +18,10 @@ This test asserts ``RUST_KEYS ⊆ PYTHON_KEYS`` (every Rust-emitted key is also
 Python-canonical, so no key flaps out of existence on a Python apply). The
 reverse direction (Python-only keys) is DELIBERATE and documented — the
 Python ``apply`` CLI is the canonical writer per the Option-A interop
-strategy (DIAGRAMS_COLLECTION, DUAL_*, VCO_CODE_GRAPH_*_FLOOR, VCT_INSTALL_ROOT,
-VCT_PROJECT_ID, VCT_DIAGRAMS_ACCESS_LIST are Python-only by design), so we do
-NOT require the sets to be equal.
+strategy (DUAL_*, VCO_CODE_GRAPH_*_FLOOR, VCT_INSTALL_ROOT,
+VCT_PROJECT_ID are Python-only by design), so we do
+NOT require the sets to be equal. (v0.2.102: DIAGRAMS_COLLECTION and
+VCT_DIAGRAMS_ACCESS_LIST left the Python set with the diagrams runtime.)
 """
 
 from __future__ import annotations

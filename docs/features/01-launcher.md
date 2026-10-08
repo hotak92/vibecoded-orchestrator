@@ -437,7 +437,7 @@ Lists which other projects can read this project's code graph (or none).
 Sets the access level (`read` / `none`) between two projects. Audits the grant.
 
 ### Reading access and counts
-`codegraph_list_projects` returns every project card with its per-class counts and the acting project's access level (read / none), and drives the `/codegraph` dashboard. There is no per-call access-check command: cross-project code-graph reads are enforced by the weaviate-kg MCP through `VCT_CODE_GRAPH_ACCESS_LIST`, which the launcher projects from the `codegraph_access` table. The retired v0.2.100 commands `codegraph_check_access`, `codegraph_summary`, `codegraph_load_graph` (the in-launcher force-layout graph; a subgraph is available through the `vco codegraph-diagram` CLI) and `codegraph_set_entity_access_bulk` (per-entity access was project-level by design, and nothing read the property it wrote) are gone.
+`codegraph_list_projects` returns every project card with its per-class counts and the acting project's access level (read / none), and drives the `/codegraph` dashboard. There is no per-call access-check command: cross-project code-graph reads are enforced by the weaviate-kg MCP through `VCT_CODE_GRAPH_ACCESS_LIST`, which the launcher projects from the `codegraph_access` table. The retired v0.2.100 commands `codegraph_check_access`, `codegraph_summary`, `codegraph_load_graph` (the in-launcher force-layout graph) and `codegraph_set_entity_access_bulk` (per-entity access was project-level by design, and nothing read the property it wrote) are gone.
 
 ---
 
@@ -775,7 +775,7 @@ Twenty-one Tauri commands mutate or read the per-project Claude Code registry. E
 #### Agent / skill / hook mutations
 - `register_project_agent(project_id, name, source)` / `set_project_agent_enabled(agent_id, enabled)` / `unregister_project_agent(agent_id)`.
 - `register_project_skill(project_id, name, source)` / `set_project_skill_enabled(skill_id, enabled)` / `unregister_project_skill(skill_id)`.
-- `register_project_hook(project_id, req)` / `set_project_hook_enabled(project_id, event, matcher, command, enabled)` / `unregister_project_hook(project_id, event, matcher, command)` — these live in `commands/project_hooks_settings.rs` (not `project_state_cmd.rs`) and edit `.claude/settings.json`. Identity is the natural key `(event, matcher, command)`, not a row id, because a hook can exist in `settings.json` with no mirror row at all. `register` optionally seeds the hook script when the command points at one that does not exist (never overwriting an existing file, the `create_starter_diagram_file` rule).
+- `register_project_hook(project_id, req)` / `set_project_hook_enabled(project_id, event, matcher, command, enabled)` / `unregister_project_hook(project_id, event, matcher, command)` — these live in `commands/project_hooks_settings.rs` (not `project_state_cmd.rs`) and edit `.claude/settings.json`. Identity is the natural key `(event, matcher, command)`, not a row id, because a hook can exist in `settings.json` with no mirror row at all. `register` optionally seeds the hook script when the command points at one that does not exist, never overwriting an existing file.
 
 #### Permissions / secrets / bindings
 - `add_project_permission(project_id, kind, pattern)` / `delete_project_permission(perm_id)`.

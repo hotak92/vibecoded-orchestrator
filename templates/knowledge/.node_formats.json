@@ -354,12 +354,15 @@
   },
   "knowledge/concepts/orchestrator-hook-system.md": {
     "title": "Orchestrator Hook System",
-    "description": "The Orchestrator Hook System functions as the orchestrator's nervous system by intercepting specific lifecycle events like session starts and tool usage to automate workflows, enforce security, and preserve context. Implemented as shell scripts registered in `.claude/settings.json`, these hooks bind to events such as `PreToolUse` and `PostToolUse` to perform actions ranging from credential scrubbing to automatic knowledge-graph synchronization. The architecture supports both blocking hooks that abort operations and non-blocking background tasks, with a dedicated compaction path that saves state before context pruning and reinjects it afterward. This system matters because it transforms Claude Code into a robust autonomous engine capable of handling quality gates, developer experience improvements, and continuous state management without manual intervention.",
-    "summary": "The Orchestrator Hook System intercepts ~20 lifecycle events via shell scripts registered in `.claude/settings.json` to enforce security, sync knowledge graphs to Weaviate, and preserve context during compaction. Blocking hooks can abort operations, while non-blocking hooks execute in the background to manage services like Weaviate and Ollama without delaying the initial prompt.",
-    "generated_at": "2026-10-06T02:27:12.219301+00:00",
+    "description": "The Orchestrator Hook System functions as the core mechanism intercepting Claude Code lifecycle events to transform it into an automated workflow engine. Hooks are scripts registered in `.claude/settings.json` that bind to specific events, such as tool use, compaction, or session start, running either synchronously or in the background. Functionally, they facilitate security enforcement, automate knowledge-graph synchronization, and manage context preservation across various operations. This system is critical for implementing complex agentic workflows by adding necessary quality gates and external service integration points into the execution flow.",
+    "summary": "Hooks, registered in `.claude/settings.json`, intercept Claude Code lifecycle events (e.g., `PreToolUse`, `PostToolUse`, `PreCompact`) to automate workflows, enabling security enforcement, knowledge-graph synchronization, and context preservation. The most critical function is the structured reinjection of context state during compaction via `compact-context-reinject.sh`, which places the unconstrained `.claude/CONTEXT_STATE.md` at the start of the payload to mitigate Lost-In-The-Middle (LITM) ordering issues.",
+    "generated_at": "2026-10-07T20:21:11.611389+00:00",
     "backend": "ollama",
-    "content_hash": "75f851aa6b3f554c",
-    "total_chunks": 1
+    "chunk_summaries": {
+      "1.0": "The hook system intercepts specific Claude Code lifecycle events (e.g., prompt submit, tool use, compaction, stop) to transform the CLI into a workflow engine that manages context, security, cost tracking, and state synchronization."
+    },
+    "content_hash": "b45b407b3b030231",
+    "total_chunks": 3
   },
   "knowledge/concepts/orchestrator-knowledge-graph.md": {
     "title": "Orchestrator Knowledge Graph",
@@ -371,12 +374,15 @@
   },
   "knowledge/concepts/orchestrator-mcp-servers.md": {
     "title": "Orchestrator MCP Servers",
-    "description": "Orchestrator MCP Servers are native Python processes that extend Claude Code with semantic search capabilities by managing knowledge graphs and code structures within Weaviate. The primary `weaviate-kg` server handles hybrid search operations combining BM25 keyword matching with vector similarity, while a separate code-embedding service on port 11440 provides backend infrastructure for text embeddings. Specific environment variables control access to Ollama for embeddings and define distinct collections for project-specific and shared knowledge graphs. These servers matter because they offload complex reasoning tasks like document retrieval and graph management from Claude's native tools, utilizing specialized infrastructure for Ollama and Weaviate that are not directly exposed as MCP tools.",
-    "summary": "The `weaviate-kg` MCP server manages semantic search and Knowledge Graph operations within Weaviate by fusing BM25 and vector similarity, with `hybrid_search` automatically tiering result detail based on relevance scores and `semantic_graph_search` traversing typed WikiLinks to return connected subgraphs.",
-    "generated_at": "2026-10-05T03:42:55.553265+00:00",
+    "description": "Orchestrator MCP Servers extend Claude Code by providing semantic search capabilities via Model Context Protocol (MCP) servers. Key components include `weaviate-kg` for managing Knowledge and Code Graphs, which relies on Weaviate and Ollama for its backend infrastructure. While the `code-embedding-service` runs as a separate REST API, the primary semantic search and graph management functionality is exposed through the `weaviate-kg` MCP. These servers should be used when advanced, context-aware retrieval and graph traversal beyond native Claude capabilities are required.",
+    "summary": "Orchestrator MCP Servers manage semantic search and knowledge graph operations via Python processes, with the `weaviate-kg` server being the primary component. The most important fact is that `weaviate-kg` facilitates hybrid search (BM25 + vector) and GraphRAG via `semantic_graph_search` across project and shared knowledge graphs stored in Weaviate.",
+    "generated_at": "2026-10-07T20:20:36.206339+00:00",
     "backend": "ollama",
-    "content_hash": "88b3366fb854a710",
-    "total_chunks": 1
+    "chunk_summaries": {
+      "1.0": "This deprecated section details the architecture of the Claude Orchestrator MCP Servers, which utilize four distinct Python processes—Weaviate-KG, Ollama, Search, and Coordination—to provide semantic search, local LLM inference, web search, and team coordination capabilities."
+    },
+    "content_hash": "0e619b30d6cc0d83",
+    "total_chunks": 2
   },
   "knowledge/concepts/orchestrator-rl-retrieval.md": {
     "title": "Orchestrator RL Retrieval",
@@ -444,10 +450,11 @@
   },
   "knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md": {
     "title": "Project-extra codegraph paths",
-    "description": "This feature allows indexing additional read-only filesystem paths into a project's codegraph without converting them into launcher projects.\nIt supports six launcher commands to manage extra paths while preventing unintended state changes like creating `.claude/` directories.\nThe system ensures accurate search results by unioning file UUIDs from primary repos and extras in a single pass during analysis.\nIt matters because it enables users to query sibling repositories or private forks without registering them as write targets or managing their own project state.",
-    "summary": "The \"Project-extra codegraph paths\" feature allows indexing additional read-only filesystem paths into a project's codegraph collection without registering them as launcher projects. This architecture consists of four layers: a database table (`project_codegraph_extra_paths`) for persistence, a Tauri launcher with commands to manage paths and handle disambiguation when paths conflict with existing projects, a hub resolver API for configuration, and a GUI for user interaction. A critical invariant ensures that `--prune-stale` operations visit all relevant files in a single invocation to prevent UUID deletion conflicts, enforced via a per-project mutex and a shared set in the analyzer. Path canonicalization rules standardize paths before storage, while hook execution follows a first-match-wins order (own-repo → extras → siblings). The system supports audit logging for all state transitions and is designed to be backwards compatible, excluding knowledge graphs, diagrams, and write operations for these extra paths.",
-    "generated_at": "2026-07-20T18:53:18.375689+00:00",
-    "content_hash": "3c71083227280c32",
+    "description": "Project-extra codegraph paths index additional read-only filesystem paths into a project's codegraph without registering them as primary launcher projects. This functionality involves persisting paths in a dedicated database table, exposing them via the Hub resolver, and managing synchronization through the Launcher and GUI. Use this mechanism when a user needs search queries to include content from related, non-primary repositories, such as a private fork referencing a public sibling clone.",
+    "summary": "This feature indexes additional read-only filesystem paths into a project's codegraph via a dedicated DB table, enabling inclusion of sibling repositories without promoting them to launcher projects. The critical invariant mandates that `--prune-stale` must visit all target files in a single invocation to prevent multi-pass UUID deletion conflicts.",
+    "generated_at": "2026-10-08T03:16:24.901916+00:00",
+    "backend": "ollama",
+    "content_hash": "2a80d3c40ec54727",
     "total_chunks": 1
   },
   "knowledge/concepts/prompt-engineering-fundamentals.md": {

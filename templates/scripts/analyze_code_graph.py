@@ -637,8 +637,8 @@ _LANGUAGE_IGNORE_DIRS_EXTRAS: Dict[str, frozenset] = {
     'csharp': frozenset({'obj', 'bin', '.vs'}),
     # JS / TS test-coverage reports + vendored third-party deps.
     # v0.2.72 (P5): `vendor` — some JS/TS projects vendor third-party
-    # libraries into `<pkg>/vendor/` (e.g. the launcher's bundled
-    # diagram editors under `launcher/vendor/diagrams-editor/`). Those
+    # libraries into `<pkg>/vendor/` (the live example, a vendored diagram
+    # editor, left in v0.2.102; the class of noise stays). Those
     # are minified/third-party sources, not first-party code; indexing
     # them injects thousands of vendor functions as retrieval noise.
     # (Go/Ruby already skip `vendor` via their own extras above.)
@@ -4330,7 +4330,7 @@ class CodeGraphAnalyzer:
 
         v0.2.72 (P5): `.bundle.js` + `.chunk.js` join `.min.js` — these are
         build-output bundles (webpack/rollup/esbuild), not source. A vendored
-        `excalidraw.bundle.js` was live-confirmed injecting its functions as
+        bundle (since removed) was live-confirmed injecting its functions as
         retrieval context. `.chunk.js` covers split-chunk output that doesn't
         live under an already-ignored codegen dir. F8: the suffix set is the
         SHARED module-level constant (`_JS_SKIP_SUFFIXES`, via `_FINDER_SPECS`)

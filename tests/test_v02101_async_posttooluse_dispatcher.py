@@ -93,18 +93,25 @@ TEMPLATES = {
     "windows": REPO_ROOT / "templates" / "settings.json.windows.template",
 }
 
-#: The six scripts whose async PostToolUse REGISTRATIONS the dispatcher
+#: The five scripts whose async PostToolUse REGISTRATIONS the dispatcher
 #: supersedes (the scripts themselves still ship — the dispatcher routes to
 #: them). Used for the template-absence assertion; the routing-coverage
 #: assertion DERIVES its expectation from the retirement table instead.
+#: v0.2.102: post-file-delete left this set — the script was deleted with
+#: the diagrams integrations and now carries its OWN v0.2.102 retirement
+#: rows (see RETIRED_V02102_STEMS).
 SUPERSEDED_STEMS = (
     "post-edit-outcome",
     "post-bash-context-record",
     "kg-summary-generator",
     "post-git-commit-kg-sync",
-    "post-file-delete",
     "kg-update-nudge",
 )
+
+#: The diagram-delete cascade hook, retired outright in v0.2.102 (script
+#: deleted, dispatcher row removed): its registration must stay absent from
+#: the templates AND declared in the retirement table under v0.2.102.
+RETIRED_V02102_STEMS = ("post-file-delete",)
 
 #: PostToolUse registrations that must stay SYNCHRONOUS and registered
 #: (they deliver stdout envelopes or gate follow-up behaviour the harness
@@ -336,7 +343,18 @@ def test_route_table_stems_equal_the_v02101_retirement_rows():
     )
     assert retired == set(SUPERSEDED_STEMS), (
         "the retirement table's v0.2.101 PostToolUse rows must cover exactly "
-        f"the six merged scripts; got {sorted(retired)}"
+        f"the five merged scripts; got {sorted(retired)}"
+    )
+    retired_v02102 = {
+        entry.target.rsplit(".", 1)[0]
+        for entry in hr.RETIRED_REGISTRATIONS
+        if entry.event == "PostToolUse"
+        and entry.kind == hr.KIND_HOOK_SCRIPT
+        and entry.retired_in == "v0.2.102"
+    }
+    assert retired_v02102 == set(RETIRED_V02102_STEMS), sorted(retired_v02102)
+    assert not (routed & retired_v02102), (
+        "a v0.2.102-retired script must not be routed by the dispatcher"
     )
 
 
@@ -348,7 +366,7 @@ def test_route_table_is_the_pre_v02101_registration_shape():
     consistently re-routed to the WRONG tool. This golden map is the
     registration shape the v0.2.100 templates shipped, transcribed once
     from the lane brief: post-edit-outcome on Edit|Write,
-    post-bash-context-record + post-file-delete on Bash,
+    post-bash-context-record on Bash (post-file-delete until v0.2.102),
     post-git-commit-kg-sync on Bash(git commit *) only, kg-summary-
     generator on Edit/Write/store_knowledge_node, kg-update-nudge on
     everything. A routing edit that moves a sub-hook to another tool must
@@ -356,7 +374,7 @@ def test_route_table_is_the_pre_v02101_registration_shape():
     instead of one silent drift.
     """
     no_commit = {
-        "post-bash-context-record", "post-file-delete", "kg-update-nudge",
+        "post-bash-context-record", "kg-update-nudge",
     }
     with_commit = no_commit | {"post-git-commit-kg-sync"}
     golden = {
@@ -407,9 +425,9 @@ def test_retirement_rows_cover_both_os_extensions():
         entry.target for entry in hr.RETIRED_REGISTRATIONS
         if entry.event == "PostToolUse"
         and entry.kind == hr.KIND_HOOK_SCRIPT
-        and entry.retired_in == "v0.2.101"
+        and entry.retired_in in ("v0.2.101", "v0.2.102")
     }
-    for stem in SUPERSEDED_STEMS:
+    for stem in (*SUPERSEDED_STEMS, *RETIRED_V02102_STEMS):
         assert f"{stem}.sh" in targets, targets
         assert f"{stem}.ps1" in targets, targets
 
@@ -594,19 +612,19 @@ def test_sh_dispatcher_failure_is_silent_and_logged_once(sh_rig):
     """A child that speaks and dies must NOT reach the harness: one line in
     the metrics-dir log instead (the 'records only on failure' promise)."""
     payload = _payload("Bash", command="ls -la")
-    proc, invoked, _body = sh_rig.run(payload, fail_stem="post-file-delete")
+    proc, invoked, _body = sh_rig.run(payload, fail_stem="post-bash-context-record")
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert proc.stdout == "" and proc.stderr == "", (
         f"a failing child leaked to the harness: {proc.stdout!r} {proc.stderr!r}"
     )
-    assert "post-file-delete" in invoked, "the failing child must still have run"
+    assert "post-bash-context-record" in invoked, "the failing child must still have run"
     logs = list(sh_rig.home.rglob("post-tool-use-async.log"))
     assert logs, "no failure log was written under the metrics home"
     content = logs[0].read_text(encoding="utf-8")
-    assert "post-file-delete" in content, content
+    assert "post-bash-context-record" in content, content
     assert "exit=3" in content, content
-    assert "boom from post-file-delete" in content.replace("\n", " ") or (
-        "boom from post-file-delete" in content
+    assert "boom from post-bash-context-record" in content.replace("\n", " ") or (
+        "boom from post-bash-context-record" in content
     ), content
 
 
@@ -640,19 +658,19 @@ def test_sh_dispatcher_skips_stems_disabled_via_the_env_file(sh_rig):
     env_dir = Path(sh_rig.env["CLAUDE_PROJECT_DIR"]) / ".claude"
     env_dir.mkdir(parents=True, exist_ok=True)
     (env_dir / "env").write_text(
-        "# user knobs\nVCO_ASYNC_DISABLED_HOOKS=post-file-delete,kg-update-nudge\n",
+        "# user knobs\nVCO_ASYNC_DISABLED_HOOKS=post-bash-context-record,kg-update-nudge\n",
         encoding="utf-8",
     )
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = sh_rig.run(payload)
     expected = _expected_subhooks(
         sh_rig.rows, "Bash", "ls -la",
-        disabled={"post-file-delete", "kg-update-nudge"},
+        disabled={"post-bash-context-record", "kg-update-nudge"},
     )
     assert proc.returncode == 0
     assert proc.stdout == "" and proc.stderr == ""
     assert set(invoked) == expected
-    assert "post-file-delete" not in invoked
+    assert "post-bash-context-record" not in invoked
     assert "kg-update-nudge" not in invoked
 
 
@@ -660,15 +678,16 @@ def test_sh_dispatcher_skips_stems_disabled_via_the_env_file(sh_rig):
 def test_sh_dispatcher_skips_stems_disabled_via_process_env(sh_rig):
     """The key also works as a plain environment variable (shell export or
     settings.json env channel), with surrounding spaces and unknown stems
-    tolerated; an exact-stem match only — `post-file` must not disable
-    `post-file-delete`."""
-    sh_rig.env["VCO_ASYNC_DISABLED_HOOKS"] = " post-file , no-such-hook ,post-bash-context-record"
+    tolerated; an exact-stem match only — `kg-update` must not disable
+    `kg-update-nudge`. (v0.2.102: the original witness stem,
+    post-file-delete, is no longer routed — the substring pair moved to
+    kg-update / kg-update-nudge.)"""
+    sh_rig.env["VCO_ASYNC_DISABLED_HOOKS"] = " kg-update , no-such-hook ,post-bash-context-record "
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = sh_rig.run(payload)
     assert proc.returncode == 0 and proc.stdout == "" and proc.stderr == ""
     assert "post-bash-context-record" not in invoked
-    assert "post-file-delete" in invoked, "substring match would over-disable"
-    assert "kg-update-nudge" in invoked
+    assert "kg-update-nudge" in invoked, "substring match would over-disable"
 
 
 @pytest.mark.skipif(not _needs_bash(), reason="bash/md5sum unavailable")
@@ -682,13 +701,13 @@ def test_sh_dispatcher_payload_survives_a_stdin_eating_env_file(sh_rig):
     env_dir.mkdir(parents=True, exist_ok=True)
     (env_dir / "env").write_text(
         "read -r _pta_eaten || true\n"
-        "VCO_ASYNC_DISABLED_HOOKS=post-file-delete\n",
+        "VCO_ASYNC_DISABLED_HOOKS=post-bash-context-record\n",
         encoding="utf-8",
     )
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = sh_rig.run(payload)
     expected = _expected_subhooks(
-        sh_rig.rows, "Bash", "ls -la", disabled={"post-file-delete"}
+        sh_rig.rows, "Bash", "ls -la", disabled={"post-bash-context-record"}
     )
     assert proc.returncode == 0 and proc.stdout == "" and proc.stderr == ""
     assert set(invoked) == expected, (
@@ -705,14 +724,14 @@ def test_sh_dispatcher_reads_a_quoted_env_value(sh_rig):
     env_dir = Path(sh_rig.env["CLAUDE_PROJECT_DIR"]) / ".claude"
     env_dir.mkdir(parents=True, exist_ok=True)
     (env_dir / "env").write_text(
-        'VCO_ASYNC_DISABLED_HOOKS="post-file-delete,kg-update-nudge"\n',
+        'VCO_ASYNC_DISABLED_HOOKS="post-bash-context-record,kg-update-nudge"\n',
         encoding="utf-8",
     )
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = sh_rig.run(payload)
     expected = _expected_subhooks(
         sh_rig.rows, "Bash", "ls -la",
-        disabled={"post-file-delete", "kg-update-nudge"},
+        disabled={"post-bash-context-record", "kg-update-nudge"},
     )
     assert proc.returncode == 0 and proc.stdout == "" and proc.stderr == ""
     assert set(invoked) == expected
@@ -833,17 +852,17 @@ def test_ps1_dispatcher_routes_exactly_the_derived_set(ps_rig, case_id, payload)
 @pytest.mark.skipif(not _have_pwsh(), reason="pwsh unavailable")
 def test_ps1_dispatcher_failure_is_silent_and_logged_once(ps_rig):
     payload = _payload("Bash", command="ls -la")
-    proc, invoked, _body = ps_rig.run(payload, fail_stem="post-file-delete")
+    proc, invoked, _body = ps_rig.run(payload, fail_stem="post-bash-context-record")
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert proc.stdout.strip() == "" and proc.stderr.strip() == "", (
         f"a failing child leaked to the harness (.ps1): "
         f"{proc.stdout!r} {proc.stderr!r}"
     )
-    assert "post-file-delete" in invoked
+    assert "post-bash-context-record" in invoked
     logs = list(ps_rig.home.rglob("post-tool-use-async.log"))
     assert logs, "no failure log was written under the metrics home (.ps1)"
     content = logs[0].read_text(encoding="utf-8")
-    assert "post-file-delete" in content, content
+    assert "post-bash-context-record" in content, content
     assert "exit=3" in content, content
 
 
@@ -855,21 +874,21 @@ def test_ps1_dispatcher_skips_stems_disabled_via_the_env_file(ps_rig):
     env_dir = Path(ps_rig.env["CLAUDE_PROJECT_DIR"]) / ".claude"
     env_dir.mkdir(parents=True, exist_ok=True)
     (env_dir / "env").write_bytes(
-        b"# user knobs\r\nVCO_ASYNC_DISABLED_HOOKS=post-file-delete\r\n"
+        b"# user knobs\r\nVCO_ASYNC_DISABLED_HOOKS=post-bash-context-record\r\n"
     )
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = ps_rig.run(payload)
     expected = _expected_subhooks(
-        ps_rig.rows, "Bash", "ls -la", disabled={"post-file-delete"}
+        ps_rig.rows, "Bash", "ls -la", disabled={"post-bash-context-record"}
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == "" and proc.stderr.strip() == ""
     assert set(invoked) == expected
-    assert "post-file-delete" not in invoked
+    assert "post-bash-context-record" not in invoked
 
 
 @pytest.mark.skipif(not _have_pwsh(), reason="pwsh unavailable")
-@pytest.mark.parametrize("quoted", ['"post-file-delete"', "'post-file-delete'"])
+@pytest.mark.parametrize("quoted", ['"post-bash-context-record"', "'post-bash-context-record'"])
 def test_ps1_dispatcher_reads_a_quoted_env_value(ps_rig, quoted):
     """N-B (ps1 leg): the regex capture must strip ONE surrounding quote
     pair, so a hand-edited `VCO_ASYNC_DISABLED_HOOKS="a,b"` disables the
@@ -883,12 +902,12 @@ def test_ps1_dispatcher_reads_a_quoted_env_value(ps_rig, quoted):
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = ps_rig.run(payload)
     expected = _expected_subhooks(
-        ps_rig.rows, "Bash", "ls -la", disabled={"post-file-delete"}
+        ps_rig.rows, "Bash", "ls -la", disabled={"post-bash-context-record"}
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == "" and proc.stderr.strip() == ""
     assert set(invoked) == expected
-    assert "post-file-delete" not in invoked
+    assert "post-bash-context-record" not in invoked
 
 
 # ---------------------------------------------------------------------------

@@ -108,8 +108,9 @@ pub mod hub_port;
 
 // v0.2.54 Track I: per-boot bearer-token primitives (generate /
 // persist-0o600 / constant-time-compare / Bearer parse). Extracted
-// from vct-hub's auth.rs so the launcher's diagrams local server
-// (diagrams.token) reuses the same implementation as hub.token.
+// from vct-hub's auth.rs so every local HTTP surface reuses the same
+// implementation as hub.token (the first second-surface consumer was
+// the v0.2.102-deleted diagrams local server's diagrams.token).
 pub mod boot_token;
 
 // v0.2.62: shared pause-marker mechanism for the hub-side infra watchdog.

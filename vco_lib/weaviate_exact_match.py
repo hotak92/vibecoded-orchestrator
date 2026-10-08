@@ -29,9 +29,10 @@ harmless once this module's predicate rejects the extras — but never miss.
 ``delete_file_rows_exact`` stays the code graph's deleter (predicate + full
 scan fallback + per-row failure accounting — a different shape); this module
 is the KG-side home for "select the exact rows from a narrowing read", shared
-by ``templates/scripts/sync_knowledge_graph.py``,
-``claude_mcp_servers/weaviate_mcp/server.py`` (``store_knowledge_node``) and
-``vco_lib/diagram_indexer.py`` (the ``<Project>_Diagrams`` delete/upsert).
+by ``templates/scripts/sync_knowledge_graph.py`` and
+``claude_mcp_servers/weaviate_mcp/server.py`` (``store_knowledge_node``); a
+third consumer, the ``<Project>_Diagrams`` delete/upsert in the diagram
+indexer, was removed with the diagrams runtime in v0.2.102.
 
 v0.2.101 pull-in ③ extends the same rule to the MCP's READ-ONLY lookups
 (chunk windows, neighbour chunks, WikiLink targets, code-entity chunks and

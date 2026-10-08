@@ -323,9 +323,9 @@ PATH_BEARING_DB_COLUMNS: tuple[ColumnPolicy, ...] = (
         "diagram_index_retry",
         "file_path",
         POLICY_SWEEP_ONLY,
-        "A queued retry for a diagram that failed to index. Re-derived by "
-        "`vco rebuild-diagram-index`; the move surfaces that command rather "
-        "than rewriting a queue VCO does not own the semantics of.",
+        "A queued retry for a diagram that failed to index (the indexing "
+        "runtime was removed in v0.2.102; existing rows are frozen user "
+        "data the move never rewrites).",
     ),
     ColumnPolicy(
         "diagram_index_retry",
@@ -470,10 +470,11 @@ PATH_BEARING_DB_COLUMNS: tuple[ColumnPolicy, ...] = (
         "project_diagrams",
         "file_path",
         POLICY_SWEEP_ONLY,
-        "MAY be relative or absolute (`diagrams_cmd.rs::resolve_diagram_path` "
-        "branches on `is_absolute`). Relative rows follow the move for free; "
-        "absolute rows are re-derived by `vco rebuild-diagram-index`, which "
-        "the deferral names.",
+        "MAY be relative or absolute (the removed diagrams resolver branched "
+        "on `is_absolute`). Relative rows follow the move for free; "
+        "absolute rows are frozen as-is (the rebuild CLI that re-derived "
+        "them was removed with the diagrams integrations in v0.2.102; the "
+        "deferral names the table instead).",
     ),
     ColumnPolicy(
         "project_diagrams",

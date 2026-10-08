@@ -60,8 +60,8 @@ Operations
 
 ``register``
     Add a new entry, optionally seeding a starter hook script when the
-    referenced file does not exist yet (the ``create_starter_diagram_file``
-    pattern: never clobber an existing file).
+    referenced file does not exist yet. Never clobbers an existing file:
+    an existing script is left untouched and only the entry is added.
 
 ``unregister``
     Remove the entry. **Never deletes the script file** — same removal
@@ -440,7 +440,7 @@ _STARTER_SUFFIXES = (".sh", ".ps1")
 
 # A relative path token with no drive letter, no leading slash, and no
 # `..` component. Starter seeding is confined to project-relative paths
-# for the same reason `create_starter_diagram_file` confines its write.
+# so the write can never land outside the project root.
 _SAFE_REL_TOKEN_RE = re.compile(r"^(?!/)(?![A-Za-z]:)[\w.][\w./-]*$")
 
 
@@ -1570,9 +1570,8 @@ exit 0
 def starter_content(script_name: str, event: str) -> str:
     """Minimal runnable starter body for a hook script, chosen by suffix.
 
-    Mirrors ``diagrams_cmd::starter_content_for``: a valid, immediately
-    runnable seed with a comment explaining the contract, not a stub that
-    errors on first fire.
+    A valid, immediately runnable seed with a comment explaining the
+    contract, not a stub that errors on first fire.
     """
     template = _STARTER_PS1 if script_name.lower().endswith(".ps1") else _STARTER_SH
     return template.format(script_name=script_name, event=event)
@@ -1585,8 +1584,7 @@ def create_starter_script(
 
     Returns ``None`` when the command names no seedable script; otherwise
     a dict with ``path`` and ``created`` (``False`` = the file already
-    existed and was left untouched, the non-clobber rule
-    ``create_starter_diagram_file`` follows).
+    existed and was left untouched, per the never-clobber rule).
 
     The write is confined to ``project_folder``: the path token is
     already vetted as project-relative by

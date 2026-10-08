@@ -46,24 +46,14 @@ pub mod desktop_shortcut;
 // commands in `rl_settings` stay registered; both surfaces resolve through
 // `vct_launcher_core::db::settings::resolve_dual_flags`.
 pub mod dual_flags;
-// Phase 1.1 of the diagrams (Mermaid + Excalidraw) integration plan
-// (.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md).
-// Sibling Phase 1.2/1.3/1.5 agents stub these command names — keep
-// stable; the merge wires their tabs/wrappers against these.
-pub mod diagrams_cmd;
-// v0.2.34 Agent D — `subscribe_to_diagram_changes` + filesystem watcher
-// that emits `diagram-changed` Tauri events. Split from `diagrams_cmd`
-// because it owns process-wide state (`HashMap<project_id,
-// RecommendedWatcher>` + debounce slots) that doesn't belong on the
-// per-command shape. See
-// `.claude/context/plans/diagrams-frontend-wiring-handoff-2026-05-25.md`.
-pub mod diagram_watcher;
-// v0.2.36 Agent R — local HTTP server that serves the vendored
-// Mermaid/Excalidraw editors at 127.0.0.1:<free-port>. Lazy-started
-// on the first `open_diagrams_editor` Tauri command. Replaces the
-// embedded Excalidraw editor (broken on Wayland+webkit2gtk) and adds
-// a visual Mermaid editor alongside the existing text-only one.
-pub mod diagrams_local_server;
+// v0.2.102 (owner ruling 2026-10-07): the diagrams integrations were
+// dropped entirely — `diagrams_cmd`, `diagram_watcher` and
+// `diagrams_local_server` are deleted. The GENERIC `project_modules`
+// machinery that lived in `diagrams_cmd` (set_project_module_enabled /
+// clear_project_module + the re-render and bundle-update spawns) moved
+// to `module_enabled.rs`. The `is_project_module_active` READ command
+// moved with them, then was REMOVED (owner decision 2026-10-08): zero
+// callers remained after the Diagrams tab went.
 pub mod embed_admission;
 pub mod embedding_catalog;
 pub mod embedding_enrichment;

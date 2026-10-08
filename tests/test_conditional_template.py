@@ -41,12 +41,12 @@ class RenderActiveTests(unittest.TestCase):
     def test_active_block_kept(self):
         template = (
             "before\n"
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "## Diagrams section body\n"
             "{{/if_module_active}}\n"
             "after\n"
         )
-        out = render_conditional_blocks(template, active_modules={"diagrams"})
+        out = render_conditional_blocks(template, active_modules={"model_gateway"})
         # The tag lines themselves must be stripped from the output.
         self.assertNotIn("{{#if_module_active", out)
         self.assertNotIn("{{/if_module_active", out)
@@ -57,12 +57,12 @@ class RenderActiveTests(unittest.TestCase):
         self.assertIn("after", out)
 
     def test_inactive_module_block_stripped_no_scar(self):
-        # Block is dropped because "diagrams" is NOT in active_modules.
+        # Block is dropped because "model_gateway" is NOT in active_modules.
         # The trailing blank line after the closing tag should be consumed
         # too, so we don't get a "before\n\n\nafter" scar.
         template = (
             "before\n"
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "## Diagrams section body\n"
             "{{/if_module_active}}\n"
             "\n"
@@ -83,12 +83,12 @@ class RenderActiveTests(unittest.TestCase):
         # Whole-line tag matching tolerates leading/trailing whitespace.
         template = (
             "before\n"
-            "   {{#if_module_active diagrams}}   \n"
+            "   {{#if_module_active model_gateway}}   \n"
             "body\n"
             "   {{/if_module_active}}   \n"
             "after\n"
         )
-        out = render_conditional_blocks(template, active_modules={"diagrams"})
+        out = render_conditional_blocks(template, active_modules={"model_gateway"})
         self.assertIn("body", out)
         self.assertNotIn("{{#if_module_active", out)
 
@@ -96,17 +96,17 @@ class RenderActiveTests(unittest.TestCase):
         # No trailing newline in input → no trailing newline in output.
         template_no_nl = (
             "before\n"
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "body\n"
             "{{/if_module_active}}"
         )
-        out = render_conditional_blocks(template_no_nl, active_modules={"diagrams"})
+        out = render_conditional_blocks(template_no_nl, active_modules={"model_gateway"})
         self.assertEqual(out, "before\nbody")
 
         # Trailing newline in input → trailing newline in output.
         template_with_nl = template_no_nl + "\n"
         out2 = render_conditional_blocks(
-            template_with_nl, active_modules={"diagrams"}
+            template_with_nl, active_modules={"model_gateway"}
         )
         self.assertEqual(out2, "before\nbody\n")
 
@@ -117,7 +117,7 @@ class RenderInactiveTests(unittest.TestCase):
     def test_inactive_block_kept_when_module_inactive(self):
         template = (
             "before\n"
-            "{{#if_module_inactive diagrams}}\n"
+            "{{#if_module_inactive model_gateway}}\n"
             "Diagrams is OFF. Enable it in DiagramsTab.\n"
             "{{/if_module_inactive}}\n"
             "after\n"
@@ -128,12 +128,12 @@ class RenderInactiveTests(unittest.TestCase):
     def test_inactive_block_stripped_when_module_active(self):
         template = (
             "before\n"
-            "{{#if_module_inactive diagrams}}\n"
+            "{{#if_module_inactive model_gateway}}\n"
             "Diagrams is OFF. Enable it in DiagramsTab.\n"
             "{{/if_module_inactive}}\n"
             "after\n"
         )
-        out = render_conditional_blocks(template, active_modules={"diagrams"})
+        out = render_conditional_blocks(template, active_modules={"model_gateway"})
         self.assertNotIn("Diagrams is OFF", out)
         self.assertNotIn("{{#if_module_inactive", out)
         self.assertEqual(out, "before\nafter\n")
@@ -145,26 +145,26 @@ class MultipleBlocksTests(unittest.TestCase):
 
     def test_two_blocks_same_module_both_kept(self):
         template = (
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "block A\n"
             "{{/if_module_active}}\n"
             "middle\n"
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "block B\n"
             "{{/if_module_active}}\n"
         )
-        out = render_conditional_blocks(template, active_modules={"diagrams"})
+        out = render_conditional_blocks(template, active_modules={"model_gateway"})
         self.assertIn("block A", out)
         self.assertIn("block B", out)
         self.assertIn("middle", out)
 
     def test_two_blocks_same_module_both_dropped(self):
         template = (
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "block A\n"
             "{{/if_module_active}}\n"
             "middle\n"
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "block B\n"
             "{{/if_module_active}}\n"
         )
@@ -174,32 +174,32 @@ class MultipleBlocksTests(unittest.TestCase):
         self.assertIn("middle", out)
 
     def test_different_modules_independent(self):
-        # diagrams active, rl inactive → only diagrams block survives.
+        # model_gateway active, rl inactive → only model_gateway block survives.
         template = (
-            "{{#if_module_active diagrams}}\n"
-            "DIAGRAMS BLOCK\n"
+            "{{#if_module_active model_gateway}}\n"
+            "MODULE_GATEWAY BLOCK\n"
             "{{/if_module_active}}\n"
             "{{#if_module_active rl}}\n"
             "RL BLOCK\n"
             "{{/if_module_active}}\n"
         )
-        out = render_conditional_blocks(template, active_modules={"diagrams"})
-        self.assertIn("DIAGRAMS BLOCK", out)
+        out = render_conditional_blocks(template, active_modules={"model_gateway"})
+        self.assertIn("MODULE_GATEWAY BLOCK", out)
         self.assertNotIn("RL BLOCK", out)
 
     def test_active_and_inactive_mirror_pair(self):
         # An active and an inactive block for the same module are mutually
         # exclusive: exactly one survives.
         template = (
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "ON message\n"
             "{{/if_module_active}}\n"
-            "{{#if_module_inactive diagrams}}\n"
+            "{{#if_module_inactive model_gateway}}\n"
             "OFF message\n"
             "{{/if_module_inactive}}\n"
         )
         out_active = render_conditional_blocks(
-            template, active_modules={"diagrams"}
+            template, active_modules={"model_gateway"}
         )
         self.assertIn("ON message", out_active)
         self.assertNotIn("OFF message", out_active)
@@ -215,7 +215,7 @@ class ErrorTests(unittest.TestCase):
     def test_nested_blocks_raise(self):
         # Even nesting of the same kind is unsupported in Phase 1.5.B.
         template = (
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "outer\n"
             "{{#if_module_active rl}}\n"
             "inner\n"
@@ -223,18 +223,18 @@ class ErrorTests(unittest.TestCase):
             "{{/if_module_active}}\n"
         )
         with self.assertRaises(TemplateError) as cm:
-            render_conditional_blocks(template, active_modules={"diagrams"})
+            render_conditional_blocks(template, active_modules={"model_gateway"})
         # The nested-open is on line 3 (1-based).
         self.assertEqual(cm.exception.line_no, 3)
         self.assertIn("Nested", str(cm.exception))
 
     def test_unmatched_opening_raises(self):
         template = (
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "body\n"
         )
         with self.assertRaises(TemplateError) as cm:
-            render_conditional_blocks(template, active_modules={"diagrams"})
+            render_conditional_blocks(template, active_modules={"model_gateway"})
         self.assertEqual(cm.exception.line_no, 1)
         self.assertIn("never closed", str(cm.exception))
 
@@ -244,19 +244,19 @@ class ErrorTests(unittest.TestCase):
             "{{/if_module_active}}\n"
         )
         with self.assertRaises(TemplateError) as cm:
-            render_conditional_blocks(template, active_modules={"diagrams"})
+            render_conditional_blocks(template, active_modules={"model_gateway"})
         # The orphan close is on line 2.
         self.assertEqual(cm.exception.line_no, 2)
         self.assertIn("Unmatched closing", str(cm.exception))
 
     def test_mismatched_kind_open_active_close_inactive(self):
         template = (
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "body\n"
             "{{/if_module_inactive}}\n"
         )
         with self.assertRaises(TemplateError) as cm:
-            render_conditional_blocks(template, active_modules={"diagrams"})
+            render_conditional_blocks(template, active_modules={"model_gateway"})
         # The mismatched close is on line 3.
         self.assertEqual(cm.exception.line_no, 3)
         self.assertIn("Mismatched", str(cm.exception))
@@ -266,12 +266,12 @@ class ErrorTests(unittest.TestCase):
         # patterns, falls into the catch-all and raises with line number.
         template = (
             "before\n"
-            "{{#if_modul_active diagrams}}\n"
+            "{{#if_modul_active model_gateway}}\n"
             "body\n"
             "{{/if_modul_active}}\n"
         )
         with self.assertRaises(TemplateError) as cm:
-            render_conditional_blocks(template, active_modules={"diagrams"})
+            render_conditional_blocks(template, active_modules={"model_gateway"})
         # The typoed opening tag is on line 2.
         self.assertEqual(cm.exception.line_no, 2)
         msg = str(cm.exception)
@@ -287,7 +287,7 @@ class ErrorTests(unittest.TestCase):
             "{{/if_module_active}}\n"
         )
         with self.assertRaises(TemplateError):
-            render_conditional_blocks(template, active_modules={"diagrams"})
+            render_conditional_blocks(template, active_modules={"model_gateway"})
 
 
 class VariableSurvivesActiveBlockTests(unittest.TestCase):
@@ -296,12 +296,12 @@ class VariableSurvivesActiveBlockTests(unittest.TestCase):
 
     def test_variable_placeholder_inside_active_block_preserved(self):
         template = (
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active model_gateway}}\n"
             "Project: {{PROJECT_NAME}}\n"
             "Root: {{PROJECT_ROOT}}\n"
             "{{/if_module_active}}\n"
         )
-        out = render_conditional_blocks(template, active_modules={"diagrams"})
+        out = render_conditional_blocks(template, active_modules={"model_gateway"})
         # Variables remain as-is for the downstream pass to resolve.
         self.assertIn("Project: {{PROJECT_NAME}}", out)
         self.assertIn("Root: {{PROJECT_ROOT}}", out)
@@ -312,12 +312,12 @@ class NoTagTemplatePassThroughTests(unittest.TestCase):
 
     def test_no_tags_byte_identical_with_trailing_newline(self):
         template = "Plain template\n\nWith multiple lines.\n"
-        out = render_conditional_blocks(template, active_modules={"diagrams"})
+        out = render_conditional_blocks(template, active_modules={"model_gateway"})
         self.assertEqual(out, template)
 
     def test_no_tags_byte_identical_without_trailing_newline(self):
         template = "Plain template\n\nWith multiple lines."
-        out = render_conditional_blocks(template, active_modules={"diagrams"})
+        out = render_conditional_blocks(template, active_modules={"model_gateway"})
         self.assertEqual(out, template)
 
 
@@ -330,9 +330,10 @@ class ResolveActiveModulesStubTests(unittest.TestCase):
             "any-project-id",
             db_path=Path("/nonexistent/path/launcher.db"),
         )
+        # v0.2.102: the default-on set is EMPTY (diagrams, its only member,
+        # was removed with the diagrams runtime) — no DB means no modules.
         self.assertEqual(result, set(_DEFAULT_ACTIVE_MODULES))
-        # Diagrams must be in the defaults (Phase 1.5 ships it default-on).
-        self.assertIn("diagrams", result)
+        self.assertEqual(result, set())
 
     def test_empty_db_no_project_modules_table_returns_defaults(self):
         # Create an empty SQLite DB with no project_modules table — the
@@ -349,8 +350,11 @@ class ResolveActiveModulesStubTests(unittest.TestCase):
             result = resolve_active_modules("p1", db_path=db)
             self.assertEqual(result, set(_DEFAULT_ACTIVE_MODULES))
 
-    def test_db_with_disabled_diagrams_removes_from_active(self):
-        # Real DB with project_modules.diagrams=0 → diagrams NOT active.
+    def test_db_with_disabled_module_not_added_to_active(self):
+        # v0.2.102: with no default-on modules left (the default-on set is
+        # empty), an enabled=0 row is INERT — it must not ADD the module.
+        # (Pre-v0.2.102 this test pinned a default-on module being removed;
+        # that path is unreachable until a default-on module exists again.)
         import sqlite3
 
         with tempfile.TemporaryDirectory() as td:
@@ -362,13 +366,13 @@ class ResolveActiveModulesStubTests(unittest.TestCase):
             )
             conn.execute(
                 "INSERT INTO project_modules VALUES (?, ?, ?)",
-                ("p1", "diagrams", 0),
+                ("p1", "model_gateway", 0),
             )
             conn.commit()
             conn.close()
 
             result = resolve_active_modules("p1", db_path=db)
-            self.assertNotIn("diagrams", result)
+            self.assertNotIn("model_gateway", result)
 
     def test_db_with_enabled_extra_module_adds_to_active(self):
         # A module not in defaults but enabled=1 in the DB → added.
@@ -390,8 +394,9 @@ class ResolveActiveModulesStubTests(unittest.TestCase):
 
             result = resolve_active_modules("p1", db_path=db)
             self.assertIn("rl_retrieval", result)
-            # Default-on modules still present.
-            self.assertIn("diagrams", result)
+            # v0.2.102: no default-on modules exist any more — the row is
+            # the ONLY source of the module.
+            self.assertNotIn("diagrams", result)
 
     def test_different_project_unaffected_by_other_project_rows(self):
         import sqlite3
@@ -403,16 +408,23 @@ class ResolveActiveModulesStubTests(unittest.TestCase):
                 "CREATE TABLE project_modules "
                 "(project_id TEXT, module_name TEXT, enabled INTEGER)"
             )
-            # p1 disables diagrams; querying p2 must NOT inherit that.
+            # p1 disables model_gateway; p2 enables it. Querying p2 must
+            # NOT inherit p1's row (rows are keyed by project UUID).
             conn.execute(
                 "INSERT INTO project_modules VALUES (?, ?, ?)",
-                ("p1", "diagrams", 0),
+                ("p1", "model_gateway", 0),
+            )
+            conn.execute(
+                "INSERT INTO project_modules VALUES (?, ?, ?)",
+                ("p2", "model_gateway", 1),
             )
             conn.commit()
             conn.close()
 
-            result = resolve_active_modules("p2", db_path=db)
-            self.assertIn("diagrams", result)
+            result_p2 = resolve_active_modules("p2", db_path=db)
+            self.assertIn("model_gateway", result_p2)
+            result_p1 = resolve_active_modules("p1", db_path=db)
+            self.assertNotIn("model_gateway", result_p1)
 
 
 class ModuleGatewayDeliveryKeyTests(unittest.TestCase):

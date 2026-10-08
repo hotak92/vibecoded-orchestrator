@@ -20,8 +20,8 @@ After consolidation:
 
   * Underscore-PRESERVING rule (code-graph collections):
       ``vco_lib.project_naming.canonical_class_prefix`` is the SSOT.
-      ``vco_lib.codegraph_to_mermaid._sanitize_collection_prefix`` is a
-      thin wrapper that catches ``ValueError`` and falls back to the
+      ``vco_lib.codegraph_naming.sanitize_collection_prefix`` (moved there
+      in v0.2.102 from the deleted codegraph_to_mermaid) is a thin wrapper that catches ``ValueError`` and falls back to the
       legacy regex behaviour for malformed inputs.
 
 These tests pin BOTH consolidations against fixture inputs so a future
@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import pytest
 
-from vco_lib.codegraph_to_mermaid import _sanitize_collection_prefix
+from vco_lib.codegraph_naming import sanitize_collection_prefix as _sanitize_collection_prefix
 from vco_lib.config_projection import _sanitize_kg_collection
 from vco_lib.project_init import sanitize_for_weaviate_class
 from vco_lib.project_naming import canonical_class_prefix
@@ -103,7 +103,7 @@ class TestUnderscoreDroppingRule:
 
 
 class TestUnderscorePreservingRule:
-    """``codegraph_to_mermaid._sanitize_collection_prefix`` must delegate
+    """``codegraph_naming.sanitize_collection_prefix`` must delegate
     to ``project_naming.canonical_class_prefix`` for valid inputs and
     fall back to the legacy regex behaviour for inputs that would
     otherwise raise ``ValueError``."""
@@ -233,7 +233,9 @@ def test_no_fifth_sanitizer_in_vco_lib() -> None:
         ("codegraph_naming.py", "canonical_class_prefix"),
         # Endorsed wrappers (delegate to SSOTs).
         ("config_projection.py", "_sanitize_kg_collection"),
-        ("codegraph_to_mermaid.py", "_sanitize_collection_prefix"),
+        # v0.2.102: the never-raising wrapper moved here (codegraph_naming)
+        # from the deleted codegraph_to_mermaid module.
+        ("codegraph_naming.py", "sanitize_collection_prefix"),
         # v0.2.84 D1 (P2): the ENDORSED Python mirror of the hub's
         # ``vct_launcher_core::collection_naming::sanitize_collection_prefix``
         # (the underscore-PRESERVING slug→prefix rule the dev/diagrams

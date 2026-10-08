@@ -112,7 +112,7 @@ def _cids(project: Path) -> set:
 
 class TestNeverUpdatedPreSplitProject:
     @pytest.mark.parametrize("version,name,given,modules", [
-        ("v0.2.86", "my-proj", None, {"diagrams"}),         # folder-name identity
+        ("v0.2.86", "my-proj", None, {"some_module"}),         # folder-name identity
         ("v0.2.98", "Custom Name", "Custom Name", set()),     # name given at install
         ("v0.2.33", "my-proj", None, set()),                  # first marked release
     ])
@@ -139,7 +139,7 @@ class TestNeverUpdatedPreSplitProject:
 
     def test_an_edited_old_render_takes_the_edited_route(self, tmp_path):
         orch, project = _old_project(tmp_path, "v0.2.86", name="my-proj",
-                                     modules={"diagrams"}, edit=True)
+                                     modules={"some_module"}, edit=True)
         res = _update(project, orch)
         text = (project / "CLAUDE.md").read_text(encoding="utf-8")
         assert res["templates"]["claude_md_migrated"] == ["migrated-edited"]
@@ -169,7 +169,7 @@ class TestStructuralMatch:
     """Review R18F-03: recognition must not depend on today's roots or name."""
 
     @pytest.mark.parametrize("version,modules", [
-        ("v0.2.33", set()), ("v0.2.86", {"diagrams"}), ("v0.2.98", set()),
+        ("v0.2.33", set()), ("v0.2.86", {"some_module"}), ("v0.2.98", set()),
     ])
     def test_an_old_render_under_other_roots_and_name_is_untouched(
             self, tmp_path, version, modules):
@@ -195,7 +195,7 @@ class TestStructuralMatch:
     def test_an_edit_on_a_placeholder_line_is_still_an_edit(self, tmp_path):
         """A wildcard must not swallow an edit: the same key is ONE value."""
         orch, project = _old_project_elsewhere(
-            tmp_path, "v0.2.86", name="Old Name", modules={"diagrams"},
+            tmp_path, "v0.2.86", name="Old Name", modules={"some_module"},
             edit=lambda t: t.replace("- Project root: `/old/place/their-proj`",
                                      "- Project root: `/old/place/their-proj` (monorepo)", 1))
         res = _update(project, orch)
@@ -223,7 +223,7 @@ class TestEditedMigrationDoesNotDuplicateVcoSections:
     def test_nothing_the_user_wrote_is_lost_and_no_vco_section_is_duplicated(
             self, tmp_path):
         orch, project = _old_project_elsewhere(tmp_path, "v0.2.86", name="Old Name",
-                                               modules={"diagrams"}, edit=self._edit)
+                                               modules={"some_module"}, edit=self._edit)
         original = (project / "CLAUDE.md").read_text(encoding="utf-8")
         res = _update(project, orch)
         text = (project / "CLAUDE.md").read_text(encoding="utf-8")

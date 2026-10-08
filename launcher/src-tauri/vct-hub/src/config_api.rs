@@ -46,9 +46,9 @@
 //! classes under `canonical_class_prefix(NAME)` and stamps the
 //! `project` property = NAME, so the MCP/CLI consumer must rebuild each
 //! peer's prefix + filter from the NAME. Emitting slugs diverged on
-//! both derived values → silent zero peer rows. This mirrors the
-//! `diagrams_access_list` resolver, which already emits NAMES for the
-//! same writer/reader-parity reason.
+//! both derived values → silent zero peer rows. (The diagrams resolver
+//! this used to mirror was removed in v0.2.102 with the dropped
+//! diagrams integrations — same writer/reader-parity reason applied.)
 //!
 //! ─── 503 vs 500 ──────────────────────────────────────────────────
 //!
@@ -299,11 +299,14 @@ struct ProjectConfigResponse {
     /// `kg_collection` by swapping the `_KnowledgeGraph` suffix for
     /// `_Diagrams`. Falls back to `<slug-sanitized>_Diagrams` when the
     /// primary KG binding's collection name doesn't end with
-    /// `_KnowledgeGraph` (a non-default rename pattern). Consumed by
-    /// `claude_mcp_servers/weaviate_mcp/server.py::DIAGRAMS_COLLECTION`
-    /// for the hybrid_search diagrams fan-out and by
-    /// `vco_lib.diagram_indexer::index_diagram_async` for the Weaviate
-    /// upsert target.
+    /// `_KnowledgeGraph` (a non-default rename pattern).
+    ///
+    /// v0.2.102 (diagrams dropped): the field STAYS for recognition —
+    /// the Python migration/rename/orphan paths read it (via
+    /// `vco_lib.project_config.ProjectConfig`) to keep identifying a
+    /// user's existing `<Project>_Diagrams` collection. Its runtime
+    /// consumers (the weaviate-kg diagrams fan-out, the diagram
+    /// indexer) were deleted in the same change.
     ///
     /// Additive field — pre-fix Python clients see an unknown field and
     /// ignore it (the Python ProjectConfig parser back-fills with an
@@ -314,21 +317,11 @@ struct ProjectConfigResponse {
     embedding_models: EmbeddingModels,
     kg_access_list: Vec<String>,
     codegraph_access_list: Vec<String>,
-    /// v0.2.34 A7 — peer-project diagrams collection names this
-    /// project may search. Sourced from the ``diagram_access`` table
-    /// (grantor side joined to ``projects.name`` for the grantee =
-    /// this project), then sanitised + suffixed to canonical Weaviate
-    /// class names (``<SanitizedName>_Diagrams``).
-    ///
-    /// Discrete from ``kg_access_list``: pre-v0.2.34 the MCP fell
-    /// back to the KG list (wrong granularity). The MCP now reads
-    /// this field via ``ProjectConfig.diagrams_access_list`` with
-    /// no KG fallback. Additive field — pre-v0.2.34 clients see an
-    /// unknown field and ignore it; pre-v0.2.34 hubs paired with
-    /// v0.2.34+ clients fall back to the env CSV
-    /// (``VCT_DIAGRAMS_ACCESS_LIST`` — written by the Python
-    /// ``config_projection`` contract via the same JOIN).
-    diagrams_access_list: Vec<String>,
+    // v0.2.102 (diagrams dropped, owner ruling 2026-10-07): the
+    // `diagrams_access_list` field was removed — its only consumer (the
+    // weaviate-kg diagrams fan-out) was deleted in the same change and
+    // `VCT_DIAGRAMS_ACCESS_LIST` is no longer projected. The
+    // `diagram_access` TABLE stays (user data); nothing reads it now.
     weaviate_url: String,
     ollama_url: String,
     /// v0.2.97: the code-embedding service URL (the machine row). Additive —
@@ -699,26 +692,9 @@ async fn project_config(
         Err(e) => return db_error_response("list codegraph access", e),
     };
 
-    // 5b. Diagrams access matrix (v0.2.34 A7). Same JOIN shape as the
-    // codegraph variant above, but reads ``diagram_access`` and
-    // pulls ``projects.name`` (display name) rather than ``slug`` —
-    // the diagrams collection-naming rule keys on the canonicalised
-    // project NAME (the indexer writes ``<SanitizedName>_Diagrams``
-    // rows into Weaviate). Returns the already-canonical Weaviate
-    // class names so the MCP can use them as-is (mirrors the
-    // kg_access_list contract: hub returns canonical class names,
-    // env-fallback returns raw names + MCP sanitises).
-    let diagrams_access_list_raw =
-        match list_diagram_grantor_names_for_grantee(&h.0, &project.id) {
-            Ok(v) => v,
-            Err(e) => return db_error_response("list diagram access", e),
-        };
-    let mut diagrams_access_list: Vec<String> = diagrams_access_list_raw
-        .iter()
-        .map(|name| format!("{}_Diagrams", sanitize_diagrams_class_prefix(name)))
-        .collect();
-    diagrams_access_list.sort();
-    diagrams_access_list.dedup();
+    // 5b. (v0.2.102: the diagrams access-matrix resolution that used to
+    // run here was removed with the dropped diagrams integrations — see
+    // the struct-field note above. The `diagram_access` table stays.)
 
     // 6. active_embedding — v0.2.71 T-B-emb cascade (B1 two-DB-location bridge).
     //
@@ -1296,7 +1272,6 @@ async fn project_config(
         },
         kg_access_list,
         codegraph_access_list,
-        diagrams_access_list,
         weaviate_url,
         ollama_url,
         code_embed_url,
@@ -1601,9 +1576,9 @@ fn resolve_shared_kg_from_orchestrator_root(db: &vct_launcher_core::db::Db) -> O
 /// grantee` selecting `p.slug`. The consumer derives each peer's
 /// Weaviate class prefix via `canonical_class_prefix(entry)` AND uses
 /// `entry` as the `project`-property filter — both must be the NAME the
-/// analyzer wrote (a slug diverges on both). Converged on the
-/// `list_diagram_grantor_names_for_grantee` sibling below, which
-/// already selects `p.name` for the same reason.
+/// analyzer wrote (a slug diverges on both). (The
+/// `list_diagram_grantor_names_for_grantee` sibling this converged with
+/// was removed in v0.2.102 with the dropped diagrams integrations.)
 ///
 /// This is inlined here rather than added to
 /// `vct-launcher-core/src/db/access.rs` because it's the only
@@ -1631,46 +1606,6 @@ fn list_codegraph_grantor_names_for_grantee(
         .map_err(|e| format!("collect list_codegraph_grantor_names: {}", e))
 }
 
-/// JOIN over ``diagram_access`` (grantee filter) + ``projects``
-/// (grantor name lookup). Returns the list of grantor project NAMES
-/// (display names — ``projects.name``) whose diagrams this project
-/// may search.
-///
-/// v0.2.34 A7. Mirrors ``list_codegraph_grantor_slugs_for_grantee``
-/// in shape but reads from a different access-matrix table and
-/// pulls the display NAME rather than ``slug`` — the diagrams
-/// indexer's collection-naming rule keys on the canonicalised
-/// project name, not the slug. Caller is expected to sanitise +
-/// suffix the returned names into ``<Sanitized>_Diagrams`` class
-/// names; this helper stays close to the raw DB shape so a future
-/// caller that wants names for a different purpose (audit panel,
-/// UI rendering) can consume them directly.
-///
-/// Inlined here rather than promoted to vct-launcher-core for the
-/// same reason as the codegraph sibling: single caller today.
-/// Parameterised SQL — no string concat.
-fn list_diagram_grantor_names_for_grantee(
-    db: &vct_launcher_core::db::Db,
-    grantee_project_id: &str,
-) -> Result<Vec<String>, String> {
-    let guard = db.lock();
-    let mut stmt = guard
-        .prepare(
-            "SELECT p.name
-               FROM diagram_access da
-               JOIN projects p ON p.id = da.grantor_project_id
-              WHERE da.grantee_project_id = ?1
-                AND da.access_level = 'read'
-              ORDER BY p.name",
-        )
-        .map_err(|e| format!("prepare list_diagram_grantor_names: {}", e))?;
-    let rows = stmt
-        .query_map(params![grantee_project_id], |r| r.get::<_, String>(0))
-        .map_err(|e| format!("query list_diagram_grantor_names: {}", e))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("collect list_diagram_grantor_names: {}", e))
-}
-
 /// Sanitiser for a project display name → Weaviate class prefix used
 /// in diagrams collection names (``<Sanitized>_Diagrams``).
 ///
@@ -1683,7 +1618,8 @@ fn list_diagram_grantor_names_for_grantee(
 /// (spaces, hyphens, dots). The divergence silently broke
 /// cross-project diagrams visibility on first invocation — the
 /// indexer wrote under one class, the MCP searched a different one,
-/// the hub's ``diagrams_access_list`` pointed at a third.
+/// the hub's (v0.2.102: removed) ``diagrams_access_list`` pointed at
+/// a third.
 ///
 /// Rule (must match Python's ``sanitize_for_weaviate_class``):
 ///   1. Split on any non-alphanumeric run (``[^A-Za-z0-9]+`` —
@@ -1724,6 +1660,14 @@ fn list_diagram_grantor_names_for_grantee(
 /// are deliberately distinct — codegraph keeps underscores because
 /// its on-disk schema convention does (``Camel_Case_CodeFunction``),
 /// diagrams strips them because ``sanitize_for_weaviate_class`` does.
+///
+/// v0.2.102: `#[cfg(test)]` — the fn's one production call site (the
+/// ``diagrams_access_list`` emission) was removed with the field. It
+/// stays as the Rust half of the cross-language parity pin (the
+/// naming rule keeps recognising existing user ``_Diagrams``
+/// collections; ``collection_naming::DIAGRAMS_SUFFIX`` is the runtime
+/// SSOT for that recognition).
+#[cfg(test)]
 fn sanitize_diagrams_class_prefix(project_name: &str) -> String {
     const FALLBACK: &str = "vct";
     // Step 1 + 2: split on non-alphanumeric runs; PascalCase each part
@@ -2835,164 +2779,6 @@ kg_tier_full = 0.8
         );
     }
 
-    /// Seed a project with an explicit display NAME (distinct from the
-    /// slug). The default `seed_full_project` helper hard-codes
-    /// "Test Display Name" which is fine for tests that only care
-    /// about IDs / slugs, but A7's diagrams resolver reads
-    /// `projects.name` and sanitises it into a class prefix — so
-    /// per-test distinct names are needed for the cross-grant assertions.
-    fn seed_project_with_distinct_name(
-        handle: &LauncherDbHandle,
-        id: &str,
-        name: &str,
-        slug: &str,
-    ) {
-        let folder = format!("/tmp/test-config-project-{}", id);
-        let now = chrono::Utc::now().timestamp_millis();
-        let guard = handle.0.lock();
-        guard
-            .execute(
-                "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'base', ?4, ?5, ?5)",
-                rusqlite::params![id, name, folder, slug, now],
-            )
-            .unwrap();
-        drop(guard);
-        handle
-            .0
-            .set_project_kg_binding(
-                id,
-                "primary",
-                &format!("{}_KnowledgeGraph", capitalize(slug)),
-                Some("qwen3-embedding:0.6b"),
-                Some(1024),
-                None,
-                None,
-                &empty_json_obj(),
-            )
-            .unwrap();
-        handle
-            .0
-            .set_project_kg_binding(
-                id,
-                "shared",
-                "VibeCodedOrchestrator_KnowledgeGraph",
-                Some("qwen3-embedding:0.6b"),
-                Some(1024),
-                None,
-                None,
-                &empty_json_obj(),
-            )
-            .unwrap();
-        handle
-            .0
-            .set_project_kg_binding(
-                id,
-                "archive",
-                &format!("{}_Development", capitalize(slug)),
-                Some("qwen3-embedding:0.6b"),
-                Some(1024),
-                None,
-                None,
-                &empty_json_obj(),
-            )
-            .unwrap();
-        handle
-            .0
-            .set_project_codegraph_binding(
-                id,
-                &capitalize(slug),
-                Some("CodeSage-Large-v2"),
-                Some(2048),
-                None,
-                None,
-                true,
-                &empty_json_obj(),
-            )
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn config_diagrams_access_list_resolves_grantor_names() {
-        // v0.2.34 A7 — independent diagrams access matrix. Project A
-        // grants project B read access to A's diagrams; B's resolver
-        // response must list A's *_Diagrams collection name. The
-        // grant uses `set_diagram_access` (project-id-based) and the
-        // hub joins back to projects.name + sanitises.
-        let (base, h) = spawn_config_api_hub().await;
-        seed_project_with_distinct_name(&h, "proj-a", "ProjectA", "project-a");
-        seed_project_with_distinct_name(&h, "proj-b", "ProjectB", "project-b");
-        h.0.set_diagram_access("proj-a", "proj-b", "read").unwrap();
-
-        let resp = reqwest::get(format!("{}/projects/proj-b/config", base))
-            .await
-            .expect("hub reachable");
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.expect("json body");
-        let dg_list: Vec<String> = body
-            .get("diagrams_access_list")
-            .and_then(|v| v.as_array())
-            .expect("diagrams_access_list present")
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        // ProjectA → sanitised "ProjectA" + "_Diagrams"
-        assert!(
-            dg_list.contains(&"ProjectA_Diagrams".to_string()),
-            "expected ProjectA_Diagrams, got: {:?}",
-            dg_list,
-        );
-
-        // Inverse: A's response must NOT contain B's diagrams collection
-        // (no grant the other way).
-        let resp_a = reqwest::get(format!("{}/projects/proj-a/config", base))
-            .await
-            .expect("hub reachable");
-        let body_a: serde_json::Value = resp_a.json().await.expect("json body");
-        let dg_list_a: Vec<String> = body_a
-            .get("diagrams_access_list")
-            .and_then(|v| v.as_array())
-            .expect("diagrams_access_list present")
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        assert!(
-            !dg_list_a.contains(&"ProjectB_Diagrams".to_string()),
-            "ProjectB_Diagrams should NOT be in proj-a's list: {:?}",
-            dg_list_a,
-        );
-    }
-
-    #[tokio::test]
-    async fn config_diagrams_access_list_independent_of_kg_access() {
-        // Granular bug guard: granting KG access alone must NOT leak
-        // diagrams visibility, and vice versa. Pre-v0.2.34 the MCP
-        // piggybacked VCT_KG_ACCESS_LIST → granting KG leaked diagrams.
-        let (base, h) = spawn_config_api_hub().await;
-        seed_project_with_distinct_name(&h, "p-a", "ProjectA", "project-a");
-        seed_project_with_distinct_name(&h, "p-b", "ProjectB", "project-b");
-        // KG-only grant (A → B).
-        h.0.kg_set_access("p-b", "ProjectA_KnowledgeGraph", "read")
-            .unwrap();
-
-        let resp = reqwest::get(format!("{}/projects/p-b/config", base))
-            .await
-            .expect("hub reachable");
-        let body: serde_json::Value = resp.json().await.expect("json body");
-        let dg_list: Vec<String> = body
-            .get("diagrams_access_list")
-            .and_then(|v| v.as_array())
-            .expect("diagrams_access_list present")
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        assert!(
-            dg_list.is_empty(),
-            "KG-only grant must NOT populate diagrams_access_list, got: {:?}",
-            dg_list,
-        );
-    }
-
     #[test]
     fn sanitize_diagrams_class_prefix_matches_python_canonical_rule() {
         // v0.2.34 cr-b2 (2026-05-25): rule is now Python's canonical
@@ -3144,46 +2930,10 @@ kg_tier_full = 0.8
         );
     }
 
-    /// End-to-end DB seeding check: a project whose display name
-    /// contains non-alphanumeric chars must produce the canonical
-    /// ``<Pascal>_Diagrams`` class name when looked up through the
-    /// real hub resolver (``GET /api/v1/projects/{id}/config``).
-    ///
-    /// Pre-cr-b2 this test would have caught the bug: seeding "Foo Bar"
-    /// would have produced the divergent ``Foo_Bar_Diagrams`` rather
-    /// than the canonical ``FooBar_Diagrams``.
-    #[tokio::test]
-    async fn config_diagrams_access_list_handles_non_alnum_grantor_name() {
-        let (base, h) = spawn_config_api_hub().await;
-        // Grantor display name has a SPACE — the canary for the cr-b2 bug.
-        seed_project_with_distinct_name(&h, "p-spaced", "Foo Bar", "p-spaced");
-        seed_project_with_distinct_name(&h, "p-grantee", "Grantee", "p-grantee");
-        h.0.set_diagram_access("p-spaced", "p-grantee", "read")
-            .unwrap();
-
-        let resp = reqwest::get(format!("{}/projects/p-grantee/config", base))
-            .await
-            .expect("hub reachable");
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.expect("json body");
-        let dg_list: Vec<String> = body
-            .get("diagrams_access_list")
-            .and_then(|v| v.as_array())
-            .expect("diagrams_access_list present")
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-
-        // Post-cr-b2: must be the canonical PascalCase-concat form.
-        // Pre-cr-b2 would have produced "Foo_Bar_Diagrams" (underscore).
-        assert!(
-            dg_list.contains(&"FooBar_Diagrams".to_string()),
-            "expected canonical FooBar_Diagrams (cr-b2 canonical), got: {:?}. \
-             If this fails with 'Foo_Bar_Diagrams', sanitize_diagrams_class_prefix \
-             reverted to the pre-cr-b2 underscore-replace algorithm.",
-            dg_list,
-        );
-    }
+    /// (v0.2.102: the route-level diagrams_access_list tests that used to
+    /// pin this sanitiser end-to-end were removed with the field; the
+    /// unit pins below stay — the naming rule keeps recognising existing
+    /// user `_Diagrams` collections.)
 
     #[tokio::test]
     async fn config_emits_active_embedding_from_module_settings() {

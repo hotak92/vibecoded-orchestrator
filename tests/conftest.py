@@ -549,7 +549,6 @@ _SCRATCH_PROJECT_DIR = _VCO_TEST_STATE / "scratch_project"
 _AMBIENT_CLAUDE_PROJECT_DIR = os.environ.get("CLAUDE_PROJECT_DIR")
 _CLAUDE_PROJECT_DIR_OPT_OUT_FILES: frozenset = frozenset({
     "test_project_resolution.py",
-    "test_post_file_edit_diagrams_branch.py",
     "test_pre_edit_hook_dedup_regression.py",
     "test_v0291_perf_quickwins.py",
 })

@@ -24,13 +24,15 @@ from vco_lib import bundled_versions  # noqa: E402
 
 class LoadBundledVersionsTests(unittest.TestCase):
     def test_real_manifest_loads_with_expected_npm_keys(self) -> None:
-        """The on-disk `bundled_mcp_versions.toml` parses cleanly and
-        exposes the four pinned npm keys named in the Phase-0 plan."""
+        """The on-disk `bundled_mcp_versions.toml` parses cleanly.
+        v0.2.102: the four diagram npm pins were REMOVED with the
+        diagrams integrations — the npm table is legitimately empty now;
+        only [chromium] pins anything."""
         versions = bundled_versions.load_bundled_versions()
         npm = versions.get("npm", {})
-        expected_keys = {"mermaid_mcp", "excalidraw_mcp",
-                         "mermaid_lib", "excalidraw_lib"}
+        expected_keys: set[str] = set()
         self.assertEqual(set(npm.keys()), expected_keys)
+        self.assertIn("chromium", versions)
 
     def test_each_npm_entry_has_required_fields(self) -> None:
         versions = bundled_versions.load_bundled_versions()

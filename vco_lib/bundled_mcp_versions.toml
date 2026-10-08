@@ -1,5 +1,7 @@
-# Single source of truth for all pinned external dependencies (Phase 0
-# of the diagrams-integration plan, 2026-05-24).
+# Single source of truth for all pinned external dependencies (introduced
+# by the 2026-05-24 diagrams plan; the diagram pins were removed in
+# v0.2.102 — only [chromium] remains, so the [npm.*] set is currently
+# empty and the schema below is kept for the next pin).
 #
 # Bumping any version here is a deliberate act that ships in a VCO
 # release. Never auto-resolved; never floating.
@@ -19,7 +21,7 @@
 # Schema
 # ------
 # Each [npm.<key>] table has:
-#   package : str — the npm package name (e.g. "claude-mermaid").
+#   package : str — the npm package name.
 #   version : str — exact semver, NO leading "^" or "~". Resolver is
 #                   disabled at install time so the installed version
 #                   must equal this string byte-for-byte.
@@ -39,55 +41,11 @@
 # editions of the manifest along — same fail-safe pattern the allowlist
 # file uses.
 
-[npm.mermaid_mcp]
-package = "claude-mermaid"
-version = "1.6.3"
-shasum  = "a5f1050ef7af6dc2595f5507366006489fef2879"
-
-[npm.excalidraw_mcp]
-# Phase 2 (2026-05-25): Resolved via plan §8.3 path (b/c hybrid).
-# The plan-named fork `@sanjibdevnathlabs/mcp-excalidraw-local` is not
-# on npm, so we adopted upstream `excalidraw-mcp-server@2.0.0` (by
-# debu-sinha) — MIT-licensed, actively maintained, bundles
-# `@excalidraw/excalidraw@0.18.0` matching our [npm.excalidraw_lib] pin
-# below — and vendored it in-tree at
-# `vco_lib/excalidraw_mcp_fork/`.
-#
-# (v0.2.34: vendored tree moved from `claude_mcp_servers/` to
-# `vco_lib/` so it ships in the Python wheel — see
-# `vco_lib/bundled_versions.py` docstring for the wheel-packaging
-# rationale.)
-#
-# See `vco_lib/excalidraw_mcp_fork/VENDORED.md` for the full
-# audit trail (upstream URL, commit/version, modifications, update
-# policy).
-#
-# `package` is a `file:` URL so install.py routes to the local-path
-# branch of `_install_pinned_npm` (`npm install -g <local-dir>` rather
-# than `<pkg>@<version>` registry fetch). `version` carries the source
-# version string + vendor date so audit logs + the launcher GUI can
-# show provenance; `shasum` is empty because integrity is verified by
-# the on-disk tree (git tracks the vendored files), not by npm's
-# tarball integrity field.
-#
-# (v0.2.54 Track I, P0-3: the vendored tree now ships an esbuild
-# self-contained bundle at `dist/mcp/index.bundled.js` — the runtime
-# entry — plus a committed `npm-shrinkwrap.json` pinning the full
-# dependency tree for the legacy `npm install -g` path. Regeneration
-# recipe + rationale: VENDORED.md "Bundling recipe".)
-package = "file:vco_lib/excalidraw_mcp_fork"
-version = "git+vendored-2.0.0-2026-05-25"
-shasum  = ""
-
-[npm.mermaid_lib]
-package = "mermaid"
-version = "11.15.0"
-shasum  = "b485c13ea5e1e74f3328c4bb00427bda87fa1c1e"
-
-[npm.excalidraw_lib]
-package = "@excalidraw/excalidraw"
-version = "0.18.1"
-shasum  = "fd6ad752807c814698c5f51dab778845b7e4bba7"
+# v0.2.102 (owner ruling 2026-10-07): the four diagram pins
+# ([npm.mermaid_mcp], [npm.excalidraw_mcp], [npm.mermaid_lib],
+# [npm.excalidraw_lib]) were REMOVED with the diagrams integrations —
+# the wrappers, the vendored excalidraw fork and the install pre-pins
+# they served are all gone. Only the [chromium] reuse pin remains.
 
 [chromium]
 # Mermaid PNG export + Excalidraw PNG export both lazy-load a Chromium

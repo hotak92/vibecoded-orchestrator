@@ -782,7 +782,7 @@ def _settle_user_section_review(folder: Path, template_hash: str, top: str,
 # ---------------------------------------------------------------------------
 # CLAUDE.md re-render entrypoint (Phase 1.5.B)
 #
-# Wired into the DiagramsTab toggle (Phase 1.3 — sibling): when the user
+# Wired into the per-module toggles (Phase 1.3 — sibling): when the user
 # flips a module toggle, the launcher's Tauri command
 # ``set_project_module_enabled`` calls this CLI via subprocess (Option A
 # pattern from Phase 0.B's config_projection — Rust shells out to Python
@@ -813,8 +813,7 @@ def render_claude_md(
 
     Used by the launcher's ``set_project_module_enabled`` Tauri command
     (via the ``re-render-claude-md`` CLI subcommand) when the user
-    toggles a module on/off in DiagramsTab or any future per-module
-    settings UI.
+    toggles a module on/off in a per-module settings UI.
 
     Idempotent on the managed body: feeding the same active-modules set
     in twice produces byte-identical output.

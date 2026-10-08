@@ -1359,7 +1359,8 @@ def _bootstrap_compute_missing_prereqs(system_block: dict) -> list[dict]:
                 ),
             })
 
-    # Node/npm — required for Claude Code MCP layer + diagram MCP.
+    # Node/npm — required for the Claude Code MCP layer (npx-spawned
+    # playwright MCP).
     if not system_block["node"]["ok"]:
         out.append({
             "name": "node",
@@ -5393,12 +5394,14 @@ def main() -> int:
                              "package whose version drifted from "
                              "bundled_mcp_versions.toml back to the pinned "
                              "version. Without this flag, drift is detected and "
-                             "reported via UPDATE_DEFERRED.md (Phase 0 of "
-                             "the diagrams-integration plan, 2026-05-24) but "
-                             "the user's installed version is left untouched. "
-                             "Use this when you intentionally want VCO to "
-                             "overwrite an out-of-band `npm install -g` your "
-                             "shell history shows you ran.")
+                             "reported via UPDATE_DEFERRED.md but the user's "
+                             "installed version is left untouched. (v0.2.102: "
+                             "the [npm.*] pin set is currently EMPTY — the "
+                             "diagram wrappers were the last pins — so today "
+                             "this flag matches nothing; it stays for the next "
+                             "npm pin.) Use this when you intentionally want "
+                             "VCO to overwrite an out-of-band `npm install -g` "
+                             "your shell history shows you ran.")
     parser.add_argument("--rewrite-stale-mcps", action="store_true", default=False,
                         help="On --update, prompt for consent to rewrite any "
                              "~/.claude.json mcpServers entries whose paths point "
@@ -6325,32 +6328,11 @@ def main() -> int:
     _install_playwright_browsers()
     _install_codegraph_treesitter(venv_python)  # Part 5: optional TS grammars
 
-    # Phase 1.2 (diagrams plan): pre-pin the `claude-mermaid` npm
-    # package at the version declared in `bundled_mcp_versions.toml`
-    # so the first Mermaid invocation doesn't pay the cold-install
-    # cost. Default-disabled per project (see BUNDLED_MCP_DEFAULT_
-    # DISABLED in vct-launcher-core); pre-installing here means
-    # opt-in is one click in the launcher, not a 30 s wait.
-    # Opt-out: VCT_SKIP_MERMAID=1.
-    # Non-fatal: returns False on skip / npm missing / pin mismatch; the
-    # VCO-owned wrapper then spawns upstream via `npx_resolver.
-    # package_run_argv` (npx ladder → `npm exec`), or exits 1 if neither.
-    _install_pinned_npm("mermaid_mcp", skip_env_var="VCT_SKIP_MERMAID")
-
-    # Phase 2 (diagrams plan): pre-pin the vendored Excalidraw MCP
-    # (see `bundled_mcp_versions.toml::[npm.excalidraw_mcp]`). The pin
-    # is a `file:` URL pointing at
-    # `vco_lib/excalidraw_mcp_fork/` (moved from
-    # `claude_mcp_servers/excalidraw_mcp_fork/` in v0.2.34 so the
-    # vendored tree ships in the Python wheel); the install branch in
-    # `_install_pinned_npm` calls `npm install -g <vendor-dir>` rather
-    # than fetching from the registry. Default-disabled per project
-    # (same posture as Mermaid). Opt-out: VCT_SKIP_EXCALIDRAW=1.
-    # Non-fatal: returns False on skip / npm missing / vendor missing;
-    # the wrapper still works at runtime via `node <vendor-entry>`
-    # because the wrapper spawns Node directly on the vendored path,
-    # bypassing the global install entirely if it didn't land.
-    _install_pinned_npm("excalidraw_mcp", skip_env_var="VCT_SKIP_EXCALIDRAW")
+    # v0.2.102: the mermaid / excalidraw diagram-MCP pre-pins were removed
+    # with the diagrams integrations (owner ruling 2026-10-07) — the wrapper
+    # modules, the vendored excalidraw fork and the `bundled_mcp_versions.toml`
+    # pins they consumed were all deleted. `_install_pinned_npm` itself stays
+    # (generic machinery, used by the playwright browser pre-cache above).
 
     # Step 11: Initial code graph analysis (if repo has code)
     # Skipped on first install — user runs manually after setup
@@ -12164,11 +12146,6 @@ _development_class_definition = _project_init._development_class_definition
 _SAFE_CLASS_RE = _project_init._SAFE_CLASS_RE
 _derive_project_kg_name = _project_init._derive_project_kg_name
 _derive_project_dev_name = _project_init._derive_project_dev_name
-# fix/a1-indexing-pipeline (2026-05-25) — path-based Diagrams name
-# derivation, matching the KG / Dev helper shape so _ensure_collections
-# can include the diagrams class in its bootstrap pass.
-_derive_project_diagrams_name = _project_init._derive_project_diagrams_name
-_diagrams_class_definition = _project_init._diagrams_class_definition
 
 
 def _derive_orchestrator_project_name() -> str:
@@ -12584,14 +12561,9 @@ def _ensure_collections(embed_config: dict,
     else:
         dev_name = _derive_project_dev_name(PROJECT_ROOT)
 
-    # Per-project Diagrams collection (Phase 1.5 — fix/a1-indexing-
-    # pipeline 2026-05-25). Resolution mirrors KG / Dev: env var
-    # overrides, else path-based derivation.
-    env_diagrams = os.environ.get("DIAGRAMS_COLLECTION")
-    if env_diagrams:
-        diagrams_name = env_diagrams
-    else:
-        diagrams_name = _derive_project_diagrams_name(PROJECT_ROOT)
+    # v0.2.102: the per-project Diagrams collection resolution was removed
+    # with the diagrams integrations — the install no longer creates or
+    # projects `<Project>_Diagrams`. Existing collections stay untouched.
 
     # Cross-project shared KG. All vibecoded installs read from the same shared
     # collection name (default "VibeCodedOrchestrator_KnowledgeGraph" since
@@ -12684,7 +12656,6 @@ def _ensure_collections(embed_config: dict,
 
     kg_name = _resolve_existing_casing(kg_name)
     dev_name = _resolve_existing_casing(dev_name)
-    diagrams_name = _resolve_existing_casing(diagrams_name)
     if shared_name:
         shared_name = _resolve_existing_casing(shared_name)
 
@@ -12701,7 +12672,6 @@ def _ensure_collections(embed_config: dict,
     # casing so .env writes and binding rows match what Weaviate actually has.
     os.environ["KG_COLLECTION"] = kg_name
     os.environ["DEVELOPMENT_COLLECTION"] = dev_name
-    os.environ["DIAGRAMS_COLLECTION"] = diagrams_name
     if shared_name:
         os.environ["SHARED_KG_COLLECTION"] = shared_name
 
@@ -12713,11 +12683,6 @@ def _ensure_collections(embed_config: dict,
     required: list[tuple[str, "Callable[..., dict]"]] = [
         (kg_name, _kg_class_definition),
         (dev_name, _development_class_definition),
-        # fix/a1-indexing-pipeline (2026-05-25): include the Diagrams
-        # class in the self-install bootstrap so the orchestrator clone
-        # has somewhere to write when the user starts saving .mmd /
-        # .excalidraw files. Symmetric with project_init.bootstrap_collections.
-        (diagrams_name, _diagrams_class_definition),
     ]
     # Shared cross-project KG. Same schema as the per-project KG (the MCP
     # server reads them with the same shape). Created once per Weaviate
@@ -12864,79 +12829,11 @@ def _ensure_collections(embed_config: dict,
                   "failed": [{"name": n, "error": e[:200]} for n, e in failed]},
         )
 
-    # V0243-18: warn when the Diagrams collection was just created (or
-    # already existed) but no .mmd / .excalidraw sources are present in
-    # the project. Users won't get useful results from describe_excalidraw
-    # or diagram-search skills until diagrams exist on disk.
-    _warn_if_diagrams_empty(diagrams_name, weaviate_url)
-
-
-def _warn_if_diagrams_empty(diagrams_name: str, weaviate_url: str) -> None:
-    """V0243-18 — Emit an install-log warning when the Diagrams collection
-    has been bootstrapped but contains 0 rows and no .mmd / .excalidraw
-    source files exist under ``.claude/diagrams/``.
-
-    Skills like ``describe_excalidraw`` and diagram-search will return
-    nothing until diagrams are created. The warning surfaces this so the
-    user understands why the feature appears "empty" on a fresh install.
-
-    Soft-fail throughout: transport errors, missing collection, or a
-    Weaviate count-query failure are all treated as "unknown" and the
-    warning is suppressed (we don't want false positives).
-
-    Idempotent: emits only a log line (no deferral entry — this is
-    informational, not actionable in the same way as a schema drift).
-    """
-    if not diagrams_name:
-        return
-
-    # Count .mmd + .excalidraw files under .claude/diagrams/.
-    diagrams_dir = PROJECT_ROOT / ".claude" / "diagrams"
-    source_count = 0
-    if diagrams_dir.is_dir():
-        for ext in ("*.mmd", "*.excalidraw"):
-            source_count += len(list(diagrams_dir.rglob(ext)))
-
-    if source_count > 0:
-        # Sources exist — collection will be populated; no warning needed.
-        _log_install_event(
-            "7b/10", "info",
-            f"diagrams_empty_check: {source_count} source file(s) found under "
-            f".claude/diagrams/ — no empty-collection warning",
-            data={"diagrams_collection": diagrams_name,
-                  "source_count": source_count},
-        )
-        return
-
-    # No sources. Try to get the Weaviate object count to distinguish
-    # "just created / genuinely empty" from "creation failed" (failed →
-    # count unknown → skip warning).
-    from vco_lib.project_init import _http_count_objects
-    count = _http_count_objects(diagrams_name, weaviate_url=weaviate_url)
-
-    if count is None:
-        # Unknown — Weaviate unreachable or collection absent; skip.
-        return
-
-    if count > 0:
-        # Has objects but no on-disk sources (e.g. reinstall after manual
-        # diagram creation). Not a problem — no warning.
-        return
-
-    # count == 0 AND no on-disk sources → user hasn't created diagrams yet.
-    print(
-        f"  WARN [7b/10] Diagrams collection `{diagrams_name}` is empty: "
-        f"no .mmd / .excalidraw sources found under .claude/diagrams/. "
-        f"Skills like describe_excalidraw will return nothing until you "
-        f"save diagrams there (via the mermaid or excalidraw MCP tools)."
-    )
-    _log_install_event(
-        "7b/10", "warn",
-        "Diagrams collection empty: no .mmd sources found",
-        data={"diagrams_collection": diagrams_name,
-              "source_count": 0,
-              "weaviate_count": 0},
-    )
+    # v0.2.102: the Diagrams collection bootstrap + empty-collection warning
+    # were removed with the diagrams integrations (owner ruling 2026-10-07).
+    # Existing `<Project>_Diagrams` collections on user machines are D-data —
+    # never dropped, still recognised by the migration/naming paths — but the
+    # install no longer creates or projects them.
 
 
 # ---------------------------------------------------------------------------
@@ -19533,8 +19430,9 @@ def _auto_scrub_removed_mcp_entries(
     Owner ruling (PLAN-V0300 item 15): ``search`` was DELETED, so its
     now-orphaned registration is removed automatically — no consent prompt —
     because the module it pointed at no longer exists (a leftover entry
-    guarantees a failing MCP subprocess every session). ``mermaid`` /
-    ``excalidraw`` are NOT auto-scrubbed (owner: users keep those). Idempotent
+    guarantees a failing MCP subprocess every session). v0.2.102 (owner
+    ruling 2026-10-07) adds ``mermaid`` / ``excalidraw`` to the auto-scrub
+    set: both diagram wrapper modules were deleted outright. Idempotent
     and soft-fail: no entry → no write, no print.
 
     Returns the removed names.
@@ -21234,7 +21132,8 @@ def _check_claude_cli() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bundled-versions pinning (Phase 0, diagrams-integration plan 2026-05-24)
+# Bundled-versions pinning (introduced by the 2026-05-24 diagrams plan;
+# the diagrams pins themselves were removed in v0.2.102 with the modules)
 # ---------------------------------------------------------------------------
 #
 # All external npm packages that ship-as-default with VCO are pinned to

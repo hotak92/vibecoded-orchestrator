@@ -4,39 +4,6 @@ The orchestrator (this repo) is licensed **AGPL-3.0-or-later** (see `LICENSE`). 
 
 For the launcher binary's compiled-in Rust crates, see `launcher/dist/THIRD_PARTY_LICENSES.txt` (regenerated at release time via `cargo about generate`). This file covers the npm packages and Python packages that the orchestrator's MCP servers + launcher webview bundle.
 
-## Diagrams stack (Phase 1 + Phase 2 of the diagrams-integration plan, 2026-05-24/25)
-
-### Mermaid MCP — `claude-mermaid@1.6.3`
-
-- **License:** MIT
-- **Pin:** `bundled_mcp_versions.toml::[npm.mermaid_mcp]`
-- **Install path:** `npm install -g claude-mermaid@1.6.3` via `install.py::_install_pinned_npm`
-- **Wrapped by:** `claude_mcp_servers/wrappers/mermaid_proxy.py`
-- **Upstream:** <https://github.com/claude-mermaid-mcp/claude-mermaid>
-
-### Mermaid library (embedded in launcher) — `mermaid@11.15.0`
-
-- **License:** MIT
-- **Pin:** `bundled_mcp_versions.toml::[npm.mermaid_lib]` (mirror in `launcher/package.json`)
-- **Used by:** `launcher/src/lib/project-state/DiagramsTab.svelte` for the embedded preview
-- **Upstream:** <https://github.com/mermaid-js/mermaid>
-
-### Excalidraw MCP — `excalidraw-mcp-server@2.0.0` (vendored in-tree)
-
-- **License:** MIT, Copyright (c) 2025 Debu Sinha (`vco_lib/excalidraw_mcp_fork/LICENSE`)
-- **Pin:** `bundled_mcp_versions.toml::[npm.excalidraw_mcp]` (`file:vco_lib/excalidraw_mcp_fork`)
-- **Vendor audit:** `vco_lib/excalidraw_mcp_fork/VENDORED.md`
-- **Wrapped by:** `claude_mcp_servers/wrappers/excalidraw_proxy.py`
-- **Upstream:** <https://github.com/debu-sinha/excalidraw-mcp-server>
-
-### Excalidraw library (self-hosted browser editor) — `@excalidraw/excalidraw@0.18.1`
-
-- **License:** MIT
-- **Pin:** `bundled_mcp_versions.toml::[npm.excalidraw_lib]` (mirror in `launcher/package.json`)
-- **Used by:** the self-hosted Excalidraw editor at `launcher/vendor/diagrams-editor/excalidraw/` — esbuild-bundled into `excalidraw.bundle.js` (built by `src/build.mjs`) + served in the user's default browser by the diagrams local server. (v0.2.61: replaced the old embedded `ExcalidrawEditor.svelte`, which is removed.) See `launcher/vendor/diagrams-editor/excalidraw/LICENSE-excalidraw` + `VENDORED.md`.
-- **Peer dependencies bundled into the editor:** `react@^18.3.1`, `react-dom@^18.3.1` (both MIT, Copyright Meta Platforms, Inc.)
-- **Upstream:** <https://github.com/excalidraw/excalidraw>
-
 ## Other MCP servers
 
 ### Playwright MCP — `@playwright/mcp` (lazy-installed)
@@ -69,6 +36,6 @@ For the launcher binary's compiled-in Rust crates, see `launcher/dist/THIRD_PART
 
 ## License compatibility note
 
-The orchestrator is AGPL-3.0; all bundled third-party software is under permissive (MIT, Apache 2.0, BSD) or LGPL licenses. AGPL is compatible with redistribution of MIT/Apache/BSD-licensed dependencies under their own license terms. Vendored copies (such as `vco_lib/excalidraw_mcp_fork/`) retain their original LICENSE files verbatim; modifying any of those vendor directories triggers the vendoring discipline in their respective `VENDORED.md` files.
+The orchestrator is AGPL-3.0; all bundled third-party software is under permissive (MIT, Apache 2.0, BSD) or LGPL licenses. AGPL is compatible with redistribution of MIT/Apache/BSD-licensed dependencies under their own license terms. Vendored copies retain their original LICENSE files verbatim; modifying any vendor directory triggers the vendoring discipline in its `VENDORED.md` file. (The mermaid/excalidraw diagrams stack this file documented through v0.2.101 was removed in v0.2.102; removing the code removes the attribution obligation.)
 
 If you're packaging vibecoded-orchestrator for redistribution, this file plus the per-dependency LICENSE files inside each vendor directory satisfies the MIT/Apache attribution requirements. The AGPL terms apply to the orchestrator code itself.

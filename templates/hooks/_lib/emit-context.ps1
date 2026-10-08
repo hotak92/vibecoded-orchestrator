@@ -139,7 +139,7 @@ function Get-VcoHookLibRole {
     $base = $base -replace '\.(sh|ps1)$', ''
     switch ($base) {
         "route-touched-path" {
-            return "routing a touched path to kg-sync (knowledge/), the development collection (docs/), the diagram indexer and the code-graph queue, so every Edit, Write and CLI write is being parsed and then dropped"
+            return "routing a touched path to kg-sync (knowledge/), the development collection (docs/) and the code-graph queue, so every Edit, Write and CLI write is being parsed and then dropped"
         }
         "bash-write-targets" {
             return "recovering the paths a shell command wrote, so no CLI write is even looked at -- a redirect, a heredoc, sed -i or patch into knowledge/ or docs/ now reaches Weaviate never"

@@ -39,7 +39,18 @@ from tests.common.shipped_programs import (
 #:   for the releases in which the Rust binary was called ``vco``.
 #: - ``cli_verbs.json``: the table itself.
 EXEMPT_PREFIXES = ("tests/",)
-EXEMPT_FILES = {"CHANGELOG.md", "launcher/tools/vct-cli/cli_verbs.json"}
+EXEMPT_FILES = {
+    "CHANGELOG.md",
+    # The legacy CLAUDE.md archive is a byte-pinned historical record of
+    # RELEASED templates (`git show <tag>`-verified by
+    # tests/test_v02100_legacy_claude_md.py) — its bodies name verbs that
+    # existed when each version shipped (e.g. `rebuild-diagram-index`,
+    # removed in v0.2.102) and must never be edited to track the current
+    # verb tree. Its integrity is pinned by the hash tests, not by verb
+    # currency.
+    "vco_lib/legacy_templates/claude_md.toml",
+    "launcher/tools/vct-cli/cli_verbs.json",
+}
 
 TEXT_SUFFIXES = {
     "", ".md", ".py", ".rs", ".sh", ".ps1", ".psm1", ".ts", ".js", ".svelte",

@@ -54,8 +54,8 @@ import hashlib
 import json
 import sys
 
-# The RETRIEVAL tools only. store_knowledge_node / query_code_structure /
-# describe_excalidraw return no retrieved content to suppress.
+# The RETRIEVAL tools only. store_knowledge_node / query_code_structure
+# return no retrieved content to suppress.
 KG_TOOLS = ("hybrid_search", "semantic_graph_search")
 CODE_TOOLS = ("search_code_graph",)
 

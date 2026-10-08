@@ -71,7 +71,7 @@ $PsExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { '
 #
 # WHY Start-Process AND NOT Start-Job: a job's child is torn down when the
 # host process exits. Hooks exit immediately; the work they detach (a KG sync,
-# a whole-collection duplicate scan, a diagram index + snapshot) takes
+# a whole-collection duplicate scan) takes
 # seconds. Start-Process spawns an independent OS process that survives, which
 # is what the POSIX siblings get from `( ... ) &` / setsid. Same reasoning as
 # `_lib/kg-sync-debounce.ps1`'s flusher.

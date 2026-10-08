@@ -119,6 +119,31 @@ def test_canonical_prefix_rejects_invalid(bad: str):
         canonical_class_prefix(bad)
 
 
+# ────────────── never-raising wrapper (moved from codegraph_to_mermaid,
+# deleted v0.2.102; imported by project_identity / codegraph_prefix_record /
+# codegraph_resync / project_init / the generate-code-summary template) ──────
+
+
+def test_never_raising_wrapper_matches_ssot_in_domain():
+    from vco_lib.codegraph_naming import sanitize_collection_prefix
+    for name in ("Camel_Case", "VibeCoded Orchestrator", "Foo-Bar", "abc"):
+        assert sanitize_collection_prefix(name) == canonical_class_prefix(name)
+
+
+def test_never_raising_wrapper_falls_back_never_raises():
+    from vco_lib.codegraph_naming import sanitize_collection_prefix
+    # Inputs the SSOT REJECTS (empty / leading digit) raise there but return
+    # the legacy-regex result here — the contract the drift/prune fallbacks
+    # rely on.
+    assert sanitize_collection_prefix("") == ""
+    assert sanitize_collection_prefix("123abc") == "123abc"
+    with pytest.raises(ValueError):
+        canonical_class_prefix("123abc")
+    # Everything the SSOT accepts passes through byte-identically.
+    assert sanitize_collection_prefix("foo bar!") == canonical_class_prefix("foo bar!")
+    assert sanitize_collection_prefix("camel_case") == "Camel_case"
+
+
 # ─────────────────────── CLI round-trip (the Rust-facing surface) ────────────
 
 

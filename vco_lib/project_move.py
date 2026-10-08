@@ -1795,12 +1795,13 @@ def _codegraph_wrapper(folder: Path) -> str:
     """The code-graph analyzer command for ``folder``, as a real path.
 
     No CLI verb analyzes a code graph — the Python `vco` CLI ships
-    ``verify-pins``, ``verify-env-projection``, ``verify-diagrams``,
-    ``rebuild-diagram-index``, ``codegraph-diagram``, ``doctor``,
-    ``project`` and ``fix-transcript``, and the launcher's `vct-cli`
-    ``codegraph`` only lists and searches. The analyzer ships as the BUNDLED
-    wrapper in the project's own ``.claude/scripts/``, so that is what the
-    remediation names.
+    ``verify-pins``, ``verify-env-projection``, ``doctor``, ``project``
+    and ``fix-transcript`` (the diagram verbs ``verify-diagrams``,
+    ``rebuild-diagram-index`` and ``codegraph-diagram`` were removed in
+    v0.2.102 with the diagrams integrations), and the launcher's
+    `vct-cli` ``codegraph`` only lists and searches. The analyzer ships
+    as the BUNDLED wrapper in the project's own ``.claude/scripts/``,
+    so that is what the remediation names.
 
     A printed command is shipped code. An earlier draft of this module
     emitted a `vco` "codegraph analyze <path>" command, which parses as an

@@ -172,8 +172,8 @@ def recorded_is_basename_derivation(folder: Path, recorded: str) -> bool:
     treated as poison.
 
     Uses the SHARED code-prefix sanitizer
-    (``codegraph_to_mermaid._sanitize_collection_prefix``, the never-raising
-    wrapper over ``project_naming.canonical_class_prefix``) — the same one
+    (``codegraph_naming.sanitize_collection_prefix``, the never-raising
+    wrapper over ``canonical_class_prefix``) — the same one
     ``project_init.derive_project_code_prefix`` delegates to. Imported here
     directly rather than through ``project_init`` because that module imports
     THIS one.
@@ -182,10 +182,10 @@ def recorded_is_basename_derivation(folder: Path, recorded: str) -> bool:
         basename = Path(folder).name or ""
         if not basename:
             return False
-        from vco_lib.codegraph_to_mermaid import _sanitize_collection_prefix
+        from vco_lib.codegraph_naming import sanitize_collection_prefix
         from vco_lib.project_identity import normalise_for_match
 
-        basename_derived = _sanitize_collection_prefix(basename) or ""
+        basename_derived = sanitize_collection_prefix(basename) or ""
     except Exception:  # noqa: BLE001 — never raise into a drift decision
         return False
     if not basename_derived:

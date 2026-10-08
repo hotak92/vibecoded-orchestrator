@@ -5,7 +5,7 @@
 Every tool's schema is ALWAYS in a session's context while the MCP server is
 connected, so its ``description`` (the function docstring, which FastMCP
 serialises into ``tools/list``) is a permanent token cost paid by every chat
-and every subagent. The six tools once carried 13 255 chars of descriptions;
+and every subagent. The tools once carried 13 255 chars of descriptions across six;
 v0.2.101 trims them to what a caller needs and pins the result with a hard
 ceiling so it cannot silently regrow.
 
@@ -33,21 +33,21 @@ TIER_DOC = (
     / "score-driven-retrieval-tiers.md"
 )
 
-# The six user-facing tools whose docstrings become MCP tool descriptions.
+# The five user-facing tools whose docstrings become MCP tool descriptions.
+# (v0.2.102: describe_excalidraw was removed with the diagrams integrations;
+# the budget is unchanged — the retired tool's ~500 chars are simply freed.)
 TOOL_NAMES = (
     "hybrid_search",
     "search_code_graph",
     "store_knowledge_node",
     "semantic_graph_search",
     "query_code_structure",
-    "describe_excalidraw",
 )
 
-# Hard ceiling on the SUM of the six descriptions. Was 13 255 before the trim;
-# the v0.2.101 texts measure 3 464 (the layer filter's accepted values in
-# search_code_graph are restored — a caller-facing contract — and four
-# docstrings were tightened to fit). 36 chars of headroom: a short wording
-# tweak fits, a re-pasted essay does not.
+# Hard ceiling on the SUM of the descriptions. Was 13 255 across six tools
+# before the v0.2.101 trim (which measured 3 464); v0.2.102 dropped
+# describe_excalidraw. 36 chars of headroom over the v0.2.101 measure: a
+# short wording tweak fits, a re-pasted essay does not.
 DESCRIPTION_BUDGET = 3500
 
 # The server ``instructions`` string is a second always-in-context cost.
@@ -91,7 +91,7 @@ class WeaviateToolDescriptionBudgetTests(unittest.TestCase):
         self.assertTrue(SERVER.is_file(), f"missing {SERVER}")
         self.descriptions = _tool_descriptions()
 
-    def test_all_six_tools_are_present(self) -> None:
+    def test_all_five_tools_are_present(self) -> None:
         self.assertEqual(set(self.descriptions), set(TOOL_NAMES))
 
     def test_total_description_chars_within_budget(self) -> None:

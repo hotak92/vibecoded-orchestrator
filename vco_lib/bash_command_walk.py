@@ -3,10 +3,11 @@
 """Shared chain-walker for Bash command strings (v0.2.95, lane F10).
 
 ONE home for "split a shell command into independently-walkable
-segments". Extracted from ``vco_lib/diagram_delete_parser`` when a
-SECOND consumer appeared (``vco_lib.bash_write_targets``, which needs
-the same chain / wrapper / env-prefix / ``bash -c`` handling to find
-WRITE targets rather than DELETE targets).
+segments". Extracted from the diagram-delete parser (a module v0.2.102
+removed with the diagrams runtime) when a SECOND consumer appeared
+(``vco_lib.bash_write_targets``, which needs the same chain / wrapper /
+env-prefix / ``bash -c`` handling to find WRITE targets rather than
+DELETE targets).
 
 Per the project's A>B>C rule the two consumers now share this
 implementation instead of mirroring it: a fix to the chain splitter or

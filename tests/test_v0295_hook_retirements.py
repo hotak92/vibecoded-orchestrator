@@ -316,12 +316,14 @@ class MergeRemovalTests(unittest.TestCase):
 # is retired is the individual async REGISTRATIONS (each one cost a process
 # spawn per tool call and wrote a ~660 B async_hook_response transcript
 # record whenever it spoke or died).
+# v0.2.102: post-file-delete left this set — the script was deleted with
+# the diagrams integrations and now carries its own v0.2.102 retirement
+# rows (still async-only; still matched below through the same table).
 ASYNC_V02101_STEMS = (
     "post-edit-outcome",
     "post-bash-context-record",
     "kg-summary-generator",
     "post-git-commit-kg-sync",
-    "post-file-delete",
     "kg-update-nudge",
 )
 
@@ -454,12 +456,25 @@ class AsyncDispatcherRetirementTests(unittest.TestCase):
         self.assertIn(_anchored_sh("user-prompt-submit-reminder"),
                       _cmds(merged, "UserPromptSubmit"))
         self.assertIn(_anchored_sh("kg-update-nudge"), _cmds(merged, "SessionStart"))
-        # One removal record per retired registration, naming the dispatcher.
+        # One removal record per retired registration. v0.2.102: the
+        # post-file-delete registration now retires through its OWN
+        # v0.2.102 row (the script was deleted with the diagrams
+        # integrations — no dispatcher replacement, the capability is gone);
+        # the other three name the dispatcher as before.
         self.assertEqual(len(removed), 4)
         for r in removed:
             self.assertEqual(r["event"], "PostToolUse")
-            self.assertEqual(r["retirement"].retired_in, "v0.2.101")
-            self.assertIn("post-tool-use-async", r["retirement"].audit_replacement)
+            if "post-file-delete" in r["command"]:
+                self.assertEqual(r["retirement"].retired_in, "v0.2.102")
+                self.assertEqual(
+                    r["retirement"].audit_replacement,
+                    "nothing (the capability was removed)",
+                )
+            else:
+                self.assertEqual(r["retirement"].retired_in, "v0.2.101")
+                self.assertIn(
+                    "post-tool-use-async", r["retirement"].audit_replacement
+                )
         # Idempotent: a second pass removes nothing and changes nothing.
         removed2: list = []
         twice = project_init._merge_hooks_for_bundle(

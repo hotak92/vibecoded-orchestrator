@@ -17,12 +17,12 @@ The orchestrator ships MCP (Model Context Protocol) servers that extend Claude C
 
 | Server | Purpose | Key Tools |
 |---|---|---|
-| weaviate-kg | Semantic search + KG/code-graph management | hybrid_search, semantic_graph_search, search_code_graph, query_code_structure, store_knowledge_node, describe_excalidraw |
+| weaviate-kg | Semantic search + KG/code-graph management | hybrid_search, semantic_graph_search, search_code_graph, query_code_structure, store_knowledge_node |
 | code-embedding-service | GPU/CPU code-embedding HTTP service (port 11440) | `/embed`, `/health` (REST, not MCP) |
 
 A separately-invoked **playwright** MCP (browser automation) is enabled by default and runs via `npx -y @playwright/mcp@latest`. The code-embedding FastAPI service on port 11440 is backend infrastructure for `weaviate-kg`, not an MCP exposed to Claude.
 
-v0.2.101 retired the default REGISTRATION of the diagram wrapper MCPs (`mermaid`, `excalidraw`) and deleted the `search` (paper-search) MCP outright. An install that already has a diagram entry keeps it; the Diagrams tab and `describe_excalidraw` read files on disk and never needed the MCPs. Per-project MCP enable/disable is written to `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code honours for user-scope servers.
+v0.2.101 retired the default REGISTRATION of the diagram wrapper MCPs (`mermaid`, `excalidraw`); v0.2.102 removed the diagrams integrations outright — both wrapper modules were deleted, a leftover VCO-shaped entry is auto-scrubbed on the next update, and the `describe_excalidraw` tool is gone with the fan-out. Existing `.mmd` / `.excalidraw` files and `_Diagrams` collections are untouched user data. Per-project MCP enable/disable is written to `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code honours for user-scope servers.
 
 ## Not exposed as MCP tools
 

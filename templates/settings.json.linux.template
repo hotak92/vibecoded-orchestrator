@@ -450,26 +450,6 @@
             "timeout": 10
           }
         ]
-      },
-      {
-        "matcher": "Write|Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-diagram-path-validation.sh\"",
-            "timeout": 3
-          }
-        ]
-      },
-      {
-        "matcher": "mcp__mermaid__.*|mcp__excalidraw__.*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-diagram-path-validation.sh\"",
-            "timeout": 3
-          }
-        ]
       }
     ],
     "ConfigChange": [

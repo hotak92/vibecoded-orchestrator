@@ -14,8 +14,9 @@
 //! `register_default_orchestrator_mcps` constructs the canonical bundled
 //! MCP entries (`weaviate-kg`, `playwright` — Ollama was dropped in v0.2.11,
 //! `search` was deleted and the diagram wrappers `mermaid`/`excalidraw`
-//! retired from default shipping in v0.2.101; `vct-coordination` is Pro-tier
-//! and intentionally omitted here) and writes them via `register_mcp` above.
+//! retired from default shipping in v0.2.101, then deleted outright in
+//! v0.2.102; `vct-coordination` is Pro-tier and intentionally omitted
+//! here) and writes them via `register_mcp` above.
 //! Same function is
 //! invoked both from the launcher's `install_orchestrator()` Tauri command
 //! AND from a thin CLI subcommand on the launcher binary
@@ -91,22 +92,10 @@ pub fn register_mcp(
 }
 
 /// The names of every MCP entry registered in a `~/.claude.json`-shaped
-/// file's `mcpServers` map (empty when the file or map is absent). One
-/// home for this read: the GUI's server list uses it to surface legacy
-/// wrapper entries (v0.2.101 — registered-but-uncataloged) for the
-/// per-project toggle.
-pub fn registered_mcp_names(claude_json: &Path) -> Result<Vec<String>, String> {
-    if !claude_json.exists() {
-        return Ok(Vec::new());
-    }
-    let root = crate::json_file::read_json_or_empty(claude_json)?;
-    let names = root
-        .get("mcpServers")
-        .and_then(|v| v.as_object())
-        .map(|obj| obj.keys().cloned().collect())
-        .unwrap_or_default();
-    Ok(names)
-}
+/// file's `mcpServers` map (empty when the file or map is absent).
+/// (v0.2.102: REMOVED — its only caller was the dashboard's legacy
+/// diagram-wrapper surface, deleted with the dropped diagrams
+/// integrations. Nothing else read it.)
 
 pub fn deregister_mcp(target: &Path, mcp_name: &str) -> Result<(), String> {
     if !target.exists() {
@@ -538,9 +527,10 @@ pub fn build_default_mcp_entries(
     // different command: `vco doctor` probes the ladder in
     // `vco_lib/npx_resolver.py` at the end of every install/update, defers
     // `npx_missing_mcp_unspawnable`, and the launcher's registration badge
-    // turns yellow with the same remediation. (The VCO-owned mermaid /
-    // excalidraw wrapper proxies CAN fall back to `npm exec` because they
-    // spawn the upstream package themselves; a registered entry cannot.)
+    // turns yellow with the same remediation. (Historical aside: the
+    // v0.2.102-deleted mermaid / excalidraw wrapper proxies could fall back
+    // to `npm exec` because they spawned the upstream package themselves; a
+    // registered entry cannot.)
     //
     // Pre-v0.2.73 this entry was MISSING from both builders (audit
     // finding F-1): the GUI catalog shipped `enabled: true`, so the
@@ -559,9 +549,11 @@ pub fn build_default_mcp_entries(
 
     // NOTE (v0.2.101): `search` (module deleted) and the diagram wrapper MCPs
     // `mermaid` / `excalidraw` (registration retired) no longer appear here.
-    // An install that already has those entries keeps them — they stay in
-    // `[bundled].all_names` / `uninstall_scrub_names` — but no default
-    // registration composes them.
+    // They stay in `[bundled].all_names` / `uninstall_scrub_names`, but no
+    // default registration composes them. v0.2.102: all three names carry
+    // `auto_scrub` in the deprecated registry, so a leftover VCO-shaped
+    // entry is REMOVED by the ordinary update (see the scrub below), not
+    // kept.
 
     vec![
         ("weaviate-kg".to_string(), weaviate_entry, weaviate_dropped),
@@ -746,8 +738,9 @@ pub fn register_default_orchestrator_mcps(
     // (PLAN-V0300 item 15): delete now + scrub, no consent prompt; the caller
     // prints one notice line. Only VCO-shaped entries are removed (path inside
     // install_root), so a user's own MCP that shares a name is left alone.
-    // `mermaid`/`excalidraw` are NOT marked auto_scrub (owner: users keep
-    // them). Idempotent — a second run finds nothing.
+    // v0.2.102: `mermaid`/`excalidraw` joined the auto_scrub set (diagrams
+    // dropped, owner ruling 2026-10-07) — same shape gate, same one notice.
+    // Idempotent — a second run finds nothing.
     report.removed_deprecated = scrub_auto_scrub_mcp_entries(&claude_json, install_root);
 
     Ok(report)
@@ -2185,10 +2178,14 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// LEAVE-ALONE: the diagram MCP entries (mermaid/excalidraw) are NOT
-    /// auto-scrubbed — owner ruling: an existing install keeps them.
+    /// ACT (v0.2.102, owner ruling 2026-10-07 — diagrams dropped): VCO-shaped
+    /// `mermaid`/`excalidraw` entries ARE auto-scrubbed like `search` — the
+    /// wrappers they spawn are deleted, so a leftover entry would fail to
+    /// spawn on every session. Red-proof: drop `auto_scrub` from the two
+    /// `[deprecated.*]` TOML rows → this fails (entries survive, nothing is
+    /// reported).
     #[test]
-    fn auto_scrub_leaves_diagram_mcp_entries_untouched() {
+    fn auto_scrub_removes_vco_shaped_diagram_mcp_entries() {
         let root = make_pseudo_install_root();
         let target = tmp_target();
         let py = pseudo_venv_python(&root).display().to_string();
@@ -2198,6 +2195,60 @@ mod tests {
                 "mcpServers": {
                     "mermaid": {"command": py, "args": ["-m", "claude_mcp_servers.wrappers.mermaid_proxy"]},
                     "excalidraw": {"command": py, "args": ["-m", "claude_mcp_servers.wrappers.excalidraw_proxy"]},
+                    "my-own-mermaid": {"command": "/usr/local/bin/my-mermaid"},
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report =
+            register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), None)
+                .unwrap();
+        assert_eq!(
+            report.removed_deprecated,
+            vec!["excalidraw".to_string(), "mermaid".to_string()],
+            "both VCO-shaped diagram entries must be scrubbed in the table's \
+             stable (BTreeMap) order: {:?}",
+            report.removed_deprecated
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(json["mcpServers"].get("mermaid").is_none(), "{}", json);
+        assert!(json["mcpServers"].get("excalidraw").is_none(), "{}", json);
+        // A DIFFERENT-name user MCP is never touched.
+        assert_eq!(
+            json["mcpServers"]["my-own-mermaid"]["command"],
+            "/usr/local/bin/my-mermaid"
+        );
+
+        // Idempotent: a second pass reports nothing.
+        let second =
+            register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), None)
+                .unwrap();
+        assert!(
+            second.removed_deprecated.is_empty(),
+            "second run must remove nothing: {:?}",
+            second.removed_deprecated
+        );
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// LEAVE-ALONE (v0.2.102): a user's OWN third-party MCP that merely SHARES
+    /// the retired names (command outside install_root — not VCO-shaped) is
+    /// never removed; the shape gate is what makes the scrub safe.
+    #[test]
+    fn auto_scrub_leaves_a_users_own_diagram_named_entries() {
+        let root = make_pseudo_install_root();
+        let target = tmp_target();
+        fs::write(
+            &target,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "mermaid": {"command": "/usr/local/bin/my-mermaid"},
+                    "excalidraw": {"command": "/opt/tools/excalidraw-mcp"},
                 }
             }))
             .unwrap(),

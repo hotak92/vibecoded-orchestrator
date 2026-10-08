@@ -164,8 +164,8 @@ _kg_debounce_window() {
 }
 
 # State dir for pending-sync locks. Lives under the project's
-# .claude/state/ (the canonical hook state dir — same one the diagram
-# throttle and gate-skipped sentinels use). $1 = PROJECT_ROOT.
+# .claude/state/ (the canonical hook state dir — same one the
+# gate-skipped sentinels and the former diagram throttle used). $1 = PROJECT_ROOT.
 _kg_debounce_dir() {
     printf '%s/.claude/state/kg_sync_pending' "$1"
 }
@@ -190,9 +190,9 @@ _KG_DEBOUNCE_REAP_THROTTLE_SECONDS=30
 # MUST MATCH _lib/kg-sync-debounce.ps1 ($KG_DEBOUNCE_LOCK_CEILING).
 _KG_DEBOUNCE_LOCK_CEILING=64
 
-# Hash a file path → a slash-free lock key. Reuses the portable
-# md5-via-Python pattern already used by the diagram throttle in
-# post-file-edit.sh. $1 = path, $2 = python interpreter ($PY).
+# Hash a file path → a slash-free lock key. Portable md5-via-Python
+# pattern (the same one the former diagram throttle in post-file-edit.sh
+# used). $1 = path, $2 = python interpreter ($PY).
 _kg_debounce_key() {
     printf '%s' "$1" \
         | "$2" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" \
@@ -581,8 +581,8 @@ _kg_debounce_reap_stale() {
     now=$(date +%s 2>/dev/null) || return 0
 
     # Reaper throttle: skip the O(M^2) sweep if we ran it within the last
-    # ~30s. Mirrors the diagram-throttle stamp-file pattern in
-    # post-file-edit.sh (~line 336). A `.ts` stamp holds the epoch of the
+    # ~30s. Stamp-file pattern (as the former diagram throttle in
+    # post-file-edit.sh used). A `.ts` stamp holds the epoch of the
     # last completed reap; we no-op if it's too recent. This is SAFE for
     # coalesce-NEVER-DROP: orphans are recovered by the very NEXT
     # un-throttled reap, at most ~throttle extra delay, still well inside

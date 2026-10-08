@@ -38,8 +38,8 @@ $EmitContextLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
 if (Test-Path $EmitContextLib) { . $EmitContextLib }
 
 # v0.2.95 (lane F10): the ROUTING - knowledge/ -> kg-sync, docs/ ->
-# upload_docs, .claude/diagrams/ -> the indexer, code files -> the
-# end-of-turn code-graph drain queue - plus the Phase-8 access gate and
+# upload_docs, code files -> the end-of-turn code-graph drain queue -
+# plus the Phase-8 access gate and
 # the per-file debounce now live in _lib/route-touched-path.ps1, because a
 # SECOND hook needs exactly the same decision: post-bash-file-sync.ps1,
 # which gives a CLI write (`cat > knowledge/foo.md <<EOF`, `sed -i`, `cp`)
@@ -121,7 +121,7 @@ $DocsDirSep = $DocsDir.TrimEnd('\','/') + [System.IO.Path]::DirectorySeparatorCh
 
 if (-not $EditedFile) { exit 0 }
 
-# === Routing: knowledge/ + docs/ + diagrams + the code-graph drain queue ===
+# === Routing: knowledge/ + docs/ + the code-graph drain queue ===
 # ONE home - _lib/route-touched-path.ps1 - shared with
 # post-bash-file-sync.ps1 so a CLI write routes identically to an
 # Edit/Write. Initialize-VcoRoute resolves the debounce helper, the

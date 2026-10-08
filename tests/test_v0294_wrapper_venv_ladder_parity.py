@@ -66,12 +66,8 @@ SCRIPTS = REPO / "templates" / "scripts"
 #:   * `query_code_graph.py` / `analyze_code_graph.py` — module-scope
 #:     `vco_lib.*` imports since v0.2.75.
 #:   * `sync_knowledge_graph.py` — `weaviate_mcp.chunking` (v0.2.49 Bug K).
-#:   * `code-graph-to-mermaid` (`python -m vco_lib.cli codegraph-diagram`) —
-#:     `vco_lib` at module scope; `weaviate` function-local in
-#:     `codegraph_to_mermaid.fetch_subgraph`, without which there is no
-#:     diagram (verdict-changing, so gated). Found un-migrated by the lane F
-#:     verification: it probed two layouts relative to itself and then ran a
-#:     bare `python3`.
+#:   * (`code-graph-to-mermaid` was an eighth gated wrapper until v0.2.102,
+#:     when the mermaid exporter was deleted with the diagrams integrations.)
 GATED_WRAPPERS = {
     # tool           bash            ps1                    modules
     "kg-sync": (
@@ -102,16 +98,11 @@ GATED_WRAPPERS = {
         "code-graph-analyze.ps1",
         "import weaviate, weaviate_mcp, vco_lib",
     ),
-    "code-graph-to-mermaid": (
-        "code-graph-to-mermaid",
-        "code-graph-to-mermaid.ps1",
-        "import weaviate, vco_lib",
-    ),
 }
 
 #: Every wrapper pair must be covered — a new one that quietly ships its own
 #: ladder is the defect this file exists to prevent.
-EXPECTED_PAIR_COUNT = 9
+EXPECTED_PAIR_COUNT = 8
 
 _BASH_DECL = re.compile(r'^LADDER_IMPORT="([^"]*)"\s*$')
 _PS1_DECL = re.compile(r'^\$LadderImport\s*=\s*"([^"]*)"\s*$')
@@ -232,7 +223,6 @@ ORIGINAL_SET_LINES = {
     "kg-migrate": "set -e",
     "code-graph-query": None,
     "code-graph-analyze": None,
-    "code-graph-to-mermaid": None,
 }
 
 
@@ -422,10 +412,6 @@ def _stripped_env() -> dict:
         # to a bare `python` / `python3`.
         ("code-graph-analyze", "analyze_code_graph.py", 1),
         ("kg-search", "search_knowledge.py", 1),
-        # Found by the lane F verification, not the implementation: it ran
-        # `python3 -m vco_lib.cli` (no script file to tripwire — the module
-        # is the target, and a bare python has none of it).
-        ("code-graph-to-mermaid", None, 1),
     ],
 )
 def test_bash_wrapper_refuses_instead_of_running_a_bare_interpreter(

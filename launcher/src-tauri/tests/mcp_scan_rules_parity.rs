@@ -125,3 +125,36 @@ fn table_pins_known_values() {
         "TOKEN must be a secret-shaped needle"
     );
 }
+
+/// v0.2.102 (owner ruling 2026-10-07, diagrams dropped): the on-disk table
+/// must carry `[deprecated.mermaid]` + `[deprecated.excalidraw]` with
+/// `removed_in = "v0.2.102"` and `auto_scrub = true` — the same posture as
+/// `[deprecated.search]`. This pins the rows the convergence engine and the
+/// Python scrub both read; a table edit that drops or disarms them turns
+/// every stale wrapper entry back into a permanent failing spawn.
+#[test]
+fn table_pins_the_v02102_diagram_autoscrub_rows() {
+    let disk = load_disk_table();
+    for name in ["mermaid", "excalidraw"] {
+        let row = disk
+            .deprecated_default_mcps
+            .get(name)
+            .unwrap_or_else(|| panic!("[deprecated.{name}] missing from the on-disk table"));
+        assert_eq!(row.removed_in, "v0.2.102", "{name}");
+        assert!(
+            row.auto_scrub,
+            "{name}: auto_scrub must be true — the wrappers are deleted, so a \
+             leftover VCO-shaped entry fails to spawn on every session"
+        );
+        assert!(
+            !row.reason.is_empty(),
+            "{name}: the reason is shown verbatim in the retirement notice"
+        );
+        // Every deprecated name must still be recognised as bundled (the
+        // is_user_added discriminator + uninstall scrub depend on it).
+        assert!(
+            disk.bundled_mcp_names.iter().any(|b| b == name),
+            "{name} must stay in [bundled].all_names"
+        );
+    }
+}

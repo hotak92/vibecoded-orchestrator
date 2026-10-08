@@ -361,31 +361,41 @@ def test_frontend_slot_key_list_matches_the_writer():
 
 
 def test_the_gate_is_default_OFF_on_BOTH_sides():
-    """Two independent default-active lists must agree, or the GUI lies.
+    """The default-active gate must stay default-OFF, or the GUI lies.
 
     The template renderer resolves active modules in Python
-    (`_DEFAULT_ACTIVE_MODULES`); the card's checkbox reads the Rust
-    `is_project_module_active`, which seeds a row for anything in
-    `ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES`. If `model_gateway` were
-    added to either, the two would disagree — a checkbox showing ON over a
-    CLAUDE.md with no routing section, or vice versa — and the whole "an
-    install with no gateway reads nothing about GLM" guarantee would depend
-    on which side you asked.
+    (`_DEFAULT_ACTIVE_MODULES`). Its former Rust mirror — the
+    `is_project_module_active` command with its
+    `ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES` backfill — was REMOVED in
+    v0.2.102 (owner decision 2026-10-08: zero callers after the Diagrams
+    tab went), so nothing on the Rust side can seed a default-active row
+    any more. If `model_gateway` were added to the Python list (or the
+    Rust backfill command were resurrected), a checkbox could show ON over
+    a CLAUDE.md with no routing section — and the whole "an install with
+    no gateway reads nothing about GLM" guarantee would depend on which
+    side you asked.
     """
     from vco_lib.project_init import _DEFAULT_ACTIVE_MODULES
 
     assert "model_gateway" not in _DEFAULT_ACTIVE_MODULES
 
     rust = (
-        REPO / "launcher" / "src-tauri" / "src" / "commands" / "diagrams_cmd.rs"
+        REPO / "launcher" / "src-tauri" / "src" / "commands" / "module_enabled.rs"
     ).read_text(encoding="utf-8")
-    m = re.search(
-        r"ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES: &\[&str\] = &\[(.*?)\];",
-        rust,
-        re.DOTALL,
+    # The declaration, not the name: historical comments in the file may
+    # mention the removed const, but a live `const ... : &[&str]` is a
+    # resurrection.
+    assert not re.search(
+        r"ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES\s*:\s*&\[&str\]", rust
+    ), (
+        "the Rust default-active backfill was removed with "
+        "`is_project_module_active` in v0.2.102; a resurrection needs this "
+        "test re-pointed at the new list"
     )
-    assert m, "the Rust default-active list moved; re-point this test"
-    assert "model_gateway" not in m.group(1)
+    assert "pub async fn is_project_module_active" not in rust, (
+        "the `is_project_module_active` Tauri command was removed in "
+        "v0.2.102 (zero callers); wire a consumer first if it returns"
+    )
 
 
 def test_frontend_module_name_matches_the_template_gate():
@@ -518,7 +528,7 @@ def render(active: set[str]) -> str:
 
 def test_no_gateway_means_no_word_about_vendor_models():
     """LEAVE-ALONE: an install with no gateway reads nothing about GLM."""
-    out = render({"diagrams"}).lower()
+    out = render({"some_module"}).lower()
     for token in ("glm", "claude-gw", "model routing", "artificial analysis"):
         assert token not in out, (
             f"{token!r} reached a project with no gateway configured; the "
@@ -527,7 +537,7 @@ def test_no_gateway_means_no_word_about_vendor_models():
 
 
 def test_gateway_active_renders_the_routing_section():
-    out = render({"diagrams", "model_gateway"})
+    out = render({"some_module", "model_gateway"})
     assert "## Model routing" in out
     assert "claude-gw/glm-5.3" in out
     assert "CLAUDE_CODE_SUBAGENT_MODEL" in out, (
@@ -544,12 +554,13 @@ def test_the_section_is_the_only_difference_it_makes():
     `template_review_pending` deferral. Gating the whole section means
     projects that do not opt in see no churn at all.
     """
-    off = render({"diagrams"})
+    off = render(set())
     assert "Model routing" not in off
-    # The blocks are adjacent, not nested: dropping ours must not disturb the
-    # diagrams block's own rendering.
-    assert "## Diagrams (Mermaid + Excalidraw)" in render({"diagrams"})
-    assert "## Diagrams (Mermaid + Excalidraw)" not in render(set())
+    # v0.2.102: the diagrams conditional section was removed with the
+    # diagrams integrations, so `model_gateway` is the ONLY conditional
+    # block left — a render with the (historical) `diagrams` id is
+    # byte-identical to an empty module set.
+    assert render({"some_module"}) == off
 
 
 def test_the_conditional_blocks_are_not_nested():
@@ -557,7 +568,7 @@ def test_the_conditional_blocks_are_not_nested():
     project's install, not just gateway users."""
     from vco_lib.project_init import render_conditional_blocks
 
-    for mods in (set(), {"diagrams"}, {"model_gateway"}, {"diagrams", "model_gateway"}):
+    for mods in (set(), {"some_module"}, {"model_gateway"}, {"some_module", "model_gateway"}):
         render_conditional_blocks(
             TEMPLATE.read_text(encoding="utf-8"), active_modules=mods
         )
@@ -696,11 +707,11 @@ def test_the_definition_name_guidance_renders_inside_the_gate_only():
     no-vendor-words test catches the leak half; this pins the presence
     half, so the guidance cannot be dropped from the gated render either)."""
     at_names = [f"@{n.removesuffix('.md')}" for n in MODULE_GATEWAY_AGENT_FILES]
-    on = render({"diagrams", "model_gateway"})
+    on = render({"some_module", "model_gateway"})
     for at_name in at_names:
         assert at_name in on
     assert "cannot carry `claude-gw/*` ids" in on
-    off = render({"diagrams"})
+    off = render({"some_module"})
     for at_name in at_names:
         assert at_name not in off
 

@@ -55,8 +55,9 @@ with a per-context pattern rather than one pattern:
     third-party bundles and compiled binaries. **Precision-biased.** A false
     positive here fires on every commit and trains people to ignore the
     scanner, which is how a real alert gets missed. Two false-positive corpora
-    are PROVEN present in this repo (both in the vendored Excalidraw bundle,
-    both inside ``check-no-secrets.sh``'s ``*/dist/*`` scan set):
+    were PROVEN present in this repo's former vendored Excalidraw bundle
+    (deleted in v0.2.102; the shape rules it justified are KEPT — a generic
+    secret shape stays a shape regardless of which bundle proved it):
 
       * ``assets/index-*.js`` carries the Slovak locale chunk name
         ``sk-SK-<hash>-<hash>``, which a loose ``sk-`` tail matches.
@@ -216,10 +217,11 @@ SHAPES: Tuple[CredentialShape, ...] = (
             "argv_name": "^AKIA[0-9A-Z]{16}$",
         },
         note=(
-            "ABSENT from repo_scan: PROVEN base64 collision. The vendored "
-            "Excalidraw bundle's base64 WASM/font payload contains an "
-            "AKIA+16-upper-alnum run by chance. Adding it to repo_scan would "
-            "make check-no-secrets.sh fail on every commit."
+            "ABSENT from repo_scan: PROVEN base64 collision (found in the "
+            "former vendored Excalidraw bundle, deleted v0.2.102): its "
+            "base64 WASM/font payload contains an AKIA+16-upper-alnum run "
+            "by chance. Adding it to repo_scan would make "
+            "check-no-secrets.sh fail on every commit."
         ),
     ),
     CredentialShape(

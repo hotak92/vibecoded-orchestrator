@@ -117,7 +117,6 @@ Backwards-compatible by construction.
 
 - KG syncing: extra paths' `knowledge/` subdirs are NOT auto-synced into
   the project's KG. Codegraph only.
-- Diagrams: same.
 - Hook-driven writes against extra paths: extras are READ-ONLY references.
   `ruff`/`pyright` don't run against extras.
 - Auto-drop of Weaviate entries on row delete: handled by the analyzer's

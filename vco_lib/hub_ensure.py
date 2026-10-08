@@ -280,10 +280,11 @@ def resolve_hub_port(
 
     The ONE Python client port reader. Callers: ``vco_lib.project_config._discover_hub``,
     ``vco_lib.access_resolver._hub_port``, ``vco_lib.codegraph_resync``,
-    ``claude_mcp_servers/rl_client/hub_writer._read_hub_port``,
-    ``claude_mcp_servers/wrappers/_base`` and ``weaviate_mcp/server``'s access
-    lookup, and ``vco verify-diagrams`` (check 5). Stdlib-only, so it works
-    before the install has installed anything. ``vct_root`` defaults to
+    ``claude_mcp_servers/rl_client/hub_writer._read_hub_port``, and
+    ``weaviate_mcp/server``'s access lookup. (Through v0.2.101 the diagram
+    wrapper base and the diagrams verifier were callers too; both were
+    removed in v0.2.102 with the diagrams integration.) Stdlib-only, so it
+    works before the install has installed anything. ``vct_root`` defaults to
     :func:`vco_lib.paths.vct_root_dir`. ``install.py --bootstrap --json`` and
     :mod:`vco_lib.secrets_bootstrap` DESCRIBE the hub and use
     :func:`running_hub_port`; install.py's health probe talks to it and uses

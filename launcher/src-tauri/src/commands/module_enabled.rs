@@ -47,9 +47,12 @@
 
 use tauri::{command, AppHandle, Emitter, State};
 
+use std::path::{Path, PathBuf};
+
 use crate::db::Db;
 use vct_launcher_core::db::settings::ModuleEnableState;
 use vct_launcher_core::manifest::ModuleManifest;
+use vct_launcher_core::process::CommandExt as _;
 
 /// Tauri event name used to notify the Svelte renderer that a module's
 /// per-project enable flag flipped. The renderer redraws affected tabs
@@ -67,8 +70,9 @@ pub struct ModuleEnabledChangedEvent {
 ///
 /// Auth/permission model: the launcher's Tauri command surface is local-
 /// only (no remote callers), so no per-call authentication is performed
-/// — same as the sibling `set_project_module_enabled` command in
-/// `diagrams_cmd`. The audit log records every flip for forensic trace.
+/// — same as the sibling `set_project_module_enabled` command below
+/// (moved here from `diagrams_cmd` in v0.2.102). The audit log records
+/// every flip for forensic trace.
 ///
 /// Returns `Ok(())` on success. Errors propagate the DB-layer message
 /// (parser failure on a hand-edited row, FK violation if `project_id`
@@ -113,7 +117,7 @@ pub async fn module_set_enabled_for_project(
 
     // Fire-and-forget renderer notification. Soft-fail: a missing window
     // handle (rare; happens during shutdown) must not roll back the DB
-    // write. Mirrors the pattern in `diagrams_cmd::set_project_module_enabled`.
+    // write. Mirrors the pattern in `set_project_module_enabled` below.
     let payload = ModuleEnabledChangedEvent {
         project_id: project_id.clone(),
         module_id: module_id.clone(),
@@ -796,6 +800,287 @@ pub fn clear_enabled_rows_for_uninstalled_module(db: &Db, module_id: &str) -> us
     }
 }
 
+// ─── project_modules machinery (moved from diagrams_cmd.rs, v0.2.102) ─────
+//
+// These commands read/write the `project_modules` table (migration 022) —
+// the per-project active flag behind `{{#if_module_active <name>}}`
+// rendering and module-gated bundle delivery. They lived in
+// `diagrams_cmd.rs` because `diagrams` was the first module to use them;
+// when the diagrams integrations were dropped (owner ruling 2026-10-07)
+// every diagram command in that file was deleted and this GENERIC
+// machinery moved here, beside the other module-toggle commands.
+// `model_gateway.ts` invokes set/clear for the model-gateway module; the
+// Python renderer reads `project_modules` from launcher.db directly
+// (`vco_lib.module_gated_delivery.active_modules_verdict`), never through
+// these commands.
+
+#[command]
+pub async fn set_project_module_enabled(
+    project_id: String,
+    module_name: String,
+    enabled: bool,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    db.set_project_module_enabled(&project_id, &module_name, enabled)?;
+    db.audit(
+        "project_module_set_enabled",
+        Some(&project_id),
+        None,
+        &serde_json::json!({
+            "module": module_name,
+            "enabled": enabled,
+        }),
+    )?;
+
+    // Phase 1.5.7 — when a module's enabled flag changes, the
+    // `{{#if_module_active <name>}}` block in CLAUDE.md needs to be
+    // re-evaluated. Spawn a background subprocess so the toggle
+    // remains snappy from the user's perspective; never block the
+    // command result on the re-render. Soft-fail throughout: if the
+    // subprocess can't be spawned (missing venv, missing project on
+    // disk, CLI error) we log a warning and return success — the
+    // user already saw the DB toggle land; the re-render is a
+    // side-effect.
+    spawn_re_render_claude_md(&db, &project_id);
+
+    // v0.2.100 (AD-7, L5-F03): a module row can change what the bundle
+    // DELIVERS (today: the model-gateway agent definitions), so the toggle
+    // runs the ordinary bundle update instead of leaving the delivery — and
+    // the re-rendered CLAUDE.md's claim about it — to whenever the user next
+    // updates. The decision of WHAT to deliver stays in Python
+    // (`vco_lib.module_gated_delivery`); this only triggers the engine.
+    schedule_bundle_update_for_project(&db, &project_id, spawn_bundle_update);
+
+    Ok(())
+}
+
+/// Clear a project's EXPLICIT module choice — the way back to "follows the
+/// machine" (v0.2.101, G1 follow-up).
+///
+/// The inverse of [`set_project_module_enabled`], same shape: the row is
+/// deleted (nothing is remembered of the previous choice), then the same
+/// two side effects a flip triggers run, because a cleared row changes
+/// what the bundle DELIVERS exactly like a flip — with no row, the module
+/// falls back to its default resolution (for `model_gateway`, the machine
+/// gateway signal). `Ok(false)` when no row existed: the state is already
+/// the default one, so neither the re-render nor the bundle update has
+/// anything to do, and a double-click must not look like a failure.
+#[command]
+pub async fn clear_project_module(
+    project_id: String,
+    module_name: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    let cleared = db.clear_project_module(&project_id, &module_name)?;
+    if !cleared {
+        return Ok(false);
+    }
+    db.audit(
+        "project_module_cleared",
+        Some(&project_id),
+        None,
+        &serde_json::json!({
+            "module": module_name,
+            "cleared": true,
+        }),
+    )?;
+    // Same reasoning as `set_project_module_enabled`: the CLAUDE.md
+    // conditional block and the bundle delivery both read the row (or its
+    // absence), so both must re-run. Soft-fail throughout.
+    spawn_re_render_claude_md(&db, &project_id);
+    schedule_bundle_update_for_project(&db, &project_id, spawn_bundle_update);
+    Ok(true)
+}
+
+/// Resolve `project_id`'s folder and hand it to `run`. Split from the spawn
+/// so the "a toggle triggers delivery" wiring is testable without a Tauri
+/// runtime. Soft-fail: an unknown project or a missing folder is logged and
+/// nothing runs (the DB row already landed; the next update delivers).
+fn schedule_bundle_update_for_project(db: &Db, project_id: &str, run: impl FnOnce(String, PathBuf)) {
+    match db.get_project(project_id) {
+        Ok(Some(p)) => {
+            let folder = PathBuf::from(&p.folder_path);
+            if folder.is_dir() {
+                run(project_id.to_string(), folder);
+            } else {
+                tracing::warn!(
+                    "[vct] module toggle: project folder {} does not exist; the next \
+                     bundle update delivers",
+                    folder.display()
+                );
+            }
+        }
+        Ok(None) => tracing::warn!(
+            "[vct] module toggle: project {} not found; no bundle update",
+            project_id
+        ),
+        Err(e) => tracing::warn!(
+            "[vct] module toggle: db lookup for {} failed: {}; no bundle update",
+            project_id,
+            e
+        ),
+    }
+}
+
+/// Background `install-bundle --update` for one project. Never two engines on
+/// one manifest: the engine itself takes the per-folder turn
+/// (`single_flight::bundle_engine_turn`, v0.2.100 W3R-06), which "Update all"
+/// and the per-project update share — a toggle during either WAITS and then
+/// delivers, instead of racing it (or being refused and losing the delivery).
+fn spawn_bundle_update(project_id: String, folder: PathBuf) {
+    tauri::async_runtime::spawn(async move {
+        let (warnings, _summary) =
+            crate::commands::projects_v2::run_install_bundle_update(&folder).await;
+        for w in &warnings {
+            tracing::warn!("[vct] module toggle bundle update ({}): {}", project_id, w);
+        }
+        tracing::info!(
+            "[vct] module toggle: bundle update finished for project {} ({} warning(s))",
+            project_id,
+            warnings.len()
+        );
+    });
+}
+
+/// Background re-render of `<project_folder>/CLAUDE.md` after a module
+/// toggle. Resolves the project folder via `Db::get_project`, locates a
+/// usable Python interpreter, and spawns `python -m vco_lib.project_init
+/// re-render-claude-md --folder <path> --project-name <name>
+/// --project-id <id> --json` detached from the Tauri command. The
+/// command returns immediately — the re-render runs in the background.
+///
+/// Soft-fail philosophy: every error in this path is logged and
+/// swallowed. The DB row write already happened in the caller; the
+/// template re-render is a follow-on side effect, not a contract.
+/// Failures here surface only in the launcher's log and (eventually)
+/// the next time `re-render-claude-md` is invoked by some other path.
+fn spawn_re_render_claude_md(db: &Db, project_id: &str) {
+    let project = match db.get_project(project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            tracing::warn!(
+                "[vct] re-render-claude-md: project {} not found; \
+                 skipping background re-render",
+                project_id
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[vct] re-render-claude-md: db lookup for {} failed: {}; \
+                 skipping background re-render",
+                project_id, e
+            );
+            return;
+        }
+    };
+
+    let folder = PathBuf::from(&project.folder_path);
+    if !folder.is_dir() {
+        tracing::warn!(
+            "[vct] re-render-claude-md: project folder {} does not exist; \
+             skipping background re-render",
+            folder.display()
+        );
+        return;
+    }
+
+    let python = match resolve_project_python(&folder) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                "[vct] re-render-claude-md: no usable Python for project \
+                 {} (folder={}); skipping background re-render",
+                project_id,
+                folder.display()
+            );
+            return;
+        }
+    };
+
+    // Spawn detached — we don't await stdout/stderr from this child.
+    // The CLI itself writes its own logs and falls back gracefully.
+    let project_id_str = project_id.to_string();
+    let project_name = project.name.clone();
+    let folder_str = folder.to_string_lossy().into_owned();
+    let spawn_result = std::process::Command::new(&python).silent()
+        .arg("-m")
+        .arg("vco_lib.project_init")
+        .arg("re-render-claude-md")
+        .arg("--folder")
+        .arg(&folder_str)
+        .arg("--project-name")
+        .arg(&project_name)
+        .arg("--project-id")
+        .arg(&project_id_str)
+        .arg("--json")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .spawn();
+
+    match spawn_result {
+        Ok(child) => {
+            tracing::info!(
+                "[vct] re-render-claude-md: spawned pid={} for project {} ({})",
+                child.id(),
+                project_name,
+                project_id_str
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[vct] re-render-claude-md: spawn failed for project {} ({}): {}",
+                project_name, project_id_str, e
+            );
+        }
+    }
+}
+
+/// Pick a Python interpreter for the project-folder re-render. Prefers
+/// the project's own `.venv` and the orchestrator's `claude_mcp_servers/.venv`
+/// (the canonical install layout). Falls back to `python3` / `python` on
+/// PATH. Returns `None` only when nothing usable is found — the caller
+/// soft-fails in that case.
+fn resolve_project_python(folder: &Path) -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) { "python.exe" } else { "python" };
+    let bin_dir = if cfg!(windows) { "Scripts" } else { "bin" };
+
+    let candidates = [
+        folder.join(".venv").join(bin_dir).join(exe_name),
+        folder
+            .join("claude_mcp_servers")
+            .join(".venv")
+            .join(bin_dir)
+            .join(exe_name),
+    ];
+    for c in candidates.iter() {
+        if c.is_file() {
+            return Some(c.clone());
+        }
+    }
+    // Last resort: PATH lookup. Use `which`-style on POSIX, where the
+    // PATH chain typically has `python3` first. We avoid shelling out
+    // to `which` directly; the spawn will fail later if PATH lookup is
+    // empty and we'll log a warning then.
+    if cfg!(windows) {
+        Some(PathBuf::from("python.exe"))
+    } else {
+        Some(PathBuf::from("python3"))
+    }
+}
+
+// ─── Module-active lookup ───────────────────────────────────────────────
+// v0.2.102 (owner decision 2026-10-08): the `is_project_module_active`
+// Tauri command and the default-active backfill it carried
+// (`ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES` + `has_module_row`) were
+// REMOVED — after the Diagrams tab went, the command had zero callers
+// (the invoke census recorded it as an open finding). The `project_modules`
+// read surface that remains is `Db::is_module_active` (used by the tests
+// below and the generic module machinery) and the module_enabled /
+// module_effective_enabled commands; nothing seeds a default-active row
+// any more.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,5 +1367,96 @@ mod tests {
             .explicit,
             Some(false),
         );
+    }
+
+    // ─── project_modules machinery tests (moved from diagrams_cmd.rs, v0.2.102)
+    //
+    // `make_db_with_project` mirrors the helper these tests had in
+    // diagrams_cmd.rs: an in-memory Db plus a project row pointing at a
+    // REAL folder (the bundle-update scheduler refuses folder-less rows).
+
+    fn make_db_with_project(id: &str, name: &str, folder: &Path) -> Db {
+        let db = mkdb();
+        db.insert_project(id, name, &folder.to_string_lossy(), ProjectHost::Base, id)
+            .expect("insert project");
+        db
+    }
+
+    #[test]
+    fn is_module_active_returns_false_for_absent_row() {
+        // For an unregistered (project, module) pair the answer is `false`
+        // — never an error.
+        //
+        // NOTE: this exercises the DB layer directly (Db::is_module_active),
+        // NOT a Tauri command — the `is_project_module_active` command and
+        // its default-active backfill were removed in v0.2.102 (owner
+        // decision 2026-10-08: zero callers after the Diagrams tab went).
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p1", "Acme", dir.path());
+        let r = db.is_module_active("p1", "model_gateway").unwrap();
+        assert!(!r, "unknown module should be inactive (got {})", r);
+    }
+
+    /// v0.2.100 (AD-7, L5-F03): the toggle triggers the bundle update for
+    /// the toggled project's folder (act) — and runs nothing for a project
+    /// whose folder is gone or that is not registered (leave-alone).
+    #[test]
+    fn module_toggle_schedules_the_bundle_update_for_the_project_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p1", "Acme", dir.path());
+        let mut seen: Vec<(String, PathBuf)> = Vec::new();
+        schedule_bundle_update_for_project(&db, "p1", |id, f| seen.push((id, f)));
+        assert_eq!(seen, vec![("p1".to_string(), dir.path().to_path_buf())]);
+
+        let mut none: Vec<(String, PathBuf)> = Vec::new();
+        schedule_bundle_update_for_project(&db, "missing", |id, f| none.push((id, f)));
+        let gone = make_db_with_project("p2", "Gone", &dir.path().join("absent"));
+        schedule_bundle_update_for_project(&gone, "p2", |id, f| none.push((id, f)));
+        assert!(none.is_empty(), "nothing may run without a real folder: {none:?}");
+    }
+
+    #[test]
+    fn is_module_active_round_trips_through_set_then_get() {
+        // Toggle on → reflects as true; toggle off → reflects as false.
+        // Mirrors the lifecycle exercised by `set_project_module_enabled`
+        // from the frontend (model_gateway.ts) against the Db read.
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p1", "Acme", dir.path());
+        db.set_project_module_enabled("p1", "model_gateway", true).unwrap();
+        assert!(db.is_module_active("p1", "model_gateway").unwrap());
+        db.set_project_module_enabled("p1", "model_gateway", false).unwrap();
+        assert!(!db.is_module_active("p1", "model_gateway").unwrap());
+    }
+
+    #[test]
+    fn resolve_project_python_prefers_project_venv() {
+        // Mirror the canonical install layout: <project>/.venv/{bin|Scripts}/python
+        // wins over <project>/claude_mcp_servers/.venv/...
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = if cfg!(windows) { "Scripts" } else { "bin" };
+        let exe_name = if cfg!(windows) { "python.exe" } else { "python" };
+        let project_venv_py = dir.path().join(".venv").join(bin_dir).join(exe_name);
+        let mcp_venv_py = dir
+            .path()
+            .join("claude_mcp_servers")
+            .join(".venv")
+            .join(bin_dir)
+            .join(exe_name);
+        std::fs::create_dir_all(project_venv_py.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(mcp_venv_py.parent().unwrap()).unwrap();
+        std::fs::write(&project_venv_py, b"").unwrap();
+        std::fs::write(&mcp_venv_py, b"").unwrap();
+        let picked = resolve_project_python(dir.path()).unwrap();
+        assert_eq!(picked, project_venv_py);
+    }
+
+    #[test]
+    fn resolve_project_python_falls_back_to_path_when_no_venv() {
+        let dir = tempfile::tempdir().unwrap();
+        let picked = resolve_project_python(dir.path()).unwrap();
+        // The fallback is OS-dependent but never None — the caller
+        // soft-fails on spawn if the PATH lookup also misses.
+        let expected = if cfg!(windows) { "python.exe" } else { "python3" };
+        assert_eq!(picked, PathBuf::from(expected));
     }
 }

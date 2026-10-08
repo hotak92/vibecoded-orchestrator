@@ -407,7 +407,7 @@ function Get-KgDebounceDir {
 }
 
 # Hash a file path → slash-free lock key (MD5 hex), matching the bash
-# sibling's md5-via-Python key and the diagram-throttle MD5 pattern.
+# sibling's md5-via-Python key (the former diagram throttle's MD5 pattern).
 function Get-KgDebounceKey {
     param([string]$Path)
     $md5 = [System.Security.Cryptography.MD5]::Create()
@@ -477,8 +477,8 @@ function Invoke-KgDebounceReapStale {
     $now = Get-Date
 
     # Reaper throttle: skip the O(M^2) sweep if we ran it within the last
-    # ~30s. Mirrors the diagram-throttle stamp-file pattern in
-    # post-file-edit.sh (~line 336) and the bash sibling's `.last_reap.ts`.
+    # ~30s. Stamp-file pattern (as the former diagram throttle in
+    # post-file-edit.sh used) and the bash sibling's `.last_reap.ts`.
     # SAFE for coalesce-NEVER-DROP: orphans are recovered by the very NEXT
     # un-throttled reap (at most ~throttle extra delay), well inside the
     # eventually-consistent contract. Best-effort: a stat/write failure falls

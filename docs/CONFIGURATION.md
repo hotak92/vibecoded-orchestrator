@@ -223,16 +223,15 @@ Don't put PATs or API keys in `~/.claude.json` `env:` blocks — Claude Code's e
 
 ## Permission matrices
 
-The launcher enforces four independent cross-project access matrices, each backed by its own table in `launcher.db`. They do NOT share a default: **KG is default-GRANT**, the other three are **default-DENY**. Inspecting `launcher.db` (or reading Rust accessors) without this table in front of you invites the wrong assumption that everything is default-deny. The defaults are set on project add in `launcher/src-tauri/src/commands/project_state_populate.rs`.
+The launcher enforces three independent cross-project access matrices, each backed by its own table in `launcher.db`. They do NOT share a default: **KG is default-GRANT**, the other two are **default-DENY**. Inspecting `launcher.db` (or reading Rust accessors) without this table in front of you invites the wrong assumption that everything is default-deny. The defaults are set on project add in `launcher/src-tauri/src/commands/project_state_populate.rs`.
 
 | Matrix | Table (key) | Default on project add | How to grant more |
 |---|---|---|---|
 | **KG access** | `kg_collection_access` (project_id, collection_name) | **GRANT** — the project's OWN KG + the machine-shared KG get read rows automatically | Cross-project KG reads are explicit-grant (launcher Identity tab → KG access matrix) |
 | **Code-graph access** | `codegraph_access` (grantor_project_id, grantee_project_id) | **DENY** (empty) | Launcher Codegraph → Cross-Project Access tab |
-| **Diagrams access** | `diagram_access` (same shape as code-graph) | **DENY** (empty) | Launcher Diagrams cross-project surface |
 | **Secrets** | per-`(scope, key, requester)` active flags + grants | **DENY** for cross-project | Shared-scope secrets (Preferences → Secrets) are readable by requesters unless paused per-project; per-project secrets are project-only unless explicitly shared via the SecretsPanel |
 
-**Why KG grants by default but code-graph denies.** The KG read gate rejects any collection without an explicit row — so without the auto-grant, a fresh project's searches against its own KG would fail on day one. The default-grant seeds the project's own KG plus the machine-shared KG (knowledge is intentionally cross-project value: a pattern learned in one project is usually useful in the next). Source code is the opposite: it is proprietary and per-tenant, so code-graph (and diagrams, which follow the same shape) stay empty until you deliberately grant one project read access to another's. Secrets follow the same default-deny posture — cross-project reads require an explicit grant, and even a shared-scope secret can be paused for a specific requester. See the KG-vs-code-graph asymmetry table in the project `CLAUDE.md` for the read-fan-out consequences of this design.
+**Why KG grants by default but code-graph denies.** The KG read gate rejects any collection without an explicit row — so without the auto-grant, a fresh project's searches against its own KG would fail on day one. The default-grant seeds the project's own KG plus the machine-shared KG (knowledge is intentionally cross-project value: a pattern learned in one project is usually useful in the next). Source code is the opposite: it is proprietary and per-tenant, so code-graph stays empty until you deliberately grant one project read access to another's. Secrets follow the same default-deny posture — cross-project reads require an explicit grant, and even a shared-scope secret can be paused for a specific requester. See the KG-vs-code-graph asymmetry table in the project `CLAUDE.md` for the read-fan-out consequences of this design. (The former `diagram_access` matrix followed the same default-deny shape; its grant surface was removed with the diagrams integration in v0.2.102, and the table itself is left in place on existing installs.)
 
 ## vct-hub
 
@@ -310,7 +309,7 @@ Environment keys for this leg:
 
 Discovery: `VCT_HUB_PORT` env → `<vct_root_dir>/hub.port` → `7700` default; token: `VCT_HUB_TOKEN` env → `<vct_root_dir>/hub.token`. All clients enforce the same exit-code shape (0 success / 1 hub unreachable / 2 project not registered / 3 service misconfigured / 4 field not found / 5 forbidden — hub refused the token on `/env`|`/config`, callers MUST NOT env/file-fallback / 64 usage error). Stderr emissions are rate-limited per `(pid, error_kind)` to one line per 5 minutes — `VCO_HOOK_DEBUG=1` bypasses the limit.
 
-**Stale `VCT_HUB_TOKEN` (v0.2.91)**: the hub regenerates `hub.token` on every start, so a shell that exported `VCT_HUB_TOKEN` before an update holds a value the hub refuses — and the env pin wins over the file, so every resolve from that shell used to fail with a misleading "hub unreachable / launcher may have restarted" diagnostic until the shell was replaced. Now, on a PROVABLE refusal (401/403) where the exported token differs from the on-disk one, every hub client — the resolver script quadruplet, the access-matrix gate trio `vct_access_check.{sh,ps1}` + `vco_lib/access_resolver.py`, `vco_lib/project_config.py`, the wrapper MCPs, the weaviate MCP's writable-collections probe, `vco verify-diagrams`, the codegraph-resync spawn registration, `vct-cli` (`launcher/tools/vct-cli`) and `vct` (`tools/vct-secrets`) — retries **once** with the on-disk token (scoped `hub.token.<project_id>` on the per-project routes, global otherwise) and prints one line to stderr:
+**Stale `VCT_HUB_TOKEN` (v0.2.91)**: the hub regenerates `hub.token` on every start, so a shell that exported `VCT_HUB_TOKEN` before an update holds a value the hub refuses — and the env pin wins over the file, so every resolve from that shell used to fail with a misleading "hub unreachable / launcher may have restarted" diagnostic until the shell was replaced. Now, on a PROVABLE refusal (401/403) where the exported token differs from the on-disk one, every hub client — the resolver script quadruplet, the access-matrix gate trio `vct_access_check.{sh,ps1}` + `vco_lib/access_resolver.py`, `vco_lib/project_config.py`, the weaviate MCP's writable-collections probe, the codegraph-resync spawn registration, `vct-cli` (`launcher/tools/vct-cli`) and `vct` (`tools/vct-secrets`) — retries **once** with the on-disk token (scoped `hub.token.<project_id>` on the per-project routes, global otherwise) and prints one line to stderr:
 
 ```
 stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — run `unset VCT_HUB_TOKEN` or open a new shell
@@ -458,7 +457,9 @@ MCP servers are registered in the user's `~/.claude.json`. Each launches via the
 - Command: `<install>/.venv/bin/python claude_mcp_servers/weaviate_mcp/server.py` (legacy installs: `claude_mcp_servers/.venv/bin/python`)
 - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_WRITE_DISABLED` (write gate; legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases), plus the EmbeddingService vars (`ACTIVE_EMBEDDING`, `CODE_EMBED_SERVICE_URL`, etc.). The OpenAI key is NOT among them — it is a secret-shaped key and never reaches this file; the embedding stack resolves it in-process from VCO's own shared slot (see the env table above).
 
-> **v0.2.101**: the `search` MCP (paper search) was deleted outright, and the `mermaid` / `excalidraw` diagram wrapper MCPs are no longer registered by default. An install that already has a diagram entry keeps it; a still-live `search` entry is **removed automatically by the ordinary install/update**, with one notice line (no consent prompt — the module is gone). Claude's built-in WebSearch / WebFetch cover web and academic retrieval.
+> **v0.2.101**: the `search` MCP (paper search) was deleted outright; a still-live `search` entry is **removed automatically by the ordinary install/update**, with one notice line (no consent prompt — the module is gone). Claude's built-in WebSearch / WebFetch cover web and academic retrieval.
+>
+> **v0.2.102**: the `mermaid` / `excalidraw` diagram wrapper MCPs were removed entirely with the diagrams integration. A leftover wrapper entry from an older install is scrubbed automatically by the ordinary install/update (one notice line; third-party same-name entries a user installed themselves are left alone), and the `mcp__mermaid__*` / `mcp__excalidraw__*` permission-allow patterns are dropped from existing projects' `.claude/settings.json` at the next bundle update.
 
 **playwright** — browser automation, enabled by default and invoked separately via `npx -y @playwright/mcp@latest`. `install.py` pre-caches it (opt out with `VCT_SKIP_PLAYWRIGHT=1`).
 - The entry stores the bare name `npx`, which Claude Code resolves from the spawn PATH at MCP-launch time. On a machine without Node.js there is nothing to resolve, so the MCP never starts — and pre-v0.2.91 nothing said so (the installer printed "the MCP will lazy-install when first invoked", which is impossible without npx). Since v0.2.91 the doctor phase probes it via `vco_lib/npx_resolver.py`, defers `npx_missing_mcp_unspawnable`, and the launcher's registration badge turns yellow with the same remediation.
@@ -810,7 +811,7 @@ installations:
   use this script when you want to rebuild the cache from scratch (for
   example after a bulk import or a node-format schema change).
 
-## `vco` CLI — verify commands (Phase 0 of the diagrams integration)
+## `vco` CLI — verify commands
 
 The `vco` console-script is registered on PATH automatically when
 `install.py` runs (it does `pip install -e .` against the orchestrator's
@@ -818,8 +819,7 @@ The `vco` console-script is registered on PATH automatically when
 `.venv/bin/vco` on Unix and `.venv\Scripts\vco.exe` on Windows). For
 manual / out-of-band installs, run `pip install -e .` from the repo root
 into any venv. Fall back to `python -m vco_lib.cli <subcommand>` if for any
-reason the entry point isn't on PATH. Phase 0 ships two acceptance
-verifiers:
+reason the entry point isn't on PATH. Two acceptance verifiers ship:
 
 ### `vco verify-pins`
 
@@ -841,18 +841,20 @@ $ vco verify-pins
 OK — all pinned packages match manifest.
 package                                       pinned  installed  status
 --------------------------------------------  ------  ---------  ------
-claude-mermaid                                1.4.2   1.4.2      match
-@sanjibdevnathlabs/mcp-excalidraw-local       0.3.1   0.3.1      match
 ```
+
+(v0.2.102 removed the four diagram npm pins — `mermaid_mcp`, `excalidraw_mcp`,
+`mermaid_lib`, `excalidraw_lib` — with the diagrams integration; the `[npm.*]`
+table is currently empty, so `verify-pins` reports a bare OK. The machinery
+stays: any future `[npm.*]` pin is verified the same way.)
 
 ### `vco verify-env-projection <project_slug_or_id>`
 
 Confirms `.claude/settings.json env`, `.claude/env`, and
 `.vscode/settings.json claude-code.env` all match the canonical projection
 emitted by `vco_lib.config_projection.project_env_from_db(project_id)`.
-This is the source-of-truth contract codified by the diagrams plan: every
-env value in those three surfaces is a projection of launcher DB state,
-never authored by hand.
+This is the source-of-truth contract: every env value in those three
+surfaces is a projection of launcher DB state, never authored by hand.
 
 | Flag    | Behaviour                                                        |
 | ------- | ---------------------------------------------------------------- |
@@ -863,53 +865,3 @@ never authored by hand.
 Exit codes: `0` = all match, `1` = drift, `2` = project not found or DB
 unreadable, `3` = `--fix` failed or contract idempotency broken.
 
-### `vco verify-diagrams <project_slug_or_id>`
-
-End-to-end verifier for the Diagrams Integration feature. Runs 13
-focused checks covering: project row in launcher DB, `project_modules`
-seed row, migration 022 applied, MCP wrapper entries in `~/.claude.json`
-(absent = OK: the wrapper MCPs are optional since v0.2.101 and the
-Diagrams tab does not need them; a PRESENT entry still has its module
-path verified), hub allowlist HTTP route alive, env projection
-across the three surfaces, per-project Weaviate `<Project>_Diagrams`
-class present, `PreToolUse` + `PostToolUse` hooks registered, hook
-scripts on disk + executable, `vco_lib.diagram_indexer` /
-`vco_lib.diagram_paths` importable, CLAUDE.md diagrams section
-rendered.
-
-| Flag      | Behaviour                                                       |
-| --------- | --------------------------------------------------------------- |
-| `--json`  | Emit a single JSON envelope on stdout (machine-readable).        |
-| `--fix`   | Best-effort repair where possible (re-seed `project_modules` row, re-project env, create minimal Weaviate class). Logs and continues per-check on failure — unlike `verify-pins` which aborts on the first failure. |
-| `--all`   | Iterate every project registered in the launcher DB. Worst exit code across all projects wins. |
-| `--quick` | Skip the slow checks (Weaviate connectivity, hub HTTP probe). Useful in CI / pre-commit hooks. |
-
-Example output:
-
-```text
-$ vco verify-diagrams demo --quick
-verify-diagrams: demo (project_id=p-1)
-  folder: /home/me/projects/demo
-
-  [OK]   project_row — project 'demo' (id=p-1)
-  [OK]   project_modules_row — project_modules('diagrams', enabled=1) row present
-  [OK]   migration_022 — migration 22 applied + all 6 tables present
-  [OK]   mcp_wrappers — wrapper MCPs not registered — optional since v0.2.101; the Diagrams tab does not need them
-  [SKIP] hub_allowlist — --quick: hub HTTP probe skipped
-  [FAIL] env_projection — 1 drift entries: DIAGRAMS_COLLECTION on .vscode/settings.json: expected 'Demo_Diagrams', got '<missing>'
-         > fix: vco verify-env-projection p-1 --fix
-  [SKIP] weaviate_diagrams_class — --quick: Weaviate connectivity check skipped
-  [OK]   pretooluse_hooks — both PreToolUse entries (Write|Edit + MCP matchers) present
-  [OK]   post_delete_hook — PostToolUse → post-tool-use-async dispatcher registered (routes Bash → post-file-delete)
-  [OK]   hook_scripts_on_disk — all 2 hook scripts present + executable
-  [OK]   indexer_importable — key functions resolvable
-  [OK]   path_validator — round-trip OK (good→None, bad→string)
-  [OK]   claude_md_section — diagrams section present
-
-Summary: 10 OK, 1 FAIL, 2 SKIP
-```
-
-Exit codes: `0` = all OK (or only SKIP/FIXED), `1` = at least one
-FAIL, `2` = environment problem (project not in launcher DB, DB
-unreadable), `3` = `--fix` ran but failed to repair at least one
-check.

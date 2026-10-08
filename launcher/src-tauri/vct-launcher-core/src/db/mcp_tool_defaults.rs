@@ -10,10 +10,9 @@
 //! `manifest::ToolAllowlistEntry`) and cleared on uninstall.
 //!
 //! Why a SEPARATE module from `diagrams.rs`:
-//!   * The diagrams.rs file already mixes five concerns (project
-//!     diagrams, snapshots, access grants, per-project tool grants,
-//!     per-project modules). Adding a sixth (per-module/global tool
-//!     defaults) blurs the boundary further.
+//!   * The diagrams.rs file (named for migration 022) holds the
+//!     PER-PROJECT tables: tool grants and module flags. Adding
+//!     per-module/global tool defaults blurs that boundary.
 //!   * `project_mcp_tool_grants` is PER-PROJECT (Phase 1.1 sibling
 //!     keyed on project_id). `module_mcp_tool_defaults` is per-MCP/per-
 //!     module (Phase 4 generalisation keyed on mcp_name). Different
@@ -76,7 +75,7 @@ impl Db {
         // First drop every row for this (mcp_name, module_id) pair.
         // Scoping the delete by module_id matters: two modules could in
         // theory both ship an MCP with the same `mcp_name` (e.g. a
-        // future "diagrams-pro" supplanting bundled diagrams). The
+        // "reranker-pro" module supplanting a bundled reranker). The
         // delete-then-insert pattern keeps each module's row set
         // independent.
         tx.execute(
@@ -185,14 +184,14 @@ mod tests {
     fn reconcile_inserts_fresh_set() {
         let db = empty_db();
         let entries = vec![
-            ("render".to_string(), true, Some("render mermaid".to_string())),
+            ("render".to_string(), true, Some("render output".to_string())),
             ("export_png".to_string(), false, None),
         ];
         let n = db
-            .reconcile_mcp_tool_defaults("mermaid", "diagrams", &entries, 100)
+            .reconcile_mcp_tool_defaults("some-mcp", "some-module", &entries, 100)
             .unwrap();
         assert_eq!(n, 2);
-        let listed = db.list_mcp_tool_defaults("mermaid").unwrap();
+        let listed = db.list_mcp_tool_defaults("some-mcp").unwrap();
         assert_eq!(listed.len(), 2);
         // Sorted alphabetically.
         assert_eq!(listed[0].tool_name, "export_png");
@@ -202,7 +201,7 @@ mod tests {
         assert!(listed[1].default_enabled);
         assert_eq!(
             listed[1].description.as_deref(),
-            Some("render mermaid")
+            Some("render output")
         );
     }
 
@@ -243,17 +242,17 @@ mod tests {
     fn reconcile_empty_clears_set() {
         let db = empty_db();
         db.reconcile_mcp_tool_defaults(
-            "mermaid",
-            "diagrams",
+            "some-mcp",
+            "some-module",
             &[("render".to_string(), true, None)],
             100,
         )
         .unwrap();
-        assert_eq!(db.list_mcp_tool_defaults("mermaid").unwrap().len(), 1);
+        assert_eq!(db.list_mcp_tool_defaults("some-mcp").unwrap().len(), 1);
         // Manifest update drops the tool_allowlist block entirely → empty entries.
-        db.reconcile_mcp_tool_defaults("mermaid", "diagrams", &[], 200)
+        db.reconcile_mcp_tool_defaults("some-mcp", "some-module", &[], 200)
             .unwrap();
-        assert!(db.list_mcp_tool_defaults("mermaid").unwrap().is_empty());
+        assert!(db.list_mcp_tool_defaults("some-mcp").unwrap().is_empty());
     }
 
     #[test]
