@@ -150,6 +150,12 @@ pub struct RegistrationReport {
     pub failures: Vec<String>,
     /// Soft-failures from the optional launcher.db sync step.
     pub db_warnings: Vec<String>,
+    /// v0.2.102 (L-1): names of `auto_scrub` deprecated MCP entries
+    /// removed from `~/.claude.json` during this pass — the same payload
+    /// the CLI path prints one notice line per name for (see lib.rs's
+    /// `register-mcps` handler). Surfaced here so the GUI repair action
+    /// does not scrub silently. Empty on an idempotent second run.
+    pub removed_deprecated: Vec<String>,
 }
 
 /// MCP names the registration-health badge probes for
@@ -542,6 +548,9 @@ pub async fn rerun_mcp_registration(
             "success_count": report.success_count(),
             "total": report.outcomes.len(),
             "failures": failures,
+            // v0.2.102 (L-1): the scrubbed names go into the audit line
+            // too, so a silent-looking GUI repair stays traceable.
+            "removed_deprecated": report.removed_deprecated.clone(),
         }),
     );
 
@@ -551,6 +560,9 @@ pub async fn rerun_mcp_registration(
         total: report.outcomes.len(),
         failures,
         db_warnings: report.db_warnings,
+        // v0.2.102 (L-1): carried, not dropped — the FE toasts one line
+        // per name (mirror of the CLI notice in lib.rs).
+        removed_deprecated: report.removed_deprecated,
     })
 }
 

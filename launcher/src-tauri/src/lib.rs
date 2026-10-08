@@ -3166,11 +3166,11 @@ pub fn run() {
             commands::module_enabled::rl_events_count,
             // v0.2.100 W5R-02: the RL scoring lock every RL scoring control renders.
             commands::module_enabled::rl_scoring_lock,
-            // Generic `project_modules` active-flag read (moved from
-            // diagrams_cmd.rs in v0.2.102). No frontend caller remains
-            // after the Diagrams tab went — the invoke census records it
-            // as an open finding for the owner.
-            commands::module_enabled::is_project_module_active,
+            // v0.2.102 (owner decision 2026-10-08): `is_project_module_active`
+            // was REMOVED from here — after the Diagrams tab went it had zero
+            // callers (the invoke census recorded it as an open finding). The
+            // generic `project_modules` WRITES (`set_project_module_enabled`,
+            // `clear_project_module`) stay registered (see above).
             // PR-6 (v0.2.11): per-project .claude/env key reader+writer
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,

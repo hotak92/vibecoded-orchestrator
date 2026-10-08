@@ -159,14 +159,12 @@ const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string; c
   // read_project_diagram_source, write_text_file, resolve_project_path,
   // subscribe_to_diagram_changes, open_diagrams_editor,
   // open_diagram_editor_for_path. The GENERIC module-toggle machinery
-  // (set_project_module_enabled / clear_project_module /
-  // is_project_module_active) stayed — model_gateway.ts invokes the first
-  // two — and moved from diagrams_cmd.rs to module_enabled.rs.
-  is_project_module_active: {
-    class: 'uncalled-finding',
-    reason:
-      'v0.2.102: kept per the diagrams-removal brief (generic project_modules read surface) but its only callers were the removed Diagrams tab/page wiring; {{#if_module_active}} rendering reads launcher.db directly (vco_lib.module_gated_delivery), not this command. Owner call: wire a consumer or approve removal.',
-  },
+  // (set_project_module_enabled / clear_project_module) stayed —
+  // model_gateway.ts invokes both — and moved from diagrams_cmd.rs to
+  // module_enabled.rs. `is_project_module_active` (an uncalled-finding
+  // entry here at first) was then REMOVED by owner decision 2026-10-08:
+  // it is in neither generate_handler! nor this map now, and either
+  // half coming back alone fails a census test below.
   restart_rl_container: {
     class: 'owner-deferred',
     reason: 'owner 2026-10-05: kept unwired for future RL module enablement ("we need to enable the module later on"); a generic module Restart on the tile would subsume it (v0.2.102+)',

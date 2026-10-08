@@ -50,8 +50,10 @@ pub mod dual_flags;
 // dropped entirely — `diagrams_cmd`, `diagram_watcher` and
 // `diagrams_local_server` are deleted. The GENERIC `project_modules`
 // machinery that lived in `diagrams_cmd` (set_project_module_enabled /
-// clear_project_module / is_project_module_active + the re-render and
-// bundle-update spawns) moved to `module_enabled.rs`.
+// clear_project_module + the re-render and bundle-update spawns) moved
+// to `module_enabled.rs`. The `is_project_module_active` READ command
+// moved with them, then was REMOVED (owner decision 2026-10-08): zero
+// callers remained after the Diagrams tab went.
 pub mod embed_admission;
 pub mod embedding_catalog;
 pub mod embedding_enrichment;

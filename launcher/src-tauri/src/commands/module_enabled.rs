@@ -1071,102 +1071,15 @@ fn resolve_project_python(folder: &Path) -> Option<PathBuf> {
 }
 
 // ─── Module-active lookup ───────────────────────────────────────────────
-
-/// Set of modules that are orchestrator-bundled-default-active. When
-/// `is_project_module_active` is called for one of these and no row
-/// exists in `project_modules` yet, we treat the absence as a
-/// pre-v0.2.33 backfill gap (these projects existed before the seed
-/// path in `projects_v2.rs:521` was wired) — auto-seed the row with
-/// `enabled=true` and return true.
-///
-/// The user's explicit opt-out writes `enabled=0` which is a real row,
-/// so the backfill never re-enables what the user disabled.
-///
-/// EMPTY since v0.2.102: the only member was `diagrams`, dropped with
-/// the diagrams integrations (owner ruling 2026-10-07) along with its
-/// project-creation seeding in `projects_v2.rs`. The mechanism stays for
-/// any future orchestrator-bundled module that ships default-active.
-const ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES: &[&str] = &[];
-
-/// Read the `project_modules` active flag for a (project, module) pair.
-/// Returns `false` for unknown pairs (no row) UNLESS the module is in
-/// the orchestrator-bundled-default-active set (see
-/// `ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES` — empty since v0.2.102),
-/// in which case the row is seeded with `enabled=true` and we return true.
-///
-/// Soft-fail: if the seed write fails (e.g. transient DB lock) we log
-/// + still return `true` so the user-facing surface isn't blocked on a
-/// write retry. The next call retries the seed.
-#[command]
-pub async fn is_project_module_active(
-    project_id: String,
-    module_name: String,
-    db: State<'_, Db>,
-) -> Result<bool, String> {
-    // First check: row exists?
-    let active = db
-        .is_module_active(&project_id, &module_name)
-        .map_err(|e| format!("is_project_module_active: {e}"))?;
-    if active {
-        return Ok(true);
-    }
-
-    // Row absent or explicitly disabled. The DB layer collapses both
-    // cases into `false`, so we need to disambiguate before deciding
-    // whether to backfill. A direct query keeps the DB layer pure
-    // (no new method needed on `Db`) and is cheap (~1 row scan).
-    if ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES.contains(&module_name.as_str())
-        && !has_module_row(&db, &project_id, &module_name)?
-    {
-        // Backfill: pre-v0.2.33 projects predate the seed path in
-        // `projects_v2.rs:521`, so the row is missing rather than
-        // user-disabled. Seed it default-active.
-        if let Err(e) = db.set_project_module_enabled(&project_id, &module_name, true) {
-            tracing::warn!(
-                "[vct] is_project_module_active: backfill seed failed for \
-                 ({}, {}): {} — returning true anyway; next call retries",
-                project_id, module_name, e
-            );
-        } else {
-            // Audit so we can trace retroactive seeds in support cases.
-            let _ = db.audit(
-                "project_module_backfill_seed",
-                Some(&project_id),
-                None,
-                &serde_json::json!({
-                    "module": module_name,
-                    "reason": "orchestrator_bundled_default_active",
-                }),
-            );
-        }
-        return Ok(true);
-    }
-
-    Ok(false)
-}
-
-/// Returns true if `(project_id, module_name)` has any row in
-/// `project_modules` (regardless of `enabled` value). Used to
-/// disambiguate "row absent" from "row present, disabled" in
-/// `is_project_module_active`. Soft-fails on DB errors — returns
-/// false so the caller's backfill path runs (the row will get
-/// recreated, idempotent UPSERT).
-fn has_module_row(db: &Db, project_id: &str, module_name: &str) -> Result<bool, String> {
-    let guard = db.lock();
-    let exists: bool = guard
-        .query_row(
-            "SELECT 1 FROM project_modules
-             WHERE project_id = ?1 AND module_name = ?2
-             LIMIT 1",
-            rusqlite::params![project_id, module_name],
-            |_| Ok(true),
-        )
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(false),
-            other => Err(format!("has_module_row({}, {}): {}", project_id, module_name, other)),
-        })?;
-    Ok(exists)
-}
+// v0.2.102 (owner decision 2026-10-08): the `is_project_module_active`
+// Tauri command and the default-active backfill it carried
+// (`ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES` + `has_module_row`) were
+// REMOVED — after the Diagrams tab went, the command had zero callers
+// (the invoke census recorded it as an open finding). The `project_modules`
+// read surface that remains is `Db::is_module_active` (used by the tests
+// below and the generic module machinery) and the module_enabled /
+// module_effective_enabled commands; nothing seeds a default-active row
+// any more.
 
 #[cfg(test)]
 mod tests {
@@ -1475,10 +1388,9 @@ mod tests {
         // — never an error.
         //
         // NOTE: this exercises the DB layer directly (Db::is_module_active),
-        // NOT the Tauri command. The command layer adds the backfill for
-        // modules in ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES (empty
-        // since v0.2.102) — see `has_module_row_distinguishes_absent_from_disabled`
-        // below for the command-layer contract.
+        // NOT a Tauri command — the `is_project_module_active` command and
+        // its default-active backfill were removed in v0.2.102 (owner
+        // decision 2026-10-08: zero callers after the Diagrams tab went).
         let dir = tempfile::tempdir().unwrap();
         let db = make_db_with_project("p1", "Acme", dir.path());
         let r = db.is_module_active("p1", "model_gateway").unwrap();
@@ -1504,31 +1416,10 @@ mod tests {
     }
 
     #[test]
-    fn has_module_row_distinguishes_absent_from_disabled() {
-        // The Tauri command layer's backfill relies on `has_module_row`
-        // to tell apart "no row exists yet" from "row exists with
-        // enabled=0". Without this distinction we'd re-enable modules
-        // the user explicitly opted out of.
-        let dir = tempfile::tempdir().unwrap();
-        let db = make_db_with_project("p1", "Acme", dir.path());
-
-        // Absent row → returns false.
-        assert!(!has_module_row(&db, "p1", "model_gateway").unwrap());
-
-        // Disabled row → returns true (row exists, even if enabled=0).
-        db.set_project_module_enabled("p1", "model_gateway", false).unwrap();
-        assert!(has_module_row(&db, "p1", "model_gateway").unwrap());
-
-        // Enabled row → also true.
-        db.set_project_module_enabled("p1", "model_gateway", true).unwrap();
-        assert!(has_module_row(&db, "p1", "model_gateway").unwrap());
-    }
-
-    #[test]
     fn is_module_active_round_trips_through_set_then_get() {
         // Toggle on → reflects as true; toggle off → reflects as false.
         // Mirrors the lifecycle exercised by `set_project_module_enabled`
-        // + `is_project_module_active` from the frontend.
+        // from the frontend (model_gateway.ts) against the Db read.
         let dir = tempfile::tempdir().unwrap();
         let db = make_db_with_project("p1", "Acme", dir.path());
         db.set_project_module_enabled("p1", "model_gateway", true).unwrap();

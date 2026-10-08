@@ -41,10 +41,11 @@ What this test pins
 
 The wrapper-MCP spawn (``python -m claude_mcp_servers.wrappers.mermaid_proxy``)
 is NOT exercised here because ``claude_mcp_servers/`` is not in the
-wheel by design (the wrappers are launcher-MCP infrastructure, not
-library code). The wrapper IS exercised by ``test_mermaid_proxy.py``
-and ``test_excalidraw_proxy.py``; the regression that THIS test guards
-is the import-time ``load_bundled_versions()`` failure, which is the
+wheel by design (the wrappers were launcher-MCP infrastructure, not
+library code). The wrapper WAS exercised, while the diagram wrappers
+still shipped (removed in v0.2.102), by ``test_mermaid_proxy.py`` and
+``test_excalidraw_proxy.py``; the regression that THIS test guards
+is the import-time ``load_bundled_versions()`` failure, which was the
 proximate cause of the wrapper ``SystemExit(1)``.
 
 Build mechanics

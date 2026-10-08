@@ -1947,11 +1947,13 @@ pub struct McpRegistration {
     /// per-project overrides in `project_mcp_tool_grants`. Per-project
     /// rows always win; absent rows fall through to `default_enabled`.
     ///
-    /// Empty `Vec` and `None` are semantically equivalent here — the hub
-    /// falls back to its hardcoded bundled-MCP defaults when no rows are
-    /// registered for `mcp_name`. This means an orchestrator-bundled MCP
-    /// that ships WITHOUT a manifest still gets sensible defaults; a paid
-    /// module that ships WITH a manifest declares its own.
+    /// Empty `Vec` and `None` are semantically equivalent here — with no
+    /// rows registered for `mcp_name` the hub returns an EMPTY grants
+    /// map: failsafe-DENY for an unregistered MCP, never failsafe-ALLOW
+    /// (v0.2.102 removed the hardcoded bundled-MCP fallback that used to
+    /// fill this arm, along with the deleted diagram wrappers). Defaults
+    /// exist only when a module manifest declares them; a paid module
+    /// that ships WITH a manifest declares its own.
     ///
     /// Reconciliation contract on module update: tools added in the new
     /// version are inserted with their declared `default_enabled`. Tools

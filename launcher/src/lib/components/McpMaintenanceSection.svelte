@@ -30,6 +30,7 @@
   import {
     isUserReEnabledAfterRetirement,
     npxState,
+    removedDeprecatedNotices,
     retiredBadgeText,
     retiredRows,
     showsCannotSpawnTag,
@@ -80,6 +81,8 @@
     total: number;
     failures: string[];
     db_warnings: string[];
+    /** v0.2.102: auto_scrub deprecated entries removed during this pass. */
+    removed_deprecated: string[];
   }
   interface StaleMcpEntry {
     name: string;
@@ -168,6 +171,12 @@
         );
       }
       for (const w of res.db_warnings) toast.error(`DB warning: ${w}`);
+      // v0.2.102 L-1: the scrub of auto_scrub deprecated MCP entries is
+      // NEVER silent on this path either — one toast per removed name,
+      // the same sentence the CLI prints (see mcp-maintenance-logic).
+      for (const line of removedDeprecatedNotices(res.removed_deprecated)) {
+        toast.info(line);
+      }
     } catch (e) {
       toast.error(e);
     } finally {

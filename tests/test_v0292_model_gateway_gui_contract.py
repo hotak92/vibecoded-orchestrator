@@ -361,16 +361,19 @@ def test_frontend_slot_key_list_matches_the_writer():
 
 
 def test_the_gate_is_default_OFF_on_BOTH_sides():
-    """Two independent default-active lists must agree, or the GUI lies.
+    """The default-active gate must stay default-OFF, or the GUI lies.
 
     The template renderer resolves active modules in Python
-    (`_DEFAULT_ACTIVE_MODULES`); the card's checkbox reads the Rust
-    `is_project_module_active`, which seeds a row for anything in
-    `ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES`. If `model_gateway` were
-    added to either, the two would disagree — a checkbox showing ON over a
-    CLAUDE.md with no routing section, or vice versa — and the whole "an
-    install with no gateway reads nothing about GLM" guarantee would depend
-    on which side you asked.
+    (`_DEFAULT_ACTIVE_MODULES`). Its former Rust mirror — the
+    `is_project_module_active` command with its
+    `ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES` backfill — was REMOVED in
+    v0.2.102 (owner decision 2026-10-08: zero callers after the Diagrams
+    tab went), so nothing on the Rust side can seed a default-active row
+    any more. If `model_gateway` were added to the Python list (or the
+    Rust backfill command were resurrected), a checkbox could show ON over
+    a CLAUDE.md with no routing section — and the whole "an install with
+    no gateway reads nothing about GLM" guarantee would depend on which
+    side you asked.
     """
     from vco_lib.project_init import _DEFAULT_ACTIVE_MODULES
 
@@ -379,13 +382,20 @@ def test_the_gate_is_default_OFF_on_BOTH_sides():
     rust = (
         REPO / "launcher" / "src-tauri" / "src" / "commands" / "module_enabled.rs"
     ).read_text(encoding="utf-8")
-    m = re.search(
-        r"ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES: &\[&str\] = &\[(.*?)\];",
-        rust,
-        re.DOTALL,
+    # The declaration, not the name: historical comments in the file may
+    # mention the removed const, but a live `const ... : &[&str]` is a
+    # resurrection.
+    assert not re.search(
+        r"ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES\s*:\s*&\[&str\]", rust
+    ), (
+        "the Rust default-active backfill was removed with "
+        "`is_project_module_active` in v0.2.102; a resurrection needs this "
+        "test re-pointed at the new list"
     )
-    assert m, "the Rust default-active list moved; re-point this test"
-    assert "model_gateway" not in m.group(1)
+    assert "pub async fn is_project_module_active" not in rust, (
+        "the `is_project_module_active` Tauri command was removed in "
+        "v0.2.102 (zero callers); wire a consumer first if it returns"
+    )
 
 
 def test_frontend_module_name_matches_the_template_gate():

@@ -2,8 +2,9 @@
 # Copyright (c) 2026 VibeCoded Tools
 """DB-as-source-of-truth contract for the per-project ``.env`` template.
 
-This module is **Phase 0.D** of the diagrams-integration plan (2026-05-24,
-see ``.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md``).
+Historical provenance: this module began as Phase 0.D of the
+diagrams-integration plan (2026-05-24 — that plan's runtime was removed
+in v0.2.102, but this env surface is plan-independent and stays).
 It is the parallel of :mod:`vco_lib.config_projection` for the FOURTH
 per-project env surface that Phase 0.B explicitly carved out as out-of-
 scope:

@@ -9,6 +9,7 @@ import {
   isUserReEnabledAfterRetirement,
   MCP_RETIRED_CONFIG_KEY,
   npxState,
+  removedDeprecatedNotices,
   retiredBadgeText,
   retiredRows,
   showsCannotSpawnTag,
@@ -105,6 +106,27 @@ describe('retiredBadgeText', () => {
       'retired',
     );
     expect(retiredBadgeText(row({ mcp_name: 'x', config: null }))).toBe('retired');
+  });
+});
+
+describe('removedDeprecatedNotices', () => {
+  // v0.2.102 L-1: the GUI repair action scrubs auto_scrub deprecated MCP
+  // entries (mermaid/excalidraw leftovers); this is the notice surface so
+  // the scrub is never silent.
+  it('returns one CLI-mirroring notice line per scrubbed name', () => {
+    expect(removedDeprecatedNotices(['mermaid', 'excalidraw'])).toEqual([
+      'removed obsolete MCP entry `mermaid` — that module no longer ships',
+      'removed obsolete MCP entry `excalidraw` — that module no longer ships',
+    ]);
+  });
+
+  it('says nothing on an idempotent second run (empty list)', () => {
+    expect(removedDeprecatedNotices([])).toEqual([]);
+  });
+
+  it('tolerates a nullish payload from an older backend without throwing', () => {
+    expect(removedDeprecatedNotices(null)).toEqual([]);
+    expect(removedDeprecatedNotices(undefined)).toEqual([]);
   });
 });
 

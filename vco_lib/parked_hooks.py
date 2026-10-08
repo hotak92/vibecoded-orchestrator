@@ -64,9 +64,10 @@ separators). Two commands are the same hook when they invoke the same
 (:func:`vco_lib.hook_retirements.vco_hook_script_identity` — the identity the
 supersede pass already uses), or, for an inline command, when they are equal
 after :func:`vco_lib.hook_retirements.normalize_command` (which strips that
-guard prefix). The matcher must match too, because the template ships some
-scripts under several matchers in one event (``pre-diagram-path-validation.sh``
-under ``Write|Edit`` and the diagram MCP matchers; until v0.2.101 also
+guard prefix). The matcher must match too, because the template HAS
+SHIPPED some scripts under several matchers in one event (until v0.2.102
+``pre-diagram-path-validation.sh`` under ``Write|Edit`` and the diagram
+MCP matchers, retired with the diagrams integrations; until v0.2.101 also
 ``kg-summary-generator.sh`` under ``Edit``, ``Write`` and a store tool — those
 three async registrations merged into the ``post-tool-use-async`` dispatcher)
 and disabling one of them must not keep

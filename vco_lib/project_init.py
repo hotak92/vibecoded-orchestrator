@@ -254,12 +254,11 @@ def derive_project_collection_names(project_name: str) -> dict:
     writes are gated). Default "false" (writes allowed). Stored as a
     string so all 4 env surfaces can pass it through unchanged.
 
-    `diagrams_collection` is the per-project Weaviate class that holds
-    Mermaid/Excalidraw diagrams indexed by `vco_lib.diagram_indexer`
-    (Phase 1.5 of the Diagrams Integration). Auto-paired with the KG
-    collection on project init by `derive_project_diagrams_name`
-    callers; reads are unconditional, writes flow through the indexer
-    module only.
+    `diagrams_collection` names the per-project Weaviate class an older
+    install created for diagrams. v0.2.102 removed the diagrams runtime
+    (and `vco_lib.diagram_indexer`); the field is RECOGNITION-ONLY —
+    `derive_project_diagrams_name` callers still name the class so
+    migrate/drop/orphan paths recognise existing user collections.
     """
     basename = sanitize_for_weaviate_class(project_name)
     # Canonical shared KG class name. Aligned across:
