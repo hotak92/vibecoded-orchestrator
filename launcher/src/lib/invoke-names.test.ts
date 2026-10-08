@@ -140,8 +140,6 @@ const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string; c
   // v0.2.101 Q4: apply_module_db_migrations left this table — it is now
   // invoked by the module tile's "Re-apply DB migrations" repair action
   // (ModuleCatalog), gated on the recorded last-apply failure state.
-  diagram_grant_access: { class: 'owner-deferred', reason: OWNER_0102 },
-  list_diagram_access: { class: 'owner-deferred', reason: OWNER_0102 },
   migrate_to_bind_path: { class: 'owner-deferred', reason: OWNER_0102 },
   migrate_to_named_volume: { class: 'owner-deferred', reason: OWNER_0102 },
   perform_hard_cut: { class: 'owner-deferred', reason: OWNER_030 },
@@ -151,6 +149,24 @@ const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string; c
   // cannot be listed here (the stale-entry assertion would fail):
   // check_for_weights_update_now, delete_project_codegraph_binding (and
   // get_diagrams_token + the all-projects env wrapper went in v0.2.100).
+  // v0.2.102 (diagrams dropped, owner ruling 2026-10-07): the whole diagram
+  // command set left generate_handler! with the Diagrams tab —
+  // list_project_diagrams, register_project_diagram,
+  // create_starter_diagram_file, unregister_project_diagram,
+  // set_project_diagram_enabled, list_diagram_snapshots,
+  // create_diagram_snapshot, restore_diagram_snapshot,
+  // delete_diagram_snapshot, diagram_grant_access, list_diagram_access,
+  // read_project_diagram_source, write_text_file, resolve_project_path,
+  // subscribe_to_diagram_changes, open_diagrams_editor,
+  // open_diagram_editor_for_path. The GENERIC module-toggle machinery
+  // (set_project_module_enabled / clear_project_module /
+  // is_project_module_active) stayed — model_gateway.ts invokes the first
+  // two — and moved from diagrams_cmd.rs to module_enabled.rs.
+  is_project_module_active: {
+    class: 'uncalled-finding',
+    reason:
+      'v0.2.102: kept per the diagrams-removal brief (generic project_modules read surface) but its only callers were the removed Diagrams tab/page wiring; {{#if_module_active}} rendering reads launcher.db directly (vco_lib.module_gated_delivery), not this command. Owner call: wire a consumer or approve removal.',
+  },
   restart_rl_container: {
     class: 'owner-deferred',
     reason: 'owner 2026-10-05: kept unwired for future RL module enablement ("we need to enable the module later on"); a generic module Restart on the tile would subsume it (v0.2.102+)',

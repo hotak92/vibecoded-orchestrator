@@ -384,7 +384,8 @@ pub async fn list_project_hooks_effective(
 }
 
 /// Testable core of [`list_project_hooks_effective`] (takes `&Db` instead of
-/// `State<Db>`) — the `create_starter_diagram_file_with_db` precedent.
+/// `State<Db>`) — the pattern the (v0.2.102-deleted)
+/// `create_starter_diagram_file_with_db` set.
 pub async fn effective_hooks_view(
     db: &Db,
     project_id: &str,

@@ -270,13 +270,15 @@ export const ASYNC_DISABLED_KEY = 'VCO_ASYNC_DISABLED_HOOKS';
 /** The routed sub-hooks. MUST MATCH the dispatcher ROUTE_TABLEs
  * (templates/hooks/post-tool-use-async.{sh,ps1}) — the vitest suite
  * DERIVES the set from the shipped table, so a routing row without a
- * toggle here (or a toggle without a row) is red. */
+ * toggle here (or a toggle without a row) is red.
+ * (v0.2.102: `post-file-delete` left the table — it was 100% the
+ * diagram-delete cascade and was retired with the dropped diagrams
+ * integrations.) */
 export const ASYNC_SUBHOOK_STEMS: readonly string[] = [
   'post-edit-outcome',
   'kg-summary-generator',
   'post-bash-context-record',
   'post-git-commit-kg-sync',
-  'post-file-delete',
   'kg-update-nudge',
 ];
 
@@ -286,7 +288,6 @@ export const ASYNC_SUBHOOK_DESCRIPTIONS: Record<string, string> = {
   'kg-summary-generator': 'KG node summary refresh after knowledge edits and node writes',
   'post-bash-context-record': 'Bash outcome telemetry paired with the pre-bash injection',
   'post-git-commit-kg-sync': 'Background KG review agent after a git commit',
-  'post-file-delete': 'Diagram delete cascade (SQLite + sidecar + Weaviate)',
   'kg-update-nudge': 'Per-tool-call work-unit bookkeeping behind the KG-write nudge',
 };
 
@@ -307,7 +308,7 @@ export function parseAsyncDisabled(raw: string | null | undefined): string[] {
 }
 
 /** Whether one stem is currently switched off (exact stem match — a
- * `post-file` entry must never disable `post-file-delete`). */
+ * `post-git` entry must never disable `post-git-commit-kg-sync`). */
 export function isAsyncSubhookDisabled(
   raw: string | null | undefined,
   stem: string,

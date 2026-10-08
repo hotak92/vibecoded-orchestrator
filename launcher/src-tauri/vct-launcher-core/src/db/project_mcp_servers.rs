@@ -324,8 +324,10 @@ impl Db {
     /// enabled it on purpose" — the column holds the same value either way —
     /// so a remediation pass would silently disable diagram MCPs some users
     /// deliberately turned on. Flipping a user-visible toggle on a guess is
-    /// worse than a stale default on installs that already exist; the toggle
-    /// is one click in the launcher's Diagrams tab for anyone who wants it off.
+    /// worse than a stale default on installs that already exist. (v0.2.102:
+    /// the rows themselves are now retired by the deprecated registry and
+    /// the `~/.claude.json` entries auto-scrubbed; this note stays as the
+    /// record of why no enabled-flag remediation ever ran.)
     #[allow(clippy::too_many_arguments)]
     pub fn register_project_mcp_server_honoring_defaults(
         &self,

@@ -168,16 +168,18 @@ const DEFAULT_MCP_NAMES: &[&str] = &["weaviate-kg"];
 /// Bundled MCPs whose registered `command` is a BARE NAME resolved from PATH.
 ///
 /// v0.2.91 WP-D. These are evaluated ONLY when the entry is actually present
-/// in `~/.claude.json` — `mermaid`/`excalidraw` are no longer registered by
-/// default (retired in v0.2.101) and `playwright` may be legitimately absent,
-/// so their absence must never move the badge (the reason
-/// `DEFAULT_MCP_NAMES` excludes them). A legacy install may still have the
-/// diagram wrappers present; they too spawn `npx` as a child. What
-/// DOES move the badge is a PRESENT entry whose command cannot be resolved:
-/// that MCP is registered, enabled, and structurally incapable of starting —
-/// the failure that went unseen for months in the field because nothing on any
-/// surface asked the question.
-const NPX_DEPENDENT_MCP_NAMES: &[&str] = &["playwright", "mermaid", "excalidraw"];
+/// in `~/.claude.json` — `playwright` may be legitimately absent, so its
+/// absence must never move the badge (the reason `DEFAULT_MCP_NAMES`
+/// excludes it). What DOES move the badge is a PRESENT entry whose command
+/// cannot be resolved: that MCP is registered, enabled, and structurally
+/// incapable of starting — the failure that went unseen for months in the
+/// field because nothing on any surface asked the question.
+///
+/// v0.2.102: reduced to `["playwright"]` — the list's other two members
+/// (`mermaid`, `excalidraw`) were the diagram wrappers, dropped with the
+/// diagrams integrations (owner ruling 2026-10-07); their leftover entries
+/// are removed by the auto-scrub, never probed.
+const NPX_DEPENDENT_MCP_NAMES: &[&str] = &["playwright"];
 
 /// Payload of `python -m vco_lib.npx_resolver --json`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1530,10 +1532,11 @@ mod tests {
 
     #[test]
     fn absent_npx_mcps_do_not_move_the_badge() {
-        // mermaid/excalidraw are no longer registered by default (retired in
-        // v0.2.101) and playwright may be absent. Their absence is not a fault
-        // (the reason DEFAULT_MCP_NAMES excludes them) — only a
-        // PRESENT+unspawnable entry is.
+        // playwright may be absent from `~/.claude.json`. Its absence is not
+        // a fault (the reason DEFAULT_MCP_NAMES excludes it) — only a
+        // PRESENT+unspawnable entry is. (v0.2.102: the other two names this
+        // test used to cite — mermaid/excalidraw — are dropped; their
+        // leftover entries are auto-scrubbed, never probed.)
         let root = "/opt/vco";
         let servers = servers_from(healthy_defaults(root));
         let probe = probe_with(None, false);
@@ -1568,8 +1571,8 @@ mod tests {
         let root = "/opt/vco";
         let mut servers = servers_from(healthy_defaults(root));
         servers.insert(
-            "mermaid".to_string(),
-            serde_json::json!({"command": "/opt/vco/.venv/bin/python", "args": ["-m", "x"]}),
+            "playwright".to_string(),
+            serde_json::json!({"command": "/opt/node/bin/npx", "args": ["-y", "@playwright/mcp@latest"]}),
         );
         assert!(
             bare_commands_to_probe(&servers).is_empty(),
@@ -1579,7 +1582,7 @@ mod tests {
         let (entries, badge, _) = build_registration_view(root, &servers, Some(&probe));
         assert_eq!(badge, "green");
         assert_eq!(
-            entries.iter().find(|e| e.name == "mermaid").unwrap().command_resolvable,
+            entries.iter().find(|e| e.name == "playwright").unwrap().command_resolvable,
             None,
         );
     }
@@ -1867,9 +1870,9 @@ mod tests {
                     "command": user_path,
                     "args": ["/srv/user-mcp/server.js"],
                 },
-                "mermaid": {
+                "other-vco-mcp": {
                     "command": format!("{}/.venv/bin/python", install_root),
-                    "args": ["-m", "claude_mcp_servers.wrappers.mermaid_proxy"],
+                    "args": ["-m", "claude_mcp_servers.weaviate_mcp.server"],
                 },
             }
         });
@@ -1877,7 +1880,7 @@ mod tests {
 
         let stale = detect_stale_mcp_entries(install_root, &tmp);
         // `weaviate-kg` is stale (venv outside install_root).
-        // `mermaid` already anchored on install_root — not stale.
+        // `other-vco-mcp` already anchored on install_root — not stale.
         // `user-mcp` is /usr/bin/node — not vco-shaped, ignored.
         assert_eq!(stale.len(), 1, "expected exactly 1 stale entry, got: {:?}", stale);
         assert_eq!(stale[0].name, "weaviate-kg");

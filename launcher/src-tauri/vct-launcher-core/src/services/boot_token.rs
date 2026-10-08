@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // v0.2.54 Track I — per-boot bearer-token primitives, extracted from
-// `vct-hub/src/auth.rs` so a second local HTTP surface (the launcher's
-// diagrams editor server, `<vct_root_dir>/diagrams.token`) can reuse
-// the exact same generate / persist / compare discipline instead of
-// growing a near-identical copy. vct-hub's `auth.rs` now delegates to
-// this module for `hub.token`; keep the two call-sites on the SAME
-// implementation — drift between token surfaces is how subtle auth
-// bugs are born.
+// `vct-hub/src/auth.rs` so a second local HTTP surface can reuse the
+// exact same generate / persist / compare discipline instead of
+// growing a near-identical copy (the first was the v0.2.102-deleted
+// diagrams editor server's `<vct_root_dir>/diagrams.token`). vct-hub's
+// `auth.rs` now delegates to this module for `hub.token`; keep every
+// call-site on the SAME implementation — drift between token surfaces
+// is how subtle auth bugs are born.
 //
 // Scope: deliberately tiny and dependency-light (rand + hex only — no
 // axum/http types). HTTP-layer concerns (HeaderMap extraction,

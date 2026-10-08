@@ -428,7 +428,7 @@ describe('async sub-hook toggles — list semantics', () => {
   it('tells whether a stem is off — exact stems only', () => {
     expect(isAsyncSubhookDisabled('a,b', 'b')).toBe(true);
     expect(isAsyncSubhookDisabled('a,b', 'c')).toBe(false);
-    expect(isAsyncSubhookDisabled('post-file', 'post-file-delete')).toBe(false);
+    expect(isAsyncSubhookDisabled('post-git', 'post-git-commit-kg-sync')).toBe(false);
   });
 
   it('computes the value to persist; null REMOVES the key', () => {
@@ -441,8 +441,8 @@ describe('async sub-hook toggles — list semantics', () => {
   });
 
   it('confirms with what changed', () => {
-    expect(asyncSubhookToastText('post-file-delete', true)).toMatch(/skipped/);
-    expect(asyncSubhookToastText('post-file-delete', false)).toMatch(/runs again/);
+    expect(asyncSubhookToastText('kg-update-nudge', true)).toMatch(/skipped/);
+    expect(asyncSubhookToastText('kg-update-nudge', false)).toMatch(/runs again/);
   });
 
   it('explains the channel and the carried-over pre-merge disables', () => {

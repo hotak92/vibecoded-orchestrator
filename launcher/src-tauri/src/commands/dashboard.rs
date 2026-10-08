@@ -297,92 +297,20 @@ async fn update_orchestrator_setting_inner(
 // MCP server management
 // ---------------------------------------------------------------------------
 
-/// The retired diagram-wrapper MCP ids (v0.2.101): no longer registered on
-/// install, but an install that already has an entry KEEPS it (owner
-/// ruling). Rows for them are appended to the server list ONLY when the
-/// entry is actually registered, so the per-project Permissions toggle
-/// keeps working on legacy installs and fresh installs see nothing.
-pub(crate) const LEGACY_WRAPPER_MCP_IDS: [&str; 2] = ["mermaid", "excalidraw"];
-
-/// Testable core of [`get_mcp_servers`]: the catalog rows plus a read-only
-/// row per LEGACY wrapper id that is registered in `~/.claude.json` but
-/// absent from the catalog (v0.2.101). Pure — no filesystem.
-pub(crate) fn with_legacy_wrapper_rows(
-    catalog: Vec<McpServerConfig>,
-    registered: &[String],
-) -> Vec<McpServerConfig> {
-    let mut servers = catalog;
-    for id in LEGACY_WRAPPER_MCP_IDS {
-        if !registered.iter().any(|n| n == id) {
-            continue; // not on this install — nothing to show
-        }
-        if servers.iter().any(|s| s.id == id) {
-            continue; // catalog still lists it — no duplicate row
-        }
-        servers.push(McpServerConfig {
-            id: id.to_string(),
-            name: id.to_string(),
-            description: "Legacy diagram wrapper MCP kept from a pre-v0.2.101 \
-                install (not re-registered). Per-project on/off lives in the \
-                project's Permissions tab."
-                .to_string(),
-            enabled: true,
-            command: String::new(),
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            min_tier: OrchestratorTier::Free,
-            port: None,
-            configurable: false,
-            settings: std::collections::HashMap::new(),
-        });
-    }
-    servers
-}
-
-/// The registered legacy wrapper names for THIS machine (empty on a fresh
-/// install or when `~/.claude.json` cannot be read — the list is then just
-/// the catalog). Separate from the pure core so tests need no filesystem.
-fn registered_names_here() -> Vec<String> {
-    crate::mcp_registration::registered_mcp_names(
-        &crate::mcp_registration::user_claude_json(),
-    )
-    .unwrap_or_default()
-}
+// v0.2.102 (owner ruling 2026-10-07, diagrams dropped): the legacy
+// diagram-wrapper surface that used to live here — LEGACY_WRAPPER_MCP_IDS,
+// `with_legacy_wrapper_rows` and `legacy_wrapper_toggle_refusal` — was
+// removed. It existed so a pre-v0.2.101 install that KEPT a `mermaid` /
+// `excalidraw` entry still showed a row with a per-project remedy. With
+// `[deprecated.mermaid]` / `[deprecated.excalidraw]` now carrying
+// `auto_scrub = true`, the ordinary update removes those VCO-shaped
+// entries outright, so the rows are unreachable and the classification
+// is dead code.
 
 /// Get all MCP server configurations.
 #[command]
 pub fn get_mcp_servers() -> Vec<McpServerConfig> {
-    with_legacy_wrapper_rows(load_config().mcp_servers, &registered_names_here())
-}
-
-/// SF-1 (v0.2.101): the GLOBAL toggle must never be a one-way loss for a
-/// legacy wrapper entry. Disable used to deregister it from
-/// `~/.claude.json` (irreversible from the GUI), while enable is refused
-/// because the canonical registration builder retired the wrappers — so
-/// OFF destroyed the entry and ON was an error. Both directions are now
-/// refused with the truthful remedy: the non-destructive channel for
-/// these rows is the per-project Permissions toggle, which writes the
-/// project's `disabledMcpServers` and needs no global registration
-/// change. Pure — no filesystem — so tests need no `~/.claude.json`.
-///
-/// Mirrors the row condition in `with_legacy_wrapper_rows`: an id that is
-/// REGISTERED but ABSENT from the catalog.
-pub(crate) fn legacy_wrapper_toggle_refusal(
-    mcp_id: &str,
-    in_catalog: bool,
-    registered: bool,
-) -> Option<String> {
-    if in_catalog || !registered {
-        return None;
-    }
-    Some(format!(
-        "MCP server '{}' is a legacy diagram-wrapper entry kept from a pre-v0.2.101 \
-         install (registration retired in v0.2.101); the launcher does not modify \
-         its global registration. Turn it off per project instead: the project's \
-         Permissions tab → MCP servers (stored as `disabledMcpServers` under this \
-         project's entry in ~/.claude.json)",
-        mcp_id
-    ))
+    load_config().mcp_servers
 }
 
 /// Toggle an MCP server on/off.
@@ -412,23 +340,6 @@ async fn toggle_mcp_server_inner(mcp_id: String, enabled: bool, tier: &str) -> R
     // the install path while `server` mutably borrows `config`.
     let install_path = config.install_path.clone();
 
-    // v0.2.101: a legacy wrapper entry that is registered but no longer in
-    // the catalog (appended to `get_mcp_servers` for the per-project
-    // toggle) has no catalog row to flip. SF-1 (v0.2.101 re-review): BOTH
-    // directions are refused — disable used to deregister the entry, a
-    // one-way loss since enable cannot re-register it (the canonical
-    // entry builder retired the wrappers). The owner ruling is that an
-    // install which kept the entry KEEPS it; the launcher never makes
-    // keeping it a one-way loss. The per-project `disabledMcpServers`
-    // toggle is the non-destructive off-switch for these rows.
-    if let Some(err) = legacy_wrapper_toggle_refusal(
-        &mcp_id,
-        config.mcp_servers.iter().any(|s| s.id == mcp_id),
-        registered_names_here().iter().any(|n| *n == mcp_id),
-    ) {
-        return Err(err);
-    }
-
     let server = config.mcp_servers.iter_mut()
         .find(|s| s.id == mcp_id)
         .ok_or_else(|| format!("MCP server '{}' not found", mcp_id))?;
@@ -449,7 +360,7 @@ async fn toggle_mcp_server_inner(mcp_id: String, enabled: bool, tier: &str) -> R
     // venv-python / real wrapper module args / filtered env) — NOT the
     // GUI-catalog shape from `mcp_server_to_claude_entry`. The catalog's
     // command fields are display stubs (relative .py path for
-    // weaviate-kg, bare `python` for the diagram wrappers, empty env):
+    // weaviate-kg, empty env):
     // writing them into ~/.claude.json produced an entry Claude Code
     // could not spawn, so a disable→enable cycle permanently broke the
     // MCP until the next `install.py --update` rewrote it. The catalog
@@ -916,137 +827,13 @@ mod tests {
     #[allow(dead_code)]
     static SERIALIZE: Mutex<()> = Mutex::new(());
 
-    fn catalog_row(id: &str) -> McpServerConfig {
-        McpServerConfig {
-            id: id.to_string(),
-            name: id.to_string(),
-            description: String::new(),
-            enabled: true,
-            command: "python".into(),
-            args: Vec::new(),
-            env: HashMap::new(),
-            min_tier: OrchestratorTier::Free,
-            port: None,
-            configurable: true,
-            settings: HashMap::new(),
-        }
-    }
-
-    /// v0.2.101 (owner ruling): a legacy install that still carries a
-    /// diagram-wrapper entry keeps its row in the server list — the
-    /// Permissions tab builds the per-project toggle table from it.
-    /// Red-proof: drop the `with_legacy_wrapper_rows` append (or gate it on
-    /// something other than registration) → this fails.
-    #[test]
-    fn legacy_wrapper_rows_appear_only_when_registered() {
-        // Registered legacy wrapper → appended after the catalog rows.
-        let out = with_legacy_wrapper_rows(
-            vec![catalog_row("weaviate-kg")],
-            &["weaviate-kg".to_string(), "mermaid".to_string()],
-        );
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[1].id, "mermaid");
-        assert!(!out[1].configurable, "no catalog row backs this toggle");
-
-        // Nothing registered → catalog only (fresh install sees nothing).
-        let out = with_legacy_wrapper_rows(vec![catalog_row("weaviate-kg")], &[]);
-        assert_eq!(out.len(), 1);
-
-        // Catalog already lists the id → no duplicate row.
-        let out = with_legacy_wrapper_rows(
-            vec![catalog_row("weaviate-kg"), catalog_row("excalidraw")],
-            &["excalidraw".to_string()],
-        );
-        assert_eq!(out.len(), 2);
-    }
-
-    /// SF-1 (v0.2.101 re-review): pure core — the refusal fires ONLY for
-    /// registered-but-uncataloged (legacy wrapper) ids.
-    /// Red-proof: restore the old disable-arms-deregister behavior (or
-    /// drop the refusal) → this fails.
-    #[test]
-    fn legacy_wrapper_toggle_refusal_only_for_registered_uncataloged() {
-        // Registered + not in catalog → refused.
-        let err = legacy_wrapper_toggle_refusal("mermaid", false, true)
-            .expect("legacy wrapper toggle must be refused");
-        assert!(err.contains("legacy"), "error names what the row is: {err}");
-        assert!(
-            err.contains("disabledMcpServers"),
-            "error names the per-project channel that works: {err}"
-        );
-
-        // In the catalog (normal bundled row) → no refusal, both directions.
-        assert!(legacy_wrapper_toggle_refusal("mermaid", true, true).is_none());
-        // Not registered anywhere → falls through to "not found" below.
-        assert!(legacy_wrapper_toggle_refusal("mermaid", false, false).is_none());
-    }
-
-    /// SF-1 (v0.2.101 re-review): the global toggle must never make a
-    /// legacy wrapper entry a one-way loss. Disable used to DEREGISTER the
-    /// entry from ~/.claude.json (irreversible: enable is refused because
-    /// the canonical builder retired the wrappers). Post-fix: BOTH
-    /// directions are refused and the ~/.claude.json entry is untouched.
-    /// Red-proof: re-arm the `deregister_mcp` call on disable → this
-    /// fails on the "entry untouched" assertion.
-    #[test]
-    fn test_toggle_mcp_server_refuses_legacy_wrapper_both_directions_entry_untouched() {
-        let (home, _guard) = setup_temp_env();
-        seed_default_config(&home);
-
-        // Pre-seed ~/.claude.json with a legacy mermaid entry (a
-        // pre-v0.2.101 install that kept its wrapper registration).
-        let claude_json = home.join(".claude.json");
-        let seeded_entry = serde_json::json!({
-            "type": "stdio",
-            "command": "python",
-            "args": ["-m", "claude_mcp_servers.wrappers.mermaid_proxy"],
-            "env": {}
-        });
-        std::fs::write(
-            &claude_json,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "mcpServers": { "mermaid": seeded_entry }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        // Disable: refused, entry untouched.
-        let err = rt().block_on(async {
-            toggle_mcp_server_inner("mermaid".to_string(), false, "free").await
-        })
-        .expect_err("legacy wrapper disable must be refused");
-        assert!(err.contains("legacy diagram-wrapper entry"), "got: {err}");
-        assert!(
-            err.contains("disabledMcpServers"),
-            "error must name the per-project channel: {err}"
-        );
-        let cj = read_claude_json(&home);
-        assert_eq!(
-            cj["mcpServers"].get("mermaid"),
-            Some(&seeded_entry),
-            "legacy entry must be untouched in ~/.claude.json, got: {}",
-            cj["mcpServers"]
-        );
-
-        // Enable: refused too (no canonical builder for it any more).
-        let err = rt().block_on(async {
-            toggle_mcp_server_inner("mermaid".to_string(), true, "free").await
-        })
-        .expect_err("legacy wrapper enable must be refused");
-        assert!(err.contains("legacy diagram-wrapper entry"), "got: {err}");
-        assert!(
-            err.contains("disabledMcpServers"),
-            "enable refusal must also name the per-project channel: {err}"
-        );
-        let cj = read_claude_json(&home);
-        assert_eq!(
-            cj["mcpServers"].get("mermaid"),
-            Some(&seeded_entry),
-            "legacy entry must still be untouched after enable attempt, got: {}",
-            cj["mcpServers"]
-        );
-    }
+    /// v0.2.102: the three legacy diagram-wrapper tests that lived here
+    /// (`legacy_wrapper_rows_appear_only_when_registered`,
+    /// `legacy_wrapper_toggle_refusal_only_for_registered_uncataloged`,
+    /// `test_toggle_mcp_server_refuses_legacy_wrapper_both_directions_entry_untouched`)
+    /// were removed with the classification they pinned — auto-scrub makes
+    /// the kept-entry shape unreachable (see the note above
+    /// `get_mcp_servers`).
 
     /// Set up a temp dir as the launcher's state root + the user's HOME.
     /// Returns a guard that restores prior env on drop and the temp path.
@@ -1359,8 +1146,8 @@ mod tests {
     /// Post-fix: the entry is removed from ~/.claude.json on disable.
     ///
     /// v0.2.101: uses `weaviate-kg` (the only venv-python-backed bundled
-/// default left after `search` was deleted and the diagram wrappers
-/// retired).
+    /// default left after `search` was deleted and the diagram wrappers
+    /// retired; v0.2.102: the wrappers themselves are gone too).
     #[test]
     fn test_toggle_mcp_server_off_removes_from_claude_json() {
         let (home, _guard) = setup_temp_env();

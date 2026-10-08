@@ -93,11 +93,10 @@
   // The per-tool allowlist UI existed for the mermaid/excalidraw wrapper
   // MCPs, which VCO no longer registers by default. The shipped catalog has
   // no per-tool-capable MCP, so the section rendered an empty placeholder on
-  // every fresh install. The wrapper modules still ship — an install that
-  // already has the entry keeps working, filtered by the hub's tool-grant
-  // route with its defaults — but VCO no longer offers a per-tool editor for
-  // a retired MCP. The per-SERVER on/off toggle table above stays (it is
-  // generic and serves the servers VCO does register).
+  // every fresh install. (v0.2.102: the wrappers themselves were deleted and
+  // the hub's tool-grant route went with them — existing entries are
+  // auto-scrubbed on update.) The per-SERVER on/off toggle table above
+  // stays (it is generic and serves the servers VCO does register).
 
   const KIND_HELP: Record<string, string> = {
     write_scope: 'Glob the agent is allowed to write to (e.g. src/**).',

@@ -767,7 +767,7 @@ pub(crate) fn create_setup_phases(
             }
 
             // Phase 3: the V52-AF post-bundle pipeline (post-bundle populate,
-            // global-module enabled-seed, diagrams seed, codegraph spawn,
+            // global-module enabled-seed, codegraph spawn,
             // kg-sync spawn, kg-summary spawn, schema checks). Order is
             // LOAD-BEARING: it MUST run after install-bundle dropped the
             // analyzer / kg-sync / summary wrappers (the 2026-05-06
@@ -828,10 +828,14 @@ pub(crate) fn create_setup_phases(
 /// forensic trail from prior race-condition fixes:
 ///   1. populate_project_state_from_filesystem (post-bundle re-walk)
 ///   2. seed_enabled_rows_for_new_project (global modules → this project)
-///   3. set_project_module_enabled('diagrams', true) — opt-out default
-///   4. codegraph::spawn_initial_build — needs bundle's analyzer wrapper
-///   5. kg_sync::spawn_initial_sync — needs bundle's kg-sync wrapper
-///   6. kg_summary::spawn_initial_summary — needs bundle's summary script
+///   3. codegraph::spawn_initial_build — needs bundle's analyzer wrapper
+///   4. kg_sync::spawn_initial_sync — needs bundle's kg-sync wrapper
+///   5. kg_summary::spawn_initial_summary — needs bundle's summary script
+///
+/// (v0.2.102: the former step 3 — `set_project_module_enabled('diagrams',
+/// true)`, the diagrams opt-out default — was removed with the dropped
+/// diagrams integrations; the `project_modules` table stays for the
+/// generic module machinery.)
 ///
 /// Steps 4-6 each queue a `PENDING` row in launcher.db FIRST so the GUI
 /// can render an immediate "Queued" status while the background task
@@ -958,7 +962,7 @@ pub(crate) async fn apply_post_bundle_steps(
     // Soft-fail throughout: `seed_enabled_rows_for_new_project` logs
     // per-module failures and returns the success count. We audit the
     // count for forensic trace and continue regardless. Mirrors the
-    // soft-fail pattern of `set_project_module_enabled` below.
+    // soft-fail pattern of `module_enabled::set_project_module_enabled`.
     //
     // V52-AF (2026-06-09): also runs on update (AF-2 in the audit).
     // The seed is `INSERT OR IGNORE` so user-configured opt-outs
@@ -974,39 +978,21 @@ pub(crate) async fn apply_post_bundle_steps(
         );
     }
 
-    // Phase 1.1 (diagrams): seed the project-modules row for `diagrams`
-    // so the (Phase 1.5.7) conditional CLAUDE.md template renderer sees
-    // the module as active by default. The plan is opt-out — the user
-    // disables per-project via DiagramsTab → `set_project_module_enabled`
-    // (which flips `enabled` to 0; the row stays).
+    // v0.2.102 (owner ruling 2026-10-07): the `project_modules('diagrams')`
+    // seed that used to run here was removed with the dropped diagrams
+    // integrations — no shipped module is seeded default-active into
+    // `project_modules` any more. (Pre-v0.2.102 projects keep their row;
+    // it is user data and simply has no consumer left.)
     //
-    // ORDER MATTERS (mirrors the install-flow-architectural-overhaul
-    // 2026-05-06 race-condition rule): this MUST run AFTER
-    // `run_install_bundle` completes. The bundle install is allowed to
-    // drop files the conditional-block primitive expects to find; if we
-    // seeded earlier the renderer could race ahead and miss them.
-    //
-    // Soft-fail: a DB error on this insert is logged (cosmetic — the
-    // conditional CLAUDE.md section just won't render until the user
-    // re-toggles the module). Never propagated.
-    //
-    // V52-AF (2026-06-09): on UPDATE this step is a no-op when the
-    // user has previously disabled diagrams — `set_project_module_enabled`
-    // is an idempotent UPSERT that flips `enabled` back to 1 only if
-    // the row doesn't already exist with `enabled=0`. Audit recommendation
-    // AF-7 (G4.7) explicitly classified this as "no gap" because the
-    // update must not overwrite a user opt-out. Verified via
-    // `Db::set_project_module_enabled` (uses INSERT OR IGNORE pattern).
-    if let Err(e) = db.set_project_module_enabled(project_id, "diagrams", true) {
-        tracing::warn!(
-            "[vct] warning: could not seed project_modules('diagrams') for {}: {}",
-            project_id, e,
-        );
-        warnings.push(format!(
-            "seed project_modules('diagrams'): {} (CLAUDE.md diagrams section will not render until re-toggled)",
-            e
-        ));
-    }
+    // FORENSIC TRAIL (kept per the V52-AF load-bearing-comment rule):
+    // the seed ran AFTER `run_install_bundle` on purpose, mirroring the
+    // install-flow-architectural-overhaul 2026-05-06 race-condition
+    // rule — the bundle install was allowed to drop files the
+    // conditional-block primitive expected to find; seeding earlier let
+    // the renderer race ahead and miss them. On UPDATE the seed was a
+    // no-op when the user had previously disabled diagrams (INSERT OR
+    // IGNORE; audit AF-7/G4.7 classified overwriting a user opt-out as
+    // the defect to avoid).
 
     // Gap 2 (OSS launch 2026-05-12): kick off the initial code-graph
     // build in the background so `search_code_graph` returns useful
@@ -2110,8 +2096,8 @@ pub(crate) async fn run_install_bundle_update_with_root(
 /// guard a separate-process CLI race — `migrate_collections`'s top-of-call
 /// orphan-`__staging` recovery is the second line of defense for that).
 ///
-/// Mirrors the per-key in-process lock pattern used by `diagram_watcher.rs`
-/// (`LazyLock<Mutex<HashMap<...>>>`).
+/// Mirrors the per-key in-process lock pattern the (v0.2.102: deleted)
+/// `diagram_watcher.rs` used (`LazyLock<Mutex<HashMap<...>>>`).
 /// Try to claim the per-project migrate lock. `None` on contention (the
 /// caller soft-skips this cycle); the returned guard releases on drop.
 ///
@@ -3631,7 +3617,9 @@ pub async fn update_all_projects(
 ///
 /// Behaviour:
 ///   * Resolves the per-project Python interpreter via the same chain
-///     as `templates/hooks/pre-diagram-path-validation.sh`:
+///     `module_enabled::resolve_project_python` implements (documented
+///     until v0.2.102 by the deleted
+///     `templates/hooks/pre-diagram-path-validation.sh`):
 ///     `VCT_VENV` → `<VCT_INSTALL_ROOT>/.venv` →
 ///     `<VCT_INSTALL_ROOT>/claude_mcp_servers/.venv` → system `python3`.
 ///     Returns an `Err(String)` only when NO interpreter is reachable;
@@ -3803,7 +3791,9 @@ fn apply_project_env_via_python(
 }
 
 /// Resolve a Python interpreter that can `import vco_lib`. Mirrors the
-/// chain documented in `templates/hooks/pre-diagram-path-validation.sh`:
+/// chain `module_enabled::resolve_project_python` implements (documented
+/// until v0.2.102 by the deleted
+/// `templates/hooks/pre-diagram-path-validation.sh`):
 ///   1. `$VCT_VENV/bin/python` (POSIX) or `$VCT_VENV/Scripts/python.exe`
 ///      (Windows) — pinned by the launcher when it knows the venv.
 ///   2. `<VCT_INSTALL_ROOT>/.venv/bin/python` (POSIX) or

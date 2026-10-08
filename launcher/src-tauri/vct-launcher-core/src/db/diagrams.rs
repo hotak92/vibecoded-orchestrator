@@ -1,29 +1,32 @@
-//! Per-project diagrams registry + snapshots + cross-project access +
-//! per-tool MCP grants + per-project module-active flags.
+//! Per-tool MCP grant reader + per-project module-active flags.
 //!
-//! Schema: `migrations/021_diagrams.sql`. All FK-bearing tables CASCADE
-//! on `projects.id` so deleting a project wipes its diagrams, snapshots,
-//! grants, tool-grants, and module rows. Snapshot rows additionally
-//! CASCADE on the parent `project_diagrams.id`.
+//! v0.2.102 (owner ruling 2026-10-07 — diagrams dropped): this file used
+//! to also hold the diagrams registry / snapshots / cross-project access
+//! DB functions. Those died with the Diagrams tab and the diagram Tauri
+//! commands (their only consumers). What stays:
 //!
-//! Phase 1.1 scope: this file is pure DB. The Tauri-command wrappers in
-//! `commands/diagrams_cmd.rs` add audit-log + filesystem side effects.
-//! The (out-of-scope-here) wrapper MCP and `diagram_indexer.py` are
-//! consumers of this storage.
+//!   * `list_project_mcp_tools` — the `project_mcp_tool_grants` READER the
+//!     hub's `mcp_tool_grants_api` route serves.
+//!   * the `project_modules` functions — the per-project module-active
+//!     flag behind `{{#if_module_active <name>}}` rendering and
+//!     module-gated bundle delivery (consumed via
+//!     `commands/module_enabled.rs`, moved out of `diagrams_cmd.rs` in
+//!     the same change).
+//!
+//! Schema: `migrations/022_diagrams.sql`. The migration and ALL its
+//! tables stay (user data is never dropped); the file name keeps the
+//! migration's name for archaeological continuity even though the
+//! diagram query functions are gone. All FK-bearing tables CASCADE on
+//! `projects.id`, so deleting a project wipes its diagrams, snapshots,
+//! grants, tool-grants, and module rows — pinned by the cascade tests
+//! below, which seed the diagram tables with raw SQL now that the
+//! typed writers are deleted.
 //!
 //! Design notes:
-//!   * Snapshot bytes are stored opaque — the writer chooses raw vs
-//!     gzipped. `restore_diagram_snapshot` returns `(file_path, bytes)`
-//!     to its caller; the filesystem write is the Tauri command's job
-//!     (so it owns the atomic-rename + audit-log discipline).
 //!   * `is_module_active` defaults to `false` for unknown modules. This
 //!     is the conservative choice — a missing row should not surface a
 //!     module-specific CLAUDE.md section, since the row will be present
 //!     for any project that genuinely has the module installed.
-//!   * Validations: `diagram_type` is checked in Rust before INSERT
-//!     (defense-in-depth against the SQL CHECK constraint) so callers
-//!     get a clear Rust-level error rather than a stringified SQLite
-//!     "constraint failed" message. Same for `access_level`.
 
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
@@ -32,53 +35,6 @@ use serde::{Deserialize, Serialize};
 use super::Db;
 
 // ─── Row types ───────────────────────────────────────────────────────────
-
-/// One row in `project_diagrams`. Mirrors the extended Phase 1.5 schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiagramRow {
-    pub id: i64,
-    pub project_id: String,
-    pub diagram_name: String,
-    pub diagram_type: String,
-    pub file_path: String,
-    pub category_path: String,
-    pub enabled: bool,
-    pub inferred_title: Option<String>,
-    pub diagram_kind: Option<String>,
-    pub content_text: Option<String>,
-    pub node_count: Option<i64>,
-    pub edge_count: Option<i64>,
-    pub chat_id: Option<String>,
-    pub linked_session_summary: Option<String>,
-    pub config_json: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-/// One row in `diagram_snapshots`. `content` is opaque bytes (the writer
-/// chooses raw vs gzipped).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotRow {
-    pub id: i64,
-    pub diagram_id: i64,
-    pub content_hash: String,
-    /// Opaque payload. Serde-serialised as a byte array (the launcher
-    /// frontend rarely reads this directly; snapshot UIs render the
-    /// metadata + ask the backend to restore on click).
-    pub content: Vec<u8>,
-    pub created_at: i64,
-    pub trigger: String,
-    pub label: Option<String>,
-}
-
-/// One row in `diagram_access`. Mirrors the codegraph_access shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccessRow {
-    pub grantor_project_id: String,
-    pub grantee_project_id: String,
-    pub access_level: String,
-    pub granted_at: i64,
-}
 
 /// One row in `project_mcp_tool_grants` — per-tool allowlist override.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,372 +54,23 @@ pub struct ModuleRow {
     pub registered_at: i64,
 }
 
-// ─── Validation constants ────────────────────────────────────────────────
-
-const VALID_DIAGRAM_TYPES: &[&str] = &["mermaid", "excalidraw"];
-const VALID_ACCESS_LEVELS: &[&str] = &["read", "none"];
-
-fn check_in(label: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
-    if allowed.iter().any(|a| *a == value) {
-        Ok(())
-    } else {
-        Err(format!(
-            "invalid {}: '{}' (allowed: {:?})",
-            label, value, allowed
-        ))
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════
-// Diagrams
+// Per-tool MCP grants (reader)
 // ═══════════════════════════════════════════════════════════════════════
 
 impl Db {
-    /// Register (or upsert) a diagram. Returns the canonical row.
-    ///
-    /// Upsert semantics mirror `register_project_agent`: on conflict
-    /// (project_id, diagram_name), the file_path / category_path /
-    /// type are refreshed; the `enabled` flag is preserved so user
-    /// toggles survive re-registration from the populate path.
-    pub fn register_diagram(
-        &self,
-        project_id: &str,
-        diagram_name: &str,
-        diagram_type: &str,
-        file_path: &str,
-        category_path: &str,
-    ) -> Result<DiagramRow, String> {
-        check_in("diagram_type", diagram_type, VALID_DIAGRAM_TYPES)?;
-        let now = Utc::now().timestamp_millis();
-        let guard = self.lock();
-        guard
-            .execute(
-                "INSERT INTO project_diagrams
-                 (project_id, diagram_name, diagram_type, file_path,
-                  category_path, enabled, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)
-                 ON CONFLICT(project_id, diagram_name) DO UPDATE SET
-                    diagram_type   = excluded.diagram_type,
-                    file_path      = excluded.file_path,
-                    category_path  = excluded.category_path,
-                    updated_at     = excluded.updated_at",
-                params![
-                    project_id,
-                    diagram_name,
-                    diagram_type,
-                    file_path,
-                    category_path,
-                    now,
-                ],
-            )
-            .map_err(|e| format!("register_diagram: {}", e))?;
-        // Re-fetch so the returned row carries `id` + any prior derived
-        // metadata that the upsert intentionally left alone.
-        let id: i64 = guard
-            .query_row(
-                "SELECT id FROM project_diagrams
-                 WHERE project_id = ?1 AND diagram_name = ?2",
-                params![project_id, diagram_name],
-                |r| r.get(0),
-            )
-            .map_err(|e| format!("register_diagram fetch id: {}", e))?;
-        drop(guard);
-        self.get_diagram_by_id(id)?.ok_or_else(|| {
-            format!(
-                "register_diagram: row vanished after insert (project={}, name={})",
-                project_id, diagram_name
-            )
-        })
-    }
-
-    /// Fetch a single diagram by primary key.
-    pub fn get_diagram_by_id(&self, id: i64) -> Result<Option<DiagramRow>, String> {
-        let guard = self.lock();
-        let row = guard
-            .query_row(
-                "SELECT id, project_id, diagram_name, diagram_type, file_path,
-                        category_path, enabled, inferred_title, diagram_kind,
-                        content_text, node_count, edge_count, chat_id,
-                        linked_session_summary, config_json,
-                        created_at, updated_at
-                 FROM project_diagrams WHERE id = ?1",
-                params![id],
-                row_to_diagram,
-            )
-            .optional()
-            .map_err(|e| format!("get_diagram_by_id: {}", e))?;
-        Ok(row)
-    }
-
-    /// List all diagrams for a project, ordered by name.
-    pub fn list_project_diagrams(&self, project_id: &str) -> Result<Vec<DiagramRow>, String> {
-        let guard = self.lock();
-        let mut stmt = guard
-            .prepare(
-                "SELECT id, project_id, diagram_name, diagram_type, file_path,
-                        category_path, enabled, inferred_title, diagram_kind,
-                        content_text, node_count, edge_count, chat_id,
-                        linked_session_summary, config_json,
-                        created_at, updated_at
-                 FROM project_diagrams WHERE project_id = ?1
-                 ORDER BY diagram_name ASC",
-            )
-            .map_err(|e| format!("prepare: {}", e))?;
-        let rows = stmt
-            .query_map(params![project_id], row_to_diagram)
-            .map_err(|e| format!("query: {}", e))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("collect: {}", e))
-    }
-
-    /// Toggle a diagram's `enabled` flag. Pure DB op — the FS move (if any)
-    /// is the caller's responsibility (Tauri command level). Mirrors the
-    /// project_mcp_servers shape rather than project_agents because
-    /// diagrams don't have a `.disabled/` sibling convention yet (the
-    /// plan defers that to the Tauri command, which also runs the file
-    /// move and audit).
-    pub fn set_diagram_enabled(
-        &self,
-        project_id: &str,
-        diagram_name: &str,
-        enabled: bool,
-    ) -> Result<(), String> {
-        let guard = self.lock();
-        let n = guard
-            .execute(
-                "UPDATE project_diagrams SET enabled = ?1, updated_at = ?2
-                 WHERE project_id = ?3 AND diagram_name = ?4",
-                params![
-                    enabled as i32,
-                    Utc::now().timestamp_millis(),
-                    project_id,
-                    diagram_name,
-                ],
-            )
-            .map_err(|e| format!("set_diagram_enabled: {}", e))?;
-        if n == 0 {
-            return Err(format!(
-                "diagram '{}' not registered for project {}",
-                diagram_name, project_id
-            ));
-        }
-        Ok(())
-    }
-
-    /// Drop a diagram (cascades to its snapshots).
-    pub fn unregister_diagram(
-        &self,
-        project_id: &str,
-        diagram_name: &str,
-    ) -> Result<(), String> {
-        let guard = self.lock();
-        guard
-            .execute(
-                "DELETE FROM project_diagrams
-                 WHERE project_id = ?1 AND diagram_name = ?2",
-                params![project_id, diagram_name],
-            )
-            .map_err(|e| format!("unregister_diagram: {}", e))?;
-        Ok(())
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Snapshots
-// ═══════════════════════════════════════════════════════════════════════
-
-impl Db {
-    /// Create a snapshot. The `(diagram_id, content_hash)` UNIQUE
-    /// constraint means identical content fed twice will fail with
-    /// a SQLite "UNIQUE constraint failed" error — callers that want
-    /// dedup-then-no-op semantics should check for the hash first or
-    /// match on the error. The Tauri command layer wraps this with
-    /// idempotent UPSERT-or-fetch semantics.
-    pub fn create_diagram_snapshot(
-        &self,
-        diagram_id: i64,
-        content_hash: &str,
-        content: &[u8],
-        trigger: &str,
-        label: Option<&str>,
-    ) -> Result<SnapshotRow, String> {
-        let now = Utc::now().timestamp_millis();
-        let guard = self.lock();
-        guard
-            .execute(
-                "INSERT INTO diagram_snapshots
-                 (diagram_id, content_hash, content, created_at, trigger, label)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![diagram_id, content_hash, content, now, trigger, label],
-            )
-            .map_err(|e| format!("create_diagram_snapshot: {}", e))?;
-        let id = guard.last_insert_rowid();
-        Ok(SnapshotRow {
-            id,
-            diagram_id,
-            content_hash: content_hash.to_string(),
-            content: content.to_vec(),
-            created_at: now,
-            trigger: trigger.to_string(),
-            label: label.map(str::to_string),
-        })
-    }
-
-    /// List snapshots for a diagram, newest first.
-    pub fn list_diagram_snapshots(
-        &self,
-        diagram_id: i64,
-    ) -> Result<Vec<SnapshotRow>, String> {
-        let guard = self.lock();
-        let mut stmt = guard
-            .prepare(
-                "SELECT id, diagram_id, content_hash, content, created_at, trigger, label
-                 FROM diagram_snapshots WHERE diagram_id = ?1
-                 ORDER BY created_at DESC, id DESC",
-            )
-            .map_err(|e| format!("prepare: {}", e))?;
-        let rows = stmt
-            .query_map(params![diagram_id], row_to_snapshot)
-            .map_err(|e| format!("query: {}", e))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("collect: {}", e))
-    }
-
-    /// Look up a snapshot by id. Used by `restore_diagram_snapshot` to
-    /// fetch the bytes without re-listing the whole timeline.
-    pub fn get_diagram_snapshot(
-        &self,
-        snapshot_id: i64,
-    ) -> Result<Option<SnapshotRow>, String> {
-        let guard = self.lock();
-        let row = guard
-            .query_row(
-                "SELECT id, diagram_id, content_hash, content, created_at, trigger, label
-                 FROM diagram_snapshots WHERE id = ?1",
-                params![snapshot_id],
-                row_to_snapshot,
-            )
-            .optional()
-            .map_err(|e| format!("get_diagram_snapshot: {}", e))?;
-        Ok(row)
-    }
-
-    /// Resolve the (file_path, content) pair the caller needs to write
-    /// back to disk in order to restore a snapshot.
-    ///
-    /// Pure DB query: no filesystem side effect. The caller (the Tauri
-    /// command) is responsible for the atomic-rename write so the
-    /// audit-log + restore-event ordering stays in one place.
-    pub fn restore_diagram_snapshot(
-        &self,
-        snapshot_id: i64,
-    ) -> Result<(String, Vec<u8>), String> {
-        let snapshot = self
-            .get_diagram_snapshot(snapshot_id)?
-            .ok_or_else(|| format!("snapshot {} not found", snapshot_id))?;
-        // Look up the parent diagram for its file_path.
-        let diagram = self
-            .get_diagram_by_id(snapshot.diagram_id)?
-            .ok_or_else(|| {
-                format!(
-                    "parent diagram {} for snapshot {} not found",
-                    snapshot.diagram_id, snapshot_id
-                )
-            })?;
-        Ok((diagram.file_path, snapshot.content))
-    }
-
-    /// Drop a snapshot row by id.
-    pub fn delete_diagram_snapshot(&self, snapshot_id: i64) -> Result<(), String> {
-        let guard = self.lock();
-        guard
-            .execute(
-                "DELETE FROM diagram_snapshots WHERE id = ?1",
-                params![snapshot_id],
-            )
-            .map_err(|e| format!("delete_diagram_snapshot: {}", e))?;
-        Ok(())
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Cross-project access (mirrors codegraph_access)
-// ═══════════════════════════════════════════════════════════════════════
-
-impl Db {
-    /// Grant or revoke `grantee`'s read access to `grantor`'s diagrams.
-    /// Idempotent UPSERT on (grantor, grantee).
-    pub fn set_diagram_access(
-        &self,
-        grantor_project_id: &str,
-        grantee_project_id: &str,
-        access_level: &str,
-    ) -> Result<(), String> {
-        check_in("access_level", access_level, VALID_ACCESS_LEVELS)?;
-        let guard = self.lock();
-        guard
-            .execute(
-                "INSERT INTO diagram_access
-                 (grantor_project_id, grantee_project_id, access_level, granted_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(grantor_project_id, grantee_project_id)
-                 DO UPDATE SET access_level = excluded.access_level,
-                               granted_at   = excluded.granted_at",
-                params![
-                    grantor_project_id,
-                    grantee_project_id,
-                    access_level,
-                    Utc::now().timestamp_millis(),
-                ],
-            )
-            .map_err(|e| format!("set_diagram_access: {}", e))?;
-        Ok(())
-    }
-
-    /// List every access row where the given project is the grantor
-    /// (i.e. "who can read MY diagrams?"). Newest first.
-    pub fn list_diagram_access(
-        &self,
-        grantor_project_id: &str,
-    ) -> Result<Vec<AccessRow>, String> {
-        let guard = self.lock();
-        let mut stmt = guard
-            .prepare(
-                "SELECT grantor_project_id, grantee_project_id, access_level, granted_at
-                 FROM diagram_access WHERE grantor_project_id = ?1
-                 ORDER BY granted_at DESC",
-            )
-            .map_err(|e| format!("prepare: {}", e))?;
-        let rows = stmt
-            .query_map(params![grantor_project_id], |r| {
-                Ok(AccessRow {
-                    grantor_project_id: r.get(0)?,
-                    grantee_project_id: r.get(1)?,
-                    access_level: r.get(2)?,
-                    granted_at: r.get(3)?,
-                })
-            })
-            .map_err(|e| format!("query: {}", e))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("collect: {}", e))
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Per-tool MCP grants
-// ═══════════════════════════════════════════════════════════════════════
-
-impl Db {
-    /// List every per-tool grant for a project's MCP server.
-    ///
-    /// v0.2.101 (owner ruling — remove dead GUI-side code): the WRITE side
-    /// (`set_mcp_tool_enabled`) was RETIRED. Its only production callers
-    /// were the per-tool-grant Tauri commands the wrapper-MCP permissions
-    /// UI used, and that UI is gone with the wrapper MCPs' default
-    /// registration; this READER stays because the hub's
-    /// `mcp_tool_grants_api` route serves it to wrapper MCPs that legacy
-    /// installs still run. Rows reach the table through history (written
-    /// before the retirement) or directly by the user.
+    /// List a project's per-tool grant rows for one MCP, alphabetical by
+    /// tool name. The corresponding WRITER (`set_mcp_tool_enabled`) was
+    /// RETIRED (v0.2.101). Its only production callers were the
+    /// per-tool-grant Tauri commands the wrapper-MCP permissions UI used,
+    /// and that UI is gone with the wrapper MCPs' default registration;
+    /// this READER stays because the hub's `mcp_tool_grants_api` route
+    /// serves it. (v0.2.102: the diagram wrappers that route was built
+    /// for are deleted and their leftover entries auto-scrubbed; the
+    /// route + reader remain as the generic per-tool surface for any
+    /// module-shipped MCP with a `tool_allowlist`.) Rows reach the table
+    /// through history (written before the retirement), by a module
+    /// install, or directly by the user.
     pub fn list_project_mcp_tools(
         &self,
         project_id: &str,
@@ -609,47 +216,6 @@ impl Db {
     }
 }
 
-// ─── Row-mapping helpers ─────────────────────────────────────────────────
-
-fn row_to_diagram(r: &rusqlite::Row) -> rusqlite::Result<DiagramRow> {
-    let enabled_i: i32 = r.get(6)?;
-    Ok(DiagramRow {
-        id: r.get(0)?,
-        project_id: r.get(1)?,
-        diagram_name: r.get(2)?,
-        diagram_type: r.get(3)?,
-        file_path: r.get(4)?,
-        category_path: r.get(5)?,
-        enabled: enabled_i != 0,
-        inferred_title: r.get(7)?,
-        diagram_kind: r.get(8)?,
-        content_text: r.get(9)?,
-        node_count: r.get(10)?,
-        edge_count: r.get(11)?,
-        chat_id: r.get(12)?,
-        linked_session_summary: r.get(13)?,
-        config_json: r.get(14)?,
-        created_at: r.get(15)?,
-        updated_at: r.get(16)?,
-    })
-}
-
-fn row_to_snapshot(r: &rusqlite::Row) -> rusqlite::Result<SnapshotRow> {
-    Ok(SnapshotRow {
-        id: r.get(0)?,
-        diagram_id: r.get(1)?,
-        content_hash: r.get(2)?,
-        content: r.get(3)?,
-        created_at: r.get(4)?,
-        trigger: r.get(5)?,
-        label: r.get(6)?,
-    })
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Tests
-// ═══════════════════════════════════════════════════════════════════════
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,215 +234,8 @@ mod tests {
         db
     }
 
-    // ─── Diagrams CRUD ──────────────────────────────────────────────────
-
-    #[test]
-    fn register_and_list_diagram_round_trip() {
-        let db = make_db_with_project("p1", "Acme");
-        let row = db
-            .register_diagram(
-                "p1",
-                "login-form",
-                "mermaid",
-                ".claude/diagrams/gui/auth/login-form.mmd",
-                "gui/auth",
-            )
-            .unwrap();
-        assert_eq!(row.diagram_name, "login-form");
-        assert_eq!(row.diagram_type, "mermaid");
-        assert_eq!(row.category_path, "gui/auth");
-        assert!(row.enabled);
-        assert!(row.id > 0);
-
-        let listed = db.list_project_diagrams("p1").unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].diagram_name, "login-form");
-    }
-
-    #[test]
-    fn register_rejects_invalid_diagram_type() {
-        let db = make_db_with_project("p1", "Acme");
-        let err = db
-            .register_diagram("p1", "x", "drawio", ".claude/diagrams/g/x.drawio", "g")
-            .unwrap_err();
-        assert!(err.contains("invalid diagram_type"), "got: {}", err);
-    }
-
-    #[test]
-    fn register_is_upsert_preserves_enabled() {
-        let db = make_db_with_project("p1", "Acme");
-        db.register_diagram("p1", "x", "mermaid", "a.mmd", "g").unwrap();
-        db.set_diagram_enabled("p1", "x", false).unwrap();
-
-        // Re-register; enabled must stay false.
-        db.register_diagram("p1", "x", "mermaid", "a.mmd", "g").unwrap();
-        let listed = db.list_project_diagrams("p1").unwrap();
-        assert_eq!(listed.len(), 1);
-        assert!(!listed[0].enabled, "user toggle must survive re-register");
-    }
-
-    #[test]
-    fn set_diagram_enabled_errors_on_unknown_row() {
-        let db = make_db_with_project("p1", "Acme");
-        let err = db
-            .set_diagram_enabled("p1", "ghost", false)
-            .unwrap_err();
-        assert!(err.contains("not registered"), "got: {}", err);
-    }
-
-    #[test]
-    fn unregister_removes_diagram_and_cascades_snapshots() {
-        let db = make_db_with_project("p1", "Acme");
-        let row = db
-            .register_diagram("p1", "x", "mermaid", "a.mmd", "g")
-            .unwrap();
-        db.create_diagram_snapshot(row.id, "hash1", b"flowchart TD; A-->B", "manual", None)
-            .unwrap();
-        assert_eq!(db.list_diagram_snapshots(row.id).unwrap().len(), 1);
-
-        db.unregister_diagram("p1", "x").unwrap();
-        assert!(db.list_project_diagrams("p1").unwrap().is_empty());
-        // Snapshot rows cascade-removed.
-        assert!(db.list_diagram_snapshots(row.id).unwrap().is_empty());
-    }
-
-    // ─── Snapshots ──────────────────────────────────────────────────────
-
-    #[test]
-    fn create_and_list_snapshot_round_trip() {
-        let db = make_db_with_project("p1", "Acme");
-        let d = db
-            .register_diagram("p1", "x", "mermaid", "a.mmd", "g")
-            .unwrap();
-        let content = b"flowchart TD; A-->B".to_vec();
-        let snap = db
-            .create_diagram_snapshot(d.id, "abc123", &content, "manual", Some("first save"))
-            .unwrap();
-        assert_eq!(snap.content, content);
-        assert_eq!(snap.trigger, "manual");
-        assert_eq!(snap.label.as_deref(), Some("first save"));
-
-        let listed = db.list_diagram_snapshots(d.id).unwrap();
-        assert_eq!(listed.len(), 1);
-        // Round-trip: bytes are byte-identical.
-        assert_eq!(listed[0].content, content);
-    }
-
-    #[test]
-    fn snapshot_dedup_rejects_identical_content_hash() {
-        let db = make_db_with_project("p1", "Acme");
-        let d = db
-            .register_diagram("p1", "x", "mermaid", "a.mmd", "g")
-            .unwrap();
-        db.create_diagram_snapshot(d.id, "abc", b"data", "manual", None)
-            .unwrap();
-        // Same (diagram_id, content_hash) → UNIQUE constraint fires.
-        let err = db
-            .create_diagram_snapshot(d.id, "abc", b"other-data-but-same-hash", "manual", None)
-            .unwrap_err();
-        assert!(
-            err.to_lowercase().contains("unique"),
-            "expected UNIQUE constraint error, got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn restore_returns_file_path_and_bytes() {
-        let db = make_db_with_project("p1", "Acme");
-        let d = db
-            .register_diagram(
-                "p1",
-                "x",
-                "mermaid",
-                ".claude/diagrams/g/x.mmd",
-                "g",
-            )
-            .unwrap();
-        let content = b"opaque bytes (may be gzipped later)".to_vec();
-        let snap = db
-            .create_diagram_snapshot(d.id, "h1", &content, "manual", None)
-            .unwrap();
-
-        let (path, bytes) = db.restore_diagram_snapshot(snap.id).unwrap();
-        assert_eq!(path, ".claude/diagrams/g/x.mmd");
-        assert_eq!(bytes, content);
-    }
-
-    #[test]
-    fn delete_snapshot_removes_only_target_row() {
-        let db = make_db_with_project("p1", "Acme");
-        let d = db
-            .register_diagram("p1", "x", "mermaid", "a.mmd", "g")
-            .unwrap();
-        let s1 = db
-            .create_diagram_snapshot(d.id, "h1", b"v1", "manual", None)
-            .unwrap();
-        let _s2 = db
-            .create_diagram_snapshot(d.id, "h2", b"v2", "manual", None)
-            .unwrap();
-        db.delete_diagram_snapshot(s1.id).unwrap();
-        let listed = db.list_diagram_snapshots(d.id).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].content_hash, "h2");
-    }
-
-    // ─── Access grants ──────────────────────────────────────────────────
-
-    #[test]
-    fn diagram_access_grant_and_list() {
-        let db = make_db_with_project("pA", "ProjA");
-        // Seed a second project.
-        let slug = db.generate_unique_slug("ProjB").unwrap();
-        db.insert_project(
-            "pB",
-            "ProjB",
-            if cfg!(windows) {
-                r"C:\tmp\pB"
-            } else {
-                "/tmp/pB"
-            },
-            ProjectHost::Base,
-            &slug,
-        )
-        .unwrap();
-
-        db.set_diagram_access("pA", "pB", "read").unwrap();
-        let grants = db.list_diagram_access("pA").unwrap();
-        assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].grantee_project_id, "pB");
-        assert_eq!(grants[0].access_level, "read");
-
-        // UPSERT: change level on the same edge.
-        db.set_diagram_access("pA", "pB", "none").unwrap();
-        let grants = db.list_diagram_access("pA").unwrap();
-        assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].access_level, "none");
-    }
-
-    #[test]
-    fn diagram_access_rejects_invalid_level() {
-        let db = make_db_with_project("pA", "ProjA");
-        let slug = db.generate_unique_slug("ProjB").unwrap();
-        db.insert_project(
-            "pB",
-            "ProjB",
-            if cfg!(windows) {
-                r"C:\tmp\pB-iv"
-            } else {
-                "/tmp/pB-iv"
-            },
-            ProjectHost::Base,
-            &slug,
-        )
-        .unwrap();
-        let err = db.set_diagram_access("pA", "pB", "write").unwrap_err();
-        assert!(err.contains("invalid access_level"), "got: {}", err);
-    }
-
-    // ─── Per-tool MCP grants ────────────────────────────────────────────
-    //
-    // v0.2.101: the WRITE side (`Db::set_mcp_tool_enabled`) was retired
+    // ─── Per-tool MCP grants (reader) ──────────────────────────────────
+    // The v0.2.101 retirement removed the WRITE side that used to ship
     // with the per-tool-grant GUI (owner ruling). Tests seed
     // `project_mcp_tool_grants` rows with the table's own UPSERT SQL —
     // the same statement the retired writer issued — and pin the READER
@@ -899,14 +258,14 @@ mod tests {
     #[test]
     fn list_project_mcp_tools_reads_seeded_grant_rows() {
         let db = make_db_with_project("p1", "Acme");
-        seed_tool_grant(&db, "p1", "mermaid", "render", true);
-        seed_tool_grant(&db, "p1", "mermaid", "export_png", false);
+        seed_tool_grant(&db, "p1", "some-mcp", "render", true);
+        seed_tool_grant(&db, "p1", "some-mcp", "export_png", false);
         // Different MCP, same project.
         seed_tool_grant(&db, "p1", "weaviate-kg", "store_knowledge_node", false);
 
-        let mermaid = db.list_project_mcp_tools("p1", "mermaid").unwrap();
-        assert_eq!(mermaid.len(), 2);
-        let by_name: std::collections::HashMap<_, _> = mermaid
+        let some = db.list_project_mcp_tools("p1", "some-mcp").unwrap();
+        assert_eq!(some.len(), 2);
+        let by_name: std::collections::HashMap<_, _> = some
             .iter()
             .map(|t| (t.tool_name.as_str(), t.enabled))
             .collect();
@@ -919,10 +278,10 @@ mod tests {
         assert!(!wv[0].enabled);
 
         // UPSERT: flip render off.
-        seed_tool_grant(&db, "p1", "mermaid", "render", false);
-        let mermaid = db.list_project_mcp_tools("p1", "mermaid").unwrap();
-        assert_eq!(mermaid.len(), 2, "still two rows, just one flipped");
-        let by_name: std::collections::HashMap<_, _> = mermaid
+        seed_tool_grant(&db, "p1", "some-mcp", "render", false);
+        let some = db.list_project_mcp_tools("p1", "some-mcp").unwrap();
+        assert_eq!(some.len(), 2, "still two rows, just one flipped");
+        let by_name: std::collections::HashMap<_, _> = some
             .iter()
             .map(|t| (t.tool_name.as_str(), t.enabled))
             .collect();
@@ -935,19 +294,19 @@ mod tests {
     fn module_active_default_off_then_toggled_on() {
         let db = make_db_with_project("p1", "Acme");
         // Pre-seed: no row → inactive.
-        assert!(!db.is_module_active("p1", "diagrams").unwrap());
+        assert!(!db.is_module_active("p1", "model_gateway").unwrap());
 
         // Seed module as active.
-        db.set_project_module_enabled("p1", "diagrams", true).unwrap();
-        assert!(db.is_module_active("p1", "diagrams").unwrap());
+        db.set_project_module_enabled("p1", "model_gateway", true).unwrap();
+        assert!(db.is_module_active("p1", "model_gateway").unwrap());
 
         // Disable it.
-        db.set_project_module_enabled("p1", "diagrams", false).unwrap();
-        assert!(!db.is_module_active("p1", "diagrams").unwrap());
+        db.set_project_module_enabled("p1", "model_gateway", false).unwrap();
+        assert!(!db.is_module_active("p1", "model_gateway").unwrap());
 
         // Re-enable it (UPSERT path).
-        db.set_project_module_enabled("p1", "diagrams", true).unwrap();
-        assert!(db.is_module_active("p1", "diagrams").unwrap());
+        db.set_project_module_enabled("p1", "model_gateway", true).unwrap();
+        assert!(db.is_module_active("p1", "model_gateway").unwrap());
     }
 
     // ─── clear_project_module (v0.2.101, G1 follow-up) ──────────────────
@@ -956,7 +315,7 @@ mod tests {
     fn clear_project_module_deletes_only_the_named_row_and_reports_absence() {
         let db = make_db_with_project("p1", "Acme");
         db.set_project_module_enabled("p1", "model_gateway", false).unwrap();
-        db.set_project_module_enabled("p1", "diagrams", true).unwrap();
+        db.set_project_module_enabled("p1", "rl", true).unwrap();
 
         // ACT: the explicit choice goes away — the module's default
         // resolution takes over again ("follows the machine").
@@ -964,14 +323,14 @@ mod tests {
         let modules = db.list_project_modules("p1").unwrap();
         assert_eq!(
             modules.iter().map(|m| m.module_name.as_str()).collect::<Vec<_>>(),
-            vec!["diagrams"],
+            vec!["rl"],
             "only the named (project, module) row is deleted"
         );
 
         // LEAVE-ALONE: clearing a row that is not there is Ok(false), not
         // an error — and it still touches nothing else.
         assert!(!db.clear_project_module("p1", "model_gateway").unwrap());
-        assert!(!db.clear_project_module("p-other", "diagrams").unwrap());
+        assert!(!db.clear_project_module("p-other", "rl").unwrap());
         assert_eq!(db.list_project_modules("p1").unwrap().len(), 1);
     }
 
@@ -979,12 +338,12 @@ mod tests {
     fn list_project_modules_alphabetical() {
         let db = make_db_with_project("p1", "Acme");
         db.set_project_module_enabled("p1", "rl", true).unwrap();
-        db.set_project_module_enabled("p1", "diagrams", true).unwrap();
-        db.set_project_module_enabled("p1", "mao", false).unwrap();
+        db.set_project_module_enabled("p1", "mao", true).unwrap();
+        db.set_project_module_enabled("p1", "model_gateway", false).unwrap();
 
         let rows = db.list_project_modules("p1").unwrap();
         let names: Vec<&str> = rows.iter().map(|m| m.module_name.as_str()).collect();
-        assert_eq!(names, vec!["diagrams", "mao", "rl"]);
+        assert_eq!(names, vec!["mao", "model_gateway", "rl"]);
     }
 
     #[test]
@@ -1004,13 +363,53 @@ mod tests {
         )
         .unwrap();
 
-        db.set_project_module_enabled("pA", "diagrams", true).unwrap();
+        db.set_project_module_enabled("pA", "model_gateway", true).unwrap();
         // pB has no row → inactive.
-        assert!(db.is_module_active("pA", "diagrams").unwrap());
-        assert!(!db.is_module_active("pB", "diagrams").unwrap());
+        assert!(db.is_module_active("pA", "model_gateway").unwrap());
+        assert!(!db.is_module_active("pB", "model_gateway").unwrap());
     }
 
-    // ─── Cascades ───────────────────────────────────────────────────────
+    // ─── Cascades (migration 022 schema — the tables stay, so their
+    // ON DELETE CASCADE behaviour stays pinned. v0.2.102: seeds use raw
+    // SQL now that the typed diagram writers are deleted.) ──────────────
+
+    /// Seed one row into each migration-022 diagram table with raw SQL.
+    fn seed_diagram_tables(db: &Db, project_id: &str, grantee: &str) {
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT INTO project_diagrams
+                 (project_id, diagram_name, diagram_type, file_path,
+                  category_path, enabled, created_at, updated_at)
+                 VALUES (?1, 'x', 'mermaid', 'a.mmd', 'g', 1, 0, 0)",
+                params![project_id],
+            )
+            .unwrap();
+        let diagram_id: i64 = guard
+            .query_row(
+                "SELECT id FROM project_diagrams
+                 WHERE project_id = ?1 AND diagram_name = 'x'",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        guard
+            .execute(
+                "INSERT INTO diagram_snapshots
+                 (diagram_id, content_hash, content, created_at, trigger, label)
+                 VALUES (?1, 'h1', X'7631', 0, 'manual', NULL)",
+                params![diagram_id],
+            )
+            .unwrap();
+        guard
+            .execute(
+                "INSERT INTO diagram_access
+                 (grantor_project_id, grantee_project_id, access_level, granted_at)
+                 VALUES (?1, ?2, 'read', 0)",
+                params![project_id, grantee],
+            )
+            .unwrap();
+    }
 
     #[test]
     fn cascade_deletes_diagrams_snapshots_grants_modules_when_project_dropped() {
@@ -1029,14 +428,9 @@ mod tests {
         )
         .unwrap();
 
-        let d = db
-            .register_diagram("pA", "x", "mermaid", "a.mmd", "g")
-            .unwrap();
-        db.create_diagram_snapshot(d.id, "h1", b"v1", "manual", None)
-            .unwrap();
-        db.set_diagram_access("pA", "pB", "read").unwrap();
-        seed_tool_grant(&db, "pA", "mermaid", "render", true);
-        db.set_project_module_enabled("pA", "diagrams", true).unwrap();
+        seed_diagram_tables(&db, "pA", "pB");
+        seed_tool_grant(&db, "pA", "some-mcp", "render", true);
+        db.set_project_module_enabled("pA", "model_gateway", true).unwrap();
 
         // Drop the parent project.
         {
@@ -1046,23 +440,35 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(db.list_project_diagrams("pA").unwrap().is_empty());
-        assert!(db.list_diagram_snapshots(d.id).unwrap().is_empty());
-        assert!(db.list_diagram_access("pA").unwrap().is_empty());
-        assert!(db.list_project_mcp_tools("pA", "mermaid").unwrap().is_empty());
-        assert!(db.list_project_modules("pA").unwrap().is_empty());
-        // pB still exists; its inverse-grant lookup is empty (only pA was grantor).
-        let inverse: i64 = {
+        {
             let guard = db.lock();
-            guard
+            for table in [
+                "project_diagrams",
+                "diagram_snapshots",
+                "diagram_access",
+                "project_mcp_tool_grants",
+                "project_modules",
+            ] {
+                let n: i64 = guard
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {}", table),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(n, 0, "{} rows must cascade away with the project", table);
+            }
+            // pB still exists; its inverse-grant lookup is empty (only pA
+            // was grantor).
+            let inverse: i64 = guard
                 .query_row(
                     "SELECT COUNT(*) FROM diagram_access WHERE grantee_project_id = ?1",
                     params!["pB"],
                     |r| r.get(0),
                 )
-                .unwrap()
-        };
-        assert_eq!(inverse, 0, "grantor-side cascade should have removed the row");
+                .unwrap();
+            assert_eq!(inverse, 0, "grantor-side cascade should have removed the row");
+        }
     }
 
     /// PRAGMA foreign_key_check verifies no dangling refs after the cascade.
@@ -1083,14 +489,9 @@ mod tests {
         )
         .unwrap();
 
-        let d = db
-            .register_diagram("pA", "x", "mermaid", "a.mmd", "g")
-            .unwrap();
-        db.create_diagram_snapshot(d.id, "h1", b"v1", "manual", None)
-            .unwrap();
-        db.set_diagram_access("pA", "pB", "read").unwrap();
-        seed_tool_grant(&db, "pA", "mermaid", "render", true);
-        db.set_project_module_enabled("pA", "diagrams", true).unwrap();
+        seed_diagram_tables(&db, "pA", "pB");
+        seed_tool_grant(&db, "pA", "some-mcp", "render", true);
+        db.set_project_module_enabled("pA", "model_gateway", true).unwrap();
 
         {
             let guard = db.lock();
