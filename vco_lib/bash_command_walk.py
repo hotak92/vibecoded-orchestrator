@@ -34,6 +34,7 @@ source order, left to right, which is what makes that legal.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from typing import Callable, List, Optional
 
@@ -115,11 +116,20 @@ def split_chain(tokens: List[str]) -> List[List[str]]:
     """Split a token list into segments at top-level chain operators.
 
     `shlex.split` keeps `;`, `&&`, `||`, `|`, `&` as standalone tokens
-    when they appear unquoted in the source. We just iterate and slice
-    on those. Sub-commands inside `bash -c "..."` survive as ONE string
-    token (because the quotes preserved them), so they are NOT split
-    here -- they're re-parsed by `parse_dash_c` when the walker
-    recognises a `bash -c` wrapper.
+    when they appear SURROUNDED BY SPACES in the source; glued to a word
+    (``do tail log; sleep 5; done`` keeps ``log;`` as one token) the
+    separator rides inside the token, so :func:`_split_glued` peels
+    trailing ``;`` / ``&`` runs off into standalone separator tokens
+    first (v0.2.102 W4-D: without it a ``while …; do …; sleep …; done``
+    loop was ONE segment and the sleep inside it invisible to every
+    consumer — the wait-loop guard's central case). ``|`` / ``||`` glued
+    to a word end are left alone: the piped shapes real commands use put
+    spaces around them.
+
+    Sub-commands inside `bash -c "..."` survive as ONE string token
+    (because the quotes preserved them), so they are NOT split here --
+    they're re-parsed by `parse_dash_c` when the walker recognises a
+    `bash -c` wrapper.
 
     Empty segments (e.g. trailing `;`) are dropped to keep downstream
     iteration tight.
@@ -127,15 +137,47 @@ def split_chain(tokens: List[str]) -> List[List[str]]:
     segments: List[List[str]] = []
     current: List[str] = []
     for tok in tokens:
-        if tok in CHAIN_SEPARATORS:
-            if current:
-                segments.append(current)
-                current = []
-            continue
-        current.append(tok)
+        for piece in _split_glued(tok):
+            if piece in CHAIN_SEPARATORS:
+                if current:
+                    segments.append(current)
+                    current = []
+                continue
+            current.append(piece)
     if current:
         segments.append(current)
     return segments
+
+
+#: A token with a glued trailing ``;`` / ``&`` run (``log;``, ``foo&&``).
+#: The word may be empty (a leading separator); the separator run is
+#: re-emitted as the standalone token(s) :data:`CHAIN_SEPARATORS` knows.
+_GLUED_RE = re.compile(r"^(?P<word>.*?)(?P<sep>[;&][;&]*)$")
+
+
+def _split_glued(token: str) -> List[str]:
+    """``['log;', 'sleep']`` → ``['log', ';', 'sleep']`` (separator runs of
+    two identical characters stay one token — ``foo&&`` → ``foo``, ``&&``).
+    Tokens without a glued trailing ``;`` / ``&`` pass through untouched."""
+    if len(token) <= 1 or token in CHAIN_SEPARATORS:
+        return [token]
+    m = _GLUED_RE.match(token)
+    if m is None:
+        return [token]
+    out: List[str] = []
+    word = m.group("word")
+    if word:
+        out.append(word)
+    seps = m.group("sep")
+    i = 0
+    while i < len(seps):
+        if seps[i : i + 2] == "&&":
+            out.append("&&")
+            i += 2
+            continue
+        out.append(seps[i])
+        i += 1
+    return out
 
 
 def strip_env_assignments(tokens: List[str]) -> List[str]:
