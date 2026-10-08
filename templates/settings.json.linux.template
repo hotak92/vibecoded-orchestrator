@@ -41,6 +41,9 @@
       "Bash(wget * | sh*)"
     ]
   },
+  "skillOverrides": {
+    "loop": "user-invocable-only"
+  },
   "hooks": {
     "SessionStart": [
       {
@@ -164,6 +167,18 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-skill-keyword-suggest.sh\"",
             "timeout": 2
+          }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "matcher": "loop|schedule",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" record-expansion",
+            "timeout": 10
           }
         ]
       }
@@ -400,6 +415,77 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(sleep *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(watch *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(tail *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(while *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(until *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(timeout *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(cat *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(head *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(ls *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(wc *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(grep *)"
+          }
+        ]
+      },
+      {
         "matcher": "*",
         "hooks": [
           {
@@ -447,6 +533,27 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-brief-kg-inject.sh\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Read(*)"
+          }
+        ]
+      },
+      {
+        "matcher": "ScheduleWakeup|CronCreate|Monitor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
             "timeout": 10
           }
         ]
