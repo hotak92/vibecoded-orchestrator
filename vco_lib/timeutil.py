@@ -7,7 +7,9 @@ Consolidates 4 sites with 2 different timestamp formats identified in
 finding 7:
 * install.py::_utc_iso_now → "%Y-%m-%dT%H:%M:%SZ" (Z-suffixed)
 * embedding_service.py → microsecond-precision with +00:00 offset
-* project_init.py + diagram_indexer.py → various inline strftime
+* project_init.py → various inline strftime (the diagram indexer, a
+  second inline-strftime user, was deleted with the diagrams runtime in
+  v0.2.102)
 
 Per docs/INSTALL_ARCHITECTURE_v2.md §7.5.
 

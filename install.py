@@ -5394,12 +5394,14 @@ def main() -> int:
                              "package whose version drifted from "
                              "bundled_mcp_versions.toml back to the pinned "
                              "version. Without this flag, drift is detected and "
-                             "reported via UPDATE_DEFERRED.md (Phase 0 of "
-                             "the diagrams-integration plan, 2026-05-24) but "
-                             "the user's installed version is left untouched. "
-                             "Use this when you intentionally want VCO to "
-                             "overwrite an out-of-band `npm install -g` your "
-                             "shell history shows you ran.")
+                             "reported via UPDATE_DEFERRED.md but the user's "
+                             "installed version is left untouched. (v0.2.102: "
+                             "the [npm.*] pin set is currently EMPTY — the "
+                             "diagram wrappers were the last pins — so today "
+                             "this flag matches nothing; it stays for the next "
+                             "npm pin.) Use this when you intentionally want "
+                             "VCO to overwrite an out-of-band `npm install -g` "
+                             "your shell history shows you ran.")
     parser.add_argument("--rewrite-stale-mcps", action="store_true", default=False,
                         help="On --update, prompt for consent to rewrite any "
                              "~/.claude.json mcpServers entries whose paths point "

@@ -189,7 +189,8 @@ PRIMARY_KG_SUFFIX = "_KnowledgeGraph"
 
 #: KG-family class suffixes whose stem is the shared per-project basename.
 #: (Same family ``vco_lib.project_init._KG_SUFFIXES`` scans, plus ``_Diagrams``
-#: which the diagram indexer owns — a bound class either way.)
+#: — legacy classes left by older installs are still recognised as bound;
+#: v0.2.102 removed the indexer that created them.)
 _KG_FAMILY_SUFFIXES: tuple[str, ...] = (
     PRIMARY_KG_SUFFIX,
     "_Development",

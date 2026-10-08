@@ -71,7 +71,6 @@ def _fake_cfg(**fields) -> types.SimpleNamespace:
         "code_graph_collection_prefix": "",
         "code_graph_project": "",
         "kg_access_list": [],
-        "diagrams_access_list": [],
     }
     base.update(fields)
     return types.SimpleNamespace(**base)

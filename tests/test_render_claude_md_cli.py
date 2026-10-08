@@ -3,10 +3,10 @@
 
 Covers:
   - CLI invokes the full render pipeline and writes CLAUDE.md correctly.
-  - Module active produces a CLAUDE.md WITH the conditional diagrams
-    section.
-  - Module inactive produces a CLAUDE.md WITHOUT the diagrams section.
-  - The two outputs are visibly different.
+  - A module disabled via a launcher.db ``project_modules`` row stays out
+    of the render's ``active_modules`` (v0.2.102: no shipped section is
+    gated on the retired ``diagrams`` id any more; the machinery is pinned
+    with a neutral module name).
   - User content below the managed-region closing marker is preserved
     across a re-render.
   - The CLI emits valid JSON on stdout with `--json`.
@@ -60,9 +60,9 @@ class CliRendersClaudeMdTests(unittest.TestCase):
     """End-to-end: `re-render-claude-md` writes a sensible CLAUDE.md."""
 
     def test_default_modules_active_no_diagrams_section(self):
-        # With the stub fallback (no DB), diagrams is default-on — the
-        # verdict still answers the id (machinery kept, v0.2.102) — but no
-        # shipped section is gated on it any more, so the rendered
+        # With the stub fallback (no DB) the default-on set is EMPTY
+        # (v0.2.102: ``diagrams``, its only member, was removed) — and no
+        # shipped section is gated on the id any more, so the rendered
         # CLAUDE.md must NOT contain a Diagrams section.
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td)
@@ -82,7 +82,7 @@ class CliRendersClaudeMdTests(unittest.TestCase):
             # v0.2.102: active_modules is DOC-DRIVEN — with no diagrams
             # section left in the template, the id no longer appears even
             # though the verdict machinery still answers it.
-            self.assertNotIn("diagrams", payload["active_modules"])
+            self.assertNotIn("some_module", payload["active_modules"])
 
             claude_md = (folder / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertNotIn("## Diagrams", claude_md)
@@ -97,9 +97,10 @@ class CliRendersClaudeMdTests(unittest.TestCase):
             self.assertNotIn("{{PROJECT_NAME}}", claude_md)
 
     def test_module_inactive_via_db_diagrams_section_absent(self):
-        # Provision a launcher DB where project_modules.diagrams=0 for
-        # this project. The rendered CLAUDE.md must NOT contain the
-        # Diagrams section.
+        # Provision a launcher DB where project_modules.some_module=0 for
+        # this project. The module must stay out of the render's
+        # active_modules, and the rendered CLAUDE.md must NOT contain the
+        # (template-absent) Diagrams section.
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td) / "project"
             folder.mkdir()
@@ -113,7 +114,7 @@ class CliRendersClaudeMdTests(unittest.TestCase):
             )
             conn.execute(
                 "INSERT INTO project_modules VALUES (?, ?, ?)",
-                ("test-project", "diagrams", 0),
+                ("test-project", "some_module", 0),
             )
             conn.commit()
             conn.close()
@@ -133,7 +134,7 @@ class CliRendersClaudeMdTests(unittest.TestCase):
             )
             payload = json.loads(result.stdout)
             self.assertTrue(payload["ok"])
-            self.assertNotIn("diagrams", payload["active_modules"])
+            self.assertNotIn("some_module", payload["active_modules"])
 
             claude_md = (folder / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertNotIn("## Diagrams (Mermaid + Excalidraw)", claude_md)
@@ -156,7 +157,7 @@ class CliRendersClaudeMdTests(unittest.TestCase):
         # active-modules set, confirm user content survives.
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td)
-            # Render 1: default-on (diagrams active).
+            # Render 1: stub fallback (empty default-on set, v0.2.102).
             res1 = _run_cli([
                 "re-render-claude-md",
                 "--folder", str(folder),
@@ -173,7 +174,7 @@ class CliRendersClaudeMdTests(unittest.TestCase):
                     "this is a user-added section that must survive\n"
                 )
 
-            # Render 2: explicitly disable diagrams via DB.
+            # Render 2: explicitly disable a module via DB.
             state_dir = Path(td) / "state"
             state_dir.mkdir()
             db = state_dir / "launcher.db"
@@ -184,7 +185,7 @@ class CliRendersClaudeMdTests(unittest.TestCase):
             )
             conn.execute(
                 "INSERT INTO project_modules VALUES (?, ?, ?)",
-                ("toggled", "diagrams", 0),
+                ("toggled", "some_module", 0),
             )
             conn.commit()
             conn.close()
@@ -207,7 +208,8 @@ class CliRendersClaudeMdTests(unittest.TestCase):
             # User content survives.
             self.assertIn("## User custom", final)
             self.assertIn("this is a user-added section that must survive", final)
-            # Diagrams section gone.
+            # Diagrams section absent (removed from the template in
+            # v0.2.102; the assert pins it STAYS absent).
             self.assertNotIn("## Diagrams (Mermaid + Excalidraw)", final)
 
     def test_cli_human_prose_mode(self):

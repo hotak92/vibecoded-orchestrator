@@ -986,8 +986,10 @@ class DocstringsStateWhatTheCodeDoes(unittest.TestCase):
         ])
         active = project_init.resolve_active_modules(pid, db_path=db)
         self.assertNotIn("model_gateway", active)
-        self.assertIn("diagrams", active)   # the default-on set
-        self.assertIn("something_else", active)
+        # v0.2.102: the default-on set is EMPTY (``diagrams``, its only
+        # member, was removed with the diagrams runtime) — the row is the
+        # only active module.
+        self.assertEqual(active, {"something_else"})
 
     def test_user_modified_emitter_does_not_call_dismiss_a_placeholder(self):
         """`dismiss-deferral` exists and the entry prints it. The docstring

@@ -470,8 +470,8 @@ PATH_BEARING_DB_COLUMNS: tuple[ColumnPolicy, ...] = (
         "project_diagrams",
         "file_path",
         POLICY_SWEEP_ONLY,
-        "MAY be relative or absolute (`diagrams_cmd.rs::resolve_diagram_path` "
-        "branches on `is_absolute`). Relative rows follow the move for free; "
+        "MAY be relative or absolute (the removed diagrams resolver branched "
+        "on `is_absolute`). Relative rows follow the move for free; "
         "absolute rows are frozen as-is (the rebuild CLI that re-derived "
         "them was removed with the diagrams integrations in v0.2.102; the "
         "deferral names the table instead).",

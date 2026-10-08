@@ -13,13 +13,16 @@ Weaviate class name to round-trip end-to-end:
      used by the indexer (``vco_lib.diagram_indexer``) and the install
      bootstrap when creating the Diagrams collection.
   2. ``launcher/src-tauri/vct-hub/src/config_api.rs::sanitize_diagrams_class_prefix``
-     (Rust) — used by the hub when emitting ``diagrams_access_list``
-     (the canonical class names of grantor projects whose diagrams
-     this project may search).
+     (Rust) — its production call site (the hub's ``diagrams_access_list``
+     emission) was removed in v0.2.102 with the diagrams runtime; the
+     helper is kept ``#[cfg(test)]`` as this parity pin, because the
+     ``<Project>_Diagrams`` collection-NAME derivation itself stays
+     (recognition of existing user collections is deliberately kept).
   3. ``claude_mcp_servers/weaviate_mcp/server.py::_sanitize_collection_prefix``
-     (Python MCP) — used by the MCP's ``_diagrams_peer_collections``
-     env-fallback path when the hub is unreachable (sanitises raw
-     grantor names from ``VCT_DIAGRAMS_ACCESS_LIST``).
+     (Python MCP) — still live for the KG peer env-fallback path
+     (``VCT_KG_ACCESS_LIST`` → ``<prefix>_KnowledgeGraph``) and as the
+     base of the code-graph prefix sanitiser. (v0.2.102: the diagrams
+     peer fan-out that also consumed it is gone.)
 
 (1) was documented as the source-of-truth per
 ``derive_project_collection_names``'s docstring. (2) and (3) silently
@@ -48,8 +51,10 @@ Unicode, leading digits, all-symbol) and asserting that:
 
   * ``sanitize_for_weaviate_class(name)`` (Python canonical) and
   * ``_sanitize_collection_prefix(name)`` (Python MCP) and
-  * The Rust port (verified separately by
-    ``launcher/src-tauri/tests/diagrams_class_name_parity.rs``)
+  * The Rust port (verified separately by the in-crate ``#[cfg(test)]``
+    tests in ``launcher/src-tauri/vct-hub/src/config_api.rs`` — see
+    ``diagrams_class_name_parity_with_python_fixture``; there is no
+    standalone ``tests/diagrams_class_name_parity.rs``)
 
 all produce IDENTICAL output for every fixture row. Drift between any
 two layers fails the parity test on the affected side.
@@ -115,7 +120,7 @@ def _load_fixture() -> dict:
     collection phase so it's obvious why no test cases ran."""
     assert FIXTURE_PATH.exists(), (
         f"Parity fixture missing: {FIXTURE_PATH} — this file is shared "
-        "with launcher/src-tauri/tests/diagrams_class_name_parity.rs"
+        "with the in-crate Rust parity tests in vct-hub's config_api.rs"
     )
     with FIXTURE_PATH.open() as f:
         data = json.load(f)
@@ -239,7 +244,8 @@ def test_three_layers_produce_identical_diagrams_class_name() -> None:
     every layer and assert they're all equal.
 
     Note: the Rust layer is verified separately by the cargo test
-    (``launcher/src-tauri/tests/diagrams_class_name_parity.rs``)
+    (``diagrams_class_name_parity_with_python_fixture`` in
+    ``launcher/src-tauri/vct-hub/src/config_api.rs``)
     against the SAME fixture file — running that test on every CI
     matrix entry closes the Python↔Rust loop. We can't subprocess
     into Rust from a pytest unit test without compiling the launcher

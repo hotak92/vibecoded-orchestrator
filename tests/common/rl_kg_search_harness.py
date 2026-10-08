@@ -286,7 +286,6 @@ def _install_project_config_fake(configs: dict) -> list:
             raise RuntimeError(f"project not registered: {key}")
         ns = SimpleNamespace(
             kg_access_list=[],
-            diagrams_access_list=[],
             code_graph_access_list=[],
         )
         for k, v in row.items():

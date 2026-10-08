@@ -4634,9 +4634,9 @@ def _render_project_template(template_text: str, **kwargs: Any) -> str:
 #
 # Mustache-style sections that the project-template renderer strips BEFORE
 # the dict-based `{{KEY}}` placeholder pass. Designed for the "is this
-# module active for this project?" question — diagrams ships as default-on
-# with a user-toggleable opt-out in the launcher's DiagramsTab; future
-# modules (RL, MAO, paid packs) reuse the same primitive.
+# module active for this project?" question — default-on modules carry a
+# per-project opt-out row in launcher.db ``project_modules``; modules
+# (model gateway, RL, MAO, paid packs) reuse the same primitive.
 #
 # Syntax (whole-line tags):
 #
@@ -4717,7 +4717,7 @@ def render_conditional_blocks(
     Args:
         template: Raw template text (UTF-8 decoded already).
         active_modules: Set of module-name strings considered "on" for
-            this project (e.g. ``{"diagrams"}``).
+            this project (e.g. ``{"model_gateway"}``).
 
     Returns:
         The template with conditional blocks resolved. When a block is
@@ -4997,7 +4997,7 @@ def resolve_active_modules(
 ) -> set[str]:
     """Return the set of active module names for ``project_id``.
 
-    ``_DEFAULT_ACTIVE_MODULES`` (today: ``{"diagrams"}``) plus every module
+    ``_DEFAULT_ACTIVE_MODULES`` (empty since v0.2.102) plus every module
     with an ``enabled=1`` row in launcher.db ``project_modules``, minus every
     default-on module with an ``enabled=0`` row. **A module with NO row is
     active only if it is in :data:`_DEFAULT_ACTIVE_MODULES`** (v0.2.96 F-N5;

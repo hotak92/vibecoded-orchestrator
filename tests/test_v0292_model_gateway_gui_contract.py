@@ -377,7 +377,7 @@ def test_the_gate_is_default_OFF_on_BOTH_sides():
     assert "model_gateway" not in _DEFAULT_ACTIVE_MODULES
 
     rust = (
-        REPO / "launcher" / "src-tauri" / "src" / "commands" / "diagrams_cmd.rs"
+        REPO / "launcher" / "src-tauri" / "src" / "commands" / "module_enabled.rs"
     ).read_text(encoding="utf-8")
     m = re.search(
         r"ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES: &\[&str\] = &\[(.*?)\];",
@@ -518,7 +518,7 @@ def render(active: set[str]) -> str:
 
 def test_no_gateway_means_no_word_about_vendor_models():
     """LEAVE-ALONE: an install with no gateway reads nothing about GLM."""
-    out = render({"diagrams"}).lower()
+    out = render({"some_module"}).lower()
     for token in ("glm", "claude-gw", "model routing", "artificial analysis"):
         assert token not in out, (
             f"{token!r} reached a project with no gateway configured; the "
@@ -527,7 +527,7 @@ def test_no_gateway_means_no_word_about_vendor_models():
 
 
 def test_gateway_active_renders_the_routing_section():
-    out = render({"diagrams", "model_gateway"})
+    out = render({"some_module", "model_gateway"})
     assert "## Model routing" in out
     assert "claude-gw/glm-5.3" in out
     assert "CLAUDE_CODE_SUBAGENT_MODEL" in out, (
@@ -550,7 +550,7 @@ def test_the_section_is_the_only_difference_it_makes():
     # diagrams integrations, so `model_gateway` is the ONLY conditional
     # block left — a render with the (historical) `diagrams` id is
     # byte-identical to an empty module set.
-    assert render({"diagrams"}) == off
+    assert render({"some_module"}) == off
 
 
 def test_the_conditional_blocks_are_not_nested():
@@ -558,7 +558,7 @@ def test_the_conditional_blocks_are_not_nested():
     project's install, not just gateway users."""
     from vco_lib.project_init import render_conditional_blocks
 
-    for mods in (set(), {"diagrams"}, {"model_gateway"}, {"diagrams", "model_gateway"}):
+    for mods in (set(), {"some_module"}, {"model_gateway"}, {"some_module", "model_gateway"}):
         render_conditional_blocks(
             TEMPLATE.read_text(encoding="utf-8"), active_modules=mods
         )
@@ -697,11 +697,11 @@ def test_the_definition_name_guidance_renders_inside_the_gate_only():
     no-vendor-words test catches the leak half; this pins the presence
     half, so the guidance cannot be dropped from the gated render either)."""
     at_names = [f"@{n.removesuffix('.md')}" for n in MODULE_GATEWAY_AGENT_FILES]
-    on = render({"diagrams", "model_gateway"})
+    on = render({"some_module", "model_gateway"})
     for at_name in at_names:
         assert at_name in on
     assert "cannot carry `claude-gw/*` ids" in on
-    off = render({"diagrams"})
+    off = render({"some_module"})
     for at_name in at_names:
         assert at_name not in off
 

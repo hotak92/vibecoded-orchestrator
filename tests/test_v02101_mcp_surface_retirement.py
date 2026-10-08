@@ -34,7 +34,6 @@ from vco_lib import install_mcp, mcp_scan_rules  # noqa: E402
 # Text surfaces that asserted the old (false) "registered but default-disabled"
 # promise, or named the deleted search MCP.
 ORCHESTRATOR_TEMPLATE = REPO_ROOT / "templates" / "ORCHESTRATOR-CLAUDE.md.template"
-DIAGRAMS_TAB = REPO_ROOT / "launcher" / "src" / "lib" / "project-state" / "DiagramsTab.svelte"
 PERMISSIONS_TAB = REPO_ROOT / "launcher" / "src" / "lib" / "project-state" / "PermissionsTab.svelte"
 
 
@@ -357,14 +356,6 @@ class FalsePromiseTextTests(unittest.TestCase):
             "registered-but-default-disabled (they are no longer registered)",
         )
         self.assertNotIn("search_papers", text)
-
-    def test_diagrams_tab_drops_the_mcp_registration_claim(self) -> None:
-        text = DIAGRAMS_TAB.read_text(encoding="utf-8")
-        self.assertNotIn(
-            "diagrams MCP is not registered", text,
-            "the Diagrams tab module toggle no longer gates MCP registration",
-        )
-        self.assertNotIn("register the Mermaid / Excalidraw MCPs", text)
 
     def test_dead_diagram_mcp_gui_surface_is_gone(self) -> None:
         """v0.2.101: the per-tool MCP-grant GUI + its Tauri commands existed

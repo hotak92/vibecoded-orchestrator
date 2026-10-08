@@ -374,28 +374,16 @@ class ProjectConfig:
     #: about, the client emits a one-line stderr warning and still
     #: returns the parsed body (additive fields default client-side).
     schema_version: int = RESOLVER_PROTOCOL_VERSION
-    #: Peer-project diagrams collection names (already-canonical
-    #: Weaviate class names, e.g. ``("Foo_Diagrams",)``). v0.2.34 A7
-    #: split from the KG list — pre-v0.2.34 the MCP piggybacked on
-    #: ``kg_access_list`` which had the wrong granularity. Empty tuple
-    #: when no peers granted diagram read. Pre-v0.2.34 hubs omit the
-    #: field; the parser back-fills with ``()`` so old hubs paired
-    #: with v0.2.34+ clients don't crash — the MCP env-fallback path
-    #: covers the empty-tuple sentinel by reading
-    #: ``VCT_DIAGRAMS_ACCESS_LIST``. Placed after the other defaulted
-    #: fields to keep frozen-dataclass init signature backward-compat.
-    diagrams_access_list: tuple[str, ...] = ()
-    #: Per-project Weaviate diagrams collection name (Phase 1.5 —
-    #: fix/a1-indexing-pipeline 2026-05-25). The hub derives this from
-    #: the primary KG collection via the `_KnowledgeGraph` → `_Diagrams`
-    #: suffix swap. Pre-fix hubs paired with post-fix clients omit the
-    #: field; the parser back-fills with the empty string. The MCP
-    #: server's ``_config_field("diagrams_collection", ...,
-    #: empty_means_unset=True)`` treats empty as unset and falls
-    #: through to the env-var path (``DIAGRAMS_COLLECTION``), which
-    #: preserves backward compatibility while letting newer hubs serve
-    #: the canonical name directly. Additive (declared last so callers
-    #: that construct ``ProjectConfig`` positionally don't break).
+    #: Per-project Weaviate diagrams collection name. v0.2.102: the
+    #: diagrams runtime is REMOVED; the field is kept RECOGNITION-ONLY —
+    #: the ``_KnowledgeGraph`` → ``_Diagrams`` suffix-swap derivation
+    #: still names the class an older install created, so the migrate /
+    #: drop / orphan paths keep recognising existing user collections.
+    #: Nothing creates the class any more. Older hubs paired with newer
+    #: clients may omit the field; the parser back-fills the empty
+    #: string, which consumers treat as unset. Additive (declared last
+    #: so callers that construct ``ProjectConfig`` positionally don't
+    #: break).
     diagrams_collection: str = ""
     #: v0.2.40 R2 — RL Reranker per-project flags. Until v0.2.40 the
     #: three GUI checkboxes (``set_rl_use_global`` /
@@ -1303,13 +1291,10 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             codegraph_access_list=tuple(
                 str(s) for s in body["codegraph_access_list"]
             ),
-            # v0.2.34 A7 additive field — pre-v0.2.34 hubs omit it.
-            # Empty-tuple sentinel signals "no hub-resolved peers";
-            # the MCP env-fallback path reads VCT_DIAGRAMS_ACCESS_LIST
-            # in that case.
-            diagrams_access_list=tuple(
-                str(s) for s in body.get("diagrams_access_list", [])
-            ),
+            # NOTE: the v0.2.34 A7 ``diagrams_access_list`` field was
+            # removed in v0.2.102 with the diagrams runtime. A hub body
+            # still carrying the key (an older hub) is simply ignored —
+            # unknown extra keys are tolerated by this parser.
             weaviate_url=str(body["weaviate_url"]),
             ollama_url=str(body["ollama_url"]),
             grpc_port=int(body["grpc_port"]),

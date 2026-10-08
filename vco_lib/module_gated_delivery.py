@@ -114,7 +114,11 @@ GATEWAY_AGENTS_SOURCE_PREFIX = f"templates/agents/{GATEWAY_AGENTS_DIR}/"
 #: policy: a module NOT named here and with no ``project_modules`` row is
 #: INACTIVE. Moved here from ``project_init`` in v0.2.100 with the resolver
 #: that reads it (``project_init`` re-exports it as ``_DEFAULT_ACTIVE_MODULES``).
-DEFAULT_ACTIVE_MODULES: frozenset[str] = frozenset({"diagrams"})
+#: v0.2.102: EMPTY — ``diagrams``, the only member, was removed with the
+#: diagrams runtime (owner ruling 2026-10-07). The mechanism stays (as does
+#: its Rust mirror ``ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES``, now
+#: ``&[]``): a future default-on module joins here, not as a special case.
+DEFAULT_ACTIVE_MODULES: frozenset[str] = frozenset()
 
 #: Deferral condition ids this module emits and resolves (registry:
 #: ``vco_lib/deferral_conditions.toml``, ``clear_probe = "paired-resolution"``

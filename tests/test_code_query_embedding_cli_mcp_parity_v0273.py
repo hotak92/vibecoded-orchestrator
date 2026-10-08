@@ -15,7 +15,8 @@ Regression guarded here:
     ``ACTIVE_EMBEDDING`` while the CLI unconditionally used
     ``codesage_embed``.
 
-WORKTREE FOOTGUN (wave-1 diagram-test lesson): these tests do NOT spawn
+WORKTREE FOOTGUN (a lesson first learned in the wave-1 diagram tests):
+these tests do NOT spawn
 venv-resolving hooks, but we defensively clear ambient ``VCT_VENV`` /
 ``VCT_DISABLE_HUB_RESOLVER`` at import time so a hook-spawning sibling in
 the same process can't leak state.

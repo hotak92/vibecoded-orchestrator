@@ -48,10 +48,9 @@ classifiers = [
 # CLI-only runtime deps. Heavy deps (MCP SDK, Weaviate client, sentence-
 # transformers, torch) live in the `mcp` optional-dependency group so the
 # bare `vco` CLI doesn't drag them in: `verify-pins` and `verify-env-
-# projection` only need stdlib + tomllib (3.11+), and `rebuild-diagram-
-# index` / `codegraph-diagram` import Weaviate lazily inside guarded
-# `try/except ImportError` blocks. Users who want the full stack do
-# `pip install -e .[mcp]` (install.py picks this path automatically).
+# projection` only need stdlib + tomllib (3.11+). Users who want the full
+# stack do `pip install -e .[mcp]` (install.py picks this path
+# automatically).
 dependencies = [
     # tomllib is stdlib on 3.11+ (our minimum), so no backport pin is
     # needed at runtime. Listed here only as a sentinel for future
@@ -128,10 +127,10 @@ dev = [
 
 [project.scripts]
 # Single CLI entry point. Resolves to `vco_lib.cli.__main__:main`,
-# which dispatches to verify-pins / verify-env-projection / rebuild-
-# diagram-index / codegraph-diagram (and future subcommands as Phase 1+
-# adds them — each subcommand registers itself onto a shared argparse
-# subparsers action via its module's `add_subparsers(sub)` hook).
+# which dispatches to verify-pins / verify-env-projection (and future
+# subcommands as they are added — each subcommand registers itself onto a
+# shared argparse subparsers action via its module's `add_subparsers(sub)`
+# hook).
 vco = "vco_lib.cli.__main__:main"
 
 [project.urls]
