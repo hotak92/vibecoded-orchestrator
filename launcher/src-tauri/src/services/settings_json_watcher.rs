@@ -607,24 +607,43 @@ async fn sync_watches<R: Runtime + 'static>(
     let mut watched = state.watched.lock().await;
 
     // Add new.
-    let mut added: Vec<PathBuf> = Vec::new();
+    // v0.2.102 (W4-F review F1): the settings.json body is captured BEFORE
+    // the watch is registered, per dir, so the seeded baseline is the TRUE
+    // pre-watch body. Reading it after `watch()` left a window in which a
+    // REAL MCP-relevant write landed between registration and the seed
+    // read: the seed cached the POST-write hash, the queued event drained
+    // to the same body → "unchanged" → skip, and the live MCPs silently
+    // kept stale env. With a pre-watch baseline any post-registration write
+    // is always a diff: a real change reloads, a no-op write skips.
+    let mut added: HashMap<PathBuf, String> = HashMap::new();
     for dir in desired.difference(&watched) {
-        if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
-            tracing::warn!(
-                "[settings_json_watcher] watch({}) failed: {} (skipping)",
-                dir.display(),
-                e
-            );
-            continue;
+        match capture_pre_watch_body(
+            dir,
+            |p| std::fs::read_to_string(p).unwrap_or_default(),
+            |d| {
+                watcher
+                    .watch(d, RecursiveMode::NonRecursive)
+                    .map_err(|e| e.to_string())
+            },
+        ) {
+            Err(e) => {
+                tracing::warn!(
+                    "[settings_json_watcher] watch({}) failed: {} (skipping)",
+                    dir.display(),
+                    e
+                );
+                continue;
+            }
+            Ok(pre_watch_body) => {
+                added.insert(dir.clone(), pre_watch_body);
+            }
         }
-        added.push(dir.clone());
     }
     // v0.2.102 (W4-F defect A): seed the diff-guard baseline for every
-    // settings.json we just started watching, so the FIRST event after
-    // watcher start (typically the launcher's own env re-projection) is
-    // DIFFED against the on-disk body instead of failing open into a
-    // SIGHUP of every live MCP. Before any watch exists no event can be
-    // pending, so seeding here cannot race an in-flight decision.
+    // settings.json we just started watching — from the PRE-watch bodies —
+    // so the FIRST event after watcher start (typically the launcher's own
+    // env re-projection) is DIFFED against the on-disk body instead of
+    // failing open into a SIGHUP of every live MCP.
     seed_new_watch_baselines(&app, &state, &added).await;
     // Remove gone.
     let removed: Vec<PathBuf> = watched.difference(&desired).cloned().collect();
@@ -639,29 +658,46 @@ async fn sync_watches<R: Runtime + 'static>(
     Ok(())
 }
 
+/// v0.2.102 (W4-F review F1): the add-loop step for ONE newly watched dir,
+/// extracted so the ORDERING is provable in a unit test. The settings.json
+/// body is read BEFORE the watch is registered (both are injected closures
+/// — `read_body` is `fs::read_to_string`, `watch` is `watcher.watch`), so
+/// the returned baseline is the TRUE pre-watch body. Reading it after
+/// `watch()` instead left a window in which a real MCP-relevant write
+/// landed between registration and the seed read: the seed cached the
+/// post-write hash, the queued event drained the same body → "unchanged" →
+/// skip, and the live MCPs silently kept stale env. With a pre-watch
+/// baseline, any write after registration is always a diff.
+fn capture_pre_watch_body(
+    dir: &Path,
+    read_body: impl Fn(&Path) -> String,
+    mut watch: impl FnMut(&Path) -> Result<(), String>,
+) -> Result<String, String> {
+    let body = read_body(&dir.join("settings.json"));
+    watch(dir)?;
+    Ok(body)
+}
+
 /// v0.2.102 (W4-F defect A): IO/lock wrapper around [`seed_baselines`] for
-/// the dirs `sync_watches` just added to the watch set. Reads each
-/// `<project>/.claude/settings.json` body (absent file → no seed → that
-/// path keeps the fail-open first event), hashes non-strict-JSON bodies
-/// through the SAME bridge rule as fire-time, and seeds the cache under
-/// its lock. Soft-fail throughout: a bridge error just seeds fewer paths.
+/// the dirs `sync_watches` just added to the watch set, keyed on the watch
+/// DIR with the body captured BEFORE `watcher.watch(dir)` registered (the
+/// pre-watch baseline — see `sync_watches`). Maps each dir to its
+/// `<project>/.claude/settings.json` path (absent file → empty body → no
+/// seed → that path keeps the fail-open first event), hashes non-strict-JSON
+/// bodies through the SAME bridge rule as fire-time, and seeds the cache
+/// under its lock. Soft-fail throughout: a bridge error just seeds fewer
+/// paths.
 async fn seed_new_watch_baselines<R: Runtime>(
     app: &AppHandle<R>,
     state: &WatchState,
-    new_dirs: &[PathBuf],
+    pre_watch_bodies: &HashMap<PathBuf, String>,
 ) {
-    if new_dirs.is_empty() {
+    if pre_watch_bodies.is_empty() {
         return;
     }
-    let bodies: HashMap<PathBuf, String> = new_dirs
+    let bodies: HashMap<PathBuf, String> = pre_watch_bodies
         .iter()
-        .map(|dir| {
-            let path = dir.join("settings.json");
-            (
-                path.clone(),
-                std::fs::read_to_string(&path).unwrap_or_default(),
-            )
-        })
+        .map(|(dir, body)| (dir.join("settings.json"), body.clone()))
         .collect();
     let root = app
         .try_state::<Db>()
@@ -1736,6 +1772,106 @@ mod tests {
         assert!(
             decision.reload,
             "an unseedable file must keep the fail-open first event"
+        );
+    }
+
+    // ─── v0.2.102 (W4-F review F1): pre-watch baseline capture ───────────
+    //
+    // The seeding race the review found: `sync_watches` registered the
+    // watch FIRST and read the body inside the seeding step. A real
+    // MCP-relevant write landing in between was folded INTO the baseline
+    // (the seed cached the post-write hash) and its drained event skipped —
+    // silent stale env. The fix captures the body BEFORE `watch()`, per
+    // dir; these tests pin the ordering and both diff directions.
+
+    /// The ordering itself + the non-benign direction: capture → write →
+    /// event ⇒ signal. The injected readers record their invocation order,
+    /// the captured (pre-watch) body is seeded, and the event drains the
+    /// POST-write body → the write must be a diff → reload fires.
+    #[test]
+    fn pre_watch_capture_reads_before_watch_and_a_post_write_event_fires() {
+        use std::cell::RefCell;
+
+        let dir = Path::new("/proj/.claude");
+        let at_start = settings_with_env(&[("KG_COLLECTION", "MyKG")], "s");
+        let after_write = settings_with_env(&[("KG_COLLECTION", "OtherKG")], "s");
+
+        let calls: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+        let read_body = |p: &Path| {
+            assert_eq!(p, dir.join("settings.json"));
+            calls.borrow_mut().push("read");
+            at_start.clone()
+        };
+        let watch = |d: &Path| {
+            assert_eq!(d, dir);
+            calls.borrow_mut().push("watch");
+            Ok(()) // registration succeeds; the write lands right after it
+        };
+        let captured = capture_pre_watch_body(dir, read_body, watch).expect("watch must succeed");
+        assert_eq!(
+            *calls.borrow(),
+            vec!["read", "watch"],
+            "the baseline body MUST be captured BEFORE the watch is registered"
+        );
+
+        // Seeding uses the PRE-watch body; the drained event reads the
+        // POST-write body → changed → the SIGHUP fires (never a skip).
+        let path = dir.join("settings.json");
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        seed_baselines(
+            &[(path.clone(), captured)].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        assert!(cache.contains_key(&path), "the pre-watch body must seed");
+        let decision = evaluate_drained_paths(
+            &[path.clone()],
+            &mut cache,
+            |_| after_write.clone(),
+            |_| None,
+        );
+        assert!(
+            decision.reload,
+            "a real MCP-env write between watch() and the seed must reload, not skip"
+        );
+    }
+
+    /// The benign direction: a NO-OP (byte-idempotent) write landing in the
+    /// same window is still skipped — the pre-watch capture must not turn
+    /// into a needless-reload fail-open.
+    #[test]
+    fn pre_watch_capture_still_skips_a_noop_write_in_the_window() {
+        use std::cell::RefCell;
+
+        let dir = Path::new("/proj/.claude");
+        let body = settings_with_env(&[("KG_COLLECTION", "MyKG")], "s");
+
+        let calls: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+        let read_body = |p: &Path| {
+            calls.borrow_mut().push("read");
+            assert_eq!(p, dir.join("settings.json"));
+            body.clone()
+        };
+        let watch = |d: &Path| {
+            calls.borrow_mut().push("watch");
+            assert_eq!(d, dir);
+            Ok(())
+        };
+        let captured = capture_pre_watch_body(dir, read_body, watch).expect("watch must succeed");
+        assert_eq!(*calls.borrow(), vec!["read", "watch"]);
+
+        let path = dir.join("settings.json");
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        seed_baselines(
+            &[(path.clone(), captured)].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        // The idempotent re-projection writes the SAME MCP-relevant env.
+        let decision = evaluate_drained_paths(&[path], &mut cache, |_| body.clone(), |_| None);
+        assert!(
+            !decision.reload,
+            "a no-op write in the window must still be skipped (no needless SIGHUP)"
         );
     }
 }

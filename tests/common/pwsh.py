@@ -32,11 +32,16 @@ USAGE — every test that spawns pwsh builds its argv through
 
 One concern, one home: do not hand-write ``"-SettingsFile"`` at call
 sites; this module is the only place that knows the settings-file path
-and the win32 escape.
+and the win32 escape. ``PWSH_BASE_FLAGS`` is computed for the binary the
+migrated tests resolve (``pwsh``, else the POSIX ``powershell``
+fallback); a caller resolving something else should use
+``base_flags_for(exe)`` (W4-F review F2: a pre-7 ``powershell`` has no
+``-SettingsFile`` switch and must not receive it).
 """
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -75,6 +80,31 @@ def quiet_flags() -> list[str]:
     return ["-SettingsFile", settings]
 
 
+def base_flags_for(exe: str | None) -> list[str]:
+    """The base flags for the RESOLVED PowerShell binary (W4-F review F2).
+
+    Several migrated tests resolve their binary as
+    ``shutil.which("pwsh") or shutil.which("powershell")``. On the exotic
+    POSIX host where only a ``powershell`` binary exists, that is Windows
+    PowerShell 5.1 (or another pre-7 build): it has NO ``-SettingsFile``
+    switch, so receiving the flag fails at argv parse where the test passed
+    before. A binary whose name is not ``pwsh*`` therefore gets only
+    ``-NoProfile``; ``pwsh`` keeps the journal-suppression fragment.
+    ``None`` (nothing resolvable) keeps the ``pwsh`` shape — the tests that
+    need a binary skip themselves in that case.
+    """
+    if sys.platform != "win32" and exe is not None:
+        name = Path(exe).name
+        if not name.startswith("pwsh"):
+            return ["-NoProfile"]
+    return quiet_flags() + ["-NoProfile"]
+
+
 #: The base flags EVERY test-side pwsh invocation must start with (after
-#: the executable): journal suppression on POSIX, ``-NoProfile`` always.
-PWSH_BASE_FLAGS: list[str] = quiet_flags() + ["-NoProfile"]
+#: the executable): journal suppression on POSIX, ``-NoProfile`` always —
+#: computed for the binary the migrated tests actually resolve
+#: (``pwsh`` first, the POSIX ``powershell`` fallback second), so the
+#: exotic-host fallback never receives a flag it cannot parse.
+PWSH_BASE_FLAGS: list[str] = base_flags_for(
+    shutil.which("pwsh") or shutil.which("powershell")
+)

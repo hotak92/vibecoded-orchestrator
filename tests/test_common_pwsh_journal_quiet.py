@@ -28,16 +28,18 @@ from pathlib import Path
 
 import pytest
 
-from tests.common.pwsh import PWSH_BASE_FLAGS, _SETTINGS_FILE
+from tests.common.pwsh import PWSH_BASE_FLAGS, _SETTINGS_FILE, base_flags_for
 
 TESTS_DIR = Path(__file__).resolve().parent
 
 
 def test_base_flags_end_with_no_profile_and_carry_settings_on_posix():
     assert PWSH_BASE_FLAGS[-1] == "-NoProfile"
-    if sys.platform == "win32":
-        # Windows PowerShell 5.1 has no -SettingsFile and there is no
-        # syslog to silence — the spread must be a no-op there.
+    resolved = shutil.which("pwsh") or shutil.which("powershell")
+    if sys.platform == "win32" or (resolved and not Path(resolved).name.startswith("pwsh")):
+        # Windows PowerShell 5.1 (the win32 escape, or the POSIX
+        # `powershell` fallback binary) has no -SettingsFile and no syslog
+        # to silence — it must not receive the flag.
         assert PWSH_BASE_FLAGS == ["-NoProfile"]
     else:
         assert PWSH_BASE_FLAGS[:2] == ["-SettingsFile", str(_SETTINGS_FILE)]
@@ -69,6 +71,50 @@ def test_pwsh_accepts_the_base_flags():
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "2"
+
+
+def test_base_flags_for_a_pre7_powershell_omits_settings_file():
+    """W4-F review F2: the POSIX ``powershell`` fallback binary (Windows
+    PowerShell 5.1's binary name / any pre-7 build) has NO ``-SettingsFile``
+    switch — the helper must not hand it the flag, or the migrated tests
+    fail at argv parse on that exotic host where they passed before."""
+    flags = base_flags_for("/usr/bin/powershell")
+    assert "-SettingsFile" not in flags, (
+        "a pre-7 `powershell` binary cannot parse -SettingsFile"
+    )
+    assert flags == ["-NoProfile"]
+    # pwsh (POSIX) keeps the journal-suppression fragment; win32 keeps the
+    # no-op shape for every binary
+    pwsh_flags = base_flags_for("/usr/bin/pwsh")
+    assert pwsh_flags[-1] == "-NoProfile"
+    if sys.platform != "win32":
+        assert "-SettingsFile" in pwsh_flags
+
+
+def test_module_flags_follow_the_resolved_binary(monkeypatch):
+    """W4-F review F2: ``PWSH_BASE_FLAGS`` must be a function of the binary
+    the migrated tests resolve (``pwsh`` first, POSIX ``powershell``
+    second). Reloaded with only a ``powershell`` on PATH, the module-level
+    flags must drop ``-SettingsFile`` (pre-fix they carried it
+    unconditionally on POSIX — RED on the pre-fix helper)."""
+    import importlib
+
+    from tests.common import pwsh as pwsh_mod
+
+    monkeypatch.setattr(
+        pwsh_mod.shutil,
+        "which",
+        lambda name: "/usr/bin/powershell" if name == "powershell" else None,
+    )
+    try:
+        reloaded = importlib.reload(pwsh_mod)
+        assert "-SettingsFile" not in reloaded.PWSH_BASE_FLAGS, (
+            "the POSIX powershell fallback must not receive -SettingsFile"
+        )
+        assert reloaded.PWSH_BASE_FLAGS == ["-NoProfile"]
+    finally:
+        monkeypatch.undo()
+        importlib.reload(pwsh_mod)
 
 
 def test_no_test_hand_writes_the_noprofile_literal():
