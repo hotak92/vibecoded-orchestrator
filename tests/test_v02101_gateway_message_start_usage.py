@@ -102,6 +102,27 @@ def _unmark_thinking(body: bytes) -> bytes:
     return body.replace(b'"signature":"vct_', b'"signature":"')
 
 
+def _completed_usage(usage: Optional[dict]) -> Optional[dict]:
+    """The usage block as v0.2.102 (G2) completes it for the client.
+
+    The gateway's cache-field completion keeps every field the vendor stated
+    and fills an absent ``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens`` with 0, so the client's prompt-cache
+    indicator has both fields to read (the rule, including the OpenAI
+    dialect mapping, is pinned unit-level in
+    ``tests/test_v02102_gateway_catalogue.py``; no capture here speaks that
+    dialect unstated). This helper states the SAME expectation explicitly,
+    so the fixture comparisons read as "the vendor's own figures plus
+    exactly the completed fields".
+    """
+    if usage is None:
+        return None
+    expected = dict(usage)
+    expected.setdefault("cache_read_input_tokens", 0)
+    expected.setdefault("cache_creation_input_tokens", 0)
+    return expected
+
+
 def _request_body_bytes(payload: dict) -> bytes:
     """Exactly the bytes aiohttp's ``json=`` sends for ``payload``.
 
@@ -303,7 +324,14 @@ class ZaiZeroMessageStartTests(FlaggedVendorTestBase):
         # floor of this small request, so the ledger's real figure wins.
         self.assertEqual(usage["input_tokens"], 100_350)
 
-    async def test_non_streamed_vendor_response_is_untouched(self) -> None:
+    async def test_non_streamed_vendor_response_gains_only_the_cache_fields(
+        self,
+    ) -> None:
+        # v0.2.102 (G2): a buffered vendor body's usage is COMPLETED with the
+        # two cache fields the client's prompt-cache indicator reads — the
+        # vendor's own figures kept, an absent field stated as an explicit 0.
+        # Everything else about the body is untouched: the input_tokens
+        # splice is a STREAM repair and never fires on a buffered body.
         raw = json.dumps({
             "id": "msg_3", "type": "message", "role": "assistant",
             "model": "glm-5.3", "content": [{"type": "text", "text": "Hi"}],
@@ -317,7 +345,13 @@ class ZaiZeroMessageStartTests(FlaggedVendorTestBase):
                   "messages": [{"role": "user", "content": "hi"}]},
         )
         self.assertEqual(resp.status, 200)
-        self.assertEqual(await resp.read(), raw)
+        self.assertEqual(json.loads(await resp.read()), {
+            "id": "msg_3", "type": "message", "role": "assistant",
+            "model": "glm-5.3", "content": [{"type": "text", "text": "Hi"}],
+            "usage": {"input_tokens": 0, "output_tokens": 0,
+                      "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 0},
+        })
 
     async def test_a_rewrite_exception_relays_the_original_bytes(self) -> None:
         self.vendor_up.stream_chunks = [ZAI_ZERO_STREAM]
@@ -353,9 +387,14 @@ class TruthfulRouteByteIdentityTests(FlaggedVendorTestBase):
     ) -> None:
         # The stale-flag guard: a vendor that starts reporting truthfully
         # exceeds the floor and is relayed verbatim despite the flag.
+        # v0.2.102 (G2): verbatim now holds for a stream whose usage blocks
+        # already state both cache fields — an absent one would be completed
+        # (pinned in tests/test_v02102_gateway_catalogue.py), which
+        # re-serialises the event.
         honest = ZAI_ZERO_STREAM.replace(
             b'"input_tokens": 0, "output_tokens": 0',
-            b'"input_tokens": 999999, "output_tokens": 0',
+            b'"input_tokens": 999999, "output_tokens": 0,'
+            b' "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0',
         )
         self.assertNotEqual(honest, ZAI_ZERO_STREAM)
         self.vendor_up.stream_chunks = [honest]
@@ -414,13 +453,18 @@ class QwenRouteTests(FlaggedVendorTestBase):
         )
 
     async def test_truthful_qwen_stream_is_byte_identical(self) -> None:
+        # v0.2.102 (G2): verbatim holds for a stream that states both cache
+        # fields; an absent one is completed (pinned in
+        # tests/test_v02102_gateway_catalogue.py), which re-serialises.
         honest = (
             _sse("message_start", {
                 "type": "message_start",
                 "message": {"id": "msg_q2", "model": "qwen3.8-max",
                             "content": [],
                             "usage": {"input_tokens": 999_999,
-                                      "output_tokens": 0}},
+                                      "output_tokens": 0,
+                                      "cache_creation_input_tokens": 0,
+                                      "cache_read_input_tokens": 0}},
             })
             + _sse("message_stop", {"type": "message_stop"})
         )
@@ -470,10 +514,14 @@ class FixtureStreamTests(FlaggedVendorTestBase):
         self.assertEqual(start_usage["input_tokens"], floor, fixture)
         self.assertGreater(start_usage["input_tokens"], 0, fixture)
 
-        # The delta — the vendor's real final figures — survives untouched.
+        # The delta — the vendor's real final figures — survives, plus
+        # exactly the v0.2.102 (G2) cache-field completion: the z.ai
+        # captures state ``cache_read_input_tokens`` but never the creation
+        # half, so the relayed delta gains that one field as an explicit 0
+        # (the qwen captures already state both and gain nothing).
         self.assertEqual(
             _message_delta_usage(relayed),
-            _message_delta_usage(original),
+            _completed_usage(_message_delta_usage(original)),
             fixture,
         )
 
@@ -482,7 +530,9 @@ class FixtureStreamTests(FlaggedVendorTestBase):
         # signature on the way out (a "vct_" prefix), which re-serialises that
         # one event. The mark is orthogonal to the message_start splice under
         # test here and is asserted in
-        # tests/test_v02101_gateway_parity_request.py.
+        # tests/test_v02101_gateway_parity_request.py. And EXCEPT a
+        # message_delta whose usage gained the v0.2.102 (G2) cache-field
+        # completion (asserted above): that re-serialises the event too.
         original_events = _events(original)
         relayed_events = _events(relayed)
         self.assertEqual(len(original_events), len(relayed_events), fixture)
@@ -494,6 +544,11 @@ class FixtureStreamTests(FlaggedVendorTestBase):
                 and payload_o.get("type") == "message_start"
             ):
                 touched += 1
+                continue
+            if (
+                payload_o is not None
+                and payload_o.get("type") == "message_delta"
+            ):
                 continue
             delta = payload_o.get("delta") if payload_o is not None else None
             if isinstance(delta, dict) and delta.get("type") == "signature_delta":
@@ -534,7 +589,10 @@ class FixtureNonStreamTests(FlaggedVendorTestBase):
     The splice is a STREAM repair: a buffered vendor body carries its real
     usage natively (the captures show it — ``zai-tool`` reports
     ``input_tokens: 145``), and the relay policy for JSON is tool-id
-    normalisation only.
+    normalisation only. v0.2.102 (G2) adds exactly one edit: the usage
+    block's absent cache fields are completed (the z.ai captures lack the
+    creation half); a body that already states both — every qwen capture —
+    is still relayed byte-for-byte.
     """
 
     async def _assert_verbatim(self, fixture: str, model: str) -> None:
@@ -549,7 +607,18 @@ class FixtureNonStreamTests(FlaggedVendorTestBase):
         self.assertEqual(resp.status, 200, fixture)
         # A buffered thinking block's signature carries the item-(c) marker on
         # the way out; un-mark it so this compares the splice-free relay.
-        self.assertEqual(_unmark_thinking(await resp.read()), original, fixture)
+        relayed = _unmark_thinking(await resp.read())
+        expected = json.loads(original)
+        usage = expected.get("usage")
+        if isinstance(usage, dict):
+            expected["usage"] = _completed_usage(usage)
+        if expected != json.loads(original):
+            # The completion applied (an absent cache field): compare the
+            # parsed bodies — the re-serialised bytes differ from the
+            # capture by exactly those fields.
+            self.assertEqual(json.loads(relayed), expected, fixture)
+        else:
+            self.assertEqual(relayed, original, fixture)
 
     async def test_zai_captured_non_streamed_bodies(self) -> None:
         for fixture in ("zai-nonstream", "zai-tool"):
@@ -625,19 +694,28 @@ class SseRewriterMessageStartUnitTests(unittest.TestCase):
         self.assertEqual(self._usage_of(out)["input_tokens"], 36)
 
     def test_at_or_above_the_floor_is_verbatim(self) -> None:
+        # v0.2.102 (G2): verbatim holds when the usage block already states
+        # both cache fields; an absent one is completed (pinned in
+        # tests/test_v02102_gateway_catalogue.py), which re-serialises.
         event = _sse("message_start", {
             "type": "message_start",
             "message": {"id": "m",
-                        "usage": {"input_tokens": 2_000, "output_tokens": 0}},
+                        "usage": {"input_tokens": 2_000, "output_tokens": 0,
+                                  "cache_creation_input_tokens": 0,
+                                  "cache_read_input_tokens": 0}},
         })
         rewriter = ti.SseIdRewriter(message_start_usage=1_500)
         self.assertEqual(rewriter.feed(event) + rewriter.flush(), event)
 
     def test_no_estimate_is_verbatim(self) -> None:
+        # Same v0.2.102 (G2) narrowing as above: with both cache fields
+        # stated there is nothing to do at all — no floor, no completion.
         event = _sse("message_start", {
             "type": "message_start",
             "message": {"id": "m",
-                        "usage": {"input_tokens": 0, "output_tokens": 0}},
+                        "usage": {"input_tokens": 0, "output_tokens": 0,
+                                  "cache_creation_input_tokens": 0,
+                                  "cache_read_input_tokens": 0}},
         })
         rewriter = ti.SseIdRewriter()
         self.assertEqual(rewriter.feed(event) + rewriter.flush(), event)
@@ -656,20 +734,34 @@ class SseRewriterMessageStartUnitTests(unittest.TestCase):
         self.assertEqual(usage["cache_read_input_tokens"], 0)
 
     def test_a_non_integer_input_is_left_alone(self) -> None:
-        event = _sse("message_start", {
-            "type": "message_start",
-            "message": {"id": "m", "usage": {"input_tokens": True}},
-        })
-        rewriter = ti.SseIdRewriter(message_start_usage=1_500)
-        self.assertEqual(rewriter.feed(event) + rewriter.flush(), event)
+        # The floor refuses the shape; the v0.2.102 (G2) cache completion
+        # still reaches the client, so the EVENT is re-serialised — but the
+        # vendor's own (unusable) figure is left exactly as written.
+        out = self._splice({"input_tokens": True}, 1_500)
+        usage = self._usage_of(out)
+        self.assertIs(usage["input_tokens"], True)
+        self.assertEqual(usage["cache_read_input_tokens"], 0)
+        self.assertEqual(usage["cache_creation_input_tokens"], 0)
 
     def test_other_event_types_are_untouched(self) -> None:
-        event = _sse("message_delta", {
-            "type": "message_delta",
-            "usage": {"input_tokens": 0, "output_tokens": 0},
-        })
+        # message_delta is NOT "other" since v0.2.102 (G2): its usage is
+        # completed too. A delta that already states both cache fields is
+        # verbatim, and an event with no usage block stays untouched
+        # entirely.
+        stream = (
+            _sse("message_delta", {
+                "type": "message_delta",
+                "usage": {"input_tokens": 0, "output_tokens": 0,
+                          "cache_creation_input_tokens": 0,
+                          "cache_read_input_tokens": 0},
+            })
+            + _sse("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "ok"},
+            })
+        )
         rewriter = ti.SseIdRewriter(message_start_usage=1_500)
-        self.assertEqual(rewriter.feed(event) + rewriter.flush(), event)
+        self.assertEqual(rewriter.feed(stream) + rewriter.flush(), stream)
 
 
 class EstimateLadderUnitTests(unittest.TestCase):

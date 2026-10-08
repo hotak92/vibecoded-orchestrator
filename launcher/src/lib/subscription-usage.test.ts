@@ -9,6 +9,8 @@ vi.mock('$lib/tauri', () => ({ invoke: vi.fn(), tauriAvailable: vi.fn() }));
 
 import { invoke, tauriAvailable } from '$lib/tauri';
 import {
+  agentAnswer,
+  agentIdentity,
   barTone,
   barWidth,
   cardVisible,
@@ -22,7 +24,9 @@ import {
   USAGE_POLL_MS,
   USAGE_RETRY_WHILE_REFRESHING_MS,
   vendorStatus,
+  visibleAgents,
   visibleVendors,
+  type UsageAgentRow,
   type UsageBridgeResult,
   type UsageSnapshot,
   type UsageVendor,
@@ -41,13 +45,31 @@ function vendor(over: Partial<UsageVendor> = {}): UsageVendor {
   };
 }
 
-function snapshot(vendors: UsageVendor[], refreshing = false): UsageSnapshot {
+function snapshot(
+  vendors: UsageVendor[],
+  refreshing = false,
+  agents?: UsageAgentRow[],
+): UsageSnapshot {
   return {
     generated_at: '2026-09-23T04:00:00Z',
     last_refresh_at: null,
     refreshing,
     refresh_interval_s: 240,
     vendors,
+    ...(agents ? { agents } : {}),
+  };
+}
+
+function agentRow(over: Partial<UsageAgentRow> = {}): UsageAgentRow {
+  return {
+    session: 'chat-1',
+    agent: 'agent-aaa',
+    parent_agent: null,
+    model: 'glm-5.3',
+    route: 'vendor:zai',
+    fallback_from: '',
+    at: '2026-10-08T05:00:00Z',
+    ...over,
   };
 }
 
@@ -210,6 +232,34 @@ describe('polling', () => {
     expect(nextPollMs(null)).toBe(USAGE_POLL_MS);
   });
 
+});
+
+describe('per-agent attribution (v0.2.102 G3 — who actually answered)', () => {
+  it('lists the identities the gateway named, one row per (session, agent)', () => {
+    const rows = [
+      agentRow({ agent: null, model: 'claude-opus-5-5', route: 'anthropic' }),
+      agentRow({ agent: 'agent-aaa', model: 'glm-5.3-flash' }),
+    ];
+    expect(visibleAgents(snapshot([], false, rows))).toEqual(rows);
+  });
+
+  it('reads a snapshot from an older gateway (no agents block) as empty, never as an error', () => {
+    expect(visibleAgents(snapshot([]))).toEqual([]);
+  });
+
+  it('names the identity: the agent id, or "main chat" for the null agent', () => {
+    expect(agentIdentity(agentRow({ agent: 'agent-aaa' }))).toBe('agent-aaa');
+    expect(agentIdentity(agentRow({ agent: null }))).toBe('main chat');
+  });
+
+  it('names the ANSWERING model, with the fallback escape beside it when the ladder served the turn', () => {
+    expect(agentAnswer(agentRow())).toBe('glm-5.3');
+    expect(
+      agentAnswer(
+        agentRow({ model: 'glm-5.3-flash', fallback_from: 'anthropic:claude-haiku-4-5' }),
+      ),
+    ).toBe('glm-5.3-flash (fallback from anthropic:claude-haiku-4-5)');
+  });
 });
 
 describe('fetchUsage (review F4/F15: the bridge error is surfaced, not swallowed)', () => {

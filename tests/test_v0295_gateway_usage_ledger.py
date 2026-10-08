@@ -1177,7 +1177,14 @@ class RelayIsUntouchedTests(GatewayTestBase):
         self.assertEqual(await resp.read(), ANTHROPIC_STREAM)
 
     async def test_an_untouched_vendor_json_body_is_still_relayed_verbatim(self) -> None:
-        raw = b'{"id":"msg_1","content":[],"usage":{"input_tokens":3}}'
+        # v0.2.102 (G2): "untouched" for a vendor body means its usage
+        # already states both cache fields the client's prompt-cache
+        # indicator reads — then the relay is byte-for-byte. An absent
+        # field is completed with an explicit 0 (pinned in
+        # tests/test_v02102_gateway_catalogue.py), which re-serialises.
+        raw = (b'{"id":"msg_1","content":[],"usage":{"input_tokens":3,'
+               b'"cache_read_input_tokens":0,'
+               b'"cache_creation_input_tokens":0}}')
         self.vendor_up.messages_raw = raw
         resp = await self.client.post(
             "/v1/messages", headers=self.auth(),

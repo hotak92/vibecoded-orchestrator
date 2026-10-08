@@ -295,6 +295,65 @@ def split_sse_frames(
     return frames, buffer
 
 
+#: The two cache-usage fields the client reads for its "Prompt cache warm,
+#: about N min left" indicator (webview 2.1.292: ``kv1``/``dg`` — a message
+#: counts as cache-active when their sum is positive, and the TTL comes from
+#: a ``cache_creation.ephemeral_{5m,1h}_input_tokens`` block). The streamed
+#: merge (``Kf0``) makes ``message_delta`` the LAST WRITER for these fields,
+#: so a field only the ``message_start`` carried does not survive the turn.
+CACHE_READ_FIELD = "cache_read_input_tokens"
+CACHE_CREATION_FIELD = "cache_creation_input_tokens"
+
+
+def _non_negative_int(value: Any) -> Optional[int]:
+    """A non-negative count, or ``None`` — ``bool`` is not a count."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
+def complete_cache_fields(usage: MutableMapping[str, Any]) -> bool:
+    """Ensure one usage block carries BOTH cache fields. True when changed.
+
+    v0.2.102 (G2). Claude Code's prompt-cache indicator reads
+    ``cache_read_input_tokens`` / ``cache_creation_input_tokens``; vendor
+    routes report cache activity only sometimes, in one of two dialects,
+    and mostly not at turn start, so the fields were simply absent where
+    the client looks for them. This completes the block from WHAT THE
+    VENDOR RETURNED and nothing else:
+
+    * a field the vendor stated (zero included — a stated zero is a
+      reading, not a gap) is kept verbatim;
+    * an absent ``cache_read_input_tokens`` is filled from the vendor's
+      OTHER cache dialect when it speaks one —
+      ``prompt_tokens_details.cached_tokens`` (the OpenAI shape the qwen
+      endpoint also emits), the vendor's own figure under the name the
+      client reads;
+    * still absent → **0**. An explicit zero says "no cache activity
+      reported" honestly; the merge rule both upstreams need ("a later
+      zero never overwrites an earlier positive, a later positive always
+      replaces an earlier zero") keeps a planted zero from ever poisoning
+      the ledger: the vendor's real figure in a later event replaces it.
+
+    NEVER planted: a positive the vendor did not state (that would invent
+    a warm cache), and the ``cache_creation.ephemeral_*`` TTL block — no
+    seed citation documents a vendor cache TTL, so no TTL is claimed and
+    the indicator stays silent rather than guess "N min left".
+    """
+    changed = False
+    if CACHE_READ_FIELD not in usage:
+        mapped: Optional[int] = None
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, MutableMapping):
+            mapped = _non_negative_int(details.get("cached_tokens"))
+        usage[CACHE_READ_FIELD] = mapped if mapped is not None else 0
+        changed = True
+    if CACHE_CREATION_FIELD not in usage:
+        usage[CACHE_CREATION_FIELD] = 0
+        changed = True
+    return changed
+
+
 class _Unchanged:
     """Sentinel: emit the original bytes. Distinct from ``None`` = suppress."""
 
@@ -508,6 +567,8 @@ class SseIdRewriter:
             return self._on_indexed(payload)
         if kind == "message_start":
             return self._on_message_start(payload)
+        if kind == "message_delta":
+            return self._on_message_delta(payload)
         return _UNCHANGED
 
     def _on_content_block_delta(self, payload: dict) -> Any:
@@ -552,7 +613,8 @@ class SseIdRewriter:
         return patched if patched is not None else _UNCHANGED
 
     def _on_message_start(self, payload: dict) -> Any:
-        """Lift a deficient ``message_start`` ``input_tokens`` to the floor.
+        """Lift a deficient ``message_start`` ``input_tokens`` to the floor,
+        and complete the usage block's cache fields (v0.2.102, G2).
 
         FLOOR semantics: the caller's estimate is a lower bound on the
         context this turn carries, so the reported figure is replaced only
@@ -564,23 +626,31 @@ class SseIdRewriter:
         reports ``input_tokens: 0``; the qwen endpoint reports a small
         positive that under-reads the final ``message_delta`` figure.
 
-        Only ``input_tokens`` is patched. The cache fields stay as the vendor
-        wrote them — the ledger's merge rule is "a later zero never
-        overwrites an earlier positive", so an estimate planted in
-        ``cache_read_input_tokens`` here could NEVER be corrected by the
-        vendor's real zero in ``message_delta`` and would poison the ledger.
-        A lifted ``input_tokens`` has the opposite property: the real
-        positive in ``message_delta`` replaces it, last-positive-wins, so the
-        ledger still records the vendor's own final figures.
+        Only ``input_tokens`` is patched by the floor. The cache fields are
+        COMPLETED, never estimated (:func:`complete_cache_fields`): the
+        vendor's own figures are kept, an absent read is mapped from the
+        vendor's other cache dialect, and what remains is an explicit 0 —
+        never a positive the vendor did not state, and never the
+        ``cache_creation.ephemeral_*`` TTL block (no cited vendor TTL
+        exists, so no TTL is claimed). A planted zero cannot poison the
+        ledger: its merge rule is "a later positive always replaces an
+        earlier zero", so the vendor's real figure in ``message_delta``
+        wins. A lifted ``input_tokens`` has the same property: the real
+        positive in ``message_delta`` replaces it, last-positive-wins, so
+        the ledger still records the vendor's own final figures.
         """
         estimate = self._message_start_usage
-        if not isinstance(estimate, int) or estimate <= 0:
-            return _UNCHANGED
         message = payload.get("message")
-        if not isinstance(message, dict):
-            return _UNCHANGED
-        usage = message.get("usage")
-        if not isinstance(usage, dict):
+        usage = message.get("usage") if isinstance(message, dict) else None
+        cache_changed = (
+            complete_cache_fields(usage) if isinstance(usage, dict) else False
+        )
+        if not isinstance(estimate, int) or estimate <= 0:
+            # No floor to apply — the cache completion decides alone.
+            if not cache_changed:
+                return _UNCHANGED
+            return payload
+        if not isinstance(message, dict) or not isinstance(usage, dict):
             return _UNCHANGED
         if "input_tokens" in usage:
             reported = usage["input_tokens"]
@@ -589,21 +659,35 @@ class SseIdRewriter:
             # and therefore does not touch — the module's zero-versus-silence
             # discipline, applied to a type.
             if isinstance(reported, bool) or not isinstance(reported, int):
-                return _UNCHANGED
+                # The floor refuses the shape; a completed cache field
+                # still reaches the client.
+                return payload if cache_changed else _UNCHANGED
         else:
             # An ABSENT field reads as 0: a flagged vendor's number is not
             # trusted anyway, and every capture this was built from carried
             # the field.
             reported = 0
         if reported >= estimate:
+            return payload if cache_changed else _UNCHANGED
+        usage["input_tokens"] = estimate
+        return payload
+
+    def _on_message_delta(self, payload: dict) -> Any:
+        """Complete the cache fields of the turn's FINAL usage (G2).
+
+        ``message_delta`` is where both upstreams state the final figures —
+        and where the client's streamed merge (webview 2.1.292 ``Kf0``)
+        takes the cache fields from, making this event the LAST WRITER:
+        a field absent here reads as absent to the "Prompt cache warm"
+        indicator even when the vendor reported it nowhere else. The
+        completion is :func:`complete_cache_fields`, the same rule as at
+        turn start: the vendor's figures kept, its other cache dialect
+        mapped, zeros when it said nothing — never a warm cache invented.
+        """
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
             return _UNCHANGED
-        patched = dict(payload)
-        patched_message = dict(message)
-        patched_usage = dict(usage)
-        patched_usage["input_tokens"] = estimate
-        patched_message["usage"] = patched_usage
-        patched["message"] = patched_message
-        return patched
+        return payload if complete_cache_fields(usage) else _UNCHANGED
 
     def _on_block_start(self, payload: dict) -> Any:
         original_index = payload.get("index")
@@ -645,6 +729,8 @@ class SseIdRewriter:
 
 
 __all__ = [
+    "CACHE_CREATION_FIELD",
+    "CACHE_READ_FIELD",
     "DEFAULT_ID_MAP_SIZE",
     "RepairStats",
     "JSON_BUFFER_LIMIT_BYTES",
@@ -652,6 +738,7 @@ __all__ = [
     "SSE_BUFFER_LIMIT_BYTES",
     "BoundedIdMap",
     "SseIdRewriter",
+    "complete_cache_fields",
     "normalise_vendor_response",
     "restore_vendor_ids",
     "sanitise_for_anthropic",
