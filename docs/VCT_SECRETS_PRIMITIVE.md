@@ -144,9 +144,8 @@ v0.2.91 every hub client — `vct_secrets_resolve.{sh,ps1}`,
 `vct_project_config.{sh,ps1}`, `vct_access_check.{sh,ps1}` +
 `vco_lib/access_resolver.py` (the access-matrix gate trio, whose
 fail-open-to-`write` contract is untouched — it is just reached less
-often), `vco_lib/project_config.py`, the wrapper
-MCPs (`claude_mcp_servers/wrappers/_base.py`), the weaviate MCP's
-writable-collections probe, `vco verify-diagrams`, the codegraph-resync
+often), `vco_lib/project_config.py`, the weaviate MCP's
+writable-collections probe, the codegraph-resync
 spawn registration, `vct-cli` (`launcher/tools/vct-cli`) and `vct`
 (`tools/vct-secrets`) — reacts to a
 **provable** refusal (401/403) by retrying **once** with the on-disk
