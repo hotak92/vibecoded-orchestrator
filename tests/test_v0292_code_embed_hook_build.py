@@ -26,6 +26,7 @@ from pathlib import Path
 from tests.common.launcher_db_fixture import make_launcher_db
 from tests.common.ports import free_port
 from vco_lib import service_endpoints as _se
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS = REPO_ROOT / "templates" / "hooks"
@@ -269,7 +270,7 @@ class PowerShellPlanPortProbeTests(unittest.TestCase):
             env["CODE_EMBED_PORT"] = str(RETIRED_ENV_DECOY_PORT)
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -351,7 +352,7 @@ class PowerShellUnreadablePlanTests(unittest.TestCase):
             env["TEMP"] = str(fx.tmp)
             fx.marker.touch()
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -431,7 +432,7 @@ class PowerShellRefusedRuntimeTests(unittest.TestCase):
             env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -622,7 +623,7 @@ class EnsureContainersBuildGatePs1Tests(unittest.TestCase):
             env.pop("VCT_VENV", None)
             env.pop("VCT_INSTALL_ROOT", None)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-containers.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -745,7 +746,7 @@ class EnsureContainersRefusalLedgerPs1Tests(unittest.TestCase):
             env, orch = _refusal_fixture(tmp, installed_clone)
             env["TEMP"] = str(tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-containers.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -847,7 +848,7 @@ class PowerShellHookTests(unittest.TestCase):
             env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -864,7 +865,7 @@ class PowerShellHookTests(unittest.TestCase):
             env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -883,7 +884,7 @@ class PowerShellHookTests(unittest.TestCase):
             env = fx.env(svc.port)
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -898,7 +899,7 @@ class PowerShellHookTests(unittest.TestCase):
             env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),

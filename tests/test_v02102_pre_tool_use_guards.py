@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.child_env import child_env
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -64,7 +65,7 @@ def _env(tmp_path: Path) -> dict:
 
 def _run(impl: str, proj: Path, payload: dict, env: dict) -> subprocess.CompletedProcess:
     argv = ([BASH, str(HOOKS / "pre-tool-use.sh")] if impl == "sh" else
-            [str(PWSH), "-NoProfile", "-NonInteractive", "-File", str(HOOKS / "pre-tool-use.ps1")])
+            [str(PWSH), *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(HOOKS / "pre-tool-use.ps1")])
     return subprocess.run(argv, input=json.dumps(payload), capture_output=True,
                           text=True, timeout=180,
                           env=dict(env, CLAUDE_PROJECT_DIR=str(proj)), cwd=str(proj))
@@ -243,7 +244,7 @@ def _ps1_py(lib: Path, env_path: str, install_root: Path | None) -> str:
         f'. "{lib}/find-python.ps1"\n'
         'if ($PY) { Write-Output $PY } else { Write-Output "EMPTY" }\n'
     )
-    r = subprocess.run([str(PWSH), "-NoProfile", "-NonInteractive", "-Command", script],
+    r = subprocess.run([str(PWSH), *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", script],
                        capture_output=True, text=True, timeout=120,
                        env=dict(child_env()))
     assert r.returncode == 0, r.stderr
@@ -282,7 +283,7 @@ def test_find_python_ps1_path_only_opt_out(tmp_path: Path) -> None:
         f'. "{lib}/find-python.ps1"\n'
         'if ($PY) { Write-Output $PY } else { Write-Output "EMPTY" }\n'
     )
-    r = subprocess.run([str(PWSH), "-NoProfile", "-NonInteractive", "-Command", script],
+    r = subprocess.run([str(PWSH), *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", script],
                        capture_output=True, text=True, timeout=120,
                        env=dict(child_env()))
     assert r.returncode == 0, r.stderr

@@ -44,6 +44,7 @@ from typing import Optional
 import pytest
 
 from tests.common.ports import free_port
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASH_RESOLVER = REPO_ROOT / "templates" / "scripts" / "vct_access_check.sh"
@@ -205,7 +206,7 @@ def _run_ps1_resolver(project: str, collection: str, env_extra: Optional[dict] =
     if env_extra:
         env.update(env_extra)
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(PS1_RESOLVER), project, collection],
+        ["pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(PS1_RESOLVER), project, collection],
         capture_output=True, text=True, env=env, timeout=timeout,
     )
 
@@ -739,7 +740,7 @@ def test_ps1_retry_transport_failure_does_not_exit_url_error(tmp_path: Path):
     env = os.environ.copy()
     env["VCT_STATE_DIR"] = str(tmp_path / "vct")
     result = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", snippet],
+        ["pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", snippet],
         capture_output=True, text=True, env=env, timeout=60,
     )
     assert result.stdout.strip() == "STATUS:0", (

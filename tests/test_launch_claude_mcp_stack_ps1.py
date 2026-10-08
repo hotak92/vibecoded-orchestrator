@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "launch-claude-mcp-stack.ps1"
@@ -92,7 +93,7 @@ def _call_get_compose_invocation(
         env = os.environ.copy()
         env.update(extra_env)
     proc = subprocess.run(
-        [_PWSH or "pwsh", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+        [_PWSH or "pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", ps_cmd],
         capture_output=True,
         text=True,
         timeout=30,
@@ -141,7 +142,7 @@ def test_script_parses_cleanly():
     # syntax error on stderr.
     proc = subprocess.run(
         [
-            _PWSH or "pwsh", "-NoProfile", "-NonInteractive", "-Command",
+            _PWSH or "pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-Command",
             f". {_ps_quote(str(SCRIPT))}; exit 0",
         ],
         capture_output=True,
@@ -372,7 +373,7 @@ def test_sourcing_does_not_run_main(tmp_path: Path):
     log = tmp_path / "should-not-be-written.log"
     proc = subprocess.run(
         [
-            _PWSH or "pwsh", "-NoProfile", "-NonInteractive", "-Command",
+            _PWSH or "pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-Command",
             f"$env:VCT_STACK_LOG_FILE = {_ps_quote(str(log))}; "
             f". {_ps_quote(str(SCRIPT))}; "
             f"Write-Output 'SOURCED_OK'; exit 0",
@@ -435,7 +436,7 @@ def _find_runtime(tmp_path: Path, stubs: dict, script: Path = SCRIPT,
                  "VCT_STACK_WORKING_DIR": str(tmp_path / "noexist")})
     full.update(env)
     proc = subprocess.run(
-        [_PWSH or "pwsh", "-NoProfile", "-NonInteractive", "-Command",
+        [_PWSH or "pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-Command",
          f". {_ps_quote(str(script))}; $r = Find-Runtime; "
          "[Console]::Out.WriteLine('RESULT=' + $r + '|' + $script:RuntimePinRefused)"],
         capture_output=True, text=True, timeout=60, env=full,
@@ -560,7 +561,7 @@ def test_ps1_a_stale_working_dir_falls_back_to_the_wrappers_own_clone(tmp_path: 
     full.update({"HOME": str(tmp_path), "VCT_STACK_LOG_FILE": str(tmp_path / "stack.log"),
                  "VCT_STACK_WORKING_DIR": str(stale)})
     proc = subprocess.run(
-        [_PWSH or "pwsh", "-NoProfile", "-NonInteractive", "-Command",
+        [_PWSH or "pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-Command",
          f". {_ps_quote(str(script))}; Resolve-WorkingDir; "
          "[Console]::Out.WriteLine('RESULT=' + $script:VctStackWorkingDir)"],
         capture_output=True, text=True, timeout=60, env=full,
@@ -584,7 +585,7 @@ def test_ps1_an_exit_3_is_recorded_in_the_installed_clones_ledger(tmp_path: Path
                          "VCT_STACK_WORKING_DIR", "VCO_COMPOSE_SERVICES")}
     full.update({"PATH": str(fake), "HOME": str(tmp_path),
                  "VCT_STACK_LOG_FILE": str(tmp_path / "stack.log"), **_py_env(tmp_path)})
-    proc = subprocess.run([_PWSH or "pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
+    proc = subprocess.run([_PWSH or "pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(script)],
                           capture_output=True, text=True, timeout=180, env=full, cwd=str(tmp_path))
     assert proc.returncode == 3, proc.stdout + proc.stderr
     entries = DeferralReport.read(root).entries

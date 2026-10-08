@@ -32,6 +32,7 @@ from typing import Iterator
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -139,7 +140,7 @@ def _resolve(kind: str, tmp_path: Path, args: list[str], port: int = 9,
     if kind == "sh":
         cmd = [str(BASH), str(SCRIPTS / "vct_secrets_resolve.sh"), *args]
     else:
-        cmd = [str(PWSH), "-NoProfile", "-File", str(SCRIPTS / "vct_secrets_resolve.ps1"), *args]
+        cmd = [str(PWSH), *PWSH_BASE_FLAGS, "-File", str(SCRIPTS / "vct_secrets_resolve.ps1"), *args]
     start = time.monotonic()
     done = subprocess.run(cmd, capture_output=True, text=True,
                           env=_resolver_env(tmp_path, port, **extra), timeout=120)
@@ -316,7 +317,7 @@ def _run_hook(kind: str, proj: Path, tmp_path: Path, port: int = 9, **extra: str
     if kind == "sh":
         cmd = [str(BASH), str(proj / ".claude" / "hooks" / "context-size-check.sh")]
     else:
-        cmd = [str(PWSH), "-NoProfile", "-File", str(proj / ".claude" / "hooks" / "context-size-check.ps1")]
+        cmd = [str(PWSH), *PWSH_BASE_FLAGS, "-File", str(proj / ".claude" / "hooks" / "context-size-check.ps1")]
     start = time.monotonic()
     done = subprocess.run(cmd, input="{}", capture_output=True, text=True, cwd=proj, env=env, timeout=120)
     elapsed = time.monotonic() - start

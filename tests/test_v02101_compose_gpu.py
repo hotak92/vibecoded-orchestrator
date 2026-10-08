@@ -28,6 +28,7 @@ from vco_lib import compose_provider as cp
 from vco_lib import containers
 from vco_lib import gpu_verify as gv
 from vco_lib import install_services_up as isu
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SH = REPO_ROOT / "scripts" / "launch-claude-mcp-stack.sh"
@@ -514,7 +515,7 @@ def test_ps1_wrapper_parity_same_check_same_args(tmp_path: Path):
         f"Invoke-GpuVerify -Python '{fake_py}' -RuntimeBin 'podman' -Reason 'degraded'"
     )
     proc = subprocess.run(
-        [PWSH or "pwsh", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+        [PWSH or "pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", ps_cmd],
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, proc.stderr

@@ -30,6 +30,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -611,7 +612,7 @@ def test_the_two_prefilters_accept_the_same_commands(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     ps_out = subprocess.run(
-        [exe, "-NoProfile", "-File", str(ps_script)],
+        [exe, *PWSH_BASE_FLAGS, "-File", str(ps_script)],
         capture_output=True,
         text=True,
         env=child_env(),

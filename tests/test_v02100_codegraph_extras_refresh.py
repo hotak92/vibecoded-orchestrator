@@ -38,6 +38,7 @@ from typing import Optional
 import pytest
 
 from vco_lib import codegraph_extras_refresh as cer
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = REPO_ROOT / "tests" / "fixtures" / "codegraph_extra_sync_argv.json"
@@ -411,4 +412,4 @@ def test_sh_hook_spawns_refresh_without_a_queue(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not shutil.which("pwsh") or os.name == "nt", reason="pwsh (POSIX) required")
 def test_ps1_hook_spawns_refresh_without_a_queue(tmp_path: Path) -> None:
-    _hook_case(tmp_path, ["pwsh", "-NoProfile", "-File", str(DRAIN_PS1)])
+    _hook_case(tmp_path, ["pwsh", *PWSH_BASE_FLAGS, "-File", str(DRAIN_PS1)])

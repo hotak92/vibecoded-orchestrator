@@ -34,6 +34,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parent.parent
 FIXTURES = REPO / "tests" / "fixtures"
@@ -357,7 +358,7 @@ def _run_hook(argv: list[str], proj: Path, tmp_path: Path, url: str, extra: dict
 
 _SHELLS = [pytest.param(["bash", str(HOOKS / "pre-tool-use.sh")], id="sh")]
 if shutil.which("pwsh"):
-    _SHELLS.append(pytest.param(["pwsh", "-NoProfile", "-File", str(HOOKS / "pre-tool-use.ps1")], id="ps1"))
+    _SHELLS.append(pytest.param(["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / "pre-tool-use.ps1")], id="ps1"))
 
 _MOVED = {"WEAVIATE_URL": "http://127.0.0.1:18081", "OLLAMA_URL": "http://localhost:21435",
           "VCT_HUB_PORT": "17777"}
@@ -396,7 +397,7 @@ def test_ssrf_defaults_when_env_is_silent(argv, tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("argv", [
     pytest.param(["bash", str(SCRIPTS / "vct_project_config.sh"), "hub-port"], id="sh"),
-    *([pytest.param(["pwsh", "-NoProfile", "-File", str(SCRIPTS / "vct_project_config.ps1"), "-HubPort"],
+    *([pytest.param(["pwsh", *PWSH_BASE_FLAGS, "-File", str(SCRIPTS / "vct_project_config.ps1"), "-HubPort"],
                     id="ps1")] if shutil.which("pwsh") else []),
 ])
 @pytest.mark.parametrize("env_pin,file_body,want", [

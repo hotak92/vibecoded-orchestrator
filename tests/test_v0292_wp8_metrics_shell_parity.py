@@ -38,6 +38,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _LIB = _REPO_ROOT / "templates" / "hooks" / "_lib"
@@ -157,7 +158,7 @@ def _ask_ps(claude: Path, state: Path) -> dict:
     env["VCT_STATE_DIR"] = str(state)
     assert _PS is not None
     proc = subprocess.run(
-        [_PS, "-NoProfile", "-Command", _PS_PROBE.format(lib=str(_PS1))],
+        [_PS, *PWSH_BASE_FLAGS, "-Command", _PS_PROBE.format(lib=str(_PS1))],
         capture_output=True, text=True, env=env, timeout=180,
     )
     assert proc.returncode == 0, proc.stderr

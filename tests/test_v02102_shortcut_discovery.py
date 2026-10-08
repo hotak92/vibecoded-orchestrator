@@ -31,6 +31,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SH_TEST = REPO_ROOT / "tests" / "test_v02102_shortcut_discovery.sh"
@@ -120,7 +121,7 @@ def test_ps1_selection_rule(arm: str, want_reason: str, tmp_path: Path):
         """
     )
     res = subprocess.run(
-        [pwsh, "-NoProfile", "-Command", script],
+        [pwsh, *PWSH_BASE_FLAGS, "-Command", script],
         capture_output=True,
         text=True,
         timeout=60,
@@ -142,7 +143,7 @@ def test_ps1_still_parses():
     res = subprocess.run(
         [
             pwsh,
-            "-NoProfile",
+            *PWSH_BASE_FLAGS,
             "-Command",
             "$t=$null;$e=$null;"
             f"[void][System.Management.Automation.Language.Parser]::ParseFile('{PS1}',"

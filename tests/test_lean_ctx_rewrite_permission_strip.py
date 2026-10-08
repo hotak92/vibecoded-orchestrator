@@ -39,6 +39,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SH_HOOK = REPO_ROOT / "templates" / "hooks" / "lean-ctx-rewrite.sh"
@@ -212,7 +213,7 @@ def test_ps1_response_is_hook_built(tmp_path):
     env.pop("CLAUDE_PROJECT_DIR", None)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
     res = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(PS1_HOOK)],
         input=PAYLOAD,
         capture_output=True,
         text=True,

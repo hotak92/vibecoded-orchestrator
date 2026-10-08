@@ -32,6 +32,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SH_HOOK = REPO_ROOT / "templates" / "hooks" / "post-tool-security.sh"
@@ -1903,7 +1904,7 @@ class TestPs1ScannerParity:
         env.pop("VCT_DISABLE_HOOKS", None)
         env["CLAUDE_PROJECT_DIR"] = str(proj)
         subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(PS1_HOOK)],
             input=payload, capture_output=True, text=True, env=env, timeout=30,
         )
         alert_log = proj / ".claude" / "logs" / "credential_alerts.jsonl"

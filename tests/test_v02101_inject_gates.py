@@ -35,6 +35,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS_LIB = REPO_ROOT / "templates" / "hooks" / "_lib"
@@ -454,7 +455,7 @@ class TestInjectBudgetPs1:
             f'Remove-Item Env:VCO_INJECT_PROFILE\n'
             f'if (Test-VcoInjectProfileOff) {{ "OFF" }} else {{ "ON" }}\n'
         )
-        r = subprocess.run(["pwsh", "-NoProfile", "-Command", script],
+        r = subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-Command", script],
                            capture_output=True, text=True, timeout=120)
         assert r.returncode == 0, r.stderr
         lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]

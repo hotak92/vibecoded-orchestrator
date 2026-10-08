@@ -38,6 +38,7 @@ from pathlib import Path
 import pytest
 
 from vco_lib import hub_ensure
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -197,7 +198,7 @@ def test_ps1_clients(tmp_path: Path, script, function, extra, stub, env_port, fi
     lib = tmp_path / "lib.ps1"
     lib.write_text(body, encoding="utf-8")
     assert _PWSH is not None
-    r = subprocess.run([_PWSH, "-NoProfile", "-NonInteractive", "-Command", f'. "{lib}"; {function}'],
+    r = subprocess.run([_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", f'. "{lib}"; {function}'],
                        env=_env(state, env_port), capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == str(expected), (script, r.stdout, r.stderr)

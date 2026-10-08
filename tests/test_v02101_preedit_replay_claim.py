@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_v02101_router_surfaces import HOOKS, Rig, needs_bash, needs_pwsh
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 SEEN_SH = HOOKS / "_lib" / "seen-store.sh"
 SEEN_PS1 = HOOKS / "_lib" / "seen-store.ps1"
@@ -96,7 +97,7 @@ class TestBashClaimPrimitive:
 
 def _pwsh(snippet: str, cwd: Path) -> subprocess.CompletedProcess:
     script = f'. "{SEEN_PS1}"\n{snippet}\n'
-    return subprocess.run(["pwsh", "-NoProfile", "-Command", script],
+    return subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-Command", script],
                           capture_output=True, text=True, timeout=60, cwd=str(cwd))
 
 
@@ -124,7 +125,7 @@ class TestPs1ClaimPrimitive:
         snippet = (f'while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt {int(go * 1000)}) {{ }}\n'
                    f'Invoke-VcoSeenClaim -ClaimFile "{target}" -StaleAfterSeconds 60')
         script = f'. "{SEEN_PS1}"\n{snippet}\n'
-        procs = [subprocess.Popen(["pwsh", "-NoProfile", "-Command", script],
+        procs = [subprocess.Popen(["pwsh", *PWSH_BASE_FLAGS, "-Command", script],
                                   stdout=subprocess.PIPE, text=True, cwd=str(tmp_path))
                  for _ in range(4)]
         verdicts = [p.communicate(timeout=90)[0].strip() for p in procs]

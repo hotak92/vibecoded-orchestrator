@@ -27,6 +27,7 @@ from pathlib import Path
 from tests.common.launcher_db_fixture import make_launcher_db
 from vco_lib import containers
 from vco_lib import service_endpoints as se
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS = REPO_ROOT / "templates" / "hooks"
@@ -235,7 +236,7 @@ def _run_hook(machine: _Machine, shell: str, **env) -> subprocess.CompletedProce
     if shell == "bash":
         argv = ["bash", str(HOOKS / "ensure-containers.sh")]
     else:
-        argv = [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        argv = [PWSH, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File",
                 str(HOOKS / "ensure-containers.ps1")]
     return subprocess.run(argv, env=machine.env(**env), capture_output=True, text=True,
                           timeout=180, cwd=str(REPO_ROOT))
@@ -245,7 +246,7 @@ def _run_wrapper(machine: _Machine, shell: str, args: list[str], **env) -> subpr
     if shell == "bash":
         argv = ["bash", str(WRAPPER_SH), *args]
     else:
-        argv = [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(WRAPPER_PS1), *args]
+        argv = [PWSH, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File", str(WRAPPER_PS1), *args]
     return subprocess.run(argv, env=machine.env(**env), capture_output=True, text=True,
                           timeout=180, cwd=str(machine.tmp))
 
@@ -516,7 +517,7 @@ class StaleRecordHookTests(_TmpCase, _Shells):
                 if shell == "bash":
                     argv = ["bash", str(HOOKS / "ensure-containers.sh")]
                 else:
-                    argv = [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    argv = [PWSH, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File",
                             str(HOOKS / "ensure-containers.ps1")]
                 proc = subprocess.run(argv, env=env, capture_output=True, text=True,
                                       timeout=180, cwd=str(REPO_ROOT))
@@ -585,7 +586,7 @@ def _run_verify(machine: _Machine, shell: str, **env) -> subprocess.CompletedPro
     if shell == "bash":
         argv = ["bash", str(HOOKS / "verify-container-ports.sh")]
     else:
-        argv = [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        argv = [PWSH, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File",
                 str(HOOKS / "verify-container-ports.ps1")]
     return subprocess.run(argv, env=machine.env(**env), capture_output=True, text=True,
                           timeout=180, cwd=str(REPO_ROOT))
@@ -893,7 +894,7 @@ class WrapperServiceListTests(_TmpCase, _Shells):
                 env = m.env(VCT_ORCHESTRATOR_ROOT=str(root))
                 env.pop("VCT_STACK_WORKING_DIR")
                 argv = (["bash", str(WRAPPER_SH), "start"] if shell == "bash" else
-                        [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                        [PWSH, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File",
                          str(WRAPPER_PS1), "start"])
                 proc = subprocess.run(argv, env={**env, "VCO_COMPOSE_SERVICES": "weaviate"},
                                       capture_output=True, text=True, timeout=180, cwd=str(m.tmp))

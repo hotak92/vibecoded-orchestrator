@@ -63,6 +63,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -163,7 +164,7 @@ def _run_hook(
     err_path = project.parent / "hook.err"
     with open(out_path, "wb") as out, open(err_path, "wb") as err:
         proc = subprocess.run(
-            [exe, "-NoProfile", "-File", str(HOOK_PS1)],
+            [exe, *PWSH_BASE_FLAGS, "-File", str(HOOK_PS1)],
             input=json.dumps(payload).encode(),
             stdout=out,
             stderr=err,
@@ -242,7 +243,7 @@ def _run_ps(exe: str, script: str, cwd: Path) -> subprocess.CompletedProcess:
     path = cwd / "drive.ps1"
     path.write_text(script, encoding="utf-8")
     return subprocess.run(
-        [exe, "-NoProfile", "-File", str(path)],
+        [exe, *PWSH_BASE_FLAGS, "-File", str(path)],
         capture_output=True, text=True, timeout=120,
     )
 
@@ -635,7 +636,7 @@ def test_commit_review_prompt_rides_on_stdin_not_the_command_line(tmp_path):
     err_path = tmp_path / "commit-hook.err"
     with open(out_path, "wb") as out, open(err_path, "wb") as err:
         proc = subprocess.run(
-            [exe, "-NoProfile", "-File", str(COMMIT_HOOK_PS1)],
+            [exe, *PWSH_BASE_FLAGS, "-File", str(COMMIT_HOOK_PS1)],
             input=b"",
             stdout=out,
             stderr=err,

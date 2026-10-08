@@ -30,6 +30,7 @@ import pytest
 
 import vco_lib.agent_secrets as agent_secrets
 import vco_lib.project_config as project_config
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -237,7 +238,7 @@ def test_pwsh_get_hub_token_prefers_scoped(tmp_path: Path) -> None:
         + "Remove-Item Env:VCT_STATE_DIR -ErrorAction SilentlyContinue\n"
     )
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command", harness],
+        ["pwsh", *PWSH_BASE_FLAGS, "-Command", harness],
         capture_output=True,
         text=True,
         timeout=60,
@@ -265,7 +266,7 @@ def test_pwsh_get_hub_token_env_pin_wins(tmp_path: Path) -> None:
         + "Remove-Item Env:VCT_HUB_TOKEN -ErrorAction SilentlyContinue\n"
     )
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command", harness],
+        ["pwsh", *PWSH_BASE_FLAGS, "-Command", harness],
         capture_output=True,
         text=True,
         timeout=60,

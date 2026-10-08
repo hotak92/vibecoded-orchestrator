@@ -36,6 +36,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SH = REPO_ROOT / "templates" / "hooks" / "worktree-guard.sh"
@@ -300,7 +301,7 @@ def _run_ps1(payload: dict, project_dir: Path, extra_env: dict | None = None):
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        [_PS, "-NoProfile", "-File", str(PS1)],
+        [_PS, *PWSH_BASE_FLAGS, "-File", str(PS1)],
         input=json.dumps(payload),
         capture_output=True,
         text=True,

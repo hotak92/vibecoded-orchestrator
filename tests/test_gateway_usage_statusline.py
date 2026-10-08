@@ -38,6 +38,7 @@ from typing import Optional
 import pytest
 
 from tests.common.child_env import child_env
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT_SH = REPO / "templates" / "scripts" / "gateway-usage-statusline.sh"
@@ -157,7 +158,7 @@ def _run_sh(state: Path, **extra: str) -> "tuple[subprocess.CompletedProcess, fl
 def _run_ps1(state: Path, **extra: str) -> "tuple[subprocess.CompletedProcess, float]":
     started = time.monotonic()
     proc = subprocess.run(
-        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT_PS1)],
+        [_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(SCRIPT_PS1)],
         input='{"session_id": "x"}', capture_output=True, text=True,
         encoding="utf-8", env=_env(state, **extra), timeout=60,
     )

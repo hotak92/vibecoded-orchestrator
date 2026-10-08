@@ -42,6 +42,7 @@ from pathlib import Path
 from unittest import mock
 
 from vco_lib import project_config
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -180,7 +181,7 @@ def _run_ps1(script: Path, snippet: str, *, env_extra: dict, state: str):
     lib = _ps1_library(script)
     try:
         return subprocess.run(
-            [_PWSH, "-NoProfile", "-NonInteractive", "-Command",
+            [_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command",
              f'. "{lib}"; {snippet}'],
             env=env, capture_output=True, text=True, timeout=60,
         )

@@ -27,6 +27,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESOLVER = REPO_ROOT / "templates" / "scripts" / "vct_secrets_resolve.ps1"
@@ -91,7 +92,7 @@ def _run_resolver(
     }
     (tmp_path / "home").mkdir(exist_ok=True)
     return subprocess.run(
-        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), arg1, key],
+        [_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(RESOLVER), arg1, key],
         capture_output=True,
         text=True,
         env=env,
@@ -227,7 +228,7 @@ def _run_resolver_live(
     (tmp_path / "home").mkdir(exist_ok=True)
     argv = ["-SharedOnly", arg1, key] if shared_only else [arg1, key]
     return subprocess.run(
-        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), *argv],
+        [_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(RESOLVER), *argv],
         capture_output=True,
         text=True,
         env=env,
@@ -408,7 +409,7 @@ def _run_resolver_stale(
         env["VCT_HUB_TOKEN_STRICT"] = "1"
     (tmp_path / "home").mkdir(exist_ok=True)
     return subprocess.run(
-        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), "p1", key],
+        [_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(RESOLVER), "p1", key],
         capture_output=True,
         text=True,
         env=env,
@@ -586,7 +587,7 @@ def _run_resolver_argv(
     }
     (tmp_path / "home").mkdir(exist_ok=True)
     return subprocess.run(
-        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), *args],
+        [_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(RESOLVER), *args],
         capture_output=True,
         text=True,
         env=env,
@@ -658,7 +659,7 @@ def test_ps1_shared_only_dash_dash_spelling_accepted(tmp_path, sharedonly_store)
     (tmp_path / "home").mkdir(exist_ok=True)
     cp = subprocess.run(
         [
-            _PWSH, "-NoProfile", "-NonInteractive", "-Command",
+            _PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command",
             f"& '{RESOLVER}' --shared-only sodemo SHARED_KEY",
         ],
         capture_output=True,

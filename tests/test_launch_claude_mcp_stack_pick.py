@@ -21,6 +21,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "launch-claude-mcp-stack.sh"
@@ -588,7 +589,7 @@ def _wrapper_machine(tmp_path: Path, compose_up_exit: int, config_exit: int = 0)
 def _run_stack(m, shell: str, services: str):
     from tests.test_v0297_lifecycle_hooks import PWSH, WRAPPER_PS1, WRAPPER_SH
     argv = (["bash", str(WRAPPER_SH), "start"] if shell == "bash" else
-            [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(WRAPPER_PS1), "start"])
+            [PWSH, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File", str(WRAPPER_PS1), "start"])
     return subprocess.run(argv, env={**m.env(), "VCO_COMPOSE_SERVICES": services},
                           capture_output=True, text=True, timeout=240, cwd=str(m.tmp))
 

@@ -65,6 +65,7 @@ import re
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -488,7 +489,7 @@ def test_emit_context_ps1_envelope_has_no_decision() -> None:
     script = repo_root / ".github" / "scripts" / "check_emit_context_ps1.ps1"
     assert script.is_file(), f"missing behavioural check script: {script}"
     out = _sp.run(
-        [pwsh, "-NoProfile", "-File", str(script), "-RepoRoot", str(repo_root)],
+        [pwsh, *PWSH_BASE_FLAGS, "-File", str(script), "-RepoRoot", str(repo_root)],
         capture_output=True, text=True, timeout=60,
     )
     assert out.returncode == 0, (
