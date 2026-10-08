@@ -2420,6 +2420,177 @@ def _kg_binding_evidence_remediation(mismatches) -> str:
     )
 
 
+def probe_kg_drift_census(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Per registered project: do the on-disk ``knowledge/`` nodes match Weaviate?
+
+    v0.2.102 W4-C L2 (B3 report :164-172): ``vco_lib.kg_sync_drift.scan_drift``
+    existed (the ``--check-drift`` CLI leg and the bundle-update gate) but the
+    doctor — the authoritative end-of-update report — never ran it, so stored-
+    vs-disk drift was invisible exactly where a user looks for "what is wrong
+    with my install". This census is the read-only doctor leg: for every
+    registered project (the SAME enumeration ``scan_kg_binding_evidence`` uses
+    — ``vco_lib.project_identity.resolve_snapshot``, one read-only launcher.db
+    open through ``launcher_db_reader``) with a binding-sourced primary KG
+    collection, run ``scan_drift`` and report the counts (disk-only,
+    stored-only, changed) with the per-project remedy command.
+
+    REPORTED-not-owned (the ``summary_pending`` shape): the per-project
+    ``kg_sync_drift_detected`` ledger entry belongs to
+    :func:`vco_lib.kg_sync_drift.surface_drift`, whose lifecycle the doctor
+    must not fork — the finding carries the cid for identification only.
+
+    Soft-fail per project by construction: ``scan_drift`` answers ``unknown``
+    (never "drift") when Weaviate is unreachable or the hash query fails —
+    each unknown project becomes ONE warning line in an ``unknown`` finding,
+    and a per-project exception is caught the same way. A census that cannot
+    enumerate (launcher.db unreadable → ``resolvable=False``) or finds no
+    binding-sourced projects emits NOTHING — not "all agreed": the
+    ``kg_binding_evidence`` probe owns the unbound/mismatch questions.
+
+    ``full`` scope only: one class listing per project collection (network
+    reads) and the scan's own reachability probe — the same cost/promises
+    reasoning as ``kg_binding_evidence`` above.
+    """
+    import logging  # noqa: PLC0415
+
+    from vco_lib import kg_sync_drift  # noqa: PLC0415
+    from vco_lib.knowledge_residue import project_env_value  # noqa: PLC0415
+    from vco_lib.project_identity import SOURCE_BINDING, resolve_snapshot  # noqa: PLC0415
+    from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: PLC0415
+
+    try:
+        snapshot = resolve_snapshot()
+    except Exception:  # noqa: BLE001 — could not enumerate is not a verdict
+        return []
+    if not getattr(snapshot, "resolvable", False):
+        return []
+    rows = [
+        ident for ident in snapshot.projects
+        if getattr(ident, "kg_primary_source", "") == SOURCE_BINDING
+        and (getattr(ident, "kg_primary", "") or "").strip()
+        and (getattr(ident, "folder_path", "") or "").strip()
+    ]
+    if not rows:
+        return []
+
+    weaviate_url = weaviate_url_default()
+    drifted: list = []
+    unknowns: list = []
+    verified = 0
+    for ident in rows:
+        project_root = Path(ident.folder_path)  # type: ignore[arg-type]
+        collection = (ident.kg_primary or "").strip()  # type: ignore[union-attr]
+        try:
+            shared = (project_env_value(project_root, "SHARED_KG_COLLECTION") or "").strip()
+        except Exception:  # noqa: BLE001 — local file read, best-effort
+            shared = ""
+        try:
+            report = kg_sync_drift.scan_drift(
+                project_root / "knowledge",
+                weaviate_url=weaviate_url,
+                kg_collection=collection,
+                shared_kg_collection=shared,
+            )
+        except Exception as exc:  # noqa: BLE001 — one project must not kill the census
+            reason = f"scan failed: {type(exc).__name__}: {exc}"
+            logging.getLogger(__name__).warning(
+                "kg_drift_census: project '%s' could not be scanned (%s)",
+                ident.name, reason,
+            )
+            unknowns.append((ident.name, reason))
+            continue
+        if report.status == "drift" or report.stored_only:
+            # ``status`` stays "ok" for a stored-only shape (the bundle-update
+            # gate must not spawn an uncurable re-sync — see scan_drift), so
+            # the census judges on the dimension itself.
+            drifted.append((ident, report))
+        elif report.status == "unknown":
+            reason = report.detail or "drift could not be determined"
+            logging.getLogger(__name__).warning(
+                "kg_drift_census: project '%s' unknown (%s)", ident.name, reason,
+            )
+            unknowns.append((ident.name, reason))
+        else:
+            verified += 1
+
+    if drifted:
+        disk_only = sum(len(r.missing) for _i, r in drifted)
+        stored_only = sum(len(getattr(r, "stored_only", ()) or ()) for _i, r in drifted)
+        changed = sum(len(r.stale) for _i, r in drifted)
+        names = ", ".join(sorted(i.name for i, _r in drifted))
+        remedy_lines = [
+            "# Re-run the sync for each affected project (content-hash gated —\n"
+            "# unaffected nodes are skipped, nothing is deleted). Stored-only\n"
+            "# rows (their file is gone) are NOT removed by a re-sync: inspect\n"
+            "# them before removing anything.",
+        ]
+        for ident, report in drifted:
+            remedy_lines.append(
+                f"cd {ident.folder_path} && .claude/scripts/kg-sync --all"
+                f"   # {len(report.missing)} disk-only, "
+                f"{len(getattr(report, 'stored_only', ()) or ())} stored-only, "
+                f"{len(report.stale)} changed"
+            )
+        return [
+            Finding(
+                probe="kg_drift_census",
+                status=STATUS_PROBLEM,
+                summary=(
+                    f"{len(drifted)} registered project(s) with KG drift "
+                    f"({disk_only} disk-only, {stored_only} stored-only, "
+                    f"{changed} changed): {names}"
+                ),
+                fix=FIX_DEFER,
+                # Reported-not-owned: the per-project ledger entry is
+                # surface_drift's to emit and clear (see the docstring).
+                condition_id=kg_sync_drift.CID_DRIFT,
+                command="\n".join(remedy_lines),
+                detail={
+                    "projects": [
+                        {
+                            "project": ident.name,
+                            "folder": ident.folder_path,
+                            "collection": (ident.kg_primary or "").strip(),
+                            "disk_only": len(report.missing),
+                            "stored_only": len(
+                                getattr(report, "stored_only", ()) or ()
+                            ),
+                            "changed": len(report.stale),
+                            "drifted": sorted(report.drifted),
+                        }
+                        for ident, report in drifted
+                    ],
+                    "unknown": [name for name, _reason in unknowns],
+                },
+            )
+        ]
+    if unknowns:
+        lines = "; ".join(f"{name}: {reason}" for name, reason in unknowns)
+        return [
+            Finding(
+                probe="kg_drift_census",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    f"KG drift could not be determined for {len(unknowns)} "
+                    f"project(s) — {lines}"
+                ),
+                detail={"unknown": [[name, reason] for name, reason in unknowns]},
+            )
+        ]
+    return [
+        Finding(
+            probe="kg_drift_census",
+            status=STATUS_OK,
+            summary=(
+                f"{verified} registered project(s) scanned: every on-disk "
+                "knowledge/ node matches its stored row (no disk-only, "
+                "stored-only or changed nodes)"
+            ),
+            detail={"verified": verified},
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Source currency — "is this checkout the code the project ships today?"
 #
@@ -4412,6 +4583,13 @@ PROBES: dict = {
     # by the same reading (self-resolving + the registry probe
     # `kg_binding_evidence_still_mismatched`).
     "kg_binding_evidence": (probe_kg_binding_evidence, (SCOPE_FULL,)),
+    # v0.2.102 W4-C L2: full-only — per registered project, one Weaviate
+    # reachability probe + one hash query per populated collection (network
+    # reads; same cost reasoning as kg_binding_evidence). REPORTED-not-owned:
+    # the per-project kg_sync_drift_detected ledger entry belongs to
+    # kg_sync_drift.surface_drift, so no boot-scope promise is touched (this
+    # probe never runs at boot and emits/resolve nothing itself).
+    "kg_drift_census": (probe_kg_drift_census, (SCOPE_FULL,)),
     # v0.2.92 BLOCKER-1: full-only — one localhost /health call. See the
     # probe's docstring for why this is the only service whose IMAGE can go
     # stale under a healthy update.

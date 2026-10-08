@@ -3582,82 +3582,189 @@ def _title_target_row(collection, title: str, **fetch_kwargs):
     return rows[0] if rows else None
 
 
-def infer_tags_from_typed_links(
-    server: WeaviateMCPServer,
-    node_data: Dict,
-    collection_name: Optional[str] = None,
-) -> List[str]:
+# ─── v0.2.102 OD-1: tag inference from the target's AUTHORED frontmatter ───
+#
+# The pre-v0.2.102 rules read the link target's STORED Weaviate tags and
+# admitted any tag containing "-" (rule 1) or uppercase/short (rule 2). Two
+# defects (B3 report :150-162): STORED tags are themselves authored ∪
+# INFERRED, so every sync closed another hop over the link graph (A→B→C gave
+# A the tags of C two syncs later), and the two shape rules admitted almost
+# any tag. Owner decision OD-1 (2026-10-07): infer from the TARGET's on-disk
+# authored frontmatter only, admit a tag only when it is BOTH in the target's
+# authored tags AND declared in knowledge/TAG_HIERARCHY.md, and drop rules 1
+# and 2. Reading authored tags makes the inference exactly ONE hop by
+# construction — a target's inferred tags are not in its frontmatter.
+
+#: Per-process cache: the on-disk authored-tags index over KNOWLEDGE_ROOT.
+#: ``None`` = not built yet (built on first inference; knowledge/ files do
+#: not change during a sync run). Reset by ``_reset_tag_inference_caches``
+#: (the test seam for multi-run scenarios).
+_TAG_INFERENCE_INDEX: Optional[List[Tuple[str, List[str], Path]]] = None
+
+#: Per-process cache: tags declared in ``knowledge/TAG_HIERARCHY.md``.
+#: ``None`` = not read yet. An absent/unreadable hierarchy yields an EMPTY
+#: set — with nothing declared, no tag is admitted (the conservative arm:
+#: inference can only shrink to never-fire, never invent).
+_DECLARED_TAG_HIERARCHY: Optional[frozenset] = None
+
+#: Basenames never synced (and never inference sources) — the sync's own
+#: exclusion set, mirrored from ``sync_all_nodes`` below.
+_TAG_INFERENCE_EXCLUDED_BASENAMES = frozenset({"TAG_HIERARCHY.md", "VOCABULARY.md"})
+
+
+def _reset_tag_inference_caches() -> None:
+    """Drop the per-process tag-inference caches (test seam)."""
+    global _TAG_INFERENCE_INDEX, _DECLARED_TAG_HIERARCHY
+    _TAG_INFERENCE_INDEX = None
+    _DECLARED_TAG_HIERARCHY = None
+
+
+def _declared_tag_hierarchy() -> frozenset:
+    """Tags declared in ``knowledge/TAG_HIERARCHY.md``, as a set (no ``#``).
+
+    The hierarchy is a ``#tag`` tree (``#AI`` → ``├── #LLM`` …), so the
+    declaration set is every ``#``-prefixed token in the file. Markdown
+    headings never match: ``##`` is followed by a space, and the pattern
+    requires a word character immediately after the single ``#``. Purely
+    numeric tokens are dropped (an issue/section reference, the same rule the
+    inline tag harvester applies). An absent or unreadable file yields an
+    EMPTY set — nothing is declared, so no tag is admitted.
+    """
+    global _DECLARED_TAG_HIERARCHY
+    if _DECLARED_TAG_HIERARCHY is not None:
+        return _DECLARED_TAG_HIERARCHY
+    declared: set = set()
+    try:
+        hierarchy_path = KNOWLEDGE_ROOT / "TAG_HIERARCHY.md"
+        if hierarchy_path.is_file():
+            text = hierarchy_path.read_text(encoding="utf-8", errors="replace")
+            for match in re.finditer(r"#([a-zA-Z0-9][a-zA-Z0-9_-]*)", text):
+                token = match.group(1)
+                if not token.isdigit():
+                    declared.add(token)
+    except Exception:  # noqa: BLE001 — best-effort by design
+        declared = set()
+    _DECLARED_TAG_HIERARCHY = frozenset(declared)
+    return _DECLARED_TAG_HIERARCHY
+
+
+def _authored_tags_index() -> List[Tuple[str, List[str], Path]]:
+    """``(title, authored frontmatter tags, path)`` for every on-disk node.
+
+    One scan of ``knowledge/`` (cached per process — the sync never writes
+    knowledge files mid-run). The title is the frontmatter ``title`` with the
+    parser's H1/filename fallbacks; tags are the frontmatter list only,
+    ``#``-stripped and whitespace-stripped — the AUTHORED set, never the
+    stored set, per OD-1. Files without frontmatter carry no authored tags
+    and stay in the index with an empty list (a body-scraped tag is not an
+    authored declaration).
+    """
+    global _TAG_INFERENCE_INDEX
+    if _TAG_INFERENCE_INDEX is not None:
+        return _TAG_INFERENCE_INDEX
+    index: List[Tuple[str, List[str], Path]] = []
+    try:
+        if KNOWLEDGE_ROOT.is_dir():
+            for f in sorted(KNOWLEDGE_ROOT.rglob("*.md")):
+                if not f.is_file() or f.name in _TAG_INFERENCE_EXCLUDED_BASENAMES:
+                    continue
+                try:
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                except Exception:  # noqa: BLE001 — skip unreadable files
+                    continue
+                frontmatter, _body = parse_frontmatter(content)
+                title = ""
+                tags: List[str] = []
+                if isinstance(frontmatter, dict):
+                    raw_title = frontmatter.get("title")
+                    if isinstance(raw_title, str) and raw_title.strip():
+                        title = raw_title.strip()
+                    raw_tags = frontmatter.get("tags")
+                    if isinstance(raw_tags, list):
+                        for tag in raw_tags:
+                            token = str(tag).lstrip("#").strip()
+                            if token and token not in tags:
+                                tags.append(token)
+                if not title:
+                    # Same fallback precedence as parse_markdown_node: H1,
+                    # then filename stem.
+                    title = f.stem
+                    for line in content.splitlines():
+                        if line.startswith("# "):
+                            title = line[2:].strip()
+                            break
+                if title:
+                    index.append((title, tags, f))
+    except Exception:  # noqa: BLE001 — best-effort by design
+        index = []
+    _TAG_INFERENCE_INDEX = index
+    return index
+
+
+def infer_tags_from_typed_links(node_data: Dict) -> List[str]:
     """
     Infer tags from typed relationships BEFORE storing to Weaviate.
 
-    Inference rules:
-    1. Inherit capability tags from used/implemented tools
-    2. Propagate domain tags through relationships
+    v0.2.102 OD-1 (owner decision 2026-10-07): the ONLY inference source is
+    the link target's ON-DISK authored frontmatter ``tags``, and a tag is
+    admitted only when it is BOTH in that authored set AND declared in
+    ``knowledge/TAG_HIERARCHY.md``. The pre-v0.2.102 shape rules ("contains
+    '-'", "uppercase or <15 chars") are dropped, and reading AUTHORED tags
+    (never the stored set, which is itself authored ∪ inferred) bounds the
+    propagation to exactly ONE hop across syncs — A→B→C never gives A the
+    tags of C. Authored tags are never removed; this function only ADDS.
 
     Args:
-        server: Weaviate MCP server instance
         node_data: Parsed node data with typed_links
-        collection_name: Collection to read link targets from (v0.2.89
-            BUG 6 — the node's TARGET collection so shared-scoped nodes
-            infer from shared-collection siblings). Defaults to the
-            project collection.
 
     Returns:
-        List of inferred tags
+        List of inferred tags (deduped, order-preserving)
     """
     typed_links = node_data.get("typed_links", [])
-    existing_tags = set(node_data.get("tags", []))
-    inferred_tags = []
-
     if not typed_links:
-        return inferred_tags
+        return []
 
-    # Relationship types that propagate properties
-    CAPABILITY_RELATIONS = ["uses", "implements", "buildsOn"]
-    TAG_RELATIONS = ["uses", "implements", "extends", "buildsOn"]
+    declared = _declared_tag_hierarchy()
+    if not declared:
+        # Nothing declared → nothing may be admitted (an absent hierarchy
+        # must not turn inference back into "any tag").
+        return []
 
+    index = _authored_tags_index()
+    if not index:
+        return []
+
+    # Relationship types that propagate tags (unchanged gate — OD-1 rules on
+    # WHAT propagates and from WHERE, not on which relations carry it).
+    TAG_RELATIONS = ("uses", "implements", "extends", "buildsOn")
+
+    existing_tags = set(node_data.get("tags", []))
+    inferred_tags: List[str] = []
     try:
-        collection = server.client.collections.get(
-            collection_name or COLLECTION_NAME
-        )
-
         for link in typed_links:
             relation = link.get("relation_type", "")
-            target_title = link.get("target_title", "")
-
-            # Query target node.
-            # v0.2.101 B3 follow-up: `title` is word-TOKENIZED, so `Equal`
-            # matches every title CONTAINING the link's tokens, and the old
-            # `limit=1` took whichever came first — `[[uses::Weaviate]]`
-            # inherited the tags of e.g. "Weaviate Windows Ports Gotcha".
-            # The filter now only narrows; `_title_target_row` keeps the first
-            # row whose title has the SAME token sequence as the link.
-            target_row = _title_target_row(
-                collection, target_title,
-                return_properties=["tags", "node_type", "title"],
-            )
-            if target_row is None:
+            if relation not in TAG_RELATIONS:
                 continue
-
-            target_props = target_row.properties or {}
-            target_tags = target_props.get("tags", [])
-
-            # Rule 1: Inherit capability tags from used/implemented tools
-            if relation in CAPABILITY_RELATIONS:
-                capability_tags = [t for t in target_tags if "-" in t]
-                for cap in capability_tags:
-                    if cap not in existing_tags and cap not in inferred_tags:
-                        inferred_tags.append(cap)
-
-            # Rule 2: Propagate domain tags through relationships
-            if relation in TAG_RELATIONS:
-                domain_tags = [t for t in target_tags if t.upper() == t or len(t) < 15]
-                for tag in domain_tags:
-                    if (tag not in existing_tags and
-                        tag not in inferred_tags and
-                        tag not in ["test", "project", "concept", "tool"]):
-                        inferred_tags.append(tag)
-
+            target_title = link.get("target_title", "")
+            if not target_title:
+                continue
+            # WikiLink title identity: the SAME token sequence (case /
+            # punctuation insensitive), never a token SUPERSET — the rule
+            # `resolve_wikilinks_to_uuids` applies to stored rows, applied
+            # here to on-disk titles. First match in sorted-file order.
+            entry = next(
+                (e for e in index if _is_same_title(e[0], target_title)),
+                None,
+            )
+            if entry is None:
+                continue
+            for tag in entry[1]:
+                if (
+                    tag in declared
+                    and tag not in existing_tags
+                    and tag not in inferred_tags
+                ):
+                    inferred_tags.append(tag)
     except Exception:
         # Inference is best-effort - don't fail sync if it errors
         pass
@@ -4315,11 +4422,12 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 print(f"   ... and {len(validation_warnings) - 3} more warnings")
 
         # Run inference BEFORE storing (enrich with inferred tags).
-        # v0.2.89 BUG 6: inference reads the TARGET collection so a shared-
-        # scoped node inherits tags from its shared-collection link targets.
-        inferred_tags = infer_tags_from_typed_links(
-            server, node_data, collection_name=target_collection_name
-        )
+        # v0.2.102 OD-1: inference reads the link target's ON-DISK authored
+        # frontmatter (one hop, declared tags only — see
+        # `infer_tags_from_typed_links`), so it no longer consults any
+        # collection; a shared-scoped node infers from the same on-disk
+        # sources its link targets live in.
+        inferred_tags = infer_tags_from_typed_links(node_data)
         if inferred_tags:
             # Add inferred tags to node data (will be stored with original tags)
             node_data["tags"] = list(set(node_data["tags"] + inferred_tags))
@@ -5489,6 +5597,10 @@ def _print_drift_sentinel(binding, report, repair_owed=None) -> None:
             "scanned": int(getattr(report, "scanned", 0) or 0) if report is not None else 0,
             "missing": len(getattr(report, "missing", ()) or ()) if report is not None else 0,
             "stale": len(getattr(report, "stale", ()) or ()) if report is not None else 0,
+            # v0.2.102 W4-C L2: the stored-only dimension rides the sentinel
+            # WITHOUT touching `status` (the Rust gate's "drift ⇒ spawn an
+            # `--all` pass" must not fire for rows a re-sync cannot clear).
+            "stored_only": len(getattr(report, "stored_only", ()) or ()) if report is not None else 0,
             "detail": (
                 getattr(report, "detail", "") if report is not None
                 else (getattr(binding, "detail", "") or "no KG binding")
@@ -5577,6 +5689,11 @@ def _run_check_drift() -> None:
     if report.stale:
         print(f"   stale in Weaviate ({len(report.stale)}):")
         for p in report.stale:
+            print(f"     - {p}")
+    if report.stored_only:
+        print(f"   stored-only in Weaviate ({len(report.stored_only)}) — "
+              "file gone, a re-sync does NOT remove these rows:")
+        for p in report.stored_only:
             print(f"     - {p}")
     if report.status == "drift":
         print(

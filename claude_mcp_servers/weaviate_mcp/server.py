@@ -3452,6 +3452,91 @@ def _kg_collections_to_search(include_dev: bool = False) -> list[str]:
     return out
 
 
+# ─── v0.2.102 S2: per-node cross_project_access enforcement (read side) ───
+#
+# The WRITE side is the launcher's per-node access editor
+# (`kg_set_node_access` / `kg_set_node_access_bulk`, Rust commands/kg.rs):
+# it PATCHes ``cross_project_access: text[]`` onto the Weaviate object —
+# ``["*"]`` = readable by every project, ``[<project-id>…]`` = exactly those
+# launcher project ids, ``[]`` = private. Until v0.2.102 NOTHING read the
+# property (the v0.2.91 hooks-placebo class): the editor's restrictions were
+# saved and ignored. This is the ONE read-side filter builder; every
+# cross-collection fan-out site applies it to rows from a NON-SELF collection.
+#
+# Back-compat BOTH arms: a row whose collection does not carry the property
+# (legacy classes, code-graph collections the editor never touched) is
+# UNRESTRICTED — enforcement only judges rows that positively carry a
+# restriction. The SELF collection is never filtered (its rows are this
+# project's own data; the collection-level access matrix already governs
+# which peers see the collection at all).
+
+
+def _cross_project_access_allows(props, requester_project_id: str) -> bool:
+    """May ONE row from a peer collection reach *requester_project_id*?
+
+    ``props`` is the row's raw properties mapping (``None``-safe). The
+    verdict table for ``cross_project_access``:
+
+    * absent / ``None`` → ALLOW (legacy row, never restricted);
+    * contains ``"*"`` → ALLOW (explicitly shared with every project);
+    * non-empty list → ALLOW only when *requester_project_id* is in it;
+    * empty list → DENY (the writer's ``private`` mode);
+    * a value that is neither list/tuple nor ``None`` → DENY (a malformed
+      restriction is still a restriction — never guess a row onto a list).
+
+    A non-empty restriction with an UNRESOLVABLE requester id
+    (``""`` — hub down, env-fallback peer list) DENIES: the row demands
+    proof of identity, and this process cannot present one.
+    """
+    if not isinstance(props, dict):
+        return True  # unreadable properties never carried a restriction we can read
+    allowed = props.get("cross_project_access")
+    if allowed is None:
+        return True
+    if not isinstance(allowed, (list, tuple)):
+        return False
+    if "*" in allowed:
+        return True
+    if not allowed:
+        return False
+    return bool(requester_project_id) and requester_project_id in allowed
+
+
+def _own_project_id_for_access() -> str:
+    """This process's launcher project id, or ``""`` when unresolvable.
+
+    The restriction lists carry launcher project ids (the writer's GUI
+    picker sends ``project.id``), and the hub's ``ProjectConfig.project_id``
+    is the same id — one namespace, resolved through the ONE config seam
+    this module already uses. Env-fallback peer resolution (hub down) has no
+    id, hence ``""`` (and ``_cross_project_access_allows`` denies restricted
+    rows on it).
+    """
+    cfg = _try_resolve_project_config()
+    return (getattr(cfg, "project_id", "") or "") if cfg is not None else ""
+
+
+def _filter_cross_project_access(objects: list, *, is_self: bool) -> list:
+    """Apply the per-node access filter to ONE fan-out collection's rows.
+
+    ``is_self`` → returned unchanged (the self collection is never filtered;
+    each call site decides what "self" means — KG: ``coll_name ==
+    KG_COLLECTION``; code-graph: the row's prefix equals the effective
+    project's own prefix, with the bare cross-tenant path treated as self by
+    explicit request). One home, used by every fan-out site so the rule
+    cannot drift between them.
+    """
+    if is_self:
+        return objects
+    requester = _own_project_id_for_access()
+    return [
+        obj for obj in objects
+        if _cross_project_access_allows(
+            getattr(obj, "properties", None), requester,
+        )
+    ]
+
+
 def _describe_collection_source(coll_name: str) -> str:
     """Tag a collection name with its resolution source for error messages.
 
@@ -5487,10 +5572,20 @@ async def _semantic_graph_search_body(
             failed_collections_other.append((coll_name, str(exc)))
             continue
 
+        # v0.2.102 S2: per-node cross-project access filter (one home:
+        # `_filter_cross_project_access`) — applied on the raw objects
+        # BEFORE formatting, enrichment or the rich-primary collection
+        # (local list, not result-object mutation, so exotic client/fake
+        # return shapes keep working).
+        _primary_objects = _filter_cross_project_access(
+            list(primary.objects or []),
+            is_self=(coll_name == KG_COLLECTION),
+        )
+
         # Format all over-fetched results from this collection
         coll_formatted = [
             _format_obj(obj, coll_name, obj.metadata.distance)
-            for obj in primary.objects
+            for obj in _primary_objects
         ]
         # V52-J Edit 3 / V52-Q (2026-06-09): attach raw cosine score
         # (= 1.0 - Weaviate distance) on each formatted dict so the v3
@@ -5508,7 +5603,7 @@ async def _semantic_graph_search_body(
         # Soft-fail per-result: a malformed obj.vector must never
         # crash the search path.
         if query_vector is not None:
-            for r, obj in zip(coll_formatted, primary.objects):
+            for r, obj in zip(coll_formatted, _primary_objects):
                 try:
                     node_emb = _extract_obj_vector(obj, query_target)
                     if node_emb:
@@ -5521,7 +5616,7 @@ async def _semantic_graph_search_body(
                     )
         coll_formatted = _enrich_with_adjacent_chunks(handle, coll_formatted, coll_name)
         all_formatted.extend(coll_formatted)
-        for obj in primary.objects:
+        for obj in _primary_objects:
             raw_primary.append((obj, coll_name))
         successful_collections.append(coll_name)
 
@@ -5712,6 +5807,13 @@ async def _semantic_graph_search_body(
                         Filter.by_property("title").equal(title),
                         _wem.exact_row_predicate(same_tokens={"title": title}),
                     )
+                    # v0.2.102 S2: a restricted PEER row must not slip in as
+                    # a WikiLink neighbour either (self collection exempt).
+                    if obj is not None and coll_name != KG_COLLECTION:
+                        obj = obj if _cross_project_access_allows(
+                            getattr(obj, "properties", None),
+                            _own_project_id_for_access(),
+                        ) else None
                     if obj is not None:
                         formatted = _format_obj(obj, coll_name, distance=None)
                         # Per-collection chunk enrichment so adjacent chunks
@@ -5839,9 +5941,23 @@ async def _hybrid_search_single_collection(
     else:
         keyword_results = coll.query.bm25(query=query, limit=fetch_limit, return_metadata=["score"])
 
+    # v0.2.102 S2: per-node cross-project access — rows from a NON-SELF
+    # collection carrying a `cross_project_access` restriction are filtered
+    # to the requesting project BEFORE any formatting/enrichment consumes
+    # them (one home: `_filter_cross_project_access`; local lists, not
+    # result-object mutation, so exotic client/fake return shapes keep
+    # working).
+    _is_self_coll = coll_name == KG_COLLECTION
+    _semantic_objects = _filter_cross_project_access(
+        list(semantic_results.objects or []), is_self=_is_self_coll,
+    )
+    _keyword_objects = _filter_cross_project_access(
+        list(keyword_results.objects or []), is_self=_is_self_coll,
+    )
+
     semantic_formatted = [
         _format_obj(obj, coll_name, obj.metadata.distance)
-        for obj in semantic_results.objects
+        for obj in _semantic_objects
     ]
     # V52-J Edit 3 / V52-Q (2026-06-09): attach raw cosine score
     # (= 1.0 - Weaviate distance) on each formatted dict. See the
@@ -5857,7 +5973,7 @@ async def _hybrid_search_single_collection(
     # the near_text path (no raw vectors available). Per-result
     # soft-fail so a malformed vector never breaks the search path.
     if query_vector is not None:
-        for r, obj in zip(semantic_formatted, semantic_results.objects):
+        for r, obj in zip(semantic_formatted, _semantic_objects):
             try:
                 node_emb = _extract_obj_vector(obj, query_target)
                 if node_emb:
@@ -5911,7 +6027,7 @@ async def _hybrid_search_single_collection(
             entry["score_cosine"] = r["score_cosine"]
         combined[key] = entry
 
-    for obj in keyword_results.objects:
+    for obj in _keyword_objects:
         formatted_kw = _format_obj(obj, coll_name)
         key = (formatted_kw["title"], formatted_kw.get("chunk_number"))
         score = obj.metadata.score if hasattr(obj.metadata, 'score') else 0.0
@@ -7514,7 +7630,22 @@ async def search_code_graph(
                             combined = combined & f
                         kwargs["filters"] = combined
                     resp = coll.query.near_vector(**kwargs)
-                    for obj in resp.objects:
+                    # v0.2.102 S2: per-node cross-project access — rows from
+                    # a PEER project's collections carrying a
+                    # `cross_project_access` restriction are filtered to the
+                    # requesting project (one home:
+                    # `_filter_cross_project_access`). The SELF prefix and
+                    # the bare cross-tenant path (no effective project — an
+                    # explicit all-projects request) are exempt.
+                    _self_names = (
+                        {f"{self_prefix}_{b}" for b in base_names}
+                        if effective_project else None
+                    )
+                    _objs = _filter_cross_project_access(
+                        list(resp.objects or []),
+                        is_self=(_self_names is None or coll_name in _self_names),
+                    )
+                    for obj in _objs:
                         p = obj.properties
                         distance = obj.metadata.distance if (hasattr(obj.metadata, "distance") and obj.metadata.distance is not None) else 1.0
                         # F11-iv (pre-gate audit): clamp to >= 0.0 — MUST MATCH
@@ -7824,24 +7955,23 @@ async def search_code_graph(
             # confirmed in Python: `full_name` read back from the winning row
             # compared with `==` (any other spelling is another entity), exact
             # `file_path`, same `project` token sequence.
-            import vco_lib.weaviate_exact_match as _wem
+            # v0.2.102 W4-C L5: the confirmed-rows fetch is the ONE shared
+            # home (`vco_lib.codegraph_lookup.confirmed_entity_rows`) — the
+            # CLI's `_code_chunk_fetcher` calls the same helper, so a
+            # token-superset sibling can interleave chunk bodies on NEITHER
+            # surface.
+            from vco_lib.codegraph_lookup import confirmed_entity_rows
 
-            _chunk_accept = _wem.exact_row_predicate(
-                paths={"file_path": file_path},
-                values={"full_name": full_name},
-                same_tokens={"project": effective_project},
-            )
             collected: list[tuple[int, dict]] = []
             for base in ("CodeFunction", "CodeClass"):
                 try:
                     coll_obj = client.collections.get(_project_collection(base))
-                    flt = Filter.by_property("full_name").equal(full_name)
-                    if effective_project:
-                        flt = flt & Filter.by_property("project").equal(effective_project)
-                    if file_path:
-                        flt = flt & Filter.by_property("file_path").equal(file_path)
-                    rows = _wem.fetch_matching_rows(
-                        coll_obj, flt, _chunk_accept,
+                    rows = confirmed_entity_rows(
+                        coll_obj,
+                        filter_cls=Filter,
+                        project=effective_project or "",
+                        full_name=full_name,
+                        file_path=file_path,
                         max_matches=max(total, max_chunks) + 4,
                     )
                     for obj in rows:
@@ -8146,83 +8276,37 @@ def _caller_match_terms(target: str) -> list[str]:
 
 
 def _pick_canonical_chunk(objects: list):
-    """From a list of Weaviate code objects sharing a full_name, return the
-    CANONICAL (chunk_num == 0) one.
+    """The canonical chunk-0 row of a chunked code entity — SHARED home.
 
-    v0.2.72 (P3): a chunked function/class is stored as N objects that all
-    carry the same ``full_name`` but different ``chunk_num`` (0-indexed). The
-    ``query_code_structure`` lookups (methods / extends / interactions) want
-    THE object for that name — which must be the canonical chunk 0 (it holds
-    the signature-leading body, the methods list, and is the reference target
-    cross-references resolve to).
-
-    Selection: prefer chunk_num == 0; then a legacy row with chunk_num
-    None/absent (single-chunk pre-migration entity); else the lowest chunk_num
-    present; else the first object. Never raises on a missing property.
-    Returns ``None`` for an empty list.
+    v0.2.102 W4-C L5: moved to
+    :func:`vco_lib.codegraph_lookup.pick_canonical_chunk` so the CLI's
+    structure lookups select the same canonical row the MCP does. Kept as a
+    thin alias for this module's callers.
     """
-    if not objects:
-        return None
+    from vco_lib.codegraph_lookup import pick_canonical_chunk
 
-    def _cn(o):
-        try:
-            v = o.properties.get("chunk_num")
-        except Exception:  # noqa: BLE001
-            return None
-        return v
-
-    # chunk_num == 0 → canonical.
-    for o in objects:
-        if _cn(o) == 0:
-            return o
-    # legacy single-chunk (property absent/None).
-    for o in objects:
-        if _cn(o) is None:
-            return o
-    # else: lowest chunk_num present.
-    try:
-        return min(objects, key=lambda o: (_cn(o) if _cn(o) is not None else 1 << 30))
-    except Exception:  # noqa: BLE001
-        return objects[0]
+    return pick_canonical_chunk(objects)
 
 
 def _code_identity_rows(
     coll, prop: str, target: str, effective_project, *,
     tolerant_limit: int, **fetch_kwargs,
 ) -> list:
-    """The rows of the code entity named ``target`` on ``prop`` (``full_name``
-    for CodeFunction / CodeClass, ``path`` for CodeModule) — EXACT-THEN-FALLBACK.
+    """The rows of the code entity named ``target`` — EXACT-THEN-FALLBACK.
 
-    v0.2.101 pull-in (owner ruling): ``full_name`` / ``path`` / ``project``
-    are word-TOKENIZED, so the ``Equal`` these lookups used matched every
-    token-superset entity as well (``a.run`` → ``a.run_all``), and a
-    ``limit=1`` / ``limit=8`` read could answer with the sibling. That same
-    tolerance is also what resolves a user-typed ``a::run`` or a bare
-    ``paths.py``, so it is kept as the FALLBACK, never dropped:
-    ``vco_lib.weaviate_exact_match.fetch_rows_exact_then_tolerant`` returns
-    only exact rows when any exist (``full_name`` by ``==``, ``path`` by the
-    separator-insensitive exact path, ``project`` by token sequence), and
-    otherwise the very read this site made before (``tolerant_limit`` rows).
-
-    The ONE home for these lookups in this module (``query_code_structure``,
-    the ``search_code_graph`` expansion and the CG-2 language probe).
-    ``effective_project`` empty → no project clause, as before.
+    v0.2.102 W4-C L5: the implementation now lives in ONE shared home the
+    CLI (``templates/scripts/query_code_graph.py``) also calls —
+    :func:`vco_lib.codegraph_lookup.code_identity_rows` — so the MCP and the
+    CLI cannot answer the same identity question with different rows (the
+    v0.2.101 exactness ruling, previously MCP-only; see the shared module's
+    docstring for the tokenization rationale). ``effective_project`` empty →
+    no project clause, as before.
     """
-    import vco_lib.weaviate_exact_match as _wem
+    from vco_lib.codegraph_lookup import code_identity_rows
 
-    flt = Filter.by_property(prop).equal(target)
-    if effective_project:
-        flt = flt & Filter.by_property("project").equal(effective_project)
-    if prop in ("path", "file_path"):
-        accept = _wem.exact_row_predicate(
-            paths={prop: target}, same_tokens={"project": effective_project},
-        )
-    else:
-        accept = _wem.exact_row_predicate(
-            values={prop: target}, same_tokens={"project": effective_project},
-        )
-    return _wem.fetch_rows_exact_then_tolerant(
-        coll, flt, accept, tolerant_limit=tolerant_limit, **fetch_kwargs,
+    return code_identity_rows(
+        coll, prop, target, effective_project or "",
+        filter_cls=Filter, tolerant_limit=tolerant_limit, **fetch_kwargs,
     )
 
 
@@ -8584,14 +8668,40 @@ def query_code_structure(
                 #
                 # v0.2.46 V46-D: emit truncation signal so the LLM
                 # consumer knows when the list is capped at IMPORTS_LIMIT.
+                #
+                # v0.2.102 W4-C L4 (P1 report :68/:286): the by_ref
+                # narrowing reads the TARGET's tokenized `path`, so an
+                # `Equal` is only a candidate-selection filter — a token-
+                # SUPERSET target's importers came back as false positives,
+                # and a target typed ``./a/b.py`` / absolute / with a
+                # Windows separator had to luck into matching tokens. The
+                # references now come back WITH the rows and each importer
+                # is CONFIRMED in Python against the tolerant path-identity
+                # rule (`vco_lib.weaviate_exact_match.names_same_path` —
+                # the same normalisation the CLI's exclude-file filter
+                # uses; relative vs absolute, ``./``, trailing slash,
+                # separators).
                 IMPORTS_LIMIT = 20
                 response = coll.query.fetch_objects(
                     filters=with_project(
                         Filter.by_ref("imports").by_property("path").equal(target)
                     ),
                     limit=IMPORTS_LIMIT,
+                    return_references=_code_return_references("imports"),
                 )
-                importers = _dedup_ref_targets(response.objects, ("path",))
+                import vco_lib.weaviate_exact_match as _wem  # noqa: PLC0415
+
+                confirmed = [
+                    obj for obj in response.objects
+                    if any(
+                        _wem.names_same_path(
+                            (getattr(ref, "properties", None) or {}).get("path"),
+                            target,
+                        )
+                        for ref in _read_cross_reference(obj, "imports")
+                    )
+                ]
+                importers = _dedup_ref_targets(confirmed, ("path",))
                 results = [{"path": obj.properties.get("path"), "file_path": obj.properties.get("path", "")} for obj in importers]
                 _truncation_meta = {
                     "truncated": len(response.objects) >= IMPORTS_LIMIT,

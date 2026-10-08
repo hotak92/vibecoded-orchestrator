@@ -285,6 +285,12 @@ class DriftReport:
     invalid_type_skipped: int = 0
     missing: tuple = field(default_factory=tuple)
     stale: tuple = field(default_factory=tuple)
+    #: v0.2.102 W4-C L2: stored rows in the PROJECT collection whose
+    #: ``file_path`` matches NO on-disk node (either spelling) — the inverse
+    #: of ``missing``. Computed from the PROJECT hashes only: the shared
+    #: collection legitimately holds every other project's shared-scope
+    #: nodes, so its keys are never this project's "stored-only".
+    stored_only: tuple = field(default_factory=tuple)
     detail: str = ""
 
     @property
@@ -500,12 +506,37 @@ def scan_drift(
         elif stored_hash != computed_hash:
             stale.append(rel_posix)
 
+    # v0.2.102 W4-C L2: the inverse dimension — stored project-collection
+    # rows whose path matches no on-disk node (deleted/renamed files whose
+    # rows a later sync removes, or rows another writer left behind). Every
+    # on-disk candidate's both spellings count as accounted for (archived and
+    # invalid-type nodes included: their rows, when present, ARE theirs).
+    disk_shapes = {
+        shape
+        for rel_posix, _rel_parts, _content in candidates
+        for shape in _row_path_shapes(rel_posix[len("knowledge/"):])
+    }
+    stored_only = sorted(p for p in project_hashes if p not in disk_shapes)
+
+    # ``status`` keeps its PRE-v0.2.102 meaning (drift ⇔ missing/stale — the
+    # rows a re-sync REPAIRS): the bundle-update gate treats "drift" as "an
+    # `--all` pass is owed", and a stored-only shape is NOT cleared by one
+    # (the upsert only deletes rows for files that still exist), so folding
+    # it into ``status`` would make the gate re-spawn on every update
+    # forever. ``stored_only`` rides along as its own dimension; the doctor's
+    # drift census reports it with its own remedy.
     status = "drift" if (missing or stale) else "ok"
     detail = (
         f"{len(missing)} missing, {len(stale)} stale out of {len(checkable)} checked"
         if status == "drift"
         else f"{len(checkable)} node(s) verified in sync"
     )
+    if stored_only:
+        detail += (
+            f"; {len(stored_only)} stored-only row(s) whose file is gone "
+            "(a re-sync does not remove them — vco doctor's kg_drift_census "
+            "reports them)"
+        )
     if invalid_type_skipped:
         # Loud, never silent: these nodes need a frontmatter fix, not a
         # re-sync — say so in the very line the CLI prints.
@@ -523,6 +554,7 @@ def scan_drift(
         invalid_type_skipped=invalid_type_skipped,
         missing=tuple(sorted(missing)),
         stale=tuple(sorted(stale)),
+        stored_only=tuple(stored_only),
         detail=detail,
     )
 
@@ -711,6 +743,13 @@ def surface_drift(
 
     if report.status != "drift":
         return  # "unknown" — say nothing rather than guess
+    if not report.drifted:
+        # v0.2.102 W4-C L2 belt-and-braces: unreachable by construction since
+        # ``status`` stays "ok" for a stored-only shape (see scan_drift), but
+        # this entry's remedy — re-run kg-sync — cannot clear stored-only
+        # rows, so an entry emitted for one would never resolve. The doctor's
+        # drift census reports that shape instead.
+        return
 
     try:
         from vco_lib.deferral_emit import emit
@@ -906,6 +945,7 @@ def main(argv: Optional[list] = None) -> int:
             "scanned": drift_report.scanned,
             "missing": list(drift_report.missing),
             "stale": list(drift_report.stale),
+            "stored_only": list(drift_report.stored_only),
             "detail": drift_report.detail,
         }
 
@@ -920,6 +960,8 @@ def main(argv: Optional[list] = None) -> int:
             print(f"  missing: {p}")
         for p in drift_report.stale:
             print(f"  stale:   {p}")
+        for p in drift_report.stored_only:
+            print(f"  stored-only: {p}")
     return 0
 
 
