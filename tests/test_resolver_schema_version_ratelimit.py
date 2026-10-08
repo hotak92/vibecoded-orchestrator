@@ -43,6 +43,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -261,7 +262,7 @@ class PowerShellSchemaWarningRateLimitTest(unittest.TestCase):
         }
         if extra_env:
             env.update(extra_env)
-        argv = [_PWSH, "-NoProfile", "-NonInteractive", "-File",
+        argv = [_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File",
                 str(PS1_CLIENT), "-Project", "dummy-uuid-not-a-path"]
         return subprocess.run(argv, env=env, capture_output=True, text=True,
                               timeout=30)

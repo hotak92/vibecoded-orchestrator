@@ -45,6 +45,7 @@ from vco_lib import runtime_reconcile as rr
 from vco_lib import tool_search_dirs as tsd
 from vco_lib.deferral_emit import LOCK_REL
 from vco_lib.deferral_report import DeferralReport
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
@@ -520,7 +521,7 @@ def _sh(script: Path) -> list:
 
 
 def _ps1(script: Path) -> list:
-    return [PWSH or "pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)]
+    return [PWSH or "pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(script)]
 
 
 _SHELLS = [
@@ -759,7 +760,7 @@ def test_a_session_hook_records_a_refused_pin_in_the_installs_ledger(tmp_path, h
     project.mkdir()
     script = REPO_ROOT / "templates" / "hooks" / f"{hook}.{'sh' if shell == 'bash' else 'ps1'}"
     argv = ([BASH or "bash", str(script)] if shell == "bash" else
-            [PWSH or "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)])
+            [PWSH or "pwsh", *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File", str(script)])
     env = m.env(VCT_CONTAINER_RUNTIME="docker", VCT_INSTALL_ROOT=str(root),
                 CLAUDE_PROJECT_DIR=str(project))
     env[tsd.ENV_OVERRIDE] = ""
@@ -818,7 +819,7 @@ def test_a_slow_refusal_record_never_blocks_the_watchdogs_foreground(tmp_path, s
     wrapper.chmod(0o755)
     script = REPO_ROOT / "templates" / "hooks" / f"verify-container-ports.{('sh' if shell == 'bash' else 'ps1')}"
     argv = ([BASH or "bash", str(script)] if shell == "bash" else
-            [PWSH or "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)])
+            [PWSH or "pwsh", *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File", str(script)])
     env = m.env(VCT_CONTAINER_RUNTIME="docker", VCT_INSTALL_ROOT=str(root),
                 CLAUDE_PROJECT_DIR=str(project), VCT_VENV=str(wrapper))
     env[tsd.ENV_OVERRIDE] = ""
@@ -872,7 +873,7 @@ def test_a_refused_pin_record_leaves_no_temp_files_behind(tmp_path, shell):
         script = REPO_ROOT / "templates" / "hooks" / \
             f"verify-container-ports.{('sh' if shell == 'bash' else 'ps1')}"
         argv = ([BASH or "bash", str(script)] if shell == "bash" else
-                [PWSH or "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)])
+                [PWSH or "pwsh", *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File", str(script)])
         # _Machine.env points TMPDIR/TEMP at the machine's own tmp dir, so the
         # hook's GetTempPath() (pwsh) resolves there — any leak lands in m.tmp.
         env = m.env(VCT_CONTAINER_RUNTIME="docker", VCT_INSTALL_ROOT=str(root),
@@ -941,7 +942,7 @@ def test_a_session_hook_drives_a_runtime_found_only_in_a_user_local_dir(tmp_path
     project.mkdir()
     script = REPO_ROOT / "templates" / "hooks" / f"verify-container-ports.{'sh' if shell == 'bash' else 'ps1'}"
     argv = ([str(m.bin / "bash"), str(script)] if shell == "bash" else
-            [PWSH or "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)])
+            [PWSH or "pwsh", *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File", str(script)])
     env = m.env(CLAUDE_PROJECT_DIR=str(project), HOME=str(home))
     env["PATH"] = str(m.bin)
     env[tsd.ENV_OVERRIDE] = "~/bin"

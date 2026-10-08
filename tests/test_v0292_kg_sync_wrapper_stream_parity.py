@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.wrapper_staging import stage_scripts
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parent.parent
 WRAPPER_PS1 = REPO / "templates" / "scripts" / "kg-sync.ps1"
@@ -81,7 +82,7 @@ def test_refusal_goes_to_stderr_not_the_host_stream(tmp_path: Path) -> None:
         if k not in ("VCT_VENV", "VCT_INSTALL_ROOT", "VCT_ORCHESTRATOR_ROOT")
     }
     proc = subprocess.run(
-        [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        [exe, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File",
          str(proj / ".claude" / "scripts" / "kg-sync.ps1"), "--all"],
         capture_output=True, text=True, env=env, cwd=str(proj), timeout=120,
     )
@@ -148,7 +149,7 @@ def test_happy_path_exports_the_venv_root(tmp_path: Path) -> None:
         "PYTHONPATH": f"{REPO}{os.pathsep}{REPO / 'claude_mcp_servers'}",
     }
     proc = subprocess.run(
-        [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        [exe, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File",
          str(proj / ".claude" / "scripts" / "kg-sync.ps1"), "--all"],
         capture_output=True, text=True, env=env, cwd=str(proj), timeout=120,
     )

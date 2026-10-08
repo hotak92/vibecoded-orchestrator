@@ -34,6 +34,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_DIR = REPO_ROOT / "templates" / "hooks" / "_lib"
@@ -178,7 +179,7 @@ if (Test-Path -LiteralPath $inj) {{ Get-Content -LiteralPath $inj }}
 Write-Output '=====END====='
 """
     proc = subprocess.run(
-        [pwsh, "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        [pwsh, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", ps_script],
         capture_output=True, text=True, timeout=60, cwd=str(tmp_path),
     )
     assert proc.returncode == 0, (

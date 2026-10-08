@@ -34,6 +34,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -257,7 +258,7 @@ class PowerShellSchemaWarningTest(unittest.TestCase):
             "VCT_STATE_DIR": tempfile.mkdtemp(prefix="vct-resolver-test-"),
         }
         argv = [
-            _PWSH, "-NoProfile", "-NonInteractive",
+            _PWSH, *PWSH_BASE_FLAGS, "-NonInteractive",
             "-File", str(PS1_CLIENT),
             "-Project", project_arg,
         ]

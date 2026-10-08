@@ -35,6 +35,7 @@ import pytest
 
 from tests.common.child_env import child_env
 from vco_lib import ssrf_url
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parent.parent
 HOOKS = REPO / "templates" / "hooks"
@@ -161,7 +162,7 @@ def _verdicts_ps1(urls: list, env: dict, tmp_path: Path) -> list:
         "$urls = [System.IO.File]::ReadAllText($Data, [System.Text.Encoding]::UTF8) | ConvertFrom-Json\n"
         "foreach ($u in $urls) { [Console]::Out.WriteLine((Invoke-VcoSsrfCheck -Url $u -HooksDir $Hooks).Verdict) }\n",
         encoding="utf-8")
-    res = subprocess.run([shutil.which("pwsh") or "pwsh", "-NoProfile", "-File", str(driver), "-Lib", str(LIB_PS1),
+    res = subprocess.run([shutil.which("pwsh") or "pwsh", *PWSH_BASE_FLAGS, "-File", str(driver), "-Lib", str(LIB_PS1),
                           "-Hooks", str(HOOKS), "-Data", str(data)],
                          capture_output=True, text=True, timeout=300, env=env)
     assert res.returncode == 0, res.stderr
@@ -184,7 +185,7 @@ def test_every_case_through_the_shell_caller(impl: str, env_name: str, tmp_path:
 
 def _run_hook(impl: str, hooks_dir: Path, proj: Path, url: str, env: dict):
     argv = ([_BASH, str(hooks_dir / "pre-tool-use.sh")] if impl == "sh" else
-            [shutil.which("pwsh") or "pwsh", "-NoProfile", "-File", str(hooks_dir / "pre-tool-use.ps1")])
+            [shutil.which("pwsh") or "pwsh", *PWSH_BASE_FLAGS, "-File", str(hooks_dir / "pre-tool-use.ps1")])
     payload = json.dumps({"tool_name": "WebFetch", "tool_input": {"url": url, "prompt": "x"},
                           "session_id": "r18"})
     env = dict(env, CLAUDE_PROJECT_DIR=str(proj))

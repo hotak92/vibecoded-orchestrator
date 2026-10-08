@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SH_HOOK = REPO_ROOT / "templates" / "hooks" / "lean-ctx-rewrite.sh"
@@ -203,7 +204,7 @@ def _run_ps1_hook(cmd: str, tmp_path: Path, *, env_file: str | None = None,
         (proj / ".claude").mkdir(exist_ok=True)
         (proj / ".claude" / "env").write_text(env_file, encoding="utf-8")
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(PS1_HOOK)],
         input=_payload(cmd, **(extra_tool_input or {})),
         capture_output=True, text=True, cwd=proj, env=env, timeout=60,
     )
@@ -755,7 +756,7 @@ class TestPs1HookParity:
         proj = tmp_path / "proj"
         proj.mkdir(parents=True, exist_ok=True)
         res = subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(PS1_HOOK)],
             input=_payload("npm install"), capture_output=True, text=True,
             cwd=proj, env=env, timeout=60,
         )
@@ -782,7 +783,7 @@ class TestTeeWrapperPs1:
         cmdfile.write_text(cmd_text, encoding="utf-8")
         env = dict(os.environ)
         return subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(TEE_PS1),
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(TEE_PS1),
              str(fake), str(rawdir), str(cmdfile), ttl],
             capture_output=True, text=True, cwd=tmp_path, env=env,
             timeout=120,
@@ -847,7 +848,7 @@ class TestTeeWrapperPs1:
         cmdfile = tmp_path / "run.cmd"
         cmdfile.write_text("seq 1 5", encoding="utf-8")
         res = subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(TEE_PS1),
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(TEE_PS1),
              str(fake), str(blocker / "sub"), str(cmdfile), "168"],
             capture_output=True, text=True, cwd=tmp_path, timeout=120,
         )
@@ -870,7 +871,7 @@ class TestTeeWrapperPs1:
         env = dict(os.environ)
         env["PATH"] = f"{shim}{os.pathsep}{env.get('PATH', '')}"
         res = subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(TEE_PS1),
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(TEE_PS1),
              str(fake), str(rawdir), str(cmdfile), "168"],
             capture_output=True, text=True, cwd=tmp_path, env=env,
             timeout=120,
@@ -1030,7 +1031,7 @@ class TestOneQuotePairSharedHelper:
             "[Console]::Out.Write((Strip-OneQuotePair $raw))"
         )
         res = subprocess.run(
-            ["pwsh", "-NoProfile", "-Command", script],
+            ["pwsh", *PWSH_BASE_FLAGS, "-Command", script],
             input=raw, capture_output=True, text=True, cwd=tmp_path,
             timeout=60,
         )
@@ -1160,7 +1161,7 @@ def _run_lib(lib: Path, cmd_text: str, tmp_path: Path):
     cmdfile.write_text(cmd_text, encoding="utf-8")
     env = dict(os.environ)
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(lib),
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(lib),
          str(fake), str(rawdir), str(cmdfile), "168"],
         capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120,
     )
@@ -1175,7 +1176,7 @@ def _run_harness(harness_src: str, tmp_path: Path, target: Path):
     env["ACL_MARKER"] = str(marker)
     env["ACL_PATH"] = str(target)
     res = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(harness)],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(harness)],
         capture_output=True, text=True, cwd=tmp_path, env=env, timeout=60,
     )
     return res, marker

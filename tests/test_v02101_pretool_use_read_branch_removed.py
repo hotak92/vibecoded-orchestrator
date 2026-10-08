@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS = REPO_ROOT / "templates" / "hooks"
@@ -125,7 +126,7 @@ def test_ps1_read_branch_no_longer_injects(tmp_path):
     root, code_file = _read_sandbox(tmp_path)
     marker = tmp_path / "cg_cli_ran"
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(HOOKS / "pre-tool-use.ps1"),
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / "pre-tool-use.ps1"),
          "Read", ""],
         input=json.dumps(_read_payload(code_file)), capture_output=True,
         text=True, env=_hook_env(root), timeout=120, cwd=str(root))
@@ -167,7 +168,7 @@ def test_ps1_grep_branch_no_longer_injects(tmp_path):
     root, code_file = _read_sandbox(tmp_path)
     marker = tmp_path / "cg_cli_ran"
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(HOOKS / "pre-tool-use.ps1"),
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / "pre-tool-use.ps1"),
          "Grep", ""],
         input=json.dumps(_grep_payload("alpha_widget")), capture_output=True,
         text=True, env=_hook_env(root), timeout=120, cwd=str(root))
@@ -295,7 +296,7 @@ def test_ps1_read_context_inject_wrapper_emits_posttooluse(tmp_path):
                "tool_input": {"file_path": str(code_file)},
                "tool_response": {"content": _CODE_CONTENT}}
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(HOOKS / "read-context-inject.ps1")],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / "read-context-inject.ps1")],
         input=json.dumps(payload), capture_output=True, text=True,
         env=_wrapper_env(root), timeout=120, cwd=str(root))
     assert proc.returncode == 0, proc.stderr[-2000:]

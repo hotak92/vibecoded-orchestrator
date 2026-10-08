@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parent.parent
 HOOKS = REPO / "templates" / "hooks"
@@ -272,7 +273,7 @@ def _run_pre_edit(orch: Path, proj: Path, file_name: str, tmp_path: Path):
         "RL_HUB_POST_DISABLED": "1",
     })
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-File",
+        ["pwsh", *PWSH_BASE_FLAGS, "-File",
          str(orch / "templates" / "hooks" / "pre-edit-context-inject.ps1")],
         input=json.dumps(payload), capture_output=True, text=True, timeout=120, env=env,
     )

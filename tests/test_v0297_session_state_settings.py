@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOK = REPO / "templates" / "hooks" / "context-size-check.sh"
@@ -178,7 +179,7 @@ def test_the_powershell_hook_applies_the_manifests_bounds(setting: dict, tmp_pat
         if value:
             env[setting["key"]] = value
         done = subprocess.run(
-            [str(PWSH), "-NoProfile", "-NonInteractive", "-Command",
+            [str(PWSH), *PWSH_BASE_FLAGS, "-NonInteractive", "-Command",
              f'. "{lib}"; Resolve-Threshold -Key "{setting["key"]}" -Default {setting["default"]}'],
             env=env, capture_output=True, text=True, timeout=60,
         )
@@ -206,7 +207,7 @@ def test_the_powershell_sibling_resolves_the_same_way(tmp_path: Path) -> None:
                    VCT_CLAUDE_DIR=str(tmp_path / "ch"), HOME=str(tmp_path / "home"))
         env.update(extra)
         done = subprocess.run(
-            [str(PWSH), "-NoProfile", "-File", str(hooks / "context-size-check.ps1")],
+            [str(PWSH), *PWSH_BASE_FLAGS, "-File", str(hooks / "context-size-check.ps1")],
             input="{}", capture_output=True, text=True, cwd=proj, env=env, timeout=120,
         )
         assert done.returncode == 0, done.stderr

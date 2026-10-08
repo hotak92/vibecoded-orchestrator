@@ -75,6 +75,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -801,7 +802,7 @@ def ps_rig(tmp_path):
         for old in tmp_path.glob("marker.txt*"):
             old.unlink()
         proc = subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(hooks / DISPATCHER_PS1.name)],
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(hooks / DISPATCHER_PS1.name)],
             input=body, capture_output=True, text=True, env=env,
             timeout=120, cwd=str(proj),
         )

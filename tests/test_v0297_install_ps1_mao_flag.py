@@ -32,6 +32,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 INSTALL_PS1 = REPO / "install.ps1"
@@ -100,7 +101,7 @@ def _run_forwarding(tmp_path: Path, overrides: dict[str, object]) -> tuple[list[
     ]
     harness.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(harness)],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(harness)],
         capture_output=True,
         text=True,
         timeout=120,

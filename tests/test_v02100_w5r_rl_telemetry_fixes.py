@@ -31,6 +31,7 @@ import urllib.error
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MCP_DIR = REPO_ROOT / "claude_mcp_servers"
@@ -539,7 +540,7 @@ def test_each_hook_tags_its_own_task_type(tmp_path, shell, hook, expected, paylo
         pytest.skip("pwsh on POSIX")
     orch, proj, target, env = _tt_rig(tmp_path)
     argv = (["bash", str(HOOKS / f"{hook}.sh")] if shell == "sh"
-            else ["pwsh", "-NoProfile", "-File", str(HOOKS / f"{hook}.ps1")])
+            else ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / f"{hook}.ps1")])
     if hook == "pre-tool-use":
         argv += ["Edit", ""]
     if hook == "agent-brief-kg-inject":

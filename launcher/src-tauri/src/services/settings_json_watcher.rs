@@ -103,6 +103,23 @@ const PROJECT_LIST_RE_POLL: Duration = Duration::from_secs(30);
 //   * NO baseline yet (first event / cache miss / unreadable file) →
 //     fail-OPEN: reload + seed the cache.
 //
+// v0.2.102 (W4-F defect A): the fail-open above was reachable on EVERY
+// launcher boot — the baseline cache is born EMPTY, so the FIRST
+// settings.json event per project after start (typically the launcher's
+// own env re-projection, `refresh_all_projects_env_with_db`) SIGHUPped
+// every live MCP even when the write was a no-op for MCP-relevant env
+// (launcher log 2026-10-08 14:21:59: "auto-reload: signaled 1 MCP
+// process(es)" with no user-visible change). Fix at the root: `sync_watches`
+// SEEDS the baseline for every settings.json newly added to the watch set
+// (see `seed_baselines` / `seed_new_watch_baselines`), so only a REAL
+// change of MCP-relevant env AFTER that point signals. The fail-open
+// `old_hash == None` arm stays for the residual cases where seeding could
+// not produce a baseline: the file did not exist / was unreadable at watch
+// time, or its body is neither strict JSON nor readable by the JSONC
+// bridge — for those we still cannot PROVE MCP-irrelevance, and a needless
+// reload is the benign failure compared to a live MCP silently keeping
+// stale env (DENYLIST discipline above).
+//
 // The manual "Reload MCPs" button (the `reload_mcps_sighup` Tauri command)
 // stays UNCONDITIONAL — only this watcher-auto path gets the diff-guard.
 //
@@ -403,6 +420,12 @@ struct WatchState {
     /// seeded a baseline for) this file. Keyed by the canonical
     /// `.claude/settings.json` PathBuf from the modify event. A cache miss
     /// (first-ever event for a path) fails OPEN — see `mcp_env_changed`.
+    ///
+    /// v0.2.102 (W4-F defect A): `sync_watches` seeds an entry for every
+    /// settings.json newly added to the watch set (at watcher start and on
+    /// each 30 s re-poll that picks up a new project), so the first event
+    /// after boot is DIFFED, not fail-opened. A cache miss now means the
+    /// file was absent/unreadable at seed time — still fail-open.
     last_mcp_env_hash: Mutex<HashMap<PathBuf, u64>>,
     /// v0.2.72 (F1) per-path pending set: every settings.json modify event
     /// inserts its path here (and bumps `last_event`). The surviving
@@ -584,6 +607,7 @@ async fn sync_watches<R: Runtime + 'static>(
     let mut watched = state.watched.lock().await;
 
     // Add new.
+    let mut added: Vec<PathBuf> = Vec::new();
     for dir in desired.difference(&watched) {
         if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
             tracing::warn!(
@@ -593,7 +617,15 @@ async fn sync_watches<R: Runtime + 'static>(
             );
             continue;
         }
+        added.push(dir.clone());
     }
+    // v0.2.102 (W4-F defect A): seed the diff-guard baseline for every
+    // settings.json we just started watching, so the FIRST event after
+    // watcher start (typically the launcher's own env re-projection) is
+    // DIFFED against the on-disk body instead of failing open into a
+    // SIGHUP of every live MCP. Before any watch exists no event can be
+    // pending, so seeding here cannot race an in-flight decision.
+    seed_new_watch_baselines(&app, &state, &added).await;
     // Remove gone.
     let removed: Vec<PathBuf> = watched.difference(&desired).cloned().collect();
     for dir in &removed {
@@ -605,6 +637,49 @@ async fn sync_watches<R: Runtime + 'static>(
     // (and any not-yet-drained pending events) alongside the unwatch.
     state.prune_removed_dirs(&removed).await;
     Ok(())
+}
+
+/// v0.2.102 (W4-F defect A): IO/lock wrapper around [`seed_baselines`] for
+/// the dirs `sync_watches` just added to the watch set. Reads each
+/// `<project>/.claude/settings.json` body (absent file → no seed → that
+/// path keeps the fail-open first event), hashes non-strict-JSON bodies
+/// through the SAME bridge rule as fire-time, and seeds the cache under
+/// its lock. Soft-fail throughout: a bridge error just seeds fewer paths.
+async fn seed_new_watch_baselines<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &WatchState,
+    new_dirs: &[PathBuf],
+) {
+    if new_dirs.is_empty() {
+        return;
+    }
+    let bodies: HashMap<PathBuf, String> = new_dirs
+        .iter()
+        .map(|dir| {
+            let path = dir.join("settings.json");
+            (
+                path.clone(),
+                std::fs::read_to_string(&path).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let root = app
+        .try_state::<Db>()
+        .and_then(|db| crate::services::vco_lib_bridge::resolve_orchestrator_root(&db));
+    let jsonc = {
+        let bodies = bodies.clone();
+        tokio::task::spawn_blocking(move || jsonc_hashes(root.as_deref(), &bodies))
+            .await
+            .unwrap_or_default()
+    };
+    let mut cache = state.last_mcp_env_hash.lock().await;
+    let seeded = seed_baselines(&bodies, &jsonc, &mut cache);
+    if !seeded.is_empty() {
+        tracing::debug!(
+            "[settings_json_watcher] seeded {} diff-guard baseline(s) for newly watched settings.json (first no-op write after start will NOT SIGHUP)",
+            seeded.len()
+        );
+    }
 }
 
 /// `<project>/.claude/` — the parent dir of settings.json. We watch
@@ -751,6 +826,46 @@ fn evaluate_drained_paths(
         }
     }
     decision
+}
+
+/// v0.2.102 (W4-F defect A): seed diff-guard baselines for the settings.json
+/// files of newly watched project dirs, from the body ON DISK at watch time.
+///
+/// Pre-fix, `last_mcp_env_hash` was born empty and the first event per
+/// project after every launcher boot fail-opened into a SIGHUP of every
+/// live MCP — including for the launcher's own byte-idempotent env
+/// re-projection (`config_projection.apply_project_env`, pinned
+/// byte-idempotent by
+/// `tests/test_config_projection.py::test_apply_settings_json_idempotent`).
+///
+/// Semantics (pure core, injected readers for unit tests):
+///   * an ALREADY-CACHED path is left untouched (a re-poll that re-sees an
+///     existing watch must not clobber a baseline advanced by later events);
+///   * a body that is strict JSON is hashed with `hash_mcp_env`;
+///   * a body that is not strict JSON is hashed from `jsonc` (the bridge
+///     map, same rule as `evaluate_drained_paths`);
+///   * a missing/unreadable/unbridgeable body seeds NOTHING — that path
+///     keeps the fail-open reload for its first event (DENYLIST discipline:
+///     we cannot prove MCP-irrelevance without reading the file).
+///
+/// Returns the paths actually seeded (for logging / tests).
+fn seed_baselines(
+    bodies: &HashMap<PathBuf, String>,
+    jsonc: &HashMap<PathBuf, u64>,
+    cache: &mut HashMap<PathBuf, u64>,
+) -> Vec<PathBuf> {
+    let mut seeded = Vec::new();
+    for (path, body) in bodies {
+        if cache.contains_key(path) {
+            continue;
+        }
+        let Some(hash) = hash_mcp_env(body).or_else(|| jsonc.get(path).copied()) else {
+            continue;
+        };
+        cache.insert(path.clone(), hash);
+        seeded.push(path.clone());
+    }
+    seeded
 }
 
 /// Invoke the same `reload_mcps_with` core that the Tauri command
@@ -1456,6 +1571,171 @@ mod tests {
         assert_eq!(
             state.last_mcp_env_hash.lock().await.get(&p).copied(),
             Some(7u64)
+        );
+    }
+
+    // ─── v0.2.102 (W4-F defect A) baseline seeding at watch time ─────────
+    //
+    // These pin the fix for the boot-time fail-open: pre-fix,
+    // `last_mcp_env_hash` was born empty, so the FIRST settings.json
+    // event per project after every launcher boot (typically the
+    // launcher's own env re-projection) SIGHUPped every live MCP even
+    // when MCP-relevant env did not move. Post-fix, `sync_watches` seeds
+    // a baseline per newly watched settings.json, so that first no-op
+    // write is DIFFED and skipped.
+
+    /// LEAVE-ALONE (the defect itself): watcher starts (seeds the baseline
+    /// from the on-disk body), then the first event is a byte-idempotent
+    /// re-projection write → must NOT reload. Pre-fix the empty cache
+    /// fail-opened this exact sequence into a SIGHUP.
+    #[test]
+    fn seeded_first_noop_write_after_watcher_start_does_not_reload() {
+        let path = PathBuf::from("/proj/.claude/settings.json");
+        let body = settings_with_env(&[("KG_COLLECTION", "MyKG")], "stable");
+
+        // Watcher start: seed the baseline from the body on disk.
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        let seeded = seed_baselines(
+            &[(path.clone(), body.clone())].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        assert_eq!(seeded, vec![path.clone()], "the new watch must be seeded");
+        assert!(
+            cache.contains_key(&path),
+            "baseline must exist before any event"
+        );
+
+        // First event after start: the same MCP-relevant env re-written.
+        let decision =
+            evaluate_drained_paths(&[path.clone()], &mut cache, |_| body.clone(), |_| None);
+        assert!(
+            !decision.reload,
+            "the first no-op settings.json write after watcher start must NOT SIGHUP"
+        );
+    }
+
+    /// ACT: a REAL MCP-relevant env change after the seeded baseline →
+    /// still reloads (seeding must not over-suppress).
+    #[test]
+    fn seeded_real_env_change_after_watcher_start_reloads() {
+        let path = PathBuf::from("/proj/.claude/settings.json");
+        let at_start = settings_with_env(&[("KG_COLLECTION", "MyKG")], "s");
+        let changed = settings_with_env(&[("KG_COLLECTION", "OtherKG")], "s");
+
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        seed_baselines(
+            &[(path.clone(), at_start.clone())].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+
+        let decision =
+            evaluate_drained_paths(&[path.clone()], &mut cache, |_| changed.clone(), |_| None);
+        assert!(
+            decision.reload,
+            "a real MCP-relevant env change after start must still reload"
+        );
+    }
+
+    /// A newly watched project whose settings.json is JSONC gets seeded too
+    /// (through the same bridge-hash rule fire-time uses), not left to
+    /// fail-open on its first event.
+    #[test]
+    fn newly_watched_jsonc_project_is_seeded_through_the_bridge_hash() {
+        let path = PathBuf::from("/proj/.claude/settings.json");
+        let jsonc = "// team settings\n{\n  \"env\": { \"KG_COLLECTION\": \"MyKG\", },\n}\n";
+        assert_eq!(hash_mcp_env(jsonc), None, "fixture is not strict JSON");
+        let strict = settings_with_env(&[("KG_COLLECTION", "MyKG")], "x");
+        let bridge: HashMap<PathBuf, u64> = [(path.clone(), hash_mcp_env(&strict).unwrap())].into();
+
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        let seeded = seed_baselines(
+            &[(path.clone(), jsonc.to_string())].into(),
+            &bridge,
+            &mut cache,
+        );
+        assert_eq!(seeded, vec![path.clone()], "the JSONC watch must be seeded");
+
+        // Idempotent JSONC rewrite → skipped, exactly like strict JSON.
+        let decision = evaluate_drained_paths(
+            &[path.clone()],
+            &mut cache,
+            |_| jsonc.to_string(),
+            |p| bridge.get(p).copied(),
+        );
+        assert!(
+            !decision.reload,
+            "an idempotent JSONC write must not SIGHUP"
+        );
+    }
+
+    /// Leave-alone for the cache itself: re-seeding a path that already has
+    /// a baseline (a 30 s re-poll that re-sees an existing watch, or a
+    /// project re-added at the same path before prune) must NOT clobber the
+    /// advanced baseline — only genuinely cache-missing paths are seeded.
+    #[test]
+    fn seeding_skips_already_cached_paths() {
+        let path = PathBuf::from("/proj/.claude/settings.json");
+        let at_start = settings_with_env(&[("KG_COLLECTION", "MyKG")], "s");
+        let advanced = settings_with_env(&[("KG_COLLECTION", "NewerKG")], "s");
+
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        seed_baselines(
+            &[(path.clone(), at_start.clone())].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        // A later event advanced the baseline to `advanced`.
+        let _ = evaluate_drained_paths(&[path.clone()], &mut cache, |_| advanced.clone(), |_| None);
+        assert_eq!(cache.get(&path).copied(), hash_mcp_env(&advanced));
+
+        // Re-seed pass offers the STALE body again → cache must not regress.
+        let seeded = seed_baselines(
+            &[(path.clone(), at_start)].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        assert!(
+            seeded.is_empty(),
+            "an already-cached path must not be re-seeded"
+        );
+        assert_eq!(
+            cache.get(&path).copied(),
+            hash_mcp_env(&advanced),
+            "the advanced baseline must survive a re-seed pass"
+        );
+    }
+
+    /// Residual fail-open, by design (DENYLIST discipline): a settings.json
+    /// that is absent / unreadable at watch time seeds NO baseline, so its
+    /// first event still fails OPEN — we cannot prove MCP-irrelevance
+    /// without reading the file.
+    #[test]
+    fn seeding_absent_settings_json_keeps_fail_open_first_event() {
+        let path = PathBuf::from("/fresh-proj/.claude/settings.json");
+
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        // Absent file → read_to_string fails → empty body → no strict-JSON
+        // hash, nothing in the bridge map → no seed.
+        let seeded = seed_baselines(
+            &[(path.clone(), String::new())].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        assert!(seeded.is_empty());
+        assert!(!cache.contains_key(&path));
+
+        let first_body = settings_with_env(&[("KG_COLLECTION", "MyKG")], "s");
+        let decision = evaluate_drained_paths(
+            &[path.clone()],
+            &mut cache,
+            |_| first_body.clone(),
+            |_| None,
+        );
+        assert!(
+            decision.reload,
+            "an unseedable file must keep the fail-open first event"
         );
     }
 }

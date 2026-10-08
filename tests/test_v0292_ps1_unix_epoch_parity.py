@@ -40,6 +40,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -64,7 +65,7 @@ def _eval_ps(exe: str, expression: str, tmp_path: Path) -> int:
     script = tmp_path / "epoch.ps1"
     script.write_text(f"Write-Output ({expression})\n", encoding="utf-8")
     out = subprocess.run(
-        [exe, "-NoProfile", "-File", str(script)],
+        [exe, *PWSH_BASE_FLAGS, "-File", str(script)],
         capture_output=True, text=True, timeout=60,
     )
     assert out.returncode == 0, out.stderr

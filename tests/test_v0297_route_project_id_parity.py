@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -60,7 +61,7 @@ def _pwsh_pid(root: Path) -> str:
     hooks = str(HOOKS).replace("'", "''")
     proj = str(root).replace("'", "''")
     out = subprocess.run(
-        [exe, "-NoProfile", "-NonInteractive", "-Command",
+        [exe, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command",
          f". '{lib}'; Initialize-VcoRoute -HooksDir '{hooks}' -ProjectRoot '{proj}'; "
          "[Console]::Out.Write([string]$script:VcoRouteProjectId)"],
         capture_output=True, text=True, env=_env_without_pid(), timeout=120, check=True)

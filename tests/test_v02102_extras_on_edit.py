@@ -46,6 +46,7 @@ from typing import Optional
 import pytest
 
 from vco_lib import codegraph_extras_refresh as cer
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = REPO_ROOT / "tests" / "fixtures" / "codegraph_extra_sync_argv.json"
@@ -498,7 +499,7 @@ def _run_route_ps1(project_root: Path, touched: Path, session: str, env: dict) -
         f"Initialize-VcoRoute -HooksDir '{HOOKS_DIR}' -ProjectRoot '{project_root}'; "
         f"Invoke-VcoRouteTouchedPath -Path '{touched}' -SessionId '{session}'"
     )
-    return subprocess.run(["pwsh", "-NoProfile", "-Command", cmd],
+    return subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-Command", cmd],
                           capture_output=True, text=True, timeout=120, env=env)
 
 
@@ -915,7 +916,7 @@ def test_ps1_drain_ignores_a_leaked_legacy_list_file(tmp_path: Path) -> None:
     (fx["state"] / f"codegraph_drain_extra_list_{_md5('/srv/clone')}.txt").write_text(
         "/srv/clone/a.py\n"
     )
-    r = subprocess.run(["pwsh", "-NoProfile", "-File", str(DRAIN_PS1)],
+    r = subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-File", str(DRAIN_PS1)],
                        input=json.dumps({"session_id": "sessL"}),
                        capture_output=True, text=True, timeout=120,
                        env=_drain_env(root, fx))
@@ -940,7 +941,7 @@ def test_ps1_route_extra_edit_lands_in_extra_queue(tmp_path: Path) -> None:
         f"Initialize-VcoRoute -HooksDir '{HOOKS_DIR}' -ProjectRoot '{proj}'; "
         f"Invoke-VcoRouteTouchedPath -Path '{touched}' -SessionId 'sess1'"
     )
-    r = subprocess.run(["pwsh", "-NoProfile", "-Command", cmd],
+    r = subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-Command", cmd],
                        capture_output=True, text=True, timeout=120,
                        env=_route_env(tmp_path))
     assert r.returncode == 0, r.stderr
@@ -964,7 +965,7 @@ def test_ps1_route_primary_edit_stays_in_primary_queue(tmp_path: Path) -> None:
         f"Initialize-VcoRoute -HooksDir '{HOOKS_DIR}' -ProjectRoot '{proj}'; "
         f"Invoke-VcoRouteTouchedPath -Path '{touched}' -SessionId 'sess1'"
     )
-    r = subprocess.run(["pwsh", "-NoProfile", "-Command", cmd],
+    r = subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-Command", cmd],
                        capture_output=True, text=True, timeout=120,
                        env=_route_env(tmp_path))
     assert r.returncode == 0, r.stderr
@@ -987,7 +988,7 @@ def test_ps1_drain_spawns_queued_refresh_inside_the_rate_limit(tmp_path: Path) -
     primary.write_text(f"{root}/m.py\n")
     (state / "codegraph_drain_last_sync.ts").write_text(fx["now"])
 
-    r = subprocess.run(["pwsh", "-NoProfile", "-File", str(DRAIN_PS1)],
+    r = subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-File", str(DRAIN_PS1)],
                        input=json.dumps({"session_id": session}),
                        capture_output=True, text=True, timeout=120,
                        env=_drain_env(root, fx))

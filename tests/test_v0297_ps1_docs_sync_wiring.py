@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOK_PS1 = REPO / "templates" / "hooks" / "post-file-edit.ps1"
@@ -91,7 +92,7 @@ def _run_hook(exe: str, project: Path, edited: Path) -> subprocess.CompletedProc
     env.pop("VCT_VENV", None)
     payload = {"tool_input": {"file_path": str(edited)}}
     return subprocess.run(
-        [exe, "-NoProfile", "-File", str(HOOK_PS1)],
+        [exe, *PWSH_BASE_FLAGS, "-File", str(HOOK_PS1)],
         input=json.dumps(payload),
         capture_output=True,
         text=True,

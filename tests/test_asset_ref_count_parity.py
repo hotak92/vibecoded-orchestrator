@@ -26,6 +26,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SH_LIB = REPO_ROOT / "scripts" / "lib" / "asset-ref-count.sh"
@@ -134,7 +135,7 @@ def test_powershell_helper_counts_correctly(tmp_path: Path):
         f"Get-AssetRefCount -Path '{binary}'"
     )
     out = subprocess.run(
-        [pwsh, "-NoProfile", "-NonInteractive", "-Command", cmd],
+        [pwsh, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", cmd],
         capture_output=True,
         text=True,
         timeout=20,

@@ -28,6 +28,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BAT = REPO_ROOT / "first-install.bat"
@@ -86,7 +87,7 @@ def test_install_ps1_help_flag():
     proc = subprocess.run(
         [
             "powershell.exe",
-            "-NoProfile",
+            *PWSH_BASE_FLAGS,
             "-ExecutionPolicy",
             "Bypass",
             "-File",

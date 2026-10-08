@@ -40,6 +40,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SH_HOOK = REPO_ROOT / "templates" / "hooks" / "lean-ctx-rewrite.sh"
@@ -336,7 +337,7 @@ class TestPs1Parity:
         cwd = tmp_path / "proj"
         cwd.mkdir(exist_ok=True)
         return subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(PS1_HOOK)],
             input=_payload(cmd), capture_output=True, text=True,
             cwd=cwd, env=env, timeout=30,
         )

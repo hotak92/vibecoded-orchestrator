@@ -46,6 +46,7 @@ from tests.test_v02101_router_surfaces import (  # noqa: E402
     needs_bash,
     needs_pwsh,
 )
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 SCRIPTS = REPO_ROOT / "claude_mcp_servers" / "scripts"
 ROUTER = SCRIPTS / "hook_context_router.py"
@@ -287,7 +288,7 @@ class TestBatch8Ps1ExecutedEndToEnd:
         _write_state(rig, "sess-w3r", "", "pre_bash_ps1")
         env = rig.env()
         r = subprocess.run(
-            ["pwsh", "-NoProfile", "-File",
+            ["pwsh", *PWSH_BASE_FLAGS, "-File",
              str(HOOKS / "post-bash-context-record.ps1")],
             input=json.dumps(_post_payload()), capture_output=True, text=True,
             timeout=120, cwd=str(rig.proj), env=env)

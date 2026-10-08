@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.child_env import child_env
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -63,7 +64,7 @@ def _project(tmp_path: Path) -> Path:
 
 def _run(impl: str, proj: Path, command: str, env: dict, sid: str = "s1") -> subprocess.CompletedProcess:
     argv = ([BASH, str(HOOKS / "pre-tool-use.sh")] if impl == "sh" else
-            [PWSH, "-NoProfile", "-NonInteractive", "-File", str(HOOKS / "pre-tool-use.ps1")])
+            [PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(HOOKS / "pre-tool-use.ps1")])
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "session_id": sid})
     env = dict(env, CLAUDE_PROJECT_DIR=str(proj))
     return subprocess.run(argv, input=payload, capture_output=True, text=True,

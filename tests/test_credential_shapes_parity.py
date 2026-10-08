@@ -36,6 +36,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
@@ -172,7 +173,7 @@ foreach ($case in $doc.cases) {
 def test_powershell_mirror_matches_fixture():
     env = dict(os.environ, MIRROR=str(PS1_MIRROR), FIXTURE=str(FIXTURE))
     out = subprocess.run(
-        [_PWSH, "-NoProfile", "-Command", _PS_EVAL],
+        [_PWSH, *PWSH_BASE_FLAGS, "-Command", _PS_EVAL],
         env=env, capture_output=True, text=True, timeout=180,
     )
     assert out.returncode == 0, f"pwsh mirror failed: {out.stderr[:800]}"
@@ -475,7 +476,7 @@ def test_bash_mirror_ids_and_labels_match_ssot(context):
 def test_powershell_mirror_ids_and_labels_match_ssot(context):
     env = dict(os.environ, MIRROR=str(PS1_MIRROR), CS_CTX=context)
     out = subprocess.run(
-        [_PWSH, "-NoProfile", "-Command", _PS_LABELS],
+        [_PWSH, *PWSH_BASE_FLAGS, "-Command", _PS_LABELS],
         env=env, capture_output=True, text=True, timeout=120,
     )
     assert out.returncode == 0, out.stderr[:800]
@@ -535,7 +536,7 @@ def test_bash_mirror_pattern_strings_are_identical_to_ssot(context):
 def test_powershell_mirror_pattern_strings_are_identical_to_ssot(context):
     env = dict(os.environ, MIRROR=str(PS1_MIRROR), CS_CTX=context)
     out = subprocess.run(
-        [_PWSH, "-NoProfile", "-Command", _PS_PATTERNS],
+        [_PWSH, *PWSH_BASE_FLAGS, "-Command", _PS_PATTERNS],
         env=env, capture_output=True, text=True, timeout=120,
     )
     assert out.returncode == 0, out.stderr[:800]

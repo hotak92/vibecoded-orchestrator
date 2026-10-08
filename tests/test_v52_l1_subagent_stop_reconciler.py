@@ -47,6 +47,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS_DIR = REPO_ROOT / "templates" / "hooks"
@@ -943,7 +944,7 @@ def test_powershell_syntax_clean(ps1_file):
         "else { exit 0 }"
     )
     result = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command", probe],
+        ["pwsh", *PWSH_BASE_FLAGS, "-Command", probe],
         capture_output=True,
         text=True,
         timeout=15,
@@ -998,7 +999,7 @@ def test_snapshot_schema_parity_sh_ps1(tmp_path):
         f"-SnapshotDir '{ps1_snap_dir}' | Out-Null"
     )
     ps1_result = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command", cmd],
+        ["pwsh", *PWSH_BASE_FLAGS, "-Command", cmd],
         capture_output=True,
         text=True,
         timeout=30,

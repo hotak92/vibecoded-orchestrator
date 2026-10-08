@@ -30,6 +30,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -90,7 +91,7 @@ def _run(flavour: str, hooks: Path, payload: str, env: dict) -> subprocess.Compl
     if flavour == "sh":
         argv = ["bash", str(hooks / "stop-failure-notify.sh")]
     else:
-        argv = [PWSH, "-NoProfile", "-NonInteractive", "-File", str(hooks / "stop-failure-notify.ps1")]
+        argv = [PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(hooks / "stop-failure-notify.ps1")]
     return subprocess.run(argv, input=payload.encode("utf-8"), env=env,
                           capture_output=True, timeout=120)
 
