@@ -1310,6 +1310,18 @@ def call_ollama(prompt: str, model: str = OLLAMA_DEFAULT_MODEL) -> str:
     family = model.split(":", 1)[0].lower()
     if family.startswith("qwen3"):
         body["think"] = False  # Ollama 0.5+ recognizes this; older versions ignore
+    # v0.2.102 W4-E: the shared keep_alive policy applies to GENERATE
+    # requests too (one home: vco_lib.embedding_providers.ollama; default
+    # "10m", VCO_OLLAMA_KEEP_ALIVE overrides, empty string = omit). This
+    # module is stdlib-only by design, so the resolver import is guarded and
+    # the literal fallback MUST match _KEEP_ALIVE_DEFAULT in that module.
+    try:
+        from vco_lib.embedding_providers.ollama import _keep_alive as _ka
+        _keep_alive = _ka()
+    except Exception:
+        _keep_alive = "10m"
+    if _keep_alive is not None:
+        body["keep_alive"] = _keep_alive
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         f"{OLLAMA_URL}/api/generate",

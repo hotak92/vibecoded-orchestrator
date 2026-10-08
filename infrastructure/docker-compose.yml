@@ -199,6 +199,18 @@ services:
       # instead, set VCT_OLLAMA_VOLUME_NAME below.
       - ${VCT_OLLAMA_DATA_SOURCE:-ollama_data}:/root/.ollama
     environment:
+      # v0.2.102 W4-E (owner ruling 2026-10-08): server-side keep_alive
+      # backstop for requests that carry no request-level keep_alive — 10m
+      # (was: Ollama's own ~5m; the 24h experiment pinned 8.3 GB of VRAM
+      # idle after one KG search). VCO's clients send 10m per request
+      # (VCO_OLLAMA_KEEP_ALIVE overrides).
+      OLLAMA_KEEP_ALIVE: "10m"
+      # v0.2.102 W4-E: projects SHARE one model copy and queue on it;
+      # Ollama's default queue cap (512) answers the excess with 503.
+      # 1000 (owner: never lower — kg-sync on a big project). Takes effect
+      # when the container is recreated (the update's compose step does
+      # that for VCO-managed services whose config changed).
+      OLLAMA_MAX_QUEUE: "1000"
       OLLAMA_ORIGINS: "*"
       OLLAMA_FLASH_ATTENTION: "1"
       OLLAMA_KV_CACHE_TYPE: q8_0

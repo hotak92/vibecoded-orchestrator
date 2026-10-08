@@ -138,17 +138,29 @@ def call_ollama(model: str, prompt: str, num_predict: int) -> str:
     Uses think=False to disable chain-of-thought for models that support it
     (qwen3.x series). Without this, thinking tokens consume the budget and
     the response field is empty.
+
+    v0.2.102 W4-E: carries the shared keep_alive policy (one home:
+    ``vco_lib.embedding_providers.ollama._with_keep_alive`` — default "10m",
+    ``VCO_OLLAMA_KEEP_ALIVE`` overrides, empty = omit). Guarded import so
+    the script still runs standalone; the literal fallback MUST match
+    ``_KEEP_ALIVE_DEFAULT`` in that module.
     """
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0.3, "num_predict": num_predict},
+    }
+    try:
+        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
+        body = _ka(body)
+    except Exception:
+        body = {**body, "keep_alive": "10m"}
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "think": False,
-                "options": {"temperature": 0.3, "num_predict": num_predict},
-            },
+            json=body,
             timeout=120,
         )
         resp.raise_for_status()
@@ -292,6 +304,15 @@ def get_chunks_from_weaviate(title: str, file_path: str = "") -> list[tuple[int,
             )
         except Exception:
             kg_collection = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
+        # v0.2.102 W4-E: disable the weaviate-client PyPI version lookup
+        # (one home: weaviate_helpers.disable_weaviate_client_pypi_check —
+        # no dedicated client flag exists; the patch keeps every server
+        # health check intact). Guarded so a vco_lib-less run is unchanged.
+        try:
+            from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+            disable_weaviate_client_pypi_check()
+        except Exception:
+            pass
         client = weaviate.connect_to_local(host="localhost", port=8081, grpc_port=50052)
         try:
             coll = client.collections.get(kg_collection)

@@ -7,9 +7,11 @@ shedding them, and every refusal it can still emit (queue-wait bound exceeded,
 CUDA-OOM load budget exhausted, inference OOM) is a **503 with a Retry-After
 header**. Two client retry layers exist — ``EmbeddingService._retry_once_on_503``
 (sync, used by the analyzer / CLI / MCP query path) and the weaviate MCP's
-``_inline_code_embed_http`` fallback (async). Both must honour the header on the
-same policy, so the mechanism lives HERE once (CLAUDE.md "one concern, one
-home"; the policy values each caller passes stay its own):
+``_inline_code_embed_http`` fallback (async); v0.2.102 W4-E adds the third,
+:func:`retry_transient_embed` (the raw-HTTP fallback legs of the migrate /
+search CLIs, which also retry connection-refused). All must honour the header
+on the same policy, so the mechanism lives HERE once (CLAUDE.md "one concern,
+one home"; the policy values each caller passes stay its own):
 
 * :func:`parse_retry_after` — the header value (delta-seconds or HTTP-date).
 * :func:`error_retry_after` — pull a Retry-After off a raised error (attribute
@@ -77,12 +79,14 @@ __all__ = [
     "parse_retry_after",
     "error_retry_after",
     "is_503_error",
+    "is_connection_error",
     "resolve_503_delay_scale",
     "resolve_503_tolerance",
     "resolve_503_interactive_tolerance",
     "set_503_tolerance_override",
     "reset_503_tolerance_override",
     "compute_503_delay",
+    "retry_transient_embed",
 ]
 
 #: Per-request wall-clock deadline for CodeEmbed HTTP clients. MUST exceed the
@@ -192,6 +196,47 @@ def is_503_error(exc: BaseException) -> bool:
     if status == 503:
         return True
     return "503" in str(exc)
+
+
+# Marker substrings (lowercased) of connection-refused style failures raised
+# through to a generic RuntimeError by the embedding adapters (the adapters
+# wrap ``requests.RequestException`` as ``"<name> network error: <cause>"``,
+# so the cause's wording is all a type-less check can read).
+_CONNECTION_MESSAGE_MARKERS: tuple[str, ...] = (
+    "connection refused",
+    "connection error",
+    "connection reset",
+    "cannot connect",
+    "failed to establish",
+    "connect call failed",
+    "errno 111",
+)
+
+
+def is_connection_error(exc: BaseException) -> bool:
+    """True when ``exc`` looks like a connection-level transport failure
+    (refused / reset / could not establish) — v0.2.102 W4-E item 6.
+
+    The code-embed service is ONE shared container; a request that lands
+    while it is restarting (e.g. mid model-load) fails with connection
+    refused, which is TRANSIENT — the owner rule says queued/busy embeds are
+    retried on the same bounded schedule as a 503, never dropped on the
+    first shot. Timeouts are deliberately NOT matched: a timeout is the
+    bounded-post wedge guard firing, not a restart.
+
+    Stdlib-only detection, no requests/httpx/aiohttp imports (this module is
+    imported from adapters and inside the weaviate MCP process): any class
+    in the MRO whose name contains "connect" (``ClientConnectorError``,
+    ``requests.ConnectionError``, ``httpx.ConnectError``, builtin
+    ``ConnectionError``/``ConnectionResetError``) or any marker substring in
+    the message. Conservative: unknown exceptions fall through to False.
+    """
+    klass = type(exc)
+    for k in klass.__mro__:
+        if "connect" in k.__name__.lower():
+            return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _CONNECTION_MESSAGE_MARKERS)
 
 
 def resolve_503_tolerance() -> float:
@@ -315,3 +360,60 @@ def compute_503_delay(
 
         delay += random.uniform(0.0, delay * jitter_frac)
     return max(0.0, delay)
+
+
+def retry_transient_embed(fn, *args, log=None):
+    """Retry a single SYNC embed HTTP call on 503 / connection errors.
+
+    v0.2.102 W4-E item 6 — the ONE home for the raw-HTTP embed clients that
+    do not go through :meth:`EmbeddingService._retry_once_on_503` (the
+    migrate script's and the search CLI's inline CodeEmbed fallback legs).
+    The code-embed service is a shared container: a 503 means its queue-wait
+    bound was exceeded, a connection error means it is restarting (e.g. mid
+    model-load) — both transient, both retried on the SAME bounded policy as
+    the service-backed paths (Retry-After honoured verbatim, fallback
+    schedule, ``VCO_EMBED_503_TOLERANCE_SECS`` total wait, then the LAST
+    error re-raises — a loud failure, never a silent drop). Non-transient
+    errors re-raise immediately.
+
+    Deliberately does NOT widen ``_retry_once_on_503`` itself: at the
+    EmbeddingService layer a connection refusal must keep falling through to
+    this path's async sibling (the weaviate-MCP inline fallback) rather than
+    double-waiting two tolerances (the r3 double-tolerance regression).
+    """
+    import logging
+    import time as _time
+
+    logger = log or logging.getLogger(__name__)
+    scale = resolve_503_delay_scale(base=DEFAULT_503_FALLBACK_BACKOFFS[0] or 1.0)
+    legacy_bounded = scale == 0.0
+    deadline = _time.monotonic() + resolve_503_tolerance()
+    last_exc: "Exception | None" = None
+    attempt = 0
+    while True:
+        try:
+            return fn(*args)
+        except Exception as exc:  # noqa: BLE001 — inspect, then re-raise
+            if not (is_503_error(exc) or is_connection_error(exc)):
+                raise
+            last_exc = exc
+            attempt += 1
+            if legacy_bounded:
+                if attempt > len(DEFAULT_503_FALLBACK_BACKOFFS):
+                    break  # finite attempts, zero delays (test harness mode)
+                delay = 0.0
+            else:
+                if _time.monotonic() >= deadline:
+                    break  # tolerance spent → re-raise below
+                delay = compute_503_delay(
+                    attempt, error_retry_after(exc), DEFAULT_503_FALLBACK_BACKOFFS, scale
+                )
+            logger.info(
+                "embed backend transiently unavailable (503 / restarting): "
+                "%s — retry %d after %.1fs",
+                exc, attempt, delay,
+            )
+            if delay > 0:
+                _time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc

@@ -178,46 +178,29 @@ async def get_ollama_embedding(text: str) -> list[float] | None:
         except Exception as e:
             server.logger.warning("EmbeddingService.embed_text failed (%s); falling back to inline Ollama", e)
     # Inline fallback: direct Ollama call (preserves pre-v0.2.18 path).
-    # R40 (2026-09-04): num_ctx must be EXPLICIT on every Ollama embed
-    # request — unset means Ollama's small default and silent truncation of
-    # chunk tails. The window is resolved per model from the ONE table that
-    # also sizes the chunks (R40 RESOLVED: 10 240 for qwen3), not hardcoded —
-    # two independent windows for one model is the drifted-duplicate-table
-    # shape that caused a live 4x over-budget bug earlier this cycle.
-    # v0.2.77 Part 9 task 6: keep_alive pins the model resident so the hook
-    # path's inline embed doesn't re-pay the ~1.9 s model reload after any idle
-    # gap. Reuse the ONE resolver in vco_lib.embedding_providers.ollama (no
-    # inline copy). Import is soft — a broken vco_lib is loud elsewhere; here we
-    # degrade to "no keep_alive" rather than break the embed.
+    # v0.2.102 W4-E: the body comes from the ONE shared builder
+    # (vco_lib.embedding_providers.ollama.embed_request_body) so this leg
+    # sends the IDENTICAL load options per model as the canonical adapter —
+    # one runner shared across projects, never a second copy. Import is
+    # soft — a broken vco_lib is loud elsewhere; here we degrade to the
+    # pre-R40 conservative shape rather than break the embed.
     try:
-        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
-        from vco_lib.embedding_providers.ollama import _num_ctx_for_model as _nctx
+        from vco_lib.embedding_providers.ollama import embed_request_body
     except Exception:
-        def _ka(body):  # type: ignore[misc]
-            return body
-
-        def _nctx(model: str) -> int:  # type: ignore[misc]
-            # v0.2.92 R40: never return None here. An UNSET num_ctx means
-            # Ollama's 2048 default, which silently truncates any longer input
-            # and returns HTTP 200 — the failure this fix exists to remove.
-            # 2048 is the conservative floor: it is what we would have got
-            # anyway, but now it is a stated choice rather than an omission.
-            return 2048
+        def embed_request_body(model: str, *, prompt=None, input=None, num_ctx=None):  # type: ignore[misc,assignment]
+            # Degraded standalone shape (vco_lib missing = broken install):
+            # explicit 2048 floor (stated choice, not an omission — an UNSET
+            # num_ctx means Ollama's 2048 default and silent tail loss).
+            return {
+                "model": model,
+                "prompt": prompt,
+                "options": {"num_ctx": num_ctx if num_ctx is not None else 2048},
+                "truncate": False,
+            }
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{server.OLLAMA_URL}/api/embeddings",
-            # v0.2.92 round-3: was a HARDCODED 8192 with no `truncate`, which
-            # (a) contradicted R40 — the window must come from the one home
-            # that also sizes the chunks, or the two drift — and (b) let this
-            # path silently drop the tail, since qwen3 and jina truncate at
-            # HTTP 200 by default. Both corrected here rather than only
-            # reported, which is what an earlier pass did.
-            json=_ka({
-                "model": server.EMBEDDING_MODEL,
-                "prompt": text,
-                "options": {"num_ctx": _nctx(server.EMBEDDING_MODEL)},
-                "truncate": False,
-            }),
+            json=embed_request_body(server.EMBEDDING_MODEL, prompt=text),
             timeout=aiohttp.ClientTimeout(total=30)
         ) as response:
             if response.status != 200:
@@ -233,34 +216,23 @@ async def get_legacy_text_embedding(text: str) -> list[float] | None:
     Used to populate the old 'ollama_embed' named vector for backward compatibility.
     """
     from . import server
+    # v0.2.102 W4-E: ONE shared body builder — identical load options per
+    # model as the canonical adapter (see get_ollama_embedding).
     try:
-        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
-        from vco_lib.embedding_providers.ollama import _num_ctx_for_model as _nctx
+        from vco_lib.embedding_providers.ollama import embed_request_body
     except Exception:
-        def _ka(body):  # type: ignore[misc]
-            return body
-
-        def _nctx(model: str) -> int:  # type: ignore[misc]
-            # v0.2.92 R40: never return None here. An UNSET num_ctx means
-            # Ollama's 2048 default, which silently truncates any longer input
-            # and returns HTTP 200 — the failure this fix exists to remove.
-            # 2048 is the conservative floor: it is what we would have got
-            # anyway, but now it is a stated choice rather than an omission.
-            return 2048
+        def embed_request_body(model: str, *, prompt=None, input=None, num_ctx=None):  # type: ignore[misc,assignment]
+            return {
+                "model": model,
+                "prompt": prompt,
+                "options": {"num_ctx": num_ctx if num_ctx is not None else 2048},
+                "truncate": False,
+            }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{server.OLLAMA_URL}/api/embeddings",
-                # task 6: keep_alive on the legacy text embed too.
-                # v0.2.92 R40: num_ctx was UNSET here, so this legacy path
-                # inherited Ollama's 2048 default while the arctic budget is
-                # 3200 — every longer input lost its tail with a 200 response.
-                json=_ka({
-                    "model": server.LEGACY_TEXT_EMBEDDING_MODEL,
-                    "prompt": text,
-                    "options": {"num_ctx": _nctx(server.LEGACY_TEXT_EMBEDDING_MODEL)},
-                    "truncate": False,  # v0.2.92: refuse, never silently drop the tail
-                }),
+                json=embed_request_body(server.LEGACY_TEXT_EMBEDDING_MODEL, prompt=text),
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 if response.status != 200:
@@ -734,6 +706,7 @@ async def _inline_code_embed_http(
         CODE_EMBED_CLIENT_TIMEOUT_SECS,
         DEFAULT_503_FALLBACK_BACKOFFS,
         compute_503_delay,
+        is_connection_error,
         parse_retry_after,
         resolve_503_delay_scale,
         resolve_503_tolerance,
@@ -773,8 +746,18 @@ async def _inline_code_embed_http(
                         attempt, retry_after,
                     )
         except Exception as e:
-            server.logger.error("Code embedding service error: %s", e)
-            return None
+            # v0.2.102 W4-E item 6: a CONNECTION error (service restarting,
+            # e.g. mid model-load) is transient-retryable on the same bounded
+            # schedule as a 503 — never a silent first-shot drop. Any other
+            # exception still fails immediately (the service refused the
+            # input; retrying changes nothing).
+            if not is_connection_error(e):
+                server.logger.error("Code embedding service error: %s", e)
+                return None
+            server.logger.info(
+                "Code embedding service connection error (restarting?): "
+                "attempt %d — %s", attempt, e,
+            )
         # 503 → bounded retry on the shared policy (same helper + knobs as
         # EmbeddingService._retry_once_on_503).
         if legacy_bounded:
@@ -902,42 +885,26 @@ async def get_legacy_code_embedding(text: str) -> list[float] | None:
     Used to populate the old 'ollama_code_embed' named vector for backward compatibility.
     """
     from . import server
+    # v0.2.102 W4-E: ONE shared body builder — identical load options per
+    # model as the canonical adapter (see get_ollama_embedding).
     try:
-        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
-        from vco_lib.embedding_providers.ollama import _num_ctx_for_model as _nctx
+        from vco_lib.embedding_providers.ollama import embed_request_body
     except Exception:
-        def _ka(body):  # type: ignore[misc]
-            return body
-
-        def _nctx(model: str) -> int:  # type: ignore[misc]
-            # v0.2.92 R40: never return None here. An UNSET num_ctx means
-            # Ollama's 2048 default, which silently truncates any longer input
-            # and returns HTTP 200 — the failure this fix exists to remove.
-            # 2048 is the conservative floor: it is what we would have got
-            # anyway, but now it is a stated choice rather than an omission.
-            return 2048
+        def embed_request_body(model: str, *, prompt=None, input=None, num_ctx=None):  # type: ignore[misc,assignment]
+            return {
+                "model": model,
+                "prompt": prompt,
+                "options": {"num_ctx": num_ctx if num_ctx is not None else 2048},
+                "truncate": False,
+            }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{server.OLLAMA_URL}/api/embeddings",
-                # task 6: keep_alive on the legacy code embed too.
-                # v0.2.92 R40: num_ctx was UNSET. jina's 1600 budget happens to
-                # fit under Ollama's 2048 default — by luck, not by design. Set
-                # it so a future budget change cannot silently start truncating.
-                json=_ka({
-                    "model": "unclemusclez/jina-embeddings-v2-base-code:latest",
-                    "prompt": text,
-                    "options": {
-                        "num_ctx": _nctx(
-                            "unclemusclez/jina-embeddings-v2-base-code:latest"
-                        )
-                    },
-                    # R45: refuse rather than silently drop the tail. jina is
-                    # one of the models MEASURED to truncate at HTTP 200 with
-                    # `truncate` unset, so without this the caller cannot tell
-                    # a full vector from a partial one.
-                    "truncate": False,
-                }),
+                json=embed_request_body(
+                    "unclemusclez/jina-embeddings-v2-base-code:latest",
+                    prompt=text,
+                ),
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 if response.status == 200:

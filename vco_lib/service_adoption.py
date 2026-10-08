@@ -191,7 +191,10 @@ BEHAVIOR_CRITICAL_ENV_KEYS: tuple[str, ...] = (
 #: key the installer does not set but the live container has is carried so
 #: the service keeps behaving as it does today.
 CANONICAL_ENV_TARGETS: dict[str, dict[str, str]] = {
-    "ollama": {"OLLAMA_KEEP_ALIVE": "24h"},
+    # v0.2.102 W4-E: 24h → 10m (owner ruling 2026-10-08 — the 24h pin held
+    # 8.3 GB of VRAM idle after one KG search; 10m releases idle VRAM while
+    # consecutive calls still share the resident model).
+    "ollama": {"OLLAMA_KEEP_ALIVE": "10m"},
 }
 
 #: Marker both override generators use (storage_ux.rs

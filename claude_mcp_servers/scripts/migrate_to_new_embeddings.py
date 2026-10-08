@@ -131,6 +131,30 @@ def _fallback_num_ctx(model: str) -> int:
         return 8_192
 
 
+def _fallback_embed_request_body(model: str, prompt: str) -> dict:
+    """Body for the legacy inline-Ollama legs (v0.2.102 W4-E).
+
+    Routed through the ONE shared builder
+    (``vco_lib.embedding_providers.ollama.embed_request_body``) so this
+    script sends the IDENTICAL load options per model as every other VCO
+    caller (one runner, never a second copy) and carries the shared
+    keep_alive policy. Soft-fail: without vco_lib (the half-install case
+    that also sets ``HAS_EMBEDDING_SERVICE = False``) keep the pre-W4-E
+    conservative shape (explicit SSOT-or-8192 num_ctx, truncate=False, no
+    keep_alive) rather than refusing to run.
+    """
+    try:
+        from vco_lib.embedding_providers.ollama import embed_request_body
+        return embed_request_body(model, prompt=prompt)
+    except Exception:
+        return {
+            "model": model,
+            "prompt": prompt,
+            "options": {"num_ctx": _fallback_num_ctx(model)},
+            "truncate": False,
+        }
+
+
 def _active_kg_slot() -> str:
     """Return the slot name to migrate KG collections TO.
 
@@ -192,6 +216,14 @@ def _discover_code_catalog() -> list:
 
 
 def get_client() -> weaviate.WeaviateClient:
+    # v0.2.102 W4-E: disable the weaviate-client PyPI version lookup (one
+    # home: weaviate_helpers.disable_weaviate_client_pypi_check — no
+    # dedicated client flag exists; every server health check stays).
+    try:
+        from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+        disable_weaviate_client_pypi_check()
+    except Exception:
+        pass
     client = weaviate.connect_to_local(
         host=WEAVIATE_URL.replace("http://", "").split(":")[0],
         port=int(WEAVIATE_URL.split(":")[-1]),
@@ -228,15 +260,9 @@ def get_text_embedding(text: str) -> list[float] | None:
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/embeddings",
-            json={
-                "model": fallback_model,
-                "prompt": text,
-                "options": {"num_ctx": _fallback_num_ctx(fallback_model)},
-                # v0.2.92 R40: never let Ollama truncate silently — an
-                # explicit 400 the caller logs beats a 200 that dropped
-                # the tail (matches the canonical adapter).
-                "truncate": False,
-            },
+            # v0.2.102 W4-E: ONE shared body builder — identical load options
+            # per model as the canonical adapter (see _fallback_embed_request_body).
+            json=_fallback_embed_request_body(fallback_model, text),
             timeout=60,
         )
         if resp.status_code == 200:
@@ -263,6 +289,33 @@ def get_code_embedding(text: str) -> list[float] | None:
         except Exception as e:
             logger.warning("EmbeddingService code embed failed (%s); falling back to inline CodeEmbed", e)
     # Legacy fallback: direct CodeEmbed call.
+    # v0.2.102 W4-E item 6: the shared code-embed container QUEUES and emits
+    # 503 + Retry-After when its wait bound is exceeded, and refuses
+    # connections while restarting (e.g. mid model-load) — both transient,
+    # both retried on the ONE shared bounded policy (never a first-shot
+    # drop). Without vco_lib the single-shot pre-v0.2.102 shape is kept.
+    try:
+        from vco_lib.retry_after import retry_transient_embed
+
+        def _post():
+            resp = requests.post(
+                f"{CODE_EMBED_SERVICE_URL}/api/embeddings",
+                json={"model": "", "prompt": text},
+                timeout=60,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"CodeEmbed /api/embeddings returned HTTP {resp.status_code}: "
+                    f"{resp.text[:200]}"
+                )
+            return resp.json()["embedding"]
+
+        return retry_transient_embed(_post, log=logger)
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning("Code embedding error: %s", e)
+        return None
     try:
         resp = requests.post(
             f"{CODE_EMBED_SERVICE_URL}/api/embeddings",
@@ -570,12 +623,9 @@ def main():
         try:
             resp = requests.post(
                 f"{OLLAMA_URL}/api/embeddings",
-                json={
-                    "model": embedding_model_for_probe,
-                    "prompt": "test",
-                    "options": {"num_ctx": _fallback_num_ctx(embedding_model_for_probe)},
-                    "truncate": False,  # v0.2.92 R40 — see get_text_embedding
-                },
+                # v0.2.102 W4-E: ONE shared body builder (see
+                # _fallback_embed_request_body) — identical load options per model.
+                json=_fallback_embed_request_body(embedding_model_for_probe, "test"),
                 timeout=10,
             )
             assert resp.status_code == 200, f"Ollama embedding failed: {resp.status_code}"

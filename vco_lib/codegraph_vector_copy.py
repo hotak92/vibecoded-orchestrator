@@ -50,8 +50,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import logging
-import os
-import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1292,20 +1290,13 @@ def _build_client(
 ):
     """Build a Weaviate v4 client from url/env/defaults; ``None`` on failure.
 
-    Mirrors ``codegraph_resync._build_client`` (the endorsed connection recipe)
-    — kept local to avoid importing the whole resync module for the CLI path."""
+    Mirrors ``codegraph_resync._build_client`` (the endorsed connection recipe:
+    ``weaviate_helpers.connect_v4``, the ONE factory — v0.2.102 W4-E, which
+    also disables the client's per-connect PyPI version lookup)."""
     try:
-        import weaviate
-
-        from vco_lib.weaviate_helpers import weaviate_url_default
-        url = weaviate_url or weaviate_url_default()
-        m = re.match(r"^https?://([^:/]+)(?::(\d+))?", url)
-        host = m.group(1) if m else "localhost"
-        http_port = int(m.group(2)) if (m and m.group(2)) else 8081
-        gport = int(grpc_port or os.environ.get("GRPC_PORT") or 50052)
-        return weaviate.connect_to_custom(
-            http_host=host, http_port=http_port, http_secure=False,
-            grpc_host=host, grpc_port=gport, grpc_secure=False,
+        from vco_lib.weaviate_helpers import connect_v4, weaviate_url_default
+        return connect_v4(
+            weaviate_url or weaviate_url_default(), grpc_port=grpc_port
         )
     except Exception as exc:  # noqa: BLE001 — no Weaviate → CLI degrades
         logger.error("identity migration: Weaviate unavailable: %s", exc)

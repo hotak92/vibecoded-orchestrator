@@ -351,18 +351,28 @@ class TestR40NumCtxExplicit:
 
     def test_canonical_adapter_always_sets_num_ctx(self) -> None:
         src = OLLAMA_PROVIDER_PATH.read_text(encoding="utf-8")
-        # embed() + embed_batch(): both auto-resolve None via the SSOT and
-        # put it in options explicitly.
-        assert src.count('"options": {"num_ctx": num_ctx}') == 3, (
-            "ALL THREE Ollama adapter call sites must send an explicit, "
-            "resolver-backed options.num_ctx (R40: unset = Ollama default = "
-            "silent truncation). The third is the legacy `/api/embeddings` "
-            "fallback, which shipped with neither num_ctx nor truncate until "
-            "round 6 — it was invisible to the AST gate because that gate "
-            "required the literal 'OLLAMA' in the URL expression while this "
-            "adapter builds its URL from an attribute. A COUNT pinned here is "
-            "deliberately brittle: adding a fourth embed site must break this "
-            "test and force a decision, not slip through."
+        # v0.2.102 W4-E: the explicit, resolver-backed options.num_ctx now
+        # lives ONCE in the shared body builder `embed_request_body` (the
+        # ONE home — owner ruling 2026-10-08: identical load options per
+        # model across every caller), and all THREE adapter sites
+        # (embed / embed_batch / legacy `_embed_embeddings`) route their
+        # json through it. The literals are pinned once in the builder and
+        # the routing count is pinned here — a COUNT is still deliberately
+        # brittle: adding a fourth embed site must break this test and
+        # force a decision, not slip through.
+        assert src.count('"options": {"num_ctx": num_ctx}') == 1, (
+            "the explicit options.num_ctx must live EXACTLY ONCE, in "
+            "`embed_request_body` (the ONE shared body builder) — a second "
+            "literal is the drifted-duplicate shape R40 exists to remove"
+        )
+        assert src.count('"truncate": False') == 1, (
+            "the truncate:false refusal must live EXACTLY ONCE, in the "
+            "shared body builder (R45)"
+        )
+        assert src.count("embed_request_body(model") == 3, (
+            "ALL THREE Ollama adapter call sites must build their request "
+            "body through the ONE shared builder so no caller can drift "
+            "into loading a second runner of the same model (v0.2.102 W4-E)"
         )
         assert "_num_ctx_for_model(model)" in src
 
@@ -385,26 +395,24 @@ class TestR40NumCtxExplicit:
         explicitly — unset means Ollama's small default and silent
         truncation.
 
-        Updated v0.2.92 round-3. This pin used to require the LITERAL 8 192
-        and recorded the resulting defect as "REPORTED, not patched": the
-        canonical adapter sends 10 240 for qwen3 while this path hardcoded
-        8 192, so a max-packed chunk (~8 316 true tokens) overflowed by
-        ~1.5% on THIS path only. Two hardcoded windows for one model is the
-        drifted-duplicate-table shape that already caused a live 4x
-        over-budget bug this cycle, so the value now comes from the same
-        resolver that sizes the chunks — one home, no drift. The path also
-        sends `truncate: false`, so an over-window input is refused rather
-        than silently losing its tail."""
+        Updated v0.2.92 round-3 (value from the one resolver), then
+        v0.2.102 W4-E: the whole body now comes from the ONE shared builder
+        (`embed_request_body`), which sets the explicit SSOT-resolved
+        num_ctx AND `truncate: false` — a fallback leg can no longer carry
+        its own window or truncation choice at all, so the drift this test
+        guarded against is structurally impossible. The pin therefore
+        requires the builder ROUTING (the builder's own literals are pinned
+        by test_canonical_adapter_always_sets_num_ctx, its output by
+        tests/test_v02102_w4e_ollama_vram_sharing.py)."""
         src = EMBEDDINGS_PATH.read_text(encoding="utf-8")
         fn = src.split("async def get_ollama_embedding", 1)[1]
         fn = fn.split("async def ", 1)[0]
-        assert '"num_ctx": _nctx(' in fn, (
-            "the inline text-embed fallback must resolve num_ctx from the one "
-            "home that also sizes the chunks — a second hardcoded window for "
-            "the same model is free to drift from it (R40)"
+        assert "from vco_lib.embedding_providers.ollama import embed_request_body" in fn, (
+            "the inline text-embed fallback must build its request body "
+            "through the ONE shared builder so its num_ctx comes from the "
+            "one home that also sizes the chunks — a second window or "
+            "truncation choice for the same model is free to drift (R40/W4-E)"
         )
-        assert '"truncate": False' in fn, (
-            "the fallback must refuse an over-window input rather than let "
-            "Ollama silently drop its tail (qwen3 and jina truncate at HTTP "
-            "200 by default; only arctic refuses)"
-        )
+        assert (
+            "json=embed_request_body(server.EMBEDDING_MODEL, prompt=text)" in fn
+        ), "the fallback's POST body must be the builder's output verbatim"

@@ -97,14 +97,21 @@ class NumCtxIsAlwaysExplicitTests(unittest.TestCase):
     def test_every_ollama_embedding_post_sets_num_ctx(self) -> None:
         offenders = []
         for path, line, window in _embedding_post_sites():
-            if "num_ctx" not in window:
+            # v0.2.102 W4-E: a body built by the ONE shared builder
+            # (`embed_request_body`) is compliant — the builder sets the
+            # explicit SSOT-resolved num_ctx. The exemption is backed by a
+            # BEHAVIOURAL assertion (test_builder_output_sets_num_ctx), not
+            # just the name: the guard's teeth stay where they were.
+            if "num_ctx" not in window and "embed_request_body" not in window:
                 rel = path.relative_to(REPO_ROOT)
                 offenders.append(f"{rel}:{line}")
         self.assertEqual(
             offenders, [],
             "Ollama embedding request(s) with no `num_ctx` — these inherit the "
             "2048 default and SILENTLY truncate longer input while returning "
-            "HTTP 200 (v0.2.92 R40). Set it explicitly at each site:\n  "
+            "HTTP 200 (v0.2.92 R40). Set it explicitly at each site (or build "
+            "the body through vco_lib.embedding_providers.ollama."
+            "embed_request_body, the ONE shared home):\n  "
             + "\n  ".join(offenders),
         )
 
@@ -125,7 +132,7 @@ class NumCtxIsAlwaysExplicitTests(unittest.TestCase):
         """
         offenders = []
         for path, line, window in _embedding_post_sites():
-            if "truncate" not in window:
+            if "truncate" not in window and "embed_request_body" not in window:
                 rel = path.relative_to(REPO_ROOT)
                 offenders.append(f"{rel}:{line}")
         self.assertEqual(
@@ -133,9 +140,27 @@ class NumCtxIsAlwaysExplicitTests(unittest.TestCase):
             "Ollama embedding request(s) with no `truncate` — an over-window "
             "input is then accepted at HTTP 200 with its tail dropped and "
             "nothing downstream can tell (v0.2.92 R45). Send "
-            "`\"truncate\": False` at each site:\n  "
+            "`\"truncate\": False` at each site (or build the body through "
+            "vco_lib.embedding_providers.ollama.embed_request_body, the ONE "
+            "shared home):\n  "
             + "\n  ".join(offenders),
         )
+
+    def test_builder_output_sets_num_ctx_and_truncate(self) -> None:
+        """BEHAVIOURAL backing for the `embed_request_body` exemption above.
+
+        The scan accepts a site whose body comes from the ONE shared builder;
+        this test EXECUTES the builder so the exemption can never name a
+        function that stopped doing the job (a scan that exempts by name
+        alone is a scan that guards nothing)."""
+        from vco_lib.embedding_providers.ollama import embed_request_body
+
+        body = embed_request_body("qwen3-embedding:0.6b", prompt="x")
+        self.assertIn("num_ctx", body["options"])
+        self.assertIs(body["truncate"], False)
+        batch = embed_request_body("qwen3-embedding:0.6b", input=["x"])
+        self.assertIn("num_ctx", batch["options"])
+        self.assertIs(batch["truncate"], False)
 
     def test_the_scanner_actually_finds_sites(self) -> None:
         """Anti-vacuity: a scan that finds nothing would pass the test above."""

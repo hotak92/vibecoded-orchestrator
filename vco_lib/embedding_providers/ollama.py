@@ -128,12 +128,18 @@ def _num_ctx_for_model(model: str) -> int:
 # of the compose env default) and it is IDEMPOTENT — Ollama refreshes the TTL on
 # every request that carries it.
 #
-# Default "24h" (effectively "resident for the working day"). The user can
-# override via VCO_OLLAMA_KEEP_ALIVE (any value Ollama accepts: a duration like
-# "30m"/"2h", "-1" for never-evict, or "0" to opt back into immediate unload).
-# An empty override string means "send no keep_alive" (defer to Ollama's own
-# default / the OLLAMA_KEEP_ALIVE server env) — an explicit opt-out.
-_KEEP_ALIVE_DEFAULT = "24h"
+# v0.2.102 W4-E: default dropped from "24h" to "10m" (owner ruling 2026-10-08,
+# after a live measurement: ONE KG search pinned qwen3-embedding 2.4 GB +
+# snowflake-arctic-embed2 1.15 GB in VRAM for 24 h each — 8.3 GB idle total).
+# 10 m accepts the ~1.9 s reload after a genuinely idle gap in exchange for
+# releasing idle VRAM, while still covering the multi-second cadence of a
+# search/sync session (models stay resident across consecutive calls). The user
+# can override via VCO_OLLAMA_KEEP_ALIVE (any value Ollama accepts: a duration
+# like "30m"/"2h", "-1" for never-evict, or "0" to opt back into immediate
+# unload). An empty override string means "send no keep_alive" (defer to
+# Ollama's own default / the OLLAMA_KEEP_ALIVE server env) — an explicit
+# opt-out.
+_KEEP_ALIVE_DEFAULT = "10m"
 
 
 def _keep_alive() -> str | None:
@@ -165,6 +171,47 @@ def _with_keep_alive(body: dict[str, Any]) -> dict[str, Any]:
     out = dict(body)
     out["keep_alive"] = ka
     return out
+
+
+def embed_request_body(
+    model: str,
+    *,
+    prompt: "str | None" = None,
+    input: "str | list[str] | None" = None,  # noqa: A002 — mirrors Ollama's field
+    num_ctx: "int | None" = None,
+) -> dict[str, Any]:
+    """ONE home for the body of a VCO Ollama EMBED request (v0.2.102 W4-E).
+
+    Owner ruling 2026-10-08: projects must share ONE copy of each embedding
+    model. Ollama loads a SECOND runner of the same model whenever load
+    options differ, so every caller must send an IDENTICAL body shape per
+    model: explicit ``num_ctx`` resolved from the ONE table
+    (``chunking.MODEL_TOKEN_LIMITS`` via :func:`_num_ctx_for_model`),
+    ``truncate: False`` (v0.2.92 — refuse, never silently drop the tail), and
+    the shared ``keep_alive`` policy (:func:`_with_keep_alive`). The canonical
+    adapter (:class:`OllamaAdapter`) and every inline fallback leg
+    (weaviate-MCP, code-embed service, migrate/search scripts) build their
+    request through THIS function so the shapes cannot drift apart.
+
+    Exactly one of ``prompt`` (legacy single-item endpoint) or ``input``
+    (modern ``/api/embed`` endpoint, str or batch) must be given.
+    """
+    if (prompt is None) == (input is None):
+        raise ValueError("pass exactly one of prompt= or input=")
+    if num_ctx is None:
+        num_ctx = _num_ctx_for_model(model)
+    body: dict[str, Any] = {
+        "model": model,
+        "options": {"num_ctx": num_ctx},
+        # v0.2.92: an explicit over-window refusal beats a 200 that dropped
+        # the tail (see the long note in OllamaAdapter.embed).
+        "truncate": False,
+    }
+    if prompt is not None:
+        body["prompt"] = prompt
+    else:
+        body["input"] = input
+    return _with_keep_alive(body)
 
 
 def looks_like_embedding_model(name: str) -> bool:
@@ -274,29 +321,14 @@ class OllamaAdapter:
         # Try the modern batched endpoint first.
         # v0.2.70 FIX A: bounded_post enforces a TOTAL per-request deadline so a
         # dribbling/wedged socket fails this single chunk instead of hanging.
+        # v0.2.102 W4-E: the body comes from the ONE shared builder
+        # (embed_request_body) so every VCO caller sends identical load
+        # options per model — one runner, no second copy.
         try:
             response = bounded_post(
                 self.session,
                 f"{self.base_url}/api/embed",
-                # task 6: keep_alive pins the model resident (removes the ~1.9 s
-                # reload after any idle gap). Idempotent — refreshes the TTL.
-                json=_with_keep_alive({
-                    "model": model,
-                    "input": text,
-                    "options": {"num_ctx": num_ctx},
-                    # v0.2.92: NEVER let Ollama truncate silently.
-                    # Measured 2026-09-04 across the three shipped
-                    # models: with the default (truncate=true) qwen3
-                    # and jina return HTTP 200 having DROPPED the
-                    # tail — data loss with no signal — while arctic
-                    # refuses regardless (it cannot truncate at all).
-                    # truncate=false makes all three behave the same:
-                    # an explicit 400 "the input length exceeds the
-                    # context length", which the caller catches and
-                    # retries at the provable fallback budget. An
-                    # error we handle beats a success that lied.
-                    "truncate": False,
-                }),
+                json=embed_request_body(model, input=text, num_ctx=num_ctx),
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
@@ -362,28 +394,12 @@ class OllamaAdapter:
 
         # v0.2.70 FIX A: a batch is still ONE HTTP request — the bounded total
         # deadline applies per-batch (the embed unit), never per-node.
+        # v0.2.102 W4-E: body from the ONE shared builder (see embed()).
         try:
             response = bounded_post(
                 self.session,
                 f"{self.base_url}/api/embed",
-                # task 6: keep_alive pins the model resident across batches.
-                json=_with_keep_alive({
-                    "model": model,
-                    "input": texts,
-                    "options": {"num_ctx": num_ctx},
-                    # v0.2.92: NEVER let Ollama truncate silently.
-                    # Measured 2026-09-04 across the three shipped
-                    # models: with the default (truncate=true) qwen3
-                    # and jina return HTTP 200 having DROPPED the
-                    # tail — data loss with no signal — while arctic
-                    # refuses regardless (it cannot truncate at all).
-                    # truncate=false makes all three behave the same:
-                    # an explicit 400 "the input length exceeds the
-                    # context length", which the caller catches and
-                    # retries at the provable fallback budget. An
-                    # error we handle beats a success that lied.
-                    "truncate": False,
-                }),
+                json=embed_request_body(model, input=texts, num_ctx=num_ctx),
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
@@ -450,17 +466,12 @@ class OllamaAdapter:
         if num_ctx is None:
             num_ctx = _num_ctx_for_model(model)
         # v0.2.70 FIX A: bounded total deadline, same per-request granularity.
+        # v0.2.102 W4-E: body from the ONE shared builder (see embed()).
         try:
             response = bounded_post(
                 self.session,
                 f"{self.base_url}/api/embeddings",
-                # task 6: keep_alive on the legacy endpoint too.
-                json=_with_keep_alive({
-                    "model": model,
-                    "prompt": text,
-                    "options": {"num_ctx": num_ctx},
-                    "truncate": False,
-                }),
+                json=embed_request_body(model, prompt=text, num_ctx=num_ctx),
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
