@@ -9,6 +9,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import {
+    agentAnswer,
+    agentIdentity,
     barTone,
     barWidth,
     cardVisible,
@@ -20,6 +22,7 @@
     settle,
     unknownLabel,
     vendorStatus,
+    visibleAgents,
     visibleVendors,
     type UsageCardState,
   } from '$lib/subscription-usage';
@@ -120,6 +123,22 @@
           </div>
         {/each}
       </div>
+      <!-- v0.2.102 (G3): which model actually answered each (session, agent)
+           identity — the attribution the harness's agents GUI cannot show
+           (its row displays the session model for every lane,
+           anthropics/claude-code#93324). -->
+      {@const agents = visibleAgents(result.snapshot)}
+      {#if agents.length > 0}
+        <div class="usage-agents">
+          <h3 class="usage-agents-title">Who answered</h3>
+          {#each agents as a (`${a.session ?? ''}|${a.agent ?? ''}`)}
+            <div class="usage-agent-row">
+              <span class="usage-agent-name">{agentIdentity(a)}</span>
+              <span class="usage-agent-model">{agentAnswer(a)}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
     {/if}
   </section>
 {/if}
@@ -244,5 +263,34 @@
   .usage-note {
     margin: 8px 0 0;
     font-size: 11px;
+  }
+  .usage-agents {
+    margin-top: 14px;
+  }
+  .usage-agents-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--color-mid, #94a3b8);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin: 0 0 6px;
+  }
+  .usage-agent-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 12px;
+    margin: 2px 0;
+  }
+  .usage-agent-name {
+    color: var(--color-mid, #94a3b8);
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .usage-agent-model {
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    color: var(--color-text, #f1f5f9);
   }
 </style>

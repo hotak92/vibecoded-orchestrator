@@ -457,10 +457,17 @@ class UsageAccumulator:
         """Is this row the LAST WORD on the turn's usage?
 
         Two conditions, and the second is the one a field census alone
-        misses. Every field must have been reported at least once — a vendor
-        that never emits the cache fields reads False, correctly, because the
-        zeros in such a row are this module's default and not the upstream's
-        statement. AND the response must have stated its final usage: a
+        misses. Every field must have been reported at least once — and
+        since v0.2.102 (G2) that census runs on the bytes the CLIENT
+        received, which carry the gateway's cache-field completion: a cache
+        field the vendor left unstated is present as an explicit 0
+        (:func:`model_router.tool_ids.complete_cache_fields`), so a vendor
+        whose cache model simply has no creation half no longer reads
+        "incomplete" forever — the 0 is what the client was told, and this
+        accumulator's covenant is to record the client's view. The value
+        merge still cannot be poisoned by those zeros (a later positive
+        replaces an earlier zero), so the FIGURES stay the vendor's own.
+        AND the response must have stated its final usage: a
         non-streamed body always has, a stream has once ``message_delta``
         arrives.
 
@@ -512,17 +519,20 @@ class UsageRecord:
     disagree about the same request.
 
     Two windows, deliberately, and they answer different questions.
-    ``window_client`` is what the CLIENT budgeted, detected EITHER from the id
-    it asked for (an ``[1m]`` suffix, :func:`client_window`) OR from the
+    ``window_client`` is what the CLIENT budgeted, detected from the id it
+    asked for (an ``[1m]`` suffix, :func:`client_window`), from the
     ``anthropic-beta`` header it sent (a ``context-1m`` token — the spelling
     Claude Code actually uses on ordinary traffic, since it resolves the
     suffix itself and signals the window with the header; see
-    :mod:`model_router.routing`'s docstring). The header half is threaded in
-    as ``one_m_client`` by the caller, because this module never sees a
-    request. ``window_actual`` is what the model really has, per
-    :func:`model_router.catalog.resolve_window`. When they disagree the client
-    is compacting at the wrong point, and ``pct_client`` versus ``pct_actual``
-    is that disagreement in one line.
+    :mod:`model_router.routing`'s docstring) or — v0.2.102, X1, first-party
+    routes only — derived from the context table when neither signal is
+    present, because the client budgets 1M for 1M-native first-party models
+    without saying so on the wire. The header and table halves are threaded
+    in as ``one_m_client`` / ``one_m_table`` by the caller, because this
+    module never sees a request. ``window_actual`` is what the model really
+    has, per :func:`model_router.catalog.resolve_window`. When they disagree
+    the client is compacting at the wrong point, and ``pct_client`` versus
+    ``pct_actual`` is that disagreement in one line.
     """
 
     ts: str
@@ -609,6 +619,7 @@ def build_record(
     window_source: str,
     now: Optional[datetime] = None,
     one_m_client: bool = False,
+    one_m_table: bool = False,
     request_bytes: int = 0,
     fallback_from: str = "",
 ) -> UsageRecord:
@@ -619,6 +630,18 @@ def build_record(
     header carried a ``context-1m`` token. It only ever WIDENS the window to
     :data:`CLIENT_WINDOW_1M` — :func:`client_window` still answers the
     suffix half — so the two detections are one OR and cannot contradict.
+
+    ``one_m_table`` (v0.2.102, X1) is the third detection, for the case the
+    first two are blind to: Claude Code sends NEITHER the suffix nor the
+    beta for a first-party 1M-native model (``claude-opus-5-5``) yet budgets
+    1M against it — a session reached 791K while every row recorded
+    ``window_client: 200000``. The caller computes it from the context
+    table (a cited row whose flag or window says 1M), on the FIRST-PARTY
+    route only: behind a custom base URL the client budgets a vendor id at
+    200K unless it carries the suffix, whatever the model's real window is,
+    so the table may never widen a vendor route's row. Like
+    ``one_m_client`` it only ever widens: a table row saying 200K, or no
+    row, keeps :data:`CLIENT_WINDOW_DEFAULT`.
     """
     moment = now or datetime.now(timezone.utc)
     input_tokens = int(totals.get("input_tokens", 0))
@@ -627,7 +650,11 @@ def build_record(
     output_tokens = int(totals.get("output_tokens", 0))
     context_tokens = input_tokens + cache_creation + cache_read
     context_after = context_tokens + output_tokens
-    window_c = CLIENT_WINDOW_1M if one_m_client else client_window(requested)
+    window_c = (
+        CLIENT_WINDOW_1M
+        if one_m_client or one_m_table
+        else client_window(requested)
+    )
     return UsageRecord(
         ts=moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
         session=session,
@@ -1082,6 +1109,40 @@ class UsageLedger:
             for key, record in items
             if only is None or key == only
         }
+
+    def agent_rows(self) -> "list[dict[str, Any]]":
+        """One compact attribution row per (session, agent) identity.
+
+        The v0.2.102 (G3) answer to the harness's agents-GUI row showing the
+        SESSION model for every lane (anthropics/claude-code#93324): each
+        entry names the model that actually ANSWERED this identity's last
+        turn — ``forward``, with ``fallback_from`` beside it when the
+        owner's ladder served the turn (R15: no hidden remaps) — so a
+        surface that cannot see the wire can still say which model did the
+        work. ``agent`` is ``None`` for the main chat, which is an identity
+        like any other.
+
+        A PROJECTION of the same in-memory rows :meth:`sessions` serves,
+        keyed by identity rather than by chat, and reduced to the fields
+        attribution needs: who (session, agent), what answered (model,
+        route, fallback_from) and when (at). Newest last, LRU-bounded with
+        the rest of the ledger's memory. Reads the lock-protected map only;
+        never touches the file.
+        """
+        with self._lock:
+            items: Iterable[UsageRecord] = list(self._last_by_identity.values())
+        return [
+            {
+                "session": record.session,
+                "agent": record.agent,
+                "parent_agent": record.parent_agent,
+                "model": record.forward,
+                "route": record.route,
+                "fallback_from": record.fallback_from,
+                "at": record.ts,
+            }
+            for record in items
+        ]
 
     def context_floor(
         self, *, session: Optional[str], agent: Optional[str],

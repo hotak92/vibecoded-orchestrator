@@ -599,18 +599,20 @@ class KimiQuotaDialectTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tokens", kimi)
 
     async def test_without_a_client_ua_none_is_invented(self) -> None:
-        """The vendor's terms forbid passing the gateway off as a client.
-        With no client UA on record the fetch goes without one; the edge's
-        403 to a library UA reads as an honest unknown, never a guess."""
+        """The vendor's terms forbid passing the gateway off as a client,
+        and its edge refuses library user-agents — so with no client UA on
+        record the fetch is NOT SENT at all (v0.2.102, X2): a UA-less fetch
+        is a 403 the edge would answer on every refresh, and a UA is
+        relayed, never invented. The vendor reads unknown with the reason
+        beside it instead."""
         quota_url = KIMI.quota_url
         assert quota_url is not None  # noqa: S101 — pinned by RegistryRowTests
         fetch = _FakeFetch({quota_url: (403, None)})
         snap = await self._run(self._make({"kimi": KIMI}, fetch), user_agent=None)
-        headers = fetch.calls[0][1]
-        self.assertNotIn("User-Agent", headers)
+        self.assertEqual(fetch.calls, [], "the UA-less fetch must never be sent")
         kimi = self._vendor(snap, "kimi")
         self.assertEqual(kimi["state"], "unknown")
-        self.assertIn("HTTP 403", kimi["problem"])
+        self.assertIn("user-agent", (kimi["problem"] or "").lower())
         self.assertEqual(kimi["windows"], [])
 
     async def test_zai_still_speaks_its_own_dialect(self) -> None:

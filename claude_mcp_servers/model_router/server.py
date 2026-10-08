@@ -163,6 +163,7 @@ from .config import (
     context_guard_margin,
 )
 from .context_table import (
+    ONE_M_WINDOW,
     ContextTable,
     ContextTableLoader,
     ModelContext,
@@ -223,6 +224,7 @@ from .tool_ids import (
     BoundedIdMap,
     RepairStats,
     SseIdRewriter,
+    complete_cache_fields,
     normalise_vendor_response,
     restore_vendor_ids,
     sanitise_for_anthropic,
@@ -1083,6 +1085,15 @@ async def usage_windows_handler(request: web.Request) -> web.Response:
     user's subscription plan and consumption. Answers from MEMORY: a read that
     finds the cache due schedules one background refresh and returns what is
     cached now, so this route can never wait on a vendor.
+
+    The JSON also carries ``agents`` (v0.2.102, G3): one compact attribution
+    row per (session, agent) identity from the usage ledger
+    (:meth:`model_router.usage.UsageLedger.agent_rows`), naming the model
+    that ANSWERED each identity's last turn — the per-agent model the
+    harness's agents GUI cannot show (its row displays the session model for
+    every lane, anthropics/claude-code#93324). It rides THIS route because
+    the launcher's usage card already polls it; it is absent from the
+    ``?format=line`` rendering, which is a windows-only one-liner.
     """
     gateway: Gateway = request.app[APP_KEY]
     started = time.monotonic()
@@ -1098,6 +1109,11 @@ async def usage_windows_handler(request: web.Request) -> web.Response:
     snapshot = windows.snapshot()
     if request.query.get("format") == "line":
         return web.Response(text=render_line(snapshot), content_type="text/plain")
+    try:
+        snapshot["agents"] = gateway.usage.agent_rows()
+    except Exception as exc:  # a monitor read must never fail the route
+        logger.warning("usage/windows: agent attribution rows unavailable: %s", exc)
+        snapshot["agents"] = []
     return web.json_response(snapshot)
 
 
@@ -1312,6 +1328,7 @@ def _submit_usage(
         window_actual=window_actual,
         window_source=window_source,
         one_m_client=facts.one_m_client,
+        one_m_table=_one_m_table(gateway, decision, facts, requested),
         request_bytes=request_bytes,
         fallback_from=fallback_from,
     )
@@ -1320,6 +1337,47 @@ def _submit_usage(
     except RuntimeError:  # pragma: no cover — handlers always have a loop
         loop = None
     gateway.usage.submit(record, loop=loop)
+
+
+def _one_m_table(
+    gateway: "Gateway",
+    decision: Route,
+    facts: RequestFacts,
+    requested: str,
+) -> bool:
+    """Should the TABLE answer for the client's 1M budget? (v0.2.102, X1.)
+
+    The case: Claude Code budgets 1M for a first-party 1M-native model
+    (``claude-opus-5-5``) while sending NEITHER the ``[1m]`` suffix nor the
+    ``context-1m`` beta — the two explicit signals are blind to it, and the
+    ledger recorded ``window_client: 200000`` for a session that reached
+    791K. When no explicit signal fired, the context table is the gateway's
+    one cited source for "the client natively knows this model is 1M", so
+    its answer is derived here: a row whose flag or window says 1M widens
+    the recorded client window.
+
+    Two guards, both the point:
+
+    * **first-party routes only.** Behind a custom base URL the client
+      budgets an id it does not natively know at 200K unless the id carries
+      the suffix — a vendor route's row must therefore NEVER be widened by
+      the table, whatever the model's real window is. The derivation stands
+      in for the client's NATIVE knowledge, which exists on the first-party
+      route alone.
+    * **an explicit signal wins.** When the client said something itself
+      (``facts.one_m_client``) there is nothing to derive — and the
+      derivation only ever widens, so a table row saying 200K, or no row,
+      keeps the 200K default rather than guessing.
+    """
+    if facts.one_m_client or not decision.is_anthropic:
+        return False
+    try:
+        row = gateway.context.current().lookup_id(requested)
+    except Exception:  # noqa: BLE001 — a monitor may never break a relay
+        return False
+    if row is None:
+        return False
+    return bool(row.window_1m) or row.context_window >= ONE_M_WINDOW
 
 
 def _message_start_usage_estimate(
@@ -4102,13 +4160,34 @@ async def _relay_vendor_json(
         payload = json.loads(raw) if raw else None
     except ValueError:
         payload = None
-    if accumulator is not None:
-        # The bytes are already in hand, so this is a parse and not a copy.
-        _guarded(accumulator.observe_body, raw, what="usage accounting")
-    #: The body as it currently stands, through both edits below. ``out`` is
+    #: The body as it currently stands, through the edits below. ``out`` is
     #: only re-serialised when this object stops being the one ``raw``
     #: decoded to, which is what keeps an untouched response byte-identical.
     body_obj: Any = payload
+    if (
+        isinstance(payload, dict)
+        and 200 <= upstream.status < 300
+        and not (facts is not None and facts.count_tokens)
+    ):
+        # v0.2.102 (G2): the SAME cache-field completion the SSE rewriter
+        # applies to message_start/message_delta, so a buffered vendor body
+        # tells the client's prompt-cache indicator what the vendor said —
+        # its figures, its other cache dialect mapped, zeros when it said
+        # nothing. Done BEFORE the usage accounting below so the ledger and
+        # the client see the same block, the invariant the streamed path
+        # already keeps (the accumulator feeds on post-rewrite bytes there).
+        usage_block = payload.get("usage")
+        if isinstance(usage_block, dict):
+            completed = _guarded(
+                complete_cache_fields, usage_block,
+                what="cache-field completion",
+            )
+            if completed is True:
+                body_obj = payload
+                out = json.dumps(payload, **COMPACT_JSON).encode("utf-8")
+    if accumulator is not None:
+        # The bytes are already in hand, so this is a parse and not a copy.
+        _guarded(accumulator.observe_body, out, what="usage accounting")
     normalised = _guarded(
         normalise_vendor_response,
         payload,

@@ -606,6 +606,22 @@ active use finds them fresh in its model picker. There is no timer: a gateway wi
 makes no vendor calls, and no request ever waits on a vendor. `?format=line` answers one line of text — what the status-line script prints — and
 the launcher's home page shows the same data as bars with reset countdowns.
 
+**Cache-age indicator and per-agent attribution.** Claude Code's "Prompt cache warm, about N min left" hint reads the
+`cache_read_input_tokens` / `cache_creation_input_tokens` usage fields, which vendor routes state rarely and not always
+under those names. Since v0.2.102 the gateway completes those two fields on every vendor answer — streamed
+(`message_start`/`message_delta`) and buffered alike — from what the vendor itself returned: a stated figure is kept
+verbatim, an OpenAI-style `prompt_tokens_details.cached_tokens` is mapped to the name the client reads, and anything
+still absent is emitted as an explicit 0. A positive the vendor did not state is never invented, and no cache TTL is
+ever claimed for a vendor (no documented figure exists), so the "N min left" half of the hint stays silent on vendor
+routes rather than guessing. The same snapshot's JSON also carries `agents`: one row per (session, agent) identity
+naming the model that actually ANSWERED that identity's last turn — with the fallback escape beside it when the
+routing ladder served it — which the launcher's usage card renders as a "Who answered" list. That list exists because
+the VS Code agents panel shows the session model for every background lane (a harness bug,
+anthropics/claude-code#93324): the gateway's ledger is the only place the answering model is recorded. Related: for
+first-party 1M-native models (`claude-opus-5-5`, `claude-sonnet-5-5`) the client sends no `[1m]` suffix and no
+`context-1m` beta, so the ledger derives `window_client` for those routes from the chat-model context table instead of
+defaulting every row to 200K.
+
 **Usage in the `/model` picker.** The same data also rides in the picker itself, as text on each vendor row's
 label: `glm-5.3 · Z.ai subscription · 1M ctx · 5h 10% · wk 72% used`. It always reads *used*, shortest window
 first; an unknown window is left out and a vendor with nothing known gets no suffix at all — a vendor with no quota

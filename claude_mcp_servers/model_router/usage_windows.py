@@ -513,7 +513,7 @@ def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list
 
 
 # ── the per-vendor quota dialect (how each endpoint is asked and read) ────
-def _zai_quota_headers(key: str, user_agent: Optional[str]) -> dict[str, str]:
+def _zai_quota_headers(key: str, user_agent: Optional[str]) -> Optional[dict[str, str]]:
     """Z.ai's monitor endpoint: the RAW key in ``Authorization``, no scheme.
 
     The documented community usage and the 2026-09-23 probe agree, and the
@@ -524,28 +524,36 @@ def _zai_quota_headers(key: str, user_agent: Optional[str]) -> dict[str, str]:
     return {"Authorization": key, "Accept-Language": "en-US,en"}
 
 
-def _kimi_quota_headers(key: str, user_agent: Optional[str]) -> dict[str, str]:
+def _kimi_quota_headers(key: str, user_agent: Optional[str]) -> Optional[dict[str, str]]:
     """Kimi's usages endpoint: ``x-api-key`` raw, plus the relayed client UA.
 
     The vendor row's own auth shape. The endpoint sits behind the same
     Cloudflare gate as the vendor's messages endpoint (403 "error code:
     1010" to a library user-agent, 200 to a client one — live probe
-    2026-10-07), and the vendor's terms forbid passing the gateway off as
-    a different client, so a user-agent is RELAYED, never invented: with
-    none on record the fetch goes without one and honestly fails as an
-    unknown reading if the edge refuses it.
+    2026-10-07, and the intermittent 403s the background refresh drew
+    07:48-08:25 that day), and the vendor's terms forbid passing the
+    gateway off as a different client, so a user-agent is RELAYED, never
+    invented. ``None`` — the skip signal — when no client user-agent has
+    been relayed yet (v0.2.102, X2): a UA-less fetch is a fetch the edge
+    refuses, so it is not sent at all and the vendor reads unknown with the
+    reason beside it, instead of 403-ing on every refresh until the first
+    chat or read relays one.
     """
-    headers = {
+    if not user_agent:
+        return None
+    return {
         "x-api-key": key,
         "anthropic-version": DEFAULT_ANTHROPIC_VERSION,
+        "User-Agent": user_agent,
     }
-    if user_agent:
-        headers["User-Agent"] = user_agent
-    return headers
 
 
 #: One dialect per quota vendor, keyed by vendor id: ``(headers builder,
-#: payload parser)``. A vendor with a ``quota_url`` and no entry speaks the
+#: payload parser)``. The headers builder answers ``None`` when there is no
+#: HONEST way to ask right now (a user-agent-gated endpoint before any
+#: client user-agent has been relayed — the fetch is then SKIPPED, see
+#: :meth:`UsageWindows._refresh_quota_vendor`). A vendor with a
+#: ``quota_url`` and no entry speaks the
 #: Z.ai dialect — the one shape this module had before there was a second,
 #: and the shape a synthetic test row still exercises. Vendor names are
 #: allowed HERE (not in routing/catalog/secrets): this module is where the
@@ -553,7 +561,7 @@ def _kimi_quota_headers(key: str, user_agent: Optional[str]) -> dict[str, str]:
 _QUOTA_DIALECTS: Mapping[
     str,
     tuple[
-        Callable[[str, Optional[str]], dict[str, str]],
+        Callable[[str, Optional[str]], Optional[dict[str, str]]],
         Callable[..., "tuple[Optional[str], list[Window]]"],
     ],
 ] = {
@@ -858,10 +866,22 @@ class UsageWindows:
         headers_for, parse = _QUOTA_DIALECTS.get(
             vendor.vendor_id, _ZAI_QUOTA_DIALECT,
         )
-        status, payload = await self._fetch(
-            vendor.quota_url,
-            headers_for(key, self._client_user_agent),
-        )
+        headers = headers_for(key, self._client_user_agent)
+        if headers is None:
+            # The dialect declined to ask: a user-agent-gated endpoint with
+            # no client user-agent relayed yet (v0.2.102, X2). Sending the
+            # UA-less fetch would 403 at the edge on every refresh until
+            # the first chat or read relays one — and a user-agent is
+            # relayed, never invented (vendor ToS), so the honest answer
+            # until then is unknown-with-a-reason, not a refusal loop.
+            _note_problem(
+                usage,
+                f"{vendor.vendor_id} usage source not asked: no client "
+                "user-agent relayed yet, and the vendor's edge refuses "
+                "library user-agents",
+            )
+            return
+        status, payload = await self._fetch(vendor.quota_url, headers)
         self._apply(
             usage, status, payload, vendor.vendor_id,
             lambda body: parse(body, now=self._clock()),
