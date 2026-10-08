@@ -446,9 +446,10 @@ Symptom: Claude says "MCP server weaviate-kg is not connected" or tool calls lik
 claude mcp list
 # Expected: weaviate-kg ✓ Connected, playwright ✓ Connected
 # playwright appears only when npx resolves on PATH; see "npx is not on
-# PATH" below. (v0.2.101 deleted the search MCP and stopped registering the
-# mermaid/excalidraw diagram wrappers; a legacy install keeps those entries,
-# and the launcher's Permissions tab disables a server per project via
+# PATH" below. (v0.2.101 deleted the search MCP; v0.2.102 deleted the
+# mermaid/excalidraw diagram wrapper MCPs — a legacy entry is scrubbed
+# automatically by the ordinary install/update. The launcher's Permissions
+# tab disables a server per project via
 # ~/.claude.json projects[<project>].disabledMcpServers.)
 # (lean-ctx or Pro-tier MCPs may also appear if installed.)
 ```
@@ -460,14 +461,14 @@ claude mcp list
 1. **Editor opened before containers started**: restart your Claude Code session (VS Code window reload, restart the CLI, or reopen Claude Desktop) once `docker ps` / `podman ps` shows Weaviate + Ollama running.
 2. **Wrong Python in MCP config**: `MCP_PYTHON` must point at the `install.py`-created venv, not system Python — check `.claude/settings.json` → `env` (the canonical channel; CLI / Desktop app / VS Code extension all read it, and MCP subprocesses inherit from it). Do NOT put these keys in `.vscode/settings.json` `claude-code.env` — that block does not propagate to MCP subprocesses on Linux (empirical sentinel testing confirmed). If your project has keys there, copy them into `.claude/settings.json` `env` — same shape, different file.
 3. **Embedding model mismatch**: `ACTIVE_EMBEDDING` must match a model actually loaded by Ollama. Default is `qwen3` with model `qwen3-embedding:0.6b`. Verify with `podman exec vco_ollama ollama list` (the canonical container name; legacy `ollama_claude` still works as an alias).
-4. **`npx` is not on PATH** (v0.2.91): `playwright` — and `mermaid` when you enable it — are registered as the bare command `npx`, which Claude Code resolves from the spawn PATH at MCP-launch time. With no Node.js installed there is nothing to resolve, so the server never starts and `claude mcp list` shows only "Failed to connect". This was silent for months in the field; it is now surfaced in three places:
+4. **`npx` is not on PATH** (v0.2.91): `playwright` is registered as the bare command `npx`, which Claude Code resolves from the spawn PATH at MCP-launch time. With no Node.js installed there is nothing to resolve, so the server never starts and `claude mcp list` shows only "Failed to connect". This was silent for months in the field; it is now surfaced in three places:
 
    ```bash
    vco doctor                 # names the unspawnable entries + the fix
    python -m vco_lib.npx_resolver --json   # just the resolution verdict
    ```
 
-   The launcher's MCP-registration badge turns **yellow** with the same remediation, and every install/update leaves an `npx_missing_mcp_unspawnable` entry in `.claude/context/UPDATE_DEFERRED.md` that clears itself on the first run after Node is installed. If npx is missing but **npm** is present (a common fnm/nvm shape), the VCO-owned Mermaid/Excalidraw wrappers fall back to `npm exec --yes -- <pkg>@<ver>` on their own; the registered `npx` entries cannot, because their command string is what VCO's third-party-preservation and stale-entry fingerprints match on.
+   The launcher's MCP-registration badge turns **yellow** with the same remediation, and every install/update leaves an `npx_missing_mcp_unspawnable` entry in `.claude/context/UPDATE_DEFERRED.md` that clears itself on the first run after Node is installed.
 
 ## vct-hub troubleshooting
 

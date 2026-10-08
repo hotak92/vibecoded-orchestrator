@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 11 free agents, 6 skills, and 51 hooks (44 event-registered in the default `.claude/settings.json`; 5 more are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually — v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records; and 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. None is dead code; all run standalone). Alongside them: 10 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 11 free agents, 6 skills, and 49 hooks (43 event-registered in the default `.claude/settings.json`; 4 more are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually — v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records; v0.2.102 retired the diagram-indexer pair `pre-diagram-path-validation` and `post-file-delete` with the diagrams integration, and existing installs lose their registrations at the next bundle update; and 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. None is dead code; all run standalone). Alongside them: 10 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -306,12 +306,6 @@ An allow-listed command is rewritten to the lossless tee wrapper `_lib/lean-ctx-
 ### `embedding-failures-surface.sh` — context injection
 Surfaces embedding-backend failure hints written by `vco_lib/embedding_service.py` to Claude. When no embedding backend is reachable, the service drops a hint file; this hook injects its contents so Claude can diagnose / recover.
 
-### `pre-diagram-path-validation.sh` — PreToolUse (Write/Edit + Bash)
-Defense-in-depth guard for diagrams integration. Rejects `.mmd` / `.excalidraw` writes outside `.claude/diagrams/` to keep the diagram index consistent.
-
-### `post-file-delete.sh` — PostToolUse Bash (routed by `post-tool-use-async`)
-Detects deletes of `.mmd` / `.excalidraw` files under `.claude/diagrams/` and cascades the delete across SQLite + sidecar + Weaviate via `vco_lib.diagram_indexer drop <file>`. Matches `rm` / `unlink` / `mv` / PowerShell `Remove-Item` / `Move-Item`.
-
 ### `pre-bash-context-inject.sh` — PreToolUse Bash (V52-M; router wrapper since v0.2.101)
 Classified, target-keyed context injection before `Bash` tool calls. PowerShell sibling at `templates/hooks/pre-bash-context-inject.ps1`. Propagates `session_id` to child processes so the router's `rl_kg_search.py` invocations are attributable to the same session.
 
@@ -328,7 +322,7 @@ Two costs are deliberately bounded:
 - A write performed by an interpreter from its own source (`python - <<EOF … open(p,'w') … EOF`) **cannot** be read out of the command text. For `knowledge/` and `docs/` it is recovered by a watermarked mtime scan of those two directories only (lookback capped at 300 s, ~3 ms for a 1 134-file tree, at most 32 results), triggered only when the parse found nothing and the command has an opaque-write shape. **Code files written that way are a known miss** — a whole-repo walk per Bash call is unbounded, and the next `Edit` re-queues the file for the code-graph drain. Both misses are recorded in the hook's own header.
 
 ### `_lib/route-touched-path.{sh,ps1}` — the routing home (v0.2.95)
-`knowledge/**` → `kg-sync` (KG collection), `docs/**.md` → `kg-sync` (development collection), `.claude/diagrams/*.{mmd,excalidraw}` → `vco_lib.diagram_indexer` (60 s throttle), code extensions → the per-turn code-graph drain queue — each gated by the Phase-8 access matrix and coalesced by the per-file debounce. Extracted from `post-file-edit.{sh,ps1}` when `post-bash-file-sync` became a second consumer; both hooks call it, neither re-implements it.
+`knowledge/**` → `kg-sync` (KG collection), `docs/**.md` → `kg-sync` (development collection), code extensions → the per-turn code-graph drain queue — each gated by the Phase-8 access matrix and coalesced by the per-file debounce. Extracted from `post-file-edit.{sh,ps1}` when `post-bash-file-sync` became a second consumer; both hooks call it, neither re-implements it.
 
 ### `_lib/code-extensions.{sh,ps1}` — "is this a code file?" (v0.2.95)
 One home for the extension alternation the code graph acts on. The routing home reads it; two remaining pairs (`code-graph-incremental`, `stop-codegraph-drain`) still spell it out for reasons recorded in `tests/test_v0295_code_extension_one_home.py`, which fails if any of them drifts from the home. (v0.2.101: the injection wrappers and `pre-tool-use` no longer make this decision in shell at all — the router's Python core does, via `vco_lib/inject_intent.language_for_path`, whose table is parity-pinned against the analyzer's dispatch table; the `codegraph-query` and `command-noise-strip` mirrors were retired with those libs.)
