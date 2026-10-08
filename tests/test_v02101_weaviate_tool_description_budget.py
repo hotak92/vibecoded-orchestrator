@@ -14,6 +14,12 @@ deleting it (the tiers' numeric thresholds, the "when NOT to use" essays).
 That is a promise-retired-with-its-mechanism shape: a guard below asserts the
 destination doc actually exists and still carries the thresholds.
 
+v0.2.102 OD-5 (owner decision, recorded): the L7 proposal to expose a
+``get_node_connections`` DIRECT tool was recorded SUPERSEDED by
+``semantic_graph_search``'s connected-nodes traversal (which already serves
+the question) — DESCRIPTION_BUDGET is NOT raised for it, and no new tool is
+added.
+
 Measured with :func:`ast.get_docstring` (the same dedent FastMCP applies),
 never by importing the server — the module pulls in ``weaviate-client`` and
 boots heavy global state, so a parse keeps this test fast and hermetic.

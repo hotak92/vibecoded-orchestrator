@@ -33,6 +33,7 @@ import sys
 import requests
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional, List
 
 try:
@@ -279,6 +280,12 @@ from vco_lib.paths import claude_user_dir  # noqa: E402 — see import disciplin
 # ONE home; the file is consulted only when the env is silent.
 from vco_lib import weaviate_helpers as _wh  # noqa: E402 — see import discipline above
 from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 — see import discipline above
+from vco_lib.codegraph_lookup import (  # noqa: E402 — the ONE code-graph identity home (v0.2.102 L5)
+    code_identity_rows,
+    confirmed_entity_rows,
+    pick_canonical_chunk,
+)
+from vco_lib.weaviate_exact_match import names_same_path  # noqa: E402 — the ONE tolerant path-identity home (v0.2.102 L4)
 
 CONFIG_PATH = claude_user_dir() / "workflow" / "config" / "mcp-config.json"
 
@@ -561,10 +568,48 @@ class CodeGraphQuery:
             anchor = str(anchor).strip()
             if not anchor:
                 return None
-            attempts = [
-                Filter.by_property("full_name").equal(anchor),
-                Filter.by_property("file_path").equal(anchor),
-            ]
+            # v0.2.102 L5: the first two attempts are IDENTITY reads and are
+            # now EXACT-confirmed through the ONE shared home — `full_name` /
+            # `file_path` are word-TOKENIZED, so the old `Equal + limit=4`
+            # could anchor the rerank on a token-superset sibling
+            # (`a.run` → `a.run_all`). The tolerant LIKE ladder below keeps
+            # serving path-shaped / bare-symbol anchors exactly as before.
+            for _prop, _kw in (
+                ("full_name", {"full_name": anchor}),
+                ("file_path", {"file_path": anchor}),
+            ):
+                best: Optional[dict] = None
+                best_chunk = 0
+                for base in ("CodeFunction", "CodeClass"):
+                    try:
+                        coll_obj = self.client.collections.get(self._coll(base))
+                        # CONFIRMED-only identity read (the ONE shared home):
+                        # a token-superset sibling (`a.run` → `a.run_all`) can
+                        # no longer anchor the rerank, and the read budget the
+                        # F10 tests pin (ONE fetch per attempt) is kept — the
+                        # tolerant LIKE ladder below is this path's tolerance,
+                        # exactly as before.
+                        rows = confirmed_entity_rows(
+                            coll_obj, filter_cls=Filter,
+                            project=self.project or "", max_matches=4,
+                            **_kw,
+                        )
+                    except Exception:
+                        continue
+                    for obj in rows:
+                        p = obj.properties or {}
+                        try:
+                            cn = int(p.get("chunk_num") or 0)
+                        except (TypeError, ValueError):
+                            cn = 0
+                        if best is None or cn < best_chunk:
+                            best, best_chunk = p, cn
+                if best is not None:
+                    return best
+
+            # Tolerant LIKE ladder (unchanged): path-shaped anchors and bare
+            # symbols the exact pass could not resolve.
+            attempts = []
             norm = anchor.replace("\\", "/")
             if "/" in norm:
                 parts = [p for p in norm.split("/") if p]
@@ -934,17 +979,22 @@ class CodeGraphQuery:
                 collected = []  # (start_line, c_name, properties)
                 for coll_obj, c_name in ((fn_coll, "CodeFunction"), (cls_coll, "CodeClass")):
                     try:
-                        sib_filter = Filter.by_property("file_path").equal(file_path)
-                        if self.project:
-                            sib_filter = sib_filter & Filter.by_property("project").equal(self.project)
+                        # v0.2.102 L5: EXACT-path-confirmed rows through the ONE
+                        # shared home — `file_path` is word-TOKENIZED, so the
+                        # old `Equal` also returned other files' token-superset
+                        # rows (a/b.py → a/b/c.py) into the sibling window.
                         # v0.2.46 V46-D: limit=64 is an intentional top-N cap
                         # (siblings are sorted by proximity AFTER the fetch).
                         # We don't emit a per-call truncation signal here
                         # because the caller (`_format_code_result_by_rank`)
                         # already only uses up to `max_total - 1` results.
                         SIBLING_FETCH_LIMIT = 64
-                        sib_resp = coll_obj.query.fetch_objects(filters=sib_filter, limit=SIBLING_FETCH_LIMIT)
-                        for obj in sib_resp.objects:
+                        sib_rows = confirmed_entity_rows(
+                            coll_obj, filter_cls=Filter, project=self.project or "",
+                            file_path=file_path,
+                            max_matches=SIBLING_FETCH_LIMIT,
+                        )
+                        for obj in sib_rows:
                             sp = obj.properties or {}
                             if sp.get("full_name") == exclude_full_name:
                                 continue
@@ -1033,13 +1083,17 @@ class CodeGraphQuery:
                 for base in ("CodeFunction", "CodeClass"):
                     try:
                         coll_obj = self.client.collections.get(self._coll(base))
-                        flt = Filter.by_property("full_name").equal(full_name)
-                        if self.project:
-                            flt = flt & Filter.by_property("project").equal(self.project)
-                        if file_path:
-                            flt = flt & Filter.by_property("file_path").equal(file_path)
-                        resp = coll_obj.query.fetch_objects(filters=flt, limit=max(total, max_chunks) + 4)
-                        for obj in resp.objects:
+                        # v0.2.102 L5: EXACT-confirmed rows through the ONE
+                        # shared home (`confirmed_entity_rows`) — MUST MATCH
+                        # the MCP's `_fetch_code_chunks`, which calls the same
+                        # helper (CLI≡MCP parity; a token-superset sibling can
+                        # interleave chunk bodies on neither surface).
+                        resp_rows = confirmed_entity_rows(
+                            coll_obj, filter_cls=Filter, project=self.project or "",
+                            full_name=full_name, file_path=file_path,
+                            max_matches=max(total, max_chunks) + 4,
+                        )
+                        for obj in resp_rows:
                             cp = obj.properties or {}
                             cn = cp.get("chunk_num", 0) or 0
                             try:
@@ -1332,11 +1386,13 @@ class CodeGraphQuery:
         try:
             coll = self.client.collections.get(self._coll(collection))
 
-            # Get reference object
-            ref_query = coll.query.fetch_objects(
-                filters=Filter.by_property("full_name").equal(reference_name),
-                limit=1
-            )
+            # Get reference object — v0.2.102 L5: exact-then-tolerant
+            # identity (ONE shared home); a token-superset sibling
+            # (`foo.bar` → `foo.bar_baz`) can no longer seed the similarity.
+            ref_query = SimpleNamespace(objects=code_identity_rows(
+                coll, "full_name", reference_name, "",
+                filter_cls=Filter, tolerant_limit=1,
+            ))
 
             if not ref_query.objects:
                 print(f"❌ Reference '{reference_name}' not found in {collection}")
@@ -1444,11 +1500,15 @@ class CodeGraphQuery:
             if query_type == "dependencies":
                 # Module imports
                 coll = self.client.collections.get(self._coll("CodeModule"))
-                response = coll.query.fetch_objects(
-                    filters=Filter.by_property("path").equal(target),
-                    limit=1,
-                    return_references=QueryReference(link_on="imports")
+                # v0.2.102 L5: exact-then-tolerant module-path identity (the
+                # ONE shared home) — a tokenized `Equal + limit=1` could
+                # answer for `src/a_b.py` when asked for `src/a.py`.
+                dep_rows = code_identity_rows(
+                    coll, "path", target, "",
+                    filter_cls=Filter, tolerant_limit=1,
+                    return_references=QueryReference(link_on="imports"),
                 )
+                response = SimpleNamespace(objects=dep_rows)
 
                 if not response.objects:
                     if hook_format:
@@ -1537,11 +1597,14 @@ class CodeGraphQuery:
                     ["full_name", "name", "file_path", "start_line", "language"]
                     if hook_format else ["full_name"]
                 )
-                response = coll.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(target),
-                    limit=TARGET_ROWS_LIMIT,
+                # v0.2.102 L5: exact-then-tolerant identity through the ONE
+                # shared home — a token-superset sibling (`foo.bar` →
+                # `foo.bar_baz`) can no longer stand in for the target.
+                response = SimpleNamespace(objects=code_identity_rows(
+                    coll, "full_name", target, "",
+                    filter_cls=Filter, tolerant_limit=TARGET_ROWS_LIMIT,
                     return_properties=target_props,
-                )
+                ))
 
                 if not response.objects and hook_format:
                     # WP-B2 leaf-name fallback: injection surfaces extract
@@ -1549,11 +1612,11 @@ class CodeGraphQuery:
                     # `mod::Foo::bar`), so an exact full_name miss retries on
                     # `name`. Interactive callers keep full_name-exact-only
                     # (behaviour unchanged).
-                    response = coll.query.fetch_objects(
-                        filters=Filter.by_property("name").equal(target),
-                        limit=TARGET_ROWS_LIMIT,
+                    response = SimpleNamespace(objects=code_identity_rows(
+                        coll, "name", target, "",
+                        filter_cls=Filter, tolerant_limit=TARGET_ROWS_LIMIT,
                         return_properties=target_props,
-                    )
+                    ))
 
                 if not response.objects:
                     if hook_format:
@@ -1676,9 +1739,16 @@ class CodeGraphQuery:
             elif query_type == "methods":
                 # List class methods
                 coll = self.client.collections.get(self._coll("CodeClass"))
-                response = coll.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(target),
-                    limit=1
+                # v0.2.102 L5: exact-then-tolerant identity + the canonical
+                # chunk (the MCP's own selection) — the methods list lives on
+                # chunk 0, and a tokenized `limit=1` could hand back a
+                # sibling class or a non-canonical chunk.
+                methods_obj = pick_canonical_chunk(code_identity_rows(
+                    coll, "full_name", target, "",
+                    filter_cls=Filter, tolerant_limit=8,
+                ))
+                response = SimpleNamespace(
+                    objects=[methods_obj] if methods_obj is not None else []
                 )
 
                 if not response.objects:
@@ -1715,10 +1785,15 @@ class CodeGraphQuery:
             elif query_type == "extends":
                 # Find base classes
                 coll = self.client.collections.get(self._coll("CodeClass"))
-                response = coll.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(target),
-                    limit=1,
-                    return_references=QueryReference(link_on="extends")
+                # v0.2.102 L5: exact-then-tolerant identity + canonical chunk
+                # (the `extends` references live on chunk 0).
+                extends_obj = pick_canonical_chunk(code_identity_rows(
+                    coll, "full_name", target, "",
+                    filter_cls=Filter, tolerant_limit=8,
+                    return_references=QueryReference(link_on="extends"),
+                ))
+                response = SimpleNamespace(
+                    objects=[extends_obj] if extends_obj is not None else []
                 )
 
                 if not response.objects:
@@ -1768,10 +1843,11 @@ class CodeGraphQuery:
                 # Find outbound cross-service interactions for a function or module
                 interactions_coll = self.client.collections.get(self._coll("CodeInteraction"))
                 func_coll = self.client.collections.get(self._coll("CodeFunction"))
-                func_resp = func_coll.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(target),
-                    limit=1
-                )
+                # v0.2.102 L5: exact-then-tolerant identity (ONE shared home).
+                func_resp = SimpleNamespace(objects=code_identity_rows(
+                    func_coll, "full_name", target, "",
+                    filter_cls=Filter, tolerant_limit=1,
+                ))
                 # v0.2.46 V46-D: emit truncation signal (Pattern B). The
                 # `limit=50` is an intentional top-N cap, but previously
                 # the user had no way to know when the cap was hit.
@@ -1784,10 +1860,10 @@ class CodeGraphQuery:
                     )
                 else:
                     mod_coll = self.client.collections.get(self._coll("CodeModule"))
-                    mod_resp = mod_coll.query.fetch_objects(
-                        filters=Filter.by_property("path").equal(target),
-                        limit=1
-                    )
+                    mod_resp = SimpleNamespace(objects=code_identity_rows(
+                        mod_coll, "path", target, "",
+                        filter_cls=Filter, tolerant_limit=1,
+                    ))
                     if not mod_resp.objects:
                         if hook_format:
                             return
@@ -1920,15 +1996,11 @@ def format_structure_hook_block(
 def _same_source_file(a: str, b: str) -> bool:
     """Path identity for the --exclude-file filter: graph rows hold
     repo-relative POSIX paths while the hook passes whatever the Edit
-    tool_input carried (often absolute). Equal after normpath, or one is the
-    other's ``/``-separated suffix. Pure + hermetically testable."""
-    if not a or not b:
-        return False
-    na = os.path.normpath(a).replace(os.sep, "/")
-    nb = os.path.normpath(b).replace(os.sep, "/")
-    if na == nb:
-        return True
-    return na.endswith("/" + nb) or nb.endswith("/" + na)
+    tool_input carried (often absolute). Delegates to the ONE home
+    (``vco_lib.weaviate_exact_match.names_same_path``) — the same rule the
+    MCP's reverse-imports lookup confirms with (v0.2.102 L4). Pure +
+    hermetically testable."""
+    return names_same_path(a, b)
 
 
 def filter_same_language(

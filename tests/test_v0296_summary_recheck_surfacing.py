@@ -24,6 +24,8 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -53,16 +55,43 @@ _UNSET = object()
 
 
 def _resolvers(*, pending=_UNSET, cids=()):
-    """A whole fake machine: the scan's verdict + the ledger's entries.
+    """A COMPLETE fake machine (v0.2.102 W4-C flake fix).
 
-    ``pending=None`` (a scan that could not look) is a VALID injection,
-    distinct from the default (unset) resolver, so the sentinel is explicit.
+    ``summary_pending`` + ``deferral_report`` are the probe under test. Every
+    OTHER machine-reading resolver is injected too: pre-fix they stayed at
+    their defaults, so ``run_doctor`` ran the whole full-scope probe set
+    against the real machine — and against whatever an earlier test in the
+    session had left behind (a reachable class listing, a leaked env var, a
+    patched transport). On a machine with a populated unclaimed Weaviate
+    class, ``kg_binding_evidence`` flipped ``report.ok`` and these tests
+    went red in roughly one of three full runs, green alone. The doctor
+    engine's own contract (``test_v0291_doctor_phase``: "Hermeticity is the
+    design constraint — a complete fake machine is three lambdas") is what
+    this fixture now actually builds. ``pending=None`` (a scan that could
+    not look) is a VALID injection, distinct from the default (unset)
+    resolver, so the sentinel is explicit.
     """
     return doctor.DoctorResolvers(
         summary_pending=(
             None if pending is _UNSET else (lambda folder: pending)
         ),
         deferral_report=lambda folder: _FakeReport(cids),
+        # The rest of the machine, described — never measured.
+        npx_probe=lambda names: {
+            "schema_version": 1, "npx_present": True, "npm_present": True,
+            "npx_path": "/fake/npx", "npm_path": "/fake/npm",
+            "commands": {n: f"/fake/{n}" for n in names},
+        },
+        mcp_entries=lambda: {},
+        disk_usage=lambda p: SimpleNamespace(
+            total=10 ** 12, used=10 ** 9, free=500 * 2 ** 30,
+        ),
+        # "Could not look" shapes — each produces NO findings, never ok.
+        kg_binding_evidence=lambda: None,
+        gateway_state=lambda: None,
+        agent_id_problems=lambda folder: [],
+        environ=lambda: {},
+        rl_loss_summary=lambda since_ms: {"total": 0, "by_kind": {}},
     )
 
 
@@ -184,6 +213,63 @@ class SummaryPendingProbeTests(unittest.TestCase):
         self.assertEqual(scopes, (doctor.SCOPE_FULL,))
 
 
+class SessionPollutionImmunityTests(unittest.TestCase):
+    """The flake this file shipped with a fix for (coordinator item,
+    2026-10-08): the three ``report.ok`` tests flipped depending on test
+    order and live machine state — a populated UNCLAIMED Weaviate class on
+    this machine reached ``probe_kg_binding_evidence`` and turned the report
+    red in roughly 1 of 3 full runs, green alone. A test must never read the
+    live Weaviate instance. These pin the immunity: with the complete fake
+    machine, a session-polluted binding scan (exactly what a live class list
+    or an earlier test's patch leaves behind) cannot flip the verdict."""
+
+    def test_a_polluted_binding_scan_cannot_flip_the_verdict(self):
+        """Simulated polluting earlier test: the class listing answers with
+        one populated class no registered project claims. The DEFAULT
+        resolver would report it (unclaimed-class PROBLEM) — the injected
+        machine must never consult it."""
+        from vco_lib import kg_binding_doctor as kbd
+        from vco_lib.kg_binding_doctor import BindingEvidenceScan, UnclaimedClass
+
+        polluted = BindingEvidenceScan(
+            verdicts=(),
+            unclaimed=(UnclaimedClass(name="Ghost_KnowledgeGraph", count=3),),
+        )
+        with mock.patch.object(kbd, "scan_kg_binding_evidence",
+                               return_value=polluted):
+            report = doctor.run_doctor(
+                Path("/tmp/x"), resolvers=_resolvers(pending=_pending()),
+            )
+        f = next(f for f in report.findings if f.probe == "summary_pending")
+        self.assertEqual(f.status, doctor.STATUS_OK)
+        self.assertEqual(
+            [x.probe for x in report.problems], [],
+            "a session-polluted machine state must not fail the report",
+        )
+        self.assertTrue(report.ok)
+
+    def test_no_probe_touches_a_real_weaviate_transport(self):
+        """The complete fake machine leaves nothing to the defaults: running
+        the doctor with a poisoned transport seam (any HTTP attempt raises
+        loudly) still completes — nothing reached out."""
+        from vco_lib import weaviate_helpers
+
+        def _poisoned(*a, **kw):
+            raise AssertionError(
+                "a hermetic doctor run must not touch a Weaviate transport"
+            )
+
+        with mock.patch.object(weaviate_helpers, "http_request", _poisoned), \
+                mock.patch.object(weaviate_helpers, "post_graphql_safe",
+                                  _poisoned):
+            report = doctor.run_doctor(
+                Path("/tmp/x"), resolvers=_resolvers(pending=_pending()),
+            )
+        f = next(f for f in report.findings if f.probe == "summary_pending")
+        self.assertEqual(f.status, doctor.STATUS_OK)
+        self.assertTrue(report.ok)
+
+
 class SummaryPendingRealScanTests(unittest.TestCase):
     """The DEFAULT resolver is the real scan — no second counting."""
 
@@ -211,11 +297,11 @@ class SummaryPendingRealScanTests(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            # Only the ledger leg is faked (hermeticity): the scan runs for
-            # real against the fixture tree.
-            res = doctor.DoctorResolvers(
-                deferral_report=lambda folder: _FakeReport([]),
-            )
+            # Only the summary scan runs for real against the fixture tree;
+            # the REST of the machine comes from the same complete fake as
+            # `_resolvers` — pre-fix these tests had the same machine-state
+            # dependence the probe tests did (see `_resolvers`).
+            res = _resolvers(pending=_UNSET)
             report = doctor.run_doctor(root, resolvers=res)
             f = next(f for f in report.findings if f.probe == "summary_pending")
             self.assertEqual(f.status, doctor.STATUS_PROBLEM)
@@ -245,9 +331,7 @@ class SummaryPendingRealScanTests(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            res = doctor.DoctorResolvers(
-                deferral_report=lambda folder: _FakeReport([]),
-            )
+            res = _resolvers(pending=_UNSET)
             report = doctor.run_doctor(root, resolvers=res)
             f = next(f for f in report.findings if f.probe == "summary_pending")
             self.assertEqual(f.status, doctor.STATUS_OK)

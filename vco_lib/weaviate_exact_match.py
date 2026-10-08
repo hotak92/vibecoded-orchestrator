@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "PAGE_SIZE",
     "MAX_PAGES",
+    "names_same_path",
     "path_spellings",
     "path_narrowing_filter",
     "is_exact_path",
@@ -80,6 +81,34 @@ PAGE_SIZE = 100
 MAX_PAGES = 100
 
 _WORD_TOKEN_RE = re.compile(r"[^\W_]+")
+
+
+def names_same_path(a: Any, b: Any) -> bool:
+    """Tolerant path IDENTITY for a user-typed code-graph target (v0.2.102 L4).
+
+    Code-graph rows hold repo-relative POSIX paths, but a caller types
+    whatever it has — ``./a/b.py``, a trailing slash, Windows separators, or
+    an ABSOLUTE editor path for a repo-relative row. Equal after POSIX
+    normalisation (``./`` / ``..`` / trailing slash / backslashes all fold),
+    or one path is the other's whole-segment suffix (relative vs absolute).
+
+    The ONE home for the rule: the CLI's ``--exclude-file`` filter
+    (``query_code_graph.py::_same_source_file``) delegates here, and the
+    MCP's reverse-imports lookup (``query_code_structure("imports", …)``)
+    confirms each candidate importer's referenced paths with it. A missing /
+    empty / non-string side is never a match.
+    """
+    import posixpath
+
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    na = posixpath.normpath(a.replace("\\", "/"))
+    nb = posixpath.normpath(b.replace("\\", "/"))
+    if not na or not nb or na in (".", "..") or nb in (".", ".."):
+        return False
+    if na == nb:
+        return True
+    return na.endswith("/" + nb) or nb.endswith("/" + na)
 
 
 def path_spellings(canonical: str) -> Tuple[str, ...]:

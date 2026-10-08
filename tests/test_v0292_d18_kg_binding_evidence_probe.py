@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -569,3 +570,230 @@ class ClearProbeTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# v0.2.102 W4-C L2 — the doctor's KG drift census (kg_drift_census probe)
+# ---------------------------------------------------------------------------
+
+
+class DriftCensusTests(unittest.TestCase):
+    """The stored-vs-disk census: `scan_drift` finally has a doctor leg.
+
+    Every test drives the PRODUCTION probe through the registered dispatch
+    (``run_doctor``) or the probe function itself, with the REAL
+    :func:`vco_lib.kg_sync_drift.scan_drift` under the scanner's own IO seams
+    (``reachable_fn`` / ``query_hashes_fn``) — the census is wiring, the
+    scanner is the one home for the comparison.
+    """
+
+    def _identity(self, tmp, *, name="Alpha", collection="Alpha_KnowledgeGraph"):
+        from vco_lib.project_identity import (
+            SOURCE_BINDING,
+            IdentitySnapshot,
+            ProjectIdentity,
+        )
+
+        folder = tmp / (name + "-folder")
+        folder.mkdir(parents=True, exist_ok=True)
+        ident = ProjectIdentity(
+            name=name, folder_path=str(folder),
+            kg_primary=collection, kg_primary_source=SOURCE_BINDING,
+        )
+        snapshot = IdentitySnapshot(resolvable=True, projects=(ident,))
+        return ident, folder, snapshot
+
+    def _knowledge_node(self, folder, rel="concepts/x.md", text="# x\nbody\n"):
+        kdir = folder / "knowledge"
+        (kdir / rel).parent.mkdir(parents=True, exist_ok=True)
+        (kdir / rel).write_text(text, encoding="utf-8")
+        return "knowledge/" + rel
+
+    def _census(self, tmp, *, stored_own=True, extra_hashes=None,
+                reachable=True):
+        """The probe with the REAL scanner over fake Weaviate seams.
+
+        ``stored_own``: whether the on-disk node's own hash is in the stored
+        set (False = the disk-only case). ``extra_hashes``: further stored
+        rows (the stored-only case)."""
+        from functools import partial
+
+        from vco_lib import kg_sync_drift
+        from vco_lib import doctor as _doctor
+
+        _ident, folder, snapshot = self._identity(tmp)
+        rel = self._knowledge_node(folder)
+        signature = kg_sync_drift.content_signature_excluding_updated(
+            (folder / rel).read_text(encoding="utf-8")
+        )
+        hashes = {} if not stored_own else {rel: signature}
+        hashes.update(extra_hashes or {})
+        with mock.patch.object(
+            kg_binding_doctor_project_identity(), "resolve_snapshot",
+            return_value=snapshot,
+        ):
+            with mock.patch.object(
+                kg_sync_drift, "scan_drift",
+                partial(
+                    kg_sync_drift.scan_drift,
+                    reachable_fn=lambda url: reachable,
+                    query_hashes_fn=lambda url, coll, on_warn=None: dict(hashes),
+                ),
+            ):
+                report = _doctor.run_doctor(
+                    tmp, resolvers=_doctor.DoctorResolvers(),
+                )
+        return next(
+            f for f in report.findings if f.probe == "kg_drift_census"
+        ), report, rel, signature
+
+    def test_disk_only_node_is_reported_by_the_doctor_row(self):
+        """The L2 red-proof: one disk-only node → a problem row naming the
+        count and the remedy command. Pre-fix there was NO kg_drift_census
+        row at all."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            finding, report, _rel, _sig = self._census(
+                Path(td), stored_own=False, reachable=True,
+            )
+            self.assertEqual(finding.status, doctor.STATUS_PROBLEM)
+            self.assertIn("1 disk-only", finding.summary)
+            self.assertEqual(finding.detail["projects"][0]["disk_only"], 1)
+            self.assertIn("kg-sync --all", finding.command)
+            self.assertFalse(report.ok, "a drift census problem must fail the report")
+
+    def test_clean_project_is_an_ok_row(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            finding, report, _rel, _sig = self._census(
+                Path(td), stored_own=True, reachable=True,
+            )
+            self.assertEqual(finding.status, doctor.STATUS_OK)
+            self.assertTrue(report.ok)
+
+    def test_weaviate_down_is_unknown_never_a_crash(self):
+        """Soft-fail per project: Weaviate down → one warning row, `ok`."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            finding, report, _rel, _sig = self._census(
+                Path(td), stored_own=False, reachable=False,
+            )
+            self.assertEqual(finding.status, doctor.STATUS_UNKNOWN)
+            self.assertIn("Alpha", finding.summary)
+            self.assertTrue(report.ok, "an unknown census never fails the report")
+
+    def test_stored_only_row_is_census_drift_but_not_gate_drift(self):
+        """A row whose file is gone: the scanner answers `ok` (no re-sync is
+        owed — the bundle-update gate must not spawn one), and the census
+        still reports it as drift with its own remedy."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            from vco_lib import kg_sync_drift
+
+            _ident, folder, snapshot = self._identity(tmp=Path(td))
+            rel = self._knowledge_node(folder)
+            own_sig = kg_sync_drift.content_signature_excluding_updated(
+                (folder / rel).read_text(encoding="utf-8")
+            )
+            report = kg_sync_drift.scan_drift(
+                folder / "knowledge",
+                weaviate_url="http://127.0.0.1:9",
+                kg_collection="Alpha_KnowledgeGraph",
+                reachable_fn=lambda url: True,
+                query_hashes_fn=lambda url, coll, on_warn=None: {
+                    rel: own_sig,
+                    "knowledge/concepts/gone.md": "deadbeef",
+                },
+            )
+            self.assertEqual(report.status, "ok",
+                             "stored-only alone must NOT flip the gate's status")
+            self.assertEqual(report.stored_only, ("knowledge/concepts/gone.md",))
+            # And the census reports it as drift with its own remedy (the
+            # same stored set, through the probe with patched scanner seams).
+            from functools import partial
+
+            from vco_lib import doctor as _doctor
+
+            with mock.patch.object(
+                kg_binding_doctor_project_identity(), "resolve_snapshot",
+                return_value=snapshot,
+            ):
+                with mock.patch.object(
+                    kg_sync_drift, "scan_drift",
+                    partial(
+                        kg_sync_drift.scan_drift,
+                        reachable_fn=lambda url: True,
+                        query_hashes_fn=lambda url, coll, on_warn=None: {
+                            rel: own_sig,
+                            "knowledge/concepts/gone.md": "deadbeef",
+                        },
+                    ),
+                ):
+                    findings = _doctor.probe_kg_drift_census(
+                        Path(td), _doctor.DoctorResolvers(),
+                        {"scope": _doctor.SCOPE_FULL},
+                    )
+            self.assertEqual(findings[0].status, doctor.STATUS_PROBLEM)
+            self.assertEqual(findings[0].detail["projects"][0]["stored_only"], 1)
+            self.assertIn("stored-only", findings[0].summary)
+
+    def test_no_binding_sourced_projects_no_row(self):
+        """Nothing registered → the census says nothing at all (the binding
+        probe owns the unbound/mismatch questions)."""
+        import tempfile
+
+        from vco_lib import doctor as _doctor
+        from vco_lib.project_identity import IdentitySnapshot
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                kg_binding_doctor_project_identity(), "resolve_snapshot",
+                return_value=IdentitySnapshot(resolvable=True, projects=()),
+            ):
+                self.assertEqual(
+                    _doctor.probe_kg_drift_census(
+                        Path(td), _doctor.DoctorResolvers(), {},
+                    ),
+                    [],
+                )
+
+    def test_scan_exception_is_a_warning_not_a_crash(self):
+        import tempfile
+
+        from vco_lib import doctor as _doctor
+        from vco_lib import kg_sync_drift
+
+        with tempfile.TemporaryDirectory() as td:
+            _ident, folder, snapshot = self._identity(tmp=Path(td))
+            self._knowledge_node(folder)
+            with mock.patch.object(
+                kg_binding_doctor_project_identity(), "resolve_snapshot",
+                return_value=snapshot,
+            ):
+                with mock.patch.object(
+                    kg_sync_drift, "scan_drift",
+                    side_effect=RuntimeError("boom"),
+                ):
+                    findings = _doctor.probe_kg_drift_census(
+                        Path(td), _doctor.DoctorResolvers(), {},
+                    )
+            self.assertEqual(findings[0].status, doctor.STATUS_UNKNOWN)
+            self.assertIn("boom", findings[0].summary)
+
+    def test_full_only_not_a_boot_probe(self):
+        """Network reads per project collection: full scope only, the same
+        cost/promises reasoning as kg_binding_evidence."""
+        self.assertIn("kg_drift_census", doctor.PROBES)
+        _fn, scopes = doctor.PROBES["kg_drift_census"]
+        self.assertEqual(scopes, (doctor.SCOPE_FULL,))
+
+
+def kg_binding_doctor_project_identity():
+    """The module object whose ``resolve_snapshot`` the census consults."""
+    import vco_lib.project_identity as pi
+
+    return pi
