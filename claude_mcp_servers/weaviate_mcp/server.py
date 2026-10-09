@@ -2984,6 +2984,17 @@ def _format_result_by_tier(
         base["content"] = "\n".join(c for _, c in chunks)
         if fp and len(chunks) == 1:
             _label_single_chunk_coverage(base, {"file_path": fp})
+        else:
+            # No node key, or more than one row matched: the body may mix two
+            # nodes (the W7 rule), so it is not certified — say so explicitly,
+            # like the single-chunk preview path, instead of leaving no label.
+            base["coverage"] = "partial"
+            base["retrieval_hint"] = (
+                "Could not confirm this is the whole node (no file key, or "
+                "more than one matching row). Read "
+                + (fp if fp else "the source file")
+                + " for the full content."
+            )
         return base
 
     # Single-chunk node (or coll unavailable) — return content as-is.

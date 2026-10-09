@@ -8,7 +8,9 @@ The WRITE side is the launcher's per-node access editor
 Weaviate object — ``["*"]`` = readable by every project, ``[<project-id>…]``
 = exactly those launcher project ids, ``[]`` = private.
 
-Every KG read surface that can return a row from a collection that is not
+Every KG retrieval surface (agent- and hook-facing; the operator maintenance
+tools ``repair_kg_typed_links.py`` and ``maintain_knowledge_graph.py`` read
+their own explicitly named collections and are out of scope) that can return a row from a collection that is not
 the requesting project's own applies :func:`filter_objects` to those rows:
 
 * the weaviate-kg MCP fan-out (``hybrid_search``, ``semantic_graph_search``

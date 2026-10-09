@@ -133,3 +133,20 @@ def test_code_full_tier_whole_entity_has_no_partial_note():
     out = srv._format_code_result_by_tier(_code_props(3), "CodeFunction", "full",
                                           chunk_fetcher=fetch)
     assert out["chunks_shown"] == 3 and "note" not in out
+
+
+def test_keyless_fetched_single_chunk_row_is_labelled_partial(monkeypatch):
+    """W4-G review F3: a fetched row without a node key (or with more than one
+    matching row) is not certified complete, and says so explicitly."""
+    srv = _srv()
+    monkeypatch.setattr(srv, "_fetch_node_chunks", lambda *a, **k: [(1, LONG)])
+    result = dict(srv._format_obj(_obj(LONG), "C"), file_path="")
+    out = srv._format_result_by_tier(result, "full", sidecar_db={}, coll=object())
+    assert out["content"] == LONG
+    assert out["coverage"] == "partial"
+    assert "No further Read" not in out["retrieval_hint"]
+
+    monkeypatch.setattr(srv, "_fetch_node_chunks", lambda *a, **k: [(1, "a"), (1, "b")])
+    out = srv._format_result_by_tier(srv._format_obj(_obj(LONG), "C"), "full",
+                                     sidecar_db={}, coll=object())
+    assert out["coverage"] == "partial" and FP in out["retrieval_hint"]

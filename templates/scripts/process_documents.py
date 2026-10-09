@@ -412,6 +412,18 @@ def generate_document_summary(server: WeaviateMCPServer, title: str, content: st
 
     Returns summary (2-3 sentences)
     """
+    # v0.2.102 W4-G: the ONE generate-body builder owns the load-time
+    # options (shared num_ctx → one resident copy of the model across
+    # every VCO caller) and the shared keep_alive policy. The MODEL is the
+    # machine's generation model as the KG-summary ladder resolves it
+    # (`summary_backends.OLLAMA_DEFAULT_MODEL`, `KG_SUMMARY_OLLAMA_MODEL`
+    # overrides) — never a second, hard-coded model resident beside it.
+    # Imported OUTSIDE the best-effort try below: a missing vco_lib or
+    # ladder is a broken install and must fail loudly, not degrade to the
+    # default summary. The ladder ships beside this script in every bundle.
+    import summary_backends as _sb  # pyright: ignore[reportMissingImports]
+    from vco_lib.ollama_generate import generate_request_body
+
     try:
         import requests
 
@@ -426,16 +438,6 @@ Content:
 {sample}
 
 Summary:"""
-
-        # v0.2.102 W4-G: the ONE generate-body builder owns the load-time
-        # options (shared num_ctx → one resident copy of the model across
-        # every VCO caller) and the shared keep_alive policy. The MODEL is the
-        # machine's generation model as the KG-summary ladder resolves it
-        # (`summary_backends.OLLAMA_DEFAULT_MODEL`, `KG_SUMMARY_OLLAMA_MODEL`
-        # overrides) — never a second, hard-coded model resident beside it.
-        # The ladder ships beside this script in every bundle.
-        import summary_backends as _sb  # pyright: ignore[reportMissingImports]
-        from vco_lib.ollama_generate import generate_request_body
 
         response = requests.post(
             f"{OLLAMA_URL}/api/generate",

@@ -244,3 +244,12 @@ def test_haiku_api_call_sends_no_temperature(monkeypatch):
     assert gnf.call_haiku("p", 64) == "ok"
     assert "temperature" not in captured
     assert os.environ.get("ANTHROPIC_API_KEY") == "test-not-a-key"
+
+
+def test_process_documents_broken_install_fails_loudly(monkeypatch):
+    """W4-G review F2: an unimportable builder is a broken install — it must
+    raise, not degrade to the "Document about <title>" default summary."""
+    pd = importlib.import_module("process_documents")
+    monkeypatch.setitem(sys.modules, "vco_lib.ollama_generate", None)
+    with pytest.raises(ImportError):
+        pd.generate_document_summary(None, "Title", "content")
