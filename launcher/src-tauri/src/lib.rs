@@ -2880,7 +2880,10 @@ pub fn run() {
             // lifecycle (Phase 1E) + weights-update polling (Phase 3C)
             // + fine-tune-after-download (Phase 4A) + dashboard widget
             // (Phase 4B scaffolding). Wired commands:
-            commands::module_service::restart_rl_container,
+            // v0.2.102 (W5-B OD-11): the RL-specific `restart_rl_container`
+            // is retired — subsumed by the generic per-module Restart below
+            // (same restart_container_with pipeline, any installed module).
+            commands::module_service::restart_module_container,
             // NEW-3 (2026-05-28): generic start for service/container modules
             // whose container_name is NULL (auto-start was skipped).
             commands::module_service::start_module_container,
@@ -3317,15 +3320,16 @@ pub fn run() {
             // now" button instead of a copy/paste instruction.
             commands::installer::launch_installer_terminal,
             // Durable install log reader. Backs the OnboardingWizard's
-            // skip-if-installed path + a future Settings → Install
-            // Diagnostics panel. Pull-only: the FE invokes on demand.
+            // skip-if-installed path + the project Settings "Install log"
+            // panel (v0.2.102). Pull-only: the FE invokes on demand.
             commands::installer::read_install_log,
-            // TODO(safety): wire preflight_install_safety_check to the
-            //   OnboardingWizard's confirm-step (owner-deferred to v0.2.102).
-            //   `install_orchestrator` runs `diff_install` itself and refuses
-            //   with `InstallConflictError`; preflight returns the richer
-            //   SafetyReport (volumes, collections, services classification)
-            //   and should run before clicking Install on a fresh path.
+            // v0.2.102 (W5-B C7): wired to the OnboardingWizard's
+            // install-confirm panel — the FE runs this read-only check
+            // when the modal opens, renders the SafetyReport (volumes,
+            // collections, services classification) and blocks Install on
+            // a refusal. `install_orchestrator` remains the authority: it
+            // runs `diff_install` itself and refuses with
+            // `InstallConflictError`.
             commands::installer::preflight_install_safety_check,
             commands::storage_ux::get_volumes_config,
             commands::storage_ux::set_volumes_config_for_install,

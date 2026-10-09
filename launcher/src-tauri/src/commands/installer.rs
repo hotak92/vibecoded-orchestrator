@@ -2438,8 +2438,10 @@ fn list_user_paths_under(path: &Path, cap: usize) -> Vec<String> {
 }
 
 /// Pre-flight safety check: the report for a "you're about to install"
-/// panel. NOTE: no launcher screen calls this yet; the panel is deferred by
-/// the owner to v0.2.102, and this command does NOT gate installs. The
+/// panel. Since v0.2.102 (W5-B C7) the OnboardingWizard's install-confirm
+/// modal runs this when it opens and renders the findings; a refusal line
+/// (the volumes step's runtime-ownership refusal) blocks the modal's
+/// Install action. This command still does NOT gate installs itself — the
 /// actual refusal lives in `install_orchestrator` (`diff_install` conflict
 /// check). Fully read-only — never mutates Weaviate, container
 /// state, or files at `install_path`.

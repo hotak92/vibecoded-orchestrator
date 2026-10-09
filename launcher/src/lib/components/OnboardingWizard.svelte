@@ -16,6 +16,15 @@
     type WeaviateChoice,
   } from '$lib/components/onboarding-service-choice';
   import { runtimeOwnerRefusal } from '$lib/components/onboarding-runtime-refusal';
+  // v0.2.102 (W5-B C7): the install-confirm modal's safety panel, fed by
+  // `preflight_install_safety_check`. The pure derivations (refusal
+  // detection, warning lines) live in the module so vitest can pin them.
+  import {
+    safetyRefusal,
+    safetyWarnings,
+    createsCollections,
+    type SafetyReport,
+  } from '$lib/components/install-safety-panel';
   import type {
     OpenAiValidationResult,
     RegisterOpenAiResponse,
@@ -101,6 +110,37 @@
   // we want one explicit confirmation step so the user understands
   // what's about to happen.
   let showInstallConfirm = $state(false);
+
+  // v0.2.102 (W5-B C7): the safety panel inside that confirmation modal.
+  // `requestInstall()` opens the modal AND asks the backend what the
+  // install is about to touch (read-only check — it never mutates
+  // anything). A REFUSAL in the report (today: the volumes step's
+  // runtime-ownership refusal) disables the modal's Install button and is
+  // rendered as a blocking panel, so the user learns it BEFORE the install
+  // starts and dies mid-flight. Soft-fail: a check that cannot run leaves
+  // the modal usable (the install itself re-runs every check authoritatively).
+  let safetyReport = $state<SafetyReport | null>(null);
+  let safetyLoading = $state(false);
+  let safetyError = $state<string | null>(null);
+  const safetyBlock = $derived(safetyRefusal(safetyReport));
+
+  async function loadSafetyReport() {
+    safetyReport = null;
+    safetyError = null;
+    if (!installPath) return;
+    safetyLoading = true;
+    try {
+      safetyReport = await invoke<SafetyReport>('preflight_install_safety_check', {
+        installPath,
+      });
+    } catch (e) {
+      // Not a gate: the install's own steps remain the authority. The
+      // panel simply shows the probe failed.
+      safetyError = e instanceof Error ? e.message : String(e);
+    } finally {
+      safetyLoading = false;
+    }
+  }
 
   // Bug 29: shared-container detection. On step 3 entry we probe the three
   // default ports and tell the user whether their install will REUSE existing
@@ -1030,6 +1070,9 @@
   function requestInstall() {
     if (installing || sourceError) return;
     showInstallConfirm = true;
+    // W5-B C7: the check runs when the confirm modal opens, so the user
+    // reads the findings before the Install button means anything.
+    void loadSafetyReport();
   }
   async function confirmInstall() {
     showInstallConfirm = false;
@@ -1890,13 +1933,72 @@
       <code class="ow-mono">{installPath}</code>. This will set up the
       orchestrator alongside your existing source files. Continue?
     </p>
+
+    <!-- v0.2.102 (W5-B C7): the pre-flight safety panel. Read-only findings
+         from `preflight_install_safety_check`: what is preserved, what is
+         reused, and the risk lines. A REFUSAL blocks Install (see the
+         footer's disabled state) — everything else is information. -->
+    <div class="ow-safety">
+      <h3>Pre-flight check</h3>
+      {#if safetyLoading}
+        <p class="ow-secondary">Checking what the install will touch…</p>
+      {:else if safetyError}
+        <p class="ow-secondary">
+          The safety check could not run ({safetyError}) — the install's own
+          steps remain the authority.
+        </p>
+      {:else if safetyReport}
+        {#if safetyBlock}
+          <div class="ow-runtime-refusal" role="alert" style="margin:8px 0;">
+            <p><strong>Continue is blocked:</strong> the install will refuse on this condition.</p>
+            <p class="ow-error">{safetyBlock}</p>
+          </div>
+        {/if}
+        {#if safetyReport.will_preserve_user_code.length > 0}
+          <p class="ow-secondary">
+            Your code in {safetyReport.will_preserve_user_code.length} path(s)
+            under the install target is preserved — for example
+            <code class="ow-mono">{safetyReport.will_preserve_user_code[0]}</code>.
+          </p>
+        {/if}
+        {#if safetyReport.existing_volumes.length > 0}
+          <p class="ow-secondary">
+            {safetyReport.existing_volumes.length} existing container volume(s)
+            detected — they are reused as-is, never removed or rebound.
+          </p>
+        {/if}
+        {#if createsCollections(safetyReport)}
+          <p class="ow-secondary">
+            New Weaviate collections will be created:
+            {#each safetyReport.new_collections_to_add as c}<code class="ow-mono">{c}</code> {/each}.
+            Existing collections are preserved.
+          </p>
+        {/if}
+        {#if safetyReport.services_to_start.length > 0}
+          <p class="ow-secondary">
+            Services the install will start:
+            {#each safetyReport.services_to_start as s}<code class="ow-mono">{s}</code> {/each}.
+          </p>
+        {/if}
+        {#each safetyWarnings(safetyReport) as risk}
+          <p class="ow-secondary ow-warn">⚠ {risk}</p>
+        {/each}
+      {:else}
+        <p class="ow-secondary">All clear.</p>
+      {/if}
+    </div>
   {/snippet}
   {#snippet footer()}
     <div class="ow-confirm-actions">
       <button class="ow-btn" onclick={cancelInstallConfirm} disabled={installing}>
         Cancel
       </button>
-      <button class="ow-btn-primary" onclick={confirmInstall} disabled={installing || !!sourceError}>
+      <button
+        class="ow-btn-primary"
+        onclick={confirmInstall}
+        disabled={installing || !!sourceError || !!safetyBlock}
+        title={safetyBlock ? 'The pre-flight check found a condition the install will refuse on. Clear it first.' : 'Run the install'}
+      >
         {installing ? 'Installing…' : 'Install'}
       </button>
     </div>
@@ -2223,6 +2325,10 @@
   .ow-checkbox { display: flex; gap: 6px; align-items: center; margin-top: 8px; font-size: 12px; color: #ccc; cursor: pointer; }
   .ow-checkbox input { margin: 0; }
   .ow-warn { color: #ffb84a; }
+  /* v0.2.102 (W5-B C7): the install-confirm modal's pre-flight panel —
+     same card chrome as .ow-services (the canonical recipe). */
+  .ow-safety { margin-top: 8px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; background: rgba(255,255,255,0.02); }
+  .ow-safety h3 { font-size: 13px; margin: 0 0 6px; color: #ccc; }
 
   /* Bug 31: container volumes location picker. */
   .ow-volumes { margin-top: 12px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; background: rgba(255,255,255,0.02); }

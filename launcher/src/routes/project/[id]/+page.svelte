@@ -12,6 +12,14 @@
   import PacksTab from '$lib/project-state/PacksTab.svelte';
   import HooksTab from '$lib/project-state/HooksTab.svelte';
   import PermissionsTab from '$lib/project-state/PermissionsTab.svelte';
+  // v0.2.102 (W5-B C4): the per-project MCP REGISTRY tab — the rows the
+  // populate step mirrors from the project's .claude/settings.json and
+  // .mcp.json, with the registry toggle (mirrored into ~/.claude.json's
+  // disabledMcpServers by the backend through the one existing writer)
+  // and the user-added Unregister action. Sits after Permissions, which
+  // hosts the complementary per-project gate over the orchestrator's
+  // configured servers.
+  import McpTab from '$lib/project-state/McpTab.svelte';
   import SecretsTab from '$lib/project-state/SecretsTab.svelte';
   import KgCodegraphTab from '$lib/project-state/KgCodegraphTab.svelte';
   // PR-8 (v0.2.11 / 2026-05-15): per-project Identity tab + cross-project
@@ -80,7 +88,7 @@
   // when the active project's host is `orchestrator_root`. Pinned to
   // the end of the tab strip so it doesn't shift existing tab indices
   // for muscle-memory users on normal projects.
-  let activeTab = $state<'identity' | 'agents' | 'skills' | 'packs' | 'hooks' | 'permissions' | 'access' | 'secrets' | 'kg' | 'settings' | 'orchestrator_core'>('agents');
+  let activeTab = $state<'identity' | 'agents' | 'skills' | 'packs' | 'hooks' | 'permissions' | 'mcp' | 'access' | 'secrets' | 'kg' | 'settings' | 'orchestrator_core'>('agents');
 
   // v0.2.23 F2: the orchestrator-root project is treated as a special
   // project — same tab template, plus one extra "Orchestrator core"
@@ -272,6 +280,7 @@
     { id: 'packs', label: 'Packs' },
     { id: 'hooks', label: 'Hooks' },
     { id: 'permissions', label: 'Permissions' },
+    { id: 'mcp', label: 'MCP servers' },
     { id: 'access', label: 'Cross-project access' },
     { id: 'secrets', label: 'Secret refs' },
     { id: 'kg', label: 'KG / Codegraph' },
@@ -404,6 +413,8 @@
       <HooksTab projectId={project.id} />
     {:else if activeTab === 'permissions'}
       <PermissionsTab projectId={project.id} />
+    {:else if activeTab === 'mcp'}
+      <McpTab projectId={project.id} />
     {:else if activeTab === 'access'}
       <CrossProjectAccessTab projectId={project.id} />
     {:else if activeTab === 'secrets'}

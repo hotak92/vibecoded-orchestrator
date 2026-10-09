@@ -706,6 +706,39 @@
     return runtimeType === 'container' || runtimeType === 'service';
   }
 
+  // v0.2.102 (W5-B, OD-11): the generic per-module Restart. Reuses the
+  // same backend pipeline the retired RL-specific command used
+  // (`restart_module_container` → stop + re-launch via the manifest).
+  // Confirm-gated: restarting drops whatever the container is doing
+  // mid-flight (e.g. an in-progress training run), so the user says so
+  // first — the same gate Uninstall uses.
+  let restartingModuleId = $state<string | null>(null);
+
+  async function handleRestartContainer(m: ModuleCatalogEntry) {
+    if (!project) {
+      alert('Select a project from the menu bar first.');
+      return;
+    }
+    const sure = confirm(
+      `Restart ${m.name}? Its container is stopped and started again — ` +
+        'anything it is doing right now (e.g. an in-flight training run) is dropped.',
+    );
+    if (!sure) return;
+    restartingModuleId = m.id;
+    try {
+      await invoke('restart_module_container', {
+        projectId: project.id,
+        moduleId: m.id,
+      });
+      toast.success(`${m.name} container restarted`);
+      await modules.loadInstalled(project.id);
+    } catch (e) {
+      alert(`Restart failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      restartingModuleId = null;
+    }
+  }
+
   function getInstalledRow(m: ModuleCatalogEntry) {
     return mState.installed.find((r) => r.module_id === m.id) ?? null;
   }
@@ -1225,6 +1258,20 @@
                   data-testid="btn-start-container"
                 >
                   {startingModuleId === m.id ? 'Starting…' : 'Start'}
+                </button>
+              {:else if display.install_row.container_name && isLongRunningRuntime(m.runtime_type)}
+                <!-- v0.2.102 (W5-B, OD-11): the generic Restart — the tile
+                     affordance that subsumes the retired RL-specific
+                     command. Confirm-gated in the handler. -->
+                <button
+                  class="btn-3d btn-3d-secondary btn-3d-sm"
+                  onclick={() => handleRestartContainer(m)}
+                  disabled={restartingModuleId === m.id || !project}
+                  aria-label="Restart {m.name} container"
+                  data-testid="btn-restart-container"
+                  title="Stop and start this module's container (in-flight work is dropped)"
+                >
+                  {restartingModuleId === m.id ? 'Restarting…' : 'Restart'}
                 </button>
               {/if}
               <button

@@ -403,6 +403,17 @@ def _run_main_with_stats(tmp_path: Path, stats: dict, extra_argv: list):
 
     repo = tmp_path / "repo"
     _repo(repo, {"a.txt": "x\n"})
+    # v0.2.102 (W5-B follow-up, the W-CHECKOUT-LEDGER fix): pin the
+    # analyzer's deferral root at the FIXTURE repo. `child_env()` pins
+    # $VCT_ORCHESTRATOR_ROOT at the CHECKOUT (deliberately — the child must
+    # import THIS tree's vco_lib), and the analyzer's `install_root` —
+    # hence its deferral root — is exactly that variable, so the
+    # exit-0 leg's `record_successful_walk` (and any emit) wrote
+    # UPDATE_DEFERRED.md/.json + the CLAUDE.md reminder block INTO THE
+    # CHECKOUT. `--deferral-root` is the script's own seam for this
+    # (v0.2.91 MAJOR-A): every deferral op of the run, emit AND clear,
+    # targets the tmp repo instead.
+    extra_argv = ["--deferral-root", str(repo)] + list(extra_argv)
     runner = tmp_path / "runner.py"
     runner.write_text(textwrap.dedent(f"""\
         import sys, importlib.util
@@ -569,6 +580,11 @@ def test_as_extra_path_flag_reaches_analyze_repository(tmp_path):
         sys.exit(mod.main())
     """))
     argv = cer.build_extra_sync_argv(str(repo), "Acme", False, None)
+    # W-CHECKOUT-LEDGER (v0.2.102 W5-B follow-up): same pin as
+    # `_run_main_with_stats` — without it the exit-0 run's
+    # `record_successful_walk` writes the deferral ledger into the CHECKOUT
+    # ($VCT_ORCHESTRATOR_ROOT, pinned there by `child_env` for imports).
+    argv += ["--deferral-root", str(repo)]
     proc = subprocess.run([sys.executable, str(runner), *argv], capture_output=True,
                           text=True, timeout=60, env=child_env(VCT_JOERN_AVAILABLE="0"))
     assert proc.returncode == 0, proc.stderr[-2000:]
