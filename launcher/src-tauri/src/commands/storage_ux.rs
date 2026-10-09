@@ -875,6 +875,19 @@ pub(crate) fn set_deferral_root_for_tests(root: Option<PathBuf>) {
     DEFERRAL_ROOT_OVERRIDE.with(|r| *r.borrow_mut() = root);
 }
 
+/// The current override, if any (the getter half of the test seam; pins
+/// the panic-safety of [`fake_runtime_support::with_fake_runtimes`]'s
+/// restore). Always compiled like the setter — the module's own
+/// `volume_rm_only_callable_from_migrate_volumes` guard scans the source
+/// up to the file's first test-only attribute marker, and a test-gated
+/// item this early would truncate that scan before `migrate_volumes` is
+/// even defined (this is why the marker string does not appear here
+/// verbatim, either).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn deferral_root_override_for_tests() -> Option<PathBuf> {
+    DEFERRAL_ROOT_OVERRIDE.with(|r| r.borrow().clone())
+}
+
 /// Spawn a `python` (or `python3`) child to add a deferral entry via
 /// `vco_lib.deferral_report`. Used when a migration partially succeeded
 /// or when override.yml carried user customizations we don't want to
@@ -2845,16 +2858,51 @@ pub(crate) mod fake_runtime_support {
             ],
             || {
                 vct_launcher_core::services::runtime_verdict::invalidate();
+                // Panic-safe restore (review B3): a drop guard, so a test
+                // whose future panics cannot leak the override onto the
+                // next test scheduled on this thread (the leaked value is
+                // a dead tempdir — never the checkout — but a stale
+                // override would silently misdirect every later emission
+                // on the thread).
+                struct RestoreDeferralRoot;
+                impl Drop for RestoreDeferralRoot {
+                    fn drop(&mut self) {
+                        super::set_deferral_root_for_tests(None);
+                    }
+                }
+                let _restore = RestoreDeferralRoot;
                 super::set_deferral_root_for_tests(Some(dir.to_path_buf()));
                 let rt =
                     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 out = Some(vct_launcher_core::paths::with_lookup_path(Some(dir.as_os_str()), || {
                     rt.block_on(fut)
                 }));
-                super::set_deferral_root_for_tests(None);
             },
         );
         out.unwrap()
+    }
+
+    /// B3 pin: a PANICKING future must not leak the deferral-root override
+    /// onto this thread. Red-proof: replace the drop guard with a trailing
+    /// `set_deferral_root_for_tests(None)` (the pre-fix shape) and this
+    /// fails — the override survives the caught panic.
+    #[cfg(unix)]
+    #[test]
+    fn a_panicking_future_does_not_leak_the_deferral_root_override() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let dir = tempfile::tempdir().unwrap();
+        let prior_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            with_fake_runtimes(dir.path(), None, async { panic!("W5B-B3 pin: expected") });
+        }));
+        std::panic::set_hook(prior_hook);
+        assert!(result.is_err(), "the fixture future must have panicked");
+        assert!(
+            super::deferral_root_override_for_tests().is_none(),
+            "the override survived a panicking test — the next test on this \
+             thread would emit into a dead tempdir",
+        );
     }
 }
 
@@ -3497,9 +3545,14 @@ mod tests {
     /// fixture class the shared Python rule can decide, the Rust guard's
     /// verdict equals `classify_pair`'s. Drives the REAL
     /// `vco_lib.compose_override_pair.classify_pair` through the REAL
-    /// interpreter (the same call `python_classify_override_pair` makes);
-    /// skipped when no python is resolvable, like the deferral-bridge
-    /// end-to-end tests.
+    /// interpreter (the same call `python_classify_override_pair` makes).
+    ///
+    /// Skip discipline (review B2, v0.2.102): the ONLY acceptable skip is
+    /// a machine that POSITIVELY lacks a Python for vco_lib (the resolver
+    /// answers None) — announced on stderr. When an interpreter resolves,
+    /// a `None` answer from the subprocess leg is a BROKEN cross-language
+    /// pin and FAILS the test loudly; it may never silently pass green
+    /// (that would let the "must match" promise rot invisibly).
     #[test]
     fn override_pair_guard_matches_the_python_rule() {
         let cases: &[(&str, Option<&str>, Option<&str>, bool)] = &[
@@ -3516,14 +3569,47 @@ mod tests {
             ),
             ("divergent", Some(MANAGED_A), Some(MANAGED_B), true),
         ];
+
+        // The one visible skip: this environment positively has no Python.
+        let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+        else {
+            eprintln!(
+                "SKIPPED (visible): no python interpreter resolves for vco_lib on this \
+                 machine — the cross-language parity leg cannot run"
+            );
+            return;
+        };
+        // A resolved interpreter that cannot run `-c pass` is ALSO a
+        // positively-known environment fact, not a silent pass.
+        if std::process::Command::new(&python)
+            .arg("-c")
+            .arg("pass")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "SKIPPED (visible): resolved {} is not spawnable — the parity \
+                 leg cannot run",
+                python.display()
+            );
+            return;
+        }
+
         for (name, legacy, canonical, expect_divergent) in cases {
             let dir = override_pair_fixture(*legacy, *canonical);
             // Ask Python directly — the same snippet shape the guard uses.
             let legacy_p = dir.path().join("docker-compose.override.yml");
             let canonical_p = dir.path().join("compose.override.yaml");
             let Some(verdict) = python_classify_override_pair(&legacy_p, &canonical_p) else {
-                eprintln!("skipping ({name}): python rule not reachable");
-                return;
+                // Python resolved and spawns, but the rule could not be
+                // asked: the subprocess leg is BROKEN — fail loudly.
+                panic!(
+                    "fixture {name}: the shared classify_pair rule could not be \
+                     asked although {} resolves and spawns — the cross-language \
+                     parity leg is broken (spawn / import / output shape)",
+                    python.display(),
+                );
             };
             let got = override_pair_divergent(dir.path()).unwrap();
             assert_eq!(
