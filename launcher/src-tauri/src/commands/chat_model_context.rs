@@ -425,6 +425,137 @@ fn inspect_export(path: &Path) -> (bool, Option<String>, Option<usize>, Option<S
 
 // ─── Commands ─────────────────────────────────────────────────────────────
 
+// ─── v0.2.102 (OD-3): the edited-vs-shipped diff ──────────────────────────
+//
+// The pane's existing `edited` badge marks rows the USER edited through the
+// GUI (`user_edited`, the reseed guard). It cannot answer the sharper
+// question "does this row still say what VCO ships?": a machine-seeded row
+// can drift (an import, an older seed) without the flag, and a user-edited
+// row can have been edited BACK to the shipped values while keeping it.
+// This section computes the per-row comparison against the ONE shipped seed
+// (the same `load_seed_rows` the boot converge reads — no new file, no
+// second copy of the data) over the SEEDED fields only: `user_edited` and
+// `updated_at` belong to the store, not the seed, so they are not compared.
+
+/// One field that differs between the stored row and the shipped seed row
+/// for the same id. `shipped` / `yours` carry the field's value on each
+/// side, at its native JSON type (number, boolean, string).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ChatModelContextFieldDiff {
+    pub field: String,
+    pub shipped: serde_json::Value,
+    pub yours: serde_json::Value,
+}
+
+/// The per-row edited-vs-shipped verdict the pane badges and expands.
+///
+/// `edited == false` with an empty `diff` means "matches the shipped row"
+/// (or the seed could not be read — see [`edited_diff_vs_seed`]). A row
+/// whose id the shipped seed does not list (a hand-added model) is
+/// `edited == true` with the single whole-row entry below: it differs from
+/// "shipped" by existing.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatModelContextEditedDiff {
+    pub model_id: String,
+    pub edited: bool,
+    pub diff: Vec<ChatModelContextFieldDiff>,
+}
+
+/// The field name the whole-row entry uses for a row the seed does not ship.
+pub const EDITED_DIFF_NOT_SHIPPED_FIELD: &str = "(row not in shipped defaults)";
+
+/// Compare every STORED row with the shipped seed row of the same id.
+///
+/// Seed unavailable (`Ok(None)` — a binary-only install, or a clone without
+/// the file) answers an EMPTY vec rather than an error: the pane then shows
+/// no badges, which claims nothing, and the status card above the table
+/// already names the missing seed (`seed_available: false`). A DAMAGED seed
+/// is an error (same rule as every other seed reader here).
+fn edited_diff_vs_seed(db: &Db) -> Result<Vec<ChatModelContextEditedDiff>, String> {
+    let rows = db.list_chat_model_context()?;
+    let seed = match load_seed_rows(db)? {
+        Some((_, seed)) => seed,
+        None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut diff: Vec<ChatModelContextFieldDiff> = Vec::new();
+        match seed.iter().find(|s| s.model_id == row.model_id) {
+            Some(s) => {
+                if s.vendor != row.vendor {
+                    diff.push(ChatModelContextFieldDiff {
+                        field: "vendor".into(),
+                        shipped: serde_json::json!(s.vendor),
+                        yours: serde_json::json!(row.vendor),
+                    });
+                }
+                if s.context_window != row.context_window {
+                    diff.push(ChatModelContextFieldDiff {
+                        field: "context_window".into(),
+                        shipped: serde_json::json!(s.context_window),
+                        yours: serde_json::json!(row.context_window),
+                    });
+                }
+                if s.max_output != row.max_output {
+                    diff.push(ChatModelContextFieldDiff {
+                        field: "max_output".into(),
+                        shipped: serde_json::json!(s.max_output),
+                        yours: serde_json::json!(row.max_output),
+                    });
+                }
+                if s.window_1m != row.window_1m {
+                    diff.push(ChatModelContextFieldDiff {
+                        field: "window_1m".into(),
+                        shipped: serde_json::json!(s.window_1m),
+                        yours: serde_json::json!(row.window_1m),
+                    });
+                }
+                if s.text_only != row.text_only {
+                    diff.push(ChatModelContextFieldDiff {
+                        field: "text_only".into(),
+                        shipped: serde_json::json!(s.text_only),
+                        yours: serde_json::json!(row.text_only),
+                    });
+                }
+                if s.source != row.source {
+                    diff.push(ChatModelContextFieldDiff {
+                        field: "source".into(),
+                        shipped: serde_json::json!(s.source),
+                        yours: serde_json::json!(row.source),
+                    });
+                }
+                if s.source_note != row.source_note {
+                    diff.push(ChatModelContextFieldDiff {
+                        field: "source_note".into(),
+                        shipped: serde_json::json!(s.source_note),
+                        yours: serde_json::json!(row.source_note),
+                    });
+                }
+            }
+            None => diff.push(ChatModelContextFieldDiff {
+                field: EDITED_DIFF_NOT_SHIPPED_FIELD.into(),
+                shipped: serde_json::json!("—"),
+                yours: serde_json::json!("this row is yours; VCO does not ship it"),
+            }),
+        }
+        out.push(ChatModelContextEditedDiff {
+            model_id: row.model_id.clone(),
+            edited: !diff.is_empty(),
+            diff,
+        });
+    }
+    Ok(out)
+}
+
+/// The pane's badge data: per-row edited-vs-shipped, computed here from the
+/// embedded seed so the GUI never re-implements the comparison.
+#[command]
+pub async fn chat_model_context_edited_diff(
+    db: State<'_, Db>,
+) -> Result<Vec<ChatModelContextEditedDiff>, String> {
+    edited_diff_vs_seed(&db)
+}
+
 /// Result of a mutating command: what changed, and whether the gateway got
 /// it. Both halves always travel together — see the module doc.
 #[derive(Debug, Clone, Serialize)]
@@ -2000,5 +2131,148 @@ mod tests {
 
         let quiet = ReseedOutcome::default();
         assert!(quiet.written.is_empty());
+    }
+
+    // ── v0.2.102 (OD-3): edited-vs-shipped diff ─────────────────────────
+
+    /// A clone fixture whose seed carries one citable model (200K, no [1m])
+    /// — the base the edited-vs-shipped tests converge from. Not the
+    /// `#[cfg(unix)]` sibling: these tests assert pure DB+seed behaviour,
+    /// no tracing capture.
+    fn clone_with_one_seed_model_any(dir: &Path) -> PathBuf {
+        let clone = dir.join("clone");
+        let seed_dir = clone.join("claude_mcp_servers").join("model_router");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap();
+        std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
+        std::fs::create_dir_all(clone.join("state")).unwrap();
+        std::fs::write(
+            clone.join("state").join("install-manifest.json"),
+            r#"{"installed": true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            seed_dir.join("chat_model_context.seed.json"),
+            r#"{"schema_version": 1, "models": {
+                 "glm-5.3": {"vendor": "zai", "context_window": 200000,
+                             "max_output": 128000, "window_1m": false,
+                             "source": "https://docs.z.ai/guides/llm/glm-5.3"}}}"#,
+        )
+        .unwrap();
+        clone
+    }
+
+    /// THE BADGE'S CLAIM: only rows that differ from the shipped seed carry
+    /// `edited: true` — a converged row does not, an edited row does with
+    /// exactly the changed field and both values, a hand-added row does as
+    /// a whole-row entry, and a row edited BACK to the shipped values does
+    /// not (its `user_edited` flag stays set: the reseed guard and this
+    /// badge answer different questions).
+    ///
+    /// (Red-proof mutation: drop a field comparison in `edited_diff_vs_seed`
+    /// — every assertion naming that field fails; make the hand-added arm
+    /// return an empty diff — the `(row not in shipped defaults)` assertion
+    /// fails.)
+    #[test]
+    #[serial_test::serial]
+    fn edited_diff_flags_only_the_rows_that_differ_from_the_seed() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("editdiff");
+        let clone = clone_with_one_seed_model_any(&dir);
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+
+        // The seed's glm-5.3 row, field for field — the "edited back to
+        // shipped" arm must restore EXACTLY these values (the shared
+        // `input()` helper cites glm-5.1's page, which would itself diff).
+        let seed_row = || ChatModelContextInput {
+            model_id: "glm-5.3".into(),
+            vendor: "zai".into(),
+            context_window: 200_000,
+            max_output: 128_000,
+            window_1m: false,
+            text_only: false,
+            source: "https://docs.z.ai/guides/llm/glm-5.3".into(),
+            source_note: String::new(),
+        };
+
+        // Converged from the seed: matches shipped → no badge.
+        seed_and_export_on_boot(&db);
+        let diffs = edited_diff_vs_seed(&db).expect("diff computes");
+        assert_eq!(diffs.len(), 1, "the converged row is reported");
+        assert!(!diffs[0].edited);
+        assert!(diffs[0].diff.is_empty(), "identical to the shipped row");
+
+        // Edit ONE seeded field of that row: badge on, exactly that field.
+        db.upsert_chat_model_context(
+            ChatModelContextInput { context_window: 777, ..seed_row() },
+            true,
+        )
+        .unwrap();
+        // A hand-added model the seed does not ship: badge on, whole-row.
+        db.upsert_chat_model_context(input("my-own-model"), true).unwrap();
+        let diffs = edited_diff_vs_seed(&db).expect("diff computes");
+        assert_eq!(diffs.len(), 2);
+        let edited = diffs
+            .iter()
+            .find(|d| d.model_id == "glm-5.3")
+            .expect("the edited row is reported");
+        assert!(edited.edited);
+        assert_eq!(
+            edited.diff,
+            vec![ChatModelContextFieldDiff {
+                field: "context_window".into(),
+                shipped: serde_json::json!(200_000),
+                yours: serde_json::json!(777),
+            }],
+            "exactly the changed field, both values, native types"
+        );
+        let added = diffs
+            .iter()
+            .find(|d| d.model_id == "my-own-model")
+            .expect("the hand-added row is reported");
+        assert!(added.edited);
+        assert_eq!(added.diff.len(), 1);
+        assert_eq!(added.diff[0].field, EDITED_DIFF_NOT_SHIPPED_FIELD);
+
+        // Edit the row BACK to the shipped values: the flag stays set (the
+        // reseed guard must keep protecting it) but the badge goes — this
+        // is the row state the `user_edited` badge alone cannot express.
+        db.upsert_chat_model_context(seed_row(), true).unwrap();
+        let diffs = edited_diff_vs_seed(&db).expect("diff computes");
+        let back = diffs
+            .iter()
+            .find(|d| d.model_id == "glm-5.3")
+            .expect("the row is reported");
+        assert!(!back.edited, "shipped values again ⇒ no badge");
+        assert!(db.get_chat_model_context("glm-5.3").unwrap().unwrap().user_edited);
+
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No shipped seed reachable: an EMPTY answer, not an error and not a
+    /// tableful of badges — the pane shows nothing (claims nothing), and
+    /// the status card is the surface that names the missing seed.
+    #[test]
+    #[serial_test::serial]
+    fn edited_diff_with_no_seed_answers_empty_without_error() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("editdiff-noseed");
+        let clone = clone_without_seed(&dir);
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
+        db.upsert_chat_model_context(input("glm-5.3"), false).unwrap();
+
+        let diffs = edited_diff_vs_seed(&db).expect("no seed is not an error");
+        assert!(diffs.is_empty(), "no badges without a seed to compare to");
+
+        std::env::remove_var(EXPORT_PATH_ENV);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

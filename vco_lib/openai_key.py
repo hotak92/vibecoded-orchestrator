@@ -17,13 +17,21 @@ it went unread by the Python consumers. This module closes both halves:
   GUI writes) when the hub answers, else the file store
   ``$VCT_SECRETS_DIR/shared/openai_api_key`` through the ``vct`` CLI (its
   write guards apply).
-* **Resolve** — :func:`resolve_openai_api_key`: VCO's OWN slot only — the
-  shared ``openai_api_key`` (launcher keychain through the hub, else
-  ``~/.vct-secrets/shared/openai_api_key``), through
-  :func:`vco_lib.agent_secrets.get` in its shared-only mode. NOT
-  ``$OPENAI_API_KEY``, NOT a per-project binding, NOT the project's
-  ``.env``: a project's key is the project's (owner ruling 2026-09-26).
-  Every Python reader goes through it.
+* **Resolve** — :func:`resolve_openai_api_key`: the dedicated per-project
+  name first, then VCO's shared slot (owner decision OD-4 + its 2026-10-09
+  refinement). Leg 1: ``vco_openai_api_key`` at PROJECT scope — the
+  launcher keychain through the hub (a user-declared per-project key the
+  Secrets panel writes; the name is not slot-exclusive, so the hub serves
+  it), else the file store's per-project leg. Leg 2: the shared
+  ``openai_api_key`` slot, shared scope only (the hub's bundled
+  slot-exclusive declaration; a PER-PROJECT ``openai_api_key`` is never
+  read for VCO — the 2026-09-26 ruling stands for that name). A key the
+  hub reports PAUSED on either leg resolves empty with one WARNING naming
+  the panel — a pause is a deliberate owner decision and is never routed
+  around; ``key_not_active`` falls through to the next leg. NOT
+  ``$OPENAI_API_KEY``, and NOT the project's ``.env`` (tier 3 is excluded:
+  the matrix is the store, no new store). Every Python reader goes through
+  it.
 * **Migrate** — :func:`migrate_dotenv_openai_key`: a pre-v0.2.97 root
   ``.env`` line VCO wrote (under its ``# OpenAI (for embeddings)`` header)
   is removed ONLY on value evidence — it equals what the store holds,
@@ -48,6 +56,12 @@ from typing import Any, Callable, Optional
 
 #: The one name of the slot (``vct-module.json`` ``bundled_secrets``).
 OPENAI_SECRET_NAME = "openai_api_key"
+#: The DEDICATED per-project name (OD-4 refinement, owner 2026-10-09): the
+#: one way a project gives VCO its own OpenAI key. A per-project
+#: ``openai_api_key`` under the slot's own name is NEVER read for VCO — the
+#: hub keeps that name slot-exclusive, and the 2026-09-26 ruling stands for
+#: it — so the project-scoped leg has its own, unambiguous name.
+VCO_PROJECT_SECRET_NAME = "vco_openai_api_key"
 #: The variable VCO no longer reads for its own key (v0.2.98). Kept for the
 #: two places it still means something: the legacy ``.env`` LINE key
 #: :func:`migrate_dotenv_openai_key` removes, and the once-per-process warning
@@ -75,6 +89,10 @@ class MigrationUnavailable(RuntimeError):
 #: One warning per process: the env var is a process-wide fact, and a per-call
 #: repeat would be noise in an embedding loop.
 _warned_env_var = False
+
+#: One pause WARNING per process (v0.2.102, OD-4), same rationale: the pause
+#: is a machine/project-wide fact and a per-call repeat would be noise.
+_warned_paused = False
 
 
 def _warn_env_var_ignored(unreadable: str = "") -> None:
@@ -107,9 +125,12 @@ def _warn_env_var_ignored(unreadable: str = "") -> None:
     import sys
 
     shared = (
-        f"{OPENAI_ENV_VAR} is set — VCO no longer reads that variable, because "
-        f"a project shell may export ITS OWN key there and a project's key must "
-        f"never be spent on VCO. "
+        f"{OPENAI_ENV_VAR} is set — VCO no longer reads that variable: a "
+        f"project shell may export ITS OWN key there, and VCO resolves its "
+        f"OpenAI key only through the secrets panel (this project's "
+        f"{VCO_PROJECT_SECRET_NAME} first, then the shared "
+        f"{OPENAI_SECRET_NAME} slot — OD-4, v0.2.102), "
+        f"never through the environment. "
     )
     if unreadable:
         print(
@@ -137,18 +158,31 @@ def resolve_openai_api_key(project: Optional[str] = None) -> str:
     """VCO's OpenAI key for ``project`` (``None`` → the current directory), or
     ``""`` when VCO has none configured.
 
-    SCOPE RULE (owner ruling 2026-09-26): VCO's consumers use VCO's own slot
-    and nothing else. The ONE source is the shared ``openai_api_key`` slot —
-    the launcher keychain row through the hub, else
-    ``~/.vct-secrets/shared/openai_api_key``. ``$OPENAI_API_KEY`` is NOT read
-    (a project's key exported in that project's shell must not pay for VCO's
-    embeddings), and neither is a per-project secret binding nor the project's
-    own ``.env``.
+    SCOPE RULE (owner decision OD-4 + its 2026-10-09 refinement): TWO legs,
+    in order, both through :func:`vco_lib.agent_secrets.get` with tier 3
+    excluded (``allow_dotenv=False`` — the project's ``.env`` is never a
+    source):
 
-    ``project`` is only the REQUESTER identity: the hub's per-(secret ×
-    requester) pause matrix gates the keychain leg with it, and the
-    requester's ``.no-shared-fallback`` marker gates the file-store leg. It
-    never widens the lookup to that project's buckets.
+    1. **The project's dedicated key** — :data:`VCO_PROJECT_SECRET_NAME`
+       (``vco_openai_api_key``) at project scope: the launcher keychain
+       through the hub (a user-declared per-project key the Secrets panel
+       writes; the name is not slot-exclusive, so the hub serves it from
+       the user bucket), else the file store's per-project leg. This is
+       the ONE way a project gives VCO its own key.
+    2. **VCO's shared slot** — :data:`OPENAI_SECRET_NAME`
+       (``openai_api_key``) at SHARED scope only: the hub's bundled
+       slot-exclusive declaration, else ``shared/`` in the file store.
+       ``project`` is the REQUESTER identity for the hub's pause matrix
+       and the ``.no-shared-fallback`` opt-out, never a lookup scope: a
+       PER-PROJECT ``openai_api_key`` is never read for VCO (the
+       2026-09-26 ruling stands for that name).
+
+    ``key_paused`` on either leg (with no copy in a lower tier) resolves
+    ``""`` — the slot is OFF — with ONE WARNING naming the panel: a pause
+    is a deliberate owner decision, never routed around and never answered
+    from the other leg. ``key_not_active`` on leg 1 falls through to leg 2
+    (the project simply has no dedicated key). ``$OPENAI_API_KEY`` is
+    still NOT read (the matrix is the store; no new env name).
 
     Answers once per project per process — a miss costs one bounded
     localhost request, not one per embedding call."""
@@ -158,42 +192,89 @@ def resolve_openai_api_key(project: Optional[str] = None) -> str:
 
         unreadable = ""
         try:
+            # Leg 1: the project's dedicated key, project scope.
             _resolved[cache_key] = agent_secrets.get(
-                OPENAI_SECRET_NAME, project=project, shared_only=True,
+                VCO_PROJECT_SECRET_NAME, project=project, allow_dotenv=False,
             ).strip()
-        except agent_secrets.SecretNotFound:
-            # The slot answered and holds no such key: a PROVABLE absence.
+        except agent_secrets.SecretPaused:
+            # The dedicated key EXISTS and the owner paused it: the slot is
+            # OFF — one WARNING, no fall-through to the shared slot (routing
+            # around a pause is the defect), no second-copy remedy.
             _resolved[cache_key] = ""
-        except (agent_secrets.ResolverError, OSError, ValueError) as exc:
-            # KeychainLocked / HubUnreachable / Forbidden / OSError — we could
-            # NOT read the slot. Never reported as "no key in the slot".
-            _resolved[cache_key] = ""
-            unreadable = type(exc).__name__
-        if not _resolved[cache_key]:
+            _warn_paused_slot(VCO_PROJECT_SECRET_NAME)
+        except (agent_secrets.ResolverError, OSError, ValueError):
+            # key_not_active / not declared anywhere for this project (or a
+            # read failure — leg 2 will re-raise it as unreadable): the
+            # project has no dedicated key; fall through to the shared slot.
+            try:
+                # Leg 2: VCO's shared slot, shared scope only.
+                _resolved[cache_key] = agent_secrets.get(
+                    OPENAI_SECRET_NAME, project=project, shared_only=True,
+                ).strip()
+            except agent_secrets.SecretPaused:
+                _resolved[cache_key] = ""
+                _warn_paused_slot(OPENAI_SECRET_NAME)
+            except agent_secrets.SecretNotFound:
+                # Both legs answered: a PROVABLE absence.
+                _resolved[cache_key] = ""
+            except (agent_secrets.ResolverError, OSError, ValueError) as exc:
+                # KeychainLocked / HubUnreachable / Forbidden / OSError — we
+                # could NOT read the slot. Never "no key in the slot".
+                _resolved[cache_key] = ""
+                unreadable = type(exc).__name__
+        if not _resolved[cache_key] and not _warned_paused:
             _warn_env_var_ignored(unreadable)
     return _resolved[cache_key]
+
+
+def _warn_paused_slot(which: str) -> None:
+    """Say ONCE, on stderr, that an OpenAI-slot key is PAUSED — the one
+    state a user cannot otherwise distinguish from "no key configured"
+    (both render as an OpenAI slot that is off). Names the paused key, the
+    panel where it is resumed; never a value, never a "store it again"
+    remedy (a second copy is exactly the divergence this module exists to
+    prevent)."""
+    global _warned_paused
+    if _warned_paused:
+        return
+    _warned_paused = True
+    import sys
+
+    print(
+        f"VCO: the OpenAI key slot ({which}) is PAUSED — the "
+        "OpenAI embedding slot stays off until it is resumed. Resume it in "
+        "the launcher's Preferences → Secrets (or this project's Secrets "
+        "panel); do not store a second copy.",
+        file=sys.stderr,
+    )
 
 
 def env_var_no_longer_read() -> str:
     """Why the pre-v0.2.98 env-var cohort owes an action, or ``""``.
 
-    VCO used to take its OpenAI key from ``$OPENAI_API_KEY``. v0.2.98 reads
-    VCO's own slot and nothing else, so a user who configured VCO that way can
+    VCO used to take its OpenAI key from ``$OPENAI_API_KEY``. v0.2.98 stopped
+    reading the variable (and v0.2.102, OD-4, moved the resolution to the
+    secrets matrix — the project's dedicated ``vco_openai_api_key`` first,
+    then the shared slot), so a user
+    who configured VCO via the exported variable can
     lose a working setup without being told: the variable is still exported,
     the slot is empty, and the embeddings that answered yesterday now cannot.
     This predicate is what the install-time UPDATE_DEFERRED entry
     (``openai_key_env_var_no_longer_read``) is built from — the durable
     channel the owner's "never a silent loss" requires.
 
-    Holds when reading the variable WOULD have supplied a key VCO's slot does
+    Holds when reading the variable WOULD have supplied a key the slot does
     not have: ``$OPENAI_API_KEY`` is non-empty in this process's environment
     AND the shared ``openai_api_key`` slot resolves empty. Returns a one-line
     description of exactly those two facts — never a value, not even a length.
 
     Deliberately does NOT go through :func:`resolve_openai_api_key`: that
     answers once per project per process, and a cached miss from earlier in
-    the same run would make this decision stale. It probes the same one store
-    (``agent_secrets.get`` in shared-only mode) without the cache.
+    the same run would make this decision stale. It probes the SHARED slot
+    only (``agent_secrets.get`` in shared-only mode) without the cache: the
+    entry is the INSTALL's, machine-level with no project identity, and the
+    shared slot is the one a ``--openai-key``-era or env-var-era machine was
+    configured through.
 
     Only ONE resolver outcome counts as proof, and the two that do not are
     named rather than swallowed by a broad ``except``:
@@ -303,12 +384,15 @@ def emit_env_var_deferral(
         detected=evidence,
         why_deferred=(
             "VCO used to take its OpenAI key from $OPENAI_API_KEY. Since "
-            "v0.2.98 it reads VCO's own shared slot and nothing else, because "
-            "a project shell may export ITS OWN key under that name and a "
-            "project's key must never be spent on VCO. This machine is on the "
-            "OpenAI embedding backend and its slot is empty, so embeddings "
-            "that used to work will not until the key VCO should use is "
-            "stored in VCO's slot."
+            "v0.2.98 it does not read that variable (a project shell may "
+            "export ITS OWN key under that name); it resolves the key "
+            "through the launcher's Secrets panel only — this project's "
+            "dedicated vco_openai_api_key first, then the shared "
+            "openai_api_key slot (v0.2.102). This "
+            "machine is on the "
+            "OpenAI embedding backend and its shared slot is empty, so "
+            "embeddings that used to work will not until the key VCO should "
+            "use is stored in the panel."
         ),
         command_to_apply=(
             "Store the key VCO should use in VCO's own slot: "
@@ -408,7 +492,12 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     be paused rather than empty — and removed once the copy reads back
     equal. A key the hub reports PAUSED (v0.2.101 ``key_paused``) is never
     copied: a pause is a deliberate owner decision, and a file-store copy
-    would shadow it. Otherwise it stays and the status says why.
+    would shadow it. A value some project already holds as its OWN
+    per-project secret is not promoted either (v0.2.102, audit P3-2): the
+    comparison is by constant-time equality, never logged, and the status
+    names the owning project — promoting would plant a second, broader-scope
+    copy of the same value that can drift. Otherwise it stays and the
+    status says why.
 
     The value is read with the ONE line grammar (``envfile.parse_env_line``:
     ``export``, one quote pair, CRLF) — what a reader of the line gets.
@@ -418,7 +507,9 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     ``left_differs`` (the store holds another value), ``left_unverified``
     (it could not be stored or read back), ``left_unparsed`` (the value is
     not one clean token), ``left_paused`` (the stored key is paused —
-    nothing was stored; detail = the remedy). Never a value.
+    nothing was stored; detail = the remedy), ``left_project_copy``
+    (nothing was stored — a project already holds this value as its own
+    per-project secret; detail names the project). Never a value.
     """
     from vco_lib import agent_secrets
     from vco_lib.env_template import remove_line_under
@@ -462,6 +553,34 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
             )
             return False
         if stored is None:
+            # v0.2.102 (audit P3-2): before planting the shared copy, check
+            # whether some project already holds this exact value as its OWN
+            # per-project secret (constant-time compare, never logged). A
+            # promotion would create a second, broader-scope copy of the same
+            # value — the two can drift, and that divergence is the defect
+            # class this module exists to prevent. Skip the store, leave the
+            # line, and name the owning project in the verdict.
+            owner = agent_secrets.per_project_copy_owner(
+                OPENAI_SECRET_NAME, value,
+            )
+            if owner is not None:
+                print(
+                    "openai_api_key: a project already holds this value as "
+                    f"its own per-project secret ({owner}) — the shared copy "
+                    "was not created; remove the .env line by hand, or store "
+                    "it in the shared scope deliberately if you want both",
+                    file=sys.stderr,
+                )
+                outcome.update(
+                    status="left_project_copy",
+                    detail=(
+                        f"project '{owner}' already holds this value as its "
+                        "own per-project secret — the shared copy was not "
+                        "created; remove the .env line by hand, or store it "
+                        "in the shared scope deliberately if you want both"
+                    ),
+                )
+                return False
             try:
                 store_openai_api_key(value, keychain=False)
             except (StoreFailed, OSError, subprocess.SubprocessError) as exc:
@@ -620,6 +739,7 @@ __all__ = [
     "LEGACY_DOTENV_HEADER",
     "OPENAI_ENV_VAR",
     "OPENAI_SECRET_NAME",
+    "VCO_PROJECT_SECRET_NAME",
     "MigrationUnavailable",
     "StoreFailed",
     "SECRET_ARGV_FLAGS",

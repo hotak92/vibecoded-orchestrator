@@ -92,6 +92,7 @@ __all__ = [
     "KeychainLocked",
     "KeychainUnavailable",
     "lookup_stored",
+    "per_project_copy_owner",
     "ProjectNotFound",
     "SecretNotFound",
     "SecretPaused",
@@ -493,6 +494,7 @@ def get(
     project: Optional[str] = None,
     allow_file_fallback: bool = True,
     shared_only: bool = False,
+    allow_dotenv: bool = True,
 ) -> str:
     """Read a secret value through the canonical three-tier chain.
 
@@ -516,8 +518,17 @@ def get(
             own matrix gating what it may answer. ``project``
             stays the REQUESTER identity for the hub gate and for the
             requester's ``.no-shared-fallback`` opt-out; it never widens
-            the lookup. VCO's own consumers use this mode so a project's
-            key can never answer for VCO.
+            the lookup. (v0.2.102, OD-4: VCO's OpenAI-slot consumer left
+            this mode for the matrix chain — see ``allow_dotenv``; the
+            install-time env-var deferral probe still resolves this way,
+            machine-scope with no project identity.)
+        allow_dotenv: when False, tier 3 (the project's own ``.env``) is
+            skipped while tiers 1-2 keep their full chain (v0.2.102, OD-4).
+            For a caller that resolves a key through the secrets matrix
+            (per-project scope first, then shared) WITHOUT making the
+            project ``.env`` a store for that key — the OpenAI embedding
+            slot resolves this way, so a ``.env`` line can never answer
+            for it. Default True: the general chain is unchanged.
 
     Raises:
         SecretNotFound: key resolves nowhere (all tiers consulted).
@@ -617,7 +628,12 @@ def get(
         # managed copy immediately without deleting their .env line.
         # Skipped in shared-only mode: a project's `.env` is a project-scoped
         # store by definition, and this mode exists so it cannot answer.
-        if not shared_only:
+        # `allow_dotenv=False` (v0.2.102, OD-4) skips tier 3 alone: a caller
+        # that resolves through the secrets MATRIX (per-project → shared)
+        # without making the project `.env` a store for its key — the OpenAI
+        # embedding slot resolves that way, so a `.env` line can never
+        # answer for it.
+        if not shared_only and allow_dotenv:
             value = _project_dotenv_get(key, project)
             if value is not None:
                 return value
@@ -707,6 +723,47 @@ def lookup_stored(key: str, *, project: Optional[str] = None) -> tuple[str, Opti
     if value is not None:
         return STORED_FILE, value
     return state, None
+
+
+def per_project_copy_owner(key: str, value: str) -> Optional[str]:
+    """The file-store project NAME whose per-project copy of ``key`` EQUALS
+    ``value``, or ``None`` when no project holds an equal copy
+    (v0.2.102, audit P3-2).
+
+    Why a writer needs this: promoting a machine-level value into the SHARED
+    file store while some project already holds the identical value as its
+    own per-project secret would plant a second, broader-scope copy of the
+    same value — the two can drift, and the drift class is exactly what the
+    one-name-one-store rule exists to prevent. The skip decision needs only
+    the project NAME, never the value: the comparison is constant-time and
+    nothing is logged.
+
+    Walks ``$VCT_SECRETS_DIR/projects/*/`` (sorted, so the answer is
+    deterministic) and compares each ``<NAME>/<key>`` with
+    :func:`hmac.compare_digest`. The shared copy is NOT a candidate — a
+    shared copy equal to the value is not a per-project copy. A directory
+    whose file is unreadable is skipped (soft-fail). Never raises on missing
+    directories; never reads or returns a value.
+    """
+    import hmac as _hmac
+
+    root = _secrets_root()
+    projects_dir = root / "projects"
+    try:
+        names = sorted(p.name for p in projects_dir.iterdir() if p.is_dir())
+    except OSError:
+        return None
+    needle = value.strip().encode("utf-8")
+    for name in names:
+        path = projects_dir / name / key
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        stored = raw[:-1] if raw.endswith("\n") else raw
+        if _hmac.compare_digest(needle, stored.strip().encode("utf-8")):
+            return name
+    return None
 
 
 def exec_with_secrets(

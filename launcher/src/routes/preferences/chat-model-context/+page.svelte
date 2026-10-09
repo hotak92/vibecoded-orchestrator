@@ -19,6 +19,14 @@
    * The pane keeps its logic in `$lib/api/chat_model_context` (validation +
    * the invoke wrappers) so the rules are unit-tested; this file is markup,
    * local UI state, and copy.
+   *
+   * Two "edited" signals, deliberately distinct (v0.2.102, OD-3): the
+   * `edited` badge marks rows YOU changed through this pane (`user_edited`,
+   * the reseed guard); the `vs shipped` badge marks rows whose VALUES
+   * differ from the shipped seed — computed by the backend from the
+   * embedded seed, so a machine-seeded drift badges without the flag, and
+   * a row you edited back to the shipped values keeps its guard without
+   * the badge.
    */
   import { onMount } from 'svelte';
   import { toast } from '$lib/stores/toast';
@@ -31,6 +39,7 @@
     draftFromRow,
     emptyDraft,
     exportChatModelContext,
+    getChatModelContextEditedDiff,
     getChatModelContextStatus,
     listChatModelContext,
     reseedChatModelContext,
@@ -40,6 +49,7 @@
     type FieldError,
   } from '$lib/api/chat_model_context';
   import type {
+    ChatModelContextEditedDiff,
     ChatModelContextMutation,
     ChatModelContextRow,
     ChatModelContextStatus,
@@ -47,6 +57,8 @@
 
   let rows = $state<ChatModelContextRow[]>([]);
   let status = $state<ChatModelContextStatus | null>(null);
+  /** Per-row edited-vs-shipped verdicts (OD-3); empty = no seed readable. */
+  let editedDiffs = $state<ChatModelContextEditedDiff[]>([]);
   let loading = $state(true);
   let busy = $state(false);
 
@@ -55,8 +67,14 @@
   let draft = $state<ChatModelContextDraft>(emptyDraft());
   let errors = $state<FieldError[]>([]);
   let pendingDelete = $state<string | null>(null);
+  /** `model_id` of the row whose read-only diff popover is open. */
+  let diffOpen = $state<string | null>(null);
 
   const oneMillionCount = $derived(rows.filter((r) => r.window_1m).length);
+  /** Only the rows that differ from the shipped seed, keyed by id. */
+  const editedMap = $derived(
+    new Map(editedDiffs.filter((d) => d.edited).map((d) => [d.model_id, d])),
+  );
 
   function errorFor(field: FieldError['field']): string | null {
     return errors.find((e) => e.field === field)?.message ?? null;
@@ -65,9 +83,10 @@
   async function load() {
     loading = true;
     try {
-      [rows, status] = await Promise.all([
+      [rows, status, editedDiffs] = await Promise.all([
         listChatModelContext(),
         getChatModelContextStatus(),
+        getChatModelContextEditedDiff(),
       ]);
     } catch (e) {
       toast.error(e);
@@ -351,6 +370,16 @@
                         edited
                       </span>
                     {/if}
+                    {#if editedMap.get(row.model_id)}
+                      <button
+                        class="badge badge-purple badge-btn"
+                        title="This row's values differ from the shipped defaults — click to see the read-only diff"
+                        onclick={() =>
+                          (diffOpen = diffOpen === row.model_id ? null : row.model_id)}
+                      >
+                        vs shipped
+                      </button>
+                    {/if}
                   </td>
                   <td class="dim">{row.vendor}</td>
                   <td class="num mono">{row.context_window.toLocaleString()}</td>
@@ -411,6 +440,38 @@
                 {#if row.source_note}
                   <tr class="note-row">
                     <td colspan="9"><span class="dim">{row.source_note}</span></td>
+                  </tr>
+                {/if}
+                {#if diffOpen === row.model_id && editedMap.get(row.model_id)}
+                  <!-- Read-only edited-vs-shipped diff (OD-3): what VCO ships
+                       vs what this table holds, field by field. Nothing here
+                       is editable — the Edit button above is the change
+                       surface; this popover is the evidence. -->
+                  <tr class="diff-row">
+                    <td colspan="9">
+                      <table class="diff-table">
+                        <thead>
+                          <tr><th>Field</th><th>Shipped</th><th>Yours</th></tr>
+                        </thead>
+                        <tbody>
+                          {#each editedMap.get(row.model_id)!.diff as d (d.field)}
+                            <tr>
+                              <td class="mono">{d.field}</td>
+                              <td class="mono dim">
+                                {typeof d.shipped === 'number'
+                                  ? d.shipped.toLocaleString()
+                                  : String(d.shipped)}
+                              </td>
+                              <td class="mono">
+                                {typeof d.yours === 'number'
+                                  ? d.yours.toLocaleString()
+                                  : String(d.yours)}
+                              </td>
+                            </tr>
+                          {/each}
+                        </tbody>
+                      </table>
+                    </td>
                   </tr>
                 {/if}
               {/if}
@@ -721,6 +782,46 @@
   .badge-purple {
     background: rgba(var(--color-purple-rgb, 123, 95, 255), 0.15);
     color: var(--color-purple, #7b5fff);
+  }
+  /* A badge that opens the read-only diff popover — same pill shape as the
+     informational badges, but it is a button (cursor, focus, hover). */
+  .badge-btn {
+    border: none;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .badge-btn:hover {
+    background: rgba(var(--color-purple-rgb, 123, 95, 255), 0.28);
+  }
+
+  .diff-row td {
+    padding-top: 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .diff-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--color-border, rgba(255, 255, 255, 0.08));
+    border-radius: 8px;
+  }
+  .diff-table th {
+    text-align: left;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--color-mid, #94a3b8);
+    border-bottom: 1px solid var(--color-border, rgba(255, 255, 255, 0.08));
+  }
+  .diff-table td {
+    padding: 0.3rem 0.5rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    vertical-align: top;
+  }
+  .diff-table tr:last-child td {
+    border-bottom: none;
   }
 
   .fields {

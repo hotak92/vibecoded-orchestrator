@@ -594,9 +594,10 @@ def _redacted_env_snapshot() -> dict[str, str]:
             out[key] = val
     # Redact: presence + length only — no character of the key reaches the
     # failure log (v0.2.97; it used to carry a 4-char prefix). Resolved the
-    # way the service resolves it — VCO's OWN slot and nothing else (v0.2.98;
-    # the environment is no longer a source), so this entry reports the key
-    # VCO would actually use.
+    # way the service resolves it — the ONE resolver, this project's
+    # dedicated vco_openai_api_key first then the shared slot (OD-4,
+    # v0.2.102; the environment has not been a source since v0.2.98), so
+    # this entry reports the key VCO would actually use.
     from vco_lib.openai_key import resolve_openai_api_key
 
     api_key = resolve_openai_api_key()
@@ -788,7 +789,9 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
         )
         why_deferred = (
             "Cannot auto-fix: the user must bring up a local backend "
-            "(Ollama / CodeEmbed) or store an OpenAI key in VCO's own slot. "
+            "(Ollama / CodeEmbed) or store an OpenAI key in the secrets "
+            "panel — this project's dedicated vco_openai_api_key or the "
+            "shared openai_api_key slot (v0.2.102). "
             "KG syncs and code-graph indexing that require fresh vectors "
             "are blocked until at least one backend comes back online."
         )
@@ -1874,10 +1877,11 @@ def configured_text_models() -> "list[str]":
 
     # Secondary OpenAI slot (unless active is already OpenAI) when a key exists.
     # Presence of the key is the config signal; validity is a runtime concern.
-    # v0.2.98: the key is VCO's OWN slot and nothing else — the environment is
-    # not a source here either, so this admission test agrees with the key the
-    # write path will actually embed with (``self.openai_api_key``, resolved the
-    # same way). It used to OR in ``$OPENAI_EMBEDDING_API_KEY``, which admitted
+    # v0.2.98: the environment is not a source here — the ONE resolver answers
+    # (project scope first, then shared, since v0.2.102 OD-4) — so this
+    # admission test agrees with the key the write path will actually embed
+    # with (``self.openai_api_key``, resolved the same way). It used to OR in
+    # ``$OPENAI_EMBEDDING_API_KEY``, which admitted
     # a slot into the write-set that the write path then skipped for want of a
     # key — a fan-out entry with no write behind it.
     if "openai" not in active_model.lower():
@@ -2160,9 +2164,12 @@ class EmbeddingService:
             a non-default provider (``"openai"`` selects the OpenAI
             text model, ``"arctic"`` selects snowflake-arctic-embed2).
           * the OpenAI key is NOT read from the environment: it resolves
-            from VCO's own shared slot (``openai_api_key``) through
-            :func:`vco_lib.openai_key.resolve_openai_api_key`; an empty
-            string is "no key configured".
+            through :func:`vco_lib.openai_key.resolve_openai_api_key` —
+            the project's dedicated ``vco_openai_api_key`` secret first,
+            then VCO's shared ``openai_api_key`` slot (owner decision OD-4
+            + its 2026-10-09 refinement); an empty string is
+            "no key configured" (also the paused-key answer, which warns
+            once naming the Secrets panel).
           * ``CODE_EMBED_BACKEND`` → ``"service"`` (default) /
             ``"ollama"``. Affects code-model defaults.
 
@@ -2219,11 +2226,16 @@ class EmbeddingService:
         else:
             code_model_id = DEFAULT_CODE_MODEL
 
-        # v0.2.98: VCO's OWN slot only — the shared `openai_api_key`
-        # (launcher keychain → shared file store); the env var and any
-        # per-project binding are NOT sources. The resolved root rides along
-        # as the REQUESTER identity for the hub's pause matrix (and for the
-        # requester's `.no-shared-fallback` opt-out), never as a lookup scope.
+        # v0.2.102 (OD-4 + refinement): the ONE resolver — this project's
+        # dedicated `vco_openai_api_key` first (keychain per-project row →
+        # per-project file store), then VCO's shared `openai_api_key` slot
+        # (shared scope only; a per-project `openai_api_key` is never read
+        # for VCO). The env var and the project's `.env` are NOT sources
+        # (the matrix is the store; no new env name, no new store). The
+        # resolved root is the lookup scope for the dedicated key and the
+        # REQUESTER identity for the hub's pause matrix (a paused key on
+        # either leg ⇒ empty ⇒ the OpenAI slot stays off, with one WARNING
+        # naming the Secrets panel).
         from vco_lib.openai_key import resolve_openai_api_key
 
         openai_api_key = resolve_openai_api_key(str(resolved_root))
@@ -3733,10 +3745,9 @@ class EmbeddingService:
             or DEFAULT_OLLAMA_URL
         )
         if openai_api_key is None:
-            # VCO's own slot only (v0.2.98) — NOT the env var: a project's
-            # key exported in that project's shell must not pay for VCO's
-            # embeddings. This used to read ``$OPENAI_API_KEY`` directly, a
-            # second resolution path beside ``resolve_openai_api_key``.
+            # The ONE resolver (v0.2.98 retired the env-var read; v0.2.102
+            # OD-4 made it project-scope-first through the secrets matrix) —
+            # never a second resolution path beside ``resolve_openai_api_key``.
             from vco_lib.openai_key import resolve_openai_api_key
 
             openai_api_key = resolve_openai_api_key()
@@ -3773,7 +3784,8 @@ class EmbeddingService:
         # Same ONE home as ``for_project`` above (v0.2.92 R2).
         code_embed_url = _shared_service_base_url(code_embed_url)
         if openai_api_key is None:
-            # Same ONE home as ``discover_text_models`` above (v0.2.98).
+            # Same ONE home as ``discover_text_models`` above (v0.2.98;
+            # project-scope-first since v0.2.102 OD-4).
             from vco_lib.openai_key import resolve_openai_api_key
 
             openai_api_key = resolve_openai_api_key()

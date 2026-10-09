@@ -284,3 +284,49 @@ describe('SecretsPanel renders the states its derivation can produce', () => {
     expect(calls.length).toBeGreaterThan(0);
   });
 });
+
+// ─── v0.2.102 (OD-4 refinement): the VCO OpenAI key suggestion ────────────
+// THE CONTRACT IT PINS: a project gives VCO its own OpenAI key through the
+// DEDICATED per-project secret `vco_openai_api_key` — a name the user must
+// not have to discover (a per-project `openai_api_key`, the slot's own
+// name, is never read for VCO). The per-project add form therefore carries
+// a suggested-key chip that fills the KEY field, plus the one-line hint.
+// The hint copy is pinned a second time by the Python suite
+// (`tests/test_v02102_per_project_openai_key.py::PANEL_HINT`), so the panel
+// and the resolver's docs cannot drift apart.
+
+describe('SecretsPanel suggests the dedicated VCO OpenAI key (OD-4)', () => {
+  it('a per-project branch renders the suggestion WITH the hint copy', () => {
+    // Locate by TEST (`scope === 'per_project'`), assert on the CONSEQUENT:
+    // the branch names the dedicated key and shows the hint line.
+    const arm = ifBlocks().find(
+      (n) => n.test && subtreeHasLiteral(n.test, 'per_project') && subtreeHasLiteral(n.consequent, 'vco_openai_api_key'),
+    );
+    expect(
+      arm,
+      'no {#if scope === \'per_project\'} branch renders the vco_openai_api_key ' +
+        'suggestion — the dedicated name would be undiscoverable',
+    ).toBeTruthy();
+    const shown = renderedText(arm!.consequent);
+    expect(shown, `the suggestion renders: ${shown}`).toContain('vco openai key');
+    expect(shown).toContain("used by vco's openai embedding slot for this project");
+    expect(shown).toContain('falls back to the shared vco key');
+  });
+
+  it('clicking the suggestion FILLS the KEY field with the dedicated name', () => {
+    // An assignment `newKey = 'vco_openai_api_key'` as real syntax — a
+    // chip that renders the name but writes anything else (or nothing)
+    // would pass the branch test above and still be broken.
+    const assignments = NODES.filter(
+      (n) =>
+        n.type === 'AssignmentExpression' &&
+        (n.left as Record<string, unknown> | undefined)?.type === 'Identifier' &&
+        (n.left as Record<string, unknown>).name === 'newKey',
+    );
+    expect(
+      assignments.some((n) => subtreeHasLiteral(n.right, 'vco_openai_api_key')),
+      'no handler assigns the literal vco_openai_api_key to newKey — the ' +
+        'chip does not fill the KEY field',
+    ).toBe(true);
+  });
+});

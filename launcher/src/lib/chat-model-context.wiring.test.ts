@@ -66,6 +66,11 @@ function isMember(n: unknown, obj: string, prop: string): boolean {
   );
 }
 
+/** An identifier `name` appears as real syntax somewhere in `node`. */
+function subtreeHasIdentifier(node: unknown, name: string): boolean {
+  return [...walk(node)].some((n) => isIdent(n, name));
+}
+
 describe('chat-model-context pane — text_only is wired (v0.2.101 G4)', () => {
   it('renders row.text_only in the table (its own column, both branches)', () => {
     const members = [...walk(PANE)].filter((n) => isMember(n, 'row', 'text_only'));
@@ -121,5 +126,113 @@ describe('TS ReseedOutcome mirrors the Rust ReseedOutcome struct', () => {
     // and the set comparison below fails.)
     expect(rust).toContain('retired');
     expect([...ts].sort()).toEqual([...rust].sort());
+  });
+});
+
+// ─── the edited-vs-shipped badge (v0.2.102, OD-3) ──────────────────────────
+// THE DEFECT IT PINS: a shipped row can drift from the seed without the
+// `user_edited` flag (machine-seeded, an import, an older seed), and a row
+// edited BACK to the shipped values keeps the flag while matching the seed
+// again — so the flag alone cannot answer "does this row still say what
+// VCO ships?". OD-3 ordered the minimal indicator: a backend-computed
+// per-row diff against the embedded seed, a badge per differing row, and a
+// read-only (field, shipped, yours) popover. A wiring test rather than a
+// unit test because the badge's data comes from a Tauri command and this
+// repo's vitest runs headless (no component runner): what CAN be pinned is
+// that the pane asks the command, branches per row on its answer, and
+// renders the popover's three columns.
+
+describe('chat-model-context pane — the edited-vs-shipped badge is wired (OD-3)', () => {
+  const PANE_SOURCE = readFileSync(
+    resolve(here, '../routes/preferences/chat-model-context/+page.svelte'),
+    'utf8',
+  );
+
+  /** `editedMap.get(...)` — a CALL on the derived map of the command's rows. */
+  function subtreeCallsEditedMapGet(node: unknown): boolean {
+    return [...walk(node)].some((n) => {
+      if (n.type !== 'CallExpression') return false;
+      const callee = n.callee as Node | undefined;
+      return (
+        callee?.type === 'MemberExpression' &&
+        isIdent(callee.object, 'editedMap') &&
+        isIdent(callee.property, 'get')
+      );
+    });
+  }
+
+  it('asks the backend command and stores its answer (never re-derives the diff)', () => {
+    // The api wrapper invokes the Rust command by name — the pane does not
+    // compute the comparison client-side (the seed comparison is the
+    // backend's, one home).
+    const api = readFileSync(resolve(here, 'api/chat_model_context.ts'), 'utf8');
+    expect(api).toContain('chat_model_context_edited_diff');
+    // The pane loads it alongside rows/status and keeps it in state.
+    expect(PANE_SOURCE).toContain('getChatModelContextEditedDiff');
+    expect(PANE_SOURCE).toMatch(/editedDiffs\s*=\s*\$state/);
+    // No client-side re-derivation: the pane never parses the seed itself.
+    expect(PANE_SOURCE).not.toContain('seed.json');
+  });
+
+  it('branches per row on the edited-diff map and RENDERS the badge', () => {
+    // Locate the badge by its TEST (a call on the command's map), then
+    // assert on what its CONSEQUENT displays — a branch that exists but
+    // renders nothing is indistinguishable from no branch (same two-claim
+    // shape as the SecretsPanel wiring guard).
+    const arm = [...walk(PANE)]
+      .filter((n) => n.type === 'IfBlock')
+      .find((n) => n.test && subtreeCallsEditedMapGet(n.test));
+    expect(
+      arm,
+      'no {#if} tests `editedMap.get(...)`; a row differing from the ' +
+        'shipped seed would render no badge',
+    ).toBeTruthy();
+    const shown = [...walk(arm!.consequent)]
+      .filter((n) => n.type === 'Text' && typeof n.data === 'string')
+      .map((n) => n.data as string)
+      .join(' ')
+      .replace(/\s+/g, ' ');
+    expect(shown).toContain('vs shipped');
+  });
+
+  it('renders the read-only popover with the three columns, gated on the same map', () => {
+    // The popover row must be conditioned on BOTH the open row (`diffOpen`)
+    // and the map, and show field / shipped / yours — the evidence half of
+    // OD-3. Locate by the two-part test; assert on the consequent.
+    const arm = [...walk(PANE)]
+      .filter((n) => n.type === 'IfBlock')
+      .find(
+        (n) =>
+          n.test &&
+          subtreeHasIdentifier(n.test, 'diffOpen') &&
+          subtreeCallsEditedMapGet(n.test),
+      );
+    expect(arm, 'the diff popover has no {#if} gating it on diffOpen and the map').toBeTruthy();
+    const shown = [...walk(arm!.consequent)]
+      .filter((n) => n.type === 'Text' && typeof n.data === 'string')
+      .map((n) => n.data as string)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .toLowerCase();
+    for (const column of ['field', 'shipped', 'yours']) {
+      expect(shown, `the popover renders the '${column}' column`).toContain(column);
+    }
+    // Read-only: no <input> inside the popover — the Edit button above is
+    // the change surface, the popover is the evidence.
+    expect(
+      [...walk(arm!.consequent)].some((n) => n.type === 'InputElement'),
+      'the diff popover must not contain an input',
+    ).toBe(false);
+  });
+
+  it('the Rust command exists and is registered in the invoke handler', () => {
+    const cmd = loadRust().find(
+      (f) => f.rel === 'src/commands/chat_model_context.rs',
+    );
+    expect(cmd, 'the commands/chat_model_context.rs file moved?').toBeTruthy();
+    expect(cmd!.text).toContain('pub async fn chat_model_context_edited_diff');
+    const lib = loadRust().find((f) => f.rel === 'src/lib.rs');
+    expect(lib, 'src/lib.rs moved?').toBeTruthy();
+    expect(lib!.text).toContain('commands::chat_model_context::chat_model_context_edited_diff');
   });
 });

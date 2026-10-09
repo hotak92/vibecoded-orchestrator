@@ -3079,6 +3079,8 @@ pub fn run() {
             // only in a log line.
             commands::chat_model_context::chat_model_context_list,
             commands::chat_model_context::chat_model_context_status,
+            // v0.2.102 (OD-3): the pane's per-row edited-vs-shipped badge.
+            commands::chat_model_context::chat_model_context_edited_diff,
             commands::chat_model_context::chat_model_context_upsert,
             commands::chat_model_context::chat_model_context_delete,
             commands::chat_model_context::chat_model_context_reseed,

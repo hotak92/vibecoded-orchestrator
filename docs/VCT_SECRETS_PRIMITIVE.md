@@ -330,6 +330,29 @@ period. (The hub-first resolvers — `vct_secrets_resolve.sh` / `.ps1` /
 `agent_secrets.py` — consult the hub before this tier and the project
 `.env` after it.)
 
+### The OpenAI embedding key is per-project too (v0.2.102, OD-4 + refinement)
+
+VCO's OpenAI embedding slot resolves TWO names, in order (owner decision
+OD-4 and its 2026-10-09 refinement):
+
+1. **`vco_openai_api_key`, project scope** — the DEDICATED name for a
+   project that wants VCO to embed with its own key. Add it from the
+   project's Secrets panel (the per-project tab suggests it as "VCO
+   OpenAI key"); it lands in the OS keychain and answers through the
+   hub's user-declared per-project bucket — or, file-store-only, via
+   `vct set --project <NAME> --key vco_openai_api_key` (value on stdin).
+2. **`openai_api_key`, shared scope only** — VCO's own slot (the bundled
+   declaration every install resolves). A per-project `openai_api_key`
+   under this name is NEVER read for VCO: the hub keeps that name
+   slot-exclusive, and the 2026-09-26 ruling stands for it.
+
+`key_paused` on either name turns the slot OFF for that requester with
+one WARNING naming the Secrets panel (never a route-around, never a
+second copy); `key_not_active` for the dedicated name falls through to
+the shared slot. `$OPENAI_API_KEY` stays unread (no new env name) and the
+project's `.env` is not a source for either name (tier 3 is excluded for
+them).
+
 ### What the launcher's Secrets panel shows (v0.3.0)
 
 The panel reads BOTH launcher-managed stores and labels each key with the
