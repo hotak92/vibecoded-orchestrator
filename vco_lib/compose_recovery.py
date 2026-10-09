@@ -452,8 +452,7 @@ def _declared_unmanaged_why(name: str, unmanaged: Optional[Mapping[str, str]]) -
 
         decl = _infra.load()
         if not decl.resolvable:
-            return ("the project infrastructure declarations (launcher.db) could not be read, "
-                    "so whether a project declared it unmanaged is unknown")
+            return _infra.UNREADABLE_REASON
         return decl.why(_infra.KIND_UNMANAGED_CONTAINER, name)
     return unmanaged.get(name)
 

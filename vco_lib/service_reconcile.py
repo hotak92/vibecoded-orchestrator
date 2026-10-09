@@ -1402,6 +1402,10 @@ def reconcile(
         detection = _det.detect(runtime=runtime, installer_project=installer_project,
                                 extra_endpoints=extra, run=run, fetch=fetch, tcp_open=tcp_open)
     result.detection = detection
+    if getattr(detection, "refused", None):
+        # Review A1: no candidate is offered while the declarations are
+        # unreadable — say so in the run's output, never silently.
+        result.lines.append(f"  ! service detection offered nothing: {detection.refused}")
 
     taken = {c.port for s in SERVICES for c in detection.for_service(s) if c.port}
     taken |= {port for c in detection.containers for port in c.host_ports.values()}
@@ -2362,6 +2366,8 @@ def cli(verb: str, args: argparse.Namespace) -> int:
     db = getattr(args, "db_path", None)
     if verb == "candidates":
         det = _det.detect(runtime=_runtime(), services=(args.service,) if args.service else SERVICES)
+        if det.refused:
+            print(f"service detection offered nothing: {det.refused}", file=sys.stderr)
         if args.json:
             print(json.dumps({"schema": 1, "candidates": det.to_json()}, indent=2, sort_keys=True))
             return 0

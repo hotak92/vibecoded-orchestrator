@@ -85,6 +85,14 @@ KIND_ENV: dict[str, str] = {
 
 TABLE = "project_infra_declarations"
 
+#: The ONE wording every consumer refuses with when :attr:`Declarations.resolvable`
+#: is ``False`` (compose recovery's heal, service detection) — must match the
+#: Rust watchdog's ``declared_unmanaged_why`` Err arm in spirit and shape.
+UNREADABLE_REASON = (
+    "the project infrastructure declarations (launcher.db) could not be read, "
+    "so whether a project declared it unmanaged is unknown"
+)
+
 #: Weaviate class names: a letter, then letters / digits / underscores.
 #: Weaviate capitalises the first letter, so the stored form does too.
 _CLASS_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,254}")

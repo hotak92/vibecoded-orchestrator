@@ -743,3 +743,50 @@ def test_both_emitters_build_the_same_entry(tmp_path):
     assert from_doctor.title == from_install.title
     assert from_doctor.why_deferred == from_install.why_deferred
     assert from_doctor.command_to_apply == from_install.command_to_apply
+
+
+# ---------------------------------------------------------------------------
+# Review A1: the adoption feed refuses when the declarations are unreadable
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("runtime", ["docker", "podman"])
+def test_detection_offers_nothing_when_the_declarations_cannot_be_read(runtime, monkeypatch):
+    from vco_lib import service_detection as det
+
+    peer = _container("peer-weaviate", image="semitechnologies/weaviate:1.30", port=8082,
+                      running=False, runtime=runtime)
+    probed: list[str] = []
+
+    def fetch(url, timeout, **kw):
+        probed.append(url)
+        return None
+
+    common = dict(runtime=runtime, installer_project="infrastructure", containers=[peer],
+                  fetch=fetch, tcp_open=lambda *a: False)
+    # Arm 1 — resolvable, nothing declared: offered exactly as before.
+    monkeypatch.setattr(infra, "load", lambda **kw: infra.Declarations(resolvable=True))
+    offered = det.detect(**common)
+    assert [c.container.name for c in offered.for_service("weaviate") if c.container] == ["peer-weaviate"]
+    assert offered.refused is None
+    # Arm 2 — a launcher.db that exists but cannot be read: nothing offered,
+    # nothing probed, every listed port reserved, and the reason is the one
+    # every other consumer refuses with.
+    probed.clear()
+    monkeypatch.setattr(infra, "load", lambda **kw: infra.Declarations(resolvable=False))
+    refused = det.detect(**common)
+    assert all(refused.for_service(s) == [] for s in det.SERVICES)
+    assert probed == []
+    assert refused.refused == infra.UNREADABLE_REASON
+    assert 8082 in refused.reserved_ports
+    assert [c.name for c in refused.containers] == ["peer-weaviate"], "the listing itself is kept"
+
+
+def test_detection_refusal_reads_a_real_unreadable_launcher_db(tmp_path, monkeypatch):
+    from vco_lib import service_detection as det
+
+    bad = tmp_path / "launcher.db"
+    bad.write_bytes(b"this is not sqlite" * 100)
+    monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(bad))
+    out = det.detect(runtime=None, containers=[], fetch=lambda *a, **k: pytest.fail("no probe"),
+                     tcp_open=lambda *a: False)
+    assert out.refused == infra.UNREADABLE_REASON

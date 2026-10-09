@@ -587,6 +587,11 @@ class Detection:
     #: container publishes, stopped or not). Never candidates, and never
     #: free for VCO to take — ``service_reconcile`` counts them as taken.
     reserved_ports: frozenset[int] = frozenset()
+    #: v0.2.102 W5-A review A1: set when the project infrastructure
+    #: declarations exist but could not be read. A declaration can name ANY
+    #: container or port, so nothing is offered — :attr:`candidates` stays
+    #: empty — and this says why (the shape every other consumer uses).
+    refused: Optional[str] = None
 
     def for_service(self, service: str) -> list[Candidate]:
         return list(self.candidates.get(service, []))
@@ -644,13 +649,21 @@ def detect(
     publish) and *declared_ports* (loopback ports of a project's own
     services) never become candidates and are never probed, so nothing
     downstream can adopt, re-point or migrate them; the ports land in
-    :attr:`Detection.reserved_ports`. Default: :mod:`vco_lib.infra_declarations`."""
+    :attr:`Detection.reserved_ports`. Default: :mod:`vco_lib.infra_declarations`;
+    when those declarations exist but cannot be read (review A1) nothing is
+    probed and no candidate is offered — :attr:`Detection.refused` says why."""
     fetch = fetch or default_fetch
     tcp_open = tcp_open or default_tcp_open
+    refused: Optional[str] = None
     if unmanaged is None or declared_ports is None:
         from vco_lib import infra_declarations as _infra  # noqa: PLC0415
 
         decl = _infra.load()
+        if not decl.resolvable:
+            # Review A1: an unreadable "do not touch" list is not an empty
+            # one — the heal and the watchdog refuse in this state, and so
+            # does the adoption feed: no candidate at all.
+            refused = _infra.UNREADABLE_REASON
         if unmanaged is None:
             unmanaged = _infra.unmanaged_containers(decl)
         if declared_ports is None:
@@ -661,6 +674,12 @@ def detect(
     else:
         listed = list_containers_or_none(runtime, run=run)
         detection = Detection(containers=listed or [], listed=listed is not None)
+    if refused is not None:
+        detection.refused = refused
+        # Every listed container's ports stay out of VCO's reach too.
+        detection.reserved_ports = frozenset(
+            p for c in detection.containers for p in c.host_ports.values())
+        return detection
     skip_ports = set(int(p) for p in declared_ports)
     for c in detection.containers:
         if c.name in skip_names:
