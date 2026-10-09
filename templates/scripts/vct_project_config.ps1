@@ -801,6 +801,18 @@ function Get-Config {
                     }
                     return 0
                 }
+                # v0.2.102 W5-A (M3): the three infrastructure-declaration
+                # lists render one value per line (the bash sibling's shape;
+                # MUST MATCH vco_lib/project_config.py::INFRA_LIST_FIELDS).
+                # Empty list -> no stdout + exit 0.
+                if ($FieldName -in @("external_collections", "unmanaged_containers", "ssrf_extra_local_ports")) {
+                    if ($val -is [System.Collections.IEnumerable] -and -not ($val -is [string])) {
+                        foreach ($item in $val) {
+                            if ($null -ne $item) { [Console]::Out.WriteLine([string]$item) }
+                        }
+                    }
+                    return 0
+                }
                 # Arrays / nested objects → emit compact JSON; scalars → raw.
                 if ($val -is [System.Collections.IEnumerable] -and -not ($val -is [string])) {
                     [Console]::Out.Write(($val | ConvertTo-Json -Compress -Depth 8))

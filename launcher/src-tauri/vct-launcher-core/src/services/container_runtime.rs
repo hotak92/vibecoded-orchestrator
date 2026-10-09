@@ -1785,6 +1785,13 @@ pub fn path_is_under_root(candidate: &str, root: &Path) -> bool {
     cand == root || cand.starts_with(&format!("{base}/"))
 }
 
+/// Is `name` a runtime-generated ANONYMOUS volume name? Docker and podman
+/// both name the volume an image `VOLUME` gets (when nothing is mounted at
+/// that path) with 64 lower-case hex characters (v0.2.102 NB-R3).
+pub fn is_anonymous_volume_name(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Is `name` a named volume (not a host path) in a `-v name:/dest` arg?
 /// The runtimes' rule: a volume name starts alphanumeric and holds only
 /// `[A-Za-z0-9_.-]`; anything with a separator or a drive is a bind.
@@ -1853,7 +1860,18 @@ pub fn module_claim_for_start(
 ///    `Contradicts` (checked first: positive evidence never outweighs it);
 /// 3. a bind under the state root, a mount equal to a recorded one, or an
 ///    env path under the state root → `ThisInstall`;
-/// 4. any other bind / volume → `Foreign`; none → `Stateless`.
+/// 4. (v0.2.102 NB-R3) every data mount is an ANONYMOUS volume (the
+///    runtime-generated 64-hex name an image `VOLUME` gets when nothing is
+///    mounted there) at a mount point the module's recorded configuration
+///    declares → `ThisInstall`. The ≤0.2.99 per-project module container
+///    carried exactly that shape and was refused as "another install". An
+///    anonymous volume names no source, so it can never CONTRADICT a
+///    recorded mount (step 2 skips it); it only counts as evidence at a
+///    declared data path, and only when nothing else is mounted — one
+///    unexplained anonymous volume, or any other unrecorded mount, still
+///    refuses. The replacement is `rm -f` WITHOUT `-v` on both runtimes, so
+///    the anonymous volume and its data survive (unattached, recoverable);
+/// 5. any other bind / volume → `Foreign`; none → `Stateless`.
 pub fn classify_pre_label_evidence(
     stdout: &str,
     state_roots: &[PathBuf],
@@ -1901,7 +1919,14 @@ pub fn classify_pre_label_evidence(
                 }
             })
     };
+    // NB-R3: an anonymous volume at a declared data path (see step 4).
+    let anon_at_declared = |volume: bool, source: &str, dest: &str| {
+        volume && is_anonymous_volume_name(source) && recorded.iter().any(|r| same_dest(&r.destination, dest))
+    };
     for (volume, source, dest, what) in &data_mounts {
+        if anon_at_declared(*volume, source, dest) {
+            continue; // names no source — cannot contradict a recorded one
+        }
         let at_point: Vec<&RecordedMount> = recorded.iter().filter(|r| same_dest(&r.destination, dest)).collect();
         if !at_point.is_empty() && !at_point.iter().any(|r| matches_recorded(*volume, source, dest, r)) {
             return PreLabelEvidence::Contradicts {
@@ -1924,6 +1949,13 @@ pub fn classify_pre_label_evidence(
                 return PreLabelEvidence::ThisInstall(format!("env {}={}", k, v));
             }
         }
+    }
+    if !data_mounts.is_empty() && data_mounts.iter().all(|(v, s, d, _)| anon_at_declared(*v, s, d)) {
+        let points: Vec<&str> = data_mounts.iter().map(|(_, _, d, _)| d.as_str()).collect();
+        return PreLabelEvidence::ThisInstall(format!(
+            "anonymous volume(s) only, at the module's declared data path(s) {}",
+            points.join(", ")
+        ));
     }
     match data_mounts.into_iter().next() {
         Some((_, _, _, what)) => PreLabelEvidence::Foreign {
@@ -6354,6 +6386,95 @@ mod tests {
             classify_pre_label_evidence(&ev, &[root], &win.recorded_mounts),
             PreLabelEvidence::Contradicts { .. }
         ), "an uncertain (case-only) match refuses");
+    }
+
+    // ─── v0.2.102 NB-R3: anonymous-volume-only legacy module containers ───
+
+    const NB_R3_ANON: &str = "3f5a9c0e1b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a4c6e8b0d2f4a";
+    const NB_R3_ANON2: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// The real `{{json .Mounts}}` shape of an anonymous volume, per runtime.
+    fn nb_r3_anon_mounts(runtime: &str, vols: &[(&str, &str)]) -> String {
+        let m: Vec<serde_json::Value> = vols
+            .iter()
+            .map(|(name, dest)| {
+                if runtime == "docker" {
+                    serde_json::json!({"Type": "volume", "Name": name,
+                        "Source": format!("/var/lib/docker/volumes/{name}/_data"),
+                        "Destination": dest, "Driver": "local", "Mode": "", "RW": true, "Propagation": ""})
+                } else {
+                    serde_json::json!({"Type": "volume", "Name": name,
+                        "Source": format!("/home/u/.local/share/containers/storage/volumes/{name}/_data"),
+                        "Destination": dest, "Driver": "local", "Mode": "",
+                        "Options": ["nosuid", "nodev", "rbind"], "RW": true, "Propagation": "rprivate"})
+                }
+            })
+            .collect();
+        format!("{}\t{}\n", serde_json::Value::Array(m), serde_json::json!(["PATH=/usr/bin"]))
+    }
+
+    #[test]
+    fn nb_r3_anonymous_volume_names_are_recognised() {
+        assert!(is_anonymous_volume_name(NB_R3_ANON));
+        assert!(!is_anonymous_volume_name("vct-rl-data"));
+        assert!(!is_anonymous_volume_name(&NB_R3_ANON.to_uppercase()));
+        assert!(!is_anonymous_volume_name(&NB_R3_ANON[..63]));
+    }
+
+    /// ACT (both runtimes): an anonymous volume at the module's declared
+    /// data path is this install's → replaced; the replacement is `rm -f`
+    /// without `-v`, so the volume survives.
+    #[tokio::test]
+    async fn nb_r3_anonymous_volume_at_the_declared_data_path_is_accepted() {
+        let claim = r18f06_claim(vec![r18f06_bind("/home/u/.vct/modules/vct-rl/data", "/data")]);
+        for runtime in ["docker", "podman"] {
+            let ev = nb_r3_anon_mounts(runtime, &[(NB_R3_ANON, "/data/")]);
+            assert!(
+                matches!(classify_pre_label_evidence(&ev, &[r18_08_root()], &claim.recorded_mounts),
+                    PreLabelEvidence::ThisInstall(ref w) if w.contains("anonymous") && w.contains("/data")),
+                "{runtime}"
+            );
+            let (out, rms) = r18f06_clear(&ev, &claim, r18_08_root()).await;
+            assert!(out.is_ok(), "{runtime}: {out:?}");
+            assert_eq!(rms, 1, "{runtime}");
+        }
+    }
+
+    /// LEAVE-ALONE (both runtimes): an anonymous volume at a path the module
+    /// does NOT declare, an extra unexplained anonymous volume, an
+    /// anonymous volume beside a foreign bind, or no recorded mounts at all
+    /// — all still refused, nothing removed.
+    #[tokio::test]
+    async fn nb_r3_anonymous_volumes_that_match_nothing_are_still_refused() {
+        let claim = r18f06_claim(vec![r18f06_bind("/home/u/.vct/modules/vct-rl/data", "/data")]);
+        for runtime in ["docker", "podman"] {
+            let cases = [
+                nb_r3_anon_mounts(runtime, &[(NB_R3_ANON, "/cache")]),
+                nb_r3_anon_mounts(runtime, &[(NB_R3_ANON, "/data"), (NB_R3_ANON2, "/cache")]),
+            ];
+            for ev in &cases {
+                let verdict = classify_pre_label_evidence(ev, &[r18_08_root()], &claim.recorded_mounts);
+                assert!(matches!(verdict, PreLabelEvidence::Foreign { .. }), "{runtime}: {verdict:?}");
+                let (out, rms) = r18f06_clear(ev, &claim, r18_08_root()).await;
+                assert!(out.is_err(), "{runtime}");
+                assert_eq!(rms, 0, "{runtime}");
+            }
+            let ev = nb_r3_anon_mounts(runtime, &[(NB_R3_ANON, "/data")]);
+            let (out, rms) = r18f06_clear(&ev, &ModuleClaim::bare(true), r18_08_root()).await;
+            assert!(out.is_err(), "{runtime}: no declared data path, no evidence");
+            assert_eq!(rms, 0, "{runtime}");
+        }
+        // Beside an unrecorded bind outside the state root: still refused.
+        let mut m: serde_json::Value = serde_json::from_str(
+            nb_r3_anon_mounts("docker", &[(NB_R3_ANON, "/data")]).split('\t').next().unwrap(),
+        )
+        .unwrap();
+        m.as_array_mut().unwrap().push(serde_json::json!({"Type": "bind", "Source": "/srv/other", "Destination": "/x"}));
+        let ev = format!("{}\t[]\n", m);
+        assert!(matches!(
+            classify_pre_label_evidence(&ev, &[r18_08_root()], &claim.recorded_mounts),
+            PreLabelEvidence::Foreign { .. }
+        ));
     }
 
     /// LEAVE-ALONE: with recorded mounts, an evidence read that fails or

@@ -41,8 +41,22 @@ Ollama      ``OLLAMA_URL``, else the compiled default port
 code-embed  ``CODE_EMBED_SERVICE_URL``, else the compiled default port
 vct-hub     :func:`vco_lib.hub_ensure.resolve_hub_port`
             (``VCT_HUB_PORT`` → ``hub.port`` → 7700)
+declared    ``VCT_SSRF_EXTRA_LOCAL_PORTS`` — loopback ports of the
+            project's OWN services (a second project's Ollama, say),
+            declared on the launcher's Identity tab and projected into
+            that project's env (:mod:`vco_lib.infra_declarations`);
+            comma / space separated, invalid entries ignored
 always      ``:8082`` and Gradio ``:7860`` (no env knob; historical)
 =========== ==========================================================
+
+The hub-port loopback allowance stays by design (owner OD-18): every hub
+``/api/v1/*`` route but the liveness probe needs the bearer token, so an
+allowed fetch without it learns nothing — the record is the "WebFetch SSRF
+guard" section of ``docs/CONFIGURATION.md`` (v0.2.102 NB-H4).
+
+A declared extra port is allowed for the DECLARING project only (it reaches
+the guard through that project's env), and only as a loopback pair. An
+undeclared port stays blocked — there is no literal list to grow.
 
 A loopback pair is allowed as ``localhost``, ``127.0.0.1`` and ``[::1]``
 alike; a non-loopback pair (an adopted service on ``gpu.lan``) as exactly that
@@ -84,7 +98,7 @@ BLOCK when any of:
 The check runs in ``allow`` → ``block`` → ``pass`` order: an allowed service
 is never blocked by the legacy pattern that also matches ``localhost``.
 
-Stdlib-only apart from two ``vco_lib`` leaves, imported when the allowed pairs
+Stdlib-only apart from three ``vco_lib`` leaves, imported when the allowed pairs
 are first needed; the whole run is one interpreter start per WebFetch.
 """
 
@@ -423,6 +437,11 @@ def service_urls() -> list[str]:
         f"http://localhost:{resolve_hub_port()}",
     ]
     urls.extend(f"http://localhost:{port}" for port in _FIXED_LOCAL_PORTS)
+    # v0.2.102 W5-A (M3): the project's declared local ports (env only — the
+    # allowance is per-project; see the module docstring).
+    from vco_lib.infra_declarations import ssrf_extra_local_ports
+
+    urls.extend(f"http://localhost:{port}" for port in ssrf_extra_local_ports())
     return urls
 
 

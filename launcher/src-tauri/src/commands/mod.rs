@@ -46,6 +46,10 @@ pub mod desktop_shortcut;
 // commands in `rl_settings` stay registered; both surfaces resolve through
 // `vct_launcher_core::db::settings::resolve_dual_flags`.
 pub mod dual_flags;
+// v0.2.102 W5-A (M3): the Identity tab's "Infrastructure this project owns"
+// panel — external collections, unmanaged containers, local ports
+// (`vct_launcher_core::db::infra_declarations`, migration 049).
+pub mod infra_declarations;
 // v0.2.102 (owner ruling 2026-10-07): the diagrams integrations were
 // dropped entirely — `diagrams_cmd`, `diagram_watcher` and
 // `diagrams_local_server` are deleted. The GENERIC `project_modules`

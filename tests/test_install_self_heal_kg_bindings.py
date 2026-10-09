@@ -426,11 +426,11 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         with mock.patch("sqlite3.connect", side_effect=_tracking_connect):
             install._self_heal_kg_bindings_on_update(report)
 
-        # RO opened for detection, RW opened to apply. FOUR RO opens, all
+        # RO opened for detection, RW opened to apply. FIVE RO opens, all
         # lock-free: the Bug-N probe, the D18 evidence-heal precondition,
-        # and — because the precondition does NOT clear here — the two the
-        # evidence scan itself makes (identity snapshot + shared-pointer
-        # exemption).
+        # and — because the precondition does NOT clear here — the three the
+        # evidence scan itself makes (identity snapshot, the v0.2.102 M3
+        # declared-external collections read, shared-pointer exemption).
         #
         # It does not clear on purpose. The binding names
         # `Vibecoded…` (lowercase c) while Weaviate holds `VibeCoded…`, so
@@ -443,9 +443,9 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         # then re-reads it under the same cursor, sees a name that is no
         # longer the one the scan measured, and refuses.
         self.assertEqual(
-            len(ro_calls), 4,
-            f"expected 4 RO probes (Bug-N detection + D18 precondition + "
-            f"2 evidence-scan reads), got {len(ro_calls)} calls: {ro_calls}",
+            len(ro_calls), 5,
+            f"expected 5 RO probes (Bug-N detection + D18 precondition + "
+            f"3 evidence-scan reads), got {len(ro_calls)} calls: {ro_calls}",
         )
         self.assertEqual(
             len(rw_calls), 1,

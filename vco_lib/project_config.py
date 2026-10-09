@@ -490,6 +490,45 @@ class ProjectConfig:
     #: empty string, which callers treat as "unset" (fall through to the
     #: projected ``CODE_EMBED_SERVICE_URL``).
     code_embed_url: str = ""
+    #: v0.2.102 W5-A (M3) — what THIS project declared its own on the
+    #: launcher's Identity tab (``project_infra_declarations``; see
+    #: :mod:`vco_lib.infra_declarations`). Additive: a pre-v0.2.102 hub omits
+    #: them and the parser back-fills empty tuples. Machine-wide "do not
+    #: touch" decisions read launcher.db through ``infra_declarations``, not
+    #: this per-project view.
+    external_collections: tuple[str, ...] = ()
+    unmanaged_containers: tuple[str, ...] = ()
+    ssrf_extra_local_ports: tuple[int, ...] = ()
+
+
+#: The resolver fields that are plain lists of declared values (v0.2.102 M3).
+#: MUST MATCH the bash (``_is_infra_list_field``) and ps1 siblings of
+#: ``templates/scripts/vct_project_config``, which render each one value per
+#: line for ``--field``; ``tests/test_v02102_infra_boundary.py`` runs all three
+#: against one stub hub.
+INFRA_LIST_FIELDS: tuple[str, ...] = (
+    "external_collections",
+    "unmanaged_containers",
+    "ssrf_extra_local_ports",
+)
+
+
+def _str_list(raw: Any) -> tuple[str, ...]:
+    """A JSON list of strings → tuple; anything else → ``()`` (defensive,
+    like ``_parse_extra_codegraph_paths``: one bad field never wedges
+    ``resolve()``)."""
+    if not isinstance(raw, list):
+        return ()
+    return tuple(str(v) for v in raw if isinstance(v, str) and v)
+
+
+def _port_list(raw: Any) -> tuple[int, ...]:
+    if not isinstance(raw, list):
+        return ()
+    return tuple(
+        int(v) for v in raw
+        if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 65535
+    )
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -1353,6 +1392,10 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             # env-resolution / disabled mode.
             rl_server_port=_coerce_optional_port(body.get("rl_server_port")),
             code_embed_url=str(body.get("code_embed_url") or ""),
+            # v0.2.102 W5-A (M3) additive declaration lists.
+            external_collections=_str_list(body.get("external_collections")),
+            unmanaged_containers=_str_list(body.get("unmanaged_containers")),
+            ssrf_extra_local_ports=_port_list(body.get("ssrf_extra_local_ports")),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(

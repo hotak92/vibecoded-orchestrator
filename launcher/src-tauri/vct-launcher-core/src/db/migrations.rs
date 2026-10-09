@@ -258,6 +258,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "chat_model_context.text_only (v0.2.101 — the image-capability flag the model gateway reads from the exported table: 1 = the vendor page states this model takes TEXT-ONLY input, so a request routed to it has each image block replaced by a short text note instead of silently degrading; 0 = images pass through untouched, the conservative default the gateway reader itself gives an absent key). The launcher's seed mirror was silently DROPPING the field, so the pane could not show it and a reseed could not carry it. Plain ALTER TABLE ADD COLUMN (the migration-030 shape — no CHECK to widen, no rebuild): existing rows backfill to 0, the IN (0,1) domain CHECK matches window_1m/user_edited. LAUNCHER_DB_TABLE_SET_VERSION bumps 47->48 atomically with this migration (B-2), with scripts/regen_schema_versions_json.py refreshing the committed snapshot in the same merge.",
         sql: include_str!("migrations/048_chat_model_context_text_only.sql"),
     },
+    Migration {
+        version: 49,
+        description: "project_infra_declarations (v0.2.102 W5-A / M3 — what on this machine belongs to a PROJECT, not to VCO: external_collection = a Weaviate class the project owns, skipped by the doctor's unclaimed/fixture readings and the binding-evidence heal; unmanaged_container = a container VCO never heals, starts, re-creates, labels or adopts (hub watchdog, compose-recovery heals, service detection); local_port = a loopback port of the project's own service, projected as VCT_SSRF_EXTRA_LOCAL_PORTS for the WebFetch guard and never probed for adoption). Additive new table, ON DELETE CASCADE with the project. LAUNCHER_DB_TABLE_SET_VERSION bumps 48->49 atomically with this migration, with scripts/regen_schema_versions_json.py refreshing the committed snapshot.",
+        sql: include_str!("migrations/049_project_infra_declarations.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.

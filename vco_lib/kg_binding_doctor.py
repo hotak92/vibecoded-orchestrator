@@ -74,7 +74,12 @@ Exemptions, all conservative (each can only under-report, never nag):
 * a class that is evidence for ANY registered project (claimed via the
   ownership bar) or named by ANY binding row;
 * a class whose sample carries no usable relative paths — the anchor check
-  could not run, and unknown is not unclaimed. A binding that merely differs from ``expected`` while its own
+  could not run, and unknown is not unclaimed;
+* a class a registered project DECLARED external (v0.2.102 W5-A, M3 —
+  :mod:`vco_lib.infra_declarations`): the project's own runtime data, which
+  no VCO reading may call unclaimed, fixture-shaped or binding evidence. It
+  is not hidden — :attr:`BindingEvidenceScan.external` names it with who
+  declared it, and the doctor prints that line. A binding that merely differs from ``expected`` while its own
 class holds the data is NOT a mismatch — a deliberately custom-named binding
 is a supported state (the Identity-tab picker exists for it) and crying wolf
 there would bury the real signal. Classes bound by OTHER projects are
@@ -85,9 +90,10 @@ would accuse each other's classes on every healthy machine.
 Reads and writes
 ----------------
 Everything here is a READ: one ``GET /v1/schema``, one Aggregate count and
-one bounded ``Get`` per ``*_KnowledgeGraph`` class, one read-only
-``launcher.db`` open (:func:`vco_lib.project_identity.resolve_snapshot` — the
-single DB-open helper), and ``stat`` calls under project folders. No binding
+one bounded ``Get`` per ``*_KnowledgeGraph`` class, read-only ``launcher.db``
+opens (:func:`vco_lib.project_identity.resolve_snapshot`, the declared-external
+collections through :mod:`vco_lib.infra_declarations`, the shared-pointer
+exemption), and ``stat`` calls under project folders. No binding
 is ever written, renamed or re-stamped by this module.
 
 Positive evidence only
@@ -230,6 +236,19 @@ class UnclaimedClass:
 
 
 @dataclass(frozen=True)
+class ExternalClass:
+    """A class present in Weaviate that a registered project declared its own.
+
+    Skipped by every leg of the scan (v0.2.102 W5-A, M3): never counted,
+    never sampled, never evidence, never unclaimed, never fixture-shaped.
+    Reported so the skip is visible, with :attr:`why` naming the declarer.
+    """
+
+    name: str
+    why: str
+
+
+@dataclass(frozen=True)
 class BindingEvidenceScan:
     """Every binding-backed project's verdict, or nothing (see the scan)."""
 
@@ -248,6 +267,9 @@ class BindingEvidenceScan:
     #: only, no counts: this is a listing, and adding a per-class Aggregate
     #: call to a `full`-scope probe buys nothing the report uses.
     fixture_shaped: tuple[str, ...] = ()
+    #: v0.2.102 W5-A (M3): classes in Weaviate that a project declared
+    #: external — skipped by every leg above, listed here with the reason.
+    external: tuple[ExternalClass, ...] = ()
 
     @property
     def mismatches(self) -> tuple[ProjectBindingVerdict, ...]:
@@ -343,6 +365,24 @@ def _file_exists_default(folder: str, rel_path: str) -> bool:
         return False
 
 
+def _external_collections_default(db_path: Optional[Path]) -> Optional[dict[str, str]]:
+    """``{class: why}`` for every declared-external collection, or ``None``
+    when the declarations exist but could not be read (v0.2.102 W5-A, M3).
+
+    The ONE reader is :mod:`vco_lib.infra_declarations` (launcher.db ∪ the
+    projected ``VCT_EXTERNAL_COLLECTIONS``)."""
+    from vco_lib import infra_declarations as infra
+
+    decl = infra.load(db_path=db_path)
+    if not decl.resolvable:
+        return None
+    kind = infra.KIND_EXTERNAL_COLLECTION
+    return {
+        name: decl.why(kind, name) or "declared external"
+        for name in decl.values(kind)
+    }
+
+
 def _shared_pointer_exempt_default(db_path: Optional[Path]) -> str:
     """The canonical shared class name, for the unclaimed exemption.
 
@@ -390,6 +430,7 @@ def scan_kg_binding_evidence(
     count_objects: Optional[Callable[[str], Optional[int]]] = None,  # pyright: ignore[reportRedeclaration] — shadowed on purpose by the call-time default below
     sample_paths: Optional[Callable[[str], Optional[tuple[str, ...]]]] = None,  # pyright: ignore[reportRedeclaration] — shadowed on purpose by the call-time default below
     file_exists: Optional[Callable[[str, str], bool]] = None,
+    external_collections: Optional[Callable[[], Optional[dict[str, str]]]] = None,  # pyright: ignore[reportRedeclaration] — shadowed on purpose by the call-time default below
 ) -> Optional[BindingEvidenceScan]:
     """Compare every registered project's primary binding against its data.
 
@@ -402,7 +443,11 @@ def scan_kg_binding_evidence(
         * ``None`` when the comparison could not be LOOKED at — launcher.db
           unreadable, or the Weaviate schema listing unknown (unreachable,
           non-200, unparsable). Probe failure is not evidence: the caller
-          emits NOTHING, neither a problem nor an "all agreed".
+          emits NOTHING, neither a problem nor an "all agreed". The same
+          holds when the project infrastructure declarations exist but could
+          not be read (v0.2.102 M3): a class someone declared external must
+          never be reported, or handed to the heal, because the list naming
+          it was unreadable.
 
     Never raises and never writes: read-only DB open, HTTP reads, ``stat``.
     Every IO seam is injectable for hermetic tests; the defaults are resolved
@@ -427,19 +472,34 @@ def scan_kg_binding_evidence(
             return _sample_file_paths_default(name, weaviate_url)
     if file_exists is None:
         file_exists = _file_exists_default
+    if external_collections is None:
+        def external_collections() -> Optional[dict[str, str]]:  # noqa: F811
+            return _external_collections_default(db_path)
 
     snapshot = resolve_snapshot(db_path=db_path)
     if not snapshot.resolvable:
+        return None
+    declared = external_collections()
+    if declared is None:
         return None
 
     listing = list_classes()
     if listing is None:
         return None
+    # v0.2.102 W5-A (M3): a declared-external class leaves the scan here, so
+    # no leg below — evidence, the heal that consumes it, unclaimed, fixture —
+    # can ever see it. It is named in `external` instead.
+    external = tuple(
+        ExternalClass(name=name, why=declared[name])
+        for name in sorted({n for n in listing if isinstance(n, str) and n in declared})
+    )
     kg_classes = sorted(
         {
             name
             for name in listing
-            if isinstance(name, str) and name.endswith(PRIMARY_KG_SUFFIX)
+            if isinstance(name, str)
+            and name.endswith(PRIMARY_KG_SUFFIX)
+            and name not in declared
         }
     )
 
@@ -567,12 +627,13 @@ def scan_kg_binding_evidence(
             name for name in listing
             if isinstance(name, str)
             and name not in already
+            and name not in declared
             and fixture_stem_of(name) is not None
         )
     )
     return BindingEvidenceScan(
         verdicts=tuple(verdicts), unclaimed=unclaimed,
-        fixture_shaped=fixture_shaped,
+        fixture_shaped=fixture_shaped, external=external,
     )
 
 
@@ -621,6 +682,21 @@ def render_three_values(verdict: ProjectBindingVerdict) -> str:
     )
 
 
+def external_note(scan: BindingEvidenceScan) -> str:
+    """The sentence every doctor finding appends when the scan skipped
+    declared-external classes (v0.2.102 W5-A, M3) — ``""`` when it skipped
+    none. One renderer, so the agreement, unclaimed and mismatch findings
+    word the skip identically."""
+    ext: tuple[ExternalClass, ...] = tuple(scan.external)
+    if not ext:
+        return ""
+    names = "; ".join(f"{e.name} ({e.why})" for e in ext)
+    return (
+        f" Skipped {len(ext)} declared-external class(es) — a project's own "
+        f"data, never unclaimed or binding evidence: {names}."
+    )
+
+
 def jsonable_verdicts(scan: BindingEvidenceScan) -> list[dict[str, Any]]:
     """The ``Finding.detail`` payload shape for the doctor's JSON report.
 
@@ -652,6 +728,7 @@ def jsonable_verdicts(scan: BindingEvidenceScan) -> list[dict[str, Any]]:
 __all__ = [
     "BindingEvidenceScan",
     "ClassEvidence",
+    "ExternalClass",
     "DEFAULT_SHARED_KG_COLLECTION",
     "MIN_MATCHED_PATHS",
     "OWNERSHIP_MATCH_FRACTION",

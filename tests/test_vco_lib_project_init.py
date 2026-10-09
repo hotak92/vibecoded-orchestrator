@@ -858,7 +858,7 @@ class DetectAndRenameLegacyComposeOverrideTests(unittest.TestCase):
         self.assertEqual(legacy.read_text(), "# legacy\n")
         self.assertEqual(canonical.read_text(), "# canonical\n")
         self.assertIn(
-            "compose_override_filename_conflict",
+            "compose_override_pair_diverged",
             self._read_deferral_ids(),
         )
 
@@ -922,7 +922,7 @@ class DetectAndRenameLegacyComposeOverrideTests(unittest.TestCase):
 
         ids = self._read_deferral_ids()
         self.assertIn("compose_override_renamed", ids)
-        self.assertIn("compose_override_filename_conflict", ids)
+        self.assertIn("compose_override_pair_diverged", ids)
 
     def test_legacy_outside_known_dirs_ignored(self):
         """Legacy files in unrelated subdirs should not be touched —

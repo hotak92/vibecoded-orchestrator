@@ -6263,8 +6263,8 @@ def _emit_chunker_revision_resync_deferral(
 #     in place, emit a `compose_override_renamed` deferral so the operator
 #     can see the migration on next session.
 #   - Both present → conflict; do NOT rename, emit
-#     `compose_override_filename_conflict` so the operator resolves
-#     manually.
+#     `compose_override_pair_diverged` (v0.2.102; superseded
+#     `compose_override_filename_conflict`) so the operator resolves.
 #
 # Idempotent + soft-fail: subsequent runs find the legacy file gone and
 # silently no-op. Permission / disk errors are caught and surfaced as a
@@ -6274,12 +6274,12 @@ def _emit_chunker_revision_resync_deferral(
 
 _LEGACY_COMPOSE_OVERRIDE_NAME = "docker-compose.override.yml"
 _CANONICAL_COMPOSE_OVERRIDE_NAME = "compose.override.yaml"
-_COMPOSE_OVERRIDE_SEARCH_SUBDIRS = ("infrastructure", "claude_mcp_servers")
 
 # v0.2.83 PLAN-v0283 B-F2 + N-2: the compose-override conditions the
 # reconciliation clears when they NO LONGER HOLD this run.
 #
-# B-F2 (original scope): `compose_override_filename_conflict` — the
+# B-F2 (original scope): the divergent-pair deferral (`compose_override_pair_diverged`
+# since v0.2.102, superseding `compose_override_filename_conflict`) — the
 # HUMAN-JUDGEMENT deferral that pre-.83 persisted FOREVER after the user
 # resolved the pair (the incident this fix targets).
 #
@@ -6303,7 +6303,9 @@ _COMPOSE_OVERRIDE_SEARCH_SUBDIRS = ("infrastructure", "claude_mcp_servers")
 # the third run (record already gone). See `test_idempotent_after_rename`
 # (updated with an N-2 comment).
 _COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS = (
-    "compose_override_filename_conflict",
+    # v0.2.102: the divergent-pair state is `compose_override_pair_diverged`;
+    # the retired id stays listed so a pre-v0.2.102 entry drains on this pass.
+    "compose_override_pair_diverged", "compose_override_filename_conflict",
     "compose_override_renamed",
     "compose_override_rename_failed",
 )
@@ -6312,6 +6314,9 @@ _COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS = (
 # v0.2.100: the pair classifiers (B-F2 + U16) live in vco_lib.compose_override_pair
 # (project_init.py is past its line ratchet); these names keep their call sites.
 from vco_lib.compose_override_pair import (  # noqa: E402
+    CID_PAIR_DIVERGED as _CID_PAIR_DIVERGED,
+    SEARCH_SUBDIRS as _COMPOSE_OVERRIDE_SEARCH_SUBDIRS,
+    divergent_pairs_entry as _divergent_pairs_entry,
     classify_pair as _classify_compose_override_conflict,
     reconcile_vco_generated_pair as _reconcile_vco_generated_override_pair,
 )
@@ -6328,8 +6333,8 @@ def _reconcile_compose_override_deferrals(
     run — i.e. it is NOT in ``active_condition_ids``, the set this run re-emitted
     from its own path walk — resolve the on-disk entry. Scope
     (``_COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS``):
-      * ``compose_override_filename_conflict`` — the pair became absent /
-        identical / re-mirrored (B-F2).
+      * ``compose_override_pair_diverged`` (and the retired
+        ``compose_override_filename_conflict``) — the pair converged (B-F2).
       * ``compose_override_renamed`` — the rename is complete (legacy path gone
         this run → not re-emitted) (N-2).
       * ``compose_override_rename_failed`` — the failure no longer recurs
@@ -6391,7 +6396,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
           the legacy file to the canonical bytes (canonical wins), no deferral,
           record an auto-resolution.
         * genuinely divergent (parse failure / parsed-unequal / yaml missing)
-          → keep today's `compose_override_filename_conflict` deferral verbatim.
+          → the `compose_override_pair_diverged` deferral (v0.2.102).
       Do NOT rename in any conflict case.
     - Else: rename via `Path.rename()`. Emit a `compose_override_renamed`
       deferral entry naming both the old and new absolute paths so the
@@ -6465,13 +6470,13 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                 )
                 _de.record_auto_resolution(
                     install_root,
-                    "compose_override_filename_conflict",
+                    _CID_PAIR_DIVERGED,
                     "kept_identical_mirror_pair",
                     detail,
                     log=_log_auto,
                 )
                 auto_resolved.append(detail)
-                auto_resolved_condition_ids.add("compose_override_filename_conflict")
+                auto_resolved_condition_ids.add(_CID_PAIR_DIVERGED)
                 continue
             if classification == "semantic_equal":
                 # B-F2(ii): comment/whitespace drift only. Canonical content
@@ -6498,13 +6503,13 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                 )
                 _de.record_auto_resolution(
                     install_root,
-                    "compose_override_filename_conflict",
+                    _CID_PAIR_DIVERGED,
                     "remirrored_semantic_equal_override",
                     detail,
                     log=_log_auto,
                 )
                 auto_resolved.append(detail)
-                auto_resolved_condition_ids.add("compose_override_filename_conflict")
+                auto_resolved_condition_ids.add(_CID_PAIR_DIVERGED)
                 continue
             # U16 (v0.2.100): both halves are VCO's own generated output →
             # reconcile them here; never ask the user to pick between them.
@@ -6512,10 +6517,10 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                 install_root, legacy_path, target_path, backup_ts)
             if detail is not None:
                 _de.record_auto_resolution(
-                    install_root, "compose_override_filename_conflict",
+                    install_root, _CID_PAIR_DIVERGED,
                     "reconciled_vco_generated_pair", detail, log=_log_auto)
                 auto_resolved.append(detail)
-                auto_resolved_condition_ids.add("compose_override_filename_conflict")
+                auto_resolved_condition_ids.add(_CID_PAIR_DIVERGED)
                 continue
             # B-F2(iii): genuinely divergent — keep today's deferral. Don't
             # overwrite the canonical file with the legacy one (or vice versa).
@@ -6538,7 +6543,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
     if renamed:
         active_ids.add("compose_override_renamed")
     if conflicts:
-        active_ids.add("compose_override_filename_conflict")
+        active_ids.add(_CID_PAIR_DIVERGED)
     if errors:
         active_ids.add("compose_override_rename_failed")
     reconciled = _reconcile_compose_override_deferrals(
@@ -6608,40 +6613,8 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
         ))
 
     if conflicts:
-        conflict_lines = "\n".join(
-            f"- legacy: `{old}` -- canonical: `{new}`"
-            for old, new in conflicts
-        )
-        _pending_entries.append(DeferralEntry(
-            condition_id="compose_override_filename_conflict",
-            title="Both legacy and canonical compose override files present",
-            detected=(
-                "Detected a legacy `docker-compose.override.yml` AND a "
-                "canonical `compose.override.yaml` in the same directory. "
-                "The rename was NOT applied (the canonical file may already "
-                "carry user changes that differ from the legacy file). "
-                "Conflicting pairs:\n"
-                f"{conflict_lines}"
-            ),
-            why_deferred=(
-                "Auto-merging override YAML is unsafe — the two files may "
-                "encode different volume sources, ports, or service "
-                "additions. The operator must compare them and pick one."
-            ),
-            command_to_apply=(
-                "# Compare each conflicting pair, then delete whichever "
-                "is stale:\n"
-                + "\n".join(
-                    f"diff -u {old} {new}\n"
-                    f"# Then `rm` the one you do NOT want to keep."
-                    for old, new in conflicts
-                )
-            ),
-            severity="warning",
-            kg_node_refs=[
-                "knowledge/concepts/podman-compose-override-comment-yaml-drift-footgun.md",
-            ],
-        ))
+        # v0.2.102: the ONE divergent-pair entry, shared with the doctor's probe.
+        _pending_entries.append(_divergent_pairs_entry(conflicts))
 
     if errors:
         error_lines = "\n".join(

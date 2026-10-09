@@ -1017,7 +1017,16 @@ def render_adoption_override(plans: Sequence[ServicePlan], *,
 def write_adoption_override(infra_dir: Path, body: str) -> Optional[str]:
     """Write the override ATOMICALLY to BOTH auto-load names (the C-RT-5
     convention).  REFUSES (returns the reason) when an existing override is
-    user-authored (no managed marker) — never clobber a user's file."""
+    user-authored (no managed marker) — never clobber a user's file — and
+    (v0.2.102 P299-B2) when the two halves already DIVERGE: one of them may be
+    a hand edit that kept the marker, and writing one body to both would
+    silently discard it (the doctor reports the pair as
+    ``compose_override_pair_diverged``)."""
+    from vco_lib.compose_override_pair import divergent_pair_refusal
+
+    diverged = divergent_pair_refusal(infra_dir)
+    if diverged is not None:
+        return diverged
     for name in _OVERRIDE_FILES:
         target = infra_dir / name
         if target.is_file():

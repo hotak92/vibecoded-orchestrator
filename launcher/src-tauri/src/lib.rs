@@ -2988,6 +2988,9 @@ pub fn run() {
             commands::dual_flags::set_dual_flag_for_project,
             commands::dual_flags::get_dual_flags_global_defaults,
             commands::dual_flags::set_dual_flag_global_default,
+            // v0.2.102 W5-A (M3): what a project declared its own (Identity tab).
+            commands::infra_declarations::get_project_infra_declarations,
+            commands::infra_declarations::set_project_infra_declarations,
             // v0.2.91 WP-L (decision #21): the machine-global diagnostic log
             // level. Consumed by `crate::logging::apply_stored_level` (this
             // process, live) and projected to every project as VCO_LOG_LEVEL.

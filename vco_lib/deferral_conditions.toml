@@ -432,6 +432,13 @@ clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
 notes = "v0.2.100 (AD-5, WP-06): the hub watchdog found a stopped service container whose own compose labels name another project and left it alone (no up, no rm, no start). A true description of the machine, kept true by its emitter: `infra_watchdog::record_foreign` rewrites the row when the set of foreign services changes and resolves it (`deferral_bridge::resolve_deferral_conditions`) on the first tick that finds none — including the hub's first tick after a restart. NOT install.py-owned (W1R-15): owned-drop-when-absent would expire the row on the next update while the condition still holds."
 
+[conditions.watchdog_gave_up]
+class = "action_required"
+owner = "vct-hub (infra_watchdog.rs)"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "v0.2.102 (W5-A, P299-B3 / OD-13 a): the hub watchdog exhausted its crash-loop budget (MAX_CONSECUTIVE_FAILURES failed heals in a row) for a VCO-managed service and stopped retrying. Until v0.2.102 that was one tracing::error! line nobody sees. The row names each given-up service with the attempt count, the last error and a remedy (start it by hand / `python install.py --update`; the pause marker silences it). Kept true by its emitter: `infra_watchdog::record_gave_up` rewrites the row when the set of given-up services changes and resolves it (`deferral_bridge::resolve_deferral_conditions`) once none is given up — the next verified heal, or the service observed running again (external recovery), including the hub's first tick after a restart. NOT install.py-owned (W1R-15 precedent): an update must not drop a give-up whose service is still down."
+
 [conditions.services_stop_incomplete]
 class = "action_required"
 owner = "vct-launcher (commands/lifecycle.rs)"
@@ -646,7 +653,12 @@ app_state orchestrator_root_kg_collection is exempt (its lifecycle belongs \
 to the shared-KG surfaces). Diagnosis only: the entry NEVER prints a drop \
 command — re-adding the project, re-binding via the Identity tab, or \
 migrate-collections are the named remedies, and dismissal records 'expected \
-leftover'."""
+leftover'. v0.2.102 (W5-A, M3): a class that is a project's OWN runtime data \
+is resolved by DECLARING it external on that project's Identity tab \
+(project_infra_declarations, kind external_collection; projected as \
+VCT_EXTERNAL_COLLECTIONS) — the scan then skips it on every leg (never \
+unclaimed, never fixture-shaped, never binding evidence for the heal) and the \
+doctor names it as skipped with who declared it."""
 
 [conditions.kg_binding_evidence_mismatch]
 class = "action_required"
@@ -1444,6 +1456,36 @@ class = "action_required"
 owner = "vco_lib.project_init"
 clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
+status = "retired"
+notes = """SUPERSEDED in v0.2.102 (W5-A) by compose_override_pair_diverged — the \
+same divergent-pair state, now ONE condition both the install-time rename pass \
+and the doctor emit and clear through compose_override_pair.divergent_pairs. \
+No producer emits this id any more. Kept so a pre-v0.2.102 on-disk entry \
+drains: the rename pass's reconcile (project_init \
+_COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS, the paired site) resolves it on the \
+next install/update, since it is never re-detected."""
+
+[conditions.compose_override_pair_diverged]
+class = "action_required"
+owner = "vco_lib.doctor + vco_lib.project_init (install-time rename pass)"
+clear_probe = "probe:py:compose_override_pair_still_diverged"
+emit_surfaces = ["ledger"]
+notes = """v0.2.102 (W5-A, P299-B2): an install's two override auto-load \
+names (compose.override.yaml for podman-compose, docker-compose.override.yml \
+for docker compose v1, in infrastructure/ or the legacy claude_mcp_servers/) \
+hold DIFFERENT configurations, so the two runtimes start different stacks — \
+the 2026-09 outage left one twin hand-fixed and the other still broken. \
+Equality is compose_override_pair.classify_pair's (byte-identical or \
+YAML-equal; unreadable / unparsable reads as divergent). ONE condition, TWO \
+emitters reading the same state (compose_override_pair.divergent_pairs) and \
+building the same entry (divergent_pairs_entry): the doctor's \
+compose_override_pair probe, and the install-time rename pass \
+(project_init._detect_and_rename_legacy_compose_override), which no longer \
+emits its own compose_override_filename_conflict (retired, superseded by this \
+id). Cleared by the clear probe, by the doctor's OK reading, and by the rename \
+pass's reconcile once the halves agree or one is gone. The Python override \
+writer (service_adoption.write_adoption_override) REFUSES to overwrite a \
+divergent pair, because either half may be a hand edit."""
 
 [conditions.schema_migration_required]
 class = "action_required"
