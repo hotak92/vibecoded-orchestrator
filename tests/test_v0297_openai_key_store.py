@@ -100,24 +100,44 @@ def test_the_vco_slot_is_the_only_source_and_the_env_var_is_ignored(
     assert openai_key.resolve_openai_api_key() == CANARY, "VCO's own slot is"
 
 
-def test_a_projects_key_never_answers_for_vco(stores: Path, tmp_path, monkeypatch) -> None:
-    """The plan's red-proof: a project holding an OpenAI key in EVERY
-    project-scoped store it has — its ``.env`` (both spellings), the
-    per-project file-store slot, and the session environment — resolves to
-    ``""`` for VCO, and VCO's own shared slot answers once it is set."""
+def test_the_dedicated_project_key_answers_and_the_slot_name_never_does(
+    stores: Path, tmp_path, monkeypatch,
+) -> None:
+    """v0.2.102 (OD-4 + its 2026-10-09 refinement). A project gives VCO its
+    own OpenAI key through the DEDICATED ``vco_openai_api_key`` — that
+    per-project copy answers for the project. A per-project
+    ``openai_api_key`` under the slot's own name NEVER answers (the
+    2026-09-26 ruling stands for it), and neither do the project's
+    ``.env`` (either spelling) nor the session environment."""
     project = tmp_path / "rental-app"
     project.mkdir()
     (project / ".vct-project").write_text("rental-app\n")
     (project / ".env").write_text(
         f'OPENAI_API_KEY="{OTHER}"\nopenai_api_key="{OTHER}"\n'
     )
-    per_project = stores / "projects" / "rental-app" / openai_key.OPENAI_SECRET_NAME
-    per_project.parent.mkdir(parents=True)
-    per_project.write_text(OTHER)
     monkeypatch.setenv("OPENAI_API_KEY", OTHER)
 
+    # No copy anywhere: the env var and the .env lines never answer.
     assert openai_key.resolve_openai_api_key(str(project)) == ""
-    openai_key.store_openai_api_key(CANARY)
+    # A per-project openai_api_key (the SLOT's name) still never answers.
+    slot_name = stores / "projects" / "rental-app" / openai_key.OPENAI_SECRET_NAME
+    slot_name.parent.mkdir(parents=True)
+    slot_name.write_text(OTHER)
+    openai_key._resolved.clear()  # the resolver answers once per project
+    assert openai_key.resolve_openai_api_key(str(project)) == ""
+    # The DEDICATED name's per-project copy DOES answer (project first).
+    dedicated = stores / "projects" / "rental-app" / openai_key.VCO_PROJECT_SECRET_NAME
+    dedicated.write_text(OTHER)
+    openai_key._resolved.clear()
+    assert openai_key.resolve_openai_api_key(str(project)) == OTHER
+    # ... and outranks a shared copy of a DIFFERENT value.
+    openai_key.store_openai_api_key(CANARY)  # clears the resolver cache
+    assert openai_key.resolve_openai_api_key(str(project)) == OTHER
+    # Without the dedicated copy, the shared slot serves as before — and
+    # the per-project slot-name copy is still ignored.
+    dedicated.unlink()
+    slot_name.unlink()
+    openai_key._resolved.clear()
     assert openai_key.resolve_openai_api_key(str(project)) == CANARY
 
 

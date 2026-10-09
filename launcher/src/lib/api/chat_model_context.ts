@@ -23,6 +23,7 @@
 
 import { invoke } from '$lib/tauri';
 import type {
+  ChatModelContextEditedDiff,
   ChatModelContextInput,
   ChatModelContextMutation,
   ChatModelContextRow,
@@ -39,6 +40,17 @@ export async function listChatModelContext(): Promise<ChatModelContextRow[]> {
 /** Header status: export path, what the gateway currently sees, seed state. */
 export async function getChatModelContextStatus(): Promise<ChatModelContextStatus> {
   return invoke<ChatModelContextStatus>('chat_model_context_status');
+}
+
+/**
+ * Per-row edited-vs-shipped verdict (v0.2.102, OD-3): which stored rows
+ * differ from the shipped seed, field by field. Computed in Rust from the
+ * embedded seed — the comparison is the backend's, never re-implemented
+ * here. An empty array means "no seed readable" (no badges), not "nothing
+ * differs"; the status card's `seed_available` names that case.
+ */
+export async function getChatModelContextEditedDiff(): Promise<ChatModelContextEditedDiff[]> {
+  return invoke<ChatModelContextEditedDiff[]>('chat_model_context_edited_diff');
 }
 
 /**
