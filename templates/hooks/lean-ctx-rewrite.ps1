@@ -149,6 +149,12 @@ if (-not (Test-Path -LiteralPath $teePath)) { exit 0 }
 # 4. Allow-list decision. Every failure arm exits 0 with NO stdout → the
 #    original command runs raw under the normal permission flow.
 try { $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop } catch { exit 0 }
+# v0.2.102 W5-D: lean-ctx compression is Bash-only, by design (owner
+# decision). The wrapper re-runs the command through a POSIX shell
+# (lean-ctx -c), which cannot run PowerShell syntax, so this hook stays
+# registered on matcher Bash and any other tool name (a PowerShell-tool call
+# reaching it through a user-widened matcher) runs raw.
+if ($payload -and $payload.tool_name -and [string]$payload.tool_name -ne "Bash") { exit 0 }
 $cmd = ""
 if ($payload -and $payload.tool_input -and $payload.tool_input.command) {
     $cmd = [string]$payload.tool_input.command

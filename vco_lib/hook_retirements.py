@@ -605,7 +605,10 @@ class PriorShippedShape:
     def matches(self, event: str, matcher: str, hook: Any) -> bool:
         """True when ``hook`` (an inner-hook dict under ``matcher`` in
         ``event``) IS this shipped shape. Never raises."""
-        if event != self.event or matcher != self.matcher:
+        # v0.2.102 W5-D: a group whose matcher the merge already widened
+        # (MATCHER_MIGRATIONS) still carries this shipped shape.
+        if event != self.event or matcher not in (
+                self.matcher, migrated_matcher(self.event, self.matcher, self.target)):
             return False
         if not isinstance(hook, dict):
             return False
@@ -687,6 +690,115 @@ def _v02101_reshape_rows() -> Tuple[PriorShippedShape, ...]:
 #: under the row's matcher (else the row is dead), and its shape must differ
 #: from the row (else there is nothing to reshape).
 PRIOR_SHIPPED_SHAPES: Tuple[PriorShippedShape, ...] = _v02101_reshape_rows()
+
+
+# ── MIGRATED matchers (v0.2.102 W5-D) ──────────────────────────────────────
+#
+# A shipped hook whose registration keeps its script, command and keys but
+# whose GROUP MATCHER widened. v0.2.102 moves every shell-inspecting hook
+# from ``Bash`` to ``Bash|PowerShell``: Claude Code on Windows without Git
+# Bash has no Bash tool (the shell tool is ``PowerShell``), so a ``Bash``
+# registration never fires there (vendor hooks doc, "PowerShell" tool).
+# Neither table above can express that — the scrub needs a retired script,
+# a reshape row an exact old shape — and the supersede pass compares
+# commands only, so without this table an upgraded install would keep the
+# ``Bash`` group forever (and gain no PowerShell twin rules).
+
+
+@dataclass(frozen=True)
+class MatcherMigration:
+    """One group-matcher widening, as DATA.
+
+    Attributes:
+        event: the settings.json hook event.
+        old: the matcher VCO shipped the group under (verbatim).
+        new: the matcher the current template ships it under.
+        targets: the hook-script BASENAMES (both OS flavours) whose groups
+            move. A user group moves only when EVERY command in it is one
+            of these — a group that also carries the user's own hook is
+            theirs and is left exactly as it is.
+        retired_in: the release that widened the matcher.
+        reason: why, for readers of the table.
+    """
+
+    event: str
+    old: str
+    new: str
+    targets: frozenset
+    retired_in: str
+    reason: str
+
+
+def _shell_matcher_migrations() -> Tuple[MatcherMigration, ...]:
+    reason = (
+        "Claude Code on Windows without Git Bash registers no Bash tool — "
+        "its shell tool is PowerShell — so a hook matched on Bash alone "
+        "never fired there; v0.2.102 matches Bash|PowerShell (vendor hooks "
+        "doc) and the decision modules read PowerShell syntax"
+    )
+
+    def both(*stems: str) -> frozenset:
+        return frozenset(f"{st}.{ext}" for st in stems for ext in ("sh", "ps1"))
+
+    return (
+        MatcherMigration(
+            event="PreToolUse", old="Bash", new="Bash|PowerShell",
+            targets=both("pre-vercel-token-guard", "pre-bash-context-inject",
+                         "wait-guard"),
+            retired_in="v0.2.102", reason=reason),
+        MatcherMigration(
+            event="PostToolUse", old="Bash", new="Bash|PowerShell",
+            targets=both("post-bash-file-sync"),
+            retired_in="v0.2.102", reason=reason),
+    )
+
+
+#: The table. ``tests/test_v02102_powershell_hooks.py`` pins every row to
+#: BOTH settings templates (each target ships under ``new``, none under
+#: ``old``).
+MATCHER_MIGRATIONS: Tuple[MatcherMigration, ...] = _shell_matcher_migrations()
+
+
+def migrated_matcher(event: str, matcher: str, target: Optional[str]) -> str:
+    """The matcher a ``(event, matcher, script)`` registration is migrated
+    to — ``matcher`` itself when no row covers it. Never raises."""
+    for row in MATCHER_MIGRATIONS:
+        if row.event == event and row.old == matcher and target in row.targets:
+            return row.new
+    return matcher
+
+
+def migrate_group_matcher(event: str, group: Any, template_matchers: Any) -> Optional[str]:
+    """The new matcher for a user ``group`` of ``event``, or ``None`` when it
+    must stay as it is.
+
+    Moves only when (a) a :data:`MATCHER_MIGRATIONS` row covers the group's
+    matcher, (b) EVERY inner hook is a command whose script identity is one
+    of the row's targets (a group carrying anything else is the user's),
+    and (c) ``template_matchers`` — identity → the matchers the CURRENT
+    template ships it under in this event — has each identity under the new
+    matcher (an older template is never "upgraded" past what it ships).
+    Never raises."""
+    if not isinstance(group, dict):
+        return None
+    matcher = group.get("matcher")
+    inner = group.get("hooks")
+    if not isinstance(matcher, str) or not isinstance(inner, list) or not inner:
+        return None
+    for row in MATCHER_MIGRATIONS:
+        if row.event != event or row.old != matcher:
+            continue
+        idents = []
+        for h in inner:
+            cmd = h.get("command") if isinstance(h, dict) else None
+            ident = vco_hook_script_identity(cmd) if isinstance(cmd, str) and cmd else None
+            if ident is None or ident not in row.targets:
+                idents = []
+                break
+            idents.append(ident)
+        if idents and all(row.new in (template_matchers.get(i) or ()) for i in idents):
+            return row.new
+    return None
 
 
 def match_prior_shipped_shape(
@@ -1459,6 +1571,8 @@ __all__ = [
     "DISABLED_STEMS_ENV_KEY",
     "KIND_COMMAND",
     "KIND_HOOK_SCRIPT",
+    "MATCHER_MIGRATIONS",
+    "MatcherMigration",
     "PRIOR_SHIPPED_SHAPES",
     "PriorShippedShape",
     "RETIRED_REGISTRATIONS",
@@ -1470,6 +1584,8 @@ __all__ = [
     "main",
     "match_prior_shipped_shape",
     "match_retired_registration",
+    "migrate_group_matcher",
+    "migrated_matcher",
     "normalize_command",
     "removal_envelope_rows",
     "scrub_retired_registrations",

@@ -54,6 +54,7 @@ if ($EffectiveToolName) {
     switch ($EffectiveToolName) {
         { $_ -in 'Read', 'Write', 'Edit' } { $WordsThisTurn = 1000 }
         'Bash' { $WordsThisTurn = 500 }
+        'PowerShell' { $WordsThisTurn = 500 }
         'Task' { $WordsThisTurn = 2000 }
         default { $WordsThisTurn = 200 }
     }

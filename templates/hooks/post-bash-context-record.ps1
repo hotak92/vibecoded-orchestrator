@@ -55,7 +55,8 @@ try {
     }
 } catch { }
 
-if ($ToolName -ne "Bash") { exit 0 }
+# Bash, or the PowerShell tool (v0.2.102 W5-D) -- pairs with pre-bash.
+if ($ToolName -ne "Bash" -and $ToolName -ne "PowerShell") { exit 0 }
 if (-not $SessionId) { $SessionId = "default" }
 if (-not $Command) { exit 0 }
 

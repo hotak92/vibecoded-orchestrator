@@ -3470,6 +3470,7 @@ pub fn run() {
             // edit each node in a Claude session for the PostToolUse hook
             // to backfill it lazily.
             commands::kg_summary::get_kg_summary_status,
+            commands::kg_summary::get_summary_model_info,
             commands::kg_summary::retry_kg_summary,
             // v0.2.96 WP-7b: the GUI "Recheck summary backend now" action
             // (Preferences → KG Summaries) — shells to

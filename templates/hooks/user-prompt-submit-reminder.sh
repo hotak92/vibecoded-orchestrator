@@ -55,7 +55,7 @@ WORDS_THIS_TURN=0
 if [ -n "${CLAUDE_TOOL_NAME:-}" ]; then
     case "$CLAUDE_TOOL_NAME" in
         Read|Write|Edit) WORDS_THIS_TURN=1000 ;;
-        Bash) WORDS_THIS_TURN=500 ;;
+        Bash|PowerShell) WORDS_THIS_TURN=500 ;;
         Task) WORDS_THIS_TURN=2000 ;;
         *) WORDS_THIS_TURN=200 ;;
     esac

@@ -92,6 +92,8 @@ Write|post-edit-outcome|-
 Write|kg-summary-generator|-
 Bash|post-bash-context-record|-
 Bash|post-git-commit-kg-sync|git-commit-prefix
+PowerShell|post-bash-context-record|-
+PowerShell|post-git-commit-kg-sync|git-commit-prefix
 mcp__weaviate-kg__store_knowledge_node|kg-summary-generator|-
 *|kg-update-nudge|-
 '

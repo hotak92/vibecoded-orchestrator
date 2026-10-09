@@ -122,7 +122,7 @@ WEB_TOOL_NAMES = {
 AGENT_TOOL_NAMES = {"Agent", "Task"}
 # B6 fix: Bash output IS intake; capped tighter than Read because it's
 # more often noise (status checks, short results).
-BASH_TOOL_NAMES = {"Bash", "Grep", "Glob"}
+BASH_TOOL_NAMES = {"Bash", "PowerShell", "Grep", "Glob"}  # PowerShell: v0.2.102 W5-D
 
 
 # ── nudge-body strip patterns (B13: self-suppression fix) ──────────────────

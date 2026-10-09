@@ -142,7 +142,9 @@ except Exception:
 sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 " 2>/dev/null)
 
-[ "$TOOL_NAME" = "Bash" ] || exit 0
+# Bash, or the PowerShell tool (v0.2.102 W5-D — the only shell tool on
+# Windows without Git Bash; the parser reads its syntax via --tool).
+case "$TOOL_NAME" in Bash|PowerShell) ;; *) exit 0 ;; esac
 [ -z "$COMMAND" ] && exit 0
 
 # The parser lib is missing → this hook can recover NO write target from any
@@ -166,7 +168,7 @@ if ! command -v vco_bash_write_prefilter >/dev/null 2>&1; then
     exit 0
 fi
 
-vco_bash_write_prefilter "$COMMAND" || exit 0
+vco_bash_write_prefilter "$COMMAND" "$TOOL_NAME" || exit 0
 
 # Telemetry attribution for the children we spawn (same 3-layer chain as
 # post-file-edit.sh: an empty VCT_SESSION_ID makes every CLI-emitted event
@@ -178,7 +180,7 @@ vco_bash_write_prefilter "$COMMAND" || exit 0
 # ---------------------------------------------------------------------------
 vco_bash_write_init "$SCRIPT_DIR" "$PY"
 SCAN_STATE="$PROJECT_ROOT/.claude/state/bash_write_scan.ts"
-PATHS=$(vco_bash_write_targets "$COMMAND" "$PROJECT_ROOT" "$SCAN_STATE")
+PATHS=$(vco_bash_write_targets "$COMMAND" "$PROJECT_ROOT" "$SCAN_STATE" "$TOOL_NAME")
 
 [ -z "$PATHS" ] && exit 0
 

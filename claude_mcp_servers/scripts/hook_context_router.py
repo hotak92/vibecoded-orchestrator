@@ -618,7 +618,10 @@ def _resolve_rev(rev: str, cwd: str) -> str:
 def _bash_plan(payload: Dict, cwd: str) -> _Plan:
     plan = _Plan()
     command = str((payload.get("tool_input") or {}).get("command") or "")
-    bi = classify_bash(command, cwd)
+    # v0.2.102 W5-D: the PowerShell tool feeds the same surface; the
+    # classifier reads its command through the Bash-equivalent translation.
+    tool = str(payload.get("tool_name") or "Bash")
+    bi = classify_bash(command, cwd, tool)
     plan.intent_out = bi.to_dict()
     if bi.intent == INTENT_MECHANICAL:
         return plan  # no query, no injection, no RL retrieval event

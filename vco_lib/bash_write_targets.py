@@ -91,6 +91,11 @@ import time
 from typing import List, Optional, Sequence, Tuple
 
 from vco_lib.bash_command_walk import tokenize, walk_command
+from vco_lib.powershell_command import (
+    BASH_TOOL,
+    POWERSHELL_TOOL,
+    command_for_bash_readers,
+)
 
 # --- Vocabulary ----------------------------------------------------------
 
@@ -798,12 +803,20 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
         default="",
         help="watermark file; enables the bounded knowledge/docs mtime fallback",
     )
+    parser.add_argument(
+        "--tool",
+        default=BASH_TOOL,
+        choices=(BASH_TOOL, POWERSHELL_TOOL),
+        help="the shell tool the command came from (v0.2.102 W5-D: a "
+             "PowerShell command is read through its Bash-equivalent form)",
+    )
     args = parser.parse_args(argv)
 
     try:
         command = sys.stdin.read()
     except (OSError, UnicodeDecodeError):
         return 0
+    command = command_for_bash_readers(args.tool, command)
 
     root = args.project_root or None
 

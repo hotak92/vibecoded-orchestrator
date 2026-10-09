@@ -674,8 +674,11 @@ def _wait_guard_groups(doc: dict, event: str, matcher: str | None = None):
 @pytest.mark.parametrize("tpl", [LINUX, WINDOWS], ids=["linux", "windows"])
 class TestRegistrations:
     def test_bash_group_if_rules(self, tpl):
-        (g,) = _wait_guard_groups(_load(tpl), "PreToolUse", "Bash")
-        rules = [h.get("if") for h in g["hooks"]]
+        # v0.2.102 W5-D: the group matches Bash|PowerShell; its Bash rules
+        # come first and stay exactly these (the PowerShell twins are pinned
+        # in tests/test_v02102_powershell_hooks.py).
+        (g,) = _wait_guard_groups(_load(tpl), "PreToolUse", "Bash|PowerShell")
+        rules = [h.get("if") for h in g["hooks"] if h.get("if", "").startswith("Bash(")]
         assert rules == WAIT_GUARD_BASH_RULES
         for h in g["hooks"]:
             assert h.get("timeout") == 10

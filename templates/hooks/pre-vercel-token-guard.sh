@@ -51,8 +51,9 @@ except Exception:
     print('{}')
 " 2>/dev/null || echo "{}")
 
-# Only inspect Bash invocations
-[[ "$TOOL_NAME" != "Bash" ]] && exit 0
+# Only inspect shell invocations: Bash, or the PowerShell tool (v0.2.102
+# W5-D — the only shell tool on Windows without Git Bash).
+[[ "$TOOL_NAME" != "Bash" && "$TOOL_NAME" != "PowerShell" ]] && exit 0
 
 # Extract the command string from the tool_input JSON
 CMD=$(printf '%s' "$TOOL_ARGS" | "$PY" -c "
@@ -66,9 +67,26 @@ except Exception:
 
 # Match `vercel` (or its absolute/local-bin paths) followed somewhere by
 # --token=... or --token <value>. We accept any preceding pipeline stages.
-if echo "$CMD" | LEAN_CTX_OFF=1 command grep -qE '(^|[[:space:]/])vercel([[:space:]]|$)'; then
+# `\` joins the boundary class: a PowerShell path (`.\node_modules\.bin\vercel`),
+# and `vercel.cmd` / `vercel.exe` are the Windows shims.
+if echo "$CMD" | LEAN_CTX_OFF=1 command grep -qiE '(^|[[:space:]/\\])vercel(\.cmd|\.exe)?([[:space:]]|$)'; then
     if echo "$CMD" | LEAN_CTX_OFF=1 command grep -qE -- '--token[= ]'; then
-        cat >&2 <<'EOF'
+        if [[ "$TOOL_NAME" == "PowerShell" ]]; then
+            cat >&2 <<'EOF'
+BLOCKED: `vercel --token=...` echoes the token back in stdout (in the
+`next:` block on success), which leaks `vcp_*` strings into the tool-result
+view. Use the env var instead, which the CLI reads transparently and never
+prints:
+
+    $env:VERCEL_TOKEN = (Get-Content ~/.vct-secrets/shared/vercel_token); `
+      .\node_modules\.bin\vercel deploy --prod --yes
+
+If you really need --token (e.g. machine that has no env access), pipe the
+output through `2>&1 | Select-Object -Last 3` or redirect stderr and only
+keep stdout (vercel writes the deployment URL on stdout, errors on stderr).
+EOF
+        else
+            cat >&2 <<'EOF'
 BLOCKED: `vercel --token=...` echoes the token back in stdout (in the
 `next:` block on success), which leaks `vcp_*` strings into the tool-result
 view. Use the env var instead, which the CLI reads transparently and never
@@ -81,8 +99,8 @@ If you really need --token (e.g. machine that has no env access), pipe the
 output through `2>&1 | tail -3` or redirect stderr to /dev/null and only
 keep stdout (vercel writes the deployment URL on stdout, errors on stderr).
 EOF
+        fi
         exit 2
     fi
 fi
-
 exit 0

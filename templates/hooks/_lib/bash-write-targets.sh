@@ -65,7 +65,7 @@ vco_bash_write_init() {
     return 0
 }
 
-# vco_bash_write_prefilter <command>
+# vco_bash_write_prefilter <command> [tool]   (tool: Bash default, or PowerShell)
 #
 # Pure bash, no subprocess: this runs on EVERY Bash tool call and must cost
 # ~nothing. Exit 0 when the command plausibly wrote a file.
@@ -102,8 +102,27 @@ vco_bash_write_init() {
 # two operating systems must agree about which commands are worth parsing.
 # `tests/test_v0295_bash_write_sync.py` runs both against one corpus.
 vco_bash_write_prefilter() {
-    local c="${1:-}"
+    local c="${1:-}" tool="${2:-Bash}"
     [ -n "$c" ] || return 1
+    if [ "$tool" = "PowerShell" ]; then
+        # v0.2.102 W5-D — a PowerShell-tool command: PowerShell is
+        # case-insensitive and writes paths with `\`, so fold both (tr, not
+        # ${c,,}: macOS ships bash 3.2), strip the `$null` sinks, then its
+        # write spellings (cmdlets + aliases) join the checks below.
+        c="$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]' | tr '\\' '/')"
+        c="${c//\*> \$null/}"
+        c="${c//\*>\$null/}"
+        c="${c//2> \$null/}"
+        c="${c//2>\$null/}"
+        c="${c//> \$null/}"
+        c="${c//>\$null/}"
+        local p=" ${c//[;&|(){\}]/ } "
+        case "$p" in
+            *' set-content '*|*' add-content '*|*' ac '*|*' out-file '*) return 0 ;;
+            *' tee-object '*|*' new-item '*|*' ni '*) return 0 ;;
+            *' copy-item '*|*' copy '*|*' cpi '*|*' move-item '*|*' move '*|*' mi '*) return 0 ;;
+        esac
+    fi
     local s="$c"
     s="${s//2>&1/}"
     s="${s//1>&2/}"
@@ -143,7 +162,7 @@ vco_bash_write_prefilter() {
     return 1
 }
 
-# vco_bash_write_targets <command> <project_root> [scan_state]
+# vco_bash_write_targets <command> <project_root> [scan_state] [tool]
 #
 # One absolute path per line, for paths that EXIST (the command has already
 # run, so a candidate that isn't on disk was a parse artefact). Passing a
@@ -151,10 +170,11 @@ vco_bash_write_prefilter() {
 # writes the command text cannot express — see the Python module's
 # docstring for the bound and the cost.
 vco_bash_write_targets() {
-    local cmd="${1:-}" root="${2:-}" scan_state="${3:-}"
+    local cmd="${1:-}" root="${2:-}" scan_state="${3:-}" tool="${4:-Bash}"
     [ -n "$cmd" ] && [ -n "$root" ] && [ -n "$_VCO_BWT_PY" ] || return 0
     local args=( -m vco_lib.bash_write_targets --project-root "$root" --require-exists )
     [ -n "$scan_state" ] && args+=( --scan-state "$scan_state" )
+    [ "$tool" = "PowerShell" ] && args+=( --tool PowerShell )
     printf '%s' "$cmd" | \
         PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" \
         "$_VCO_BWT_PY" "${args[@]}" 2>/dev/null || true

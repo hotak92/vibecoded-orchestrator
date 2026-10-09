@@ -75,7 +75,8 @@ COMMAND=$(printf '%s' "$_PARSED" | sed -n '3p')
 TR_B64=$(printf '%s' "$_PARSED" | sed -n '4p')
 TOOL_USE_ID_RAW=$(printf '%s' "$_PARSED" | sed -n '5p')
 
-[ "$TOOL_NAME" != "Bash" ] && exit 0
+# Bash, or the PowerShell tool (v0.2.102 W5-D) — pairs with pre-bash.
+[ "$TOOL_NAME" != "Bash" ] && [ "$TOOL_NAME" != "PowerShell" ] && exit 0
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 
 # Re-derive cmd_hash from the command (must match pre-bash's hash exactly)

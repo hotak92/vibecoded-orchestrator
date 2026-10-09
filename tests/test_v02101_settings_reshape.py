@@ -38,6 +38,7 @@ from vco_lib.hook_retirements import (
     PriorShippedShape,
     hook_command_key,
     match_retired_registration,
+    migrated_matcher,
     removal_envelope_rows,
     vco_hook_script_identity,
 )
@@ -166,7 +167,14 @@ def test_user_modified_prebash_entry_is_untouched(os_name: str, changes: dict) -
     removed: list = []
     merged = settings_merge.smart_merge_settings(
         user, _current(os_name), retired_removed=removed)
-    assert _handlers(merged, "PreToolUse", "pre-bash-context-inject") == before, (
+    # v0.2.102 W5-D: the handler is preserved byte-for-byte; only its GROUP
+    # matcher widens Bash -> Bash|PowerShell (MATCHER_MIGRATIONS) — the
+    # matcher names which shell tool the VCO script sees, not a knob the
+    # user tuned (a user-CHANGED matcher is never migrated: see
+    # test_prior_shape_under_a_user_matcher_is_untouched).
+    want = [(migrated_matcher("PreToolUse", m, vco_hook_script_identity(h["command"])), h)
+            for m, h in before]
+    assert _handlers(merged, "PreToolUse", "pre-bash-context-inject") == want, (
         "a user-modified registration must be preserved exactly (user-wins)")
     assert not any(isinstance(r["retirement"], PriorShippedShape)
                    and "pre-bash" in r["command"] for r in removed)
@@ -213,9 +221,12 @@ def _v02101_shaped(os_name: str) -> dict:
     template ships; the caller asserts the six were actually removed."""
     doc = _current(os_name)
     for g in doc["hooks"]["PreToolUse"]:
-        if g.get("matcher") == "Bash":
+        if g.get("matcher") == "Bash|PowerShell":
+            # v0.2.101 shipped the group under `Bash`, with no PowerShell twins.
+            g["matcher"] = "Bash"
             g["hooks"] = [h for h in g["hooks"]
-                          if h.get("if") not in V02102_NEW_RULES]
+                          if h.get("if") not in V02102_NEW_RULES
+                          and h.get("if", "").startswith("Bash(")]
     return doc
 
 
@@ -257,7 +268,7 @@ def test_user_tuned_rule_is_not_given_a_shipped_twin(os_name: str) -> None:
     on (command, if), not the full fingerprint."""
     user = _v02101_shaped(os_name)
     for g in user["hooks"]["PreToolUse"]:
-        if g.get("matcher") != "Bash":
+        if g.get("matcher") not in ("Bash", "Bash|PowerShell"):
             continue
         for h in g["hooks"]:
             if h.get("if") == "Bash(awk *)":
@@ -365,8 +376,11 @@ def test_reshape_rows_are_not_retirements() -> None:
 def test_prior_shape_row_is_live(row: PriorShippedShape) -> None:
     os_name = "linux" if row.target.endswith(".sh") else "windows"
     template = _current(os_name)
+    # v0.2.102 W5-D: a row whose matcher was widened (MATCHER_MIGRATIONS)
+    # reshapes into the template's group under the widened matcher.
+    live_matcher = migrated_matcher(row.event, row.matcher, row.target)
     shipped = [h for m, h in _handlers(template, row.event, row.target.rsplit(".", 1)[0])
-               if m == row.matcher]
+               if m == live_matcher]
     assert shipped, (
         f"{row.target}: the template no longer ships it under {row.matcher!r} "
         "— the row reshapes into nothing; retire the row (or declare a "

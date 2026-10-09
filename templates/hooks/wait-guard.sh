@@ -5,7 +5,8 @@
 # Wait-loop / polling guard — THIN WRAPPER (v0.2.102 lane W4-D).
 # Registered FOUR times; every registration is this one script with a mode:
 #
-#   pretooluse       PreToolUse matchers Bash (if-filtered verb rules),
+#   pretooluse       PreToolUse matchers Bash|PowerShell (if-filtered verb
+#                    rules, one handler per tool -- vendor hooks doc),
 #                    Read, and ScheduleWakeup|CronCreate|Monitor
 #   record-expansion UserPromptExpansion, matcher loop|schedule (records a
 #                    user-typed /loop or /schedule — the documented direct

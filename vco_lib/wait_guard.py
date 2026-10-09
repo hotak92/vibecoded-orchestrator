@@ -80,6 +80,12 @@ from vco_lib.bash_command_walk import (
     tokenize,
     walk_command,
 )
+from vco_lib.powershell_command import (
+    POWERSHELL_TOOL,
+    PS_WAIT_VERBS,
+    SHELL_TOOLS,
+    command_for_bash_readers,
+)
 
 __all__ = [
     "DEFAULT_REPEAT_MAX",
@@ -101,6 +107,32 @@ SELF_WAKE_TOOLS = frozenset({"ScheduleWakeup", "CronCreate", "Monitor"})
 #: First-verb table of the repeat detector: a read-only command whose
 #: normalized form repeats (same verb, same tokens) N times in the window.
 REPEAT_VERBS = frozenset({"tail", "head", "cat", "ls", "wc", "grep"})
+
+#: v0.2.102 W5-D — the PowerShell twin ``if`` rules of the wait-guard
+#: PreToolUse group (matcher ``Bash|PowerShell``; a single ``if`` rule
+#: matches ONE tool's calls — vendor hooks doc — so the PowerShell tool gets
+#: its own handlers). The cmdlets whose Bash reading is a pattern or repeat
+#: verb above (derived from the ONE PowerShell table; cmdlet names only —
+#: Claude Code canonicalizes aliases before matching, vendor permissions doc
+#: "PowerShell"), the foreground waits, ``Receive-Job`` (its ``-Wait`` form
+#: blocks) and Windows ``timeout.exe`` (a native executable, so no alias
+#: canonicalization covers it). NO loop-keyword rules: ``while``/``do``/
+#: ``for``/``foreach`` are language keywords, not commands, so a rule keyed
+#: on one can never match — a loop body is caught by the cmdlet inside it
+#: (``Start-Sleep``), each subcommand being checked on its own.
+#: MUST MATCH the ``PowerShell(...)`` rules of the wait-guard group in BOTH
+#: settings templates — locked by tests/test_v02102_powershell_hooks.py.
+_PS_RULE_BASH_VERBS = ("sleep", "cat", "ls", "wc", "grep",
+                       "wait-job", "wait-process", "wait-event")
+_PS_RULE_EXTRA = ("Receive-Job", "timeout")
+
+
+def powershell_rule_spellings() -> List[str]:
+    """The command spellings the wait-guard's PowerShell twin rules cover."""
+    from vco_lib.powershell_command import spellings_for_bash_verbs
+
+    return spellings_for_bash_verbs(_PS_RULE_BASH_VERBS) + list(_PS_RULE_EXTRA)
+
 
 DEFAULT_REPEAT_MAX = 4
 DEFAULT_REPEAT_WINDOW_S = 600
@@ -135,7 +167,7 @@ def _env_int(env: Dict[str, str], name: str, default: int) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Static polling patterns (foreground Bash)
+# Static polling patterns (foreground Bash, and PowerShell read as Bash)
 # ═══════════════════════════════════════════════════════════════════════
 
 _TAIL_FOLLOW_FLAGS = frozenset({"-f", "-F", "--follow"})
@@ -181,6 +213,11 @@ def _pattern_of_segment(tokens: List[str], depth: int) -> Optional[tuple]:
         return ("tail --follow", " ".join(body[:3]))
     if verb in _SCAN_WRAPPER_VERBS:
         return _scan_wrapped(body, depth)
+    if verb in PS_WAIT_VERBS:
+        # PowerShell's foreground waits (Wait-Job / Wait-Process /
+        # Wait-Event, and Receive-Job -Wait) — the translated name; no Bash
+        # command starts with one, so this never fires on a Bash call.
+        return (verb, " ".join(body[:3]))
     return None
 
 
@@ -240,7 +277,7 @@ def static_pattern(command: str, depth: int = 0) -> Optional[tuple]:
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def bash_repeat_key(command: str) -> Optional[str]:
+def bash_repeat_key(command: str, prefix: str = "bash") -> Optional[str]:
     """The normalized repeat key for a Bash STATUS CHECK, or ``None`` when
     the command is not one (first peeled verb outside :data:`REPEAT_VERBS`).
 
@@ -258,7 +295,7 @@ def bash_repeat_key(command: str) -> Optional[str]:
         return None
     if os.path.basename(first[0]).lower() not in REPEAT_VERBS:
         return None
-    return "bash:" + " ".join(tokens)
+    return prefix + ":" + " ".join(tokens)
 
 
 def read_repeat_key(tool_input: Dict[str, Any]) -> Optional[str]:
@@ -296,15 +333,36 @@ _KNOB = (
 )
 
 
-def static_deny_reason(command: str, pattern: tuple) -> str:
+#: What to use instead of a foreground wait, per shell tool (owner: every
+#: deny explains why AND what to use instead — in the caller's own shell).
+_INSTEAD_BASH = (
+    " WHAT TO DO INSTEAD: run the long command ONCE with"
+    " run_in_background: true (or, to wait for an existing process,"
+    " `tail --pid=<PID> -f /dev/null` in the background), then END YOUR"
+    " TURN; the completion notification wakes you."
+)
+_INSTEAD_POWERSHELL = (
+    " WHAT TO DO INSTEAD: run the long command ONCE with"
+    " run_in_background: true (or, to wait for an existing process or job,"
+    " `Wait-Process -Id <PID>` / `Wait-Job -Id <N>` with"
+    " run_in_background: true — never Start-Sleep, a while ($true) loop,"
+    " Get-Content -Wait or a foreground Wait-* cmdlet), then END YOUR TURN;"
+    " the completion notification wakes you."
+)
+
+
+def _shell_label(tool: str) -> str:
+    return "PowerShell" if tool == POWERSHELL_TOOL else "Bash"
+
+
+def static_deny_reason(command: str, pattern: tuple, tool: str = "Bash") -> str:
     name, evidence = pattern
+    ps = tool == POWERSHELL_TOOL
+    read_as = f" (read as `{evidence}`)" if ps else f" ({evidence})"
     return (
-        f"BLOCKED by the VCO wait-loop guard: the Bash command `{command}` "
-        f"matches the polling pattern `{name}` ({evidence})." + _WHY +
-        " WHAT TO DO INSTEAD: run the long command ONCE with"
-        " run_in_background: true (or, to wait for an existing process,"
-        " `tail --pid=<PID> -f /dev/null` in the background), then END YOUR"
-        " TURN; the completion notification wakes you." + _KNOB
+        f"BLOCKED by the VCO wait-loop guard: the {_shell_label(tool)} command "
+        f"`{command}` matches the polling pattern `{name}`{read_as}." + _WHY +
+        (_INSTEAD_POWERSHELL if ps else _INSTEAD_BASH) + _KNOB
     )
 
 
@@ -330,14 +388,19 @@ def self_wake_main_reason(tool: str) -> str:
     )
 
 
-def repeat_deny_reason(key: str, count: int, window_s: int) -> str:
+def repeat_deny_reason(key: str, count: int, window_s: int,
+                       tool: str = "") -> str:
     ordinal = "%dth" % count
+    again = (
+        " (Get-Content / Get-ChildItem / Select-String / Measure-Object"
+        " included)" if tool == POWERSHELL_TOOL else ""
+    )
     return (
         f"BLOCKED by the VCO wait-loop guard: this is the {ordinal} identical "
         f"status check (`{key}`) within {window_s}s — repeated polling of the "
         f"same thing." + _WHY +
-        " WHAT TO DO INSTEAD: do not re-check the file/log; start the work"
-        " once with run_in_background: true, END YOUR TURN, and read the"
+        f" WHAT TO DO INSTEAD: do not re-check the file/log{again}; start the"
+        " work once with run_in_background: true, END YOUR TURN, and read the"
         " file ONCE after the completion notification." + _KNOB
     )
 
@@ -420,7 +483,7 @@ def _stderr(line: str) -> None:
 
 def _repeat_check(
     payload: Dict[str, Any], key: str, env: Dict[str, str],
-    state_root: Optional[Path], now: float,
+    state_root: Optional[Path], now: float, tool: str = "",
 ) -> Optional[str]:
     window_s = _env_int(env, "VCO_WAIT_GUARD_REPEAT_WINDOW_S",
                         DEFAULT_REPEAT_WINDOW_S)
@@ -432,7 +495,7 @@ def _repeat_check(
     state["checks"][key] = [t for t in stamps if now - t <= window_s]
     _save_state(path, state)
     if len(state["checks"][key]) >= max_n:
-        return repeat_deny_reason(key, len(state["checks"][key]), window_s)
+        return repeat_deny_reason(key, len(state["checks"][key]), window_s, tool)
     return None
 
 
@@ -467,19 +530,23 @@ def evaluate(
             return None
         return self_wake_main_reason(str(tool))
 
-    if tool == "Bash":
+    if tool in SHELL_TOOLS:
         command = tool_input.get("command")
         if not isinstance(command, str) or not command.strip():
             return None
         if tool_input.get("run_in_background"):
             # The sanctioned trigger: a backgrounded command never polls.
             return None
-        pattern = static_pattern(command)
+        # PowerShell (v0.2.102 W5-D): read through its Bash-equivalent form
+        # — one detector for both shells (vco_lib.powershell_command).
+        readable = command_for_bash_readers(tool, command)
+        pattern = static_pattern(readable)
         if pattern is not None:
-            return static_deny_reason(command, pattern)
-        key = bash_repeat_key(command)
+            return static_deny_reason(command, pattern, str(tool))
+        key = bash_repeat_key(
+            readable, "powershell" if tool == POWERSHELL_TOOL else "bash")
         if key is not None:
-            return _repeat_check(payload, key, env, state_root, now)
+            return _repeat_check(payload, key, env, state_root, now, str(tool))
         return None
 
     if tool == "Read":
