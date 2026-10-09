@@ -106,8 +106,10 @@ SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
 COMMAND=$(printf '%s' "$_PARSED" | sed -n '3p')
 TOOL_USE_ID_RAW=$(printf '%s' "$_PARSED" | sed -n '4p')
 
-# Only fire for Bash tool
-if [[ "$TOOL_NAME" != "Bash" ]]; then
+# Only fire for a shell tool: Bash, or PowerShell (v0.2.102 W5-D — the only
+# shell tool on Windows without Git Bash; the router reads its command
+# through vco_lib.powershell_command's Bash-equivalent translation).
+if [[ "$TOOL_NAME" != "Bash" && "$TOOL_NAME" != "PowerShell" ]]; then
     exit 0
 fi
 [ -z "$COMMAND" ] && exit 0

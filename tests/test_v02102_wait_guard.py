@@ -674,6 +674,9 @@ def _wait_guard_groups(doc: dict, event: str, matcher: str | None = None):
 @pytest.mark.parametrize("tpl", [LINUX, WINDOWS], ids=["linux", "windows"])
 class TestRegistrations:
     def test_bash_group_if_rules(self, tpl):
+        # v0.2.102 W5-D (review W5D-2): the Bash group keeps matcher Bash
+        # and exactly these rules; the PowerShell tool has its own if-less
+        # group (pinned in tests/test_v02102_powershell_hooks.py).
         (g,) = _wait_guard_groups(_load(tpl), "PreToolUse", "Bash")
         rules = [h.get("if") for h in g["hooks"]]
         assert rules == WAIT_GUARD_BASH_RULES

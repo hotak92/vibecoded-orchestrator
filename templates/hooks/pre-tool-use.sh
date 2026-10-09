@@ -64,7 +64,7 @@ if [ -z "${PY:-}" ]; then
     # stderr on exit 0 never reaches it). Non-blocking: blocking every Bash
     # call would make a Python-less machine unusable, and the notice names the
     # fix. MUST MATCH pre-tool-use.ps1's Write-VcoNoPythonNotice.
-    if printf '%s' "$_NOPY_STDIN" | grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"Bash"'; then
+    if printf '%s' "$_NOPY_STDIN" | grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"(Bash|PowerShell)"'; then
         _NOPY_MSG="[VCO broken install] The Bash security scans (shell-injection guard + .claude/scripts/bash_security.py) did NOT run: no Python interpreter was found (python3 / python / py on PATH). Put Python 3 on PATH or re-run the orchestrator's install / update (python install.py --update in the orchestrator root, or the launcher's Update), then retry."
         echo "$_NOPY_MSG" >&2
         _NOPY_SID="$(printf '%s' "$_NOPY_STDIN" | grep -Eo '"session_id"[[:space:]]*:[[:space:]]*"[A-Za-z0-9_-]+"' | head -n 1 | sed 's/.*"\([A-Za-z0-9_-]*\)"$/\1/')"
@@ -295,8 +295,10 @@ if [[ "$TOOL_NAME" == "WebFetch" ]]; then
     fi
 fi
 
-# === 2. SHELL INJECTION SCAN (Bash tool) ===
-if [[ "$TOOL_NAME" == "Bash" ]]; then
+# === 2. SHELL INJECTION SCAN (Bash tool, and the PowerShell tool — v0.2.102
+# W5-D: the only shell tool on Windows without Git Bash; the scanner's
+# `--shell powershell` rule set reads its syntax) ===
+if [[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "PowerShell" ]]; then
     CMD=$(_get_field "command")
     INJECTION_FOUND=""
 
@@ -318,7 +320,7 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
     if [[ -n "$INJECTION_FOUND" ]]; then
         # Block messages route to stderr — see bash-security branch.
         {
-            echo "🚨 Shell injection guard: detected '$INJECTION_FOUND' in Bash command."
+            echo "🚨 Shell injection guard: detected '$INJECTION_FOUND' in $TOOL_NAME command."
             echo "   Blocked command preview: ${CMD:0:120}"
             echo "   If this is intentional, run the command manually in a terminal."
         } >&2
@@ -329,7 +331,9 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
     # Extended security scan via bash_security.py
     SECURITY_SCRIPT="$PROJECT_ROOT/.claude/scripts/bash_security.py"
     if [[ -f "$SECURITY_SCRIPT" ]]; then
-        SECURITY_RESULT=$(echo "$CMD" | "$PY" "$SECURITY_SCRIPT" 2>&1)
+        _SEC_SHELL="bash"
+        [[ "$TOOL_NAME" == "PowerShell" ]] && _SEC_SHELL="powershell"
+        SECURITY_RESULT=$(echo "$CMD" | "$PY" "$SECURITY_SCRIPT" --shell "$_SEC_SHELL" 2>&1)
         SECURITY_EXIT=$?
         if [[ "$SECURITY_EXIT" -eq 2 ]]; then
             # Emit the block message to STDERR (not stdout). Claude
@@ -342,7 +346,7 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
             # 2026-05-20 hook-spam report described. Route the human-
             # readable message to stderr so the harness displays it.
             {
-                echo "🚨 Bash security scanner blocked this command:"
+                echo "🚨 $TOOL_NAME security scanner blocked this command:"
                 echo "   $SECURITY_RESULT"
             } >&2
             echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"bash_security_blocked\",\"detail\":\"${SECURITY_RESULT:0:200}\",\"cmd_preview\":\"${CMD:0:80}\"}" >> "$SECURITY_LOG" 2>/dev/null || true

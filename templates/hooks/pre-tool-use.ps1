@@ -269,8 +269,10 @@ if ($ToolName -eq "WebFetch") {
     }
 }
 
-# === 2. SHELL INJECTION SCAN ===
-if ($ToolName -eq "Bash") {
+# === 2. SHELL INJECTION SCAN (Bash, and the PowerShell tool -- v0.2.102 W5-D:
+# the only shell tool on Windows without Git Bash; the scanner's
+# `--shell powershell` rule set reads its syntax) ===
+if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
     $cmd = Get-Field "command"
     $injection = ""
     if ($cmd -match '(?i)(curl|wget)\s[^|]+\|\s*(ba)?sh\b') { $injection = "network fetch piped to shell" }
@@ -280,7 +282,7 @@ if ($ToolName -eq "Bash") {
     if ($injection) {
         # Route the block message to STDERR (matches pre-tool-use.sh) —
         # see the SSRF-guard branch above for why plain stdout is dropped.
-        [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in Bash command.")
+        [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in $ToolName command.")
         $preview = if ($cmd.Length -gt 120) { $cmd.Substring(0, 120) } else { $cmd }
         [Console]::Error.WriteLine("   Blocked command preview: $preview")
         [Console]::Error.WriteLine("   If this is intentional, run the command manually in a terminal.")
@@ -298,13 +300,14 @@ if ($ToolName -eq "Bash") {
     }
     if ((Test-Path $SecurityScript) -and $PY) {
         try {
-            $secOut = $cmd | & $PY $SecurityScript 2>&1
+            $secShell = if ($ToolName -eq "PowerShell") { "powershell" } else { "bash" }
+            $secOut = $cmd | & $PY $SecurityScript --shell $secShell 2>&1
             $secExit = $LASTEXITCODE
             if ($secExit -eq 2) {
                 # Route to STDERR (matches pre-tool-use.sh's bash-security
                 # branch) — same stdout-discard rationale as the SSRF /
                 # injection guards above.
-                [Console]::Error.WriteLine("Bash security scanner blocked this command:")
+                [Console]::Error.WriteLine("$ToolName security scanner blocked this command:")
                 [Console]::Error.WriteLine("   $secOut")
                 $detail = if ("$secOut".Length -gt 200) { "$secOut".Substring(0,200) } else { "$secOut" }
                 $detailEsc = $detail -replace '\\', '\\\\' -replace '"', '\"'

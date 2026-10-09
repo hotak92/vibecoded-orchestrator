@@ -43,11 +43,34 @@ try {
     # Empty/malformed stdin — keep variables at defaults
 }
 
-if ($ToolName -ne "Bash") { exit 0 }
+# Bash, or the PowerShell tool (v0.2.102 W5-D -- the only shell tool on
+# Windows without Git Bash).
+if ($ToolName -ne "Bash" -and $ToolName -ne "PowerShell") { exit 0 }
 
-# Match `vercel` (or path/local-bin variants) followed somewhere by --token=... or --token <value>.
-$hasVercel = $cmd -match '(^|[\s/])vercel(\s|$)'
+# Match `vercel` (or path/local-bin variants, incl. a PowerShell `\` path and
+# the vercel.cmd / vercel.exe shims) followed somewhere by --token=... or
+# --token <value>.
+$hasVercel = $cmd -match '(^|[\s/\\])vercel(\.cmd|\.exe)?(\s|$)'
 $hasToken  = $cmd -match '--token[= ]'
+
+if ($hasVercel -and $hasToken -and $ToolName -eq "Bash") {
+    # The Bash tool on Windows (Git Bash): name the Bash form.
+    $stderrText = @"
+BLOCKED: ``vercel --token=...`` echoes the token back in stdout (in the
+``next:`` block on success), which leaks ``vcp_*`` strings into the tool-result
+view. Use the env var instead, which the CLI reads transparently and never
+prints:
+
+    export VERCEL_TOKEN=`$(cat ~/.vct-secrets/shared/vercel_token) && \
+      ./node_modules/.bin/vercel deploy --prod --yes
+
+If you really need --token (e.g. machine that has no env access), pipe the
+output through ``2>&1 | tail -3`` or redirect stderr to /dev/null and only
+keep stdout (vercel writes the deployment URL on stdout, errors on stderr).
+"@
+    [Console]::Error.WriteLine($stderrText)
+    exit 2
+}
 
 if ($hasVercel -and $hasToken) {
     $stderrText = @"

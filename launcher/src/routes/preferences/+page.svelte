@@ -22,6 +22,7 @@
     APP_STATE_KEY_ACTIVE_EMBEDDING,
     OLLAMA_URL,
   } from '$lib/preferences/loaders';
+  import { parseSummaryTiers, type SummaryTier } from '$lib/preferences/summary_tiers';
   import { get } from 'svelte/store';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
@@ -1166,6 +1167,9 @@
   let kgSummaryModel = $state<string>(KG_SUMMARY_DEFAULT_MODEL);
   let kgSummaryOverride = $state<KgSummaryOverride>('');
   let kgSummaryOllamaModel = $state<string>('');
+  // v0.2.102 W5-D: the local tier models (from the ONE tier table, via
+  // `get_summary_model_info`) — named by the "No Ollama models" hint.
+  let summaryTiers = $state<SummaryTier[]>([]);
   let kgSummaryLoading = $state(false);
   let kgSummarySaving = $state(false);
   let kgSummaryError = $state<string | null>(null);
@@ -1210,7 +1214,8 @@
     kgSummaryLoading = true;
     kgSummaryError = null;
     try {
-      const [consentRes, modelRes, overrideRes, ollamaRes] = await PREF_LOADERS.kgSummary.load();
+      const [consentRes, modelRes, overrideRes, ollamaRes, modelInfo] = await PREF_LOADERS.kgSummary.load();
+      summaryTiers = parseSummaryTiers(modelInfo);
       kgSummaryConsent = consentRes === true;
       kgSummaryModel = (modelRes.is_set && modelRes.value)
         ? modelRes.value
@@ -2472,9 +2477,9 @@
             </p>
           {:else if ollamaModels.length === 0}
             <p class="pr-hint pr-kgsum-warn">
-              No Ollama models installed. Run
-              <code>ollama pull qwen3.5:9b</code> (16 GB+ VRAM) or
-              <code>ollama pull gemma4:e4b</code> (low-VRAM / CPU) then
+              No Ollama models installed. Pull the model for this machine's tier{#if summaryTiers.length}:
+              {#each summaryTiers as tier, i}{i > 0 ? (i === summaryTiers.length - 1 ? ' or ' : ', ') : ' '}<code>ollama pull {tier.model}</code> ({tier.when}){/each}{/if}
+              (re-running the orchestrator update pulls it for you), then
               <button class="pr-link-btn" onclick={() => void fetchOllamaModels()}>retry</button>.
             </p>
           {:else}

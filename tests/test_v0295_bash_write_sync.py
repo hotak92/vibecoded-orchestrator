@@ -338,7 +338,8 @@ def _stub_kg_sync(project: Path, marker: Path) -> None:
 
 
 def _run_hook(project: Path, command: str, session: str = "s-1",
-              extra_env: dict | None = None) -> subprocess.CompletedProcess:
+              extra_env: dict | None = None,
+              tool_name: str = "Bash") -> subprocess.CompletedProcess:
     bash = shutil.which("bash")
     assert bash is not None
     # `child_env()` — the ONE home for a child process's environment — and NOT
@@ -366,7 +367,7 @@ def _run_hook(project: Path, command: str, session: str = "s-1",
     if extra_env:
         env.update(extra_env)
     payload = {
-        "tool_name": "Bash",
+        "tool_name": tool_name,
         "session_id": session,
         "tool_input": {"command": command},
     }
@@ -415,13 +416,15 @@ def test_the_hook_is_registered_on_both_operating_systems() -> None:
         entries = [
             hook
             for group in doc["hooks"]["PostToolUse"]
-            if group.get("matcher") == "Bash"
+            # v0.2.102 W5-D: Bash|PowerShell (the PowerShell tool is the
+            # only shell tool on Windows without Git Bash).
+            if group.get("matcher") == "Bash|PowerShell"
             for hook in group.get("hooks", [])
             if needle in hook.get("command", "")
         ]
         assert len(entries) == 1, (
             f"{name}: post-bash-file-sync must be registered exactly once on "
-            f"PostToolUse(Bash); found {len(entries)}"
+            f"PostToolUse(Bash|PowerShell); found {len(entries)}"
         )
         # NOT async: the hook emits an additionalContext envelope (the pending
         # duplicate-scan report), which an async hook's stdout cannot deliver.

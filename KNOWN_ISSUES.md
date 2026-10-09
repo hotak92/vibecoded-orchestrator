@@ -117,7 +117,8 @@ flagging for early adopters and the next iteration.
       to `templates/scripts/generate-kg-summary.py`. That script picks the first
       available backend in order — `claude` CLI on PATH → Ollama at
       `KG_SUMMARY_OLLAMA_URL` (default `http://localhost:11435`, model
-      `KG_SUMMARY_OLLAMA_MODEL`, default `qwen3.5:9b`) → `ANTHROPIC_API_KEY`
+      `KG_SUMMARY_OLLAMA_MODEL`, default the machine's generation model —
+      `vco_lib.summary_model`) → `ANTHROPIC_API_KEY`
       direct. If none of the three is reachable, the script logs
       `KG-summary: no backend available` and exits 0; the launcher detects this
       marker on the first node, hard-stops the walk, and transitions the

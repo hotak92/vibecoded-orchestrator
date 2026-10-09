@@ -60,6 +60,7 @@ from typing import Any, Optional
 
 from vco_lib.hook_retirements import (
     match_prior_shipped_shape,
+    migrate_group_matcher,
     scrub_retired_registrations,
     vco_hook_script_identity,
 )
@@ -301,6 +302,20 @@ def merge_hooks_block(
                 ident = vco_hook_script_identity(c)
                 if ident:
                     template_matchers.setdefault(ident, set()).add(normalize_matcher(t_entry))
+
+        # v0.2.102 W5-D (MATCHER_MIGRATIONS): a group of shipped shell hooks
+        # still under the old `Bash` matcher is moved to the template's
+        # `Bash|PowerShell` BEFORE anything below keys on matchers — so the
+        # reshape, supersede and append passes see it under the matcher the
+        # template ships, and the append pass adds only the PowerShell twin
+        # rules the group lacks (folded into this same group, below).
+        # A group that also holds a user's own hook is left alone.
+        u_entries = [
+            {**entry, "matcher": new_m}
+            if (new_m := migrate_group_matcher(event, entry, template_matchers))
+            else entry
+            for entry in u_entries
+        ]
         present_idents: set[tuple[str, str]] = set()
         present_cmds: set[tuple[str, str]] = set()
 
@@ -478,12 +493,41 @@ def merge_hooks_block(
             ]
             if not new_inner:
                 continue
+            # v0.2.102: rules of an if-group the user's file already carries
+            # (same matcher, same command) JOIN that group instead of
+            # opening a second one — a grown group (or the PowerShell twins
+            # of a migrated one) then has the fresh-install shape.
+            host = _if_group_host(merged_entries, normalize_matcher(t_entry), new_inner)
+            if host is not None:
+                host["hooks"] = list(host.get("hooks", [])) + new_inner
+                continue
             appended = dict(t_entry)
             appended["hooks"] = new_inner
             merged_entries.append(appended)
 
         out[event] = merged_entries
     return out
+
+
+def _if_group_host(entries: list, matcher: str, new_inner: list) -> Optional[dict]:
+    """The merged entry an appended batch of ``if`` rules should join, or
+    ``None``. Only when EVERY appended hook carries an ``if`` and an entry
+    under the same matcher is an if-group (every hook has an ``if``) of the
+    same command — never for if-less registrations, whose append behaviour
+    is unchanged."""
+    if not new_inner or not all(isinstance(h.get("if"), str) for h in new_inner):
+        return None
+    cmds = {h.get("command") for h in new_inner}
+    for entry in entries:
+        if not isinstance(entry, dict) or normalize_matcher(entry) != matcher:
+            continue
+        inner = entry.get("hooks")
+        if not isinstance(inner, list) or not inner:
+            continue
+        if all(isinstance(h, dict) and isinstance(h.get("if"), str) for h in inner) \
+                and any(h.get("command") in cmds for h in inner):
+            return entry
+    return None
 
 
 def _hook_fingerprint(hook: dict) -> str:

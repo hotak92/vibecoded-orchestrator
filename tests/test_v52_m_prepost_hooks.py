@@ -462,7 +462,8 @@ class SettingsTemplatesRegisterNewHooks(unittest.TestCase):
         json.loads(text)
 
     def test_pre_bash_hook_runs_on_bash_matcher(self) -> None:
-        """Pre-bash injection must be PreToolUse, matcher=Bash."""
+        """Pre-bash injection must be PreToolUse, matcher=Bash|PowerShell
+        (v0.2.102 W5-D: the PowerShell tool feeds the same surface)."""
         p = REPO_ROOT / "templates" / "settings.json.linux.template"
         cfg = json.loads(p.read_text(encoding="utf-8"))
         hooks = cfg["hooks"]["PreToolUse"]
@@ -472,8 +473,8 @@ class SettingsTemplatesRegisterNewHooks(unittest.TestCase):
                 if "pre-bash-context-inject.sh" in h.get("command", ""):
                     registered.append(group.get("matcher", ""))
         self.assertIn(
-            "Bash", registered,
-            "pre-bash-context-inject.sh must be registered under PreToolUse matcher=Bash",
+            "Bash|PowerShell", registered,
+            "pre-bash-context-inject.sh must be registered under PreToolUse matcher=Bash|PowerShell",
         )
 
     def test_post_bash_hook_runs_on_bash_matcher(self) -> None:

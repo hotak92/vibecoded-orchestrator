@@ -3,9 +3,12 @@
 # Copyright (c) 2026 VibeCoded Tools
 #
 # Wait-loop / polling guard — THIN WRAPPER (v0.2.102 lane W4-D).
-# Registered FOUR times; every registration is this one script with a mode:
+# Registered FIVE times; every registration is this one script with a mode:
 #
 #   pretooluse       PreToolUse matchers Bash (if-filtered verb rules),
+#                    PowerShell (NO if: a PowerShell loop keyword is not a
+#                    command, so no if rule could match it -- the module
+#                    judges loops itself; v0.2.102 review W5D-2),
 #                    Read, and ScheduleWakeup|CronCreate|Monitor
 #   record-expansion UserPromptExpansion, matcher loop|schedule (records a
 #                    user-typed /loop or /schedule — the documented direct

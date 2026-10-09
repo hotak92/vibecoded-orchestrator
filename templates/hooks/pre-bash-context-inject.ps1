@@ -96,7 +96,10 @@ try {
     }
 } catch { }
 
-if ($ToolName -ne "Bash") { exit 0 }
+# Bash, or the PowerShell tool (v0.2.102 W5-D -- the only shell tool on
+# Windows without Git Bash; the router reads its command through
+# vco_lib.powershell_command's Bash-equivalent translation).
+if ($ToolName -ne "Bash" -and $ToolName -ne "PowerShell") { exit 0 }
 if (-not $Command) { exit 0 }
 
 if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {

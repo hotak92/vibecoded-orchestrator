@@ -245,6 +245,7 @@ from vco_lib.embedding_selection import (  # noqa: E402,F401
     select_code_embedding_backend,
     select_kg_embedding_backend,
     select_summary_backend,
+    summary_model_for_hardware,
     _CODE_BACKEND_CODESAGE,
     _CODE_BACKEND_QWEN3,
     _CODE_BACKEND_JINA,  # pyright: ignore[reportUnusedImport] — re-export
@@ -253,10 +254,12 @@ from vco_lib.embedding_selection import (  # noqa: E402,F401
     _KG_BACKEND_ARCTIC,
     _KG_BACKEND_OPENAI,
     _SUMMARY_BACKEND_CLI,  # pyright: ignore[reportUnusedImport] — re-export
-    _SUMMARY_BACKEND_QWEN35_9B,
-    _SUMMARY_BACKEND_GEMMA,
+    _SUMMARY_BACKEND_QWEN35_9B,  # pyright: ignore[reportUnusedImport] — re-export
+    _SUMMARY_BACKEND_GEMMA,  # pyright: ignore[reportUnusedImport] — re-export
     _SUMMARY_BACKEND_OPENAI,  # pyright: ignore[reportUnusedImport] — re-export
 )
+from vco_lib.host_probe import (  # noqa: E402 — stdlib-only leaf (pre-venv safe)
+    probe_cpu_cores as _probe_cpu_cores, probe_system_ram_gb as _probe_system_ram_gb)
 # v0.2.77 5c task 2: install-time projection of the concurrency budget.
 from vco_lib.install_embed_concurrency import (  # noqa: E402
     finalize_embed_config_for_host as _finalize_embed_config_for_host,
@@ -8034,49 +8037,9 @@ def _decide_gpu_mode(
     return "cpu"
 
 
-def _probe_system_ram_gb() -> float:
-    """Best-effort system RAM probe across Linux/macOS/Windows.
-
-    Uses `psutil` if available (fastest and most portable). Falls back
-    to /proc/meminfo on Linux, `sysctl hw.memsize` on macOS, and `wmic`
-    on Windows. Returns 0.0 on any failure — caller handles gracefully.
-    """
-    try:
-        import psutil  # type: ignore
-        return round(psutil.virtual_memory().total / (1024.0 ** 3), 2)
-    except ImportError:
-        pass
-    except Exception:
-        return 0.0
-
-    system = platform.system()
-    try:
-        if system == "Linux":
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        kb = int(line.split()[1])
-                        return round(kb / (1024.0 ** 2), 2)
-        elif system == "Darwin":
-            result = subprocess.run(
-                ["sysctl", "-n", "hw.memsize"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return round(int(result.stdout.strip()) / (1024.0 ** 3), 2)
-        elif system == "Windows":
-            result = subprocess.run(
-                ["wmic", "ComputerSystem", "get", "TotalPhysicalMemory"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    s = line.strip()
-                    if s.isdigit():
-                        return round(int(s) / (1024.0 ** 3), 2)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
-        pass
-    return 0.0
+# `_probe_cpu_cores` / `_probe_system_ram_gb` moved to vco_lib.host_probe
+# (v0.2.102 W5-D, second caller: the runtime summary-model resolver);
+# re-bound at the import block near the top under their historical names.
 
 
 # Inference model pull list for install-time.
@@ -8101,15 +8064,8 @@ def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
     uses (v0.2.23 C10), local tier only (CLI/OpenAI are not Ollama models):
     ``qwen3.5:9b`` / ``gemma4:e4b``, else the always-fits floor ``qwen3.5:0.8b``.
     """
-    summary_pick = select_summary_backend(
-        gpu_vram_gb=float(sysinfo.vram_gb or 0.0), ram_gb=float(sysinfo.ram_gb or 0.0),
-        cores=_probe_cpu_cores(), claude_cli_available=False,
-        openai_consent=False, openai_key_available=False)
-    if summary_pick == _SUMMARY_BACKEND_QWEN35_9B:
-        return ["qwen3.5:9b"]
-    if summary_pick == _SUMMARY_BACKEND_GEMMA:
-        return ["gemma4:e4b"]
-    return ["qwen3.5:0.8b"]
+    return [summary_model_for_hardware(
+        float(sysinfo.vram_gb or 0.0), float(sysinfo.ram_gb or 0.0), _probe_cpu_cores())]
 
 
 # ---------------------------------------------------------------------------
@@ -8137,52 +8093,6 @@ def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _probe_cpu_cores() -> int:
-    """Best-effort PHYSICAL CPU-core count, cross-OS.
-
-    v0.2.49: switched from logical=True (counts SMT threads) to
-    logical=False (counts physical cores) after post-update validation on a
-    contributor's Windows box showed the embedding-model auto-selector tier-up'd to
-    qwen3 on a host where the logical count (16) crossed the >=8
-    threshold even though the actual physical cores (8) were exactly at
-    the boundary — qwen3-embedding on CPU-only Ollama takes ~30s per
-    embedding, so the selector should require margin, not just count
-    HyperThreads. Embedding throughput on CPU is gated by physical
-    arithmetic units, not thread count.
-
-    Prefers `psutil.cpu_count(logical=False)` (returns the PHYSICAL
-    core count; cross-OS, handles cgroup limits on Linux containers,
-    docs explicitly: "the number of physical cores only"). Falls back to
-    `os.cpu_count() // 2` (a conservative estimate assuming SMT, which
-    is true on most modern Intel/AMD desktops + Apple Silicon's
-    performance/efficiency split where logical count overstates
-    embedding-capable cores). Returns 0 on any probe failure — the
-    selectors treat 0 as "low-end CPU" (drops to the smaller-model
-    tier), which is the conservative direction (better to under-spec
-    than over-promise).
-    """
-    try:
-        import psutil  # type: ignore
-        n = psutil.cpu_count(logical=False)
-        if n and n > 0:
-            return int(n)
-        # psutil returns None on some hypervisors / containers when
-        # physical-core probing isn't supported. Fall through to
-        # os.cpu_count() // 2 as a conservative estimate.
-    except ImportError:
-        pass
-    except Exception:
-        return 0
-    try:
-        n = os.cpu_count()
-        if n and n > 0:
-            # Conservative: assume SMT/HT, halve the logical count.
-            # On non-SMT hardware this under-counts by 2x, which is the
-            # safer direction (we drop to a smaller model tier).
-            return max(1, int(n) // 2)
-        return 0
-    except Exception:
-        return 0
 
 
 def _lspci_has_vendor(vendor_substr: str) -> bool:

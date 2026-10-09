@@ -84,7 +84,9 @@ try {
     # Empty/malformed stdin -- keep variables at defaults.
 }
 
-if ($ToolName -ne "Bash") { exit 0 }
+# Bash, or the PowerShell tool (v0.2.102 W5-D -- the only shell tool on
+# Windows without Git Bash; the parser reads its syntax via -Tool).
+if ($ToolName -ne "Bash" -and $ToolName -ne "PowerShell") { exit 0 }
 if (-not $Command) { exit 0 }
 
 # The parser lib is missing -> this hook can recover NO write target from any
@@ -103,7 +105,7 @@ if (-not (Get-Command Test-VcoWriteSuspicious -ErrorAction SilentlyContinue)) {
     }
     exit 0
 }
-if (-not (Test-VcoWriteSuspicious $Command)) { exit 0 }
+if (-not (Test-VcoWriteSuspicious -Command $Command -Tool $ToolName)) { exit 0 }
 
 # Telemetry attribution for the children we spawn (same 3-layer chain as
 # post-file-edit.ps1).
@@ -112,7 +114,7 @@ if ($SessionId) { $Env:VCT_SESSION_ID = $SessionId }
 # --- Command -> written paths --------------------------------------------
 Initialize-VcoBashWriteTargets -HooksDir $ScriptDir
 $ScanState = Join-Path $ProjectRoot ".claude/state/bash_write_scan.ts"
-$Paths = Get-VcoBashWriteTargets -Command $Command -ProjectRoot $ProjectRoot -ScanState $ScanState
+$Paths = Get-VcoBashWriteTargets -Command $Command -ProjectRoot $ProjectRoot -ScanState $ScanState -Tool $ToolName
 if (-not $Paths -or $Paths.Count -eq 0) { exit 0 }
 
 # --- Route each path through the SHARED home ------------------------------

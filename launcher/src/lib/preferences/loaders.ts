@@ -147,6 +147,9 @@ export const PREF_LOADERS = {
         appStateGet(APP_STATE_KEY_KG_SUMMARY_MODEL),
         appStateGet(APP_STATE_KEY_KG_SUMMARY_OVERRIDE),
         appStateGet(APP_STATE_KEY_KG_SUMMARY_OLLAMA_MODEL),
+        // v0.2.102 W5-D: the tier table the "No Ollama models installed"
+        // hint names (soft: null when the resolver cannot run).
+        safeInvoke<unknown>('get_summary_model_info'),
       ]),
   },
   codeEmbed: {

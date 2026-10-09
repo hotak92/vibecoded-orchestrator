@@ -30,9 +30,15 @@ Env overrides (shared knobs — the ``KG_SUMMARY_*`` names stay canonical for
 BOTH callers; the code generator adds a ``CODE_SUMMARY_BACKEND`` alias that
 falls back to ``KG_SUMMARY_BACKEND`` via the ``env_keys`` parameter):
   KG_SUMMARY_BACKEND        → force "cli" | "ollama" | "api" | "openai" | "skip"
-                              (auto-detect default; "api" = Anthropic, "openai" = OpenAI)
-  KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag (default: qwen3.5:9b for 16GB+ VRAM,
-                                                         gemma4:e4b for low-VRAM/CPU)
+                              (auto-detect default; "api" = Anthropic, "openai" = OpenAI).
+                              Unset: the launcher Preferences → KG Summaries
+                              backend pin (app_state kg_summary_backend_override)
+  KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag. Unset: the machine's generation
+                              model, resolved by vco_lib.summary_model — the
+                              launcher Preferences pick, else what install
+                              recorded and pulled, else the hardware tier
+                              (qwen3.5:9b at 16 GB+ VRAM, gemma4:e4b at 6-16 GB
+                              VRAM or a capable CPU, qwen3.5:0.8b floor)
   KG_SUMMARY_OLLAMA_URL     → Ollama base URL (default: http://localhost:11435)
   KG_SUMMARY_OPENAI_MODEL   → OpenAI model name (default: gpt-4o-mini)
   KG_SUMMARY_TIMEOUT        → per-call timeout seconds (default: 180)
@@ -194,7 +200,30 @@ import urllib.request
 from pathlib import Path
 
 ANTHROPIC_MODEL = "claude-haiku-5-5"
-OLLAMA_DEFAULT_MODEL = os.getenv("KG_SUMMARY_OLLAMA_MODEL", "qwen3.5:9b")
+def _resolve_ollama_model() -> str:
+    """The machine's local generation model (v0.2.102 W5-D).
+
+    ``KG_SUMMARY_OLLAMA_MODEL`` wins without touching vco_lib; otherwise the
+    ONE resolver, :func:`vco_lib.summary_model.resolve_model` (Preferences
+    pick → install record → hardware tier, the same table install's pull list
+    comes from). A ``vco_lib`` that cannot be imported is a BROKEN install
+    (``call_ollama`` needs it too): said once on stderr, and the empty model
+    makes :func:`ollama_available` report the tier unavailable."""
+    override = os.getenv("KG_SUMMARY_OLLAMA_MODEL", "").strip()
+    if override:
+        return override
+    try:
+        from vco_lib.summary_model import resolve_model
+    except ImportError as exc:
+        sys.stderr.write(
+            f"[summary_backends] broken install: vco_lib is not importable ({exc}); "
+            "the local Ollama summary tier is unavailable until the orchestrator's "
+            "install / update is re-run\n")
+        return ""
+    return resolve_model()
+
+
+OLLAMA_DEFAULT_MODEL = _resolve_ollama_model()
 OLLAMA_URL = os.getenv("KG_SUMMARY_OLLAMA_URL", "http://localhost:11435").rstrip("/")
 TIMEOUT = int(os.getenv("KG_SUMMARY_TIMEOUT", "180"))
 
@@ -211,6 +240,11 @@ OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 # "consent never granted" → consent=False (the safe default).
 APP_STATE_KEY_OPENAI_CONSENT = "kg_summary_openai_consent"
 APP_STATE_KEY_OPENAI_MODEL = "kg_summary_openai_model"
+#: v0.2.102 W5-D: the launcher Preferences → KG Summaries backend pin
+#: ('' = auto-detect, or one of cli / ollama / openai / skip). Written by the
+#: launcher since v0.2.23 (preferences/loaders.ts — MUST MATCH); read by
+#: `_forced_backend` after the env keys.
+APP_STATE_KEY_BACKEND_OVERRIDE = "kg_summary_backend_override"
 
 SYSTEM_PROMPT = (
     "You are a technical documentation summarizer. "
@@ -1280,6 +1314,10 @@ def ollama_available() -> bool:
     (OpenAI / Anthropic API / skip); nothing is ever pulled at runtime (an
     ``/api/generate`` for an absent model is a 404, and a pull is multi-GB).
     """
+    if not OLLAMA_DEFAULT_MODEL:
+        _log("  Ollama summary tier unavailable: no generation model resolved "
+             "(vco_lib not importable — see the stderr line above)")
+        return False
     want = OLLAMA_DEFAULT_MODEL if ":" in OLLAMA_DEFAULT_MODEL else f"{OLLAMA_DEFAULT_MODEL}:latest"
     try:
         with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as resp:
@@ -1551,17 +1589,29 @@ def call_openai(prompt: str) -> str:
 # Tier dispatch
 # ──────────────────────────────────────────────────────────────────────
 def _forced_backend(env_keys: tuple[str, ...]) -> str:
-    """First non-empty forced-backend env value across *env_keys*.
+    """First non-empty forced-backend value: *env_keys* in order, then the
+    launcher Preferences pin (``app_state[kg_summary_backend_override]``,
+    v0.2.102 W5-D — the operator's env wins over the GUI, as for every
+    other summary knob).
 
     The KG generator passes the default ``("KG_SUMMARY_BACKEND",)``; the
     code generator passes ``("CODE_SUMMARY_BACKEND", "KG_SUMMARY_BACKEND")``
     (its own alias first, falling back to the shared knob).
     """
+    return _forced_backend_with_source(env_keys)[0]
+
+
+def _forced_backend_with_source(env_keys: tuple[str, ...]) -> "tuple[str, str]":
+    """``(value, source)`` behind :func:`_forced_backend`; source is
+    ``"env"``, ``"Preferences"`` or ``""``."""
     for key in env_keys:
         value = os.getenv(key, "").lower().strip()
         if value:
-            return value
-    return ""
+            return value, "env"
+    pinned = (_read_app_state_value(APP_STATE_KEY_BACKEND_OVERRIDE) or "").lower().strip()
+    if pinned:
+        return pinned, "Preferences"
+    return "", ""
 
 
 def select_backend(
@@ -1602,14 +1652,16 @@ def select_backend(
             return cached
         _BACKEND_CACHE.pop("choice", None)
 
-    forced = _forced_backend(env_keys)
+    forced, forced_via = _forced_backend_with_source(env_keys)
     if forced in VALID_BACKENDS:
         # Consent gate still applies to forced=openai (defense-in-depth:
         # an env var alone shouldn't bypass user consent; --force-api
         # is the explicit operator override).
         if forced == "openai" and not force_api and not openai_consent_granted():
+            source = (f"{env_keys[0]}=openai" if forced_via == "env" else
+                      "the launcher Preferences backend pin is openai")
             _log(
-                f"  {label}: {env_keys[0]}=openai but consent not "
+                f"  {label}: {source} but consent not "
                 "granted. Set kg_summary_openai_consent=true in launcher "
                 "Preferences → KG Summaries, or pass --force-api. "
                 "Skipping for this run."
@@ -1617,7 +1669,7 @@ def select_backend(
             _BACKEND_CACHE["choice"] = "skip"
             return "skip"
         _BACKEND_CACHE["choice"] = forced
-        _log(f"  {label} backend: {forced} (forced via env)")
+        _log(f"  {label} backend: {forced} (forced via {forced_via})")
         return forced
 
     # `_tier_selectable` is checked BEFORE each probe so a demoted CLI

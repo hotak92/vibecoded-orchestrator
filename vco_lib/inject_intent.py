@@ -67,6 +67,12 @@ from vco_lib.bash_command_walk import (
     strip_env_assignments,
     tokenize,
 )
+from vco_lib.powershell_command import (
+    BASH_TOOL,
+    POWERSHELL_TOOL,
+    command_for_bash_readers,
+    spellings_for_bash_verbs,
+)
 from vco_lib.bash_write_targets import (
     _REDIRECT_NOISE,
     _SECRETISH_RE,
@@ -159,6 +165,27 @@ _GIT_SEARCH_SUBS = frozenset({"grep"})
 #: produce carries no content to key a retrieval query on.
 _EDIT_RULE_VERBS = frozenset({"perl", "ruby", "tee", "cp", "mv"})
 _CHAIN_RULE_VERBS = frozenset({"cd"})
+
+#: v0.2.102 W5-D — the PowerShell twin rules of the same group. A single
+#: ``if`` rule matches ONE tool's calls (vendor hooks doc), so the group
+#: carries a ``PowerShell(<Cmdlet> *)`` handler for every cmdlet whose Bash
+#: reading lands on a classifier verb above (derived from the ONE PowerShell
+#: table, :mod:`vco_lib.powershell_command`; cmdlet names only — Claude Code
+#: canonicalizes aliases before matching, vendor permissions doc
+#: "PowerShell"), plus the native executables that exist on a Windows host
+#: without Git Bash and mean the same in both shells (an executable is not an
+#: alias, so canonicalization cannot cover it). MUST MATCH the ``PowerShell(...)`` rules
+#: of pre-bash-context-inject in BOTH settings templates — locked by
+#: tests/test_v02102_powershell_hooks.py.
+_PS_NATIVE_RULE_VERBS = frozenset({"rg"})
+
+
+def powershell_rule_spellings() -> List[str]:
+    """The command spellings the PowerShell twin rules cover (``git <sub>``
+    rules are formed from :data:`_GIT_READ_SUBS` / :data:`_GIT_SEARCH_SUBS`
+    exactly like the Bash ones)."""
+    verbs = _READ_VERBS | _SEARCH_VERBS | _EDIT_RULE_VERBS | _CHAIN_RULE_VERBS
+    return spellings_for_bash_verbs(sorted(verbs)) + sorted(_PS_NATIVE_RULE_VERBS)
 
 _SINK_NOISE = _REDIRECT_NOISE  # one home: the bash_write_targets strip list
 
@@ -634,8 +661,12 @@ def _resolve_cd_dir(seg: List[str], base: str) -> Optional[str]:
     return os.path.normpath(os.path.join(base, dest)) if base else dest
 
 
-def classify_bash(command: str, cwd: str = "") -> BashIntent:
-    """A1: classify a Bash tool command.
+def classify_bash(command: str, cwd: str = "", tool_name: str = BASH_TOOL) -> BashIntent:
+    """A1: classify a Bash tool command — or a PowerShell tool command
+    (``tool_name="PowerShell"``, v0.2.102 W5-D), which is read through its
+    Bash-equivalent form (:func:`vco_lib.powershell_command.to_bash_equivalent`:
+    ``Get-Content f`` → ``cat f``, ``Set-Content -Path f`` → ``tee f``) so
+    ONE classifier serves both shell tools.
 
     Strongest intent across chain segments wins (EDIT > SEARCH > READ >
     MECHANICAL). Heredoc bodies are stripped BEFORE tokenising (a body line
@@ -651,6 +682,7 @@ def classify_bash(command: str, cwd: str = "") -> BashIntent:
     segments like ``| tail -5`` used to flood the RL corpus with unpairable
     ``pre_bash`` outcome events; see the comment at the demotion site).
     """
+    command = command_for_bash_readers(tool_name, command or "")
     if not command or not command.strip():
         return BashIntent()
 
@@ -1254,6 +1286,8 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
     p_classify = sub.add_parser("classify", help="stdin: one Bash command; stdout: JSON BashIntent")
     p_classify.add_argument("--cwd", default="", help="project/call cwd for relative target resolution")
     p_classify.add_argument("--out", default="", help="also write the JSON to this file (the router's --intent-out seam)")
+    p_classify.add_argument("--tool", default=BASH_TOOL, choices=(BASH_TOOL, POWERSHELL_TOOL),
+                            help="the shell tool the command came from (PowerShell is read as its Bash equivalent)")
     p_task = sub.add_parser("task-type", help="stdout: the RL task_type of an injection profile")
     p_task.add_argument("profile")
     p_gate = sub.add_parser("kg-gate", help="stdout: JSON KgGate (null when the profile has no KG leg)")
@@ -1269,7 +1303,7 @@ def _cli_main(argv: Optional[List[str]] = None) -> int:
             command = sys.stdin.read()
         except (OSError, UnicodeDecodeError):
             command = ""
-        bi = classify_bash(command, args.cwd)
+        bi = classify_bash(command, args.cwd, args.tool)
         payload = json.dumps(bi.to_dict())
         sys.stdout.write(payload + "\n")
         if args.out:

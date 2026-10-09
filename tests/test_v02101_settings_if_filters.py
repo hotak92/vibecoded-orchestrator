@@ -124,12 +124,16 @@ class TestSettingsRegistrations:
 
     def test_bash_pretooluse_is_the_c1_if_group(self, tpl: Path) -> None:
         doc = _load(tpl)
+        # v0.2.102 W5-D: the group matches Bash|PowerShell; its Bash rules
+        # come first, unchanged (the PowerShell twins are pinned in
+        # tests/test_v02102_powershell_hooks.py).
         groups = [g for g in _groups(doc, "PreToolUse")
-                  if g.get("matcher") == "Bash"
+                  if g.get("matcher") == "Bash|PowerShell"
                   and any("pre-bash-context-inject" in h for h in _hook_basenames(g))]
         assert len(groups) == 1, "exactly one Bash group hosts pre-bash-context-inject"
         hooks = groups[0]["hooks"]
-        assert [h.get("if") for h in hooks] == C1_IF_RULES + V02102_RULES, (
+        assert [h.get("if") for h in hooks
+                if h.get("if", "").startswith("Bash(")] == C1_IF_RULES + V02102_RULES, (
             "the §C1 if-rules must be one handler per rule, in plan order")
         for h in hooks:
             # SF-1 (wave-2 GLM review): 10, not 8 — at review time the
@@ -154,11 +158,11 @@ class TestSettingsRegistrations:
         alongside the group would double-spawn every matching command."""
         doc = _load(tpl)
         for g in _groups(doc, "PreToolUse"):
-            if g.get("matcher") != "Bash":
+            if g.get("matcher") not in ("Bash", "Bash|PowerShell"):
                 continue
             for h in g["hooks"]:
                 if "pre-bash-context-inject" in h.get("command", ""):
-                    assert h.get("if") in C1_IF_RULES + V02102_RULES
+                    assert h.get("if"), "every pre-bash handler carries an if rule"
 
     # --- §C2: Read on PostToolUse -----------------------------------------
 
@@ -262,7 +266,7 @@ class TestSettingsRegistrations:
         lost rows vs the pre-redesign 500-char regime)."""
         doc = _load(tpl)
         groups = [g for g in _groups(doc, "PreToolUse")
-                  if g.get("matcher") == "Bash"
+                  if g.get("matcher") == "Bash|PowerShell"
                   and any("pre-bash-context-inject" in n
                           for n in _hook_basenames(g))]
         assert groups, "the §C1 bash group is missing"
@@ -285,11 +289,14 @@ class TestSettingsRegistrations:
 
 
 def _bash_group_rules(doc: dict) -> list[str]:
-    """The `if` rules of the pre-bash-context-inject Bash group(s), in order."""
+    """The Bash `if` rules of the pre-bash-context-inject group(s), in order
+    (v0.2.102 W5-D: the group matches Bash|PowerShell; its PowerShell twin
+    rules are locked by tests/test_v02102_powershell_hooks.py)."""
     return [h.get("if") for g in _groups(doc, "PreToolUse")
-            if g.get("matcher") == "Bash"
+            if g.get("matcher") == "Bash|PowerShell"
             for h in g.get("hooks", [])
-            if "pre-bash-context-inject" in h.get("command", "")]
+            if "pre-bash-context-inject" in h.get("command", "")
+            and h.get("if", "").startswith("Bash(")]
 
 
 def _classifier_rule_set() -> set[str]:

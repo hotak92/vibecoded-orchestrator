@@ -20,9 +20,14 @@ Four-tier model selection (in order):
 
 Env overrides:
   KG_SUMMARY_BACKEND        → force "cli" | "ollama" | "api" | "openai" | "skip"
-                              (auto-detect default; "api" = Anthropic, "openai" = OpenAI)
-  KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag (default: qwen3.5:9b for 16GB+ VRAM,
-                                                          gemma4:e4b for low-VRAM/CPU)
+                              (auto-detect default; "api" = Anthropic, "openai" = OpenAI).
+                              Unset: the launcher Preferences backend pin
+  KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag. Unset: the machine's generation
+                              model (vco_lib.summary_model — Preferences pick,
+                              else the model install recorded and pulled, else
+                              the hardware tier: qwen3.5:9b at 16 GB+ VRAM,
+                              gemma4:e4b at 6-16 GB VRAM or a capable CPU,
+                              qwen3.5:0.8b floor)
   KG_SUMMARY_OLLAMA_URL     → Ollama base URL (default: http://localhost:11435)
   KG_SUMMARY_OPENAI_MODEL   → OpenAI model name (default: gpt-4o-mini — cheapest
                               summary-capable model as of 2026-05-21)

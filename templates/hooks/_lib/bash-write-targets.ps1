@@ -54,7 +54,7 @@ function Initialize-VcoBashWriteTargets {
     $script:VcoBwtPython = $resolved
 }
 
-# Test-VcoWriteSuspicious <Command>
+# Test-VcoWriteSuspicious <Command> [Tool]   (Tool: Bash default, or PowerShell)
 #
 # Runs on EVERY Bash call, so it must cost ~nothing and must not spawn.
 # The `/dev/null` sinks and fd duplications are stripped FIRST because
@@ -78,8 +78,24 @@ function Initialize-VcoBashWriteTargets {
 # MUST MATCH _lib/bash-write-targets.sh's vco_bash_write_prefilter;
 # tests/test_v0295_bash_write_sync.py runs both against one corpus.
 function Test-VcoWriteSuspicious {
-    param([string]$Command)
+    param([string]$Command, [string]$Tool = "Bash")
     if (-not $Command) { return $false }
+    if ($Tool -eq "PowerShell") {
+        # v0.2.102 W5-D -- a PowerShell-tool command: PowerShell is
+        # case-insensitive and writes paths with `\`, so fold both, strip the
+        # `$null` sinks, then its write spellings (cmdlets + aliases) join the
+        # checks below.
+        $Command = $Command.ToLowerInvariant().Replace('\', '/')
+        foreach ($sink in @('*> $null', '*>$null', '2> $null', '2>$null', '> $null', '>$null')) {
+            $Command = $Command.Replace($sink, '')
+        }
+        $p = " " + ($Command -replace '[;&|(){}]', ' ') + " "
+        foreach ($verb in @(' set-content ', ' add-content ', ' ac ', ' out-file ',
+                            ' tee-object ', ' new-item ', ' ni ',
+                            ' copy-item ', ' copy ', ' cpi ', ' move-item ', ' move ', ' mi ')) {
+            if ($p.Contains($verb)) { return $true }
+        }
+    }
     $s = $Command
     foreach ($noise in @('2>&1', '1>&2', '>&2', '&>/dev/null', '2>/dev/null',
                          '1>/dev/null', '>/dev/null', '> /dev/null')) {
@@ -136,12 +152,13 @@ function Invoke-VcoBashWriteParser {
     }
 }
 
-# Get-VcoBashWriteTargets <Command> <ProjectRoot> [ScanState]
+# Get-VcoBashWriteTargets <Command> <ProjectRoot> [ScanState] [Tool]
 # Absolute paths that EXIST (the command has already run).
 function Get-VcoBashWriteTargets {
-    param([string]$Command, [string]$ProjectRoot, [string]$ScanState = "")
+    param([string]$Command, [string]$ProjectRoot, [string]$ScanState = "", [string]$Tool = "Bash")
     $extra = @('--require-exists')
     if ($ScanState) { $extra += @('--scan-state', $ScanState) }
+    if ($Tool -eq "PowerShell") { $extra += @('--tool', 'PowerShell') }
     return @(Invoke-VcoBashWriteParser -Command $Command -ProjectRoot $ProjectRoot -ExtraArgs $extra |
              Where-Object { $_ -and $_.ToString().Trim() })
 }

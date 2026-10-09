@@ -228,7 +228,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -248,7 +248,7 @@
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -411,6 +411,102 @@
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
             "timeout": 10,
             "if": "Bash(mv *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Get-Content *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Select-String *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Set-Location *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Push-Location *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Copy-Item *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Move-Item *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Set-Content *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Add-Content *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Out-File *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Tee-Object *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(rg *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(git show*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(git grep*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(git diff*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(git log*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(git blame*)"
           }
         ]
       },
@@ -482,6 +578,16 @@
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
             "timeout": 10,
             "if": "Bash(grep *)"
+          }
+        ]
+      },
+      {
+        "matcher": "PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10
           }
         ]
       },
@@ -625,7 +731,7 @@
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
