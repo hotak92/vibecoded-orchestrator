@@ -421,6 +421,13 @@
   let embCatalogError = $state<string | null>(null);
   let defaultTextModel = $state<string>('');
   let defaultCodeModel = $state<string>('');
+  // v0.2.102 W6-B (F4): the "Detected backend" readout in the Code Graph
+  // Embeddings section renders THIS snapshot of the code row, captured at
+  // load — never `defaultCodeModel`, which is the same row BUT also the
+  // live value of the "Default code embedding" Dropdown above, so binding
+  // the readout to it made the "install-time detected" line follow the
+  // user's in-progress dropdown pick.
+  let detectedCodeModel = $state<string>('');
 
   function buildEmbOptions(models: ModelChoice[]) {
     return models.map((m) => ({
@@ -443,26 +450,43 @@
     if (r.defaults) {
       defaultTextModel = r.defaults.text_model ?? '';
       defaultCodeModel = r.defaults.code_model ?? '';
+      detectedCodeModel = defaultCodeModel;
     }
   }
 
   /** Save the user's pick for the text-embedding default. Per the
    *  v0.2.18 locked rule, this is the EXPLICIT consent surface — no
-   *  auto-switch fires elsewhere when an OpenAI key validates. */
+   *  auto-switch fires elsewhere when an OpenAI key validates.
+   *
+   *  v0.2.102 W6-B (F3): the backend helper also stamps the CANONICAL
+   *  `embedding.active_profile` (v0.2.68 Defect D) — the row the
+   *  "Embedding profile (global)" select displays — so a successful save
+   *  MUST re-read that select, or it keeps showing the stale profile
+   *  while the row on disk changed. `refresh` re-runs the loader only if
+   *  its section was already activated; if it wasn't, the section's own
+   *  first activation reads the fresh row anyway.
+   *  (F5): the text save fans into a machine-wide env re-projection (N
+   *  serial subprocesses, on the blocking pool) — the busy state below
+   *  keeps the Dropdown visibly disabled for the whole sweep. */
   async function saveDefaultTextEmbedding(value: string) {
+    defaultTextSaving = true;
     try {
       await invoke('set_default_embedding_models', {
         textModel: value || null,
         codeModel: null,
       });
       defaultTextModel = value;
+      loaders.refresh('activeEmbedding');
       toast.success('Default text embedding saved');
     } catch (e) {
       toast.error(e);
+    } finally {
+      defaultTextSaving = false;
     }
   }
 
   async function saveDefaultCodeEmbedding(value: string) {
+    defaultCodeSaving = true;
     try {
       await invoke('set_default_embedding_models', {
         textModel: null,
@@ -472,8 +496,18 @@
       toast.success('Default code embedding saved');
     } catch (e) {
       toast.error(e);
+    } finally {
+      defaultCodeSaving = false;
     }
   }
+
+  // v0.2.102 W6-B (F5): busy states for the two default-embedding
+  // Dropdowns. The TEXT path is a machine-wide sweep (every project's env
+  // re-projected, N serial Python subprocesses) and can take a while on a
+  // many-project machine; the CODE path is a single app_state write. Both
+  // now disable their control + show a saving placeholder for the duration.
+  let defaultTextSaving = $state(false);
+  let defaultCodeSaving = $state(false);
 
   /**
    * v0.2.18 Commit 7 (2026-05-19): styled-modal confirmation for
@@ -2187,14 +2221,23 @@
             Applied to the KG binding when you create a new project. Existing
             projects are not affected. Greyed-out options are unreachable
             from this machine.
+            <!-- v0.2.102 W6-B (F3/F5): the save is NOT local — the backend
+                 also stamps the global embedding profile and re-projects
+                 every project's env (a machine-wide sweep that can take a
+                 while). -->
+            Saving also sets the global embedding profile (see "Embedding
+            profile (global)" below) and refreshes every project's
+            environment — this can take a while on machines with many
+            projects.
           </span>
         </div>
         <div class="pr-dd">
           <Dropdown
             options={embCatalog ? buildEmbOptions(embCatalog.text_models) : []}
             value={defaultTextModel}
-            placeholder={embCatalog ? 'Select model…' : 'Loading…'}
+            placeholder={defaultTextSaving ? 'Saving…' : embCatalog ? 'Select model…' : 'Loading…'}
             ariaLabel="Default text embedding"
+            disabled={defaultTextSaving}
             onChange={(v: string) => void saveDefaultTextEmbedding(v)}
           />
         </div>
@@ -2211,8 +2254,9 @@
           <Dropdown
             options={embCatalog ? buildEmbOptions(embCatalog.code_models) : []}
             value={defaultCodeModel}
-            placeholder={embCatalog ? 'Select model…' : 'Loading…'}
+            placeholder={defaultCodeSaving ? 'Saving…' : embCatalog ? 'Select model…' : 'Loading…'}
             ariaLabel="Default code embedding"
+            disabled={defaultCodeSaving}
             onChange={(v: string) => void saveDefaultCodeEmbedding(v)}
           />
         </div>
@@ -2552,18 +2596,28 @@
         embeddings (functions, classes, modules, APIs). Defaults to the
         install-time detected backend; pin a specific one when you want
         to evaluate alternatives or fall back from a paid model.
+        <!-- v0.2.102 W6-B (F1): the override is READ by the indexer's
+             embedding resolver (vco_lib/embedding_service.py), with
+             explicit CODE_EMBED_* env still winning. True promise: a pin
+             applies to the NEXT indexing run — existing objects keep
+             their vectors until re-indexed. -->
+        Takes effect on the next code-graph indexing run (a running indexer
+        keeps its resolution); already-indexed entities keep their stored
+        vectors until you re-index. An explicit CODE_EMBED_MODEL /
+        CODE_EMBED_BACKEND env override still wins over this pick.
       </p>
 
       {#if codeEmbedLoading}
         <p class="pr-hint">Loading…</p>
       {:else}
-        <!-- Read-only detected backend. We reuse the same
-             defaultCodeModel state populated by loadEmbeddingCatalog()
-             above — single source of truth. -->
+        <!-- Read-only detected backend. v0.2.102 W6-B (F4): bound to
+             detectedCodeModel — the snapshot captured at load — never
+             defaultCodeModel, which is the live value of the mutable
+             "Default code embedding" Dropdown above. -->
         <div class="pr-kgsum-block">
           <p class="pr-kgsum-block-label">Detected backend</p>
           <p class="pr-hint">
-            <code>{defaultCodeModel || '(unset — install hasn\'t run hardware selection)'}</code>
+            <code>{detectedCodeModel || '(unset — install hasn\'t run hardware selection)'}</code>
           </p>
         </div>
 

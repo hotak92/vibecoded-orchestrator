@@ -1812,6 +1812,192 @@ def resolve_active_text_model_id() -> str:
     return _model_id_for_active(active)
 
 
+# ── v0.2.102 W6-B (Preferences audit F1): the Code Graph Embeddings reader ──
+#
+# The launcher's Preferences → "Code Graph Embeddings" section has written
+# three ``app_state`` keys since v0.2.23 —
+#
+#   * ``code_embed_backend_override`` — "" | "auto" | "codesage" | "qwen3" |
+#     "jina" | "openai" | "ollama"
+#   * ``code_embed_openai_model``     — the OpenAI model id when the pin is
+#     ``openai`` (default ``text-embedding-3-small``)
+#   * ``code_embed_ollama_model``     — the Ollama model name when the pin is
+#     ``ollama`` (no auto-pick; the user chooses from the dropdown)
+#
+# — and until v0.2.102 NOTHING read them: the section promised "Override the
+# backend the code-graph indexer uses" while the indexer resolved its code
+# model purely from ``CODE_EMBED_*`` env / the codesage default. The resolver
+# below is the reader, mirroring what W5-D did for the KG-summary twin
+# (``vco_lib.summary_model``): ONE resolution home called by
+# :meth:`EmbeddingService.for_project` (the constructor the analyzer, the
+# install seed and the MCP server all go through).
+#
+# Precedence (first hit wins; ``resolve_code_model_id`` returns the model AND
+# which rung answered):
+#
+# 1. ``CODE_EMBED_MODEL`` env (non-empty) — the operator's explicit override.
+# 2. ``CODE_EMBED_BACKEND`` env PRESENT (even as ``service``) — an explicitly
+#    exported backend choice is an operator decision and blocks the
+#    Preferences leg; ``ollama`` means the qwen3 CPU fallback, anything else
+#    the CodeEmbed service's codesage default. (An ABSENT variable is not a
+#    choice — the pre-v0.2.102 default of ``"service"`` only applied to the
+#    default leg.)
+# 3. the launcher Preferences pin (``code_embed_backend_override`` +
+#    the model key that matches it). ``""`` / ``auto`` = no pin. ``openai``
+#    passes through the SAME consent gate the KG-summary OpenAI tier uses
+#    (``kg_summary_openai_consent``) — no cost-bearing call without consent;
+#    a refusal raises :class:`CodeEmbedConsentRefusal` (loud, names the real
+#    source, never silently falls back to a free backend).
+# 4. the install/hardware default — ``codesage-large-v2`` via the CodeEmbed
+#    service (exactly the pre-v0.2.102 behaviour when nothing is pinned).
+#
+# A pin only changes what the NEXT code-graph indexing run embeds with
+# (``for_project`` constructs per run); already-indexed objects keep their
+# stored vectors until re-indexed. The Preferences section's copy says so.
+
+#: Written by the launcher's Preferences page (``preferences/loaders.ts``
+#: ``APP_STATE_KEY_CODE_EMBED_*`` — MUST MATCH those constants).
+APP_STATE_KEY_CODE_EMBED_OVERRIDE = "code_embed_backend_override"
+APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL = "code_embed_openai_model"
+APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL = "code_embed_ollama_model"
+#: The OpenAI cost gate is ONE key shared with the KG-summary OpenAI tier
+#: (``summary_backends.openai_consent_granted``) — the Preferences UI gates
+#: the code-embed ``openai`` radio on the same checkbox.
+APP_STATE_KEY_CODE_EMBED_OPENAI_CONSENT = "kg_summary_openai_consent"
+
+SOURCE_ENV = "env"
+SOURCE_PREFERENCES = "preferences"
+SOURCE_DEFAULT = "default"
+
+_OPENAI_CODE_EMBED_DEFAULT_MODEL = "text-embedding-3-small"
+
+
+class CodeEmbedConsentRefusal(NoEmbeddingBackendError):
+    """The Preferences code-embed pin is ``openai`` but consent was withheld.
+
+    Cost gate (v0.2.102 W6-B): the OpenAI option of the launcher's Code
+    Graph Embeddings section must never produce a cost-bearing embed call
+    without the SAME consent the KG-summary OpenAI tier requires
+    (``app_state[kg_summary_openai_consent]``). The refusal is PERMANENT for
+    the service instance's life — ``_raise_if_code_backend_down`` raises it
+    regardless of backend reachability, on every code-embed call, so the
+    indexer fails loudly naming the source and the remedy instead of paying
+    or silently re-routing the code graph to another embedder.
+    """
+
+    permanent = True
+
+    def __init__(self, message: str, model_id: str) -> None:
+        super().__init__(
+            message,
+            attempted_backends=["openai"],
+            error_per_backend={
+                "openai": "kg_summary_openai_consent not granted in launcher.db"
+            },
+            capture=False,
+        )
+        self.model_id = model_id
+
+
+def _app_state_reader():
+    """The ONE app_state read home (soft-fail; ``None`` when unreadable)."""
+    from vco_lib.launcher_db_reader import read_app_state_value
+
+    return read_app_state_value
+
+
+def _code_embed_openai_consent_granted(app_state) -> bool:
+    """Truthy values are ``true`` / ``1`` / ``yes`` (case-insensitive) — the
+    SAME truthiness rule as ``summary_backends.openai_consent_granted``."""
+    raw = app_state(APP_STATE_KEY_CODE_EMBED_OPENAI_CONSENT)
+    if not isinstance(raw, str):
+        return False
+    return raw.strip().lower() in {"true", "1", "yes"}
+
+
+def resolve_code_model_id(
+    env=None,
+    *,
+    app_state=None,
+) -> "tuple[str, str]":
+    """``(model_id, source)`` for the CODE slot — see the section docstring
+    above for the precedence. ``env`` (default ``os.environ``) and
+    ``app_state`` (default the launcher.db reader) are seams for tests.
+
+    Raises:
+        CodeEmbedConsentRefusal: the Preferences pin is ``openai`` and the
+            OpenAI consent (``kg_summary_openai_consent``) is not granted.
+            The exception carries the pinned model id so the caller keeps
+            the openai slot (and refuses code embeds) rather than silently
+            re-routing to a free backend.
+    """
+    env = os.environ if env is None else env
+    if app_state is None:
+        app_state = _app_state_reader()
+
+    env_code_model = str(env.get("CODE_EMBED_MODEL", "") or "").strip()
+    if env_code_model:
+        return env_code_model, SOURCE_ENV
+    if "CODE_EMBED_BACKEND" in env:
+        backend = str(env.get("CODE_EMBED_BACKEND", "") or "").strip().lower() or "service"
+        if backend == "ollama":
+            return DEFAULT_TEXT_MODEL, SOURCE_ENV
+        return DEFAULT_CODE_MODEL, SOURCE_ENV
+
+    pin = ""
+    raw_pin = app_state(APP_STATE_KEY_CODE_EMBED_OVERRIDE)
+    if isinstance(raw_pin, str):
+        pin = raw_pin.strip().lower()
+
+    if pin in ("", "auto"):
+        return DEFAULT_CODE_MODEL, SOURCE_DEFAULT
+    if pin == "codesage":
+        return DEFAULT_CODE_MODEL, SOURCE_PREFERENCES
+    if pin == "qwen3":
+        return DEFAULT_TEXT_MODEL, SOURCE_PREFERENCES
+    if pin == "jina":
+        return _FALLBACK_JINA_MODEL, SOURCE_PREFERENCES
+    if pin == "openai":
+        raw_model = app_state(APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL)
+        model = _to_openai_api_model(
+            raw_model.strip() if isinstance(raw_model, str) and raw_model.strip()
+            else _OPENAI_CODE_EMBED_DEFAULT_MODEL
+        )
+        if not _code_embed_openai_consent_granted(app_state):
+            raise CodeEmbedConsentRefusal(
+                "Preferences code-embed pin is openai "
+                f"({APP_STATE_KEY_CODE_EMBED_OVERRIDE}=openai, model {model}) but "
+                "OpenAI consent was not granted. Set "
+                f"{APP_STATE_KEY_CODE_EMBED_OPENAI_CONSENT}=true in launcher "
+                "Preferences (KG Summaries → consent) or clear the Code Graph "
+                "Embeddings override. Code embeddings are REFUSED until then — "
+                "no cost-bearing call is made without consent.",
+                model_id=model,
+            )
+        return model, SOURCE_PREFERENCES
+    if pin == "ollama":
+        raw_model = app_state(APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL)
+        model = raw_model.strip() if isinstance(raw_model, str) else ""
+        if model:
+            return model, SOURCE_PREFERENCES
+        # A pin with no model picked yet: say so and use the default — the
+        # alternative (indexing against a guessed Ollama model) is the
+        # silent-wrong-backend failure this resolver exists to prevent.
+        print(
+            "[vct] code-embed: Preferences pin is 'ollama' but no model is "
+            f"picked ({APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL} empty); using the "
+            "install default",
+            file=sys.stderr,
+        )
+        return DEFAULT_CODE_MODEL, SOURCE_DEFAULT
+    print(
+        f"[vct] code-embed: ignoring unknown Preferences pin {pin!r} "
+        f"({APP_STATE_KEY_CODE_EMBED_OVERRIDE}); using the install default",
+        file=sys.stderr,
+    )
+    return DEFAULT_CODE_MODEL, SOURCE_DEFAULT
+
+
 def configured_text_models() -> "list[str]":
     """Return the model ids of every TEXT slot a KG write would populate.
 
@@ -2171,7 +2357,10 @@ class EmbeddingService:
             "no key configured" (also the paused-key answer, which warns
             once naming the Secrets panel).
           * ``CODE_EMBED_BACKEND`` → ``"service"`` (default) /
-            ``"ollama"``. Affects code-model defaults.
+            ``"ollama"``. Affects code-model defaults. An explicitly
+            exported value also BLOCKS the launcher Preferences code-embed
+            pin (``code_embed_backend_override`` — v0.2.102 W6-B); env
+            always wins, exactly like the text-model legs above.
 
         v0.2.52 V52-AJ — launcher.db fallback:
             When ``ACTIVE_EMBEDDING`` / ``EMBEDDING_MODEL`` env vars are
@@ -2215,16 +2404,30 @@ class EmbeddingService:
         # EMBEDDING_MODEL must NOT collapse a seeded arctic profile to qwen3).
         text_model_id = resolve_active_text_model_id()
 
-        # Code model id. CODE_EMBED_BACKEND="ollama" means CPU fallback
-        # via the qwen3 model; "service" means the FastAPI service.
-        code_backend = os.environ.get("CODE_EMBED_BACKEND", "service").strip().lower() or "service"
-        env_code_model = os.environ.get("CODE_EMBED_MODEL", "").strip()
-        if env_code_model:
-            code_model_id = env_code_model
-        elif code_backend == "ollama":
-            code_model_id = DEFAULT_TEXT_MODEL  # qwen3 CPU fallback
-        else:
-            code_model_id = DEFAULT_CODE_MODEL
+        # Code model id. ONE resolution home (v0.2.102 W6-B, Preferences
+        # audit F1): explicit env (CODE_EMBED_MODEL, then an explicitly
+        # exported CODE_EMBED_BACKEND) → the launcher's Code Graph
+        # Embeddings Preferences pin → the install/hardware default
+        # (codesage via the FastAPI service; CODE_EMBED_BACKEND=ollama env
+        # means the qwen3 CPU fallback). See resolve_code_model_id above.
+        code_pref_error: "CodeEmbedConsentRefusal | None" = None
+        try:
+            code_model_id, code_model_source = resolve_code_model_id()
+        except CodeEmbedConsentRefusal as exc:
+            # The OpenAI cost gate refused the pin. Loud on stderr; the
+            # pinned (openai) model id is kept so the slot stays
+            # openai_code_embed and every code embed raises the refusal —
+            # the text/KG path is unaffected.
+            print(f"[vct] {exc}", file=sys.stderr)
+            code_pref_error = exc
+            code_model_id = exc.model_id
+            code_model_source = SOURCE_PREFERENCES
+        if code_model_source == SOURCE_PREFERENCES and code_pref_error is None:
+            print(
+                f"[vct] code-embed: Preferences pin in effect — {code_model_id} "
+                f"({APP_STATE_KEY_CODE_EMBED_OVERRIDE})",
+                file=sys.stderr,
+            )
 
         # v0.2.102 (OD-4 + refinement): the ONE resolver — this project's
         # dedicated `vco_openai_api_key` first (keychain per-project row →
@@ -2305,6 +2508,14 @@ class EmbeddingService:
             # backend semantics (qwen3_embed routes to Ollama, not the
             # CodeEmbed service).
             svc._code_ready = None
+
+        # v0.2.102 W6-B: a refused OpenAI pin (consent gate) is recorded
+        # like a down backend — but PERMANENTLY: every code embed raises it
+        # (see _raise_if_code_backend_down) instead of making a cost-bearing
+        # call or silently re-routing the code graph.
+        if code_pref_error is not None:
+            svc._code_backend_error = code_pref_error
+            svc._code_ready = False
 
         # Probe both readiness flags so we can fail fast with a useful
         # error and write the diagnostic.
@@ -3034,6 +3245,11 @@ class EmbeddingService:
         if not codes:
             return []
         if "openai" in self._code_slot:
+            # v0.2.102 W6-B: the consent refusal (a PERMANENT
+            # _code_backend_error) must gate this leg too — it would
+            # otherwise make the cost-bearing OpenAI call the gate exists
+            # to prevent.
+            self._raise_if_code_backend_down()
             return self._retry_once_on_503(
                 self.openai.embed_batch, self.code_model_id, codes
             )
@@ -3618,8 +3834,14 @@ class EmbeddingService:
     def _raise_if_code_backend_down(self) -> None:
         """v0.2.100: the configured CodeSage backend was down at construction
         and no substitute embedder is allowed — raise the typed error (not an
-        Ollama call for a model Ollama does not serve) until it answers again."""
-        if self._code_backend_error is not None and not self.codeembed.is_reachable():
+        Ollama call for a model Ollama does not serve) until it answers again.
+
+        v0.2.102 W6-B: a PERMANENT error (``CodeEmbedConsentRefusal`` — the
+        OpenAI cost gate refused the Preferences pin) raises regardless of
+        reachability; no probe can grant consent."""
+        if self._code_backend_error is None:
+            return
+        if getattr(self._code_backend_error, "permanent", False) or not self.codeembed.is_reachable():
             raise self._code_backend_error
 
     def _embed_code_via_active(
@@ -3680,6 +3902,9 @@ class EmbeddingService:
             )
 
         if "openai" in self._code_slot:
+            # v0.2.102 W6-B: the consent refusal gates this leg before any
+            # cost-bearing OpenAI call (see embed_code_batch).
+            self._raise_if_code_backend_down()
             return self.openai.embed(
                 _to_openai_api_model(self.code_model_id), code
             )

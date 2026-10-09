@@ -73,33 +73,36 @@
   async function loadSettings() {
     // Every read soft-fails with a console warning so browser-mode (vite dev)
     // lands on defaults instead of an unhandled rejection.
-    try {
-      const paths = await invoke<string[]>('get_user_owned_paths');
-      if (paths) userOwnedPaths = paths;
-      const auto = await invoke<boolean>('get_auto_check_enabled');
-      if (auto !== null) autoCheckEnabled = auto;
-      const retry = await invoke<boolean>('get_auto_retry_failed_installs_setting');
-      if (retry !== null) autoRetryFailedInstalls = retry;
-    } catch (e) {
-      console.warn('[updates] settings load skipped:', e);
-    }
+    // v0.2.102 W6-B (F6): the five reads are INDEPENDENT — they ran
+    // sequentially and the slow one (the remote release-tag lookup, a
+    // network round trip) serialised the whole mount behind it. One
+    // Promise.all cuts the mount to the slowest read instead of their sum;
+    // each read keeps its own soft-fail (a failure leaves that setting on
+    // its default, exactly as before).
+    const [paths, auto, retry, rv, tagResult] = await Promise.all([
+      invoke<string[]>('get_user_owned_paths')
+        .catch((e) => { console.warn('[updates] get_user_owned_paths failed:', e); return null; }),
+      invoke<boolean>('get_auto_check_enabled')
+        .catch((e) => { console.warn('[updates] get_auto_check_enabled failed:', e); return null; }),
+      invoke<boolean>('get_auto_retry_failed_installs_setting')
+        .catch((e) => { console.warn('[updates] get_auto_retry_failed_installs_setting failed:', e); return null; }),
+      invoke<string>('get_launcher_running_version')
+        .catch((e) => { console.warn('[updates] get_launcher_running_version skipped:', e); return null; }),
+      invoke<string | null>('get_latest_source_release_tag')
+        .then((tag) => ({ tag: tag ?? null, failed: false }))
+        .catch((e) => {
+          // v0.2.92 (WP-13): an ERROR here is not "no tags" — say so.
+          console.warn('[updates] get_latest_source_release_tag failed:', e);
+          return { tag: null as string | null, failed: true };
+        }),
+    ]);
 
-    try {
-      const rv = await invoke<string>('get_launcher_running_version');
-      if (rv) runningVersion = rv;
-    } catch (e) {
-      console.warn('[updates] get_launcher_running_version skipped:', e);
-    }
-    try {
-      const tag = await invoke<string | null>('get_latest_source_release_tag');
-      latestSourceTag = tag ?? null;
-      latestTagLookupFailed = false;
-    } catch (e) {
-      // v0.2.92 (WP-13): an ERROR here is not "no tags" — say so.
-      console.warn('[updates] get_latest_source_release_tag failed:', e);
-      latestSourceTag = null;
-      latestTagLookupFailed = true;
-    }
+    if (paths) userOwnedPaths = paths;
+    if (auto !== null) autoCheckEnabled = auto;
+    if (retry !== null) autoRetryFailedInstalls = retry;
+    if (rv) runningVersion = rv;
+    latestSourceTag = tagResult.tag;
+    latestTagLookupFailed = tagResult.failed;
 
     binaryLags = false;
     if (runningVersion && latestSourceTag) {
