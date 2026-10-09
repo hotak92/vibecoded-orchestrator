@@ -681,6 +681,26 @@ pub fn run() {
         std::process::exit(exit_code);
     }
 
+    // v0.2.102 review fix 3 (coordinator ruling): when THIS process was
+    // started as a relaunch child (`--vct-relaunch-parent=<pid>`, appended
+    // by the one relaunch path in `commands::restart`), wait — bounded,
+    // env-tunable — for the exiting parent to be GONE before the Tauri
+    // builder (and with it the single-instance plugin, registered first)
+    // runs. Without this, a child that reaches plugin setup while the old
+    // process still holds the per-user lock hands its argv to a launcher
+    // that is about to exit and dies — leaving NO launcher running. A
+    // normal second launch carries no flag and keeps today's immediate
+    // hand-off. Soft-fail: on wait expiry we log one line and fall through
+    // to the ordinary single-instance behaviour.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if let Some(parent_pid) =
+            commands::restart::relaunch_parent_pid(&argv)
+        {
+            commands::restart::wait_for_relaunch_parent_before_lock(parent_pid);
+        }
+    }
+
     // v0.2.49: reap any stale install.py.lock left behind by a crashed
     // launcher (segfault / OOM-kill / kill -9 — none of which run
     // Rust destructors, so `.kill_on_drop(true)` can't help). Without
@@ -2212,6 +2232,18 @@ pub fn run() {
             // Emits `vct-launcher-update-available` event when remote HEAD
             // has new commits — never auto-applies.
             commands::self_update::spawn_daily_check(app.handle().clone());
+
+            // v0.2.102 (S16-13 / OD-7) review fix 4: the hidden-idle
+            // stale-binary self-relaunch check, as its OWN background loop —
+            // deliberately NOT in `tray.rs`, so it keeps running when the
+            // system tray failed to build (a session with no
+            // StatusNotifier host). One periodic check
+            // (`VCT_LAUNCHER_STALE_IDLE_CHECK_SECS`, default 10 min) that
+            // leaves the launcher alone unless a `launcher_binary_stale`
+            // record exists, this process started `--start-hidden`, no
+            // window is visible, no update is in flight and no modal is
+            // pending; the act is the restart modal's own guarded relaunch.
+            commands::restart::spawn_stale_idle_checks(app.handle().clone());
 
             // v0.2.97: materialize the bundled core-module manifests into the
             // state dir (the hub does the same at its own start) — every

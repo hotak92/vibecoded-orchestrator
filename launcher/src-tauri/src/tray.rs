@@ -160,20 +160,7 @@ fn tray_click_action(
 /// the blocking probes inside must run on the runtime, and the
 /// no-bare-tokio-spawn-in-sync-fns source scan requires that context to
 /// be explicit (v0.2.90).
-///
-/// v0.2.102 (S16-13 / OD-7): this loop is also the launcher's periodic
-/// background tick, so it carries the hidden-idle stale-binary check
-/// (`commands::restart::hidden_idle_stale_relaunch_tick`) at that check's
-/// own env-tunable cadence. The check itself decides — it leaves the
-/// launcher alone unless `launcher_binary_stale` is recorded AND no window
-/// is visible AND no update is in flight AND no modal is pending; on the
-/// act arm it relaunches the hidden launcher into the dist binary through
-/// the restart modal's own guarded path and exits the process.
-async fn hub_status_poll_loop<R: Runtime>(
-    app: AppHandle<R>,
-    hub_label: MenuItem<R>,
-    hub_stop: MenuItem<R>,
-) {
+async fn hub_status_poll_loop<R: Runtime>(hub_label: MenuItem<R>, hub_stop: MenuItem<R>) {
     // First tick fires immediately so the user sees real state
     // shortly after the tray appears (no "probing…" stickiness).
     let s = tokio::task::spawn_blocking(crate::hub_status::probe)
@@ -185,10 +172,6 @@ async fn hub_status_poll_loop<R: Runtime>(
         crate::hub_status::HubStatus::Running { .. }
     ));
 
-    // The stale-idle check is NOT due on the first tick: a launcher that
-    // just booted (hidden or not) is by definition on its own binary.
-    let mut stale_idle_check_due = std::time::Instant::now()
-        + crate::commands::restart::stale_idle_check_interval();
     let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
     ticker.tick().await; // burn the immediate-fire tick
     loop {
@@ -201,11 +184,6 @@ async fn hub_status_poll_loop<R: Runtime>(
             s,
             crate::hub_status::HubStatus::Running { .. }
         ));
-        if std::time::Instant::now() >= stale_idle_check_due {
-            stale_idle_check_due = std::time::Instant::now()
-                + crate::commands::restart::stale_idle_check_interval();
-            crate::commands::restart::hidden_idle_stale_relaunch_tick(&app).await;
-        }
     }
 }
 
@@ -380,13 +358,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // services probe never starves the hub label. Probe is cheap
     // (read lockfile + kill(pid, 0)) — no HTTP call — so the poll
     // budget is well below the interval.
-    // v0.2.102 (S16-13 / OD-7): the poller carries the hidden-idle
-    // stale-binary self-relaunch check — see `hub_status_poll_loop`.
-    tauri::async_runtime::spawn(hub_status_poll_loop(
-        app.clone(),
-        hub_label.clone(),
-        hub_stop.clone(),
-    ));
+    tauri::async_runtime::spawn(hub_status_poll_loop(hub_label.clone(), hub_stop.clone()));
 
     // Background poller. `MenuItem<R>` is internally `Arc`-wrapped and
     // cheap to clone, so the spawned task gets its own handle without

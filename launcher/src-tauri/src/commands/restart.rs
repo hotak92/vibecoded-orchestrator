@@ -81,11 +81,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Runtime};
 use vct_launcher_core::process::CommandExt as _;
+
+use std::future::Future;
 
 /// v0.2.54 Track D (Theme 5): process boot instant, initialized in
 /// `lib.rs::setup` (and defensively at first use here). Used to detect
@@ -401,17 +403,24 @@ pub(crate) fn restart_to_dist(
     restart_to_dist_args(install_root, running, spawner, &[])
 }
 
-/// The argv-carrying core of [`restart_to_dist`] (v0.2.102, S16-13): the modal's
-/// Continue path passes no extra argv; the hidden idle self-relaunch passes
-/// `--start-hidden` so a tray-only launcher never flashes a window across the
-/// relaunch. Same guard, same deferral clear — one home.
+/// The argv-carrying core of [`restart_to_dist`] (v0.2.102, S16-13): the
+/// modal's Continue path passes no extra argv; the hidden idle self-relaunch
+/// passes `--start-hidden` so a tray-only launcher never flashes a window
+/// across the relaunch. EVERY relaunch child additionally carries
+/// [`RELAUNCH_PARENT_FLAG`] with the exiting process's pid — appended HERE,
+/// the one path both flavours share — so the child waits out the parent's
+/// single-instance lock (see `wait_for_relaunch_parent_before_lock`) instead
+/// of losing the spawn-then-exit race and leaving no launcher running.
+/// Same guard, same deferral clear — one home.
 fn restart_to_dist_args(
     install_root: &Path,
     running: &str,
     spawner: &dyn Spawner,
-    args: &[&str],
+    extra_args: &[String],
 ) -> Result<PathBuf, RelaunchError> {
-    let result = spawn_guarded(install_root, running, spawner, args);
+    let mut args: Vec<String> = extra_args.to_vec();
+    args.push(relaunch_parent_arg());
+    let result = spawn_guarded(install_root, running, spawner, &args);
     if matches!(
         result,
         Ok(_) | Err(RelaunchError::Refused(RelaunchRefusal::NotNewer { .. }))
@@ -431,7 +440,12 @@ fn restart_to_dist_hidden(
     running: &str,
     spawner: &dyn Spawner,
 ) -> Result<PathBuf, RelaunchError> {
-    restart_to_dist_args(install_root, running, spawner, &[crate::HIDDEN_START_FLAG])
+    restart_to_dist_args(
+        install_root,
+        running,
+        spawner,
+        &[crate::HIDDEN_START_FLAG.to_string()],
+    )
 }
 
 /// Read `<install_root>/.claude/context/UPDATE_DEFERRED.md`, strip the
@@ -665,8 +679,11 @@ pub(crate) enum RelaunchOutcome {
 /// home serves both relaunch flavours — the modal's Continue (no extra args,
 /// the user is looking at the window) and the hidden idle self-relaunch
 /// (`--start-hidden`, so a tray-only launcher stays tray-only across it).
+/// Both flavours additionally carry [`RELAUNCH_PARENT_FLAG`] (appended by
+/// [`restart_to_dist_args`], the one path) so the child waits out the
+/// exiting parent's single-instance lock instead of losing to it.
 pub(crate) trait Spawner {
-    fn spawn_detached(&self, exe: &Path, args: &[&str]) -> Result<(), String>;
+    fn spawn_detached(&self, exe: &Path, args: &[String]) -> Result<(), String>;
 }
 
 /// The production spawner: fully detached (`setsid` / `DETACHED_PROCESS`),
@@ -674,7 +691,7 @@ pub(crate) trait Spawner {
 pub(crate) struct DetachedSpawner;
 
 impl Spawner for DetachedSpawner {
-    fn spawn_detached(&self, exe: &Path, args: &[&str]) -> Result<(), String> {
+    fn spawn_detached(&self, exe: &Path, args: &[String]) -> Result<(), String> {
         spawn_detached_launcher(exe, args)
     }
 }
@@ -710,13 +727,13 @@ pub(crate) fn decide_relaunch(
 
 /// Guard, then spawn: the testable ACT of a relaunch. Returns the binary it
 /// started. Nothing is spawned on any refusal. `args` are the child's extra
-/// argv (empty for the modal path, `--start-hidden` for the hidden idle
-/// self-relaunch — see [`Spawner`]).
+/// argv (the relaunch-parent flag for the modal path; plus `--start-hidden`
+/// for the hidden idle self-relaunch — see [`Spawner`]).
 pub(crate) fn spawn_guarded(
     install_root: &Path,
     running: &str,
     spawner: &dyn Spawner,
-    args: &[&str],
+    args: &[String],
 ) -> Result<PathBuf, RelaunchError> {
     let exe = dist_launcher_path(install_root);
     let dist_version = crate::commands::installer::read_on_disk_binary_version(install_root);
@@ -770,7 +787,7 @@ pub(crate) async fn relaunch<R: Runtime>(
     }
 
     before_spawn();
-    let exe = spawn_guarded(install_root, running, &DetachedSpawner, &[])?;
+    let exe = spawn_guarded(install_root, running, &DetachedSpawner, &[relaunch_parent_arg()])?;
     if let Err(e) = clear_restart_deferral(install_root) {
         tracing::warn!("[restart] relaunch: could not clear the restart deferral: {}", e);
     }
@@ -790,11 +807,13 @@ pub(crate) async fn relaunch<R: Runtime>(
 // window opens, so a tray-only launcher sat on a stale binary indefinitely
 // (register §16 / OD-7).
 //
-// OD-7(a): the HIDDEN launcher relaunches ITSELF into the dist binary when
-// `launcher_binary_stale` is recorded, no window is visible, no update
-// pipeline/apply is running (the update-gate lockfile — the one apply-in-
-// flight source of truth) and no modal is pending. The relaunch is the SAME
-// guarded path the modal's Continue performs ([`restart_to_dist_hidden`] →
+// OD-7(a): a launcher STARTED `--start-hidden` relaunches ITSELF into the
+// dist binary when `launcher_binary_stale` is recorded, no window is
+// visible, no update pipeline/apply is running (the update-gate lockfile —
+// the one apply-in-flight source of truth) and no modal is pending. A
+// visible-mode launcher the user merely hid to the tray keeps the modal
+// path (owner OD-7 scope). The relaunch is the SAME guarded path the
+// modal's Continue performs ([`restart_to_dist_hidden`] →
 // [`spawn_guarded`] → the version guard), plus `--start-hidden` so the
 // relaunched process keeps the tray-only start. The session-start hook does
 // NOT kill GUI processes; this tick is the hidden launcher acting on itself.
@@ -829,7 +848,7 @@ fn stale_idle_check_interval_from(raw: Option<&str>) -> Duration {
         .unwrap_or(DEFAULT_STALE_IDLE_CHECK_INTERVAL)
 }
 
-/// The four guards of the hidden-idle self-relaunch, already resolved —
+/// The guards of the hidden-idle self-relaunch, already resolved —
 /// injectable so every act/leave-alone arm is testable without a running
 /// launcher, DB or file system.
 pub(crate) struct IdleStaleGuards {
@@ -838,19 +857,26 @@ pub(crate) struct IdleStaleGuards {
     /// Any launcher window is visible (the restart modal's Continue belongs
     /// to the user then, not to a background tick).
     pub window_visible: bool,
-    /// The update-gate lockfile is present — a pipeline/apply owns the tree.
+    /// The update-gate lockfile is present AND within its completion
+    /// deadline — a pipeline/apply owns the tree. (The reader is
+    /// deadline-based: a lockfile past its `expected_completion_by`, or
+    /// unparseable/undated, reads as NOT in flight.)
     pub update_in_flight: bool,
-    /// A modal-blocking condition is pending: today the unconsumed update
-    /// handoff outcome (`update.lock.json` / `update.result.json` under the
-    /// vct state dir), whose post-update modal the FE has not yet rendered
-    /// and acknowledged.
+    /// A modal-blocking file is present on disk at tick time
+    /// (`update.lock.json` / `update.result.json` under the vct state dir —
+    /// written mid-life by an updater handoff). Both are consumed (deleted)
+    /// at every boot by `poll_update_lock_on_boot`, so a long-lived hidden
+    /// launcher sees them only while an updater genuinely left them behind.
     pub modal_pending: bool,
+    /// THIS process was started with `--start-hidden` (OD-7's scope). A
+    /// visible-mode launcher the user hid to the tray keeps the modal path.
+    pub started_hidden: bool,
 }
 
 /// What the tick decided. `LeaveAlone` carries the reason for the debug log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IdleStaleDecision {
-    /// All four guards pass — perform the modal's own relaunch, hidden.
+    /// All guards pass — perform the modal's own relaunch, hidden.
     Relaunch,
     /// Leave the running launcher alone, and why.
     LeaveAlone(&'static str),
@@ -861,6 +887,8 @@ pub(crate) enum IdleStaleDecision {
 pub(crate) fn decide_hidden_idle_relaunch(g: &IdleStaleGuards) -> IdleStaleDecision {
     if !g.binary_stale {
         IdleStaleDecision::LeaveAlone("no launcher_binary_stale record")
+    } else if !g.started_hidden {
+        IdleStaleDecision::LeaveAlone("not a --start-hidden launcher; the modal stays the path")
     } else if g.window_visible {
         IdleStaleDecision::LeaveAlone("a window is visible")
     } else if g.update_in_flight {
@@ -890,54 +918,127 @@ fn binary_stale_recorded(install_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The modal-pending reader: an update handoff (or its outcome) that no FE
-/// has consumed yet. `update.lock.json` is PRESERVED while an updater may
-/// still be running; `update.result.json` is written right before the
-/// relaunch and consumed at the next boot's `poll_update_lock_on_boot`.
-/// Either present ⇒ a post-update modal/toast is still owed to the user.
+/// The modal-pending reader: an update-handoff file present on disk at tick
+/// time. `update.lock.json` is PRESERVED while an updater may still be
+/// running; `update.result.json` is written right before the updater's
+/// relaunch. Both are consumed (deleted) at every boot by
+/// `update_handoff::poll_update_lock_on_boot`, so mid-life presence means an
+/// updater left them behind moments ago — leave-alone.
 fn update_handoff_modal_pending() -> bool {
     let root = vct_launcher_core::paths::vct_root_dir();
     root.join(crate::commands::update_handoff::UPDATE_LOCK_FILE).is_file()
         || root.join(crate::commands::update_handoff::UPDATE_RESULT_FILE).is_file()
 }
 
-/// True when any webview window is visible. An visibility answer we cannot
-/// get (`Err`) counts as VISIBLE — false-leave-alone is recoverable (the
-/// next tick), relaunching under a window we could not inspect is not.
-fn any_window_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
-    use tauri::Manager as _;
-    app.webview_windows()
-        .values()
-        .any(|w| w.is_visible().unwrap_or(true))
+/// PURE visibility decision over a set of per-window visibility answers:
+/// `Some(true)` visible, `Some(false)` hidden, `None` UNKNOWN (the
+/// `is_visible()` call failed). Unknown counts as VISIBLE — the
+/// conservative direction: a false leave-alone is recoverable (the next
+/// tick retries), relaunching under a window we could not inspect is not.
+pub(crate) fn visible_window_among(
+    visibilities: impl IntoIterator<Item = Option<bool>>,
+) -> bool {
+    visibilities.into_iter().any(|v| v.unwrap_or(true))
 }
 
-/// Resolve the four guards against live process/install state.
-fn read_idle_stale_guards<R: Runtime>(app: &AppHandle<R>, install_root: &Path) -> IdleStaleGuards {
+/// Enumerate every window the app can see and answer "is any visible"
+/// through [`visible_window_among`].
+///
+/// RESIDUAL (precise, review fix 1): `webview_windows()` lists windows
+/// REGISTERED with the manager at build time. Two things are therefore not
+/// covered: (a) a window whose builder has been constructed but whose
+/// `build()` has not yet completed — Tauri registers windows at build time,
+/// so a window in that sub-second construction span is invisible to this
+/// probe; (b) plain non-webview windows — enumerating those needs Tauri's
+/// `unstable` feature (`Manager::windows`), which this crate does not
+/// enable, and the launcher creates no non-webview windows today (native
+/// dialogs are plugin-owned, not tauri windows). The pre-exit re-check
+/// ([`perform_hidden_idle_relaunch`]) narrows the construction span to the
+/// moment between spawn and exit but cannot eliminate it.
+fn any_window_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
+    use tauri::Manager as _;
+    let windows = app.webview_windows();
+    let visibilities = windows.values().map(|w| w.is_visible().ok());
+    visible_window_among(visibilities)
+}
+
+/// Assemble the guards against live state. The window probe and the owning
+/// argv are INJECTED (they are the only app/process-dependent inputs), so
+/// the assembly is testable without a Tauri app: a test whose probe says
+/// "visible" must see `window_visible: true` in the assembled guards, and
+/// one whose argv lacks `--start-hidden` must see `started_hidden: false`.
+pub(crate) fn guards_from_probe(
+    install_root: &Path,
+    window_probe: impl FnOnce() -> bool,
+    own_argv: &[String],
+) -> IdleStaleGuards {
     IdleStaleGuards {
         binary_stale: binary_stale_recorded(install_root),
-        window_visible: any_window_visible(app),
-        // ONE apply-in-flight source of truth: the same lockfile the update
-        // pipeline writes before git pull and deletes on drop, and the MCP
-        // servers honour (exit 75). No second state machine here.
+        window_visible: window_probe(),
+        // ONE apply-in-flight source of truth: the same deadline-based
+        // lockfile reader the MCP servers honour. No second state machine.
         update_in_flight: crate::commands::update_gate::is_update_in_progress(),
         modal_pending: update_handoff_modal_pending(),
+        started_hidden: crate::start_hidden_requested(own_argv),
     }
 }
 
-/// One periodic check, called from the launcher's background hub tick
-/// (`tray.rs::hub_status_poll_loop`) at [`stale_idle_check_interval`].
+/// What the act core did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HiddenIdleRelaunchOutcome {
+    /// Spawned and the process was told to exit (the injected `exit` ran).
+    Exited,
+    /// Spawned, but a guard FLIPPED on the pre-exit re-check — the old
+    /// process stays running. The already-spawned child carries
+    /// [`RELAUNCH_PARENT_FLAG`], so it waits out its bounded lock window,
+    /// sees this parent live, and gives up (logged there) — the
+    /// single-instance hand-off then exits it cleanly. Nothing is lost.
+    Aborted(&'static str),
+    /// The version guard refused; NOTHING was spawned. The next tick
+    /// retries.
+    Refused(RelaunchError),
+}
+
+/// The testable ACT of the hidden-idle tick: guarded relaunch, then —
+/// because the spawn takes time and the decision was taken BEFORE it —
+/// RE-VALIDATE the guards immediately before the process exit and abort if
+/// any flipped (a window opened, an update started, a modal landed, ...).
+/// `guards` is called exactly twice: once would let a flipped guard kill a
+/// freshly opened window; re-checking is the review's MEDIUM-1 fix.
+pub(crate) fn perform_hidden_idle_relaunch(
+    install_root: &Path,
+    running: &str,
+    spawner: &dyn Spawner,
+    guards: impl Fn() -> IdleStaleGuards,
+    exit: impl FnOnce(),
+) -> HiddenIdleRelaunchOutcome {
+    if let Err(e) = restart_to_dist_hidden(install_root, running, spawner) {
+        return HiddenIdleRelaunchOutcome::Refused(e);
+    }
+    match decide_hidden_idle_relaunch(&guards()) {
+        IdleStaleDecision::Relaunch => {
+            exit();
+            HiddenIdleRelaunchOutcome::Exited
+        }
+        IdleStaleDecision::LeaveAlone(reason) => HiddenIdleRelaunchOutcome::Aborted(reason),
+    }
+}
+
+/// One periodic check, driven by [`drive_stale_idle_checks`] from the
+/// background loop spawned at boot ([`spawn_stale_idle_checks`]).
 ///
 /// Leave-alone arms log at debug and return; the act logs ONE line, performs
-/// the modal's own guarded relaunch (hidden flavour) and exits the process.
-/// A typed refusal (dist not newer, version unreadable, binary missing)
-/// logs a warning and returns — the next tick retries, and the record stays
-/// honest on disk.
+/// the modal's own guarded relaunch (hidden flavour) with the pre-exit
+/// re-check, and exits the process. A typed refusal (dist not newer,
+/// version unreadable, binary missing) logs a warning and returns — the
+/// next tick retries, and the record stays honest on disk.
 pub(crate) async fn hidden_idle_stale_relaunch_tick<R: Runtime>(app: &AppHandle<R>) {
     let Ok(install_root) = crate::commands::installer::find_local_repo_root() else {
         return; // same no-clone case the boot freshness probe skips silently
     };
-    let guards = read_idle_stale_guards(app, &install_root);
-    match decide_hidden_idle_relaunch(&guards) {
+    let argv: Vec<String> = std::env::args().collect();
+    let guards = || guards_from_probe(&install_root, || any_window_visible(app), &argv);
+    match decide_hidden_idle_relaunch(&guards()) {
         IdleStaleDecision::LeaveAlone(reason) => {
             tracing::debug!(
                 "[restart] hidden idle stale check: leaving the launcher alone ({})",
@@ -951,26 +1052,230 @@ pub(crate) async fn hidden_idle_stale_relaunch_tick<R: Runtime>(app: &AppHandle<
                  modal's own path",
                 crate::services::binary_freshness::CID_BINARY_STALE
             );
-            if let Err(e) =
-                restart_to_dist_hidden(&install_root, env!("CARGO_PKG_VERSION"), &DetachedSpawner)
-            {
-                tracing::warn!(
-                    "[restart] hidden idle relaunch refused (non-fatal, the next tick \
-                     retries): {}",
-                    e
-                );
-                return;
+            let outcome = perform_hidden_idle_relaunch(
+                &install_root,
+                env!("CARGO_PKG_VERSION"),
+                &DetachedSpawner,
+                guards,
+                || {
+                    crate::quit_dialog::force_quit();
+                    app.exit(0);
+                },
+            );
+            match outcome {
+                HiddenIdleRelaunchOutcome::Exited => {}
+                HiddenIdleRelaunchOutcome::Aborted(reason) => {
+                    tracing::warn!(
+                        "[restart] hidden idle relaunch ABORTED before exit: {} — this \
+                         process stays; the spawned child gives up its bounded \
+                         single-instance wait and exits",
+                        reason
+                    );
+                }
+                HiddenIdleRelaunchOutcome::Refused(e) => {
+                    tracing::warn!(
+                        "[restart] hidden idle relaunch refused (non-fatal, the next \
+                         tick retries): {}",
+                        e
+                    );
+                }
             }
-            crate::quit_dialog::force_quit();
-            app.exit(0);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.102 review fix 3 (coordinator ruling): the relaunch child must not
+// lose the single-instance lock to the exiting parent.
+// ---------------------------------------------------------------------------
+
+/// Argv flag the ONE relaunch path ([`restart_to_dist_args`]) appends to
+/// every child: `--vct-relaunch-parent=<pid of the exiting process>`. A
+/// child started with it waits (bounded) for that pid to be GONE before the
+/// single-instance plugin runs, instead of racing the parent's teardown and
+/// handing its argv to a process that is about to exit — the failure that
+/// left NO launcher running. A NORMAL second launch (no flag) keeps today's
+/// immediate hand-off to the running instance.
+pub(crate) const RELAUNCH_PARENT_FLAG: &str = "--vct-relaunch-parent";
+
+/// The flag value this process attaches when relaunching a child.
+fn relaunch_parent_arg() -> String {
+    format!("{}={}", RELAUNCH_PARENT_FLAG, std::process::id())
+}
+
+/// PURE: extract the parent pid from an argv slice (`--vct-relaunch-parent=<pid>`).
+/// `None` when the flag is absent, malformed, or names pid 0.
+pub(crate) fn relaunch_parent_pid<S: AsRef<str>>(argv: &[S]) -> Option<u32> {
+    argv.iter().find_map(|a| {
+        let pid = a
+            .as_ref()
+            .strip_prefix(RELAUNCH_PARENT_FLAG)?
+            .strip_prefix('=')?;
+        pid.parse::<u32>().ok().filter(|p| *p != 0)
+    })
+}
+
+/// Default bounded wait for the parent's exit before the single-instance
+/// plugin runs. Generous: the parent has already decided to exit — the wait
+/// only covers its teardown, and the act's own log line precedes it.
+pub(crate) const DEFAULT_RELAUNCH_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Env knob for [`DEFAULT_RELAUNCH_LOCK_WAIT`], in seconds.
+pub(crate) const ENV_RELAUNCH_LOCK_WAIT_SECS: &str = "VCT_LAUNCHER_RELAUNCH_LOCK_WAIT_SECS";
+
+/// Poll cadence of the parent-exit wait.
+const RELAUNCH_LOCK_POLL: Duration = Duration::from_millis(250);
+
+/// The wait bound: `VCT_LAUNCHER_RELAUNCH_LOCK_WAIT_SECS` seconds when set
+/// to a positive integer, the generous default otherwise.
+pub(crate) fn relaunch_lock_wait() -> Duration {
+    relaunch_lock_wait_from(std::env::var(ENV_RELAUNCH_LOCK_WAIT_SECS).ok().as_deref())
+}
+
+/// Pure core of [`relaunch_lock_wait`].
+fn relaunch_lock_wait_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_RELAUNCH_LOCK_WAIT)
+}
+
+/// How waiting for the parent ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParentWaitOutcome {
+    /// The parent is gone — its single-instance lock is released.
+    ParentGone,
+    /// The bounded window expired with the parent still alive.
+    TimedOut(Duration),
+}
+
+/// The bounded parent-exit wait, injectable (`is_alive` + `sleep`) so both
+/// arms are testable without real processes. Checks aliveness BEFORE the
+/// first sleep (a parent that is already gone costs no wait at all).
+pub(crate) fn wait_for_parent_exit(
+    pid: u32,
+    budget: Duration,
+    poll: Duration,
+    mut is_alive: impl FnMut(u32) -> bool,
+    mut sleep: impl FnMut(Duration),
+) -> ParentWaitOutcome {
+    let deadline = Instant::now() + budget;
+    while is_alive(pid) {
+        if Instant::now() >= deadline {
+            return ParentWaitOutcome::TimedOut(budget);
+        }
+        sleep(poll);
+    }
+    ParentWaitOutcome::ParentGone
+}
+
+/// Production wrapper: called at the very top of `lib.rs::run()` (before the
+/// Tauri builder, hence before the single-instance plugin) when this process
+/// was started as a relaunch child. Waits the bounded window; on expiry logs
+/// one line and falls through — the plugin's normal hand-off then decides,
+/// exactly like a normal second launch.
+pub(crate) fn wait_for_relaunch_parent_before_lock(parent_pid: u32) {
+    let budget = relaunch_lock_wait();
+    tracing::info!(
+        "[restart] relaunch child: waiting up to {:?} for the previous launcher \
+         (pid {}) to exit and release the single-instance lock",
+        budget,
+        parent_pid
+    );
+    match wait_for_parent_exit(
+        parent_pid,
+        budget,
+        RELAUNCH_LOCK_POLL,
+        process_alive,
+        |d| std::thread::sleep(d),
+    ) {
+        ParentWaitOutcome::ParentGone => {}
+        ParentWaitOutcome::TimedOut(_) => {
+            tracing::warn!(
+                "[restart] relaunch child: the previous launcher (pid {}) still holds \
+                 the single-instance lock after {:?} — giving up the wait; the \
+                 single-instance hand-off decides",
+                parent_pid,
+                budget
+            );
+        }
+    }
+}
+
+/// Is `pid` a live process? One sysinfo snapshot refreshed for exactly that
+/// pid (never the whole table — this polls every 250 ms while a relaunch
+/// child waits). A zombie reads as alive for the moment until its reaper
+/// collects it, which only lengthens the wait by one poll.
+fn process_alive(pid: u32) -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(sysinfo::Pid::from_u32(pid)).is_some()
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.102 review fix 4: the stale-idle loop is INDEPENDENT of tray creation
+// ---------------------------------------------------------------------------
+
+/// Wake cadence of the standalone stale-idle loop. The STALE check itself
+/// runs at [`stale_idle_check_interval`]; this is only how often the loop
+/// looks at the clock (matches the tray poll's 5 s so the two loops behave
+/// alike when both run).
+const STALE_IDLE_POLL: Duration = Duration::from_secs(5);
+
+/// The stale-idle check scheduler + invoker, over an INJECTED wake stream
+/// and tick: for every wake instant, fire the tick iff the wake is at or
+/// past the next-due instant, then push next-due a full interval past the
+/// wake. The FIRST wake is never due (next-due is seeded from it) — a
+/// freshly booted launcher is by definition on its own binary. Pure over
+/// its inputs: the production loop feeds `Instant::now()` wakes on a
+/// [`STALE_IDLE_POLL`] sleep, tests feed synthetic clocks — no source scan.
+pub(crate) async fn drive_stale_idle_checks<I, T, TF>(
+    wakes: I,
+    interval: Duration,
+    mut tick: T,
+) where
+    I: IntoIterator<Item = Instant>,
+    T: FnMut() -> TF,
+    TF: Future<Output = ()>,
+{
+    let mut next_due: Option<Instant> = None;
+    for now in wakes {
+        let due = next_due.get_or_insert(now + interval);
+        if now >= *due {
+            *due = now + interval;
+            tick().await;
+        }
+    }
+}
+
+/// Spawn the tray-independent stale-idle loop: it MUST run even when the
+/// system tray failed to build (a session with no StatusNotifier host —
+/// review fix 4; the tick no longer lives in `tray.rs` for exactly that
+/// reason). Spawned once from `lib.rs` setup beside the daily update check.
+pub(crate) fn spawn_stale_idle_checks<R: Runtime + 'static>(app: AppHandle<R>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(STALE_IDLE_POLL).await;
+            let now = Instant::now();
+            drive_stale_idle_checks(
+                [now],
+                stale_idle_check_interval(),
+                || hidden_idle_stale_relaunch_tick(&app),
+            )
+            .await;
+        }
+    });
 }
 
 /// Spawn the new launcher fully detached. The current process exits
 /// immediately afterward; the child must be in its own session/process
 /// group so the kernel doesn't tear it down with us.
-fn spawn_detached_launcher(exe: &Path, args: &[&str]) -> Result<(), String> {
+fn spawn_detached_launcher(exe: &Path, args: &[String]) -> Result<(), String> {
     let mut cmd = std::process::Command::new(exe).silent();
     cmd.args(args);
     cmd.stdin(std::process::Stdio::null())
@@ -1408,11 +1713,8 @@ condition_ids: [launcher_restart_required]
     }
 
     impl Spawner for RecordingSpawner {
-        fn spawn_detached(&self, exe: &Path, args: &[&str]) -> Result<(), String> {
-            self.spawned.borrow_mut().push((
-                exe.to_path_buf(),
-                args.iter().map(|a| a.to_string()).collect(),
-            ));
+        fn spawn_detached(&self, exe: &Path, args: &[String]) -> Result<(), String> {
+            self.spawned.borrow_mut().push((exe.to_path_buf(), args.to_vec()));
             Ok(())
         }
     }
@@ -1484,9 +1786,14 @@ condition_ids: [launcher_restart_required]
         let exe = restart_to_dist(td.path(), "0.2.100", &spawner).expect("newer dist");
         assert_eq!(exe, dist_launcher_path(td.path()));
         assert_eq!(spawner.count(), 1);
-        // The MODAL flavour carries no extra argv — the user is looking at
-        // the window the Continue button lives in.
-        assert_eq!((*spawner.spawned.borrow())[0].1, Vec::<String>::new());
+        // The MODAL flavour carries only the relaunch-parent flag (no
+        // --start-hidden — the user is looking at the window the Continue
+        // button lives in).
+        assert_eq!(
+            (*spawner.spawned.borrow())[0].1,
+            vec![relaunch_parent_arg()],
+            "the modal's child must carry the single-instance wait flag and nothing else",
+        );
     }
 
     /// Tri-state: an absent sidecar or a non-X.Y.Z version is never "newer".
@@ -1610,17 +1917,18 @@ condition_ids: [launcher_restart_required]
     // v0.2.102 (S16-13 / OD-7): hidden idle stale self-relaunch.
     // -----------------------------------------------------------------
 
-    /// The act state: a stale record, hidden, no update, no modal.
+    /// The act state: a stale record, started hidden, no update, no modal.
     fn idle_guards() -> IdleStaleGuards {
         IdleStaleGuards {
             binary_stale: true,
             window_visible: false,
             update_in_flight: false,
             modal_pending: false,
+            started_hidden: true,
         }
     }
 
-    /// ACT: stale + hidden + idle → the tick's decision is Relaunch.
+    /// ACT: stale + started hidden + idle → the tick's decision is Relaunch.
     #[test]
     fn hidden_idle_relaunch_fires_when_hidden_and_idle() {
         assert_eq!(
@@ -1628,6 +1936,25 @@ condition_ids: [launcher_restart_required]
             IdleStaleDecision::Relaunch,
             "a hidden idle launcher over a recorded stale binary must self-relaunch",
         );
+    }
+
+    /// LEAVE-ALONE (OD-7 scope, review fix 4): a launcher NOT started
+    /// `--start-hidden` — e.g. a visible-mode launcher the user hid to the
+    /// tray — keeps the modal path; the background tick never changes its
+    /// start mode from under the user.
+    #[test]
+    fn hidden_idle_relaunch_leaves_a_visible_mode_launcher_alone() {
+        let mut g = idle_guards();
+        g.started_hidden = false;
+        assert_eq!(
+            decide_hidden_idle_relaunch(&g),
+            IdleStaleDecision::LeaveAlone(
+                "not a --start-hidden launcher; the modal stays the path"
+            ),
+        );
+        // And the other arm: the same guards WITH the flag relaunch (pinned
+        // above, restated so the pair reads as one decision).
+        assert_eq!(decide_hidden_idle_relaunch(&idle_guards()), IdleStaleDecision::Relaunch);
     }
 
     /// LEAVE-ALONE (the point of OD-7): a visible window means the modal's
@@ -1698,8 +2025,9 @@ condition_ids: [launcher_restart_required]
     }
 
     /// ACT leg: the relaunch the tick performs is the DIST binary, exactly
-    /// once, carrying `--start-hidden` (a tray-only launcher must stay
-    /// tray-only across the self-relaunch — no window flash).
+    /// once, carrying `--start-hidden` AND the relaunch-parent flag (a
+    /// tray-only launcher must stay tray-only across the self-relaunch, and
+    /// the child must wait out the exiting parent's single-instance lock).
     #[test]
     fn hidden_idle_act_relaunches_the_dist_binary_hidden() {
         let td = root_with_dist_and_stale_record("0.2.102");
@@ -1711,9 +2039,13 @@ condition_ids: [launcher_restart_required]
             *spawner.spawned.borrow(),
             vec![(
                 dist_launcher_path(td.path()),
-                vec![crate::HIDDEN_START_FLAG.to_string()],
+                vec![
+                    crate::HIDDEN_START_FLAG.to_string(),
+                    relaunch_parent_arg(),
+                ],
             )],
-            "the hidden idle relaunch must spawn the dist binary with --start-hidden",
+            "the hidden idle relaunch must spawn the dist binary --start-hidden \
+             and carrying the relaunch-parent flag",
         );
     }
 
@@ -1833,6 +2165,321 @@ condition_ids: [launcher_restart_required]
             DEFAULT_STALE_IDLE_CHECK_INTERVAL,
             Duration::from_secs(600),
             "the default stays generous (10 min) — ratchet DOWN only",
+        );
+    }
+
+    // ─── v0.2.102 review fix 2: the window seam and its safety default ────
+
+    /// The safety-critical default: an UNKNOWN visibility answer counts as
+    /// VISIBLE. Flipping `unwrap_or(true)` to `unwrap_or(false)` in
+    /// `visible_window_among` makes this test fail — that flip is exactly
+    /// the "guard becomes unsafe" mutation.
+    #[test]
+    fn an_unknown_visibility_answer_counts_as_visible() {
+        assert!(
+            visible_window_among([None]),
+            "unknown visibility must be treated as VISIBLE (leave-alone)",
+        );
+        assert!(
+            visible_window_among([Some(false), None, Some(false)]),
+            "one unknown among hidden windows still counts as visible",
+        );
+    }
+
+    #[test]
+    fn no_visible_window_only_when_every_answer_is_hidden() {
+        assert!(!visible_window_among([Some(false), Some(false)]));
+        assert!(!visible_window_among([]), "no windows at all → not visible");
+        assert!(visible_window_among([Some(false), Some(true)]));
+    }
+
+    /// The guard ASSEMBLY must consult the injected window probe — a
+    /// hardcode (`window_visible: false`) fails here, because the probe
+    /// says visible and the assembled guard must carry that.
+    #[test]
+    fn guards_assembly_reads_the_window_probe() {
+        let td = tempfile::tempdir().unwrap();
+        let argv = vec![
+            "vct-launcher".to_string(),
+            crate::HIDDEN_START_FLAG.to_string(),
+        ];
+        let visible = guards_from_probe(td.path(), || true, &argv);
+        assert!(visible.window_visible, "the probe's answer must survive assembly");
+        let hidden = guards_from_probe(td.path(), || false, &argv);
+        assert!(!hidden.window_visible);
+    }
+
+    /// The assembly must derive `started_hidden` from the owning argv —
+    /// both arms (OD-7 scope, review fix 4).
+    #[test]
+    fn guards_assembly_reads_started_hidden_from_argv() {
+        let td = tempfile::tempdir().unwrap();
+        let with_flag = vec![
+            "vct-launcher".to_string(),
+            crate::HIDDEN_START_FLAG.to_string(),
+        ];
+        let without_flag = vec!["vct-launcher".to_string()];
+        assert!(guards_from_probe(td.path(), || false, &with_flag).started_hidden);
+        assert!(!guards_from_probe(td.path(), || false, &without_flag).started_hidden);
+    }
+
+    // ─── v0.2.102 review fix 1: the pre-exit re-validation ────────────────
+
+    /// ACT: guards still pass after the spawn → the process is told to exit,
+    /// exactly once.
+    #[test]
+    fn the_act_exits_when_the_recheck_still_passes() {
+        let td = root_with_dist_and_stale_record("0.2.102");
+        let spawner = RecordingSpawner::default();
+        let exits = std::cell::Cell::new(0u32);
+        let outcome = perform_hidden_idle_relaunch(
+            td.path(),
+            "0.2.101",
+            &spawner,
+            || idle_guards(),
+            || exits.set(exits.get() + 1),
+        );
+        assert_eq!(outcome, HiddenIdleRelaunchOutcome::Exited);
+        assert_eq!(exits.get(), 1, "the exit must run exactly once");
+        assert_eq!(spawner.count(), 1);
+    }
+
+    /// LEAVE-ALONE (the race the review found): a window opened between the
+    /// decision and the exit → the re-check aborts, the exit NEVER runs, and
+    /// the old process stays. The already-spawned child is not lost state:
+    /// it carries the relaunch-parent flag and gives up its bounded lock
+    /// wait (see the fix-3 tests).
+    #[test]
+    fn a_window_opened_during_the_spawn_aborts_the_exit() {
+        let td = root_with_dist_and_stale_record("0.2.102");
+        let spawner = RecordingSpawner::default();
+        let exits = std::cell::Cell::new(0u32);
+        let outcome = perform_hidden_idle_relaunch(
+            td.path(),
+            "0.2.101",
+            &spawner,
+            || {
+                let mut g = idle_guards();
+                g.window_visible = true; // opened while the child was spawning
+                g
+            },
+            || exits.set(exits.get() + 1),
+        );
+        assert_eq!(
+            outcome,
+            HiddenIdleRelaunchOutcome::Aborted("a window is visible"),
+        );
+        assert_eq!(exits.get(), 0, "the process exit must NOT run after a flip");
+        // The child WAS spawned — the abort relies on the child's bounded
+        // lock wait (fix 3) to exit cleanly, and its spawn args prove the
+        // flag that makes it wait is present.
+        assert_eq!(spawner.count(), 1);
+        assert!((*spawner.spawned.borrow())[0].1.contains(&relaunch_parent_arg()));
+    }
+
+    /// Same race, the update-in-flight flip (also re-checked pre-exit).
+    #[test]
+    fn an_update_started_during_the_spawn_aborts_the_exit() {
+        let td = root_with_dist_and_stale_record("0.2.102");
+        let spawner = RecordingSpawner::default();
+        let outcome = perform_hidden_idle_relaunch(
+            td.path(),
+            "0.2.101",
+            &spawner,
+            || {
+                let mut g = idle_guards();
+                g.update_in_flight = true;
+                g
+            },
+            || panic!("the exit must not run"),
+        );
+        assert_eq!(
+            outcome,
+            HiddenIdleRelaunchOutcome::Aborted("an update is in flight"),
+        );
+    }
+
+    /// Refusal: a not-newer dist spawns nothing and exits nothing.
+    #[test]
+    fn a_refused_relaunch_exits_nothing() {
+        let td = root_with_dist_and_stale_record("0.2.100"); // not newer than running
+        let spawner = RecordingSpawner::default();
+        let outcome = perform_hidden_idle_relaunch(
+            td.path(),
+            "0.2.101",
+            &spawner,
+            || idle_guards(),
+            || panic!("the exit must not run on a refusal"),
+        );
+        assert!(matches!(outcome, HiddenIdleRelaunchOutcome::Refused(_)));
+        assert_eq!(spawner.count(), 0, "a refusal spawns nothing");
+    }
+
+    // ─── v0.2.102 review fix 4: the tray-independent loop's scheduler ────
+
+    /// Behavioural wiring proof (no source scan): the drive core invokes the
+    /// injected tick ONLY at due wakes. Deleting the `tick().await` (or the
+    /// due test) in `drive_stale_idle_checks` fails this.
+    #[tokio::test]
+    async fn the_stale_idle_loop_fires_the_tick_only_at_due_wakes() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(600);
+        // Wakes every 5 s for 25 minutes: due exactly at 600 s and 1200 s
+        // (the FIRST wake seeds next-due and is never due itself).
+        let wakes: Vec<Instant> = (0..=300)
+            .map(|i| t0 + Duration::from_secs(5 * i))
+            .collect();
+        let fired = std::cell::Cell::new(0u32);
+        let fired_at = std::cell::RefCell::new(Vec::<Instant>::new());
+        drive_stale_idle_checks(wakes, interval, || {
+            fired.set(fired.get() + 1);
+            fired_at.borrow_mut().push(Instant::now());
+            std::future::ready(())
+        })
+        .await;
+        assert_eq!(
+            fired.get(),
+            2,
+            "25 min of 5 s wakes at a 10 min interval fire the tick exactly twice",
+        );
+        let _ = fired_at; // (counting is the assertion; times are debug aid)
+    }
+
+    /// The first wake is never due — a freshly booted launcher is on its
+    /// own binary, and the first wake also seeds the schedule when the
+    /// interval is env-shortened between wakes.
+    #[tokio::test]
+    async fn the_first_wake_is_never_due() {
+        let t0 = Instant::now();
+        let fired = std::cell::Cell::new(0u32);
+        drive_stale_idle_checks(
+            [t0, t0 + Duration::from_secs(5)],
+            Duration::from_secs(600),
+            || {
+                fired.set(fired.get() + 1);
+                std::future::ready(())
+            },
+        )
+        .await;
+        assert_eq!(fired.get(), 0, "no wake before the first interval may fire");
+    }
+
+    // ─── v0.2.102 review fix 3: the relaunch child's bounded lock wait ────
+
+    #[test]
+    fn relaunch_parent_pid_parses_the_flag() {
+        let argv = vec![
+            "vct-launcher".to_string(),
+            format!("{}=4242", RELAUNCH_PARENT_FLAG),
+        ];
+        assert_eq!(relaunch_parent_pid(&argv), Some(4242));
+        // Position-independent (matches how HIDDEN_START_FLAG is matched).
+        assert_eq!(
+            relaunch_parent_pid(&[format!("{}=7", RELAUNCH_PARENT_FLAG)]),
+            Some(7),
+        );
+    }
+
+    #[test]
+    fn relaunch_parent_pid_none_for_normal_launches_and_malformed_values() {
+        // A NORMAL second launch keeps today's immediate hand-off: no flag,
+        // no wait.
+        assert_eq!(
+            relaunch_parent_pid(&["vct-launcher".to_string(), "--start-hidden".to_string()]),
+            None,
+        );
+        assert_eq!(relaunch_parent_pid::<String>(&[]), None);
+        // Malformed / zero values never name a process to wait on.
+        assert_eq!(relaunch_parent_pid(&[format!("{}=", RELAUNCH_PARENT_FLAG)]), None);
+        assert_eq!(relaunch_parent_pid(&[format!("{}=abc", RELAUNCH_PARENT_FLAG)]), None);
+        assert_eq!(relaunch_parent_pid(&[format!("{}=0", RELAUNCH_PARENT_FLAG)]), None);
+        assert_eq!(
+            relaunch_parent_pid(&[RELAUNCH_PARENT_FLAG.to_string()]),
+            None,
+            "the flag without =pid is not a wait request",
+        );
+    }
+
+    /// ACT arm 1: a parent that is already gone costs no wait at all.
+    #[test]
+    fn the_lock_wait_returns_immediately_when_the_parent_is_gone() {
+        let slept = std::cell::Cell::new(0u32);
+        let outcome = wait_for_parent_exit(
+            4242,
+            Duration::from_secs(30),
+            Duration::from_millis(250),
+            |_| false, // parent gone on the very first probe
+            |_| slept.set(slept.get() + 1),
+        );
+        assert_eq!(outcome, ParentWaitOutcome::ParentGone);
+        assert_eq!(slept.get(), 0, "no sleep may happen when the parent is gone");
+    }
+
+    /// ACT arm 2: a parent that exits mid-wait is noticed on the next poll.
+    #[test]
+    fn the_lock_wait_polls_until_the_parent_exits() {
+        let probes = std::cell::Cell::new(0u32);
+        let outcome = wait_for_parent_exit(
+            4242,
+            Duration::from_secs(30),
+            Duration::from_millis(250),
+            |_| {
+                let n = probes.get();
+                probes.set(n + 1);
+                n < 3 // alive for the first 3 probes, gone on the 4th
+            },
+            |_| {},
+        );
+        assert_eq!(outcome, ParentWaitOutcome::ParentGone);
+        assert_eq!(probes.get(), 4);
+    }
+
+    /// Give-up arm: a parent that never exits exhausts the bounded window
+    /// (TimedOut) — never an unbounded hang.
+    #[test]
+    fn the_lock_wait_gives_up_after_the_bounded_window() {
+        let slept = std::cell::Cell::new(0u32);
+        let outcome = wait_for_parent_exit(
+            4242,
+            Duration::from_millis(80),
+            Duration::from_millis(10),
+            |_| true, // parent never exits
+            |_| slept.set(slept.get() + 1),
+        );
+        assert_eq!(outcome, ParentWaitOutcome::TimedOut(Duration::from_millis(80)));
+        assert!(slept.get() >= 1, "the wait must have polled before giving up");
+    }
+
+    #[test]
+    fn relaunch_lock_wait_parsing() {
+        assert_eq!(relaunch_lock_wait_from(Some("45")), Duration::from_secs(45));
+        for raw in [None, Some(""), Some("abc"), Some("0"), Some("-1")] {
+            assert_eq!(
+                relaunch_lock_wait_from(raw),
+                DEFAULT_RELAUNCH_LOCK_WAIT,
+                "{raw:?} must fall back to the generous default",
+            );
+        }
+        assert_eq!(
+            DEFAULT_RELAUNCH_LOCK_WAIT,
+            Duration::from_secs(30),
+            "the default bound stays generous — ratchet DOWN only",
+        );
+    }
+
+    /// The production aliveness probe works both ways on this machine: our
+    /// own pid is alive; a child we already reaped is not. (Unix-gated: the
+    /// reap trick relies on wait() collecting the entry.)
+    #[cfg(unix)]
+    #[test]
+    fn process_alive_sees_live_and_reaped_processes() {
+        assert!(process_alive(std::process::id()), "our own pid is alive");
+        let mut child = std::process::Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap child");
+        assert!(
+            !process_alive(pid),
+            "a reaped child must read as gone — the wait would never end otherwise",
         );
     }
 }
