@@ -1658,8 +1658,10 @@ def select_backend(
         # an env var alone shouldn't bypass user consent; --force-api
         # is the explicit operator override).
         if forced == "openai" and not force_api and not openai_consent_granted():
+            source = (f"{env_keys[0]}=openai" if forced_via == "env" else
+                      "the launcher Preferences backend pin is openai")
             _log(
-                f"  {label}: {env_keys[0]}=openai but consent not "
+                f"  {label}: {source} but consent not "
                 "granted. Set kg_summary_openai_consent=true in launcher "
                 "Preferences → KG Summaries, or pass --force-api. "
                 "Skipping for this run."

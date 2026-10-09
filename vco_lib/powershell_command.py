@@ -51,6 +51,7 @@ CLI (debugging; the command goes through STDIN, never argv)::
 """
 from __future__ import annotations
 
+import re
 import shlex
 import sys
 from dataclasses import dataclass, field
@@ -64,6 +65,7 @@ __all__ = [
     "SPELLINGS",
     "CMDLET_BASH_VERB",
     "is_shell_tool",
+    "loop_pattern",
     "statements",
     "to_bash_equivalent",
     "command_for_bash_readers",
@@ -729,6 +731,96 @@ def to_bash_equivalent(command: str) -> str:
                 parts.append("|" if (k == 0 and st.sep == "|") else ";")
             parts.append(" ".join(_quote(t) for t in seg))
     return " ".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Loop shapes (the wait guard's PowerShell-only rule)
+# ═══════════════════════════════════════════════════════════════════════
+
+#: A ``foreach`` range whose upper bound is a type's MaxValue never ends in
+#: practice; a literal bound at or above this is treated the same.
+UNBOUNDED_RANGE_MIN = 1_000_000
+
+_MAXVALUE_RE = re.compile(
+    r"\.\.\s*\[(?:system\.)?(?:int|int32|int64|long|uint32|uint64|double|decimal)\]::maxvalue",
+    re.IGNORECASE,
+)
+_RANGE_LITERAL_RE = re.compile(r"\.\.\s*(\d[\d_]*)")
+
+
+def _paren_body(toks: List[_Tok], open_idx: int) -> Tuple[List[_Tok], int]:
+    """Tokens inside the ``(`` at ``open_idx`` up to its matching ``)``."""
+    depth, body = 0, []
+    for k in range(open_idx, len(toks)):
+        t = toks[k]
+        if t.op == "(":
+            depth += 1
+            if depth == 1:
+                continue
+        elif t.op == ")":
+            depth -= 1
+            if depth == 0:
+                return body, k
+        body.append(t)
+    return body, len(toks)
+
+
+def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
+    """``(pattern_name, evidence)`` for a PowerShell loop that waits, else
+    ``None`` (v0.2.102 W5-D review W5D-2).
+
+    A PowerShell loop keyword is not a command, so no ``PowerShell(...)``
+    ``if`` rule can ever match it; the wait guard therefore runs on EVERY
+    PowerShell call and asks this function. Detected, with or without a
+    ``Start-Sleep`` inside (a loop with no sleep spins and re-polls just the
+    same):
+
+    * ``while (<cond>) { … }`` — any condition;
+    * ``do { … } while (…)`` / ``do { … } until (…)``;
+    * ``for (<init>; ; <step>)`` — an EMPTY condition (``for (;;)``); a
+      ``for`` with a condition is bounded and passes;
+    * ``foreach ($x in a..<bound>)`` where the bound is a type's
+      ``MaxValue`` or a literal >= :data:`UNBOUNDED_RANGE_MIN`; a
+      ``foreach`` over a collection (``foreach ($f in $files)``) passes.
+
+    Keywords are recognised only as unquoted words followed by their
+    syntax (``(`` / ``{``), so ``Write-Output "while (x)"`` and the
+    ``ForEach-Object`` alias ``foreach { … }`` never match. Never raises."""
+    if not isinstance(command, str) or not command.strip():
+        return None
+    toks = _tokenize(command)
+    for i, t in enumerate(toks):
+        if t.op or t.quoted:
+            continue
+        word = t.text.lower()
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if word == "do" and nxt is not None and nxt.op == "{":
+            return ("do loop", "do { ... } while/until (...)")
+        if nxt is None or nxt.op != "(":
+            continue
+        if word == "while":
+            body, _end = _paren_body(toks, i + 1)
+            cond = " ".join(b.text for b in body)[:60]
+            return ("while loop", f"while ({cond})")
+        if word == "for":
+            body, _end = _paren_body(toks, i + 1)
+            parts: List[List[_Tok]] = [[]]
+            for b in body:
+                if b.op == ";":
+                    parts.append([])
+                else:
+                    parts[-1].append(b)
+            if len(parts) >= 2 and not parts[1]:
+                return ("for (;;) loop", "for (...; ; ...)")
+        if word == "foreach":
+            body, _end = _paren_body(toks, i + 1)
+            src = " ".join(b.text for b in body)
+            if _MAXVALUE_RE.search(src):
+                return ("unbounded foreach", f"foreach ({src[:60]})")
+            m = _RANGE_LITERAL_RE.search(src)
+            if m and int(m.group(1).replace("_", "")) >= UNBOUNDED_RANGE_MIN:
+                return ("unbounded foreach", f"foreach ({src[:60]})")
+    return None
 
 
 def command_for_bash_readers(tool_name: object, command: str) -> str:

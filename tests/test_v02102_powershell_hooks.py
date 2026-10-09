@@ -56,13 +56,18 @@ NEW = "Bash|PowerShell"
 #: matcher (the `*`-matcher hooks — pre-tool-use, the async dispatcher —
 #: already see PowerShell and branch on the tool name inside).
 SHELL_HOOKS = {
-    "PreToolUse": ("pre-vercel-token-guard", "pre-bash-context-inject", "wait-guard"),
+    "PreToolUse": ("pre-vercel-token-guard", "pre-bash-context-inject"),
     "PostToolUse": ("post-bash-file-sync",),
 }
+#: The wait guard is registered TWICE for the shell tools (review W5D-2): its
+#: Bash group keeps matcher `Bash` + the verb `if` rules, and the PowerShell
+#: tool gets an if-less `PowerShell` group — a PowerShell loop keyword is not
+#: a command, so no `PowerShell(...)` rule could ever match it.
+WAIT_GUARD = "wait-guard"
 #: lean-ctx stays Bash-only: its wrapper re-runs the command through a POSIX
 #: shell (`lean-ctx -c`), so a PowerShell command cannot be wrapped; the
 #: scripts step aside on any other tool name.
-BASH_ONLY = ("lean-ctx-rewrite",)
+BASH_ONLY = ("lean-ctx-rewrite", WAIT_GUARD)
 
 
 def _load(p: Path) -> dict:
@@ -154,10 +159,18 @@ class TestRegistrations:
             bi = inject_intent.classify_bash(sample, str(REPO_ROOT), "PowerShell")
             assert bi.intent != inject_intent.INTENT_MECHANICAL, (rule, sample, bi)
 
-    def test_wait_guard_twin_rules_derive_from_the_guard(self, tpl):
-        (g,) = _groups_of(_load(tpl), "PreToolUse", "wait-guard")
-        assert _ps_rules(g) == [f"PowerShell({v} *)"
-                                for v in wait_guard.powershell_rule_spellings()]
+    def test_wait_guard_powershell_group_has_no_if(self, tpl):
+        doc = _load(tpl)
+        groups = [g for g in doc["hooks"]["PreToolUse"]
+                  if any(_stem(h.get("command", "")) == WAIT_GUARD for h in g["hooks"])]
+        by_matcher = {g.get("matcher"): g for g in groups}
+        ps = by_matcher["PowerShell"]
+        (h,) = ps["hooks"]
+        assert "if" not in h, "an if rule cannot match a PowerShell loop keyword (W5D-2)"
+        assert h["command"].endswith("pretooluse") and h.get("timeout") == 10
+        bash = by_matcher["Bash"]
+        assert all(x["if"].startswith("Bash(") for x in bash["hooks"])
+        assert "Bash|PowerShell" not in by_matcher
 
     def test_twin_rules_name_only_commands_that_can_match(self, tpl):
         """Claude Code canonicalizes aliases before matching a PowerShell
@@ -170,7 +183,7 @@ class TestRegistrations:
         natives = {"rg", "git", "timeout"}
         aliases = {k for k, v in SPELLINGS.items() if k != v.lower()}
         doc = _load(tpl)
-        for stem in ("pre-bash-context-inject", "wait-guard"):
+        for stem in ("pre-bash-context-inject",):
             (g,) = _groups_of(doc, "PreToolUse", stem)
             for rule in _ps_rules(g):
                 head = rule[len("PowerShell("):-1].split()[0].rstrip("*")
@@ -180,13 +193,12 @@ class TestRegistrations:
 
     def test_twin_counts(self, tpl):
         doc = _load(tpl)
-        counts = {stem: len(_ps_rules(_groups_of(doc, "PreToolUse", stem)[0]))
-                  for stem in ("pre-bash-context-inject", "wait-guard")}
-        assert counts == {"pre-bash-context-inject": 16, "wait-guard": 10}
+        (g,) = _groups_of(doc, "PreToolUse", "pre-bash-context-inject")
+        assert len(_ps_rules(g)) == 16
 
     def test_twins_are_the_same_handler(self, tpl):
         doc = _load(tpl)
-        for stem in ("pre-bash-context-inject", "wait-guard"):
+        for stem in ("pre-bash-context-inject",):
             (g,) = _groups_of(doc, "PreToolUse", stem)
             shapes = {json.dumps({k: v for k, v in h.items() if k != "if"},
                                  sort_keys=True) for h in g["hooks"]}
@@ -288,6 +300,46 @@ class TestWaitGuard:
         assert "run_in_background: true" in reason
         assert "tail --pid" not in reason, "a PowerShell caller gets PowerShell advice"
 
+    @pytest.mark.parametrize("cmd", [
+        "while ($true) { Get-Date }",
+        "do { Get-Process } until ($false)",
+        "do { Get-Job } while ($true)",
+        "for (;;) { Get-Date }",
+        "foreach ($i in 1..[int]::MaxValue) { Get-Date }",
+        "foreach ($i in 1..10000000) { Test-Path x }",
+        "while (-not (Test-Path done.txt)) { }",
+    ])
+    def test_powershell_loops_are_denied_without_a_sleep(self, cmd, tmp_path):
+        """W5D-2: a loop keyword can match no `if` rule, so the guard runs on
+        every PowerShell call and judges the loop itself — sleep or not."""
+        reason = wait_guard.evaluate(_ps(cmd), env={}, state_root=tmp_path)
+        assert reason, cmd
+        assert "PowerShell command" in reason and "loop" in reason
+        assert "WHY:" in reason and "WHAT TO DO INSTEAD" in reason
+        assert "while ($true)" in reason, "the teaching names the loop shape to avoid"
+        assert "VCO_WAIT_GUARD=off" in reason
+
+    @pytest.mark.parametrize("cmd", [
+        "foreach ($f in $files) { Get-Content $f }",
+        "foreach ($i in 1..10) { $i }",
+        "for ($i = 0; $i -lt 5; $i++) { $i }",
+        "Get-ChildItem | foreach { $_.Name }",
+        'Write-Output "while ($true) { }"',
+        "Get-Content README.md",
+    ])
+    def test_bounded_powershell_is_allowed(self, cmd, tmp_path):
+        assert wait_guard.evaluate(_ps(cmd), env={}, state_root=tmp_path) is None
+
+    def test_ordinary_powershell_is_decided_quickly(self, tmp_path):
+        """The PowerShell group has no `if`, so this runs on EVERY call."""
+        import time
+
+        start = time.perf_counter()
+        for i in range(50):  # distinct commands: the repeat detector stays out
+            assert wait_guard.evaluate(_ps(f"Get-ChildItem src{i} -Recurse | Select-Object -First 5"),
+                                       env={}, state_root=tmp_path) is None
+        assert (time.perf_counter() - start) / 50 < 0.02
+
     def test_bash_still_denied_with_bash_advice(self, tmp_path):
         reason = wait_guard.evaluate(_bash("sleep 30"), env={}, state_root=tmp_path)
         assert reason and "Bash command" in reason and "tail --pid" in reason
@@ -312,14 +364,15 @@ class TestWaitGuard:
     @pytest.mark.skipif(BASH is None, reason="no bash")
     @pytest.mark.parametrize("wrapper", [
         "sh", pytest.param("ps1", marks=pytest.mark.skipif(PWSH_FOUND is None, reason="pwsh absent"))])
-    def test_wrappers_deny_a_powershell_sleep(self, wrapper, tmp_path):
+    @pytest.mark.parametrize("cmd", ["Start-Sleep 45", "while ($true) { Get-Date }"])
+    def test_wrappers_deny_a_powershell_sleep(self, wrapper, cmd, tmp_path):
         env = child_env()
         env.update(VCT_STATE_DIR=str(tmp_path / "state"), PYTHONPATH=str(REPO_ROOT),
                    HOME=str(tmp_path / "home"))
         env["VCT_VENV"] = __import__("sys").executable
         argv = (["bash", str(HOOKS / "wait-guard.sh"), "pretooluse"] if wrapper == "sh"
                 else [PWSH, *PWSH_BASE_FLAGS, "-File", str(HOOKS / "wait-guard.ps1"), "pretooluse"])
-        proc = subprocess.run(argv, input=json.dumps(_ps("Start-Sleep 45")),
+        proc = subprocess.run(argv, input=json.dumps(_ps(cmd)),
                               capture_output=True, text=True, env=env, timeout=120)
         assert proc.returncode == 0, proc.stderr
         assert json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -569,6 +622,9 @@ def _v02101_shaped(tpl: Path) -> dict:
     """The current template as v0.2.101/early-v0.2.102 shipped it: shell
     groups on `Bash`, no PowerShell twins."""
     doc = _load(tpl)
+    for event in doc["hooks"]:
+        doc["hooks"][event] = [g for g in doc["hooks"][event]
+                               if g.get("matcher") != "PowerShell"]
     for groups in doc["hooks"].values():
         for g in groups:
             if g.get("matcher") == NEW:
@@ -594,6 +650,14 @@ class TestMigration:
                     f"{event}/{stem}: upgraded install differs from a fresh one")
                 assert len(_groups_of(merged, event, stem)) == len(
                     _groups_of(template, event, stem)), f"{stem}: a second group appeared"
+        # the wait guard: same handlers per matcher (the PowerShell group is
+        # a new registration, appended at the end of the event)
+        def per_matcher(doc):
+            out: dict = {}
+            for m, h in _handlers(doc, "PreToolUse", WAIT_GUARD):
+                out.setdefault(m, []).append(h)
+            return out
+        assert per_matcher(merged) == per_matcher(template)
 
     def test_one_handler_per_rule(self, tpl):
         merged = settings_merge.smart_merge_settings(_v02101_shaped(tpl), _load(tpl))

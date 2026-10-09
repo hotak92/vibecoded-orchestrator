@@ -82,6 +82,7 @@ from vco_lib.bash_command_walk import (
 )
 from vco_lib.powershell_command import (
     POWERSHELL_TOOL,
+    loop_pattern,
     PS_WAIT_VERBS,
     SHELL_TOOLS,
     command_for_bash_readers,
@@ -108,31 +109,13 @@ SELF_WAKE_TOOLS = frozenset({"ScheduleWakeup", "CronCreate", "Monitor"})
 #: normalized form repeats (same verb, same tokens) N times in the window.
 REPEAT_VERBS = frozenset({"tail", "head", "cat", "ls", "wc", "grep"})
 
-#: v0.2.102 W5-D — the PowerShell twin ``if`` rules of the wait-guard
-#: PreToolUse group (matcher ``Bash|PowerShell``; a single ``if`` rule
-#: matches ONE tool's calls — vendor hooks doc — so the PowerShell tool gets
-#: its own handlers). The cmdlets whose Bash reading is a pattern or repeat
-#: verb above (derived from the ONE PowerShell table; cmdlet names only —
-#: Claude Code canonicalizes aliases before matching, vendor permissions doc
-#: "PowerShell"), the foreground waits, ``Receive-Job`` (its ``-Wait`` form
-#: blocks) and Windows ``timeout.exe`` (a native executable, so no alias
-#: canonicalization covers it). NO loop-keyword rules: ``while``/``do``/
-#: ``for``/``foreach`` are language keywords, not commands, so a rule keyed
-#: on one can never match — a loop body is caught by the cmdlet inside it
-#: (``Start-Sleep``), each subcommand being checked on its own.
-#: MUST MATCH the ``PowerShell(...)`` rules of the wait-guard group in BOTH
-#: settings templates — locked by tests/test_v02102_powershell_hooks.py.
-_PS_RULE_BASH_VERBS = ("sleep", "cat", "ls", "wc", "grep",
-                       "wait-job", "wait-process", "wait-event")
-_PS_RULE_EXTRA = ("Receive-Job", "timeout")
-
-
-def powershell_rule_spellings() -> List[str]:
-    """The command spellings the wait-guard's PowerShell twin rules cover."""
-    from vco_lib.powershell_command import spellings_for_bash_verbs
-
-    return spellings_for_bash_verbs(_PS_RULE_BASH_VERBS) + list(_PS_RULE_EXTRA)
-
+#: v0.2.102 W5-D (review W5D-2): the PowerShell tool gets NO ``if``-filtered
+#: twins. Its loop keywords (``while``/``do``/``for``/``foreach``) are not
+#: commands, so no ``PowerShell(...)`` rule can ever match them; the guard is
+#: registered for PowerShell WITHOUT an ``if`` (every call — the PowerShell
+#: tool only exists where Git Bash does not, so the spawn cost is bounded)
+#: and :func:`vco_lib.powershell_command.loop_pattern` judges the loop
+#: shapes here.
 
 DEFAULT_REPEAT_MAX = 4
 DEFAULT_REPEAT_WINDOW_S = 600
@@ -355,10 +338,13 @@ def _shell_label(tool: str) -> str:
     return "PowerShell" if tool == POWERSHELL_TOOL else "Bash"
 
 
-def static_deny_reason(command: str, pattern: tuple, tool: str = "Bash") -> str:
+def static_deny_reason(command: str, pattern: tuple, tool: str = "Bash",
+                       translated: bool = True) -> str:
+    """``translated``: the evidence is the PowerShell command's Bash
+    reading (said as "read as"), not a quote of the command itself."""
     name, evidence = pattern
     ps = tool == POWERSHELL_TOOL
-    read_as = f" (read as `{evidence}`)" if ps else f" ({evidence})"
+    read_as = f" (read as `{evidence}`)" if ps and translated else f" ({evidence})"
     return (
         f"BLOCKED by the VCO wait-loop guard: the {_shell_label(tool)} command "
         f"`{command}` matches the polling pattern `{name}`{read_as}." + _WHY +
@@ -543,6 +529,12 @@ def evaluate(
         pattern = static_pattern(readable)
         if pattern is not None:
             return static_deny_reason(command, pattern, str(tool))
+        if tool == POWERSHELL_TOOL:
+            # A loop that waits, with or without a Start-Sleep inside
+            # (review W5D-2): judged on the PowerShell text itself.
+            loop = loop_pattern(command)
+            if loop is not None:
+                return static_deny_reason(command, loop, str(tool), translated=False)
         key = bash_repeat_key(
             readable, "powershell" if tool == POWERSHELL_TOOL else "bash")
         if key is not None:

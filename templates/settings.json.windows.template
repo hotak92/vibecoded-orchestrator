@@ -511,7 +511,7 @@
         ]
       },
       {
-        "matcher": "Bash|PowerShell",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
@@ -578,66 +578,16 @@
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
             "timeout": 10,
             "if": "Bash(grep *)"
-          },
+          }
+        ]
+      },
+      {
+        "matcher": "PowerShell",
+        "hooks": [
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
-            "timeout": 10,
-            "if": "PowerShell(Get-Content *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
-            "timeout": 10,
-            "if": "PowerShell(Select-String *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
-            "timeout": 10,
-            "if": "PowerShell(Start-Sleep *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
-            "timeout": 10,
-            "if": "PowerShell(Get-ChildItem *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
-            "timeout": 10,
-            "if": "PowerShell(Measure-Object *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
-            "timeout": 10,
-            "if": "PowerShell(Wait-Job *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
-            "timeout": 10,
-            "if": "PowerShell(Wait-Process *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
-            "timeout": 10,
-            "if": "PowerShell(Wait-Event *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
-            "timeout": 10,
-            "if": "PowerShell(Receive-Job *)"
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
-            "timeout": 10,
-            "if": "PowerShell(timeout *)"
+            "timeout": 10
           }
         ]
       },

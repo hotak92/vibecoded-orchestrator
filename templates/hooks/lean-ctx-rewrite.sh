@@ -172,8 +172,8 @@ try:
     cmd = ti.get("command", "")
 except Exception:
     nothing()
-# v0.2.102 W5-D: lean-ctx compression is Bash-only, by design (owner
-# decision). The wrapper re-runs the command through a POSIX shell
+# v0.2.102 W5-D: lean-ctx compression is Bash-only (coordinator decision 2026-10-09, accepted in review).
+# The wrapper re-runs the command through a POSIX shell
 # (lean-ctx -c), which cannot run PowerShell syntax, so this hook stays
 # registered on matcher Bash and any other tool name (a PowerShell-tool
 # call reaching it through a user-widened matcher) runs raw.

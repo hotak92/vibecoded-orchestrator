@@ -743,8 +743,11 @@ def _shell_matcher_migrations() -> Tuple[MatcherMigration, ...]:
     return (
         MatcherMigration(
             event="PreToolUse", old="Bash", new="Bash|PowerShell",
-            targets=both("pre-vercel-token-guard", "pre-bash-context-inject",
-                         "wait-guard"),
+            # wait-guard is NOT here (review W5D-2): its Bash group keeps
+            # matcher Bash with its if rules, and the PowerShell tool gets a
+            # SEPARATE if-less `PowerShell` group, which the merge appends
+            # like any new registration.
+            targets=both("pre-vercel-token-guard", "pre-bash-context-inject"),
             retired_in="v0.2.102", reason=reason),
         MatcherMigration(
             event="PostToolUse", old="Bash", new="Bash|PowerShell",

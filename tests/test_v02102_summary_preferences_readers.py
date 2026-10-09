@@ -78,4 +78,23 @@ def test_code_generator_alias_order(sb, tmp_path, monkeypatch):
 
 def test_openai_pin_still_needs_consent(sb, tmp_path):
     _pin(tmp_path, "openai")
-    assert sb.select_backend() == "skip", "a pin never bypasses the OpenAI consent gate"
+    lines: list = []
+    sb.set_logger(lines.append)
+    try:
+        assert sb.select_backend() == "skip", "a pin never bypasses the OpenAI consent gate"
+    finally:
+        sb.set_logger(print)
+    msg = " ".join(lines)
+    assert "Preferences backend pin is openai" in msg, msg
+    assert "KG_SUMMARY_BACKEND=openai" not in msg, "the skip names the real source"
+
+
+def test_env_openai_skip_names_the_env_var(sb, monkeypatch):
+    monkeypatch.setenv("KG_SUMMARY_BACKEND", "openai")
+    lines: list = []
+    sb.set_logger(lines.append)
+    try:
+        assert sb.select_backend() == "skip"
+    finally:
+        sb.set_logger(print)
+    assert "KG_SUMMARY_BACKEND=openai" in " ".join(lines)
