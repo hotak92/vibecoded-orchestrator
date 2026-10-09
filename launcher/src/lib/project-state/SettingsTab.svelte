@@ -52,6 +52,17 @@
   // the shared one (browse-cancel is a silent no-op there, which is the
   // behaviour this flow wants too).
   import { pickDirectory } from '$lib/dialog';
+  // v0.2.102 (W5-B C8): the orchestrator install log panel — the durable
+  // `state/logs/install.jsonl` reader the installer ships. Pure tail/copy
+  // derivations live in the module so vitest pins them; this component
+  // only loads + renders.
+  import {
+    tailEvents,
+    copyText,
+    summaryLine,
+    eventLine,
+    type InstallLogView,
+  } from './install-log-panel';
 
   // Move types are declared HERE rather than in `$lib/types/launcher.ts`
   // because this is their only consumer today. The plan itself is produced by
@@ -189,6 +200,41 @@
       newName = project?.name ?? '';
     } catch (e) {
       toast.error(e);
+    }
+  }
+
+  // ─── v0.2.102 (W5-B C8): Install log panel ─────────────────────────────
+  //
+  // Pull-only on purpose (the reader is a PULL-only API by design — see
+  // commands/installer/install_log.rs): loaded on mount, re-read on the
+  // Refresh click. `read_install_log` resolves the ORCHESTRATOR root's
+  // state/logs/install.jsonl and reports the path it read; the panel names
+  // it so "which log is this?" is answered in place.
+  let installLog = $state<InstallLogView | null>(null);
+  let installLogLoading = $state(false);
+  let installLogError = $state<string | null>(null);
+
+  async function loadInstallLog() {
+    installLogLoading = true;
+    installLogError = null;
+    try {
+      installLog = await invoke<InstallLogView>('read_install_log');
+    } catch (e) {
+      // Read errors are rare (the missing file itself is a normal
+      // `exists=false` case, not an error) — surface them inline.
+      installLogError = e instanceof Error ? e.message : String(e);
+    } finally {
+      installLogLoading = false;
+    }
+  }
+
+  async function copyInstallLog() {
+    if (!installLog) return;
+    try {
+      await navigator.clipboard.writeText(copyText(installLog));
+      toast.success('Install log copied');
+    } catch (e) {
+      toast.error(`Copy failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -595,6 +641,11 @@
   }
 
   onMount(load);
+  // W5-B C8: the install log rides along with the settings load (a DB
+  // read + one file read; no Weaviate, no containers).
+  onMount(() => {
+    void loadInstallLog();
+  });
   // Re-load when the embedding page swaps projectId (rare — the project
   // page already remounts the tab, but keep the effect for safety).
   $effect(() => {
@@ -948,6 +999,57 @@
       </button>
     </section>
 
+    <!-- v0.2.102 (W5-B C8): orchestrator install log — the durable
+         state/logs/install.jsonl timeline (install.py + post-install
+         events). Tail + copy; pull-only. This is the ORCHESTRATOR root's
+         log (the install that serves every project), not per-project
+         output — the panel says which path it read. -->
+    <section class="ps-section">
+      <h2>Install log</h2>
+      {#if installLogError}
+        <p class="ps-hint">Couldn't read the install log: {installLogError}</p>
+      {:else if installLogLoading && !installLog}
+        <p class="ps-hint">Reading…</p>
+      {:else}
+        <p class="ps-hint">{summaryLine(installLog)}</p>
+        {#if installLog}
+          <p class="ps-hint">
+            Log file: <code>{installLog.log_path}</code>
+            {installLog.exists ? '' : '(not created yet — nothing has installed)'}
+          </p>
+          {#if tailEvents(installLog).length > 0}
+            <p class="ps-hint">
+              Last {tailEvents(installLog).length} of {installLog.events.length} event(s):
+            </p>
+            <div class="ps-install-log">
+              {#each tailEvents(installLog) as e (e.ts + e.step + e.phase)}
+                <div class="ps-install-log-line phase-{e.phase}" title={e.detail}>
+                  <span class="ps-log-ts">{e.ts}</span>
+                  <span class="ps-log-actor">{e.actor}</span>
+                  <span class="ps-log-step">{e.step}</span>
+                  <span class="ps-log-phase">{e.phase}</span>
+                  <span class="ps-log-detail">{e.detail}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        {/if}
+      {/if}
+      <div class="ps-move-row">
+        <button class="ps-btn" onclick={() => void loadInstallLog()} disabled={installLogLoading}>
+          {installLogLoading ? 'Reading…' : 'Refresh'}
+        </button>
+        <button
+          class="ps-btn"
+          onclick={() => void copyInstallLog()}
+          disabled={!installLog || installLog.events.length === 0}
+          title="Copy the summary block and every event line to the clipboard"
+        >
+          Copy
+        </button>
+      </div>
+    </section>
+
     <section class="ps-section ps-danger">
       <h2>Danger zone</h2>
 
@@ -1150,4 +1252,22 @@
     background: rgba(211, 47, 47, 0.4); color: rgba(255,255,255,0.5);
     cursor: not-allowed;
   }
+
+  /* v0.2.102 (W5-B C8): install-log tail. Canonical ps recipe; monospace
+     lines, error/warn phases tinted, no new tokens. */
+  .ps-install-log {
+    max-height: 220px; overflow-y: auto; border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 6px; padding: 6px 8px; background: rgba(255,255,255,0.02);
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .ps-install-log-line {
+    display: grid; grid-template-columns: 160px 90px 130px 50px 1fr;
+    gap: 8px; font-family: ui-monospace, monospace; font-size: 10px; color: #aaa;
+  }
+  .ps-install-log-line.phase-error .ps-log-phase,
+  .ps-install-log-line.phase-error .ps-log-detail { color: #ff8888; }
+  .ps-install-log-line.phase-warn .ps-log-phase,
+  .ps-install-log-line.phase-warn .ps-log-detail { color: #ffb84a; }
+  .ps-install-log-line.phase-ok .ps-log-phase { color: rgb(0,212,184); }
+  .ps-log-detail { color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>

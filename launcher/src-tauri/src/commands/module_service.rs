@@ -1392,8 +1392,9 @@ pub fn parse_inspect_running_state(stdout: &str) -> bool {
 
 // ─── Tauri commands (Phase 1E / 3C / 4A / 4B) ───────────────────────────
 //
-// Step 24 commit b: the lifecycle surface (`restart_rl_container`; "is it
-// running" is the hub's `module_health_snapshot`) proxies to the hub's
+// Step 24 commit b: the lifecycle surface (`restart_module_container`,
+// the generic per-module Restart since v0.2.102; "is it running" is the
+// hub's `module_health_snapshot`) proxies to the hub's
 // `/api/v1/projects/{project_id}/modules/{module_id}/...` endpoints
 // (filled in by `vct-hub::lifecycle_api`). The supervisor logic lives
 // in `vct-hub::module_supervisor`.
@@ -1405,44 +1406,49 @@ pub fn parse_inspect_running_state(stdout: &str) -> bool {
 // and during the v0.2.21 → v0.2.22 cutover where some users may run a
 // stale hub binary.
 
-/// Restart the per-project RL container. Hub proxy not yet wired for
-/// restart (the hub-side endpoint is 501 until a catalog resolver
-/// lands, Phase 3+). For now this command runs the in-process path —
-/// the supervisor logic is the same implementation that the hub's
-/// `module_supervisor` ships, so behaviour matches v0.2.21 exactly.
+/// v0.2.102 (W5-B, OD-11): the GENERIC per-module Restart. Retires and
+/// subsumes `restart_rl_container` — the owner ruling quoted by the
+/// invoke-name census read: kept unwired for future RL module enablement
+/// ("we need to enable the module later on"); a generic module Restart on
+/// the tile would subsume it (v0.2.102+). This is that Restart: any
+/// installed module with a container on its install row can be restarted
+/// from its tile, through the same `restart_container_with` pipeline the
+/// RL-specific command used (stop + re-launch via the manifest; a name
+/// held by another install refuses BEFORE the stop). The module tile's
+/// confirm dialog is the GUI gate — the command restarts a running
+/// container, which drops in-flight module work.
+///
+/// Hub proxy not yet wired for restart (the hub-side endpoint is 501
+/// until a catalog resolver lands) — this runs the in-process path.
 #[command]
-pub async fn restart_rl_container(
+pub async fn restart_module_container(
     project_id: String,
+    module_id: String,
     db: State<'_, Db>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let install = db
-        .get_module_install(&project_id, RL_RERANKER_MODULE_ID)?
-        .ok_or_else(|| {
-            format!(
-                "vct-rl-reranker not installed for project {}",
-                project_id
-            )
-        })?;
+        .get_module_install(&project_id, &module_id)?
+        .ok_or_else(|| format!("{} not installed for project {}", module_id, project_id))?;
     let container_name = install
         .container_name
-        .ok_or("container_name not yet set on install row".to_string())?;
+        .ok_or("container_name not yet set on install row (use the tile's Start)".to_string())?;
 
     let project = db
         .get_project(&project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
-    let manifest = crate::commands::modules::find_manifest_for_resume(&db, RL_RERANKER_MODULE_ID)
+    let manifest = crate::commands::modules::find_manifest_for_resume(&db, &module_id)
         .ok_or_else(|| {
             format!(
                 "manifest for {} not in catalog (cannot restart container)",
-                RL_RERANKER_MODULE_ID
+                module_id
             )
         })?;
 
     let rl_port = ensure_project_rl_port(&db, &project)?;
 
     let podman = detect_container_runtime().await?;
-    let ctx = PlaceholderCtx::new(RL_RERANKER_MODULE_ID);
+    let ctx = PlaceholderCtx::new(&module_id);
     restart_container_with(
         &SystemContainerCli,
         podman,
@@ -1454,8 +1460,7 @@ pub async fn restart_rl_container(
         read_persisted_gpu_mode(),
         &db,
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// NEW-3 (2026-05-28): generic "Start" Tauri command for any installed
@@ -4929,8 +4934,32 @@ mod tests {
     /// image (`ghcr.io/hotak92/vct-rl-reranker:0.1.0`) being present.
     /// In CI without podman / without the image, the test is skipped
     /// (not a failure) to keep the suite hermetic.
-    #[tokio::test]
-    async fn v0252_d_resume_named_container_drift_persists_resolved_name() {
+    ///
+    /// v0.2.102 (W5-B follow-up) — the ORDER-FLAKE fix. This test reads
+    /// the process env (the runtime detector's pin + tool-search table)
+    /// and the runtime-verdict TTL cache while OTHER tests MUTATE both
+    /// (`storage_ux::with_fake_runtimes` pins `VCT_CONTAINER_RUNTIME` and
+    /// empties `VCT_TOOL_SEARCH_DIRS` process-wide under the env lock, and
+    /// its resolves land in the shared cache keyed without those inputs).
+    /// Co-run, the resume path resolved against a fake docker pin or a
+    /// poisoned cache and the drift assert failed. Now the whole body runs
+    /// under `with_env_vars` (both vars CLEARED — the prod default, the
+    /// real podman via the real PATH) which both stabilises the reads AND
+    /// serialises this test against every env-mutating test on the
+    /// workspace env lock, and the verdict cache is dropped at entry so an
+    /// earlier test's answer cannot decide this one's runtime.
+    #[test]
+    fn v0252_d_resume_named_container_drift_persists_resolved_name() {
+        vct_launcher_core::test_env::with_env_vars(
+            &[
+                ("VCT_CONTAINER_RUNTIME", None),
+                ("VCT_TOOL_SEARCH_DIRS", None),
+            ],
+            || {
+                vct_launcher_core::services::runtime_verdict::invalidate();
+                let rt =
+                    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(async {
         // Gate on a real podman + cached image. Skip cleanly on
         // headless CI.
         let podman_ok = std::process::Command::new("podman")
@@ -5020,6 +5049,9 @@ mod tests {
         let _ = std::process::Command::new("podman")
             .args(["rm", "-f", "vct-rl-reranker-rs-slug"])
             .output();
+                })
+            },
+        )
     }
 
     /// T4 (gate): a `status='installed'` row whose manifest declares a

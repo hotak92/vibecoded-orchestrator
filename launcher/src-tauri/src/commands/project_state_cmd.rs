@@ -295,13 +295,41 @@ pub async fn set_project_mcp_server_enabled(
     enabled: bool,
     db: State<'_, Db>,
 ) -> Result<(), String> {
-    db.set_project_mcp_server_enabled(&project_id, &mcp_name, enabled)?;
+    set_project_mcp_server_enabled_with_claude_json(
+        &db,
+        &project_id,
+        &mcp_name,
+        enabled,
+        &crate::mcp_registration::user_claude_json(),
+    )
+}
+
+/// Testable core of [`set_project_mcp_server_enabled`] (v0.2.102 W5-B C4:
+/// the per-project MCP tab's toggle).
+///
+/// Flips the `project_mcp_servers` REGISTRY row (the bundled/user-added
+/// registration the Custom-MCP surfaces read), then routes the very same
+/// (project, server) pair through
+/// [`set_project_mcp_permission_with_claude_json`] — the ONE existing
+/// writer of `~/.claude.json projects[<path>].disabledMcpServers` — so the
+/// toggle reaches Claude Code instead of only moving a launcher-DB row
+/// Claude Code never reads. One writer, two stores, one call: the tab
+/// never hand-writes `~/.claude.json` and never spawns a second mirror.
+fn set_project_mcp_server_enabled_with_claude_json(
+    db: &Db,
+    project_id: &str,
+    mcp_name: &str,
+    enabled: bool,
+    claude_json: &Path,
+) -> Result<(), String> {
+    db.set_project_mcp_server_enabled(project_id, mcp_name, enabled)?;
     db.audit(
         "project_mcp_server_set_enabled",
-        Some(&project_id),
+        Some(project_id),
         None,
         &serde_json::json!({ "mcp": mcp_name, "enabled": enabled }),
     )?;
+    set_project_mcp_permission_with_claude_json(db, project_id, mcp_name, enabled, claude_json)?;
     Ok(())
 }
 
@@ -2149,6 +2177,113 @@ mod tests {
 
         std::fs::remove_dir_all(&project_dir).ok();
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// v0.2.102 (W5-B C4): the per-project MCP tab's registry toggle must
+    /// reach Claude Code through the ONE existing writer. Disabling flips
+    /// the `project_mcp_servers` registry row AND writes the name into
+    /// `~/.claude.json projects[<path>].disabledMcpServers`; re-enabling
+    /// restores the row and REMOVES the mirrored name. Red-proof: drop the
+    /// `set_project_mcp_permission_with_claude_json` call from
+    /// `set_project_mcp_server_enabled_with_claude_json` → the disabled-set
+    /// assertions fail while the registry row still flips.
+    #[test]
+    fn set_project_mcp_server_enabled_flips_row_and_mirrors_claude_json() {
+        let db = make_db();
+        let project_dir = scratch_project_dir();
+        db.insert_project(
+            "pmt1",
+            "McpTab",
+            project_dir.to_string_lossy().as_ref(),
+            ProjectHost::Base,
+            &db.generate_unique_slug("McpTab").unwrap(),
+        )
+        .unwrap();
+        db.register_project_mcp_server(
+            "pmt1",
+            "my-custom",
+            true,
+            "user",
+            None,
+            None,
+            None,
+            &serde_json::json!({"command": "x"}),
+        )
+        .unwrap();
+        let tmp =
+            std::env::temp_dir().join(format!("vct-mcptab-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let claude_json = tmp.join(".claude.json");
+        let key = crate::mcp_registration::project_key_for_claude_json(&project_dir);
+
+        // Toggle OFF: registry row flips AND the name lands in the mirror.
+        set_project_mcp_server_enabled_with_claude_json(
+            &db, "pmt1", "my-custom", false, &claude_json,
+        )
+        .unwrap();
+        let rows = db.list_project_mcp_servers("pmt1").unwrap();
+        assert!(!rows[0].enabled, "registry row must be disabled");
+        let j1: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(
+            j1["projects"][&key]["disabledMcpServers"],
+            serde_json::json!(["my-custom"]),
+            "toggling off must write the entry: {j1}",
+        );
+
+        // Toggle ON: registry row restored AND the mirrored name removed.
+        set_project_mcp_server_enabled_with_claude_json(
+            &db, "pmt1", "my-custom", true, &claude_json,
+        )
+        .unwrap();
+        let rows = db.list_project_mcp_servers("pmt1").unwrap();
+        assert!(rows[0].enabled, "registry row must be re-enabled");
+        let j2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert!(
+            j2["projects"][&key].get("disabledMcpServers").is_none(),
+            "toggling on must remove the entry (the writer drops the key on an \
+             empty list): {j2}",
+        );
+
+        std::fs::remove_dir_all(&project_dir).ok();
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// v0.2.102 (W5-B C4): unregister removes the server for THAT project
+    /// only — a sibling project's registration of the same name survives,
+    /// and neither project's `~/.claude.json` opt-out list is touched by an
+    /// unregister (it deletes a registry row, not a permission gate).
+    #[test]
+    fn unregister_project_mcp_server_removes_only_that_projects_row() {
+        let db = make_db();
+        seed_project(&db, "pU1", "U1");
+        seed_project(&db, "pU2", "U2");
+        let cfg = serde_json::json!({"command": "x"});
+        for pid in ["pU1", "pU2"] {
+            db.register_project_mcp_server(
+                pid, "searxng", true, "user", None, None, None, &cfg,
+            )
+            .unwrap();
+        }
+
+        // Same DB writes the command performs.
+        db.unregister_project_mcp_server("pU1", "searxng").unwrap();
+        db.audit(
+            "project_mcp_server_unregister",
+            Some("pU1"),
+            None,
+            &serde_json::json!({ "mcp": "searxng" }),
+        )
+        .unwrap();
+
+        assert!(
+            db.list_project_mcp_servers("pU1").unwrap().is_empty(),
+            "the unregistered project's row must be gone",
+        );
+        let other = db.list_project_mcp_servers("pU2").unwrap();
+        assert_eq!(other.len(), 1, "the other project keeps its row");
+        assert_eq!(other[0].mcp_name, "searxng");
     }
 
     /// Per-project isolation: disabling a server for project A does NOT

@@ -4233,6 +4233,50 @@ mod tests {
 
     }
 
+    /// v0.2.102 (W5-B S3): the deprecation field must flow from the L0
+    /// catalog row to the catalog entry the GUI renders — that entry is
+    /// what `DeprecationBanner.svelte` keys on (`deprecatedInstalled` =
+    /// `m.deprecated && installed`). An L0 row marked deprecated with an
+    /// installed row produces `deprecated=true` + the message; the same
+    /// module unmarked produces `false`. Red-proof: drop the
+    /// `deprecated: l0.deprecated` copy in `ModuleCatalogEntry::from_l0`
+    /// → the true-case assertions fail.
+    #[test]
+    fn list_module_catalog_carries_l0_deprecation_to_the_entry() {
+        let (_lock, _tmp) = isolate_state();
+        let db = open_db();
+
+        // Deprecated + installed: the banner case.
+        let mut l0 = fake_l0_rl("0.2.7");
+        l0.deprecated = true;
+        l0.deprecation_message = "Use v2; EOL 2027-01-01.".into();
+        l0.deprecation_eol_date = "2027-01-01".into();
+        seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Installed);
+        let response =
+            list_module_catalog_impl_with_l0(&db, ok_envelope(vec![l0]));
+        let entry = response
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("L0 entry present");
+        assert!(entry.deprecated, "deprecated must reach the catalog entry");
+        assert_eq!(entry.deprecation_message, "Use v2; EOL 2027-01-01.");
+        assert_eq!(entry.deprecation_eol_date, "2027-01-01");
+        assert_eq!(entry.kind, "installed");
+
+        // Same module, unmarked: the not-otherwise case.
+        let db2 = open_db();
+        seed_install(&db2, "vct-rl-reranker", "0.2.7", ModuleStatus::Installed);
+        let response2 =
+            list_module_catalog_impl_with_l0(&db2, ok_envelope(vec![fake_l0_rl("0.2.7")]));
+        let entry2 = response2
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("L0 entry present");
+        assert!(!entry2.deprecated, "an unmarked row must stay undeprecated");
+    }
+
     /// Test 2: L0 returns RL with version=0.2.7, no install row →
     /// kind=available, version=0.2.7.
     #[test]

@@ -475,10 +475,119 @@ pub fn render_override_yaml(cfg: &StorageConfig) -> String {
 /// [`compose_override_sibling_path`].
 pub fn write_compose_override(body: &str) -> Result<PathBuf, String> {
     let path = compose_override_path()?;
-    write_override_yaml_to(&path, body)?;
     let sibling = compose_override_sibling_path()?;
-    write_override_yaml_to(&sibling, body)?;
-    Ok(path)
+    write_compose_override_at(&path, &sibling, body)
+}
+
+/// [`write_compose_override`]'s testable core: applies the divergent-pair
+/// guard, then mirrors `body` to BOTH auto-load names.
+///
+/// v0.2.102 (W5-B follow-up, from W5-A's P299-B2 rule): never overwrite
+/// a DIVERGENT pair — one of the halves may be a hand edit that kept
+/// the managed marker, and mirroring one body to both names would
+/// silently discard it. Same refusal as the Python adoption writer
+/// (`vco_lib.service_adoption.write_adoption_override`); the decision
+/// itself comes from the ONE shared rule (see
+/// [`override_pair_divergent`]).
+fn write_compose_override_at(path: &Path, sibling: &Path, body: &str) -> Result<PathBuf, String> {
+    if override_pair_divergent(path.parent().expect("override path has a parent"))? {
+        return Err(divergent_override_pair_refusal(path.parent().unwrap()));
+    }
+    write_override_yaml_to(path, body)?;
+    write_override_yaml_to(sibling, body)?;
+    Ok(path.to_path_buf())
+}
+
+/// Is the compose-override PAIR in `infra_dir` divergent (both auto-load
+/// halves present and holding DIFFERENT configurations)?
+///
+/// Cross-language rule (A>B>C, option A): the "are these two YAML files
+/// the same config?" decision belongs to ONE implementation —
+/// `vco_lib.compose_override_pair.classify_pair` — which we call through
+/// the existing `python -c` subprocess pattern (same resolver + bounded
+/// runner as the deferral bridge). Rust decides only the trivial
+/// half: do both files exist. After the W5-A merge the Python module also
+/// exposes `pair_state`/`divergent_pair_refusal` wrapping exactly this
+/// classify call for the adoption writer; this function is the Rust-side
+/// twin of that wrapper, so the two override writers cannot disagree
+/// about what "the same config" means.
+///
+/// FALLBACK (option C, narrow): when Python cannot be asked (no
+/// interpreter resolved, spawn/import failure, timeout) we fall back to
+/// BYTE equality — identical bytes proceed, different bytes refuse. That
+/// is strictly the conservative arm of `classify_pair` itself (its own
+/// rule: unreadable / unparsable / PyYAML-missing ⇒ divergent), so the
+/// fallback can only ever refuse MORE than the shared rule, never less;
+/// a comment-only drift that Python would call `semantic_equal` is
+/// refused until Python is back. MUST MATCH `classify_pair`'s verdict
+/// table — pinned by `override_pair_guard_matches_the_python_rule` below
+/// on every fixture class both can decide.
+fn override_pair_divergent(infra_dir: &Path) -> Result<bool, String> {
+    let legacy = infra_dir.join("docker-compose.override.yml");
+    let canonical = infra_dir.join("compose.override.yaml");
+    if !legacy.is_file() || !canonical.is_file() {
+        // Absent or single — nothing to diverge (pair_state's own first
+        // two arms, in the only place they need Rust).
+        return Ok(false);
+    }
+    match python_classify_override_pair(&legacy, &canonical) {
+        Some(verdict) => Ok(verdict == "divergent"),
+        None => {
+            // Couldn't ask the shared rule — conservative byte fallback.
+            let a = std::fs::read(&legacy).map_err(|e| format!("read {}: {e}", legacy.display()))?;
+            let b = std::fs::read(&canonical)
+                .map_err(|e| format!("read {}: {e}", canonical.display()))?;
+            Ok(a != b)
+        }
+    }
+}
+
+/// Ask the ONE shared rule (`vco_lib.compose_override_pair.classify_pair`)
+/// whether the two halves hold the same configuration. `Some(verdict)` is
+/// one of `identical` / `semantic_equal` / `divergent`; `None` means the
+/// rule could not be asked at all (no interpreter, spawn failure, bad
+/// output) — never a config judgement.
+fn python_classify_override_pair(legacy: &Path, canonical: &Path) -> Option<String> {
+    let python = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()?;
+    let root = super::installer::find_local_repo_root().ok()?;
+    let script = format!(
+        "import sys\nsys.path.insert(0, {})\nfrom pathlib import Path\n\
+         from vco_lib.compose_override_pair import classify_pair\n\
+         print(classify_pair(Path({}), Path({})))\n",
+        vct_launcher_core::services::deferral_bridge::py_quote(
+            &root.to_string_lossy()
+        ),
+        vct_launcher_core::services::deferral_bridge::py_quote(&legacy.to_string_lossy()),
+        vct_launcher_core::services::deferral_bridge::py_quote(
+            &canonical.to_string_lossy()
+        ),
+    );
+    let mut cmd = std::process::Command::new(python).silent();
+    cmd.arg("-c").arg(script);
+    let out = vct_launcher_core::process::output_bounded(
+        &mut cmd,
+        None,
+        std::time::Duration::from_secs(10),
+    )
+    .ok()?;
+    let verdict = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    match verdict.as_str() {
+        "identical" | "semantic_equal" | "divergent" => Some(verdict.to_string()),
+        _ => None,
+    }
+}
+
+/// The refusal text — the same shape as the Python adoption writer's
+/// `divergent_pair_refusal` (vco_lib/compose_override_pair.py): names both
+/// halves, says why, and the two ways out. Keep the wording aligned with
+/// the Python twin so a user reading either surface sees one message.
+fn divergent_override_pair_refusal(infra_dir: &Path) -> String {
+    format!(
+        "{} and {} hold DIFFERENT configurations (one may be a hand edit) — refusing to \
+         overwrite either; make them agree (or delete the stale one), then re-run",
+        infra_dir.join("compose.override.yaml").display(),
+        infra_dir.join("docker-compose.override.yml").display(),
+    )
 }
 
 /// Atomic write to an arbitrary target path. Used by
@@ -749,6 +858,36 @@ async fn detect_legacy_volumes_inner() -> Vec<DetectedLegacyVolume> {
 // Deferral routing — Rust -> Python helper
 // ---------------------------------------------------------------------------
 
+// This thread's deferral-emission root override. Thread-local on purpose
+// — the same shape as `paths::with_lookup_path`: the override lasts
+// exactly the driving thread's test body. (Plain comment: a doc comment
+// on a macro invocation is dropped by rustc.)
+thread_local! {
+    static DEFERRAL_ROOT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Point THIS thread's storage-deferral emissions at `root` (a tempdir),
+/// or restore checkout resolution with `None`. Test seam — production
+/// never calls it. Used by [`fake_runtime_support::with_fake_runtimes`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn set_deferral_root_for_tests(root: Option<PathBuf>) {
+    DEFERRAL_ROOT_OVERRIDE.with(|r| *r.borrow_mut() = root);
+}
+
+/// The current override, if any (the getter half of the test seam; pins
+/// the panic-safety of [`fake_runtime_support::with_fake_runtimes`]'s
+/// restore). Always compiled like the setter — the module's own
+/// `volume_rm_only_callable_from_migrate_volumes` guard scans the source
+/// up to the file's first test-only attribute marker, and a test-gated
+/// item this early would truncate that scan before `migrate_volumes` is
+/// even defined (this is why the marker string does not appear here
+/// verbatim, either).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn deferral_root_override_for_tests() -> Option<PathBuf> {
+    DEFERRAL_ROOT_OVERRIDE.with(|r| r.borrow().clone())
+}
+
 /// Spawn a `python` (or `python3`) child to add a deferral entry via
 /// `vco_lib.deferral_report`. Used when a migration partially succeeded
 /// or when override.yml carried user customizations we don't want to
@@ -758,6 +897,15 @@ async fn detect_legacy_volumes_inner() -> Vec<DetectedLegacyVolume> {
 /// subprocess returns non-zero) is logged and swallowed so the caller's
 /// error path still proceeds. Deferrals are an FYI mechanism — we don't
 /// want a failure HERE to mask the original failure THERE.
+///
+/// v0.2.102 (W5-B follow-up, the checkout-leak fix): the emission root is
+/// REDIRECTABLE per thread (see [`set_deferral_root_for_tests`] below).
+/// Production never sets the override and the root keeps resolving the
+/// checkout; tests that drive a migration command into a deferral branch
+/// ([`fake_runtime_support::with_fake_runtimes`]) point it at their
+/// tempdir so a test can never write a ledger or a reminder block into
+/// the real checkout (pinned by
+/// `tests/test_v0294_tracked_stub_carries_no_operational_state.py`).
 fn emit_deferral(
     condition_id: &str,
     title: &str,
@@ -766,9 +914,12 @@ fn emit_deferral(
     command_to_apply: &str,
     severity: &str,
 ) {
-    let repo_root = match super::installer::find_local_repo_root() {
-        Ok(r) => r,
-        Err(_) => return,
+    let repo_root = match DEFERRAL_ROOT_OVERRIDE.with(|r| r.borrow().clone()) {
+        Some(root) => root,
+        None => match super::installer::find_local_repo_root() {
+            Ok(r) => r,
+            Err(_) => return,
+        },
     };
     // v0.2.77 (Part 7c task 4): the shared Python-bridge deferral writer
     // owns interpreter resolution + the injection-safe `-c` snippet +
@@ -2671,6 +2822,24 @@ pub(crate) mod fake_runtime_support {
     /// Run `fut` on THIS thread (a current-thread runtime), with `dir` as the
     /// only lookup PATH and `pin` as `VCT_CONTAINER_RUNTIME` (under the
     /// workspace env lock, restored afterwards).
+    ///
+    /// v0.2.102 (W5-B follow-up) — two isolation duties, both fixing the
+    /// order-flake pair with `v0252_d_resume_named_container_drift_persists_
+    /// resolved_name` (module_service):
+    ///
+    ///  1. The runtime-verdict TTL cache (`runtime_verdict::decide_cached`)
+    ///     is keyed on (install_root, mode, purpose) — NOT on the decision
+    ///     inputs this harness changes (the pin, the tool-search table, the
+    ///     lookup PATH). A test that resolved podman earlier in this process
+    ///     (the real-podman resume test does) would answer for us, so a
+    ///     fresh resolve under OUR env requires dropping the cache first.
+    ///     Done under the env lock, so no other env-pinned resolve can
+    ///     interleave.
+    ///  2. Any deferral a driven migration command emits lands in `dir`,
+    ///     never in the checkout (see [`super::emit_deferral`]'s override).
+    ///     Before this, the flaked refusal branch ran a REAL `cp -a`,
+    ///     soft-failed, and wrote `.claude/context/UPDATE_DEFERRED.md` +
+    ///     the CLAUDE.md reminder block INTO THE CHECKOUT.
     pub(crate) fn with_fake_runtimes<T>(
         dir: &Path,
         pin: Option<&str>,
@@ -2688,6 +2857,21 @@ pub(crate) mod fake_runtime_support {
                 ("VCT_TOOL_SEARCH_DIRS", Some("")),
             ],
             || {
+                vct_launcher_core::services::runtime_verdict::invalidate();
+                // Panic-safe restore (review B3): a drop guard, so a test
+                // whose future panics cannot leak the override onto the
+                // next test scheduled on this thread (the leaked value is
+                // a dead tempdir — never the checkout — but a stale
+                // override would silently misdirect every later emission
+                // on the thread).
+                struct RestoreDeferralRoot;
+                impl Drop for RestoreDeferralRoot {
+                    fn drop(&mut self) {
+                        super::set_deferral_root_for_tests(None);
+                    }
+                }
+                let _restore = RestoreDeferralRoot;
+                super::set_deferral_root_for_tests(Some(dir.to_path_buf()));
                 let rt =
                     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 out = Some(vct_launcher_core::paths::with_lookup_path(Some(dir.as_os_str()), || {
@@ -2696,6 +2880,29 @@ pub(crate) mod fake_runtime_support {
             },
         );
         out.unwrap()
+    }
+
+    /// B3 pin: a PANICKING future must not leak the deferral-root override
+    /// onto this thread. Red-proof: replace the drop guard with a trailing
+    /// `set_deferral_root_for_tests(None)` (the pre-fix shape) and this
+    /// fails — the override survives the caught panic.
+    #[cfg(unix)]
+    #[test]
+    fn a_panicking_future_does_not_leak_the_deferral_root_override() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let dir = tempfile::tempdir().unwrap();
+        let prior_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            with_fake_runtimes(dir.path(), None, async { panic!("W5B-B3 pin: expected") });
+        }));
+        std::panic::set_hook(prior_hook);
+        assert!(result.is_err(), "the fixture future must have panicked");
+        assert!(
+            super::deferral_root_override_for_tests().is_none(),
+            "the override survived a panicking test — the next test on this \
+             thread would emit into a dead tempdir",
+        );
     }
 }
 
@@ -3230,6 +3437,186 @@ mod tests {
         assert!(target.exists());
         let body = std::fs::read_to_string(&target).unwrap();
         assert_eq!(body, "services: {}\n");
+    }
+
+    // ----- v0.2.102 (W5-B follow-up): the divergent-pair write guard ------
+
+    /// Fixture: an infra dir whose two auto-load halves hold `legacy_body`
+    /// and `canonical_body` (a half passed `None` is not created).
+    fn override_pair_fixture(
+        legacy_body: Option<&str>,
+        canonical_body: Option<&str>,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(b) = legacy_body {
+            std::fs::write(dir.path().join("docker-compose.override.yml"), b).unwrap();
+        }
+        if let Some(b) = canonical_body {
+            std::fs::write(dir.path().join("compose.override.yaml"), b).unwrap();
+        }
+        dir
+    }
+
+    const MANAGED_A: &str = "# Auto-generated by VCT Launcher\nservices:\n  a:\n    image: one\n";
+    const MANAGED_B: &str = "# Auto-generated by VCT Launcher\nservices:\n  a:\n    image: two\n";
+
+    /// ACT arm (refuse): a DIVERGENT pair — both halves present, both even
+    /// carrying the managed marker, but different configs — makes
+    /// `override_pair_divergent` true and the refusal name both halves.
+    /// Red-proof: delete the guard call in `write_compose_override` and
+    /// this fails (the guard answers false).
+    #[test]
+    fn divergent_override_pair_is_detected_and_refused() {
+        let dir = override_pair_fixture(Some(MANAGED_A), Some(MANAGED_B));
+        assert!(
+            override_pair_divergent(dir.path()).unwrap(),
+            "a byte-different pair must read as divergent",
+        );
+        let refusal = divergent_override_pair_refusal(dir.path());
+        for needle in [
+            "compose.override.yaml",
+            "docker-compose.override.yml",
+            "DIFFERENT configurations",
+            "refusing to overwrite either",
+        ] {
+            assert!(refusal.contains(needle), "{needle:?} missing from {refusal:?}");
+        }
+    }
+
+    /// LEAVE-ALONE arms (write proceeds): equal pair, single halves, and
+    /// no pair at all are NOT divergent — the guard must refuse exactly
+    /// the divergent case, never block a legitimate (re)write.
+    #[test]
+    fn equal_or_partial_override_pairs_are_not_divergent() {
+        // Byte-identical pair.
+        let dir = override_pair_fixture(Some(MANAGED_A), Some(MANAGED_A));
+        assert!(!override_pair_divergent(dir.path()).unwrap());
+        // Single halves — nothing to diverge.
+        let dir = override_pair_fixture(Some(MANAGED_A), None);
+        assert!(!override_pair_divergent(dir.path()).unwrap());
+        let dir = override_pair_fixture(None, Some(MANAGED_A));
+        assert!(!override_pair_divergent(dir.path()).unwrap());
+        // No pair at all.
+        let dir = override_pair_fixture(None, None);
+        assert!(!override_pair_divergent(dir.path()).unwrap());
+    }
+
+    /// The guarded WRITER's act/leave-alone arms, end to end on a temp
+    /// pair (`write_compose_override` resolves the CHECKOUT's
+    /// infrastructure dir; the core takes paths so the arms can be driven
+    /// against fixtures — the guard logic is identical).
+    #[test]
+    fn guarded_pair_write_leaves_a_divergent_pair_alone_and_rewrites_an_equal_one() {
+        // DIVERGENT: the write is refused and BOTH halves keep their bytes.
+        let dir = override_pair_fixture(Some(MANAGED_A), Some(MANAGED_B));
+        let canonical = dir.path().join("compose.override.yaml");
+        let legacy = dir.path().join("docker-compose.override.yml");
+        let err = write_compose_override_at(&canonical, &legacy, "services: {new: true}\n")
+            .expect_err("a divergent pair must refuse the write");
+        assert!(err.contains("refusing to overwrite either"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&canonical).unwrap(),
+            MANAGED_B,
+            "the canonical half must be untouched",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            MANAGED_A,
+            "the legacy half must be untouched",
+        );
+
+        // EQUAL: the write proceeds and BOTH halves carry the new body.
+        let dir = override_pair_fixture(Some(MANAGED_A), Some(MANAGED_A));
+        let canonical = dir.path().join("compose.override.yaml");
+        let legacy = dir.path().join("docker-compose.override.yml");
+        write_compose_override_at(&canonical, &legacy, "services: {new: true}\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&canonical).unwrap(), "services: {new: true}\n");
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "services: {new: true}\n");
+
+        // SINGLE half: also written (nothing to diverge).
+        let dir = override_pair_fixture(None, Some(MANAGED_A));
+        let canonical = dir.path().join("compose.override.yaml");
+        let legacy = dir.path().join("docker-compose.override.yml");
+        write_compose_override_at(&canonical, &legacy, "services: {new: true}\n").unwrap();
+        assert!(legacy.is_file(), "the missing half is created (the mirror)");
+    }
+
+    /// PARITY (the "must match" pin for the subprocess leg): on every
+    /// fixture class the shared Python rule can decide, the Rust guard's
+    /// verdict equals `classify_pair`'s. Drives the REAL
+    /// `vco_lib.compose_override_pair.classify_pair` through the REAL
+    /// interpreter (the same call `python_classify_override_pair` makes).
+    ///
+    /// Skip discipline (review B2, v0.2.102): the ONLY acceptable skip is
+    /// a machine that POSITIVELY lacks a Python for vco_lib (the resolver
+    /// answers None) — announced on stderr. When an interpreter resolves,
+    /// a `None` answer from the subprocess leg is a BROKEN cross-language
+    /// pin and FAILS the test loudly; it may never silently pass green
+    /// (that would let the "must match" promise rot invisibly).
+    #[test]
+    fn override_pair_guard_matches_the_python_rule() {
+        let cases: &[(&str, Option<&str>, Option<&str>, bool)] = &[
+            ("identical", Some(MANAGED_A), Some(MANAGED_A), false),
+            // Comment-only drift: Python says semantic_equal (NOT divergent)
+            // — the one class the byte fallback cannot see. If this ever
+            // regresses to `true`, the Rust side has stopped reaching the
+            // shared rule and is silently refusing equal configs.
+            (
+                "semantic_equal",
+                Some("# managed\nservices: {}\n"),
+                Some("# managed — edited comment\nservices: {}\n"),
+                false,
+            ),
+            ("divergent", Some(MANAGED_A), Some(MANAGED_B), true),
+        ];
+
+        // The one visible skip: this environment positively has no Python.
+        let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+        else {
+            eprintln!(
+                "SKIPPED (visible): no python interpreter resolves for vco_lib on this \
+                 machine — the cross-language parity leg cannot run"
+            );
+            return;
+        };
+        // A resolved interpreter that cannot run `-c pass` is ALSO a
+        // positively-known environment fact, not a silent pass.
+        if std::process::Command::new(&python)
+            .arg("-c")
+            .arg("pass")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "SKIPPED (visible): resolved {} is not spawnable — the parity \
+                 leg cannot run",
+                python.display()
+            );
+            return;
+        }
+
+        for (name, legacy, canonical, expect_divergent) in cases {
+            let dir = override_pair_fixture(*legacy, *canonical);
+            // Ask Python directly — the same snippet shape the guard uses.
+            let legacy_p = dir.path().join("docker-compose.override.yml");
+            let canonical_p = dir.path().join("compose.override.yaml");
+            let Some(verdict) = python_classify_override_pair(&legacy_p, &canonical_p) else {
+                // Python resolved and spawns, but the rule could not be
+                // asked: the subprocess leg is BROKEN — fail loudly.
+                panic!(
+                    "fixture {name}: the shared classify_pair rule could not be \
+                     asked although {} resolves and spawns — the cross-language \
+                     parity leg is broken (spawn / import / output shape)",
+                    python.display(),
+                );
+            };
+            let got = override_pair_divergent(dir.path()).unwrap();
+            assert_eq!(
+                got, *expect_divergent,
+                "fixture {name}: python said {verdict:?}, guard said divergent={got}",
+            );
+        }
     }
 
     // ----- Path-resolution ------------------------------------------------

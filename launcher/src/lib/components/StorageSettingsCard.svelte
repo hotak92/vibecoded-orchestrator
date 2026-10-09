@@ -19,6 +19,18 @@
   import { invoke } from '$lib/tauri';
   import { pickDirectory } from '$lib/dialog';
   import { toast } from '$lib/stores/toast';
+  // v0.2.102 (W5-B): the volume-data migration panel + its confirm modal.
+  // Both commands COPY (cp -a) and never delete the source; the modal says
+  // so, and the pure copy/validation live in the module.
+  import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import {
+    CANONICAL_VOLUMES,
+    migrationArgs,
+    validationError,
+    modalCopy,
+    type MigrationDirection,
+    type MigrationOutcome,
+  } from '$lib/components/storage-migration-panel';
 
   type StorageMode = 'named' | 'bind';
 
@@ -86,6 +98,17 @@
     });
     if (picked) {
       bindRoot = picked;
+    }
+  }
+
+  async function browseMigrationFolder() {
+    const picked = await pickDirectory({
+      title: migDirection === 'to_bind'
+        ? `Choose the folder to copy ${migVolume} INTO`
+        : `Choose the folder to copy INTO ${migVolume}`,
+    });
+    if (picked) {
+      migPath = picked;
     }
   }
 
@@ -164,6 +187,64 @@
 
   // Are any external aliases pinned right now?
   const aliasKeys = $derived(Object.keys(externalAliases));
+
+  // ─── v0.2.102 (W5-B): volume-data migration ───────────────────────────
+  //
+  // The two migration commands the storage backend ships
+  // (`migrate_to_named_volume`, `migrate_to_bind_path`) — both COPY with
+  // cp -a and never delete the source. Confirm-gated: the modal is the
+  // ONLY path to the invoke (never auto-run), its copy states what moves
+  // where and that nothing is deleted, and Cancel leaves everything
+  // untouched.
+  let migDirection = $state<MigrationDirection>('to_bind');
+  let migVolume = $state<string>(CANONICAL_VOLUMES[0]);
+  let migPath = $state('');
+  let migModalOpen = $state(false);
+  let migrating = $state(false);
+
+  const migError = $derived(validationError(migDirection, migVolume, migPath));
+  const migCopy = $derived(modalCopy(migDirection, migVolume, migPath));
+
+  function requestMigration() {
+    // The button is disabled while invalid; this guard is belt-and-braces.
+    if (migError !== null) return;
+    migModalOpen = true;
+  }
+
+  function cancelMigration() {
+    // Cancel arm: close and change nothing.
+    migModalOpen = false;
+  }
+
+  async function runMigration() {
+    const args = migrationArgs(migDirection, migVolume, migPath);
+    if (args === null) {
+      migModalOpen = false;
+      return;
+    }
+    migModalOpen = false;
+    migrating = true;
+    try {
+      // Literal invokes per direction (not a computed name) — the
+      // invoke-name census must see both commands.
+      const out =
+        migDirection === 'to_named'
+          ? await invoke<MigrationOutcome>('migrate_to_named_volume', args)
+          : await invoke<MigrationOutcome>('migrate_to_bind_path', args);
+      if (out.success) {
+        toast.success(`Migration done. ${out.message}`);
+      } else {
+        toast.error(`Migration did not complete: ${out.message}`);
+      }
+      if (out.deferral_emitted) {
+        toast.info('A deferral entry was recorded — see UPDATE_DEFERRED.md for the manual command.');
+      }
+    } catch (e) {
+      toast.error(`Migration failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      migrating = false;
+    }
+  }
 </script>
 
 <section class="storage-card">
@@ -369,6 +450,63 @@
       </fieldset>
     {/if}
 
+    <!-- v0.2.102 (W5-B): volume-data migration. A COPY in either direction
+         (cp -a under the hood) — nothing is deleted; the confirm modal says
+         exactly what moves where before anything runs. -->
+    <fieldset class="mig-form">
+      <legend>Migrate volume data</legend>
+      <p class="hint">
+        Copy a volume's data between a named volume and a folder on disk.
+        This is a copy — the source is left in place, nothing is deleted.
+        Applies on top of the mode above: switch the mode (and Apply, then
+        restart containers) first, then migrate the data across.
+      </p>
+      <div class="mig-grid">
+        <label class="radio-row">
+          <input type="radio" bind:group={migDirection} value="to_bind" />
+          <span class="radio-label"><strong>Named volume → folder</strong></span>
+        </label>
+        <label class="radio-row">
+          <input type="radio" bind:group={migDirection} value="to_named" />
+          <span class="radio-label"><strong>Folder → named volume</strong></span>
+        </label>
+        <label class="path-label">
+          Volume
+          <select bind:value={migVolume}>
+            {#each CANONICAL_VOLUMES as v}
+              <option value={v}>{v}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="path-label">
+          {migDirection === 'to_bind' ? 'Target folder' : 'Source folder'}
+          <div class="path-input-wrap">
+            <input
+              type="text"
+              bind:value={migPath}
+              placeholder="(absolute path)"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <button type="button" class="browse" onclick={browseMigrationFolder}>
+              Browse…
+            </button>
+          </div>
+        </label>
+      </div>
+      {#if migError}
+        <p class="hint mig-error">{migError}</p>
+      {/if}
+      <button
+        type="button"
+        class="primary"
+        disabled={migError !== null || migrating || saving}
+        onclick={requestMigration}
+      >
+        {migrating ? 'Migrating…' : 'Migrate…'}
+      </button>
+    </fieldset>
+
     <footer class="actions">
       <div class="path-info">
         <span class="muted">Config file:</span>
@@ -386,11 +524,34 @@
     <p class="hint footer-hint">
       After saving, restart containers via Services to pick up the new
       storage configuration. Existing data is not moved automatically —
-      use the per-volume migration helpers in the docs to rsync data
-      between paths.
+      use "Migrate volume data" above to copy it between locations.
     </p>
   {/if}
 </section>
+
+<!-- v0.2.102 (W5-B): the migration confirm modal. Act (Continue) runs the
+     copy; Cancel closes and changes nothing. Never auto-opened. -->
+{#if migModalOpen}
+<DialogRoot bind:open={migModalOpen} width="480px" onClose={cancelMigration}>
+  {#snippet header()}
+    <div class="mig-modal-header">
+      <h2>{migCopy.title}</h2>
+      <button type="button" class="ow-modal-x" onclick={cancelMigration} aria-label="Close" title="Close">×</button>
+    </div>
+  {/snippet}
+  {#snippet body()}
+    <p class="mig-modal-body">{migCopy.body}</p>
+  {/snippet}
+  {#snippet footer()}
+    <div class="mig-modal-actions">
+      <button type="button" class="browse" onclick={cancelMigration}>Cancel</button>
+      <button type="button" class="primary" onclick={() => void runMigration()}>
+        Continue
+      </button>
+    </div>
+  {/snippet}
+</DialogRoot>
+{/if}
 
 <style>
   /* v0.2.46: replaced undefined --bg-* and --text-* tokens (which all fell
@@ -683,6 +844,42 @@
   .footer-hint {
     margin-top: 0.75rem;
   }
+
+  /* v0.2.102 (W5-B): migration panel + confirm modal (canonical recipe). */
+  .mig-form .mig-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem 1rem;
+    margin: 0.5rem 0;
+  }
+  .mig-form .path-label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 11px;
+    color: #888;
+    font-weight: 500;
+  }
+  .mig-form select {
+    padding: 6px 10px;
+    background: rgba(255,255,255,0.05);
+    color: inherit;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 13px;
+  }
+  .mig-error { color: #f99; }
+  .mig-modal-header {
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .mig-modal-header h2 { margin: 0; font-size: 15px; }
+  .ow-modal-x {
+    background: none; border: none; color: inherit; font-size: 18px;
+    cursor: pointer; padding: 0 4px;
+  }
+  .mig-modal-body { margin: 0 0 10px; color: #ccc; font-size: 13px; line-height: 1.5; }
+  .mig-modal-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
 
   .muted {
     color: #888;

@@ -173,6 +173,29 @@ pub fn with_lookup_path<T>(path: Option<&std::ffi::OsStr>, f: impl FnOnce() -> T
     f()
 }
 
+/// The lookup path THIS thread has injected via [`with_lookup_path`], when
+/// one is active (debug/test builds only — the injection surface itself is
+/// `cfg(debug_assertions)`). Release builds always answer `None`.
+///
+/// v0.2.102 (W5-B follow-up): the runtime-verdict cache key includes this
+/// so two tests with different injected PATHs can never read each other's
+/// cached verdict — the order-flake where a fake-runtime test resolved
+/// another test's real runtime out of the shared cache. Same-process
+/// callers with no injection share the empty key, as before.
+#[cfg(debug_assertions)]
+pub(crate) fn current_injected_lookup_path() -> Option<std::ffi::OsString> {
+    INJECTED_LOOKUP_PATH.with(|cell| match cell.borrow().as_ref() {
+        Some(Some(p)) => Some(p.clone()),
+        // Not injected, or explicitly unset — both mean "the real PATH".
+        _ => None,
+    })
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn current_injected_lookup_path() -> Option<std::ffi::OsString> {
+    None
+}
+
 /// Relative hops from the launcher binary's own directory to a candidate
 /// orchestrator-clone root, probed as `<exe_dir>/<hop>/.claude/scripts/<bin>`.
 ///

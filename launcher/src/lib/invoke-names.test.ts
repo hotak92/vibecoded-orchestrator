@@ -140,11 +140,18 @@ const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string; c
   // v0.2.101 Q4: apply_module_db_migrations left this table — it is now
   // invoked by the module tile's "Re-apply DB migrations" repair action
   // (ModuleCatalog), gated on the recorded last-apply failure state.
-  migrate_to_bind_path: { class: 'owner-deferred', reason: OWNER_0102 },
-  migrate_to_named_volume: { class: 'owner-deferred', reason: OWNER_0102 },
+  // v0.2.102 (W5-B) — six commands left this table by GAINING their
+  // reachable component (each is now a literal invoke; the census test
+  // below fails if the caller disappears):
+  //   - preflight_install_safety_check → OnboardingWizard's install-confirm
+  //     panel (onboarding-safety.wiring.test.ts)
+  //   - read_install_log → project SettingsTab "Install log" panel
+  //     (install-log-panel.wiring.test.ts)
+  //   - migrate_to_bind_path / migrate_to_named_volume → Storage page's
+  //     "Migrate volume data" confirm modal (storage-migration.wiring.test.ts)
+  //   - set_project_mcp_server_enabled / unregister_project_mcp_server →
+  //     the project page's MCP registry tab (mcp-tab.wiring.test.ts)
   perform_hard_cut: { class: 'owner-deferred', reason: OWNER_030 },
-  preflight_install_safety_check: { class: 'owner-deferred', reason: OWNER_0102 },
-  read_install_log: { class: 'owner-deferred', reason: OWNER_0102 },
   // v0.2.101 Q4: retired commands are GONE from generate_handler!, so they
   // cannot be listed here (the stale-entry assertion would fail):
   // check_for_weights_update_now, delete_project_codegraph_binding (and
@@ -165,12 +172,13 @@ const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string; c
   // entry here at first) was then REMOVED by owner decision 2026-10-08:
   // it is in neither generate_handler! nor this map now, and either
   // half coming back alone fails a census test below.
-  restart_rl_container: {
-    class: 'owner-deferred',
-    reason: 'owner 2026-10-05: kept unwired for future RL module enablement ("we need to enable the module later on"); a generic module Restart on the tile would subsume it (v0.2.102+)',
-  },
-  set_project_mcp_server_enabled: { class: 'owner-deferred', reason: OWNER_0102 },
-  unregister_project_mcp_server: { class: 'owner-deferred', reason: OWNER_0102 },
+  // v0.2.102 (W5-B, OD-11): restart_rl_container is RETIRED — removed
+  // from generate_handler! and from this map — superseded by the generic
+  // `restart_module_container` (any installed module, the tile's Restart
+  // button, modules-restart.wiring.test.ts). The owner ruling this entry
+  // carried read: "kept unwired for future RL module enablement ('we need
+  // to enable the module later on'); a generic module Restart on the tile
+  // would subsume it (v0.2.102+)" — OD-11 approved exactly that.
 };
 
 // ─── the tree ──────────────────────────────────────────────────────────────
