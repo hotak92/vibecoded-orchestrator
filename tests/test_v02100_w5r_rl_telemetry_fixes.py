@@ -359,8 +359,14 @@ def test_hook_process_latency_with_a_hung_hub(tmp_path):
     assert timings["detached_main"] < 1.0, timings
     assert timings["inline"] - timings["detached"] >= 3.5, timings
     # The worst case (wedged hub AND hung secondary) costs pre-tool-use only
-    # its 0.4 s embed cap over the fast detached run — machine-independent.
-    assert timings["pre_tool_use_worst_main"] < 0.4 + 0.5, timings
+    # its 0.4 s embed cap over the fast detached run. The cap is wall-clock;
+    # the process overhead around it is not — under a loaded machine (a full
+    # suite beside a cargo build) the detached run itself went 0.08 s -> 0.31 s
+    # and this leg 0.43 s -> 1.2 s. So the slack scales with the measured
+    # detached baseline instead of being a fixed number; a hung secondary
+    # (30 s) or a POST back on the critical path (2 s each) still fails it.
+    slack = 0.5 + 3 * timings["detached_main"]
+    assert timings["pre_tool_use_worst_main"] < 0.4 + slack, timings
     assert timings["pre_tool_use_worst"] - timings["detached"] < 0.4 + 0.5, timings
 
 
