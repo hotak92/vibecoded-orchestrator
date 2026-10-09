@@ -33,6 +33,13 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   $VCT_DISABLE_HOOKS    — set to non-empty to bypass entirely.
 #   $VCO_HOOK_DEBUG=1     — verbose stderr, and run the spawn in the
 #                           foreground (`--wait`) so its exit code is known.
+#
+# v0.2.102 (S16-13 / OD-7): a launcher this hook starts with --start-hidden
+# and leaves in the tray RELAUNCHES ITSELF into the refreshed dist binary
+# when a launcher_binary_stale record exists, no window is visible, no
+# update is in flight and no modal is pending (the launcher's own periodic
+# check; this hook never kills GUI processes). Nothing for this hook to do
+# beyond starting it hidden.
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 

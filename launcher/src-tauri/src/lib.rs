@@ -681,6 +681,26 @@ pub fn run() {
         std::process::exit(exit_code);
     }
 
+    // v0.2.102 review fix 3 (coordinator ruling): when THIS process was
+    // started as a relaunch child (`--vct-relaunch-parent=<pid>`, appended
+    // by the one relaunch path in `commands::restart`), wait — bounded,
+    // env-tunable — for the exiting parent to be GONE before the Tauri
+    // builder (and with it the single-instance plugin, registered first)
+    // runs. Without this, a child that reaches plugin setup while the old
+    // process still holds the per-user lock hands its argv to a launcher
+    // that is about to exit and dies — leaving NO launcher running. A
+    // normal second launch carries no flag and keeps today's immediate
+    // hand-off. Soft-fail: on wait expiry we log one line and fall through
+    // to the ordinary single-instance behaviour.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if let Some(parent_pid) =
+            commands::restart::relaunch_parent_pid(&argv)
+        {
+            commands::restart::wait_for_relaunch_parent_before_lock(parent_pid);
+        }
+    }
+
     // v0.2.49: reap any stale install.py.lock left behind by a crashed
     // launcher (segfault / OOM-kill / kill -9 — none of which run
     // Rust destructors, so `.kill_on_drop(true)` can't help). Without
@@ -1155,16 +1175,41 @@ pub fn run() {
             // consume so this isn't a per-boot cost — only once per
             // install/update boundary.
             //
+            // v0.2.102 (L6 / OD-6) — boot order vs the settings.json
+            // watcher: when this refresh runs, `settings_json_watcher`
+            // (spawned further down in this same `setup()`) MUST NOT arm
+            // until it completes, else its detached writes would land on
+            // an armed watcher and turn the silent boot refresh into a
+            // global MCP SIGHUP. That ordering used to be incidental (the
+            // refresh simply sat earlier in `setup()`, and the pull-in R
+            // report 2026-10-06 documented "the refresh must not be
+            // detached" as an exception). It is now STRUCTURAL: the
+            // refresh completes a oneshot handed to the watcher spawn,
+            // which awaits it (bounded, env-tunable — see
+            // `settings_json_watcher::await_refresh_gate`) before
+            // registering a single watch. A refresh that outlives the
+            // bound arms the watcher anyway with a WARNING.
+            //
             // Soft-fail throughout: any error here MUST NOT block boot.
             // The walk-up resolver remains a working fallback for the
             // common case (binary inside the clone).
+            let mut install_boundary_refresh_done: Option<
+                tokio::sync::oneshot::Receiver<()>,
+            > = None;
             {
                 use tauri::Manager;
                 if let Some(db) = app.try_state::<db::Db>() {
                     let consumed = consume_install_path_seed_if_present(db.inner());
                     if consumed {
+                        let (refresh_done_tx, refresh_done_rx) =
+                            tokio::sync::oneshot::channel::<()>();
+                        install_boundary_refresh_done = Some(refresh_done_rx);
                         let report = commands::projects_v2::
                             refresh_all_projects_env_with_db(db.inner());
+                        // Release the watcher gate on every path out of the
+                        // refresh (a dropped sender releases it too; sending
+                        // keeps the intent explicit).
+                        let _ = refresh_done_tx.send(());
                         if !report.refreshed.is_empty()
                             || !report.refreshed_with_warnings.is_empty()
                             || !report.failed.is_empty()
@@ -2188,6 +2233,18 @@ pub fn run() {
             // has new commits — never auto-applies.
             commands::self_update::spawn_daily_check(app.handle().clone());
 
+            // v0.2.102 (S16-13 / OD-7) review fix 4: the hidden-idle
+            // stale-binary self-relaunch check, as its OWN background loop —
+            // deliberately NOT in `tray.rs`, so it keeps running when the
+            // system tray failed to build (a session with no
+            // StatusNotifier host). One periodic check
+            // (`VCT_LAUNCHER_STALE_IDLE_CHECK_SECS`, default 10 min) that
+            // leaves the launcher alone unless a `launcher_binary_stale`
+            // record exists, this process started `--start-hidden`, no
+            // window is visible, no update is in flight and no modal is
+            // pending; the act is the restart modal's own guarded relaunch.
+            commands::restart::spawn_stale_idle_checks(app.handle().clone());
+
             // v0.2.97: materialize the bundled core-module manifests into the
             // state dir (the hub does the same at its own start) — every
             // manifest reader looks there, and nothing used to write it.
@@ -2446,7 +2503,17 @@ pub fn run() {
             // the mcp-instability audit. POSIX-only (skipped on
             // Windows; the manual McpMaintenanceSection button stays
             // available as the cross-OS fallback).
-            services::settings_json_watcher::spawn(app.handle().clone());
+            //
+            // v0.2.102 (L6 / OD-6): the spawn carries the
+            // install-boundary refresh gate resolved above — the watcher
+            // arms only after that refresh completes (bounded,
+            // env-tunable wait, WARNING + arm-anyway at the bound), so
+            // the boundary refresh's own settings.json writes can never
+            // SIGHUP the live MCPs.
+            services::settings_json_watcher::spawn(
+                app.handle().clone(),
+                install_boundary_refresh_done,
+            );
 
             // Resume background tasks left behind by a previous launcher
             // process (crash, force-quit, OOM). Two-phase, soft-fail —
