@@ -1017,12 +1017,14 @@ pub async fn kg_set_collection_access_mode(
 // migration. This is best-effort — the launcher's collection-level access
 // gate is still authoritative for reads.
 //
-// ENFORCED SINCE v0.2.102 (S2): the weaviate-kg MCP's cross-collection
-// fan-out reads (`hybrid_search` / `semantic_graph_search` over the shared
-// KG + `VCT_KG_ACCESS_LIST`, `search_code_graph` over
-// `VCT_CODE_GRAPH_ACCESS_LIST`) filter every NON-SELF row carrying a
-// `cross_project_access` restriction to the requesting project
-// (`server.py::_filter_cross_project_access`). Rows without the property
+// ENFORCED SINCE v0.2.102 (S2 + W4-G) on EVERY KG read surface, through
+// one verdict (`vco_lib/kg_node_access.py`): the weaviate-kg MCP fan-out
+// (`hybrid_search` / `semantic_graph_search` over the shared KG +
+// `VCT_KG_ACCESS_LIST`, `search_code_graph` over
+// `VCT_CODE_GRAPH_ACCESS_LIST`), the hook router's KG leg
+// (`rl_kg_search.py`, every context-injection surface) and the kg-search /
+// kg-info CLIs filter every NON-SELF row carrying a `cross_project_access`
+// restriction to the requesting project. Rows without the property
 // stay unrestricted (legacy back-compat); `*` = every project; `[]` =
 // private; a list = exactly those launcher project IDs. The KG screen says
 // so next to the control (`lib/kg/node-access-notice.ts`).

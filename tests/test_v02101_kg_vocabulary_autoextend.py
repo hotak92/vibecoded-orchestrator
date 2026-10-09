@@ -416,14 +416,18 @@ class SyncVocabularyGateTests(tally_h._SyncTestBase):
         NEVER failed; the historical warn-only path stays."""
         vocab = _write_vocab(self.root)
         before = _md5(vocab)
-        self._write_node("knowledge/concepts/plain.md", "Plain", None)
+        # v0.2.102 W4-G: a folder that stands for a declared type now maps to
+        # its SINGULAR type (`concepts/` → `concept`, pinned in
+        # test_v02102_w4g_folder_node_type.py); a folder that names NO type
+        # keeps the folder name and this legacy warn-only path.
+        self._write_node("knowledge/notes/plain.md", "Plain", None)
         mod = self.load()
         harness = self.install_working_backends(mod)
         code, out, _err = self.run_main(mod, ["kg-sync", "--all"])
         self.assertEqual(code, 0)
         rows = self._kg_rows(harness)
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].properties.get("node_type"), "concepts")
+        self.assertEqual(rows[0].properties.get("node_type"), "notes")
         self.assertEqual(_md5(vocab), before)
         self.assertIn("not declared", out)  # legacy warning still teaches
 

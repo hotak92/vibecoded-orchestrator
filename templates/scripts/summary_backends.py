@@ -1203,11 +1203,18 @@ def call_cli(prompt: str) -> str:
 # ──────────────────────────────────────────────────────────────────────
 # Backend: Ollama
 # ──────────────────────────────────────────────────────────────────────
-# Per-model generation params for short technical summarization. Override
-# via env: KG_SUMMARY_OLLAMA_OPTIONS='{"temperature":0.5,"num_ctx":16000}'
+# Per-model SAMPLING params for short technical summarization. Override
+# via env: KG_SUMMARY_OLLAMA_OPTIONS='{"temperature":0.5,"top_p":0.9}'
 #
-# num_ctx 24576 (24k) comfortably fits ~3 × 8k chunks of input + system + output.
-# Our prompts are ~1.5k tokens (4000-char body truncation) + 350 num_predict.
+# The context window is NOT set here (v0.2.102 W4-G): load-time options
+# (num_ctx and friends) are owned by the ONE generate-body builder,
+# `vco_lib.ollama_generate.generate_request_body`, so every VCO caller loads a
+# model with the same window and Ollama keeps ONE resident copy. Its window
+# (32768 — ~3 × 8k chunks of input + system + output) is machine-wide and
+# overridable with VCO_OLLAMA_GENERATE_NUM_CTX; a num_ctx inside
+# KG_SUMMARY_OLLAMA_OPTIONS is superseded by that knob (dropped, with a
+# stderr note naming it). Our prompts are ~1.5k tokens (4000-char body
+# truncation) + 350 num_predict.
 #
 # qwen3.5:* defaults to thinking-mode and emits <think>...</think> blocks
 # unless suppressed. Ollama exposes a `think: false` toggle on /api/generate
@@ -1217,7 +1224,6 @@ OLLAMA_MODEL_DEFAULTS: dict[str, dict] = {
         "temperature": 0.5,
         "top_p": 0.8,
         "top_k": 20,
-        "num_ctx": 32768,
         "num_predict": 1024,
         "repeat_penalty": 1.1,
     },
@@ -1225,7 +1231,6 @@ OLLAMA_MODEL_DEFAULTS: dict[str, dict] = {
         "temperature": 0.5,
         "top_p": 0.8,
         "top_k": 20,
-        "num_ctx": 32768,
         "num_predict": 1024,
         "repeat_penalty": 1.1,
     },
@@ -1233,14 +1238,12 @@ OLLAMA_MODEL_DEFAULTS: dict[str, dict] = {
         "temperature": 0.8,
         "top_p": 0.95,
         "top_k": 64,
-        "num_ctx": 32768,
         "num_predict": 1024,
     },
     "gemma3": {  # fallback for plain gemma3 tags
         "temperature": 0.8,
         "top_p": 0.95,
         "top_k": 64,
-        "num_ctx": 32768,
         "num_predict": 1024,
     },
 }
@@ -1257,7 +1260,6 @@ def _ollama_options_for(model: str) -> dict:
     return OLLAMA_MODEL_DEFAULTS.get(family, {
         "temperature": 0.4,
         "top_p": 0.9,
-        "num_ctx": 32768,
         "num_predict": 1024,
     })
 
@@ -1299,29 +1301,23 @@ def ollama_available() -> bool:
 
 
 def call_ollama(prompt: str, model: str = OLLAMA_DEFAULT_MODEL) -> str:
-    options = _ollama_options_for(model)
-    body = {
-        "model": model,
-        "prompt": prompt,
-        "system": SYSTEM_PROMPT,
-        "stream": False,
-        "options": options,
-    }
+    # v0.2.102 W4-G: the body comes from the ONE generate-body builder
+    # (`vco_lib.ollama_generate`) — shared load-time options (num_ctx) so the
+    # model stays one resident copy across every VCO caller, plus the shared
+    # keep_alive policy. Deliberately unguarded: a missing vco_lib is a broken
+    # install, and this tier must fail (the ladder moves on and logs it)
+    # rather than load a second runner with divergent options.
+    from vco_lib.ollama_generate import generate_request_body
+
     family = model.split(":", 1)[0].lower()
-    if family.startswith("qwen3"):
-        body["think"] = False  # Ollama 0.5+ recognizes this; older versions ignore
-    # v0.2.102 W4-E: the shared keep_alive policy applies to GENERATE
-    # requests too (one home: vco_lib.embedding_providers.ollama; default
-    # "10m", VCO_OLLAMA_KEEP_ALIVE overrides, empty string = omit). This
-    # module is stdlib-only by design, so the resolver import is guarded and
-    # the literal fallback MUST match _KEEP_ALIVE_DEFAULT in that module.
-    try:
-        from vco_lib.embedding_providers.ollama import _keep_alive as _ka
-        _keep_alive = _ka()
-    except Exception:
-        _keep_alive = "10m"
-    if _keep_alive is not None:
-        body["keep_alive"] = _keep_alive
+    body = generate_request_body(
+        model,
+        prompt=prompt,
+        system=SYSTEM_PROMPT,
+        options=_ollama_options_for(model),
+        # Ollama 0.5+ recognizes `think`; older versions ignore it.
+        think=False if family.startswith("qwen3") else None,
+    )
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         f"{OLLAMA_URL}/api/generate",

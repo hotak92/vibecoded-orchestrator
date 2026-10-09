@@ -720,6 +720,7 @@ async def _inline_code_embed_http(
         parse_retry_after,
         resolve_503_delay_scale,
         resolve_503_tolerance,
+        resolve_refused_tolerance,
     )
 
     scale = resolve_503_delay_scale()
@@ -727,11 +728,23 @@ async def _inline_code_embed_http(
     tolerance = (
         resolve_503_tolerance() if tolerance_secs is None else tolerance_secs
     )
-    deadline = time.monotonic() + tolerance
+    started = time.monotonic()
+    deadline = started + tolerance
+    # v0.2.102 W4-G (coordinator ruling 2026-10-09): the service being DOWN
+    # (refused / no listener) is not the service being BUSY (503, queued).
+    # An interactive caller — every caller that passes `tolerance_secs` (see
+    # r3 above) — waits on a refusal only for the short bound from the ONE
+    # policy home (`resolve_refused_tolerance`), then fails loudly; batch
+    # callers keep the long tolerance for both kinds.
+    refused_tolerance = min(
+        tolerance, resolve_refused_tolerance(interactive=tolerance_secs is not None)
+    )
+    refused_deadline = started + refused_tolerance
     attempt = 0
     while True:
         attempt += 1
         retry_after: "float | None" = None
+        refused = False
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -768,6 +781,7 @@ async def _inline_code_embed_http(
                 "Code embedding service connection error (restarting?): "
                 "attempt %d — %s", attempt, e,
             )
+            refused = True
         # 503 → bounded retry on the shared policy (same helper + knobs as
         # EmbeddingService._retry_once_on_503).
         if legacy_bounded:
@@ -787,9 +801,18 @@ async def _inline_code_embed_http(
                     tolerance,
                 )
                 return None
+            if refused and time.monotonic() >= refused_deadline:
+                server.logger.error(
+                    "Code embedding service unreachable (connection refused / "
+                    "no listener) for %.0fs; giving up",
+                    refused_tolerance,
+                )
+                return None
             delay = compute_503_delay(
                 attempt, retry_after, DEFAULT_503_FALLBACK_BACKOFFS, scale
             )
+            if refused:
+                delay = min(delay, max(0.0, refused_deadline - time.monotonic()))
         if delay > 0:
             await asyncio.sleep(delay)
 

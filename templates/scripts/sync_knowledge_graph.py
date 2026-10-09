@@ -1624,6 +1624,30 @@ def _parse_vocabulary_types_fallback(text: str) -> set:
     return aliases
 
 
+def _folder_node_type(folder: str) -> str:
+    """Singular node type for a knowledge/ folder (v0.2.102 W4-G).
+
+    One home: ``vco_lib.kg_vocabulary.node_type_for_folder``. The ImportError
+    arm is the same VERSION-SKEW case ``_load_vocabulary_node_types``
+    documents (a bundled script newer than the clone's vco_lib): it keeps the
+    pre-0.2.102 folder-name value and says so once on stderr.
+    """
+    global _VOCAB_IMPORT_WARNED
+    try:
+        from vco_lib.kg_vocabulary import load_vocabulary, node_type_for_folder
+    except ImportError as exc:
+        if not _VOCAB_IMPORT_WARNED:
+            _VOCAB_IMPORT_WARNED = True
+            print(
+                f"⚠️  vco_lib.kg_vocabulary is older than this script ({exc}) — "
+                "folder-derived node types keep the folder name. Run "
+                "`python install.py --update` from the orchestrator root.",
+                file=sys.stderr,
+            )
+        return folder
+    return node_type_for_folder(folder, load_vocabulary(PROJECT_ROOT))
+
+
 def _load_vocabulary_node_types() -> frozenset:
     """Valid node types = built-ins ∪ aliases declared in the project's
     knowledge/VOCABULARY.md. Missing/unreadable ontology → built-ins only.
@@ -1981,7 +2005,14 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
         type_from_frontmatter = True
     else:
         rel_path = file_path.relative_to(KNOWLEDGE_ROOT)
-        node_type = str(rel_path.parts[0]) if len(rel_path.parts) > 1 else "general"
+        # v0.2.102 W4-G: the folder stands for a SINGULAR type
+        # (`concepts/` → `concept`), resolved by the one vocabulary home;
+        # rows stored under the plural heal on the zero-embed metadata
+        # repair (KG_METADATA_REPAIR_BUMPS gains 0.2.102).
+        node_type = (
+            _folder_node_type(str(rel_path.parts[0]))
+            if len(rel_path.parts) > 1 else "general"
+        )
         type_from_frontmatter = False
 
     # Temporal metadata from frontmatter

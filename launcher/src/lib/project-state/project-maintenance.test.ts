@@ -94,6 +94,11 @@ describe('openProjectLogsAction (#9)', () => {
 describe('node access notice (S2, v0.2.102)', () => {
   it('says the restriction is enforced on cross-project reads; only node scopes carry it', () => {
     expect(NODE_ACCESS_ENFORCED_NOTICE).toMatch(/Enforced on cross-project reads/);
+    // W4-G: the notice names every enforcing read surface (each is pinned
+    // by tests/test_v02102_w4g_node_access_all_surfaces.py).
+    expect(NODE_ACCESS_ENFORCED_NOTICE).toMatch(/MCP search/);
+    expect(NODE_ACCESS_ENFORCED_NOTICE).toMatch(/kg-search \/ kg-info CLIs/);
+    expect(NODE_ACCESS_ENFORCED_NOTICE).toMatch(/hook context injection/);
     expect(accessNoticeFor('node')).toBe(NODE_ACCESS_ENFORCED_NOTICE);
     expect(accessNoticeFor('node-bulk')).toBe(NODE_ACCESS_ENFORCED_NOTICE);
     expect(accessNoticeFor('collection')).toBeNull();

@@ -164,10 +164,12 @@ class TestTopLevelDialect:
         assert node["node_type"] == "tool"
         assert node["tags"] == ["alpha"]
 
-    def test_folder_fallback_type_unchanged(self, sync_mod, tmp_path):
+    def test_folder_fallback_type_is_the_singular_type(self, sync_mod, tmp_path):
+        # v0.2.102 W4-G: the folder fallback stores the SINGULAR type the
+        # folder stands for (it stored the folder name "concepts" before).
         path = _write_node(tmp_path, "nofm.md", "# Just a heading\n\n#payments body\n")
         node = sync_mod.parse_markdown_node(path.read_text(encoding="utf-8"), path)
-        assert node["node_type"] == "concepts"  # folder name, pre-existing rule
+        assert node["node_type"] == "concept"
 
 
 class TestTagsStringForms:

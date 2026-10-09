@@ -44,6 +44,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.pwsh import PWSH_BASE_FLAGS
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = REPO_ROOT / "templates"
 LINUX = TEMPLATES / "settings.json.linux.template"
@@ -596,7 +598,7 @@ class TestWrapperParity:
                 env=_wrapper_env(tmp_path), timeout=60,
             )
             ps = subprocess.run(
-                [pwsh, "-NoProfile", "-File", str(HOOK_PS1), "pretooluse"],
+                [pwsh, *PWSH_BASE_FLAGS, "-File", str(HOOK_PS1), "pretooluse"],
                 input=stdin_text, capture_output=True, text=True,
                 env=_wrapper_env(tmp_path), timeout=120,
             )
