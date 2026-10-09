@@ -54,10 +54,12 @@ def stores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     openai_key._resolved.clear()
     openai_key._warned_env_var = False
     openai_key._warned_paused = False
+    openai_key._warned_leg1 = False
     yield secrets
     openai_key._resolved.clear()
     openai_key._warned_env_var = False
     openai_key._warned_paused = False
+    openai_key._warned_leg1 = False
 
 
 def _project_dir(tmp_path: Path) -> Path:
@@ -169,11 +171,67 @@ def test_a_paused_dedicated_key_disables_the_slot_even_with_shared_present(
     assert "PAUSED" in err
     assert "Preferences → Secrets" in err, "the WARNING names the panel"
     assert "second copy" in err, "the WARNING warns against forking the value"
+    # W5C-2 (coordinator-confirmed semantics): the WARNING must SAY that the
+    # slot stays off even with a healthy shared key, and why — plus how to
+    # resume. Anything less reads as "no key configured".
+    assert "even though the shared VCO key may be healthy" in err
+    assert "route around" in err, "it names the no-fallback rule"
+    assert "Resume" in err, "it says how to resume"
     assert PROJECT_KEY not in err and SHARED_KEY not in err
 
     # Once per process, not once per call.
     assert openai_key.resolve_openai_api_key(project) == ""
     assert capsys.readouterr().err == ""
+
+
+def test_a_leg1_read_failure_falls_back_with_one_warning(
+    stores: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """W5C-3: a genuine READ failure of the dedicated leg (locked keychain,
+    hub error, timeout) is not an absence — the resolver still falls back
+    to the shared slot (the run must not break), but ONE WARNING names the
+    failure class and the fallback, so a keychain problem is not hidden
+    behind a healthy shared answer. Once per process; never a value."""
+    def answer(key, project):
+        if key == openai_key.VCO_PROJECT_SECRET_NAME:
+            return agent_secrets.KeychainLocked("keychain is locked")
+        return SHARED_KEY if key == openai_key.OPENAI_SECRET_NAME else None
+
+    _fake_hub(monkeypatch, answer)
+    project = str(_project_dir(tmp_path))
+    assert openai_key.resolve_openai_api_key(project) == SHARED_KEY, (
+        "a read failure falls back to the shared slot — the run must not break"
+    )
+    err = capsys.readouterr().err
+    assert "could not READ" in err
+    assert openai_key.VCO_PROJECT_SECRET_NAME in err
+    assert "KeychainLocked" in err, "the WARNING names the failure class"
+    assert "falling back to the shared VCO key" in err
+    assert "do not store a second copy" in err, "no divergence remedy"
+    assert PROJECT_KEY not in err and SHARED_KEY not in err
+
+    # Once per process, not once per call.
+    assert openai_key.resolve_openai_api_key(project) == SHARED_KEY
+    assert capsys.readouterr().err == ""
+
+
+def test_a_leg1_absence_falls_back_silently(
+    stores: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The other half of W5C-3: ``key_not_active`` for the dedicated name
+    is a PROVEN absence — the ordinary machine without a dedicated key must
+    fall through to the shared slot with NO warning on every run."""
+    def answer(key, project):
+        if key == openai_key.OPENAI_SECRET_NAME:
+            return SHARED_KEY
+        return None  # key_not_active for the dedicated name
+
+    _fake_hub(monkeypatch, answer)
+    assert openai_key.resolve_openai_api_key(str(_project_dir(tmp_path))) == SHARED_KEY
+    err = capsys.readouterr().err
+    assert err == "", "an ordinary absence is silent — only read failures warn"
 
 
 def test_a_paused_shared_key_disables_the_slot(

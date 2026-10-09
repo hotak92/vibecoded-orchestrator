@@ -56,6 +56,7 @@ def _slot(value: str | None) -> Iterator[Path]:
         openai_key._resolved.clear()
         openai_key._warned_env_var = False
         openai_key._warned_paused = False
+        openai_key._warned_leg1 = False
         try:
             with patch.dict(os.environ, {"VCT_SECRETS_DIR": str(root)}):
                 yield root
@@ -63,6 +64,7 @@ def _slot(value: str | None) -> Iterator[Path]:
             openai_key._resolved.clear()
             openai_key._warned_env_var = False
             openai_key._warned_paused = False
+            openai_key._warned_leg1 = False
 
 
 @contextlib.contextmanager
