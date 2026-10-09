@@ -36,6 +36,13 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #   $env:VCT_DISABLE_HOOKS — set to non-empty to bypass entirely.
 #   $env:VCO_HOOK_DEBUG=1  — verbose stderr, and run the spawn in the
 #                            foreground (`--wait`) so its exit code is known.
+#
+# v0.2.102 (S16-13 / OD-7): a launcher this hook starts with --start-hidden
+# and leaves in the tray RELAUNCHES ITSELF into the refreshed dist binary
+# when a launcher_binary_stale record exists, no window is visible, no
+# update is in flight and no modal is pending (the launcher's own periodic
+# check; this hook never kills GUI processes). Nothing for this hook to do
+# beyond starting it hidden.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 

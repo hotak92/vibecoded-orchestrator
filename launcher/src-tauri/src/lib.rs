@@ -1155,16 +1155,41 @@ pub fn run() {
             // consume so this isn't a per-boot cost — only once per
             // install/update boundary.
             //
+            // v0.2.102 (L6 / OD-6) — boot order vs the settings.json
+            // watcher: when this refresh runs, `settings_json_watcher`
+            // (spawned further down in this same `setup()`) MUST NOT arm
+            // until it completes, else its detached writes would land on
+            // an armed watcher and turn the silent boot refresh into a
+            // global MCP SIGHUP. That ordering used to be incidental (the
+            // refresh simply sat earlier in `setup()`, and the pull-in R
+            // report 2026-10-06 documented "the refresh must not be
+            // detached" as an exception). It is now STRUCTURAL: the
+            // refresh completes a oneshot handed to the watcher spawn,
+            // which awaits it (bounded, env-tunable — see
+            // `settings_json_watcher::await_refresh_gate`) before
+            // registering a single watch. A refresh that outlives the
+            // bound arms the watcher anyway with a WARNING.
+            //
             // Soft-fail throughout: any error here MUST NOT block boot.
             // The walk-up resolver remains a working fallback for the
             // common case (binary inside the clone).
+            let mut install_boundary_refresh_done: Option<
+                tokio::sync::oneshot::Receiver<()>,
+            > = None;
             {
                 use tauri::Manager;
                 if let Some(db) = app.try_state::<db::Db>() {
                     let consumed = consume_install_path_seed_if_present(db.inner());
                     if consumed {
+                        let (refresh_done_tx, refresh_done_rx) =
+                            tokio::sync::oneshot::channel::<()>();
+                        install_boundary_refresh_done = Some(refresh_done_rx);
                         let report = commands::projects_v2::
                             refresh_all_projects_env_with_db(db.inner());
+                        // Release the watcher gate on every path out of the
+                        // refresh (a dropped sender releases it too; sending
+                        // keeps the intent explicit).
+                        let _ = refresh_done_tx.send(());
                         if !report.refreshed.is_empty()
                             || !report.refreshed_with_warnings.is_empty()
                             || !report.failed.is_empty()
@@ -2446,7 +2471,17 @@ pub fn run() {
             // the mcp-instability audit. POSIX-only (skipped on
             // Windows; the manual McpMaintenanceSection button stays
             // available as the cross-OS fallback).
-            services::settings_json_watcher::spawn(app.handle().clone());
+            //
+            // v0.2.102 (L6 / OD-6): the spawn carries the
+            // install-boundary refresh gate resolved above — the watcher
+            // arms only after that refresh completes (bounded,
+            // env-tunable wait, WARNING + arm-anyway at the bound), so
+            // the boundary refresh's own settings.json writes can never
+            // SIGHUP the live MCPs.
+            services::settings_json_watcher::spawn(
+                app.handle().clone(),
+                install_boundary_refresh_done,
+            );
 
             // Resume background tasks left behind by a previous launcher
             // process (crash, force-quit, OOM). Two-phase, soft-fail —

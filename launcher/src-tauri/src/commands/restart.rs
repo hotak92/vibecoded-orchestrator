@@ -398,7 +398,20 @@ pub(crate) fn restart_to_dist(
     running: &str,
     spawner: &dyn Spawner,
 ) -> Result<PathBuf, RelaunchError> {
-    let result = spawn_guarded(install_root, running, spawner);
+    restart_to_dist_args(install_root, running, spawner, &[])
+}
+
+/// The argv-carrying core of [`restart_to_dist`] (v0.2.102, S16-13): the modal's
+/// Continue path passes no extra argv; the hidden idle self-relaunch passes
+/// `--start-hidden` so a tray-only launcher never flashes a window across the
+/// relaunch. Same guard, same deferral clear — one home.
+fn restart_to_dist_args(
+    install_root: &Path,
+    running: &str,
+    spawner: &dyn Spawner,
+    args: &[&str],
+) -> Result<PathBuf, RelaunchError> {
+    let result = spawn_guarded(install_root, running, spawner, args);
     if matches!(
         result,
         Ok(_) | Err(RelaunchError::Refused(RelaunchRefusal::NotNewer { .. }))
@@ -408,6 +421,17 @@ pub(crate) fn restart_to_dist(
         }
     }
     result
+}
+
+/// v0.2.102 (S16-13 / OD-7): the hidden idle launcher's flavour of
+/// [`restart_to_dist`] — same version guard and deferral clear, plus
+/// [`crate::HIDDEN_START_FLAG`] so the relaunched process stays tray-only.
+fn restart_to_dist_hidden(
+    install_root: &Path,
+    running: &str,
+    spawner: &dyn Spawner,
+) -> Result<PathBuf, RelaunchError> {
+    restart_to_dist_args(install_root, running, spawner, &[crate::HIDDEN_START_FLAG])
 }
 
 /// Read `<install_root>/.claude/context/UPDATE_DEFERRED.md`, strip the
@@ -636,8 +660,13 @@ pub(crate) enum RelaunchOutcome {
 
 /// Starts a launcher binary. Injected so the guard's act/leave-alone arms are
 /// tested without ever starting a real launcher.
+///
+/// v0.2.102 (S16-13): takes the child's extra argv so the ONE guarded-spawn
+/// home serves both relaunch flavours — the modal's Continue (no extra args,
+/// the user is looking at the window) and the hidden idle self-relaunch
+/// (`--start-hidden`, so a tray-only launcher stays tray-only across it).
 pub(crate) trait Spawner {
-    fn spawn_detached(&self, exe: &Path) -> Result<(), String>;
+    fn spawn_detached(&self, exe: &Path, args: &[&str]) -> Result<(), String>;
 }
 
 /// The production spawner: fully detached (`setsid` / `DETACHED_PROCESS`),
@@ -645,8 +674,8 @@ pub(crate) trait Spawner {
 pub(crate) struct DetachedSpawner;
 
 impl Spawner for DetachedSpawner {
-    fn spawn_detached(&self, exe: &Path) -> Result<(), String> {
-        spawn_detached_launcher(exe)
+    fn spawn_detached(&self, exe: &Path, args: &[&str]) -> Result<(), String> {
+        spawn_detached_launcher(exe, args)
     }
 }
 
@@ -680,17 +709,20 @@ pub(crate) fn decide_relaunch(
 }
 
 /// Guard, then spawn: the testable ACT of a relaunch. Returns the binary it
-/// started. Nothing is spawned on any refusal.
+/// started. Nothing is spawned on any refusal. `args` are the child's extra
+/// argv (empty for the modal path, `--start-hidden` for the hidden idle
+/// self-relaunch — see [`Spawner`]).
 pub(crate) fn spawn_guarded(
     install_root: &Path,
     running: &str,
     spawner: &dyn Spawner,
+    args: &[&str],
 ) -> Result<PathBuf, RelaunchError> {
     let exe = dist_launcher_path(install_root);
     let dist_version = crate::commands::installer::read_on_disk_binary_version(install_root);
     decide_relaunch(running, dist_version.as_deref(), &exe).map_err(RelaunchError::Refused)?;
     spawner
-        .spawn_detached(&exe)
+        .spawn_detached(&exe, args)
         .map_err(RelaunchError::SpawnFailed)?;
     Ok(exe)
 }
@@ -738,7 +770,7 @@ pub(crate) async fn relaunch<R: Runtime>(
     }
 
     before_spawn();
-    let exe = spawn_guarded(install_root, running, &DetachedSpawner)?;
+    let exe = spawn_guarded(install_root, running, &DetachedSpawner, &[])?;
     if let Err(e) = clear_restart_deferral(install_root) {
         tracing::warn!("[restart] relaunch: could not clear the restart deferral: {}", e);
     }
@@ -747,11 +779,200 @@ pub(crate) async fn relaunch<R: Runtime>(
     Ok(RelaunchOutcome::Spawned { exe })
 }
 
+// ---------------------------------------------------------------------------
+// v0.2.102 (S16-13 / OD-7): hidden idle launcher self-relaunch on binary_stale
+// ---------------------------------------------------------------------------
+//
+// The session-start hook spawns the launcher with `--start-hidden` (see
+// `templates/hooks/session-start-ensure-hub.sh`); that process lives until
+// reboot and, after a terminal `install.py --update`, keeps running the OLD
+// binary. The restart modal's `binary_stale` banner is seen only when a
+// window opens, so a tray-only launcher sat on a stale binary indefinitely
+// (register §16 / OD-7).
+//
+// OD-7(a): the HIDDEN launcher relaunches ITSELF into the dist binary when
+// `launcher_binary_stale` is recorded, no window is visible, no update
+// pipeline/apply is running (the update-gate lockfile — the one apply-in-
+// flight source of truth) and no modal is pending. The relaunch is the SAME
+// guarded path the modal's Continue performs ([`restart_to_dist_hidden`] →
+// [`spawn_guarded`] → the version guard), plus `--start-hidden` so the
+// relaunched process keeps the tray-only start. The session-start hook does
+// NOT kill GUI processes; this tick is the hidden launcher acting on itself.
+//
+// The `launcher_binary_stale` condition itself is NOT stripped here — it
+// clears by its existing probe: the relaunched process's boot
+// `reconcile_dist_at_rest` sees a `Fresh` verdict and retires the record
+// (`binary_freshness::clear_stale_condition_if_fresh`).
+
+/// Default cadence of the hidden-idle stale check. Generous by design: the
+/// condition it heals (a tray-only launcher running yesterday's binary) is
+/// wrong for hours, not seconds, and each tick reads a few small files.
+pub(crate) const DEFAULT_STALE_IDLE_CHECK_INTERVAL: Duration =
+    Duration::from_secs(10 * 60);
+
+/// Env knob for [`DEFAULT_STALE_IDLE_CHECK_INTERVAL`], in seconds.
+pub(crate) const ENV_STALE_IDLE_CHECK_SECS: &str = "VCT_LAUNCHER_STALE_IDLE_CHECK_SECS";
+
+/// The tick interval: `VCT_LAUNCHER_STALE_IDLE_CHECK_SECS` seconds when set
+/// to a positive integer, the generous default otherwise (absent, malformed
+/// or non-positive values never shorten the cadence to something hostile).
+pub(crate) fn stale_idle_check_interval() -> Duration {
+    stale_idle_check_interval_from(std::env::var(ENV_STALE_IDLE_CHECK_SECS).ok().as_deref())
+}
+
+/// Pure core of [`stale_idle_check_interval`] (env reads are process-global,
+/// so the parsing decision is tested without touching the environment).
+fn stale_idle_check_interval_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_STALE_IDLE_CHECK_INTERVAL)
+}
+
+/// The four guards of the hidden-idle self-relaunch, already resolved —
+/// injectable so every act/leave-alone arm is testable without a running
+/// launcher, DB or file system.
+pub(crate) struct IdleStaleGuards {
+    /// A `launcher_binary_stale` record is on disk for this install.
+    pub binary_stale: bool,
+    /// Any launcher window is visible (the restart modal's Continue belongs
+    /// to the user then, not to a background tick).
+    pub window_visible: bool,
+    /// The update-gate lockfile is present — a pipeline/apply owns the tree.
+    pub update_in_flight: bool,
+    /// A modal-blocking condition is pending: today the unconsumed update
+    /// handoff outcome (`update.lock.json` / `update.result.json` under the
+    /// vct state dir), whose post-update modal the FE has not yet rendered
+    /// and acknowledged.
+    pub modal_pending: bool,
+}
+
+/// What the tick decided. `LeaveAlone` carries the reason for the debug log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleStaleDecision {
+    /// All four guards pass — perform the modal's own relaunch, hidden.
+    Relaunch,
+    /// Leave the running launcher alone, and why.
+    LeaveAlone(&'static str),
+}
+
+/// PURE decision core of the hidden-idle self-relaunch. Never relaunch with a
+/// window open or an update in flight — the leave-alone arms are the point.
+pub(crate) fn decide_hidden_idle_relaunch(g: &IdleStaleGuards) -> IdleStaleDecision {
+    if !g.binary_stale {
+        IdleStaleDecision::LeaveAlone("no launcher_binary_stale record")
+    } else if g.window_visible {
+        IdleStaleDecision::LeaveAlone("a window is visible")
+    } else if g.update_in_flight {
+        IdleStaleDecision::LeaveAlone("an update is in flight")
+    } else if g.modal_pending {
+        IdleStaleDecision::LeaveAlone("a modal is pending")
+    } else {
+        IdleStaleDecision::Relaunch
+    }
+}
+
+/// Is a `launcher_binary_stale` section recorded in this install's
+/// UPDATE_DEFERRED.md? Uses the SAME cid constant and section extractor as
+/// `get_launcher_restart_status` (the modal's banner), so the tick and the
+/// banner can never disagree about what "recorded" means. A missing or
+/// unreadable file is simply not recorded (leave-alone).
+fn binary_stale_recorded(install_root: &Path) -> bool {
+    let target = install_root
+        .join(".claude")
+        .join("context")
+        .join("UPDATE_DEFERRED.md");
+    std::fs::read_to_string(&target)
+        .map(|content| {
+            extract_section(&content, crate::services::binary_freshness::CID_BINARY_STALE)
+                .is_some()
+        })
+        .unwrap_or(false)
+}
+
+/// The modal-pending reader: an update handoff (or its outcome) that no FE
+/// has consumed yet. `update.lock.json` is PRESERVED while an updater may
+/// still be running; `update.result.json` is written right before the
+/// relaunch and consumed at the next boot's `poll_update_lock_on_boot`.
+/// Either present ⇒ a post-update modal/toast is still owed to the user.
+fn update_handoff_modal_pending() -> bool {
+    let root = vct_launcher_core::paths::vct_root_dir();
+    root.join(crate::commands::update_handoff::UPDATE_LOCK_FILE).is_file()
+        || root.join(crate::commands::update_handoff::UPDATE_RESULT_FILE).is_file()
+}
+
+/// True when any webview window is visible. An visibility answer we cannot
+/// get (`Err`) counts as VISIBLE — false-leave-alone is recoverable (the
+/// next tick), relaunching under a window we could not inspect is not.
+fn any_window_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
+    use tauri::Manager as _;
+    app.webview_windows()
+        .values()
+        .any(|w| w.is_visible().unwrap_or(true))
+}
+
+/// Resolve the four guards against live process/install state.
+fn read_idle_stale_guards<R: Runtime>(app: &AppHandle<R>, install_root: &Path) -> IdleStaleGuards {
+    IdleStaleGuards {
+        binary_stale: binary_stale_recorded(install_root),
+        window_visible: any_window_visible(app),
+        // ONE apply-in-flight source of truth: the same lockfile the update
+        // pipeline writes before git pull and deletes on drop, and the MCP
+        // servers honour (exit 75). No second state machine here.
+        update_in_flight: crate::commands::update_gate::is_update_in_progress(),
+        modal_pending: update_handoff_modal_pending(),
+    }
+}
+
+/// One periodic check, called from the launcher's background hub tick
+/// (`tray.rs::hub_status_poll_loop`) at [`stale_idle_check_interval`].
+///
+/// Leave-alone arms log at debug and return; the act logs ONE line, performs
+/// the modal's own guarded relaunch (hidden flavour) and exits the process.
+/// A typed refusal (dist not newer, version unreadable, binary missing)
+/// logs a warning and returns — the next tick retries, and the record stays
+/// honest on disk.
+pub(crate) async fn hidden_idle_stale_relaunch_tick<R: Runtime>(app: &AppHandle<R>) {
+    let Ok(install_root) = crate::commands::installer::find_local_repo_root() else {
+        return; // same no-clone case the boot freshness probe skips silently
+    };
+    let guards = read_idle_stale_guards(app, &install_root);
+    match decide_hidden_idle_relaunch(&guards) {
+        IdleStaleDecision::LeaveAlone(reason) => {
+            tracing::debug!(
+                "[restart] hidden idle stale check: leaving the launcher alone ({})",
+                reason
+            );
+        }
+        IdleStaleDecision::Relaunch => {
+            tracing::info!(
+                "[restart] hidden idle launcher: {} recorded and no window, update or \
+                 modal pending — relaunching into the dist binary via the restart \
+                 modal's own path",
+                crate::services::binary_freshness::CID_BINARY_STALE
+            );
+            if let Err(e) =
+                restart_to_dist_hidden(&install_root, env!("CARGO_PKG_VERSION"), &DetachedSpawner)
+            {
+                tracing::warn!(
+                    "[restart] hidden idle relaunch refused (non-fatal, the next tick \
+                     retries): {}",
+                    e
+                );
+                return;
+            }
+            crate::quit_dialog::force_quit();
+            app.exit(0);
+        }
+    }
+}
+
 /// Spawn the new launcher fully detached. The current process exits
 /// immediately afterward; the child must be in its own session/process
 /// group so the kernel doesn't tear it down with us.
-fn spawn_detached_launcher(exe: &Path) -> Result<(), String> {
+fn spawn_detached_launcher(exe: &Path, args: &[&str]) -> Result<(), String> {
     let mut cmd = std::process::Command::new(exe).silent();
+    cmd.args(args);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1176,12 +1397,22 @@ condition_ids: [launcher_restart_required]
     /// start a real launcher.
     #[derive(Default)]
     struct RecordingSpawner {
-        spawned: std::cell::RefCell<Vec<PathBuf>>,
+        spawned: std::cell::RefCell<Vec<(PathBuf, Vec<String>)>>,
+    }
+
+    impl RecordingSpawner {
+        /// How many spawns were recorded.
+        fn count(&self) -> usize {
+            self.spawned.borrow().len()
+        }
     }
 
     impl Spawner for RecordingSpawner {
-        fn spawn_detached(&self, exe: &Path) -> Result<(), String> {
-            self.spawned.borrow_mut().push(exe.to_path_buf());
+        fn spawn_detached(&self, exe: &Path, args: &[&str]) -> Result<(), String> {
+            self.spawned.borrow_mut().push((
+                exe.to_path_buf(),
+                args.iter().map(|a| a.to_string()).collect(),
+            ));
             Ok(())
         }
     }
@@ -1208,9 +1439,13 @@ condition_ids: [launcher_restart_required]
     fn relaunch_proceeds_for_a_newer_dist_binary() {
         let td = root_with_dist(Some("0.2.100"));
         let spawner = RecordingSpawner::default();
-        let exe = spawn_guarded(td.path(), "0.2.99", &spawner).expect("newer dist relaunches");
+        let exe =
+            spawn_guarded(td.path(), "0.2.99", &spawner, &[]).expect("newer dist relaunches");
         assert_eq!(exe, dist_launcher_path(td.path()));
-        assert_eq!(*spawner.spawned.borrow(), vec![dist_launcher_path(td.path())]);
+        assert_eq!(
+            *spawner.spawned.borrow(),
+            vec![(dist_launcher_path(td.path()), Vec::new())]
+        );
     }
 
     /// LEAVE-ALONE: an equal or OLDER dist binary is a typed refusal and
@@ -1220,7 +1455,8 @@ condition_ids: [launcher_restart_required]
         for dist in ["0.2.99", "0.2.98", "0.2.9"] {
             let td = root_with_dist(Some(dist));
             let spawner = RecordingSpawner::default();
-            let err = spawn_guarded(td.path(), "0.2.99", &spawner).expect_err(dist);
+            let err = spawn_guarded(td.path(), "0.2.99", &spawner, &[])
+                .expect_err(dist);
             assert_eq!(
                 err,
                 RelaunchError::Refused(RelaunchRefusal::NotNewer {
@@ -1247,7 +1483,10 @@ condition_ids: [launcher_restart_required]
         let td = root_with_dist(Some("0.2.101"));
         let exe = restart_to_dist(td.path(), "0.2.100", &spawner).expect("newer dist");
         assert_eq!(exe, dist_launcher_path(td.path()));
-        assert_eq!(spawner.spawned.borrow().len(), 1);
+        assert_eq!(spawner.count(), 1);
+        // The MODAL flavour carries no extra argv — the user is looking at
+        // the window the Continue button lives in.
+        assert_eq!((*spawner.spawned.borrow())[0].1, Vec::<String>::new());
     }
 
     /// Tri-state: an absent sidecar or a non-X.Y.Z version is never "newer".
@@ -1256,12 +1495,12 @@ condition_ids: [launcher_restart_required]
         let spawner = RecordingSpawner::default();
         let td = root_with_dist(None);
         assert!(matches!(
-            spawn_guarded(td.path(), "0.2.99", &spawner),
+            spawn_guarded(td.path(), "0.2.99", &spawner, &[]),
             Err(RelaunchError::Refused(RelaunchRefusal::DistVersionUnknown { .. }))
         ));
         let td = root_with_dist(Some("0.2.100-rc1"));
         assert!(matches!(
-            spawn_guarded(td.path(), "0.2.99", &spawner),
+            spawn_guarded(td.path(), "0.2.99", &spawner, &[]),
             Err(RelaunchError::Refused(RelaunchRefusal::VersionUnreadable { .. }))
         ));
         assert!(spawner.spawned.borrow().is_empty());
@@ -1365,5 +1604,235 @@ condition_ids: [launcher_restart_required]
         );
         assert!(!target.exists(), "clear should have unlinked the solo entry");
         holder.join().expect("holder joins");
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.102 (S16-13 / OD-7): hidden idle stale self-relaunch.
+    // -----------------------------------------------------------------
+
+    /// The act state: a stale record, hidden, no update, no modal.
+    fn idle_guards() -> IdleStaleGuards {
+        IdleStaleGuards {
+            binary_stale: true,
+            window_visible: false,
+            update_in_flight: false,
+            modal_pending: false,
+        }
+    }
+
+    /// ACT: stale + hidden + idle → the tick's decision is Relaunch.
+    #[test]
+    fn hidden_idle_relaunch_fires_when_hidden_and_idle() {
+        assert_eq!(
+            decide_hidden_idle_relaunch(&idle_guards()),
+            IdleStaleDecision::Relaunch,
+            "a hidden idle launcher over a recorded stale binary must self-relaunch",
+        );
+    }
+
+    /// LEAVE-ALONE (the point of OD-7): a visible window means the modal's
+    /// Continue belongs to the user — a background tick must never restart
+    /// the launcher under them.
+    #[test]
+    fn hidden_idle_relaunch_leaves_a_visible_window_alone() {
+        let mut g = idle_guards();
+        g.window_visible = true;
+        assert_eq!(
+            decide_hidden_idle_relaunch(&g),
+            IdleStaleDecision::LeaveAlone("a window is visible"),
+        );
+    }
+
+    /// LEAVE-ALONE: an update pipeline/apply owns the tree — relaunching
+    /// mid-update would race the swap the gate exists to serialize.
+    #[test]
+    fn hidden_idle_relaunch_leaves_an_inflight_update_alone() {
+        let mut g = idle_guards();
+        g.update_in_flight = true;
+        assert_eq!(
+            decide_hidden_idle_relaunch(&g),
+            IdleStaleDecision::LeaveAlone("an update is in flight"),
+        );
+    }
+
+    /// LEAVE-ALONE: a pending modal (the unconsumed update-handoff outcome)
+    /// owes the user a surface — not a silent process replacement.
+    #[test]
+    fn hidden_idle_relaunch_leaves_a_pending_modal_alone() {
+        let mut g = idle_guards();
+        g.modal_pending = true;
+        assert_eq!(
+            decide_hidden_idle_relaunch(&g),
+            IdleStaleDecision::LeaveAlone("a modal is pending"),
+        );
+    }
+
+    /// LEAVE-ALONE: no stale record → nothing to heal.
+    #[test]
+    fn hidden_idle_relaunch_leaves_a_fresh_binary_alone() {
+        let mut g = idle_guards();
+        g.binary_stale = false;
+        assert_eq!(
+            decide_hidden_idle_relaunch(&g),
+            IdleStaleDecision::LeaveAlone("no launcher_binary_stale record"),
+        );
+    }
+
+    /// A temp install root whose dist slot is NEWER than `running` AND whose
+    /// deferral ledger carries a `launcher_binary_stale` record — the full
+    /// act state of the hidden idle tick, on disk.
+    fn root_with_dist_and_stale_record(dist: &str) -> tempfile::TempDir {
+        let td = root_with_dist(Some(dist));
+        let ctx = td.path().join(".claude").join("context");
+        std::fs::create_dir_all(&ctx).unwrap();
+        std::fs::write(
+            ctx.join("UPDATE_DEFERRED.md"),
+            format!(
+                "---\ncondition_ids: [{cid}]\n---\n\n# VCO Update Deferred\n\n{body}\n",
+                cid = crate::services::binary_freshness::CID_BINARY_STALE,
+                body = stale_doc(),
+            ),
+        )
+        .unwrap();
+        td
+    }
+
+    /// ACT leg: the relaunch the tick performs is the DIST binary, exactly
+    /// once, carrying `--start-hidden` (a tray-only launcher must stay
+    /// tray-only across the self-relaunch — no window flash).
+    #[test]
+    fn hidden_idle_act_relaunches_the_dist_binary_hidden() {
+        let td = root_with_dist_and_stale_record("0.2.102");
+        let spawner = RecordingSpawner::default();
+        let exe =
+            restart_to_dist_hidden(td.path(), "0.2.101", &spawner).expect("newer dist relaunches");
+        assert_eq!(exe, dist_launcher_path(td.path()));
+        assert_eq!(
+            *spawner.spawned.borrow(),
+            vec![(
+                dist_launcher_path(td.path()),
+                vec![crate::HIDDEN_START_FLAG.to_string()],
+            )],
+            "the hidden idle relaunch must spawn the dist binary with --start-hidden",
+        );
+    }
+
+    /// The `launcher_binary_stale` condition clears by its EXISTING probe,
+    /// not by this path: after the act the record is still on disk (we do
+    /// not strip it), and the relaunched process's boot probe's own
+    /// predicate (`should_clear_stale_condition`) retires it on a `Fresh`
+    /// verdict — the probe-tested act leg lives in binary_freshness.
+    #[test]
+    fn hidden_idle_act_leaves_the_stale_record_to_its_probe() {
+        let td = root_with_dist_and_stale_record("0.2.102");
+        let spawner = RecordingSpawner::default();
+        restart_to_dist_hidden(td.path(), "0.2.101", &spawner)
+            .expect("newer dist relaunches");
+        let target = td
+            .path()
+            .join(".claude")
+            .join("context")
+            .join("UPDATE_DEFERRED.md");
+        let body = std::fs::read_to_string(&target).expect("ledger still readable");
+        assert!(
+            extract_section(&body, crate::services::binary_freshness::CID_BINARY_STALE).is_some(),
+            "the tick must NOT strip the stale record — the relaunched process's \
+             boot probe retires it",
+        );
+        assert!(
+            crate::services::binary_freshness::should_clear_stale_condition(
+                &crate::services::binary_freshness::FreshnessVerdict::Fresh
+            ),
+            "a Fresh verdict (the post-relaunch boot state) must clear the record \
+             through the existing probe",
+        );
+    }
+
+    /// The reader agrees with the modal's banner on what "recorded" means:
+    /// same cid, same section extractor; absent file / other condition →
+    /// not recorded.
+    #[test]
+    fn binary_stale_recorded_uses_the_modal_cid_and_section() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = td.path().join(".claude").join("context");
+        std::fs::create_dir_all(&ctx).unwrap();
+        std::fs::write(ctx.join("UPDATE_DEFERRED.md"), stale_doc()).unwrap();
+        assert!(binary_stale_recorded(td.path()), "a recorded entry is found");
+
+        std::fs::write(
+            ctx.join("UPDATE_DEFERRED.md"),
+            "---\ncondition_ids: [other_thing]\n---\n\n## other_thing (warning)\n\n---\n",
+        )
+        .unwrap();
+        assert!(
+            !binary_stale_recorded(td.path()),
+            "an unrelated condition is not a stale record",
+        );
+
+        std::fs::remove_file(ctx.join("UPDATE_DEFERRED.md")).unwrap();
+        assert!(
+            !binary_stale_recorded(td.path()),
+            "a missing ledger is not a stale record",
+        );
+    }
+
+    /// The modal-pending reader follows the isolated state dir: a preserved
+    /// updater lock (or an unconsumed outcome) is pending; a clean dir is
+    /// not. Never touches the real `~/.vct`.
+    #[test]
+    fn update_handoff_modal_pending_follows_the_state_dir() {
+        let (_guard, dir) = {
+            let td = vct_launcher_core::test_env::state_dir_guard();
+            let p = td.path().to_path_buf();
+            (td, p)
+        };
+        assert!(
+            !update_handoff_modal_pending(),
+            "a clean state dir has no pending modal",
+        );
+        std::fs::write(dir.join(crate::commands::update_handoff::UPDATE_LOCK_FILE), "{}")
+            .unwrap();
+        assert!(
+            update_handoff_modal_pending(),
+            "a preserved update.lock.json means the post-update modal is still owed",
+        );
+        std::fs::remove_file(dir.join(crate::commands::update_handoff::UPDATE_LOCK_FILE))
+            .unwrap();
+        std::fs::write(
+            dir.join(crate::commands::update_handoff::UPDATE_RESULT_FILE),
+            "{\"success\":true}",
+        )
+        .unwrap();
+        assert!(
+            update_handoff_modal_pending(),
+            "an unconsumed update.result.json means the post-update modal is still owed",
+        );
+    }
+
+    /// The env knob: positive seconds win; absent / malformed / zero /
+    /// negative fall back to the generous default (never a hostile cadence).
+    #[test]
+    fn stale_idle_check_interval_parsing() {
+        assert_eq!(
+            stale_idle_check_interval_from(Some("90")),
+            Duration::from_secs(90),
+        );
+        assert_eq!(
+            stale_idle_check_interval_from(Some(" 90 ")),
+            Duration::from_secs(90),
+            "surrounding whitespace is tolerated",
+        );
+        for raw in [None, Some(""), Some("abc"), Some("0"), Some("-5"), Some("1.5")] {
+            assert_eq!(
+                stale_idle_check_interval_from(raw),
+                DEFAULT_STALE_IDLE_CHECK_INTERVAL,
+                "{raw:?} must fall back to the generous default",
+            );
+        }
+        assert_eq!(
+            DEFAULT_STALE_IDLE_CHECK_INTERVAL,
+            Duration::from_secs(600),
+            "the default stays generous (10 min) — ratchet DOWN only",
+        );
     }
 }
