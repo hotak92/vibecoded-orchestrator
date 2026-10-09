@@ -765,6 +765,57 @@ could not be read — probe failure is not evidence. To merge leftover objects
 into the class you kept: `python -m vco_lib.project_init migrate-collections
 --help`.
 
+## A project runs its own Weaviate / Ollama next to VCO's (infrastructure declarations)
+
+A project may run its own Weaviate or Ollama for its own runtime while VCO
+keeps its development KG on VCO's Weaviate. VCO classifies collections and
+containers partly by NAME SHAPE, so a runtime collection called
+`Something_KnowledgeGraph` can read as an "unclaimed" leftover
+(`kg_unclaimed_populated_classes`), and a stopped runtime container can look
+like a service to adopt. Declare what the project owns instead — launcher →
+the project's page → **Identity** tab → **Infrastructure this project owns**:
+
+- **External collections** — never reported as unclaimed or fixture-shaped,
+  never evidence for a KG binding repoint. `vco doctor` names each skipped
+  class and who declared it.
+- **Unmanaged containers** — the hub watchdog never inspects, starts or
+  re-creates them; compose recovery refuses to touch them; service detection
+  never offers them for adoption (and never takes their ports).
+- **Local ports** — WebFetch may reach them from that project (the SSRF guard
+  reads `VCT_SSRF_EXTRA_LOCAL_PORTS`), and service detection never probes them.
+
+A container or a collection is one object on the machine, so a declaration
+protects it everywhere; the WebFetch allowance is per-project. If the
+declarations cannot be read (a damaged `launcher.db`), every heal of a VCO
+container refuses until they can — an unreadable "do not touch" list is not
+an empty one.
+
+## The two compose override files disagree (`compose_override_pair_diverged`)
+
+`infrastructure/compose.override.yaml` (read by podman-compose) and
+`infrastructure/docker-compose.override.yml` (read by docker compose v1) are
+meant to be one configuration written twice. When they differ — typically one
+was fixed by hand and the other was not — the two runtimes start different
+stacks. `vco doctor` reports it with a read-only compare command (`diff`, or
+`fc` on Windows). VCO overwrites neither file while they differ: decide which
+half is right, make the other identical (or delete the stale one), then run
+`vco doctor` again — the entry clears itself once they agree. The install-time
+rename pass reports the same state under the same id (it covers the legacy
+`claude_mcp_servers/` location too); its former `compose_override_filename_conflict`
+id is retired, and an old entry of it clears on the next install or update.
+
+## The hub watchdog gave up on a service (`watchdog_gave_up`)
+
+The hub restarts a stopped VCO service with an exponential backoff and stops
+after 5 failed heals in a row, rather than thrash the runtime. The ledger entry
+names the service, its container, the attempts and the last error. Look at the
+container's logs (`docker logs <name>` / `podman logs <name>`), fix the cause
+(image, port, memory, compose file), then start it — or run
+`python install.py --update`. The entry clears itself as soon as the service is
+seen running, whoever starts it. A service you stopped on purpose from the
+launcher's Services page is not supervised (the Stop drops the watchdog's pause
+marker), and a container a project declared **unmanaged** is never supervised.
+
 ## The update badge never lights on v0.2.97/0.2.98 (fixed in v0.2.99)
 
 Two defects shipped in v0.2.97/0.2.98 hid updates from the launcher without any error anywhere:

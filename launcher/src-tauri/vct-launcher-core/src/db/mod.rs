@@ -121,6 +121,12 @@ pub mod chat_model_context;
 // `services::service_endpoints`.
 pub mod service_endpoints;
 
+// Migration 049 (v0.2.102 W5-A / M3) — what on this machine belongs to a
+// project, not to VCO (external collections, unmanaged containers, local
+// ports). Written by the launcher's Identity tab; read by the hub watchdog and
+// `/config` route here, and by `vco_lib.infra_declarations` in Python.
+pub mod infra_declarations;
+
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {
     crate::paths::vct_root_dir().join("launcher.db")

@@ -213,6 +213,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, NotRequired, Optional, TypedDict
 
+from vco_lib import infra_declarations as _infra
 from vco_lib import jsonc_edit, settings_refusal
 from vco_lib import service_endpoints as _service_endpoints
 from vco_lib.atomic import atomic_rewrite_text
@@ -374,6 +375,15 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     "VCT_PROJECT_ID",
     "VCT_KG_ACCESS_LIST",
     "VCT_CODE_GRAPH_ACCESS_LIST",
+    # v0.2.102 W5-A (M3): the project's infrastructure declarations (launcher
+    # Identity tab → ``project_infra_declarations``, migration 049), read by
+    # ``vco_lib.infra_declarations``. Python-only like CODE_EMBED_SERVICE_URL
+    # (the subset parity test allows that direction). Conditionally emitted —
+    # omitted when the project declares nothing of that kind, so removing the
+    # last declaration REMOVES the key on the next apply.
+    "VCT_EXTERNAL_COLLECTIONS",
+    "VCT_UNMANAGED_CONTAINERS",
+    "VCT_SSRF_EXTRA_LOCAL_PORTS",
     # VCT_DIAGRAMS_ACCESS_LIST — REMOVED in v0.2.102 with the diagrams
     # integrations (its only consumer, the weaviate MCP's diagrams
     # fan-out, is gone). Same posture as DIAGRAMS_COLLECTION above: no
@@ -1950,6 +1960,9 @@ def project_env_from_db(
         # (one rule, one home) but no longer PROJECTED — DIAGRAMS_COLLECTION
         # left the canonical key set with the diagrams integrations.
 
+        # v0.2.102 W5-A (M3): this project's infrastructure declarations.
+        infra_declared = _infra.project_values_on_conn(conn, project_id)
+
         # Access lists.
         kg_access = _fetch_kg_access_list(
             conn,
@@ -2319,6 +2332,10 @@ def project_env_from_db(
         _set("VCT_KG_ACCESS_LIST", ",".join(kg_access))
     if code_graph_access:
         _set("VCT_CODE_GRAPH_ACCESS_LIST", ",".join(code_graph_access))
+    # v0.2.102 W5-A (M3): one key per declaration kind, only when non-empty.
+    for kind, values in infra_declared.items():
+        if values:
+            _set(_infra.KIND_ENV[kind], _infra.env_value(values))
 
     # GITHUB_TOKEN is never resolved here, by design: since v0.2.73 VCO
     # writes no secret value into a project (consumers resolve the PAT at

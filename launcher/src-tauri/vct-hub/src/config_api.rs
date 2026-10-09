@@ -585,6 +585,22 @@ struct ProjectConfigResponse {
     /// because the field is defaultable client-side.
     #[serde(default)]
     rl_server_port: Option<u16>,
+    /// v0.2.102 W5-A (M3) — what THIS project declared its own
+    /// (`project_infra_declarations`, migration 049; written by the launcher's
+    /// Identity tab). Same lists `config_projection` projects into the
+    /// project env as `VCT_EXTERNAL_COLLECTIONS` / `VCT_UNMANAGED_CONTAINERS` /
+    /// `VCT_SSRF_EXTRA_LOCAL_PORTS`; served here so the three resolver clients
+    /// (bash / ps1 / python) read them without SQLite. Additive and
+    /// defaultable client-side (empty list on a pre-v0.2.102 hub) — no
+    /// `schema_version` bump. A DB read failure degrades to empty lists with
+    /// a warning (an enrichment, like `code_graph_extra_paths`); the
+    /// machine-wide "do not touch" decisions never read this route.
+    #[serde(default)]
+    external_collections: Vec<String>,
+    #[serde(default)]
+    unmanaged_containers: Vec<String>,
+    #[serde(default)]
+    ssrf_extra_local_ports: Vec<u16>,
 }
 
 /// One enabled extra codegraph path for the resolver response.
@@ -1253,6 +1269,21 @@ async fn project_config(
             }
         };
 
+    // v0.2.102 W5-A (M3): this project's infrastructure declarations.
+    let infra = match h.0.list_infra_declarations(&project.id) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project.id,
+                error = %e,
+                "[vct-hub config_api] list_infra_declarations failed; returning empty",
+            );
+            Default::default()
+        }
+    };
+    let ssrf_extra_local_ports: Vec<u16> =
+        infra.local_ports.iter().filter_map(|p| p.parse::<u16>().ok()).collect();
+
     let response = ProjectConfigResponse {
         schema_version: RESOLVER_PROTOCOL_VERSION,
         project_id: project.id.clone(),
@@ -1291,6 +1322,9 @@ async fn project_config(
         retrieval_tuning,
         code_graph_extra_paths,
         rl_server_port,
+        external_collections: infra.external_collections,
+        unmanaged_containers: infra.unmanaged_containers,
+        ssrf_extra_local_ports,
     };
 
     // 9. ?key= filter — pull a single top-level field by name.
@@ -3966,6 +4000,31 @@ kg_tier_full = 0.8
             "the hub must never emit the incoherent (log=true, write=false) \
              pair; body={body}",
         );
+    }
+
+    // ─── v0.2.102 W5-A (M3): infrastructure declarations ────────────────
+
+    /// The three lists are always present (empty by default) and carry what
+    /// the Identity tab stored for THIS project only.
+    #[tokio::test]
+    async fn config_returns_the_projects_infra_declarations() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-infra", "peer-project");
+        seed_full_project(&h, "p-other", "other-project");
+        let url = format!("{}/projects/p-infra/config", base);
+        let body: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+        for key in ["external_collections", "unmanaged_containers", "ssrf_extra_local_ports"] {
+            assert_eq!(body[key], serde_json::json!([]), "{key} empty by default");
+        }
+        use vct_launcher_core::db::infra_declarations as infra;
+        h.0.set_infra_declarations("p-infra", infra::KIND_EXTERNAL_COLLECTION, &["PeerRuntime_Memory".into()]).unwrap();
+        h.0.set_infra_declarations("p-infra", infra::KIND_UNMANAGED_CONTAINER, &["peer-weaviate".into()]).unwrap();
+        h.0.set_infra_declarations("p-infra", infra::KIND_LOCAL_PORT, &["11436".into()]).unwrap();
+        h.0.set_infra_declarations("p-other", infra::KIND_LOCAL_PORT, &["9999".into()]).unwrap();
+        let body: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+        assert_eq!(body["external_collections"], serde_json::json!(["PeerRuntime_Memory"]));
+        assert_eq!(body["unmanaged_containers"], serde_json::json!(["peer-weaviate"]));
+        assert_eq!(body["ssrf_extra_local_ports"], serde_json::json!([11436]), "only this project's ports");
     }
 
     // ─── v0.2.47: code_graph_extra_paths field ──────────────────────────

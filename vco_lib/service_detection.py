@@ -582,6 +582,11 @@ class Detection:
     #: The runtime answered the listing: a container absent from
     #: ``containers`` does not exist (``False``: could not look).
     listed: bool = False
+    #: v0.2.102 W5-A (M3): host ports that belong to what a project declared
+    #: its own (declared local ports + every port a declared-unmanaged
+    #: container publishes, stopped or not). Never candidates, and never
+    #: free for VCO to take — ``service_reconcile`` counts them as taken.
+    reserved_ports: frozenset[int] = frozenset()
 
     def for_service(self, service: str) -> list[Candidate]:
         return list(self.candidates.get(service, []))
@@ -616,6 +621,8 @@ def detect(
     probe_defaults: bool = True,
     read_schema: Optional[Callable[[str, int], bool]] = None,
     containers_listed: bool = True,
+    unmanaged: Optional[Iterable[str]] = None,
+    declared_ports: Optional[Iterable[int]] = None,
 ) -> Detection:
     """Every candidate for every service in *services*, probed.
 
@@ -630,14 +637,38 @@ def detect(
     ``probe_defaults=False`` — no sweep of VCO's and upstream's
     default ports, only *extra_endpoints* and the given containers' ports;
     *read_schema* — ``(host, port) → bool``, whether a Weaviate's
-    ``/v1/schema`` is read there (default: everywhere)."""
+    ``/v1/schema`` is read there (default: everywhere).
+
+    v0.2.102 W5-A (M3): what a project DECLARED its own is never a
+    candidate — *unmanaged* container names (and every host port they
+    publish) and *declared_ports* (loopback ports of a project's own
+    services) never become candidates and are never probed, so nothing
+    downstream can adopt, re-point or migrate them; the ports land in
+    :attr:`Detection.reserved_ports`. Default: :mod:`vco_lib.infra_declarations`."""
     fetch = fetch or default_fetch
     tcp_open = tcp_open or default_tcp_open
+    if unmanaged is None or declared_ports is None:
+        from vco_lib import infra_declarations as _infra  # noqa: PLC0415
+
+        decl = _infra.load()
+        if unmanaged is None:
+            unmanaged = _infra.unmanaged_containers(decl)
+        if declared_ports is None:
+            declared_ports = _infra.local_ports(decl)
+    skip_names = frozenset(unmanaged)
     if containers is not None:
         detection = Detection(containers=list(containers), listed=containers_listed)
     else:
         listed = list_containers_or_none(runtime, run=run)
         detection = Detection(containers=listed or [], listed=listed is not None)
+    skip_ports = set(int(p) for p in declared_ports)
+    for c in detection.containers:
+        if c.name in skip_names:
+            skip_ports.update(c.host_ports.values())
+    # The declared containers stay in `detection.containers` — the listing is
+    # a FACT the drift / presence checks and the taken-port set rely on — but
+    # they never become a candidate (the loop below skips them).
+    detection.reserved_ports = frozenset(skip_ports)
     for service in services:
         slots: dict[tuple[str, int], dict[str, Any]] = {}
 
@@ -653,7 +684,7 @@ def detect(
 
         unpublished: list[ContainerInfo] = []
         for c in detection.containers:
-            if service_of_container(c) != service:
+            if c.name in skip_names or service_of_container(c) != service:
                 continue
             host_port = c.host_ports.get(CONTAINER_PORTS[service])
             if host_port is None:
@@ -665,10 +696,14 @@ def detect(
             else:
                 entry["stopped"].append(c)
         for port in PROBE_PORTS[service] if probe_defaults else ():
+            if port in skip_ports:
+                continue
             slot("localhost", port, f"port:{port}")
         for ep in extra_endpoints:
             if ep.service == service:
                 host = "localhost" if ep.host == "127.0.0.1" else ep.host
+                if host == "localhost" and ep.port in skip_ports:
+                    continue
                 slot(host, ep.port, ep.origin, scheme=ep.scheme, grpc=ep.grpc_port)
 
         out: list[Candidate] = []

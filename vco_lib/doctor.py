@@ -238,6 +238,10 @@ CID_INSTALL_MARKER_UNBACKED = "install_manifest_attests_uninstalled_source"
 #: the copy it installed itself.
 CID_FORMER_LAUNCHER_CLI = "former_launcher_cli_on_path"
 
+#: v0.2.102 W5-A (P299-B2): the install's two override auto-load names hold
+#: different configurations. Probe + entry live in :mod:`vco_lib.doctor_infra`.
+CID_COMPOSE_OVERRIDE_PAIR_DIVERGED = "compose_override_pair_diverged"
+
 #: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
 #: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
 #: doctor but emitted by its owner — re-emitting it here would fork its
@@ -247,6 +251,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
     CID_KG_BINDING_EVIDENCE_MISMATCH, CID_KG_UNCLAIMED,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
     CID_INSTALL_MARKER_UNBACKED, CID_FORMER_LAUNCHER_CLI,
+    CID_COMPOSE_OVERRIDE_PAIR_DIVERGED,
 )
 
 #: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
@@ -257,6 +262,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
 DOCTOR_SELF_RESOLVING_CIDS: tuple[str, ...] = (
     CID_DISK_SPACE_LOW, CID_KG_BINDING_EVIDENCE_MISMATCH,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
+    CID_COMPOSE_OVERRIDE_PAIR_DIVERGED,
 )
 
 #: Env override for the free-space floor, in GiB (float). Default
@@ -440,6 +446,20 @@ class DoctorResolvers:
     #: ``last_kg_sync_at`` app_state rows). Injected so the last-KG-sync probe
     #: is driven from described rows, no launcher.db.
     kg_sync_rows: Optional[Callable[[], dict]] = None
+    #: () -> :class:`vco_lib.infra_declarations.Declarations` (v0.2.102 M3).
+    #: Injected so the declaration-honouring probes are driven from described
+    #: declarations, no launcher.db.
+    infra_declarations: Optional[Callable[[], Any]] = None
+
+    def resolve_infra_declarations(self):
+        """What projects declared their own — :mod:`vco_lib.infra_declarations`,
+        the ONE reader. Never raises (the reader soft-fails to
+        ``resolvable=False``)."""
+        if self.infra_declarations is not None:
+            return self.infra_declarations()
+        from vco_lib import infra_declarations  # noqa: PLC0415
+
+        return infra_declarations.load()
 
     def resolve_kg_sync_rows(self) -> dict:
         """The ``app_state`` rows behind the last-certified-KG-sync report.
@@ -1909,6 +1929,20 @@ def probe_code_embed_image(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
             )
         ]
     if getattr(state, "verdict", None) == code_embed_image.STALE:
+        # v0.2.102 W5-A (M3): a code-embed container a project declared
+        # unmanaged is not VCO's to rebuild — report the fact, print no
+        # rebuild, emit no entry.
+        declared = _declared_unmanaged_reason(res, "code_embed")
+        if declared is not None:
+            return [
+                Finding(
+                    probe="code_embed_image",
+                    status=STATUS_OK,
+                    summary=(f"{state.summary} The container is {declared}, so VCO "
+                             "prints no rebuild for it and leaves it alone."),
+                    detail=dict(detail, declared_unmanaged=declared),
+                )
+            ]
         return [
             Finding(
                 probe="code_embed_image",
@@ -1938,6 +1972,22 @@ def probe_code_embed_image(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
             detail=detail,
         )
     ]
+
+
+def _declared_unmanaged_reason(res: DoctorResolvers, service: str) -> Optional[str]:
+    """Why VCO's container for ``service`` is not VCO's to touch — a project
+    declared it unmanaged — else ``None``. Soft-fail: an unreadable list is
+    ``None`` here (this only phrases a report; it never gates an action)."""
+    try:
+        from vco_lib import containers as _containers  # noqa: PLC0415
+        from vco_lib import infra_declarations as _infra  # noqa: PLC0415
+
+        decl = res.resolve_infra_declarations()
+        if decl is None:
+            return None
+        return decl.why(_infra.KIND_UNMANAGED_CONTAINER, _containers.canonical_name(service))
+    except Exception:  # noqa: BLE001 — phrasing must never cost the finding
+        return None
 
 
 def probe_model_gateway_runnable(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
@@ -2111,7 +2161,14 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
     scan = res.resolve_kg_binding_evidence()
     if scan is None:
         return []
-    from vco_lib.kg_binding_doctor import jsonable_verdicts, render_three_values
+    from vco_lib.kg_binding_doctor import external_note, jsonable_verdicts, render_three_values
+
+    # v0.2.102 W5-A (M3): declared-external classes left the scan before any
+    # leg looked at them; every finding below says which, and who declared it.
+    skipped = external_note(scan)
+    external_detail = [
+        {"class": e.name, "why": e.why} for e in (getattr(scan, "external", ()) or ())
+    ]
 
     mismatches = list(scan.mismatches)
     unclaimed = list(scan.unclaimed)
@@ -2133,9 +2190,9 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
             summary=(
                 f"{checked} registered project(s) with a primary KG "
                 "binding: every one matches where its data demonstrably "
-                "lives"
+                "lives" + skipped
             ),
-            detail={"unclaimed": [u.name for u in unclaimed]},
+            detail={"unclaimed": [u.name for u in unclaimed], "external": external_detail},
         )
         extra_fixture = list(getattr(scan, "fixture_shaped", ()) or ())
         if not unclaimed and not extra_fixture:
@@ -2151,7 +2208,7 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
             Finding(
                 probe="kg_binding_evidence",
                 status=STATUS_PROBLEM,
-                summary=_kg_unclaimed_summary(unclaimed, extra_fixture),
+                summary=_kg_unclaimed_summary(unclaimed, extra_fixture) + skipped,
                 fix=FIX_DEFER,
                 condition_id=CID_KG_UNCLAIMED,
                 command=_kg_unclaimed_remediation(unclaimed, extra_fixture),
@@ -2160,6 +2217,7 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
                         {"class": u.name, "count": u.count} for u in unclaimed
                     ],
                     "fixture_shaped": extra_fixture,
+                    "external": external_detail,
                     "verdicts": jsonable_verdicts(scan),
                 },
             ),
@@ -2177,7 +2235,7 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
             status=STATUS_PROBLEM,
             summary=(
                 f"{len(mismatches)} project(s) whose KG data lives in a class "
-                f"the primary binding does not name — {lines}"
+                f"the primary binding does not name — {lines}" + skipped
             ),
             fix=FIX_DEFER,
             condition_id=CID_KG_BINDING_EVIDENCE_MISMATCH,
@@ -2192,6 +2250,7 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
                 # contract) — the dedicated finding + entry come on the
                 # first pass clean of mismatches.
                 "unclaimed": [u.name for u in scan.unclaimed],
+                "external": external_detail,
             },
         )
     ]
@@ -2317,6 +2376,10 @@ def _kg_unclaimed_remediation(unclaimed, extra_fixture=()) -> str:
         "#   collection (the picker does not move existing objects).\n"
         "# To move objects between collections:\n"
         "#   python -m vco_lib.project_init migrate-collections --help\n"
+        "# If the class is a project's OWN data (its runtime, not VCO's KG):\n"
+        "#   declare it external — launcher -> that project's page -> Identity\n"
+        "#   tab -> Infrastructure this project owns -> External collections.\n"
+        "#   Every VCO reading skips a declared class from then on.\n"
         "# If the leftover is expected: dismiss this entry — the dismissal\n"
         "#   records that choice.\n"
         "# Then confirm: vco doctor\n"
@@ -2375,8 +2438,9 @@ def _kg_unclaimed_entry(finding: Finding):
             "and no registered project's folder anchors their sampled "
             "paths — data with no reader, typically a removed project's "
             "leftover. Choosing what unclaimed data is (re-add the project, "
-            "re-bind it to a current project, migrate the objects, or "
-            "accept the leftover) is the user's call, and VCO never "
+            "re-bind it to a current project, migrate the objects, declare "
+            "it a project's own external collection on that project's "
+            "Identity tab, or accept the leftover) is the user's call, and VCO never "
             "proposes deleting it — a populated collection is hours of "
             "work and the printed remedy intentionally offers no drop "
             "command. The entry clears itself via the registered clear "
@@ -4538,6 +4602,26 @@ def probe_agent_model_ids(folder: Path, res: DoctorResolvers, ctx: dict) -> list
     )]
 
 
+def probe_infra_declarations(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.doctor_infra` (v0.2.102 M3)."""
+    from vco_lib import doctor_infra  # noqa: PLC0415
+
+    return doctor_infra.probe_infra_declarations(folder, res, ctx)
+
+
+def probe_compose_override_pair(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.doctor_infra` (v0.2.102 P299-B2)."""
+    from vco_lib import doctor_infra  # noqa: PLC0415
+
+    return doctor_infra.probe_compose_override_pair(folder, res, ctx)
+
+
+def _compose_override_pair_entry(finding: Finding):
+    from vco_lib import doctor_infra  # noqa: PLC0415
+
+    return doctor_infra.compose_override_pair_entry(finding)
+
+
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
@@ -4594,6 +4678,14 @@ PROBES: dict = {
     # probe's docstring for why this is the only service whose IMAGE can go
     # stale under a healthy update.
     "code_embed_image": (probe_code_embed_image, (SCOPE_FULL,)),
+    # v0.2.102 W5-A (M3): full-only, informational — one read-only launcher.db
+    # open listing what projects declared their own. No registered condition.
+    "infra_declarations": (probe_infra_declarations, (SCOPE_FULL,)),
+    # v0.2.102 W5-A (P299-B2): full-only — two file reads + a YAML compare.
+    # Doctor-owned, self-resolving `compose_override_pair_diverged`; full-only
+    # for the boot-promise reason (the pair changes only through an
+    # install/update or a hand edit the next full run reads).
+    "compose_override_pair": (probe_compose_override_pair, (SCOPE_FULL,)),
     # v0.2.95 R5c: full-only — it RUNS the registered entry point
     # (`--version`), and it reports nothing at all on the majority of machines,
     # where the gateway's login-time autostart was never opted into.
@@ -5105,6 +5197,7 @@ _ENTRY_BUILDERS: dict = {
     CID_GATEWAY_UNRUNNABLE: _gateway_unrunnable_entry,
     CID_INSTALL_MARKER_UNBACKED: _install_marker_unbacked_entry,
     CID_FORMER_LAUNCHER_CLI: _former_launcher_cli_entry,
+    CID_COMPOSE_OVERRIDE_PAIR_DIVERGED: _compose_override_pair_entry,
 }
 
 

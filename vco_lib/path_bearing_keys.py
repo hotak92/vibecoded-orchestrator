@@ -516,6 +516,10 @@ PATH_BEARING_DB_COLUMNS: tuple[ColumnPolicy, ...] = (
         "disabled (migration 042). Rewriting it would change what "
         "re-enabling restores; it must round-trip byte-exact.",
     ),
+    # ── project_infra_declarations (migration 049, v0.2.102 M3) ──────────
+    # Collection names, container names and port numbers — machine objects
+    # keyed by name, never a folder path: a move changes none of them.
+    *_plain("project_infra_declarations", "project_id", "kind", "value"),
     # ── project_kg_bindings ──────────────────────────────────────────────
     *_plain(
         "project_kg_bindings",

@@ -74,7 +74,18 @@
 //! (`vct_launcher_core::services::container_ownership`) and:
 //!   * starts (or unpauses) an existing container BY NAME only when it is
 //!     VCO's (`Owned`); never composes against it, never removes it;
-//!   * leaves a `Foreign` one alone (log + `watchdog_foreign_container`);
+//!   * leaves a `Foreign` one alone (log + `watchdog_foreign_container`) —
+//!     BY DESIGN this includes a container labelled with a LEGACY VCO compose
+//!     project (an older install's `claude_mcp_servers` home, say): the
+//!     watchdog never heals it, `python install.py --update` is what takes
+//!     such a container over, through its compose-identity guard (v0.2.102
+//!     NB-R6, recorded — no behaviour change);
+//!   * leaves a container a project DECLARED unmanaged alone before any
+//!     probe (v0.2.102 W5-A / M3 — `project_infra_declarations`, the
+//!     launcher's Identity tab): the explicit form of "not VCO's", for a
+//!     project that runs its own Weaviate / Ollama. Declared → untouched
+//!     (no inspect, no start, no create); an unreadable declaration list
+//!     heals nothing that tick ([`HealOutcome::Unmanaged`]);
 //!   * skips the tick when ownership or state cannot be read, or when only
 //!     podman's storage holds the name;
 //!   * composes ONLY a name that exists in neither `inspect` nor
@@ -93,9 +104,13 @@
 //! consecutive-failure counter. The wait between restart ATTEMPTS grows
 //! exponentially (45s → 90s → 180s → … capped at ~30 min, see
 //! [`backoff_delay_secs`]); after [`MAX_CONSECUTIVE_FAILURES`] failed
-//! restarts in a row the watchdog GIVES UP on that service and logs a
-//! single clear error (no infinite thrash). A successful restart resets
-//! the counter and clears the give-up state.
+//! restarts in a row the watchdog GIVES UP on that service, logs a single
+//! clear error (no infinite thrash) and — since v0.2.102 (P299-B3) — writes
+//! the `watchdog_gave_up` ledger row naming the service, the attempts, the
+//! last error and the remedy, so the give-up reaches the launcher's Updates
+//! page instead of only a log. A successful restart (or the service seen
+//! running again) resets the counter, clears the give-up state and resolves
+//! the row ([`record_gave_up`]).
 //!
 //! NOTE (NIT-7): because the watchdog gates attempts by counting fixed
 //! ticks (it does NOT sleep a variable amount), the backoff schedule is a
@@ -355,6 +370,9 @@ pub enum HealOutcome {
     Skipped(String),
     /// Already running when looked at (a race with another starter).
     AlreadyRunning,
+    /// A project declared this container unmanaged (v0.2.102 M3) — left
+    /// alone before any runtime call: no inspect, no start, no create.
+    Unmanaged(String),
 }
 
 /// Heal ONE stopped/missing service container (AD-5):
@@ -367,11 +385,16 @@ pub enum HealOutcome {
 /// * the name exists in neither `inspect` nor `ps -a --external` → `create`
 ///   (the guarded compose path) — the only compose the watchdog runs;
 /// * after any action, [`verify_running`] decides.
+///
+/// `declared_unmanaged` is the reason when a project declared `container`
+/// unmanaged ([`declared_unmanaged_why`]): the outcome is then
+/// [`HealOutcome::Unmanaged`] and the runtime is never called.
 pub async fn heal_service<R, C, Fut>(
     runner: &R,
     row: Option<&ServiceEndpointRow>,
     container: &str,
     installer_project: Option<&str>,
+    declared_unmanaged: Option<&str>,
     create: C,
     policy: VerifyPolicy,
 ) -> HealOutcome
@@ -380,6 +403,9 @@ where
     C: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
+    if let Some(why) = declared_unmanaged {
+        return HealOutcome::Unmanaged(why.to_string());
+    }
     let identity = read_identity(runner, container).await;
     let action: &'static str = match &identity.state {
         ContainerState::Running => return HealOutcome::AlreadyRunning,
@@ -928,6 +954,150 @@ fn record_foreign(root: &Path, now: &BTreeMap<String, String>) {
     }
 }
 
+/// Why `container` must be left alone this tick, from the machine-wide
+/// declarations ([`Db::unmanaged_container_reasons`]): `Some(reason)` when a
+/// project declared it, or when the declarations could not be read (an
+/// unreadable "do not touch" list is not an empty one); `None` → VCO's to heal.
+pub fn declared_unmanaged_why(
+    declared: &Result<BTreeMap<String, String>, String>,
+    container: &str,
+) -> Option<String> {
+    match declared {
+        Ok(map) => map.get(container).cloned(),
+        Err(e) => Some(format!(
+            "the project infrastructure declarations could not be read ({e}), so whether a \
+             project declared it unmanaged is unknown"
+        )),
+    }
+}
+
+/// One service the watchdog has given up on (v0.2.102 P299-B3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GaveUp {
+    pub container: String,
+    pub attempts: u32,
+    pub last_error: String,
+}
+
+/// Fold one heal outcome into the per-service crash-loop state and the
+/// given-up set. Pure (no I/O) — the tick's bookkeeping, extracted so the
+/// give-up surface is testable with an injectable runner. Returns `true`
+/// when this outcome made the service cross into "given up".
+pub fn apply_heal_outcome(
+    service: &str,
+    container: &str,
+    outcome: &HealOutcome,
+    backoff: &mut Backoff,
+    gave_up: &mut BTreeMap<String, GaveUp>,
+) -> bool {
+    match outcome {
+        HealOutcome::Verified { .. } | HealOutcome::AlreadyRunning => {
+            backoff.reset_on_success();
+            gave_up.remove(service);
+            false
+        }
+        HealOutcome::Failed(e) => {
+            let was = backoff.is_given_up();
+            backoff.record_failure();
+            if backoff.is_given_up() {
+                gave_up.insert(
+                    service.to_string(),
+                    GaveUp {
+                        container: container.to_string(),
+                        attempts: backoff.consecutive_failures,
+                        last_error: e.clone(),
+                    },
+                );
+            }
+            !was && backoff.is_given_up()
+        }
+        HealOutcome::Foreign(_) | HealOutcome::Skipped(_) | HealOutcome::Unmanaged(_) => false,
+    }
+}
+
+/// The give-up record the watchdog keeps true (the [`ForeignLedger`] shape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GaveUpLedger {
+    Unchanged,
+    Emit { detected: String, command: String },
+    Resolve,
+}
+
+/// Pure: compare this tick's given-up set with the last recorded one.
+/// `prev = None` (hub just started) with an empty set resolves once, so a
+/// row left by a previous hub run does not outlive the condition.
+pub fn gave_up_ledger_change(
+    prev: Option<&BTreeMap<String, GaveUp>>,
+    now: &BTreeMap<String, GaveUp>,
+) -> GaveUpLedger {
+    if prev == Some(now) {
+        return GaveUpLedger::Unchanged;
+    }
+    if now.is_empty() {
+        return GaveUpLedger::Resolve;
+    }
+    let detected = now
+        .iter()
+        .map(|(svc, g)| {
+            format!(
+                "{svc} ('{}'): gave up after {} failed heal attempt(s); last error: {}",
+                g.container, g.attempts, g.last_error
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut command = String::from(
+        "# The hub stopped retrying. Look at why the container will not stay up:\n",
+    );
+    for (svc, g) in now {
+        command.push_str(&format!(
+            "#   {svc}: inspect `{}` (its logs: `<docker|podman> logs {}`), fix the cause, then start it.\n",
+            g.container, g.container
+        ));
+    }
+    command.push_str(
+        "# Or re-run the guarded bring-up: python install.py --update\n\
+         # This entry clears itself once the service is seen running (any start, by anyone).\n\
+         # To stop the hub supervising a service you stopped on purpose, use the launcher's\n\
+         # Services page Stop (it drops the watchdog pause marker).",
+    );
+    GaveUpLedger::Emit { detected, command }
+}
+
+/// The last given-up set written to the ledger (this hub process).
+static LAST_GAVE_UP: std::sync::Mutex<Option<BTreeMap<String, GaveUp>>> = std::sync::Mutex::new(None);
+
+/// Keep `watchdog_gave_up` true for `root` (paired-resolution: this is the
+/// site its registry row names). Best-effort.
+fn record_gave_up(root: &Path, now: &BTreeMap<String, GaveUp>) {
+    let mut last = LAST_GAVE_UP.lock().unwrap_or_else(|p| p.into_inner());
+    let change = gave_up_ledger_change(last.as_ref(), now);
+    let result = match &change {
+        GaveUpLedger::Unchanged => return,
+        GaveUpLedger::Resolve => deferral_bridge::resolve_deferral_conditions(root, root, &["watchdog_gave_up"]),
+        GaveUpLedger::Emit { detected, command } => deferral_bridge::emit_deferral_entry(
+            root,
+            root,
+            &deferral_bridge::DeferralEntryFields {
+                condition_id: "watchdog_gave_up",
+                title: "The hub watchdog gave up restarting a VCO service",
+                detected,
+                why_deferred: "Repeated heals of a VCO-managed service failed (each one verified \
+                               not running afterwards), so the watchdog stopped retrying rather \
+                               than thrash the runtime. Something keeps the container from \
+                               staying up — an image, a port, memory, a broken compose file — \
+                               and only a look at its logs says which.",
+                command_to_apply: command,
+                severity: "warning",
+            },
+        ),
+    };
+    match result {
+        Ok(()) => *last = Some(now.clone()),
+        Err(e) => tracing::warn!("[vct-hub] infra watchdog: watchdog_gave_up record not updated: {}", e),
+    }
+}
+
 // ─── Spawn + tick loop ───────────────────────────────────────────────────
 
 /// Spawn the infra watchdog as a detached `tokio` task. Called once from
@@ -995,6 +1165,9 @@ async fn run_watchdog_loop(db: LauncherDbHandle, config: WatchdogConfig) {
     // variable amounts. `attempts_since_wait[svc]` counts ticks elapsed
     // since the last restart attempt for that service.
     let mut ticks_since_attempt: HashMap<String, u64> = HashMap::new();
+    // v0.2.102 P299-B3: services given up on, kept across ticks so the
+    // `watchdog_gave_up` row stays true until each one is seen running.
+    let mut gave_up: BTreeMap<String, GaveUp> = BTreeMap::new();
 
     let base = config.interval.as_secs().max(1);
 
@@ -1018,7 +1191,7 @@ async fn run_watchdog_loop(db: LauncherDbHandle, config: WatchdogConfig) {
         // `detect_runtime_detailed()` is already non-panicking. The result is that the watchdog upholds
         // its "never crashes the hub" contract: a single bad tick logs and
         // the next tick tries again.
-        run_one_tick(&db, base, &mut backoffs, &mut ticks_since_attempt).await;
+        run_one_tick(&db, base, &mut backoffs, &mut ticks_since_attempt, &mut gave_up).await;
     }
 }
 
@@ -1059,6 +1232,7 @@ async fn run_one_tick(
     base: u64,
     backoffs: &mut HashMap<String, Backoff>,
     ticks_since_attempt: &mut HashMap<String, u64>,
+    gave_up: &mut BTreeMap<String, GaveUp>,
 ) {
     // Resolve the runtime once per tick (cached after first detect).
     let detection = detect_runtime_detailed().await;
@@ -1096,6 +1270,9 @@ async fn run_one_tick(
     };
     let installer_project = installer_compose_project(&infra_dir);
     let mut foreign: BTreeMap<String, String> = BTreeMap::new();
+    // v0.2.102 W5-A (M3): what projects declared unmanaged, read once per
+    // tick (poison-tolerant). An Err keeps every service hands-off this tick.
+    let declared = db.0.unmanaged_container_reasons();
 
     for (service, default_container) in CANONICAL_INFRA_SERVICES.iter() {
         let service = *service;
@@ -1104,9 +1281,27 @@ async fn run_one_tick(
         // alone BEFORE any probe — its owner's stop is respected.
         let supervision = supervision_for(&db.0, service, default_container);
         if !supervision.compose_managed {
+            // No longer VCO's to supervise: a give-up about it is over.
+            gave_up.remove(service);
             continue;
         }
         let container = supervision.container.as_str();
+
+        // v0.2.102 W5-A (M3): a declared-unmanaged container is left alone
+        // BEFORE any probe — not even an inspect.
+        if let Some(why) = declared_unmanaged_why(&declared, container) {
+            if first_time(&format!("watchdog-unmanaged:{service}:{why}")) {
+                tracing::info!(
+                    service,
+                    container,
+                    why = %why,
+                    "[vct-hub] infra watchdog: NOT supervising a container a project declared \
+                     unmanaged (no inspect, no start, no create)."
+                );
+            }
+            gave_up.remove(service);
+            continue;
+        }
 
         // BLOCKER-2 gate: don't supervise a service that isn't part of THIS
         // install. The GPU-only `code_embed` legitimately doesn't exist on a
@@ -1114,6 +1309,7 @@ async fn run_one_tick(
         // would trigger a multi-GB image build. (Quiet — normal on CPU
         // hosts.)
         if !service_in_stack(service) {
+            gave_up.remove(service);
             continue;
         }
 
@@ -1125,12 +1321,14 @@ async fn run_one_tick(
         match probe {
             ContainerProbe::Running => {
                 // Observing the service UP resets its crash-loop state
-                // (covers external recovery: a user / hook restarted it).
+                // (covers external recovery: a user / hook restarted it)
+                // and clears its give-up record (P299-B3).
                 if let Some(b) = backoffs.get_mut(service) {
                     if b.consecutive_failures > 0 || b.gave_up {
                         b.reset_on_success();
                     }
                 }
+                gave_up.remove(service);
                 ticks_since_attempt.remove(service);
                 continue;
             }
@@ -1148,7 +1346,9 @@ async fn run_one_tick(
 
         // `running == false` here (authoritative NotRunning above).
         if !service_eligible_for_restart(false, supervision.compose_managed, paused) {
-            // Down, but deliberately paused. Leave it alone.
+            // Down, but deliberately paused. Leave it alone — and a give-up
+            // about it is over: the user stopped it on purpose.
+            gave_up.remove(service);
             continue;
         }
 
@@ -1188,10 +1388,13 @@ async fn run_one_tick(
             supervision.row.as_ref(),
             container,
             installer_project.as_deref(),
+            None, // declared-unmanaged containers were skipped above
             || create_missing(&runtime, &infra_dir, service),
             VerifyPolicy::default(),
         )
         .await;
+        // Counter, give-up flag and the given-up set (P299-B3) — one pure fold.
+        let crossed = apply_heal_outcome(service, container, &outcome, backoff, gave_up);
         match outcome {
             HealOutcome::Verified { action } => {
                 tracing::info!(
@@ -1200,13 +1403,12 @@ async fn run_one_tick(
                     action,
                     "[vct-hub] infra watchdog: verified running."
                 );
-                backoff.reset_on_success();
                 ticks_since_attempt.remove(service);
             }
             HealOutcome::AlreadyRunning => {
-                backoff.reset_on_success();
                 ticks_since_attempt.remove(service);
             }
+            HealOutcome::Unmanaged(_) => {}
             HealOutcome::Foreign(why) => {
                 if first_time(&format!("watchdog-foreign:{service}:{why}")) {
                     tracing::warn!(
@@ -1228,8 +1430,7 @@ async fn run_one_tick(
                 );
             }
             HealOutcome::Failed(e) => {
-                backoff.record_failure();
-                if backoff.is_given_up() {
+                if crossed {
                     tracing::error!(
                         service,
                         container,
@@ -1239,7 +1440,8 @@ async fn run_one_tick(
                         "[vct-hub] infra watchdog: GIVING UP after repeated failed \
                          heals. The hub will NOT retry until the service is seen \
                          running again (start it manually, or `touch` the pause \
-                         marker to silence the watchdog for it)."
+                         marker to silence the watchdog for it); recorded as \
+                         watchdog_gave_up."
                     );
                 } else {
                     tracing::warn!(
@@ -1258,12 +1460,18 @@ async fn run_one_tick(
         }
     }
     if let Some(root) = infra_dir.parent() {
-        // The record spawns a bounded Python payload (W4R-05): off the
+        // The records spawn a bounded Python payload (W4R-05): off the
         // runtime's workers, so a slow interpreter never parks the tick's
         // thread — and never longer than the payload's bound.
         let root = root.to_path_buf();
-        if let Err(e) = tokio::task::spawn_blocking(move || record_foreign(&root, &foreign)).await {
-            tracing::warn!("[vct-hub] infra watchdog: foreign-container record task failed: {}", e);
+        let gave_up_now = gave_up.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            record_foreign(&root, &foreign);
+            record_gave_up(&root, &gave_up_now);
+        })
+        .await
+        {
+            tracing::warn!("[vct-hub] infra watchdog: ledger record task failed: {}", e);
         }
     }
 }
@@ -1879,7 +2087,7 @@ mod tests {
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("vibecoded"))));
         let row = managed_row("code_embed");
         let composed = std::cell::Cell::new(false);
-        let out = heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), || {
+        let out = heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), None, || {
             composed.set(true);
             async { Ok(()) }
         }, QUICK)
@@ -1907,7 +2115,7 @@ mod tests {
         r.on("inspect", fail("Error: no such container vco_code_embed"));
         r.on("ps", ok("[]"));
         let row = managed_row("code_embed");
-        let out = heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), || async { Ok(()) }, QUICK).await;
+        let out = heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), None, || async { Ok(()) }, QUICK).await;
         assert!(matches!(&out, HealOutcome::Failed(e) if e.contains("not running")), "{out:?}");
         let mut b = Backoff::default();
         if let HealOutcome::Failed(_) = out {
@@ -1925,7 +2133,7 @@ mod tests {
         r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
         r.on("start", ok(""));
         let row = managed_row("ollama");
-        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), || async {
+        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), None, || async {
             panic!("an existing container is never composed")
         }, QUICK)
         .await;
@@ -1944,7 +2152,7 @@ mod tests {
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
         r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
         r.on("start", ok(""));
-        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), || async {
+        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), None, || async {
             panic!("an existing container is never composed")
         }, QUICK)
         .await;
@@ -1952,7 +2160,7 @@ mod tests {
 
         let r = FakeRunner::new("podman");
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("vibecoded"))));
-        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), || async {
+        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), None, || async {
             panic!("never composed")
         }, QUICK)
         .await;
@@ -1968,7 +2176,7 @@ mod tests {
         r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
         r.on("unpause", ok(""));
         let row = managed_row("weaviate");
-        let out = heal_service(&r, Some(&row), "vco_weaviate", Some("infrastructure"), || async {
+        let out = heal_service(&r, Some(&row), "vco_weaviate", Some("infrastructure"), None, || async {
             panic!("never composed")
         }, QUICK)
         .await;
@@ -1983,7 +2191,7 @@ mod tests {
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
         r.on("start", ok(""));
         let row = managed_row("ollama");
-        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), || async { Ok(()) }, QUICK).await;
+        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), None, || async { Ok(()) }, QUICK).await;
         assert!(matches!(out, HealOutcome::Failed(_)), "{out:?}");
     }
 
@@ -1996,14 +2204,123 @@ mod tests {
         let r = FakeRunner::new("podman");
         r.on("inspect", fail("Error: no such container vco_code_embed"));
         r.on("ps", ok(r#"[{"Names":["vco_code_embed"],"State":"storage"}]"#));
-        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), never, QUICK).await, HealOutcome::Skipped(_)));
+        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), None, never, QUICK).await, HealOutcome::Skipped(_)));
         let r = FakeRunner::new("podman");
         r.on("inspect", fail("Error: cannot connect to podman socket"));
-        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), never, QUICK).await, HealOutcome::Skipped(_)));
+        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), None, never, QUICK).await, HealOutcome::Skipped(_)));
         let r = FakeRunner::new("podman");
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
-        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", None, never, QUICK).await, HealOutcome::Skipped(_)));
+        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", None, None, never, QUICK).await, HealOutcome::Skipped(_)));
         assert_eq!(r.verbs(), vec!["inspect"]);
+    }
+
+    // ----- v0.2.102 W5-A (M3): declared-unmanaged containers ------------
+
+    /// Declared → untouched: not one runtime call (no inspect, start or
+    /// create). Undeclared, the same stopped VCO container is started and
+    /// verified. Both runtimes.
+    #[tokio::test]
+    async fn a_declared_unmanaged_container_is_never_touched_and_an_undeclared_one_is_healed() {
+        for runtime in ["podman", "docker"] {
+            let mut declared = BTreeMap::new();
+            declared.insert("vco_ollama".to_string(), "declared unmanaged by project 'peer-project'".to_string());
+            let declared: Result<BTreeMap<String, String>, String> = Ok(declared);
+            let row = managed_row("ollama");
+
+            let r = FakeRunner::new(runtime);
+            let why = declared_unmanaged_why(&declared, "vco_ollama");
+            let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), why.as_deref(), || async {
+                panic!("a declared container is never created")
+            }, QUICK)
+            .await;
+            assert!(matches!(&out, HealOutcome::Unmanaged(w) if w.contains("peer-project")), "{runtime}: {out:?}");
+            assert!(r.verbs().is_empty(), "{runtime}: no runtime call at all, got {:?}", r.verbs());
+
+            let r = FakeRunner::new(runtime);
+            r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+            r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+            r.on("start", ok(""));
+            let why = declared_unmanaged_why(&declared, "vco_weaviate");
+            assert!(why.is_none());
+            let out = heal_service(&r, Some(&row), "vco_weaviate", Some("infrastructure"), why.as_deref(), || async {
+                panic!("an existing container is never composed")
+            }, QUICK)
+            .await;
+            assert_eq!(out, HealOutcome::Verified { action: "start" }, "{runtime}");
+        }
+    }
+
+    /// An unreadable declaration list keeps every container hands-off.
+    #[test]
+    fn unreadable_declarations_heal_nothing() {
+        let declared: Result<BTreeMap<String, String>, String> = Err("disk I/O error".into());
+        let why = declared_unmanaged_why(&declared, "vco_weaviate").expect("hands-off");
+        assert!(why.contains("could not be read"), "{why}");
+    }
+
+    // ----- v0.2.102 P299-B3: the give-up reaches the ledger -------------
+
+    /// A start that never sticks, MAX times in a row → the service crosses
+    /// into "given up" and the ledger change is an entry naming the service,
+    /// the attempts, the last error and a remedy. Then the leave-alone arm:
+    /// the service seen healthy again resolves it.
+    #[tokio::test]
+    async fn repeated_failed_heals_write_the_gave_up_entry_and_recovery_clears_it() {
+        let row = managed_row("ollama");
+        let mut backoff = Backoff::default();
+        let mut gave_up: BTreeMap<String, GaveUp> = BTreeMap::new();
+        let mut crossings = 0;
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            let r = FakeRunner::new("podman");
+            r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+            r.on("start", ok(""));
+            let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), None, || async { Ok(()) }, QUICK).await;
+            assert!(matches!(out, HealOutcome::Failed(_)), "{out:?}");
+            if apply_heal_outcome("ollama", "vco_ollama", &out, &mut backoff, &mut gave_up) {
+                crossings += 1;
+            }
+        }
+        assert_eq!(crossings, 1, "the crossing is reported exactly once");
+        let g = gave_up.get("ollama").expect("given up");
+        assert_eq!(g.attempts, MAX_CONSECUTIVE_FAILURES);
+        assert!(g.last_error.contains("not running"), "{g:?}");
+        match gave_up_ledger_change(None, &gave_up) {
+            GaveUpLedger::Emit { detected, command } => {
+                assert!(detected.contains("ollama") && detected.contains("vco_ollama"), "{detected}");
+                assert!(detected.contains(&format!("{} failed heal", MAX_CONSECUTIVE_FAILURES)), "{detected}");
+                assert!(command.contains("install.py --update"), "{command}");
+            }
+            other => panic!("expected an entry, got {other:?}"),
+        }
+        let recorded = gave_up.clone();
+        assert_eq!(gave_up_ledger_change(Some(&recorded), &gave_up), GaveUpLedger::Unchanged);
+
+        // Leave-alone arm: the next heal verifies → the record resolves.
+        let r = FakeRunner::new("docker");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+        r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+        r.on("start", ok(""));
+        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), None, || async { Ok(()) }, QUICK).await;
+        assert!(!apply_heal_outcome("ollama", "vco_ollama", &out, &mut backoff, &mut gave_up));
+        assert!(gave_up.is_empty() && !backoff.is_given_up());
+        assert_eq!(gave_up_ledger_change(Some(&recorded), &gave_up), GaveUpLedger::Resolve);
+    }
+
+    /// Below the budget nothing is written; skips / foreign / unmanaged never
+    /// count toward it.
+    #[test]
+    fn fewer_failures_and_non_failures_write_nothing() {
+        let mut backoff = Backoff::default();
+        let mut gave_up = BTreeMap::new();
+        for _ in 1..MAX_CONSECUTIVE_FAILURES {
+            apply_heal_outcome("weaviate", "vco_weaviate", &HealOutcome::Failed("x".into()), &mut backoff, &mut gave_up);
+        }
+        for o in [HealOutcome::Skipped("s".into()), HealOutcome::Foreign("f".into()), HealOutcome::Unmanaged("u".into())] {
+            apply_heal_outcome("weaviate", "vco_weaviate", &o, &mut backoff, &mut gave_up);
+        }
+        assert!(gave_up.is_empty());
+        assert_eq!(backoff.consecutive_failures, MAX_CONSECUTIVE_FAILURES - 1);
+        assert_eq!(gave_up_ledger_change(None, &gave_up), GaveUpLedger::Resolve);
     }
 
     #[test]

@@ -1405,6 +1405,8 @@ def reconcile(
 
     taken = {c.port for s in SERVICES for c in detection.for_service(s) if c.port}
     taken |= {port for c in detection.containers for port in c.host_ports.values()}
+    # v0.2.102 W5-A (M3): a declared project's ports are never VCO's to take.
+    taken |= set(getattr(detection, "reserved_ports", ()) or ())
     for service in SERVICES:
         others = {r.port for s, r in result.rows.items() if s != service}
         others |= {r.grpc_port for r in result.rows.values() if r.grpc_port}

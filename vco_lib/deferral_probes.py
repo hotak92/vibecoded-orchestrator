@@ -913,6 +913,28 @@ def kg_unclaimed_classes_still_present(ctx: ProbeContext) -> Optional[bool]:
     return bool(scan.unclaimed)
 
 
+def compose_override_pair_still_diverged(ctx: ProbeContext) -> Optional[bool]:
+    """``compose_override_pair_diverged`` — do the two override halves in the
+    install's ``infrastructure/`` still hold different configurations?
+
+    The SAME reading both emitters use — the doctor's probe and the
+    install-time rename pass (:func:`vco_lib.compose_override_pair.divergent_pairs`
+    over every directory the pass walks). True: a pair still diverges.
+    False: every pair is equal, single or absent — the state is over.
+    None: ``ctx.folder`` is not an install root (no ``vco_lib/``), so the pairs
+    it would read are not the ones the entry named.
+    """
+    from vco_lib import compose_override_pair as cop
+
+    folder = Path(ctx.folder)
+    if not (folder / "vco_lib" / "__init__.py").is_file():
+        return None
+    try:
+        return bool(cop.divergent_pairs(folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def service_endpoint_still_unreachable(ctx: ProbeContext) -> Optional[bool]:
     """``service_endpoint_unreachable`` — do the named rows still not answer?
 
@@ -1232,6 +1254,7 @@ PROBES: dict[str, ProbeFn] = {
     "env_reprojection_still_owed": env_reprojection_still_owed,
     "kg_binding_evidence_still_mismatched": kg_binding_evidence_still_mismatched,
     "kg_unclaimed_classes_still_present": kg_unclaimed_classes_still_present,
+    "compose_override_pair_still_diverged": compose_override_pair_still_diverged,
     "parked_hook_conflict_still_present": parked_hook_conflict_still_present,
     "async_subhook_disable_carry_still_owed": async_subhook_disable_carry_still_owed,
     "project_hooks_relative_paths_still_present": project_hooks_relative_paths_still_present,

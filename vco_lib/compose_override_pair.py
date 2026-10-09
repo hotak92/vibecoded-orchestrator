@@ -11,12 +11,44 @@ two questions about a coexisting pair:
 * :func:`classify_pair` (v0.2.83 B-F2) — byte-identical / YAML-equal /
   divergent;
 * :func:`reconcile_vco_generated_pair` (v0.2.100 U16) — for a divergent pair
-  whose BOTH halves VCO generated, reconcile them instead of asking the user.
+  whose BOTH halves VCO generated, reconcile them instead of asking the user;
+* :func:`pair_state` (v0.2.102 W5-A, P299-B2) — the general case: are the two
+  auto-load halves in an install's ``infrastructure/`` the same config? A
+  divergent pair means docker compose and podman-compose run DIFFERENT
+  configurations (the 2026-09 outage: one twin hand-fixed, the other still
+  poisoned). The doctor and the install-time rename pass both report it as
+  ``compose_override_pair_diverged`` (one entry builder:
+  :func:`divergent_pairs_entry`) and
+  every Python override writer refuses to overwrite such a pair
+  (``service_adoption.write_adoption_override``) — a divergent half may be a
+  user's edit, and only the user can say which half is right.
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+
+#: Docker Compose v1's auto-load name for the override.
+LEGACY_NAME = "docker-compose.override.yml"
+#: podman-compose's (and Compose v2's preferred) auto-load name.
+CANONICAL_NAME = "compose.override.yaml"
+
+#: The directories under an install root that may hold an override pair: the
+#: compose home, and the hand-edited legacy location some users have. ONE home
+#: — the install-time rename pass (``project_init``), the doctor and the clear
+#: probe all walk exactly these.
+SEARCH_SUBDIRS: tuple[str, ...] = ("infrastructure", "claude_mcp_servers")
+
+#: The ONE condition for "the two halves hold different configurations"
+#: (v0.2.102 W5-A). It SUPERSEDES the install-time pass's former
+#: ``compose_override_filename_conflict`` (retired in the registry; existing
+#: entries of the old id drain through the rename pass's reconcile).
+CID_PAIR_DIVERGED = "compose_override_pair_diverged"
+
+PAIR_ABSENT = "absent"        # neither half exists
+PAIR_SINGLE = "single"        # exactly one half exists — nothing to diverge
+PAIR_EQUAL = "equal"          # both exist; byte-identical or YAML-equal
+PAIR_DIVERGENT = "divergent"  # both exist and differ (or cannot be compared)
 
 
 def classify_pair(legacy_path: Path, canonical_path: Path) -> str:
@@ -34,7 +66,8 @@ def classify_pair(legacy_path: Path, canonical_path: Path) -> str:
         user's "update to use the new one" ruling), NO deferral.
       * ``"divergent"``     — genuinely different (parse failure on either side,
         yaml unavailable, or parsed-unequal). B-F2(iii): keep today's
-        ``compose_override_filename_conflict`` deferral verbatim.
+        divergent-pair deferral (``compose_override_pair_diverged`` since
+        v0.2.102; ``compose_override_filename_conflict`` before).
 
     Conservative on every uncertainty: unreadable file, import-yaml failure, or
     a parse error anywhere ⇒ ``"divergent"`` (defer to human judgement).
@@ -152,3 +185,105 @@ def reconcile_vco_generated_pair(
     return (f"reconciled VCO's own generated override pair: `{canonical_path}` = the newest "
             f"generator output (`{newest.name}`, {rule}), `{legacy_path.name}` re-mirrored; the "
             f"replaced bytes are in {_ADOPT_BACKUPS_REL.as_posix()}/{ts}/")
+
+
+def pair_state(infra_dir: Path) -> str:
+    """The state of the override pair in ``infra_dir`` (v0.2.102 P299-B2).
+
+    One of :data:`PAIR_ABSENT`, :data:`PAIR_SINGLE`, :data:`PAIR_EQUAL`,
+    :data:`PAIR_DIVERGENT`. Equality is :func:`classify_pair`'s — the rename
+    pass's rule, so the doctor and the install pass cannot disagree about what
+    "the same config" means; its conservative arm (unreadable, unparsable,
+    PyYAML missing) reads as divergent, never as equal.
+    """
+    legacy = Path(infra_dir) / LEGACY_NAME
+    canonical = Path(infra_dir) / CANONICAL_NAME
+    present = [p for p in (legacy, canonical) if p.is_file()]
+    if not present:
+        return PAIR_ABSENT
+    if len(present) == 1:
+        return PAIR_SINGLE
+    if classify_pair(legacy, canonical) in ("identical", "semantic_equal"):
+        return PAIR_EQUAL
+    return PAIR_DIVERGENT
+
+
+def divergent_pair_refusal(infra_dir: Path) -> Optional[str]:
+    """The refusal an override WRITER returns for a divergent pair, else None.
+
+    Writing one body to both names would silently replace whichever half the
+    user edited; the writer must leave both alone and say why.
+    """
+    if pair_state(infra_dir) != PAIR_DIVERGENT:
+        return None
+    return (
+        f"{Path(infra_dir) / CANONICAL_NAME} and {Path(infra_dir) / LEGACY_NAME} hold "
+        "DIFFERENT configurations (one may be a hand edit) — refusing to overwrite "
+        "either; make them agree (or delete the stale one), then re-run"
+    )
+
+
+def divergent_pairs(install_root: Path) -> list[tuple[Path, Path]]:
+    """Every ``(legacy, canonical)`` pair under :data:`SEARCH_SUBDIRS` of
+    ``install_root`` whose halves diverge (:func:`pair_state`)."""
+    out: list[tuple[Path, Path]] = []
+    for sub in SEARCH_SUBDIRS:
+        d = Path(install_root) / sub
+        if pair_state(d) == PAIR_DIVERGENT:
+            out.append((d / LEGACY_NAME, d / CANONICAL_NAME))
+    return out
+
+
+def pair_remediation(pairs: "list[tuple[Path, Path]]") -> str:
+    """The read-only remedy every surface prints for divergent pairs."""
+    from vco_lib import remedy_shell
+
+    compare = "fc" if remedy_shell.is_windows() else "diff"
+    lines = [
+        "# The two override auto-load names hold DIFFERENT configurations:",
+        "#   podman-compose reads compose.override.yaml, docker compose v1 reads",
+        "#   docker-compose.override.yml, so the two runtimes start different",
+        "#   stacks. Compare each pair (read-only):",
+    ]
+    for legacy, canonical in pairs:
+        lines.append(f"{compare} {remedy_shell.quote(legacy)} {remedy_shell.quote(canonical)}")
+    lines += [
+        "# Keep the half that is right, make the other identical to it (or",
+        "# delete the stale one). VCO overwrites neither while they differ.",
+        "# Then confirm: vco doctor   (this entry clears itself once they agree)",
+    ]
+    return remedy_shell.steps(*lines)
+
+
+def divergent_pairs_summary(pairs: "list[tuple[Path, Path]]") -> str:
+    names = "; ".join(f"{canonical} vs {legacy}" for legacy, canonical in pairs)
+    return (
+        f"{len(pairs)} compose override pair(s) hold different configurations — "
+        f"podman-compose and docker compose would start different stacks: {names}"
+    )
+
+
+def divergent_pairs_entry(pairs: "list[tuple[Path, Path]]", *, detected: Optional[str] = None):
+    """The ONE ``compose_override_pair_diverged`` deferral entry — built here
+    for both emitters (the doctor's probe and the install-time rename pass), so
+    the two can never word the same state differently."""
+    from vco_lib.deferral_report import DeferralEntry
+
+    return DeferralEntry(
+        condition_id=CID_PAIR_DIVERGED,
+        title="The two compose override files disagree",
+        detected=detected or divergent_pairs_summary(pairs),
+        why_deferred=(
+            "Only you can say which half is right: either may be a hand edit (the "
+            "2026-09 outage left one twin fixed by hand and the other still broken), "
+            "and auto-merging override YAML is unsafe — the halves may encode "
+            "different volume sources, ports or services. VCO overwrites neither "
+            "while they differ: its override writers refuse the pair and the "
+            "install-time rename pass does not rename it. The entry clears itself "
+            "as soon as the two files agree or one is removed — at the next doctor "
+            "run, install or update."
+        ),
+        command_to_apply=pair_remediation(pairs),
+        severity="warning",
+        kg_node_refs=["docs/TROUBLESHOOTING.md"],
+    )

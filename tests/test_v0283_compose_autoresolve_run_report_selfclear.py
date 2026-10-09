@@ -5,7 +5,7 @@ seed→finalize choreography (no resurrection).
 
 Mechanism the fix closes:
 
-* ``compose_override_filename_conflict`` (and its siblings
+* ``compose_override_pair_diverged`` (and its siblings
   ``compose_override_renamed`` / ``_rename_failed``) are FOREIGN to install.py
   — ``project_init`` emits them, so they are NOT in
   ``install._INSTALL_OWNED_CONDITION_IDS`` / ``_PREFIXES``.
@@ -59,7 +59,7 @@ from vco_lib import project_init  # noqa: E402
 from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
 from vco_lib.install_deferral_flow import InstallDeferralFlow  # noqa: E402
 
-_CONFLICT_CID = "compose_override_filename_conflict"
+_CONFLICT_CID = "compose_override_pair_diverged"
 _RENAMED_CID = "compose_override_renamed"
 _RENAME_FAILED_CID = "compose_override_rename_failed"
 _LEGACY = "docker-compose.override.yml"

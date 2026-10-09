@@ -219,6 +219,8 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 49 = migration 049_project_infra_declarations.sql (v0.2.102 W5-A / M3 —
+#: per-project external collections, unmanaged containers and local ports).
 #: 48 = migration 048_chat_model_context_text_only.sql (v0.2.101 — the
 #: image-capability flag: 1 = the vendor page states the model takes
 #: TEXT-ONLY input, so the gateway replaces image blocks routed to it with a
@@ -295,7 +297,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 48
+LAUNCHER_DB_TABLE_SET_VERSION = 49
 
 
 # ===========================================================================

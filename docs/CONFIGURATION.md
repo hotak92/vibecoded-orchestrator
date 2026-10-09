@@ -148,6 +148,18 @@ The inputs this chain replaced are **retired**: `VCT_WEAVIATE_URL` / `VCT_OLLAMA
 | `CODE_EMBED_PORT` | `11440` | Host port for the code-embed container, written from the row into `infrastructure/.env`. Same not-a-user-knob rule as `OLLAMA_PORT`. |
 | `WEAVIATE_GRPC_PORT` | `50052` | Weaviate gRPC port used by the `weaviate-kg` MCP client and published by the compose file; projected from the row's `grpc_port`. `GRPC_PORT` is the legacy `.claude/settings.json` spelling and still works; the `WEAVIATE_`-prefixed name is canonical. |
 
+### A project's own Weaviate / Ollama — infrastructure declarations (v0.2.102)
+
+A project may run its OWN Weaviate or Ollama for its own runtime (a second Weaviate on `8082`, an Ollama on `11436`) while VCO keeps its development KG on the machine's Weaviate above — the separation is by design, since VCO has no per-project instance override. What VCO needs is to never mistake the project's pieces for its own, so the project declares them on the launcher's Identity tab (**Infrastructure this project owns**), stored in `launcher.db` `project_infra_declarations` (migration 049) and read by one module, `vco_lib/infra_declarations.py` (Rust: `vct-launcher-core/src/db/infra_declarations.rs`):
+
+| Declaration | Projected env key | Honoured by |
+|---|---|---|
+| External collections | `VCT_EXTERNAL_COLLECTIONS` | the doctor's binding-evidence scan: never unclaimed, never fixture-shaped, never evidence for a binding repoint; named as skipped with its declarer |
+| Unmanaged containers | `VCT_UNMANAGED_CONTAINERS` | the hub watchdog (not even inspected), compose-recovery heals (refused), service detection (never an adoption candidate, its ports never taken), the doctor (no rebuild printed for it) |
+| Local ports | `VCT_SSRF_EXTRA_LOCAL_PORTS` | the WebFetch SSRF guard (allowed for this project, loopback only), service detection (never probed) |
+
+Each key is comma-separated and emitted only when the project declares something of that kind (removing the last declaration removes the key). The keys are the projection the Python readers see (and, exported in the shell, the only channel of a launcher-less install); the hub watchdog reads `launcher.db` itself. The hub's `/config` serves the same three lists (`external_collections`, `unmanaged_containers`, `ssrf_extra_local_ports`); `vct_project_config.{sh,ps1} --field <name>` prints one value per line. Containers and collections are protected machine-wide whichever project declared them; the SSRF allowance is per-project. A launcher.db that exists but cannot be read makes every heal of a VCO container refuse.
+
 ## Knowledge graph env vars
 
 The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup, resolved through the 5-level chain above. The launcher's env projection (`python -m vco_lib.config_projection apply`) writes the canonical per-project values into both `.claude/env` (POSIX shell-sourceable) and `.claude/settings.json::env` (the channel that actually propagates to MCP subprocesses on Linux).
@@ -326,6 +338,8 @@ Bounded and non-destructive: exactly one extra request, nothing restarts or loop
 ## WebFetch SSRF guard
 
 The `pre-tool-use` hook checks every WebFetch URL against a private-address guard (`vco_lib/ssrf_url.py` is the one implementation). Alongside the local services (Weaviate, Ollama, code-embed), `http://localhost:<hub port>` — the port resolved by the same `VCT_HUB_PORT` → `hub.port` → `7700` ladder above — is **deliberately allowlisted** so WebFetch can reach the hub's `/api/v1/...` routes locally; this is safe because every `/api/v1/*` route except the `/api/v1/health` liveness probe requires the bearer token from `<vct_root_dir>/hub.token` (mode `0o600`), with the per-project `/env` and `/config` routes additionally requiring a project-scoped token, so an allowlisted fetch without the token learns nothing (v0.2.102 NB-H4 / OD-18).
+
+A project that runs its own local service (its own Ollama on `11436`, say) can let WebFetch reach it by declaring the port on the launcher's Identity tab (**Infrastructure this project owns → Local ports**). The declaration is projected into that project's `.claude/settings.json` `env` as `VCT_SSRF_EXTRA_LOCAL_PORTS` (comma-separated); the guard allows each listed port as a loopback pair (`localhost` / `127.0.0.1` / `[::1]`) for that project only. Invalid entries are ignored, and a port nobody declared stays blocked. On a launcher-less install, export the variable in the shell that starts Claude Code instead — VCO's env projection owns the key in `.claude/settings.json` and removes a hand-added copy on the next apply.
 
 ## Paid-module license framework
 
