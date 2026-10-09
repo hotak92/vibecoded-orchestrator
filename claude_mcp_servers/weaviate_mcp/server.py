@@ -199,7 +199,6 @@ except ImportError:
 from mcp.server.fastmcp import FastMCP
 import weaviate
 from weaviate.classes.query import Filter, MetadataQuery, QueryReference
-import aiohttp
 
 # FN-5a (v0.2.81): the six REQUIRED shipped-submodule relative imports below
 # (`.chunking`, `.code_ranking`, `.rl_state`, `.embeddings` ×2, `.rl_enrichment`)
@@ -2468,6 +2467,14 @@ def _format_code_result_by_tier(
     body_out = assembled or matched_body
     out[body_field] = (header + body_out) if header else body_out
     out["chunks_shown"] = len(chunks)
+    # v0.2.102 W4-G: the window (3 / 7 chunks) can be smaller than the entity
+    # — a `full`-tier result over a 12-chunk body is NOT the whole body. Say
+    # so, exactly like the single-chunk truncated views above.
+    if len(chunks) < total:
+        out["note"] = (
+            f"Showing {len(chunks)} of {total} chunks (partial view). "
+            "Read the source file for the full body."
+        )
     return out
 
 
@@ -2821,6 +2828,32 @@ def _fetch_node_chunks(
         return []
 
 
+def _label_single_chunk_coverage(base: dict, result: dict) -> None:
+    """Coverage label for a SINGLE-chunk node whose body is ``base["content"]``.
+
+    v0.2.102 W4-G (a dogfood finding): ``_format_obj`` truncates the display
+    ``content`` to 300 chars, and the single-chunk fallbacks below returned
+    that preview labelled ``coverage: complete`` + "No further Read … needed"
+    — a false promise, so agents worked from a preview. Now: complete only
+    when the body is the whole node; a truncated preview is labelled
+    ``partial`` with a hint naming the file to Read.
+    """
+    if result.get("content_truncated"):
+        fp = result.get("file_path", "") or ""
+        base["coverage"] = "partial"
+        base["retrieval_hint"] = (
+            "Preview only (the first 300 characters of the node). Read "
+            + (fp if fp else "the source file")
+            + " for the full content."
+        )
+        return
+    base["coverage"] = "complete"
+    base["retrieval_hint"] = (
+        "Full node provided (single-chunk node). No further Read of the "
+        "source file is needed."
+    )
+
+
 def _format_result_by_tier(
     result: dict,
     tier: str,
@@ -2943,6 +2976,27 @@ def _format_result_by_tier(
             )
         return base
 
+    # v0.2.102 W4-G: a SINGLE-chunk node whose row was fetched → return the
+    # row's FULL body (the result's `content` is `_format_obj`'s 300-char
+    # display preview). "complete" keeps the W7 rule: it needs the node key
+    # (`file_path`) and exactly one confirmed row.
+    if chunks and not (total_chunks and total_chunks > 1):
+        base["content"] = "\n".join(c for _, c in chunks)
+        if fp and len(chunks) == 1:
+            _label_single_chunk_coverage(base, {"file_path": fp})
+        else:
+            # No node key, or more than one row matched: the body may mix two
+            # nodes (the W7 rule), so it is not certified — say so explicitly,
+            # like the single-chunk preview path, instead of leaving no label.
+            base["coverage"] = "partial"
+            base["retrieval_hint"] = (
+                "Could not confirm this is the whole node (no file key, or "
+                "more than one matching row). Read "
+                + (fp if fp else "the source file")
+                + " for the full content."
+            )
+        return base
+
     # Single-chunk node (or coll unavailable) — return content as-is.
     if tier == "single_chunk":
         # For multi-chunk nodes where we couldn't fetch, prepend node summary if available.
@@ -2951,13 +3005,10 @@ def _format_result_by_tier(
             base["content"] = f"[Node summary: {node_summary}]\n\n{content}"
         else:
             base["content"] = content
-            # Single-chunk node returned whole at single_chunk tier → complete.
+            # Single-chunk node at single_chunk tier → complete unless the
+            # content is a truncated preview (then partial + Read hint).
             if not (total_chunks and total_chunks > 1):
-                base["coverage"] = "complete"
-                base["retrieval_hint"] = (
-                    "Full node provided (single-chunk node). No further Read of "
-                    "the source file is needed."
-                )
+                _label_single_chunk_coverage(base, result)
         return base
 
     # three_chunks / full fallback when chunk fetch failed: return full snippet.
@@ -2970,12 +3021,10 @@ def _format_result_by_tier(
     # redundantly Read the source file. For a MULTI-chunk node that reached this
     # fallback because chunk-fetch FAILED, coverage is NOT complete (content is
     # the single matched chunk's snippet) → no hint, so the caller knows to Read.
+    # v0.2.102 W4-G: unless that content is `_format_obj`'s truncated
+    # preview — then it is labelled partial with a hint naming the file.
     if not (total_chunks and total_chunks > 1):
-        base["coverage"] = "complete"
-        base["retrieval_hint"] = (
-            "Full node provided (single-chunk node). No further Read of the "
-            "source file is needed."
-        )
+        _label_single_chunk_coverage(base, result)
     return base
 
 
@@ -3454,66 +3503,26 @@ def _kg_collections_to_search(include_dev: bool = False) -> list[str]:
 
 # ─── v0.2.102 S2: per-node cross_project_access enforcement (read side) ───
 #
-# The WRITE side is the launcher's per-node access editor
-# (`kg_set_node_access` / `kg_set_node_access_bulk`, Rust commands/kg.rs):
-# it PATCHes ``cross_project_access: text[]`` onto the Weaviate object —
-# ``["*"]`` = readable by every project, ``[<project-id>…]`` = exactly those
-# launcher project ids, ``[]`` = private. Until v0.2.102 NOTHING read the
-# property (the v0.2.91 hooks-placebo class): the editor's restrictions were
-# saved and ignored. This is the ONE read-side filter builder; every
-# cross-collection fan-out site applies it to rows from a NON-SELF collection.
-#
-# Back-compat BOTH arms: a row whose collection does not carry the property
-# (legacy classes, code-graph collections the editor never touched) is
-# UNRESTRICTED — enforcement only judges rows that positively carry a
-# restriction. The SELF collection is never filtered (its rows are this
-# project's own data; the collection-level access matrix already governs
-# which peers see the collection at all).
+# The verdict, the row filter and the requester-id rungs live in ONE home,
+# `vco_lib/kg_node_access.py`, shared with the kg-search / kg-info CLIs and
+# (through the wrappers below) the hook router's KG leg — so the launcher's
+# "Enforced on cross-project reads" notice holds on EVERY KG read surface,
+# not only this MCP's fan-out. These wrappers only bind the module's own
+# config seam (`_try_resolve_project_config`) as the requester source.
+import vco_lib.kg_node_access as _kg_node_access  # noqa: E402
 
-
-def _cross_project_access_allows(props, requester_project_id: str) -> bool:
-    """May ONE row from a peer collection reach *requester_project_id*?
-
-    ``props`` is the row's raw properties mapping (``None``-safe). The
-    verdict table for ``cross_project_access``:
-
-    * absent / ``None`` → ALLOW (legacy row, never restricted);
-    * contains ``"*"`` → ALLOW (explicitly shared with every project);
-    * non-empty list → ALLOW only when *requester_project_id* is in it;
-    * empty list → DENY (the writer's ``private`` mode);
-    * a value that is neither list/tuple nor ``None`` → DENY (a malformed
-      restriction is still a restriction — never guess a row onto a list).
-
-    A non-empty restriction with an UNRESOLVABLE requester id
-    (``""`` — hub down, env-fallback peer list) DENIES: the row demands
-    proof of identity, and this process cannot present one.
-    """
-    if not isinstance(props, dict):
-        return True  # unreadable properties never carried a restriction we can read
-    allowed = props.get("cross_project_access")
-    if allowed is None:
-        return True
-    if not isinstance(allowed, (list, tuple)):
-        return False
-    if "*" in allowed:
-        return True
-    if not allowed:
-        return False
-    return bool(requester_project_id) and requester_project_id in allowed
+_cross_project_access_allows = _kg_node_access.allows
 
 
 def _own_project_id_for_access() -> str:
     """This process's launcher project id, or ``""`` when unresolvable.
 
-    The restriction lists carry launcher project ids (the writer's GUI
-    picker sends ``project.id``), and the hub's ``ProjectConfig.project_id``
-    is the same id — one namespace, resolved through the ONE config seam
-    this module already uses. Env-fallback peer resolution (hub down) has no
-    id, hence ``""`` (and ``_cross_project_access_allows`` denies restricted
-    rows on it).
+    Hub-resolved ``ProjectConfig.project_id`` first, then the
+    launcher-projected ``$VCT_PROJECT_ID`` (``kg_node_access.
+    requester_from_config``); ``""`` when neither is known, and
+    ``_cross_project_access_allows`` then denies restricted rows.
     """
-    cfg = _try_resolve_project_config()
-    return (getattr(cfg, "project_id", "") or "") if cfg is not None else ""
+    return _kg_node_access.requester_from_config(_try_resolve_project_config())
 
 
 def _filter_cross_project_access(objects: list, *, is_self: bool) -> list:
@@ -3523,18 +3532,12 @@ def _filter_cross_project_access(objects: list, *, is_self: bool) -> list:
     each call site decides what "self" means — KG: ``coll_name ==
     KG_COLLECTION``; code-graph: the row's prefix equals the effective
     project's own prefix, with the bare cross-tenant path treated as self by
-    explicit request). One home, used by every fan-out site so the rule
-    cannot drift between them.
+    explicit request). The requester id is resolved lazily — only when a
+    row's verdict depends on it.
     """
-    if is_self:
-        return objects
-    requester = _own_project_id_for_access()
-    return [
-        obj for obj in objects
-        if _cross_project_access_allows(
-            getattr(obj, "properties", None), requester,
-        )
-    ]
+    return _kg_node_access.filter_objects(
+        objects, is_self=is_self, requester=_own_project_id_for_access,
+    )
 
 
 def _describe_collection_source(coll_name: str) -> str:
@@ -3581,7 +3584,6 @@ def _format_failed_collections_hint(failed: list[str]) -> str:
 # Base directory for KG markdown files. When set, store_knowledge_node will
 # write the .md file if it doesn't already exist (file_path is relative to this dir).
 KG_BASE_DIR = os.getenv("KG_BASE_DIR", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # Fallback base directory: the orchestrator project root inferred from this server's location.
 # server.py lives at  <project>/claude_mcp_servers/weaviate_mcp/server.py
 # so parent.parent.parent = <project>/
@@ -4904,6 +4906,10 @@ def _format_obj(obj, collection_name: str, distance: float | None = None) -> dic
         "title": title,
         "node_type": obj.properties.get("node_type") or _default_node_type,
         "content": content[:300] + "..." if len(content) > 300 else content,
+        # v0.2.102 W4-G: says the display `content` above is a PREVIEW, so the
+        # tier renderer never labels it the whole node (`coverage: complete`)
+        # — it fetches the full row or says "preview" and points at the file.
+        "content_truncated": len(content) > 300,
         # Full-body fingerprint (untruncated) for content-identity dedup. See
         # the comment above + content_dedup.content_identity_key's truncation
         # guard. Empty string when content is empty (helper then falls back to
@@ -6005,6 +6011,9 @@ async def _hybrid_search_single_collection(
             # field. Without this the rebuilt entry would lose content_sha and
             # the collapse would fall back to hashing the truncated body.
             "content_sha": r.get("content_sha", ""),
+            # v0.2.102 W4-G: keep the preview flag so the tier renderer can
+            # tell a truncated `content` from a whole single-chunk node.
+            "content_truncated": bool(r.get("content_truncated")),
             "tags": r.get("tags", []),
             "file_path": r.get("file_path", ""),
             "collection": coll_name,
@@ -6050,6 +6059,7 @@ async def _hybrid_search_single_collection(
                 # propagate the full-body fingerprint so the collapse content
                 # pass never keys on the truncated display body.
                 "content_sha": formatted_kw.get("content_sha", ""),
+                "content_truncated": bool(formatted_kw.get("content_truncated")),
                 "tags": formatted_kw.get("tags", []),
                 "file_path": formatted_kw.get("file_path", ""),
                 "collection": coll_name,
@@ -9110,157 +9120,6 @@ def query_code_structure(
             "success": False,
             "error": str(e)
         }, indent=2)
-
-
-async def nl_code_query(
-    question: str,
-    model: str = "claude/haiku",
-    project: str = None
-) -> str:
-    """
-    Translate a natural language question about code structure into a structured query and execute it.
-
-    Uses a local or cloud LLM to interpret the question and call query_code_structure() automatically.
-
-    Examples:
-      "What does the authenticate function call?" → callers query on authenticate
-      "What classes inherit from BaseModel?" → extends query
-      "What does orchestrator/agents/blackboard.py import?" → dependencies query
-      "Find a path from handle_request to send_response" → path query
-
-    Args:
-        question: Natural language question about code structure
-        model: Model to use for NL interpretation. Format: "claude/haiku", "ollama/qwen3.5:0.8b",
-               "ollama/qwen3.5:9b". Default: "claude/haiku" (uses ANTHROPIC_API_KEY env var).
-               Ollama models are free and run locally.
-        project: Optional project name filter (same as query_code_structure)
-    """
-    _CLAUDE_MODEL_MAP = {
-        "claude/haiku": "claude-haiku-5-5",
-        "claude/sonnet": "claude-sonnet-4-6",
-        "claude/opus": "claude-opus-4-6",
-    }
-
-    system_prompt = (
-        "You are a code structure query interpreter. Given a natural language question about code, "
-        "extract the query_type and target for query_code_structure().\n\n"
-        "Available query_type values and their target formats:\n"
-        "- dependencies: target = file path (e.g. 'orchestrator/agents/blackboard.py')\n"
-        "- imports: target = module path that is imported (e.g. 'orchestrator.utils')\n"
-        "- callers: target = full function name (e.g. 'orchestrator.agents.blackboard.claim')\n"
-        "- methods: target = full class name (e.g. 'orchestrator.agents.blackboard.Blackboard')\n"
-        "- extends: target = full class name (e.g. 'orchestrator.agents.base.BaseAgent')\n"
-        "- interactions: target = full function name or file path\n"
-        "- path: target = 'source_full_name->dest_full_name' (e.g. 'module.foo->module.bar')\n\n"
-        "Respond ONLY with a JSON object with exactly two keys: query_type and target.\n"
-        "Example: {\"query_type\": \"callers\", \"target\": \"orchestrator.agents.blackboard.claim\"}"
-    )
-    user_prompt = f"Question: {question}"
-
-    try:
-        if model.startswith("claude/"):
-            anthropic_model = _CLAUDE_MODEL_MAP.get(model, "claude-haiku-5-5")
-            if not ANTHROPIC_API_KEY:
-                return json.dumps({
-                    "success": False,
-                    "error": "ANTHROPIC_API_KEY env var not set; use an ollama/ model instead",
-                    "question": question,
-                }, indent=2)
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": ANTHROPIC_API_KEY,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": anthropic_model,
-                        "max_tokens": 256,
-                        "system": system_prompt,
-                        "messages": [{"role": "user", "content": user_prompt}],
-                    },
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        return json.dumps({
-                            "success": False,
-                            "error": f"Anthropic API error {resp.status}: {body[:200]}",
-                            "question": question,
-                        }, indent=2)
-                    data = await resp.json()
-                    raw_text = data["content"][0]["text"]
-
-        elif model.startswith("ollama/"):
-            ollama_model = model[len("ollama/"):]
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{OLLAMA_URL}/api/generate",
-                    json={
-                        "model": ollama_model,
-                        "prompt": f"{system_prompt}\n\n{user_prompt}",
-                        "stream": False,
-                    },
-                    timeout=aiohttp.ClientTimeout(total=60),
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        return json.dumps({
-                            "success": False,
-                            "error": f"Ollama API error {resp.status}: {body[:200]}",
-                            "question": question,
-                        }, indent=2)
-                    data = await resp.json()
-                    raw_text = data.get("response", "")
-
-        else:
-            return json.dumps({
-                "success": False,
-                "error": f"Unknown model prefix in '{model}'. Use 'claude/' or 'ollama/'.",
-                "question": question,
-            }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "success": False,
-            "error": f"Model call failed: {e}",
-            "question": question,
-        }, indent=2)
-
-    # Extract JSON from the model response (may be wrapped in markdown fences)
-    json_match = re.search(r'\{[^{}]+\}', raw_text, re.DOTALL)
-    if not json_match:
-        return json.dumps({
-            "success": False,
-            "error": f"Could not parse JSON from model response: {raw_text[:300]}",
-            "question": question,
-        }, indent=2)
-
-    try:
-        parsed = json.loads(json_match.group())
-        query_type = str(parsed["query_type"]).strip()
-        target = str(parsed["target"]).strip()
-    except (KeyError, json.JSONDecodeError) as e:
-        return json.dumps({
-            "success": False,
-            "error": f"JSON missing query_type/target: {e}. Raw: {raw_text[:300]}",
-            "question": question,
-        }, indent=2)
-
-    # Execute the interpreted query
-    result_str = query_code_structure(query_type, target, project)
-    try:
-        result = json.loads(result_str)
-    except json.JSONDecodeError:
-        result = {"raw": result_str}
-
-    return json.dumps({
-        "question": question,
-        "interpreted_as": {"query_type": query_type, "target": target},
-        "model_used": model,
-        **result,
-    }, indent=2)
 
 
 async def migrate_embeddings(

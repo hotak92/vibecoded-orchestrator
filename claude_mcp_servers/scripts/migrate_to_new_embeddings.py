@@ -295,22 +295,9 @@ def get_code_embedding(text: str) -> list[float] | None:
     # both retried on the ONE shared bounded policy (never a first-shot
     # drop). Without vco_lib the single-shot pre-v0.2.102 shape is kept.
     try:
-        from vco_lib.retry_after import retry_transient_embed
+        from vco_lib.retry_after import post_code_embed
 
-        def _post():
-            resp = requests.post(
-                f"{CODE_EMBED_SERVICE_URL}/api/embeddings",
-                json={"model": "", "prompt": text},
-                timeout=60,
-            )
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"CodeEmbed /api/embeddings returned HTTP {resp.status_code}: "
-                    f"{resp.text[:200]}"
-                )
-            return resp.json()["embedding"]
-
-        return retry_transient_embed(_post, log=logger)
+        return post_code_embed(CODE_EMBED_SERVICE_URL, text, log=logger)
     except ImportError:
         pass
     except Exception as e:

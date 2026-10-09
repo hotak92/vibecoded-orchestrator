@@ -85,6 +85,27 @@ def _resolve_kg_collections() -> tuple[str, str]:
 
 
 KG_COLLECTION, SHARED_KG_COLLECTION = _resolve_kg_collections()
+
+
+def _access_filter(objects, coll_name: str) -> list:
+    """v0.2.102 W4-G: per-node ``cross_project_access`` on every read here.
+
+    Rows from a collection other than this project's own (shared / peer /
+    an explicit ``--project`` / ``--collection`` target) that the launcher's
+    per-node editor restricted to other projects are dropped. ONE home:
+    ``vco_lib.kg_node_access`` (the same verdict the MCP fan-out and the hook
+    router apply). Deliberately unguarded: a vco_lib that cannot be imported
+    is a broken install and must fail loudly, never fall back to returning
+    restricted rows.
+    """
+    from vco_lib.kg_node_access import filter_cli_rows
+
+    return filter_cli_rows(
+        objects,
+        coll_name=coll_name,
+        self_collection=KG_COLLECTION,
+        project_root=Path(__file__).resolve().parent.parent.parent,
+    )
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
 
@@ -886,14 +907,16 @@ def search_knowledge(
                 if DUAL_EMBEDDING_ENABLED:
                     nv_kwargs["target_vector"] = _get_target_vector_slot()
                 response = collection.query.near_vector(**nv_kwargs)
-
-                # Add collection source to each result
-                for obj in response.objects:
-                    obj._collection_source = coll_name
-                    all_results.append(obj)
             except Exception:
                 # Collection might not exist, skip silently
-                pass
+                continue
+
+            # Add collection source to each result (restricted non-self
+            # rows dropped first — outside the try so a broken install
+            # surfaces instead of being skipped as "collection missing").
+            for obj in _access_filter(response.objects, coll_name):
+                obj._collection_source = coll_name
+                all_results.append(obj)
 
         # Sort all results by distance (lower is better)
         all_results.sort(key=lambda obj: obj.metadata.distance if hasattr(obj, 'metadata') and obj.metadata and hasattr(obj.metadata, 'distance') else 1.0)
@@ -1185,7 +1208,7 @@ def list_all_nodes(collections: list = None):
                     break
                 if not response.objects:
                     break
-                all_objects.extend(response.objects)
+                all_objects.extend(_access_filter(response.objects, coll_name))
                 if len(response.objects) < PAGE_SIZE:
                     break
                 cursor = response.objects[-1].uuid
@@ -1243,7 +1266,7 @@ def search_recent(days: int = 7, node_type: str = None, collections: list = None
                 )
             except Exception:
                 continue
-            objects.extend(response.objects)
+            objects.extend(_access_filter(response.objects, coll_name))
 
         # Sort by updated_at
         sorted_nodes = sorted(
@@ -1295,7 +1318,7 @@ def search_created(days: int = 7, node_type: str = None, collections: list = Non
                 )
             except Exception:
                 continue
-            objects.extend(response.objects)
+            objects.extend(_access_filter(response.objects, coll_name))
 
         # Sort by created_at
         sorted_nodes = sorted(

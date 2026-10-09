@@ -30,7 +30,6 @@ import os
 import re
 import subprocess
 import sys
-import requests
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -474,23 +473,40 @@ def generate_code_embedding(text: str) -> Optional[List[float]]:
     ``embed_code_query`` (the MCP's ``get_code_query_embedding`` does the
     same — CLI≡MCP invariant). Documents/backfill still use ``embed_code``.
     """
+    from vco_lib.retry_after import (
+        is_503_error,
+        post_code_embed,
+        reset_503_tolerance_override,
+        resolve_503_interactive_tolerance,
+        set_503_tolerance_override,
+    )
+
     svc = _get_or_create_embedding_service()
     if svc is not None:
+        # v0.2.102 W4-G: an interactive query (hooks run this CLI) waits on a
+        # 503 only up to the INTERACTIVE tolerance — the same bound the MCP
+        # query path sets around this call (CLI≡MCP). A 503 that outlasts it
+        # is exhaustion, not unavailability: no second tolerance through the
+        # inline fallback.
+        token = set_503_tolerance_override(resolve_503_interactive_tolerance())
         try:
             return svc.embed_code_query(text)
         except Exception as e:
+            if is_503_error(e):
+                print(f"❌ Embedding error: code-embed still busy (503) after the "
+                      f"interactive bound: {e}", file=sys.stderr)
+                return None
             print(f"⚠️  EmbeddingService.embed_code_query failed: {e}", file=sys.stderr)
-    # Legacy fallback: direct CodeEmbed HTTP call.
+        finally:
+            reset_503_tolerance_override(token)
+    # Legacy fallback: direct CodeEmbed HTTP call. v0.2.102 W4-G (W4-E §7):
+    # retried on the ONE shared transient policy — the shared code-embed
+    # container answers 503 when its queue bound is exceeded and refuses
+    # connections while restarting; both were a first-shot drop here.
+    # Interactive bounds: a 503 is waited on up to the interactive tolerance,
+    # a refused connection (service down) only ~10 s, then a loud failure.
     try:
-        response = requests.post(
-            f"{CODE_EMBED_SERVICE_URL}/api/embeddings",
-            json={"model": "", "prompt": text},
-            timeout=60,
-        )
-        if response.status_code == 200:
-            return response.json()["embedding"]
-        print(f"❌ Embedding generation failed: HTTP {response.status_code}")
-        return None
+        return post_code_embed(CODE_EMBED_SERVICE_URL, text, interactive=True)
     except Exception as e:
         print(f"❌ Embedding error: {e}")
         return None

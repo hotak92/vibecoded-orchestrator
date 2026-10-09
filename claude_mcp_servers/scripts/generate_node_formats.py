@@ -124,6 +124,11 @@ def get_available_models() -> list[str]:
         sys.exit(1)
 
 
+def _generation_candidates() -> list[str]:
+    """``MODEL_CANDIDATES`` led by the ladder's model (``_sb.OLLAMA_DEFAULT_MODEL``)."""
+    return list(dict.fromkeys([_sb.OLLAMA_DEFAULT_MODEL, *MODEL_CANDIDATES]))
+
+
 def pick_model(candidates: list[str], available: list[str]) -> str:
     """Pick the first candidate model that is available."""
     for model in candidates:
@@ -144,24 +149,21 @@ def call_ollama(model: str, prompt: str, num_predict: int) -> str:
     (qwen3.x series). Without this, thinking tokens consume the budget and
     the response field is empty.
 
-    v0.2.102 W4-E: carries the shared keep_alive policy (one home:
-    ``vco_lib.embedding_providers.ollama._with_keep_alive`` — default "10m",
-    ``VCO_OLLAMA_KEEP_ALIVE`` overrides, empty = omit). Guarded import so
-    the script still runs standalone; the literal fallback MUST match
-    ``_KEEP_ALIVE_DEFAULT`` in that module.
+    v0.2.102 W4-G: the body comes from the ONE generate-body builder
+    (``vco_lib.ollama_generate.generate_request_body``) — the shared
+    load-time options (``num_ctx``) keep the model ONE resident copy across
+    every VCO caller, and the shared keep_alive policy rides along. The
+    import is unguarded: a missing vco_lib is a broken install and must
+    fail loudly, not load a second runner with divergent options.
     """
-    body = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "think": False,
-        "options": {"temperature": 0.3, "num_predict": num_predict},
-    }
-    try:
-        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
-        body = _ka(body)
-    except Exception:
-        body = {**body, "keep_alive": "10m"}
+    from vco_lib.ollama_generate import generate_request_body
+
+    body = generate_request_body(
+        model,
+        prompt=prompt,
+        options={"temperature": 0.3, "num_predict": num_predict},
+        think=False,
+    )
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
@@ -199,7 +201,14 @@ def call_haiku(prompt: str, max_tokens: int) -> str:
             json={
                 "model": HAIKU_MODEL,
                 "max_tokens": max_tokens,
-                "temperature": 0.3,
+                # v0.2.102 W4-G: NO `temperature`. The Claude 5.5 generation
+                # rejects non-default sampling params with a 400 (Opus 5.5:
+                # removed; Sonnet 5.5: non-default values rejected — Anthropic
+                # models reference as cached in the Claude API skill,
+                # 2026-09-25). Haiku 5.5 is not listed there, so its behaviour
+                # is unverified offline; the API default is sent instead of a
+                # value that may 400, matching the KG-summary API tier
+                # (summary_backends.call_api), which never sent one.
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=60,
@@ -738,7 +747,10 @@ def main() -> None:
         print("Using provider: Haiku (API)")
     else:
         available = get_available_models()
-        model = pick_model(MODEL_CANDIDATES, available)
+        # v0.2.102 W4-G: the machine's generation model as the KG-summary
+        # ladder resolves it comes FIRST, so node formats reuse the model the
+        # ladder keeps resident instead of loading a second one.
+        model = pick_model(_generation_candidates(), available)
         _ollama_model = model
         print(f"Using provider: Ollama ({model})")
 

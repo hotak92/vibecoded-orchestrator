@@ -248,6 +248,7 @@ async def main():
         _get_result_verbosity_by_score,
         _format_result_by_tier,
         _kg_collections_to_search,
+        _filter_cross_project_access,
         _embedding_dim_for,
         _collapse_to_one_per_node,
         resolve_and_enrich_dual,
@@ -343,17 +344,26 @@ async def main():
                         primary = coll.query.near_vector(**nv_kwargs)
                 except Exception:
                     continue
-                if not primary.objects:
+                # v0.2.102 W4-G: per-node `cross_project_access` — a row
+                # from a NON-SELF collection (shared / peer) restricted to
+                # another project never reaches an injection. One home:
+                # `vco_lib.kg_node_access` via the server wrapper, the same
+                # filter the MCP fan-out applies.
+                primary_objects = _filter_cross_project_access(
+                    list(primary.objects or []),
+                    is_self=(coll_name == KG_COLLECTION),
+                )
+                if not primary_objects:
                     continue
                 coll_formatted = [
                     _format_obj(obj, coll_name, obj.metadata.distance)
-                    for obj in primary.objects
+                    for obj in primary_objects
                 ]
                 # F-G: attach the matched node's active-slot vector (mirrors the
                 # MCP emb-enrichment block). Soft-fail per result.
                 if q_vector is not None:
                     from weaviate_mcp.server import _extract_obj_vector
-                    for r, obj in zip(coll_formatted, primary.objects):
+                    for r, obj in zip(coll_formatted, primary_objects):
                         try:
                             node_emb = _extract_obj_vector(obj, query_target)
                             if node_emb:

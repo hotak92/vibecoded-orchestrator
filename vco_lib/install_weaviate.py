@@ -2384,7 +2384,11 @@ KG_METADATA_REPAIR_STATE_KEY = "last_kg_metadata_repair_version"
 #: `sync_knowledge_graph.py::_normalise_frontmatter` another dialect — a stamp
 #: below the newest entry then reads as owed again. Never re-use an entry: the
 #: stamp records WHICH generation was satisfied, not how many passes have run.
-KG_METADATA_REPAIR_BUMPS: "tuple[str, ...]" = ("0.2.95",)
+#: 0.2.102 (W4-G): a node WITHOUT a frontmatter ``type:`` now stores the
+#: singular type for its folder (``kg_vocabulary.node_type_for_folder`` —
+#: ``concepts`` → ``concept``) instead of the folder name, so rows stored
+#: under the plural heal on the zero-embed repair pass.
+KG_METADATA_REPAIR_BUMPS: "tuple[str, ...]" = ("0.2.95", "0.2.102")
 
 #: What a certified pass writes to :data:`KG_METADATA_REPAIR_STATE_KEY`.
 KG_METADATA_REPAIR_STAMP = KG_METADATA_REPAIR_BUMPS[-1]

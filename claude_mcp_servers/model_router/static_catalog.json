@@ -1,11 +1,13 @@
 {
   "schema_version": 1,
-  "_comment": "Last-resort catalog, used ONLY when a live fetch fails (no credentials yet, no network, vendor outage). It is a SNAPSHOT taken on 2026-09-02, not a maintained list: vendors add and retire models on the same endpoint, which is why the live fetch exists and why the gateway re-tries it far sooner than the live TTL when the static list is in use. Whenever a family is served from here the gateway says so — '_vct_catalog_source' in the /v1/models response and 'catalog_source' in /health both read 'static'. Selecting a model that has since been retired produces the upstream's own 4xx, relayed verbatim. Rows here carry ids and nothing else, so every window on a snapshot-served picker resolves from the chat-model context table or from the family floor, never from 'max_input_tokens' (a snapshot states none). A model the snapshot lists but the table does not cite therefore reads 'unverified context' rather than being guessed at.",
+  "_comment": "Last-resort catalog, used ONLY when a live fetch fails (no credentials yet, no network, vendor outage). It began as a SNAPSHOT taken on 2026-09-02 and is curated by hand since (each curated addition is dated in its family comment); it is never a complete list: vendors add and retire models on the same endpoint, which is why the live fetch exists and why the gateway re-tries it far sooner than the live TTL when the static list is in use. Whenever a family is served from here the gateway says so — '_vct_catalog_source' in the /v1/models response and 'catalog_source' in /health both read 'static'. Selecting a model that has since been retired produces the upstream's own 4xx, relayed verbatim. Rows here carry ids and nothing else, so every window on a snapshot-served picker resolves from the chat-model context table or from the family floor, never from 'max_input_tokens' (a snapshot states none). A model the snapshot lists but the table does not cite therefore reads 'unverified context' rather than being guessed at.",
   "families": {
     "anthropic": {
-      "_comment": "First-party Claude ids observed in a live /v1/models response under an OAuth login. Display names are the ids themselves: inventing marketing names here would put a string in the picker that no upstream ever returned. claude-haiku-5-5 was added 2026-10-08 from the Anthropic models overview (its API id and alias are the same string); claude-haiku-4-5-20251001 stays listed because Anthropic still serves it as a legacy model.",
+      "_comment": "First-party Claude ids observed in a live /v1/models response under an OAuth login. Display names are the ids themselves: inventing marketing names here would put a string in the picker that no upstream ever returned. claude-haiku-5-5, claude-opus-5-5 and claude-sonnet-5-5 were added 2026-10-08 from the Anthropic models overview (each API id and alias are the same string; the chat-model context seed cites the same page for all three); claude-haiku-4-5-20251001 stays listed because Anthropic still serves it as a legacy model.",
       "models": [
         { "id": "claude-fable-5-1" },
+        { "id": "claude-opus-5-5" },
+        { "id": "claude-sonnet-5-5" },
         { "id": "claude-opus-5" },
         { "id": "claude-sonnet-5" },
         { "id": "claude-fable-5" },
@@ -16,7 +18,7 @@
       ]
     },
     "zai": {
-      "_comment": "GLM ids observed in a live /v1/models response under a Coding Plan key. The same nine ids the shipped chat-model context seed cites.",
+      "_comment": "GLM ids observed in a live /v1/models response under a Coding Plan key; curated 2026-10-01 (glm-5.2 retired, glm-5.3 added). The same nine ids the shipped chat-model context seed cites.",
       "models": [
         { "id": "glm-5.3" },
         { "id": "glm-5.3-flash" },

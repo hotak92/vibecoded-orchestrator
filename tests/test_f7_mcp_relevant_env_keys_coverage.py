@@ -70,8 +70,9 @@ DOCUMENTED_EXCLUSIONS: frozenset[str] = frozenset(
         # v0.2.97: the MCP now resolves it through
         # `vco_lib.openai_key.resolve_openai_api_key` — env, else the
         # `openai_api_key` secret — so no literal read of it is left in
-        # weaviate_mcp for this grep to find, and the entry went with it.)
-        "ANTHROPIC_API_KEY",
+        # weaviate_mcp for this grep to find, and the entry went with it.
+        # ANTHROPIC_API_KEY left with v0.2.102: its only reader was the
+        # unregistered `nl_code_query`, removed by owner decision.)
         # RL-server plumbing: read by the optional RL enrichment path, not
         # the base search fan-out; a change reconnects lazily, no reload
         # needed (and these aren't projected into settings.json env).

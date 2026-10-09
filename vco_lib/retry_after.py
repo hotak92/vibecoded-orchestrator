@@ -83,10 +83,12 @@ __all__ = [
     "resolve_503_delay_scale",
     "resolve_503_tolerance",
     "resolve_503_interactive_tolerance",
+    "resolve_refused_tolerance",
     "set_503_tolerance_override",
     "reset_503_tolerance_override",
     "compute_503_delay",
     "retry_transient_embed",
+    "post_code_embed",
 ]
 
 #: Per-request wall-clock deadline for CodeEmbed HTTP clients. MUST exceed the
@@ -104,7 +106,17 @@ DEFAULT_503_TOLERANCE_SECS = 420.0
 #: ``VCO_EMBED_503_INTERACTIVE_TOLERANCE_SECS``.
 DEFAULT_503_INTERACTIVE_TOLERANCE_SECS = 90.0
 
+#: Default INTERACTIVE bound (seconds) on retrying a CONNECTION failure —
+#: refused / no listener, i.e. the service is DOWN, not busy (v0.2.102 W4-G,
+#: coordinator ruling 2026-10-09). A 503 means the request is queued
+#: server-side and is waited on up to the interactive tolerance; a refusal
+#: gets only a short bounded retry (enough to ride out a container restart)
+#: and then fails loudly. Batch paths keep their long tolerance for both.
+#: Override via ``VCO_EMBED_INTERACTIVE_REFUSED_TOLERANCE_SECS``.
+DEFAULT_INTERACTIVE_REFUSED_TOLERANCE_SECS = 10.0
+
 EMBED_503_TOLERANCE_ENV = "VCO_EMBED_503_TOLERANCE_SECS"
+EMBED_INTERACTIVE_REFUSED_TOLERANCE_ENV = "VCO_EMBED_INTERACTIVE_REFUSED_TOLERANCE_SECS"
 EMBED_503_INTERACTIVE_TOLERANCE_ENV = "VCO_EMBED_503_INTERACTIVE_TOLERANCE_SECS"
 #: Back-compat C-9 knob: SCALES computed delays proportionally; ``0`` means
 #: zero-delay legacy-bounded mode (see :func:`resolve_503_delay_scale`).
@@ -284,6 +296,33 @@ def resolve_503_interactive_tolerance() -> float:
     return min(val, resolve_503_tolerance())
 
 
+def resolve_refused_tolerance(*, interactive: bool) -> float:
+    """Total seconds a client keeps retrying a CONNECTION failure.
+
+    THE one policy home for "service down" vs "service busy" (v0.2.102
+    W4-G). Batch paths (``interactive=False``) treat a refusal like a 503 and
+    get :func:`resolve_503_tolerance` — a restart mid model-load must not
+    drop a backfill. Interactive paths (a query a user or a hook is waiting
+    on) get ``VCO_EMBED_INTERACTIVE_REFUSED_TOLERANCE_SECS`` (default
+    :data:`DEFAULT_INTERACTIVE_REFUSED_TOLERANCE_SECS`), clamped to the 503
+    tolerance in force (never longer). Same parsing rules as the other
+    knobs: malformed / negative → default, explicit ``0`` = fail-fast.
+    """
+    bound = resolve_503_tolerance()
+    if not interactive:
+        return bound
+    raw = os.getenv(EMBED_INTERACTIVE_REFUSED_TOLERANCE_ENV)
+    val: float = DEFAULT_INTERACTIVE_REFUSED_TOLERANCE_SECS
+    if raw is not None:
+        try:
+            candidate = float(raw)
+        except (TypeError, ValueError):
+            candidate = DEFAULT_INTERACTIVE_REFUSED_TOLERANCE_SECS
+        if candidate >= 0:
+            val = candidate
+    return min(val, bound)
+
+
 def set_503_tolerance_override(tolerance_secs: float) -> "Token[Optional[float]]":
     """Bound ``resolve_503_tolerance`` to ``tolerance_secs`` in this context.
 
@@ -362,7 +401,7 @@ def compute_503_delay(
     return max(0.0, delay)
 
 
-def retry_transient_embed(fn, *args, log=None):
+def retry_transient_embed(fn, *args, log=None, interactive: bool = False):
     """Retry a single SYNC embed HTTP call on 503 / connection errors.
 
     v0.2.102 W4-E item 6 — the ONE home for the raw-HTTP embed clients that
@@ -387,7 +426,12 @@ def retry_transient_embed(fn, *args, log=None):
     logger = log or logging.getLogger(__name__)
     scale = resolve_503_delay_scale(base=DEFAULT_503_FALLBACK_BACKOFFS[0] or 1.0)
     legacy_bounded = scale == 0.0
-    deadline = _time.monotonic() + resolve_503_tolerance()
+    started = _time.monotonic()
+    deadline = started + resolve_503_tolerance()
+    # v0.2.102 W4-G: a refusal (service DOWN) gets its own, on interactive
+    # paths much shorter, bound — see resolve_refused_tolerance.
+    refused_tolerance = resolve_refused_tolerance(interactive=interactive)
+    refused_deadline = started + refused_tolerance
     last_exc: "Exception | None" = None
     attempt = 0
     while True:
@@ -405,9 +449,20 @@ def retry_transient_embed(fn, *args, log=None):
             else:
                 if _time.monotonic() >= deadline:
                     break  # tolerance spent → re-raise below
+                if not is_503_error(exc) and _time.monotonic() >= refused_deadline:
+                    logger.error(
+                        "embed backend unreachable (connection refused / no "
+                        "listener) for %.0fs — giving up: %s",
+                        refused_tolerance, exc,
+                    )
+                    break
                 delay = compute_503_delay(
                     attempt, error_retry_after(exc), DEFAULT_503_FALLBACK_BACKOFFS, scale
                 )
+                if not is_503_error(exc):
+                    # Never sleep past the refusal bound: the last retry
+                    # lands AT it, then the next failure gives up.
+                    delay = min(delay, max(0.0, refused_deadline - _time.monotonic()))
             logger.info(
                 "embed backend transiently unavailable (503 / restarting): "
                 "%s — retry %d after %.1fs",
@@ -417,3 +472,47 @@ def retry_transient_embed(fn, *args, log=None):
                 _time.sleep(delay)
     assert last_exc is not None
     raise last_exc
+
+
+def post_code_embed(
+    code_embed_url: str, text: str, *, timeout: float = 60, interactive: bool = False, log=None,
+) -> list:
+    """Embed *text* through the code-embed service's raw ``/api/embeddings``
+    route, retried on the shared transient policy (:func:`retry_transient_embed`).
+
+    v0.2.102 W4-G — the ONE home for the legacy raw-HTTP CodeEmbed leg that
+    the migrate script and the code-graph query CLI fall back to when the
+    EmbeddingService is unavailable (W4-E §7: the CLI's copy posted once and
+    dropped the embed on the first 503 / refused connection). A non-200 is
+    raised as ``RuntimeError("... HTTP <code> ...")`` so ``is_503_error``
+    classifies it; the last transient error re-raises once the tolerance is
+    spent.
+
+    ``interactive=True`` (the query CLI, which the context-injection hooks
+    run under a seconds-scale budget) waits on a 503 up to
+    :func:`resolve_503_interactive_tolerance` and on a refused connection
+    only up to :func:`resolve_refused_tolerance` (~10 s) — the same split the
+    weaviate-MCP query path uses.
+    """
+    import requests
+
+    def _post():
+        resp = requests.post(
+            f"{code_embed_url}/api/embeddings",
+            json={"model": "", "prompt": text},
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"CodeEmbed /api/embeddings returned HTTP {resp.status_code}: "
+                f"{resp.text[:200]}"
+            )
+        return resp.json()["embedding"]
+
+    if not interactive:
+        return retry_transient_embed(_post, log=log)
+    token = set_503_tolerance_override(resolve_503_interactive_tolerance())
+    try:
+        return retry_transient_embed(_post, log=log, interactive=True)
+    finally:
+        reset_503_tolerance_override(token)

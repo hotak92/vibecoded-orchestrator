@@ -1186,7 +1186,7 @@ class CatalogHideIdsTests(unittest.TestCase):
         # the latest filter as Haiku 5.5's older sibling, not by the hide
         # list; its plain-row case is pinned in WindowRowsTests.)
         for first_party in (
-            "claude-opus-5[1m]", "claude-sonnet-5[1m]", "claude-haiku-5-5[1m]",
+            "claude-opus-5-5[1m]", "claude-sonnet-5-5[1m]", "claude-haiku-5-5[1m]",
         ):
             self.assertIn(first_party, published,
                           "a vendor hide list must never reach first party")
@@ -1274,15 +1274,19 @@ class WindowRowsTests(unittest.TestCase):
 
     def test_the_withheld_plain_row_is_reported_not_silently_dropped(self):
         union = self._union()
-        self.assertIn("claude-opus-5", union.hidden)
-        self.assertNotIn("claude-opus-5", {e.id for e in union.entries})
+        self.assertIn("claude-opus-5-5", union.hidden)
+        self.assertNotIn("claude-opus-5-5", {e.id for e in union.entries})
+        self.assertIn("claude-opus-5-5[1m]", {e.id for e in union.entries})
 
     def test_both_restores_the_plain_row_and_stops_reporting_it(self):
+        # v0.2.102 W4-G: the Opus family's latest in the static snapshot is
+        # claude-opus-5-5 (claude-opus-5 is now its older sibling, withheld
+        # by the latest filter, not by the window_rows knob under test).
         union = self._union(window_rows=cat.WINDOW_ROWS_BOTH)
         ids = {e.id for e in union.entries}
-        self.assertIn("claude-opus-5", ids)
-        self.assertIn("claude-opus-5[1m]", ids)
-        self.assertNotIn("claude-opus-5", union.hidden)
+        self.assertIn("claude-opus-5-5", ids)
+        self.assertIn("claude-opus-5-5[1m]", ids)
+        self.assertNotIn("claude-opus-5-5", union.hidden)
 
 
 if __name__ == "__main__":  # pragma: no cover

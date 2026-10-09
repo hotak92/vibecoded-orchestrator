@@ -90,7 +90,7 @@ class ModelIdParsingTests(unittest.TestCase):
         ("claude-3-7-sonnet-20250219", "claude-sonnet", (3, 7), "20250219", False),
         ("claude-haiku-4-5-20251001", "claude-haiku", (4, 5), "20251001", False),
         ("claude-haiku-5-5", "claude-haiku", (5, 5), None, False),
-        ("glm-5.3","glm", (5, 3), None, False),
+        ("glm-5.3", "glm", (5, 3), None, False),
         ("glm-5.3-flash", "glm-flash", (5, 3), None, False),
         ("glm-5-turbo", "glm-turbo", (5,), None, False),
         ("glm-4.5-air", "glm-air", (4, 5), None, False),
@@ -836,8 +836,10 @@ class ShippedDataInvariantTests(unittest.TestCase):
             [
                 f"claude-fable-5-1{ONE_M_SUFFIX}",
                 f"claude-haiku-5-5{ONE_M_SUFFIX}",
-                f"claude-opus-5{ONE_M_SUFFIX}",
-                f"claude-sonnet-5{ONE_M_SUFFIX}",
+                # v0.2.102 W4-G: Opus / Sonnet 5.5 joined the static
+                # snapshot, so they are their families' latest.
+                f"claude-opus-5-5{ONE_M_SUFFIX}",
+                f"claude-sonnet-5-5{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.8-max{ONE_M_SUFFIX}",
@@ -853,8 +855,8 @@ class ShippedDataInvariantTests(unittest.TestCase):
         self.assertEqual(
             sorted(latest.hidden),
             [
-                # ``claude-fable-5-1``, ``claude-opus-5`` and
-                # ``claude-sonnet-5`` are here as the PLAIN spelling of a 1M
+                # ``claude-fable-5-1``, ``claude-opus-5-5`` and
+                # ``claude-sonnet-5-5`` are here as the PLAIN spelling of a 1M
                 # model, withheld by the ``window_rows`` default (one model,
                 # one row) rather than by the latest filter — reported, and
                 # still routable by name.
@@ -876,8 +878,11 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 # The legacy Haiku (older sibling of claude-haiku-5-5) and
                 # the current Haiku's plain spelling (window_rows default).
                 "claude-haiku-4-5-20251001", "claude-haiku-5-5",
-                "claude-opus-4-8", "claude-opus-5",
-                "claude-sonnet-4-6", "claude-sonnet-5",
+                # v0.2.102 W4-G: claude-opus-5 / claude-sonnet-5 are now
+                # older siblings of the 5.5 rows (latest filter), and the
+                # 5.5 plain spellings are withheld by the window_rows default.
+                "claude-opus-4-8", "claude-opus-5", "claude-opus-5-5",
+                "claude-sonnet-4-6", "claude-sonnet-5", "claude-sonnet-5-5",
             ],
         )
 
