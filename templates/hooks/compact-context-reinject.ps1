@@ -5,8 +5,15 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # compact-context-reinject.ps1
-# Fires on SessionStart matcher "compact"
-# Re-injects critical session context to stdout (becomes additionalContext).
+# Fires on SessionStart matchers "compact", "resume" and "startup"
+# (v0.2.102 W6-F: the ORCHESTRATOR template documented "SessionStart
+# (compact/resume)" while only compact was registered, and
+# diff-context-inject's "full injection" comment had no backing hook at
+# startup). Re-injects critical session context to stdout (becomes
+# additionalContext); at startup/resume injects CONTEXT_STATE.md (in full,
+# inside the per-section budgets and the shared cap). The COMPACTION
+# ARTEFACTS (pre-compact snapshot, pruned-activity summary) are emitted
+# only for source=compact or an absent/unknown source (the pre-W6-F shape).
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 # Shared session_id parse + path-safety sanitise (Get-VcoHookSessionId). One
@@ -27,6 +34,19 @@ $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (G
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $SessionId = Get-VcoHookSessionId -Stdin $HookStdin
+
+# v0.2.102 W6-F (items 5+6): which SessionStart source fired us. The
+# compaction artefact sections (snapshot, pruned summary) are emitted only
+# for compactions; an absent/unknown source keeps the pre-W6-F shape.
+# MUST MATCH the .sh sibling's _IS_COMPACT_SOURCE.
+$HookSource = ""
+if ($HookStdin) {
+    try {
+        $srcPayload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+        if ($srcPayload -and $srcPayload.source) { $HookSource = [string]$srcPayload.source }
+    } catch { }
+}
+$IsCompactSource = ($HookSource -eq "" -or $HookSource -eq "compact")
 
 # v0.2.100 WP-17: the WHOLE output goes through the shared injection cap
 # (_lib/emit-context.ps1 Limit-VcoHookContext): Claude Code shows the model
@@ -106,10 +126,17 @@ function Get-VcoSnapshotSavedLine([string]$Path) {
 # -- build the sections (text incl. their own header) --
 $S_ctx = ""; $S_sess = ""; $S_plan = ""; $S_commits = ""; $S_snap = ""; $S_pruned = ""
 
-# 1. CONTEXT_STATE.md -- START position (the FLEX section)
+# 1. CONTEXT_STATE.md -- START position (the FLEX section). The header
+# names WHY we fired (compact vs startup/resume) so the model does not read
+# a fresh session's injection as post-compaction recovery. MUST MATCH the
+# .sh sibling.
 $CtxState = Join-Path $ProjectDir ".claude/CONTEXT_STATE.md"
 if (Test-Path -LiteralPath $CtxState) {
-    $S_ctx = "## Current Task State (re-injected after compaction)`n" + ([IO.File]::ReadAllText($CtxState).TrimEnd())
+    if ($IsCompactSource) {
+        $S_ctx = "## Current Task State (re-injected after compaction)`n" + ([IO.File]::ReadAllText($CtxState).TrimEnd())
+    } else {
+        $S_ctx = "## Current Task State (re-injected at session start: $HookSource)`n" + ([IO.File]::ReadAllText($CtxState).TrimEnd())
+    }
 }
 
 # 1b. Per-session task state (Track C). IF this session has written its own
@@ -142,9 +169,10 @@ $gitLog = ""
 try { $gitLog = (@(& git -C $ProjectDir log --oneline -8 2>$null) | ForEach-Object { "$_" }) -join "`n" } catch { }
 $S_commits = "## Recent Commits`n$gitLog"
 
-# 4. Pre-compaction snapshot (line cap 50); stale => one line, NOT replayed
+# 4. Pre-compaction snapshot (line cap 50); stale => one line, NOT replayed.
+#    A compaction artefact: only emitted for source=compact / unknown (W6-F).
 $Snapshot = Join-Path $ProjectDir ".claude/context/pre-compact-snapshot.md"
-if (Test-Path -LiteralPath $Snapshot) {
+if ($IsCompactSource -and (Test-Path -LiteralPath $Snapshot)) {
     if (Test-VcoSnapshotStale -Path $Snapshot) {
         $S_snap = "## Pre-Compaction Snapshot (stale -- NOT replayed)`nLast saved: $(Get-VcoSnapshotSavedLine -Path $Snapshot). This snapshot is older than the current session's compaction, so pre-compact-save.ps1 did not run for it (it should, on every compact since v0.2.102). Read .claude/context/pre-compact-snapshot.md only if you need it."
     } else {
@@ -152,9 +180,11 @@ if (Test-Path -LiteralPath $Snapshot) {
     }
 }
 
-# 5. Pruned activity summary (line cap 30), truncated AFTER re-injection
+# 5. Pruned activity summary (line cap 30), truncated AFTER re-injection.
+#    A compaction artefact: only emitted (and only that path truncates) for
+#    source=compact / unknown (W6-F).
 $Pruned = Join-Path $ProjectDir ".claude/context/pruned-context-summary.md"
-if ((Test-Path -LiteralPath $Pruned) -and ((Get-Item -LiteralPath $Pruned).Length -gt 0)) {
+if ($IsCompactSource -and (Test-Path -LiteralPath $Pruned) -and ((Get-Item -LiteralPath $Pruned).Length -gt 0)) {
     $S_pruned = (Get-Content -LiteralPath $Pruned -TotalCount 30) -join "`n"
 }
 

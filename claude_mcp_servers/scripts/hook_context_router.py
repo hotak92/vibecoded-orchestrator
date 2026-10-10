@@ -7,7 +7,7 @@ Usage (the thin .sh/.ps1 wrappers of Wave 2 call exactly this)::
 
     hook_context_router.py <surface> [--intent-out FILE] [--claim]   # hook JSON on stdin
 
-    surfaces: bash | read | write | edit | grep | agent
+    surfaces: bash | read | write | edit | grep | agent | prompt
 
 Contract
 --------
@@ -118,6 +118,7 @@ from vco_lib.inject_intent import (  # noqa: E402
     kg_query_for_targets,
     language_for_path,
     pattern_gate,
+    prompt_query,
     sanitize_session_id,
     search_symbol_for_pattern,
     task_type_for,
@@ -126,7 +127,7 @@ from vco_lib.inject_intent import (  # noqa: E402
 
 import hook_dual_search as _hds  # noqa: E402 — sibling module (sys.path above)
 
-SURFACES = ("bash", "read", "write", "edit", "grep", "agent")
+SURFACES = ("bash", "read", "write", "edit", "grep", "agent", "prompt")
 
 _BASH_PROFILE_BY_INTENT = {
     INTENT_READ: "bash_read",
@@ -811,6 +812,32 @@ def _agent_plan(payload: Dict, cwd: str) -> _Plan:
     return plan  # no CG leg on the agent surface (§2.1: keep the brief small)
 
 
+def _prompt_plan(payload: Dict, cwd: str) -> _Plan:
+    """v0.2.102 W6-F: the UserPromptSubmit surface — the shipped "search the
+    KG on every prompt" promise (README.md:108-113, GETTING_STARTED.md:
+    321-323). The query is the user's prompt TEXT (:func:`prompt_query`
+    owns the trim/skip rule) — the one prose query in the redesign, because
+    prose is all a prompt carries. KG leg only: §2.1 issues no semantic
+    code-graph queries from injection surfaces, and a prompt yields no
+    exact-lookup symbol.
+
+    The payload carries no ``prompt_id`` on UserPromptSubmit, so the
+    per-turn budget fails OPEN for this surface (documented fail-open); the
+    per-injection soft cap still bounds the block, and the surface fires
+    once per prompt by construction."""
+    plan = _Plan()
+    query = prompt_query(str(payload.get("prompt") or ""))
+    plan.intent_out = {"surface": "prompt", "has_query": bool(query)}
+    if not query:
+        return plan
+    gate = kg_gate("prompt")
+    if gate is not None:
+        plan.kg_query = query
+        plan.kg_profile = "prompt"
+        plan.kg_limit = gate.max_rows or 3
+    return plan
+
+
 _PLAN_BUILDERS = {
     "bash": _bash_plan,
     "read": _read_plan,
@@ -818,6 +845,7 @@ _PLAN_BUILDERS = {
     "edit": _edit_plan,
     "grep": _grep_plan,
     "agent": _agent_plan,
+    "prompt": _prompt_plan,
 }
 
 
@@ -896,6 +924,29 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
         if kg_script.is_file():
             try:
                 kg_mod = _hds._load_cg_module(kg_script)
+                # v0.2.102 W6-F: pay the producer's heavy lazy imports in the
+                # MAIN thread (the hook_dual_search.main() discipline). The
+                # real producer (rl_kg_search.main) imports
+                # weaviate_mcp.server LAZILY, and that module registers a
+                # SIGHUP handler AT IMPORT TIME — signal.signal raises
+                # ValueError in a non-main thread, and the legs run in
+                # run_legs' worker threads. On surfaces whose plan ALSO runs
+                # a CG leg this never fired, because query_code_graph.py
+                # imports weaviate_mcp.server at MODULE level and the router
+                # loads that module in the main thread (below); on a KG-ONLY
+                # plan (the agent surface, the W6-F prompt surface, any bash
+                # plan whose CG leg gated off, or a missing CG script) the
+                # KG leg died on the import and the surface silently never
+                # injected. Warm the import here so the worker thread's
+                # import is a sys.modules hit. Only for the SHIPPED producer
+                # — a VCO_ROUTER_KG_SCRIPT stub pays nothing. Best-effort: a
+                # failed warm import is re-attempted (and reported) by the
+                # leg's own error path.
+                if kg_script == _HERE / "rl_kg_search.py":
+                    try:
+                        import weaviate_mcp.server  # noqa: F401
+                    except BaseException:  # noqa: BLE001
+                        pass
                 argv = [plan.kg_query, "--limit", str(plan.kg_limit),
                         "--hook-format", "--injection-profile", plan.kg_profile,
                         "--task-type", task_type_for(plan.kg_profile)]

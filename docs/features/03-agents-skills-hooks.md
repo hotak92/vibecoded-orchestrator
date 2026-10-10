@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 11 free agents, 6 skills, and 50 hooks (44 event-registered in the default `.claude/settings.json`; 4 more are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually — v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records; v0.2.102 retired the diagram-indexer pair `pre-diagram-path-validation` and `post-file-delete` with the diagrams integration, and existing installs lose their registrations at the next bundle update; and 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. None is dead code; all run standalone). Alongside them: 10 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 11 free agents, 6 skills, and 51 hooks (45 event-registered in the default `.claude/settings.json`; 4 more are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually — v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records; v0.2.102 retired the diagram-indexer pair `pre-diagram-path-validation` and `post-file-delete` with the diagrams integration, and existing installs lose their registrations at the next bundle update; and 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. None is dead code; all run standalone). Alongside them: 10 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -94,8 +94,8 @@ Display KG resource paths at session start. Optionally launches the RL server if
 ### `context-size-check.sh` — SessionStart (startup, blocking)
 Warn if `CONTEXT_STATE.md` exceeds configured thresholds (warn: 300 lines, max: 400 lines). Prompts to run `doc-maintainer` agent to trim.
 
-### `compact-context-reinject.sh` — SessionStart (compact)
-Re-inject `CONTEXT_STATE.md`, recent git commits, active plan, and pre-compact snapshot after context compaction.
+### `compact-context-reinject.sh` — SessionStart (startup + compact + resume)
+Re-inject `CONTEXT_STATE.md`, recent git commits and the active plan at session start, after a resume, and after context compaction (the pre-compact snapshot and pruned-activity sections are compaction artefacts and emit only on `compact`). Before v0.2.102 only the `compact` matcher was registered.
 
 <details>
 <summary>Details</summary>
@@ -111,7 +111,10 @@ Save a snapshot of current working state before every compaction (`/compact` and
 Log compaction event and send desktop notification after compaction completes. Appends to `~/.claude/metrics/compactions.jsonl`. Resets the `diff-context-inject.sh` baseline.
 
 ### `user-prompt-submit-reminder.sh` — UserPromptSubmit (blocking)
-Inject workflow reminders (update CONTEXT_STATE.md, check KG-first policy) when session output volume suggests substantial work has occurred.
+Inject workflow reminders (update CONTEXT_STATE.md, check KG-first policy) when session output volume suggests substantial work has occurred. The counter is the session's cumulative work units from the live transcript (incremental `claude_token_counter.py` scan, v0.2.102 — the pre-v0.2.102 hardwired `WORDS_THIS_TURN=0` meant the reminders could never fire).
+
+### `prompt-context-inject.sh` — UserPromptSubmit (blocking, v0.2.102)
+The prompt-time leg of the context router (surface `prompt`): the user's prompt text is the KG query (short prompts, slash commands and bang passthroughs skip); same §2.1 score floors, budgets, seen-store dedupe, TTL cache and kill switches as the tool-call injection surfaces. KG leg only (no semantic code-graph queries from injection surfaces).
 
 ### `diff-context-inject.sh` — UserPromptSubmit (blocking)
 Only inject the changed sections of `CONTEXT_STATE.md` rather than the full file on every prompt.

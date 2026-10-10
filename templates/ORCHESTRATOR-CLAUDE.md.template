@@ -382,8 +382,8 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `session-start-kg-loader.sh` — display KG resource paths.
 - `context-size-check.sh` — warn (no truncation) if `CONTEXT_STATE.md` exceeds 500 lines.
 
-**SessionStart (compact/resume)**:
-- `compact-context-reinject.sh` — re-inject `CONTEXT_STATE.md` + recent commits + active plan + pre-compact snapshot.
+**SessionStart (startup/compact/resume)**:
+- `compact-context-reinject.sh` — re-inject `CONTEXT_STATE.md` + recent commits + active plan (matchers: `startup`, `compact`, `resume`; the pre-compact snapshot section only on `compact` — it is a compaction artefact).
 
 **PreCompact (manual + auto)**:
 - `pre-compact-save.sh` — save git status + recent files to `.claude/context/pre-compact-snapshot.md` (before every compaction, `/compact` included).
@@ -392,8 +392,9 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `post-compact.sh` — log compaction event + desktop notification (logs to `~/.claude/metrics/compactions.jsonl`).
 
 **UserPromptSubmit**:
-- `user-prompt-submit-reminder.sh` — workflow reminders.
+- `user-prompt-submit-reminder.sh` — workflow reminders (counter = the session's cumulative work units from the live transcript, scanned incrementally by the same `claude_token_counter.py` the nudge uses).
 - `diff-context-inject.sh` — section-level diffs of `CONTEXT_STATE.md` (70–90% token savings after the first prompt).
+- `prompt-context-inject.sh` — the prompt-time leg of the context router (surface `prompt`): the user's prompt text is the KG query (short prompts, slash commands and bang passthroughs skip); same score floors, titles-only formatting, budgets, seen-store dedupe and kill switches as the tool-call surfaces.
 
 **PreToolUse**:
 - `pre-tool-use.sh` — SSRF guard + shell-injection scan + Build Anchor / file backup (matcher: `*`). Its former pre-Edit KG suggestion was retired in v0.2.101 — the injection wrappers below are the one home for edit-time KG context.

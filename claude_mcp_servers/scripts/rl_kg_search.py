@@ -76,6 +76,9 @@ KNOWN_TASK_TYPES = (
     "pre_write_kg_search",
     "pre_search_kg_search",
     "agent_brief_kg_search",
+    # v0.2.102 W6-F: the UserPromptSubmit surface (the router's `prompt`
+    # profile) — its own partition, never free text in the corpus key.
+    "prompt_kg_search",
 )
 
 

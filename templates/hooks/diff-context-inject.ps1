@@ -5,8 +5,12 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # diff-context-inject.ps1
-# Diff-based context injection — only inject CHANGED sections of CONTEXT_STATE.md.
-# First prompt: create baseline snapshot (full injection done by SessionStart hook).
+# Diff-based context injection - only inject CHANGED sections of CONTEXT_STATE.md.
+# First prompt: create baseline snapshot. The FULL injection the baseline
+# defers is real: compact-context-reinject.ps1 (SessionStart matchers
+# startup/resume/compact, since v0.2.102 W6-F) injects CONTEXT_STATE.md in
+# full at session start, inside its per-section budgets and the shared
+# hook-output cap (_lib/reinject-budgets.txt + _lib/emit-context.ps1).
 # Subsequent prompts: output only changed sections (or nothing if unchanged).
 # After /compact: reset baseline (detected via compact flag).
 #

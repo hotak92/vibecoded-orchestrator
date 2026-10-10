@@ -5,7 +5,19 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # user-prompt-submit-reminder.ps1
-# Context preservation reminder triggered on output volume.
+# Context preservation reminder triggered on output volume (work units).
+#
+# v0.2.102 W6-F: the counter COUNTS again. Pre-W6-F the .sh sibling
+# hardwired WORDS_THIS_TURN=0 and this file read a tool_name the
+# UserPromptSubmit payload never carries, so the session counter never grew
+# and neither the checkpoint nor the staleness nudge could fire. The counter
+# is now the session's cumulative WORK UNITS from the live transcript,
+# scanned INCREMENTALLY (per-session byte offset) by the same
+# .claude/scripts/claude_token_counter.py the KG-update nudge uses - one
+# home, no second counting implementation. Thresholds keep the retired
+# word-scale's documented token equivalents: 300 000 work units for the
+# checkpoint (was "200K words (~300K tokens)"), a 180 000-unit delta for
+# the CONTEXT_STATE-staleness window (was 120K words).
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
@@ -25,16 +37,14 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # via stdin-capture diagnostic.
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
-$ToolNameFromStdin = ""
 $SessionId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
-        if ($payload.tool_name)  { $ToolNameFromStdin = [string]$payload.tool_name }
         if ($payload.session_id) { $SessionId = [string]$payload.session_id }
     }
 } catch {
-    # Empty/malformed stdin — fall through to defaults
+    # Empty/malformed stdin - fall through to defaults
 }
 if (-not $SessionId) { $SessionId = "default" }
 
@@ -43,36 +53,123 @@ $ProjectName = Split-Path $ProjectDir -Leaf
 $ContextFile = Join-Path $ProjectDir ".claude/CONTEXT_STATE.md"
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
 $SessionLog = Join-Path $Tmp "claude-session-$ProjectName-$SessionId"
+$OffsetFile = "$SessionLog.scan_offset"
 
 if (-not (Test-Path $SessionLog)) {
     Set-Content -Path $SessionLog -Value "0" -Encoding ascii
 }
 
-$WordsThisTurn = 0
-$EffectiveToolName = if ($ToolNameFromStdin) { $ToolNameFromStdin } elseif ($env:CLAUDE_TOOL_NAME) { $env:CLAUDE_TOOL_NAME } else { "" }
-if ($EffectiveToolName) {
-    switch ($EffectiveToolName) {
-        { $_ -in 'Read', 'Write', 'Edit' } { $WordsThisTurn = 1000 }
-        'Bash' { $WordsThisTurn = 500 }
-        'PowerShell' { $WordsThisTurn = 500 }
-        'Task' { $WordsThisTurn = 2000 }
-        default { $WordsThisTurn = 200 }
-    }
-}
-
 $TotalWords = 0
 try { $TotalWords = [int](Get-Content $SessionLog -Raw -ErrorAction Stop).Trim() } catch { $TotalWords = 0 }
 
-if ($WordsThisTurn -gt 0) {
-    $TotalWords += $WordsThisTurn
-    Set-Content -Path $SessionLog -Value $TotalWords -Encoding ascii
+# Accumulate the work units the transcript gained since the last prompt
+# (W6-F). The counter module resolves from the HOOK'S OWN bundle
+# (../scripts) or $env:CLAUDE_PROJECT_DIR/.claude/scripts - never cwd (same
+# ladder as kg-update-nudge). A transcript to count with no importable
+# counter is a broken install: the embedded Python prints a loud stderr
+# line and exits 1, propagated below (non-blocking for UserPromptSubmit;
+# only exit 2 blocks a prompt). No Python at all is environmental - the
+# counter silently keeps its last value, as before.
+$FindPy = Join-Path $PSScriptRoot "_lib/find-python.ps1"
+if (Test-Path -LiteralPath $FindPy -PathType Leaf) { . $FindPy }
+if ($PY) {
+    $env:_UPSR_HOOK_DIR = $PSScriptRoot
+    $env:_UPSR_STATE = $SessionLog
+    $env:_UPSR_OFFSET = $OffsetFile
+    $scanSrc = @'
+import json, os, sys
+
+state_file = os.environ.get("_UPSR_STATE", "")
+offset_file = os.environ.get("_UPSR_OFFSET", "")
+
+def _read_num(path):
+    try:
+        with open(path, "r") as f:
+            return int((f.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+def _write_num(path, value):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(value))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+total = _read_num(state_file)
+try:
+    payload = json.loads(sys.stdin.read() or "{}")
+except Exception:
+    payload = {}
+transcript = ""
+if isinstance(payload, dict):
+    transcript = payload.get("transcript_path") or ""
+if not transcript or not os.path.exists(transcript):
+    print(total)  # nothing to count: keep the accumulated value
+    sys.exit(0)
+
+_counter_dir = ""
+for _d in (
+    os.path.normpath(os.path.join(os.environ.get("_UPSR_HOOK_DIR", "x"),
+                                  os.pardir, "scripts")),
+    os.path.join(os.environ.get("CLAUDE_PROJECT_DIR", "x"),
+                 ".claude", "scripts"),
+):
+    if os.path.isfile(os.path.join(_d, "claude_token_counter.py")):
+        _counter_dir = _d
+        break
+if not _counter_dir:
+    print("[user-prompt-submit-reminder] BROKEN INSTALL: .claude/scripts/"
+          "claude_token_counter.py is missing; the session work counter "
+          "cannot run. Re-run the VCO bundle update to restore it.",
+          file=sys.stderr)
+    sys.exit(1)
+sys.path.insert(0, _counter_dir)
+try:
+    from claude_token_counter import TranscriptScanner
+except ImportError:
+    print("[user-prompt-submit-reminder] BROKEN INSTALL: .claude/scripts/"
+          "claude_token_counter.py failed to import; the session work "
+          "counter cannot run. Re-run the VCO bundle update.",
+          file=sys.stderr)
+    sys.exit(1)
+
+try:
+    prev_off = _read_num(offset_file)
+    res = TranscriptScanner().scan(transcript, start_offset=prev_off)
+    # A scan that did not start at the persisted offset (rotated transcript
+    # or the bounded tail window of a first scan over an oversized file) is
+    # a fresh basis - its delta replaces the cumulative, never adds to it.
+    base = total if res.start_offset_used == prev_off else 0
+    total = base + res.work_units_total
+    end = res.end_offset or prev_off
+    if end != prev_off:
+        _write_num(offset_file, end)  # offset first: a kill between the two
+        _write_num(state_file, total)  # writes under-counts (safe direction)
+except Exception:
+    # A scanning hiccup must never break the prompt: keep the old total.
+    pass
+print(total)
+'@
+    $scanOut = $HookStdin | & $PY -c $scanSrc
+    $scanRc = $LASTEXITCODE
+    Remove-Item Env:_UPSR_HOOK_DIR, Env:_UPSR_STATE, Env:_UPSR_OFFSET -ErrorAction SilentlyContinue
+    if ($scanRc -ne 0) { exit 1 }  # broken install: the python side already said why on stderr
+    if ($scanOut) {
+        $last = ($scanOut | Select-Object -Last 1)
+        try { $TotalWords = [int]([string]$last).Trim() } catch { }
+    }
 }
 
-if ($TotalWords -ge 200000) {
+# 300K work units = the documented "~300K tokens" scale of the retired
+# 200K-word threshold (W6-F: the counter now holds real work units).
+if ($TotalWords -ge 300000) {
     $Marker = Join-Path $Tmp "claude-ctx-warn-$ProjectName-$SessionId"
     if (Test-Path $Marker) { exit 0 }
     Write-Output ""
-    Write-Output "Session checkpoint (~300K tokens used)"
+    Write-Output "Session checkpoint (~300K work units this session)"
     Write-Output "   - /refresh-context - Update KG if topic shifted"
     Write-Output "   - Update CONTEXT_STATE.md with findings"
     Write-Output "   - Consider new session before context compression"
@@ -81,8 +178,9 @@ if ($TotalWords -ge 200000) {
     exit 0
 }
 
-# CONTEXT_STATE staleness — counter-based, one-shot per ~120K-word window
-# since the LAST nudge or last actual edit (whichever is more recent).
+# CONTEXT_STATE staleness - counter-based, one-shot per ~180K-work-unit
+# window (the retired 120K-word window's token equivalent) since the LAST
+# nudge or last actual edit (whichever is more recent).
 #
 # Replaces the prior time-based 30-min staleness check that fired 4-5x
 # during long deep-work sessions. The new condition is "enough work has
@@ -108,9 +206,9 @@ if (Test-Path $StalenessMarker) {
     }
 }
 $Delta = $TotalWords - $LastFireWords
-if ($Delta -ge 120000) {
+if ($Delta -ge 180000) {
     Write-Output ""
-    Write-Output "~${Delta} words of work since last CONTEXT_STATE update."
+    Write-Output "~${Delta} work units since last CONTEXT_STATE update."
     Write-Output "   Append a 1-2 line progress note now (what shipped + what's next),"
     Write-Output "   before context grows further or /compact lands."
     Write-Output ""
