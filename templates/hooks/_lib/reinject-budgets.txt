@@ -1,0 +1,38 @@
+# reinject-budgets.txt (v0.2.102 W6-D) -- the ONE committed budget table
+# both compact-context-reinject siblings PARSE (shared config, A>B>C tier B).
+# Read by templates/hooks/compact-context-reinject.sh and .ps1. Do not fork
+# per-language copies of these numbers; edit them here once.
+#
+# RULE: the compact re-inject caps its WHOLE output at VCO_HOOK_CONTEXT_CAP
+# (default 9 500, Claude Code shows only a preview past 10 000). Before
+# v0.2.102 the cap was applied to the concatenated stream, so an oversized
+# CONTEXT_STATE.md cut the stream inside section 1 and the plan / commits /
+# snapshot sections NEVER reached the model. Each section now gets a budget
+# IN CHARACTERS (the section's own header included) and is truncated WITHIN
+# itself, ending with a pointer naming the file to Read. `context_state`
+# has no row: it is the FLEX section and gets
+#     cap - overhead - sum(min(section length, its budget) for present
+#                         fixed sections)
+# so every section is always represented.
+#
+# A USER-LOWERED CAP SCALES THESE ROWS (v0.2.102 review F2): when
+# VCO_HOOK_CONTEXT_CAP is below overhead + the sum of the fixed rows + the
+# 200-char flex floor, the fixed budgets shrink proportionally, each floored
+# at 300 chars (a section header plus its cut marker) — every section stays
+# represented at any cap down to the sane floor 1750. Below 1750 no
+# budgeting can keep six section headers, and the whole-stream backstop
+# cuts inside the later sections.
+#
+# Format: one `name value` pair per line; blank lines and lines starting
+# with `#` are ignored. Values must be POSITIVE integers — a 0 row is
+# rejected with one stderr line and its section runs uncapped (both
+# siblings enforce this identically). Behavioural parity of the two
+# siblings is locked by tests/test_v02102_reinject_budgets_and_snapshot.py.
+session_state 2000
+plan 1200
+commits 800
+snapshot 1200
+pruned 600
+# headroom for the blank lines between sections and the shared cut marker;
+# never allocated to a section
+overhead 400

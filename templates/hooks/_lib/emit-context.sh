@@ -32,7 +32,7 @@
 # on Windows (provided $PY resolution from find-python.sh has run).
 
 # ───────────────────────────────────────────────────────────────────────────
-# vco_cap_context <text> [pointer]   /   ... | vco_cap_context_stream [pointer]
+# vco_cap_context <text> [pointer] [limit]   /   ... | vco_cap_context_stream [pointer]
 #
 # v0.2.100 WP-17 — THE cap for text a hook injects into the model's context.
 # Claude Code's hooks contract: injected hook output past 10 000 characters is
@@ -45,6 +45,13 @@
 # characters (default 9 500, clamped to 1 000..10 000; headroom for the
 # harness's own wrapper) and ENDS with a marker that says what was cut and
 # where the rest is, so the model can Read it.
+#
+# v0.2.102 W6-D: the optional third argument (a per-call `limit`) overrides
+# the global cap for ONE call — the value the caller computed as a SECTION
+# budget inside the global cap (compact-context-reinject truncates each of
+# its sections within itself so no section is dropped wholesale). The marker
+# is the same: the section cut exists to keep the whole stream under the
+# 10 000-character hook-injection limit.
 #
 # Counted in the shell's locale (characters under UTF-8, bytes under C —
 # bytes >= characters, so the limit holds either way); a multi-byte sequence
@@ -64,8 +71,12 @@ vco_hook_context_cap() {
 }
 
 vco_cap_context() {
-    local text="$1" pointer="${2:-}" cap total marker keep head
-    cap="$(vco_hook_context_cap)"
+    local text="$1" pointer="${2:-}" limit="${3:-}" cap total marker keep head
+    if [ -n "$limit" ]; then
+        cap="$limit"
+    else
+        cap="$(vco_hook_context_cap)"
+    fi
     total=${#text}
     if [ "$total" -le "$cap" ]; then
         printf '%s' "$text"

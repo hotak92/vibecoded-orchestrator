@@ -3,7 +3,11 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 # pre-compact-save.sh
-# Fires BEFORE auto context compaction (PreCompact event, matcher: "auto").
+# Fires BEFORE every context compaction (PreCompact event, matcher: "*" —
+# v0.2.102 W6-D widened it from "auto": the vendor hooks doc gives PreCompact
+# exactly two matcher values, manual and auto, and a manual /compact under
+# matcher "auto" saved NOTHING, so the reinject hook replayed a stale
+# snapshot after every manual compaction).
 # Saves a snapshot of current working state to disk so compact-context-reinject.sh
 # can restore it after compaction. Does NOT write to stdout (not added to context).
 

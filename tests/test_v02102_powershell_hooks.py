@@ -78,11 +78,15 @@ def _stem(cmd: str) -> str:
     return (vco_hook_script_identity(cmd) or "").rsplit(".", 1)[0]
 
 
-def _groups_of(doc: dict, event: str, stem: str) -> list:
+def _groups_of(doc: dict, event: str, stem: str, matchers=None) -> list:
     """The SHELL groups (matcher naming Bash) that carry ``stem`` — the
-    wait guard is also registered on Read and the self-wake tools."""
+    wait guard is also registered on Read and the self-wake tools.
+    ``matchers`` (v0.2.102 W6-D) overrides the Bash default: the groups
+    whose matcher is IN that set — for MATCHER_MIGRATIONS rows that widen
+    something other than Bash (e.g. PreCompact ``auto`` -> ``*``)."""
     return [g for g in doc["hooks"].get(event, [])
-            if "Bash" in str(g.get("matcher", "")).split("|")
+            if (("Bash" in str(g.get("matcher", "")).split("|")
+                 if matchers is None else g.get("matcher") in matchers))
             and any(_stem(h.get("command", "")) == stem for h in g.get("hooks", []))]
 
 
@@ -212,7 +216,12 @@ class TestRegistrations:
         for row in MATCHER_MIGRATIONS:
             for target in (t for t in row.targets if t.endswith(ext)):
                 stem = target.rsplit(".", 1)[0]
-                matchers = {g.get("matcher") for g in _groups_of(doc, row.event, stem)}
+                # W6-D: rows no longer all widen a Bash matcher, so the
+                # group filter is the row's own old/new pair (for the Bash
+                # rows this is the same set the old "contains Bash" filter
+                # selected).
+                matchers = {g.get("matcher") for g in _groups_of(
+                    doc, row.event, stem, matchers={row.old, row.new})}
                 assert matchers == {row.new}, (row.event, target, matchers)
 
 
