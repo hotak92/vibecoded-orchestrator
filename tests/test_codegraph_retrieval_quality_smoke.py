@@ -224,8 +224,11 @@ def test_live_known_noise_query_returns_only_relevant_or_empty() -> None:
     either zero rows or only rows scoring above the post-rerank floor — never a
     flood of below-floor noise.
 
-    Gated: SKIPS when Weaviate / a code collection is absent (non-blocking in
-    infra-less CI). The weaviate-smoke workflow sets
+    Gated: OPT-IN — ``tests/conftest.py`` pins ``WEAVIATE_URL`` at the
+    unroutable sentinel unless the run sets ``VCO_TEST_LIVE_WEAVIATE=1`` (v0.2.102
+    W6-B2 last round; an ambient URL alone is not an opt-in), so a plain run
+    SKIPS here without contacting any backend. Also SKIPS when Weaviate / a
+    code collection is absent (non-blocking in infra-less CI). The weaviate-smoke workflow sets
     VCO_RUN_LIVE_RETRIEVAL_SMOKE=1 to convert a skip into a failure so the live
     lane genuinely exercises real data.
     """

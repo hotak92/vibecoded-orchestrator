@@ -584,6 +584,107 @@ pub fn code_embed_in_stack(infra_dir: Option<&Path>) -> bool {
         .unwrap_or(false)
 }
 
+// ─── code_embed marker refresh on a selection change (W6-B2 last round) ───
+
+/// The launcher.db selection inputs the last refresh ran for (`None` = never
+/// ran, or the last run failed — retried next tick).
+static LAST_CODE_MODEL_INPUTS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Per-tick budget for the Python refresh.
+const CODE_EMBED_MARKER_REFRESH_TIMEOUT_SECS: u64 = 60;
+
+/// Run `refresh` when `inputs` differ from the last successful run (and on
+/// the first tick, which reconciles a marker written by an older install).
+/// `refresh` returns whether it succeeded; a failure forgets the inputs so
+/// the next tick retries. Returns whether `refresh` ran. Injectable so the
+/// select → marker → supervise chain is provable without a Python or a
+/// runtime.
+pub async fn refresh_code_embed_marker_if_changed<F, Fut>(
+    last: &std::sync::Mutex<Option<String>>,
+    inputs: Option<String>,
+    refresh: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let Some(inputs) = inputs else { return false };
+    {
+        let g = last.lock().unwrap_or_else(|p| p.into_inner());
+        if g.as_deref() == Some(inputs.as_str()) {
+            return false;
+        }
+    }
+    let ok = refresh().await;
+    let mut g = last.lock().unwrap_or_else(|p| p.into_inner());
+    *g = if ok { Some(inputs) } else { None };
+    true
+}
+
+/// The ONE decision lives in Python (`vco_lib.compose_env
+/// refresh-code-embed-marker`, the same `code_embed_in_stack` install and the
+/// session plan use); this only runs it. Selecting CodeSage on a GPU host
+/// whose install runs no container turns the marker on and the tick below
+/// creates the container; deselecting turns it off and the tick stops
+/// supervising it (the container and its volumes are never touched).
+async fn run_code_embed_marker_refresh(infra_dir: &Path) -> bool {
+    let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib() else {
+        tracing::debug!("[vct-hub] infra watchdog: no Python for the code_embed marker refresh");
+        return false;
+    };
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.compose_env")
+        .arg("refresh-code-embed-marker")
+        .arg("--infra-dir")
+        .arg(infra_dir.as_os_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(root) = infra_dir.parent() {
+        cmd.current_dir(root);
+    }
+    match tokio::time::timeout(
+        Duration::from_secs(CODE_EMBED_MARKER_REFRESH_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) if out.status.success() => {
+            let line = String::from_utf8_lossy(&out.stdout);
+            if line.contains("\"changed\": true") {
+                tracing::info!(
+                    "[vct-hub] infra watchdog: code-model selection changed — code_embed marker refreshed: {}",
+                    line.trim()
+                );
+            }
+            true
+        }
+        Ok(Ok(out)) => {
+            tracing::warn!(
+                "[vct-hub] infra watchdog: code_embed marker refresh failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("[vct-hub] infra watchdog: cannot run the code_embed marker refresh: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("[vct-hub] infra watchdog: code_embed marker refresh timed out");
+            false
+        }
+    }
+}
+
+/// The selection fingerprint: launcher.db's inputs plus the hub's own
+/// `CODE_EMBED_MODEL` override (also read by the decision).
+fn code_model_inputs(db: &LauncherDbHandle) -> Option<String> {
+    let fp = db.0.code_model_inputs_fingerprint().ok()?;
+    Some(format!("{fp}|env={}", std::env::var("CODE_EMBED_MODEL").unwrap_or_default()))
+}
+
 /// True when `service` should be supervised on this host. Always true for
 /// `weaviate` / `ollama`; for `code_embed` it defers to
 /// [`code_embed_in_stack`] (with the compose dir whose `.env` carries the
@@ -1272,6 +1373,13 @@ async fn run_one_tick(
             return;
         }
     };
+
+    // W6-B2 last round: a code-model selection change recomputes the
+    // code_embed marker BEFORE the stack gate below reads it.
+    refresh_code_embed_marker_if_changed(&LAST_CODE_MODEL_INPUTS, code_model_inputs(db), || {
+        run_code_embed_marker_refresh(&infra_dir)
+    })
+    .await;
 
     let runner = RuntimeRunner {
         binary: runtime.binary_path.clone(),
@@ -2254,6 +2362,70 @@ mod tests {
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
         assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", None, None, never, QUICK).await, HealOutcome::Skipped(_)));
         assert_eq!(r.verbs(), vec!["inspect"]);
+    }
+
+    // ----- v0.2.102 W6-B2 last round: selection → marker → supervision -----
+
+    /// Selecting CodeSage on a GPU host whose install runs no container: the
+    /// changed selection inputs run the refresh (here a stand-in writing the
+    /// marker the Python decision would), the stack gate then admits
+    /// code_embed, and the heal path CREATES the missing container.
+    /// Deselecting drops the marker → not supervised. Unchanged inputs →
+    /// no refresh at all.
+    #[tokio::test]
+    async fn a_codesage_selection_brings_the_container_up_and_deselecting_stops_supervising_it() {
+        let last = std::sync::Mutex::new(None);
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        std::fs::write(&env_file, "CODE_EMBED_HOST_GPU=true\nCODE_EMBED_IN_STACK=false\n").unwrap();
+        assert!(!code_embed_in_stack(Some(dir.path())), "no container before the selection");
+
+        // Select CodeSage → the inputs change → the refresh turns the marker on.
+        let ran = refresh_code_embed_marker_if_changed(&last, Some("pin=codesage".into()), || async {
+            std::fs::write(&env_file, "CODE_EMBED_HOST_GPU=true\nCODE_EMBED_IN_STACK=true\n").unwrap();
+            true
+        })
+        .await;
+        assert!(ran);
+        assert!(service_in_stack("code_embed", Some(dir.path())));
+        // … and the tick's heal path creates the missing container.
+        let r = FakeRunner::new("podman");
+        r.on("inspect", fail("Error: no such container vco_code_embed"));
+        r.on("ps", ok("[]"));
+        r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+        let created = std::cell::Cell::new(false);
+        let out = heal_service(&r, Some(&managed_row("code_embed")), "vco_code_embed", Some("infrastructure"), None, || {
+            created.set(true);
+            async { Ok(()) }
+        }, QUICK)
+        .await;
+        assert!(created.get(), "the missing container is composed: {out:?}");
+        assert!(matches!(out, HealOutcome::Verified { .. }), "{out:?}");
+
+        // Same inputs next tick → no refresh run.
+        let again = refresh_code_embed_marker_if_changed(&last, Some("pin=codesage".into()), || async {
+            panic!("unchanged inputs must not re-run the refresh")
+        })
+        .await;
+        assert!(!again);
+
+        // Deselect → the marker drops → the stack gate excludes code_embed.
+        refresh_code_embed_marker_if_changed(&last, Some("pin=jina".into()), || async {
+            std::fs::write(&env_file, "CODE_EMBED_HOST_GPU=true\nCODE_EMBED_IN_STACK=false\n").unwrap();
+            true
+        })
+        .await;
+        assert!(!service_in_stack("code_embed", Some(dir.path())));
+    }
+
+    /// A failed refresh forgets the inputs, so the next tick retries.
+    #[tokio::test]
+    async fn a_failed_marker_refresh_is_retried_next_tick() {
+        let last = std::sync::Mutex::new(None);
+        assert!(refresh_code_embed_marker_if_changed(&last, Some("x".into()), || async { false }).await);
+        assert!(refresh_code_embed_marker_if_changed(&last, Some("x".into()), || async { true }).await);
+        assert!(!refresh_code_embed_marker_if_changed(&last, Some("x".into()), || async { true }).await);
+        assert!(!refresh_code_embed_marker_if_changed(&last, None, || async { true }).await);
     }
 
     // ----- v0.2.102 W5-A (M3): declared-unmanaged containers ------------

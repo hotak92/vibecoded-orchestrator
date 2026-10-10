@@ -86,7 +86,7 @@ class ContextCeilingTestBase(GatewayTestBase):
         return {**self.auth(), "x-claude-code-session-id": session, **extra}
 
     async def rows(self) -> list[dict]:
-        await self.client.app[srv.APP_KEY].usage.drain()
+        await self.client.app[srv.APP_KEY].quiesce()  # handlers finished + appends drained
         path = self.usage_ledger_path
         if not path.is_file():
             return []

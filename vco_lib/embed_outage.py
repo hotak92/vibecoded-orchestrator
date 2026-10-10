@@ -61,7 +61,10 @@ def watchdog_state(container: str, root: Optional[Path] = None) -> str:
                         f"({entry.detected.strip()[:200]})")
     except Exception:  # noqa: BLE001 — an unreadable ledger is "not known"
         return "the hub watchdog state is not known"
-    return f"the hub watchdog restarts {container} automatically when it is part of this install"
+    extra = (" (a GPU host where CodeSage is selected; a new selection is picked up on the "
+             "watchdog's next tick)" if container == CODE_EMBED_CONTAINER else "")
+    return (f"the hub watchdog restarts {container} automatically when it is part of this "
+            f"install{extra}")
 
 
 def _hint(args: str) -> str:

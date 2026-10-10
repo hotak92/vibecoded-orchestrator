@@ -30,6 +30,38 @@ impl Db {
         Ok(row)
     }
 
+    /// v0.2.102 W6-B2 last round: a fingerprint of every launcher.db input the
+    /// code_embed stack decision reads — the `app_state` rows whose key
+    /// contains `code_emb` (the Preferences pin and its model picks, the
+    /// "Default code embedding" dropdown) and every code-graph binding's
+    /// record / analyzed stamp / `config_json` (Codegraph-tab target, fill).
+    /// Change DETECTION only: the hub re-runs the ONE Python decision
+    /// (`vco_lib.compose_env refresh-code-embed-marker`) when this changes; it
+    /// interprets nothing. The key pattern is pinned against the Python
+    /// reader by `tests/test_v02102_code_embed_in_stack.py`. Poison-tolerant
+    /// (the watchdog task must never panic).
+    pub fn code_model_inputs_fingerprint(&self) -> Result<String, String> {
+        let guard = self.lock_recover();
+        let state: String = guard
+            .query_row(
+                "SELECT COALESCE(group_concat(key || '=' || value, ';'), '') FROM \
+                 (SELECT key, value FROM app_state WHERE key LIKE '%code_emb%' ORDER BY key)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("code_model_inputs_fingerprint(app_state): {e}"))?;
+        let bindings: String = guard
+            .query_row(
+                "SELECT COALESCE(group_concat(project_id || ',' || COALESCE(embedding_model, '') \
+                 || ',' || COALESCE(last_analyzed_at, '') || ',' || COALESCE(config_json, ''), ';'), '') \
+                 FROM (SELECT * FROM project_codegraph_bindings ORDER BY project_id)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("code_model_inputs_fingerprint(bindings): {e}"))?;
+        Ok(format!("{state}|{bindings}"))
+    }
+
     /// v0.2.62 (CONCERN-6 remediation): poison-tolerant boolean reader for
     /// the hub's detached infra-watchdog task, which must never panic.
     ///
@@ -345,6 +377,31 @@ mod tests {
         // upsert overwrites
         db.app_state_set("hello", "there").unwrap();
         assert_eq!(db.app_state_get("hello").unwrap().as_deref(), Some("there"));
+    }
+
+    /// W6-B2 last round: the fingerprint moves with every selection input
+    /// (pin, default dropdown, a binding's target) and with nothing else.
+    #[test]
+    fn code_model_inputs_fingerprint_tracks_the_selection_inputs_only() {
+        use crate::db::models::ProjectHost;
+
+        let db = Db::open_in_memory().expect("in-memory db");
+        let base = db.code_model_inputs_fingerprint().unwrap();
+        db.app_state_set("launcher.unrelated_flag", "1").unwrap();
+        assert_eq!(db.code_model_inputs_fingerprint().unwrap(), base, "unrelated keys ignored");
+        db.app_state_set("code_embed_backend_override", "codesage").unwrap();
+        let pinned = db.code_model_inputs_fingerprint().unwrap();
+        assert_ne!(pinned, base);
+        db.app_state_set("default_code_embedding", "jina").unwrap();
+        let defaulted = db.code_model_inputs_fingerprint().unwrap();
+        assert_ne!(defaulted, pinned);
+        db.insert_project("p1", "P", "/tmp/p", ProjectHost::Base, "p").unwrap();
+        db.set_project_codegraph_binding(
+            "p1", "P", None, None, None, None, true,
+            &serde_json::json!({"code_model_target": "codesage-large-v2"}),
+        )
+        .unwrap();
+        assert_ne!(db.code_model_inputs_fingerprint().unwrap(), defaulted, "a target counts");
     }
 
     // ─── v0.2.95: the poison-tolerant writers ───────────────────────────

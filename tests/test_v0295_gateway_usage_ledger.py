@@ -804,7 +804,7 @@ class UsageThroughTheGatewayTests(GatewayTestBase):
 
     async def rows(self) -> list[dict]:
         """Every row on DISK, after the queued appends have landed."""
-        await self.client.app[APP_KEY].usage.drain()
+        await self.client.app[APP_KEY].quiesce()  # handlers finished + appends drained
         if not self.usage_ledger_path.is_file():
             return []
         return [
@@ -1311,7 +1311,7 @@ class UsageRouteTests(GatewayTestBase):
             json={"model": "claude-opus-5", "messages": [], "stream": True},
         )
         await resp.read()
-        await self.client.app[APP_KEY].usage.drain()
+        await self.client.app[APP_KEY].quiesce()  # handlers finished + appends drained
         body = await (await self.client.get("/usage", headers=self.auth())).json()
         self.assertEqual(set(body), {"sessions", "ledger_path", "rows_written"})
         self.assertEqual(body["rows_written"], 1)
@@ -1361,7 +1361,7 @@ class UsageRouteTests(GatewayTestBase):
             json={"model": "claude-opus-5", "messages": [], "stream": True},
         )
         await resp.read()
-        await self.client.app[APP_KEY].usage.drain()
+        await self.client.app[APP_KEY].quiesce()  # handlers finished + appends drained
         body = await (await self.client.get("/health")).json()
         self.assertEqual(body["usage_ledger"]["rows_written"], 1)
         self.assertTrue(body["usage_ledger"]["last_write_ts"].endswith("Z"))

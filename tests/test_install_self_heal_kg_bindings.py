@@ -211,9 +211,10 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
-        # Also pop WEAVIATE_URL/PORT we may have set.
-        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
+        # WEAVIATE_URL / WEAVIATE_PORT set by the test are restored by
+        # `self._env_patch.stop()` above (mock.patch.dict restores the exact prior
+        # env). The old `os.environ.pop` here REMOVED the suite pin and let every
+        # later test resolve a live backend (v0.2.102 W6-B2 last round).
 
     def _set_weaviate_url(self, port: int) -> None:
         os.environ["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
@@ -784,8 +785,10 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
-        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
+        # WEAVIATE_URL / WEAVIATE_PORT set by the test are restored by
+        # `self._env_patch.stop()` above (mock.patch.dict restores the exact prior
+        # env). The old `os.environ.pop` here REMOVED the suite pin and let every
+        # later test resolve a live backend (v0.2.102 W6-B2 last round).
 
     def _set_weaviate_url(self, port: int) -> None:
         os.environ["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
@@ -1363,8 +1366,10 @@ class SelfHealDeadRootRowSweepEndToEndTests(unittest.TestCase):
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
-        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
+        # WEAVIATE_URL / WEAVIATE_PORT set by the test are restored by
+        # `self._env_patch.stop()` above (mock.patch.dict restores the exact prior
+        # env). The old `os.environ.pop` here REMOVED the suite pin and let every
+        # later test resolve a live backend (v0.2.102 W6-B2 last round).
 
     def test_end_to_end_sweeps_dead_root_own_primary_row(self):
         CANON = "VCODev_KnowledgeGraph"                 # live canonical
@@ -1477,8 +1482,10 @@ class SelfHealIdentityPickRemedyEndToEndTests(unittest.TestCase):
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
-        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
+        # WEAVIATE_URL / WEAVIATE_PORT set by the test are restored by
+        # `self._env_patch.stop()` above (mock.patch.dict restores the exact prior
+        # env). The old `os.environ.pop` here REMOVED the suite pin and let every
+        # later test resolve a live backend (v0.2.102 W6-B2 last round).
 
     def test_identity_pick_then_update_clears_the_drift_entry(self):
         DEAD = "VibeCodedOrchestrator_KnowledgeGraph"  # ptr (machine default)

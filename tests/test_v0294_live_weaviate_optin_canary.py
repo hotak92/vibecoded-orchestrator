@@ -45,6 +45,10 @@ def test_the_pin_stood_aside_and_the_ambient_value_survived():
     would break it.
     """
     ambient = _conftest._AMBIENT_WEAVIATE_URL
+    if not (_conftest._LIVE_WEAVIATE_OPTED_IN or _conftest._ALLOW_REAL_STATE):
+        # v0.2.102 W6-B2 last round: no explicit opt-in → pinned like any file.
+        assert os.environ.get("WEAVIATE_URL") == UNROUTABLE_SENTINEL_URL
+        return
     if ambient is None:
         assert "WEAVIATE_URL" not in os.environ, (
             "the stand-aside must REMOVE the key when the ambient env had "
@@ -86,13 +90,18 @@ def test_a_non_opted_out_file_would_still_be_pinned():
 _DISTINCT_AMBIENT = "http://127.0.0.9:9998"
 
 
-def _child_skip_reasons(target: str, ambient: str) -> str:
+def _child_skip_reasons(target: str, ambient: str, *, opt_in: bool = True) -> str:
     import subprocess
 
     from tests.common.child_env import child_env
 
     env = child_env()
     env["WEAVIATE_URL"] = ambient
+    env.pop("VCO_TEST_ALLOW_REAL_STATE", None)
+    if opt_in:
+        env[_conftest._LIVE_WEAVIATE_OPTIN_ENV] = "1"
+    else:
+        env.pop(_conftest._LIVE_WEAVIATE_OPTIN_ENV, None)
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rs",
          str(REPO_ROOT / "tests" / target)],
@@ -136,3 +145,14 @@ def test_a_non_opt_out_live_module_still_sees_the_pin():
         f"a NON-opt-out live module reached the ambient backend:\n{out[-1500:]}"
     )
     assert _DISTINCT_AMBIENT not in out, out[-1500:]
+
+
+def test_without_the_opt_in_an_opt_out_module_sees_the_pin():
+    """v0.2.102 W6-B2 last round: an ambient WEAVIATE_URL alone (a developer
+    shell, a Claude Code session) is NOT an opt-in. Red before: the listed
+    modules read the ambient value and reached a live backend."""
+    for target in ("test_v0246_v46b_live_ci10_diff_gate.py",
+                   "test_codegraph_retrieval_quality_smoke.py"):
+        out = _child_skip_reasons(target, _DISTINCT_AMBIENT, opt_in=False)
+        assert _DISTINCT_AMBIENT not in out, (
+            f"{target} reached the ambient backend without the opt-in:\n{out[-1500:]}")

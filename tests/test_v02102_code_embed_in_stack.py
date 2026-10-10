@@ -239,3 +239,75 @@ def test_the_spawn_gate_uses_the_serving_aware_probe(monkeypatch, tmp_path):
                                      check_owed=False)
     assert res.status == "deferred"
     assert "Ollama at http://x" in res.message
+
+
+# --- W6-B2 last round: a selection change brings the container up/down ------
+
+
+def _infra(tmp_path, *, gpu: "str | None", backend="ollama", model=QWEN3, marker="false"):
+    infra = tmp_path / "infrastructure"
+    infra.mkdir(exist_ok=True)
+    lines = [f"CODE_EMBED_BACKEND={backend}", f"CODE_EMBED_MODEL={model}",
+             f"CODE_EMBED_IN_STACK={marker}", "CODE_EMBED_DOCKERFILE=Dockerfile.cuda"]
+    if gpu is not None:
+        lines.append(f"CODE_EMBED_HOST_GPU={gpu}")
+    (infra / ".env").write_text("\n".join(lines) + "\n")
+    return infra
+
+
+def _refresh(infra, *, pin=None, default=QWEN3, rows=()):
+    state = {"default_code_embedding": default, "code_embed_backend_override": pin}
+    return compose_env.refresh_code_embed_marker(
+        infra, app_state=lambda key: state.get(key), binding_rows=list(rows), environ={})
+
+
+def test_selecting_codesage_on_a_gpu_host_turns_the_marker_on_with_codesage_pairing(tmp_path):
+    infra = _infra(tmp_path, gpu="true")
+    out = _refresh(infra, pin="codesage")
+    assert out == {"ok": True, "in_stack": True, "changed": True}
+    keys = compose_env._read_env_keys(infra)
+    assert keys["CODE_EMBED_IN_STACK"] == "true"
+    assert (keys["CODE_EMBED_BACKEND"], keys["CODE_EMBED_MODEL"]) == ("gpu", CODESAGE)
+    assert keys["CODE_EMBED_DOCKERFILE"] == "Dockerfile.cuda"  # other lines kept
+    assert _refresh(infra, pin="codesage")["changed"] is False  # idempotent
+
+
+def test_a_codegraph_tab_target_of_codesage_counts_too(tmp_path):
+    infra = _infra(tmp_path, gpu="true")
+    rows = [{"last_analyzed_at": 1, "embedding_model": QWEN3,
+             "config": {"code_model_target": "codesage-large-v2"}}]
+    assert _refresh(infra, rows=rows)["in_stack"] is True
+
+
+def test_deselecting_drops_only_the_marker(tmp_path):
+    infra = _infra(tmp_path, gpu="true", backend="gpu", model=CODESAGE, marker="true")
+    out = _refresh(infra, pin="jina", default=JINA)
+    assert out["in_stack"] is False and out["changed"] is True
+    keys = compose_env._read_env_keys(infra)
+    assert keys["CODE_EMBED_IN_STACK"] == "false"
+    # The pairing is left as it was: nothing about the container is touched.
+    assert (keys["CODE_EMBED_BACKEND"], keys["CODE_EMBED_MODEL"]) == ("gpu", CODESAGE)
+
+
+def test_a_non_gpu_host_never_runs_the_container(tmp_path):
+    infra = _infra(tmp_path, gpu="false")
+    assert _refresh(infra, pin="codesage")["in_stack"] is False
+    assert compose_env._read_env_keys(infra)["CODE_EMBED_IN_STACK"] == "false"
+
+
+def test_the_cli_runs_the_refresh(tmp_path, monkeypatch):
+    infra = _infra(tmp_path, gpu="false")
+    from vco_lib import launcher_db_reader as ldr
+
+    monkeypatch.setattr(ldr, "read_app_state_value", lambda key, db_path=None: None)
+    monkeypatch.setattr(ldr, "list_codegraph_binding_rows", lambda: [])
+    assert compose_env._main(["refresh-code-embed-marker", "--infra-dir", str(infra)]) == 0
+
+
+def test_every_selection_key_the_decision_reads_matches_the_hub_fingerprint():
+    """The hub re-runs the refresh when launcher.db rows whose key contains
+    ``code_emb`` change (vct-launcher-core ``code_model_inputs_fingerprint``) —
+    so every app_state key the decision reads must match that pattern."""
+    seen: list = []
+    ces.code_models_in_use("", environ={}, app_state=lambda k: seen.append(k), binding_rows=[])
+    assert seen and all("code_emb" in k for k in seen), seen
