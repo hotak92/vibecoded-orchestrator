@@ -1,0 +1,84 @@
+{
+ "source": "geometry.cpp",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Circle",
+   "start": 10,
+   "end": 18
+  },
+  {
+   "kind": "class",
+   "name": "Point",
+   "start": 20,
+   "end": 23
+  },
+  {
+   "kind": "class",
+   "name": "Box",
+   "start": 25,
+   "end": 29
+  },
+  {
+   "kind": "function",
+   "name": "Circle",
+   "start": 35,
+   "end": 35
+  },
+  {
+   "kind": "function",
+   "name": "area",
+   "start": 37,
+   "end": 39
+  },
+  {
+   "kind": "function",
+   "name": "circumference",
+   "start": 41,
+   "end": 43
+  },
+  {
+   "kind": "function",
+   "name": "distance",
+   "start": 45,
+   "end": 49
+  },
+  {
+   "kind": "function",
+   "name": "quadrant",
+   "start": 55,
+   "end": 60
+  },
+  {
+   "kind": "function",
+   "name": "smaller",
+   "start": 63,
+   "end": 66
+  },
+  {
+   "kind": "class",
+   "name": "Tally",
+   "start": 73,
+   "end": 83
+  },
+  {
+   "kind": "function",
+   "name": "add",
+   "start": 75,
+   "end": 75
+  },
+  {
+   "kind": "function",
+   "name": "total",
+   "start": 77,
+   "end": 79
+  },
+  {
+   "kind": "function",
+   "name": "summarize",
+   "start": 88,
+   "end": 99
+  }
+ ]
+}

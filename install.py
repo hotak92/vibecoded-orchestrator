@@ -21315,11 +21315,11 @@ def _install_playwright_browsers() -> None:
 
 def _install_codegraph_treesitter(venv_python: Path) -> None:
     """Install the OPTIONAL ``codegraph-ts`` extra (tree-sitter grammars) so the
-    code-graph analyzer's cross-reference pass extracts call edges for
-    non-Python languages. Best-effort soft-fail (mirrors
-    ``_install_playwright_browsers``): the analyzer degrades to Python-only
-    ``ast`` call extraction without it — every grammar import in
-    ``vco_lib/codegraph_calls.py`` is guarded.
+    code-graph analyzer parses non-Python DEFINITIONS (v0.2.102) and call edges
+    with tree-sitter. Best-effort soft-fail (mirrors
+    ``_install_playwright_browsers``): without it the analyzer degrades to the
+    regex definitions extractors + Python-only call edges — every grammar
+    import in ``vco_lib/codegraph_grammars.py`` is guarded.
 
     The skip/argv DECISION lives in
     ``vco_lib.install_companions.codegraph_ts_install_plan`` (pure + tested);
@@ -21345,7 +21345,7 @@ def _install_codegraph_treesitter(venv_python: Path) -> None:
         _log_install_event("codegraph-ts", "skip", _note)
         return
 
-    print("[codegraph-ts] Installing tree-sitter call-extraction extra "
+    print("[codegraph-ts] Installing tree-sitter code-graph grammars "
           "(this may take ~20s) ... ", flush=True)
     # Soft-fail (on_failure="return"): the analyzer degrades to Python-only when
     # the extra is absent. Reuse the pip robustness flags + subprocess env.
@@ -21358,8 +21358,8 @@ def _install_codegraph_treesitter(venv_python: Path) -> None:
             on_failure="return",
             fail_message="  WARN: codegraph-ts extra install exited non-zero.",
             user_hint_lines=[
-                "Cross-language code-graph call edges stay Python-only until "
-                "this succeeds. Retry: pip install -e '.[codegraph-ts]' (orch "
+                "Non-Python code-graph definitions stay regex, call edges Python-"
+                "only, until this succeeds. Retry: pip install -e '.[codegraph-ts]' (orch "
                 "venv; -e required). Skip with VCT_SKIP_CODEGRAPH_TS=1.",
             ],
         )

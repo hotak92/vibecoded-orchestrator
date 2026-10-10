@@ -26,6 +26,7 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_svelte_script_definitions, note_path
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     run_pure_extractor,
@@ -301,10 +302,31 @@ def extract_svelte_file(
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
     # --- Functions / arrow exports / reactive decls ---
-    for decl in _parse_svelte_functions(content):
+    # Definitions: the <script> blocks parsed with the tree-sitter TypeScript
+    # grammar first (v0.2.102; no Svelte template grammar is needed for the
+    # script), the regex parser as the fallback. Same four kinds either way:
+    # function / export / arrow_export / reactive.
+    ts_decls = extract_svelte_script_definitions(
+        _extract_svelte_script_blocks(content), content, origin=relative_path,
+    )
+    note_path("svelte", "tree-sitter" if ts_decls is not None else "regex")
+    decls: List[Dict[str, Any]] = []
+    if ts_decls is not None:
+        decls = [
+            {"name": d.name, "kind": d.tag, "is_async": d.is_async,
+             "start_line": d.start_line, "end_line": d.end_line}
+            for d, _is_module in ts_decls
+        ]
+    else:
+        for decl in _parse_svelte_functions(content):
+            start_line = content[:decl["start_offset"]].count('\n') + 1
+            end_line = _extract_balanced_block(source_lines, start_line, language="svelte")
+            decls.append({**decl, "start_line": start_line, "end_line": end_line})
+
+    for decl in decls:
         name: str = decl["name"]
-        start_line = content[:decl["start_offset"]].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line, language="svelte")
+        start_line = decl["start_line"]
+        end_line = decl["end_line"]
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
 
         kind = decl["kind"]

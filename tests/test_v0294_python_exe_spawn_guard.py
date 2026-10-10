@@ -420,8 +420,11 @@ class TheLadderReOwesTheWalkThatNeverRan(unittest.TestCase):
     """
 
     def test_the_ladder_covers_the_release_being_prepared(self):
-        self.assertEqual(ceg.EXTRACTOR_GENERATION_BUMPS[-1], "0.2.94")
-        self.assertEqual(ceg.CURRENT_EXTRACTOR_GENERATION, "0.2.94")
+        # The 0.2.94 recovery rung must stay on the ladder (never edited away);
+        # v0.2.102 appended the tree-sitter definitions rung after it, so the
+        # head is whatever the newest rung is.
+        self.assertIn("0.2.94", ceg.EXTRACTOR_GENERATION_BUMPS)
+        self.assertEqual(ceg.CURRENT_EXTRACTOR_GENERATION, ceg.EXTRACTOR_GENERATION_BUMPS[-1])
 
     def test_a_project_stranded_by_the_field_defect_is_owed_again(self):
         verdict = ceg.decide(

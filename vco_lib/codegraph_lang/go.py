@@ -29,6 +29,7 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_definitions, note_path
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
@@ -140,6 +141,54 @@ def _go_methods_for_struct(
     return methods
 
 
+def _regex_go_definitions(
+    content_clean: str, source_lines: List[str],
+) -> Tuple[List[Tuple[str, int, int, List[str]]], List[Tuple[str, str, int, int]]]:
+    """REGEX definitions discovery — the FALLBACK when the tree-sitter Go
+    grammar cannot load (``vco_lib.codegraph_defs``). Returns
+    ``(types, functions)``: types ``(name, start_line, end_line, methods)``,
+    functions ``(name, args, start_line, end_line)``. Behaviour is the
+    pre-v0.2.102 regex extractor's, unchanged (golden regex snapshots)."""
+    # Structs / interfaces as "classes"
+    type_pattern = re.compile(r'type\s+([\w]+)\s+(?:struct|interface)\s*\{', re.MULTILINE)
+    # v0.2.92 WP-5b: a LIST of (name, start_line), not a dict keyed by name —
+    # see the same change in `ruby.py`, where the fixture proves the loss.
+    # Two same-named types in ONE file are legal when declared inside
+    # different function bodies (`func f() { type cfg struct{…} }`), and
+    # this pattern is not anchored to package scope, so the dict
+    # silently kept only the last.
+    # The writer's occurrence disambiguator keys on `(kind, identity_key)` and
+    # already covers KIND_CLASS, so the second declaration lands as `<name>#2`.
+    struct_decls: List[Tuple[str, int]] = []
+    for m in type_pattern.finditer(content_clean):
+        name = m.group(1)
+        start_line = content_clean[:m.start()].count('\n') + 1
+        struct_decls.append((name, start_line))
+
+    # Functions: func Name(...) and methods: func (recv Type) Name(...)
+    func_pattern = re.compile(
+        r'func\s+(?:\([^)]+\)\s+)?([\w]+)\s*\(([^)]*)\)',
+        re.MULTILINE
+    )
+
+    types_out: List[Tuple[str, int, int, List[str]]] = []
+    for sname, start_line in struct_decls:
+        _class_end_line = _extract_balanced_block(source_lines, start_line, language="go")  # V52-O.11.E (was: start_line + 40)
+        # V52-O.11.F.2-GO (v0.2.52): `methods` scoped to receiver-bound funcs.
+        methods = _go_methods_for_struct(content_clean, sname, source_lines)
+        types_out.append((sname, start_line, _class_end_line, methods))
+
+    funcs_out: List[Tuple[str, str, int, int]] = []
+    for m in func_pattern.finditer(content_clean):
+        fname, args_str = m.group(1), m.group(2)
+        if fname[0].islower() and fname in ('if', 'for', 'switch', 'select'):
+            continue
+        start_line = content_clean[:m.start()].count('\n') + 1
+        end_line = _extract_balanced_block(source_lines, start_line, language="go")  # V52-O.11.E (was: start_line + 40)
+        funcs_out.append((fname, args_str, start_line, end_line))
+    return types_out, funcs_out
+
+
 def extract_go_file(
     source_text: str, file_path: Path, repo_root: Path, helpers: Any,
 ) -> FileExtraction:
@@ -164,30 +213,24 @@ def extract_go_file(
     block_imports = re.findall(r'"([^"]+)"', re.sub(r'import\s*\(([^)]*)\)', r'\1', content, flags=re.DOTALL))
     imports = list(dict.fromkeys(single_imports + block_imports))
 
-    # Structs / interfaces as "classes"
-    type_pattern = re.compile(r'type\s+([\w]+)\s+(?:struct|interface)\s*\{', re.MULTILINE)
-    # v0.2.92 WP-5b: a LIST of (name, start_line), not a dict keyed by name —
-    # see the same change in `ruby.py`, where the fixture proves the loss.
-    # Two same-named types in ONE file are legal when declared inside
-    # different function bodies (`func f() { type cfg struct{…} }`), and
-    # this pattern is not anchored to package scope, so the dict
-    # silently kept only the last.
-    # The writer's occurrence disambiguator keys on `(kind, identity_key)` and
-    # already covers KIND_CLASS, so the second declaration lands as `<name>#2`.
-    struct_decls: List[Tuple[str, int]] = []
-    for m in type_pattern.finditer(content_clean):
-        name = m.group(1)
-        start_line = content_clean[:m.start()].count('\n') + 1
-        struct_decls.append((name, start_line))
+    # Types + functions: tree-sitter first (v0.2.102), regex fallback.
+    # Records: types (name, start_line, end_line, methods, is_struct_or_interface);
+    #          funcs (name, args, start_line, end_line).
+    defs = extract_definitions("go", content, origin=relative_path)
+    if defs is not None:
+        note_path("go", "tree-sitter")
+        types = [
+            (c.name, c.start_line, c.end_line, defs.methods_of(c.name), c.keyword in ("struct", "interface"))
+            for c in defs.classes
+        ]
+        funcs = [(f.name, f.params, f.start_line, f.end_line) for f in defs.functions]
+    else:
+        note_path("go", "regex")
+        regex_types, funcs = _regex_go_definitions(content_clean, source_lines)
+        types = [(n, s_, e_, m, True) for n, s_, e_, m in regex_types]
 
     #: Unique type names in source order — what the module summary lists.
-    struct_names: List[str] = list(dict.fromkeys(n for n, _ in struct_decls))
-
-    # Functions: func Name(...) and methods: func (recv Type) Name(...)
-    func_pattern = re.compile(
-        r'func\s+(?:\([^)]+\)\s+)?([\w]+)\s*\(([^)]*)\)',
-        re.MULTILINE
-    )
+    struct_names: List[str] = list(dict.fromkeys(t[0] for t in types))
 
     # Module summary
     pkg_match = re.search(r'^package\s+(\w+)', content, re.MULTILINE)
@@ -223,22 +266,16 @@ def extract_go_file(
     # `start_line + len(class_lines)`, which is that line PLUS ONE, while the
     # FUNCTION loop below already used the returned value directly. One
     # convention now; the golden corpus had ratified the +1 across 7 languages.
-    for sname, start_line in struct_decls:
-        _class_end_line = _extract_balanced_block(source_lines, start_line, language="go")  # V52-O.11.E (was: start_line + 40)
+    for sname, start_line, _class_end_line, methods, struct_like in types:
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
-        signature = f"type {sname} struct/interface"
-        # V52-O.11.F.2-GO (v0.2.52, 2026-06-09): scope `methods` to
-        # functions whose receiver is `sname`. Pre-fix this line
-        # iterated func_pattern over the WHOLE file's content_clean,
-        # attributing EVERY fn (including receiver-less package-level
-        # functions and methods on OTHER structs) to EVERY struct —
-        # audit a79152 reproduced: a 50-fn file with 3 structs
-        # produced 150 incorrect method attributions, drowning real
-        # signal in the `query_code_structure(methods, StructName)`
-        # MCP path. Mirrors V52-O.11.F (Rust); Go uses receiver
-        # syntax instead of `impl` blocks (see helper docstring).
-        methods = _go_methods_for_struct(content_clean, sname, source_lines)
+        # Struct/interface rows keep their pre-v0.2.102 signature; other named
+        # types (`type ID string`, func types, aliases — tree-sitter only)
+        # are labelled plainly.
+        signature = f"type {sname} struct/interface" if struct_like else f"type {sname}"
+        # `methods` (V52-O.11.F.2-GO): receiver-bound functions of `sname` —
+        # from the tree-sitter receiver types, or `_go_methods_for_struct`
+        # on the regex fallback.
         entities.append(CodeEntity(
             kind=KIND_CLASS, file_path_rel=relative_path,
             name=sname, full_name=f"{pkg_name}.{sname}",
@@ -254,12 +291,7 @@ def extract_go_file(
         stats['classes'] += 1
 
     # Function entries
-    for m in func_pattern.finditer(content_clean):
-        fname, args_str = m.group(1), m.group(2)
-        if fname[0].islower() and fname in ('if', 'for', 'switch', 'select'):
-            continue
-        start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line, language="go")  # V52-O.11.E (was: start_line + 40)
+    for fname, args_str, start_line, end_line in funcs:
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{pkg_name}.{fname}"
         signature = f"func {fname}({args_str})"

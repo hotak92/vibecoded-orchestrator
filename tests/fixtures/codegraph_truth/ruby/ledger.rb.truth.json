@@ -1,0 +1,108 @@
+{
+ "source": "ledger.rb",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Accounting",
+   "start": 8,
+   "end": 12
+  },
+  {
+   "kind": "function",
+   "name": "version",
+   "start": 9,
+   "end": 11
+  },
+  {
+   "kind": "class",
+   "name": "Account",
+   "start": 14,
+   "end": 26
+  },
+  {
+   "kind": "function",
+   "name": "initialize",
+   "start": 15,
+   "end": 17
+  },
+  {
+   "kind": "function",
+   "name": "deposit",
+   "start": 19,
+   "end": 21
+  },
+  {
+   "kind": "function",
+   "name": "default",
+   "start": 23,
+   "end": 25
+  },
+  {
+   "kind": "class",
+   "name": "Account",
+   "start": 29,
+   "end": 33
+  },
+  {
+   "kind": "function",
+   "name": "withdraw?",
+   "start": 30,
+   "end": 32
+  },
+  {
+   "kind": "class",
+   "name": "SavingsAccount",
+   "start": 35,
+   "end": 39
+  },
+  {
+   "kind": "function",
+   "name": "apply_interest",
+   "start": 36,
+   "end": 38
+  },
+  {
+   "kind": "class",
+   "name": "Vault",
+   "start": 43,
+   "end": 53
+  },
+  {
+   "kind": "function",
+   "name": "store",
+   "start": 46,
+   "end": 49
+  },
+  {
+   "kind": "function",
+   "name": "total",
+   "start": 52,
+   "end": 52
+  },
+  {
+   "kind": "class",
+   "name": "Reporting",
+   "start": 55,
+   "end": 64
+  },
+  {
+   "kind": "class",
+   "name": "Summary",
+   "start": 59,
+   "end": 63
+  },
+  {
+   "kind": "function",
+   "name": "render",
+   "start": 60,
+   "end": 62
+  },
+  {
+   "kind": "function",
+   "name": "audit",
+   "start": 68,
+   "end": 72
+  }
+ ]
+}

@@ -316,7 +316,12 @@ def test_no_unconditional_func_finditer_in_rust_struct_loop() -> None:
     # `f"type {sname} struct/interface"`, JS/Java/C# use other strings),
     # then scan WINDOWS of code around it. The loop body for a single
     # struct entry is small (~25 lines), so 800 chars window is plenty.
-    rust_signature_anchor = 'signature = f"struct/enum/trait {sname}"'
+    # v0.2.102 W6-E: the per-struct methods scan moved, with the rest of the
+    # regex discovery, into the regex FALLBACK helper
+    # `_regex_rust_definitions` (the tree-sitter path takes `methods` from
+    # impl-block containment). The guard follows it there: anchor on the
+    # helper's per-struct `methods = …` line.
+    rust_signature_anchor = 'methods = _rust_methods_for_struct(content_clean, sname, source_lines)'
     anchor_pos = src.find(rust_signature_anchor)
     assert anchor_pos >= 0, (
         f"Could not locate Rust signature anchor in analyze_code_graph.py — "

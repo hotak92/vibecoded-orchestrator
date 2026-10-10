@@ -66,6 +66,7 @@ import pytest
 
 from vco_lib.codegraph_entities import KIND_CLASS, KIND_FUNCTION
 from vco_lib.codegraph_lang.cpp import extract_cpp_file
+from tests._codegraph_truth_harness import force_regex_definitions, treesitter_available
 
 
 class _Helpers:
@@ -471,11 +472,21 @@ double distance(const shapes::Point& a, const shapes::Point& b) {
 '''
 
 
-def test_the_corpus_fixtures_pre_existing_rows_do_not_move(tmp_path) -> None:
+@pytest.mark.parametrize("backend", ["regex", "treesitter"])
+def test_the_corpus_fixtures_pre_existing_rows_do_not_move(tmp_path, monkeypatch, backend) -> None:
     """The shipped ``geometry.cpp`` head, verbatim. Its three class rows and
     two out-of-line method rows carry the line ranges WP-5 corrected; the
     only change this package may make to it is the ADDITION of
-    ``geometry.distance``, which is the gap R25 ordered closed."""
+    ``geometry.distance``, which is the gap R25 ordered closed.
+
+    v0.2.102: pinned on BOTH definitions backends. The tree-sitter path (the
+    shipped default) additionally captures the out-of-line constructor
+    ``Circle::Circle`` (35) and lists the class's declared members — every
+    other row and range is identical."""
+    if backend == "regex":
+        force_regex_definitions(monkeypatch)
+    elif not treesitter_available("cpp"):
+        pytest.skip("codegraph-ts extra not installed")
     fx = _extract(tmp_path, source=_GEOMETRY_HEAD, fname="geometry.cpp")
     classes = {c.full_name: (c.start_line, c.end_line) for c in _classes(fx)}
     assert classes == {
@@ -484,18 +495,23 @@ def test_the_corpus_fixtures_pre_existing_rows_do_not_move(tmp_path) -> None:
         "geometry.Box": (25, 29),
     }
     functions = {f.full_name: (f.start_line, f.end_line) for f in _functions(fx)}
-    assert functions == {
+    expected = {
         "geometry.Circle.area": (37, 39),
         "geometry.Circle.circumference": (41, 43),
         # The one addition — `geometry.cpp:45`, named by line in the corpus
         # README's "Known uncaptured shapes" section until this change.
         "geometry.distance": (45, 49),
     }
+    if backend == "treesitter":
+        expected["geometry.Circle.Circle"] = (35, 35)
+    assert functions == expected
     circle = next(c for c in _classes(fx) if c.name == "Circle")
     assert circle.extras is not None
-    assert circle.extras["methods"] == ["area", "circumference"], (
-        "the constructor is still not captured, so it must still not appear "
-        "in the methods list — the graph agrees with itself either way"
+    # The graph agrees with itself on either backend: the regex path captures
+    # no constructor and lists none; tree-sitter captures it and lists it.
+    assert circle.extras["methods"] == (
+        ["area", "circumference"] if backend == "regex"
+        else ["Circle", "area", "circumference"]
     )
 
 

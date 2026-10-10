@@ -130,7 +130,21 @@ logger = logging.getLogger(__name__)
 #:          declaring the stranded projects finished — permanently, silently,
 #:          and with no error anywhere. The asymmetry that decides it is the
 #:          same one :func:`decide` is built on.
-EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92", "0.2.93", "0.2.94")
+#: 0.2.102 — tree-sitter DEFINITIONS (``vco_lib.codegraph_defs``) became the
+#:          default for TypeScript, JavaScript, Svelte ``<script>`` blocks,
+#:          Rust, Go, Java, C#, C++, Ruby, Lua and shell; the regex extractors
+#:          remain only as the fallback when a grammar cannot load. Output
+#:          changed from unchanged source for every one of those languages
+#:          (new symbols: TS generic functions / interfaces / annotated
+#:          arrows, Go generics, C++ out-of-line constructors, shell
+#:          next-line-brace functions …; dropped phantoms: Rust ``fn`` in
+#:          string literals, ``#[tokio::test]`` / ``#[cfg(test)] mod`` code;
+#:          corrected line ranges and therefore bodies). Python, PowerShell
+#:          and Protocol Buffers are unchanged. The per-entity content-hash
+#:          gate re-embeds only rows whose extracted text changed;
+#:          ``CODEGRAPH_EMBED_REVISION`` is NOT bumped (model, chunking and
+#:          embed text construction are unchanged).
+EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92", "0.2.93", "0.2.94", "0.2.102")
 
 #: Releases DELIBERATELY not added to the ladder, each with the evidence that
 #: decided it. A release must appear in EXACTLY ONE of these two structures —

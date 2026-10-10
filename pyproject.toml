@@ -83,10 +83,13 @@ mcp = [
     "uvicorn >= 0.46.0",
     "psutil >= 7.2.2",
 ]
-# Cross-language code-graph CALL extraction (CG-2 / Part 5). OPTIONAL — the
-# analyzer's cross-reference pass falls back to Python-only ``ast`` call
-# extraction when this extra is absent (vco_lib/codegraph_calls.py soft-fails
-# per-language on ImportError). Every package below ships wheels for
+# Code-graph tree-sitter grammars: non-Python DEFINITIONS (v0.2.102,
+# vco_lib/codegraph_defs.py) and CALL extraction (CG-2 / Part 5,
+# vco_lib/codegraph_calls.py), both loaded through vco_lib/codegraph_grammars.py.
+# install.py installs this extra by default (opt out: VCT_SKIP_CODEGRAPH_TS=1).
+# OPTIONAL — when it is absent each language soft-falls back to the regex
+# definitions extractors and to Python-only ``ast`` call edges (logged once
+# per language). Every package below ships wheels for
 # linux x86_64 + macOS arm64 + Windows amd64 (verified 2026-07-10), so the
 # extra resolves on all three OSes.
 #

@@ -55,6 +55,8 @@ import logging
 import threading
 from typing import Dict, List, Optional, Tuple
 
+from vco_lib.codegraph_grammars import load_language
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -72,65 +74,55 @@ logger = logging.getLogger(__name__)
 _PYTHON_LANG = "python"
 
 # Per-language tree-sitter spec: canonical language id -> (
-#     grammar module name,
-#     factory attribute on that module (``language`` for all but typescript),
 #     primary query source (captures @callee = the callee expression node),
 #     optional secondary query source (e.g. rust macro invocations) or None,
-# ).
+# ). The grammar itself is loaded by the ONE grammar home,
+# :func:`vco_lib.codegraph_grammars.load_language` (shared with the
+# definitions layer :mod:`vco_lib.codegraph_defs`).
 #
 # The primary query captures the *callee expression* (which may be a bare
 # identifier, a scoped/selector/field expression, etc.); :func:`_leaf_name`
 # then reduces it to the trailing identifier — so one query per grammar covers
 # free calls, method calls and namespaced calls uniformly.
-_CallSpec = Tuple[str, str, str, Optional[str]]
+_CallSpec = Tuple[str, Optional[str]]
 _CALL_QUERIES: Dict[str, _CallSpec] = {
     "rust": (
-        "tree_sitter_rust", "language",
         "(call_expression function: (_) @callee)",
         "(macro_invocation macro: (identifier) @callee)",
     ),
     "go": (
-        "tree_sitter_go", "language",
         "(call_expression function: (_) @callee)",
         None,
     ),
     "java": (
-        "tree_sitter_java", "language",
         "(method_invocation name: (identifier) @callee)",
         None,
     ),
     "ruby": (
-        "tree_sitter_ruby", "language",
         "(call method: (identifier) @callee)",
         None,
     ),
     "cpp": (
-        "tree_sitter_cpp", "language",
         "(call_expression function: (_) @callee)",
         None,
     ),
     "csharp": (
-        "tree_sitter_c_sharp", "language",
         "(invocation_expression function: (_) @callee)",
         None,
     ),
     "lua": (
-        "tree_sitter_lua", "language",
         "(function_call name: (_) @callee)",
         None,
     ),
     "shell": (
-        "tree_sitter_bash", "language",
         "(command name: (command_name) @callee)",
         None,
     ),
     "javascript": (
-        "tree_sitter_javascript", "language",
         "(call_expression function: (_) @callee)",
         None,
     ),
     "typescript": (
-        "tree_sitter_typescript", "language_typescript",
         "(call_expression function: (_) @callee)",
         None,
     ),
@@ -175,30 +167,30 @@ def _try_load_runtime(lang: str) -> Optional["_LangRuntime"]:
     spec = _CALL_QUERIES.get(lang)
     if spec is None:
         return None
-    mod_name, factory_attr, primary_q, secondary_q = spec
+    language = load_language(lang)
+    if language is None:
+        # codegraph_grammars already logged the unavailability once.
+        return None
+    primary_q, secondary_q = spec
     try:
-        import importlib
+        from tree_sitter import Query  # type: ignore
 
-        from tree_sitter import Language, Query  # type: ignore
-
-        grammar_mod = importlib.import_module(mod_name)
-        language = Language(getattr(grammar_mod, factory_attr)())
         queries = [Query(language, primary_q)]
         if secondary_q:
             queries.append(Query(language, secondary_q))
         return _LangRuntime(language, queries)
-    except Exception as exc:  # noqa: BLE001 — soft-fail: ImportError + any
-        # grammar-load/ABI/query-compile error → fall back to no edges.
+    except Exception as exc:  # noqa: BLE001 — soft-fail: a query-compile
+        # error → fall back to no edges for this language.
         logger.info(
-            "codegraph_calls: tree-sitter call extraction unavailable for "
+            "codegraph_calls: tree-sitter call query unavailable for "
             "language '%s' (%s: %s); falling back to no call edges for this "
-            "language. Install the optional extra to enable it: "
-            "pip install '.[codegraph-ts]'",
+            "language.",
             lang, type(exc).__name__, exc,
         )
         return None
 
 
+# ---------------------------------------------------------------------------
 # Identifier-leaf reducer: the trailing name component of a callee expression.
 # A "name" leaf is one whose text is a bare identifier (starts alpha/underscore,
 # remainder alnum/underscore). We take the LAST such leaf in source order,

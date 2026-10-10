@@ -46,7 +46,7 @@ def codegraph_ts_install_plan(
     project_root: str,
 ) -> Tuple[bool, Optional[str], Optional[List[str]]]:
     """Decide whether install.py should install the optional ``codegraph-ts``
-    extra (tree-sitter call-extraction grammars), and with what pip argv.
+    extra (tree-sitter code-graph grammars), and with what pip argv.
 
     Pure decision function (no I/O, no subprocess) — the testable core of
     install.py's ``_install_codegraph_treesitter`` soft-fail step. install.py

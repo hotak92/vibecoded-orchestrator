@@ -28,6 +28,7 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_definitions, note_path
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
@@ -176,61 +177,70 @@ def extract_cpp_file(
     # Includes
     includes = re.findall(r'#include\s*[<"]([^>"]+)[>"]', content)
 
-    # Classes / structs
-    class_pattern = re.compile(
-        # v0.2.92: an optional `template <…>` clause is PART of the class
-        # declaration, so the match must begin at it. Without this the
-        # whitespace skip below would move `template <typename T>\nclass Box`
-        # from the template line onto the `class` line and drop the template
-        # clause out of the stored `body` — the old `m.start()` landed on the
-        # template line only by accident (it was the previous line's newline).
-        r'(?:^|\n)\s*(?:template\s*<[^>]*>\s*)?(?:class|struct)\s+'
-        # v0.2.92 WP-5c (R23, pre-existing): tokens may stand between the
-        # keyword and the NAME — an export macro (`class MYLIB_API Widget {`,
-        # ubiquitous in shipped C++ headers) — and between the name and the
-        # base-clause: `final`. Neither could be skipped, so `class Derived
-        # final : public Base {` and `class MYLIB_API Widget {` produced NO
-        # class row at all. That was a silent loss before this release; with
-        # the free-function capture below it becomes a MISATTRIBUTION, because
-        # every member defined in such a class body has no enclosing type to
-        # be found by containment and is minted under the file stem instead.
-        # Non-greedy, so the ordinary `class Foo {` still matches with an
-        # empty prefix and every already-captured type keeps its name.
-        r'(?:[\w]+\s+)*?([\w]+)\s*(?:final\s*)?'
-        r'(?::[^{]*)?\{',
-        re.MULTILINE
-    )
-    # v0.2.92 WP-5b: a LIST of (name, start_line), not a dict keyed by name —
-    # see the same change in `ruby.py`, where the fixture proves the loss. Two
-    # types with one name in ONE translation unit are legal in different
-    # namespaces (`namespace a { struct Cfg {…}; } namespace b { struct Cfg
-    # {…}; }`), and this extractor ignores namespaces when building
-    # `full_name`, so the dict silently kept only the last. The writer's
-    # occurrence disambiguator keys on `(kind, identity_key)` and already
-    # covers KIND_CLASS, so the second lands as `Cfg#2`.
-    #
-    # v0.2.92 WP-5c: the tuple gained the END line, computed here rather than
-    # inside the emit loop — the same shape `java.py` already carries. The
-    # free-function pass below needs every type's full RANGE before it can
-    # decide whether a definition sits inside a class body, and computing it
-    # twice would be the duplication this cycle is removing.
-    class_decls: List[Tuple[str, int, int]] = []
-    for m in class_pattern.finditer(content_clean):
-        cname = m.group(1)
-        if cname in ('if', 'else', 'while', 'for', 'switch', 'namespace', 'return'):
-            continue
-        # v0.2.92: the pattern's `(?:^|\n)\s*` prefix makes `m.start()` the
-        # newline ENDING the previous line, so the stored `start_line` was one
-        # line too high — the golden fixture's `Circle` was stored starting on
-        # `namespace shapes {` (and therefore took the WHOLE namespace as its
-        # body) and `Point` on the previous class's `};`.
-        start_line = content_clean[
-            :skip_leading_whitespace(content_clean, m.start(), m.end())
-        ].count('\n') + 1
-        class_decls.append((
-            cname, start_line,
-            _extract_balanced_block(source_lines, start_line, language="cpp"),  # V52-O.11.E (was: start_line + 60)
-        ))
+    # Definitions: tree-sitter first (v0.2.102), regex fallback. Records:
+    #   class_decls (name, start_line, end_line).
+    defs = extract_definitions("cpp", content, origin=relative_path)
+    note_path("cpp", "tree-sitter" if defs is not None else "regex")
+    if defs is not None:
+        class_decls: List[Tuple[str, int, int]] = [
+            (c.name, c.start_line, c.end_line) for c in defs.classes
+        ]
+    else:
+        # Classes / structs
+        class_pattern = re.compile(
+            # v0.2.92: an optional `template <…>` clause is PART of the class
+            # declaration, so the match must begin at it. Without this the
+            # whitespace skip below would move `template <typename T>\nclass Box`
+            # from the template line onto the `class` line and drop the template
+            # clause out of the stored `body` — the old `m.start()` landed on the
+            # template line only by accident (it was the previous line's newline).
+            r'(?:^|\n)\s*(?:template\s*<[^>]*>\s*)?(?:class|struct)\s+'
+            # v0.2.92 WP-5c (R23, pre-existing): tokens may stand between the
+            # keyword and the NAME — an export macro (`class MYLIB_API Widget {`,
+            # ubiquitous in shipped C++ headers) — and between the name and the
+            # base-clause: `final`. Neither could be skipped, so `class Derived
+            # final : public Base {` and `class MYLIB_API Widget {` produced NO
+            # class row at all. That was a silent loss before this release; with
+            # the free-function capture below it becomes a MISATTRIBUTION, because
+            # every member defined in such a class body has no enclosing type to
+            # be found by containment and is minted under the file stem instead.
+            # Non-greedy, so the ordinary `class Foo {` still matches with an
+            # empty prefix and every already-captured type keeps its name.
+            r'(?:[\w]+\s+)*?([\w]+)\s*(?:final\s*)?'
+            r'(?::[^{]*)?\{',
+            re.MULTILINE
+        )
+        # v0.2.92 WP-5b: a LIST of (name, start_line), not a dict keyed by name —
+        # see the same change in `ruby.py`, where the fixture proves the loss. Two
+        # types with one name in ONE translation unit are legal in different
+        # namespaces (`namespace a { struct Cfg {…}; } namespace b { struct Cfg
+        # {…}; }`), and this extractor ignores namespaces when building
+        # `full_name`, so the dict silently kept only the last. The writer's
+        # occurrence disambiguator keys on `(kind, identity_key)` and already
+        # covers KIND_CLASS, so the second lands as `Cfg#2`.
+        #
+        # v0.2.92 WP-5c: the tuple gained the END line, computed here rather than
+        # inside the emit loop — the same shape `java.py` already carries. The
+        # free-function pass below needs every type's full RANGE before it can
+        # decide whether a definition sits inside a class body, and computing it
+        # twice would be the duplication this cycle is removing.
+        class_decls = []
+        for m in class_pattern.finditer(content_clean):
+            cname = m.group(1)
+            if cname in ('if', 'else', 'while', 'for', 'switch', 'namespace', 'return'):
+                continue
+            # v0.2.92: the pattern's `(?:^|\n)\s*` prefix makes `m.start()` the
+            # newline ENDING the previous line, so the stored `start_line` was one
+            # line too high — the golden fixture's `Circle` was stored starting on
+            # `namespace shapes {` (and therefore took the WHOLE namespace as its
+            # body) and `Point` on the previous class's `};`.
+            start_line = content_clean[
+                :skip_leading_whitespace(content_clean, m.start(), m.end())
+            ].count('\n') + 1
+            class_decls.append((
+                cname, start_line,
+                _extract_balanced_block(source_lines, start_line, language="cpp"),  # V52-O.11.E (was: start_line + 60)
+            ))
 
     #: Unique type names in source order — what the module summary lists.
     class_names: List[str] = list(dict.fromkeys(n for n, _, _ in class_decls))
@@ -300,25 +310,41 @@ def extract_cpp_file(
     #: WP-5b list change made representable — do not share one method list.
     in_class_methods: Dict[Tuple[str, int], List[str]] = {}
 
-    for m in _CPP_FREE_FUNCTION_PATTERN.finditer(content_clean):
-        run, fname, args_str = m.group(1), m.group(2), m.group(3)
-        if fname in _CPP_NON_FUNCTION_NAMES:
-            continue
-        if not _cpp_run_is_a_declaration(run):
-            continue
-        # Same whitespace skip as `class_pattern`: the leading `(?:^|\n)\s*`
-        # makes `m.start()` the newline ENDING the previous line.
-        decl_pos = skip_leading_whitespace(content_clean, m.start(), m.end())
-        start_line = content_clean[:decl_pos].count('\n') + 1
-        if _cpp_is_macro_continuation(clean_lines, start_line):
-            continue
-        end_line = _extract_balanced_block(source_lines, start_line, language="cpp")
-        owner = _enclosing_type(start_line)
-        if owner is not None:
-            in_class_methods.setdefault(owner, [])
-            if fname not in in_class_methods[owner]:
-                in_class_methods[owner].append(fname)
-        fn_decls.append((fname, args_str, start_line, end_line, owner))
+    #: Out-of-line `Class::method` definitions: (class, name, args, start, end).
+    outofline: List[Tuple[str, str, str, int, int]] = []
+    if defs is not None:
+        for f in defs.functions:
+            if f.qualifier:
+                outofline.append((f.qualifier, f.name, f.params, f.start_line, f.end_line))
+            else:
+                fn_decls.append((
+                    f.name, f.params, f.start_line, f.end_line,
+                    _enclosing_type(f.start_line) if f.container else None,
+                ))
+    else:
+        for m in _CPP_FREE_FUNCTION_PATTERN.finditer(content_clean):
+            run, fname, args_str = m.group(1), m.group(2), m.group(3)
+            if fname in _CPP_NON_FUNCTION_NAMES:
+                continue
+            if not _cpp_run_is_a_declaration(run):
+                continue
+            # Same whitespace skip as `class_pattern`: the leading `(?:^|\n)\s*`
+            # makes `m.start()` the newline ENDING the previous line.
+            decl_pos = skip_leading_whitespace(content_clean, m.start(), m.end())
+            start_line = content_clean[:decl_pos].count('\n') + 1
+            if _cpp_is_macro_continuation(clean_lines, start_line):
+                continue
+            end_line = _extract_balanced_block(source_lines, start_line, language="cpp")
+            owner = _enclosing_type(start_line)
+            if owner is not None:
+                in_class_methods.setdefault(owner, [])
+                if fname not in in_class_methods[owner]:
+                    in_class_methods[owner].append(fname)
+            fn_decls.append((fname, args_str, start_line, end_line, owner))
+        for m in method_pattern.finditer(content_clean):
+            start_line = content_clean[:m.start()].count('\n') + 1
+            end_line = _extract_balanced_block(source_lines, start_line, language="cpp")  # V52-O.11.E (was: start_line + 50)
+            outofline.append((m.group(1), m.group(2), m.group(3), start_line, end_line))
 
     # Extract classes
     # v0.2.92 — the `end_line` convention. `_extract_balanced_block` returns
@@ -328,17 +354,21 @@ def extract_cpp_file(
     # FUNCTION loop below already used the returned value directly. One
     # convention now; the golden corpus had ratified the +1 across 7 languages.
     for cname, start_line, _class_end_line in class_decls:
-        methods = [m.group(2) for m in method_pattern.finditer(content_clean)
-                   if m.group(1) == cname]
+        if defs is not None:
+            # tree-sitter: declared + in-body-defined members in body order,
+            # then out-of-line `cname::` definitions.
+            methods = defs.methods_of(cname)
+        else:
+            methods = [q_name for q_cls, q_name, _a, _s, _e in outofline if q_cls == cname]
         # v0.2.92 WP-5c: …plus the members DEFINED IN THIS BODY, which have no
         # `Class::` qualifier for `method_pattern` to find. Out-of-line names
         # keep their order and come first; the in-class names follow, deduped
         # (a member cannot legally be defined both ways, but a name repeated
         # by an overload set must not be listed twice).
-        methods = methods + [
-            n for n in in_class_methods.get((cname, start_line), [])
-            if n not in methods
-        ]
+            methods = methods + [
+                n for n in in_class_methods.get((cname, start_line), [])
+                if n not in methods
+            ]
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
         signature = f"class {cname}"
@@ -368,10 +398,7 @@ def extract_cpp_file(
         stats['classes'] += 1
 
     # Extract method implementations
-    for m in method_pattern.finditer(content_clean):
-        class_name, method_name, args_str = m.group(1), m.group(2), m.group(3)
-        start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line, language="cpp")  # V52-O.11.E (was: start_line + 50)
+    for class_name, method_name, args_str, start_line, end_line in outofline:
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{class_name}.{method_name}"
         signature = f"{class_name}::{method_name}({args_str})"

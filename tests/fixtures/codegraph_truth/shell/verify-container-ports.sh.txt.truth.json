@@ -1,0 +1,72 @@
+{
+ "source": "verify-container-ports.sh.txt",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "json_str",
+   "start": 62,
+   "end": 70
+  },
+  {
+   "kind": "function",
+   "name": "log_services_json",
+   "start": 73,
+   "end": 88
+  },
+  {
+   "kind": "function",
+   "name": "log_recovery_json",
+   "start": 89,
+   "end": 96
+  },
+  {
+   "kind": "function",
+   "name": "log_run",
+   "start": 97,
+   "end": 105
+  },
+  {
+   "kind": "function",
+   "name": "service_of",
+   "start": 106,
+   "end": 113
+  },
+  {
+   "kind": "function",
+   "name": "log_container",
+   "start": 114,
+   "end": 114
+  },
+  {
+   "kind": "function",
+   "name": "log_recovered",
+   "start": 115,
+   "end": 115
+  },
+  {
+   "kind": "function",
+   "name": "probe_port",
+   "start": 280,
+   "end": 291
+  },
+  {
+   "kind": "function",
+   "name": "container_running",
+   "start": 293,
+   "end": 297
+  },
+  {
+   "kind": "function",
+   "name": "container_pid_alive",
+   "start": 304,
+   "end": 312
+  },
+  {
+   "kind": "function",
+   "name": "zombie_policy",
+   "start": 380,
+   "end": 389
+  }
+ ]
+}

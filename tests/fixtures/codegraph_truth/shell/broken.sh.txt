@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Broken mid-file (an `if` left unclosed on line 9) for the definitions gate.
+
+first() {
+  echo 1
+}
+
+second() {
+  if [ "$1" = x ]; then
+    echo 2
+}
+
+third() {
+  echo 3
+}

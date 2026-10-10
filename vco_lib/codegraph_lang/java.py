@@ -30,6 +30,7 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_definitions, note_path
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
@@ -372,36 +373,45 @@ def extract_java_file(
     # import statements
     imports = re.findall(r'import\s+([\w.]+);', content)
 
-    # class / interface / enum
-    class_pattern = re.compile(
-        r'(?:public|private|protected|abstract|final|\s)*'
-        r'(?:class|interface|enum)\s+([\w]+)'
-        r'(?:\s+extends\s+[\w<>, ]+)?(?:\s+implements\s+[\w<>, ]+)?\s*\{',
-        re.MULTILINE
-    )
-    # v0.2.92 WP-5b: a LIST of (name, start_line, end_line), not a dict keyed
-    # by name — see the same change in `ruby.py`, where the fixture proves the
-    # loss. Java forbids two TOP-LEVEL types with one name, but not two nested
-    # ones (`class A { class Node {} } class B { class Node {} }` is legal and
-    # this pattern matches both), and the dict kept only the last. The writer's
-    # occurrence disambiguator keys on `(kind, identity_key)` and already
-    # covers KIND_CLASS, so the second lands as `Node#2`.
-    class_decls: List[Tuple[str, int, int]] = []
-    for m in class_pattern.finditer(content_clean):
-        name = m.group(1)
-        if not name or name[0].islower():
-            continue
-        # v0.2.92: `class_pattern`'s leading `(?:public|…|\s)*` group starts
-        # matching at the whitespace after the previous token, so `m.start()`
-        # sits on the previous line — the golden fixture's `Account` class was
-        # stored starting on `package golden;`.
-        start_line = content_clean[
-            :skip_leading_whitespace(content_clean, m.start(), m.end())
-        ].count('\n') + 1
-        class_decls.append((
-            name, start_line,
-            _extract_balanced_block(source_lines, start_line, language="java"),  # V52-O.11.E (was: start_line + 60)
-        ))
+    # Definitions: tree-sitter first (v0.2.102), regex fallback. Records:
+    #   class_decls (name, start_line, end_line).
+    defs = extract_definitions("java", content, origin=relative_path)
+    note_path("java", "tree-sitter" if defs is not None else "regex")
+    if defs is not None:
+        class_decls: List[Tuple[str, int, int]] = [
+            (c.name, c.start_line, c.end_line) for c in defs.classes
+        ]
+    else:
+        # class / interface / enum
+        class_pattern = re.compile(
+            r'(?:public|private|protected|abstract|final|\s)*'
+            r'(?:class|interface|enum)\s+([\w]+)'
+            r'(?:\s+extends\s+[\w<>, ]+)?(?:\s+implements\s+[\w<>, ]+)?\s*\{',
+            re.MULTILINE
+        )
+        # v0.2.92 WP-5b: a LIST of (name, start_line, end_line), not a dict keyed
+        # by name — see the same change in `ruby.py`, where the fixture proves the
+        # loss. Java forbids two TOP-LEVEL types with one name, but not two nested
+        # ones (`class A { class Node {} } class B { class Node {} }` is legal and
+        # this pattern matches both), and the dict kept only the last. The writer's
+        # occurrence disambiguator keys on `(kind, identity_key)` and already
+        # covers KIND_CLASS, so the second lands as `Node#2`.
+        class_decls = []
+        for m in class_pattern.finditer(content_clean):
+            name = m.group(1)
+            if not name or name[0].islower():
+                continue
+            # v0.2.92: `class_pattern`'s leading `(?:public|…|\s)*` group starts
+            # matching at the whitespace after the previous token, so `m.start()`
+            # sits on the previous line — the golden fixture's `Account` class was
+            # stored starting on `package golden;`.
+            start_line = content_clean[
+                :skip_leading_whitespace(content_clean, m.start(), m.end())
+            ].count('\n') + 1
+            class_decls.append((
+                name, start_line,
+                _extract_balanced_block(source_lines, start_line, language="java"),  # V52-O.11.E (was: start_line + 60)
+            ))
 
     #: Unique type names in source order — what the module summary lists.
     class_names: List[str] = list(dict.fromkeys(n for n, _, _ in class_decls))
@@ -465,8 +475,9 @@ def extract_java_file(
         # Computed once per NAME: the helper already unions every declaration
         # with that name, so two rows for one name repeat no work.
         if cname not in _methods_by_name:
-            _methods_by_name[cname] = _java_methods_for_class(
-                content_clean, cname, source_lines
+            _methods_by_name[cname] = (
+                defs.methods_of(cname) if defs is not None
+                else _java_methods_for_class(content_clean, cname, source_lines)
             )
         methods = _methods_by_name[cname]
         signature = f"class {cname}"
@@ -485,34 +496,47 @@ def extract_java_file(
         ))
         stats['classes'] += 1
 
-    for m in method_pattern.finditer(content_clean):
-        mname, args_str, terminator = m.group(1), m.group(2), m.group(3)
-        if mname in ('if', 'while', 'for', 'switch', 'catch', 'try', 'else', 'return'):
-            continue
-        # v0.2.92: same leading-whitespace group as `class_pattern`. Before this
-        # fix `Account.deposit` and `Account.getBalance` were both stored
-        # starting on the PREVIOUS member's closing `}`, and their stored
-        # `body` began with that brace.
-        decl_pos = skip_leading_whitespace(content_clean, m.start(), m.end())
-        # v0.2.92 WP-5b: reject a match whose modifier/return-type run is
-        # actually a STATEMENT (`new Thread(runnable);`). Only reachable now
-        # that `;` is an accepted terminator — see `_JAVA_NON_DECL_TOKENS`.
-        if not _java_declaration_run_is_a_member(content_clean, decl_pos, m.start(1)):
-            continue
-        start_line = content_clean[:decl_pos].count('\n') + 1
-        # v0.2.92 WP-5b: branch on the terminator. A `;` declaration has no
-        # body and ends on its own line; only `{` opens a block a brace scan
-        # can measure.
-        if terminator == '{':
-            end_line = _extract_balanced_block(source_lines, start_line, language="java")  # V52-O.11.E (was: start_line + 50)
-        else:
-            end_line = content_clean[:m.end()].count('\n') + 1
+    # (name, args, start_line, end_line, enclosing) — tree-sitter members
+    # carry their true lexical container; the regex fallback keeps its
+    # nearest-preceding-class rule.
+    fn_records: List[Tuple[str, str, int, int, str]] = []
+    if defs is not None:
+        fn_records = [
+            (f.name, f.params, f.start_line, f.end_line, f.container or file_path.stem)
+            for f in defs.functions
+        ]
+    else:
+        for m in method_pattern.finditer(content_clean):
+            mname, args_str, terminator = m.group(1), m.group(2), m.group(3)
+            if mname in ('if', 'while', 'for', 'switch', 'catch', 'try', 'else', 'return'):
+                continue
+            # v0.2.92: same leading-whitespace group as `class_pattern`. Before this
+            # fix `Account.deposit` and `Account.getBalance` were both stored
+            # starting on the PREVIOUS member's closing `}`, and their stored
+            # `body` began with that brace.
+            decl_pos = skip_leading_whitespace(content_clean, m.start(), m.end())
+            # v0.2.92 WP-5b: reject a match whose modifier/return-type run is
+            # actually a STATEMENT (`new Thread(runnable);`). Only reachable now
+            # that `;` is an accepted terminator — see `_JAVA_NON_DECL_TOKENS`.
+            if not _java_declaration_run_is_a_member(content_clean, decl_pos, m.start(1)):
+                continue
+            start_line = content_clean[:decl_pos].count('\n') + 1
+            # v0.2.92 WP-5b: branch on the terminator. A `;` declaration has no
+            # body and ends on its own line; only `{` opens a block a brace scan
+            # can measure.
+            if terminator == '{':
+                end_line = _extract_balanced_block(source_lines, start_line, language="java")  # V52-O.11.E (was: start_line + 50)
+            else:
+                end_line = content_clean[:m.end()].count('\n') + 1
+            # Find enclosing class
+            enclosing = next(
+                (c for c, cl, _ in sorted(class_decls, key=lambda d: d[1], reverse=True)
+                 if cl <= start_line), file_path.stem
+            )
+            fn_records.append((mname, args_str, start_line, end_line, enclosing))
+
+    for mname, args_str, start_line, end_line, enclosing in fn_records:
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
-        # Find enclosing class
-        enclosing = next(
-            (c for c, cl, _ in sorted(class_decls, key=lambda d: d[1], reverse=True)
-             if cl <= start_line), file_path.stem
-        )
         full_name = f"{enclosing}.{mname}"
         signature = f"{mname}({args_str})"
         entities.append(CodeEntity(

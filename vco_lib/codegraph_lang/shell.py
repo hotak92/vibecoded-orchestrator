@@ -15,7 +15,7 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from vco_lib.codegraph_entities import (
     CodeEntity,
@@ -24,6 +24,7 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_definitions, note_path
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
@@ -76,12 +77,25 @@ def extract_shell_file(
     entities: List[CodeEntity] = []
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
-    for m in func_pattern.finditer(content_clean):
-        fname = m.group(1) or m.group(2)
-        if not fname:
-            continue
-        start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line, language="shell")  # V52-O.11.E (was: start_line + 30)
+    # Definitions: tree-sitter (bash grammar) first (v0.2.102) — it also
+    # finds `name()` with the brace on the next line and subshell bodies
+    # `name() ( … )`, which the regex cannot; regex fallback otherwise.
+    #   fn_records: (name, start_line, end_line)
+    defs = extract_definitions("shell", content, origin=relative_path)
+    note_path("shell", "tree-sitter" if defs is not None else "regex")
+    fn_records: List[Tuple[str, int, int]] = []
+    if defs is not None:
+        fn_records = [(f.name, f.start_line, f.end_line) for f in defs.functions]
+    else:
+        for m in func_pattern.finditer(content_clean):
+            fname = m.group(1) or m.group(2)
+            if not fname:
+                continue
+            start_line = content_clean[:m.start()].count('\n') + 1
+            end_line = _extract_balanced_block(source_lines, start_line, language="shell")  # V52-O.11.E (was: start_line + 30)
+            fn_records.append((fname, start_line, end_line))
+
+    for fname, start_line, end_line in fn_records:
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{fname}"
         signature = f"{fname}()"

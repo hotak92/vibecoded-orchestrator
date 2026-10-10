@@ -1,0 +1,36 @@
+{
+ "source": "edge_cases.lua",
+ "reviewed": "W6-E 2026-10-10 (hand-written before extraction)",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Stack",
+   "start": 2,
+   "end": 2
+  },
+  {
+   "kind": "function",
+   "name": "helper",
+   "start": 17,
+   "end": 22
+  },
+  {
+   "kind": "function",
+   "name": "inner",
+   "start": 18,
+   "end": 20
+  },
+  {
+   "kind": "function",
+   "name": "format",
+   "start": 24,
+   "end": 26
+  },
+  {
+   "kind": "function",
+   "name": "trim",
+   "start": 29,
+   "end": 31
+  }
+ ]
+}

@@ -20,8 +20,8 @@ Creates and populates Weaviate collections for code analysis:
 
 Supports incremental analysis (only re-parse changed files).
 
-Supported languages: Python (AST), Lua (regex), C++/C (regex), JavaScript/TypeScript/JSX (regex),
-                    Go (regex), Rust (regex), Java (regex), Ruby (regex), Shell (regex).
+Supported languages: Python (ast); TS/JS/JSX, Svelte, Rust, Go, Java, C#, C++/C, Ruby, Lua, Shell (tree-sitter,
+                    regex fallback without the codegraph-ts extra / on a parse error); PowerShell, Proto (regex).
 
 Usage:
     python analyze_code_graph.py /path/to/repo

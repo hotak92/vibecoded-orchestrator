@@ -1,0 +1,60 @@
+{
+ "source": "Account.java",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Account",
+   "start": 4,
+   "end": 18
+  },
+  {
+   "kind": "function",
+   "name": "Account",
+   "start": 7,
+   "end": 9
+  },
+  {
+   "kind": "function",
+   "name": "deposit",
+   "start": 11,
+   "end": 13
+  },
+  {
+   "kind": "function",
+   "name": "getBalance",
+   "start": 15,
+   "end": 17
+  },
+  {
+   "kind": "class",
+   "name": "Ledger",
+   "start": 22,
+   "end": 24
+  },
+  {
+   "kind": "function",
+   "name": "balanceOf",
+   "start": 23,
+   "end": 23
+  },
+  {
+   "kind": "class",
+   "name": "BaseAccount",
+   "start": 26,
+   "end": 36
+  },
+  {
+   "kind": "function",
+   "name": "audit",
+   "start": 27,
+   "end": 27
+  },
+  {
+   "kind": "function",
+   "name": "touch",
+   "start": 29,
+   "end": 35
+  }
+ ]
+}
