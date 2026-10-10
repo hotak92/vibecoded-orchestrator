@@ -1802,6 +1802,19 @@ def _disable_rl_hub_writes_in_tests(request):
 # command line named the sentinel. Containing them by default is the point.
 # A developer who wants them live runs with `VCO_TEST_ALLOW_REAL_STATE=1`, the
 # one hatch for "run against my real install".
+#
+# v0.2.102 W6-B2 last round — the stand-aside is OPT-IN, never ambient. Before,
+# a listed file got the ambient value unconditionally, and a developer shell
+# (or a Claude Code session, whose `.claude/settings.json` env exports
+# `WEAVIATE_URL=http://localhost:8081`) therefore reached the LIVE Weaviate on
+# every plain full-suite run — measured: `test_codegraph_retrieval_quality_smoke`
+# queried localhost:8081. A listed file now sees the ambient value ONLY when
+# the run sets `VCO_TEST_LIVE_WEAVIATE=1` (the installer-smoke X-2 step and
+# `scripts/pre-ship-check.sh` Section 5 do) or `VCO_TEST_ALLOW_REAL_STATE=1`;
+# otherwise it is pinned like every other file and its live legs skip.
+_LIVE_WEAVIATE_OPTIN_ENV = "VCO_TEST_LIVE_WEAVIATE"
+_LIVE_WEAVIATE_OPTED_IN = os.environ.get(_LIVE_WEAVIATE_OPTIN_ENV, "") not in ("", "0", "false")
+
 _LIVE_WEAVIATE_OPT_OUT_FILES: frozenset = frozenset({
     "test_v0246_v46b_live_ci10_diff_gate.py",
     "test_v0246_kg_sync_live.py",
@@ -1816,9 +1829,30 @@ def _weaviate_url_pin_for(test_file: str) -> "str | None":
     Pure and importable, so both branches are provable without a backend
     (`tests/test_v0294_fixture_class_guard.py` drives it directly).
     """
-    if _ALLOW_REAL_STATE or test_file in _LIVE_WEAVIATE_OPT_OUT_FILES:
+    if _ALLOW_REAL_STATE or (_LIVE_WEAVIATE_OPTED_IN and test_file in _LIVE_WEAVIATE_OPT_OUT_FILES):
         return _AMBIENT_WEAVIATE_URL
     return _fixture_guard.UNROUTABLE_SENTINEL_URL
+
+
+class WeaviateUrlLeak(AssertionError):
+    """A test left ``WEAVIATE_URL`` at a value the pin did not give it."""
+
+
+def _weaviate_url_leak(test_file: str, expected: "str | None") -> "str | None":
+    """The loud message when the process env no longer carries *expected* —
+    the pin's decision for *test_file* — or None when it does. Pure, so the
+    guard is provable without a failing test (``tests/test_v0294_fixture_
+    class_guard.py``)."""
+    seen = os.environ.get("WEAVIATE_URL")
+    if seen == expected:
+        return None
+    return (
+        f"{test_file} left WEAVIATE_URL={seen!r} (the pin is {expected!r}). A test "
+        "that changes it must restore it exactly (monkeypatch / mock.patch.dict, or "
+        "pop the key it added) — a leaked or REMOVED value lets every later test, "
+        "and every child it spawns, resolve a live backend. Live tests opt in with "
+        f"{_LIVE_WEAVIATE_OPTIN_ENV}=1."
+    )
 
 
 @contextlib.contextmanager
@@ -1973,15 +2007,23 @@ def _pin_weaviate_url(request):
     whatever classes they create.
     """
     prev_allow = os.environ.get(_fixture_guard.ALLOW_FIXTURE_WRITES_ENV)
-    with _weaviate_url_applied_for(request.node.fspath.basename):
+    test_file = request.node.fspath.basename
+    leak = None
+    with _weaviate_url_applied_for(test_file) as target:
         os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = "1"
         try:
             yield
         finally:
+            # v0.2.102 W6-B2 last round: the GUARD. Every other fixture (and
+            # monkeypatch) has torn down by now, so anything but the pin is a
+            # leak this test caused — fail it loudly, by name.
+            leak = None if _ALLOW_REAL_STATE else _weaviate_url_leak(test_file, target)
             if prev_allow is None:
                 os.environ.pop(_fixture_guard.ALLOW_FIXTURE_WRITES_ENV, None)
             else:
                 os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = prev_allow
+    if leak:
+        raise WeaviateUrlLeak(leak)
 
 
 # Test files that EXPLICITLY exercise `spawn_background_resync`'s launch path

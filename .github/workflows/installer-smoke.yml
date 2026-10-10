@@ -473,6 +473,9 @@ jobs:
       - name: Retrieval-quality floor regression (X-2)
         env:
           WEAVIATE_URL: "http://localhost:8081"
+          # The live stand-aside is opt-in (tests/conftest.py
+          # _LIVE_WEAVIATE_OPTIN_ENV): without it the suite pins WEAVIATE_URL.
+          VCO_TEST_LIVE_WEAVIATE: "1"
         run: |
           set -euo pipefail
           # -rs surfaces skip reasons in the log so an accidental all-skip

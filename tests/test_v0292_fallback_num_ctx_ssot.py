@@ -146,8 +146,11 @@ class MigrateScriptNumCtxTests(unittest.TestCase):
         self.assertIs(body["truncate"], False)
 
 
-class SearchKnowledgeNumCtxTests(unittest.TestCase):
-    """m-R5-5 — search_knowledge.py legacy Ollama leg."""
+class SearchKnowledgeNoLegacyLegTests(unittest.TestCase):
+    """v0.2.102 W6-B2 (owner ruling 2026-10-10): the search_knowledge.py
+    legacy direct-Ollama query leg (m-R5-5's subject) is REMOVED — it embedded
+    with ``EMBEDDING_MODEL`` against the legacy ``ollama_embed`` slot, another
+    model's space. No service → the loud error, no HTTP call."""
 
     def setUp(self):
         self.mod = _load_module(
@@ -155,40 +158,19 @@ class SearchKnowledgeNumCtxTests(unittest.TestCase):
             REPO_ROOT / "templates" / "scripts" / "search_knowledge.py",
         )
 
-    def _embed_and_capture(self, env: dict) -> dict:
+    def test_no_service_is_loud_and_posts_nothing(self):
+        import requests
+
         with mock.patch.object(
             self.mod, "_get_or_create_embedding_service", return_value=None,
-        ), mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
-            self.mod.requests, "post", return_value=_FakeResponse(),
-        ) as post:
-            vec = self.mod.get_embedding("some query")
-        self.assertEqual(vec, [0.1, 0.2, 0.3])
-        return post.call_args.kwargs["json"]
-
-    def test_fallback_resolves_num_ctx_from_ssot_default_model(self):
-        body = self._embed_and_capture(
-            {"EMBEDDING_MODEL": "qwen3-embedding:0.6b"}
-        )
-        self.assertEqual(body["options"]["num_ctx"], 10_240)
-        self.assertIs(body["truncate"], False)
-
-    def test_fallback_tracks_model_table(self):
-        """Per-model resolution — the drift-duplicate literal dies here."""
-        body = self._embed_and_capture(
-            {"EMBEDDING_MODEL": "snowflake-arctic-embed2:latest"}
-        )
-        self.assertEqual(body["options"]["num_ctx"], 4_096)
-        self.assertIs(body["truncate"], False)
-
-    def test_resolver_soft_fails_to_documented_literal(self):
-        """Standalone (no vco_lib) → NUM_CTX_FALLBACK, never raises."""
-        with mock.patch.dict(
-            sys.modules, {"vco_lib.embedding_providers.ollama": None},
-        ):
-            self.assertEqual(
-                self.mod._num_ctx_for_model("qwen3-embedding:0.6b"),
-                10_240,
-            )
+        ), mock.patch.object(requests, "post") as post:
+            with self.assertRaises(Exception) as ctx:
+                self.mod.get_embedding("some query")
+            with self.assertRaises(Exception):
+                self.mod._get_target_vector_slot()
+        self.assertIn("never queried with a different embedding model", str(ctx.exception))
+        post.assert_not_called()
+        self.assertFalse(hasattr(self.mod, "_fallback_embed_request_body"))
 
 
 if __name__ == "__main__":

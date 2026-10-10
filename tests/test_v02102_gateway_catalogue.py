@@ -194,7 +194,7 @@ class ClientWindowDerivationTests(GatewayTestBase):
         self.assertEqual(resp.status, 200)
         from model_router import server as srv
 
-        await self.client.app[srv.APP_KEY].usage.drain()
+        await self.client.app[srv.APP_KEY].quiesce()  # handlers finished + appends drained
         lines = [
             json.loads(line)
             for line in self.usage_ledger_path.read_text(encoding="utf-8").splitlines()
@@ -273,7 +273,7 @@ class ClientWindowDerivationTests(GatewayTestBase):
         self.assertEqual(resp.status, 200)
         from model_router import server as srv
 
-        await self.client.app[srv.APP_KEY].usage.drain()
+        await self.client.app[srv.APP_KEY].quiesce()  # handlers finished + appends drained
         lines = [
             json.loads(line)
             for line in self.usage_ledger_path.read_text(encoding="utf-8").splitlines()

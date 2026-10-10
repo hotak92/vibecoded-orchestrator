@@ -254,6 +254,7 @@ except ImportError as _exc:
 # discipline" note further below), so a failed import here already fails
 # loudly (ImportError) with no fallback, matching that same discipline.
 from vco_lib.log_setup import configure_logging  # noqa: E402 — after package-identity bootstrap
+from vco_lib.embed_outage import EmbeddingBackendUnavailable  # noqa: E402 — after package-identity bootstrap
 configure_logging()
 logger = logging.getLogger(__name__)
 
@@ -4146,6 +4147,15 @@ def get_weaviate_client():
     return weaviate_client
 
 
+def _embedding_unavailable_response(exc: EmbeddingBackendUnavailable, query: str = "") -> str:
+    """The loud failure every MCP search tool returns when its query could
+    not be embedded with the recorded model (v0.2.102 W6-B2, owner ruling
+    2026-10-10): backend, container, watchdog state and remedy in ``error``
+    — never a silent empty result, never another embedding model."""
+    logger.error("embedding backend unavailable: %s", exc)
+    return json.dumps({**exc.as_payload(), "query": query, "count": 0, "results": []}, indent=2)
+
+
 def _weaviate_unreachable_response(exc: WeaviateUnreachable, query: str = "") -> str:
     """Format WeaviateUnreachable as the structured failure response that
     MCP search tools (hybrid_search / semantic_graph_search /
@@ -4730,6 +4740,10 @@ def _reset_weaviate_client_cache() -> None:
 # is idempotent. No lock needed.
 _cached_embed_service: "EmbeddingService | None" = None
 _embed_service_construction_failed_at: float = 0.0  # epoch seconds
+#: v0.2.102 W6-B2: why the last construction failed (quoted by the loud
+#: outage error) and when the cached service last re-read its code record.
+_embed_service_construction_error: str = ""
+_embed_record_checked_at: float = 0.0
 _EMBED_SERVICE_RETRY_WINDOW = 10.0  # don't re-probe failed construction more than once per 10s
 
 
@@ -5410,6 +5424,8 @@ async def semantic_graph_search(
         _assert_workspace_unchanged("semantic_graph_search")
         client = get_weaviate_client()
         return await _semantic_graph_search_body(client, query, limit, depth, detail, include_stale)
+    except EmbeddingBackendUnavailable as exc:
+        return _embedding_unavailable_response(exc, query=query)
     except WeaviateWorkspaceDriftError as exc:
         # Surface the refuse-loud message verbatim. Do NOT reset the client
         # cache (this is not a Weaviate outage) — the fix is a subprocess
@@ -5559,6 +5575,8 @@ async def _semantic_graph_search_body(
                 if stale is not None:
                     nv_kwargs["filters"] = stale
                 primary = handle.query.near_vector(**nv_kwargs)
+        except EmbeddingBackendUnavailable:
+            raise  # the query could not be embedded: every leg fails alike — loud
         except Exception as exc:
             classified = _classify_weaviate_failure(exc)
             if isinstance(classified, WeaviateUnreachable):
@@ -6270,6 +6288,8 @@ async def hybrid_search(
         return await _hybrid_search_body(
             query, limit, node_type, tags, days, detail, include_stale,
         )
+    except EmbeddingBackendUnavailable as exc:
+        return _embedding_unavailable_response(exc, query=query)
     except WeaviateWorkspaceDriftError as exc:
         # v0.2.74 T5-1 backstop: surface the refuse-loud message verbatim.
         # Do NOT reset the client cache (this is not a Weaviate outage) —
@@ -6367,6 +6387,11 @@ async def _hybrid_search_body(
             _vec, _slot = await _get_search_vector(query)
             query_vector = _vec
             query_target = _slot or ""
+        except EmbeddingBackendUnavailable:
+            # v0.2.102 W6-B2: the embedder that serves the recorded model is
+            # down (after the transient retry) — every semantic leg would fail
+            # alike, so fail LOUDLY now instead of N per-collection retries.
+            raise
         except Exception as exc:
             # Best-effort capture — vector unavailable means downstream
             # log_retrieval omits the field, but search itself proceeds.
@@ -6442,6 +6467,8 @@ async def _hybrid_search_body(
             successful_collections.append(coll_name)
             continue
         e = coll_combined
+        if isinstance(e, EmbeddingBackendUnavailable):
+            raise e  # the query could not be embedded — loud, not a per-collection skip
         # Loud-fail v2: don't swallow Weaviate-unreachable. Connection-time
         # failures fire from get_weaviate_client(); query-time failures
         # (cached client + Weaviate stopped mid-session) fire here.
@@ -7604,9 +7631,9 @@ async def search_code_graph(
                     )
                     # v0.2.18: target the slot matching the active code
                     # backend (codesage_embed / ollama_code_embed /
-                    # openai_code_embed / jina_embed). Falls back to the
-                    # pre-v0.2.18 ACTIVE_EMBEDDING branching when the
-                    # service isn't available.
+                    # openai_code_embed / jina_embed). v0.2.102 W6-B2: no
+                    # fallback when the service is unavailable — the query
+                    # embed above already raised the loud error.
                     if DUAL_EMBEDDING_ENABLED:
                         # v0.2.73 C-6: mirror the CLI's
                         # ``_active_code_vector_slot`` — svc present → its
@@ -8233,8 +8260,17 @@ async def search_code_graph(
             if _cg_failed_other:
                 _degraded["errors"] = {n: r for n, r in _cg_failed_other}
             response_payload["degraded"] = {"failed_collections": _degraded}
+            # v0.2.102 W6-B2: PARTIAL results are marked as such at the top
+            # level — a failed collection is never a silent hole.
+            response_payload["partial"] = True
+            response_payload["warning"] = (
+                f"PARTIAL results: {len(_cg_failed_schema) + len(_cg_failed_other)} "
+                "code-graph collection(s) could not be searched — see `degraded`."
+            )
         return _large_result(response_payload)
 
+    except EmbeddingBackendUnavailable as exc:
+        return _embedding_unavailable_response(exc, query=query)
     except WeaviateUnreachable as exc:
         # Loud-fail per 2026-05-08 silent-zero antipattern fix.
         _reset_weaviate_client_cache()

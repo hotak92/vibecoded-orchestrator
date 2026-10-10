@@ -282,10 +282,15 @@ class LadderTestBase(GatewayTestBase):
             **payload,
         }
 
-    async def rows(self) -> list[dict]:
+    async def rows(self, client: Any = None) -> list[dict]:
+        """The ledger rows once the gateway that SERVED the request is quiet.
+
+        W6-B2 last round: pass the client a test built itself — quiescing
+        ``self.client``'s gateway while the request ran on another one is the
+        race the reprobe test flaked on (both write one ledger file)."""
         from model_router import server as srv
 
-        await self.client.app[srv.APP_KEY].usage.drain()
+        await (client or self.client).app[srv.APP_KEY].quiesce()  # handlers finished + appends drained
         path = self.usage_ledger_path
         if not path.is_file():
             return []
@@ -517,7 +522,7 @@ class FallbackLadderTests(LadderTestBase):
         self.assertEqual(len(self.anthropic_up.message_requests), 1)
         self.assertEqual(len(self.vendor_up.message_requests), 1)
         self.assertEqual(len(qwen.message_requests), 2)
-        rows = await self.rows()
+        rows = await self.rows(client)
         self.assertEqual(rows[0]["forward"], "qwen3.8-flash")
         self.assertEqual(rows[0]["fallback_from"], "vendor:zai:glm-5.3-flash")
 
@@ -575,6 +580,61 @@ class FallbackLadderTests(LadderTestBase):
 # ══════════════════════════════════════════════════════════════════════════
 # A8 — thinking.clear_thinking (OD-10)
 # ══════════════════════════════════════════════════════════════════════════
+class LedgerQuiesceTests(LadderTestBase):
+    """v0.2.102 W6-B2 last round — the reprobe-test flake, root-caused.
+
+    A request's ledger row is submitted at its terminal point, which runs AFTER
+    the client has the whole body (the upstream response still closes, an
+    await, before ``access()``). A reader that only drained the queued appends
+    could therefore run before the submit and find no row — under full-suite
+    load ``rows[0]`` raised IndexError. :meth:`Gateway.quiesce` waits for the
+    in-flight handlers first; ``inflight_middleware`` counts them."""
+
+    async def test_quiesce_waits_for_a_handler_still_past_its_response(self) -> None:
+        import asyncio
+
+        from model_router import server as srv
+
+        gateway = self.client.app[srv.APP_KEY]
+        done: list = []
+
+        async def _terminal_point_later() -> None:
+            await asyncio.sleep(0.05)
+            done.append("submitted")
+            gateway.request_finished()
+
+        gateway.request_started()
+        task = asyncio.create_task(_terminal_point_later())
+        await gateway.usage.drain()
+        self.assertEqual(done, [], "drain alone returns before the late submit (the race)")
+        await gateway.quiesce()
+        self.assertEqual(done, ["submitted"])
+        await task
+
+    async def test_the_usage_submit_happens_while_the_request_is_counted(self) -> None:
+        """Wiring: the middleware covers the terminal point, so quiesce sees it."""
+        from model_router import server as srv
+
+        gateway = self.client.app[srv.APP_KEY]
+        seen: list = []
+        real = srv._submit_usage
+
+        def _spy(*a, **kw):
+            seen.append(gateway._inflight)
+            return real(*a, **kw)
+
+        srv._submit_usage = _spy
+        self.addCleanup(setattr, srv, "_submit_usage", real)
+        self.anthropic_up.messages_body = _success(HAIKU)
+        resp = await self.client.post("/v1/messages", json=self.ask(HAIKU), headers=self.chat())
+        self.assertEqual(resp.status, 200)
+        await resp.read()
+        rows = await self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(seen and seen[0] >= 1, seen)
+        self.assertEqual(gateway._inflight, 0)
+
+
 class _SeedContext:
     """The one thing :func:`_apply_clear_thinking` needs from a gateway."""
 

@@ -14009,6 +14009,33 @@ MemAvailable:   23456789 kB
         use super::super::*;
         use crate::commands::gpu_policy::GpuMode;
 
+        /// v0.2.102 W6-B2 (owner decision 5): the Preferences key
+        /// `launcher.hardware_snapshot` has a behavioural reader — set the
+        /// row, the decided GPU mode the module start path reads
+        /// (`read_persisted_hardware_snapshot` → `read_persisted_gpu_mode`)
+        /// follows it; change the value, the answer changes.
+        #[test]
+        fn hardware_snapshot_key_value_drives_the_read_gpu_mode() {
+            let db = crate::db::Db::open_in_memory().unwrap();
+            assert!(read_persisted_hardware_snapshot(&db).unwrap().is_none());
+            let row = |mode: &str| {
+                format!(
+                    r#"{{"has_nvidia_gpu":true,"gpu_name":"g","has_apple_silicon":false,"ram_gb":32,"use_gpu":true,"low_resource":false,"vram_gb":16.0,"gpu_mode_decided":"{}"}}"#,
+                    mode
+                )
+            };
+            db.app_state_set("launcher.hardware_snapshot", &row("cuda")).unwrap();
+            assert_eq!(
+                read_persisted_hardware_snapshot(&db).unwrap().unwrap().gpu_mode_decided,
+                GpuMode::Cuda
+            );
+            db.app_state_set("launcher.hardware_snapshot", &row("cpu")).unwrap();
+            assert_eq!(
+                read_persisted_hardware_snapshot(&db).unwrap().unwrap().gpu_mode_decided,
+                GpuMode::Cpu
+            );
+        }
+
         /// Build a `SystemDetection` fixture that mimics the RTX 4080
         /// SUPER host the validation pass produced — `has_nvidia_gpu`
         /// true, 16 GB VRAM (well above the 8 GB threshold).

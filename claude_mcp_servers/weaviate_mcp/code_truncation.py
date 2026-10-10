@@ -32,7 +32,6 @@ this module no longer keeps its own copy (see v0.2.92 WP-E note below):
 
 from __future__ import annotations
 
-import os
 import re
 
 # Chars-per-token ratio for code is ~3.5 (more punctuation than prose). This
@@ -68,6 +67,17 @@ except ImportError:  # pragma: no cover - bare-module import path (tests load
 _DEFAULT_TOKEN_LIMIT = 1024
 
 
+def _default_code_model() -> str:
+    """The code model when a caller passes none — the ONE resolver's answer
+    (v0.2.102 W6-B2, :mod:`vco_lib.code_embed_model`; it was a third, env-only
+    ``CODE_EMBED_MODEL`` read here, repeated at three sites). Every analyzer
+    call passes the EmbeddingService's model explicitly; this is the bare-call
+    default only."""
+    from vco_lib.code_embed_model import resolve_code_model
+
+    return resolve_code_model(role="write").model
+
+
 def _max_chars_for_model(model: str | None = None) -> int:
     """Return max character budget for a given code embedding model.
 
@@ -83,7 +93,7 @@ def _max_chars_for_model(model: str | None = None) -> int:
     so there is exactly one place these numbers are declared.
     """
     if model is None:
-        model = os.getenv("CODE_EMBED_MODEL", "codesage/codesage-large-v2")
+        model = _default_code_model()
     try:
         # Sibling first — see the module-level note: the absolute path can bind
         # another checkout's chunking and silently swap MODEL_TOKEN_LIMITS.
@@ -497,7 +507,7 @@ def chunk_or_truncate_for_embedding(
     except ImportError:  # pragma: no cover — same-package import, defensive only
         from .chunking import Chunker  # type: ignore[no-redef]
 
-    resolved_model = model or os.getenv("CODE_EMBED_MODEL", "codesage/codesage-large-v2")
+    resolved_model = model or _default_code_model()
     chunker = Chunker.for_model(resolved_model)
     source_id = full_name or signature
     chunks = chunker.chunk_text(text=full_text, source_id=source_id, metadata={})
@@ -571,7 +581,7 @@ def chunk_or_truncate_class_for_embedding(
     except ImportError:  # pragma: no cover
         from .chunking import Chunker  # type: ignore[no-redef]
 
-    resolved_model = model or os.getenv("CODE_EMBED_MODEL", "codesage/codesage-large-v2")
+    resolved_model = model or _default_code_model()
     chunker = Chunker.for_model(resolved_model)
     source_id = full_name or signature
     chunks = chunker.chunk_text(text=full_text, source_id=source_id, metadata={})

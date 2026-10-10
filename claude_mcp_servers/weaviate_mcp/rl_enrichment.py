@@ -1223,7 +1223,14 @@ def _resolve_code_embedding_triple(
     except Exception:  # noqa: BLE001
         pass
     if not code_model:
-        code_model = os.getenv("CODE_EMBED_MODEL", "") or code_source
+        # v0.2.102 W6-B2: the ONE code-model resolver, not a raw env read.
+        try:
+            from vco_lib.code_embed_model import resolve_code_model
+            code_model = resolve_code_model(
+                codegraph_prefix=getattr(server, "CODE_GRAPH_PROJECT", None) or None).model
+        except Exception:  # noqa: BLE001 — a label; never blocks an emit
+            code_model = ""
+        code_model = code_model or code_source
     return code_source, code_dim, code_model
 
 def _emit_code_structure_telemetry(

@@ -460,8 +460,6 @@ def code_embed_unavailable_entry(detail: str, *, vco_managed: bool = True) -> An
         "does not switch the code graph to another embedder behind your back — one "
         "code graph keeps exactly one embedder. The knowledge graph is unaffected."
     )
-    fallback = ("Developers who accept a mixed-embedder code graph may set "
-                "VCO_CODE_EMBED_ALLOW_FALLBACK=1.")
     if vco_managed:
         return DeferralEntry(
             condition_id=CODE_EMBED_UNAVAILABLE_CID,
@@ -472,7 +470,7 @@ def code_embed_unavailable_entry(detail: str, *, vco_managed: bool = True) -> An
                 "Nothing to do if it comes back: the next session start starts VCO's "
                 "code_embed container and VCO clears this entry once the service answers. "
                 f"To start it now: `{runtime_command_hint('start vco_code_embed')}`, or "
-                f"re-run `python install.py --update`. {fallback}"
+                "re-run `python install.py --update`."
             ),
             severity="warning",
         )
@@ -483,7 +481,7 @@ def code_embed_unavailable_entry(detail: str, *, vco_managed: bool = True) -> An
         why_deferred=why + " VCO does not run this code_embed, so it does not start it.",
         command_to_apply=(
             "Start the code_embed service you configured (its container or host), then "
-            f"re-run `python install.py --update`. {fallback}"
+            "re-run `python install.py --update`."
         ),
         severity="warning",
     )

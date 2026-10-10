@@ -515,6 +515,22 @@ def _peer_is_loopback(request: web.Request) -> Optional[bool]:
 
 
 @web.middleware
+async def inflight_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], Any],
+) -> web.StreamResponse:
+    """Count the request as in flight until its handler has fully returned —
+    i.e. past its terminal point, where the usage row is submitted
+    (:meth:`Gateway.quiesce`)."""
+    gateway = request.app[APP_KEY]
+    gateway.request_started()
+    try:
+        return await handler(request)
+    finally:
+        gateway.request_finished()
+
+
+@web.middleware
 async def loopback_only_middleware(
     request: web.Request,
     handler: Callable[[web.Request], Any],
@@ -609,6 +625,15 @@ class Gateway:
         #: of shared state, and so a test can swap it on the gateway object.
         #: It resolves its own file path lazily and never on the request path.
         self.usage = UsageLedger()
+        #: v0.2.102 W6-B2 last round: handlers still running. A request's
+        #: ledger row is submitted at its terminal point, which runs AFTER the
+        #: client has the whole body — so "drain the queued appends" alone
+        #: could run before that submit and miss the row (a shutdown racing a
+        #: last turn; the gateway tests' flake). :meth:`quiesce` waits for
+        #: these first. Counted by :func:`inflight_middleware`.
+        self._inflight = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
         self.catalog = CatalogService(
             vendors=vendors,
             anthropic=anthropic,
@@ -636,13 +661,32 @@ class Gateway:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
 
+    def request_started(self) -> None:
+        self._inflight += 1
+        self._idle.clear()
+
+    def request_finished(self) -> None:
+        self._inflight = max(0, self._inflight - 1)
+        if self._inflight == 0:
+            self._idle.set()
+
+    async def quiesce(self, timeout_s: float = 10.0) -> None:
+        """Wait for in-flight handlers (bounded), then for queued ledger
+        appends — after this every finished request's row is on disk."""
+        try:
+            await asyncio.wait_for(self._idle.wait(), timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning("model-gateway: %d request(s) still in flight after %.0fs; "
+                           "draining the ledger without them", self._inflight, timeout_s)
+        await self.usage.drain()
+
     async def stop(self) -> None:
         # Queued ledger appends first: they are scheduled on the loop's
         # executor and a shutdown that tore the loop down under them would
         # drop the last rows of the session — the ones a user looking at a
-        # context monitor cares most about. Bounded by the number of requests
-        # still in flight, which at shutdown is none or nearly none.
-        await self.usage.drain()
+        # context monitor cares most about. In-flight handlers are waited for
+        # first (bounded): their rows are submitted after their responses.
+        await self.quiesce()
         # Before the session closes: an in-flight usage refresh holds it.
         await self.usage_windows.stop()
         if self._session is not None and not self._session.closed:
@@ -4283,7 +4327,7 @@ def create_app(
         token_file_stamp=token_file_stamp,
     )
     app = web.Application(
-        middlewares=[loopback_only_middleware],
+        middlewares=[loopback_only_middleware, inflight_middleware],
         client_max_size=UNBOUNDED_CLIENT_MAX_SIZE,
     )
     app[APP_KEY] = gateway

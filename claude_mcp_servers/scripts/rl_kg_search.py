@@ -304,7 +304,23 @@ async def main():
             vector = None
             target_name = None
         else:
-            vector, target_name = await embed_hook_query(effective_query)
+            from vco_lib.embed_outage import (
+                EmbeddingBackendUnavailable,
+                hook_unavailable_line,
+            )
+
+            try:
+                vector, target_name = await embed_hook_query(effective_query)
+            except EmbeddingBackendUnavailable as exc:
+                # v0.2.102 W6-B2 (owner ruling 2026-10-10): the embedder that
+                # serves the KG's model stayed down past the transient retry.
+                # A hook shows ONE visible line (never a silent empty result,
+                # never another model's vector); the CLI fails loudly.
+                if args.hook_format:
+                    print(hook_unavailable_line("kg"))
+                    return
+                print(f"❌ {exc}", file=sys.stderr)
+                raise SystemExit(1) from exc
         # F-G (v0.2.70): the active named-vector slot (e.g. "qwen3_embed"). The
         # hook path historically attached NO node vector at all, so EVERY
         # hook-driven retrieval (≈72% of all events) carried no n_emb → cosine

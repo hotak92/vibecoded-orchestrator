@@ -11,7 +11,6 @@ Handles chunked nodes automatically - reassembles all chunks from same source.
 import sys
 import os
 import re
-import requests
 import weaviate
 import time
 from pathlib import Path
@@ -37,11 +36,10 @@ from weaviate.classes.query import Filter
 _WEAVIATE_URL_ENV = (os.getenv("WEAVIATE_URL") or "").strip()
 _WEAVIATE_PORT_ENV = (os.getenv("WEAVIATE_PORT") or "").strip()
 WEAVIATE_URL = _WEAVIATE_URL_ENV or f"http://localhost:{_WEAVIATE_PORT_ENV or 8081}"
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
-# v0.2.18: EMBEDDING_MODEL is resolved by EmbeddingService at search
-# time (see `_get_embedding_service` below). Kept the OLLAMA_URL env
-# for the legacy `get_embedding()` fallback path used when the service
-# isn't reachable.
+# v0.2.18: EMBEDDING_MODEL / OLLAMA_URL are resolved by EmbeddingService at
+# search time (see `_get_or_create_embedding_service` below). v0.2.102 W6-B2:
+# this script's own OLLAMA_URL fed only the legacy direct-Ollama query leg,
+# removed with it (owner ruling 2026-10-10 — no other embedding model).
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 
 # v0.2.21 Step 18 (caller migration): resolve KG collection names via the
@@ -178,60 +176,6 @@ MAX_QUERY_TOKENS = 2500
 # free-tier / partial install running this script without the orchestrator
 # packages). See `_chars_per_token()` below.
 CHARS_PER_TOKEN_FALLBACK = 4
-
-# Standalone-only default for the num_ctx of the DEFAULT text model
-# (qwen3-embedding:0.6b). MUST MATCH that model's entry in
-# `claude_mcp_servers/weaviate_mcp/chunking.py::MODEL_TOKEN_LIMITS`; only
-# reached when the SSOT resolver isn't importable — same literal discipline
-# as CHARS_PER_TOKEN_FALLBACK above. See `_num_ctx_for_model()` below.
-NUM_CTX_FALLBACK = 10_240
-
-
-def _num_ctx_for_model(model: str) -> int:
-    """Resolve the Ollama ``num_ctx`` for *model* from the ONE SSOT.
-
-    Routed through ``vco_lib.embedding_providers.ollama._num_ctx_for_model``
-    (the same resolver the canonical adapter uses; it reads
-    ``chunking.MODEL_TOKEN_LIMITS``) whenever the orchestrator packages are
-    importable, so the value tracks the table instead of mirroring it
-    (v0.2.92 m-R5-5 — this was a second hardcoded copy of 10_240). Falls
-    back to ``NUM_CTX_FALLBACK`` when this script runs standalone with no
-    vco_lib on sys.path — never raises. Same lazy/soft-fail shape as
-    ``_max_query_tokens()`` and ``_chars_per_token()``.
-    """
-    try:
-        from vco_lib.embedding_providers.ollama import (
-            _num_ctx_for_model as _ssot_resolver,
-        )
-        return int(_ssot_resolver(model))
-    except Exception:
-        return NUM_CTX_FALLBACK
-
-
-def _fallback_embed_request_body(model: str, text: str) -> dict:
-    """Body for the inline Ollama fallback leg (v0.2.102 W4-E).
-
-    Routed through the ONE shared builder
-    (``vco_lib.embedding_providers.ollama.embed_request_body``) whenever the
-    orchestrator packages are importable — identical load options per model
-    as the canonical adapter (one runner, never a second copy) plus the
-    shared keep_alive policy. Falls back to the standalone shape
-    (SSOT-resolved num_ctx via ``_num_ctx_for_model``, ``truncate: False``,
-    v0.2.92 R40/R45) when vco_lib is absent — never raises.
-    """
-    try:
-        from vco_lib.embedding_providers.ollama import embed_request_body
-        return embed_request_body(model, prompt=text)
-    except Exception:
-        return {
-            "model": model,
-            "prompt": text,
-            "options": {"num_ctx": _num_ctx_for_model(model)},
-            # v0.2.92 R40: never let Ollama truncate silently — a loud 400
-            # the caller raises beats a 200 that dropped the query tail.
-            "truncate": False,
-        }
-
 
 def _max_query_tokens() -> int:
     """Resolve the query-token cap for the currently-active text model.
@@ -592,15 +536,16 @@ def get_weaviate_client():
 # basically a singleton; the cache exists for tests + the orchestrator
 # venv re-entry case.
 _cached_embedding_service: "EmbeddingService | None" = None
+#: Why the service could not be built (quoted by the loud outage error).
+_embedding_construction_error: str = ""
 
 
 def _get_or_create_embedding_service():
     """Return the active EmbeddingService, or None if unavailable.
 
-    Used by `get_embedding()` to embed the query before
-    `near_vector`. Falls back to the legacy Ollama-direct path when
-    EmbeddingService isn't importable OR construction raises (e.g.
-    every backend down).
+    Used by `get_embedding()` to embed the query before `near_vector`.
+    v0.2.102 W6-B2: None is a LOUD error at query time (no legacy
+    Ollama-direct path — owner ruling 2026-10-10).
     """
     global _cached_embedding_service
     if _cached_embedding_service is not None:
@@ -611,13 +556,14 @@ def _get_or_create_embedding_service():
         _cached_embedding_service = EmbeddingService.for_project()
         return _cached_embedding_service
     except NoEmbeddingBackendError as e:
-        # Soft-fail at query time: the failure JSONL + .md hint were
-        # already written by NoEmbeddingBackendError. The caller falls
-        # through to the legacy Ollama path which may also fail — that
-        # surfaces a clear user-visible error.
+        # The failure JSONL + .md hint were already written by
+        # NoEmbeddingBackendError; get_embedding() raises the loud error.
+        global _embedding_construction_error
+        _embedding_construction_error = str(e)
         print(f"⚠️  EmbeddingService not available: {e}", file=sys.stderr)
         return None
     except Exception as e:
+        _embedding_construction_error = str(e)
         print(f"⚠️  EmbeddingService construction failed: {e}", file=sys.stderr)
         return None
 
@@ -628,80 +574,55 @@ def _get_or_create_embedding_service():
 _CLI_DUAL_EMBED_BUDGET_S = 1.0
 
 
+def _kg_search_unavailable(construction_error: str = ""):
+    """The loud error for a KG query that cannot be embedded with the KG's
+    model (owner ruling 2026-10-10 — never another embedding model). Built by
+    ``vco_lib.embed_outage`` when importable; a vco_lib-less run is a BROKEN
+    install and says so."""
+    try:
+        from vco_lib.embed_outage import query_unavailable
+    except Exception as exc:  # noqa: BLE001
+        return RuntimeError(
+            "KG search unavailable: vco_lib is not importable — a broken install "
+            f"({exc}); re-run `python install.py --update`. The KG is never queried "
+            "with a different embedding model.")
+    return query_unavailable("kg", None, construction_error=construction_error)
+
+
 def _get_target_vector_slot() -> str:
     """Return the named-vector slot to query for the active model.
 
-    Falls back to ``"ollama_embed"`` (the pre-v0.2.18 hardcode) when the
-    EmbeddingService isn't available — preserves legacy-install
-    behaviour where every slot was qwen3-shaped under ollama_embed.
-    Callers that hit this fallback on a non-qwen3 install will get
-    poor search results, but they won't crash.
-
     v0.2.94: the slot READ itself is the shared
     ``vco_lib.kg_vector_slot.slot_for_service`` — one home with kg-sync's
-    writer, the MCP write path and the duplicate scanner. The legacy default
-    above is unchanged and stays this caller's own decision; the import is
-    function-local and reached only when the service exists, so the
-    "vco_lib isn't importable" path still returns the hardcode.
+    writer, the MCP write path and the duplicate scanner.
+
+    v0.2.102 W6-B2: no ``"ollama_embed"`` default when the service is
+    unavailable — that slot holds another model's vectors on every current
+    install, so a query aimed at it searched noise. Raises the loud error.
     """
     svc = _get_or_create_embedding_service()
     if svc is None:
-        return "ollama_embed"
+        raise _kg_search_unavailable(_embedding_construction_error)
     from vco_lib.kg_vector_slot import slot_for_service
 
     return slot_for_service(svc, "ollama_embed")
 
 
 def get_embedding(text: str) -> list:
-    """Embed *text* via the active text backend.
+    """Embed the CLI's retrieval QUERY with the KG's model.
 
-    v0.2.18: routes through EmbeddingService (which picks ollama /
-    openai based on env). Falls back to a direct Ollama call on the
-    legacy qwen3-embedding model if EmbeddingService isn't available
-    (kept for forward-compat with installs that haven't migrated).
-
-    v0.2.101: this embeds a SEARCH QUERY (the CLI's retrieval query), so it
-    routes through ``embed_text_query`` which applies the active model's
-    query-side instruction. The fallback below stays UNPREFIXED — a
-    half-migrated install's degraded path (the prefix needs the resolved
-    model from the table).
+    v0.2.101: routes through ``embed_text_query`` (the active model's
+    query-side instruction). v0.2.102 W6-B2 (owner ruling 2026-10-10): through
+    the ONE query-embed entry ``vco_lib.embed_outage.embed_query_or_raise`` —
+    transient retry, then the LOUD error; the pre-v0.2.102 direct-Ollama leg
+    (``EMBEDDING_MODEL`` against the legacy ``ollama_embed`` slot) is gone.
     """
     svc = _get_or_create_embedding_service()
-    if svc is not None:
-        return svc.embed_text_query(text)
-    # Legacy fallback: direct Ollama call. Only reached when vco_lib
-    # isn't importable (HAS_EMBEDDING_SERVICE=False) — that case
-    # indicates a half-migrated install, NOT a normal operating state.
-    # Reads the embedding model name via os.getenv (the v0.2.18 audit
-    # grep targets os-environ-dot-EMBEDDING-MODEL specifically, which
-    # EmbeddingService now owns; the fallback uses os.getenv to stay
-    # outside that pattern). Anyone hitting this fallback should re-run
-    # install.py --update to rebundle the vco_lib package.
-    # v0.2.92 R40: num_ctx was UNSET here, so this fallback inherited Ollama's
-    # 2048 default. Queries are short, so nothing was being lost in practice —
-    # but an unset window is an omission, not a decision, and the next caller
-    # to send something longer would have lost its tail with an HTTP 200.
-    # v0.2.92 (m-R5-5): the value is now resolved from the ONE SSOT (the
-    # `_num_ctx_for_model` resolver over `chunking.MODEL_TOKEN_LIMITS` —
-    # same resolver the canonical adapter uses) whenever the orchestrator
-    # packages are importable, so it tracks the table instead of mirroring
-    # it. The literal below is the documented standalone fallback for the
-    # case this comment block describes (script running with NO vco_lib on
-    # sys.path); it MUST MATCH chunking.MODEL_TOKEN_LIMITS for the default
-    # model.
-    fallback_model = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
-    response = requests.post(
-        f"{OLLAMA_URL}/api/embeddings",
-        # v0.2.102 W4-E: ONE shared body builder — identical load options per
-        # model as the canonical adapter (one runner, never a second copy)
-        # and the shared keep_alive policy.
-        json=_fallback_embed_request_body(fallback_model, text),
-    )
+    if svc is None:
+        raise _kg_search_unavailable(_embedding_construction_error)
+    from vco_lib.embed_outage import embed_query_or_raise
 
-    if response.status_code != 200:
-        raise Exception(f"Failed to get embedding: {response.text}")
-
-    return response.json()["embedding"]
+    return embed_query_or_raise("kg", svc, text)
 
 
 def _chars_per_token() -> int:

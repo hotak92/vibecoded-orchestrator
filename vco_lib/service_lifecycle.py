@@ -108,12 +108,34 @@ FetchJsonFn = Callable[[str, float], Optional[dict]]
 # ─── the compose service list (I1) ──────────────────────────────────────
 
 
+def code_embed_out_of_stack(infra_dir: "Path | None" = None) -> bool:
+    """v0.2.102 W6-B2: True when install's ``CODE_EMBED_IN_STACK`` marker
+    (``infrastructure/.env``) says the code_embed container is NOT part of
+    this install — no code graph uses CodeSage, or no GPU (the ONE decision,
+    ``vco_lib.code_embed_serving.code_embed_in_stack``). An absent marker (a
+    pre-v0.2.102 install) keeps the old behaviour: False."""
+    from vco_lib.compose_env import read_code_embed_in_stack  # noqa: PLC0415
+
+    if infra_dir is None:
+        from vco_lib.python_exe import resolve_install_root  # noqa: PLC0415
+
+        root = resolve_install_root()
+        if root is None:
+            return False
+        infra_dir = root / "infrastructure"
+    return read_code_embed_in_stack(infra_dir) is False
+
+
 def compose_services(rows: Mapping[str, "_se.EndpointRow"]) -> list[str]:
     """The compose services VCO may bring up: ``vco_managed`` + ``enabled``
     rows, plus services with NO row (before the first reconcile, VCO's own
     stack is the default). Never an ``adopted_*`` service. Order: weaviate,
-    ollama, code_embed."""
-    return list(_se.plan(rows)["managed_services"])
+    ollama, code_embed. code_embed only when it is part of this install
+    (:func:`code_embed_out_of_stack`)."""
+    services = list(_se.plan(rows)["managed_services"])
+    if "code_embed" in services and code_embed_out_of_stack():
+        services.remove("code_embed")
+    return services
 
 
 def _enables_gpu_profile(argv: Sequence[str]) -> bool:
@@ -247,6 +269,10 @@ def container_policies(
             entry["mode"], bool(entry["enabled"]), bool(entry["autostart"]),
             bool(entry["present"]),
         )
+        if service == "code_embed" and code_embed_out_of_stack():
+            # Not part of this install (W6-B2): VCO neither creates nor
+            # restarts it — a leftover container is left exactly as it is.
+            on_missing = on_zombie = on_stopped = "ignore"
         known.append(ContainerPolicy(container, service, entry["mode"],
                                      on_missing, on_zombie, on_stopped))
     if required is None:

@@ -111,6 +111,27 @@ CODE_EMBED_SERVICE_URL = service_base_url()
 # accessor reads/writes them via the ``server`` module object.
 
 
+#: How often a cached EmbeddingService re-reads the code graph's recorded model.
+_RECORD_RECHECK_SECS = 30.0
+
+
+def _code_record_changed(svc, prefix: str) -> bool:
+    """True when the launcher DB now records a different code model for
+    ``prefix`` than the one ``svc`` resolved at construction. Soft-fails to
+    False (a DB hiccup must not churn the service)."""
+    try:
+        from vco_lib.code_embed_model import CodeModelResolution, read_code_model_record
+
+        res = getattr(svc, "code_model_resolution", None)
+        if not prefix or not isinstance(res, CodeModelResolution):
+            return False
+        rec = read_code_model_record(prefix)
+        before = res.recorded.model if res.recorded else None
+        return before != (rec.model if rec else None)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _get_embedding_service():
     """Return a cached EmbeddingService instance for this MCP session.
 
@@ -119,24 +140,43 @@ def _get_embedding_service():
       * Construction raised NoEmbeddingBackendError recently (within the
         10-second retry window — avoids hammering already-down services).
 
-    On None, the legacy inline helpers below fall through to their
-    original HTTP-call bodies, which preserves backward compatibility
-    for half-migrated installs and lets each helper produce its own
-    "service unreachable" error rather than masking it with a generic
-    one.
+    On None, the WRITE/backfill helpers below fall through to their inline
+    HTTP bodies, each of which embeds with its OWN named model into that
+    model's slot (a transport fallback, never a model substitution). The
+    SEARCH paths never do: they raise the loud
+    ``vco_lib.embed_outage.EmbeddingBackendUnavailable`` (owner ruling
+    2026-10-10 — a query embedded by another model searches noise). The
+    construction error is kept on ``server._embed_service_construction_error``
+    so that loud text can quote it.
     """
     from . import server
     if not server.HAS_EMBEDDING_SERVICE:
         return None
-    if server._cached_embed_service is not None:
-        return server._cached_embed_service
-
     import time as _time
+
+    if server._cached_embed_service is not None:
+        # v0.2.102 W6-B2: a long-lived MCP must not keep querying the PRE-flip
+        # space after a fill completes (or a re-walk records another model) —
+        # re-read the cheap DB record at most every _RECORD_RECHECK_SECS and
+        # rebuild the service when it changed.
+        now = _time.monotonic()
+        if now - getattr(server, "_embed_record_checked_at", 0.0) < _RECORD_RECHECK_SECS:
+            return server._cached_embed_service
+        server._embed_record_checked_at = now
+        if not _code_record_changed(server._cached_embed_service,
+                                    getattr(server, "CODE_GRAPH_PROJECT", None) or ""):
+            return server._cached_embed_service
+        server.logger.info("weaviate-kg: the code graph's recorded model changed — "
+                           "rebuilding the embedding service")
+        server._cached_embed_service = None
     if (_time.monotonic() - server._embed_service_construction_failed_at) < server._EMBED_SERVICE_RETRY_WINDOW:
         return None  # in the retry window — don't probe again yet
 
     try:
-        server._cached_embed_service = server.EmbeddingService.for_project()
+        # v0.2.102 W6-B2: the code leg embeds in the space THIS project's
+        # code graph is recorded as indexed in (vco_lib.code_embed_model).
+        server._cached_embed_service = server.EmbeddingService.for_project(
+            codegraph_prefix=getattr(server, "CODE_GRAPH_PROJECT", None) or None)
         return server._cached_embed_service
     except server.NoEmbeddingBackendError as e:
         server.logger.warning(
@@ -146,6 +186,7 @@ def _get_embedding_service():
             server._EMBED_SERVICE_RETRY_WINDOW,
         )
         server._embed_service_construction_failed_at = _time.monotonic()
+        server._embed_service_construction_error = str(e)
         return None
     except Exception as e:
         server.logger.warning(
@@ -154,6 +195,7 @@ def _get_embedding_service():
             e,
         )
         server._embed_service_construction_failed_at = _time.monotonic()
+        server._embed_service_construction_error = str(e)
         return None
 
 
@@ -309,11 +351,15 @@ async def get_embedding(text: str) -> list[float] | None:
         return None  # Let Weaviate's text2vec module handle it
 
     if server.ACTIVE_EMBEDDING == "openai":
+        # Owner ruling 2026-10-10: never another embedding model — an OpenAI
+        # failure is NOT answered with an Ollama vector (a different space
+        # stored under the OpenAI slot). None = the caller's loud degrade.
         vec = await server.get_openai_embedding(text)
-        if vec:
-            return vec
-        # Fall back to Ollama if OpenAI fails
-        server.logger.warning("OpenAI embedding failed, falling back to Ollama")
+        if not vec:
+            server.logger.error(
+                "OpenAI embedding failed; no other embedding model is used "
+                "(the vectors would not be comparable)")
+        return vec or None
 
     return await server.get_ollama_embedding(text)
 
@@ -555,76 +601,28 @@ async def _get_search_vector(
     ``embed_code`` unprefixed. ``task`` selects the per-use instruction
     sentence (see ``chunking.QUERY_TASKS``); ``None`` uses the scheme default.
 
-    Falls through to the legacy ACTIVE_EMBEDDING-branching path when
-    the service is unavailable (that path is UNPREFIXED — a half-migrated
-    install's degraded fallback; the prefix table needs the resolved model).
+    No legacy fallback (owner ruling 2026-10-10): when the service is
+    unavailable or its backend stays down past the transient retry, this
+    raises ``vco_lib.embed_outage.EmbeddingBackendUnavailable`` carrying the
+    loud text (backend, container, watchdog state, remedy) — the pre-v0.2.102
+    ACTIVE_EMBEDDING branch embedded with whatever the env named (a code
+    query with CodeSage on a jina-indexed graph) and searched noise.
 
     Args:
         text: Text to embed.
         scheme: 'kg' or 'code' — determines text vs code backend.
         task: QUERY_TASKS key (KG search / hook injection / code-nl / code-sim).
     """
+    from vco_lib.embed_outage import embed_query_or_raise
+
     from . import server
     svc = server._get_embedding_service()
-    if svc is not None:
-        try:
-            if scheme == "code":
-                vec = await asyncio.to_thread(svc.embed_code_query, text, task)
-                target = svc.code_vector_slot
-            else:
-                vec = await asyncio.to_thread(svc.embed_text_query, text, task)
-                target = svc.text_vector_slot
-            return vec, target
-        except Exception as e:
-            server.logger.warning(
-                "_get_search_vector via EmbeddingService failed (%s); "
-                "falling back to legacy ACTIVE_EMBEDDING branching", e
-            )
-
-    # Legacy fallback path (pre-v0.2.18): branches on ACTIVE_EMBEDDING.
-    if server.ACTIVE_EMBEDDING == "openai" and server.OPENAI_API_KEY:
-        vec = await server.get_openai_embedding(text)
-        if vec:
-            return vec, "openai_embed"
-        # Audit fix (2026-04-30): on openai failure, do NOT silently fall
-        # through to qwen3/arctic below — that mixes embedding spaces and
-        # surfaces poor results without any signal to the caller. Log the
-        # failure and return None; the caller will see a clear error.
-        server.logger.warning(
-            "_get_search_vector: ACTIVE_EMBEDDING=openai but OpenAI call "
-            "failed; refusing to fall back to legacy embedder (would "
-            "produce results from a different vector space). Caller will "
-            "receive None."
-        )
-        return None, ""
-
-    if scheme == "code":
-        if server.ACTIVE_EMBEDDING in ("codesage", "qwen3"):
-            # Use new CodeSage model (default for code)
-            # Review E2 (v0.2.102): this branch is reached only on the
-            # DEGRADED path (EmbeddingService unavailable/failed) and serves
-            # an INTERACTIVE query — the inline CodeEmbed fallback must run
-            # at the interactive tolerance, never the 420 s batch one.
-            from vco_lib.retry_after import resolve_503_interactive_tolerance
-
-            vec = await server.get_code_embedding(
-                text, tolerance_secs=resolve_503_interactive_tolerance()
-            )
-            target = "codesage_embed"
-        else:
-            # Legacy: Jina via Ollama
-            vec = await server.get_legacy_code_embedding(text)
-            target = "ollama_code_embed"
-    else:
-        if server.ACTIVE_EMBEDDING in ("qwen3", "codesage"):
-            # Use new Qwen3-Embedding (default for KG)
-            vec = await server.get_ollama_embedding(text)
-            target = "qwen3_embed"
-        else:
-            # Legacy: Arctic via Ollama
-            vec = await server.get_legacy_text_embedding(text)
-            target = "ollama_embed"
-    return vec, target
+    vec = await asyncio.to_thread(
+        embed_query_or_raise, scheme, svc, text, task,
+        construction_error=getattr(server, "_embed_service_construction_error", ""),
+    )
+    assert svc is not None  # embed_query_or_raise raised for a missing service
+    return vec, (svc.code_vector_slot if scheme == "code" else svc.text_vector_slot)
 
 
 async def count_tokens_async(text: str) -> int:
@@ -675,7 +673,34 @@ async def get_code_embedding(
                 "EmbeddingService.embed_code failed (%s); falling back to inline CodeEmbed call",
                 e,
             )
+    # v0.2.102 W6-B2 (owner ruling 2026-10-10): this vector lands in the
+    # CodeSage slot, so the container must SERVE CodeSage — on a 6-12 GB / AMD
+    # host its ``backend=ollama`` proxies another model, whose vector would be
+    # stored as CodeSage's. An unreported name (down / restarting) is not
+    # judged here: the inline leg's transient retry owns that.
+    served = await asyncio.to_thread(_container_model_name, server.CODE_EMBED_SERVICE_URL)
+    if served and "codesage" not in served.lower():
+        server.logger.error(
+            "get_code_embedding: the code_embed container at %s serves %r, not "
+            "CodeSage — no CodeSage vector is produced (never another model's)",
+            server.CODE_EMBED_SERVICE_URL, served,
+        )
+        return None
     return await server._inline_code_embed_http(text, tolerance_secs=tolerance_secs)
+
+
+def _container_model_name(url: str) -> "str | None":
+    """The model the code_embed container reports on ``/health`` (None when
+    it does not answer). Soft-fails to None."""
+    try:
+        import requests
+
+        from vco_lib.embedding_providers.codeembed import CodeEmbedAdapter
+
+        with requests.Session() as session:
+            return CodeEmbedAdapter(url, session, timeout=5.0).model_name
+    except Exception:  # noqa: BLE001
+        return None
 
 
 async def _inline_code_embed_http(
@@ -836,79 +861,42 @@ async def get_code_query_embedding(text: str, task: str | None = None) -> list[f
 
     MUST MATCH ``templates/scripts/query_code_graph.py::generate_code_embedding``.
 
-    v0.2.102 r3 — the INTERACTIVE tolerance. This is the path a
-    ``search_code_graph`` / ``query_code_structure`` tool call waits on, so it
-    must NOT inherit the 420 s batch tolerance (round-2 regression: a
-    persistently-503 service blocked the caller's turn for up to ~840 s — the
-    svc leg's 420 s plus a SECOND full tolerance in the inline fallback). Two
-    rules, per the re-review's fix:
-
-    * the svc leg runs under the interactive bound
-      (``VCO_EMBED_503_INTERACTIVE_TOLERANCE_SECS``, default 90 s, clamped to
-      the batch tolerance) via the context override — the PRODUCTION retry
-      loop inside ``embed_code_query`` resolves its tolerance per call, so no
-      parameter needs threading through the batch call sites;
-    * the inline fallback runs ONLY for NON-503 unavailability (svc not
-      constructed, backend down, connection refused) — never as a second full
-      retry after the first leg already proved the backend persistently
-      503ing. Tolerance exhaustion returns None immediately (the tool's
-      "Failed to generate query embedding" degrade path).
+    v0.2.102 W6-B2 (owner ruling 2026-10-10): ONE entry,
+    ``vco_lib.embed_outage.embed_query_or_raise`` — the interactive 503
+    bound, the restart wait, and NO inline CodeEmbed fallback (that endpoint
+    serves CodeSage; a jina/qwen3/OpenAI-indexed graph queried with it
+    searches noise). A backend that stays down raises
+    ``EmbeddingBackendUnavailable`` — ``search_code_graph`` returns its loud
+    text instead of "Failed to generate query embedding".
     """
-    from . import server
-    # vco_lib import is a hard requirement of the whole MCP process (the
-    # loud-fail discipline) — deliberately OUTSIDE any try below.
-    from vco_lib.retry_after import (
-        is_503_error,
-        reset_503_tolerance_override,
-        resolve_503_interactive_tolerance,
-        set_503_tolerance_override,
-    )
+    from vco_lib.embed_outage import embed_query_or_raise
 
-    tolerance = resolve_503_interactive_tolerance()
+    from . import server
     svc = server._get_embedding_service()
-    if svc is not None:
-        token = set_503_tolerance_override(tolerance)
-        try:
-            return await asyncio.to_thread(svc.embed_code_query, text, task)
-        except Exception as e:
-            if is_503_error(e):
-                # Tolerance EXHAUSTION, not unavailability: the first leg just
-                # proved the backend persistently 503ing — handing it a second
-                # full tolerance (the old svc→inline chain) is the double-
-                # tolerance defect. Fail fast instead.
-                server.logger.error(
-                    "embed_code_query still 503 after the interactive bound "
-                    "(%.0fs); giving up without the inline fallback",
-                    tolerance,
-                )
-                return None
-            server.logger.warning(
-                "EmbeddingService.embed_code_query failed (%s); falling back to inline CodeEmbed call",
-                e,
-            )
-        finally:
-            reset_503_tolerance_override(token)
-    # Legacy fallback (svc unavailable / non-503 unavailability): direct
-    # CodeEmbed HTTP call — at the INTERACTIVE tolerance, not a second batch one.
-    return await server._inline_code_embed_http(text, tolerance_secs=tolerance)
+    return await asyncio.to_thread(
+        embed_query_or_raise, "code", svc, text, task,
+        construction_error=getattr(server, "_embed_service_construction_error", ""),
+    )
 
 
 def _active_code_query_slot() -> str:
     """Return the active code-vector slot for a query's ``target_vector``.
 
     v0.2.73 C-6: mirrors the CLI's
-    ``query_code_graph.py::_active_code_vector_slot`` EXACTLY — svc present
-    → its resolved ``code_vector_slot``; svc None → ``"codesage_embed"``
-    (the CLI's unconditional pre-v0.2.18 fallback). Kept as a named helper
-    so both search + any future code-query call site cannot re-fork the
-    fallback.
+    ``query_code_graph.py::_active_code_vector_slot`` EXACTLY. svc None
+    raises the loud ``EmbeddingBackendUnavailable`` (v0.2.102 W6-B2: the old
+    ``"codesage_embed"`` default named a slot the graph may not be indexed in).
 
     MUST MATCH ``templates/scripts/query_code_graph.py::_active_code_vector_slot``.
     """
     from . import server
     svc = server._get_embedding_service()
     if svc is None:
-        return "codesage_embed"
+        from vco_lib.embed_outage import query_unavailable
+
+        raise query_unavailable(
+            "code", None,
+            construction_error=getattr(server, "_embed_service_construction_error", ""))
     return svc.code_vector_slot
 
 

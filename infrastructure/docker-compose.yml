@@ -257,7 +257,9 @@ services:
       - "${CODE_EMBED_PORT:-11440}:11440"
     environment:
       CODE_EMBED_BACKEND: "${CODE_EMBED_BACKEND:-gpu}"
-      CODE_EMBED_MODEL: "codesage/codesage-large-v2"
+      # v0.2.102 W6-B2: follows the backend (install writes it to .env from the
+      # tier table — an Ollama-served model for CODE_EMBED_BACKEND=ollama).
+      CODE_EMBED_MODEL: "${CODE_EMBED_MODEL:-codesage/codesage-large-v2}"
       CODE_EMBED_DEVICE: "auto"
       CODE_EMBED_DTYPE: "bfloat16"
       CODE_EMBED_PORT: "11440"

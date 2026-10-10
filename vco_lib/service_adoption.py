@@ -1750,9 +1750,15 @@ def adopt_services(
     return result
 
 
-def _derive_embed_config() -> dict:
+def _derive_embed_config(install_code_model: Optional[str] = None) -> dict:
     """Minimal embed config for ``compose_env.write_infrastructure_env``:
-    GPU vendor from the host probe (the ONE home), backend accordingly."""
+    GPU vendor from the host probe (the ONE home); the code model is the
+    install tier table's answer (``app_state.default_code_embedding``, what
+    install.py wrote) and the container backend FOLLOWS it (v0.2.102 W6-B2,
+    re-review LOW-7: serving follows the model — CodeSage → the container's
+    gpu backend, an Ollama model → ``ollama``, so the written
+    ``CODE_EMBED_MODEL`` is one that backend serves). With no install default
+    recorded, the pre-v0.2.102 vendor rule stands."""
     vendor = ""
     try:
         from vco_lib import gpu_device as _gpu_device
@@ -1762,6 +1768,19 @@ def _derive_embed_config() -> dict:
             vendor = str(getattr(gpus[0], "vendor", "") or "")
     except Exception:  # noqa: BLE001 — probe failure ⇒ no substitution keys
         vendor = ""
+    from vco_lib.code_embed_serving import APP_STATE_KEY_DEFAULT_CODE_EMBED, container_pairing
+
+    if install_code_model is None:
+        try:
+            from vco_lib.launcher_db_reader import read_app_state_value
+
+            install_code_model = read_app_state_value(APP_STATE_KEY_DEFAULT_CODE_EMBED)
+        except Exception:  # noqa: BLE001 — unreadable ⇒ the vendor rule
+            install_code_model = None
+    model = (install_code_model or "").strip()
+    pairing = container_pairing(model) if model else None
+    if pairing is not None:
+        return {"gpu_vendor": vendor, "code_backend": pairing[0], "code_model": model}
     return {"gpu_vendor": vendor, "code_backend": "gpu" if vendor else "ollama"}
 
 

@@ -273,7 +273,7 @@ class ZaiZeroMessageStartTests(FlaggedVendorTestBase):
         self.assertEqual(resp.status, 200)
         await resp.read()
         gateway = self.client.app[APP_KEY]
-        await gateway.usage.drain()
+        await gateway.quiesce()  # handlers finished + appends drained
         rows = [
             json.loads(line)
             for line in self.usage_ledger_path.read_text(

@@ -48,6 +48,7 @@ for _p in (str(_REPO_ROOT), str(_REPO_ROOT / "claude_mcp_servers")):
         sys.path.insert(0, _p)
 
 import vco_lib.retry_after as ra  # noqa: E402  (RED-PROOF: absent pre-fix)
+from vco_lib.embed_outage import EmbeddingBackendUnavailable  # noqa: E402
 from vco_lib.embedding_providers import codeembed as ce  # noqa: E402
 from vco_lib.embedding_service import (  # noqa: E402
     _EMBED_503_RETRY_BACKOFFS,
@@ -461,6 +462,14 @@ def test_tolerance_override_binds_the_shared_resolver(monkeypatch):
     assert ra.resolve_503_tolerance() == 420.0, "reset restores the batch value"
 
 
+def _run_query(text):
+    """Run the MCP query path; return the vector or the raised loud error."""
+    try:
+        return asyncio.run(emb.get_code_query_embedding(text))
+    except EmbeddingBackendUnavailable as exc:
+        return exc
+
+
 @pytest.fixture()
 def fake_query_env(monkeypatch):
     """Fake ``weaviate_mcp.server`` carrying BOTH a fake EmbeddingService (svc)
@@ -514,10 +523,12 @@ def test_interactive_query_persistent_503_gives_up_within_the_interactive_bound(
     svc.embed_code_query = _embed_code_query
 
     t0 = time.monotonic()
-    out = asyncio.run(emb.get_code_query_embedding("def f(): pass"))
+    out = _run_query("def f(): pass")
     elapsed = time.monotonic() - t0
 
-    assert out is None, "a spent interactive bound degrades to None (the tool's fail-safe)"
+    assert isinstance(out, EmbeddingBackendUnavailable), (
+        "a spent interactive bound is the LOUD busy error (W6-B2), not None")
+    assert "busy" in str(out) and "503" in str(out)
     assert state["inline_calls"] == 0, (
         "NO second tolerance via the inline fallback after 503 exhaustion"
     )
@@ -525,16 +536,15 @@ def test_interactive_query_persistent_503_gives_up_within_the_interactive_bound(
     assert calls["n"] > 1, "the svc leg genuinely retried before giving up"
 
 
-def test_interactive_query_connection_refused_still_uses_the_fallback(
+def test_interactive_query_connection_refused_never_uses_another_endpoint(
     monkeypatch, fake_query_env
 ):
-    """LEAVE-ALONE pin (green before+after): NON-503 unavailability — svc
-    construction failure / connection refused — still falls through to the
-    inline CodeEmbed fallback; only 503-tolerance exhaustion must not."""
+    """Owner ruling 2026-10-10 (W6-B2): NON-503 unavailability is a LOUD
+    error — the raw CodeEmbed endpoint (it serves CodeSage, whatever the graph
+    is indexed in) is never asked instead. Pre-W6-B2 this fell through to the
+    inline fallback and returned its vector."""
     fake, svc, state = fake_query_env
-    monkeypatch.delenv("VCO_EMBED_503_RETRY_DELAY", raising=False)
-    monkeypatch.delenv("VCO_EMBED_503_TOLERANCE_SECS", raising=False)
-    monkeypatch.delenv("VCO_EMBED_503_INTERACTIVE_TOLERANCE_SECS", raising=False)
+    monkeypatch.setenv("VCO_EMBED_503_RETRY_DELAY", "0")
 
     def _refused(text, task=None):
         raise ConnectionError("[Errno 111] Connection refused")
@@ -544,40 +554,30 @@ def test_interactive_query_connection_refused_still_uses_the_fallback(
         _FakeAioResponse(200, payload={"embedding": [0.3, 0.4]})
     ]
 
-    out = asyncio.run(emb.get_code_query_embedding("x"))
+    out = _run_query("x")
 
-    assert out == [0.3, 0.4]
-    assert state["inline_calls"] == 1
+    assert isinstance(out, EmbeddingBackendUnavailable)
+    assert "never queried with a different embedding model" in str(out)
+    assert state["inline_calls"] == 0
+    assert _FakeAioSession.posts == []
 
 
-def test_query_path_inline_fallback_uses_the_interactive_tolerance(
-    monkeypatch, fake_query_env
-):
-    """RED-PROOF (r3): when the query path DOES reach the inline fallback (svc
-    unconfigured), the fallback retries at the INTERACTIVE tolerance, not the
-    batch one. Pre-fix the fallback had no tolerance parameter and always used
-    the batch knob (1.0 s here → the red run takes ≥ 1 s; post-fix the 0.2 s
-    interactive bound wins)."""
+def test_query_path_without_a_service_is_loud(monkeypatch, fake_query_env):
+    """W6-B2: an unconfigured service is the loud error naming the
+    construction failure — no inline CodeEmbed post at any tolerance."""
     fake, svc, state = fake_query_env
-    monkeypatch.delenv("VCO_EMBED_503_RETRY_DELAY", raising=False)
-    monkeypatch.setenv("VCO_EMBED_503_TOLERANCE_SECS", "1.0")
-    monkeypatch.setenv("VCO_EMBED_503_INTERACTIVE_TOLERANCE_SECS", "0.2")
-    fake._get_embedding_service = lambda: None  # svc unconfigured → fallback
+    fake._get_embedding_service = lambda: None
+    fake._embed_service_construction_error = "Ollama did not answer"
     _FakeAioSession.script = [
-        _FakeAioResponse(503, headers={"Retry-After": "0.01"})
+        _FakeAioResponse(200, payload={"embedding": [0.3, 0.4]})
     ]
 
-    t0 = time.monotonic()
-    out = asyncio.run(emb.get_code_query_embedding("x"))
-    elapsed = time.monotonic() - t0
+    out = _run_query("x")
 
-    assert out is None
-    assert state["inline_calls"] == 1
-    assert len(_FakeAioSession.posts) > 3, "it retried, not posted once"
-    assert elapsed < 0.7, (
-        "the query-path fallback must stop at the interactive bound (0.2 s), "
-        "not the batch one (1.0 s)"
-    )
+    assert isinstance(out, EmbeddingBackendUnavailable)
+    assert "Ollama did not answer" in str(out)
+    assert state["inline_calls"] == 0
+    assert _FakeAioSession.posts == []
 
 
 def test_inline_fallback_default_tolerance_is_the_batch_one(

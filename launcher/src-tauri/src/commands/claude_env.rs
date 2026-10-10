@@ -45,48 +45,16 @@ fn resolve_env_file(db: &Db, project_id: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
-/// Parse a single line of `.claude/env`. Returns `Some((key, value))` if the
-/// line is a non-comment `KEY=VALUE` form; `None` otherwise (blank lines,
-/// comments, malformed lines).
-fn parse_kv_line(line: &str) -> Option<(&str, &str)> {
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-        return None;
-    }
-    let (k, v) = line.split_once('=')?;
-    let key = k.trim();
-    if key.is_empty() {
-        return None;
-    }
-    Some((key, v))
-}
+/// The line parser and the reader live in ONE home,
+/// `vct_launcher_core::services::env_file` (v0.2.102 W6-B2 — the hub's
+/// infra watchdog reads `infrastructure/.env` with the same code).
+use vct_launcher_core::services::env_file::parse_kv_line;
 
-/// Read the value of `key` from `path`, if the file exists and the key is
-/// present. Any `KEY=VALUE` env file — `module_gui` also reads the
-/// orchestrator's `infrastructure/.env` with it (v0.2.97). Returns:
-///   * `Ok(Some(value))` — file present, key found (last occurrence wins,
-///     mirroring shell `source` semantics).
-///   * `Ok(None)` — file missing OR key absent.
-///   * `Err(_)` — IO error other than NotFound (permission denied, etc.).
+/// Read the value of `key` from `path` — see
+/// [`vct_launcher_core::services::env_file::read_key`]. Any `KEY=VALUE` env
+/// file — `module_gui` also reads the orchestrator's `infrastructure/.env`.
 pub(crate) fn read_key(path: &Path, key: &str) -> Result<Option<String>, String> {
-    let raw = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("read {}: {}", path.display(), e)),
-    };
-    let mut found: Option<String> = None;
-    for line in raw.lines() {
-        if let Some((k, v)) = parse_kv_line(line) {
-            if k == key {
-                // Preserve the value verbatim (no trim) so values with
-                // intentional trailing spaces — unusual but legal — survive
-                // a read/write round-trip. Hook-side `[ "$X" = "off" ]`
-                // will fail for `off ` anyway, which is the user's call.
-                found = Some(v.to_string());
-            }
-        }
-    }
-    Ok(found)
+    vct_launcher_core::services::env_file::read_key(path, key)
 }
 
 /// Atomically write `path` so it contains exactly one `KEY=VALUE` line for

@@ -125,3 +125,7 @@ pub mod watchdog_pause;
 // bounded identity-checked exe walk; standby-aware, never writes launcher.db
 // while install.py holds it). Every launcher/hub root resolver delegates here.
 pub mod install_root;
+// v0.2.102 W6-B2: the ONE `KEY=VALUE` env-file reader — the launcher's
+// `.claude/env` / `infrastructure/.env` reads and the hub watchdog's
+// `CODE_EMBED_IN_STACK` marker read share it.
+pub mod env_file;

@@ -177,45 +177,28 @@ def test_node_formats_prefers_the_ladder_model(monkeypatch):
                           ["qwen3.5:9b", "gemma4:e4b"]) == "gemma4:e4b"
 
 
-# ─── item 2: code-graph CLI raw CodeEmbed fallback retries ───────────────
+# ─── item 2: code-graph CLI raw CodeEmbed fallback — SUPERSEDED ──────────
+#
+# v0.2.102 W6-B2 (owner ruling 2026-10-10, no fallback to a different embedding
+# model): the CLI's raw CodeEmbed query leg is removed — that endpoint serves
+# CodeSage whatever the graph is indexed in. Its transient retries now live in
+# the ONE query entry (vco_lib.embed_outage.embed_query_or_raise, the service's
+# container wait); the shared raw-HTTP helper post_code_embed keeps its own
+# retry pins (tests/test_v02102_w4g_interactive_refused_bound.py).
 
 
-def test_query_code_graph_codeembed_fallback_retries_503(monkeypatch):
+def test_query_code_graph_has_no_raw_codeembed_query_leg(monkeypatch):
     qcg = importlib.import_module("query_code_graph")
     import requests
 
-    calls: list = []
-
-    def _post(url, json=None, timeout=None, **kw):  # noqa: A002
-        calls.append(url)
-        resp = mock.MagicMock()
-        if len(calls) < 3:
-            resp.status_code, resp.text = 503, "busy"
-        else:
-            resp.status_code = 200
-            resp.json.return_value = {"embedding": [0.5, 0.5]}
-        return resp
-
-    monkeypatch.setattr(qcg, "_get_or_create_embedding_service", lambda: None)
-    monkeypatch.setattr(requests, "post", _post)
-    assert qcg.generate_code_embedding("def f(): pass") == [0.5, 0.5]
-    assert len(calls) == 3 and calls[0].endswith("/api/embeddings")
-
-
-def test_query_code_graph_codeembed_non_transient_is_not_retried(monkeypatch):
-    qcg = importlib.import_module("query_code_graph")
-    import requests
+    from vco_lib.embed_outage import EmbeddingBackendUnavailable
 
     calls: list = []
-
-    def _post(url, **kw):
-        calls.append(url)
-        return SimpleNamespace(status_code=400, text="bad")
-
     monkeypatch.setattr(qcg, "_get_or_create_embedding_service", lambda: None)
-    monkeypatch.setattr(requests, "post", _post)
-    assert qcg.generate_code_embedding("x") is None
-    assert len(calls) == 1
+    monkeypatch.setattr(requests, "post", lambda url, **kw: calls.append(url))
+    with pytest.raises(EmbeddingBackendUnavailable):
+        qcg.generate_code_embedding("def f(): pass")
+    assert calls == []
 
 
 # ─── item 6: W4-H review F1-F3 ───────────────────────────────────────────

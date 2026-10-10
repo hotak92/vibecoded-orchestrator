@@ -540,11 +540,22 @@ def enrich_collection_vectors(
     live_vc = schema.get("vectorConfig") or {}
     if new_slot not in live_vc:
         present = sorted(live_vc.keys())
+        # v0.2.102 W6-B2: migrate-collections only plans CODE collections for
+        # an index-type change, so for them the remedy that actually adds the
+        # slot (additively) and fills it is the analyzer's explicit apply.
+        remedy = (
+            "Select the model in launcher Preferences → Code Graph Embeddings "
+            "(or the project's Codegraph tab) and re-run `.claude/scripts/"
+            f"code-graph-analyze . --project {collection_name.rpartition('_')[0]}` "
+            "— the analyzer adds the slot non-destructively and embeds only the "
+            "rows without it."
+            if is_code_collection(collection_name) else
+            "Run `python -m vco_lib.project_init migrate-collections "
+            "--name <project>` first to add the slot non-destructively."
+        )
         raise SlotNotInSchemaError(
             f"Slot {new_slot!r} is in the catalog but not in the live "
-            f"schema of {collection_name!r}. Live slots: {present}. "
-            f"Run `python -m vco_lib.project_init migrate-collections "
-            f"--name <project>` first to add the slot non-destructively."
+            f"schema of {collection_name!r}. Live slots: {present}. {remedy}"
         )
 
     # ── Pre-flight 4: EmbeddingService + backend reachability ───────────
@@ -554,7 +565,16 @@ def enrich_collection_vectors(
         # is reachable AND captures the failure into the JSONL log +
         # EMBEDDING_FAILURES.md hint. We don't catch — that's the
         # signal the user is supposed to see.
-        embedding_service = EmbeddingService.for_project(project_root=project_root)
+        # v0.2.102 W6-B2: a code collection is filled with ITS graph's TARGET
+        # model (the one resolver, write role); the walk below refuses a
+        # new_slot that is not that model's slot (it used to fill any slot
+        # with whatever model the env resolved).
+        prefix, _sep, _base = collection_name.rpartition("_")
+        embedding_service = EmbeddingService.for_project(
+            project_root=project_root,
+            codegraph_prefix=prefix if is_code_collection(collection_name) and _sep else None,
+            code_model_role="write",
+        )
 
     try:
         kind = "code" if is_code_collection(collection_name) else "text"
@@ -590,6 +610,13 @@ def enrich_collection_vectors(
             else embedding_service.text_vector_slot
         )
         same_active = active_slot == new_slot
+        if kind == "code" and not same_active:
+            raise SlotNotInSchemaError(
+                f"{collection_name!r}: slot {new_slot!r} is not the slot of this "
+                f"graph's selected code model ({getattr(embedding_service, 'code_model_id', '?')} → "
+                f"{active_slot!r}); a slot is only ever filled with its own "
+                "model's vectors. Select that model first."
+            )
 
         # ── Open Weaviate client ────────────────────────────────────
         if weaviate_client_factory is not None:
