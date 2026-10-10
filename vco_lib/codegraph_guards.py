@@ -131,6 +131,43 @@ def _coerce_rev(stored_rev: Any) -> Optional[int]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# v0.2.102 W6-B2 (re-review MEDIUM b): the FILL TALLY — the fill walk's own
+# counters. While a code-model fill walks the graph, every fingerprint read
+# against the TARGET slot is recorded per object (the ONE point-read every
+# skip/stamp/embed decision goes through), so the walk knows how many rows it
+# visited and how many lacked the target vector — completeness without a
+# second scan of every object. ``vco_lib.code_embed_model`` starts/stops it.
+# ---------------------------------------------------------------------------
+
+_FILL_TALLY: Optional[Dict[str, Any]] = None
+
+
+def start_fill_tally(slot: str) -> None:
+    global _FILL_TALLY
+    _FILL_TALLY = {"slot": slot, "rows": {}}
+
+
+def stop_fill_tally() -> Optional[Dict[str, Any]]:
+    """End the tally: ``{"slot", "visited", "lacking"}`` (rows read against the
+    slot, and how many of them had no vector there), or None when none ran."""
+    global _FILL_TALLY
+    tally, _FILL_TALLY = _FILL_TALLY, None
+    if tally is None:
+        return None
+    rows = tally["rows"]
+    return {"slot": tally["slot"], "visited": len(rows),
+            "lacking": sum(1 for present in rows.values() if present is not True)}
+
+
+def _tally_read(collection: Any, det_uuid: str, vector_slot: Optional[str],
+                present: Optional[bool]) -> None:
+    tally = _FILL_TALLY
+    if tally is not None and vector_slot == tally["slot"]:
+        key = (str(getattr(collection, "name", "") or id(collection)), str(det_uuid))
+        tally["rows"][key] = present
+
+
 def read_object_fingerprint(
     collection: Any,
     det_uuid: str,
@@ -174,6 +211,7 @@ def read_object_fingerprint(
         else:
             existing = fetch_by_id(det_uuid, return_properties=read_props)
         if existing is None:
+            _tally_read(collection, det_uuid, vector_slot, None)  # a new row
             return None
         existing_props = getattr(existing, "properties", None) or {}
         total_chunks: Optional[int] = None
@@ -191,6 +229,7 @@ def read_object_fingerprint(
             fingerprint["vector_present"] = slot_vector_present(
                 getattr(existing, "vector", None), vector_slot,
             )
+            _tally_read(collection, det_uuid, vector_slot, fingerprint["vector_present"])
         return fingerprint
     except Exception:  # noqa: BLE001 — any read failure → unknown → write
         return None

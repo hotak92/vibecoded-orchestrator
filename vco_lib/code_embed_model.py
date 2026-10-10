@@ -71,7 +71,7 @@ APP_STATE_KEY_CODE_EMBED_OVERRIDE = "code_embed_backend_override"
 APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL = "code_embed_openai_model"
 APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL = "code_embed_ollama_model"
 #: install.py's hardware-ladder pick / the "Default code embedding" dropdown.
-APP_STATE_KEY_DEFAULT_CODE_EMBED = "default_code_embedding"
+from vco_lib.code_embed_serving import APP_STATE_KEY_DEFAULT_CODE_EMBED  # noqa: E402,F401
 
 SOURCE_ENV = "env"
 SOURCE_PROJECT = "project"
@@ -133,6 +133,11 @@ class CodeModelResolution:
     carry: Optional[str] = None
     target_refused: bool = False
     refusal: Optional[OpenAIEmbeddingsConsentRefusal] = None
+
+    @property
+    def record_refused(self) -> bool:
+        return bool(self.recorded is not None and is_openai_code_model(self.recorded.model)
+                    and self.refusal is not None and self.model == self.recorded.model)
 
     @property
     def slot(self) -> str:
@@ -394,9 +399,16 @@ def resolve_code_model(
     elif same_code_model(target, record.model) or role == "query" or target_refusal:
         model, source = record.model, SOURCE_RECORDED
         filling = not same_code_model(target, record.model) and target_refusal is None
-    else:  # a write while the target fills
+    elif is_openai_code_model(record.model) and consent_refusal_for(
+            record.model, SOURCE_RECORDED, app_state) is not None:
+        # Re-review MEDIUM (a): an OpenAI-RECORDED graph cannot keep its
+        # vectors fresh without the embeddings consent, and a fill would strip
+        # them from every rewritten row — so no fill starts: the record stays
+        # and its own (refused) model is what this role gets — loud.
+        model, source = record.model, SOURCE_RECORDED
+    else:  # a write while the target fills; the record's vector rides along
         model, source, filling = target, target_source, True
-        carry = None if is_openai_code_model(record.model) else record.model
+        carry = record.model
     refusal = consent_refusal_for(model, source, app_state)
     return CodeModelResolution(
         model=model, source=source, target=target, target_source=target_source,
@@ -553,7 +565,10 @@ def _db_and_prefix(codegraph_prefix: str):
     return _discover_db_path(), canonical_prefix(codegraph_prefix)
 
 
-def write_fill_progress(codegraph_prefix: str, target: str, filled: int, total: int) -> bool:
+def write_fill_progress(codegraph_prefix: str, target: str, filled: int, total: int,
+                        *, revision: Optional[int] = None, source: str = "scan") -> bool:
+    """Stamp ``{target, filled, total, revision, source}`` on the binding row —
+    ``source`` is ``walk`` (the fill walk's own counters) or ``scan``."""
     from vco_lib.kg_binding_heal import stamp_codegraph_model_fill
 
     db_path, prefix = _db_and_prefix(codegraph_prefix)
@@ -561,7 +576,22 @@ def write_fill_progress(codegraph_prefix: str, target: str, filled: int, total: 
         return False
     return stamp_codegraph_model_fill(db_path, prefix, {
         "target": target, "filled": int(filled), "total": int(total),
-        "at": int(time.time() * 1000)})
+        "revision": revision, "source": source, "at": int(time.time() * 1000)})
+
+
+def current_embed_revision() -> Optional[int]:
+    """The code graph's current ``embed_revision`` (the analyzer constant the
+    resync driver already resolves) — a stamped fill counter is trusted only
+    at the revision it was counted at."""
+    try:
+        from pathlib import Path
+
+        from vco_lib.codegraph_resync import _resolve_embed_revision
+
+        analyzer = Path(__file__).resolve().parents[1] / "templates" / "scripts" / "analyze_code_graph.py"
+        return int(_resolve_embed_revision(analyzer)) if analyzer.is_file() else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _default_client():
@@ -603,21 +633,49 @@ def scan_slot_fill(
                 pass
 
 
+def _counters_consistent(counters: Optional[Mapping[str, Any]], target: str,
+                         total: Optional[int], revision: Optional[int]) -> bool:
+    """Trust stamped/walk counters only when they are about THIS target, at
+    THIS revision, against the graph's CURRENT object count, and add up."""
+    if not counters or total is None:
+        return False
+    try:
+        filled, counted_total = int(counters["filled"]), int(counters["total"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (same_code_model(str(counters.get("target") or ""), target)
+            and counted_total == total and 0 <= filled <= total
+            and (revision is None or counters.get("revision") in (None, revision)))
+
+
 def settle_fill(
-    codegraph_prefix: str, target: str, *, client_factory: Optional[Callable[[], Any]] = None,
+    codegraph_prefix: str, target: str, *, counters: Optional[Mapping[str, Any]] = None,
+    client_factory: Optional[Callable[[], Any]] = None,
+    weaviate_url: Optional[str] = None,
 ) -> Optional[str]:
-    """Measure the target's slot: COMPLETE → flip the record to the target
-    (searches move to it; returns ``"complete"``); otherwise store the
-    progress (returns ``"filling"``). None when it cannot be measured."""
+    """Settle the target's slot: COMPLETE → flip the record to the target
+    (searches move to it; ``"complete"``); otherwise stamp the progress
+    (``"filling"``). None when it cannot be measured.
+
+    Re-review MEDIUM (b): completeness comes from ``counters`` — the fill
+    walk's own tally, or the progress stamped on the binding row — checked
+    against the graph's current object count (five cheap aggregates). The full
+    vector scan runs ONLY when counters are missing or inconsistent."""
     slot, dim = code_model_slot(target)
-    measured = scan_slot_fill(codegraph_prefix, slot, client_factory=client_factory)
-    if measured is None:
-        return None
-    filled, total = measured
+    revision = current_embed_revision()
+    total = count_code_objects(codegraph_prefix, weaviate_url=weaviate_url)
+    if counters is not None and total is not None and _counters_consistent(
+            counters, target, total, revision):
+        filled, source = int(counters["filled"]), str(counters.get("source") or "walk")
+    else:
+        measured = scan_slot_fill(codegraph_prefix, slot, client_factory=client_factory)
+        if measured is None:
+            return None
+        (filled, total), source = measured, "scan"
     if filled == total:
         write_code_model_record(codegraph_prefix, CodeModelRecord(target, dim, slot))
         return "complete"
-    write_fill_progress(codegraph_prefix, target, filled, total)
+    write_fill_progress(codegraph_prefix, target, filled, total, revision=revision, source=source)
     return "filling"
 
 
@@ -643,6 +701,9 @@ class AnalyzerRunPlan:
 def _fill_line(prefix: str, res: CodeModelResolution, weaviate_url: Optional[str]) -> str:
     n = count_code_objects(prefix, weaviate_url=weaviate_url)
     cost = " through the OpenAI API (cost-bearing)" if is_openai_code_model(res.target) else ""
+    if res.carry and is_openai_code_model(res.carry):
+        cost += (f"; rows rewritten meanwhile also refresh their {res.carry} vector "
+                 "through the OpenAI API (cost-bearing)")
     return (f"[vct] code-embed: {prefix} moves to {res.target} (slot {code_model_slot(res.target)[0]}, "
             f"from {_SOURCE_LABEL.get(res.target_source, res.target_source)}); filling up to "
             f"{n if n is not None else '?'} object(s){cost} — existing vectors are kept, "
@@ -687,7 +748,11 @@ def prepare_analyzer_run(
               f"{codegraph_prefix} keeps {res.recorded.model if res.recorded else res.model}.",
               file=sys.stderr)
     if res.refusal is not None:
-        return AnalyzerRunPlan(record=res.recorded, model=res.model, refusal=str(res.refusal))
+        extra = (" The graph keeps its recorded OpenAI vectors; no fill to "
+                 f"{res.target} starts until the consent is on (or rebuild with "
+                 "--force-recreate)." if res.record_refused and not same_code_model(
+                     res.target, res.model) else "")
+        return AnalyzerRunPlan(record=res.recorded, model=res.model, refusal=str(res.refusal) + extra)
     if res.recorded is None:  # first build: make the target's slot exist, embed it
         err = ensure_slot_on_collections(codegraph_prefix, res.model, add=True,
                                          weaviate_url=weaviate_url)
@@ -708,6 +773,10 @@ def prepare_analyzer_run(
               f"{codegraph_prefix} keeps {base} this run.", file=sys.stderr)
         return AnalyzerRunPlan(record=res.recorded, model=base, role="query", target=res.target)
     print(_fill_line(codegraph_prefix, res, weaviate_url), flush=True)
+    if not scoped:  # the whole-graph walk counts its own reads against the target slot
+        from vco_lib import codegraph_guards
+
+        codegraph_guards.start_fill_tally(code_model_slot(res.target)[0])
     return AnalyzerRunPlan(record=res.recorded, model=res.target, target=res.target,
                            filling=True, rewalk=not scoped)
 
@@ -716,6 +785,7 @@ def finish_analyzer_run(
     codegraph_prefix: str, plan: AnalyzerRunPlan, service: Any, *, scoped: bool,
     client_factory: Optional[Callable[[], Any]] = None,
     repo_root: Any = None, index_dot_claude: bool = False,
+    stats: Optional[Mapping[str, Any]] = None, revision: Optional[int] = None,
 ) -> Optional[str]:
     """After a clean walk: a recreate stamps its model; a whole-graph run
     measures the target's slot and flips the record once it is complete (or
@@ -723,6 +793,9 @@ def finish_analyzer_run(
     detached full walk (:func:`spawn_fill_walk`)."""
     if scoped and plan.filling and repo_root is not None:
         return spawn_fill_walk(repo_root, codegraph_prefix, index_dot_claude=index_dot_claude)
+    from vco_lib import codegraph_guards
+
+    tally = codegraph_guards.stop_fill_tally()
     if plan.force_recreate:
         model = str(getattr(service, "code_model_id", "") or plan.model)
         slot, dim = code_model_slot(model)
@@ -731,7 +804,21 @@ def finish_analyzer_run(
         return "complete"
     if scoped or plan.refusal or not (plan.filling or plan.record is None):
         return None
-    return settle_fill(codegraph_prefix, plan.target or plan.model, client_factory=client_factory)
+    target = plan.target or plan.model
+    stats = stats or {}
+    clean = not any(int(stats.get(k, 0) or 0) for k in
+                    ("files_skipped", "insert_errors", "chunk_plan_failures"))
+    counters = None
+    if tally and clean and tally["slot"] == code_model_slot(target)[0]:
+        # Every row the walk visited holds the target vector now (it embedded
+        # the ones that lacked it and wrote nothing that failed).
+        counters = {"target": target, "filled": tally["visited"],
+                    "total": tally["visited"], "revision": revision, "source": "walk"}
+        total = count_code_objects(codegraph_prefix)
+        if total is not None:
+            counters["total"] = total
+            counters["filled"] = min(tally["visited"], total)
+    return settle_fill(codegraph_prefix, target, counters=counters, client_factory=client_factory)
 
 
 def fill_owed(codegraph_prefix: str) -> bool:
@@ -787,6 +874,7 @@ def project_status(
         "complete": bool(res.recorded) and not res.filling and not res.target_refused,
         "cost_bearing": is_openai_code_model(res.target),
         "target_refused": res.target_refused,
+        "record_refused": res.record_refused,
         "folder": folder,
     }
 
@@ -828,7 +916,8 @@ def reconcile_code_embedding(folder: Any, codegraph_prefix: str) -> Optional[str
                 res = resolve_code_model(codegraph_prefix=codegraph_prefix, record=live,
                                          project_target=target_from_binding(read_binding_row(codegraph_prefix)))
         if res.filling:
-            return settle_fill(codegraph_prefix, res.target)
+            return settle_fill(codegraph_prefix, res.target,
+                               counters=fill_from_binding(read_binding_row(codegraph_prefix)))
         return None
     except Exception as exc:  # noqa: BLE001 — never aborts a bundle run
         print(f"[vct] code-embed: self-heal skipped for {folder} ({exc})", file=sys.stderr)

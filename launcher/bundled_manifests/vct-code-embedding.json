@@ -5,7 +5,7 @@
   "id": "vct-code-embedding",
   "name": "Code Embedding Service",
   "version": "0.3.1",
-  "description": "GPU/CPU code embedding service (HTTP on port 11440 unless its CODE_EMBED_PORT setting says otherwise). Wraps CodeSage-Large-v2 (2048-dim, Apache-2.0) via sentence-transformers. Falls back to Ollama jina-v2-base-code on CPU-only setups.",
+  "description": "Serves CodeSage-Large-v2 code embeddings (2048-dim, Apache-2.0, sentence-transformers; HTTP on port 11440 unless its CODE_EMBED_PORT setting says otherwise). Used only by code graphs whose selected model is CodeSage; jina-v2-base-code and qwen3-embedding code graphs are embedded by Ollama directly, not by this service. In VCO's own install it is the code_embed container (infrastructure/docker-compose.yml), started on GPU hosts.",
   "publisher": "VibeCoded Tools",
   "repository": "https://github.com/VibeCoded-Tools/orchestrator",
 
@@ -58,7 +58,7 @@
     {
       "key": "CODE_EMBED_BACKEND",
       "prompt": "Embedding backend",
-      "description": "gpu = sentence-transformers on local GPU (needs 3GB VRAM); ollama = jina-v2-base-code via Ollama (CPU-friendly, lower quality)",
+      "description": "gpu = CodeSage via sentence-transformers (needs 3GB VRAM); ollama = the service only proxies the install tier's Ollama code model (no CodeSage) - code graphs on such hosts are embedded by Ollama directly. Chosen at install time.",
       "type": "string",
       "default": "gpu",
       "options": ["gpu", "ollama"],
@@ -96,8 +96,7 @@
     "cwd": "{install_dir}",
     "env_from_settings": ["CODE_EMBED_BACKEND", "CODE_EMBED_DEVICE", "CODE_EMBED_PORT"],
     "env_fixed": {
-      "PYTHONPATH": "{install_dir}",
-      "CODE_EMBED_MODEL": "codesage/codesage-large-v2"
+      "PYTHONPATH": "{install_dir}"
     },
     "health_check": {
       "type": "http_get",
@@ -109,6 +108,8 @@
     "auto_restart": true,
     "log_file": "{VCT_LOGS}/vct-code-embedding.log"
   },
+
+  "_model_note": "No CODE_EMBED_MODEL pin (v0.2.102 W6-B2): the service derives its model from CODE_EMBED_BACKEND (claude_mcp_servers/code_embedding_service/server.py: gpu -> codesage/codesage-large-v2, ollama -> an Ollama-served model), so this runtime can never pair a backend with a model it cannot serve. VCO's own container gets the install tier's model through the compose env file install writes (vco_lib/compose_env.py code_embed_service_model).",
 
   "_mcp_note": "Not an MCP — it's an HTTP service the weaviate-kg MCP calls internally.",
 

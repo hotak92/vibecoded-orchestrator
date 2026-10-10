@@ -1423,7 +1423,10 @@ impl Db {
     ///     touched — since v0.2.102 W6-B2 the code-model RECORD and the fill
     ///     progress are owned by `vco_lib.code_embed_model` (stamped when a
     ///     slot is complete), so commit/timestamp are the only facts a build
-    ///     can honestly advance.
+    ///     can honestly advance — and NOT the timestamp of a never-built SEED
+    ///     (a model, `last_analyzed_at` NULL): stamping it would make the
+    ///     seed's hardcoded codesage/2048 look like a real record (re-review
+    ///     LOW-10); the analyzer's own record stamp promotes it instead.
     ///   * UPDATE-only, never an upsert: hub-side we don't know the
     ///     canonical `collection_prefix`, and seeding a binding is the
     ///     launcher/build path's job. No binding → `Ok(false)` leave-alone.
@@ -1442,7 +1445,9 @@ impl Db {
             .execute(
                 "UPDATE project_codegraph_bindings
                     SET last_analyzed_commit = COALESCE(?2, last_analyzed_commit),
-                        last_analyzed_at = ?3,
+                        last_analyzed_at = CASE
+                            WHEN last_analyzed_at IS NULL AND embedding_model IS NOT NULL
+                            THEN NULL ELSE ?3 END,
                         updated_at = ?3
                   WHERE project_id = ?1",
                 params![project_id, analyzed_commit, analyzed_at],
@@ -2822,8 +2827,8 @@ mod tests {
     // ───── v0.2.91 (#31): detached-walk binding stamp ─────
 
     /// ACT: the terminal-report stamp advances commit + timestamp while
-    /// PRESERVING model/dim/prefix/enabled/config — the launcher-side
-    /// drift machinery owns those.
+    /// PRESERVING model/dim/prefix/enabled/config — the code-model record
+    /// owner (vco_lib.code_embed_model, v0.2.102) owns those.
     #[test]
     fn advance_codegraph_binding_stamps_commit_and_time_preserving_space() {
         let db = make_db();
@@ -2834,7 +2839,7 @@ mod tests {
             Some("CodeSage-Large-v2"),
             Some(2048),
             None,
-            None,
+            Some(1),
             true,
             &serde_json::json!({"configured_profile": "codesage"}),
         )
@@ -2858,6 +2863,23 @@ mod tests {
             b.config.get("configured_profile").and_then(|v| v.as_str()),
             Some("codesage")
         );
+    }
+
+    /// v0.2.102 W6-B2 (re-review LOW-10): a never-built SEED (model set,
+    /// `last_analyzed_at` NULL) is NOT promoted to a record by this stamp.
+    #[test]
+    fn advance_codegraph_binding_never_promotes_a_seed() {
+        let db = make_db();
+        seed_project(&db, "p1", "One");
+        db.set_project_codegraph_binding(
+            "p1", "ProjectOne", Some("codesage-large-v2"), Some(2048), None, None, true,
+            &JsonValue::Null,
+        )
+        .unwrap();
+        assert!(db.advance_codegraph_binding_analyzed("p1", Some("sha"), 7).unwrap());
+        let b = db.get_project_codegraph_binding("p1").unwrap().unwrap();
+        assert_eq!(b.last_analyzed_at, None, "the seed must not look like a record");
+        assert_eq!(b.last_analyzed_commit.as_deref(), Some("sha"));
     }
 
     /// Commit-unknown (non-git tree / provenance absent) PRESERVES the

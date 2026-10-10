@@ -209,7 +209,7 @@ describe('W6-B2 — the section shows each graph\'s recorded model, target and f
         .filter((n) => n.type === 'MemberExpression' && (n.property as Node)?.type === 'Identifier')
         .map((n) => (n.property as Node).name as string),
     );
-    for (const field of ['recorded_model', 'target_model', 'cost_bearing', 'target_refused']) {
+    for (const field of ['recorded_model', 'target_model', 'cost_bearing', 'target_refused', 'record_refused']) {
       expect(props.has(field), `status block reads p.${field}`).toBe(true);
     }
   });
@@ -252,8 +252,30 @@ describe('W6-B2 — OpenAI summaries and embeddings are separate toggles', () =>
       (i) => attrText(i, 'name') === 'code-embed-override' && attrText(i, 'value') === 'openai',
     ) as Node;
     const ids = identifiers(attr(radio, 'disabled'));
-    expect(ids.has('openaiEmbeddingsConsent')).toBe(true);
+    expect(ids.has('openaiEmbeddingsEffective')).toBe(true);
     expect(ids.has('kgSummaryConsent')).toBe(false);
+  });
+
+  it('re-review LOW-9: an unset toggle shows the EFFECTIVE consent the Python reader answers', () => {
+    // The derived value is never re-computed in TS: it is the row, else the
+    // status payload's `openai_embeddings_consent` (vco_lib/openai_consent.py).
+    const derived = [...walk(PREFS.instance)].find(
+      (n) => n.type === 'VariableDeclarator' && isIdent(n.id, 'openaiEmbeddingsEffective'),
+    ) as Node;
+    expect(derived, 'openaiEmbeddingsEffective').toBeTruthy();
+    const props = new Set(
+      [...walk(derived)]
+        .filter((n) => n.type === 'MemberExpression' && (n.property as Node)?.type === 'Identifier')
+        .map((n) => (n.property as Node).name as string),
+    );
+    expect(props.has('openai_embeddings_consent')).toBe(true);
+    expect(identifiers(derived).has('openaiEmbeddingsConsent')).toBe(true);
+    const label = elements(PREFS.fragment, 'label').find(
+      (l) => attrText(l, 'data-testid') === 'openai-embeddings-consent',
+    ) as Node;
+    const input = elements(label, 'input')[0];
+    expect(identifiers(attr(input, 'checked')).has('openaiEmbeddingsEffective')).toBe(true);
+    expect(src).toMatch(/keys: \['openAi', 'openAiEmbeddingsConsent', 'codeEmbedStatus'\]/);
   });
 
   it('the consent key matches the Python reader', async () => {

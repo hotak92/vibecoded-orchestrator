@@ -64,6 +64,16 @@ def resolve(env=None, state=None, record=None, role="query"):
                                   record=record, record_reader=lambda _p: None, role=role)
 
 
+@pytest.fixture(autouse=True)
+def _no_leaked_fill_tally():
+    """prepare_analyzer_run starts the module-level fill tally for a whole-graph
+    fill; a test that does not reach finish_analyzer_run must not leak it."""
+    yield
+    from vco_lib import codegraph_guards
+
+    codegraph_guards.stop_fill_tally()
+
+
 @pytest.fixture
 def launcher_db(tmp_path, monkeypatch):
     """A real-schema launcher.db with one registered project ``Acme`` whose
@@ -310,6 +320,102 @@ class TestComposeServiceModel:
         assert env["CODE_EMBED_MODEL"] == "${CODE_EMBED_MODEL:-codesage/codesage-large-v2}"
 
 
+class TestServingFollowsTheModel:
+    """Owner rule 2026-10-10: CodeSage → its own container; jina / qwen3 →
+    Ollama; OpenAI → OpenAI. One map, ``vco_lib.code_embed_serving``."""
+
+    def test_the_serving_map_matches_the_slot_map(self):
+        from vco_lib.code_embed_serving import code_serving_backend
+        from vco_lib.embedding_service import CODE_SLOT_MAP
+
+        for pattern, slot, _dim in CODE_SLOT_MAP:
+            want = ("code_embed" if slot == "codesage_embed"
+                    else "openai" if "openai" in slot else "ollama")
+            assert code_serving_backend(pattern) == want, pattern
+        assert code_serving_backend(_JINA) == "ollama"
+        assert code_serving_backend("openai-text-embedding-3-small") == "openai"
+
+    def test_jina_on_a_gpu_host_is_embedded_by_ollama_not_the_codesage_container(self, launcher_db):
+        """Red before W6-B2 round 3: jina_embed was routed to the container
+        whenever /health answered — on a GPU host, CodeSage vectors in the jina slot."""
+        _state(launcher_db, code_embed_backend_override="jina")
+        with _patched_adapters() as a, patch.dict(os.environ, {"CODE_GRAPH_PROJECT": "Acme"}):
+            a.code.model_name = "codesage/codesage-large-v2"
+            a.ollama.embed.return_value = [0.5] * 768
+            svc = EmbeddingService.for_project(code_model_role="write")
+            try:
+                assert svc.code_vector_slot == "jina_embed"
+                assert svc.embed_code("def f(): pass") == [0.5] * 768
+                a.code.embed.assert_not_called()
+                a.code.embed_batch.assert_not_called()
+            finally:
+                svc.close()
+
+    def test_codesage_is_never_served_by_a_container_running_another_model(self, launcher_db):
+        _state(launcher_db, code_embed_backend_override="codesage")
+        with _patched_adapters() as a, patch.dict(os.environ, {"CODE_GRAPH_PROJECT": "Acme"}):
+            a.code.model_name = "qwen3-embedding:0.6b"   # an ollama-backend container
+            svc = EmbeddingService.for_project(code_model_role="write")
+            try:
+                with pytest.raises(NoEmbeddingBackendError, match="serves 'qwen3-embedding:0.6b'"):
+                    svc.embed_code("def f(): pass")
+                a.code.embed.assert_not_called()
+            finally:
+                svc.close()
+
+    def test_codesage_goes_to_its_container(self, launcher_db):
+        _state(launcher_db, code_embed_backend_override="codesage")
+        with _patched_adapters() as a, patch.dict(os.environ, {"CODE_GRAPH_PROJECT": "Acme"}):
+            a.code.model_name = "codesage/codesage-large-v2"
+            a.code.embed.return_value = [0.7] * 2048
+            svc = EmbeddingService.for_project(code_model_role="write")
+            try:
+                assert svc.embed_code("def f(): pass") == [0.7] * 2048
+                a.ollama.embed.assert_not_called()
+            finally:
+                svc.close()
+
+    def test_container_pairing_is_always_servable(self):
+        from vco_lib.code_embed_serving import CODE_EMBED_GPU_MODEL, container_pairing
+
+        assert container_pairing("codesage-large-v2") == ("gpu", CODE_EMBED_GPU_MODEL)
+        assert container_pairing(DEFAULT_TEXT_MODEL) == ("ollama", DEFAULT_TEXT_MODEL)
+        assert container_pairing("text-embedding-3-small") is None
+        server = (REPO_ROOT / "claude_mcp_servers" / "code_embedding_service" / "server.py").read_text()
+        assert f'GPU_DEFAULT_MODEL = "{CODE_EMBED_GPU_MODEL}"' in server
+
+    def test_the_bundled_manifest_pairs_no_model_with_a_backend_that_cannot_serve_it(self):
+        manifest = json.loads((REPO_ROOT / "launcher" / "bundled_manifests"
+                               / "vct-code-embedding.json").read_text())
+        assert "CODE_EMBED_MODEL" not in manifest["runtime"]["env_fixed"]   # the server derives it
+        assert "Falls back to Ollama jina" not in manifest["description"]
+        assert "embedded by Ollama directly" in manifest["description"]
+        assert manifest["license"]["required"] is False                     # never a paid module
+
+    def test_adoption_derives_the_install_models_pairing(self, monkeypatch):
+        """Re-review LOW-7: the adoption path's .env refresh writes a
+        CODE_EMBED_MODEL the container's backend can serve."""
+        from vco_lib import gpu_device, service_adoption
+        from vco_lib.compose_env import compose_substitution_env
+
+        monkeypatch.setattr(gpu_device, "enumerate_gpus",
+                            lambda: [types.SimpleNamespace(vendor="amd")])
+        amd = service_adoption._derive_embed_config(DEFAULT_TEXT_MODEL)
+        assert (amd["code_backend"], amd["code_model"]) == ("ollama", DEFAULT_TEXT_MODEL)
+        assert compose_substitution_env(amd)["CODE_EMBED_MODEL"] == DEFAULT_TEXT_MODEL
+        gpu = service_adoption._derive_embed_config("codesage-large-v2")
+        assert compose_substitution_env(gpu)["CODE_EMBED_MODEL"] == "codesage/codesage-large-v2"
+        legacy = service_adoption._derive_embed_config("")
+        assert legacy == {"gpu_vendor": "amd", "code_backend": "gpu"}   # no install default: old rule
+
+
+class TestReReviewLows:
+    def test_status_command_doc_no_longer_promises_an_apply_command(self):
+        rs = (REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "embedding_catalog.rs").read_text()
+        doc = rs[rs.index("Per-project code-graph embedding model status"):rs.index("pub async fn get_code_embed_model_status")]
+        assert "apply command" not in doc and "no apply step" in doc
+
+
 # ═══════════════════════════ the analyzer's fill ═══════════════════════════
 
 
@@ -375,6 +481,91 @@ class TestAnalyzerFill:
             "Acme", None, False)
         _state(launcher_db, code_embed_backend_override="codesage")
         assert not cem.fill_owed("Acme")
+
+
+class TestOpenAIRecordedFill:
+    """Re-review MEDIUM (a)."""
+
+    def test_with_consent_rewritten_rows_keep_a_fresh_openai_vector(self, monkeypatch, capsys):
+        rec = cem.CodeModelRecord("text-embedding-3-small", 1536, "openai_code_embed")
+        state = {"code_embed_backend_override": "qwen3", CONSENT: "true"}
+        w = resolve(state=state, record=rec, role="write")
+        assert (w.model, w.carry, w.filling) == (DEFAULT_TEXT_MODEL, "text-embedding-3-small", True)
+        monkeypatch.setattr(cem, "_object_count", lambda name, url: 2)
+        line = cem._fill_line("Acme", w, None)
+        assert "refresh their text-embedding-3-small vector through the OpenAI API (cost-bearing)" in line
+
+    def test_without_consent_no_fill_starts_and_the_record_stays(self, launcher_db, monkeypatch):
+        _stamp_record(launcher_db, "text-embedding-3-small", 1536)
+        _state(launcher_db, code_embed_backend_override="qwen3", **{CONSENT: "false"})
+        monkeypatch.setattr(cem, "ensure_slot_on_collections",
+                            lambda *a, **k: pytest.fail("a fill must not start"))
+        plan = cem.prepare_analyzer_run("Acme", scoped=False, force_recreate=False)
+        assert plan.refusal and "keeps its recorded OpenAI vectors" in plan.refusal
+        assert not cem.fill_owed("Acme")
+        status = cem.status_all(count=False)["projects"][0]
+        assert status["record_refused"] and status["recorded_model"] == "text-embedding-3-small"
+
+
+class TestFillCounters:
+    """Re-review MEDIUM (b): completeness from the walk's own counters; the
+    vector scan only when they are missing or inconsistent."""
+
+    @staticmethod
+    def _walk(slot, rows):
+        """Drive the ONE fingerprint read the analyzer uses, per row."""
+        from vco_lib import codegraph_guards as guards
+
+        for i, vec in enumerate(rows):
+            obj = None if vec is None else types.SimpleNamespace(
+                properties={"content_hash": "h", "embed_revision": 1}, vector=vec)
+            coll = types.SimpleNamespace(name="Acme_CodeFunction", query=types.SimpleNamespace(
+                fetch_object_by_id=lambda uid, _o=obj, **kw: _o))
+            guards.read_object_fingerprint(coll, f"u{i}", "embed_revision", vector_slot=slot)
+
+    def _plan(self):
+        return cem.AnalyzerRunPlan(record=CODESAGE_RECORD, model=DEFAULT_TEXT_MODEL,
+                                   target=DEFAULT_TEXT_MODEL, filling=True, rewalk=True)
+
+    def test_a_clean_walk_that_visited_every_row_flips_without_a_scan(self, launcher_db, monkeypatch):
+        from vco_lib import codegraph_guards as guards
+
+        _stamp_record(launcher_db, DEFAULT_CODE_MODEL, 2048)
+        guards.start_fill_tally("qwen3_embed")
+        self._walk("qwen3_embed", [{"codesage_embed": [1.0]}, {"qwen3_embed": [1.0]}, None])
+        monkeypatch.setattr(cem, "count_code_objects", lambda prefix, **kw: 3)
+        monkeypatch.setattr(cem, "scan_slot_fill", lambda *a, **k: pytest.fail("no scan"))
+        out = cem.finish_analyzer_run("Acme", self._plan(), None, scoped=False,
+                                      stats={"files_skipped": 0, "insert_errors": 0}, revision=1)
+        assert out == "complete" and cem.read_code_model_record("Acme").model == DEFAULT_TEXT_MODEL
+
+    def test_inconsistent_or_missing_counters_fall_back_to_the_scan(self, launcher_db, monkeypatch):
+        from vco_lib import codegraph_guards as guards
+
+        _stamp_record(launcher_db, DEFAULT_CODE_MODEL, 2048)
+        scans = []
+        monkeypatch.setattr(cem, "scan_slot_fill",
+                            lambda prefix, slot, **k: scans.append(slot) or (1, 4))
+        monkeypatch.setattr(cem, "count_code_objects", lambda prefix, **kw: 4)
+        guards.start_fill_tally("qwen3_embed")
+        self._walk("qwen3_embed", [{"qwen3_embed": [1.0]}])              # visited 1 of 4
+        assert cem.finish_analyzer_run("Acme", self._plan(), None, scoped=False,
+                                       stats={"files_skipped": 2}, revision=1) == "filling"
+        assert scans == ["qwen3_embed"]                                    # dirty walk → scan
+        fill = _row(launcher_db)["config"]["code_model_fill"]
+        assert (fill["filled"], fill["total"], fill["source"]) == (1, 4, "scan")
+        assert cem.finish_analyzer_run("Acme", self._plan(), None, scoped=False,
+                                       stats={}, revision=1) == "filling"
+        assert scans == ["qwen3_embed", "qwen3_embed"]                     # no tally → scan
+
+    def test_the_bundle_update_flips_from_stamped_counters_without_a_scan(self, launcher_db, monkeypatch):
+        _stamp_record(launcher_db, DEFAULT_CODE_MODEL, 2048, config={"code_model_fill": {
+            "target": DEFAULT_TEXT_MODEL, "filled": 5, "total": 5, "revision": 1, "source": "walk"}})
+        _state(launcher_db, code_embed_backend_override="qwen3")
+        monkeypatch.setattr(cem, "count_code_objects", lambda prefix, **kw: 5)
+        monkeypatch.setattr(cem, "scan_slot_fill", lambda *a, **k: pytest.fail("no scan"))
+        assert cem.reconcile_code_embedding(launcher_db.parent / "acme", "Acme") == "complete"
+        assert cem.read_code_model_record("Acme").model == DEFAULT_TEXT_MODEL
 
 
 class TestOnlyNeededReembeds:

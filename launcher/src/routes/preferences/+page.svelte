@@ -1515,6 +1515,7 @@
     complete: boolean;
     cost_bearing: boolean;
     target_refused: boolean;
+    record_refused: boolean;
   }
   interface CodeEmbedStatus {
     target: string;
@@ -1545,6 +1546,7 @@
   function codeEmbedFillText(p: CodeEmbedProjectStatus): string {
     if (p.complete) return 'complete';
     if (p.target_refused) return 'not filled — OpenAI embeddings are not allowed';
+    if (p.record_refused) return 'blocked — the indexed OpenAI vectors need "Allow OpenAI for embeddings"';
     if (!p.recorded_model) return 'not indexed yet — its first run embeds the target';
     if (p.filled !== null && p.total !== null) return `${p.filled} of ${p.total} filled`;
     const n = p.total === null ? '' : ` (${p.total} objects)`;
@@ -1556,6 +1558,12 @@
   // never set: the reader then follows the active embedding profile
   // (vco_lib/openai_consent.py); nothing is written on the user's behalf.
   let openaiEmbeddingsConsent = $state<boolean | null>(null);
+  // Re-review LOW-9: the EFFECTIVE consent — the row when set, else the
+  // Python reader's answer (it follows the active profile), carried on the
+  // status payload; never re-derived here (one reader, vco_lib/openai_consent.py).
+  const openaiEmbeddingsEffective = $derived(
+    openaiEmbeddingsConsent ?? codeEmbedStatus?.openai_embeddings_consent ?? false,
+  );
   let openaiEmbeddingsSaving = $state(false);
   let openaiEmbeddingsError = $state<string | null>(null);
 
@@ -2731,6 +2739,13 @@
                   <code>{p.target_model}</code>: {codeEmbedFillText(p)}
                   · {p.cost_bearing ? 'OpenAI-billed' : 'no API cost'}
                 </p>
+                {#if p.record_refused}
+                  <p class="pr-hint pr-kgsum-warn">
+                    This graph is indexed with an OpenAI model and "Allow OpenAI for embeddings" is
+                    off — its searches are refused and no switch starts (its vectors would be lost)
+                    until the toggle is on.
+                  </p>
+                {/if}
                 {#if p.target_refused}
                   <p class="pr-hint pr-kgsum-warn">
                     The target is an OpenAI model but "Allow OpenAI for embeddings" is off —
@@ -2797,7 +2812,7 @@
               value="openai"
               checked={codeEmbedOverride === 'openai'}
               onchange={() => void saveCodeEmbedOverride('openai')}
-              disabled={codeEmbedSaving || !openaiEmbeddingsConsent}
+              disabled={codeEmbedSaving || !openaiEmbeddingsEffective}
             />
             <span>OpenAI embeddings (requires "Allow OpenAI for embeddings"; billed per call — the switch embeds the graph once)</span>
           </label>
@@ -3117,7 +3132,7 @@
          breadcrumbs. Per the v0.2.18 locked rule, post-Apply success
          shows a styled-modal consent prompt before flipping the new-
          project defaults to openai-*. -->
-    <section class="pr-section" use:lazySection={{ loaders, keys: ['openAi', 'openAiEmbeddingsConsent'] }} aria-labelledby="pr-openai-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['openAi', 'openAiEmbeddingsConsent', 'codeEmbedStatus'] }} aria-labelledby="pr-openai-title">
       <h2 class="pr-section-title" id="pr-openai-title">OpenAI API key (optional)</h2>
       <div class="pr-pat-row">
         <div class="pr-onboarding-text">
@@ -3140,7 +3155,7 @@
           <label class="pr-kgsum-checkbox" data-testid="openai-embeddings-consent">
             <input
               type="checkbox"
-              checked={openaiEmbeddingsConsent === true}
+              checked={openaiEmbeddingsEffective}
               onchange={(e) => {
                 const t = e.currentTarget as HTMLInputElement;
                 void saveOpenAiEmbeddingsConsent(t.checked);
@@ -3151,8 +3166,8 @@
           </label>
           {#if openaiEmbeddingsConsent === null}
             <span class="pr-onboarding-hint">
-              Not set — it follows your embedding profile: on while OpenAI is the
-              active embedding profile, off otherwise. Tick or untick to decide.
+              Not set — following your embedding profile ({openaiEmbeddingsEffective
+                ? 'on: OpenAI is your active embedding profile' : 'off'}). Tick or untick to decide.
             </span>
           {/if}
           {#if openaiEmbeddingsError}

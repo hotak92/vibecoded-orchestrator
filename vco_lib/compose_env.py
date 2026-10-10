@@ -37,23 +37,23 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 
-#: The code_embed SERVICE's GPU-backend model id (the sentence-transformers /
-#: HuggingFace form). MUST MATCH ``code_embedding_service/server.py``
-#: ``GPU_DEFAULT_MODEL`` and the compose default.
-CODE_EMBED_GPU_MODEL = "codesage/codesage-large-v2"
-
-
 def code_embed_service_model(embed_config: dict) -> Optional[str]:
-    """The model the code_embed service must load for this install's backend:
-    the tier table's ``code_model`` when it is an Ollama model (``ollama``
-    backend), CodeSage for the ``gpu`` backend, nothing otherwise (``openai``
-    runs no service)."""
+    """The model the code_embed container must load for this install: the
+    pairing from the ONE serving map (``vco_lib.code_embed_serving``) for the
+    backend install chose — ``gpu`` → CodeSage; ``ollama`` → the tier table's
+    Ollama code model (never CodeSage, which Ollama does not serve); nothing
+    otherwise (``openai`` runs no container)."""
+    from vco_lib.code_embed_serving import (
+        CODE_EMBED_GPU_MODEL,
+        CODE_SERVED_BY_OLLAMA,
+        code_serving_backend,
+    )
+
     backend = str(embed_config.get("code_backend", "") or "").strip().lower()
     model = str(embed_config.get("code_model", "") or "").strip()
     if backend == "gpu":
         return CODE_EMBED_GPU_MODEL
-    if backend == "ollama" and model and "codesage" not in model.lower() \
-            and not model.lower().startswith(("openai-", "text-embedding-")):
+    if backend == "ollama" and model and code_serving_backend(model) == CODE_SERVED_BY_OLLAMA:
         return model
     return None
 

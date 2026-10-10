@@ -1846,7 +1846,12 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
 /// owns since v0.2.102 W6-B2 — it stamps a model only once its slot is
 /// complete, so a build that is still filling a new model's slot must not
 /// overwrite it here (the analyzer has already written the row when this
-/// runs). Soft-fail: a DB hiccup is logged, never propagated.
+/// runs). One exception (re-review LOW-10): a binding that never had a real
+/// build (`last_analyzed_at` NULL — the hardcoded codesage/2048 seed) takes
+/// THIS build's provenance as its first record, so a soft-failed Python stamp
+/// can never leave the seed looking like a record (the timestamp below would
+/// otherwise turn it into one). Soft-fail: a DB hiccup is logged, never
+/// propagated.
 fn persist_codegraph_provenance(
     db: &Db,
     project_id: &str,
@@ -1864,11 +1869,20 @@ fn persist_codegraph_provenance(
         .as_ref()
         .map(|b| b.config.clone())
         .unwrap_or(serde_json::Value::Null);
+    let seeded = existing.as_ref().is_none_or(|b| b.last_analyzed_at.is_none());
+    let (embedding_model, embedding_dim) = if seeded {
+        (Some(prov.model.clone()), Some(prov.dim))
+    } else {
+        (
+            existing.as_ref().and_then(|b| b.embedding_model.clone()),
+            existing.as_ref().and_then(|b| b.embedding_dim),
+        )
+    };
     if let Err(e) = db.set_project_codegraph_binding(
         project_id,
         &collection_prefix,
-        existing.as_ref().and_then(|b| b.embedding_model.as_deref()),
-        existing.as_ref().and_then(|b| b.embedding_dim),
+        embedding_model.as_deref(),
+        embedding_dim,
         prov.analyzed_commit.as_deref(),
         Some(analyzed_at),
         enabled,
@@ -3156,7 +3170,7 @@ mod build_tests {
             Some("codesage-large-v2"),
             Some(2048),
             None,
-            None,
+            Some(1_600_000_000_000),
             true,
             &serde_json::json!({"code_model_fill": {"target": "qwen3-embedding:0.6b"}, "keep": "me"}),
         )
@@ -3177,6 +3191,32 @@ mod build_tests {
         assert_eq!(b.config["keep"], serde_json::json!("me"));
         assert_eq!(b.config["code_model_fill"]["target"], serde_json::json!("qwen3-embedding:0.6b"));
         assert_eq!(b.collection_prefix, "Proj");
+    }
+
+    /// Re-review LOW-10: a never-built SEED (last_analyzed_at NULL, the
+    /// hardcoded codesage/2048) takes this build's provenance as its first
+    /// record instead of being stamped "analyzed" with the seed's model.
+    #[test]
+    fn persist_provenance_turns_a_seed_into_the_builds_record() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Seed", "/tmp/ps", ProjectHost::Base, "ps").unwrap();
+        db.set_project_codegraph_binding(
+            &pid, "Seed", Some("codesage-large-v2"), Some(2048), None, None, true,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        let prov = CodegraphProvenance {
+            model: "qwen3-embedding:0.6b".to_string(),
+            dim: 1024,
+            embed_revision: 1,
+            analyzed_commit: Some("c0ffee".to_string()),
+        };
+        persist_codegraph_provenance(&db, &pid, "Seed", &prov, 1_700_000_000_000);
+        let b = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
+        assert_eq!(b.embedding_model.as_deref(), Some("qwen3-embedding:0.6b"));
+        assert_eq!(b.embedding_dim, Some(1024));
+        assert_eq!(b.last_analyzed_at, Some(1_700_000_000_000));
     }
 
 }

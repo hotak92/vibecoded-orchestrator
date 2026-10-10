@@ -401,12 +401,13 @@ pub async fn get_default_embedding_models(
 
 /// Per-project code-graph embedding model status for the Preferences "Code
 /// Graph Embeddings" section (v0.2.102 W6-B2): the model each project's code
-/// graph is RECORDED as indexed with, the configured pick, whether a change is
-/// pending, roughly how many objects applying it embeds and whether that is
-/// OpenAI-billed, plus the exact apply command. The answer is computed by the
-/// ONE resolver, `python -m vco_lib.code_embed_model status` (rung A of the
-/// cross-language ladder) — this command only transports it. Errors surface
-/// to the section verbatim; nothing is guessed.
+/// graph is RECORDED as indexed with (what searches use), the selected target,
+/// the target's fill progress (rows filled / total, or complete — a selection
+/// is applied automatically, so there is no apply step to show) and whether it
+/// is OpenAI-billed. The answer is computed by the ONE resolver,
+/// `python -m vco_lib.code_embed_model status` (rung A of the cross-language
+/// ladder) — this command only transports it. Errors surface to the section
+/// verbatim; nothing is guessed.
 #[command]
 pub async fn get_code_embed_model_status(
     db: State<'_, Db>,

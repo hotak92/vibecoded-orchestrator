@@ -251,6 +251,17 @@ def _resolve_code_slot(model_id: str) -> tuple[str, int]:
     return DEFAULT_CODE_SLOT
 
 
+# Where a code model's embeddings are SERVED from — the ONE map lives in
+# vco_lib.code_embed_serving (stdlib-only: install's bootstrap path decides the
+# container pairing from it too). Before v0.2.102 the client routed BY SLOT and
+# sent `jina_embed` to the code_embed container whenever its /health answered —
+# on a GPU host a container serving CodeSage (v0.2.18 c2cf6be5).
+from vco_lib.code_embed_serving import (  # noqa: E402 — the one serving map
+    CODE_SERVED_BY_CONTAINER,
+    code_serving_backend,
+)
+
+
 # ---------------------------------------------------------------------------
 # OpenAI catalog-id ↔ API-model-name translation
 # ---------------------------------------------------------------------------
@@ -2397,6 +2408,7 @@ class EmbeddingService:
                 code_embed_url=code_embed_url, text_model_id=text_model_id,
                 code_model_id=code_resolution.carry, openai_api_key=openai_api_key,
             )
+            svc._code_carry_service._openai_embeddings_consent = openai_embeddings_ok
 
         # Probe both readiness flags so we can fail fast with a useful
         # error and write the diagnostic.
@@ -2647,11 +2659,13 @@ class EmbeddingService:
             self._code_ready = (
                 bool(self.openai_api_key) and self.openai.validate().valid
             )
-        elif self._code_slot in ("codesage_embed", "jina_embed"):
-            # Either the FastAPI service or Ollama (jina via Ollama).
-            # Prefer CodeEmbed service if reachable; fall back to Ollama.
+        elif self._code_served_by_container():
+            # CodeSage: its own container (v0.2.102 W6-B2 — serving follows
+            # the model). The Ollama leg is kept only for the v0.2.100
+            # developer opt-in fallback; an embed through a container that
+            # serves another model raises (_require_container_serves_code_model).
             self._code_ready = (
-                self.codeembed.is_reachable() or self.ollama.is_reachable()
+                self._container_serves_code_model() or self.ollama.is_reachable()
             )
         else:
             # qwen3-embed CPU fallback or generic Ollama code model.
@@ -2841,12 +2855,10 @@ class EmbeddingService:
         self._last_truncated_slots = {}
         # Service leg: hand the RAW query through with is_query=True + the task
         # key. The SERVICE owns the prefix here (no client-side prepend).
-        if (
-            "openai" not in self._code_slot
-            and self._code_slot in ("codesage_embed", "jina_embed")
-        ):
+        if self._code_served_by_container():
             self._raise_if_code_backend_down()
             if self.codeembed.is_reachable():
+                self._require_container_serves_code_model()
                 key = _memo_key("query:" + task + ":" + code)
                 cached = self._embed_memo_code.get(key)
                 if cached is not None:
@@ -3119,10 +3131,10 @@ class EmbeddingService:
     def embed_code_batch(self, codes: list[str]) -> list[list[float]]:
         """Batched code embedding. Empty input → empty output.
 
-        Routes to CodeEmbed service when slot is ``codesage_embed`` or
-        ``jina_embed`` AND the service is reachable; falls back to
-        Ollama (which can serve jina or qwen3) when the service is down.
-        OpenAI goes through ``openai`` adapter directly.
+        Serving follows the model (:func:`code_serving_backend`): CodeSage →
+        the code_embed container when reachable (and serving CodeSage);
+        jina / qwen3 / other Ollama models → Ollama; OpenAI → the ``openai``
+        adapter.
 
         W1 (2026-09-05): the CodeEmbed leg is bounded + failure-isolated
         like the Ollama twin — one over-window entity can neither silently
@@ -3140,11 +3152,12 @@ class EmbeddingService:
                 self.openai.embed_batch, self.code_model_id, codes
             )
         self._raise_if_code_backend_down()
-        if self._code_slot in ("codesage_embed", "jina_embed"):
-            # Service when reachable (bounded + isolated, W1); otherwise
-            # fall through to the Ollama leg using the configured code model
-            # id — best-effort, and it shares the same bounded helper.
+        if self._code_served_by_container():
+            # CodeSage → its container when reachable (bounded + isolated, W1);
+            # jina / qwen3 / other Ollama models never reach the container
+            # (v0.2.102 W6-B2 — serving follows the model).
             if self.codeembed.is_reachable():
+                self._require_container_serves_code_model()
                 return self._embed_codeembed_batch_bounded(codes)
         # WP-R: the Ollama code fallback (e.g. jina/qwen3 code embeds served via
         # Ollama on a CPU/low-VRAM floor) shares the same num_ctx/whole-batch
@@ -3488,8 +3501,8 @@ class EmbeddingService:
 
         # CodeEmbed service if not active and reachable
         if (
-            self._code_slot not in ("codesage_embed", "jina_embed")
-            and self.codeembed.is_reachable()
+            not self._code_served_by_container()
+            and self._container_serves_code_model()
         ):
             if self._secondary_breaker_should_skip("codesage_embed"):
                 self._note_secondary_embed_skipped("codesage_embed")
@@ -3737,6 +3750,33 @@ class EmbeddingService:
 
             raise OpenAIEmbeddingsConsentRefusal(refusal_message(model, what), model)
 
+    def _code_served_by_container(self) -> bool:
+        return code_serving_backend(self.code_model_id) == CODE_SERVED_BY_CONTAINER
+
+    def _container_serves_code_model(self) -> bool:
+        """The container answers AND serves this model. A container whose
+        /health names ANOTHER model (``backend=ollama`` proxying the tier's
+        Ollama model, on a 6-12 GB NVIDIA / AMD host) is not CodeSage — never
+        a silent stand-in. An unreported name is not judged."""
+        if not self.codeembed.is_reachable():
+            return False
+        name = getattr(self.codeembed, "model_name", None)
+        return not isinstance(name, str) or not name or "codesage" in name.lower()
+
+    def _require_container_serves_code_model(self) -> None:
+        if not self._container_serves_code_model():
+            served = getattr(self.codeembed, "model_name", None)
+            raise NoEmbeddingBackendError(
+                f"The code_embed container at {self.code_embed_url} serves "
+                f"{served!r}, not {self.code_model_id} — CodeSage is "
+                "only served by that container in its gpu backend (re-run the installer's "
+                "hardware selection to serve CodeSage, or select an Ollama code model). "
+                "No embedding is stored with another model's vectors.",
+                attempted_backends=["codeembed"],
+                error_per_backend={"codeembed": f"serves {served!r}"},
+                capture=False,
+            )
+
     def _raise_if_code_backend_down(self) -> None:
         """v0.2.100: the configured CodeSage backend was down at construction
         and no substitute embedder is allowed — raise the typed error (not an
@@ -3762,9 +3802,10 @@ class EmbeddingService:
         ``embed_code_query`` applies the prefix itself before calling here).
         Defaults keep every document/backfill caller byte-identical.
 
-        For codesage_embed / jina_embed slots, prefer the FastAPI service
-        when reachable; fall back to Ollama otherwise. OpenAI path applies
-        the same catalog-id-prefix strip as ``_embed_text_via_active``.
+        Serving follows the model (:func:`code_serving_backend`): CodeSage →
+        the FastAPI container when reachable (refused if it serves another
+        model); every other local model → Ollama. OpenAI path applies the
+        same catalog-id-prefix strip as ``_embed_text_via_active``.
 
         The Ollama leg shrinks on refusal for the same reason the text leg
         does (round-6 BLOCKER, the twin of round-5's): `truncate: false` makes
@@ -3815,8 +3856,9 @@ class EmbeddingService:
                 _to_openai_api_model(self.code_model_id), code
             )
         self._raise_if_code_backend_down()
-        if self._code_slot in ("codesage_embed", "jina_embed"):
+        if self._code_served_by_container():
             if self.codeembed.is_reachable():
+                self._require_container_serves_code_model()
                 # W1: through the ONE shared shrink loop — see docstring.
                 # Records under the ACTIVE CODE slot exactly like the
                 # Ollama leg below (assign, never latch).

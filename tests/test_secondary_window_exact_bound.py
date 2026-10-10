@@ -908,6 +908,10 @@ def _codeembed_service(monkeypatch, adapter, *, active_slot="codesage_embed"):
     )
     svc._text_slot = "qwen3_embed"
     svc._code_slot = active_slot
+    if active_slot == "qwen3_embed":
+        # v0.2.102 W6-B2: serving follows the MODEL, so an Ollama-served active
+        # slot needs an Ollama model id too (the slot alone no longer routes).
+        svc.code_model_id = DEFAULT_TEXT_MODEL
     return svc
 
 
