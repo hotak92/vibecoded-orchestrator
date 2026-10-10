@@ -104,8 +104,8 @@ Uses LITM (Lost-In-The-Middle) ordering: most critical content placed at both st
 
 </details>
 
-### `pre-compact-save.sh` — PreCompact (auto)
-Save a snapshot of current working state before auto-compaction: git status (top 30 files), recently changed files, current open file list. Output written to `.claude/context/pre-compact-snapshot.md`.
+### `pre-compact-save.sh` — PreCompact (manual + auto)
+Save a snapshot of current working state before every compaction (`/compact` and auto-compact alike; matcher `*` — v0.2.102 widened it from `auto`, under which a manual `/compact` saved nothing and the re-inject later replayed a stale snapshot): git status (top 30 files), recently changed files, current open file list. Output written to `.claude/context/pre-compact-snapshot.md`.
 
 ### `post-compact.sh` — PostCompact
 Log compaction event and send desktop notification after compaction completes. Appends to `~/.claude/metrics/compactions.jsonl`. Resets the `diff-context-inject.sh` baseline.

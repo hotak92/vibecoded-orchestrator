@@ -7,7 +7,11 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # pre-compact-save.ps1
-# Fires BEFORE auto context compaction (PreCompact event).
+# Fires BEFORE every context compaction (PreCompact event, matcher "*" --
+# v0.2.102 W6-D widened it from "auto": the vendor hooks doc gives PreCompact
+# exactly two matcher values, manual and auto, and a manual /compact under
+# matcher "auto" saved NOTHING, so the reinject hook replayed a stale
+# snapshot after every manual compaction).
 # Saves a snapshot of current working state so compact-context-reinject.ps1
 # can restore it after compaction.
 

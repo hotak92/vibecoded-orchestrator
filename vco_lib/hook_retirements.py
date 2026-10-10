@@ -729,7 +729,7 @@ class MatcherMigration:
     reason: str
 
 
-def _shell_matcher_migrations() -> Tuple[MatcherMigration, ...]:
+def _matcher_migrations() -> Tuple[MatcherMigration, ...]:
     reason = (
         "Claude Code on Windows without Git Bash registers no Bash tool — "
         "its shell tool is PowerShell — so a hook matched on Bash alone "
@@ -753,13 +753,30 @@ def _shell_matcher_migrations() -> Tuple[MatcherMigration, ...]:
             event="PostToolUse", old="Bash", new="Bash|PowerShell",
             targets=both("post-bash-file-sync"),
             retired_in="v0.2.102", reason=reason),
+        # v0.2.102 W6-D: PreCompact fires on BOTH triggers, but the `auto`
+        # matcher never matched a manual /compact -- so after every manual
+        # compact the reinject hook replayed a stale pre-compact snapshot
+        # (measured: three manual compacts re-injected a snapshot dated
+        # 2026-09-29). The vendor hooks doc gives PreCompact exactly two
+        # matcher values, `manual` and `auto`; an omitted or `*` matcher
+        # activates on every occurrence of the event.
+        MatcherMigration(
+            event="PreCompact", old="auto", new="*",
+            targets=both("pre-compact-save"),
+            retired_in="v0.2.102",
+            reason=(
+                "PreCompact has two matcher values, manual and auto (vendor "
+                "hooks doc); `auto` alone never fired on a manual /compact, "
+                "so the pre-compact snapshot went stale and the reinject "
+                "hook replayed it after every manual compaction"
+            )),
     )
 
 
 #: The table. ``tests/test_v02102_powershell_hooks.py`` pins every row to
 #: BOTH settings templates (each target ships under ``new``, none under
 #: ``old``).
-MATCHER_MIGRATIONS: Tuple[MatcherMigration, ...] = _shell_matcher_migrations()
+MATCHER_MIGRATIONS: Tuple[MatcherMigration, ...] = _matcher_migrations()
 
 
 def migrated_matcher(event: str, matcher: str, target: Optional[str]) -> str:

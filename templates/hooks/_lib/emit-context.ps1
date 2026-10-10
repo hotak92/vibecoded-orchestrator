@@ -20,7 +20,7 @@
 # OS support: pure PowerShell — no Python or external tools required.
 
 # ---------------------------------------------------------------------------
-# Limit-VcoHookContext -Text <s> [-Pointer <s>]
+# Limit-VcoHookContext -Text <s> [-Pointer <s>] [-Limit <n>]
 #
 # v0.2.100 WP-17 -- THE cap for text a hook injects into the model's context.
 # Claude Code's hooks contract: injected hook output past 10 000 characters is
@@ -31,6 +31,12 @@
 # saying what was cut and where the rest is. .Length counts UTF-16 code units
 # (>= characters), so the limit holds; a surrogate pair split by the cut is
 # dropped. MUST MATCH _lib/emit-context.sh's vco_cap_context.
+#
+# v0.2.102 W6-D: the optional -Limit overrides the global cap for ONE call --
+# the value the caller computed as a SECTION budget inside the global cap
+# (compact-context-reinject truncates each of its sections within itself so
+# no section is dropped wholesale). The marker is the same: the section cut
+# exists to keep the whole stream under the 10 000-character injection limit.
 function Get-VcoHookContextCap {
     $cap = 9500
     $raw = [string]$env:VCO_HOOK_CONTEXT_CAP
@@ -46,9 +52,9 @@ function Get-VcoHookContextCap {
 }
 
 function Limit-VcoHookContext {
-    param([string]$Text, [string]$Pointer = '')
+    param([string]$Text, [string]$Pointer = '', [int]$Limit = 0)
     if (-not $Text) { return $Text }
-    $cap = Get-VcoHookContextCap
+    $cap = if ($Limit -gt 0) { $Limit } else { Get-VcoHookContextCap }
     $total = $Text.Length
     if ($total -le $cap) { return $Text }
     $suffix = if ($Pointer) { " $Pointer" } else { "" }

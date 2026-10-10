@@ -385,8 +385,8 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 **SessionStart (compact/resume)**:
 - `compact-context-reinject.sh` — re-inject `CONTEXT_STATE.md` + recent commits + active plan + pre-compact snapshot.
 
-**PreCompact (auto)**:
-- `pre-compact-save.sh` — save git status + recent files to `.claude/context/pre-compact-snapshot.md`.
+**PreCompact (manual + auto)**:
+- `pre-compact-save.sh` — save git status + recent files to `.claude/context/pre-compact-snapshot.md` (before every compaction, `/compact` included).
 
 **PostCompact**:
 - `post-compact.sh` — log compaction event + desktop notification (logs to `~/.claude/metrics/compactions.jsonl`).
