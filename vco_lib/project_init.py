@@ -9952,8 +9952,9 @@ def install_project_bundle(
     result["actions"]["orphan-preserved"] = orphan_preserved
     # v0.2.100 AD-7 (L5-F04): every gated skip is visible (log + ledger row).
     from vco_lib.module_gated_delivery import record_gate_outcomes
-    record_gate_outcomes(folder, _gate_outcomes, dry_run=dry_run,
-                         log=lambda m: _log("4.bundle.gated", "info", m))
+    record_gate_outcomes(folder, _gate_outcomes, dry_run=dry_run, log=lambda m: _log("4.bundle.gated", "info", m))
+    from vco_lib.code_embed_model import reconcile_folder_code_embedding  # v0.2.102 W6-B2: code-model self-heal
+    reconcile_folder_code_embedding(folder, dry_run=dry_run)
     result["actions"]["orphan-retired"] = orphan_retired
     result["actions"]["knowledge-retired"] = knowledge_retired
     # v0.2.83 B-F5: one honest auto-resolution record per retired orphan (file
@@ -9972,8 +9973,7 @@ def install_project_bundle(
                     log=_log_auto,
                 )
         except Exception as _exc:  # noqa: BLE001 — bookkeeping is best-effort
-            _log("4.bundle.orphan_retired", "warn",
-                 f"orphan-retire auto-resolution record failed: {_exc}")
+            _log("4.bundle.orphan_retired", "warn", f"orphan-retire auto-resolution record failed: {_exc}")
     if orphan_retired:
         _log("4.bundle.orphan_retired", "info",
              f"retired {len(orphan_retired)} user-modified orphan manifest "

@@ -100,7 +100,9 @@ def test_gpu_default_backend_unchanged():
     assert env.get("CODE_EMBED_BACKEND") == "${CODE_EMBED_BACKEND:-gpu}", (
         f"default backend changed: {env.get('CODE_EMBED_BACKEND')!r}"
     )
-    assert env.get("CODE_EMBED_MODEL") == "codesage/codesage-large-v2", (
+    # v0.2.102 W6-B2: the model follows the backend (install writes it to
+    # infrastructure/.env from the tier table); the DEFAULT is still codesage.
+    assert env.get("CODE_EMBED_MODEL") == "${CODE_EMBED_MODEL:-codesage/codesage-large-v2}", (
         f"default model changed: {env.get('CODE_EMBED_MODEL')!r}"
     )
 

@@ -151,7 +151,14 @@ describe('the registry holds every loader exactly once', () => {
     // + `moduleUpdateAutoCheck` (v0.2.100): one lazy entry; its write goes
     // through the api wrapper (see module-update-autocheck.test.ts).
     expect(PREF_LOADER_KEYS).toContain('moduleUpdateAutoCheck');
-    expect(PREF_LOADER_KEYS.length).toBe(Object.keys(BEFORE).length + 3);
+    // + `codeEmbedStatus` (v0.2.102 W6-B2): the per-project recorded vs
+    // configured code model, lazy + slow (Weaviate object counts).
+    expect(PREF_LOADER_KEYS).toContain('codeEmbedStatus');
+    expect(PREF_LOADERS.codeEmbedStatus.slow).toBe(true);
+    // + `openAiEmbeddingsConsent` (v0.2.102 W6-B2, owner ruling 2026-10-10):
+    // the OpenAI EMBEDDINGS consent, separate from the summaries one.
+    expect(PREF_LOADER_KEYS).toContain('openAiEmbeddingsConsent');
+    expect(PREF_LOADER_KEYS.length).toBe(Object.keys(BEFORE).length + 5);
   });
 
   it('every lazy key is attached to a section of the page', () => {

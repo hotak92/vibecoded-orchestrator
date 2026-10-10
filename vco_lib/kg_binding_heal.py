@@ -2799,3 +2799,87 @@ def self_heal_kg_bindings(
             ],
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.102 W6-B2: the code-graph model RECORD + fill-progress stamps
+# ---------------------------------------------------------------------------
+
+#: ``config_json`` key of the fill progress — MUST MATCH
+#: ``vco_lib.code_embed_model.FILL_CONFIG_KEY``.
+_CODE_MODEL_FILL_KEY = "code_model_fill"
+
+
+def _update_codegraph_binding(db_path, prefix: str, mutate) -> bool:
+    """Read-modify-write ONE ``project_codegraph_bindings`` row (matched by
+    prefix, case-insensitive) in a single transaction. ``mutate(row_dict)``
+    (with the row's current ``last_analyzed_at``) returns the column→value
+    updates. Never INSERTs — the launcher creates the
+    row; soft-fail False on any sqlite error or a missing row."""
+    from pathlib import Path
+
+    db_path = Path(db_path)
+    if not db_path.is_file() or not prefix:
+        return False
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            row = conn.execute(
+                "SELECT project_id, config_json, last_analyzed_at FROM project_codegraph_bindings "
+                "WHERE lower(collection_prefix) = lower(?) LIMIT 1", (prefix,),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                config = json.loads(row[1] or "null")
+            except ValueError:
+                config = None
+            updates = mutate(config if isinstance(config, dict) else {}, row[2])
+            updates["updated_at"] = int(time.time() * 1000)
+            cols = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(
+                f"UPDATE project_codegraph_bindings SET {cols} WHERE project_id = ?",
+                (*updates.values(), row[0]),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — a missed stamp is re-derived next run
+        return False
+
+
+def stamp_codegraph_model_record(
+    db_path, prefix: str, model: str, dim: int, now_ms: int,
+) -> bool:
+    """Stamp what a project's code graph's COMPLETE slot holds onto its
+    EXISTING ``project_codegraph_bindings`` row — the record
+    :mod:`vco_lib.code_embed_model` reads (and the launcher's build path also
+    writes from the analyzer's ``CODEGRAPH_PROVENANCE`` line).
+
+    Sets ``embedding_model`` / ``embedding_dim``, ``last_analyzed_at`` only
+    when still NULL (the "a real build produced this" marker), and clears the
+    fill progress (a flip ends the fill). Never INSERTs — the launcher is the
+    row's creator; this heals its provenance, hence this module (the single
+    Python binding writer)."""
+    if not model:
+        return False
+
+    def mutate(config: dict, analyzed_at) -> dict:
+        config.pop(_CODE_MODEL_FILL_KEY, None)
+        return {"embedding_model": model, "embedding_dim": int(dim),
+                "last_analyzed_at": analyzed_at if analyzed_at is not None else now_ms,
+                "config_json": json.dumps(config, sort_keys=True)}
+
+    return _update_codegraph_binding(db_path, prefix, mutate)
+
+
+def stamp_codegraph_model_fill(db_path, prefix: str, fill: dict) -> bool:
+    """Record the fill progress of a target model (``{"target", "filled",
+    "total", "at"}``) in the binding's ``config_json`` — the launcher DB is
+    the reference for what a graph still needs (owner ruling 2026-10-10)."""
+    def mutate(config: dict, _analyzed_at) -> dict:
+        config[_CODE_MODEL_FILL_KEY] = dict(fill)
+        return {"config_json": json.dumps(config, sort_keys=True)}
+
+    return _update_codegraph_binding(db_path, prefix, mutate)

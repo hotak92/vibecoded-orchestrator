@@ -426,6 +426,7 @@ try:
     # resolution, the all-chunks-SKIP verdict, and the completion stamp all
     # live there; this file keeps only the I/O seams.
     from vco_lib import codegraph_extractor_generation as _extractor_gen
+    from vco_lib import code_embed_model as _cem  # v0.2.102 W6-B2: the code-model resolver
     # v0.2.92 (BLOCKER-2): "may this run DROP the five <prefix>_Code* classes?"
     # — composes the W8 identity SSOT; no second identity rule lives here.
     from vco_lib.codegraph_drop_guard import (  # noqa: F401 — re-export
@@ -1103,18 +1104,8 @@ except ImportError:
     print("Error: weaviate-client not installed. Install with: pip install weaviate-client", file=sys.stderr)
     sys.exit(1)
 
-# Code embedding configuration — v0.2.18 centralised via EmbeddingService.
-# Pre-v0.2.18, this script read CODE_EMBED_BACKEND / CODE_EMBED_SERVICE_URL /
-# CODE_EMBED_MODEL directly and hardcoded the active slot to either
-# `codesage_embed` (service) or `ollama_code_embed` (ollama). The hardcode
-# silently broke OpenAI-as-code-embed installs and made the slot decision
-# duplicate the same logic in 5+ places. v0.2.18: a single
-# EmbeddingService instance (constructed in main()) owns the choice; this
-# module's embed_* helpers route through it.
-#
-# Kept-but-unused env reads (CODE_EMBED_BACKEND/SERVICE_URL/MODEL) live on
-# vco_lib/embedding_service.py:for_project() now. Searching this file for
-# those names will turn up only the historical comment above.
+# The code model + slot are decided by ONE resolver, vco_lib.code_embed_model
+# (via the EmbeddingService built in main()); this file reads no CODE_EMBED_* env.
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
 # Note: We use manual vectorization (vectorizer=None) and generate embeddings via the configured backend.
@@ -6599,8 +6590,14 @@ def main():
     # governs the emits below AND the clear on the success path.
     deferral_root = _resolve_deferral_root(args.deferral_root, install_root)
     embedding_service: Optional[EmbeddingService] = None
+    # v0.2.102 W6-B2: the graph's recorded model, or the selected target filled additively (vco_lib.code_embed_model).
+    _cem_scoped = args.only_file is not None or args.only_files_from is not None
+    _cem_plan = _cem.prepare_analyzer_run(project_name, scoped=_cem_scoped, force_recreate=args.force_recreate)
+    if _cem_plan.refusal:
+        print(f"❌ {_cem_plan.refusal}", file=sys.stderr)
+        return _cem.EXIT_CODE_MODEL_REFUSED
     try:
-        embedding_service = EmbeddingService.for_project(install_root)
+        embedding_service = EmbeddingService.for_project(install_root, codegraph_prefix=project_name, code_model_record=_cem_plan.record, code_model_role=_cem_plan.role)
     except NoEmbeddingBackendError as e:
         _deferral_op("emit_no_backend", deferral_root, e)
         print(f"⚠️  Code-graph analysis skipped: {e}", file=sys.stderr)
@@ -6642,7 +6639,7 @@ def main():
         args.index_dot_claude, repo_path
     )
     # v0.2.92: CLI flag OR its env transport (ONE resolver, in vco_lib).
-    analyzer.force_rewalk = _extractor_gen.resolve_force_rewalk(args.force_rewalk)
+    analyzer.force_rewalk = _extractor_gen.resolve_force_rewalk(args.force_rewalk) or _cem_plan.rewalk  # a fill visits every row
     if analyzer.force_rewalk:
         print("🔁 Force re-walk: re-extracting every file (per-entity "
               "content-hash gating unchanged — unchanged rows do NOT re-embed).")
@@ -6956,6 +6953,7 @@ def main():
         # v0.2.82 (G6, WP-3 contract): one NORMATIVE provenance line at
         # successful run end (WP-3's launcher parser reads the last occurrence).
         _print_codegraph_provenance(embedding_service, repo_path)
+        _cem.finish_analyzer_run(project_name, _cem_plan, embedding_service, scoped=_cem_scoped, repo_root=repo_path, index_dot_claude=analyzer.index_dot_claude)
         # v0.2.91 wave-3 fix (MAJOR-1): the NARROW paired clear, at the only
         # point that proves the walk actually happened. v0.2.95 F1 adds the
         # chunker re-sync's code-graph half here (force-recreate walks only).

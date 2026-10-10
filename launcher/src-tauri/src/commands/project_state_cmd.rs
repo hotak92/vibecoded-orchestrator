@@ -1293,6 +1293,31 @@ pub fn set_project_codegraph_binding_row_with_db(
     Ok(row)
 }
 
+/// v0.2.102 W6-B2: which model id a codegraph-binding save must validate —
+/// the selection (`config.code_model_target`) when present, else
+/// `embedding_model` but only when it differs from the stored record. Pure
+/// over the DB read (unit-tested).
+pub(crate) fn codegraph_model_to_validate(
+    db: &Db,
+    project_id: &str,
+    req: &SetCodegraphBindingReq,
+) -> Option<String> {
+    let non_empty = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    if let Some(target) = req.config.get("code_model_target").and_then(|v| v.as_str()).and_then(non_empty) {
+        return Some(target);
+    }
+    let model = req.embedding_model.as_deref().and_then(non_empty)?;
+    let stored = db
+        .get_project_codegraph_binding(project_id)
+        .ok()
+        .flatten()
+        .and_then(|b| b.embedding_model);
+    (stored.as_deref().map(str::trim) != Some(model.as_str())).then_some(model)
+}
+
 #[command]
 pub async fn set_project_codegraph_binding(
     project_id: String,
@@ -1304,16 +1329,22 @@ pub async fn set_project_codegraph_binding(
     // `set_project_kg_binding` above, but kind=Code. Rejects unknown
     // names so the GUI dropdown's "available" set is also the only set
     // that can be persisted.
-    if let Some(model_id) = req.embedding_model.as_deref().filter(|s| !s.trim().is_empty()) {
+    //
+    // v0.2.102 W6-B2: the model the user SELECTS is `config.code_model_target`
+    // (`embedding_model` is the record of what the graph is indexed with, which
+    // the Codegraph tab now sends back unchanged). Validate the selection, and
+    // the record only when it changed — a record whose backend is down right
+    // now must not block saving an unrelated edit.
+    if let Some(model_id) = codegraph_model_to_validate(&db, &project_id, &req) {
         let result = crate::commands::embedding_catalog::validate_model_against_catalog(
-            model_id.trim().to_string(),
+            model_id.clone(),
             crate::commands::embedding_catalog::ModelKind::Code,
             db.clone(),
         )
         .await?;
         if let crate::commands::embedding_catalog::ValidationResult::Invalid { reason } = result {
             return Err(format!(
-                "embedding_model '{}' not valid for codegraph binding: {}",
+                "code-embedding model '{}' not valid for codegraph binding: {}",
                 model_id, reason
             ));
         }
@@ -1855,6 +1886,28 @@ mod tests {
             .unwrap()
             .expect("binding row present");
         assert_eq!(stored.collection_prefix, "Custom_Prefix");
+    }
+
+    /// v0.2.102 W6-B2: the save validates the SELECTION (code_model_target),
+    /// and the record only when it changed — an unchanged record (whose
+    /// backend may be down) never blocks an unrelated edit.
+    #[test]
+    fn codegraph_save_validates_the_selection_not_an_unchanged_record() {
+        let db = make_db();
+        seed_project(&db, "p-sel", "Sel");
+        let mut req = codegraph_req("Sel");
+        req.embedding_model = Some("codesage-large-v2".into());
+        // No stored row yet → a (new) record is validated.
+        assert_eq!(codegraph_model_to_validate(&db, "p-sel", &req).as_deref(), Some("codesage-large-v2"));
+        set_project_codegraph_binding_row_with_db(&db, "p-sel", &req).unwrap();
+        // Same record sent back unchanged → nothing to validate.
+        assert_eq!(codegraph_model_to_validate(&db, "p-sel", &req), None);
+        // A selection → the selection is validated.
+        req.config = serde_json::json!({"code_model_target": "qwen3-embedding:0.6b"});
+        assert_eq!(
+            codegraph_model_to_validate(&db, "p-sel", &req).as_deref(),
+            Some("qwen3-embedding:0.6b")
+        );
     }
 
     /// v0.2.101 (Q4 retirement): the `delete_project_codegraph_binding`

@@ -45,6 +45,10 @@ export const APP_STATE_KEY_KG_SUMMARY_OLLAMA_MODEL = 'kg_summary_ollama_model';
 export const APP_STATE_KEY_CODE_EMBED_OVERRIDE = 'code_embed_backend_override';
 export const APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL = 'code_embed_openai_model';
 export const APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL = 'code_embed_ollama_model';
+// v0.2.102 W6-B2 (owner ruling 2026-10-10): OpenAI EMBEDDINGS (KG text + code
+// graph) have their own consent, separate from the summaries one above.
+// MUST MATCH vco_lib/openai_consent.py APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT.
+export const APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT = 'openai_embeddings_consent';
 export const APP_STATE_KEY_ACTIVE_EMBEDDING = 'embedding.active_profile';
 export const APP_STATE_KEY_HARDWARE_SNAPSHOT = 'launcher.hardware_snapshot';
 
@@ -161,6 +165,21 @@ export const PREF_LOADERS = {
         appStateGet(APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL),
         appStateGet(APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL),
       ]),
+  },
+  openAiEmbeddingsConsent: {
+    eager: false,
+    section: 'OpenAI API key + Code Graph Embeddings (the embeddings consent)',
+    /** null = never set (the Python reader then follows the active profile). */
+    load: () => appStateGetBool(APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT),
+  },
+  codeEmbedStatus: {
+    eager: false,
+    slow: true,
+    section: 'Code Graph Embeddings (per-project recorded vs target model + fill)',
+    /** v0.2.102 W6-B2: per project, the recorded (searched) model, the
+     *  selected target, its fill progress and whether it is OpenAI-billed —
+     *  computed by `python -m vco_lib.code_embed_model status` (slow). */
+    load: <S>() => invoke<S>('get_code_embed_model_status'),
   },
   ollamaModels: {
     eager: false,

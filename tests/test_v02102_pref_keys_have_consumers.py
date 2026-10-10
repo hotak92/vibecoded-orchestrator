@@ -17,9 +17,20 @@ Python (``vco_lib`` / ``claude_mcp_servers`` / ``templates`` / top level),
 shell or config. A key with no such reader needs an explicit entry in
 ``ALLOWLIST`` below naming its reader or supersession, so the exemption is
 a recorded decision, not an oversight.
+
+v0.2.102 W6-B2 (review MEDIUM-4): the presence scan was satisfied by a quoted
+key in a comment or docstring, or by a constant nothing reads. It now counts
+only a REAL read site: the literal in executable code (Python via ``ast``,
+docstrings excluded; Rust/shell/config with comments stripped), and — when
+the literal only initialises a named constant — that constant referenced again
+somewhere in the backend code. Still a floor, not a wiring proof: every key
+ALSO needs a value-mutation reader test (the
+``test_v02102_code_embed_preferences_readers.py`` /
+``test_v02102_summary_preferences_readers.py`` pattern).
 """
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -72,16 +83,89 @@ def _is_test_file(path: Path) -> bool:
     return any(marker in name for marker in _TEST_MARKERS)
 
 
-def _load_backend_text() -> str:
-    chunks: list[str] = []
-    for path in _iter_backend_files():
-        if _is_test_file(path):
-            continue
-        try:
-            chunks.append(path.read_text(encoding="utf-8", errors="ignore"))
-        except OSError:
-            continue
-    return "\n".join(chunks)
+_RUST_COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+_HASH_COMMENT = re.compile(r"(?m)^\s*#[^\n]*$")
+
+
+def _docstring_nodes(tree: ast.AST) -> set:
+    out = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body and isinstance(body[0], ast.Expr) \
+                and isinstance(getattr(body[0], "value", None), ast.Constant):
+            out.add(id(body[0].value))
+    return out
+
+
+class _Backend:
+    """Backend code with comments and docstrings removed: per Python file its
+    AST, per other file its comment-stripped text."""
+
+    def __init__(self) -> None:
+        self.py: list[ast.AST] = []
+        self.text: list[str] = []
+        for path in _iter_backend_files():
+            if _is_test_file(path):
+                continue
+            try:
+                src = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if path.suffix == ".py":
+                try:
+                    self.py.append(ast.parse(src))
+                    continue
+                except SyntaxError:
+                    pass
+            self.text.append(self.strip(path.suffix, src))
+
+    @staticmethod
+    def strip(suffix: str, src: str) -> str:
+        """Comment-stripped text of a non-Python backend file."""
+        if suffix == ".rs":
+            return _RUST_COMMENT.sub("", src)
+        if suffix in {".sh", ".ps1", ".toml"}:
+            return _HASH_COMMENT.sub("", src)
+        return src
+
+    def _py_names(self) -> "dict[str, int]":
+        if not hasattr(self, "_names"):
+            counts: dict[str, int] = {}
+            for tree in self.py:
+                for node in ast.walk(tree):
+                    name = (node.id if isinstance(node, ast.Name)
+                            else node.attr if isinstance(node, ast.Attribute)
+                            else node.name if isinstance(node, ast.alias) else None)
+                    if name:
+                        counts[name] = counts.get(name, 0) + 1
+            self._names = counts
+        return self._names
+
+    def has_real_read(self, key: str) -> bool:
+        for tree in self.py:
+            docs = _docstring_nodes(tree)
+            parents = {id(c): n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Constant) and node.value == key) or id(node) in docs:
+                    continue
+                parent = parents.get(id(node))
+                targets = (parent.targets if isinstance(parent, ast.Assign)
+                           else [parent.target] if isinstance(parent, ast.AnnAssign) else None)
+                if targets is None:
+                    return True  # used inline (a call argument, a comparison, …)
+                names = [t.id for t in targets if isinstance(t, ast.Name)]
+                # A constant counts once somebody reads it: the assignment is
+                # one Name occurrence, a reader is a second.
+                if any(self._py_names().get(n, 0) >= 2 for n in names):
+                    return True
+        for text in self.text:
+            for m in re.finditer(r'"' + re.escape(key) + r'"', text):
+                const = re.search(r"const\s+(\w+)\s*:\s*&str\s*=\s*$", text[:m.start()])
+                if const is None:
+                    return True
+                if len(re.findall(r"\b" + const.group(1) + r"\b", "\n".join(self.text))) >= 2:
+                    return True
+        return False
 
 
 def _pref_keys() -> dict[str, str]:
@@ -95,12 +179,12 @@ def _pref_keys() -> dict[str, str]:
 
 
 def test_every_pref_key_has_a_backend_consumer():
-    backend = _load_backend_text()
+    backend = _Backend()
     keys = _pref_keys()
     missing = [
         f"{const} = '{key}'"
         for const, key in sorted(keys.items())
-        if key not in ALLOWLIST and f'"{key}"' not in backend
+        if key not in ALLOWLIST and not backend.has_real_read(key)
     ]
     assert not missing, (
         "Preferences app_state keys with NO non-frontend consumer (the F1 "
@@ -110,10 +194,10 @@ def test_every_pref_key_has_a_backend_consumer():
 
 
 def test_allowlist_entries_are_not_stale():
-    backend = _load_backend_text()
+    backend = _Backend()
     keys = _pref_keys()
     stale = [
-        key for key in ALLOWLIST if key in keys and f'"{key}"' in backend
+        key for key in ALLOWLIST if key in keys and backend.has_real_read(key)
     ]
     assert not stale, (
         "ALLOWLIST entries whose key now HAS a backend reader (remove the "
@@ -127,3 +211,23 @@ def test_allowlist_only_names_real_keys():
     assert not unknown, (
         "ALLOWLIST names keys loaders.ts no longer exports: " + ", ".join(unknown)
     )
+
+
+def test_a_comment_docstring_or_unread_constant_is_not_a_reader():
+    """The tightened census rejects exactly the shapes the review named."""
+    fake = _Backend.__new__(_Backend)
+    fake.py = [ast.parse(
+        '"""Mentions "k_doc" in a docstring."""\n'
+        "# reads 'k_comment' here\n"
+        'UNREAD = "k_unread"\n'
+        'USED = "k_used"\n'
+        "def f(get):\n"
+        '    """also "k_doc"."""\n'
+        '    return get(USED), get("k_inline")\n'
+    )]
+    fake.text = [_Backend.strip(".rs", '// "k_rs_comment"\nconst DEAD: &str = "k_rs_dead";\n'
+                 'const LIVE: &str = "k_rs_live";\nfn g() { read(LIVE); read("k_rs_inline"); }\n')]
+    for key in ("k_doc", "k_comment", "k_unread", "k_rs_comment", "k_rs_dead"):
+        assert not fake.has_real_read(key), key
+    for key in ("k_used", "k_inline", "k_rs_live", "k_rs_inline"):
+        assert fake.has_real_read(key), key

@@ -222,7 +222,7 @@ class _GuardTestBase(unittest.TestCase):
             code_model_id = "fake-code-model"
 
             @classmethod
-            def for_project(cls, _root):
+            def for_project(cls, _root, **_kw):  # v0.2.102 W6-B2: + the code-model kwargs
                 return cls()
 
             def code_backend_ready(self):

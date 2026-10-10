@@ -12,7 +12,12 @@
     ModelChoice,
   } from '$lib/types/embedding-catalog';
   import Dropdown from '$lib/components/Dropdown.svelte';
-  import { canRemoveKgBinding, removeKgBinding } from './kg-bindings';
+  import {
+    canRemoveKgBinding,
+    codegraphBindingSaveReq,
+    codegraphSelectedModel,
+    removeKgBinding,
+  } from './kg-bindings';
   import EnrichmentProgressModal from '$lib/components/EnrichmentProgressModal.svelte';
   // v0.2.18 (Plan C): Re-analyze code-graph modal. Forks the enrichment
   // modal's streaming pattern against analyze_code_graph.py --json-progress.
@@ -76,28 +81,15 @@
   // single-collection Tauri command sequentially across the list,
   // streams vct-enrichment-progress events, and closes on completion.
   //
-  // The shape is multi-collection because the codegraph Save path
-  // enrich-migrates 5 sibling Code* classes (CodeModule/CodeClass/
-  // CodeFunction/CodeAPI/CodeInteraction) — see CODE_COLLECTION_SUFFIXES
-  // below. The KG Save path wraps its single collection in a 1-element
-  // list to keep the modal contract uniform.
+  // The shape is multi-collection (the modal contract); the KG Save path
+  // wraps its single collection in a 1-element list. v0.2.102 W6-B2: the
+  // codegraph Save path no longer enriches — the next code-graph run fills
+  // the selected model's slot with the analyzer's own embed text (the
+  // enrichment filled it from a raw property, with whatever model the env
+  // resolved).
   type CollectionTarget = { name: string; new_slot: string };
   type EnrichmentTarget = { collections: CollectionTarget[] };
   let enrichmentTarget = $state<EnrichmentTarget | null>(null);
-
-  // Canonical code-class suffixes, ORDER-PRESERVING (Python's
-  // `_CODE_COLLECTION_SUFFIXES` is a frozenset which has no canonical
-  // order; we mirror the order used throughout vco_lib/weaviate_schema.py
-  // docstrings + log messages: Module, Class, Function, API, Interaction.
-  // The exact order affects only the UX (which class runs first); the
-  // correctness guarantee — enriching all 5 — is order-independent.
-  const CODE_COLLECTION_SUFFIXES = [
-    'CodeModule',
-    'CodeClass',
-    'CodeFunction',
-    'CodeAPI',
-    'CodeInteraction',
-  ] as const;
 
   // v0.2.18 (Plan C): Re-analyze code-graph modal driver state. Populated
   // when the user clicks "Re-analyze code graph"; the modal mounts on
@@ -166,7 +158,7 @@
       }
       if (snapshot.codegraph_binding) {
         cgPrefix = snapshot.codegraph_binding.collection_prefix;
-        cgEmbedding = snapshot.codegraph_binding.embedding_model ?? '';
+        cgEmbedding = codegraphSelectedModel(snapshot.codegraph_binding);
         cgEmbeddingInitial = cgEmbedding;
         cgEnabled = snapshot.codegraph_binding.enabled;
       }
@@ -263,9 +255,9 @@
     // Empty → set: no migration needed (fresh binding).
     if (!fromModel) return true;
     const msg = `Changing the ${kind === 'kg' ? 'KG' : 'code graph'} embedding model from
-"${fromModel}" to "${toModel}" will require re-embedding all existing
-nodes into the new vector slot. The previous slot's vectors will be
-preserved (you can revert without data loss).
+"${fromModel}" to "${toModel}" will re-embed all existing nodes into the
+new vector slot${kind === 'codegraph' ? ' on the next code-graph run' : ''}. The previous
+slot's vectors will be preserved (you can revert without data loss).
 
 Continue?`;
     return confirm(msg);
@@ -360,41 +352,22 @@ Continue?`;
       return;
     }
     try {
+      // v0.2.102 W6-B2: keep the record + build provenance + config; the
+      // selection goes to config.code_model_target (see kg-bindings.ts).
       await invoke<ProjectCodegraphBinding>('set_project_codegraph_binding', {
         projectId,
-        req: {
+        req: codegraphBindingSaveReq(snapshot?.codegraph_binding, {
           collection_prefix: cgPrefix.trim(),
-          embedding_model: cgEmbedding.trim() || null,
+          target_model: cgEmbedding.trim() || null,
           enabled: cgEnabled,
-          config: {},
-        },
+        }),
       });
       toast.success('Codegraph binding saved');
       if (cgEmbedding && cgEmbeddingInitial && cgEmbedding !== cgEmbeddingInitial) {
-        // Codegraph enrichment targets the per-class collections that
-        // the user's prefix expands to. v0.2.18 (Commit 9 + Commit 10):
-        // expand to ALL 5 sibling Code* classes (CodeModule, CodeClass,
-        // CodeFunction, CodeAPI, CodeInteraction). Pre-Commit-10 we
-        // only enriched CodeFunction, which silently left the 4 other
-        // classes on the old slot and made search return empty against
-        // them (because search_code_graph queries the active slot per
-        // EmbeddingService.code_vector_slot). Enriching all 5 is a
-        // correctness requirement, not a perf optimisation.
-        const slot = resolveSlot('codegraph', cgEmbedding);
-        const prefix = cgPrefix.trim();
-        if (slot && prefix) {
-          enrichmentTarget = {
-            collections: CODE_COLLECTION_SUFFIXES.map((suffix) => ({
-              name: `${prefix}${suffix}`,
-              new_slot: slot,
-            })),
-          };
-        } else {
-          toast.error(
-            `Saved binding but couldn't resolve a slot for ${cgEmbedding}; `
-            + 'manual enrichment may be needed.',
-          );
-        }
+        toast.success(
+          `The next code-graph run adds ${cgEmbedding}'s vectors beside the existing ones `
+          + 'and switches searches to it once complete (Preferences → Code Graph Embeddings shows progress).',
+        );
       }
       await load();
     } catch (e) {

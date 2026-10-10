@@ -145,21 +145,121 @@ describe('W6-B F1 — Code Graph Embeddings writes + effect-timing copy', () => 
     },
   );
 
-  it('the section copy states the effect timing (next indexing run) and the env precedence', () => {
+  it('the section copy states the TRUE effect (W6-B2 round 2): applied automatically, additively', () => {
     const src = readFileSync(
       resolve(here, '../../routes/preferences/+page.svelte'),
       'utf8',
     );
-    // The reader lands on the NEXT indexer construction; the copy must not
-    // promise an instant switch, and must admit CODE_EMBED_* env wins.
-    expect(
-      src.includes('next code-graph indexing run'),
-      'the section must say the pin takes effect on the next indexing run',
-    ).toBe(true);
-    expect(
-      /CODE_EMBED_MODEL\s*\/\s*CODE_EMBED_BACKEND env override still wins/.test(src),
-      'the section must say an explicit CODE_EMBED_* env override still wins',
-    ).toBe(true);
+    // Red on 2cc19a9c: the copy promised "next indexing run" and that
+    // CODE_EMBED_BACKEND env wins — neither true under the one resolver.
+    expect(src).not.toContain('next code-graph indexing run');
+    expect(src).not.toMatch(/CODE_EMBED_BACKEND env override still wins/);
+    expect(src).toContain('A change is applied automatically');
+    expect(src).toContain('nothing is');
+    expect(src).toContain('until the new one is complete');
+    expect(src).not.toContain('--apply-code-model-change');
+  });
+});
+
+// ─── W6-B2 — per-project recorded model, target, fill progress, cost ───────
+
+describe('W6-B2 — the section shows each graph\'s recorded model, target and fill progress', () => {
+  it('the codeEmbedStatus loader invokes get_code_embed_model_status (lazy + slow)', async () => {
+    const { PREF_LOADERS } = await import('./loaders');
+    expect(PREF_LOADERS.codeEmbedStatus.eager).toBe(false);
+    expect(PREF_LOADERS.codeEmbedStatus.slow).toBe(true);
+    const loadersSrc = readFileSync(resolve(here, './loaders.ts'), 'utf8');
+    expect(loadersSrc).toMatch(/codeEmbedStatus:[\s\S]*?invoke<S>\('get_code_embed_model_status'\)/);
+  });
+
+  it('loadCodeEmbedStatus goes through the registry and keeps the error for the section', () => {
+    const fn = findFunction(PREFS.instance, 'loadCodeEmbedStatus');
+    expect(fn, 'no loadCodeEmbedStatus()').toBeTruthy();
+    const loads = [...walk(fn)].filter(
+      (n) => n.type === 'MemberExpression' && isIdent(n.property, 'codeEmbedStatus'),
+    );
+    expect(loads.length, 'must read PREF_LOADERS.codeEmbedStatus').toBeGreaterThan(0);
+    expect(identifiers(fn).has('codeEmbedStatusError')).toBe(true);
+  });
+
+  it.each(['saveCodeEmbedOverride', 'saveCodeEmbedOpenaiModel', 'saveCodeEmbedOllamaModel', 'saveOpenAiEmbeddingsConsent'])(
+    "%s refreshes the per-project status AFTER the save resolves",
+    (handler) => {
+      const fn = findFunction(PREFS.instance, handler) as Node;
+      const refreshes = memberCallArgs(fn, 'loaders', 'refresh').filter(
+        (a) => a && (a.value as string) === 'codeEmbedStatus',
+      );
+      expect(refreshes.length, `${handler} must call loaders.refresh('codeEmbedStatus')`).toBe(1);
+      const invoke = callsNamed(fn, 'invoke')[0];
+      expect(startOf(refreshes[0])).toBeGreaterThan(startOf(invoke));
+    },
+  );
+
+  it('the template renders recorded model, target, fill progress and cost per project', () => {
+    const block = elements(PREFS.fragment, 'div').find(
+      (d) => attrText(d, 'data-testid') === 'code-embed-status',
+    );
+    expect(block, 'the status block').toBeTruthy();
+    const ids = identifiers(block);
+    for (const used of ['codeEmbedStatus', 'codeEmbedFillText', 'codeEmbedStatusError']) {
+      expect(ids.has(used), `status block uses ${used}`).toBe(true);
+    }
+    const props = new Set(
+      [...walk(block)]
+        .filter((n) => n.type === 'MemberExpression' && (n.property as Node)?.type === 'Identifier')
+        .map((n) => (n.property as Node).name as string),
+    );
+    for (const field of ['recorded_model', 'target_model', 'cost_bearing', 'target_refused']) {
+      expect(props.has(field), `status block reads p.${field}`).toBe(true);
+    }
+  });
+
+  it('the fill text states n of N, complete, not-started and refused truthfully', () => {
+    const fn = findFunction(PREFS.instance, 'codeEmbedFillText') as Node;
+    expect(fn).toBeTruthy();
+    const src = readFileSync(resolve(here, '../../routes/preferences/+page.svelte'), 'utf8')
+      .slice(startOf(fn), (fn.end as number));
+    for (const needle of ["'complete'", 'filled} of ${p.total}', 'next code-graph run', 'not allowed']) {
+      expect(src, needle).toContain(needle);
+    }
+  });
+});
+
+// ─── W6-B2 — two OpenAI toggles: summaries vs embeddings ───────────────────
+
+describe('W6-B2 — OpenAI summaries and embeddings are separate toggles', () => {
+  const src = readFileSync(resolve(here, '../../routes/preferences/+page.svelte'), 'utf8');
+
+  it('the summaries toggle says summaries only; the embeddings toggle says KG + code graph', () => {
+    expect(src).toContain('<span>Allow OpenAI for KG summaries (incurs cost)</span>');
+    expect(src).toContain('<span>Allow OpenAI for embeddings (KG + code graph; incurs cost)</span>');
+  });
+
+  it('the embeddings toggle writes openai_embeddings_consent via app_state_set_bool', () => {
+    const fn = findFunction(PREFS.instance, 'saveOpenAiEmbeddingsConsent') as Node;
+    expect(fn).toBeTruthy();
+    const invokes = callsNamed(fn, 'invoke');
+    expect((invokes[0].arguments as Node[])[0].value).toBe('app_state_set_bool');
+    expect(identifiers((invokes[0].arguments as Node[])[1]).has('APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT')).toBe(true);
+    const label = elements(PREFS.fragment, 'label').find(
+      (l) => attrText(l, 'data-testid') === 'openai-embeddings-consent',
+    );
+    expect(identifiers(label).has('saveOpenAiEmbeddingsConsent')).toBe(true);
+  });
+
+  it('the code-graph OpenAI radio is gated on the EMBEDDINGS consent, not the summaries one', () => {
+    const radio = elements(PREFS.fragment, 'input').find(
+      (i) => attrText(i, 'name') === 'code-embed-override' && attrText(i, 'value') === 'openai',
+    ) as Node;
+    const ids = identifiers(attr(radio, 'disabled'));
+    expect(ids.has('openaiEmbeddingsConsent')).toBe(true);
+    expect(ids.has('kgSummaryConsent')).toBe(false);
+  });
+
+  it('the consent key matches the Python reader', async () => {
+    const { APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT } = await import('./loaders');
+    const py = readFileSync(resolve(here, '../../../../vco_lib/openai_consent.py'), 'utf8');
+    expect(py).toContain(`APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT = "${APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT}"`);
   });
 });
 

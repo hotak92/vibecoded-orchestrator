@@ -3427,6 +3427,7 @@ pub fn run() {
             commands::embedding_catalog::get_embedding_catalog,
             commands::embedding_catalog::set_default_embedding_models,
             commands::embedding_catalog::get_default_embedding_models,
+            commands::embedding_catalog::get_code_embed_model_status,
             commands::embedding_catalog::validate_model_against_catalog,
             // Embedding enrichment migration (v0.2.18, Commit 9). Spawns
             // `python -m vco_lib.embedding_enrichment enrich` with

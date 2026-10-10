@@ -1418,14 +1418,12 @@ impl Db {
     /// contract (see `db/bindings_writer.rs` header) intact: the hub calls
     /// THIS method rather than copying the launcher's stamping logic.
     ///
-    /// Deliberately narrower than the launcher path:
+    /// Same narrowness as the launcher path:
     ///   * `embedding_model` / `embedding_dim` / `config_json` are NEVER
-    ///     touched — the drift classifier that decides whether a live tier
-    ///     may overwrite the stored space is launcher-side machinery
-    ///     (`classify_embedding_change` + app_state), and the detached
-    ///     resync re-embeds into the binding's EXISTING space by
-    ///     construction, so commit/timestamp are the only facts it can
-    ///     honestly advance.
+    ///     touched — since v0.2.102 W6-B2 the code-model RECORD and the fill
+    ///     progress are owned by `vco_lib.code_embed_model` (stamped when a
+    ///     slot is complete), so commit/timestamp are the only facts a build
+    ///     can honestly advance.
     ///   * UPDATE-only, never an upsert: hub-side we don't know the
     ///     canonical `collection_prefix`, and seeding a binding is the
     ///     launcher/build path's job. No binding → `Ok(false)` leave-alone.

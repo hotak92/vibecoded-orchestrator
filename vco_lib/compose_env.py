@@ -37,6 +37,27 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 
+#: The code_embed SERVICE's GPU-backend model id (the sentence-transformers /
+#: HuggingFace form). MUST MATCH ``code_embedding_service/server.py``
+#: ``GPU_DEFAULT_MODEL`` and the compose default.
+CODE_EMBED_GPU_MODEL = "codesage/codesage-large-v2"
+
+
+def code_embed_service_model(embed_config: dict) -> Optional[str]:
+    """The model the code_embed service must load for this install's backend:
+    the tier table's ``code_model`` when it is an Ollama model (``ollama``
+    backend), CodeSage for the ``gpu`` backend, nothing otherwise (``openai``
+    runs no service)."""
+    backend = str(embed_config.get("code_backend", "") or "").strip().lower()
+    model = str(embed_config.get("code_model", "") or "").strip()
+    if backend == "gpu":
+        return CODE_EMBED_GPU_MODEL
+    if backend == "ollama" and model and "codesage" not in model.lower() \
+            and not model.lower().startswith(("openai-", "text-embedding-")):
+        return model
+    return None
+
+
 def compose_substitution_env(embed_config: dict) -> dict[str, str]:
     """Keys docker-compose.yml substitutes that install.py COMPUTES
     (rather than inheriting from the caller's environment).
@@ -52,6 +73,15 @@ def compose_substitution_env(embed_config: dict) -> dict[str, str]:
     backend = str(embed_config.get("code_backend", "") or "")
     if backend:
         env["CODE_EMBED_BACKEND"] = backend
+    # v0.2.102 W6-B2 (owner decision 6): the service's MODEL follows its
+    # backend. docker-compose.yml hardcoded `codesage/codesage-large-v2`, so an
+    # `ollama`-backend service (CPU / AMD-GPU hosts) asked Ollama for a model it
+    # does not serve. The model now comes from the SAME tier table the client
+    # resolver's install default does (`code_model` after the tier overrides —
+    # what install writes as `default_code_embedding` and the pull plan pulls).
+    model = code_embed_service_model(embed_config)
+    if model:
+        env["CODE_EMBED_MODEL"] = model
     # CUDA Dockerfile only for NVIDIA hosts (AMD ROCm / Apple / CPU stay
     # on the multi-arch CPU default — there is no ROCm code-embed image).
     if embed_config.get("gpu_vendor") == "nvidia":

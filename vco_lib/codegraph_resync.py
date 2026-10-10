@@ -3072,16 +3072,17 @@ def _maybe_run_exposure_heal(repo_root: Path, project_name: str) -> bool:
     return True
 
 
-def _active_code_slot() -> Optional[str]:
-    """The named-vector slot the configured code model writes to — the slot the
-    analyzer will embed into on this machine (``EmbeddingService.for_project``
-    resolves it exactly as the analyzer's own service does). ``None`` when it
+def _active_code_slot(project_name: Optional[str] = None) -> Optional[str]:
+    """The named-vector slot ``project_name``'s code graph embeds into — the
+    slot the analyzer writes for that graph (``EmbeddingService.for_project``
+    with the graph's prefix resolves it exactly as the analyzer's own service
+    does: its recorded model, v0.2.102 W6-B2). ``None`` when it
     cannot be resolved (no backend reachable / import failure): the caller then
     does not audit — never guesses a slot to judge rows against."""
     try:
         from vco_lib.embedding_service import EmbeddingService
 
-        svc = EmbeddingService.for_project()
+        svc = EmbeddingService.for_project(codegraph_prefix=project_name)
         try:
             return svc.code_vector_slot or None
         finally:
@@ -3103,6 +3104,12 @@ def vectorless_audit_owed(project_name: str, current_revision: int) -> bool:
     return not (key or "").endswith(f"@{int(current_revision)}")
 
 
+#: The owed-list name of a pending code-model fill (not an audit: it has no
+#: ledger record — it stops being owed when the slot is complete and the
+#: record flips).
+CODE_MODEL_FILL_OWED = "code_model_fill"
+
+
 def _one_time_audits_owed(
     project_name: str, analyzer: Optional[Path], index_dot_claude: bool,
 ) -> list:
@@ -3121,6 +3128,17 @@ def _one_time_audits_owed(
             owed.append(_audits.AUDIT_IGNORED_PATHS)
     except Exception as exc:  # noqa: BLE001
         logger.debug("codegraph resync: ignore-purge gate read failed: %s", exc)
+    # v0.2.102 W6-B2 (owner ruling 2026-10-10): a selected code model whose
+    # slot is still being filled is owed work of the same kind — the bundle
+    # update spawns the ordinary full, revision-gated walk, whose analyzer adds
+    # the slot and embeds only the rows that lack it.
+    try:
+        from vco_lib.code_embed_model import fill_owed
+
+        if fill_owed(project_name):
+            owed.append(CODE_MODEL_FILL_OWED)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("codegraph resync: code-model fill gate read failed: %s", exc)
     return owed
 
 
@@ -3209,7 +3227,7 @@ def _maybe_run_vectorless_audit(
     (``None`` when not run or undeterminable). Never raises.
     """
     revision = _resolve_embed_revision(analyzer_path)
-    slot = (slot_resolver or _active_code_slot)()
+    slot = slot_resolver() if slot_resolver else _active_code_slot(project_name)
     if not slot:
         return None
     key = f"{slot}@{revision}"

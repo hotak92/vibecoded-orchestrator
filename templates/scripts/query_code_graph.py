@@ -393,6 +393,9 @@ except Exception:
 
 
 _cached_embedding_service: "EmbeddingService | None" = None
+#: The code graph this run queries (set by main()); the service resolves THAT
+#: graph's recorded code model (v0.2.102 W6-B2, vco_lib.code_embed_model).
+_embedding_codegraph_prefix: "str | None" = None
 
 
 def _get_or_create_embedding_service():
@@ -403,7 +406,8 @@ def _get_or_create_embedding_service():
     if not HAS_EMBEDDING_SERVICE:
         return None
     try:
-        _cached_embedding_service = EmbeddingService.for_project()
+        _cached_embedding_service = EmbeddingService.for_project(
+            codegraph_prefix=_embedding_codegraph_prefix)
         return _cached_embedding_service
     except Exception as e:
         print(f"⚠️  EmbeddingService construction failed: {e}", file=sys.stderr)
@@ -2243,6 +2247,13 @@ def main(argv=None):
             effective_project = None
     if not effective_project:
         effective_project = os.getenv("CODE_GRAPH_PROJECT") or os.getenv("PROJECT_NAME") or None
+
+    # The query embedding must be in the space THIS graph is indexed in.
+    global _embedding_codegraph_prefix, _cached_embedding_service
+    if effective_project != _embedding_codegraph_prefix:
+        if _cached_embedding_service is not None:
+            _cached_embedding_service.close()
+        _embedding_codegraph_prefix, _cached_embedding_service = effective_project, None
 
     # Create query interface
     querier = CodeGraphQuery(project=effective_project)

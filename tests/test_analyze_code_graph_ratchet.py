@@ -116,7 +116,9 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # `_ensure_*` loop bodies behind `vco_lib.codegraph_schema.ensure_analyzer_
 # properties` and routing `_write_one_object`'s inline point-read through the
 # one fingerprint seam — net 7157 -> 7027 (after the review round), re-pinned DOWNWARD.
-_ANALYZER_LINES_MAX = 7027
+# v0.2.102 (W6-B2): the code-model decision moved behind
+# `vco_lib.code_embed_model` (two thin seams here) — net 7027 -> 7025, re-pinned DOWNWARD.
+_ANALYZER_LINES_MAX = 7025
 
 
 def _measure() -> int:

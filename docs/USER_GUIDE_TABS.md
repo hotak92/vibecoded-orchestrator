@@ -690,8 +690,12 @@ same function as KG bindings.
 
 - Disable code graph for a project (e.g. it's not a code project):
   toggle `enabled = false` and skip running the analyzer.
-- Switch embedding model: change `embedding_model` and
-  `embedding_dim`, then run `code-graph-analyze` to re-embed.
+- Switch embedding model: pick it here (or in Preferences → Code Graph
+  Embeddings). The choice is applied automatically: the next code-graph run
+  adds the new model's named vector beside the old one and embeds only the
+  rows without it (it logs the object count, and whether it is OpenAI-billed,
+  before it starts). `embedding_model` stays the RECORD searches use until the
+  new slot is complete; switching back to a still-complete model is instant.
 
 #### Gotchas
 
@@ -699,12 +703,14 @@ same function as KG bindings.
   you change `collection_prefix`, you must rebuild the code graph
   from scratch — the old `Acme_CodeFunction` collection won't be
   queried under the new prefix.
-- `embedding_dim` mismatches with `embedding_model` will produce
-  garbage results silently. The launcher does not validate the
-  pairing.
-- The CodeSage service (port 11440) must be running. If you set
-  `CODE_EMBED_BACKEND=ollama` in the env, the launcher row is
-  display-only — actual embeddings come from Ollama.
+- The model each code graph embeds and searches with is resolved in ONE place
+  (`vco_lib/code_embed_model.py`): this row's recorded model once the graph is
+  built, otherwise the selected target (`CODE_EMBED_MODEL` env → this tab's
+  selection → Preferences pin → install default). A model whose
+  RECORDED named vector the existing collections do not declare is refused
+  with exit 6, never written as silent 422s.
+- The CodeSage service (port 11440) must be running when the recorded model
+  is CodeSage.
 
 ---
 

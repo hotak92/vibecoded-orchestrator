@@ -679,7 +679,7 @@ class ContentPropertyTests(_BaseEnrichmentTest):
         ]
         collection = _FakeCollection(objs)
         client = _FakeClient({self.CODE_COLL: collection})
-        svc = _FakeEmbeddingService()
+        svc = _FakeEmbeddingService(code_vector_slot="jina_embed")
         ee.enrich_collection_vectors(
             collection_name=self.CODE_COLL,
             new_slot="jina_embed",
@@ -705,7 +705,7 @@ class ContentPropertyTests(_BaseEnrichmentTest):
         ]
         collection = _FakeCollection(objs)
         client = _FakeClient({coll_name: collection})
-        svc = _FakeEmbeddingService()
+        svc = _FakeEmbeddingService(code_vector_slot="jina_embed")
         ee.enrich_collection_vectors(
             collection_name=coll_name,
             new_slot="jina_embed",
@@ -728,7 +728,7 @@ class ContentPropertyTests(_BaseEnrichmentTest):
         ]
         collection = _FakeCollection(objs)
         client = _FakeClient({coll_name: collection})
-        svc = _FakeEmbeddingService()
+        svc = _FakeEmbeddingService(code_vector_slot="jina_embed")
         ee.enrich_collection_vectors(
             collection_name=coll_name,
             new_slot="jina_embed",
@@ -1134,7 +1134,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
                 )
                 collection = _FakeCollection([obj])
                 client = _FakeClient({coll_name: collection})
-                svc = _FakeEmbeddingService()
+                svc = _FakeEmbeddingService(code_vector_slot="jina_embed")
 
                 report = ee.enrich_collection_vectors(
                     collection_name=coll_name,
@@ -1208,7 +1208,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
                 for i in range(3)
             ]
             client = _FakeClient({coll_name: _FakeCollection(objs)})
-            svc = _FakeEmbeddingService()
+            svc = _FakeEmbeddingService(code_vector_slot="jina_embed")
 
             report = ee.enrich_collection_vectors(
                 collection_name=coll_name,
@@ -1262,7 +1262,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
         r_mod = ee.enrich_collection_vectors(
             collection_name="SoftFail_CodeModule",
             new_slot="jina_embed",
-            embedding_service=_FakeEmbeddingService(),
+            embedding_service=_FakeEmbeddingService(code_vector_slot="jina_embed"),
             weaviate_client_factory=lambda: client_mod,
         )
         self.assertEqual(r_mod.enriched, 1)
@@ -1272,7 +1272,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
             ee.enrich_collection_vectors(
                 collection_name="SoftFail_CodeAPI",
                 new_slot="jina_embed",
-                embedding_service=_FakeEmbeddingService(),
+                embedding_service=_FakeEmbeddingService(code_vector_slot="jina_embed"),
                 weaviate_client_factory=lambda: _FakeClient({}),
             )
 
@@ -1290,7 +1290,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
         r_fn = ee.enrich_collection_vectors(
             collection_name="SoftFail_CodeFunction",
             new_slot="jina_embed",
-            embedding_service=_FakeEmbeddingService(),
+            embedding_service=_FakeEmbeddingService(code_vector_slot="jina_embed"),
             weaviate_client_factory=lambda: client_fn,
         )
         self.assertEqual(r_fn.enriched, 1)

@@ -19,6 +19,7 @@
     APP_STATE_KEY_CODE_EMBED_OVERRIDE,
     APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL,
     APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL,
+    APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT,
     APP_STATE_KEY_ACTIVE_EMBEDDING,
     OLLAMA_URL,
   } from '$lib/preferences/loaders';
@@ -1449,6 +1450,7 @@
       });
       codeEmbedOverride = next;
       codeEmbedSaved = true;
+      loaders.refresh('codeEmbedStatus');
       setTimeout(() => { codeEmbedSaved = false; }, 2000);
     } catch (e) {
       codeEmbedError = String(e);
@@ -1468,6 +1470,7 @@
       });
       codeEmbedOpenaiModel = next;
       codeEmbedSaved = true;
+      loaders.refresh('codeEmbedStatus');
       setTimeout(() => { codeEmbedSaved = false; }, 2000);
     } catch (e) {
       codeEmbedError = String(e);
@@ -1487,11 +1490,98 @@
       });
       codeEmbedOllamaModel = next;
       codeEmbedSaved = true;
+      loaders.refresh('codeEmbedStatus');
       setTimeout(() => { codeEmbedSaved = false; }, 2000);
     } catch (e) {
       codeEmbedError = String(e);
     } finally {
       codeEmbedSaving = false;
+    }
+  }
+
+  // v0.2.102 W6-B2: per-project truth for the section — the model each code
+  // graph is RECORDED as indexed with (searches use it), the selected target
+  // and its fill progress. Shape: `python -m vco_lib.code_embed_model status`.
+  interface CodeEmbedProjectStatus {
+    project_id: string | null;
+    name: string | null;
+    prefix: string;
+    recorded_model: string | null;
+    target_model: string;
+    target_source: string;
+    filling: boolean;
+    filled: number | null;
+    total: number | null;
+    complete: boolean;
+    cost_bearing: boolean;
+    target_refused: boolean;
+  }
+  interface CodeEmbedStatus {
+    target: string;
+    target_source: string;
+    target_cost_bearing: boolean;
+    openai_embeddings_consent: boolean;
+    projects: CodeEmbedProjectStatus[];
+  }
+  let codeEmbedStatus = $state<CodeEmbedStatus | null>(null);
+  let codeEmbedStatusLoading = $state(false);
+  let codeEmbedStatusError = $state<string | null>(null);
+
+  async function loadCodeEmbedStatus() {
+    codeEmbedStatusLoading = true;
+    codeEmbedStatusError = null;
+    try {
+      codeEmbedStatus = await PREF_LOADERS.codeEmbedStatus.load<CodeEmbedStatus>();
+    } catch (e) {
+      codeEmbedStatus = null;
+      codeEmbedStatusError = String(e);
+    } finally {
+      codeEmbedStatusLoading = false;
+    }
+  }
+
+  /** Fill progress, truthful: "n of N", "starts on the next code-graph run",
+   *  or "complete". */
+  function codeEmbedFillText(p: CodeEmbedProjectStatus): string {
+    if (p.complete) return 'complete';
+    if (p.target_refused) return 'not filled — OpenAI embeddings are not allowed';
+    if (!p.recorded_model) return 'not indexed yet — its first run embeds the target';
+    if (p.filled !== null && p.total !== null) return `${p.filled} of ${p.total} filled`;
+    const n = p.total === null ? '' : ` (${p.total} objects)`;
+    return `fill starts on the next code-graph run${n}`;
+  }
+
+  // v0.2.102 W6-B2: the OpenAI EMBEDDINGS consent (KG text + code graph) —
+  // separate from the summaries consent (owner ruling 2026-10-10). null =
+  // never set: the reader then follows the active embedding profile
+  // (vco_lib/openai_consent.py); nothing is written on the user's behalf.
+  let openaiEmbeddingsConsent = $state<boolean | null>(null);
+  let openaiEmbeddingsSaving = $state(false);
+  let openaiEmbeddingsError = $state<string | null>(null);
+
+  async function loadOpenAiEmbeddingsConsent() {
+    openaiEmbeddingsError = null;
+    try {
+      openaiEmbeddingsConsent = await PREF_LOADERS.openAiEmbeddingsConsent.load();
+    } catch (e) {
+      openaiEmbeddingsError = String(e);
+    }
+  }
+
+  async function saveOpenAiEmbeddingsConsent(next: boolean) {
+    openaiEmbeddingsSaving = true;
+    openaiEmbeddingsError = null;
+    try {
+      await invoke<void>('app_state_set_bool', {
+        key: APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT,
+        value: next,
+      });
+      openaiEmbeddingsConsent = next;
+      loaders.refresh('codeEmbedStatus');
+    } catch (e) {
+      openaiEmbeddingsError = String(e);
+    } finally {
+      openaiEmbeddingsSaving = false;
     }
   }
 
@@ -2078,6 +2168,8 @@
     artifactTool: () => { shownPanels.artifactTool = true; },
     kgSummary: loadKgSummarySettings,
     codeEmbed: loadCodeEmbedSettings,
+    codeEmbedStatus: loadCodeEmbedStatus,
+    openAiEmbeddingsConsent: loadOpenAiEmbeddingsConsent,
     ollamaModels: fetchOllamaModels,
     stateDir: loadStateDir,
     pat: loadPat,
@@ -2457,7 +2549,7 @@
               }}
               disabled={kgSummarySaving || !openaiPresent}
             />
-            <span>Allow OpenAI for summaries &amp; embeddings (incurs cost)</span>
+            <span>Allow OpenAI for KG summaries (incurs cost)</span>
           </label>
           {#if !openaiPresent}
             <p class="pr-hint pr-kgsum-warn">
@@ -2470,8 +2562,9 @@
               Heads-up: each summary or embedding triggers an API call
               against the model picked below. Cost is small per call
               (≈$0.0001 with gpt-4o-mini, ≈$0.005 with gpt-4o) but adds
-              up across a large KG. Switch to Claude CLI or Local
-              Ollama any time to stop the spend.
+              up across a large KG. Switch to Claude CLI or Local Ollama any
+              time to stop the spend. OpenAI <em>embeddings</em> have their own
+              toggle under <strong>OpenAI API key</strong>.
             </p>
           {/if}
         </div>
@@ -2589,22 +2682,22 @@
          dropdown layout, different app_state keys. Read-only "detected"
          row reflects `default_code_embedding` (set by install.py during
          hardware selection). -->
-    <section class="pr-section" use:lazySection={{ loaders, keys: ['codeEmbed', 'ollamaModels'] }} aria-labelledby="pr-codeembed-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['codeEmbed', 'codeEmbedStatus', 'openAiEmbeddingsConsent', 'ollamaModels'] }} aria-labelledby="pr-codeembed-title">
       <h2 class="pr-section-title" id="pr-codeembed-title">Code Graph Embeddings</h2>
       <p class="pr-hint" style="margin-bottom: 10px;">
-        Override the backend the code-graph indexer uses for code-entity
-        embeddings (functions, classes, modules, APIs). Defaults to the
-        install-time detected backend; pin a specific one when you want
-        to evaluate alternatives or fall back from a paid model.
-        <!-- v0.2.102 W6-B (F1): the override is READ by the indexer's
-             embedding resolver (vco_lib/embedding_service.py), with
-             explicit CODE_EMBED_* env still winning. True promise: a pin
-             applies to the NEXT indexing run — existing objects keep
-             their vectors until re-indexed. -->
-        Takes effect on the next code-graph indexing run (a running indexer
-        keeps its resolution); already-indexed entities keep their stored
-        vectors until you re-index. An explicit CODE_EMBED_MODEL /
-        CODE_EMBED_BACKEND env override still wins over this pick.
+        Choose the model code-entity embeddings (functions, classes,
+        modules, APIs) should use. Defaults to the install-time detected
+        backend; pin a specific one to evaluate alternatives or fall back
+        from a paid model.
+        <!-- v0.2.102 W6-B2 (owner ruling 2026-10-10): applied automatically
+             and additively by vco_lib/code_embed_model.py. -->
+        A change is applied automatically: each project's next code-graph run
+        adds the new model's vectors beside the existing ones (nothing is
+        dropped) and embeds only what is missing; searches keep using the
+        model a graph is indexed with until the new one is complete, then
+        switch. Switching back to a model that is still complete is instant.
+        A per-project choice on the project's Codegraph tab, or an explicit
+        <code>CODE_EMBED_MODEL</code> environment variable, wins over this pick.
       </p>
 
       {#if codeEmbedLoading}
@@ -2619,6 +2712,36 @@
           <p class="pr-hint">
             <code>{detectedCodeModel || '(unset — install hasn\'t run hardware selection)'}</code>
           </p>
+        </div>
+
+        <!-- v0.2.102 W6-B2: per project — the recorded (searched) model, the
+             target, its fill progress and whether it is OpenAI-billed. -->
+        <div class="pr-kgsum-block" data-testid="code-embed-status">
+          <p class="pr-kgsum-block-label">Per-project code graphs</p>
+          {#if codeEmbedStatusLoading}
+            <p class="pr-hint">Reading each project's code-graph model…</p>
+          {:else if codeEmbedStatusError}
+            <p class="pr-hint pr-kgsum-warn">Couldn't read the code-graph models: {codeEmbedStatusError}</p>
+          {:else if codeEmbedStatus && codeEmbedStatus.projects.length > 0}
+            {#each codeEmbedStatus.projects as p (p.prefix)}
+              <div class="pr-codeembed-project">
+                <p class="pr-hint">
+                  <strong>{p.name ?? p.prefix}</strong> — searching
+                  <code>{p.recorded_model ?? '—'}</code>; target
+                  <code>{p.target_model}</code>: {codeEmbedFillText(p)}
+                  · {p.cost_bearing ? 'OpenAI-billed' : 'no API cost'}
+                </p>
+                {#if p.target_refused}
+                  <p class="pr-hint pr-kgsum-warn">
+                    The target is an OpenAI model but "Allow OpenAI for embeddings" is off —
+                    it is not filled and no API call is made.
+                  </p>
+                {/if}
+              </div>
+            {/each}
+          {:else}
+            <p class="pr-hint">No project has a code graph yet.</p>
+          {/if}
         </div>
 
         <div class="pr-kgsum-block">
@@ -2674,9 +2797,9 @@
               value="openai"
               checked={codeEmbedOverride === 'openai'}
               onchange={() => void saveCodeEmbedOverride('openai')}
-              disabled={codeEmbedSaving || !kgSummaryConsent}
+              disabled={codeEmbedSaving || !openaiEmbeddingsConsent}
             />
-            <span>OpenAI embeddings (requires the consent above; cost per call)</span>
+            <span>OpenAI embeddings (requires "Allow OpenAI for embeddings"; billed per call — the switch embeds the graph once)</span>
           </label>
           <label class="pr-kgsum-radio">
             <input
@@ -2994,7 +3117,7 @@
          breadcrumbs. Per the v0.2.18 locked rule, post-Apply success
          shows a styled-modal consent prompt before flipping the new-
          project defaults to openai-*. -->
-    <section class="pr-section" use:lazySection={{ loaders, keys: ['openAi'] }} aria-labelledby="pr-openai-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['openAi', 'openAiEmbeddingsConsent'] }} aria-labelledby="pr-openai-title">
       <h2 class="pr-section-title" id="pr-openai-title">OpenAI API key (optional)</h2>
       <div class="pr-pat-row">
         <div class="pr-onboarding-text">
@@ -3013,6 +3136,28 @@
             probe (no tokens consumed). Leaving this blank keeps the launcher on
             local models (recommended for most users).
           </span>
+          <!-- v0.2.102 W6-B2: the EMBEDDINGS consent (KG text + code graph). -->
+          <label class="pr-kgsum-checkbox" data-testid="openai-embeddings-consent">
+            <input
+              type="checkbox"
+              checked={openaiEmbeddingsConsent === true}
+              onchange={(e) => {
+                const t = e.currentTarget as HTMLInputElement;
+                void saveOpenAiEmbeddingsConsent(t.checked);
+              }}
+              disabled={openaiEmbeddingsSaving}
+            />
+            <span>Allow OpenAI for embeddings (KG + code graph; incurs cost)</span>
+          </label>
+          {#if openaiEmbeddingsConsent === null}
+            <span class="pr-onboarding-hint">
+              Not set — it follows your embedding profile: on while OpenAI is the
+              active embedding profile, off otherwise. Tick or untick to decide.
+            </span>
+          {/if}
+          {#if openaiEmbeddingsError}
+            <span class="pr-onboarding-hint pr-kgsum-warn">{openaiEmbeddingsError}</span>
+          {/if}
         </div>
         <div class="pr-pat-actions">
           {#if openaiPresent}
@@ -3944,6 +4089,12 @@
      Boxy block layout that mirrors the rest of the page (.pr-onboarding-row
      style: subtle border + tinted background) so the new sections don't
      feel like a foreign body. */
+  .pr-codeembed-project {
+    margin: 4px 0 8px;
+  }
+  .pr-codeembed-project code {
+    word-break: break-all;
+  }
   .pr-kgsum-block {
     padding: 10px 14px; background: rgba(255,255,255,0.03);
     border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;

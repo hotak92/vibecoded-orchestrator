@@ -136,7 +136,10 @@ def _get_embedding_service():
         return None  # in the retry window — don't probe again yet
 
     try:
-        server._cached_embed_service = server.EmbeddingService.for_project()
+        # v0.2.102 W6-B2: the code leg embeds in the space THIS project's
+        # code graph is recorded as indexed in (vco_lib.code_embed_model).
+        server._cached_embed_service = server.EmbeddingService.for_project(
+            codegraph_prefix=getattr(server, "CODE_GRAPH_PROJECT", None) or None)
         return server._cached_embed_service
     except server.NoEmbeddingBackendError as e:
         server.logger.warning(

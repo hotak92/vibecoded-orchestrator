@@ -34,6 +34,7 @@ install" discipline (see CHANGELOG v0.2.41 + v0.2.42 hardening notes).
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -424,6 +425,76 @@ def _codegraph_prefix_on_conn(
         return None
     val = (row["collection_prefix"] or "").strip()
     return val or None
+
+
+_BINDING_COLUMNS = (
+    "b.project_id, b.collection_prefix, b.embedding_model, b.embedding_dim, "
+    "b.last_analyzed_at, b.config_json"
+)
+
+
+def _binding_row_dict(row: sqlite3.Row) -> dict:
+    """One ``project_codegraph_bindings`` row as a plain dict (``config``
+    parsed from ``config_json``; an unparseable blob reads as ``{}``)."""
+    out = {k: row[k] for k in row.keys()}
+    try:
+        cfg = json.loads(out.pop("config_json", None) or "null")
+    except Exception:  # noqa: BLE001 — a bad blob is "no config"
+        cfg = None
+    out["config"] = cfg if isinstance(cfg, dict) else {}
+    return out
+
+
+def get_codegraph_binding_row(prefix: str) -> Optional[dict]:
+    """The ``project_codegraph_bindings`` row whose ``collection_prefix`` is
+    ``prefix`` (case-insensitive — Weaviate class names are), or ``None``.
+
+    v0.2.102 W6-B2: the code-graph model RECORD lives in this row's
+    ``embedding_model`` / ``embedding_dim`` (read by
+    :mod:`vco_lib.code_embed_model`). Read-only, soft-fail.
+    """
+    if not prefix:
+        return None
+    conn = _open_db_readonly()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            f"SELECT {_BINDING_COLUMNS} FROM project_codegraph_bindings AS b "
+            "WHERE lower(b.collection_prefix) = lower(?) LIMIT 1",
+            (prefix,),
+        ).fetchone()
+        return _binding_row_dict(row) if row else None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def list_codegraph_binding_rows() -> Optional[List[dict]]:
+    """Every registered project's code-graph binding row joined with its
+    ``name`` / ``folder_path`` (for the Preferences status), or ``None`` when
+    launcher.db is unavailable."""
+    conn = _open_db_readonly()
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute(
+            f"SELECT {_BINDING_COLUMNS}, p.name, p.folder_path "
+            "FROM project_codegraph_bindings AS b "
+            "JOIN projects AS p ON p.id = b.project_id ORDER BY p.name"
+        ).fetchall()
+        return [_binding_row_dict(r) for r in rows]
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _project_id_for_name_on_conn(
