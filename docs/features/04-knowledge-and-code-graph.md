@@ -1,6 +1,6 @@
 # Knowledge Graph & Code Graph
 
-The semantic memory layer: an Obsidian-style knowledge graph (`knowledge/`), a five-collection code graph (definitions: Python `ast` for Python, regex extractors for the other languages; call edges: tree-sitter where its grammar is installed), the Weaviate schemas behind both, the embedding pipeline (text and code), and the shell scripts that let Claude — and human adopters — drive all of it from the CLI. Source mostly in `claude_mcp_servers/weaviate_mcp/`, `.claude/scripts/`, and `knowledge/`.
+The semantic memory layer: an Obsidian-style knowledge graph (`knowledge/`), a five-collection AST-based code graph, the Weaviate schemas behind both, the embedding pipeline (text and code), and the shell scripts that let Claude — and human adopters — drive all of it from the CLI. Source mostly in `claude_mcp_servers/weaviate_mcp/`, `.claude/scripts/`, and `knowledge/`.
 
 The OSS bundle ships seven canonical node types (`project`, `concept`, `tool`, `model`, `hardware`, `research`, `coordination`), but seed content only populates four folders (`concepts/`, `models/`, `tools/`, `patterns/`) — the rest ship empty for adopters to fill in as they author. `patterns/` is a content category, not a node type; pattern nodes carry `type: concept` in frontmatter. See the full reconciliation in [Bundled Seed Content](#knowledge-graph-bundled-seed-content) below.
 
@@ -151,7 +151,7 @@ Entity UUIDs are generated as `uuid5(NAMESPACE_DNS, f"{project}::{full_name}")`.
 ## Code Graph Analysis
 
 ### `analyze_code_graph.py` — main analysis script
-Code extraction engine (Python `ast`; regex extractors for the other languages; tree-sitter call edges) at `.claude/scripts/analyze_code_graph.py`. Accepts a repo path and populates all five code graph collections. Since P2f (v0.2.76) the analyzer is walk + orchestration only: the per-language extractors were lifted out into the `vco_lib/codegraph_lang/` package (one module per language — `python.py`, `javascript.py`, `svelte.py`, `powershell.py`, `go.py`, `rust.py`, `java.py`, `ruby.py`, `shell.py`, `lua.py`, `cpp.py`, `csharp.py`, `proto.py`, plus shared helpers in `_shared.py`), dispatched through the `codegraph_lang.EXTRACTORS` registry. Each `_analyze_<lang>_file` method in the analyzer is a one-line delegator into that registry.
+Full AST/regex code extraction engine at `.claude/scripts/analyze_code_graph.py`. Accepts a repo path and populates all five code graph collections. Since P2f (v0.2.76) the analyzer is walk + orchestration only: the per-language extractors were lifted out into the `vco_lib/codegraph_lang/` package (one module per language — `python.py`, `javascript.py`, `svelte.py`, `powershell.py`, `go.py`, `rust.py`, `java.py`, `ruby.py`, `shell.py`, `lua.py`, `cpp.py`, `csharp.py`, `proto.py`, plus shared helpers in `_shared.py`), dispatched through the `codegraph_lang.EXTRACTORS` registry. Each `_analyze_<lang>_file` method in the analyzer is a one-line delegator into that registry.
 
 ### Language support
 Python (full fidelity via `ast` module), plus regex-based extraction for: Lua, C++/C, C#, JavaScript, TypeScript, JSX, Go, Rust, Java, Ruby, Shell, Proto, Svelte (v0.2.53), PowerShell (v0.2.53). Each maps to a module in `vco_lib/codegraph_lang/`.
