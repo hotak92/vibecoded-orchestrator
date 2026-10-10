@@ -27,15 +27,28 @@
 #   queries from injection surfaces, and a free-text prompt yields no
 #   exact-lookup symbol.
 # - Never exit non-zero. Empty/failed retrieval → exit 0 silently.
-# - The UserPromptSubmit payload carries no prompt_id, so the router's
-#   per-turn budget fails OPEN for this surface (documented there); the
-#   per-injection soft cap still bounds the block and the surface fires
-#   once per prompt by construction.
+# - prompt_id IS a common hook-input field and is normally PRESENT on
+#   UserPromptSubmit (it names the submitted prompt), so the router's
+#   per-turn budget applies per turn here; it may be absent on the first
+#   turn / older harnesses, in which case the budget fails OPEN for that
+#   turn (documented in the router). The per-injection soft cap bounds the
+#   block either way.
 
 # Scrub sensitive env vars before any subprocess spawning
 # (list MUST MATCH _lib/scrub-env.sh; enforced by the scrub parity gate).
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# v0.2.102 W6-F fix-round: per-surface kill switch (VCO_PROMPT_INJECT=off)
+# disables ONLY this prompt surface — the per-prompt python + weaviate-stack
+# spawn is the one injection surface whose latency sits on the critical path
+# of EVERY prompt, so it gets its own opt-out beside the global
+# VCO_INJECT_PROFILE=off (checked in _lib/inject-budget.sh below, which
+# disables every surface). Checked here BEFORE anything is spawned; the
+# router re-checks it (the enforcement home). MUST MATCH the .ps1 sibling.
+case "$(printf '%s' "${VCO_PROMPT_INJECT:-}" | tr '[:upper:]' '[:lower:]')" in
+    off) exit 0 ;;
+esac
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ]; then

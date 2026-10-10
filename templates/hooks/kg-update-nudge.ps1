@@ -228,7 +228,7 @@ if is_post_tool:
 # --- Scan transcript for work_units_total + escape markers ---
 session_total = 0
 escape_marker_token_total = 0
-_new_scan_offset = None  # W6-F: resume point to persist (None = no scan ran; 0 IS a valid offset — a scan that consumed nothing, e.g. a transcript rotated to empty, must persist 0 so the next run does not skip regrown content)
+_new_scan_offset = None  # W6-F: resume point to persist (None = no scan ran; 0 IS a valid offset -- a scan that consumed nothing, e.g. a transcript rotated to empty, must persist 0 so the next run does not skip regrown content)
 
 import re
 NO_KG_UPDATE_MARKER_RE = re.compile(r"\[No KG update needed:\s*\S[^\]]*\]")

@@ -157,6 +157,42 @@ def test_missing_counter_module_is_loud(tmp_path: Path) -> None:
 
 
 @needs_bash
+def test_rotated_transcript_resumes_from_zero(tmp_path: Path) -> None:
+    """Fix-round 2026-10-11 (review LOW): the old ``end = res.end_offset or
+    prev_off`` treated 0 as "no offset" — after a rotate-to-empty scan
+    (``end_offset == 0`` is falsy) it kept the STALE offset and skipped both
+    writes, so a transcript that later regrew PAST the stale byte offset
+    resumed mid-file and never counted the regrown head. The nudge's
+    unconditional-persist shape (0 IS a valid resume offset) is mirrored
+    here: the rotate run must persist offset 0 and a fresh-basis total 0,
+    and the regrown content must be counted in full."""
+    rig = _rig(tmp_path)
+    first = _entry("a", 5000)
+    rig["transcript"].write_text(first, encoding="utf-8")
+    assert _run(rig, "s-rot").returncode == 0
+    assert _counter(rig, "s-rot") == 5_000
+    stale_off = len(first.encode("utf-8"))
+    assert stale_off > 0
+    # Rotate to empty: a fresh basis — total resets, offset must persist 0.
+    rig["transcript"].write_text("", encoding="utf-8")
+    r = _run(rig, "s-rot")
+    assert r.returncode == 0, r.stderr[-600:]
+    assert _counter(rig, "s-rot") == 0, (
+        "rotate-to-empty is a fresh basis; the stale total must not survive"
+    )
+    # Regrow PAST the stale offset: the pre-fix code resumed at stale_off
+    # mid-file and missed the regrown head; post-fix it counts everything.
+    regrown = "".join(_entry(f"n{i}", 4000) for i in range(20))
+    assert len(regrown.encode("utf-8")) > stale_off
+    rig["transcript"].write_text(regrown, encoding="utf-8")
+    r = _run(rig, "s-rot")
+    assert r.returncode == 0, r.stderr[-600:]
+    assert _counter(rig, "s-rot") == 80_000, (
+        "content regrown past the pre-fix stale offset must be counted in full"
+    )
+
+
+@needs_bash
 def test_no_transcript_is_silent(tmp_path: Path) -> None:
     rig = _rig(tmp_path)
     payload = {"hook_event_name": "UserPromptSubmit", "session_id": "s-none",

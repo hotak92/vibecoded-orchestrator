@@ -15,6 +15,14 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
+# v0.2.102 W6-F fix-round: per-surface kill switch (VCO_PROMPT_INJECT=off)
+# disables ONLY this prompt surface (the global VCO_INJECT_PROFILE=off,
+# checked in _lib/inject-budget.ps1 below, disables every surface). Checked
+# here BEFORE anything is spawned; the router re-checks it (the enforcement
+# home). MUST MATCH the .sh sibling.
+$VcoPromptInject = "$env:VCO_PROMPT_INJECT"
+if ($VcoPromptInject -and $VcoPromptInject.ToLowerInvariant() -eq "off") { exit 0 }
+
 $ScriptDir = $PSScriptRoot
 $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Resolve-Path (Join-Path $ScriptDir "..\..")).Path }
 

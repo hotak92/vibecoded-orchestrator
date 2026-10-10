@@ -91,7 +91,8 @@ class Rig:
         env = {k: v for k, v in os.environ.items()
                if k not in ("VCT_DISABLE_HOOKS", "VCT_INSTALL_ROOT",
                             "VCT_ORCHESTRATOR_ROOT", "VCO_INJECT_PROFILE",
-                            "VCO_RL_TASK_TYPE", "VCT_VENV", "VCO_STUB_KG_LONG")}
+                            "VCO_PROMPT_INJECT", "VCO_RL_TASK_TYPE",
+                            "VCT_VENV", "VCO_STUB_KG_LONG")}
         env.update({
             "CLAUDE_PROJECT_DIR": str(self.proj),
             "VCT_ORCHESTRATOR_ROOT": str(REPO_ROOT),
@@ -225,6 +226,32 @@ class TestPromptWrapperSh:
         assert r.stdout.strip() == ""
         assert rig.kg_records() == []
 
+    def test_per_surface_kill_switch_prompt_inject_off(self, rig: Rig) -> None:
+        """VCO_PROMPT_INJECT=off (fix-round 2026-10-11, review MEDIUM-2):
+        the prompt surface's own opt-out — the wrapper exits BEFORE any
+        python starts, so not even the stub producer is spawned."""
+        r = rig.run("How does the KG nudge threshold interact with compaction?",
+                    env_overrides={"VCO_PROMPT_INJECT": "off"})
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == ""
+        assert rig.kg_records() == [], "the router must never be spawned"
+
+    def test_per_surface_kill_switch_is_case_insensitive(self, rig: Rig) -> None:
+        r = rig.run("How does the KG nudge threshold interact with compaction?",
+                    env_overrides={"VCO_PROMPT_INJECT": "OFF"})
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == ""
+        assert rig.kg_records() == []
+
+    def test_per_surface_kill_switch_non_off_keeps_surface(self, rig: Rig) -> None:
+        """Only the literal `off` (any case) disables — any other value,
+        including a set-but-not-off one, keeps the surface working."""
+        r = rig.run("How does the KG nudge threshold interact with compaction?",
+                    env_overrides={"VCO_PROMPT_INJECT": "on"})
+        assert r.returncode == 0, r.stderr
+        assert "KG: Stub Node" in r.stdout
+        assert rig.kg_records()
+
     def test_disable_hooks_switch(self, rig: Rig) -> None:
         r = rig.run("How does the KG nudge threshold interact with compaction?",
                     env_overrides={"VCT_DISABLE_HOOKS": "1"})
@@ -258,6 +285,53 @@ def test_prompt_wrapper_ps1_parity(rig: Rig) -> None:
     assert env["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert "KG: Stub Node" in env["hookSpecificOutput"]["additionalContext"]
     assert rig.kg_records(), "the .ps1 wrapper must reach the KG leg"
+
+
+@needs_pwsh
+def test_prompt_wrapper_ps1_honours_per_surface_kill_switch(rig: Rig) -> None:
+    """VCO_PROMPT_INJECT=off in the .ps1 sibling too: exit before any
+    python starts (fix-round; MUST MATCH the .sh arm)."""
+    r = rig.run("How does the KG nudge threshold interact with compaction?",
+                shell="ps1", env_overrides={"VCO_PROMPT_INJECT": "off"})
+    assert r.returncode == 0, r.stderr[-800:]
+    assert r.stdout.strip() == ""
+    assert rig.kg_records() == []
+
+
+@needs_bash
+def test_router_rechecks_per_surface_kill_switch(tmp_path: Path) -> None:
+    """The router is the ENFORCEMENT home for VCO_PROMPT_INJECT=off: driven
+    DIRECTLY (no wrapper), the prompt surface must exit silently — the
+    wrapper check is only the spawn-avoiding fast path."""
+    rig = Rig(tmp_path)
+    payload = json.dumps({
+        "hook_event_name": "UserPromptSubmit", "session_id": "sess-pi-ks",
+        "cwd": str(rig.proj),
+        "prompt": "How does the KG nudge threshold interact with compaction?",
+    })
+    env = child_env({k: v for k, v in os.environ.items()
+                     if k not in ("VCT_DISABLE_HOOKS", "VCO_INJECT_PROFILE",
+                                  "VCO_PROMPT_INJECT")})
+    env.update({
+        "CLAUDE_PROJECT_DIR": str(rig.proj),
+        "VCT_STATE_DIR": str(tmp_path / "vctstate"),
+        "HOME": str(tmp_path / "home"),
+        "KG_COLLECTION": "PromptProjKG",
+        "RL_HUB_POST_DISABLED": "1",
+        "VCO_ROUTER_KG_SCRIPT": str(rig.kg_stub),
+        "VCO_STUB_KG_RECORD": str(rig.kg_record),
+        "VCO_PROMPT_INJECT": "off",
+    })
+    r = subprocess.run(
+        [sys.executable,
+         str(REPO_ROOT / "claude_mcp_servers/scripts/hook_context_router.py"),
+         "prompt"],
+        input=payload, capture_output=True, text=True, timeout=120,
+        cwd=str(rig.proj), env=env,
+    )
+    assert r.returncode == 0, r.stderr[-400:]
+    assert r.stdout.strip() == ""
+    assert rig.kg_records() == []
 
 
 # --- the registration -----------------------------------------------------------
@@ -315,21 +389,26 @@ def test_prompt_registration_migrates_into_existing_installs(os_name: str) -> No
 
 @needs_bash
 def test_kg_leg_survives_a_thread_hostile_producer_import(tmp_path: Path) -> None:
-    """REGRESSION (W6-F, found wiring item 1): the router runs legs in
-    worker threads; the real KG producer (rl_kg_search.main) imports
-    weaviate_mcp.server LAZILY, and that module registers a SIGHUP handler
-    at IMPORT time (server.py:282 -> _lib/sighup_handler.py:85) — illegal in
-    a non-main thread. CG-bearing surfaces masked it (query_code_graph.py
-    imports weaviate_mcp.server at module level and the router loads that
-    module main-thread); a KG-ONLY plan (agent, prompt, a bash plan whose
-    CG leg gated off) died on the import and silently never injected. The
-    router now warms the import in the main thread for the shipped producer.
+    """REGRESSION (W6-F, found wiring item 1; fix-round 2026-10-11: the fix
+    moved to the ROOT): the router runs legs in worker threads; the real KG
+    producer (rl_kg_search.main) imports weaviate_mcp.server LAZILY, and
+    that module registers a SIGHUP handler at IMPORT time (server.py:282 ->
+    _lib/sighup_handler.py) — signal.signal raises ValueError off the main
+    thread. CG-bearing surfaces masked it (query_code_graph.py imports
+    weaviate_mcp.server at module level and the router loads that module
+    main-thread); a KG-ONLY plan (agent, prompt, a bash plan whose CG leg
+    gated off) died on the import and silently never injected. The ROOT fix
+    (fix-round) makes register_sighup_exit_handler a logged no-op off the
+    main thread, so the worker-thread import succeeds; the interim main-
+    thread warm import in the router was retired with it.
 
     Driven with the REAL rl_kg_search producer against the unroutable
-    sentinel backend: pre-fix stderr carries "main thread" (the leg died on
-    the import); post-fix the leg reaches the backend layer and soft-fails
-    there instead. Requires the venv's weaviate stack — skips cleanly when
-    it is not importable."""
+    sentinel backend: pre-fix stderr carries the ValueError ("signal.signal()
+    can only be called from the main thread" — the leg died on the import);
+    post-fix the worker-thread import succeeds (a benign no-op WARNING from
+    the sighup helper MAY appear) and the leg reaches the backend layer and
+    soft-fails there instead. Requires the venv's weaviate stack — skips
+    cleanly when it is not importable."""
     probe = subprocess.run(
         [sys.executable, "-c", "import weaviate, weaviate_mcp.server"],
         capture_output=True, text=True,
@@ -345,7 +424,8 @@ def test_kg_leg_survives_a_thread_hostile_producer_import(tmp_path: Path) -> Non
         "prompt": "How does the KG nudge threshold interact with compaction?",
     })
     env = child_env({k: v for k, v in os.environ.items()
-                     if k not in ("VCT_DISABLE_HOOKS", "VCO_INJECT_PROFILE")})
+                     if k not in ("VCT_DISABLE_HOOKS", "VCO_INJECT_PROFILE",
+                                  "VCO_PROMPT_INJECT")})
     env.update({
         "CLAUDE_PROJECT_DIR": str(proj),
         "VCT_STATE_DIR": str(tmp_path / "vctstate"),
@@ -363,9 +443,9 @@ def test_kg_leg_survives_a_thread_hostile_producer_import(tmp_path: Path) -> Non
         cwd=str(proj), env=env,
     )
     assert r.returncode == 0
-    assert "main thread" not in r.stderr, (
-        "the KG leg's weaviate_mcp import ran in a worker thread: "
-        f"{r.stderr[-400:]}"
+    assert "signal.signal() can only be called" not in r.stderr, (
+        "the KG leg's weaviate_mcp import died on the worker-thread "
+        f"SIGHUP registration: {r.stderr[-400:]}"
     )
     assert "leg failed" in r.stderr and "Weaviate" in r.stderr, (
         "the leg should reach the backend layer and soft-fail there: "

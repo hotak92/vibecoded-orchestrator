@@ -145,7 +145,15 @@ try:
     # a fresh basis — its delta replaces the cumulative, never adds to it.
     base = total if res.start_offset_used == prev_off else 0
     total = base + res.work_units_total
-    end = res.end_offset or prev_off
+    # W6-F fix-round: persist the end_offset UNCONDITIONALLY -- 0 IS
+    # a valid offset (a transcript rotated to empty consumed nothing and
+    # must reset the resume point to 0, else content regrown past the stale
+    # offset is skipped mid-line). The old `or prev_off` kept the stale
+    # offset after a rotate-to-empty -- the exact rotation defect class the
+    # nudge fixed with its `_new_scan_offset is not None` shape; mirrored
+    # here (the reminder has no "no scan ran" branch -- reaching this line
+    # means a scan ran and end_offset is always an int).
+    end = res.end_offset
     if end != prev_off:
         _write_num(offset_file, end)  # offset first: a kill between the two
         _write_num(state_file, total)  # writes under-counts (safe direction)

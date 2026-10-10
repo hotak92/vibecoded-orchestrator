@@ -47,7 +47,9 @@ Mechanism (one interpreter, one home):
   surfaces' keys (and vice-versa). Empty results are NEVER cached (§9).
 
 Kill switch: ``VCO_INJECT_PROFILE=off`` → exit 0 silently (checked first,
-beside the wrappers' own check).
+beside the wrappers' own check). Per-surface: ``VCO_PROMPT_INJECT=off``
+disables ONLY the ``prompt`` surface (checked beside the global switch;
+the prompt wrappers also check it before spawning anything).
 
 Env seams (tests + Wave 2):
 * ``VCO_ROUTER_KG_SCRIPT`` — path to the KG producer (default: sibling
@@ -821,10 +823,14 @@ def _prompt_plan(payload: Dict, cwd: str) -> _Plan:
     code-graph queries from injection surfaces, and a prompt yields no
     exact-lookup symbol.
 
-    The payload carries no ``prompt_id`` on UserPromptSubmit, so the
-    per-turn budget fails OPEN for this surface (documented fail-open); the
-    per-injection soft cap still bounds the block, and the surface fires
-    once per prompt by construction."""
+    ``prompt_id`` IS a common hook-input field and is normally PRESENT on
+    UserPromptSubmit (it names the prompt being submitted — the field the
+    per-turn budget keys on, so the budget applies per turn here as on
+    every other surface). It may be ABSENT (the vendor docs' "absent until
+    the first user input" edge, older harnesses); the budget then fails
+    OPEN for that one turn (budget_state_path's documented None-sentinel).
+    The per-injection soft cap bounds the block either way, and the
+    surface fires once per prompt by construction."""
     plan = _Plan()
     query = prompt_query(str(payload.get("prompt") or ""))
     plan.intent_out = {"surface": "prompt", "has_query": bool(query)}
@@ -924,29 +930,18 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
         if kg_script.is_file():
             try:
                 kg_mod = _hds._load_cg_module(kg_script)
-                # v0.2.102 W6-F: pay the producer's heavy lazy imports in the
-                # MAIN thread (the hook_dual_search.main() discipline). The
-                # real producer (rl_kg_search.main) imports
-                # weaviate_mcp.server LAZILY, and that module registers a
+                # v0.2.102 W6-F fix-round (review MEDIUM): the producer's
+                # lazy weaviate_mcp.server import runs inside the leg, i.e.
+                # in run_legs' WORKER thread, and that module registers a
                 # SIGHUP handler AT IMPORT TIME — signal.signal raises
-                # ValueError in a non-main thread, and the legs run in
-                # run_legs' worker threads. On surfaces whose plan ALSO runs
-                # a CG leg this never fired, because query_code_graph.py
-                # imports weaviate_mcp.server at MODULE level and the router
-                # loads that module in the main thread (below); on a KG-ONLY
-                # plan (the agent surface, the W6-F prompt surface, any bash
-                # plan whose CG leg gated off, or a missing CG script) the
-                # KG leg died on the import and the surface silently never
-                # injected. Warm the import here so the worker thread's
-                # import is a sys.modules hit. Only for the SHIPPED producer
-                # — a VCO_ROUTER_KG_SCRIPT stub pays nothing. Best-effort: a
-                # failed warm import is re-attempted (and reported) by the
-                # leg's own error path.
-                if kg_script == _HERE / "rl_kg_search.py":
-                    try:
-                        import weaviate_mcp.server  # noqa: F401
-                    except BaseException:  # noqa: BLE001
-                        pass
+                # ValueError off the main thread. The original W6-F fix
+                # warmed the import here in the main thread (masked on
+                # CG-bearing surfaces by query_code_graph.py's own
+                # main-thread module-level import); the ROOT fix now lives
+                # in _lib/sighup_handler.py, whose
+                # register_sighup_exit_handler is a logged no-op off the
+                # main thread — so ANY non-main-thread importer is safe
+                # and the warm-import shim is retired (one home, not two).
                 argv = [plan.kg_query, "--limit", str(plan.kg_limit),
                         "--hook-format", "--injection-profile", plan.kg_profile,
                         "--task-type", task_type_for(plan.kg_profile)]
@@ -1326,6 +1321,16 @@ def _main(argv: List[str]) -> int:
 
     # Kill switch first (beside the wrappers' own check): off → total silence.
     if (os.environ.get("VCO_INJECT_PROFILE") or "").strip().lower() == "off":
+        return 0
+
+    # v0.2.102 W6-F fix-round (review MEDIUM): per-surface kill switch for
+    # the prompt surface — VCO_PROMPT_INJECT=off disables ONLY UserPromptSubmit
+    # injection (the per-prompt python+weaviate-stack spawn is the one
+    # surface whose latency sits on the critical path of EVERY prompt).
+    # The wrappers check it too, before any spawn; THIS is the enforcement
+    # home (one code path for every caller of the router).
+    if surface == "prompt" and \
+            (os.environ.get("VCO_PROMPT_INJECT") or "").strip().lower() == "off":
         return 0
 
     try:
