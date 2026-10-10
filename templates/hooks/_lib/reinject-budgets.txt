@@ -15,9 +15,19 @@
 #                         fixed sections)
 # so every section is always represented.
 #
+# A USER-LOWERED CAP SCALES THESE ROWS (v0.2.102 review F2): when
+# VCO_HOOK_CONTEXT_CAP is below overhead + the sum of the fixed rows + the
+# 200-char flex floor, the fixed budgets shrink proportionally, each floored
+# at 300 chars (a section header plus its cut marker) — every section stays
+# represented at any cap down to the sane floor 1750. Below 1750 no
+# budgeting can keep six section headers, and the whole-stream backstop
+# cuts inside the later sections.
+#
 # Format: one `name value` pair per line; blank lines and lines starting
-# with `#` are ignored. Behavioural parity of the two siblings is locked by
-# tests/test_v02102_reinject_budgets_and_snapshot.py.
+# with `#` are ignored. Values must be POSITIVE integers — a 0 row is
+# rejected with one stderr line and its section runs uncapped (both
+# siblings enforce this identically). Behavioural parity of the two
+# siblings is locked by tests/test_v02102_reinject_budgets_and_snapshot.py.
 session_state 2000
 plan 1200
 commits 800

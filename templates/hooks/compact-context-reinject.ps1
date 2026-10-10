@@ -58,6 +58,13 @@ if (Test-Path -LiteralPath $BudgetFile) {
         $parts = $trimmed -split '\s+', 3
         if ($parts.Count -lt 2) { continue }
         if ($parts[1] -notmatch '^[0-9]+$') { continue }
+        # v0.2.102 W6-D review F3: rows must be POSITIVE integers. A 0 row is
+        # rejected with one stderr line and its section runs uncapped -- the
+        # same semantics the .sh sibling enforces.
+        if ([int]$parts[1] -le 0) {
+            [Console]::Error.WriteLine("[VCO] reinject-budgets.txt: ignoring non-positive budget row '$($parts[0]) $($parts[1])' (rows must be positive integers; the section runs uncapped)")
+            continue
+        }
         $RB[$parts[0]] = [int]$parts[1]
     }
 } else {
@@ -153,16 +160,43 @@ if ((Test-Path -LiteralPath $Pruned) -and ((Get-Item -LiteralPath $Pruned).Lengt
 
 # -- budget the flex section, then emit every section under its budget --
 $HaveCap = [bool](Get-Command Limit-VcoHookContext -ErrorAction SilentlyContinue)
+$RbMinSection = 300   # a section's floor: its header plus a cut marker
+$RbFlexFloor = 200
 $Flex = 0
 if ($HaveCap -and $RB.ContainsKey('overhead')) {
+    $cap = Get-VcoHookContextCap
+    # v0.2.102 W6-D review F2: a user-lowered VCO_HOOK_CONTEXT_CAP below what
+    # the table asks for (overhead + sum of fixed budgets + the flex floor)
+    # scales the FIXED budgets down proportionally, each floored at
+    # $RbMinSection chars, so every section stays represented at any cap down
+    # to the sane floor 1750 (5*300 + 200 flex floor + 250 headroom). Below
+    # that no budgeting can keep six headers, and the whole-stream backstop
+    # cuts inside the later sections -- documented in the table.
+    $fixedTotal = 0
+    foreach ($k in 'session_state','plan','commits','snapshot','pruned') {
+        if ($RB.ContainsKey($k)) { $fixedTotal += [int]$RB[$k] }
+    }
+    if ([int]$RB['overhead'] + $fixedTotal + $RbFlexFloor -gt $cap) {
+        $avail = $cap - [int]$RB['overhead'] - $RbFlexFloor
+        if ($avail -lt ($RbMinSection * 5)) {
+            $avail = $cap - 250 - $RbFlexFloor   # bare-minimum headroom
+        }
+        if ($avail -gt 0 -and $fixedTotal -gt 0) {
+            foreach ($k in 'session_state','plan','commits','snapshot','pruned') {
+                if ($RB.ContainsKey($k)) {
+                    $RB[$k] = [Math]::Max($RbMinSection, [int][Math]::Floor([int]$RB[$k] * $avail / $fixedTotal))
+                }
+            }
+        }
+    }
     $fixed = 0
     if ($S_sess)    { $fixed += Get-RbAlloc $S_sess    (Get-RbBudget 'session_state') }
     if ($S_plan)    { $fixed += Get-RbAlloc $S_plan    (Get-RbBudget 'plan') }
     if ($S_commits) { $fixed += Get-RbAlloc $S_commits (Get-RbBudget 'commits') }
     if ($S_snap)    { $fixed += Get-RbAlloc $S_snap    (Get-RbBudget 'snapshot') }
     if ($S_pruned)  { $fixed += Get-RbAlloc $S_pruned  (Get-RbBudget 'pruned') }
-    $Flex = (Get-VcoHookContextCap) - [int]$RB['overhead'] - $fixed
-    if ($Flex -lt 200) { $Flex = 200 }
+    $Flex = $cap - [int]$RB['overhead'] - $fixed
+    if ($Flex -lt $RbFlexFloor) { $Flex = $RbFlexFloor }
 }
 
 function Emit-RbSection([string]$Text, [int]$Budget, [string]$Pointer) {
@@ -186,9 +220,13 @@ $Parts += Emit-RbSection $S_pruned (Get-RbBudget 'pruned') "(pruned activity sum
 # Truncate the pruned summary AFTER emitting it (unchanged behaviour).
 if ($S_pruned) { Set-Content -Path $Pruned -Value "" -NoNewline }
 
-$ReinjectText = (@($Parts) | ForEach-Object { [string]$_ }) -join "`n"
+# v0.2.102 W6-D review F4: strip the trailing newlines, cap, then write the
+# text + exactly ONE newline -- byte-for-byte what the .sh sibling's
+# vco_cap_context_stream emits (Write-Output would add a second trailing
+# newline and the two siblings' outputs would differ only by that byte).
+$ReinjectText = ((@($Parts) | ForEach-Object { [string]$_ }) -join "`n").TrimEnd("`r", "`n")
 if ($HaveCap) {
     $ReinjectText = Limit-VcoHookContext -Text $ReinjectText -Pointer "The rest is on disk: Read .claude/CONTEXT_STATE.md (and .claude/context/CONTEXT_STATE_<session>.md, the active plan under .claude/context/plans/, .claude/context/pre-compact-snapshot.md)."
 }
-if ($ReinjectText) { Write-Output $ReinjectText }
+if ($ReinjectText) { [Console]::Out.Write($ReinjectText + "`n") }
 exit 0

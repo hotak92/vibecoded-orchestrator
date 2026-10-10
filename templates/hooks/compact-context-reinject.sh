@@ -88,6 +88,13 @@ if [ -f "$_RB_FILE" ]; then
     while read -r _rb_key _rb_val _; do
         [ -n "${_rb_val:-}" ] || continue
         case "$_rb_val" in *[!0-9]*) continue ;; esac
+        # v0.2.102 W6-D review F3: rows must be POSITIVE integers. A 0 row is
+        # rejected with one stderr line and its section runs uncapped — the
+        # same semantics the .ps1 sibling enforces.
+        if [ "$_rb_val" -eq 0 ]; then
+            echo "[VCO] reinject-budgets.txt: ignoring non-positive budget row '$_rb_key $_rb_val' (rows must be positive integers; the section runs uncapped)" >&2
+            continue
+        fi
         case "$_rb_key" in
             session_state) RB_session_state="$_rb_val" ;;
             plan)          RB_plan="$_rb_val" ;;
@@ -145,7 +152,13 @@ _vco_snapshot_is_stale() {
     case "$max" in ''|*[!0-9]*) max=1800 ;; esac
     mtime=$(_vco_snapshot_mtime "$1") || return 1
     [ -n "$mtime" ] || return 1
-    [ $(( $(date +%s) - mtime )) -gt "$max" ]
+    # Stale iff the snapshot predates (now - max). Comparing mtimes DIRECTLY
+    # (rather than an integer-second age) keeps VCO_SNAPSHOT_MAX_AGE=0 meaning
+    # "any existing snapshot is stale" — an age computed as $(date +%s) minus
+    # an integer mtime is 0 for a just-written file and would never trip
+    # `-gt 0` here (the .ps1 sibling compares fractional seconds and would,
+    # so the two would diverge exactly at the documented 0 edge).
+    [ "$mtime" -lt $(( $(date +%s) - max )) ]
 }
 _vco_snapshot_saved_line() {
     head -5 "$1" 2>/dev/null | grep -m1 '^Saved: ' || printf '(unknown save time)'
@@ -214,18 +227,47 @@ fi
 # RB_flex is empty (=> section 1 uncapped) when either the shared cap helper
 # or the budget table is unavailable — the pre-v0.2.102 behaviour, with the
 # whole-stream cap as the only bound.
+RB_MIN_SECTION=300   # a section's floor: its header plus a cut marker
+RB_FLEX_FLOOR=200
+_rb_floor() {
+    local v="$1"
+    [ "$v" -lt "$RB_MIN_SECTION" ] && v=$RB_MIN_SECTION
+    printf '%s' "$v"
+}
 RB_flex=""
 if command -v vco_cap_context >/dev/null 2>&1 && [ -n "$RB_overhead" ]; then
+    _cap=$(vco_hook_context_cap)
+    # v0.2.102 W6-D review F2: a user-lowered VCO_HOOK_CONTEXT_CAP below what
+    # the table asks for (overhead + sum of fixed budgets + the flex floor)
+    # scales the FIXED budgets down proportionally, each floored at
+    # RB_MIN_SECTION chars, so every section stays represented at any cap
+    # down to the sane floor 1750 (5*300 + 200 flex floor + 250 headroom).
+    # Below that no budgeting can keep six headers, and the whole-stream
+    # backstop cuts inside the later sections — documented in the table.
+    _fixed_total=$(( RB_session_state + RB_plan + RB_commits + RB_snapshot + RB_pruned ))
+    if [ $(( RB_overhead + _fixed_total + RB_FLEX_FLOOR )) -gt "$_cap" ]; then
+        _avail=$(( _cap - RB_overhead - RB_FLEX_FLOOR ))
+        if [ "$_avail" -lt $(( RB_MIN_SECTION * 5 )) ]; then
+            _avail=$(( _cap - 250 - RB_FLEX_FLOOR ))   # bare-minimum headroom
+        fi
+        if [ "$_avail" -gt 0 ] && [ "$_fixed_total" -gt 0 ]; then
+            [ -n "$RB_session_state" ] && RB_session_state=$(_rb_floor "$(( RB_session_state * _avail / _fixed_total ))")
+            [ -n "$RB_plan" ]          && RB_plan=$(_rb_floor "$(( RB_plan * _avail / _fixed_total ))")
+            [ -n "$RB_commits" ]       && RB_commits=$(_rb_floor "$(( RB_commits * _avail / _fixed_total ))")
+            [ -n "$RB_snapshot" ]      && RB_snapshot=$(_rb_floor "$(( RB_snapshot * _avail / _fixed_total ))")
+            [ -n "$RB_pruned" ]        && RB_pruned=$(_rb_floor "$(( RB_pruned * _avail / _fixed_total ))")
+        fi
+    fi
     _fixed=0
     [ -n "$S_sess" ]    && _fixed=$(( _fixed + $(_rb_alloc "$S_sess"    "$RB_session_state") ))
     [ -n "$S_plan" ]    && _fixed=$(( _fixed + $(_rb_alloc "$S_plan"    "$RB_plan") ))
     [ -n "$S_commits" ] && _fixed=$(( _fixed + $(_rb_alloc "$S_commits" "$RB_commits") ))
     [ -n "$S_snap" ]    && _fixed=$(( _fixed + $(_rb_alloc "$S_snap"    "$RB_snapshot") ))
     [ -n "$S_pruned" ]  && _fixed=$(( _fixed + $(_rb_alloc "$S_pruned"  "$RB_pruned") ))
-    RB_flex=$(( $(vco_hook_context_cap) - RB_overhead - _fixed ))
+    RB_flex=$(( _cap - RB_overhead - _fixed ))
     # Never let the fixed sections crowd the flex section out entirely —
     # the whole-stream cap backstops the rare pathological case.
-    [ "$RB_flex" -lt 200 ] && RB_flex=200
+    [ "$RB_flex" -lt "$RB_FLEX_FLOOR" ] && RB_flex=$RB_FLEX_FLOOR
 fi
 
 {

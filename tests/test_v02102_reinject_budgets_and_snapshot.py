@@ -244,8 +244,10 @@ def test_budget_table_is_wellformed_and_ships():
                for g in hook_lib_data_globs())
 
 
-@pytest.mark.parametrize("impl", _SHELLS)
-def test_oversize_context_state_keeps_every_section(impl, tmp_path):
+def _oversize_project(tmp_path: Path) -> Path:
+    """A project whose every reinject section is oversize (pure ASCII, so
+    the .sh (characters) and .ps1 (UTF-16 units) length computations agree
+    and byte parity is achievable)."""
     proj = _project(tmp_path)
     (proj / ".claude" / "CONTEXT_STATE.md").write_text(_big(30000),
                                                        encoding="utf-8")
@@ -262,6 +264,12 @@ def test_oversize_context_state_keeps_every_section(impl, tmp_path):
         "## Modified Files\nM src/snapshot-file.py\n", encoding="utf-8")
     (proj / ".claude" / "context" / "pruned-context-summary.md").write_text(
         "edited: knowledge/a.md\n" * 60, encoding="utf-8")
+    return proj
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_oversize_context_state_keeps_every_section(impl, tmp_path):
+    proj = _oversize_project(tmp_path)
     out = _hook(impl, "compact-context-reinject", proj,
                 json.dumps({"session_id": "s1"}))
     # every section is represented
@@ -296,3 +304,142 @@ def test_small_inputs_are_unchanged(impl, tmp_path):
     assert MARKER not in out, "nothing was oversize; nothing may be cut"
     for needle in ("short", "this session only", "ship it", "src/fresh.py"):
         assert needle in out, needle
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Review fixes 2026-10-10 (F1-F4, review MERGE-AFTER-FIXES round)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _age_snapshot(snap: Path, impl: str, *, days: float = 0, seconds: float = 0):
+    """Back-date a snapshot deterministically for both siblings."""
+    if impl == "sh":
+        epoch = datetime.now().timestamp() - days * 86400 - seconds
+        subprocess.run(["touch", "-d", "@%.3f" % epoch, str(snap)], check=True)
+    else:
+        back = f"(Get-Date).AddDays(-{days}).AddSeconds(-{seconds})" \
+            if days else f"(Get-Date).AddSeconds(-{seconds})"
+        subprocess.run(
+            [PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command",
+             f"(Get-Item -LiteralPath '{snap}').LastWriteTime = {back}"],
+            check=True, capture_output=True)
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+@pytest.mark.parametrize(
+    "maxage,days,seconds,expect_stale",
+    [("0", 11, 0, True),      # an old snapshot is refused even at 0
+     ("0", 0, 2, True),       # a FRESH-ENOUGH snapshot (2 s old) is refused at 0
+     ("2000000", 11, 0, False),  # a huge window replays an 11-day-old snapshot
+     ("garbage", 11, 0, True)],  # garbage falls back to the 1800 default
+    ids=["zero-old", "zero-fresh", "huge-replays", "garbage-default"])
+def test_snapshot_max_age_knob_changes_the_outcome(
+        impl, tmp_path, maxage, days, seconds, expect_stale):
+    """F1 (MEDIUM): the VCO_SNAPSHOT_MAX_AGE knob is pinned with NON-default
+    values on both siblings — a future refactor that hardcodes 1800 (or
+    breaks the 0 edge the docs promise) goes red here."""
+    proj = _project(tmp_path)
+    snap = proj / ".claude" / "context" / "pre-compact-snapshot.md"
+    snap.write_text("# Pre-Compaction Snapshot\n"
+                    "Saved: 2026-09-29T03:27:47+02:00\n\n"
+                    "M src/ancient-file.py\n", encoding="utf-8")
+    _age_snapshot(snap, impl, days=days, seconds=seconds)
+    out = _hook(impl, "compact-context-reinject", proj,
+                json.dumps({"session_id": "s1"}),
+                VCO_SNAPSHOT_MAX_AGE=maxage)
+    if expect_stale:
+        assert "stale -- NOT replayed" in out, (impl, maxage)
+        assert "ancient-file" not in out, (impl, maxage)
+    else:
+        assert "stale" not in out, (impl, maxage)
+        assert "ancient-file" in out, (impl, maxage)
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+@pytest.mark.parametrize("cap,at_min", [(4000, False), (1000, True)],
+                         ids=["scaled-4000", "clamp-minimum-1000"])
+def test_lowered_cap_scales_budgets_and_keeps_sections(
+        impl, tmp_path, cap, at_min):
+    """F2 (LOW): a user-lowered VCO_HOOK_CONTEXT_CAP scales the fixed
+    budgets down (each floored at 300 chars) so every section stays
+    represented. 1000 is the shared cap helper's clamp MINIMUM (values below
+    are clamped up), and even there the scaled floors keep every section
+    header — the whole-stream backstop cuts inside the headerless pruned
+    tail, which is the documented below-1750 degradation."""
+    proj = _oversize_project(tmp_path)
+    out = _hook(impl, "compact-context-reinject", proj,
+                json.dumps({"session_id": "s1"}),
+                VCO_HOOK_CONTEXT_CAP=str(cap))
+    assert len(out.rstrip("\n")) <= cap
+    if at_min:
+        # 1000 is the cap helper's clamp MINIMUM. The scaled floors still
+        # keep the first three sections' headers, but six oversize sections
+        # cannot fit: the whole-stream backstop engages and names the files.
+        for header in ("## Current Task State", "## This Session's Task State",
+                       "## Active Plan"):
+            assert header in out, (impl, header)
+        assert f"output cut at {cap} of" in out, (impl, cap)
+        return
+    for header in ("## Current Task State", "## This Session's Task State",
+                   "## Active Plan", "## Recent Commits",
+                   "## Pre-Compaction Snapshot"):
+        assert header in out, (impl, header)
+    # the scaled budgets FIT: the whole-stream backstop must stay idle
+    # (without scaling the unfloored table sums past this cap and the
+    # backstop cuts the stream)
+    assert f"output cut at {cap} of" not in out, (impl, cap)
+
+
+def _hook_from_dir(impl: str, hook_dir: Path, project: Path,
+                   payload: str, **extra: str) -> tuple[str, str]:
+    """Run the reinject hook from a COPIED hook dir (so its _lib table can
+    be edited) and return (stdout, stderr)."""
+    argv = (["bash", str(hook_dir / "compact-context-reinject.sh")]
+            if impl == "sh" else
+            [PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File",
+             str(hook_dir / "compact-context-reinject.ps1")])
+    res = subprocess.run(argv, input=payload, capture_output=True, text=True,
+                         timeout=120, env=_env(project, **extra),
+                         cwd=str(project))
+    assert res.returncode == 0, res.stderr
+    return res.stdout, res.stderr
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_zero_budget_row_is_rejected_identically(impl, tmp_path):
+    """F3 (LOW): a table row of 0 is REJECTED at parse (one stderr line) in
+    BOTH siblings and its section runs uncapped — the semantics the table
+    documents. Before the fix the .sh treated 0 as a zero cap (marker-only
+    output) while the .ps1 treated it as uncapped."""
+    hook_dir = tmp_path / "hooks"
+    shutil.copytree(HOOKS / "_lib", hook_dir / "_lib")
+    shutil.copy(HOOKS / ("compact-context-reinject.sh" if impl == "sh"
+                         else "compact-context-reinject.ps1"), hook_dir)
+    table = hook_dir / "_lib" / "reinject-budgets.txt"
+    table.write_text(table.read_text(encoding="utf-8").replace(
+        "\nplan 1200\n", "\nplan 0\n"), encoding="utf-8")
+    proj = _oversize_project(tmp_path)
+    out, err = _hook_from_dir(impl, hook_dir, proj,
+                              json.dumps({"session_id": "s1"}))
+    assert "non-positive budget row 'plan 0'" in err, (impl, err)
+    assert "rows must be positive integers" in err, impl
+    # the plan section runs UNCAPPED: its full (line-capped) content is
+    # present and carries no cut marker of its own
+    plan_section = out.split("## Active Plan", 1)[1].split("## Recent Commits", 1)[0]
+    assert MARKER not in plan_section, (impl, "a rejected row must not cap")
+    assert plan_section.rstrip().endswith(
+        "plan step line padded out past sixty characters wide"), impl
+
+
+@pytest.mark.skipif(not HAVE_PWSH, reason="pwsh not installed")
+def test_sh_ps1_byte_parity_on_a_fixed_oversize_input(tmp_path):
+    """F4 (LOW): the two siblings' output is BYTE-IDENTICAL for the same
+    fixture (all sections oversize, pure ASCII so the .sh character counts
+    and the .ps1 UTF-16 unit counts agree), normalising CRLF only."""
+    proj_sh = _oversize_project(tmp_path / "sh")
+    proj_ps = _oversize_project(tmp_path / "ps")
+    payload = json.dumps({"session_id": "s1"})
+    out_sh = _hook("sh", "compact-context-reinject", proj_sh, payload)
+    out_ps = _hook("ps1", "compact-context-reinject", proj_ps, payload)
+    a, b = out_sh.replace("\r\n", "\n"), out_ps.replace("\r\n", "\n")
+    assert a == b
