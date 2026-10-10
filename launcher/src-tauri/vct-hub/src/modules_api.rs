@@ -3677,13 +3677,17 @@ mod tests {
     async fn terminal_report_finalizes_row_and_stamps_binding() {
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "proj-t1", "Terminal One", "/tmp/proj-t1");
+        // A BUILT binding (a real record: `last_analyzed_at` set). A
+        // never-built seed is deliberately not stamped since v0.2.102 W6-B2 —
+        // pinned by `advance_codegraph_binding_never_promotes_a_seed`
+        // (vct-launcher-core db/project_state.rs).
         h.0.set_project_codegraph_binding(
             "proj-t1",
             "TerminalOne",
             Some("CodeSage-Large-v2"),
             Some(2048),
             None,
-            None,
+            Some(1_600_000_000_000),
             true,
             &serde_json::Value::Null,
         )
@@ -3736,7 +3740,7 @@ mod tests {
             Some("abc123def"),
             "success finalize must stamp the binding like the launcher path"
         );
-        assert!(binding.last_analyzed_at.is_some());
+        assert!(binding.last_analyzed_at.is_some_and(|t| t > 1_600_000_000_000));
         // The stored space stays launcher-owned.
         assert_eq!(binding.embedding_model.as_deref(), Some("CodeSage-Large-v2"));
         assert_eq!(binding.embedding_dim, Some(2048));

@@ -505,6 +505,7 @@ class TestOpenAIRecordedFill:
         assert not cem.fill_owed("Acme")
         status = cem.status_all(count=False)["projects"][0]
         assert status["record_refused"] and status["recorded_model"] == "text-embedding-3-small"
+        assert status["complete"] is False, "a refused record is not complete (review nit)"
 
 
 class TestFillCounters:
@@ -538,6 +539,31 @@ class TestFillCounters:
         out = cem.finish_analyzer_run("Acme", self._plan(), None, scoped=False,
                                       stats={"files_skipped": 0, "insert_errors": 0}, revision=1)
         assert out == "complete" and cem.read_code_model_record("Acme").model == DEFAULT_TEXT_MODEL
+
+    def test_an_orphan_row_does_not_block_the_flip(self, launcher_db, monkeypatch):
+        """Review F1 (HIGH) probe: one orphan row (its file deleted / entity
+        refactored away — no walk visits it, the resync driver never prunes)
+        beside an otherwise complete clean walk. Red before the final round:
+        the counters were adjusted to the live count (3 of 4) and the scan
+        agreed, so the record never flipped."""
+        from vco_lib import codegraph_guards as guards
+
+        _stamp_record(launcher_db, DEFAULT_CODE_MODEL, 2048)
+        guards.start_fill_tally("qwen3_embed")
+        self._walk("qwen3_embed", [{"codesage_embed": [1.0]}, {"qwen3_embed": [1.0]}, None])
+        monkeypatch.setattr(cem, "count_code_objects", lambda prefix, **kw: 4)  # + 1 orphan
+        monkeypatch.setattr(cem, "scan_slot_fill", lambda *a, **k: (3, 4))
+        out = cem.finish_analyzer_run("Acme", self._plan(), None, scoped=False,
+                                      stats={"files_skipped": 0, "insert_errors": 0}, revision=1)
+        assert out == "complete"
+        assert cem.read_code_model_record("Acme").model == DEFAULT_TEXT_MODEL
+
+    def test_an_empty_measurement_never_flips(self, launcher_db, monkeypatch):
+        _stamp_record(launcher_db, DEFAULT_CODE_MODEL, 2048)
+        monkeypatch.setattr(cem, "count_code_objects", lambda prefix, **kw: 0)
+        monkeypatch.setattr(cem, "scan_slot_fill", lambda *a, **k: (0, 0))
+        assert cem.settle_fill("Acme", DEFAULT_TEXT_MODEL) is None
+        assert cem.read_code_model_record("Acme").model == DEFAULT_CODE_MODEL
 
     def test_inconsistent_or_missing_counters_fall_back_to_the_scan(self, launcher_db, monkeypatch):
         from vco_lib import codegraph_guards as guards
@@ -762,7 +788,9 @@ class TestEveryCallerUsesTheResolver:
     def test_rl_telemetry_label(self, spy, monkeypatch):
         from weaviate_mcp import rl_enrichment
 
-        monkeypatch.setattr(rl_enrichment.server, "_get_embedding_service", lambda: None)
+        # Patch the LIVE module: a setattr on the lazy proxy would be restored
+        # as a shadowing attribute ON the proxy (an ordering leak).
+        monkeypatch.setattr(rl_enrichment.server._live(), "_get_embedding_service", lambda: None)
         assert rl_enrichment._resolve_code_embedding_triple("codesage_embed")[2] == self.SENTINEL
 
     def test_for_project_callers_pass_their_graph_and_role(self, monkeypatch):
@@ -910,3 +938,92 @@ def _run_analyzer(tmp_path: Path, *, refusal: str, rewalk: bool):
     proc = subprocess.run([sys.executable, str(runner)], capture_output=True, text=True,
                           timeout=120, env=child_env(VCT_JOERN_AVAILABLE="0"))
     return proc, log
+
+
+# ═══════════════════ W6-B2 final round — the review's LOWs ═══════════════════
+
+
+class TestFinalRoundLows:
+    def test_live_record_needs_the_slot_on_every_sampled_object(self, monkeypatch):
+        """F4: one object cannot prove a complete slot — the pick's slot must be
+        populated on every sampled object (red before: limit=1, first wins)."""
+        from vco_lib import weaviate_helpers as wh
+
+        objs = [{"vectors": {"codesage_embed": [1.0] * 2048, "qwen3_embed": [1.0] * 1024}},
+                {"vectors": {"codesage_embed": [1.0] * 2048}}]
+        seen = []
+
+        def _http(method, url, **kw):
+            seen.append(url)
+            return 200, json.dumps({"objects": objs}).encode()
+
+        monkeypatch.setattr(wh, "http_request", _http)
+        assert cem._sample_vectors("Acme_CodeFunction", "http://w") == {"codesage_embed": 2048}
+        assert f"limit={cem._LIVE_SAMPLE}" in seen[0]
+
+    def test_live_record_never_short_circuits_on_a_filling_pick(self, launcher_db, monkeypatch):
+        """F4: a fill toward the pick is in progress → its slot is partial."""
+        conn_cfg = {"code_model_fill": {"target": DEFAULT_TEXT_MODEL, "filled": 1, "total": 9}}
+        import sqlite3
+
+        conn = sqlite3.connect(str(launcher_db))
+        conn.execute("UPDATE project_codegraph_bindings SET config_json=? WHERE project_id='p1'",
+                     (json.dumps(conn_cfg),))
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(cem, "_sample_vectors",
+                            lambda name, url: {"codesage_embed": 2048, "qwen3_embed": 1024})
+        rec = cem.record_from_live("Acme", DEFAULT_TEXT_MODEL)
+        assert rec is not None and rec.slot == "codesage_embed"
+
+    def test_binding_read_modify_write_is_one_write_transaction(self, launcher_db, monkeypatch):
+        """F7: the SELECT runs INSIDE a BEGIN IMMEDIATE (red before: autocommit
+        SELECT, then an implicit transaction for the UPDATE only)."""
+        import sqlite3
+
+        from vco_lib import kg_binding_heal as kbh
+
+        statements: list = []
+        real_connect = sqlite3.connect
+
+        def _connect(*a, **k):
+            conn = real_connect(*a, **k)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        monkeypatch.setattr(kbh.sqlite3, "connect", _connect)
+        assert kbh.stamp_codegraph_model_fill(launcher_db, "Acme", {"target": "x"})
+        first = [st.split()[0].upper() for st in statements if st.strip()]
+        assert first[:2] == ["BEGIN", "SELECT"], statements
+
+    def test_a_long_lived_mcp_rebuilds_its_service_when_the_record_flips(self, launcher_db, monkeypatch):
+        """F8: the cached query service is re-checked against the DB record and
+        rebuilt after a flip (red before: cached for the process lifetime)."""
+        from weaviate_mcp import embeddings as emb
+        from weaviate_mcp import server
+
+        _stamp_record(launcher_db, DEFAULT_CODE_MODEL, 2048)
+        old = MagicMock()
+        old.code_model_resolution = cem.resolve_code_model(codegraph_prefix="Acme")
+        assert old.code_model_resolution.recorded.model == DEFAULT_CODE_MODEL
+        new = MagicMock()
+        monkeypatch.setattr(server, "CODE_GRAPH_PROJECT", "Acme", raising=False)
+        monkeypatch.setattr(server, "_cached_embed_service", old)
+        monkeypatch.setattr(server, "_embed_record_checked_at", -1e18, raising=False)
+        monkeypatch.setattr(server.EmbeddingService, "for_project",
+                            classmethod(lambda cls, **kw: new))
+        assert emb._get_embedding_service() is old            # record unchanged → kept
+        monkeypatch.setattr(server, "_embed_record_checked_at", -1e18, raising=False)
+        _stamp_record(launcher_db, DEFAULT_TEXT_MODEL, 1024)   # the flip
+        assert emb._get_embedding_service() is new
+
+    def test_a_refused_record_is_not_reported_complete(self):
+        """Review nit: ``complete`` ignored ``record_refused`` (red before)."""
+        rec = cem.CodeModelRecord("text-embedding-3-small", 1536, "openai_code_embed")
+        res = cem.CodeModelResolution(
+            model=rec.model, source="record", target=rec.model, target_source="record",
+            recorded=rec, filling=False,
+            refusal=cem.OpenAIEmbeddingsConsentRefusal("refused", rec.model))
+        assert res.record_refused
+        status = cem.project_status("/tmp/x", "Acme", count=False, resolution=res)
+        assert status["complete"] is False

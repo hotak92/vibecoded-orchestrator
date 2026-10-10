@@ -1094,7 +1094,14 @@ async fn run_build_task(
         // v0.2.100) and a model change is a tracked fill, not drift.
         if let Some(prov) = provenance.as_ref() {
             let db = app.state::<Db>();
-            persist_codegraph_provenance(&db, &project_id, &canonical_identity, prov, finished_at);
+            persist_codegraph_provenance(
+                &db,
+                &project_id,
+                &canonical_identity,
+                prov,
+                finished_at,
+                status_str == build_status::SUCCESS,
+            );
         }
 
         // ── Task 6: non-root metadata backfill rider ──
@@ -1499,6 +1506,10 @@ pub(crate) struct CodegraphProvenance {
     /// `none` (non-git tree / git absent). Distinguished so we never persist
     /// the string "none" as a commit sha.
     pub analyzed_commit: Option<String>,
+    /// v0.2.102 W6-B2 (review F3): the optional `filling=1` token — this run
+    /// embedded a target whose slot is still being filled, so `model` is not
+    /// a complete slot and must never become the record. Absent → false.
+    pub filling: bool,
 }
 
 /// Parse the LAST `CODEGRAPH_PROVENANCE` line from analyzer stdout.
@@ -1525,6 +1536,7 @@ pub(crate) fn parse_codegraph_provenance(stdout: &str) -> Option<CodegraphProven
         let mut dim: Option<i64> = None;
         let mut rev: Option<i64> = None;
         let mut commit: Option<Option<String>> = None;
+        let mut filling = false;
         for tok in rest.split_whitespace() {
             let Some((k, v)) = tok.split_once('=') else {
                 continue;
@@ -1536,6 +1548,7 @@ pub(crate) fn parse_codegraph_provenance(stdout: &str) -> Option<CodegraphProven
                 "analyzed_commit" => {
                     commit = Some(if v == "none" { None } else { Some(v.to_string()) })
                 }
+                "filling" => filling = v == "1",
                 _ => {}
             }
         }
@@ -1548,6 +1561,7 @@ pub(crate) fn parse_codegraph_provenance(stdout: &str) -> Option<CodegraphProven
                     dim,
                     embed_revision,
                     analyzed_commit,
+                    filling,
                 });
             }
             _ => continue,
@@ -1850,14 +1864,22 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
 /// build (`last_analyzed_at` NULL — the hardcoded codesage/2048 seed) takes
 /// THIS build's provenance as its first record, so a soft-failed Python stamp
 /// can never leave the seed looking like a record (the timestamp below would
-/// otherwise turn it into one). Soft-fail: a DB hiccup is logged, never
-/// propagated.
+/// otherwise turn it into one).
+///
+/// W6-B2 final round (review F3 — confirmed real): that promotion happens
+/// ONLY when this build's model is provably a complete slot: a SUCCESS build
+/// (`build_complete`; a PARTIAL one is not), not a fill run (`prov.filling`),
+/// and no fill toward that model recorded in `config_json.code_model_fill`.
+/// Otherwise a seed is stamped with NO model (the placeholder never becomes a
+/// record; the next run reads the record off the live data). Soft-fail: a DB
+/// hiccup is logged, never propagated.
 fn persist_codegraph_provenance(
     db: &Db,
     project_id: &str,
     canonical_identity: &str,
     prov: &CodegraphProvenance,
     analyzed_at: i64,
+    build_complete: bool,
 ) {
     let existing = db.get_project_codegraph_binding(project_id).ok().flatten();
     let collection_prefix = existing
@@ -1870,8 +1892,16 @@ fn persist_codegraph_provenance(
         .map(|b| b.config.clone())
         .unwrap_or(serde_json::Value::Null);
     let seeded = existing.as_ref().is_none_or(|b| b.last_analyzed_at.is_none());
-    let (embedding_model, embedding_dim) = if seeded {
+    let fill_toward_model = config
+        .get("code_model_fill")
+        .and_then(|f| f.get("target"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case(&prov.model));
+    let promotable = build_complete && !prov.filling && !fill_toward_model;
+    let (embedding_model, embedding_dim) = if seeded && promotable {
         (Some(prov.model.clone()), Some(prov.dim))
+    } else if seeded {
+        (None, None)
     } else {
         (
             existing.as_ref().and_then(|b| b.embedding_model.clone()),
@@ -3181,8 +3211,9 @@ mod build_tests {
             dim: 1024,
             embed_revision: 3,
             analyzed_commit: Some("deadbeef".to_string()),
+            filling: true,
         };
-        persist_codegraph_provenance(&db, &pid, "Proj", &prov, 1_700_000_000_000);
+        persist_codegraph_provenance(&db, &pid, "Proj", &prov, 1_700_000_000_000, true);
         let b = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
         assert_eq!(b.embedding_model.as_deref(), Some("codesage-large-v2"));
         assert_eq!(b.embedding_dim, Some(2048));
@@ -3211,12 +3242,62 @@ mod build_tests {
             dim: 1024,
             embed_revision: 1,
             analyzed_commit: Some("c0ffee".to_string()),
+            filling: false,
         };
-        persist_codegraph_provenance(&db, &pid, "Seed", &prov, 1_700_000_000_000);
+        persist_codegraph_provenance(&db, &pid, "Seed", &prov, 1_700_000_000_000, true);
         let b = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
         assert_eq!(b.embedding_model.as_deref(), Some("qwen3-embedding:0.6b"));
         assert_eq!(b.embedding_dim, Some(1024));
         assert_eq!(b.last_analyzed_at, Some(1_700_000_000_000));
+    }
+
+    /// Review F3 (W6-B2 final round): a seed is NEVER handed a half-filled
+    /// target — not from a fill run, not from a recorded fill toward that
+    /// model, not from a PARTIAL build. It gets no model (the placeholder
+    /// never becomes a record either). Red before: all three promoted
+    /// `prov.model`.
+    #[test]
+    fn persist_provenance_never_promotes_a_half_filled_target_onto_a_seed() {
+        let cases: [(bool, bool, serde_json::Value); 3] = [
+            (true, true, serde_json::Value::Null), // a fill run
+            (true, false, serde_json::json!({"code_model_fill": {"target": "qwen3-embedding:0.6b"}})),
+            (false, false, serde_json::Value::Null), // PARTIAL build
+        ];
+        for (i, (complete, filling, config)) in cases.into_iter().enumerate() {
+            let db = Db::open_in_memory().unwrap();
+            let pid = uuid::Uuid::new_v4().to_string();
+            db.insert_project(&pid, "Seed", "/tmp/pf", ProjectHost::Base, "pf").unwrap();
+            db.set_project_codegraph_binding(
+                &pid, "Seed", Some("codesage-large-v2"), Some(2048), None, None, true, &config,
+            )
+            .unwrap();
+            let prov = CodegraphProvenance {
+                model: "qwen3-embedding:0.6b".to_string(),
+                dim: 1024,
+                embed_revision: 1,
+                analyzed_commit: None,
+                filling,
+            };
+            persist_codegraph_provenance(&db, &pid, "Seed", &prov, 1_700_000_000_000, complete);
+            let b = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
+            assert_eq!(b.embedding_model, None, "case {i}");
+            assert_eq!(b.embedding_dim, None, "case {i}");
+            assert_eq!(b.last_analyzed_at, Some(1_700_000_000_000), "case {i}");
+        }
+    }
+
+    #[test]
+    fn provenance_parser_reads_the_optional_filling_token() {
+        let p = parse_codegraph_provenance(
+            "CODEGRAPH_PROVENANCE model=m dim=8 embed_revision=1 analyzed_commit=none filling=1\n",
+        )
+        .unwrap();
+        assert!(p.filling);
+        let q = parse_codegraph_provenance(
+            "CODEGRAPH_PROVENANCE model=m dim=8 embed_revision=1 analyzed_commit=none\n",
+        )
+        .unwrap();
+        assert!(!q.filling);
     }
 
 }

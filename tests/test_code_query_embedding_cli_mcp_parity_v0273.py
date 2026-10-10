@@ -157,12 +157,16 @@ class CodeQueryEmbeddingParityTests(unittest.TestCase):
         self.server._get_embedding_service = lambda: None
         self.cli._get_or_create_embedding_service = lambda: None
         try:
-            self.assertEqual(
-                self.server._active_code_query_slot(),
-                self.cli._active_code_vector_slot(),
-            )
-            # CLI's documented svc-None fallback is codesage_embed.
-            self.assertEqual(self.server._active_code_query_slot(), "codesage_embed")
+            # v0.2.102 W6-B2 (owner ruling 2026-10-10): svc None is the SAME
+            # loud error on both surfaces — the old shared "codesage_embed"
+            # default named a slot the graph may not be indexed in.
+            from vco_lib.embed_outage import EmbeddingBackendUnavailable
+
+            with self.assertRaises(EmbeddingBackendUnavailable) as mcp_ctx:
+                self.server._active_code_query_slot()
+            with self.assertRaises(EmbeddingBackendUnavailable) as cli_ctx:
+                self.cli._active_code_vector_slot()
+            self.assertEqual(mcp_ctx.exception.scheme, cli_ctx.exception.scheme)
         finally:
             self.server._get_embedding_service = orig_mcp
             self.cli._get_or_create_embedding_service = orig_cli

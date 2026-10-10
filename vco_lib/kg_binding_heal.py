@@ -2822,27 +2822,38 @@ def _update_codegraph_binding(db_path, prefix: str, mutate) -> bool:
     if not db_path.is_file() or not prefix:
         return False
     try:
-        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        # W6-B2 final round (review F7): the SELECT and the UPDATE of the whole
+        # config_json blob run in ONE write transaction (BEGIN IMMEDIATE takes
+        # the write lock up front), so a concurrent launcher writer — the
+        # Codegraph tab saving `code_model_target`, the provenance persist —
+        # can neither be lost nor lose this stamp between the two statements.
+        conn = sqlite3.connect(str(db_path), timeout=5.0, isolation_level=None)
         try:
-            row = conn.execute(
-                "SELECT project_id, config_json, last_analyzed_at FROM project_codegraph_bindings "
-                "WHERE lower(collection_prefix) = lower(?) LIMIT 1", (prefix,),
-            ).fetchone()
-            if row is None:
-                return False
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                config = json.loads(row[1] or "null")
-            except ValueError:
-                config = None
-            updates = mutate(config if isinstance(config, dict) else {}, row[2])
-            updates["updated_at"] = int(time.time() * 1000)
-            cols = ", ".join(f"{k} = ?" for k in updates)
-            conn.execute(
-                f"UPDATE project_codegraph_bindings SET {cols} WHERE project_id = ?",
-                (*updates.values(), row[0]),
-            )
-            conn.commit()
-            return True
+                row = conn.execute(
+                    "SELECT project_id, config_json, last_analyzed_at FROM project_codegraph_bindings "
+                    "WHERE lower(collection_prefix) = lower(?) LIMIT 1", (prefix,),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    return False
+                try:
+                    config = json.loads(row[1] or "null")
+                except ValueError:
+                    config = None
+                updates = mutate(config if isinstance(config, dict) else {}, row[2])
+                updates["updated_at"] = int(time.time() * 1000)
+                cols = ", ".join(f"{k} = ?" for k in updates)
+                conn.execute(
+                    f"UPDATE project_codegraph_bindings SET {cols} WHERE project_id = ?",
+                    (*updates.values(), row[0]),
+                )
+                conn.execute("COMMIT")
+                return True
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
         finally:
             conn.close()
     except Exception:  # noqa: BLE001 — a missed stamp is re-derived next run

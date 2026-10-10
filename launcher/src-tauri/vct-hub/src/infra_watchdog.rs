@@ -56,11 +56,11 @@
 //!      this" signal a deliberate stop drops so the watchdog backs off; a
 //!      RAW external stop with no marker DOES get restarted (that is the
 //!      desired self-healing behavior), AND
-//!   4. the service is actually PART of this install — the GPU-only
-//!      `code_embed` service legitimately does not exist on a CPU-only /
-//!      `CODE_EMBED_BACKEND=ollama` host (`profiles: [gpu]` in the compose
-//!      file), so the watchdog must never try to build/start it there (see
-//!      [`code_embed_in_stack`]), AND
+//!   4. the service is actually PART of this install — the CodeSage-only
+//!      `code_embed` service legitimately does not exist where no code graph
+//!      uses CodeSage or there is no GPU (install's `CODE_EMBED_IN_STACK`
+//!      marker; `profiles: [gpu]` in the compose file), so the watchdog must
+//!      never try to build/start it there (see [`code_embed_in_stack`]), AND
 //!   5. the service has not exhausted its crash-loop budget
 //!      (see [`Backoff`]).
 //!
@@ -215,12 +215,11 @@ pub const CANONICAL_INFRA_SERVICES: [(&str, &str); 3] = [
     ("code_embed", "vco_code_embed"),
 ];
 
-/// The GPU-only service — gated behind `profiles: [gpu]` in the compose
-/// file. On a CPU-only / `CODE_EMBED_BACKEND=ollama` host the
-/// `vco_code_embed` container legitimately does NOT exist, and the
-/// watchdog must NEVER try to build/start it there (a stray `up code_embed`
-/// would trigger a multi-GB CodeSage image build on a CPU box). See
-/// [`code_embed_in_stack`].
+/// The CodeSage-only service — gated behind `profiles: [gpu]` in the
+/// compose file. Where no code graph uses CodeSage (or there is no GPU) the
+/// `vco_code_embed` container legitimately does NOT exist, and the watchdog
+/// must NEVER try to build/start it there (a stray `up code_embed` would
+/// trigger a multi-GB CodeSage image build). See [`code_embed_in_stack`].
 pub const GPU_ONLY_SERVICE: &str = "code_embed";
 
 /// app_state key (in launcher.db) that gates the LAUNCHER's own services
@@ -241,11 +240,11 @@ pub const APP_STATE_KEY_WATCHER_ENABLED: &str = "launcher.services_watcher_enabl
 pub const ENV_ORCHESTRATOR_ROOT: &str = "VCT_ORCHESTRATOR_ROOT";
 pub const ENV_INSTALL_ROOT: &str = "VCT_INSTALL_ROOT";
 
-/// Env override for `CODE_EMBED_BACKEND`. When `ollama` (case-insensitive)
-/// the CodeSage GPU service is NOT part of the stack — the host uses the
-/// Ollama CPU-embedding fallback and `vco_code_embed` is never built. Any
-/// other value (or unset) leaves the GPU-profile decision to the
-/// runtime/overlay signals (see [`code_embed_in_stack`]).
+/// Env `CODE_EMBED_BACKEND` — the pre-v0.2.102 stack signal, consulted only
+/// when `infrastructure/.env` carries no `CODE_EMBED_IN_STACK` marker. When
+/// `ollama` (case-insensitive) the CodeSage service is NOT part of the stack:
+/// the host's code models are served by Ollama (where jina / qwen3 run — not
+/// a fallback). See [`code_embed_in_stack`].
 pub const ENV_CODE_EMBED_BACKEND: &str = "CODE_EMBED_BACKEND";
 
 // ─── Configuration ──────────────────────────────────────────────────────
@@ -541,47 +540,57 @@ pub fn pause_marker_path(service: &str) -> PathBuf {
     watchdog_pause::pause_marker_path(service)
 }
 
-// ─── code_embed (GPU-only) stack-membership gate (BLOCKER-2) ─────────────
+// ─── code_embed stack-membership gate (BLOCKER-2; v0.2.102 W6-B2) ────────
+
+/// The marker install / service adoption write to `infrastructure/.env`
+/// (`vco_lib.compose_env.compose_substitution_env`, decided by
+/// `vco_lib.code_embed_serving.code_embed_in_stack`): `true` when the
+/// code_embed container is part of THIS install.
+pub const INFRA_ENV_CODE_EMBED_IN_STACK: &str = "CODE_EMBED_IN_STACK";
 
 /// Should the watchdog supervise `code_embed` on THIS host?
 ///
-/// `code_embed` (the CodeSage GPU embedding service) is gated behind
-/// `profiles: [gpu]` in `infrastructure/docker-compose.yml`. On a CPU-only
-/// or `CODE_EMBED_BACKEND=ollama` host the `vco_code_embed` container
-/// legitimately does NOT exist — the host uses the Ollama CPU-embedding
-/// fallback. A blind `compose up code_embed` there would (a) try to BUILD
-/// the multi-GB CodeSage image on a CPU box and (b) fail / waste resources.
-/// So the watchdog must only target `code_embed` when the install actually
-/// includes it.
+/// The `code_embed` container serves ONE model: CodeSage (its `gpu`
+/// backend). Serving follows the model (owner rule 2026-10-10): jina / qwen3
+/// code graphs are embedded by Ollama — where those models are served, not a
+/// fallback — and OpenAI ones by OpenAI, so on a host where no code graph
+/// uses CodeSage (or with no GPU) the `vco_code_embed` container legitimately
+/// does not exist, and a blind `compose up code_embed` there would build the
+/// multi-GB CodeSage image for nothing.
 ///
-/// Resolution (any one ⇒ excluded):
-///   1. `CODE_EMBED_BACKEND=ollama` (case-insensitive) — explicit CPU
-///      fallback. This is the authoritative "not in stack" signal install.py
-///      writes to `.env` on a CPU-only host.
-///
-/// Otherwise: included. We deliberately DEFAULT-INCLUDE when the backend is
-/// unset / `gpu`, because the restart path is the GPU-aware wrapper which
-/// itself probes for NVIDIA + CDI and degrades to a CPU-only `up -d` WITHOUT
-/// the gpu profile when no GPU is present — i.e. on a GPU-less host the
-/// wrapper never enables the gpu profile, so `code_embed` is never built
-/// even if we "target" it. The hard exclusion above is the belt; the
-/// wrapper's own GPU probe is the suspenders. The container-probe also
-/// returns `false` for a never-created `vco_code_embed`, but step 1 stops us
-/// BEFORE we ever issue a build on an explicitly-CPU host.
-pub fn code_embed_in_stack() -> bool {
-    // Excluded iff CODE_EMBED_BACKEND is explicitly `ollama`
-    // (case-insensitive, trimmed). Unset / `gpu` / anything else → included.
+/// Resolution — the SAME decision install / compose make (A>B>C: one Python
+/// home, its projected value read here, never re-derived):
+///   1. `CODE_EMBED_IN_STACK` in `<infra_dir>/.env` — `true` / `false`
+///      (case-insensitive; `1` / `0` accepted) is authoritative.
+///   2. Absent (an install from before v0.2.102): the pre-W6-B2 rule —
+///      excluded iff the process env's `CODE_EMBED_BACKEND` is `ollama`,
+///      otherwise included (the restart path is the GPU-aware wrapper, which
+///      never enables the gpu profile on a GPU-less host).
+pub fn code_embed_in_stack(infra_dir: Option<&Path>) -> bool {
+    if let Some(dir) = infra_dir {
+        if let Ok(Some(v)) = vct_launcher_core::services::env_file::read_key(
+            &dir.join(".env"),
+            INFRA_ENV_CODE_EMBED_IN_STACK,
+        ) {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => return true,
+                "false" | "0" => return false,
+                _ => {}
+            }
+        }
+    }
     !std::env::var(ENV_CODE_EMBED_BACKEND)
         .map(|v| v.trim().eq_ignore_ascii_case("ollama"))
         .unwrap_or(false)
 }
 
 /// True when `service` should be supervised on this host. Always true for
-/// `weaviate` / `ollama`; for the GPU-only `code_embed` it defers to
-/// [`code_embed_in_stack`].
-pub fn service_in_stack(service: &str) -> bool {
+/// `weaviate` / `ollama`; for `code_embed` it defers to
+/// [`code_embed_in_stack`] (with the compose dir whose `.env` carries the
+/// marker).
+pub fn service_in_stack(service: &str, infra_dir: Option<&Path>) -> bool {
     if service == GPU_ONLY_SERVICE {
-        code_embed_in_stack()
+        code_embed_in_stack(infra_dir)
     } else {
         true
     }
@@ -1304,11 +1313,11 @@ async fn run_one_tick(
         }
 
         // BLOCKER-2 gate: don't supervise a service that isn't part of THIS
-        // install. The GPU-only `code_embed` legitimately doesn't exist on a
-        // CPU-only / `CODE_EMBED_BACKEND=ollama` host; targeting it there
-        // would trigger a multi-GB image build. (Quiet — normal on CPU
-        // hosts.)
-        if !service_in_stack(service) {
+        // install. `code_embed` (CodeSage only) legitimately doesn't exist
+        // where no code graph uses CodeSage or there is no GPU — the
+        // install's `CODE_EMBED_IN_STACK` marker says so; targeting it there
+        // would trigger a multi-GB image build. (Quiet — normal there.)
+        if !service_in_stack(service, Some(infra_dir.as_path())) {
             gave_up.remove(service);
             continue;
         }
@@ -1913,21 +1922,21 @@ mod tests {
         assert_eq!(classify_probe(true, "weird-state", ""), ContainerProbe::ProbeError);
     }
 
-    // ----- BLOCKER-2: code_embed (GPU-only) stack-membership gate -----
+    // ----- BLOCKER-2 / W6-B2: code_embed stack-membership gate -----
 
     #[test]
     #[serial_test::serial]
     fn code_embed_excluded_when_backend_is_ollama() {
         let _env_lock = vct_launcher_core::test_env::env_lock();
         let prev = std::env::var_os(ENV_CODE_EMBED_BACKEND);
-        // Explicit CPU fallback → code_embed not in stack.
+        // No marker (a pre-v0.2.102 install) → the env rule.
         for v in ["ollama", "OLLAMA", " Ollama "] {
             std::env::set_var(ENV_CODE_EMBED_BACKEND, v);
-            assert!(!code_embed_in_stack(), "backend={:?} must exclude code_embed", v);
-            assert!(!service_in_stack("code_embed"));
+            assert!(!code_embed_in_stack(None), "backend={:?} must exclude code_embed", v);
+            assert!(!service_in_stack("code_embed", None));
             // weaviate / ollama are always in stack regardless.
-            assert!(service_in_stack("weaviate"));
-            assert!(service_in_stack("ollama"));
+            assert!(service_in_stack("weaviate", None));
+            assert!(service_in_stack("ollama", None));
         }
         match prev {
             Some(p) => std::env::set_var(ENV_CODE_EMBED_BACKEND, p),
@@ -1941,10 +1950,43 @@ mod tests {
         let _env_lock = vct_launcher_core::test_env::env_lock();
         let prev = std::env::var_os(ENV_CODE_EMBED_BACKEND);
         std::env::remove_var(ENV_CODE_EMBED_BACKEND);
-        assert!(code_embed_in_stack(), "unset backend defaults to in-stack");
-        assert!(service_in_stack("code_embed"));
+        assert!(code_embed_in_stack(None), "unset backend defaults to in-stack");
+        assert!(service_in_stack("code_embed", None));
         std::env::set_var(ENV_CODE_EMBED_BACKEND, "gpu");
-        assert!(code_embed_in_stack(), "gpu backend keeps code_embed in stack");
+        assert!(code_embed_in_stack(None), "gpu backend keeps code_embed in stack");
+        match prev {
+            Some(p) => std::env::set_var(ENV_CODE_EMBED_BACKEND, p),
+            None => std::env::remove_var(ENV_CODE_EMBED_BACKEND),
+        }
+    }
+
+    /// W6-B2: the install's marker decides, per host class — the SAME
+    /// decision `vco_lib.code_embed_serving.code_embed_in_stack` makes for
+    /// install / compose. A marker beats the process env both ways.
+    #[test]
+    #[serial_test::serial]
+    fn code_embed_follows_the_install_marker_per_host_class() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let prev = std::env::var_os(ENV_CODE_EMBED_BACKEND);
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        // NVIDIA >= 12 GB, CodeSage selected → in stack (even with a stale
+        // `ollama` backend in the process env).
+        std::env::set_var(ENV_CODE_EMBED_BACKEND, "ollama");
+        std::fs::write(&env_file, "CODE_EMBED_BACKEND=gpu\nCODE_EMBED_IN_STACK=true\n").unwrap();
+        assert!(code_embed_in_stack(Some(dir.path())));
+        // GPU host whose code graphs use jina / qwen3 (served by Ollama), and
+        // a CPU-only host → not in stack, even with an unset / `gpu` env.
+        std::env::remove_var(ENV_CODE_EMBED_BACKEND);
+        for marker in ["false", "FALSE", "0"] {
+            std::fs::write(&env_file, format!("CODE_EMBED_IN_STACK={marker}\n")).unwrap();
+            assert!(!code_embed_in_stack(Some(dir.path())), "marker={marker}");
+            assert!(!service_in_stack("code_embed", Some(dir.path())));
+            assert!(service_in_stack("ollama", Some(dir.path())));
+        }
+        // Unreadable / unrecognised marker → the legacy env rule.
+        std::fs::write(&env_file, "CODE_EMBED_IN_STACK=maybe\n").unwrap();
+        assert!(code_embed_in_stack(Some(dir.path())));
         match prev {
             Some(p) => std::env::set_var(ENV_CODE_EMBED_BACKEND, p),
             None => std::env::remove_var(ENV_CODE_EMBED_BACKEND),

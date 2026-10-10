@@ -287,6 +287,15 @@ def test_live_known_noise_query_returns_only_relevant_or_empty() -> None:
     # (We cannot assert exact rows without controlling the seed, but a floored
     # gibberish query returning the max limit is the regression signature.)
     combined = (proc.stdout or "") + (proc.stderr or "")
+    # v0.2.102 W6-B2: a query the CLI cannot embed (the backend that serves the
+    # graph's model is down) is now a LOUD non-zero exit, where it used to print
+    # "Failed to generate query embedding" and exit 0 — which let this smoke
+    # pass with nothing searched. Missing embedding infra is the same gate as
+    # missing Weaviate: skip, or fail under the live lane.
+    if proc.returncode != 0 and "never queried with a different embedding model" in combined:
+        if _REQUIRE_LIVE:
+            pytest.fail(f"VCO_RUN_LIVE_RETRIEVAL_SMOKE=1 but the embedding backend is down: {combined}")
+        pytest.skip("live retrieval smoke skipped: the code graph's embedding backend is unavailable")
     assert proc.returncode == 0, f"CLI errored: {combined}"
     # Count result rows heuristically by the CLI's per-result marker.
     hit_markers = combined.count("full_name") + combined.lower().count("score")

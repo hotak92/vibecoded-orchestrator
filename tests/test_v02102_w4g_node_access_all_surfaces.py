@@ -188,7 +188,8 @@ def test_kg_search_search_filters_peer_rows_keeps_self(monkeypatch, capsys):
     client = _Client({SELF: _self_rows(), PEER: _peer_rows()})
     monkeypatch.setattr(sk, "HAS_RL_PIPELINE", False)
     with mock.patch.object(sk, "get_weaviate_client", return_value=client), \
-         mock.patch.object(sk, "get_embedding", return_value=[0.0] * 8):
+         mock.patch.object(sk, "get_embedding", return_value=[0.0] * 8), \
+         mock.patch.object(sk, "_get_target_vector_slot", return_value="qwen3_embed"):
         sk.search_knowledge("q", limit=20, detail="titles")
     seen = _titles(capsys.readouterr().out)
     assert seen >= PEER_VISIBLE | {"SelfPrivate", "SelfOtherOnly"}

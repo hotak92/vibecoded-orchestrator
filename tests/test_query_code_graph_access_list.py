@@ -119,7 +119,8 @@ class QueryCodeGraphAccessListTests(unittest.TestCase):
         client = _FakeClient(contents)
         querier = qcg.CodeGraphQuery(project="Alpha")
         querier.client = client
-        with mock.patch.object(qcg, "generate_code_embedding", return_value=[0.0] * 2048):
+        with mock.patch.object(qcg, "generate_code_embedding", return_value=[0.0] * 2048), \
+             mock.patch.object(qcg, "_active_code_vector_slot", return_value="codesage_embed"):
             querier.search_by_concept("foo", collection="CodeFunction", limit=5)
         self.assertEqual(client.collections.requested, ["Alpha_CodeFunction"])
 
@@ -138,7 +139,8 @@ class QueryCodeGraphAccessListTests(unittest.TestCase):
         client = _FakeClient(contents)
         querier = qcg.CodeGraphQuery(project="Alpha")
         querier.client = client
-        with mock.patch.object(qcg, "generate_code_embedding", return_value=[0.0] * 2048):
+        with mock.patch.object(qcg, "generate_code_embedding", return_value=[0.0] * 2048), \
+             mock.patch.object(qcg, "_active_code_vector_slot", return_value="codesage_embed"):
             querier.search_by_concept("foo", collection="CodeFunction", limit=5)
         self.assertEqual(
             client.collections.requested,
@@ -162,7 +164,8 @@ class QueryCodeGraphAccessListTests(unittest.TestCase):
         client = _FakeClient(contents)
         querier = qcg.CodeGraphQuery(project=None)
         querier.client = client
-        with mock.patch.object(qcg, "generate_code_embedding", return_value=[0.0] * 2048):
+        with mock.patch.object(qcg, "generate_code_embedding", return_value=[0.0] * 2048), \
+             mock.patch.object(qcg, "_active_code_vector_slot", return_value="codesage_embed"):
             querier.search_by_concept("foo", collection="CodeFunction", limit=5)
         self.assertEqual(client.collections.requested, ["CodeFunction"])
 
@@ -187,6 +190,7 @@ class QueryCodeGraphAccessListTests(unittest.TestCase):
             captured.append(line)
 
         with mock.patch.object(qcg, "generate_code_embedding", return_value=[0.0] * 2048), \
+             mock.patch.object(qcg, "_active_code_vector_slot", return_value="codesage_embed"), \
              mock.patch("builtins.print", side_effect=_spy_print):
             querier.search_by_concept("foo", collection="CodeFunction", limit=5)
 
@@ -222,7 +226,8 @@ class QueryCodeGraphAccessListTests(unittest.TestCase):
         client = _PartialClient()
         querier = qcg.CodeGraphQuery(project="Alpha")
         querier.client = client
-        with mock.patch.object(qcg, "generate_code_embedding", return_value=[0.0] * 2048):
+        with mock.patch.object(qcg, "generate_code_embedding", return_value=[0.0] * 2048), \
+             mock.patch.object(qcg, "_active_code_vector_slot", return_value="codesage_embed"):
             # Must not raise
             querier.search_by_concept("foo", collection="CodeFunction", limit=5)
         self.assertEqual(

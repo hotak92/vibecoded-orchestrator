@@ -88,6 +88,7 @@ __all__ = [
     "reset_503_tolerance_override",
     "compute_503_delay",
     "retry_transient_embed",
+    "wait_until_reachable",
     "post_code_embed",
 ]
 
@@ -472,6 +473,52 @@ def retry_transient_embed(fn, *args, log=None, interactive: bool = False):
                 _time.sleep(delay)
     assert last_exc is not None
     raise last_exc
+
+
+def wait_until_reachable(probe, *, interactive: bool, log=None) -> bool:
+    """Poll ``probe()`` until it answers True or the REFUSED bound elapses.
+
+    v0.2.102 W6-B2 (owner ruling 2026-10-10): a down embedding container is
+    waited on — the hub watchdog restarts it — on the SAME transient policy
+    :func:`retry_transient_embed` applies to a refused connection
+    (:func:`resolve_refused_tolerance`: ~10 s for an interactive query, the
+    batch tolerance for an analyzer walk), then the caller fails LOUDLY. It
+    never answers by switching to another embedder. Scale ``0``
+    (``VCO_EMBED_503_RETRY_DELAY=0``) keeps the finite zero-delay test mode.
+    Returns whether the probe answered.
+    """
+    import logging
+    import time as _time
+
+    logger = log or logging.getLogger(__name__)
+    if probe():
+        return True
+    scale = resolve_503_delay_scale(base=DEFAULT_503_FALLBACK_BACKOFFS[0] or 1.0)
+    legacy_bounded = scale == 0.0
+    tolerance = resolve_refused_tolerance(interactive=interactive)
+    deadline = _time.monotonic() + tolerance
+    attempt = 0
+    while True:
+        attempt += 1
+        if legacy_bounded:
+            if attempt > len(DEFAULT_503_FALLBACK_BACKOFFS):
+                return False
+            delay = 0.0
+        else:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                logger.error("embed backend unreachable for %.0fs — giving up", tolerance)
+                return False
+            delay = min(
+                compute_503_delay(attempt, None, DEFAULT_503_FALLBACK_BACKOFFS, scale),
+                remaining,
+            )
+        logger.info("embed backend unreachable (restarting?) — re-probe %d after %.1fs",
+                    attempt, delay)
+        if delay > 0:
+            _time.sleep(delay)
+        if probe():
+            return True
 
 
 def post_code_embed(

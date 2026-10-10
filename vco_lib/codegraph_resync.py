@@ -2227,6 +2227,81 @@ def code_embed_service_healthy(
         return False
 
 
+def _walk_code_models(project_name: Optional[str]) -> "list[str]":
+    """The models the project's walk embeds with: the write target plus the
+    record carried during a fill (``vco_lib.code_embed_model``). ``[]`` when
+    unresolvable."""
+    try:
+        from vco_lib.code_embed_model import resolve_code_model
+
+        res = resolve_code_model(codegraph_prefix=project_name, role="write")
+        return [m for m in (res.model, res.carry) if m]
+    except Exception as exc:  # noqa: BLE001 — unresolvable → the legacy probe
+        logger.info("codegraph resync: code model unresolvable (%s)", exc)
+        return []
+
+
+def walk_uses_container(project_name: Optional[str]) -> bool:
+    """Does the project's walk embed through the code_embed container? (A
+    walk whose models cannot be resolved is assumed to — the pre-W6-B2
+    behaviour, so the stale-image gate is never skipped on a guess.)"""
+    from vco_lib.code_embed_serving import CODE_SERVED_BY_CONTAINER, code_serving_backend
+
+    models = _walk_code_models(project_name)
+    return not models or any(
+        code_serving_backend(m) == CODE_SERVED_BY_CONTAINER for m in models)
+
+
+def code_backend_down(
+    project_name: Optional[str], code_embed_url: Optional[str] = None,
+) -> "tuple[Optional[str], bool]":
+    """``(label, container_used)``: ``label`` names the embedding backend the
+    project's walk needs that does not answer (None when all do);
+    ``container_used`` says whether that walk embeds through the code_embed
+    container (the stale-image gate applies only then).
+
+    v0.2.102 W6-B2 final round (review F2): serving follows the model
+    (``vco_lib.code_embed_serving``) — a jina / qwen3 graph is embedded by
+    Ollama (probed for the model), CodeSage by the container, an OpenAI model
+    by OpenAI (its consent gate lives in the resolver; no probe). Pre-fix this
+    gate probed the container for every graph, so on a CPU-only host — where
+    no container exists — a fill or resync could never run. The models are
+    the walk's write models (the target plus the record carried during a
+    fill); an unresolvable model keeps the pre-W6-B2 container probe."""
+    from vco_lib.code_embed_serving import (
+        CODE_SERVED_BY_CONTAINER,
+        CODE_SERVED_BY_OPENAI,
+        code_serving_backend,
+    )
+
+    models = _walk_code_models(project_name)
+    if not models:
+        ok = code_embed_service_healthy(code_embed_url)
+        return (None if ok else f"code-embed service (:{DEFAULT_CODE_EMBED_PORT})"), True
+    container_used = False
+    for model in models:
+        serving = code_serving_backend(model)
+        if serving == CODE_SERVED_BY_CONTAINER:
+            container_used = True
+            if not code_embed_service_healthy(code_embed_url):
+                return (f"the code_embed container (:{DEFAULT_CODE_EMBED_PORT}) serving "
+                        f"{model}"), True
+        elif serving == CODE_SERVED_BY_OPENAI:
+            continue
+        else:
+            from vco_lib import ollama_pull
+            from vco_lib.embedding_service import DEFAULT_OLLAMA_URL
+
+            base = (os.environ.get("OLLAMA_URL") or "").strip() or DEFAULT_OLLAMA_URL
+            try:
+                _present, missing = ollama_pull.verify_present(base, [model])
+            except Exception:  # noqa: BLE001 — Ollama down / bad body
+                return f"Ollama at {base} (serving {model})", container_used
+            if missing:
+                return f"Ollama at {base} (model {model} not pulled)", container_used
+    return None, container_used
+
+
 def code_embed_image_verdict(
     repo_root: "Path | str | None",
     code_embed_url: Optional[str] = None,
@@ -2346,6 +2421,8 @@ def _resolve_analyzer(repo_root: Path) -> Optional[Path]:
 def build_resync_deferral(
     project_name: str,
     command_to_apply: str,
+    *,
+    backend: str = "",
 ) -> Optional["_DeferralEntryT"]:
     """Construct the ``codegraph_embed_resync_pending`` :class:`DeferralEntry`.
 
@@ -2358,16 +2435,19 @@ def build_resync_deferral(
         condition_id=_CONDITION_ID,
         title="Code-graph re-embed pending (chunking revision changed)",
         detected=(
-            "The code-embedding service (:{port}) was unreachable during "
+            "{backend} was unreachable during "
             "--update, so the revision-gated code-graph resync for project "
             "'{proj}' could not run. About 7-9% of functions/classes were "
             "embedded under the pre-chunking scheme and need re-embedding so "
             "their over-budget tails become searchable.".format(
-                port=DEFAULT_CODE_EMBED_PORT, proj=project_name
+                backend=(backend[:1].upper() + backend[1:]) if backend else
+                f"The code-embedding service (:{DEFAULT_CODE_EMBED_PORT})",
+                proj=project_name,
             )
         ),
         why_deferred=(
-            "A per-object re-embed needs the code-embedding service running; "
+            "A per-object re-embed needs the embedding backend that serves "
+            "this graph's model running; "
             "launching the analyze now would fail every embed. The resync is "
             "resumable — re-running it once the service is up re-embeds only "
             "the stale rows (revision mismatch) and skips everything already "
@@ -3492,7 +3572,10 @@ def _run_resync_and_verify_slotted(
     # driver runs `--run-resync` → the driver embedded 3 156 requests through
     # the stale image anyway, because the ordering constraint lived only in
     # prose. Every path now passes the same verdict here.
-    if code_embed_image_verdict(repo_root) == _STALE_VERDICT:
+    # v0.2.102 W6-B2: only a walk that embeds THROUGH the container (a
+    # CodeSage graph) is refused for a stale image; jina / qwen3 graphs are
+    # embedded by Ollama and never touch it.
+    if walk_uses_container(project_name) and code_embed_image_verdict(repo_root) == _STALE_VERDICT:
         print(
             "[resync-driver] code-embed image STALE — NOT embedding through "
             "it; rebuild the image first (see UPDATE_DEFERRED.md)",
@@ -4167,16 +4250,19 @@ def spawn_background_resync(
             owed = {k: v for k, v in stale_counts.items() if v}
             logger.info("codegraph resync: stale rows owed: %s", owed)
 
-    if check_service and not code_embed_service_healthy(code_embed_url):
-        deferral = build_resync_deferral(project_name, resume_cmd)
-        return ResyncTriggerResult(
-            status="deferred",
-            message=(
-                f"code-embed service (:{DEFAULT_CODE_EMBED_PORT}) unreachable — "
-                "resync deferred (see UPDATE_DEFERRED.md)"
-            ),
-            deferral=deferral,
-        )
+    # v0.2.102 W6-B2 (review F2): serving-aware — probe the backend that
+    # serves THIS graph's model (Ollama for jina / qwen3, the container for
+    # CodeSage, nothing for OpenAI), so CPU-only hosts fill and resync.
+    container_used = True
+    if check_service:
+        down, container_used = code_backend_down(project_name, code_embed_url)
+        if down is not None:
+            deferral = build_resync_deferral(project_name, resume_cmd, backend=down)
+            return ResyncTriggerResult(
+                status="deferred",
+                message=f"{down} unreachable — resync deferred (see UPDATE_DEFERRED.md)",
+                deferral=deferral,
+            )
 
     # v0.2.96 (WP-3, register issue 8): a LIVE service is not a CURRENT
     # service. Liveness above only proves something answers on the port; the
@@ -4193,7 +4279,7 @@ def spawn_background_resync(
     # this machine can compare against) keeps the pre-gate behavior: proceed.
     # A sourceless PROJECT tree is not unknown — the verdict helper judges it
     # against the install root that owns the machine's one service.
-    if check_service and code_embed_image_verdict(
+    if check_service and container_used and code_embed_image_verdict(
         repo_root, code_embed_url,
     ) == _STALE_VERDICT:
         deferral = build_stale_image_deferral(

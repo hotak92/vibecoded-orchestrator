@@ -215,10 +215,10 @@ def _code_down_service(monkeypatch, tmp_path, *, opt_in: bool):
     monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
     monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / ".vct"))
     monkeypatch.setenv("VCT_CLAUDE_DIR", str(tmp_path / ".claude-home"))
-    if opt_in:
-        monkeypatch.setenv(es.CODE_EMBED_ALLOW_FALLBACK_ENV, "1")
+    if opt_in:  # the removed v0.2.100 opt-in — must switch nothing now
+        monkeypatch.setenv("VCO_CODE_EMBED_ALLOW_FALLBACK", "1")
     else:
-        monkeypatch.delenv(es.CODE_EMBED_ALLOW_FALLBACK_ENV, raising=False)
+        monkeypatch.delenv("VCO_CODE_EMBED_ALLOW_FALLBACK", raising=False)
     monkeypatch.setattr("vco_lib.openai_key.resolve_openai_api_key", lambda *a, **k: "")
     ollama = mock.MagicMock(spec=es.OllamaAdapter)
     ollama.is_reachable.return_value = True
@@ -257,11 +257,12 @@ def test_code_embed_down_raises_typed_error_and_writes_no_row_at_construction(mo
         svc.close()
 
 
-def test_developer_opt_in_keeps_the_loud_fallback(monkeypatch, tmp_path, capsys):
+def test_the_removed_opt_in_switches_nothing(monkeypatch, tmp_path):
+    """Owner ruling 2026-10-10: no fallback to a different embedding model —
+    ever. The v0.2.100 developer opt-in is removed; setting it changes nothing."""
     _es, svc, emitted, _o = _code_down_service(monkeypatch, tmp_path, opt_in=True)
     try:
-        assert svc.code_vector_slot == "qwen3_embed"
+        assert svc.code_vector_slot == "codesage_embed"
         assert emitted == []
-        assert "VCO_CODE_EMBED_ALLOW_FALLBACK=1" in capsys.readouterr().err
     finally:
         svc.close()

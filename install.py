@@ -229,7 +229,7 @@ from vco_lib.symlink_handler import (  # noqa: E402
 # so in-module callers AND external importers (`install.select_*`, used by
 # tests/test_hardware_auto_selection.py +
 # tests/test_inference_pull_list_matches_summary_backend.py) keep working.
-# The five names carrying a per-line `pyright: ignore[reportUnusedImport]`
+# The names carrying a per-line `pyright: ignore[reportUnusedImport]`
 # have no in-module caller — they are RE-EXPORTS this module's public surface
 # owes to `tests/test_hardware_auto_selection.py`, which imports all sixteen
 # `from install import …`. Deleting them would break that suite and shrink a
@@ -244,7 +244,7 @@ from vco_lib.embedding_selection import (  # noqa: E402,F401
     _cpu_meets,  # pyright: ignore[reportUnusedImport] — re-export for tests
     select_code_embedding_backend,
     select_kg_embedding_backend,
-    select_summary_backend,
+    select_summary_backend,  # pyright: ignore[reportUnusedImport] — re-export (tests/test_hardware_auto_selection.py)
     summary_model_for_hardware,
     _CODE_BACKEND_CODESAGE,
     _CODE_BACKEND_QWEN3,
@@ -11670,9 +11670,16 @@ def _start_services(
                     print(f"    [start] {label}: not detected")
 
     # Determine which compose services need to start.
-    # If --gpu, we additionally bring up code_embed (gated on the gpu profile +
-    # overlay file). On CPU-only setups the service uses Ollama as code embed
-    # backend and code_embed is intentionally skipped.
+    # v0.2.102 W6-B2 (owner rule 2026-10-10 — serving follows the model): the
+    # code_embed container serves ONLY CodeSage, so it is started on a GPU
+    # host where a code model in use is CodeSage; jina / qwen3 graphs are
+    # embedded by Ollama directly. ONE decision
+    # (vco_lib.code_embed_serving.code_embed_in_stack), also projected to
+    # infrastructure/.env as CODE_EMBED_IN_STACK for the hub watchdog.
+    from vco_lib.compose_env import code_embed_container_in_stack  # noqa: PLC0415
+
+    code_embed_wanted = code_embed_container_in_stack(
+        {**embed_config, "has_gpu": bool(sysinfo.has_gpu)})
     services_to_start: list[str] = []
     # v0.2.61: our OWN vct-managed adopts are force-recreated so a changed
     # compose config applies on --update; foreign adopts NEVER are. A recreate
@@ -11685,7 +11692,7 @@ def _start_services(
         from vco_lib.service_lifecycle import compose_services  # noqa: PLC0415
         services_to_start = [
             s for s in compose_services(_SERVICE_ENDPOINTS["rows"])
-            if s != "code_embed" or sysinfo.has_gpu
+            if s != "code_embed" or code_embed_wanted
         ]
     elif decisions:
         # Decision-driven: only bring up services where the action is start
@@ -11693,7 +11700,7 @@ def _start_services(
         # do NOT get a compose START — but a vct-managed adopt DOES get a
         # force-recreate so a changed compose config is applied (v0.2.61).
         for svc in ("weaviate", "ollama", "code_embed"):
-            if svc == "code_embed" and not sysinfo.has_gpu:
+            if svc == "code_embed" and not code_embed_wanted:
                 continue
             d = decisions.get(svc, {})
             disposition = _classify_service_compose_action(

@@ -35,6 +35,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from vco_lib.code_embed_serving import (
+    CODE_EMBED_IN_STACK_KEY,
+    code_embed_in_stack,
+    code_models_in_use,
+)
 
 
 def code_embed_service_model(embed_config: dict) -> Optional[str]:
@@ -55,6 +60,48 @@ def code_embed_service_model(embed_config: dict) -> Optional[str]:
         return CODE_EMBED_GPU_MODEL
     if backend == "ollama" and model and code_serving_backend(model) == CODE_SERVED_BY_OLLAMA:
         return model
+    return None
+
+
+def code_embed_container_in_stack(embed_config: dict) -> bool:
+    """Whether install starts the code_embed container: a GPU host
+    (``has_gpu``, else a probed ``gpu_vendor``) where a code model in use is
+    served by it (:func:`vco_lib.code_embed_serving.code_embed_in_stack`)."""
+    has_gpu = embed_config.get("has_gpu")
+    if has_gpu is None:
+        has_gpu = bool(embed_config.get("gpu_vendor"))
+    install_model = str(embed_config.get("code_model") or "").strip()
+    if not install_model:
+        # No resolved install code model (a partial config): the pre-W6-B2
+        # rule — a GPU host runs the container. Never guessed away.
+        return bool(has_gpu)
+    return code_embed_in_stack(bool(has_gpu), code_models_in_use(install_model))
+
+
+def read_code_embed_in_stack(infra_dir: Path) -> Optional[bool]:
+    """The ``CODE_EMBED_IN_STACK`` marker in ``<infra_dir>/.env``: True /
+    False, or None when absent / unreadable / unrecognised (an install from
+    before v0.2.102 — callers keep their pre-marker behaviour). MUST MATCH
+    ``infra_watchdog.rs::code_embed_in_stack`` (true/1, false/0)."""
+    try:
+        text = (Path(infra_dir) / ".env").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    value: Optional[str] = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() == CODE_EMBED_IN_STACK_KEY:
+            value = val  # last occurrence wins
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if v in ("true", "1"):
+        return True
+    if v in ("false", "0"):
+        return False
     return None
 
 
@@ -82,6 +129,11 @@ def compose_substitution_env(embed_config: dict) -> dict[str, str]:
     model = code_embed_service_model(embed_config)
     if model:
         env["CODE_EMBED_MODEL"] = model
+    # v0.2.102 W6-B2: is the code_embed container part of this install at
+    # all? ONE decision (vco_lib.code_embed_serving.code_embed_in_stack),
+    # projected here so install's compose start and the hub watchdog
+    # (infra_watchdog.rs reads this key) follow it — never re-derived.
+    env[CODE_EMBED_IN_STACK_KEY] = "true" if code_embed_container_in_stack(embed_config) else "false"
     # CUDA Dockerfile only for NVIDIA hosts (AMD ROCm / Apple / CPU stay
     # on the multi-arch CPU default — there is no ROCm code-embed image).
     if embed_config.get("gpu_vendor") == "nvidia":

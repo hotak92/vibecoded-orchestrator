@@ -189,7 +189,9 @@ def same_code_model(a: str, b: str) -> bool:
 
 
 def is_openai_code_model(model: str) -> bool:
-    return "openai" in code_model_slot(model)[0]
+    from vco_lib.code_embed_serving import is_openai_code_model as _is_openai
+
+    return _is_openai(model)
 
 
 def _str(app_state: Callable[[str], Optional[str]], key: str) -> str:
@@ -436,19 +438,32 @@ def _declared_slots(name: str, weaviate_url: Optional[str]) -> Optional[set]:
     return set((schema.get("vectorConfig") or {}).keys())
 
 
+#: How many stored objects per collection a live record read samples (review
+#: F4: one object cannot tell a complete slot from a partly-filled one).
+_LIVE_SAMPLE = 20
+
+
 def _sample_vectors(name: str, weaviate_url: Optional[str]) -> "dict[str, int]":
-    """``{slot: dim}`` for the populated named vectors of one stored object."""
+    """``{slot: dim}`` for the named vectors populated on EVERY sampled stored
+    object (up to :data:`_LIVE_SAMPLE`) — a slot some sampled object lacks is
+    not a complete slot."""
     from vco_lib import weaviate_helpers as _wh
 
     base = (weaviate_url or _wh.weaviate_url_default()).rstrip("/")
     status, body = _wh.http_request(
-        "GET", f"{base}/v1/objects?class={name}&limit=1&include=vector", timeout=10.0,
+        "GET", f"{base}/v1/objects?class={name}&limit={_LIVE_SAMPLE}&include=vector",
+        timeout=10.0,
     )
     if status != 200:
         return {}
     objs = json.loads(body.decode("utf-8")).get("objects") or []
-    vectors = (objs[0].get("vectors") or {}) if objs else {}
-    return {k: len(v) for k, v in vectors.items() if isinstance(v, list) and v}
+    common: "Optional[dict[str, int]]" = None
+    for obj in objs:
+        vectors = obj.get("vectors") or {}
+        have = {k: len(v) for k, v in vectors.items() if isinstance(v, list) and v}
+        common = have if common is None else {
+            k: d for k, d in common.items() if have.get(k) == d}
+    return common or {}
 
 
 def _object_count(name: str, weaviate_url: Optional[str]) -> int:
@@ -475,15 +490,20 @@ def record_from_live(
     stored, nothing is unambiguous, or Weaviate is unreachable."""
     prefix = canonical_prefix(codegraph_prefix)
     pick_slot, pick_dim = code_model_slot(pick)
+    # Review F4: a fill toward the pick is in progress → its slot is partial
+    # by definition; never short-circuit on it (another populated slot is the
+    # record, or nothing is).
+    fill = fill_from_binding(read_binding_row(prefix)) or {}
+    pick_filling = bool(fill.get("target")) and same_code_model(str(fill["target"]), pick)
     try:
         for name in _collections(prefix):
             populated = _sample_vectors(name, weaviate_url)
             if not populated:
                 continue
-            if populated.get(pick_slot) == pick_dim:
+            if not pick_filling and populated.get(pick_slot) == pick_dim:
                 return CodeModelRecord(pick, pick_dim, pick_slot)
             for slot, model in _SLOT_MODEL.items():
-                if slot in populated:
+                if slot in populated and not (pick_filling and slot == pick_slot):
                     return CodeModelRecord(model, populated[slot], slot)
             if "openai_code_embed" in populated:
                 dim = populated["openai_code_embed"]
@@ -636,15 +656,24 @@ def scan_slot_fill(
 def _counters_consistent(counters: Optional[Mapping[str, Any]], target: str,
                          total: Optional[int], revision: Optional[int]) -> bool:
     """Trust stamped/walk counters only when they are about THIS target, at
-    THIS revision, against the graph's CURRENT object count, and add up."""
+    THIS revision, and add up against the graph's CURRENT object count.
+
+    W6-B2 final round (review F1 HIGH): a clean whole-graph walk's counters
+    cover exactly the rows the walk is RESPONSIBLE for — every row of a file
+    it walked. Orphan rows (a deleted file, a refactored-away entity: no walk
+    visits them, and the resync driver never prunes) are not, so for
+    ``source == "walk"`` the live count may EXCEED the counted total; any
+    other source must match it exactly."""
     if not counters or total is None:
         return False
     try:
         filled, counted_total = int(counters["filled"]), int(counters["total"])
     except (KeyError, TypeError, ValueError):
         return False
+    within = (counted_total <= total if counters.get("source") == "walk"
+              else counted_total == total)
     return (same_code_model(str(counters.get("target") or ""), target)
-            and counted_total == total and 0 <= filled <= total
+            and within and 0 <= filled <= counted_total
             and (revision is None or counters.get("revision") in (None, revision)))
 
 
@@ -666,12 +695,17 @@ def settle_fill(
     total = count_code_objects(codegraph_prefix, weaviate_url=weaviate_url)
     if counters is not None and total is not None and _counters_consistent(
             counters, target, total, revision):
-        filled, source = int(counters["filled"]), str(counters.get("source") or "walk")
+        filled, total = int(counters["filled"]), int(counters["total"])
+        source = str(counters.get("source") or "walk")
     else:
         measured = scan_slot_fill(codegraph_prefix, slot, client_factory=client_factory)
         if measured is None:
             return None
         (filled, total), source = measured, "scan"
+    if total <= 0:
+        # Nothing measured (an empty graph, or a walk that read no row): no
+        # flip onto a slot no object proves (W6-B2 final round, LOW).
+        return None
     if filled == total:
         write_code_model_record(codegraph_prefix, CodeModelRecord(target, dim, slot))
         return "complete"
@@ -810,14 +844,15 @@ def finish_analyzer_run(
                     ("files_skipped", "insert_errors", "chunk_plan_failures"))
     counters = None
     if tally and clean and tally["slot"] == code_model_slot(target)[0]:
-        # Every row the walk visited holds the target vector now (it embedded
-        # the ones that lacked it and wrote nothing that failed).
+        # Every row the walk visited holds the target vector now: it embedded
+        # the ``lacking`` ones and wrote nothing that failed. Those are exactly
+        # the rows it is responsible for — NOT adjusted to the live count
+        # (orphans would block the flip forever; review F1).
         counters = {"target": target, "filled": tally["visited"],
                     "total": tally["visited"], "revision": revision, "source": "walk"}
-        total = count_code_objects(codegraph_prefix)
-        if total is not None:
-            counters["total"] = total
-            counters["filled"] = min(tally["visited"], total)
+        print(f"[vct] code-embed: {codegraph_prefix}: the fill walk embedded "
+              f"{tally['lacking']} missing {target} vector(s) across "
+              f"{tally['visited']} row(s).", flush=True)
     return settle_fill(codegraph_prefix, target, counters=counters, client_factory=client_factory)
 
 
@@ -871,7 +906,10 @@ def project_status(
         "filling": res.filling,
         "filled": progress.get("filled") if progress else None,
         "total": progress.get("total") if progress else objects,
-        "complete": bool(res.recorded) and not res.filling and not res.target_refused,
+        # W6-B2 final round (review nit): a graph whose RECORDED OpenAI model
+        # the consent refuses is not complete — its searches are blocked.
+        "complete": (bool(res.recorded) and not res.filling and not res.target_refused
+                     and not res.record_refused),
         "cost_bearing": is_openai_code_model(res.target),
         "target_refused": res.target_refused,
         "record_refused": res.record_refused,

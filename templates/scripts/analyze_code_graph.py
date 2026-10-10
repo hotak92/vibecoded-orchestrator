@@ -6952,7 +6952,7 @@ def main():
 
         # v0.2.82 (G6, WP-3 contract): one NORMATIVE provenance line at
         # successful run end (WP-3's launcher parser reads the last occurrence).
-        _print_codegraph_provenance(embedding_service, repo_path)
+        _print_codegraph_provenance(embedding_service, repo_path, filling=bool(_cem_plan.filling))
         _cem.finish_analyzer_run(project_name, _cem_plan, embedding_service, scoped=_cem_scoped, repo_root=repo_path, index_dot_claude=analyzer.index_dot_claude, stats=stats, revision=CODEGRAPH_EMBED_REVISION)
         # v0.2.91 wave-3 fix (MAJOR-1): the NARROW paired clear, at the only
         # point that proves the walk actually happened. v0.2.95 F1 adds the
@@ -6970,7 +6970,7 @@ def main():
 
 
 def _print_codegraph_provenance(
-    embedding_service: "Optional[EmbeddingService]", repo_path: Path,
+    embedding_service: "Optional[EmbeddingService]", repo_path: Path, filling: bool = False,
 ) -> None:
     """v0.2.82 (G6): print the ONE provenance line WP-3 parses (built by
     ``guards.provenance_line`` — model/dim from the EmbeddingService, commit via
@@ -6979,7 +6979,7 @@ def _print_codegraph_provenance(
         _guards.provenance_line(
             getattr(embedding_service, "code_model_id", ""),
             getattr(embedding_service, "code_dim", 0),
-            CODEGRAPH_EMBED_REVISION, repo_path,
+            CODEGRAPH_EMBED_REVISION, repo_path, filling=filling,
         ),
         flush=True,
     )

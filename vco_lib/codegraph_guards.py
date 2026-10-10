@@ -58,7 +58,7 @@ from vco_lib import git_meta
 
 
 def provenance_line(
-    model: Any, dim: Any, embed_revision: int, repo_path: Any,
+    model: Any, dim: Any, embed_revision: int, repo_path: Any, *, filling: bool = False,
 ) -> str:
     """v0.2.82 (G6): build the ONE machine-readable provenance line WP-3 parses.
 
@@ -91,9 +91,14 @@ def provenance_line(
             commit = sha
     except Exception:  # noqa: BLE001 — non-git tree / git absent → none
         pass
+    # v0.2.102 W6-B2 (review F3): ``filling=1`` marks a run that embedded a
+    # TARGET still being filled — its model is NOT a complete slot, so the
+    # launcher must never promote it to the record (an extra key=value token;
+    # the parser ignores keys it does not know, so older launchers are safe).
     return (
         f"CODEGRAPH_PROVENANCE model={model_s} dim={dim_i} "
         f"embed_revision={embed_revision} analyzed_commit={commit}"
+        + (" filling=1" if filling else "")
     )
 
 

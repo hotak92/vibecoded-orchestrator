@@ -503,22 +503,25 @@ class SearchKnowledgeTests(unittest.TestCase):
         finally:
             mod._cached_embedding_service = None
 
-    def test_target_vector_slot_falls_back_to_ollama_embed(self):
+    def test_target_vector_slot_without_a_service_is_loud(self):
         mod = self._import_module()
         original_has = mod.HAS_EMBEDDING_SERVICE
         mod.HAS_EMBEDDING_SERVICE = False
         mod._cached_embedding_service = None
         try:
-            # Without the service, must fall back to the pre-v0.2.18
-            # hardcoded slot name.
-            self.assertEqual(mod._get_target_vector_slot(), "ollama_embed")
+            # v0.2.102 W6-B2 (owner ruling 2026-10-10): no "ollama_embed"
+            # default — that slot holds another model's vectors.
+            with self.assertRaises(Exception) as ctx:
+                mod._get_target_vector_slot()
+            self.assertIn("never queried with a different embedding model",
+                          str(ctx.exception))
         finally:
             mod.HAS_EMBEDDING_SERVICE = original_has
 
     def test_module_does_not_read_embedding_model_at_top_level(self):
         mod = self._import_module()
-        # EMBEDDING_MODEL is now read inside the legacy fallback only,
-        # not at module level.
+        # EMBEDDING_MODEL is resolved by EmbeddingService, never at module
+        # level (the legacy fallback that read it was removed in v0.2.102).
         self.assertFalse(hasattr(mod, "EMBEDDING_MODEL"))
 
 

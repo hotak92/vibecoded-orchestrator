@@ -361,9 +361,9 @@ def _collection_name(base: str, project: str = None) -> str:
 
 
 # Code embedding configuration — v0.2.18: centralised via
-# EmbeddingService. Pre-v0.2.18 read CODE_EMBED_BACKEND / CODE_EMBED_-
-# SERVICE_URL / CODE_EMBED_MODEL directly and hardcoded the slot.
-CODE_EMBED_SERVICE_URL = _env_str("CODE_EMBED_SERVICE_URL") or "http://localhost:11440"
+# EmbeddingService, which reads CODE_EMBED_SERVICE_URL itself. v0.2.102
+# W6-B2: this CLI's own copy fed only the raw CodeEmbed query fallback,
+# which is gone (owner ruling 2026-10-10 — no other embedding model).
 
 # Import EmbeddingService — graceful fallback for half-installed venvs.
 #
@@ -396,6 +396,8 @@ _cached_embedding_service: "EmbeddingService | None" = None
 #: The code graph this run queries (set by main()); the service resolves THAT
 #: graph's recorded code model (v0.2.102 W6-B2, vco_lib.code_embed_model).
 _embedding_codegraph_prefix: "str | None" = None
+#: Why the service could not be built (quoted by the loud outage error).
+_embedding_construction_error: str = ""
 
 
 def _get_or_create_embedding_service():
@@ -410,16 +412,24 @@ def _get_or_create_embedding_service():
             codegraph_prefix=_embedding_codegraph_prefix)
         return _cached_embedding_service
     except Exception as e:
+        global _embedding_construction_error
+        _embedding_construction_error = str(e)
         print(f"⚠️  EmbeddingService construction failed: {e}", file=sys.stderr)
         return None
 
 
 def _active_code_vector_slot() -> str:
-    """Return the active code-vector slot. Falls back to codesage_embed
-    when EmbeddingService isn't available (pre-v0.2.18 default)."""
+    """Return the active code-vector slot (the graph's RECORDED model's).
+
+    v0.2.102 W6-B2: no ``codesage_embed`` default when the service is
+    unavailable — it named a slot the graph may not be indexed in. Raises the
+    loud ``vco_lib.embed_outage.EmbeddingBackendUnavailable`` instead.
+    MUST MATCH ``weaviate_mcp/embeddings.py::_active_code_query_slot``."""
     svc = _get_or_create_embedding_service()
     if svc is None:
-        return "codesage_embed"
+        from vco_lib.embed_outage import query_unavailable
+
+        raise query_unavailable("code", None, construction_error=_embedding_construction_error)
     return svc.code_vector_slot
 
 
@@ -467,53 +477,21 @@ except ImportError as exc:  # pragma: no cover — surface a clear error
 
 
 def generate_code_embedding(text: str) -> Optional[List[float]]:
-    """Generate code embedding via EmbeddingService.
+    """Embed a SEARCH QUERY with the code graph's recorded model.
 
-    v0.2.18: routes through EmbeddingService.embed_code (which picks
-    CodeEmbed / Ollama / OpenAI from env). Falls back to direct
-    CodeEmbed-service HTTP call when the service isn't available.
-
-    v0.2.101: this embeds a SEARCH QUERY, so it routes through
-    ``embed_code_query`` (the MCP's ``get_code_query_embedding`` does the
-    same — CLI≡MCP invariant). Documents/backfill still use ``embed_code``.
+    v0.2.102 W6-B2 (owner ruling 2026-10-10): through the ONE query-embed
+    entry ``vco_lib.embed_outage.embed_query_or_raise`` — the interactive 503
+    bound, the restart wait, and NO raw CodeEmbed fallback (that endpoint
+    serves CodeSage, whatever the graph is indexed in). A backend that stays
+    down raises ``EmbeddingBackendUnavailable`` (the caller prints it loudly).
+    MUST MATCH ``weaviate_mcp/embeddings.py::get_code_query_embedding``.
     """
-    from vco_lib.retry_after import (
-        is_503_error,
-        post_code_embed,
-        reset_503_tolerance_override,
-        resolve_503_interactive_tolerance,
-        set_503_tolerance_override,
-    )
+    from vco_lib.embed_outage import embed_query_or_raise
 
-    svc = _get_or_create_embedding_service()
-    if svc is not None:
-        # v0.2.102 W4-G: an interactive query (hooks run this CLI) waits on a
-        # 503 only up to the INTERACTIVE tolerance — the same bound the MCP
-        # query path sets around this call (CLI≡MCP). A 503 that outlasts it
-        # is exhaustion, not unavailability: no second tolerance through the
-        # inline fallback.
-        token = set_503_tolerance_override(resolve_503_interactive_tolerance())
-        try:
-            return svc.embed_code_query(text)
-        except Exception as e:
-            if is_503_error(e):
-                print(f"❌ Embedding error: code-embed still busy (503) after the "
-                      f"interactive bound: {e}", file=sys.stderr)
-                return None
-            print(f"⚠️  EmbeddingService.embed_code_query failed: {e}", file=sys.stderr)
-        finally:
-            reset_503_tolerance_override(token)
-    # Legacy fallback: direct CodeEmbed HTTP call. v0.2.102 W4-G (W4-E §7):
-    # retried on the ONE shared transient policy — the shared code-embed
-    # container answers 503 when its queue bound is exceeded and refuses
-    # connections while restarting; both were a first-shot drop here.
-    # Interactive bounds: a 503 is waited on up to the interactive tolerance,
-    # a refused connection (service down) only ~10 s, then a loud failure.
-    try:
-        return post_code_embed(CODE_EMBED_SERVICE_URL, text, interactive=True)
-    except Exception as e:
-        print(f"❌ Embedding error: {e}")
-        return None
+    return embed_query_or_raise(
+        "code", _get_or_create_embedding_service(), text,
+        construction_error=_embedding_construction_error,
+    )
 
 
 def _reference_code_text(props: dict) -> str:
@@ -791,12 +769,20 @@ class CodeGraphQuery:
             print(f"⚠️  Query enrichment skipped: {_exc}", file=sys.stderr)
             effective_query = query
 
+        from vco_lib.embed_outage import EmbeddingBackendUnavailable, hook_unavailable_line
+
         try:
-            # Generate query embedding
             query_embedding = generate_code_embedding(effective_query)
-            if not query_embedding:
-                print("❌ Failed to generate query embedding")
+        except EmbeddingBackendUnavailable as exc:
+            # Loud (owner ruling 2026-10-10): one visible line for a hook,
+            # the full text + a non-zero exit for the CLI.
+            if hook_format:
+                print(hook_unavailable_line("code"))
                 return
+            print(f"❌ {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+
+        try:
 
             # Build per-(collection_name, project_filter_value) fan-out
             # list. Self comes first; peers appear in

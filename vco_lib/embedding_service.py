@@ -191,12 +191,14 @@ TEXT_SLOT_MAP: tuple[tuple[str, str, int], ...] = (
 )
 
 # Code models → code-collection named-vector slots.
+from vco_lib.code_embed_serving import OPENAI_CODE_SLOT_ROWS as _OPENAI_CODE_ROWS  # noqa: E402
+
 CODE_SLOT_MAP: tuple[tuple[str, str, int], ...] = (
     # OpenAI (forward-compat — OpenAI doesn't have a code-specific model
-    # today, but the slot is reserved per the locked design decision)
-    ("text-embedding-3-large", "openai_code_embed", 3072),
-    ("text-embedding-3-small", "openai_code_embed", 1536),
-    ("openai-", "openai_code_embed", 1536),
+    # today, but the slot is reserved per the locked design decision). The
+    # patterns' ONE home is code_embed_serving.OPENAI_CODE_SLOT_ROWS, which the
+    # serving map matches too (v0.2.102 W6-B2).
+    *((sub, "openai_code_embed", dim) for sub, dim in _OPENAI_CODE_ROWS),
     # CodeSage (default GPU code embed)
     ("codesage-large-v2", "codesage_embed", 2048),
     ("codesage/codesage-large-v2", "codesage_embed", 2048),
@@ -330,176 +332,19 @@ def _to_openai_api_model(catalog_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Code-backend fallback chain (v0.2.18 correctness follow-up)
+# No cross-model fallback — ever (owner ruling 2026-10-10)
 # ---------------------------------------------------------------------------
 #
-# Background: when ``for_project()`` resolves ``code_model_id`` to
-# ``codesage-large-v2`` (the GPU-accelerated CodeEmbed default) but the
-# FastAPI service is DOWN, every code-embed call subsequently routes to
-# Ollama with model id ``codesage-large-v2`` — and Ollama doesn't have
-# that model pulled. Net: every embed call raises RuntimeError.
-#
-# v0.2.100 (L1-F13, owner rule "one code graph, exactly one embedder"): the
-# chain below NO LONGER runs by default. Switching codesage → qwen3/jina at
-# construction left one code graph holding vectors from two embedders. A down
-# code_embed service now raises :class:`NoEmbeddingBackendError` for CODE
-# embeds and records ``code_embed_backend_unavailable``; the KG is unaffected.
-# The old behaviour survives only as an explicit, loud developer opt-in:
-# ``VCO_CODE_EMBED_ALLOW_FALLBACK=1`` (see ``CODE_EMBED_ALLOW_FALLBACK_ENV``).
-#
-# With the opt-in set, the chain probes available backends at construction
-# time and picks the FIRST reachable one. Order is locked by the v0.2.18
-# plan (user direction 2026-05-19):
-#
-#   1. CodeEmbed FastAPI service (``/health`` → 200) — preferred,
-#      GPU-accelerated, code-specific embeddings (codesage-large-v2,
-#      2048-dim, slot ``codesage_embed``).
-#   2. Ollama ``qwen3-embedding:0.6b`` — universal fallback. Every VCO
-#      machine that has the KG also has qwen3 pulled, so reusing it
-#      for code keeps code-graph working on every machine where the
-#      KG works (1024-dim, slot ``qwen3_embed``).
-#   3. Ollama ``unclemusclez/jina-embeddings-v2-base-code:latest`` —
-#      code-specific Ollama fallback (auto-pulled by the
-#      ``low_resource`` preset, but not by every preset, hence rank 3)
-#      (768-dim, slot ``jina_embed``).
-#
-# OpenAI is handled separately by the caller — this function only
-# probes local backends.
+# "falling back to a different embedding model should never be done because
+# the vectors would just not be comparable to those used to embed the data in
+# weaviate". The v0.2.18 chain that switched a CodeSage code graph to an Ollama
+# embedder when code_embed was down (made opt-in by v0.2.100 as
+# VCO_CODE_EMBED_ALLOW_FALLBACK) is REMOVED. A down backend = transient retry
+# (vco_lib.retry_after) while the hub watchdog restarts the container, then a
+# LOUD error (vco_lib.embed_outage) — never a model switch.
 
-# Locked model id constants for the fallback chain. Kept here rather
-# than buried in the function body so callers / tests can patch them
-# in isolation.
-_FALLBACK_QWEN3_MODEL = "qwen3-embedding:0.6b"
+#: jina-v2-base-code's Ollama tag (the Preferences "jina" pin's model).
 _FALLBACK_JINA_MODEL = "unclemusclez/jina-embeddings-v2-base-code:latest"
-
-#: Developer opt-in (truthy) that restores the pre-0.2.100 silent switch of a
-#: CodeSage code graph to an Ollama embedder when code_embed is down. Off by
-#: default; when on, every switch prints a WARNING naming this variable.
-CODE_EMBED_ALLOW_FALLBACK_ENV = "VCO_CODE_EMBED_ALLOW_FALLBACK"
-
-
-def _code_fallback_opted_in() -> bool:
-    raw = os.environ.get(CODE_EMBED_ALLOW_FALLBACK_ENV, "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
-
-
-def _ollama_has_model(ollama: "OllamaAdapter", needle: str) -> bool:
-    """Return True iff ``needle`` appears in Ollama's ``/api/tags`` list.
-
-    Substring match, case-insensitive — handles tag variants like
-    ``"qwen3-embedding:0.6b"`` vs ``"qwen3-embedding:latest"``. Soft-
-    fail (returns False) on any HTTP error.
-    """
-    try:
-        models = ollama.list_models()
-    except Exception:  # pragma: no cover (defensive — adapter swallows)
-        return False
-    needle_lower = needle.lower()
-    for m in models:
-        name = str(m.get("name", "")).lower()
-        if needle_lower in name or name.startswith(needle_lower.split(":")[0]):
-            return True
-    return False
-
-
-def _resolve_code_model_with_fallback(
-    *,
-    requested_model_id: str,
-    requested_slot: str,
-    requested_dim: int,
-    ollama: "OllamaAdapter",
-    codeembed: "CodeEmbedAdapter",
-) -> tuple[str, str, int, str]:
-    """Resolve the code model + slot via the locked fallback chain.
-
-    The chain only fires when the caller-resolved slot is
-    ``codesage_embed`` — i.e. when the user intent is to use the
-    GPU/CodeEmbed-service path. For any other slot (explicit
-    ``jina_embed`` user override, CPU-fallback ``qwen3_embed``,
-    ``openai_code_embed``), the requested triple is returned
-    unchanged.
-
-    Args:
-        requested_model_id: Model id resolved by env-based logic in
-            ``for_project()``.
-        requested_slot: Named-vector slot the requested model maps to.
-        requested_dim: Vector dim of the requested model.
-        ollama: Adapter for probing Ollama ``/api/tags``.
-        codeembed: Adapter for probing CodeEmbed ``/health``.
-
-    Returns:
-        ``(model_id, slot, dim, reason)`` — the first reachable backend
-        in the locked chain, or the requested triple if nothing is
-        reachable. ``reason`` is a human-readable string describing
-        what was picked and why (empty when the requested codesage
-        path is fully reachable, since that's the no-op case the user
-        configured).
-
-    Raises:
-        NoEmbeddingBackendError: the codesage slot's service is down and
-            ``VCO_CODE_EMBED_ALLOW_FALLBACK`` is not set (v0.2.100 default).
-    """
-    # Off-chain slots: don't second-guess the user's explicit choice.
-    if requested_slot != "codesage_embed":
-        return requested_model_id, requested_slot, requested_dim, ""
-
-    # 1. CodeEmbed service: the preferred path. If it's up, we're done.
-    if codeembed.is_reachable():
-        # No fallback fired — caller will use the requested triple
-        # and the existing routing logic will dispatch to CodeEmbed.
-        return requested_model_id, requested_slot, requested_dim, ""
-
-    # v0.2.100: no silent embedder switch unless a developer opted in.
-    if not _code_fallback_opted_in():
-        where = getattr(codeembed, "base_url", "the configured CODE_EMBED_SERVICE_URL")
-        raise NoEmbeddingBackendError(
-            f"CodeEmbed service unreachable at {where}; the code graph "
-            f"is configured for {requested_model_id} and is NOT switched to another "
-            f"embedder (set {CODE_EMBED_ALLOW_FALLBACK_ENV}=1 to allow that).",
-            attempted_backends=["codeembed"],
-            error_per_backend={"codeembed": f"{where}/health did not answer"},
-            capture=False,
-        )
-
-    # 2. Ollama qwen3-embedding:0.6b — universal fallback.
-    if _ollama_has_model(ollama, _FALLBACK_QWEN3_MODEL):
-        return (
-            _FALLBACK_QWEN3_MODEL,
-            "qwen3_embed",
-            1024,
-            (
-                f"WARNING ({CODE_EMBED_ALLOW_FALLBACK_ENV}=1): CodeEmbed service "
-                f"unreachable at {codeembed.base_url}; "
-                f"using ollama:{_FALLBACK_QWEN3_MODEL} (slot=qwen3_embed) — "
-                "this code graph now mixes embedders"
-            ),
-        )
-
-    # 3. Ollama jina — code-specific Ollama fallback.
-    if _ollama_has_model(ollama, _FALLBACK_JINA_MODEL):
-        # Strip the ":latest" tag suffix for the resolver — the slot map
-        # matches on the model family, not the tag.
-        return (
-            _FALLBACK_JINA_MODEL,
-            "jina_embed",
-            768,
-            (
-                f"WARNING ({CODE_EMBED_ALLOW_FALLBACK_ENV}=1): CodeEmbed + qwen3 "
-                "both unavailable; using ollama:jina-embeddings-v2-base-code "
-                "(slot=jina_embed) — this code graph now mixes embedders"
-            ),
-        )
-
-    # 4. All down — return the requested triple. The caller's
-    #    code_backend_ready() check will then correctly report False
-    #    (CodeEmbed unreachable + Ollama lacks every fallback model),
-    #    surfacing NoEmbeddingBackendError via the existing path.
-    return (
-        requested_model_id,
-        requested_slot,
-        requested_dim,
-        "All code-embed backends unreachable; code embeddings will fail until one comes up",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2334,62 +2179,25 @@ class EmbeddingService:
             openai_api_key=openai_api_key,
         )
 
-        # ----- Code-backend fallback chain (v0.2.18 correctness fix) -----
-        # If the env-based resolution above picked codesage-large-v2 (the
-        # CodeEmbed-service default) but the FastAPI service is down,
-        # falling back to qwen3 / jina via Ollama keeps code-graph working
-        # on machines where the GPU service hasn't been started.
-        #
-        # The chain only fires for the codesage_embed slot — other slots
-        # (qwen3_embed CPU fallback, jina_embed explicit, openai_code_embed)
-        # reflect explicit user/preset intent and are left alone.
-        # v0.2.100: a down code_embed no longer switches embedders; the
-        # typed error is kept for CODE embeds only (text/KG unaffected) and
-        # recorded as ``code_embed_backend_unavailable``.
-        try:
-            new_model, new_slot, new_dim, reason = _resolve_code_model_with_fallback(
-                requested_model_id=svc.code_model_id,
-                requested_slot=svc.code_vector_slot,
-                requested_dim=svc.code_dim,
-                ollama=svc.ollama,
-                codeembed=svc.codeembed,
+        # A CodeSage graph whose container is down at construction: the
+        # typed error stays on the service (code embeds raise it; the
+        # embed-time re-probe self-heals once the watchdog restarted the
+        # container) — never a switch to another embedder (owner ruling
+        # 2026-10-10). v0.2.100 W3R-04: no ledger write from construction (it
+        # runs at every session start while the ensure hook may still be
+        # starting a container that loads its model for minutes).
+        if svc._code_served_by_container() and not svc.codeembed.is_reachable():
+            from vco_lib.embed_outage import code_backend_unavailable_message
+
+            exc = NoEmbeddingBackendError(
+                code_backend_unavailable_message(svc.code_model_id, code_embed_url),
+                attempted_backends=["codeembed"],
+                error_per_backend={"codeembed": f"{code_embed_url}/health did not answer"},
+                capture=False,
             )
-        except NoEmbeddingBackendError as exc:
-            # v0.2.100 W3R-04: NO ledger write from construction — this runs at
-            # every session start (MCP server, KG-sync hook) while the ensure
-            # hook is still starting a code_embed that loads its model for
-            # seconds to minutes; a row here flapped on healthy machines. The
-            # typed error stays on the service (code embeds raise it; the
-            # embed-time re-probe self-heals). The durable
-            # ``code_embed_backend_unavailable`` row is install.py step 7's,
-            # which can afford the bounded wait and the container-state check.
             print(f"[vct] {exc}", file=sys.stderr)
             svc._code_backend_error = exc
             svc._code_ready = False
-            new_model, new_slot, new_dim, reason = (
-                svc.code_model_id, svc.code_vector_slot, svc.code_dim, ""
-            )
-        if reason:
-            # Fallback fired — surface the chosen backend in stderr so
-            # operators and tests can see what was selected. We use a
-            # plain print() (not logger.warning) because logging may not
-            # be configured at construction time in install.py / Tauri
-            # subprocess contexts, and the message MUST reach stderr.
-            print(reason, file=sys.stderr)
-        if (new_model, new_slot, new_dim) != (
-            svc.code_model_id,
-            svc.code_vector_slot,
-            svc.code_dim,
-        ):
-            # Reassign the slot triple so search-by-active-slot stays
-            # correct and the dispatcher routes to the resolved model.
-            svc.code_model_id = new_model
-            svc._code_slot = new_slot
-            svc._code_dim = new_dim
-            # Invalidate cached readiness — the new slot has different
-            # backend semantics (qwen3_embed routes to Ollama, not the
-            # CodeEmbed service).
-            svc._code_ready = None
 
         # v0.2.102 W6-B: a refused OpenAI model (consent gate) is recorded
         # like a down backend — but PERMANENTLY: every code embed raises it
@@ -2660,13 +2468,10 @@ class EmbeddingService:
                 bool(self.openai_api_key) and self.openai.validate().valid
             )
         elif self._code_served_by_container():
-            # CodeSage: its own container (v0.2.102 W6-B2 — serving follows
-            # the model). The Ollama leg is kept only for the v0.2.100
-            # developer opt-in fallback; an embed through a container that
-            # serves another model raises (_require_container_serves_code_model).
-            self._code_ready = (
-                self._container_serves_code_model() or self.ollama.is_reachable()
-            )
+            # CodeSage: ONLY its own container (v0.2.102 W6-B2 — serving
+            # follows the model; no cross-model fallback, owner ruling
+            # 2026-10-10). A container serving another model is not ready.
+            self._code_ready = self._container_serves_code_model()
         else:
             # qwen3-embed CPU fallback or generic Ollama code model.
             self._code_ready = self.ollama.is_reachable()
@@ -2831,12 +2636,14 @@ class EmbeddingService:
         """Embed a SEARCH QUERY into the active code space, PREFIXED.
 
         Two routes, ONE rule (no double prefix):
-          * CODE-EMBED SERVICE (``codesage_embed`` / ``jina_embed`` reachable):
+          * the code_embed CONTAINER (the model is CodeSage —
+            :func:`vco_lib.code_embed_serving.code_serving_backend`; a down or
+            mis-serving container is a loud error, never another embedder):
             the SERVICE resolves its own loaded model's prefix from the SAME
             table, so the client sends the RAW query with ``is_query=True``
             and the task key (``QUERY_TASKS``) — never prepending anything
             itself. The service applies the wording for that task.
-          * OpenAI / Ollama legs: no service is involved, so the CLIENT
+          * OpenAI / Ollama legs (jina, qwen3, OpenAI): no service is involved, so the CLIENT
             prepends the resolved prefix here (with the same task).
 
         ``task`` defaults to the code wording (``QUERY_TASK_DEFAULT_CODE`` —
@@ -2857,18 +2664,17 @@ class EmbeddingService:
         # key. The SERVICE owns the prefix here (no client-side prepend).
         if self._code_served_by_container():
             self._raise_if_code_backend_down()
-            if self.codeembed.is_reachable():
-                self._require_container_serves_code_model()
-                key = _memo_key("query:" + task + ":" + code)
-                cached = self._embed_memo_code.get(key)
-                if cached is not None:
-                    return cached
-                vec = self._retry_once_on_503(
-                    self._embed_code_via_active, code, True, task
-                )
-                self._memo_put(self._embed_memo_code, key, vec)
-                return vec
-        # OpenAI / Ollama leg (+ the service-down fallback): client prefix.
+            self._require_container_serves_code_model(interactive=True)
+            key = _memo_key("query:" + task + ":" + code)
+            cached = self._embed_memo_code.get(key)
+            if cached is not None:
+                return cached
+            vec = self._container_call(
+                self._embed_code_via_active, code, True, task, interactive=True
+            )
+            self._memo_put(self._embed_memo_code, key, vec)
+            return vec
+        # OpenAI / Ollama leg: client prefix.
         prefix = query_prefix_for_model(self.code_model_id, task)
         if not prefix:
             return self.embed_code(code)
@@ -3153,12 +2959,12 @@ class EmbeddingService:
             )
         self._raise_if_code_backend_down()
         if self._code_served_by_container():
-            # CodeSage → its container when reachable (bounded + isolated, W1);
-            # jina / qwen3 / other Ollama models never reach the container
-            # (v0.2.102 W6-B2 — serving follows the model).
-            if self.codeembed.is_reachable():
-                self._require_container_serves_code_model()
-                return self._embed_codeembed_batch_bounded(codes)
+            # CodeSage → its container ONLY (bounded + isolated, W1); jina /
+            # qwen3 / other Ollama models never reach it (v0.2.102 W6-B2 —
+            # serving follows the model); a down container is a loud error,
+            # never another embedder (owner ruling 2026-10-10).
+            self._require_container_serves_code_model()
+            return self._embed_codeembed_batch_bounded(codes)
         # WP-R: the Ollama code fallback (e.g. jina/qwen3 code embeds served via
         # Ollama on a CPU/low-VRAM floor) shares the same num_ctx/whole-batch
         # hazard as the text path, so route it through the SAME bounded + isolated
@@ -3763,7 +3569,58 @@ class EmbeddingService:
         name = getattr(self.codeembed, "model_name", None)
         return not isinstance(name, str) or not name or "codesage" in name.lower()
 
-    def _require_container_serves_code_model(self) -> None:
+    def _container_down_error(self) -> NoEmbeddingBackendError:
+        """The ONE loud outage error for the CodeSage container (owner ruling
+        2026-10-10): names the container, the watchdog state and the remedy;
+        never a different embedder."""
+        from vco_lib.embed_outage import code_backend_unavailable_message
+
+        return NoEmbeddingBackendError(
+            code_backend_unavailable_message(self.code_model_id, self.code_embed_url),
+            attempted_backends=["codeembed"],
+            error_per_backend={"codeembed": f"{self.code_embed_url}/health did not answer"},
+            capture=False,
+        )
+
+    def _probe_container(self) -> bool:
+        invalidate = getattr(self.codeembed, "invalidate_health", None)
+        if callable(invalidate):
+            invalidate()
+        return bool(self.codeembed.is_reachable())
+
+    def _container_call(self, fn, *args, interactive: bool):
+        """A CodeSage-container embed: a 503 or a refused connection (the
+        container restarting) is retried on the shared transient policy
+        (:func:`vco_lib.retry_after.retry_transient_embed`); a connection
+        failure that outlasts it becomes the loud outage error."""
+        from vco_lib.retry_after import is_connection_error, retry_transient_embed
+
+        try:
+            return retry_transient_embed(fn, *args, log=logger, interactive=interactive)
+        except Exception as exc:  # noqa: BLE001 — classify, then re-raise
+            if is_connection_error(exc):
+                invalidate = getattr(self.codeembed, "invalidate_health", None)
+                if callable(invalidate):
+                    invalidate()
+                raise self._container_down_error() from exc
+            raise
+
+    def _require_container_serves_code_model(self, *, interactive: bool = False) -> None:
+        if not self.codeembed.is_reachable():
+            # Down. A QUERY waits on the shared transient policy's refused
+            # bound (~10 s, vco_lib.retry_after.resolve_refused_tolerance)
+            # while the hub watchdog restarts the container; a batch write
+            # fails at once (the walk's own retry/backoff owns batch pacing —
+            # unchanged from v0.2.101). Then the loud outage error.
+            if not interactive:
+                raise self._container_down_error()
+            from vco_lib.retry_after import wait_until_reachable
+
+            if not wait_until_reachable(self._probe_container, interactive=True, log=logger):
+                raise self._container_down_error()
+            if not getattr(self._code_backend_error, "permanent", False):
+                self._code_backend_error = None
+                self._code_ready = True
         if not self._container_serves_code_model():
             served = getattr(self.codeembed, "model_name", None)
             raise NoEmbeddingBackendError(
@@ -3787,7 +3644,13 @@ class EmbeddingService:
         reachability; no probe can grant consent."""
         if self._code_backend_error is None:
             return
-        if getattr(self._code_backend_error, "permanent", False) or not self.codeembed.is_reachable():
+        if getattr(self._code_backend_error, "permanent", False):
+            raise self._code_backend_error
+        if self._code_served_by_container():
+            # Transient: _require_container_serves_code_model waits for the
+            # watchdog's restart, then raises the loud outage error.
+            return
+        if not self.codeembed.is_reachable():
             raise self._code_backend_error
 
     def _embed_code_via_active(
@@ -3857,21 +3720,20 @@ class EmbeddingService:
             )
         self._raise_if_code_backend_down()
         if self._code_served_by_container():
-            if self.codeembed.is_reachable():
-                self._require_container_serves_code_model()
-                # W1: through the ONE shared shrink loop — see docstring.
-                # Records under the ACTIVE CODE slot exactly like the
-                # Ollama leg below (assign, never latch).
-                vec, sent = _embed_shrinking_on_overflow(
-                    lambda candidate: self.codeembed.embed(
-                        candidate, is_query=is_query, task=task
-                    ),
-                    code,
-                    model_id=self.code_model_id,
-                    on_shrink=_warn,
-                )
-                self._last_truncated_slots[self._code_slot] = sent < len(code)
-                return vec
+            self._require_container_serves_code_model()
+            # W1: through the ONE shared shrink loop — see docstring.
+            # Records under the ACTIVE CODE slot exactly like the
+            # Ollama leg below (assign, never latch).
+            vec, sent = _embed_shrinking_on_overflow(
+                lambda candidate: self.codeembed.embed(
+                    candidate, is_query=is_query, task=task
+                ),
+                code,
+                model_id=self.code_model_id,
+                on_shrink=_warn,
+            )
+            self._last_truncated_slots[self._code_slot] = sent < len(code)
+            return vec
 
         vec, sent = _embed_shrinking_on_overflow(
             lambda candidate: self.ollama.embed(self.code_model_id, candidate),

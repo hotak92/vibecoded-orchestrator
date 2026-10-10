@@ -319,18 +319,8 @@ def test_options_identity_migrate_and_search_fallbacks(monkeypatch):
     assert captured[0]["json"]["options"] == want["options"], captured
     assert captured[0]["json"]["keep_alive"] == "10m", captured
 
-    # search_knowledge.get_embedding fallback
-    captured.clear()
-    sk_dir = str(_REPO_ROOT / "templates" / "scripts")
-    if sk_dir not in sys.path:
-        sys.path.insert(0, sk_dir)
-    sk = importlib.import_module("search_knowledge")
-    monkeypatch.setattr(sk, "_get_or_create_embedding_service", lambda: None)
-    monkeypatch.setattr(sk.requests, "post", _fake_post)
-    monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
-    sk.get_embedding("hello")
-    assert captured[0]["json"]["options"] == want["options"], captured
-    assert captured[0]["json"]["keep_alive"] == "10m", captured
+    # (search_knowledge.get_embedding's direct-Ollama leg was removed in
+    # v0.2.102 W6-B2 — owner ruling 2026-10-10, no other embedding model.)
 
 
 def test_generate_calls_carry_keep_alive(monkeypatch):
@@ -629,33 +619,33 @@ def test_pypi_check_noop_survives_async_connect_path():
     assert conn._connected is True
 
 
-def test_get_search_vector_legacy_code_fallback_uses_interactive_tolerance(
+def test_get_search_vector_without_a_service_is_loud_never_a_legacy_leg(
     monkeypatch,
 ):
-    """E2: ``_get_search_vector``'s legacy code branch is an INTERACTIVE
-    query path reached only on the degraded (svc-unavailable) leg — its
-    inline CodeEmbed call must run at the interactive tolerance, never the
-    420 s batch one (a hard-down service must not stall the tool call for
-    minutes)."""
+    """v0.2.102 W6-B2 (owner ruling 2026-10-10) supersedes E2: the legacy
+    code branch (an inline CodeEmbed call — CodeSage — whatever the graph is
+    indexed in) is gone. svc unavailable → the loud error; nothing posted."""
+    import pytest
+
     from weaviate_mcp import server
     from weaviate_mcp.embeddings import _get_search_vector
-    from vco_lib.retry_after import resolve_503_interactive_tolerance
+    from vco_lib.embed_outage import EmbeddingBackendUnavailable
 
-    captured: dict = {}
+    called: list = []
 
     async def _fake_inline(text, tolerance_secs=None):  # noqa: ARG001
-        captured["tolerance_secs"] = tolerance_secs
+        called.append(text)
         return [0.7]
 
     monkeypatch.setattr(server, "_get_embedding_service", lambda: None)
     monkeypatch.setattr(server, "_inline_code_embed_http", _fake_inline)
     monkeypatch.setattr(server, "ACTIVE_EMBEDDING", "codesage")
-    vec, target = asyncio.run(_get_search_vector("hello", "code", "code-nl"))
-    assert vec == [0.7] and target == "codesage_embed"
-    assert captured["tolerance_secs"] == resolve_503_interactive_tolerance(), (
-        "the legacy interactive code fallback must pass the INTERACTIVE "
-        "tolerance, not the 420 s batch default"
-    )
+    for scheme in ("code", "kg"):
+        with pytest.raises(EmbeddingBackendUnavailable) as ctx:
+            asyncio.run(_get_search_vector("hello", scheme, None))
+        assert ctx.value.scheme == scheme
+        assert "never queried with a different embedding model" in str(ctx.value)
+    assert called == []
 
 
 def test_canonical_env_targets_carry_max_queue():

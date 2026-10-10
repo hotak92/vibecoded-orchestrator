@@ -238,6 +238,16 @@ def cache_get(project_root: str, key: str) -> Optional[str]:
         return None
 
 
+def cache_leg_output(project_root: str, key: str, blob: str) -> None:
+    """Cache a producer leg's output — unless it is the embedding-outage line
+    (v0.2.102 W6-B2): that line is SHOWN once per run and never cached, so the
+    next run re-probes the backend the watchdog may have healed."""
+    from vco_lib.embed_outage import is_hook_unavailable_text
+
+    if not is_hook_unavailable_text(blob):
+        cache_put(project_root, key, blob)
+
+
 def cache_put(project_root: str, key: str, blob: str) -> None:
     if not key or not blob:  # §9: empty is NEVER cached
         return
@@ -943,7 +953,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
         if kg_key:
             kg_text = (results.get("kg") or "").strip()
             if kg_text:
-                cache_put(project_root, kg_key, kg_text + "\n")
+                cache_leg_output(project_root, kg_key, kg_text + "\n")
                 kg_text = kg_text + "\n"
         if cg_keys:
             raw = (results.get("cg") or "").strip()
@@ -956,7 +966,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                 cg_symbol_texts.append(raw + "\n")
                 if len(cg_keys) == 1:
                     only_key = next(iter(cg_keys.values()))
-                    cache_put(project_root, only_key, raw + "\n")
+                    cache_leg_output(project_root, only_key, raw + "\n")
     cg_text = "".join(cg_symbol_texts)
     return kg_text, cg_text
 
