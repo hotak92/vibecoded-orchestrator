@@ -51,7 +51,7 @@ def extract_lua_file(
     imports = re.findall(r"require\s*[(\s]*[\"']([^\"']+)[\"']", content)
 
     # Definitions: tree-sitter first (v0.2.102), regex fallback.
-    defs = extract_definitions("lua", content)
+    defs = extract_definitions("lua", content, origin=relative_path)
     note_path("lua", "tree-sitter" if defs is not None else "regex")
 
     # Detect table-based classes: uppercase Name = {} or Name.__index = Name

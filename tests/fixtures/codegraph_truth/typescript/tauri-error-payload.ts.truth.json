@@ -1,6 +1,6 @@
 {
  "source": "tauri-error-payload.ts",
- "reviewed": "W6-E 2026-10-10",
+ "reviewed": "W6-E 2026-10-10; review round: TS type aliases are definitions (policy LOW-4)",
  "symbols": [
   {
    "kind": "function",
@@ -25,6 +25,12 @@
    "name": "errorText",
    "start": 71,
    "end": 73
+  },
+  {
+   "kind": "class",
+   "name": "OrchestratorConflictPayload",
+   "start": 82,
+   "end": 88
   },
   {
    "kind": "function",

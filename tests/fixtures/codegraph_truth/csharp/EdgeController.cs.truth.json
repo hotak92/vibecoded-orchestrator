@@ -1,66 +1,123 @@
 {
  "source": "EdgeController.cs",
- "reviewed": "W6-E 2026-10-10 (hand-written before extraction)",
+ "reviewed": "W6-E 2026-10-10 (hand-written; full_name + methods scored)",
  "symbols": [
   {
    "kind": "class",
    "name": "EdgeController",
    "start": 8,
-   "end": 29
+   "end": 29,
+   "full_name": "Edge.EdgeController",
+   "methods": [
+    "EdgeController",
+    "GetOne",
+    "Echo",
+    "Name"
+   ]
   },
   {
    "kind": "function",
    "name": "EdgeController",
    "start": 10,
-   "end": 10
+   "end": 10,
+   "full_name": "Edge.EdgeController.EdgeController"
   },
   {
    "kind": "function",
    "name": "GetOne",
    "start": 13,
-   "end": 13
+   "end": 13,
+   "full_name": "Edge.EdgeController.GetOne"
   },
   {
    "kind": "function",
    "name": "Echo",
    "start": 17,
-   "end": 20
+   "end": 20,
+   "full_name": "Edge.EdgeController.Echo"
   },
   {
    "kind": "class",
    "name": "Cursor",
    "start": 22,
-   "end": 28
+   "end": 28,
+   "full_name": "Edge.Cursor",
+   "methods": [
+    "Advance"
+   ]
   },
   {
    "kind": "function",
    "name": "Advance",
    "start": 24,
-   "end": 27
+   "end": 27,
+   "full_name": "Edge.Cursor.Advance"
   },
   {
    "kind": "class",
    "name": "IWorker",
    "start": 31,
-   "end": 34
+   "end": 34,
+   "full_name": "Edge.IWorker",
+   "methods": [
+    "Work"
+   ]
   },
   {
    "kind": "function",
    "name": "Work",
    "start": 33,
-   "end": 33
+   "end": 33,
+   "full_name": "Edge.IWorker.Work"
   },
   {
    "kind": "class",
    "name": "Line",
    "start": 36,
-   "end": 39
+   "end": 39,
+   "full_name": "Edge.Line",
+   "methods": [
+    "Length"
+   ]
   },
   {
    "kind": "function",
    "name": "Length",
    "start": 38,
-   "end": 38
+   "end": 38,
+   "full_name": "Edge.Line.Length"
+  },
+  {
+   "kind": "class",
+   "name": "Mode",
+   "start": 42,
+   "end": 42,
+   "full_name": "Edge.Mode",
+   "methods": []
+  },
+  {
+   "kind": "class",
+   "name": "Runner",
+   "start": 44,
+   "end": 51,
+   "full_name": "Edge.Runner",
+   "methods": [
+    "Run"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "Run",
+   "start": 46,
+   "end": 50,
+   "full_name": "Edge.Runner.Run"
+  },
+  {
+   "kind": "function",
+   "name": "Twice",
+   "start": 48,
+   "end": 48,
+   "full_name": "Edge.Runner.Twice"
   }
  ]
 }

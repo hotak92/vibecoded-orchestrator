@@ -64,3 +64,25 @@ mod tests {
 
 #[tokio::test]
 async fn top_level_async_test() {}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_or_test() -> u8 {
+    1
+}
+
+#[cfg(any(test, debug_assertions))]
+fn debug_helper() {}
+
+#[cfg(all(test, unix))]
+fn unix_test_helper() {}
+
+#[rstest]
+fn parametrised(#[values(1, 2)] x: u8) {
+    let _ = x;
+}
+
+#[cfg(debug_assertions)]
+fn debug_only_production() {}
+
+#[cfg(test)]
+mod external_tests;

@@ -387,7 +387,7 @@ def extract_js_file(
     #   class_decls: (name, start_line, base, end_line, keyword, methods)
     #   func_matches: (name, start_line, is_async, end_line)
     grammar = "tsx" if suffix == ".tsx" else ("typescript" if suffix == ".ts" else "javascript")
-    defs = extract_definitions(grammar, content)
+    defs = extract_definitions(grammar, content, origin=relative_path)
     if defs is not None:
         note_path(grammar, "tree-sitter")
         class_decls = [

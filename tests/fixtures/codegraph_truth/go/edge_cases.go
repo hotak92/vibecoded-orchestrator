@@ -35,3 +35,11 @@ var describe = func(p Pair) string {
 }
 
 const doc = "func Fake() {}"
+
+type ID string
+
+type Handler func(int) int
+
+func (h Handler) Call(x int) int { return h(x) }
+
+type Alias = Pair

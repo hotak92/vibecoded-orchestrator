@@ -42,3 +42,16 @@ record Point(int x, int y) {
         return x + y;
     }
 }
+
+enum Level {
+    LOW, HIGH;
+
+    String lower() {
+        return name().toLowerCase();
+    }
+}
+
+@interface Marker {
+    String value() default "";
+    int priority();
+}

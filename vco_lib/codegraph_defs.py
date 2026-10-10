@@ -39,10 +39,18 @@ Policies (shared by every language — the ground-truth fixtures under
 * ``end_line`` is the declaration's closing line (``}``, ``end``, ``;``).
 * Nested declarations are found at any depth (as the regex extractors did);
   their ``full_name`` stays whatever the extractor already used.
-* Rust: functions and types under a ``#[test]``-family attribute
-  (``#[test]``, ``#[tokio::test]``, any attribute whose path ends in
-  ``test``) or a ``#[cfg(test)]``-family gate on themselves or on any
-  enclosing ``mod`` / ``impl`` are test code and are not returned.
+* Rust: functions and types under a test-function attribute (``#[test]``,
+  ``#[tokio::test]``, ``#[rstest]`` — any path ending in ``test`` /
+  ``rstest``) or a TEST-ONLY ``cfg`` on themselves or on any enclosing
+  ``mod`` / ``impl`` are test code and are not returned. Test-only follows the
+  repo's own rule (``launcher/src-tauri/tests/command_silent_gate.rs``
+  ``is_test_cfg_attr``): ``cfg(test)``, ``cfg(all(test, …))``,
+  ``cfg(any(test, debug_assertions))``; NOT ``cfg(any(target_os = "linux",
+  test))``, ``cfg(any(test, feature = "x"))`` or ``cfg(not(test))``.
+  Limitation: ``#[cfg(test)] mod tests;`` gates a DIFFERENT file, which is
+  analyzed on its own and is therefore not recognised as test code.
+* A file whose parse tree has an error takes the regex path whole (see
+  :func:`_has_parse_error`).
 """
 from __future__ import annotations
 
@@ -218,6 +226,12 @@ _JS_CLASS_TYPES = {
     "class_declaration": "class",
     "abstract_class_declaration": "class",
     "interface_declaration": "interface",
+    # TypeScript type-level declarations (v0.2.102 review LOW-4) — named,
+    # searchable units with no methods of their own.
+    "enum_declaration": "enum",
+    "type_alias_declaration": "type",
+    "internal_module": "namespace",
+    "module": "namespace",
 }
 _JS_FUNC_TYPES = {"function_declaration", "generator_function_declaration"}
 _JS_FUNC_VALUE_TYPES = {"arrow_function", "function_expression", "function", "generator_function"}
@@ -262,7 +276,7 @@ def _js_definitions(src: _Src, root, *, svelte_module: Optional[bool] = None) ->
         t = node.type
         if t in _JS_CLASS_TYPES:
             name_node = node.child_by_field_name("name")
-            if name_node is None:
+            if name_node is None or name_node.type == "string":  # `declare module "x"`
                 return True
             outer = _js_outer(node)
             start = _decl_start(outer, _JS_SKIP) if outer is not node else _decl_start(node, _JS_SKIP)
@@ -275,7 +289,9 @@ def _js_definitions(src: _Src, root, *, svelte_module: Optional[bool] = None) ->
             body = node.child_by_field_name("body")
             if body is not None:
                 for member in body.named_children:
-                    if member.type in _JS_METHOD_TYPES:
+                    value = member.child_by_field_name("value") if member.type == "public_field_definition" else None
+                    is_field_fn = value is not None and value.type in _JS_FUNC_VALUE_TYPES
+                    if member.type in _JS_METHOD_TYPES or is_field_fn:  # `onClick = () => {…}`
                         mname = member.child_by_field_name("name")
                         if mname is not None:
                             defs.add_method(cname, src.text(mname))
@@ -292,6 +308,21 @@ def _js_definitions(src: _Src, root, *, svelte_module: Optional[bool] = None) ->
                 is_async=_has_child_token(node, "async"), exported=outer is not node,
                 tag="export" if outer is not node else "function",
             ))
+            return True
+        if t == "function_signature" and node.parent is not None and node.parent.type == "ambient_declaration":
+            # `declare function f(): T;` — an ambient declaration is the only
+            # definition there is. (Overload signatures beside an
+            # implementation are NOT rows; the implementation is.)
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                ambient = node.parent
+                outer = _js_outer(ambient)
+                defs.functions.append(_make(
+                    src, KIND_FUNCTION, src.text(name_node), _decl_start(outer, _JS_SKIP), outer,
+                    keyword="function", params=_strip_delims(_field_text(src, node, "parameters")),
+                    exported=outer is not ambient, has_body=False,
+                    tag="export" if outer is not ambient else "function",
+                ))
             return True
         if t in ("lexical_declaration", "variable_declaration"):
             outer = _js_outer(node)
@@ -339,35 +370,105 @@ _RUST_TYPE_ITEMS = {"struct_item": "struct", "enum_item": "enum", "trait_item": 
 _RUST_FN_ITEMS = {"function_item", "function_signature_item"}
 
 
+#: Attribute macros whose LAST path segment marks a test function:
+#: ``#[test]``, ``#[tokio::test]``, ``#[async_std::test]``, ``#[rstest]``.
+_RUST_TEST_ATTR_LEAVES = frozenset({"test", "rstest"})
+
+#: Bare cfg predicates an ``any(...)`` may combine with ``test`` and still be
+#: test-only — the repo's own convention (``launcher/src-tauri/tests/
+#: command_silent_gate.rs::is_test_cfg_attr`` treats ``any(test,
+#: debug_assertions)`` as test-only and ``any(test, feature = "x")`` as not).
+_RUST_TEST_ONLY_ANY_ARGS = frozenset({"test", "debug_assertions"})
+
+
+def _parse_cfg(text: str):  # noqa: ANN202 — nested list/str tree
+    """Parse a cfg predicate into ``str`` leaves and ``(name, [args])`` calls.
+    ``feature = "x"`` becomes the leaf ``'feature="x"'``. Unparseable input
+    yields ``None`` (callers then treat it as NOT test-only — conservative)."""
+    toks: List[str] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+        elif ch in "(),=":
+            toks.append(ch)
+            i += 1
+        elif ch == '"':
+            j = text.find('"', i + 1)
+            if j == -1:
+                return None
+            toks.append(text[i:j + 1])
+            i = j + 1
+        else:
+            j = i
+            while j < len(text) and not text[j].isspace() and text[j] not in '(),="':
+                j += 1
+            toks.append(text[i:j])
+            i = j
+    pos = 0
+
+    def expr():  # noqa: ANN202
+        nonlocal pos
+        if pos >= len(toks):
+            raise ValueError("eof")
+        name = toks[pos]
+        pos += 1
+        if pos < len(toks) and toks[pos] == "=":
+            pos += 1
+            value = toks[pos] if pos < len(toks) else ""
+            pos += 1
+            return f"{name}={value}"
+        if pos < len(toks) and toks[pos] == "(":
+            pos += 1
+            args = []
+            while pos < len(toks) and toks[pos] != ")":
+                args.append(expr())
+                if pos < len(toks) and toks[pos] == ",":
+                    pos += 1
+            pos += 1  # ')'
+            return (name, args)
+        return name
+
+    try:
+        tree = expr()
+    except (ValueError, IndexError):
+        return None
+    return tree if pos == len(toks) else None
+
+
+def _cfg_is_test_only(node) -> bool:  # noqa: ANN001
+    """True when the cfg predicate holds ONLY in test builds:
+    ``test``; ``all(…)`` with any test-only argument; ``any(…)`` whose every
+    argument is ``test`` / ``debug_assertions`` (at least one ``test``).
+    ``not(…)`` and everything else gate production code."""
+    if isinstance(node, str):
+        return node == "test"
+    if not isinstance(node, tuple):
+        return False
+    name, args = node
+    if name == "all":
+        return any(_cfg_is_test_only(a) for a in args)
+    if name == "any":
+        return (bool(args) and all(isinstance(a, str) and a in _RUST_TEST_ONLY_ANY_ARGS for a in args)
+                and "test" in args)
+    return False
+
+
 def _rust_attr_is_test(text: str) -> bool:
-    """``#[test]``, ``#[tokio::test]``, ``#[cfg(test)]``, ``#[cfg(any(test, …))]``
-    and friends. ``text`` is the attribute item source (``#[…]`` / ``#![…]``)."""
+    """Is the attribute item ``text`` (``#[…]`` / ``#![…]``) a test gate?
+    Test-function macros (:data:`_RUST_TEST_ATTR_LEAVES`) and test-only
+    ``cfg(...)`` predicates (:func:`_cfg_is_test_only`)."""
     inner = text.strip().lstrip("#").lstrip("!").strip()
     if inner.startswith("[") and inner.endswith("]"):
         inner = inner[1:-1].strip()
     path = inner.split("(", 1)[0].strip()
-    if path.split("::")[-1].strip() == "test":
+    if path.split("::")[-1].strip() in _RUST_TEST_ATTR_LEAVES:
         return True
     if path == "cfg":
-        args = inner[len("cfg"):].strip()
-        if args.startswith("(") and args.endswith(")"):
-            args = args[1:-1]
-        # `cfg(test)`, `cfg(any(test, …))`, `cfg(all(test, …))` — but NOT
-        # `cfg(not(test))`, which gates PRODUCTION code.
-        tokens = args.replace("(", " ( ").replace(")", " ) ").replace(",", " ").split()
-        negated_depth: List[int] = []
-        depth = 0
-        for i, tok in enumerate(tokens):
-            if tok == "(":
-                depth += 1
-            elif tok == ")":
-                depth -= 1
-                while negated_depth and negated_depth[-1] > depth:
-                    negated_depth.pop()
-            elif tok == "not" and i + 1 < len(tokens) and tokens[i + 1] == "(":
-                negated_depth.append(depth + 1)
-            elif tok == "test" and not negated_depth:
-                return True
+        tree = _parse_cfg(inner)
+        if isinstance(tree, tuple) and tree[0] == "cfg" and len(tree[1]) == 1:
+            return _cfg_is_test_only(tree[1][0])
     return False
 
 
@@ -508,20 +609,22 @@ def _go_definitions(src: _Src, root) -> Definitions:  # noqa: ANN001
 
     def visit(node, anc):  # noqa: ANN001,ANN202
         t = node.type
-        if t == "type_spec":
+        if t in ("type_spec", "type_alias"):
+            # Every named type (v0.2.102 review LOW-4): structs and interfaces
+            # as before, plus `type ID string`, `type H func(…)`, and aliases
+            # `type A = B` — methods attach to any of them by receiver.
             tnode = node.child_by_field_name("type")
             name_node = node.child_by_field_name("name")
-            if tnode is None or name_node is None or tnode.type not in ("struct_type", "interface_type"):
+            if tnode is None or name_node is None:
                 return True
             parent = node.parent
             single = parent is not None and parent.type == "type_declaration" and len(
-                [c for c in parent.named_children if c.type == "type_spec"]) == 1
+                [c for c in parent.named_children if c.type in ("type_spec", "type_alias")]) == 1
             outer = parent if single else node
             tname = src.text(name_node)
-            defs.classes.append(_make(
-                src, KIND_CLASS, tname, outer, outer,
-                keyword="struct" if tnode.type == "struct_type" else "interface",
-            ))
+            keyword = {"struct_type": "struct", "interface_type": "interface"}.get(
+                tnode.type, "alias" if t == "type_alias" else "type")
+            defs.classes.append(_make(src, KIND_CLASS, tname, outer, outer, keyword=keyword))
             if tnode.type == "interface_type":
                 for member in tnode.named_children:
                     if member.type in ("method_elem", "method_spec"):
@@ -558,8 +661,12 @@ _JAVA_CLASS_TYPES = {
     "interface_declaration": "interface",
     "enum_declaration": "enum",
     "record_declaration": "record",
+    "annotation_type_declaration": "@interface",
 }
-_JAVA_FUNC_TYPES = {"method_declaration", "constructor_declaration", "compact_constructor_declaration"}
+_JAVA_FUNC_TYPES = {
+    "method_declaration", "constructor_declaration", "compact_constructor_declaration",
+    "annotation_type_element_declaration",  # `String value() default "";`
+}
 _JAVA_SKIP = {"marker_annotation", "annotation"}
 
 _CS_CLASS_TYPES = {
@@ -568,8 +675,27 @@ _CS_CLASS_TYPES = {
     "record_declaration": "record",
     "record_struct_declaration": "record",
     "struct_declaration": "struct",
+    "enum_declaration": "enum",
 }
-_CS_FUNC_TYPES = {"method_declaration", "constructor_declaration"}
+#: ``local_function_statement`` — a C# local function, found at any depth like
+#: every nested definition; it is never a member of the class's methods list.
+_CS_FUNC_TYPES = {"method_declaration", "constructor_declaration", "local_function_statement"}
+
+#: Body wrappers between a type declaration and its members (Java enums nest
+#: members one level deeper, in ``enum_body_declarations``).
+_MEMBER_BODY_TYPES = frozenset({
+    "class_body", "interface_body", "enum_body", "enum_body_declarations",
+    "annotation_type_body", "declaration_list", "enum_member_declaration_list",
+})
+
+
+def _member_owner(node):  # noqa: ANN001,ANN202
+    """The declaration a member belongs to DIRECTLY: climb the body wrappers;
+    whatever sits above them is the owner (``None`` at the top)."""
+    parent = node.parent
+    while parent is not None and parent.type in _MEMBER_BODY_TYPES:
+        parent = parent.parent
+    return parent
 _CS_SKIP = {"attribute_list"}
 
 
@@ -614,10 +740,10 @@ def _member_definitions(
                 src.text(c) for c in node.children if c.type in ("modifier", "modifiers")
             ).split()
             body = node.child_by_field_name("body")
-            # Membership: only a DIRECT member of the class body counts toward
-            # its methods list (a method of an anonymous / local class does not).
-            parent_body = node.parent
-            owner_node = parent_body.parent if parent_body is not None else None
+            # Membership: only a DIRECT member of the type body counts toward
+            # its methods list (a method of an anonymous class, or a local
+            # function, does not).
+            owner_node = _member_owner(node)
             if owner_node is not None and owner_node.type in class_types and container:
                 defs.add_method(container, mname)
             defs.functions.append(_make(
@@ -629,8 +755,7 @@ def _member_definitions(
             return True
         if t in member_extra:
             name_node = node.child_by_field_name("name")
-            parent_body = node.parent
-            owner_node = parent_body.parent if parent_body is not None else None
+            owner_node = _member_owner(node)
             if name_node is not None and owner_node is not None and owner_node.type in class_types:
                 owner = owner_node.child_by_field_name("name")
                 if owner is not None:
@@ -1012,19 +1137,46 @@ def supported_definition_languages() -> "frozenset[str]":
     return frozenset(_WALKERS)
 
 
-def extract_definitions(language: str, source_text: str) -> Optional[Definitions]:
+_PARSE_ERROR_LOGGED: Set[Tuple[str, str]] = set()
+
+
+def _has_parse_error(tree, language: str, origin: str) -> bool:  # noqa: ANN001
+    """True when the parse tree contains an ERROR / MISSING node.
+
+    Why the whole file goes to regex rather than unioning regex discovery for
+    the ERROR spans: tree-sitter's error recovery does not confine damage to
+    the ERROR node — a half-edited signature can make it absorb every later
+    declaration into one ERROR subtree, or re-parent them so their ranges are
+    wrong without any ERROR node around them. Deciding which tree-sitter rows
+    to trust next to an error would be a heuristic of its own; the regex
+    extractor is the pre-v0.2.102 behaviour, scans line-by-line, and loses
+    only the broken definition itself. A clean file (the common case) keeps
+    the exact tree-sitter path. Logged once per file per process."""
+    if not tree.root_node.has_error:
+        return False
+    key = (language, origin)
+    if key not in _PARSE_ERROR_LOGGED:
+        _PARSE_ERROR_LOGGED.add(key)
+        logger.info(
+            "codegraph_defs: %s parse error in %s; using the regex extractor "
+            "for this file", language, origin or "<source>",
+        )
+    return True
+
+
+def extract_definitions(language: str, source_text: str, origin: str = "") -> Optional[Definitions]:
     """Parse ``source_text`` with ``language``'s grammar and return its
-    definitions, or ``None`` when the grammar is unavailable (the caller then
-    runs its regex discovery). Never raises for a parse problem: tree-sitter
-    is error-tolerant, and a walker failure is logged and treated as
-    "unavailable" for this file."""
+    definitions, or ``None`` when the caller must run its regex discovery
+    instead: the grammar is unavailable, the file has a parse error
+    (:func:`_has_parse_error`), or the walker raised (logged). ``origin`` (the
+    file's repo-relative path) only labels the log lines."""
     entry = _WALKERS.get(language)
     if entry is None:
         return None
     grammar, walker = entry
     data = source_text.encode("utf-8", "replace")
     tree = parse(grammar, data)
-    if tree is None:
+    if tree is None or _has_parse_error(tree, language, origin):
         return None
     try:
         return walker(_Src(data), tree.root_node)
@@ -1037,20 +1189,21 @@ def extract_definitions(language: str, source_text: str) -> Optional[Definitions
 
 
 def extract_svelte_script_definitions(
-    blocks: Iterable[Tuple[str, bool, int]], content: str,
+    blocks: Iterable[Tuple[str, bool, int]], content: str, origin: str = "",
 ) -> Optional[List[Tuple[Definition, bool]]]:
     """Definitions of every Svelte ``<script>`` block, parsed with the
     TypeScript grammar (a superset of the JavaScript Svelte scripts use).
 
     ``blocks`` is the Svelte extractor's ``(body, is_module, body_offset)``
     list; returned line numbers are FILE lines. ``None`` when the grammar is
-    unavailable. Each item is ``(definition, is_module_scope)``.
+    unavailable or any block has a parse error (the whole file then takes the
+    regex path). Each item is ``(definition, is_module_scope)``.
     """
     results: List[Tuple[Definition, bool]] = []
     for body, is_module, offset in blocks:
         data = body.encode("utf-8", "replace")
         tree = parse("typescript", data)
-        if tree is None:
+        if tree is None or _has_parse_error(tree, "svelte", origin):
             return None
         try:
             defs = _js_definitions(_Src(data), tree.root_node, svelte_module=is_module)

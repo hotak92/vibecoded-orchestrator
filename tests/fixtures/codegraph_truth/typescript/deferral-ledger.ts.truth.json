@@ -1,7 +1,19 @@
 {
  "source": "deferral-ledger.ts",
- "reviewed": "W6-E 2026-10-10",
+ "reviewed": "W6-E 2026-10-10; review round: TS type aliases are definitions (policy LOW-4)",
  "symbols": [
+  {
+   "kind": "class",
+   "name": "LedgerScope",
+   "start": 17,
+   "end": 17
+  },
+  {
+   "kind": "class",
+   "name": "DispositionSource",
+   "start": 20,
+   "end": 20
+  },
   {
    "kind": "class",
    "name": "RetryAttempt",

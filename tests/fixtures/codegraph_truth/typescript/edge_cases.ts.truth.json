@@ -1,60 +1,137 @@
 {
  "source": "edge_cases.ts",
- "reviewed": "W6-E 2026-10-10 (hand-written before extraction)",
+ "reviewed": "W6-E 2026-10-10 (hand-written; full_name + methods scored)",
  "symbols": [
   {
    "kind": "class",
    "name": "Shape",
    "start": 2,
-   "end": 5
+   "end": 5,
+   "full_name": "edge_cases.Shape",
+   "methods": [
+    "area",
+    "scale"
+   ]
   },
   {
    "kind": "class",
    "name": "Base",
    "start": 7,
-   "end": 12
+   "end": 12,
+   "full_name": "edge_cases.Base",
+   "methods": [
+    "area",
+    "scale"
+   ]
   },
   {
    "kind": "class",
    "name": "Square",
    "start": 14,
-   "end": 21
+   "end": 21,
+   "full_name": "edge_cases.Square",
+   "methods": [
+    "constructor",
+    "area"
+   ]
   },
   {
    "kind": "function",
    "name": "pick",
    "start": 23,
-   "end": 23
+   "end": 23,
+   "full_name": "edge_cases.pick"
   },
   {
    "kind": "function",
    "name": "summarize",
    "start": 25,
-   "end": 29
+   "end": 29,
+   "full_name": "edge_cases.summarize"
   },
   {
    "kind": "function",
    "name": "groupBy",
    "start": 31,
-   "end": 40
+   "end": 40,
+   "full_name": "edge_cases.groupBy"
   },
   {
    "kind": "function",
    "name": "outer",
    "start": 42,
-   "end": 47
+   "end": 47,
+   "full_name": "edge_cases.outer"
   },
   {
    "kind": "function",
    "name": "inner",
    "start": 43,
-   "end": 45
+   "end": 45,
+   "full_name": "edge_cases.inner"
   },
   {
    "kind": "function",
    "name": "stream",
    "start": 51,
-   "end": 53
+   "end": 53,
+   "full_name": "edge_cases.stream"
+  },
+  {
+   "kind": "class",
+   "name": "Level",
+   "start": 55,
+   "end": 58,
+   "full_name": "edge_cases.Level",
+   "methods": []
+  },
+  {
+   "kind": "class",
+   "name": "Pair",
+   "start": 60,
+   "end": 60,
+   "full_name": "edge_cases.Pair",
+   "methods": []
+  },
+  {
+   "kind": "class",
+   "name": "Shapes",
+   "start": 62,
+   "end": 66,
+   "full_name": "edge_cases.Shapes",
+   "methods": []
+  },
+  {
+   "kind": "function",
+   "name": "unit",
+   "start": 63,
+   "end": 65,
+   "full_name": "edge_cases.unit"
+  },
+  {
+   "kind": "class",
+   "name": "Widget",
+   "start": 68,
+   "end": 73,
+   "full_name": "edge_cases.Widget",
+   "methods": [
+    "onClick",
+    "make"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "ambient",
+   "start": 75,
+   "end": 75,
+   "full_name": "edge_cases.ambient"
+  },
+  {
+   "kind": "function",
+   "name": "overloaded",
+   "start": 79,
+   "end": 81,
+   "full_name": "edge_cases.overloaded"
   }
  ]
 }

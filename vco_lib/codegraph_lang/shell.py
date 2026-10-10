@@ -81,7 +81,7 @@ def extract_shell_file(
     # finds `name()` with the brace on the next line and subshell bodies
     # `name() ( … )`, which the regex cannot; regex fallback otherwise.
     #   fn_records: (name, start_line, end_line)
-    defs = extract_definitions("shell", content)
+    defs = extract_definitions("shell", content, origin=relative_path)
     note_path("shell", "tree-sitter" if defs is not None else "regex")
     fn_records: List[Tuple[str, int, int]] = []
     if defs is not None:

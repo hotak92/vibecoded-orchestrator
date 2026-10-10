@@ -9,17 +9,19 @@ helpers object (no embedding, no Weaviate, no writes) and scores the extracted
 class/function symbols against each fixture's committed, hand-reviewed
 ``<file>.truth.json``.
 
-A symbol is ``(kind, name, start_line, end_line)``; precision and recall are
-multiset matches, so a wrong line RANGE counts as both a false positive and a
-false negative — the truncated-body and runaway-scan defects score as misses,
-not as hits.
+A symbol is ``(kind, name, start_line, end_line, full_name, methods)``.
+``full_name`` and (for classes) ``methods`` are scored only where the truth row
+states them — every hand-written ``edge_cases.*`` / ``broken.*`` truth does,
+so a wrong identity or a wrong member list is a miss there. Precision and
+recall are multiset matches, so a wrong line RANGE counts as both a false
+positive and a false negative — the truncated-body and runaway-scan defects
+score as misses, not as hits.
 """
 from __future__ import annotations
 
 import json
-from collections import Counter
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from vco_lib.codegraph_entities import KIND_CLASS, KIND_FUNCTION
 from vco_lib.codegraph_lang.cpp import extract_cpp_file
@@ -51,7 +53,9 @@ EXTRACTORS: Dict[str, Tuple[Callable, str]] = {
     "svelte": (extract_svelte_file, "typescript"),
 }
 
-Symbol = Tuple[str, str, int, int]
+#: (kind, name, start, end, full_name, methods) — methods is a tuple, or
+#: None for functions.
+Symbol = Tuple[str, str, int, int, str, Optional[Tuple[str, ...]]]
 
 
 class StubHelpers:
@@ -85,15 +89,41 @@ def extracted_symbols(lang: str, fixture: Path) -> List[Symbol]:
     out: List[Symbol] = []
     for e in fx.entities:
         if e.kind == KIND_CLASS:
-            out.append(("class", e.name, e.start_line, e.end_line))
+            methods = tuple((e.extras or {}).get("methods") or ())
+            out.append(("class", e.name, e.start_line, e.end_line, e.full_name, methods))
         elif e.kind == KIND_FUNCTION:
-            out.append(("function", e.name, e.start_line, e.end_line))
+            out.append(("function", e.name, e.start_line, e.end_line, e.full_name, None))
     return out
 
 
-def truth_symbols(fixture: Path) -> List[Symbol]:
-    rows = json.loads(truth_path(fixture).read_text(encoding="utf-8"))["symbols"]
-    return [(r["kind"], r["name"], r["start"], r["end"]) for r in rows]
+def truth_symbols(fixture: Path) -> List[Dict[str, Any]]:
+    return json.loads(truth_path(fixture).read_text(encoding="utf-8"))["symbols"]
+
+
+def _matches(sym: Symbol, row: Dict[str, Any]) -> bool:
+    kind, name, start, end, full_name, methods = sym
+    if (kind, name, start, end) != (row["kind"], row["name"], row["start"], row["end"]):
+        return False
+    if "full_name" in row and row["full_name"] != full_name:
+        return False
+    if "methods" in row and tuple(row["methods"]) != methods:
+        return False
+    return True
+
+
+def match_file(lang: str, fixture: Path) -> Tuple[int, List[Symbol], List[Dict[str, Any]]]:
+    """(true positives, unmatched extracted, unmatched truth) for one fixture."""
+    extracted = extracted_symbols(lang, fixture)
+    missing: List[Dict[str, Any]] = []
+    tp = 0
+    for row in truth_symbols(fixture):
+        hit = next((i for i, sym in enumerate(extracted) if _matches(sym, row)), None)
+        if hit is None:
+            missing.append(row)
+        else:
+            extracted.pop(hit)
+            tp += 1
+    return tp, extracted, missing
 
 
 def force_regex_definitions(monkeypatch) -> None:  # noqa: ANN001
@@ -116,11 +146,10 @@ def score(lang: str) -> Tuple[float, float, int, int, int]:
     fixture of ``lang``."""
     tp = n_ext = n_truth = 0
     for fixture in fixture_files(lang):
-        ext = Counter(extracted_symbols(lang, fixture))
-        tru = Counter(truth_symbols(fixture))
-        tp += sum((ext & tru).values())
-        n_ext += sum(ext.values())
-        n_truth += sum(tru.values())
+        hits, extra, missing = match_file(lang, fixture)
+        tp += hits
+        n_ext += hits + len(extra)
+        n_truth += hits + len(missing)
     precision = tp / n_ext if n_ext else (1.0 if not n_truth else 0.0)
     recall = tp / n_truth if n_truth else 1.0
     return precision, recall, tp, n_ext, n_truth

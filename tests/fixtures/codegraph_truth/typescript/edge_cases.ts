@@ -51,3 +51,31 @@ const label = "function fake() {}";
 export default async function* stream(): AsyncGenerator<number> {
   yield label.length;
 }
+
+export enum Level {
+  Low,
+  High,
+}
+
+export type Pair<T> = [T, T];
+
+namespace Shapes {
+  export function unit(): number {
+    return 1;
+  }
+}
+
+class Widget {
+  onClick = (e: Event): void => {
+    e.preventDefault();
+  };
+  static make = async () => new Widget();
+}
+
+declare function ambient(x: number): string;
+
+function overloaded(a: string): string;
+function overloaded(a: number): number;
+function overloaded(a: any): any {
+  return a;
+}

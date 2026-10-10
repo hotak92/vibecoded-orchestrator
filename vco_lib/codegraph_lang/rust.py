@@ -373,7 +373,7 @@ def extract_rust_file(
     # (`#[test]`-family attributes incl. `#[tokio::test]`, and `#[cfg(test)]`
     # on the item or on any enclosing `mod`/`impl`) and never mints a symbol
     # from a string literal.
-    defs = extract_definitions("rust", content)
+    defs = extract_definitions("rust", content, origin=relative_path)
     if defs is not None:
         note_path("rust", "tree-sitter")
         types = [(c.name, c.start_line, c.end_line, defs.methods_of(c.name)) for c in defs.classes]

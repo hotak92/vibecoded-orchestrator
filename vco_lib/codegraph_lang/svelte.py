@@ -307,7 +307,7 @@ def extract_svelte_file(
     # script), the regex parser as the fallback. Same four kinds either way:
     # function / export / arrow_export / reactive.
     ts_decls = extract_svelte_script_definitions(
-        _extract_svelte_script_blocks(content), content,
+        _extract_svelte_script_blocks(content), content, origin=relative_path,
     )
     note_path("svelte", "tree-sitter" if ts_decls is not None else "regex")
     decls: List[Dict[str, Any]] = []

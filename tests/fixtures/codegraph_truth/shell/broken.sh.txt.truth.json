@@ -1,0 +1,20 @@
+{
+ "source": "broken.sh.txt",
+ "reviewed": "W6-E 2026-10-10 (hand-written; full_name + methods scored)",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "first",
+   "start": 4,
+   "end": 6,
+   "full_name": "broken.sh.first"
+  },
+  {
+   "kind": "function",
+   "name": "third",
+   "start": 13,
+   "end": 15,
+   "full_name": "broken.sh.third"
+  }
+ ]
+}

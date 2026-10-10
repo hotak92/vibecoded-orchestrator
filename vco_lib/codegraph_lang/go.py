@@ -214,19 +214,23 @@ def extract_go_file(
     imports = list(dict.fromkeys(single_imports + block_imports))
 
     # Types + functions: tree-sitter first (v0.2.102), regex fallback.
-    # Records: types (name, start_line, end_line, methods);
+    # Records: types (name, start_line, end_line, methods, is_struct_or_interface);
     #          funcs (name, args, start_line, end_line).
-    defs = extract_definitions("go", content)
+    defs = extract_definitions("go", content, origin=relative_path)
     if defs is not None:
         note_path("go", "tree-sitter")
-        types = [(c.name, c.start_line, c.end_line, defs.methods_of(c.name)) for c in defs.classes]
+        types = [
+            (c.name, c.start_line, c.end_line, defs.methods_of(c.name), c.keyword in ("struct", "interface"))
+            for c in defs.classes
+        ]
         funcs = [(f.name, f.params, f.start_line, f.end_line) for f in defs.functions]
     else:
         note_path("go", "regex")
-        types, funcs = _regex_go_definitions(content_clean, source_lines)
+        regex_types, funcs = _regex_go_definitions(content_clean, source_lines)
+        types = [(n, s_, e_, m, True) for n, s_, e_, m in regex_types]
 
     #: Unique type names in source order — what the module summary lists.
-    struct_names: List[str] = list(dict.fromkeys(n for n, _, _, _ in types))
+    struct_names: List[str] = list(dict.fromkeys(t[0] for t in types))
 
     # Module summary
     pkg_match = re.search(r'^package\s+(\w+)', content, re.MULTILINE)
@@ -262,10 +266,13 @@ def extract_go_file(
     # `start_line + len(class_lines)`, which is that line PLUS ONE, while the
     # FUNCTION loop below already used the returned value directly. One
     # convention now; the golden corpus had ratified the +1 across 7 languages.
-    for sname, start_line, _class_end_line, methods in types:
+    for sname, start_line, _class_end_line, methods, struct_like in types:
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
-        signature = f"type {sname} struct/interface"
+        # Struct/interface rows keep their pre-v0.2.102 signature; other named
+        # types (`type ID string`, func types, aliases — tree-sitter only)
+        # are labelled plainly.
+        signature = f"type {sname} struct/interface" if struct_like else f"type {sname}"
         # `methods` (V52-O.11.F.2-GO): receiver-bound functions of `sname` —
         # from the tree-sitter receiver types, or `_go_methods_for_struct`
         # on the regex fallback.

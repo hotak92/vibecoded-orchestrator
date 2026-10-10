@@ -38,3 +38,14 @@ namespace Edge
         public int Length() => B - A;
     }
 }
+
+public enum Mode { On, Off }
+
+public class Runner
+{
+    public int Run(int x)
+    {
+        int Twice(int y) => y * 2;
+        return Twice(x);
+    }
+}

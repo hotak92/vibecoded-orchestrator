@@ -172,7 +172,7 @@ def extract_ruby_file(
     # already covers KIND_CLASS, so the second row lands as `Account#2`.
     # Definitions: tree-sitter first (v0.2.102), regex fallback. Records:
     #   class_decls (name, start_line, end_line).
-    defs = extract_definitions("ruby", content)
+    defs = extract_definitions("ruby", content, origin=relative_path)
     note_path("ruby", "tree-sitter" if defs is not None else "regex")
     if defs is not None:
         class_decls: List[Tuple[str, int, int]] = [
