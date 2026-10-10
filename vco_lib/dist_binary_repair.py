@@ -327,7 +327,10 @@ def run_repair_leg(
     if outcome.restored and launcher_pid is not None and not launcher_driven:
         # The canonical path now holds HEAD's binary but the running process
         # still executes the old image. Surface the honest "restart to pick it
-        # up" banner; the launcher never restarts itself.
+        # up" banner. A VISIBLE launcher shows the restart modal; a launcher
+        # started with --start-hidden and idle relaunches itself through the
+        # same guarded path (v0.2.102 W6-C, restart.rs
+        # hidden_idle_stale_relaunch_tick) — install.py never relaunches it.
         if on_restart_required is not None:
             on_restart_required(launcher_pid)
 
