@@ -1,0 +1,138 @@
+{
+ "source": "deferral-ledger.ts",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "RetryAttempt",
+   "start": 22,
+   "end": 27
+  },
+  {
+   "kind": "class",
+   "name": "RetrySummary",
+   "start": 29,
+   "end": 40
+  },
+  {
+   "kind": "class",
+   "name": "LedgerEntry",
+   "start": 42,
+   "end": 57
+  },
+  {
+   "kind": "class",
+   "name": "DeferralLedgerView",
+   "start": 59,
+   "end": 74
+  },
+  {
+   "kind": "class",
+   "name": "DismissOutcome",
+   "start": 76,
+   "end": 84
+  },
+  {
+   "kind": "function",
+   "name": "scopeNoun",
+   "start": 106,
+   "end": 110
+  },
+  {
+   "kind": "function",
+   "name": "panelTitle",
+   "start": 113,
+   "end": 117
+  },
+  {
+   "kind": "function",
+   "name": "groupEntries",
+   "start": 132,
+   "end": 141
+  },
+  {
+   "kind": "function",
+   "name": "badgeCount",
+   "start": 160,
+   "end": 163
+  },
+  {
+   "kind": "function",
+   "name": "retryingCount",
+   "start": 169,
+   "end": 177
+  },
+  {
+   "kind": "function",
+   "name": "unbackedRetryableCount",
+   "start": 180,
+   "end": 184
+  },
+  {
+   "kind": "function",
+   "name": "actionGroupNote",
+   "start": 191,
+   "end": 213
+  },
+  {
+   "kind": "function",
+   "name": "mountConfigError",
+   "start": 224,
+   "end": 236
+  },
+  {
+   "kind": "function",
+   "name": "dispositionLabel",
+   "start": 239,
+   "end": 252
+  },
+  {
+   "kind": "function",
+   "name": "autoRetryIsBacked",
+   "start": 324,
+   "end": 331
+  },
+  {
+   "kind": "function",
+   "name": "dispositionExplanation",
+   "start": 334,
+   "end": 357
+  },
+  {
+   "kind": "function",
+   "name": "retryLine",
+   "start": 367,
+   "end": 384
+  },
+  {
+   "kind": "function",
+   "name": "dismissConfirmMessage",
+   "start": 391,
+   "end": 401
+  },
+  {
+   "kind": "function",
+   "name": "dismissResultMessage",
+   "start": 404,
+   "end": 418
+  },
+  {
+   "kind": "function",
+   "name": "sourceNotice",
+   "start": 427,
+   "end": 436
+  },
+  {
+   "kind": "function",
+   "name": "emptyStateMessage",
+   "start": 439,
+   "end": 443
+  },
+  {
+   "kind": "function",
+   "name": "findEntry",
+   "start": 446,
+   "end": 451
+  }
+ ]
+}

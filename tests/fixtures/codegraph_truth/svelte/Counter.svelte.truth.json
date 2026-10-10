@@ -1,0 +1,36 @@
+{
+ "source": "Counter.svelte",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "createStore",
+   "start": 8,
+   "end": 10
+  },
+  {
+   "kind": "function",
+   "name": "increment",
+   "start": 18,
+   "end": 20
+  },
+  {
+   "kind": "function",
+   "name": "reset",
+   "start": 22,
+   "end": 24
+  },
+  {
+   "kind": "function",
+   "name": "double",
+   "start": 26,
+   "end": 26
+  },
+  {
+   "kind": "function",
+   "name": "doubled",
+   "start": 28,
+   "end": 28
+  }
+ ]
+}

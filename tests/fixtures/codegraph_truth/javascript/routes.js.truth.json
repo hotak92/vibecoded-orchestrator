@@ -1,0 +1,24 @@
+{
+ "source": "routes.js",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "registerRoutes",
+   "start": 3,
+   "end": 6
+  },
+  {
+   "kind": "function",
+   "name": "createItem",
+   "start": 8,
+   "end": 10
+  },
+  {
+   "kind": "function",
+   "name": "listItems",
+   "start": 12,
+   "end": 14
+  }
+ ]
+}

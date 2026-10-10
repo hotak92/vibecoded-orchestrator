@@ -1,0 +1,1224 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Part of VibeCoded Orchestrator.
+//! The ONE home for the launcher's `git` invocations and for the questions it
+//! asks git about a repo's currency.
+//!
+//! ## Why this module exists (v0.2.92, WP-13)
+//!
+//! Two independent subsystems answered the question "which branch is this
+//! repo on?" and answered it DIFFERENTLY:
+//!
+//! * `installer.rs` — `check_for_updates`, the (since retired) `update_orchestrator`,
+//!   `resolve_pull_branch`, and two more sites — each inlined
+//!   `if b.is_empty() || b == "HEAD" { "main" } else { b }`. Five copies of
+//!   one rule, correct in all five.
+//! * `self_update.rs` — `current_branch` returned `git rev-parse
+//!   --abbrev-ref HEAD` verbatim. Zero copies of the rule.
+//!
+//! In a detached HEAD, `--abbrev-ref` returns the literal string `"HEAD"`.
+//! The installer surface normalised it to `main` and worked. The self-update
+//! surface passed `"HEAD"` through into `HEAD..vco_upstream/HEAD` — a ref
+//! that DID NOT EXIST on the field install, because `ensure_upstream_remote`
+//! only ever runs `remote add` / `set-url`, and the git that install ran
+//! never created a remote HEAD symref on `fetch`. git returned `fatal:`, and
+//! `.unwrap_or(0)` turned that into the number zero, and zero meant "up to
+//! date".
+//!
+//! **That last premise is git-VERSION dependent, and saying it unqualified
+//! cost a red CI run.** Since git 2.48, `fetch` honours
+//! `remote.<name>.followRemoteHEAD`, whose default `create` makes a plain
+//! `remote add` + `fetch` DO create `refs/remotes/<remote>/HEAD`. So on a
+//! modern git `HEAD..<remote>/HEAD` resolves and returns a count; on the
+//! field install's older git it was `fatal:`. Neither behaviour changes what
+//! this module must do — the normaliser answers with the RESOLVED branch and
+//! never constructs `<remote>/HEAD` at all — but the regression fixtures
+//! below have to pin the shape explicitly instead of inheriting whatever the
+//! host's git happens to do (see [`pin_absent_remote_head`]).
+//!
+//! So: two subsystems, one question, opposite answers on the same repo. That
+//! is a duplicated SYSTEM even though the two shared no lines of code — and
+//! the divergence is what let a real install sit five weeks behind while
+//! every surface said it was current. The fix is not "add the normalisation
+//! to the sixth place"; it is that there is exactly ONE place.
+//!
+//! ## What lives here
+//!
+//! * [`run_git`] — spawn + capture + timeout, the production git runner.
+//! * [`resolve_branch`] — the branch question, answered as a
+//!   [`BranchState`] that says BOTH which branch to compare against AND
+//!   whether HEAD is detached. The detached bit was previously destroyed by
+//!   normalisation (`"HEAD"` → `"main"` loses the fact); surfaces need it to
+//!   explain themselves and to offer the reattach affordance.
+//! * [`commits_behind`] — `rev-list --count`, returning `Result` so callers
+//!   must decide what to do about failure instead of receiving a `0`.
+//! * [`remote_default_branch`] / [`latest_remote_tag`] — questions asked of
+//!   the REMOTE rather than of local HEAD.
+//!
+//! ## What does NOT live here, deliberately
+//!
+//! `git remote set-head` is NOT called by any PRODUCTION path here or
+//! anywhere else in the launcher, and must not be added as a "second fix"
+//! for the missing `vco_upstream/HEAD` ref. The normaliser IS the fix; a
+//! second mechanism is a second thing to drift.
+//!
+//! The one `set-head` in this file is [`pin_absent_remote_head`], which is
+//! `#[cfg(test)]` and only ever `--delete`s. It does not fix anything for a
+//! user: it pins a FIXTURE's environment so the regression tests reproduce
+//! the field shape on every git version. Test-fixture setup and a production
+//! repair are different things; keep it that way.
+
+use std::ffi::OsStr;
+use std::path::Path;
+use std::time::Duration;
+
+use tokio::process::Command as TokioCommand;
+use vct_launcher_core::process::CommandExt as _;
+
+/// Wall-clock ceiling for a single git invocation. Matches the value
+/// `self_update.rs` used before the extraction — a network `ls-remote` on a
+/// slow link is the long pole, and 30s is generous for it while still
+/// bounded (an unbounded git hangs the daily check forever).
+pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The program a `git` spawn hands `Command::new`, resolved NOW.
+///
+/// `git` is resolved through `vct_launcher_core::paths::spawn_program`: on the
+/// process `PATH` in production, as before; over a test's per-thread injected
+/// lookup `PATH` otherwise, so a test puts a fake `git` first without setting
+/// the shared process `PATH` (v0.2.97 review R6). Exposed separately from
+/// [`git_command`] so a caller that builds its command LATER (inside a future
+/// polled on another tick — the fetch ladder) can resolve at call time.
+pub(crate) fn git_program() -> std::ffi::OsString {
+    vct_launcher_core::paths::spawn_program("git")
+}
+
+/// A silent `git` command — the one place the launcher's git runners name
+/// the program (see [`git_program`]).
+///
+/// NOT `kill_on_drop`: most git verbs mutate the work tree or the index, and
+/// killing one part-way (a cancelled task, app shutdown) can leave a
+/// half-applied checkout behind. The two places where a dropped future
+/// genuinely means "abandon this child" opt in explicitly —
+/// [`git_network_command`] and [`run_git`].
+pub(crate) fn git_command() -> TokioCommand {
+    TokioCommand::new(git_program()).silent()
+}
+
+/// The git verbs that talk to a remote. A dropped future for one of these is
+/// a timed-out or abandoned network wait, and the child must die with it
+/// (v0.2.100 WP-05, L2-F03): before, a `git fetch` whose
+/// `tokio::time::timeout` fired kept running as an orphan, held its ref and
+/// `shallow` locks, and made the NEXT attempt of the same ladder fail on a
+/// lock the previous attempt still owned.
+pub(crate) const NETWORK_VERBS: &[&str] = &["fetch", "ls-remote", "pull", "push", "clone"];
+
+/// `true` when `verb` (a git subcommand) talks to a remote — [`NETWORK_VERBS`].
+pub(crate) fn is_network_verb(verb: &str) -> bool {
+    NETWORK_VERBS.contains(&verb)
+}
+
+/// A silent `git` command for a NETWORK verb, with `kill_on_drop(true)`: when
+/// the future awaiting it is dropped (a per-attempt timeout, a cancelled
+/// caller) the child is killed rather than orphaned.
+///
+/// `program` comes from [`git_program`], resolved by the caller at call time.
+///
+/// Windows: `kill_on_drop` maps to `TerminateProcess` on the child. The wiring
+/// is unit-tested on every OS (`network_commands_are_kill_on_drop`); the
+/// end-to-end orphan test drives a POSIX `sh` fake git and is `#[cfg(unix)]`
+/// — on Windows the kill itself is tokio's, not ours, and is not exercised by
+/// a fake-git integration test here.
+pub(crate) fn git_network_command(program: &OsStr) -> TokioCommand {
+    let mut cmd = TokioCommand::new(program).silent();
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+/// The command [`run_git`] spawns, over a program the caller resolved
+/// EARLIER (see [`git_program`] — a future polled on a later tick must
+/// resolve at call time, which is also what lets a test inject a fake git
+/// for every attempt). Factored out so the `kill_on_drop` wiring is
+/// unit-testable without spawning anything.
+fn run_git_command_with(program: &OsStr, repo: &Path, args: &[&str]) -> TokioCommand {
+    // `run_git` ALWAYS runs under `GIT_TIMEOUT`. A timed-out child must not
+    // outlive the Err it produced: the caller has already been told "failed"
+    // and moves on; an orphan finishing the operation later (or holding its
+    // lock files) contradicts that answer.
+    let mut cmd = git_network_command(program);
+    cmd.args(args).current_dir(repo);
+    cmd
+}
+
+/// Run `git <args>` in `repo`, returning trimmed stdout.
+///
+/// `Err` on: spawn failure, timeout (the child is killed), OR a non-zero exit
+/// (with trimmed stderr AND the exit status in the message — an empty stderr
+/// must never leave the error without evidence, v0.2.100 WP-05 / I-06).
+/// A caller that wants to inspect a non-zero exit rather than treat it as an
+/// error should not use this helper.
+///
+/// Output is captured, never inherited — `.silent()` also suppresses the
+/// console window Windows would otherwise flash for every invocation.
+pub(crate) async fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    run_git_with(&git_program(), repo, args).await
+}
+
+/// [`run_git`] over a pre-resolved program (see [`run_git_command_with`]).
+async fn run_git_with(program: &OsStr, repo: &Path, args: &[&str]) -> Result<String, String> {
+    let fut = run_git_command_with(program, repo, args).output();
+    let output = tokio::time::timeout(GIT_TIMEOUT, fut)
+        .await
+        .map_err(|_| format!("git {} timed out", args.join(" ")))?
+        .map_err(|e| format!("git {} failed: {}", args.join(" "), e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "git {}: {} ({})",
+            args.join(" "),
+            stderr.trim(),
+            output.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Spawn git and hand back the RAW [`std::process::Output`].
+///
+/// Contract deliberately differs from [`run_git`]: `Err` is a SPAWN failure
+/// only — a non-zero git exit comes back as `Ok(output)` for the caller to
+/// judge. Callers that need to branch on a specific exit code, or that read
+/// stdout on failure, use this; everything else uses [`run_git`].
+///
+/// Deliberately UNTIMED, unlike [`run_git`]: the callers that need raw
+/// `Output` include `git pull` / `git rebase` on a full clone, and a 30s
+/// ceiling on those would abort a legitimately slow update mid-write. A
+/// caller that wants the ceiling uses [`run_git`].
+///
+/// v0.2.92 (MAJOR-7): generic over `AsRef<OsStr>` rather than fixed to
+/// `&[&str]`, so a call site holding a `PathBuf`/`OsStr` argument (staging a
+/// merged file by path) can route through the runner instead of keeping a
+/// raw `Command::new("git")` next to it. Lossy `to_string_lossy` conversion
+/// at such a site would be a real behaviour change on a non-UTF-8 path; a
+/// second raw spawn is a worse one.
+pub(crate) async fn run_git_raw<S: AsRef<OsStr>>(
+    repo: &Path,
+    args: &[S],
+) -> Result<std::process::Output, String> {
+    run_git_raw_env(repo, args, &[]).await
+}
+
+/// The command [`run_git_raw_env`] spawns: `kill_on_drop` for a NETWORK verb
+/// only ([`is_network_verb`]) — a raw `git pull`/`push` abandoned by its
+/// caller is killed, a raw `git commit`/`rebase --continue` is left to finish.
+fn raw_git_command<S: AsRef<OsStr>>(
+    repo: &Path,
+    args: &[S],
+    envs: &[(&str, &str)],
+) -> TokioCommand {
+    let mut cmd = git_command();
+    cmd.kill_on_drop(is_network_verb(&first_arg(args)))
+        .args(args)
+        .current_dir(repo);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
+/// [`run_git_raw`] plus explicit environment overrides.
+///
+/// Exists for the two `GIT_EDITOR=true` sites (`git commit --no-edit` /
+/// `git rebase --continue` after a one-click conflict resolution): a Tauri
+/// subprocess has no controlling tty, so git's editor must be short-circuited
+/// or the command hangs forever. Expressing that as a runner parameter is what
+/// lets those sites stop constructing their own `Command`.
+pub(crate) async fn run_git_raw_env<S: AsRef<OsStr>>(
+    repo: &Path,
+    args: &[S],
+    envs: &[(&str, &str)],
+) -> Result<std::process::Output, String> {
+    raw_git_command(repo, args, envs)
+        .output()
+        .await
+        .map_err(|e| format!("git {} spawn failed: {}", first_arg(args), e))
+}
+
+/// The first argument, lossily, for error messages only. Matches the
+/// pre-generic `args.first().unwrap_or(&"")` shape.
+fn first_arg<S: AsRef<OsStr>>(args: &[S]) -> String {
+    args.first()
+        .map(|a| a.as_ref().to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The answer to "which branch, and is HEAD attached to it?".
+///
+/// `name` is always usable as the right-hand side of a
+/// `<remote>/<name>` ref — never the literal `"HEAD"`, never empty. When
+/// HEAD is detached (or the branch name is unreadable) `name` falls back to
+/// [`FALLBACK_BRANCH`] and `detached` records that the fallback happened for
+/// the detached reason.
+///
+/// Keeping both fields is the point. The old five inline normalisations were
+/// each correct AND each threw away the detached bit, so no surface could
+/// say "you are on a detached HEAD" — it could only say `Branch: main`,
+/// which is a true-ish statement about a repo the user cannot push, pull
+/// with tracking, or reason about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchState {
+    /// Branch to compare/pull against. Never `"HEAD"`, never empty.
+    pub name: String,
+    /// `true` when HEAD points at a commit rather than a branch.
+    pub detached: bool,
+}
+
+/// The branch every surface falls back to when HEAD names none.
+///
+/// `main` and not the remote's actual default: resolving the remote default
+/// costs a network round-trip on a path (`check_for_updates` at startup)
+/// that must stay fast and must work offline. [`remote_default_branch`]
+/// exists for callers that can afford to ask; this constant is what the
+/// offline/fast path uses, and it matches what every one of the five deleted
+/// inline copies used.
+pub(crate) const FALLBACK_BRANCH: &str = "main";
+
+/// Resolve [`BranchState`] for `repo`.
+///
+/// `Err` only when git itself could not be run (spawn failure/timeout) — a
+/// repo whose HEAD is unreadable for any other reason yields
+/// `Ok(BranchState { name: "main", detached: false })`, matching the
+/// pre-extraction behaviour of all five installer.rs sites (which returned
+/// `"main"` on a non-zero exit).
+///
+/// Note the asymmetry, which is intentional: `detached` is only ever `true`
+/// when git POSITIVELY reported the detached shape (`HEAD` or empty from
+/// `--abbrev-ref`). A git we could not run tells us nothing about
+/// attachment, so we do not claim it.
+pub(crate) async fn resolve_branch(repo: &Path) -> Result<BranchState, String> {
+    let raw = match run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Distinguish "git is broken/absent" (propagate) from "this repo's
+            // HEAD is unreadable" (fall back, as the five inline copies did).
+            // A spawn failure or timeout is the former; a non-zero exit —
+            // e.g. an unborn HEAD in a freshly `git init`ed repo — is the
+            // latter.
+            if e.contains("timed out") || e.contains("failed:") {
+                return Err(e);
+            }
+            return Ok(BranchState {
+                name: FALLBACK_BRANCH.to_string(),
+                detached: false,
+            });
+        }
+    };
+    Ok(branch_state_from_abbrev_ref(&raw))
+}
+
+/// The pure normaliser behind [`resolve_branch`]: `git rev-parse --abbrev-ref
+/// HEAD` output → [`BranchState`].
+///
+/// `--abbrev-ref` prints the literal `HEAD` for a detached HEAD. That is
+/// git's documented behaviour, not an error, which is exactly why an
+/// `unwrap_or_else(|_| "main")` on the Result never fired for it.
+///
+/// v0.2.93: split out so the SYNCHRONOUS cached-status surface
+/// (`self_update::cached_update_status_for`, which cannot await) applies the
+/// same rule instead of carrying a second copy of it.
+pub(crate) fn branch_state_from_abbrev_ref(raw: &str) -> BranchState {
+    let b = raw.trim();
+    if b.is_empty() || b == "HEAD" {
+        return BranchState {
+            name: FALLBACK_BRANCH.to_string(),
+            detached: true,
+        };
+    }
+    BranchState {
+        name: b.to_string(),
+        detached: false,
+    }
+}
+
+/// Count how many commits `HEAD` is BEHIND `<remote>/<branch>` —
+/// `git rev-list --count HEAD..<remote>/<branch>`. Requires a prior fetch.
+///
+/// Returns `Result`, and every caller must handle the `Err` arm explicitly.
+/// This signature is load-bearing: the incident this module exists to
+/// prevent was produced by `.unwrap_or(0)` on exactly this call, which made
+/// "git refused to answer" and "you are current" the same u32.
+pub(crate) async fn commits_behind(
+    repo: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<u32, String> {
+    let raw = run_git(
+        repo,
+        &["rev-list", "--count", &format!("HEAD..{remote}/{branch}")],
+    )
+    .await?;
+    raw.parse::<u32>()
+        .map_err(|e| format!("count parse failed (raw={raw:?}): {e}"))
+}
+
+/// Ask the REMOTE which branch its `HEAD` points at, via
+/// `git ls-remote --symref <remote> HEAD`.
+///
+/// Output shape (verified empirically):
+///
+/// ```text
+/// ref: refs/heads/main	HEAD
+/// 08897d00…	HEAD
+/// ```
+///
+/// Returns the short branch name (`main`). `Ok(None)` when the remote
+/// answered but advertised no symref (an old server, or a remote whose HEAD
+/// is unborn); `Err` when the remote could not be reached at all — the
+/// caller decides which of those two is acceptable for its surface.
+#[allow(dead_code)] // consumed by the reattach guard chain + future callers
+pub(crate) async fn remote_default_branch(
+    repo: &Path,
+    remote: &str,
+) -> Result<Option<String>, String> {
+    let out = run_git(repo, &["ls-remote", "--symref", remote, "HEAD"]).await?;
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("ref: ") {
+            // `refs/heads/main\tHEAD`
+            let refname = rest.split_whitespace().next().unwrap_or("");
+            if let Some(short) = refname.strip_prefix("refs/heads/") {
+                if !short.is_empty() {
+                    return Ok(Some(short.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The newest release tag ON THE REMOTE, by version order.
+///
+/// **This is not `git describe`.** `git describe --tags --abbrev=0` answers
+/// "what is the closest tag reachable FROM HEAD", which is a different
+/// question with a dangerously plausible answer: an install detached on
+/// `v0.2.88` gets told the latest source release is `v0.2.88`. Truthful, and
+/// the single line that most directly produced "everything reported healthy"
+/// during the five-week outage.
+///
+/// Implementation: `git ls-remote --tags --refs --sort=-v:refname <remote>`.
+/// `--refs` drops the `^{}` peeled duplicates.
+///
+/// v0.2.100 WP-01: only strict release tags are candidates — `v` + `X.Y.Z`
+/// per `vct_launcher_core::version` (owner ruling Q7) — and the newest is
+/// chosen by THAT comparator, not by taking git's first row. git's
+/// `-v:refname` ranks `v0.2.100-rc1` ABOVE `v0.2.100` (without a
+/// `versionsort.suffix` config) and accepts anything as a tag name, so a
+/// stray `v1.2`, `v0.2.100.1` or `-rc1` tag could have been reported as
+/// "the latest release". The sort flag is kept only as a cheap pre-order.
+///
+/// v0.2.102 NB-R5: `--sort` on `ls-remote` needs git ≥ 2.18 — an older git
+/// exits 129 with `error: unknown option \`sort'` on stderr. Because the
+/// flag is only a pre-order, on that exact error the command is re-run
+/// WITHOUT it and [`newest_release_tag`]'s client-side pass (the one
+/// version comparator) orders the rows. Any other failure propagates.
+///
+/// `Ok(None)` when the remote has no strict release tag. `Err` when the
+/// remote could not be reached — the caller renders "couldn't check",
+/// never its own tag.
+pub(crate) fn latest_remote_tag<'a>(
+    repo: &'a Path,
+    remote: &'a str,
+) -> impl std::future::Future<Output = Result<Option<String>, String>> + Send + 'a {
+    // Resolved at CALL time, not poll time ([`git_program`]'s documented
+    // pattern for callers that build commands inside a future): the NB-R5
+    // fallback below re-invokes git from within the future, and both
+    // attempts must resolve the same program.
+    let program = git_program();
+    async move {
+        let sorted = run_git_with(
+            &program,
+            repo,
+            &["ls-remote", "--tags", "--refs", "--sort=-v:refname", remote],
+        )
+        .await;
+        let out = match sorted {
+            Ok(out) => out,
+            Err(e) if e.contains("unknown option") => {
+                tracing::info!(
+                    "[git] ls-remote rejected --sort (git < 2.18); re-running \
+                     without it — ordering is client-side anyway"
+                );
+                run_git_with(&program, repo, &["ls-remote", "--tags", "--refs", remote]).await?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(newest_release_tag(&out))
+    }
+}
+
+/// The newest strict `vX.Y.Z` tag named in `git ls-remote --tags` output.
+///
+/// Pure (no git) so the filter and the ordering are testable on their own;
+/// [`latest_remote_tag`] is the only caller. A tag without the `v` prefix
+/// is not a release tag in this repository's convention and is skipped.
+pub(crate) fn newest_release_tag(ls_remote_output: &str) -> Option<String> {
+    use vct_launcher_core::version;
+    ls_remote_output
+        .lines()
+        // `<sha>\trefs/tags/<name>`
+        .filter_map(|line| line.split('\t').nth(1))
+        .filter_map(|refname| refname.trim().strip_prefix("refs/tags/"))
+        .filter(|tag| tag.starts_with('v') && version::is_strict(tag))
+        .max_by(|a, b| {
+            // Both already passed `is_strict`, so `cmp` cannot fail.
+            version::cmp(a, b).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(str::to_string)
+}
+
+/// `true` when the working tree has no modified/staged/untracked entries.
+///
+/// Used as a guard in front of the launcher's only path-less
+/// `git checkout <branch>` (the reattach affordance). Untracked files count:
+/// a checkout that would overwrite one aborts, and a guard that lets the
+/// user reach an abort has not guarded anything.
+pub(crate) async fn tree_is_clean(repo: &Path) -> Result<bool, String> {
+    let out = run_git(repo, &["status", "--porcelain"]).await?;
+    Ok(out.trim().is_empty())
+}
+
+/// `true` when `commit` is an ancestor of `other` —
+/// `git merge-base --is-ancestor <commit> <other>` (exit 0 = yes, 1 = no).
+///
+/// A non-zero-that-is-not-1 (bad ref, broken repo) comes back as `Err`, so
+/// "I could not tell" is never silently the same as "no".
+pub(crate) async fn is_ancestor(
+    repo: &Path,
+    commit: &str,
+    other: &str,
+) -> Result<bool, String> {
+    let output = tokio::time::timeout(
+        GIT_TIMEOUT,
+        git_command()
+            .args(["merge-base", "--is-ancestor", commit, other])
+            .current_dir(repo)
+            .output(),
+    )
+    .await
+    .map_err(|_| "git merge-base --is-ancestor timed out".to_string())?
+    .map_err(|e| format!("git merge-base --is-ancestor failed: {e}"))?;
+
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base --is-ancestor {commit} {other}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// TEST-ONLY fixture pin: guarantee `refs/remotes/<remote>/HEAD` does NOT
+/// exist in `repo`, on every git version.
+///
+/// ## The divergence this exists to kill
+///
+/// Two regression suites — this module's `detached_fixture` and
+/// `self_update`'s `detached_upstream_fixture` — build their local repo with
+/// `init` + `remote add` + `fetch` (never `clone`) specifically so that
+/// `<remote>/HEAD` is ABSENT, which is what made the field install's
+/// `HEAD..vco_upstream/HEAD` a `fatal:` rather than a number. Two tests assert
+/// exactly that failure reaches the caller:
+///
+/// * `commits_behind_errors_on_a_ref_that_does_not_exist`
+/// * `self_update::…::apply_rebuilds_everything_when_diff_unknown`
+///
+/// "`fetch` does not create a remote HEAD" stopped being true in git 2.48,
+/// which added `remote.<name>.followRemoteHEAD` with the default `create`.
+/// On git 2.43 (the maintainer's machine) both tests passed; on git 2.55
+/// (GitHub's `ubuntu-latest`, 2026-09) the fetch created the ref, the
+/// "missing" ref resolved, `rev-list` answered `2`, and both tests failed —
+/// green locally, red in CI, with nothing wrong in the production code.
+///
+/// So the fixture states the shape instead of inheriting it. Belt AND
+/// braces, because either half alone is a bet on a git version:
+///
+/// 1. `remote.<remote>.followRemoteHEAD=never` — stops a git ≥2.48 from
+///    (re)creating the ref on any LATER fetch a test body runs. Unknown
+///    config keys are inert on older gits, so this is a no-op there.
+/// 2. `remote set-head <remote> --delete` — removes a ref that an earlier
+///    fetch already created. Idempotent: exit 0 whether or not it exists,
+///    and it removes only the HEAD symref (`<remote>/main` survives —
+///    verified on 2.43 and pinned by
+///    `pin_absent_remote_head_defeats_a_modern_git_remote_head`).
+///
+/// Then it ASSERTS the postcondition. If a future git defeats both halves,
+/// the fixture fails loudly here rather than turning the two tests into
+/// silent tautologies (or another baffling CI-only red).
+///
+/// Call AFTER the fixture's last fetch.
+#[cfg(test)]
+pub(crate) fn pin_absent_remote_head(repo: &Path, remote: &str) {
+    let run = |args: &[&str]| -> std::process::Output {
+        std::process::Command::new("git")
+            .silent()
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} in {}: {e}", repo.display()))
+    };
+
+    let key = format!("remote.{remote}.followRemoteHEAD");
+    let set = run(&["config", &key, "never"]);
+    assert!(
+        set.status.success(),
+        "git config {key} never failed in {}: {}",
+        repo.display(),
+        String::from_utf8_lossy(&set.stderr).trim()
+    );
+
+    let head_ref = format!("refs/remotes/{remote}/HEAD");
+    let ref_names = |out: std::process::Output| -> Vec<String> {
+        let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        v.sort();
+        v
+    };
+    let list = |run: &dyn Fn(&[&str]) -> std::process::Output| {
+        ref_names(run(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/remotes/{remote}"),
+        ]))
+    };
+    let before = list(&run);
+
+    // Not asserted on: `--delete` is a no-op when the ref is absent, which is
+    // the common case on git <2.48. The postconditions below are the
+    // assertions that matter.
+    let _ = run(&["remote", "set-head", remote, "--delete"]);
+
+    let after = list(&run);
+    assert!(
+        !after.contains(&head_ref),
+        "fixture pin failed: {head_ref} still exists in {}. This git ({}) \
+         resists both followRemoteHEAD=never and `remote set-head --delete`; \
+         the detached-HEAD regression tests assume that ref is ABSENT and are \
+         meaningless until the pin is taught the new behaviour.",
+        repo.display(),
+        String::from_utf8_lossy(&run(&["--version"]).stdout).trim()
+    );
+
+    // …and the pin must have taken NOTHING ELSE with it. `set-head --delete`
+    // removes the HEAD symref, not what it points at; a git that ever
+    // dereferenced instead would silently gut the fixture's branch refs and
+    // every test using it would fail somewhere far away from the cause.
+    let expected: Vec<String> = before.into_iter().filter(|r| *r != head_ref).collect();
+    assert_eq!(
+        after,
+        expected,
+        "fixture pin removed more than {head_ref} in {}",
+        repo.display()
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::process::{Command as StdCommand, Stdio};
+
+    macro_rules! skip_if_no_git {
+        () => {
+            if StdCommand::new("git")
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| !s.success())
+                .unwrap_or(true)
+            {
+                eprintln!("skipping: git not on PATH");
+                return;
+            }
+        };
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let st = StdCommand::new("git")
+            .args(args)
+            .current_dir(cwd)
+            // Keep the developer's ~/.gitconfig (hooks, signing, templates,
+            // init.defaultBranch) out of the fixture entirely.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(st.success(), "git {args:?} failed in {}", cwd.display());
+    }
+
+    /// Build the fixture that reproduces the FIELD shape, not a convenient
+    /// one. Two properties are load-bearing and easy to get wrong:
+    ///
+    /// 1. `refs/remotes/vco_upstream/HEAD` does NOT exist, so
+    ///    `HEAD..vco_upstream/HEAD` is a `fatal:` — the shape that turned
+    ///    into `.unwrap_or(0)`'s "up to date". The repo is therefore built
+    ///    with `init` + `remote add` + `fetch`, NEVER `clone` (clone always
+    ///    creates that ref; the production `ensure_upstream_remote`, which
+    ///    only ever runs `remote add` / `set-url`, does not) — AND the
+    ///    absence is then PINNED by [`pin_absent_remote_head`], because
+    ///    `fetch` alone stopped guaranteeing it in git 2.48
+    ///    (`remote.<name>.followRemoteHEAD` defaults to `create`). Without
+    ///    the pin this fixture is green on an old git and red on a new one,
+    ///    which is exactly what it did in CI on 2026-09-07;
+    /// 2. HEAD is left DETACHED on the first tag with the remote two commits
+    ///    ahead — the exact state the field install sat in.
+    ///
+    /// Returns (tempdir, local repo path, remote name).
+    pub(super) fn detached_fixture() -> (tempfile::TempDir, PathBuf, &'static str) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let local = root.join("local");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+
+        git(&root, &["init", "--bare", "--initial-branch=main", "-q", "remote.git"]);
+
+        git(&seed, &["init", "--initial-branch=main", "-q"]);
+        std::fs::write(seed.join("a.txt"), "a\n").unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "-qm", "c1"]);
+        git(&seed, &["tag", "v0.0.1"]);
+        git(&seed, &["remote", "add", "vco_upstream", remote.to_str().unwrap()]);
+        git(&seed, &["push", "-q", "vco_upstream", "main", "--tags"]);
+
+        // Local: init + remote add + fetch. NOT clone. (See doc comment.)
+        git(&local, &["init", "--initial-branch=main", "-q"]);
+        git(&local, &["remote", "add", "vco_upstream", remote.to_str().unwrap()]);
+        git(&local, &["fetch", "-q", "vco_upstream"]);
+        git(&local, &["checkout", "-q", "-B", "main", "vco_upstream/main"]);
+
+        // Upstream moves two commits ahead, adding a Rust file and a
+        // frontend file so rebuild-gating tests have real inputs, plus a
+        // newer tag so "latest release" has something to be wrong about.
+        std::fs::create_dir_all(seed.join("launcher/src-tauri/src")).unwrap();
+        std::fs::write(seed.join("launcher/src-tauri/src/main.rs"), "fn main() {}\n").unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "-qm", "c2"]);
+        std::fs::create_dir_all(seed.join("launcher/src")).unwrap();
+        std::fs::write(seed.join("launcher/src/app.ts"), "export {};\n").unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "-qm", "c3"]);
+        git(&seed, &["tag", "v0.0.2"]);
+        git(&seed, &["push", "-q", "vco_upstream", "main", "--tags"]);
+
+        git(&local, &["fetch", "-q", "vco_upstream", "--tags"]);
+        git(&local, &["checkout", "-q", "--detach", "v0.0.1"]);
+
+        // Property 1, stated rather than inherited. MUST come after the last
+        // fetch: on git >= 2.48 that fetch creates the very ref this pin
+        // removes.
+        pin_absent_remote_head(&local, "vco_upstream");
+
+        (tmp, local, "vco_upstream")
+    }
+
+    /// THE regression test for the field incident's root cause. Against the
+    /// pre-fix `current_branch` this asserts the opposite of what shipped:
+    /// that surface returned the literal `"HEAD"`, which then produced a ref
+    /// that does not exist.
+    #[tokio::test]
+    async fn resolve_branch_detached_head_normalises_and_flags() {
+        skip_if_no_git!();
+        let (_tmp, repo, _remote) = detached_fixture();
+
+        // Precondition: the fixture really is in the broken shape. If this
+        // ever fails the test below is proving nothing.
+        let raw = run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .expect("rev-parse");
+        assert_eq!(raw, "HEAD", "fixture is not in a detached HEAD");
+
+        let st = resolve_branch(&repo).await.expect("resolve_branch");
+        assert_eq!(st.name, "main", "detached HEAD must normalise to main");
+        assert!(st.detached, "detached HEAD must be FLAGGED, not just normalised");
+    }
+
+    /// The pure rule the sync cached-status surface shares (v0.2.93).
+    #[test]
+    fn branch_state_from_abbrev_ref_applies_the_one_normalisation_rule() {
+        let d = branch_state_from_abbrev_ref("HEAD\n");
+        assert_eq!(d.name, FALLBACK_BRANCH);
+        assert!(d.detached);
+        let e = branch_state_from_abbrev_ref("   ");
+        assert_eq!(e.name, FALLBACK_BRANCH);
+        assert!(e.detached);
+        let a = branch_state_from_abbrev_ref("feature/x\n");
+        assert_eq!(a.name, "feature/x");
+        assert!(!a.detached);
+    }
+
+    #[tokio::test]
+    async fn resolve_branch_attached_reports_the_real_branch_not_detached() {
+        skip_if_no_git!();
+        let (_tmp, repo, _remote) = detached_fixture();
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let st = resolve_branch(&repo).await.expect("resolve_branch");
+        assert_eq!(st.name, "main");
+        assert!(!st.detached, "an attached HEAD must not be flagged detached");
+    }
+
+    #[tokio::test]
+    async fn resolve_branch_reports_a_non_main_branch_verbatim() {
+        skip_if_no_git!();
+        let (_tmp, repo, _remote) = detached_fixture();
+        git(&repo, &["checkout", "-q", "-b", "feature/x"]);
+
+        let st = resolve_branch(&repo).await.expect("resolve_branch");
+        assert_eq!(
+            st.name, "feature/x",
+            "a real branch must survive the normaliser untouched"
+        );
+        assert!(!st.detached);
+    }
+
+    /// The missing-ref failure has to reach the caller as `Err`. This is the
+    /// exact call whose `.unwrap_or(0)` produced the outage.
+    #[tokio::test]
+    async fn commits_behind_errors_on_a_ref_that_does_not_exist() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+
+        // Precondition: `<remote>/HEAD` really is absent. The fixture PINS
+        // that (see `pin_absent_remote_head`); a git >= 2.48 would otherwise
+        // have created it on fetch, `rev-list` would answer `2`, and this
+        // test would fail while nothing was wrong with the code — which is
+        // precisely what CI did on 2026-09-07.
+        let probe = run_git(&repo, &["show-ref", "--verify", &format!("refs/remotes/{remote}/HEAD")])
+            .await;
+        assert!(
+            probe.is_err(),
+            "fixture precondition: refs/remotes/{remote}/HEAD must be ABSENT, \
+             else the call below is not asking for a missing ref at all"
+        );
+
+        // Asking for it is what self_update.rs did in a detached HEAD.
+        let err = commits_behind(&repo, remote, "HEAD")
+            .await
+            .expect_err("HEAD..<remote>/HEAD must be an error, not a count");
+        assert!(
+            err.contains("rev-list"),
+            "the error must name the failing git command, got: {err}"
+        );
+    }
+
+    /// Red-proof for [`pin_absent_remote_head`], and the ONE place the CI
+    /// divergence is reproducible on ANY git version.
+    ///
+    /// `remote set-head <remote> -a` creates `refs/remotes/<remote>/HEAD`
+    /// by hand — byte-for-byte the state a git >= 2.48 `fetch` leaves behind
+    /// under its `followRemoteHEAD=create` default. The first half asserts
+    /// the CI failure verbatim (a COUNT, not an error); the second asserts
+    /// the pin restores the field shape and leaves the branch ref intact.
+    /// Delete the `pin_absent_remote_head` call from either fixture and this
+    /// still passes — but delete the pin's `--delete` leg and this goes red
+    /// on every machine, which is the point.
+    #[tokio::test]
+    async fn pin_absent_remote_head_defeats_a_modern_git_remote_head() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+
+        git(&repo, &["remote", "set-head", remote, "-a"]);
+
+        // THE CI FAILURE, reproduced: the "missing" ref resolves and the
+        // count comes back as if everything were fine.
+        let n = commits_behind(&repo, remote, "HEAD")
+            .await
+            .expect("with <remote>/HEAD present this resolves — that IS the divergence");
+        assert_eq!(n, 2, "and it answers with a plausible-looking count");
+
+        pin_absent_remote_head(&repo, remote);
+
+        commits_behind(&repo, remote, "HEAD")
+            .await
+            .expect_err("after the pin the field shape is back: a missing ref, an Err");
+
+        // The pin must remove the HEAD symref ONLY.
+        let n = commits_behind(&repo, remote, "main")
+            .await
+            .expect("the branch ref must survive the pin");
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn commits_behind_counts_correctly_against_the_resolved_branch() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+        let st = resolve_branch(&repo).await.expect("resolve_branch");
+
+        let n = commits_behind(&repo, remote, &st.name)
+            .await
+            .expect("count via the RESOLVED branch must succeed even when detached");
+        assert_eq!(n, 2, "fixture puts upstream exactly two commits ahead");
+    }
+
+    #[tokio::test]
+    async fn latest_remote_tag_reads_the_remote_not_head() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+
+        // What the OLD implementation would have said: HEAD is detached on
+        // v0.0.1, so `describe` returns the install's own tag.
+        let describe = run_git(&repo, &["describe", "--tags", "--abbrev=0"])
+            .await
+            .expect("describe");
+        assert_eq!(describe, "v0.0.1", "fixture precondition");
+
+        let tag = latest_remote_tag(&repo, remote)
+            .await
+            .expect("ls-remote")
+            .expect("remote has tags");
+        assert_eq!(
+            tag, "v0.0.2",
+            "the newest REMOTE tag, not the newest tag reachable from HEAD"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_remote_tag_sorts_by_version_not_lexicographically() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+        // v0.0.10 sorts BELOW v0.0.2 lexicographically and ABOVE it by
+        // version. Push it and require the version answer.
+        let seed = repo.parent().unwrap().join("seed");
+        git(&seed, &["tag", "v0.0.10"]);
+        git(&seed, &["push", "-q", "vco_upstream", "--tags"]);
+
+        let tag = latest_remote_tag(&repo, remote)
+            .await
+            .expect("ls-remote")
+            .expect("tags");
+        assert_eq!(tag, "v0.0.10", "must order by version, not lexicographically");
+    }
+
+    /// v0.2.100 WP-01: the release this cycle exists for, through REAL git:
+    /// a bare remote carrying v0.2.99 + v0.2.100 (+ v0.2.9/v0.2.10 and
+    /// v0.3.11/v0.10.0) must report v0.2.100 over v0.2.99 in its minor line
+    /// and v0.10.0 overall.
+    #[tokio::test]
+    async fn latest_remote_tag_ranks_0_2_100_above_0_2_99() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+        let seed = repo.parent().unwrap().join("seed");
+        for t in ["v0.2.99", "v0.2.100", "v0.2.9", "v0.2.10"] {
+            git(&seed, &["tag", t]);
+        }
+        git(&seed, &["push", "-q", "vco_upstream", "--tags"]);
+        let tag = latest_remote_tag(&repo, remote).await.expect("ls-remote").expect("tags");
+        assert_eq!(tag, "v0.2.100", "0.2.100 > 0.2.99 > 0.2.10 > 0.2.9");
+
+        for t in ["v0.3.11", "v0.10.0"] {
+            git(&seed, &["tag", t]);
+        }
+        git(&seed, &["push", "-q", "vco_upstream", "--tags"]);
+        let tag = latest_remote_tag(&repo, remote).await.expect("ls-remote").expect("tags");
+        assert_eq!(tag, "v0.10.0", "0.10.0 > 0.3.11 > 0.2.100");
+    }
+
+    /// v0.2.100 WP-01: tags that are not strict `vX.Y.Z` never win — even
+    /// when git's own version sort puts them first (`-rc1` sorts ABOVE its
+    /// release under `-v:refname`).
+    #[tokio::test]
+    async fn latest_remote_tag_ignores_non_x_y_z_tags() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+        let seed = repo.parent().unwrap().join("seed");
+        for t in ["v0.2.100", "v0.2.100-rc1", "v1.2", "v0.2.100.1", "v9.9.9x", "9.9.9"] {
+            git(&seed, &["tag", t]);
+        }
+        git(&seed, &["push", "-q", "vco_upstream", "--tags"]);
+        let tag = latest_remote_tag(&repo, remote).await.expect("ls-remote").expect("tags");
+        assert_eq!(tag, "v0.2.100");
+    }
+
+    #[test]
+    fn newest_release_tag_is_none_when_no_tag_is_strict() {
+        let out = "abc\trefs/tags/v1.2\ndef\trefs/tags/v0.2.100-rc1\n";
+        assert_eq!(newest_release_tag(out), None);
+    }
+
+    // ── v0.2.102 NB-R5: `--sort` needs git ≥ 2.18 ──────────────────────
+    //
+    // A fake git on the thread-local lookup PATH (paths::with_lookup_path,
+    // never the process PATH — v0.2.97 R6). Sibling of upstream_fetch's
+    // `fake_git`; test-local on purpose: its recording contract differs
+    // (arg-per-line for call-order assertions).
+
+    /// Plant a fake `git` in a fresh dir. `body` runs AFTER the call is
+    /// recorded. Tags are emitted in ASCENDING order so a missing
+    /// client-side sort would answer v0.0.2, not v0.0.10.
+    #[cfg(unix)]
+    fn fake_git_recording(dir: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let calls = dir.join("calls");
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\n{}\n",
+            calls.display(),
+            body
+        );
+        let git = dir.join("git");
+        std::fs::write(&git, script).unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The remote's rows arrive in ascending version order (and git never
+    /// sorted them): the fallback re-run without `--sort` must still answer
+    /// the NEWEST strict tag, via the one client-side comparator. The fake
+    /// rejects `--sort` exactly the way a pre-2.18 git does (exit 129 +
+    /// "error: unknown option" on stderr). Pre-fix this was a plain Err.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn latest_remote_tag_falls_back_when_git_rejects_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_git_recording(
+            dir.path(),
+            // In the shell body, "\\`" inside double quotes is a LITERAL
+            // backtick — the exact shape git's parser prints.
+            "for a in \"$@\"; do [ \"$a\" = \"--sort=-v:refname\" ] && { printf '%s\\n' \"error: unknown option \\`sort'\" >&2; exit 129; }; done; \
+             printf 'sha1\\trefs/tags/v0.0.2\\nsha2\\trefs/tags/v0.0.10\\n'",
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let fut = vct_launcher_core::paths::with_lookup_path(
+            Some(dir.path().as_os_str()),
+            || latest_remote_tag(repo.path(), "vco_upstream"),
+        );
+        let tag = fut.await.expect("the --sort fallback must succeed").expect("tags present");
+        assert_eq!(tag, "v0.0.10", "client-side ordering by the version comparator");
+        let calls: Vec<String> = std::fs::read_to_string(dir.path().join("calls"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            calls.iter().filter(|l| *l == "ls-remote").count(),
+            2,
+            "exactly one retry without --sort, got args log: {calls:?}"
+        );
+    }
+
+    /// LEAVE-ALONE: a git that accepts `--sort` is called exactly ONCE, with
+    /// the flag — the fallback must not become the primary path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn latest_remote_tag_calls_a_sort_aware_git_once() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_git_recording(
+            dir.path(),
+            "printf 'sha1\\trefs/tags/v0.0.2\\nsha2\\trefs/tags/v0.0.10\\n'",
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let fut = vct_launcher_core::paths::with_lookup_path(
+            Some(dir.path().as_os_str()),
+            || latest_remote_tag(repo.path(), "vco_upstream"),
+        );
+        let tag = fut.await.expect("ls-remote").expect("tags present");
+        assert_eq!(tag, "v0.0.10");
+        let calls: Vec<String> = std::fs::read_to_string(dir.path().join("calls"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            calls.iter().filter(|l| *l == "ls-remote").count(),
+            1,
+            "a sort-aware git must not be re-invoked, got args log: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|l| l == "--sort=-v:refname"),
+            "the single call must carry --sort, got args log: {calls:?}"
+        );
+    }
+
+    /// A non-`--sort` failure (here: a garbage remote ref) is NOT retried —
+    /// the fallback matches the "unknown option" stderr only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn latest_remote_tag_does_not_fallback_on_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_git_recording(
+            dir.path(),
+            "echo 'fatal: could not read from remote repository' >&2; exit 128",
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let fut = vct_launcher_core::paths::with_lookup_path(
+            Some(dir.path().as_os_str()),
+            || latest_remote_tag(repo.path(), "vco_upstream"),
+        );
+        let err = fut.await.expect_err("a genuine failure must stay an error");
+        assert!(err.contains("could not read from remote repository"), "got: {err}");
+        let calls: Vec<String> = std::fs::read_to_string(dir.path().join("calls"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            calls.iter().filter(|l| *l == "ls-remote").count(),
+            1,
+            "no retry on an unrelated failure, got args log: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_remote_tag_is_none_when_the_remote_has_no_tags() {
+        skip_if_no_git!();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bare = root.join("bare.git");
+        let local = root.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        git(root, &["init", "--bare", "--initial-branch=main", "-q", "bare.git"]);
+        git(&local, &["init", "--initial-branch=main", "-q"]);
+        git(&local, &["remote", "add", "up", bare.to_str().unwrap()]);
+
+        assert_eq!(
+            latest_remote_tag(&local, "up").await.expect("ls-remote"),
+            None,
+            "a tagless remote is Ok(None), not an error and not a fabricated tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_default_branch_reads_the_symref() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+        assert_eq!(
+            remote_default_branch(&repo, remote).await.expect("symref"),
+            Some("main".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn is_ancestor_distinguishes_yes_no_and_broken() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+
+        assert!(
+            is_ancestor(&repo, "HEAD", &format!("{remote}/main"))
+                .await
+                .expect("ancestor probe"),
+            "the detached tag IS an ancestor of the upstream tip"
+        );
+
+        // An orphan commit shares no history with upstream.
+        git(&repo, &["checkout", "-q", "--orphan", "orphanwork"]);
+        std::fs::write(repo.join("z.txt"), "z\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "orphan"]);
+        assert!(
+            !is_ancestor(&repo, "HEAD", &format!("{remote}/main"))
+                .await
+                .expect("ancestor probe"),
+            "an orphan commit is NOT an ancestor"
+        );
+
+        // A ref that does not resolve is neither yes nor no.
+        assert!(
+            is_ancestor(&repo, "HEAD", "no_such_remote/main")
+                .await
+                .is_err(),
+            "an unresolvable ref must be Err, never a silent `false`"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_is_clean_reflects_tracked_and_untracked_state() {
+        skip_if_no_git!();
+        let (_tmp, repo, _remote) = detached_fixture();
+        assert!(tree_is_clean(&repo).await.expect("status"));
+
+        std::fs::write(repo.join("a.txt"), "modified\n").unwrap();
+        assert!(!tree_is_clean(&repo).await.expect("status"));
+
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        assert!(tree_is_clean(&repo).await.expect("status"));
+
+        std::fs::write(repo.join("brand-new.txt"), "x\n").unwrap();
+        assert!(
+            !tree_is_clean(&repo).await.expect("status"),
+            "untracked files count — a checkout that would clobber one aborts"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_git_surfaces_a_non_zero_exit_as_err_with_stderr() {
+        skip_if_no_git!();
+        let (_tmp, repo, _remote) = detached_fixture();
+        let err = run_git(&repo, &["rev-parse", "definitely-not-a-ref"])
+            .await
+            .expect_err("bad ref must be Err");
+        assert!(err.starts_with("git rev-parse"), "got: {err}");
+    }
+
+    // ── v0.2.100 WP-05: kill_on_drop wiring + exit-status evidence ──────
+
+    /// The wiring half of "a timed-out git child is killed", on EVERY OS
+    /// (Windows included — the end-to-end orphan test in `self_update` is
+    /// POSIX-only). Network verbs and `run_git` are `kill_on_drop`; a raw
+    /// mutating verb is NOT (killing a half-done `commit`/`rebase` is worse
+    /// than letting it finish).
+    #[test]
+    fn network_commands_are_kill_on_drop() {
+        let git = git_program();
+        assert!(git_network_command(&git).get_kill_on_drop());
+        assert!(
+            run_git_command_with(&git_program(), Path::new("."), &["rev-parse", "HEAD"])
+                .get_kill_on_drop()
+        );
+        for verb in NETWORK_VERBS {
+            assert!(
+                raw_git_command(Path::new("."), &[*verb, "x"], &[]).get_kill_on_drop(),
+                "raw `git {verb}` must be kill_on_drop"
+            );
+        }
+        for verb in ["commit", "rebase", "merge", "checkout", "add"] {
+            assert!(
+                !raw_git_command(Path::new("."), &[verb], &[]).get_kill_on_drop(),
+                "raw `git {verb}` mutates the tree and must NOT be killed on drop"
+            );
+            assert!(!is_network_verb(verb));
+        }
+        assert!(!git_command().get_kill_on_drop(), "the plain builder stays opt-in");
+    }
+
+    /// I-06 class, `run_git` half: a non-zero exit with EMPTY stderr still
+    /// carries evidence — the exit status. Pre-fix the message was
+    /// `"git <args>: "` and nothing else.
+    #[tokio::test]
+    async fn run_git_error_carries_the_exit_status() {
+        skip_if_no_git!();
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        // `git rev-parse --verify --quiet <bad>` exits 1 and prints NOTHING.
+        let err = run_git(tmp.path(), &["rev-parse", "--verify", "--quiet", "nope"])
+            .await
+            .expect_err("bad ref must be Err");
+        // `ExitStatus`'s Display: `exit status: 1` on Unix, `exit code: 1` on
+        // Windows.
+        let want = if cfg!(windows) { "exit code: 1" } else { "exit status: 1" };
+        assert!(err.contains(want), "no exit status in: {err}");
+    }
+}

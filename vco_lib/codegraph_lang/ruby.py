@@ -48,6 +48,7 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_definitions, note_path
 from vco_lib.codegraph_lang._shared import (
     _extract_external_calls,
     blank_block_comments_preserving_lines,
@@ -169,15 +170,24 @@ def extract_ruby_file(
     # `initialize` / `deposit` / `default` were unreachable in the graph. The
     # writer's occurrence disambiguator keys on `(kind, identity_key)` and
     # already covers KIND_CLASS, so the second row lands as `Account#2`.
-    class_decls: List[Tuple[str, int, int]] = []
-    for m in _RUBY_CLASS_RE.finditer(content_clean):
-        name = m.group(1).split('::')[-1]  # unqualified name
-        start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = extract_end_keyword_block(
-            source_lines, start_line, language="ruby",
-            max_lookahead=_RUBY_CLASS_LOOKAHEAD,
-        )
-        class_decls.append((name, start_line, end_line))
+    # Definitions: tree-sitter first (v0.2.102), regex fallback. Records:
+    #   class_decls (name, start_line, end_line).
+    defs = extract_definitions("ruby", content)
+    note_path("ruby", "tree-sitter" if defs is not None else "regex")
+    if defs is not None:
+        class_decls: List[Tuple[str, int, int]] = [
+            (c.name, c.start_line, c.end_line) for c in defs.classes
+        ]
+    else:
+        class_decls = []
+        for m in _RUBY_CLASS_RE.finditer(content_clean):
+            name = m.group(1).split('::')[-1]  # unqualified name
+            start_line = content_clean[:m.start()].count('\n') + 1
+            end_line = extract_end_keyword_block(
+                source_lines, start_line, language="ruby",
+                max_lookahead=_RUBY_CLASS_LOOKAHEAD,
+            )
+            class_decls.append((name, start_line, end_line))
 
     #: Unique class names in source order — what the module summary lists, and
     #: what `_ruby_methods_for_class` is called once per. Reopening a class
@@ -247,8 +257,9 @@ def extract_ruby_file(
         # Ruby. Computed once per NAME (a reopened class's two rows describe
         # one runtime class and share its method set, as C# partials do).
         if cname not in _methods_by_name:
-            _methods_by_name[cname] = _ruby_methods_for_class(
-                content_clean, cname, source_lines
+            _methods_by_name[cname] = (
+                defs.methods_of(cname) if defs is not None
+                else _ruby_methods_for_class(content_clean, cname, source_lines)
             )
         methods = _methods_by_name[cname]
         signature = f"class {cname}"
@@ -266,16 +277,26 @@ def extract_ruby_file(
         ))
         stats['classes'] += 1
 
-    for m in func_pattern.finditer(content_clean):
-        fname = m.group(1)
-        args_str = m.group(2) or ''
-        start_line = content_clean[:m.start()].count('\n') + 1
-        # v0.2.92 WP-5b: the `end`-keyword scanner, for the same reason as the
-        # class loop above — and it also answers the Ruby-3.0 endless method
-        # (`def size = @n`), which opens no block and is one line long.
-        end_line = extract_end_keyword_block(source_lines, start_line, language="ruby")
+    # (name, args, start_line, end_line, enclosing) from either path —
+    # tree-sitter members carry their lexical class/module container.
+    fn_records: List[Tuple[str, str, int, int, str]] = []
+    if defs is not None:
+        fn_records = [
+            (f.name, f.params, f.start_line, f.end_line, f.container or file_path.stem)
+            for f in defs.functions
+        ]
+    else:
+        for m in func_pattern.finditer(content_clean):
+            fname = m.group(1)
+            args_str = m.group(2) or ''
+            start_line = content_clean[:m.start()].count('\n') + 1
+            # v0.2.92 WP-5b: the `end`-keyword scanner (also answers the
+            # Ruby-3.0 endless method, which opens no block).
+            end_line = extract_end_keyword_block(source_lines, start_line, language="ruby")
+            fn_records.append((fname, args_str, start_line, end_line, _enclosing_for(start_line)))
+
+    for fname, args_str, start_line, end_line, enclosing in fn_records:
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
-        enclosing = _enclosing_for(start_line)
         full_name = f"{enclosing}.{fname}"
         signature = f"def {fname}({args_str})"
         entities.append(CodeEntity(

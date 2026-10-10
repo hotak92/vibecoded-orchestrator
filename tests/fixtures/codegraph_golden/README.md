@@ -34,7 +34,26 @@ before and across the P2f `CodeEntity` IR refactor.
 
 ## Snapshots
 
-`expected/*.json` is one normalized snapshot per code collection
+Two snapshot sets, one per DEFINITIONS backend (v0.2.102 W6-E):
+
+* `expected/*.json` — the REGEX fallback (what a project gets without the
+  `codegraph-ts` extra). The "(regex)" labels in the table above describe
+  this set; it was not changed by the tree-sitter work.
+* `expected_treesitter/*.json` — the shipped default, the tree-sitter
+  definitions layer (`vco_lib/codegraph_defs.py`). Reviewed diff against the
+  regex set at creation: TS `interface Named` and `class User implements
+  Named` gain rows (the regex class pattern refused `implements`), TS
+  `identity` (a return-type-annotated arrow) gains a row, the C++ out-of-line
+  constructor `Circle::Circle` gains a row and joins `Circle`'s methods, the
+  Rust trait `Resettable` lists its `reset`, Ruby `Reporting`'s methods no
+  longer claim the nested `Summary#render`, and three one-line arrows /
+  reactive declarations (`client.doubler`, `Counter.double`,
+  `Counter.doubled`) end on their own line instead of a brace scan's runaway.
+  Proto and PowerShell are identical in both sets (no grammar).
+
+`test_codegraph_golden.py` checks each set with its backend forced (the
+tree-sitter check skips where the extra is absent). Each is one normalized
+snapshot per code collection
 (`CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction`).
 Each is the analyzer's stored output, normalized (sorted by
 `(path, full_name)`, volatile fields stripped, `content_hash` KEPT). They are
@@ -109,9 +128,12 @@ Read this before adding a row that "should" be here and concluding the
 extractor regressed. Each of these is a stated limitation of the regex
 extractors, exercised by a fixture that deliberately contains the shape:
 
-* **C++ out-of-line CONSTRUCTORS.** `geometry.cpp:35` is
-  `shapes::Circle::Circle(double radius) : radius_(radius) {}` — it produces
-  no `CodeFunction` row, because `method_pattern`'s `\)\s*(?:const)?…\{` tail
+* **C++ out-of-line CONSTRUCTORS — regex fallback only.** The tree-sitter
+  definitions layer (v0.2.102, the shipped default) captures this shape like
+  any other definition; the gap below applies to the regex fallback.
+  `geometry.cpp:35` is
+  `shapes::Circle::Circle(double radius) : radius_(radius) {}` — on the regex
+  path it produces no `CodeFunction` row, because `method_pattern`'s `\)\s*(?:const)?…\{` tail
   is broken by the member-initialiser list. It is an out-of-line MEMBER
   rather than a free function, so v0.2.92 WP-5c's free-function capture
   deliberately does not reach it either: that pattern refuses every
@@ -125,7 +147,11 @@ extractors, exercised by a fixture that deliberately contains the shape:
   defects: the failure mode WP-5b declined the free-function capture over,
   and the one R25 made the acceptance bar, is a SPURIOUS row. A junk row is
   worse than the honest gap it replaces; a missing row is merely the gap
-  continuing. Measured against the adversarial probe at v0.2.92 WP-5c:
+  continuing. Measured against the adversarial probe at v0.2.92 WP-5c (all
+  REGEX-fallback gaps: the tree-sitter path, measured at v0.2.102, captures
+  every shape below with its real name and range — operators as
+  `operator+` / `operator()`, destructors as `~Widget`, a specialization
+  under its template's name):
   - a **default argument containing a call** (`int f(int x, int y = g()) {`) —
     the argument group is `[^)]*` and cannot cross the inner `)`. That bound
     is load-bearing: it is what stops a match sweeping across statements.

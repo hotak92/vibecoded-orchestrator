@@ -31,6 +31,7 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_definitions, note_path
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
@@ -270,43 +271,17 @@ def _js_methods_for_class(
     return methods
 
 
-def extract_js_file(
-    source_text: str, file_path: Path, repo_root: Path, helpers: Any,
-) -> FileExtraction:
-    """Pure producer: parse a JS/TS file, RETURN a :class:`FileExtraction`.
-
-    Extracts imports, functions, classes, Fastify route definitions, and
-    external HTTP calls (fetch). Handles both .js/.mjs and .ts/.tsx files.
+def _regex_js_definitions(
+    content_clean: str, source_lines: List[str],
+) -> Tuple[List[str], list, List[str], list]:
+    """REGEX definitions discovery — the FALLBACK when the tree-sitter
+    grammar cannot load (``vco_lib.codegraph_defs``). Returns
+    ``(class_names, class_decls, all_func_names, func_matches)`` in the
+    record shapes :func:`extract_js_file` stores (class:
+    ``(name, start_line, base, end_line, keyword, methods)``; function:
+    ``(name, start_line, is_async, end_line)``). Behaviour is the pre-v0.2.102
+    regex extractor's, unchanged (pinned by the golden regex snapshots).
     """
-    content = source_text
-    source_lines = content.split('\n')
-    loc = len([line for line in source_lines
-               if line.strip() and not line.strip().startswith('//')
-               and not line.strip().startswith('*')])
-    file_hash = hashlib.sha256(content.encode()).hexdigest()
-    relative_path = file_path.relative_to(repo_root).as_posix()
-
-    # Determine language label from extension
-    suffix = file_path.suffix.lower()
-    if suffix in ('.ts', '.tsx'):
-        language = "TypeScript"
-    else:
-        language = "JavaScript"
-
-    # Strip single-line and multi-line comments for cleaner pattern matching
-    content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
-    content_clean = blank_block_comments_preserving_lines(content_clean)
-
-    # --- Imports ---
-    imports: List[str] = []
-    # ES module imports: import { x } from './y' / import x from './y' / import './y'
-    for m in re.finditer(r"""import\s+(?:(?:\{[^}]*\}|[\w*]+(?:\s+as\s+\w+)?)\s+from\s+)?['"]([^'"]+)['"]""", content):
-        imports.append(m.group(1))
-    # CommonJS require: require('./y') / require('y')
-    for m in re.finditer(r"""require\s*\(\s*['"]([^'"]+)['"]\s*\)""", content):
-        imports.append(m.group(1))
-
-    # --- Classes ---
     class_names: List[str] = []
     class_pattern = re.compile(
         r'(?:export\s+(?:default\s+)?)?class\s+([\w]+)\s*(?:extends\s+([\w.]+)\s*)?{',
@@ -357,6 +332,76 @@ def extract_js_file(
         is_async = m.group(2) is not None
         func_matches.append((fname, start_line, is_async))
         all_func_names.append(fname)
+
+    classes_out = []
+    for cname, start_line, base in class_decls:
+        end_line = _extract_balanced_block(source_lines, start_line, language="javascript")  # V52-O.11.E (was: start_line + 80)
+        # V52-O.11.F.2-JS (v0.2.52): methods scoped to this class's brace-balanced body.
+        methods = _js_methods_for_class(content_clean, cname, source_lines)
+        classes_out.append((cname, start_line, base, end_line, "class", methods))
+    funcs_out = []
+    for fname, start_line, is_async in func_matches:
+        end_line = _extract_balanced_block(source_lines, start_line, language="javascript")  # V52-O.11.E (was: start_line + 40)
+        funcs_out.append((fname, start_line, is_async, end_line))
+    return class_names, classes_out, all_func_names, funcs_out
+
+
+def extract_js_file(
+    source_text: str, file_path: Path, repo_root: Path, helpers: Any,
+) -> FileExtraction:
+    """Pure producer: parse a JS/TS file, RETURN a :class:`FileExtraction`.
+
+    Extracts imports, functions, classes, Fastify route definitions, and
+    external HTTP calls (fetch). Handles both .js/.mjs and .ts/.tsx files.
+    """
+    content = source_text
+    source_lines = content.split('\n')
+    loc = len([line for line in source_lines
+               if line.strip() and not line.strip().startswith('//')
+               and not line.strip().startswith('*')])
+    file_hash = hashlib.sha256(content.encode()).hexdigest()
+    relative_path = file_path.relative_to(repo_root).as_posix()
+
+    # Determine language label from extension
+    suffix = file_path.suffix.lower()
+    if suffix in ('.ts', '.tsx'):
+        language = "TypeScript"
+    else:
+        language = "JavaScript"
+
+    # Strip single-line and multi-line comments for cleaner pattern matching
+    content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+    content_clean = blank_block_comments_preserving_lines(content_clean)
+
+    # --- Imports ---
+    imports: List[str] = []
+    # ES module imports: import { x } from './y' / import x from './y' / import './y'
+    for m in re.finditer(r"""import\s+(?:(?:\{[^}]*\}|[\w*]+(?:\s+as\s+\w+)?)\s+from\s+)?['"]([^'"]+)['"]""", content):
+        imports.append(m.group(1))
+    # CommonJS require: require('./y') / require('y')
+    for m in re.finditer(r"""require\s*\(\s*['"]([^'"]+)['"]\s*\)""", content):
+        imports.append(m.group(1))
+
+    # --- Classes + functions: tree-sitter first (v0.2.102), regex fallback ---
+    # Records the storage loops below consume, whichever path produced them:
+    #   class_decls: (name, start_line, base, end_line, keyword, methods)
+    #   func_matches: (name, start_line, is_async, end_line)
+    grammar = "tsx" if suffix == ".tsx" else ("typescript" if suffix == ".ts" else "javascript")
+    defs = extract_definitions(grammar, content)
+    if defs is not None:
+        note_path(grammar, "tree-sitter")
+        class_decls = [
+            (c.name, c.start_line, c.base, c.end_line, c.keyword, defs.methods_of(c.name))
+            for c in defs.classes
+        ]
+        class_names = [c[0] for c in class_decls]
+        func_matches = [(f.name, f.start_line, f.is_async, f.end_line) for f in defs.functions]
+        all_func_names = [f[0] for f in func_matches]
+    else:
+        note_path(grammar, "regex")
+        class_names, class_decls, all_func_names, func_matches = _regex_js_definitions(
+            content_clean, source_lines,
+        )
 
     # --- Fastify route definitions ---
     # Pattern: { secure: true/false, method: 'POST', url: '/tx/build', handler, schema }
@@ -445,26 +490,16 @@ def extract_js_file(
     # `start_line + len(class_lines)`, which is that line PLUS ONE, while the
     # FUNCTION loop below already used the returned value directly. One
     # convention now; the golden corpus had ratified the +1 across 7 languages.
-    for cname, start_line, base_class in class_decls:
-        _class_end_line = _extract_balanced_block(source_lines, start_line, language="javascript")  # V52-O.11.E (was: start_line + 80)
+    for cname, start_line, base_class, _class_end_line, keyword, methods in class_decls:
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
-        # V52-O.11.F.2-JS (v0.2.52, 2026-06-09): scope `methods` to
-        # method declarations inside this class's brace-balanced body
-        # (with full method-shape coverage: static, get/set, generators,
-        # private, async + combinations — plus depth-tracking that
-        # prevents nested call statements like `cb(x) { ... }` inside
-        # method bodies from being miscounted as class methods).
-        # Pre-V52-O.11.F.2-JS this inlined a `method_inside.finditer`
-        # over `class_body` with an under-covering pattern; the new
-        # helper mirrors the V52-O.11.F Rust pattern (parallel fix
-        # for JS/TS class method attribution).
-        methods = _js_methods_for_class(content_clean, cname, source_lines)
+        # `methods` comes from the definitions discovery: the tree-sitter
+        # class body (v0.2.102) or, on the regex fallback, the V52-O.11.F.2-JS
+        # depth-tracking scan (`_js_methods_for_class`).
 
-        signature = f"class {cname}"
+        signature = f"{keyword} {cname}"
         if base_class:
             signature += f" extends {base_class}"
-
 
         entities.append(CodeEntity(
             kind=KIND_CLASS, file_path_rel=relative_path,
@@ -485,8 +520,7 @@ def extract_js_file(
         stats['classes'] += 1
 
     # --- Store functions ---
-    for fname, start_line, is_async in func_matches:
-        end_line = _extract_balanced_block(source_lines, start_line, language="javascript")  # V52-O.11.E (was: start_line + 40)
+    for fname, start_line, is_async, end_line in func_matches:
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{fname}"
         signature = f"{'async ' if is_async else ''}function {fname}()"

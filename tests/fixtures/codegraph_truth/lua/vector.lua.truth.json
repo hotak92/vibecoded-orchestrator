@@ -1,0 +1,18 @@
+{
+ "source": "vector.lua",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Vector",
+   "start": 8,
+   "end": 8
+  },
+  {
+   "kind": "function",
+   "name": "clamp",
+   "start": 29,
+   "end": 38
+  }
+ ]
+}

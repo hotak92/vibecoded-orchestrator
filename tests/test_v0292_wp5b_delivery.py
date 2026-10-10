@@ -57,6 +57,7 @@ from vco_lib.codegraph_extractor_generation import (
     REASON_CROSSES_BUMP,
     REASON_NO_GRAPH,
     decide,
+    parse_semver,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -74,7 +75,8 @@ def test_wp5b_rides_the_existing_0292_bump_rather_than_adding_one() -> None:
     # v0.2.93 release-time pin move: the intent (per this test's docstring)
     # is PRESENCE of the 0.2.92 entry; `[-1]` was a then-current fact of the
     # 0.2.92 cycle. The covers-the-release guard in wp5 owns "newest".
-    assert EXTRACTOR_GENERATION_BUMPS[-1] >= "0.2.92", (
+    # v0.2.102: compared as SEMVER — as strings "0.2.102" sorts below "0.2.92".
+    assert parse_semver(EXTRACTOR_GENERATION_BUMPS[-1]) >= parse_semver("0.2.92"), (
         "a NEWER entry appeared: re-check that WP-5b's fixes are covered by it"
     )
 

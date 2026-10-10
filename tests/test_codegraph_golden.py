@@ -54,6 +54,8 @@ from typing import Any, Dict, List
 
 import pytest
 
+from tests._codegraph_truth_harness import force_regex_definitions, treesitter_available
+
 _THIS_DIR = Path(__file__).parent
 _REPO_ROOT = _THIS_DIR.parent
 _ANALYZER_PATH = _REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
@@ -238,24 +240,46 @@ def _dump(rows: List[Dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_golden_snapshots_match(analyzer_mod: types.ModuleType) -> None:
+#: The two DEFINITIONS backends the extractors can run (v0.2.102 W6-E) and
+#: the snapshot directory each one is pinned against. ``treesitter`` is the
+#: shipped default (``vco_lib.codegraph_defs``); ``regex`` is the fallback a
+#: grammar-less install runs — ``expected/`` still pins it, unchanged.
+_BACKEND_DIRS = {
+    "regex": _EXPECTED_DIR,
+    "treesitter": _FIXTURE_ROOT / "expected_treesitter",
+}
+
+
+@pytest.fixture(params=["regex", "treesitter"])
+def defs_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Pin which definitions backend the extractors run for one test."""
+    if request.param == "regex":
+        force_regex_definitions(monkeypatch)
+    elif not treesitter_available("rust", "javascript", "typescript", "go", "java",
+                                  "csharp", "cpp", "ruby", "lua", "shell"):
+        pytest.skip("codegraph-ts extra not installed — tree-sitter snapshots not checkable")
+    return request.param
+
+
+def test_golden_snapshots_match(analyzer_mod: types.ModuleType, defs_backend: str) -> None:
     """The analyzer's normalized stored output over the fixture repo must equal
-    the committed per-collection snapshots. On CODEGRAPH_GOLDEN_REGEN=1 the
-    snapshots are (re)written and the run is marked skipped (regen is not a pass
-    — a human must review the diff)."""
+    the committed per-collection snapshots of the active definitions backend.
+    On CODEGRAPH_GOLDEN_REGEN=1 the snapshots are (re)written and the run is
+    marked skipped (regen is not a pass — a human must review the diff)."""
+    expected_dir = _BACKEND_DIRS[defs_backend]
     colls = _run_analyzer(analyzer_mod)
 
     if _REGEN:
-        _EXPECTED_DIR.mkdir(parents=True, exist_ok=True)
+        expected_dir.mkdir(parents=True, exist_ok=True)
         for base in _COLLECTION_BASES:
             rows = _collection_snapshot(colls[base])
-            (_EXPECTED_DIR / f"{base}.json").write_text(_dump(rows), encoding="utf-8")
+            (expected_dir / f"{base}.json").write_text(_dump(rows), encoding="utf-8")
         pytest.skip(
             "CODEGRAPH_GOLDEN_REGEN=1 — snapshots rewritten; review the diff by hand"
         )
 
     for base in _COLLECTION_BASES:
-        expected_path = _EXPECTED_DIR / f"{base}.json"
+        expected_path = expected_dir / f"{base}.json"
         assert expected_path.exists(), (
             f"missing golden snapshot {expected_path} — run with "
             "CODEGRAPH_GOLDEN_REGEN=1 to create it (then review the diff)"
@@ -263,14 +287,14 @@ def test_golden_snapshots_match(analyzer_mod: types.ModuleType) -> None:
         expected = json.loads(expected_path.read_text(encoding="utf-8"))
         actual = _collection_snapshot(colls[base])
         assert actual == expected, (
-            f"golden snapshot drift in {base}: the analyzer's stored output "
-            f"diverged from tests/fixtures/codegraph_golden/expected/{base}.json. "
+            f"golden snapshot drift in {base} ({defs_backend} definitions): the "
+            f"analyzer's stored output diverged from {expected_path}. "
             "This is a SEMANTIC REGRESSION — fix the code, or (if you conclude "
             "the prior behavior was a bug) STOP and report before regenerating."
         )
 
 
-def test_golden_dedup_no_duplicate_identity(analyzer_mod: types.ModuleType) -> None:
+def test_golden_dedup_no_duplicate_identity(analyzer_mod: types.ModuleType, defs_backend: str) -> None:
     """Every stored row has a UNIQUE identity within its collection.
 
     v0.2.92 (Defect B): this test used to key on
@@ -316,7 +340,7 @@ def test_golden_dedup_no_duplicate_identity(analyzer_mod: types.ModuleType) -> N
             assert len(uuids) >= 1, k
 
 
-def test_golden_fixture_coverage(analyzer_mod: types.ModuleType) -> None:
+def test_golden_fixture_coverage(analyzer_mod: types.ModuleType, defs_backend: str) -> None:
     """Sanity floor: the corpus exercises every entity-emitting axis the later
     IR refactor must preserve. Guards against a fixture file silently vanishing
     or the analyzer regressing to emit nothing for a language."""
@@ -460,11 +484,16 @@ def test_golden_fixture_coverage(analyzer_mod: types.ModuleType) -> None:
         "a control-flow header, a lambda, a brace-init or a member-initialiser "
         "entry minted a function row"
     )
-    # The one shape still uncaptured, named in the corpus README: an
-    # out-of-line CONSTRUCTOR (`geometry.cpp:35`), whose member-initialiser
-    # list breaks `method_pattern`'s `\)\s*(?:const)?…\{` tail. Asserted so
-    # the README's claim stays true rather than merely written down.
-    assert "geometry.Circle.Circle" not in fn_names
+    # The one shape the REGEX fallback still cannot capture, named in the
+    # corpus README: an out-of-line CONSTRUCTOR (`geometry.cpp:35`), whose
+    # member-initialiser list breaks `method_pattern`'s `\)\s*(?:const)?…\{`
+    # tail. The tree-sitter definitions layer (v0.2.102, the shipped default)
+    # parses it like any other definition. Asserted per backend so the
+    # README's claim stays true rather than merely written down.
+    if defs_backend == "regex":
+        assert "geometry.Circle.Circle" not in fn_names
+    else:
+        assert "geometry.Circle.Circle" in fn_names
 
     # C#: namespace-qualified class + interface + generic method + property.
     assert "Warehouse.InventoryController" in class_names, "csharp class extracted"

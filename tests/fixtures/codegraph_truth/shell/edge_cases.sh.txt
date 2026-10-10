@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Edge cases for the definitions gate (shell).
+
+setup()
+{
+  echo "setup"
+}
+
+function teardown() {
+  echo "teardown"
+}
+
+in_subshell() (
+  cd /tmp && ls
+)
+
+outer() {
+  inner() {
+    echo "inner"
+  }
+  inner
+}
+
+echo "fake() { :; }"

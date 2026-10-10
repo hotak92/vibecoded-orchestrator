@@ -1,0 +1,36 @@
+{
+ "source": "tauri.ts",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "tauriAvailable",
+   "start": 11,
+   "end": 13
+  },
+  {
+   "kind": "function",
+   "name": "isTauriRuntime",
+   "start": 16,
+   "end": 18
+  },
+  {
+   "kind": "function",
+   "name": "invoke",
+   "start": 26,
+   "end": 35
+  },
+  {
+   "kind": "function",
+   "name": "safeInvoke",
+   "start": 55,
+   "end": 69
+  },
+  {
+   "kind": "function",
+   "name": "listen",
+   "start": 71,
+   "end": 79
+  }
+ ]
+}

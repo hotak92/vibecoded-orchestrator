@@ -1,0 +1,72 @@
+{
+ "source": "json_file.rs",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "BackupPolicy",
+   "start": 49,
+   "end": 61
+  },
+  {
+   "kind": "function",
+   "name": "sibling_path",
+   "start": 70,
+   "end": 77
+  },
+  {
+   "kind": "function",
+   "name": "lock_path",
+   "start": 79,
+   "end": 81
+  },
+  {
+   "kind": "function",
+   "name": "acquire_lock",
+   "start": 85,
+   "end": 126
+  },
+  {
+   "kind": "function",
+   "name": "pid_alive",
+   "start": 128,
+   "end": 132
+  },
+  {
+   "kind": "class",
+   "name": "LockGuard",
+   "start": 134,
+   "end": 137
+  },
+  {
+   "kind": "function",
+   "name": "drop",
+   "start": 140,
+   "end": 142
+  },
+  {
+   "kind": "function",
+   "name": "read_json_or_empty",
+   "start": 151,
+   "end": 160
+  },
+  {
+   "kind": "function",
+   "name": "read_object_or_empty",
+   "start": 169,
+   "end": 178
+  },
+  {
+   "kind": "function",
+   "name": "atomic_write_json",
+   "start": 182,
+   "end": 198
+  },
+  {
+   "kind": "function",
+   "name": "write_backup",
+   "start": 201,
+   "end": 219
+  }
+ ]
+}

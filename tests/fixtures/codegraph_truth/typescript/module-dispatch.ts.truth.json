@@ -1,0 +1,42 @@
+{
+ "source": "module-dispatch.ts",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "DispatchContext",
+   "start": 16,
+   "end": 19
+  },
+  {
+   "kind": "function",
+   "name": "_resetLegacyVerdictCacheForTests",
+   "start": 53,
+   "end": 55
+  },
+  {
+   "kind": "function",
+   "name": "isPolicyRefusal",
+   "start": 66,
+   "end": 68
+  },
+  {
+   "kind": "function",
+   "name": "assertLegacyActionAllowed",
+   "start": 88,
+   "end": 107
+  },
+  {
+   "kind": "function",
+   "name": "dispatchAction",
+   "start": 133,
+   "end": 161
+  },
+  {
+   "kind": "function",
+   "name": "renderTemplate",
+   "start": 175,
+   "end": 191
+  }
+ ]
+}

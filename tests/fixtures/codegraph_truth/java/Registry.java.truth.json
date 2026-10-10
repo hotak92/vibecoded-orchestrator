@@ -1,0 +1,66 @@
+{
+ "source": "Registry.java",
+ "reviewed": "W6-E 2026-10-10 (hand-written before extraction)",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Registry",
+   "start": 7,
+   "end": 38
+  },
+  {
+   "kind": "function",
+   "name": "Registry",
+   "start": 10,
+   "end": 12
+  },
+  {
+   "kind": "function",
+   "name": "toString",
+   "start": 15,
+   "end": 17
+  },
+  {
+   "kind": "function",
+   "name": "map",
+   "start": 19,
+   "end": 21
+  },
+  {
+   "kind": "class",
+   "name": "Node",
+   "start": 23,
+   "end": 29
+  },
+  {
+   "kind": "function",
+   "name": "next",
+   "start": 26,
+   "end": 28
+  },
+  {
+   "kind": "class",
+   "name": "Color",
+   "start": 31,
+   "end": 31
+  },
+  {
+   "kind": "function",
+   "name": "run",
+   "start": 34,
+   "end": 36
+  },
+  {
+   "kind": "class",
+   "name": "Point",
+   "start": 40,
+   "end": 44
+  },
+  {
+   "kind": "function",
+   "name": "sum",
+   "start": 41,
+   "end": 43
+  }
+ ]
+}

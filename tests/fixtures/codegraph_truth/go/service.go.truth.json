@@ -1,0 +1,30 @@
+{
+ "source": "service.go",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Greeter",
+   "start": 7,
+   "end": 9
+  },
+  {
+   "kind": "function",
+   "name": "Greet",
+   "start": 12,
+   "end": 14
+  },
+  {
+   "kind": "function",
+   "name": "NewGreeter",
+   "start": 17,
+   "end": 19
+  },
+  {
+   "kind": "function",
+   "name": "addNumbers",
+   "start": 21,
+   "end": 23
+  }
+ ]
+}

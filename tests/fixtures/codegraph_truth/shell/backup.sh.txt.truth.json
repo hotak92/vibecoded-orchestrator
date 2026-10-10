@@ -1,0 +1,24 @@
+{
+ "source": "backup.sh.txt",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "prepare_dir",
+   "start": 10,
+   "end": 13
+  },
+  {
+   "kind": "function",
+   "name": "upload_archive",
+   "start": 16,
+   "end": 19
+  },
+  {
+   "kind": "function",
+   "name": "run_backup",
+   "start": 21,
+   "end": 26
+  }
+ ]
+}

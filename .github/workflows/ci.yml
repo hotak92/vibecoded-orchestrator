@@ -259,7 +259,11 @@ jobs:
           # the repo only on cwd that probe fails here while passing on any
           # real install, and the spawn-guard tests went red for the runner,
           # not the code.
-          pip install -e .
+          # v0.2.102: WITH the codegraph-ts extra — install.py installs it by
+          # default, the code graph's tree-sitter definitions layer is the
+          # shipped path, and the definitions correctness gate
+          # (tests/test_codegraph_definitions_truth.py) skips without it.
+          pip install -e ".[codegraph-ts]"
       - name: pytest
         run: pytest tests/ -q
 

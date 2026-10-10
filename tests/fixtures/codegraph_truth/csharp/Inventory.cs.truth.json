@@ -1,0 +1,54 @@
+{
+ "source": "Inventory.cs",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "IRepository",
+   "start": 10,
+   "end": 13
+  },
+  {
+   "kind": "function",
+   "name": "Find",
+   "start": 12,
+   "end": 12
+  },
+  {
+   "kind": "class",
+   "name": "Item",
+   "start": 15,
+   "end": 15
+  },
+  {
+   "kind": "class",
+   "name": "InventoryController",
+   "start": 18,
+   "end": 43
+  },
+  {
+   "kind": "function",
+   "name": "Lookup",
+   "start": 22,
+   "end": 25
+  },
+  {
+   "kind": "function",
+   "name": "WrapAll",
+   "start": 27,
+   "end": 30
+  },
+  {
+   "kind": "function",
+   "name": "GetAll",
+   "start": 33,
+   "end": 36
+  },
+  {
+   "kind": "function",
+   "name": "Add",
+   "start": 39,
+   "end": 42
+  }
+ ]
+}

@@ -1,0 +1,36 @@
+{
+ "source": "edge_cases.sh.txt",
+ "reviewed": "W6-E 2026-10-10 (hand-written before extraction)",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "setup",
+   "start": 4,
+   "end": 7
+  },
+  {
+   "kind": "function",
+   "name": "teardown",
+   "start": 9,
+   "end": 11
+  },
+  {
+   "kind": "function",
+   "name": "in_subshell",
+   "start": 13,
+   "end": 15
+  },
+  {
+   "kind": "function",
+   "name": "outer",
+   "start": 17,
+   "end": 22
+  },
+  {
+   "kind": "function",
+   "name": "inner",
+   "start": 18,
+   "end": 20
+  }
+ ]
+}

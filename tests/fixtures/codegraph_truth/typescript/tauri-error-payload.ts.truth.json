@@ -1,0 +1,36 @@
+{
+ "source": "tauri-error-payload.ts",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "parseTaggedErrorPayload",
+   "start": 27,
+   "end": 52
+  },
+  {
+   "kind": "function",
+   "name": "tryParseObject",
+   "start": 54,
+   "end": 64
+  },
+  {
+   "kind": "function",
+   "name": "escapeRe",
+   "start": 66,
+   "end": 68
+  },
+  {
+   "kind": "function",
+   "name": "errorText",
+   "start": 71,
+   "end": 73
+  },
+  {
+   "kind": "function",
+   "name": "parseOrchestratorConflictError",
+   "start": 91,
+   "end": 97
+  }
+ ]
+}

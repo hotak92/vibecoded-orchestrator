@@ -1,0 +1,60 @@
+{
+ "source": "edge_cases.ts",
+ "reviewed": "W6-E 2026-10-10 (hand-written before extraction)",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Shape",
+   "start": 2,
+   "end": 5
+  },
+  {
+   "kind": "class",
+   "name": "Base",
+   "start": 7,
+   "end": 12
+  },
+  {
+   "kind": "class",
+   "name": "Square",
+   "start": 14,
+   "end": 21
+  },
+  {
+   "kind": "function",
+   "name": "pick",
+   "start": 23,
+   "end": 23
+  },
+  {
+   "kind": "function",
+   "name": "summarize",
+   "start": 25,
+   "end": 29
+  },
+  {
+   "kind": "function",
+   "name": "groupBy",
+   "start": 31,
+   "end": 40
+  },
+  {
+   "kind": "function",
+   "name": "outer",
+   "start": 42,
+   "end": 47
+  },
+  {
+   "kind": "function",
+   "name": "inner",
+   "start": 43,
+   "end": 45
+  },
+  {
+   "kind": "function",
+   "name": "stream",
+   "start": 51,
+   "end": 53
+  }
+ ]
+}

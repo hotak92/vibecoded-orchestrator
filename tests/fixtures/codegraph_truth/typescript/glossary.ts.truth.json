@@ -1,0 +1,24 @@
+{
+ "source": "glossary.ts",
+ "reviewed": "W6-E 2026-10-10",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "GlossaryEntry",
+   "start": 12,
+   "end": 23
+  },
+  {
+   "kind": "function",
+   "name": "getEntry",
+   "start": 149,
+   "end": 151
+  },
+  {
+   "kind": "function",
+   "name": "allEntries",
+   "start": 153,
+   "end": 157
+  }
+ ]
+}

@@ -1,0 +1,66 @@
+{
+ "source": "EdgeController.cs",
+ "reviewed": "W6-E 2026-10-10 (hand-written before extraction)",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "EdgeController",
+   "start": 8,
+   "end": 29
+  },
+  {
+   "kind": "function",
+   "name": "EdgeController",
+   "start": 10,
+   "end": 10
+  },
+  {
+   "kind": "function",
+   "name": "GetOne",
+   "start": 13,
+   "end": 13
+  },
+  {
+   "kind": "function",
+   "name": "Echo",
+   "start": 17,
+   "end": 20
+  },
+  {
+   "kind": "class",
+   "name": "Cursor",
+   "start": 22,
+   "end": 28
+  },
+  {
+   "kind": "function",
+   "name": "Advance",
+   "start": 24,
+   "end": 27
+  },
+  {
+   "kind": "class",
+   "name": "IWorker",
+   "start": 31,
+   "end": 34
+  },
+  {
+   "kind": "function",
+   "name": "Work",
+   "start": 33,
+   "end": 33
+  },
+  {
+   "kind": "class",
+   "name": "Line",
+   "start": 36,
+   "end": 39
+  },
+  {
+   "kind": "function",
+   "name": "Length",
+   "start": 38,
+   "end": 38
+  }
+ ]
+}

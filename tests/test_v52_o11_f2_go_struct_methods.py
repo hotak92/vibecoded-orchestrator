@@ -351,7 +351,10 @@ def test_no_unconditional_func_finditer_in_go_struct_loop() -> None:
     # struct/interface"` line first (unique to Go — Rust uses
     # `f"struct/enum/trait {sname}"`, JS/Java/C# use other strings),
     # then scan the struct-loop body around it.
-    go_signature_anchor = 'signature = f"type {sname} struct/interface"'
+    # v0.2.102 W6-E: the per-struct receiver scan moved into the regex
+    # FALLBACK helper `_regex_go_definitions` (tree-sitter takes `methods`
+    # from receiver types). Anchor on the helper's per-struct `methods = …`.
+    go_signature_anchor = 'methods = _go_methods_for_struct(content_clean, sname, source_lines)'
     anchor_pos = src.find(go_signature_anchor)
     assert anchor_pos >= 0, (
         f"Could not locate Go signature anchor in codegraph_lang/go.py — "

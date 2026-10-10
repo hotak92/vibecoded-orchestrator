@@ -43,6 +43,7 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_definitions, note_path
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
@@ -627,6 +628,24 @@ def _csharp_methods_for_class(
     return methods
 
 
+def _csharp_controller_route(classes: List[Any], line: int, route_pattern: "re.Pattern[str]") -> str:
+    """Controller-level ``[Route("…")]`` prefix for a method on ``line``
+    (tree-sitter path, v0.2.102): the ``[Route]`` attribute of the INNERMOST
+    enclosing type that carries one — how ASP.NET combines templates. ``''``
+    when no enclosing type declares a route. ``classes`` are
+    :class:`vco_lib.codegraph_defs.Definition` rows with their attribute
+    texts."""
+    enclosing = sorted(
+        (c for c in classes if c.start_line <= line <= c.end_line),
+        key=lambda c: c.start_line, reverse=True,
+    )
+    for cls in enclosing:
+        m = route_pattern.search("\n".join(cls.attributes))
+        if m:
+            return '/' + m.group(1).strip('/')
+    return ''
+
+
 def extract_csharp_file(
     source_text: str, file_path: Path, repo_root: Path, helpers: Any,
 ) -> FileExtraction:
@@ -657,67 +676,76 @@ def extract_csharp_file(
     ns_match = re.search(r'namespace\s+([\w.]+)', content)
     ns = ns_match.group(1) if ns_match else file_path.stem
 
-    # Classes / interfaces / records
-    class_pattern = re.compile(
-        r'(?:public|private|protected|internal|abstract|sealed|partial|\s)+'
-        r'(?:class|interface|record|struct)\s+([\w<>, ]+?)(?:\s*:\s*[\w<>, ]+?)?\s*\{',
-        re.MULTILINE
-    )
-    # v0.2.92 WP-5b: a LIST of (name, start_line, end_line), not a dict keyed
-    # by name. Two reasons, both of which the dict made unrepresentable:
-    #   * two same-named types in one file (two namespaces, or a `partial
-    #     class` split within the file) collapsed onto one row — the same loss
-    #     class this release fixed for FUNCTIONS via the occurrence
-    #     disambiguator, which keys on `(kind, identity_key)` and has always
-    #     covered KIND_CLASS;
-    #   * a positional record's `end_line` cannot come from a brace scan, so
-    #     each declaration now carries the end its OWN shape implies.
-    class_decls: List[Tuple[str, int, int]] = []
-    for m in class_pattern.finditer(content_clean):
-        raw = m.group(1).strip().split('<')[0].strip()  # strip generics
-        if not raw or raw[0].islower():
-            continue
-        # v0.2.92: `m.start()`, NOT the declaration. `class_pattern`'s leading
-        # group `(?:public|…|\s)+` starts matching at the whitespace after the
-        # PREVIOUS token, so the match routinely begins on the previous line —
-        # the golden fixture's `interface IRepository` was stored starting on
-        # the enclosing namespace's `{`, which then made
-        # `_extract_balanced_block` return the NAMESPACE's closing brace and
-        # gave the interface a `body` containing the whole file.
-        start_line = content_clean[
-            :_csharp_declaration_start(content_clean, m.start(), m.end())
-        ].count('\n') + 1
-        class_decls.append((
-            raw, start_line,
-            _extract_balanced_block(source_lines, start_line, language="csharp"),  # V52-O.11.E (was: start_line + 60)
-        ))
-
-    # v0.2.92 WP-5b: positional records (`record Item(int Id, string Name);`).
-    # See `_CSHARP_POSITIONAL_RECORD_RE` — disjoint from `class_pattern`, so a
-    # declaration is never counted twice. The terminator decides the extent:
-    # `;` is a bodiless record that ends on its own declaration, `{` opens a
-    # body the brace scanner can measure. Same three-way branch the METHOD loop
-    # below already uses, for the same reason — running a brace scan on a
-    # declaration that opens no brace latches onto the next construct's.
-    for m in _CSHARP_POSITIONAL_RECORD_RE.finditer(content_clean):
-        rname = m.group(1)
-        decl_pos = _csharp_declaration_start(content_clean, m.start(), m.end())
-        start_line = content_clean[:decl_pos].count('\n') + 1
-        # Scanning from the `(` itself: the shared scanner counts it as depth,
-        # so the parameter list's own `;`/`{` can never be read as the
-        # terminator (`record Pair(Func<int> f = () => { });`).
-        term, term_pos = scan_to_declaration_terminator(
-            content_clean, m.end() - 1, stops=";{"
+    # Definitions: tree-sitter first (v0.2.102), regex fallback. Records:
+    #   class_decls (name, start_line, end_line), source order.
+    defs = extract_definitions("csharp", content)
+    note_path("csharp", "tree-sitter" if defs is not None else "regex")
+    if defs is not None:
+        class_decls: List[Tuple[str, int, int]] = [
+            (c.name, c.start_line, c.end_line) for c in defs.classes
+        ]
+    else:
+        # Classes / interfaces / records
+        class_pattern = re.compile(
+            r'(?:public|private|protected|internal|abstract|sealed|partial|\s)+'
+            r'(?:class|interface|record|struct)\s+([\w<>, ]+?)(?:\s*:\s*[\w<>, ]+?)?\s*\{',
+            re.MULTILINE
         )
-        if term == '{':
-            end_line = _extract_balanced_block(source_lines, start_line, language="csharp")
-        elif term == ';':
-            end_line = content_clean[:term_pos].count('\n') + 1
-        else:
-            end_line = start_line
-        class_decls.append((rname, start_line, end_line))
+        # v0.2.92 WP-5b: a LIST of (name, start_line, end_line), not a dict keyed
+        # by name. Two reasons, both of which the dict made unrepresentable:
+        #   * two same-named types in one file (two namespaces, or a `partial
+        #     class` split within the file) collapsed onto one row — the same loss
+        #     class this release fixed for FUNCTIONS via the occurrence
+        #     disambiguator, which keys on `(kind, identity_key)` and has always
+        #     covered KIND_CLASS;
+        #   * a positional record's `end_line` cannot come from a brace scan, so
+        #     each declaration now carries the end its OWN shape implies.
+        class_decls = []
+        for m in class_pattern.finditer(content_clean):
+            raw = m.group(1).strip().split('<')[0].strip()  # strip generics
+            if not raw or raw[0].islower():
+                continue
+            # v0.2.92: `m.start()`, NOT the declaration. `class_pattern`'s leading
+            # group `(?:public|…|\s)+` starts matching at the whitespace after the
+            # PREVIOUS token, so the match routinely begins on the previous line —
+            # the golden fixture's `interface IRepository` was stored starting on
+            # the enclosing namespace's `{`, which then made
+            # `_extract_balanced_block` return the NAMESPACE's closing brace and
+            # gave the interface a `body` containing the whole file.
+            start_line = content_clean[
+                :_csharp_declaration_start(content_clean, m.start(), m.end())
+            ].count('\n') + 1
+            class_decls.append((
+                raw, start_line,
+                _extract_balanced_block(source_lines, start_line, language="csharp"),  # V52-O.11.E (was: start_line + 60)
+            ))
 
-    class_decls.sort(key=lambda d: d[1])  # source order, records interleaved
+        # v0.2.92 WP-5b: positional records (`record Item(int Id, string Name);`).
+        # See `_CSHARP_POSITIONAL_RECORD_RE` — disjoint from `class_pattern`, so a
+        # declaration is never counted twice. The terminator decides the extent:
+        # `;` is a bodiless record that ends on its own declaration, `{` opens a
+        # body the brace scanner can measure. Same three-way branch the METHOD loop
+        # below already uses, for the same reason — running a brace scan on a
+        # declaration that opens no brace latches onto the next construct's.
+        for m in _CSHARP_POSITIONAL_RECORD_RE.finditer(content_clean):
+            rname = m.group(1)
+            decl_pos = _csharp_declaration_start(content_clean, m.start(), m.end())
+            start_line = content_clean[:decl_pos].count('\n') + 1
+            # Scanning from the `(` itself: the shared scanner counts it as depth,
+            # so the parameter list's own `;`/`{` can never be read as the
+            # terminator (`record Pair(Func<int> f = () => { });`).
+            term, term_pos = scan_to_declaration_terminator(
+                content_clean, m.end() - 1, stops=";{"
+            )
+            if term == '{':
+                end_line = _extract_balanced_block(source_lines, start_line, language="csharp")
+            elif term == ';':
+                end_line = content_clean[:term_pos].count('\n') + 1
+            else:
+                end_line = start_line
+            class_decls.append((rname, start_line, end_line))
+
+        class_decls.sort(key=lambda d: d[1])  # source order, records interleaved
     #: Unique type names in source order — what the module summary lists.
     class_names: List[str] = list(dict.fromkeys(n for n, _, _ in class_decls))
 
@@ -809,8 +837,9 @@ def extract_csharp_file(
         # header has no `{`, and the helper's docstring has always said the
         # primary-constructor parameters are not extracted as members.
         if cname not in _methods_by_name:
-            _methods_by_name[cname] = _csharp_methods_for_class(
-                content_clean, cname, source_lines
+            _methods_by_name[cname] = (
+                defs.methods_of(cname) if defs is not None
+                else _csharp_methods_for_class(content_clean, cname, source_lines)
             )
         methods = _methods_by_name[cname]
         signature = f"class {cname}"
@@ -829,55 +858,92 @@ def extract_csharp_file(
         stats['classes'] += 1
 
     # Methods
-    for m in method_pattern.finditer(content_clean):
-        mname = m.group(1)
-        terminator = m.group(2)
-        # v0.2.92: the MODULE-level filter, which is the same set
-        # `_csharp_methods_for_class` uses. The inline 10-word tuple that stood
-        # here let `await`, `default`, `finally`, `base` and `nameof` through.
-        if mname in _CSHARP_KW_FILTER:
-            continue
-        # v0.2.92: the declaration start, NOT `m.start()`. See
-        # `_csharp_declaration_start` — the leading modifier group begins
-        # matching at the whitespace after the previous token, and the
-        # return-type group swallows a parenless `[HttpPost]` attribute as if
-        # it were a type token, so `m.start()` lands one member too high. It is
-        # already what the route path below uses; the entity's own
-        # `start_line`/`end_line`/`body` were still derived from the raw match.
-        decl_pos = _csharp_declaration_start(content_clean, m.start(), m.end())
-        # v0.2.92: reject a match whose modifier/return-type run is actually a
-        # statement (`return Ok();`) or a type declaration
-        # (`record Item(int Id, string Name);`). Both minted function rows in
-        # the golden fixture. See `_CSHARP_NON_DECL_TOKENS`.
-        if not _csharp_declaration_run_is_a_member(content_clean, decl_pos, m.start(1)):
-            continue
-        start_line = content_clean[:decl_pos].count('\n') + 1
-        # v0.2.92: branch on the DECLARATION TERMINATOR. Only a `{` opens a
-        # brace block, and only for that shape is a brace scan meaningful:
-        #   * `;`  — an interface / abstract / extern declaration has NO body
-        #     and ends on its own line. Running `_extract_balanced_block` from
-        #     it finds no opener on the declaration line, keeps scanning, and
-        #     latches onto the NEXT type's braces: on the golden fixture,
-        #     `IRepository.Find` (a one-line interface method) would take a
-        #     `body` spanning the record, the `[Route]` attribute and the
-        #     controller's class header. Masked before this release only
-        #     because the skewed `start_line` happened to point at the
-        #     interface's own `{`.
-        #   * `=>` — an expression-bodied member ends at its `;`.
-        if terminator == '{':
-            end_line = _extract_balanced_block(source_lines, start_line, language="csharp")  # V52-O.11.E (was: start_line + 50)
-        elif terminator == '=>':
-            end_line = content_clean[
-                :_csharp_expression_body_end(content_clean, m.end())
-            ].count('\n') + 1
-        else:  # ';' — a declaration with no body
-            end_line = content_clean[:m.end()].count('\n') + 1
+    # Per-method records from either definitions path:
+    #   (name, start_line, end_line, enclosing, is_async, attr_text, ctrl_route)
+    # `attr_text` is the attribute block that structurally decorates the
+    # method; `ctrl_route` its controller-level `[Route("…")]` prefix.
+    fn_records: List[Tuple[str, int, int, str, bool, str, str]] = []
+    if defs is not None:
+        for f in defs.functions:
+            fn_records.append((
+                f.name, f.start_line, f.end_line, f.container or file_path.stem,
+                f.is_async, "\n".join(f.attributes),
+                _csharp_controller_route(defs.classes, f.start_line, route_attr_pattern),
+            ))
+    else:
+        for m in method_pattern.finditer(content_clean):
+            mname = m.group(1)
+            terminator = m.group(2)
+            # v0.2.92: the MODULE-level filter, which is the same set
+            # `_csharp_methods_for_class` uses. The inline 10-word tuple that stood
+            # here let `await`, `default`, `finally`, `base` and `nameof` through.
+            if mname in _CSHARP_KW_FILTER:
+                continue
+            # v0.2.92: the declaration start, NOT `m.start()`. See
+            # `_csharp_declaration_start` — the leading modifier group begins
+            # matching at the whitespace after the previous token, and the
+            # return-type group swallows a parenless `[HttpPost]` attribute as if
+            # it were a type token, so `m.start()` lands one member too high. It is
+            # already what the route path below uses; the entity's own
+            # `start_line`/`end_line`/`body` were still derived from the raw match.
+            decl_pos = _csharp_declaration_start(content_clean, m.start(), m.end())
+            # v0.2.92: reject a match whose modifier/return-type run is actually a
+            # statement (`return Ok();`) or a type declaration
+            # (`record Item(int Id, string Name);`). Both minted function rows in
+            # the golden fixture. See `_CSHARP_NON_DECL_TOKENS`.
+            if not _csharp_declaration_run_is_a_member(content_clean, decl_pos, m.start(1)):
+                continue
+            start_line = content_clean[:decl_pos].count('\n') + 1
+            # v0.2.92: branch on the DECLARATION TERMINATOR. Only a `{` opens a
+            # brace block, and only for that shape is a brace scan meaningful:
+            #   * `;`  — an interface / abstract / extern declaration has NO body
+            #     and ends on its own line. Running `_extract_balanced_block` from
+            #     it finds no opener on the declaration line, keeps scanning, and
+            #     latches onto the NEXT type's braces: on the golden fixture,
+            #     `IRepository.Find` (a one-line interface method) would take a
+            #     `body` spanning the record, the `[Route]` attribute and the
+            #     controller's class header. Masked before this release only
+            #     because the skewed `start_line` happened to point at the
+            #     interface's own `{`.
+            #   * `=>` — an expression-bodied member ends at its `;`.
+            if terminator == '{':
+                end_line = _extract_balanced_block(source_lines, start_line, language="csharp")  # V52-O.11.E (was: start_line + 50)
+            elif terminator == '=>':
+                end_line = content_clean[
+                    :_csharp_expression_body_end(content_clean, m.end())
+                ].count('\n') + 1
+            else:  # ';' — a declaration with no body
+                end_line = content_clean[:m.end()].count('\n') + 1
+            body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
+            enclosing = next(
+                (c for c, cl, _ in sorted(class_decls, key=lambda d: d[1], reverse=True)
+                 if cl <= start_line), file_path.stem
+            )
+            is_async = bool(re.search(r'\basync\b', body[:200]))
+            # ASP.NET route entries for HTTP-attributed methods.
+            # v0.2.92: the attribute block is the one that STRUCTURALLY decorates
+            # this declaration (see _csharp_attribute_block) — not whatever `[Http`
+            # happened to fall inside a 5-line window. ``decl_pos`` is computed once
+            # above, where the entity's own line numbers now come from it too.
+            attr_text, attr_start = _csharp_attribute_block(content_clean, decl_pos)
+
+            # Controller-level [Route("…")]: the first one declared BEFORE this
+            # method's own attribute block. Slicing at `attr_start` (rather than at
+            # `m.start()`, which sits AFTER the attributes) keeps a method's own
+            # `[Route]` from being read as its controller's prefix and then joined
+            # to itself.
+            ctrl_route = ''
+            base_route_m = route_attr_pattern.search(content_clean[:attr_start])
+            if base_route_m:
+                ctrl_route = '/' + base_route_m.group(1).strip('/')
+            # A method-level [Route("…")] supplies the template when the verb
+            # attribute carries none (`[HttpGet]` + `[Route("all")]`, and the
+            # shared-bracket `[HttpGet, Route("all")]`), which is how ASP.NET
+            # resolves it too.
+            fn_records.append((mname, start_line, end_line, enclosing, is_async, attr_text, ctrl_route))
+
+    for mname, start_line, end_line, enclosing, is_async, attr_text, ctrl_route in fn_records:
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
-        enclosing = next(
-            (c for c, cl, _ in sorted(class_decls, key=lambda d: d[1], reverse=True)
-             if cl <= start_line), file_path.stem
-        )
-        is_async = bool(re.search(r'\basync\b', body[:200]))
         full_name = f"{ns}.{enclosing}.{mname}"
         signature = f"{mname}(...)"
         entities.append(CodeEntity(
@@ -893,26 +959,8 @@ def extract_csharp_file(
         ))
         stats['functions'] += 1
 
-        # ASP.NET route entries for HTTP-attributed methods.
-        # v0.2.92: the attribute block is the one that STRUCTURALLY decorates
-        # this declaration (see _csharp_attribute_block) — not whatever `[Http`
-        # happened to fall inside a 5-line window. ``decl_pos`` is computed once
-        # above, where the entity's own line numbers now come from it too.
-        attr_text, attr_start = _csharp_attribute_block(content_clean, decl_pos)
-
-        # Controller-level [Route("…")]: the first one declared BEFORE this
-        # method's own attribute block. Slicing at `attr_start` (rather than at
-        # `m.start()`, which sits AFTER the attributes) keeps a method's own
-        # `[Route]` from being read as its controller's prefix and then joined
-        # to itself.
-        ctrl_route = ''
-        base_route_m = route_attr_pattern.search(content_clean[:attr_start])
-        if base_route_m:
-            ctrl_route = '/' + base_route_m.group(1).strip('/')
-        # A method-level [Route("…")] supplies the template when the verb
-        # attribute carries none (`[HttpGet]` + `[Route("all")]`, and the
-        # shared-bracket `[HttpGet, Route("all")]`), which is how ASP.NET
-        # resolves it too.
+        # ASP.NET route entries for HTTP-attributed methods (`attr_text` /
+        # `ctrl_route` come from the method's definitions record above).
         method_route_m = _CSHARP_METHOD_ROUTE_RE.search(attr_text)
 
         # One row per verb attribute: an action may legitimately declare more
