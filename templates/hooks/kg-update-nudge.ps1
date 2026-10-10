@@ -125,6 +125,9 @@ $env:_KG_NUDGE_FIRST       = $FIRST_THRESHOLD
 $env:_KG_NUDGE_INTERVAL    = $INTERVAL
 $env:_KG_NUDGE_METRICS     = $metricsFile
 $env:_KG_NUDGE_VERSION     = $METRIC_VERSION
+# v0.2.102 W6-F: the counter module resolves from this hook's own bundle
+# (../scripts) first - never from the caller's cwd.
+$env:_KG_NUDGE_HOOK_DIR    = $PSScriptRoot
 
 $pythonScript = @'
 """KG-update nudge body — shared by .sh and .ps1 hook shims."""
@@ -225,39 +228,114 @@ if is_post_tool:
 # --- Scan transcript for work_units_total + escape markers ---
 session_total = 0
 escape_marker_token_total = 0
+_new_scan_offset = None  # W6-F: resume point to persist (None = no scan ran; 0 IS a valid offset -- a scan that consumed nothing, e.g. a transcript rotated to empty, must persist 0 so the next run does not skip regrown content)
 
 import re
 NO_KG_UPDATE_MARKER_RE = re.compile(r"\[No KG update needed:\s*\S[^\]]*\]")
 
-# v9: delegate to shared module (cross-OS path resolution).
+# v9: delegate to shared module. v0.2.102 W6-F: the counter resolves from
+# the HOOK'S OWN bundle (../scripts next to this hook) or
+# $env:CLAUDE_PROJECT_DIR/.claude/scripts - NEVER from os.getcwd() (the
+# pre-W6-F resolution): hooks fire with the caller's cwd, and a session
+# working in another checkout imported nothing and silently counted 0. A
+# transcript to count with no importable counter is a broken install: loud
+# stderr + exit 1 (the shim propagates it; non-blocking for
+# UserPromptSubmit), never a silent zero.
 _have_scanner = False
-_scripts_dir = os.path.join(os.getcwd(), ".claude", "scripts")
-if os.path.isfile(os.path.join(_scripts_dir, "claude_token_counter.py")):
-    sys.path.insert(0, _scripts_dir)
-    try:
-        from claude_token_counter import (
-            TranscriptScanner,
-            iter_assistant_text_for_marker_scan,
-        )
-        _have_scanner = True
-    except ImportError:
+_counter_candidates = []
+_hook_dir = os.environ.get("_KG_NUDGE_HOOK_DIR", "")
+if _hook_dir:
+    _counter_candidates.append(
+        os.path.normpath(os.path.join(_hook_dir, os.pardir, "scripts")))
+_project_dir = os.environ.get("CLAUDE_PROJECT_DIR", "")
+if _project_dir:
+    _counter_candidates.append(
+        os.path.join(_project_dir, ".claude", "scripts"))
+for _d in _counter_candidates:
+    _f = os.path.join(_d, "claude_token_counter.py")
+    if os.path.isfile(_f):
+        sys.path.insert(0, _d)
         try:
-            from claude_token_counter import TranscriptScanner, iter_assistant_text
-            iter_assistant_text_for_marker_scan = iter_assistant_text
+            from claude_token_counter import (
+                TranscriptScanner,
+                iter_assistant_text_for_marker_scan,
+            )
             _have_scanner = True
         except ImportError:
-            pass
+            try:
+                from claude_token_counter import TranscriptScanner, iter_assistant_text
+                iter_assistant_text_for_marker_scan = iter_assistant_text
+                _have_scanner = True
+            except ImportError:
+                pass
+        break
 
-if _have_scanner and transcript_path and os.path.exists(transcript_path):
+_want_scan = bool(transcript_path) and os.path.exists(transcript_path)
+if not _have_scanner and _want_scan:
+    print(
+        "[kg-update-nudge] BROKEN INSTALL: .claude/scripts/"
+        "claude_token_counter.py is missing or unimportable (looked next to "
+        "the hook and under $CLAUDE_PROJECT_DIR); the work-unit counter "
+        "cannot run and the KG-update nudge would silently never fire. "
+        "Re-run the VCO bundle update to restore it.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+# W6-F incremental scanning: recover this session's resume point BEFORE the
+# scan (best-effort, unlocked read - the authoritative read-modify-write is
+# the locked one below). Rows written before W6-F carry no scan_offset and
+# simply get one last full (or bounded-tail) scan.
+_prev_scan_offset = 0
+_prev_cumulative = 0
+if _want_scan and os.path.exists(METRICS_FILE):
+    try:
+        with open(METRICS_FILE, "r", encoding="utf-8") as _pf:
+            for _pl in _pf:
+                _pl = _pl.strip()
+                if not _pl:
+                    continue
+                try:
+                    _pe = json.loads(_pl)
+                except json.JSONDecodeError:
+                    continue
+                if _pe.get("session_id") == session_id:
+                    if _pe.get("metric_version") == METRIC_VERSION:
+                        _prev_scan_offset = int(_pe.get("scan_offset") or 0)
+                        _prev_cumulative = int(_pe.get("cumulative_total") or 0)
+                    break
+    except (OSError, ValueError):
+        pass
+
+if _have_scanner and _want_scan:
     _escape_holder = [0]
     def _on_msg(entry, msg, running_units):
+        # With incremental scanning the callback only sees NEWLY consumed
+        # bytes - a marker in already-consumed bytes was acted on by the
+        # scan that consumed them.
         for t in iter_assistant_text_for_marker_scan(msg):
             if NO_KG_UPDATE_MARKER_RE.search(t):
                 _escape_holder[0] = running_units
                 break
-    scan_result = TranscriptScanner().scan(transcript_path, on_assistant_message=_on_msg)
-    session_total = scan_result.work_units_total
-    escape_marker_token_total = _escape_holder[0]
+    scan_result = TranscriptScanner().scan(
+        transcript_path, on_assistant_message=_on_msg,
+        start_offset=_prev_scan_offset)
+    # W6-F: the scan's totals are the DELTA over the byte range it scanned;
+    # accumulate them onto the persisted cumulative. A scan that did NOT
+    # start at the persisted offset (rotated transcript restart, or the
+    # bounded tail window of a first scan over an oversized transcript) is
+    # a FRESH BASIS - its total replaces the cumulative, it cannot add to
+    # it.
+    _scan_base = (
+        _prev_cumulative
+        if scan_result.start_offset_used == _prev_scan_offset
+        else 0
+    )
+    session_total = _scan_base + scan_result.work_units_total
+    escape_marker_token_total = (
+        _scan_base + _escape_holder[0] if _escape_holder[0] else 0
+    )
+    _new_scan_offset = scan_result.end_offset
 
 # HK-4 / D-7: acquire the stable lock for the whole read-modify-write.
 _lock_fd = _acquire_lock(LOCKFILE)
@@ -359,6 +437,12 @@ The escape hatch is for the truly orthogonal turn (deploys, status reports, scru
 # Bookkeeping
 if session_total:
     current["last_seen_total"] = session_total
+# W6-F: persist the incremental-scan resume point + cumulative basis (only
+# when a scan actually ran - a run without a transcript must not wipe the
+# resume state).
+if _new_scan_offset is not None:
+    current["scan_offset"] = _new_scan_offset
+    current["cumulative_total"] = session_total
 current["updated_at"] = datetime.now(timezone.utc).isoformat()
 current["metric_version"] = METRIC_VERSION
 state[session_id] = current
@@ -410,11 +494,16 @@ sys.exit(0)
 
 # Run the Python script. Output (the nudge message) goes to stdout, which
 # Claude Code surfaces as a system-reminder for UserPromptSubmit hooks.
+# v0.2.102 W6-F: a non-zero exit is the BROKEN-INSTALL loud-fail (the counter
+# module missing while a transcript asked to be counted) - propagate it;
+# UserPromptSubmit treats exit 1 as non-blocking (only 2 blocks the prompt).
 & $pythonCmd -c $pythonScript
+$pyRc = $LASTEXITCODE
 
 # Cleanup the temp payload file + the env vars we set (per-process, harmless
 # but tidy).
 Remove-Item -LiteralPath $nudgeInputFile -Force -ErrorAction SilentlyContinue
-Remove-Item Env:_KG_NUDGE_INPUT_FILE, Env:_KG_NUDGE_FIRST, Env:_KG_NUDGE_INTERVAL, Env:_KG_NUDGE_METRICS, Env:_KG_NUDGE_VERSION -ErrorAction SilentlyContinue
+Remove-Item Env:_KG_NUDGE_INPUT_FILE, Env:_KG_NUDGE_FIRST, Env:_KG_NUDGE_INTERVAL, Env:_KG_NUDGE_METRICS, Env:_KG_NUDGE_VERSION, Env:_KG_NUDGE_HOOK_DIR -ErrorAction SilentlyContinue
 
+if ($pyRc -ne 0) { exit 1 }
 exit 0

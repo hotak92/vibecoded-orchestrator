@@ -7,7 +7,7 @@ Usage (the thin .sh/.ps1 wrappers of Wave 2 call exactly this)::
 
     hook_context_router.py <surface> [--intent-out FILE] [--claim]   # hook JSON on stdin
 
-    surfaces: bash | read | write | edit | grep | agent
+    surfaces: bash | read | write | edit | grep | agent | prompt
 
 Contract
 --------
@@ -47,7 +47,9 @@ Mechanism (one interpreter, one home):
   surfaces' keys (and vice-versa). Empty results are NEVER cached (§9).
 
 Kill switch: ``VCO_INJECT_PROFILE=off`` → exit 0 silently (checked first,
-beside the wrappers' own check).
+beside the wrappers' own check). Per-surface: ``VCO_PROMPT_INJECT=off``
+disables ONLY the ``prompt`` surface (checked beside the global switch;
+the prompt wrappers also check it before spawning anything).
 
 Env seams (tests + Wave 2):
 * ``VCO_ROUTER_KG_SCRIPT`` — path to the KG producer (default: sibling
@@ -118,6 +120,7 @@ from vco_lib.inject_intent import (  # noqa: E402
     kg_query_for_targets,
     language_for_path,
     pattern_gate,
+    prompt_query,
     sanitize_session_id,
     search_symbol_for_pattern,
     task_type_for,
@@ -126,7 +129,7 @@ from vco_lib.inject_intent import (  # noqa: E402
 
 import hook_dual_search as _hds  # noqa: E402 — sibling module (sys.path above)
 
-SURFACES = ("bash", "read", "write", "edit", "grep", "agent")
+SURFACES = ("bash", "read", "write", "edit", "grep", "agent", "prompt")
 
 _BASH_PROFILE_BY_INTENT = {
     INTENT_READ: "bash_read",
@@ -821,6 +824,36 @@ def _agent_plan(payload: Dict, cwd: str) -> _Plan:
     return plan  # no CG leg on the agent surface (§2.1: keep the brief small)
 
 
+def _prompt_plan(payload: Dict, cwd: str) -> _Plan:
+    """v0.2.102 W6-F: the UserPromptSubmit surface — the shipped "search the
+    KG on every prompt" promise (README.md:108-113, GETTING_STARTED.md:
+    321-323). The query is the user's prompt TEXT (:func:`prompt_query`
+    owns the trim/skip rule) — the one prose query in the redesign, because
+    prose is all a prompt carries. KG leg only: §2.1 issues no semantic
+    code-graph queries from injection surfaces, and a prompt yields no
+    exact-lookup symbol.
+
+    ``prompt_id`` IS a common hook-input field and is normally PRESENT on
+    UserPromptSubmit (it names the prompt being submitted — the field the
+    per-turn budget keys on, so the budget applies per turn here as on
+    every other surface). It may be ABSENT (the vendor docs' "absent until
+    the first user input" edge, older harnesses); the budget then fails
+    OPEN for that one turn (budget_state_path's documented None-sentinel).
+    The per-injection soft cap bounds the block either way, and the
+    surface fires once per prompt by construction."""
+    plan = _Plan()
+    query = prompt_query(str(payload.get("prompt") or ""))
+    plan.intent_out = {"surface": "prompt", "has_query": bool(query)}
+    if not query:
+        return plan
+    gate = kg_gate("prompt")
+    if gate is not None:
+        plan.kg_query = query
+        plan.kg_profile = "prompt"
+        plan.kg_limit = gate.max_rows or 3
+    return plan
+
+
 _PLAN_BUILDERS = {
     "bash": _bash_plan,
     "read": _read_plan,
@@ -828,6 +861,7 @@ _PLAN_BUILDERS = {
     "edit": _edit_plan,
     "grep": _grep_plan,
     "agent": _agent_plan,
+    "prompt": _prompt_plan,
 }
 
 
@@ -906,6 +940,18 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
         if kg_script.is_file():
             try:
                 kg_mod = _hds._load_cg_module(kg_script)
+                # v0.2.102 W6-F fix-round (review MEDIUM): the producer's
+                # lazy weaviate_mcp.server import runs inside the leg, i.e.
+                # in run_legs' WORKER thread, and that module registers a
+                # SIGHUP handler AT IMPORT TIME — signal.signal raises
+                # ValueError off the main thread. The original W6-F fix
+                # warmed the import here in the main thread (masked on
+                # CG-bearing surfaces by query_code_graph.py's own
+                # main-thread module-level import); the ROOT fix now lives
+                # in _lib/sighup_handler.py, whose
+                # register_sighup_exit_handler is a logged no-op off the
+                # main thread — so ANY non-main-thread importer is safe
+                # and the warm-import shim is retired (one home, not two).
                 argv = [plan.kg_query, "--limit", str(plan.kg_limit),
                         "--hook-format", "--injection-profile", plan.kg_profile,
                         "--task-type", task_type_for(plan.kg_profile)]
@@ -1285,6 +1331,16 @@ def _main(argv: List[str]) -> int:
 
     # Kill switch first (beside the wrappers' own check): off → total silence.
     if (os.environ.get("VCO_INJECT_PROFILE") or "").strip().lower() == "off":
+        return 0
+
+    # v0.2.102 W6-F fix-round (review MEDIUM): per-surface kill switch for
+    # the prompt surface — VCO_PROMPT_INJECT=off disables ONLY UserPromptSubmit
+    # injection (the per-prompt python+weaviate-stack spawn is the one
+    # surface whose latency sits on the critical path of EVERY prompt).
+    # The wrappers check it too, before any spawn; THIS is the enforcement
+    # home (one code path for every caller of the router).
+    if surface == "prompt" and \
+            (os.environ.get("VCO_PROMPT_INJECT") or "").strip().lower() == "off":
         return 0
 
     try:

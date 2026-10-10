@@ -102,6 +102,11 @@
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/context-size-check.ps1\"",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/compact-context-reinject.ps1\"",
+            "timeout": 5
           }
         ]
       },
@@ -117,6 +122,16 @@
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-update-nudge.ps1\"",
             "timeout": 4
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/compact-context-reinject.ps1\"",
+            "timeout": 5
           }
         ]
       }
@@ -167,6 +182,11 @@
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-skill-keyword-suggest.ps1\"",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/prompt-context-inject.ps1\"",
+            "timeout": 10
           }
         ]
       }

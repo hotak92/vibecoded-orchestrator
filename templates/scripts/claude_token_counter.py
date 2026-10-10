@@ -187,6 +187,16 @@ class ScanResult:
     `cache_creation_total` and `cache_read_total` are exposed for any consumer
     (the nudge is the only current one) — do NOT use cache_creation as a work
     signal.
+
+    v0.2.102 W6-F: incremental scanning. `start_offset_used` is the byte
+    offset the scan actually began at (== the requested `start_offset`,
+    except 0 after a rotation restart, or `size - tail_scan_bytes` when a
+    first-time scan met an oversized transcript); `end_offset` is the byte
+    offset up to which the file was CONSUMED (complete lines only) — persist
+    it and pass it back as the next scan's `start_offset`. With either
+    non-default the totals are the DELTA over the scanned byte range, not
+    whole-file totals; the caller accumulates them onto its own persisted
+    cumulative counter.
     """
 
     work_units_total: int = 0          # v10.1 — the work-done counter
@@ -195,6 +205,8 @@ class ScanResult:
     output_tokens_total: int = 0       # diagnostic / debugging
     deduped_requests: int = 0
     raw_entries_with_usage: int = 0
+    start_offset_used: int = 0         # W6-F: where the scan actually began
+    end_offset: int = 0                # W6-F: bytes consumed (resume point)
     seen_request_ids: set[str] = field(default_factory=set)
     # Per-request char tallies, accumulated when the next request's tool_result
     # blocks reveal what was returned. Keyed by tool_use_id (correlates the
@@ -243,35 +255,114 @@ class TranscriptScanner:
 
     Computes `work_units_total` (v10.1) — the recommended signal for the
     KG-update nudge. See module docstring for formula.
+
+    v0.2.102 W6-F — incremental, size-bounded scanning. The pre-W6-F scanner
+    returned an EMPTY result for any transcript >= 256 MB ("hard cap to avoid
+    OOM"), which answered "0 work units" for exactly the long sessions the
+    nudge exists for (measured live: a 1.55 GB main-session transcript
+    scanned to 0). The replacement contract:
+
+    * `start_offset` resumes a scan from a previously persisted
+      `ScanResult.end_offset`, so a growing transcript is only ever scanned
+      once. The file is streamed line by line in BINARY mode — the whole
+      transcript is never read into memory, at any size.
+    * A resume seeds the requestId dedup set from a bounded BACKSCAN window
+      (default 1 MB) just before the offset, so a request whose streaming
+      entries straddle the boundary is not double-counted. A request whose
+      entries span MORE than the window (a single >1 MB tool result)
+      escapes the seed — a one-request over-count once per such boundary,
+      accepted and documented; the reverse error (under-count) is what the
+      seed prevents for the common case.
+    * A first-time scan (no usable offset) of a transcript at/over
+      `max_full_scan_bytes` does a BOUNDED TAIL scan of the last
+      `tail_scan_bytes` (default 64 MB): the counter answers "work units in
+      the recent tail" instead of "0 because too big". The caller treats the
+      result as a fresh basis (its persisted cumulative does not apply to a
+      window that started mid-file — see `start_offset_used`).
+    * The file's final line is consumed only when newline-terminated: a
+      live transcript's last line may be mid-write, and counting a partial
+      JSON row would both mis-parse and lose it for the next resume.
+    * `start_offset` past end-of-file means the transcript was rotated or
+      truncated: the scan restarts from 0 (or the tail window when the new
+      file is already oversized).
+
+    The constructor limits are injectable so tests exercise the oversized
+    branches without manufacturing real 256 MB files.
     """
 
-    MAX_TRANSCRIPT_BYTES = 256 * 1024 * 1024  # 256 MB hard cap to avoid OOM
+    MAX_TRANSCRIPT_BYTES = 256 * 1024 * 1024  # full-scan limit (NOT a give-up)
+    TAIL_SCAN_BYTES = 64 * 1024 * 1024        # first-scan window over the limit
+    BACKSCAN_BYTES = 1 * 1024 * 1024          # dedup-seed window on resume
+
+    def __init__(
+        self,
+        max_full_scan_bytes: int | None = None,
+        tail_scan_bytes: int | None = None,
+        backscan_bytes: int | None = None,
+    ) -> None:
+        self.max_full_scan_bytes = (
+            max_full_scan_bytes if max_full_scan_bytes else self.MAX_TRANSCRIPT_BYTES
+        )
+        self.tail_scan_bytes = (
+            tail_scan_bytes if tail_scan_bytes else self.TAIL_SCAN_BYTES
+        )
+        self.backscan_bytes = (
+            backscan_bytes if backscan_bytes is not None else self.BACKSCAN_BYTES
+        )
 
     def scan(
         self,
         transcript_path: str | os.PathLike,
         on_assistant_message: callable | None = None,
+        start_offset: int = 0,
     ) -> ScanResult:
         """Scan a transcript file. Returns aggregated totals.
 
         on_assistant_message: optional callback receiving (entry_dict, msg_dict,
                               running_work_units). Used by kg-update-nudge
                               to detect escape markers in assistant text.
+                              With a non-zero `start_offset` the callback —
+                              like the totals — covers only the NEWLY scanned
+                              byte range (a marker in already-consumed bytes
+                              was acted on by the scan that consumed them).
         """
         result = ScanResult()
         path = os.fspath(transcript_path)
         if not path or not os.path.exists(path):
             return result
         try:
-            if os.path.getsize(path) >= self.MAX_TRANSCRIPT_BYTES:
-                return result
+            size = os.path.getsize(path)
         except OSError:
             return result
 
+        offset = max(0, int(start_offset or 0))
+        if offset > size:
+            offset = 0  # rotated/truncated transcript: restart
+        if offset == 0 and size >= self.max_full_scan_bytes:
+            # First scan of a huge transcript: count the bounded TAIL window
+            # rather than giving up (the pre-W6-F empty result) or scanning
+            # the whole file on a hook's time budget.
+            offset = max(0, size - self.tail_scan_bytes)
+        result.start_offset_used = offset
+
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    self._process_line(line, result, on_assistant_message)
+            with open(path, "rb") as f:
+                if offset > 0:
+                    self._seed_seen_request_ids(f, offset, result)
+                    f.seek(offset)
+                while True:
+                    raw = f.readline()
+                    if not raw:
+                        break
+                    if not raw.endswith(b"\n"):
+                        # Mid-write final line: leave it UNCONSUMED for the
+                        # next resume (end_offset is not advanced past it).
+                        break
+                    result.end_offset = f.tell()
+                    self._process_line(
+                        raw.decode("utf-8", errors="replace"),
+                        result, on_assistant_message,
+                    )
         except OSError:
             pass
 
@@ -279,6 +370,41 @@ class TranscriptScanner:
         # mid-call) — discarded; do not credit speculative chars.
         result._pending_intake.clear()
         return result
+
+    def _seed_seen_request_ids(
+        self, f, offset: int, result: ScanResult
+    ) -> None:
+        """Seed the dedup set from the bounded window just BEFORE `offset`,
+        so a requestId whose entries straddle the resume boundary is
+        recognised as already-counted. Reads at most `backscan_bytes`."""
+        window = min(offset, self.backscan_bytes)
+        if window <= 0:
+            return
+        try:
+            f.seek(offset - window)
+            data = f.read(window)
+        except OSError:
+            return
+        # Drop the window's first partial line (we seeked into its middle).
+        nl = data.find(b"\n")
+        if 0 <= nl < len(data) - 1:
+            data = data[nl + 1:]
+        for raw in data.split(b"\n"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            msg = entry.get("message")
+            req_id = entry.get("requestId") or (
+                msg.get("id") if isinstance(msg, dict) else ""
+            ) or ""
+            if req_id:
+                result.seen_request_ids.add(req_id)
 
     def _process_line(
         self,

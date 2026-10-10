@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Diff-based context injection — only inject CHANGED sections of CONTEXT_STATE.md
-# First prompt: create baseline snapshot (full injection handled by session-start hooks)
+# First prompt: create baseline snapshot. The FULL injection the baseline
+# defers is real: compact-context-reinject.sh (SessionStart matchers
+# startup/resume/compact, since v0.2.102 W6-F) injects CONTEXT_STATE.md in
+# full at session start, inside its per-section budgets and the shared
+# hook-output cap (_lib/reinject-budgets.txt + _lib/emit-context.sh).
 # Subsequent prompts: output only changed sections (or nothing if unchanged)
 # After /compact: reset baseline (detected via compact flag)
 
@@ -106,8 +110,9 @@ diff_context_section() {
     # If the live file doesn't exist, nothing to do.
     [ -f "$live_file" ] || return 0
 
-    # If no snapshot exists, create baseline (first prompt — full injection
-    # is done by the session-start hooks).
+    # If no snapshot exists, create baseline (first prompt — the full
+    # injection is compact-context-reinject.sh's at SessionStart, see the
+    # header comment).
     if [ ! -f "$snap_file" ]; then
         cp "$live_file" "$snap_file"
         return 0

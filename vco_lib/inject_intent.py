@@ -1046,6 +1046,37 @@ def agent_task_section(prompt: str) -> str:
     return sentence[:400]
 
 
+# --- A3: the UserPromptSubmit surface's query rule (v0.2.102 W6-F) ------------
+
+#: Below this many trimmed characters a prompt is an acknowledgement or
+#: continuation ("ok", "yes, go on") with no retrieval value — skip it.
+PROMPT_MIN_CHARS = 24
+#: Query cap for the prompt surface (the agent_brief 400 rationale: brief
+#: queries embed better and bound the cache key / argv surface).
+PROMPT_QUERY_MAX_CHARS = 400
+
+_WS_RUN_RE = re.compile(r"\s+")
+
+
+def prompt_query(prompt: str) -> str:
+    """The KG query for the UserPromptSubmit surface: the user's prompt
+    TEXT, trimmed, whitespace-collapsed and capped — the one surface whose
+    query is prose rather than a path/symbol topic, because the README /
+    GETTING_STARTED promise is "search the KG on every prompt" and prose is
+    all a prompt carries.
+
+    "" when the prompt is not worth a retrieval: empty, a slash command
+    (``/compact …`` — harness directives, not knowledge queries), a bang
+    shell passthrough (``!ls``), or trivially short (below
+    :data:`PROMPT_MIN_CHARS`)."""
+    text = _WS_RUN_RE.sub(" ", (prompt or "").strip())
+    if not text or text.startswith(("/", "!")):
+        return ""
+    if len(text) < PROMPT_MIN_CHARS:
+        return ""
+    return text[:PROMPT_QUERY_MAX_CHARS]
+
+
 # --- §2.1 noise-gate table (the ONE tunable home) -----------------------------
 
 STRONG_SCORE = 0.85
@@ -1102,6 +1133,11 @@ KG_GATES: Dict[str, Optional[KgGate]] = {
     # Agent brief: small + deterministic (lands in the lane's FIRST prompt)
     "agent_brief": KgGate(floor=0.65, tier_above="three_chunks", max_rows=3,
                           max_chars=1500),
+    # UserPromptSubmit (v0.2.102 W6-F): the shipped "search the KG on every
+    # prompt" promise (README.md:108-113, GETTING_STARTED.md:321-323). The
+    # query is the user's free-text prompt, so this is a WEAK-signal surface
+    # like the Read rows: 0.70 floor, titles-only below 0.85.
+    "prompt": KgGate(floor=0.70, tier_above="single_chunk", max_rows=3),
 }
 
 #: §2.1 code-graph column.
@@ -1122,6 +1158,10 @@ CG_POLICIES: Dict[str, CgPolicy] = {
     "edit": CgPolicy(enabled=True, exclude_self_file=True),
     "write": CgPolicy(enabled=True, exclude_self_file=True),
     "agent_brief": CgPolicy(enabled=False),
+    # No CG leg on the prompt surface: §2.1 issues no SEMANTIC code-graph
+    # queries from injection surfaces, and a free-text prompt yields no
+    # exact-lookup key.
+    "prompt": CgPolicy(enabled=False),
 }
 
 #: WP-B1/WP-D: RL task_type per profile. ``pre_search_kg_search`` is
@@ -1139,6 +1179,7 @@ TASK_TYPE_BY_PROFILE: Dict[str, str] = {
     "edit": "pre_edit_kg_search",
     "write": "pre_write_kg_search",
     "agent_brief": "agent_brief_kg_search",
+    "prompt": "prompt_kg_search",
 }
 
 #: Every profile name the router / --injection-profile accept.

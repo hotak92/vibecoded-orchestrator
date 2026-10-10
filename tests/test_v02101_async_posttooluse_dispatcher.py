@@ -18,8 +18,10 @@ tool call because 3 registrations fired.
 THE FIX (plan-of-record, PLAN-V0300:1012 "merge async hooks"): ONE async
 PostToolUse registration (matcher ``*``, timeout 15) running
 ``post-tool-use-async.{sh,ps1}``. The dispatcher reads stdin ONCE to a temp
-file, routes by ``tool_name`` (plus a ``git-commit-prefix`` gate that
-carries the retired ``if: Bash(git commit *)`` registration key) to the
+file, routes by ``tool_name`` (plus a ``git-commit-chain`` gate that
+carries the retired ``if: Bash(git commit *)`` registration key, widened
+in v0.2.102 W6-F to a quote-aware CHAIN walk — ``cd x && git commit``
+fires it, quoted text does not) to the
 UNCHANGED per-concern scripts, runs the matched children CONCURRENTLY (the
 wall-time shape the separate async registrations had), and guarantees
 silence: child stdout is discarded, child stderr / non-zero exits condense
@@ -82,6 +84,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vco_lib import hook_retirements as hr  # noqa: E402
+from vco_lib.git_commit_gate import command_has_git_commit  # noqa: E402
 
 HOOKS = REPO_ROOT / "templates" / "hooks"
 DISPATCHER_SH = HOOKS / "post-tool-use-async.sh"
@@ -159,7 +162,7 @@ def _parse_rows(block: str) -> list[tuple[str, str, str]]:
             continue
         m = ROUTE_ROW_RE.match(line.strip())
         assert m, f"routing-table row is not tool|stem|gate shaped: {line!r}"
-        assert m.group(3) in ("-", "git-commit-prefix"), (
+        assert m.group(3) in ("-", "git-commit-chain"), (
             f"unknown gate {m.group(3)!r} in row {line!r}"
         )
         rows.append((m.group(1), m.group(2), m.group(3)))
@@ -177,18 +180,19 @@ def _expected_subhooks(
 
     Never hand-copied: the table is the one declaration, and this function
     is the same match the dispatcher performs (tool equality or ``*``; the
-    ``git-commit-prefix`` gate keyed on ``tool_input.command`` being
-    ``git commit`` exactly or followed by a space — the word-boundary form
-    of the retired ``if: Bash(git commit *)`` key, review N-1; minus any
-    stem disabled via ``VCO_ASYNC_DISABLED_HOOKS``, review SF-2).
+    ``git-commit-chain`` gate (v0.2.102 W6-F — was ``git-commit-prefix``)
+    decided by the ONE home ``vco_lib.git_commit_gate.command_has_git_commit``:
+    a quote-aware chain walk that fires on a ``git commit`` segment ANYWHERE
+    in the command — ``cd sub && git commit`` fires, ``echo "git commit"``
+    does not; minus any stem disabled via ``VCO_ASYNC_DISABLED_HOOKS``,
+    review SF-2).
     """
-    c = command.lstrip() if command else ""
-    is_commit = c == "git commit" or c.startswith("git commit ")
+    is_commit = bool(command) and command_has_git_commit(command)
     out: set[str] = set()
     for tool, stem, gate in rows:
         if tool != "*" and tool != tool_name:
             continue
-        if gate == "git-commit-prefix" and not is_commit:
+        if gate == "git-commit-chain" and not is_commit:
             continue
         if disabled and stem in disabled:
             continue
@@ -383,10 +387,15 @@ def test_route_table_is_the_pre_v02101_registration_shape():
         ("Bash", "git commit -m x"): with_commit,
         # N-1 word boundary: bare `git commit` fires the retired
         # `if: Bash(git commit *)` gate; `git commit-tree` (different
-        # porcelain command) and a non-prefix compound do NOT.
+        # porcelain command) does NOT. v0.2.102 W6-F: the gate walks the
+        # CHAIN (the pre-W6-F prefix match left the reviewer dormant since
+        # 2026-06-13 — every `cd … && git commit` missed) and stays
+        # quote-aware (an echoed "git commit" is data, not a commit).
         ("Bash", "git commit"): with_commit,
         ("Bash", "git commit-tree abc123"): no_commit,
-        ("Bash", "cd sub && git commit -m x"): no_commit,
+        ("Bash", "cd sub && git commit -m x"): with_commit,
+        ("Bash", "git -C /repo commit -m x"): with_commit,
+        ("Bash", "echo 'git commit'"): no_commit,
         ("Edit", None): {
             "post-edit-outcome", "kg-summary-generator", "kg-update-nudge",
         },
@@ -513,6 +522,10 @@ def sh_rig(tmp_path):
         "TMPDIR": str(tmpdir),
         "CLAUDE_PROJECT_DIR": str(proj),
         "VCO_TEST_MARKER": str(marker),
+        # W6-F: the git-commit-chain gate imports vco_lib.git_commit_gate
+        # from the orchestrator root (the dispatcher resolves it through
+        # _lib/resolve-vco-venv's orchestrator ladder).
+        "VCT_ORCHESTRATOR_ROOT": str(REPO_ROOT),
     })
     env.pop("VCT_DISABLE_HOOKS", None)
     env.pop("KG_NUDGE_OFF", None)
@@ -567,8 +580,9 @@ def _payload(tool_name: str, command: str | None = None, **tool_input) -> dict:
 
 
 #: (case id, payload). The EXPECTED set is derived per case from the table.
-#: The two git-boundary cases pin review N-1: bare `git commit` fires the
-#: gate, `git commit-tree` (a different porcelain command) must NOT.
+#: The git-boundary cases pin review N-1 + W6-F: bare `git commit` fires the
+#: gate, `git commit-tree` (a different porcelain command) must NOT, and a
+#: CHAINED `cd sub && git commit` (the W6-F widening) fires.
 ROUTING_CASES = [
     ("bash-plain", _payload("Bash", command="ls -la")),
     ("bash-git-commit", _payload("Bash", command="git commit -m 'x'")),
@@ -777,6 +791,10 @@ def ps_rig(tmp_path):
         "TMP": str(tmpdir),
         "CLAUDE_PROJECT_DIR": str(proj),
         "VCO_TEST_MARKER": str(marker),
+        # W6-F: the git-commit-chain gate imports vco_lib.git_commit_gate
+        # from the orchestrator root (the dispatcher resolves it through
+        # _lib/resolve-vco-venv's orchestrator ladder).
+        "VCT_ORCHESTRATOR_ROOT": str(REPO_ROOT),
     })
     env.pop("VCT_DISABLE_HOOKS", None)
     env.pop("KG_NUDGE_OFF", None)
