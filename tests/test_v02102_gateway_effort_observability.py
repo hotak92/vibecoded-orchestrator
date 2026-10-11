@@ -264,6 +264,52 @@ class EffortOnTheLedgerTests(EffortObservabilityTestBase):
         # zai accepts medium live — nothing is rewritten.
         self.assertEqual(rows[0]["effort_forwarded"], "medium")
 
+    async def test_kimi_route_records_the_pair(self) -> None:
+        """The kimi vendor row: doc-only policy, nothing rewritten.
+
+        Kimi documents medium→high as a VENDOR-side collapse (effort.py's
+        module rule: a collapse is recorded as data, never applied as a
+        rewrite), so the forwarded value is the client's own — and the row
+        says so on this route too.
+        """
+        from model_router.vendors import VENDORS
+
+        self.vendor = replace(VENDORS["kimi"], upstream=self.vendor.upstream)
+        self.client = await self.make_client()
+        self.vendor_up.messages_body = _success("k3")
+        await self.post({
+            "model": "claude-gw/kimi/k3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "medium"},
+        })
+        rows = await self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["route"], "vendor:kimi")
+        self.assertEqual(rows[0]["effort_requested"], "medium")
+        # No kimi translate entry — the collapse is the vendor's, upstream.
+        self.assertEqual(rows[0]["effort_forwarded"], "medium")
+
+    async def test_deepseek_route_records_the_pair(self) -> None:
+        """The deepseek models ride the QWEN vendor row — same recording.
+
+        deepseek-v4.1-flash's effort policy is also collapse-only (the
+        endpoint maps low/medium→high itself), so nothing is rewritten; the
+        pair is still recorded on the row, which is the route-agnostic claim
+        this suite pins per vendor surface.
+        """
+        await self.post({
+            "model": "claude-gw/qwen/deepseek-v4.1-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "medium"},
+        })
+        rows = await self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["route"], "vendor:qwen")
+        self.assertEqual(rows[0]["forward"], "deepseek-v4.1-flash")
+        self.assertEqual(rows[0]["effort_requested"], "medium")
+        # Collapse-only policy — the client's value goes on unchanged.
+        self.assertEqual(rows[0]["effort_forwarded"], "medium")
+
 
 class EffortOnTheAccessLineTests(EffortObservabilityTestBase):
 

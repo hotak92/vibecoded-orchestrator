@@ -567,15 +567,17 @@ class LedgerTests(unittest.TestCase):
         )
 
     def test_keep_lines_is_about_a_quarter_of_the_cap(self) -> None:
-        """The documented figure, at the shipped default: 21 845 lines.
+        """The documented figure, at the shipped default: 16 868 lines.
 
-        Re-derived at v0.2.102: the effort pair (``effort_requested`` /
-        ``effort_forwarded``) joined the row, so the measured
-        :data:`U.LEDGER_ROW_BYTES` moved from 545 to 600 and the line count
-        at the same quarter-cap with it.
+        Re-measured at v0.2.102 (review LOW H1): the constant is the LONGEST
+        realistic fully-populated row across every route (776 bytes of JSON +
+        newline — the qwen/deepseek namespaced ``[1m]`` id, UUID ids, 7-digit
+        token counts, the longest fallback label, the ``budget_tokens=``
+        effort spelling), so the line count at the same quarter-cap moved
+        with it. The pre-pair figure of 545 was a derived underestimate.
         """
         ledger = U.UsageLedger(self.path)
-        self.assertEqual(ledger._keep_lines(), 21_845)
+        self.assertEqual(ledger._keep_lines(), 16_868)
         surviving = ledger._keep_lines() * U.LEDGER_ROW_BYTES
         self.assertAlmostEqual(
             surviving / U.LEDGER_MAX_BYTES, 0.25, places=2,

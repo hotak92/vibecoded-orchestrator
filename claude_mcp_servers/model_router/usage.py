@@ -111,22 +111,35 @@ LEDGER_BASENAME = "gateway-usage.jsonl"
 #: disk-usage decision the user never made.
 LEDGER_MAX_BYTES = 50 * 1024 * 1024
 
-#: One fully-populated row, measured — every field set, a UUID session id and
-#: a UUID agent id, a namespaced ``[1m]`` model id. Used only to turn a byte
-#: cap into a LINE count for :func:`vco_lib.atomic.rotate_tail_lines`, which
-#: keeps lines rather than bytes. Re-measured at v0.2.102 when the effort
-#: pair (``effort_requested`` / ``effort_forwarded``) joined the row.
-LEDGER_ROW_BYTES = 600
+#: One fully-populated row, measured — the LONGEST realistic row across every
+#: route (anthropic, zai, qwen, kimi — the qwen/deepseek model id is the
+#: longest namespaced ``[1m]`` spelling), every field set at its realistic
+#: maximum: UUID session/agent/parent-agent ids, 7-digit token counts on a
+#: 1M-window chat, ``window_actual`` 1 000 000, an 8-digit
+#: ``request_bytes``, the longest ``fallback_from`` label
+#: (``vendor:qwen:deepseek-v4.1-flash``), and the LONGEST effort spelling
+#: (``budget_tokens=8192`` on both sides of the pair; a named tier is
+#: shorter). That case serialises to 776 bytes + the newline. Used only to
+#: turn a byte cap into a LINE count for
+#: :func:`vco_lib.atomic.rotate_tail_lines`, which keeps lines rather than
+#: bytes — a TYPICAL row is smaller, so the surviving tail is at most about a
+#: quarter of the cap, never more. Re-measured at v0.2.102 when the effort
+#: pair (``effort_requested`` / ``effort_forwarded``) joined the row; the
+#: pre-pair figure of 545 was itself a derived underestimate.
+LEDGER_ROW_BYTES = 777
 
 #: What fraction of :data:`LEDGER_MAX_BYTES` survives a rotation. A quarter:
 #: enough recent history that a monitor restarted after a rotation still has
 #: context to show, and small enough that rotations are rare rather than one
-#: per write. At the default cap that is ``(52428800 // 4) // 600`` =
-#: **21 845 lines**, about 13.1 MiB — a quarter of the cap, as intended.
+#: per write. At the default cap that is ``(52428800 // 4) // 777`` =
+#: **16 868 lines**, about 12.5 MiB when every row is a maximal
+#: :data:`LEDGER_ROW_BYTES` row — at most a quarter of the cap, as intended;
+#: typical (smaller) rows keep the same LINE count and proportionally fewer
+#: bytes.
 #:
-#: The ratio holds for a TYPICAL row. An atypically long client-supplied model
-#: id makes the surviving tail proportionally larger; the file is still
-#: bounded, because the next append re-checks the cap.
+#: The ratio holds for a MAXIMAL row. An atypically long client-supplied model
+#: id beyond even that makes the surviving tail proportionally larger; the
+#: file is still bounded, because the next append re-checks the cap.
 LEDGER_KEEP_FRACTION = 4
 
 #: How many sessions the in-memory "last row per chat" map holds. Bounded and
