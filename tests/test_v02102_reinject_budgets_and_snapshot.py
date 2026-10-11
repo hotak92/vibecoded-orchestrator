@@ -62,7 +62,7 @@ DEFAULT_CAP = 9500
 def _env(project: Path, **extra: str) -> dict:
     env = dict(os.environ)
     for key in ("VCT_DISABLE_HOOKS", "VCO_HOOK_CONTEXT_CAP",
-                "VCO_SNAPSHOT_MAX_AGE"):
+                "VCO_SNAPSHOT_MAX_AGE", "VCO_SNAPSHOT_FILELIST_N"):
         env.pop(key, None)
     env["CLAUDE_PROJECT_DIR"] = str(project)
     env.update(extra)
@@ -234,8 +234,10 @@ def test_budget_table_is_wellformed_and_ships():
             continue
         key, val, *_ = t.split()
         rows[key] = int(val)
-    assert {"session_state", "plan", "commits", "snapshot", "pruned",
+    assert {"session_state", "plan", "commits", "snapshot",
             "overhead"} <= set(rows)
+    # v0.2.102 W6-K: the pruned section was removed with precompact_prune.py
+    assert "pruned" not in rows, "the retired pruned row must not return"
     assert sum(v for k, v in rows.items() if k != "overhead") + \
         rows["overhead"] < 10000
     # hook_lib_data_globs must cover it, or it never reaches installs.
@@ -262,8 +264,6 @@ def _oversize_project(tmp_path: Path) -> Path:
     (proj / ".claude" / "context" / "pre-compact-snapshot.md").write_text(
         "# Pre-Compaction Snapshot\nSaved: now\n\n"
         "## Modified Files\nM src/snapshot-file.py\n", encoding="utf-8")
-    (proj / ".claude" / "context" / "pruned-context-summary.md").write_text(
-        "edited: knowledge/a.md\n" * 60, encoding="utf-8")
     return proj
 
 
@@ -364,21 +364,25 @@ def test_lowered_cap_scales_budgets_and_keeps_sections(
     budgets down (each floored at 300 chars) so every section stays
     represented. 1000 is the shared cap helper's clamp MINIMUM (values below
     are clamped up), and even there the scaled floors keep every section
-    header — the whole-stream backstop cuts inside the headerless pruned
-    tail, which is the documented below-1750 degradation."""
+    tail, which is the documented below-1650 degradation (W6-K: five
+    sections since the pruned row was removed with precompact_prune.py)."""
     proj = _oversize_project(tmp_path)
     out = _hook(impl, "compact-context-reinject", proj,
                 json.dumps({"session_id": "s1"}),
                 VCO_HOOK_CONTEXT_CAP=str(cap))
     assert len(out.rstrip("\n")) <= cap
     if at_min:
-        # 1000 is the cap helper's clamp MINIMUM. The scaled floors still
-        # keep the first three sections' headers, but six oversize sections
-        # cannot fit: the whole-stream backstop engages and names the files.
+        # 1000 is the cap helper's clamp MINIMUM — below the 1650 all-
+        # oversize floor (W6-K: five sections). The scaled floors keep every
+        # section HEADER as long as the section's real content is not itself
+        # over its floor (this fixture's commits/snapshot are small), and
+        # the whole-stream backstop stays idle; with every section oversize
+        # the backstop would cut inside the later sections instead.
         for header in ("## Current Task State", "## This Session's Task State",
-                       "## Active Plan"):
+                       "## Active Plan", "## Recent Commits",
+                       "## Pre-Compaction Snapshot"):
             assert header in out, (impl, header)
-        assert f"output cut at {cap} of" in out, (impl, cap)
+        assert f"output cut at {cap} of" not in out, (impl, cap)
         return
     for header in ("## Current Task State", "## This Session's Task State",
                    "## Active Plan", "## Recent Commits",
@@ -443,3 +447,152 @@ def test_sh_ps1_byte_parity_on_a_fixed_oversize_input(tmp_path):
     out_ps = _hook("ps1", "compact-context-reinject", proj_ps, payload)
     a, b = out_sh.replace("\r\n", "\n"), out_ps.replace("\r\n", "\n")
     assert a == b
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# v0.2.102 W6-K — precompact_prune.py removed; snapshot file list rebuilt
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_precompact_prune_no_longer_ships():
+    """Item 6 (owner-approved removal): the script is gone from the shipped
+    tree — the bundle update's orphan pass then deletes the installed copy
+    (manifest case b: hash matches prior-shipped, never user-touched)."""
+    assert not (REPO / "templates" / "scripts" / "precompact_prune.py").exists()
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_precompact_save_does_not_invoke_a_prune_script(impl, tmp_path):
+    """Behavioural pin (no source scan): a planted canary
+    .claude/scripts/precompact_prune.py must NOT run — the hook call was
+    removed with the script, and an upgraded install's leftover copy (until
+    the orphan pass deletes it) stays inert."""
+    proj = _project(tmp_path)
+    canary = proj / ".claude" / "scripts" / "precompact_prune.py"
+    canary.parent.mkdir(parents=True, exist_ok=True)
+    probe = proj / "prune-canary-ran"
+    canary.write_text(
+        "open(r'%s', 'w').close()\n" % probe.as_posix(), encoding="utf-8")
+    _hook(impl, "pre-compact-save", proj,
+          json.dumps({"session_id": "s1", "trigger": "manual"}))
+    assert not probe.exists(), "pre-compact-save still invokes precompact_prune.py"
+
+
+def _snapshot_filelist(snapshot: Path) -> "list[str]":
+    text = snapshot.read_text(encoding="utf-8")
+    section = text.split("## Recently Modified Files", 1)[1]
+    lines = section.splitlines()
+    # drop the heading's remainder (" (newest first, ...)") on the first line
+    if lines and not lines[0].startswith("/"):
+        lines = lines[1:]
+    return [ln for ln in lines if ln.strip()]
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_snapshot_filelist_newest_first_capped_at_n(impl, tmp_path):
+    """Item 5: newest-first order, capped at VCO_SNAPSHOT_FILELIST_N; no
+    boundary exists yet (no marker, no transcript) so every file qualifies
+    by age and only N bounds the list."""
+    proj = _project(tmp_path)
+    # _project() wrote CONTEXT_STATE.md just now — back-date it so only the
+    # f*.py files (deterministic mtimes below) populate the list.
+    os.utime(proj / ".claude" / "CONTEXT_STATE.md", (1700000000, 1700000000))
+    files = []
+    for i in range(8):
+        f = proj / ("f%d.py" % i)
+        f.write_text("x", encoding="utf-8")
+        os.utime(f, (1700000000 + i, 1700000000 + i))
+        files.append(f)
+    _hook(impl, "pre-compact-save", proj,
+          json.dumps({"session_id": "s1", "trigger": "manual"}),
+          VCO_SNAPSHOT_FILELIST_N="5")
+    listed = _snapshot_filelist(proj / ".claude" / "context" / "pre-compact-snapshot.md")
+    assert len(listed) == 5, (impl, listed)
+    names = [Path(ln).name for ln in listed]
+    assert names == ["f7.py", "f6.py", "f5.py", "f4.py", "f3.py"], (impl, names)
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_snapshot_filelist_boundary_is_the_last_compact(impl, tmp_path):
+    """Item 5: after a first compaction wrote the marker, the SECOND run
+    lists only files modified since that marker."""
+    proj = _project(tmp_path)
+    old = proj / "old.py"
+    old.write_text("x", encoding="utf-8")
+    # The marker is epoch SECONDS (truncated): back-date everything that
+    # predates the first compaction by a wide margin so the boundary is
+    # unambiguous.
+    _past = datetime.now(timezone.utc).timestamp() - 3600
+    os.utime(old, (_past, _past))
+    os.utime(proj / ".claude" / "CONTEXT_STATE.md", (_past, _past))
+    _hook(impl, "pre-compact-save", proj,
+          json.dumps({"session_id": "s1", "trigger": "manual"}))
+    marker = proj / ".claude" / "context" / "last-compact-marker"
+    assert marker.exists()
+    fresh = proj / "fresh.py"
+    fresh.write_text("x", encoding="utf-8")
+    # The marker is integer epoch SECONDS: pin fresh.py safely past it so
+    # the assertion cannot flake on a same-second boundary.
+    _after = float(marker.read_text().strip()) + 10
+    os.utime(fresh, (_after, _after))
+    _hook(impl, "pre-compact-save", proj,
+          json.dumps({"session_id": "s1", "trigger": "manual"}))
+    listed = _snapshot_filelist(proj / ".claude" / "context" / "pre-compact-snapshot.md")
+    names = [Path(ln).name for ln in listed]
+    assert "fresh.py" in names, (impl, names)
+    assert "old.py" not in names, (impl, names)
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_snapshot_filelist_boundary_is_chat_start_without_marker(impl, tmp_path):
+    """Item 5: with NO compact marker, the boundary is the chat's start —
+    the transcript's first-entry timestamp. Files older than the first
+    transcript entry are excluded even on the FIRST compaction."""
+    proj = _project(tmp_path)
+    older = proj / "older.py"
+    older.write_text("x", encoding="utf-8")
+    start = datetime.now(timezone.utc) + timedelta(seconds=5)
+    os.utime(older, (start.timestamp() - 3600, start.timestamp() - 3600))
+    newer = proj / "newer.py"
+    newer.write_text("x", encoding="utf-8")
+    os.utime(newer, (start.timestamp() + 60, start.timestamp() + 60))
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "timestamp": start.isoformat(),
+                    "message": "first"}) + "\n", encoding="utf-8")
+    _hook(impl, "pre-compact-save", proj,
+          json.dumps({"session_id": "s1", "trigger": "manual",
+                      "transcript_path": str(transcript)}))
+    names = [Path(ln).name for ln in _snapshot_filelist(
+        proj / ".claude" / "context" / "pre-compact-snapshot.md")]
+    assert "newer.py" in names, (impl, names)
+    assert "older.py" not in names, (impl, names)
+
+
+def test_sh_filelist_says_so_when_no_python_resolves(tmp_path):
+    """W6-K review F3 (LOW): a python-less machine must get an EXPLICIT
+    notice — in the snapshot section AND on stderr — not a silently empty
+    section under a heading that promised a file list. The .ps1 sibling
+    needs no interpreter for its listing (native PowerShell), so this arm
+    is .sh-only by construction."""
+    proj = _project(tmp_path)
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    # A PATH with everything the hook itself needs but NO python3/python/py;
+    # VCO_FIND_PYTHON_PATH_ONLY=1 keeps the venv ladder out of the decision.
+    for name in ("bash", "dirname", "git", "date", "mkdir", "cat", "touch",
+                 "head"):
+        src = shutil.which(name)
+        assert src, name
+        os.symlink(src, stub_bin / name)
+    env = _env(proj, VCO_FIND_PYTHON_PATH_ONLY="1", PATH=str(stub_bin))
+    res = subprocess.run(
+        ["bash", str(HOOKS / "pre-compact-save.sh")],
+        input=json.dumps({"session_id": "s1", "trigger": "manual"}),
+        capture_output=True, text=True, timeout=120, env=env,
+        cwd=str(proj))
+    assert res.returncode == 0, res.stderr
+    snap = proj / ".claude" / "context" / "pre-compact-snapshot.md"
+    text = snap.read_text(encoding="utf-8")
+    assert "(file list unavailable" in text, text
+    assert "no Python interpreter resolved" in res.stderr, res.stderr

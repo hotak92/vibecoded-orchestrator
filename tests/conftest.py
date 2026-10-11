@@ -1812,12 +1812,28 @@ def _disable_rl_hub_writes_in_tests(request):
 # the run sets `VCO_TEST_LIVE_WEAVIATE=1` (the installer-smoke X-2 step and
 # `scripts/pre-ship-check.sh` Section 5 do) or `VCO_TEST_ALLOW_REAL_STATE=1`;
 # otherwise it is pinned like every other file and its live legs skip.
+#
+# v0.2.102 W6-K (owner ruling 2026-10-11) — the READ-ONLY smoke files are
+# exempt from that opt-in again: read-only access to the live Weaviate is
+# SAFE, so `test_codegraph_retrieval_quality_smoke` (queries only, creates
+# nothing — asserted by a schema-class snapshot around its live leg) and the
+# opt-in canary see the ambient value UNCONDITIONALLY, on a plain full-suite
+# run included. The two write-capable files (they create + drop their own
+# uniquely-named classes) KEEP the opt-in requirement — the W6-B2 concern
+# stands for anything that can CREATE state on a live backend.
 _LIVE_WEAVIATE_OPTIN_ENV = "VCO_TEST_LIVE_WEAVIATE"
 _LIVE_WEAVIATE_OPTED_IN = os.environ.get(_LIVE_WEAVIATE_OPTIN_ENV, "") not in ("", "0", "false")
 
 _LIVE_WEAVIATE_OPT_OUT_FILES: frozenset = frozenset({
     "test_v0246_v46b_live_ci10_diff_gate.py",
     "test_v0246_kg_sync_live.py",
+    "test_codegraph_retrieval_quality_smoke.py",
+    "test_v0294_live_weaviate_optin_canary.py",
+})
+
+#: The READ-ONLY members of the list above (owner 2026-10-11: read-only live
+#: access is safe; the ambient URL reaches them without any opt-in env).
+_LIVE_WEAVIATE_READONLY_FILES: frozenset = frozenset({
     "test_codegraph_retrieval_quality_smoke.py",
     "test_v0294_live_weaviate_optin_canary.py",
 })
@@ -1829,6 +1845,8 @@ def _weaviate_url_pin_for(test_file: str) -> "str | None":
     Pure and importable, so both branches are provable without a backend
     (`tests/test_v0294_fixture_class_guard.py` drives it directly).
     """
+    if test_file in _LIVE_WEAVIATE_READONLY_FILES:
+        return _AMBIENT_WEAVIATE_URL
     if _ALLOW_REAL_STATE or (_LIVE_WEAVIATE_OPTED_IN and test_file in _LIVE_WEAVIATE_OPT_OUT_FILES):
         return _AMBIENT_WEAVIATE_URL
     return _fixture_guard.UNROUTABLE_SENTINEL_URL

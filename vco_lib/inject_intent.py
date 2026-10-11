@@ -1050,7 +1050,31 @@ def agent_task_section(prompt: str) -> str:
 
 #: Below this many trimmed characters a prompt is an acknowledgement or
 #: continuation ("ok", "yes, go on") with no retrieval value — skip it.
-PROMPT_MIN_CHARS = 24
+#: v0.2.102 W6-K (owner ruling 2026-10-11): 24 -> 100 — "ok to proceed" /
+#: "start the review" must spawn no search; the knob is
+#: ``VCO_PROMPT_MIN_CHARS`` (documented beside ``VCO_PROMPT_INJECT``).
+PROMPT_MIN_CHARS = 100
+#: Env knob for the one threshold above (one threshold, one home: this
+#: module's ``prompt_query`` is the only reader; the wrappers and the router
+#: reach it through :func:`prompt_query``).
+PROMPT_MIN_CHARS_ENV = "VCO_PROMPT_MIN_CHARS"
+
+
+def _prompt_min_chars() -> int:
+    """:data:`PROMPT_MIN_CHARS`, overridable via ``VCO_PROMPT_MIN_CHARS``.
+
+    A non-positive or unparseable value falls back to the default (a knob
+    that silently disabled the surface would be a second kill switch by
+    accident — ``VCO_PROMPT_INJECT=off`` is that switch, on purpose)."""
+    raw = (os.environ.get(PROMPT_MIN_CHARS_ENV) or "").strip()
+    if raw:
+        try:
+            val = int(raw)
+        except ValueError:
+            return PROMPT_MIN_CHARS
+        if val > 0:
+            return val
+    return PROMPT_MIN_CHARS
 #: Query cap for the prompt surface (the agent_brief 400 rationale: brief
 #: queries embed better and bound the cache key / argv surface).
 PROMPT_QUERY_MAX_CHARS = 400
@@ -1067,12 +1091,13 @@ def prompt_query(prompt: str) -> str:
 
     "" when the prompt is not worth a retrieval: empty, a slash command
     (``/compact …`` — harness directives, not knowledge queries), a bang
-    shell passthrough (``!ls``), or trivially short (below
-    :data:`PROMPT_MIN_CHARS`)."""
+    shell passthrough (``!ls``), or trivially short (below the
+    :data:`PROMPT_MIN_CHARS` threshold, overridable via
+    :data:`PROMPT_MIN_CHARS_ENV`)."""
     text = _WS_RUN_RE.sub(" ", (prompt or "").strip())
     if not text or text.startswith(("/", "!")):
         return ""
-    if len(text) < PROMPT_MIN_CHARS:
+    if len(text) < _prompt_min_chars():
         return ""
     return text[:PROMPT_QUERY_MAX_CHARS]
 

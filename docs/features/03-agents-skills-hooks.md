@@ -94,8 +94,8 @@ Display KG resource paths at session start. Optionally launches the RL server if
 ### `context-size-check.sh` — SessionStart (startup, blocking)
 Warn if `CONTEXT_STATE.md` exceeds configured thresholds (warn: 300 lines, max: 400 lines). Prompts to run `doc-maintainer` agent to trim.
 
-### `compact-context-reinject.sh` — SessionStart (startup + compact + resume)
-Re-inject `CONTEXT_STATE.md`, recent git commits and the active plan at session start, after a resume, and after context compaction (the pre-compact snapshot and pruned-activity sections are compaction artefacts and emit only on `compact`). Before v0.2.102 only the `compact` matcher was registered.
+### `compact-context-reinject.sh` — SessionStart (startup + compact)
+Re-inject `CONTEXT_STATE.md`, recent git commits and the active plan at session start and after context compaction (the pre-compact snapshot section is a compaction artefact and emits only on `compact`). Before v0.2.102 only the `compact` matcher was registered; v0.2.102 W6-F briefly added `resume` and W6-K withdrew it (owner 2026-10-11: a resumed chat already has CONTEXT_STATE in context) — the bundle update scrubs the resume group from installs that received it.
 
 <details>
 <summary>Details</summary>
@@ -234,7 +234,7 @@ Why: pre-v0.2.101 the templates carried EIGHT async PostToolUse registrations ac
 Spawns a background Haiku agent to generate/update summary descriptions for KG nodes after edits. Content-hash dedup: skips regeneration if node content unchanged. Summaries written to `knowledge/.node_formats.json`. Since v0.2.101 it is no longer registered directly (three registrations retired into the dispatcher); its own knowledge-path validation is the gate the retired `if:` keys used to pre-filter.
 
 ### `post-git-commit-kg-sync.sh` — PostToolUse Bash(git commit *) (routed by `post-tool-use-async`)
-Spawn a background Haiku agent to review the commit diff and update relevant KG nodes and docs. Non-blocking. Guards with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside agent subprocesses. Since v0.2.101 the registration is the dispatcher's `git-commit-prefix` routing gate, which reproduces the retired `if: Bash(git commit *)` key.
+Spawn a background Haiku agent to review the commit diff and update relevant KG nodes and docs. Non-blocking. Guards with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside agent subprocesses. Since v0.2.101 the registration is the dispatcher's `git-commit-prefix` routing gate, which reproduces the retired `if: Bash(git commit *)` key. Since v0.2.102 W6-K the spawn goes through the backend chain `.claude/scripts/kg_reviewer_backend.py` (owner ruling 2026-10-11): Haiku by default; when Haiku is unavailable (quota / 429 / auth — a real signal latched in the summary backend's breaker file) it falls back `claude-gw/glm-5.3-flash` → `claude-gw/deepseek-v4.1-flash` → `claude-gw/qwen3.8-flash`, each only when the local model gateway's catalogue actually serves it, and finally to OpenAI when the user enabled OpenAI for summaries (a degraded, review-only rung — no KG writes). Every skipped rung and every fallback is logged to `.claude/logs/kg-commit-review.log`.
 
 ### `post-tool-security.sh` — PostToolUse Edit|Write (background)
 Scan written files for accidentally included credentials. Non-blocking; alerts logged to `.claude/logs/credential_alerts.jsonl` with desktop notification.

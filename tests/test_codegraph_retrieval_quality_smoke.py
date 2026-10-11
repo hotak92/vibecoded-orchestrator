@@ -175,6 +175,25 @@ def _has_code_collection(url: str) -> bool:
         return False
 
 
+def _schema_class_names(url: str) -> frozenset:
+    """The backend's schema-class set — the read-only proof's snapshot.
+
+    Best-effort: an unreadable schema returns an empty set, which makes the
+    before/after comparison vacuously pass rather than flake the smoke."""
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(
+            f"{url.rstrip('/')}/v1/schema", timeout=5
+        ) as resp:
+            schema = json.load(resp)
+        return frozenset(
+            c.get("class", "") for c in schema.get("classes", [])
+        )
+    except Exception:
+        return frozenset()
+
+
 def _live_infra_present() -> tuple[bool, str]:
     url = os.environ.get("WEAVIATE_URL", "http://localhost:8081")
     if not _weaviate_ready(url):
@@ -224,13 +243,17 @@ def test_live_known_noise_query_returns_only_relevant_or_empty() -> None:
     either zero rows or only rows scoring above the post-rerank floor — never a
     flood of below-floor noise.
 
-    Gated: OPT-IN — ``tests/conftest.py`` pins ``WEAVIATE_URL`` at the
-    unroutable sentinel unless the run sets ``VCO_TEST_LIVE_WEAVIATE=1`` (v0.2.102
-    W6-B2 last round; an ambient URL alone is not an opt-in), so a plain run
-    SKIPS here without contacting any backend. Also SKIPS when Weaviate / a
-    code collection is absent (non-blocking in infra-less CI). The weaviate-smoke workflow sets
-    VCO_RUN_LIVE_RETRIEVAL_SMOKE=1 to convert a skip into a failure so the live
-    lane genuinely exercises real data.
+    READ-ONLY (v0.2.102 W6-K, owner ruling 2026-10-11): this file only ever
+    QUERIES — it creates, writes and drops nothing, and the test below
+    snapshots the backend's schema-class set before/after its live leg to
+    prove it (a write call would change that set). ``tests/conftest.py``
+    therefore restores the AMBIENT ``WEAVIATE_URL`` for this file
+    unconditionally — read-only live access is safe — and a plain full-suite
+    run from a session exporting ``WEAVIATE_URL`` genuinely exercises the
+    live backend here. SKIPS when Weaviate / a code collection is absent
+    (non-blocking in infra-less CI). The weaviate-smoke workflow sets
+    VCO_RUN_LIVE_RETRIEVAL_SMOKE=1 to convert a skip into a failure so the
+    live lane genuinely exercises real data.
     """
     present, detail = _live_infra_present()
     if not present:
@@ -241,6 +264,10 @@ def test_live_known_noise_query_returns_only_relevant_or_empty() -> None:
         pytest.skip(f"live retrieval smoke skipped: {detail}")
 
     url = detail
+    # v0.2.102 W6-K: the cheap no-write proof — snapshot the schema-class
+    # set around the live leg. This file creates nothing; any write call
+    # (a class create/drop) would show up as a diff here.
+    _schema_before = _schema_class_names(url)
     # A query with no plausible code-entity match. If the floors work, the
     # result set is empty or contains only genuinely high-score rows.
     #
@@ -310,3 +337,9 @@ def test_live_known_noise_query_returns_only_relevant_or_empty() -> None:
         f"{combined[:1000]}"
     )
     _ = hit_markers  # informational; not asserted strictly to stay seed-agnostic
+    # v0.2.102 W6-K: read-only, PROVEN — the schema-class set is unchanged.
+    _schema_after = _schema_class_names(url)
+    assert _schema_after == _schema_before, (
+        "this smoke is READ-ONLY by contract but the schema changed around "
+        f"its live leg: {_schema_before ^ _schema_after}"
+    )

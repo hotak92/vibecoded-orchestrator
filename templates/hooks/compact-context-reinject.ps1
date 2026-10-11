@@ -5,15 +5,18 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # compact-context-reinject.ps1
-# Fires on SessionStart matchers "compact", "resume" and "startup"
+# Fires on SessionStart matchers "compact" and "startup"
 # (v0.2.102 W6-F: the ORCHESTRATOR template documented "SessionStart
 # (compact/resume)" while only compact was registered, and
 # diff-context-inject's "full injection" comment had no backing hook at
 # startup). Re-injects critical session context to stdout (becomes
-# additionalContext); at startup/resume injects CONTEXT_STATE.md (in full,
+# additionalContext); at startup injects CONTEXT_STATE.md (in full,
 # inside the per-section budgets and the shared cap). The COMPACTION
-# ARTEFACTS (pre-compact snapshot, pruned-activity summary) are emitted
-# only for source=compact or an absent/unknown source (the pre-W6-F shape).
+# ARTEFACT (pre-compact snapshot) is emitted only for source=compact or an
+# absent/unknown source (the pre-W6-F shape). v0.2.102 W6-K: the "resume"
+# matcher was withdrawn (owner 2026-10-11 -- a resumed chat already has
+# CONTEXT_STATE in context) and the pruned-activity summary section was
+# removed with precompact_prune.py.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 # Shared session_id parse + path-safety sanitise (Get-VcoHookSessionId). One
@@ -36,7 +39,7 @@ try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $SessionId = Get-VcoHookSessionId -Stdin $HookStdin
 
 # v0.2.102 W6-F (items 5+6): which SessionStart source fired us. The
-# compaction artefact sections (snapshot, pruned summary) are emitted only
+# compaction artefact section (snapshot) is emitted only
 # for compactions; an absent/unknown source keeps the pre-W6-F shape.
 # MUST MATCH the .sh sibling's _IS_COMPACT_SOURCE.
 $HookSource = ""
@@ -124,7 +127,7 @@ function Get-VcoSnapshotSavedLine([string]$Path) {
 }
 
 # -- build the sections (text incl. their own header) --
-$S_ctx = ""; $S_sess = ""; $S_plan = ""; $S_commits = ""; $S_snap = ""; $S_pruned = ""
+$S_ctx = ""; $S_sess = ""; $S_plan = ""; $S_commits = ""; $S_snap = ""
 
 # 1. CONTEXT_STATE.md -- START position (the FLEX section). The header
 # names WHY we fired (compact vs startup/resume) so the model does not read
@@ -180,14 +183,6 @@ if ($IsCompactSource -and (Test-Path -LiteralPath $Snapshot)) {
     }
 }
 
-# 5. Pruned activity summary (line cap 30), truncated AFTER re-injection.
-#    A compaction artefact: only emitted (and only that path truncates) for
-#    source=compact / unknown (W6-F).
-$Pruned = Join-Path $ProjectDir ".claude/context/pruned-context-summary.md"
-if ($IsCompactSource -and (Test-Path -LiteralPath $Pruned) -and ((Get-Item -LiteralPath $Pruned).Length -gt 0)) {
-    $S_pruned = (Get-Content -LiteralPath $Pruned -TotalCount 30) -join "`n"
-}
-
 # -- budget the flex section, then emit every section under its budget --
 $HaveCap = [bool](Get-Command Limit-VcoHookContext -ErrorAction SilentlyContinue)
 $RbMinSection = 300   # a section's floor: its header plus a cut marker
@@ -199,20 +194,21 @@ if ($HaveCap -and $RB.ContainsKey('overhead')) {
     # the table asks for (overhead + sum of fixed budgets + the flex floor)
     # scales the FIXED budgets down proportionally, each floored at
     # $RbMinSection chars, so every section stays represented at any cap down
-    # to the sane floor 1750 (5*300 + 200 flex floor + 250 headroom). Below
-    # that no budgeting can keep six headers, and the whole-stream backstop
+    # to the sane floor 1650 (4*300 + 200 flex floor + 250 headroom;
+    # v0.2.102 W6-K removed the fifth fixed section with precompact_prune.py).
+    # Below that no budgeting can keep five headers, and the whole-stream backstop
     # cuts inside the later sections -- documented in the table.
     $fixedTotal = 0
-    foreach ($k in 'session_state','plan','commits','snapshot','pruned') {
+    foreach ($k in 'session_state','plan','commits','snapshot') {
         if ($RB.ContainsKey($k)) { $fixedTotal += [int]$RB[$k] }
     }
     if ([int]$RB['overhead'] + $fixedTotal + $RbFlexFloor -gt $cap) {
         $avail = $cap - [int]$RB['overhead'] - $RbFlexFloor
-        if ($avail -lt ($RbMinSection * 5)) {
+        if ($avail -lt ($RbMinSection * 4)) {
             $avail = $cap - 250 - $RbFlexFloor   # bare-minimum headroom
         }
         if ($avail -gt 0 -and $fixedTotal -gt 0) {
-            foreach ($k in 'session_state','plan','commits','snapshot','pruned') {
+            foreach ($k in 'session_state','plan','commits','snapshot') {
                 if ($RB.ContainsKey($k)) {
                     $RB[$k] = [Math]::Max($RbMinSection, [int][Math]::Floor([int]$RB[$k] * $avail / $fixedTotal))
                 }
@@ -224,7 +220,6 @@ if ($HaveCap -and $RB.ContainsKey('overhead')) {
     if ($S_plan)    { $fixed += Get-RbAlloc $S_plan    (Get-RbBudget 'plan') }
     if ($S_commits) { $fixed += Get-RbAlloc $S_commits (Get-RbBudget 'commits') }
     if ($S_snap)    { $fixed += Get-RbAlloc $S_snap    (Get-RbBudget 'snapshot') }
-    if ($S_pruned)  { $fixed += Get-RbAlloc $S_pruned  (Get-RbBudget 'pruned') }
     $Flex = $cap - [int]$RB['overhead'] - $fixed
     if ($Flex -lt $RbFlexFloor) { $Flex = $RbFlexFloor }
 }
@@ -246,9 +241,6 @@ if ($LatestPlan) { $PlanPointer = "rest is on disk: Read .claude/context/plans/$
 $Parts += Emit-RbSection $S_plan (Get-RbBudget 'plan') $PlanPointer
 $Parts += Emit-RbSection $S_commits (Get-RbBudget 'commits') "run 'git log --oneline -20' for more"
 $Parts += Emit-RbSection $S_snap (Get-RbBudget 'snapshot') "rest is on disk: Read .claude/context/pre-compact-snapshot.md"
-$Parts += Emit-RbSection $S_pruned (Get-RbBudget 'pruned') "(pruned activity summary truncated)"
-# Truncate the pruned summary AFTER emitting it (unchanged behaviour).
-if ($S_pruned) { Set-Content -Path $Pruned -Value "" -NoNewline }
 
 # v0.2.102 W6-D review F4: strip the trailing newlines, cap, then write the
 # text + exactly ONE newline -- byte-for-byte what the .sh sibling's
