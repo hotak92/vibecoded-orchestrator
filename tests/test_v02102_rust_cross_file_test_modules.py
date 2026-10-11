@@ -209,6 +209,49 @@ def test_scan_is_bounded_by_the_nearest_package(tmp_path: Path) -> None:
     assert crm.rust_file_is_test_only(root / "src" / "tests.rs", root) is True
 
 
+@pytest.mark.parametrize("gated_first", [True, False])
+def test_a_file_reached_through_both_a_gated_and_an_ungated_declaration_stays_production(
+    tmp_path: Path, gated_first: bool,
+) -> None:
+    """Production wins: one ungated route is enough, whichever declaration
+    comes first and whichever file declares it."""
+    root = tmp_path
+    (root / "Cargo.toml").write_text("[package]\nname = \"dual\"\n")
+    (root / "src").mkdir()
+    gated = "#[cfg(test)]\n#[path = \"shared.rs\"]\nmod shared_for_tests;\n"
+    ungated = "#[path = \"shared.rs\"]\nmod shared;\n"
+    (root / "src" / "lib.rs").write_text(
+        "mod other;\n" + (gated + ungated if gated_first else ungated + gated))
+    # A second declaring file adds a gated route from elsewhere too.
+    (root / "src" / "other.rs").write_text("#[cfg(test)]\n#[path = \"shared.rs\"]\nmod again;\n")
+    (root / "src" / "shared.rs").write_text("pub fn shared_fn() {}\n")
+    (root / "src" / "only_gated.rs").write_text("fn g() {}\n")
+    (root / "src" / "lib.rs").write_text(
+        (root / "src" / "lib.rs").read_text() + "#[cfg(test)]\nmod only_gated;\n")
+    assert crm.rust_file_is_test_only(root / "src" / "shared.rs", root) is False
+    assert _names(root, "src/shared.rs") == ["shared_fn"]
+    # control: the same crate's gated-only file IS test-only
+    assert crm.rust_file_is_test_only(root / "src" / "only_gated.rs", root) is True
+
+
+def test_a_project_without_rust_never_scans(tmp_path: Path, monkeypatch) -> None:
+    """Zero cost for non-Rust projects: no entry point lists or parses
+    anything when no `.rs` file is involved."""
+    def boom(*a: Any, **k: Any) -> None:
+        raise AssertionError("the Rust pre-pass scanned a non-Rust project")
+
+    monkeypatch.setattr(crm, "_list_rust_files", boom)
+    monkeypatch.setattr(crm, "_graph", boom)
+    py = tmp_path / "app.py"
+    py.write_text("def f():\n    return 1\n")
+    (tmp_path / ".git").mkdir()
+    assert crm.rust_file_is_test_only(py, tmp_path) is False
+    assert crm.rust_module_dependents([py], tmp_path) == []
+    assert crm.add_rust_module_dependents([py], [py], tmp_path) == [py]
+    assert crm.single_file_scope(py, tmp_path, lambda p: False) == [py]
+    assert filter_changed_files(tmp_path, [py], run=_git_diff_run(["app.py"])) == [py]
+
+
 def test_without_the_grammar_nothing_is_gated(tmp_path: Path, monkeypatch) -> None:
     root = _crate(tmp_path)
     monkeypatch.setattr(codegraph_defs, "parse", lambda lang, data: None)

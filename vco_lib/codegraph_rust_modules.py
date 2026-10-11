@@ -46,6 +46,15 @@ none), excluding nested packages, ``target``, ``vendor``, ``node_modules`` and
 dot-directories. The file listing is cached per process (one analyzer run);
 each file's declarations are cached by ``(mtime_ns, size)``, so an edit within
 the process is seen. :func:`clear_cache` resets both.
+
+Cost (measured 2026-10-11 on this repository): the first Rust file of a
+process pays one cold scan of its package — a stat and a tree-sitter parse of
+every ``.rs`` file in it, about 5 ms per file (286 files across the repo's
+packages: 1.45 s). Every later file of the same package is served from the
+cache (a stat per file to detect edits). A very large single-package Rust
+repository pays that scan proportionally, once per analyzer process. A
+project with no Rust pays nothing: every entry point returns before any scan
+when the file (or the changed set) has no ``.rs`` suffix.
 """
 from __future__ import annotations
 
