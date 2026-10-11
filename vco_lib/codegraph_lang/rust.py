@@ -18,7 +18,6 @@ TODAY.
 """
 from __future__ import annotations
 
-import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +32,7 @@ from vco_lib.codegraph_entities import (
     ModuleDescriptor,
 )
 from vco_lib.codegraph_defs import extract_definitions, note_path
+from vco_lib.codegraph_rust_modules import rust_effective_file_hash, rust_file_is_test_only
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
@@ -356,7 +356,9 @@ def extract_rust_file(
     source_lines = content.split('\n')
     loc = len([line for line in source_lines
                if line.strip() and not line.strip().startswith('//')])
-    file_hash = hashlib.sha256(content.encode()).hexdigest()
+    # v0.2.102 W6-G: salted for a file only a test-gated `mod x;` elsewhere
+    # loads, so the unchanged-file gate re-walks it when that gate flips.
+    file_hash = rust_effective_file_hash(content, file_path, repo_root)
     relative_path = file_path.relative_to(repo_root).as_posix()
 
     content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
@@ -373,8 +375,15 @@ def extract_rust_file(
     # (`#[test]`-family attributes incl. `#[tokio::test]`, and `#[cfg(test)]`
     # on the item or on any enclosing `mod`/`impl`) and never mints a symbol
     # from a string literal.
-    defs = extract_definitions("rust", content, origin=relative_path)
-    if defs is not None:
+    # A file loaded only through a test-gated `mod x;` in ANOTHER file
+    # (`#[cfg(test)] mod tests;` in lib.rs → tests.rs) is test code as a
+    # whole (v0.2.102 W6-G, vco_lib.codegraph_rust_modules): no classes or
+    # functions; the module row stays, as for a file under `#![cfg(test)]`.
+    test_only_file = rust_file_is_test_only(file_path, repo_root)
+    defs = None if test_only_file else extract_definitions("rust", content, origin=relative_path)
+    if test_only_file:
+        types, funcs = [], []
+    elif defs is not None:
         note_path("rust", "tree-sitter")
         types = [(c.name, c.start_line, c.end_line, defs.methods_of(c.name)) for c in defs.classes]
         funcs = [(f.name, f.params, f.start_line, f.end_line, f.is_async) for f in defs.functions]
@@ -480,4 +489,5 @@ def analyze_rust_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, i
     return run_pure_extractor(
         ctx, file_path, repo_root, extract_rust_file,
         {'modules': 0, 'classes': 0, 'functions': 0},
+        file_hash_fn=rust_effective_file_hash,
     )

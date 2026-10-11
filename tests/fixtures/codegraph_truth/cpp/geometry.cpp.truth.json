@@ -1,84 +1,108 @@
 {
  "source": "geometry.cpp",
- "reviewed": "W6-E 2026-10-10",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
  "symbols": [
   {
    "kind": "class",
    "name": "Circle",
    "start": 10,
-   "end": 18
+   "end": 18,
+   "full_name": "geometry.Circle",
+   "methods": [
+    "Circle",
+    "area",
+    "circumference"
+   ]
   },
   {
    "kind": "class",
    "name": "Point",
    "start": 20,
-   "end": 23
+   "end": 23,
+   "full_name": "geometry.Point",
+   "methods": []
   },
   {
    "kind": "class",
    "name": "Box",
    "start": 25,
-   "end": 29
+   "end": 29,
+   "full_name": "geometry.Box",
+   "methods": []
   },
   {
    "kind": "function",
    "name": "Circle",
    "start": 35,
-   "end": 35
+   "end": 35,
+   "full_name": "geometry.Circle.Circle"
   },
   {
    "kind": "function",
    "name": "area",
    "start": 37,
-   "end": 39
+   "end": 39,
+   "full_name": "geometry.Circle.area"
   },
   {
    "kind": "function",
    "name": "circumference",
    "start": 41,
-   "end": 43
+   "end": 43,
+   "full_name": "geometry.Circle.circumference"
   },
   {
    "kind": "function",
    "name": "distance",
    "start": 45,
-   "end": 49
+   "end": 49,
+   "full_name": "geometry.distance"
   },
   {
    "kind": "function",
    "name": "quadrant",
    "start": 55,
-   "end": 60
+   "end": 60,
+   "full_name": "geometry.quadrant"
   },
   {
    "kind": "function",
    "name": "smaller",
    "start": 63,
-   "end": 66
+   "end": 66,
+   "full_name": "geometry.smaller"
   },
   {
    "kind": "class",
    "name": "Tally",
    "start": 73,
-   "end": 83
+   "end": 83,
+   "full_name": "geometry.Tally",
+   "methods": [
+    "add",
+    "total"
+   ]
   },
   {
    "kind": "function",
    "name": "add",
    "start": 75,
-   "end": 75
+   "end": 75,
+   "full_name": "geometry.Tally.add"
   },
   {
    "kind": "function",
    "name": "total",
    "start": 77,
-   "end": 79
+   "end": 79,
+   "full_name": "geometry.Tally.total"
   },
   {
    "kind": "function",
    "name": "summarize",
    "start": 88,
-   "end": 99
+   "end": 99,
+   "full_name": "geometry.summarize"
   }
  ]
 }

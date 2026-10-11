@@ -1,60 +1,81 @@
 {
  "source": "Account.java",
- "reviewed": "W6-E 2026-10-10",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
  "symbols": [
   {
    "kind": "class",
    "name": "Account",
    "start": 4,
-   "end": 18
+   "end": 18,
+   "full_name": "golden.Account",
+   "methods": [
+    "Account",
+    "deposit",
+    "getBalance"
+   ]
   },
   {
    "kind": "function",
    "name": "Account",
    "start": 7,
-   "end": 9
+   "end": 9,
+   "full_name": "Account.Account"
   },
   {
    "kind": "function",
    "name": "deposit",
    "start": 11,
-   "end": 13
+   "end": 13,
+   "full_name": "Account.deposit"
   },
   {
    "kind": "function",
    "name": "getBalance",
    "start": 15,
-   "end": 17
+   "end": 17,
+   "full_name": "Account.getBalance"
   },
   {
    "kind": "class",
    "name": "Ledger",
    "start": 22,
-   "end": 24
+   "end": 24,
+   "full_name": "golden.Ledger",
+   "methods": [
+    "balanceOf"
+   ]
   },
   {
    "kind": "function",
    "name": "balanceOf",
    "start": 23,
-   "end": 23
+   "end": 23,
+   "full_name": "Ledger.balanceOf"
   },
   {
    "kind": "class",
    "name": "BaseAccount",
    "start": 26,
-   "end": 36
+   "end": 36,
+   "full_name": "golden.BaseAccount",
+   "methods": [
+    "audit",
+    "touch"
+   ]
   },
   {
    "kind": "function",
    "name": "audit",
    "start": 27,
-   "end": 27
+   "end": 27,
+   "full_name": "BaseAccount.audit"
   },
   {
    "kind": "function",
    "name": "touch",
    "start": 29,
-   "end": 35
+   "end": 35,
+   "full_name": "BaseAccount.touch"
   }
  ]
 }

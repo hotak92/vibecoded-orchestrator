@@ -498,6 +498,7 @@ try:
         prune_file_rows as _prune_file_rows, prune_git_deleted_files as _prune_git_deleted_files,
         filter_changed_files as _filter_changed_files_impl,
     )
+    from vco_lib.codegraph_rust_modules import single_file_scope as _single_file_scope
     # v0.2.91 dogfood fix: the orchestrator-root heuristic behind the
     # `--index-dot-claude` default has TWO callers now (here and the deferral
     # retry driver), so it lives in vco_lib rather than as a mirrored copy.
@@ -4252,10 +4253,9 @@ class CodeGraphAnalyzer:
 
         for lang_name, _find_fn, analyze_fn in lang_dispatch:
             if lang_name == dispatch_name:
-                # Return the RESOLVED root so the downstream
-                # `analyze_fn(f, source_root)` relativizes against the same
-                # symlink-normalized operand we gated on.
-                return [(lang_name, analyze_fn, [resolved], repo_root)]
+                # RESOLVED root (relativize against the gated operand); + Rust module dependents (W6-G).
+                return [(lang_name, analyze_fn, _single_file_scope(resolved, repo_root, lambda p: _path_is_excluded(
+                    p.relative_to(repo_root).parts, ignore_dirs)), repo_root)]
 
         # dispatch_name not present in lang_dispatch (shouldn't happen —
         # the map is kept in lock-step). Defensive no-op.

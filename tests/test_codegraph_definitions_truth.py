@@ -14,7 +14,10 @@ COMMITTED, hand-reviewed ground truth:
   files were written for this gate and their truth was written BY HAND before
   the extractor ran on them.
 * ``<file>.truth.json`` — the expected ``(kind, name, start, end)`` symbols
-  under the policies stated in :mod:`vco_lib.codegraph_defs`.
+  under the policies stated in :mod:`vco_lib.codegraph_defs`, each with its
+  ``full_name`` and (classes) ``methods`` — on EVERY fixture since W6-G; the
+  rows for the copied files were written by hand from the source, never
+  regenerated from the extractor.
 
 Each language must reach >= 95 % precision AND recall (multiset match on the
 full tuple — a wrong line range is a miss). The extractors run their shipped
@@ -52,6 +55,11 @@ def test_every_fixture_has_reviewed_truth(lang: str) -> None:
         for row in data["symbols"]:
             assert row["kind"] in ("class", "function")
             assert 1 <= row["start"] <= row["end"], row
+            # W6-G: identity and membership are scored on every fixture, not
+            # only the hand-written edge/broken ones.
+            assert row.get("full_name"), f"{tp.name}: {row['name']} carries no full_name"
+            if row["kind"] == "class":
+                assert isinstance(row.get("methods"), list), f"{tp.name}: {row['name']} carries no methods"
 
 
 def _require_grammar(grammar: str) -> None:

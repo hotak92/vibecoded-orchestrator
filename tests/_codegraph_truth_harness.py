@@ -10,9 +10,9 @@ class/function symbols against each fixture's committed, hand-reviewed
 ``<file>.truth.json``.
 
 A symbol is ``(kind, name, start_line, end_line, full_name, methods)``.
-``full_name`` and (for classes) ``methods`` are scored only where the truth row
-states them — every hand-written ``edge_cases.*`` / ``broken.*`` truth does,
-so a wrong identity or a wrong member list is a miss there. Precision and
+``full_name`` and (for classes) ``methods`` are scored where the truth row
+states them — every committed truth file does (W6-G extended the copied repo
+fixtures by hand), so a wrong identity or a wrong member list is a miss. Precision and
 recall are multiset matches, so a wrong line RANGE counts as both a false
 positive and a false negative — the truncated-body and runaway-scan defects
 score as misses, not as hits.

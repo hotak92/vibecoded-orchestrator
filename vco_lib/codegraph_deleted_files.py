@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence, Tuple
 
+from vco_lib.codegraph_rust_modules import add_rust_module_dependents
+
 #: (analyzer collection attribute, anchor property) for every file-anchored
 #: code-graph collection. CodeModule keys the file on ``path``; the rest on
 #: ``file_path`` (API + Interaction joined in v0.2.82).
@@ -111,6 +113,13 @@ def filter_changed_files(
     unknown SHAs fall back to the full list with one stderr notice — never a
     hard error. Shares its range rule with :func:`git_deleted_paths`, so the
     re-walk set and the delete set always describe the same diff.
+
+    v0.2.102 W6-G: a changed Rust file also re-queues the files it loads as
+    modules (transitively, among ``files``) — a ``#[cfg(test)]`` added to or
+    removed from ``mod tests;`` in ``lib.rs`` flips ``tests.rs`` between test
+    and production code although ``tests.rs`` itself is unchanged
+    (:func:`vco_lib.codegraph_rust_modules.add_rust_module_dependents`; the
+    unchanged-file gate still skips a dependent whose status did not flip).
     """
     if not (repo_path / ".git").exists():
         print(f"ℹ️  {repo_path} is not a git repository; analyzing all files",
@@ -134,7 +143,7 @@ def filter_changed_files(
         print("⚠️  Git not available or not a git repo, analyzing all files")
         return files
     changed = {repo_path / line.strip() for line in result.stdout.split('\n') if line.strip()}
-    return [f for f in files if f in changed]
+    return add_rust_module_dependents([f for f in files if f in changed], files, repo_path)
 
 
 def git_deleted_paths(

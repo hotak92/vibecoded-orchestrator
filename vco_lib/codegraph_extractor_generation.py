@@ -139,7 +139,12 @@ logger = logging.getLogger(__name__)
 #:          arrows, Go generics, C++ out-of-line constructors, shell
 #:          next-line-brace functions …; dropped phantoms: Rust ``fn`` in
 #:          string literals, ``#[tokio::test]`` / ``#[cfg(test)] mod`` code;
-#:          corrected line ranges and therefore bodies). Python, PowerShell
+#:          corrected line ranges and therefore bodies; and — W6-G — every
+#:          class/function of a Rust file loaded only through a test-gated
+#:          ``#[cfg(test)] mod x;`` in ANOTHER file, which
+#:          ``vco_lib.codegraph_rust_modules`` now resolves; such a file's
+#:          module ``file_hash`` is salted, so this rung's re-walk also
+#:          re-stamps it). Python, PowerShell
 #:          and Protocol Buffers are unchanged. The per-entity content-hash
 #:          gate re-embeds only rows whose extracted text changed;
 #:          ``CODEGRAPH_EMBED_REVISION`` is NOT bumped (model, chunking and
