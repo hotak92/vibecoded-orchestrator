@@ -1,24 +1,28 @@
 {
  "source": "glossary.ts",
- "reviewed": "W6-E 2026-10-10",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
  "symbols": [
   {
    "kind": "class",
    "name": "GlossaryEntry",
    "start": 12,
-   "end": 23
+   "end": 23,
+   "full_name": "glossary.GlossaryEntry",
+   "methods": []
   },
   {
    "kind": "function",
    "name": "getEntry",
    "start": 149,
-   "end": 151
+   "end": 151,
+   "full_name": "glossary.getEntry"
   },
   {
    "kind": "function",
    "name": "allEntries",
    "start": 153,
-   "end": 157
+   "end": 157,
+   "full_name": "glossary.allEntries"
   }
  ]
 }

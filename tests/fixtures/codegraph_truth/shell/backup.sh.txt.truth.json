@@ -1,24 +1,27 @@
 {
  "source": "backup.sh.txt",
- "reviewed": "W6-E 2026-10-10",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
  "symbols": [
   {
    "kind": "function",
    "name": "prepare_dir",
    "start": 10,
-   "end": 13
+   "end": 13,
+   "full_name": "backup.sh.prepare_dir"
   },
   {
    "kind": "function",
    "name": "upload_archive",
    "start": 16,
-   "end": 19
+   "end": 19,
+   "full_name": "backup.sh.upload_archive"
   },
   {
    "kind": "function",
    "name": "run_backup",
    "start": 21,
-   "end": 26
+   "end": 26,
+   "full_name": "backup.sh.run_backup"
   }
  ]
 }

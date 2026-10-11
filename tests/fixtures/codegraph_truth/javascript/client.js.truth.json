@@ -1,24 +1,31 @@
 {
  "source": "client.js",
- "reviewed": "W6-E 2026-10-10",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
  "symbols": [
   {
    "kind": "class",
    "name": "ApiClient",
    "start": 5,
-   "end": 13
+   "end": 13,
+   "full_name": "client.ApiClient",
+   "methods": [
+    "constructor",
+    "request"
+   ]
   },
   {
    "kind": "function",
    "name": "buildClient",
    "start": 15,
-   "end": 17
+   "end": 17,
+   "full_name": "client.buildClient"
   },
   {
    "kind": "function",
    "name": "doubler",
    "start": 19,
-   "end": 19
+   "end": 19,
+   "full_name": "client.doubler"
   }
  ]
 }

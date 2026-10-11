@@ -133,6 +133,7 @@ def run_pure_extractor(
     repo_root: Path,
     extract: Callable[[str, Path, Path, "ExtractorHelpers"], Any],
     empty_stats: Dict[str, int],
+    file_hash_fn: Optional[Callable[[str, Path, Path], str]] = None,
 ) -> Dict[str, int]:
     """The shared thin-shim body for a pure ``extract_<lang>_file`` producer.
 
@@ -159,6 +160,11 @@ def run_pure_extractor(
     ``empty_stats`` is the language's own zero-stats dict (they differ:
     js/csharp/proto also carry ``apis``) so the returned shape stays identical
     to the pre-Part-6 body on the skip paths.
+
+    ``file_hash_fn(content, file_path, repo_root)`` replaces the plain
+    ``sha256(content)`` for a language whose extraction depends on OTHER files
+    (Rust: a test-gated ``mod x;`` elsewhere — v0.2.102 W6-G). The extractor
+    must stamp the same value on its module row, or the gate never matches.
     """
     content = file_path.read_text(encoding="utf-8", errors="ignore")
     if _is_minified_content(content):
@@ -174,7 +180,8 @@ def run_pure_extractor(
             _note(_rel_min)
         return dict(empty_stats)
 
-    file_hash = hashlib.sha256(content.encode()).hexdigest()
+    file_hash = (file_hash_fn(content, file_path, repo_root) if file_hash_fn is not None
+                 else hashlib.sha256(content.encode()).hexdigest())
     relative_path = file_path.relative_to(repo_root).as_posix()
     if ctx._get_existing_module(relative_path, file_hash):
         print(f"⏭️  Skipping {relative_path} (unchanged)")

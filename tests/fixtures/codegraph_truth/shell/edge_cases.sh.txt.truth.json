@@ -1,36 +1,41 @@
 {
  "source": "edge_cases.sh.txt",
- "reviewed": "W6-E 2026-10-10 (hand-written before extraction)",
+ "reviewed": "W6-E 2026-10-10 (hand-written before extraction); W6-G 2026-10-11: full_name + methods added by hand from the source",
  "symbols": [
   {
    "kind": "function",
    "name": "setup",
    "start": 4,
-   "end": 7
+   "end": 7,
+   "full_name": "edge_cases.sh.setup"
   },
   {
    "kind": "function",
    "name": "teardown",
    "start": 9,
-   "end": 11
+   "end": 11,
+   "full_name": "edge_cases.sh.teardown"
   },
   {
    "kind": "function",
    "name": "in_subshell",
    "start": 13,
-   "end": 15
+   "end": 15,
+   "full_name": "edge_cases.sh.in_subshell"
   },
   {
    "kind": "function",
    "name": "outer",
    "start": 17,
-   "end": 22
+   "end": 22,
+   "full_name": "edge_cases.sh.outer"
   },
   {
    "kind": "function",
    "name": "inner",
    "start": 18,
-   "end": 20
+   "end": 20,
+   "full_name": "edge_cases.sh.inner"
   }
  ]
 }

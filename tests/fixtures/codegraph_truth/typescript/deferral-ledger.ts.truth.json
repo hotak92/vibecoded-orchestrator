@@ -1,150 +1,181 @@
 {
  "source": "deferral-ledger.ts",
- "reviewed": "W6-E 2026-10-10; review round: TS type aliases are definitions (policy LOW-4)",
+ "reviewed": "W6-E 2026-10-10; review round: TS type aliases are definitions (policy LOW-4); W6-G 2026-10-11: full_name + methods added by hand from the source",
  "symbols": [
   {
    "kind": "class",
    "name": "LedgerScope",
    "start": 17,
-   "end": 17
+   "end": 17,
+   "full_name": "deferral-ledger.LedgerScope",
+   "methods": []
   },
   {
    "kind": "class",
    "name": "DispositionSource",
    "start": 20,
-   "end": 20
+   "end": 20,
+   "full_name": "deferral-ledger.DispositionSource",
+   "methods": []
   },
   {
    "kind": "class",
    "name": "RetryAttempt",
    "start": 22,
-   "end": 27
+   "end": 27,
+   "full_name": "deferral-ledger.RetryAttempt",
+   "methods": []
   },
   {
    "kind": "class",
    "name": "RetrySummary",
    "start": 29,
-   "end": 40
+   "end": 40,
+   "full_name": "deferral-ledger.RetrySummary",
+   "methods": []
   },
   {
    "kind": "class",
    "name": "LedgerEntry",
    "start": 42,
-   "end": 57
+   "end": 57,
+   "full_name": "deferral-ledger.LedgerEntry",
+   "methods": []
   },
   {
    "kind": "class",
    "name": "DeferralLedgerView",
    "start": 59,
-   "end": 74
+   "end": 74,
+   "full_name": "deferral-ledger.DeferralLedgerView",
+   "methods": []
   },
   {
    "kind": "class",
    "name": "DismissOutcome",
    "start": 76,
-   "end": 84
+   "end": 84,
+   "full_name": "deferral-ledger.DismissOutcome",
+   "methods": []
   },
   {
    "kind": "function",
    "name": "scopeNoun",
    "start": 106,
-   "end": 110
+   "end": 110,
+   "full_name": "deferral-ledger.scopeNoun"
   },
   {
    "kind": "function",
    "name": "panelTitle",
    "start": 113,
-   "end": 117
+   "end": 117,
+   "full_name": "deferral-ledger.panelTitle"
   },
   {
    "kind": "function",
    "name": "groupEntries",
    "start": 132,
-   "end": 141
+   "end": 141,
+   "full_name": "deferral-ledger.groupEntries"
   },
   {
    "kind": "function",
    "name": "badgeCount",
    "start": 160,
-   "end": 163
+   "end": 163,
+   "full_name": "deferral-ledger.badgeCount"
   },
   {
    "kind": "function",
    "name": "retryingCount",
    "start": 169,
-   "end": 177
+   "end": 177,
+   "full_name": "deferral-ledger.retryingCount"
   },
   {
    "kind": "function",
    "name": "unbackedRetryableCount",
    "start": 180,
-   "end": 184
+   "end": 184,
+   "full_name": "deferral-ledger.unbackedRetryableCount"
   },
   {
    "kind": "function",
    "name": "actionGroupNote",
    "start": 191,
-   "end": 213
+   "end": 213,
+   "full_name": "deferral-ledger.actionGroupNote"
   },
   {
    "kind": "function",
    "name": "mountConfigError",
    "start": 224,
-   "end": 236
+   "end": 236,
+   "full_name": "deferral-ledger.mountConfigError"
   },
   {
    "kind": "function",
    "name": "dispositionLabel",
    "start": 239,
-   "end": 252
+   "end": 252,
+   "full_name": "deferral-ledger.dispositionLabel"
   },
   {
    "kind": "function",
    "name": "autoRetryIsBacked",
    "start": 324,
-   "end": 331
+   "end": 331,
+   "full_name": "deferral-ledger.autoRetryIsBacked"
   },
   {
    "kind": "function",
    "name": "dispositionExplanation",
    "start": 334,
-   "end": 357
+   "end": 357,
+   "full_name": "deferral-ledger.dispositionExplanation"
   },
   {
    "kind": "function",
    "name": "retryLine",
    "start": 367,
-   "end": 384
+   "end": 384,
+   "full_name": "deferral-ledger.retryLine"
   },
   {
    "kind": "function",
    "name": "dismissConfirmMessage",
    "start": 391,
-   "end": 401
+   "end": 401,
+   "full_name": "deferral-ledger.dismissConfirmMessage"
   },
   {
    "kind": "function",
    "name": "dismissResultMessage",
    "start": 404,
-   "end": 418
+   "end": 418,
+   "full_name": "deferral-ledger.dismissResultMessage"
   },
   {
    "kind": "function",
    "name": "sourceNotice",
    "start": 427,
-   "end": 436
+   "end": 436,
+   "full_name": "deferral-ledger.sourceNotice"
   },
   {
    "kind": "function",
    "name": "emptyStateMessage",
    "start": 439,
-   "end": 443
+   "end": 443,
+   "full_name": "deferral-ledger.emptyStateMessage"
   },
   {
    "kind": "function",
    "name": "findEntry",
    "start": 446,
-   "end": 451
+   "end": 451,
+   "full_name": "deferral-ledger.findEntry"
   }
  ]
 }

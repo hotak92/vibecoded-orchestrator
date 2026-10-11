@@ -47,8 +47,10 @@ Policies (shared by every language — the ground-truth fixtures under
   ``is_test_cfg_attr``): ``cfg(test)``, ``cfg(all(test, …))``,
   ``cfg(any(test, debug_assertions))``; NOT ``cfg(any(target_os = "linux",
   test))``, ``cfg(any(test, feature = "x"))`` or ``cfg(not(test))``.
-  Limitation: ``#[cfg(test)] mod tests;`` gates a DIFFERENT file, which is
-  analyzed on its own and is therefore not recognised as test code.
+  ``#[cfg(test)] mod tests;`` gates a DIFFERENT file; that file is resolved
+  and marked test-only by the per-crate pre-pass in
+  :mod:`vco_lib.codegraph_rust_modules`, which reads the declarations through
+  :func:`extract_rust_module_declarations` (same rule, same parser).
 * A file whose parse tree has an error takes the regex path whole (see
   :func:`_has_parse_error`).
 """
@@ -580,6 +582,73 @@ def _rust_definitions(src: _Src, root) -> Definitions:  # noqa: ANN001
 
     _walk(root, visit)
     return defs
+
+
+@dataclass(frozen=True)
+class RustModDecl:
+    """One out-of-line ``mod name;`` declaration of a Rust file.
+
+    ``inline`` lists the enclosing INLINE modules outermost first, each as
+    ``(name, path_attr)``; ``test_gated`` applies the same test-only rule as
+    the definitions walk (:func:`_rust_is_test_gated` — the declaration's own
+    attributes, any enclosing ``mod`` and the file's ``#![cfg(test)]``)."""
+
+    name: str
+    path_attr: Optional[str]
+    inline: Tuple[Tuple[str, Optional[str]], ...]
+    test_gated: bool
+
+
+def _rust_path_attr(src: _Src, node) -> Optional[str]:  # noqa: ANN001
+    """The string of a ``#[path = "…"]`` attribute on ``node``, else None."""
+    for text in _rust_outer_attrs(src, node):
+        inner = text.strip().lstrip("#").strip()
+        if inner.startswith("[") and inner.endswith("]"):
+            inner = inner[1:-1].strip()
+        key, sep, value = inner.partition("=")
+        value = value.strip()
+        if sep and key.strip() == "path" and len(value) >= 2 and value[0] == value[-1] == '"':
+            return value[1:-1]
+    return None
+
+
+def extract_rust_module_declarations(source_text: str) -> Optional[List[RustModDecl]]:
+    """Every out-of-line ``mod x;`` declaration in a Rust file, for the
+    cross-file test-module pre-pass (:mod:`vco_lib.codegraph_rust_modules`).
+    ``None`` when the grammar is unavailable (the caller then has no gating
+    information and gates nothing — the pre-v0.2.102 behaviour). A
+    declaration inside an ERROR subtree is skipped: its attributes cannot be
+    trusted, and an ungated reading only keeps the target file indexed."""
+    data = source_text.encode("utf-8", "replace")
+    tree = parse("rust", data)
+    if tree is None:
+        return None
+    src = _Src(data)
+    decls: List[RustModDecl] = []
+
+    def visit(node, anc):  # noqa: ANN001,ANN202
+        if node.type == "ERROR":
+            return False
+        if node.type != "mod_item":
+            return True
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return False
+        if node.child_by_field_name("body") is not None:
+            return True  # inline module: its own nested declarations
+        inline = tuple(
+            (src.text(a.child_by_field_name("name")), _rust_path_attr(src, a))
+            for a in anc
+            if a.type == "mod_item" and a.child_by_field_name("name") is not None
+        )
+        decls.append(RustModDecl(
+            name=src.text(name_node), path_attr=_rust_path_attr(src, node),
+            inline=inline, test_gated=_rust_is_test_gated(src, node, anc),
+        ))
+        return False
+
+    _walk(tree.root_node, visit)
+    return decls
 
 
 # ---------------------------------------------------------------------------
