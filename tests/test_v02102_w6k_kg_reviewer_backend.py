@@ -58,14 +58,15 @@ class _Rig:
 
     def __init__(self, chain, monkeypatch, *, haiku=True, claude=True,
                  gateway_base="http://127.0.0.1:11460",
-                 catalogue=frozenset(), consent=False, openai_key=True):
+                 catalogue=frozenset(), consent=False, openai_key=True,
+                 refusal=None):
         self.lines: list[str] = []
         self.chain = chain
         monkeypatch.setattr(chain.shutil, "which",
                             lambda cmd: "/usr/bin/claude" if claude else None)
         monkeypatch.setattr(
             chain, "gateway_catalogue",
-            lambda timeout_s=2.0: (gateway_base, catalogue))
+            lambda timeout_s=2.0: (gateway_base, catalogue, refusal))
         monkeypatch.setattr(
             chain._sb, "breaker_state", self._breaker_state)
         monkeypatch.setattr(
@@ -179,6 +180,148 @@ def test_record_clears_on_success(chain, monkeypatch, tmp_path):
     assert rc == 0
     assert chain._sb._load_breaker_file().get("kg_reviewer:haiku") in (
         None, {}) or not chain._sb.breaker_state("kg_reviewer:haiku")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Review fixes 2026-10-11 (W6-K review F1/F2/F4, MERGE-AFTER-FIXES round)
+# ═══════════════════════════════════════════════════════════════════════
+
+import http.server
+import subprocess as _subprocess
+import threading
+
+
+class _AuthRequiredCatalogue(http.server.BaseHTTPRequestHandler):
+    """A stub gateway ``/v1/models`` that REQUIRES the host bearer token —
+    the shape of the REAL daemon (model_router's server 401s a missing
+    token on every route). Drives the REAL urllib request inside
+    ``gateway_catalogue`` — the probe is never monkeypatched here."""
+
+    token = "stub-host-token"
+
+    def do_GET(self):
+        if self.path != "/v1/models":
+            self.send_error(404)
+            return
+        auth = self.headers.get("Authorization") or ""
+        if auth != f"Bearer {self.token}":
+            self._reply(401, {"type": "error",
+                              "error": {"type": "authentication_error",
+                                        "message": "missing host token"}})
+            return
+        self._reply(200, {"data": [{"id": "claude-gw/glm-5.3-flash"},
+                                   {"id": "claude-gw/qwen3.8-flash"}]})
+
+    def _reply(self, code: int, obj: dict) -> None:
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:  # silence the test log
+        pass
+
+
+@pytest.fixture()
+def stub_gateway():
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _AuthRequiredCatalogue)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield port
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def _point_at_stub(monkeypatch, tmp_path, port, token_text):
+    """Route the chain's port resolution and token read at the stub."""
+    import vco_lib.vscode_settings as _vs
+    import claude_mcp_servers.model_router.config as _mrc
+    monkeypatch.setattr(_vs, "resolve_gateway_ports", lambda: (port,))
+    token_file = tmp_path / "model-gateway.token"
+    if token_text is not None:
+        token_file.write_text(token_text, encoding="utf-8")
+    monkeypatch.setattr(_mrc, "token_path", lambda: token_file)
+
+
+def test_catalogue_probe_authenticates_with_the_host_token(
+        chain, monkeypatch, tmp_path, stub_gateway):
+    """F1 (HIGH): the real daemon 401s a tokenless ``/v1/models``, so a
+    probe without ``Authorization: Bearer <host token>`` makes EVERY
+    gateway rung dead in production. The token comes from the same token
+    file ``_gateway_auth_env`` reads (one helper, one home)."""
+    _point_at_stub(monkeypatch, tmp_path, stub_gateway,
+                   "  stub-host-token\n")
+    res = chain.gateway_catalogue()
+    assert res[0] == f"http://127.0.0.1:{stub_gateway}", res
+    ids = res[1]
+    assert "claude-gw/glm-5.3-flash" in ids, ids
+    assert "claude-gw/qwen3.8-flash" in ids, ids
+
+
+def test_a_refused_probe_is_distinguished_from_no_gateway(
+        chain, monkeypatch, tmp_path, stub_gateway):
+    """F1: the gateway ANSWERING with 401 (no readable token file here) is
+    not "no local model gateway answered" — the third return element
+    carries the refusal so the skip log line can stay honest."""
+    _point_at_stub(monkeypatch, tmp_path, stub_gateway, None)
+    res = chain.gateway_catalogue()
+    assert res[0] is None, res
+    assert not res[1], res
+    refusal = res[2]
+    assert refusal and "401" in refusal, res
+
+
+def test_a_refused_gateway_is_logged_as_a_refusal(chain, monkeypatch):
+    """F1: the skip line for a 401'd probe names the refusal — the old
+    wording ("no local model gateway answered") was FALSE for a 401."""
+    rig = _Rig(chain, monkeypatch, claude=False, gateway_base=None,
+               refusal="HTTP 401 from http://127.0.0.1:11460")
+    rig.decide()
+    rig.assert_logged("refused the catalogue probe")
+    rig.assert_logged("HTTP 401")
+    assert not any("no local model gateway answered" in ln
+                   for ln in rig.lines), rig.lines
+
+
+def test_run_consumes_the_prompt_file(chain, monkeypatch, tmp_path):
+    """F2 (LOW): the .sh sibling stages the prompt through ``mktemp`` — one
+    LEAKED file per commit until the chain unlinks it after reading. The
+    decision is stubbed to ``skip`` so the test pins exactly the
+    read-and-unlink, nothing else in the chain."""
+    monkeypatch.setattr(
+        chain, "select_reviewer_backend",
+        lambda log=None: {"mode": "skip", "model": "", "base_url": None,
+                          "reason": "test"})
+    pf = tmp_path / "prompt.txt"
+    pf.write_text("review this", encoding="utf-8")
+    log = tmp_path / "review.log"
+    assert chain.main(["run", "--prompt-file", str(pf),
+                       "--log", str(log)]) == 0
+    assert not pf.exists(), "the consumed prompt file must be unlinked"
+
+
+def test_run_handles_a_hung_reviewer_timeout(chain, monkeypatch, tmp_path):
+    """F4 (LOW): a ``TimeoutExpired`` from the claude child must be HANDLED
+    — classified, logged, non-zero exit — not an uncaught traceback dumped
+    into the detached log."""
+    _Rig(chain, monkeypatch)  # haiku rung available
+
+    def _raise(*a, **kw):
+        raise _subprocess.TimeoutExpired(cmd=["claude"], timeout=900)
+
+    monkeypatch.setattr(chain.subprocess, "run", _raise)
+    pf = tmp_path / "prompt.txt"
+    pf.write_text("review this", encoding="utf-8")
+    log = tmp_path / "review.log"
+    rc = chain.main(["run", "--prompt-file", str(pf), "--log", str(log)])
+    assert rc == 124, rc
+    assert "TIMED OUT" in log.read_text(encoding="utf-8")
 
 
 def test_gateway_auth_env_reads_the_token_file_not_argv(

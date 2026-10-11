@@ -567,3 +567,32 @@ def test_snapshot_filelist_boundary_is_chat_start_without_marker(impl, tmp_path)
         proj / ".claude" / "context" / "pre-compact-snapshot.md")]
     assert "newer.py" in names, (impl, names)
     assert "older.py" not in names, (impl, names)
+
+
+def test_sh_filelist_says_so_when_no_python_resolves(tmp_path):
+    """W6-K review F3 (LOW): a python-less machine must get an EXPLICIT
+    notice — in the snapshot section AND on stderr — not a silently empty
+    section under a heading that promised a file list. The .ps1 sibling
+    needs no interpreter for its listing (native PowerShell), so this arm
+    is .sh-only by construction."""
+    proj = _project(tmp_path)
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    # A PATH with everything the hook itself needs but NO python3/python/py;
+    # VCO_FIND_PYTHON_PATH_ONLY=1 keeps the venv ladder out of the decision.
+    for name in ("bash", "dirname", "git", "date", "mkdir", "cat", "touch",
+                 "head"):
+        src = shutil.which(name)
+        assert src, name
+        os.symlink(src, stub_bin / name)
+    env = _env(proj, VCO_FIND_PYTHON_PATH_ONLY="1", PATH=str(stub_bin))
+    res = subprocess.run(
+        ["bash", str(HOOKS / "pre-compact-save.sh")],
+        input=json.dumps({"session_id": "s1", "trigger": "manual"}),
+        capture_output=True, text=True, timeout=120, env=env,
+        cwd=str(proj))
+    assert res.returncode == 0, res.stderr
+    snap = proj / ".claude" / "context" / "pre-compact-snapshot.md"
+    text = snap.read_text(encoding="utf-8")
+    assert "(file list unavailable" in text, text
+    assert "no Python interpreter resolved" in res.stderr, res.stderr

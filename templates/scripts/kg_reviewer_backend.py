@@ -15,8 +15,9 @@ Owner ruling 2026-10-11 — keep it, and fall back, in this order:
    quota / 429 / auth — recorded by the ``record`` subcommand below);
 2. ``claude-gw/glm-5.3-flash`` → ``claude-gw/deepseek-v4.1-flash`` →
    ``claude-gw/qwen3.8-flash`` — each ONLY when the local model gateway
-   actually serves it (the catalogue is ASKED via ``GET /v1/models``;
-   availability is never hard-coded) and its tier is not latched;
+   actually serves it (the catalogue is ASKED via ``GET /v1/models``,
+   authenticated with the daemon's host token; availability is never
+   hard-coded) and its tier is not latched;
 3. OpenAI — only when the user enabled OpenAI for SUMMARIES (the
    ``kg_summary_openai_consent`` gate from :mod:`summary_backends`); this
    rung is DEGRADED: an API call reviews the diff and proposes node edits
@@ -51,6 +52,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -93,25 +95,60 @@ def _log(line: str) -> None:
     print(f"[kg-reviewer] {line}", file=sys.stderr)
 
 
-def gateway_catalogue(timeout_s: float = 2.0) -> "tuple[Optional[str], frozenset]" :
+def _gateway_token() -> str:
+    """Read the local model gateway's loopback host token.
+
+    ONE home for the read (W6-K review F1, 2026-10-11): the daemon's
+    owner-only token FILE via ``model_router.config.token_path`` — the
+    same read :func:`_gateway_auth_env` performs for the spawn env and
+    this module now also uses to AUTHENTICATE the catalogue probe (the
+    daemon 401s a tokenless ``GET /v1/models`` on every route).
+
+    Raises on any failure (missing module, missing/unreadable/empty
+    file); callers that can proceed without a token catch and degrade.
+    """
+    from claude_mcp_servers.model_router.config import token_path
+
+    token = token_path().read_text(encoding="utf-8").strip()
+    if not token:
+        raise RuntimeError("the model gateway token file is empty")
+    return token
+
+
+def gateway_catalogue(
+    timeout_s: float = 2.0,
+) -> "tuple[Optional[str], frozenset, Optional[str]]":
     """Ask the local model gateway which models it serves.
 
-    Returns ``(base_url, ids)`` — the probed base URL (None when no
-    gateway answered) and the union catalogue's model ids (empty on any
-    failure). Availability is EVIDENCE from the running daemon, never an
-    assumption: the owner's ruling says "only those the local model gateway
-    can actually serve".
+    Returns ``(base_url, ids, refusal)`` — the probed base URL (None when
+    no gateway answered), the union catalogue's model ids (empty on any
+    failure), and a refusal description when a gateway ANSWERED but
+    refused the probe (``HTTP 401``/``403`` — distinct from "no gateway
+    answered", so the skip log line stays honest). Availability is
+    EVIDENCE from the running daemon, never an assumption: the owner's
+    ruling says "only those the local model gateway can actually serve".
     """
     try:
         from vco_lib.vscode_settings import resolve_gateway_ports
         ports = resolve_gateway_ports()
     except Exception:  # noqa: BLE001 — a missing vco_lib is "no gateway"
-        return None, frozenset()
+        return None, frozenset(), None
+    try:
+        headers = {"Authorization": f"Bearer {_gateway_token()}"}
+    except Exception:  # noqa: BLE001 — probe anyway; ours then 401s and is
+        headers = {}  # reported as a refusal, never as "no gateway"
+    refusal: Optional[str] = None
     for port in ports:
         base = f"http://127.0.0.1:{port}"
+        request = urllib.request.Request(f"{base}/v1/models", headers=headers)
         try:
-            with urllib.request.urlopen(f"{base}/v1/models", timeout=timeout_s) as r:
+            with urllib.request.urlopen(request, timeout=timeout_s) as r:
                 payload = json.load(r)
+        except urllib.error.HTTPError as exc:
+            # The gateway answered and refused: remember it, try the next
+            # port (a later port answering wins over an earlier refusal).
+            refusal = f"HTTP {exc.code} from {base}"
+            continue
         except Exception:  # noqa: BLE001 — unreachable port: try the next
             continue
         ids = frozenset(
@@ -119,8 +156,8 @@ def gateway_catalogue(timeout_s: float = 2.0) -> "tuple[Optional[str], frozenset
             for m in (payload.get("data") or payload.get("models") or [])
             if isinstance(m, dict)
         )
-        return base, ids
-    return None, frozenset()
+        return base, ids, None
+    return None, frozenset(), refusal
 
 
 def _haiku_available(log: Callable[[str], None]) -> bool:
@@ -137,9 +174,14 @@ def _haiku_available(log: Callable[[str], None]) -> bool:
 
 def _gateway_model_available(model: str, base: Optional[str],
                              ids: frozenset,
-                             log: Callable[[str], None]) -> bool:
+                             log: Callable[[str], None],
+                             refusal: Optional[str] = None) -> bool:
     if base is None:
-        log(f"rung {model}: unavailable (no local model gateway answered)")
+        if refusal:
+            log(f"rung {model}: unavailable (the local model gateway "
+                f"refused the catalogue probe: {refusal})")
+        else:
+            log(f"rung {model}: unavailable (no local model gateway answered)")
         return False
     if model not in ids:
         log(f"rung {model}: not served by the gateway catalogue "
@@ -183,9 +225,9 @@ def select_reviewer_backend(
     if _haiku_available(log):
         return {"mode": "claude", "model": "haiku", "base_url": None,
                 "reason": "default"}
-    base, ids = gateway_catalogue()
+    base, ids, refusal = gateway_catalogue()
     for model in GATEWAY_RUNGS:
-        if _gateway_model_available(model, base, ids, log):
+        if _gateway_model_available(model, base, ids, log, refusal):
             return {"mode": "claude", "model": model, "base_url": base,
                     "reason": "haiku unavailable; gateway serves this model"}
     if _openai_available(log):
@@ -214,11 +256,7 @@ def _gateway_auth_env(base_url: str) -> "dict[str, str]":
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
     }
     try:
-        from claude_mcp_servers.model_router.config import token_path
-
-        token = token_path().read_text(encoding="utf-8").strip()
-        if token:
-            env["ANTHROPIC_AUTH_TOKEN"] = token
+        env["ANTHROPIC_AUTH_TOKEN"] = _gateway_token()
     except Exception as exc:  # noqa: BLE001 — no token, no gateway run
         raise RuntimeError(f"cannot read the model gateway token: {exc}") from exc
     return env
@@ -256,8 +294,26 @@ def _cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _consume_prompt_file(path: str) -> str:
+    """Read the reviewer prompt file and unlink it once read.
+
+    W6-K review F2 (2026-10-11): the ``.sh`` sibling stages the prompt
+    through ``mktemp`` and nothing else ever removed it — one leaked file
+    per commit until the tmp reaper. The consumer owns the cleanup: read
+    into memory, then best-effort unlink (the ``.ps1`` sibling's log-dir
+    staging file is consumed the same way; it is rewritten per commit).
+    """
+    file = Path(path)
+    text = file.read_text(encoding="utf-8")
+    try:
+        file.unlink()
+    except OSError:
+        pass  # best-effort: a leftover staging file never fails the review
+    return text
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
-    prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+    prompt = _consume_prompt_file(args.prompt_file)
     decision = select_reviewer_backend()
     model = decision["model"]
     started = time.time()
@@ -300,8 +356,26 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,"
         "mcp__weaviate-kg__store_knowledge_node,Write,Edit",
     ]
-    proc = subprocess.run(cmd, input=prompt, env=env, capture_output=True,
-                          text=True, timeout=args.timeout_s)
+    try:
+        proc = subprocess.run(cmd, input=prompt, env=env, capture_output=True,
+                              text=True, timeout=args.timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        # W6-K review F4 (2026-10-11): a hung reviewer must not dump a raw
+        # TimeoutExpired traceback into the detached log — classify it
+        # (summary_backends reads "timeout" as a capacity strike), log it
+        # and exit non-zero (124, the conventional timeout code).
+        def _text(maybe: "Any") -> str:
+            if isinstance(maybe, bytes):
+                return maybe.decode("utf-8", errors="replace")
+            return maybe or ""
+
+        tail = (f"timeout after {args.timeout_s}s\n{exc}\n"
+                + _text(exc.stdout) + _text(exc.stderr))[-4000:]
+        _record_outcome(model, 124, tail, _log)
+        with open(args.log, "a", encoding="utf-8") as fh:
+            fh.write(f"\n[kg-reviewer {started:.0f}] TIMED OUT after "
+                     f"{args.timeout_s}s on {model}\n{tail}\n")
+        return 124
     tail = ((proc.stdout or "") + (proc.stderr or ""))[-4000:]
     _record_outcome(model, proc.returncode, tail, _log)
     with open(args.log, "ab") as fh:

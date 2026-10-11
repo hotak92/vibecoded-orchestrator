@@ -66,6 +66,11 @@ try {
 } catch { }
 [void]$lines.Add("")
 [void]$lines.Add("## Recently Modified Files (newest first, since the last compaction)")
+# Parity-touch 2026-10-11 (W6-K review F3): the .sh sibling now records an
+# explicit "(file list unavailable: no Python interpreter resolved)" line
+# when nothing resolves -- its listing shells out to python. This .ps1
+# listing is native PowerShell and needs no interpreter, so no equivalent
+# arm exists here.
 try {
     # The N knob (owner 2026-10-11: N=30 to start). One threshold, one home:
     # this listing is the only reader; the .sh sibling reads the same env var.

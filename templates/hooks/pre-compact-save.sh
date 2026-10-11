@@ -132,6 +132,14 @@ rows.sort(reverse=True)
 for _, path in rows[:_n()]:
     print(path)
 PYEOF
+    else
+        # W6-K review F3 (2026-10-11): a python-less machine must not get a
+        # SILENTLY empty section under a heading that promised a file list —
+        # say so explicitly, in the snapshot AND on stderr. The .ps1 sibling
+        # needs no interpreter for its listing (native PowerShell), so this
+        # arm is .sh-only by construction.
+        echo "(file list unavailable: no Python interpreter resolved -- this listing needs one; the git status above is unaffected)"
+        echo "pre-compact-save: no Python interpreter resolved; the Recently Modified Files listing was skipped" >&2
     fi
     echo ""
 } > "$SNAPSHOT_FILE"
