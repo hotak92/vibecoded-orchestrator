@@ -347,9 +347,14 @@ OD-4 and its 2026-10-09 refinement):
    slot-exclusive, and the 2026-09-26 ruling stands for it.
 
 `key_paused` on either name turns the slot OFF for that requester with
-one WARNING naming the Secrets panel (never a route-around, never a
-second copy); `key_not_active` for the dedicated name falls through to
-the shared slot. `$OPENAI_API_KEY` stays unread (no new env name) and the
+one WARNING naming the Secrets panel and how to resume there (never a
+route-around, never a second copy). A paused DEDICATED key keeps the slot
+off even when the shared key is healthy — falling back would route around
+the deliberate pause; resume the key in the panel instead. `key_not_active`
+for the dedicated name falls through to the shared slot (silently — the
+project simply has no dedicated key); a READ failure on the dedicated leg
+(hub error, timeout, degraded keychain) also falls through, but with one
+WARNING naming the failure — a read failure is not an absence. `$OPENAI_API_KEY` stays unread (no new env name) and the
 project's `.env` is not a source for either name (tier 3 is excluded for
 them).
 
