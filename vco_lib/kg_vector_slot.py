@@ -171,7 +171,11 @@ def kg_query_target_vector(
     one UNNAMED vector          ``""`` (omit — legacy collections reject it)
     exactly one NAMED vector    that name (unambiguous, and naming it keeps
                                 the choice visible to the operator)
-    several NAMED vectors       the ACTIVE slot
+    several NAMED vectors       the slot the collection is RECORDED as
+                                complete in (v0.2.102 W6-I,
+                                ``vco_lib.kg_embed_model``) — the ACTIVE
+                                slot in the steady state, the previous
+                                model's while a newly selected one fills
     undeterminable              ``None`` — refuse
     ==========================  ============================================
 
@@ -197,4 +201,11 @@ def kg_query_target_vector(
         return ""
     if len(slots) == 1:
         return slots[0]
+    name = str(getattr(collection, "name", "") or "")
+    if name:
+        from vco_lib.kg_embed_model import recorded_query_slot  # noqa: PLC0415 - lazy, like the resolver import above
+
+        recorded = recorded_query_slot(name, service=service)
+        if recorded and recorded in slots:
+            return recorded
     return active or slots[0]

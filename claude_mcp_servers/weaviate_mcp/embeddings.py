@@ -450,6 +450,29 @@ async def _get_all_kg_embeddings_tagged(
     return (await _get_all_kg_embeddings(text)), []
 
 
+async def complete_kg_write_vectors(
+    vectors: "dict[str, list[float]]", truncated: "list[str]", text: str, collection: str,
+) -> "dict[str, list[float]]":
+    """v0.2.102 W6-I — finish a KG write's vectors (``store_knowledge_node``):
+    through ``vco_lib.kg_embed_model.complete_write_vectors`` whenever a
+    service is in hand. The ACTIVE (target) slot is REQUIRED — a row holding
+    only another model's vector is never stored (``KgWriteVectorMissing``
+    propagates, loud; W6-H's "fallback-only write") — and while ``collection``
+    fills toward a newly selected model the RECORDED model's vector rides
+    along, so the rewritten node stays in the slot searches read.
+    ``truncated`` (the call's truncation record) gains the carry slot when
+    its vector came from a bounded window. No service → returned as-is (the
+    inline transport fallback names no target)."""
+    from vco_lib.kg_embed_model import complete_write_vectors
+
+    from . import server
+    svc = server._get_embedding_service()
+    if svc is None:
+        return vectors
+    return await asyncio.to_thread(
+        complete_write_vectors, svc, dict(vectors or {}), text, collection, truncated)
+
+
 async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
     """Get all KG embedding variants — every reachable text backend.
 
@@ -623,6 +646,39 @@ async def _get_search_vector(
     )
     assert svc is not None  # embed_query_or_raise raised for a missing service
     return vec, (svc.code_vector_slot if scheme == "code" else svc.text_vector_slot)
+
+
+async def _kg_search_vector(
+    text: str, collection: str, task: str | None = None, *, steady=None,
+) -> tuple[list[float] | None, str]:
+    """The query vector + slot for searching ONE KG collection (v0.2.102 W6-I).
+
+    The collection is searched with the model it is RECORDED as complete in
+    (``vco_lib.kg_embed_model``). In the steady state that is the service's
+    own model and this is exactly ``steady`` — the CALLER's own
+    :func:`_get_search_vector` binding (so a seam patched on the caller's
+    module is honoured; default: ``server``'s). While a newly selected model's slot
+    fills, the query is embedded with the recorded model instead — through
+    the same loud query-embed entry, never another model."""
+    from vco_lib.kg_embed_model import recorded_query_model, sibling_text_service
+
+    from . import server
+    model = await asyncio.to_thread(recorded_query_model, collection) if collection else ""
+    if model:
+        from vco_lib.embed_outage import embed_query_or_raise
+
+        svc = server._get_embedding_service()
+        qs = sibling_text_service(svc, model) if svc is not None else None
+        vec = await asyncio.to_thread(
+            embed_query_or_raise, "kg", qs, text, task,
+            construction_error=getattr(server, "_embed_service_construction_error", ""),
+        )
+        assert qs is not None  # embed_query_or_raise raised for a missing service
+        return vec, qs.text_vector_slot
+    fn = steady or server._get_search_vector
+    if task is None:
+        return await fn(text)
+    return await fn(text, task=task)
 
 
 async def count_tokens_async(text: str) -> int:

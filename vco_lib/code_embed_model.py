@@ -430,12 +430,9 @@ def _collections(prefix: str) -> "list[str]":
 
 
 def _declared_slots(name: str, weaviate_url: Optional[str]) -> Optional[set]:
-    from vco_lib import weaviate_helpers as _wh
+    from vco_lib.embed_slot_fill import declared_slots
 
-    schema = _wh.fetch_schema(name, weaviate_url=weaviate_url)
-    if schema is None:
-        return None
-    return set((schema.get("vectorConfig") or {}).keys())
+    return declared_slots(name, weaviate_url)
 
 
 #: How many stored objects per collection a live record read samples (review
@@ -445,40 +442,17 @@ _LIVE_SAMPLE = 20
 
 def _sample_vectors(name: str, weaviate_url: Optional[str]) -> "dict[str, int]":
     """``{slot: dim}`` for the named vectors populated on EVERY sampled stored
-    object (up to :data:`_LIVE_SAMPLE`) — a slot some sampled object lacks is
-    not a complete slot."""
-    from vco_lib import weaviate_helpers as _wh
+    object (up to :data:`_LIVE_SAMPLE`) — the shared core
+    (:func:`vco_lib.embed_slot_fill.sample_common_vectors`, W6-I)."""
+    from vco_lib.embed_slot_fill import sample_common_vectors
 
-    base = (weaviate_url or _wh.weaviate_url_default()).rstrip("/")
-    status, body = _wh.http_request(
-        "GET", f"{base}/v1/objects?class={name}&limit={_LIVE_SAMPLE}&include=vector",
-        timeout=10.0,
-    )
-    if status != 200:
-        return {}
-    objs = json.loads(body.decode("utf-8")).get("objects") or []
-    common: "Optional[dict[str, int]]" = None
-    for obj in objs:
-        vectors = obj.get("vectors") or {}
-        have = {k: len(v) for k, v in vectors.items() if isinstance(v, list) and v}
-        common = have if common is None else {
-            k: d for k, d in common.items() if have.get(k) == d}
-    return common or {}
+    return sample_common_vectors(name, weaviate_url, _LIVE_SAMPLE)
 
 
 def _object_count(name: str, weaviate_url: Optional[str]) -> int:
-    from vco_lib import weaviate_helpers as _wh
+    from vco_lib.embed_slot_fill import object_count
 
-    base = (weaviate_url or _wh.weaviate_url_default()).rstrip("/")
-    status, body = _wh.http_request(
-        "POST", f"{base}/v1/graphql",
-        body={"query": f"{{ Aggregate {{ {name} {{ meta {{ count }} }} }} }}"},
-        timeout=10.0,
-    )
-    if status != 200:
-        return 0
-    data = json.loads(body.decode("utf-8"))
-    return int(data["data"]["Aggregate"][name][0]["meta"]["count"])
+    return object_count(name, weaviate_url)
 
 
 def record_from_live(
@@ -531,41 +505,19 @@ def ensure_slot_on_collections(
     """Check (``add=False``) or make (``add=True``) every EXISTING code
     collection declare ``model``'s slot. Returns an error message, or None.
 
-    The add is the additive, vector-preserving slot-add
-    (:func:`vco_lib.weaviate_schema.add_named_vector_slot`); it never drops
-    data. An unreachable Weaviate gives no verdict (the walk's connect
+    The shared core (:func:`vco_lib.embed_slot_fill.ensure_slot`, W6-I — the
+    KG fill uses the same one): the add is the additive, vector-preserving
+    slot-add; an unreachable Weaviate gives no verdict (the walk's connect
     reports it); a collection that does not exist yet needs no slot."""
-    from vco_lib.weaviate_schema import CODE_NAMED_VECTORS, AddSlotResult, NamedVectorSlot
+    from vco_lib.embed_slot_fill import ensure_slot
+    from vco_lib.weaviate_schema import CODE_NAMED_VECTORS
 
     slot, dim = code_model_slot(model)
-    catalog = {s.name: s for s in CODE_NAMED_VECTORS}
-    if slot in catalog and catalog[slot].dim != dim:
-        return (f"{model} is {dim}-dimensional but the code slot it maps to "
-                f"({slot}) is declared at {catalog[slot].dim}; pick a model whose "
-                "dimension matches, or a different backend.")
-    if slot_adder is None:
-        from vco_lib.weaviate_schema import add_named_vector_slot as slot_adder
-    prefix = canonical_prefix(codegraph_prefix)
-    for name in _collections(prefix):
-        try:
-            declared = _declared_slots(name, weaviate_url)
-        except Exception:  # noqa: BLE001
-            # An unreachable Weaviate is the walk's own failure to report (its
-            # connect, to the same URL, fails loudly) — no verdict here.
-            return None
-        if declared is None or slot in declared:
-            continue
-        if not add:
-            return (f"{name} does not declare the {slot} named vector that {model} "
-                    "embeds into — its stored vectors are from another model.")
-        try:
-            result = slot_adder(name, catalog.get(slot) or NamedVectorSlot(slot, dim),
-                                weaviate_url=weaviate_url)
-        except Exception as exc:  # noqa: BLE001
-            return f"adding the {slot} named vector to {name} failed: {exc}"
-        if result == AddSlotResult.DimMismatchError:
-            return f"{name} already stores {slot} vectors of another dimension."
-    return None
+    return ensure_slot(
+        _collections(canonical_prefix(codegraph_prefix)), slot, dim, CODE_NAMED_VECTORS,
+        model=model, add=add, weaviate_url=weaviate_url, slot_adder=slot_adder,
+        declared=lambda name, url: _declared_slots(name, url),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -624,33 +576,17 @@ def scan_slot_fill(
     codegraph_prefix: str, slot: str, *, client_factory: Optional[Callable[[], Any]] = None,
 ) -> "Optional[tuple[int, int]]":
     """``(filled, total)`` across the graph's existing code collections:
-    objects whose ``slot`` holds a vector vs all objects. Weaviate cannot
-    filter on "vector missing", so this is a cursor scan with vectors (the
-    client's iterator takes no per-slot selection). None when Weaviate cannot
-    be asked (never a guess)."""
-    prefix = canonical_prefix(codegraph_prefix)
-    client = None
-    try:
-        client = (client_factory or _default_client)()
-        filled = total = 0
-        for name in _collections(prefix):
-            if not client.collections.exists(name):
-                continue
-            coll = client.collections.get(name)
-            for obj in coll.iterator(include_vector=True, return_properties=[]):
-                total += 1
-                vec = obj.vector
-                if isinstance(vec, dict) and vec.get(slot):
-                    filled += 1
-        return filled, total
-    except Exception:  # noqa: BLE001 — unreachable → no verdict
+    objects whose ``slot`` holds a vector vs all objects — the shared cursor
+    scan (:func:`vco_lib.embed_slot_fill.scan_slot_counts`, W6-I). None when
+    Weaviate cannot be asked (never a guess)."""
+    from vco_lib.embed_slot_fill import scan_slot_counts
+
+    measured = scan_slot_counts(_collections(canonical_prefix(codegraph_prefix)), [slot],
+                                client_factory=client_factory or _default_client)
+    if measured is None:
         return None
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
+    counts, total = measured
+    return counts[slot], total
 
 
 def _counters_consistent(counters: Optional[Mapping[str, Any]], target: str,

@@ -159,7 +159,7 @@ def stage_no_results_event(
         return deferred_events
 
 
-async def embed_hook_query(text: str):
+async def embed_hook_query(text: str, collection: str | None = None):
     """Embed the hook's retrieval query through the MCP QUERY-side method.
 
     v0.2.101: every search path must embed its QUERY through
@@ -171,10 +171,29 @@ async def embed_hook_query(text: str):
     Kept as a named helper so the hook↔query-method wiring is asserted
     BEHAVIOURALLY (mutate this task or the wiring and the test goes red),
     rather than by a source scan.
-    """
-    from weaviate_mcp.server import _get_search_vector
 
-    return await _get_search_vector(text, task="hook_injection")
+    ``collection`` (v0.2.102 W6-I; default: the project's own KG): embed with
+    the model that KG collection is RECORDED as complete in — the selected
+    model once its slot is complete (``weaviate_mcp.server._kg_search_vector``,
+    which IS ``_get_search_vector`` in the steady state).
+    """
+    from weaviate_mcp.server import KG_COLLECTION, _get_search_vector, _kg_search_vector
+
+    return await _kg_search_vector(
+        text, KG_COLLECTION if collection is None else collection, task="hook_injection",
+        steady=_get_search_vector)
+
+
+def _rl_model_name(collection: str, default: str) -> str:
+    """The model the RL log records for ``collection``'s query (W6-I): the
+    recorded model while a newly selected one fills, else ``default`` (the
+    pre-W6-I label, unchanged in the steady state)."""
+    try:
+        from vco_lib.kg_embed_model import recorded_query_model
+
+        return recorded_query_model(collection) or default
+    except Exception:  # noqa: BLE001 — a label, never a search failure
+        return default
 
 
 async def main():
@@ -334,6 +353,25 @@ async def main():
         # Per-(query-text, vector) KG fan-out across all granted collections.
         # Extracted as a reusable closure so the single-query path AND the
         # oversized-query per-chunk path share ONE fan-out (no duplication).
+        # W6-I: a collection still recorded in another model (a selected one
+        # whose slot is not complete yet) is searched with ITS model's vector
+        # — one embed per (query text, slot); the given vector serves every
+        # collection recorded in the project KG's model (the steady state).
+        _per_slot: dict = {}
+
+        async def _vector_for(coll_name: str, q_text: str, q_vector):
+            if EMBEDDING_SOURCE == "weaviate" or q_vector is None:
+                return q_vector, query_target
+            from vco_lib.kg_embed_model import recorded_query_slot, target_text_model, text_model_slot
+
+            slot = recorded_query_slot(coll_name) or text_model_slot(target_text_model())[0]
+            if not query_target or slot == query_target:
+                return q_vector, query_target
+            key = (q_text, slot)
+            if key not in _per_slot:
+                _per_slot[key] = await embed_hook_query(q_text, coll_name)
+            return _per_slot[key]
+
         async def _retrieve_for_vector(q_text: str, q_vector, q_limit: int) -> list[dict]:
             out: list[dict] = []
             for coll_name in collections_to_search:
@@ -342,6 +380,7 @@ async def main():
                 except Exception:
                     # Collection may not exist (peer never indexed yet) — skip.
                     continue
+                c_vector, c_target = await _vector_for(coll_name, q_text, q_vector)
                 try:
                     if EMBEDDING_SOURCE == "weaviate":
                         primary = coll.query.near_text(
@@ -351,14 +390,14 @@ async def main():
                         )
                     else:
                         nv_kwargs: dict[str, Any] = dict(
-                            near_vector=q_vector,
+                            near_vector=c_vector,
                             limit=q_limit,
                             return_metadata=["distance"],
                             # F-G: ask Weaviate to return the per-object vector so
                             # we can attach `emb` (and thus n_emb) on the hook path.
                             include_vector=True,
                         )
-                        if q_target := query_target:
+                        if q_target := c_target:
                             nv_kwargs["target_vector"] = q_target
                         primary = coll.query.near_vector(**nv_kwargs)
                 except Exception:
@@ -384,7 +423,7 @@ async def main():
                     from weaviate_mcp.server import _extract_obj_vector
                     for r, obj in zip(coll_formatted, primary_objects):
                         try:
-                            node_emb = _extract_obj_vector(obj, query_target)
+                            node_emb = _extract_obj_vector(obj, c_target)
                             if node_emb:
                                 r["emb"] = node_emb
                         except Exception:
@@ -500,7 +539,7 @@ async def main():
                         query=effective_query,
                         query_vector=vector,
                         active_slot=query_target,
-                        model_name=EMBEDDING_MODEL,
+                        model_name=_rl_model_name(KG_COLLECTION, EMBEDDING_MODEL),
                         embed_budget_s=dual_embed_budget_s(task_type),
                         backfill_other=False,
                         task_type=task_type,
@@ -515,7 +554,7 @@ async def main():
 
                     _rl_enrich_nodes_with_linked_embs(
                         all_formatted, query_emb=vector, active_slot=query_target,
-                        model_name=EMBEDDING_MODEL,
+                        model_name=_rl_model_name(KG_COLLECTION, EMBEDDING_MODEL),
                     )
             except Exception:
                 # Soft-fail: enrichment is best-effort telemetry; never break

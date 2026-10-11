@@ -81,7 +81,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import requests
 
@@ -1658,7 +1658,7 @@ def _is_context_overflow_error(exc: BaseException) -> bool:
     return False
 
 
-def resolve_active_text_model_id() -> str:
+def resolve_active_text_model_id(env: "Optional[Mapping[str, str]]" = None) -> str:
     """Return the ACTIVE text-slot model id, honoring the env override.
 
     ONE resolution home for "which text model does the active slot use", shared
@@ -1677,13 +1677,17 @@ def resolve_active_text_model_id() -> str:
     qwen3's 10 240-ctx fed to e.g. a 2 048-ctx embedder → silent truncation of the
     ACTIVE slot (R2-3).
     """
-    env_text_model = os.environ.get("EMBEDDING_MODEL", "").strip()
+    # ``env`` (v0.2.102 W6-I): another process's env (a project's projected
+    # ``.claude/settings.json`` env, read by the KG embedding self-heal that
+    # runs in the launcher's/installer's process) — same chain, no copy.
+    source = os.environ if env is None else env
+    env_text_model = (source.get("EMBEDDING_MODEL") or "").strip()
     if env_text_model:
         return env_text_model
-    active = _resolve_active_embedding()
+    active = _resolve_active_embedding(env)
     if active == "openai":
         return (
-            os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip()
+            (source.get("OPENAI_EMBEDDING_MODEL") or "text-embedding-3-small").strip()
             or "text-embedding-3-small"
         )
     return _model_id_for_active(active)
@@ -1803,7 +1807,7 @@ def configured_text_models() -> "list[str]":
 # user-locked 2026-06-09): exactly one resolution chain, env always wins.
 
 
-def _resolve_active_embedding() -> str:
+def _resolve_active_embedding(env: "Optional[Mapping[str, str]]" = None) -> str:
     """Return the active embedding profile (lowercased, stripped).
 
     Thin delegate to the ONE home, ``vco_lib.kg_context_triple.
@@ -1831,7 +1835,7 @@ def _resolve_active_embedding() -> str:
     """
     from vco_lib.kg_context_triple import active_embedding_profile
 
-    return active_embedding_profile()
+    return active_embedding_profile(env)
 
 
 def _model_id_for_active(active: str) -> str:

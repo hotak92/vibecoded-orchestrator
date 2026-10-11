@@ -99,6 +99,24 @@ pub struct DuplicatePair {
     pub confidence: f64,
 }
 
+/// One object the scan could NOT compare because it lacks the vector in the
+/// slot the scan queries (`detect_duplicates.py --json` →
+/// `objects_missing_vector`, v0.2.102 W6-H). `has_slots` names the vectors
+/// the object DOES carry — the "why" the GUI shows next to the title.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MissingVectorObject {
+    #[serde(default)]
+    pub uuid: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub target_vector: String,
+    #[serde(default)]
+    pub has_slots: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DuplicateScanResult {
     /// Threshold that the scan ran with (echoed back from the script
@@ -115,6 +133,28 @@ pub struct DuplicateScanResult {
     /// project still carrying a pre-v0.2.96 `detect_duplicates.py` working
     /// (it reports 0, which is what those scans implicitly claimed).
     pub nodes_skipped: u64,
+    /// Objects skipped because they lack the queried slot's vector (v0.2.102
+    /// W6-I surfaces W6-H's `--json` key). Non-empty means `pairs` is a FLOOR
+    /// for the same reason as `nodes_skipped`. Empty from a pre-v0.2.102
+    /// script (`#[serde(default)]`).
+    pub objects_missing_vector: Vec<MissingVectorObject>,
+}
+
+/// The `--json` document `kg-duplicates` prints (tolerant of older scripts:
+/// every key but `threshold` defaults).
+#[derive(Debug, Deserialize)]
+struct DuplicatesPayload {
+    threshold: f64,
+    #[serde(default)]
+    pairs: Vec<DuplicatePair>,
+    #[serde(default)]
+    nodes_skipped: u64,
+    #[serde(default)]
+    objects_missing_vector: Vec<MissingVectorObject>,
+}
+
+fn parse_duplicates_payload(json_doc: &str) -> Result<DuplicatesPayload, serde_json::Error> {
+    serde_json::from_str(json_doc)
 }
 
 /// Result of `code_graph_reanalyze_current` / `code_graph_prune_stale`.
@@ -363,15 +403,7 @@ pub async fn kg_check_duplicates(
     })?;
     let json_doc = &stdout[json_start..];
 
-    #[derive(Deserialize)]
-    struct Payload {
-        threshold: f64,
-        #[serde(default)]
-        pairs: Vec<DuplicatePair>,
-        #[serde(default)]
-        nodes_skipped: u64,
-    }
-    let payload: Payload = serde_json::from_str(json_doc).map_err(|e| {
+    let payload = parse_duplicates_payload(json_doc).map_err(|e| {
         format!(
             "parse kg-duplicates JSON: {} — first stdout line was `{}` \
              (doc head: {})",
@@ -389,6 +421,7 @@ pub async fn kg_check_duplicates(
             "threshold": payload.threshold,
             "pair_count": payload.pairs.len(),
             "nodes_skipped": payload.nodes_skipped,
+            "objects_missing_vector": payload.objects_missing_vector.len(),
         }),
     )?;
 
@@ -396,6 +429,7 @@ pub async fn kg_check_duplicates(
         threshold: payload.threshold,
         pairs: payload.pairs,
         nodes_skipped: payload.nodes_skipped,
+        objects_missing_vector: payload.objects_missing_vector,
     })
 }
 
@@ -734,6 +768,29 @@ pub async fn validate_clone_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.2.102 W6-I: the scan's `objects_missing_vector` list (W6-H's
+    /// `--json` key) reaches the GUI — title, path and the slots each object
+    /// DOES carry — and a pre-v0.2.102 script (no key) still parses (empty).
+    #[test]
+    fn duplicates_payload_carries_objects_missing_vector() {
+        let doc = r#"{"threshold": 0.95, "pairs": [], "nodes_skipped": 1,
+            "objects_missing_vector": [{"uuid": "u1", "title": "Node A",
+            "path": "knowledge/a.md", "target_vector": "qwen3_embed",
+            "has_slots": ["arctic2_embed"]}]}"#;
+        let p = parse_duplicates_payload(doc).unwrap();
+        assert_eq!(p.nodes_skipped, 1);
+        assert_eq!(p.objects_missing_vector.len(), 1);
+        let o = &p.objects_missing_vector[0];
+        assert_eq!(o.title, "Node A");
+        assert_eq!(o.path, "knowledge/a.md");
+        assert_eq!(o.target_vector, "qwen3_embed");
+        assert_eq!(o.has_slots, vec!["arctic2_embed".to_string()]);
+
+        let old = parse_duplicates_payload(r#"{"threshold": 0.9, "pairs": []}"#).unwrap();
+        assert!(old.objects_missing_vector.is_empty());
+        assert_eq!(old.nodes_skipped, 0);
+    }
 
     /// #9: the open-logs target is the PROJECT's `.claude/logs`, and a
     /// missing folder is refused (leave-alone) rather than opened.

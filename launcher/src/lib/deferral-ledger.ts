@@ -285,6 +285,10 @@ export const AUTO_RETRY_BACKED_CONDITIONS: ReadonlySet<string> = new Set([
   // nodes owed. `retry:py:kg_seed` re-runs `sync_knowledge_graph.py --all`,
   // so the GUI's retry claim is true for this row.
   'kg_sync_failures_pending',
+  // v0.2.102 W6-I: a KG collection still filling the newly selected
+  // embedding model. `retry:py:kg_seed` re-runs `kg-sync --all`, whose
+  // pre-walk fill embeds the missing vectors — the retry claim is true.
+  'kg_embed_fill_pending',
   // v0.2.101: the SHARED-collection seed an install used to block on is now
   // enqueued. `retry:py:kg_seed_shared` re-runs the same shipped
   // `sync_knowledge_graph.py --all` against the shared class, so the GUI's

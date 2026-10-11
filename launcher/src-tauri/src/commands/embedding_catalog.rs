@@ -281,13 +281,13 @@ async fn run_vco_lib_cli(
 
 /// The status CLI prints ONE JSON object line; take the last non-empty line
 /// so a stray log line above it cannot break the parse.
-fn parse_last_json_line(stdout: &str) -> Result<serde_json::Value, String> {
+fn parse_last_json_line(stdout: &str, label: &str) -> Result<serde_json::Value, String> {
     let line = stdout
         .lines()
         .map(str::trim)
         .rfind(|l| !l.is_empty())
-        .ok_or_else(|| "code-embed status printed nothing".to_string())?;
-    serde_json::from_str(line).map_err(|e| format!("parse code-embed status JSON: {}", e))
+        .ok_or_else(|| format!("{} printed nothing", label))?;
+    serde_json::from_str(line).map_err(|e| format!("parse {} JSON: {}", label, e))
 }
 
 // ─── Tauri commands ──────────────────────────────────────────────────────
@@ -418,7 +418,26 @@ pub async fn get_code_embed_model_status(
     let stdout =
         run_vco_lib_cli(&args, install_root, CODE_EMBED_STATUS_TIMEOUT_SECS, "code-embed status")
             .await?;
-    parse_last_json_line(&stdout)
+    parse_last_json_line(&stdout, "code-embed status")
+}
+
+/// Per-project KG embedding model status (v0.2.102 W6-I): for each of a
+/// project's KG collections (its KG, the shared KG, the development
+/// collection) the model the collection is RECORDED as complete in (what
+/// searches use), the selected target, and the target's fill progress. The
+/// answer is computed by `python -m vco_lib.kg_embed_model status` (the ONE
+/// resolver, rung A) — this command only transports it, verbatim.
+#[command]
+pub async fn get_kg_embed_model_status(
+    db: State<'_, Db>,
+) -> Result<serde_json::Value, String> {
+    let install_root = crate::commands::installer::resolve_install_root_sync(&db);
+    let args: Vec<std::ffi::OsString> =
+        vec!["vco_lib.kg_embed_model".into(), "status".into(), "--json".into()];
+    let stdout =
+        run_vco_lib_cli(&args, install_root, CODE_EMBED_STATUS_TIMEOUT_SECS, "kg-embed status")
+            .await?;
+    parse_last_json_line(&stdout, "kg-embed status")
 }
 
 /// Check a model id against the live catalog. Used by the project-binding
@@ -468,10 +487,20 @@ mod tests {
     #[test]
     fn code_embed_status_takes_the_last_json_line() {
         let out = "[vct] a log line\n{\"pick\":\"codesage-large-v2\",\"projects\":[]}\n\n";
-        let v = parse_last_json_line(out).expect("parses");
+        let v = parse_last_json_line(out, "code-embed status").expect("parses");
         assert_eq!(v["pick"], "codesage-large-v2");
-        assert!(parse_last_json_line("").is_err());
-        assert!(parse_last_json_line("not json").is_err());
+        assert!(parse_last_json_line("", "code-embed status").is_err());
+        assert!(parse_last_json_line("not json", "code-embed status").is_err());
+    }
+
+    /// v0.2.102 W6-I: the KG status transport names ITS command in errors.
+    #[test]
+    fn kg_embed_status_parse_errors_name_the_kg_command() {
+        let v = parse_last_json_line("{\"target\":\"qwen3-embedding:0.6b\",\"projects\":[]}", "kg-embed status")
+            .expect("parses");
+        assert_eq!(v["target"], "qwen3-embedding:0.6b");
+        let err = parse_last_json_line("", "kg-embed status").unwrap_err();
+        assert!(err.contains("kg-embed status"), "{err}");
     }
 
     fn dummy_catalog() -> EmbeddingCatalog {
