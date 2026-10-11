@@ -165,8 +165,10 @@ describe('the alert entry and the store sync', () => {
     expect(entry.key).toBe(KG_RESCAN_ALERT_KEY);
     expect(entry.message).toContain('2 projects');
     expect(entry.actions).toEqual([
-      { label: 'Scan Acme', command: 'kg_check_duplicates', args: { projectId: 'p1' } },
-      { label: 'Scan Beta', command: 'kg_check_duplicates', args: { projectId: 'p2' } },
+      // `key` is the action's identity (projectId) — two projects sharing
+      // a display name must keep two distinct bell buttons (W6-J review R4).
+      { label: 'Scan Acme', key: 'p1', command: 'kg_check_duplicates', args: { projectId: 'p1' } },
+      { label: 'Scan Beta', key: 'p2', command: 'kg_check_duplicates', args: { projectId: 'p2' } },
     ]);
   });
 

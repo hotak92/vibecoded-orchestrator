@@ -89,3 +89,66 @@ describe('notifications store', () => {
     expect(get(errorCount)).toBe(3);
   });
 });
+
+describe('alert action identity (v0.2.102 W6-J review R4)', () => {
+  beforeEach(() => {
+    notifications.clearAll();
+  });
+
+  it('two projects sharing a display name keep two buttons; one scan drops only its own', () => {
+    // The slug is the unique key, not the display name: two registered
+    // projects CAN both be called "Demo". Their action buttons share the
+    // label `Scan Demo` but must be keyed (and dropped) by projectId.
+    notifications.upsertAlert(
+      {
+        key: 'kg-rescan',
+        message: 'two projects may need a re-scan',
+        actions: [
+          { label: 'Scan Demo', key: 'proj-a', command: 'kg_check_duplicates', args: { projectId: 'proj-a' } },
+          { label: 'Scan Demo', key: 'proj-b', command: 'kg_check_duplicates', args: { projectId: 'proj-b' } },
+        ],
+      },
+      1000,
+    );
+    let list = snapshot();
+    expect(list).toHaveLength(1);
+    expect(list[0].actions).toHaveLength(2);
+
+    // Project A's scan succeeded → only A's button goes.
+    notifications.dropAction(list[0].id, 'proj-a');
+    list = snapshot();
+    expect(list).toHaveLength(1);
+    expect(list[0].actions).toHaveLength(1);
+    expect(list[0].actions?.[0].key).toBe('proj-b');
+  });
+
+  it('dropping the last action clears the alert', () => {
+    notifications.upsertAlert(
+      {
+        key: 'kg-rescan',
+        message: 'one project',
+        actions: [
+          { label: 'Scan Demo', key: 'proj-b', command: 'kg_check_duplicates' },
+        ],
+      },
+      1000,
+    );
+    const [entry] = snapshot();
+    notifications.dropAction(entry.id, 'proj-b');
+    expect(snapshot()).toHaveLength(0);
+  });
+
+  it('an action without an explicit key falls back to its label', () => {
+    notifications.upsertAlert(
+      {
+        key: 'kg-rescan',
+        message: 'legacy shape',
+        actions: [{ label: 'Scan Demo', command: 'kg_check_duplicates' }],
+      },
+      1000,
+    );
+    const [entry] = snapshot();
+    notifications.dropAction(entry.id, 'Scan Demo');
+    expect(snapshot()).toHaveLength(0);
+  });
+});

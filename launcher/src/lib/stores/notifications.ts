@@ -30,9 +30,16 @@ import { writable, derived } from 'svelte/store';
 
 /** One actionable button on an info alert (v0.2.102 W6-J). The command is a
  *  Tauri command name; the panel that renders it narrows it to the literal
- *  union it supports so the invoke-name census still sees the names. */
+ *  union it supports so the invoke-name census still sees the names.
+ *  `key` is the action's IDENTITY — the each-key in the bell and the
+ *  `dropAction` match — so two actions that share a display label (two
+ *  registered projects with the same display name) stay two distinct
+ *  buttons; producers set it to the projectId the action targets. Falls
+ *  back to the label when absent. */
 export interface NotificationAction {
   label: string;
+  /** Stable identity (e.g. the target projectId). Defaults to the label. */
+  key?: string;
   command: string;
   args?: Record<string, unknown>;
 }
@@ -140,13 +147,15 @@ function upsertAlert(
 /**
  * One action of an alert ran successfully — drop just that action. When the
  * last action goes, the alert goes with it (nothing left to act on).
+ * Matched by the action's identity key (`a.key ?? a.label`) — NOT by the
+ * display label, which is not unique (two projects may share a name).
  */
-function dropAction(id: number, label: string): void {
+function dropAction(id: number, key: string): void {
   items.update((list) =>
     list.flatMap((n) => {
       if (n.id !== id) return [n];
       const before = n.actions ?? [];
-      const actions = before.filter((a) => a.label !== label);
+      const actions = before.filter((a) => (a.key ?? a.label) !== key);
       if (actions.length === before.length) return [n];
       if (actions.length === 0) return [];
       return [{ ...n, actions }];

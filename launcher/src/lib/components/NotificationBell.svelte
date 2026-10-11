@@ -52,9 +52,12 @@
   }
 
   /** Run an alert's action button. On success that action leaves the entry
-   *  (the last one clears the alert); a failure stays and is toasted. */
+   *  (the last one clears the alert); a failure stays and is toasted.
+   *  Buttons are keyed by the action's identity (`a.key ?? a.label`), not
+   *  the display label — two projects sharing a display name must keep
+   *  two distinct buttons. */
   async function runAction(n: ErrorNotification, a: NotificationAction) {
-    const key = `${n.id}:${a.label}`;
+    const key = `${n.id}:${a.key ?? a.label}`;
     running = { ...running, [key]: true };
     try {
       const result = await invoke<unknown>(a.command as BellActionCommand, a.args);
@@ -65,7 +68,7 @@
           ? duplicateScanSummary(a.label, result as DuplicateScanResult)
           : `${a.label} finished`,
       );
-      notifications.dropAction(n.id, a.label);
+      notifications.dropAction(n.id, a.key ?? a.label);
     } catch (e) {
       toast.error(e);
     } finally {
@@ -122,13 +125,13 @@
                 </div>
                 {#if n.actions && n.actions.length > 0}
                   <div class="bell-item-actionrow">
-                    {#each n.actions as a (a.label)}
+                    {#each n.actions as a (a.key ?? a.label)}
                       <button
                         class="bell-action-btn"
                         data-testid="bell-action"
-                        disabled={running[`${n.id}:${a.label}`]}
+                        disabled={running[`${n.id}:${a.key ?? a.label}`]}
                         onclick={() => void runAction(n, a)}
-                      >{running[`${n.id}:${a.label}`] ? 'Running…' : a.label}</button>
+                      >{running[`${n.id}:${a.key ?? a.label}`] ? 'Running…' : a.label}</button>
                     {/each}
                   </div>
                 {/if}

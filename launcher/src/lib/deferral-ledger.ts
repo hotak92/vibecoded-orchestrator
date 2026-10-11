@@ -5,7 +5,7 @@
 // deferral-ledger panel.
 //
 // Extracted from the Svelte component for the same reason as
-// `codegraph-build-banner-logic.ts` / `regenerate-modal-logic.ts`: the repo has
+// `codegraph-build-banner-logic.ts` (`regenerate-modal-logic.ts` was removed v0.2.102 W6-J): the repo has
 // no jsdom / testing-library (a deliberate scope decision, wave-2 verdict 2),
 // so a component test would mean new devDeps and a lockfile regen for one file.
 // Everything that DECIDES anything lives here and is unit-tested; the .svelte

@@ -75,6 +75,9 @@ export function rescanAlertEntry(candidates: RescanCandidate[]): {
         : `${candidates.length} projects' knowledge graphs may need a fresh duplicate scan (a new embedding model is being filled in, or some stored objects may lack the vector the scan compares).`,
     actions: candidates.map((c) => ({
       label: `Scan ${c.name}`,
+      // Identity = projectId: two registered projects may share a display
+      // name, and the bell keys/drops actions by this, not the label.
+      key: c.projectId,
       command: 'kg_check_duplicates',
       args: { projectId: c.projectId },
     })),
