@@ -4777,10 +4777,12 @@ try:
         _get_both_embeddings,  # noqa: F401 — re-export (block comment above): consumed off `server`
         _get_all_kg_embeddings,  # noqa: F401 — re-export (block comment above): consumed off `server`
         _get_all_kg_embeddings_tagged,
+        complete_kg_write_vectors,
         _get_all_code_embeddings,  # noqa: F401 — re-export (block comment above): consumed off `server`
         _scheme_for_collection,
         _primary_named_vector,
         _get_search_vector,
+        _kg_search_vector,
         count_tokens_async,  # noqa: F401 — re-export (block comment above): consumed off `server`
         get_code_embedding,
         _inline_code_embed_http,  # noqa: F401 — re-export (block comment above): consumed off `server`
@@ -5561,7 +5563,7 @@ async def _semantic_graph_search_body(
                     nt_kwargs["filters"] = stale
                 primary = handle.query.near_text(**nt_kwargs)
             else:
-                vector, target_name = await _get_search_vector(query)
+                vector, target_name = await _kg_search_vector(query, coll_name, steady=_get_search_vector)
                 query_vector = vector
                 query_target = target_name or ""
                 nv_kwargs = dict(
@@ -5944,7 +5946,7 @@ async def _hybrid_search_single_collection(
         else:
             semantic_results = coll.query.near_text(query=query, limit=fetch_limit, return_metadata=["distance"])
     else:
-        vector, target_name = await _get_search_vector(query)
+        vector, target_name = await _kg_search_vector(query, coll_name, steady=_get_search_vector)
         query_vector = vector
         query_target = target_name or ""
         nv_kwargs = dict(
@@ -6384,7 +6386,9 @@ async def _hybrid_search_body(
     query_target: str = ""
     if EMBEDDING_SOURCE != "weaviate":
         try:
-            _vec, _slot = await _get_search_vector(query)
+            # W6-I: the RL capture is the project KG's query (its recorded
+            # model + slot) — the pair the dual log keys its "other" slot on.
+            _vec, _slot = await _kg_search_vector(query, KG_COLLECTION, steady=_get_search_vector)
             query_vector = _vec
             query_target = _slot or ""
         except EmbeddingBackendUnavailable:
@@ -7275,6 +7279,9 @@ async def store_knowledge_node(
                 # so every MCP-written single-chunk row (the overwhelming
                 # majority) resolved UNKNOWN for every slot.
                 vectors, truncated_all = await _get_all_kg_embeddings_tagged(content)
+                truncated_all = list(truncated_all)
+                vectors = await complete_kg_write_vectors(
+                    vectors, truncated_all, content, target_collection_name)
                 properties.update(
                     _truncation_tag_properties(
                         truncated_all, _active_text_slot_name(),
@@ -7363,6 +7370,9 @@ async def store_knowledge_node(
                     vectors, truncated_all = await _get_all_kg_embeddings_tagged(
                         chunk.content
                     )
+                    truncated_all = list(truncated_all)
+                    vectors = await complete_kg_write_vectors(
+                        vectors, truncated_all, chunk.content, target_collection_name)
                     chunk_props.update(
                         _truncation_tag_properties(
                             truncated_all, _active_text_slot_name(),

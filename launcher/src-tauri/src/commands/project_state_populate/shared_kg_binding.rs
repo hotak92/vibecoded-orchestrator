@@ -320,7 +320,6 @@ pub fn repair_shared_kg_bindings(
                     &project.id,
                     "shared",
                     &to,
-                    row.embedding_model.as_deref(),
                     row.embedding_dim,
                     row.kg_dir_path.as_deref(),
                     row.weaviate_url.as_deref(),
@@ -538,12 +537,10 @@ mod tests {
             project_id,
             role,
             collection,
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             Some("http://localhost:8081"),
-            config,
-        )
+            config)
         .unwrap();
     }
 
@@ -879,6 +876,16 @@ mod tests {
     #[test]
     fn sweep_preserves_the_row_metadata_it_is_not_repairing() {
         let db = poisoned_db();
+        // W6-J: the retired embedding_model column is never written anymore,
+        // so a historical value is seeded directly — and the repair sweep's
+        // rewrite must leave it untouched (never drop user DB data).
+        db.lock()
+            .execute(
+                "UPDATE project_kg_bindings SET embedding_model = 'qwen3-embedding:0.6b' \
+                 WHERE project_id = 'p1' AND role = 'shared'",
+                [],
+            )
+            .unwrap();
         repair_shared_kg_bindings(&db, Some(&live_classes()), NO_LEDGER);
 
         let row = db
@@ -887,7 +894,20 @@ mod tests {
             .into_iter()
             .find(|b| b.role == "shared")
             .expect("shared row");
-        assert_eq!(row.embedding_model.as_deref(), Some("qwen3-embedding:0.6b"));
+        let stored_model: Option<String> = db
+            .lock()
+            .query_row(
+                "SELECT embedding_model FROM project_kg_bindings \
+                 WHERE project_id = 'p1' AND role = 'shared'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_model.as_deref(),
+            Some("qwen3-embedding:0.6b"),
+            "the retired column's historical value survives the repair write"
+        );
         assert_eq!(row.embedding_dim, Some(1024));
         assert_eq!(row.weaviate_url.as_deref(), Some("http://localhost:8081"));
     }

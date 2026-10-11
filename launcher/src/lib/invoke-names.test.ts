@@ -95,6 +95,13 @@ const DYNAMIC_INVOKES: DynamicInvoke[] = [
     names: [],
     reason: 'manifest ActionRef::Legacy string, gated by module_manifest_command_allowed',
   },
+  {
+    file: 'lib/components/NotificationBell.svelte',
+    expr: 'a.command',
+    names: ['kg_check_duplicates'],
+    reason:
+      "the alert action's `command` field (W6-J KG re-scan alert); the BellActionCommand literal-union type in the same file names every allowed command",
+  },
 ];
 
 type NotInvokedClass = 'rust-only' | 'tray' | 'owner-deferred' | 'uncalled-finding';

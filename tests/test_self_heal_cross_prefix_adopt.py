@@ -172,9 +172,9 @@ def _start_stub_weaviate(
 
 _INSERT_BINDING_SQL = (
     "INSERT INTO project_kg_bindings "
-    "(project_id, role, collection_name, embedding_model, "
+    "(project_id, role, collection_name, "
     "embedding_dim, kg_dir_path, weaviate_url, config_json, "
-    "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)"
+    "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)"
 )
 
 

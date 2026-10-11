@@ -253,7 +253,11 @@ pub struct ProjectKgBinding {
     pub project_id: String,
     pub role: String,
     pub collection_name: String,
-    pub embedding_model: Option<String>,
+    // v0.2.102 W6-J (owner ruling 2026-10-11): the per-project KG embedding
+    // model picker is RETIRED — one global embedding setting serves every
+    // project and the shared KG. The DB column stays (never drop user data;
+    // the `projects.rl_port` convention, migration 017) but nothing reads or
+    // writes it anymore, so the struct carries no field for it.
     pub embedding_dim: Option<i64>,
     pub kg_dir_path: Option<String>,
     pub weaviate_url: Option<String>,
@@ -1017,7 +1021,6 @@ impl Db {
         project_id: &str,
         role: &str,
         collection_name: &str,
-        embedding_model: Option<&str>,
         embedding_dim: Option<i64>,
         kg_dir_path: Option<&str>,
         weaviate_url: Option<&str>,
@@ -1027,22 +1030,25 @@ impl Db {
         let now = Utc::now().timestamp_millis();
         let cfg = json_to_str(config);
         let guard = self.lock();
+        // v0.2.102 W6-J: the retired `embedding_model` column is deliberately
+        // absent from the column list — new rows store NULL there and an
+        // upsert no longer overwrites a historical value (never drop user
+        // DB data).
         guard
             .execute(
                 "INSERT INTO project_kg_bindings
-                 (project_id, role, collection_name, embedding_model, embedding_dim,
+                 (project_id, role, collection_name, embedding_dim,
                   kg_dir_path, weaviate_url, config_json, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(project_id, role) DO UPDATE SET
                     collection_name = excluded.collection_name,
-                    embedding_model = excluded.embedding_model,
                     embedding_dim = excluded.embedding_dim,
                     kg_dir_path = excluded.kg_dir_path,
                     weaviate_url = excluded.weaviate_url,
                     config_json = excluded.config_json,
                     updated_at = excluded.updated_at",
                 params![
-                    project_id, role, collection_name, embedding_model, embedding_dim,
+                    project_id, role, collection_name, embedding_dim,
                     kg_dir_path, weaviate_url, cfg, now,
                 ],
             )
@@ -1051,7 +1057,6 @@ impl Db {
             project_id: project_id.to_string(),
             role: role.to_string(),
             collection_name: collection_name.to_string(),
-            embedding_model: embedding_model.map(str::to_string),
             embedding_dim,
             kg_dir_path: kg_dir_path.map(str::to_string),
             weaviate_url: weaviate_url.map(str::to_string),
@@ -1091,7 +1096,6 @@ impl Db {
         project_slug: &str,
         role: &str,
         collection_name: &str,
-        embedding_model: Option<&str>,
         embedding_dim: Option<i64>,
         kg_dir_path: Option<&str>,
         weaviate_url: Option<&str>,
@@ -1153,19 +1157,18 @@ impl Db {
 
         let primary_write = guard.execute(
             "INSERT INTO project_kg_bindings
-             (project_id, role, collection_name, embedding_model, embedding_dim,
+             (project_id, role, collection_name, embedding_dim,
               kg_dir_path, weaviate_url, config_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(project_id, role) DO UPDATE SET
                 collection_name = excluded.collection_name,
-                embedding_model = excluded.embedding_model,
                 embedding_dim = excluded.embedding_dim,
                 kg_dir_path = excluded.kg_dir_path,
                 weaviate_url = excluded.weaviate_url,
                 config_json = excluded.config_json,
                 updated_at = excluded.updated_at",
             params![
-                project_id, role, collection_name, embedding_model, embedding_dim,
+                project_id, role, collection_name, embedding_dim,
                 kg_dir_path, weaviate_url, cfg, now,
             ],
         );
@@ -1180,19 +1183,18 @@ impl Db {
         if should_mirror {
             let mirror_write = guard.execute(
                 "INSERT INTO project_kg_bindings
-                 (project_id, role, collection_name, embedding_model, embedding_dim,
+                 (project_id, role, collection_name, embedding_dim,
                   kg_dir_path, weaviate_url, config_json, updated_at)
-                 VALUES (?1, 'shared', ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 VALUES (?1, 'shared', ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(project_id, role) DO UPDATE SET
                     collection_name = excluded.collection_name,
-                    embedding_model = excluded.embedding_model,
                     embedding_dim = excluded.embedding_dim,
                     kg_dir_path = excluded.kg_dir_path,
                     weaviate_url = excluded.weaviate_url,
                     config_json = excluded.config_json,
                     updated_at = excluded.updated_at",
                 params![
-                    project_id, collection_name, embedding_model, embedding_dim,
+                    project_id, collection_name, embedding_dim,
                     kg_dir_path, weaviate_url, mirror_config, now,
                 ],
             );
@@ -1267,7 +1269,6 @@ impl Db {
             project_id: project_id.to_string(),
             role: role.to_string(),
             collection_name: collection_name.to_string(),
-            embedding_model: embedding_model.map(str::to_string),
             embedding_dim,
             kg_dir_path: kg_dir_path.map(str::to_string),
             weaviate_url: weaviate_url.map(str::to_string),
@@ -1283,7 +1284,7 @@ impl Db {
         let guard = self.lock();
         let mut stmt = guard
             .prepare(
-                "SELECT project_id, role, collection_name, embedding_model, embedding_dim,
+                "SELECT project_id, role, collection_name, embedding_dim,
                         kg_dir_path, weaviate_url, config_json, updated_at
                  FROM project_kg_bindings WHERE project_id = ?1
                  ORDER BY role ASC",
@@ -1291,17 +1292,16 @@ impl Db {
             .map_err(|e| format!("prepare: {}", e))?;
         let rows = stmt
             .query_map(params![project_id], |r| {
-                let cfg_s: String = r.get(7)?;
+                let cfg_s: String = r.get(6)?;
                 Ok(ProjectKgBinding {
                     project_id: r.get(0)?,
                     role: r.get(1)?,
                     collection_name: r.get(2)?,
-                    embedding_model: r.get(3)?,
-                    embedding_dim: r.get(4)?,
-                    kg_dir_path: r.get(5)?,
-                    weaviate_url: r.get(6)?,
+                    embedding_dim: r.get(3)?,
+                    kg_dir_path: r.get(4)?,
+                    weaviate_url: r.get(5)?,
                     config: json_from_str(&cfg_s),
-                    updated_at: r.get(8)?,
+                    updated_at: r.get(7)?,
                 })
             })
             .map_err(|e| format!("query: {}", e))?;
@@ -2030,7 +2030,6 @@ mod tests {
             "p1",
             "primary",
             "ProjectOneKG",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -2305,9 +2304,57 @@ mod tests {
         let db = make_db();
         seed_project(&db, "p1", "Project One");
         let err = db
-            .set_project_kg_binding("p1", "weird", "X", None, None, None, None, &JsonValue::Null)
+            .set_project_kg_binding("p1", "weird", "X", None, None, None, &JsonValue::Null)
             .unwrap_err();
         assert!(err.contains("invalid kg_binding.role"));
+    }
+
+    /// v0.2.102 W6-J: the retired `embedding_model` column keeps its
+    /// historical value through a re-save of the binding — both upsert paths
+    /// (the plain writer and the root-sync writer the GUI/hub saves use). The
+    /// column is retired, never dropped: no write path may erase user data
+    /// in it. Red against the pre-W6-J upsert, whose
+    /// `embedding_model = excluded.embedding_model` overwrote it with NULL.
+    #[test]
+    fn kg_binding_resave_keeps_the_retired_embedding_model_value() {
+        let db = make_db();
+        seed_project(&db, "p1", "Project One");
+        db.set_project_kg_binding("p1", "primary", "P1_KG", Some(1024), None, None, &JsonValue::Null)
+            .unwrap();
+        db.lock()
+            .execute(
+                "UPDATE project_kg_bindings SET embedding_model = 'historical-model' \
+                 WHERE project_id = 'p1' AND role = 'primary'",
+                [],
+            )
+            .unwrap();
+        let stored = |db: &Db| -> Option<String> {
+            db.lock()
+                .query_row(
+                    "SELECT embedding_model FROM project_kg_bindings \
+                     WHERE project_id = 'p1' AND role = 'primary'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        db.set_project_kg_binding("p1", "primary", "P1_KG", Some(1024), None, None, &JsonValue::Null)
+            .unwrap();
+        assert_eq!(stored(&db).as_deref(), Some("historical-model"));
+
+        db.set_project_kg_binding_with_root_sync(
+            "p1",
+            "p1",
+            "primary",
+            "P1_Renamed_KG",
+            Some(1024),
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .unwrap();
+        assert_eq!(stored(&db).as_deref(), Some("historical-model"));
     }
 
     #[test]
@@ -2315,12 +2362,10 @@ mod tests {
         let db = make_db();
         seed_project(&db, "p1", "Project One");
         db.set_project_kg_binding(
-            "p1", "primary", "P1Primary", None, None, None, None, &JsonValue::Null,
-        )
+            "p1", "primary", "P1Primary", None, None, None, &JsonValue::Null)
         .unwrap();
         db.set_project_kg_binding(
-            "p1", "shared", "SharedKG", None, None, None, None, &JsonValue::Null,
-        )
+            "p1", "shared", "SharedKG", None, None, None, &JsonValue::Null)
         .unwrap();
         // Both bindings present.
         let bindings = db.list_project_kg_bindings("p1").unwrap();
@@ -2394,7 +2439,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &serde_json::json!({"manual_override": "v0.2.28-recovery"}),
         )
         .unwrap();
@@ -2406,7 +2450,6 @@ mod tests {
             ORCHESTRATOR_ROOT_SLUG_FOR_TEST,
             "primary",
             "RootKnowledgeGraph",
-            None,
             None,
             None,
             None,
@@ -2448,7 +2491,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &JsonValue::Null,
         )
         .unwrap();
@@ -2458,7 +2500,6 @@ mod tests {
             "peer-project",
             "primary",
             "PeerPrimary",
-            None,
             None,
             None,
             None,
@@ -2513,7 +2554,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &JsonValue::Null,
         )
         .unwrap();
@@ -2523,7 +2563,6 @@ mod tests {
             ORCHESTRATOR_ROOT_SLUG_FOR_TEST,
             "shared",
             "DifferentSharedName",
-            None,
             None,
             None,
             None,
@@ -2580,7 +2619,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &JsonValue::Null,
         )
         .unwrap();
@@ -2604,8 +2642,7 @@ mod tests {
         db.kg_set_access("p1", "OldPrimary_KG", "write").unwrap();
         // Seed primary BEFORE the rebind so the OLD name is observable.
         db.set_project_kg_binding(
-            "p1", "primary", "OldPrimary_KG", None, None, None, None, &JsonValue::Null,
-        )
+            "p1", "primary", "OldPrimary_KG", None, None, None, &JsonValue::Null)
         .unwrap();
 
         // Rebind via the root-sync method (peer slug — no shared mirror).
@@ -2614,7 +2651,6 @@ mod tests {
             "peer-project",
             "primary",
             "NewPrimary_KG",
-            None,
             None,
             None,
             None,
@@ -2641,15 +2677,13 @@ mod tests {
         seed_project(&db, "p1", "Peer Project");
         // No kg_collection_access row yet.
         db.set_project_kg_binding(
-            "p1", "primary", "OldPrimary_KG", None, None, None, None, &JsonValue::Null,
-        )
+            "p1", "primary", "OldPrimary_KG", None, None, None, &JsonValue::Null)
         .unwrap();
         db.set_project_kg_binding_with_root_sync(
             "p1",
             "peer-project",
             "primary",
             "NewPrimary_KG",
-            None,
             None,
             None,
             None,
@@ -2695,8 +2729,7 @@ mod tests {
                 .unwrap();
         }
         db.set_project_kg_binding(
-            "p1", "primary", "OldPrimary_KG", None, None, None, None, &JsonValue::Null,
-        )
+            "p1", "primary", "OldPrimary_KG", None, None, None, &JsonValue::Null)
         .unwrap();
         // Source has write; pre-existing target at lower privilege.
         db.kg_set_access("p1", "OldPrimary_KG", "write").unwrap();
@@ -2707,7 +2740,6 @@ mod tests {
             "peer-project",
             "primary",
             "NewPrimary_KG",
-            None,
             None,
             None,
             None,
@@ -2754,12 +2786,10 @@ mod tests {
         }
         // Seed primary + shared both at the old name; seed an access row at the old name.
         db.set_project_kg_binding(
-            "root1", "primary", "OldRoot_KG", None, None, None, None, &JsonValue::Null,
-        )
+            "root1", "primary", "OldRoot_KG", None, None, None, &JsonValue::Null)
         .unwrap();
         db.set_project_kg_binding(
-            "root1", "shared", "OldRoot_KG", None, None, None, None, &JsonValue::Null,
-        )
+            "root1", "shared", "OldRoot_KG", None, None, None, &JsonValue::Null)
         .unwrap();
         db.kg_set_access("root1", "OldRoot_KG", "write").unwrap();
 
@@ -2771,7 +2801,6 @@ mod tests {
             "orchestrator-root",
             "primary",
             "NewRoot_KG",
-            None,
             None,
             None,
             None,

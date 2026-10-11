@@ -3083,7 +3083,6 @@ mod kg_access_propagation_tests {
             None,
             None,
             None,
-            None,
             &serde_json::Value::Null,
         )
         .unwrap();
@@ -3148,7 +3147,6 @@ mod kg_access_propagation_tests {
             "p1",
             "primary",
             "LazyClass_KnowledgeGraph",
-            None,
             None,
             None,
             None,
@@ -3445,7 +3443,6 @@ mod adopt_populated_tests {
             project_id,
             role,
             collection,
-            None,
             None,
             None,
             None,
@@ -4581,7 +4578,7 @@ mod populate_access_for_project_tests {
     }
 
     fn bind_primary(db: &Db, id: &str, coll: &str) {
-        db.set_project_kg_binding(id, "primary", coll, None, None, None, None, &serde_json::json!({}))
+        db.set_project_kg_binding(id, "primary", coll, None, None, None, &serde_json::json!({}))
             .unwrap();
     }
 
@@ -5099,7 +5096,6 @@ mod populate_access_for_project_tests {
             None,
             None,
             None,
-            None,
             &serde_json::Value::Null,
         )
         .unwrap();
@@ -5107,7 +5103,6 @@ mod populate_access_for_project_tests {
             "p1",
             "shared",
             &shared_collection,
-            None,
             None,
             None,
             None,

@@ -288,7 +288,6 @@ def add_project(
     kg_shared: Optional[str] = None,
     codegraph_prefix: Optional[str] = None,
     kg_extra_roles: Optional[Mapping[str, str]] = None,
-    kg_embedding_model: Optional[str] = None,
     kg_embedding_dim: Optional[int] = None,
     codegraph_embedding_model: Optional[str] = None,
     codegraph_embedding_dim: Optional[int] = None,
@@ -336,7 +335,6 @@ def add_project(
             "project_id": project_id,
             "role": role,
             "collection_name": coll,
-            "embedding_model": kg_embedding_model,
             "embedding_dim": kg_embedding_dim,
             "kg_dir_path": kg_dir_path,
         }

@@ -315,15 +315,18 @@ class DuplicateDetector:
     #:
     #: WHY an object can lack the target slot (determinable from the slots it
     #: DOES carry, recorded per object in ``has_slots``):
-    #:   * it carries OTHER named slots only — it was written while a
-    #:     different embedding profile was active (kg-sync writes only the
-    #:     ACTIVE slot unless dual-write is on), or by a sync whose ACTIVE
-    #:     backend failed at call time and only a fallback slot landed
-    #:     (`templates/scripts/sync_knowledge_graph.py::_build_vector_arg`,
-    #:     whose docstring documents "dict only has the fallback's slot").
-    #:     A KNOWN gap, reported rather than fixed here: the fallback-only
-    #:     write leaves the object invisible to every query that targets the
-    #:     active slot — including this scan.
+    #:   * it carries OTHER named slots only — written by a pre-v0.2.102
+    #:     sync whose ACTIVE backend failed at call time so only a fallback
+    #:     slot landed, or while a different embedding profile was active
+    #:     before the collection recorded which model it is complete in.
+    #:     v0.2.102 W6-I closed both producers going forward: a KG write
+    #:     without the active vector now FAILS (`vco_lib.kg_embed_model.
+    #:     complete_write_vectors`), and this scan queries the slot the
+    #:     collection is RECORDED as complete in (`kg_vector_slot.
+    #:     kg_query_target_vector`), so a profile switch whose new slot is
+    #:     still filling no longer lands objects here. Rows written before
+    #:     that remain until the next whole-tree `kg-sync --all` re-embeds
+    #:     them (its active-slot gate) — hence the per-object skip stays.
     #:   * it carries NO slot at all — every embedding backend failed for
     #:     that write, or the object predates vectorization.
     #:
@@ -642,11 +645,11 @@ class DuplicateDetector:
                     f"⚠️  PARTIAL scan: {len(missing_vector_objects)} of "
                     f"{len(nodes)} objects lack the target vector "
                     f"{target_vector!r} and were not compared: {titles}. "
-                    "Such objects were written while a different embedding "
-                    "profile was active, or by a sync whose active backend "
-                    "failed and only a fallback slot landed "
-                    "(sync_knowledge_graph.py::_build_vector_arg) — they are "
-                    "invisible to every query on this slot. Any duplicate "
+                    "Such objects were written by an older sync whose active "
+                    "backend failed (only a fallback slot landed), or while "
+                    "a different embedding profile was active — they are "
+                    "invisible to every query on this slot until the next "
+                    "whole-tree `kg-sync --all` re-embeds them. Any duplicate "
                     "involving them is NOT in this verdict."
                 )
 
@@ -693,10 +696,11 @@ class DuplicateDetector:
             report_lines.append(
                 f"> ⚠️ **PARTIAL SCAN** — {len(self.objects_missing_vector)} "
                 "object(s) carry no vector in the slot this scan queries and "
-                f"were never compared ({titles}). They were written while a "
-                "different embedding profile was active, or by a sync whose "
-                "active backend failed and only a fallback slot landed — "
-                "re-embed them (kg-sync) for a complete verdict.\n"
+                f"were never compared ({titles}). They were written by an "
+                "older sync whose active backend failed (only a fallback slot "
+                "landed), or while a different embedding profile was active — "
+                "the next whole-tree `kg-sync --all` re-embeds them; re-run "
+                "the scan after it for a complete verdict.\n"
             )
         report_lines.extend([
             "---\n",

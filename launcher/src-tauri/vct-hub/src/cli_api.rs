@@ -2330,7 +2330,6 @@ mod hub_access_matrix_wiring_tests {
                 None,
                 None,
                 None,
-                None,
                 &serde_json::Value::Null,
             )
             .expect("seed binding");
@@ -2662,7 +2661,6 @@ mod hub_access_matrix_wiring_tests {
                 &pid,
                 "primary",
                 "OwnPrimary_KG",
-                None,
                 None,
                 None,
                 None,

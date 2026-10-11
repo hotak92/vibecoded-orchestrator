@@ -230,7 +230,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &serde_json::json!({}),
         )
         .unwrap();

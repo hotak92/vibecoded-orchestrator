@@ -175,34 +175,18 @@ fn hub_global_active_embedding(db: &Db) -> Option<String> {
         })
 }
 
-/// Resolve ACTIVE_EMBEDDING for a project (B1 two-DB-location bridge).
+/// Resolve ACTIVE_EMBEDDING — ONE global profile for every project
+/// (v0.2.102 W6-J; owner ruling 2026-10-11).
 ///
-/// Cascade (LOCKED — must match the launcher + Python resolvers):
-///   1. per-project `module_settings/orchestrator-core/active_embedding`
-///      WHERE `active_embedding_source == "user"` → verbatim (sticky).
-///   2. machine-global default (`hub_global_active_embedding`).
-///   3. `"qwen3"`.
+/// Order (must match the launcher `project_env_settings.rs::
+/// resolve_active_embedding_cascade` + the Python `config_projection.py`):
+///   1. machine-global default (`hub_global_active_embedding`);
+///   2. `"qwen3"`.
 ///
-/// Soft-fail on every read. An "auto" marker, a legacy NO-marker row, or an
-/// absent per-project row all fall to leg 2 (inherit global).
-fn resolve_active_embedding_for_hub(db: &Db, project_id: &str) -> String {
-    let source = db
-        .get_setting(project_id, "orchestrator-core", "active_embedding_source")
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_str().map(String::from));
-    if source.as_deref() == Some("user") {
-        if let Some(value) = db
-            .get_setting(project_id, "orchestrator-core", "active_embedding")
-            .ok()
-            .flatten()
-            .and_then(|v| v.as_str().map(String::from))
-            .filter(|s| !s.is_empty())
-        {
-            return value;
-        }
-        // source=user but the value row is missing/empty — fall through.
-    }
+/// The per-project `module_settings/orchestrator-core/active_embedding` row
+/// and its `active_embedding_source` marker (the removed Settings-tab picker)
+/// are RETIRED: left in launcher.db, never read here.
+fn resolve_active_embedding_for_hub(db: &Db) -> String {
     hub_global_active_embedding(db).unwrap_or_else(|| "qwen3".to_string())
 }
 
@@ -712,26 +696,11 @@ async fn project_config(
     // run here was removed with the dropped diagrams integrations — see
     // the struct-field note above. The `diagram_access` table stays.)
 
-    // 6. active_embedding — v0.2.71 T-B-emb cascade (B1 two-DB-location bridge).
-    //
-    // The SAME cascade as launcher `project_env_settings.rs::
-    // resolve_active_embedding_cascade` + the Python `config_projection.py`
-    // writer (cross-surface lockstep — a hub read and a GUI write/populate
-    // can NEVER disagree, the Defect-D class):
-    //
-    //   1. per-project module_settings/orchestrator-core/active_embedding
-    //      WHERE active_embedding_source == "user" (sticky pick) → verbatim.
-    //   2. machine-global app_state[embedding.active_profile], then the
-    //      hardware-pick derive (app_state[default_text_embedding] → profile).
-    //      This is the BRIDGE: a non-user project yields to the global value
-    //      the launcher/install.py also computed, so the two DB locations
-    //      (app_state vs per-project module_settings) can't diverge.
-    //   3. "qwen3" final fallback.
-    //
-    // An "auto" marker OR a legacy NO-marker per-project row both fall to
-    // leg 2 (inherit global) — the LOCKED v0.2.71 decision that fixes the
-    // auto-seeded qwen3 case (a backfill-stamped qwen3 with no provenance).
-    let active_embedding = resolve_active_embedding_for_hub(&h.0, &project.id);
+    // 6. active_embedding — ONE global profile for every project (v0.2.102
+    //    W6-J): the SAME resolution as the launcher populate + the Python
+    //    `config_projection.py` writer (a hub read and a GUI write can never
+    //    disagree). The retired per-project pick is not read.
+    let active_embedding = resolve_active_embedding_for_hub(&h.0);
 
     // 7. shared_kg_write_disabled (module_settings → orchestrator-core).
     // Default false — match the access-matrix audit's "asymmetric
@@ -1186,13 +1155,18 @@ async fn project_config(
     codegraph_access_list.sort();
     codegraph_access_list.dedup();
 
-    // Embeddings: from binding rows when present, otherwise the
-    // launcher's compiled defaults.
-    let text_embedding = kg_bindings
-        .iter()
-        .find(|b| b.role == "primary")
-        .and_then(|b| b.embedding_model.clone())
-        .unwrap_or_else(|| "qwen3-embedding:0.6b".to_string());
+    // Embeddings: the code leg is the codegraph binding's record; the text
+    // leg is the project's RESOLVED active profile's model. (Until v0.2.102
+    // W6-J the text leg read `project_kg_bindings.embedding_model` — the
+    // retired per-project KG model pick: one global embedding setting now.
+    // The match mirrors the SSOT `vco_lib/embedding_selection.py::
+    // model_id_for_active` — keep them equal.)
+    let text_embedding = match active_embedding.as_str() {
+        "arctic" => "snowflake-arctic-embed2:latest",
+        "openai" => "text-embedding-3-small",
+        _ => "qwen3-embedding:0.6b",
+    }
+    .to_string();
     let code_embedding = cg_binding
         .as_ref()
         .and_then(|b| b.embedding_model.clone())
@@ -1916,7 +1890,6 @@ mod tests {
                 id,
                 "primary",
                 &format!("{}_KnowledgeGraph", capitalize(slug)),
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -1929,7 +1902,6 @@ mod tests {
                 id,
                 "shared",
                 "VibeCodedOrchestrator_KnowledgeGraph",
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -1942,7 +1914,6 @@ mod tests {
                 id,
                 "archive",
                 &format!("{}_Development", capitalize(slug)),
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -2018,7 +1989,6 @@ mod tests {
                 id,
                 "primary",
                 &format!("{}_KnowledgeGraph", capitalize(slug)),
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -2287,7 +2257,6 @@ mod tests {
                 project_id,
                 "primary",
                 "MyCustomKG_KnowledgeGraph",
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -2299,7 +2268,6 @@ mod tests {
                 project_id,
                 "shared",
                 "VibeCodedOrchestrator_KnowledgeGraph",
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -2354,7 +2322,6 @@ mod tests {
                 project_id,
                 "primary",
                 "WeirdName_Custom",
-                None,
                 None,
                 None,
                 None,
@@ -2970,11 +2937,11 @@ kg_tier_full = 0.8
     /// user `_Diagrams` collections.)
 
     #[tokio::test]
-    async fn config_emits_active_embedding_from_module_settings() {
-        // v0.2.71 T-B-emb: a STICKY per-project pick (value + source=user)
-        // overrides the default 'qwen3'. (Pre-v0.2.71 this test set only the
-        // value with no marker; under the provenance cascade a no-marker row
-        // inherits the global default, so the value alone no longer pins.)
+    async fn config_ignores_the_retired_per_project_pick() {
+        // v0.2.102 W6-J: a RETIRED per-project pick (value + source=user, what
+        // the removed Settings-tab picker wrote) no longer overrides the
+        // global profile — the hub answers the machine default. Red against
+        // the v0.2.71 cascade, which returned the sticky pick verbatim.
         let (base, h) = spawn_config_api_hub().await;
         seed_full_project(&h, "p-openai", "myproject");
         h.0.set_setting(
@@ -3005,7 +2972,8 @@ kg_tier_full = 0.8
         let body: serde_json::Value = resp.json().await.expect("json body");
         assert_eq!(
             body.get("active_embedding").and_then(|v| v.as_str()),
-            Some("openai")
+            Some("qwen3"),
+            "one global profile — the retired per-project pick is not read"
         );
         assert_eq!(
             body.get("shared_kg_write_disabled").and_then(|v| v.as_bool()),
@@ -3266,7 +3234,6 @@ kg_tier_full = 0.8
             "root-id",
             "primary",
             "VCODev_KnowledgeGraph",
-            None,
             None,
             None,
             None,
@@ -4386,7 +4353,6 @@ kg_tier_full = 0.8
             project_id,
             "primary",
             "VibeCodedOrchestrator_KnowledgeGraph", // capital-C canonical
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4397,7 +4363,6 @@ kg_tier_full = 0.8
             project_id,
             "shared",
             "VibeCodedOrchestrator_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4629,7 +4594,6 @@ kg_tier_full = 0.8
             project_id,
             "primary",
             "FreshProject_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4680,7 +4644,6 @@ kg_tier_full = 0.8
             project_id,
             "primary",
             "Unreach_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4795,7 +4758,6 @@ kg_tier_full = 0.8
             "p-root",
             "primary",
             "RootOwned_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4816,7 +4778,6 @@ kg_tier_full = 0.8
             id,
             "primary",
             "NoSharedRow_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4857,7 +4818,6 @@ kg_tier_full = 0.8
             id,
             "primary",
             "UnresolvableShared_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4993,7 +4953,6 @@ kg_tier_full = 0.8
             phantom_id,
             "primary",
             "Phantom_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -5007,7 +4966,6 @@ kg_tier_full = 0.8
             phantom_id,
             "shared",
             "PhantomShared_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -5071,7 +5029,6 @@ kg_tier_full = 0.8
             healthy_id,
             "primary",
             "Existing_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -5084,7 +5041,6 @@ kg_tier_full = 0.8
             healthy_id,
             "shared",
             "Existing_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,

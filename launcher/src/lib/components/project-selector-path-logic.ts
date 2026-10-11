@@ -4,7 +4,8 @@
 // v0.2.91 (#32) — pure decision logic for the New Project modal's
 // Name↔Path coupling, extracted from ProjectSelector.svelte so it is
 // unit-testable without mounting the component (mirrors
-// codegraph-build-banner-logic.ts / regenerate-modal-logic.ts).
+// codegraph-build-banner-logic.ts; the regenerate-modal-logic.ts sibling
+// was retired in v0.2.102 W6-J with the model-switch modal).
 //
 // The hazard these functions pin: while the path is untouched, the
 // reactive Name→Path sync rewrites it on every keystroke — so the browse

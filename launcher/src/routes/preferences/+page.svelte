@@ -40,6 +40,7 @@
   // with scope="global" for the HOST-WIDE DEFAULTS, and on each project's
   // Settings tab with scope="project" for that project's own choices.
   import DualWriteFlagsPanel from '$lib/project-state/DualWriteFlagsPanel.svelte';
+  import KgEmbedStatus from '$lib/preferences/KgEmbedStatus.svelte';
   // Machine-global Artifact-tool switch. Own component (this page is already
   // ~4k lines) and, unlike everything else here, it edits CLAUDE CODE's own
   // user-scope settings file rather than launcher.db — see
@@ -2294,8 +2295,9 @@
 
     <!--
       Default embedding models for new projects (v0.2.18 Commit 8).
-      App-level — applies to projects created from now on. Existing
-      projects keep their per-binding model. Populated from the live
+      App-level. (v0.2.102 W6-J: the text default no longer seeds a
+      per-binding KG model — that column is retired; the KG embeds with the
+      global profile this save also stamps.) Populated from the live
       catalog so users can only pick what their machine can serve;
       unavailable models render greyed-out with a tooltip explaining
       why. Per the v0.2.18 locked rule (no-auto-switch), this is the
@@ -2316,11 +2318,11 @@
       {/if}
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
-          <strong>Default text embedding for new projects</strong>
+          <strong>Text embedding (KG, every project)</strong>
           <span class="pr-onboarding-hint">
-            Applied to the KG binding when you create a new project. Existing
-            projects are not affected. Greyed-out options are unreachable
-            from this machine.
+            The KG embedding model is one global setting for every project
+            and the shared KG. Greyed-out options are unreachable from this
+            machine.
             <!-- v0.2.102 W6-B (F3/F5): the save is NOT local — the backend
                  also stamps the global embedding profile and re-projects
                  every project's env (a machine-wide sweep that can take a
@@ -3801,8 +3803,10 @@
           <span class="pr-onboarding-hint">
             Which model the launcher uses for KG / Codegraph embeddings.
             Changing this affects every project created or refreshed from
-            now on; existing collections keep their stored embeddings
-            until re-synced.
+            now on. Existing KG collections keep their stored embeddings and
+            stay searchable with the model they are complete in; the new
+            model's vectors are filled in alongside on the next whole-tree
+            sync, and searches move to it once complete (status below).
             <br /><br />
             Note: this is distinct from the per-new-project
             <strong>Default embedding models</strong> section above. That
@@ -3836,6 +3840,10 @@
       {#if activeEmbeddingError}
         <p class="pr-error">Couldn't save: {activeEmbeddingError}</p>
       {/if}
+      <!-- v0.2.102 W6-I: per project, each KG collection's recorded (searched)
+           model vs the selected one + fill progress, and the duplicate scan
+           with its "objects missing the vector" list. -->
+      <KgEmbedStatus />
     </section>
 
     <!-- v0.2.23 F2 wave 2b: Volume location. Relocated from the popover.

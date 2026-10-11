@@ -450,6 +450,29 @@ async def _get_all_kg_embeddings_tagged(
     return (await _get_all_kg_embeddings(text)), []
 
 
+async def complete_kg_write_vectors(
+    vectors: "dict[str, list[float]]", truncated: "list[str]", text: str, collection: str,
+) -> "dict[str, list[float]]":
+    """v0.2.102 W6-I — finish a KG write's vectors (``store_knowledge_node``):
+    through ``vco_lib.kg_embed_model.complete_write_vectors`` whenever a
+    service is in hand. The ACTIVE (target) slot is REQUIRED — a row holding
+    only another model's vector is never stored (``KgWriteVectorMissing``
+    propagates, loud; W6-H's "fallback-only write") — and while ``collection``
+    fills toward a newly selected model the RECORDED model's vector rides
+    along, so the rewritten node stays in the slot searches read.
+    ``truncated`` (the call's truncation record) gains the carry slot when
+    its vector came from a bounded window. No service → returned as-is (the
+    inline transport fallback names no target)."""
+    from vco_lib.kg_embed_model import complete_write_vectors
+
+    from . import server
+    svc = server._get_embedding_service()
+    if svc is None:
+        return vectors
+    return await asyncio.to_thread(
+        complete_write_vectors, svc, dict(vectors or {}), text, collection, truncated)
+
+
 async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
     """Get all KG embedding variants — every reachable text backend.
 
@@ -494,30 +517,43 @@ async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
     # ALWAYS populated every reachable slot, so a project that deliberately
     # left dual-write OFF still got the secondary slots written whenever the
     # service happened to be down — an inconsistency with the primary path.
-    # The active slot (qwen3_embed here) is ALWAYS written; only the secondary
-    # fan-out is gated.
+    # The active slot is ALWAYS written; only the secondary fan-out is gated.
+    #
+    # W6-J (review F2): the active vector is labelled with the slot of the
+    # model that PRODUCED it. `get_ollama_embedding` embeds
+    # `server.EMBEDDING_MODEL` — qwen3 only on a qwen3 profile — so the
+    # hardcoded "qwen3_embed" label this leg used to write stored another
+    # model's vector under the qwen3 slot on a non-qwen3 profile. A failure
+    # of that call raises (it answers a vector or nothing), so a row whose
+    # active slot never came back is never stored here either. The label
+    # comes from the ONE text slot map (`kg_embed_model.text_model_slot`,
+    # the same resolver the record/fill machinery uses), and a secondary
+    # vector never overwrites the active slot (a profile whose model maps to
+    # the legacy `ollama_embed` slot — mxbai, nomic — would otherwise have
+    # its own vector replaced by the legacy arctic one).
     from vco_lib.embedding_service import _resolve_write_all_slots
+    from vco_lib.kg_embed_model import text_model_slot
     _write_all = _resolve_write_all_slots()
 
     if _write_all:
-        qwen3_vec, legacy_vec, openai_vec = await asyncio.gather(
-            server.get_ollama_embedding(text),         # qwen3-embedding (new primary)
+        active_vec, legacy_vec, openai_vec = await asyncio.gather(
+            server.get_ollama_embedding(text),         # the ACTIVE text model
             server.get_legacy_text_embedding(text),     # snowflake-arctic-embed2 (legacy)
             server.get_openai_embedding(text),
         )
     else:
         # Toggle OFF: only the active slot. Mirrors the primary path's
         # single-entry return.
-        qwen3_vec = await server.get_ollama_embedding(text)
+        active_vec = await server.get_ollama_embedding(text)
         legacy_vec = None
         openai_vec = None
     vectors: dict[str, list[float]] = {}
-    if qwen3_vec:
-        vectors["qwen3_embed"] = qwen3_vec
+    if active_vec:
+        vectors[text_model_slot(server.EMBEDDING_MODEL)[0]] = active_vec
     if legacy_vec:
-        vectors["ollama_embed"] = legacy_vec
+        vectors.setdefault("ollama_embed", legacy_vec)
     if openai_vec:
-        vectors["openai_embed"] = openai_vec
+        vectors.setdefault("openai_embed", openai_vec)
     return vectors
 
 
@@ -623,6 +659,39 @@ async def _get_search_vector(
     )
     assert svc is not None  # embed_query_or_raise raised for a missing service
     return vec, (svc.code_vector_slot if scheme == "code" else svc.text_vector_slot)
+
+
+async def _kg_search_vector(
+    text: str, collection: str, task: str | None = None, *, steady=None,
+) -> tuple[list[float] | None, str]:
+    """The query vector + slot for searching ONE KG collection (v0.2.102 W6-I).
+
+    The collection is searched with the model it is RECORDED as complete in
+    (``vco_lib.kg_embed_model``). In the steady state that is the service's
+    own model and this is exactly ``steady`` — the CALLER's own
+    :func:`_get_search_vector` binding (so a seam patched on the caller's
+    module is honoured; default: ``server``'s). While a newly selected model's slot
+    fills, the query is embedded with the recorded model instead — through
+    the same loud query-embed entry, never another model."""
+    from vco_lib.kg_embed_model import recorded_query_model, sibling_text_service
+
+    from . import server
+    model = await asyncio.to_thread(recorded_query_model, collection) if collection else ""
+    if model:
+        from vco_lib.embed_outage import embed_query_or_raise
+
+        svc = server._get_embedding_service()
+        qs = sibling_text_service(svc, model) if svc is not None else None
+        vec = await asyncio.to_thread(
+            embed_query_or_raise, "kg", qs, text, task,
+            construction_error=getattr(server, "_embed_service_construction_error", ""),
+        )
+        assert qs is not None  # embed_query_or_raise raised for a missing service
+        return vec, qs.text_vector_slot
+    fn = steady or server._get_search_vector
+    if task is None:
+        return await fn(text)
+    return await fn(text, task=task)
 
 
 async def count_tokens_async(text: str) -> int:

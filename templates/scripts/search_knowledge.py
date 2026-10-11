@@ -625,6 +625,50 @@ def get_embedding(text: str) -> list:
     return embed_query_or_raise("kg", svc, text)
 
 
+class _CollectionQueries:
+    """Per-collection query vectors for one search (v0.2.102 W6-I).
+
+    Each KG collection is searched with the model it is RECORDED as complete
+    in (``vco_lib.kg_embed_model``). In the steady state that is the
+    service's own model, and the vector is :func:`get_embedding`'s (embedded
+    once, lazily) with :func:`_get_target_vector_slot`'s slot — exactly the
+    pre-W6-I path. A collection still recorded in another model (a selected
+    model whose slot is not complete yet) gets ITS model's query vector, one
+    embed per distinct model, through the same loud query-embed entry."""
+
+    def __init__(self, query: str) -> None:
+        self.query = query
+        self._memo: dict = {}
+
+    @staticmethod
+    def _recorded(coll_name: str) -> str:
+        from vco_lib.kg_embed_model import recorded_query_model
+
+        return recorded_query_model(coll_name)
+
+    def vector(self, coll_name: str):
+        """``(vector, slot)``; slot ``""`` = the service's own (resolved by
+        the caller only where it targets a slot)."""
+        model = self._recorded(coll_name)
+        if not model:
+            if "" not in self._memo:
+                self._memo[""] = get_embedding(self.query)
+            return self._memo[""], ""
+        svc = _get_or_create_embedding_service()
+        if svc is None:
+            raise _kg_search_unavailable(_embedding_construction_error)
+        from vco_lib.embed_outage import embed_query_or_raise
+        from vco_lib.kg_embed_model import sibling_text_service
+
+        qs = sibling_text_service(svc, model)
+        if model not in self._memo:
+            self._memo[model] = embed_query_or_raise("kg", qs, self.query)
+        return self._memo[model], qs.text_vector_slot
+
+    def model(self, coll_name: str) -> str:
+        return self._recorded(coll_name) or _ACTIVE_EMBEDDING_MODEL
+
+
 def _chars_per_token() -> int:
     """The chars-per-token heuristic, read from its ONE home.
 
@@ -763,8 +807,11 @@ def search_knowledge(
     client = get_weaviate_client()
 
     try:
-        # Get embedding for query
-        query_vector = get_embedding(query)
+        # Get embedding for query — per collection (W6-I). The project KG's
+        # (vector, slot, model) is the triple the RL log records.
+        _queries = _CollectionQueries(query)
+        query_vector, _query_slot = _queries.vector(KG_COLLECTION)
+        _query_model = _queries.model(KG_COLLECTION)
 
         # Build filters
         filters = []
@@ -811,22 +858,26 @@ def search_knowledge(
         # Query all collections and merge results
         all_results = []
         for coll_name in collections_to_query:
+            # Outside the per-collection try: a query that cannot be embedded
+            # with this collection's model is LOUD, never "collection missing".
+            _coll_vector, _coll_slot = _queries.vector(coll_name)
             try:
                 collection = client.collections.get(coll_name)
 
                 nv_kwargs = dict(
-                    near_vector=query_vector,
+                    near_vector=_coll_vector,
                     limit=fetch_limit,
                     return_metadata=['distance'],
                 )
                 if weaviate_filter:
                     nv_kwargs["filters"] = weaviate_filter
-                # v0.2.18: target the slot matching the ACTIVE text model
+                # v0.2.18: target the slot matching the text model
                 # (qwen3_embed / openai_text_embed / arctic2_embed / ...).
                 # Pre-v0.2.18 hardcoded "ollama_embed" which only worked for
-                # the legacy snowflake-arctic-embed2 install.
+                # the legacy snowflake-arctic-embed2 install. v0.2.102 W6-I:
+                # the slot THIS collection is recorded as complete in.
                 if DUAL_EMBEDDING_ENABLED:
-                    nv_kwargs["target_vector"] = _get_target_vector_slot()
+                    nv_kwargs["target_vector"] = _coll_slot or _get_target_vector_slot()
                 response = collection.query.near_vector(**nv_kwargs)
             except Exception:
                 # Collection might not exist, skip silently
@@ -906,8 +957,8 @@ def search_knowledge(
                                 _candidates,
                                 query=query,
                                 query_vector=list(query_vector),
-                                active_slot=_get_target_vector_slot(),
-                                model_name=_ACTIVE_EMBEDDING_MODEL,
+                                active_slot=_query_slot or _get_target_vector_slot(),
+                                model_name=_query_model,
                                 embed_budget_s=_CLI_DUAL_EMBED_BUDGET_S,
                                 backfill_other=False,
                                 task_type="kg_search_cli",
@@ -925,8 +976,8 @@ def search_knowledge(
                         limit=limit,
                         query_emb=list(query_vector) if query_vector else None,
                         embedding_source=_ACTIVE_EMBEDDING_SOURCE,
-                        embedding_dim=_embedding_dim_for(_ACTIVE_EMBEDDING_MODEL),
-                        embedding_model=_ACTIVE_EMBEDDING_MODEL,
+                        embedding_dim=_embedding_dim_for(_query_model),
+                        embedding_model=_query_model,
                         task_id=f"kg_cli_{_uuid.uuid4().hex[:8]}",
                         task_type="kg_search_cli",
                         **_dual_fields,

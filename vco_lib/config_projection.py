@@ -223,9 +223,6 @@ from vco_lib.atomic import atomic_rewrite_text
 # itself is transport-agnostic and is used HERE for a pure sqlite read.
 from vco_lib.weaviate_helpers import ProbeResult
 from vco_lib.launcher_db_reader import (
-    ACTIVE_EMBEDDING_SETTING_KEY,
-    ACTIVE_EMBEDDING_SOURCE_SETTING_KEY,
-    ACTIVE_EMBEDDING_SOURCE_USER,
     APP_STATE_KEY_ACTIVE_EMBEDDING,
     APP_STATE_KEY_DEFAULT_TEXT_EMBED,
     ORCHESTRATOR_CORE_MODULE_ID,
@@ -785,35 +782,6 @@ def _fetch_module_setting_str(
     return str(v) if isinstance(v, str) else default
 
 
-def _fetch_module_setting_str_opt(
-    conn: sqlite3.Connection,
-    project_id: str,
-    module_id: str,
-    setting_key: str,
-) -> Optional[str]:
-    """Like :func:`_fetch_module_setting_str` but distinguishes absence.
-
-    Returns ``None`` when the row is missing (or stores a non-string /
-    unparseable JSON value), and the decoded string otherwise. Callers
-    that must tell "row absent" apart from "row present == some default"
-    use this rather than the ``default``-collapsing variant above.
-    """
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT setting_value FROM module_settings "
-        "WHERE project_id = ? AND module_id = ? AND setting_key = ?",
-        (project_id, module_id, setting_key),
-    )
-    row = cur.fetchone()
-    if row is None:
-        return None
-    try:
-        v = json.loads(row["setting_value"])
-    except (json.JSONDecodeError, TypeError):
-        return None
-    return v if isinstance(v, str) else None
-
-
 # ─── v0.2.72 T-FLOOR (P1): code-graph two-stage floor app_state keys ─────────
 #
 # Machine-global code-graph floor values, written by T-GUI-DB (the launcher's
@@ -984,39 +952,28 @@ def _global_active_embedding(conn: sqlite3.Connection) -> Optional[str]:
     )
 
 
-def _resolve_active_embedding_cascade(
-    conn: sqlite3.Connection,
-    project_id: str,
-) -> str:
-    """Resolve ACTIVE_EMBEDDING for a project — the ONE shared cascade.
+def _resolve_active_embedding_cascade(conn: sqlite3.Connection) -> str:
+    """Resolve ACTIVE_EMBEDDING — ONE global profile for every project.
 
-    LOCKED order (must match ``project_env_settings.rs::
-    resolve_active_embedding_cascade`` + the hub ``config_api.rs``
-    resolver byte-for-byte — cross-surface lockstep prevents the
-    Defect-D class of GUI-write-vs-hub-read disagreement):
+    v0.2.102 W6-J (owner ruling 2026-10-11: "I'd just remove the per-project
+    selection and go with one single global setting"): the machine-global
+    profile (:func:`_global_active_embedding` — Preferences'
+    ``app_state[embedding.active_profile]``, then the hardware-pick derive)
+    is the only selector, else ``"qwen3"``. Must match
+    ``project_env_settings.rs::resolve_active_embedding_cascade`` and the hub
+    ``config_api.rs::resolve_active_embedding_for_hub``.
 
-      1. per-project ``module_settings/orchestrator-core/active_embedding``
-         WHERE ``active_embedding_source == "user"`` → returned verbatim
-         (sticky deliberate pick).
-      2. machine-global default (:func:`_global_active_embedding`).
-      3. ``"qwen3"`` final fallback.
-
-    An ``"auto"`` marker, a legacy NO-marker per-project row, or an absent
-    per-project row all fall to leg 2 (inherit the global default). Every
-    read is soft-fail.
+    RETIRED, never deleted: the per-project
+    ``module_settings/orchestrator-core/active_embedding`` row and its
+    ``active_embedding_source`` marker (the removed Settings-tab picker's
+    writes, v0.2.71-v0.2.101) stay in launcher.db untouched, and NOTHING
+    reads them — the same convention as the retired
+    ``project_kg_bindings.embedding_model`` column (migration 017's
+    ``projects.rl_port``: the data stays, the consumers move off it). A
+    project whose stored pick differed converges on the next projection;
+    its KG collections keep searching their RECORDED model while the global
+    model is filled in additively (``vco_lib.kg_embed_model``).
     """
-    source = _fetch_module_setting_str_opt(
-        conn, project_id, ORCHESTRATOR_CORE_MODULE_ID,
-        ACTIVE_EMBEDDING_SOURCE_SETTING_KEY,
-    )
-    if source == ACTIVE_EMBEDDING_SOURCE_USER:
-        value = _fetch_module_setting_str_opt(
-            conn, project_id, ORCHESTRATOR_CORE_MODULE_ID,
-            ACTIVE_EMBEDDING_SETTING_KEY,
-        )
-        if value:
-            return value
-        # source=user but the value row is missing/empty — fall through.
     return _global_active_embedding(conn) or "qwen3"
 
 
@@ -2007,29 +1964,11 @@ def project_env_from_db(
         if active_embedding_override is not None:
             active_embedding = active_embedding_override
         else:
-            # v0.2.71 T-B-emb: the LOAD-BEARING ACTIVE_EMBEDDING writer.
-            # The value here is what lands in .claude/{settings.json,env}
-            # (the Rust populate() value does NOT reach those canonical
-            # surfaces). Resolve via the ONE cascade — must match
-            # project_env_settings.rs::resolve_active_embedding_cascade +
-            # the hub config_api.rs resolver EXACTLY (cross-surface lockstep,
-            # the Defect-D class):
-            #
-            #   1. per-project module_settings/orchestrator-core/active_embedding
-            #      WHERE active_embedding_source == "user" → verbatim (sticky).
-            #   2. machine-global app_state[embedding.active_profile], then the
-            #      hardware-pick derive (app_state[default_text_embedding] →
-            #      profile). This is the BRIDGE: a non-user project yields to
-            #      the global value the launcher/install.py also computed.
-            #   3. "qwen3" final fallback.
-            #
-            # An "auto" marker OR a legacy NO-marker per-project row both fall
-            # to leg 2 (inherit global) — the LOCKED v0.2.71 decision that
-            # supersedes the brittle pre-v0.2.71 "stored == qwen3" heuristic
-            # and fixes the auto-seeded qwen3 case (a backfill-stamped qwen3
-            # with no provenance). GUARD on the derive: an unmapped/absent hardware
-            # pick → stay qwen3 (never stamp a guessed profile → wrong slot).
-            active_embedding = _resolve_active_embedding_cascade(conn, project_id)
+            # The LOAD-BEARING ACTIVE_EMBEDDING writer: the value here is what
+            # lands in .claude/{settings.json,env}. v0.2.102 W6-J: ONE global
+            # profile for every project (the per-project pick is retired —
+            # see `_resolve_active_embedding_cascade`).
+            active_embedding = _resolve_active_embedding_cascade(conn)
 
         # v0.2.72 T-FLOOR (P1): machine-global code-graph two-stage floor
         # overrides. T-GUI-DB writes app_state[codegraph.retrieval_floor] /

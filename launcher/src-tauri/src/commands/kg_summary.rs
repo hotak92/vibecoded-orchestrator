@@ -205,7 +205,7 @@ pub async fn retry_kg_summary(
 
 /// Deadline for the recheck subprocess. The recheck spawns one generator
 /// child per pending row (each an LLM call), so the honest budget is the
-/// enrichment precedent (`embedding_enrichment::ENRICHMENT_TIMEOUT_SECS`
+/// enrichment precedent (the retired `embedding_enrichment::ENRICHMENT_TIMEOUT_SECS`
 /// = 30 min), not the 30 s gateway-CLI one. A kill at the deadline is
 /// safe: the operation is idempotent and soft-fail per row — anything not
 /// regenerated stays pending for the next recheck.

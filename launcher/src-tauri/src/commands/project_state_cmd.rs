@@ -834,7 +834,9 @@ pub struct SetKgBindingReq {
     #[serde(default = "default_kg_role")]
     pub role: String,
     pub collection_name: String,
-    pub embedding_model: Option<String>,
+    // v0.2.102 W6-J: no `embedding_model` — the per-project KG model pick was
+    // retired (one global embedding setting). The DB column survives with its
+    // historical values; nothing reads or writes it now.
     pub embedding_dim: Option<i64>,
     pub kg_dir_path: Option<String>,
     pub weaviate_url: Option<String>,
@@ -852,25 +854,6 @@ pub async fn set_project_kg_binding(
     app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<ProjectKgBinding, String> {
-    // v0.2.18 Commit 8: when an embedding_model is supplied, verify it
-    // against the live catalog so a typo doesn't silently break the
-    // seed pipeline. Empty/None passes through unchanged (caller is
-    // explicitly clearing or leaving the existing binding alone).
-    if let Some(model_id) = req.embedding_model.as_deref().filter(|s| !s.trim().is_empty()) {
-        let result = crate::commands::embedding_catalog::validate_model_against_catalog(
-            model_id.trim().to_string(),
-            crate::commands::embedding_catalog::ModelKind::Text,
-            db.clone(),
-        )
-        .await?;
-        if let crate::commands::embedding_catalog::ValidationResult::Invalid { reason } = result {
-            return Err(format!(
-                "embedding_model '{}' not valid for KG binding: {}",
-                model_id, reason
-            ));
-        }
-    }
-
     // F3 (v0.2.72): the row write's post-projection can now be
     // machine-global (F2: orchestrator-root rebind → refresh ALL projects,
     // N serial Python subprocesses) — run the sync core on the blocking
@@ -1062,7 +1045,6 @@ pub fn set_project_kg_binding_row_with_db(
         &project_slug,
         &req.role,
         &req.collection_name,
-        req.embedding_model.as_deref(),
         req.embedding_dim,
         req.kg_dir_path.as_deref(),
         req.weaviate_url.as_deref(),
@@ -1597,7 +1579,6 @@ mod tests {
         let req = SetKgBindingReq {
             role: "primary".to_string(),
             collection_name: "F5Bind_KnowledgeGraph".to_string(),
-            embedding_model: None,
             embedding_dim: None,
             kg_dir_path: None,
             weaviate_url: None,
@@ -1626,7 +1607,6 @@ mod tests {
         let req = SetKgBindingReq {
             role: "primary".to_string(),
             collection_name: "F5Unbind_KnowledgeGraph".to_string(),
-            embedding_model: None,
             embedding_dim: None,
             kg_dir_path: None,
             weaviate_url: None,
@@ -1660,11 +1640,10 @@ mod tests {
     // ─── v0.2.92 D18 follow-up: a GUI class-pick records the human ────
     // ─── choice (manual_override) on the binding row ──────────────────
 
-    fn kg_req(collection: &str, model: Option<&str>, config: JsonValue) -> SetKgBindingReq {
+    fn kg_req(collection: &str, config: JsonValue) -> SetKgBindingReq {
         SetKgBindingReq {
             role: "primary".to_string(),
             collection_name: collection.to_string(),
-            embedding_model: model.map(str::to_string),
             embedding_dim: None,
             kg_dir_path: None,
             weaviate_url: None,
@@ -1698,7 +1677,6 @@ mod tests {
             "p-d18-pick",
             "primary",
             "D18Pick_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             None,
             None,
             None,
@@ -1711,7 +1689,7 @@ mod tests {
         set_project_kg_binding_row_with_db(
             &db,
             "p-d18-pick",
-            &kg_req("Picked_KnowledgeGraph", None, serde_json::json!({})),
+            &kg_req("Picked_KnowledgeGraph", serde_json::json!({})),
         )
         .expect("binding write must succeed");
 
@@ -1724,18 +1702,18 @@ mod tests {
         );
     }
 
-    /// (b) A model-only edit (collection UNCHANGED) expresses no class
-    /// preference — the row must stay machine-repairable, so no sentinel
-    /// may be stamped by it.
+    /// (b) A same-collection edit (collection UNCHANGED) expresses no
+    /// class preference — the row must stay machine-repairable, so no
+    /// sentinel may be stamped by it. (Until W6-J this was the picker's
+    /// "model-only edit"; the model field no longer exists on the request.)
     #[test]
-    fn set_project_kg_binding_model_only_edit_is_not_stamped() {
+    fn set_project_kg_binding_same_collection_edit_is_not_stamped() {
         let db = make_db();
         seed_project(&db, "p-d18-model", "D18Model");
         db.set_project_kg_binding(
             "p-d18-model",
             "primary",
             "D18Model_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             None,
             None,
             None,
@@ -1746,37 +1724,32 @@ mod tests {
         set_project_kg_binding_row_with_db(
             &db,
             "p-d18-model",
-            &kg_req(
-                "D18Model_KnowledgeGraph",
-                Some("snowflake-arctic-embed2"),
-                serde_json::json!({}),
-            ),
+            &kg_req("D18Model_KnowledgeGraph", serde_json::json!({})),
         )
         .expect("binding write must succeed");
 
         let cfg = stored_kg_config(&db, "p-d18-model");
         assert!(
             cfg.get("manual_override").is_none(),
-            "a model-only edit is not a class pick — stamping it would \
+            "a same-collection edit is not a class pick — stamping it would \
              freeze the row against legitimate automated repair; got {}",
             cfg,
         );
     }
 
-    /// (c) A pre-existing sentinel survives a model-only edit. The GUI
-    /// always sends `config: {}`, so a write that replaced config_json
-    /// wholesale would silently strip the human pick on an embedding-model
-    /// tweak and hand the row back to the automated heal — the exact
+    /// (c) A pre-existing sentinel survives a same-collection edit. The
+    /// GUI always sends `config: {}`, so a write that replaced config_json
+    /// wholesale would silently strip the human pick on a no-class-change
+    /// save and hand the row back to the automated heal — the exact
     /// regression this pins.
     #[test]
-    fn set_project_kg_binding_manual_override_survives_model_only_edit() {
+    fn set_project_kg_binding_manual_override_survives_same_collection_edit() {
         let db = make_db();
         seed_project(&db, "p-d18-keep", "D18Keep");
         db.set_project_kg_binding(
             "p-d18-keep",
             "primary",
             "D18Keep_KnowledgeGraph",
-            None,
             None,
             None,
             None,
@@ -1787,11 +1760,7 @@ mod tests {
         set_project_kg_binding_row_with_db(
             &db,
             "p-d18-keep",
-            &kg_req(
-                "D18Keep_KnowledgeGraph",
-                Some("qwen3-embedding:0.6b"),
-                serde_json::json!({}),
-            ),
+            &kg_req("D18Keep_KnowledgeGraph", serde_json::json!({})),
         )
         .expect("binding write must succeed");
 
@@ -1799,7 +1768,7 @@ mod tests {
         assert_eq!(
             cfg.get("manual_override"),
             Some(&JsonValue::Bool(true)),
-            "the human pick must survive a model-only edit; got {}",
+            "the human pick must survive a same-collection edit; got {}",
             cfg,
         );
     }
@@ -1818,7 +1787,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &serde_json::json!({"evidence_repoint": {"from": "Old_KnowledgeGraph"}}),
         )
         .unwrap();
@@ -1828,7 +1796,6 @@ mod tests {
             "p-d18-merge",
             &kg_req(
                 "Picked_KnowledgeGraph",
-                None,
                 serde_json::json!({"user_note": "keep me"}),
             ),
         )
@@ -2044,7 +2011,6 @@ mod tests {
         let req = SetKgBindingReq {
             role: "primary".to_string(),
             collection_name: "Root_KnowledgeGraph".to_string(),
-            embedding_model: None,
             embedding_dim: None,
             kg_dir_path: None,
             weaviate_url: None,

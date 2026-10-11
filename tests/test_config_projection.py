@@ -548,10 +548,15 @@ def test_active_embedding_legacy_no_marker_row_inherits_global(
     assert env["ACTIVE_EMBEDDING"] == "arctic"
 
 
-def test_active_embedding_source_user_is_sticky(tmp_path: Path) -> None:
-    """v0.2.71 T-B-emb: a deliberate per-project pick (value + source=user)
-    is STICKY — returned verbatim even when the machine-global default differs
-    (here global=arctic, user pick=openai)."""
+def test_retired_per_project_pick_yields_to_the_global_profile(tmp_path: Path) -> None:
+    """v0.2.102 W6-J (owner ruling 2026-10-11: ONE global embedding setting):
+    a per-project pick the removed Settings-tab picker wrote (value +
+    source=user) no longer overrides the global profile — the projection
+    writes the machine default (here global=arctic, stored pick=openai).
+    The retired rows stay in launcher.db untouched. Red against the v0.2.71
+    cascade, which returned the sticky pick verbatim."""
+    import sqlite3
+
     db = tmp_path / "launcher.db"
     proj = tmp_path / "p"
     proj.mkdir()
@@ -565,7 +570,16 @@ def test_active_embedding_source_user_is_sticky(tmp_path: Path) -> None:
         app_state={"embedding.active_profile": "arctic"},
     )
     env = project_env_from_db("a3", db_path=db)["canonical_env"]
-    assert env["ACTIVE_EMBEDDING"] == "openai"
+    assert env["ACTIVE_EMBEDDING"] == "arctic"
+    conn = sqlite3.connect(db)
+    try:
+        kept = conn.execute(
+            "SELECT setting_value FROM module_settings WHERE project_id='a3' "
+            "AND module_id='orchestrator-core' AND setting_key='active_embedding'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert kept == ('"openai"',), "the retired row is kept (never drop user data)"
 
 
 def test_active_embedding_source_auto_inherits_global(tmp_path: Path) -> None:
@@ -637,31 +651,31 @@ def test_active_embedding_bridges_global_app_state(tmp_path: Path) -> None:
     assert env["ACTIVE_EMBEDDING"] == "openai"
 
 
-def test_active_embedding_source_user_survives_update(tmp_path: Path) -> None:
-    """v0.2.71 T-B-emb SURVIVES-UPDATE (projection-truth): a source=user pick
-    re-projects to the SAME ACTIVE_EMBEDDING value across a simulated update
-    (the projection re-derives to the same value, never goes stale), and a
-    second projection run yields an identical env."""
+def test_projects_with_diverged_stored_picks_project_one_profile(tmp_path: Path) -> None:
+    """F6 (W6-I review) made moot: two projects whose RETIRED stored picks
+    differ (arctic / openai, both source=user) project the SAME
+    ACTIVE_EMBEDDING — the global profile — so every project hands the shared
+    KG the same target and its record cannot ping-pong between projects."""
     db = tmp_path / "launcher.db"
-    proj = tmp_path / "p"
-    proj.mkdir()
-    # Global default is qwen3 (an auto-seed would write qwen3); the user
-    # deliberately picked arctic (source=user).
+    p1 = tmp_path / "p1"
+    p2 = tmp_path / "p2"
+    p1.mkdir()
+    p2.mkdir()
     _make_launcher_db(
-        db, project_id="a7", project_name="Example Survivor",
-        project_folder=str(proj),
+        db, project_id="a7", project_name="Example One",
+        project_folder=str(p1), project_slug="example-one",
+        extra_projects=[("a8", "Example Two", str(p2), "example-two")],
         module_settings=[
             ("a7", "orchestrator-core", "active_embedding", '"arctic"'),
             ("a7", "orchestrator-core", "active_embedding_source", '"user"'),
+            ("a8", "orchestrator-core", "active_embedding", '"openai"'),
+            ("a8", "orchestrator-core", "active_embedding_source", '"user"'),
         ],
         app_state={"embedding.active_profile": "qwen3"},
     )
-    before = project_env_from_db("a7", db_path=db)["canonical_env"]["ACTIVE_EMBEDDING"]
-    assert before == "arctic"
-    # Simulate an update: the DB rows are untouched by any update path; the
-    # projection re-runs and must re-derive the SAME value (not stale).
-    after = project_env_from_db("a7", db_path=db)["canonical_env"]["ACTIVE_EMBEDDING"]
-    assert after == before == "arctic"
+    one = project_env_from_db("a7", db_path=db)["canonical_env"]["ACTIVE_EMBEDDING"]
+    two = project_env_from_db("a8", db_path=db)["canonical_env"]["ACTIVE_EMBEDDING"]
+    assert one == two == "qwen3"
 
 
 def test_from_db_diagrams_suffix_swap_from_canonical_kg(tmp_path: Path) -> None:

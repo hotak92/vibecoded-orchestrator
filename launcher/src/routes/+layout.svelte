@@ -97,6 +97,10 @@
   // contains a language whose parser is missing, ask (modal) before installing.
   import CodegraphParsersModal from '$lib/components/CodegraphParsersModal.svelte';
   import { codegraphParsers } from '$lib/stores/codegraph-parsers';
+  // v0.2.102 W6-J: the KG duplicate re-scan alert (the bell; see
+  // kg-rescan-alerts.ts for the candidacy rule).
+  import { syncKgRescanAlert } from '$lib/kg-rescan-alerts';
+  import { notifications } from '$lib/stores/notifications';
   import { invoke, listen } from '$lib/tauri';
   // M-P1-5: per-install-root scoping for localStorage flags. See
   // `install-state-store.ts` for the migration rationale (two clones
@@ -230,6 +234,14 @@
     // Cancelled on teardown (review R1 F15) so a remount never stacks checks.
     const cancelFreshnessCheck = scheduleStartupCheck(() => gatewayFreshness.check());
 
+    // v0.2.102 W6-J: after boot settles, list the projects whose KG may need
+    // a duplicate re-scan into the notification bell (read-only; a failed
+    // status read changes nothing). Same cancel-on-teardown discipline as
+    // the freshness check above.
+    const cancelKgRescanCheck = scheduleStartupCheck(() =>
+      syncKgRescanAlert({ invoke, store: notifications }),
+    );
+
     // Check onboarding / changelog gates once per app load.
     //
     // Bug 14 fix (2026-05-05): the `onboarding_complete` flag now lives in
@@ -361,6 +373,7 @@
       stopStatusPolling();
       stopShellListeners?.();
       cancelFreshnessCheck();
+      cancelKgRescanCheck();
     };
   });
 

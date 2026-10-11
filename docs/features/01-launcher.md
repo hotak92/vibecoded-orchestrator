@@ -138,7 +138,7 @@ Global settings: profile, about. Backed by `db::settings` table (key/value JSON 
 `module_settings` table stores per-(project, module) non-secret settings as JSON-encoded values. Unique constraint on `(project_id, module_id, setting_key)`.
 
 ### Per-project KG Binding
-`project_kg_bindings` table maps a project to its primary Weaviate collection name, embedding model, embedding dim, `knowledge/` dir path, and optional Weaviate URL override. Role can be `primary`, `shared`, or `archive`.
+`project_kg_bindings` table maps a project to its primary Weaviate collection name, embedding dim, `knowledge/` dir path, and optional Weaviate URL override. Role can be `primary`, `shared`, or `archive`. (The `embedding_model` column survives in the schema with its historical values but is retired — v0.2.102 removed the per-binding KG model pick; the KG embeds with the one global embedding profile (Preferences → Embedding profile), for every project and the shared KG.)
 
 ### Per-project Code Graph Binding
 `project_codegraph_bindings` tracks collection prefix, embedding model, last analyzed git SHA, and an `enabled` toggle. Used by the `/codegraph` UI to show analysis currency.
@@ -781,7 +781,7 @@ Twenty-one Tauri commands mutate or read the per-project Claude Code registry. E
 #### Permissions / secrets / bindings
 - `add_project_permission(project_id, kind, pattern)` / `delete_project_permission(perm_id)`.
 - `set_project_secret_ref(project_id, key_name, resolution)` / `delete_project_secret_ref(ref_id)`.
-- `set_project_kg_binding(project_id, collection, embedding_model, ...)`.
+- `set_project_kg_binding(project_id, collection, ...)`.
 - `set_project_codegraph_binding(project_id, collection_prefix, embedding_model, last_sha, enabled)`.
 
 ### change_log Polling for Concurrency Invalidation

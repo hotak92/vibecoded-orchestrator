@@ -725,28 +725,18 @@ APP_STATE_KEY_ACTIVE_EMBEDDING = "embedding.active_profile"
 #:     ::APP_STATE_DEFAULT_TEXT_EMBED (canonical string: "default_text_embedding")
 APP_STATE_KEY_DEFAULT_TEXT_EMBED = "default_text_embedding"
 
-# ─── v0.2.71 T-B-emb: per-project active-embedding marker ────────────────────
+# ─── module_settings module id shared with the Rust launcher ──────────────
 #
-# The per-project ACTIVE_EMBEDDING profile + its provenance live in
-# ``module_settings`` under module_id ``orchestrator-core``. Mirror constants:
-#   launcher/src-tauri/src/commands/project_env_settings.rs
-#     ::ORCHESTRATOR_CORE_MODULE_ID / ::ACTIVE_EMBEDDING_SETTING_KEY /
-#     ::ACTIVE_EMBEDDING_SOURCE_SETTING_KEY /
-#     ::ACTIVE_EMBEDDING_SOURCE_USER / ::ACTIVE_EMBEDDING_SOURCE_AUTO
-# The hub config_api.rs resolver + config_projection.py use the same cascade:
-# a source=="user" per-project row is sticky; "auto" / legacy-no-marker / absent
-# rows inherit the machine-global ``app_state[embedding.active_profile]``.
+# Mirror: launcher/src-tauri/vct-launcher-core/src/db/module_settings_keys.rs
+# ::ORCHESTRATOR_CORE_MODULE_ID. (v0.2.102 W6-J retired the per-project
+# ``active_embedding`` / ``active_embedding_source`` rows this module id also
+# carried: ONE global embedding profile, owner ruling 2026-10-11. The rows stay
+# in launcher.db untouched and nothing reads them — see
+# ``config_projection._resolve_active_embedding_cascade``.)
 
-#: module_settings module_id that owns the per-project active-embedding rows.
+#: module_settings module_id of the orchestrator's own per-project settings
+#: (the dual-embedding flags).
 ORCHESTRATOR_CORE_MODULE_ID = "orchestrator-core"
-#: setting_key for the per-project ACTIVE_EMBEDDING profile value.
-ACTIVE_EMBEDDING_SETTING_KEY = "active_embedding"
-#: setting_key for the provenance marker companion row.
-ACTIVE_EMBEDDING_SOURCE_SETTING_KEY = "active_embedding_source"
-#: marker value: deliberate Settings-tab user pick (sticky across updates).
-ACTIVE_EMBEDDING_SOURCE_USER = "user"
-#: marker value: startup-backfill auto-seed (inherits the global default).
-ACTIVE_EMBEDDING_SOURCE_AUTO = "auto"
 
 #: TEXT model id → ACTIVE_EMBEDDING named-vector slot ("profile").
 #:

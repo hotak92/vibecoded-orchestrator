@@ -2841,9 +2841,6 @@ pub fn run() {
             // version floor, which never trips in v0.2.60).
             commands::projects_v2::probe_stale_derived_collections,
             commands::projects_v2::apply_stale_derived_choice,
-            // v0.2.71: per-slot populated-entry counts (T-C-modal) — powers the
-            // model-switch modal's "keep previous model" smart default.
-            commands::embedding_slot_counts::project_embedding_slot_counts,
             commands::projects_v2::perform_hard_cut,
             commands::projects_v2::rename_project_v2,
             commands::projects_v2::rename_collections_v2,
@@ -3035,10 +3032,6 @@ pub fn run() {
             commands::rl_settings::get_rl_online_training_disabled,
             commands::rl_settings::get_rl_global_training_source_flag,
             commands::rl_settings::list_rl_global_training_source_projects,
-            // v0.2.71: per-project active-embedding profile picker (T-B-emb) —
-            // writes active_embedding_source=user (sticky per-project choice).
-            commands::project_env_settings::set_project_active_embedding,
-            commands::project_env_settings::get_project_active_embedding,
             // v0.2.71: per-project dual-embedding-write + dual-RL-log flags
             // (T-B-flags) — launcher.db-as-truth, projected to .claude/env.
             commands::rl_settings::set_dual_embedding_write_all_slots,
@@ -3498,15 +3491,8 @@ pub fn run() {
             commands::embedding_catalog::set_default_embedding_models,
             commands::embedding_catalog::get_default_embedding_models,
             commands::embedding_catalog::get_code_embed_model_status,
+            commands::embedding_catalog::get_kg_embed_model_status,
             commands::embedding_catalog::validate_model_against_catalog,
-            // Embedding enrichment migration (v0.2.18, Commit 9). Spawns
-            // `python -m vco_lib.embedding_enrichment enrich` with
-            // --stream-progress and re-emits per-batch progress as
-            // `vct-enrichment-progress` Tauri events for the
-            // KgCodegraphTab progress modal. Idempotent: re-running on
-            // an already-enriched collection produces 0 enriched + the
-            // full skipped count. Never deletes existing slot data.
-            commands::embedding_enrichment::enrich_collection_vectors,
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
             commands::kg::kg_set_node_access,

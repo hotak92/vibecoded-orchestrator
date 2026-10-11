@@ -983,8 +983,10 @@ fn populate_kg_bindings(
     // Weaviate URL. Where Weaviate is reached is machine-global — the
     // launcher.db `service_endpoints` row — and a literal snapshotted here
     // (it was `http://localhost:8081`) could only drift from it.
+    // v0.2.102 W6-J: and NO embedding model either — the per-project KG
+    // model pick was retired (one global embedding setting); the column
+    // stays in the schema, unwritten, with whatever it already holds.
     let weaviate_url: Option<&str> = None;
-    let embedding_model = "qwen3-embedding:0.6b";
     let embedding_dim: i64 = 1024;
 
     // X-1 / v0.2.76: route the derive-name-then-write through the single
@@ -1019,7 +1021,6 @@ fn populate_kg_bindings(
             db,
             project_id,
             project_name,
-            Some(embedding_model),
             Some(embedding_dim),
             weaviate_url,
             &JsonValue::Null,
@@ -1060,7 +1061,6 @@ fn populate_kg_bindings(
                     project_id,
                     "shared",
                     &shared_collection,
-                    Some(embedding_model),
                     Some(embedding_dim),
                     None,
                     weaviate_url,
@@ -1297,7 +1297,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &JsonValue::Null,
         )
         .unwrap();
@@ -1381,7 +1380,6 @@ mod tests {
             "p1",
             "shared",
             "UserPicked_KnowledgeGraph",
-            None,
             None,
             None,
             None,
@@ -2524,7 +2522,20 @@ mod tests {
         assert_eq!(bindings.len(), 2);
         let primary = bindings.iter().find(|b| b.role == "primary").unwrap();
         assert_eq!(primary.collection_name, "Acme_KnowledgeGraph");
-        assert_eq!(primary.embedding_model.as_deref(), Some("qwen3-embedding:0.6b"));
+        // W6-J: the retired `embedding_model` column is never written — a
+        // fresh populate leaves it NULL (the column stays in the schema;
+        // existing values are never dropped). Red against the pre-W6-J
+        // `Some("qwen3-embedding:0.6b")` seed.
+        let stored_model: Option<String> = db
+            .lock()
+            .query_row(
+                "SELECT embedding_model FROM project_kg_bindings \
+                 WHERE project_id = 'p1' AND role = 'primary'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_model, None);
         assert_eq!(primary.embedding_dim, Some(1024));
         // SE-4 red-proof (7): the binding records no Weaviate URL — the
         // machine row is where Weaviate is reached. Red against the

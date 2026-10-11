@@ -9953,8 +9953,8 @@ def install_project_bundle(
     # v0.2.100 AD-7 (L5-F04): every gated skip is visible (log + ledger row).
     from vco_lib.module_gated_delivery import record_gate_outcomes
     record_gate_outcomes(folder, _gate_outcomes, dry_run=dry_run, log=lambda m: _log("4.bundle.gated", "info", m))
-    from vco_lib.code_embed_model import reconcile_folder_code_embedding  # v0.2.102 W6-B2: code-model self-heal
-    reconcile_folder_code_embedding(folder, dry_run=dry_run)
+    from vco_lib.embed_slot_fill import reconcile_folder_embeddings  # v0.2.102 W6-B2/W6-I: code + KG model self-heal
+    reconcile_folder_embeddings(folder, dry_run=dry_run)
     result["actions"]["orphan-retired"] = orphan_retired
     result["actions"]["knowledge-retired"] = knowledge_retired
     # v0.2.83 B-F5: one honest auto-resolution record per retired orphan (file

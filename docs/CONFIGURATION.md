@@ -185,7 +185,7 @@ The `EmbeddingService` (in `vco_lib/embedding_service.py`) is the unified entry 
 
 | Var | Values | What it does |
 |---|---|---|
-| `ACTIVE_EMBEDDING` | `qwen3` (default) | `openai` | Selects the active text-embedding slot for KG + development collections. `qwen3` → `qwen3_embed` named vector; `openai` → `openai_embed`. |
+| `ACTIVE_EMBEDDING` | `qwen3` (default) | `openai` | Selects the active text-embedding slot for KG + development collections. `qwen3` → `qwen3_embed` named vector; `openai` → `openai_embed`. Projected by the launcher from the ONE global embedding profile (Preferences → Embedding profile) into every project — not chosen per project (v0.2.102). |
 | `EMBEDDING_MODEL` | `qwen3-embedding:0.6b` (default) | model id | Explicit text model override. When `ACTIVE_EMBEDDING=openai` and this is unset, defaults to `text-embedding-3-small`. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` (default) | OpenAI model id | Used only when `ACTIVE_EMBEDDING=openai` and `EMBEDDING_MODEL` is unset. |
 | `OPENAI_API_KEY` | (unset) | API key | **VCO does not read this** (v0.2.98). The row stays because the name still matters elsewhere — env-scrubbing hooks strip it from spawned subprocesses, and third-party tooling uses it — but no VCO consumer takes its OpenAI key from it. The key VCO embeds with is resolved per process by `vco_lib.openai_key` from VCO's own shared slot `openai_api_key` (launcher keychain → `~/.vct-secrets/shared/`); a per-project binding under that name and the consuming project's own `.env` are not consulted either, so a project that exports its own key never has it spent on VCO. Required when `ACTIVE_EMBEDDING=openai`. `install.py --openai-key` stores it in the slot — never in `.env`. |

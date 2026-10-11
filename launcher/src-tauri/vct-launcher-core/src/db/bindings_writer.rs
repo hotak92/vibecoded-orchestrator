@@ -49,12 +49,10 @@ pub const KG_PRIMARY_SUFFIX: &str = "_KnowledgeGraph";
 /// against the Python SSOT (`vco_lib.codegraph_naming.sanitize_for_weaviate_class`)
 /// by `tests/fixtures/kg_sanitizer_parity.json`. Callers pass the raw name; the
 /// derived basename + `_KnowledgeGraph` suffix is written.
-#[allow(clippy::too_many_arguments)]
 pub fn write_kg_binding_primary_from_name(
     db: &Db,
     project_id: &str,
     project_name: &str,
-    embedding_model: Option<&str>,
     embedding_dim: Option<i64>,
     weaviate_url: Option<&str>,
     config: &JsonValue,
@@ -65,7 +63,6 @@ pub fn write_kg_binding_primary_from_name(
         project_id,
         "primary",
         &collection,
-        embedding_model,
         embedding_dim,
         None,
         weaviate_url,
@@ -83,7 +80,6 @@ pub fn write_kg_binding(
     project_id: &str,
     role: &str,
     collection_name: &str,
-    embedding_model: Option<&str>,
     embedding_dim: Option<i64>,
     kg_dir_path: Option<&str>,
     weaviate_url: Option<&str>,
@@ -93,7 +89,6 @@ pub fn write_kg_binding(
         project_id,
         role,
         collection_name,
-        embedding_model,
         embedding_dim,
         kg_dir_path,
         weaviate_url,
@@ -510,7 +505,6 @@ mod rename_tests {
             project,
             role,
             collection,
-            None,
             None,
             dir,
             None,

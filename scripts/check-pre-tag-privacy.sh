@@ -13,6 +13,9 @@
 #     - Desktop/PROGETTI/Claude/ author-machine layout
 #     - HANDOFF-*.md at repo root
 #     - /home/martino in shipping code outside intentional sentinels
+#     - tracked symlinks whose target is an absolute path or escapes
+#       the repo (v0.2.102 W6-J: a symlink's payload is blob content no
+#       line grep ever reads — see the section below)
 #
 #   Track D (other personal-project name leaks):
 #     - AI_hive, ARTup, SD15, Agape, FrameAboutYou,
@@ -86,6 +89,64 @@ handoff_hits=$(git ls-tree -r --name-only HEAD | grep -E '^HANDOFF-[^/]+\.md$' |
 if [ -n "$handoff_hits" ]; then
     echo "::error::pre-tag privacy gate: HANDOFF-*.md files tracked at repo root"
     echo "$handoff_hits" | sed 's/^/  - /'
+    FAIL=1
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# v0.2.102 W6-J (review NEW): tracked SYMLINKS must stay inside the repo
+# ─────────────────────────────────────────────────────────────────────
+# Gate 21's line greps are structurally blind to a symlink: a mode-120000
+# entry carries its target as blob content that no text grep of the tree
+# ever reads, so a committed `launcher/node_modules ->
+# /home/<user>/.../node_modules` (review R1) shipped a private absolute
+# path straight past every check_pattern above. Scan ls-tree for symlink
+# entries and refuse any whose target is an absolute path or lexically
+# escapes the repository root. In-repo relative targets (including
+# dangling ones) are allowed — a repo may legitimately link within
+# itself. Pinned by tests/test_v02102_gate21_tracked_symlinks.py, which
+# runs THIS script against scratch git repos.
+symlink_hits=""
+while IFS=$'\t' read -r meta path; do
+    [ -n "${meta:-}" ] || continue
+    mode=${meta%% *}
+    [ "$mode" = "120000" ] || continue
+    rest=${meta#* }
+    obj=${rest#* }
+    target=$(git cat-file blob "$obj" 2>/dev/null || printf '%s' '')
+    case "$target" in
+        /*)
+            symlink_hits="${symlink_hits}${path} -> ${target} (absolute path)"$'\n'
+            ;;
+        *)
+            # Lexically resolve dirname(path)/target; a ".." consumed at
+            # the repo root means the target escapes the repository.
+            combined="$(dirname "$path")/$target"
+            norm=""
+            escaped=0
+            oldIFS=$IFS
+            IFS='/'
+            for part in $combined; do
+                case "$part" in
+                    ""|".") ;;
+                    "..")
+                        case "$norm" in
+                            "") escaped=1 ;;
+                            *)  norm="${norm%/*}" ;;
+                        esac
+                        ;;
+                    *) norm="$norm/$part" ;;
+                esac
+            done
+            IFS=$oldIFS
+            if [ "$escaped" -ne 0 ]; then
+                symlink_hits="${symlink_hits}${path} -> ${target} (escapes repo)"$'\n'
+            fi
+            ;;
+    esac
+done < <(git ls-tree -r HEAD 2>/dev/null)
+if [ -n "$symlink_hits" ]; then
+    echo "::error::pre-tag privacy gate: tracked symlink(s) with absolute or repo-escaping targets"
+    printf '%s' "$symlink_hits" | sed 's/^/  - /'
     FAIL=1
 fi
 

@@ -3812,7 +3812,7 @@ fn apply_project_env_via_python(
 /// embedded environment.
 ///
 /// Naming: the `_local` suffix historically differentiated this from the
-/// same-name helpers in `embedding_catalog.rs` / `embedding_enrichment.rs` /
+/// same-name helpers in `embedding_catalog.rs` / the v0.2.102-retired `embedding_enrichment.rs` /
 /// `codegraph_reanalyze.rs`. v0.2.77 hoisted the canonical ladder into
 /// `vct_launcher_core::python_resolve` (the "one home" for the RT-4 ladder);
 /// this is now a thin delegating shim kept only to avoid churning the many
@@ -3863,9 +3863,9 @@ fn resolve_python_for_vco_lib_local() -> Option<PathBuf> {
 ///   (`drop_owned_collections`, `apply_stale_derived_choice`,
 ///   `perform_hard_cut`) do their deleting INSIDE that child, so an
 ///   interpreter that cannot import `vco_lib` deletes nothing at all.
-/// * `embedding_slot_counts` (via `resolve_python_for_vco_lib_or` directly) —
-///   KEPT, and documented at that call site: a read-only count whose every
-///   other unresolvable condition already returns `SlotCounts::empty`.
+/// * (`embedding_slot_counts`, a read-only count that also used
+///   `resolve_python_for_vco_lib_or`, was retired in v0.2.102 W6-J with the
+///   per-project embedding picker's model-switch modal.)
 ///
 /// Cross-language pin: the Python half of the same ladder is
 /// `vco_lib/python_exe.py` (see its module docstring).
@@ -7393,7 +7393,6 @@ mod tests {
             &pid,
             "primary",
             "Acme_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,

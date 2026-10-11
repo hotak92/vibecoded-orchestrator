@@ -80,7 +80,9 @@ export interface ProjectKgBinding {
   project_id: string;
   role: string; // primary | shared | archive
   collection_name: string;
-  embedding_model: string | null;
+  // v0.2.102 W6-J: no `embedding_model` — the per-project KG model pick was
+  // retired (one global embedding setting). The DB column survives; nothing
+  // reads or writes it.
   embedding_dim: number | null;
   kg_dir_path: string | null;
   weaviate_url: string | null;

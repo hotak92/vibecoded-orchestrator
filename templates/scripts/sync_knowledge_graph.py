@@ -317,6 +317,9 @@ from vco_lib.kg_truncation_tags import truncation_tag_properties  # noqa: E402 -
 # never populated — the divergence that left the duplicate scanner querying no
 # slot at all on multi-vector collections.
 from vco_lib.kg_vector_slot import active_text_vector_slot, collection_vector_slots  # noqa: E402 — must follow the AuthlibDeprecationWarning filter block above, like every import in this group
+# v0.2.102 W6-I: which model each KG collection is searched/written with
+# (recorded vs selected target, the additive fill) — one home.
+from vco_lib import kg_embed_model as _kg_embed_model  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, like every import in this group
 # v0.2.92 WP-B1 (D13): the canonical file_path shape helper. `to_posix_rel`
 # is pure + dependency-free (see its docstring); importing it loudly here
 # (never an inline copy) because every Weaviate write below must store ONE
@@ -1015,6 +1018,7 @@ def _embedding_failures_jsonl_hint() -> str:
 def _build_vector_arg(
     server: "WeaviateMCPServer",
     text: str,
+    collection_name: str = "",
 ) -> "Tuple[object, Mapping[str, List[float]], Optional[List[str]]]":
     """Embed *text* and shape it for `Weaviate.collection.data.insert(vector=)`.
 
@@ -1038,9 +1042,13 @@ def _build_vector_arg(
         Failure modes:
           - All backends fail → empty dict → raises RuntimeError so the
             caller's exception handler kicks in and counts a failure.
-          - Active backend fails but a fallback succeeds → dict only has
-            the fallback's slot. Search will still work with the
-            fallback's model. The caller logs which slots landed.
+          - Active backend fails but a secondary succeeds → RAISES
+            (v0.2.102 W6-I, ``kg_embed_model.complete_write_vectors``): a
+            row holding only another model's vector was invisible to every
+            search on the active slot (W6-H's "fallback-only write"). While
+            ``collection_name`` fills toward a newly selected model, the
+            RECORDED model's vector is added too (the carry), so a rewritten
+            node never leaves the slot searches still read.
       * ``DUAL_EMBEDDING_ENABLED=false`` (legacy) → single flat vector
         from the active backend. ``vector_arg`` is a ``list[float]``,
         ``slots_map`` is ``{slot_name: vec}`` so logging stays uniform.
@@ -1061,7 +1069,11 @@ def _build_vector_arg(
                 "No embedding backend produced a vector. "
                 f"See {_embedding_failures_jsonl_hint()} for details."
             )
-        return slots, slots, list(truncated)
+        truncated = list(truncated)
+        slots = _kg_embed_model.complete_write_vectors(
+            getattr(server, "embedding_service", None), dict(slots), text, collection_name, truncated,
+            active_slot=server.text_vector_slot)
+        return slots, slots, truncated
     # Legacy flat-vector path (DUAL_EMBEDDING_ENABLED=false).
     slots, truncated = server._get_all_kg_embeddings_tagged(text)
     active_slot = server.text_vector_slot
@@ -3442,7 +3454,8 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         )
 
         if _plan.is_single:
-            vec_arg, slots_written, truncated_slots = _build_vector_arg(server, content)
+            vec_arg, slots_written, truncated_slots = _build_vector_arg(
+                server, content, DEV_COLLECTION_NAME)
             data_obj = {
                 "title": doc_data["title"],
                 "content": doc_data["content"],
@@ -3477,7 +3490,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         last_slots: Mapping[str, List[float]] = {}
         for i, chunk in enumerate(chunks):
             vec_arg, last_slots, truncated_slots = _build_vector_arg(
-                server, chunk.content
+                server, chunk.content, DEV_COLLECTION_NAME
             )
             data_obj = {
                 "title": doc_data["title"],
@@ -4821,7 +4834,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 # DUAL_EMBEDDING_ENABLED=true (default) this fans out to every
                 # reachable text backend so multiple slots get populated.
                 vec_arg, slots_written, truncated_slots = _build_vector_arg(
-                    server, content
+                    server, content, target_collection_name
                 )
 
             # Prepare data object
@@ -4954,7 +4967,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     # v0.2.18: embed via EmbeddingService (multi-slot when
                     # DUAL_EMBEDDING_ENABLED — see _build_vector_arg).
                     vec_arg, last_slots, truncated_slots = _build_vector_arg(
-                        server, chunk.content
+                        server, chunk.content, target_collection_name
                     )
 
                 # Prepare data object (tags, links, typed_links, external_links shared across all chunks)
@@ -5995,9 +6008,15 @@ def main():
 
         # Sync files
         if sys.argv[1] == "--all":
+            # v0.2.102 W6-I: a selected model that differs from a collection's
+            # recorded one is filled additively BEFORE the walk (only missing
+            # vectors embed), so unchanged nodes then skip with zero re-embeds.
+            _kg_embed_model.fill_before_walk(_fill_collections(), embedding_service)
             kg_tally = sync_all_nodes(server)
             doc_tally = sync_all_docs(server)
             total_fail = kg_tally.failed + doc_tally.failed
+            _kg_embed_model.after_walk(_fill_collections(), PROJECT_ROOT,
+                                       embedding_service, full_tree=True)
             # v0.2.89 BUG 6: surface how many nodes routed to the shared
             # collection via `scope: shared` frontmatter.
             _shared_note = (
@@ -6163,6 +6182,8 @@ def main():
             sys.exit(0 if total_fail == 0 else 1)
         elif sys.argv[1] == "--all-docs":
             doc_tally = sync_all_docs(server)
+            _kg_embed_model.after_walk(_fill_collections(), PROJECT_ROOT,
+                                       embedding_service, full_tree=False)
             print(f"📊 Docs: {doc_tally.summary_fragment()}")
             _print_run_details(doc_tally, run_kind="--all-docs")
             # v0.2.92 D17: docs-only failures are owed work too. NO clear
@@ -6205,6 +6226,8 @@ def main():
                     )
                 tally.add(outcome)
 
+            _kg_embed_model.after_walk(_fill_collections(), PROJECT_ROOT,
+                                       embedding_service, full_tree=False)
             if len(raw_args) > 1:
                 print(f"📊 List: {tally.summary_fragment()}")
             # v0.2.95: the hook path repairs metadata too (a single edited
@@ -6353,6 +6376,24 @@ def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
         # Soft-fail — don't escalate. The failure JSONL written by
         # NoEmbeddingBackendError already captures the diagnostic.
         print(f"   (deferral emit failed: {inner})", file=sys.stderr)
+
+
+_FILL_COLLECTIONS: "Optional[List[str]]" = None
+
+
+def _fill_collections() -> "List[str]":
+    """The collections this run writes (v0.2.102 W6-I fill set): the
+    project's KG, the shared KG when this project may write it, and the
+    development collection. Resolved once per process (one access-matrix
+    ask per run, also on the per-edit path)."""
+    global _FILL_COLLECTIONS
+    if _FILL_COLLECTIONS is None:
+        names = [COLLECTION_NAME, DEV_COLLECTION_NAME]
+        if (SHARED_COLLECTION_NAME and not _resolve_shared_kg_write_disabled()
+                and _shared_write_matrix_allows(SHARED_COLLECTION_NAME)[0]):
+            names.append(SHARED_COLLECTION_NAME)
+        _FILL_COLLECTIONS = [n for n in names if n]
+    return list(_FILL_COLLECTIONS)
 
 
 def _clear_sync_failures_deferral(install_root: Path) -> None:
