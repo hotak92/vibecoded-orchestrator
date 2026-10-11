@@ -144,8 +144,16 @@ logger = logging.getLogger(__name__)
 #:          ``#[cfg(test)] mod x;`` in ANOTHER file, which
 #:          ``vco_lib.codegraph_rust_modules`` now resolves; such a file's
 #:          module ``file_hash`` is salted, so this rung's re-walk also
-#:          re-stamps it). Python, PowerShell
-#:          and Protocol Buffers are unchanged. The per-entity content-hash
+#:          re-stamps it). W6-L, same rung: PowerShell (functions /
+#:          filters, PowerShell 5 classes, enums and methods) and Protocol
+#:          Buffers (messages and enums at any depth, services as classes,
+#:          streaming rpcs as CodeAPI rows) gained tree-sitter definitions
+#:          through OPTIONAL parsers VCO offers on demand; and a module row's
+#:          ``file_hash`` is now salted while its file is extracted by the
+#:          regex FALLBACK (grammar unavailable —
+#:          ``codegraph_defs.regex_fallback_hash_salt``), so a parser
+#:          installed LATER re-extracts that language's unchanged files on the
+#:          next walk without another rung. Python is unchanged. The per-entity content-hash
 #:          gate re-embeds only rows whose extracted text changed;
 #:          ``CODEGRAPH_EMBED_REVISION`` is NOT bumped (model, chunking and
 #:          embed text construction are unchanged).

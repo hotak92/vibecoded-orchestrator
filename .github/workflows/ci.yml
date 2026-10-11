@@ -264,6 +264,12 @@ jobs:
           # shipped path, and the definitions correctness gate
           # (tests/test_codegraph_definitions_truth.py) skips without it.
           pip install -e ".[codegraph-ts]"
+          # v0.2.102 W6-L: the OPTIONAL PowerShell / proto parsers (never in a
+          # default install; VCO offers them per detected language) through the
+          # same installer helper the launcher uses — pins from pyproject, the
+          # language pack's proto grammar pre-fetched, every grammar verified.
+          # The definitions gate and the tree-sitter golden cover them.
+          python -m vco_lib.codegraph_parsers install --all
       - name: pytest
         run: pytest tests/ -q
 

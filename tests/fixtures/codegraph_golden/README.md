@@ -49,7 +49,17 @@ Two snapshot sets, one per DEFINITIONS backend (v0.2.102 W6-E):
   longer claim the nested `Summary#render`, and three one-line arrows /
   reactive declarations (`client.doubler`, `Counter.double`,
   `Counter.doubled`) end on their own line instead of a brace scan's runaway.
-  Proto and PowerShell are identical in both sets (no grammar).
+  W6-L (the OPTIONAL PowerShell / proto parsers, reviewed diff): `catalog.proto`
+  gains one CodeClass row, the service `catalog.v1.CatalogService` (methods
+  `GetProduct`, `ListProducts`); its messages, its two CodeAPI rows and every
+  PowerShell row (`deploy.ps1`: same names, ranges and signatures) are
+  byte-identical to the regex set. In `expected/` (regex) exactly one field
+  changed, reviewed per record: the `file_hash` of every non-Python module
+  (14 rows; the three Python modules are untouched), because a module
+  extracted by the regex FALLBACK now carries a salted hash so a parser
+  installed later re-extracts it (`codegraph_defs.regex_fallback_hash_salt`;
+  `force_regex_definitions` forces that salt, so the snapshot is the same on
+  every machine whatever grammars it has).
 
 `test_codegraph_golden.py` checks each set with its backend forced (the
 tree-sitter check skips where the extra is absent). Each is one normalized

@@ -1,0 +1,19 @@
+{
+ "source": "vct_access_check.ps1.txt",
+ "reviewed": "W6-L 2026-10-11: copy of templates/scripts/vct_access_check.ps1; drafted from extractor output, every start/end line checked against the source (each end is the function's own closing brace)",
+ "symbols": [
+  {"kind": "function", "name": "Get-AccessStateDir", "start": 87, "end": 90, "full_name": "vct_access_check.ps1.Get-AccessStateDir"},
+  {"kind": "function", "name": "ConvertTo-HubPort", "start": 97, "end": 113, "full_name": "vct_access_check.ps1.ConvertTo-HubPort"},
+  {"kind": "function", "name": "Get-AccessHubPort", "start": 115, "end": 128, "full_name": "vct_access_check.ps1.Get-AccessHubPort"},
+  {"kind": "function", "name": "Get-AccessHubToken", "start": 130, "end": 133, "full_name": "vct_access_check.ps1.Get-AccessHubToken"},
+  {"kind": "function", "name": "Get-AccessHubTokenOnDisk", "start": 165, "end": 176, "full_name": "vct_access_check.ps1.Get-AccessHubTokenOnDisk"},
+  {"kind": "function", "name": "Write-AccessStaleEnvTokenWarning", "start": 178, "end": 186, "full_name": "vct_access_check.ps1.Write-AccessStaleEnvTokenWarning"},
+  {"kind": "function", "name": "Test-AccessStaleEnvRetryIsDefinitive", "start": 188, "end": 197, "full_name": "vct_access_check.ps1.Test-AccessStaleEnvRetryIsDefinitive"},
+  {"kind": "function", "name": "Get-AccessStaleEnvFallbackToken", "start": 199, "end": 218, "full_name": "vct_access_check.ps1.Get-AccessStaleEnvFallbackToken"},
+  {"kind": "function", "name": "Write-AccessMetric", "start": 222, "end": 249, "full_name": "vct_access_check.ps1.Write-AccessMetric"},
+  {"kind": "function", "name": "Test-AccessShouldSuppressWarning", "start": 251, "end": 271, "full_name": "vct_access_check.ps1.Test-AccessShouldSuppressWarning"},
+  {"kind": "function", "name": "Write-AccessWarning", "start": 273, "end": 301, "full_name": "vct_access_check.ps1.Write-AccessWarning"},
+  {"kind": "function", "name": "Invoke-AccessFailOpen", "start": 303, "end": 309, "full_name": "vct_access_check.ps1.Invoke-AccessFailOpen"},
+  {"kind": "function", "name": "Invoke-AccessRequest", "start": 327, "end": 400, "full_name": "vct_access_check.ps1.Invoke-AccessRequest"}
+ ]
+}

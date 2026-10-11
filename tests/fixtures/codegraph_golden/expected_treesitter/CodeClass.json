@@ -126,6 +126,27 @@
   },
   {
     "chunk_num": 0,
+    "class_body": "service CatalogService {\n  rpc GetProduct(ProductRequest) returns (Product);\n  rpc ListProducts(ProductRequest) returns (ProductList);\n}",
+    "content_hash": "59775d22eb4249de52294fa425f31c5e6d38da25eeda0390911ffcb0b834e767",
+    "doc": "",
+    "embed_revision": 0,
+    "end_line": 27,
+    "file_path": "src/catalog.proto",
+    "full_name": "catalog.v1.CatalogService",
+    "is_test": false,
+    "language": "proto",
+    "methods": [
+      "GetProduct",
+      "ListProducts"
+    ],
+    "name": "CatalogService",
+    "project": "GoldenProj",
+    "signature": "service CatalogService",
+    "start_line": 24,
+    "total_chunks": 1
+  },
+  {
+    "chunk_num": 0,
     "class_body": "message Product {\n  string id = 1;\n  string name = 2;\n  double price = 3;\n}",
     "content_hash": "c78df14dc4a04bf569c458dcdab3e5dd72d3049b64232367ff8313647550f099",
     "doc": "",

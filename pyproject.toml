@@ -113,6 +113,29 @@ codegraph-ts = [
     "tree-sitter-lua == 0.5.0",
     "tree-sitter-bash == 0.25.1",
 ]
+# OPTIONAL code-graph parsers (v0.2.102 W6-L) — NOT installed by default.
+# VCO detects the languages each registered project contains and the launcher
+# offers the missing parsers in a modal; the ONE installer helper
+# (vco_lib/codegraph_parsers.py) installs the checked ones into VCO's venv,
+# reading these exact pins from here. Same core pin as codegraph-ts (an
+# install that would move tree-sitter is refused by the pin itself).
+#   tree-sitter-powershell 0.26.4  MIT  (airbus-cert/tree-sitter-powershell),
+#     language ABI 15; wheels for linux x86_64/aarch64 (glibc + musl),
+#     macOS x86_64/arm64, Windows amd64/arm64.
+#   tree-sitter-language-pack 1.21.3  MIT  (xberg-io) — used ONLY for its
+#     `proto` grammar (coder3101/tree-sitter-proto, MIT), ABI 14; wheels for
+#     manylinux_2_34 x86_64/aarch64, macOS x86_64/arm64, Windows amd64/arm64.
+#     It downloads one ~22 MB per-platform parser bundle (sha256-checked) from
+#     GitHub Releases at INSTALL time only (codegraph_parsers pre-fetches into
+#     <venv>/share/vco-codegraph-parsers); a walk never downloads.
+codegraph-ts-powershell = [
+    "tree-sitter == 0.26.0",
+    "tree-sitter-powershell == 0.26.4",
+]
+codegraph-ts-proto = [
+    "tree-sitter == 0.26.0",
+    "tree-sitter-language-pack == 1.21.3",
+]
 # Test/dev tools — mirrors requirements-dev.txt.
 test = [
     "pytest >= 9.0.3",

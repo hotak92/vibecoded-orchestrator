@@ -892,6 +892,18 @@ class InstallWiringTests(unittest.TestCase):
             for name in self.PINNED_ARGV_DECISIONS:
                 if name in body:
                     delegating.add(name)
+        # v0.2.102 W6-L: a function that hands its pip target to the ONE
+        # parser installer helper (vco_lib.codegraph_parsers.install, which
+        # composes the `-m pip install` argv) is a delegated pip site too.
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            body = ast.get_source_segment(self.src, node) or ""
+            if "from vco_lib.codegraph_parsers import install" not in body:
+                continue
+            for name in self.PINNED_ARGV_DECISIONS:
+                if name in body:
+                    delegating.add(name)
         self.assertEqual(
             delegating, self.PINNED_ARGV_DECISIONS,
             "PINNED_ARGV_DECISIONS is out of sync with install.py's delegated "

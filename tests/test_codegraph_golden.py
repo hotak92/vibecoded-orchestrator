@@ -256,8 +256,11 @@ def defs_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
     if request.param == "regex":
         force_regex_definitions(monkeypatch)
     elif not treesitter_available("rust", "javascript", "typescript", "go", "java",
-                                  "csharp", "cpp", "ruby", "lua", "shell"):
-        pytest.skip("codegraph-ts extra not installed — tree-sitter snapshots not checkable")
+                                  "csharp", "cpp", "ruby", "lua", "shell",
+                                  "powershell", "proto"):
+        # W6-L: the tree-sitter snapshot includes the OPTIONAL PowerShell /
+        # proto parsers (CI installs them: codegraph_parsers install --all).
+        pytest.skip("code-graph parsers not all installed — tree-sitter snapshots not checkable")
     return request.param
 
 

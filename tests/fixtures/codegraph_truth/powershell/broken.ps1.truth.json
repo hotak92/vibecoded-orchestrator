@@ -1,0 +1,9 @@
+{
+ "source": "broken.ps1",
+ "reviewed": "W6-L 2026-10-11 (hand-written before extraction): a statement broken INSIDE a complete function; the parse error routes the whole file to the regex fallback, which must keep every definition",
+ "symbols": [
+  {"kind": "function", "name": "Get-First", "start": 1, "end": 3, "full_name": "broken.Get-First"},
+  {"kind": "function", "name": "Get-Broken", "start": 5, "end": 7, "full_name": "broken.Get-Broken"},
+  {"kind": "function", "name": "Get-Last", "start": 9, "end": 11, "full_name": "broken.Get-Last"}
+ ]
+}

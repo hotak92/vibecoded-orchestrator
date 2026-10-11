@@ -30,6 +30,8 @@ from vco_lib.codegraph_lang.go import extract_go_file
 from vco_lib.codegraph_lang.java import extract_java_file
 from vco_lib.codegraph_lang.javascript import extract_js_file
 from vco_lib.codegraph_lang.lua import extract_lua_file
+from vco_lib.codegraph_lang.powershell import extract_powershell_file
+from vco_lib.codegraph_lang.proto import extract_proto_file
 from vco_lib.codegraph_lang.ruby import extract_ruby_file
 from vco_lib.codegraph_lang.rust import extract_rust_file
 from vco_lib.codegraph_lang.shell import extract_shell_file
@@ -51,6 +53,10 @@ EXTRACTORS: Dict[str, Tuple[Callable, str]] = {
     "lua": (extract_lua_file, "lua"),
     "shell": (extract_shell_file, "shell"),
     "svelte": (extract_svelte_file, "typescript"),
+    # OPTIONAL parsers (v0.2.102 W6-L) — offered on demand, not in the default
+    # codegraph-ts extra; CI installs them (ci.yml) so the gate runs there.
+    "powershell": (extract_powershell_file, "powershell"),
+    "proto": (extract_proto_file, "proto"),
 }
 
 #: (kind, name, start, end, full_name, methods) — methods is a tuple, or
@@ -130,8 +136,18 @@ def force_regex_definitions(monkeypatch) -> None:  # noqa: ANN001
     """Make every extractor take its REGEX fallback for one test (as on an
     install without the ``codegraph-ts`` extra)."""
     from vco_lib import codegraph_defs
+    from vco_lib.codegraph_lang import _shared
 
     monkeypatch.setattr(codegraph_defs, "parse", lambda lang, data: None)
+    # W6-L: an install without the grammar also stamps the regex-fallback
+    # hash salt on the module row (codegraph_defs.regex_fallback_hash_salt) —
+    # forced here too, so the regex snapshot is the same on every machine
+    # whatever grammars it happens to have.
+    monkeypatch.setattr(
+        _shared, "regex_fallback_hash_salt",
+        lambda path: (codegraph_defs.REGEX_FALLBACK_HASH_SALT
+                      if codegraph_defs.definitions_grammar_for_path(path) else ""),
+    )
 
 
 def treesitter_available(*grammars: str) -> bool:

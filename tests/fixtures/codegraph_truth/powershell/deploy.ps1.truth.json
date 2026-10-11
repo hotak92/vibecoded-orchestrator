@@ -1,0 +1,9 @@
+{
+ "source": "deploy.ps1",
+ "reviewed": "W6-L 2026-10-11: copy of the golden corpus file; drafted from extractor output, every start/end line checked against the source",
+ "symbols": [
+  {"kind": "function", "name": "Invoke-Deploy", "start": 6, "end": 21, "full_name": "deploy.Invoke-Deploy"},
+  {"kind": "function", "name": "Write-Step", "start": 14, "end": 17, "full_name": "deploy.Write-Step"},
+  {"kind": "function", "name": "Get-Even", "start": 23, "end": 25, "full_name": "deploy.Get-Even"}
+ ]
+}

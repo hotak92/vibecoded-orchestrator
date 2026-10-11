@@ -1,0 +1,13 @@
+{
+ "source": "edge_cases.proto",
+ "reviewed": "W6-L 2026-10-11 (hand-written before extraction; full_name + methods written by hand from the source)",
+ "symbols": [
+  {"kind": "class", "name": "Order", "start": 12, "end": 24, "full_name": "truth.v1.Order", "methods": []},
+  {"kind": "class", "name": "Line", "start": 14, "end": 17, "full_name": "truth.v1.Order.Line", "methods": []},
+  {"kind": "class", "name": "Indented", "start": 26, "end": 28, "full_name": "truth.v1.Indented", "methods": []},
+  {"kind": "class", "name": "Status", "start": 30, "end": 33, "full_name": "truth.v1.Status", "methods": []},
+  {"kind": "class", "name": "Empty", "start": 35, "end": 35, "full_name": "truth.v1.Empty", "methods": []},
+  {"kind": "class", "name": "OrderService", "start": 37, "end": 42, "full_name": "truth.v1.OrderService", "methods": ["Get", "Stream"]},
+  {"kind": "class", "name": "Health", "start": 44, "end": 46, "full_name": "truth.v1.Health", "methods": ["Check"]}
+ ]
+}

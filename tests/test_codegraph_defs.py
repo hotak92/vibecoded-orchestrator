@@ -37,19 +37,33 @@ def _ts_available(grammar: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def test_every_grammar_module_is_pinned_in_the_codegraph_ts_extra() -> None:
+def _extra_pins(extra: str) -> set:
     pyproject = (_REPO / "pyproject.toml").read_text(encoding="utf-8")
-    block = re.search(r"^codegraph-ts = \[(.*?)^\]", pyproject, re.MULTILINE | re.DOTALL)
-    assert block, "pyproject.toml lost its [codegraph-ts] extra"
-    pinned = set(re.findall(r'"(tree-sitter-[\w-]+) ==', block.group(1)))
+    block = re.search(rf"^{re.escape(extra)} = \[(.*?)^\]", pyproject, re.MULTILINE | re.DOTALL)
+    assert block, f"pyproject.toml lost its [{extra}] extra"
+    return set(re.findall(r'"(tree-sitter-[\w-]+) ==', block.group(1)))
+
+
+def test_every_grammar_module_is_pinned_in_the_codegraph_ts_extra() -> None:
+    """Default grammars in ``codegraph-ts``; each OPTIONAL one (W6-L) in its
+    own ``codegraph-ts-<grammar>`` extra and NOT in the default one."""
+    default = _extra_pins("codegraph-ts")
     for lang, (module, _factory) in codegraph_grammars.GRAMMARS.items():
         package = module.replace("_", "-")
-        assert package in pinned, f"{lang}: grammar module {module} is not pinned in codegraph-ts"
+        if lang in codegraph_grammars.OPTIONAL_GRAMMARS:
+            assert package not in default, f"{lang}: optional parser leaked into the default extra"
+            assert package in _extra_pins(f"codegraph-ts-{lang}"), lang
+        else:
+            assert package in default, f"{lang}: grammar module {module} is not pinned in codegraph-ts"
+    for lang in codegraph_grammars.PACK_GRAMMARS:
+        assert lang in codegraph_grammars.OPTIONAL_GRAMMARS, lang
+        assert "tree-sitter-language-pack" in _extra_pins(f"codegraph-ts-{lang}"), lang
+        assert "tree-sitter-language-pack" not in default
 
 
 def test_every_definitions_walker_has_a_grammar() -> None:
     for lang, (grammar, _walker) in codegraph_defs._WALKERS.items():
-        assert grammar in codegraph_grammars.GRAMMARS, lang
+        assert grammar in codegraph_grammars.all_grammar_ids(), lang
 
 
 # ---------------------------------------------------------------------------
@@ -68,8 +82,19 @@ def test_missing_grammar_returns_none_and_logs_once(monkeypatch, caplog) -> None
 
 
 def test_unknown_language_has_no_definitions() -> None:
-    assert codegraph_defs.extract_definitions("powershell", "function F { }") is None
-    assert codegraph_defs.extract_definitions("proto", "message M {}") is None
+    assert codegraph_defs.extract_definitions("python", "def f(): pass") is None
+    assert codegraph_defs.extract_definitions("cobol", "IDENTIFICATION DIVISION.") is None
+
+
+@pytest.mark.parametrize("lang,source", [
+    ("powershell", "function F { }"),
+    ("proto", "message M {}"),
+])
+def test_optional_parser_absent_means_regex(lang: str, source: str, monkeypatch) -> None:
+    """W6-L leave-alone: an OPTIONAL parser that is not installed (or a pack
+    grammar not downloaded) -> ``None`` -> the extractor's regex path."""
+    monkeypatch.setattr(codegraph_grammars, "_LANGUAGES", {lang: None})
+    assert codegraph_defs.extract_definitions(lang, source) is None
 
 
 def test_regex_fallback_runs_when_the_grammar_is_absent(monkeypatch) -> None:
@@ -171,6 +196,8 @@ def test_grammar_modules_resolvable_when_extra_installed() -> None:
     if importlib.util.find_spec("tree_sitter") is None:
         pytest.skip("codegraph-ts extra not installed")
     for lang in codegraph_grammars.GRAMMARS:
+        if lang in codegraph_grammars.OPTIONAL_GRAMMARS:
+            continue  # offered on demand, not part of the default extra (W6-L)
         assert codegraph_grammars.load_language(lang) is not None, lang
 
 
@@ -262,4 +289,6 @@ def test_the_analyzer_docstring_states_the_shipped_parsers() -> None:
     assert "tree-sitter" in doc
     for lang in ("Rust", "Go", "Java", "Ruby", "Lua", "Shell", "C++/C", "JavaScript/TypeScript/JSX"):
         assert f"{lang} (regex)" not in doc, lang
-    assert "PowerShell, Proto (regex)" in doc
+    # W6-L: PowerShell / proto use tree-sitter through OPTIONAL parsers.
+    assert "PowerShell, Proto (regex)" not in doc
+    assert "PowerShell, Proto\n" in doc and "optional parsers offered on demand" in doc
