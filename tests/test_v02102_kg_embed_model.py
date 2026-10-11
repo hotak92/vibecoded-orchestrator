@@ -614,6 +614,49 @@ def test_inline_fallback_secondary_never_overwrites_the_active_slot(monkeypatch)
         "the active model's vector keeps its slot; the legacy one does not replace it"
 
 
+def test_a_project_whose_retired_pick_diverged_converges_through_the_additive_fill(kgenv, tmp_path):
+    """W6-J (one global embedding profile): a project whose stored per-project
+    pick (the removed Settings-tab picker's `source=user` row) was qwen3 —
+    and whose KG is complete in qwen3 — while the GLOBAL profile is arctic.
+    Its next env projection carries the global profile; the KG then searches
+    the RECORDED qwen3 slot until the additive fill completes arctic, and no
+    qwen3 vector is ever dropped. Nothing new: the W6-I fill does the
+    convergence; this pins that a diverged project reaches it."""
+    from tests.common.launcher_db_fixture import make_launcher_db
+    from vco_lib.config_projection import project_env_from_db
+    from vco_lib.embedding_service import resolve_active_text_model_id
+
+    proj = tmp_path / "diverged"
+    proj.mkdir()
+    db = make_launcher_db(
+        tmp_path / "projection.db",
+        projects=[{"project_id": "pd", "name": "Diverged", "folder_path": str(proj)}],
+        app_state={"embedding.active_profile": "arctic"},
+        module_settings=[
+            ("pd", "orchestrator-core", "active_embedding", '"qwen3"'),
+            ("pd", "orchestrator-core", "active_embedding_source", '"user"'),
+        ],
+    )
+    env = project_env_from_db("pd", db_path=db)["canonical_env"]
+    assert env["ACTIVE_EMBEDDING"] == "arctic", "the projection carries the global profile"
+    target = resolve_active_text_model_id({"ACTIVE_EMBEDDING": env["ACTIVE_EMBEDDING"]})
+    assert target == ARCTIC
+
+    coll = _qwen3_collection(kgenv)
+    kem.write_record(COLL, _record(QWEN3))
+    query = kem.resolve_kg_model(COLL, role="query", target=target)
+    assert query.model == QWEN3 and query.filling, "searches stay on the recorded slot meanwhile"
+    write = kem.resolve_kg_model(COLL, role="write", target=target)
+    assert write.model == ARCTIC and write.carry == QWEN3, "writes embed the global model and carry"
+
+    ollama = FakeOllama()
+    assert kem.fill_collection(COLL, _svc(target, ollama), log=lambda _m: None,
+                               client_factory=kgenv.client) == "complete"
+    assert all(o.vector.get("qwen3_embed") for o in coll.objs), "never drop data"
+    assert all(o.vector.get("arctic2_embed") for o in coll.objs)
+    assert kem.read_record(COLL).model == ARCTIC, "converged on the global profile"
+
+
 def test_status_counts_objects_only_for_an_unrecorded_collection(kgenv):
     """W6-J: the launcher's re-scan alert must tell a stored-but-unrecorded KG
     (its stamp failed, or no slot is complete) from an empty/absent one (a

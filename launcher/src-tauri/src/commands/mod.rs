@@ -18,8 +18,8 @@ pub mod claude_env;
 pub mod gpu;
 pub mod gpu_policy;
 pub mod codegraph;
-// v0.2.18 (Plan C): Re-analyze runner. Forks the Tauri-streaming pattern
-// from `embedding_enrichment` against `analyze_code_graph.py
+// v0.2.18 (Plan C): Re-analyze runner. Forked the Tauri-streaming pattern
+// from the (v0.2.102-retired) `embedding_enrichment` command against `analyze_code_graph.py
 // --json-progress`. Re-analyze always passes `--prune-stale` (it's the
 // "authoritative refresh" path); `--language` is optional and scopes the
 // re-walk + prune to one language.
@@ -60,16 +60,10 @@ pub mod infra_declarations;
 // callers remained after the Diagrams tab went.
 pub mod embed_admission;
 pub mod embedding_catalog;
-pub mod embedding_enrichment;
 // v0.2.75 P2 — pure `.env` audit + sentinel-rewrite (Rust mirror of
 // vco_lib/secrets_audit.py) backing the launcher-side "Migrate from .env"
 // button. Consumed by secrets_cmd::migrate_env_secrets_from_dotenv.
 pub mod env_secrets_migrate;
-// v0.2.71 Track T-C-modal — per-slot populated-vector COUNTS for a project's
-// KG collection. Powers the RegenerateOrDeferModal "keep previous model"
-// option (smart default = most-populated slot). Thin shell-out to
-// `vco_lib.embedding_enrichment slot-counts`; no duplicate count logic.
-pub mod embedding_slot_counts;
 // v0.2.92 WP-13: the ONE git runner + the ONE branch resolver. `installer.rs`
 // normalised a detached `"HEAD"` → `main` at five inline sites while
 // `self_update.rs` did it at zero, so the two update surfaces gave OPPOSITE

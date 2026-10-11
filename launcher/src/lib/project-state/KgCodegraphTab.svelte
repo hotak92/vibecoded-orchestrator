@@ -390,10 +390,9 @@ Continue?`;
         </label>
       </div>
       <p class="ps-hint">
-        The KG's embedding model is not picked per binding: it is the global embedding profile
-        (Preferences → Embedding profile), unless this project picked its own profile on its
-        Settings tab. A newly selected model's vectors are filled in alongside the existing ones
-        automatically.
+        The KG's embedding model is one global setting (Preferences → Embedding profile) for every
+        project and the shared KG. A newly selected model's vectors are filled in alongside the
+        existing ones automatically.
       </p>
       <button class="ps-btn-primary" onclick={saveKg}>Save KG binding</button>
 

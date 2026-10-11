@@ -2321,9 +2321,8 @@
           <strong>Text embedding (KG, every project)</strong>
           <span class="pr-onboarding-hint">
             The KG embedding model is one global setting for every project
-            and the shared KG (a project whose own profile was picked on its
-            Settings tab keeps that pick). Greyed-out options are unreachable
-            from this machine.
+            and the shared KG. Greyed-out options are unreachable from this
+            machine.
             <!-- v0.2.102 W6-B (F3/F5): the save is NOT local — the backend
                  also stamps the global embedding profile and re-projects
                  every project's env (a machine-wide sweep that can take a

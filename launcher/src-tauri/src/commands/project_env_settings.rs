@@ -46,36 +46,12 @@ use crate::db::Db;
 /// Default: `"qwen3"` (matches install.py's default and the MCP server's fallback).
 pub const APP_STATE_KEY_ACTIVE_EMBEDDING: &str = "embedding.active_profile";
 
-/// `module_settings` identifiers for the per-project ACTIVE_EMBEDDING profile.
-///
-/// `(project_id, ORCHESTRATOR_CORE_MODULE_ID, ACTIVE_EMBEDDING_SETTING_KEY)` is
-/// the per-project row that the hub resolver (`config_api.rs`) + the Python
-/// `config_projection` writer read to stamp `ACTIVE_EMBEDDING` into
-/// `.claude/{settings.json,env}`. v0.2.71 T-B-emb adds a companion
-/// `ACTIVE_EMBEDDING_SOURCE_SETTING_KEY` marker row so a deliberate user pick
-/// (`"user"`) becomes sticky-across-updates while an auto-seed (`"auto"`) and a
-/// legacy NO-marker row both inherit the machine-global default.
-pub const ORCHESTRATOR_CORE_MODULE_ID: &str = "orchestrator-core";
-pub const ACTIVE_EMBEDDING_SETTING_KEY: &str = "active_embedding";
-pub const ACTIVE_EMBEDDING_SOURCE_SETTING_KEY: &str = "active_embedding_source";
-
-/// Provenance marker values for `active_embedding_source`.
-///
-/// * `"user"` — written by the Settings-tab per-project embedding picker
-///   (`set_project_active_embedding`). STICKY: the resolver returns the
-///   per-project `active_embedding` row verbatim and NO update path may
-///   overwrite it.
-/// * `"auto"` — written by the startup backfill (`project_backfill.rs`). The
-///   resolver treats it as "inherit the machine-global default".
-///
-/// A LEGACY per-project `active_embedding` row with NO `active_embedding_source`
-/// companion (written before v0.2.71) is treated identically to `"auto"` —
-/// inherit the global default. This is a LOCKED decision (v0.2.71 MASTER PLAN
-/// §Sweep B): a legacy deliberate qwen3 pick getting overridden by a global
-/// arctic default is the accepted cost of fixing the far-more-common
-/// auto-seeded qwen3 case (the backfill stamped qwen3 with no provenance).
-pub const ACTIVE_EMBEDDING_SOURCE_USER: &str = "user";
-pub const ACTIVE_EMBEDDING_SOURCE_AUTO: &str = "auto";
+// v0.2.102 W6-J (owner ruling 2026-10-11: one single global embedding
+// setting): the per-project `module_settings/orchestrator-core/
+// active_embedding` + `active_embedding_source` rows (the removed Settings-tab
+// picker's writes, v0.2.71-v0.2.101) are RETIRED — left in launcher.db
+// untouched, read by nothing (the convention of the retired
+// `project_kg_bindings.embedding_model` column; migration 017).
 
 /// `app_state` key for an override of the cross-project shared KG class name.
 /// Default: `"VibeCodedOrchestrator_KnowledgeGraph"` (since v0.2.23 B1; was
@@ -256,185 +232,26 @@ fn global_active_embedding(db: &Db) -> Option<String> {
         })
 }
 
-/// The ONE active-embedding resolution cascade (v0.2.71 T-B-emb).
+/// The ONE active-embedding resolution — ONE global profile for every
+/// project (v0.2.102 W6-J; owner ruling 2026-10-11).
 ///
-/// Resolution order (LOCKED — must match the hub `config_api.rs` resolver and
-/// the Python `config_projection.py` writer EXACTLY):
+/// Order (must match the hub `config_api.rs::resolve_active_embedding_for_hub`
+/// and the Python `config_projection.py::_resolve_active_embedding_cascade`):
 ///
-///   1. Per-project `module_settings/orchestrator-core/active_embedding`
-///      WHERE the companion `active_embedding_source` row == `"user"`
-///      (a deliberate Settings-tab pick) → returned VERBATIM (sticky).
-///   2. Machine-global `app_state[embedding.active_profile]` (then the
-///      hardware-pick derive) — when the per-project row is `"auto"`,
-///      a legacy NO-marker row, or absent. This is the two-DB-location
-///      BRIDGE (B1): a per-project row that is NOT a user pick yields to the
-///      global default, so a GUI write to `app_state` (Identity tab) and a
-///      hub read can never disagree on a non-user project.
-///   3. `"qwen3"` — final fallback.
+///   1. Machine-global `app_state[embedding.active_profile]` (Preferences),
+///      then the hardware-pick derive (`app_state[default_text_embedding]`).
+///   2. `"qwen3"` — final fallback.
 ///
-/// Soft-fail: every DB read is best-effort; a hiccup falls through to the
-/// next leg (never panics, never blocks an env render).
+/// There is no per-project leg: the v0.2.71 sticky per-project pick (the
+/// Settings-tab picker, `set_project_active_embedding`) was removed, and its
+/// stored rows are retired (never read, never deleted). A project whose
+/// stored pick differed converges on its next env projection; its KG
+/// collections keep searching their RECORDED model while the global model
+/// fills in additively (`vco_lib/kg_embed_model.py`).
 ///
-/// `project_id == None` (test / DB-less contexts) skips leg 1 and resolves
-/// from the global default only — matching the `populate(None)` contract.
-pub fn resolve_active_embedding_cascade(db: &Db, project_id: Option<&str>) -> String {
-    // Leg 1: sticky per-project user pick.
-    if let Some(pid) = project_id {
-        let source = db
-            .get_setting(pid, ORCHESTRATOR_CORE_MODULE_ID, ACTIVE_EMBEDDING_SOURCE_SETTING_KEY)
-            .ok()
-            .flatten()
-            .and_then(|v| v.as_str().map(String::from));
-        if source.as_deref() == Some(ACTIVE_EMBEDDING_SOURCE_USER) {
-            if let Some(value) = db
-                .get_setting(pid, ORCHESTRATOR_CORE_MODULE_ID, ACTIVE_EMBEDDING_SETTING_KEY)
-                .ok()
-                .flatten()
-                .and_then(|v| v.as_str().map(String::from))
-                .filter(|s| !s.is_empty())
-            {
-                return value;
-            }
-            // source=user but the value row is missing/empty — fall through
-            // to the global default rather than returning an empty string.
-        }
-    }
-    // Legs 2 + 3: machine-global default, else qwen3.
+/// Soft-fail: every DB read is best-effort.
+pub fn resolve_active_embedding_cascade(db: &Db) -> String {
     global_active_embedding(db).unwrap_or_else(|| DEFAULT_ACTIVE_EMBEDDING.to_string())
-}
-
-/// Persist a deliberate per-project active-embedding pick from the
-/// Settings-tab picker. Writes BOTH the value row AND the
-/// `active_embedding_source = "user"` marker so the cascade treats it as
-/// sticky across updates.
-///
-/// `profile` is a normalised profile id (`qwen3` / `arctic` / `openai` /
-/// `codesage`) — the picker resolves the chosen model's slot to a profile
-/// before calling this. The pair is written atomically enough for our
-/// purposes (two `set_setting` upserts; a crash between them leaves the
-/// value row without a user marker, which the cascade treats as auto =
-/// inherit global — the conservative outcome, never a wrong sticky slot).
-pub fn write_project_active_embedding_user(
-    db: &Db,
-    project_id: &str,
-    profile: &str,
-) -> Result<(), String> {
-    let profile = profile.trim();
-    if profile.is_empty() {
-        return Err("write_project_active_embedding_user: empty profile".into());
-    }
-    db.set_setting(
-        project_id,
-        ORCHESTRATOR_CORE_MODULE_ID,
-        ACTIVE_EMBEDDING_SETTING_KEY,
-        &serde_json::Value::String(profile.to_string()),
-    )?;
-    db.set_setting(
-        project_id,
-        ORCHESTRATOR_CORE_MODULE_ID,
-        ACTIVE_EMBEDDING_SOURCE_SETTING_KEY,
-        &serde_json::Value::String(ACTIVE_EMBEDDING_SOURCE_USER.to_string()),
-    )?;
-    Ok(())
-}
-
-/// Free-function core of `set_project_active_embedding` — write the sticky
-/// per-project pick, then re-project the env files so
-/// `.claude/{settings.json,env}` reflect the new ACTIVE_EMBEDDING and the
-/// settings watcher's diff-guard can fire the guarded MCP reload.
-///
-/// F5 (v0.2.72): the re-projection moved INTO the command (previously the
-/// doc comment delegated it to "the caller" — and one caller, the
-/// model-switch modal's "keep previous model" path, never did it, leaving
-/// the live MCP on a stale ACTIVE_EMBEDDING until an unrelated refresh).
-/// Soft-fail: a projection hiccup lands in the returned result's
-/// `warnings`; it never rolls back the DB write.
-pub fn set_project_active_embedding_with_db(
-    db: &Db,
-    project_id: &str,
-    profile: &str,
-) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
-    if project_id.is_empty() {
-        return Err("set_project_active_embedding: project_id required".into());
-    }
-    write_project_active_embedding_user(db, project_id, profile)?;
-    Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
-}
-
-/// Tauri command — Settings-tab per-project embedding picker WRITE path.
-///
-/// Records a deliberate user pick (`source = "user"`, sticky). The frontend
-/// passes the resolved PROFILE id (qwen3 / arctic / openai / codesage), not
-/// the raw model id — the picker maps the chosen catalog model's slot to its
-/// profile before invoking. The command re-projects the env files itself
-/// (F5, v0.2.72) — callers no longer need a follow-up
-/// `refresh_project_env` invoke (a duplicate one is a harmless idempotent
-/// no-op: the watcher diff-guard hash-matches and skips the reload).
-///
-/// F3: the re-projection is a Python subprocess (300 s cap), so the sync
-/// core runs on the blocking pool, not a tokio worker. The DB write lives
-/// inside the closure, so a join failure is propagated.
-#[tauri::command]
-pub async fn set_project_active_embedding(
-    project_id: String,
-    profile: String,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    crate::commands::blocking::run_with_db_on_blocking_pool(
-        app,
-        "set_project_active_embedding",
-        move |db| set_project_active_embedding_with_db(db, &project_id, &profile),
-    )
-    .await?
-    .map(|_| ())
-}
-
-/// Resolved per-project active-embedding profile + its provenance, for the
-/// Settings-tab picker to render its current selection and source badge.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ActiveEmbeddingState {
-    /// The EFFECTIVE profile the cascade resolves to (what lands in
-    /// `.claude/{settings.json,env}`). Always non-empty (qwen3 floor).
-    pub effective: String,
-    /// Provenance of the effective value: `"user"` (sticky per-project pick),
-    /// or `"auto"` (inherited from the machine-global default — covers
-    /// `source=auto`, a legacy NO-marker row, or no per-project row at all).
-    pub source: String,
-}
-
-/// Tauri command — Settings-tab per-project embedding picker READ path.
-///
-/// Returns the EFFECTIVE active-embedding profile (post-cascade) plus its
-/// provenance so the picker can show the current selection and whether it's
-/// a sticky user pick or inherited from the global default.
-#[tauri::command]
-pub async fn get_project_active_embedding(
-    project_id: String,
-    db: tauri::State<'_, Db>,
-) -> Result<ActiveEmbeddingState, String> {
-    if project_id.is_empty() {
-        return Err("get_project_active_embedding: project_id required".into());
-    }
-    let is_user = db
-        .get_setting(
-            &project_id,
-            ORCHESTRATOR_CORE_MODULE_ID,
-            ACTIVE_EMBEDDING_SOURCE_SETTING_KEY,
-        )
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_str().map(String::from))
-        .as_deref()
-        == Some(ACTIVE_EMBEDDING_SOURCE_USER);
-    let effective = resolve_active_embedding_cascade(&db, Some(&project_id));
-    Ok(ActiveEmbeddingState {
-        effective,
-        source: if is_user {
-            ACTIVE_EMBEDDING_SOURCE_USER.to_string()
-        } else {
-            ACTIVE_EMBEDDING_SOURCE_AUTO.to_string()
-        },
-    })
 }
 
 /// Canonical shared-KG class name — LAST-RESORT FALLBACK.
@@ -720,25 +537,16 @@ pub fn populate(
     let ollama_port = endpoints::machine_port(db, CoreService::Ollama);
     let code_embed_port = endpoints::machine_port(db, CoreService::CodeEmbed);
 
-    // v0.2.71 T-B-emb: resolve via the ONE shared cascade. Sticky per-project
-    // user pick (module_settings/orchestrator-core/active_embedding WHERE
-    // source=user) → machine-global default (app_state[embedding.active_profile]
-    // → hardware-pick derive) → qwen3. The same fn backs the hub resolver +
-    // the Settings-tab picker; `config_projection.py` mirrors it for the
-    // canonical .claude/{settings.json,env} writer.
-    //
-    // v0.2.69 FIX 1 (Defect D add-path gap) carried forward inside
-    // `global_active_embedding`: when the canonical `embedding.active_profile`
-    // key is empty/absent (the usual state on a fresh add — only the GUI
-    // Identity-tab chooser writes it), derive the profile from the machine's
-    // hardware pick (`app_state[default_text_embedding]`) BEFORE falling to
-    // "qwen3" (conservative: never stamp a guessed profile → wrong vector slot).
+    // ONE global profile for every project (v0.2.102 W6-J): machine-global
+    // `app_state[embedding.active_profile]` → hardware-pick derive → qwen3.
+    // The same fn backs the hub resolver; `config_projection.py` mirrors it
+    // for the canonical .claude/{settings.json,env} writer.
     //
     // NOTE: this Rust populate() value feeds the `.env` template +
     // SecretsPanel surfaces, NOT the canonical `.claude/{settings.json,env}`
-    // (those come from the Python `config_projection` writer, which mirrors
-    // this cascade). Both are fixed in lockstep so the two surfaces agree.
-    let active_embedding = resolve_active_embedding_cascade(db, project_id);
+    // (those come from the Python `config_projection` writer). Both resolve
+    // the same global profile, so the two surfaces agree.
+    let active_embedding = resolve_active_embedding_cascade(db);
 
     // PR-9 (v0.2.11): shared KG resolution with three-tier priority.
     //
@@ -1316,44 +1124,6 @@ mod tests {
 
     // ─── F5 (v0.2.72): env re-projection after MCP-relevant DB writes ──
 
-    /// `set_project_active_embedding_with_db` writes the sticky pick AND
-    /// re-projects the project's env. Proof of the refresh: the returned
-    /// `RefreshProjectEnvResult` carries the access list only the refresh
-    /// path (populate) computes — seeded here so the value is
-    /// deterministic. Previously the refresh was delegated to "the
-    /// caller"; the model-switch modal never did it → stale MCP env.
-    #[test]
-    fn set_project_active_embedding_persists_and_reprojects() {
-        let db = Db::open_in_memory().unwrap();
-        db.insert_project(
-            "p-f5-emb",
-            "F5Emb",
-            "/nonexistent/f5-emb",
-            crate::db::models::ProjectHost::Base,
-            "f5emb",
-        )
-        .unwrap();
-        db.kg_set_access("p-f5-emb", "PeerProj_KnowledgeGraph", "read")
-            .unwrap();
-
-        let result = set_project_active_embedding_with_db(&db, "p-f5-emb", "arctic")
-            .expect("setter must succeed");
-
-        // The sticky user pick landed (cascade leg 1).
-        assert_eq!(
-            resolve_active_embedding_cascade(&db, Some("p-f5-emb")),
-            "arctic",
-        );
-        // The env re-projection ran (populate resolved the seeded peer).
-        assert_eq!(
-            result.kg_access_list,
-            vec!["PeerProj".to_string()],
-            "the setter must re-project env after the write",
-        );
-        // Empty project_id keeps its precondition error.
-        assert!(set_project_active_embedding_with_db(&db, "", "arctic").is_err());
-    }
-
     /// `set_text_embedding_and_profile` writes the machine-global default
     /// keys AND re-projects every project's env (all auto projects inherit
     /// the new value via the cascade's global leg). Proof of the
@@ -1748,7 +1518,7 @@ mod tests {
         );
     }
 
-    // ─── v0.2.71 T-B-emb: active-embedding cascade + marker ─────────────
+    // ─── v0.2.102 W6-J: ONE global embedding profile ───────────────────
 
     /// Seed a project row so module_settings writes have a valid FK.
     fn seed_bare_project(db: &Db, name: &str) -> String {
@@ -1760,149 +1530,82 @@ mod tests {
         id
     }
 
-    /// Leg 1: a per-project row marked source=user is STICKY — returned
-    /// verbatim even when the machine-global default says otherwise.
+    /// Seed the RETIRED v0.2.71 per-project pick (what the removed
+    /// Settings-tab picker wrote) directly — no code path writes it anymore.
+    fn seed_retired_user_pick(db: &Db, pid: &str, profile: &str) {
+        db.set_setting(
+            pid,
+            "orchestrator-core",
+            "active_embedding",
+            &serde_json::Value::String(profile.to_string()),
+        )
+        .unwrap();
+        db.set_setting(
+            pid,
+            "orchestrator-core",
+            "active_embedding_source",
+            &serde_json::Value::String("user".to_string()),
+        )
+        .unwrap();
+    }
+
+    /// A stored per-project `source=user` pick no longer overrides the
+    /// global profile — and the retired rows are left in place (never
+    /// deleted). Red against the v0.2.71 cascade, whose leg 1 returned the
+    /// sticky pick verbatim.
     #[test]
-    fn cascade_source_user_is_sticky_over_global() {
+    fn retired_per_project_pick_yields_to_the_global_profile() {
         let db = Db::open_in_memory().unwrap();
-        let pid = seed_bare_project(&db, "Sticky");
-        // Machine-global default is arctic.
+        let pid = seed_bare_project(&db, "Diverged");
         db.app_state_set(APP_STATE_KEY_ACTIVE_EMBEDDING, "arctic").unwrap();
-        // But this project's user pick is openai.
-        write_project_active_embedding_user(&db, &pid, "openai").unwrap();
+        seed_retired_user_pick(&db, &pid, "openai");
 
+        assert_eq!(resolve_active_embedding_cascade(&db), "arctic");
+        assert_eq!(populate(&db, "Diverged", Some(&pid)).active_embedding, "arctic");
+        // The retired rows survive untouched (never drop user data).
         assert_eq!(
-            resolve_active_embedding_cascade(&db, Some(&pid)),
-            "openai",
-            "source=user pick must win over the global default"
+            db.get_setting(&pid, "orchestrator-core", "active_embedding")
+                .unwrap()
+                .and_then(|v| v.as_str().map(String::from))
+                .as_deref(),
+            Some("openai"),
         );
     }
 
-    /// Leg 2: a per-project row marked source=auto INHERITS the global
-    /// default (it does NOT pin its own stored value).
+    /// F6 (W6-I review) made moot: two projects whose RETIRED stored picks
+    /// differ resolve the SAME profile, so they hand the shared KG the same
+    /// target and its record can no longer ping-pong between them.
     #[test]
-    fn cascade_source_auto_inherits_global() {
+    fn projects_with_diverged_stored_picks_resolve_one_profile() {
         let db = Db::open_in_memory().unwrap();
-        let pid = seed_bare_project(&db, "AutoSeed");
-        db.app_state_set(APP_STATE_KEY_ACTIVE_EMBEDDING, "arctic").unwrap();
-        // Backfill-style auto seed: value qwen3 + source=auto.
-        db.set_setting(
-            &pid, ORCHESTRATOR_CORE_MODULE_ID, ACTIVE_EMBEDDING_SETTING_KEY,
-            &serde_json::Value::String("qwen3".to_string()),
-        ).unwrap();
-        db.set_setting(
-            &pid, ORCHESTRATOR_CORE_MODULE_ID, ACTIVE_EMBEDDING_SOURCE_SETTING_KEY,
-            &serde_json::Value::String(ACTIVE_EMBEDDING_SOURCE_AUTO.to_string()),
-        ).unwrap();
-
-        assert_eq!(
-            resolve_active_embedding_cascade(&db, Some(&pid)),
-            "arctic",
-            "source=auto must inherit the machine-global default (arctic), not pin its stored qwen3"
-        );
+        let p1 = seed_bare_project(&db, "One");
+        let p2 = seed_bare_project(&db, "Two");
+        db.app_state_set(APP_STATE_KEY_ACTIVE_EMBEDDING, "qwen3").unwrap();
+        seed_retired_user_pick(&db, &p1, "arctic");
+        seed_retired_user_pick(&db, &p2, "openai");
+        let a = populate(&db, "One", Some(&p1)).active_embedding;
+        let b = populate(&db, "Two", Some(&p2)).active_embedding;
+        assert_eq!(a, "qwen3");
+        assert_eq!(a, b, "one global profile — never a per-project target");
     }
 
-    /// Leg 2 (auto-seeded-qwen3 case): a LEGACY per-project row with NO source
-    /// marker inherits the global default. This is the locked decision that
-    /// fixes the auto-qwen3 bug — the brittle pre-v0.2.71 "==qwen3" heuristic
-    /// is gone; provenance, not value, decides.
-    #[test]
-    fn cascade_legacy_no_marker_inherits_global_auto_seeded_case() {
-        let db = Db::open_in_memory().unwrap();
-        let pid = seed_bare_project(&db, "LegacyAutoSeeded");
-        // Global hardware pick is arctic.
-        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, "snowflake-arctic-embed2:latest")
-            .unwrap();
-        // Legacy backfill stamped qwen3 with NO source companion.
-        db.set_setting(
-            &pid, ORCHESTRATOR_CORE_MODULE_ID, ACTIVE_EMBEDDING_SETTING_KEY,
-            &serde_json::Value::String("qwen3".to_string()),
-        ).unwrap();
-
-        assert_eq!(
-            resolve_active_embedding_cascade(&db, Some(&pid)),
-            "arctic",
-            "legacy no-marker row must inherit the global default (auto-qwen3 fix)"
-        );
-    }
-
-    /// Leg 3: nothing set anywhere → qwen3 floor.
+    /// Empty state → qwen3.
     #[test]
     fn cascade_empty_resolves_qwen3() {
         let db = Db::open_in_memory().unwrap();
-        let pid = seed_bare_project(&db, "Empty");
-        assert_eq!(resolve_active_embedding_cascade(&db, Some(&pid)), "qwen3");
-        // And with no project at all.
-        assert_eq!(resolve_active_embedding_cascade(&db, None), "qwen3");
+        assert_eq!(resolve_active_embedding_cascade(&db), "qwen3");
     }
 
-    /// BRIDGE (B1): a GUI write to the global app_state profile (Identity
-    /// tab) is what a non-user project's cascade resolves to — so a hub read
-    /// (which uses the SAME cascade) can never disagree with the populate /
-    /// projection value. Here: no user pick on the project, global=openai.
+    /// The global profile written by Preferences reaches every project.
     #[test]
-    fn cascade_bridge_global_app_state_reaches_non_user_project() {
+    fn global_profile_reaches_every_project() {
         let db = Db::open_in_memory().unwrap();
         let pid = seed_bare_project(&db, "Bridge");
-        // GUI Identity-tab style global write.
         db.app_state_set(APP_STATE_KEY_ACTIVE_EMBEDDING, "openai").unwrap();
-        // No per-project user pick → inherits global.
-        assert_eq!(resolve_active_embedding_cascade(&db, Some(&pid)), "openai");
-        // populate() (the .env-template surface) agrees.
-        let s = populate(&db, "Bridge", Some(&pid));
-        assert_eq!(s.active_embedding, "openai");
+        assert_eq!(resolve_active_embedding_cascade(&db), "openai");
+        assert_eq!(populate(&db, "Bridge", Some(&pid)).active_embedding, "openai");
     }
 
-    /// The writer stamps source=user, and the read command reports it.
-    #[test]
-    fn picker_write_then_get_reports_user_source() {
-        let db = Db::open_in_memory().unwrap();
-        let pid = seed_bare_project(&db, "Picker");
-        write_project_active_embedding_user(&db, &pid, "arctic").unwrap();
-        // Stored marker is exactly "user".
-        let src = db
-            .get_setting(&pid, ORCHESTRATOR_CORE_MODULE_ID, ACTIVE_EMBEDDING_SOURCE_SETTING_KEY)
-            .unwrap()
-            .unwrap();
-        assert_eq!(src.as_str(), Some("user"));
-        // Cascade returns the picked value.
-        assert_eq!(resolve_active_embedding_cascade(&db, Some(&pid)), "arctic");
-    }
-
-    /// SURVIVES UPDATE: a source=user row + the projected populate() value
-    /// are unchanged after a simulated update that re-runs the backfill
-    /// (the auto-seed must NOT overwrite a user pick) and re-projects env.
-    #[test]
-    fn source_user_survives_simulated_update() {
-        let db = Db::open_in_memory().unwrap();
-        let pid = seed_bare_project(&db, "Survivor");
-        // Machine-global default is qwen3 (the auto-seed would write qwen3).
-        // The user deliberately picked openai.
-        write_project_active_embedding_user(&db, &pid, "openai").unwrap();
-        let before = populate(&db, "Survivor", Some(&pid)).active_embedding;
-        assert_eq!(before, "openai");
-
-        // Simulate an update: re-run the startup backfill (which writes
-        // source=auto seeds for NON-user projects but must leave a user pick
-        // alone) and re-project the env (populate re-derives).
-        let report = crate::project_backfill::backfill_all_projects(&db);
-        assert!(report.errors.is_empty(), "backfill errors: {:?}", report.errors);
-
-        // The user pick + its marker survived...
-        let value = db
-            .get_setting(&pid, ORCHESTRATOR_CORE_MODULE_ID, ACTIVE_EMBEDDING_SETTING_KEY)
-            .unwrap()
-            .unwrap();
-        assert_eq!(value.as_str(), Some("openai"), "user value must survive backfill");
-        let src = db
-            .get_setting(&pid, ORCHESTRATOR_CORE_MODULE_ID, ACTIVE_EMBEDDING_SOURCE_SETTING_KEY)
-            .unwrap()
-            .unwrap();
-        assert_eq!(src.as_str(), Some("user"), "user marker must survive backfill");
-        // ...and the re-projected env value is identical (not stale, re-derived).
-        let after = populate(&db, "Survivor", Some(&pid)).active_embedding;
-        assert_eq!(after, before, "projected ACTIVE_EMBEDDING must be unchanged across update");
-    }
 
     /// Edge: no bindings at all → false (nothing to compare against).
     #[test]

@@ -323,25 +323,6 @@ describe('component + layout wiring (AST)', () => {
     expect(calls(actionButtons[0], 'runAction').length).toBe(1);
   });
 
-  it('the enrichment progress event keeps a listener on its remaining caller', () => {
-    // The retired EnrichmentProgressModal was the only listener for
-    // `vct-enrichment-progress`; the model-switch "Regenerate now" is the
-    // remaining `enrich_collection_vectors` caller, so it listens and renders.
-    const src = readFileSync(resolve(here, '../components/RegenerateOrDeferModal.svelte'), 'utf8');
-    const ast = parse(src, { modern: true }) as unknown as Node;
-    const instance = (ast.instance as Node).content as Node;
-    let regen: Node | null = null;
-    for (const n of walk(instance)) {
-      if (n.type === 'FunctionDeclaration' && isIdent(n.id, 'regenerateModelSwitch')) regen = n;
-    }
-    expect(regen, 'no regenerateModelSwitch()').toBeTruthy();
-    const listens = calls(regen, 'listen').filter(
-      (c) => ((c.arguments as Node[])[0] as Node)?.value === 'vct-enrichment-progress',
-    );
-    expect(listens.length).toBe(1);
-    expect(JSON.stringify(ast.fragment)).toContain('rgd-regen-progress');
-  });
-
   it('the layout schedules the re-scan check at startup and cancels it on teardown', () => {
     const src = readFileSync(resolve(here, '../../routes/+layout.svelte'), 'utf8');
     expect(src).toContain('scheduleStartupCheck(() =>');

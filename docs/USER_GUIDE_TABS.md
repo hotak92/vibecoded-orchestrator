@@ -555,8 +555,7 @@ DB; the binding row is the launcher's record of what those should be.
   - Both default to `weaviate_url = http://localhost:8081`,
     `embedding_dim = 1024`. (They no longer record an embedding model:
     v0.2.102 retired the per-binding KG model pick — the KG embeds with the
-    embedding profile: the global one, or the project's own Settings-tab
-    pick.)
+    one global embedding profile, for every project and the shared KG.)
 - Idempotence: populate **only inserts a binding if no row exists for that role**. User edits to the row survive re-onboarding (in contrast to agents/skills/hooks where `model/file_path/source` get overwritten).
 
 #### Primary vs shared
@@ -608,8 +607,8 @@ Both toggles load on mount and on project change and revert the checkbox on a fa
 | `config` | Reserved JSON blob. |
 
 (The table also has an `embedding_model` column, retired in v0.2.102: the
-per-binding KG model pick is gone — the KG embeds with the embedding profile
-(global, or the project's own Settings-tab pick). Existing values are kept in the DB, but nothing reads or writes
+per-binding KG model pick is gone — the KG embeds with the one global
+embedding profile (Preferences → Embedding profile). Existing values are kept in the DB, but nothing reads or writes
 them.)
 
 #### Duplicate scan

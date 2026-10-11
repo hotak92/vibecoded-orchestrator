@@ -294,7 +294,7 @@ def machine_kg_selections(launcher_db: Path) -> tuple[Optional[KgSelection], lis
         for row in conn.execute("SELECT id, name FROM projects ORDER BY name").fetchall():
             write_all, _rl, arctic = cp._resolve_dual_flags_cascade(conn, row["id"])
             projects.append(KgSelection(
-                active=cp._resolve_active_embedding_cascade(conn, row["id"]),
+                active=cp._resolve_active_embedding_cascade(conn),
                 write_all=write_all, arctic_secondary=arctic,
                 origin=f"project {row['name']}",
             ))
