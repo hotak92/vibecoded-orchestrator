@@ -49,9 +49,11 @@
 //!
 //! Note: the GUI's "model id" string (e.g. `"qwen3-embedding:0.6b"` or
 //! `"openai-text-embedding-3-small"`) is what gets written to
-//! `project_kg_bindings.embedding_model` and to
-//! `app_state.default_text_embedding`. The slot name is metadata that the
-//! Python sync scripts derive from the id.
+//! `app_state.default_text_embedding` (and, for the code graph, to the
+//! codegraph binding). The slot name is metadata that the Python sync
+//! scripts derive from the id. (The per-project KG binding's
+//! `embedding_model` column was retired in v0.2.102 W6-J — one global
+//! embedding setting; nothing reads or writes it anymore.)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -440,9 +442,10 @@ pub async fn get_kg_embed_model_status(
     parse_last_json_line(&stdout, "kg-embed status")
 }
 
-/// Check a model id against the live catalog. Used by the project-binding
-/// save path (`set_project_kg_binding`, `set_project_codegraph_binding`)
-/// to reject names the machine can't currently serve.
+/// Check a model id against the live catalog. Used by the codegraph
+/// binding save path (`set_project_codegraph_binding`) to reject names the
+/// machine can't currently serve. (The KG binding save no longer takes a
+/// model — v0.2.102 W6-J retired the per-project KG model pick.)
 ///
 /// "Currently serve" is `available_now=true` AND the model id is present
 /// in the relevant list (text vs code). An entry whose

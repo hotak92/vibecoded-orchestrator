@@ -1352,7 +1352,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &JsonValue::Null,
         )
         .expect("set primary binding");
@@ -1485,7 +1484,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &JsonValue::Null,
         )
         .expect("set base primary");
@@ -1583,7 +1581,6 @@ mod tests {
             project_id,
             "primary",
             collection,
-            None,
             None,
             None,
             None,

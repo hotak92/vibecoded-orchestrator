@@ -27,7 +27,7 @@
   // VCO_BRAND_REFERENCE.md.
 
   import { onMount, onDestroy } from 'svelte';
-  import { invoke } from '$lib/tauri';
+  import { invoke, listen } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import {
     pickKeepCandidate,
@@ -124,6 +124,12 @@
     detail: '',
     error: null,
   });
+
+  // v0.2.102 W6-J: the streaming enrichment's per-batch progress
+  // (`vct-enrichment-progress`, emitted by `enrich_collection_vectors`) is
+  // shown while "Regenerate now" runs. Its previous listener was the
+  // EnrichmentProgressModal, retired with the per-project KG model picker.
+  let regenProgress = $state('');
 
   const anyBusy = $derived(
     artifacts.some((a) => rows[a.artifact_name]?.busy) || switchState.busy,
@@ -330,8 +336,8 @@
   /**
    * R1 HIGH fix — the pure model-switch "Regenerate now": enrich the project's
    * KG collection into the new profile's named-vector slot. Uses the existing
-   * streaming `enrich_collection_vectors` command (the same one the
-   * EnrichmentProgressModal drives). `collection` + `targetSlot` are resolved
+   * streaming `enrich_collection_vectors` command (the one the retired
+   * EnrichmentProgressModal drove, until v0.2.102 W6-J). `collection` + `targetSlot` are resolved
    * server-side (from the canonical TEXT_SLOT_MAP) and carried on the
    * ModelSwitchContext. If either is missing (probe soft-failed) we cannot
    * regenerate — surface that and leave Keep/Defer available.
@@ -351,6 +357,22 @@
       return;
     }
     switchState = { ...switchState, busy: true, error: null };
+    regenProgress = '';
+    let unlisten: (() => void) | null = null;
+    try {
+      unlisten = await listen<{ collection: string; new_slot: string; progress: number; message: string }>(
+        'vct-enrichment-progress',
+        (e) => {
+          const p = e.payload;
+          if (!p || p.collection !== collection || p.new_slot !== targetSlot) return;
+          const pct = Math.round(Math.max(0, Math.min(1, p.progress)) * 100);
+          regenProgress = p.message ? `${pct}% — ${p.message}` : `${pct}%`;
+        },
+      );
+    } catch (e) {
+      // Non-fatal: the re-embed still runs, only the running line is missing.
+      console.warn('[vct] enrichment progress listener failed', e);
+    }
     try {
       await invoke('enrich_collection_vectors', {
         collectionName: collection,
@@ -376,6 +398,9 @@
       toast.error(
         `Regenerate failed: ${e instanceof Error ? e.message : String(e)}`,
       );
+    } finally {
+      unlisten?.();
+      regenProgress = '';
     }
   }
 
@@ -439,6 +464,9 @@
           </p>
         {/if}
 
+        {#if switchState.busy && regenProgress}
+          <div class="rgd-progress" data-testid="rgd-regen-progress">{regenProgress}</div>
+        {/if}
         {#if switchState.error}
           <div class="rgd-error">{switchState.error}</div>
         {/if}
@@ -702,6 +730,11 @@
   }
   .rgd-warn strong {
     color: var(--color-pink, #ff4fa0);
+  }
+  .rgd-progress {
+    margin: 8px 0;
+    font-size: 11px;
+    color: rgb(0, 191, 166);
   }
   .rgd-error {
     margin: 8px 0;

@@ -137,7 +137,6 @@ fn backfill_one_project(
             &project.id,
             "primary",
             &collection_name,
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,            // kg_dir_path — resolved from project_path at read time
             None,            // weaviate_url — falls through to global default
@@ -311,7 +310,6 @@ mod tests {
             &pid,
             "primary",
             "Custom_UserChosen_KG",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,

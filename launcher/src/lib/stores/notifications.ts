@@ -6,7 +6,12 @@
 // errors (failed module install, container start failure, etc.) often
 // vanish before the user reads them. This store keeps a durable copy of
 // every error toast so the user can review them later from the bell in
-// the RightSidebar, copy the text, or dismiss them.
+// the MenuBar, copy the text, or dismiss them.
+//
+// v0.2.102 W6-J: the same inbox also carries INFO alerts with action
+// buttons (`upsertAlert`, tone 'info') — state-of-the-world heads-ups like
+// "these projects' KGs may need a duplicate re-scan" (kg-rescan-alerts.ts),
+// where a re-check REPLACES the entry rather than counting occurrences.
 //
 // Auto-resolution (mixed strategy, per a contributor 2026-06-05):
 //   1. Dedup by `key`: two errors with the same key collapse into one
@@ -23,6 +28,15 @@
 
 import { writable, derived } from 'svelte/store';
 
+/** One actionable button on an info alert (v0.2.102 W6-J). The command is a
+ *  Tauri command name; the panel that renders it narrows it to the literal
+ *  union it supports so the invoke-name census still sees the names. */
+export interface NotificationAction {
+  label: string;
+  command: string;
+  args?: Record<string, unknown>;
+}
+
 export interface ErrorNotification {
   id: number;
   /** Resolution/dedup key. Falls back to the message text when absent. */
@@ -33,6 +47,10 @@ export interface ErrorNotification {
   lastSeen: number;
   /** How many times this same error fired (dedup counter). */
   count: number;
+  /** 'error' (default, red styling) or 'info' (a heads-up, calmer tint). */
+  tone?: 'error' | 'info';
+  /** Actionable buttons (info alerts) — each runs one Tauri command. */
+  actions?: NotificationAction[];
 }
 
 const items = writable<ErrorNotification[]>([]);
@@ -83,14 +101,69 @@ function dismiss(id: number): void {
   items.update((list) => list.filter((n) => n.id !== id));
 }
 
+/**
+ * Insert or refresh an ACTIONABLE alert (v0.2.102 W6-J — the KG re-scan
+ * heads-up). Unlike `record` (an error happened; dedup counts), an alert
+ * describes CURRENT state: a re-check REPLACES the message and the action
+ * list under the same key and never bumps a count. Clear it with
+ * `resolve(key)` when nothing qualifies anymore.
+ */
+function upsertAlert(
+  entry: { key: string; message: string; actions?: NotificationAction[] },
+  now: number,
+): void {
+  items.update((list) => {
+    const existing = list.find((n) => n.key === entry.key);
+    if (existing) {
+      return list.map((n) =>
+        n.key === entry.key
+          ? { ...n, message: entry.message, tone: 'info' as const, actions: entry.actions, lastSeen: now }
+          : n,
+      );
+    }
+    return [
+      ...list,
+      {
+        id: nextId++,
+        key: entry.key,
+        message: entry.message,
+        firstSeen: now,
+        lastSeen: now,
+        count: 1,
+        tone: 'info' as const,
+        actions: entry.actions,
+      },
+    ];
+  });
+}
+
+/**
+ * One action of an alert ran successfully — drop just that action. When the
+ * last action goes, the alert goes with it (nothing left to act on).
+ */
+function dropAction(id: number, label: string): void {
+  items.update((list) =>
+    list.flatMap((n) => {
+      if (n.id !== id) return [n];
+      const before = n.actions ?? [];
+      const actions = before.filter((a) => a.label !== label);
+      if (actions.length === before.length) return [n];
+      if (actions.length === 0) return [];
+      return [{ ...n, actions }];
+    }),
+  );
+}
+
 /** Clear every stored error (the panel's "Clear all"). */
 function clearAll(): void {
   items.update(() => []);
 }
 
-/** Live count for the bell badge. */
+/** Live ERROR count for the bell badge. Info alerts (W6-J `upsertAlert`) are
+ *  not errors — the bell counts them separately — so they never inflate this
+ *  (an info-only inbox must not read "1 error"). */
 export const errorCount = derived(items, ($items) =>
-  $items.reduce((sum, n) => sum + n.count, 0),
+  $items.reduce((sum, n) => (n.tone === 'info' ? sum : sum + n.count), 0),
 );
 
 export const notifications = {
@@ -99,4 +172,6 @@ export const notifications = {
   resolve,
   dismiss,
   clearAll,
+  upsertAlert,
+  dropAction,
 };

@@ -124,6 +124,10 @@ def kgenv(tmp_path, monkeypatch):
     monkeypatch.setattr(esf, "declared_slots", lambda name, url: set(KG_SLOTS) if name in state.colls else None)
     monkeypatch.setattr(esf, "object_count", lambda name, url: len(state.colls[name].objs) if name in state.colls else 0)
     monkeypatch.setattr(esf, "sample_common_vectors", lambda name, url, limit: {})
+    # W6-J: the per-slot population seam (sample_common_vectors delegates to
+    # it). raising=False so this fixture also runs against the pre-W6-J source
+    # (red-proofs), where the seam does not exist yet.
+    monkeypatch.setattr(esf, "sample_slot_population", lambda name, url, limit: ({}, 0), raising=False)
     monkeypatch.setattr(ee, "_http_get_schema", lambda name, url: {"vectorConfig": {s: {} for s in KG_SLOTS}})
     monkeypatch.setattr(ee, "_estimate_object_count", lambda name: len(state.colls[name].objs))
     state.client = lambda: FakeClient(state.colls)
@@ -301,6 +305,8 @@ def test_no_record_reads_the_complete_slot_off_live_data(kgenv, monkeypatch):
     """A collection embedded before v0.2.102 has no record; a reader samples
     it, so a switch made before this release still searches the populated
     slot instead of the empty new one."""
+    monkeypatch.setattr(esf, "sample_slot_population",
+                        lambda name, url, limit: ({"qwen3_embed": (1024, 3)}, 3), raising=False)
     monkeypatch.setattr(esf, "sample_common_vectors", lambda name, url, limit: {"qwen3_embed": 1024})
     res = kem.resolve_kg_model(COLL, role="query")
     assert res.model == QWEN3 and res.source == kem.SOURCE_LIVE
@@ -470,3 +476,157 @@ def test_kg_sync_all_fills_before_the_walk_and_settles_after(tmp_path, monkeypat
             contextlib.redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
         mod.main()
     assert order == ["node", ("after", False)], "a scoped run never embeds a whole collection"
+
+
+# ─── W6-J F1: the no-record window (review 2026-10-11) ─────────────────
+#
+# A collection indexed before v0.2.102 has no record, and the bundle self-heal
+# that would stamp one soft-fails when Weaviate is down at update time. If the
+# user then switches profile and edits a node before any whole-tree sync, the
+# scoped run must STILL keep the node in the slot searches read (carry off the
+# live sample) and leave the ledger row that schedules the fill.
+
+
+def test_no_record_scoped_edit_carries_the_sampled_slot_and_emits_the_row(kgenv, tmp_path, monkeypatch):
+    """The exact F1 scenario: no record (pre-v0.2.102 collection, stamp
+    skipped) + a profile switch + a scoped edit. Pre-fix the rewrite stored
+    the TARGET's vector only (dropping the node from the slot searches read)
+    and no `kg_embed_fill_pending` row was emitted, so nothing scheduled the
+    fill."""
+    from vco_lib.deferral_report import DeferralReport
+
+    folder = tmp_path / "proj"
+    (folder / ".claude").mkdir(parents=True)
+    _qwen3_collection(kgenv)  # 3 objects, qwen3_embed only; NO record stamped
+    # The live sample (paid once per process) sees qwen3 on every object.
+    monkeypatch.setattr(esf, "sample_slot_population",
+                        lambda name, url, limit: ({"qwen3_embed": (1024, 3)}, 3), raising=False)
+    monkeypatch.setattr(esf, "sample_common_vectors", lambda name, url, limit: {"qwen3_embed": 1024})
+    ollama = FakeOllama()
+
+    slots = kem.complete_write_vectors(_svc(ARCTIC, ollama), {"arctic2_embed": [1.0]}, "body", COLL)
+    assert set(slots) == {"arctic2_embed", "qwen3_embed"}, \
+        "a scoped rewrite with no record must carry the slot the sample shows"
+    assert (QWEN3, "body") in ollama.calls, "the carry embeds with the recorded (sampled) model"
+    assert kem.read_record(COLL) is None, "a sample is never stamped as the record"
+
+    kem.after_walk([COLL], folder, _svc(ARCTIC, ollama), full_tree=False)
+    report = DeferralReport.read(folder)
+    assert report and report.has_condition(kem.DEFERRAL_CID), \
+        "a scoped run that finds the fill owed (live sample) must emit the ledger row"
+
+
+def test_one_target_only_rewrite_does_not_blind_the_live_read(kgenv, monkeypatch):
+    """F1's second half: after ONE node was rewritten target-only, the
+    sample's every-object intersection is empty. The live read must follow
+    the slot a MAJORITY of the sample still holds — falling to the target
+    would search the new, nearly-empty slot (the defect W6-I exists to kill)."""
+    _qwen3_collection(kgenv)
+    # Post-rewrite sample: 2 objects qwen3-only, 1 object arctic2-only.
+    monkeypatch.setattr(
+        esf, "sample_slot_population",
+        lambda name, url, limit: ({"qwen3_embed": (1024, 2), "arctic2_embed": (1024, 1)}, 3),
+        raising=False)
+    # The pre-fix seam reads an empty intersection for the same sample.
+    monkeypatch.setattr(esf, "sample_common_vectors", lambda name, url, limit: {})
+
+    rec = kem.record_from_live(COLL, ARCTIC)
+    assert rec is not None and rec.model == QWEN3, "the majority slot is the live record"
+    res = kem.resolve_kg_model(COLL, role="query")
+    assert res.model == QWEN3 and res.source == kem.SOURCE_LIVE, \
+        "searches must NOT fall to the target off an empty intersection"
+
+
+def test_live_read_still_prefers_a_complete_target_and_refuses_a_split_sample(kgenv, monkeypatch):
+    """The quorum changes nothing when the target's slot really is populated
+    on every sampled object (a finished switch), and a sample with NO majority
+    slot gives no verdict (the pre-fix behaviour — never a guess)."""
+    monkeypatch.setattr(esf, "sample_slot_population",
+                        lambda name, url, limit: ({"arctic2_embed": (1024, 3),
+                                                   "qwen3_embed": (1024, 3)}, 3), raising=False)
+    monkeypatch.setattr(esf, "sample_common_vectors",
+                        lambda name, url, limit: {"arctic2_embed": 1024, "qwen3_embed": 1024})
+    rec = kem.record_from_live(COLL, ARCTIC)
+    assert rec is not None and rec.model == ARCTIC, "a complete target slot stays preferred"
+
+    kem._LIVE_CACHE.clear()
+    monkeypatch.setattr(esf, "sample_slot_population",
+                        lambda name, url, limit: ({"arctic2_embed": (1024, 1),
+                                                   "qwen3_embed": (1024, 1)}, 3), raising=False)
+    monkeypatch.setattr(esf, "sample_common_vectors", lambda name, url, limit: {})
+    assert kem.record_from_live(COLL, ARCTIC) is None, "no majority → no verdict (no guess)"
+
+
+def test_inline_fallback_labels_the_vector_with_the_model_that_made_it(monkeypatch):
+    """F2 (W6-I review): with no EmbeddingService in hand, the inline leg of
+    the MCP's `_get_all_kg_embeddings` stored the vector
+    `server.get_ollama_embedding` returned under the hardcoded label
+    "qwen3_embed" — but that call embeds `server.EMBEDDING_MODEL`, so on a
+    non-qwen3 profile another model's vector was stored under the qwen3 slot.
+    The label now follows the model that PRODUCED the vector."""
+    import weaviate_mcp.server as srv
+    from vco_lib.embedding_service import DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV
+
+    monkeypatch.setattr(srv, "_get_embedding_service", lambda: None)
+    monkeypatch.delenv(DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV, raising=False)
+
+    async def _fake_ollama(text):  # embeds server.EMBEDDING_MODEL, as the real one does
+        return [0.7, 0.7, 0.7]
+
+    monkeypatch.setattr(srv, "get_ollama_embedding", _fake_ollama)
+
+    monkeypatch.setattr(srv, "EMBEDDING_MODEL", ARCTIC)
+    vectors = asyncio.run(srv._get_all_kg_embeddings("node text"))
+    assert list(vectors) == ["arctic2_embed"], "an arctic vector is never labelled qwen3"
+
+    monkeypatch.setattr(srv, "EMBEDDING_MODEL", QWEN3)
+    vectors = asyncio.run(srv._get_all_kg_embeddings("node text"))
+    assert list(vectors) == ["qwen3_embed"], "the default profile's label is unchanged"
+
+
+def test_inline_fallback_secondary_never_overwrites_the_active_slot(monkeypatch):
+    """F2 follow-through: with dual-write ON, a profile whose model maps to
+    the legacy `ollama_embed` slot (nomic, mxbai) must keep ITS vector there —
+    the legacy arctic vector the same leg gathers is not allowed to replace
+    it (the row would then hold another model's vector under the active
+    model's slot, the exact mislabel F2 closes)."""
+    import weaviate_mcp.server as srv
+    from vco_lib.embedding_service import DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV
+
+    monkeypatch.setattr(srv, "_get_embedding_service", lambda: None)
+    monkeypatch.setenv(DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV, "1")
+
+    async def _active(text):
+        return [0.1, 0.1]
+
+    async def _legacy(text):
+        return [0.9, 0.9]
+
+    async def _openai(text):
+        return None
+
+    monkeypatch.setattr(srv, "get_ollama_embedding", _active)
+    monkeypatch.setattr(srv, "get_legacy_text_embedding", _legacy)
+    monkeypatch.setattr(srv, "get_openai_embedding", _openai)
+    monkeypatch.setattr(srv, "EMBEDDING_MODEL", "nomic-embed-text")
+    vectors = asyncio.run(srv._get_all_kg_embeddings("node text"))
+    assert vectors == {"ollama_embed": [0.1, 0.1]}, \
+        "the active model's vector keeps its slot; the legacy one does not replace it"
+
+
+def test_status_counts_objects_only_for_an_unrecorded_collection(kgenv):
+    """W6-J: the launcher's re-scan alert must tell a stored-but-unrecorded KG
+    (its stamp failed, or no slot is complete) from an empty/absent one (a
+    fresh project, an unused development collection) — "no record" alone
+    describes both, and an alert on the empty one would never clear."""
+    _qwen3_collection(kgenv)  # 3 objects, no record
+    st = kem.collection_status(COLL, ARCTIC)
+    assert st["recorded_model"] is None and st["objects"] == 3
+
+    empty = kem.collection_status("Acme_Development", ARCTIC)
+    assert empty["recorded_model"] is None and empty["objects"] == 0
+
+    kem.write_record(COLL, kem.KgModelRecord(QWEN3, 1024, "qwen3_embed"))
+    assert kem.collection_status(COLL, ARCTIC)["objects"] is None, \
+        "a recorded collection is not counted for this field"
+    assert kem.collection_status("Acme_Development", ARCTIC, count=False)["objects"] is None

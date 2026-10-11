@@ -1186,13 +1186,18 @@ async fn project_config(
     codegraph_access_list.sort();
     codegraph_access_list.dedup();
 
-    // Embeddings: from binding rows when present, otherwise the
-    // launcher's compiled defaults.
-    let text_embedding = kg_bindings
-        .iter()
-        .find(|b| b.role == "primary")
-        .and_then(|b| b.embedding_model.clone())
-        .unwrap_or_else(|| "qwen3-embedding:0.6b".to_string());
+    // Embeddings: the code leg is the codegraph binding's record; the text
+    // leg is the project's RESOLVED active profile's model. (Until v0.2.102
+    // W6-J the text leg read `project_kg_bindings.embedding_model` — the
+    // retired per-project KG model pick: one global embedding setting now.
+    // The match mirrors the SSOT `vco_lib/embedding_selection.py::
+    // model_id_for_active` — keep them equal.)
+    let text_embedding = match active_embedding.as_str() {
+        "arctic" => "snowflake-arctic-embed2:latest",
+        "openai" => "text-embedding-3-small",
+        _ => "qwen3-embedding:0.6b",
+    }
+    .to_string();
     let code_embedding = cg_binding
         .as_ref()
         .and_then(|b| b.embedding_model.clone())
@@ -1916,7 +1921,6 @@ mod tests {
                 id,
                 "primary",
                 &format!("{}_KnowledgeGraph", capitalize(slug)),
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -1929,7 +1933,6 @@ mod tests {
                 id,
                 "shared",
                 "VibeCodedOrchestrator_KnowledgeGraph",
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -1942,7 +1945,6 @@ mod tests {
                 id,
                 "archive",
                 &format!("{}_Development", capitalize(slug)),
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -2018,7 +2020,6 @@ mod tests {
                 id,
                 "primary",
                 &format!("{}_KnowledgeGraph", capitalize(slug)),
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -2287,7 +2288,6 @@ mod tests {
                 project_id,
                 "primary",
                 "MyCustomKG_KnowledgeGraph",
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -2299,7 +2299,6 @@ mod tests {
                 project_id,
                 "shared",
                 "VibeCodedOrchestrator_KnowledgeGraph",
-                Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
                 None,
@@ -2354,7 +2353,6 @@ mod tests {
                 project_id,
                 "primary",
                 "WeirdName_Custom",
-                None,
                 None,
                 None,
                 None,
@@ -3266,7 +3264,6 @@ kg_tier_full = 0.8
             "root-id",
             "primary",
             "VCODev_KnowledgeGraph",
-            None,
             None,
             None,
             None,
@@ -4386,7 +4383,6 @@ kg_tier_full = 0.8
             project_id,
             "primary",
             "VibeCodedOrchestrator_KnowledgeGraph", // capital-C canonical
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4397,7 +4393,6 @@ kg_tier_full = 0.8
             project_id,
             "shared",
             "VibeCodedOrchestrator_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4629,7 +4624,6 @@ kg_tier_full = 0.8
             project_id,
             "primary",
             "FreshProject_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4680,7 +4674,6 @@ kg_tier_full = 0.8
             project_id,
             "primary",
             "Unreach_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4795,7 +4788,6 @@ kg_tier_full = 0.8
             "p-root",
             "primary",
             "RootOwned_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4816,7 +4808,6 @@ kg_tier_full = 0.8
             id,
             "primary",
             "NoSharedRow_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4857,7 +4848,6 @@ kg_tier_full = 0.8
             id,
             "primary",
             "UnresolvableShared_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -4993,7 +4983,6 @@ kg_tier_full = 0.8
             phantom_id,
             "primary",
             "Phantom_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -5007,7 +4996,6 @@ kg_tier_full = 0.8
             phantom_id,
             "shared",
             "PhantomShared_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -5071,7 +5059,6 @@ kg_tier_full = 0.8
             healthy_id,
             "primary",
             "Existing_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -5084,7 +5071,6 @@ kg_tier_full = 0.8
             healthy_id,
             "shared",
             "Existing_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,

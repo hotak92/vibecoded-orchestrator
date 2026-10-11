@@ -2,7 +2,7 @@
   // SPDX-License-Identifier: AGPL-3.0-or-later
   // v0.2.18 (Plan C): Re-analyze code-graph progress modal.
   //
-  // Forks `EnrichmentProgressModal` for the analyze_code_graph.py
+  // Forked from `EnrichmentProgressModal` (retired v0.2.102 W6-J) for the analyze_code_graph.py
   // re-walk that Plan C wires onto the user-clickable "Re-analyze code
   // graph" button. Differences vs the enrichment modal:
   //

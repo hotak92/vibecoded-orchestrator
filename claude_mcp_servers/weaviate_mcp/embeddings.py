@@ -517,30 +517,43 @@ async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
     # ALWAYS populated every reachable slot, so a project that deliberately
     # left dual-write OFF still got the secondary slots written whenever the
     # service happened to be down — an inconsistency with the primary path.
-    # The active slot (qwen3_embed here) is ALWAYS written; only the secondary
-    # fan-out is gated.
+    # The active slot is ALWAYS written; only the secondary fan-out is gated.
+    #
+    # W6-J (review F2): the active vector is labelled with the slot of the
+    # model that PRODUCED it. `get_ollama_embedding` embeds
+    # `server.EMBEDDING_MODEL` — qwen3 only on a qwen3 profile — so the
+    # hardcoded "qwen3_embed" label this leg used to write stored another
+    # model's vector under the qwen3 slot on a non-qwen3 profile. A failure
+    # of that call raises (it answers a vector or nothing), so a row whose
+    # active slot never came back is never stored here either. The label
+    # comes from the ONE text slot map (`kg_embed_model.text_model_slot`,
+    # the same resolver the record/fill machinery uses), and a secondary
+    # vector never overwrites the active slot (a profile whose model maps to
+    # the legacy `ollama_embed` slot — mxbai, nomic — would otherwise have
+    # its own vector replaced by the legacy arctic one).
     from vco_lib.embedding_service import _resolve_write_all_slots
+    from vco_lib.kg_embed_model import text_model_slot
     _write_all = _resolve_write_all_slots()
 
     if _write_all:
-        qwen3_vec, legacy_vec, openai_vec = await asyncio.gather(
-            server.get_ollama_embedding(text),         # qwen3-embedding (new primary)
+        active_vec, legacy_vec, openai_vec = await asyncio.gather(
+            server.get_ollama_embedding(text),         # the ACTIVE text model
             server.get_legacy_text_embedding(text),     # snowflake-arctic-embed2 (legacy)
             server.get_openai_embedding(text),
         )
     else:
         # Toggle OFF: only the active slot. Mirrors the primary path's
         # single-entry return.
-        qwen3_vec = await server.get_ollama_embedding(text)
+        active_vec = await server.get_ollama_embedding(text)
         legacy_vec = None
         openai_vec = None
     vectors: dict[str, list[float]] = {}
-    if qwen3_vec:
-        vectors["qwen3_embed"] = qwen3_vec
+    if active_vec:
+        vectors[text_model_slot(server.EMBEDDING_MODEL)[0]] = active_vec
     if legacy_vec:
-        vectors["ollama_embed"] = legacy_vec
+        vectors.setdefault("ollama_embed", legacy_vec)
     if openai_vec:
-        vectors["openai_embed"] = openai_vec
+        vectors.setdefault("openai_embed", openai_vec)
     return vectors
 
 

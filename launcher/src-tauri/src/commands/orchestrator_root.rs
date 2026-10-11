@@ -433,11 +433,10 @@ fn ensure_orchestrator_root_kg_binding(db: &Db, root_id: &str) {
         root_id,
         "primary",
         &collection_name,
-        // embedding_model / dim / kg_dir / weaviate_url / config left
+        // embedding_dim / kg_dir / weaviate_url / config left
         // None — defaults inherit from launcher.toml env block. The
         // binding's job is to declare ownership of the collection
         // name; the embedding/host knobs live in the global config.
-        None,
         None,
         None,
         None,
@@ -863,7 +862,6 @@ mod tests {
             &root_id,
             "primary",
             "VCODev_KnowledgeGraph",
-            None,
             None,
             None,
             None,

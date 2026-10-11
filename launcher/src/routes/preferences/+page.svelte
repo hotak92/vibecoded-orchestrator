@@ -2295,8 +2295,9 @@
 
     <!--
       Default embedding models for new projects (v0.2.18 Commit 8).
-      App-level — applies to projects created from now on. Existing
-      projects keep their per-binding model. Populated from the live
+      App-level. (v0.2.102 W6-J: the text default no longer seeds a
+      per-binding KG model — that column is retired; the KG embeds with the
+      global profile this save also stamps.) Populated from the live
       catalog so users can only pick what their machine can serve;
       unavailable models render greyed-out with a tooltip explaining
       why. Per the v0.2.18 locked rule (no-auto-switch), this is the
@@ -2317,10 +2318,11 @@
       {/if}
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
-          <strong>Default text embedding for new projects</strong>
+          <strong>Text embedding (KG, every project)</strong>
           <span class="pr-onboarding-hint">
-            Applied to the KG binding when you create a new project. Existing
-            projects are not affected. Greyed-out options are unreachable
+            The KG embedding model is one global setting for every project
+            and the shared KG (a project whose own profile was picked on its
+            Settings tab keeps that pick). Greyed-out options are unreachable
             from this machine.
             <!-- v0.2.102 W6-B (F3/F5): the save is NOT local — the backend
                  also stamps the global embedding profile and re-projects

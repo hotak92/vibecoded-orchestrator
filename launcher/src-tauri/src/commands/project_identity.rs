@@ -251,17 +251,13 @@ pub fn update_project_identity_with_db(
         }
 
         // Preserve any non-collection-name fields on the existing primary
-        // binding (embedding model, weaviate URL, etc.). Falls through to
+        // binding (embedding dim, weaviate URL, etc.). Falls through to
         // populate-time defaults when no row exists yet.
         let existing = db
             .list_project_kg_bindings(project_id)
             .ok()
             .and_then(|bindings| bindings.into_iter().find(|b| b.role == "primary"));
 
-        let embedding_model = existing
-            .as_ref()
-            .and_then(|b| b.embedding_model.clone())
-            .unwrap_or_else(|| "qwen3-embedding:0.6b".to_string());
         let embedding_dim = existing.as_ref().and_then(|b| b.embedding_dim).unwrap_or(1024);
         // v0.2.97: carry an existing value through the rename, never invent
         // one — a binding's Weaviate URL is not read (the machine row is), and
@@ -272,7 +268,6 @@ pub fn update_project_identity_with_db(
             project_id,
             "primary",
             new_kg,
-            Some(&embedding_model),
             Some(embedding_dim),
             existing.as_ref().and_then(|b| b.kg_dir_path.as_deref()),
             weaviate_url.as_deref(),

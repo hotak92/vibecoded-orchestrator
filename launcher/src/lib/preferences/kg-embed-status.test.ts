@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// v0.2.102 W6-I — the KG embedding-model status + duplicate-scan skip list.
+// v0.2.102 W6-I — the KG embedding-model status. (W6-J moved the duplicate
+// scan to the project's KG tab — project-state/kg-duplicates.test.ts covers
+// it — and kept this panel to the per-collection fill status.)
 //
-// Three layers:
-//   1. the helpers DRIVE the real invokes (injected `invoke`) and phrase the
-//      payloads (fill progress, the "objects missing the vector" why);
-//   2. the TS payload types mirror the Rust structs field-for-field, so a
-//      field the scanner emits cannot silently vanish between Rust and the
-//      GUI (W6-H's `objects_missing_vector` was dropped by the Rust payload
-//      before this lane);
-//   3. AST wiring: the component loads the status on mount, its button runs
-//      the scan, the skip list renders from `objects_missing_vector`, and
-//      the Preferences page mounts the component.
+// Two layers:
+//   1. the helper DRIVES the real invoke (injected `invoke`) and phrases the
+//      fill progress;
+//   2. AST wiring: the component loads the status on mount, and the
+//      Preferences page mounts it.
 // WHAT IT DOES NOT PROVE: real-DOM click delivery (no DOM harness in this
 // suite) and the Python answers (tests/test_v02102_kg_embed_model.py).
 
@@ -20,17 +17,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { parse } from 'svelte/compiler';
-import { sourceFile } from '../test-support/source-census';
-import { isIdent, rustStructFields, tsInterfaceFields, walk } from '../test-support/wiring-ast';
-import {
-  hasSlotsText,
-  kgEmbedFillText,
-  loadKgEmbedStatus,
-  missingVectorExplanation,
-  runDuplicateScan,
-  type KgEmbedCollection,
-  type MissingVectorObject,
-} from './kg-embed-status';
+import { isIdent, walk } from '../test-support/wiring-ast';
+import { kgEmbedFillText, loadKgEmbedStatus, type KgEmbedCollection } from './kg-embed-status';
 
 const here = dirname(fileURLToPath(import.meta.url));
 type Node = Record<string, unknown>;
@@ -47,6 +35,7 @@ function recordingInvoke(result: unknown) {
 const base: KgEmbedCollection = {
   collection: 'Acme_KnowledgeGraph',
   recorded_model: 'qwen3-embedding:0.6b',
+  objects: null,
   target_model: 'snowflake-arctic-embed2:latest',
   filling: true,
   filled: null,
@@ -62,12 +51,6 @@ describe('helpers drive the real commands', () => {
     const out = await loadKgEmbedStatus(d);
     expect(d.calls).toEqual([['get_kg_embed_model_status', undefined]]);
     expect(out.projects).toEqual([]);
-  });
-
-  it('runDuplicateScan invokes kg_check_duplicates with the project id', async () => {
-    const d = recordingInvoke({ threshold: 0.95, pairs: [], nodes_skipped: 0, objects_missing_vector: [] });
-    await runDuplicateScan('p-1', d);
-    expect(d.calls).toEqual([['kg_check_duplicates', { projectId: 'p-1' }]]);
   });
 });
 
@@ -94,41 +77,6 @@ describe('fill progress text', () => {
   });
 });
 
-describe('the duplicate scan skip list', () => {
-  const objs: MissingVectorObject[] = [
-    { uuid: 'u1', title: 'Node A', path: 'knowledge/a.md', target_vector: 'qwen3_embed', has_slots: ['arctic2_embed'] },
-    { uuid: 'u2', title: 'Node B', path: 'knowledge/b.md', target_vector: 'qwen3_embed', has_slots: [] },
-  ];
-  it('explains why the objects were not compared and names the slot', () => {
-    const why = missingVectorExplanation(objs);
-    expect(why).toContain('2 object(s)');
-    expect(why).toContain('qwen3_embed');
-    expect(why).toContain('could not compare');
-  });
-  it('no objects → no explanation', () => {
-    expect(missingVectorExplanation([])).toBe('');
-  });
-  it('names the slots each object DOES carry', () => {
-    expect(hasSlotsText(objs[0])).toBe('has: arctic2_embed');
-    expect(hasSlotsText(objs[1])).toBe('has no vector at all');
-  });
-});
-
-describe('TS payload types mirror the Rust structs', () => {
-  const rustSrc = sourceFile(
-    'orchestrator_core.rs',
-    readFileSync(resolve(here, '../../../src-tauri/src/commands/orchestrator_core.rs'), 'utf8'),
-    'rust',
-  ).text;
-  const tsSrc = readFileSync(resolve(here, 'kg-embed-status.ts'), 'utf8');
-  it.each(['MissingVectorObject', 'DuplicateScanResult'])('%s field sets are identical', (name) => {
-    const rust = rustStructFields(rustSrc, name);
-    const ts = tsInterfaceFields(tsSrc, name);
-    expect(rust.length).toBeGreaterThan(0);
-    expect([...ts].sort()).toEqual([...rust].sort());
-  });
-});
-
 describe('component + page wiring (AST)', () => {
   const src = readFileSync(resolve(here, 'KgEmbedStatus.svelte'), 'utf8');
   const ast = parse(src, { modern: true }) as unknown as Node;
@@ -149,24 +97,9 @@ describe('component + page wiring (AST)', () => {
     expect(calls(mounts[0], 'refresh').length).toBe(1);
   });
 
-  it('the button runs scan(), and scan() runs the duplicate scan', () => {
-    expect(calls(fn('scan'), 'runDuplicateScan').length).toBe(1);
-    const buttons = [...walk(fragment)].filter((n) => n.type === 'RegularElement' && n.name === 'button');
-    expect(buttons.length).toBe(1);
-    const onclick = (buttons[0].attributes as Node[]).find((a) => a.name === 'onclick');
-    expect(onclick, 'button has no onclick').toBeTruthy();
-    expect(calls(onclick, 'scan').length).toBe(1);
-  });
-
-  it('the skip list renders from objects_missing_vector, with the explanation', () => {
-    const eachOverMissing = [...walk(fragment)].filter((n) => {
-      if (n.type !== 'EachBlock') return false;
-      const e = n.expression as Node;
-      return e?.type === 'MemberExpression' && isIdent(e.property, 'objects_missing_vector');
-    });
-    expect(eachOverMissing.length).toBe(1);
-    expect(calls(fragment, 'missingVectorExplanation').length).toBe(1);
-    expect(calls(fragment, 'hasSlotsText').length).toBe(1);
+  it('W6-J: the duplicate scan is gone from Preferences (it lives on the KG tab now)', () => {
+    expect(calls(instance, 'runDuplicateScan').length).toBe(0);
+    expect([...walk(fragment)].filter((n) => n.type === 'RegularElement' && n.name === 'button').length).toBe(0);
   });
 
   it('the Preferences page mounts <KgEmbedStatus />', () => {

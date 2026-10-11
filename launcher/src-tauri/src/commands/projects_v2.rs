@@ -7393,7 +7393,6 @@ mod tests {
             &pid,
             "primary",
             "Acme_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,

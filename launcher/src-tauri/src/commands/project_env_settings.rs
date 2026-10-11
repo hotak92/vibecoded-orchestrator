@@ -1472,7 +1472,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &serde_json::json!({}),
         )
         .unwrap();
@@ -1500,7 +1499,7 @@ mod tests {
             root_id,
             "primary",
             "ShouldBeIgnored_KG",
-            None, None, None, None,
+            None, None, None,
             &serde_json::json!({}),
         )
         .unwrap();
@@ -1563,7 +1562,7 @@ mod tests {
         .unwrap();
         db.set_project_kg_binding(
             root_id, "primary", "",
-            None, None, None, None,
+            None, None, None,
             &serde_json::json!({}),
         )
         .unwrap();
@@ -1680,7 +1679,7 @@ mod tests {
             project_id,
             "primary",
             "VCODev_KnowledgeGraph",
-            None, None, None, None,
+            None, None, None,
             &serde_json::json!({}),
         )
         .unwrap();
@@ -1947,7 +1946,7 @@ mod tests {
             "vco-root",
             "primary",
             "VCODev_KnowledgeGraph",
-            None, None, None, None,
+            None, None, None,
             &serde_json::json!({}),
         )
         .unwrap();
@@ -1980,7 +1979,7 @@ mod tests {
             "p-weird",
             "primary",
             "WeirdName_Custom",
-            None, None, None, None,
+            None, None, None,
             &serde_json::json!({}),
         )
         .unwrap();
@@ -2036,7 +2035,7 @@ mod tests {
             "p-secrets",
             "primary",
             "SecretsProject_KnowledgeGraph",
-            None, None, None, None,
+            None, None, None,
             &serde_json::json!({}),
         )
         .unwrap();

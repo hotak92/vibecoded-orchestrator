@@ -11,8 +11,11 @@ target's slot is complete. What that design needs from Weaviate is the same for
 both stores, so it lives here once:
 
 * :func:`declared_slots` — which named vectors a class declares (REST schema);
+* :func:`sample_slot_population` — per slot, how many of the sampled objects
+  hold it (``{slot: (dim, count)}`` + the sample size) — a cheap live read,
+  never a completeness proof;
 * :func:`sample_common_vectors` — the slots populated on EVERY sampled object
-  (a cheap live record read, never a completeness proof);
+  (the every-object filter over :func:`sample_slot_population`);
 * :func:`object_count` — the GraphQL aggregate count;
 * :func:`scan_slot_counts` — the objective completeness measure: a cursor scan
   counting, per slot, the objects that hold a vector there;
@@ -40,10 +43,20 @@ def declared_slots(name: str, weaviate_url: Optional[str]) -> Optional[set]:
     return set((schema.get("vectorConfig") or {}).keys())
 
 
-def sample_common_vectors(name: str, weaviate_url: Optional[str], limit: int) -> "dict[str, int]":
-    """``{slot: dim}`` for the named vectors populated on EVERY sampled stored
-    object (up to ``limit``) — a slot some sampled object lacks is not a
-    complete slot. ``{}`` on an empty class or any failure."""
+def sample_slot_population(
+    name: str, weaviate_url: Optional[str], limit: int,
+) -> "tuple[dict[str, tuple[int, int]], int]":
+    """``({slot: (dim, objects_holding_it)}, sampled)`` for up to ``limit``
+    stored objects — the per-slot populations of ONE sample, in first-seen
+    order. ``({}, 0)`` on an empty class or any failure (no verdict, never a
+    guess).
+
+    This is the raw read; the two consumers differ in what they conclude:
+    :func:`sample_common_vectors` keeps only the slots EVERY sampled object
+    holds, while the KG's live record read
+    (:func:`vco_lib.kg_embed_model.record_from_live`) follows a MAJORITY slot,
+    so a handful of objects rewritten target-only cannot empty the answer
+    (W6-J, review F1)."""
     from vco_lib import weaviate_helpers as _wh
 
     base = (weaviate_url or _wh.weaviate_url_default()).rstrip("/")
@@ -52,15 +65,26 @@ def sample_common_vectors(name: str, weaviate_url: Optional[str], limit: int) ->
         timeout=10.0,
     )
     if status != 200:
-        return {}
+        return {}, 0
     objs = json.loads(body.decode("utf-8")).get("objects") or []
-    common: "Optional[dict[str, int]]" = None
+    population: "dict[str, tuple[int, int]]" = {}
     for obj in objs:
         vectors = obj.get("vectors") or {}
-        have = {k: len(v) for k, v in vectors.items() if isinstance(v, list) and v}
-        common = have if common is None else {
-            k: d for k, d in common.items() if have.get(k) == d}
-    return common or {}
+        for slot, vec in vectors.items():
+            if isinstance(vec, list) and vec:
+                dim, count = population.get(slot, (len(vec), 0))
+                population[slot] = (dim, count + 1)
+    return population, len(objs)
+
+
+def sample_common_vectors(name: str, weaviate_url: Optional[str], limit: int) -> "dict[str, int]":
+    """``{slot: dim}`` for the named vectors populated on EVERY sampled stored
+    object (up to ``limit``) — a slot some sampled object lacks is not a
+    complete slot. ``{}`` on an empty class or any failure."""
+    population, sampled = sample_slot_population(name, weaviate_url, limit)
+    if sampled <= 0:
+        return {}
+    return {slot: dim for slot, (dim, count) in population.items() if count == sampled}
 
 
 def object_count(name: str, weaviate_url: Optional[str]) -> int:

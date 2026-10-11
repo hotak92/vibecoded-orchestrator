@@ -99,33 +99,9 @@ class DialogRootOnCloseIsNeverUsedAsAGate(unittest.TestCase):
         )
 
 
-class EnrichmentModalStaysReachable(unittest.TestCase):
-    """The site the rule came from, pinned directly."""
-
-    MODAL = SVELTE_ROOT / "lib" / "components" / "EnrichmentProgressModal.svelte"
-
-    def setUp(self) -> None:
-        self.src = self.MODAL.read_text(encoding="utf-8")
-        mounts = list(_iter_dialogroot_mounts(self.src))
-        self.assertEqual(len(mounts), 1, "expected exactly one DialogRoot mount")
-        self.attrs = mounts[0]
-
-    def test_on_close_is_unconditional(self) -> None:
-        expr = _attr_expression(self.attrs, "onClose")
-        self.assertIsNotNone(expr, "the parent must be told about EVERY dismissal")
-        self.assertNotRegex(
-            expr or "",
-            r"allDone",
-            "a run-state-conditional onClose is what stranded the modal",
-        )
-
-    def test_every_dismissal_route_reaches_one_handler(self) -> None:
-        # Close button, Escape and backdrop all land on `handleClose`, which
-        # calls the parent's `onClose` and — mid-run — says the run continues.
-        self.assertIn("function handleClose()", self.src)
-        self.assertIn("onClose={handleClose}", self.src)
-        self.assertIn("onclick={handleClose}", self.src)
-        self.assertIn("toast.info(", self.src)
+# The site the rule came from, `EnrichmentProgressModal`, was retired in
+# v0.2.102 W6-J with its only mount (the per-project KG model picker on
+# `KgCodegraphTab`); the repo-wide rule above keeps holding every other mount.
 
 
 if __name__ == "__main__":  # pragma: no cover

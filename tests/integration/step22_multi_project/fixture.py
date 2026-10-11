@@ -186,9 +186,9 @@ def _seed_kg_bindings(
         conn.execute(
             """
             INSERT INTO project_kg_bindings
-                (project_id, role, collection_name, embedding_model,
+                (project_id, role, collection_name,
                  embedding_dim, kg_dir_path, weaviate_url, config_json, updated_at)
-            VALUES (?, ?, ?, 'qwen3-embedding:0.6b', 1024, NULL, NULL, '{}', ?)
+            VALUES (?, ?, ?, 1024, NULL, NULL, '{}', ?)
             """,
             (spec.project_id, role, coll_name, now),
         )

@@ -1016,7 +1016,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &serde_json::Value::Null,
         )
         .unwrap();
@@ -1035,7 +1034,6 @@ mod tests {
             &pid,
             "shared",
             "VibeCodedOrchestrator_KnowledgeGraph",
-            None,
             None,
             None,
             None,
@@ -1284,7 +1282,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &serde_json::Value::Null,
         )
         .unwrap();
@@ -1358,7 +1355,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &serde_json::Value::Null,
         )
         .unwrap();
@@ -1396,7 +1392,6 @@ mod tests {
             &pid,
             "primary",
             "Acme_KnowledgeGraph",
-            None,
             None,
             None,
             None,
@@ -1455,7 +1450,6 @@ mod tests {
             &pid,
             "primary",
             "Acme_KnowledgeGraph",
-            None,
             None,
             None,
             None,

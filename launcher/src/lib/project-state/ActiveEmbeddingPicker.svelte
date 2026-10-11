@@ -2,12 +2,13 @@
 <script lang="ts">
   // v0.2.71 T-B-emb — per-project ACTIVE_EMBEDDING profile picker.
   //
-  // First-class per-project embedding CHOICE. Distinct from the
-  // KgCodegraphTab per-binding model picker (which sets
-  // project_kg_bindings.embedding_model + triggers enrichment) — THIS picker
-  // sets the `module_settings/orchestrator-core/active_embedding` PROFILE
+  // First-class per-project embedding CHOICE. It sets the
+  // `module_settings/orchestrator-core/active_embedding` PROFILE
   // (qwen3 / arctic / openai) that the hub resolver + config_projection
   // stamp into .claude/{settings.json,env} as ACTIVE_EMBEDDING.
+  // (The KG / Codegraph tab's per-binding KG model dropdown it was once
+  // contrasted with was retired in v0.2.102 W6-J — it wrote a column no
+  // code read.)
   //
   // Writing here marks the row source="user" (sticky), so the choice
   // SURVIVES bundle/orchestrator updates (no update path overwrites a

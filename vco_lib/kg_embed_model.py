@@ -43,7 +43,11 @@ Now:
   complete is an instant flip;
 * a scoped run (one file, the MCP store) that meets a pending fill leaves the
   auto-retryable ledger row ``kg_embed_fill_pending``, whose retry is the
-  existing ``retry:py:kg_seed`` handler (``kg-sync --all``);
+  existing ``retry:py:kg_seed`` handler (``kg-sync --all``). A collection with
+  NO record (pre-v0.2.102, stamp skipped) still resolves off the live sample
+  on these paths (W6-J, review F1): the scoped rewrite CARRIES the sampled
+  slot and the row is emitted, so the window cannot strand a node on the new,
+  nearly-empty slot;
 * the bundle update self-heals: it stamps a missing record off live data,
   settles a pending fill (the instant flip) and keeps that row truthful.
 
@@ -277,31 +281,47 @@ def _record_for_slot(slot: str, dim: int) -> Optional[KgModelRecord]:
 
 def record_from_live(collection: str, target: str, *,
                      weaviate_url: Optional[str] = None) -> Optional[KgModelRecord]:
-    """A record read off a SAMPLE of stored objects (readers only, never
-    stamped): the target when its slot is populated on every sampled object
-    and no fill toward it is in progress, else the first unambiguous slot
-    populated on every sampled object. None when nothing is stored or
-    Weaviate cannot be asked."""
-    from vco_lib.embed_slot_fill import sample_common_vectors
+    """A record read off a SAMPLE of stored objects (readers and the scoped
+    write path, never stamped): the target when its slot is populated on every
+    sampled object and no fill toward it is in progress, else the first
+    unambiguous slot a MAJORITY of the sampled objects hold. None when nothing
+    is stored, no slot holds a majority, or Weaviate cannot be asked.
+
+    Why a majority and not the every-object intersection (W6-J, review F1): a
+    node rewritten while no record existed can carry the target's vector ONLY,
+    and one such object empties the intersection — the old read then returned
+    None and the resolver fell to the TARGET, searching the new, nearly-empty
+    slot and missing the whole collection. The majority slot is where the data
+    still is. First-seen order breaks count ties (the sample payload's own
+    order), so a collection with two complete slots reads the same slot the
+    pre-W6-J intersection read."""
+    from vco_lib.embed_slot_fill import sample_slot_population
 
     try:
-        populated = sample_common_vectors(collection, weaviate_url, _LIVE_SAMPLE)
+        population, sampled = sample_slot_population(collection, weaviate_url, _LIVE_SAMPLE)
     except Exception:  # noqa: BLE001
         return None
-    if not populated:
+    if sampled <= 0 or not population:
         return None
     t_slot, t_dim = text_model_slot(target)
     fill = read_fill(collection) or {}
     target_filling = bool(fill.get("target")) and same_text_model(str(fill["target"]), target)
-    if not target_filling and populated.get(t_slot) == t_dim:
+    t_dim_seen, t_count = population.get(t_slot, (0, 0))
+    if not target_filling and t_count == sampled and t_dim_seen == t_dim:
         return KgModelRecord(target, t_dim, t_slot)
-    for slot, dim in populated.items():
+    best: Optional[KgModelRecord] = None
+    best_count = 0
+    for slot, (dim, count) in population.items():
         if target_filling and slot == t_slot:
             continue
+        if count * 2 <= sampled:
+            continue  # no majority — not the collection's serving slot
         rec = _record_for_slot(slot, dim)
-        if rec is not None:
-            return rec
-    return None
+        if rec is None:
+            continue  # ambiguous/unknown slot — never a guess
+        if best is None or count > best_count:
+            best, best_count = rec, count
+    return best
 
 
 def _live_record_cached(collection: str, target: str) -> Optional[KgModelRecord]:
@@ -335,7 +355,9 @@ def resolve_kg_model(
     ``target`` defaults to the ONE text resolver; callers holding a live
     ``EmbeddingService`` pass its ``text_model_id``. ``record`` supersedes the
     launcher.db read (``None`` = known absent). ``live=False`` skips the
-    Weaviate sample when no record exists (hot write paths)."""
+    Weaviate sample when no record exists; the default (``True``) pays one
+    cached 20-object sample per collection per process, which is what keeps a
+    pre-record collection's writes and ledger truthful (W6-J, review F1)."""
     target = target or target_text_model()
     source = SOURCE_RECORDED
     if record is _UNSET:
@@ -455,8 +477,13 @@ def complete_write_vectors(svc: Any, slots: "dict[str, list]", text: str,
             "model's vector is stored in its place — the write fails and is retried.")
     if not collection:
         return slots
+    # W6-J (review F1): the resolution SAMPLES live data when no record exists
+    # (cached once per collection per process — only the first write pays it).
+    # A pre-v0.2.102 collection whose stamp was skipped (Weaviate down at the
+    # bundle run) is exactly where a scoped rewrite must not go target-only:
+    # without the carry the node leaves the slot searches read.
     res = resolve_kg_model(collection, role="write",
-                           target=str(getattr(svc, "text_model_id", "") or "") or None, live=False)
+                           target=str(getattr(svc, "text_model_id", "") or "") or None)
     if res.carry and svc is not None:
         cslot = text_model_slot(res.carry)[0]
         if not slots.get(cslot):
@@ -653,7 +680,12 @@ def _resolve_fill_deferral(folder: Path) -> None:
 def _owed_list(collections: Iterable[str], target: str) -> "list[tuple[str, str, str]]":
     owed = []
     for name in dict.fromkeys(c for c in collections if c):
-        res = resolve_kg_model(name, role="write", target=target, live=False)
+        # W6-J (review F1): live sampling is allowed here so a collection with
+        # NO record whose sample shows a non-target slot still owes the fill —
+        # this is what emits `kg_embed_fill_pending` from a scoped run (the
+        # sample is cached once per collection per process; a recorded
+        # collection never pays it).
+        res = resolve_kg_model(name, role="write", target=target)
         if res.filling and res.recorded is not None:
             owed.append((name, res.recorded.model, target))
     return owed
@@ -772,9 +804,25 @@ def collection_status(collection: str, target: str, *, count: bool = True) -> "d
             total = object_count(collection, None)
         except Exception:  # noqa: BLE001
             total = None
+    # W6-J: how many objects an UNRECORDED collection holds. A record is
+    # stamped only off a non-empty collection with a complete slot, so "no
+    # record" alone also describes an empty or absent collection (a fresh
+    # project, a development collection nothing was written to) — the
+    # launcher's re-scan alert needs to tell those apart from a stored KG
+    # whose stamp failed or whose slots are all incomplete. None = not
+    # counted (recorded collection, ``count=False``, or Weaviate unreachable).
+    objects = None
+    if record is None and count:
+        try:
+            from vco_lib.embed_slot_fill import object_count
+
+            objects = int(object_count(collection, None))
+        except Exception:  # noqa: BLE001
+            objects = None
     return {
         "collection": collection,
         "recorded_model": record.model if record else None,
+        "objects": objects,
         "target_model": target,
         "filling": res.filling,
         "filled": progress.get("filled") if progress else None,
