@@ -202,6 +202,7 @@ from .usage import (
     access_extra,
     build_record,
     count_tokens_estimate,
+    effort_extra,
     guard_count_tokens,
     note_count_substitution,
     read_identity,
@@ -217,7 +218,7 @@ from .vendors import (
     validate_registry,
     vendor_display_name,
 )
-from .effort import translate_effort
+from .effort import requested_effort, translate_effort
 from .tool_ids import (
     COMPACT_JSON,
     JSON_BUFFER_LIMIT_BYTES,
@@ -1344,6 +1345,8 @@ def _submit_usage(
     usage_complete: bool,
     request_bytes: int = 0,
     fallback_from: str = "",
+    effort_requested: Optional[str] = None,
+    effort_forwarded: Optional[str] = None,
 ) -> None:
     """Write one ledger row for a finished request, or decline to.
 
@@ -1375,6 +1378,8 @@ def _submit_usage(
         one_m_table=_one_m_table(gateway, decision, facts, requested),
         request_bytes=request_bytes,
         fallback_from=fallback_from,
+        effort_requested=effort_requested,
+        effort_forwarded=effort_forwarded,
     )
     try:
         loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
@@ -2424,6 +2429,16 @@ def _ladder_escalation(
         url = f"{next_decision.upstream}{_canonical_path(request)}"
         if request.query_string:
             url = f"{url}?{request.query_string}"
+        # v0.2.102: the escalated attempt gets its OWN effort pair — the
+        # request is the client's (``payload``), but the rung's shaping above
+        # (including ITS effort translation) is what goes upstream, and a
+        # fallback row must not record the rung the request escaped.
+        escalation_effort_requested = _guarded(
+            requested_effort, payload, what="effort observability",
+        )
+        escalation_effort_forwarded = _guarded(
+            requested_effort, shaped, what="effort observability",
+        )
         return await _proxy(
             request,
             gateway,
@@ -2440,6 +2455,16 @@ def _ladder_escalation(
             images=images,
             facts=facts,
             allow_oauth_retry=False,
+            effort_requested=(
+                escalation_effort_requested
+                if escalation_effort_requested is not _ABANDON
+                else None
+            ),
+            effort_forwarded=(
+                escalation_effort_forwarded
+                if escalation_effort_forwarded is not _ABANDON
+                else None
+            ),
             ladder_escalate=_ladder_escalation(
                 request=request,
                 gateway=gateway,
@@ -2527,6 +2552,13 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     #: says otherwise: an over-buffer or unparseable body is never parsed a
     #: second time just to count it, and "not counted" must not read as "0".
     images_field = IMAGES_UNCOUNTED
+    #: The effort selector the CLIENT sent (v0.2.102, register item
+    #: 2026-10-10), read off the parsed body BEFORE any shaping pass can
+    #: touch it — this is the observation, and ``effort_forwarded`` below is
+    #: what actually goes upstream after the rewrites. ``None`` until a
+    #: parsed body says otherwise: the over-buffer and unparseable paths
+    #: never learn it, and absent stays absent rather than becoming a guess.
+    effort_requested: Optional[str] = None
     if over_buffer:
         # Deliberately NOT parsed and deliberately NOT refused: the body is
         # past what this daemon will hold, so it goes upstream as a stream and
@@ -2598,6 +2630,14 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             # Counted from the ALREADY-PARSED body — no second parse, and the
             # bytes that go upstream are untouched by it either way.
             images_field = _images_field(payload)
+            # Same discipline: read the effort off the body the CLIENT sent,
+            # before the shaping passes below can rewrite it. A defect in the
+            # reader costs the OBSERVATION (stays None), never the request.
+            effort_read = _guarded(
+                requested_effort, payload, what="effort observability",
+            )
+            if effort_read is not _ABANDON:
+                effort_requested = effort_read
 
     decision: "Route | RouteError"
     if unparseable:
@@ -2878,6 +2918,23 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                     mutated = True
                     clear_thinking_applied = True
 
+    # The effort selector as it stands AFTER every shaping pass — this is the
+    # value the upstream is about to receive, read off the same payload the
+    # bytes below are serialised from, so the recorded pair can only ever
+    # disagree through a rewrite the gateway actually made (translation, or a
+    # first-party thinking-param drop). ``None`` on the over-buffer and
+    # unparseable paths, where there is no parsed payload to read: unknown,
+    # never guessed.
+    effort_forwarded: Optional[str] = (
+        _guarded(
+            requested_effort, forward_payload, what="effort observability",
+        )
+        if forward_payload is not None
+        else None
+    )
+    if effort_forwarded is _ABANDON:
+        effort_forwarded = None
+
     headers["Content-Type"] = "application/json"
     headers.setdefault("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
 
@@ -2970,6 +3027,8 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         images=images_field,
         facts=facts,
         ladder_escalate=ladder_hook,
+        effort_requested=effort_requested,
+        effort_forwarded=effort_forwarded,
     )
 
 
@@ -3020,6 +3079,8 @@ async def _proxy(
     ladder_escalate: Optional[Callable[[str], Awaitable[Optional[web.StreamResponse]]]] = None,
     fallback_from: str = "",
     allow_ladder_retry: bool = True,
+    effort_requested: Optional[str] = None,
+    effort_forwarded: Optional[str] = None,
 ) -> web.StreamResponse:
     """Forward one request upstream and relay the answer.
 
@@ -3093,6 +3154,12 @@ async def _proxy(
         # saying the same thing twice reads as two events.
         if rewrite_failed and "note=rewrite_failed" not in note:
             parts.append("note=rewrite_failed")
+        # v0.2.102: the effort pair, in the ONE shape every proxied line
+        # carries (``effort_req=… effort_fwd=…``, ``-`` for absent). Here
+        # rather than in the handler so the recursive paths below — the
+        # oauth retry, a quota reprobe, a ladder escalation — each record
+        # the pair for THEIR attempt without every caller re-adding it.
+        parts.append(effort_extra(effort_requested, effort_forwarded))
         # THE terminal point of this request, so it is also where the
         # accounting is closed: one access line and at most one ledger row,
         # written from the same place, can never disagree about how a request
@@ -3154,6 +3221,10 @@ async def _proxy(
                     # R15: the rung this request escaped, when the ladder
                     # served it — empty (never omitted) on ordinary rows.
                     fallback_from=fallback_from,
+                    # v0.2.102: the effort pair for THIS attempt, the same
+                    # observation the access line above just recorded.
+                    effort_requested=effort_requested,
+                    effort_forwarded=effort_forwarded,
                 ),
                 what="usage ledger",
             )
@@ -3239,6 +3310,8 @@ async def _proxy(
                         ladder_escalate=ladder_escalate,
                         fallback_from=fallback_from,
                         allow_ladder_retry=allow_ladder_retry,
+                        effort_requested=effort_requested,
+                        effort_forwarded=effort_forwarded,
                     )
             vendor = decision.vendor
             # WP-6 review MAJOR-1, refined by the no-discovery-vendor
@@ -3286,6 +3359,8 @@ async def _proxy(
                         ladder_escalate=ladder_escalate,
                         fallback_from=fallback_from,
                         allow_ladder_retry=False,
+                        effort_requested=effort_requested,
+                        effort_forwarded=effort_forwarded,
                     )
 
                 return await _ladder_quota_branch(
@@ -3323,6 +3398,8 @@ async def _proxy(
                             images=images,
                             facts=facts,
                             fallback_from=fallback_from,
+                            effort_requested=effort_requested,
+                            effort_forwarded=effort_forwarded,
                         )
                         if allow_quota_reprobe
                         and isinstance(body, (bytes, bytearray))
@@ -4032,6 +4109,8 @@ def _quota_reprobe(
     images: str = IMAGES_UNCOUNTED,
     facts: Optional[RequestFacts] = None,
     fallback_from: str = "",
+    effort_requested: Optional[str] = None,
+    effort_forwarded: Optional[str] = None,
 ) -> Callable[[str], Awaitable[web.StreamResponse]]:
     """A single re-send of a request whose quota refusal is being re-checked.
 
@@ -4089,6 +4168,8 @@ def _quota_reprobe(
             allow_oauth_retry=False,
             allow_quota_reprobe=False,
             fallback_from=fallback_from,
+            effort_requested=effort_requested,
+            effort_forwarded=effort_forwarded,
         )
 
     return resend

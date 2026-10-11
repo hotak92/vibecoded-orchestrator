@@ -261,6 +261,8 @@ def _run_main(mod, argv: list[str], *, boom: bool):
         # omits an attribute the production code reads turns a contract test
         # into an AttributeError at the first change to that contract.
         nodes_skipped = 0
+        # v0.2.102: same contract for the missing-vector skip list.
+        objects_missing_vector = ()
         find_duplicates = real_find  # the REAL scan logic
 
         def __init__(self, similarity_threshold: float = 0.95) -> None:
@@ -315,9 +317,12 @@ def test_clean_scan_still_exits_zero_in_json_mode() -> None:
     # Exact dict on purpose: this is the launcher's machine contract, so a
     # new key must be a deliberate edit here. `nodes_skipped` joined it in
     # v0.2.96 — 0 is what "clean AND complete" looks like, as distinct from
-    # "clean among the nodes I managed to compare".
+    # "clean among the nodes I managed to compare". `objects_missing_vector`
+    # joined in v0.2.102 with the same meaning for objects present but short
+    # of the target vector.
     assert json.loads(out) == {
         "threshold": 0.99, "count": 0, "pairs": [], "nodes_skipped": 0,
+        "objects_missing_vector": [],
     }
 
 

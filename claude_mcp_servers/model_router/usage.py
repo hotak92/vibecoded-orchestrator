@@ -111,21 +111,35 @@ LEDGER_BASENAME = "gateway-usage.jsonl"
 #: disk-usage decision the user never made.
 LEDGER_MAX_BYTES = 50 * 1024 * 1024
 
-#: One fully-populated row, measured — every field set, a UUID session id and
-#: a UUID agent id, a namespaced ``[1m]`` model id. Used only to turn a byte
-#: cap into a LINE count for :func:`vco_lib.atomic.rotate_tail_lines`, which
-#: keeps lines rather than bytes.
-LEDGER_ROW_BYTES = 545
+#: One fully-populated row, measured — the LONGEST realistic row across every
+#: route (anthropic, zai, qwen, kimi — the qwen/deepseek model id is the
+#: longest namespaced ``[1m]`` spelling), every field set at its realistic
+#: maximum: UUID session/agent/parent-agent ids, 7-digit token counts on a
+#: 1M-window chat, ``window_actual`` 1 000 000, an 8-digit
+#: ``request_bytes``, the longest ``fallback_from`` label
+#: (``vendor:qwen:deepseek-v4.1-flash``), and the LONGEST effort spelling
+#: (``budget_tokens=8192`` on both sides of the pair; a named tier is
+#: shorter). That case serialises to 776 bytes + the newline. Used only to
+#: turn a byte cap into a LINE count for
+#: :func:`vco_lib.atomic.rotate_tail_lines`, which keeps lines rather than
+#: bytes — a TYPICAL row is smaller, so the surviving tail is at most about a
+#: quarter of the cap, never more. Re-measured at v0.2.102 when the effort
+#: pair (``effort_requested`` / ``effort_forwarded``) joined the row; the
+#: pre-pair figure of 545 was itself a derived underestimate.
+LEDGER_ROW_BYTES = 777
 
 #: What fraction of :data:`LEDGER_MAX_BYTES` survives a rotation. A quarter:
 #: enough recent history that a monitor restarted after a rotation still has
 #: context to show, and small enough that rotations are rare rather than one
-#: per write. At the default cap that is ``(52428800 // 4) // 545`` =
-#: **24 049 lines**, about 13.1 MiB — a quarter of the cap, as intended.
+#: per write. At the default cap that is ``(52428800 // 4) // 777`` =
+#: **16 868 lines**, about 12.5 MiB when every row is a maximal
+#: :data:`LEDGER_ROW_BYTES` row — at most a quarter of the cap, as intended;
+#: typical (smaller) rows keep the same LINE count and proportionally fewer
+#: bytes.
 #:
-#: The ratio holds for a TYPICAL row. An atypically long client-supplied model
-#: id makes the surviving tail proportionally larger; the file is still
-#: bounded, because the next append re-checks the cap.
+#: The ratio holds for a MAXIMAL row. An atypically long client-supplied model
+#: id beyond even that makes the surviving tail proportionally larger; the
+#: file is still bounded, because the next append re-checks the cap.
 LEDGER_KEEP_FRACTION = 4
 
 #: How many sessions the in-memory "last row per chat" map holds. Bounded and
@@ -576,6 +590,19 @@ class UsageRecord:
     #: differ because of a fallback (and from where). Empty on every ordinary
     #: row, so its absence means "no fallback", never "unknown".
     fallback_from: str = ""
+    #: v0.2.102 (register item 2026-10-10): the effort selector this request
+    #: carried, both directions. ``effort_requested`` is what the CLIENT sent
+    #: (``output_config.effort``, or the older ``thinking.budget_tokens`` as
+    #: ``budget_tokens=<n>``); ``effort_forwarded`` is what the gateway sent
+    #: UPSTREAM after its per-vendor translation
+    #: (:func:`model_router.effort.translate_effort`) and the other shaping
+    #: passes. ``None`` — stored as ``null`` — when the payload carries no
+    #: selector or was never parsed (over-buffer / unparseable bodies): absent
+    #: is an observation, never a guess. Read through the ONE reader
+    #: :func:`model_router.effort.requested_effort`, on both sides, so the
+    #: pair can only disagree through a rewrite the gateway actually made.
+    effort_requested: Optional[str] = None
+    effort_forwarded: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
@@ -622,6 +649,8 @@ def build_record(
     one_m_table: bool = False,
     request_bytes: int = 0,
     fallback_from: str = "",
+    effort_requested: Optional[str] = None,
+    effort_forwarded: Optional[str] = None,
 ) -> UsageRecord:
     """Assemble one row. Pure — no clock unless the caller declines to pass one.
 
@@ -679,6 +708,8 @@ def build_record(
         usage_complete=usage_complete,
         request_bytes=max(0, int(request_bytes)),
         fallback_from=str(fallback_from or ""),
+        effort_requested=effort_requested,
+        effort_forwarded=effort_forwarded,
     )
 
 
@@ -728,6 +759,27 @@ def access_extra(totals: Mapping[str, int], *, seen: bool) -> str:
         f"cache_r={show('cache_read_input_tokens')} "
         f"out={show('output_tokens')} "
         f"ctx={context}"
+    )
+
+
+def effort_extra(
+    effort_requested: Optional[str], effort_forwarded: Optional[str],
+) -> str:
+    """The effort pair on the access line, in ONE shape (v0.2.102).
+
+    ``effort_req=<value|-> effort_fwd=<value|->`` — both fields always
+    present on a proxied line, for the same reason :func:`access_extra`
+    always prints its five: an absent field could not be told apart from a
+    counter that never ran, and ``-`` is the honest spelling of "this
+    request carried no effort selector" (or its body was never parsed — the
+    over-buffer and unparseable paths, where neither value is known). The
+    ``budget_tokens=<n>`` spelling is the older client build's selector, so
+    a value that is not one of :data:`model_router.effort.EFFORT_VALUES` is
+    still an observation, never a formatting error.
+    """
+    return (
+        f"effort_req={effort_requested or '-'} "
+        f"effort_fwd={effort_forwarded or '-'}"
     )
 
 
@@ -1327,6 +1379,7 @@ __all__ = [
     "build_record",
     "client_window",
     "count_tokens_estimate",
+    "effort_extra",
     "event_payload",
     "guard_count_tokens",
     "note_count_substitution",

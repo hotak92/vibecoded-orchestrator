@@ -282,10 +282,51 @@ def translate_effort(
     return new_payload, True
 
 
+def requested_effort(payload: Any) -> Optional[str]:
+    """The effort selector one payload carries, in the spelling it carries it.
+
+    The OBSERVABILITY reader behind the access line's and the usage ledger's
+    ``effort_requested`` / ``effort_forwarded`` fields (v0.2.102, register
+    item 2026-10-10): Claude Code puts its selector in ONE of two places
+    depending on the build (see the module docstring), and this answers
+    whichever is present —
+
+    * ``output_config.effort`` — returned verbatim (a string like ``medium``);
+    * ``thinking.budget_tokens`` — the older spelling, returned as
+      ``budget_tokens=<n>`` so the recorded field stays a string and the two
+      spellings can never be confused with each other;
+    * neither — ``None``, which the ledger stores as ``null``. Never a guess
+      and never a default: an absent selector is an observation about the
+      client build, not a hole to fill.
+
+    The SAME reader serves both directions of the observation: called on the
+    client's parsed body it is what was REQUESTED; called on the forwarded
+    payload (after :func:`translate_effort` and the other shaping passes) it
+    is what was FORWARDED — so the two can only ever disagree through a
+    rewrite the gateway actually made, which is precisely what the pair
+    exists to make visible.
+    """
+    if not isinstance(payload, dict):
+        return None
+    output_config = payload.get("output_config")
+    if isinstance(output_config, dict):
+        effort = output_config.get("effort")
+        if isinstance(effort, str) and effort:
+            return effort
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict):
+        budget = thinking.get("budget_tokens")
+        # bool is an int subclass; True is not a token budget.
+        if isinstance(budget, int) and not isinstance(budget, bool):
+            return f"budget_tokens={budget}"
+    return None
+
+
 __all__ = [
     "EFFORT_POLICIES",
     "EFFORT_VALUES",
     "EffortPolicy",
     "effort_policy",
+    "requested_effort",
     "translate_effort",
 ]
