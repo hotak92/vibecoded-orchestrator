@@ -567,9 +567,15 @@ class LedgerTests(unittest.TestCase):
         )
 
     def test_keep_lines_is_about_a_quarter_of_the_cap(self) -> None:
-        """The documented figure, at the shipped default: 24 049 lines."""
+        """The documented figure, at the shipped default: 21 845 lines.
+
+        Re-derived at v0.2.102: the effort pair (``effort_requested`` /
+        ``effort_forwarded``) joined the row, so the measured
+        :data:`U.LEDGER_ROW_BYTES` moved from 545 to 600 and the line count
+        at the same quarter-cap with it.
+        """
         ledger = U.UsageLedger(self.path)
-        self.assertEqual(ledger._keep_lines(), 24_049)
+        self.assertEqual(ledger._keep_lines(), 21_845)
         surviving = ledger._keep_lines() * U.LEDGER_ROW_BYTES
         self.assertAlmostEqual(
             surviving / U.LEDGER_MAX_BYTES, 0.25, places=2,

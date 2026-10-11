@@ -303,6 +303,37 @@ class DuplicateDetector:
     #: default for the same reason as `scan_error`.
     nodes_skipped: int = 0
 
+    #: Objects that ARE present but carry no vector in the slot this scan
+    #: queries, and were therefore skipped PER OBJECT rather than aborting
+    #: the run. A PARTIAL scan, not a failed one (v0.2.102, field defect
+    #: observed on v0.2.101 2026-10-10: `nearObject params: vector not found
+    #: for target: qwen3_embed` — one such object, and the WHOLE scan died
+    #: with "no verdict"). Weaviate uses the SAME sentence for a vanished
+    #: object (no trailing target) and for an object with no vector in the
+    #: named slot, so the scan distinguishes them by asking the collection,
+    #: never by reading the message.
+    #:
+    #: WHY an object can lack the target slot (determinable from the slots it
+    #: DOES carry, recorded per object in ``has_slots``):
+    #:   * it carries OTHER named slots only — it was written while a
+    #:     different embedding profile was active (kg-sync writes only the
+    #:     ACTIVE slot unless dual-write is on), or by a sync whose ACTIVE
+    #:     backend failed at call time and only a fallback slot landed
+    #:     (`templates/scripts/sync_knowledge_graph.py::_build_vector_arg`,
+    #:     whose docstring documents "dict only has the fallback's slot").
+    #:     A KNOWN gap, reported rather than fixed here: the fallback-only
+    #:     write leaves the object invisible to every query that targets the
+    #:     active slot — including this scan.
+    #:   * it carries NO slot at all — every embedding backend failed for
+    #:     that write, or the object predates vectorization.
+    #:
+    #: Same loudness contract as `nodes_skipped`: `main` never prints
+    #: "clean" while it is non-empty, `--json` carries it, and the markdown
+    #: report states it. Class-level default (an empty tuple — immutable, so
+    #: a doubles-based test that bypasses `__init__` can never share state)
+    #: for the same reason as `scan_error`.
+    objects_missing_vector: "tuple" = ()
+
     def __init__(self, similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
         """Initialize detector"""
         self.threshold = similarity_threshold
@@ -347,6 +378,47 @@ class DuplicateDetector:
             return fetch(node_uuid) is None
         except Exception:  # noqa: BLE001 — probe failed, so nothing is confirmed
             return False
+
+    def _object_vector_slots(self, node_uuid: str) -> "tuple | None":
+        """The vector slot names one object ACTUALLY carries, or ``None``.
+
+        ``None`` is the conservative answer of :meth:`_node_is_gone` applied
+        to vectors: anything that cannot be POSITIVELY established — the
+        client has no ``fetch_object_by_id``, the probe raises, or the object
+        is not there (so the question is moot and the caller falls back to
+        the vanished-node tolerance). A caller that treated ``None`` as "no
+        vector" would let a dead transport skip every node and report a
+        partial-but-plausible verdict, the exact lie this scanner has been
+        fixed for three times (v0.2.92, v0.2.94, v0.2.96).
+
+        Every determinable answer is a tuple:
+
+        * ``("qwen3_embed", ...)`` — a named-vector object, the slots that
+          actually hold a vector;
+        * ``("",)`` — a legacy single-UNNAMED-vector object's one vector,
+          spelled the same way :func:`_target_vector` spells the slot it
+          would query for such a class (the empty string, i.e. "omit the
+          kwarg"), so ``target_vector in slots`` answers uniformly;
+        * ``()`` — the object is present but carries NO vector in any slot.
+        """
+        try:
+            fetch = self.collection.query.fetch_object_by_id
+        except AttributeError:  # client too old to answer — cannot confirm
+            return None
+        try:
+            obj = fetch(node_uuid, include_vector=True)
+        except Exception:  # noqa: BLE001 — probe failed, so nothing is confirmed
+            return None
+        if obj is None:
+            return None
+        vector = getattr(obj, "vector", None)
+        if vector is None:
+            return ()
+        if isinstance(vector, dict):
+            return tuple(str(name) for name in vector.keys())
+        # weaviate-client 4.x returns a bare list for a class with one
+        # UNNAMED vector — the pseudo-slot spelling, see the docstring.
+        return ("",)
 
     def close(self):
         """Close Weaviate connection"""
@@ -411,6 +483,7 @@ class DuplicateDetector:
             duplicates = []
             checked_pairs = set()
             skipped_uuids: List[str] = []
+            missing_vector_objects: List[Dict] = []
 
             for i, node in enumerate(nodes):
                 if (i + 1) % 10 == 0:
@@ -451,6 +524,31 @@ class DuplicateDetector:
                     # the thing it inspects dies at that thing's first
                     # refactor).
                     #
+                    # v0.2.102 (field defect on v0.2.101, 2026-10-10): the
+                    # trailing-target shape — an object that IS present but
+                    # carries no vector in the queried slot — used to reach
+                    # the same `raise` and abort the WHOLE scan over one
+                    # object. It is now distinguished by the same ask-the-
+                    # collection probe (`_object_vector_slots`): present and
+                    # CONFIRMED short of the target slot → skip THIS object,
+                    # count it, and say why (the slots it does carry — see
+                    # `objects_missing_vector`). Present WITH the target slot,
+                    # or undeterminable (probe failed / client too old) → the
+                    # v0.2.96 guards below decide, and a wrong slot / dead
+                    # transport stays as loud as it ever was.
+                    present_slots = self._object_vector_slots(node_uuid)
+                    if (
+                        present_slots is not None
+                        and target_vector not in present_slots
+                    ):
+                        missing_vector_objects.append({
+                            "uuid": node_uuid,
+                            "title": node_title,
+                            "path": node_path,
+                            "target_vector": target_vector,
+                            "has_slots": list(present_slots),
+                        })
+                        continue
                     # CONFIRMED gone → benign, skip and count it. Anything
                     # else — still present, or the probe itself failed, so we
                     # cannot confirm — re-raises and FAILS the scan, because
@@ -502,16 +600,25 @@ class DuplicateDetector:
 
             # v0.2.96: account for the skips BEFORE declaring the scan
             # complete. Two outcomes, never a silent one.
+            # v0.2.102: objects lacking the target vector join the accounting
+            # — they are skips too, and every skip is a node whose duplicates
+            # were never looked for.
             self.nodes_skipped = len(skipped_uuids)
-            if nodes and self.nodes_skipped == len(nodes):
+            self.objects_missing_vector = tuple(missing_vector_objects)
+            total_skipped = self.nodes_skipped + len(missing_vector_objects)
+            if nodes and total_skipped == len(nodes):
                 # Nothing was compared at all. That is not a partial verdict,
                 # it is the absence of one — treat it exactly like a query
                 # failure so `main` exits non-zero and prints "no verdict".
                 raise RuntimeError(
-                    f"all {len(nodes)} nodes disappeared between the snapshot "
-                    "and their comparison, so nothing was compared. The "
-                    "collection is being rewritten wholesale (a re-embed or a "
-                    "full kg-sync); re-run this scan once it finishes."
+                    f"all {len(nodes)} nodes were skipped between the "
+                    "snapshot and their comparison ({self.nodes_skipped} "
+                    "disappeared — re-synced under new uuids; "
+                    f"{len(missing_vector_objects)} lack the target vector "
+                    f"{target_vector!r}), so nothing was compared. The "
+                    "collection is being rewritten wholesale (a re-embed or "
+                    "a full kg-sync) or was embedded under a different "
+                    "profile; re-run this scan once writes settle."
                 )
             if self.nodes_skipped:
                 _progress(
@@ -519,6 +626,28 @@ class DuplicateDetector:
                     "nodes were re-synced while the scan ran and were not "
                     "compared. Any duplicate involving them is NOT in this "
                     "verdict — re-run when writes settle."
+                )
+            if missing_vector_objects:
+                # Skip-and-report per object: the count, the TITLES, and the
+                # WHY — which slots each object does carry, so the operator
+                # can tell a profile switch from a dead-backend write without
+                # re-probing by hand. See `objects_missing_vector` for the
+                # two known code paths that produce such objects.
+                titles = ", ".join(
+                    f"{o['title']!r} (has: "
+                    f"{', '.join(o['has_slots']) or 'no vector at all'})"
+                    for o in missing_vector_objects
+                )
+                _progress(
+                    f"⚠️  PARTIAL scan: {len(missing_vector_objects)} of "
+                    f"{len(nodes)} objects lack the target vector "
+                    f"{target_vector!r} and were not compared: {titles}. "
+                    "Such objects were written while a different embedding "
+                    "profile was active, or by a sync whose active backend "
+                    "failed and only a fallback slot landed "
+                    "(sync_knowledge_graph.py::_build_vector_arg) — they are "
+                    "invisible to every query on this slot. Any duplicate "
+                    "involving them is NOT in this verdict."
                 )
 
             _progress("\n✅ Analysis complete\n")
@@ -555,6 +684,19 @@ class DuplicateDetector:
                 "Duplicates involving them are NOT listed below. Re-run "
                 "`.claude/scripts/kg-duplicates` when knowledge writes have "
                 "settled for a complete verdict.\n"
+            )
+        # v0.2.102: objects lacking the target vector, same contract.
+        if self.objects_missing_vector:
+            titles = ", ".join(
+                repr(o["title"]) for o in self.objects_missing_vector
+            )
+            report_lines.append(
+                f"> ⚠️ **PARTIAL SCAN** — {len(self.objects_missing_vector)} "
+                "object(s) carry no vector in the slot this scan queries and "
+                f"were never compared ({titles}). They were written while a "
+                "different embedding profile was active, or by a sync whose "
+                "active backend failed and only a fallback slot landed — "
+                "re-embed them (kg-sync) for a complete verdict.\n"
             )
         report_lines.extend([
             "---\n",
@@ -664,6 +806,11 @@ def main():
                 # "0 pairs" and "0 pairs, 12 nodes never looked at" are not
                 # the same verdict.
                 "nodes_skipped": detector.nodes_skipped,
+                # v0.2.102: the per-object skip-and-report list for objects
+                # present but short of the target vector — count, titles and
+                # the slots each DOES carry (the WHY), so a consumer can tell
+                # a profile switch from a dead-backend write.
+                "objects_missing_vector": list(detector.objects_missing_vector),
             }
             json.dump(payload, sys.stdout)
             sys.stdout.write("\n")
@@ -687,21 +834,46 @@ def main():
                     f"⚠️  PARTIAL: {detector.nodes_skipped} node(s) re-synced "
                     "mid-scan were never compared — this count is a floor."
                 )
+            if detector.objects_missing_vector:
+                titles = ", ".join(
+                    repr(o["title"]) for o in detector.objects_missing_vector
+                )
+                print(
+                    f"⚠️  PARTIAL: {len(detector.objects_missing_vector)} "
+                    "object(s) lack the target vector and were never "
+                    f"compared ({titles}) — this count is a floor."
+                )
             print(f"\n💡 Next: Review {output_path}")
         elif detector.scan_error:
             # NOT "clean". The scan did not finish, so there is no verdict to
             # report — saying otherwise is the same lie the JSON branch above
             # stopped telling.
             print("⚠️  Scan did NOT complete — no verdict. See the error above.")
-        elif detector.nodes_skipped:
+        elif detector.nodes_skipped or detector.objects_missing_vector:
             # v0.2.96: NOT "clean". Every node the scan never compared is a
             # node whose duplicates were never looked for, and the hook's
             # report grep keys on ⚠️, so this reaches the reader exactly where
-            # the false "clean" used to.
+            # the false "clean" used to. v0.2.102: objects short of the
+            # target vector are the same class of skip.
+            parts = []
+            if detector.nodes_skipped:
+                parts.append(
+                    f"{detector.nodes_skipped} node(s) were re-synced "
+                    "mid-scan"
+                )
+            if detector.objects_missing_vector:
+                titles = ", ".join(
+                    repr(o["title"]) for o in detector.objects_missing_vector
+                )
+                parts.append(
+                    f"{len(detector.objects_missing_vector)} object(s) lack "
+                    f"the target vector ({titles})"
+                )
             print(
-                f"⚠️  PARTIAL verdict: no duplicates among the nodes compared, "
-                f"but {detector.nodes_skipped} node(s) were re-synced mid-scan "
-                "and never compared. Re-run once knowledge writes settle."
+                "⚠️  PARTIAL verdict: no duplicates among the nodes compared, "
+                "but " + " and ".join(parts) + " and were never compared. "
+                "Re-run once knowledge writes settle (and re-embed the "
+                "objects named above, e.g. via kg-sync, if they persist)."
             )
         else:
             print("✅ No duplicates detected - knowledge graph is clean!")
