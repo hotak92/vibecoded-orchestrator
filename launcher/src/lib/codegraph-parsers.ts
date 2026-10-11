@@ -124,12 +124,19 @@ export const INITIAL_PARSERS_STATE: ParsersState = {
   error: null,
 };
 
-/** Only local, non-empty, distinct folders are scanned. */
+/**
+ * Only LOCAL, non-empty, distinct folders are scanned: every kept path is
+ * an absolute local path (POSIX `/…` or a Windows drive `C:\…` / `C:/…`).
+ * UNC shares (`\\server\share`), URLs and relative paths are dropped, so
+ * the Rust scan always receives a folder on this machine.
+ */
+const LOCAL_PATH_RE = /^(\/|[A-Za-z]:[\\/])/;
+
 export function projectPaths(paths: Iterable<string | null | undefined>): string[] {
   const out: string[] = [];
   for (const p of paths) {
     const t = (p ?? '').trim();
-    if (t && !out.includes(t)) out.push(t);
+    if (t && LOCAL_PATH_RE.test(t) && !out.includes(t)) out.push(t);
   }
   return out;
 }

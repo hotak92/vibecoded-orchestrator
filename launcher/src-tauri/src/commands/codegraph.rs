@@ -1216,21 +1216,29 @@ fn emit_build(
     let _ = app.emit(BUILD_EVENT, payload);
 }
 
-/// File-extension set we know `analyze_code_graph.py` can handle. Kept
-/// in sync with the language dispatch table at the top of that file
-/// (Python / TS / JS / Go / Rust / Java / Lua / C++ / Ruby / Shell /
-/// C# / Proto). Empty extension list => skip pre-check, just run.
+/// File-extension set the analyzer can handle. This is a MIRROR of
+/// `vco_lib.inject_intent.EXT_TO_LANG` (itself parity-pinned to the
+/// analyzer's `_EXT_TO_DISPATCH_NAME`): the detector runs BEFORE any
+/// Python subprocess and must stay pure Rust, so it cannot call the
+/// table's home directly — the parity test
+/// `TestExtLangOneHome::test_rust_prebuild_detector_matches_the_python_table`
+/// (tests/test_v02101_structure_hook_format.py) turns red the moment the
+/// two tables drift. A language missing here is never built from the
+/// launcher (a PowerShell-only project stays SKIPPED); `zsh` was dropped
+/// because the analyzer ignores it.
 fn supported_extensions() -> &'static [&'static str] {
     &[
         // Python
         "py",
-        // TypeScript / JavaScript
-        "ts", "tsx", "js", "jsx", "mjs",
+        // TypeScript / JavaScript (+ Svelte single-file components)
+        "ts", "tsx", "js", "jsx", "mjs", "svelte",
         // Compiled
         "go", "rs", "java", "cs",
         // Native / scripting
         "cpp", "cc", "cxx", "c", "h", "hpp",
-        "lua", "rb", "sh", "bash", "zsh",
+        "lua", "rb", "sh", "bash",
+        // PowerShell
+        "ps1", "psm1",
         // RPC / schemas
         "proto",
     ]
@@ -2336,6 +2344,25 @@ mod build_tests {
         // Should not error out; should return empty set.
         let langs = detect_supported_languages(&bogus, 3).unwrap();
         assert!(langs.is_empty());
+    }
+
+    #[test]
+    fn detect_picks_up_powershell_svelte_and_proto() {
+        // v0.2.102 fix round: the analyzer indexes ps1/psm1/svelte, so a
+        // PowerShell-only or Svelte-only project must NOT be SKIPPED by the
+        // pre-build detector. The table mirrors inject_intent.EXT_TO_LANG
+        // (parity test: TestExtLangOneHome in
+        // tests/test_v02101_structure_hook_format.py).
+        let d = tmpdir("ps1svelte");
+        fs::write(d.join("tool.ps1"), b"function F {}").unwrap();
+        fs::write(d.join("mod.psm1"), b"function G {}").unwrap();
+        fs::write(d.join("App.svelte"), b"<script>let x = 1;</script>").unwrap();
+        fs::write(d.join("svc.proto"), b"syntax = \"proto3\";").unwrap();
+        let langs = detect_supported_languages(&d, 3).unwrap();
+        for ext in ["ps1", "psm1", "svelte", "proto"] {
+            assert!(langs.contains(ext), "missing {} in {:?}", ext, langs);
+        }
+        fs::remove_dir_all(&d).ok();
     }
 
     #[test]

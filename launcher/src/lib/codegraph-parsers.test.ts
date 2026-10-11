@@ -187,6 +187,23 @@ describe('copy', () => {
   it('joins names', () => {
     expect(joinNames(['A'])).toBe('A');
     expect(joinNames(['A', 'B', 'C'])).toBe('A, B and C');
-    expect(projectPaths(['', 'a', 'a', null])).toEqual(['a']);
+    expect(projectPaths(['', '/w/a', '/w/a', null])).toEqual(['/w/a']);
+  });
+
+  it('keeps only local absolute folders (the "local" claim is checked, not assumed)', () => {
+    // POSIX and Windows drive paths are local; UNC shares, URLs and
+    // relative paths are dropped before anything is scanned.
+    expect(
+      projectPaths([
+        '/w/app',
+        'C:\\Users\\dev\\app',
+        'D:/data/proj',
+        '\\\\fileserver\\share\\proj',
+        'file:///w/app',
+        'relative/app',
+        '',
+        null,
+      ]),
+    ).toEqual(['/w/app', 'C:\\Users\\dev\\app', 'D:/data/proj']);
   });
 });

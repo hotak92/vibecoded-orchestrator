@@ -266,6 +266,35 @@ class TestExtLangOneHome:
         for ext, lang in mod._EXT_TO_DISPATCH_NAME.items():
             assert EXT_TO_LANG.get(ext) == lang, f"ext {ext} diverges"
 
+    def test_rust_prebuild_detector_matches_the_python_table(self) -> None:
+        """The launcher's pre-build extension detector
+        (``supported_extensions`` in launcher/src-tauri/src/commands/
+        codegraph.rs) must cover EXACTLY this table. A language the analyzer
+        indexes but the detector lacks means the project is never built from
+        the launcher (a PowerShell- or Svelte-only project stays SKIPPED);
+        an extension the analyzer ignores builds pointlessly. The detector
+        is pure Rust running BEFORE any Python subprocess, so it cannot
+        call the table's home directly — this parity test is what keeps the
+        mirror from drifting (A>B>C option C, chosen for that reason)."""
+        import re
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from vco_lib.inject_intent import EXT_TO_LANG
+
+        rust_src = (
+            REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "codegraph.rs"
+        ).read_text(encoding="utf-8")
+        m = re.search(
+            r"fn supported_extensions\(\)[^{]*\{(.*?)\n\}", rust_src, re.DOTALL)
+        assert m, "supported_extensions() not found in codegraph.rs"
+        rust_exts = set(re.findall(r'"([a-z0-9]+)"', m.group(1)))
+        python_exts = {ext.lstrip(".") for ext in EXT_TO_LANG}
+        assert rust_exts == python_exts, (
+            "launcher supported_extensions() drifted from "
+            f"inject_intent.EXT_TO_LANG: only-in-Rust={sorted(rust_exts - python_exts)} "
+            f"missing-from-Rust={sorted(python_exts - rust_exts)}"
+        )
+
     def test_language_for_path(self) -> None:
         from vco_lib.inject_intent import language_for_path
         assert language_for_path("src/mod.py") == "python"

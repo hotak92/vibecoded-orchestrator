@@ -285,6 +285,54 @@ def test_install_py_routes_the_default_extra_through_the_helper(monkeypatch, tmp
     assert "--prefer-binary" in seen["pip_flags"]
 
 
+def test_install_py_pip_runs_only_through_the_helper_runner_boundary(monkeypatch) -> None:
+    """Red-provable routing proof WITHOUT a real pip run.
+
+    install.py's only subprocess boundary (``_run_logged_subprocess``) is
+    stubbed to record the argv and fake rc 0, so even a fully regressed
+    install.py (pip invoked directly, helper never called) cannot install
+    anything here — it can only turn this test RED by failing to reach the
+    ONE installer helper. Unlike the test above, the REAL helper runs, so
+    the runner boundary install.py hands over is exercised end to end."""
+    import types as _types
+
+    import install as installer
+
+    real_install = cp.install
+    helper_calls: List[dict] = []
+    boundary_argv: List[list] = []
+
+    def spying_install(**kw):
+        helper_calls.append(kw)
+        return real_install(**kw)
+
+    def fake_logged_run(cmd, **_kw):
+        argv = list(cmd)
+        boundary_argv.append(argv)
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cp, "install", spying_install)
+    monkeypatch.setattr(installer, "_run_logged_subprocess", fake_logged_run)
+    monkeypatch.delenv("VCT_SKIP_CODEGRAPH_TS", raising=False)
+    monkeypatch.setattr(installer, "_log_install_event", lambda *a, **k: None)
+
+    installer._install_codegraph_treesitter(Path("/venv/bin/python"))
+
+    # 1) the ONE helper was reached, with install.py's runner and target.
+    assert len(helper_calls) == 1, (
+        "install.py did not route through vco_lib.codegraph_parsers.install")
+    kw = helper_calls[0]
+    assert kw["python"] == Path("/venv/bin/python")
+    assert kw["targets"] == ["-e", f"{installer.PROJECT_ROOT}[codegraph-ts]"]
+    assert not kw.get("verify_parsers")  # the default extra: pip only
+    # 2) exactly ONE subprocess crossed the boundary — the helper's pip argv,
+    #    carried by install.py's runner (a second argv would mean install.py
+    #    also ran pip around the helper).
+    assert len(boundary_argv) == 1, boundary_argv
+    assert boundary_argv[0][:4] == ["/venv/bin/python", "-m", "pip", "install"]
+    assert f"{installer.PROJECT_ROOT}[codegraph-ts]" in boundary_argv[0]
+
+
 # ---------------------------------------------------------------------------
 # Optional grammars: the loader never downloads; regex fallback; hash salt
 # ---------------------------------------------------------------------------
