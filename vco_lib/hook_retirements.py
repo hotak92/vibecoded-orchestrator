@@ -201,6 +201,17 @@ class RetiredRegistration:
             ``is_async`` argument). Callers that cannot tell pass ``None``
             and async-only rows do NOT match — no positive evidence, no
             removal.
+        group_matcher: (v0.2.102 W6-K) match ONLY registrations that sit in
+            a group whose ``matcher`` equals this value verbatim. For events
+            whose matcher selects a firing context (SessionStart's
+            ``startup`` / ``compact`` / ``resume``), retiring ONE context
+            must not touch the others: the v0.2.102 W6-F ``resume``
+            registration of ``compact-context-reinject`` was withdrawn
+            (owner 2026-10-11: a resumed chat already has CONTEXT_STATE in
+            context) while the ``startup`` and ``compact`` groups keep
+            firing. Callers that cannot see the group's matcher pass
+            ``None`` and scoped rows do NOT match — same conservative
+            no-evidence-no-removal rule as ``async_only``.
     """
 
     event: str
@@ -210,6 +221,7 @@ class RetiredRegistration:
     retired_in: str
     replacement: str
     async_only: bool = False
+    group_matcher: str = ""
 
     @property
     def audit_replacement(self) -> str:
@@ -496,6 +508,46 @@ RETIRED_REGISTRATIONS: Tuple[RetiredRegistration, ...] = (
         replacement="",
         async_only=True,
     ),
+    # v0.2.102 W6-K (owner ruling 2026-10-11): the W6-F `resume`
+    # registration of the re-inject hook is withdrawn — a resumed chat
+    # already carries CONTEXT_STATE in its context, so re-injecting it
+    # duplicates the whole block. Matcher-scoped (group_matcher="resume"):
+    # the `startup` and `compact` groups of the SAME script keep firing, so
+    # this row must never match them.
+    RetiredRegistration(
+        event="SessionStart",
+        kind=KIND_HOOK_SCRIPT,
+        target="compact-context-reinject.sh",
+        reason=(
+            "the SessionStart `resume` re-inject registration was withdrawn "
+            "in v0.2.102 (owner 2026-10-11): a resumed chat already has "
+            "CONTEXT_STATE in context; only the startup and compact "
+            "groups keep firing"
+        ),
+        retired_in="v0.2.102",
+        replacement=(
+            "compact-context-reinject under the startup and compact "
+            "matchers (unchanged)"
+        ),
+        group_matcher="resume",
+    ),
+    RetiredRegistration(
+        event="SessionStart",
+        kind=KIND_HOOK_SCRIPT,
+        target="compact-context-reinject.ps1",
+        reason=(
+            "the SessionStart `resume` re-inject registration was withdrawn "
+            "in v0.2.102 (owner 2026-10-11): a resumed chat already has "
+            "CONTEXT_STATE in context; only the startup and compact "
+            "groups keep firing"
+        ),
+        retired_in="v0.2.102",
+        replacement=(
+            "compact-context-reinject under the startup and compact "
+            "matchers (unchanged)"
+        ),
+        group_matcher="resume",
+    ),
 )
 
 
@@ -505,6 +557,7 @@ def match_retired_registration(
     *,
     hook_identity: Optional[str],
     is_async: Optional[bool] = None,
+    group_matcher: Optional[str] = None,
 ) -> Optional[RetiredRegistration]:
     """Return the retirement this ``(event, command)`` matches, or ``None``.
 
@@ -525,6 +578,11 @@ def match_retired_registration(
             ONLY on ``is_async is True``: no positive evidence, no removal.
             Callers WITH the evidence must pass it; omitting it silently
             degrades to the conservative leave-alone, never to a deletion.
+        group_matcher: (v0.2.102 W6-K) the matcher of the GROUP the
+            registration sits in, when the caller can see it (the scrub
+            walks groups); ``None`` when it cannot. Rows with a non-empty
+            ``group_matcher`` match ONLY on an exact equality — a scoped
+            retirement never fires on evidence the caller does not have.
 
     The walk is deliberately not re-implemented beside this table:
     :func:`vco_hook_script_identity` — the one home for "which token is the
@@ -545,6 +603,10 @@ def match_retired_registration(
             continue
         if entry.async_only and is_async is not True:
             continue  # SF-3: only a positively-async registration matches
+        if entry.group_matcher and group_matcher != entry.group_matcher:
+            continue  # W6-K: a matcher-scoped retirement needs the group's
+            # matcher as POSITIVE evidence — a caller that cannot see it
+            # leaves the registration alone (same rule as async_only).
         if entry.kind == KIND_HOOK_SCRIPT:
             if hook_identity and hook_identity == entry.target:
                 return entry
@@ -951,6 +1013,9 @@ def scrub_retired_registrations(user_hooks: dict) -> Tuple[dict, list]:
                         # SF-3: the scrub SEES the inner-hook dict, so the
                         # async-only rows get their positive evidence here.
                         is_async=None if not isinstance(_async, bool) else _async,
+                        # W6-K: the scrub walks GROUPS, so matcher-scoped
+                        # rows get their evidence here too.
+                        group_matcher=entry.get("matcher"),
                     )
                 if match is None:
                     kept_hooks.append(h)

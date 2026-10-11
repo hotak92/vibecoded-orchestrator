@@ -383,8 +383,8 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `session-start-kg-loader.sh` — display KG resource paths.
 - `context-size-check.sh` — warn (no truncation) if `CONTEXT_STATE.md` exceeds 500 lines.
 
-**SessionStart (startup/compact/resume)**:
-- `compact-context-reinject.sh` — re-inject `CONTEXT_STATE.md` + recent commits + active plan (matchers: `startup`, `compact`, `resume`; the pre-compact snapshot section only on `compact` — it is a compaction artefact).
+**SessionStart (startup/compact)**:
+- `compact-context-reinject.sh` — re-inject `CONTEXT_STATE.md` + recent commits + active plan (matchers: `startup`, `compact`; the pre-compact snapshot section only on `compact` — it is a compaction artefact; `resume` deliberately does NOT re-inject: a resumed chat already has CONTEXT_STATE in context).
 
 **PreCompact (manual + auto)**:
 - `pre-compact-save.sh` — save git status + recent files to `.claude/context/pre-compact-snapshot.md` (before every compaction, `/compact` included).

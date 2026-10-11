@@ -124,16 +124,6 @@
             "timeout": 4
           }
         ]
-      },
-      {
-        "matcher": "resume",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/compact-context-reinject.sh\"",
-            "timeout": 5
-          }
-        ]
       }
     ],
     "PreCompact": [

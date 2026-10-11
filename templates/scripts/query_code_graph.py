@@ -1673,40 +1673,92 @@ class CodeGraphQuery:
 
                 if hook_format:
                     # WP-B2 injection block: one CODE: row per matched target
-                    # entity (<= 5), callers <= 5 each, edge-confirmed callers
+                    # ENTITY (<= 5), callers <= 5 each, edge-confirmed callers
                     # first, symbol+file:line ONLY. The language identity
                     # filter and the revision stamp are applied by the shared
                     # pure helpers (hermetically tested).
-                    ordered_callers = sorted(
-                        callers,
-                        key=lambda c: 0 if ((c.properties or {}).get("full_name") in confirmed_names) else 1,
-                    )
-                    caller_items = [
-                        {
-                            "full_name": (c.properties or {}).get("full_name") or "",
-                            "file": (c.properties or {}).get("file_path") or "",
-                            "line": (c.properties or {}).get("start_line"),
-                        }
-                        for c in ordered_callers
-                    ]
-                    if exclude_file:
-                        # §2.1 Edit row: self-file callers are context the
-                        # model already has (it is editing that file).
-                        caller_items = [
-                            c for c in caller_items
-                            if not _same_source_file(c.get("file") or "", exclude_file)
+                    #
+                    # v0.2.102 W6-K (item 9): the callers list is computed PER
+                    # DISTINCT matched full_name, never shared across rows.
+                    # The identity lookup above is exact-then-TOLERANT, so a
+                    # bare-leaf target ("prompt") can resolve to several
+                    # DIFFERENT functions — pre-fix, the ONE callers list
+                    # built from the requested target's name terms was
+                    # stamped on every row (live v0.2.101 symptom: five
+                    # different functions each carrying the same
+                    # "callers: ... (+43)" line). A group whose terms equal
+                    # the requested target's reuses the already-fetched
+                    # caller_response (the common exact-match case costs
+                    # exactly what it did before); every other group runs its
+                    # own contains_any fetch, corroborated against ITS rows'
+                    # uuids. Chunked rows of one function collapse to a
+                    # single entity (the canonical chunk's def line), which
+                    # is what "one row per matched entity" always meant.
+                    def _hook_caller_items(terms, uuids, preloaded=None):
+                        resp = preloaded
+                        if resp is None:
+                            resp = coll.query.fetch_objects(
+                                filters=Filter.by_property("call_names").contains_any(
+                                    terms
+                                ),
+                                limit=CALLERS_FETCH_LIMIT,
+                                return_references=QueryReference(link_on="calls"),
+                            )
+                        group_confirmed = set()
+                        for obj in resp.objects:
+                            for ref in read_cross_reference(obj, "calls"):
+                                if str(getattr(ref, "uuid", "")) in uuids:
+                                    group_confirmed.add(
+                                        (obj.properties or {}).get("full_name") or ""
+                                    )
+                                    break
+                        ordered = sorted(
+                            _dedup_objects_by_full_name(resp.objects),
+                            key=lambda c: 0
+                            if ((c.properties or {}).get("full_name") in group_confirmed)
+                            else 1,
+                        )
+                        items = [
+                            {
+                                "full_name": (c.properties or {}).get("full_name") or "",
+                                "file": (c.properties or {}).get("file_path") or "",
+                                "line": (c.properties or {}).get("start_line"),
+                            }
+                            for c in ordered
                         ]
-                    entities = []
+                        if exclude_file:
+                            # §2.1 Edit row: self-file callers are context the
+                            # model already has (it is editing that file).
+                            items = [
+                                c for c in items
+                                if not _same_source_file(c.get("file") or "", exclude_file)
+                            ]
+                        return items
+
+                    target_terms = _caller_match_terms(target)
+                    groups: "dict[str, list]" = {}
                     for row in response.objects[:HOOK_FORMAT_MAX_ROWS]:
-                        p = row.properties or {}
+                        fn = (row.properties or {}).get("full_name") or target
+                        groups.setdefault(fn, []).append(row)
+                    entities = []
+                    for fn, fn_rows in groups.items():
+                        terms = _caller_match_terms(fn)
+                        if terms == target_terms:
+                            items = _hook_caller_items(
+                                terms, target_uuids, preloaded=caller_response)
+                        else:
+                            items = _hook_caller_items(
+                                terms, {str(r.uuid) for r in fn_rows})
+                        canonical = pick_canonical_chunk(fn_rows)
+                        p = (canonical.properties or {}) if canonical is not None else {}
                         entities.append({
-                            "full_name": p.get("full_name") or target,
+                            "full_name": fn,
                             "kind": "function",
                             "language": p.get("language") or "",
                             "file": p.get("file_path") or "",
                             "line": p.get("start_line"),
                             "rel": "callers",
-                            "callers": caller_items,
+                            "callers": items,
                         })
                     entities = filter_same_language(entities, target, source_file)
                     block = format_structure_hook_block(

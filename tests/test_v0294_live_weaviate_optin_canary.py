@@ -37,18 +37,19 @@ def test_this_file_is_registered_as_a_stand_aside():
 
 
 def test_the_pin_stood_aside_and_the_ambient_value_survived():
-    """The whole claim: an opted-in file sees the environment, not the pin.
+    """The whole claim: this canary sees the environment, not the pin.
+
+    v0.2.102 W6-K (owner 2026-10-11): this file is one of the READ-ONLY
+    smoke files, which see the ambient value UNCONDITIONALLY — read-only
+    live access is safe, no opt-in env required.
 
     ``None`` (the key absent) is a real, required outcome — a live test doing
     ``os.environ.get("WEAVIATE_URL", "http://localhost:8081")`` needs the
     ABSENCE to reach its own default, so restoring an empty string instead
     would break it.
     """
+    assert Path(__file__).name in _conftest._LIVE_WEAVIATE_READONLY_FILES
     ambient = _conftest._AMBIENT_WEAVIATE_URL
-    if not (_conftest._LIVE_WEAVIATE_OPTED_IN or _conftest._ALLOW_REAL_STATE):
-        # v0.2.102 W6-B2 last round: no explicit opt-in → pinned like any file.
-        assert os.environ.get("WEAVIATE_URL") == UNROUTABLE_SENTINEL_URL
-        return
     if ambient is None:
         assert "WEAVIATE_URL" not in os.environ, (
             "the stand-aside must REMOVE the key when the ambient env had "
@@ -147,12 +148,22 @@ def test_a_non_opt_out_live_module_still_sees_the_pin():
     assert _DISTINCT_AMBIENT not in out, out[-1500:]
 
 
-def test_without_the_opt_in_an_opt_out_module_sees_the_pin():
-    """v0.2.102 W6-B2 last round: an ambient WEAVIATE_URL alone (a developer
-    shell, a Claude Code session) is NOT an opt-in. Red before: the listed
-    modules read the ambient value and reached a live backend."""
-    for target in ("test_v0246_v46b_live_ci10_diff_gate.py",
-                   "test_codegraph_retrieval_quality_smoke.py"):
+def test_without_the_opt_in_a_write_capable_module_sees_the_pin():
+    """v0.2.102 W6-B2 last round, still true for the WRITE-capable files:
+    an ambient WEAVIATE_URL alone (a developer shell, a Claude Code session)
+    is NOT an opt-in. Red before: the listed modules read the ambient value
+    and reached a live backend."""
+    for target in ("test_v0246_v46b_live_ci10_diff_gate.py",):
         out = _child_skip_reasons(target, _DISTINCT_AMBIENT, opt_in=False)
         assert _DISTINCT_AMBIENT not in out, (
             f"{target} reached the ambient backend without the opt-in:\n{out[-1500:]}")
+
+
+def test_without_the_opt_in_a_readonly_smoke_module_reads_the_ambient_url():
+    """v0.2.102 W6-K (owner 2026-10-11): the READ-ONLY smoke file queries the
+    live backend on a plain run — ambient, unconditional, by design."""
+    target = "test_codegraph_retrieval_quality_smoke.py"
+    out = _child_skip_reasons(target, _DISTINCT_AMBIENT, opt_in=False)
+    assert _DISTINCT_AMBIENT in out, (
+        f"{target} must read the ambient WEAVIATE_URL at import with no "
+        f"opt-in (read-only live access is sanctioned):\n{out[-1500:]}")

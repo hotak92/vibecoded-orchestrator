@@ -159,12 +159,37 @@ def test_prompt_query_rule():
     assert prompt_query("!ls -la") == "", "bang shell passthroughs skip"
     assert prompt_query("ok") == "", "trivially short prompts skip"
     assert prompt_query("yes, continue") == ""
-    q = prompt_query("How does the KG nudge threshold interact with compaction?")
+    # v0.2.102 W6-K (owner 2026-10-11): the bar is 100 trimmed chars — an
+    # 80-char acknowledgement-of-detail prompt still spawns no search.
+    assert prompt_query(
+        "Please go ahead and start the review of the hooks lane now, thanks"
+        " " + "x" * 20) == "", "below 100 chars skips"
+    q = prompt_query("How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?")
     assert q.startswith("How does the KG nudge")
     # whitespace collapses to single spaces; the query is capped
     q2 = prompt_query("line one\n\nline two\twith\tspaces " + "x" * 500)
     assert "\n" not in q2 and "\t" not in q2
     assert len(q2) <= 400
+
+
+def test_prompt_min_chars_knob(monkeypatch):
+    """VCO_PROMPT_MIN_CHARS moves the one threshold, both arms (W6-K)."""
+    from vco_lib import inject_intent
+    from vco_lib.inject_intent import prompt_query
+
+    mid = "a" * 60
+    assert prompt_query(mid) == "", "60 chars is below the default 100"
+    monkeypatch.setenv(inject_intent.PROMPT_MIN_CHARS_ENV, "50")
+    assert prompt_query(mid) == mid, "the knob lowers the threshold"
+    monkeypatch.setenv(inject_intent.PROMPT_MIN_CHARS_ENV, "120")
+    assert prompt_query("b" * 115) == "", "the knob raises the threshold"
+    long_enough = "c" * 130
+    assert prompt_query(long_enough) == long_enough
+    # A non-positive or unparseable value falls back to the default — the
+    # knob must not become an accidental second kill switch.
+    for bad in ("0", "-5", "garbage", ""):
+        monkeypatch.setenv(inject_intent.PROMPT_MIN_CHARS_ENV, bad)
+        assert prompt_query("d" * 120) == "d" * 120, f"{bad!r} falls back to 100"
 
 
 def test_prompt_profile_is_registered():
@@ -185,7 +210,7 @@ def test_prompt_profile_is_registered():
 @needs_bash
 class TestPromptWrapperSh:
     def test_prompt_injects_kg_context(self, rig: Rig) -> None:
-        prompt = "How does the KG nudge threshold interact with compaction?"
+        prompt = "How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?"
         r = rig.run(prompt)
         assert r.returncode == 0, r.stderr[-800:]
         kg = rig.kg_records()
@@ -220,7 +245,7 @@ class TestPromptWrapperSh:
         assert rig.kg_records() == []
 
     def test_kill_switch_profile_off(self, rig: Rig) -> None:
-        r = rig.run("How does the KG nudge threshold interact with compaction?",
+        r = rig.run("How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?",
                     env_overrides={"VCO_INJECT_PROFILE": "off"})
         assert r.returncode == 0, r.stderr
         assert r.stdout.strip() == ""
@@ -230,14 +255,14 @@ class TestPromptWrapperSh:
         """VCO_PROMPT_INJECT=off (fix-round 2026-10-11, review MEDIUM-2):
         the prompt surface's own opt-out — the wrapper exits BEFORE any
         python starts, so not even the stub producer is spawned."""
-        r = rig.run("How does the KG nudge threshold interact with compaction?",
+        r = rig.run("How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?",
                     env_overrides={"VCO_PROMPT_INJECT": "off"})
         assert r.returncode == 0, r.stderr
         assert r.stdout.strip() == ""
         assert rig.kg_records() == [], "the router must never be spawned"
 
     def test_per_surface_kill_switch_is_case_insensitive(self, rig: Rig) -> None:
-        r = rig.run("How does the KG nudge threshold interact with compaction?",
+        r = rig.run("How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?",
                     env_overrides={"VCO_PROMPT_INJECT": "OFF"})
         assert r.returncode == 0, r.stderr
         assert r.stdout.strip() == ""
@@ -246,21 +271,21 @@ class TestPromptWrapperSh:
     def test_per_surface_kill_switch_non_off_keeps_surface(self, rig: Rig) -> None:
         """Only the literal `off` (any case) disables — any other value,
         including a set-but-not-off one, keeps the surface working."""
-        r = rig.run("How does the KG nudge threshold interact with compaction?",
+        r = rig.run("How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?",
                     env_overrides={"VCO_PROMPT_INJECT": "on"})
         assert r.returncode == 0, r.stderr
         assert "KG: Stub Node" in r.stdout
         assert rig.kg_records()
 
     def test_disable_hooks_switch(self, rig: Rig) -> None:
-        r = rig.run("How does the KG nudge threshold interact with compaction?",
+        r = rig.run("How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?",
                     env_overrides={"VCT_DISABLE_HOOKS": "1"})
         assert r.returncode == 0, r.stderr
         assert r.stdout.strip() == ""
         assert rig.kg_records() == []
 
     def test_repeat_prompt_injects_once_per_session(self, rig: Rig) -> None:
-        prompt = "How does the KG nudge threshold interact with compaction?"
+        prompt = "How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?"
         r1 = rig.run(prompt)
         assert "KG: Stub Node" in r1.stdout
         r2 = rig.run(prompt)
@@ -269,7 +294,7 @@ class TestPromptWrapperSh:
         )
 
     def test_per_injection_cap_marks_the_cut(self, rig: Rig) -> None:
-        r = rig.run("How does the KG nudge threshold interact with compaction?",
+        r = rig.run("How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?",
                     env_overrides={"VCO_STUB_KG_LONG": "1"})
         assert r.returncode == 0, r.stderr
         ctx = _envelope(r.stdout)["hookSpecificOutput"]["additionalContext"]
@@ -278,7 +303,7 @@ class TestPromptWrapperSh:
 
 @needs_pwsh
 def test_prompt_wrapper_ps1_parity(rig: Rig) -> None:
-    prompt = "How does the KG nudge threshold interact with compaction?"
+    prompt = "How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?"
     r = rig.run(prompt, shell="ps1")
     assert r.returncode == 0, r.stderr[-800:]
     env = _envelope(r.stdout)
@@ -291,7 +316,7 @@ def test_prompt_wrapper_ps1_parity(rig: Rig) -> None:
 def test_prompt_wrapper_ps1_honours_per_surface_kill_switch(rig: Rig) -> None:
     """VCO_PROMPT_INJECT=off in the .ps1 sibling too: exit before any
     python starts (fix-round; MUST MATCH the .sh arm)."""
-    r = rig.run("How does the KG nudge threshold interact with compaction?",
+    r = rig.run("How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?",
                 shell="ps1", env_overrides={"VCO_PROMPT_INJECT": "off"})
     assert r.returncode == 0, r.stderr[-800:]
     assert r.stdout.strip() == ""
@@ -307,7 +332,7 @@ def test_router_rechecks_per_surface_kill_switch(tmp_path: Path) -> None:
     payload = json.dumps({
         "hook_event_name": "UserPromptSubmit", "session_id": "sess-pi-ks",
         "cwd": str(rig.proj),
-        "prompt": "How does the KG nudge threshold interact with compaction?",
+        "prompt": "How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?",
     })
     env = child_env({k: v for k, v in os.environ.items()
                      if k not in ("VCT_DISABLE_HOOKS", "VCO_INJECT_PROFILE",
@@ -421,7 +446,7 @@ def test_kg_leg_survives_a_thread_hostile_producer_import(tmp_path: Path) -> Non
     payload = json.dumps({
         "hook_event_name": "UserPromptSubmit", "session_id": "thr-1",
         "cwd": str(proj),
-        "prompt": "How does the KG nudge threshold interact with compaction?",
+        "prompt": "How does the KG nudge threshold interact with compaction and with the per-section reinject budgets across sessions?",
     })
     env = child_env({k: v for k, v in os.environ.items()
                      if k not in ("VCT_DISABLE_HOOKS", "VCO_INJECT_PROFILE",

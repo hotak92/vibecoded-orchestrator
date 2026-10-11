@@ -96,34 +96,46 @@ Skip if the commit is purely cosmetic or test-only.
 "@
 
     $logFile = Join-Path $LogDir "kg-commit-review.log"
-    $allowedTools = "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,mcp__weaviate-kg__store_knowledge_node,Write,Edit"
-    # The prompt rides on STDIN, never on the command line, for two reasons:
-    #   * Start-Process joins an ARRAY -ArgumentList with spaces and the child
-    #     re-splits it (QUIRK 3 in _lib/resolve-powershell.ps1) — this prompt
-    #     embeds `git diff` output, and the CLI parsed the diff's `---` token
-    #     as an option ("error: unknown option '---'", exit 1) on every
-    #     non-empty commit, so the review never actually ran;
-    #   * the Windows command line is capped at 32 767 chars, and this prompt
-    #     carries the first 300 lines of the unified diff.
-    # `claude -p` with no prompt argument reads the prompt from stdin — the
-    # same stdin shape summary_backends.call_cli adopted.
-    # [IO.File]::WriteAllText, not Set-Content -Encoding utf8: on Windows
-    # PowerShell 5.1 the cmdlet form prepends a UTF-8 BOM, which would then
-    # be the first bytes of the model's prompt.
+    # The prompt rides on STDIN / a prompt FILE, never on the command line
+    # (Start-Process re-splits -ArgumentList; the prompt embeds `git diff`
+    # output whose `---` the CLI parsed as an option; the Windows command
+    # line is capped at 32 767 chars). [IO.File]::WriteAllText, not
+    # Set-Content -Encoding utf8: the cmdlet form prepends a UTF-8 BOM on
+    # Windows PowerShell 5.1.
     $PromptFile = Join-Path $LogDir "kg-commit-review.prompt"
     [System.IO.File]::WriteAllText($PromptFile, $prompt)
+    # v0.2.102 W6-K (owner ruling 2026-10-11): spawn through the shared
+    # backend chain -- Haiku by default; when Haiku is unavailable
+    # (quota/429/auth, a REAL signal latched in the summary breaker) fall
+    # back to the gateway flash models the local model gateway actually
+    # serves (glm-5.3-flash -> deepseek-v4.1-flash -> qwen3.8-flash), then
+    # to OpenAI when the user enabled OpenAI for summaries. One chain, one
+    # home: .claude/scripts/kg_reviewer_backend.py. Broken/partial install
+    # (python or the chain script missing): the pre-W6-K direct Haiku
+    # spawn, unchanged.
+    $ReviewerChain = Join-Path $ProjectRoot ".claude/scripts/kg_reviewer_backend.py"
+    $LibDir = Join-Path $PSScriptRoot "_lib"
+    $FindPy = Join-Path $LibDir "find-python.ps1"
+    if (Test-Path $FindPy) { . $FindPy }
     # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1). TWO
     # cmdlet-level parameter rejections were killing this spawn outright:
     #   * `-WindowStyle Hidden` is rejected by non-Windows PowerShell editions;
     #   * naming the SAME file for -RedirectStandardOutput and
-    #     -RedirectStandardError is rejected on EVERY edition ("...are same"),
-    #     which is what this call did — so the commit review has never started
-    #     on Windows either. stderr goes to `<log>.err` instead.
-    $proc = Start-VcoDetachedProcess -FilePath "claude" `
-        -ArgumentList @('-p', '--model', 'haiku', '--max-turns', '10', '--no-session-persistence', '--allowedTools', $allowedTools) `
-        -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
-        -RedirectStandardInput $PromptFile `
-        -WorkingDirectory $ProjectRoot -PassThru
+    #     -RedirectStandardError is rejected on EVERY edition ("...are same").
+    # stderr goes to `<log>.err` instead.
+    if ($PY -and (Test-Path $ReviewerChain)) {
+        $proc = Start-VcoDetachedProcess -FilePath $PY `
+            -ArgumentList @($ReviewerChain, 'run', '--prompt-file', $PromptFile, '--log', $logFile, '--max-turns', '10') `
+            -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
+            -WorkingDirectory $ProjectRoot -PassThru
+    } else {
+        $allowedTools = "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,mcp__weaviate-kg__store_knowledge_node,Write,Edit"
+        $proc = Start-VcoDetachedProcess -FilePath "claude" `
+            -ArgumentList @('-p', '--model', 'haiku', '--max-turns', '10', '--no-session-persistence', '--allowedTools', $allowedTools) `
+            -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
+            -RedirectStandardInput $PromptFile `
+            -WorkingDirectory $ProjectRoot -PassThru
+    }
 
     $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     $msgEsc = $CommitMsg -replace '\\', '\\\\' -replace '"', '\"'

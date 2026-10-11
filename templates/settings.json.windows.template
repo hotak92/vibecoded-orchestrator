@@ -124,16 +124,6 @@
             "timeout": 4
           }
         ]
-      },
-      {
-        "matcher": "resume",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/compact-context-reinject.ps1\"",
-            "timeout": 5
-          }
-        ]
       }
     ],
     "PreCompact": [

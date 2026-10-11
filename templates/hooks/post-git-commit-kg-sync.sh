@@ -90,17 +90,41 @@ ${DIFF_DETAIL}
 Focus on architectural changes, new features, API changes, and pattern changes.
 Skip if the commit is purely cosmetic or test-only."
 
-# Spawn background Haiku agent via Claude CLI
-# Uses --model haiku for cost efficiency, --max-turns 10 to cap effort
-nohup claude -p "$PROMPT" \
-    --model haiku \
-    --max-turns 10 \
-    --no-session-persistence \
-    --allowedTools "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,mcp__weaviate-kg__store_knowledge_node,Write,Edit" \
-    >> "$LOG_DIR/kg-commit-review.log" 2>&1 &
+# Spawn the background reviewer through the shared backend chain
+# (v0.2.102 W6-K, owner ruling 2026-10-11): Haiku by default; when Haiku is
+# unavailable (quota/429/auth — a REAL signal, latched in the summary
+# breaker), fall back to the gateway flash models the local model gateway
+# actually serves (glm-5.3-flash -> deepseek-v4.1-flash -> qwen3.8-flash),
+# then to OpenAI when the user enabled OpenAI for summaries. One chain, one
+# home: .claude/scripts/kg_reviewer_backend.py (it reuses summary_backends'
+# classification/breaker). Every fallback is logged there.
+REVIEWER_CHAIN="$PROJECT_ROOT/.claude/scripts/kg_reviewer_backend.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+if [ -n "${PY:-}" ] && [ -f "$REVIEWER_CHAIN" ]; then
+    PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/vco-kg-reviewer.XXXXXX")"
+    printf '%s' "$PROMPT" > "$PROMPT_FILE"
+    nohup "$PY" "$REVIEWER_CHAIN" run \
+        --prompt-file "$PROMPT_FILE" \
+        --log "$LOG_DIR/kg-commit-review.log" \
+        --max-turns 10 \
+        >> "$LOG_DIR/kg-commit-review.log" 2>&1 &
+    REVIEWER_PID=$!
+else
+    # Broken/partial install (python or the chain script missing): the
+    # pre-W6-K direct Haiku spawn, unchanged.
+    nohup claude -p "$PROMPT" \
+        --model haiku \
+        --max-turns 10 \
+        --no-session-persistence \
+        --allowedTools "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,mcp__weaviate-kg__store_knowledge_node,Write,Edit" \
+        >> "$LOG_DIR/kg-commit-review.log" 2>&1 &
+    REVIEWER_PID=$!
+fi
 
 # Log the event
-echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"commit\":\"${COMMIT_HASH}\",\"message\":\"${COMMIT_MSG}\",\"pid\":$!}" \
+echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"commit\":\"${COMMIT_HASH}\",\"message\":\"${COMMIT_MSG}\",\"pid\":${REVIEWER_PID}}" \
     >> "$LOG_DIR/kg-commit-reviews.jsonl" 2>/dev/null || true
 
 # No stdout: PostToolUse plain stdout is dropped per the v2.1.x

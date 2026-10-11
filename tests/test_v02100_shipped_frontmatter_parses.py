@@ -87,6 +87,11 @@ ISOLATION_EXEMPT: dict[str, str] = {
     # guide: explicit "NOT enabled" list — defaults
     "agents/free/planner": "guide: planning only",
     "agents/free/code-explorer": "guide: read-only research (Write/Edit only saves its report file)",
+    # v0.2.102 W6-K: the reviewer's Write is scoped BY ITS INSTRUCTIONS to its
+    # own report file at the path the brief names (never source/tests/docs);
+    # a worktree isolation would make it review a COPY and write the report
+    # into the throwaway worktree — the opposite of the rule's intent.
+    "agents/free/code-reviewer": "report-only review: Write saves its report file at the brief-named path, never source",
     "agents/free/tester": "guide: writes tests but low risk (tests go in tests/)",
     "agents/free/doc-maintainer": "guide: documentation",
     "agents/free/kg-maintainer": "guide: knowledge graph read/write to isolated state",

@@ -407,9 +407,10 @@ def test_default_decision_is_the_sentinel():
 
 
 def test_opt_out_decision_restores_the_ambient_value_only_when_opted_in(monkeypatch):
-    """v0.2.102 W6-B2 last round: the stand-aside needs VCO_TEST_LIVE_WEAVIATE=1.
-    Red before: a listed file got the ambient value unconditionally, so a plain
-    run from a shell exporting WEAVIATE_URL reached the live Weaviate."""
+    """v0.2.102 W6-B2 last round: the WRITE-capable stand-aside needs
+    VCO_TEST_LIVE_WEAVIATE=1. Red before: a listed file got the ambient value
+    unconditionally, so a plain run from a shell exporting WEAVIATE_URL
+    reached the live Weaviate."""
     monkeypatch.setattr(_conftest, "_ALLOW_REAL_STATE", False)
     monkeypatch.setattr(_conftest, "_LIVE_WEAVIATE_OPTED_IN", True)
     for name in sorted(_conftest._LIVE_WEAVIATE_OPT_OUT_FILES):
@@ -418,10 +419,31 @@ def test_opt_out_decision_restores_the_ambient_value_only_when_opted_in(monkeypa
             == _conftest._AMBIENT_WEAVIATE_URL
         ), f"{name} must see the ambient WEAVIATE_URL when opted in"
     monkeypatch.setattr(_conftest, "_LIVE_WEAVIATE_OPTED_IN", False)
-    for name in sorted(_conftest._LIVE_WEAVIATE_OPT_OUT_FILES):
+    write_capable = sorted(
+        _conftest._LIVE_WEAVIATE_OPT_OUT_FILES
+        - _conftest._LIVE_WEAVIATE_READONLY_FILES
+    )
+    assert write_capable, "the read-only carve-out must not swallow the list"
+    for name in write_capable:
         assert (
             _conftest._weaviate_url_pin_for(name) == fcg.UNROUTABLE_SENTINEL_URL
         ), f"{name} must be pinned without the explicit opt-in"
+
+
+def test_readonly_smoke_files_see_the_ambient_url_without_any_opt_in(monkeypatch):
+    """v0.2.102 W6-K (owner 2026-10-11: read-only live access is SAFE): the
+    read-only members are ambient UNCONDITIONALLY — a plain full-suite run
+    from a session exporting WEAVIATE_URL may query the live backend, and
+    that is the sanctioned behaviour again."""
+    monkeypatch.setattr(_conftest, "_ALLOW_REAL_STATE", False)
+    monkeypatch.setattr(_conftest, "_LIVE_WEAVIATE_OPTED_IN", False)
+    for name in sorted(_conftest._LIVE_WEAVIATE_READONLY_FILES):
+        assert (
+            _conftest._weaviate_url_pin_for(name)
+            == _conftest._AMBIENT_WEAVIATE_URL
+        ), f"read-only {name} must see the ambient WEAVIATE_URL with no opt-in"
+        assert name in _conftest._LIVE_WEAVIATE_OPT_OUT_FILES, (
+            f"{name} must stay in the collection-time carve-out list too")
 
 
 def test_the_leak_guard_names_a_changed_or_removed_url(monkeypatch):

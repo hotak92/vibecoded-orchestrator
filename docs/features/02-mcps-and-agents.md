@@ -277,9 +277,6 @@ Generates LLM summaries (Claude Haiku) for KG nodes and stores them in `knowledg
 ### `bash_security.py`
 Security scan backend for `pre-tool-use.sh`: SSRF guards, shell injection pattern matching.
 
-### `precompact_prune.py`
-Pre-compaction pruning of `CONTEXT_STATE.md` to stay within line limits. Invoked by the `PreCompact` hook.
-
 ### `detect-project.sh` / `detect-project.ps1`
 Given a file path and the current project root, prints the name of the sibling folder (under the root's parent) that holds the file, or nothing. Its only consumer is the unregistered `code-graph-incremental` hook. It is never used to choose a code graph to search: since v0.2.100 every hook search (pre-edit included) runs as the calling project, with its own prefix (which also holds its extra code-graph paths) and its own code-graph grants, because a folder name is not a grant. (Secrets scoping by a `.vct-project` marker is `vct detect-project`, a different tool.)
 

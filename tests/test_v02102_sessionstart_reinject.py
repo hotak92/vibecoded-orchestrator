@@ -14,12 +14,18 @@ Pre-fix defects (research report 2026-10-10, items 8 and 13 — verified):
 Post-fix contract:
 
 * Both settings templates register compact-context-reinject under
-  ``startup``, ``compact`` AND ``resume`` (kg-update-nudge stays
-  compact-only — its own reset semantics deliberately exclude resume).
+  ``startup`` and ``compact`` ONLY (kg-update-nudge stays compact-only).
+  W6-F had also registered ``resume``; v0.2.102 W6-K withdrew it (owner
+  2026-10-11: a resumed chat already has CONTEXT_STATE in context) via a
+  matcher-scoped retirement row — the scrub removes the resume group from
+  an install that received the W6-F shape, and never touches the
+  startup/compact groups of the same script.
 * The settings merge delivers the two new registrations to an existing
   install (user file with the v0.2.101 compact-only shape) exactly once,
   idempotently, never touching the user's own hooks.
-* The hook honours the payload ``source``: startup/resume inject
+* The hook honours the payload ``source`` (kept even though the resume
+  REGISTRATION is gone — a user may still register it themselves):
+  startup/resume inject
   CONTEXT_STATE.md (in full, inside the W6-D per-section budgets and the
   shared cap) but SKIP the compaction artefacts (the pre-compact snapshot
   and pruned-activity summary are meaningless outside compaction);
@@ -73,13 +79,14 @@ def _matchers_for(doc: dict, stem: str) -> set:
 
 
 @pytest.mark.parametrize("tpl", TPLS, ids=["linux", "windows"])
-def test_reinject_registered_for_startup_compact_and_resume(tpl: Path):
+def test_reinject_registered_for_startup_and_compact_only(tpl: Path):
+    """W6-K (owner 2026-10-11): resume must NOT re-inject — a resumed chat
+    already has CONTEXT_STATE in context."""
     doc = json.loads(tpl.read_text(encoding="utf-8"))
     matchers = _matchers_for(doc, "compact-context-reinject")
-    assert {"startup", "compact", "resume"} <= matchers, (
-        f"{tpl.name}: the documented SessionStart (compact/resume) re-inject "
-        f"plus the startup CONTEXT_STATE injection need all three matchers; "
-        f"got {sorted(matchers)}"
+    assert matchers == {"startup", "compact"}, (
+        f"{tpl.name}: the re-inject needs exactly the startup and compact "
+        f"matchers (resume withdrawn, W6-K); got {sorted(matchers)}"
     )
 
 
@@ -112,18 +119,51 @@ def _v02101_user(ext: str) -> dict:
 
 
 @pytest.mark.parametrize("tpl", TPLS, ids=["linux", "windows"])
-def test_resume_and_startup_registrations_migrate_once(tpl: Path):
+def test_startup_registration_migrates_once(tpl: Path):
     template = json.loads(tpl.read_text(encoding="utf-8"))
     ext = "sh" if tpl is LINUX else "ps1"
     user = _v02101_user(ext)
     once = settings_merge.smart_merge_settings(user, template)
     matchers = _matchers_for(once, "compact-context-reinject")
-    assert {"startup", "compact", "resume"} <= matchers, (
-        f"the merge must deliver the new registrations; got {sorted(matchers)}"
+    assert {"startup", "compact"} <= matchers, (
+        f"the merge must deliver the startup registration; got {sorted(matchers)}"
     )
     # Idempotent: merging its own output changes nothing.
     twice = settings_merge.smart_merge_settings(once, template)
     assert twice["hooks"]["SessionStart"] == once["hooks"]["SessionStart"]
+
+
+@pytest.mark.parametrize("tpl", TPLS, ids=["linux", "windows"])
+def test_w6f_resume_registration_is_scrubbed(tpl: Path):
+    """W6-K: an install that received W6-F's resume group loses it on the
+    next ordinary update, and ONLY it — the same script's startup and
+    compact groups survive the merge untouched."""
+    template = json.loads(tpl.read_text(encoding="utf-8"))
+    ext = "sh" if tpl is LINUX else "ps1"
+    cmd = (f'bash "${{CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/'
+           f'compact-context-reinject.{ext}"' if ext == "sh" else
+           f'powershell -NoProfile -ExecutionPolicy Bypass -File '
+           f'"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/'
+           f'compact-context-reinject.{ext}"')
+    w6f_user = {"hooks": {"SessionStart": [
+        {"matcher": "startup", "hooks": [
+            {"type": "command", "command": cmd, "timeout": 5}]},
+        {"matcher": "compact", "hooks": [
+            {"type": "command", "command": cmd, "timeout": 5}]},
+        {"matcher": "resume", "hooks": [
+            {"type": "command", "command": cmd, "timeout": 5}]},
+    ]}}
+    merged = settings_merge.smart_merge_settings(w6f_user, template)
+    matchers = _matchers_for(merged, "compact-context-reinject")
+    assert "resume" not in matchers, (
+        f"the withdrawn W6-F resume registration must be scrubbed; "
+        f"got {sorted(matchers)}"
+    )
+    assert {"startup", "compact"} <= matchers
+    # Idempotent: a second merge changes nothing (no resurrection, no
+    # double-removal churn).
+    twice = settings_merge.smart_merge_settings(merged, template)
+    assert twice["hooks"]["SessionStart"] == merged["hooks"]["SessionStart"]
 
 
 @pytest.mark.parametrize("tpl", TPLS, ids=["linux", "windows"])
@@ -194,7 +234,9 @@ def test_startup_injects_context_state_without_compaction_artefacts(impl, tmp_pa
 
 @pytest.mark.parametrize("impl", _SHELLS)
 def test_resume_injects_context_state(impl, tmp_path):
-    """Item 5: the documented SessionStart(resume) re-inject fires."""
+    """The hook still HONOURS source=resume (a user may register it under
+    resume themselves); VCO's own registration was withdrawn (W6-K), the
+    hook's source awareness was not."""
     out = _reinject(impl, _project(tmp_path), "resume")
     assert "## Current Task State" in out
     assert "Current Status" in out
