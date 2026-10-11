@@ -180,9 +180,16 @@ def resolve_openai_api_key(project: Optional[str] = None) -> str:
     ``key_paused`` on either leg (with no copy in a lower tier) resolves
     ``""`` — the slot is OFF — with ONE WARNING naming the panel: a pause
     is a deliberate owner decision, never routed around and never answered
-    from the other leg. ``key_not_active`` on leg 1 falls through to leg 2
-    (the project simply has no dedicated key). ``$OPENAI_API_KEY`` is
-    still NOT read (the matrix is the store; no new env name).
+    from the other leg (W5C-2, coordinator-confirmed: a paused DEDICATED
+    key keeps the slot off even when the shared key is healthy — falling
+    back would route around the pause). ``key_not_active`` on leg 1 falls
+    through to leg 2 silently (the project simply has no dedicated key);
+    a READ failure on leg 1 (hub error, timeout, degraded keychain) also
+    falls through — the run must not break — but with ONE WARNING naming
+    the failure class (W5C-3: a read failure is not an absence, and a
+    silent shared-key answer would hide a keychain problem).
+    ``$OPENAI_API_KEY`` is still NOT read (the matrix is the store; no new
+    env name).
 
     Answers once per project per process — a miss costs one bounded
     localhost request, not one per embedding call."""
@@ -201,50 +208,114 @@ def resolve_openai_api_key(project: Optional[str] = None) -> str:
             # OFF — one WARNING, no fall-through to the shared slot (routing
             # around a pause is the defect), no second-copy remedy.
             _resolved[cache_key] = ""
-            _warn_paused_slot(VCO_PROJECT_SECRET_NAME)
-        except (agent_secrets.ResolverError, OSError, ValueError):
-            # key_not_active / not declared anywhere for this project (or a
-            # read failure — leg 2 will re-raise it as unreadable): the
-            # project has no dedicated key; fall through to the shared slot.
-            try:
-                # Leg 2: VCO's shared slot, shared scope only.
-                _resolved[cache_key] = agent_secrets.get(
-                    OPENAI_SECRET_NAME, project=project, shared_only=True,
-                ).strip()
-            except agent_secrets.SecretPaused:
-                _resolved[cache_key] = ""
-                _warn_paused_slot(OPENAI_SECRET_NAME)
-            except agent_secrets.SecretNotFound:
-                # Both legs answered: a PROVABLE absence.
-                _resolved[cache_key] = ""
-            except (agent_secrets.ResolverError, OSError, ValueError) as exc:
-                # KeychainLocked / HubUnreachable / Forbidden / OSError — we
-                # could NOT read the slot. Never "no key in the slot".
-                _resolved[cache_key] = ""
-                unreadable = type(exc).__name__
+            _warn_paused_slot(VCO_PROJECT_SECRET_NAME, dedicated=True)
+        except (
+            agent_secrets.SecretNotFound,
+            agent_secrets.AccessDenied,
+            agent_secrets.ProjectNotFound,
+        ):
+            # key_not_active / not declared anywhere for this project — a
+            # PROVEN absence of the dedicated key: fall through to the
+            # shared slot SILENTLY (the ordinary no-dedicated-key machine
+            # must not warn on every embedding run).
+            _resolved[cache_key], unreadable = _resolve_shared_leg(
+                agent_secrets, project,
+            )
+        except (agent_secrets.ResolverError, OSError, ValueError) as exc:
+            # W5C-3: a genuine READ failure of leg 1 (hub error, timeout,
+            # degraded keychain) is NOT an absence — the project may well
+            # hold a dedicated key we could not see. Fall through to the
+            # shared slot (the run must not break), but SAY SO once, naming
+            # the failure class; never a value.
+            _warn_leg1_read_failure(type(exc).__name__)
+            _resolved[cache_key], unreadable = _resolve_shared_leg(
+                agent_secrets, project,
+            )
         if not _resolved[cache_key] and not _warned_paused:
             _warn_env_var_ignored(unreadable)
     return _resolved[cache_key]
 
 
-def _warn_paused_slot(which: str) -> None:
+def _resolve_shared_leg(agent_secrets, project: Optional[str]) -> tuple[str, str]:
+    """Leg 2 of :func:`resolve_openai_api_key`, as a helper so every leg-1
+    fall-through runs the SAME code: VCO's shared ``openai_api_key`` slot,
+    shared scope only. Returns ``(value, unreadable)`` — ``unreadable``
+    names the failure class when the slot could not be READ (never a
+    value)."""
+    try:
+        return agent_secrets.get(
+            OPENAI_SECRET_NAME, project=project, shared_only=True,
+        ).strip(), ""
+    except agent_secrets.SecretPaused:
+        _warn_paused_slot(OPENAI_SECRET_NAME)
+        return "", ""
+    except agent_secrets.SecretNotFound:
+        # Both legs answered: a PROVABLE absence.
+        return "", ""
+    except (agent_secrets.ResolverError, OSError, ValueError) as exc:
+        # KeychainLocked / HubUnreachable / Forbidden / OSError — we could
+        # NOT read the slot. Never reported as "no key in the slot".
+        return "", type(exc).__name__
+
+
+def _warn_paused_slot(which: str, *, dedicated: bool = False) -> None:
     """Say ONCE, on stderr, that an OpenAI-slot key is PAUSED — the one
     state a user cannot otherwise distinguish from "no key configured"
     (both render as an OpenAI slot that is off). Names the paused key, the
-    panel where it is resumed; never a value, never a "store it again"
-    remedy (a second copy is exactly the divergence this module exists to
-    prevent)."""
+    panel where it is resumed, and — for the DEDICATED key (W5C-2,
+    coordinator-confirmed semantics) — that the slot stays off EVEN WHEN
+    the shared VCO key is healthy: falling back would route around a
+    deliberate pause. Never a value, never a "store it again" remedy (a
+    second copy is exactly the divergence this module exists to prevent)."""
     global _warned_paused
     if _warned_paused:
         return
     _warned_paused = True
     import sys
 
+    if dedicated:
+        print(
+            f"VCO: this project's OpenAI key ({which}) is PAUSED — VCO's "
+            "OpenAI embedding slot stays OFF for this project even though "
+            "the shared VCO key may be healthy: falling back would route "
+            "around a deliberate pause. Resume the key in the launcher's "
+            "Preferences → Secrets (or this project's Secrets panel); do "
+            "not store a second copy.",
+            file=sys.stderr,
+        )
+        return
     print(
         f"VCO: the OpenAI key slot ({which}) is PAUSED — the "
         "OpenAI embedding slot stays off until it is resumed. Resume it in "
         "the launcher's Preferences → Secrets (or this project's Secrets "
         "panel); do not store a second copy.",
+        file=sys.stderr,
+    )
+
+
+#: One leg-1 read-failure WARNING per process (W5C-3), same rationale as
+#: :data:`_warned_paused`: the failure is a machine/project-wide fact.
+_warned_leg1 = False
+
+
+def _warn_leg1_read_failure(failure: str) -> None:
+    """Say ONCE, on stderr, that the project's dedicated OpenAI key could
+    not be READ (W5C-3) — a read failure is not an absence, and silently
+    answering from the shared slot would hide a keychain problem behind a
+    healthy fallback. Names the failure class and the fallback; never a
+    value, never a "store it again" remedy."""
+    global _warned_leg1
+    if _warned_leg1:
+        return
+    _warned_leg1 = True
+    import sys
+
+    print(
+        f"VCO: could not READ this project's {VCO_PROJECT_SECRET_NAME} "
+        f"({failure}) — falling back to the shared VCO key for this run. "
+        "This is a read failure, not an absence; the project's key may be "
+        "stored. Check the launcher (vct-hub) and the keychain, and do not "
+        "store a second copy.",
         file=sys.stderr,
     )
 
@@ -481,6 +552,85 @@ def _is_clean_key(value: str) -> bool:
     return bool(value) and not any(ch.isspace() or ch in "#'\"" for ch in value)
 
 
+def _registered_project_ids() -> list[str]:
+    """The launcher's registered project ids (sorted), or ``[]`` when the
+    launcher DB is missing or unreadable — a fresh install before the
+    launcher's first start has no projects, so there is nobody to ask and
+    the P3-2 probe stays with the file-store leg alone."""
+    try:
+        from vco_lib.config_projection import list_registered_projects
+        return sorted(str(p["id"]) for p in list_registered_projects())
+    except Exception:  # noqa: BLE001 — a probe never breaks the migration
+        return []
+
+
+def _hub_per_project_copy_owner(
+    value: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """``(owner, why_unknown)`` for the HUB-served per-project keychain
+    copies of ``value`` — review W5C-1: the P3-2 probe covered file-store
+    copies only.
+
+    Asks, for every registered launcher project, the hub to resolve the
+    DEDICATED name :data:`VCO_PROJECT_SECRET_NAME` with THAT project as the
+    requester (``allow_file_fallback=False`` — the keychain leg only; the
+    file-store leg is the other probe's job). The dedicated name is the one
+    per-project keychain copy the matrix can SERVE: a per-project
+    ``openai_api_key`` is slot-exclusive and never served on ``/env``, so
+    it can neither be compared nor drift into the promotion.
+
+    Answers, per project:
+
+    * a value → constant-time compare (:func:`hmac.compare_digest`, never
+      logged): equal ⇒ that project is the ``owner``.
+    * ``key_not_active`` / not found / unknown project ⇒ a PROVEN absence
+      for that project's OWN bucket — the requester IS the project, and no
+      active row means nothing stored there. (Deliberate refinement of the
+      fix instruction's literal ``key_not_active = unknown`` grouping:
+      taken literally, every project without the key would read as
+      ``unknown`` and the promotion could never fire at all — killing the
+      v0.2.97 auto-migration this probe guards. Flagged in the lane
+      report for the coordinator.)
+    * ``key_paused`` (``SecretPaused``) ⇒ ``unknown`` — the project HOLDS
+      a key it declines to show, and that key could be this value.
+    * hub down / any other read failure (locked keychain, refusal, OS
+      error) ⇒ ``unknown``.
+
+    ``why_unknown`` is set when ANY project's answer is ``unknown``: the
+    caller must then skip the promotion conservatively (a second copy is
+    only ever planted on proof that no project holds the value). Neither
+    return value ever carries the value itself.
+    """
+    from vco_lib import agent_secrets
+
+    for pid in _registered_project_ids():
+        try:
+            theirs = agent_secrets.get(
+                VCO_PROJECT_SECRET_NAME, project=pid, allow_file_fallback=False,
+            ).strip()
+        except agent_secrets.SecretPaused:
+            return None, (
+                f"project '{pid}' has a {VCO_PROJECT_SECRET_NAME} that is "
+                "PAUSED — its value could not be compared"
+            )
+        except (
+            agent_secrets.SecretNotFound,
+            agent_secrets.AccessDenied,
+            agent_secrets.ProjectNotFound,
+        ):
+            continue  # proven absence for this project's own bucket
+        except (agent_secrets.ResolverError, OSError, ValueError) as exc:
+            return None, (
+                f"the launcher's keychain could not be asked for project "
+                f"'{pid}' ({type(exc).__name__})"
+            )
+        if theirs and hmac.compare_digest(
+            value.encode("utf-8"), theirs.encode("utf-8"),
+        ):
+            return pid, None
+    return None, None
+
+
 def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     """Move a pre-v0.2.97 VCO-written ``OPENAI_API_KEY`` line out of
     ``<root>/.env``.
@@ -493,11 +643,16 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     equal. A key the hub reports PAUSED (v0.2.101 ``key_paused``) is never
     copied: a pause is a deliberate owner decision, and a file-store copy
     would shadow it. A value some project already holds as its OWN
-    per-project secret is not promoted either (v0.2.102, audit P3-2): the
-    comparison is by constant-time equality, never logged, and the status
-    names the owning project — promoting would plant a second, broader-scope
-    copy of the same value that can drift. Otherwise it stays and the
-    status says why.
+    per-project secret is not promoted either (v0.2.102, audit P3-2 +
+    review W5C-1): BOTH per-project stores are probed with constant-time
+    equality, never logged — the file store (either name) and, through the
+    hub, the keychain copies the matrix can serve (the dedicated name;
+    a per-project ``openai_api_key`` is slot-exclusive and never served,
+    so it can neither be compared nor drift). When the keychain state
+    cannot be PROVEN — hub down, or a project's key paused — the promotion
+    is skipped conservatively and the verdict says why: a second,
+    broader-scope copy is only ever planted on proof that no project holds
+    the value. Otherwise it stays and the status says why.
 
     The value is read with the ONE line grammar (``envfile.parse_env_line``:
     ``export``, one quote pair, CRLF) — what a reader of the line gets.
@@ -509,7 +664,9 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     not one clean token), ``left_paused`` (the stored key is paused —
     nothing was stored; detail = the remedy), ``left_project_copy``
     (nothing was stored — a project already holds this value as its own
-    per-project secret; detail names the project). Never a value.
+    per-project secret; detail names the project), ``left_unproven``
+    (nothing was stored — the keychain per-project state could not be
+    proven; detail names the reason). Never a value.
     """
     from vco_lib import agent_secrets
     from vco_lib.env_template import remove_line_under
@@ -553,16 +710,40 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
             )
             return False
         if stored is None:
-            # v0.2.102 (audit P3-2): before planting the shared copy, check
-            # whether some project already holds this exact value as its OWN
-            # per-project secret (constant-time compare, never logged). A
-            # promotion would create a second, broader-scope copy of the same
-            # value — the two can drift, and that divergence is the defect
-            # class this module exists to prevent. Skip the store, leave the
-            # line, and name the owning project in the verdict.
-            owner = agent_secrets.per_project_copy_owner(
-                OPENAI_SECRET_NAME, value,
-            )
+            # v0.2.102 (audit P3-2 + review W5C-1): before planting the
+            # shared copy, check whether some project already holds this
+            # exact value as its OWN per-project secret (constant-time
+            # compare, never logged). A promotion would create a second,
+            # broader-scope copy of the same value — the two can drift, and
+            # that divergence is the defect class this module exists to
+            # prevent. BOTH stores are probed: the file store (either name)
+            # and, through the hub, the servABLE keychain copies (the
+            # dedicated name). Skip the store, leave the line, and name the
+            # owning project — or the reason the keychain state could not be
+            # proven, in which case the skip is conservative.
+            for name in (OPENAI_SECRET_NAME, VCO_PROJECT_SECRET_NAME):
+                owner = agent_secrets.per_project_copy_owner(name, value)
+                if owner is not None:
+                    break
+            else:
+                owner, why_unknown = _hub_per_project_copy_owner(value)
+                if why_unknown is not None:
+                    print(
+                        "openai_api_key: the keychain per-project state "
+                        f"could not be proven ({why_unknown}) — the shared "
+                        "copy was not created; store it in the shared scope "
+                        "deliberately, or remove the .env line by hand",
+                        file=sys.stderr,
+                    )
+                    outcome.update(
+                        status="left_unproven",
+                        detail=(
+                            f"{why_unknown} — the shared copy was not "
+                            "created; store it in the shared scope "
+                            "deliberately, or remove the .env line by hand"
+                        ),
+                    )
+                    return False
             if owner is not None:
                 print(
                     "openai_api_key: a project already holds this value as "

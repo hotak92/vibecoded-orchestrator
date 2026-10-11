@@ -185,3 +185,136 @@ def test_a_differing_stored_shared_value_still_wins_without_the_probe_firing(
     assert result["status"] == "left_differs"
     assert (tmp_path / ".env").read_text() == original
     assert _shared(stores).read_text().strip() == OTHER
+
+
+# ─── W5C-1: the probe also covers HUB-served keychain per-project copies ─
+
+def _fake_hub(monkeypatch: pytest.MonkeyPatch, answer) -> None:
+    """Stand in for the hub's ``/env``: ``answer(key, project)`` → value,
+    ``None`` ⇒ ``SecretNotFound``, an exception instance ⇒ raised."""
+    from vco_lib import agent_secrets as ase
+
+    def _hub_get(key: str, project):
+        result = answer(key, project)
+        if isinstance(result, Exception):
+            raise result
+        if result is None:
+            raise ase.SecretNotFound(f"key {key!r} not found")
+        return result
+
+    monkeypatch.setattr(ase, "_hub_get", _hub_get)
+
+
+def test_an_equal_keychain_copy_skips_the_promotion(stores, tmp_path, monkeypatch) -> None:
+    """W5C-1 arm 1: a project's KEYCHAIN copy (what the Secrets panel
+    writes) served by the hub under the dedicated name and EQUAL to the
+    root-``.env`` value ⇒ the promotion is skipped, the verdict names the
+    owning project, and no shared copy is planted."""
+    monkeypatch.setattr(openai_key, "_registered_project_ids", lambda: ["proj-1"])
+
+    def answer(key, project):
+        if key == openai_key.VCO_PROJECT_SECRET_NAME and project == "proj-1":
+            return CANARY  # the project's keychain copy, equal to the line
+        return None  # VCO's own stores: a proven absence
+
+    _fake_hub(monkeypatch, answer)
+    original = _LEGACY.format(value=CANARY)
+    (tmp_path / ".env").write_text(original)
+
+    result = openai_key.migrate_dotenv_openai_key(tmp_path)
+
+    assert result["status"] == "left_project_copy"
+    assert "proj-1" in result["detail"], "the verdict names the owning project"
+    assert (tmp_path / ".env").read_text() == original
+    assert not _shared(stores).exists(), "no second, broader-scope copy"
+    assert CANARY not in result["detail"]
+
+
+def test_a_differing_keychain_copy_promotes_as_today(stores, tmp_path, monkeypatch) -> None:
+    """W5C-1 arm 2: a keychain copy that DIFFERS is not an owner — the
+    promotion proceeds exactly as before."""
+    monkeypatch.setattr(openai_key, "_registered_project_ids", lambda: ["proj-1"])
+
+    def answer(key, project):
+        if key == openai_key.VCO_PROJECT_SECRET_NAME and project == "proj-1":
+            return OTHER
+        return None
+
+    _fake_hub(monkeypatch, answer)
+    (tmp_path / ".env").write_text(_LEGACY.format(value=CANARY))
+
+    result = openai_key.migrate_dotenv_openai_key(tmp_path)
+
+    assert result["status"] == "migrated"
+    assert _shared(stores).read_text().strip() == CANARY
+
+
+def test_a_hub_that_cannot_be_asked_skips_the_promotion(stores, tmp_path, monkeypatch) -> None:
+    """W5C-1 arm 3, the conservative half: with a project registered and
+    the hub DOWN, the keychain per-project state cannot be proven — the
+    promotion is skipped and the verdict says why. A second copy is only
+    ever planted on proof that no project holds the value."""
+    from vco_lib import agent_secrets as ase
+
+    monkeypatch.setattr(openai_key, "_registered_project_ids", lambda: ["proj-1"])
+
+    def answer(key, project):
+        raise ase.HubUnreachable("hub is down")
+
+    _fake_hub(monkeypatch, answer)
+    original = _LEGACY.format(value=CANARY)
+    (tmp_path / ".env").write_text(original)
+
+    result = openai_key.migrate_dotenv_openai_key(tmp_path)
+
+    assert result["status"] == "left_unproven"
+    assert "proj-1" in result["detail"] or "asked" in result["detail"], (
+        "the verdict names what could not be proven"
+    )
+    assert (tmp_path / ".env").read_text() == original
+    assert not _shared(stores).exists(), "nothing is stored on an unproven state"
+    assert CANARY not in result["detail"]
+
+
+def test_a_paused_project_key_also_skips_the_promotion(stores, tmp_path, monkeypatch) -> None:
+    """W5C-1, paused arm: a project's dedicated key that EXISTS but is
+    PAUSED cannot be compared — its value could be the line's value, so
+    the promotion is skipped conservatively."""
+    from vco_lib import agent_secrets as ase
+
+    monkeypatch.setattr(openai_key, "_registered_project_ids", lambda: ["proj-1"])
+
+    def answer(key, project):
+        if key == openai_key.VCO_PROJECT_SECRET_NAME and project == "proj-1":
+            return ase.SecretPaused("key exists but is paused")
+        return None
+
+    _fake_hub(monkeypatch, answer)
+    original = _LEGACY.format(value=CANARY)
+    (tmp_path / ".env").write_text(original)
+
+    result = openai_key.migrate_dotenv_openai_key(tmp_path)
+
+    assert result["status"] == "left_unproven"
+    assert "PAUSED" in result["detail"]
+    assert (tmp_path / ".env").read_text() == original
+    assert not _shared(stores).exists()
+
+
+def test_an_equal_dedicated_file_store_copy_also_skips_the_promotion(
+    stores, tmp_path,
+) -> None:
+    """The file-store walk covers BOTH names: a per-project
+    ``vco_openai_api_key`` file equal to the line skips the promotion too
+    (same drift class, same verdict)."""
+    dedicated = stores / "projects" / "alpha" / openai_key.VCO_PROJECT_SECRET_NAME
+    dedicated.parent.mkdir(parents=True)
+    dedicated.write_text(CANARY)
+    original = _LEGACY.format(value=CANARY)
+    (tmp_path / ".env").write_text(original)
+
+    result = openai_key.migrate_dotenv_openai_key(tmp_path)
+
+    assert result["status"] == "left_project_copy"
+    assert "alpha" in result["detail"]
+    assert not _shared(stores).exists()
