@@ -116,6 +116,10 @@ pub mod model_gateway;
 // restart ends every agent session routed through the gateway. The verdict
 // lives in `python -m vco_lib.gateway_freshness`.
 pub mod gateway_freshness;
+// v0.2.102 W6-L: code-graph parsers on demand — which missing tree-sitter
+// parsers to offer for the registered projects, "Not now", and the install.
+// Every decision lives in `python -m vco_lib.codegraph_parsers`.
+pub mod codegraph_parsers;
 // v0.2.97: subscription usage windows for the home-page card. The numbers
 // are the gateway's (`GET /usage/windows`), read through
 // `python -m vco_lib.gateway_usage` so the host token never enters Rust.

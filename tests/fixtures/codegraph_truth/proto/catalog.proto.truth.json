@@ -1,0 +1,10 @@
+{
+ "source": "catalog.proto",
+ "reviewed": "W6-L 2026-10-11: copy of the golden corpus file; written by hand from the source (services are classes whose methods are their rpcs)",
+ "symbols": [
+  {"kind": "class", "name": "ProductRequest", "start": 10, "end": 12, "full_name": "catalog.v1.ProductRequest", "methods": []},
+  {"kind": "class", "name": "Product", "start": 14, "end": 18, "full_name": "catalog.v1.Product", "methods": []},
+  {"kind": "class", "name": "ProductList", "start": 20, "end": 22, "full_name": "catalog.v1.ProductList", "methods": []},
+  {"kind": "class", "name": "CatalogService", "start": 24, "end": 27, "full_name": "catalog.v1.CatalogService", "methods": ["GetProduct", "ListProducts"]}
+ ]
+}

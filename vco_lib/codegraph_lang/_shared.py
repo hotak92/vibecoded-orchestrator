@@ -55,6 +55,7 @@ from typing import (
     Tuple,
 )
 
+from vco_lib.codegraph_defs import regex_fallback_hash_salt
 from vco_lib.codegraph_entities import CodeEntity, KIND_API
 
 
@@ -163,8 +164,9 @@ def run_pure_extractor(
 
     ``file_hash_fn(content, file_path, repo_root)`` replaces the plain
     ``sha256(content)`` for a language whose extraction depends on OTHER files
-    (Rust: a test-gated ``mod x;`` elsewhere — v0.2.102 W6-G). The extractor
-    must stamp the same value on its module row, or the gate never matches.
+    (Rust: a test-gated ``mod x;`` elsewhere — v0.2.102 W6-G). Since W6-L the
+    gate's hash (salted for a regex-fallback file) is written onto the module
+    row HERE, so the gate and the stored value cannot disagree.
     """
     content = file_path.read_text(encoding="utf-8", errors="ignore")
     if _is_minified_content(content):
@@ -182,12 +184,22 @@ def run_pure_extractor(
 
     file_hash = (file_hash_fn(content, file_path, repo_root) if file_hash_fn is not None
                  else hashlib.sha256(content.encode()).hexdigest())
+    # v0.2.102 W6-L: a file extracted by the REGEX fallback (its tree-sitter
+    # grammar cannot load) carries a salted hash, so installing the parser
+    # later re-extracts exactly that language's unchanged files on the next
+    # walk (see codegraph_defs.regex_fallback_hash_salt). The ONE value is
+    # stamped on the module row below, whatever the extractor computed.
+    salt = regex_fallback_hash_salt(file_path)
+    if salt:
+        file_hash = hashlib.sha256((file_hash + salt).encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
     if ctx._get_existing_module(relative_path, file_hash):
         print(f"⏭️  Skipping {relative_path} (unchanged)")
         return dict(empty_stats)
 
     fx = extract(content, file_path, repo_root, ExtractorHelpers(ctx))
+    if fx.module is not None:
+        fx.module.file_hash = file_hash
     return ctx.write_file_extraction(fx)
 
 

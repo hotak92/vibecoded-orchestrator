@@ -1,0 +1,11 @@
+{
+ "source": "library_api.proto",
+ "reviewed": "W6-L 2026-10-11 (hand-written before extraction; full_name + methods written by hand from the source)",
+ "symbols": [
+  {"kind": "class", "name": "Book", "start": 12, "end": 26, "full_name": "library.api.v2.Book", "methods": []},
+  {"kind": "class", "name": "Format", "start": 13, "end": 17, "full_name": "library.api.v2.Book.Format", "methods": []},
+  {"kind": "class", "name": "ListBooksRequest", "start": 28, "end": 32, "full_name": "library.api.v2.ListBooksRequest", "methods": []},
+  {"kind": "class", "name": "ListBooksResponse", "start": 34, "end": 37, "full_name": "library.api.v2.ListBooksResponse", "methods": []},
+  {"kind": "class", "name": "Library", "start": 39, "end": 52, "full_name": "library.api.v2.Library", "methods": ["ListBooks", "GetBook", "WatchBooks"]}
+ ]
+}

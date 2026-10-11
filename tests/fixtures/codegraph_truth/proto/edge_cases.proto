@@ -1,0 +1,46 @@
+// Hand-written definitions edge cases for the proto truth gate.
+// message Commented { }
+syntax = "proto3";
+
+package truth.v1;
+
+import "google/protobuf/empty.proto";
+
+/* message InBlockComment {
+} */
+
+message Order {
+  string id = 1;
+  message Line {
+    string sku = 1;
+    int32 qty = 2;
+  }
+  repeated Line lines = 2;
+  oneof payment {
+    string card = 3;
+    string voucher = 4;
+  }
+  map<string, string> labels = 5;
+}
+
+  message Indented {
+    string note = 1; // a "}" in a comment
+  }
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OPEN = 1;
+}
+
+message Empty {}
+
+service OrderService {
+  rpc Get(Order) returns (Order);
+  rpc Stream(stream Order) returns (stream Order) {
+    option deprecated = true;
+  }
+}
+
+service Health {
+  rpc Check(google.protobuf.Empty) returns (google.protobuf.Empty);
+}

@@ -21330,7 +21330,11 @@ def _install_codegraph_treesitter(venv_python: Path) -> None:
 
     The skip/argv DECISION lives in
     ``vco_lib.install_companions.codegraph_ts_install_plan`` (pure + tested);
-    this shim owns only the subprocess run + logging glue (opt out with
+    the install runs through the ONE parser installer helper
+    ``vco_lib.codegraph_parsers.install`` (shared with the launcher's parser
+    modal, v0.2.102 W6-L — PowerShell / proto are NOT in this default extra,
+    they are offered per detected language); this shim supplies only
+    install.py's runner + logging glue (opt out with
     ``VCT_SKIP_CODEGRAPH_TS=1``; pip target ``-e <root>[codegraph-ts]``, whose
     ``-e`` is LOAD-BEARING — without it pip replaces step 4's editable install
     with a frozen copy of vco_lib; see that docstring for the v0.2.92 evidence).
@@ -21356,27 +21360,38 @@ def _install_codegraph_treesitter(venv_python: Path) -> None:
           "(this may take ~20s) ... ", flush=True)
     # Soft-fail (on_failure="return"): the analyzer degrades to Python-only when
     # the extra is absent. Reuse the pip robustness flags + subprocess env.
-    try:
-        result = _run_logged_subprocess(
-            [str(venv_python), "-m", "pip", "install",
-             *_pip_install_flags(), *(pip_target or [])],
-            step="codegraph-ts", phase_label="pip-install-codegraph-ts",
-            timeout=600, cwd=str(PROJECT_ROOT), env=_pip_subprocess_env(),
+    # v0.2.102 W6-L: through the ONE parser installer helper the launcher's
+    # parser modal also uses (vco_lib.codegraph_parsers.install); this shim
+    # only supplies install.py's runner, flags and env.
+    from vco_lib.codegraph_parsers import install as _install_parsers, install_log_path
+
+    def _runner(argv, timeout):
+        r = _run_logged_subprocess(
+            list(argv), step="codegraph-ts", phase_label="pip-install-codegraph-ts",
+            timeout=timeout, cwd=str(PROJECT_ROOT), env=_pip_subprocess_env(),
             on_failure="return",
             fail_message="  WARN: codegraph-ts extra install exited non-zero.",
             user_hint_lines=[
                 "Non-Python code-graph definitions stay regex, call edges Python-"
                 "only, until this succeeds. Retry: pip install -e '.[codegraph-ts]' (orch "
-                "venv; -e required). Skip with VCT_SKIP_CODEGRAPH_TS=1.",
+                "venv; -e required), or accept the launcher's parser offer. Skip with "
+                "VCT_SKIP_CODEGRAPH_TS=1.",
             ],
         )
-        if result.returncode == 0:
-            print("[codegraph-ts] tree-sitter grammars installed OK.")
-            _log_install_event("codegraph-ts", "ok", "codegraph-ts installed")
-    except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"  WARN: codegraph-ts extra install failed: {e}")
+        return r.returncode, r.stdout or "", r.stderr or ""
+
+    result = _install_parsers(
+        python=venv_python, targets=[*(pip_target or [])],
+        label="tree-sitter code-graph grammars", runner=_runner,
+        pip_flags=_pip_install_flags(), log_path=install_log_path(), pip_timeout=600,
+    )
+    if result.ok:
+        print("[codegraph-ts] tree-sitter grammars installed OK.")
+        _log_install_event("codegraph-ts", "ok", "codegraph-ts installed")
+    elif not result.log_tail:  # timeout / unstartable pip (a pip exit printed its own tail)
+        print(f"  WARN: codegraph-ts extra install failed: {result.message}")
         _log_install_event("codegraph-ts", "warn",
-                           f"pip install -e .[codegraph-ts] failed: {e}")
+                           f"pip install -e .[codegraph-ts] failed: {result.message}")
 
 
 # ---------------------------------------------------------------------------

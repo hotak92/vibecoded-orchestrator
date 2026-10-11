@@ -1,0 +1,9 @@
+{
+ "source": "broken.proto",
+ "reviewed": "W6-L 2026-10-11 (hand-written before extraction): a field broken INSIDE a complete message; the parse error routes the whole file to the regex fallback, which must keep every top-level message",
+ "symbols": [
+  {"kind": "class", "name": "First", "start": 5, "end": 7, "full_name": "broken.v1.First", "methods": []},
+  {"kind": "class", "name": "Half", "start": 9, "end": 11, "full_name": "broken.v1.Half", "methods": []},
+  {"kind": "class", "name": "Last", "start": 13, "end": 15, "full_name": "broken.v1.Last", "methods": []}
+ ]
+}

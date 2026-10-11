@@ -76,6 +76,11 @@ pub const OP_UPDATE_ALL_PROJECTS: &str = "update_all_projects";
 /// one restart is in flight would end every agent session a second time.
 pub const OP_GATEWAY_RESTART: &str = "model_gateway_restart";
 
+/// Operation key: a code-graph parser install into the orchestrator venv
+/// (`codegraph_parsers::codegraph_parsers_install`). Two concurrent pip runs
+/// into one venv can interleave and leave it half-installed.
+pub const OP_CODEGRAPH_PARSERS_INSTALL: &str = "codegraph_parsers_install";
+
 /// Operation key: an in-place update of the ORCHESTRATOR CLONE — held by
 /// `update_run::run_update` (every surface and every kind since v0.2.100) and
 /// by the conflict resolvers that hand their claim over to it

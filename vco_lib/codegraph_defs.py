@@ -1181,6 +1181,157 @@ def _shell_definitions(src: _Src, root) -> Definitions:  # noqa: ANN001
 
 
 # ---------------------------------------------------------------------------
+# PowerShell (tree-sitter-powershell — an OPTIONAL parser, v0.2.102 W6-L)
+# ---------------------------------------------------------------------------
+
+_PS_SCOPES = frozenset({"global", "script", "local", "private"})
+
+
+def _ps_param_names(src: _Src, node) -> List[str]:  # noqa: ANN001
+    """``$name`` of every declared parameter — the ``param(…)`` block AND the
+    inline ``function f($a, $b)`` list (the regex read only the former)."""
+    names: List[str] = []
+    for holder in node.children:
+        block = holder
+        if holder.type == "script_block":
+            block = next((c for c in holder.children if c.type == "param_block"), None)
+        if block is None or block.type not in ("param_block", "function_parameter_declaration"):
+            continue
+        for plist in (c for c in block.children if c.type == "parameter_list"):
+            for param in (c for c in plist.children if c.type == "script_parameter"):
+                var = next((c for c in param.children if c.type == "variable"), None)
+                if var is None:
+                    continue
+                name = src.text(var).lstrip("$")
+                if name and name not in names:
+                    names.append(name)
+    return names
+
+
+def _powershell_definitions(src: _Src, root) -> Definitions:  # noqa: ANN001
+    """Functions / filters at any depth (scope prefix split off the name,
+    nested functions keep no container — the regex's ``stem.name`` identity),
+    classes and enums, and class methods/constructors as members."""
+    defs = Definitions()
+
+    def visit(node, anc):  # noqa: ANN001,ANN202
+        if node.type == "function_statement":
+            name_node = next((c for c in node.children if c.type == "function_name"), None)
+            if name_node is None:
+                return True
+            raw = src.text(name_node)
+            scope = ""
+            head, sep, tail = raw.partition(":")
+            if sep and head.lower() in _PS_SCOPES:
+                scope, raw = head.lower(), tail
+            keyword = src.text(node.children[0]).lower() if node.children else "function"
+            defs.functions.append(_make(
+                src, KIND_FUNCTION, raw, node, node,
+                keyword="filter" if keyword == "filter" else "function",
+                params=", ".join("$" + p for p in _ps_param_names(src, node)),
+                tag=scope,
+            ))
+        elif node.type in ("class_statement", "enum_statement"):
+            names = [c for c in node.children if c.type == "simple_name"]
+            if not names:
+                return True
+            cname = src.text(names[0])
+            is_class = node.type == "class_statement"
+            defs.classes.append(_make(
+                src, KIND_CLASS, cname, node, node,
+                keyword="class" if is_class else "enum",
+                base=src.text(names[1]) if is_class and len(names) > 1 else None,
+            ))
+            defs.methods.setdefault(cname, [])
+            if not is_class:
+                return False
+        elif node.type == "class_method_definition":
+            owner = next((a for a in reversed(anc) if a.type == "class_statement"), None)
+            name_node = next((c for c in node.children if c.type == "simple_name"), None)
+            if owner is None or name_node is None:
+                return True
+            owner_names = [c for c in owner.children if c.type == "simple_name"]
+            cname = src.text(owner_names[0]) if owner_names else ""
+            mname = src.text(name_node)
+            params: List[str] = []
+            plist = next((c for c in node.children if c.type == "class_method_parameter_list"), None)
+            if plist is not None:
+                for p in (c for c in plist.children if c.type == "class_method_parameter"):
+                    var = next((c for c in p.children if c.type == "variable"), None)
+                    if var is not None:
+                        params.append(src.text(var))
+            is_static = any(c.type == "class_attribute" and src.text(c).lower() == "static"
+                            for c in node.children)
+            defs.functions.append(_make(
+                src, KIND_FUNCTION, mname, node, node,
+                keyword="method", params=", ".join(params), container=cname,
+                tag="static" if is_static else "",
+            ))
+            if cname:
+                defs.add_method(cname, mname)
+        return True
+
+    _walk(root, visit)
+    return defs
+
+
+# ---------------------------------------------------------------------------
+# Protocol Buffers (tree-sitter-language-pack ``proto`` — OPTIONAL, W6-L)
+# ---------------------------------------------------------------------------
+
+_PROTO_TYPES = {"message": "message_name", "enum": "enum_name", "service": "service_name"}
+
+
+def _proto_definitions(src: _Src, root) -> Definitions:  # noqa: ANN001
+    """Messages and enums at any depth (``container`` = the enclosing
+    message chain, dotted — proto's own nested-type identity), services as
+    classes whose methods are their rpcs. Each rpc is ALSO returned as a
+    function with ``container`` = service and ``params`` = ``"In -> Out"``
+    (the request/response type texts) so the extractor can build its
+    ``CodeAPI`` rows from the tree."""
+    defs = Definitions()
+
+    def visit(node, anc):  # noqa: ANN001,ANN202
+        name_type = _PROTO_TYPES.get(node.type)
+        if name_type is not None:
+            name_node = next((c for c in node.children if c.type == name_type), None)
+            if name_node is None:
+                return True
+            name = src.text(name_node)
+            chain = []
+            for a in anc:
+                if a.type in ("message", "enum"):
+                    a_name = next((c for c in a.children if c.type == _PROTO_TYPES[a.type]), None)
+                    if a_name is not None:
+                        chain.append(src.text(a_name))
+            defs.classes.append(_make(
+                src, KIND_CLASS, name, node, node, keyword=node.type,
+                container=".".join(chain) or None,
+            ))
+        elif node.type == "rpc":
+            owner = next((a for a in reversed(anc) if a.type == "service"), None)
+            name_node = next((c for c in node.children if c.type == "rpc_name"), None)
+            if owner is None or name_node is None:
+                return True
+            sname_node = next((c for c in owner.children if c.type == "service_name"), None)
+            sname = src.text(sname_node) if sname_node is not None else ""
+            types = [src.text(c) for c in node.children if c.type == "message_or_enum_type"]
+            rname = src.text(name_node)
+            defs.functions.append(_make(
+                src, KIND_FUNCTION, rname, node, node, keyword="rpc",
+                container=sname,
+                params=" -> ".join(types[:2]) if len(types) >= 2 else "",
+            ))
+            if sname:
+                defs.add_method(sname, rname)
+            return False
+        return True
+
+    _walk(root, visit)
+    return defs
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -1197,6 +1348,10 @@ _WALKERS: Dict[str, Tuple[str, Callable]] = {
     "ruby": ("ruby", _ruby_definitions),
     "lua": ("lua", _lua_definitions),
     "shell": ("shell", _shell_definitions),
+    # OPTIONAL parsers (not in the default ``codegraph-ts`` extra; VCO offers
+    # them when a project contains the language — vco_lib.codegraph_parsers).
+    "powershell": ("powershell", _powershell_definitions),
+    "proto": ("proto", _proto_definitions),
 }
 
 
@@ -1204,6 +1359,65 @@ def supported_definition_languages() -> "frozenset[str]":
     """Language ids :func:`extract_definitions` has a walker for (whether or
     not the grammar is installed in this process)."""
     return frozenset(_WALKERS)
+
+
+def definition_grammars(language: str) -> "frozenset[str]":
+    """Grammar ids the DEFINITIONS layer needs for a code-graph language
+    (dispatch key). TypeScript needs both factories (``.tsx`` parses with
+    ``tsx``); Svelte ``<script>`` blocks parse with ``typescript``; Python
+    (``ast``) and unknown languages need none."""
+    if language == "svelte":
+        return frozenset({"typescript"})
+    entry = _WALKERS.get(language)
+    if entry is None:
+        return frozenset()
+    if language == "typescript":
+        return frozenset({"typescript", "tsx"})
+    return frozenset({entry[0]})
+
+
+#: Extensions whose definitions grammar is not the language default.
+_GRAMMAR_BY_SUFFIX = {".tsx": "tsx", ".svelte": "typescript"}
+
+#: Appended to a file's content before hashing when its definitions grammar
+#: cannot load (see :func:`regex_fallback_hash_salt`).
+REGEX_FALLBACK_HASH_SALT = "\0vco-codegraph-defs:regex-fallback"
+
+
+def definitions_grammar_for_path(path: "str | object") -> Optional[str]:
+    """The grammar id the definitions layer parses ``path`` with, or ``None``
+    (Python, unknown extensions). Language from the code graph's own
+    extension table (:data:`vco_lib.inject_intent.EXT_TO_LANG`, parity-pinned
+    to the analyzer's ``_EXT_TO_DISPATCH_NAME``)."""
+    from vco_lib.inject_intent import language_for_path
+
+    text = str(path)
+    suffix = text[text.rfind("."):].lower() if "." in text else ""
+    if suffix in _GRAMMAR_BY_SUFFIX:
+        return _GRAMMAR_BY_SUFFIX[suffix]
+    entry = _WALKERS.get(language_for_path(text))
+    return entry[0] if entry is not None else None
+
+
+def regex_fallback_hash_salt(path: "str | object") -> str:
+    """``""`` when ``path`` is extracted by tree-sitter (or needs no grammar),
+    :data:`REGEX_FALLBACK_HASH_SALT` when its grammar cannot load.
+
+    Why (v0.2.102 W6-L): the analyzer skips a file whose module row carries
+    the same ``file_hash`` — keyed on CONTENT only, so installing a parser
+    later (VCO offers the optional ones on demand) would never re-extract an
+    unchanged file. Salting the hash of a regex-extracted file makes the
+    module hash name the extraction mode too: the first walk after a parser
+    install sees a different hash for exactly that language's files and
+    re-extracts them (the per-entity content hash then re-embeds only rows
+    whose text changed); nothing else is touched. Salting the FALLBACK, not
+    the tree-sitter path, leaves every default install's hashes unchanged."""
+    from vco_lib.codegraph_grammars import load_language
+
+    grammar = definitions_grammar_for_path(path)
+    if grammar is None or load_language(grammar) is not None:
+        return ""
+    return REGEX_FALLBACK_HASH_SALT
 
 
 _PARSE_ERROR_LOGGED: Set[Tuple[str, str]] = set()

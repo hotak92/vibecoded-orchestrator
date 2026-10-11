@@ -70,7 +70,9 @@ def _require_grammar(grammar: str) -> None:
         return
     msg = f"tree-sitter grammar for {grammar} not installed (codegraph-ts extra)"
     if os.environ.get("CI"):
-        pytest.fail(msg + " — CI must install .[codegraph-ts]; the gate cannot skip there")
+        pytest.fail(msg + " — CI must install .[codegraph-ts] and the optional "
+                    "parsers (python -m vco_lib.codegraph_parsers install --all); "
+                    "the gate cannot skip there")
     pytest.skip(msg)
 
 
@@ -93,6 +95,8 @@ def test_definitions_meet_precision_and_recall(lang: str) -> None:
 @pytest.mark.parametrize("lang,metric", [
     ("typescript", "recall"),    # generic functions / interfaces invisible
     ("rust", "precision"),       # string-literal phantoms + test code indexed
+    ("powershell", "recall"),    # W6-L: PowerShell 5 classes/enums/methods invisible
+    ("proto", "recall"),         # W6-L: nested/indented messages, enums, services invisible
 ])
 def test_regex_fallback_stays_below_the_bar(lang: str, metric: str, monkeypatch) -> None:
     force_regex_definitions(monkeypatch)

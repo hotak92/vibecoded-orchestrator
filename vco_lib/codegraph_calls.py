@@ -324,6 +324,16 @@ def extract_call_names(language: str, body: str) -> Optional[List[str]]:
     return _extract_treesitter_calls(lang, body)
 
 
+def call_grammars(language: str) -> "frozenset[str]":
+    """Grammar ids CALL extraction needs for a code-graph language (dispatch
+    key): the language's own grammar when it has a call query, ``javascript``
+    for Svelte (its ``<script>`` blocks are passed as JavaScript), none for
+    Python (``ast``) and the languages excluded above."""
+    if language == "svelte":
+        return frozenset({"javascript"})
+    return frozenset({language}) if language in _CALL_QUERIES else frozenset()
+
+
 def supported_call_languages() -> "frozenset[str]":
     """Return the set of canonical language ids for which call extraction is
     currently available in THIS process.

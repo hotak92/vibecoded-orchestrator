@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package broken.v1;
+
+message First {
+  string id = 1;
+}
+
+message Half {
+  string id = ;
+}
+
+message Last {
+  string id = 1;
+}
