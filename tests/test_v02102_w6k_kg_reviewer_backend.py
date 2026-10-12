@@ -4,10 +4,11 @@
 
 Owner ruling 2026-10-11: keep the Haiku reviewer; when Haiku is unavailable
 (a REAL signal — quota / 429 / auth / absent), fall back
-``claude-gw/glm-5.3-flash`` → ``claude-gw/deepseek-v4.1-flash`` →
-``claude-gw/qwen3.8-flash`` — each only when the LOCAL MODEL GATEWAY
-actually serves it (the catalogue is ASKED, never assumed) — and use
-OpenAI when the user enabled OpenAI for SUMMARIES.
+``claude-gw/glm-5.3-flash[1m]`` → ``claude-gw/qwen/deepseek-v4.1-flash[1m]``
+→ ``claude-gw/qwen/qwen3.8-flash[1m]`` (the live catalogue's spelling —
+W6-N F-1) — each only when the LOCAL MODEL GATEWAY actually serves it (the
+catalogue is ASKED, never assumed) — and use OpenAI when the user enabled
+OpenAI for SUMMARIES.
 
 Every rung of that walk is driven here with faked
 catalogue/consent/breaker state; the classification and the breaker file
@@ -15,10 +16,13 @@ are summary_backends' own (one home), pointed at a temp state dir.
 """
 from __future__ import annotations
 
+import http.server
 import importlib
 import importlib.util
 import json
+import subprocess as _subprocess
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -92,25 +96,29 @@ def test_haiku_is_the_default(chain, monkeypatch):
                             "base_url": None, "reason": "default"}
 
 
-def test_absent_cli_falls_to_the_first_served_gateway_model(chain, monkeypatch):
-    rig = _Rig(chain, monkeypatch, claude=False,
-               catalogue=frozenset({"claude-gw/glm-5.3-flash",
-                                    "claude-gw/qwen3.8-flash"}))
+def test_latched_haiku_falls_to_the_first_served_gateway_model(
+        chain, monkeypatch):
+    # W6-N F-2: an ABSENT CLI now skips the gateway rungs too (they spawn
+    # `claude -p`) — see test_v02102_w6n_kg_reviewer_fixes.py.
+    rig = _Rig(chain, monkeypatch,
+               catalogue=frozenset({"claude-gw/glm-5.3-flash[1m]",
+                                    "claude-gw/qwen/qwen3.8-flash[1m]"}))
+    rig.latched["kg_reviewer:haiku"] = {"reason": "quota", "remaining": 1}
     d = rig.decide()
     assert d["mode"] == "claude"
-    assert d["model"] == "claude-gw/glm-5.3-flash"
+    assert d["model"] == "claude-gw/glm-5.3-flash[1m]"
     assert d["base_url"] == "http://127.0.0.1:11460"
-    rig.assert_logged("rung haiku: unavailable (no `claude` CLI on PATH)")
+    rig.assert_logged("rung haiku: latched (quota)")
 
 
 def test_quota_latched_haiku_is_a_real_signal_and_falls_back(chain, monkeypatch):
     """The W6-K defect: an exhausted Haiku silently skipped the review."""
     rig = _Rig(chain, monkeypatch,
-               catalogue=frozenset({"claude-gw/deepseek-v4.1-flash"}))
+               catalogue=frozenset({"claude-gw/qwen/deepseek-v4.1-flash[1m]"}))
     rig.latched["kg_reviewer:haiku"] = {
         "reason": "quota", "until": 9e18, "remaining": 17999}
     d = rig.decide()
-    assert d["model"] == "claude-gw/deepseek-v4.1-flash", d
+    assert d["model"] == "claude-gw/qwen/deepseek-v4.1-flash[1m]", d
     rig.assert_logged("rung haiku: latched (quota)")
     rig.assert_logged("rung claude-gw/glm-5.3-flash: not served")
 
@@ -118,18 +126,19 @@ def test_quota_latched_haiku_is_a_real_signal_and_falls_back(chain, monkeypatch)
 def test_catalogue_membership_is_asked_not_assumed(chain, monkeypatch):
     """A gateway rung the daemon does NOT list is skipped with a line —
     availability is evidence, never a hard-coded yes."""
-    rig = _Rig(chain, monkeypatch, claude=False,
-               catalogue=frozenset({"claude-gw/qwen3.8-flash"}))
+    rig = _Rig(chain, monkeypatch,
+               catalogue=frozenset({"claude-gw/qwen/qwen3.8-flash[1m]"}))
+    rig.latched["kg_reviewer:haiku"] = {"reason": "quota", "remaining": 1}
     d = rig.decide()
-    assert d["model"] == "claude-gw/qwen3.8-flash"
+    assert d["model"] == "claude-gw/qwen/qwen3.8-flash[1m]"
     rig.assert_logged("rung claude-gw/glm-5.3-flash: not served")
-    rig.assert_logged("rung claude-gw/deepseek-v4.1-flash: not served")
+    rig.assert_logged("rung claude-gw/qwen/deepseek-v4.1-flash: not served")
 
 
 def test_no_gateway_falls_to_openai_only_with_summaries_consent(
         chain, monkeypatch):
-    rig = _Rig(chain, monkeypatch, claude=False, gateway_base=None,
-               consent=True)
+    rig = _Rig(chain, monkeypatch, gateway_base=None, consent=True)
+    rig.latched["kg_reviewer:haiku"] = {"reason": "quota", "remaining": 1}
     d = rig.decide()
     assert d["mode"] == "openai", d
     assert "degraded" in d["reason"]
@@ -186,9 +195,6 @@ def test_record_clears_on_success(chain, monkeypatch, tmp_path):
 # Review fixes 2026-10-11 (W6-K review F1/F2/F4, MERGE-AFTER-FIXES round)
 # ═══════════════════════════════════════════════════════════════════════
 
-import http.server
-import subprocess as _subprocess
-import threading
 
 
 class _AuthRequiredCatalogue(http.server.BaseHTTPRequestHandler):
@@ -209,8 +215,9 @@ class _AuthRequiredCatalogue(http.server.BaseHTTPRequestHandler):
                               "error": {"type": "authentication_error",
                                         "message": "missing host token"}})
             return
-        self._reply(200, {"data": [{"id": "claude-gw/glm-5.3-flash"},
-                                   {"id": "claude-gw/qwen3.8-flash"}]})
+        # The live shape (W6-N F-1): ``[1m]`` rows, ``qwen/`` namespace.
+        self._reply(200, {"data": [{"id": "claude-gw/glm-5.3-flash[1m]"},
+                                   {"id": "claude-gw/qwen/qwen3.8-flash[1m]"}]})
 
     def _reply(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode("utf-8")
@@ -260,8 +267,8 @@ def test_catalogue_probe_authenticates_with_the_host_token(
     res = chain.gateway_catalogue()
     assert res[0] == f"http://127.0.0.1:{stub_gateway}", res
     ids = res[1]
-    assert "claude-gw/glm-5.3-flash" in ids, ids
-    assert "claude-gw/qwen3.8-flash" in ids, ids
+    assert "claude-gw/glm-5.3-flash[1m]" in ids, ids
+    assert "claude-gw/qwen/qwen3.8-flash[1m]" in ids, ids
 
 
 def test_a_refused_probe_is_distinguished_from_no_gateway(
@@ -280,8 +287,9 @@ def test_a_refused_probe_is_distinguished_from_no_gateway(
 def test_a_refused_gateway_is_logged_as_a_refusal(chain, monkeypatch):
     """F1: the skip line for a 401'd probe names the refusal — the old
     wording ("no local model gateway answered") was FALSE for a 401."""
-    rig = _Rig(chain, monkeypatch, claude=False, gateway_base=None,
+    rig = _Rig(chain, monkeypatch, gateway_base=None,
                refusal="HTTP 401 from http://127.0.0.1:11460")
+    rig.latched["kg_reviewer:haiku"] = {"reason": "quota", "remaining": 1}
     rig.decide()
     rig.assert_logged("refused the catalogue probe")
     rig.assert_logged("HTTP 401")

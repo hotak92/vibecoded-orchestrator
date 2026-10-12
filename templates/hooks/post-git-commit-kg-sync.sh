@@ -61,9 +61,19 @@ if [ "$COMMIT_HASH" = "$LAST_REVIEWED" ]; then
 fi
 echo "$COMMIT_HASH" > "$LAST_REVIEWED_FILE"
 
-# Get the diff (limit to 8000 chars to keep Haiku context small)
-DIFF=$(git diff HEAD~1..HEAD --stat --no-color 2>/dev/null | head -50)
-DIFF_DETAIL=$(git diff HEAD~1..HEAD --no-color 2>/dev/null | head -300)
+# Get the diff (limit to 8000 chars to keep Haiku context small).
+# Root-commit safe (v0.2.102 W6-N F-3): a first commit has no HEAD~1, and
+# `git diff HEAD~1..HEAD` printed NOTHING there -- the fresh-repo first
+# build was reviewed with an empty diff. A root commit is shown against the
+# empty tree by `git show`; every other commit keeps the diff against its
+# FIRST parent (`git show` on a merge would print a combined diff instead).
+if git rev-parse --verify --quiet HEAD~1 >/dev/null 2>&1; then
+    DIFF=$(git diff HEAD~1 HEAD --stat --no-color 2>/dev/null | head -50)
+    DIFF_DETAIL=$(git diff HEAD~1 HEAD --no-color 2>/dev/null | head -300)
+else
+    DIFF=$(git show --format= --stat --no-color HEAD 2>/dev/null | head -50)
+    DIFF_DETAIL=$(git show --format= --no-color HEAD 2>/dev/null | head -300)
+fi
 
 # Build the agent prompt — single-project mode (KG and docs are inside this repo)
 PROMPT="Review the following git commit and update relevant knowledge graph nodes and documentation.
@@ -105,18 +115,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -n "${PY:-}" ] && [ -f "$REVIEWER_CHAIN" ]; then
     PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/vco-kg-reviewer.XXXXXX")"
     printf '%s' "$PROMPT" > "$PROMPT_FILE"
+    # No --max-turns here: the turn budget is ONE knob owned by the chain
+    # (DEFAULT_MAX_TURNS / VCO_KG_REVIEW_MAX_TURNS, v0.2.102 W6-N F-4).
     nohup "$PY" "$REVIEWER_CHAIN" run \
         --prompt-file "$PROMPT_FILE" \
         --log "$LOG_DIR/kg-commit-review.log" \
-        --max-turns 10 \
         >> "$LOG_DIR/kg-commit-review.log" 2>&1 &
     REVIEWER_PID=$!
 else
     # Broken/partial install (python or the chain script missing): the
-    # pre-W6-K direct Haiku spawn, unchanged.
+    # pre-W6-K direct Haiku spawn. With no python this branch cannot ask
+    # the chain for the turn budget, so it mirrors it: the default 30 must
+    # match DEFAULT_MAX_TURNS in .claude/scripts/kg_reviewer_backend.py, and
+    # a non-positive/non-numeric VCO_KG_REVIEW_MAX_TURNS falls back to it.
+    MAX_TURNS="${VCO_KG_REVIEW_MAX_TURNS:-}"
+    case "$MAX_TURNS" in
+        ''|*[!0-9]*) MAX_TURNS=30 ;;
+    esac
+    [ "$MAX_TURNS" -gt 0 ] 2>/dev/null || MAX_TURNS=30
     nohup claude -p "$PROMPT" \
         --model haiku \
-        --max-turns 10 \
+        --max-turns "$MAX_TURNS" \
         --no-session-persistence \
         --allowedTools "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,mcp__weaviate-kg__store_knowledge_node,Write,Edit" \
         >> "$LOG_DIR/kg-commit-review.log" 2>&1 &

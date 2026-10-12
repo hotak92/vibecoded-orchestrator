@@ -594,7 +594,9 @@ EXPECTED_CLAUDE_ARGV = [
     "--model",
     "haiku",
     "--max-turns",
-    "10",
+    # The no-python branch mirrors the chain's DEFAULT_MAX_TURNS (v0.2.102
+    # W6-N F-4: 10 truncated about half the logged reviews).
+    "30",
     "--no-session-persistence",
     "--allowedTools",
     "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,"

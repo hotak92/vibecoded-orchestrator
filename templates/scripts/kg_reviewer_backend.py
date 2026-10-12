@@ -13,11 +13,15 @@ Owner ruling 2026-10-11 — keep it, and fall back, in this order:
 1. ``haiku`` via the local ``claude`` CLI (the default; unavailable = the
    CLI is absent, or its tier is breaker-latched for a REAL signal —
    quota / 429 / auth — recorded by the ``record`` subcommand below);
-2. ``claude-gw/glm-5.3-flash`` → ``claude-gw/deepseek-v4.1-flash`` →
-   ``claude-gw/qwen3.8-flash`` — each ONLY when the local model gateway
+2. GLM-5.3-Flash (z.ai) → DeepSeek-V4.1-Flash (QwenCloud) →
+   Qwen3.8-Flash (QwenCloud) — each ONLY when the local model gateway
    actually serves it (the catalogue is ASKED via ``GET /v1/models``,
    authenticated with the daemon's host token; availability is never
-   hard-coded) and its tier is not latched;
+   hard-coded), its tier is not latched, and the ``claude`` CLI the rung
+   spawns is on PATH. The gateway spelling of each id
+   (``claude-gw/glm-5.3-flash[1m]``, ``claude-gw/qwen/qwen3.8-flash[1m]``
+   …) is DERIVED from model_router's vendor table, never hand-written
+   (W6-N F-1: a hand-written ``claude-gw/qwen3.8-flash`` never matched);
 3. OpenAI — only when the user enabled OpenAI for SUMMARIES (the
    ``kg_summary_openai_consent`` gate from :mod:`summary_backends`); this
    rung is DEGRADED: an API call reviews the diff and proposes node edits
@@ -37,11 +41,17 @@ log line).
 Usage (from the hook, both OS siblings)::
 
     kg_reviewer_backend.py select                 # JSON decision on stdout
-    kg_reviewer_backend.py run --prompt-file P --log L [--max-turns 10]
+    kg_reviewer_backend.py run --prompt-file P --log L [--max-turns N]
     kg_reviewer_backend.py record --model M --exit N --text-file T
 
 ``run`` selects, executes and records the outcome in one process so the
 hook stays a thin wrapper (no JSON parsing in shell).
+
+The turn budget is ONE knob (W6-N F-4): :data:`DEFAULT_MAX_TURNS`,
+overridden by ``VCO_KG_REVIEW_MAX_TURNS`` (documented in
+``docs/CONFIGURATION.md``) and read through :func:`resolve_max_turns` for
+every rung's spawn; ``--max-turns`` is an explicit per-run override. The
+hooks' broken-install branch (no python) mirrors the default.
 """
 from __future__ import annotations
 
@@ -73,22 +83,100 @@ for _candidate in (
 
 import summary_backends as _sb  # noqa: E402 — sibling in .claude/scripts/
 
-#: The fallback rungs (owner order, 2026-10-11). ``model`` is the value for
-#: ``claude -p --model``; gateway models carry the ``claude-gw/`` vendor
-#: prefix the gateway rewrites. Only these three flash models — the ruling
-#: names them and the catalogue check keeps the chain honest when the
-#: gateway cannot serve one.
-GATEWAY_RUNGS: "tuple[str, ...]" = (
-    "claude-gw/glm-5.3-flash",
-    "claude-gw/deepseek-v4.1-flash",
-    "claude-gw/qwen3.8-flash",
+#: The fallback rungs (owner order, 2026-10-11) as ``(vendor row id, bare
+#: model id)`` — the vendor-neutral facts. The id the gateway publishes is
+#: DERIVED (:func:`gateway_rungs`) from model_router's vendor table, the one
+#: home of every gateway namespace: z.ai rides ``claude-gw/``, QwenCloud
+#: ``claude-gw/qwen/``. W6-N F-1 (2026-10-12): the W6-K table hand-wrote
+#: ``claude-gw/deepseek-v4.1-flash`` / ``claude-gw/qwen3.8-flash`` and
+#: compared without the ``[1m]`` window spelling, so no rung ever matched
+#: the live catalogue. Only these three flash models — the ruling names
+#: them, and the catalogue check keeps the chain honest when the gateway
+#: cannot serve one.
+GATEWAY_RUNG_MODELS: "tuple[tuple[str, str], ...]" = (
+    ("zai", "glm-5.3-flash"),
+    ("qwen", "deepseek-v4.1-flash"),
+    ("qwen", "qwen3.8-flash"),
 )
+
+#: The reviewer's turn budget — ONE knob for every rung's spawn (W6-N F-4).
+#: 10 (the pre-W6-N value) truncated 46 of 89 logged runs in the maintainer
+#: tree, 4 of 6 and 2 of 3 in two other projects ("Reached max turns (10)"),
+#: so a typical review needs more than 10: search per touched area, read the
+#: node, write it, and the same again for a doc. 30 gives the median review
+#: two to three times the turns the truncated runs were cut at, and still
+#: fits the 900 s timeout at ~20 s a turn. Every run now logs its turn count
+#: (``turns=`` in the run line) so the next change to this number is read
+#: from data. Overridden by :data:`MAX_TURNS_ENV`; the hooks' no-python
+#: branch mirrors this default ("must match" comment there).
+DEFAULT_MAX_TURNS = 30
+MAX_TURNS_ENV = "VCO_KG_REVIEW_MAX_TURNS"
+
+#: The wall-clock bound of one reviewer run (``--timeout-s`` default).
+DEFAULT_TIMEOUT_S = 900
+
+
+def resolve_max_turns(explicit: "Optional[int]" = None) -> int:
+    """The turn budget for one run: ``explicit`` (``--max-turns``) when
+    positive, else :data:`MAX_TURNS_ENV`, else :data:`DEFAULT_MAX_TURNS`.
+
+    A non-positive or unparseable env value falls back to the default
+    rather than becoming a 0-turn kill switch (the rule
+    ``VCO_PROMPT_MIN_CHARS`` follows)."""
+    if explicit is not None and explicit > 0:
+        return explicit
+    raw = os.environ.get(MAX_TURNS_ENV, "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_TURNS
+    return value if value > 0 else DEFAULT_MAX_TURNS
+
+
+def _model_router() -> "tuple[Any, Any, Any]":
+    """``(VENDORS, advertised_id, strip_1m)`` from model_router — the one
+    home for gateway id spelling. Raises ImportError on a broken install
+    (the caller logs it as such)."""
+    from claude_mcp_servers.model_router.routing import (
+        advertised_id, strip_1m)
+    from claude_mcp_servers.model_router.vendors import VENDORS
+    return VENDORS, advertised_id, strip_1m
+
+
+def gateway_rungs() -> "tuple[str, ...]":
+    """The rung ids as the gateway spells them WITHOUT the window suffix
+    (``claude-gw/qwen/qwen3.8-flash``) — derived, never hand-written."""
+    vendors, advertised_id, _strip = _model_router()
+    return tuple(advertised_id(vendors[vendor_id], bare, False)
+                 for vendor_id, bare in GATEWAY_RUNG_MODELS)
+
+
+def _served_id(rung: str, ids: frozenset) -> "Optional[str]":
+    """The catalogue id that serves ``rung``, or None.
+
+    The ``[1m]`` suffix is a CLIENT context hint (the gateway strips it
+    before routing), and by default the gateway publishes a 1M model ONLY
+    as ``<id>[1m]`` — so membership compares ids with the hint stripped.
+    The LISTED spelling is returned so the spawn uses exactly what the
+    gateway publishes; with both spellings listed the ``[1m]`` row wins,
+    as in the shipped gateway agents' ``model:`` lines."""
+    _v, _a, strip_1m = _model_router()
+    matches = sorted((i for i in ids if strip_1m(i) == rung),
+                     key=lambda i: (i == rung, i))
+    return matches[0] if matches else None
+
 
 _TIER_HAIKU = "kg_reviewer:haiku"
 
 
 def _tier_for(model: str) -> str:
-    return _TIER_HAIKU if model == "haiku" else f"kg_reviewer:{model}"
+    """Breaker tier key. A gateway model keys on its id WITHOUT the
+    ``[1m]`` hint, so a change of published spelling cannot split one
+    model's breaker in two."""
+    if model == "haiku":
+        return _TIER_HAIKU
+    _v, _a, strip_1m = _model_router()
+    return f"kg_reviewer:{strip_1m(model)}"
 
 
 def _log(line: str) -> None:
@@ -172,27 +260,29 @@ def _haiku_available(log: Callable[[str], None]) -> bool:
     return True
 
 
-def _gateway_model_available(model: str, base: Optional[str],
+def _gateway_model_available(rung: str, base: Optional[str],
                              ids: frozenset,
                              log: Callable[[str], None],
-                             refusal: Optional[str] = None) -> bool:
+                             refusal: Optional[str] = None) -> "Optional[str]":
+    """The catalogue id to spawn for ``rung``, or None (with a log line)."""
     if base is None:
         if refusal:
-            log(f"rung {model}: unavailable (the local model gateway "
+            log(f"rung {rung}: unavailable (the local model gateway "
                 f"refused the catalogue probe: {refusal})")
         else:
-            log(f"rung {model}: unavailable (no local model gateway answered)")
-        return False
-    if model not in ids:
-        log(f"rung {model}: not served by the gateway catalogue "
+            log(f"rung {rung}: unavailable (no local model gateway answered)")
+        return None
+    served = _served_id(rung, ids)
+    if served is None:
+        log(f"rung {rung}: not served by the gateway catalogue "
             f"({len(ids)} ids) — skipped, availability is never assumed")
-        return False
-    latched = _sb.breaker_state(_tier_for(model))
+        return None
+    latched = _sb.breaker_state(_tier_for(served))
     if latched:
-        log(f"rung {model}: latched ({latched.get('reason')}), "
+        log(f"rung {served}: latched ({latched.get('reason')}), "
             f"{latched.get('remaining')}s remaining")
-        return False
-    return True
+        return None
+    return served
 
 
 def _openai_available(log: Callable[[str], None]) -> bool:
@@ -225,11 +315,28 @@ def select_reviewer_backend(
     if _haiku_available(log):
         return {"mode": "claude", "model": "haiku", "base_url": None,
                 "reason": "default"}
-    base, ids, refusal = gateway_catalogue()
-    for model in GATEWAY_RUNGS:
-        if _gateway_model_available(model, base, ids, log, refusal):
-            return {"mode": "claude", "model": model, "base_url": base,
-                    "reason": "haiku unavailable; gateway serves this model"}
+    try:
+        rungs = gateway_rungs()
+    except Exception as exc:  # noqa: BLE001 — a broken install, said so
+        rungs = ()
+        log(f"gateway rungs: unavailable (BROKEN INSTALL — model_router "
+            f"is not importable: {exc})")
+    if rungs and shutil.which("claude") is None:
+        # W6-N F-2: every gateway rung spawns `claude -p` pointed at the
+        # gateway, so without the CLI it would fail at spawn — skip each
+        # with its line and let the walk reach the OpenAI rung.
+        for rung in rungs:
+            log(f"rung {rung}: unavailable (no `claude` CLI on PATH — the "
+                f"gateway rungs spawn `claude -p`)")
+        rungs = ()
+    if rungs:
+        base, ids, refusal = gateway_catalogue()
+        for rung in rungs:
+            served = _gateway_model_available(rung, base, ids, log, refusal)
+            if served:
+                return {"mode": "claude", "model": served, "base_url": base,
+                        "reason": "haiku unavailable; gateway serves this "
+                                  "model"}
     if _openai_available(log):
         return {"mode": "openai", "model": _sb._openai_model(),
                 "base_url": None,
@@ -347,10 +454,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # whose `---` tokens would be parsed as options; the command line is
     # also capped at 32 767 chars there. ``claude -p`` with no prompt
     # argument reads the prompt from stdin.
+    # ``--output-format json`` so the run line can record the turns used
+    # (W6-N F-4: the text output carried no count, so the turn budget could
+    # not be read from the logs); the answer text is unpacked for the log.
     cmd = [
         "claude", "-p",
         "--model", model,
-        "--max-turns", str(args.max_turns),
+        "--max-turns", str(resolve_max_turns(args.max_turns)),
+        "--output-format", "json",
         "--no-session-persistence",
         "--allowedTools",
         "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,"
@@ -379,11 +490,32 @@ def _cmd_run(args: argparse.Namespace) -> int:
     tail = ((proc.stdout or "") + (proc.stderr or ""))[-4000:]
     _record_outcome(model, proc.returncode, tail, _log)
     with open(args.log, "ab") as fh:
-        if proc.stdout:
-            fh.write(proc.stdout.encode("utf-8", errors="replace"))
+        fh.write(_run_log_text(model, proc.returncode, proc.stdout or "",
+                               started).encode("utf-8", errors="replace"))
         if proc.stderr:
             fh.write(proc.stderr.encode("utf-8", errors="replace"))
     return proc.returncode
+
+
+def _run_log_text(model: str, exit_code: int, stdout: str,
+                  started: float) -> str:
+    """The log text of one finished ``claude -p --output-format json`` run:
+    the answer, then one ``[kg-reviewer <ts>] model=… turns=N`` line — the
+    per-run turn count the budget is tuned from. Output that is not the
+    JSON result object (an older CLI, a crash) is logged verbatim with
+    ``turns=?``."""
+    try:
+        result = json.loads(stdout)
+    except ValueError:
+        result = None
+    if not isinstance(result, dict):
+        return (f"{stdout}\n[kg-reviewer {started:.0f}] model={model} "
+                f"exit={exit_code} turns=?\n")
+    answer = result.get("result")
+    body = answer if isinstance(answer, str) else ""
+    return (f"{body}\n[kg-reviewer {started:.0f}] model={model} "
+            f"exit={exit_code} turns={result.get('num_turns', '?')} "
+            f"subtype={result.get('subtype', '?')}\n")
 
 
 def main(argv: "Optional[list[str]]" = None) -> int:
@@ -395,8 +527,10 @@ def main(argv: "Optional[list[str]]" = None) -> int:
     p_run = sub.add_parser("run", help="select + execute + record")
     p_run.add_argument("--prompt-file", required=True)
     p_run.add_argument("--log", required=True)
-    p_run.add_argument("--max-turns", type=int, default=10)
-    p_run.add_argument("--timeout-s", type=int, default=900)
+    p_run.add_argument("--max-turns", type=int, default=None,
+                       help=f"turn budget (default: ${MAX_TURNS_ENV}, "
+                            f"else {DEFAULT_MAX_TURNS})")
+    p_run.add_argument("--timeout-s", type=int, default=DEFAULT_TIMEOUT_S)
     p_rec = sub.add_parser("record", help="record a finished run's outcome")
     p_rec.add_argument("--model", required=True)
     p_rec.add_argument("--exit", type=int, required=True)
