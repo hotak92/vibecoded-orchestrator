@@ -2,8 +2,12 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.102 W6-N F-8 (owner ruling 2026-10-12).
 
-1. ``post-file-edit`` (both siblings) no longer tells the agent to "Run
-   /workflow-optimizer" — no such skill ships, and after the edit it is moot.
+1. ``post-file-edit`` (both siblings) emits no after-edit workflow nudge at
+   all: the "Run /workflow-optimizer" line (no such skill ships) went in
+   F-8, and the rest of the nudge -- "[Workflow file edited]" with its
+   skills-setup-guide.md pointer, and the CONTEXT_STATE "expert-skill
+   review" pointer at a never-shipped skill file -- in the review round
+   (owner-approved removal 2026-10-12).
 2. BEFORE an Edit/Write of a prompt-shaped file (agent definition, skill,
    prompt template) the pre-edit / pre-write context router suggests the
    project's ENABLED prompt-authoring agent, as a ``NOTE:`` block deduped by
@@ -60,8 +64,8 @@ def _run_post_file_edit(cmd: list, proj: Path, edited: Path) -> str:
 
 
 @pytest.mark.parametrize("sibling", ["sh", "ps1"])
-def test_post_file_edit_no_longer_points_at_workflow_optimizer(tmp_path,
-                                                               sibling):
+def test_post_file_edit_emits_no_after_edit_workflow_nudge(tmp_path,
+                                                            sibling):
     if sibling == "sh":
         cmd = ["bash", str(HOOKS / "post-file-edit.sh")]
     else:
@@ -73,9 +77,28 @@ def test_post_file_edit_no_longer_points_at_workflow_optimizer(tmp_path,
     skill = proj / ".claude" / "skills" / "demo" / "SKILL.md"
     skill.parent.mkdir(parents=True)
     skill.write_text("---\nname: demo\n---\n", encoding="utf-8")
-    out = _run_post_file_edit(cmd, proj, skill)
-    assert "[Workflow file edited]" in out, out  # the nudge itself stays
-    assert "workflow-optimizer" not in out, out
+    hook = proj / ".claude" / "hooks" / "demo.sh"
+    hook.parent.mkdir(parents=True)
+    hook.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    # The CONTEXT_STATE arm fired only when this (never shipped) skill file
+    # existed and the state file carried > 5 markers: arrange both, so the
+    # removal is proven on the arm's own trigger.
+    expert = (proj / ".claude" / "skills" / "project-experts"
+              / "claude-orchestrator-expert.md")
+    expert.parent.mkdir(parents=True)
+    expert.write_text("x\n", encoding="utf-8")
+    state = proj / ".claude" / "CONTEXT_STATE.md"
+    state.write_text("".join(f"## Status\n- \u2705 item {i}\n"
+                             for i in range(8)), encoding="utf-8")
+    for edited in (skill, hook, state):
+        out = _run_post_file_edit(cmd, proj, edited)
+        # Owner-approved removal 2026-10-12 (W6-N review round): the WHOLE
+        # after-edit workflow nudge is gone, not just its
+        # /workflow-optimizer line.
+        for gone in ("workflow-optimizer", "[Workflow file edited]",
+                     "skills-setup-guide.md", "expert-skill review",
+                     "claude-orchestrator-expert.md"):
+            assert gone not in out, (edited.name, gone, out)
 
 
 # ── 2a. classification + presence (the one home) ─────────────────────────
@@ -86,7 +109,9 @@ def test_post_file_edit_no_longer_points_at_workflow_optimizer(tmp_path,
     (".claude/agents/team/sub-agent.md", True),
     (".claude/skills/fix-issue/SKILL.md", True),
     (".claude/commands/review.md", True),
-    ("templates/agents/free/expert-coder.md", True),
+    # The VCO-repo-only templates/**/agents rule was dropped (W6-N review
+    # MEDIUM-2): it described this repo, not an ordinary project.
+    ("templates/agents/free/expert-coder.md", False),
     ("templates/packs/x/skills/y/SKILL.md", True),
     ("prompts/system.j2", True),
     ("src/summarize.prompt.md", True),

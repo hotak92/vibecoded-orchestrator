@@ -71,6 +71,10 @@ try {
     # build was reviewed with an empty diff. A root commit is shown against
     # the empty tree by `git show`; every other commit keeps the diff against
     # its FIRST parent (`git show` on a merge prints a combined diff instead).
+    # No SIGPIPE hazard here (W6-N review MEDIUM-3, the .sh sibling's
+    # pipefail defect): `Select-Object -First` stops the upstream native
+    # command without raising, and this script sets no pipefail-like
+    # preference. The >64 KiB commit test runs both siblings.
     & git rev-parse --verify --quiet 'HEAD~1' *> $null
     if ($LASTEXITCODE -eq 0) {
         $Diff       = (& git diff 'HEAD~1' HEAD --stat --no-color 2>$null | Select-Object -First 50) -join "`n"
@@ -145,12 +149,15 @@ Skip if the commit is purely cosmetic or test-only.
     } else {
         # With no python this branch cannot ask the chain for the turn
         # budget, so it mirrors it: the default 30 must match
-        # DEFAULT_MAX_TURNS in .claude/scripts/kg_reviewer_backend.py, and a
-        # non-positive/non-numeric VCO_KG_REVIEW_MAX_TURNS falls back to it.
+        # DEFAULT_MAX_TURNS in .claude/scripts/kg_reviewer_backend.py, and
+        # VCO_KG_REVIEW_MAX_TURNS must parse as resolve_max_turns() there
+        # does: plain ASCII digits only (no sign, blanks or `_`, and NOT
+        # trimmed), positive, within int64; anything else falls back to 30.
+        # A parity test pins the three parsers to each other.
         $MaxTurns = 30
-        $rawTurns = "$env:VCO_KG_REVIEW_MAX_TURNS".Trim()
+        $rawTurns = "$env:VCO_KG_REVIEW_MAX_TURNS"
         $parsedTurns = [int64]0
-        if ($rawTurns -match '^[0-9]+$' -and [int64]::TryParse($rawTurns, [ref]$parsedTurns) -and $parsedTurns -gt 0) { $MaxTurns = $parsedTurns }
+        if ($rawTurns -cmatch '\A[0-9]+\z' -and [int64]::TryParse($rawTurns, [ref]$parsedTurns) -and $parsedTurns -gt 0) { $MaxTurns = $parsedTurns }
         $allowedTools = "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,mcp__weaviate-kg__store_knowledge_node,Write,Edit"
         $proc = Start-VcoDetachedProcess -FilePath "claude" `
             -ArgumentList @('-p', '--model', 'haiku', '--max-turns', "$MaxTurns", '--no-session-persistence', '--allowedTools', $allowedTools) `

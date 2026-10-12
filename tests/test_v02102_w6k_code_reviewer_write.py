@@ -22,7 +22,7 @@ def _frontmatter(text: str) -> dict:
     assert m, "frontmatter block missing"
     out = {}
     for line in m.group(1).splitlines():
-        if line.startswith("tools:") or ":" not in line:
+        if ":" not in line:
             continue
         key, _, val = line.partition(":")
         out[key.strip()] = val.strip()
@@ -30,11 +30,12 @@ def _frontmatter(text: str) -> dict:
 
 
 def test_write_is_in_the_tools_list():
+    # The tools list is read from the FRONTMATTER (the harness reads it
+    # there), never from a `tools:` line anywhere in the body.
     fm = _frontmatter(AGENT.read_text(encoding="utf-8"))
-    m = re.search(r"^tools:\s*(.+)$", AGENT.read_text(encoding="utf-8"),
-                  re.MULTILINE)
-    assert m, "tools: line missing"
-    tools = [t.strip() for t in m.group(1).split(",")]
+    assert fm.get("name") == "code-reviewer", fm
+    assert fm.get("tools"), "tools: line missing from the frontmatter"
+    tools = [t.strip() for t in fm["tools"].split(",")]
     assert "Write" in tools, tools
     # read-only review capability preserved
     for needed in ("Read", "Grep", "Glob", "Bash"):

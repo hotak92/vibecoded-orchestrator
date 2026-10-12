@@ -16,8 +16,9 @@ Pure stdlib, no I/O beyond ``os.path`` existence checks.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import PurePosixPath
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Mapping, Optional, Tuple
 
 #: The prompt-authoring agents to suggest, in preference order; the first one
 #: ENABLED in the project wins (an agent the user switched off lives in
@@ -50,40 +51,112 @@ def _rel_parts(file_path: str, project_root: str) -> Tuple[str, ...]:
     return tuple(p for p in PurePosixPath(path).parts if p not in ("/", ""))
 
 
-def is_prompt_shaped(file_path: str, project_root: str = "") -> bool:
-    """True for agent definitions, skills and prompt templates.
+#: Instruction files the coding agents load as standing prompts, matched by
+#: exact file name wherever they sit (Claude Code also loads nested
+#: ``CLAUDE.md`` files; Codex reads ``AGENTS.md``; Gemini CLI ``GEMINI.md``).
+_INSTRUCTION_FILE_NAMES = frozenset({"CLAUDE.md", "CLAUDE.local.md",
+                                     "AGENTS.md", "GEMINI.md"})
 
-    * ``.claude/agents/**/*.md`` and ``.claude/commands/**/*.md`` (slash
-      commands are prompt templates);
-    * any ``SKILL.md`` (the skill file name is the convention, wherever it
-      lives — ``.claude/skills/**`` and shipped skill sources alike);
-    * agent definition sources: a ``.md`` under an ``agents/`` directory
-      that sits under a ``templates/`` directory (``README.md`` excluded);
-    * ``*.prompt`` / ``*.prompt.md`` / ``*.prompt.txt`` files, and template
-      files under a ``prompts/`` directory.
+#: The Claude Code settings files whose ``hooks`` may carry a ``prompt`` /
+#: ``agent`` hook (the hook's prompt text lives inside the JSON).
+_SETTINGS_FILE_NAMES = frozenset({"settings.json", "settings.local.json"})
+
+#: A ``prompt`` / ``agent`` hook entry in settings JSON text.
+_HOOK_PROMPT_RE = re.compile(r'"type"\s*:\s*"(?:prompt|agent)"')
+
+
+def _after(dirs: List[str], first: str, second: str) -> int:
+    """Index just past the first ``first/second`` pair in ``dirs``, or -1."""
+    for i in range(len(dirs) - 1):
+        if dirs[i] == first and dirs[i + 1] == second:
+            return i + 2
+    return -1
+
+
+def _touches_hook_prompt(tool_input: Optional[Mapping]) -> bool:
+    """True when the Edit/Write text -- the new ``content``, or either side
+    of an ``old_string`` -> ``new_string`` edit -- holds a ``prompt`` /
+    ``agent`` hook entry. Only what the call itself carries is read (no
+    file I/O): an edit elsewhere in a settings file that happens to hold a
+    prompt hook is not a prompt edit."""
+    if not tool_input:
+        return False
+    for key in ("content", "new_string", "old_string"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and _HOOK_PROMPT_RE.search(value):
+            return True
+    return False
+
+
+def prompt_kind(file_path: str, project_root: str = "",
+                tool_input: Optional[Mapping] = None) -> Optional[str]:
+    """What kind of prompt ``file_path`` is, or None when it is not one.
+
+    * ``"agent definition"`` -- ``.claude/agents/**/*.md``;
+    * ``"slash command"`` -- ``.claude/commands/**/*.md``;
+    * ``"skill"`` -- any ``SKILL.md``, and a skill's supporting text files
+      (``.claude/skills/<name>/**`` with a prompt-template extension);
+    * ``"output style"`` -- ``.claude/output-styles/**/*.md``;
+    * ``"instruction file"`` -- ``CLAUDE.md`` / ``CLAUDE.local.md`` /
+      ``AGENTS.md`` / ``GEMINI.md`` anywhere,
+      ``.github/copilot-instructions.md``,
+      ``.github/instructions/**/*.instructions.md``,
+      ``.github/chatmodes/**/*.chatmode.md``, ``.cursor/rules/**/*.mdc``;
+    * ``"prompt template"`` -- ``*.prompt`` / ``*.prompt.md`` /
+      ``*.prompt.txt``, and template files under a ``prompts/`` directory;
+    * ``"hook prompt"`` -- ``.claude/settings.json`` /
+      ``settings.local.json`` when the Edit/Write itself adds, changes or
+      removes a ``"type": "prompt"`` / ``"agent"`` hook (``tool_input``).
+      Hook SCRIPTS that assemble a prompt in shell are not detected: no
+      cheap, precise test tells them from any other script.
+
+    ``README.md`` is never a prompt.
     """
     parts = _rel_parts(file_path, project_root)
     if not parts:
-        return False
+        return None
     name = parts[-1]
     lower = name.lower()
     dirs = [d.lower() for d in parts[:-1]]
-    if name == "SKILL.md":
-        return True
-    if lower.endswith((".prompt", ".prompt.md", ".prompt.txt")):
-        return True
     ext = os.path.splitext(lower)[1]
+    if name == "SKILL.md":
+        return "skill"
+    if name in _INSTRUCTION_FILE_NAMES:
+        return "instruction file"
+    if lower == "readme.md":
+        return None
+    if lower.endswith((".prompt", ".prompt.md", ".prompt.txt")):
+        return "prompt template"
+    if lower in _SETTINGS_FILE_NAMES and dirs[-1:] == [".claude"]:
+        return "hook prompt" if _touches_hook_prompt(tool_input) else None
+    if dirs[:1] == [".github"]:
+        if len(dirs) == 1 and lower == "copilot-instructions.md":
+            return "instruction file"
+        if dirs[1:2] == ["instructions"] and lower.endswith(".instructions.md"):
+            return "instruction file"
+        if dirs[1:2] == ["chatmodes"] and lower.endswith(".chatmode.md"):
+            return "instruction file"
+    if ext == ".mdc" and _after(dirs, ".cursor", "rules") >= 0:
+        return "instruction file"
+    if ext == ".md":
+        if _after(dirs, ".claude", "agents") >= 0:
+            return "agent definition"
+        if _after(dirs, ".claude", "commands") >= 0:
+            return "slash command"
+        if _after(dirs, ".claude", "output-styles") >= 0:
+            return "output style"
+    skill_at = _after(dirs, ".claude", "skills")
+    if skill_at >= 0 and len(dirs) > skill_at and ext in _PROMPT_DIR_EXTS:
+        return "skill"
     if "prompts" in dirs and ext in _PROMPT_DIR_EXTS:
-        return True
-    if ext != ".md" or lower == "readme.md":
-        return False
-    for i, d in enumerate(dirs):
-        nxt = dirs[i + 1] if i + 1 < len(dirs) else ""
-        if d == ".claude" and nxt in ("agents", "commands"):
-            return True
-        if d == "agents" and "templates" in dirs[:i]:
-            return True
-    return False
+        return "prompt template"
+    return None
+
+
+def is_prompt_shaped(file_path: str, project_root: str = "",
+                     tool_input: Optional[Mapping] = None) -> bool:
+    """True when :func:`prompt_kind` names a kind."""
+    return prompt_kind(file_path, project_root, tool_input) is not None
 
 
 def _agent_dirs(project_root: str) -> Iterable[str]:
@@ -116,13 +189,19 @@ def enabled_prompt_agent(project_root: str,
     return None
 
 
-def nudge_block(file_path: str, project_root: str) -> str:
+def nudge_block(file_path: str, project_root: str,
+                tool_input: Optional[Mapping] = None) -> str:
     """The ``NOTE:`` block for one prompt-shaped file, or ``""``.
 
     The header's first field names the file, so the seen-store key is per
     file; the caller passes the block through the session seen-store.
+    ``tool_input`` (the Edit/Write input) is what tells a hook-prompt edit
+    of ``.claude/settings.json`` from any other settings edit.
     """
-    if not file_path or not is_prompt_shaped(file_path, project_root):
+    if not file_path:
+        return ""
+    kind = prompt_kind(file_path, project_root, tool_input)
+    if not kind:
         return ""
     agent = enabled_prompt_agent(project_root)
     if not agent:
@@ -130,7 +209,7 @@ def nudge_block(file_path: str, project_root: str) -> str:
     rel = "/".join(_rel_parts(file_path, project_root))
     lines = [
         f"{NOTE_PREFIX}prompt-shaped file {rel} | agent={agent}",
-        f"  This file is a prompt (agent definition, skill or prompt template)."
+        f"  This edit changes a prompt ({kind})."
         f" Consider delegating the change to the `{agent}` agent, or applying"
         f" its guidance, before editing it.",
     ]

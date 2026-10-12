@@ -67,12 +67,18 @@ echo "$COMMIT_HASH" > "$LAST_REVIEWED_FILE"
 # build was reviewed with an empty diff. A root commit is shown against the
 # empty tree by `git show`; every other commit keeps the diff against its
 # FIRST parent (`git show` on a merge would print a combined diff instead).
+#
+# `|| true` on every capture (W6-N review MEDIUM-3): on a diff bigger than
+# the pipe buffer `head` exits first and `git` dies of SIGPIPE (141); under
+# `set -o pipefail` the capture then fails and `set -e` killed the hook
+# before the reviewer was spawned. The truncated text is exactly what is
+# wanted, so the capture's status is not an error.
 if git rev-parse --verify --quiet HEAD~1 >/dev/null 2>&1; then
-    DIFF=$(git diff HEAD~1 HEAD --stat --no-color 2>/dev/null | head -50)
-    DIFF_DETAIL=$(git diff HEAD~1 HEAD --no-color 2>/dev/null | head -300)
+    DIFF=$(git diff HEAD~1 HEAD --stat --no-color 2>/dev/null | head -50) || true
+    DIFF_DETAIL=$(git diff HEAD~1 HEAD --no-color 2>/dev/null | head -300) || true
 else
-    DIFF=$(git show --format= --stat --no-color HEAD 2>/dev/null | head -50)
-    DIFF_DETAIL=$(git show --format= --no-color HEAD 2>/dev/null | head -300)
+    DIFF=$(git show --format= --stat --no-color HEAD 2>/dev/null | head -50) || true
+    DIFF_DETAIL=$(git show --format= --no-color HEAD 2>/dev/null | head -300) || true
 fi
 
 # Build the agent prompt — single-project mode (KG and docs are inside this repo)
@@ -127,7 +133,10 @@ else
     # pre-W6-K direct Haiku spawn. With no python this branch cannot ask
     # the chain for the turn budget, so it mirrors it: the default 30 must
     # match DEFAULT_MAX_TURNS in .claude/scripts/kg_reviewer_backend.py, and
-    # a non-positive/non-numeric VCO_KG_REVIEW_MAX_TURNS falls back to it.
+    # VCO_KG_REVIEW_MAX_TURNS must parse as resolve_max_turns() there does:
+    # plain ASCII digits only (no sign, blanks or `_`), positive, within
+    # int64 (`-gt` refuses a larger value); anything else falls back to 30.
+    # A parity test pins the three parsers to each other.
     MAX_TURNS="${VCO_KG_REVIEW_MAX_TURNS:-}"
     case "$MAX_TURNS" in
         ''|*[!0-9]*) MAX_TURNS=30 ;;

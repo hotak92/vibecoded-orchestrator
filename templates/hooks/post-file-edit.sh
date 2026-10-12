@@ -25,9 +25,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   3. Queue code-graph incremental update for code files
 #
 # LLM-visible reminders (routed through additionalContext envelope):
-#   4. CONTEXT_STATE.md significant-changes → expert-skill update prompt
-#   5. .claude/skills or .claude/hooks edits → workflow-test prompt
-#   6. Code-file edits → CONTEXT_STATE / KG capture reminder
+#   4. the routing home's report ($VCO_ROUTE_NUDGE: the pending KG
+#      duplicate-scan report) and the once-per-session broken-install notice
 #
 # Plain stdout from PostToolUse hooks is silently dropped per the
 # v2.1.x contract (see `.claude/context/hook-audit-2026-05-10.md`),
@@ -178,39 +177,12 @@ elif command -v vco_report_missing_hook_lib >/dev/null 2>&1; then
     fi
 fi
 
-# 4. CONTEXT_STATE.md significant-changes → expert-skill nudge.
-if [[ "$EDITED_FILE" == *"CONTEXT_STATE.md" ]]; then
-    EXPERT_SKILL="$PROJECT_ROOT/.claude/skills/project-experts/claude-orchestrator-expert.md"
-    if [ -f "$EXPERT_SKILL" ]; then
-        CHANGES=$(grep -E "(✅|##\s+(Status|Current Work|Next Steps|Knowledge Captured))" "$EDITED_FILE" | wc -l)
-        if [ "$CHANGES" -gt 5 ]; then
-            _add_nudge "[CONTEXT_STATE.md updated — expert-skill review] ${CHANGES} significant markers detected.
-Consider updating .claude/skills/project-experts/claude-orchestrator-expert.md if any of:
-  - Major milestone completed (Skills system, knowledge graph, etc.)
-  - Architecture changed (MCP, agents, workflow)
-  - New scripts/commands added (kg-*, wrappers)
-  - Recent work section needs refresh"
-        fi
-    fi
-fi
-
-# 5. Workflow-system edits (Skills/Agents/hooks) → workflow-test nudge.
-# v0.2.102 W6-N F-8 (owner ruling 2026-10-12): the "Run /workflow-optimizer"
-# line is gone -- no such skill ships, and after the edit its job is moot.
-# The prompt-file advice now comes BEFORE the edit, from the pre-edit /
-# pre-write context router (vco_lib/prompt_edit_nudge.py).
-WORKFLOW_CHANGED=false
-if [[ "$EDITED_FILE" == "$PROJECT_ROOT/.claude/skills"* ]] || \
-   [[ "$EDITED_FILE" == "$PROJECT_ROOT/.claude/hooks"* ]]; then
-    WORKFLOW_CHANGED=true
-fi
-if [ "$WORKFLOW_CHANGED" = true ]; then
-    _add_nudge "[Workflow file edited] $(basename "$EDITED_FILE") was changed.
-Consider:
-  - Test the change in actual usage before assuming it works.
-  - Update documentation if the structure changed.
-  - Update skills-setup-guide.md if the setup process changed."
-fi
+# The after-edit workflow nudges are gone (owner-approved removal
+# 2026-10-12, v0.2.102 W6-N review round): the CONTEXT_STATE.md
+# "expert-skill review" pointer named a skill file VCO never ships, and the
+# "[Workflow file edited]" reminder pointed at a skills-setup-guide.md that
+# exists nowhere. Prompt-file advice comes BEFORE the edit, from the
+# pre-edit / pre-write context router (vco_lib/prompt_edit_nudge.py).
 
 # Emit accumulated nudges as a single PostToolUse envelope.
 if [ -n "$LLM_NUDGE" ] && command -v emit_additional_context >/dev/null 2>&1; then

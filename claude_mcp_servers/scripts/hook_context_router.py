@@ -1322,7 +1322,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         _CURRENT_RUN_ID = ""
 
 
-def _emit_prompt_nudge(payload: Dict, sid: str, project_root: str) -> None:
+def _emit_prompt_nudge(payload: Dict, sid: str, project_root: str,
+                       prompt_id: str) -> None:
     """v0.2.102 W6-N F-8 (owner ruling 2026-10-12): before an Edit/Write of a
     prompt-shaped file, suggest the project's ENABLED prompt-authoring agent
     (:mod:`vco_lib.prompt_edit_nudge` decides both). Printed FIRST, as a
@@ -1330,15 +1331,30 @@ def _emit_prompt_nudge(payload: Dict, sid: str, project_root: str) -> None:
     at most once per session per file — on this run and on the edit
     wrapper's cache replay alike (the shell/PowerShell filters parse NOTE
     too). An untrustworthy session (no store) gets no nudge: without a
-    store "at most once" cannot be kept, and silence is the safe side."""
-    file_path = str((payload.get("tool_input") or {}).get("file_path") or "")
-    block = _prompt_nudge_block(file_path, project_root)
+    store "at most once" cannot be kept, and silence is the safe side.
+
+    Inside the injection budgets like every other block (W6-N review
+    NIT-6): capped by the per-injection soft cap, degraded to its header
+    line (which keeps the dedup identity) once the per-turn budget is
+    spent, and CHARGED to the per-turn budget before the KG/CODE legs read
+    it, so the blocks that follow in the same run see the NOTE's cost."""
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    file_path = str(tool_input.get("file_path") or "")
+    block = _prompt_nudge_block(file_path, project_root, tool_input)
     inject_file = seen_store_path("inject", sid, project_root)
     if not block or not inject_file:
         return
     shown = filter_seen_blocks(block, inject_file, "", project_root)
-    if shown.strip():
-        print(shown.rstrip("\n"))
+    if not shown.strip():
+        return
+    text = cap_block(shown.strip("\n"))
+    budget_path = budget_state_path(sid, prompt_id, project_root)
+    if _budget_used(budget_path) + len(text) > PER_TURN_BUDGET_CHARS:
+        text = text.split("\n", 1)[0]
+    print(text)
+    _budget_charge(budget_path, len(text) + 1)
 
 
 def _main(argv: List[str]) -> int:
@@ -1394,7 +1410,7 @@ def _main(argv: List[str]) -> int:
     plan = _PLAN_BUILDERS[surface](payload, cwd)
 
     if surface in ("edit", "write"):
-        _emit_prompt_nudge(payload, sid, project_root)
+        _emit_prompt_nudge(payload, sid, project_root, prompt_id)
 
     def _write_intent_out() -> None:
         """The Wave-2 wrapper's outcome-event seam (WP-D 2: intent +

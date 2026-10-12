@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -111,6 +112,8 @@ GATEWAY_RUNG_MODELS: "tuple[tuple[str, str], ...]" = (
 #: branch mirrors this default ("must match" comment there).
 DEFAULT_MAX_TURNS = 30
 MAX_TURNS_ENV = "VCO_KG_REVIEW_MAX_TURNS"
+_DIGITS_RE = re.compile(r"[0-9]+")
+_INT64_MAX = 2 ** 63 - 1
 
 #: The wall-clock bound of one reviewer run (``--timeout-s`` default).
 DEFAULT_TIMEOUT_S = 900
@@ -125,12 +128,16 @@ def resolve_max_turns(explicit: "Optional[int]" = None) -> int:
     ``VCO_PROMPT_MIN_CHARS`` follows)."""
     if explicit is not None and explicit > 0:
         return explicit
-    raw = os.environ.get(MAX_TURNS_ENV, "").strip()
-    try:
-        value = int(raw)
-    except ValueError:
+    # Plain ASCII digits only, unstripped, within int64 — the grammar the
+    # hooks' no-python mirrors accept (``.sh``: ``*[!0-9]*`` + ``-gt 0``;
+    # ``.ps1``: ``^[0-9]+$`` + ``[int64]::TryParse``). ``int()`` alone would
+    # also take ``+5``, `` 5 `` and ``1_000``, which the mirrors refuse;
+    # a parity test pins all three (W6-N review LOW-5).
+    raw = os.environ.get(MAX_TURNS_ENV, "")
+    if not _DIGITS_RE.fullmatch(raw):
         return DEFAULT_MAX_TURNS
-    return value if value > 0 else DEFAULT_MAX_TURNS
+    value = int(raw)
+    return value if 0 < value <= _INT64_MAX else DEFAULT_MAX_TURNS
 
 
 def _model_router() -> "tuple[Any, Any, Any]":
@@ -369,14 +376,67 @@ def _gateway_auth_env(base_url: str) -> "dict[str, str]":
     return env
 
 
+#: ``subtype`` of a ``claude -p --output-format json`` result whose run
+#: ended on the CLIENT's ``--max-turns`` budget (Agent SDK
+#: ``SDKResultMessage``; it carries no ``result`` field).
+MAX_TURNS_SUBTYPE = "error_max_turns"
+#: The text-mode equivalent (an older CLI, or a ``record`` text file).
+_TEXT_MAX_TURNS_RE = re.compile(r"(?m)^Error: Reached max turns \(\d+\)\s*$")
+
+
+def parse_run_result(stdout: str) -> "Optional[dict]":
+    """The ``--output-format json`` result object, or None when the output
+    is not one (an older CLI, a crash, text mode)."""
+    try:
+        result = json.loads(stdout or "")
+    except ValueError:
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def run_failure_evidence(stdout: str, stderr: str) -> "tuple[bool, str]":
+    """``(served, text)`` for one finished reviewer run.
+
+    ``served`` is True when the run ended on the client's own turn budget
+    (``subtype == "error_max_turns"``, or the text-mode "Reached max turns"
+    line): the backend answered every turn, so it is not a backend failure
+    — no strike, no latch (W6-N review HIGH-1).
+
+    ``text`` is what the breaker may classify: the parsed ``result`` string
+    plus stderr, NEVER the raw JSON. The result object's ``duration_ms``,
+    token counts, cost and ``session_id`` carry ``401`` / ``429`` / ``503``
+    digits that the substring classifier read as auth / rate-limit /
+    capacity signals (about 1 failed run in 10 latched falsely). A
+    non-JSON stdout (text mode) is the answer itself and is kept.
+    """
+    result = parse_run_result(stdout)
+    if result is not None:
+        if result.get("subtype") == MAX_TURNS_SUBTYPE:
+            return True, ""
+        answer = result.get("result")
+        text = (answer if isinstance(answer, str) else "") + "\n" + (stderr or "")
+    else:
+        text = (stdout or "") + (stderr or "")
+        if _TEXT_MAX_TURNS_RE.search(text):
+            return True, ""
+    return False, text.strip()[-4000:]
+
+
 def _record_outcome(model: str, exit_code: "Optional[int]", text: str,
-                    log: Callable[[str], None]) -> None:
+                    log: Callable[[str], None], *,
+                    served: bool = False) -> None:
     """Classify the finished run and latch/clear its tier (one home:
     summary_backends' breaker — the same real-signal machinery the summary
-    ladder uses)."""
+    ladder uses). ``served`` (see :func:`run_failure_evidence`) marks a run
+    the backend answered in full that ended on the client's turn budget: it
+    clears the tier like a success instead of striking it."""
     tier = _tier_for(model) if model != "openai" else "kg_reviewer:openai"
-    if exit_code == 0:
+    if exit_code == 0 or served:
         _sb.clear_backend_trip(tier)
+        if exit_code != 0:
+            log(f"run on {model} hit its turn budget (exit={exit_code}) — "
+                f"not a backend failure; raise {MAX_TURNS_ENV} if this "
+                f"recurs")
         return
     reason, signal = _sb.classify_backend_failure(text=text)
     tripped = _sb.trip_backend(tier, reason, signal=signal)
@@ -391,13 +451,14 @@ def _cmd_select() -> int:
 
 
 def _cmd_record(args: argparse.Namespace) -> int:
-    text = ""
+    raw = ""
     try:
-        text = Path(args.text_file).read_text(encoding="utf-8",
-                                              errors="replace")[-4000:]
+        raw = Path(args.text_file).read_text(encoding="utf-8",
+                                             errors="replace")
     except OSError:
         pass
-    _record_outcome(args.model, args.exit, text, _log)
+    served, text = run_failure_evidence(raw, "")
+    _record_outcome(args.model, args.exit, text, _log, served=served)
     return 0
 
 
@@ -480,15 +541,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 return maybe.decode("utf-8", errors="replace")
             return maybe or ""
 
+        out, err = _text(exc.stdout), _text(exc.stderr)
+        # The breaker reads "timeout" plus the parsed evidence only — not
+        # str(exc), whose argv echo (turn budget, model id) and the timeout
+        # seconds are digits the substring classifier could misread
+        # (W6-N review HIGH-1). The log keeps the full detail.
+        _served, evidence = run_failure_evidence(out, err)
+        _record_outcome(model, 124, f"timeout\n{evidence}", _log)
         tail = (f"timeout after {args.timeout_s}s\n{exc}\n"
-                + _text(exc.stdout) + _text(exc.stderr))[-4000:]
-        _record_outcome(model, 124, tail, _log)
+                + out + err)[-4000:]
         with open(args.log, "a", encoding="utf-8") as fh:
             fh.write(f"\n[kg-reviewer {started:.0f}] TIMED OUT after "
                      f"{args.timeout_s}s on {model}\n{tail}\n")
         return 124
-    tail = ((proc.stdout or "") + (proc.stderr or ""))[-4000:]
-    _record_outcome(model, proc.returncode, tail, _log)
+    # Classify on the parsed ``result`` + stderr only, never the raw JSON
+    # (W6-N review HIGH-1 — see run_failure_evidence).
+    served, evidence = run_failure_evidence(proc.stdout or "",
+                                            proc.stderr or "")
+    _record_outcome(model, proc.returncode, evidence, _log, served=served)
     with open(args.log, "ab") as fh:
         fh.write(_run_log_text(model, proc.returncode, proc.stdout or "",
                                started).encode("utf-8", errors="replace"))
@@ -504,11 +574,8 @@ def _run_log_text(model: str, exit_code: int, stdout: str,
     per-run turn count the budget is tuned from. Output that is not the
     JSON result object (an older CLI, a crash) is logged verbatim with
     ``turns=?``."""
-    try:
-        result = json.loads(stdout)
-    except ValueError:
-        result = None
-    if not isinstance(result, dict):
+    result = parse_run_result(stdout)
+    if result is None:
         return (f"{stdout}\n[kg-reviewer {started:.0f}] model={model} "
                 f"exit={exit_code} turns=?\n")
     answer = result.get("result")
