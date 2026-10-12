@@ -195,6 +195,10 @@ Consider updating .claude/skills/project-experts/claude-orchestrator-expert.md i
 fi
 
 # 5. Workflow-system edits (Skills/Agents/hooks) → workflow-test nudge.
+# v0.2.102 W6-N F-8 (owner ruling 2026-10-12): the "Run /workflow-optimizer"
+# line is gone -- no such skill ships, and after the edit its job is moot.
+# The prompt-file advice now comes BEFORE the edit, from the pre-edit /
+# pre-write context router (vco_lib/prompt_edit_nudge.py).
 WORKFLOW_CHANGED=false
 if [[ "$EDITED_FILE" == "$PROJECT_ROOT/.claude/skills"* ]] || \
    [[ "$EDITED_FILE" == "$PROJECT_ROOT/.claude/hooks"* ]]; then
@@ -205,7 +209,6 @@ if [ "$WORKFLOW_CHANGED" = true ]; then
 Consider:
   - Test the change in actual usage before assuming it works.
   - Update documentation if the structure changed.
-  - Run /workflow-optimizer to check for optimizations.
   - Update skills-setup-guide.md if the setup process changed."
 fi
 

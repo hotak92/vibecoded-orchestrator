@@ -156,6 +156,10 @@ if ($EditedFile.EndsWith("CONTEXT_STATE.md", [StringComparison]::OrdinalIgnoreCa
 }
 
 # 5. Workflow-system edits → workflow-test nudge.
+# v0.2.102 W6-N F-8 (owner ruling 2026-10-12): the "Run /workflow-optimizer"
+# line is gone -- no such skill ships, and after the edit its job is moot.
+# The prompt-file advice now comes BEFORE the edit, from the pre-edit /
+# pre-write context router (vco_lib/prompt_edit_nudge.py).
 $workflowChanged = $false
 $skillsDir = Join-Path $ProjectRoot ".claude/skills"
 $hooksDir = Join-Path $ProjectRoot ".claude/hooks"
@@ -165,7 +169,7 @@ if ($EditedFile.StartsWith($skillsDir, [StringComparison]::OrdinalIgnoreCase) -o
 }
 if ($workflowChanged) {
     $bn = Split-Path $EditedFile -Leaf
-    Add-Nudge "[Workflow file edited] $bn was changed.`nConsider:`n  - Test the change in actual usage before assuming it works.`n  - Update documentation if the structure changed.`n  - Run /workflow-optimizer to check for optimizations.`n  - Update skills-setup-guide.md if the setup process changed."
+    Add-Nudge "[Workflow file edited] $bn was changed.`nConsider:`n  - Test the change in actual usage before assuming it works.`n  - Update documentation if the structure changed.`n  - Update skills-setup-guide.md if the setup process changed."
 }
 
 # Emit accumulated nudges as a single PostToolUse envelope.

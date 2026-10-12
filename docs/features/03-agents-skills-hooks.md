@@ -158,6 +158,8 @@ Every KG/code-graph injection surface is a THIN wrapper around one Python router
 
 The surfaces: `pre-bash-context-inject` (Bash), `pre-edit-context-inject` (Edit), `pre-write-context-inject` (Write), `grep-context-inject` (Grep), `agent-brief-kg-inject` (Agent|Task, PreToolUse `updatedInput`) and `read-context-inject` (Read, PostToolUse — the result surface, where the just-read content feeds the lookup).
 
+**Before-edit prompt-agent nudge** (v0.2.102 W6-N, owner ruling 2026-10-12): on the `edit` and `write` surfaces, when the target is prompt-shaped — `.claude/agents/**/*.md`, `.claude/commands/**/*.md`, any `SKILL.md`, agent sources under `templates/**/agents/`, `*.prompt` / `*.prompt.md` files and templates under a `prompts/` directory — the router prints one `NOTE:` block suggesting the project's ENABLED prompt-authoring agent (`prompt-engineer` if the project has it, else `agent-author`; nothing when neither is enabled). The block goes through the session seen-store, so it appears at most once per session per file, and the shell/PowerShell cache-replay filters parse `NOTE:` the same way. One home: `vco_lib/prompt_edit_nudge.py`.
+
 ### `pre-edit-context-inject.sh` — PreToolUse Edit (blocking)
 Inject gated KG + EXACT code-graph context for the symbol being edited, before the Edit executes.
 
