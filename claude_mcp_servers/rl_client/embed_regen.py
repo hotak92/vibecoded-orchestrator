@@ -141,8 +141,11 @@ def regenerate_node_vector_tagged(
     svc = embedding_service
     if svc is None and embed_fn is None:
         try:
-            from claude_mcp_servers.weaviate_mcp.server import _get_embedding_service
-            svc = _get_embedding_service()
+            # v0.2.102 W6-M: the live server's accessor when one is loaded,
+            # the light KG host's (same code, kg_query_core) in the hook producer.
+            from claude_mcp_servers.weaviate_mcp.kg_host import host as _kg_host
+
+            svc = _kg_host("claude_mcp_servers.weaviate_mcp")._get_embedding_service()
         except Exception as exc:  # noqa: BLE001
             logger.debug("embed_regen: cannot resolve EmbeddingService (%s)", exc)
             return None, False

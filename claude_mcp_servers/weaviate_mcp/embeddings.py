@@ -80,123 +80,30 @@ from vco_lib.code_embed_image import service_base_url  # noqa: E402
 CODE_EMBED_SERVICE_URL = service_base_url()
 
 
-# ─── EmbeddingService accessor ──────────────────────────────────────────
+# ─── EmbeddingService accessor + query-embed entries (v0.2.102 W6-M) ────
 #
-# v0.2.18: Lazy + cached EmbeddingService accessor.
-#
-# Why lazy: the MCP server is long-running (one process per Claude Code
-# session). Constructing at import time would probe backends before the
-# Weaviate/Ollama containers have settled, producing a stale
-# NoEmbeddingBackendError that survives until the next session restart.
-#
-# Why cached: the service owns an HTTP connection pool; one instance
-# amortises TLS+keep-alive across every embed call this MCP makes for
-# the rest of the session.
-#
-# Why not module-level singleton: per the v0.2.18 locked design
-# decision, EmbeddingService is per-project — but this MCP server IS
-# pinned to one project for its lifetime (KG_COLLECTION env is set per-
-# project by the launcher), so "per-MCP-instance" satisfies the
-# per-project constraint.
-#
-# Concurrency: the cached service is initialised under the asyncio
-# event loop's natural serialisation. Two near-simultaneous tool calls
-# may both try to construct the service; the second's `for_project()`
-# is a few-ms re-probe of already-running backends, and the cache write
-# is idempotent. No lock needed.
-#
-# M-1 coupling: the cache globals ``_cached_embed_service`` /
-# ``_embed_service_construction_failed_at`` / ``_EMBED_SERVICE_RETRY_WINDOW``
-# live on ``server`` (tests poke ``server._cached_embed_service``), so this
-# accessor reads/writes them via the ``server`` module object.
+# ``_get_embedding_service`` (+ its record re-check helper),
+# ``_get_search_vector`` and ``_kg_search_vector`` moved VERBATIM to
+# ``kg_query_core`` so the hook KG producer embeds its query through them
+# without importing this module (aiohttp + the OpenAI-key resolution). Their
+# only edit: the ``from . import server`` lookup is ``kg_host.host()`` — the
+# SAME server module whenever one is loaded, the light host otherwise. They
+# are re-exported AND rebound into THIS namespace (``bind_into``), so
+# ``server``'s ``from .embeddings import …`` and every patch on
+# ``embeddings.<name>`` behave exactly as before.
+from . import kg_query_core as _kg_query_core  # noqa: E402
+from .kg_query_core import (  # noqa: E402 — re-export (block comment above)
+    _RECORD_RECHECK_SECS as _RECORD_RECHECK_SECS,
+    _code_record_changed as _code_record_changed,
+    _get_embedding_service as _get_embedding_service,
+    _get_search_vector as _get_search_vector,
+    _kg_search_vector as _kg_search_vector,
+)
 
-
-#: How often a cached EmbeddingService re-reads the code graph's recorded model.
-_RECORD_RECHECK_SECS = 30.0
-
-
-def _code_record_changed(svc, prefix: str) -> bool:
-    """True when the launcher DB now records a different code model for
-    ``prefix`` than the one ``svc`` resolved at construction. Soft-fails to
-    False (a DB hiccup must not churn the service)."""
-    try:
-        from vco_lib.code_embed_model import CodeModelResolution, read_code_model_record
-
-        res = getattr(svc, "code_model_resolution", None)
-        if not prefix or not isinstance(res, CodeModelResolution):
-            return False
-        rec = read_code_model_record(prefix)
-        before = res.recorded.model if res.recorded else None
-        return before != (rec.model if rec else None)
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _get_embedding_service():
-    """Return a cached EmbeddingService instance for this MCP session.
-
-    Returns None when:
-      * vco_lib isn't importable (HAS_EMBEDDING_SERVICE=False), OR
-      * Construction raised NoEmbeddingBackendError recently (within the
-        10-second retry window — avoids hammering already-down services).
-
-    On None, the WRITE/backfill helpers below fall through to their inline
-    HTTP bodies, each of which embeds with its OWN named model into that
-    model's slot (a transport fallback, never a model substitution). The
-    SEARCH paths never do: they raise the loud
-    ``vco_lib.embed_outage.EmbeddingBackendUnavailable`` (owner ruling
-    2026-10-10 — a query embedded by another model searches noise). The
-    construction error is kept on ``server._embed_service_construction_error``
-    so that loud text can quote it.
-    """
-    from . import server
-    if not server.HAS_EMBEDDING_SERVICE:
-        return None
-    import time as _time
-
-    if server._cached_embed_service is not None:
-        # v0.2.102 W6-B2: a long-lived MCP must not keep querying the PRE-flip
-        # space after a fill completes (or a re-walk records another model) —
-        # re-read the cheap DB record at most every _RECORD_RECHECK_SECS and
-        # rebuild the service when it changed.
-        now = _time.monotonic()
-        if now - getattr(server, "_embed_record_checked_at", 0.0) < _RECORD_RECHECK_SECS:
-            return server._cached_embed_service
-        server._embed_record_checked_at = now
-        if not _code_record_changed(server._cached_embed_service,
-                                    getattr(server, "CODE_GRAPH_PROJECT", None) or ""):
-            return server._cached_embed_service
-        server.logger.info("weaviate-kg: the code graph's recorded model changed — "
-                           "rebuilding the embedding service")
-        server._cached_embed_service = None
-    if (_time.monotonic() - server._embed_service_construction_failed_at) < server._EMBED_SERVICE_RETRY_WINDOW:
-        return None  # in the retry window — don't probe again yet
-
-    try:
-        # v0.2.102 W6-B2: the code leg embeds in the space THIS project's
-        # code graph is recorded as indexed in (vco_lib.code_embed_model).
-        server._cached_embed_service = server.EmbeddingService.for_project(
-            codegraph_prefix=getattr(server, "CODE_GRAPH_PROJECT", None) or None)
-        return server._cached_embed_service
-    except server.NoEmbeddingBackendError as e:
-        server.logger.warning(
-            "EmbeddingService construction failed (NoEmbeddingBackendError): %s. "
-            "Falling back to legacy inline helpers for the next %.0fs.",
-            e,
-            server._EMBED_SERVICE_RETRY_WINDOW,
-        )
-        server._embed_service_construction_failed_at = _time.monotonic()
-        server._embed_service_construction_error = str(e)
-        return None
-    except Exception as e:
-        server.logger.warning(
-            "EmbeddingService construction failed (%s) — falling back to "
-            "legacy inline helpers.",
-            e,
-        )
-        server._embed_service_construction_failed_at = _time.monotonic()
-        server._embed_service_construction_error = str(e)
-        return None
+_kg_query_core.bind_into(globals(), (
+    '_code_record_changed', '_get_embedding_service', '_get_search_vector',
+    '_kg_search_vector',
+))
 
 
 async def get_ollama_embedding(text: str) -> list[float] | None:
@@ -618,80 +525,6 @@ def _primary_named_vector(scheme: str) -> str:
     """Return the primary (first) named vector name for a scheme."""
     from . import server
     return next(iter(server.VECTOR_SCHEMES[scheme]))
-
-
-async def _get_search_vector(
-    text: str, scheme: str = "kg", task: str | None = None
-) -> tuple[list[float] | None, str]:
-    """Get embedding for search, returns (vector, target_vector_name).
-
-    v0.2.18: routes through EmbeddingService which resolves BOTH the
-    embedding backend AND the named-vector slot from env in one place.
-    Pre-v0.2.18 this branched on ACTIVE_EMBEDDING here, which duplicated
-    the slot-resolution logic already living in the Wave-A
-    EmbeddingService TEXT_SLOT_MAP / CODE_SLOT_MAP.
-
-    v0.2.101: this is a SEARCH path, so it embeds through the QUERY-side
-    methods (``embed_text_query`` / ``embed_code_query``) which apply the
-    active model's query-prefix — documents still go through ``embed_text`` /
-    ``embed_code`` unprefixed. ``task`` selects the per-use instruction
-    sentence (see ``chunking.QUERY_TASKS``); ``None`` uses the scheme default.
-
-    No legacy fallback (owner ruling 2026-10-10): when the service is
-    unavailable or its backend stays down past the transient retry, this
-    raises ``vco_lib.embed_outage.EmbeddingBackendUnavailable`` carrying the
-    loud text (backend, container, watchdog state, remedy) — the pre-v0.2.102
-    ACTIVE_EMBEDDING branch embedded with whatever the env named (a code
-    query with CodeSage on a jina-indexed graph) and searched noise.
-
-    Args:
-        text: Text to embed.
-        scheme: 'kg' or 'code' — determines text vs code backend.
-        task: QUERY_TASKS key (KG search / hook injection / code-nl / code-sim).
-    """
-    from vco_lib.embed_outage import embed_query_or_raise
-
-    from . import server
-    svc = server._get_embedding_service()
-    vec = await asyncio.to_thread(
-        embed_query_or_raise, scheme, svc, text, task,
-        construction_error=getattr(server, "_embed_service_construction_error", ""),
-    )
-    assert svc is not None  # embed_query_or_raise raised for a missing service
-    return vec, (svc.code_vector_slot if scheme == "code" else svc.text_vector_slot)
-
-
-async def _kg_search_vector(
-    text: str, collection: str, task: str | None = None, *, steady=None,
-) -> tuple[list[float] | None, str]:
-    """The query vector + slot for searching ONE KG collection (v0.2.102 W6-I).
-
-    The collection is searched with the model it is RECORDED as complete in
-    (``vco_lib.kg_embed_model``). In the steady state that is the service's
-    own model and this is exactly ``steady`` — the CALLER's own
-    :func:`_get_search_vector` binding (so a seam patched on the caller's
-    module is honoured; default: ``server``'s). While a newly selected model's slot
-    fills, the query is embedded with the recorded model instead — through
-    the same loud query-embed entry, never another model."""
-    from vco_lib.kg_embed_model import recorded_query_model, sibling_text_service
-
-    from . import server
-    model = await asyncio.to_thread(recorded_query_model, collection) if collection else ""
-    if model:
-        from vco_lib.embed_outage import embed_query_or_raise
-
-        svc = server._get_embedding_service()
-        qs = sibling_text_service(svc, model) if svc is not None else None
-        vec = await asyncio.to_thread(
-            embed_query_or_raise, "kg", qs, text, task,
-            construction_error=getattr(server, "_embed_service_construction_error", ""),
-        )
-        assert qs is not None  # embed_query_or_raise raised for a missing service
-        return vec, qs.text_vector_slot
-    fn = steady or server._get_search_vector
-    if task is None:
-        return await fn(text)
-    return await fn(text, task=task)
 
 
 async def count_tokens_async(text: str) -> int:

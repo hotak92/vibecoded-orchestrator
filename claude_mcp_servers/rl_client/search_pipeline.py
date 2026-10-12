@@ -433,9 +433,7 @@ def _drive_retention_housekeeping() -> None:
     """
     project_id: Optional[str] = None
     try:
-        from claude_mcp_servers.weaviate_mcp.server import _try_resolve_project_config
-
-        cfg = _try_resolve_project_config()
+        cfg = _kg_server()._try_resolve_project_config()
         if cfg is not None:
             project_id = getattr(cfg, "project_id", None)
     except Exception:  # noqa: BLE001 — scope resolution is best-effort
@@ -446,6 +444,20 @@ def _drive_retention_housekeeping() -> None:
         maybe_run_retention(project_id=project_id)
     except Exception as exc:  # noqa: BLE001 — retention never breaks the caller
         logger.debug("_drive_retention_housekeeping: raised (%s)", exc)
+
+
+def _kg_server():
+    """The module standing for ``weaviate_mcp.server`` here (v0.2.102 W6-M).
+
+    The server module itself whenever one is loaded (the MCP, the suite —
+    identical to the former ``from claude_mcp_servers.weaviate_mcp import
+    server``); in the hook KG producer, where none is, the light KG host
+    (``kg_query_core``), which serves the config + RL state these call sites
+    read without the ~0.7 s server import. See ``weaviate_mcp.kg_host``.
+    """
+    from claude_mcp_servers.weaviate_mcp.kg_host import host
+
+    return host("claude_mcp_servers.weaviate_mcp")
 
 
 def _retrieval_emit_has_consumer() -> bool:
@@ -582,9 +594,7 @@ def _resolve_rl_enabled() -> bool:
         return False
     # Per-project toggle. Soft-fail to enabled.
     try:
-        from claude_mcp_servers.weaviate_mcp.server import _try_resolve_project_config
-
-        cfg = _try_resolve_project_config()
+        cfg = _kg_server()._try_resolve_project_config()
         if cfg is not None and not getattr(cfg, "rl_reranker_enabled_for_project", True):
             return False
     except Exception as exc:
@@ -659,7 +669,7 @@ async def _do_rerank(
     failure.
     """
     try:
-        from claude_mcp_servers.weaviate_mcp.server import _get_rl_client
+        _get_rl_client = _kg_server()._get_rl_client
     except Exception as exc:
         logger.debug("_do_rerank: cannot import _get_rl_client (%s)", exc)
         return None
@@ -762,9 +772,7 @@ def _bump_rl_counter(field: str, reason: "Optional[str]" = None) -> None:
         root = _os.environ.get("CLAUDE_PROJECT_DIR", "")
         if not root:
             try:
-                from claude_mcp_servers.weaviate_mcp import server as _srv
-
-                root = getattr(_srv, "KG_BASE_DIR", "") or ""
+                root = getattr(_kg_server(), "KG_BASE_DIR", "") or ""
             except Exception:  # noqa: BLE001
                 root = ""
         if not root:
@@ -856,7 +864,7 @@ def _populate_citation_cache(
     turn-end Stop-hook drain can recover the citation when the in-process
     monitor never fires. Soft-fail — staging failure never breaks search.
     """
-    from claude_mcp_servers.weaviate_mcp import server as srv
+    srv = _kg_server()
 
     # Build the cache-stored node list (same shape as what the monitor
     # later reads). This MAY differ from the rerank output if the RL

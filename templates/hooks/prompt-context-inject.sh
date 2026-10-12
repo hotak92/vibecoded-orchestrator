@@ -40,8 +40,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
 # v0.2.102 W6-F fix-round: per-surface kill switch (VCO_PROMPT_INJECT=off)
-# disables ONLY this prompt surface — the per-prompt python + weaviate-stack
-# spawn is the one injection surface whose latency sits on the critical path
+# disables ONLY this prompt surface — the per-prompt python spawn (router +
+# KG search) is the one injection surface whose latency sits on the critical path
 # of EVERY prompt, so it gets its own opt-out beside the global
 # VCO_INJECT_PROFILE=off (checked in _lib/inject-budget.sh below, which
 # disables every surface). Checked here BEFORE anything is spawned; the
@@ -57,7 +57,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
-# Resolve the VCO venv (the router needs the weaviate stack + vco_lib) and
+# Resolve the VCO venv (the router needs the venv's packages + vco_lib) and
 # the router script — both live ONLY in the orchestrator root, never under
 # the user's project (v0.2.100 F3 discipline). The router still runs with
 # THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's KG +
