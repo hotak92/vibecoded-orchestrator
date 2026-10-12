@@ -1567,16 +1567,121 @@ def test_slot_is_released_when_the_holder_crashes(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="flock-based slots are POSIX")
-def test_bound_expiry_runs_anyway_never_drops(tmp_path):
+def test_expiry_keeps_waiting_while_the_holder_is_alive(tmp_path):
+    """W6-U (ship-gate #4): past the wait period a driver does NOT run over a
+    live holder — the old "run anyway" started every queued driver at once."""
+    import threading
+    import time
+
     from vco_lib.atomic import machine_slot
 
     slot_dir = tmp_path / "slots"
-    proc, _ = _holder(tmp_path, slot_dir, 1, "3")
-    ran = []
-    with machine_slot(slot_dir, slots=1, wait_s=0.2, poll_s=0.05) as got:
-        ran.append(got)
-    assert ran == [None], "past the bound the work still runs (slot None)"
+    proc, line = _holder(tmp_path, slot_dir, 1, "2.5")
+    assert line == "slot=0"
+    holder = json.loads((slot_dir / "slot-0.holder.json").read_text())
+    assert holder["pid"] == proc.pid, "the holder records itself"
+    entered: list = []
+    waits: list = []
+    t0 = time.monotonic()
+
+    def _waiter():
+        with machine_slot(slot_dir, slots=1, wait_s=0.2, poll_s=0.05,
+                          on_wait=waits.append) as got:
+            entered.append((got, time.monotonic() - t0))
+
+    t = threading.Thread(target=_waiter)
+    t.start()
+    time.sleep(1.2)
+    assert entered == [], "a live holder is waited for past the period"
+    assert len(waits) >= 2, "queued, then 'still queued' once per period"
+    t.join(15)
+    assert entered and entered[0][0] == 0
+    assert entered[0][1] >= 2.0, "it ran only once the holder's 2.5 s sleep ended"
     proc.wait(10)
+    assert not (slot_dir / "slot-0.holder.json").exists(), "the holder cleans up"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock-based slots are POSIX")
+def test_dead_holder_with_its_lock_still_held_is_taken_over(tmp_path):
+    """The lock stays held (here by this test, standing in for a leaked fd)
+    but the recorded holder is provably dead → after the period the slot is
+    taken over, the record names the taker meanwhile, and is restored after."""
+    import os
+    import subprocess
+
+    from vco_lib.atomic import exclusive_file_lock, machine_slot
+
+    slot_dir = tmp_path / "slots"
+    slot_dir.mkdir()
+    gone = subprocess.Popen([sys.executable, "-c", "pass"], env=child_env())
+    gone.wait(10)  # reaped: the pid is provably dead
+    dead = {"pid": gone.pid, "start_time": 1.0, "takeover": False}
+    (slot_dir / "slot-0.holder.json").write_text(json.dumps(dead))
+    taken: list = []
+    with exclusive_file_lock(slot_dir / "slot-0.lock", timeout_s=0):
+        with machine_slot(slot_dir, slots=1, wait_s=0.1, poll_s=0.05,
+                          on_takeover=lambda i, h: taken.append((i, h))) as got:
+            during = json.loads((slot_dir / "slot-0.holder.json").read_text())
+    assert got == 0 and taken == [(0, dead)]
+    assert during["pid"] == os.getpid() and during["takeover"] is True
+    assert json.loads((slot_dir / "slot-0.holder.json").read_text()) == dead
+
+
+def test_holder_liveness_rules(monkeypatch):
+    """Unknown is alive; dead pid, reused pid (other start time) and this
+    process are provably dead."""
+    import os
+
+    from vco_lib import update_lock
+    from vco_lib.atomic import slot_holder_provably_dead as dead
+
+    assert dead(None) is False and dead({}) is False and dead({"pid": "x"}) is False
+    assert dead({"pid": os.getpid()}) is True
+    monkeypatch.setattr(update_lock, "pid_alive", lambda pid: None)
+    monkeypatch.setattr(update_lock, "process_start_time", lambda pid: None)
+    assert dead({"pid": 999999, "start_time": 5.0}) is False, "unknown counts as alive"
+    monkeypatch.setattr(update_lock, "pid_alive", lambda pid: False)
+    assert dead({"pid": 999999}) is True
+    monkeypatch.setattr(update_lock, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(update_lock, "process_start_time", lambda pid: 100.0)
+    assert dead({"pid": 999999, "start_time": 100.2}) is False, "same process"
+    assert dead({"pid": 999999, "start_time": 50.0}) is True, "pid reused"
+    assert dead({"pid": 999999}) is False, "no recorded start time → unknown"
+
+
+_SLOT_WAITER = r"""
+import sys, time
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from vco_lib.atomic import machine_slot
+with machine_slot(Path(sys.argv[2]), slots=1, wait_s=0.1, poll_s=0.02) as s:
+    t0 = time.time()
+    time.sleep(0.4)
+    print(f"{t0} {time.time()}", flush=True)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock-based slots are POSIX")
+def test_n_waiters_past_the_period_never_overlap(tmp_path):
+    """No thundering herd: N drivers all past their wait period still run one
+    at a time on a single slot."""
+    import subprocess
+
+    script = tmp_path / "waiter.py"
+    script.write_text(_SLOT_WAITER)
+    slot_dir = tmp_path / "slots"
+    procs = [subprocess.Popen([sys.executable, str(script), str(REPO_ROOT), str(slot_dir)],
+                              stdout=subprocess.PIPE, text=True, env=child_env())
+             for _ in range(4)]
+    spans = []
+    for proc in procs:
+        out, _ = proc.communicate(timeout=60)
+        assert proc.returncode == 0
+        a, b = out.split()
+        spans.append((float(a), float(b)))
+    spans.sort()
+    for (_, end), (start, _) in zip(spans, spans[1:]):
+        assert start >= end - 0.01, f"run intervals overlap: {spans}"
 
 
 def test_driver_entry_takes_a_slot_and_honours_the_env(monkeypatch, tmp_path):

@@ -121,7 +121,10 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # v0.2.102 (W6-O): import resolution moved to `vco_lib.codegraph_imports` and the
 # skipped-row metadata heal to `vco_lib.codegraph_guards` (one-line seams here)
 # — net 7025 -> 7022, re-pinned DOWNWARD.
-_ANALYZER_LINES_MAX = 7022
+# v0.2.102 (W6-U): the failing-insert rows + stamp acceptance live in
+# `vco_lib.codegraph_extractor_generation`; two one-line seams here, paid for by
+# shorter comments — net 7022 -> 7019, re-pinned DOWNWARD.
+_ANALYZER_LINES_MAX = 7019
 
 
 def _measure() -> int:

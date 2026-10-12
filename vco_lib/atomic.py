@@ -703,6 +703,72 @@ def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -
             pass
 
 
+#: Start times closer than this are the same process (psutil ``create_time``
+#: is derived from boot time + clock ticks, so it can wobble by a tick).
+_START_TIME_TOLERANCE_S = 1.0
+
+
+def _slot_holder_path(slot_dir: Path, i: int) -> Path:
+    return Path(slot_dir) / f"slot-{i}.holder.json"
+
+
+def _slot_takeover_lock_path(slot_dir: Path, i: int) -> Path:
+    return Path(slot_dir) / f"slot-{i}.takeover.lock"
+
+
+def _this_process_holder(*, takeover: bool) -> dict:
+    from vco_lib.update_lock import process_start_time  # noqa: PLC0415
+
+    pid = os.getpid()
+    return {"pid": pid, "start_time": process_start_time(pid), "takeover": takeover}
+
+
+def _read_slot_holder(path: Path) -> Optional[dict]:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def slot_holder_provably_dead(holder: Optional[dict]) -> bool:
+    """PURE-ish (reads the process table): is the recorded slot holder PROVABLY
+    gone? True only when ``update_lock.pid_alive`` says False, when the pid now
+    belongs to a different process (start time differs from the recorded one —
+    pid reuse), or when the holder is THIS process (a re-entrant take must not
+    wait on itself). Everything unknown — no record, a malformed one, an
+    undeterminable liveness or start time — counts as ALIVE."""
+    if not isinstance(holder, dict):
+        return False
+    pid = holder.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    from vco_lib.update_lock import pid_alive, process_start_time  # noqa: PLC0415
+
+    if pid == os.getpid():
+        return True  # this process (or a dead one whose pid we now carry)
+    if pid_alive(pid) is False:
+        return True
+    recorded = holder.get("start_time")
+    if isinstance(recorded, (int, float)) and not isinstance(recorded, bool):
+        now = process_start_time(pid)
+        if now is not None and abs(float(recorded) - now) > _START_TIME_TOLERANCE_S:
+            return True
+    return False
+
+
+def _write_slot_holder(path: Path, payload: Optional[dict]) -> None:
+    """Best-effort: a holder record that cannot be written only means waiters
+    read the slot's holder as unknown (= alive) — conservative, never unsafe."""
+    try:
+        if payload is None:
+            Path(path).unlink(missing_ok=True)
+        else:
+            atomic_write_json(path, payload)
+    except OSError:
+        pass
+
+
 @contextlib.contextmanager
 def machine_slot(
     slot_dir: Path,
@@ -711,6 +777,7 @@ def machine_slot(
     wait_s: float,
     poll_s: float = 5.0,
     on_wait: Optional[Any] = None,
+    on_takeover: Optional[Any] = None,
 ) -> Iterator[Optional[int]]:
     """Hold ONE of ``slots`` machine-wide slots under ``slot_dir`` for the block
     — a counting semaphore built from :func:`exclusive_file_lock` (v0.2.102
@@ -718,27 +785,58 @@ def machine_slot(
 
     Queue, never drop:
     * each poll tries every slot non-blocking, and the first free one is held
-      for the block;
-    * when all are busy, ``on_wait(waited_s)`` is called once (the caller logs
-      a line) and the take retries every ``poll_s``;
-    * after ``wait_s`` the block runs ANYWAY, yielding ``None``. A wedged
-      holder must never stop work forever; the bound only caps how long
-      fairness is honoured.
+      for the block; the holder records itself in ``slot-<i>.holder.json``
+      (pid + process start time) and removes the record on exit;
+    * when all are busy, ``on_wait(waited_s)`` is called (the caller logs a
+      line) — once when the wait starts, then once per further ``wait_s``
+      period ("still queued") — and the take retries every ``poll_s``;
+    * after ``wait_s`` (v0.2.102 W6-U) the driver keeps waiting while every
+      holder is alive — it does NOT run over a live holder. It takes over a
+      busy slot only when that slot's recorded holder is PROVABLY dead
+      (:func:`slot_holder_provably_dead`; unknown counts as alive). The
+      takeover happens under a non-blocking ``slot-<i>.takeover.lock`` held for
+      the block, so of N expired waiters exactly one takes a given slot, and
+      the taker rewrites the holder record with itself, so other waiters see a
+      live holder; on exit it restores the dead holder's record, so a slot
+      whose flock stays held (a lock fd leaked into a surviving child) can be
+      taken over again. ``on_takeover(slot, dead_holder)`` lets the caller log.
+
+    Known limit (narrow overlap window): the holder record is written just
+    AFTER the flock is taken. A crashed holder leaves its record behind (its
+    flock is released with the process); if a new holder takes that freed
+    flock and an expired waiter reads the stale dead record in the instant
+    before the new holder overwrites it, the waiter takes over a slot that is
+    in fact live — two drivers run on one slot until one finishes. The same
+    holds when a dead holder's lock fd survives in a child process that is
+    still working. Both need an expired wait AND a crash; the cost is one
+    over-cap run, never a lost or corrupted one.
 
     A slot is released when the block exits. Because ``flock`` belongs to the
     open file description, it is also released when the holder process exits
-    or crashes; nothing is left to clean up.
+    or crashes.
 
     Best-effort exactly like :func:`exclusive_file_lock`: where ``flock`` does
     not exist (Windows, or a filesystem without it) the first slot "succeeds"
-    without exclusion, so the block runs unbounded, as it did before.
+    without exclusion, so the block runs unbounded, as it did before. The
+    yielded value is always a slot index (``Optional`` only for callers typed
+    against the pre-W6-U contract, which yielded ``None`` on expiry).
     """
     import time  # noqa: PLC0415
 
     n = max(1, int(slots))
-    deadline = time.monotonic() + max(0.0, float(wait_s))
+    period = max(0.0, float(wait_s))
     started = time.monotonic()
-    announced = False
+    deadline = started + period
+    next_notice: Optional[float] = None
+
+    def _notify(cb: Optional[Any], *args: Any) -> None:
+        if cb is None:
+            return
+        try:
+            cb(*args)
+        except Exception:  # noqa: BLE001 — a log hook never blocks the queue
+            pass
+
     while True:
         for i in range(n):
             cm = exclusive_file_lock(Path(slot_dir) / f"slot-{i}.lock", timeout_s=0)
@@ -746,20 +844,44 @@ def machine_slot(
                 cm.__enter__()
             except LockTimeout:
                 continue
+            holder_path = _slot_holder_path(slot_dir, i)
+            mine = _this_process_holder(takeover=False)
+            _write_slot_holder(holder_path, mine)
             try:
                 yield i
             finally:
+                if _read_slot_holder(holder_path) == json.loads(json.dumps(mine)):
+                    _write_slot_holder(holder_path, None)
                 cm.__exit__(None, None, None)
             return
-        if not announced and on_wait is not None:
-            announced = True
-            try:
-                on_wait(time.monotonic() - started)
-            except Exception:  # noqa: BLE001 — a log hook never blocks the queue
-                pass
-        if time.monotonic() >= deadline:
-            yield None
-            return
+        now = time.monotonic()
+        if now >= deadline:
+            for i in range(n):
+                holder_path = _slot_holder_path(slot_dir, i)
+                if not slot_holder_provably_dead(_read_slot_holder(holder_path)):
+                    continue
+                tcm = exclusive_file_lock(_slot_takeover_lock_path(slot_dir, i), timeout_s=0)
+                try:
+                    tcm.__enter__()
+                except LockTimeout:
+                    continue  # another waiter is taking this slot over
+                try:
+                    dead = _read_slot_holder(holder_path)  # re-read under the lock
+                    if not slot_holder_provably_dead(dead):
+                        continue
+                    _write_slot_holder(holder_path, _this_process_holder(takeover=True))
+                    _notify(on_takeover, i, dead)
+                    try:
+                        yield i
+                    finally:
+                        _write_slot_holder(holder_path, dead)
+                    return
+                finally:
+                    tcm.__exit__(None, None, None)
+        if next_notice is None or now >= next_notice:
+            _notify(on_wait, now - started)
+            # then "still queued" once per wait period (floored: wait_s=0 never spams)
+            next_notice = (next_notice or started) + max(period, 10 * float(poll_s))
         time.sleep(max(0.05, float(poll_s)))
 
 
