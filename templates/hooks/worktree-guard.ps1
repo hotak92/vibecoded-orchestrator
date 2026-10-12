@@ -172,14 +172,103 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
     } catch { $Toplevel = "" }
 }
 
-# ── Not a git repo ⇒ graceful no-op ───────────────────────────────────────
-# Echo nothing + exit 0 so the harness does its own default — do NOT abort a
-# legitimate non-git spawn with a non-zero exit.
+# -- Isolation notices (v0.2.102 W6-Q) - must match worktree-guard.sh --------
+# The harness discards a WorktreeCreate systemMessage, so a non-default
+# create leaves a one-shot notice keyed by the identifier; the SubagentStart
+# hook subagent-start-isolation-check.ps1 hands it to the agent.
+$NoticeDir = Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "worktree-guard"
+# Per-launch records (v0.2.102 W6-Q follow-up): one home is
+# _lib/worktree-records.ps1 (must match _lib/worktree-records.sh).
+$WtrecHelper = Join-Path $PSScriptRoot "_lib/worktree-records.ps1"
+if (Test-Path -LiteralPath $WtrecHelper) {
+    . $WtrecHelper
+    Remove-WtrecStale $ProjectRoot
+}
+function Save-LaunchRecord([string]$mode, [string]$path, [string]$base, [string]$toplevel) {
+    if (Get-Command Write-WtrecRecord -ErrorAction SilentlyContinue) {
+        Write-WtrecRecord $ProjectRoot $WtName $mode $path $base $toplevel
+    }
+}
+function Write-Notice([string]$text) {
+    if (-not $WtName) { return }
+    if ($WtName -notmatch '^[A-Za-z0-9_-][A-Za-z0-9._-]*$') { return }
+    try {
+        New-Item -ItemType Directory -Force -Path $NoticeDir -ErrorAction Stop | Out-Null
+        Set-Content -LiteralPath (Join-Path $NoticeDir "notice-$WtName.txt") -Value $text -Encoding UTF8 -ErrorAction Stop
+    } catch { }
+}
+
+# -- Not a git repo => run in place, isolation OFF, said out loud ------------
+# Echoing nothing fails the launch ("If the hook fails or produces no path,
+# worktree creation fails with an error" - hooks reference, WorktreeCreate
+# output). Return the working directory itself; the harness accepts a
+# directory with no git metadata that no repository contains. No
+# identifier => plain no-op. Same decision as worktree-guard.sh.
 if (-not $Toplevel) {
-    Log-Event "noop" "not_a_repo" $ProposedPath ""
+    if (-not $WtName) {
+        Log-Event "noop" "not_a_repo" $ProposedPath ""
+        exit 0
+    }
+    $RunDir = $GitScopeDir
+    try { $RunDir = (Resolve-Path -LiteralPath $GitScopeDir -ErrorAction Stop).ProviderPath } catch { }
+    Write-Notice "VCO worktree-guard: worktree isolation is OFF for this subagent. $RunDir is not inside a git repository, so no isolated worktree can be created; you are working DIRECTLY in the project folder and every edit lands there immediately. Say this in your final report. Isolation turns on by itself once the folder is a git repository (git init)."
+    Log-Event "in_place" "not_a_repo" $ProposedPath $RunDir
+    Save-LaunchRecord "in_place" $RunDir "" ""
+    [Console]::Error.WriteLine("worktree-guard: $RunDir is not a git repository - the subagent runs in place, without worktree isolation")
+    Emit-WtPath $RunDir
     exit 0
 }
 $ToplevelAbs = Norm-Path $Toplevel
+
+# -- No commits yet => base the worktree on a snapshot commit ----------------
+# Unborn HEAD makes `git worktree add --detach <path> HEAD` fail and the
+# harness refuses the main checkout itself, so build a commit of the working
+# tree through a throwaway index (user index/refs/HEAD untouched) and detach
+# the worktree there. Same decision as worktree-guard.sh.
+$BaseRef = "HEAD"
+$BaseReason = "worktree_add_detached_head"
+& git -C $ToplevelAbs rev-parse --verify -q 'HEAD^{commit}' 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    $SnapSha = ""
+    $SnapErr = ""
+    $SnapTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("vco-wtg-" + [guid]::NewGuid().ToString("N"))
+    $PrevIndex = $env:GIT_INDEX_FILE
+    $PrevNames = @($env:GIT_AUTHOR_NAME, $env:GIT_AUTHOR_EMAIL, $env:GIT_COMMITTER_NAME, $env:GIT_COMMITTER_EMAIL)
+    try {
+        New-Item -ItemType Directory -Force -Path $SnapTmp -ErrorAction Stop | Out-Null
+        $env:GIT_INDEX_FILE = Join-Path $SnapTmp "index"
+        $SnapErr = (& git -C $ToplevelAbs add -A -- . ':(exclude).claude/worktrees' 2>&1 | Out-String)
+        if ($LASTEXITCODE -eq 0) {
+            $SnapTree = (& git -C $ToplevelAbs write-tree 2>$null | Select-Object -First 1)
+            if ($LASTEXITCODE -eq 0 -and $SnapTree) {
+                $env:GIT_AUTHOR_NAME = "VCO worktree-guard"
+                $env:GIT_AUTHOR_EMAIL = "worktree-guard@vco.invalid"
+                $env:GIT_COMMITTER_NAME = "VCO worktree-guard"
+                $env:GIT_COMMITTER_EMAIL = "worktree-guard@vco.invalid"
+                $out = (& git -C $ToplevelAbs -c commit.gpgsign=false commit-tree $SnapTree -m "VCO worktree-guard: snapshot of the working tree (repository has no commits yet)" 2>$null | Select-Object -First 1)
+                if ($LASTEXITCODE -eq 0 -and $out) { $SnapSha = ([string]$out).Trim() }
+            }
+        }
+    } catch {
+        $SnapErr = $_.Exception.Message
+    } finally {
+        $env:GIT_INDEX_FILE = $PrevIndex
+        $env:GIT_AUTHOR_NAME = $PrevNames[0]
+        $env:GIT_AUTHOR_EMAIL = $PrevNames[1]
+        $env:GIT_COMMITTER_NAME = $PrevNames[2]
+        $env:GIT_COMMITTER_EMAIL = $PrevNames[3]
+        try { Remove-Item -LiteralPath $SnapTmp -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    if (-not $SnapSha) {
+        $SnapDetail = if ($SnapErr -and $SnapErr.Trim()) { $SnapErr.Trim() } else { "git write-tree/commit-tree failed" }
+        $reason = "repository at $ToplevelAbs has no commits and a snapshot commit of its working tree could not be built: $SnapDetail"
+        Log-Event "create_failed" $reason $ProposedPath ""
+        [Console]::Error.WriteLine("worktree-guard: ABORT - $reason")
+        exit 1
+    }
+    $BaseRef = $SnapSha
+    $BaseReason = "worktree_add_snapshot_no_head"
+}
 
 # Create-Worktree: run `git worktree add --detach <target> HEAD`. Idempotent
 # (already-registered path → success). On genuine failure, emit reason to
@@ -207,12 +296,19 @@ function Create-Worktree([string]$target) {
     # agents; clean separate checkout of HEAD).
     $addErr = ""
     try {
-        $addErr = (& git -C $ToplevelAbs worktree add --detach $target HEAD 2>&1 | Out-String)
+        $addErr = (& git -C $ToplevelAbs worktree add --detach $target $BaseRef 2>&1 | Out-String)
     } catch {
         $addErr = $_.Exception.Message
     }
     if ($LASTEXITCODE -eq 0) {
-        Log-Event "created" "worktree_add_detached_head" $ProposedPath $target
+        if ($BaseRef -ne "HEAD") {
+            Write-Notice "VCO worktree-guard: this repository has no commits yet, so your isolated worktree ($target) starts from a SNAPSHOT of the project's working tree (commit $BaseRef, on no branch) instead of HEAD. The main checkout is untouched by your edits. Say this in your final report and give the user the command that brings your changes back: git -C `"$target`" add -A && git -C `"$target`" diff --binary --cached $BaseRef | git -C `"$ToplevelAbs`" apply"
+        }
+        Log-Event "created" $BaseReason $ProposedPath $target
+        $recMode = if ($BaseRef -eq "HEAD") { "head" } else { "snapshot" }
+        $recBase = ""
+        try { $recBase = ([string](& git -C $target rev-parse HEAD 2>$null | Select-Object -First 1)).Trim() } catch { }
+        Save-LaunchRecord $recMode $target $recBase $ToplevelAbs
         Emit-WtPath $target
         exit 0
     }

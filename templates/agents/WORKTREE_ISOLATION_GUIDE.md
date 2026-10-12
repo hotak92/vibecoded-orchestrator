@@ -2,11 +2,15 @@
 
 ## What it does
 
-When an agent has `isolation: worktree` in its frontmatter, Claude Code automatically:
-1. Creates a temporary git worktree (a separate checkout of the repo, on a new branch)
-2. Runs the agent in that isolated copy
-3. If the agent makes **no changes** → worktree is auto-cleaned (no trace)
-4. If the agent **makes changes** → returns the worktree path + branch name for review/merge
+When an agent has `isolation: worktree` in its frontmatter, Claude Code and VCO's isolation hooks
+(see "How VCO creates the worktree" below):
+1. Create a temporary git worktree under `.claude/worktrees/` (a separate checkout of the repo, on a
+   detached HEAD)
+2. Run the agent in that isolated copy
+3. If the agent makes **no changes**, the worktree is removed when the agent finishes. VCO's
+   `subagent-stop-reconcile` hook does this, because the harness does not clean up worktrees that a
+   `WorktreeCreate` hook created.
+4. If the agent **makes changes**, the worktree is kept for review/merge, and its path is logged
 
 ## Why it matters
 
@@ -61,21 +65,89 @@ Do NOT add to agents that:
 - Only output text/analysis to the conversation
 - Only write to isolated state directories (e.g., `state/`, `knowledge/`)
 
-## Merging worktree changes
+## How VCO creates the worktree (and the two special cases)
 
-After an agent with worktree isolation completes, if it made changes:
+VCO registers its own `WorktreeCreate` hook, `.claude/hooks/worktree-guard.sh` (`.ps1` on Windows). The hook
+replaces Claude Code's built-in git logic for every isolated launch, so it handles three cases:
+
+| Project folder | What the agent gets | Isolation |
+|---|---|---|
+| Git repository with at least one commit | a detached worktree of `HEAD` under `.claude/worktrees/` | on |
+| Git repository with **no commits yet** (just `git init`-ed) | a detached worktree of a **snapshot commit** of the current working tree (built through a throwaway index; your index, refs and HEAD are not touched, `.gitignore` is honoured, the commit is on no branch) | on |
+| Folder that is **not a git repository** | the folder itself; the agent edits your files directly | **off** |
+
+In the last two cases the agent receives a notice when it starts (through the `SubagentStart` hook
+`subagent-start-isolation-check`) explaining what happened, and it is asked to repeat that notice in its
+report. For a snapshot worktree the notice includes the command that copies the agent's changes back into
+the main checkout:
+
 ```bash
-# View what the agent changed
-git diff main..<worktree-branch>
-
-# Merge if satisfied
-git merge <worktree-branch>
-
-# Or discard
-git branch -D <worktree-branch>
+git -C <worktree> add -A && git -C <worktree> diff --binary --cached <snapshot-sha> | git -C <project> apply
 ```
 
-Claude Code may also prompt you to review/merge automatically.
+### Cleanup when the agent finishes
+
+For a worktree that `worktree-guard` created, Claude Code does not remove it and does not run a
+`WorktreeRemove` hook when a subagent finishes. VCO's `SubagentStop` hook, `subagent-stop-reconcile`,
+removes it instead (with `git worktree remove`, never `--force`), but only when **all** of these hold:
+
+- `git status` in the worktree shows nothing: no modified files, no untracked files, and no ignored files
+  either (a fresh checkout has none, so any is the agent's output, such as a report under a git-excluded
+  `.claude/` folder);
+- the worktree's HEAD is still the commit it was created from (so no commits were added);
+- git itself agrees to remove it (git refuses a dirty or locked worktree).
+
+Anything else is **kept**. The kept path and the reason (`has_changes`, `head_moved_or_commits`, …) are
+written to `.claude/logs/worktree-guard.jsonl` and printed on the hook's stderr. The agent's report also
+names the worktree it worked in. Remove a kept worktree yourself after merging or discarding it:
+`git worktree remove <path>`.
+
+- The worktrees are created detached, so there is no branch to delete.
+- A **snapshot** worktree (repository with no commits yet) is removed the same way. Its snapshot commit is
+  on no branch or tag once the worktree is gone, and git's normal garbage collection deletes it later.
+- An agent that ran **in place** (folder not a git repository) is never touched: there is no worktree,
+  only your folder.
+- A worktree that `worktree-guard` did not create is never touched either.
+
+The per-launch records behind this live in `.claude/state/worktree-guard/` and are pruned after 30 days.
+
+### When isolation was skipped
+
+If an agent's definition declares `isolation: worktree` but no worktree was created for that launch, the
+agent is warned at start (`ISOLATION SKIPPED`) to stop and report rather than edit the shared checkout.
+This can happen when the agent was started as an agent-teams teammate, which runs in the main session's
+directory. The check reads the definition from `.claude/agents/` or `~/.claude/agents/` by the agent's
+`name`. It stays silent when the definition cannot be found (plugin agents, `--agents` JSON) and when
+`worktree-guard` is not registered.
+
+Isolation switches back to the normal case automatically: once the folder is a git repository you get
+snapshot worktrees, and after the first commit you get ordinary worktrees of `HEAD`. Each decision is
+logged in `.claude/logs/worktree-guard.jsonl` (`in_place`, `worktree_add_snapshot_no_head`,
+`worktree_add_detached_head`).
+
+Without such a hook, Claude Code cannot launch an `isolation: worktree` agent in either special case. A
+repository with no commits fails with `Failed to resolve base branch "HEAD"`, and a non-git folder fails
+with `not in a git repository and no WorktreeCreate hooks are configured`. If you disable `worktree-guard`
+from the launcher, those projects lose their isolated agents until the repository has a commit.
+
+## Merging worktree changes
+
+After an agent with worktree isolation completes, if it made changes, its worktree is kept (path in the
+agent's report and in `.claude/logs/worktree-guard.jsonl`). `worktree-guard` creates it on a detached
+HEAD, so give the agent's commits a branch before merging:
+```bash
+# View what the agent changed (committed and uncommitted)
+git -C <worktree> status
+git -C <worktree> diff HEAD
+
+# Keep it: commit in the worktree if needed, name the result, merge
+git -C <worktree> switch -c agent-work      # or: git -C <worktree> commit ... first
+git merge agent-work
+
+# Clean up (after merging, or to discard)
+git worktree remove <worktree>              # add --force to discard uncommitted work
+git branch -D agent-work                    # if you created it
+```
 
 ## Frontmatter syntax
 

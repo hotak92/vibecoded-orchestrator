@@ -25,7 +25,10 @@
 # Keep them in lockstep.
 #
 # Always exits 0 (never blocks subagent start). Silent when isolation not
-# requested or no cwd is exposed.
+# requested or no cwd is exposed — except for a worktree-guard notice
+# (v0.2.102 W6-Q): when worktree-guard ran this agent in place (folder not a
+# git repo) or on a snapshot base (repo with no commits), its one-shot notice
+# is delivered here so the agent can tell the user why.
 
 # Scrub sensitive env vars before any subprocess spawning.
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
@@ -106,14 +109,132 @@ cwd = (
     or ""
 )
 agent_id = d.get("agent_id") or ""
+agent_type = d.get("agent_type") or ""
 sys.stdout.write(str(iso) + "\n")
-sys.stdout.write(str(cwd) + "\n")
-sys.stdout.write(str(agent_id))
-' 2>/dev/null || printf '0\n\n')
+sys.stdout.write(str(cwd).replace("\n", " ") + "\n")
+sys.stdout.write(str(agent_id).replace("\n", " ") + "\n")
+sys.stdout.write(str(agent_type).replace("\n", " "))
+' 2>/dev/null || printf '0\n\n\n')
 
 ISO_FLAG="$(printf '%s' "$PARSED" | sed -n '1p')"
 CWD_FIELD="$(printf '%s' "$PARSED" | sed -n '2p')"
 AGENT_ID="$(printf '%s' "$PARSED" | sed -n '3p')"
+AGENT_TYPE="$(printf '%s' "$PARSED" | sed -n '4p')"
+
+# emit_ctx MSG — the SubagentStart additionalContext envelope.
+emit_ctx() {
+    if command -v emit_additional_context >/dev/null 2>&1; then
+        emit_additional_context "$1" "SubagentStart"
+    else
+        "$PY" -c "
+import json, sys
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'SubagentStart',
+        'additionalContext': sys.stdin.read(),
+    }
+}))
+" <<< "$1" 2>/dev/null || true
+    fi
+}
+
+# ── worktree-guard notice (v0.2.102 W6-Q) ─────────────────────────────────
+# worktree-guard.sh leaves .claude/state/worktree-guard/notice-<name>.txt
+# when it could not give this agent an ordinary worktree of HEAD (folder not
+# a git repo → runs in place; repo with no commits → snapshot base). The
+# WorktreeCreate `name` is `agent-<agent_id>`; accept the bare id too. The
+# notice is delivered once (the harness keeps an injected copy across
+# re-runs) and then removed. It does not depend on the isolation flag,
+# which the live SubagentStart payload does not carry.
+case "$AGENT_ID" in
+    ''|*[!A-Za-z0-9._-]*|.*) ;;
+    *)
+        for NOTICE in "$PROJECT_ROOT/.claude/state/worktree-guard/notice-agent-$AGENT_ID.txt" \
+                      "$PROJECT_ROOT/.claude/state/worktree-guard/notice-$AGENT_ID.txt"; do
+            if [ -f "$NOTICE" ]; then
+                NOTICE_MSG="$(cat "$NOTICE" 2>/dev/null || true)"
+                rm -f "$NOTICE" 2>/dev/null || true
+                case "$NOTICE_MSG" in
+                    *[![:space:]]*) emit_ctx "$NOTICE_MSG"; exit 0 ;;
+                esac
+            fi
+        done
+        ;;
+esac
+
+# ── Skipped-isolation detection (v0.2.102 W6-Q follow-up) ─────────────────
+# The live SubagentStart payload carries no isolation flag, so the payload
+# branch further down can never fire on its own. What IS knowable: the
+# agent's definition (by `agent_type`, which is the frontmatter `name`) and
+# whether worktree-guard handled this launch — WorktreeCreate fires before
+# SubagentStart (verified live on Claude Code 2.1.285), and the guard writes
+# a record per launch (_lib/worktree-records.sh). A definition that declares
+# `isolation: worktree` with NO record for this agent id means the harness
+# started it without creating a worktree — e.g. an agent-teams teammate,
+# which the docs say "runs in the main session's working directory" despite
+# frontmatter isolation. Warned only when it is decidable:
+#   * the definition is found in <project>/.claude/agents or ~/.claude/agents
+#     (plugin-scoped `a:b` types and --agents JSON definitions: unknown → no-op);
+#   * worktree-guard is registered in this project's settings (when it is
+#     parked, the harness makes the worktree itself and writes no record).
+# A record that outlived its reaped worktree still counts (a resumed agent).
+agent_def_isolation() {
+    AGENT_TYPE_FOR_PY="$1" PROJECT_FOR_PY="$PROJECT_ROOT" "$PY" -c '
+import os, re, sys
+from pathlib import Path
+want = os.environ["AGENT_TYPE_FOR_PY"]
+roots = [Path(os.environ["PROJECT_FOR_PY"]) / ".claude" / "agents",
+         Path.home() / ".claude" / "agents"]
+def front(p):
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    out = {}
+    for line in text[3:end].splitlines():
+        m = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$", line)
+        if m:
+            out[m.group(1)] = m.group(2).strip("\"'\''")
+    return out
+for root in roots:
+    if not root.is_dir():
+        continue
+    for p in sorted(root.rglob("*.md")):
+        fm = front(p)
+        if fm is None:
+            continue
+        if fm.get("name", p.stem) == want:
+            print(fm.get("isolation", ""))
+            sys.exit(0)
+' 2>/dev/null || true
+}
+guard_registered() {
+    local f
+    for f in "$PROJECT_ROOT/.claude/settings.json" "$PROJECT_ROOT/.claude/settings.local.json"; do
+        [ -f "$f" ] && grep -q 'worktree-guard\.' "$f" 2>/dev/null && return 0
+    done
+    return 1
+}
+case "$AGENT_TYPE" in
+    ''|*:*) ;;
+    *)
+        if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
+            # shellcheck source=_lib/worktree-records.sh disable=SC1091
+            . "$SCRIPT_DIR/_lib/worktree-records.sh"
+            if ! wtrec_find "$PROJECT_ROOT" "$AGENT_ID" >/dev/null \
+                && guard_registered \
+                && [ "$(agent_def_isolation "$AGENT_TYPE")" = "worktree" ]; then
+                emit_ctx "ISOLATION SKIPPED - the definition of \`$AGENT_TYPE\` declares \`isolation: worktree\`, but no isolated worktree was created for this launch: you are running in the parent's working directory and every edit lands in the shared checkout (this happens, for example, when the agent is started as an agent-teams teammate). BEFORE any edit or git write: stop and report this to the caller, or work only on what the brief explicitly allows in the shared tree. Do NOT commit from the parent checkout."
+                exit 0
+            fi
+        fi
+        ;;
+esac
 
 # No-op: isolation not requested, or payload doesn't expose a cwd. Don't guess.
 [ "${ISO_FLAG:-0}" = "1" ] || exit 0
@@ -150,18 +271,6 @@ case "$MSG" in
     *) exit 0 ;;
 esac
 
-if command -v emit_additional_context >/dev/null 2>&1; then
-    emit_additional_context "$MSG" "SubagentStart"
-else
-    "$PY" -c "
-import json, sys
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'SubagentStart',
-        'additionalContext': sys.stdin.read(),
-    }
-}))
-" <<< "$MSG" 2>/dev/null || true
-fi
+emit_ctx "$MSG"
 
 exit 0

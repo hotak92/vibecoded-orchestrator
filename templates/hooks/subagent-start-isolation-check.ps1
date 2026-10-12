@@ -44,6 +44,7 @@ if (-not $HookStdin) { exit 0 }
 $IsoFlag = $false
 $CwdField = ""
 $AgentId = ""
+$AgentType = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
@@ -69,9 +70,97 @@ try {
             if ($payload.PSObject.Properties[$f] -and $payload.$f) { $CwdField = [string]$payload.$f; break }
         }
         if ($payload.PSObject.Properties['agent_id'] -and $payload.agent_id) { $AgentId = [string]$payload.agent_id }
+        if ($payload.PSObject.Properties['agent_type'] -and $payload.agent_type) { $AgentType = [string]$payload.agent_type }
     }
 } catch {
     exit 0
+}
+
+function Emit-Ctx([string]$text) {
+    if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+        Emit-AdditionalContext $text 'SubagentStart'
+    } else {
+        $envelope = [ordered]@{
+            hookSpecificOutput = [ordered]@{
+                hookEventName     = 'SubagentStart'
+                additionalContext = $text
+            }
+        }
+        Write-Output ($envelope | ConvertTo-Json -Compress -Depth 8)
+    }
+}
+
+# -- worktree-guard notice (v0.2.102 W6-Q) - must match the .sh --------------
+# worktree-guard.ps1 leaves .claude/state/worktree-guard/notice-<name>.txt
+# when the agent runs in place (not a git repo) or on a snapshot base (no
+# commits yet). WorktreeCreate `name` is `agent-<agent_id>`; the bare id is
+# accepted too. Delivered once, then removed; independent of the isolation
+# flag (the live SubagentStart payload does not carry one).
+if ($AgentId -and ($AgentId -match '^[A-Za-z0-9_-][A-Za-z0-9._-]*$')) {
+    $NoticeDir = Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "worktree-guard"
+    foreach ($nm in @("notice-agent-$AgentId.txt", "notice-$AgentId.txt")) {
+        $np = Join-Path $NoticeDir $nm
+        if (Test-Path -LiteralPath $np -PathType Leaf) {
+            $nt = ""
+            try { $nt = (Get-Content -LiteralPath $np -Raw -ErrorAction Stop) } catch { }
+            try { Remove-Item -LiteralPath $np -Force -ErrorAction SilentlyContinue } catch { }
+            if ($nt -and ($nt -match '\S')) {
+                Emit-Ctx $nt.TrimEnd()
+                exit 0
+            }
+        }
+    }
+}
+
+# -- Skipped-isolation detection (v0.2.102 W6-Q follow-up) - must match .sh --
+# A definition (found by agent_type = frontmatter `name`, in the project's or
+# the user's .claude/agents) that declares `isolation: worktree`, with NO
+# worktree-guard record for this agent id while the guard is registered,
+# means the harness started the agent without a worktree (e.g. an
+# agent-teams teammate). Unknown definition / plugin-scoped type => no-op.
+function Get-AgentDefIsolation([string]$type) {
+    $roots = @((Join-Path (Join-Path $ProjectRoot ".claude") "agents"),
+               (Join-Path (Join-Path $HOME ".claude") "agents"))
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        $files = Get-ChildItem -LiteralPath $root -Recurse -File -Filter "*.md" -ErrorAction SilentlyContinue | Sort-Object FullName
+        foreach ($f in $files) {
+            $text = ""
+            try { $text = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop } catch { continue }
+            $fm = @{}
+            if ($text -and $text.StartsWith("---")) {
+                $end = $text.IndexOf("`n---", 3)
+                if ($end -ge 0) {
+                    foreach ($line in ($text.Substring(3, $end - 3) -split "`r?`n")) {
+                        if ($line -match '^([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$') {
+                            $fm[$Matches[1]] = $Matches[2].Trim('"', "'")
+                        }
+                    }
+                }
+            }
+            $nm = if ($fm.ContainsKey("name")) { $fm["name"] } else { $f.BaseName }
+            if ($nm -eq $type) {
+                if ($fm.ContainsKey("isolation")) { return $fm["isolation"] }
+                return ""
+            }
+        }
+    }
+    return ""
+}
+function Test-GuardRegistered {
+    foreach ($n in @("settings.json", "settings.local.json")) {
+        $p = Join-Path (Join-Path $ProjectRoot ".claude") $n
+        if ((Test-Path -LiteralPath $p -PathType Leaf) -and (Select-String -LiteralPath $p -Pattern 'worktree-guard\.' -Quiet -ErrorAction SilentlyContinue)) { return $true }
+    }
+    return $false
+}
+$WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
+if ($AgentType -and -not $AgentType.Contains(":") -and $AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
+    . $WtrecHelper
+    if (-not (Find-WtrecRecord $ProjectRoot $AgentId) -and (Test-GuardRegistered) -and ((Get-AgentDefIsolation $AgentType) -eq "worktree")) {
+        Emit-Ctx "ISOLATION SKIPPED - the definition of ``$AgentType`` declares ``isolation: worktree``, but no isolated worktree was created for this launch: you are running in the parent's working directory and every edit lands in the shared checkout (this happens, for example, when the agent is started as an agent-teams teammate). BEFORE any edit or git write: stop and report this to the caller, or work only on what the brief explicitly allows in the shared tree. Do NOT commit from the parent checkout."
+        exit 0
+    }
 }
 
 # No-op: isolation not requested, or no cwd exposed. Don't guess.
@@ -98,17 +187,6 @@ $Msg = "WARNING: ISOLATION VIOLATION SUSPECTED - this subagent requested ``isola
 
 if (-not ($Msg -match '\S')) { exit 0 }
 
-if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
-    Emit-AdditionalContext $Msg 'SubagentStart'
-} else {
-    $envelope = [ordered]@{
-        hookSpecificOutput = [ordered]@{
-            hookEventName     = 'SubagentStart'
-            additionalContext = $Msg
-        }
-    }
-    $json = $envelope | ConvertTo-Json -Compress -Depth 8
-    Write-Output $json
-}
+Emit-Ctx $Msg
 
 exit 0

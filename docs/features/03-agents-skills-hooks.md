@@ -38,7 +38,9 @@ v0.2.101 moved the topical specialists out of the default catalogue into **eleve
 
 ## Worktree Isolation
 
-Agents with `isolation: worktree` run in a temporary git worktree (isolated branch). No changes → worktree is auto-cleaned. Changes → worktree path + branch name returned for review/merge. Prevents partial implementations from corrupting the working directory. See `templates/agents/WORKTREE_ISOLATION_GUIDE.md`.
+Agents with `isolation: worktree` run in a temporary git worktree (a detached checkout under `.claude/worktrees/`). With no changes, the worktree is removed when the agent finishes; VCO's `subagent-stop-reconcile` SubagentStop hook does this, since Claude Code does not clean up worktrees created by a WorktreeCreate hook. Removal needs a clean status (untracked and ignored files count as changes), HEAD still at its base commit, and `git worktree remove` without `--force` agreeing. With changes, the worktree is kept for review/merge, and its path and reason are logged to `.claude/logs/worktree-guard.jsonl`. If an agent whose definition declares isolation starts without a worktree (for example as an agent-teams teammate), `subagent-start-isolation-check` warns it to stop and report. Prevents partial implementations from corrupting the working directory. See `templates/agents/WORKTREE_ISOLATION_GUIDE.md`.
+
+VCO's `worktree-guard` WorktreeCreate hook creates the worktree, so it also covers the two cases where git alone cannot. In a repository with **no commits yet**, the worktree starts from a snapshot commit of the working tree, isolation stays on, and your index, refs and HEAD are untouched. In a folder that is **not a git repository**, the agent runs in place with isolation off. In both cases the agent is told why when it starts (via `subagent-start-isolation-check`) and repeats it in its report.
 
 ---
 
