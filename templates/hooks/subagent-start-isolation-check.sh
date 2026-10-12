@@ -25,7 +25,10 @@
 # Keep them in lockstep.
 #
 # Always exits 0 (never blocks subagent start). Silent when isolation not
-# requested or no cwd is exposed.
+# requested or no cwd is exposed — except for a worktree-guard notice
+# (v0.2.102 W6-Q): when worktree-guard ran this agent in place (folder not a
+# git repo) or on a snapshot base (repo with no commits), its one-shot notice
+# is delivered here so the agent can tell the user why.
 
 # Scrub sensitive env vars before any subprocess spawning.
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
@@ -115,6 +118,47 @@ ISO_FLAG="$(printf '%s' "$PARSED" | sed -n '1p')"
 CWD_FIELD="$(printf '%s' "$PARSED" | sed -n '2p')"
 AGENT_ID="$(printf '%s' "$PARSED" | sed -n '3p')"
 
+# emit_ctx MSG — the SubagentStart additionalContext envelope.
+emit_ctx() {
+    if command -v emit_additional_context >/dev/null 2>&1; then
+        emit_additional_context "$1" "SubagentStart"
+    else
+        "$PY" -c "
+import json, sys
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'SubagentStart',
+        'additionalContext': sys.stdin.read(),
+    }
+}))
+" <<< "$1" 2>/dev/null || true
+    fi
+}
+
+# ── worktree-guard notice (v0.2.102 W6-Q) ─────────────────────────────────
+# worktree-guard.sh leaves .claude/state/worktree-guard/notice-<name>.txt
+# when it could not give this agent an ordinary worktree of HEAD (folder not
+# a git repo → runs in place; repo with no commits → snapshot base). The
+# WorktreeCreate `name` is `agent-<agent_id>`; accept the bare id too. The
+# notice is delivered once (the harness keeps an injected copy across
+# re-runs) and then removed. It does not depend on the isolation flag,
+# which the live SubagentStart payload does not carry.
+case "$AGENT_ID" in
+    ''|*[!A-Za-z0-9._-]*|.*) ;;
+    *)
+        for NOTICE in "$PROJECT_ROOT/.claude/state/worktree-guard/notice-agent-$AGENT_ID.txt" \
+                      "$PROJECT_ROOT/.claude/state/worktree-guard/notice-$AGENT_ID.txt"; do
+            if [ -f "$NOTICE" ]; then
+                NOTICE_MSG="$(cat "$NOTICE" 2>/dev/null || true)"
+                rm -f "$NOTICE" 2>/dev/null || true
+                case "$NOTICE_MSG" in
+                    *[![:space:]]*) emit_ctx "$NOTICE_MSG"; exit 0 ;;
+                esac
+            fi
+        done
+        ;;
+esac
+
 # No-op: isolation not requested, or payload doesn't expose a cwd. Don't guess.
 [ "${ISO_FLAG:-0}" = "1" ] || exit 0
 [ -n "$CWD_FIELD" ] || exit 0
@@ -150,18 +194,6 @@ case "$MSG" in
     *) exit 0 ;;
 esac
 
-if command -v emit_additional_context >/dev/null 2>&1; then
-    emit_additional_context "$MSG" "SubagentStart"
-else
-    "$PY" -c "
-import json, sys
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'SubagentStart',
-        'additionalContext': sys.stdin.read(),
-    }
-}))
-" <<< "$MSG" 2>/dev/null || true
-fi
+emit_ctx "$MSG"
 
 exit 0

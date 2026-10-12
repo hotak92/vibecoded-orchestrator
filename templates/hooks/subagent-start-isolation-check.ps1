@@ -74,6 +74,42 @@ try {
     exit 0
 }
 
+function Emit-Ctx([string]$text) {
+    if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+        Emit-AdditionalContext $text 'SubagentStart'
+    } else {
+        $envelope = [ordered]@{
+            hookSpecificOutput = [ordered]@{
+                hookEventName     = 'SubagentStart'
+                additionalContext = $text
+            }
+        }
+        Write-Output ($envelope | ConvertTo-Json -Compress -Depth 8)
+    }
+}
+
+# -- worktree-guard notice (v0.2.102 W6-Q) - must match the .sh --------------
+# worktree-guard.ps1 leaves .claude/state/worktree-guard/notice-<name>.txt
+# when the agent runs in place (not a git repo) or on a snapshot base (no
+# commits yet). WorktreeCreate `name` is `agent-<agent_id>`; the bare id is
+# accepted too. Delivered once, then removed; independent of the isolation
+# flag (the live SubagentStart payload does not carry one).
+if ($AgentId -and ($AgentId -match '^[A-Za-z0-9_-][A-Za-z0-9._-]*$')) {
+    $NoticeDir = Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "worktree-guard"
+    foreach ($nm in @("notice-agent-$AgentId.txt", "notice-$AgentId.txt")) {
+        $np = Join-Path $NoticeDir $nm
+        if (Test-Path -LiteralPath $np -PathType Leaf) {
+            $nt = ""
+            try { $nt = (Get-Content -LiteralPath $np -Raw -ErrorAction Stop) } catch { }
+            try { Remove-Item -LiteralPath $np -Force -ErrorAction SilentlyContinue } catch { }
+            if ($nt -and ($nt -match '\S')) {
+                Emit-Ctx $nt.TrimEnd()
+                exit 0
+            }
+        }
+    }
+}
+
 # No-op: isolation not requested, or no cwd exposed. Don't guess.
 if (-not $IsoFlag) { exit 0 }
 if (-not $CwdField) { exit 0 }
@@ -98,17 +134,6 @@ $Msg = "WARNING: ISOLATION VIOLATION SUSPECTED - this subagent requested ``isola
 
 if (-not ($Msg -match '\S')) { exit 0 }
 
-if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
-    Emit-AdditionalContext $Msg 'SubagentStart'
-} else {
-    $envelope = [ordered]@{
-        hookSpecificOutput = [ordered]@{
-            hookEventName     = 'SubagentStart'
-            additionalContext = $Msg
-        }
-    }
-    $json = $envelope | ConvertTo-Json -Compress -Depth 8
-    Write-Output $json
-}
+Emit-Ctx $Msg
 
 exit 0

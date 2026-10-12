@@ -231,7 +231,7 @@
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.ps1\"",
-            "timeout": 3
+            "timeout": 60
           }
         ]
       }

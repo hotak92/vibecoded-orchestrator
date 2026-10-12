@@ -61,6 +61,36 @@ Do NOT add to agents that:
 - Only output text/analysis to the conversation
 - Only write to isolated state directories (e.g., `state/`, `knowledge/`)
 
+## How VCO creates the worktree (and the two special cases)
+
+VCO registers its own `WorktreeCreate` hook, `.claude/hooks/worktree-guard.sh` (`.ps1` on Windows). The hook
+replaces Claude Code's built-in git logic for every isolated launch, so it handles three cases:
+
+| Project folder | What the agent gets | Isolation |
+|---|---|---|
+| Git repository with at least one commit | a detached worktree of `HEAD` under `.claude/worktrees/` | on |
+| Git repository with **no commits yet** (just `git init`-ed) | a detached worktree of a **snapshot commit** of the current working tree (built through a throwaway index; your index, refs and HEAD are not touched, `.gitignore` is honoured, the commit is on no branch) | on |
+| Folder that is **not a git repository** | the folder itself; the agent edits your files directly | **off** |
+
+In the last two cases the agent receives a notice when it starts (through the `SubagentStart` hook
+`subagent-start-isolation-check`) explaining what happened, and it is asked to repeat that notice in its
+report. For a snapshot worktree the notice includes the command that copies the agent's changes back into
+the main checkout:
+
+```bash
+git -C <worktree> add -A && git -C <worktree> diff --binary --cached <snapshot-sha> | git -C <project> apply
+```
+
+Isolation switches back to the normal case automatically: once the folder is a git repository you get
+snapshot worktrees, and after the first commit you get ordinary worktrees of `HEAD`. Each decision is
+logged in `.claude/logs/worktree-guard.jsonl` (`in_place`, `worktree_add_snapshot_no_head`,
+`worktree_add_detached_head`).
+
+Without such a hook, Claude Code cannot launch an `isolation: worktree` agent in either special case. A
+repository with no commits fails with `Failed to resolve base branch "HEAD"`, and a non-git folder fails
+with `not in a git repository and no WorktreeCreate hooks are configured`. If you disable `worktree-guard`
+from the launcher, those projects lose their isolated agents until the repository has a commit.
+
 ## Merging worktree changes
 
 After an agent with worktree isolation completes, if it made changes:

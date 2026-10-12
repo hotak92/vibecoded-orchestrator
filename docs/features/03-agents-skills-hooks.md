@@ -40,6 +40,8 @@ v0.2.101 moved the topical specialists out of the default catalogue into **eleve
 
 Agents with `isolation: worktree` run in a temporary git worktree (isolated branch). No changes → worktree is auto-cleaned. Changes → worktree path + branch name returned for review/merge. Prevents partial implementations from corrupting the working directory. See `templates/agents/WORKTREE_ISOLATION_GUIDE.md`.
 
+VCO's `worktree-guard` WorktreeCreate hook creates the worktree, so it also covers the two cases where git alone cannot. In a repository with **no commits yet**, the worktree starts from a snapshot commit of the working tree, isolation stays on, and your index, refs and HEAD are untouched. In a folder that is **not a git repository**, the agent runs in place with isolation off. In both cases the agent is told why when it starts (via `subagent-start-isolation-check`) and repeats it in its report.
+
 ---
 
 ## Bundled Skills (`templates/skills/`)

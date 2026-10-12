@@ -746,12 +746,52 @@ def _v02101_reshape_rows() -> Tuple[PriorShippedShape, ...]:
     return tuple(rows)
 
 
+def _v02102_reshape_rows() -> Tuple[PriorShippedShape, ...]:
+    """The v0.2.102 W6-Q reshape, per OS flavour: ``worktree-guard`` under
+    ``WorktreeCreate`` (no matcher), ``{type, timeout 3}`` since v0.2.71.
+
+    v0.2.102 makes the hook build a snapshot commit of the working tree when
+    the repository has no commits yet (``git add -A`` through a throwaway
+    index), on top of the ``git worktree add`` checkout it always ran. A
+    harness kill at 3 s fails the create, and a failed WorktreeCreate means
+    the ``isolation: worktree`` agent cannot launch at all — so the timeout
+    rises to 60 s (the hook only runs once per isolated launch).
+    """
+    rows = []
+    flavours = (
+        ("sh", 'bash "${{CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/{script}"'),
+        ("ps1", 'powershell -NoProfile -ExecutionPolicy Bypass -File '
+                '"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/{script}"'),
+    )
+    for ext, cmd_fmt in flavours:
+        script = f"worktree-guard.{ext}"
+        rows.append(PriorShippedShape(
+            event="WorktreeCreate", matcher="", target=script,
+            command_key=hook_command_key(cmd_fmt.format(script=script)),
+            fields=(("timeout", 3), ("type", "command")),
+            shipped="v0.2.71–v0.2.101",
+            retired_in="v0.2.102",
+            reason=(
+                "a 3 s harness timeout can kill the worktree create (a "
+                "checkout, plus a working-tree snapshot in a repository with "
+                "no commits), and a failed create leaves the isolated agent "
+                "unlaunchable"
+            ),
+            replacement=(
+                f"the current template's {script} registration "
+                f"(WorktreeCreate, raised timeout)"
+            ),
+        ))
+    return tuple(rows)
+
+
 #: The table. One row per (event, matcher, script) shape VCO shipped and
 #: has since reshaped. ``tests/test_v02101_settings_reshape.py`` pins every
 #: row to BOTH settings templates: the template must still ship the script
 #: under the row's matcher (else the row is dead), and its shape must differ
 #: from the row (else there is nothing to reshape).
-PRIOR_SHIPPED_SHAPES: Tuple[PriorShippedShape, ...] = _v02101_reshape_rows()
+PRIOR_SHIPPED_SHAPES: Tuple[PriorShippedShape, ...] = (
+    _v02101_reshape_rows() + _v02102_reshape_rows())
 
 
 # ── MIGRATED matchers (v0.2.102 W5-D) ──────────────────────────────────────
