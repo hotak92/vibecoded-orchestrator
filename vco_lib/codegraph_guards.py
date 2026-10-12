@@ -191,13 +191,35 @@ ANCHOR_HEAL_PROPS: Dict[str, Tuple[str, ...]] = {
 }
 
 
-def anchor_heal_props_for(collection: Any) -> Tuple[str, ...]:
-    """The :data:`ANCHOR_HEAL_PROPS` entry for ``collection``'s class."""
+def anchor_heal_props_for(collection: Any,
+                          declared_cache: Optional[Dict[str, Any]] = None) -> Tuple[str, ...]:
+    """The :data:`ANCHOR_HEAL_PROPS` entry for ``collection``'s class.
+
+    With ``declared_cache`` (a dict the caller keeps for the run), only the
+    props the class actually DECLARES are returned: asking a fingerprint read
+    for an undeclared property fails the read, and a failed read falls through
+    to a full write that re-embeds (W6-O review LOW-5 — e.g. CodeAPI without
+    ``is_test`` when edge 8_to_9 was deferred and the analyzer's ensure
+    soft-failed). The class schema is read once per collection name and
+    cached; an unreadable schema yields ``()`` — no heal, never a failed read.
+    """
     name = str(getattr(collection, "name", "") or "")
+    wanted: Tuple[str, ...] = ()
     for suffix, props in ANCHOR_HEAL_PROPS.items():
         if name.endswith(suffix):
-            return props
-    return ()
+            wanted = props
+            break
+    if not wanted or declared_cache is None:
+        return wanted
+    if name not in declared_cache:
+        try:
+            declared_cache[name] = frozenset(
+                p.name for p in collection.config.get().properties)
+        except Exception as exc:  # noqa: BLE001 — unreadable schema → no heal
+            logger.debug("anchor heal: schema read on %s failed: %s", name, exc)
+            declared_cache[name] = frozenset()
+    declared = declared_cache[name]
+    return tuple(p for p in wanted if p in declared)
 
 
 def anchor_heal_patch(stored: Optional[Mapping[str, Any]], props: Any) -> Dict[str, Any]:

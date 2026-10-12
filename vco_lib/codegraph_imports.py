@@ -6,9 +6,10 @@ The ONE place a stored ``import_names`` entry becomes a CodeModule ``imports``
 edge. ``analyze_code_graph.create_cross_references`` builds an
 :class:`ImportIndex` over every known module path and asks
 :func:`resolve_import_targets` for each (importer, import name) pair; the
-MCP's and the query CLI's ``dependencies`` readers use
+MCP's and the query CLI's ``imports`` readers use
 :func:`import_edge_compatible` / :func:`filter_compatible_import_rows` to hide
-edges that the resolver below can no longer produce.
+edges that the resolver below can no longer produce, and
+:func:`purge_incompatible_import_edges` deletes the stored ones on every walk.
 
 Why this module exists (the measured defects it closes)
 -------------------------------------------------------
@@ -31,38 +32,62 @@ extension table, mirrored and parity-pinned in
   they never are module rows to resolve to.
 * **Rust** — ``use`` trees (``crate::a::b``, ``self::…``, ``super::…`` any
   number of times, ``{a, b::{c, self}}`` groups, ``as`` renames, ``*`` globs),
-  workspace crates by package-directory name (``vct-launcher-core/src/lib.rs``
-  is crate ``vct_launcher_core``), a bare first segment naming a child module
+  workspace crates by the name their ``Cargo.toml`` declares (``[lib] name``,
+  else ``[package] name``, ``-`` read as ``_``; read once when the index is
+  built with a ``repo_root``, the package directory name when it cannot be
+  read), a bare first segment naming a child module
   of the importer, and out-of-line ``mod x;`` declarations (stored as
   ``"mod x"``). A path resolves to the longest prefix that is a module file
   (``x.rs`` or ``x/mod.rs``); the trailing item names (types, functions) are
   dropped. Not supported: ``#[path]`` attributes and paths relative to an
-  INLINE ``mod x { … }`` block; ``std``/external crates never resolve.
+  INLINE ``mod x { … }`` block; sysroot (``std``, ``core``, ``alloc``,
+  ``proc_macro``, ``test``) and external crates never resolve, even when a
+  workspace crate shares the name.
 * **TypeScript / JavaScript / Svelte** (one family) — relative specifiers
   (``./x``, ``../x``), the SvelteKit ``$lib/`` alias (the nearest ancestor
-  ``src/lib``) and the ``@/`` / ``~/`` aliases (nearest ancestor ``src/``, then
-  the ancestor itself). Each tries the path as written, ``.js``/``.mjs``/
+  ``src/lib``) and the ``@/`` / ``~/`` aliases (the ``src/`` of the nearest
+  ancestor that has one, else the repository root — never the importer's own
+  folder). Each tries the path as written, ``.js``/``.mjs``/
   ``.cjs``/``.jsx`` → ``.ts``/``.tsx`` (ESM-style TypeScript), then appended
   ``.ts .tsx .js .jsx .mjs .svelte`` and ``/index.*``. ``tsconfig.json``
   ``paths`` are NOT read (the index is built from stored module paths, with
   no file access); bare package specifiers never resolve.
 * **Shell** — ``source``/``.`` arguments. A literal relative path resolves
-  against the importer's directory, then the repository root; a path with a
-  dynamic prefix (``"$DIR/_lib/x.sh"``, ``"$(dirname "$0")/x.sh"``) resolves by
-  its literal tail, preferring the candidate closest to the importer.
+  against the importer's directory, then the repository root, and nowhere
+  else; only a path with a dynamic prefix (``"$DIR/_lib/x.sh"``,
+  ``"$(dirname "$0")/x.sh"``) resolves by its literal tail, preferring the
+  candidate closest to the importer.
 * **PowerShell** — a dot-sourced path takes the shell path rule (``\\`` read as
   ``/``); a bare ``Import-Module Name`` takes the generic stem rule.
 * **Every other language** — the generic stem rule, restricted to that
   language.
 
-Pure: no I/O, no Weaviate. Paths are repository-relative POSIX strings.
+Pure resolution: no Weaviate, and no I/O beyond the ``Cargo.toml`` reads of
+:func:`build_import_index` when it is given a ``repo_root``. Paths are
+repository-relative POSIX strings.
+
+Stored wrong edges (v0.2.102 W6-O review HIGH-1, owner decision 2026-10-12)
+--------------------------------------------------------------------------
+Hiding a pre-W6-O wrong-language edge on read is not enough: the reverse
+``imports`` query is capped, so hidden rows still used up the cap. Every
+analyzer walk therefore DELETES, one beacon at a time, each stored ``imports``
+edge whose two endpoints have known, incompatible languages
+(:func:`purge_incompatible_import_edges`). The decision needs only the two
+endpoints — never a desired edge set — so a partial or soft-failed scan can
+only miss edges, never delete a right one; an edge whose either side is
+unknown is left alone, and a module's ref set is never replaced. Running on
+every walk (not one release rung) means an install that skips a release, or
+whose re-walk soft-failed, still converges on its next ordinary walk.
 """
 from __future__ import annotations
 
+import logging
+import os
 import posixpath
 import re
+import tomllib
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Set
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from vco_lib.inject_intent import language_for_path
 
@@ -75,7 +100,17 @@ __all__ = [
     "row_language",
     "filter_compatible_import_rows",
     "expand_rust_use_tree",
+    "incompatible_import_edges",
+    "purge_incompatible_import_edges",
+    "DELETE_INCOMPATIBLE_IMPORT_EDGES",
 ]
+
+logger = logging.getLogger(__name__)
+
+#: Kill switch for :func:`purge_incompatible_import_edges` (owner decision
+#: 2026-10-12: deletion ON). Read at call time, so a test or an emergency
+#: patch can flip it; ``False`` restores hide-on-read only.
+DELETE_INCOMPATIBLE_IMPORT_EDGES = True
 
 #: Languages that import each other. Everything else is its own family.
 _FAMILY: Dict[str, str] = {
@@ -88,6 +123,8 @@ _JS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".svelte")
 _JS_RUNTIME_EXTS = (".js", ".mjs", ".cjs", ".jsx")
 _RUST_MOD_RS = frozenset({"lib.rs", "main.rs", "mod.rs"})
 _RUST_ROOT_FILES = ("lib.rs", "main.rs")
+#: Sysroot crates: ``use core::mem`` never means a workspace crate named core.
+_RUST_SYSROOT_CRATES = frozenset({"std", "core", "alloc", "proc_macro", "test"})
 #: Characters that make a shell path segment dynamic (not literally matchable).
 _SHELL_DYNAMIC = re.compile(r"[$`(){}~*?\[\]]")
 
@@ -124,11 +161,11 @@ def filter_compatible_import_rows(source_props: Optional[Mapping[str, Any]],
                                   targets: Sequence[Any]) -> List[Any]:
     """Drop ``imports`` targets of a language the source cannot import.
 
-    The read-side companion of the resolver: edges stored by a pre-W6-O
-    analyzer (a Python module "importing" ``logging.rs``) stay in Weaviate —
-    the write pass only ever ADDS edges (see
-    ``codegraph_references.add_missing_reference_edges``) — so every
-    ``dependencies`` reader filters them with the same family rule.
+    The read-side backstop of :func:`purge_incompatible_import_edges`: an edge
+    stored by a pre-W6-O analyzer (a Python module "importing" ``logging.rs``)
+    survives until the next walk deletes it, and a peer collection this
+    install never walks keeps its edges — so every ``imports`` reader filters
+    them with the same family rule.
     """
     src_lang = row_language(source_props)
     out: List[Any] = []
@@ -155,8 +192,34 @@ class ImportIndex:
     rust_crates: Dict[str, str] = field(default_factory=dict)
 
 
-def build_import_index(paths: Iterable[str]) -> ImportIndex:
-    """Index ``paths`` (repo-relative POSIX module paths) for resolution."""
+def _cargo_crate_name(repo_root: Optional[str], crate_dir: str) -> Optional[str]:
+    """The crate name ``<repo_root>/<crate_dir>/Cargo.toml`` declares —
+    ``[lib] name``, else ``[package] name`` — with ``-`` read as ``_``.
+    ``None`` when there is no root, no file, or nothing readable."""
+    if not repo_root:
+        return None
+    manifest = os.path.join(repo_root, *(crate_dir.split("/") if crate_dir else []), "Cargo.toml")
+    try:
+        with open(manifest, "rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError, ValueError):
+        return None
+    for table in ("lib", "package"):
+        section = data.get(table)
+        name = section.get("name") if isinstance(section, dict) else None
+        if isinstance(name, str) and name.strip():
+            return name.strip().replace("-", "_")
+    return None
+
+
+def build_import_index(paths: Iterable[str], *, repo_root: Optional[str] = None) -> ImportIndex:
+    """Index ``paths`` (repo-relative POSIX module paths) for resolution.
+
+    ``repo_root`` (the directory those paths are relative to) lets each Rust
+    library crate be indexed by the name its ``Cargo.toml`` declares, read
+    once here; without it, or when the manifest cannot be read, a crate falls
+    back to its package directory name. Sysroot names are never indexed.
+    """
     ordered: List[str] = []
     seen: Set[str] = set()
     for raw in paths:
@@ -183,11 +246,14 @@ def build_import_index(paths: Iterable[str]) -> ImportIndex:
         while d and d not in dirs:
             dirs.add(d)
             d = posixpath.dirname(d)
-        if lang == "rust" and p.endswith("/src/lib.rs"):
+        if lang == "rust" and (p == "src/lib.rs" or p.endswith("/src/lib.rs")):
             src_dir = posixpath.dirname(p)
-            pkg = posixpath.basename(posixpath.dirname(src_dir))
-            if pkg:
-                rust_crates.setdefault(pkg.replace("-", "_"), src_dir)
+            crate_dir = posixpath.dirname(src_dir)
+            crate = _cargo_crate_name(repo_root, crate_dir)
+            if crate is None:
+                crate = posixpath.basename(crate_dir).replace("-", "_")
+            if crate and crate not in _RUST_SYSROOT_CRATES:
+                rust_crates.setdefault(crate, src_dir)
     return ImportIndex(
         paths=frozenset(ordered), language=language, names=names,
         basenames=basenames, dirs=frozenset(dirs), rust_crates=rust_crates,
@@ -437,10 +503,18 @@ def _resolve_js(importer: str, spec: str, index: ImportIndex) -> List[str]:
                 roots.append(lib)
                 break
     elif spec.startswith(("@/", "~/")):
+        # The alias root is ONE directory: the `src/` of the nearest ancestor
+        # that has one, else the repository root. Probing every ancestor would
+        # answer with the nearest folder that happens to hold a same-named file
+        # (`@/utils` from `src/components/Card.ts` → `src/components/utils.ts`).
         rest = spec[2:]
+        root = ""
         for anc in _ancestors(importer):
             src = posixpath.join(anc, "src") if anc else "src"
-            roots.extend([src, anc] if src in index.dirs else [anc])
+            if src in index.dirs:
+                root = src
+                break
+        roots.append(root)
     for root in roots:
         base = posixpath.normpath(posixpath.join(root, rest)) if rest else root
         hit = _js_lookup(base, index)
@@ -479,9 +553,10 @@ def _resolve_path_like(importer: str, arg: str, index: ImportIndex, fam: str) ->
             cand = posixpath.normpath(posixpath.join(base, arg)) if base else posixpath.normpath(arg)
             if not cand.startswith("..") and ok(cand):
                 return [cand]
-        tail = segs
-    else:
-        tail = segs[dynamic_at + 1:]
+        # A literal path names ONE file; when it is not where the shell would
+        # look, an unrelated same-named file elsewhere is not the import.
+        return []
+    tail = segs[dynamic_at + 1:]
     tail = [s for s in tail if s]
     while tail and tail[0] in (".", ".."):
         tail = tail[1:]
@@ -495,3 +570,99 @@ def _resolve_path_like(importer: str, arg: str, index: ImportIndex, fam: str) ->
     importer_dir = posixpath.dirname(importer)
     best = max(cands, key=lambda p: (_common_prefix_len(importer_dir, posixpath.dirname(p)), -len(p)))
     return [best]
+
+
+# ── stored wrong-language edges (deleted on every walk) ──────────────────────
+
+
+def _path_of_key(key: Any) -> str:
+    """A module-cache key is ``(project_source, path)`` or a bare path."""
+    if isinstance(key, tuple) and len(key) == 2:
+        key = key[1]
+    return str(key or "").replace("\\", "/")
+
+
+def incompatible_import_edges(stored_refs: Mapping[str, Sequence[Any]],
+                              path_by_uuid: Mapping[str, str]) -> List[Tuple[str, str]]:
+    """Distinct ``(source_uuid, target_uuid)`` ``imports`` edges that are
+    provably wrong: both endpoints are known modules whose languages are
+    known and in different import families.
+
+    An endpoint missing from ``path_by_uuid`` (a row this scan did not see, a
+    target in another collection) or whose language is unknown leaves the
+    edge alone — compatibility cannot be decided, so it is kept.
+    """
+    out: List[Tuple[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for src_uuid, targets in stored_refs.items():
+        src_fam = import_family(language_for_path(path_by_uuid.get(str(src_uuid), "")))
+        if not src_fam:
+            continue
+        for target in targets or ():
+            pair = (str(src_uuid), str(target))
+            if pair in seen:
+                continue
+            dst_path = path_by_uuid.get(pair[1])
+            if not dst_path:
+                continue
+            dst_fam = import_family(language_for_path(dst_path))
+            if dst_fam and dst_fam != src_fam:
+                seen.add(pair)
+                out.append(pair)
+    return out
+
+
+def purge_incompatible_import_edges(collection: Any,
+                                    stored_refs: Mapping[str, Sequence[Any]],
+                                    module_cache: Mapping[Any, Any],
+                                    *, enabled: Optional[bool] = None) -> int:
+    """Delete every provably wrong stored ``imports`` edge, one beacon at a time.
+
+    ``stored_refs`` is the analyzer's already-loaded ``{module_uuid:
+    [target_uuid, ...]}`` scan and ``module_cache`` its ``{(project_source,
+    path) | path: uuid}`` map, so a walk with nothing to delete costs no
+    Weaviate call. Each delete is ``data.reference_delete`` with a beacon
+    qualified by ``collection.name`` (the analyzer writes class-qualified
+    beacons; see ``codegraph_ref_dedup``), so a module's other edges are never
+    touched and its ref set is never replaced. A failed delete is logged and
+    skipped; the next walk retries it. Returns the number of edges deleted.
+
+    ``enabled`` defaults to :data:`DELETE_INCOMPATIBLE_IMPORT_EDGES`.
+    """
+    if enabled is None:
+        enabled = DELETE_INCOMPATIBLE_IMPORT_EDGES
+    if not enabled or not stored_refs or collection is None:
+        return 0
+    path_by_uuid: Dict[str, str] = {}
+    for key, uuid in module_cache.items():
+        path = _path_of_key(key)
+        if path and uuid:
+            path_by_uuid[str(uuid)] = path
+    edges = incompatible_import_edges(stored_refs, path_by_uuid)
+    if not edges:
+        return 0
+    to_ref: Callable[[str], Any] = _qualified_reference_builder(getattr(collection, "name", None))
+    deleted = 0
+    for src_uuid, dst_uuid in edges:
+        try:
+            collection.data.reference_delete(
+                from_uuid=src_uuid, from_property="imports", to=to_ref(dst_uuid))
+            deleted += 1
+        except Exception as exc:  # noqa: BLE001 — one failed delete never aborts the walk
+            logger.warning("code graph: could not delete the wrong-language imports edge "
+                           "%s -> %s (%s); the next walk retries it", src_uuid, dst_uuid, exc)
+    return deleted
+
+
+def _qualified_reference_builder(collection_name: Optional[str]) -> Callable[[str], Any]:
+    """``uuid`` → the ``to=`` argument naming ``collection_name`` (CodeModule
+    edges point into their own collection). A bare UUID when the client's
+    ``ReferenceToMulti`` is unavailable or the collection is unnamed."""
+    if collection_name:
+        try:
+            from weaviate.classes.data import ReferenceToMulti  # noqa: PLC0415
+        except ImportError:
+            ReferenceToMulti = None  # type: ignore[assignment]  # noqa: N806
+        if ReferenceToMulti is not None:
+            return lambda uuid: ReferenceToMulti(target_collection=collection_name, uuids=uuid)
+    return lambda uuid: uuid

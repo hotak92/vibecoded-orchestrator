@@ -455,16 +455,23 @@ class QueryCodeStructureTruncationTests(unittest.TestCase):
         self.assertEqual(payload["count"], 3)
 
     def test_imports_emits_truncated_flag(self):
-        """Site 8: imports query — verify truncated flag for reverse-imports."""
+        """Site 8: imports query — verify truncated flag for reverse-imports.
+
+        v0.2.102 W6-O review HIGH-1: `truncated` counts CONFIRMED importers
+        (path identity + language compatibility), not raw rows — 20 raw rows
+        that import nothing once read `truncated: true` with no results, the
+        defect itself. So the fixture now carries real `imports` references:
+        IMPORTS_LIMIT + 1 confirmed importers → 20 results, truncated."""
         import claude_mcp_servers.weaviate_mcp.server as srv
 
+        target = _FakeObj("target", uuid="target-uuid", properties={"path": "target_module"})
         modules = []
-        for i in range(20):  # == IMPORTS_LIMIT
+        for i in range(21):  # == IMPORTS_LIMIT + 1
             obj = _FakeObj(f"mod{i}", uuid=f"mod-uuid-{i}")
             obj.properties = {
                 "path": f"src/mod{i}.py",
-                "imports": ["target_module"],
             }
+            obj.references = {"imports": mock.Mock(objects=[target])}
             modules.append(obj)
         contents = {"CodeModule": modules}
         client = self._patched_client(contents)
@@ -477,6 +484,7 @@ class QueryCodeStructureTruncationTests(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertTrue(payload["truncated"], f"imports should be truncated at 20: {payload}")
         self.assertEqual(payload["limit"], 20)
+        self.assertEqual(len(payload["results"]), 20)
 
     def test_composed_by_emits_truncated_flag(self):
         """Site 10: composed_by query — verify truncated flag."""

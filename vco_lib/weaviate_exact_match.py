@@ -190,11 +190,14 @@ def fetch_matching_rows(
     page_size: int = PAGE_SIZE,
     max_pages: int = MAX_PAGES,
     max_matches: Optional[int] = None,
+    accept_object: bool = False,
     **fetch_kwargs: Any,
 ) -> list:
     """Page a narrowing ``fetch_objects`` read; keep only rows *accept* confirms.
 
-    *accept* receives the row's raw ``properties`` dict; a predicate that raises
+    *accept* receives the row's raw ``properties`` dict (the whole row object
+    when *accept_object* is set — e.g. to read its resolved references); a
+    predicate that raises
     REJECTS the row (an error must never select a row for deletion). Paging
     stops at the first short page, at *max_matches* accepted rows, or at the
     page cap (logged — the result is then a confirmed SUBSET, never a guess).
@@ -226,7 +229,7 @@ def fetch_matching_rows(
                 if key in seen:
                     continue
                 seen.add(key)
-            props = getattr(obj, "properties", None) or {}
+            props = obj if accept_object else (getattr(obj, "properties", None) or {})
             try:
                 hit = bool(accept(props))
             except Exception:  # noqa: BLE001 — a predicate error never selects

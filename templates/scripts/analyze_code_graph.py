@@ -516,6 +516,7 @@ try:
     # v0.2.102 W6-O: language-aware import → module resolution (one home).
     from vco_lib.codegraph_imports import (
         build_import_index as _build_import_index,
+        purge_incompatible_import_edges as _purge_incompatible_import_edges,
         resolve_import_targets as _resolve_import_targets,
     )
 except ImportError as _exc:  # noqa: F841 — used in the message below
@@ -2745,7 +2746,7 @@ class CodeGraphAnalyzer:
             slot = slot if slot in cache[name] else None
         fp = _guards.read_object_fingerprint(
             collection, det_uuid, _EMBED_REVISION_PROP, want_total_chunks=want_total_chunks,
-            vector_slot=slot, heal_props=_guards.anchor_heal_props_for(collection),  # W6-O
+            vector_slot=slot, heal_props=_guards.anchor_heal_props_for(collection, self.__dict__.setdefault("_declared_props", {})),
         )
         if fp is not None and fp.get("vector_present") is False:
             fp["embed_revision"] = _EMBED_REVISION_VECTORLESS
@@ -5546,7 +5547,7 @@ class CodeGraphAnalyzer:
         for _k, _uuid in self.module_cache.items():
             _p = _k[1] if isinstance(_k, tuple) and len(_k) == 2 else _k
             module_uuid_by_path[_p] = _uuid
-        import_index = _build_import_index(module_uuid_by_path)  # W6-O
+        import_index = _build_import_index(module_uuid_by_path, repo_root=getattr(self, "_analyze_repo_root", None))
 
         # --- 1. Function calls ---
         print("   Linking function calls...")
@@ -5800,10 +5801,8 @@ class CodeGraphAnalyzer:
                     if target_uuid:
                         imports_to_add.append(target_uuid)
 
-            # v0.2.92: one add-if-absent write per module. Worst live site
-            # (1518 beacons / 4 distinct targets) — BOTH multipliers apply:
-            # re-linked on every analyze, and several import names in one file
-            # routinely resolve to the same module row.
+            # v0.2.92: one add-if-absent write per module (re-linked on every
+            # analyze; several names in one file often resolve to one row).
             if imports_to_add:
                 try:
                     stats['imports'] += _add_missing_reference_edges(
@@ -5812,8 +5811,9 @@ class CodeGraphAnalyzer:
                 except Exception as e:
                     logger.debug(f"Failed to add import refs for {mod_path}: {e}")
 
-        # Counts are edges CREATED this pass (zeros on a no-op re-analyze).
-        print(f"   Done: {stats['calls']} call refs, {stats['extends']} extends refs, {stats['imports']} import refs")
+        stats['imports_deleted'] = _purge_incompatible_import_edges(  # W6-O: every walk drops wrong-language edges
+            getattr(self, "modules_collection", None), stored_import_refs, self.module_cache)
+        print(f"   Done: {stats['calls']} call refs, {stats['extends']} extends refs, {stats['imports']} import refs, {stats['imports_deleted']} wrong-language import refs deleted")
         return stats
 
     def _extract_annotation_type_names(self, annotation: Optional[ast.expr]) -> List[str]:

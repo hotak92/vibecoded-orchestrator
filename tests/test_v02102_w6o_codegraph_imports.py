@@ -342,11 +342,13 @@ def test_codeapi_spec_has_is_test_and_edge_8_to_9_owns_it() -> None:
 
 
 class _Coll:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, declared=("file_path", "is_test")) -> None:
         self.name = name
         self.updates: list = []
         self.data = types.SimpleNamespace(
             update=lambda uuid, properties: self.updates.append((uuid, dict(properties))))
+        self.config = types.SimpleNamespace(get=lambda: types.SimpleNamespace(
+            properties=[types.SimpleNamespace(name=n) for n in declared]))
 
 
 @pytest.mark.parametrize("file_path,expected", [
@@ -430,6 +432,60 @@ def test_analyzer_skip_path_heals_a_hash_matched_legacy_row(analyzer_mod, stored
         mp.setattr(analyzer_mod, "DUAL_EMBEDDING_ENABLED", False)
         assert inst._write_one_object(coll, "u1", {"properties": dict(props)}, "GET /items/list") == "u1"
     assert coll.updates == want_patch
+
+
+def test_heal_props_only_for_declared_properties() -> None:
+    """Review LOW-5: a class without `is_test` (8_to_9 deferred, ensure
+    soft-failed) must not get `is_test` in the fingerprint read — that read
+    would fail and the row would re-embed. One schema read per class."""
+    reads: list = []
+    coll = _Coll("P_CodeAPI", declared=("file_path",))
+    real_get = coll.config.get
+    coll.config.get = lambda: reads.append(1) or real_get()
+    cache: dict = {}
+    assert guards.anchor_heal_props_for(coll, cache) == ("file_path",)
+    assert guards.anchor_heal_props_for(coll, cache) == ("file_path",)
+    assert reads == [1]
+    full = _Coll("P_CodeAPI")
+    assert guards.anchor_heal_props_for(full, {}) == ("file_path", "is_test")
+    broken = _Coll("P_CodeAPI")
+    broken.config.get = lambda: (_ for _ in ()).throw(RuntimeError("schema down"))
+    assert guards.anchor_heal_props_for(broken, {}) == ()
+    # a class with nothing to heal never reads its schema
+    fn = _Coll("P_CodeFunction")
+    fn.config.get = lambda: pytest.fail("schema read for a class with no heal props")
+    assert guards.anchor_heal_props_for(fn, {}) == ()
+
+
+def test_analyzer_skip_path_asks_only_for_declared_heal_props(analyzer_mod) -> None:
+    """The WIRING of LOW-5: with `is_test` undeclared, the analyzer's
+    fingerprint point-read does not request it (a request for an undeclared
+    property fails the read and forces a re-embed)."""
+    props = {"endpoint": "/items/list", "method": "GET", "api_description": "GET /items/list",
+             "parameters": [], "returns": "", "file_path": "tests/fixtures/routes.js",
+             "is_test": True}
+    content_hash = analyzer_mod._content_hash_for_object("P_CodeAPI", props)
+    stored = {"content_hash": content_hash, "embed_revision": analyzer_mod.CODEGRAPH_EMBED_REVISION,
+              "file_path": None}
+    asked: list = []
+    coll = _Coll("P_CodeAPI", declared=("file_path",))
+
+    def _fetch(uuid, return_properties, **kw):
+        asked.append(list(return_properties))
+        if "is_test" in return_properties:
+            raise RuntimeError("no such prop: is_test")
+        return types.SimpleNamespace(properties={k: stored.get(k) for k in return_properties},
+                                     vector=None)
+
+    coll.query = types.SimpleNamespace(fetch_object_by_id=_fetch)
+    coll.data.replace = coll.data.insert = lambda **kw: pytest.fail("re-embedded")
+    inst = analyzer_mod.CodeGraphAnalyzer.__new__(analyzer_mod.CodeGraphAnalyzer)
+    inst._embed_skip_fingerprint = None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(analyzer_mod, "DUAL_EMBEDDING_ENABLED", False)
+        assert inst._write_one_object(coll, "u1", {"properties": dict(props)}, "GET /items/list") == "u1"
+    assert all("is_test" not in a for a in asked), asked
+    assert coll.updates == [("u1", {"file_path": "tests/fixtures/routes.js"})]
 
 
 def test_revision_stamp_path_also_heals_through_the_stash(analyzer_mod) -> None:

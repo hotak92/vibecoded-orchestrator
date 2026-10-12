@@ -8496,7 +8496,9 @@ from vco_lib.codegraph_references import (  # noqa: E402 — kept beside its exp
 )
 # v0.2.102 W6-O: both `imports` directions hide stored edges between modules of
 # languages that cannot import each other (a pre-W6-O analyzer resolved import
-# names by file stem across languages; the write pass never deletes edges).
+# names by file stem across languages). Every analyzer walk deletes such stored
+# edges; this read filter is the backstop for rows not walked yet and for peer
+# collections this install never walks.
 from vco_lib.codegraph_imports import (  # noqa: E402
     filter_compatible_import_rows as _filter_compatible_import_rows,
     import_edge_compatible as _import_edge_compatible,
@@ -8748,19 +8750,21 @@ def query_code_structure(
                 # the same normalisation the CLI's exclude-file filter
                 # uses; relative vs absolute, ``./``, trailing slash,
                 # separators).
+                #
+                # v0.2.102 W6-O review HIGH-1: the confirmation (path identity
+                # AND language compatibility) runs WHILE paging, before the
+                # cap — capping the raw rows first let wrong-language importers
+                # (191 on one live `time.rs`) use up all 20 slots and answer
+                # empty. Pages continue until IMPORTS_LIMIT + 1 distinct
+                # confirmed importers or exhaustion, so `truncated` counts
+                # confirmed importers only.
                 IMPORTS_LIMIT = 20
-                response = coll.query.fetch_objects(
-                    filters=with_project(
-                        Filter.by_ref("imports").by_property("path").equal(target)
-                    ),
-                    limit=IMPORTS_LIMIT,
-                    return_references=_code_return_references("imports"),
-                )
                 import vco_lib.weaviate_exact_match as _wem  # noqa: PLC0415
 
-                confirmed = [
-                    obj for obj in response.objects
-                    if any(
+                _seen_importers: set = set()
+
+                def _confirmed_importer(obj) -> bool:
+                    if not any(
                         _wem.names_same_path(
                             (getattr(ref, "properties", None) or {}).get("path"),
                             target,
@@ -8770,12 +8774,29 @@ def query_code_structure(
                             _row_language(getattr(ref, "properties", None)),
                         )
                         for ref in _read_cross_reference(obj, "imports")
-                    )
-                ]
-                importers = _dedup_ref_targets(confirmed, ("path",))
+                    ):
+                        return False
+                    key = (getattr(obj, "properties", None) or {}).get("path")
+                    if key:  # one answer per importer path (dedup_ref_targets' rule)
+                        if key in _seen_importers:
+                            return False
+                        _seen_importers.add(key)
+                    return True
+
+                confirmed = _wem.fetch_matching_rows(
+                    coll,
+                    with_project(
+                        Filter.by_ref("imports").by_property("path").equal(target)
+                    ),
+                    _confirmed_importer,
+                    accept_object=True,
+                    max_matches=IMPORTS_LIMIT + 1,
+                    return_references=_code_return_references("imports"),
+                )
+                importers = _dedup_ref_targets(confirmed, ("path",))[:IMPORTS_LIMIT]
                 results = [{"path": obj.properties.get("path"), "file_path": obj.properties.get("path", "")} for obj in importers]
                 _truncation_meta = {
-                    "truncated": len(response.objects) >= IMPORTS_LIMIT,
+                    "truncated": len(confirmed) > IMPORTS_LIMIT,
                     "limit": IMPORTS_LIMIT,
                 }
 
