@@ -245,6 +245,24 @@ def test_missing_scan_helper_is_a_loud_alert(tmp_path, sibling):
     assert run.alerted and "UNAVAILABLE" in run.rows[-1]["patterns"], run.rows
 
 
+def test_sh_no_python_is_a_loud_alert(tmp_path):
+    """No interpreter = a broken install: the .sh must say the edit went
+    unscanned (parity with the .ps1 'no Python interpreter' alert), never
+    exit silently as if the edit were clean."""
+    proj = _project(tmp_path)
+    hooks = tmp_path / "hooks"
+    shutil.copytree(HOOKS, hooks)
+    # find-python.sh resolves nothing: $PY stays empty.
+    (hooks / "_lib" / "find-python.sh").write_text("PY=\n", encoding="utf-8")
+    target = proj / "src" / "a.py"
+    target.write_text("X = 1\n", encoding="utf-8")
+    run = _run("sh", proj, "Write",
+               {"file_path": str(target), "content": "X = 1\n"}, hooks)
+    assert "credential scanner UNAVAILABLE" in run.proc.stderr, run.proc.stderr
+    envelope = json.loads(run.proc.stdout)
+    assert "UNAVAILABLE" in envelope["hookSpecificOutput"]["additionalContext"]
+
+
 _PEM_HEAD = "-----BEGIN EC " + "PRIVATE KEY-----"
 _PEM_TAIL = "-----END EC " + "PRIVATE KEY-----"
 
