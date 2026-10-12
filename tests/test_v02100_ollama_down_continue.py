@@ -314,6 +314,11 @@ class _Resp(io.BytesIO):
 def test_summary_ollama_tier_needs_the_model_present_and_never_pulls(monkeypatch, tmp_path):
     monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path))
     sb = _summary_backends()
+    # Pin the tier model: unpinned, OLLAMA_DEFAULT_MODEL is resolved at import
+    # from the machine's hardware tier, and a GPU-less CI runner lands on the
+    # qwen3.5:0.8b floor — the very model this test holds as "not the tier
+    # model". ollama_available() reads the module constant, so pin that.
+    monkeypatch.setattr(sb, "OLLAMA_DEFAULT_MODEL", "qwen3.5:9b")
     urls = []
 
     def tags(held):
