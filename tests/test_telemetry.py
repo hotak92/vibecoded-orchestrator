@@ -100,8 +100,8 @@ class PIIScrubTests(unittest.TestCase):
     def test_scrubs_jwt(self) -> None:
         # Realistic JWT: header.payload.signature, all base64url, 40+ char sig.
         jwt = (
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
-            ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0"
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"  # vco-secret-scan: test-placeholder
+            ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0"  # vco-secret-scan: test-placeholder
             ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
         )
         out = self.collector_mod._scrub_pii(f"auth={jwt}")

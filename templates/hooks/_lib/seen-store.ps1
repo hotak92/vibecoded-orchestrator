@@ -434,7 +434,10 @@ function Invoke-VcoFilterSeenBlocks {
 
     foreach ($line in ($InputText -split "`n")) {
         $line = $line.TrimEnd("`r")
-        $m = [regex]::Match($line, '^(KG|CODE): (.+)$')
+        # NOTE: blocks (v0.2.102 W6-N F-8, the router's before-edit
+        # prompt-agent nudge) are keyed like CODE on their first field.
+        # MUST MATCH seen-store.sh and hook_context_router.py _HEADER_RE.
+        $m = [regex]::Match($line, '^(KG|CODE|NOTE): (.+)$')
         if ($m.Success) {
             . $flush
             $curPrefix = $m.Groups[1].Value

@@ -604,10 +604,10 @@ def test_credential_scan_emits_alert_on_aws_key(tmp_path):
 
     # 2. Subagent writes a file with the canonical AWS-test-key.
     leak = project / "src" / "leak.py"
-    # AKIAIOSFODNN7EXAMPLE is the AWS documentation example key —
+    # AKIAIOSFODNN7EXAMPLE is the AWS documentation example key —  # vco-secret-scan: test-placeholder
     # matches the `AKIA[A-Z0-9]{16}` pattern in credscan.sh.
     leak.write_text(
-        "AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'\n",
+        "AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'\n",  # vco-secret-scan: test-placeholder
         encoding="utf-8",
     )
 

@@ -53,6 +53,14 @@
 #   pem_private_key is absent from command_scan and argv_name.
 # ---------------------------------------------------------------------------
 
+# The ONE explicit test-placeholder opt-out (owner ruling 2026-10-12): a line
+# carrying this text is a declared test fixture and a content scanner does not
+# report it. No heuristic on how a value looks -- only this marker, on the
+# same line. MUST MATCH vco_lib/credential_shapes.py::TEST_PLACEHOLDER_MARKER
+# (pinned by tests/test_credential_shapes_parity.py).
+# shellcheck disable=SC2034
+CREDSHAPES_TEST_PLACEHOLDER_MARKER='vco-secret-scan: test-placeholder'
+
 # credshapes_for_context CONTEXT
 #   Populates the parallel arrays CREDSHAPES_IDS[], CREDSHAPES_LABELS[] and
 #   CREDSHAPES_PATTERNS[] (index-aligned; IDS are the stable SSOT shape ids,

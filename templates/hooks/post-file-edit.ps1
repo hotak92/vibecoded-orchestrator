@@ -19,9 +19,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #
 # Side-effects (background): KG / docs sync, code-graph incremental.
 # LLM-visible reminders (additionalContext envelope):
-#   - Code-file edits → CONTEXT_STATE / KG capture reminder
-#   - CONTEXT_STATE.md significant-changes → expert-skill update prompt
-#   - .claude/skills or .claude/hooks edits → workflow-test prompt
+#   - the routing home's report (the pending KG duplicate-scan report)
+#     and the once-per-session broken-install notice
 #
 # Plain stdout from PostToolUse hooks is silently dropped per the
 # v2.1.x contract — reminders intended for the model MUST go through
@@ -142,31 +141,12 @@ if (Get-Command Invoke-VcoRouteTouchedPath -ErrorAction SilentlyContinue) {
     if ($missingNotice) { Add-Nudge $missingNotice }
 }
 
-# 4. CONTEXT_STATE.md significant-changes → expert-skill nudge.
-if ($EditedFile.EndsWith("CONTEXT_STATE.md", [StringComparison]::OrdinalIgnoreCase)) {
-    $expertSkill = Join-Path $ProjectRoot ".claude/skills/project-experts/claude-orchestrator-expert.md"
-    if (Test-Path $expertSkill) {
-        try {
-            $changes = (Select-String -Path $EditedFile -Pattern '(✅|##\s+(Status|Current Work|Next Steps|Knowledge Captured))' -ErrorAction SilentlyContinue | Measure-Object).Count
-            if ($changes -gt 5) {
-                Add-Nudge "[CONTEXT_STATE.md updated — expert-skill review] $changes significant markers detected.`nConsider updating .claude/skills/project-experts/claude-orchestrator-expert.md if any of:`n  - Major milestone completed (Skills system, knowledge graph, etc.)`n  - Architecture changed (MCP, agents, workflow)`n  - New scripts/commands added (kg-*, wrappers)`n  - Recent work section needs refresh"
-            }
-        } catch { }
-    }
-}
-
-# 5. Workflow-system edits → workflow-test nudge.
-$workflowChanged = $false
-$skillsDir = Join-Path $ProjectRoot ".claude/skills"
-$hooksDir = Join-Path $ProjectRoot ".claude/hooks"
-if ($EditedFile.StartsWith($skillsDir, [StringComparison]::OrdinalIgnoreCase) -or
-    $EditedFile.StartsWith($hooksDir,  [StringComparison]::OrdinalIgnoreCase)) {
-    $workflowChanged = $true
-}
-if ($workflowChanged) {
-    $bn = Split-Path $EditedFile -Leaf
-    Add-Nudge "[Workflow file edited] $bn was changed.`nConsider:`n  - Test the change in actual usage before assuming it works.`n  - Update documentation if the structure changed.`n  - Run /workflow-optimizer to check for optimizations.`n  - Update skills-setup-guide.md if the setup process changed."
-}
+# The after-edit workflow nudges are gone (owner-approved removal
+# 2026-10-12, v0.2.102 W6-N review round): the CONTEXT_STATE.md
+# "expert-skill review" pointer named a skill file VCO never ships, and the
+# "[Workflow file edited]" reminder pointed at a skills-setup-guide.md that
+# exists nowhere. Prompt-file advice comes BEFORE the edit, from the
+# pre-edit / pre-write context router (vco_lib/prompt_edit_nudge.py).
 
 # Emit accumulated nudges as a single PostToolUse envelope.
 if ($LlmNudge -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {

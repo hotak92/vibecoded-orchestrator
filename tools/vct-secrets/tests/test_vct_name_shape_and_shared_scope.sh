@@ -81,8 +81,8 @@ FX_GH_FINE="github_pat_$(_rep A 22)_$(_rep B 59)"              # fine-grained: 1
 # AWS's own documentation example key. tests/test_v52_l1_subagent_stop_
 # reconciler.py already uses this exact literal for the same reason: it has
 # the shape and is unmistakably not a real credential.
-FX_AWS='AKIAIOSFODNN7EXAMPLE'
-FX_JWT='eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0'                   # {"alg":"none","typ":"JWT"}
+FX_AWS='AKIAIOSFODNN7EXAMPLE'  # vco-secret-scan: test-placeholder
+FX_JWT='eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0'                   # {"alg":"none","typ":"JWT"} vco-secret-scan: test-placeholder
 FX_GITLAB="glpat-$(_rep A 20)"
 FX_SLACK="xoxb-$(_rep A 20)"
 
@@ -257,7 +257,8 @@ t_other_create_boundaries_guarded() {
     # recover-blob: an extracted "KEY" that is credential-shaped is skipped.
     local root="$TMP/rbstore"; rm -rf "$root"; mkdir -p "$root/shared"
     VCT_SECRETS_DIR="$root" "$VCT" version >/dev/null 2>&1
-    printf 'ghp_BASE00000000000000000000000000000000\n%s=x\nSAFE=keepme\n' "$FX_OPENROUTER" \
+    local base_pat='ghp_BASE00000000000000000000000000000000'  # vco-secret-scan: test-placeholder
+    printf '%s\n%s=x\nSAFE=keepme\n' "$base_pat" "$FX_OPENROUTER" \
         > "$root/shared/github_pat"
     chmod 600 "$root/shared/github_pat"
     VCT_SECRETS_DIR="$root" "$VCT" recover-blob --shared --key github_pat >"$TMP/ro" 2>"$TMP/re" || return 1

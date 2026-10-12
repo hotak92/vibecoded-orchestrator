@@ -681,7 +681,7 @@ mod tests {
         // Token on line 0 + a `KEY=` continuation line = classic blob shape.
         fs::write(
             &f,
-            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nOPENAI_API_KEY=sk-fake\n",
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nOPENAI_API_KEY=sk-fake\n", // vco-secret-scan: test-placeholder
         )
         .unwrap();
         let err = read_whole_file_trimmed(&f, "github_pat").unwrap_err();
@@ -707,7 +707,7 @@ mod tests {
         )
         .unwrap();
         let got = read_whole_file_trimmed(&f, "deploy_key").unwrap();
-        assert!(got.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(got.starts_with("-----BEGIN RSA PRIVATE KEY-----")); // vco-secret-scan: test-placeholder
         fs::remove_dir_all(&p).ok();
     }
 

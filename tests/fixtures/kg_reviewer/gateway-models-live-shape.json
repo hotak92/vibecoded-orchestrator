@@ -1,0 +1,18 @@
+{
+  "_fixture_note": "Shape of the local model gateway's authenticated GET /v1/models (model_router.catalog.to_models_response) with the default WINDOW_ROWS_ONE_M_ONLY: a 1M model is published ONLY as '<id>[1m]', and QwenCloud rows carry the 'claude-gw/qwen/' namespace. The three flash ids are the ones the running gateway listed on 2026-10-12 (coordinator probe for W6-N F-1); the other rows complete the envelope.",
+  "data": [
+    {"type": "model", "id": "claude-haiku-5-5", "display_name": "Haiku 5.5", "description": "", "_vct_window_source": "table"},
+    {"type": "model", "id": "claude-opus-5-5[1m]", "display_name": "Opus 5.5 (1M context)", "description": "", "_vct_window_source": "table"},
+    {"type": "model", "id": "claude-gw/glm-5.3[1m]", "display_name": "glm-5.3 · Z.ai subscription · 1M ctx", "description": "", "_vct_window_source": "table"},
+    {"type": "model", "id": "claude-gw/glm-5.3-flash[1m]", "display_name": "glm-5.3-flash · Z.ai subscription · 1M ctx", "description": "", "_vct_window_source": "table"},
+    {"type": "model", "id": "claude-gw/qwen/qwen3.8-max[1m]", "display_name": "qwen3.8-max · QwenCloud Token Plan · 1M ctx", "description": "", "_vct_window_source": "table"},
+    {"type": "model", "id": "claude-gw/qwen/qwen3.8-flash[1m]", "display_name": "qwen3.8-flash · QwenCloud Token Plan · 1M ctx", "description": "", "_vct_window_source": "table"},
+    {"type": "model", "id": "claude-gw/qwen/deepseek-v4.1-flash[1m]", "display_name": "deepseek-v4.1-flash · QwenCloud Token Plan · 1M ctx", "description": "", "_vct_window_source": "table"},
+    {"type": "model", "id": "claude-gw/kimi/k3[1m]", "display_name": "k3 · Kimi Code subscription · 1M ctx", "description": "", "_vct_window_source": "table"}
+  ],
+  "has_more": false,
+  "first_id": "claude-haiku-5-5",
+  "last_id": "claude-gw/kimi/k3[1m]",
+  "_vct_catalog_source": {"anthropic": "live", "zai": "live", "qwen": "live", "kimi": "live"},
+  "_vct_catalog_hidden": ["claude-gw/glm-5.3-flash", "claude-gw/qwen/deepseek-v4.1-flash", "claude-gw/qwen/qwen3.8-flash"]
+}

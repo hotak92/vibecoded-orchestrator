@@ -7,7 +7,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # post-tool-security.ps1
 # Fires after Write/Edit. Non-blocking (always exits 0).
-# Scans for accidentally committed credentials and notifies.
+# Scans the text the call INTRODUCED for credentials and notifies.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 $EmitContextLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
@@ -68,15 +68,28 @@ if (-not (Test-Path $AlertDir)) {
 
 if (-not $EditedFile -or -not (Test-Path -LiteralPath $EditedFile -PathType Leaf)) { exit 0 }
 
-# PATTERN SOURCE (changed - read this before adding a regex): the shapes are
-# NOT defined here, and this is no longer a hand-kept mirror of
-# post-tool-security.sh. Both read the SAME vocabulary from _lib/credshapes.ps1
-# ('content_scan' context), whose SSOT is vco_lib/credential_shapes.py. The old
-# hand-lockstep arrangement is what let the copies drift until they disagreed
-# about which vendors they could see - and until the "Anthropic/OpenAI API key"
-# label sat over a pattern matching neither modern OpenAI project keys
-# (sk-proj-/sk-svcacct-/sk-admin-) nor OpenRouter (sk-or-v1-). Add shapes to
-# the SSOT, never here.
+# WHAT IS SCANNED (v0.2.102 W6-N, owner ruling 2026-10-12): only what THIS
+# call introduced -- Edit `new_string`, Write
+# `content` -- never the whole file. Scanning the whole file re-alerted on
+# every unrelated edit of a file that already held a test placeholder (the
+# `ghp_...` fixtures in secrets.rs). A line carrying the explicit marker
+# `vco-secret-scan: test-placeholder` is a declared placeholder; nothing is
+# inferred from how a value looks. Findings name the project-relative path,
+# the line(s) and the shape label -- never the value. Bash-written files are
+# not covered: this hook is registered for Edit|Write only.
+#
+# ONE implementation, shared with the .sh sibling:
+# .claude/scripts/credscan_introduced.py (resolved from this hook's own
+# bundle, ../scripts, then $ProjectRoot/.claude/scripts). It owns the scope,
+# the marker test and the PEM body floor (>= 120 base64 chars; control flow
+# over a multi-line window, so it cannot live in the vocabulary).
+#
+# PATTERN SOURCE (read this before adding a regex): the shapes are NOT
+# defined here. Both siblings read the SAME vocabulary from _lib/credshapes
+# ('content_scan' context), whose SSOT is vco_lib/credential_shapes.py, and
+# hand it to the scan helper; the test-placeholder marker comes from the same
+# mirror (Get-CredShapesTestPlaceholderMarker). Add shapes to the SSOT, never
+# here.
 #
 # `Hook leak-test marker` (VCT_HOOK_LEAK_PROBE_a3f7c2) is a smoke-test
 # marker - keeps fixture credentials non-real-looking; users seeing this alert
@@ -88,47 +101,58 @@ if (Test-Path -LiteralPath $CredShapesLib -PathType Leaf) { . $CredShapesLib }
 $content = $null
 try { $content = Get-Content -LiteralPath $EditedFile -Raw -ErrorAction Stop } catch { exit 0 }
 
-$alerts = @()
+$ScanHelper = $null
+foreach ($cand in @((Join-Path $ScriptDir "../scripts/credscan_introduced.py"),
+                    (Join-Path $ProjectRoot ".claude/scripts/credscan_introduced.py"))) {
+    if (Test-Path -LiteralPath $cand -PathType Leaf) { $ScanHelper = $cand; break }
+}
 
-if (-not (Get-Command Get-CredShapes -ErrorAction SilentlyContinue)) {
+$alerts = @()
+$relFile = $EditedFile
+$summary = ""
+$findings = @()
+
+if (-not (Get-Command Get-CredShapes -ErrorAction SilentlyContinue) -or
+    -not (Get-Command Get-CredShapesTestPlaceholderMarker -ErrorAction SilentlyContinue)) {
     # A MISSING vocabulary must not look like a clean file: downstream reads an
     # empty $alerts as "nothing found", so a silent degrade would turn a broken
     # install into a permanent all-clear. Raise it as a real alert instead.
     $alerts += "credential scanner UNAVAILABLE (_lib/credshapes.ps1 missing)"
+} elseif (-not $ScanHelper) {
+    $alerts += "credential scanner UNAVAILABLE (scripts/credscan_introduced.py missing)"
+} elseif (-not $PY) {
+    $alerts += "credential scanner UNAVAILABLE (no Python interpreter)"
 } else {
-    foreach ($shape in (Get-CredShapes -Context 'content_scan')) {
-        # Key on the STABLE SSOT shape id, not the display label.
-        if ($shape.Id -eq 'pem_private_key') {
-            # v0.2.82: PEM detection requires a PLAUSIBLE key body (>=120 base64
-            # chars after the BEGIN marker, before -----END). An RSA key body is
-            # >=1600 chars, but a real EC SEC1 P-256 body is only ~164 - the
-            # earlier >=256 floor SILENTLY MISSED every EC key. 120 stays above
-            # the 13-char secrets.rs write-guard stub while catching P-256 EC
-            # keys. MUST MATCH the .sh sibling's check_pem_key body floor.
-            #
-            # The body floor is CONTROL FLOW over a multi-line window, not
-            # vocabulary - a single regex cannot express it - so it stays
-            # language-local here while the marker itself comes from the shared
-            # vocabulary.
-            $pemMatches = [regex]::Matches($content, $shape.Re)
-            foreach ($pm in $pemMatches) {
-                $pemStart = $pm.Index + $pm.Length
-                $len = [Math]::Min(8192, $content.Length - $pemStart)
-                if ($len -le 0) { continue }
-                $window = $content.Substring($pemStart, $len)
-                $endIdx = $window.IndexOf('-----END')
-                $body = if ($endIdx -ge 0) { $window.Substring(0, $endIdx) } else { $window }
-                $b64 = ($body -replace '[^A-Za-z0-9+/=]', '')
-                if ($b64.Length -ge 120) { $alerts += $shape.Label; break }
-            }
-            continue
+    $spec = [ordered]@{
+        marker = (Get-CredShapesTestPlaceholderMarker)
+        shapes = @(Get-CredShapes -Context 'content_scan' | ForEach-Object { ,@($_.Id, $_.Label, $_.Re) })
+    }
+    # The vocabulary rides an environment variable, not argv: Windows
+    # PowerShell 5.1 mangles a native argument that holds a double quote, and
+    # the generic-secret patterns hold one.
+    $env:VCO_CREDSCAN_SHAPES = ($spec | ConvertTo-Json -Compress -Depth 5)
+    $verdict = $null
+    try {
+        $prevEnc = $OutputEncoding
+        $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $raw = ($HookStdin | & $PY $ScanHelper --root $ProjectRoot --shapes-env VCO_CREDSCAN_SHAPES --format json 2>$null | Out-String)
+        $OutputEncoding = $prevEnc
+        if ($LASTEXITCODE -eq 0 -and $raw.Trim()) { $verdict = $raw | ConvertFrom-Json -ErrorAction Stop }
+    } catch { $verdict = $null }
+    Remove-Item Env:VCO_CREDSCAN_SHAPES -ErrorAction SilentlyContinue
+    if (-not $verdict) {
+        $alerts += "credential scanner UNAVAILABLE (scripts/credscan_introduced.py failed)"
+    } else {
+        if ($verdict.path) { $relFile = [string]$verdict.path }
+        $findings = @($verdict.findings)
+        if ($findings.Count -gt 0) {
+            $summary = [string]$verdict.summary
+            $alerts += [string]$verdict.patterns
         }
-        if ($content -match $shape.Re) { $alerts += $shape.Label }
     }
 }
 
 if ($alerts.Count -gt 0) {
-    $base = Split-Path $EditedFile -Leaf
     # Test-mode: smoke tests set $env:VCT_HOOK_LEAK_PROBE OR include
     # the literal sentinel "VCT_HOOK_LEAK_PROBE_a3f7c2" in the test
     # fixture. Suppress the desktop notify, JSONL log, and model
@@ -142,18 +166,24 @@ if ($alerts.Count -gt 0) {
         } catch { }
     }
     if ($isLeakTest) {
-        Write-Output "[leak-test] would-emit alert for: $base :: $($alerts -join ' ')"
+        Write-Output "[leak-test] would-emit alert for: $relFile :: $($alerts -join ' ')"
         exit 0
     }
-    $msg = "Possible credential in ${base}: $($alerts -join ' ')"
+    # Path + line(s) + shape label; NEVER the value (owner ruling 2026-10-12).
+    $detail = if ($summary) { $summary } else { $alerts -join ' ' }
+    $msg = "Possible credential in ${relFile}: $detail"
     # Build the JSONL line via ConvertTo-Json so all fields are properly
     # escaped (paths with quotes, future labels with metacharacters, etc.).
-    # -Compress keeps it on one line; -Depth 5 is plenty for this flat shape.
-    # Audit fix 2026-05-07.
+    # -Compress keeps it on one line. `findings` = [{line, id, label}] --
+    # never a value. Audit fix 2026-05-07.
+    $findingRows = @($findings | ForEach-Object {
+        [ordered]@{ line = $_.line; id = [string]$_.id; label = [string]$_.label }
+    })
     $entry = [ordered]@{
         timestamp  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        file       = $EditedFile
+        file       = $relFile
         patterns   = ($alerts -join ' ')
+        findings   = $findingRows
         # V52-L.2 Fix 2a: include session_id + agent_id + agent_type so
         # post-hoc forensics can attribute the credential alert back to
         # the agent that triggered the write.
@@ -164,7 +194,7 @@ if ($alerts.Count -gt 0) {
     $line = $entry | ConvertTo-Json -Compress -Depth 5
     try { Add-Content -Path $AlertLog -Value $line -ErrorAction Stop } catch { }
 
-    # v0.2.82: desktop-toast DEDUP — same (file, patterns) key notifies at
+    # v0.2.82: desktop-toast DEDUP - same (file, findings) key notifies at
     # most once per 6h. JSONL log + model envelope stay per-event (forensics
     # and agent awareness are never rate-limited — only the human toast).
     # MUST MATCH the .sh sibling's dedup (same file, same key derivation).
@@ -174,7 +204,7 @@ if ($alerts.Count -gt 0) {
     $dedupKey = $null
     try {
         $sha = [System.Security.Cryptography.SHA256]::Create()
-        $keyBytes = [System.Text.Encoding]::UTF8.GetBytes("$EditedFile|$($alerts -join ' ')")
+        $keyBytes = [System.Text.Encoding]::UTF8.GetBytes("$relFile|$msg")
         $dedupKey = ([System.BitConverter]::ToString($sha.ComputeHash($keyBytes)) -replace '-', '').Substring(0, 16).ToLower()
     } catch { }
     $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -202,7 +232,13 @@ if ($alerts.Count -gt 0) {
     # PostToolUse hooks is silently dropped — the desktop notification
     # above reaches the user, but without this envelope path the model
     # never saw credential alerts on files it had just written.
-    $reminder = "[Security alert] $msg`nReview the diff before continuing. The credential pattern was found in the`nfile you just edited ($EditedFile). If it was unintended (test fixture,`nexample doc), confirm it's safe; if it leaked from real input, redact it`nbefore any further git operations or external sharing."
+    # The marker text comes from the vocabulary mirror (one home), never a
+    # literal here.
+    $markerText = ""
+    if (Get-Command Get-CredShapesTestPlaceholderMarker -ErrorAction SilentlyContinue) {
+        $markerText = Get-CredShapesTestPlaceholderMarker
+    }
+    $reminder = "[Security alert] $msg`nReview the lines named above before continuing: the credential pattern is in`ntext this edit introduced (or on a line it changed) in $relFile. If it is`na deliberate test placeholder, mark its line with the comment`n``$markerText``; if it leaked from real input, redact`nit before any further git operations or external sharing."
     if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
         Emit-AdditionalContext $reminder PostToolUse
     }

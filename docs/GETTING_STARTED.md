@@ -326,7 +326,7 @@ Once a project is configured, here is what fires on normal use:
 - Files under `knowledge/` sync to Weaviate (per-project `<KG_COLLECTION>`; content-hash skip on unchanged nodes)
 - Files under `docs/` sync to the development collection (per-project `<DEVELOPMENT_COLLECTION>`; same content-hash + status handling as the KG — unchanged content is a cheap no-op)
 - Code files are queued for code graph re-analysis (`code-graph-incremental.{sh,ps1}` — invokes `analyze --incremental --language <lang> --prune-stale`, scoped per-language so deleted files in one language never wipe rows from another)
-- A credential scan runs on the written file (`post-tool-security.sh`)
+- A credential scan runs on the text the edit introduced (`post-tool-security.sh`; it reports path, line and shape, never the value)
 
 **On every explicit retrieval** (`PostToolUse` hook on `mcp__weaviate-kg__hybrid_search` / `semantic_graph_search` / `search_code_graph`, v0.2.91):
 - `post-mcp-retrieval-record.{sh,ps1}` records what the retrieval already put in the context window into the same per-session stores the injecting hooks consult, so a node or entity you deliberately fetched is not re-injected minutes later by the pre-edit hook

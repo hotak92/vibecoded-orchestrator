@@ -105,6 +105,13 @@ if ! credshapes_for_context repo_scan; then
   exit 2
 fi
 TOKEN_SHAPES=("${CREDSHAPES_PATTERNS[@]}")
+if [ -z "${CREDSHAPES_TEST_PLACEHOLDER_MARKER:-}" ]; then
+  # The shape passes need the marker to tell a declared test placeholder
+  # from a leak; without it they could only over- or under-report.
+  echo "check-no-secrets: FATAL — test-placeholder marker missing from" >&2
+  echo "  $_CNS_SHAPES_LIB; refusing to scan with a partial vocabulary." >&2
+  exit 2
+fi
 if [ "${#TOKEN_SHAPES[@]}" -eq 0 ]; then
   echo "check-no-secrets: FATAL — empty credential-shape list; refusing to" >&2
   echo "  report a clean tree that was never actually scanned." >&2
@@ -160,6 +167,27 @@ scan_files() {
     # 123 even though another batch DID match; keying on exit status
     # would silently drop that report.
     matches=$(printf '%s\n' "$list" | xargs -r grep -l "$mode" -- "$token" 2>/dev/null || true)
+    if [ "$mode" = "-E" ] && [ -n "$matches" ]; then
+      # Credential SHAPES honour the ONE explicit test-placeholder opt-out
+      # (owner ruling 2026-10-12, same rule as the hook scanners): a line
+      # carrying CREDSHAPES_TEST_PLACEHOLDER_MARKER is a declared fixture,
+      # so a file is reported only when a matching line WITHOUT the marker
+      # remains. The marker covers its own line only; nothing is inferred
+      # from how a value looks. The -F passes (the historical leaked-token
+      # BLOCKLIST) do NOT honour it: a known leak is never a placeholder.
+      # Counts only (`-c` reads all input; no early-exit SIGPIPE), never a
+      # matched line.
+      local kept="" n
+      while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        n=$(grep -E -- "$token" "$f" 2>/dev/null \
+            | grep -cvF -- "$CREDSHAPES_TEST_PLACEHOLDER_MARKER" 2>/dev/null || true)
+        if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+          kept="${kept}${f}"$'\n'
+        fi
+      done <<< "$matches"
+      matches="${kept%$'\n'}"
+    fi
     if [ -n "$matches" ]; then
       printf 'BLOCKED (%s): pattern "%s" found in:\n' "$label" "$token" >&2
       while IFS= read -r f; do

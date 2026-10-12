@@ -25,7 +25,8 @@
 # Functions:
 #   scan_file_for_credentials <file_path>
 #     Runs the content_scan patterns against $file_path. Echoes each matched
-#     label (newline-delimited) on stdout. Empty output → clean.
+#     label (newline-delimited) on stdout. Empty output → clean. A line
+#     carrying the test-placeholder marker is skipped.
 #     Returns 0 always (caller checks output, not exit code).
 #
 # Never echoes any part of the file's contents — labels only.
@@ -86,9 +87,25 @@ scan_file_for_credentials() {
         printf '%s\n' "credential scanner UNAVAILABLE (content_scan context rejected)"
         return 0
     fi
-    local i
+    # The ONE explicit opt-out (owner ruling 2026-10-12): a line carrying
+    # the test-placeholder marker is a declared fixture and is not reported;
+    # the marker covers its own line only, and nothing is inferred from how
+    # a value looks. Same rule, same marker (credshapes.sh mirror of
+    # vco_lib/credential_shapes.TEST_PLACEHOLDER_MARKER) as post-tool-security.
+    local marker="${CREDSHAPES_TEST_PLACEHOLDER_MARKER:-}"
+    if [ -z "$marker" ]; then
+        printf '%s\n' "credential scanner UNAVAILABLE (test-placeholder marker missing from _lib/credshapes.sh)"
+        return 0
+    fi
+    local i n
     for i in "${!CREDSHAPES_PATTERNS[@]}"; do
-        if grep -qE -- "${CREDSHAPES_PATTERNS[$i]}" "$file_path" 2>/dev/null; then
+        # Count the matching lines that do NOT carry the marker. `-c` reads
+        # all input (a `-q` early exit would SIGPIPE the first grep, which a
+        # pipefail caller misreads as "no match"); only a count is printed,
+        # never a line.
+        n=$(grep -E -- "${CREDSHAPES_PATTERNS[$i]}" "$file_path" 2>/dev/null \
+            | grep -cvF -- "$marker" 2>/dev/null || true)
+        if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
             alerts+=("${CREDSHAPES_LABELS[$i]}")
         fi
     done
