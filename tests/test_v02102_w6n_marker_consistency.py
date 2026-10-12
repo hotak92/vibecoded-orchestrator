@@ -111,8 +111,11 @@ def test_repo_scanner_blocklist_ignores_the_marker(tmp_path):
     BLOCKLIST passes do not honour the marker."""
     tree = tmp_path / "tree"
     tree.mkdir()
+    # Assembled at runtime: the literal prefix in this file would itself trip
+    # the repo-tree leak gate that runs check-no-secrets over every tracked file.
+    leaked_prefix = "wh_vct" + "_ls_"
     (tree / "notes.md").write_text(
-        f"wh_vct_ls_example  <!-- {TEST_PLACEHOLDER_MARKER} -->\n",
+        f"{leaked_prefix}example  <!-- {TEST_PLACEHOLDER_MARKER} -->\n",
         encoding="utf-8")
     proc = _check_no_secrets(tree)
     assert proc.returncode == 1 and "leaked token" in proc.stderr, proc.stderr
