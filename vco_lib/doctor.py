@@ -4554,6 +4554,14 @@ def probe_retired_endpoint_env(folder: Path, res: DoctorResolvers, ctx: dict) ->
     )]
 
 
+def probe_codegraph_insert_failures(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.codegraph_extractor_generation`
+    (v0.2.102 W6-U): code graphs certified with an accepted failing set."""
+    from vco_lib import codegraph_extractor_generation  # noqa: PLC0415
+
+    return codegraph_extractor_generation.doctor_insert_failures(folder)
+
+
 def probe_agent_model_ids(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
     """Does every agent definition name a gateway model id the router knows?
 
@@ -4706,6 +4714,10 @@ PROBES: dict = {
     # entry can clear), so the boot counter must never point at it. It runs
     # where it is read: `vco doctor` and install/update's end-of-run report.
     "retired_endpoint_env": (probe_retired_endpoint_env, (SCOPE_FULL,)),
+    # v0.2.102 W6-U: full-only for the same promise reason — no registered
+    # condition (only a clean force walk clears it). Names the files a graph
+    # was certified without, so the accepted-failure state is never silent.
+    "codegraph_insert_failures": (probe_codegraph_insert_failures, (SCOPE_FULL,)),
     # v0.2.100 F1/F4: full-only, informational — the RL telemetry loss
     # ledger's surface (lost hub POSTs, skipped dual-log twins). No registered
     # condition: a loss is a count to watch, not a ledger entry to clear.

@@ -642,11 +642,11 @@ def _redirect_user_state_dir(request):
     install_root_keys = {"VCT_INSTALL_ROOT": str(_REPO_ROOT)}
     # W-TOOL-DIRS: unconditional, like W-INSTALL-ROOT (see the block above).
     install_root_keys[TOOL_SEARCH_DIRS_ENV] = ""
-    # W1-C (v0.2.102 R5): bound the resync-driver slot queue wait so a wedged
-    # slot holder in a test degrades to run-anyway in seconds instead of the
-    # 6 h production default (which would surface as an apparent hang). A
-    # test that cares about the wait sets its own value after this fixture —
-    # monkeypatch.setenv runs later and wins.
+    # W1-C (v0.2.102 R5) / W6-U: shorten the resync-driver slot wait period so
+    # a slot left by a DEAD (or this-process) holder in a test is taken over in
+    # seconds instead of after the 6 h production default (an apparent hang).
+    # A live holder is still waited for. A test that cares about the wait sets
+    # its own value after this fixture — monkeypatch.setenv runs later and wins.
     resync_keys = {"VCO_RESYNC_DRIVER_WAIT_S": "5"}
     self_isolated = (
         request.node.fspath.basename in _SELF_ISOLATED_STATE_DIR_FILES

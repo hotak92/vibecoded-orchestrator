@@ -3415,12 +3415,16 @@ def spawn_code_summary_after_walk(
 #: Every detached driver walks a whole project and embeds through the one GPU /
 #: Weaviate, and nothing bounded them across projects: an "Update all" over N
 #: projects owed a re-index, or a deferral-retry wave, ran N walks at once.
-#: Drivers beyond the cap QUEUE for a slot. They are never dropped, and after
-#: the generous wait bound a driver runs anyway (with a log line), so a wedged
-#: holder cannot stall the queue forever. The slot is released on exit or
-#: crash (flock semantics); see ``vco_lib.atomic.machine_slot``.
+#: Drivers beyond the cap QUEUE for a slot and are never dropped. Past the wait
+#: period a driver keeps queueing while every slot holder is alive ("still
+#: queued", once per period) and takes over a slot only when its recorded
+#: holder is PROVABLY dead (v0.2.102 W6-U) — so an "Update all" over N projects
+#: never starts the N−2 queued walks at once when the period expires. The slot
+#: is released on exit or crash (flock semantics); see
+#: ``vco_lib.atomic.machine_slot`` (and its known narrow overlap window).
 #:   VCO_RESYNC_DRIVER_SLOTS   — slots (default 2; minimum 1)
-#:   VCO_RESYNC_DRIVER_WAIT_S  — max queue wait in seconds (default 21600 = 6 h)
+#:   VCO_RESYNC_DRIVER_WAIT_S  — wait period in seconds before a dead holder's
+#:                               slot may be taken over (default 21600 = 6 h)
 _DRIVER_SLOTS_ENV = "VCO_RESYNC_DRIVER_SLOTS"
 _DRIVER_WAIT_ENV = "VCO_RESYNC_DRIVER_WAIT_S"
 _DRIVER_SLOTS_DEFAULT = 2
@@ -3498,22 +3502,23 @@ def run_resync_and_verify(
         slots = int(_env_number(_DRIVER_SLOTS_ENV, _DRIVER_SLOTS_DEFAULT, 1))
         wait_s = _env_number(_DRIVER_WAIT_ENV, _DRIVER_WAIT_DEFAULT_S, 0)
 
-        def _on_wait(_waited: float) -> None:
-            print(
-                f"[resync-driver] {project_name}: all {slots} resync-driver slot(s) "
-                f"are busy — queued (waits up to {wait_s / 3600:.1f} h; "
-                f"{_DRIVER_SLOTS_ENV} raises the cap)",
-                flush=True,
-            )
+        def _on_wait(waited: float) -> None:
+            if waited < 1.0:
+                msg = (f"all {slots} resync-driver slot(s) are busy — queued "
+                       f"({_DRIVER_SLOTS_ENV} raises the cap)")
+            else:
+                msg = (f"still queued after {waited / 3600:.1f} h — every slot "
+                       f"holder is alive, so this driver keeps waiting (never "
+                       f"runs over a live holder)")
+            print(f"[resync-driver] {project_name}: {msg}", flush=True)
+
+        def _on_takeover(slot_i: int, dead: object) -> None:
+            pid = dead.get("pid") if isinstance(dead, dict) else None
+            print(f"[resync-driver] {project_name}: slot {slot_i}'s holder "
+                  f"(pid {pid}) is gone — taking the slot over", flush=True)
 
         with machine_slot(_driver_slot_dir(), slots=slots, wait_s=wait_s,
-                          on_wait=_on_wait) as slot:
-            if slot is None:
-                print(
-                    f"[resync-driver] {project_name}: no slot freed within "
-                    f"{wait_s:.0f}s — running anyway (queue, never drop)",
-                    flush=True,
-                )
+                          on_wait=_on_wait, on_takeover=_on_takeover):
             return _run_resync_and_verify_slotted(
                 project_name, repo_root, analyzer_path,
                 prune_stale=prune_stale, force_rewalk=force_rewalk,

@@ -338,9 +338,11 @@ def test_A_RISK2_deferred_embed_never_strands_in_the_weaviate_kwargs(
 ):
     """RISK-2. ``build_chunk_write_params`` does ``dict(insert_params)`` and
     ``_write_one_object`` splats it into ``data.replace(uuid=…, **params)``. A
-    stranded callable is a TypeError → ``insert_errors > 0`` →
-    ``walk_certifies_generation`` refuses the stamp → EVERY future update
-    re-spawns a full force-rewalk, forever."""
+    stranded callable is a TypeError → ``insert_errors > 0`` on every row →
+    ``stamp_after_walk`` holds the stamp back and the project re-walks on the
+    next update; the second identical walk then ACCEPTS the failing set (W6-U)
+    — a graph certified with every such row missing, flagged only by the
+    ``codegraph_insert_failures`` doctor probe."""
     monkeypatch.setattr(
         am, "chunk_or_truncate_for_embedding",
         lambda s, b, **kw: [f"[chunk {i+1}/{n_chunks}]\n\nc{i}" for i in range(n_chunks)])

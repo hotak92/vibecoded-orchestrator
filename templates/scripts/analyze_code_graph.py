@@ -3813,9 +3813,8 @@ class CodeGraphAnalyzer:
                     print(f"⚠️  Insert error in {rel_for_msg}: {e}")
                     stats['files_skipped'] += 1
                     stats['insert_errors'] += 1
-                    # R-3 (C-2): the module row may already carry the new
-                    # hash + current revision — un-stamp it so this file
-                    # re-walks next run instead of being skipped forever.
+                    stats.setdefault('insert_error_rows', []).append(_extractor_gen.insert_failure_row(rel_for_msg, e))
+                    # R-3 (C-2): un-stamp the module row so this file re-walks next run.
                     self._invalidate_module_row(f, source_root)
                 except Exception as e:
                     # Non-insert failure (parse error not caught
@@ -3843,9 +3842,8 @@ class CodeGraphAnalyzer:
                             break
                     if seen_dedup:
                         stats['insert_errors'] += 1
-                    # R-3 (C-2): same compensation as the insert-error
-                    # branch — ANY caught per-file failure after the module
-                    # write leaves a lying module row behind.
+                        stats.setdefault('insert_error_rows', []).append(_extractor_gen.insert_failure_row(rel_for_msg, e))
+                    # R-3 (C-2): same compensation — ANY per-file failure leaves a lying module row.
                     self._invalidate_module_row(f, source_root)
 
         # v0.2.102 (S16-3): rows of files skipped as minified/generated this
@@ -6850,13 +6848,12 @@ def main():
         print(f"   Cross-references: {ref_stats['calls']} calls, {ref_stats['extends']} extends, {ref_stats['imports']} imports")
         print()
 
-        # v0.2.92: record COMPLETION of a force re-walk (never earlier — an
-        # interrupted run must leave NO stamp so it stays owed). Rules + soft
-        # fail live in vco_lib; see `stamp_after_walk`.
+        # v0.2.92: record COMPLETION of a force re-walk (never earlier). Rules, the
+        # failing-set acceptance (v0.2.102 W6-U) + soft fail: `stamp_after_walk`.
         _stamped = _extractor_gen.stamp_after_walk(
-            repo_path, force_rewalk=getattr(analyzer, "force_rewalk", False),
+            repo_path, force_rewalk=getattr(analyzer, "force_rewalk", False), project=project_name,
             only_file=args.only_file, only_files_from=args.only_files_from,
-            language=args.language, insert_errors=stats.get("insert_errors", 0),
+            language=args.language, insert_errors=stats.get("insert_errors", 0), failing_rows=stats.get("insert_error_rows"),
             files_analyzed=stats.get("files_analyzed", 0),
         )
         if _stamped:
