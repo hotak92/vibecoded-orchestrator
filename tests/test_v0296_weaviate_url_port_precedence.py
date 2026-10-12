@@ -309,7 +309,9 @@ class TestOneHome(unittest.TestCase):
 class TestMcpMirrorParity(unittest.TestCase):
     """The ONE sanctioned mirror agrees with the shared home, on every case.
 
-    ``claude_mcp_servers/weaviate_mcp/server.py`` deliberately does not
+    ``claude_mcp_servers/weaviate_mcp/kg_query_core.py`` (the KG config
+    layer moved out of ``server.py`` verbatim in v0.2.102 W6-M; ``server``
+    re-exports ``WEAVIATE_URL`` from it) deliberately does not
     import ``vco_lib`` — it boots on half-installed environments where the
     import would fail, so a boot-critical dependency there would trade a
     real failure mode for a cosmetic convergence. That makes its copy a
@@ -324,7 +326,7 @@ class TestMcpMirrorParity(unittest.TestCase):
     """
 
     MIRROR_SRC = (
-        REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
+        REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "kg_query_core.py"
     )
 
     CASES = (
@@ -370,7 +372,7 @@ class TestMcpMirrorParity(unittest.TestCase):
                     _wh.weaviate_url_default(),
                     f"MCP mirror diverged from the shared home for {case!r}. "
                     "Both must change together — see the comment block above "
-                    "the mirror in weaviate_mcp/server.py.",
+                    "the mirror in weaviate_mcp/kg_query_core.py.",
                 )
         finally:
             for k, v in saved.items():

@@ -91,7 +91,8 @@ from vco_lib.kg_truncation_tags import (  # noqa: E402
 #     path the caller imported is the one the moved functions observe.
 import sys as _sys
 import types as _types
-import importlib as _importlib
+
+from . import kg_host as _kg_host  # noqa: E402 — stdlib-only resolver, no server import
 
 # Sibling ``server`` module name(s) to resolve, current package first. Two keys
 # exist when the package is imported under both path prefixes; prefer the one
@@ -124,21 +125,21 @@ class _LazyServerProxy(_types.ModuleType):
         # under a shared test runner ``__main__`` is pytest, and a loose
         # attribute check would resolve the pytest process for every subsequent
         # test once anything set that attr on it (an ordering-pollution trap).
-        _main = _sys.modules.get("__main__")
+        # (The strict check lives in ONE home, ``kg_host._bare_script_server``,
+        # shared with the light-host resolver.)
+        _main = _kg_host._bare_script_server()
         if _main is not None and _main is not self:
-            _mf = getattr(_main, "__file__", None) or ""
-            _mf = _mf.replace("\\", "/")
-            if _mf.endswith("weaviate_mcp/server.py") and hasattr(
-                _main, "_rl_client_instances"
-            ):
-                return _main
+            return _main
         for _name in _SERVER_MOD_NAMES:
             mod = _sys.modules.get(_name)
             if mod is not None and mod is not self:
                 return mod
-        # Not yet in sys.modules under any known key → import the canonical
-        # sibling (this module's own package first).
-        return _importlib.import_module(_SERVER_MOD_NAMES[0])
+        # No server module under any known key. v0.2.102 W6-M: that is the hook
+        # KG producer's process — answer with the LIGHT host
+        # (``kg_query_core``), which serves the KG/RL state itself and imports
+        # the server only for a name it does not carry. Pre-W6-M this imported
+        # ``server`` here (~0.7 s per hook run).
+        return _kg_host.host(__package__)
 
     def __getattr__(self, name):
         return getattr(self._live(), name)
@@ -3066,9 +3067,12 @@ def _rl_enrich_nodes_with_linked_embs(
 
         coll_resolver = _default_coll_resolver
 
-    # Import Filter lazily; the search path already does this elsewhere.
+    # The filter builder of the live host (v0.2.102 W6-M): weaviate-client's
+    # ``Filter`` inside the MCP, the plain-HTTP adapter's in the hook producer
+    # (whose collection handles come from ``kg_http``) — never a weaviate
+    # import on the hook path.
     try:
-        from weaviate.classes.query import Filter  # type: ignore
+        Filter = server.Filter
     except Exception as exc:
         server.logger.debug("RL enrich: Filter import failed (%s); skipping", exc)
         return

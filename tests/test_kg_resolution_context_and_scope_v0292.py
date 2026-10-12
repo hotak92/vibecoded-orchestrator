@@ -483,8 +483,10 @@ class TestNoOrchestratorGuessRemains:
         """The ``Path(__file__).parent.parent.parent`` fallback must live in
         ONE place (``_resolution_context``) that also labels it a guess — not
         inline in the resolver where nothing marks it as unverified."""
+        # v0.2.102 W6-M: the resolver moved verbatim to kg_query_core.py
+        # (server.py re-exports and rebinds it).
         source = (
-            REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
+            REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "kg_query_core.py"
         ).read_text(encoding="utf-8")
         start = source.index("def _try_resolve_project_config()")
         end = source.index("def _config_field_with_source(")

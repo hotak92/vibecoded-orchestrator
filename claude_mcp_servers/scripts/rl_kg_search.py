@@ -2,16 +2,20 @@
 """
 Quick KG search with RL reranking — uses the same pipeline as the weaviate MCP.
 
-Called by the pre-edit hook for context injection with RL-reranked results.
-Uses the MCP server's functions directly (same Weaviate client, same RL server,
-same score-driven verbosity tiers).
+Called by the hook router for context injection with RL-reranked results.
+Runs the MCP server's OWN query/format code (same collections fan-out, access
+filter, RL pipeline, score-driven verbosity tiers) — since v0.2.102 W6-M
+through ``weaviate_mcp.kg_host.host()``: the server module when one is already
+loaded, otherwise the light ``weaviate_mcp.kg_query_core`` host, which reads
+Weaviate over plain HTTP (``weaviate_mcp.kg_http``) instead of paying ~0.7 s
+to import weaviate-client + the MCP SDK on every hook run.
 
 Usage:
     python rl_kg_search.py "query text" [--limit 1]
 
 Output: human-readable text with title | type | score=X.XX | content,
 formatted per the score-driven tier system in
-claude_mcp_servers/weaviate_mcp/server.py (_get_result_verbosity_by_score and
+claude_mcp_servers/weaviate_mcp/kg_query_core.py (_get_result_verbosity_by_score and
 _format_result_by_tier).
 """
 import asyncio
@@ -25,8 +29,9 @@ from typing import Any
 # v0.2.100 F3: hooks in EVERY project now run THIS file from the orchestrator
 # root (located via VCT_ORCHESTRATOR_ROOT / VCT_INSTALL_ROOT), with cwd in the
 # calling project — so the cwd can no longer be assumed to be the root.
-# Identity is NOT taken from this file's location: `weaviate_mcp.server`
-# resolves the project from CLAUDE_PROJECT_DIR (the calling project), and the
+# Identity is NOT taken from this file's location: the KG host
+# (`weaviate_mcp.kg_query_core`, or the server when loaded) resolves the
+# project from CLAUDE_PROJECT_DIR (the calling project), and the
 # collections/permissions come from that project's hub config and env.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, ".."))
@@ -177,11 +182,25 @@ async def embed_hook_query(text: str, collection: str | None = None):
     model once its slot is complete (``weaviate_mcp.server._kg_search_vector``,
     which IS ``_get_search_vector`` in the steady state).
     """
-    from weaviate_mcp.server import KG_COLLECTION, _get_search_vector, _kg_search_vector
+    kg = _kg_host()
+    return await kg._kg_search_vector(
+        text, kg.KG_COLLECTION if collection is None else collection, task="hook_injection",
+        steady=kg._get_search_vector)
 
-    return await _kg_search_vector(
-        text, KG_COLLECTION if collection is None else collection, task="hook_injection",
-        steady=_get_search_vector)
+
+def _kg_host():
+    """The module the KG search reads its query/format code from (v0.2.102 W6-M).
+
+    ``weaviate_mcp.server`` whenever a server module is already loaded in this
+    process (a code-graph leg that imported it, the test suite — so every
+    ``patch("weaviate_mcp.server.X")`` still applies here); otherwise the light
+    ``weaviate_mcp.kg_query_core``, the SAME code moved out of the server, whose
+    Weaviate client is the plain-HTTP read adapter. One resolver, one home:
+    ``weaviate_mcp.kg_host.host``.
+    """
+    from weaviate_mcp.kg_host import host
+
+    return host("weaviate_mcp")
 
 
 def _rl_model_name(collection: str, default: str) -> str:
@@ -263,22 +282,24 @@ async def main():
     # + project_id propagation fixes). Caller still owns Weaviate fan-out
     # because the pipeline is intentionally orthogonal to retrieval
     # strategy.
-    from weaviate_mcp.server import (
-        get_weaviate_client,
-        _format_obj,
-        _enrich_with_adjacent_chunks,
-        _get_result_verbosity_by_score,
-        _format_result_by_tier,
-        _kg_collections_to_search,
-        _filter_cross_project_access,
-        _embedding_dim_for,
-        _collapse_to_one_per_node,
-        resolve_and_enrich_dual,
-        KG_COLLECTION,
-        EMBEDDING_SOURCE,
-        EMBEDDING_MODEL,
-        _RL_OVERFETCH,
-    )
+    # v0.2.102 W6-M: the same names, read off the KG host — the server module
+    # when one is loaded (identical to the former `from weaviate_mcp.server
+    # import …`), else the light `kg_query_core` (plain-HTTP Weaviate client).
+    kg = _kg_host()
+    get_weaviate_client = kg.get_weaviate_client
+    _format_obj = kg._format_obj
+    _enrich_with_adjacent_chunks = kg._enrich_with_adjacent_chunks
+    _get_result_verbosity_by_score = kg._get_result_verbosity_by_score
+    _format_result_by_tier = kg._format_result_by_tier
+    _kg_collections_to_search = kg._kg_collections_to_search
+    _filter_cross_project_access = kg._filter_cross_project_access
+    _embedding_dim_for = kg._embedding_dim_for
+    _collapse_to_one_per_node = kg._collapse_to_one_per_node
+    resolve_and_enrich_dual = kg.resolve_and_enrich_dual
+    KG_COLLECTION = kg.KG_COLLECTION
+    EMBEDDING_SOURCE = kg.EMBEDDING_SOURCE
+    EMBEDDING_MODEL = kg.EMBEDDING_MODEL
+    _RL_OVERFETCH = kg._RL_OVERFETCH
     from claude_mcp_servers.rl_client.search_pipeline import (
         RerankRequest,
         dual_log_request_fields,
@@ -420,7 +441,7 @@ async def main():
                 # F-G: attach the matched node's active-slot vector (mirrors the
                 # MCP emb-enrichment block). Soft-fail per result.
                 if q_vector is not None:
-                    from weaviate_mcp.server import _extract_obj_vector
+                    _extract_obj_vector = kg._extract_obj_vector
                     for r, obj in zip(coll_formatted, primary_objects):
                         try:
                             node_emb = _extract_obj_vector(obj, c_target)
@@ -526,9 +547,7 @@ async def main():
         dual_inputs = None
         if vector is not None:
             if oversized:
-                from weaviate_mcp.server import _dual_rl_log_expected
-
-                if _dual_rl_log_expected():
+                if kg._dual_rl_log_expected():
                     from vco_lib.rl_telemetry_loss import KIND_DUAL_SKIP, record_loss
 
                     record_loss(KIND_DUAL_SKIP, "oversized_query", task_type=task_type)
@@ -550,9 +569,7 @@ async def main():
                         query_task="hook_injection",
                     )
                 else:
-                    from weaviate_mcp.server import _rl_enrich_nodes_with_linked_embs
-
-                    _rl_enrich_nodes_with_linked_embs(
+                    kg._rl_enrich_nodes_with_linked_embs(
                         all_formatted, query_emb=vector, active_slot=query_target,
                         model_name=_rl_model_name(KG_COLLECTION, EMBEDDING_MODEL),
                     )
