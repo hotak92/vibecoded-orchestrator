@@ -52,7 +52,10 @@ from vco_lib import settings_merge
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS = REPO_ROOT / "templates" / "hooks"
 _PS = shutil.which("pwsh") or shutil.which("powershell")
-_LEAK_ENV_KEYS = ("CLAUDE_PROJECT_DIR", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+# CLAUDE_CONFIG_DIR: worktree-guard's record prune reads the user settings
+# from it (else ~/.claude); a developer's real value must not reach a test.
+_LEAK_ENV_KEYS = ("CLAUDE_PROJECT_DIR", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                  "CLAUDE_CONFIG_DIR")
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32", reason="bash flavour is POSIX-only; the pwsh arm runs where pwsh exists")

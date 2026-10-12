@@ -80,9 +80,11 @@ if (-not $EditedFile -or -not (Test-Path -LiteralPath $EditedFile -PathType Leaf
 #
 # ONE implementation, shared with the .sh sibling:
 # .claude/scripts/credscan_introduced.py (resolved from this hook's own
-# bundle, ../scripts, then $ProjectRoot/.claude/scripts). It owns the scope,
-# the marker test and the PEM body floor (>= 120 base64 chars; control flow
-# over a multi-line window, so it cannot live in the vocabulary).
+# bundle, ../scripts, then $ProjectRoot/.claude/scripts). It owns the scope
+# and the marker test. There is NO length / body floor: a PEM
+# `BEGIN ... PRIVATE KEY` line alerts whatever follows it (owner ruling
+# 2026-10-12: a secret may be short). Every vocabulary match is a finding
+# unless its own line carries the marker.
 #
 # PATTERN SOURCE (read this before adding a regex): the shapes are NOT
 # defined here. Both siblings read the SAME vocabulary from _lib/credshapes

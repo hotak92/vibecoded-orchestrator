@@ -14,8 +14,12 @@ every unrelated edit. Now:
 3. a line carrying the explicit marker ``vco-secret-scan: test-placeholder``
    (one home: ``vco_lib.credential_shapes.TEST_PLACEHOLDER_MARKER``) is a
    declared placeholder; nothing is inferred from how a value looks;
-4. a missing vocabulary still alerts loudly, the PEM body floor stays, and
-   the ledger gets a row for every finding.
+4. a missing vocabulary still alerts loudly, and the ledger gets a row for
+   every finding;
+5. (W6-T, owner ruling 2026-10-12) every ``BEGIN ... PRIVATE KEY`` marker
+   alerts whatever body follows it -- the v0.2.82 120-char body floor is gone
+   ("secrets may not just be keys ... potentially shorter than 120 chars");
+   only the explicit marker on the BEGIN line silences it.
 
 Both siblings are run for real and must agree.
 """
@@ -241,22 +245,74 @@ def test_missing_scan_helper_is_a_loud_alert(tmp_path, sibling):
     assert run.alerted and "UNAVAILABLE" in run.rows[-1]["patterns"], run.rows
 
 
+def test_sh_no_python_is_a_loud_alert(tmp_path):
+    """No interpreter = a broken install: the .sh must say the edit went
+    unscanned (parity with the .ps1 'no Python interpreter' alert), never
+    exit silently as if the edit were clean."""
+    proj = _project(tmp_path)
+    hooks = tmp_path / "hooks"
+    shutil.copytree(HOOKS, hooks)
+    # find-python.sh resolves nothing: $PY stays empty.
+    (hooks / "_lib" / "find-python.sh").write_text("PY=\n", encoding="utf-8")
+    target = proj / "src" / "a.py"
+    target.write_text("X = 1\n", encoding="utf-8")
+    run = _run("sh", proj, "Write",
+               {"file_path": str(target), "content": "X = 1\n"}, hooks)
+    assert "credential scanner UNAVAILABLE" in run.proc.stderr, run.proc.stderr
+    envelope = json.loads(run.proc.stdout)
+    assert "UNAVAILABLE" in envelope["hookSpecificOutput"]["additionalContext"]
+
+
 _PEM_HEAD = "-----BEGIN EC " + "PRIVATE KEY-----"
 _PEM_TAIL = "-----END EC " + "PRIVATE KEY-----"
 
 
 @pytest.mark.parametrize("sibling", SIBLINGS)
-@pytest.mark.parametrize("body, alerts", [("MHcCAQEE", False),
-                                          ("\n".join(["A" * 64] * 3), True)])
-def test_pem_body_floor_on_introduced_text(tmp_path, sibling, body, alerts):
+@pytest.mark.parametrize("body, tail", [
+    ("MHcCAQEE", True),                       # the secrets.rs-sized 13-char stub
+    ("", True),                               # no body at all
+    ("\n".join(["A" * 64] * 3), True),       # a full-size body
+    ("short", False),                         # no END line either
+], ids=["short-body", "empty-body", "full-body", "no-end"])
+def test_every_pem_marker_alerts(tmp_path, sibling, body, tail):
+    """No body-length floor: the BEGIN line alone is the finding."""
     proj = _project(tmp_path)
-    before = "X = 1\n"
-    ti = _edit(proj, before, "X = 1", f"X = 1\nK = '''{_PEM_HEAD}\n{body}\n"
-               f"{_PEM_TAIL}'''")
+    end = f"\n{_PEM_TAIL}" if tail else ""
+    ti = _edit(proj, "X = 1\n", "X = 1", f"X = 1\nK = '''{_PEM_HEAD}\n{body}{end}'''")
     run = _run(sibling, proj, "Edit", ti)
-    assert run.alerted is alerts, run.rows
-    if alerts:
-        assert run.rows[-1]["findings"][0]["id"] == "pem_private_key"
+    assert run.alerted, run.rows
+    assert run.rows[-1]["findings"] == [{"line": 2, "id": "pem_private_key", "label": "PEM private key"}]
+
+
+@pytest.mark.parametrize("sibling", SIBLINGS)
+def test_pem_marker_silenced_only_by_the_marker_on_its_line(tmp_path, sibling):
+    proj = _project(tmp_path)
+    ti = _edit(proj, "X = 1\n", "X = 1",
+               f"X = 1\nK = '''{_PEM_HEAD}  # {MARKER}\nMHcCAQEE\n{_PEM_TAIL}'''")
+    assert not _run(sibling, proj, "Edit", ti).alerted
+
+    proj2 = _project(tmp_path / "second")
+    ti2 = _edit(proj2, "X = 1\n", "X = 1",
+                f"X = 1\n# {MARKER}\nK = '''{_PEM_HEAD}\nMHcCAQEE  # {MARKER}\n{_PEM_TAIL}'''")
+    run = _run(sibling, proj2, "Edit", ti2)
+    assert run.alerted, "a marker on another line (before, or on the body) must not silence the BEGIN line"
+    assert [f["line"] for f in run.rows[-1]["findings"]] == [3]
+
+
+def test_no_body_floor_left_in_the_scan_helper():
+    """The floor's constants and gate are gone from the one implementation."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("credscan_introduced_w6t", SCRIPTS / "credscan_introduced.py")
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for gone in ("PEM_BODY_FLOOR", "PEM_WINDOW", "PEM_SHAPE_ID", "_pem_plausible"):
+        assert not hasattr(mod, gone), gone
+    import re
+    shapes = [("pem_private_key", "PEM private key", re.compile("BEGIN [A-Z0-9 ]*PRIVATE KEY"))]
+    text = f"{_PEM_HEAD}\n"
+    assert mod.scan_lines(text, [1], shapes, MARKER) == [
+        {"line": 1, "id": "pem_private_key", "label": "PEM private key"}]
 
 
 @pytest.mark.parametrize("sibling", SIBLINGS)

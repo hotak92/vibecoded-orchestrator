@@ -524,7 +524,10 @@ t_set_rejects_blob() {
     [ -f "$VCT_SECRETS_DIR/projects/sg/clean" ] || return 1
 
     # PEM → accepted WITHOUT --allow-multiline.
-    printf -- '-----BEGIN RSA PRIVATE KEY-----\nMIIE\nAAAA\n-----END RSA PRIVATE KEY-----' \
+    # The \n escapes are expanded by printf (the value is the format), as before.
+    local pem_fmt='-----BEGIN RSA PRIVATE KEY-----\nMIIE\nAAAA\n-----END RSA PRIVATE KEY-----'  # vco-secret-scan: test-placeholder
+    # shellcheck disable=SC2059
+    printf -- "$pem_fmt" \
         | "$VCT" set --project sg --key pemk 2>/dev/null || { echo "    PEM rejected without flag"; return 1; }
     [ -f "$VCT_SECRETS_DIR/projects/sg/pemk" ] || return 1
 

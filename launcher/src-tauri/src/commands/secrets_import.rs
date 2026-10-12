@@ -703,7 +703,7 @@ mod tests {
         let f = p.join("deploy_key");
         fs::write(
             &f,
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n-----END RSA PRIVATE KEY-----\n",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n-----END RSA PRIVATE KEY-----\n", // vco-secret-scan: test-placeholder
         )
         .unwrap();
         let got = read_whole_file_trimmed(&f, "deploy_key").unwrap();

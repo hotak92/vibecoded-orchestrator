@@ -118,6 +118,9 @@ if ($AgentId -and ($AgentId -match '^[A-Za-z0-9_-][A-Za-z0-9._-]*$')) {
 # worktree-guard record for this agent id while the guard is registered,
 # means the harness started the agent without a worktree (e.g. an
 # agent-teams teammate). Unknown definition / plugin-scoped type => no-op.
+# A record that outlived its reaped worktree still counts (a resumed agent):
+# Remove-WtrecStale keeps records until idle past max(30, cleanupPeriodDays)
+# + 30 days, and this lookup (Find-WtrecRecord) restarts the idle clock.
 # The decision lives in _lib/worktree-records.ps1 :: Test-WtrecIsolationSkipped,
 # shared with subagent-stop-reconcile's post-hoc alert (Layer 3b).
 $WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"

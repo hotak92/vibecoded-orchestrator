@@ -177,7 +177,9 @@ esac
 #     (plugin-scoped `a:b` types and --agents JSON definitions: unknown → no-op);
 #   * worktree-guard is registered in this project's settings (when it is
 #     parked, the harness makes the worktree itself and writes no record).
-# A record that outlived its reaped worktree still counts (a resumed agent).
+# A record that outlived its reaped worktree still counts (a resumed agent):
+# wtrec_prune keeps records until idle past max(30, cleanupPeriodDays) + 30
+# days, and this lookup (wtrec_find) restarts the idle clock.
 # The decision lives in _lib/worktree-records.sh :: wtrec_isolation_skipped,
 # shared with subagent-stop-reconcile's post-hoc alert (Layer 3b).
 if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then

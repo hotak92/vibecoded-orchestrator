@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn pem_is_legit_multiline() {
-        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n-----END RSA PRIVATE KEY-----";
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n-----END RSA PRIVATE KEY-----"; // vco-secret-scan: test-placeholder
         assert_eq!(is_single_line_secret(pem, false, "deploy_key"), Ok(()));
         assert_eq!(classify_secret_value(pem, "deploy_key"), "legit_multiline");
     }

@@ -26,7 +26,15 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 # See audit finding F6, 2026-04-30. _lib/find-python.sh sets $PY.
 # shellcheck source=_lib/find-python.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
-[ -z "${PY:-}" ] && exit 0  # No Python — silent no-op (security log skipped)
+if [ -z "${PY:-}" ]; then
+    # No Python = a BROKEN install, and an unscanned edit must not look like a
+    # clean one (loud-fail; parity with the .ps1 "credential scanner
+    # UNAVAILABLE (no Python interpreter)" alert). emit_additional_context
+    # needs Python too, so the fixed, escape-free envelope is printed directly.
+    echo "post-tool-security: credential scanner UNAVAILABLE (no Python interpreter) - edits are not being scanned" >&2
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"[Security alert] credential scanner UNAVAILABLE (no Python interpreter): this edit was NOT scanned for credentials. This is a broken VCO install - repair it with the orchestrator update."}}'
+    exit 0
+fi
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($1) are EMPTY because $CLAUDE_TOOL_ARG_FILE_PATH and
@@ -94,9 +102,10 @@ mkdir -p "$(dirname "$ALERT_LOG")"
 #
 # ONE implementation: .claude/scripts/credscan_introduced.py (resolved from
 # this hook's own bundle, ../scripts, then $PROJECT_ROOT/.claude/scripts),
-# shared with the .ps1 sibling. It owns the scope, the marker test and the
-# PEM body floor (>= 120 base64 chars; control flow over a multi-line
-# window, so it cannot live in the vocabulary).
+# shared with the .ps1 sibling. It owns the scope and the marker test. There
+# is NO length / body floor: a PEM `BEGIN ... PRIVATE KEY` line alerts
+# whatever follows it (owner ruling 2026-10-12: a secret may be short).
+# Every vocabulary match is a finding unless its own line carries the marker.
 #
 # PATTERN SOURCE (read this before adding a regex): the shapes are NOT
 # defined here. They come from the credential-shape vocabulary SSOT

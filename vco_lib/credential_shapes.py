@@ -352,11 +352,10 @@ SHAPES: Tuple[CredentialShape, ...] = (
             "content_scan": "BEGIN [A-Z0-9 ]*PRIVATE KEY",
         },
         note=(
-            "The >=120-char base64 BODY FLOOR that suppresses stub/pattern "
-            "files is CONTROL FLOW over a multi-line window, not vocabulary, "
-            "and grep -E cannot express it. It stays language-local in "
-            "post-tool-security.{sh,ps1}, exactly as the segment-split "
-            "predicate stays language-local in the env-key-needle SSOT."
+            "No body-length floor: every BEGIN ... PRIVATE KEY marker is a "
+            "finding unless its own line carries TEST_PLACEHOLDER_MARKER "
+            "(owner ruling 2026-10-12 removed the v0.2.82 120-char floor; "
+            "a secret may be short)."
         ),
     ),
     CredentialShape(
