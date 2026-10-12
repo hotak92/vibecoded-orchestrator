@@ -107,7 +107,7 @@ Get-CimInstance Win32_Process | Where-Object {
 
 ### Windows: `install.py --update` step 7c "seeding Weaviate" hangs at 40-50% (V52-AJ — FIXED in v0.2.52)
 
-**Symptom** (Windows + CPU-only, reported in v0.2.51 by users who configured `arctic` as their embedding via the launcher's Identity tab): `install.py --update` reaches step `7c/10 seeding Weaviate` and hangs for hours at 40-50% completion. The log shows `CI-10: full sync (context change: embedding=None→'qwen3', ...)` — using qwen3 (slow on CPU: ~30s/chunk) instead of the user-selected arctic.
+**Symptom** (Windows + CPU-only, reported in v0.2.51 by users who configured `arctic` as their embedding in the launcher — then the Identity tab's embedding selector, since v0.2.102 Preferences → **Embedding profile (global)**): `install.py --update` reaches step `7c/10 seeding Weaviate` and hangs for hours at 40-50% completion. The log shows `CI-10: full sync (context change: embedding=None→'qwen3', ...)` — using qwen3 (slow on CPU: ~30s/chunk) instead of the user-selected arctic.
 
 **Why it happened** (v0.2.51 root cause): `install.py` spawned `python sync_knowledge_graph.py` as a subprocess. The subprocess called `EmbeddingService.for_project()`, which read ONLY from `os.environ` (`ACTIVE_EMBEDDING` env var). It did NOT read `app_state.embedding.active_profile` from `launcher.db`, nor `.claude/settings.json`, nor `.claude/env`. Setting `ACTIVE_EMBEDDING=arctic` in `.claude/settings.json` had no effect — that file is read by Claude Code's MCP subprocesses, not by `install.py`'s sync subprocess.
 
@@ -117,7 +117,7 @@ Get-CimInstance Win32_Process | Where-Object {
 2. `EmbeddingService.for_project()` reads `launcher.db` as fallback when env unset (single canonical chain: env → launcher.db → `"qwen3"` default).
 3. This `docs/TROUBLESHOOTING.md` entry + `templates/ORCHESTRATOR-CLAUDE.md.template` documents the resolution chain so users + future Claude know which channel to use.
 
-**On v0.2.52+**: no action needed. Whatever you selected in the launcher's Identity tab → Embedding selector is what `install.py --update` will use. Setting `$env:ACTIVE_EMBEDDING` in PowerShell before running install.py still works as an override.
+**On v0.2.52+**: no action needed. Whatever you selected in the launcher's Preferences → **Embedding profile (global)** (the only embedding selector since v0.2.102 — one value for every project) is what `install.py --update` will use. Setting `$env:ACTIVE_EMBEDDING` in PowerShell before running install.py still works as an override.
 
 **Pre-v0.2.52 workaround** (if you're still on v0.2.51 and stuck): set the env var in your shell BEFORE running install.py:
 

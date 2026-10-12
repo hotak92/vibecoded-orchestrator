@@ -706,8 +706,9 @@ def kg_binding_keep_set() -> tuple[list[str], bool]:
 # Used by EmbeddingService.for_project() + install.py's subprocess env-thread
 # layer to resolve the active embedding profile when no env var is set.
 #
-# The launcher writes ``embedding.active_profile`` from the Identity tab's
-# embedding selector + on install.py's preset choice. Mirror constant:
+# The launcher writes ``embedding.active_profile`` from Preferences →
+# "Embedding profile (global)" — the only embedding selector since v0.2.102
+# (the per-project Identity-tab selector was removed). Mirror constant:
 #   launcher/src-tauri/src/commands/project_env_settings.rs
 #     ::APP_STATE_KEY_ACTIVE_EMBEDDING (canonical string: "embedding.active_profile")
 #

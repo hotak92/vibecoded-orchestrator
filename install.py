@@ -9955,8 +9955,8 @@ def _read_active_embedding_from_app_state() -> "str | None":
     """v0.2.52 V52-AJ: return the launcher's active embedding profile, or None.
 
     Reads ``app_state[embedding.active_profile]`` (canonical key written by
-    the launcher's Identity-tab embedding selector + install.py's preset
-    seeding). ``None`` when the DB / table / key is absent, the stored
+    the launcher's Preferences → "Embedding profile (global)" selector, the
+    only embedding selector since v0.2.102). ``None`` when the DB / table / key is absent, the stored
     value is empty after stripping, or any sqlite error fires (soft-fail
     throughout — callers treat ``None`` as "use env or default").
 
@@ -10152,7 +10152,7 @@ def _reconcile_install_active_embedding(
         or getattr(args, "low_resource", False)
         or getattr(args, "cpu_only", False)
     )
-    #   (b) a launcher.db embedding.active_profile value (GUI Identity tab)
+    #   (b) a launcher.db embedding.active_profile value (Preferences → Embedding profile (global))
     db_choice = _read_active_embedding_from_app_state()
     deliberate = cli_flag or bool(db_choice)
 

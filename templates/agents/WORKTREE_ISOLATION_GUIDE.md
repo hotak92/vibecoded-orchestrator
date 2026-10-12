@@ -34,9 +34,9 @@ Enable on agents that write source code:
 - `glm-implementer`, `glm-implementer-high`, `qwen-implementer`, `qwen-implementer-high`, `deepseek-implementer`, `kimi-implementer` (gateway module) — bounded, fully-specified code-fix lanes
 - `qwen-flash-sweeper` (gateway module) — fully-specified mechanical edits across named files
 
-NOT enabled (read-only or advisory agents). By rule: an agent whose only writes are report, spec or artifact documents — never source or config — is exempt; this list names every current exemption, and the frontmatter test in `tests/test_v02100_shipped_frontmatter_parses.py` holds the same set over write-capable agents (read-only agents such as `code-reviewer` have no Write/Edit tools and need no exemption):
+NOT enabled (read-only or advisory agents). By rule: an agent whose only writes are report, spec or artifact documents — never source or config — is exempt; this list names every current exemption, and the frontmatter test in `tests/test_v02100_shipped_frontmatter_parses.py` holds the same set over write-capable agents (an agent with no Write/Edit tool would need no exemption; since v0.2.102 `code-reviewer` carries Write for its report file, so it is listed like the others):
 - `planner` — planning only
-- `code-reviewer`, `code-explorer` — read-only research/review (`code-explorer` writes only its report file)
+- `code-reviewer`, `code-explorer` — review / research; each writes only its own report file, never source
 - `tester` — writes tests but low risk (tests go in tests/)
 - `doc-maintainer` — documentation
 - `kg-maintainer` — knowledge graph read/write to isolated state
