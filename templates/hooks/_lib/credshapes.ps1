@@ -113,3 +113,17 @@ function Get-CredShapeCombined {
     )
     (Get-CredShapes -Context $Context | ForEach-Object { $_.Re }) -join '|'
 }
+
+function Get-CredShapesTestPlaceholderMarker {
+    <#
+    .SYNOPSIS
+      The ONE explicit test-placeholder opt-out (owner ruling 2026-10-12).
+    .DESCRIPTION
+      A line carrying this text is a declared test fixture and a content
+      scanner does not report it. No heuristic on how a value looks - only
+      this marker, on the same line. MUST MATCH
+      vco_lib/credential_shapes.py::TEST_PLACEHOLDER_MARKER (pinned by
+      tests/test_credential_shapes_parity.py).
+    #>
+    'vco-secret-scan: test-placeholder'
+}

@@ -88,7 +88,7 @@ def test_fixture_contains_no_real_looking_token_literals():
 
     Guards against someone 'improving' the fixture with a captured real token.
     """
-    allowed_doc_key = "AKIAIOSFODNN7EXAMPLE"
+    allowed_doc_key = "AKIAIOSFODNN7EXAMPLE"  # vco-secret-scan: test-placeholder
     for case in _cases():
         text = case["text"]
         body = text.replace(allowed_doc_key, "")
@@ -403,7 +403,7 @@ def test_command_scan_is_strict_superset_of_lean_ctx_token_literal():
     probes += [
         "ATATT" + "A" * 24, "ghp_" + "A" * 12, "github_pat_" + "A" * 12,
         "ghs_" + "A" * 12, "glpat-" + "A" * 12, "xoxb-" + "A" * 12,
-        "AKIAIOSFODNN7EXAMPLE", "eyJ" + "A" * 30,
+        "AKIAIOSFODNN7EXAMPLE", "eyJ" + "A" * 30,  # vco-secret-scan: test-placeholder
         "curl -H 'X: ghp_" + "A" * 36 + "'",
     ]
     narrowed = [

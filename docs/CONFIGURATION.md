@@ -237,6 +237,22 @@ Secrets never live in env files or JSON configs. They live in the OS keychain (m
 
 Don't put PATs or API keys in `~/.claude.json` `env:` blocks — Claude Code's env loader does not expand `${VAR}` (anthropics/claude-code#2065, #4276), so embedded secrets would land in argv and become visible to `ps`.
 
+
+### Credential scan of your edits (`post-tool-security`)
+
+After every Edit / Write, the `post-tool-security` hook scans the text that call **introduced** for credential shapes (GitHub / GitLab / Slack / AWS / Atlassian / vendor `sk-…` keys, JWTs, PEM private keys, generic `SECRET=` / `API_KEY=` assignments — the `content_scan` context of `vco_lib/credential_shapes.py`):
+
+- **Edit**: the full lines the new text occupies in the file afterwards (a credential already on a line you changed is reported too); **MultiEdit**: each edit's new text; **Write**: the whole content written. A credential that was already in the file, on a line you did not touch, is not reported again. Files written by Bash commands are not covered (the hook is registered for Edit/Write).
+- A finding names the **project-relative path, the line number(s) and the shape** — never the value — in the desktop notification, in the `[Security alert]` note to the model, and in the ledger `.claude/logs/credential_alerts.jsonl` (one row per event: `file`, `patterns`, `findings: [{line, id, label}]`). The desktop notification is deduped for 6 h per identical finding; the ledger is not.
+- **Silencing a genuine test fixture**: put the marker `vco-secret-scan: test-placeholder` on the **same line** as the value, normally in a comment:
+
+  ```rust
+  let fixture = "ghp_<36 characters>"; // vco-secret-scan: test-placeholder
+  ```
+
+  That is the only opt-out. Nothing is inferred from how a value looks (a real password can look like `123456789`), and the marker covers its own line only. Formats without comments (JSON fixtures) cannot carry it; such a line alerts only when an edit introduces or changes it.
+- If the scanner cannot run (its vocabulary `_lib/credshapes.*` or its helper `.claude/scripts/credscan_introduced.py` is missing, or no Python is found by the `.ps1`), it raises a `credential scanner UNAVAILABLE` alert on every edit instead of passing silently. Re-run the bundle update to repair the install.
+
 ## Permission matrices
 
 The launcher enforces three independent cross-project access matrices, each backed by its own table in `launcher.db`. They do NOT share a default: **KG is default-GRANT**, the other two are **default-DENY**. Inspecting `launcher.db` (or reading Rust accessors) without this table in front of you invites the wrong assumption that everything is default-deny. The defaults are set on project add in `launcher/src-tauri/src/commands/project_state_populate.rs`.

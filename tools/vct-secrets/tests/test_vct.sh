@@ -562,7 +562,8 @@ t_recover_blob() {
     printf 'same-value'  > "$root/projects/rp/COLLIDE_SAME"; chmod 600 "$root/projects/rp/COLLIDE_SAME"
     printf 'standalone-v' > "$root/projects/rp/COLLIDE_DIFF"; chmod 600 "$root/projects/rp/COLLIDE_DIFF"
     # Blob: base token + same-collision + differ-collision + blob-only line.
-    printf 'ghp_BASE00000000000000000000000000000000\nCOLLIDE_SAME=same-value\nexport COLLIDE_DIFF=blob-differs\nBLOBONLY=fresh-secret\n' \
+    local base_pat='ghp_BASE00000000000000000000000000000000'  # vco-secret-scan: test-placeholder
+    printf '%s\nCOLLIDE_SAME=same-value\nexport COLLIDE_DIFF=blob-differs\nBLOBONLY=fresh-secret\n' "$base_pat" \
         > "$root/projects/rp/github_pat"
     chmod 600 "$root/projects/rp/github_pat"
     # A project folder for the canonical deferral.
@@ -578,7 +579,7 @@ t_recover_blob() {
         >"$TMP/rb.out" 2>"$TMP/rb.err" || { cat "$TMP/rb.err"; return 1; }
 
     # Base token rewritten to single-line.
-    [ "$(cat "$root/projects/rp/github_pat")" = "ghp_BASE00000000000000000000000000000000" ] \
+    [ "$(cat "$root/projects/rp/github_pat")" = "$base_pat" ] \
         || { echo "    base token not rewritten"; return 1; }
     # Blob-only key recovered.
     [ "$(cat "$root/projects/rp/BLOBONLY" 2>/dev/null)" = "fresh-secret" ] \
@@ -656,11 +657,12 @@ t_doctor_fix_shape() {
     local root="$TMP/dfstore"
     rm -rf "$root"; mkdir -p "$root/shared"
     export VCT_SECRETS_DIR="$root"
-    printf 'ghp_BASE00000000000000000000000000000000\nSIDEKEY=side-secret\n' > "$root/shared/github_pat"
+    local base_pat='ghp_BASE00000000000000000000000000000000'  # vco-secret-scan: test-placeholder
+    printf '%s\nSIDEKEY=side-secret\n' "$base_pat" > "$root/shared/github_pat"
     chmod 600 "$root/shared/github_pat"
     "$VCT" doctor --fix-shape >"$TMP/df.out" 2>"$TMP/df.err" || return 1
     # Base rewritten to the single-line token.
-    [ "$(cat "$root/shared/github_pat")" = "ghp_BASE00000000000000000000000000000000" ] \
+    [ "$(cat "$root/shared/github_pat")" = "$base_pat" ] \
         || { echo "    --fix-shape did not recover the blob"; return 1; }
     # Side key extracted.
     [ "$(cat "$root/shared/SIDEKEY" 2>/dev/null)" = "side-secret" ] || return 1

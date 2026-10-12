@@ -24,6 +24,7 @@ one that forgets the other trips CI.
 """
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
@@ -217,8 +218,11 @@ class TestShPemPlausibleBodyAndNotifyDedup:
         )
         _run_sh_scanner(tmp_path, FAKE_CLASSIC_PAT)
         alerts = _run_sh_scanner(tmp_path, FAKE_CLASSIC_PAT)
-        # JSONL: BOTH events logged (forensics never rate-limited).
-        assert alerts.count("GitHub token") == 2, alerts
+        # JSONL: BOTH events logged (forensics never rate-limited). One row
+        # per event; each row also carries the label inside its `findings`
+        # (v0.2.102 W6-N), so count rows, not label occurrences.
+        rows = [json.loads(ln) for ln in alerts.splitlines() if ln.strip()]
+        assert [r["patterns"] for r in rows] == ["GitHub token"] * 2, alerts
         # Toast: exactly ONE notify call across the two runs.
         n_calls = (
             len(calls.read_text(encoding="utf-8").splitlines())

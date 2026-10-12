@@ -34,7 +34,7 @@ from unittest import mock
 from vco_lib import vscode_settings as vs
 
 HOST_TOKEN = "dogfood-host-token-not-a-real-secret"
-ACCESS_TOKEN = "dogfood-oauth-access-token-synthetic"
+ACCESS_TOKEN = "dogfood-oauth-access-token-synthetic"  # vco-secret-scan: test-placeholder
 
 
 class _Endpoint(BaseHTTPRequestHandler):

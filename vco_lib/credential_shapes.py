@@ -135,7 +135,19 @@ __all__ = [
     "combined_pattern",
     "matching_labels",
     "is_credential_shaped_name",
+    "TEST_PLACEHOLDER_MARKER",
 ]
+
+#: The ONE explicit opt-out a content scanner honours (owner ruling
+#: 2026-10-12): a line carrying this text -- normally inside a comment, e.g.
+#: ``"ghp_..." // vco-secret-scan: test-placeholder`` -- is a declared test
+#: placeholder and is not reported. There is deliberately NO heuristic on how
+#: a value looks ("a real password could be 123456789"): only this marker, on
+#: the SAME line as the value, silences it. Mirrored as
+#: ``CREDSHAPES_TEST_PLACEHOLDER_MARKER`` in ``_lib/credshapes.sh`` and
+#: ``Get-CredShapesTestPlaceholderMarker`` in ``_lib/credshapes.ps1``; the
+#: parity test pins both to this value.
+TEST_PLACEHOLDER_MARKER = "vco-secret-scan: test-placeholder"
 
 #: The four haystacks, each with its own documented bias. A caller MUST name one.
 CONTEXTS: Tuple[str, ...] = ("repo_scan", "content_scan", "command_scan", "argv_name")

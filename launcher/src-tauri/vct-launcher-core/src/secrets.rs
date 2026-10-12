@@ -2696,7 +2696,7 @@ mod tests {
             },
             "user",
             "github_pat",
-            "ghp_0123456789abcdef0123456789abcdef0123",
+            "ghp_0123456789abcdef0123456789abcdef0123", // vco-secret-scan: test-placeholder
         );
     }
 
@@ -2726,7 +2726,7 @@ mod tests {
         let scope = SecretScope::Shared {
             project_id: "_user_shared_",
         };
-        set(scope, "user", "github_pat", "ghp_0123456789abcdef0123456789abcdef0123")
+        set(scope, "user", "github_pat", "ghp_0123456789abcdef0123456789abcdef0123") // vco-secret-scan: test-placeholder
             .expect("a hermetic write at the production tuple must succeed");
         assert!(get(scope, "user", "github_pat").unwrap().is_some());
         delete(scope, "user", "github_pat").expect("hermetic delete");
