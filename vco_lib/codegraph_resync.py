@@ -1813,11 +1813,13 @@ def _resolve_metadata_helpers():
 
 
 # Per-base config for the backfill: (path property, body property or None).
-# CodeModule gets is_test only (its `module_summary` is not a doc source).
+# CodeModule gets is_test only (its `module_summary` is not a doc source);
+# so does CodeAPI (v0.2.102 W6-O, schema edge 8_to_9 adds the property).
 _BACKFILL_BASES: dict = {
     "CodeFunction": ("file_path", "function_body"),
     "CodeClass": ("file_path", "class_body"),
     "CodeModule": ("path", None),
+    "CodeAPI": ("file_path", None),
 }
 
 
@@ -1860,6 +1862,7 @@ def _backfill_anchor_file_paths(
     prefix: str,
     *,
     counts: dict,
+    is_test_fn=None,
 ) -> tuple:
     """v0.2.82 (Task 4): PATCH `file_path` onto anchor-less CodeAPI/Interaction
     rows by resolving their stored reference to a file-anchored collection.
@@ -1910,6 +1913,16 @@ def _backfill_anchor_file_paths(
                 for ref_prop, target_prop in ref_specs
             ]
 
+            # Only when the class DECLARES is_test (edge 8_to_9 / the analyzer's
+            # ensure added it): an undeclared property would fail the whole
+            # PATCH and lose the anchor with it.
+            heal_is_test = False
+            if base == "CodeAPI" and is_test_fn is not None:
+                try:
+                    heal_is_test = "is_test" in {
+                        p.name for p in coll.config.get().properties}
+                except Exception:  # noqa: BLE001 — unreadable → anchor only
+                    heal_is_test = False
             updated = 0
             left = 0
             for obj in coll.iterator(
@@ -1923,10 +1936,17 @@ def _backfill_anchor_file_paths(
                 if not resolved_path:
                     left += 1
                     continue
+                patch: dict = {"file_path": resolved_path}
+                # v0.2.102 W6-O: CodeAPI's is_test is derived from file_path,
+                # so the row anchored here gets it in the same PATCH (the
+                # metadata half above ran first and skipped it: no path yet).
+                if heal_is_test and is_test_fn is not None:
+                    try:
+                        patch["is_test"] = bool(is_test_fn(resolved_path))
+                    except Exception:  # noqa: BLE001 — heuristic never wedges a patch
+                        pass
                 try:
-                    coll.data.update(
-                        uuid=obj.uuid, properties={"file_path": resolved_path},
-                    )
+                    coll.data.update(uuid=obj.uuid, properties=patch)
                     updated += 1
                 except Exception as exc:  # noqa: BLE001 — per-row soft-fail
                     logger.warning(
@@ -2111,7 +2131,7 @@ def backfill_codegraph_metadata(
         # totals are surfaced under reserved summary keys the CLI prints as a
         # machine-readable line.
         anchored, unresolvable = _backfill_anchor_file_paths(
-            client, prefix, counts=counts,
+            client, prefix, counts=counts, is_test_fn=is_test_fn,
         )
         counts["_file_path_backfilled"] = anchored
         counts["_file_path_unresolvable"] = unresolvable

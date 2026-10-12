@@ -12,6 +12,8 @@ same "add this skip-vectorized property if missing" loop:
      (v0.2.73 M1/M4);
   3. ``migrations/codegraph_collection/7_to_8.py`` — ``project`` on
      CodeInteraction + its backfill (v0.2.102 S16-4);
+     ``migrations/codegraph_collection/8_to_9.py`` — ``is_test`` on CodeAPI
+     + its backfill from the stored ``file_path`` (v0.2.102 W6-O);
   4. ``templates/scripts/analyze_code_graph.py`` — the ``_ensure_*_property``
      belt-and-suspenders helpers that fire on every analyze run (covering
      Weaviate-down windows the edges can't).
@@ -98,6 +100,9 @@ CODEGRAPH_PROPERTY_SPECS: Dict[str, Tuple[PropSpec, ...]] = {
     ),
     "CodeAPI": (
         ("embed_revision", "INT", _EMBED_REVISION_DESC),
+        # v0.2.102 W6-O (edge 8_to_9): test-fixture routes (19 of 22 VCO rows)
+        # were indistinguishable from production endpoints.
+        ("is_test", "BOOL", _IS_TEST_DESC),
     ),
     "CodeInteraction": (
         ("embed_revision", "INT", _EMBED_REVISION_DESC),

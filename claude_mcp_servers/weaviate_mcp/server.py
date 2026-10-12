@@ -8494,6 +8494,14 @@ from vco_lib.codegraph_references import (  # noqa: E402 — kept beside its exp
     dedup_ref_targets as _dedup_ref_targets,
     read_cross_reference as _read_cross_reference,
 )
+# v0.2.102 W6-O: both `imports` directions hide stored edges between modules of
+# languages that cannot import each other (a pre-W6-O analyzer resolved import
+# names by file stem across languages; the write pass never deletes edges).
+from vco_lib.codegraph_imports import (  # noqa: E402
+    filter_compatible_import_rows as _filter_compatible_import_rows,
+    import_edge_compatible as _import_edge_compatible,
+    row_language as _row_language,
+)
 # v0.2.94 W-WEAVIATE, same loud-fail rule (review LOW-2): the fixture-class
 # write guard was imported INSIDE `store_knowledge_node`'s broad `try`, so a
 # broken install surfaced as a generic "Error storing node" instead of the
@@ -8701,8 +8709,11 @@ def query_code_structure(
                         + _code_structure_not_found_hint(query_type, target, effective_project),
                     }, indent=2)
 
-                imports = _dedup_ref_targets(
-                    _read_cross_reference(module_rows[0], "imports"), ("path",)
+                imports = _filter_compatible_import_rows(
+                    module_rows[0].properties,
+                    _dedup_ref_targets(
+                        _read_cross_reference(module_rows[0], "imports"), ("path",)
+                    ),
                 )
                 results = [{"path": imp.properties.get("path"), "file_path": imp.properties.get("path", "")} for imp in imports]
 
@@ -8753,6 +8764,10 @@ def query_code_structure(
                         _wem.names_same_path(
                             (getattr(ref, "properties", None) or {}).get("path"),
                             target,
+                        )
+                        and _import_edge_compatible(
+                            _row_language(getattr(obj, "properties", None)),
+                            _row_language(getattr(ref, "properties", None)),
                         )
                         for ref in _read_cross_reference(obj, "imports")
                     )

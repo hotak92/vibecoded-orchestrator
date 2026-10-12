@@ -118,7 +118,13 @@ DEVELOPMENT_COLLECTION_SCHEMA_VERSION = 2
 #: ``migrations/codegraph_collection/7_to_8.py`` add_property's it and
 #: backfills the rows lacking a value with the prefix identity (per-row PATCH,
 #: resumable; NO drop, NO re-embed, no vector touched).
-CODEGRAPH_COLLECTION_SCHEMA_VERSION = 8
+#: v9: v0.2.102 W6-O — ``is_test`` (BOOL) on CodeAPI (19 of 22 VCO CodeAPI rows
+#: were test-fixture routes nothing could exclude). ADDITIVE + data-preserving:
+#: ``migrations/codegraph_collection/8_to_9.py`` add_property's it; the rows are
+#: backfilled data-side from their stored ``file_path``
+#: (``codegraph_resync.backfill_codegraph_metadata``, same as the v6 is_test) —
+#: NO drop, NO re-embed (``is_test`` is excluded from the content hash).
+CODEGRAPH_COLLECTION_SCHEMA_VERSION = 9
 
 # ===========================================================================
 # Layer 2 — KG node content schema (USER-CURATED — upgrade in place on bump)

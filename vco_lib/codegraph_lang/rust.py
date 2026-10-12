@@ -41,6 +41,18 @@ from vco_lib.codegraph_lang._shared import (
     scan_to_declaration_terminator,
 )
 
+_RUST_USE_RE = re.compile(r'\buse\s+([^;]+);')
+_RUST_MOD_DECL_RE = re.compile(r'^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(\w+)\s*;', re.MULTILINE)
+
+
+def regex_rust_imports(content_clean: str) -> List[str]:
+    """Regex fallback for a file the Rust grammar cannot parse: every ``use``
+    tree (multi-line ones too, whitespace-collapsed) then every out-of-line
+    ``mod x;`` as ``"mod x"`` — the same shapes the tree-sitter walker stores.
+    ``content_clean`` must already have its comments blanked."""
+    uses = [" ".join(m.group(1).split()) for m in _RUST_USE_RE.finditer(content_clean)]
+    return uses + [f"mod {m.group(1)}" for m in _RUST_MOD_DECL_RE.finditer(content_clean)]
+
 
 def _rust_methods_for_struct(
     content_clean: str,
@@ -364,9 +376,6 @@ def extract_rust_file(
     content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
     content_clean = blank_block_comments_preserving_lines(content_clean)
 
-    # use statements
-    imports = re.findall(r'use\s+([\w::{}, ]+);', content)
-
     # Types + functions: tree-sitter first (v0.2.102), regex fallback.
     # Records the storage loops below consume, whichever path produced them:
     #   types: (name, start_line, end_line, methods)
@@ -381,6 +390,10 @@ def extract_rust_file(
     # functions; the module row stays, as for a file under `#![cfg(test)]`.
     test_only_file = rust_file_is_test_only(file_path, repo_root)
     defs = None if test_only_file else extract_definitions("rust", content, origin=relative_path)
+    # Imports (v0.2.102 W6-O): `use` trees + out-of-line `mod x;` as "mod x",
+    # from the same parse when it ran (test-gated items excluded); the
+    # comment-stripped regex otherwise (a test-only file keeps its imports).
+    imports = defs.imports if defs is not None else regex_rust_imports(content_clean)
     if test_only_file:
         types, funcs = [], []
     elif defs is not None:

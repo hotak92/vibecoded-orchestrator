@@ -305,6 +305,13 @@ def _noisy_migrations_dir(root: Path) -> Path:
         "print('EDGE_APPLIED=1')\n"
         "sys.exit(0)\n"
     )
+    # v0.2.102 W6-O: canonical is v9 — the ladder also walks 8→9.
+    (d / "8_to_9.py").write_text(
+        "import sys\n"
+        "print('8_to_9: GuardPrefix_CodeAPI carries `is_test` (present or added)')\n"
+        "print('EDGE_APPLIED=1')\n"
+        "sys.exit(0)\n"
+    )
     return root / "migrations"
 
 

@@ -59,6 +59,7 @@ _ANALYZER_PATH = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 _EDGE_4_TO_5 = REPO_ROOT / "migrations" / "codegraph_collection" / "4_to_5.py"
 _EDGE_5_TO_6 = REPO_ROOT / "migrations" / "codegraph_collection" / "5_to_6.py"
 _EDGE_7_TO_8 = REPO_ROOT / "migrations" / "codegraph_collection" / "7_to_8.py"
+_EDGE_8_TO_9 = REPO_ROOT / "migrations" / "codegraph_collection" / "8_to_9.py"
 
 
 def _load_module(name: str, path: Path) -> types.ModuleType:
@@ -183,6 +184,7 @@ _EDGE_SUBSETS = (
     ("4_to_5", _EDGE_4_TO_5, "_V5_PROPS"),
     ("5_to_6", _EDGE_5_TO_6, "_V6_PROPS"),
     ("7_to_8", _EDGE_7_TO_8, "_V8_PROPS"),
+    ("8_to_9", _EDGE_8_TO_9, "_V9_PROPS"),
 )
 
 
@@ -398,20 +400,22 @@ def test_ensure_skips_present_props_and_absent_classes():
 
 
 def test_ensure_subset_filter_never_probes_out_of_scope_classes():
-    """5_to_6 shape: with the is_test/n_callers subset, CodeAPI and
-    CodeInteraction have no spec'd props → they are never even probed
-    (mirrors the pre-P2d edge, which never touched them)."""
+    """5_to_6 shape: with the is_test/n_callers subset, CodeInteraction has no
+    spec'd props → it is never even probed (mirrors the pre-P2d edge, which
+    never touched it). CodeAPI is in scope since v9 (W6-O: is_test on CodeAPI)
+    and receives is_test only."""
     probed: list = []
     colls = {f"P_{s}": _UnitColl() for s in CODEGRAPH_PROPERTY_SPECS}
     results = ensure_codegraph_properties(
         _client(colls, probed), "P", props_subset=("is_test", "n_callers")
     )
-    assert set(results) == {"P_CodeModule", "P_CodeClass", "P_CodeFunction"}
-    assert "P_CodeAPI" not in probed and "P_CodeInteraction" not in probed
+    assert set(results) == {"P_CodeModule", "P_CodeClass", "P_CodeFunction", "P_CodeAPI"}
+    assert "P_CodeInteraction" not in probed
     assert [p.name for p in colls["P_CodeFunction"].added] == [
         "is_test", "n_callers",
     ]
-    assert [p.name for p in colls["P_CodeAPI"].added] == []
+    assert [p.name for p in colls["P_CodeAPI"].added] == ["is_test"]
+    assert [p.name for p in colls["P_CodeInteraction"].added] == []
 
 
 def test_ensure_error_carries_failing_class():
