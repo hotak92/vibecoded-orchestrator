@@ -106,7 +106,9 @@ def test_canonical_version_helper() -> None:
     # 6_to_7.py (targeted delete_by_id; NO drop, NO re-embed, survivors untouched).
     # v0.2.102 S16-4: `project` on CodeInteraction → bumped 7→8 with
     # migrations/codegraph_collection/7_to_8.py (add_property + backfill only).
-    assert sv.canonical_version("codegraph_collection") == 8
+    # v0.2.102 W6-O: `is_test` on CodeAPI → bumped 8→9 with
+    # migrations/codegraph_collection/8_to_9.py (add_property only; data-side backfill).
+    assert sv.canonical_version("codegraph_collection") == 9
     assert sv.canonical_version("rl_events_payload_shape") == 3
     with pytest.raises(KeyError):
         sv.canonical_version("not_a_real_artifact_type")

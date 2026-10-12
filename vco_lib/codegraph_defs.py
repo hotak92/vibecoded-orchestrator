@@ -99,6 +99,10 @@ class Definitions:
     #: class name -> member method names (source order, de-duplicated), the
     #: union over every same-named declaration (Ruby reopening, Rust impls).
     methods: Dict[str, List[str]] = field(default_factory=dict)
+    #: import statements in source order, as the module row's
+    #: ``import_names`` stores them (v0.2.102 W6-O; Rust and shell walkers
+    #: only — see :mod:`vco_lib.codegraph_imports` for the resolution rules).
+    imports: List[str] = field(default_factory=list)
 
     def add_method(self, owner: str, name: str) -> None:
         names = self.methods.setdefault(owner, [])
@@ -528,9 +532,21 @@ def _rust_definitions(src: _Src, root) -> Definitions:  # noqa: ANN001
 
     def visit(node, anc):  # noqa: ANN001,ANN202
         t = node.type
-        if (t in ("mod_item", "impl_item", "function_item", *_RUST_TYPE_ITEMS)
+        if (t in ("mod_item", "impl_item", "function_item", "use_declaration", *_RUST_TYPE_ITEMS)
                 and _rust_is_test_gated(src, node, anc)):
             return False  # the whole subtree is test code
+        # W6-O imports: `use` trees (whitespace-collapsed, as the regex stored
+        # them) and out-of-line `mod x;` declarations as "mod x".
+        if t == "use_declaration":
+            arg = node.child_by_field_name("argument")
+            if arg is not None:
+                defs.imports.append(" ".join(src.text(arg).split()))
+            return False
+        if t == "mod_item" and node.child_by_field_name("body") is None:
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                defs.imports.append(f"mod {src.text(name_node)}")
+            return False
         if t in _RUST_TYPE_ITEMS:
             name_node = node.child_by_field_name("name")
             if name_node is not None:
@@ -1166,10 +1182,22 @@ def _lua_local_decl_line(src: _Src, root, name: str) -> Optional[int]:  # noqa: 
 # ---------------------------------------------------------------------------
 
 
+#: Shell commands that read another script into the current shell.
+SHELL_SOURCE_COMMANDS = frozenset({"source", "."})
+
+
 def _shell_definitions(src: _Src, root) -> Definitions:  # noqa: ANN001
     defs = Definitions()
 
     def visit(node, anc):  # noqa: ANN001,ANN202
+        # W6-O imports: only real `source`/`.` COMMANDS — comments, strings and
+        # heredoc bodies are other node types and never reach this branch.
+        if node.type == "command":
+            name_node = node.child_by_field_name("name")
+            args = node.children_by_field_name("argument")
+            if name_node is not None and args and src.text(name_node) in SHELL_SOURCE_COMMANDS:
+                defs.imports.append(src.text(args[0]))
+            return True
         if node.type == "function_definition":
             name_node = node.child_by_field_name("name")
             if name_node is not None:

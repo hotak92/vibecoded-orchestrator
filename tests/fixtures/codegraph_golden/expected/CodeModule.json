@@ -46,14 +46,11 @@
   },
   {
     "complexity": 2.0,
-    "content_hash": "2e11b5aee9476684bc1647358c898da9eb33c029d34bf7e8bbb256d825ab7358",
+    "content_hash": "f9cc480855489df59ecdba3e4484ae34199cf95a7465eec0e4687c58950c3e10",
     "embed_revision": 0,
     "file_hash": "6682e86a996a3b472dca2871e73691c4cc07c82f69189ad0f9cbbd50a5e4c149",
     "import_names": [
-      "set",
-      "./lib/common.sh",
-      "}",
-      "}"
+      "./lib/common.sh"
     ],
     "is_test": false,
     "language": "shell",

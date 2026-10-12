@@ -84,7 +84,7 @@ reviewed and accepted it. Do NOT regen to make a red test pass.
 
 Read this before treating a committed value as correct. **A golden snapshot
 records what the analyzer DOES, which is not always what it SHOULD do**, and
-this corpus has twice been found ratifying a real defect as expected
+this corpus has three times been found ratifying a real defect as expected
 behaviour:
 
 * v0.2.92 (Defect B): `engine.rs` declares `fn reset` twice and the snapshot
@@ -98,6 +98,13 @@ behaviour:
   blank line; the Rust trait's bodiless `fn reset(&mut self);` borrowed the
   `impl`'s braces; and two rows were minted from a `record` declaration and a
   `return new` statement while the file's one generic method had no row at all.
+* v0.2.102 (W6-O): `backup.sh`'s `import_names` were
+  `["set", "./lib/common.sh", "}", "}"]` — the shell regex read `. ` at a
+  sentence end in a comment (and `}` after `.`) as a `.` (source) command. Only
+  `./lib/common.sh` is sourced; both snapshots were regenerated for that one
+  row (`import_names` + its `content_hash`). The same regeneration added the
+  new `is_test: false` to every CodeAPI row (schema v9; the corpus lives under
+  `src/`, so none is a test). Nothing else moved.
   None of it was caught by a snapshot comparison, because the snapshot WAS the
   defect.
 

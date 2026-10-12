@@ -321,6 +321,10 @@ def _drive_single(analyzer_mod, inst, base, current, floor, stored_rev):
     coll.query.stored[det] = {
         "content_hash": stored_hash, "embed_revision": stored_rev,
         "total_chunks": 1,
+        # v0.2.102 W6-O: a post-v0.2.82 row carries its hash-excluded anchor
+        # metadata, so the skipped-row heal has nothing to add (a legacy row
+        # without it is covered by tests/test_v02102_w6o_codegraph_imports.py).
+        "file_path": "src/a.py", "is_test": False,
     }
     calls = {"n": 0}
 

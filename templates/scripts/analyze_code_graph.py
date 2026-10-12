@@ -509,11 +509,15 @@ try:
     # edges, shared with the MCP (`query_code_structure`) and the query CLI.
     from vco_lib.codegraph_references import (
         add_missing_reference_edges as _add_missing_reference_edges,
-        build_module_name_index as _build_module_name_index,
         build_short_name_index as _build_short_name_index,
         reference_target_uuids as _reference_target_uuids,
         resolve_base_class_targets as _resolve_base_class_targets,
-        resolve_import_target_path as _resolve_import_target_path,
+    )
+    # v0.2.102 W6-O: language-aware import → module resolution (one home).
+    from vco_lib.codegraph_imports import (
+        build_import_index as _build_import_index,
+        purge_incompatible_import_edges as _purge_incompatible_import_edges,
+        resolve_import_targets as _resolve_import_targets,
     )
 except ImportError as _exc:  # noqa: F841 — used in the message below
     sys.stderr.write(
@@ -2186,18 +2190,14 @@ class CodeGraphAnalyzer:
 
         # ── v0.2.73 (M1-prod): stamp `is_test` at the choke point ───────────
         # Pure path heuristic (see is_test_path — single home in
-        # code_ranking, IMPORTED directly above per R1/ruling #1). File-anchored
-        # collections only (Function/Class/Module); CodeAPI/CodeInteraction
-        # aren't file-anchored → skipped. `"is_test" not in props` (not a
-        # falsy check): False is a valid preset. Stamped BEFORE the chunk
-        # fan-out so `chunk_props = dict(props)` copies it to every chunk.
+        # code_ranking, IMPORTED directly above per R1/ruling #1). Function/
+        # Class/Module, and CodeAPI since v0.2.102 W6-O (test-fixture routes
+        # must be excludable); CodeInteraction has no is_test. `"is_test" not in
+        # props` (not a falsy check): False is a valid preset. Stamped BEFORE the
+        # chunk fan-out so `chunk_props = dict(props)` copies it to every chunk.
         if file_path_rel:
             coll_name = getattr(collection, "name", "") or ""
-            if (
-                coll_name.endswith("CodeFunction")
-                or coll_name.endswith("CodeClass")
-                or coll_name.endswith("CodeModule")
-            ):
+            if coll_name.endswith(("CodeFunction", "CodeClass", "CodeModule", "CodeAPI")):
                 props = insert_params.get("properties")
                 if isinstance(props, dict) and "is_test" not in props:
                     try:
@@ -2745,8 +2745,8 @@ class CodeGraphAnalyzer:
             slot = _active_code_vector_slot()
             slot = slot if slot in cache[name] else None
         fp = _guards.read_object_fingerprint(
-            collection, det_uuid, _EMBED_REVISION_PROP,
-            want_total_chunks=want_total_chunks, vector_slot=slot,
+            collection, det_uuid, _EMBED_REVISION_PROP, want_total_chunks=want_total_chunks,
+            vector_slot=slot, heal_props=_guards.anchor_heal_props_for(collection, self.__dict__.setdefault("_declared_props", {})),
         )
         if fp is not None and fp.get("vector_present") is False:
             fp["embed_revision"] = _EMBED_REVISION_VECTORLESS
@@ -2859,9 +2859,8 @@ class CodeGraphAnalyzer:
             if not props.get("content_hash"):
                 props["content_hash"] = content_hash
             self._embed_skip_fingerprint = {
-                "uuid": det_uuid,
-                "content_hash": content_hash,
-                "stored_total_chunks": fp.get("total_chunks"),
+                "uuid": det_uuid, "content_hash": content_hash,
+                "stored_total_chunks": fp.get("total_chunks"), "heal": fp.get("heal"),
             }
             return
 
@@ -2890,9 +2889,8 @@ class CodeGraphAnalyzer:
                 if not props.get("content_hash"):
                     props["content_hash"] = content_hash
                 self._embed_skip_fingerprint = {
-                    "uuid": det_uuid,
-                    "content_hash": content_hash,
-                    "stored_total_chunks": fp.get("total_chunks"),
+                    "uuid": det_uuid, "content_hash": content_hash,
+                    "stored_total_chunks": fp.get("total_chunks"), "heal": fp.get("heal"),
                 }
                 self._embed_revision_patched = (
                     getattr(self, "_embed_revision_patched", 0) + 1
@@ -2987,7 +2985,7 @@ class CodeGraphAnalyzer:
         # collection), empty stored hash — FALLS THROUGH to the normal
         # replace()/insert(). A read failure must never cause a stale index.
         props = insert_params.get("properties")
-        skip_replace = False
+        skip_replace, _heal = False, None
         # F3 (pre-gate audit): chunk-shrink detection. When the CANONICAL
         # (chunk 0) write of a Function/Class finds the stored row was chunked
         # into MORE chunks than this run is writing, the tail rows
@@ -3051,8 +3049,8 @@ class CodeGraphAnalyzer:
                 and _stash.get("uuid") == det_uuid
                 and _stash.get("content_hash") == content_hash
             ):
-                skip_replace = True
-                _stash_used = True
+                skip_replace = _stash_used = True
+                _heal = _stash.get("heal")  # W6-O: hash-excluded metadata
                 self._embed_skip_fingerprint = None
                 if _is_chunkable and props.get("chunk_num") in (0, None):
                     try:
@@ -3100,7 +3098,7 @@ class CodeGraphAnalyzer:
                         and fp["content_hash"] == content_hash
                         and fp["embed_revision"] == CODEGRAPH_EMBED_REVISION
                     ):
-                        skip_replace = True
+                        skip_replace, _heal = True, fp.get("heal")
 
         # F3: the entity shrank — delete the stale tail rows. Runs on BOTH the
         # skip and write paths (the cleanup itself soft-fails; see helper).
@@ -3120,6 +3118,7 @@ class CodeGraphAnalyzer:
             # (and the WP-C per-file reconcile) does NOT delete this live row
             # just because we skipped its write.
             _note_written_uuid(self, collection.name, det_uuid)
+            _guards.heal_skipped_row(collection, det_uuid, props, _heal)  # W6-O
             return det_uuid
 
         # v0.2.16 docstring (above) claimed ``replace()`` is upsert.
@@ -5548,7 +5547,7 @@ class CodeGraphAnalyzer:
         for _k, _uuid in self.module_cache.items():
             _p = _k[1] if isinstance(_k, tuple) and len(_k) == 2 else _k
             module_uuid_by_path[_p] = _uuid
-        module_name_to_path = _build_module_name_index(module_uuid_by_path)
+        import_index = _build_import_index(module_uuid_by_path, repo_root=getattr(self, "_analyze_repo_root", None))
 
         # --- 1. Function calls ---
         print("   Linking function calls...")
@@ -5797,16 +5796,13 @@ class CodeGraphAnalyzer:
                 continue
             imports_to_add: List[str] = []
             for imp_name in import_names:
-                target_path = _resolve_import_target_path(imp_name, module_name_to_path)
-                if target_path and target_path != mod_path:
+                for target_path in _resolve_import_targets(mod_path, imp_name, import_index):
                     target_uuid = module_uuid_by_path.get(target_path)  # C-12
                     if target_uuid:
                         imports_to_add.append(target_uuid)
 
-            # v0.2.92: one add-if-absent write per module. Worst live site
-            # (1518 beacons / 4 distinct targets) — BOTH multipliers apply:
-            # re-linked on every analyze, and several import names in one file
-            # routinely resolve to the same module row.
+            # v0.2.92: one add-if-absent write per module (re-linked on every
+            # analyze; several names in one file often resolve to one row).
             if imports_to_add:
                 try:
                     stats['imports'] += _add_missing_reference_edges(
@@ -5815,8 +5811,9 @@ class CodeGraphAnalyzer:
                 except Exception as e:
                     logger.debug(f"Failed to add import refs for {mod_path}: {e}")
 
-        # Counts are edges CREATED this pass (zeros on a no-op re-analyze).
-        print(f"   Done: {stats['calls']} call refs, {stats['extends']} extends refs, {stats['imports']} import refs")
+        stats['imports_deleted'] = _purge_incompatible_import_edges(  # W6-O: every walk drops wrong-language edges
+            getattr(self, "modules_collection", None), stored_import_refs, self.module_cache)
+        print(f"   Done: {stats['calls']} call refs, {stats['extends']} extends refs, {stats['imports']} import refs, {stats['imports_deleted']} wrong-language import refs deleted")
         return stats
 
     def _extract_annotation_type_names(self, annotation: Optional[ast.expr]) -> List[str]:

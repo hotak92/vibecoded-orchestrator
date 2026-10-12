@@ -60,6 +60,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 # LOUD-FAIL import (no fallback): a broken vco_lib install must surface. MUST
 # MATCH the sibling call site in vco_lib/project_init.py.
 from vco_lib.weaviate_vectors import clean_named_vector
+# v0.2.102 W6-O: the one language-compatibility rule for `imports` edges.
+from vco_lib.codegraph_imports import filter_compatible_import_rows
 
 # v0.2.91 (Decision #21): the CLI entry point below (--migrate-identity)
 # called `logging.basicConfig` directly with a hardcoded INFO level,
@@ -330,6 +332,13 @@ def _read_reference_targets(src_obj, base: str) -> Dict[str, List[str]]:
             if cross is None:
                 continue
             objs = getattr(cross, "objects", None) or []
+            if base == "CodeModule" and name == "imports":
+                # v0.2.102 W6-O review HIGH-1: a pre-W6-O wrong-language edge
+                # (both endpoint languages known and incompatible) is not
+                # carried into the copy — the analyzer would only delete it
+                # again. Unknown language on either side → kept.
+                objs = filter_compatible_import_rows(
+                    getattr(src_obj, "properties", None), objs)
             targets = [str(getattr(o, "uuid", "")) for o in objs]
             targets = [t for t in targets if t]
             if targets:

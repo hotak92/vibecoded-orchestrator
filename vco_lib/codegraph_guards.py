@@ -50,11 +50,14 @@ STAMP.
 """
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from vco_lib import git_meta
+
+logger = logging.getLogger(__name__)
 
 
 def provenance_line(
@@ -173,12 +176,91 @@ def _tally_read(collection: Any, det_uuid: str, vector_slot: Optional[str],
         tally["rows"][key] = present
 
 
+#: v0.2.102 W6-O: hash-EXCLUDED metadata a SKIPPED (content-identical) row
+#: still has to receive. ``file_path`` and ``is_test`` are excluded from the
+#: content hash (they never feed the vector), so a row written before the stamp
+#: existed hash-matches forever and the write that would stamp them never runs
+#: — measured: CodeAPI rows of a pre-v0.2.82 graph with ``file_path = null``
+#: whose route carries no ``handler`` reference for the anchor backfill to
+#: follow, and every CodeAPI row's ``is_test``. Scoped to the small classes
+#: whose rows predate these props; the read adds these names to the ONE
+#: fingerprint point-read (no extra request).
+ANCHOR_HEAL_PROPS: Dict[str, Tuple[str, ...]] = {
+    "CodeAPI": ("file_path", "is_test"),
+    "CodeInteraction": ("file_path",),
+}
+
+
+def anchor_heal_props_for(collection: Any,
+                          declared_cache: Optional[Dict[str, Any]] = None) -> Tuple[str, ...]:
+    """The :data:`ANCHOR_HEAL_PROPS` entry for ``collection``'s class.
+
+    With ``declared_cache`` (a dict the caller keeps for the run), only the
+    props the class actually DECLARES are returned: asking a fingerprint read
+    for an undeclared property fails the read, and a failed read falls through
+    to a full write that re-embeds (W6-O review LOW-5 — e.g. CodeAPI without
+    ``is_test`` when edge 8_to_9 was deferred and the analyzer's ensure
+    soft-failed). The class schema is read once per collection name and
+    cached; an unreadable schema yields ``()`` — no heal, never a failed read.
+    """
+    name = str(getattr(collection, "name", "") or "")
+    wanted: Tuple[str, ...] = ()
+    for suffix, props in ANCHOR_HEAL_PROPS.items():
+        if name.endswith(suffix):
+            wanted = props
+            break
+    if not wanted or declared_cache is None:
+        return wanted
+    if name not in declared_cache:
+        try:
+            declared_cache[name] = frozenset(
+                p.name for p in collection.config.get().properties)
+        except Exception as exc:  # noqa: BLE001 — unreadable schema → no heal
+            logger.debug("anchor heal: schema read on %s failed: %s", name, exc)
+            declared_cache[name] = frozenset()
+    declared = declared_cache[name]
+    return tuple(p for p in wanted if p in declared)
+
+
+def anchor_heal_patch(stored: Optional[Mapping[str, Any]], props: Any) -> Dict[str, Any]:
+    """PURE: the properties a skipped row lacks and this walk can supply.
+
+    Only a NULL/empty stored value is filled (a stored ``False`` is a value);
+    never overwrites. ``stored`` is the fingerprint's ``"heal"`` mapping —
+    ``None`` (props not read) yields ``{}``.
+    """
+    if not stored or not isinstance(props, dict):
+        return {}
+    patch: Dict[str, Any] = {}
+    for name, old in stored.items():
+        new = props.get(name)
+        if (old is None or old == "") and new is not None and new != "":
+            patch[name] = new
+    return patch
+
+
+def heal_skipped_row(collection: Any, det_uuid: str, props: Any,
+                     stored: Optional[Mapping[str, Any]]) -> bool:
+    """PATCH :func:`anchor_heal_patch` onto a skipped row. One ``data.update``
+    of metadata only (no vector, no tombstone); soft-fails. True on a write."""
+    patch = anchor_heal_patch(stored, props)
+    if not patch:
+        return False
+    try:
+        collection.data.update(uuid=det_uuid, properties=patch)
+        return True
+    except Exception as exc:  # noqa: BLE001 — metadata heal never wedges a walk
+        logger.debug("anchor heal on %s failed: %s", det_uuid, exc)
+        return False
+
+
 def read_object_fingerprint(
     collection: Any,
     det_uuid: str,
     embed_revision_prop: str,
     want_total_chunks: bool = False,
     vector_slot: Optional[str] = None,
+    heal_props: Sequence[str] = (),
 ) -> Optional[dict]:
     """Point-read an object's tombstone-skip fingerprint by UUID (I/O helper).
 
@@ -200,13 +282,17 @@ def read_object_fingerprint(
     the slot positively came back empty/missing, ``True`` when it holds a
     vector, ``None`` when the payload could not be judged. Omitted (default) →
     the read and the returned dict are exactly the pre-.102 ones.
+
+    v0.2.102 (W6-O): ``heal_props`` (:func:`anchor_heal_props_for`) rides the
+    SAME read and returns as ``"heal": {name: stored value}`` for
+    :func:`heal_skipped_row`. Empty (default) → no extra key, no extra prop.
     """
     try:
         query = getattr(collection, "query", None)
         fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
         if not callable(fetch_by_id):
             return None
-        read_props = ["content_hash", embed_revision_prop]
+        read_props = ["content_hash", embed_revision_prop, *heal_props]
         if want_total_chunks:
             read_props.append("total_chunks")
         if vector_slot:
@@ -230,6 +316,8 @@ def read_object_fingerprint(
             "embed_revision": existing_props.get(embed_revision_prop),
             "total_chunks": total_chunks,
         }
+        if heal_props:
+            fingerprint["heal"] = {p: existing_props.get(p) for p in heal_props}
         if vector_slot:
             fingerprint["vector_present"] = slot_vector_present(
                 getattr(existing, "vector", None), vector_slot,

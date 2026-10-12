@@ -181,6 +181,9 @@ from vco_lib.codegraph_references import (  # noqa: E402 — must follow the
     normalize_reference_targets,
     read_cross_reference,
 )
+# v0.2.102 W6-O: hide stored `imports` edges of a language the source module
+# cannot import (written by a pre-W6-O, language-blind resolver).
+from vco_lib.codegraph_imports import filter_compatible_import_rows  # noqa: E402
 
 # P1-D (2026-05-08): centralized access-matrix helper. `kg_access` lives at
 # <orchestrator>/claude_mcp_servers/scripts/kg_access.py; the editable install
@@ -1542,8 +1545,11 @@ class CodeGraphQuery:
                 # beacons on a single module). Printing them raw answers "what
                 # does X import?" with N copies of the same path.
                 _refs = response.objects[0].references or {}
-                imports = dedup_ref_targets(
-                    normalize_reference_targets(_refs.get("imports")), ("path",)
+                imports = filter_compatible_import_rows(
+                    response.objects[0].properties,
+                    dedup_ref_targets(
+                        normalize_reference_targets(_refs.get("imports")), ("path",)
+                    ),
                 )
 
                 if hook_format:

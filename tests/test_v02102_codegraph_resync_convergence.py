@@ -813,11 +813,13 @@ def test_runner_auto_applies_7_to_8_as_an_additive_edge_with_no_consent_deferral
     from vco_lib import schema_migration_runner as smr
     from vco_lib import schema_versions as sv
 
-    assert sv.canonical_version("codegraph_collection") == 8
+    # W6-O added the v9 edge (8_to_9, also additive): from v7 the runner walks both.
+    assert sv.canonical_version("codegraph_collection") == 9
     db = _launcher_db(tmp_path)
     for suffix in smr._CODEGRAPH_CLASS_SUFFIXES:
         avr.register_artifact_version(db, project_id="p1", artifact_type="codegraph_collection",
-                                      artifact_name=f"Acme_{suffix}", schema_version=8,
+                                      artifact_name=f"Acme_{suffix}",
+                                      schema_version=sv.canonical_version("codegraph_collection"),
                                       materialized_at=1)
     conn = sqlite3.connect(str(db))
     conn.execute("UPDATE artifact_schema_versions SET schema_version = 7"
@@ -838,14 +840,15 @@ def test_runner_auto_applies_7_to_8_as_an_additive_edge_with_no_consent_deferral
         artifact_names=names, weaviate_url="http://127.0.0.1:9",
         include_orchestrator_wide=False, now_ms=1)
 
-    assert applied and set(applied) == {"7_to_8.py"}
+    assert applied and set(applied) == {"7_to_8.py", "8_to_9.py"}
+    assert applied.index("7_to_8.py") < applied.index("8_to_9.py")
     assert not report.errors and not report.refused
     assert smr.build_deferral_entries(report) == []
     conn = sqlite3.connect(str(db))
     versions = conn.execute("SELECT DISTINCT schema_version FROM artifact_schema_versions"
                             " WHERE artifact_type='codegraph_collection'").fetchall()
     conn.close()
-    assert versions == [(8,)]
+    assert versions == [(9,)]
 
 
 def test_edge_header_is_derived_and_non_destructive():
@@ -855,7 +858,7 @@ def test_edge_header_is_derived_and_non_destructive():
     e78 = [e for e in edges if e.path.name == "7_to_8.py"]
     assert e78 and (e78[0].from_version, e78[0].to_version) == (7, 8)
     assert smr._verify_edge_classification(e78[0], derived=True, preserving_required=True) is None
-    assert smr._assert_contiguous(edges, start=edges[0].from_version, end=8) is None
+    assert smr._assert_contiguous(edges, start=edges[0].from_version, end=9) is None
 
 
 def test_adding_a_property_does_not_change_the_embedding_fingerprint():

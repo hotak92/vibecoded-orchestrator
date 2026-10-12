@@ -118,7 +118,10 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # one fingerprint seam — net 7157 -> 7027 (after the review round), re-pinned DOWNWARD.
 # v0.2.102 (W6-B2): the code-model decision moved behind
 # `vco_lib.code_embed_model` (two thin seams here) — net 7027 -> 7025, re-pinned DOWNWARD.
-_ANALYZER_LINES_MAX = 7025
+# v0.2.102 (W6-O): import resolution moved to `vco_lib.codegraph_imports` and the
+# skipped-row metadata heal to `vco_lib.codegraph_guards` (one-line seams here)
+# — net 7025 -> 7022, re-pinned DOWNWARD.
+_ANALYZER_LINES_MAX = 7022
 
 
 def _measure() -> int:
