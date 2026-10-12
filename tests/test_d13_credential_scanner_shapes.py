@@ -52,30 +52,32 @@ FAKE_CLASSIC_PAT = "ghp_" + ("c" * 36)
 FAKE_UNQUOTED_ENV = "API_KEY=" + ("d" * 40)
 # Legacy QUOTED generic secret (must still fire).
 FAKE_QUOTED_SECRET = 'API_KEY="' + ("e" * 40) + '"'
-# v0.2.82: PEM plausible-body rule. The STUB mirrors the secrets.rs
-# write-guard fixture shape (13-char body — a pattern literal, not a leak);
-# the PLAUSIBLE one has a >=256-char base64-ish body (real keys are >=1600).
+# PEM fixtures. v0.2.82 gated a PEM alert on a >=120-char base64 body; the
+# owner ruling of 2026-10-12 (W6-T) removed that floor -- "secrets may not just
+# be keys, but also passwords, ports, IPs, whatever, potentially shorter than
+# 120 chars" -- so EVERY `BEGIN ... PRIVATE KEY` marker alerts, the 13-char
+# secrets.rs write-guard stub shape included, unless its own line carries the
+# explicit `vco-secret-scan: test-placeholder` marker. The BEGIN lines below
+# carry it so scanning THIS file stays quiet; the hook sees only the string.
 PEM_STUB = (
-    "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n"
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n"  # vco-secret-scan: test-placeholder
     "-----END RSA PRIVATE KEY-----"
 )
 PEM_PLAUSIBLE = (
-    "-----BEGIN RSA PRIVATE KEY-----\n"
+    "-----BEGIN RSA PRIVATE KEY-----\n"  # vco-secret-scan: test-placeholder
     + ("M" * 64 + "\n") * 5
     + "-----END RSA PRIVATE KEY-----"
 )
 # v0.2.82 M2: a real EC SEC1 P-256 private key body is only ~164 base64 chars
-# (RSA bodies are >=1600). The earlier >=256 floor SILENTLY MISSED every EC key.
-# This synthetic EC-shaped body is 164 base64 chars (128 across two 64-char
-# lines + a 36-char tail) — deliberately BETWEEN the 120 floor (must alert) and
-# the old 256 floor (would NOT have alerted): the fail-without proof for M2.
+# (RSA bodies are >=1600); the earlier >=256 floor SILENTLY MISSED every EC key.
 PEM_EC_P256 = (
-    "-----BEGIN EC PRIVATE KEY-----\n"
+    "-----BEGIN EC PRIVATE KEY-----\n"  # vco-secret-scan: test-placeholder
     + ("M" * 64 + "\n") * 2
     + ("M" * 36 + "\n")
     + "-----END EC PRIVATE KEY-----"
 )
-
+# The stub with the explicit marker on its BEGIN line: the ONE way to silence it.
+PEM_STUB_MARKED = PEM_STUB.replace("-----\n", "----- # vco-secret-scan: test-placeholder\n", 1)
 
 def _run_sh_scanner(tmp_path: Path, file_body: str) -> str:
     """Write ``file_body`` to a temp file, run the .sh scanner over it via
@@ -174,32 +176,30 @@ class TestShScannerShapes:
 
 
 @pytest.mark.skipif(_IS_WINDOWS, reason="bash hook; .ps1 covered separately")
-class TestShPemPlausibleBodyAndNotifyDedup:
-    """v0.2.82: (a) PEM alerts require a plausible key body — pattern
-    literals / stub fixtures (secrets.rs write-guard test) must not alert
-    on every edit; (b) the desktop toast dedupes per (file, patterns) key
-    while the JSONL forensic log stays per-event."""
+class TestShPemNoBodyFloorAndNotifyDedup:
+    """(a) W6-T (owner ruling 2026-10-12): every PEM marker alerts, whatever
+    body follows it -- the v0.2.82 120-char body floor is gone; only the
+    explicit marker on the BEGIN line silences it. (b) the desktop toast
+    dedupes per (file, patterns) key while the JSONL forensic log stays
+    per-event."""
 
-    def test_pem_stub_body_does_not_alert(self, tmp_path):
-        # Fails on pre-v0.2.82 scanners (bare BEGIN-marker regex fired).
+    def test_pem_stub_body_alerts(self, tmp_path):
+        # Red under the v0.2.82 floor (a 13-char body was suppressed).
         alerts = _run_sh_scanner(tmp_path, PEM_STUB)
-        assert "PEM private key" not in alerts, alerts
+        assert "PEM private key" in alerts, alerts
 
     def test_pem_plausible_body_still_alerts(self, tmp_path):
-        # Leave-alone: a real-shaped key body must keep firing.
         alerts = _run_sh_scanner(tmp_path, PEM_PLAUSIBLE)
         assert "PEM private key" in alerts, alerts
 
     def test_pem_ec_p256_body_alerts(self, tmp_path):
-        # M2 fail-without: an EC SEC1 P-256 body (~164 base64 chars) PASSED
-        # SILENTLY at the old >=256 floor. At the 120 floor it MUST alert.
+        # M2: an EC SEC1 P-256 body (~164 base64 chars) must alert.
         alerts = _run_sh_scanner(tmp_path, PEM_EC_P256)
         assert "PEM private key" in alerts, alerts
 
-    def test_pem_stub_still_below_lowered_floor(self, tmp_path):
-        # Leave-alone under the lowered floor: the 13-char secrets.rs stub must
-        # STILL not alert even at the 120 floor (it is far below 120).
-        alerts = _run_sh_scanner(tmp_path, PEM_STUB)
+    def test_pem_stub_with_marker_on_its_line_is_silent(self, tmp_path):
+        # Leave-alone: the explicit marker is the only opt-out.
+        alerts = _run_sh_scanner(tmp_path, PEM_STUB_MARKED)
         assert "PEM private key" not in alerts, alerts
 
     def test_desktop_notify_deduped_but_jsonl_per_event(self, tmp_path):
@@ -1922,9 +1922,13 @@ class TestPs1ScannerParity:
         alerts = self._run_ps1(tmp_path, FAKE_UNQUOTED_ENV)
         assert "Generic secret (unquoted)" in alerts, alerts
 
-    def test_ps1_pem_stub_body_does_not_alert(self, tmp_path):
-        # v0.2.82 parity with the .sh plausible-body rule.
+    def test_ps1_pem_stub_body_alerts(self, tmp_path):
+        # W6-T parity with the .sh sibling: no body floor.
         alerts = self._run_ps1(tmp_path, PEM_STUB)
+        assert "PEM private key" in alerts, alerts
+
+    def test_ps1_pem_stub_with_marker_on_its_line_is_silent(self, tmp_path):
+        alerts = self._run_ps1(tmp_path, PEM_STUB_MARKED)
         assert "PEM private key" not in alerts, alerts
 
     def test_ps1_pem_plausible_body_still_alerts(self, tmp_path):
@@ -1932,8 +1936,8 @@ class TestPs1ScannerParity:
         assert "PEM private key" in alerts, alerts
 
     def test_ps1_pem_ec_p256_body_alerts(self, tmp_path):
-        # M2 parity: the EC SEC1 P-256 body (~164 chars) must alert at the
-        # lowered 120 floor on the Windows sibling too.
+        # M2 parity: the EC SEC1 P-256 body (~164 chars) must alert on the
+        # Windows sibling too.
         alerts = self._run_ps1(tmp_path, PEM_EC_P256)
         assert "PEM private key" in alerts, alerts
 

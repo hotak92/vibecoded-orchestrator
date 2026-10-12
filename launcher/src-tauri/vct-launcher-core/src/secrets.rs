@@ -3591,7 +3591,7 @@ mod tests {
         // LEAVE-ALONE: a legit multi-line PEM passes the allowlist under the
         // DEFAULT guard (no opt-out needed) and is written verbatim.
         let pem =
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n-----END RSA PRIVATE KEY-----";
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n-----END RSA PRIVATE KEY-----"; // vco-secret-scan: test-placeholder
         set(scope, "deploy", "deploy_key", pem).unwrap();
         assert_eq!(get(scope, "deploy", "deploy_key").unwrap().as_deref(), Some(pem));
     }

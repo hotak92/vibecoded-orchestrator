@@ -36,13 +36,19 @@ function Write-WtrecRecord([string]$root, [string]$name, [string]$mode, [string]
 }
 
 # Find-WtrecRecord: the record file for an agent id (wt-agent-<id>.json, else
-# wt-<id>.json), or "" when there is none.
+# wt-<id>.json), or "" when there is none. A found record's LastWriteTime is
+# bumped, so it tracks the agent's LAST activity (a resume's SubagentStart,
+# its SubagentStop) and Remove-WtrecStale's idle window counts from there.
+# Must match wtrec_find in the .sh sibling.
 function Find-WtrecRecord([string]$root, [string]$id) {
     if (-not (Test-WtrecName $id)) { return "" }
     $dir = Join-Path $root $script:WtrecSubdir
     foreach ($nm in @("wt-agent-$id.json", "wt-$id.json")) {
         $p = Join-Path $dir $nm
-        if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+        if (Test-Path -LiteralPath $p -PathType Leaf) {
+            try { [System.IO.File]::SetLastWriteTime($p, (Get-Date)) } catch { }
+            return $p
+        }
     }
     return ""
 }
@@ -121,14 +127,62 @@ function Set-WtrecStatus([string]$file, [string]$status, [string]$reason) {
     } catch { }
 }
 
-# Remove-WtrecStale: drop records and notices older than 30 days.
+# Get-WtrecCleanupDays: the largest valid `cleanupPeriodDays` (Claude Code's
+# transcript retention) from the user settings
+# ($env:CLAUDE_CONFIG_DIR, else ~/.claude) and the project's settings.json +
+# settings.local.json, floored at 30. Only that one key is read; a bool,
+# negative or non-number value is ignored. Must match the python block in
+# wtrec_prune (.sh sibling).
+function Get-WtrecCleanupDays([string]$root) {
+    $cfg = $env:CLAUDE_CONFIG_DIR
+    if (-not $cfg) { $cfg = Join-Path $HOME ".claude" }
+    $days = [double]30
+    $files = @((Join-Path $cfg "settings.json"),
+               (Join-Path (Join-Path $root ".claude") "settings.json"),
+               (Join-Path (Join-Path $root ".claude") "settings.local.json"))
+    foreach ($f in $files) {
+        if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
+        try {
+            $doc = Get-Content -LiteralPath $f -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch { continue }
+        if ($null -eq $doc -or $doc -isnot [System.Management.Automation.PSCustomObject]) { continue }
+        $prop = $doc.PSObject.Properties["cleanupPeriodDays"]
+        if ($null -eq $prop) { continue }
+        $v = $prop.Value
+        if ($null -eq $v -or $v -is [bool]) { continue }
+        # By type NAME: Windows PowerShell 5.1 may not have System.Numerics
+        # loaded, and a missing type literal would throw.
+        $numTypes = @("System.Byte", "System.Int16", "System.Int32", "System.Int64", "System.Single",
+                      "System.Double", "System.Decimal", "System.Numerics.BigInteger")
+        if ($numTypes -notcontains $v.GetType().FullName) { continue }
+        $fv = [double]::NaN
+        try { $fv = [double]$v } catch { }
+        if ([double]::IsNaN($fv) -or [double]::IsInfinity($fv) -or $fv -lt 0) { continue }
+        if ($fv -gt $days) { $days = $fv }
+    }
+    return $days
+}
+
+# Remove-WtrecStale: keep the directory bounded without breaking a resume.
+# Notices go after 30 days; records of ANY status go only once IDLE
+# (LastWriteTime - Find-WtrecRecord bumps it on every lookup) longer than
+# max(30, cleanupPeriodDays) + 30 days, so a resumed subagent still finds
+# its record. Must match wtrec_prune in the .sh sibling.
 function Remove-WtrecStale([string]$root) {
     $dir = Join-Path $root $script:WtrecSubdir
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return }
     try {
         $cut = (Get-Date).AddDays(-30)
         Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
-            Where-Object { ($_.Name -like 'wt-*.json' -or $_.Name -like 'notice-*.txt') -and $_.LastWriteTime -lt $cut } |
+            Where-Object { $_.Name -like 'notice-*.txt' -and $_.LastWriteTime -lt $cut } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch { }
+    try {
+        $window = (Get-WtrecCleanupDays $root) + 30
+        # An unrepresentable window (infinite / beyond DateTime) prunes nothing.
+        $recCut = (Get-Date).AddDays(-$window)
+        Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'wt-*.json' -and -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and $_.LastWriteTime -lt $recCut } |
             Remove-Item -Force -ErrorAction SilentlyContinue
     } catch { }
 }

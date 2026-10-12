@@ -65,11 +65,15 @@ with open(e["WTREC_OUT"], "w", encoding="utf-8") as fh:
 
 # wtrec_find PROJECT_ROOT AGENT_ID — print the record file for this agent
 # (`wt-agent-<id>.json`, else `wt-<id>.json`); return 1 when there is none.
+# A found record's mtime is bumped (`touch -c`), so the mtime tracks the
+# agent's LAST activity (a resume's SubagentStart, its SubagentStop) and
+# wtrec_prune's idle window counts from there, not from the launch.
 wtrec_find() {
     local root="$1" id="$2" f
     wtrec_valid_name "$id" || return 1
     for f in "$root/$WTREC_SUBDIR/wt-agent-$id.json" "$root/$WTREC_SUBDIR/wt-$id.json"; do
         if [ -f "$f" ]; then
+            touch -c "$f" 2>/dev/null || true
             printf '%s\n' "$f"
             return 0
         fi
@@ -135,7 +139,9 @@ wtrec_guard_registered() {
 # worktree-guard is registered, and the guard wrote no record for this agent
 # id. Anything unknown returns 1 — never guess an agent into a violation. A
 # record that outlived its reaped worktree still counts as isolated (a
-# resumed agent).
+# resumed agent): wtrec_prune keeps every record until it has been idle
+# longer than the resume window, and each lookup here (wtrec_find) restarts
+# that idle clock.
 wtrec_isolation_skipped() {
     local root="$1" id="$2" type="$3"
     case "$type" in ''|*:*) return 1 ;; esac
@@ -179,14 +185,66 @@ except Exception:
 ' 2>/dev/null || true
 }
 
-# wtrec_prune PROJECT_ROOT — drop records and notices older than 30 days, so
-# the directory stays bounded. A record outlives its worktree on purpose: a
-# resumed subagent's SubagentStart must still find it (isolation-check).
+# wtrec_prune PROJECT_ROOT — keep the directory bounded without breaking a
+# resume. A record outlives its worktree on purpose: a resumed subagent's
+# SubagentStart must still find it (isolation-check), or the skipped-isolation
+# warning and the Layer 3b worktree-violation alert fire for an agent the
+# guard DID isolate. So:
+#   * notices (one-shot, consumed at SubagentStart) go after 30 days;
+#   * records of ANY status go only once IDLE (mtime — wtrec_find bumps it on
+#     every lookup) longer than max(30, cleanupPeriodDays) + 30 days.
+#     `cleanupPeriodDays` is Claude Code's transcript retention (default 30):
+#     a subagent can be resumed while its transcript exists, and the extra 30
+#     days is margin. It is the ONLY key read, from
+#     ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json and the project's
+#     .claude/settings.json + settings.local.json; the largest valid value
+#     wins (a longer window only keeps records longer). A bool, negative or
+#     non-number value is ignored. Nothing else in those files is used or
+#     printed.
+#   * no python → no record is pruned (the window cannot be computed; a
+#     too-early prune is the defect, a few extra small files are not).
+# MUST MATCH Remove-WtrecStale in _lib/worktree-records.ps1.
 wtrec_prune() {
-    local d="$1/$WTREC_SUBDIR"
+    local root="$1" d="$1/$WTREC_SUBDIR"
     [ -d "$d" ] || return 0
-    find "$d" -maxdepth 1 -type f \( -name 'wt-*.json' -o -name 'notice-*.txt' \) -mtime +30 \
+    find "$d" -maxdepth 1 -type f -name 'notice-*.txt' -mtime +30 \
         -exec rm -f {} + 2>/dev/null || true
+    [ -n "${PY:-}" ] || return 0
+    WTREC_DIR="$d" WTREC_ROOT="$root" "$PY" -c '
+import json, math, os, time
+e = os.environ
+cfg = e.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+root = e["WTREC_ROOT"]
+days = 30.0
+for p in (os.path.join(cfg, "settings.json"),
+          os.path.join(root, ".claude", "settings.json"),
+          os.path.join(root, ".claude", "settings.local.json")):
+    try:
+        with open(p, encoding="utf-8-sig") as fh:
+            v = json.load(fh).get("cleanupPeriodDays")
+    except Exception:
+        continue
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        continue
+    try:
+        fv = float(v)
+    except OverflowError:
+        continue  # beyond a double: invalid (PowerShell cannot parse it either)
+    if math.isnan(fv) or math.isinf(fv) or fv < 0:
+        continue
+    days = max(days, fv)
+cut = time.time() - (days + 30.0) * 86400.0
+d = e["WTREC_DIR"]
+for n in os.listdir(d):
+    if not (n.startswith("wt-") and n.endswith(".json")):
+        continue
+    p = os.path.join(d, n)
+    try:
+        if os.path.isfile(p) and not os.path.islink(p) and os.path.getmtime(p) < cut:
+            os.remove(p)
+    except OSError:
+        pass
+' 2>/dev/null || true
 }
 
 # wtrec_reap PROJECT_ROOT AGENT_ID — remove the agent's worktree when it is

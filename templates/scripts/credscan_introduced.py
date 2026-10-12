@@ -23,7 +23,9 @@ edit. Now:
   ``vco-secret-scan: test-placeholder`` (the SSOT is
   ``vco_lib/credential_shapes.py::TEST_PLACEHOLDER_MARKER``; the caller passes
   the value from its own vocabulary mirror) is a declared test placeholder.
-  Nothing is inferred from how a value looks.
+  Nothing is inferred from how a value looks -- nor from its length: a
+  ``-----BEGIN ... PRIVATE KEY-----`` line alerts whatever body follows it
+  (the v0.2.82 120-char body floor is gone, owner ruling 2026-10-12).
 * **Never the value.** Findings are ``(line, shape id, label)`` and the
   project-relative path; no part of a matched value is ever printed.
 
@@ -51,16 +53,6 @@ import os
 import re
 import sys
 from typing import Dict, List, Optional, Sequence, Tuple
-
-#: The shape whose match is gated by a plausible key body (below).
-PEM_SHAPE_ID = "pem_private_key"
-
-#: v0.2.82: a PEM marker alerts only with a PLAUSIBLE body -- >= 120 base64
-#: chars before ``-----END`` within 8 KiB. A real EC SEC1 P-256 body is ~164
-#: chars; the secrets.rs write-guard stub is 13. Control flow over a
-#: multi-line window, not vocabulary, so it lives here, not in the SSOT.
-PEM_BODY_FLOOR = 120
-PEM_WINDOW = 8192
 
 Shape = Tuple[str, str, "re.Pattern[str]"]
 
@@ -104,20 +96,13 @@ def _span_lines(text: str, starts: List[int],
     return sorted(lines)
 
 
-def _pem_plausible(text: str, end: int) -> bool:
-    window = text[end:end + PEM_WINDOW]
-    stop = window.find("-----END")
-    body = window if stop < 0 else window[:stop]
-    return len(re.sub(r"[^A-Za-z0-9+/=]", "", body)) >= PEM_BODY_FLOOR
-
-
 def scan_lines(text: str, line_numbers: Sequence[int], shapes: Sequence[Shape],
                marker: str) -> List[Dict]:
     """Findings on the given 1-based lines of ``text``; a line carrying
-    ``marker`` is skipped. The PEM body is read from ``text`` past the
-    marker line (it spans the following lines)."""
+    ``marker`` is skipped. Every shape match is a finding -- a PEM
+    ``BEGIN ... PRIVATE KEY`` line included, whatever follows it (owner
+    ruling 2026-10-12: no body-length floor; a secret may be short)."""
     lines = text.split("\n")
-    starts = _line_starts(text)
     found: List[Dict] = []
     for n in line_numbers:
         if n < 1 or n > len(lines):
@@ -126,11 +111,7 @@ def scan_lines(text: str, line_numbers: Sequence[int], shapes: Sequence[Shape],
         if marker and marker in line:
             continue
         for shape_id, label, rx in shapes:
-            m = rx.search(line)
-            if not m:
-                continue
-            if shape_id == PEM_SHAPE_ID and not _pem_plausible(
-                    text, starts[n - 1] + m.end()):
+            if not rx.search(line):
                 continue
             found.append({"line": n, "id": shape_id, "label": label})
     return found
