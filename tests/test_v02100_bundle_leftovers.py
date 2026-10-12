@@ -448,6 +448,67 @@ class OnePredicateTests(_Base):
                        "templates/agents/_archive/old-helper.md"), calls)
 
 
+class RetiredGeneratedOutputTests(_Base):
+    """v0.2.102 W6-R item 10: `.claude/context/pruned-context-summary.md`, the
+    run-time output of the retired precompact_prune.py, is removed by the next
+    bundle UPDATE only when its bytes are provably that producer's output
+    (empty, or its one summary line). A non-empty match is backed up first;
+    any other content is the user's — untouched and unreported."""
+
+    REL = ".claude/context/pruned-context-summary.md"
+    SUMMARY = (b"*Stale context pruned (~512 tokens): Files read: `/a/b.py`, `/c.md`; "
+               b"2 search results. Re-read if needed.*")
+
+    def _seed(self, data: bytes) -> Path:
+        p = self.proj / self.REL
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return p
+
+    def test_generated_summary_is_backed_up_and_removed_on_update(self):
+        self._install(update_mode=False)
+        p = self._seed(self.SUMMARY)
+        result = self._install(update_mode=True)
+        self.assertFalse(p.exists())
+        self.assertTrue(p.parent.is_dir(), ".claude/context must stay")
+        self.assertEqual(result["generated_outputs_removed"], [self.REL])
+        self.assertTrue(any("retired VCO producers" in n for n in result.get("notes", [])))
+        backups = list((self.proj / ".claude/backups/bundle-adoptions").rglob(
+            "pruned-context-summary.md"))
+        self.assertEqual([b.read_bytes() for b in backups], [self.SUMMARY])
+
+    def test_empty_generated_file_is_removed_without_a_backup(self):
+        self._install(update_mode=False)
+        p = self._seed(b"")
+        result = self._install(update_mode=True)
+        self.assertFalse(p.exists())
+        self.assertEqual(result["generated_outputs_removed"], [self.REL])
+
+    def test_user_content_at_the_path_is_untouched_and_unreported(self):
+        self._install(update_mode=False)
+        for data in (b"# my notes\n", self.SUMMARY + b"\nmy own line\n", b"Re-read if needed."):
+            p = self._seed(data)
+            result = self._install(update_mode=True)
+            self.assertEqual(p.read_bytes(), data)
+            self.assertNotIn("generated_outputs_removed", result)
+
+    def test_first_install_and_dry_run_remove_nothing(self):
+        p = self._seed(self.SUMMARY)
+        self._install(update_mode=False)
+        self.assertTrue(p.exists())
+        result = self._install(update_mode=True, dry_run=True)
+        self.assertTrue(p.exists())
+        self.assertEqual(result["generated_outputs_removed"], [self.REL])
+
+    def test_shape_accepts_every_output_the_producer_could_write(self):
+        shape = bundle_leftovers.RETIRED_OUTPUTS[0].shape
+        for ok in (b"", self.SUMMARY, self.SUMMARY + b"\n", self.SUMMARY + b"\r\n",
+                   b"*Stale context pruned (~200 tokens): 3 command outputs. Re-read if needed.*"):
+            self.assertIsNotNone(shape.fullmatch(ok), ok)
+        for user in (b"\n\n", b"x", self.SUMMARY + b"\n\n", b"*Stale context pruned*"):
+            self.assertIsNone(shape.fullmatch(user), user)
+
+
 class LedgerMergeReadTests(unittest.TestCase):
     """F-W2-08(c): an entry a standalone Rust writer added to the Markdown is
     READ even when the JSON sidecar exists, so the next Python write keeps it."""

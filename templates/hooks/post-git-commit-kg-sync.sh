@@ -118,7 +118,28 @@ REVIEWER_CHAIN="$PROJECT_ROOT/.claude/scripts/kg_reviewer_backend.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_lib/find-python.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
-if [ -n "${PY:-}" ] && [ -f "$REVIEWER_CHAIN" ]; then
+# v0.2.102 W6-R (loud-fail rule): a missing python or a missing shipped chain
+# script is a BROKEN install. It is named on stderr, in kg-commit-review.log
+# and in this commit's kg-commit-reviews.jsonl row (`broken_install`) — this
+# hook runs async, so the log/ledger lines are the ones a user can find.
+BROKEN_INSTALL=""
+if [ -z "${PY:-}" ]; then
+    if [ -f "$SCRIPT_DIR/_lib/find-python.sh" ]; then
+        BROKEN_INSTALL="no Python interpreter found (_lib/find-python.sh resolved none)"
+    else
+        BROKEN_INSTALL="$SCRIPT_DIR/_lib/find-python.sh is missing, so no Python interpreter was resolved"
+    fi
+fi
+if [ ! -f "$REVIEWER_CHAIN" ]; then
+    BROKEN_INSTALL="${BROKEN_INSTALL:+$BROKEN_INSTALL; }$REVIEWER_CHAIN is missing"
+fi
+if [ -n "$BROKEN_INSTALL" ]; then
+    BROKEN_LINE="post-git-commit-kg-sync: broken install: $BROKEN_INSTALL - the KG reviewer runs the plain Haiku spawn without the backend fallback chain; repair it with the project's bundle update (launcher: project Settings -> Update bundle)"
+    printf '%s\n' "$BROKEN_LINE" >&2
+    printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BROKEN_LINE" \
+        >> "$LOG_DIR/kg-commit-review.log" 2>/dev/null || true
+fi
+if [ -z "$BROKEN_INSTALL" ]; then
     PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/vco-kg-reviewer.XXXXXX")"
     printf '%s' "$PROMPT" > "$PROMPT_FILE"
     # No --max-turns here: the turn budget is ONE knob owned by the chain
@@ -129,8 +150,11 @@ if [ -n "${PY:-}" ] && [ -f "$REVIEWER_CHAIN" ]; then
         >> "$LOG_DIR/kg-commit-review.log" 2>&1 &
     REVIEWER_PID=$!
 else
-    # Broken/partial install (python or the chain script missing): the
-    # pre-W6-K direct Haiku spawn. With no python this branch cannot ask
+    # Broken/partial install (python or the chain script missing), named
+    # above: the pre-W6-K direct Haiku spawn is KEPT so the commit is still
+    # reviewed. It hides nothing — the breakage is reported on every commit
+    # in three places before this spawn, and dropping the review would lose
+    # the KG update for no gain in visibility. With no python this branch cannot ask
     # the chain for the turn budget, so it mirrors it: the default 30 must
     # match DEFAULT_MAX_TURNS in .claude/scripts/kg_reviewer_backend.py, and
     # VCO_KG_REVIEW_MAX_TURNS must parse as resolve_max_turns() there does:
@@ -152,7 +176,13 @@ else
 fi
 
 # Log the event
-echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"commit\":\"${COMMIT_HASH}\",\"message\":\"${COMMIT_MSG}\",\"pid\":${REVIEWER_PID}}" \
+BROKEN_FIELD=""
+if [ -n "$BROKEN_INSTALL" ]; then
+    # JSON-escape the reason (paths may carry `\` or `"`); no python here.
+    BROKEN_ESC="$(printf '%s' "$BROKEN_INSTALL" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    BROKEN_FIELD=",\"broken_install\":\"${BROKEN_ESC}\""
+fi
+echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"commit\":\"${COMMIT_HASH}\",\"message\":\"${COMMIT_MSG}\",\"pid\":${REVIEWER_PID}${BROKEN_FIELD}}" \
     >> "$LOG_DIR/kg-commit-reviews.jsonl" 2>/dev/null || true
 
 # No stdout: PostToolUse plain stdout is dropped per the v2.1.x

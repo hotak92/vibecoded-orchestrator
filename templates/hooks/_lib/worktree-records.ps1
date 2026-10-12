@@ -47,6 +47,63 @@ function Find-WtrecRecord([string]$root, [string]$id) {
     return ""
 }
 
+# Get-WtrecAgentDefIsolation: the `isolation:` frontmatter value of the agent
+# definition whose `name` (else file stem) is $type, searched in
+# <project>/.claude/agents then ~/.claude/agents; "" when unknown or absent.
+# Must match wtrec_agent_def_isolation in the .sh sibling.
+function Get-WtrecAgentDefIsolation([string]$root, [string]$type) {
+    $roots = @((Join-Path (Join-Path $root ".claude") "agents"),
+               (Join-Path (Join-Path $HOME ".claude") "agents"))
+    foreach ($r in $roots) {
+        if (-not (Test-Path -LiteralPath $r -PathType Container)) { continue }
+        $files = Get-ChildItem -LiteralPath $r -Recurse -File -Filter "*.md" -ErrorAction SilentlyContinue | Sort-Object FullName
+        foreach ($f in $files) {
+            $text = ""
+            try { $text = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop } catch { continue }
+            $fm = @{}
+            if ($text -and $text.StartsWith("---")) {
+                $end = $text.IndexOf("`n---", 3)
+                if ($end -ge 0) {
+                    foreach ($line in ($text.Substring(3, $end - 3) -split "`r?`n")) {
+                        if ($line -match '^([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$') {
+                            $fm[$Matches[1]] = $Matches[2].Trim('"', "'")
+                        }
+                    }
+                }
+            }
+            $nm = if ($fm.ContainsKey("name")) { $fm["name"] } else { $f.BaseName }
+            if ($nm -eq $type) {
+                if ($fm.ContainsKey("isolation")) { return $fm["isolation"] }
+                return ""
+            }
+        }
+    }
+    return ""
+}
+
+# Test-WtrecGuardRegistered: worktree-guard registered in the project's
+# settings (when parked, the harness makes the worktree and no record exists).
+function Test-WtrecGuardRegistered([string]$root) {
+    foreach ($n in @("settings.json", "settings.local.json")) {
+        $p = Join-Path (Join-Path $root ".claude") $n
+        if ((Test-Path -LiteralPath $p -PathType Leaf) -and (Select-String -LiteralPath $p -Pattern 'worktree-guard\.' -Quiet -ErrorAction SilentlyContinue)) { return $true }
+    }
+    return $false
+}
+
+# Test-WtrecIsolationSkipped: $true only when it is DECIDABLE that this launch
+# skipped its isolation (definition found, not plugin-scoped, declares
+# `isolation: worktree`; guard registered; no record for this agent id).
+# Shared by subagent-start-isolation-check and subagent-stop-reconcile.
+# Must match wtrec_isolation_skipped in the .sh sibling.
+function Test-WtrecIsolationSkipped([string]$root, [string]$id, [string]$type) {
+    if (-not $type -or $type.Contains(":")) { return $false }
+    if (-not (Test-WtrecName $id)) { return $false }
+    if (Find-WtrecRecord $root $id) { return $false }
+    if (-not (Test-WtrecGuardRegistered $root)) { return $false }
+    return ((Get-WtrecAgentDefIsolation $root $type) -eq "worktree")
+}
+
 function Read-WtrecRecord([string]$file) {
     try { return (Get-Content -LiteralPath $file -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
 }

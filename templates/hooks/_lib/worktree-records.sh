@@ -21,7 +21,10 @@
 #                             (wtrec_reap) and records the outcome in `status`
 #   subagent-start-isolation-check
 #                             asks whether the guard handled this agent at all
-#                             (wtrec_find) to detect a skipped isolation
+#                             (wtrec_isolation_skipped) to detect a skipped
+#                             isolation; subagent-stop-reconcile asks the same
+#                             question, plus the record's mode, to decide its
+#                             post-hoc worktree-violation alert (Layer 3b)
 #
 # `name` is the WorktreeCreate identifier, `agent-<agent_id>` on the live
 # harness (Claude Code 2.1.285); lookups by agent_id try both spellings.
@@ -72,6 +75,74 @@ wtrec_find() {
         fi
     done
     return 1
+}
+
+# wtrec_agent_def_isolation PROJECT_ROOT AGENT_TYPE — print the `isolation:`
+# frontmatter value of the agent definition whose `name` (else file stem) is
+# AGENT_TYPE, searched in <project>/.claude/agents then ~/.claude/agents.
+# Prints "" when the definition is unknown or declares no isolation.
+wtrec_agent_def_isolation() {
+    [ -n "${PY:-}" ] || return 0
+    AGENT_TYPE_FOR_PY="$2" PROJECT_FOR_PY="$1" "$PY" -c '
+import os, re, sys
+from pathlib import Path
+want = os.environ["AGENT_TYPE_FOR_PY"]
+roots = [Path(os.environ["PROJECT_FOR_PY"]) / ".claude" / "agents",
+         Path.home() / ".claude" / "agents"]
+def front(p):
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    out = {}
+    for line in text[3:end].splitlines():
+        m = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$", line)
+        if m:
+            out[m.group(1)] = m.group(2).strip("\"'\''")
+    return out
+for root in roots:
+    if not root.is_dir():
+        continue
+    for p in sorted(root.rglob("*.md")):
+        fm = front(p)
+        if fm is None:
+            continue
+        if fm.get("name", p.stem) == want:
+            print(fm.get("isolation", ""))
+            sys.exit(0)
+' 2>/dev/null || true
+}
+
+# wtrec_guard_registered PROJECT_ROOT — 0 when worktree-guard is registered in
+# the project's settings. When it is parked, the harness makes the worktree
+# itself and the guard writes no record, so "no record" proves nothing.
+wtrec_guard_registered() {
+    local f
+    for f in "$1/.claude/settings.json" "$1/.claude/settings.local.json"; do
+        [ -f "$f" ] && grep -q 'worktree-guard\.' "$f" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# wtrec_isolation_skipped PROJECT_ROOT AGENT_ID AGENT_TYPE — 0 when it is
+# DECIDABLE that this launch skipped its isolation: the definition (found,
+# and not a plugin-scoped `a:b` type) declares `isolation: worktree`,
+# worktree-guard is registered, and the guard wrote no record for this agent
+# id. Anything unknown returns 1 — never guess an agent into a violation. A
+# record that outlived its reaped worktree still counts as isolated (a
+# resumed agent).
+wtrec_isolation_skipped() {
+    local root="$1" id="$2" type="$3"
+    case "$type" in ''|*:*) return 1 ;; esac
+    wtrec_valid_name "$id" || return 1
+    wtrec_find "$root" "$id" >/dev/null && return 1
+    wtrec_guard_registered "$root" || return 1
+    [ "$(wtrec_agent_def_isolation "$root" "$type")" = "worktree" ]
 }
 
 # wtrec_get FILE KEY — print one string field of a record ("" when absent).

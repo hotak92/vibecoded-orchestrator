@@ -860,7 +860,7 @@ def _fetch_node_chunks(
         )
         chunk_list: list[tuple[int, str]] = []
         for obj in objs:
-            cn = obj.properties.get("chunk_num", 0) or 0
+            cn = _whole_number(obj.properties.get("chunk_num", 0)) or 0
             chunk_list.append((cn, obj.properties.get("content", "") or ""))
         chunk_list.sort(key=lambda x: x[0])
         if max_chunks >= len(chunk_list):
@@ -1479,6 +1479,20 @@ def _parse_chunk_header(content: str) -> tuple[int, int] | None:
     return None
 
 
+def _whole_number(value):
+    """A whole-number float (``2.0``) as ``int``; anything else unchanged.
+
+    ``chunk_num`` / ``total_chunks`` are Weaviate ``number`` properties, and
+    both clients return a ``number`` as ``float`` (the weaviate-client path and
+    kg_http's ``_convert``), so a chunk count rendered as "2/2.0 chunks" and
+    reached int-only consumers as a float. Non-whole values (never written by
+    the chunker) and non-floats pass through untouched.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
 def _format_obj(obj, collection_name: str, distance: float | None = None) -> dict:
     """
     Format a Weaviate object into the standard result dict.
@@ -1503,8 +1517,8 @@ def _format_obj(obj, collection_name: str, distance: float | None = None) -> dic
     # So we read the property explicitly (preserving an explicit 0/None) and
     # normalise a missing/0 chunk to "chunk 1 of 1" at the END.
     parsed = _parse_chunk_header(content)
-    _raw_chunk_num = obj.properties.get("chunk_num")
-    _raw_total = obj.properties.get("total_chunks")
+    _raw_chunk_num = _whole_number(obj.properties.get("chunk_num"))
+    _raw_total = _whole_number(obj.properties.get("total_chunks"))
     chunk_number = (
         _raw_chunk_num if _raw_chunk_num not in (None, 0)
         else (parsed[0] if parsed else None)
