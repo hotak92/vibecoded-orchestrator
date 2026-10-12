@@ -334,24 +334,36 @@ mod tests {
 
     /// v0.2.102 R1 pin (owner 2026-10-07): the active/paused permission gate
     /// runs BEFORE the short value cache on EVERY resolve. A key cached while
-    /// active (real keychain — the cache is mock-inactive by design) is NOT
-    /// served once it is paused for the requester, even well inside the TTL.
-    /// Uses the real keychain under the hermetic test baton; cleans up.
+    /// active is NOT served once it is paused for the requester, even well
+    /// inside the TTL. Hermetic (W6-P): the test mock is the store and a TTL is
+    /// pinned, which turns the production value cache on above the mock.
     #[test]
     fn paused_secret_is_never_served_from_the_value_cache() {
-        let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
         let _state = crate::test_env::state_dir_guard_with(&[]);
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let _ttl = crate::secrets::TestValueCacheTtlGuard::new(std::time::Duration::from_secs(30));
         let db = Db::open_in_memory().unwrap();
         let scope = SecretScope::PerProject {
             project_id: "p-cachepin",
         };
         crate::secrets::set(scope, "vct-sec", "API_TOKEN", "v-cache-pin").unwrap();
 
-        // Populate the cross-request value cache with a Background resolve.
+        // Populate the cross-request value cache with a Background resolve,
+        // and prove it IS cached: a second resolve reads no store.
         assert!(matches!(
             resolve_module_secret(&db, "vct-sec", "API_TOKEN", "per-project", Some("p-cachepin")),
             SecretLookup::Value(v) if v == "v-cache-pin"
         ));
+        let reads = crate::secrets::for_tests::mock_read_count();
+        assert!(matches!(
+            resolve_module_secret(&db, "vct-sec", "API_TOKEN", "per-project", Some("p-cachepin")),
+            SecretLookup::Value(v) if v == "v-cache-pin"
+        ));
+        assert_eq!(
+            crate::secrets::for_tests::mock_read_count(),
+            reads,
+            "precondition: the value is served from the value cache"
+        );
 
         // Pause it for that requester: the gate must refuse BEFORE any cache
         // is consulted — `Inactive`, never a cached value.
@@ -367,7 +379,5 @@ mod tests {
             resolve_module_secret(&db, "vct-sec", "API_TOKEN", "per-project", Some("p-cachepin")),
             SecretLookup::Inactive
         ));
-
-        let _ = crate::secrets::delete(scope, "vct-sec", "API_TOKEN");
     }
 }
