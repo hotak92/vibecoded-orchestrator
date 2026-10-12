@@ -332,7 +332,7 @@ from .kg_query_core import (  # noqa: E402,F401 — re-export (block comment abo
     _resolve_shared_kg_write_disabled, _resolve_shared_kg_read_disabled,
     _parse_csv_env, _kg_peer_collections, _kg_collections_to_search,
     _own_project_id_for_access, _filter_cross_project_access,
-    _sanitize_collection_prefix, serialize_datetime, _parse_chunk_header, _format_obj,
+    _sanitize_collection_prefix, serialize_datetime, _parse_chunk_header, _whole_number, _format_obj,
     _fetch_adjacent_chunks, _enrich_with_adjacent_chunks, _collapse_to_one_per_node,
     _weaviate_host_port, EmbeddingService, NoEmbeddingBackendError,
     HAS_EMBEDDING_SERVICE, _user_home, _resolve_project_config, _HAS_PROJECT_CONFIG,
@@ -362,7 +362,7 @@ _kg_query_core.bind_into(globals(), (
     '_resolve_shared_kg_read_disabled', '_parse_csv_env', '_kg_peer_collections',
     '_kg_collections_to_search', '_own_project_id_for_access',
     '_filter_cross_project_access', '_sanitize_collection_prefix',
-    'serialize_datetime', '_parse_chunk_header', '_format_obj',
+    'serialize_datetime', '_parse_chunk_header', '_whole_number', '_format_obj',
     '_fetch_adjacent_chunks', '_enrich_with_adjacent_chunks',
     '_collapse_to_one_per_node', '_weaviate_host_port',
 ))

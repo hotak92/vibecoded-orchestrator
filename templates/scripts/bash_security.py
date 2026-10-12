@@ -189,6 +189,28 @@ _rule(
     r"\$\{?\w*(KEY|TOKEN|SECRET|PASS|CRED)\w*",
     "Expanding a secret-shaped env var (use vct-secrets)",
 )
+#: Credential FILE extensions — the ONE list. A path holding ``.<ext>`` followed
+#: by a non-word character or its end (``.env``, ``.env.local``, ``x.netrc``)
+#: is a credential file. Read by the ``read_env_files`` / ``ps_read_env_files``
+#: rules below and, through :func:`credential_file_globs` (CLI
+#: ``--credential-file-globs``), by worktree-guard's no-commits snapshot, which
+#: must not copy such files into a snapshot commit (v0.2.102 W6-R).
+CREDENTIAL_FILE_EXTENSIONS: tuple[str, ...] = ("env", "credentials", "netrc", "pgpass")
+_CRED_EXT_ALT = "|".join(CREDENTIAL_FILE_EXTENSIONS)
+
+
+def credential_file_globs() -> list[str]:
+    """git ``:(glob)`` patterns matching exactly the paths the
+    ``\\.(<ext>)\\b`` credential-file test matches: ``**/*.<ext>`` (the
+    extension ends the name) and ``**/*.<ext>[!A-Za-z0-9_]*`` (a non-word
+    character follows it). ``*`` matches a leading dot in git's wildmatch, so
+    ``**/*.env`` covers a bare ``.env`` too."""
+    out: list[str] = []
+    for ext in CREDENTIAL_FILE_EXTENSIONS:
+        out += [f"**/*.{ext}", f"**/*.{ext}[!A-Za-z0-9_]*"]
+    return out
+
+
 _rule(
     "read_env_files",
     # v0.2.76 (R6b): match `cat <credential-file>` (a READ), not `cat > x.env`
@@ -196,7 +218,7 @@ _rule(
     # a compound. The negative lookahead `(?![^;&|\n]*>)` rejects a redirect
     # between `cat` and the extension; `[^;&|\n]*` keeps the filename inside the
     # same simple command. `cat ~/.env` / `cat .env.local` still match.
-    r"cat\s+(?![^;&|\n]*>)[^;&|\n]*\.(env|credentials|netrc|pgpass)\b",
+    rf"cat\s+(?![^;&|\n]*>)[^;&|\n]*\.({_CRED_EXT_ALT})\b",
     "Reading credential files",
 )
 
@@ -1110,7 +1132,7 @@ _ps_rule(
 )
 _ps_rule(
     "ps_read_env_files",
-    r"\b(?:get-content|gc|cat|type)\s+[^;|>]*\.(?:env|credentials|netrc|pgpass)\b",
+    rf"\b(?:get-content|gc|cat|type)\s+[^;|>]*\.(?:{_CRED_EXT_ALT})\b",
     "Reading credential files",
 )
 _ps_rule(
@@ -1258,6 +1280,10 @@ def main() -> int:
     # Accept command from argument or stdin; `--shell powershell` (first
     # arguments) selects the PowerShell rule set too.
     args = sys.argv[1:]
+    if args == ["--credential-file-globs"]:
+        # One glob per line (worktree-guard's snapshot exclusion).
+        print("\n".join(credential_file_globs()))
+        return 0
     shell = "bash"
     if len(args) >= 2 and args[0] == "--shell" and args[1] in SHELLS:
         shell = args[1]

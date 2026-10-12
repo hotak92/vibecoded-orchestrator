@@ -291,7 +291,8 @@ def test_every_moved_function_is_one_code_object_bound_to_server():
         if isinstance(obj, types.FunctionType) and obj.__module__ == core.__name__
         and name not in EMBEDDINGS_MOVED + LIGHT_ONLY and not name.startswith("__")
     ]
-    assert len(moved) == 37, moved
+    # 37 moved by W6-M + `_whole_number` (v0.2.102 W6-R, chunk-count ints).
+    assert len(moved) == 38, moved
     for name in moved:
         fn = getattr(server, name)
         assert _same_code(fn, getattr(core, name)), name
@@ -527,8 +528,10 @@ def test_hook_output_is_byte_identical_across_the_two_transports(
         tmp_path, fake_weaviate, monkeypatch, capsys):
     light = _light_run(tmp_path, fake_weaviate)
     via_server = _server_run(tmp_path, monkeypatch, capsys)
-    # (``2/2.0``: v4 returns ``number`` properties as float — the live format.)
-    assert "KG: Alpha node | concept | score=0.80 | FULL NODE (2/2.0 chunks):" in via_server
+    # v4 (and kg_http) return ``number`` properties as float; v0.2.102 W6-R
+    # normalises whole-number chunk counts in ``_format_obj``, so both
+    # transports render ``2/2`` (was ``2/2.0``).
+    assert "KG: Alpha node | concept | score=0.80 | FULL NODE (2/2 chunks):" in via_server
     assert "Alpha second chunk body." in via_server  # the chunk fetch ran
     assert "KG: Beta node | pattern | score=0.60 | 1 CHUNK:" in via_server
     assert light["stdout"] == via_server

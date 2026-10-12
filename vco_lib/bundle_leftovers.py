@@ -37,10 +37,19 @@ completed action — nothing is pending):
   bytes differ from what VCO shipped is backed up first. Both are reported.
   At the orchestrator root those paths ARE the live compose files, so the
   caller only drops their manifest entries there and never calls this.
+
+* :func:`retire_generated_outputs` — v0.2.102 (W6-R): a file VCO did not
+  SHIP but GENERATED at run time, whose producer has been retired, is left
+  behind by every rule above (it was never in the manifest and matches no
+  shipped template). Each such output is DECLARED in :data:`RETIRED_OUTPUTS`
+  with the exact byte shape its producer wrote; a file at that path is
+  removed only when its bytes match that shape (a non-empty one is backed up
+  first). Anything else at the path is the user's: untouched, unreported.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Optional
@@ -48,12 +57,50 @@ from typing import Callable, Iterable, Optional
 __all__ = [
     "COMPOSE_BUCKET",
     "LeftoverOutcome",
+    "RETIRED_OUTPUTS",
+    "RetiredOutput",
     "is_compose_copy",
     "remove_vco_leftovers",
     "retire_compose_copies",
     "retire_disabled_orphan",
+    "retire_generated_outputs",
     "run_leftover_policy",
 ]
+
+
+@dataclass(frozen=True)
+class RetiredOutput:
+    """One run-time output of a retired VCO producer.
+
+    ``shape`` must fullmatch the file's WHOLE bytes for the file to count as
+    VCO-generated — the producer's every possible output, nothing wider.
+    """
+
+    rel: str
+    producer: str
+    retired_in: str
+    shape: "re.Pattern[bytes]"
+
+
+#: The declared retired outputs. State-keyed like the hook-retirement table
+#: (``vco_lib.hook_retirements``): the bytes on disk decide, never "what
+#: changed since the last release", so a project several releases behind gets
+#: the same answer.
+RETIRED_OUTPUTS: tuple = (
+    # precompact_prune.py (PreCompact; removed in 0.2.102 W6-K) rewrote this
+    # file on every compaction with either nothing (`write_text("")`) or ONE
+    # line, no trailing newline:
+    #   *Stale context pruned (~<n> tokens): <parts>. Re-read if needed.*
+    # Nothing reads it any more. One trailing newline is tolerated (an editor
+    # that opened and saved it unchanged); any other content is the user's.
+    RetiredOutput(
+        rel=".claude/context/pruned-context-summary.md",
+        producer="templates/scripts/precompact_prune.py",
+        retired_in="0.2.102",
+        shape=re.compile(
+            rb"(?:\*Stale context pruned \(~\d+ tokens\): [^\r\n]*\. Re-read if needed\.\*)?(?:\r?\n)?"),
+    ),
+)
 
 #: The destination bucket the bundle used to fill with compose copies.
 COMPOSE_BUCKET = "infrastructure/"
@@ -171,10 +218,12 @@ def _md_render(root: Path, folder: Path, dest_rel: str) -> Optional[Callable[[by
     return lambda raw: transform.render(raw)[0]
 
 
-def _backup_and_remove(folder: Path, dest_rel: str, ts: str, *, backup: bool) -> Optional[str]:
+def _backup_and_remove(folder: Path, dest_rel: str, ts: str, *, backup: bool,
+                       prune: bool = True) -> Optional[str]:
     """Back ``dest_rel`` up (when asked) THEN unlink it; prune now-empty
-    parents. Raises on any failure BEFORE the unlink — never removes bytes
-    without the captured copy the caller promised."""
+    parents unless ``prune=False`` (a directory hooks write into, such as
+    ``.claude/context``, stays). Raises on any failure BEFORE the unlink —
+    never removes bytes without the captured copy the caller promised."""
     from vco_lib.fs_prune import prune_now_empty_parents
     from vco_lib.project_init import _backup_bytes_for_adoption  # the patch point
 
@@ -183,7 +232,8 @@ def _backup_and_remove(folder: Path, dest_rel: str, ts: str, *, backup: bool) ->
     if backup:
         backup_rel = _backup_bytes_for_adoption(folder, dest_rel, ts, target.read_bytes())
     target.unlink()
-    prune_now_empty_parents(folder, target.parent)
+    if prune:
+        prune_now_empty_parents(folder, target.parent)
     return backup_rel
 
 
@@ -370,6 +420,45 @@ def retire_compose_copies(
     return outcome
 
 
+def retire_generated_outputs(
+    folder: Path,
+    *,
+    backup_ts: Callable[[], str],
+    dry_run: bool = False,
+    outputs: Iterable[RetiredOutput] = RETIRED_OUTPUTS,
+) -> LeftoverOutcome:
+    """Remove every declared retired output whose bytes are provably the
+    retired producer's (see :data:`RETIRED_OUTPUTS`). A non-empty match is
+    backed up under ``.claude/backups/bundle-adoptions/<ts>/`` first; an
+    unreadable file or a backup failure leaves the file in place (reported
+    as an error). A file of any other shape is the user's and is left alone."""
+    outcome = LeftoverOutcome()
+    folder = Path(folder)
+    for out in outputs:
+        target = folder / out.rel
+        if target.is_symlink() or not target.is_file():
+            continue
+        try:
+            data = target.read_bytes()
+        except OSError:
+            continue
+        if not out.shape.fullmatch(data):
+            continue  # the user's content — untouched, unreported
+        detail = (f"written by `{out.producer}`, retired in VCO {out.retired_in}; "
+                  "nothing reads it any more")
+        if dry_run:
+            outcome.removed.append((out.rel, None, detail))
+            continue
+        try:
+            backup_rel = _backup_and_remove(folder, out.rel, backup_ts(), backup=bool(data),
+                                            prune=False)
+        except Exception as exc:  # noqa: BLE001 — reported; file left in place
+            outcome.errors.append((out.rel, f"{type(exc).__name__}: {exc}"))
+            continue
+        outcome.removed.append((out.rel, backup_rel, detail))
+    return outcome
+
+
 def run_leftover_policy(
     folder: Path,
     orchestrator_root: Path,
@@ -384,13 +473,16 @@ def run_leftover_policy(
     backup_ts: Callable[[], str],
     log: Callable[[str], None],
 ) -> dict:
-    """The bundle engine's single call: both rules, their envelope keys
-    (``compose_copies_removed`` / ``leftovers_removed``, present only when
-    non-empty), one informational ``notes`` line each, a warning per file
-    that could not be removed. Returns ``{cid: removed-this-run}`` for the
-    bundle reconcile (a record clears on the next update that removed
-    nothing). The leftover pass runs on UPDATES only — a first install (safe
-    add included) never removes anything it did not itself write."""
+    """The bundle engine's single call: the three rules, their envelope keys
+    (``compose_copies_removed`` / ``leftovers_removed`` /
+    ``generated_outputs_removed``, present only when non-empty), one
+    informational ``notes`` line each, a warning per file that could not be
+    removed. Returns ``{cid: removed-this-run}`` for the bundle reconcile (a
+    record clears on the next update that removed nothing); the generated-
+    output rule writes no ledger row — its ``notes`` line is the report, and
+    a backed-up copy is named in the log. The leftover and generated-output
+    passes run on UPDATES only — a first install (safe add included) never
+    removes anything it did not itself write."""
     compose = retire_compose_copies(folder, compose_prior, backup_ts=backup_ts,
                                     dry_run=dry_run)
     leftovers = (
@@ -399,12 +491,19 @@ def run_leftover_policy(
                              dry_run=dry_run, log=log)
         if update_mode else LeftoverOutcome()
     )
+    # v0.2.102 W6-R: outputs of retired producers — UPDATES only, like the
+    # leftover pass (a first install removes nothing it did not itself write).
+    generated = (
+        retire_generated_outputs(folder, backup_ts=backup_ts, dry_run=dry_run)
+        if update_mode else LeftoverOutcome()
+    )
     for rel, _err in compose.errors:
         new_files[rel] = compose_prior[rel]  # still ours; the next run retries
     verb = "would be removed (dry run)" if dry_run else "removed"
     for outcome, key, label in (
         (compose, "compose_copies_removed", "compose-file copies"),
         (leftovers, "leftovers_removed", "retired VCO file(s)"),
+        (generated, "generated_outputs_removed", "output(s) of retired VCO producers"),
     ):
         if outcome.removed:
             result[key] = [rel for rel, _bk, _d in outcome.removed]

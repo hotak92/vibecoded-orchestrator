@@ -225,10 +225,36 @@ $ToplevelAbs = Norm-Path $Toplevel
 # harness refuses the main checkout itself, so build a commit of the working
 # tree through a throwaway index (user index/refs/HEAD untouched) and detach
 # the worktree there. Same decision as worktree-guard.sh.
+# v0.2.102 W6-R - must match the .sh: credential FILES are excluded from the
+# snapshot, by the ONE credential-file list (.claude/scripts/bash_security.py
+# --credential-file-globs). When it cannot be read (python or the script
+# missing - a broken install) the snapshot is REFUSED, never taken without
+# the exclusion.
 $BaseRef = "HEAD"
 $BaseReason = "worktree_add_detached_head"
+$SnapCredExcluded = ""
 & git -C $ToplevelAbs rev-parse --verify -q 'HEAD^{commit}' 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) {
+    $FindPy = Join-Path $ScriptDir "_lib/find-python.ps1"
+    if ((-not $PY) -and (Test-Path -LiteralPath $FindPy)) { . $FindPy }
+    $SnapSecurity = Join-Path (Join-Path (Split-Path -Parent $ScriptDir) "scripts") "bash_security.py"
+    $SnapGlobs = @()
+    if ($PY -and (Test-Path -LiteralPath $SnapSecurity)) {
+        try { $SnapGlobs = @(& $PY $SnapSecurity --credential-file-globs 2>$null | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() }) } catch { $SnapGlobs = @() }
+    }
+    if ($SnapGlobs.Count -eq 0) {
+        $pyShown = if ($PY) { $PY } else { "no python interpreter" }
+        $reason = "broken install: repository at $ToplevelAbs has no commits, and the credential-file list its snapshot must exclude could not be read ($pyShown / $SnapSecurity) - refusing to snapshot a working tree that may hold credential files; repair it with the project's bundle update (launcher: project Settings -> Update bundle)"
+        Log-Event "create_failed" $reason $ProposedPath ""
+        [Console]::Error.WriteLine("worktree-guard: ABORT - $reason")
+        exit 1
+    }
+    $SnapExcludes = @(':(exclude).claude/worktrees') + @($SnapGlobs | ForEach-Object { ":(exclude,glob)$_" })
+    $SnapCredSpecs = @($SnapGlobs | ForEach-Object { ":(glob)$_" })
+    try {
+        $SnapCredExcluded = (@(& git -C $ToplevelAbs ls-files --cached --others --exclude-standard -- @SnapCredSpecs 2>$null) |
+            Sort-Object -Unique | Select-Object -First 20) -join " "
+    } catch { $SnapCredExcluded = "" }
     $SnapSha = ""
     $SnapErr = ""
     $SnapTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("vco-wtg-" + [guid]::NewGuid().ToString("N"))
@@ -237,7 +263,7 @@ if ($LASTEXITCODE -ne 0) {
     try {
         New-Item -ItemType Directory -Force -Path $SnapTmp -ErrorAction Stop | Out-Null
         $env:GIT_INDEX_FILE = Join-Path $SnapTmp "index"
-        $SnapErr = (& git -C $ToplevelAbs add -A -- . ':(exclude).claude/worktrees' 2>&1 | Out-String)
+        $SnapErr = (& git -C $ToplevelAbs add -A -- . @SnapExcludes 2>&1 | Out-String)
         if ($LASTEXITCODE -eq 0) {
             $SnapTree = (& git -C $ToplevelAbs write-tree 2>$null | Select-Object -First 1)
             if ($LASTEXITCODE -eq 0 -and $SnapTree) {
@@ -302,7 +328,7 @@ function Create-Worktree([string]$target) {
     }
     if ($LASTEXITCODE -eq 0) {
         if ($BaseRef -ne "HEAD") {
-            Write-Notice "VCO worktree-guard: this repository has no commits yet, so your isolated worktree ($target) starts from a SNAPSHOT of the project's working tree (commit $BaseRef, on no branch) instead of HEAD. The main checkout is untouched by your edits. Say this in your final report and give the user the command that brings your changes back: git -C `"$target`" add -A && git -C `"$target`" diff --binary --cached $BaseRef | git -C `"$ToplevelAbs`" apply"
+            Write-Notice "VCO worktree-guard: this repository has no commits yet, so your isolated worktree ($target) starts from a SNAPSHOT of the project's working tree (commit $BaseRef, on no branch) instead of HEAD. The main checkout is untouched by your edits. Credential files (VCO's credential-file list: *.env, *.env.*, *.credentials, *.netrc, *.pgpass and the like) are EXCLUDED from the snapshot and are not in your worktree$(if ($SnapCredExcluded) { " - left out here: $SnapCredExcluded" }); if the task needs one, ask the caller instead of recreating it. Say this in your final report and give the user the command that brings your changes back: git -C `"$target`" add -A && git -C `"$target`" diff --binary --cached $BaseRef | git -C `"$ToplevelAbs`" apply"
         }
         Log-Event "created" $BaseReason $ProposedPath $target
         $recMode = if ($BaseRef -eq "HEAD") { "head" } else { "snapshot" }

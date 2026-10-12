@@ -216,7 +216,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The launcher no longer restarts live MCPs on its own first `settings.json` write after start** (W4-F). The watcher's diff guard reloads MCPs only when MCP-relevant env changed, but it started with an empty baseline. The first event per project after a launcher start, usually the launcher's own env re-projection, therefore always counted as a change and sent SIGHUP to every live MCP even when nothing relevant had changed. The watcher now seeds the baseline for every `settings.json` it starts watching (at start, and on each 30-second re-poll that picks up a new project) from the body read BEFORE the watch is registered, so a real change written between registration and the seed still reloads (`launcher/src-tauri/src/services/settings_json_watcher.rs`). A file that was absent or unreadable when the watch started keeps the old reload-on-first-event behaviour, since a needless reload is the safe failure. Same lane, test suite only: tests that run `pwsh` on Linux no longer flood the system journal (PowerShell 7 logs every compiled script block to syslog, about 14 entries per `.ps1` run). Every such test now starts `pwsh` through one helper, `tests/common/pwsh.py`, with a session-local `LogLevel: Error` settings file; the user's PowerShell configuration and Windows runs are untouched.
 
-<!-- W6-R: the coordinator inserts the five W6-R fix entries here (lane W6-S left this marker; delete it on insert). -->
+- **The stop-time worktree-violation alert can fire** (W6-R; whole-branch review). `subagent-stop-reconcile` Layer 3b read its isolation flag only from payload fields SubagentStop never carries. It now decides like the start-time check, through one shared function in `_lib/worktree-records` (a guard record with mode head/snapshot = isolated; no record + a definition declaring `isolation: worktree` = skipped), read before the reap.
+
+- **The PowerShell subagent snapshot records files again** (W6-R). `_lib/snapshot.ps1`'s `GetRelativePath` probe was a static call that throws, so the `.ps1` SubagentStop reconciler (credential scan, KG sync, worktree-violation alert) never saw a change.
+
+- **KG chunk counts are integers** (W6-R). `_format_obj` normalises whole-number float `chunk_num` / `total_chunks` (both the weaviate client and the HTTP adapter return floats): hook output reads `FULL NODE (2/2 chunks)`, not `(2/2.0 chunks)`.
+
+- **The orphaned `.claude/context/pruned-context-summary.md` is retired** (W6-R). A bundle update removes it only when its bytes are exactly what the retired `precompact_prune.py` wrote (a non-empty one is backed up first); any other content is left untouched.
+
+- **The post-commit KG reviewer names a broken install** (W6-R). When python or `kg_reviewer_backend.py` is missing, `post-git-commit-kg-sync` says so on stderr and in the commit's `kg-commit-reviews.jsonl` row (and `kg-commit-review.log` on bash) instead of falling back silently; it still reviews the commit through the direct Haiku spawn.
+
+- **The no-commits worktree snapshot never copies credential files** (W6-R). `*.env`, `*.env.*`, `*.credentials`, `*.netrc`, `*.pgpass` are excluded from the snapshot commit and the agent's worktree, using VCO's one credential-file list (`bash_security.py`, shared with the secrets guard); the notice names the excluded files, and the snapshot is refused when that list cannot be read.
+
+- **The bundle's embedding self-heal no longer aborts `install-bundle`** (W6-R; found by CI). Each half (code graph, KG) runs on its own; a failure — a missing module such as `requests` included — prints one stderr line naming the broken install and the repair and records `embed_self_heal_failed` (action_required; resolved by the next run where both halves complete).
+
+- **install.py's preset step seeds the global embedding profile** (W6-R). `app_state[embedding.active_profile]` is seeded from the text model the preset chose (shared model→profile table) only when no profile is set yet — a Preferences choice is never overwritten, and an unmapped model seeds nothing.
 
 ### Removed
 

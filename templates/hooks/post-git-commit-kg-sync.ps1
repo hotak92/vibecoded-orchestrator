@@ -126,12 +126,30 @@ Skip if the commit is purely cosmetic or test-only.
     # serves (glm-5.3-flash -> deepseek-v4.1-flash -> qwen3.8-flash), then
     # to OpenAI when the user enabled OpenAI for summaries. One chain, one
     # home: .claude/scripts/kg_reviewer_backend.py. Broken/partial install
-    # (python or the chain script missing): the pre-W6-K direct Haiku
-    # spawn, unchanged.
+    # (python or the chain script missing): reported as a broken install
+    # (below), then the pre-W6-K direct Haiku spawn.
     $ReviewerChain = Join-Path $ProjectRoot ".claude/scripts/kg_reviewer_backend.py"
     $LibDir = Join-Path $PSScriptRoot "_lib"
     $FindPy = Join-Path $LibDir "find-python.ps1"
     if (Test-Path $FindPy) { . $FindPy }
+    # v0.2.102 W6-R (loud-fail rule) - must match the .sh sibling: a missing
+    # python or a missing shipped chain script is a BROKEN install, named on
+    # stderr and in this commit's kg-commit-reviews.jsonl row
+    # (`broken_install`); the hook runs async, so the ledger row is the one a
+    # user can find. (Unlike the .sh, which appends, the spawn below
+    # TRUNCATES kg-commit-review.log as it redirects into it, so a line
+    # written there would be lost: the ledger is this sibling's record.)
+    $BrokenParts = @()
+    if (-not $PY) {
+        if (Test-Path $FindPy) { $BrokenParts += "no Python interpreter found (_lib/find-python.ps1 resolved none)" }
+        else { $BrokenParts += "$FindPy is missing, so no Python interpreter was resolved" }
+    }
+    if (-not (Test-Path $ReviewerChain)) { $BrokenParts += "$ReviewerChain is missing" }
+    $BrokenInstall = $BrokenParts -join "; "
+    if ($BrokenInstall) {
+        $brokenLine = "post-git-commit-kg-sync: broken install: $BrokenInstall - the KG reviewer runs the plain Haiku spawn without the backend fallback chain; repair it with the project's bundle update (launcher: project Settings -> Update bundle)"
+        [Console]::Error.WriteLine($brokenLine)
+    }
     # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1). TWO
     # cmdlet-level parameter rejections were killing this spawn outright:
     #   * `-WindowStyle Hidden` is rejected by non-Windows PowerShell editions;
@@ -141,12 +159,15 @@ Skip if the commit is purely cosmetic or test-only.
     # No --max-turns on the chain spawn: the turn budget is ONE knob owned
     # by the chain (DEFAULT_MAX_TURNS / VCO_KG_REVIEW_MAX_TURNS, v0.2.102
     # W6-N F-4).
-    if ($PY -and (Test-Path $ReviewerChain)) {
+    if (-not $BrokenInstall) {
         $proc = Start-VcoDetachedProcess -FilePath $PY `
             -ArgumentList @($ReviewerChain, 'run', '--prompt-file', $PromptFile, '--log', $logFile) `
             -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
             -WorkingDirectory $ProjectRoot -PassThru
     } else {
+        # Broken install, named above: the direct Haiku spawn is KEPT so the
+        # commit is still reviewed; it hides nothing (the breakage was just
+        # reported in three places), and dropping it would lose the KG update.
         # With no python this branch cannot ask the chain for the turn
         # budget, so it mirrors it: the default 30 must match
         # DEFAULT_MAX_TURNS in .claude/scripts/kg_reviewer_backend.py, and
@@ -172,7 +193,12 @@ Skip if the commit is purely cosmetic or test-only.
     # `"pid":}` — a malformed line in a JSONL telemetry file that every later
     # reader has to survive. Record a null instead.
     $pidVal = if ($proc) { $proc.Id } else { "null" }
-    $line = "{""timestamp"":""$ts"",""commit"":""$CommitHash"",""message"":""$msgEsc"",""pid"":$pidVal}"
+    $brokenField = ""
+    if ($BrokenInstall) {
+        $brokenEsc = $BrokenInstall -replace '\\', '\\\\' -replace '"', '\"'
+        $brokenField = ",""broken_install"":""$brokenEsc"""
+    }
+    $line = "{""timestamp"":""$ts"",""commit"":""$CommitHash"",""message"":""$msgEsc"",""pid"":$pidVal$brokenField}"
     try { Add-Content -Path (Join-Path $LogDir "kg-commit-reviews.jsonl") -Value $line -ErrorAction Stop } catch { }
 
 # No stdout: PostToolUse plain stdout is dropped per the v2.1.x

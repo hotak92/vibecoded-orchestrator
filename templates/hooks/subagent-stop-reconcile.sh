@@ -158,6 +158,32 @@ STOP_REASON="$(printf '%s' "$PARSED" | sed -n '5p')"
 ISO_FLAG="$(printf '%s' "$PARSED" | sed -n '6p')"
 ISO_CWD="$(printf '%s' "$PARSED" | sed -n '7p')"
 
+# v0.2.102 W6-R: the live SubagentStop payload carries none of the isolation
+# fields parsed above, so on its own ISO_FLAG never becomes 1 and Layer 3b
+# could never fire. Derive it the way subagent-start-isolation-check does,
+# from worktree-guard's per-launch record and the agent's definition
+# (_lib/worktree-records.sh — one home for both hooks):
+#   * a record with mode head|snapshot → the guard gave this agent its own
+#     worktree: isolation happened, so stay silent (ISO_FLAG=0);
+#   * no record, guard registered, definition declares `isolation: worktree`
+#     → isolation was skipped: ISO_FLAG=1 and the working directory is the
+#     parent checkout (ISO_CWD cleared, so the cwd exemption cannot apply);
+#   * anything else (in_place record, unknown definition, plugin type, guard
+#     parked) → the payload-derived value stands.
+# Read BEFORE Step 1b's reap, which rewrites the record's status.
+if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
+    # shellcheck source=_lib/worktree-records.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/worktree-records.sh"
+    if ISO_REC="$(wtrec_find "$PROJECT_ROOT" "$AGENT_ID")"; then
+        case "$(wtrec_get "$ISO_REC" mode)" in
+            head|snapshot) ISO_FLAG=0 ;;
+        esac
+    elif wtrec_isolation_skipped "$PROJECT_ROOT" "$AGENT_ID" "$AGENT_TYPE"; then
+        ISO_FLAG=1
+        ISO_CWD=""
+    fi
+fi
+
 # Step 1 (preserved from V52-L.2): emit the audit row.
 # Build the JSONL line in Python so every field is properly escaped.
 JSONL=$(SESSION_ID_FOR_PY="$SESSION_ID" \
@@ -589,8 +615,11 @@ fi
 # SubagentStart both missed. Non-blocking, soft-fail.
 #
 # Guard conditions (all must hold to emit a violation):
-#   - the payload exposed an isolation flag (ISO_FLAG == 1); else no-op
-#     (we don't guess non-isolation agents into violations),
+#   - isolation was requested and skipped (ISO_FLAG == 1): derived after the
+#     payload parse from worktree-guard's record + the agent's definition
+#     (wtrec_isolation_skipped), or from a payload isolation flag when a
+#     harness build exposes one; a guard record with mode head|snapshot
+#     forces no-op (we don't guess non-isolation agents into violations),
 #   - the diff found >0 changed files under the parent root (FILE_COUNT>0),
 #   - the reported cwd (if any) was NOT a separate worktree (cwd == parent
 #     toplevel OR cwd absent). When the build DOES expose a real worktree

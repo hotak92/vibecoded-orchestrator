@@ -120,6 +120,30 @@ try {
     exit 0
 }
 
+# v0.2.102 W6-R - must match the .sh sibling: the live SubagentStop payload
+# carries none of the isolation fields parsed above, so derive the flag from
+# worktree-guard's record + the agent's definition (_lib/worktree-records.ps1,
+# shared with subagent-start-isolation-check):
+#   * record with mode head|snapshot => isolated: stay silent ($IsoFlag off);
+#   * no record, guard registered, definition declares `isolation: worktree`
+#     => skipped: $IsoFlag on, cwd treated as the parent checkout;
+#   * anything else => the payload-derived value stands.
+# Read BEFORE Step 1b's reap, which rewrites the record's status.
+$WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
+if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
+    . $WtrecHelper
+    try {
+        $isoRecFile = Find-WtrecRecord $ProjectRoot $AgentId
+        if ($isoRecFile) {
+            $isoRec = Read-WtrecRecord $isoRecFile
+            if ($isoRec -and (@("head", "snapshot") -contains [string]$isoRec.mode)) { $IsoFlag = $false }
+        } elseif (Test-WtrecIsolationSkipped $ProjectRoot $AgentId $AgentType) {
+            $IsoFlag = $true
+            $IsoCwd = ""
+        }
+    } catch { }
+}
+
 # Step 1 (V52-L.2 preserved): emit the audit row.
 $entry = [ordered]@{
     timestamp       = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -458,7 +482,9 @@ if ($SessionId -and $fileCount -gt 0 -and (Test-Path -LiteralPath $MetricsLib -P
 # fell back to the shared tree. Write a `worktree_violation` row to
 # .claude/logs/worktree-guard.jsonl. Non-blocking, soft-fail.
 #
-# Guard conditions (all must hold): isolation flag present, >0 changed files,
+# Guard conditions (all must hold): isolation requested and skipped ($IsoFlag,
+# derived after the payload parse from the guard record + the definition via
+# Test-WtrecIsolationSkipped, or a payload flag), >0 changed files,
 # and the reported cwd was NOT a separate worktree (cwd == parent toplevel OR
 # cwd absent).
 if ($IsoFlag -and $fileCount -gt 0) {

@@ -9597,7 +9597,8 @@ def _write_preset_defaults_to_app_state(
 ) -> None:
     """Seed the launcher's `app_state` table with the install-time
     embedding-model defaults so the GUI dropdowns pre-populate for
-    brand-new projects.
+    brand-new projects, plus the global `embedding.active_profile` when no
+    profile is set yet (v0.2.102 W6-R).
 
     Ordering constraint: if install.py runs BEFORE the launcher has
     ever been started (fresh first-install), the launcher.db file does
@@ -9693,6 +9694,23 @@ def _write_preset_defaults_to_app_state(
                 (_APP_STATE_KEY_DEFAULT_CODE_EMBED, code_model, now_ms),
             )
             code_inserted = cur.rowcount > 0
+            # v0.2.102 W6-R: also seed the ONE global embedding profile
+            # (`embedding.active_profile`) from the text model chosen above,
+            # mapped through the shared model→profile table. Same DO NOTHING
+            # semantic: a profile the user set in Preferences is never
+            # overwritten; an unmapped model seeds nothing (never a guess).
+            from vco_lib.launcher_db_reader import (
+                APP_STATE_KEY_ACTIVE_EMBEDDING, profile_for_text_model,
+            )
+            profile = profile_for_text_model(text_model)
+            profile_inserted = False
+            if profile:
+                cur.execute(
+                    "INSERT INTO app_state (key, value, updated_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING",
+                    (APP_STATE_KEY_ACTIVE_EMBEDDING, profile, now_ms),
+                )
+                profile_inserted = cur.rowcount > 0
             # v0.2.77 5c task 2: seed the hardware-derived concurrency knobs.
             _seed_concurrency_app_state(cur, embed_config, now_ms)
             conn.commit()
@@ -9713,13 +9731,16 @@ def _write_preset_defaults_to_app_state(
             "preset_defaults", "ok",
             f"app_state defaults seeded "
             f"(active={active}, text={text_model}, code={code_model}, "
-            f"text_inserted={text_inserted}, code_inserted={code_inserted})",
+            f"text_inserted={text_inserted}, code_inserted={code_inserted}, "
+            f"profile={profile}, profile_inserted={profile_inserted})",
             data={
                 "active_embedding": active,
                 "default_text_embedding": text_model,
                 "default_code_embedding": code_model,
                 "text_inserted": text_inserted,
                 "code_inserted": code_inserted,
+                "active_profile": profile,
+                "profile_inserted": profile_inserted,
                 "db_path": str(db_path),
             },
         )

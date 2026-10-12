@@ -708,7 +708,8 @@ def kg_binding_keep_set() -> tuple[list[str], bool]:
 #
 # The launcher writes ``embedding.active_profile`` from Preferences →
 # "Embedding profile (global)" — the only embedding selector since v0.2.102
-# (the per-project Identity-tab selector was removed). Mirror constant:
+# (the per-project Identity-tab selector was removed); install.py's preset
+# step seeds it when absent. Mirror constant:
 #   launcher/src-tauri/src/commands/project_env_settings.rs
 #     ::APP_STATE_KEY_ACTIVE_EMBEDDING (canonical string: "embedding.active_profile")
 #
@@ -877,8 +878,8 @@ def read_app_state_active_embedding(
     is an empty string after stripping.
 
     This is the bridge between the launcher's stored embedding choice
-    (written by the Identity-tab embedding selector + install.py's preset
-    seeding) and any subprocess (``install.py``'s ``sync_knowledge_graph.py``
+    (written by the Preferences → Embedding profile selector; install.py's preset
+    step seeds it when absent) and any subprocess (``install.py``'s ``sync_knowledge_graph.py``
     spawn, the MCP server's ``EmbeddingService.for_project()``) that
     needs to know which embedding to use when no env override is set.
 

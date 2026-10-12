@@ -1330,6 +1330,23 @@ whole-tree runs only) resolves the row once no listed collection is still \
 owed. The bundle self-heal also resolves it when a settle finds every slot \
 complete (the instant switch back)."""
 
+[conditions.embed_self_heal_failed]
+class = "action_required"
+owner = "vco_lib.embed_slot_fill"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.102 W6-R: one half of the bundle run's embedding-model self-heal \
+(`embed_slot_fill.reconcile_folder_embeddings` — the code-graph half or the KG \
+half) raised, its import included. Each half runs in its own guard, so the \
+bundle update completes; the failure is printed on stderr and recorded here. \
+A missing module (e.g. `requests` absent from the interpreter the bundle ran \
+with) is a BROKEN install, named with the module and the repair (re-run the \
+orchestrator update, which installs VCO's requirements into its venv). \
+action_required, not auto_retryable: nothing retries a broken runtime. \
+Paired resolution: the next non-dry-run bundle run in which BOTH halves \
+complete resolves the row. NOT install.py-owned: the root bundle runs inside \
+an install.py run whose finalize would drop a row it did not itself emit."""
+
 [conditions.codegraph_embed_resync_pending]
 class = "auto_retryable"
 owner = "vco_lib.codegraph_resync"

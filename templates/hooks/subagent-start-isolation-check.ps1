@@ -118,46 +118,12 @@ if ($AgentId -and ($AgentId -match '^[A-Za-z0-9_-][A-Za-z0-9._-]*$')) {
 # worktree-guard record for this agent id while the guard is registered,
 # means the harness started the agent without a worktree (e.g. an
 # agent-teams teammate). Unknown definition / plugin-scoped type => no-op.
-function Get-AgentDefIsolation([string]$type) {
-    $roots = @((Join-Path (Join-Path $ProjectRoot ".claude") "agents"),
-               (Join-Path (Join-Path $HOME ".claude") "agents"))
-    foreach ($root in $roots) {
-        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
-        $files = Get-ChildItem -LiteralPath $root -Recurse -File -Filter "*.md" -ErrorAction SilentlyContinue | Sort-Object FullName
-        foreach ($f in $files) {
-            $text = ""
-            try { $text = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop } catch { continue }
-            $fm = @{}
-            if ($text -and $text.StartsWith("---")) {
-                $end = $text.IndexOf("`n---", 3)
-                if ($end -ge 0) {
-                    foreach ($line in ($text.Substring(3, $end - 3) -split "`r?`n")) {
-                        if ($line -match '^([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$') {
-                            $fm[$Matches[1]] = $Matches[2].Trim('"', "'")
-                        }
-                    }
-                }
-            }
-            $nm = if ($fm.ContainsKey("name")) { $fm["name"] } else { $f.BaseName }
-            if ($nm -eq $type) {
-                if ($fm.ContainsKey("isolation")) { return $fm["isolation"] }
-                return ""
-            }
-        }
-    }
-    return ""
-}
-function Test-GuardRegistered {
-    foreach ($n in @("settings.json", "settings.local.json")) {
-        $p = Join-Path (Join-Path $ProjectRoot ".claude") $n
-        if ((Test-Path -LiteralPath $p -PathType Leaf) -and (Select-String -LiteralPath $p -Pattern 'worktree-guard\.' -Quiet -ErrorAction SilentlyContinue)) { return $true }
-    }
-    return $false
-}
+# The decision lives in _lib/worktree-records.ps1 :: Test-WtrecIsolationSkipped,
+# shared with subagent-stop-reconcile's post-hoc alert (Layer 3b).
 $WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
-if ($AgentType -and -not $AgentType.Contains(":") -and $AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
+if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
     . $WtrecHelper
-    if (-not (Find-WtrecRecord $ProjectRoot $AgentId) -and (Test-GuardRegistered) -and ((Get-AgentDefIsolation $AgentType) -eq "worktree")) {
+    if (Test-WtrecIsolationSkipped $ProjectRoot $AgentId $AgentType) {
         Emit-Ctx "ISOLATION SKIPPED - the definition of ``$AgentType`` declares ``isolation: worktree``, but no isolated worktree was created for this launch: you are running in the parent's working directory and every edit lands in the shared checkout (this happens, for example, when the agent is started as an agent-teams teammate). BEFORE any edit or git write: stop and report this to the caller, or work only on what the brief explicitly allows in the shared tree. Do NOT commit from the parent checkout."
         exit 0
     }

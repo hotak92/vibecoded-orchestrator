@@ -170,8 +170,12 @@ function Take-Snapshot {
         if (-not $hash) { continue }
         try {
             # Path.GetRelativePath is .NET Core+; fall back to manual
-            # prefix-strip for older PowerShell hosts.
-            $rel = if ([System.IO.Path]::GetType().GetMethod('GetRelativePath',
+            # prefix-strip for older PowerShell hosts. The probe is the TYPE's
+            # reflection (`[System.IO.Path].GetMethod`): the former
+            # `[System.IO.Path]::GetType()` is a static call that throws
+            # ("does not contain a method named 'GetType'"), so every file hit
+            # the catch and the snapshot was always empty (v0.2.102 W6-R).
+            $rel = if ([System.IO.Path].GetMethod('GetRelativePath',
                     [type[]]@([string],[string]))) {
                 [System.IO.Path]::GetRelativePath($resolvedRoot, $abs)
             } else {
@@ -286,7 +290,7 @@ function Diff-Snapshot {
         }
         if ($info.Length -gt 5MB) { continue }
         try {
-            $rel = if ([System.IO.Path]::GetType().GetMethod('GetRelativePath',
+            $rel = if ([System.IO.Path].GetMethod('GetRelativePath',
                     [type[]]@([string],[string]))) {
                 [System.IO.Path]::GetRelativePath($resolvedRoot, $abs)
             } else {

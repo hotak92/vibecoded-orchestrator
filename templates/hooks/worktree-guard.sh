@@ -379,15 +379,51 @@ TOPLEVEL_ABS="$(norm_path "$TOPLEVEL")"
 # worktrees are excluded) and detaches the worktree there. The commit is on
 # no branch; the notice gives the agent the exact command that carries its
 # changes back into the main checkout.
+#
+# v0.2.102 W6-R: credential FILES are excluded from the snapshot. In a new
+# project with no .gitignore, `add -A` would otherwise copy a `.env` into the
+# snapshot commit (git's object store) and into the agent's worktree. The
+# globs come from the ONE credential-file list VCO keeps
+# (.claude/scripts/bash_security.py --credential-file-globs, the same list
+# the secrets guard's `read_env_files` rule reads). When that list cannot be
+# read (python or the script missing — a broken install) the snapshot is
+# REFUSED rather than taken without the exclusion.
 BASE_REF="HEAD"
 BASE_REASON="worktree_add_detached_head"
+SNAP_CRED_EXCLUDED=""
 if ! git -C "$TOPLEVEL_ABS" rev-parse --verify -q 'HEAD^{commit}' >/dev/null 2>&1; then
+    SNAP_SECURITY="$SCRIPT_DIR/../scripts/bash_security.py"
+    SNAP_GLOBS=""
+    if [ -n "${PY:-}" ] && [ -f "$SNAP_SECURITY" ]; then
+        SNAP_GLOBS="$("$PY" "$SNAP_SECURITY" --credential-file-globs 2>/dev/null || true)"
+    fi
+    if [ -z "$SNAP_GLOBS" ]; then
+        REASON="broken install: repository at $TOPLEVEL_ABS has no commits, and the credential-file list its snapshot must exclude could not be read (${PY:-no python interpreter} / $SNAP_SECURITY) - refusing to snapshot a working tree that may hold credential files; repair it with the project's bundle update (launcher: project Settings -> Update bundle)"
+        log_event "create_failed" "$REASON" "$PROPOSED_PATH" ""
+        printf 'worktree-guard: ABORT - %s\n' "$REASON" >&2
+        exit 1
+    fi
+    SNAP_EXCLUDES=(':(exclude).claude/worktrees')
+    while IFS= read -r _g; do
+        [ -n "$_g" ] && SNAP_EXCLUDES+=(":(exclude,glob)$_g")
+    done <<EOF
+$SNAP_GLOBS
+EOF
+    SNAP_CRED_SPECS=()
+    while IFS= read -r _g; do
+        [ -n "$_g" ] && SNAP_CRED_SPECS+=(":(glob)$_g")
+    done <<EOF
+$SNAP_GLOBS
+EOF
+    # The credential files this snapshot leaves out (named in the notice).
+    SNAP_CRED_EXCLUDED="$(git -C "$TOPLEVEL_ABS" ls-files --cached --others --exclude-standard \
+        -- "${SNAP_CRED_SPECS[@]}" 2>/dev/null | sort -u | head -20 | tr '\n' ' ' || true)"
     SNAP_TMP="$(mktemp -d 2>/dev/null || true)"
     SNAP_SHA=""
     SNAP_ERR=""
     if [ -n "$SNAP_TMP" ]; then
         SNAP_IDX="$SNAP_TMP/index"
-        if SNAP_ERR="$(GIT_INDEX_FILE="$SNAP_IDX" git -C "$TOPLEVEL_ABS" add -A -- . ':(exclude).claude/worktrees' 2>&1)"; then
+        if SNAP_ERR="$(GIT_INDEX_FILE="$SNAP_IDX" git -C "$TOPLEVEL_ABS" add -A -- . "${SNAP_EXCLUDES[@]}" 2>&1)"; then
             SNAP_TREE="$(GIT_INDEX_FILE="$SNAP_IDX" git -C "$TOPLEVEL_ABS" write-tree 2>/dev/null || true)"
             if [ -n "$SNAP_TREE" ]; then
                 SNAP_SHA="$(GIT_AUTHOR_NAME="VCO worktree-guard" GIT_AUTHOR_EMAIL="worktree-guard@vco.invalid" \
@@ -431,7 +467,7 @@ create_worktree() {
     # parallel agents, and the agent gets a clean separate checkout of HEAD.
     if add_err="$(git -C "$TOPLEVEL_ABS" worktree add --detach "$target" "$BASE_REF" 2>&1)"; then
         if [ "$BASE_REF" != "HEAD" ]; then
-            write_notice "VCO worktree-guard: this repository has no commits yet, so your isolated worktree ($target) starts from a SNAPSHOT of the project's working tree (commit $BASE_REF, on no branch) instead of HEAD. The main checkout is untouched by your edits. Say this in your final report and give the user the command that brings your changes back: git -C \"$target\" add -A && git -C \"$target\" diff --binary --cached $BASE_REF | git -C \"$TOPLEVEL_ABS\" apply"
+            write_notice "VCO worktree-guard: this repository has no commits yet, so your isolated worktree ($target) starts from a SNAPSHOT of the project's working tree (commit $BASE_REF, on no branch) instead of HEAD. The main checkout is untouched by your edits. Credential files (VCO's credential-file list: *.env, *.env.*, *.credentials, *.netrc, *.pgpass and the like) are EXCLUDED from the snapshot and are not in your worktree${SNAP_CRED_EXCLUDED:+ - left out here: ${SNAP_CRED_EXCLUDED% }}; if the task needs one, ask the caller instead of recreating it. Say this in your final report and give the user the command that brings your changes back: git -C \"$target\" add -A && git -C \"$target\" diff --binary --cached $BASE_REF | git -C \"$TOPLEVEL_ABS\" apply"
         fi
         log_event "created" "$BASE_REASON" "$PROPOSED_PATH" "$target"
         if [ "$BASE_REF" = "HEAD" ]; then rec_mode="head"; else rec_mode="snapshot"; fi
