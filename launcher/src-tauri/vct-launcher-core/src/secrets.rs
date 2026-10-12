@@ -610,26 +610,39 @@ fn session_memo_store(service: &str, key: &str, value: &Option<String>, read_gen
 
 // ─── Short cross-request value cache (v0.2.102 R1, owner 2026-10-07) ─────────
 //
-// RED-PHASE SEAM ONLY (tests land first): the TTL resolution the cache will
-// read. No cache behaviour exists yet — the tests below assert it and FAIL.
+// The cache sits ABOVE the store switch in `get_with_context`: one lookup
+// before the store is consulted, one store after it answered — whether that
+// store is the OS keychain or the test mock. So the hermetic mock tests
+// exercise the production cache code, not a copy of it.
 
 /// Default lifetime of a cached resolved value: ~30 s (owner ruling: keep it
 /// simple — one map, fixed TTL, no sweeper, no persistence).
 const SECRET_VALUE_CACHE_TTL_SECS_DEFAULT: u64 = 30;
 
+// Thread-local (W6-P): a TTL pinned by one test never changes the cache
+// behaviour another concurrently running test observes.
 #[cfg(any(test, debug_assertions))]
-static TEST_VALUE_CACHE_TTL_OVERRIDE: std::sync::Mutex<Option<std::time::Duration>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    static TEST_VALUE_CACHE_TTL_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// The value-cache TTL in force: the test override, else `VCT_HUB_SECRET_CACHE_SECS`
 /// (whole seconds; `0` DISABLES the cache), else the 30 s default. `None` = disabled.
+///
+/// While the test mock is the store on this thread and no TTL is pinned, the
+/// cache is OFF: the many mock tests that drive the store directly (one-shot
+/// read failures, unavailability, mid-read hooks) assume every read reaches
+/// it. A test that exercises the cache pins a TTL with
+/// [`TestValueCacheTtlGuard`] and then runs the very lookup/store code
+/// production runs.
 #[cfg(any(test, debug_assertions))]
 fn current_value_cache_ttl() -> Option<std::time::Duration> {
-    if let Some(ttl) = *TEST_VALUE_CACHE_TTL_OVERRIDE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-    {
+    if let Some(ttl) = TEST_VALUE_CACHE_TTL_OVERRIDE.with(|c| c.get()) {
         return (ttl.as_nanos() > 0).then_some(ttl);
+    }
+    if for_tests::mock_is_active() {
+        return None;
     }
     production_value_cache_ttl()
 }
@@ -658,8 +671,9 @@ fn production_value_cache_ttl() -> Option<std::time::Duration> {
     })
 }
 
-/// Test-only RAII guard pinning the value-cache TTL (`0` disables). Restores
-/// the previous override on drop.
+/// Test-only RAII guard pinning the value-cache TTL for THIS thread (`0`
+/// disables). Restores the previous override on drop. Under the test mock the
+/// cache is active only while such a guard is held.
 #[cfg(any(test, debug_assertions))]
 pub struct TestValueCacheTtlGuard {
     prev: Option<std::time::Duration>,
@@ -668,11 +682,7 @@ pub struct TestValueCacheTtlGuard {
 #[cfg(any(test, debug_assertions))]
 impl TestValueCacheTtlGuard {
     pub fn new(ttl: std::time::Duration) -> Self {
-        let mut slot = TEST_VALUE_CACHE_TTL_OVERRIDE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = *slot;
-        *slot = Some(ttl);
+        let prev = TEST_VALUE_CACHE_TTL_OVERRIDE.with(|c| c.replace(Some(ttl)));
         Self { prev }
     }
 }
@@ -680,10 +690,7 @@ impl TestValueCacheTtlGuard {
 #[cfg(any(test, debug_assertions))]
 impl Drop for TestValueCacheTtlGuard {
     fn drop(&mut self) {
-        let mut slot = TEST_VALUE_CACHE_TTL_OVERRIDE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        *slot = self.prev;
+        TEST_VALUE_CACHE_TTL_OVERRIDE.with(|c| c.set(self.prev));
     }
 }
 
@@ -723,19 +730,49 @@ fn secret_value_cache(
     })
 }
 
+/// The cache slot for `(service, key)` in the store currently answering reads.
+/// In production that is always the OS keychain, so the slot is the plain
+/// `(service, key)`. In test/debug builds a thread whose store is the test
+/// mock gets its own namespace (the mock is a per-thread store), so a value one
+/// thread's mock holds is never served to a thread reading the keychain or a
+/// different mock.
+fn value_cache_slot(service: &str, key: &str) -> (String, String) {
+    #[cfg(any(test, debug_assertions))]
+    if for_tests::mock_is_active() {
+        return (
+            format!("{}{}", for_tests::mock_value_cache_namespace(), service),
+            key.to_string(),
+        );
+    }
+    (service.to_string(), key.to_string())
+}
+
+/// Drop every value-cache entry whose slot starts with `namespace` (test seam:
+/// a mock store that is cleared or disabled takes its cached values with it).
+#[cfg(any(test, debug_assertions))]
+fn value_cache_forget_namespace(namespace: &str) {
+    if let Some(cache) = SECRET_VALUE_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(service, _), _| !service.starts_with(namespace));
+    }
+}
+
 /// Look up a still-fresh value. `None` when the cache is disabled, the key is
 /// absent, the entry expired, or a `set`/`delete` bumped the generation since
 /// it was stored (the stale entry is dropped on the spot).
 fn value_cache_lookup(service: &str, key: &str) -> Option<String> {
     let ttl = current_value_cache_ttl()?;
+    let slot = value_cache_slot(service, key);
     let mut cache = secret_value_cache().lock().unwrap_or_else(|p| p.into_inner());
     let fresh = |e: &SecretValueCacheEntry| {
         e.gen == current_secret_generation() && e.fetched_at.elapsed() <= ttl
     };
-    match cache.get(&(service.to_string(), key.to_string())) {
+    match cache.get(&slot) {
         Some(e) if fresh(e) => Some(e.value.clone()),
         Some(_) => {
-            cache.remove(&(service.to_string(), key.to_string()));
+            cache.remove(&slot);
             None
         }
         None => None,
@@ -754,7 +791,7 @@ fn value_cache_store(service: &str, key: &str, value: String, read_gen: u64) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(
-            (service.to_string(), key.to_string()),
+            value_cache_slot(service, key),
             SecretValueCacheEntry {
                 value,
                 fetched_at: std::time::Instant::now(),
@@ -1591,13 +1628,11 @@ pub fn get_with_context(
     // paths, every one of which has ALREADY passed its permission gate
     // (active/paused flag) before reaching this read; the gate is upstream of
     // `get_with_context` and runs on EVERY call, so a paused key is never
-    // served from here. Consulted AFTER the lock gate and the request memo,
-    // and skipped entirely while the test mock is the store. A hit constructs
-    // no Entry and touches no daemon (pinned by
-    // `value_cache_second_read_within_ttl_skips_the_keychain`).
+    // served from here. Consulted AFTER the lock gate and the request memo and
+    // BEFORE the store switch below (mock or OS keychain), so the hermetic
+    // mock tests prove this exact code. A hit reads no store at all (pinned by
+    // `value_cache_second_read_within_ttl_skips_the_store`).
     let value_cache_eligible = ctx == CallContext::Background;
-    #[cfg(any(test, debug_assertions))]
-    let value_cache_eligible = value_cache_eligible && !for_tests::mock_is_active();
     if value_cache_eligible {
         if let Some(v) = value_cache_lookup(&service, key) {
             return Ok(Some(v));
@@ -1619,39 +1654,62 @@ pub fn get_with_context(
     // proceeding call.
     #[cfg(any(test, debug_assertions))]
     note_entry_construction();
+    // THE store switch (W6-P): the test mock when it is active on this thread,
+    // else the OS keychain. Both arms produce `outcome`; the mid-read hook, the
+    // session memo store and the value-cache store below run once, for either
+    // arm — so the mock tests exercise exactly the production post-read path.
     #[cfg(any(test, debug_assertions))]
-    if let Some(result) = for_tests::mock_get(scope, module_id, key) {
+    let mock_result = for_tests::mock_get(scope, module_id, key);
+    #[cfg(not(any(test, debug_assertions)))]
+    let mock_result: Option<Result<Option<String>, String>> = None;
+    let outcome = match mock_result {
         // v0.2.102: a mock error carrying an unavailability detail is
         // classified exactly like the real worker path's (session flag set).
-        let outcome = result.map_err(|e| {
+        Some(result) => result.map_err(|e| {
             if is_keychain_unavailable_detail(&e) {
                 session_note_unavailable();
             }
             KeychainError::Other(e)
-        })?;
-        // v0.2.84 (review F2): fire the mid-read hook AFTER the value has been
-        // read but BEFORE the memo store — the exact TOCTOU window. A test
-        // installs a hook that performs a concurrent `set`/`delete` (bumping the
-        // generation) to prove the entry, tagged with the PRE-read generation,
-        // is invalidated even though `outcome` already captured the pre-write
-        // value. No-op in prod.
-        #[cfg(any(test, debug_assertions))]
-        for_tests::fire_mid_read_hook();
-        // Cache the successful mock outcome (value or genuine miss) so the
-        // session memo path is exercised under the test mock exactly as it is
-        // against the real keychain. Tagged with the PRE-read generation (F2).
-        session_memo_store(&service, key, &outcome, read_gen);
-        return Ok(outcome);
+        })?,
+        None => read_keychain_value(ctx, &service, key)?,
+    };
+    // v0.2.84 (review F2): fire the mid-read hook AFTER the value has been
+    // read but BEFORE the memo store — the exact TOCTOU window. A test
+    // installs a hook that performs a concurrent `set`/`delete` (bumping the
+    // generation) to prove the entry, tagged with the PRE-read generation, is
+    // invalidated even though `outcome` already captured the pre-write value.
+    // No-op in prod / when unarmed.
+    #[cfg(any(test, debug_assertions))]
+    for_tests::fire_mid_read_hook();
+    // Memoize the SUCCESSFUL outcome only (errors already propagated via `?`, so
+    // they are never cached — a transient failure stays retryable and keeps
+    // flipping the hub's honest degraded flag on every occurrence). Tagged with
+    // the PRE-read generation snapshot (F2) so a write that raced this read
+    // invalidates the entry rather than being masked by it.
+    session_memo_store(&service, key, &outcome, read_gen);
+    if value_cache_eligible {
+        if let Some(v) = outcome.as_ref() {
+            value_cache_store(&service, key, v.clone(), read_gen);
+        }
     }
+    Ok(outcome)
+}
+
+/// The OS-keychain arm of `get_with_context`'s store switch: one bounded,
+/// paced, retried `get_password`. `Ok(None)` is a genuine key-not-present miss.
+fn read_keychain_value(
+    ctx: CallContext,
+    service: &str,
+    key: &str,
+) -> Result<Option<String>, KeychainError> {
     // v0.2.76 (A4): own (service, key) → 'static + Send job → bounded-timeout
     // worker. keyring::Error is not Send-safe to carry across the channel
     // uniformly, so classify NoEntry INSIDE the job and return a plain
-    // Result<Option<String>, String>. v0.2.84 (D8.2): the outer `service`
-    // String + `key` &str are retained for the post-read memo store, so the
-    // closure gets its OWN shadowed owned copies (spelling `Entry::new(&service,
-    // &key)` preserved verbatim for the P9 structural guard).
+    // Result<Option<String>, String>. The closure gets its OWN shadowed owned
+    // copies of `service` / `key` (spelling `Entry::new(&service, &key)`
+    // preserved verbatim for the P9 structural guard).
     let outcome = {
-        let service = service.clone();
+        let service = service.to_string();
         let key = key.to_string();
         run_keychain_with_timeout_ctx(ctx, move || {
             with_cross_process_pace(|| {
@@ -1673,21 +1731,6 @@ pub fn get_with_context(
         })?
         .map_err(KeychainError::Other)?
     };
-    // v0.2.84 (review F2): mid-read hook, real-keychain path — same TOCTOU
-    // window (value read, not yet stored). No-op in prod / when unarmed.
-    #[cfg(any(test, debug_assertions))]
-    for_tests::fire_mid_read_hook();
-    // Memoize the SUCCESSFUL outcome only (errors already propagated via `?`, so
-    // they are never cached — a transient failure stays retryable and keeps
-    // flipping the hub's honest degraded flag on every occurrence). Tagged with
-    // the PRE-read generation snapshot (F2) so a write that raced this read
-    // invalidates the entry rather than being masked by it.
-    session_memo_store(&service, key, &outcome, read_gen);
-    if value_cache_eligible {
-        if let Some(v) = outcome.as_ref() {
-            value_cache_store(&service, key, v.clone(), read_gen);
-        }
-    }
     Ok(outcome)
 }
 
@@ -2335,6 +2378,13 @@ pub mod for_tests {
         static MOCK_UNAVAILABLE_GET_KEYS: RefCell<HashSet<String>> =
             RefCell::new(HashSet::new());
 
+        // W6-P: how many reads reached the mock STORE on this thread (every
+        // `mock_get` while the mock is active, injected failures included).
+        // The hermetic "did this read touch the store?" probe — thread-local,
+        // so concurrently running tests never perturb each other's count.
+        // Reset by `MockGuard::new` / `clear_mock`.
+        static MOCK_READ_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
         // v0.2.84 (review F2): a one-shot callback fired by `get_with_context`
         // in the TOCTOU window between its pre-read generation snapshot and the
         // memo store. A test installs a hook that performs a concurrent
@@ -2398,6 +2448,8 @@ pub mod for_tests {
         MOCK_STORE.with(|cell| {
             *cell.borrow_mut() = None;
         });
+        // W6-P: values this thread's mock put in the value cache go with it.
+        super::value_cache_forget_namespace(&mock_value_cache_namespace());
         MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
         MOCK_FAIL_GET_KEYS.with(|cell| cell.borrow_mut().clear());
         MOCK_UNAVAILABLE_GET_KEYS.with(|cell| cell.borrow_mut().clear());
@@ -2418,6 +2470,9 @@ pub mod for_tests {
                 map.clear();
             }
         });
+        // W6-P: an emptied store must not keep answering from the value cache.
+        super::value_cache_forget_namespace(&mock_value_cache_namespace());
+        MOCK_READ_COUNT.with(|c| c.set(0));
         MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
         MOCK_FAIL_GET_KEYS.with(|cell| cell.borrow_mut().clear());
         MOCK_UNAVAILABLE_GET_KEYS.with(|cell| cell.borrow_mut().clear());
@@ -2486,6 +2541,23 @@ pub mod for_tests {
     /// the store" and skip the host entirely.
     pub fn mock_is_active() -> bool {
         MOCK_STORE.with(|cell| cell.borrow().is_some())
+    }
+
+    /// W6-P: number of reads that reached the mock STORE on this thread since
+    /// the last `MockGuard::new` / `clear_mock` — a read served by the value
+    /// cache (or the session memo) does not count. The hermetic replacement
+    /// for counting real `keyring::Entry` constructions.
+    pub fn mock_read_count() -> usize {
+        MOCK_READ_COUNT.with(|c| c.get())
+    }
+
+    /// W6-P: the value-cache namespace of this thread's mock store. The mock
+    /// is a per-thread store, so its cached values are keyed apart from the OS
+    /// keychain's and from every other thread's mock (`ThreadId`s are never
+    /// reused within a process). The leading NUL cannot start a real service
+    /// name.
+    pub(super) fn mock_value_cache_namespace() -> String {
+        format!("\u{0}mock-{:?}\u{0}", std::thread::current().id())
     }
 
     /// Snapshot all entries currently in the mock store.
@@ -2573,6 +2645,7 @@ pub mod for_tests {
         MOCK_STORE.with(|cell| {
             let slot = cell.borrow();
             slot.as_ref().map(|map| {
+                MOCK_READ_COUNT.with(|c| c.set(c.get() + 1));
                 // v0.2.82: injected one-shot read failure (models a transient
                 // daemon error mid-request, NOT a miss). Consumed on fire.
                 let unavailable =
@@ -4554,44 +4627,72 @@ mod tests {
 
     // ─── v0.2.102 R1 (owner 2026-10-07): short cross-request value cache ──────
     //
-    // Real keychain under the hermetic baton (the cache is mock-inactive by
-    // design); the entry-construction counter is the "touched the keychain"
-    // probe. Every test cleans up after itself.
+    // W6-P: hermetic. The test mock is the store (no OS keychain, no D-Bus),
+    // and the cache sits ABOVE the store switch in `get_with_context`, so
+    // these tests drive the production cache code. Under the mock the cache is
+    // off unless a TTL is pinned, so every test pins one; the "did this read
+    // reach the store?" probe is `for_tests::mock_read_count()`.
+
+    /// The TTL the cache tests pin: the production default.
+    fn default_cache_ttl() -> TestValueCacheTtlGuard {
+        TestValueCacheTtlGuard::new(std::time::Duration::from_secs(
+            SECRET_VALUE_CACHE_TTL_SECS_DEFAULT,
+        ))
+    }
 
     /// WITHIN the TTL a second Background read of the same key must not touch
-    /// the keychain at all.
+    /// the store at all.
     #[test]
-    fn value_cache_second_read_within_ttl_skips_the_keychain() {
-        use std::sync::atomic::Ordering;
-        let _lock = test_serialize::keychain_serialize_lock();
+    fn value_cache_second_read_within_ttl_skips_the_store() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
         let scope = SecretScope::PerProject { project_id: "p-r1cache" };
-        let _ = delete(scope, "r1mod", "K");
         set(scope, "r1mod", "K", "v1").unwrap();
-        let base = ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst);
+        let base = for_tests::mock_read_count();
         let first =
             get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap();
         assert_eq!(first.as_deref(), Some("v1"));
-        let after_first = ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst);
-        assert!(after_first > base, "precondition: the first read hit the keychain");
+        let after_first = for_tests::mock_read_count();
+        assert_eq!(after_first, base + 1, "precondition: the first read hit the store");
         let second =
             get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap();
         assert_eq!(second.as_deref(), Some("v1"));
         assert_eq!(
-            ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst),
+            for_tests::mock_read_count(),
             after_first,
-            "a read within the TTL must be served from the value cache — no Entry, no daemon"
+            "a read within the TTL must be served from the value cache — no store read"
         );
-        let _ = delete(scope, "r1mod", "K");
     }
 
-    /// AFTER the TTL the next read refetches (same value, fresh keychain op).
+    /// The cache serves Background reads only: an Interactive read always
+    /// reaches the store, even with a fresh cached value present.
+    #[test]
+    fn value_cache_never_serves_an_interactive_read() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
+        let scope = SecretScope::PerProject { project_id: "p-r1cache" };
+        set(scope, "r1mod", "K", "v1").unwrap();
+        get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap();
+        let after_bg = for_tests::mock_read_count();
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Interactive)
+                .unwrap()
+                .as_deref(),
+            Some("v1")
+        );
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_bg + 1,
+            "an Interactive read must reach the store"
+        );
+    }
+
+    /// AFTER the TTL the next read refetches (same value, fresh store read).
     #[test]
     fn value_cache_refetches_after_the_ttl_expires() {
-        use std::sync::atomic::Ordering;
-        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
         let _ttl = TestValueCacheTtlGuard::new(std::time::Duration::from_millis(60));
         let scope = SecretScope::PerProject { project_id: "p-r1cache" };
-        let _ = delete(scope, "r1mod", "K");
         set(scope, "r1mod", "K", "v1").unwrap();
         assert_eq!(
             get_with_context(scope, "r1mod", "K", CallContext::Background)
@@ -4599,7 +4700,7 @@ mod tests {
                 .as_deref(),
             Some("v1")
         );
-        let after_first = ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst);
+        let after_first = for_tests::mock_read_count();
         std::thread::sleep(std::time::Duration::from_millis(120));
         assert_eq!(
             get_with_context(scope, "r1mod", "K", CallContext::Background)
@@ -4607,20 +4708,20 @@ mod tests {
                 .as_deref(),
             Some("v1")
         );
-        assert!(
-            ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst) > after_first,
-            "an expired entry must be refetched from the keychain"
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_first + 1,
+            "an expired entry must be refetched from the store"
         );
-        let _ = delete(scope, "r1mod", "K");
     }
 
     /// A write or a delete of the key drops its entry: the next read sees the
     /// NEW reality, never a stale cached value.
     #[test]
     fn value_cache_write_or_delete_drops_the_entry() {
-        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
         let scope = SecretScope::PerProject { project_id: "p-r1cache" };
-        let _ = delete(scope, "r1mod", "K");
         set(scope, "r1mod", "K", "v1").unwrap();
         assert_eq!(
             get_with_context(scope, "r1mod", "K", CallContext::Background)
@@ -4644,62 +4745,62 @@ mod tests {
         );
     }
 
-    /// Negative results are never cached: a miss stays a fresh keychain op.
+    /// Negative results are never cached: a miss stays a fresh store read.
     #[test]
     fn value_cache_never_caches_a_miss() {
-        use std::sync::atomic::Ordering;
-        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
         let scope = SecretScope::PerProject { project_id: "p-r1cache" };
-        let _ = delete(scope, "r1mod", "ABSENT");
         assert_eq!(
             get_with_context(scope, "r1mod", "ABSENT", CallContext::Background).unwrap(),
             None
         );
-        let after_first = ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst);
+        let after_first = for_tests::mock_read_count();
         assert_eq!(
             get_with_context(scope, "r1mod", "ABSENT", CallContext::Background).unwrap(),
             None
         );
-        assert!(
-            ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst) > after_first,
-            "a miss must not be cached — the second read hits the keychain again"
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_first + 1,
+            "a miss must not be cached — the second read hits the store again"
         );
     }
 
     /// `VCT_HUB_SECRET_CACHE_SECS=0` (TTL 0) disables the cache entirely.
     #[test]
     fn value_cache_zero_ttl_disables_the_cache() {
-        use std::sync::atomic::Ordering;
-        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
         let _ttl = TestValueCacheTtlGuard::new(std::time::Duration::from_secs(0));
         let scope = SecretScope::PerProject { project_id: "p-r1cache" };
-        let _ = delete(scope, "r1mod", "K");
         set(scope, "r1mod", "K", "v1").unwrap();
         assert!(get_with_context(scope, "r1mod", "K", CallContext::Background).is_ok());
-        let after_first = ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst);
+        let after_first = for_tests::mock_read_count();
         assert_eq!(
             get_with_context(scope, "r1mod", "K", CallContext::Background)
                 .unwrap()
                 .as_deref(),
             Some("v1")
         );
-        assert!(
-            ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst) > after_first,
-            "with the TTL at 0 every read must hit the keychain"
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_first + 1,
+            "with the TTL at 0 every read must hit the store"
         );
-        let _ = delete(scope, "r1mod", "K");
     }
 
     /// The lock gate stays BEFORE the cache (D8.4 posture): a locked store is
-    /// an honest terminal state, never overridden by a cached value.
+    /// an honest terminal state, never overridden by a cached value — even a
+    /// fresh one that is served again the moment the store unlocks.
     #[cfg(target_os = "linux")]
     #[test]
     fn value_cache_serves_nothing_while_the_store_is_locked() {
-        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
         let scope = SecretScope::PerProject { project_id: "p-r1cache" };
-        let _ = delete(scope, "r1mod", "K");
         set(scope, "r1mod", "K", "v1").unwrap();
         assert!(get_with_context(scope, "r1mod", "K", CallContext::Background).is_ok());
+        let after_fill = for_tests::mock_read_count();
         {
             let _probe = TestProbeGuard::new(Some(true));
             assert!(
@@ -4716,6 +4817,37 @@ mod tests {
                 .as_deref(),
             Some("v1")
         );
-        let _ = delete(scope, "r1mod", "K");
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_fill,
+            "precondition: the value was cached all along (served after unlock \
+             with no store read), so the Locked answer above beat a live entry"
+        );
+    }
+
+    /// The cache is keyed per store: a value cached from one thread's mock is
+    /// never served to a read against a different mock store, and clearing a
+    /// mock store drops what it had cached.
+    #[test]
+    fn value_cache_is_scoped_to_the_store_that_answered() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
+        let scope = SecretScope::PerProject { project_id: "p-r1cache" };
+        set(scope, "r1mod", "K", "v1").unwrap();
+        get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap();
+        let other = std::thread::spawn(move || {
+            let _mock = for_tests::MockGuard::new();
+            let _ttl = default_cache_ttl();
+            get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(other, None, "another store's cached value must never be served");
+        for_tests::clear_mock();
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap(),
+            None,
+            "a cleared store must not keep answering from the value cache"
+        );
     }
 }
