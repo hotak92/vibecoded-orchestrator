@@ -161,9 +161,12 @@ logger = logging.getLogger(__name__)
 #:          pass resolves imports language-aware (``vco_lib.codegraph_imports``)
 #:          and adds the Rust/TS/Svelte/shell edges it never found; CodeAPI rows
 #:          gain ``is_test`` and a skipped row's missing ``file_path``/``is_test``
-#:          is PATCHed (``codegraph_guards.heal_skipped_row``). Measured on this
-#:          repository: 178 Rust and 133 shell module rows change content and
-#:          re-embed once; nothing else does. Python is unchanged. The per-entity content-hash
+#:          is PATCHed (``codegraph_guards.heal_skipped_row``). W6-O's OWN
+#:          delta, measured on this repository: 178 Rust and 133 shell module
+#:          rows change content and re-embed once, and W6-O re-embeds nothing
+#:          else (its Python change is edge resolution only). The W6-E, W6-G
+#:          and W6-L output changes above re-embed further rows in the
+#:          languages they name. The per-entity content-hash
 #:          gate re-embeds only rows whose extracted text changed;
 #:          ``CODEGRAPH_EMBED_REVISION`` is NOT bumped (model, chunking and
 #:          embed text construction are unchanged).
