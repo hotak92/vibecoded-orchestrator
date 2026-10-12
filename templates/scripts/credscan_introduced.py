@@ -10,13 +10,12 @@ fixtures in ``secrets.rs``) re-raised a desktop alert on every unrelated
 edit. Now:
 
 * **Scope = what the tool call introduced.** ``Edit`` -> the full lines the
-  ``new_string`` occupies in the file after the edit (every occurrence when
-  ``replace_all``); ``MultiEdit`` -> the same for each of its ``edits``;
+  ``new_string`` occupies in the file after the edit (every occurrence);
   ``Write`` -> the whole file (the call wrote all of it). A credential that
   was already in the file and is not on a line the edit touched is not
   reported again. A pre-existing credential on a line the edit DID touch is
   reported: the line is part of the change. A payload that carries none of
-  ``new_string`` / ``edits`` / ``content`` (an unknown tool shape) is scanned
+  ``new_string`` / ``content`` (an unknown tool shape) is scanned
   whole -- recall wins when the scope cannot be known. An ``Edit`` whose
   ``new_string`` cannot be located in the file any more is scanned on the
   ``new_string`` text itself, reported without a file line number.
@@ -167,31 +166,25 @@ def introduced_scan(payload: Dict, root: str, shapes: Sequence[Shape],
     starts = _line_starts(text)
     total = len(text.split("\n"))
 
-    edits: List[Dict] = []
-    if isinstance(ti.get("edits"), list):
-        edits = [e for e in ti["edits"] if isinstance(e, dict)]
-    elif "new_string" in ti:
-        edits = [ti]
-
-    if edits:
+    # Claude Code's file-writing tools are Edit, Write and NotebookEdit; the
+    # former MultiEdit tool no longer exists (the 2.1.x CLI keeps its name
+    # only as a legacy permission-rule alias), so there is no ``edits`` shape
+    # to handle here.
+    if "new_string" in ti:
         verdict["scope"] = "edit"
-        file_lines: set = set()
-        loose: List[str] = []
-        for e in edits:
-            new = str(e.get("new_string") or "").replace("\r\n", "\n")
-            if not new:
-                continue  # a deletion introduces nothing
+        new = str(ti.get("new_string") or "").replace("\r\n", "\n")
+        found: List[Dict] = []
+        if new:  # a deletion (empty new_string) introduces nothing
             hit = _span_lines(text, starts, new)
-            if hit is None:
-                loose.append(new)
+            if hit is not None:
+                found = scan_lines(text, hit, shapes, marker)
             else:
-                file_lines.update(hit)
-        found = scan_lines(text, sorted(file_lines), shapes, marker)
-        for new in loose:
-            for f in scan_lines(new, range(1, len(new.split("\n")) + 1),
-                                shapes, marker):
-                f["line"] = None  # located in the edit text, not the file
-                found.append(f)
+                # Not locatable in the file any more: scan the edit text
+                # itself, reported without a file line number.
+                for f in scan_lines(new, range(1, len(new.split("\n")) + 1),
+                                    shapes, marker):
+                    f["line"] = None
+                    found.append(f)
     else:
         verdict["scope"] = "write" if "content" in ti else "file"
         found = scan_lines(text, range(1, total + 1), shapes, marker)

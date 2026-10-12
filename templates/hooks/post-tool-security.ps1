@@ -69,7 +69,7 @@ if (-not (Test-Path $AlertDir)) {
 if (-not $EditedFile -or -not (Test-Path -LiteralPath $EditedFile -PathType Leaf)) { exit 0 }
 
 # WHAT IS SCANNED (v0.2.102 W6-N, owner ruling 2026-10-12): only what THIS
-# call introduced -- Edit `new_string` (+ MultiEdit `edits`), Write
+# call introduced -- Edit `new_string`, Write
 # `content` -- never the whole file. Scanning the whole file re-alerted on
 # every unrelated edit of a file that already held a test placeholder (the
 # `ghp_...` fixtures in secrets.rs). A line carrying the explicit marker
@@ -232,7 +232,13 @@ if ($alerts.Count -gt 0) {
     # PostToolUse hooks is silently dropped — the desktop notification
     # above reaches the user, but without this envelope path the model
     # never saw credential alerts on files it had just written.
-    $reminder = "[Security alert] $msg`nReview the lines named above before continuing: the credential pattern is in`ntext this edit introduced (or on a line it changed) in $relFile. If it is`na deliberate test placeholder, mark its line with the comment`n``vco-secret-scan: test-placeholder``; if it leaked from real input, redact`nit before any further git operations or external sharing."
+    # The marker text comes from the vocabulary mirror (one home), never a
+    # literal here.
+    $markerText = ""
+    if (Get-Command Get-CredShapesTestPlaceholderMarker -ErrorAction SilentlyContinue) {
+        $markerText = Get-CredShapesTestPlaceholderMarker
+    }
+    $reminder = "[Security alert] $msg`nReview the lines named above before continuing: the credential pattern is in`ntext this edit introduced (or on a line it changed) in $relFile. If it is`na deliberate test placeholder, mark its line with the comment`n``$markerText``; if it leaked from real input, redact`nit before any further git operations or external sharing."
     if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
         Emit-AdditionalContext $reminder PostToolUse
     }

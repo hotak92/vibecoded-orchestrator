@@ -79,9 +79,23 @@ function Scan-FileForCredentials {
 
     # One pass per shape, in SSOT declaration order so the reported label
     # sequence matches the .sh sibling exactly.
+    # The ONE explicit opt-out (owner ruling 2026-10-12): a line carrying
+    # the test-placeholder marker is a declared fixture and is not reported;
+    # the marker covers its own line only, and nothing is inferred from how
+    # a value looks. Same rule, same marker (credshapes.ps1 mirror of
+    # vco_lib/credential_shapes.TEST_PLACEHOLDER_MARKER) as post-tool-security.
+    if (-not (Get-Command Get-CredShapesTestPlaceholderMarker -ErrorAction SilentlyContinue)) {
+        Write-Output "credential scanner UNAVAILABLE (test-placeholder marker missing from _lib/credshapes.ps1)"
+        return
+    }
+    $marker = Get-CredShapesTestPlaceholderMarker
+    $lines = $content -split "`r?`n"
     foreach ($shape in (Get-CredShapes -Context 'content_scan')) {
-        if ($content -match $shape.Re) {
-            $alerts.Add($shape.Label) | Out-Null
+        foreach ($ln in $lines) {
+            if (($ln -match $shape.Re) -and (-not $ln.Contains($marker))) {
+                $alerts.Add($shape.Label) | Out-Null
+                break
+            }
         }
     }
 

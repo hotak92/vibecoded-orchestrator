@@ -83,7 +83,7 @@ mkdir -p "$(dirname "$ALERT_LOG")"
 [[ ! -f "$EDITED_FILE" ]] && exit 0
 
 # WHAT IS SCANNED (v0.2.102 W6-N, owner ruling 2026-10-12): only what THIS
-# call introduced -- Edit `new_string` (+ MultiEdit `edits`), Write
+# call introduced -- Edit `new_string`, Write
 # `content` -- never the whole file. Scanning the whole file re-alerted on
 # every unrelated edit of a file that already held a test placeholder (the
 # `ghp_...` fixtures in secrets.rs). A line carrying the explicit marker
@@ -225,7 +225,7 @@ sys.stdout.write(json.dumps({
 Review the lines named above before continuing: the credential pattern is in
 text this edit introduced (or on a line it changed) in ${REL_FILE}. If it is
 a deliberate test placeholder, mark its line with the comment
-\`vco-secret-scan: test-placeholder\`; if it leaked from real input, redact
+\`${CREDSHAPES_TEST_PLACEHOLDER_MARKER:-}\`; if it leaked from real input, redact
 it before any further git operations or external sharing."
     if command -v emit_additional_context >/dev/null 2>&1; then
         emit_additional_context "$REMINDER" PostToolUse

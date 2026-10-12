@@ -8,7 +8,7 @@ edited file on every Edit/Write, so the ``ghp_…`` test fixtures already in
 every unrelated edit. Now:
 
 1. only the lines the call introduced are scanned (Edit ``new_string``,
-   MultiEdit ``edits``, Write ``content``);
+   Write ``content``; Claude Code has no MultiEdit tool any more);
 2. findings name the project-relative path, the line(s) and the shape label,
    never the value -- in the toast, the JSONL ledger and the model reminder;
 3. a line carrying the explicit marker ``vco-secret-scan: test-placeholder``
@@ -199,18 +199,6 @@ def test_write_scans_its_content(tmp_path, sibling):
         {"line": 3, "id": "github_token", "label": "GitHub token"}]
     assert run.rows[-1]["file"] == "src/new.py"
     _assert_never_the_value(run)
-
-
-@pytest.mark.parametrize("sibling", SIBLINGS)
-def test_multiedit_scans_each_new_string(tmp_path, sibling):
-    proj = _project(tmp_path)
-    target = proj / "src" / "app.py"
-    target.write_text(f'A = 1\nB = 2\nC = "{TOKEN}"\nD = 4\n',
-                      encoding="utf-8")
-    run = _run(sibling, proj, "MultiEdit", {"file_path": str(target), "edits": [
-        {"old_string": "A = 0", "new_string": "A = 1"},
-        {"old_string": "C = 0", "new_string": f'C = "{TOKEN}"'}]})
-    assert [f["line"] for f in run.rows[-1]["findings"]] == [3], run.rows
 
 
 @pytest.mark.parametrize("sibling", SIBLINGS)
