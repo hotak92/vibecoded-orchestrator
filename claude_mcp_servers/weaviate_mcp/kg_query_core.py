@@ -860,8 +860,8 @@ def _fetch_node_chunks(
         )
         chunk_list: list[tuple[int, str]] = []
         for obj in objs:
-            cn = _whole_number(obj.properties.get("chunk_num", 0)) or 0
-            chunk_list.append((cn, obj.properties.get("content", "") or ""))
+            cn = int(_whole_number(obj.properties.get("chunk_num", 0)) or 0)
+            chunk_list.append((cn, str(obj.properties.get("content", "") or "")))
         chunk_list.sort(key=lambda x: x[0])
         if max_chunks >= len(chunk_list):
             return chunk_list
