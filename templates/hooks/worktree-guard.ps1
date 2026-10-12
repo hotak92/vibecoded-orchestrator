@@ -177,6 +177,18 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
 # create leaves a one-shot notice keyed by the identifier; the SubagentStart
 # hook subagent-start-isolation-check.ps1 hands it to the agent.
 $NoticeDir = Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "worktree-guard"
+# Per-launch records (v0.2.102 W6-Q follow-up): one home is
+# _lib/worktree-records.ps1 (must match _lib/worktree-records.sh).
+$WtrecHelper = Join-Path $PSScriptRoot "_lib/worktree-records.ps1"
+if (Test-Path -LiteralPath $WtrecHelper) {
+    . $WtrecHelper
+    Remove-WtrecStale $ProjectRoot
+}
+function Save-LaunchRecord([string]$mode, [string]$path, [string]$base, [string]$toplevel) {
+    if (Get-Command Write-WtrecRecord -ErrorAction SilentlyContinue) {
+        Write-WtrecRecord $ProjectRoot $WtName $mode $path $base $toplevel
+    }
+}
 function Write-Notice([string]$text) {
     if (-not $WtName) { return }
     if ($WtName -notmatch '^[A-Za-z0-9_-][A-Za-z0-9._-]*$') { return }
@@ -201,6 +213,7 @@ if (-not $Toplevel) {
     try { $RunDir = (Resolve-Path -LiteralPath $GitScopeDir -ErrorAction Stop).ProviderPath } catch { }
     Write-Notice "VCO worktree-guard: worktree isolation is OFF for this subagent. $RunDir is not inside a git repository, so no isolated worktree can be created; you are working DIRECTLY in the project folder and every edit lands there immediately. Say this in your final report. Isolation turns on by itself once the folder is a git repository (git init)."
     Log-Event "in_place" "not_a_repo" $ProposedPath $RunDir
+    Save-LaunchRecord "in_place" $RunDir "" ""
     [Console]::Error.WriteLine("worktree-guard: $RunDir is not a git repository - the subagent runs in place, without worktree isolation")
     Emit-WtPath $RunDir
     exit 0
@@ -292,6 +305,10 @@ function Create-Worktree([string]$target) {
             Write-Notice "VCO worktree-guard: this repository has no commits yet, so your isolated worktree ($target) starts from a SNAPSHOT of the project's working tree (commit $BaseRef, on no branch) instead of HEAD. The main checkout is untouched by your edits. Say this in your final report and give the user the command that brings your changes back: git -C `"$target`" add -A && git -C `"$target`" diff --binary --cached $BaseRef | git -C `"$ToplevelAbs`" apply"
         }
         Log-Event "created" $BaseReason $ProposedPath $target
+        $recMode = if ($BaseRef -eq "HEAD") { "head" } else { "snapshot" }
+        $recBase = ""
+        try { $recBase = ([string](& git -C $target rev-parse HEAD 2>$null | Select-Object -First 1)).Trim() } catch { }
+        Save-LaunchRecord $recMode $target $recBase $ToplevelAbs
         Emit-WtPath $target
         exit 0
     }

@@ -81,6 +81,8 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
 def _run(script: str, flavour: str, payload: dict | str, project: Path) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _LEAK_ENV_KEYS}
     env["CLAUDE_PROJECT_DIR"] = str(project)
+    # A per-test HOME: isolation-check reads ~/.claude/agents (user scope).
+    env["HOME"] = str(project.parent / "fakehome")
     path = HOOKS / f"{script}.{flavour}"
     argv = ["bash", str(path)] if flavour == "sh" else [_PS, *PWSH_BASE_FLAGS, "-File", str(path)]
     return subprocess.run(argv, input=payload if isinstance(payload, str) else json.dumps(payload),
@@ -280,3 +282,199 @@ def test_user_tuned_timeout_is_left_alone(os_name: str) -> None:
         h["timeout"] = 15
     merged = settings_merge.smart_merge_settings(old, template)
     assert [h["timeout"] for h in _guard_hooks(merged)] == [15]
+
+
+# ── follow-up 1: SubagentStop reaps an UNCHANGED guard-created worktree ─────
+# "No changes -> worktree is auto-cleaned" (WORKTREE_ISOLATION_GUIDE.md,
+# docs/features/03) was false while worktree-guard creates the worktrees: the
+# harness keeps a hook-created worktree and runs no WorktreeRemove when a
+# subagent finishes (hooks reference, WorktreeRemove). subagent-stop-reconcile
+# now removes it — only when provably unchanged.
+
+
+def _stop(flavour: str, agent_id: str, project: Path) -> subprocess.CompletedProcess:
+    return _run("subagent-stop-reconcile", flavour,
+                {"hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": agent_id,
+                 "agent_type": "expert-coder", "cwd": str(project)}, project)
+
+
+def _committed_repo(root: Path) -> Path:
+    root.mkdir(parents=True)
+    _git(root, "init", "-q", "--initial-branch=main")
+    (root / "app.py").write_text("print('v1')\n", encoding="utf-8")
+    (root / ".gitignore").write_text("build/\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "seed")
+    return root
+
+
+def _launch(flavour: str, repo: Path, agent_id: str) -> Path:
+    proc = _guard(flavour, f"agent-{agent_id}", repo)
+    assert proc.returncode == 0, proc.stderr
+    return Path(proc.stdout.strip().splitlines()[-1])
+
+
+def _record(project: Path, agent_id: str) -> dict:
+    p = project / ".claude" / "state" / "worktree-guard" / f"wt-agent-{agent_id}.json"
+    return json.loads(p.read_text(encoding="utf-8-sig"))
+
+
+def _reap_rows(project: Path) -> list[dict]:
+    log = project / ".claude" / "logs" / "worktree-guard.jsonl"
+    if not log.exists():
+        return []
+    return [r for r in _log_rows(project) if r.get("hook") == "subagent-stop-reconcile"]
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_unchanged_worktree_is_removed_at_subagent_stop(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "aaa111")
+    assert _record(repo, "aaa111")["mode"] == "head"
+
+    proc = _stop(flavour, "aaa111", repo)
+
+    assert proc.returncode == 0, proc.stderr
+    assert not wt.exists()
+    assert str(wt) not in _git(repo, "worktree", "list", "--porcelain").stdout
+    assert _reap_rows(repo)[-1]["decision"] == "reap_removed"
+    assert _record(repo, "aaa111")["status"] == "removed"
+    # The user's checkout is untouched.
+    assert (repo / "app.py").read_text(encoding="utf-8") == "print('v1')\n"
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+@pytest.mark.parametrize("change", ["untracked", "modified", "ignored", "commit"])
+def test_changed_worktree_is_kept(flavour: str, change: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "bbb222")
+    if change == "untracked":
+        (wt / "new.py").write_text("X = 1\n", encoding="utf-8")
+    elif change == "modified":
+        (wt / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    elif change == "ignored":
+        (wt / "build").mkdir()
+        (wt / "build" / "report.txt").write_text("agent output\n", encoding="utf-8")
+    else:
+        (wt / "app.py").write_text("print('v2')\n", encoding="utf-8")
+        _git(wt, "commit", "-qam", "agent work")
+
+    proc = _stop(flavour, "bbb222", repo)
+
+    assert proc.returncode == 0, proc.stderr
+    assert wt.is_dir(), f"a worktree with a {change} change must be kept"
+    row = _reap_rows(repo)[-1]
+    assert row["decision"] == "reap_kept"
+    assert row["resolved_path"] == str(wt)
+    assert "KEPT at " + str(wt) in proc.stderr
+    assert _record(repo, "bbb222")["status"] == "kept"
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_snapshot_worktree_is_removed_and_leaves_no_ref(flavour: str, tmp_path: Path) -> None:
+    repo = _no_commit_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "ccc333")
+    assert _record(repo, "ccc333")["mode"] == "snapshot"
+    proc = _stop(flavour, "ccc333", repo)
+    assert proc.returncode == 0, proc.stderr
+    assert not wt.exists()
+    # The snapshot commit is on no ref: nothing to delete, git gc collects it.
+    assert _git(repo, "for-each-ref").stdout.strip() == ""
+    assert (repo / "app.py").is_file() and (repo / "secret.env").is_file()
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_in_place_folder_is_never_removed(flavour: str, tmp_path: Path) -> None:
+    folder = tmp_path / "plain"
+    folder.mkdir()
+    (folder / "file.txt").write_text("keep me\n", encoding="utf-8")
+    assert _guard(flavour, "agent-ddd444", folder).returncode == 0
+    proc = _stop(flavour, "ddd444", folder)
+    assert proc.returncode == 0, proc.stderr
+    assert (folder / "file.txt").read_text(encoding="utf-8") == "keep me\n"
+    row = _reap_rows(folder)[-1]
+    assert (row["decision"], row["reason"]) == ("reap_skipped", "in_place_never_removed")
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_stop_without_a_record_touches_nothing(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    # A worktree the guard did not create (no record) must never be reaped.
+    other = tmp_path / "other-wt"
+    _git(repo, "worktree", "add", "-q", "--detach", str(other), "HEAD")
+    proc = _stop(flavour, "eee555", repo)
+    assert proc.returncode == 0, proc.stderr
+    assert other.is_dir()
+    assert _reap_rows(repo) == []
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_second_stop_is_a_noop(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    _launch(flavour, repo, "fff666")
+    assert _stop(flavour, "fff666", repo).returncode == 0
+    proc = _stop(flavour, "fff666", repo)
+    assert proc.returncode == 0, proc.stderr
+    row = _reap_rows(repo)[-1]
+    assert (row["decision"], row["reason"]) == ("reap_skipped", "already_handled")
+
+
+# ── follow-up 2: the skipped-isolation warning can fire ─────────────────────
+
+
+def _agent_def(project: Path, name: str, isolation: str | None, user_scope: bool = False) -> None:
+    base = (project.parent / "fakehome") if user_scope else project
+    d = base / ".claude" / "agents"
+    d.mkdir(parents=True, exist_ok=True)
+    iso = f"isolation: {isolation}\n" if isolation else ""
+    (d / f"{name}-file.md").write_text(
+        f"---\nname: {name}\ndescription: test agent\n{iso}---\nBody.\n", encoding="utf-8")
+
+
+def _register_guard(project: Path) -> None:
+    d = project / ".claude"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "settings.json").write_text(json.dumps({"hooks": {"WorktreeCreate": [{"hooks": [
+        {"type": "command",
+         "command": 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/worktree-guard.sh"'}]}]}}),
+        encoding="utf-8")
+
+
+def _start(flavour: str, project: Path, agent_id: str, agent_type: str) -> subprocess.CompletedProcess:
+    return _run("subagent-start-isolation-check", flavour,
+                {"hook_event_name": "SubagentStart", "cwd": str(project),
+                 "agent_id": agent_id, "agent_type": agent_type}, project)
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+@pytest.mark.parametrize("user_scope", [False, True], ids=["project-def", "user-def"])
+def test_isolated_definition_without_a_worktree_is_warned(flavour: str, user_scope: bool,
+                                                         tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    _register_guard(repo)
+    _agent_def(repo, "my-coder", "worktree", user_scope=user_scope)
+    proc = _start(flavour, repo, "abc123", "my-coder")
+    assert proc.returncode == 0, proc.stderr
+    ctx = json.loads(proc.stdout.strip().splitlines()[-1])["hookSpecificOutput"]["additionalContext"]
+    assert "ISOLATION SKIPPED" in ctx and "my-coder" in ctx
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+@pytest.mark.parametrize("case", ["guard-made-worktree", "guard-not-registered",
+                                  "definition-not-isolated", "definition-unknown", "plugin-type"])
+def test_skipped_isolation_warning_leave_alone(flavour: str, case: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    agent_type = "my-coder"
+    if case != "guard-not-registered":
+        _register_guard(repo)
+    if case == "definition-not-isolated":
+        _agent_def(repo, "my-coder", None)
+    elif case != "definition-unknown":
+        _agent_def(repo, "my-coder", "worktree")
+    if case == "guard-made-worktree":
+        _launch(flavour, repo, "abc123")
+    if case == "plugin-type":
+        agent_type = "some-plugin:my-coder"
+    proc = _start(flavour, repo, "abc123", agent_type)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == ""

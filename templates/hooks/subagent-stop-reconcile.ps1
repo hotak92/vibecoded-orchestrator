@@ -134,6 +134,34 @@ try {
     Add-Content -Path $LogFile -Value $line -ErrorAction Stop
 } catch { }
 
+# Step 1b (v0.2.102 W6-Q follow-up) - must match the .sh sibling: reap the
+# agent's worktree when it is provably unchanged (the harness neither removes
+# a hook-created worktree nor runs WorktreeRemove when a subagent finishes).
+# Conditions live in _lib/worktree-records.ps1 :: Invoke-WtrecReap. A kept
+# worktree is logged with path + reason and named on stderr. Never blocks.
+$WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
+if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
+    . $WtrecHelper
+    $reap = $null
+    try { $reap = Invoke-WtrecReap $ProjectRoot $AgentId } catch { $reap = $null }
+    if ($reap) {
+        try {
+            $row = [ordered]@{
+                timestamp     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                hook          = "subagent-stop-reconcile"
+                decision      = "reap_" + $reap.Decision
+                reason        = $reap.Reason
+                agent_id      = $AgentId
+                resolved_path = $reap.Path
+            }
+            Add-Content -Path (Join-Path $LogDir "worktree-guard.jsonl") -Value ($row | ConvertTo-Json -Compress) -ErrorAction Stop
+        } catch { }
+        if ($reap.Decision -eq "kept") {
+            [Console]::Error.WriteLine("subagent-stop-reconcile: worktree of agent $AgentId KEPT at $($reap.Path) ($($reap.Reason)) - review, merge or remove it")
+        }
+    }
+}
+
 # ----------------------------------------------------------------------
 # Steps 2-5 (V52-L.1): only when we have a usable AgentId AND the
 # snapshot helper sourced successfully. Otherwise short-circuit to

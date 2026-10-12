@@ -109,14 +109,17 @@ cwd = (
     or ""
 )
 agent_id = d.get("agent_id") or ""
+agent_type = d.get("agent_type") or ""
 sys.stdout.write(str(iso) + "\n")
-sys.stdout.write(str(cwd) + "\n")
-sys.stdout.write(str(agent_id))
-' 2>/dev/null || printf '0\n\n')
+sys.stdout.write(str(cwd).replace("\n", " ") + "\n")
+sys.stdout.write(str(agent_id).replace("\n", " ") + "\n")
+sys.stdout.write(str(agent_type).replace("\n", " "))
+' 2>/dev/null || printf '0\n\n\n')
 
 ISO_FLAG="$(printf '%s' "$PARSED" | sed -n '1p')"
 CWD_FIELD="$(printf '%s' "$PARSED" | sed -n '2p')"
 AGENT_ID="$(printf '%s' "$PARSED" | sed -n '3p')"
+AGENT_TYPE="$(printf '%s' "$PARSED" | sed -n '4p')"
 
 # emit_ctx MSG — the SubagentStart additionalContext envelope.
 emit_ctx() {
@@ -156,6 +159,80 @@ case "$AGENT_ID" in
                 esac
             fi
         done
+        ;;
+esac
+
+# ── Skipped-isolation detection (v0.2.102 W6-Q follow-up) ─────────────────
+# The live SubagentStart payload carries no isolation flag, so the payload
+# branch further down can never fire on its own. What IS knowable: the
+# agent's definition (by `agent_type`, which is the frontmatter `name`) and
+# whether worktree-guard handled this launch — WorktreeCreate fires before
+# SubagentStart (verified live on Claude Code 2.1.285), and the guard writes
+# a record per launch (_lib/worktree-records.sh). A definition that declares
+# `isolation: worktree` with NO record for this agent id means the harness
+# started it without creating a worktree — e.g. an agent-teams teammate,
+# which the docs say "runs in the main session's working directory" despite
+# frontmatter isolation. Warned only when it is decidable:
+#   * the definition is found in <project>/.claude/agents or ~/.claude/agents
+#     (plugin-scoped `a:b` types and --agents JSON definitions: unknown → no-op);
+#   * worktree-guard is registered in this project's settings (when it is
+#     parked, the harness makes the worktree itself and writes no record).
+# A record that outlived its reaped worktree still counts (a resumed agent).
+agent_def_isolation() {
+    AGENT_TYPE_FOR_PY="$1" PROJECT_FOR_PY="$PROJECT_ROOT" "$PY" -c '
+import os, re, sys
+from pathlib import Path
+want = os.environ["AGENT_TYPE_FOR_PY"]
+roots = [Path(os.environ["PROJECT_FOR_PY"]) / ".claude" / "agents",
+         Path.home() / ".claude" / "agents"]
+def front(p):
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    out = {}
+    for line in text[3:end].splitlines():
+        m = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$", line)
+        if m:
+            out[m.group(1)] = m.group(2).strip("\"'\''")
+    return out
+for root in roots:
+    if not root.is_dir():
+        continue
+    for p in sorted(root.rglob("*.md")):
+        fm = front(p)
+        if fm is None:
+            continue
+        if fm.get("name", p.stem) == want:
+            print(fm.get("isolation", ""))
+            sys.exit(0)
+' 2>/dev/null || true
+}
+guard_registered() {
+    local f
+    for f in "$PROJECT_ROOT/.claude/settings.json" "$PROJECT_ROOT/.claude/settings.local.json"; do
+        [ -f "$f" ] && grep -q 'worktree-guard\.' "$f" 2>/dev/null && return 0
+    done
+    return 1
+}
+case "$AGENT_TYPE" in
+    ''|*:*) ;;
+    *)
+        if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
+            # shellcheck source=_lib/worktree-records.sh disable=SC1091
+            . "$SCRIPT_DIR/_lib/worktree-records.sh"
+            if ! wtrec_find "$PROJECT_ROOT" "$AGENT_ID" >/dev/null \
+                && guard_registered \
+                && [ "$(agent_def_isolation "$AGENT_TYPE")" = "worktree" ]; then
+                emit_ctx "ISOLATION SKIPPED - the definition of \`$AGENT_TYPE\` declares \`isolation: worktree\`, but no isolated worktree was created for this launch: you are running in the parent's working directory and every edit lands in the shared checkout (this happens, for example, when the agent is started as an agent-teams teammate). BEFORE any edit or git write: stop and report this to the caller, or work only on what the brief explicitly allows in the shared tree. Do NOT commit from the parent checkout."
+                exit 0
+            fi
+        fi
         ;;
 esac
 

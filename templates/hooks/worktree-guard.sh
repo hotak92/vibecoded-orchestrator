@@ -314,6 +314,20 @@ fi
 # is off or different. Notices live in .claude/state/worktree-guard/; an
 # identifier outside [A-Za-z0-9._-] gets no notice (the log row remains).
 NOTICE_DIR="$PROJECT_ROOT/.claude/state/worktree-guard"
+
+# Per-launch records (v0.2.102 W6-Q follow-up): the one home is
+# _lib/worktree-records.sh. subagent-stop-reconcile reaps an unchanged
+# worktree from its record; subagent-start-isolation-check uses the record to
+# tell "the guard handled this agent" from "isolation was skipped".
+if [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
+    # shellcheck source=_lib/worktree-records.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/worktree-records.sh"
+    wtrec_prune "$PROJECT_ROOT"
+fi
+record_launch() {
+    command -v wtrec_write >/dev/null 2>&1 || return 0
+    wtrec_write "$PROJECT_ROOT" "$WT_NAME" "$@"
+}
 write_notice() {
     case "$WT_NAME" in
         ''|*[!A-Za-z0-9._-]*|.*) return 0 ;;
@@ -346,6 +360,7 @@ if [ -z "$TOPLEVEL" ]; then
     fi
     write_notice "VCO worktree-guard: worktree isolation is OFF for this subagent. $RUN_DIR is not inside a git repository, so no isolated worktree can be created; you are working DIRECTLY in the project folder and every edit lands there immediately. Say this in your final report. Isolation turns on by itself once the folder is a git repository (git init)."
     log_event "in_place" "not_a_repo" "$PROPOSED_PATH" "$RUN_DIR"
+    record_launch "in_place" "$RUN_DIR" "" ""
     printf 'worktree-guard: %s is not a git repository - the subagent runs in place, without worktree isolation\n' "$RUN_DIR" >&2
     emit_path "$RUN_DIR"
     exit 0
@@ -400,7 +415,7 @@ fi
 # (per the strict contract — a failed create must be LOUD, never a silent
 # shared-tree fallback). Returns via exit; never returns normally on failure.
 create_worktree() {
-    local target="$1" reason existing add_err
+    local target="$1" reason existing add_err rec_mode
     # Already registered at this exact path? (re-fire / retry) → success.
     # `git worktree list --porcelain` emits `worktree <abs-path>` lines.
     existing="$(git -C "$TOPLEVEL_ABS" worktree list --porcelain 2>/dev/null \
@@ -419,6 +434,8 @@ create_worktree() {
             write_notice "VCO worktree-guard: this repository has no commits yet, so your isolated worktree ($target) starts from a SNAPSHOT of the project's working tree (commit $BASE_REF, on no branch) instead of HEAD. The main checkout is untouched by your edits. Say this in your final report and give the user the command that brings your changes back: git -C \"$target\" add -A && git -C \"$target\" diff --binary --cached $BASE_REF | git -C \"$TOPLEVEL_ABS\" apply"
         fi
         log_event "created" "$BASE_REASON" "$PROPOSED_PATH" "$target"
+        if [ "$BASE_REF" = "HEAD" ]; then rec_mode="head"; else rec_mode="snapshot"; fi
+        record_launch "$rec_mode" "$target" "$(git -C "$target" rev-parse HEAD 2>/dev/null || true)" "$TOPLEVEL_ABS"
         emit_path "$target"
         exit 0
     fi

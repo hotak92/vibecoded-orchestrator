@@ -181,6 +181,44 @@ if [ -n "$JSONL" ]; then
     printf '%s\n' "$JSONL" >> "$LOG_FILE" 2>/dev/null || true
 fi
 
+# Step 1b (v0.2.102 W6-Q follow-up): reap the agent's worktree when it is
+# provably unchanged. worktree-guard creates every isolated agent's worktree,
+# and for a hook-created worktree the harness neither removes it nor runs
+# WorktreeRemove when a subagent finishes
+# (https://code.claude.com/docs/en/hooks#worktreeremove) — so without this
+# step every launch left one behind. The decision (and every condition that
+# keeps a worktree) lives in _lib/worktree-records.sh :: wtrec_reap. A kept
+# worktree is logged with its path and reason to
+# .claude/logs/worktree-guard.jsonl and named on stderr. Runs before the
+# snapshot reconciler's early exits so it never depends on them; never
+# blocks (SubagentStop context would keep the subagent running).
+if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
+    # shellcheck source=_lib/worktree-records.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/worktree-records.sh"
+    REAP="$(wtrec_reap "$PROJECT_ROOT" "$AGENT_ID" 2>/dev/null || true)"
+    if [ -n "$REAP" ]; then
+        REAP_DECISION="$(printf '%s' "$REAP" | cut -f1)"
+        REAP_REASON="$(printf '%s' "$REAP" | cut -f2)"
+        REAP_PATH="$(printf '%s' "$REAP" | cut -f3-)"
+        AGENT_ID_FOR_PY="$AGENT_ID" DEC_FOR_PY="$REAP_DECISION" REASON_FOR_PY="$REAP_REASON" \
+        PATH_FOR_PY="$REAP_PATH" OUT_FOR_PY="$LOG_DIR/worktree-guard.jsonl" "$PY" -c '
+import json, os
+from datetime import datetime, timezone
+e = os.environ
+row = {"timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+       "hook": "subagent-stop-reconcile", "decision": "reap_" + e["DEC_FOR_PY"],
+       "reason": e["REASON_FOR_PY"], "agent_id": e["AGENT_ID_FOR_PY"],
+       "resolved_path": e["PATH_FOR_PY"]}
+with open(e["OUT_FOR_PY"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(row) + "\n")
+' 2>/dev/null || true
+        if [ "$REAP_DECISION" = "kept" ]; then
+            printf 'subagent-stop-reconcile: worktree of agent %s KEPT at %s (%s) - review, merge or remove it\n' \
+                "$AGENT_ID" "$REAP_PATH" "$REAP_REASON" >&2
+        fi
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Steps 2-5 (V52-L.1 reconciler): only when we have a usable AGENT_ID
 # AND the snapshot helper sourced successfully. Otherwise short-circuit
