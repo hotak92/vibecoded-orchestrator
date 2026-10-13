@@ -282,7 +282,7 @@ attempt_install_python() {
 # v0.2.51 Bug G: Node.js detection + auto-install
 #
 # Node 18+ is needed for:
-#   - The Playwright MCP (npx -y @playwright/mcp@latest)
+#   - The Playwright MCP (npx -y @playwright/mcp@<pin> --browser chromium)
 #   - The bundled-npm pinning helpers (@anthropic-ai/claude-code, etc.)
 #   - The Tauri launcher build path (npm during cargo tauri build)
 #

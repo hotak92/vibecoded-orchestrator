@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from vco_lib import mcp_scan_rules
+from vco_lib import playwright_mcp as _playwright_mcp
 from vco_lib.deferral_report import DeferralEntry, DeferralReport
 
 
@@ -276,27 +277,27 @@ def _build_python_mcp_entries(
         "env": weaviate_env,
     }
 
-    # playwright (F-1, v0.2.73)
-    # Browser automation via Microsoft's `@playwright/mcp`. The entry
-    # mirrors EXACTLY how the MCP is launched everywhere else in the
-    # stack: bare `npx -y @playwright/mcp@latest` — the same invocation
-    # the GUI catalog ships (vct-launcher-core/src/types.rs::
-    # default_mcp_servers) and `_install_playwright_browsers` pre-caches.
-    # `npx` resolves from PATH cross-OS; no venv-python and no env vars.
-    # Default-enabled per project. MUST stay in sync with the Rust builder
-    # mcp_registration.rs::build_default_mcp_entries.
+    # playwright (F-1, v0.2.73; pinned v0.2.102 W6-Z4)
+    # Browser automation via Microsoft's `@playwright/mcp`, registered as
+    # `npx -y @playwright/mcp@<pin> --browser chromium` — composed by
+    # `vco_lib.playwright_mcp.registration_entry` from the
+    # `bundled_mcp_versions.toml` [npx.playwright_mcp] row, the SAME row the
+    # Rust builder (mcp_registration.rs::build_default_mcp_entries) and the
+    # GUI catalog (vct-launcher-core/src/types.rs) read, and the one the
+    # install-time browser pre-cache installs for. Until v0.2.102 it was a
+    # floating `@latest` with no `--browser`, which launched the system-Chrome
+    # channel and never used the pre-cached Chromium. `npx` is a bare name; no
+    # venv-python and no env vars. Default-enabled per project. Every
+    # install / `--update` rewrites this entry wholesale (see
+    # `_python_fallback_write_mcp_entries` / Rust `register_mcp`), which is how
+    # an existing install moves off `@latest`.
     #
     # Pre-v0.2.73 this entry was MISSING from both builders (audit finding
     # F-1): the GUI catalog shipped enabled=True so the toggle-ON write
     # never fired on a fresh install, and no install path wrote the entry —
     # the Chromium pre-cache was spent on an MCP that never reached
     # ~/.claude.json.
-    playwright_entry = {
-        "type": "stdio",
-        "command": "npx",
-        "args": ["-y", "@playwright/mcp@latest"],
-        "env": {},
-    }
+    playwright_entry = _playwright_mcp.registration_entry()
     playwright_dropped: list[str] = []
 
     # NOTE (v0.2.101 → v0.2.102): the `search` MCP was deleted outright in
@@ -822,9 +823,10 @@ def _scan_deprecated_mcp_entries(
 # ids, so they are removed ONLY when the on-disk entry is positively
 # VCO-shaped — otherwise a user's own mermaid/excalidraw/playwright would be
 # destroyed on uninstall. "VCO-shaped" = the same install_root-anchored
-# predicate the deprecated/stale scanners use, PLUS playwright's exact
-# `npx -y @playwright/mcp@latest` launch fingerprint (playwright is the one
-# VCO entry with no install_root path — see _build_python_mcp_entries).
+# predicate the deprecated/stale scanners use, PLUS playwright's exact npx
+# launch fingerprint — the pinned registration or the pre-v0.2.102
+# `npx -y @playwright/mcp@latest` (playwright is the one VCO entry with no
+# install_root path — see _build_python_mcp_entries).
 # ---------------------------------------------------------------------------
 
 
@@ -908,18 +910,15 @@ def _mcp_entry_path_inside_install_root(entry: dict, install_root: Path) -> bool
 
 
 def _is_vco_shaped_playwright_entry(entry: dict) -> bool:
-    """True iff the entry is VCO's EXACT playwright launch fingerprint:
-    ``command == "npx"`` and ``args == ["-y", "@playwright/mcp@latest"]`` —
-    the invocation both builders emit (``_build_python_mcp_entries`` /
-    ``mcp_registration.rs::build_default_mcp_entries``). A user's own
+    """True iff the entry is one of VCO's EXACT playwright launch
+    fingerprints: ``command == "npx"`` with either the pinned registration
+    both builders emit today (``npx -y @playwright/mcp@<pin> --browser
+    chromium``) or the pre-v0.2.102 ``["-y", "@playwright/mcp@latest"]`` an
+    install not yet updated still carries — one predicate,
+    :func:`vco_lib.playwright_mcp.is_vco_shaped_entry`. A user's own
     playwright (a different tag, missing ``-y``, or an absolute path) does
     NOT match, so it survives uninstall."""
-    if not isinstance(entry, dict):
-        return False
-    if entry.get("command") != "npx":
-        return False
-    args = entry.get("args")
-    return args == ["-y", "@playwright/mcp@latest"]
+    return _playwright_mcp.is_vco_shaped_entry(entry)
 
 
 def _is_vco_shaped_scrub_entry(

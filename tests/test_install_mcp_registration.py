@@ -254,10 +254,14 @@ class BuildEntriesTests(unittest.TestCase):
             self.assertEqual(names, ["weaviate-kg", "playwright"])
 
     def test_playwright_entry_shape(self):
-        """F-1 (v0.2.73): playwright registration must match the shipped
-        launch command exactly (`npx -y @playwright/mcp@latest`), with an
-        empty env and no venv-python involvement — same shape as the Rust
-        builder (mcp_registration.rs) and the GUI catalog (types.rs)."""
+        """F-1 (v0.2.73) + v0.2.102 W6-Z4: playwright registration is the
+        PINNED launch `npx -y @playwright/mcp@<pin> --browser chromium` from
+        bundled_mcp_versions.toml [npx.playwright_mcp], with an empty env and
+        no venv-python involvement — same shape as the Rust builder
+        (mcp_registration.rs) and the GUI catalog (types.rs). Never the
+        floating `@latest`, which launched the system-Chrome channel."""
+        from vco_lib import playwright_mcp
+        pin = playwright_mcp.load_pin()
         with tempfile.TemporaryDirectory() as td:
             root = _make_pseudo_install_root(Path(td))
             py = install._resolve_venv_python_for_install(root)
@@ -266,7 +270,11 @@ class BuildEntriesTests(unittest.TestCase):
             entry, dropped = by_name["playwright"]
             self.assertEqual(entry["type"], "stdio")
             self.assertEqual(entry["command"], "npx")
-            self.assertEqual(entry["args"], ["-y", "@playwright/mcp@latest"])
+            self.assertEqual(
+                entry["args"],
+                ["-y", f"@playwright/mcp@{pin.version}", "--browser", "chromium"],
+            )
+            self.assertNotEqual(pin.version, "latest")
             self.assertEqual(entry["env"], {})
             self.assertEqual(dropped, [])
 
@@ -460,6 +468,38 @@ class RegisterMcpsOrchestrationTests(unittest.TestCase):
             # Deferral emitted because Python fallback was used (informational).
             ids = [e.condition_id for e in report.entries]
             self.assertIn("mcp_registration_python_fallback", ids)
+
+    def test_update_rewrites_a_legacy_latest_playwright_entry(self):
+        """v0.2.102 W6-Z4 — the refresh path for EXISTING installs: a
+        ~/.claude.json still carrying the pre-pin `npx -y
+        @playwright/mcp@latest` entry is rewritten to the pinned
+        `--browser chromium` launch by the ordinary registration pass
+        (`_register_mcps`, which every install and `--update` runs), and a
+        user's unrelated MCP is left byte-identical. Red-proof: restore the
+        `@latest` literal in `_build_python_mcp_entries` → this fails."""
+        from vco_lib import playwright_mcp
+        with tempfile.TemporaryDirectory() as td:
+            root = _make_pseudo_install_root(Path(td))
+            fake_home = Path(td) / "fake_home"
+            fake_home.mkdir()
+            target = fake_home / ".claude.json"
+            mine = {"command": "/opt/mine/serve", "args": ["--x"]}
+            target.write_text(json.dumps({"mcpServers": {
+                "playwright": {"type": "stdio", "command": "npx",
+                               "args": ["-y", "@playwright/mcp@latest"], "env": {}},
+                "mine": mine,
+            }}), encoding="utf-8")
+            self._run_with_overrides(
+                root, fake_home,
+                bundled_binary=False, allow_download=False, allow_cargo=False,
+            )
+            data = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(
+                data["mcpServers"]["playwright"],
+                playwright_mcp.registration_entry(),
+            )
+            self.assertIn("--browser", data["mcpServers"]["playwright"]["args"])
+            self.assertEqual(data["mcpServers"]["mine"], mine)
 
     def test_no_venv_emits_critical_deferral_and_does_not_crash(self):
         """No venv-python anywhere → soft-fail + critical deferral entry."""

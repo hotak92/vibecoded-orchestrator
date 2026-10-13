@@ -186,17 +186,23 @@ class InstallPyDelegationTests(unittest.TestCase):
     def test_playwright_skip_message_is_honest(self):
         """RED on c67ef888: install.py told the user the MCP would
         "lazy-install when first invoked" — impossible with `command: npx` and
-        no npx. The honest statement is that it cannot spawn."""
-        window = self.src[self.src.index("def _install_playwright_browsers"):]
-        window = window[: window.index("def _install_codegraph_treesitter")]
-        # Scope to the npx-MISSING branch: the Chromium messages further down
-        # legitimately say "will lazy-install Chromium on first browser call"
-        # (that download genuinely can happen later — the MCP spawn cannot).
-        branch = window[window.index("if not npx_path:"):]
-        branch = branch[: branch.index("print(\"(this may take")]
-        self.assertIn("CANNOT SPAWN", branch)
-        self.assertNotIn("lazy-install", branch)
+        no npx. The honest statement is that it cannot spawn.
 
+        v0.2.102 W6-Z4: the pre-cache moved into
+        ``vco_lib.playwright_mcp.precache`` (install.py keeps a thin shim), so
+        this now drives the npx-MISSING branch and reads what it PRINTS
+        instead of scanning install.py's source."""
+        from vco_lib import playwright_mcp
+
+        lines: list[str] = []
+        outcome = playwright_mcp.precache(
+            npx_path=None, runner=lambda *a, **k: None,
+            log_event=lambda *a, **k: None, environ={}, out=lines.append,
+        )
+        printed = "\n".join(lines)
+        self.assertEqual(outcome, "no-npx")
+        self.assertIn("CANNOT SPAWN", printed)
+        self.assertNotIn("lazy-install", printed)
 
 if __name__ == "__main__":
     unittest.main()

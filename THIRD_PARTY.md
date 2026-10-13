@@ -6,11 +6,11 @@ For the launcher binary's compiled-in Rust crates, see `launcher/dist/THIRD_PART
 
 ## Other MCP servers
 
-### Playwright MCP — `@playwright/mcp` (lazy-installed)
+### Playwright MCP — `@playwright/mcp` (pinned, fetched by npx)
 
 - **License:** Apache-2.0
-- **Install path:** `npx -y @playwright/mcp@latest` (no version pin — see install.py)
-- **Bundled by browser fetch:** Chromium binary downloaded on demand
+- **Install path:** `npx -y @playwright/mcp@<pin> --browser chromium` — exact version + npm shasum pinned in `vco_lib/bundled_mcp_versions.toml` `[npx.playwright_mcp]`
+- **Bundled by browser fetch:** the Chromium revision the pinned package's playwright-core requests, downloaded at install/update through that package's own installer
 - **Upstream:** <https://github.com/microsoft/playwright-mcp>
 
 ## Embedding / inference

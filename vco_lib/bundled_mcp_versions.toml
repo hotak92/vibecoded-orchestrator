@@ -47,10 +47,30 @@
 # the wrappers, the vendored excalidraw fork and the install pre-pins
 # they served are all gone. Only the [chromium] reuse pin remains.
 
+# [npx.<key>] — packages VCO REGISTERS as an `npx` launch (never
+# `npm install -g`), so `vco verify-pins` (which asks `npm ls -g` about the
+# [npm.*] set) must not see them. Same exact-version / shasum discipline as
+# [npm.*], plus:
+#   browser : str — the `--browser` value the registration passes (v0.2.102
+#                   W6-Z4: without it @playwright/mcp uses the `chrome`
+#                   channel, i.e. a system Google Chrome VCO never installs).
+# Readers: vco_lib/playwright_mcp.py (registration args, browser pre-cache,
+# doctor probe) and vct-launcher-core/src/bundled_versions.rs (BUNDLED_NPX —
+# the Rust registration builder + GUI catalog). A release bump of the
+# Playwright MCP is ONE edit here: version + shasum (`npm view
+# @playwright/mcp@<v> dist.shasum`). The browser revision is NOT pinned here
+# — it is read from the pinned package's own playwright-core at install /
+# probe time, so it cannot drift from what the MCP requests.
+[npx.playwright_mcp]
+package = "@playwright/mcp"
+version = "0.0.83"
+shasum  = "30bf9c6c0d80835517fd2e9b022559ea05cb1428"
+browser = "chromium"
+
 [chromium]
 # Mermaid PNG export + Excalidraw PNG export both lazy-load a Chromium
-# instance. Playwright already manages its own Chromium download via
-# `npx playwright install chromium` (see install.py::_install_playwright_browsers).
+# instance. Playwright already manages its own Chromium download (the pinned
+# Playwright MCP's own installer — see vco_lib/playwright_mcp.py::precache).
 # We reuse THAT Chromium rather than fetching a second copy — there is
 # no second download to pin here.
 reuse_playwright = true
