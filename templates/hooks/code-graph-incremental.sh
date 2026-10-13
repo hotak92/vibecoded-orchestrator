@@ -37,6 +37,7 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 set -euo pipefail
 
+# shellcheck source=_lib/stderr-cap.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
 EDITED_FILE="$1"
@@ -376,6 +377,19 @@ else
     _DOT_CLAUDE_FLAG="--no-index-dot-claude"
 fi
 
+# v0.2.102: an edit claimed by an extra path is analyzed with --as-extra-path,
+# like every other extra-path analyzer run (the panel's Sync button, the
+# automatic refresh and the queued Stop drain build their argv through
+# vco_lib.codegraph_extras_refresh.build_extra_sync_argv or its Rust mirror
+# extra_path_sync_args). It limits the
+# analyzer's deletes to rows provably stamped with the extra path, so a
+# single-file run under an extra never removes a primary-root row of the same
+# collection. MUST MATCH the .ps1 sibling.
+_EXTRA_PATH_FLAG=()
+if [ "$EXTRAS_MATCHED" -eq 1 ]; then
+    _EXTRA_PATH_FLAG=(--as-extra-path)
+fi
+
 # Run single-file analysis in background (no internal debounce — the
 # per-file coalescing is handled by post-file-edit.sh's debounce layer).
 # In single-file mode the analyzer scopes analysis to the one edited file,
@@ -417,6 +431,7 @@ fi
         --only-file "$EDITED_FILE" \
         --canonical-source "$_CANON_ROOT" \
         "$_DOT_CLAUDE_FLAG" \
+        ${_EXTRA_PATH_FLAG[@]+"${_EXTRA_PATH_FLAG[@]}"} \
         2>&1 | tail -5
 ) &
 

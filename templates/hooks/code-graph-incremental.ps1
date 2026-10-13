@@ -1,10 +1,10 @@
-﻿# OS-EXEMPT-PARITY: .sh sibling uses the hub resolver
-#   (vct_project_config.sh --field code_graph_collection_prefix); this
-#   .ps1 uses a different design path (`detect-project.ps1` helper +
-#   `Split-Path -Leaf` fallback), so the v0.2.23 W1 slug-vs-prefix
-#   resolver-field switch in the .sh has no corresponding change here.
-#   Marking the exemption explicitly so the OS-parity CI gate accepts
-#   the asymmetric modification.
+﻿# Parity (v0.2.102): this hook and its .sh sibling resolve the same way -
+#   hub `code_graph_collection_prefix` with a folder-name fallback, extra
+#   paths, sibling detection, canonical git root, worktree gate - and pass the
+#   same analyzer argv. tests/test_code_graph_incremental_hook.sh runs ONE
+#   scenario set against both (`sh` and `ps1` flavors). The OS-EXEMPT-PARITY
+#   marker that used to sit here claimed this file did not use the hub
+#   resolver; it did, and the exemption only hid the two from the parity gate.
 # parity-confirmation 2026-05-10: .sh sibling now uses _lib/find-python.sh; this .ps1 already used _lib/find-python.ps1 — true parity, no asymmetric fix.
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
@@ -145,10 +145,16 @@ if ($EditedFile -notlike "$RepoPath/*" -and $EditedFile -notlike "$RepoPath\*") 
 
 # Auto-detect project (best-effort; helper may not exist on Windows).
 # v0.2.47: skip when extras already claimed the edited file.
+# v0.2.102: detect-project.ps1 is a function LIBRARY (it only defines
+# Get-ProjectForFile, mirroring the `source` + detect_project_for_file use of
+# the .sh sibling). Running it as a script with positional args, as this hook
+# did since v0.2.50, printed nothing, so sibling detection was dead on Windows.
+# Dot-source it and call the function, like the .sh hook. MUST MATCH the .sh.
 $DetectPs1 = Join-Path $DefaultRepoRoot ".claude/scripts/detect-project.ps1"
 if (-not $ExtrasMatched -and (Test-Path $DetectPs1)) {
     try {
-        $detected = (& $PsExe -NoProfile -File $DetectPs1 $EditedFile $RepoPath 2>$null).Trim()
+        . $DetectPs1
+        $detected = ("" + (Get-ProjectForFile -FilePath $EditedFile -CurrentRoot $RepoPath)).Trim()
         if ($detected) {
             $ProjectName = $detected
             $RepoPath = Join-Path (Split-Path $RepoPath -Parent) $detected
@@ -287,6 +293,13 @@ if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 $IndexDotClaude = Resolve-IndexDotClaude -Root $CanonRoot
 $DotClaudeFlag = if ($IndexDotClaude) { '--index-dot-claude' } else { '--no-index-dot-claude' }
 $analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, '--canonical-source', $CanonRoot, $DotClaudeFlag)
+# v0.2.102: an edit claimed by an extra path is analyzed with --as-extra-path,
+# like every other extra-path analyzer run (vco_lib.codegraph_extras_refresh.
+# build_extra_sync_argv): deletes are limited to rows provably stamped with
+# the extra path. MUST MATCH the .sh sibling.
+if ($ExtrasMatched) {
+    $analyzerArgs += '--as-extra-path'
+}
 # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1, dot-sourced
 # at the top of this file): an unguarded `-WindowStyle Hidden` is REJECTED on
 # non-Windows PowerShell editions, so the analyzer spawn never happens and the
