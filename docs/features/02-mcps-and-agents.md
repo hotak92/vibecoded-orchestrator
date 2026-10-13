@@ -230,10 +230,10 @@ the objects that predate that fix and would otherwise stay duplicated until thei
 node happens to be edited again.
 
 ### `kg-infer` CLI (roadmap — not shipped)
-Removed from the bundle in v0.2.54 (Track G parity sweep): the wrapper shipped without its backing `infer_knowledge.py` module, so it was broken-on-arrival on every OS. The intent — infer typed WikiLink relationships using a local LLM and apply tag-propagation rules from `TAG_HIERARCHY.md` — remains roadmap; the wrapper returns together with `infer_knowledge.py` when that lands.
+Removed from the bundle in v0.2.54 (Track G parity sweep): the wrapper shipped without its backing `infer_knowledge.py` module, so it was broken-on-arrival on every OS. The intent to infer typed WikiLink relationships with a local LLM remains roadmap; the wrapper returns together with `infer_knowledge.py` when that lands. Its other half, applying tag-propagation rules from `TAG_HIERARCHY.md`, is withdrawn: owner decision OD-1 (2026-10-07, re-confirmed 2026-10-13) rules that the KG is not hierarchical and a node's tags are exactly its frontmatter, so no tool propagates tags through links.
 
 ### `kg-migrate` CLI
-Validate and fix KG nodes against `VOCABULARY.md` and `TAG_HIERARCHY.md`. Flags: `--check`, `--fix`, `--interactive`, `--file <path>`. Backed by `migrate_to_vocabulary.py`.
+Validate KG nodes against `VOCABULARY.md`; `--fix` normalises tag format and adds keyword-suggested tags (no tag hierarchy is involved). Flags: `--check`, `--fix`, `--interactive`, `--file <path>`. Backed by `migrate_to_vocabulary.py`.
 
 ### `code-graph-analyze` CLI
 Analyze a repository and populate code graph collections in Weaviate.

@@ -4,9 +4,10 @@
 """
 Migrate Knowledge Nodes to Vocabulary Standard
 
-Scans all knowledge nodes and suggests/applies fixes to comply with:
-- knowledge/VOCABULARY.md
-- knowledge/TAG_HIERARCHY.md
+Validates every knowledge node against knowledge/VOCABULARY.md (via
+sync_knowledge_graph.validate_node_against_vocabulary); --fix normalises tag
+format and adds keyword-suggested tags. Tags are never derived from a tag
+hierarchy: a node's tags are exactly its frontmatter (OD-1).
 
 Usage:
     python migrate_to_vocabulary.py --check           # Check all nodes, report issues
