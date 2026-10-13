@@ -175,22 +175,21 @@ def test_g5_soft_label_propagates_to_event():
 
 
 def test_g5_drain_soft_labels_below_terminal_floor(monkeypatch, tmp_path):
-    """G5 end-to-end at the drain: an AGING pending file whose window is below the
-    terminal floor but above the soft floor is computed as a soft label rather
-    than left to die."""
+    """G5 end-to-end at the drain: a FINAL window (the session ended — W6-RL2)
+    below the terminal floor but above the soft floor is computed as a soft
+    label rather than left to die."""
     import time as _time
     from claude_mcp_servers.scripts import rl_drain_citations as drain
     from claude_mcp_servers.rl_client import citation_pending
 
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
-    # Force the floors: gate high, terminal floor high, soft floor low, age=0.
+    # Force the floors: gate high, terminal floor high, soft floor low.
     monkeypatch.setenv("RL_MIN_ANSWER_TOKENS_FOR_CITATION", "25000")
     monkeypatch.setenv("RL_TERMINAL_CITATION_MIN_TOKENS", "2000")
     monkeypatch.setenv("RL_SOFT_CITATION_MIN_TOKENS", "10")
-    monkeypatch.setenv("RL_TERMINAL_CITATION_AGE_SECONDS", "0")
 
-    # Stage a pending file aged 1800s (older than terminal age 0, younger than
-    # the 3600s TTL so the sweep-first step does not reclaim it).
+    # Stage a pending file aged 1800s (age no longer matters: the SessionEnd
+    # drain below is what makes the window final).
     ctx = {
         "nodes": [{"title": "Alpha", "n_emb": [1.0, 0.0]}],
         "active_model": "qwen3-embedding:0.6b",
@@ -234,7 +233,7 @@ def test_g5_drain_soft_labels_below_terminal_floor(monkeypatch, tmp_path):
 
     summary = drain.drain_session(
         "sess-soft", transcript_path="/fake/transcript.jsonl",
-        project_root=str(tmp_path),
+        project_root=str(tmp_path), session_end=True,
         compute_fn=_fake_compute, token_count_fn=_fake_token_count,
     )
 

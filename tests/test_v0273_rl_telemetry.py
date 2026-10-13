@@ -361,7 +361,7 @@ def _transcript(tmp_path, query, answer_text):
     return str(p)
 
 
-def _drain(tmp_path, session_id, transcript, computed: list):
+def _drain(tmp_path, session_id, transcript, computed: list, *, session_end=False):
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
@@ -380,6 +380,7 @@ def _drain(tmp_path, session_id, transcript, computed: list):
         project_root=str(tmp_path),
         compute_fn=_compute,
         token_count_fn=lambda text: len(text) // 4,
+        **({"session_end": True} if session_end else {}),
     )
 
 
@@ -394,14 +395,26 @@ def test_rl4_young_below_gate_file_is_left(tmp_path):
     assert not computed
 
 
-def test_rl4_aged_file_above_terminal_floor_is_computed(tmp_path):
-    """An AGING file whose window clears the terminal floor gets labeled
-    instead of dying at TTL."""
+def test_rl4_aged_file_of_a_live_session_is_left(tmp_path):
+    """v0.2.102 W6-RL2 (owner ruling R7-4): age alone never applies the
+    terminal floor — a 40-minute-old file of a LIVE session keeps
+    accumulating (the retired RL_TERMINAL_CITATION_AGE_SECONDS trigger)."""
     computed: list = []
     _stage_pending_file(tmp_path, "sess-b", "task-aged", age_seconds=2400)
-    # ~12k chars ≈ 3k tokens: above the 2000 terminal floor, below 25k gate.
     transcript = _transcript(tmp_path, "how are batches validated?", "answer body " * 1000)
     summary = _drain(tmp_path, "sess-b", transcript, computed)
+    assert summary["computed"] == 0 and summary["left"] == 1
+    assert not computed
+
+
+def test_rl4_session_end_file_above_terminal_floor_is_computed(tmp_path):
+    """At the session's END (SessionEnd drain) a window that clears the
+    terminal floor gets labeled instead of being lost."""
+    computed: list = []
+    _stage_pending_file(tmp_path, "sess-b", "task-aged", age_seconds=10)
+    # ~12k chars ≈ 3k tokens: above the 2000 terminal floor, below 25k gate.
+    transcript = _transcript(tmp_path, "how are batches validated?", "answer body " * 1000)
+    summary = _drain(tmp_path, "sess-b", transcript, computed, session_end=True)
     assert summary["computed"] == 1
     assert computed[0]["ctx"]["fire_reason"] == "terminal_floor"
     assert computed[0]["ctx"]["window_tokens"] >= 2000
@@ -411,12 +424,13 @@ def test_rl4_aged_file_above_terminal_floor_is_computed(tmp_path):
     assert not list(pend_dir.glob("*task-aged*"))
 
 
-def test_rl4_aged_file_below_terminal_floor_is_left(tmp_path):
-    """Aged but genuinely tiny window (< terminal floor) still left for TTL."""
+def test_rl4_session_end_file_below_every_floor_is_left(tmp_path):
+    """Session ended but a genuinely tiny window (< soft floor): the SessionEnd
+    drain deletes nothing — the next drain finalizes it."""
     computed: list = []
     _stage_pending_file(tmp_path, "sess-c", "task-tiny", age_seconds=2400)
-    transcript = _transcript(tmp_path, "how are batches validated?", "tiny " * 100)
-    summary = _drain(tmp_path, "sess-c", transcript, computed)
+    transcript = _transcript(tmp_path, "how are batches validated?", "tiny " * 40)
+    summary = _drain(tmp_path, "sess-c", transcript, computed, session_end=True)
     assert summary["computed"] == 0
     assert summary["left"] == 1
 

@@ -3,7 +3,7 @@ title: Orchestrator Hook System
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, hooks, automation, workflow]
 created: 2026-04-27T18:30:00Z
-updated: 2026-10-06T09:00:00Z
+updated: 2026-10-13T00:00:00Z
 status: active
 ---
 
@@ -135,6 +135,11 @@ Context nearing limit
 
 **subagent-stop-reconcile.sh** / **stop-drain-citations.sh** (async)
 - Reconciles subagent output in a DETACHED job (v0.2.102): reaps an unchanged worktree, scans and indexes what the agent changed (its own worktree when it had one, else the shared-tree snapshot diff, recorded as unattributed), and files alerts for the PARENT. The citation drain scores the RL citations staged by the subagent's injections against the subagent's own transcript (`agent_transcript_path`).
+
+### SessionEnd
+
+**stop-drain-citations.sh** (synchronous, timeout 5; v0.2.102)
+- The main chat's end: records it, then scores the session's pending RL citations with the terminal and soft-label floors in a DETACHED drain. RL citations have no scoring deadline — a citation below the full token gate waits for its own chat to end and is scored against that chat's transcript only. A file is removed before then only when provably abandoned (`RL_CITATION_ABANDONED_DAYS`, default 7, and no live owner), scored first or logged as unscored.
 
 ### PreToolUse
 

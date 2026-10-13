@@ -435,7 +435,7 @@ def _drive_retention_housekeeping() -> None:
 
     Used by the opted-out skip branch in ``rerank_and_emit`` — mirrors the
     writer-side ``RLTelemetryWriter._maybe_prune_rl_events`` (same
-    ``maybe_run_retention`` single home: same hourly throttle, same 6-h
+    ``maybe_run_retention`` single home: same hourly throttle, same
     in-flight-citation floor, same soft-fail). Project scope resolves the
     same way the writer's does (the hub ProjectConfig); resolution failure
     degrades to a global prune, matching the writer's project_id=None

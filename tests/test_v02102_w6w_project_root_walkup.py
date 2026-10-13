@@ -6,7 +6,7 @@ The defect: ``citation_pending._resolve_project_root()`` returned
 ``CLAUDE_PROJECT_DIR``, else the BARE cwd. The ``kg-search`` CLI runs without
 ``CLAUDE_PROJECT_DIR`` (Bash tool, user shell); run from a subfolder it staged
 ``<subfolder>/.claude/state/rl_pending/nosession__kg_cli_*.json``, which the
-drain and the TTL sweep (both keyed on the project root) never visit. The same
+drains and the collector (all keyed on the project root) never visit. The same
 bare-cwd rung lived in the RL fallback counter writer (+ rl-doctor's reader),
 the hook context router's state root, the retrieval-expansion log, and — as
 the install root rather than the cwd — the force-flush sentinel.
@@ -149,7 +149,7 @@ class TestCitationPending:
         monkeypatch.chdir(layout.sub)
         path = _stage()
         assert path is not None
-        assert cp.sweep_expired(ttl_seconds=0, now_ms=10**15) == 1
+        assert cp.collect_abandoned(idle_after_s=0, now=10**12) == 1
         assert not path.exists()
 
     def test_env_wins(self, layout, monkeypatch, tmp_path):
@@ -178,7 +178,7 @@ class TestCitationPending:
             assert _stage() is None
             assert cp.pending_dir() is None
             assert cp.list_pending_for_session("") == []
-            assert cp.sweep_expired() == 0
+            assert cp.collect_abandoned() == 0
         assert not (plain / ".claude").exists()
         assert any("skipping the pending-queue write" in r.message for r in caplog.records)
 

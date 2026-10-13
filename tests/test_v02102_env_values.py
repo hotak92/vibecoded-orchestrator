@@ -511,10 +511,12 @@ def test_embed_request_timeout_says_bad_values(monkeypatch, caplog, raw):
 @pytest.mark.parametrize("raw", FLOAT_PROBES)
 def test_rl_plain_float_ttls(monkeypatch, raw):
     """The ``float(env or DEFAULT)`` family: any float, blank/garbage ->
-    default (deferred emit, identity cache, recovery deadline, drain age)."""
+    default (deferred emit, identity cache, recovery deadline), plus the
+    citation collector's abandoned-file bound (W6-RL2; positive only — it
+    replaced the retired drain terminal age)."""
+    from claude_mcp_servers.rl_client import citation_pending as cp
     from claude_mcp_servers.rl_client import deferred_emit as de
     from claude_mcp_servers.weaviate_mcp import rl_enrichment as rle
-    import rl_drain_citations as drain
 
     _set(monkeypatch, de.ORPHAN_TTL_ENV, raw)
     assert _same(de._orphan_ttl_s(), _parse_or(raw, de._ORPHAN_TTL_DEFAULT_S))
@@ -523,8 +525,11 @@ def test_rl_plain_float_ttls(monkeypatch, raw):
     _set(monkeypatch, rle._RL_CODE_RECOVER_DEADLINE_ENV, raw)
     assert _same(rle._rl_code_recover_budget()[1],
                  _parse_or(raw, rle._RL_CODE_RECOVER_DEADLINE_DEFAULT_S))
-    _set(monkeypatch, "RL_TERMINAL_CITATION_AGE_SECONDS", raw)
-    assert _same(drain._terminal_age_seconds(), _parse_or(raw, 1800.0))
+    _set(monkeypatch, cp.ABANDONED_AFTER_ENV, raw)
+    days = _parse_or(raw, cp.ABANDONED_AFTER_DAYS_DEFAULT)
+    if not days > 0:
+        days = cp.ABANDONED_AFTER_DAYS_DEFAULT
+    assert _same(cp.abandoned_after_seconds(), days * 86400.0)
 
 
 @pytest.mark.parametrize("raw", FLOAT_PROBES)

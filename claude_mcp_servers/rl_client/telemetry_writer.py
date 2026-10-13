@@ -404,7 +404,7 @@ class RLTelemetryWriter:
         # HOUSEKEEPING, not telemetry — a user who opts out of collecting NEW
         # events still wants their pre-existing rl_events rows to age out (the
         # opt-out promise is "stop recording me", not "keep my old rows
-        # forever"). The 6-h in-flight-citation floor inside the retention plan
+        # forever"). The in-flight-citation floor inside the retention plan
         # applies identically in both branches.
         self._maybe_prune_rl_events()
 
