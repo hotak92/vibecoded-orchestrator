@@ -366,7 +366,7 @@ def test_marker_mirrors_match_the_ssot():
     from vco_lib.credential_shapes import TEST_PLACEHOLDER_MARKER
     assert TEST_PLACEHOLDER_MARKER == MARKER
     sh = subprocess.run(
-        ["bash", "-c", '. "$1"; printf %s "$CREDSHAPES_TEST_PLACEHOLDER_MARKER"',
+        ["bash", "-c", '. "$1"; printf %s "$CSHAPES_TEST_PLACEHOLDER_MARKER"',
          "_", str(HOOKS / "_lib" / "credshapes.sh")],
         capture_output=True, text=True, check=True)
     assert sh.stdout == TEST_PLACEHOLDER_MARKER

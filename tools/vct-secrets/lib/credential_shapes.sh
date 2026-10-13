@@ -50,12 +50,12 @@
 # alternation as a whole stays whole-string. Mirrors, in SSOT declaration
 # order: github_token, github_fine_grained_pat, aws_access_key_id, gitlab_pat,
 # slack_token, atlassian_token, jwt, sk_vendor_key.
-_CREDSHAPES_ARGV_NAME_RE='^gh[pousr]_[A-Za-z0-9]{36}$|^github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}$|^AKIA[0-9A-Z]{16}$|^glpat-[A-Za-z0-9_-]{20,}$|^xox[bpoas]-[A-Za-z0-9_-]{20,}$|^ATATT[A-Za-z0-9_-]{20,}$|^eyJ[A-Za-z0-9_-]{20,}$|^sk-[A-Za-z0-9_-]{20,}$'
+_CSHAPES_ARGV_NAME_RE='^gh[pousr]_[A-Za-z0-9]{36}$|^github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}$|^AKIA[0-9A-Z]{16}$|^glpat-[A-Za-z0-9_-]{20,}$|^xox[bpoas]-[A-Za-z0-9_-]{20,}$|^ATATT[A-Za-z0-9_-]{20,}$|^eyJ[A-Za-z0-9_-]{20,}$|^sk-[A-Za-z0-9_-]{20,}$'
 
 # _credshapes_is_argv_name_credential NAME
 #   exit 0 when NAME has the shape of a live credential, 1 otherwise.
 #   Pure predicate: no side effects, no logging, safe to call anywhere.
 #   LC_ALL=C so the character classes are byte-wise and locale-independent.
 _credshapes_is_argv_name_credential() {
-    printf '%s' "${1:-}" | LC_ALL=C grep -qE "$_CREDSHAPES_ARGV_NAME_RE"
+    printf '%s' "${1:-}" | LC_ALL=C grep -qE "$_CSHAPES_ARGV_NAME_RE"
 }

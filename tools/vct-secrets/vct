@@ -442,7 +442,7 @@ Do NOT 'vct set' it blindly — that risks a second, divergent copy on disk."
 # re-enables the exact hazard. A false positive has a real remedy that keeps
 # the guard intact — pick a name that is not credential-shaped (names are
 # arbitrary; prefix it) — and the error message says so.
-_VCT_CREDENTIAL_NAME_SHAPES="$_CREDSHAPES_ARGV_NAME_RE"
+_VCT_CREDENTIAL_NAME_SHAPES="$_CSHAPES_ARGV_NAME_RE"
 
 # The placeholder that stands in for a credential-shaped name in any message,
 # audit row or report. Never interpolate the name itself alongside it.

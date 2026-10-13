@@ -122,6 +122,14 @@ FILE_KIND_CASES = [
     ("env_dollar_reference", "DB_PWD=" + "$X", ".env", []),  # vco-secret-scan: test-placeholder
     ("py_call_is_an_expression", "password" + EQ + "get_password()", "app.py", []),
     ("yaml_unquoted", "password: " + "hunter" + "2", "config.yaml", [UY]),  # vco-secret-scan: test-placeholder
+    # Review R2 V-2: YAML booleans are syntax (any case), single letters and
+    # words that merely start like one are values; outside YAML a literal.
+    ("yaml_boolean_no", "password: " + "no", "config.yaml", []),  # vco-secret-scan: test-placeholder
+    ("yaml_boolean_false_comment", "password: " + "False # off", "c.yml", []),  # vco-secret-scan: test-placeholder
+    ("yaml_boolean_on_upper", "api_key: " + "ON", "c.yaml", []),  # vco-secret-scan: test-placeholder
+    ("yaml_single_letter_y", "password: " + "y", "config.yaml", [UY]),  # vco-secret-scan: test-placeholder
+    ("yaml_word_offset", "password: " + "offset", "config.yaml", [UY]),  # vco-secret-scan: test-placeholder
+    ("env_no_is_a_literal", "PASSWORD=" + "no", ".env", [U]),  # vco-secret-scan: test-placeholder
     ("dockerfile_env", "ENV DB_PASSWORD " + "hunter" + "2", "Dockerfile", [U]),
     # Backticks: a JS literal in code, shell command substitution (syntax)
     # in an env/config-style file.
@@ -257,15 +265,14 @@ _CODE_CASES = (
 _MARK = "  # " + TEST_PLACEHOLDER_MARKER
 # (name, body, alerts, file name). Code cases run in a .py file; the file-kind
 # cases (review F2) each run in their own kind, with and without the marker.
-_SCANNER_CASES = (
-    [(n, b, a, "f.py") for n, b, a in _CODE_CASES]
-    + [(n, t + "\n", bool(e), f) for n, t, f, e in FILE_KIND_CASES]
-    + [(n + "_marked", t + _MARK + "\n", False, f)
-       for n, t, f, _e in FILE_KIND_CASES]
-)
+_SCANNER_CASES: list[tuple[str, str | bytes, bool, str]] = []
+_SCANNER_CASES.extend((n, b, a, "f.py") for n, b, a in _CODE_CASES)
+_SCANNER_CASES.extend((n, t + "\n", bool(e), f) for n, t, f, e in FILE_KIND_CASES)
+_SCANNER_CASES.extend((n + "_marked", t + _MARK + "\n", False, f)
+                      for n, t, f, _e in FILE_KIND_CASES)
 # re-review 2 #8: a CRLF line with an empty value is silent in every
 # scanner -- grep keeps the `\r`, so credscan.sh strips CRs first.
-_SCANNER_CASES += (("crlf_empty_value", b"DB_PASSWORD=\r\n", False, ".env"),)
+_SCANNER_CASES.append(("crlf_empty_value", b"DB_PASSWORD=\r\n", False, ".env"))
 _IDS = [c[0] for c in _SCANNER_CASES]
 
 

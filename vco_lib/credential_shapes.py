@@ -153,7 +153,7 @@ __all__ = [
 #: placeholder and is not reported. There is deliberately NO heuristic on how
 #: a value looks ("a real password could be 123456789"): only this marker, on
 #: the SAME line as the value, silences it. Mirrored as
-#: ``CREDSHAPES_TEST_PLACEHOLDER_MARKER`` in ``_lib/credshapes.sh`` and
+#: ``CSHAPES_TEST_PLACEHOLDER_MARKER`` in ``_lib/credshapes.sh`` and
 #: ``Get-CredShapesTestPlaceholderMarker`` in ``_lib/credshapes.ps1``; the
 #: parity test pins both to this value.
 TEST_PLACEHOLDER_MARKER = "vco-secret-scan: test-placeholder"
@@ -165,8 +165,9 @@ TEST_PLACEHOLDER_MARKER = "vco-secret-scan: test-placeholder"
 #: * ``env_config`` -- an unquoted value is a literal: .env / .env.* / *.env.*,
 #:   .ini / .cnf, .properties, .conf / .cfg, shell scripts and rc files,
 #:   Dockerfile / Containerfile (``ENV``), .pypirc and .npmrc (ini syntax).
-#: * ``yaml`` -- the same, with YAML's own value syntax (``null``, ``~``,
-#:   ``*alias``, flow / template braces) silent: its own unquoted shape.
+#: * ``yaml`` -- the same, with YAML's own value syntax (``null``, ``~``, the
+#:   boolean words, ``*alias``, flow / template braces) silent: its own
+#:   unquoted shape.
 #: * ``backtick_code`` -- a language with backtick STRING literals (JS / TS and
 #:   their component formats, Go raw strings); the only kind where a backtick
 #:   literal is a value. In shell / env files a backtick is command
@@ -331,9 +332,31 @@ _GENERIC_BACKTICK_VALUE = "`([^`$]|\\$[^`{])+\\$?`"
 #: ``{{ template }}``. Block-scalar indicators ``|`` / ``>`` (with ``-`` /
 #: ``+``) ALERT -- a literal follows on the next line -- and so does an anchored
 #: value ``&a hunter2``.
+#:
+#: YAML booleans are syntax too (W6-V review R2 V-2): ``yes`` / ``no`` /
+#: ``true`` / ``false`` / ``on`` / ``off`` are silent, in any letter case like
+#: ``null``, when the word ends the value or is followed by a space (so
+#: ``false # disabled`` is silent, ``offset`` / ``no-reply`` / ``yesterday``
+#: alert). Choice: the YAML 1.1 boolean words that real loaders resolve
+#: (PyYAML's 1.1 resolver set) but NOT the single letters ``y`` / ``n`` /
+#: ``Y`` / ``N`` -- the 1.1 spec lists them, PyYAML does not resolve them and
+#: YAML 1.2 makes them plain strings, so ``password: y`` stays a literal and
+#: alerts. Only the ``yaml`` kind: in an env/config file ``PASSWORD=no`` is a
+#: literal and alerts. Like ``null``, the words are silent after either
+#: separator (``KEY: no`` / ``KEY=no`` inside a YAML file).
+#:
+#: grep -E has no lookahead, so the words are excluded as a trie of
+#: "differs at this letter" arms; the first-character class excludes their
+#: initials (n t f y o) and each arm re-admits a value that leaves the trie.
 _GENERIC_YAML_VALUE = (
-    "([^\"'$`~*{\\[nN #]|[nN]($|[^uU])|[nN][uU]($|[^lL])"
-    "|[nN][uU][lL]($|[^lL])|[nN][uU][lL][lL][^ ])"
+    "([^\"'$`~*{\\[nNtTfFyYoO #]"
+    "|[nN]($|[^uUoO])|[nN][oO][^ ]"
+    "|[nN][uU]($|[^lL])|[nN][uU][lL]($|[^lL])|[nN][uU][lL][lL][^ ]"
+    "|[tT]($|[^rR])|[tT][rR]($|[^uU])|[tT][rR][uU]($|[^eE])|[tT][rR][uU][eE][^ ]"
+    "|[fF]($|[^aA])|[fF][aA]($|[^lL])|[fF][aA][lL]($|[^sS])"
+    "|[fF][aA][lL][sS]($|[^eE])|[fF][aA][lL][sS][eE][^ ]"
+    "|[yY]($|[^eE])|[yY][eE]($|[^sS])|[yY][eE][sS][^ ]"
+    "|[oO]($|[^nNfF])|[oO][nN][^ ]|[oO][fF]($|[^fF])|[oO][fF][fF][^ ])"
 )
 
 # ---------------------------------------------------------------------------

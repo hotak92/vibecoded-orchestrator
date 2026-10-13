@@ -140,9 +140,9 @@ if [ -n "${CS_HAS_PATH:-}" ]; then
 else
     credshapes_for_context "$CS_CTX" || { echo "__BAD_CONTEXT__"; exit 0; }
 fi
-for i in "${!CREDSHAPES_PATTERNS[@]}"; do
-    if printf '%s' "$CS_TEXT" | LC_ALL=C grep -qE -- "${CREDSHAPES_PATTERNS[$i]}"; then
-        printf '%s\n' "${CREDSHAPES_IDS[$i]}"
+for i in "${!CSHAPES_PATTERNS[@]}"; do
+    if printf '%s' "$CS_TEXT" | LC_ALL=C grep -qE -- "${CSHAPES_PATTERNS[$i]}"; then
+        printf '%s\n' "${CSHAPES_IDS[$i]}"
     fi
 done
 """
@@ -278,12 +278,12 @@ def test_mirrors_carry_the_ssot_file_kind_table():
     sh = BASH_MIRROR.read_text(encoding="utf-8")
     ps = PS1_MIRROR.read_text(encoding="utf-8-sig")
     for ssot, sh_name, ps_name in (
-        (ENV_CONFIG_EXACT_NAMES, "CREDSHAPES_ENV_CONFIG_EXACT_NAMES", "exact"),
-        (ENV_CONFIG_NAME_PREFIXES, "CREDSHAPES_ENV_CONFIG_NAME_PREFIXES", "prefixes"),
-        (ENV_CONFIG_NAME_INFIXES, "CREDSHAPES_ENV_CONFIG_NAME_INFIXES", "infixes"),
-        (ENV_CONFIG_NAME_SUFFIXES, "CREDSHAPES_ENV_CONFIG_NAME_SUFFIXES", "suffixes"),
-        (YAML_NAME_SUFFIXES, "CREDSHAPES_YAML_NAME_SUFFIXES", "yaml"),
-        (BACKTICK_CODE_NAME_SUFFIXES, "CREDSHAPES_BACKTICK_CODE_NAME_SUFFIXES", "backtick"),
+        (ENV_CONFIG_EXACT_NAMES, "CSHAPES_ENV_CONFIG_EXACT_NAMES", "exact"),
+        (ENV_CONFIG_NAME_PREFIXES, "CSHAPES_ENV_CONFIG_NAME_PREFIXES", "prefixes"),
+        (ENV_CONFIG_NAME_INFIXES, "CSHAPES_ENV_CONFIG_NAME_INFIXES", "infixes"),
+        (ENV_CONFIG_NAME_SUFFIXES, "CSHAPES_ENV_CONFIG_NAME_SUFFIXES", "suffixes"),
+        (YAML_NAME_SUFFIXES, "CSHAPES_YAML_NAME_SUFFIXES", "yaml"),
+        (BACKTICK_CODE_NAME_SUFFIXES, "CSHAPES_BACKTICK_CODE_NAME_SUFFIXES", "backtick"),
     ):
         assert _sh_array(sh, sh_name) == ssot, sh_name
         assert _ps_array(ps, ps_name) == ssot, ps_name
@@ -294,7 +294,7 @@ def test_mirrors_carry_the_ssot_file_kind_table():
     assert restricted == (("generic_secret_backtick", "backtick_code"),
                           ("generic_secret_unquoted", "env_config"),
                           ("generic_secret_unquoted_yaml", "yaml"))
-    assert _sh_array(sh, "CREDSHAPES_KIND_RESTRICTED") == tuple(
+    assert _sh_array(sh, "CSHAPES_KIND_RESTRICTED") == tuple(
         f"{i}:{k}" for i, k in restricted)
     ps_pairs = tuple(re.findall(r"\$r\['([^']+)'\] = '([^']+)'", ps))
     assert ps_pairs == restricted
@@ -330,9 +330,79 @@ def test_vct_mirror_matches_fixture(case):
 def test_vct_mirror_alternation_equals_ssot_argv_name():
     """The vct mirror's alternation is byte-identical to the SSOT's."""
     text = VCT_MIRROR.read_text(encoding="utf-8")
-    m = re.search(r"_CREDSHAPES_ARGV_NAME_RE='([^']*)'", text)
-    assert m, "could not find _CREDSHAPES_ARGV_NAME_RE in the vct mirror"
+    m = re.search(r"_CSHAPES_ARGV_NAME_RE='([^']*)'", text)
+    assert m, "could not find _CSHAPES_ARGV_NAME_RE in the vct mirror"
     assert m.group(1) == combined_pattern("argv_name")
+
+
+# ---------------------------------------------------------------------------
+# Structural — the mirrors' own names do not read as secrets to bash_security
+# ---------------------------------------------------------------------------
+# W6-V review R2 finding V-1: `bash_security`'s `echo_secret_var` /
+# `secret_var_expansion` rules match any `$NAME` containing KEY / TOKEN /
+# SECRET / PASS / CRED (case-insensitive), so the mirror arrays' former
+# `CRED`-prefixed stem made echoing them a BLOCKED command. The fix is the
+# names (the `CSHAPES_*` stem), never a weaker needle: the control rows
+# below prove real secret-shaped names are still refused. The stem also
+# carries no `VCO_` / `VCT_` prefix, because these are internal shell arrays,
+# not env keys (tests/test_v0292_env_keys_documented.py treats every
+# `VCO_*` / `VCT_*` name a shipped script reads as an env key to document).
+
+_SHELL_NAME_FILES = (
+    BASH_MIRROR,
+    BASH_MIRROR.parent / "credscan.sh",
+    VCT_MIRROR,
+)
+_ASSIGNED_NAME_RE = re.compile(
+    r"(?m)^[ \t]*(?:local[ \t]+|readonly[ \t]+|export[ \t]+|declare[ \t]+-\w+[ \t]+)?"
+    r"([A-Za-z_]\w*)\+?="
+)
+
+
+def _bash_security():
+    sys.path.insert(0, str(REPO / "templates" / "scripts"))
+    try:
+        import importlib
+        import bash_security  # pyright: ignore[reportMissingImports]  # resolved by the sys.path.insert above
+        importlib.reload(bash_security)
+    finally:
+        sys.path.pop(0)
+    return bash_security
+
+
+def _mirror_assigned_names() -> set:
+    names: set = set()
+    for path in _SHELL_NAME_FILES:
+        names.update(_ASSIGNED_NAME_RE.findall(path.read_text(encoding="utf-8")))
+    return names
+
+
+def test_mirror_variable_names_are_not_secret_shaped():
+    names = _mirror_assigned_names()
+    # Non-vacuous: the output contract and the vct alternation are found.
+    assert {"CSHAPES_IDS", "CSHAPES_LABELS", "CSHAPES_PATTERNS",
+            "CSHAPES_TEST_PLACEHOLDER_MARKER", "_CSHAPES_ARGV_NAME_RE"} <= names
+    bs = _bash_security()
+    blocked = {}
+    for name in sorted(names):
+        for cmd in (f'echo "${name}"', f"echo ${{{name}}}",
+                    f'printf "%s," ${{{name}[@]}}', f'printf "%s\\n" "${name}"'):
+            ok, reason = bs.check_command(cmd)
+            if not ok:
+                blocked[cmd] = reason.splitlines()[0] if reason else ""
+    assert not blocked, f"mirror names read as secrets: {blocked}"
+
+
+@pytest.mark.parametrize("cmd", [
+    'echo "$MY_CRED_TOKEN"',
+    "echo $MY_CRED_TOKEN",
+    'printf "%s" "${DB_PASSWORD}"',
+    "echo $CREDENTIALS",
+])
+def test_real_secret_shaped_names_still_blocked(cmd):
+    ok, reason = _bash_security().check_command(cmd)
+    assert not ok, f"needle weakened: {cmd!r} passed"
+    assert "secret" in reason.lower(), reason
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +452,7 @@ def test_consuming_site_actually_loads_the_vocabulary(rel):
     no-private-copy test while silently scanning for nothing.
     """
     text = (REPO / rel).read_text(encoding="utf-8")
-    assert re.search(r"credshapes(\.sh|\.ps1)|credential_shapes\.sh|Get-CredShapes|_CREDSHAPES_", text), (
+    assert re.search(r"credshapes(\.sh|\.ps1)|credential_shapes\.sh|Get-CredShapes|_CSHAPES_", text), (
         f"{rel} does not reference the shared credential-shape vocabulary"
     )
 
@@ -548,8 +618,8 @@ _BASH_LABELS = r"""
 set -u
 . "$MIRROR"
 credshapes_for_context "$CS_CTX" || exit 1
-for i in "${!CREDSHAPES_IDS[@]}"; do
-    printf '%s\t%s\n' "${CREDSHAPES_IDS[$i]}" "${CREDSHAPES_LABELS[$i]}"
+for i in "${!CSHAPES_IDS[@]}"; do
+    printf '%s\t%s\n' "${CSHAPES_IDS[$i]}" "${CSHAPES_LABELS[$i]}"
 done
 """
 
@@ -614,8 +684,8 @@ _BASH_PATTERNS = r"""
 set -u
 . "$MIRROR"
 credshapes_for_context "$CS_CTX" || exit 1
-for i in "${!CREDSHAPES_PATTERNS[@]}"; do
-    printf '%s\t%s\n' "${CREDSHAPES_IDS[$i]}" "${CREDSHAPES_PATTERNS[$i]}"
+for i in "${!CSHAPES_PATTERNS[@]}"; do
+    printf '%s\t%s\n' "${CSHAPES_IDS[$i]}" "${CSHAPES_PATTERNS[$i]}"
 done
 """
 
