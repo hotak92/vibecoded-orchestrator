@@ -484,3 +484,30 @@ def test_skipped_isolation_warning_leave_alone(flavour: str, case: str, tmp_path
     proc = _start(flavour, repo, "abc123", agent_type)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == ""
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_guard_outside_any_vco_project_is_quiet(flavour: str, tmp_path: Path) -> None:
+    """Fable re-check F-2: with no enclosing VCO project (CLAUDE_PROJECT_DIR
+    unset, no .claude marker) the lane-reservation lookup must be skipped
+    quietly in BOTH siblings — the .ps1 used to Join-Path an empty root and
+    print two binding errors on every WorktreeCreate."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "f.txt")
+    _git(repo, "commit", "-q", "-m", "init")
+    env = {k: v for k, v in os.environ.items() if k not in _LEAK_ENV_KEYS}
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    env["HOME"] = str(tmp_path / "fakehome")
+    path = HOOKS / f"worktree-guard.{flavour}"
+    argv = ["bash", str(path)] if flavour == "sh" else [_PS, *PWSH_BASE_FLAGS, "-File", str(path)]
+    proc = subprocess.run(
+        argv, input=json.dumps({"hook_event_name": "WorktreeCreate", "name": "agent-noroot",
+                                "cwd": str(repo)}),
+        capture_output=True, text=True, env=env, cwd=str(repo), timeout=90)
+    assert proc.returncode == 0, proc.stderr
+    assert "Cannot bind argument" not in proc.stderr, proc.stderr
+    assert "Value cannot be null" not in proc.stderr, proc.stderr
+    assert proc.stdout.strip(), "the worktree path is still printed"

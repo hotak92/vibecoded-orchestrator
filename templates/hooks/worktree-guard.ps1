@@ -233,8 +233,11 @@ function Write-Notice([string]$text) {
 # can take minutes and must never be killed mid-run; the WorktreeCreate
 # registration carries no timeout, so the harness default (600 s) is the
 # outer bound.
-$LanePending = Join-Path (Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "lane-reservations") "pending"
-if ($WtName -and (Test-Path -LiteralPath $LanePending -PathType Container) -and
+# No enclosing VCO project => no reservation can exist (same as the .sh
+# sibling, whose `ls` on the root-less path fails quietly).
+$LanePending = ""
+if ($ProjectRoot) { $LanePending = Join-Path (Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "lane-reservations") "pending" }
+if ($LanePending -and $WtName -and (Test-Path -LiteralPath $LanePending -PathType Container) -and
     @(Get-ChildItem -LiteralPath $LanePending -File -Filter "res-*.json" -ErrorAction SilentlyContinue).Count -gt 0) {
     $VcoPy = $null
     $VenvHelper = Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1"
