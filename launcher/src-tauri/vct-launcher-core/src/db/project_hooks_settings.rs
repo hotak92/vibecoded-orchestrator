@@ -110,6 +110,61 @@ impl Db {
         Ok(())
     }
 
+    /// Park a registration the bundle merge KEPT OUT because the user's
+    /// disable of the same hook on another event carries to it (v0.2.102,
+    /// lane W6-HTAB; `vco_lib.parked_hooks carried`). There were no removed
+    /// bytes — `entry_json` is the shipped registration in the parked-entry
+    /// shape, built by Python.
+    ///
+    /// Unlike [`Self::park_project_hook_entry`] this NEVER overwrites a parked
+    /// entry already on the row: an existing one is the user's only copy of
+    /// what they disabled, and losing it to a synthesised entry would be data
+    /// loss. Returns `true` when this call parked the row, `false` when the
+    /// row was already parked (nothing changed). The new row's `source` /
+    /// `source_module` come from the row whose disable carries, so a bundled
+    /// hook stays labelled bundled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn park_carried_project_hook_entry(
+        &self,
+        project_id: &str,
+        event: &str,
+        matcher: &str,
+        command: &str,
+        entry_json: &str,
+        source: &str,
+        source_module: Option<&str>,
+        timeout_ms: Option<i64>,
+    ) -> Result<bool, String> {
+        let now = Utc::now().timestamp_millis();
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE project_hooks
+                    SET disabled_entry_json = ?5, enabled = 0, updated_at = ?6
+                  WHERE project_id = ?1 AND event = ?2 AND matcher = ?3
+                    AND command = ?4 AND disabled_entry_json IS NULL",
+                params![project_id, event, matcher, command, entry_json, now],
+            )
+            .map_err(|e| format!("park_carried_project_hook_entry (update): {}", e))?;
+        if n > 0 {
+            return Ok(true);
+        }
+        let inserted = guard
+            .execute(
+                "INSERT OR IGNORE INTO project_hooks
+                 (project_id, event, matcher, command, source, source_module,
+                  enabled, timeout_ms, config_json, disabled_entry_json,
+                  installed_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, '{}', ?8, ?9, ?9)",
+                params![
+                    project_id, event, matcher, command, source, source_module,
+                    timeout_ms, entry_json, now
+                ],
+            )
+            .map_err(|e| format!("park_carried_project_hook_entry (insert): {}", e))?;
+        Ok(inserted > 0)
+    }
+
     /// Read back a parked entry, or `None` when this hook is not parked.
     pub fn get_parked_project_hook_entry(
         &self,
@@ -308,6 +363,66 @@ mod tests {
         let parked = db.list_parked_project_hooks("p1").unwrap();
         assert_eq!(parked.len(), 1);
         assert_eq!(parked[0].timeout_ms, Some(5000), "metadata preserved");
+    }
+
+    // ─── W6-HTAB: carried registrations ────────────────────────────────
+
+    const CARRIED: &str = r#"{"schema":1,"event":"SessionEnd","matcher":"","item":{"command":"y"}}"#;
+
+    #[test]
+    fn a_carried_park_creates_a_row_labelled_like_its_source() {
+        let db = db_with_project();
+        let parked = db
+            .park_carried_project_hook_entry(
+                "p1", "SessionEnd", "", "bash d.sh", CARRIED, "bundled", None, Some(5000),
+            )
+            .unwrap();
+        assert!(parked);
+        let rows = db.list_parked_project_hooks("p1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event, "SessionEnd");
+        assert_eq!(rows[0].source, "bundled");
+        assert_eq!(rows[0].timeout_ms, Some(5000));
+        assert_eq!(rows[0].disabled_entry_json, CARRIED);
+        assert!(!db.list_project_hooks("p1").unwrap()[0].enabled);
+    }
+
+    #[test]
+    fn a_carried_park_never_overwrites_an_entry_already_parked() {
+        let db = db_with_project();
+        db.park_project_hook_entry("p1", "SessionEnd", "", "bash d.sh", PARKED).unwrap();
+        let parked = db
+            .park_carried_project_hook_entry(
+                "p1", "SessionEnd", "", "bash d.sh", CARRIED, "bundled", None, None,
+            )
+            .unwrap();
+        assert!(!parked, "an existing parked entry is the user's bytes — kept");
+        assert_eq!(
+            db.get_parked_project_hook_entry("p1", "SessionEnd", "", "bash d.sh")
+                .unwrap()
+                .as_deref(),
+            Some(PARKED)
+        );
+    }
+
+    #[test]
+    fn a_carried_park_fills_an_unparked_mirror_row_in_place() {
+        let db = db_with_project();
+        db.register_project_hook(
+            "p1", "SessionEnd", "", "bash d.sh", "bundled", None, Some(7000),
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert!(db
+            .park_carried_project_hook_entry(
+                "p1", "SessionEnd", "", "bash d.sh", CARRIED, "project", None, None,
+            )
+            .unwrap());
+        let rows = db.list_project_hooks("p1").unwrap();
+        assert_eq!(rows.len(), 1, "no duplicate row");
+        let parked = db.list_parked_project_hooks("p1").unwrap();
+        assert_eq!(parked[0].timeout_ms, Some(7000), "mirror metadata kept");
+        assert_eq!(parked[0].source, "bundled");
     }
 
     #[test]

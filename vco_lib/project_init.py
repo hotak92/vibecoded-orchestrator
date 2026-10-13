@@ -3436,15 +3436,9 @@ def _hook_globs_for_os() -> tuple[str, ...]:
     return hook_globs()
 
 
-def _settings_template_path(orchestrator_root: Path) -> Path:
-    """Pick the OS-specific settings.json template file."""
-    import platform
-    name = (
-        "settings.json.windows.template"
-        if platform.system() == "Windows"
-        else "settings.json.linux.template"
-    )
-    return orchestrator_root / "templates" / name
+# v0.2.102 (W6-HTAB): the OS template pick moved to its one home beside the
+# merge I/O, so the launcher's parked-hook carry check reads the same file.
+from vco_lib.bundle_settings_io import settings_template_path as _settings_template_path  # noqa: E402
 
 
 # v0.2.92: `_prune_now_empty_parents` moved to `vco_lib.fs_prune`. This module

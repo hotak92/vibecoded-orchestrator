@@ -33,7 +33,7 @@ from vco_lib.parked_hooks import ParkedHooksState
 from vco_lib.settings_merge import smart_merge_settings
 
 __all__ = ["REFUSAL_SURFACE", "STATUS_EDIT_REFUSED", "STATUS_UNPARSEABLE",
-           "merge_settings_template", "retry_command"]
+           "merge_settings_template", "retry_command", "settings_template_path"]
 
 #: ``settings_write_refused_<surface>`` family member for this writer.
 REFUSAL_SURFACE = "bundle_claude_settings_json"
@@ -42,6 +42,19 @@ STATUS_EDIT_REFUSED = "unchanged (JSONC edit refused)"
 
 #: ``write(target, data) -> redirect`` — ``project_init._write_file_atomic``.
 Writer = Callable[[Path, bytes], Optional[Path]]
+
+
+def settings_template_path(orchestrator_root: Path) -> Path:
+    """The OS-specific settings.json template the bundle merges — one home
+    (moved from ``project_init`` in v0.2.102; the launcher's parked-hook
+    carry check, ``vco_lib.parked_hooks carried``, reads the same file)."""
+    import platform
+    name = (
+        "settings.json.windows.template"
+        if platform.system() == "Windows"
+        else "settings.json.linux.template"
+    )
+    return Path(orchestrator_root) / "templates" / name
 
 
 def retry_command(project_root: Path) -> str:

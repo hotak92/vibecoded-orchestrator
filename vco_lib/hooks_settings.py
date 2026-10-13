@@ -1146,6 +1146,49 @@ def _remove_if_group(
     }
 
 
+def parked_entry_for_registration(
+    event: str, matcher: str, group: Dict[str, Any], items: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """A parked entry for a SHIPPED registration that was never written to
+    the project's settings.json (v0.2.102, lane W6-HTAB).
+
+    The case: a hook the user disabled on one event, which an upgrade newly
+    ships on another event. The bundle merge keeps that registration out
+    (``vco_lib.parked_hooks.find_parked_match``, ``live_identities``), so
+    there are no removed bytes to park. This builds the entry a disable
+    WOULD have produced had the registration been added the way the merge
+    adds it — its own group, appended after the event's existing groups,
+    the event key appended if absent — so :func:`insert_hook` restores it
+    exactly there. ``group`` is the template group (its non-``hooks`` keys
+    and key order are kept); ``items`` the template inner hooks of that one
+    command, copied. Several items (an ``if`` group) produce the ``items``
+    form, as :func:`_remove_if_group` does. Pure; one home of the blob shape.
+    """
+    if not items:
+        raise ValueError("parked_entry_for_registration needs at least one item")
+    keys = list(group.keys())
+    entry: Dict[str, Any] = {
+        "schema": PARKED_SCHEMA_VERSION,
+        "event": event,
+        "matcher": matcher,
+        # None = append: no recorded position to honour (insert_hook clamps).
+        "group_index": None,
+        "hook_index": None,
+    }
+    if len(items) == 1:
+        entry["item"] = dict(items[0])
+    else:
+        entry["items"] = [{"hook_index": None, "item": dict(it)} for it in items]
+    entry.update({
+        "group_removed": True,
+        "group_extra": {k: v for k, v in group.items() if k != "hooks"},
+        "group_key_index": keys.index("hooks") if "hooks" in keys else None,
+        "event_index": None,
+        "hooks_key_index": None,
+    })
+    return entry
+
+
 def _hook_present_in_another_form(
     doc: SettingsDoc, event: str, matcher: str, command: str, if_rule: Any = _ANY_IF
 ) -> bool:
