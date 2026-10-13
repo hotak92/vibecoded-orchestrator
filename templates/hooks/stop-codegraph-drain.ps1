@@ -275,6 +275,31 @@ foreach ($p in $lines) {
     [void]$byRoot[$h].Add($p)
 }
 
+# v0.2.102 W6-ALERTS2 (owner ruling 3): a gate probe found the hub unreachable
+# and indexed on doubt (FIX-A' unchanged). Tell the model once per session per
+# agent key so it can bring the hub back. This hook runs async on Stop, so
+# Claude Code hands the additionalContext over on the next turn (vendor hooks
+# doc, "How async hooks execute"). MUST MATCH stop-codegraph-drain.sh.
+if ($script:WorktreeGateHubUnreachable) {
+    $emitLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
+    if (Test-Path -LiteralPath $emitLib) { . $emitLib }
+    $sidLib = Join-Path $PSScriptRoot "_lib/session-id.ps1"
+    if (Test-Path -LiteralPath $sidLib) { . $sidLib }
+    $hubKey = $SessionId
+    if (Get-Command Get-VcoHookFastAgentKey -ErrorAction SilentlyContinue) {
+        $hubKey = Get-VcoHookFastAgentKey -HookStdin $HookStdin
+    }
+    if (Get-Command Get-VcoHubUnreachableNotice -ErrorAction SilentlyContinue) {
+        $hubNotice = Get-VcoHubUnreachableNotice -HooksDir $PSScriptRoot -ProjectRoot $ProjectRoot -AgentKey $hubKey `
+            -Who "The end-of-turn code-graph drain (stop-codegraph-drain)" `
+            -What "It still indexed this turn's worktree edits (the safe default when it cannot confirm that a worktree is unregistered), so throwaway worktrees may be indexed until the hub is back."
+        if ($hubNotice -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
+            $hubEvent = if ($HookStdin -match '"SubagentStop"') { "SubagentStop" } else { "Stop" }
+            Emit-AdditionalContext $hubNotice $hubEvent
+        }
+    }
+}
+
 # Nothing survived -> advance the rate-limit clock + clean up.
 if ($byRoot.Count -eq 0) {
     Set-Content -LiteralPath $lastTsFile -Value "$now" -NoNewline -ErrorAction SilentlyContinue

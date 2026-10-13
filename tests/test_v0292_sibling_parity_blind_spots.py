@@ -49,6 +49,10 @@ PS1_ONLY_LIB: frozenset[str] = frozenset({
     # v0.2.102 W6-R5FIX (review R5-8): the BOM-free UTF-8 writer; bash writes
     # the bytes it is given, so there is nothing to mirror.
     "utf8-nobom.ps1",
+    # v0.2.102 W6-ALERTS2: the pending path of agent-alerts-deliver.ps1, out
+    # of the hook file so PowerShell does not parse it on every tool call
+    # (matcher *). bash reads a script as it runs it — nothing to split.
+    "agent-alerts-deliver-pending.ps1",
 })
 
 

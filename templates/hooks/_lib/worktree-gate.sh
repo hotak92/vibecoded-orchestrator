@@ -45,6 +45,14 @@
 # (mirror cross-language logic; keep the git primitive + probe semantics
 # identical).
 
+# v0.2.102 W6-ALERTS2 (owner ruling 3): set to 1 when a probe answered
+# "hub unreachable" (exit 1). The decision does not change — still INDEX on
+# doubt — but the caller tells the model, once per session, so it can bring
+# the hub back (`vco_report_hub_unreachable` in _lib/emit-context.sh). Reset
+# when this lib is sourced, so an exported value never leaks in.
+# MUST MATCH worktree-gate.ps1's $script:WorktreeGateHubUnreachable.
+VCO_WORKTREE_GATE_HUB_UNREACHABLE=""
+
 # Return 0 (TRUE — SKIP the edit) when the edit is in an EPHEMERAL/unregistered
 # worktree; return 1 (FALSE — INDEX the edit) otherwise.
 #
@@ -100,6 +108,10 @@ _worktree_gate_should_skip() {
     if [ "$_wg_rc" -eq 2 ]; then
         return 0   # definitively unregistered worktree → SKIP
     fi
+    # exit 1 = hub unreachable (or a stale token): flag it for the caller's
+    # once-per-session notice; the decision stays INDEX.
+    # shellcheck disable=SC2034  # read by the sourcing hook
+    [ "$_wg_rc" -eq 1 ] && VCO_WORKTREE_GATE_HUB_UNREACHABLE=1
     # exit 0 (registered) OR exit 1 (uncertain / launcher off) → INDEX.
     return 1
 }

@@ -313,6 +313,18 @@ if [ "$EXTRAS_MATCHED" -eq 0 ]; then
         echo "ℹ️  code-graph: skipped worktree edit (ephemeral/unregistered) $EDITED_FILE" >&2
         exit 0
     fi
+    # v0.2.102 W6-ALERTS2 (owner ruling 3): the gate indexed on doubt because
+    # the hub did not answer. Say so (stderr — this script is run from the CLI
+    # or by a caller, with no hook event to answer), once per session/hour.
+    # MUST MATCH the .ps1 sibling.
+    if [ "${VCO_WORKTREE_GATE_HUB_UNREACHABLE:-}" = "1" ]; then
+        # shellcheck source=_lib/emit-context.sh disable=SC1091
+        [ -f "$SCRIPT_DIR/_lib/emit-context.sh" ] && . "$SCRIPT_DIR/_lib/emit-context.sh"
+        if command -v vco_report_hub_unreachable >/dev/null 2>&1; then
+            vco_report_hub_unreachable "$SCRIPT_DIR" "$REPO_PATH" "" "code-graph-incremental" \
+                "It indexed $EDITED_FILE anyway (the safe default when it cannot confirm that a worktree is unregistered), so throwaway worktrees may be indexed until the hub is back."
+        fi
+    fi
 fi
 
 # Resolve python: prefer venv, fall back to system python (cross-OS).

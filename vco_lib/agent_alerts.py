@@ -61,12 +61,25 @@ delivery moves such a file's rows to ``.claude/logs/agent-alerts-undelivered.jso
 and removes it, so the no-pending fast path stays an interpreter-free glob.
 A delivery claim nobody re-adopted for 7 days (its pid alive but its reuse
 unprovable) is swept the same way (review R6-1).
+
+Tagged rows in the undelivered log (owner ruling on review R7-2): a move can
+fail part-way (the log written but the claim's unlink refused, or the log
+write cut short), and the next sweep then moves the same rows again.
+Duplicates are acceptable there, untagged ones are not: before it writes the
+log, a move JOURNALS the attempt by marking the rows in the claim
+(:data:`SWEEP_ATTEMPT_KEY`, :func:`_move_rows_to_log`), so a row moved again
+later is written with ``possibly_duplicate: true``. A line that cannot be read
+as a JSON object (unparseable, truncated at end of file, not UTF-8, not an
+object) is never dropped: :func:`_read_rows` carries it as a
+``possibly_broken: true`` row holding its raw text, which a delivery moves to
+the log (``unreadable_alert_row``) and a sweep logs with the rest.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -102,6 +115,27 @@ DELIVERING_STALE_SECONDS = 60.0
 ORPHAN_AFTER_SECONDS = 7 * 24 * 3600.0
 #: Where an orphan's rows are kept for a human (relative to the project).
 UNDELIVERED_LOG_REL = Path(".claude") / "logs" / "agent-alerts-undelivered.jsonl"
+
+#: Undelivered-log row tags (owner ruling on review R7-2). A reader of the
+#: log treats a row carrying either as potentially broken:
+#: ``possibly_duplicate`` — moved by a RETRY after an earlier attempt on the
+#: same rows (the earlier copy may be in the log already, whole or partial);
+#: ``possibly_broken`` — the line could not be read as a JSON object; the row
+#: carries ``broken_reason``, the raw text (``raw``, at most
+#: :data:`MAX_BROKEN_RAW_CHARS`), ``raw_chars`` and ``raw_cut``.
+POSSIBLY_DUPLICATE_KEY = "possibly_duplicate"
+POSSIBLY_BROKEN_KEY = "possibly_broken"
+#: Internal journal mark written into a claim's rows BEFORE they are appended
+#: to the undelivered log (:func:`_move_rows_to_log`). Never written to the
+#: log itself; its presence on a row being moved means an earlier attempt
+#: may already have logged it.
+SWEEP_ATTEMPT_KEY = "_undelivered_move_attempted"
+#: Bound on the raw text a ``possibly_broken`` row carries.
+MAX_BROKEN_RAW_CHARS = 4096
+#: Temp file of the journal rewrite. The leading dot keeps it out of every
+#: ``agent_alerts_*`` glob (the deliver hooks' fast path, the claim globs),
+#: so a crash mid-rewrite never leaves something that looks pending.
+_REWRITE_TMP_PREFIX = ".agent_alerts_rewrite."
 
 #: ``None`` = pick the lock protocol by platform; tests set ``False`` to
 #: drive the Windows (O_EXCL sidecar) protocol on POSIX.
@@ -178,23 +212,102 @@ def append_alert(project_root: str, session_id: str, agent_id: str,
         return None
 
 
+def _broken_row(text: str, reason: str) -> Dict[str, Any]:
+    """A line that is not a readable row, carried as a ``possibly_broken``
+    row: the raw text travels in a JSON string (escaped on write, so it can
+    never break the JSONL around it), bounded at :data:`MAX_BROKEN_RAW_CHARS`."""
+    row: Dict[str, Any] = {
+        POSSIBLY_BROKEN_KEY: True,
+        "broken_reason": reason,
+        "raw": text[:MAX_BROKEN_RAW_CHARS],
+        "raw_chars": len(text),
+    }
+    if len(text) > MAX_BROKEN_RAW_CHARS:
+        row["raw_cut"] = True
+    return row
+
+
 def _read_rows(path: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+    """Every row of ``path``. A line that is not a JSON object is NOT dropped
+    (owner ruling on review R7-2): it comes back as a :func:`_broken_row` —
+    ``unparseable``, ``truncated`` (the last line, no newline: a write cut
+    short), ``not_an_object`` or ``invalid_utf8``. Blank lines are skipped.
+    ``[]`` when the file cannot be read."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(row, dict):
-                    rows.append(row)
+        data = path.read_bytes()
     except OSError:
-        pass
+        return []
+    rows: List[Dict[str, Any]] = []
+    lines = data.split(b"\n")
+    last = len(lines) - 1  # ``b""`` when the file ends with a newline
+    for i, raw in enumerate(lines):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            rows.append(_broken_row(raw.decode("utf-8", errors="replace"), "invalid_utf8"))
+            continue
+        try:
+            row = json.loads(text)
+        except ValueError:
+            rows.append(_broken_row(text, "truncated" if i == last else "unparseable"))
+            continue
+        rows.append(row if isinstance(row, dict) else _broken_row(text, "not_an_object"))
     return rows
+
+
+def _rewrite_rows(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """Replace ``path``'s content with ``rows`` atomically (temp file +
+    ``os.replace``). Not :func:`vco_lib.atomic.atomic_write_bytes`: its temp
+    name is ``<name>.<rand>.tmp``, which for a claim matches the
+    ``*.delivering.*`` glob — a crash would leave a fake claim. The caller
+    holds the lock. Raises ``OSError`` (the temp file is removed)."""
+    tmp = path.parent / f"{_REWRITE_TMP_PREFIX}{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _move_rows_to_log(claim: Path, all_rows: List[Dict[str, Any]],
+                      to_log: List[Dict[str, Any]], log: Path, reason: str) -> None:
+    """Move ``to_log`` (a subset of ``claim``'s ``all_rows``, same dict
+    objects) to the undelivered log, journalled (owner ruling on review R7-2).
+
+    1. Remember which rows already carry :data:`SWEEP_ATTEMPT_KEY` — an
+       earlier attempt may have logged them.
+    2. Mark ``to_log`` and rewrite the claim with the marks, so whatever
+       happens next (a log write cut short, a refused unlink, a crash), a
+       later move of these rows knows it is a retry.
+    3. Append them to the log; the retried ones carry
+       ``possibly_duplicate: true``.
+
+    The rows are marked IN PLACE, so a caller that hands them back to the
+    alert file after a failed log write hands back the marks too. When the
+    journal itself fails nothing was logged: the marks are taken off again
+    and ``OSError`` is raised. The caller holds the lock. Raises ``OSError``."""
+    retried = [r.get(SWEEP_ATTEMPT_KEY) is True for r in to_log]
+    for r in to_log:
+        r[SWEEP_ATTEMPT_KEY] = True
+    try:
+        _rewrite_rows(claim, all_rows)
+    except OSError:
+        for r, was in zip(to_log, retried):
+            if not was:
+                r.pop(SWEEP_ATTEMPT_KEY, None)
+        raise
+    _log_undelivered(log, to_log, reason, retried)
 
 
 def _claim(project_root: str, path: Path) -> Optional[Path]:
@@ -305,10 +418,11 @@ def sweep_orphan_alerts(project_root: str,
         try:
             log.parent.mkdir(parents=True, exist_ok=True)
             with _lock(project_root):
-                _log_undelivered(log, rows, "orphaned_alert_file")
+                _move_rows_to_log(claimed, rows, rows, log, "orphaned_alert_file")
         except OSError:
-            # The log is unwritable: hand the rows back (never lost). If even
-            # that fails, the claim stays on disk and is re-adopted later.
+            # The log is unwritable (or was cut short): hand the rows back,
+            # journal marks included, so a later move tags them (R7-2). If
+            # even that fails, the claim stays on disk and is re-adopted later.
             if _append_back(project_root, path, rows):
                 _finish([claimed])
             continue
@@ -326,22 +440,31 @@ def sweep_orphan_alerts(project_root: str,
             with _lock(project_root):
                 if not claim.exists():
                     continue  # re-adopted or swept meanwhile
-                _log_undelivered(log, _read_rows(claim), "orphaned_delivery_claim")
+                rows = _read_rows(claim)
+                _move_rows_to_log(claim, rows, rows, log, "orphaned_delivery_claim")
                 claim.unlink()
         except OSError:
-            continue  # log unwritable (or unlink refused): the claim stays, never lost
+            # Log unwritable (or unlink refused): the claim stays, never lost;
+            # its rows carry the journal mark, so the retry is tagged (R7-2).
+            continue
         swept += 1
     return swept
 
 
-def _log_undelivered(log: Path, rows: List[Dict[str, Any]], reason: str) -> None:
+def _log_undelivered(log: Path, rows: List[Dict[str, Any]], reason: str,
+                     retried: Optional[List[bool]] = None) -> None:
     """Append ``rows`` to the undelivered log, each tagged with ``reason`` and
-    the sweep time. The caller holds the lock. Raises ``OSError``."""
+    the sweep time; ``retried[i]`` adds ``possibly_duplicate: true`` (R7-2).
+    The journal mark is not written. The caller holds the lock. Raises
+    ``OSError``."""
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with open(log, "a", encoding="utf-8") as fh:
-        for r in rows:
-            fh.write(json.dumps(dict(r, undelivered_reason=reason, swept_at=stamp),
-                                ensure_ascii=False) + "\n")
+        for i, r in enumerate(rows):
+            out = dict(r, undelivered_reason=reason, swept_at=stamp)
+            out.pop(SWEEP_ATTEMPT_KEY, None)
+            if retried is not None and retried[i]:
+                out[POSSIBLY_DUPLICATE_KEY] = True
+            fh.write(json.dumps(out, ensure_ascii=False) + "\n")
 
 
 def _row_matches(row: Dict[str, Any], session_id: str, agent_id: str) -> bool:
@@ -385,8 +508,15 @@ def _collect(project_root: str, session_id: str,
         if claimed is None:
             continue
         rows = _read_rows(claimed)
-        mine = [r for r in rows if _row_matches(r, session_id, agent)]
-        others = [r for r in rows if not _row_matches(r, session_id, agent)]
+        # A line that is not a readable row is no one's to deliver; it goes
+        # to the undelivered log, tagged possibly_broken (owner ruling on
+        # review R7-2) — it used to be dropped here without a trace.
+        broken = [r for r in rows if r.get(POSSIBLY_BROKEN_KEY) is True]
+        good = [r for r in rows if r.get(POSSIBLY_BROKEN_KEY) is not True]
+        mine = [r for r in good if _row_matches(r, session_id, agent)]
+        others = [r for r in good if not _row_matches(r, session_id, agent)]
+        if broken and not _log_broken(project_root, claimed, rows, broken):
+            others.extend(broken)  # log unwritable: keep them in the file
         if not _append_back(project_root, path, others):
             # Could not hand the others back: keep the WHOLE claim on disk
             # (re-adopted later) rather than lose them; deliver nothing from
@@ -395,6 +525,21 @@ def _collect(project_root: str, session_id: str,
         taken.extend(mine)
         claims.append(claimed)
     return taken, claims
+
+
+def _log_broken(project_root: str, claim: Path, all_rows: List[Dict[str, Any]],
+                broken: List[Dict[str, Any]]) -> bool:
+    """Move a claim's ``possibly_broken`` rows to the undelivered log
+    (journalled, so a retry is tagged). ``False`` when the log could not be
+    written — the caller then keeps them. Never raises."""
+    log = Path(project_root) / UNDELIVERED_LOG_REL
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with _lock(project_root):
+            _move_rows_to_log(claim, all_rows, broken, log, "unreadable_alert_row")
+        return True
+    except OSError:
+        return False
 
 
 def _finish(claims: List[Path]) -> None:

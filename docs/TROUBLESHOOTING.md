@@ -490,6 +490,10 @@ curl -s http://127.0.0.1:7700/health
 
 If `--status` says `stale`, run `vct-hub --start-if-not-running` — it cleans up the dead lockfile and spawns a fresh detached instance (idempotent; safe to run any time).
 
+### `[VCO hub unreachable]` notice in the chat
+
+Hooks that need a hub answer and do not get one keep their safe default and tell the assistant. Since v0.2.102 the code-graph worktree gate (`stop-codegraph-drain`, `code-graph-incremental`) does this: when it cannot ask whether a worktree is registered, it indexes the edit anyway. The notice comes once per session per agent (for the CLI-run `code-graph-incremental`, at most once an hour). Bring the hub back with `vct-hub --start-if-not-running`. If `vct-hub` is not on `PATH`, use `python -m vco_lib.hub_ensure ensure` with the VCO venv's python. If VCO was just updated, restart the launcher and reload the editor window, since a session started before the update may hold a stale `VCT_HUB_TOKEN`. The once-per-session markers are `.claude/state/hub_unreachable_notice_<key>`.
+
 ### Hub bind posture: loopback vs all interfaces (`VCT_HUB_BIND_ALL`, module widen)
 
 The hub binds `127.0.0.1` (loopback-only) by default, so a leaked `hub.token` cannot be used from another machine on your LAN. Two things widen the bind to `0.0.0.0` (all interfaces):
