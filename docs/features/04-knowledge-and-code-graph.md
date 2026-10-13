@@ -222,7 +222,7 @@ Truncates code before embedding using priority order: (1) signature always inclu
 Core sync backend: parses YAML frontmatter, extracts WikiLinks (typed and untyped), generates embeddings, upserts to Weaviate. Handles schema migration (adds `typed_links` property if missing on existing collections).
 
 ### `maintain_knowledge_graph.py`
-Integrity checks: orphaned nodes, broken WikiLinks, nodes missing required frontmatter fields. `--fix` / `--rebuild` are REFUSED when the resolved collection is the SHARED KG (nodes other projects contributed look like orphans from any single project root and would be deleted); `--check` stays available. Override — accepting that loss — with `VCO_MAINTAIN_SHARED_KG_CONSENT=1`.
+Integrity checks: orphaned nodes, broken WikiLinks, node timestamps that disagree with the source file (frontmatter `updated:` → stored `updated` property; else file mtime → stored `updated_at`), and WikiLinks missing from the stored `links`/`typed_links`. `--fix` re-syncs the flagged nodes through the kg-sync writer (`sync_knowledge_graph.sync_node`) — an upsert that never rewrites the .md files and never invents nodes; broken links whose target does not exist stay the broken-link report. `--fix` / `--rebuild` are REFUSED when the resolved collection is the SHARED KG (nodes other projects contributed look like orphans from any single project root and would be deleted); `--check` stays available and writes nothing. Override — accepting that loss — with `VCO_MAINTAIN_SHARED_KG_CONSENT=1`.
 
 ### `add_temporal_metadata.py`
 Backfills `valid_from` / `created` / `updated` fields in YAML frontmatter from `git log` history. Falls back to filesystem timestamps for files not in git.

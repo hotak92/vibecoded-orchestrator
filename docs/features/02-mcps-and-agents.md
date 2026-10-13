@@ -263,7 +263,7 @@ Backfill `valid_from` / `created` / `updated` fields in KG node YAML frontmatter
 Point-in-time KG queries — "what did the knowledge graph look like on date X?" — using `valid_from` / `valid_until` Weaviate filters.
 
 ### `maintain_knowledge_graph.py`
-Integrity checks: orphaned nodes, broken WikiLinks, missing required frontmatter fields. `--fix` / `--rebuild` are refused on the SHARED KG collection (other projects' nodes would read as orphans); `VCO_MAINTAIN_SHARED_KG_CONSENT=1` overrides, accepting that loss.
+Integrity checks: orphaned nodes, broken WikiLinks, node timestamps that disagree with the source file (frontmatter `updated:` → stored `updated` property; else file mtime → stored `updated_at`), and WikiLinks missing from the stored `links`/`typed_links`. `--fix` re-syncs the flagged nodes through the kg-sync writer (never rewriting the .md files, never inventing nodes); `--check` writes nothing. `--fix` / `--rebuild` are refused on the SHARED KG collection (other projects' nodes would read as orphans); `VCO_MAINTAIN_SHARED_KG_CONSENT=1` overrides, accepting that loss.
 
 ### `process_documents.py`
 Auto-chunk uploaded documents in `documents/` to Weaviate `DocumentChunks` collection and create a KG node for the source.
