@@ -28,10 +28,10 @@
 //! See `bundled_mcp_versions.toml` itself for the canonical schema doc.
 //! For Rust callers: every `[npm.<key>]` table parses into a
 //! [`PinnedPackage`] with `package`, `version`, and `shasum` strings.
-//! Unknown top-level sections (e.g. `[chromium]`) are tolerated by the
-//! TOML parser but not exposed here — Rust callers today only need the
-//! npm slice. Add an accessor when a new section grows a real Rust
-//! consumer.
+//! `[npx.<key>]` tables parse separately into [`NpxLaunchPin`] (see
+//! `parse_npx_str`). Unknown top-level sections are tolerated by the
+//! TOML parser but not exposed here. Add an accessor when a new section
+//! grows a real Rust consumer.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -129,7 +129,7 @@ pub struct PinnedPackage {
 }
 
 /// Top-level TOML schema. Only the `npm` table is modelled in Rust
-/// today; unknown sections (e.g. `[chromium]`) are tolerated by serde's
+/// here; other sections (`[npx.*]`, anything unknown) are tolerated by serde's
 /// default behaviour (`deny_unknown_fields` is NOT set).
 #[derive(Debug, Deserialize)]
 struct BundledManifestRaw {
@@ -424,7 +424,8 @@ browser = "chromium"
         // v0.2.102 (diagrams dropped): the four diagram pins
         // (excalidraw_lib / excalidraw_mcp / mermaid_lib / mermaid_mcp)
         // were the ONLY npm pins — the [npm] table is now legitimately
-        // empty ([chromium] is a separate top-level table, not an npm pin).
+        // empty ([npx.playwright_mcp] is a separate top-level table, not an
+        // npm pin).
         // The empty `vec![]` literal is load-bearing:
         // `tests/test_bundled_versions_parity.py::
         // test_rust_unit_test_pins_same_key_set` greps it. The type
@@ -458,16 +459,20 @@ shasum  = "a5f1050ef7af6dc2595f5507366006489fef2879"
 
     #[test]
     fn unknown_top_level_sections_are_tolerated() {
-        // Forward-compat: `[chromium]` is present in the real file and
-        // not modelled by Rust today. Must not error.
+        // Forward-compat: a top-level section the npm reader does not model
+        // (the real file's `[npx.*]`, or one not invented yet) must not error
+        // and must not leak into the npm map.
         let sample = r#"
 [npm.mermaid_mcp]
 package = "claude-mermaid"
 version = "1.6.3"
 shasum  = "a5f1050ef7af6dc2595f5507366006489fef2879"
 
-[chromium]
-reuse_playwright = true
+[npx.playwright_mcp]
+package = "@playwright/mcp"
+version = "9.9.9"
+shasum  = "0000000000000000000000000000000000000000"
+browser = "chromium"
 
 [future_section_we_have_not_invented_yet]
 foo = "bar"

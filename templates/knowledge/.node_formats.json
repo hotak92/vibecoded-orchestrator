@@ -374,15 +374,12 @@
   },
   "knowledge/concepts/orchestrator-mcp-servers.md": {
     "title": "Orchestrator MCP Servers",
-    "description": "Orchestrator MCP Servers extend Claude Code by providing semantic search capabilities via Model Context Protocol (MCP) servers. Key components include `weaviate-kg` for managing Knowledge and Code Graphs, which relies on Weaviate and Ollama for its backend infrastructure. While the `code-embedding-service` runs as a separate REST API, the primary semantic search and graph management functionality is exposed through the `weaviate-kg` MCP. These servers should be used when advanced, context-aware retrieval and graph traversal beyond native Claude capabilities are required.",
-    "summary": "Orchestrator MCP Servers manage semantic search and knowledge graph operations via Python processes, with the `weaviate-kg` server being the primary component. The most important fact is that `weaviate-kg` facilitates hybrid search (BM25 + vector) and GraphRAG via `semantic_graph_search` across project and shared knowledge graphs stored in Weaviate.",
-    "generated_at": "2026-10-07T20:20:36.206339+00:00",
+    "description": "The Orchestrator ships Model Context Protocol (MCP) servers to extend Claude Code with semantic search capabilities. Key components include the `weaviate-kg` server, which manages Knowledge and Code Graphs using Weaviate, and a separate `code-embedding-service` for HTTP-based code embeddings. This infrastructure is critical for advanced retrieval, enabling semantic search and code graph interaction within the Claude Code environment. Use this when deep knowledge retrieval, semantic search, or structured code-graph querying is required beyond Claude's native tools.",
+    "summary": "Orchestrator MCP servers extend Claude Code with semantic search via Python-backed processes, with `weaviate-kg` managing Knowledge Graph operations. The most important fact is that `weaviate-kg` provides hybrid search, combining BM25 keyword search and vector similarity across per-project and shared Knowledge Graphs.",
+    "generated_at": "2026-10-13T05:28:14.566244+00:00",
     "backend": "ollama",
-    "chunk_summaries": {
-      "1.0": "This deprecated section details the architecture of the Claude Orchestrator MCP Servers, which utilize four distinct Python processes—Weaviate-KG, Ollama, Search, and Coordination—to provide semantic search, local LLM inference, web search, and team coordination capabilities."
-    },
-    "content_hash": "0e619b30d6cc0d83",
-    "total_chunks": 2
+    "content_hash": "3bfd17adad09d835",
+    "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-rl-retrieval.md": {
     "title": "Orchestrator RL Retrieval",
@@ -450,11 +447,11 @@
   },
   "knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md": {
     "title": "Project-extra codegraph paths",
-    "description": "Project-extra codegraph paths index additional read-only filesystem paths into a project's codegraph without registering them as primary launcher projects. This functionality involves persisting paths in a dedicated database table, exposing them via the Hub resolver, and managing synchronization through the Launcher and GUI. Use this mechanism when a user needs search queries to include content from related, non-primary repositories, such as a private fork referencing a public sibling clone.",
-    "summary": "This feature indexes additional read-only filesystem paths into a project's codegraph via a dedicated DB table, enabling inclusion of sibling repositories without promoting them to launcher projects. The critical invariant mandates that `--prune-stale` must visit all target files in a single invocation to prevent multi-pass UUID deletion conflicts.",
-    "generated_at": "2026-10-08T03:16:24.901916+00:00",
+    "description": "Project-extra codegraph paths index additional filesystem folders into a project's codegraph without registering them as full launcher projects. These paths are persisted in the `project_codegraph_extra_paths` table and are accessible via the Hub resolver's configuration endpoint. Key components include GUI panels, dedicated launcher commands for management, and hooks that queue edits to specific code folder drains. This mechanism is vital for enabling comprehensive code graph analysis across related, unmanaged repositories, such as private forks needing access to sibling public-repo content.",
+    "summary": "Indexes additional filesystem folders as \"code folders\" without registering them as launcher projects, using the `project_codegraph_extra_paths` DB table. The critical invariant is that both the Launcher and Analyzer CLI must perform all indexing in a single invocation to prevent stale UUID deletion.",
+    "generated_at": "2026-10-13T05:33:06.384821+00:00",
     "backend": "ollama",
-    "content_hash": "2a80d3c40ec54727",
+    "content_hash": "796c8b917fac38e9",
     "total_chunks": 1
   },
   "knowledge/concepts/prompt-engineering-fundamentals.md": {

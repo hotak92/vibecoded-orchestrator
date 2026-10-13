@@ -9464,7 +9464,7 @@ mod tests {
             // Pinning manifest for external packages (introduced as
             // Phase 0 of the v0.2.102-dropped diagrams-integration plan,
             // 2026-05-24; its [npm] table is empty since that removal —
-            // [chromium] remains). Listed here
+            // [npx.playwright_mcp] remains). Listed here
             // so a copy install carries new editions of the manifest
             // along — same fail-safe
             // self-reference shape used for

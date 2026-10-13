@@ -89,11 +89,16 @@ def load_bundled_versions(path: Path | None = None) -> dict[str, dict[str, str]]
               "npm": {
                 "<key>": {"package": "...", "version": "...", "shasum": "..."},
               },
-              "chromium": {"reuse_playwright": True},
+              "npx": {
+                "<key>": {"package": "...", "version": "...", "shasum": "...",
+                          "browser": "..."},
+              },
             }
 
         (The npm table is currently EMPTY — the four diagram pins were
-        removed in v0.2.102 with the diagrams integrations.)
+        removed in v0.2.102 with the diagrams integrations, and the
+        ``[chromium] reuse_playwright`` marker was retired with its last
+        reader; ``[npx.playwright_mcp]`` is the one pin left.)
 
         Unknown sections and extra keys are preserved (forward-compat).
 
