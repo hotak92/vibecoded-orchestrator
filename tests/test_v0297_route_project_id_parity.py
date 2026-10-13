@@ -12,8 +12,9 @@ Phase-8 write gate ran with no project id (silent-allow + a
 
 These tests EXECUTE the real scripts — bash and PowerShell — against a real
 managed block produced by the projection's own block builder, and pin both
-to the Python line rule (:func:`vco_lib.envfile.env_value`) so the three
-cannot drift.
+to the Python line rule (:func:`vco_lib.envfile.env_value` with
+``last_wins=True`` — v0.2.102: the file is sourced, so the LAST assignment is
+the one a shell sees) so the three cannot drift.
 """
 from __future__ import annotations
 
@@ -75,8 +76,13 @@ CASES = {
     "managed_block_crlf": _build_managed_block({"VCT_PROJECT_ID": PID}).replace("\n", "\r\n"),
     "bare": f"VCT_PROJECT_ID={PID}\n",
     "single_quoted": f"export VCT_PROJECT_ID='{PID}'\n",
-    "user_line_first_wins": 'export VCT_PROJECT_ID="mine"\n'
-                            + _build_managed_block({"VCT_PROJECT_ID": PID}),
+    # A user line BEFORE the block is overridden by the block (last wins).
+    "user_line_before_block": 'export VCT_PROJECT_ID="mine"\n'
+                              + _build_managed_block({"VCT_PROJECT_ID": PID}),
+    # A user override AFTER the block — where the block's header tells users
+    # to put their own exports — wins, as it does when the file is sourced.
+    "user_override_after_block": _build_managed_block({"VCT_PROJECT_ID": PID})
+                                 + "\nexport VCT_PROJECT_ID='mine'\n",
     "commented_out": f'# export VCT_PROJECT_ID="{PID}"\n',
     "absent": _build_managed_block({"KG_COLLECTION": "P_KnowledgeGraph"}),
 }
@@ -87,9 +93,20 @@ def test_bash_and_powershell_read_what_the_projection_writes(tmp_path, case):
     text = CASES[case]
     (tmp_path / ".claude").mkdir()
     (tmp_path / ".claude" / "env").write_bytes(text.encode("utf-8"))
-    want = env_value(text, "VCT_PROJECT_ID") or ""
-    if case.startswith("managed_block") or case in ("bare", "single_quoted"):
+    want = env_value(text, "VCT_PROJECT_ID", last_wins=True) or ""
+    if case.startswith("managed_block") or case in (
+            "bare", "single_quoted", "user_line_before_block"):
         assert want == PID  # the reference itself reads the value
+    if case == "user_override_after_block":
+        assert want == "mine"
+    # The reference is what a shell holds after `source`.
+    sourced = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c",
+         'unset VCT_PROJECT_ID; source "$1" >/dev/null 2>&1; printf %s "${VCT_PROJECT_ID-}"',
+         "_", str(tmp_path / ".claude" / "env")],
+        capture_output=True, text=True, timeout=30, check=True).stdout
+    if not case.endswith("_crlf"):  # bash keeps a CRLF line's \r; the readers strip it
+        assert sourced == want, "bash source"
     assert _bash_pid(tmp_path) == want, "bash"
     assert _pwsh_pid(tmp_path) == want, "PowerShell"
 

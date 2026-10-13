@@ -14,7 +14,8 @@ The parse rule is deliberately identical to the shell/PowerShell resolvers it
 mirrors (``vct_secrets_resolve.sh::dotenv_get`` /
 ``vct_secrets_resolve.ps1::Get-DotenvValue``): line-oriented, ``KEY=VALUE`` or
 ``export KEY=VALUE``, one matching quote pair stripped, NO variable expansion,
-NO command substitution, first match wins. It is CRLF-safe: ``str.splitlines()``
+NO command substitution, first match wins (``env_value(..., last_wins=True)``
+is the ``source``-semantics lookup for whole-file ``.claude/env`` reads). It is CRLF-safe: ``str.splitlines()``
 splits on universal newlines so a Windows ``\\r\\n``-terminated file parses
 identically to a ``\\n`` one, and the per-line ``.strip()`` removes any residual
 ``\\r``.
@@ -34,8 +35,13 @@ Reconciled callers:
     read from the MANAGED BLOCK (markers given) has the writer's escape
     reversed; a whole-file dotenv read (no markers) does not, matching the
     shell/PowerShell dotenv resolvers.
-  * ``vco_lib.knowledge_residue.project_env_value`` and
-    ``install.py::_read_project_name_from_envfile`` — whole-file lookups.
+  * ``vco_lib.knowledge_residue.project_env_value``,
+    ``install.py::_read_project_name_from_envfile`` and
+    ``vco_lib.hook_retirements._read_disabled_stems`` — whole-file lookups of
+    a SOURCED file, so LAST assignment wins (``last_wins=True``, v0.2.102),
+    the value the shell sees. ``vco_lib.service_reconcile._read_env_file`` and
+    ``vco_lib.project_move`` build a whole-file dict from
+    :func:`parse_env_lines` — the same last-wins outcome.
   * ``vco_lib.agent_secrets._parse_dotenv_value`` — whole-file (no managed
     block) dotenv key lookup, tier-3 secret resolution.
 
@@ -170,19 +176,46 @@ def env_value(
     *,
     begin_marker: Optional[str] = None,
     end_marker: Optional[str] = None,
+    last_wins: bool = False,
 ) -> Optional[str]:
-    """First-match-wins lookup of ``key`` over :func:`parse_managed_env_lines`.
+    """Key lookup over :func:`parse_managed_env_lines`.
 
-    Returns the (quote-stripped) value of the first matching assignment, or
+    Returns the (quote-stripped) value of the matching assignment, or
     ``None`` when the key is absent (or the managed block, when requested, is
-    missing). Convenience wrapper for the two key-lookup callers.
+    missing).
+
+    Which assignment, when the key appears more than once — this switch is
+    PRECEDENCE ONLY: either way the line grammar is the same
+    (:func:`parse_env_line`), with no escape reversal beyond the managed-block
+    ``writer_escapes`` rule and no variable expansion or command substitution
+    (so a value is the literal text a ``source`` would assign only when it
+    holds no ``$``, backtick or backslash):
+
+      * ``last_wins=False`` (default) — the FIRST. The contract of the tier-3
+        dotenv secret reader (``agent_secrets._parse_dotenv_value``), which
+        must match ``vct_secrets_resolve.sh::dotenv_get`` /
+        ``Get-DotenvValue``; and of the managed-block-scoped reads, whose
+        block has one writer and one line per key.
+      * ``last_wins=True`` — the LAST: what a shell holds after ``source``-ing
+        the file. Every WHOLE-FILE read of ``.claude/env`` uses this (v0.2.102):
+        the managed block tells users to add their own exports after it, and
+        the shell honours such an override, so a reader asking "what is this
+        project's value?" must too. Mirrored, grammar and precedence, by the
+        Rust reader ``vct-launcher-core/src/services/env_file.rs``
+        (``parse_env_line`` / ``read_key``; shared case table
+        ``tests/fixtures/env_line_grammar_parity.json``) and, for
+        ``VCT_PROJECT_ID``, by ``templates/hooks/_lib/route-touched-path.sh``
+        / ``.ps1``.
     """
+    found: Optional[str] = None
     for k, v in parse_managed_env_lines(
         text, begin_marker=begin_marker, end_marker=end_marker,
     ):
         if k == key:
-            return v
-    return None
+            if not last_wins:
+                return v
+            found = v
+    return found
 
 
 def upsert_env_key(path: Path, key: str, value: Optional[str]) -> bool:

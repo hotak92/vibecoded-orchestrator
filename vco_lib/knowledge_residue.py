@@ -182,9 +182,12 @@ def project_settings_env(folder: Path) -> dict:
 def project_env_value(folder: Path, key: str) -> Optional[str]:
     """``key`` from the project's own env, LOCALLY (no hub, no DB): the
     ``.claude/settings.json`` ``env`` block, then the shell-sourced
-    ``.claude/env`` (whole file, first assignment wins — a user's own export
-    counts here, as it does when the file is sourced). ``None`` when neither
-    carries a non-empty string. Never raises.
+    ``.claude/env`` (whole file, LAST assignment wins — the value a shell
+    holds after ``source``-ing it, so a user's own export after the managed
+    block overrides the block here exactly as it does in every hook; until
+    v0.2.102 this read took the FIRST). ``None`` when neither carries a
+    non-empty string — including when the last assignment is empty, which
+    leaves the shell with an empty value too. Never raises.
 
     One home for the "settings.json, then .claude/env" lookup the
     ``SHARED_KG_READ_DISABLED`` gate and ``kg_sync_drift``'s KG_COLLECTION
@@ -198,7 +201,10 @@ def project_env_value(folder: Path, key: str) -> Optional[str]:
     try:
         env_file = Path(folder) / ".claude" / "env"
         if env_file.is_file():
-            got = env_value(env_file.read_text(encoding="utf-8", errors="replace"), key)
+            got = env_value(
+                env_file.read_text(encoding="utf-8", errors="replace"), key,
+                last_wins=True,
+            )
             if got is not None and got.strip():
                 return got.strip()
     except Exception:  # noqa: BLE001 — env read is best-effort

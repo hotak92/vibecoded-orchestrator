@@ -1301,10 +1301,7 @@ def _read_disabled_stems(folder: Path) -> Optional[list]:
         return []
     except OSError:
         return None
-    value: Optional[str] = None
-    for k, v in envfile.parse_env_lines(text):
-        if k == DISABLED_STEMS_ENV_KEY:
-            value = v
+    value = envfile.env_value(text, DISABLED_STEMS_ENV_KEY, last_wins=True)
     if not value:
         return []
     return [s.strip() for s in value.split(",") if s.strip()]
