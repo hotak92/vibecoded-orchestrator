@@ -317,6 +317,11 @@ write_fixture "code_graph_extra_paths" \
 run_hook "$EXTRA_PATH/launcher/src-tauri/src/main.rs"
 assert_ne "$(argv_get repo)" "$EXTRA_PATH" "disabled extra → repo_path never re-pointed to it"
 assert_ne "$(argv_get extra_flag)" "yes" "disabled extra → never analyzed as an extra path"
+# Positive pins (review R8): the hook must reach its worktree gate and skip
+# the edit — a crash before that point would also satisfy the two asserts above.
+assert_eq "$(argv_get invocations)" "0" "disabled extra → analyzer NOT invoked"
+assert_contains "$(cat "$HOOK_ERR")" "skipped worktree edit" \
+    "disabled extra → the worktree-gate skip is announced on stderr"
 
 # ── Scenario 4: sibling project (no extras) ────────────────────────────
 write_fixture "code_graph_extra_paths" '{"code_graph_extra_paths":[]}'
