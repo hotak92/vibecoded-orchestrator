@@ -722,8 +722,8 @@ def development_class_definition(name: str) -> dict:
     EXPLICITLY NOT MIRRORED from the KG schema (user direction 2026-05-19):
 
     * ``tags`` / ``links`` / ``typed_links`` — KG-only graph metadata;
-      Dev rows have no WikiLink resolution, no typed relationships, no
-      tag-from-typed-link inference. The corresponding fields in
+      Dev rows have no WikiLink resolution and no typed relationships.
+      The corresponding fields in
       ``parse_doc_file`` synthesize empty values for symmetry, but they
       are never written into the Dev collection.
     * ``node_type`` — redundant: every row in a Development collection is

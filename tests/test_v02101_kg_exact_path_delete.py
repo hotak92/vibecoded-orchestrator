@@ -302,44 +302,6 @@ def test_dev_collection_doc_delete_spares_token_superset_doc(
         assert removed == 1 and paths == ["docs/setup/README.md"]
 
 
-def _write_tagged(path, title, tags):
-    """A knowledge node with authored frontmatter tags (OD-1's source)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tag_list = ", ".join(tags)
-    path.write_text(
-        f"---\ntitle: {title}\ntype: concept\nstatus: active\n"
-        f"tags: [{tag_list}]\n---\nBody with [[uses::{title}]] links.\n",
-        encoding="utf-8",
-    )
-
-
-def test_tag_inference_reads_only_the_exactly_titled_link_target(sync_env):
-    """B3 follow-up: `[[uses::Weaviate]]` used to inherit the tags of whichever
-    title CONTAINING "weaviate" came first. v0.2.102 OD-1: the source is the
-    target's ON-DISK authored frontmatter, admitted only when declared in
-    knowledge/TAG_HIERARCHY.md."""
-    mod, _server, root = sync_env
-    (root / "knowledge").mkdir(parents=True, exist_ok=True)
-    (root / "knowledge" / "TAG_HIERARCHY.md").write_text(
-        "# Knowledge Graph Tag Hierarchy\n\n## Tags\n\n```\n#AI\n"
-        "#vector-db (Vector databases)\n├── #nosql\n```\n",
-        encoding="utf-8",
-    )
-    _write_tagged(root / "knowledge" / "concepts" / "weaviate-ports-gotcha.md",
-                  "Weaviate Windows Ports Gotcha", ["windows", "ports"])
-    _write_tagged(root / "knowledge" / "concepts" / "weaviate.md",
-                  "Weaviate", ["vector-db"])
-    node = {"tags": [], "typed_links": [
-        {"relation_type": "uses", "target_title": "weaviate"},
-    ]}
-    assert mod.infer_tags_from_typed_links(node) == ["vector-db"]
-    # And no tags at all when only a CONTAINING title exists.
-    node_only_superset = {"tags": [], "typed_links": [
-        {"relation_type": "uses", "target_title": "Ports"},
-    ]}
-    assert mod.infer_tags_from_typed_links(node_only_superset) == []
-
-
 def test_wikilink_resolution_points_at_the_exact_title(sync_env):
     mod, server, _root = sync_env
     coll = server.client.collections.get(mod.COLLECTION_NAME)

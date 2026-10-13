@@ -114,11 +114,14 @@ REPAIRABLE_PROPERTIES: Tuple[str, ...] = (
     "external_links",
 )
 
-#: Properties compared as SETS, not sequences. ``tags`` is assembled with
-#: ``list(set(...))`` when link inference contributes (see ``sync_node``), so
-#: its ORDER is not stable across runs; an order-sensitive comparison would
-#: rewrite those rows on every single sync forever. Order carries no meaning
-#: here, so set equality is both cheaper and correct.
+#: Properties compared as SETS, not sequences. Rows stored before v0.2.102
+#: assembled ``tags`` with ``list(set(...))`` while link-based tag inference
+#: existed, so their stored ORDER is arbitrary; an order-sensitive comparison
+#: would rewrite every such row although its tag SET already equals the
+#: frontmatter. Order carries no meaning here, so set equality is both cheaper
+#: and correct. (Since v0.2.102 OD-1 the desired value is exactly the
+#: frontmatter ``tags`` — nothing propagates through links — and this repair is
+#: what rewrites the inflated sets older versions stored.)
 _SET_COMPARED: "frozenset[str]" = frozenset({"tags"})
 
 #: Properties that must be a NON-EMPTY string to be usable as a desired

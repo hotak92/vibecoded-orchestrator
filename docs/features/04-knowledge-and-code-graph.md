@@ -70,6 +70,8 @@ The curated seed set lives in `templates/knowledge/`. As of **v0.2.81** it is ma
 ### TAG_HIERARCHY.md
 Formal 5-level tag taxonomy at `knowledge/TAG_HIERARCHY.md`: domain tags (`#AI`, `#database`, `#workflow`, …), abstraction level tags (`#high-level-plan`, `#mid-level-architecture`, `#low-level-implementation`, `#function-description`), technology tags, status tags (`#idea → #in-progress → #implemented → #tested → #deployed → #archived → #deprecated`), and pattern tags (`#RAG`, `#MCP`, etc.).
 
+It is a reference document for authors, not configuration: no sync or search logic reads it, and the sync never stores it as a node. A node's stored `tags` are exactly its frontmatter `tags` — the KG is not hierarchical, so nothing propagates through typed links (owner decision OD-1, v0.2.102). Collections synced by earlier versions, which copied link targets' tags onto linking nodes, are rewritten to the frontmatter by the zero-embed metadata repair pass at the next update.
+
 ### VOCABULARY.md
 Formal RDF-inspired vocabulary at `knowledge/VOCABULARY.md` defining namespaces (`co:`, `rdf:`, `skos:`, etc.) and canonical class definitions (`co:Project`, `co:Concept`, `co:Tool`, `co:Model`, etc.) for consistent node authoring.
 
