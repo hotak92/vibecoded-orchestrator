@@ -43,6 +43,43 @@ def test_every_language_holds_the_same_secret_read_timeout():
     assert _int(r"^_VCT_HUB_PROBE_READ_TIMEOUT_S=(\d+)$", _VCT) == py
 
 
+def test_every_language_honours_the_same_retry_after_cap_and_default():
+    """v0.2.102 fix round: the ONE retry after a ``503
+    keychain_unavailable`` waits the hub's numeric ``Retry-After`` — clamped
+    to the same cap in every client — and falls back to the same hub default
+    when the header is absent or unparseable. Python holds the rule
+    (:func:`agent_secrets._retry_wait_seconds`); the shell/PowerShell/vct
+    resolvers reimplement it per language, so the cap and the default are
+    pinned here exactly like the read timeout above."""
+    from vco_lib import agent_secrets
+
+    cap = agent_secrets.HUB_RETRY_AFTER_CAP_SECONDS
+    default = agent_secrets._HUB_RETRY_AFTER_DEFAULT_SECONDS
+    assert _int(r"^_HUB_RETRY_AFTER_CAP_S=(\d+)$", _SH) == cap
+    assert _int(r"^\$script:HubRetryAfterCapMs = (\d+)$", _PS1) == cap * 1000
+    assert _int(r"^_VCT_HUB_RETRY_AFTER_CAP_S=(\d+)$", _VCT) == cap
+    assert _int(r"^_HUB_RETRY_WAIT_S=(\d+)$", _SH) == default
+    assert _int(r"^\$script:HubRetryWaitMs = (\d+)$", _PS1) == default * 1000
+    assert _int(r"^_VCT_HUB_RETRY_WAIT_S=(\d+)$", _VCT) == default
+
+
+def test_python_retry_wait_semantics_are_the_parity_anchor():
+    """What every other language's wait computation must reproduce, pinned on
+    the ONE implementation all the others are held against (the shell/ps1/vct
+    behavioural tests assert the same numbers against their fake hubs)."""
+    from vco_lib.agent_secrets import _retry_wait_seconds
+
+    assert _retry_wait_seconds("4") == 4.0  # honoured
+    assert _retry_wait_seconds("2.5") == 2.5  # fractional seconds honoured
+    assert _retry_wait_seconds("9") == 5.0  # capped
+    assert _retry_wait_seconds("3600") == 5.0  # capped, however large
+    assert _retry_wait_seconds("0") == 0.0  # retry immediately
+    assert _retry_wait_seconds("-3") == 0.0  # negative clamps to zero
+    assert _retry_wait_seconds(None) == 2.0  # absent → hub default
+    assert _retry_wait_seconds("soon") == 2.0  # unparseable → hub default
+    assert _retry_wait_seconds("") == 2.0
+
+
 def test_secret_read_timeout_outlasts_the_hubs_own_keychain_wait():
     op_timeout = _int(
         r"KEYCHAIN_OP_TIMEOUT: std::time::Duration =\s*std::time::Duration::from_secs\((\d+)\)",
@@ -58,6 +95,8 @@ def test_config_reads_keep_the_short_timeout():
 
 def test_summary_backends_outlasts_the_shell_resolvers_worst_case():
     read = project_config.SECRET_READ_TIMEOUT_SECONDS
-    retry_wait = _int(r"^_HUB_RETRY_WAIT_S=(\d+)$", _SH)
+    # The retry wait is the Retry-After-derived CAP in the worst case, not
+    # the 2 s default (v0.2.102 fix round: the resolvers honour the header).
+    retry_wait = _int(r"^_HUB_RETRY_AFTER_CAP_S=(\d+)$", _SH)
     worst = 4 * read + retry_wait  # (by-path + /env) x (attempt + one retry)
     assert _int(r"^_SHIPPED_RESOLVER_TIMEOUT_S = (\d+)$", _SUMMARY) > worst

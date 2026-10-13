@@ -197,8 +197,16 @@ if ($env:VCT_RESOLVE_MAX_TIME) {
 # tests/test_secret_read_timeout_parity.py).
 $script:SecretReadTimeoutMs = 30000
 # Wait before the ONE retry after a 503 keychain_unavailable: the hub's own
-# Retry-After (`KEYCHAIN_UNAVAILABLE_RETRY_AFTER_SECS` in modules_api.rs).
+# Retry-After (`KEYCHAIN_UNAVAILABLE_RETRY_AFTER_SECS` in modules_api.rs)
+# when the header is numeric, clamped to [0, cap]; the hub default below when
+# the header is absent or unparseable. MUST MATCH
+# `agent_secrets.HUB_RETRY_AFTER_CAP_SECONDS` / `_HUB_RETRY_AFTER_DEFAULT_SECONDS`
+# (via `_retry_wait_seconds`), `_HUB_RETRY_AFTER_CAP_S` / `_HUB_RETRY_WAIT_S` in
+# vct_secrets_resolve.sh and `_VCT_HUB_RETRY_AFTER_CAP_S` /
+# `_VCT_HUB_RETRY_WAIT_S` in tools/vct-secrets/vct -- pinned for every
+# language by tests/test_secret_read_timeout_parity.py.
 $script:HubRetryWaitMs = 2000
+$script:HubRetryAfterCapMs = 5000
 $script:HubRetryWait = 0
 # The hub accepted the connection but did not answer in time: it is RUNNING
 # and busy (typically a slow OS keychain). Never a "not found".
@@ -213,6 +221,22 @@ function Get-HubRequestTimeoutMs {
     if ($left -le 0) { return 0 }
     if ($left -ge $script:SecretReadTimeoutMs) { return $script:SecretReadTimeoutMs }
     return [int]$left
+}
+
+function Get-HubRetryWaitMs {
+    # The wait before the ONE retry, from the response's Retry-After header:
+    # numeric -> clamped to [0, $script:HubRetryAfterCapMs]; absent or not a
+    # plain number -> $script:HubRetryWaitMs (the hub default). MUST MATCH
+    # `agent_secrets._retry_wait_seconds` and `_hub_retry_wait_seconds` in the
+    # .sh sibling (pinned by tests/test_secret_read_timeout_parity.py).
+    param($RetryAfter)
+    if ($null -ne $RetryAfter -and "$RetryAfter" -match '^(-?[0-9]+(\.[0-9]+)?)$') {
+        $waitMs = [double]::Parse($Matches[1], [System.Globalization.CultureInfo]::InvariantCulture) * 1000.0
+        if ($waitMs -lt 0) { $waitMs = 0 }
+        if ($waitMs -gt $script:HubRetryAfterCapMs) { $waitMs = $script:HubRetryAfterCapMs }
+        return [int]$waitMs
+    }
+    return [int]$script:HubRetryWaitMs
 }
 
 function Test-ConnectionRefused {
@@ -483,9 +507,20 @@ function Invoke-HubWithToken {
             $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
             if ($null -eq $body) { $body = "" }
         }
+        # v0.2.102 fix round: carry the raw Retry-After header so the ONE
+        # retry honours the hub's own wait (Get-HubRetryWaitMs). Read raw --
+        # HttpResponseMessage.Headers stores unknown headers verbatim, no
+        # date parsing -- so an HTTP-date value stays a string and falls
+        # back to the default wait rather than being guessed at.
+        $retryAfter = $null
+        $retryValues = $null
+        if ($response.Headers.TryGetValues("Retry-After", [ref]$retryValues)) {
+            $retryAfter = @($retryValues)[0]
+        }
         return @{
-            Status = [int]$response.StatusCode
-            Body   = $body
+            Status     = [int]$response.StatusCode
+            Body       = $body
+            RetryAfter = $retryAfter
         }
     } catch {
         # v0.2.102 (W6-AB): a refusal (no hub) stays $null -> exit 1 and
@@ -753,7 +788,7 @@ function Read-KeyHubEnv {
                     # retryable "store unavailable" code, distinct from 6 =
                     # locked). Mirrors the .sh `keychain_unavailable)` arm.
                     Write-Err "hub could not read the OS keychain for $Key (project $pid_): the keychain is temporarily unavailable (a keychain operation timed out) -- retry in a few seconds."
-                    $script:HubRetryWait = $script:HubRetryWaitMs
+                    $script:HubRetryWait = Get-HubRetryWaitMs -RetryAfter $result.RetryAfter
                     return @{ ExitCode = 7 }
                 }
                 Default {

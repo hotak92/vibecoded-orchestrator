@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import http.server
+import json
 import shutil
 import socket
 import subprocess
@@ -303,7 +304,11 @@ def _scripted_hub(answers: list, *, delay_s: float = 0.0):
     """v0.2.102 (W6-AB): answer each GET with the next ``(status, body)`` (the
     last one repeats), optionally after ``delay_s``; yields ``(port, hits)``
     where ``hits`` is a list the handler appends to per request. Threaded, so
-    a delayed answer never blocks the resolver's retry."""
+    a delayed answer never blocks the resolver's retry.
+
+    v0.2.102 fix round: an answer may also be a 3-tuple
+    ``(status, body, headers)`` with a dict of extra response headers -- the
+    Retry-After the resolver's ONE retry must honour."""
     hits: list[str] = []
 
     class _H(http.server.BaseHTTPRequestHandler):
@@ -312,13 +317,19 @@ def _scripted_hub(answers: list, *, delay_s: float = 0.0):
 
         def do_GET(self):  # noqa: N802 — http.server API
             hits.append(self.path)
-            status, body = answers[min(len(hits), len(answers)) - 1]
+            answer = answers[min(len(hits), len(answers)) - 1]
+            if len(answer) == 3:
+                status, body, extra_headers = answer
+            else:
+                status, body, extra_headers = *answer, {}
             if delay_s:
                 time.sleep(delay_s)
             payload = body.encode()
             try:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                for name, value in (extra_headers or {}).items():
+                    self.send_header(name, str(value))
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -345,6 +356,57 @@ def test_live_slow_keychain_completes_on_the_one_retry(tmp_path, secrets_dir):
     assert cp.returncode == 0, f"stderr={cp.stderr}"
     assert cp.stdout == "synthetic-slow-keychain-value"
     assert len(hits) == 2
+
+
+def _busy_then_ok(key: str, value: str, retry_after: str):
+    busy = '{"error": {"code": "keychain_unavailable", "message": "timed out"}}'
+    ok = json.dumps({key: value})
+    return [(503, busy, {"Retry-After": retry_after}), (200, ok, {})]
+
+
+def test_live_retry_honours_a_numeric_retry_after(tmp_path, secrets_dir):
+    """v0.2.102 fix round: the ONE retry waits the hub's OWN numeric
+    Retry-After (agent_secrets._retry_wait_seconds parity) — 4 s here, which
+    the old fixed 2 s wait cannot explain."""
+    t0 = time.monotonic()
+    with _scripted_hub(_busy_then_ok("RA_KEY", "synthetic-retry-after-value", "4")) as (
+        port, hits,
+    ):
+        cp = _run_resolver_live(tmp_path, "p1", "RA_KEY", secrets_dir, port)
+    elapsed = time.monotonic() - t0
+    assert cp.returncode == 0, f"stderr={cp.stderr}"
+    assert cp.stdout == "synthetic-retry-after-value"
+    assert len(hits) == 2
+    assert 3.5 <= elapsed <= 8.0, f"expected the honoured 4 s wait, took {elapsed:.1f}s"
+
+
+def test_live_retry_after_above_the_cap_is_clamped_to_5s(tmp_path, secrets_dir):
+    """Retry-After: 9 must wait the 5 s cap, not the 9 s the hub asked for."""
+    t0 = time.monotonic()
+    with _scripted_hub(_busy_then_ok("RA_CAP_KEY", "synthetic-capped-value", "9")) as (
+        port, hits,
+    ):
+        cp = _run_resolver_live(tmp_path, "p1", "RA_CAP_KEY", secrets_dir, port)
+    elapsed = time.monotonic() - t0
+    assert cp.returncode == 0, f"stderr={cp.stderr}"
+    assert cp.stdout == "synthetic-capped-value"
+    assert len(hits) == 2
+    assert 4.5 <= elapsed <= 8.0, f"expected the 5 s cap, took {elapsed:.1f}s"
+
+
+def test_live_unparseable_retry_after_waits_the_2s_default(tmp_path, secrets_dir):
+    """"Retry-After: soon" is not a number of seconds: the wait falls back to
+    the hub default (2 s) — never an error, never a long sleep on garbage."""
+    t0 = time.monotonic()
+    with _scripted_hub(_busy_then_ok("RA_BAD_KEY", "synthetic-fallback-value", "soon")) as (
+        port, hits,
+    ):
+        cp = _run_resolver_live(tmp_path, "p1", "RA_BAD_KEY", secrets_dir, port)
+    elapsed = time.monotonic() - t0
+    assert cp.returncode == 0, f"stderr={cp.stderr}"
+    assert cp.stdout == "synthetic-fallback-value"
+    assert len(hits) == 2
+    assert elapsed <= 4.5, f"expected the 2 s default wait, took {elapsed:.1f}s"
 
 
 def test_live_hub_that_does_not_answer_in_time_exits_7(tmp_path, secrets_dir):

@@ -43,9 +43,12 @@ Relay policy: upstream 4xx/5xx are relayed VERBATIM (status and body) so the
 vendor's own error text reaches the user. Only four statuses are the
 gateway's own: 401 (host token or Claude login), 400 (routing or an unreadable
 body), 403 (non-loopback peer), 502/503 (upstream unreachable, or no vendor
-key resolvable) — plus ONE documented exception, a vendor 402/429, which
-becomes a 429 naming the vendor (:mod:`model_router.quota` has the incident
-that bought it).
+key resolvable) — plus ONE documented exception, a quota refusal from a
+vendor: a 402/429, or a 403 whose body carries quota evidence (a vendor that
+answers "You've reached your 5-hour usage limit" with HTTP 403 — the shape
+that used to be misread as a bad key and strike it). Whichever status carried
+it, the refusal becomes a 429 naming the vendor (:mod:`model_router.quota`
+has the incident that bought it).
 
 Bodies are otherwise not EDITED, with two exceptions, both in the same spirit
 and both confined to a vendor route:
@@ -178,6 +181,7 @@ from .quota import (
     _reset_distance_s,
     classify_quota,
     find_reset_hint,
+    is_quota_refusal,
     quota_error_body,
     quota_evidence_fields,
 )
@@ -3322,6 +3326,90 @@ async def _proxy(
                         effort_forwarded=effort_forwarded,
                     )
             vendor = decision.vendor
+            # The owner's fallback ladder (OD-9). Armed only for a route
+            # with a next rung and a body that can be re-sent. Defined before
+            # the branches that may need it — the quota-status arm below and
+            # the quota-in-disguise route a vendor 403 can take through
+            # ``_auth_rejection_response``. ``allow_ladder_retry`` is the
+            # same-rung retry's recursion bound, cleared in the retry below
+            # exactly as the oauth and quota bounds are.
+            async def _ladder_retry(evidence: str) -> web.StreamResponse:
+                return await _proxy(
+                    request,
+                    gateway,
+                    decision,
+                    url,
+                    headers,
+                    body,
+                    requested_model=requested_model,
+                    stream_requested=stream_requested,
+                    started=started,
+                    note=f"{note} note=ladder_retry {evidence}".strip(),
+                    images=images,
+                    facts=facts,
+                    allow_oauth_retry=False,
+                    allow_quota_reprobe=False,
+                    ladder_escalate=ladder_escalate,
+                    fallback_from=fallback_from,
+                    allow_ladder_retry=False,
+                    effort_requested=effort_requested,
+                    effort_forwarded=effort_forwarded,
+                )
+
+            async def _quota_in_disguise(
+                held: bytes,
+            ) -> web.StreamResponse:
+                # v0.2.102 fix round: what a vendor 403 carrying quota
+                # evidence gets — EXACTLY what a 429/402 gets. The ladder
+                # when armed and the body is re-sendable bytes; else the
+                # substituted envelope, with the held body handed over (the
+                # stream is consumed by the classification that routed here,
+                # and a second read would answer empty).
+                assert vendor is not None  # noqa: S101 — the auth branch runs only for a vendor route
+                if (
+                    ladder_escalate is not None
+                    and isinstance(body, (bytes, bytearray))
+                ):
+                    return await _ladder_quota_branch(
+                        upstream,
+                        gateway,
+                        decision,
+                        access,
+                        stream_requested=stream_requested,
+                        escalate=ladder_escalate,
+                        retry=_ladder_retry if allow_ladder_retry else None,
+                        raw=held,
+                    )
+                return await _quota_response(
+                    upstream,
+                    vendor,
+                    stream_requested,
+                    access,
+                    reprobe=(
+                        _quota_reprobe(
+                            request,
+                            gateway,
+                            decision,
+                            url,
+                            headers,
+                            body,
+                            requested_model=requested_model,
+                            stream_requested=stream_requested,
+                            started=started,
+                            note=note,
+                            images=images,
+                            facts=facts,
+                            fallback_from=fallback_from,
+                            effort_requested=effort_requested,
+                            effort_forwarded=effort_forwarded,
+                        )
+                        if allow_quota_reprobe
+                        and isinstance(body, (bytes, bytearray))
+                        else None
+                    ),
+                    raw=held,
+                )
+
             # WP-6 review MAJOR-1, refined by the no-discovery-vendor
             # addendum: a vendor 401/403 must be CLASSIFIED before it can
             # touch the strike counter, and classifying means reading the
@@ -3330,10 +3418,14 @@ async def _proxy(
             # invalidate the last-good key; any 2xx resets via the elif
             # below), exempts the documented model-level access-denial
             # shape, and relays the vendor's own answer verbatim either
-            # way. Status sets here are disjoint from the quota branch's.
+            # way. Status sets here are disjoint from the quota branch's —
+            # with ONE carve-out, decided INSIDE from the held body: a 403
+            # whose body carries quota evidence is routed to the quota
+            # machinery above (``_quota_in_disguise``) with no strike.
             if vendor is not None and upstream.status in (401, 403):
                 return await _auth_rejection_response(
                     request, gateway, vendor, upstream, access,
+                    quota_route=_quota_in_disguise,
                 )
             if vendor is not None and 200 <= upstream.status < 300:
                 gateway.note_vendor_success(vendor.vendor_id)
@@ -3342,35 +3434,8 @@ async def _proxy(
                 and isinstance(body, (bytes, bytearray))
                 and upstream.status in QUOTA_STATUSES
             ):
-                # The owner's fallback ladder (OD-9). Armed only for a route
-                # with a next rung and a body that can be re-sent; the branch
-                # owns the response because deciding means reading the body.
-                # ``allow_ladder_retry`` is the same-rung retry's recursion
-                # bound, cleared in the retry below exactly as the oauth and
-                # quota bounds are.
-                async def _ladder_retry(evidence: str) -> web.StreamResponse:
-                    return await _proxy(
-                        request,
-                        gateway,
-                        decision,
-                        url,
-                        headers,
-                        body,
-                        requested_model=requested_model,
-                        stream_requested=stream_requested,
-                        started=started,
-                        note=f"{note} note=ladder_retry {evidence}".strip(),
-                        images=images,
-                        facts=facts,
-                        allow_oauth_retry=False,
-                        allow_quota_reprobe=False,
-                        ladder_escalate=ladder_escalate,
-                        fallback_from=fallback_from,
-                        allow_ladder_retry=False,
-                        effort_requested=effort_requested,
-                        effort_forwarded=effort_forwarded,
-                    )
-
+                # The ladder branch owns the response because deciding means
+                # reading the body.
                 return await _ladder_quota_branch(
                     upstream,
                     gateway,
@@ -3824,6 +3889,8 @@ async def _auth_rejection_response(
     vendor: Vendor,
     upstream: aiohttp.ClientResponse,
     access: Callable[..., None],
+    *,
+    quota_route: Optional[Callable[[bytes], Awaitable[web.StreamResponse]]] = None,
 ) -> web.StreamResponse:
     """Classify a vendor 401/403, then relay the vendor's own answer verbatim.
 
@@ -3835,11 +3902,39 @@ async def _auth_rejection_response(
     relay shape :func:`_relay_vendor_json` uses for oversized bodies: the
     classification is ours, the answer is the vendor's, and neither editing
     the other is the bug this whole function avoids.
+
+    BEFORE the auth classification, a 403 whose held body reads as a QUOTA
+    refusal (``is_quota_refusal`` — the same evidence helpers the classifier
+    uses) is a quota refusal in disguise and takes ``quota_route`` — the
+    exact route a 429/402 takes (fallback ladder when armed, else the
+    substituted envelope) with NO auth strike: a "You've reached your 5-hour
+    usage limit" 403 is about the ALLOWANCE, not the credential, and
+    striking the key would disable a healthy one (observed live with a
+    vendor answering that shape four times, 2026-10-07..11). A 401 is never
+    quota-routed, and a 403 without quota evidence classifies exactly as
+    before.
     """
     relay = gateway.relay_headers(upstream)
     raw, overflowed = await _buffer_bounded(
         upstream.content, _AUTH_BODY_LIMIT_BYTES,
     )
+    if (
+        upstream.status == 403
+        and quota_route is not None
+        and not overflowed
+        and is_quota_refusal(403, raw, upstream.headers)
+    ):
+        # Overflow stays OUT of this branch: past the hold bound the body is
+        # a prefix, and the auth relay below streams it whole — the quota
+        # evidence in a giant body is not worth losing the verbatim relay
+        # for. The one access line is quota_route's to write.
+        logger.info(
+            "model-gateway: vendor %s answered 403 with quota evidence "
+            "(a quota refusal in disguise) — routed to the quota answer, "
+            "no auth strike",
+            _log_safe(vendor.vendor_id),
+        )
+        return await quota_route(raw)
     key_level = _auth_rejection_is_key_level(upstream.status, raw)
     if key_level:
         gateway.note_vendor_auth_rejection(vendor.vendor_id)
@@ -3878,6 +3973,66 @@ async def _auth_rejection_response(
         extra=f"bytes={len(raw)} note=vendor_auth auth_class={auth_class}",
     )
     return web.Response(status=upstream.status, headers=relay, body=raw)
+
+
+def _quota_answer(
+    status: int,
+    raw: bytes,
+    headers: "Mapping[str, str]",
+    vendor: Vendor,
+    stream_requested: bool,
+    access: Callable[..., None],
+) -> web.Response:
+    """The ONE quota answer builder, from ``(status, body, headers)``.
+
+    Substituted envelope (naming the vendor, carrying the reset hint) +
+    access line + the vendor's own machine-readable wait relayed. Shared by
+    :func:`_quota_response` (which owns the body read, the DEBUG log and the
+    re-probe) and the quota-in-disguise route a vendor 403 can take through
+    :func:`_auth_rejection_response`, so the sentence a user receives cannot
+    depend on WHICH status carried the quota evidence.
+    """
+    hint = find_reset_hint(raw, headers)
+    classification = classify_quota(status, raw, headers)
+    body = quota_error_body(
+        vendor_display_name(vendor),
+        hint,
+        status=status,
+        classification=classification,
+    )
+    access(
+        CLIENT_QUOTA_STATUS,
+        stream=stream_requested,
+        # The classification is in the LOG as well as in the message: when a
+        # user reports "it told me to switch models", the line says whether
+        # the gateway had evidence for that or fell back to the weaker
+        # sentence, without needing the body it deliberately did not keep.
+        extra=" ".join(
+            part
+            for part in (
+                f"note=vendor_quota upstream_status={status} "
+                f"quota_class={classification}",
+                # WHICH evidence carried the verdict, beside the verdict
+                # itself — see quota_evidence_fields. A support question
+                # ("it told me to switch models") is answerable from this
+                # line alone, without the body deliberately not kept.
+                quota_evidence_fields(raw, headers),
+            )
+            if part
+        ),
+    )
+    # The vendor's own wait, relayed: the BODY is replaced (that is this
+    # builder's whole job), but "when may I try again?" is machine-readable
+    # advice the client acts on, and dropping it turns a 30 s rate limit into
+    # a guess. ``x-should-retry`` says the same thing to an SDK that reads it
+    # rather than the header.
+    quota_headers = dict(RETRYABLE_HEADERS)
+    retry_after = headers.get("Retry-After")
+    if retry_after:
+        quota_headers["Retry-After"] = retry_after
+    return web.json_response(
+        body, status=CLIENT_QUOTA_STATUS, headers=quota_headers,
+    )
 
 
 async def _quota_response(
@@ -3943,7 +4098,6 @@ async def _quota_response(
         # as a client-controlled model id, one actor further out.
         _log_safe(raw.decode("utf-8", "replace")),
     )
-    hint = find_reset_hint(raw, upstream.headers)
     classification = classify_quota(upstream.status, raw, upstream.headers)
     if reprobe is not None and classification == CLASS_EXHAUSTED:
         # No delay, deliberately. What is stale here is the VERDICT, not the
@@ -3959,44 +4113,8 @@ async def _quota_response(
         # client request and one line: the evidence joins the line the
         # re-probe writes rather than opening a second one.
         return await reprobe(quota_evidence_fields(raw, upstream.headers))
-    body = quota_error_body(
-        vendor_display_name(vendor),
-        hint,
-        status=upstream.status,
-        classification=classification,
-    )
-    access(
-        CLIENT_QUOTA_STATUS,
-        stream=stream_requested,
-        # The classification is in the LOG as well as in the message: when a
-        # user reports "it told me to switch models", the line says whether
-        # the gateway had evidence for that or fell back to the weaker
-        # sentence, without needing the body it deliberately did not keep.
-        extra=" ".join(
-            part
-            for part in (
-                f"note=vendor_quota upstream_status={upstream.status} "
-                f"quota_class={classification}",
-                # WHICH evidence carried the verdict, beside the verdict
-                # itself — see quota_evidence_fields. A support question
-                # ("it told me to switch models") is answerable from this
-                # line alone, without the body deliberately not kept.
-                quota_evidence_fields(raw, upstream.headers),
-            )
-            if part
-        ),
-    )
-    # The vendor's own wait, relayed: the BODY is replaced (that is this
-    # function's whole job), but "when may I try again?" is machine-readable
-    # advice the client acts on, and dropping it turns a 30 s rate limit into
-    # a guess. ``x-should-retry`` says the same thing to an SDK that reads it
-    # rather than the header.
-    quota_headers = dict(RETRYABLE_HEADERS)
-    retry_after = upstream.headers.get("Retry-After")
-    if retry_after:
-        quota_headers["Retry-After"] = retry_after
-    return web.json_response(
-        body, status=CLIENT_QUOTA_STATUS, headers=quota_headers,
+    return _quota_answer(
+        upstream.status, raw, upstream.headers, vendor, stream_requested, access,
     )
 
 
@@ -4024,6 +4142,7 @@ async def _ladder_quota_branch(
     stream_requested: bool,
     escalate: Callable[[str], Awaitable[Optional[web.StreamResponse]]],
     retry: Optional[Callable[[str], Awaitable[web.StreamResponse]]],
+    raw: Optional[bytes] = None,
 ) -> web.StreamResponse:
     """Own a quota-status answer on a fallback-ladder-armed attempt (OD-9).
 
@@ -4031,7 +4150,10 @@ async def _ladder_quota_branch(
     (a streamed body cannot be re-sent, so its refusal goes to the client,
     exactly like the quota re-probe's own bound). This branch therefore OWNS
     the response: it reads the body to decide, and a body read is a body
-    consumed.
+    consumed. Also entered — with the body handed over in ``raw`` — for a
+    vendor 403 whose body carries quota evidence (the quota-in-disguise
+    route through :func:`_auth_rejection_response`): such an answer gets
+    EXACTLY the ladder a 429/402 would have got.
 
     The order of its three outcomes is OD-9 verbatim:
 
@@ -4055,7 +4177,13 @@ async def _ladder_quota_branch(
     ``note`` (the ``quota_reprobe`` discipline); only the terminal case where
     this branch answers writes its own.
     """
-    raw = await _peek_quota_body(upstream)
+    # A PEEK via the ONE shared home, unless a caller that already had to
+    # read the body (the 403-in-disguise route through
+    # ``_auth_rejection_response``, which classifies before it can know)
+    # hands it over — reading a consumed stream back would answer empty and
+    # silently downgrade the classification below.
+    if raw is None:
+        raw = await _peek_quota_body(upstream)
     classification = classify_quota(upstream.status, raw, upstream.headers)
     evidence = " ".join(
         part

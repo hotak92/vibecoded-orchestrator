@@ -367,6 +367,54 @@ _stop_fake_hub() {
     [ -f "$statedir/.hubpid" ] && kill "$(cat "$statedir/.hubpid")" 2>/dev/null || true
 }
 
+# --- Seq-hub helper (v0.2.102 fix round) -----------------------------------
+# Answers the FIRST /env GET with a 503 keychain_unavailable carrying
+# Retry-After $4, every later GET with 200 {"K":"v"}; counts requests into
+# $statedir/.hits. For the probe-retry tests (hub_has_key's ONE retry).
+_start_seq_hub() {
+    local statedir="$1" retry_after="$2"
+    command -v python3 >/dev/null 2>&1 || return 2  # skip if no python3
+    mkdir -p "$statedir"
+    local portfile="$statedir/.port"
+    python3 - "$portfile" "$statedir/.hits" "$retry_after" <<'PYEOF' &
+import http.server, sys, socket
+portfile, hitsfile, retry_after = sys.argv[1], sys.argv[2], sys.argv[3]
+s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+with open(portfile, "w") as f: f.write(str(port))
+state = {"busy": True}  # only the FIRST answer is the busy one
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        with open(hitsfile, "a") as f: f.write("x")
+        busy = state["busy"]
+        state["busy"] = False
+        if busy:
+            payload = b'{"error":{"code":"keychain_unavailable","message":"timed out"}}'
+            status = 503
+        else:
+            payload = b'{"K":"v"}'
+            status = 200
+        self.send_response(status)
+        self.send_header("Content-Type","application/json")
+        if busy:
+            self.send_header("Retry-After", retry_after)
+        self.send_header("Content-Length",str(len(payload)))
+        self.end_headers(); self.wfile.write(payload)
+http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+PYEOF
+    echo $! > "$statedir/.hubpid"
+    local port=""
+    for _ in $(seq 1 40); do
+        [ -s "$portfile" ] && port=$(cat "$portfile") && break
+        sleep 0.05
+    done
+    [ -n "$port" ] || return 1
+    printf '%s' "$port" > "$statedir/hub.port"
+    printf 'global-canary-token' > "$statedir/hub.token"
+    chmod 600 "$statedir/hub.token"
+    return 0
+}
+
 # --- Test (4b): a 403 probe must NOT suggest `vct set`; point at resolver ---
 # Post-flip the probe rides the global hub.token (the scoped file is keyed
 # by launcher project_id, not the file-store name) and /env returns 403.
@@ -436,6 +484,43 @@ t_die_miss_hub_5xx_withholds_vct_set() {
         *"retry"*) : ;;
         *) echo "    5xx miss did not say retry: $err"; return 1 ;;
     esac
+}
+
+# --- Test (v0.2.102 fix round): the probe retries once after Retry-After ---
+# A 503 keychain_unavailable is NOT a final "store busy" for the miss probe:
+# like the resolvers, the probe asks ONCE more, after the hub's numeric
+# Retry-After (capped at 5 s) — and a 200 on the retry upgrades the verdict
+# to "the launcher keychain HAS the key" (probe 0), still withholding the
+# `vct set` hint. Elapsed is measured so the honoured 4 s wait is
+# distinguishable from a no-retry or fixed-2 s probe.
+t_probe_retries_once_after_retry_after() {
+    local sd="$TMP/hubseq"
+    _start_seq_hub "$sd" 4
+    local rc=$?
+    [ "$rc" -eq 2 ] && { echo "    (skipped: no python3)"; return 0; }
+    [ "$rc" -eq 0 ] || { echo "    seq hub failed to start"; return 1; }
+    local err t0 t1
+    t0=$(date +%s%3N 2>/dev/null || date +%s)
+    err=$(VCT_STATE_DIR="$sd" VCT_HUB_PORT="$(cat "$sd/hub.port")" \
+          "$VCT" get --project seq-miss-proj --key K 2>&1 >/dev/null)
+    t1=$(date +%s%3N 2>/dev/null || date +%s)
+    _stop_fake_hub "$sd"
+    # The retry's 200 proves the keychain holds a value → the "keychain HAS"
+    # verdict, not the pre-fix "store busy" one.
+    case "$err" in
+        *"keychain HAS"*) : ;;
+        *) echo "    probe did not reach the confirmed-HIT verdict after the retry: $err"; return 1 ;;
+    esac
+    case "$err" in
+        *"Fix: vct set"*) echo "    probe wrongly RECOMMENDED 'vct set': $err"; return 1 ;;
+    esac
+    # Two probe requests: the first 503, the retried one 200.
+    [ "$(wc -c < "$sd/.hits")" = "2" ] || {
+        echo "    expected exactly 2 probe requests, got $(wc -c < "$sd/.hits")"; return 1; }
+    # The honoured wait: >= 3 s (4 s minus margin) — a fixed 2 s wait fails this.
+    if [ "$((t1 - t0))" -lt 3000 ]; then
+        echo "    retry did not honour Retry-After: 4 (took $((t1 - t0)) ms)"; return 1
+    fi
 }
 
 # --- Test (4b, v0.2.101 Q7/S1): a key_paused 404 must NOT suggest `vct set` -
@@ -725,6 +810,7 @@ run_test "die_miss 403 withholds 'vct set' (4b)" t_die_miss_403_withholds_vct_se
 run_test "die_miss hit points at resolver (4b)"  t_die_miss_hit_points_at_resolver
 run_test "die_miss key_paused withholds 'vct set' (Q7/S1)" t_die_miss_key_paused_withholds_vct_set
 run_test "die_miss hub 5xx withholds 'vct set' (W6-AB)" t_die_miss_hub_5xx_withholds_vct_set
+run_test "probe retries once after Retry-After (fix round)" t_probe_retries_once_after_retry_after
 
 # v0.2.80 Part A/B/C — secret-shape guard + recover-blob + doctor taxonomy.
 # These run LAST: several set their own isolated VCT_SECRETS_DIR.

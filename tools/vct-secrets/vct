@@ -270,15 +270,66 @@ _hub_stale_env_fallback_token() {
 _VCT_HUB_PROBE_READ_TIMEOUT_S=30
 _VCT_HUB_PROBE_CONNECT_TIMEOUT_S=2
 
+# Wait before the ONE probe retry after a 503 keychain_unavailable: the hub's
+# own Retry-After when the header is numeric, clamped to [0, cap]; the hub
+# default below when it is absent or unparseable. MUST MATCH
+# `agent_secrets.HUB_RETRY_AFTER_CAP_SECONDS` /
+# `_HUB_RETRY_AFTER_DEFAULT_SECONDS` (via `_retry_wait_seconds`),
+# `_HUB_RETRY_AFTER_CAP_S` / `_HUB_RETRY_WAIT_S` in
+# templates/scripts/vct_secrets_resolve.sh and `$script:HubRetryAfterCapMs` /
+# `$script:HubRetryWaitMs` in vct_secrets_resolve.ps1 -- pinned for every
+# language by tests/test_secret_read_timeout_parity.py.
+_VCT_HUB_RETRY_WAIT_S=2
+_VCT_HUB_RETRY_AFTER_CAP_S=5
+
+# Response headers of the MOST RECENT probe request, captured so the retry
+# above can honour Retry-After (`--dump-header` works on every curl we ship
+# against; the newer `%header{}` / `%{retry_after}` write-out variables are
+# rejected by older curls and would FAIL the whole call). One private file
+# per vct process, removed on exit; when it cannot be created the header is
+# simply unread (fallback wait).
+_VCT_HUB_HEADER_FILE=""
+if _VCT_HUB_HEADER_FILE=$(mktemp "${TMPDIR:-/tmp}/vct_probe_headers.XXXXXX" 2>/dev/null); then
+    trap '_VCT_HUB_HEADER_FILE="${_VCT_HUB_HEADER_FILE:-}"; [ -n "$_VCT_HUB_HEADER_FILE" ] && rm -f "$_VCT_HUB_HEADER_FILE"' EXIT
+else
+    _VCT_HUB_HEADER_FILE=""
+fi
+
+# The wait before the one probe retry, from the LAST response's Retry-After
+# header: numeric -> clamped to [0, _VCT_HUB_RETRY_AFTER_CAP_S]; absent or
+# not a plain number -> _VCT_HUB_RETRY_WAIT_S. MUST MATCH
+# `agent_secrets._retry_wait_seconds`, `_hub_retry_wait_seconds` in the .sh
+# resolver and `Get-HubRetryWaitMs` in the .ps1.
+_vct_hub_retry_wait_s() {
+    local raw=""
+    if [ -n "${_VCT_HUB_HEADER_FILE:-}" ] && [ -r "${_VCT_HUB_HEADER_FILE:-}" ]; then
+        raw=$(sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*//p' "$_VCT_HUB_HEADER_FILE" \
+              2>/dev/null | tr -d '\r' | tail -n 1)
+    fi
+    if printf '%s' "$raw" | grep -Eq '^-?[0-9]+([.][0-9]+)?$'; then
+        awk -v v="$raw" -v cap="$_VCT_HUB_RETRY_AFTER_CAP_S" \
+            'BEGIN { if (v < 0) v = 0; if (v > cap) v = cap; printf "%.3f", v }'
+    else
+        printf '%s' "$_VCT_HUB_RETRY_WAIT_S"
+    fi
+}
+
 # One probe request: echoes the curl output (body + "\n<status>"); returns 0,
 # 4 when the hub was reached but did not answer in time (curl 28 timeout, 52
 # empty reply, 55/56 send/recv failure after connect), 1 on any other failure
 # (refused, no curl).
 _hub_probe_curl() {
     local url="$1" token="$2" out crc=0
-    out=$(curl --silent --show-error \
-                --connect-timeout "$_VCT_HUB_PROBE_CONNECT_TIMEOUT_S" \
-                --max-time "$_VCT_HUB_PROBE_READ_TIMEOUT_S" \
+    local probe_args=(--silent --show-error \
+                      --connect-timeout "$_VCT_HUB_PROBE_CONNECT_TIMEOUT_S" \
+                      --max-time "$_VCT_HUB_PROBE_READ_TIMEOUT_S")
+    if [ -n "${_VCT_HUB_HEADER_FILE:-}" ]; then
+        # Truncate first so a FAILED request never leaves the PREVIOUS
+        # answer's Retry-After behind (the file outlives each curl).
+        : >"$_VCT_HUB_HEADER_FILE" 2>/dev/null || true
+        probe_args+=(--dump-header "$_VCT_HUB_HEADER_FILE")
+    fi
+    out=$(curl "${probe_args[@]}" \
                 --header @- --output - --write-out '\n%{http_code}' "$url" \
                 <<<"Authorization: Bearer ${token}" 2>/dev/null) || crc=$?
     if [ "$crc" -ne 0 ]; then
@@ -299,6 +350,32 @@ hub_has_key() {
     token=$(_hub_token "$project")
     [ -n "$token" ] || return 1
     local url="http://127.0.0.1:${port}/api/v1/projects/${project}/env?key=${key}"
+    # v0.2.102 fix round: code 4 (the hub is RUNNING but could not answer --
+    # timeout, 5xx, or a temporarily unavailable keychain) gets ONE retry,
+    # after the hub's Retry-After when it sent one. MUST MATCH
+    # `read_key_hub` in templates/scripts/vct_secrets_resolve.sh and
+    # `Read-KeyHub` in the .ps1: the retry is usually answered at once
+    # because the slow keychain op's result lands in the hub's cache.
+    local rc=0
+    _hub_has_key_once "$url" "$token" && return 0
+    rc=$?
+    [ "$rc" -eq 4 ] || return "$rc"
+    sleep "${_VCT_HUB_RETRY_WAIT:-0}"
+    _hub_has_key_once "$url" "$token" && return 0
+    rc=$?
+    # A retry that could not even connect (the hub went away between
+    # attempts) does not erase what the first attempt proved: the key state
+    # is still UNKNOWN, never a confirmed absence.
+    [ "$rc" -eq 1 ] && rc=4
+    return "$rc"
+}
+
+# One probe attempt. Sets _VCT_HUB_RETRY_WAIT (0 for an immediate retry --
+# timeout / other 5xx; the Retry-After-derived wait for a 503
+# keychain_unavailable, mirroring the .sh resolver's `_HUB_RETRY_WAIT`).
+_hub_has_key_once() {
+    local url="$1" token="$2"
+    _VCT_HUB_RETRY_WAIT=0
     local body status prc=0
     body=$(_hub_probe_curl "$url" "$token") || prc=$?
     [ "$prc" -eq 0 ] || return "$prc"
@@ -357,7 +434,9 @@ hub_has_key() {
     fi
     if [ "$status" = "503" ]; then
         case "$body" in
-            *'"code":"keychain_unavailable"'*) return 4 ;;
+            *'"code":"keychain_unavailable"'*)
+                _VCT_HUB_RETRY_WAIT=$(_vct_hub_retry_wait_s)
+                return 4 ;;
         esac
     fi
     # v0.2.102 (W6-AB): any other 5xx — the hub is running but could not

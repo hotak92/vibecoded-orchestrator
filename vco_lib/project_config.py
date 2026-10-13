@@ -84,6 +84,7 @@ Caching
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import threading
@@ -194,40 +195,56 @@ class HubNotResponding(HubUnreachable):
     """
 
 
+def _is_os_error_refused(exc: BaseException) -> bool:
+    """Structural refusal test for ONE exception object: a
+    :class:`ConnectionRefusedError`, or an :class:`OSError` whose ``errno``
+    is ``ECONNREFUSED`` (Windows: ``WSAECONNREFUSED`` — CPython maps WinError
+    10061 to :class:`ConnectionRefusedError` itself; a re-wrapped OSError
+    keeps only the ``errno``)."""
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    errno_value = getattr(exc, "errno", None)
+    if isinstance(errno_value, int):
+        if errno_value == errno.ECONNREFUSED:
+            return True
+        wsa_refused = getattr(errno, "WSAECONNREFUSED", None)
+        if wsa_refused is not None and errno_value == wsa_refused:
+            return True
+    return False
+
+
 def _is_connection_refused(exc: BaseException) -> bool:
     """Did ``exc`` (a ``requests`` transport error) fail because nothing is
     LISTENING — a refused connection — as opposed to a hub that accepted the
-    connection and then did not answer? Walks the cause/context chain for a
-    :class:`ConnectionRefusedError`; falls back to the message text urllib3
-    builds for a refused ``NewConnectionError`` (``[Errno 111]`` / ``[WinError
-    10061]`` / "Connection refused"), since urllib3 wraps the OSError in its
-    own exception types. Conservative: anything not positively a refusal is
-    "not responding"."""
+    connection and then did not answer? Classified STRUCTURALLY, by exception
+    type and ``errno`` (v0.2.102 fix round): a
+    :class:`ConnectionRefusedError` or ``ECONNREFUSED`` anywhere in the
+    cause/context chain or nested args (urllib3 wraps the OS error in its own
+    types — ``NewConnectionError`` lands in ``MaxRetryError``'s reason — but
+    the underlying OSError stays reachable through the chain, verified
+    against the shipped urllib3), and a :class:`urllib.error.URLError` by its
+    ``.reason``. An exception whose MESSAGE mentions a refusal proves
+    nothing: proxy noise and nested vendor errors quote transport text, and
+    reading it classified a busy hub's miss as "no launcher hub running"
+    (the pre-fix false message, on a narrower path). Conservative: anything
+    not positively a refusal is "not responding"."""
     seen: set[int] = set()
     cur: Optional[BaseException] = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
-        if isinstance(cur, ConnectionRefusedError):
+        if _is_os_error_refused(cur):
+            return True
+        # urllib.error.URLError carries the original error in `.reason`, not
+        # in the chain every time (a bare `raise URLError(reason)` sets
+        # neither __cause__ nor __context__).
+        reason = getattr(cur, "reason", None)
+        if isinstance(reason, BaseException) and _is_connection_refused(reason):
             return True
         for arg in getattr(cur, "args", ()):
-            if isinstance(arg, ConnectionRefusedError):
+            if isinstance(arg, BaseException) and _is_connection_refused(arg):
                 return True
-            if isinstance(arg, BaseException) and _is_connection_refused_text(str(arg)):
-                return True
-        if _is_connection_refused_text(str(cur)):
-            return True
         cur = cur.__cause__ or cur.__context__
     return False
-
-
-def _is_connection_refused_text(text: str) -> bool:
-    low = text.lower()
-    return (
-        "connection refused" in low
-        or "errno 111" in low
-        or "winerror 10061" in low
-        or "actively refused" in low
-    )
 
 
 def _transport_error(exc: requests.RequestException, what: str) -> HubUnreachable:

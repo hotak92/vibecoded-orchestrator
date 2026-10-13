@@ -222,8 +222,48 @@ fi
 _SECRET_READ_TIMEOUT_S=30
 _HUB_CONNECT_TIMEOUT_S=2
 # Wait before the ONE retry after a 503 keychain_unavailable: the hub's own
-# Retry-After (`KEYCHAIN_UNAVAILABLE_RETRY_AFTER_SECS` in modules_api.rs).
+# Retry-After (`KEYCHAIN_UNAVAILABLE_RETRY_AFTER_SECS` in modules_api.rs)
+# when the header is numeric, clamped to [0, cap]; the hub default below when
+# the header is absent or unparseable. MUST MATCH
+# `agent_secrets.HUB_RETRY_AFTER_CAP_SECONDS` /
+# `_HUB_RETRY_AFTER_DEFAULT_SECONDS` (via `_retry_wait_seconds`),
+# `$script:HubRetryAfterCapMs` / `$script:HubRetryWaitMs` in
+# vct_secrets_resolve.ps1 and `_VCT_HUB_RETRY_AFTER_CAP_S` /
+# `_VCT_HUB_RETRY_WAIT_S` in tools/vct-secrets/vct — pinned for every
+# language by tests/test_secret_read_timeout_parity.py.
 _HUB_RETRY_WAIT_S=2
+_HUB_RETRY_AFTER_CAP_S=5
+
+# Response headers of the MOST RECENT hub request, captured so the retry
+# above can honour Retry-After. `--dump-header` works on every curl we ship
+# against (unlike the newer `%header{}` / `%{retry_after}` write-out
+# variables, which older macOS curls reject — a rejected write-out FAILS the
+# whole curl call). One private file per resolver process, removed on exit;
+# when it cannot be created the header is simply unread (fallback wait).
+_HUB_HEADER_FILE=""
+if _HUB_HEADER_FILE=$(mktemp "${TMPDIR:-/tmp}/vct_resolve_headers.XXXXXX" 2>/dev/null); then
+    trap '_HUB_HEADER_FILE="${_HUB_HEADER_FILE:-}"; [ -n "$_HUB_HEADER_FILE" ] && rm -f "$_HUB_HEADER_FILE"' EXIT
+else
+    _HUB_HEADER_FILE=""
+fi
+
+# The wait before the one retry, from the LAST response's Retry-After
+# header: numeric → clamped to [0, _HUB_RETRY_AFTER_CAP_S]; absent or not a
+# plain number → _HUB_RETRY_WAIT_S. MUST MATCH
+# `agent_secrets._retry_wait_seconds` and `Get-HubRetryWaitMs` in the .ps1.
+_hub_retry_wait_seconds() {
+    local raw=""
+    if [[ -n "${_HUB_HEADER_FILE:-}" && -r "$_HUB_HEADER_FILE" ]]; then
+        raw=$(sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*//p' "$_HUB_HEADER_FILE" \
+              2>/dev/null | tr -d '\r' | tail -n 1)
+    fi
+    if [[ "$raw" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+        awk -v v="$raw" -v cap="$_HUB_RETRY_AFTER_CAP_S" \
+            'BEGIN { if (v < 0) v = 0; if (v > cap) v = cap; printf "%.3f", v }'
+    else
+        printf '%s' "$_HUB_RETRY_WAIT_S"
+    fi
+}
 
 # The --max-time for the next hub request: _SECRET_READ_TIMEOUT_S, or what
 # is left of the budget when that is less. Returns 1 (nothing printed) when
@@ -438,8 +478,15 @@ _hub_curl() {
     local url="$1" token="$2"
     local body status max_time crc=0
     max_time=$(_hub_request_max_time) || return 1
-    body=$(curl --silent --show-error --max-time "$max_time" \
-                --connect-timeout "$(_hub_connect_timeout "$max_time")" \
+    local curl_args=(--silent --show-error --max-time "$max_time" \
+                     --connect-timeout "$(_hub_connect_timeout "$max_time")")
+    if [[ -n "${_HUB_HEADER_FILE:-}" ]]; then
+        # Truncate first so a FAILED request never leaves the PREVIOUS
+        # answer's Retry-After behind (the file outlives each curl).
+        : >"$_HUB_HEADER_FILE" 2>/dev/null || true
+        curl_args+=(--dump-header "$_HUB_HEADER_FILE")
+    fi
+    body=$(curl "${curl_args[@]}" \
                 --header @- \
                 --output - --write-out '\n%{http_code}' "$url" \
                 <<<"Authorization: Bearer ${token}" 2>&1) || crc=$?
@@ -859,7 +906,7 @@ read_key_hub_env() {
                     # then exit 7 — the retryable "store unavailable" code,
                     # distinct from exit 6 (locked/unreadable: unlock it).
                     err "hub could not read the OS keychain for $key (project $pid): the keychain is temporarily unavailable (a keychain operation timed out) — retry in a few seconds."
-                    _HUB_RETRY_WAIT=$_HUB_RETRY_WAIT_S
+                    _HUB_RETRY_WAIT=$(_hub_retry_wait_seconds)
                     return 7
                     ;;
                 *)

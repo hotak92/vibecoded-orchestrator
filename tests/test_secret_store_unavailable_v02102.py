@@ -156,6 +156,137 @@ def test_refused_is_plain_hub_unreachable(hub):
     assert not isinstance(ei.value, project_config.HubNotResponding)
 
 
+# ── transport classification is STRUCTURAL (v0.2.102 fix round) ─────────
+# Refused-vs-not-responding must be decided by exception TYPE and errno,
+# never by message text: an unrelated transport error whose text mentions
+# "connection refused" (proxy noise, a nested vendor error) was classified
+# as a refusal → plain HubUnreachable → the false "launcher hub isn't
+# running" remedy on a busy hub.
+
+
+def _refused_in_args() -> requests.ConnectionError:
+    # urllib3's shape: the OS error wrapped inside another exception's args
+    # (NewConnectionError lands in MaxRetryError's reason).
+    inner = ConnectionRefusedError(111, "Connection refused")
+    try:
+        raise Exception("Max retries exceeded", inner)
+    except Exception as wrapped:
+        try:
+            raise requests.ConnectionError(wrapped) from wrapped
+        except requests.ConnectionError as exc:
+            return exc
+
+
+def _rewrapped_errno_refused() -> requests.ConnectionError:
+    # urllib3 2.x's shape: the OSError re-raised as a NEW OSError that keeps
+    # only errno (not a ConnectionRefusedError instance).
+    inner = OSError(111, "Error connecting to 127.0.0.1:7700")
+    try:
+        raise requests.ConnectionError("wrapped transport error") from inner
+    except requests.ConnectionError as exc:
+        return exc
+
+
+def _text_only_refusal() -> requests.ConnectionError:
+    return requests.ConnectionError(
+        "upstream vendor error: connection refused by the policy proxy"
+    )
+
+
+def _errno_says_otherwise_text_says_refused() -> requests.ConnectionError:
+    inner = OSError(113, "No route to host (proxy noted: connection refused)")
+    try:
+        raise requests.ConnectionError("transport failed") from inner
+    except requests.ConnectionError as exc:
+        return exc
+
+
+def _urlerror_refused() -> requests.ConnectionError:
+    import urllib.error
+
+    inner = ConnectionRefusedError(111, "Connection refused")
+    return requests.ConnectionError(urllib.error.URLError(inner))
+
+
+def _urlerror_string_reason() -> requests.ConnectionError:
+    import urllib.error
+
+    return requests.ConnectionError(urllib.error.URLError("connection refused"))
+
+
+def _caused_by_timeout() -> requests.ConnectionError:
+    import socket
+
+    inner = socket.timeout("timed out")
+    try:
+        raise requests.ConnectionError("connection failed") from inner
+    except requests.ConnectionError as exc:
+        return exc
+
+
+def test_a_nested_refused_in_args_is_refused(hub):
+    hub([_refused_in_args()])
+    with pytest.raises(project_config.HubUnreachable) as ei:
+        project_config._get_with_401_retry(lambda port, _t: f"http://127.0.0.1:{port}/x")
+    assert not isinstance(ei.value, project_config.HubNotResponding)
+
+
+def test_an_errno_econnrefused_in_the_chain_is_refused(hub):
+    hub([_rewrapped_errno_refused()])
+    with pytest.raises(project_config.HubUnreachable) as ei:
+        project_config._get_with_401_retry(lambda port, _t: f"http://127.0.0.1:{port}/x")
+    assert not isinstance(ei.value, project_config.HubNotResponding)
+
+
+def test_text_mentioning_refusal_alone_is_not_a_refusal(hub):
+    hub([_text_only_refusal()])
+    with pytest.raises(project_config.HubNotResponding):
+        project_config._get_with_401_retry(lambda port, _t: f"http://127.0.0.1:{port}/x")
+
+
+def test_an_os_error_whose_text_says_refused_but_errno_does_not(hub):
+    hub([_errno_says_otherwise_text_says_refused()])
+    with pytest.raises(project_config.HubNotResponding):
+        project_config._get_with_401_retry(lambda port, _t: f"http://127.0.0.1:{port}/x")
+
+
+def test_a_urlerror_with_a_refused_reason_is_refused(hub):
+    hub([_urlerror_refused()])
+    with pytest.raises(project_config.HubUnreachable) as ei:
+        project_config._get_with_401_retry(lambda port, _t: f"http://127.0.0.1:{port}/x")
+    assert not isinstance(ei.value, project_config.HubNotResponding)
+
+
+def test_a_urlerror_with_a_string_reason_is_not_positively_a_refusal(hub):
+    # A STRING reason carries no type and no errno — conservative default is
+    # "not responding" (retryable), never the false "hub not running".
+    hub([_urlerror_string_reason()])
+    with pytest.raises(project_config.HubNotResponding):
+        project_config._get_with_401_retry(lambda port, _t: f"http://127.0.0.1:{port}/x")
+
+
+def test_a_socket_timeout_in_the_chain_is_not_a_refusal(hub):
+    hub([_caused_by_timeout()])
+    with pytest.raises(project_config.HubNotResponding):
+        project_config._get_with_401_retry(lambda port, _t: f"http://127.0.0.1:{port}/x")
+
+
+def test_a_real_refused_connection_is_still_classified_refused():
+    """The structural walk must survive the REAL requests/urllib3 chain —
+    the live check behind 'keep the behaviour': urllib3 wraps the OS error
+    in NewConnectionError/MaxRetryError, and the ConnectionRefusedError
+    stays reachable through the context chain."""
+    import socket as socket_mod
+
+    s = socket_mod.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    with pytest.raises(requests.RequestException) as ei:
+        requests.get(f"http://127.0.0.1:{port}/x", timeout=(1, 2))
+    assert project_config._is_connection_refused(ei.value)
+
+
 def test_config_reads_keep_the_short_read_timeout(hub):
     sess = hub([_Resp(200)])
     project_config._get_with_401_retry(lambda port, _t: f"http://127.0.0.1:{port}/x")

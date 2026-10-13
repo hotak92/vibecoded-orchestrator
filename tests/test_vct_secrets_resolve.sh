@@ -160,8 +160,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             import time
             with open(delay_path) as f:
                 time.sleep(float(f.read().strip()))
+        # v0.2.102 fix-round knob: `<fixture>.retry_after` sends that literal
+        # Retry-After header on every answer for the fixture (the value the
+        # resolver's ONE retry must honour).
+        retry_after_path = body_path + ".retry_after"
+        retry_after = None
+        if os.path.exists(retry_after_path):
+            with open(retry_after_path) as f:
+                retry_after = f.read().strip() or None
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if retry_after is not None:
+            self.send_header("Retry-After", retry_after)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -439,6 +449,97 @@ rc=$?
 set -e
 assert_eq "$rc" "0" "test_vct_secrets_resolve_slow_keychain_completes_on_retry_rc"
 assert_eq "$slow_out" "synthetic-slow-keychain-value" "test_vct_secrets_resolve_slow_keychain_completes_on_retry_value"
+
+# ── Test 4d3b (v0.2.102 fix round): the retry waits the hub's Retry-After ──
+# The ONE retry after a 503 keychain_unavailable must honour a NUMERIC
+# Retry-After (clamped at 5 s) the way agent_secrets._retry_wait_seconds
+# does — not a fixed 2 s wait. Elapsed is asserted in ms so the honoured
+# wait (4 s) is distinguishable from the old fixed 2 s.
+_now_ms_test() {
+    # Same ladder as the resolver's _now_ms: EPOCHREALTIME → GNU date +%s%3N
+    # → whole seconds (coarser, still bounds the waits above).
+    local t="${EPOCHREALTIME:-}"
+    if [[ -n "$t" ]]; then
+        t="${t/,/.}"
+        local whole="${t%%.*}" frac="${t#*.}000"
+        printf '%s' "$(( 10#$whole * 1000 + 10#${frac:0:3} ))"
+        return 0
+    fi
+    t=$(date +%s%3N 2>/dev/null || true)
+    if [[ "$t" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$t"
+        return 0
+    fi
+    printf '%s' "$(( $(date +%s) * 1000 ))"
+}
+cat >"$scratch/responses/GET_projects_p1_env_key=RA_KEY.json" <<'JSON'
+{"RA_KEY": "synthetic-retry-after-value"}
+JSON
+printf '503' >"$scratch/responses/GET_projects_p1_env_key=RA_KEY.json.once_status"
+printf '%s' '{"error": {"code": "keychain_unavailable", "message": "timed out"}}' \
+    >"$scratch/responses/GET_projects_p1_env_key=RA_KEY.json.once_body"
+printf '4' >"$scratch/responses/GET_projects_p1_env_key=RA_KEY.json.retry_after"
+t0=$(_now_ms_test)
+set +e
+ra_out=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 RA_KEY 2>/dev/null)
+ra_rc=$?
+set -e
+ra_ms=$(( $(_now_ms_test) - t0 ))
+assert_eq "$ra_rc" "0" "test_vct_secrets_resolve_retry_honours_retry_after_rc"
+assert_eq "$ra_out" "synthetic-retry-after-value" "test_vct_secrets_resolve_retry_honours_retry_after_value"
+if (( ra_ms >= 3500 && ra_ms <= 8000 )); then
+    assert_eq "0" "0" "test_vct_secrets_resolve_retry_honours_retry_after_waited_4s (took ${ra_ms}ms)"
+else
+    assert_eq "${ra_ms}ms" "3500..8000ms" "test_vct_secrets_resolve_retry_honours_retry_after_waited_4s"
+fi
+
+# ── Test 4d3c (v0.2.102 fix round): Retry-After above the cap is CLAMPED ──
+# Same shape with Retry-After: 9 — the wait is the 5 s cap, so the whole
+# resolve finishes well inside the 9 s the hub asked for.
+cat >"$scratch/responses/GET_projects_p1_env_key=RA_CAP_KEY.json" <<'JSON'
+{"RA_CAP_KEY": "synthetic-capped-value"}
+JSON
+printf '503' >"$scratch/responses/GET_projects_p1_env_key=RA_CAP_KEY.json.once_status"
+printf '%s' '{"error": {"code": "keychain_unavailable", "message": "timed out"}}' \
+    >"$scratch/responses/GET_projects_p1_env_key=RA_CAP_KEY.json.once_body"
+printf '9' >"$scratch/responses/GET_projects_p1_env_key=RA_CAP_KEY.json.retry_after"
+t0=$(_now_ms_test)
+set +e
+cap_out=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 RA_CAP_KEY 2>/dev/null)
+cap_rc=$?
+set -e
+cap_ms=$(( $(_now_ms_test) - t0 ))
+assert_eq "$cap_rc" "0" "test_vct_secrets_resolve_retry_after_is_capped_rc"
+assert_eq "$cap_out" "synthetic-capped-value" "test_vct_secrets_resolve_retry_after_is_capped_value"
+if (( cap_ms >= 4500 && cap_ms <= 8000 )); then
+    assert_eq "0" "0" "test_vct_secrets_resolve_retry_after_cap_is_5s_not_9s (took ${cap_ms}ms)"
+else
+    assert_eq "${cap_ms}ms" "4500..8000ms" "test_vct_secrets_resolve_retry_after_cap_is_5s_not_9s"
+fi
+
+# ── Test 4d3d (v0.2.102 fix round): an unparseable Retry-After → 2 s ──────
+# "soon" is not a number of seconds: the wait falls back to the hub default
+# (2 s), never an error and never a long sleep on garbage.
+cat >"$scratch/responses/GET_projects_p1_env_key=RA_BAD_KEY.json" <<'JSON'
+{"RA_BAD_KEY": "synthetic-fallback-value"}
+JSON
+printf '503' >"$scratch/responses/GET_projects_p1_env_key=RA_BAD_KEY.json.once_status"
+printf '%s' '{"error": {"code": "keychain_unavailable", "message": "timed out"}}' \
+    >"$scratch/responses/GET_projects_p1_env_key=RA_BAD_KEY.json.once_body"
+printf 'soon' >"$scratch/responses/GET_projects_p1_env_key=RA_BAD_KEY.json.retry_after"
+t0=$(_now_ms_test)
+set +e
+bad_out=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 RA_BAD_KEY 2>/dev/null)
+bad_rc=$?
+set -e
+bad_ms=$(( $(_now_ms_test) - t0 ))
+assert_eq "$bad_rc" "0" "test_vct_secrets_resolve_unparseable_retry_after_falls_back_rc"
+assert_eq "$bad_out" "synthetic-fallback-value" "test_vct_secrets_resolve_unparseable_retry_after_falls_back_value"
+if (( bad_ms <= 4500 )); then
+    assert_eq "0" "0" "test_vct_secrets_resolve_unparseable_retry_after_waits_the_2s_default (took ${bad_ms}ms)"
+else
+    assert_eq "${bad_ms}ms" "<=4500ms" "test_vct_secrets_resolve_unparseable_retry_after_waits_the_2s_default"
+fi
 
 # ── Test 4d4 (v0.2.102 W6-AB): a hub that does not answer in time → exit 7 ──
 # The 2026-10-13 incident shape: the hub accepts the connection but its
