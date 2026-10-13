@@ -72,7 +72,7 @@ export function extraPathStaleBadge(row: ExtraPath): ExtraPathStaleBadge | null 
 /**
  * Minimal project reference returned by the disambiguation branch of
  * `add_project_codegraph_extra_path` — only the fields the modal needs
- * to render the "Add as project / Add as path anyway" prompt.
+ * to render the "Add as project / Add as code folder anyway" prompt.
  */
 export interface ProjectMeta {
   id: string;

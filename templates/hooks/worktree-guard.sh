@@ -352,7 +352,14 @@ write_notice() {
 # calls it. No pending file → nothing below runs and the guard behaves exactly
 # as before. Consume exit 3 = nothing to consume (all expired, or not an
 # agent-* launch) → fall through. Any other failure is a LOUD abort — never a
-# silent fallback to a worktree of P. MUST MATCH worktree-guard.ps1.
+# silent fallback to a worktree of P. A consume that exits 0 without its five
+# non-empty lines (path, HEAD, repo, mode, extra JSON) is a malformed success:
+# the reservation is already claimed, so it is the same loud abort, never an
+# empty or partial path. MUST MATCH worktree-guard.ps1.
+# No VCO-side time bound here: `git worktree add` on a very large repo can
+# take minutes and must never be killed mid-run. The WorktreeCreate
+# registration carries no `timeout`, so the harness's own command-hook
+# default (600 s) is the outer bound.
 LANE_PENDING="$PROJECT_ROOT/.claude/state/lane-reservations/pending"
 if [ -n "$WT_NAME" ] && ls "$LANE_PENDING"/res-*.json >/dev/null 2>&1; then
     VCO_VENV_PYTHON=""
@@ -375,6 +382,13 @@ if [ -n "$WT_NAME" ] && ls "$LANE_PENDING"/res-*.json >/dev/null 2>&1; then
         LANE_REPO="$(printf '%s\n' "$LANE_OUT" | sed -n '3p')"
         LANE_MODE="$(printf '%s\n' "$LANE_OUT" | sed -n '4p')"
         LANE_EXTRA="$(printf '%s\n' "$LANE_OUT" | sed -n '5p')"
+        if [ -z "$LANE_PATH" ] || [ -z "$LANE_HEAD" ] || [ -z "$LANE_REPO" ] \
+            || [ -z "$LANE_MODE" ] || [ -z "$LANE_EXTRA" ]; then
+            REASON="lane reservation consume reported success but its output was malformed (expected five non-empty lines: path, HEAD, repo, mode, extra JSON) - the reservation was claimed; no worktree of the project was created in its place"
+            log_event "create_failed" "$REASON" "$PROPOSED_PATH" ""
+            printf 'worktree-guard: ABORT - %s\n' "$REASON" >&2
+            exit 1
+        fi
         log_event "created" "lane_reservation" "$PROPOSED_PATH" "$LANE_PATH"
         record_launch "$LANE_MODE" "$LANE_PATH" "$LANE_HEAD" "$LANE_REPO" "$LANE_EXTRA"
         emit_path "$LANE_PATH"

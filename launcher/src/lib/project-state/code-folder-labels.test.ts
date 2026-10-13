@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { parse } from 'svelte/compiler';
 import {
   CODE_FOLDER,
+  CODE_FOLDER_DISAMBIG,
   disabledTitle,
   reenabledTitle,
   removeConfirm,
@@ -115,5 +116,47 @@ describe('ExtraCodegraphPathsPanel renders the code-folder labels', () => {
       .map((n) => String(n.data ?? ''))
       .join(' ');
     expect(text).not.toMatch(/Extra codegraph paths|Add path\b|extra paths added/);
+  });
+});
+
+// v0.2.102 W6-AA review (A4): the disambiguation modal (the picked folder is
+// itself a launcher project) speaks of code folders too. Checked on the
+// parsed template, so neither template text nor a string literal in a
+// template expression may still say "Add as path anyway" / "read-only path".
+describe('ExtrasDisambiguationModal uses the code-folder wording', () => {
+  const modalSrc = readFileSync(
+    fileURLToPath(new URL('../components/ExtrasDisambiguationModal.svelte', import.meta.url)),
+    'utf8',
+  );
+  const modalAst = parse(modalSrc, { modern: true }) as unknown as { fragment: unknown };
+  const modalNodes: Node[] = [];
+  walk(modalAst.fragment, modalNodes);
+
+  it('pins the wording', () => {
+    expect(CODE_FOLDER_DISAMBIG.addAnywayButton).toBe('Add as code folder anyway');
+    expect(CODE_FOLDER_DISAMBIG.hint).toContain('"Add as code folder anyway"');
+    expect(Object.values(CODE_FOLDER_DISAMBIG).join(' ')).not.toMatch(/path anyway|read-only path/i);
+  });
+
+  it('no rendered text or template literal keeps the old names', () => {
+    const rendered = modalNodes
+      .filter((n) => n.type === 'Text' || n.type === 'Literal')
+      .map((n) => String((n as { data?: unknown; value?: unknown }).data ?? (n as { value?: unknown }).value ?? ''))
+      .join(' ');
+    expect(rendered).not.toMatch(/path anyway|read-only path|Adding path/i);
+  });
+
+  it('the button, its busy label, both aria labels and the prose read CODE_FOLDER_DISAMBIG', () => {
+    const members = modalNodes.map((n) => memberText(n)).filter(Boolean);
+    expect(members).toEqual(
+      expect.arrayContaining([
+        'CODE_FOLDER_DISAMBIG.addAnywayButton',
+        'CODE_FOLDER_DISAMBIG.addAnywayBusy',
+        'CODE_FOLDER_DISAMBIG.addAnywayAria',
+        'CODE_FOLDER_DISAMBIG.grantAria',
+        'CODE_FOLDER_DISAMBIG.insteadLead',
+        'CODE_FOLDER_DISAMBIG.hint',
+      ]),
+    );
   });
 });

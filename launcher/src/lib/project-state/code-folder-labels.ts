@@ -28,6 +28,23 @@ export const CODE_FOLDER = {
   disabledAria: 'This code folder is currently disabled',
 } as const;
 
+/** ExtrasDisambiguationModal: the picked folder is itself a launcher
+ *  project. The "anyway" choice adds it as a code folder of THIS project
+ *  (indexed here, and lane reservations may put worktrees there); the other
+ *  choice grants access-matrix reads instead. Not "read-only path": a code
+ *  folder is where isolated subagents may now write. */
+export const CODE_FOLDER_DISAMBIG = {
+  addAnywayButton: 'Add as code folder anyway',
+  addAnywayBusy: 'Adding code folder...',
+  addAnywayAria: 'Add this folder as a code folder anyway',
+  grantAria: 'Grant access matrix instead of adding a code folder',
+  insteadLead: 'Instead of adding it as a code folder, you can grant',
+  hint:
+    'Picking "Add as code folder anyway" indexes the folder into this ' +
+    "project's own codegraph collection, and isolated subagents may get " +
+    'worktrees there. Both choices show results in this project\'s',
+} as const;
+
 /** Sync-modal title after a folder is enabled again. */
 export function reenabledTitle(): string {
   return 'Re-syncing after re-enabling code folder';

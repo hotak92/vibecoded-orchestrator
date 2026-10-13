@@ -210,7 +210,13 @@ function Write-Notice([string]$text) {
 # vco_lib/lane_reservation.py; this block only calls it. No pending file =>
 # nothing here runs and the guard behaves exactly as before. Consume exit 3 =
 # nothing to consume => fall through; any other failure is a LOUD abort, never
-# a silent fallback to a worktree of the project.
+# a silent fallback to a worktree of the project. A consume that exits 0
+# without its five non-empty lines (path, HEAD, repo, mode, extra JSON) is a
+# malformed success: the reservation is already claimed, so it is the same
+# loud abort. No VCO-side time bound: `git worktree add` on a very large repo
+# can take minutes and must never be killed mid-run; the WorktreeCreate
+# registration carries no timeout, so the harness default (600 s) is the
+# outer bound.
 $LanePending = Join-Path (Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "lane-reservations") "pending"
 if ($WtName -and (Test-Path -LiteralPath $LanePending -PathType Container) -and
     @(Get-ChildItem -LiteralPath $LanePending -File -Filter "res-*.json" -ErrorAction SilentlyContinue).Count -gt 0) {
@@ -228,7 +234,14 @@ if ($WtName -and (Test-Path -LiteralPath $LanePending -PathType Container) -and
     }
     $LaneOut = @(& $VcoPy -m vco_lib.lane_reservation consume --project $ProjectRoot --name $WtName)
     $LaneRc = $LASTEXITCODE
-    if ($LaneRc -eq 0 -and $LaneOut.Count -ge 5) {
+    if ($LaneRc -eq 0) {
+        $LaneFields = @(0..4 | ForEach-Object { if ($_ -lt $LaneOut.Count) { [string]$LaneOut[$_] } else { "" } })
+        if (@($LaneFields | Where-Object { -not $_ }).Count -gt 0) {
+            $reason = "lane reservation consume reported success but its output was malformed (expected five non-empty lines: path, HEAD, repo, mode, extra JSON) - the reservation was claimed; no worktree of the project was created in its place"
+            Log-Event "create_failed" $reason $ProposedPath ""
+            [Console]::Error.WriteLine("worktree-guard: ABORT - $reason")
+            exit 1
+        }
         $LanePath = [string]$LaneOut[0]
         Log-Event "created" "lane_reservation" $ProposedPath $LanePath
         Save-LaunchRecord ([string]$LaneOut[3]) $LanePath ([string]$LaneOut[1]) ([string]$LaneOut[2]) ([string]$LaneOut[4])

@@ -133,7 +133,8 @@ def test_reshape_is_reported_and_idempotent(os_name: str) -> None:
     reshapes = [r for r in removed if isinstance(r["retirement"], PriorShippedShape)]
     assert sorted(vco_hook_script_identity(r["command"]) or "" for r in reshapes) == sorted(
         f"{s}.{OS_FLAVOURS[os_name][0]}"
-        # v0.2.102 W6-Q: worktree-guard's WorktreeCreate timeout 3 -> 60.
+        # v0.2.102 W6-Q/W6-AA: worktree-guard's WorktreeCreate timeout 3 -> none
+        # (the harness default applies).
         for s in ("pre-bash-context-inject", "pre-edit-context-inject", "worktree-guard"))
     # The bundle envelope and audit emitters read these records too.
     rows = removal_envelope_rows(reshapes)

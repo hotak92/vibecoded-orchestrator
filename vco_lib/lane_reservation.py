@@ -119,9 +119,14 @@ EXIT_NONE = 3
 SUBAGENT_NAME_PREFIX = "agent-"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-#: ``git worktree add`` can take minutes on a very large repo; the guard's
-#: hook timeout is 60 s, so stay inside it.
-_GIT_WRITE_TIMEOUT_S = 50
+#: Read-only git probes (rev-parse, worktree list, status) only.
+#: ``git worktree add`` deliberately has NO timeout: on a very large repo the
+#: checkout can take minutes, and killing a slow-but-working create would
+#: leave a half-written worktree and an unlaunchable agent. The outer bound is
+#: the harness's own hook timeout: the WorktreeCreate registration in
+#: templates/settings.json.*.template carries no ``timeout``, so Claude Code's
+#: command-hook default (600 s) applies. A VCO-side ceiling would add nothing
+#: that bound does not already give, and could only ever cut real work short.
 _GIT_READ_TIMEOUT_S = 15
 
 
@@ -515,12 +520,16 @@ def _materialize(rec: dict) -> tuple[str, str]:
             raise ReservationError(f"branch {branch!r} already exists in {repo_top}")
         if os.path.lexists(path):
             raise ReservationError(f"worktree path {path} already exists")
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
         try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ReservationError(
+                f"could not create the lane worktree path {path}: {exc}") from exc
+        try:
+            # No timeout, on purpose — see _GIT_READ_TIMEOUT_S above.
             proc = subprocess.run(  # noqa: S603 — argv is ours, never shell
                 ["git", "-C", repo_top, "worktree", "add", "-b", branch, path, base_sha],
-                capture_output=True, encoding="utf-8", errors="replace",
-                timeout=_GIT_WRITE_TIMEOUT_S, check=False,
+                capture_output=True, encoding="utf-8", errors="replace", check=False,
             )
         except (subprocess.SubprocessError, OSError) as exc:
             raise ReservationError(f"git worktree add could not run: {exc}") from exc
@@ -553,10 +562,20 @@ def consume(project: Path, name: str, *, now: Optional[float] = None) -> Optiona
     try:
         check_allowed(project, rec["repo"])
         path, head = _materialize(rec)
-    except (ReservationError, KeyError) as exc:
-        reason = str(exc) if isinstance(exc, ReservationError) else f"malformed reservation: missing {exc}"
+    except (ReservationError, KeyError, OSError) as exc:
+        if isinstance(exc, ReservationError):
+            reason = str(exc)
+        elif isinstance(exc, KeyError):
+            reason = f"malformed reservation: missing {exc}"
+        else:
+            # Any other filesystem failure on the way to the worktree
+            # (unwritable parent, permissions): same one-line refusal.
+            reason = f"could not create the lane worktree path: {exc}"
         rec.update(status="failed", reason=reason)
-        atomic_write_json(claimed, rec)
+        try:
+            atomic_write_json(claimed, rec)
+        except OSError as wexc:
+            reason = f"{reason} (and recording the failure on {claimed} failed: {wexc})"
         raise ReservationError(f"lane reservation {rec.get('id')!r}: {reason}") from exc
     rec.update(status="consumed", path=path, head=head)
     atomic_write_json(claimed, rec)
@@ -644,7 +663,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     a = _parser().parse_args(argv)
     try:
         return int(a.fn(a))
-    except (ReservationError, LockTimeout) as exc:
+    except (ReservationError, LockTimeout, OSError) as exc:
+        # OSError: an unwritable state dir and the like — a one-line refusal
+        # like every other failure, never a traceback.
         print(f"lane-reservation: REFUSED - {exc}", file=sys.stderr)
         return EXIT_FAILED
 

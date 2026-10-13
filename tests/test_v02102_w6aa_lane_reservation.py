@@ -478,6 +478,29 @@ def test_reap_removes_unchanged_and_its_branch(flavour: str, pr, hub: _Hub) -> N
     assert _git(r, "show-ref", "--verify", "-q", "refs/heads/lane-clean", check=False).returncode != 0
     rec = _record(p, "agent-cl1")
     assert rec["status"] == "removed" and rec["status_reason"] == "clean"
+    # The last lane is gone, so the now-empty <R>.vco-lanes/ goes too.
+    assert not (r.parent / "R.vco-lanes").exists()
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+@pytest.mark.parametrize("keeper", ["other_lane", "stray_file"])
+def test_reap_leaves_non_empty_lanes_dir(flavour: str, keeper: str, pr, hub: _Hub) -> None:
+    """rmdir-only: <R>.vco-lanes/ survives while anything is still in it —
+    another lane's worktree, or a file nobody recorded."""
+    p, r = pr
+    env = _env(hub, p)
+    lanes = r.parent / "R.vco-lanes"
+    _reserve(p, r, "HEAD", "lane-a", env, "--id", "la")
+    wt_a = Path(_guard(flavour, "agent-la1", p, env).stdout.strip().splitlines()[-1])
+    if keeper == "other_lane":
+        _reserve(p, r, "HEAD", "lane-b", env, "--id", "lb")
+        other = Path(_guard(flavour, "agent-lb1", p, env).stdout.strip().splitlines()[-1])
+    else:
+        other = lanes / "notes.txt"
+        other.write_text("keep me\n", encoding="utf-8")
+    _stop(flavour, p, "la1", env)
+    assert not wt_a.exists() and _record(p, "agent-la1")["status"] == "removed"
+    assert lanes.is_dir() and other.exists()
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
@@ -510,6 +533,120 @@ def test_reap_never_removes_adopted_worktree(flavour: str, pr, tmp_path: Path, h
     assert pre.is_dir()
     rec = _record(p, "agent-pre3")
     assert rec["status"] == "created"  # skipped: never touched
+
+
+# ── fix round (review R1 A1/A2/A3) ──────────────────────────────────────────
+
+
+def test_worktree_add_is_never_time_bounded(pr, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A1: `git worktree add` on a very large repo can take minutes; VCO must
+    never kill it mid-run. The harness's own hook timeout is the only bound."""
+    p, r = pr
+    lr.reserve(p, r, "HEAD", "b-slow", res_id="slow")
+    seen: list = []
+    real_run = subprocess.run
+
+    def spy(argv, *a, **kw):
+        if list(argv[:1]) == ["git"] and "worktree" in argv and "add" in argv:
+            seen.append(kw.get("timeout", None))
+        return real_run(argv, *a, **kw)
+
+    monkeypatch.setattr(lr.subprocess, "run", spy)
+    assert lr.consume(p, "agent-slow1") is not None
+    assert seen == [None], f"git worktree add must run unbounded, got timeout={seen}"
+
+
+@pytest.mark.parametrize("os_name", ["linux", "windows"])
+def test_worktree_create_registration_has_no_explicit_timeout(os_name: str) -> None:
+    """A1: the guard's WorktreeCreate registration carries no `timeout`, so
+    the harness default (600 s) applies rather than a VCO-chosen kill."""
+    doc = json.loads((REPO_ROOT / "templates" / f"settings.json.{os_name}.template")
+                     .read_text(encoding="utf-8"))
+    guards = [h for g in doc["hooks"]["WorktreeCreate"] for h in g["hooks"]
+              if "worktree-guard" in h.get("command", "")]
+    assert len(guards) == 1 and "timeout" not in guards[0], guards
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_lanes_dir_unwritable_fails_cleanly(flavour: str, pr, hub: _Hub) -> None:
+    """A2: an OSError creating the lane path (here <R>.vco-lanes is a FILE)
+    marks the claimed reservation failed and aborts with the usual one-line
+    reason — no traceback, no fallback worktree of P."""
+    p, r = pr
+    env = _env(hub, p)
+    _reserve(p, r, "HEAD", "lane-blocked", env, "--id", "blocked")
+    (r.parent / "R.vco-lanes").write_text("not a dir\n", encoding="utf-8")
+    proc = _guard(flavour, "agent-blk1", p, env)
+    assert proc.returncode != 0
+    assert "Traceback" not in proc.stderr, proc.stderr
+    assert "REFUSED" in proc.stderr and "could not create the lane worktree path" in proc.stderr
+    assert "ABORT" in proc.stderr
+    assert proc.stdout.strip() == ""
+    assert not (p / ".claude" / "worktrees").exists()
+    claimed = json.loads(next((p / lr.STATE_SUBDIR / "claimed").glob("res-*.json")).read_text())
+    assert claimed["status"] == "failed" and claimed["agent_name"] == "agent-blk1"
+    assert not lr.list_pending(p)
+
+
+def test_lanes_dir_unwritable_cli_exit_code(pr, hub: _Hub) -> None:
+    """A2 at the CLI: exit 2 (EXIT_FAILED), one REFUSED line, nothing on stdout."""
+    p, r = pr
+    env = _env(hub, p)
+    _reserve(p, r, "HEAD", "lane-blocked2", env, "--id", "blocked2")
+    (r.parent / "R.vco-lanes").write_text("x\n", encoding="utf-8")
+    proc = _cli("consume", "--project", str(p), "--name", "agent-blk2", env=env)
+    assert proc.returncode == lr.EXIT_FAILED, proc.stderr
+    assert proc.stdout == "" and "Traceback" not in proc.stderr
+    assert proc.stderr.strip().startswith("lane-reservation: REFUSED - ")
+
+
+def _fake_vco_python(tmp: Path, stdout: str) -> Path:
+    """A VCT_VENV whose python 'consumes' with exit 0 but prints ``stdout``."""
+    venv = tmp / "fakevenv"
+    (venv / "bin").mkdir(parents=True)
+    py = venv / "bin" / "python"
+    # Only the consume call is faked; anything else (the guard's JSON parsing,
+    # its log writer) runs on the real interpreter.
+    py.write_text(
+        "#!/usr/bin/env bash\n"
+        'case " $* " in *" vco_lib.lane_reservation "*) printf \'%s\' ' + _shq(stdout) + "; exit 0 ;; esac\n"
+        "exec " + _shq(sys.executable) + ' "$@"\n',
+        encoding="utf-8")
+    py.chmod(0o755)
+    return venv
+
+
+def _shq(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _malformed_outcome(flavour: str, p: Path, venv: Path, hub: _Hub, name: str) -> tuple:
+    env = _env(hub, p)
+    env["VCT_VENV"] = str(venv)
+    proc = _guard(flavour, name, p, env)
+    log = p / ".claude" / "logs" / "worktree-guard.jsonl"
+    rows = [json.loads(x) for x in log.read_text(encoding="utf-8-sig").splitlines() if x.strip()]
+    last = rows[-1]["decision"] if rows else ""
+    return (proc.returncode, proc.stdout.strip(), "ABORT" in proc.stderr,
+            "malformed" in proc.stderr, (p / ".claude" / "worktrees").exists(), last)
+
+
+@pytest.mark.parametrize("out", ["", "/only/a/path\n", "/p\nsha\n/r\nreservation\n",
+                                 "/p\n\n/r\nreservation\n{}\n"],
+                         ids=["empty", "one-line", "four-lines", "blank-field"])
+def test_malformed_consume_success_parity(out: str, pr, tmp_path: Path, hub: _Hub) -> None:
+    """A3: consume exit 0 with fewer than five non-empty lines is a LOUD abort
+    in BOTH siblings (same create_failed + stderr + exit 1 as a failed
+    consume) — never an empty path, never a silent fall-through."""
+    if _PS is None:
+        pytest.skip("no pwsh on PATH: the parity pair needs both flavours")
+    p, r = pr
+    lr.reserve(p, r, "HEAD", "b-mal", res_id="mal")
+    venv = _fake_vco_python(tmp_path, out)
+    sh = _malformed_outcome("sh", p, venv, hub, "agent-mal1")
+    ps = _malformed_outcome("ps1", p, venv, hub, "agent-mal2")
+    assert sh == ps, f"sh {sh} != ps1 {ps}"
+    assert sh == (1, "", True, True, False, "create_failed"), sh
 
 
 @pytest.fixture(autouse=True)

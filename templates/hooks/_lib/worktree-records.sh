@@ -264,6 +264,20 @@ for n in os.listdir(d):
 ' 2>/dev/null || true
 }
 
+# _wtrec_rmdir_lanes_parent TOPLEVEL PATH — after the reap removed a lane
+# reservation's worktree, remove its now-EMPTY parent `<R>.vco-lanes/`
+# (vco_lib/lane_reservation.py's path convention: sibling of R's toplevel).
+# rmdir only: never recursive, so a directory still holding another lane's
+# worktree or any stray file is left exactly as it is. Only that exact
+# directory is ever touched. MUST MATCH Remove-WtrecLanesParent in the .ps1.
+_wtrec_rmdir_lanes_parent() {
+    local top="$1" path="$2" parent lanes
+    parent="$(dirname "$path")"
+    lanes="$(dirname "$top")/$(basename "$top").vco-lanes"
+    [ "$parent" = "$lanes" ] || return 0
+    rmdir "$lanes" 2>/dev/null || true
+}
+
 # wtrec_reap PROJECT_ROOT AGENT_ID — remove the agent's worktree when it is
 # provably unchanged; keep it otherwise. Prints one line:
 #   "<decision>\t<reason>\t<path>"  decision ∈ removed|kept|skipped
@@ -283,8 +297,11 @@ for n in os.listdir(d):
 #     locked worktree on its own.
 # worktree-guard creates DETACHED worktrees for head/snapshot, so there is no
 # branch to delete; a reservation worktree's new branch is deleted with it
-# (compare-and-delete against the base, above). A snapshot base commit is on no ref once the worktree is gone;
-# git's normal gc collects it.
+# (compare-and-delete against the base, above), and the lanes directory it
+# lived in goes too once it is empty (_wtrec_rmdir_lanes_parent). A snapshot
+# base commit is on no ref once the worktree is gone; git's normal gc
+# collects it.
+
 wtrec_reap() {
     local root="$1" id="$2" rec mode path base top head st err listed
     rec="$(wtrec_find "$root" "$id")" || return 0
@@ -312,6 +329,7 @@ wtrec_reap() {
     fi
     if [ ! -d "$path" ]; then
         _wtrec_out removed already_gone
+        [ "$mode" = "reservation" ] && _wtrec_rmdir_lanes_parent "$top" "$path"
         return 0
     fi
     listed="$(git -C "$top" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')"
@@ -346,6 +364,7 @@ wtrec_reap() {
             else
                 _wtrec_out removed clean_branch_kept
             fi
+            _wtrec_rmdir_lanes_parent "$top" "$path"
             return 0
         fi
         _wtrec_out removed clean

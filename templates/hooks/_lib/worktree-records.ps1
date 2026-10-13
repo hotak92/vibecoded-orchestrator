@@ -197,6 +197,28 @@ function Remove-WtrecStale([string]$root) {
     } catch { }
 }
 
+# Remove-WtrecLanesParent: after the reap removed a lane reservation's
+# worktree, remove its now-EMPTY parent `<R>.vco-lanes` (the path convention
+# of vco_lib/lane_reservation.py: sibling of R's toplevel). Empty-only, never
+# recursive: a directory still holding another lane's worktree or any stray
+# file is left exactly as it is, and only that exact directory is touched.
+# Must match _wtrec_rmdir_lanes_parent in the .sh sibling.
+function Remove-WtrecLanesParent([string]$top, [string]$path) {
+    try {
+        $parent = Split-Path -Parent $path
+        $lanes = Join-Path (Split-Path -Parent $top) ((Split-Path -Leaf $top) + ".vco-lanes")
+        $norm = { param($p) [System.IO.Path]::GetFullPath($p).TrimEnd('\', '/') }
+        if ((& $norm $parent) -ne (& $norm $lanes)) { return }
+        $item = Get-Item -LiteralPath $lanes -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer) { return }
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }
+        if (@(Get-ChildItem -LiteralPath $lanes -Force -ErrorAction Stop).Count -gt 0) { return }
+        # Directory.Delete without recursion refuses a non-empty directory on
+        # its own, so a file that lands between the check and here survives.
+        [System.IO.Directory]::Delete($lanes, $false)
+    } catch { }
+}
+
 # Invoke-WtrecReap: remove the agent's worktree when provably unchanged.
 # Returns $null when the agent has no record, else an object with
 # Decision (removed|kept|skipped), Reason and Path. Same conditions as
@@ -218,7 +240,11 @@ function Invoke-WtrecReap([string]$root, [string]$id) {
     if (@("head", "snapshot", "reservation") -notcontains $mode) { return (& $out "skipped" "unknown_mode") }
     if ([string]$rec.status -ne "created") { return (& $out "skipped" "already_handled") }
     if (-not $path -or -not $base -or -not $top -or $path -eq $top) { return (& $out "kept" "incomplete_record") }
-    if (-not (Test-Path -LiteralPath $path -PathType Container)) { return (& $out "removed" "already_gone") }
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+        $r = (& $out "removed" "already_gone")
+        if ($mode -eq "reservation") { Remove-WtrecLanesParent $top $path }
+        return $r
+    }
     $listed = @()
     try {
         $listed = @((& git -C $top worktree list --porcelain 2>$null) |
@@ -242,11 +268,14 @@ function Invoke-WtrecReap([string]$root, [string]$id) {
         # points at the recorded base (update-ref compare-and-delete).
         if ($mode -eq "reservation" -and [string]$rec.branch_created -eq "yes") {
             $br = [string]$rec.branch
+            $reason = "clean_branch_kept"
             if ($br) {
                 & git -C $top update-ref -d "refs/heads/$br" $base 2>$null | Out-Null
-                if ($LASTEXITCODE -eq 0) { return (& $out "removed" "clean") }
+                if ($LASTEXITCODE -eq 0) { $reason = "clean" }
             }
-            return (& $out "removed" "clean_branch_kept")
+            $r = (& $out "removed" $reason)
+            Remove-WtrecLanesParent $top $path
+            return $r
         }
         return (& $out "removed" "clean")
     }
