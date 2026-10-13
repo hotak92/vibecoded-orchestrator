@@ -774,9 +774,11 @@ class TestSettingsMergeSkillOverrides:
 class TestDocs:
     def test_changelog_unreleased_entry(self):
         text = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        unreleased = text.split("## [Unreleased]", 1)[1].split("\n## ", 1)[0]
-        assert "wait-loop" in unreleased.lower()
-        assert "VCO_WAIT_GUARD" in unreleased
+        # Shipped in v0.2.102: anchor on that version's block, not on the
+        # (empty after the cut) Unreleased section.
+        block = text.split("## [0.2.102]", 1)[1].split("\n## [", 1)[0]
+        assert "wait-loop" in block.lower()
+        assert "VCO_WAIT_GUARD" in block
 
     def test_configuration_documents_the_knobs(self):
         text = (REPO_ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")

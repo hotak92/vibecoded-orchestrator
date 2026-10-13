@@ -3,7 +3,8 @@
 """v0.2.70 Stream F — deferred citation queue (F-QUEUE) + shared modules.
 
 Covers:
-  * citation_pending stage/read/list/delete roundtrip + TTL sweep.
+  * citation_pending stage/read/list/delete roundtrip (the TTL sweep this once covered was replaced in
+    v0.2.102 by end-event scoring and the abandoned-file collector).
   * answer_window extraction + position matching (shared with the MCP monitor).
   * rl_drain_citations ACCUMULATE-DON'T-DROP: a sub-gate pending file SURVIVES a
     Stop (not computed, not deleted); an at/above-gate pending file is computed

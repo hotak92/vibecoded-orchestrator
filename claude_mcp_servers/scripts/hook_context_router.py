@@ -1506,7 +1506,8 @@ def _bash_claim_gc(state_dir: Path) -> None:
       seen-store ``seen_inject_<sid>.txt`` / ``seen_reads_<sid>.txt`` /
       ``seen_cginject_count_<sid>.txt`` (the record of what was already
       injected/Read — survives across turns and reboots by design), the
-      ``rl_pending/`` citation queue (TTL-swept by its own owner) and the
+      ``rl_pending/`` citation queue (scored at its chat's end by its own
+      owner; abandoned files collected after ``RL_CITATION_ABANDONED_DAYS``) and the
       ``inject_budget_*`` / ``query_cache`` state. The globs here are the
       guard: they match ``bash_claim_*`` ONLY, so the durable stores are
       unreachable from this sweep by construction.

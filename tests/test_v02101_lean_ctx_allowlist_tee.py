@@ -1396,12 +1396,11 @@ class TestS5OneHomeAndPromiseTexts:
         assert "owner-only ACL" in tpl
         assert "skips compression" in tpl
         ch = CHANGELOG.read_text(encoding="utf-8-sig")
-        # The FIRST VERSIONED block (the release being cut) — the entry
-        # moved out of [Unreleased] at tag time, so anchor on the version
-        # header, not the (now empty) Unreleased section.
-        first_versioned = ch.split("## [", 3)[2]
-        assert "owner-only ACL" in first_versioned
-        assert "skips compression if it cannot make them private" in first_versioned
+        # The entry shipped in v0.2.101: anchor on THAT version's block (a
+        # "first versioned block" anchor broke when v0.2.102 was cut).
+        block = ch.split("## [0.2.101]", 1)[1].split("\n## [", 1)[0]
+        assert "owner-only ACL" in block
+        assert "skips compression if it cannot make them private" in block
 
 
 if __name__ == "__main__":

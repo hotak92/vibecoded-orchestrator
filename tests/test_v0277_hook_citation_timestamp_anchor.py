@@ -50,7 +50,7 @@ from claude_mcp_servers.scripts import rl_drain_citations as drain
 
 
 def _now_ms() -> int:
-    """A fresh epoch-ms so the drain's TTL sweep (60 min) never reaps the fixture
+    """A fresh epoch-ms so no age-based path (pre-v0.2.102: a 60-min TTL sweep) touches the fixture
     before it is processed. The unit tests of the anchor helper use synthetic
     small values (no TTL sweep there); the drain-level tests must use real time."""
     return int(time.time() * 1000)
