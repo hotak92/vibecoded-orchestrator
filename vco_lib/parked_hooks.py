@@ -108,6 +108,7 @@ __all__ = [
     "ParkedHook",
     "ParkedHooksState",
     "find_parked_match",
+    "live_hook_identities",
     "read_parked_hooks",
     "CONFLICT_CID",
     "conflict_still_present",
@@ -186,6 +187,8 @@ def find_parked_match(
     matcher: str,
     command: str,
     template_groups: Iterable[Any],
+    *,
+    live_identities: Optional[Iterable[str]] = None,
 ) -> Optional[ParkedHook]:
     """The parked row that covers the template registration
     ``(event, matcher, command)``, or ``None``.
@@ -193,12 +196,25 @@ def find_parked_match(
     ``template_groups`` is the template's group list for ``event``; it is only
     consulted when no row matches on the matcher, to decide whether a drifted
     matcher is unambiguous (see the module docstring).
+
+    ``live_identities`` (v0.2.102, review R9 F3 — a disable CARRIES to the
+    events a hook newly ships on): the ``.claude/hooks/<name>`` script
+    identities the user's settings.json registers on ANY event before the
+    merge. When no row is parked under ``event`` itself, a row parked under
+    ANOTHER event for the same script identity covers this registration —
+    provided that identity runs on no event at all in the user's file. That
+    is a hook the user switched off everywhere it ran; an upgrade that ships
+    it on a new event (``stop-drain-citations`` gaining ``SubagentStop`` and
+    ``SessionEnd``) must not switch it partly back on. A hook still running
+    on some event was turned off on ONE event only, so the new event is
+    added as before. Script identity only: an inline command has no identity
+    and never carries. ``None`` (the default) is the event-scoped rule alone.
     """
     candidates = [
         p for p in parked if p.event == event and same_hook_command(p.command, command)
     ]
     if not candidates:
-        return None
+        return _carried_parked_match(parked, command, live_identities)
     for p in candidates:
         if p.matcher == matcher:
             return p
@@ -208,6 +224,42 @@ def find_parked_match(
     # The template ships this hook under ONE matcher, so a parked row under a
     # matcher it no longer uses can only mean this registration.
     return candidates[0]
+
+
+def _carried_parked_match(
+    parked: Sequence[ParkedHook],
+    command: str,
+    live_identities: Optional[Iterable[str]],
+) -> Optional[ParkedHook]:
+    """The row parked under another event that carries its disable to
+    ``command`` (see :func:`find_parked_match`, ``live_identities``)."""
+    if live_identities is None:
+        return None
+    ident = vco_hook_script_identity(command)
+    if ident is None or ident in set(live_identities):
+        return None
+    for p in parked:
+        if vco_hook_script_identity(p.command) == ident:
+            return p
+    return None
+
+
+def live_hook_identities(hooks_block: Any) -> set[str]:
+    """Every ``.claude/hooks/<name>`` script identity a settings.json
+    ``hooks`` block registers, on any event — the ``live_identities`` input
+    of :func:`find_parked_match`. Malformed shapes contribute nothing."""
+    live: set[str] = set()
+    if not isinstance(hooks_block, dict):
+        return live
+    for groups in hooks_block.values():
+        for group in groups if isinstance(groups, list) else []:
+            inner = group.get("hooks") if isinstance(group, dict) else None
+            for item in inner if isinstance(inner, list) else []:
+                cmd = item.get("command") if isinstance(item, dict) else None
+                ident = vco_hook_script_identity(cmd) if isinstance(cmd, str) and cmd else None
+                if ident:
+                    live.add(ident)
+    return live
 
 
 def _unreadable(db_path: Path, detail: str) -> ParkedHooksState:

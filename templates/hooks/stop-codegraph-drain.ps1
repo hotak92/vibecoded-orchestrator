@@ -1,5 +1,6 @@
-﻿# Parity: kept in step with stop-codegraph-drain.sh (the v0.2.92 PowerShell-only detached-spawn hardening is
-# Windows-specific; every other behaviour must match the .sh sibling).
+﻿# Parity: kept in step with stop-codegraph-drain.sh (the v0.2.92 PowerShell-only
+# detached-spawn hardening, Start-VcoDetachedPwsh, is Windows-specific; every
+# other behaviour must match the .sh sibling).
 # stop-codegraph-drain.ps1 -- Stop hook (v0.2.73 FIX-B)
 # OS-PARITY: ports templates/hooks/stop-codegraph-drain.sh. END-OF-TURN BATCHED
 # code-graph sync. Replaces the per-EDIT code-graph-incremental scheduling that

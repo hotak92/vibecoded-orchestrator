@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Parity: kept in step with stop-codegraph-drain.ps1 (its v0.2.92 PowerShell-only
+# detached-spawn hardening is the Windows twin of the setsid / nohup spawn below;
+# every other behaviour must match the .ps1 sibling).
 # stop-codegraph-drain.sh — Stop hook (v0.2.73 FIX-B)
 #
 # END-OF-TURN BATCHED code-graph sync. Replaces the per-EDIT

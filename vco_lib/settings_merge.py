@@ -70,6 +70,7 @@ from vco_lib.parked_hooks import (
     KEPT_OUT_UNREADABLE,
     ParkedHooksState,
     find_parked_match,
+    live_hook_identities,
 )
 
 __all__ = ["merge_hooks_block", "smart_merge_settings"]
@@ -153,7 +154,10 @@ def merge_hooks_block(
     as a whole event the user lacks — is first checked against ``parked``.
     Readable state: a registration a parked row covers
     (:func:`vco_lib.parked_hooks.find_parked_match`, identity-based) is left
-    out. Unreadable state: NO registration is added, since any of them could
+    out. v0.2.102 (review R9 F3): that includes a registration on an event
+    the hook NEWLY ships on, when the same script is parked under another
+    event and runs on no event in the user's file — the disable carries
+    (its kept-out record names ``carried_from_event``). Unreadable state: NO registration is added, since any of them could
     be one the user switched off. Either way one record per left-out
     registration goes to ``kept_out``. Only additions are filtered: a
     registration already present is superseded/kept exactly as before, and a
@@ -229,6 +233,10 @@ def merge_hooks_block(
     out, scrub_removals = scrub_retired_registrations(user_hooks)
     if retired_removed is not None:
         retired_removed.extend(scrub_removals)
+    # Review R9 F3: what runs in the user's file BEFORE anything is added, so
+    # a disable parked under one event carries to an event the hook newly
+    # ships on (find_parked_match, live_identities) — order-independent.
+    live_idents = live_hook_identities(out)
 
     def _keep_out(event: str, group: Any, command: str) -> bool:
         """True (and recorded) when adding this registration must not happen."""
@@ -241,10 +249,13 @@ def merge_hooks_block(
         else:
             hit = find_parked_match(
                 parked.hooks, event, matcher, command, template_hooks.get(event) or [],
+                live_identities=live_idents,
             )
             if hit is None:
                 return False
             record.update(reason=KEPT_OUT_PARKED, parked_command=hit.command)
+            if hit.event != event:
+                record["carried_from_event"] = hit.event
         if kept_out is not None:
             kept_out.append(record)
         return True

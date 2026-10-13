@@ -79,7 +79,10 @@ export function stateTooltip(state: HookState, settingsPath: string): string {
     case 'active':
       return `Declared in ${settingsPath} — Claude Code runs it on every matching event.`;
     case 'disabled':
-      return `Removed from ${settingsPath} by the launcher. The entry is stored here, so re-enabling restores it exactly. The hook script file was not touched.`;
+      // v0.2.102 (review R9 F3): the bundle merge carries this disable to an
+      // event VCO newly ships the same script on, while the script runs on no
+      // event (vco_lib.parked_hooks.find_parked_match, live_identities).
+      return `Removed from ${settingsPath} by the launcher. The entry is stored here, so re-enabling restores it exactly. The hook script file was not touched. While this script runs on no event, a VCO update that ships it on a new event keeps that one off too; after you re-enable it here, the next bundle update adds it.`;
     case 'orphan':
       return `The launcher has a record of this hook, but ${settingsPath} does not declare it — so it does not run. It was removed outside the launcher (a hand edit, a bundle update, another tool). There is nothing stored to restore; Delete clears the stale record.`;
   }

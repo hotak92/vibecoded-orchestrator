@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with stop-drain-citations.ps1 (its PowerShell-only
+# detached spawn, Start-VcoDetachedProcess, is the Windows twin of the setsid /
+# nohup detach below; every other behaviour must match the .ps1 sibling).
 # Stop-hook deferred-citation drain (F-QUEUE, v0.2.70)
 # Fires at turn-end (Stop). Reads session_id + transcript_path from stdin JSON
 # and runs the python drain, which recovers hook-path RL citations the doomed
@@ -6,8 +9,11 @@
 #
 # ACCUMULATE-DON'T-DROP: the drain computes+writes ONLY when a pending task's
 # cumulative answer window reaches the token gate; below-gate windows are left
-# for the next Stop so they keep accumulating. It also TTL-sweeps abandoned
-# pending files. Soft-fail throughout — telemetry must never break the turn.
+# for the next Stop so they keep accumulating. No time limit scores or deletes
+# a pending file: the drain garbage-collects only PROVABLY abandoned files
+# (transcript idle for RL_CITATION_ABANDONED_DAYS, default 7 days, and no live
+# owner), each scored first when its transcript is readable, else recorded as
+# unscored. Soft-fail throughout — telemetry must never break the turn.
 #
 # v0.2.102 W6-C2 (census F12): ALSO registered on SubagentStop (async). A
 # subagent's hook events carry the PARENT's session_id/transcript_path, so the

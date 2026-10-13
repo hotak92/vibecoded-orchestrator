@@ -105,6 +105,13 @@ describe('state labels and tooltips are specific, not generic', () => {
     expect(t).toMatch(/script file was not touched/);
   });
 
+  it('says a disable also keeps the hook off on an event an update newly ships it on', () => {
+    // v0.2.102 review R9 F3 — vco_lib.parked_hooks.find_parked_match (live_identities).
+    const t = stateTooltip('disabled', SETTINGS);
+    expect(t).toMatch(/ships it on a new event keeps that one off too/);
+    expect(t).toMatch(/next bundle update adds it/);
+  });
+
   it('tells the orphan story honestly: it does not run and cannot be restored', () => {
     const t = stateTooltip('orphan', SETTINGS);
     expect(t).toMatch(/does not run/);

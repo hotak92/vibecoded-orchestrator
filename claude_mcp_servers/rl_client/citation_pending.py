@@ -609,8 +609,10 @@ def claim_task_pending(
     (v0.2.102 W6-FIN). Returns ``(state, claimed, pending_path)``:
 
     * ``"claimed"`` — this process now owns ``claimed``; compute it, then
-      :func:`delete_pending` it on a landed write or :func:`release_claim`
-      it back to ``pending_path`` on EVERY other leave path.
+      :func:`finish_scored` it (with ``pending_path``) on a landed write —
+      which also consumes a re-stage that landed during the compute — or
+      :func:`release_claim` it back to ``pending_path`` on EVERY other
+      leave path.
     * ``"taken"`` — the file exists only as another process's claim, or a
       file that was staged is gone: a drain owns it or already scored it.
       Do NOT compute (that would be the second write). Nothing is lost: a

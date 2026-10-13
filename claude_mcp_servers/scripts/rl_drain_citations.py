@@ -385,6 +385,7 @@ def drain_session(
         session_has_pending,
         record_unscored,
         collect_abandoned,
+        pending_dir,
     )
 
     started = time.time()
@@ -440,17 +441,95 @@ def drain_session(
         return known if _query_in_transcript(
             messages, kg_positions, str(payload.get("query") or "")) else ""
 
-    def _score_final(_claimed, payload: dict, source: str) -> "str | None":
+    def _ended_owner(payload: object) -> "tuple[str, str]":
+        """``(session, transcript)`` of the ENDED session a file staged
+        without a session id belongs to: the session with an end record whose
+        own transcript (same folder, :func:`session_transcript_for` — never a
+        search elsewhere) holds the file's exact query. ``("", "")`` when no
+        ended session holds it, or the file has a session / agent of its own
+        (those resolve through :func:`_answer_source`). Review R9 F2: such a
+        file can sit under the MCP monitor's claim while its chat's SessionEnd
+        drain lists the folder; without this, no drain ever attributed it
+        again and the collector logged it ``no_transcript``."""
+        if not isinstance(payload, dict) or payload.get("session_id") or payload.get("agent_id"):
+            return "", ""
+        query = str(payload.get("query") or "")
+        for sid in ended_sessions(project_root):
+            tp = session_transcript_for(known, sid)
+            if tp:
+                messages, kg_positions = _load(tp)
+                if _query_in_transcript(messages, kg_positions, query):
+                    return sid, tp
+        return "", ""
+
+    def _collector_source(payload: dict) -> str:
+        """The collector's resolver: the running chat's rule first, then an
+        ended session's own transcript for a file staged without a session id
+        (review R9 F2), before the collector falls back to ``no_transcript``."""
+        return _answer_source(payload) or _ended_owner(payload)[1]
+
+    def _score_final(_claimed, payload: dict, source: str,
+                     owner: str = "") -> "str | None":
         """Score a file whose chat has ended (finalize pass, collector):
-        final floors, its own transcript. ``None`` = a citation landed."""
+        final floors, its own transcript. ``owner`` names the ended session a
+        file without a session id was attributed to. ``None`` = a citation
+        landed."""
         messages, kg_positions = _load(source)
+        if not owner and source != known:
+            owner = _ended_owner(payload)[0]
         outcome, reason = _score_payload(
             payload, messages, kg_positions,
             final_window=True,
-            session_id=str(payload.get("session_id") or "") or session_id, gate=gate,
-            compute_fn=compute_fn, token_count_fn=token_count_fn,
+            session_id=str(payload.get("session_id") or "") or owner or session_id,
+            gate=gate, compute_fn=compute_fn, token_count_fn=token_count_fn,
         )
         return None if outcome == "computed" else reason
+
+    def _finalize_claimed(path, claimed, payload: dict, source: str, owner: str) -> bool:
+        """Score one claimed file of an ended session with the final floors
+        and finish it. Returns whether the claim was consumed (scored, or
+        removed as never-scorable and recorded); ``False`` = hand it back."""
+        reason = _score_final(claimed, payload, source, owner)
+        if reason is None:
+            summary["finalized"] += 1
+            finish_scored(claimed, path)
+            return True
+        if reason in _FINAL_UNSCORABLE:
+            summary["finalized_unscored"] += 1
+            delete_pending(claimed)
+            record_unscored(path.parent, path.name, payload, reason,
+                            when="session_ended")
+            return True
+        return False
+
+    def _holds_nosession(sid: str, tp: str) -> bool:
+        """Whether a file staged without a session id — pending OR under
+        another process's claim (the MCP monitor's) — belongs to ended
+        session ``sid``: its query is in ``sid``'s own transcript ``tp``.
+        ``True`` when ``tp`` is unknown and such files exist (the record is
+        kept rather than lost: a later drain that knows the transcript folder
+        attributes them). The end record stays while this holds, so a file
+        the monitor hands back is finalized by the next drain."""
+        d = pending_dir(project_root)
+        if d is None or not d.exists():
+            return False
+        try:
+            files = list(d.glob(f"{NO_SESSION_PREFIX}__*.json*"))
+        except OSError:
+            return True
+        if not files:
+            return False
+        if not tp:
+            return True
+        messages, kg_positions = _load(tp)
+        for f in files:
+            payload = read_pending(f)
+            if (isinstance(payload, dict) and not payload.get("session_id")
+                    and not payload.get("agent_id")
+                    and _query_in_transcript(messages, kg_positions,
+                                             str(payload.get("query") or ""))):
+                return True
+        return False
 
     # W6-C2 fix round (review R4c-1): a claim whose drain died mid-compute is
     # handed back first, so the crash costs a retry, never the citation.
@@ -593,21 +672,41 @@ def drain_session(
                             "rl_drain_citations: %s ended but its transcript is "
                             "not found; the citation stays unscored", path.name)
                         continue
-                    reason = _score_final(claimed, payload, source)
-                    if reason is None:
-                        summary["finalized"] += 1
-                        finish_scored(claimed, path)
+                    if _finalize_claimed(path, claimed, payload, source, ""):
                         claimed = None
-                    elif reason in _FINAL_UNSCORABLE:
-                        summary["finalized_unscored"] += 1
-                        delete_pending(claimed)
-                        claimed = None
-                        record_unscored(path.parent, path.name, payload, reason,
-                                        when="session_ended")
                 finally:
                     if claimed is not None:
                         release_claim(claimed, path)
-            if not session_has_pending(sid, project_root):
+            # Review R9 F2: files staged without a session id (the MCP path)
+            # whose exact query is in THIS ended session's own transcript
+            # (same folder only) are its files too — final floors.
+            sess_tp = session_transcript_for(known, sid)
+            if sess_tp:
+                sess_msgs, sess_kg = _load(sess_tp)
+                for path in list_pending_for_session(NO_SESSION_PREFIX, project_root):
+                    peek = read_pending(path)
+                    if (not isinstance(peek, dict) or peek.get("session_id")
+                            or peek.get("agent_id")
+                            or not _query_in_transcript(
+                                sess_msgs, sess_kg, str(peek.get("query") or ""))):
+                        continue  # not this ended chat's retrieval
+                    claimed = claim_pending(path)
+                    if claimed is None:
+                        continue  # the monitor / a drain holds it: kept below
+                    try:
+                        payload = read_pending(claimed)
+                        if (not isinstance(payload, dict) or payload.get("session_id")
+                                or payload.get("agent_id")
+                                or not _query_in_transcript(
+                                    sess_msgs, sess_kg, str(payload.get("query") or ""))):
+                            continue  # re-staged as someone else's meanwhile
+                        if _finalize_claimed(path, claimed, payload, sess_tp, sid):
+                            claimed = None
+                    finally:
+                        if claimed is not None:
+                            release_claim(claimed, path)
+            if (not session_has_pending(sid, project_root)
+                    and not _holds_nosession(sid, sess_tp)):
                 clear_session_ended(sid, project_root)
 
     # W6-RL2: the only time bound left — garbage collection of PROVABLY
@@ -616,7 +715,7 @@ def drain_session(
     gc_counts: dict = {}
     summary["collected"] = collect_abandoned(
         project_root, live_session=session_id,
-        source_fn=_answer_source, score_fn=_score_final, counts=gc_counts)
+        source_fn=_collector_source, score_fn=_score_final, counts=gc_counts)
     summary["collected_scored"] = gc_counts.get("scored", 0)
     summary["collected_unscored"] = gc_counts.get("unscored", 0)
     return summary
