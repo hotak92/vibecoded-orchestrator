@@ -1074,15 +1074,9 @@ def _prompt_min_chars() -> int:
     A non-positive or unparseable value falls back to the default (a knob
     that silently disabled the surface would be a second kill switch by
     accident — ``VCO_PROMPT_INJECT=off`` is that switch, on purpose)."""
-    raw = (os.environ.get(PROMPT_MIN_CHARS_ENV) or "").strip()
-    if raw:
-        try:
-            val = int(raw)
-        except ValueError:
-            return PROMPT_MIN_CHARS
-        if val > 0:
-            return val
-    return PROMPT_MIN_CHARS
+    from vco_lib.env_values import env_int  # noqa: PLC0415 — the one env-int reader
+
+    return env_int(PROMPT_MIN_CHARS_ENV, PROMPT_MIN_CHARS, minimum=1)
 #: Query cap for the prompt surface (the agent_brief 400 rationale: brief
 #: queries embed better and bound the cache key / argv surface).
 PROMPT_QUERY_MAX_CHARS = 400

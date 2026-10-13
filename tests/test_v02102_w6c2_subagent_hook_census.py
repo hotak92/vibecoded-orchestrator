@@ -676,6 +676,11 @@ def test_post_tool_security_files_subagent_alert_for_parent(tmp_path: Path, flav
     assert r.returncode == 0, r.stderr
     ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "could NOT be filed for your parent" in ctx
+    # R5-7: cause-neutral — the helper fails the same way for a missing
+    # venv, a failed write or a JSON-build failure; stderr names the cause.
+    assert ("This alert could NOT be filed for your parent agent (see the hook's stderr)."
+            "\nRepeat it in your final report.") in ctx
+    assert "venv is not" not in ctx
     assert "broken VCO install" in r.stderr
 
 

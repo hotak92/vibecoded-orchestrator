@@ -74,6 +74,7 @@ from typing import TYPE_CHECKING, Any, Optional
 # of a healthy install, and a fallback here would re-create the exact silent
 # degrade this module was fixed to stop doing.
 from vco_lib import python_exe as _python_exe
+from vco_lib.env_values import env_float
 
 # v0.2.96 (WP-3): the image-freshness verdict tokens this module's gates
 # branch on. Same hard-import rule as `python_exe` above — a second copy of
@@ -3431,13 +3432,6 @@ _DRIVER_SLOTS_DEFAULT = 2
 _DRIVER_WAIT_DEFAULT_S = 6 * 3600.0
 
 
-def _env_number(name: str, default: float, minimum: float) -> float:
-    try:
-        return max(minimum, float(os.environ.get(name, "") or default))
-    except (TypeError, ValueError):
-        return default
-
-
 def _driver_slot_dir() -> Path:
     from vco_lib.paths import vct_root_dir
 
@@ -3499,8 +3493,8 @@ def run_resync_and_verify(
         )
         return 0
     try:
-        slots = int(_env_number(_DRIVER_SLOTS_ENV, _DRIVER_SLOTS_DEFAULT, 1))
-        wait_s = _env_number(_DRIVER_WAIT_ENV, _DRIVER_WAIT_DEFAULT_S, 0)
+        slots = int(max(1, env_float(_DRIVER_SLOTS_ENV, _DRIVER_SLOTS_DEFAULT)))
+        wait_s = max(0, env_float(_DRIVER_WAIT_ENV, _DRIVER_WAIT_DEFAULT_S))
 
         def _on_wait(waited: float) -> None:
             if waited < 1.0:

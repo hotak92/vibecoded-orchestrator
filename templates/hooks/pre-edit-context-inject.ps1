@@ -242,7 +242,10 @@ if ($null -eq $Inject) { $Inject = "" }
 # === Only output if we found something ===
 if (($Inject -replace '\s+', '')) {
     # Cache the RAW router output (section-9 discipline: never cache empty).
-    try { Set-Content -LiteralPath $CacheFile -Value $Inject -Encoding UTF8 } catch { }
+    try {
+        . (Join-Path $PSScriptRoot "_lib/utf8-nobom.ps1")  # BOM-free (review R5-8)
+        Set-VcoUtf8Content -Path $CacheFile -Value $Inject
+    } catch { }
     Emit-ContextJson "[Pre-edit context for ${Basename}]:`n`n$Inject"
 }
 

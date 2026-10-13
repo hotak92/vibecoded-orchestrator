@@ -336,11 +336,10 @@ def _weaviate_url() -> str:
 
 
 def _grpc_port() -> int:
-    """Default Weaviate gRPC port from env."""
-    try:
-        return int(os.environ.get("GRPC_PORT", "50052"))
-    except ValueError:
-        return 50052
+    """Default Weaviate gRPC port from env (any int; garbage -> 50052)."""
+    from vco_lib.env_values import env_int  # noqa: PLC0415 — the one env-int reader
+
+    return env_int("GRPC_PORT", 50052)
 
 
 def _http_get_schema(collection: str, base_url: str) -> Optional[dict]:

@@ -47,7 +47,7 @@ for _p in (_REPO_ROOT, os.path.join(_HERE, "..")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from vco_lib.env_values import env_int  # noqa: E402 — after the path bootstrap above
+from vco_lib.env_values import env_float, env_int  # noqa: E402 — after the path bootstrap above
 
 
 def _gate_tokens() -> int:
@@ -73,10 +73,7 @@ def _gate_tokens() -> int:
 # only files at real risk of TTL death take the lower floor.
 
 def _terminal_age_seconds() -> float:
-    try:
-        return float(os.getenv("RL_TERMINAL_CITATION_AGE_SECONDS", "1800"))
-    except (TypeError, ValueError):
-        return 1800.0
+    return env_float("RL_TERMINAL_CITATION_AGE_SECONDS", 1800.0)
 
 
 def _terminal_floor_tokens() -> int:
@@ -106,8 +103,11 @@ def _stamp_agent_transcript(path, payload: dict, transcript_path: str) -> None:
     for the TTL sweep."""
     try:
         from vco_lib.atomic import atomic_write_json
+        from claude_mcp_servers.rl_client.citation_pending import AGENT_WINDOW_FINAL_KEY
 
         payload["agent_transcript_path"] = transcript_path
+        # The agent's own drain stamps it: its window is final now (R5-9).
+        payload.pop(AGENT_WINDOW_FINAL_KEY, None)
         atomic_write_json(path, payload, indent=None, fsync=False)
     except Exception:  # noqa: BLE001 — telemetry must not break the drain
         pass
@@ -169,6 +169,7 @@ def drain_session(
         claim_pending,
         release_claim,
         readopt_stale_claims,
+        AGENT_WINDOW_FINAL_KEY,
     )
 
     if compute_fn is None:
@@ -222,6 +223,14 @@ def drain_session(
             continue
         if agent_id and str(peek.get("agent_id") or "") != agent_id:
             continue
+        if not agent_id and peek.get("agent_id") and not peek.get("agent_transcript_path"):
+            # Review R5-3: the parent would only leave an unstamped agent
+            # file (below). Claiming it first would hide it from the *.json
+            # glob for that moment — and if the agent's ONE SubagentStop
+            # drain lists the directory then, the file is never stamped and
+            # dies unscored at the TTL sweep. Never claim it.
+            summary["left"] += 1
+            continue
         # W6-C2 fix round (review R4c-1): CLAIM before compute. The agent's
         # SubagentStop drain and the parent's Stop drain (or two overlapping
         # async Stop drains) can list the same file; whoever renames it
@@ -249,7 +258,9 @@ def drain_session(
                     continue  # another agent's (or the main chat's) file
                 answer_source = transcript_path or ""
                 final_window = True
-                if answer_source and payload.get("agent_transcript_path") != answer_source:
+                if answer_source and (
+                        payload.get("agent_transcript_path") != answer_source
+                        or payload.get(AGENT_WINDOW_FINAL_KEY) is False):
                     _stamp_agent_transcript(claimed, payload, answer_source)
             elif file_agent:
                 answer_source = str(payload.get("agent_transcript_path") or "")
@@ -258,7 +269,10 @@ def drain_session(
                     # and the parent's is the WRONG answer. Leave it (TTL sweep).
                     summary["left"] += 1
                     continue
-                final_window = True
+                # Review R5-9: a brief stamped while its agent may still be
+                # running (agent_window_final false) accumulates like the
+                # main chat's window; a finished agent's window is final.
+                final_window = payload.get(AGENT_WINDOW_FINAL_KEY) is not False
             else:
                 answer_source = transcript_path or ""
             messages, kg_positions = _load(answer_source)

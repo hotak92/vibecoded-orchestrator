@@ -61,14 +61,9 @@ from .chunking import CHARS_PER_TOKEN_TEXT
 # prior hardcoded value). A malformed / <1 value falls back to the default so a
 # typo can't wedge retrieval into fetching zero candidates.
 def _resolve_overfetch(default: int = 2) -> int:
-    raw = os.getenv("KG_OVERFETCH_MULTIPLIER", "").strip()
-    if not raw:
-        return default
-    try:
-        val = int(raw)
-    except (TypeError, ValueError):
-        return default
-    return val if val >= 1 else default
+    from vco_lib.env_values import env_int  # noqa: PLC0415 — the one env-int reader
+
+    return env_int("KG_OVERFETCH_MULTIPLIER", default, minimum=1)
 
 
 _RL_OVERFETCH = _resolve_overfetch()

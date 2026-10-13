@@ -641,19 +641,21 @@ def _safe_float(env_name: str, default: str) -> float:
     mostly hides. A tunable knob must not be a kill switch: on a bad value
     we log a WARNING and fall back to the calibrated default.
     """
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    val = env_float(env_name, None)
+    if val is not None:
+        return val
     raw = os.getenv(env_name)
-    if raw is None or raw.strip() == "":
-        return float(default)
-    try:
-        return float(raw)
-    except (ValueError, TypeError):
+    if raw is not None and raw.strip() != "":
+        # This reader's extra: a set-but-unparseable tier knob is SAID.
         logger.warning(
             "%s=%r is not a valid float; using default %s. "
             "(Tier knobs must be a plain decimal like 0.42 — a comma or "
             "stray character here would otherwise crash the whole MCP.)",
             env_name, raw, default,
         )
-        return float(default)
+    return float(default)
 
 
 _TIER_THRESHOLDS: dict[str, float] = {

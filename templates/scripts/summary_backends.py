@@ -580,6 +580,14 @@ def breaker_enabled() -> bool:
 
 
 def _float_env(name: str, default: float) -> float:
+    """A non-negative float tunable; unset / empty / garbage / negative / nan
+    → ``default``.
+
+    DOCUMENTED COPY — must match ``v = vco_lib/env_values.py::env_float(name,
+    None)`` followed by ``v if v is not None and v >= 0 else default`` (the
+    ``>=`` sends nan to the default). Stdlib-only for the same reason as
+    :func:`_int_env`; ``tests/test_v02102_env_values.py`` pins the parity.
+    """
     raw = os.getenv(name, "").strip()
     if not raw:
         return default

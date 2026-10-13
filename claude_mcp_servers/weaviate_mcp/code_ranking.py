@@ -264,13 +264,9 @@ def _coerce_env_float(env: Optional[Mapping[str, str]], key: str) -> Optional[fl
             return float(raw)
         except (TypeError, ValueError):
             return None
-    stripped = raw.strip()
-    if stripped == "":
-        return None
-    try:
-        return float(stripped)
-    except (TypeError, ValueError):
-        return None
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    return env_float(key, None, env=env)
 
 
 def resolve_retrieval_floor(

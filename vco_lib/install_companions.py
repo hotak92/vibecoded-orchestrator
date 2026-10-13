@@ -717,11 +717,9 @@ def adopt_relaunch(argv: List[str]) -> bool:
 
 def waiting_parent_pid() -> Optional[int]:
     """The pid in :data:`ENV_PARENT_WAITS`, or None when no install.py waits."""
-    try:
-        pid = int(os.environ.get(ENV_PARENT_WAITS, "").strip())
-    except ValueError:
-        return None
-    return pid if pid > 0 else None
+    from vco_lib.env_values import env_int  # noqa: PLC0415 — the one env-int reader
+
+    return env_int(ENV_PARENT_WAITS, None, minimum=1)
 
 
 def start_parent_watch() -> bool:

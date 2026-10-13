@@ -257,9 +257,10 @@ def test_the_port_file_names_match_their_owners_on_both_sides():
 
     assert vs.PORT_BASENAME == py_const(GATEWAY_CONFIG, "_PORT_BASENAME").strip('"')
     # The gateway spells its env name inline rather than as a constant, so
-    # this pins the literal it actually reads.
+    # this pins the literal it actually reads (since v0.2.102 W6-R5FIX
+    # through the one env-int reader, vco_lib.env_values.env_int).
     assert (
-        f'os.environ.get("{vs.PORT_ENV}")'
+        f'env_int("{vs.PORT_ENV}"'
         in GATEWAY_CONFIG.read_text(encoding="utf-8")
     ), "the writer would honour a pin the gateway does not read"
 

@@ -90,7 +90,7 @@ import os
 import time
 from typing import Optional
 
-from vco_lib.env_values import env_int
+from vco_lib.env_values import env_float, env_int
 
 logger = logging.getLogger(__name__)
 
@@ -118,16 +118,6 @@ _last_prune_ts: float = 0.0
 
 def _truthy(v: Optional[str]) -> bool:
     return (v or "").strip().lower() in ("true", "1", "yes", "on")
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except (ValueError, TypeError):
-        return default
 
 
 def retention_disabled() -> bool:
@@ -229,7 +219,7 @@ def maybe_run_retention(
         return {"ran": False, "skipped": "disabled", "deleted": None, "reason": "opt-out"}
 
     now_s = (now_ms / 1000.0) if now_ms is not None else time.time()
-    min_interval_s = _env_float(_ENV_MIN_INTERVAL_S, _DEFAULT_MIN_INTERVAL_S)
+    min_interval_s = env_float(_ENV_MIN_INTERVAL_S, _DEFAULT_MIN_INTERVAL_S)
     if not force and not _throttle_ready(min_interval_s, now_s):
         return {"ran": False, "skipped": "throttled", "deleted": None, "reason": "cadence"}
 

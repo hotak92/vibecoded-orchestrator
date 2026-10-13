@@ -25,6 +25,9 @@
 # --- Idempotent double-source guard ---------------------------------------
 if ($script:VcoRouteTouchedPathSourced) { return }
 $script:VcoRouteTouchedPathSourced = $true
+. (Join-Path $PSScriptRoot "utf8-nobom.ps1")  # BOM-free writes (review R5-8)
+# The detached dup-scan child dot-sources the same helper by absolute path.
+$script:VcoUtf8NoBomLib = Join-Path $PSScriptRoot "utf8-nobom.ps1"
 
 # Accumulates LLM-visible text the caller should emit (currently only the
 # pending duplicate-scan report).
@@ -190,7 +193,7 @@ function Emit-KgGateSkippedMetric {
             reason      = "gate_skipped_no_project_id"
             fail_open   = $true
         } | ConvertTo-Json -Compress
-        Add-Content -Path $jsonl -Value $row -Encoding utf8 -ErrorAction SilentlyContinue
+        Add-VcoUtf8Content -Path $jsonl -Value $row
     } catch {
         # Metric-emit failure must not break the silent-allow contract.
     }
@@ -419,7 +422,7 @@ function Update-VcoRouteExtrasCache {
         $out = & $venvPy -m vco_lib.codegraph_extras_refresh `
             --list-enabled-extra-paths --project-root $script:VcoRouteProjectRoot 2>$null
         if ($LASTEXITCODE -eq 0) {
-            Set-Content -LiteralPath $tmp -Value ($out -join "`n") -Encoding utf8 -ErrorAction Stop
+            Set-VcoUtf8Content -Path $tmp -Value ($out -join "`n")
             Move-Item -LiteralPath $tmp -Destination $Cache -Force -ErrorAction Stop
         } else {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -618,8 +621,10 @@ function Invoke-VcoRouteTouchedPath {
                 if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
                 $reportEsc = $dupReport -replace "'", "''"
                 $rootEsc = $ProjectRoot -replace "'", "''"
+                $nobomEsc = $script:VcoUtf8NoBomLib -replace "'", "''"
                 $dupChild = @"
 Set-Location -LiteralPath '$rootEsc' -ErrorAction SilentlyContinue
+. '$nobomEsc'
 try {
     # ❌ kept too — the scan's failure line is what the ⚠️ "See the error
     # above." verdict points at (parity with the bash sibling's filter).
@@ -630,7 +635,7 @@ try {
     `$out = $dupExpr | Select-String -Pattern '✅|⚠️|📊|❌|^[A-Za-z0-9_-]+: ERROR' | ForEach-Object { `$_.ToString() }
     if (`$out) {
         `$ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        Set-Content -Path '$reportEsc' -Value (@("# KG duplicate scan (every-10-edits, `$ts)") + `$out) -Encoding utf8
+        Set-VcoUtf8Content -Path '$reportEsc' -Value (@("# KG duplicate scan (every-10-edits, `$ts)") + `$out)
     }
 } catch { }
 "@

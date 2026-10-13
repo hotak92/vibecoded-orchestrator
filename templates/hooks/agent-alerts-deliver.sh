@@ -20,7 +20,7 @@
 #     subagent's own events deliver nothing (vco_lib decides).
 # The reader, the row format and the locking live in ONE place:
 # vco_lib/agent_alerts.py. Cost when nothing is pending — every tool call
-# once the * matcher is in place — is one glob, no interpreter. Always exits
+# once the * matcher is in place — is two globs, no interpreter. Always exits
 # 0. Alerts pending with no resolvable VCO venv (a broken install) are said
 # out loud — stderr and the context — never skipped in silence.
 #
@@ -37,9 +37,12 @@ STATE_DIR="$PROJECT_ROOT/.claude/state"
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 [ -z "$HOOK_STDIN" ] && exit 0
 
-# Fast path: nothing pending -> no interpreter start.
+# Fast path: nothing pending -> no interpreter start. "Pending" includes an
+# orphaned delivery claim (`<file>.jsonl.delivering.<pid>`, left by a
+# delivery killed mid-way): only Python re-adopts it, so it must not be
+# hidden behind this exit (review R5-1). MUST MATCH the .ps1.
 _pending=0
-for _f in "$STATE_DIR"/agent_alerts_*.jsonl; do
+for _f in "$STATE_DIR"/agent_alerts_*.jsonl "$STATE_DIR"/agent_alerts_*.jsonl.delivering.*; do
     [ -f "$_f" ] && { _pending=1; break; }
 done
 [ "$_pending" = "1" ] || exit 0
@@ -56,7 +59,7 @@ VCO_VENV_PYTHON=""
 command -v resolve_vco_venv_python >/dev/null 2>&1 && resolve_vco_venv_python "$SCRIPT_DIR"
 VENV="${VCO_VENV_PYTHON:-}"
 if [ -z "$VENV" ] || [ ! -x "$VENV" ]; then
-    _AD_MSG="[Subagent alerts] Alerts your subagents hit are pending in $STATE_DIR/agent_alerts_*.jsonl but cannot be read: the VCO venv is not resolvable (a broken VCO install - repair it with the orchestrator update). Read those files directly."
+    _AD_MSG="[Subagent alerts] Alerts your subagents hit are pending in $STATE_DIR/agent_alerts_*.jsonl* but cannot be read: the VCO venv is not resolvable (a broken VCO install - repair it with the orchestrator update). Read those files directly."
     echo "agent-alerts-deliver: $_AD_MSG" >&2
     _AD_EVENT="PostToolUse"
     case "$HOOK_STDIN" in *'"UserPromptSubmit"'*) _AD_EVENT="UserPromptSubmit" ;; esac

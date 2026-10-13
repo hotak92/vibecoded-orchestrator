@@ -1557,17 +1557,12 @@ def _rl_code_recover_budget() -> "tuple[int, float]":
     """Resolve (max_nodes, deadline_seconds) for the recovery loop from env,
     falling back to conservative defaults. Malformed env values fall back
     silently (a bad tunable must never widen the budget or crash the emit)."""
-    from vco_lib.env_values import env_int  # noqa: PLC0415
+    from vco_lib.env_values import env_float, env_int  # noqa: PLC0415
 
     # A negative count is clamped to 0 (= never recover), as before.
     max_nodes = env_int(_RL_CODE_RECOVER_MAX_ENV, _RL_CODE_RECOVER_MAX_DEFAULT,
                         minimum=0, clamp=True)
-    try:
-        deadline = float(
-            os.environ.get(_RL_CODE_RECOVER_DEADLINE_ENV, "") or _RL_CODE_RECOVER_DEADLINE_DEFAULT_S
-        )
-    except (TypeError, ValueError):
-        deadline = _RL_CODE_RECOVER_DEADLINE_DEFAULT_S
+    deadline = env_float(_RL_CODE_RECOVER_DEADLINE_ENV, _RL_CODE_RECOVER_DEADLINE_DEFAULT_S)
     # Clamp to sane floors so a zero/negative tunable can't disable the recovery
     # unintentionally (0 max = never recover; but a negative deadline must not
     # loop forever — treat <=0 as "no deadline gate", the count gate still bounds).
@@ -2016,12 +2011,9 @@ def _identity_cache_disabled() -> bool:
 
 
 def _identity_cache_ttl_s() -> float:
-    try:
-        return float(
-            os.environ.get(IDENTITY_CACHE_TTL_ENV, "") or _IDENTITY_CACHE_TTL_DEFAULT_S
-        )
-    except (TypeError, ValueError):
-        return _IDENTITY_CACHE_TTL_DEFAULT_S
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    return env_float(IDENTITY_CACHE_TTL_ENV, _IDENTITY_CACHE_TTL_DEFAULT_S)
 
 
 def _identity_cache_path():
@@ -3070,10 +3062,9 @@ def _rl_enrichment_gate_open() -> bool:
     global _rl_enrich_gate_cache
     import time as _time
 
-    try:
-        ttl = float(os.environ.get(_RL_ENRICH_GATE_TTL_ENV, "") or _RL_ENRICH_GATE_DEFAULT_TTL_S)
-    except (TypeError, ValueError):
-        ttl = _RL_ENRICH_GATE_DEFAULT_TTL_S
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    ttl = env_float(_RL_ENRICH_GATE_TTL_ENV, _RL_ENRICH_GATE_DEFAULT_TTL_S)
     now = _time.monotonic()
     cached = _rl_enrich_gate_cache
     if cached is not None and (now - cached[1]) < ttl:

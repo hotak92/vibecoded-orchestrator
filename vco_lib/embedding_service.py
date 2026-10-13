@@ -848,12 +848,14 @@ def _resolve_embed_request_timeout() -> float:
         A positive float — the ``timeout=`` value passed to every embed
         HTTP call.
     """
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    val = env_float(EMBED_REQUEST_TIMEOUT_ENV, None)
+    # This reader's extra: a set-but-bad value is SAID (quoted as set).
     raw = os.environ.get(EMBED_REQUEST_TIMEOUT_ENV, "").strip()
-    if not raw:
-        return DEFAULT_EMBED_REQUEST_TIMEOUT_SECS
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
+    if val is None:
+        if not raw:
+            return DEFAULT_EMBED_REQUEST_TIMEOUT_SECS
         logger.warning(
             "%s=%r is not a number; using default %.0fs",
             EMBED_REQUEST_TIMEOUT_ENV,

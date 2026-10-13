@@ -9,8 +9,8 @@
 # every pending row of the session (background completions, late
 # SubagentStop jobs). A subagent's own events deliver nothing (vco_lib
 # decides). The reader, the row format and the locking live in ONE place:
-# vco_lib/agent_alerts.py. Cost when nothing is pending: one directory
-# listing, no interpreter. Always exits 0. Alerts pending with no resolvable
+# vco_lib/agent_alerts.py. Cost when nothing is pending: two directory
+# listings, no interpreter. Always exits 0. Alerts pending with no resolvable
 # VCO venv (a broken install) are said out loud, never skipped in silence.
 #
 # MUST MATCH agent-alerts-deliver.sh.
@@ -33,9 +33,13 @@ $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 if (-not $HookStdin) { exit 0 }
 
-# Fast path: nothing pending -> no interpreter start.
+# Fast path: nothing pending -> no interpreter start. "Pending" includes an
+# orphaned delivery claim (<file>.jsonl.delivering.<pid>, left by a delivery
+# killed mid-way): only Python re-adopts it, so it must not be hidden behind
+# this exit (review R5-1). MUST MATCH the .sh.
 $pending = @(Get-ChildItem -LiteralPath $StateDir -Filter "agent_alerts_*.jsonl" -File -ErrorAction SilentlyContinue)
-if ($pending.Count -eq 0) { exit 0 }
+$claims = @(Get-ChildItem -LiteralPath $StateDir -Filter "agent_alerts_*.jsonl.delivering.*" -File -ErrorAction SilentlyContinue)
+if (($pending.Count + $claims.Count) -eq 0) { exit 0 }
 
 # The stderr cap compiles a C# writer (Add-Type, ~165 ms measured): taken
 # only once there is something to say, so the per-tool-call no-pending path
@@ -51,7 +55,7 @@ if (Test-Path $VenvLib) {
     $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 }
 if (-not $VenvPy -or -not (Test-Path $VenvPy)) {
-    $adMsg = "[Subagent alerts] Alerts your subagents hit are pending in $StateDir/agent_alerts_*.jsonl but cannot be read: the VCO venv is not resolvable (a broken VCO install - repair it with the orchestrator update). Read those files directly."
+    $adMsg = "[Subagent alerts] Alerts your subagents hit are pending in $StateDir/agent_alerts_*.jsonl* but cannot be read: the VCO venv is not resolvable (a broken VCO install - repair it with the orchestrator update). Read those files directly."
     [Console]::Error.WriteLine("agent-alerts-deliver: $adMsg")
     $adEvent = if ($HookStdin -match '"UserPromptSubmit"') { "UserPromptSubmit" } else { "PostToolUse" }
     $emitLib = Join-Path $ScriptDir "_lib/emit-context.ps1"

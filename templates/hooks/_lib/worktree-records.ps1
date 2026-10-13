@@ -11,6 +11,7 @@
 # runs no WorktreeRemove when a subagent finishes, so VCO reaps the provably
 # unchanged ones itself.
 
+. (Join-Path $PSScriptRoot "utf8-nobom.ps1")  # BOM-free writes (review R5-8)
 $script:WtrecSubdir = ".claude/state/worktree-guard"
 
 function Test-WtrecName([string]$name) {
@@ -41,7 +42,7 @@ function Write-WtrecRecord([string]$root, [string]$name, [string]$mode, [string]
         $rec["toplevel"] = $toplevel
         $rec["status"] = "created"
         $rec["created_at"] = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        Set-Content -LiteralPath (Join-Path $dir "wt-$name.json") -Value ($rec | ConvertTo-Json -Compress) -Encoding UTF8 -ErrorAction Stop
+        Set-VcoUtf8Content -Path (Join-Path $dir "wt-$name.json") -Value ($rec | ConvertTo-Json -Compress)
     } catch { }
 }
 
@@ -133,7 +134,7 @@ function Set-WtrecStatus([string]$file, [string]$status, [string]$reason) {
         $h["status"] = $status
         $h["status_reason"] = $reason
         $h["status_at"] = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        Set-Content -LiteralPath $file -Value ($h | ConvertTo-Json -Compress) -Encoding UTF8 -ErrorAction Stop
+        Set-VcoUtf8Content -Path $file -Value ($h | ConvertTo-Json -Compress)
     } catch { }
 }
 

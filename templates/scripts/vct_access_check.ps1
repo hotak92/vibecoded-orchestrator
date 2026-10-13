@@ -239,10 +239,14 @@ function Write-AccessMetric {
             fail_open  = $true
         }
         $line = $row | ConvertTo-Json -Compress -Depth 3
-        # Append with no BOM (PowerShell 7's Add-Content defaults to
-        # UTF-8 no-BOM). On 5.1 the default would be Default codepage —
-        # but we require 7+ per the script header so this is safe.
-        Add-Content -LiteralPath $jsonl -Value $line -Encoding utf8 -ErrorAction SilentlyContinue
+        # Append with no BOM on BOTH 5.1 and 7+ (review R5-8): 5.1's
+        # `Add-Content -Encoding utf8` writes a BOM when it creates the file,
+        # and the jsonl's Python reader (vco_lib/access_resolver.py) would
+        # lose its first row. The same write as Add-VcoUtf8Content in
+        # hooks/_lib/utf8-nobom.ps1 - spelled out because this script is
+        # self-contained and does not dot-source hooks/_lib.
+        [System.IO.File]::AppendAllText($jsonl, $line + [Environment]::NewLine,
+            (New-Object System.Text.UTF8Encoding($false)))
     } catch {
         # Metric write failure must not break the fail-open contract.
     }
@@ -292,7 +296,12 @@ function Write-AccessWarning {
             reason = $Reason
         }
         $line = $row | ConvertTo-Json -Compress -Depth 3
-        Add-Content -LiteralPath $jsonl -Value $line -Encoding utf8 -ErrorAction SilentlyContinue
+        # BOM-free on 5.1 and 7+ (review R5-8). The same write as Add-VcoUtf8Content
+        # in hooks/_lib/utf8-nobom.ps1 - spelled out here because this script is
+        # self-contained (its functions are also run standalone) and does not
+        # dot-source hooks/_lib.
+        [System.IO.File]::AppendAllText($jsonl, $line + [Environment]::NewLine,
+            (New-Object System.Text.UTF8Encoding($false)))
     } catch { }
 
     [Console]::Error.WriteLine(

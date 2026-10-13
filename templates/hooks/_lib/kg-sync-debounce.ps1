@@ -95,6 +95,7 @@
 # parent hook dot-sources _lib/resolve-powershell.ps1 which sets $PsExe
 # (pwsh → powershell 5.1 fallback); fall back to "pwsh" only if unset so
 # this helper is usable standalone.
+. (Join-Path $PSScriptRoot "utf8-nobom.ps1")  # BOM-free writes (review R5-8)
 function Get-KgDebouncePsExe {
     if ($script:PsExe)              { return $script:PsExe }
     if (Get-Variable -Name PsExe -Scope Global -ErrorAction SilentlyContinue) { return $global:PsExe }
@@ -665,9 +666,8 @@ function Invoke-KgDebounceSchedule {
     if ($claimed) {
         # Record the command so a reaper can recover it if we die.
         try {
-            Set-Content -LiteralPath (Join-Path $lock "cmd") `
-                -Value ("{0}`t{1}" -f $WorkingDir, $Command) `
-                -Encoding utf8 -ErrorAction SilentlyContinue
+            Set-VcoUtf8Content -Path (Join-Path $lock "cmd") `
+                -Value ("{0}`t{1}" -f $WorkingDir, $Command)
         } catch { }
         $base = Split-Path -Leaf $lock   # "<chan>_<md5>.lock"
         # Single flusher: a DETACHED process that sleeps the quiet-window,

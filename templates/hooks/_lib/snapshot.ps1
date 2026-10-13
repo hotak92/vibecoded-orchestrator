@@ -10,6 +10,7 @@
 # Soft-fail contract: every function returns silently on error. The
 # caller is expected to be a hook that MUST exit 0 regardless.
 
+. (Join-Path $PSScriptRoot "utf8-nobom.ps1")  # BOM-free writes (review R5-8)
 # Default extensions / directories (must match the .sh sibling).
 $script:VCT_SnapshotCodeExtsDefault = @(
     'py','rs','ts','tsx','js','jsx','go','java','cs','c','cpp','h','hpp',
@@ -213,8 +214,8 @@ function Take-Snapshot {
     $tmp = $snapFile + ".tmp"
     try {
         # Compact JSON to keep snapshots small.
-        $doc | ConvertTo-Json -Compress -Depth 5 `
-            | Out-File -FilePath $tmp -Encoding utf8 -ErrorAction Stop
+        # BOM-free (review R5-8): vco_lib reads the snapshot with json.load.
+        Set-VcoUtf8Content -Path $tmp -Value ($doc | ConvertTo-Json -Compress -Depth 5)
         Move-Item -LiteralPath $tmp -Destination $snapFile -Force `
             -ErrorAction Stop
         return $true

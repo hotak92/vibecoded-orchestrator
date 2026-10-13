@@ -12384,10 +12384,9 @@ def _weaviate_ready_deadline_seconds() -> float:
     user who overrode the env sees the deadline that actually applied.
     Explicit-empty / garbage env values fall back to the default.
     """
-    try:
-        return float(os.environ.get("WEAVIATE_READY_TIMEOUT") or WEAVIATE_READY_TIMEOUT)
-    except (TypeError, ValueError):
-        return float(WEAVIATE_READY_TIMEOUT)
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    return env_float("WEAVIATE_READY_TIMEOUT", float(WEAVIATE_READY_TIMEOUT))
 
 
 def _wait_for_weaviate_ready(

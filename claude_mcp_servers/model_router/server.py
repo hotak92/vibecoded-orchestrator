@@ -130,7 +130,6 @@ import asyncio
 import ipaddress
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -383,12 +382,9 @@ def fallback_retry_after_max_s() -> float:
     in the knob must not disable the same-rung retry (which a ``0`` would:
     every short rate limit would fall straight through to the next vendor).
     """
-    raw = (os.environ.get(FALLBACK_RETRY_AFTER_MAX_ENV) or "").strip()
-    try:
-        value = float(raw)
-    except ValueError:
-        return FALLBACK_RETRY_AFTER_MAX_DEFAULT_S
-    return value if value > 0 else FALLBACK_RETRY_AFTER_MAX_DEFAULT_S
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    return env_float(FALLBACK_RETRY_AFTER_MAX_ENV, FALLBACK_RETRY_AFTER_MAX_DEFAULT_S, above=0)
 
 
 #: The two answers :func:`_ladder_verdict` can give.

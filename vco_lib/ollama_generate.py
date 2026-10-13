@@ -65,14 +65,13 @@ def generate_num_ctx() -> int:
     A blank, non-integer or non-positive override is ignored with a stderr
     note — never half-applied.
     """
+    from vco_lib.env_values import env_int  # noqa: PLC0415 — the one env-int reader
+
+    val = env_int(GENERATE_NUM_CTX_ENV, None, minimum=1)
+    if val is not None:
+        return val
     raw = (os.environ.get(GENERATE_NUM_CTX_ENV) or "").strip()
-    if raw:
-        try:
-            val = int(raw)
-        except ValueError:
-            val = 0
-        if val > 0:
-            return val
+    if raw:  # this reader's extra: a bad override is SAID, once, on stderr
         _note(f"ignoring {GENERATE_NUM_CTX_ENV}={raw!r} (not a positive integer); "
               f"using {GENERATE_NUM_CTX_DEFAULT}")
     return GENERATE_NUM_CTX_DEFAULT

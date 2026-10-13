@@ -240,7 +240,8 @@ class TestSettingsRegistrations:
         router = (REPO_ROOT / "claude_mcp_servers" / "scripts" /
                   "hook_context_router.py").read_text(encoding="utf-8")
         m = re.search(
-            r'_env_float\("VCO_INJECT_BUDGET_S", ([0-9.]+)\)', router)
+            # v0.2.102 W6-R5FIX: read through the one env_float reader.
+            r'\benv_float\("VCO_INJECT_BUDGET_S", ([0-9.]+)[,)]', router)
         assert m, "router budget default not found"
         budget = float(m.group(1))
         #: The router-spawning surfaces only — `diff-context-inject`

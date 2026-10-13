@@ -58,7 +58,8 @@ Public surface:
 * :func:`claim_by_rename` / :func:`release_rename_claim` /
   :func:`claim_owner_gone` — the per-pid RENAME claim (``<name><mark><pid>``)
   two processes use to agree who owns a queue file, and the one "is this
-  claim abandoned?" rule (dead pid, or older than a stale age). Used by the
+  claim abandoned?" rule (dead pid; or older than a stale age with the pid's
+  holder proven to be a REUSE — review R5-4). Used by the
   RL citation drain and the subagent alert channel (v0.2.102 W6-C2 fix
   round, reviews R4c-1/R4c-2).
 
@@ -1048,23 +1049,45 @@ def portable_exclusive_lock(lock_path: Path, *, use_flock: Optional[bool] = None
 
 def claim_owner_gone(pid: int, age_s: float, *, stale_after_s: float) -> bool:
     """True when a per-pid rename claim (``<name>.<tag>.<pid>``) is
-    abandoned: its pid is provably dead, or the claim is older than
-    ``stale_after_s`` (the pid was reused, or liveness cannot be decided).
-    This process's own claims are never abandoned. Never raises."""
+    abandoned. This process's own claims are never abandoned. Never raises.
+
+    * pid provably dead (or no pid in the name) — abandoned;
+    * pid ALIVE — abandoned only when the claim is older than
+      ``stale_after_s`` AND pid reuse is PROVEN: the process now holding
+      that pid started after the claim was made (its start time is later
+      than the claim's mtime, ``now - age_s``). A live holder that is just
+      slow (a CPU-only embedding compute running past the age) keeps its
+      claim — taking it over would score the work twice (review R5-4), and
+      slow work is never killed or pre-empted here. Start time unknown ->
+      left alone (conservative default);
+    * liveness undecidable — the age alone decides."""
     if pid == os.getpid():
         return False
-    if pid > 0:
-        try:
-            from vco_lib.update_lock import pid_alive  # noqa: PLC0415 — one liveness rule
-
-            alive = pid_alive(pid)
-        except Exception:  # noqa: BLE001 — undecidable -> age decides
-            alive = None
-        if alive is False:
-            return True
-    else:
+    if pid <= 0:
         return True
-    return age_s >= stale_after_s
+    try:
+        from vco_lib.update_lock import pid_alive  # noqa: PLC0415 — one liveness rule
+
+        alive = pid_alive(pid)
+    except Exception:  # noqa: BLE001 — undecidable -> age decides
+        alive = None
+    if alive is False:
+        return True
+    if age_s < stale_after_s:
+        return False
+    if alive is None:
+        return True
+    try:
+        import time  # noqa: PLC0415
+
+        from vco_lib.update_lock import process_start_time  # noqa: PLC0415 — one start-time rule
+
+        started = process_start_time(pid)
+        if started is None:
+            return False
+        return float(started) > time.time() - float(age_s)
+    except Exception:  # noqa: BLE001 — unprovable reuse -> leave the claim
+        return False
 
 
 def claim_by_rename(path: Path, mark: str) -> Optional[Path]:

@@ -360,14 +360,7 @@ def explicit_port() -> Optional[int]:
     is load-bearing: an explicit port is a pin and is never moved, while a
     RESOLVED one is a best guess and may fall back.
     """
-    raw = (os.environ.get("VCT_MODEL_GATEWAY_PORT") or "").strip()
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    return value if 1 <= value <= 65535 else None
+    return env_int("VCT_MODEL_GATEWAY_PORT", None, minimum=1, maximum=65535)
 
 
 def _read_port_file(path: Path) -> Optional[int]:

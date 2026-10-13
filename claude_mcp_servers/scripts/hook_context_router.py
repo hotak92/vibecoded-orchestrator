@@ -133,7 +133,7 @@ from vco_lib.inject_intent import (  # noqa: E402
     titles_one_liner,
     turn_budget_chars,
 )
-from vco_lib.env_values import env_int  # noqa: E402
+from vco_lib.env_values import env_float, env_int  # noqa: E402
 from vco_lib.hook_agent_key import agent_state_key, sanitize_agent_id  # noqa: E402
 from vco_lib.prompt_edit_nudge import nudge_block as _prompt_nudge_block  # noqa: E402
 
@@ -151,14 +151,6 @@ _BASH_PROFILE_BY_INTENT = {
 # recovery moved INTO the classifier — inject_intent._recover_clean_symbol /
 # _DOT_EXT_TOKEN_RE — one home, so the READ demotion rule can see what was
 # recovered. The router keeps only the disk-based file_pub_symbols fallback.)
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        val = float((os.environ.get(name) or "").strip())
-        return val if val > 0 else default
-    except ValueError:
-        return default
 
 
 # --- payload parsing (the pre-bash-context-inject.sh:74-94 discipline) --------
@@ -1039,7 +1031,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
 
     if legs:
         remaining = deadline - time.monotonic()
-        leg_timeout = min(_env_float("VCO_INJECT_LEG_TIMEOUT_S", 4.0),
+        leg_timeout = min(env_float("VCO_INJECT_LEG_TIMEOUT_S", 4.0, above=0),
                           max(remaining, 0.1))
         results = _hds.run_legs(legs, leg_timeout_s=leg_timeout)
         if kg_key:
@@ -1768,7 +1760,7 @@ def _main(argv: List[str]) -> int:
     # timeout fails OPEN to silence — accepted for this bounded class, and
     # never a licence to tighten the LONG-operation timeouts elsewhere
     # (kg-sync / code-graph analysis / install / seed stay generous).
-    deadline = time.monotonic() + _env_float("VCO_INJECT_BUDGET_S", 6.0)
+    deadline = time.monotonic() + env_float("VCO_INJECT_BUDGET_S", 6.0, above=0)
     # W3R-10: the citation pending files the legs stage during THIS run are
     # amended after the suppression decisions below — the pre-legs snapshot
     # bounds which files this run owns (new or re-staged since).

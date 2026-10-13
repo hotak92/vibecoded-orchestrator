@@ -1351,14 +1351,11 @@ def _resolve_hybrid_alpha() -> float:
     KG_HYBRID_ALPHA; malformed / out-of-range values clamp to [0,1] and fall
     back to 0.6 on parse failure so a bad env var can never break search.
     """
-    raw = os.getenv("KG_HYBRID_ALPHA")
-    if raw is None:
-        return 0.6
-    try:
-        a = float(raw)
-    except (TypeError, ValueError):
-        return 0.6
-    return max(0.0, min(1.0, a))
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    # The clamp stays this expression (not env_float's clamp): it maps nan
+    # to 1.0, exactly as before.
+    return max(0.0, min(1.0, env_float("KG_HYBRID_ALPHA", 0.6)))
 
 
 _HYBRID_ALPHA: float = _resolve_hybrid_alpha()

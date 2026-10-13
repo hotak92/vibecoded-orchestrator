@@ -225,19 +225,56 @@ BATCH_SIZE = int(os.getenv("CODE_EMBED_BATCH_SIZE", "32"))
 MAX_CONCURRENT = int(os.getenv("CODE_EMBED_MAX_CONCURRENT", "4"))  # concurrent execution slots; over-capacity requests queue (QUEUE_WAIT_SECS)
 
 
+def _env_text(name: str) -> "str | None":
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _env_float(name: str, default: float, *, minimum: "float | None" = None,
+               clamp: bool = False) -> float:
+    """DOCUMENTED COPY — must match ``vco_lib/env_values.py::env_float``
+    (the ``minimum`` / ``clamp`` subset). This file also runs inside the
+    container image, where ``vco_lib`` is absent BY DESIGN (see
+    :func:`_configure_logging_for_environment`), so it cannot import the one
+    home; ``tests/test_v02102_env_values.py`` pins the parity."""
+    text = _env_text(name)
+    if text is None:
+        return default
+    try:
+        value = float(text)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return minimum if clamp else default
+    return value
+
+
+def _env_int(name: str, default: int, *, minimum: "int | None" = None,
+             clamp: bool = False) -> int:
+    """DOCUMENTED COPY — must match ``vco_lib/env_values.py::env_int`` (the
+    ``minimum`` / ``clamp`` subset); same reason and parity test as
+    :func:`_env_float`."""
+    text = _env_text(name)
+    if text is None:
+        return default
+    try:
+        value = int(text)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return minimum if clamp else default
+    return value
+
+
 def _resolve_idle_unload_secs() -> float:
     """Idle seconds before the GPU model is unloaded. 0 = never; a bad/negative
     value coerces to the 300 s default (conservative: never a shorter-than-asked
     window that would thrash the reload). Read once at import — the timer honours
     it for the process lifetime."""
-    raw = os.getenv("CODE_EMBED_IDLE_UNLOAD_SECS", "300")
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        return 300.0
-    if val < 0:
-        return 300.0
-    return val
+    return _env_float("CODE_EMBED_IDLE_UNLOAD_SECS", 300.0, minimum=0)
 
 
 IDLE_UNLOAD_SECS = _resolve_idle_unload_secs()  # 0 = never unload
@@ -247,12 +284,7 @@ def _resolve_load_oom_retries() -> int:
     """Retry attempts after a FIRST CUDA-OOM model load (total attempts =
     retries + 1). A bad/negative value coerces to the default. Read once at
     import — the load path honours it for the process lifetime."""
-    raw = os.getenv("CODE_EMBED_LOAD_OOM_RETRIES", "12")
-    try:
-        val = int(raw)
-    except (TypeError, ValueError):
-        return 12
-    return max(0, val)
+    return _env_int("CODE_EMBED_LOAD_OOM_RETRIES", 12, minimum=0, clamp=True)
 
 
 def _resolve_load_oom_backoff_secs() -> float:
@@ -261,12 +293,8 @@ def _resolve_load_oom_backoff_secs() -> float:
     Ollama before its keep-alive expires — can take minutes to be released, and
     a slow machine's load is not the ceiling. A bad/negative value coerces to
     the default. Read once at import."""
-    raw = os.getenv("CODE_EMBED_LOAD_OOM_BACKOFF_SECS", "30")
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        return 30.0
-    return max(0.0, val)
+    # ``max`` (not a bound): it maps nan to 0.0, exactly as before.
+    return max(0.0, _env_float("CODE_EMBED_LOAD_OOM_BACKOFF_SECS", 30.0))
 
 
 def _resolve_unload_freed_min_mb() -> float:
@@ -276,12 +304,7 @@ def _resolve_unload_freed_min_mb() -> float:
     holds no real VRAM), so there is nothing to OOM on reload and no reason to
     keep the handle. A bad/negative value coerces to the default. Read once at
     import."""
-    raw = os.getenv("CODE_EMBED_UNLOAD_FREED_MIN_MB", "64")
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        return 64.0
-    return max(0.0, val)
+    return max(0.0, _env_float("CODE_EMBED_UNLOAD_FREED_MIN_MB", 64.0))
 
 
 def _resolve_queue_wait_secs() -> float:
@@ -292,14 +315,7 @@ def _resolve_queue_wait_secs() -> float:
     "do not queue" (the pre-v0.2.102 C-9 immediate shed, still with
     Retry-After); a bad/negative value coerces to the 600 s default. Read once
     at import."""
-    raw = os.getenv("CODE_EMBED_QUEUE_WAIT_SECS", "600")
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        return 600.0
-    if val < 0:
-        return 600.0
-    return val
+    return _env_float("CODE_EMBED_QUEUE_WAIT_SECS", 600.0, minimum=0)
 
 
 #: Bounded CUDA-OOM load-retry budget (v0.2.102). ``LOAD_OOM_RETRIES`` extra

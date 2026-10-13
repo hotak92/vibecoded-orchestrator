@@ -61,12 +61,13 @@ retry policy.
 """
 from __future__ import annotations
 
-import os
 import time
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Optional
+
+from vco_lib.env_values import env_float
 
 __all__ = [
     "CODE_EMBED_CLIENT_TIMEOUT_SECS",
@@ -265,16 +266,7 @@ def resolve_503_tolerance() -> float:
     override = _503_TOLERANCE_OVERRIDE.get()
     if override is not None:
         return override
-    raw = os.getenv(EMBED_503_TOLERANCE_ENV)
-    if raw is None:
-        return DEFAULT_503_TOLERANCE_SECS
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        return DEFAULT_503_TOLERANCE_SECS
-    if val < 0:
-        return DEFAULT_503_TOLERANCE_SECS
-    return val
+    return env_float(EMBED_503_TOLERANCE_ENV, DEFAULT_503_TOLERANCE_SECS, minimum=0)
 
 
 def resolve_503_interactive_tolerance() -> float:
@@ -285,15 +277,9 @@ def resolve_503_interactive_tolerance() -> float:
     batch tolerance — the interactive bound may shorten a user-configured
     global tolerance, never lengthen it: ``min(interactive, batch)``.
     """
-    raw = os.getenv(EMBED_503_INTERACTIVE_TOLERANCE_ENV)
-    val: float = DEFAULT_503_INTERACTIVE_TOLERANCE_SECS
-    if raw is not None:
-        try:
-            candidate = float(raw)
-        except (TypeError, ValueError):
-            candidate = DEFAULT_503_INTERACTIVE_TOLERANCE_SECS
-        if candidate >= 0:
-            val = candidate
+    val = env_float(EMBED_503_INTERACTIVE_TOLERANCE_ENV, None)
+    if val is None or not val >= 0:  # ``>=``: nan -> default, as ever
+        val = DEFAULT_503_INTERACTIVE_TOLERANCE_SECS
     return min(val, resolve_503_tolerance())
 
 
@@ -312,15 +298,9 @@ def resolve_refused_tolerance(*, interactive: bool) -> float:
     bound = resolve_503_tolerance()
     if not interactive:
         return bound
-    raw = os.getenv(EMBED_INTERACTIVE_REFUSED_TOLERANCE_ENV)
-    val: float = DEFAULT_INTERACTIVE_REFUSED_TOLERANCE_SECS
-    if raw is not None:
-        try:
-            candidate = float(raw)
-        except (TypeError, ValueError):
-            candidate = DEFAULT_INTERACTIVE_REFUSED_TOLERANCE_SECS
-        if candidate >= 0:
-            val = candidate
+    val = env_float(EMBED_INTERACTIVE_REFUSED_TOLERANCE_ENV, None)
+    if val is None or not val >= 0:  # ``>=``: nan -> default, as ever
+        val = DEFAULT_INTERACTIVE_REFUSED_TOLERANCE_SECS
     return min(val, bound)
 
 
@@ -350,15 +330,11 @@ def resolve_503_delay_scale(base: float = 2.0) -> Optional[float]:
     as "legacy bounded mode" (finite attempts, no sleeps — used by tests).
     Unset or malformed → ``None`` (delays used unscaled).
     """
-    raw = os.getenv(EMBED_503_RETRY_DELAY_ENV)
-    if raw is None:
+    # malformed → None = unscaled (a knob must not be a kill switch);
+    # negative → 0.0 (clamped).
+    first = env_float(EMBED_503_RETRY_DELAY_ENV, None, minimum=0.0, clamp=True)
+    if first is None:
         return None
-    try:
-        first = float(raw)
-    except (TypeError, ValueError):
-        return None  # malformed → unscaled (a knob must not be a kill switch)
-    if first < 0:
-        first = 0.0
     return first / (base or 1.0)
 
 

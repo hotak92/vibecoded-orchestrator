@@ -1472,15 +1472,11 @@ def disk_min_free_bytes() -> tuple[int, float, bool]:
     default rather than disabling the probe: a fat-fingered value must not
     silently turn the check off (the same policy as ``VCO_CG_INJECT_CAP``).
     """
-    raw = os.environ.get(DISK_MIN_FREE_ENV, "").strip()
-    if raw:
-        try:
-            gib = float(raw)
-        except ValueError:
-            gib = DISK_MIN_FREE_GB_DEFAULT
-        else:
-            if gib > 0:
-                return int(gib * _GIB), gib, True
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    gib = env_float(DISK_MIN_FREE_ENV, None, above=0)
+    if gib is not None:
+        return int(gib * _GIB), gib, True
     return int(DISK_MIN_FREE_GB_DEFAULT * _GIB), DISK_MIN_FREE_GB_DEFAULT, False
 
 

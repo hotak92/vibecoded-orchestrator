@@ -145,7 +145,10 @@ try {
 } catch { }
 [void]$lines.Add("")
 
-Set-Content -Path $SnapshotFile -Value $lines -Encoding UTF8
+# BOM-free (review R5-8): the snapshot is re-injected verbatim by
+# compact-context-reinject; a BOM would ride into the model's context.
+. (Join-Path $PSScriptRoot "_lib/utf8-nobom.ps1")
+Set-VcoUtf8Content -Path $SnapshotFile -Value $lines
 
 # Update the last-compact marker (epoch seconds) -- written BEFORE the next
 # invocation's file list reads it, i.e. exactly after this compact.

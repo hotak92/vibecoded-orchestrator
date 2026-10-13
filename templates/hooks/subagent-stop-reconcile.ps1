@@ -34,6 +34,7 @@ $ScriptDir = $PSScriptRoot
 # v0.2.54 Track G (G-6): child spawns used a hardcoded `pwsh` (absent on
 # PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
 . (Join-Path $ScriptDir "_lib/resolve-powershell.ps1")
+. (Join-Path $ScriptDir "_lib/utf8-nobom.ps1")  # the one BOM-free writer (review R5-8)
 $StderrCap = Join-Path $ScriptDir "_lib/stderr-cap.ps1"
 if (Test-Path $StderrCap) { . $StderrCap }
 
@@ -210,7 +211,7 @@ if (-not $JobFile -and -not $Inline) {
         $redirect["RedirectStandardError"] = Join-Path $jobLogDir ("job.{0}.{1}.err" -f $safeJobId, $PID)
     } catch { }
     try {
-        [System.IO.File]::WriteAllText($job, $HookStdin, (New-Object System.Text.UTF8Encoding($false)))
+        Set-VcoUtf8Content -Path $job -Value $HookStdin -NoNewline
         $env:CLAUDE_PROJECT_DIR = $ProjectRoot
         Start-VcoDetachedProcess -FilePath $PsExe -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "--job", $job) @redirect | Out-Null
     } catch { }
@@ -472,7 +473,7 @@ if ($codeFiles.Count -gt 0) {
             $sb = New-Object System.Text.StringBuilder
             foreach ($p in $toEnqueue) { [void]$sb.AppendLine($p) }
             # No BOM (Encoding.UTF8 writes one into a NEW file, glued to the first path).
-            [System.IO.File]::AppendAllText($CgDrainShared, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+            Add-VcoUtf8Content -Path $CgDrainShared -Value $sb.ToString() -NoNewline
         } catch {}
     }
 }
@@ -640,7 +641,7 @@ if ($SessionId -and $fileCount -gt 0 -and (Test-Path -LiteralPath $MetricsLib -P
         }
         # No BOM: [Text.Encoding]::UTF8 writes one, and the nudge's Python reader
         # (json.loads per line, utf-8) then drops the first row.
-        [System.IO.File]::WriteAllText($tmp, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+        Set-VcoUtf8Content -Path $tmp -Value $sb.ToString() -NoNewline
         Move-Item -LiteralPath $tmp -Destination $nudgeFile -Force -ErrorAction Stop
     } catch {
         try { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue } catch {}

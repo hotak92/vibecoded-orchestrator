@@ -209,13 +209,14 @@ function Save-LaunchRecord([string]$mode, [string]$path, [string]$base, [string]
         Write-WtrecRecord $ProjectRoot $WtName $mode $path $base $toplevel $extra
     }
 }
+. (Join-Path $PSScriptRoot "_lib/utf8-nobom.ps1")  # BOM-free writes (review R5-8)
 function Write-Notice([string]$text) {
     if (-not $NoticeDir) { return }
     if (-not $WtName) { return }
     if ($WtName -notmatch '^[A-Za-z0-9_-][A-Za-z0-9._-]*$') { return }
     try {
         New-Item -ItemType Directory -Force -Path $NoticeDir -ErrorAction Stop | Out-Null
-        Set-Content -LiteralPath (Join-Path $NoticeDir "notice-$WtName.txt") -Value $text -Encoding UTF8 -ErrorAction Stop
+        Set-VcoUtf8Content -Path (Join-Path $NoticeDir "notice-$WtName.txt") -Value $text
     } catch { }
 }
 

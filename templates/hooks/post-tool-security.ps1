@@ -261,7 +261,7 @@ if ($alerts.Count -gt 0) {
     }
     $reminder = "[Security alert] $msg`nReview the lines named above before continuing: the credential pattern is in`ntext this edit introduced (or on a line it changed) in $relFile. If it is`na deliberate test placeholder, mark its line with the comment`n``$markerText``; if it leaked from real input, redact`nit before any further git operations or external sharing."
     if ($parentAlertFailed) {
-        $reminder += "`nThis alert could NOT be filed for your parent agent (the VCO venv is not`nresolvable: a broken VCO install). Repeat it in your final report."
+        $reminder += "`nThis alert could NOT be filed for your parent agent (see the hook's stderr).`nRepeat it in your final report."
     }
     if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
         Emit-AdditionalContext $reminder PostToolUse

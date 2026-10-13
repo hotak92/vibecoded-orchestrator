@@ -51,6 +51,7 @@ __all__ = [
     "PENDING_TTL_SECONDS",
     "CLAIM_MARK",
     "CTX_PENDING_PATH_KEY",
+    "AGENT_WINDOW_FINAL_KEY",
 ]
 
 # Abandoned-session TTL: a pending file with no turn-end (session killed) is
@@ -74,11 +75,19 @@ CLAIM_MARK = ".draining."
 # "never staged" (compute, or the citation is lost). Never written to disk.
 CTX_PENDING_PATH_KEY = "pending_path"
 
-# A claim older than this is re-adopted even when its pid looks alive (the
-# pid was reused) or liveness cannot be decided. Generous on purpose: one
-# compute is a handful of embedding calls, and taking a LIVE claim over
-# would let two drains score one citation.
+# A claim older than this is re-adopted when liveness cannot be decided, or
+# when its pid is alive but provably REUSED (the process holding it started
+# after the claim; review R5-4, :func:`vco_lib.atomic.claim_owner_gone`). A
+# live holder that is merely slow keeps its claim: taking it over would let
+# two drains score one citation.
 CLAIM_STALE_SECONDS: float = PENDING_TTL_SECONDS
+
+# v0.2.102 W6-R5FIX (review R5-9): a brief citation stamped with a subagent
+# transcript while that agent may still be running carries this key set to
+# ``False``; the parent drain then applies the main chat's accumulating gate
+# rather than the final-window floors. Absent (or true) = the stamped
+# transcript is a finished agent's final answer.
+AGENT_WINDOW_FINAL_KEY = "agent_window_final"
 
 # Filesystem-safe key sanitiser. session_id / task_id come from Claude Code +
 # our own uuid hex, but a defensive scrub keeps a stray path separator from
@@ -381,8 +390,10 @@ def readopt_stale_claims(
     stale_after_s: float = CLAIM_STALE_SECONDS,
 ) -> int:
     """Rename back every claim whose owner is gone: its pid is dead, or the
-    claim is older than ``stale_after_s`` (pid reused / liveness unknown).
-    A live, young claim is left alone. Returns the count re-adopted."""
+    claim is older than ``stale_after_s`` and its pid is proven reused or
+    its liveness unknown (:func:`vco_lib.atomic.claim_owner_gone`). A live
+    holder's claim is left alone however old (review R5-4). Returns the
+    count re-adopted."""
     d = pending_dir(project_root)
     if d is None or not d.exists():
         return 0
@@ -459,7 +470,18 @@ def adopt_brief_citations(
       ``parent_transcript``), so the parent's next Stop drain scores them
       against the subagent's final answer;
     * not finished (a BACKGROUND launch: PostToolUse:Agent fires at launch)
-      — tagged only; the agent's own SubagentStop drain scores them.
+      — tagged; the agent's own SubagentStop drain scores them. When the
+      agent's transcript already exists and is non-empty (a very fast agent
+      can finish — and run its one SubagentStop drain — before this
+      detached adopt job lands; review R5-9) it is ALSO stamped, with
+      ``agent_window_final: false``: a parent Stop drain then scores it
+      against the subagent's answer under the main chat's
+      accumulate-don't-drop rules (25k gate, or the terminal floors once
+      the file ages) instead of the final-window floors, because the agent
+      may still be running. Without the stamp a tagged file whose agent
+      drain already ran had no transcript and died at the TTL sweep. The
+      agent's own drain, when it comes, clears the flag (its window is
+      final).
 
     A finished agent whose transcript cannot be located re-tags nothing:
     a tagged file without a transcript would be left to the TTL sweep, and
@@ -473,10 +495,18 @@ def adopt_brief_citations(
     if not tuid or not agent:
         return 0
     agent_transcript_path = ""
+    window_final = True
     if agent_finished:
         agent_transcript_path = agent_transcript_for(parent_transcript, agent)
         if not agent_transcript_path:
             return 0
+    else:
+        cand = agent_transcript_for(parent_transcript, agent)
+        try:
+            if cand and Path(cand).stat().st_size > 0:
+                agent_transcript_path, window_final = cand, False
+        except OSError:
+            pass
     adopted = 0
     for path in list_pending_for_session(session_id, project_root):
         payload = read_pending(path)
@@ -493,6 +523,8 @@ def adopt_brief_citations(
                 payload["agent_id"] = agent
                 if agent_transcript_path:
                     payload["agent_transcript_path"] = agent_transcript_path
+                    if not window_final:
+                        payload[AGENT_WINDOW_FINAL_KEY] = False
                 from vco_lib.atomic import atomic_write_json  # noqa: PLC0415
 
                 atomic_write_json(claimed, payload, indent=None, fsync=False)

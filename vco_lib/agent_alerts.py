@@ -50,7 +50,15 @@ before the claim (and is delivered) or after it (in a fresh file). The claim
 renames the file to ``<name>.delivering.<pid>``; the claimed file is removed
 only AFTER the envelope has been written, and a claim whose delivery died is
 appended back to its file by the next delivery (review R4c-6) — an alert can
-be delivered twice after a crash, never lost.
+be delivered twice after a crash, never lost. The deliver hooks' fast path
+counts such a claim as pending, so the re-adoption is reachable from the
+hook, not only from Python (review R5-1); a live holder's claim is taken
+over only when its pid is proven reused (review R5-4).
+
+Orphans (review R5-5): an alert file untouched for 7 days is never going to
+be delivered (its session ended, or its rows carry no session id). Every
+delivery moves such a file's rows to ``.claude/logs/agent-alerts-undelivered.jsonl``
+and removes it, so the no-pending fast path stays an interpreter-free glob.
 """
 from __future__ import annotations
 
@@ -65,8 +73,11 @@ from vco_lib.atomic import claim_by_rename, claim_owner_gone, portable_exclusive
 from vco_lib.hook_agent_key import agent_state_key, sanitize_agent_id
 
 #: File prefix/suffix of a pending alert file under ``.claude/state``.
-#: MUST MATCH ``_lib/session-id.sh`` ``vco_agent_alerts_file`` and
-#: ``session-id.ps1`` ``Get-VcoAgentAlertsFile``.
+#: The only path builder is :func:`alert_file` below; shell writers reach it
+#: through ``python -m vco_lib.agent_alerts append``
+#: (``_lib/agent-alerts.{sh,ps1}``). The deliver hooks' fast path globs
+#: ``agent_alerts_*.jsonl`` and ``agent_alerts_*.jsonl.delivering.*`` — keep
+#: these names in step with ``agent-alerts-deliver.{sh,ps1}``.
 ALERT_FILE_PREFIX = "agent_alerts_"
 ALERT_FILE_SUFFIX = ".jsonl"
 
@@ -75,10 +86,20 @@ ALERT_FILE_SUFFIX = ".jsonl"
 LOCK_FILE_NAME = "agent_alerts.lock"
 #: Marker of a claimed (being-delivered) file: ``<name>.delivering.<pid>``.
 DELIVERING_MARK = ".delivering."
-#: A claim older than this is re-adopted even if its pid looks alive (a
-#: delivery takes milliseconds; a minute means it is stuck or the pid was
-#: reused).
+#: A claim older than this is re-adopted while its pid is alive only when
+#: that pid is proven REUSED (its process started after the claim; review
+#: R5-4, :func:`vco_lib.atomic.claim_owner_gone`). A delivery takes
+#: milliseconds, so a dead pid or a reused one is the realistic orphan.
 DELIVERING_STALE_SECONDS = 60.0
+
+#: An alert file untouched for this long is an ORPHAN: its session ended
+#: before any main-chat tool call or prompt delivered it, or its rows carry
+#: no session id (``nosession__``) and no agent-scoped delivery came. Its
+#: rows move to :data:`UNDELIVERED_LOG_REL` and the file is removed, so it
+#: stops costing every later tool call an interpreter start (review R5-5).
+ORPHAN_AFTER_SECONDS = 7 * 24 * 3600.0
+#: Where an orphan's rows are kept for a human (relative to the project).
+UNDELIVERED_LOG_REL = Path(".claude") / "logs" / "agent-alerts-undelivered.jsonl"
 
 #: ``None`` = pick the lock protocol by platform; tests set ``False`` to
 #: drive the Windows (O_EXCL sidecar) protocol on POSIX.
@@ -231,6 +252,60 @@ def readopt_stale_deliveries(project_root: str,
     return adopted
 
 
+def sweep_orphan_alerts(project_root: str,
+                        older_than_s: float = ORPHAN_AFTER_SECONDS) -> int:
+    """Move the rows of every alert file untouched for ``older_than_s``
+    (:data:`ORPHAN_AFTER_SECONDS`, 7 days) to :data:`UNDELIVERED_LOG_REL`
+    and remove the file (review R5-5). Such a file is an orphan: no
+    delivery for its session or agent is coming, and while it exists every
+    main-chat tool call starts an interpreter only to deliver nothing. The
+    rows are kept for a human, tagged ``undelivered_reason``; a file
+    younger than the age (another session's, still deliverable) is left
+    alone. The file is claimed first, so a delivery racing the sweep never
+    sees it half-moved; when the log cannot be written the rows go back to
+    the alert file (never lost). Returns the count swept. Never raises."""
+    if not project_root:
+        return 0
+    state = _state_dir(project_root)
+    try:
+        files = sorted(state.glob(f"{ALERT_FILE_PREFIX}*{ALERT_FILE_SUFFIX}"))
+    except OSError:
+        return 0
+    import time  # noqa: PLC0415
+
+    now = time.time()
+    log = Path(project_root) / UNDELIVERED_LOG_REL
+    swept = 0
+    for path in files:
+        try:
+            if now - path.stat().st_mtime < older_than_s:
+                continue
+        except OSError:
+            continue
+        claimed = _claim(project_root, path)
+        if claimed is None:
+            continue
+        rows = _read_rows(claimed)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with _lock(project_root):
+                with open(log, "a", encoding="utf-8") as fh:
+                    for r in rows:
+                        fh.write(json.dumps(dict(r, undelivered_reason="orphaned_alert_file",
+                                                 swept_at=stamp),
+                                            ensure_ascii=False) + "\n")
+        except OSError:
+            # The log is unwritable: hand the rows back (never lost). If even
+            # that fails, the claim stays on disk and is re-adopted later.
+            if _append_back(project_root, path, rows):
+                _finish([claimed])
+            continue
+        _finish([claimed])
+        swept += 1
+    return swept
+
+
 def _row_matches(row: Dict[str, Any], session_id: str, agent_id: str) -> bool:
     if agent_id:
         return sanitize_agent_id(str(row.get("agent_id") or "")) == agent_id
@@ -246,9 +321,12 @@ def _collect(project_root: str, session_id: str,
     are written back (the claim is per file, the match per row). Never
     raises."""
     agent = sanitize_agent_id(agent_id or "")
-    if not project_root or (not agent and not session_id):
+    if not project_root:
         return [], []
     readopt_stale_deliveries(project_root)
+    sweep_orphan_alerts(project_root)
+    if not agent and not session_id:
+        return [], []
     state = _state_dir(project_root)
     try:
         if agent:

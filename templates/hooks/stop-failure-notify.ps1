@@ -34,6 +34,7 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # notify.py; the ledger is written either way. None -> the label falls back
 # to the current location's name and no notification is sent.
 . (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+. (Join-Path $PSScriptRoot "_lib/utf8-nobom.ps1")  # the one BOM-free writer (review R5-8)
 $ProjectDir = Get-VcoProjectRoot
 $ProjectName = Split-Path $(if ($ProjectDir) { $ProjectDir } else { (Get-Location).Path }) -Leaf
 
@@ -282,7 +283,7 @@ if (-not $CoreRan) {
         $sfLedger = Join-Path $LogDir "failures.jsonl"
         try {
             $sfLine = ($sfRow | ConvertTo-Json -Compress -Depth 3)
-            [System.IO.File]::AppendAllText($sfLedger, $sfLine + "`n", (New-Object System.Text.UTF8Encoding $false))
+            Add-VcoUtf8Content -Path $sfLedger -Value ($sfLine + "`n") -NoNewline
         } catch {
             [Console]::Error.WriteLine("stop-failure-notify: ledger line NOT written to $sfLedger ($sfWhy; $($_.Exception.Message)).")
         }

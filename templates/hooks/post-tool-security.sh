@@ -255,8 +255,8 @@ a deliberate test placeholder, mark its line with the comment
 it before any further git operations or external sharing."
     if [ -n "$_PTS_PARENT_FAIL" ]; then
         REMINDER="${REMINDER}
-This alert could NOT be filed for your parent agent (the VCO venv is not
-resolvable: a broken VCO install). Repeat it in your final report."
+This alert could NOT be filed for your parent agent (see the hook's stderr).
+Repeat it in your final report."
     fi
     if command -v emit_additional_context >/dev/null 2>&1; then
         emit_additional_context "$REMINDER" PostToolUse

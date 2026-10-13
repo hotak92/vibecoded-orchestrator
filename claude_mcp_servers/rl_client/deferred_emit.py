@@ -74,10 +74,9 @@ _ORPHAN_TTL_DEFAULT_S = 900.0
 
 
 def _orphan_ttl_s() -> float:
-    try:
-        return float(os.environ.get(ORPHAN_TTL_ENV, "") or _ORPHAN_TTL_DEFAULT_S)
-    except (TypeError, ValueError):
-        return _ORPHAN_TTL_DEFAULT_S
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    return env_float(ORPHAN_TTL_ENV, _ORPHAN_TTL_DEFAULT_S)
 
 
 def _reap_orphaned_payloads(

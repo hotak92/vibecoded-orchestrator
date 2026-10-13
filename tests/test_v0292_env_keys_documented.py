@@ -121,7 +121,7 @@ PY_CONST = re.compile(
 #: Calls to the SHARED env readers in ``vco_lib`` (``vco_lib/env_values.py``):
 #: the per-file wrapper scan below cannot see a reader defined in another
 #: module, so the one home is named here. Literal key or same-file constant.
-SHARED_READERS = ("env_int",)
+SHARED_READERS = ("env_int", "env_float")
 PY_SHARED_LITERAL = re.compile(
     r"\b(?:" + "|".join(SHARED_READERS) + r")\(\s*[\"'](" + KEY + r")[\"']" + BOUNDARY
 )
@@ -202,6 +202,9 @@ def _scan_python_text(text: str, origin: str, reads: dict[str, set[str]]) -> Non
             m.group(1) or m.group(2)
             for m in PY_IDENT.finditer(block)
             if (m.group(1) or m.group(2)) in param_names
+        } | {  # a wrapper forwarding its param to a shared reader
+            m.group(1) for m in PY_SHARED_IDENT.finditer(block)
+            if m.group(1) in param_names
         }
         if not body_reads:
             continue

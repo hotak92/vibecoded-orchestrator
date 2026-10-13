@@ -41,7 +41,6 @@ Today it defaults to ``vco_lib.project_init.detect_kg_schema_drift``.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import sqlite3
 import subprocess
@@ -255,14 +254,13 @@ _CODEGRAPH_CLASS_SUFFIXES: tuple[str, ...] = (
 #: a working-path deadline. Override per-machine: ``VCT_EDGE_TIMEOUT_SECS=0``
 #: disables the cap entirely (None → subprocess.run waits indefinitely).
 def _resolve_edge_timeout() -> "Optional[int]":
-    raw = os.environ.get("VCT_EDGE_TIMEOUT_SECS", "").strip()
-    if raw:
-        try:
-            v = int(raw)
-            return None if v <= 0 else v
-        except ValueError:
-            pass  # malformed → fall through to the default
-    return 3600
+    """``VCT_EDGE_TIMEOUT_SECS``: unset / blank / malformed -> 3600; ``<= 0``
+    -> ``None`` (no timeout, this reader's extra meaning); else the value.
+    The parse is the one env-int reader's (:func:`vco_lib.env_values.env_int`)."""
+    from vco_lib.env_values import env_int  # noqa: PLC0415
+
+    v = env_int("VCT_EDGE_TIMEOUT_SECS", 3600)
+    return None if v <= 0 else v
 
 
 _EDGE_SUBPROCESS_TIMEOUT = _resolve_edge_timeout()

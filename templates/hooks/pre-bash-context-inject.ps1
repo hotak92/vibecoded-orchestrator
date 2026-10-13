@@ -222,7 +222,8 @@ if ($Intent -eq "READ" -or $Intent -eq "EDIT" -or $Intent -eq "SEARCH") {
     try { $state.targets = @($TargetsJson | ConvertFrom-Json) } catch { }
     try { $state.symbols = @($SymbolsJson | ConvertFrom-Json) } catch { }
     try {
-        $state | ConvertTo-Json -Compress | Set-Content -Path $StateFile -Encoding UTF8 -NoNewline
+        . (Join-Path $PSScriptRoot "_lib/utf8-nobom.ps1")  # BOM-free (review R5-8)
+        Set-VcoUtf8Content -Path $StateFile -Value ($state | ConvertTo-Json -Compress) -NoNewline
     } catch { }
 
     # === F-LOG (v0.2.70): the pre_bash pairing event (WP-D 2 payload) ===
