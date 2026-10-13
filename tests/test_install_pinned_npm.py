@@ -26,6 +26,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -79,7 +80,7 @@ def _patch_audit_log(tmp_path: Path):
     )
 
 
-def _mk_run_factory(stages: list):
+def _mk_run_factory(stages: list) -> Any:
     """Build a `subprocess.run` side_effect that returns canned
     CompletedProcess objects in order; raises if the test calls more
     times than expected.
@@ -373,6 +374,7 @@ class CheckNpmPinDriftTests(unittest.TestCase):
             in_sync, msg = install._check_npm_pin_drift("mermaid_mcp")
         self.assertFalse(in_sync)
         self.assertIsNotNone(msg)
+        msg = cast(str, msg)  # typing only: narrowed by the assertion above
         # Drift message must name the package, both versions, and the
         # remediation command.
         self.assertIn("1.6.2", msg)

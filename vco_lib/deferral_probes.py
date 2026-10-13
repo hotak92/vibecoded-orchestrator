@@ -713,30 +713,41 @@ def process_start_token(pid: int) -> Optional[str]:
     return None if started is None else f"wall:{started:.3f}"
 
 
-def process_identity_matches(pid: int, recorded: Optional[str]) -> Optional[bool]:
-    """Is *pid* still the process whose :func:`process_start_token` was *recorded*?
+#: :func:`process_identity_verdict` outcomes. ``band`` and ``unknown`` both
+#: read as None through :func:`process_identity_matches`; a caller that must
+#: tell them apart (``vco_lib.update_lock.decide``, v0.2.102 W6-LOWS R3 C-3)
+#: asks for the verdict.
+IDENTITY_SAME = "same"
+IDENTITY_REUSED = "reused"
+IDENTITY_BAND = "band"
+IDENTITY_UNKNOWN = "unknown"
 
-    ``True``  — same instance; ``False`` — the pid now names a DIFFERENT
-    process (it was reused); ``None`` — cannot tell (nothing recorded, the
-    process cannot be inspected, or the token kinds differ). Callers that
-    guard against a second concurrent run treat ``None`` as "still the same"
-    — the conservative direction, matching :func:`pid_is_alive`.
+
+def process_identity_verdict(pid: int, recorded: Optional[str]) -> str:
+    """Compare *pid*'s current :func:`process_start_token` with *recorded*.
+
+    ``IDENTITY_SAME`` — same instance; ``IDENTITY_REUSED`` — the pid now names
+    a DIFFERENT process; ``IDENTITY_BAND`` — both are ``wall:`` tokens and the
+    gap is over 1 s but under ``_WALL_REUSED_MIN_DELTA_S``: compared, and
+    could not be told apart; ``IDENTITY_UNKNOWN`` — no comparison was possible
+    (nothing recorded, the process cannot be inspected, the token kinds
+    differ, or a token is malformed).
     """
     if not recorded:
-        return None
+        return IDENTITY_UNKNOWN
     current = process_start_token(pid)
     if current is None:
-        return None
+        return IDENTITY_UNKNOWN
     rec_kind, _, rec_val = recorded.partition(":")
     cur_kind, _, cur_val = current.partition(":")
     if rec_kind != cur_kind:
-        return None
+        return IDENTITY_UNKNOWN
     if rec_kind == "proc":
-        return rec_val == cur_val
+        return IDENTITY_SAME if rec_val == cur_val else IDENTITY_REUSED
     try:
         delta = abs(float(rec_val) - float(cur_val))
     except ValueError:
-        return None
+        return IDENTITY_UNKNOWN
     # Both readers take the same OS creation timestamp, but the Rust writer
     # (vct-launcher-core process.rs) truncates it to whole seconds, so a live
     # holder can differ by up to (strictly under) 1 s. A gap between that and
@@ -744,10 +755,29 @@ def process_identity_matches(pid: int, recorded: Optional[str]) -> Optional[bool
     # as still alive, the safe direction for a lock — so a future reader drift
     # can never turn a LIVE holder into "pid reused".
     if delta <= 1.0:
-        return True
+        return IDENTITY_SAME
     if delta < _WALL_REUSED_MIN_DELTA_S:
-        return None
-    return False
+        return IDENTITY_BAND
+    return IDENTITY_REUSED
+
+
+def process_identity_matches(pid: int, recorded: Optional[str]) -> Optional[bool]:
+    """Is *pid* still the process whose :func:`process_start_token` was *recorded*?
+
+    ``True``  — same instance; ``False`` — the pid now names a DIFFERENT
+    process (it was reused); ``None`` — cannot tell (nothing recorded, the
+    process cannot be inspected, the token kinds differ, or a wall-token gap
+    in the "cannot tell" band). Callers that guard against a second concurrent
+    run treat ``None`` as "still the same" — the conservative direction,
+    matching :func:`pid_is_alive`. The comparison itself is
+    :func:`process_identity_verdict`.
+    """
+    verdict = process_identity_verdict(pid, recorded)
+    if verdict == IDENTITY_SAME:
+        return True
+    if verdict == IDENTITY_REUSED:
+        return False
+    return None
 
 
 # A wall-clock start token differing by at least this much names a different

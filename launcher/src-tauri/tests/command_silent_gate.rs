@@ -490,6 +490,39 @@ fn same_line_item_follows() {}
     assert_eq!(test_gated_lines(&whole), vec![true; 4]);
     assert_eq!(test_or_debug_gated_lines(&whole), vec![true; 4]);
 
+    // v0.2.102 W6-LOWS (R3 C-4): it is file-level only BEFORE the first item.
+    // Comments (stripped to blanks), blank lines and other inner attributes,
+    // including a multi-line one, may precede it.
+    let lines = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+    let preceded = strip_comments_and_strings(
+        "//! crate docs\n\n#![allow(\n    dead_code\n)]\n  #! [ cfg ( test ) ]\nfn f() {}\n",
+    );
+    assert_eq!(test_gated_lines(&preceded), vec![true; preceded.len()]);
+    // Inside an inline module it gates that module, never the whole file:
+    // the production lines around it stay visible.
+    let inline = lines(&[
+        "fn production() {",
+        "    let _ = std::process::Command::new(\"git\").status();",
+        "}",
+        "mod x {",
+        "    #![cfg(test)]",
+        "    fn t() {}",
+        "}",
+        "fn after() {}",
+    ]);
+    let g = test_gated_lines(&inline);
+    assert!(!g[0] && !g[1] && !g[7], "an inline module's #![cfg(test)] blanked production: {g:?}");
+    assert!(!test_or_debug_gated_lines(&inline)[1]);
+    // An item before it: no longer file-level.
+    let late = lines(&["use std::fmt;", "#![cfg(test)]", "fn f() {}"]);
+    assert_eq!(test_gated_lines(&late), vec![false; 3]);
+    // A first-line shebang is skipped (as the Rust lexer does); a `#!` that
+    // is not on the first line is not an inner attribute.
+    let shebang = lines(&["#!/usr/bin/env run-cargo-script", "#![cfg(test)]", "fn f() {}"]);
+    assert_eq!(test_gated_lines(&shebang), vec![true; 3]);
+    let late_bang = lines(&["", "#!/bin/x", "#![cfg(test)]", "fn f() {}"]);
+    assert_eq!(test_gated_lines(&late_bang), vec![false; 4]);
+
     // Debug-gated items: production for the strict reading, blanked for the
     // release-build reading.
     let dbg: Vec<String> = ["#[cfg(any(test, debug_assertions))]", "fn d() {", "}"]

@@ -44,38 +44,94 @@ function ConvertTo-VcoPrFullPath {
     return $trimmed
 }
 
-# Resolve-VcoPrRealPath <path> - every symlink/junction in an existing path
-# resolved, component by component (Path.resolve() semantics). A component that
-# cannot be inspected is kept as given; a link loop (>40 hops) returns the
-# unresolved full path.
+# Get-VcoPrLinkTarget <item> - the target of a symbolic link or junction, or
+# $null. Only a SymbolicLink / Junction (LinkType), or an item carrying the
+# ReparsePoint attribute, has one: PowerShell's `Target` CodeProperty also
+# lists a hard-linked FILE's other names, which are not links to follow
+# (v0.2.102 W6-LOWS, R3 C-2). `LinkTarget` is read first (PowerShell 7.x),
+# `Target` is the 5.1 fallback; both are guarded with PSObject.Properties.
+function Get-VcoPrLinkTarget {
+    param($Item)
+    if (-not $Item) { return $null }
+    $isLink = $false
+    if ($Item.PSObject.Properties['LinkType'] -and ([string]$Item.LinkType -in @('SymbolicLink', 'Junction'))) { $isLink = $true }
+    if (-not $isLink -and $Item.PSObject.Properties['Attributes']) {
+        try {
+            if ([System.IO.FileAttributes]$Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $isLink = $true }
+        } catch { }
+    }
+    if (-not $isLink) { return $null }
+    $target = $null
+    if ($Item.PSObject.Properties['LinkTarget']) { $target = $Item.LinkTarget }
+    if (-not $target -and $Item.PSObject.Properties['Target']) { $target = @($Item.Target)[0] }
+    if (-not $target) { return $null }
+    return [string]$target
+}
+
+# Split-VcoPrPath <path> - @(root, segments...) of a path WITHOUT collapsing
+# `.` or `..` (GetFullPath would collapse them lexically, before any link is
+# resolved). A relative path is anchored at the process directory, which is
+# what GetFullPath uses. A rooted but not fully qualified Windows form
+# (`\x`, `C:x`) has no unambiguous lexical split and falls back to GetFullPath.
+function Split-VcoPrPath {
+    param([string]$Path)
+    if (-not [System.IO.Path]::IsPathRooted($Path)) {
+        $Path = [System.IO.Path]::Combine([System.IO.Directory]::GetCurrentDirectory(), $Path)
+    }
+    $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))
+    $rawRoot = [System.IO.Path]::GetPathRoot($Path)
+    if (-not [string]::Equals(($rawRoot -replace '/', '\'), ($root -replace '/', '\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $Path = [System.IO.Path]::GetFullPath($Path)
+        $rawRoot = $root
+    }
+    $segs = @($Path.Substring($rawRoot.Length) -split '[\\/]' | Where-Object { $_ -and $_ -ne '.' })
+    return ,(@($root) + $segs)
+}
+
+# Resolve-VcoPrRealPath <path> - every symlink/junction in the path resolved,
+# component by component, with Path.resolve() semantics (the .sh's `cd -P`):
+# a `..` segment means "parent of the ALREADY-RESOLVED path", never a lexical
+# collapse done before the links are resolved, and a relative link target is
+# queued segment by segment against the link's own (resolved) directory, so a
+# `..` inside a target is resolved the same way (v0.2.102 W6-LOWS, R3 C-1).
+# A component that does not exist is kept as given; a link loop (>40 hops)
+# returns the lexically normalised full path.
 function Resolve-VcoPrRealPath {
     param([string]$Path)
     $full = ConvertTo-VcoPrFullPath $Path
     if (-not $full) { return "" }
-    $acc = [System.IO.Path]::GetPathRoot($full)
+    try { $parts = Split-VcoPrPath $Path } catch { return $full }
+    $acc = [string]$parts[0]
     $queue = [System.Collections.Generic.List[string]]::new()
-    foreach ($seg in ($full.Substring($acc.Length) -split '[\\/]')) { if ($seg) { $queue.Add($seg) } }
+    for ($i = 1; $i -lt $parts.Count; $i++) { $queue.Add([string]$parts[$i]) }
     $hops = 0
     while ($queue.Count -gt 0) {
         $seg = $queue[0]
         $queue.RemoveAt(0)
+        if ($seg -eq '.') { continue }
+        if ($seg -eq '..') {
+            $up = [System.IO.Path]::GetDirectoryName($acc)
+            if ($up) { $acc = $up }
+            continue
+        }
         $next = Join-Path $acc $seg
         $item = $null
         try { $item = Get-Item -LiteralPath $next -Force -ErrorAction Stop } catch { $item = $null }
-        $target = $null
-        if ($item) {
-            if ($item.PSObject.Properties['LinkTarget']) { $target = $item.LinkTarget }
-            if (-not $target -and $item.PSObject.Properties['Target']) { $target = @($item.Target)[0] }
-        }
+        $target = Get-VcoPrLinkTarget $item
         if (-not $target) { $acc = $next; continue }
         $hops++
         if ($hops -gt 40) { return $full }
-        if (-not [System.IO.Path]::IsPathRooted($target)) { $target = Join-Path $acc $target }
-        $tfull = ConvertTo-VcoPrFullPath $target
-        if (-not $tfull) { return $full }
-        $acc = [System.IO.Path]::GetPathRoot($tfull)
-        $tsegs = @($tfull.Substring($acc.Length) -split '[\\/]' | Where-Object { $_ })
-        for ($i = $tsegs.Count - 1; $i -ge 0; $i--) { $queue.Insert(0, $tsegs[$i]) }
+        # A rooted target restarts at its own root; a relative one continues
+        # from the link's directory ($acc, already resolved).
+        $tsegs = @()
+        if ([System.IO.Path]::IsPathRooted($target)) {
+            try { $tparts = Split-VcoPrPath $target } catch { return $full }
+            $acc = [string]$tparts[0]
+            for ($j = 1; $j -lt $tparts.Count; $j++) { $tsegs += [string]$tparts[$j] }
+        } else {
+            $tsegs = @($target -split '[\\/]' | Where-Object { $_ -and $_ -ne '.' })
+        }
+        for ($k = $tsegs.Count - 1; $k -ge 0; $k--) { $queue.Insert(0, $tsegs[$k]) }
     }
     return (ConvertTo-VcoPrFullPath $acc)
 }
@@ -101,9 +157,11 @@ function Get-VcoPrHomes {
 function Find-VcoProjectRoot {
     param([string]$Start = "")
     if (-not $Start) { $Start = (Get-Location).Path }
-    if (-not (Test-Path -LiteralPath $Start -PathType Container)) { return "" }
+    # The directory test runs on the RESOLVED path: `link/../a` names the
+    # parent of the link's target, not the lexical `a` (R3 C-1).
     $dir = Resolve-VcoPrRealPath $Start
     if (-not $dir) { return "" }
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return "" }
     $homes = Get-VcoPrHomes
     $cmp = if ($IsWindows -or $env:OS -eq 'Windows_NT') { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
     while ($dir) {

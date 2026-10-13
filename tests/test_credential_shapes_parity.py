@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 from tests.common.pwsh import PWSH_BASE_FLAGS
@@ -62,6 +63,7 @@ FIXTURE = REPO / "tests" / "fixtures" / "credential_shape_parity.json"
 BASH_MIRROR = REPO / "templates" / "hooks" / "_lib" / "credshapes.sh"
 PS1_MIRROR = REPO / "templates" / "hooks" / "_lib" / "credshapes.ps1"
 VCT_MIRROR = REPO / "tools" / "vct-secrets" / "lib" / "credential_shapes.sh"
+VCT_CLI = REPO / "tools" / "vct-secrets" / "vct"
 
 ID2LABEL = {s.id: s.label for s in SHAPES}
 
@@ -198,7 +200,7 @@ foreach ($case in $doc.cases) {
 def test_powershell_mirror_matches_fixture():
     env = dict(os.environ, MIRROR=str(PS1_MIRROR), FIXTURE=str(FIXTURE))
     out = subprocess.run(
-        [_PWSH, *PWSH_BASE_FLAGS, "-Command", _PS_EVAL],
+        [cast(str, _PWSH), *PWSH_BASE_FLAGS, "-Command", _PS_EVAL],
         env=env, capture_output=True, text=True, timeout=180,
     )
     assert out.returncode == 0, f"pwsh mirror failed: {out.stderr[:800]}"
@@ -254,7 +256,7 @@ foreach ($r in $doc.file_kinds) {
 }
 """
     env = dict(os.environ, MIRROR=str(PS1_MIRROR), FIXTURE=str(FIXTURE))
-    out = subprocess.run([_PWSH, *PWSH_BASE_FLAGS, "-Command", script],
+    out = subprocess.run([cast(str, _PWSH), *PWSH_BASE_FLAGS, "-Command", script],
                          env=env, capture_output=True, text=True, timeout=180)
     assert out.returncode == 0, out.stderr[:800]
     got = [ln.split("\t", 1) for ln in out.stdout.splitlines() if "\t" in ln]
@@ -352,7 +354,17 @@ _SHELL_NAME_FILES = (
     BASH_MIRROR,
     BASH_MIRROR.parent / "credscan.sh",
     VCT_MIRROR,
+    # The vct CLI's own alias of the argv_name alternation (R3 V-c). vct is a
+    # secrets CLI whose OTHER variables (`key`, `token`, ...) are secret-shaped
+    # on purpose and never echoed, so only its shape-vocabulary names are
+    # checked there (_SHELL_NAME_FILTERS).
+    VCT_CLI,
 )
+#: Per-file name filter: a file listed here contributes only the assigned
+#: names the predicate keeps; every other file contributes all its names.
+_SHELL_NAME_FILTERS = {
+    VCT_CLI: lambda name: "SHAPES" in name.upper(),
+}
 _ASSIGNED_NAME_RE = re.compile(
     r"(?m)^[ \t]*(?:local[ \t]+|readonly[ \t]+|export[ \t]+|declare[ \t]+-\w+[ \t]+)?"
     r"([A-Za-z_]\w*)\+?="
@@ -373,7 +385,9 @@ def _bash_security():
 def _mirror_assigned_names() -> set:
     names: set = set()
     for path in _SHELL_NAME_FILES:
-        names.update(_ASSIGNED_NAME_RE.findall(path.read_text(encoding="utf-8")))
+        found = _ASSIGNED_NAME_RE.findall(path.read_text(encoding="utf-8"))
+        keep = _SHELL_NAME_FILTERS.get(path)
+        names.update(n for n in found if keep is None or keep(n))
     return names
 
 
@@ -381,7 +395,8 @@ def test_mirror_variable_names_are_not_secret_shaped():
     names = _mirror_assigned_names()
     # Non-vacuous: the output contract and the vct alternation are found.
     assert {"CSHAPES_IDS", "CSHAPES_LABELS", "CSHAPES_PATTERNS",
-            "CSHAPES_TEST_PLACEHOLDER_MARKER", "_CSHAPES_ARGV_NAME_RE"} <= names
+            "CSHAPES_TEST_PLACEHOLDER_MARKER", "_CSHAPES_ARGV_NAME_RE",
+            "_VCT_CSHAPES_ARGV_NAME_RE"} <= names
     bs = _bash_security()
     blocked = {}
     for name in sorted(names):
@@ -655,7 +670,7 @@ def test_bash_mirror_ids_and_labels_match_ssot(context):
 def test_powershell_mirror_ids_and_labels_match_ssot(context):
     env = dict(os.environ, MIRROR=str(PS1_MIRROR), CS_CTX=context)
     out = subprocess.run(
-        [_PWSH, *PWSH_BASE_FLAGS, "-Command", _PS_LABELS],
+        [cast(str, _PWSH), *PWSH_BASE_FLAGS, "-Command", _PS_LABELS],
         env=env, capture_output=True, text=True, timeout=120,
     )
     assert out.returncode == 0, out.stderr[:800]
@@ -715,7 +730,7 @@ def test_bash_mirror_pattern_strings_are_identical_to_ssot(context):
 def test_powershell_mirror_pattern_strings_are_identical_to_ssot(context):
     env = dict(os.environ, MIRROR=str(PS1_MIRROR), CS_CTX=context)
     out = subprocess.run(
-        [_PWSH, *PWSH_BASE_FLAGS, "-Command", _PS_PATTERNS],
+        [cast(str, _PWSH), *PWSH_BASE_FLAGS, "-Command", _PS_PATTERNS],
         env=env, capture_output=True, text=True, timeout=120,
     )
     assert out.returncode == 0, out.stderr[:800]

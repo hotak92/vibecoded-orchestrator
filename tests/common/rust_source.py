@@ -326,6 +326,47 @@ def _item_end_line(code: Sequence[str], attr_index: int) -> Optional[int]:
     return None
 
 
+def _leading_inner_attrs(code: Sequence[str]) -> List[str]:
+    """The file's LEADING inner attributes, each as one line of text.
+
+    ``code`` is scrubbed (comments and strings gone). Only whitespace, a
+    first-line shebang (``#!`` not opening ``[``, skipped by the Rust lexer)
+    and other inner attributes (``#![...]``, possibly spanning lines) may
+    precede a file-level inner attribute; the first other token is the file's
+    first item, and nothing after it is returned.
+    """
+    text = "\n".join(code)
+    attrs: List[str] = []
+    pos = 0
+    if text.startswith("#!") and not text[2:].lstrip(" \t\r").startswith("["):
+        nl = text.find("\n")
+        pos = len(text) if nl < 0 else nl
+    while True:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if not text.startswith("#!", pos):
+            return attrs
+        open_at = pos + 2
+        while open_at < len(text) and text[open_at].isspace():
+            open_at += 1
+        if open_at >= len(text) or text[open_at] != "[":
+            return attrs
+        depth = 0
+        end = None
+        for k in range(open_at, len(text)):
+            if text[k] == "[":
+                depth += 1
+            elif text[k] == "]":
+                depth -= 1
+                if depth == 0:
+                    end = k
+                    break
+        if end is None:
+            return attrs
+        attrs.append(text[pos:end + 1].replace("\n", " "))
+        pos = end + 1
+
+
 def cfg_test_spans(
     source: str, *, include_any_test: bool = False,
 ) -> List[Tuple[int, int]]:
@@ -339,10 +380,13 @@ def cfg_test_spans(
     spans: List[Tuple[int, int]] = []
 
     # `#![cfg(test)]` is an INNER attribute: it gates the whole enclosing
-    # module, i.e. this entire file.
-    for i, line in enumerate(code):
-        if _INNER_CFG_ATTR_RE.search(line) and _predicate_mentions_test_only(
-            code, i, include_any_test=include_any_test,
+    # module. Only one that precedes the file's first item gates THIS file;
+    # inside an inline `mod x { #![cfg(test)] ... }` it gates that module only
+    # and is not a whole-file span (v0.2.102 W6-LOWS, R3 C-4; MUST MATCH
+    # `is_whole_file_test_cfg` in launcher/src-tauri/tests/support/mod.rs).
+    for attr in _leading_inner_attrs(code):
+        if _INNER_CFG_ATTR_RE.match(attr) and _predicate_mentions_test_only(
+            [attr], 0, include_any_test=include_any_test,
         ):
             return [(1, len(raw))]
 

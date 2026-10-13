@@ -442,7 +442,10 @@ Do NOT 'vct set' it blindly — that risks a second, divergent copy on disk."
 # re-enables the exact hazard. A false positive has a real remedy that keeps
 # the guard intact — pick a name that is not credential-shaped (names are
 # arbitrary; prefix it) — and the error message says so.
-_VCT_CREDENTIAL_NAME_SHAPES="$_CSHAPES_ARGV_NAME_RE"
+# The name carries no CRED / KEY / TOKEN / SECRET / PASS stem: bash_security's
+# echo rules block echoing any `$NAME` that does (v0.2.102 W6-LOWS, R3 V-c;
+# pinned by tests/test_credential_shapes_parity.py `_SHELL_NAME_FILES`).
+_VCT_CSHAPES_ARGV_NAME_RE="$_CSHAPES_ARGV_NAME_RE"
 
 # The placeholder that stands in for a credential-shaped name in any message,
 # audit row or report. Never interpolate the name itself alongside it.
@@ -452,7 +455,7 @@ _VCT_REDACTED_NAME='<redacted:credential-shaped-name>'
 # credential, 1 otherwise. NEVER prints the input (not even truncated).
 # Pure predicate: no side effects, no logging, safe to call anywhere.
 is_credential_shaped_name() {
-    printf '%s' "${1:-}" | LC_ALL=C grep -qE "$_VCT_CREDENTIAL_NAME_SHAPES"
+    printf '%s' "${1:-}" | LC_ALL=C grep -qE "$_VCT_CSHAPES_ARGV_NAME_RE"
 }
 
 # redact_name NAME → echo NAME, or the fixed placeholder when NAME is

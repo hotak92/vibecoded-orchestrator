@@ -28,8 +28,10 @@ Decision (:func:`decide`), in order:
   pid — the success path leaves a claim naming a dead pid, W2R-06) → PROCEED
   (stale; the file is the launcher's to reap, never deleted here). "Different"
   is decided by the start token when the claim carries one: the pid's current
-  token differs from the recorded one. Only a two-line (legacy) claim, or one
-  whose token cannot be compared, falls back to the time rule — alive but
+  token differs from the recorded one. A ``wall:`` token gap in the "cannot
+  tell" band (over 1 s, under 3 s) keeps the holder alive. Only a two-line
+  (legacy) claim, or one whose token cannot be compared at all (different
+  kinds, process not inspectable), falls back to the time rule — alive but
   started AFTER the claim was written. That rule assumes the wall clock did
   not step between the claim and now: psutil derives a Linux start time from
   ``/proc/stat`` ``btime``, which the kernel recomputes from the current wall
@@ -347,22 +349,38 @@ def ancestors(pid: Optional[int] = None, *, parent_of: Callable[[int], Optional[
     return chain
 
 
-def same_instance(pid: int, recorded: str) -> Optional[bool]:
+#: :func:`same_instance`'s answer when the tokens WERE compared but landed in
+#: the "cannot tell" band (``deferral_probes.IDENTITY_BAND``): :func:`decide`
+#: keeps such a holder alive and never applies the start-time rule to it
+#: (v0.2.102 W6-LOWS, R3 C-3).
+IDENTITY_CANNOT_TELL = "cannot_tell"
+
+
+def same_instance(pid: int, recorded: str) -> "bool | str | None":
     """Is *pid* still the process whose start token was *recorded*? The ONE
-    comparison home is :func:`vco_lib.deferral_probes.process_identity_matches`
+    comparison home is :func:`vco_lib.deferral_probes.process_identity_verdict`
     (imported lazily: that module is heavy, and this guard runs before the
-    venv relaunch). ``None`` = cannot tell."""
+    venv relaunch). ``True`` = same, ``False`` = reused,
+    :data:`IDENTITY_CANNOT_TELL` = compared but in the cannot-tell band,
+    ``None`` = no comparison was possible."""
     try:
-        from vco_lib.deferral_probes import process_identity_matches
-    except Exception:  # noqa: BLE001 — cannot tell → the caller's fallback
+        from vco_lib import deferral_probes as dp
+    except Exception:  # noqa: BLE001 — cannot compare → the caller's fallback
         return None
-    return process_identity_matches(pid, recorded)
+    verdict = dp.process_identity_verdict(pid, recorded)
+    if verdict == dp.IDENTITY_SAME:
+        return True
+    if verdict == dp.IDENTITY_REUSED:
+        return False
+    if verdict == dp.IDENTITY_BAND:
+        return IDENTITY_CANNOT_TELL
+    return None
 
 
 def decide(claim: Optional[Claim], *, alive: Callable[[int], Optional[bool]] = pid_alive,
            started: Callable[[int], Optional[float]] = process_start_time,
            lineage: Callable[[], Optional[list]] = ancestors,
-           identity: Callable[[int, str], Optional[bool]] = same_instance) -> Decision:
+           identity: Callable[[int, str], "bool | str | None"] = same_instance) -> Decision:
     """Pure over its probes — see the module docstring for the rule."""
     if claim is None:
         return Decision(PROCEED, "no update claim")
@@ -370,7 +388,7 @@ def decide(claim: Optional[Claim], *, alive: Callable[[int], Optional[bool]] = p
     if is_alive is False:
         return Decision(PROCEED, f"stale claim (pid {claim.pid} is not running)")
     reused = f"stale claim (pid {claim.pid} was reused by a newer process)"
-    same: Optional[bool] = None
+    same: "bool | str | None" = None
     if is_alive is True and claim.start_token:
         same = identity(claim.pid, claim.start_token)
         if same is False:
@@ -378,6 +396,8 @@ def decide(claim: Optional[Claim], *, alive: Callable[[int], Optional[bool]] = p
     if is_alive is True and same is None and claim.claimed_at is not None:
         # Legacy two-line claim, or a token that cannot be compared: the
         # wall-clock rule (see the module docstring for its clock caveat).
+        # A token compared into the cannot-tell band (IDENTITY_CANNOT_TELL)
+        # never gets here: that holder stays alive.
         began = started(claim.pid)
         if began is not None and began > claim.claimed_at + _START_SLACK_S:
             return Decision(PROCEED, reused)

@@ -314,12 +314,62 @@ pub fn test_or_debug_gated_lines(stripped: &[String]) -> Vec<bool> {
 }
 
 /// A file-level `#![cfg(test)]` makes the WHOLE file test code (the Python
-/// helper returns a whole-file span for the same attribute).
+/// helper `tests/common/rust_source.py::cfg_test_spans` returns a whole-file
+/// span for the same attribute). It is file-level only BEFORE the file's first
+/// item: only whitespace (comments are already stripped) and other inner
+/// attributes may precede it. The same attribute inside an inline
+/// `mod x { #![cfg(test)] ... }` gates that module, not the file, and must
+/// not blank the production code around it (v0.2.102 W6-LOWS, R3 C-4).
 fn is_whole_file_test_cfg(stripped: &[String]) -> bool {
-    stripped.iter().any(|l| {
-        l.replace(char::is_whitespace, "")
-            .starts_with("#![cfg(test)]")
-    })
+    let text: Vec<char> = stripped.join("\n").chars().collect();
+    let mut pos = 0usize;
+    // A shebang on the very first line (`#!` not opening `[`) is skipped by
+    // the Rust lexer, so an inner attribute after it is still file-level.
+    if text.len() >= 2 && text[0] == '#' && text[1] == '!' {
+        let mut k = 2;
+        while k < text.len() && text[k].is_whitespace() && text[k] != '\n' {
+            k += 1;
+        }
+        if k >= text.len() || text[k] != '[' {
+            pos = text.iter().position(|c| *c == '\n').unwrap_or(text.len());
+        }
+    }
+    loop {
+        while pos < text.len() && text[pos].is_whitespace() {
+            pos += 1;
+        }
+        if pos + 1 >= text.len() || text[pos] != '#' || text[pos + 1] != '!' {
+            return false; // EOF, or the first item
+        }
+        let mut open = pos + 2;
+        while open < text.len() && text[open].is_whitespace() {
+            open += 1;
+        }
+        if open >= text.len() || text[open] != '[' {
+            return false; // `#!` not opening an inner attribute
+        }
+        let mut depth = 0i64;
+        let mut end = None;
+        for (k, c) in text.iter().enumerate().skip(open) {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { return false };
+        let attr: String = text[pos..=end].iter().filter(|c| !c.is_whitespace()).collect();
+        if attr == "#![cfg(test)]" {
+            return true;
+        }
+        pos = end + 1;
+    }
 }
 
 fn gated_lines_by(stripped: &[String], is_gate: fn(&str) -> bool) -> Vec<bool> {

@@ -203,12 +203,17 @@ function Remove-WtrecStale([string]$root) {
 # recursive: a directory still holding another lane's worktree or any stray
 # file is left exactly as it is, and only that exact directory is touched.
 # Must match _wtrec_rmdir_lanes_parent in the .sh sibling.
+# Both paths are normalised lexically FIRST (GetFullPath: `.`, `..`, repeated
+# separators; TrimEnd: trailing ones), then the parent is taken, so a trailing
+# `/.` or `sub/..` in the recorded path counts the same as in the .sh
+# (_wtrec_lexnorm; v0.2.102 W6-LOWS, R3 AA-5).
 function Remove-WtrecLanesParent([string]$top, [string]$path) {
     try {
-        $parent = Split-Path -Parent $path
-        $lanes = Join-Path (Split-Path -Parent $top) ((Split-Path -Leaf $top) + ".vco-lanes")
         $norm = { param($p) [System.IO.Path]::GetFullPath($p).TrimEnd('\', '/') }
-        if ((& $norm $parent) -ne (& $norm $lanes)) { return }
+        $t = & $norm $top
+        $parent = Split-Path -Parent (& $norm $path)
+        $lanes = & $norm (Join-Path (Split-Path -Parent $t) ((Split-Path -Leaf $t) + ".vco-lanes"))
+        if ((& $norm $parent) -ne $lanes) { return }
         $item = Get-Item -LiteralPath $lanes -Force -ErrorAction Stop
         if (-not $item.PSIsContainer) { return }
         if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }

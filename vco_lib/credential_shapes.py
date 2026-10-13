@@ -335,9 +335,17 @@ _GENERIC_BACKTICK_VALUE = "`([^`$]|\\$[^`{])+\\$?`"
 #:
 #: YAML booleans are syntax too (W6-V review R2 V-2): ``yes`` / ``no`` /
 #: ``true`` / ``false`` / ``on`` / ``off`` are silent, in any letter case like
-#: ``null``, when the word ends the value or is followed by a space (so
-#: ``false # disabled`` is silent, ``offset`` / ``no-reply`` / ``yesterday``
-#: alert). Choice: the YAML 1.1 boolean words that real loaders resolve
+#: ``null``, when the word ends the value or is followed by a space or a TAB
+#: (so ``false # disabled`` and ``no<TAB># note`` are silent, ``offset`` /
+#: ``no-reply`` / ``yesterday`` alert; the TAB end and a TAB between the
+#: separator and the value were added in v0.2.102 W6-LOWS, R3 V-a).
+#:
+#: "Any letter case" is a deliberate over-acceptance (R3 V-b): PyYAML's 1.1
+#: resolver only reads ``true`` / ``True`` / ``TRUE`` (and the same three
+#: spellings of the other words) as booleans, so a mixed-case ``tRuE`` or
+#: ``nO`` is a plain STRING to a loader, yet it stays silent here. Accepted:
+#: nobody writes a password as a mixed-case boolean word, and an exact-case
+#: trie would triple every arm in all three mirrors for no real catch. Choice: the YAML 1.1 boolean words that real loaders resolve
 #: (PyYAML's 1.1 resolver set) but NOT the single letters ``y`` / ``n`` /
 #: ``Y`` / ``N`` -- the 1.1 spec lists them, PyYAML does not resolve them and
 #: YAML 1.2 makes them plain strings, so ``password: y`` stays a literal and
@@ -348,15 +356,20 @@ _GENERIC_BACKTICK_VALUE = "`([^`$]|\\$[^`{])+\\$?`"
 #: grep -E has no lookahead, so the words are excluded as a trie of
 #: "differs at this letter" arms; the first-character class excludes their
 #: initials (n t f y o) and each arm re-admits a value that leaves the trie.
+#:
+#: The ``\t`` below is a LITERAL TAB character in the pattern text (a Python
+#: string escape), not the regex escape: grep -E reads a backslash inside a
+#: bracket expression as a backslash, so the .sh and .ps1 mirrors carry a real
+#: TAB at the same spots (the string-identity parity test pins it).
 _GENERIC_YAML_VALUE = (
-    "([^\"'$`~*{\\[nNtTfFyYoO #]"
-    "|[nN]($|[^uUoO])|[nN][oO][^ ]"
-    "|[nN][uU]($|[^lL])|[nN][uU][lL]($|[^lL])|[nN][uU][lL][lL][^ ]"
-    "|[tT]($|[^rR])|[tT][rR]($|[^uU])|[tT][rR][uU]($|[^eE])|[tT][rR][uU][eE][^ ]"
+    "([^\"'$`~*{\\[nNtTfFyYoO \t#]"
+    "|[nN]($|[^uUoO])|[nN][oO][^ \t]"
+    "|[nN][uU]($|[^lL])|[nN][uU][lL]($|[^lL])|[nN][uU][lL][lL][^ \t]"
+    "|[tT]($|[^rR])|[tT][rR]($|[^uU])|[tT][rR][uU]($|[^eE])|[tT][rR][uU][eE][^ \t]"
     "|[fF]($|[^aA])|[fF][aA]($|[^lL])|[fF][aA][lL]($|[^sS])"
-    "|[fF][aA][lL][sS]($|[^eE])|[fF][aA][lL][sS][eE][^ ]"
-    "|[yY]($|[^eE])|[yY][eE]($|[^sS])|[yY][eE][sS][^ ]"
-    "|[oO]($|[^nNfF])|[oO][nN][^ ]|[oO][fF]($|[^fF])|[oO][fF][fF][^ ])"
+    "|[fF][aA][lL][sS]($|[^eE])|[fF][aA][lL][sS][eE][^ \t]"
+    "|[yY]($|[^eE])|[yY][eE]($|[^sS])|[yY][eE][sS][^ \t]"
+    "|[oO]($|[^nNfF])|[oO][nN][^ \t]|[oO][fF]($|[^fF])|[oO][fF][fF][^ \t])"
 )
 
 # ---------------------------------------------------------------------------

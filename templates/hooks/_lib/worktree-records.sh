@@ -270,12 +270,41 @@ for n in os.listdir(d):
 # rmdir only: never recursive, so a directory still holding another lane's
 # worktree or any stray file is left exactly as it is. Only that exact
 # directory is ever touched. MUST MATCH Remove-WtrecLanesParent in the .ps1.
+# Both paths are normalised LEXICALLY first (_wtrec_lexnorm: `.`, `..`,
+# repeated and trailing separators; no symlink resolution), the same way the
+# .ps1 normalises them with GetFullPath + TrimEnd (v0.2.102 W6-LOWS, R3 AA-5).
 _wtrec_rmdir_lanes_parent() {
     local top="$1" path="$2" parent lanes
+    [ -n "$top" ] && [ -n "$path" ] || return 0
+    top="$(_wtrec_lexnorm "$top")"
+    path="$(_wtrec_lexnorm "$path")"
     parent="$(dirname "$path")"
     lanes="$(dirname "$top")/$(basename "$top").vco-lanes"
+    lanes="$(_wtrec_lexnorm "$lanes")"
     [ "$parent" = "$lanes" ] || return 0
     rmdir "$lanes" 2>/dev/null || true
+}
+
+# _wtrec_lexnorm PATH — print PATH made absolute (against $PWD) and normalised
+# lexically: empty and `.` segments dropped, `..` pops the previous segment
+# (never above `/`), no trailing separator. Like .NET's GetFullPath on POSIX,
+# it does NOT resolve symlinks. MUST MATCH the $norm block of
+# Remove-WtrecLanesParent in the .ps1.
+_wtrec_lexnorm() {
+    local p="$1" rest seg
+    local -a stack=()
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    rest="$p"
+    while [ -n "$rest" ]; do
+        seg="${rest%%/*}"
+        if [ "$seg" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+        case "$seg" in
+            ''|.) ;;
+            ..) [ "${#stack[@]}" -gt 0 ] && unset "stack[$(( ${#stack[@]} - 1 ))]" ;;
+            *) stack+=("$seg") ;;
+        esac
+    done
+    if [ "${#stack[@]}" -eq 0 ]; then printf '/\n'; else printf '/%s' "${stack[@]}"; printf '\n'; fi
 }
 
 # wtrec_reap PROJECT_ROOT AGENT_ID — remove the agent's worktree when it is

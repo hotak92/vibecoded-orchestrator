@@ -23,7 +23,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
 import pytest
 
@@ -249,9 +249,138 @@ def test_ps1_resolves_symlinks_like_the_ssot(via, tmp_path):
     assert py.returncode == 0, py.stderr
     script = (f". '{PS1_LIB}'; $r = Find-VcoProjectRoot -Start '{start}'; "
               "[Console]::Out.WriteLine($r)")
-    ps = subprocess.run([PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", script],
+    ps = subprocess.run([cast(str, PWSH), *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", script],
                         env=child_env(env), capture_output=True, text=True, timeout=60, cwd=sb)
     assert ps.returncode == 0, ps.stderr
     expected = "" if want is None else os.path.realpath(want)
     assert py.stdout.strip() == expected
     assert ps.stdout.strip() == expected, f"ps1 got {ps.stdout.strip()!r}"
+
+
+# ── v0.2.102 W6-LOWS (R3 C-1 / C-2): Resolve-VcoPrRealPath segment semantics ──
+#
+# C-1: `..` means "parent of the ALREADY-RESOLVED path", as in Python's
+# Path.resolve() and the .sh's `cd -P`, never a lexical collapse done before
+# the links are resolved. With `deep -> real/proj`, `deep/../x` is
+# `real/x`, not `x`. The same holds for a `..` inside a relative link TARGET.
+# C-2: only a symbolic link or junction (or a ReparsePoint item) has a target;
+# a hard-linked FILE's other names are never followed.
+
+def _realpath_layout(sb: Path) -> None:
+    (sb / "real" / "proj" / "inner").mkdir(parents=True)
+    (sb / "real" / "x").mkdir()
+    (sb / "x").mkdir()
+    (sb / "deep").symlink_to(sb / "real" / "proj", target_is_directory=True)
+    # A relative target whose `..` follows another link: Python resolves
+    # `deep` first (-> real/proj), then `..` (-> real), then `inner`.
+    (sb / "rel").symlink_to(Path("deep") / ".." / "proj" / "inner", target_is_directory=True)
+    (sb / "f").write_text("x\n", encoding="utf-8")
+    os.link(sb / "f", sb / "g")
+
+
+_REALPATH_CASES = [
+    pytest.param("deep/../x", id="link-dotdot-x"),
+    pytest.param("deep/..", id="link-dotdot"),
+    pytest.param("deep/inner/../../x", id="link-two-dotdots"),
+    pytest.param("rel", id="relative-target-with-dotdot"),
+    pytest.param("rel/..", id="relative-target-then-dotdot"),
+    pytest.param("x/./../real//proj/", id="plain-lexical"),
+    pytest.param("deep/../missing/y", id="link-dotdot-missing-tail"),
+    pytest.param("f", id="hardlinked-file-not-followed"),
+    pytest.param("g", id="hardlinked-file-other-name"),
+]
+
+
+@pytest.mark.skipif(PWSH is None, reason="pwsh not on PATH")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("rel", _REALPATH_CASES)
+def test_ps1_realpath_resolves_dotdot_after_links(rel, tmp_path):
+    sb = tmp_path / "sb"
+    sb.mkdir()
+    _realpath_layout(sb)
+    raw = f"{sb}/{rel}"
+    want = str(Path(raw).resolve())
+    assert PWSH is not None
+    script = f". '{PS1_LIB}'; [Console]::Out.WriteLine((Resolve-VcoPrRealPath $env:W6_RAW))"
+    ps = subprocess.run([PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", script],
+                        env=child_env(dict(os.environ, W6_RAW=raw)),
+                        capture_output=True, text=True, timeout=60, cwd=sb)
+    assert ps.returncode == 0, ps.stderr
+    assert ps.stdout.strip() == want, f"ps1 {rel!r}: got {ps.stdout.strip()!r}, Path.resolve() {want!r}"
+    # The .sh resolves through `cd -P`, which needs an existing directory.
+    if os.path.isdir(raw) and BASH is not None:
+        sh = subprocess.run([BASH, "-c", f'. "{SH_LIB}"; _vco_pr_phys "$1"', "_", raw],
+                            capture_output=True, text=True, timeout=60, cwd=sb)
+        assert sh.returncode == 0, sh.stderr
+        assert sh.stdout.strip() == want, f"sh {rel!r}: got {sh.stdout.strip()!r}"
+
+
+@pytest.mark.skipif(PWSH is None, reason="pwsh not on PATH")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_ps1_walk_from_link_dotdot_start_matches_ssot(tmp_path):
+    """Find-VcoProjectRoot from `deep/../a` (deep -> real/proj) walks from
+    `real/a`, finding the marker at `real`, exactly like the Python SSOT (the
+    lexical `sb/a` does not exist, so a lexical collapse finds nothing)."""
+    sb = tmp_path / "sb"
+    (sb / "real" / ".claude").mkdir(parents=True)
+    (sb / "real" / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+    (sb / "real" / "proj").mkdir()
+    (sb / "real" / "a").mkdir()
+    # No lexical `sb/a`: only the physical reading of `deep/../a` exists.
+    (sb / "home").mkdir()
+    (sb / "deep").symlink_to(sb / "real" / "proj", target_is_directory=True)
+    start = f"{sb}/deep/../a"
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CLAUDE_PROJECT_DIR", "VCT_USER_HOME_OVERRIDE", "HOME", "USERPROFILE")}
+    env["HOME"] = str(sb / "home")
+    code = ("import sys\nfrom vco_lib.project_root import find_vco_project_root as f\n"
+            "x = f(sys.argv[1])\nprint('' if x is None else x)\n")
+    py = subprocess.run([sys.executable, "-c", code, start], env=child_env(env),
+                        capture_output=True, text=True, timeout=60, cwd=sb)
+    assert py.returncode == 0, py.stderr
+    assert PWSH is not None
+    script = f". '{PS1_LIB}'; [Console]::Out.WriteLine((Find-VcoProjectRoot -Start $env:W6_START))"
+    ps = subprocess.run([PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", script],
+                        env=child_env(dict(env, W6_START=start)),
+                        capture_output=True, text=True, timeout=60, cwd=sb)
+    assert ps.returncode == 0, ps.stderr
+    expected = os.path.realpath(sb / "real")
+    assert py.stdout.strip() == expected
+    assert ps.stdout.strip() == expected, f"ps1 got {ps.stdout.strip()!r}"
+
+
+_LINK_TARGET_CASES = [
+    # (LinkType, Attributes, LinkTarget, Target, expected)
+    pytest.param("HardLink", "Archive", None, "/elsewhere/g", "", id="hardlink-target-ignored"),
+    pytest.param("HardLink", "Archive", "/elsewhere/g", "/elsewhere/g", "", id="hardlink-linktarget-ignored"),
+    pytest.param("", "Normal", None, "/elsewhere/g", "", id="plain-item-target-ignored"),
+    pytest.param("SymbolicLink", "Directory, ReparsePoint", "/real", None, "/real", id="symlink-linktarget"),
+    pytest.param("SymbolicLink", "Directory", None, "/real", "/real", id="symlink-51-target"),
+    pytest.param("Junction", "Directory, ReparsePoint", None, "C:/real", "C:/real", id="junction-51-target"),
+    pytest.param("", "Directory, ReparsePoint", "/real", None, "/real", id="reparsepoint-no-linktype"),
+]
+
+
+@pytest.mark.skipif(PWSH is None, reason="pwsh not on PATH")
+@pytest.mark.parametrize(("link_type", "attrs", "link_target", "target", "want"), _LINK_TARGET_CASES)
+def test_ps1_link_target_only_for_symlink_junction_or_reparse_point(
+        link_type, attrs, link_target, target, want, tmp_path):
+    """C-2: PowerShell's ``Target`` CodeProperty also lists a hard-linked
+    FILE's other names (Windows). Only a SymbolicLink / Junction, or an item
+    carrying the ReparsePoint attribute, may contribute a link target."""
+    assert PWSH is not None
+    script = (
+        f". '{PS1_LIB}'\n"
+        "$o = [pscustomobject]@{ LinkType = $env:W6_LT; "
+        "Attributes = [System.IO.FileAttributes]$env:W6_ATTR; "
+        "LinkTarget = $(if ($env:W6_LTGT) { $env:W6_LTGT } else { $null }); "
+        "Target = $(if ($env:W6_TGT) { @($env:W6_TGT) } else { $null }) }\n"
+        "$r = Get-VcoPrLinkTarget $o\n"
+        "[Console]::Out.WriteLine([string]$r)\n"
+    )
+    env = dict(os.environ, W6_LT=link_type, W6_ATTR=attrs,
+               W6_LTGT=link_target or "", W6_TGT=target or "")
+    ps = subprocess.run([PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", script],
+                        env=env, capture_output=True, text=True, timeout=60, cwd=tmp_path)
+    assert ps.returncode == 0, ps.stderr
+    assert ps.stdout.strip() == want

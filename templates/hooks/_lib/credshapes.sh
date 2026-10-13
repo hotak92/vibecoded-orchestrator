@@ -193,7 +193,10 @@ credshapes_for_context() {
                 "Hook leak-test marker"
             )
             # The generic-secret patterns contain a literal `$` and backtick on
-            # purpose (regex text, never expanded).
+            # purpose (regex text, never expanded). The YAML value pattern
+            # also holds LITERAL TAB characters, exactly like the SSOT text:
+            # grep -E reads backslash-t in brackets as two characters
+            # (v0.2.102 W6-LOWS V-a).
             # shellcheck disable=SC2016
             CSHAPES_PATTERNS=(
                 'gh[pousr]_[A-Za-z0-9]{36}'
@@ -208,7 +211,7 @@ credshapes_for_context() {
                 '(^|[^$A-Za-z0-9_{]|(^|[^$])\{)[A-Za-z0-9_.-]*([Ss][Ee][Cc][Rr][Ee][Tt]|[Aa][Pp][Ii]_[Kk][Ee][Yy]|[Aa][Cc][Cc][Ee][Ss][Ss]_[Tt][Oo][Kk][Ee][Nn]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee]_[Kk][Ee][Yy]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Pp][Ww][Dd]|[Pp][Aa][Ss][Ss][Pp][Hh][Rr][Aa][Ss][Ee])["'"'"']?\??\s*(:\s*&?('"'"'[A-Za-z_]+\s+)?[A-Za-z_][A-Za-z0-9_.:]*(<[A-Za-z0-9_., &'"'"'<>]*>|\[[A-Za-z0-9_., ]*\])?\s*|\s+[A-Za-z_][A-Za-z0-9_.]*\s*)?:?[:=]\s*([rRbBuUfF]{0,2}"""[^"${][^"]*"""|[rRbBuU]{0,2}'"'"''"'"''"'"'[^'"'"'][^'"'"']*'"'"''"'"''"'"'|[rRfF]{1,2}'"'"''"'"''"'"'[^'"'"'{][^'"'"']*'"'"''"'"''"'"'|[rRbBuUfF]{0,2}"[^"${][^"]*"|[rRbBuU]{0,2}'"'"'[^'"'"'][^'"'"']*'"'"'|[rRfF]{1,2}'"'"'[^'"'"'{][^'"'"']*'"'"')'
                 '(^|[^$A-Za-z0-9_{]|(^|[^$])\{)[A-Za-z0-9_.-]*([Ss][Ee][Cc][Rr][Ee][Tt]|[Aa][Pp][Ii]_[Kk][Ee][Yy]|[Aa][Cc][Cc][Ee][Ss][Ss]_[Tt][Oo][Kk][Ee][Nn]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee]_[Kk][Ee][Yy]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Pp][Ww][Dd]|[Pp][Aa][Ss][Ss][Pp][Hh][Rr][Aa][Ss][Ee])["'"'"']?\??\s*(:\s*&?('"'"'[A-Za-z_]+\s+)?[A-Za-z_][A-Za-z0-9_.:]*(<[A-Za-z0-9_., &'"'"'<>]*>|\[[A-Za-z0-9_., ]*\])?\s*|\s+[A-Za-z_][A-Za-z0-9_.]*\s*)?:?[:=]\s*`([^`$]|\$[^`{])+\$?`'
                 '(^|[^$A-Za-z0-9_{]|(^|[^$])\{)[A-Za-z0-9_.-]*([Ss][Ee][Cc][Rr][Ee][Tt]|[Aa][Pp][Ii]_[Kk][Ee][Yy]|[Aa][Cc][Cc][Ee][Ss][Ss]_[Tt][Oo][Kk][Ee][Nn]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee]_[Kk][Ee][Yy]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Pp][Ww][Dd]|[Pp][Aa][Ss][Ss][Pp][Hh][Rr][Aa][Ss][Ee])["'"'"']?\s*[:=]([^"'"'"'$` ]|\s+[^"'"'"'$`# ])|ENV\s+[A-Za-z0-9_]*([Ss][Ee][Cc][Rr][Ee][Tt]|[Aa][Pp][Ii]_[Kk][Ee][Yy]|[Aa][Cc][Cc][Ee][Ss][Ss]_[Tt][Oo][Kk][Ee][Nn]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee]_[Kk][Ee][Yy]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Pp][Ww][Dd]|[Pp][Aa][Ss][Ss][Pp][Hh][Rr][Aa][Ss][Ee])\s+["'"'"']?[^"'"'"'$`# ]'
-                '(^|[^$A-Za-z0-9_{]|(^|[^$])\{)[A-Za-z0-9_.-]*([Ss][Ee][Cc][Rr][Ee][Tt]|[Aa][Pp][Ii]_[Kk][Ee][Yy]|[Aa][Cc][Cc][Ee][Ss][Ss]_[Tt][Oo][Kk][Ee][Nn]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee]_[Kk][Ee][Yy]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Pp][Ww][Dd]|[Pp][Aa][Ss][Ss][Pp][Hh][Rr][Aa][Ss][Ee])["'"'"']?\s*[:=]\s*([^"'"'"'$`~*{\[nNtTfFyYoO #]|[nN]($|[^uUoO])|[nN][oO][^ ]|[nN][uU]($|[^lL])|[nN][uU][lL]($|[^lL])|[nN][uU][lL][lL][^ ]|[tT]($|[^rR])|[tT][rR]($|[^uU])|[tT][rR][uU]($|[^eE])|[tT][rR][uU][eE][^ ]|[fF]($|[^aA])|[fF][aA]($|[^lL])|[fF][aA][lL]($|[^sS])|[fF][aA][lL][sS]($|[^eE])|[fF][aA][lL][sS][eE][^ ]|[yY]($|[^eE])|[yY][eE]($|[^sS])|[yY][eE][sS][^ ]|[oO]($|[^nNfF])|[oO][nN][^ ]|[oO][fF]($|[^fF])|[oO][fF][fF][^ ])'
+                '(^|[^$A-Za-z0-9_{]|(^|[^$])\{)[A-Za-z0-9_.-]*([Ss][Ee][Cc][Rr][Ee][Tt]|[Aa][Pp][Ii]_[Kk][Ee][Yy]|[Aa][Cc][Cc][Ee][Ss][Ss]_[Tt][Oo][Kk][Ee][Nn]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee]_[Kk][Ee][Yy]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Pp][Ww][Dd]|[Pp][Aa][Ss][Ss][Pp][Hh][Rr][Aa][Ss][Ee])["'"'"']?\s*[:=]\s*([^"'"'"'$`~*{\[nNtTfFyYoO 	#]|[nN]($|[^uUoO])|[nN][oO][^ 	]|[nN][uU]($|[^lL])|[nN][uU][lL]($|[^lL])|[nN][uU][lL][lL][^ 	]|[tT]($|[^rR])|[tT][rR]($|[^uU])|[tT][rR][uU]($|[^eE])|[tT][rR][uU][eE][^ 	]|[fF]($|[^aA])|[fF][aA]($|[^lL])|[fF][aA][lL]($|[^sS])|[fF][aA][lL][sS]($|[^eE])|[fF][aA][lL][sS][eE][^ 	]|[yY]($|[^eE])|[yY][eE]($|[^sS])|[yY][eE][sS][^ 	]|[oO]($|[^nNfF])|[oO][nN][^ 	]|[oO][fF]($|[^fF])|[oO][fF][fF][^ 	])'
                 'VCT_HOOK_LEAK_PROBE_a3f7c2'
             )
             ;;
