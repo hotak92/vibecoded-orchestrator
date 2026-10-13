@@ -36,6 +36,7 @@ import pytest
 
 from claude_mcp_servers.rl_client import answer_window as aw
 from claude_mcp_servers.rl_client import search_pipeline
+from claude_mcp_servers.weaviate_mcp import rl_state
 
 # Present only on the fixed code; the red-proof assertions below do not depend
 # on them (they fall back to identity so the OLD code fails on the behaviour,
@@ -337,8 +338,11 @@ def test_monitor_transcript_parse_runs_off_the_event_loop(tmp_path, monkeypatch)
 
 
 def test_cache_is_thread_safe_under_concurrent_appends(tmp_path):
-    """The loader now runs in worker threads: concurrent callers during
-    appends must never corrupt the entry (final state == full parse)."""
+    """Smoke check, not the lock proof: concurrent callers during appends must
+    never corrupt the entry (final state == full parse). This stays green even
+    with the locks removed — the entry is popped out of the dict before it is
+    extended — so the per-path lock's real guarantee (one shared parse) is
+    pinned by ``test_concurrent_first_load_of_one_transcript_parses_it_once``."""
     p = tmp_path / "t.jsonl"
     p.write_bytes(_lines(_session(5)))
     errors: list[BaseException] = []
@@ -360,6 +364,176 @@ def test_cache_is_thread_safe_under_concurrent_appends(tmp_path):
         t.join()
     assert not errors
     assert aw.load_messages_cached(p) == _expected(p)
+
+
+def _slow_read_appended(monkeypatch, delay: float, only: "str | None" = None,
+                        started: "threading.Event | None" = None):
+    """Wrap ``aw._read_appended`` with a sleep (optionally for one path only)."""
+    real = aw._read_appended
+
+    def _slow(entry, fh, start):
+        if only is None or fh.name == only:
+            if started is not None:
+                started.set()
+            time.sleep(delay)
+        return real(entry, fh, start)
+
+    monkeypatch.setattr(aw, "_read_appended", _slow)
+
+
+def test_concurrent_first_load_of_one_transcript_parses_it_once(tmp_path, monkeypatch):
+    """R3 M1: two threads asking for the same not-yet-cached transcript at once
+    share ONE parse — the per-path lock makes the second wait and then find the
+    entry current. json.loads count == number of lines. RED without the lock
+    (each thread pops nothing, builds its own entry, parses every line: 2x)."""
+    p = tmp_path / "t.jsonl"
+    p.write_bytes(_lines(_session(6)))
+    n_lines = len(p.read_bytes().splitlines())
+    expected = _expected(p)
+    _slow_read_appended(monkeypatch, 0.2)
+    counter = _LoadsCounter()
+    monkeypatch.setattr(aw._json, "loads", counter)
+    results: list = []
+    barrier = threading.Barrier(2)
+
+    def _reader():
+        barrier.wait()
+        results.append(aw.load_messages_cached(p))
+
+    threads = [threading.Thread(target=_reader) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert counter.n == n_lines, f"{counter.n} parses for {n_lines} lines (expected one parse)"
+    assert results[0] == expected and results[1] == expected
+    assert aw._PATH_LOCKS == {}, "per-path lock table must empty once no caller is in flight"
+
+
+def test_slow_parse_of_one_transcript_does_not_block_another(tmp_path, monkeypatch):
+    """R3 M2: a slow first parse of transcript A must not delay a load of B.
+    RED with one global lock held across the parse (the pre-R3 shape): B waits
+    the whole of A's parse."""
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    a.write_bytes(_lines(_session(4)))
+    b.write_bytes(_lines(_session(4, query="other")))
+    started = threading.Event()
+    _slow_read_appended(monkeypatch, 1.0, only=str(a), started=started)
+    a_done = threading.Event()
+
+    def _load_a():
+        aw.load_messages_cached(a)
+        a_done.set()
+
+    t = threading.Thread(target=_load_a)
+    t.start()
+    assert started.wait(5), "A's parse never started"
+    t0 = time.monotonic()
+    got_b = aw.load_messages_cached(b)
+    elapsed = time.monotonic() - t0
+    a_finished_first = a_done.is_set()
+    t.join()
+    assert got_b == _expected(b)
+    assert not a_finished_first and elapsed < 0.5, (
+        f"load of B waited {elapsed:.2f} s behind A's slow parse"
+    )
+
+
+def test_cached_loader_returns_a_list_the_caller_owns(tmp_path):
+    """R3 M3: the result is never the cached list itself, with or without a
+    partial tail — a later append must not change a list already returned."""
+    p = tmp_path / "t.jsonl"
+    p.write_bytes(_lines(_session(2)))
+    first = aw.load_messages_cached(p)
+    n = len(first)
+    assert first is not aw._MESSAGE_CACHE[str(p)].messages
+    with open(p, "ab") as fh:
+        fh.write(_lines(_session(1, start=500, query="later")))
+    second = aw.load_messages_cached(p)
+    assert len(first) == n, "an earlier result grew in place"
+    assert len(second) > n and second == _expected(p)
+
+
+def test_monitor_scans_never_occupy_the_default_executor(tmp_path, monkeypatch):
+    """R3 M2: while a monitor's slow transcript scan runs, an
+    ``asyncio.to_thread`` call (what the embedding path uses) still gets the
+    default executor at once. The default executor here has ONE worker, so the
+    pre-R3 monitor (scan via ``asyncio.to_thread``) holds it for the whole scan
+    and the probe waits: RED."""
+    import concurrent.futures
+
+    import claude_mcp_servers.weaviate_mcp.rl_enrichment as rlmod
+    import claude_mcp_servers.weaviate_mcp.server as srv
+
+    p = tmp_path / "sess.jsonl"
+    p.write_bytes(_lines(_session(1)))
+    scan_started = threading.Event()
+    scan_threads: list[str] = []
+
+    def _slow_load(path):
+        scan_threads.append(threading.current_thread().name)
+        scan_started.set()
+        time.sleep(0.6)
+        return aw.load_messages_cached(path)
+
+    async def _fake_find_all():
+        return [p]
+
+    async def _main():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        mon = asyncio.create_task(rlmod._rl_answer_monitor("tid-pool", 1, "alpha 0"))
+        while not scan_started.is_set():
+            await asyncio.sleep(0.005)
+        t0 = time.monotonic()
+        await asyncio.to_thread(lambda: None)
+        probe = time.monotonic() - t0
+        await mon
+        return probe
+
+    monkeypatch.setattr(srv, "_RL_MONITOR_POLL_INTERVAL", 0.005, raising=False)
+    monkeypatch.setattr(srv, "_RL_MONITOR_TIMEOUT", 0.7, raising=False)
+    with patch.object(srv, "_rl_find_all_transcripts", _fake_find_all), \
+         patch.object(srv, "_rl_load_messages", _slow_load), \
+         patch.object(srv, "_rl_check_force_flush", return_value=False), \
+         patch.object(srv, "_rl_node_content_cache", {}):
+        probe = _run(_main())
+
+    assert scan_threads and all(n.startswith("vco-rl-scan") for n in scan_threads), scan_threads
+    assert probe < 0.3, f"to_thread waited {probe:.2f} s behind a monitor scan"
+
+
+def test_monitors_on_one_transcript_leave_a_scan_worker_for_another(tmp_path, monkeypatch):
+    """R3 M2: two monitors scanning transcript A take turns in the event loop,
+    so the second scan worker stays free for transcript B. RED without the
+    per-path gate: A's two scans fill both workers and B starts only after one
+    of them ends."""
+    import claude_mcp_servers.weaviate_mcp.rl_enrichment as rlmod
+
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    starts: dict[str, list[float]] = {"a": [], "b": []}
+    ends: dict[str, list[float]] = {"a": [], "b": []}
+
+    def _fake_scan(candidate, query_snippet, pos_idx):
+        name = Path(candidate).stem
+        starts[name].append(time.monotonic())
+        time.sleep(0.4 if name == "a" else 0.01)
+        ends[name].append(time.monotonic())
+        return None
+
+    async def _main():
+        ta1 = asyncio.create_task(rlmod._rl_scan_off_loop(a, "q", 0))
+        ta2 = asyncio.create_task(rlmod._rl_scan_off_loop(a, "q", 0))
+        await asyncio.sleep(0.05)
+        tb = asyncio.create_task(rlmod._rl_scan_off_loop(b, "q", 0))
+        await asyncio.gather(ta1, ta2, tb)
+
+    monkeypatch.setattr(rlmod, "_rl_scan_candidate", _fake_scan)
+    _run(_main())
+    assert len(starts["a"]) == 2 and len(starts["b"]) == 1
+    assert ends["b"][0] < min(ends["a"]), "B's scan waited for a worker held by A"
+    assert sorted(starts["a"])[1] >= min(ends["a"]), "A's two scans overlapped"
+    assert rlmod._rl_scan_gates == {}
 
 
 # ======================================================================
@@ -472,12 +646,12 @@ def test_citation_cache_byte_cap_evicts_oldest_keeps_newest(tmp_path, monkeypatc
     monkeypatch.setenv("VCO_RL_NODE_CACHE_MAX_BYTES", "60000")  # ≈ 1.5 entries
     cands = _ctx(dim=1024, n_nodes=2)["nodes"]
     with patch.object(srv, "_rl_node_content_cache", {}), \
-         patch.object(srv, "_rl_node_content_cache_sizes", {}, create=True):
+         patch.object(rl_state, "_rl_node_content_cache_sizes", {}):
         for k in range(4):
             _populate(f"tid-{k}", cands, _f32([0.1] * 1024))
         keys = list(srv._rl_node_content_cache)
         assert keys == ["tid-3"], keys
-        assert set(srv._rl_node_content_cache_sizes) == {"tid-3"}
+        assert set(rl_state._rl_node_content_cache_sizes) == {"tid-3"}
     # Evicted entries are not lost: every search staged its pending file.
     from claude_mcp_servers.rl_client.citation_pending import list_pending_for_session
     assert len(list_pending_for_session("sess-w6mem", tmp_path)) == 4
@@ -490,7 +664,7 @@ def test_citation_cache_byte_cap_leaves_entries_alone_under_the_cap(tmp_path, mo
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
     cands = _ctx(dim=1024, n_nodes=2)["nodes"]
     with patch.object(srv, "_rl_node_content_cache", {}), \
-         patch.object(srv, "_rl_node_content_cache_sizes", {}, create=True):
+         patch.object(rl_state, "_rl_node_content_cache_sizes", {}):
         for k in range(4):
             _populate(f"tid-{k}", cands, _f32([0.1] * 1024))
         assert list(srv._rl_node_content_cache) == [f"tid-{k}" for k in range(4)]

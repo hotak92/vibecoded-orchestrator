@@ -1006,31 +1006,39 @@ def _store_compact_ctx(srv: Any, task_id: str, ctx_dict: dict) -> None:
     is bounded by estimated BYTES (``memory_bounds.node_cache_max_bytes``) as
     well as by ``_RL_NODE_CACHE_MAX`` entries. Oldest entries are evicted first;
     the entry just stored is never evicted (a single oversized ctx still serves
-    its own monitor). Entry sizes are recomputed per store — at most a few
-    hundred dict lookups plus one size estimate per new entry (the per-key
-    sizes live in ``rl_state._rl_node_content_cache_sizes``).
+    its own monitor).
+
+    The per-key sizes live in ONE home, ``rl_state._rl_node_content_cache_sizes``
+    (W6-MEM R3: read there directly, no local fallback). Every writer keeps it
+    in step — this function on store and eviction, the monitor on its pop at
+    fire time — so a store costs one size estimate (the new entry) plus one
+    pass of dict lookups over the at most ``_RL_NODE_CACHE_MAX`` keys to total
+    the bytes; nothing already sized is re-estimated. Keys the ledger has never
+    seen (an entry stored by another path) are sized once and recorded, and
+    ledger keys absent from the cache are pruned only when the ledger is larger
+    than the cache, the one state that can leave stale keys behind.
     """
+    from claude_mcp_servers.weaviate_mcp import rl_state
+
     from .ctx_compact import compact_ctx
     from .memory_bounds import approx_heap_bytes, node_cache_max_bytes
 
     cache = srv._rl_node_content_cache
+    sizes = rl_state._rl_node_content_cache_sizes
     compact = compact_ctx(ctx_dict)
     cache[task_id] = compact
-    sizes = getattr(srv, "_rl_node_content_cache_sizes", None)
-    if not isinstance(sizes, dict):
-        sizes = {}
     sizes[task_id] = approx_heap_bytes(compact)
-    # Keep the size ledger in step with the cache: forget entries popped
-    # elsewhere (the monitor pops on fire) and size any stored by another
-    # writer.
-    for stale in [k for k in sizes if k not in cache]:
-        sizes.pop(stale, None)
+    total = 0
     for key, value in cache.items():
-        if key not in sizes:
-            sizes[key] = approx_heap_bytes(value)
+        size = sizes.get(key)
+        if size is None:
+            size = sizes[key] = approx_heap_bytes(value)
+        total += size
+    if len(sizes) > len(cache):
+        for stale in [k for k in sizes if k not in cache]:
+            del sizes[stale]
     max_entries = getattr(srv, "_RL_NODE_CACHE_MAX", 256)
     max_bytes = node_cache_max_bytes()
-    total = sum(sizes.values())
     for key in list(cache):
         if len(cache) <= max_entries and total <= max_bytes:
             break

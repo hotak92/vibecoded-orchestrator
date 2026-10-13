@@ -53,6 +53,7 @@ module-level binding is both sufficient and cheaper than 29 in-function imports.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
 import os
 from pathlib import Path
@@ -168,7 +169,7 @@ def _rl_load_messages(transcript_path: "Path") -> list[dict]:
     W6-MEM: a GROWN transcript costs only its appended bytes (incremental
     parse), the messages are slimmed to the fields the answer-window consumers
     read, and the monitor calls this from a worker thread
-    (``_rl_scan_candidate`` via ``asyncio.to_thread``). The extracted answer
+    (``_rl_scan_candidate`` via ``_rl_scan_off_loop``). The extracted answer
     window is unchanged; the drain uses the same shared loader
     (mirror-don't-fork).
     """
@@ -552,9 +553,9 @@ def _rl_scan_candidate(
 ) -> "tuple[str, bool, bool] | None":
     """Load one candidate transcript and locate this retrieval's answer window.
 
-    The synchronous half of one monitor poll, run via ``asyncio.to_thread`` so
-    neither the transcript parse nor the O(messages) scans block the event loop
-    (W6-MEM). Returns None when the query is not found in this transcript, else
+    The synchronous half of one monitor poll, run on the dedicated scan
+    executor (``_rl_scan_off_loop``) so neither the transcript parse nor the
+    O(messages) scans block the event loop (W6-MEM). Returns None when the query is not found in this transcript, else
     ``(answer, complete, human_turn)`` — ``human_turn`` is whether a human turn
     follows the search, evaluated only when it can matter (an incomplete,
     non-empty window), exactly as the inline code it replaces did.
@@ -579,6 +580,56 @@ def _rl_scan_candidate(
     if not complete and answer.strip():
         human_turn = bool(server._rl_human_turn_after(messages, start_msg_idx))
     return answer, complete, human_turn
+
+# W6-MEM R3: the monitor's transcript scans run on their OWN small executor,
+# never on the loop's default executor. A first parse of a GB-scale transcript
+# takes seconds; on the default executor (min(32, cpu+4) workers) dozens of
+# live monitors could fill it, and every ``asyncio.to_thread`` call in the
+# server (query embeddings for hybrid_search, ``embeddings.py``) would queue
+# behind them. Two workers: scans of two different transcripts proceed side by
+# side, and monitors beyond that wait for a scan slot instead of a tool call
+# waiting for them. Created lazily; its threads are ordinary (non-daemon)
+# executor workers, so a scan in progress is always allowed to finish — nothing
+# here cancels or abandons work.
+_RL_SCAN_WORKERS = 2
+_rl_scan_pool: "concurrent.futures.ThreadPoolExecutor | None" = None
+# path(str) -> [asyncio.Lock, users]. Monitors on the SAME transcript take
+# turns in the event loop (free) rather than each occupying a scan worker that
+# would then block on the transcript's cache lock; the last user removes the
+# entry. Touched only from the event-loop thread, so no thread lock is needed.
+_rl_scan_gates: "dict[str, list]" = {}
+
+
+def _rl_get_scan_pool() -> "concurrent.futures.ThreadPoolExecutor":
+    global _rl_scan_pool
+    if _rl_scan_pool is None:
+        _rl_scan_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_RL_SCAN_WORKERS, thread_name_prefix="vco-rl-scan",
+        )
+    return _rl_scan_pool
+
+
+async def _rl_scan_off_loop(
+    candidate: "Path", query_snippet: str, pos_idx: int,
+) -> "tuple[str, bool, bool] | None":
+    """Run ``_rl_scan_candidate`` on the dedicated scan executor, one scan per
+    transcript at a time (see ``_rl_scan_pool`` / ``_rl_scan_gates``)."""
+    key = str(candidate)
+    slot = _rl_scan_gates.get(key)
+    if slot is None:
+        slot = _rl_scan_gates[key] = [asyncio.Lock(), 0]
+    slot[1] += 1
+    try:
+        async with slot[0]:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                _rl_get_scan_pool(),
+                functools.partial(_rl_scan_candidate, candidate, query_snippet, pos_idx),
+            )
+    finally:
+        slot[1] -= 1
+        if slot[1] <= 0 and _rl_scan_gates.get(key) is slot:
+            del _rl_scan_gates[key]
 
 async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     """
@@ -701,10 +752,9 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             # W6-MEM: the transcript load (a parse of every new byte) and the
             # O(messages) scans run in a worker thread — on a GB-scale
             # transcript they take seconds, and inside the event loop they
-            # stalled every concurrent MCP tool call for that long.
-            scanned = await asyncio.to_thread(
-                _rl_scan_candidate, candidate, query_snippet, pos_idx,
-            )
+            # stalled every concurrent MCP tool call for that long. R3: on the
+            # dedicated scan executor, so they never fill the default one.
+            scanned = await _rl_scan_off_loop(candidate, query_snippet, pos_idx)
             if scanned is None:
                 continue
             answer, complete, human_turn = scanned
@@ -778,6 +828,10 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                 from claude_mcp_servers.rl_client.ctx_compact import expand_ctx
                 ctx = expand_ctx(held_ctx or server._rl_node_content_cache.get(task_id))
                 server._rl_node_content_cache.pop(task_id, None)
+                # Keep the byte-bound size ledger (one home: rl_state) in step,
+                # so the next store need not reconcile it against the cache.
+                from claude_mcp_servers.weaviate_mcp import rl_state as _rl_state
+                _rl_state._rl_node_content_cache_sizes.pop(task_id, None)
                 # F-LOG: persist answer-window length + the fire reason so the
                 # "≥25k tokens" distribution and monitor lifecycle are auditable
                 # from stored data (pre-F-LOG both were un-observable).

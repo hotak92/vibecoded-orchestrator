@@ -130,9 +130,10 @@ _rl_monitor_tasks: "set[asyncio.Task]" = set()
 #   }
 _rl_node_content_cache: dict[str, dict] = {}
 _RL_NODE_CACHE_MAX: int = 256
-# W6-MEM: estimated retained bytes per `_rl_node_content_cache` key, maintained
-# by `search_pipeline._store_compact_ctx` for the byte bound (kept in step with
-# the cache on every store, so a key the monitor popped is forgotten there).
+# W6-MEM: estimated retained bytes per `_rl_node_content_cache` key, for the
+# byte bound. ONE home, read here directly (not re-exported): written by
+# `search_pipeline._store_compact_ctx` on store/eviction and popped by the
+# answer monitor (`rl_enrichment`) when it pops the cache entry at fire time.
 _rl_node_content_cache_sizes: dict[str, int] = {}
 
 # ─── Answer-monitor tuning ──────────────────────────────────────────────

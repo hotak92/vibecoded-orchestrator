@@ -192,14 +192,19 @@ def slim_message(msg: _Any) -> _Any:
 #     full parse would return — but its bytes are re-read next time;
 #   * stores SLIM messages (``slim_message``) and is bounded in estimated BYTES
 #     (``memory_bounds.transcript_cache_max_bytes``) as well as in entries;
-#   * is thread-safe: the monitor now runs the load in a worker thread
-#     (``asyncio.to_thread``), so one lock serialises cache access — two
-#     monitors polling the same transcript share one parse instead of racing.
+#   * is thread-safe with PER-PATH locking: the monitor runs the load in a
+#     worker thread, so two threads can ask for the same transcript at once.
+#     Each path has its own lock, held for that path's whole read-and-parse,
+#     so two callers on the SAME transcript share one parse (the second waits,
+#     then finds the entry current) instead of both parsing it. A short global
+#     lock guards only the dict operations (lookup, re-insert, eviction, the
+#     per-path lock table) and is never held while reading or parsing, so a
+#     slow first parse of one transcript never delays a caller on another.
 #
-# The returned list is the cached object and grows IN PLACE on later appends;
-# that is safe for every consumer because the transcript is append-only (a
-# later message never changes an earlier index). Pure-stdlib; identical on
-# Windows (os.stat st_ino is a stable file id on NTFS).
+# The caller gets a fresh list (a shallow copy of the cached message list, plus
+# the tentative tail when there is one), never the cached object itself — see
+# ``load_messages_cached``. Pure-stdlib; identical on Windows (os.stat st_ino is
+# a stable file id on NTFS).
 
 # Entry-count cap, kept beside the byte cap: a long-lived MCP serving many small
 # subagent transcripts is bounded by this, a few huge ones by the byte cap.
@@ -227,7 +232,34 @@ class _CacheEntry:
 # path(str) -> _CacheEntry; dict insertion order is the LRU order (a hit moves
 # the key to the end).
 _MESSAGE_CACHE: "dict[str, _CacheEntry]" = {}
+# Guards ``_MESSAGE_CACHE`` and ``_PATH_LOCKS`` — dict operations only, never
+# held across file I/O or parsing.
 _CACHE_LOCK = _threading.Lock()
+# path(str) -> [per-path lock, number of callers holding or waiting on it]. An
+# entry exists only while some caller uses the path; the last one out removes
+# it, so the table never outgrows the number of in-flight loads.
+_PATH_LOCKS: "dict[str, list]" = {}
+
+
+def _acquire_path_lock(key: str) -> "_threading.Lock":
+    """Register as a user of ``key``'s lock and return it (not yet acquired)."""
+    with _CACHE_LOCK:
+        slot = _PATH_LOCKS.get(key)
+        if slot is None:
+            slot = _PATH_LOCKS[key] = [_threading.Lock(), 0]
+        slot[1] += 1
+        return slot[0]
+
+
+def _release_path_lock(key: str) -> None:
+    """Drop one use of ``key``'s lock; forget the lock when nobody uses it."""
+    with _CACHE_LOCK:
+        slot = _PATH_LOCKS.get(key)
+        if slot is None:
+            return
+        slot[1] -= 1
+        if slot[1] <= 0:
+            del _PATH_LOCKS[key]
 
 
 def stat_signature(transcript_path: "str | Path") -> "tuple[float, int] | None":
@@ -298,41 +330,68 @@ def load_messages_cached(transcript_path: "str | Path") -> list[dict]:
     callers (MCP monitor, Stop-hook drain) route through this. Soft-fail: an
     unstattable path falls back to a plain uncached load; a read error drops
     the entry (the next call starts over) and returns what was parsed.
+
+    Concurrency (W6-MEM R3): callers on the same path are serialised by that
+    path's lock, held across the read-and-parse, so concurrent callers on one
+    transcript cause ONE parse of its bytes, not one each. Callers on different
+    paths never wait on each other: the global ``_CACHE_LOCK`` covers only the
+    dict operations around the parse.
+
+    The result is ALWAYS a new list the caller owns (a shallow copy of the
+    cached messages, plus the tentative tail when present). The cached list
+    keeps growing in place on later appends from other threads; handing that
+    object out let a consumer's ``len()``/iteration race a concurrent append
+    and made the result's type of ownership depend on whether a partial final
+    line happened to be present. The copy is one pointer per message, made only
+    when the monitor's idle-poll short-circuit saw the file change, and is
+    small next to the parse of the new bytes. The message dicts themselves are
+    shared and must be treated as read-only (every consumer only reads them).
     """
     key = str(transcript_path)
+    path_lock = _acquire_path_lock(key)
     try:
-        st = _os.stat(transcript_path)
-    except OSError:
-        return [slim_message(m) for m in load_messages(transcript_path)]
-    file_id = (st.st_dev, st.st_ino)
-    with _CACHE_LOCK:
-        entry = _MESSAGE_CACHE.pop(key, None)
-        try:
-            if entry is not None and entry.size == st.st_size and entry.mtime == st.st_mtime \
-                    and entry.file_id == file_id:
-                pass  # unchanged since the last read — nothing to parse
-            else:
-                with open(transcript_path, "rb") as fh:
-                    reuse = (
-                        entry is not None
-                        and entry.file_id == file_id
-                        and st.st_size >= entry.offset
-                    )
-                    if reuse and entry is not None and entry.offset > 0:
-                        fh.seek(entry.offset - 1)
-                        reuse = fh.read(1) == b"\n"
-                    if not reuse or entry is None:
-                        entry = _CacheEntry(file_id)
-                    _read_appended(entry, fh, entry.offset)
-                entry.size = st.st_size
-                entry.mtime = st.st_mtime
-        except OSError:
-            return list(entry.messages) if entry is not None else []
-        _MESSAGE_CACHE[key] = entry
-        _evict_locked(key)
-        if entry.tail_msg is _NO_MESSAGE:
-            return entry.messages
-        return entry.messages + [entry.tail_msg]
+        with path_lock:
+            # Stat under the path lock: a caller that waited while another
+            # parsed compares against the CURRENT file, and then usually finds
+            # the entry already current — the shared parse.
+            try:
+                st = _os.stat(transcript_path)
+            except OSError:
+                return [slim_message(m) for m in load_messages(transcript_path)]
+            file_id = (st.st_dev, st.st_ino)
+            with _CACHE_LOCK:
+                # Out of the dict while it is being extended, so eviction by a
+                # caller on another path can never drop it mid-parse.
+                entry = _MESSAGE_CACHE.pop(key, None)
+            try:
+                if entry is not None and entry.size == st.st_size \
+                        and entry.mtime == st.st_mtime and entry.file_id == file_id:
+                    pass  # unchanged since the last read — nothing to parse
+                else:
+                    with open(transcript_path, "rb") as fh:
+                        reuse = (
+                            entry is not None
+                            and entry.file_id == file_id
+                            and st.st_size >= entry.offset
+                        )
+                        if reuse and entry is not None and entry.offset > 0:
+                            fh.seek(entry.offset - 1)
+                            reuse = fh.read(1) == b"\n"
+                        if not reuse or entry is None:
+                            entry = _CacheEntry(file_id)
+                        _read_appended(entry, fh, entry.offset)
+                    entry.size = st.st_size
+                    entry.mtime = st.st_mtime
+            except OSError:
+                return list(entry.messages) if entry is not None else []
+            with _CACHE_LOCK:
+                _MESSAGE_CACHE[key] = entry
+                _evict_locked(key)
+            if entry.tail_msg is _NO_MESSAGE:
+                return list(entry.messages)
+            return entry.messages + [entry.tail_msg]
+    finally:
+        _release_path_lock(key)
 
 
 def find_kg_positions(messages: list[dict]) -> list[tuple[int, int]]:
