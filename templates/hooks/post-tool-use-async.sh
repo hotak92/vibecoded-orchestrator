@@ -105,6 +105,8 @@ Bash|post-git-commit-kg-sync|git-commit-chain
 PowerShell|post-bash-context-record|-
 PowerShell|post-git-commit-kg-sync|git-commit-chain
 mcp__weaviate-kg__store_knowledge_node|kg-summary-generator|-
+Agent|stop-drain-citations|-
+Task|stop-drain-citations|-
 *|kg-update-nudge|-
 '
 

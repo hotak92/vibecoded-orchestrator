@@ -278,14 +278,24 @@ wtrec_changed_files() {
     path="$(wtrec_get "$rec" path)"
     base="$(wtrec_get "$rec" base)"
     [ -n "$path" ] && [ -d "$path" ] || return 0
+    # NUL-separated (-z): porcelain QUOTES a path with a space or a special
+    # character even under core.quotepath=off, which made `<wt>/"a b.py"`
+    # (review R4c-7). With -z every entry is `XY <path>`, a rename/copy
+    # (R/C) followed by its ORIGIN path as the next entry (skipped).
     {
-        git -C "$path" -c core.quotepath=off status --porcelain --untracked-files=all 2>/dev/null \
-            | sed -E 's/^...//; s/^.* -> //'
+        git -C "$path" status --porcelain -z --untracked-files=all 2>/dev/null | {
+            _wtrec_skip=0
+            while IFS= read -r -d '' _wtrec_e; do
+                if [ "$_wtrec_skip" = 1 ]; then _wtrec_skip=0; continue; fi
+                case "${_wtrec_e:0:1}" in R|C) _wtrec_skip=1 ;; esac
+                [ "${#_wtrec_e}" -gt 3 ] && printf '%s\0' "${_wtrec_e:3}"
+            done
+        }
         if [ -n "$base" ]; then
-            git -C "$path" -c core.quotepath=off diff --name-only "$base" HEAD 2>/dev/null
+            git -C "$path" diff --name-only -z "$base" HEAD 2>/dev/null
         fi
-    } | sed '/^$/d' | sort -u | while IFS= read -r _wtrec_rel; do
-        printf '%s/%s\n' "$path" "$_wtrec_rel"
+    } | sort -zu | while IFS= read -r -d '' _wtrec_rel; do
+        [ -n "$_wtrec_rel" ] && printf '%s/%s\n' "$path" "$_wtrec_rel"
     done
 }
 

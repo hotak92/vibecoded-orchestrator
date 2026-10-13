@@ -179,8 +179,7 @@
           },
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-alerts-deliver.sh\"",
-            "timeout": 10
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-alerts-deliver.sh\""
           }
         ]
       }
@@ -822,12 +821,11 @@
         ]
       },
       {
-        "matcher": "Agent|Task",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-alerts-deliver.sh\"",
-            "timeout": 10
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-alerts-deliver.sh\""
           }
         ]
       }

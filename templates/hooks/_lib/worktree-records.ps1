@@ -197,12 +197,6 @@ function Remove-WtrecStale([string]$root) {
     } catch { }
 }
 
-# Remove-WtrecLanesParent: after the reap removed a lane reservation's
-# worktree, remove its now-EMPTY parent `<R>.vco-lanes` (the path convention
-# of vco_lib/lane_reservation.py: sibling of R's toplevel). Empty-only, never
-# recursive: a directory still holding another lane's worktree or any stray
-# file is left exactly as it is, and only that exact directory is touched.
-# Must match _wtrec_rmdir_lanes_parent in the .sh sibling.
 # Get-WtrecChangedFiles ROOT ID -- v0.2.102 W6-C2 (census F7): the ABSOLUTE
 # paths of the files the agent changed in ITS OWN worktree (uncommitted +
 # committed since the recorded base). Exact attribution, unlike the shared-
@@ -217,17 +211,22 @@ function Get-WtrecChangedFiles([string]$root, [string]$id) {
     $base = [string]$rec.base
     if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Container)) { return @() }
     $rels = New-Object System.Collections.Generic.List[string]
+    # NUL-separated (-z): porcelain QUOTES a path with a space even under
+    # core.quotepath=off (review R4c-7). Every -z entry is `XY <path>`; a
+    # rename/copy (R/C) is followed by its ORIGIN path (skipped).
     try {
-        foreach ($line in @(& git -C $path -c core.quotepath=off status --porcelain --untracked-files=all 2>$null)) {
-            if (-not $line -or $line.Length -lt 4) { continue }
-            $rel = $line.Substring(3)
-            $arrow = $rel.LastIndexOf(" -> ")
-            if ($arrow -ge 0) { $rel = $rel.Substring($arrow + 4) }
-            if ($rel) { $rels.Add($rel) }
+        $raw = (@(& git -C $path status --porcelain -z --untracked-files=all 2>$null) -join "`n")
+        $skip = $false
+        foreach ($e in ($raw -split "`0")) {
+            if ($skip) { $skip = $false; continue }
+            if (-not $e -or $e.Length -lt 4) { continue }
+            if ($e[0] -eq 'R' -or $e[0] -eq 'C') { $skip = $true }
+            $rels.Add($e.Substring(3))
         }
         if ($base) {
-            foreach ($line in @(& git -C $path -c core.quotepath=off diff --name-only $base HEAD 2>$null)) {
-                if ($line) { $rels.Add([string]$line) }
+            $raw = (@(& git -C $path diff --name-only -z $base HEAD 2>$null) -join "`n")
+            foreach ($e in ($raw -split "`0")) {
+                if ($e) { $rels.Add([string]$e) }
             }
         }
     } catch { }
@@ -235,6 +234,12 @@ function Get-WtrecChangedFiles([string]$root, [string]$id) {
     return $out
 }
 
+# Remove-WtrecLanesParent: after the reap removed a lane reservation's
+# worktree, remove its now-EMPTY parent `<R>.vco-lanes` (the path convention
+# of vco_lib/lane_reservation.py: sibling of R's toplevel). Empty-only, never
+# recursive: a directory still holding another lane's worktree or any stray
+# file is left exactly as it is, and only that exact directory is touched.
+# Must match _wtrec_rmdir_lanes_parent in the .sh sibling.
 function Remove-WtrecLanesParent([string]$top, [string]$path) {
     try {
         $parent = Split-Path -Parent $path

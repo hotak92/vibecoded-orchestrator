@@ -144,6 +144,21 @@ if [ "${1:-}" = "--job" ] && [ -n "${2:-}" ]; then
     JOB_FILE="$2"
 fi
 if [ -n "$JOB_FILE" ]; then
+    # Only a job file this hook writes is read (and then deleted): a plain
+    # file named subagent-reconcile-job.*.json directly in $STATE_DIR. Any
+    # other path on argv (a manual run, a diagnostic) is refused, so --job
+    # can never read or delete an arbitrary file (review R4c-9).
+    case "$JOB_FILE" in
+        "$STATE_DIR"/subagent-reconcile-job.*.json) ;;
+        *) echo "subagent-stop-reconcile: --job accepts only $STATE_DIR/subagent-reconcile-job.*.json; ignored: $JOB_FILE" >&2
+           exit 0 ;;
+    esac
+    case "${JOB_FILE#"$STATE_DIR"/}" in
+        */*) echo "subagent-stop-reconcile: --job path not directly in $STATE_DIR; ignored" >&2; exit 0 ;;
+    esac
+    if [ -L "$JOB_FILE" ] || [ ! -f "$JOB_FILE" ]; then
+        exit 0
+    fi
     HOOK_STDIN=$(cat "$JOB_FILE" 2>/dev/null || echo "")
     rm -f "$JOB_FILE" 2>/dev/null || true
 else
@@ -254,17 +269,31 @@ if [ -z "$JOB_FILE" ] && ! _vco_reconcile_inline; then
         -mtime +0 -delete 2>/dev/null || true
     _SAFE_JOB_ID="$(printf '%s' "$AGENT_ID" | tr -c 'a-zA-Z0-9_-' '_' | head -c 64)"
     JOB="$STATE_DIR/subagent-reconcile-job.${_SAFE_JOB_ID}.$$.json"
+    # The job's own output goes to a per-job log (never the hook's stdout /
+    # stderr: a child holding those keeps the harness's pipe open until the
+    # job ends, which is not detached at all). Per job, so concurrent jobs
+    # never share a file; swept after a week. A failure the job reports on
+    # stderr (an alert it could not file) is kept there.
+    JOB_LOG_DIR="$LOG_DIR/subagent-reconcile-jobs"
+    mkdir -p "$JOB_LOG_DIR" 2>/dev/null || JOB_LOG_DIR=""
+    JOB_OUT=/dev/null
+    JOB_ERR=/dev/null
+    if [ -n "$JOB_LOG_DIR" ]; then
+        find "$JOB_LOG_DIR" -maxdepth 1 -type f -name 'job.*' -mtime +6 -delete 2>/dev/null || true
+        JOB_OUT="$JOB_LOG_DIR/job.${_SAFE_JOB_ID}.$$.out"
+        JOB_ERR="$JOB_LOG_DIR/job.${_SAFE_JOB_ID}.$$.err"
+    fi
     if ( umask 077; printf '%s' "$HOOK_STDIN" > "$JOB" ) 2>/dev/null; then
         if command -v setsid >/dev/null 2>&1; then
             CLAUDE_PROJECT_DIR="$PROJECT_ROOT" setsid bash "$SCRIPT_DIR/subagent-stop-reconcile.sh" \
-                --job "$JOB" >/dev/null 2>&1 < /dev/null &
+                --job "$JOB" >"$JOB_OUT" 2>"$JOB_ERR" < /dev/null &
         elif command -v nohup >/dev/null 2>&1; then
             CLAUDE_PROJECT_DIR="$PROJECT_ROOT" nohup bash "$SCRIPT_DIR/subagent-stop-reconcile.sh" \
-                --job "$JOB" >/dev/null 2>&1 < /dev/null &
+                --job "$JOB" >"$JOB_OUT" 2>"$JOB_ERR" < /dev/null &
             disown 2>/dev/null || true
         else
             ( CLAUDE_PROJECT_DIR="$PROJECT_ROOT" bash "$SCRIPT_DIR/subagent-stop-reconcile.sh" \
-                --job "$JOB" ) >/dev/null 2>&1 < /dev/null &
+                --job "$JOB" ) >"$JOB_OUT" 2>"$JOB_ERR" < /dev/null &
         fi
     fi
     exit 0
@@ -275,26 +304,27 @@ fi
 [ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
 
 # File one PARENT-facing alert (census F8). $1 kind, $2 message, $3 optional
-# file. Reader + row format: vco_lib/agent_alerts.py. No-op for no agent.
+# file. One writer: _lib/agent-alerts.sh -> python -m vco_lib.agent_alerts
+# append (row format + locking live there; review R4c-2/R4c-3). No-op for no
+# agent. When the alert cannot be filed (broken install: no VCO venv) it is
+# never dropped silently: stderr, plus a desktop notification carrying the
+# alert itself, since a detached job's stderr reaches nobody.
+# shellcheck source=_lib/agent-alerts.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/agent-alerts.sh" ] && . "$SCRIPT_DIR/_lib/agent-alerts.sh"
 _reconcile_parent_alert() {
-    command -v vco_agent_alerts_file >/dev/null 2>&1 || return 0
-    local af
-    af="$(vco_agent_alerts_file "$PROJECT_ROOT" "$SESSION_ID" "$AGENT_ID")"
-    [ -n "$af" ] || return 0
-    mkdir -p "$(dirname "$af")" 2>/dev/null || return 0
-    KIND_FOR_PY="$1" MSG_FOR_PY="$2" FILE_FOR_PY="${3:-}" SESSION_ID_FOR_PY="$SESSION_ID" \
-    AGENT_ID_FOR_PY="$AGENT_ID" AGENT_TYPE_FOR_PY="$AGENT_TYPE" "$PY" -c '
-import json, os, sys
-from datetime import datetime, timezone
-e = os.environ
-row = {"timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-       "kind": e.get("KIND_FOR_PY", ""), "message": e.get("MSG_FOR_PY", ""),
-       "session_id": e.get("SESSION_ID_FOR_PY", ""), "agent_id": e.get("AGENT_ID_FOR_PY", ""),
-       "agent_type": e.get("AGENT_TYPE_FOR_PY", "")}
-if e.get("FILE_FOR_PY"):
-    row["file"] = e["FILE_FOR_PY"]
-sys.stdout.write(json.dumps(row) + "\n")
-' >> "$af" 2>/dev/null || true
+    [ -n "$AGENT_ID" ] || return 0
+    if command -v vco_agent_alert_append >/dev/null 2>&1 && \
+        vco_agent_alert_append "$SCRIPT_DIR" "$PROJECT_ROOT" "$SESSION_ID" "$AGENT_ID" \
+            "$AGENT_TYPE" "$1" "$2" "${3:-}"; then
+        return 0
+    fi
+    echo "subagent-stop-reconcile: alert NOT delivered to the parent: $2" >&2
+    if [ -n "${PY:-}" ] && [ -f "$PROJECT_ROOT/.claude/scripts/notify.py" ]; then
+        "$PY" "$PROJECT_ROOT/.claude/scripts/notify.py" \
+            "VCO: subagent alert NOT delivered (broken install)" "$2" \
+            --urgency critical --icon dialog-warning 2>/dev/null || true
+    fi
+    return 1
 }
 
 # v0.2.102 W6-R: the live SubagentStop payload carries none of the isolation

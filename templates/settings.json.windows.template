@@ -179,8 +179,7 @@
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-alerts-deliver.ps1\"",
-            "timeout": 10
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-alerts-deliver.ps1\""
           }
         ]
       }
@@ -822,12 +821,11 @@
         ]
       },
       {
-        "matcher": "Agent|Task",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-alerts-deliver.ps1\"",
-            "timeout": 10
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-alerts-deliver.ps1\""
           }
         ]
       }

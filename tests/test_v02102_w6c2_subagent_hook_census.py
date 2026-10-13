@@ -73,6 +73,13 @@ def _env(project: Path, **extra: str) -> dict:
     return env
 
 
+def _venv_env(project: Path, **extra: str) -> dict:
+    """An env in which the hooks resolve THIS interpreter as the VCO venv
+    and import THIS checkout's vco_lib."""
+    return _env(project, VCT_VENV=str(Path(sys.executable).parent.parent),
+                PYTHONPATH=str(REPO_ROOT), **extra)
+
+
 def _run_hook(name: str, flavour: str, payload, project: Path, *,
               env: dict | None = None, hooks_dir: Path = HOOKS,
               timeout: int = 120) -> subprocess.CompletedProcess:
@@ -540,30 +547,79 @@ class TestAgentAlertsModule:
         assert "kept A" in ctx and "kept B" not in ctx
         assert (tmp_path / ".claude" / "state" / "agent_alerts_s2__lane3.jsonl").exists()
 
-    def test_background_launch_without_agent_id_delivers_nothing(self, tmp_path: Path) -> None:
+    def test_background_launch_sweeps_only_this_session(self, tmp_path: Path) -> None:
+        """R4c-10: a launch that names no agent delivers the SESSION's rows
+        (any main-chat PostToolUse does) — never another session's."""
         _agent_alerts().append_alert(str(tmp_path), "s1", "lane1", "c", "credential", "x")
-        assert _agent_alerts().deliver_for_payload(str(tmp_path), {
+        _agent_alerts().append_alert(str(tmp_path), "s2", "lane3", "c", "credential", "y")
+        out = _agent_alerts().deliver_for_payload(str(tmp_path), {
             "hook_event_name": "PostToolUse", "tool_name": "Agent", "session_id": "s1",
-            "tool_response": {"status": "async_launched"}}) == ""
+            "tool_response": {"status": "async_launched"}})
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "] x" in ctx and "] y" not in ctx
 
     @pytest.mark.parametrize("flavour", FLAVOURS)
-    def test_shell_path_helpers_match_python(self, tmp_path: Path, flavour: str) -> None:
+    def test_shell_writer_goes_through_the_one_python_writer(self, tmp_path: Path,
+                                                             flavour: str) -> None:
+        """R4c-3: the shell helpers hand the row's inputs to
+        `python -m vco_lib.agent_alerts append`; the file and the row are
+        exactly what append_alert produces (one home for path + format)."""
         _need(flavour)
-        cases = [("s1", "lane1"), ("default", "lane1"), ("s1", ""), ("s1", "bad id")]
-        want = [str(_agent_alerts().alert_file(str(tmp_path), s, a) or "") for s, a in cases]
+        env = _venv_env(tmp_path)
+        cases = [("s1", "lane1", "worktree_kept", "kept \u00e9 at /x y", "/x y"),
+                 ("default", "lane2", "credential", "cred in a.py", ""),
+                 ("s1", "", "credential", "main chat files nothing", "")]
+        for sid, agent, kind, msg, file in cases:
+            if flavour == "sh":
+                script = (f'. "{HOOKS_LIB}/agent-alerts.sh"; '
+                          f'vco_agent_alert_append "{HOOKS}" "{tmp_path}" "$1" "$2" coder "$3" "$4" "$5"')
+                r = subprocess.run(["bash", "-c", script, "x", sid, agent, kind, msg, file],
+                                   capture_output=True, text=True, env=env, timeout=60)
+            else:
+                driver = tmp_path / "drive.ps1"
+                driver.write_text(
+                    "param($d, $r, $s, $a, $k, $m, $f)\n"
+                    f'. "{HOOKS_LIB}/agent-alerts.ps1"\n'
+                    "if (Add-VcoAgentAlert -ScriptDir $d -ProjectRoot $r -SessionId $s "
+                    "-AgentId $a -AgentType coder -Kind $k -Message $m -File $f) "
+                    "{ exit 0 } else { exit 1 }\n", encoding="utf-8")
+                r = subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-File", str(driver), str(HOOKS),
+                                    str(tmp_path), sid, agent, kind, msg, file],
+                                   capture_output=True, text=True, env=env, timeout=120)
+            assert r.returncode == 0, r.stderr
+        state = tmp_path / ".claude" / "state"
+        f1 = _agent_alerts().alert_file(str(tmp_path), "s1", "lane1")
+        f2 = _agent_alerts().alert_file(str(tmp_path), "default", "lane2")
+        assert sorted(state.glob("agent_alerts_*.jsonl")) == sorted([f1, f2])
+        row = json.loads(f1.read_text(encoding="utf-8").splitlines()[0])
+        assert row["message"] == "kept \u00e9 at /x y" and row["file"] == "/x y"
+        assert row["agent_type"] == "coder" and row["kind"] == "worktree_kept"
+        assert row["timestamp"].endswith("Z"), "the row format is the Python writer's"
+        assert "file" not in json.loads(f2.read_text().splitlines()[0])
+
+    @pytest.mark.parametrize("flavour", FLAVOURS)
+    def test_shell_writer_fails_loudly_without_the_venv(self, tmp_path: Path,
+                                                        flavour: str) -> None:
+        """Loud-fail: no resolvable VCO venv -> non-success AND a stderr line
+        naming the broken install; nothing pretends to have filed it."""
+        _need(flavour)
+        env = _env(tmp_path, VCT_VENV=str(tmp_path / "no-venv"),
+                   VCT_INSTALL_ROOT=str(tmp_path / "no-root"))
+        hooks = _hooks_copy_without(tmp_path, [])
         if flavour == "sh":
-            lines = [f'. "{HOOKS_LIB}/session-id.sh"']
-            lines += [f'vco_agent_alerts_file "{tmp_path}" "{s}" "{a}"; echo "|"' for s, a in cases]
-            r = subprocess.run(["bash", "-c", "\n".join(lines)], capture_output=True, text=True)
-            got = [x.strip() for x in r.stdout.split("|")[:-1]]
+            r = subprocess.run(["bash", "-c", f'. "{hooks}/_lib/agent-alerts.sh"; '
+                                f'vco_agent_alert_append "{hooks}" "{tmp_path}" s1 lane1 c credential msg'],
+                               capture_output=True, text=True, env=env, timeout=60)
         else:
-            lines = [f'. "{HOOKS_LIB}/session-id.ps1"']
-            lines += [f'Write-Output ("r=" + (Get-VcoAgentAlertsFile -ProjectRoot "{tmp_path}" '
-                      f'-SessionId "{s}" -AgentId "{a}"))' for s, a in cases]
-            r = subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-Command", "\n".join(lines)],
-                               capture_output=True, text=True, timeout=120)
-            got = [ln.strip()[2:] for ln in r.stdout.splitlines() if ln.strip().startswith("r=")]
-        assert got == want, r.stderr
+            r = subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-Command",
+                                f'. "{hooks}/_lib/agent-alerts.ps1"; '
+                                f'if (Add-VcoAgentAlert -ScriptDir "{hooks}" -ProjectRoot "{tmp_path}" '
+                                '-SessionId s1 -AgentId lane1 -AgentType c -Kind credential '
+                                '-Message msg) { exit 0 } else { exit 1 }'],
+                               capture_output=True, text=True, env=env, timeout=120)
+        assert r.returncode == 1
+        assert "NOT filed" in r.stderr and "broken VCO install" in r.stderr
+        assert not list((tmp_path / ".claude" / "state").glob("agent_alerts_*"))
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
@@ -599,13 +655,27 @@ def test_post_tool_security_files_subagent_alert_for_parent(tmp_path: Path, flav
     assert list(state.glob("agent_alerts_*.jsonl")) == []
     # Act: a subagent's edit is filed for the parent.
     r = _run_hook("post-tool-security", flavour,
-                  dict(payload, agent_id="lane6", agent_type="coder"), project)
+                  dict(payload, agent_id="lane6", agent_type="coder"), project,
+                  env=_venv_env(project))
     assert r.returncode == 0, r.stderr
+    assert "could NOT be filed" not in r.stdout
     files = list(state.glob("agent_alerts_*.jsonl"))
     assert [f.name for f in files] == ["agent_alerts_sessP__lane6.jsonl"], r.stderr
     row = json.loads(files[0].read_text().splitlines()[0])
     assert row["kind"] == "credential" and "cfg.py" in row["message"]
     assert AWS_KEY not in files[0].read_text(), "never the value"
+    # Loud-fail: with no resolvable VCO venv the subagent is TOLD the alert
+    # did not reach its parent (and stderr says why) — never a silent skip.
+    files[0].replace(tmp_path / "aside.jsonl")
+    r = _run_hook("post-tool-security", flavour,
+                  dict(payload, agent_id="lane6", agent_type="coder"), project,
+                  env=_env(project, VCT_VENV=str(tmp_path / "no-venv"),
+                           VCT_INSTALL_ROOT=str(tmp_path / "no-root"),
+                           VCO_FIND_PYTHON_PATH_ONLY="1"))
+    assert r.returncode == 0, r.stderr
+    ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "could NOT be filed for your parent" in ctx
+    assert "broken VCO install" in r.stderr
 
 
 # ── F6/L1 + F7 + F5: the reconciler ────────────────────────────────────────
@@ -615,30 +685,6 @@ def _start_and_stop(project: Path, flavour: str, payload: dict, mutate, env: dic
     _run_hook("subagent-start-kg-inject", flavour, payload, project)
     mutate()
     return _run_hook("subagent-stop-reconcile", flavour, payload, project, env=env)
-
-
-@pytest.mark.parametrize("flavour", FLAVOURS)
-def test_reconcile_runs_detached(tmp_path: Path, flavour: str) -> None:
-    """L1/F6 (act): without the inline switch the hook returns after the
-    audit row and ONE detached job does the work."""
-    project = _project(tmp_path)
-    payload = {"session_id": "sessR", "agent_id": "lane1", "agent_type": "coder"}
-    env = _env(project)
-    env.pop("VCO_SUBAGENT_RECONCILE_INLINE", None)
-    r = _start_and_stop(project, flavour, payload,
-                        lambda: (project / "src" / "main.py").write_text(f"k = '{AWS_KEY}'\n"),
-                        env=env)
-    assert r.returncode == 0, r.stderr
-    audit = project / ".claude" / "logs" / "subagent-reconciliation.jsonl"
-    assert audit.exists(), "the audit row is written in the foreground"
-    files_log = project / ".claude" / "logs" / "subagent-reconcile-files.jsonl"
-    assert _wait_for(lambda: files_log.exists() and
-                     not list((project / ".claude" / "state").glob("subagent-snapshot-*")), 60)
-    row = json.loads(files_log.read_text().splitlines()[-1])
-    assert row["attribution"] == "unattributed_shared_tree"
-    assert (project / ".claude" / "state" / "agent_alerts_sessR__lane1.jsonl").exists()
-    assert len(audit.read_text().splitlines()) == 1, "the job writes no second audit row"
-    assert not list((project / ".claude" / "state").glob("subagent-reconcile-job.*"))
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
@@ -698,7 +744,7 @@ def test_isolated_agent_reconciled_from_its_worktree(tmp_path: Path, flavour: st
     (wt / "src" / "leak.py").write_text(f"k = '{AWS_KEY}'\n")
     # A parent edit in the shared tree meanwhile must NOT be attributed.
     (project / "src" / "main.py").write_text("x = 2\n")
-    r = _run_hook("subagent-stop-reconcile", flavour, payload, project)
+    r = _run_hook("subagent-stop-reconcile", flavour, payload, project, env=_venv_env(project))
     assert r.returncode == 0, r.stderr
     row = json.loads((project / ".claude" / "logs" / "subagent-reconcile-files.jsonl")
                      .read_text().splitlines()[-1])
@@ -828,13 +874,24 @@ def test_registrations(os_name: str) -> None:
     doc = json.loads(TEMPLATES[os_name].read_text(encoding="utf-8"))
     ((_m, drain),) = _hooks_for(doc, "SubagentStop", "stop-drain-citations")
     assert drain.get("async") is True
+    # R4c-8: PostToolUse:Agent re-tags the brief's citations — routed by the
+    # ONE async PostToolUse dispatcher, never a second async registration.
+    assert _hooks_for(doc, "PostToolUse", "stop-drain-citations") == []
+    ext = "sh" if os_name == "linux" else "ps1"
+    table = (HOOKS / f"post-tool-use-async.{ext}").read_text(encoding="utf-8")
+    assert "\nAgent|stop-drain-citations|-\n" in table
+    assert "\nTask|stop-drain-citations|-\n" in table
+    # R4c-10: delivery on ANY main-chat PostToolUse, not only Agent|Task.
     ((m, deliver),) = _hooks_for(doc, "PostToolUse", "agent-alerts-deliver")
-    assert m == "Agent|Task"
+    assert m == "*"
     assert len(_hooks_for(doc, "UserPromptSubmit", "agent-alerts-deliver")) == 1
     for event, stem in (("SubagentStop", "subagent-stop-reconcile"),
                         ("SubagentStart", "subagent-start-kg-inject"),
                         ("PreCompact", "pre-compact-save"),
-                        ("WorktreeCreate", "worktree-guard")):  # L3: confirmed
+                        ("WorktreeCreate", "worktree-guard"),  # L3: confirmed
+                        # R4c-6: delivery is never killed mid-claim either.
+                        ("PostToolUse", "agent-alerts-deliver"),
+                        ("UserPromptSubmit", "agent-alerts-deliver")):
         ((_m, h),) = _hooks_for(doc, event, stem)
         assert "timeout" not in h, f"{event}/{stem} must not carry a killing timeout"
 
@@ -854,3 +911,621 @@ def test_pre_compact_save_ignores_subagent_compaction(tmp_path: Path, flavour: s
     r = _run_hook("pre-compact-save", flavour, {"session_id": "sessC", "trigger": "auto"}, project)
     assert r.returncode == 0, r.stderr
     assert snap.exists(), "the main chat's compaction still saves it"
+
+
+# ══ R4c fix round (2026-10-13) ═════════════════════════════════════════════
+
+
+def _dead_pid() -> int:
+    """The pid of a process that has exited (and been reaped)."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+# ── R4c-1: a pending citation is claimed before compute ───────────────────
+
+
+class TestDrainClaim:
+    def _parent_tp(self, tmp_path: Path) -> str:
+        return _transcript(tmp_path / "parent.jsonl", "parent answer " * 50)
+
+    def test_agent_compute_racing_parent_drain_writes_once(self, tmp_path: Path) -> None:
+        """The reviewer's repro: while the agent drain's compute is in flight
+        (embedding calls, seconds), the parent's Stop drain runs. Exactly ONE
+        citation write — the agent's, against the agent's transcript."""
+        import rl_drain_citations as drain
+
+        f = _stage(tmp_path, "sessD", "t1", "lane4", ts_ms=_young())
+        agent_tp = _transcript(tmp_path / "agent.jsonl", "subagent answer " * 50)
+        parent_tp = self._parent_tp(tmp_path)
+        writes: list = []
+
+        def parent_compute(task_id, answer, ctx, write=True):
+            writes.append(("parent", task_id))
+            return {"ok": True}
+
+        def agent_compute(task_id, answer, ctx, write=True):
+            drain.drain_session("sessD", parent_tp, project_root=str(tmp_path),
+                                compute_fn=parent_compute, token_count_fn=lambda t: 3000)
+            writes.append(("agent", task_id))
+            return {"ok": True}
+
+        drain.drain_session("sessD", agent_tp, agent_id="lane4", project_root=str(tmp_path),
+                            compute_fn=agent_compute, token_count_fn=lambda t: 3000)
+        assert writes == [("agent", "t1")]
+        assert not f.exists() and not list(f.parent.glob("*draining*"))
+
+    def test_two_parent_drains_overlapping_write_once(self, tmp_path: Path) -> None:
+        """Two overlapping async Stop drains (the pre-existing twin of the
+        race): the nested one sees the claimed file as gone."""
+        import rl_drain_citations as drain
+
+        _stage(tmp_path, "sessD", "t-main", "", ts_ms=_young())
+        tp = _transcript(tmp_path / "parent.jsonl", "parent answer " * 50)
+        writes: list = []
+
+        def inner(task_id, answer, ctx, write=True):
+            writes.append(("inner", task_id))
+            return {"ok": True}
+
+        def outer(task_id, answer, ctx, write=True):
+            drain.drain_session("sessD", tp, project_root=str(tmp_path), compute_fn=inner,
+                                token_count_fn=lambda t: 30000)
+            writes.append(("outer", task_id))
+            return {"ok": True}
+
+        drain.drain_session("sessD", tp, project_root=str(tmp_path), compute_fn=outer,
+                            token_count_fn=lambda t: 30000)
+        assert writes == [("outer", "t-main")]
+
+    def test_leave_paths_hand_the_claim_back(self, tmp_path: Path) -> None:
+        """Every leave path (here: compute soft-failed, and no messages)
+        renames the claim back — the file stays drainable."""
+        import rl_drain_citations as drain
+
+        f = _stage(tmp_path, "sessD", "t-soft", "lane4", ts_ms=_young())
+        agent_tp = _transcript(tmp_path / "agent.jsonl", "subagent answer " * 50)
+        summary = drain.drain_session("sessD", agent_tp, agent_id="lane4",
+                                      project_root=str(tmp_path),
+                                      compute_fn=lambda *a, **k: None,
+                                      token_count_fn=lambda t: 3000)
+        assert summary["left"] == 1 and f.exists()
+        assert not list(f.parent.glob("*draining*"))
+        empty = tmp_path / "empty.jsonl"
+        empty.write_text("")
+        drain.drain_session("sessD", str(empty), agent_id="lane4", project_root=str(tmp_path),
+                            compute_fn=lambda *a, **k: {"ok": True},
+                            token_count_fn=lambda t: 3000)
+        assert f.exists() and not list(f.parent.glob("*draining*"))
+
+    def test_crashed_claim_is_readopted_and_drained(self, tmp_path: Path) -> None:
+        """A drain that died mid-compute leaves `<name>.json.draining.<pid>`;
+        the next drain hands it back and scores it — nothing is lost."""
+        import rl_drain_citations as drain
+
+        f = _stage(tmp_path, "sessD", "t-crash", "lane4", ts_ms=_young())
+        crashed = f.with_name(f"{f.name}.draining.{_dead_pid()}")
+        f.replace(crashed)
+        agent_tp = _transcript(tmp_path / "agent.jsonl", "subagent answer " * 50)
+        computed: list = []
+        summary = drain.drain_session(
+            "sessD", agent_tp, agent_id="lane4", project_root=str(tmp_path),
+            compute_fn=lambda task_id, *a, **k: computed.append(task_id) or {"ok": True},
+            token_count_fn=lambda t: 3000)
+        assert summary["readopted"] == 1 and computed == ["t-crash"]
+        assert not crashed.exists() and not f.exists()
+
+    def test_live_claim_is_left_alone(self, tmp_path: Path) -> None:
+        """Leave-alone: a YOUNG claim held by a LIVE process is another
+        drain mid-compute — never taken over (that would double-count)."""
+        import rl_drain_citations as drain
+
+        f = _stage(tmp_path, "sessD", "t-live", "lane4", ts_ms=_young())
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            live = f.with_name(f"{f.name}.draining.{holder.pid}")
+            f.replace(live)
+            agent_tp = _transcript(tmp_path / "agent.jsonl", "subagent answer " * 50)
+            computed: list = []
+            summary = drain.drain_session(
+                "sessD", agent_tp, agent_id="lane4", project_root=str(tmp_path),
+                compute_fn=lambda task_id, *a, **k: computed.append(task_id) or {"ok": True},
+                token_count_fn=lambda t: 3000)
+            assert summary["readopted"] == 0 and computed == []
+            assert live.exists() and not f.exists()
+            # ...but an OLD claim is re-adopted even with a live pid (reused).
+            old = time.time() - 2 * 3600
+            os.utime(live, (old, old))
+            summary = drain.drain_session(
+                "sessD", agent_tp, agent_id="lane4", project_root=str(tmp_path),
+                compute_fn=lambda task_id, *a, **k: computed.append(task_id) or {"ok": True},
+                token_count_fn=lambda t: 3000)
+            assert summary["readopted"] == 1 and computed == ["t-live"]
+        finally:
+            holder.kill()
+            holder.wait()
+
+
+# ── R4c-8: the brief's citation is re-tagged with the subagent ────────────
+
+
+class TestBriefCitationAdoption:
+    def _stage_brief(self, tmp_path: Path, monkeypatch, tuid: str, task: str) -> Path:
+        monkeypatch.setenv("VCT_BRIEF_TOOL_USE_ID", tuid)
+        monkeypatch.delenv("VCT_AGENT_ID", raising=False)
+        p = _stage(tmp_path, "sessB", task, None, ts_ms=_young())
+        monkeypatch.delenv("VCT_BRIEF_TOOL_USE_ID")
+        return p
+
+    def _agent_tp(self, parent: Path, agent: str, text: str = "subagent answer ") -> str:
+        d = parent.with_suffix("") / "subagents"
+        d.mkdir(parents=True, exist_ok=True)
+        return _transcript(d / f"agent-{agent}.jsonl", text * 50)
+
+    def test_stage_records_the_brief_call(self, tmp_path: Path, monkeypatch) -> None:
+        p = self._stage_brief(tmp_path, monkeypatch, "toolu_01ABC", "t-brief")
+        d = json.loads(p.read_text())
+        assert d["brief_tool_use_id"] == "toolu_01ABC" and d["agent_id"] == ""
+        # leave-alone: an ordinary (non-brief) stage carries no marker
+        q = _stage(tmp_path, "sessB", "t-plain", None)
+        assert "brief_tool_use_id" not in json.loads(q.read_text())
+
+    def test_foreground_brief_scored_on_the_subagent_answer(self, tmp_path: Path,
+                                                           monkeypatch) -> None:
+        from claude_mcp_servers.rl_client.citation_pending import adopt_brief_citations
+        import rl_drain_citations as drain
+
+        brief = self._stage_brief(tmp_path, monkeypatch, "toolu_1", "t-brief")
+        other = self._stage_brief(tmp_path, monkeypatch, "toolu_2", "t-other-call")
+        parent = tmp_path / "sess.jsonl"
+        _transcript(parent, "parent answer " * 50)
+        agent_tp = self._agent_tp(parent, "lane9")
+        n = adopt_brief_citations("sessB", "toolu_1", "lane9", agent_finished=True,
+                                  parent_transcript=str(parent), project_root=tmp_path)
+        assert n == 1
+        d = json.loads(brief.read_text())
+        assert d["agent_id"] == "lane9" and d["agent_transcript_path"] == agent_tp
+        assert json.loads(other.read_text())["agent_id"] == "", "another call's brief untouched"
+        computed: list = []
+        drain.drain_session("sessB", str(parent), project_root=str(tmp_path),
+                            compute_fn=lambda t, a, c, write=True: computed.append((t, a)) or {"ok": 1},
+                            token_count_fn=lambda t: 3000)
+        assert [c[0] for c in computed] == ["t-brief"]
+        assert "subagent answer" in computed[0][1]
+
+    def test_background_brief_is_tagged_for_the_agent_drain(self, tmp_path: Path,
+                                                            monkeypatch) -> None:
+        from claude_mcp_servers.rl_client.citation_pending import adopt_brief_citations
+        import rl_drain_citations as drain
+
+        brief = self._stage_brief(tmp_path, monkeypatch, "toolu_bg", "t-bg")
+        parent = tmp_path / "sess.jsonl"
+        _transcript(parent, "parent answer " * 50)
+        assert adopt_brief_citations("sessB", "toolu_bg", "lane3", agent_finished=False,
+                                     parent_transcript=str(parent), project_root=tmp_path) == 1
+        d = json.loads(brief.read_text())
+        assert d["agent_id"] == "lane3" and "agent_transcript_path" not in d
+        computed: list = []
+        drain.drain_session("sessB", str(parent), project_root=str(tmp_path),
+                            compute_fn=lambda t, a, c, write=True: computed.append(t) or {"ok": 1},
+                            token_count_fn=lambda t: 3000)
+        assert computed == [], "running agent: never scored on the parent's answer"
+        agent_tp = self._agent_tp(parent, "lane3", "background answer ")
+        drain.drain_session("sessB", agent_tp, agent_id="lane3", project_root=str(tmp_path),
+                            compute_fn=lambda t, a, c, write=True: computed.append(t) or {"ok": 1},
+                            token_count_fn=lambda t: 3000)
+        assert computed == ["t-bg"]
+
+    def test_finished_agent_without_transcript_keeps_main_chat_tag(self, tmp_path: Path,
+                                                                    monkeypatch) -> None:
+        """Leave-alone: a tagged file with no transcript would die at the TTL
+        sweep; the parent's answer is a better label than none."""
+        from claude_mcp_servers.rl_client.citation_pending import adopt_brief_citations
+
+        brief = self._stage_brief(tmp_path, monkeypatch, "toolu_x", "t-x")
+        parent = tmp_path / "sess.jsonl"
+        _transcript(parent, "parent answer " * 50)
+        assert adopt_brief_citations("sessB", "toolu_x", "lane5", agent_finished=True,
+                                     parent_transcript=str(parent), project_root=tmp_path) == 0
+        assert json.loads(brief.read_text())["agent_id"] == ""
+
+    def test_router_marks_agent_surface_only(self, tmp_path: Path, monkeypatch) -> None:
+        """The router exports the Agent call's tool_use_id for the `agent`
+        surface only (an Edit's retrieval is not a brief)."""
+        import hook_context_router as router
+
+        seen: dict = {}
+
+        def fake_plan(payload, cwd):
+            seen["brief"] = os.environ.get("VCT_BRIEF_TOOL_USE_ID")
+            raise RuntimeError("stop here")  # main() swallows it, by design
+
+        for surface, want in (("agent", "toolu_R"), ("edit", None)):
+            monkeypatch.setitem(router._PLAN_BUILDERS, surface, fake_plan)
+            monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(json.dumps(
+                {"session_id": "s", "tool_use_id": "toolu_R", "cwd": str(tmp_path),
+                 "tool_input": {}})))
+            monkeypatch.setenv("VCT_BRIEF_TOOL_USE_ID", "stale")
+            monkeypatch.delenv("VCO_INJECT_PROFILE", raising=False)
+            seen.clear()
+            router.main([surface])
+            assert seen["brief"] == want, surface
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX fake venv")
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_stop_drain_hook_adopts_brief_on_post_tool_use_agent(tmp_path: Path, flavour: str) -> None:
+    _need(flavour)
+    project = _project(tmp_path)
+    argv_log = tmp_path / "argv.json"
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    py = venv / "bin" / "python"
+    py.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in *rl_drain_citations.py)\n'
+        f'  exec "{sys.executable}" -c \'import json,sys; '
+        f'open("{argv_log}","w").write(json.dumps(sys.argv[1:]))\' "$@" ;;\n'
+        "esac\n"
+        f'exec "{sys.executable}" "$@"\n', encoding="utf-8")
+    py.chmod(0o755)
+    env = _env(project, VCT_VENV=str(venv))
+    base = {"hook_event_name": "PostToolUse", "tool_name": "Agent", "session_id": "sessS",
+            "transcript_path": "/parent.jsonl", "tool_use_id": "toolu_77",
+            "tool_response": {"agentId": "lane2", "content": "report"}}
+    r = _run_hook("stop-drain-citations", flavour, base, project, env=env)
+    assert r.returncode == 0, r.stderr
+    assert _wait_for(argv_log.exists, 30), "the adopt run was never spawned"
+    argv = json.loads(argv_log.read_text())
+    assert argv[argv.index("--adopt-brief-tool-use-id") + 1] == "toolu_77"
+    assert argv[argv.index("--agent-id") + 1] == "lane2"
+    assert argv[argv.index("--transcript-path") + 1] == "/parent.jsonl"
+    assert "--agent-finished" in argv
+    # background launch: tagged only (no --agent-finished)
+    argv_log.unlink()
+    bg = dict(base, tool_response={"isAsync": True, "status": "async_launched", "agentId": "lane2"})
+    _run_hook("stop-drain-citations", flavour, bg, project, env=env)
+    assert _wait_for(argv_log.exists, 30)
+    assert "--agent-finished" not in json.loads(argv_log.read_text())
+    # leave-alone: a SUBAGENT's own Agent call, and a non-Agent tool, spawn nothing
+    argv_log.unlink()
+    _run_hook("stop-drain-citations", flavour, dict(base, agent_id="lane1"), project, env=env)
+    _run_hook("stop-drain-citations", flavour, dict(base, tool_name="Read"), project, env=env)
+    time.sleep(2)
+    assert not argv_log.exists()
+
+
+# ── R4c-2 / R4c-6 / R4c-10: the alert channel ─────────────────────────────
+
+
+_SLOW_WRITER = r'''
+import json, sys, time
+sys.path.insert(0, sys.argv[1])
+from vco_lib import agent_alerts as aa
+aa._USE_FLOCK = (sys.argv[3] == "flock")
+real_dumps = json.dumps
+def slow_dumps(obj, *a, **k):
+    # the window between the writer OPENING the file and WRITING the row
+    time.sleep(1.5)
+    return real_dumps(obj, *a, **k)
+aa.json.dumps = slow_dumps
+print("ready", flush=True)
+aa.append_alert(sys.argv[2], "sessX", "abc123", "coder", "worktree_kept", "second")
+'''
+
+
+@pytest.mark.parametrize("protocol", ["flock", "excl"])
+def test_writer_racing_a_delivery_loses_no_row(tmp_path: Path, monkeypatch, protocol: str) -> None:
+    """R4c-2: a writer inside its open→write window while a delivery claims
+    the file. Before the fix the row landed in the renamed inode and was
+    gone. Both lock protocols (POSIX flock; the Windows O_EXCL sidecar,
+    driven here on POSIX)."""
+    if protocol == "flock" and sys.platform == "win32":
+        pytest.skip("flock: POSIX")
+    aa = _agent_alerts()
+    monkeypatch.setattr(aa, "_USE_FLOCK", protocol == "flock")
+    root = str(tmp_path)
+    aa.append_alert(root, "sessX", "abc123", "coder", "credential", "first")
+    writer = subprocess.Popen([sys.executable, "-c", _SLOW_WRITER, str(REPO_ROOT), root, protocol],
+                              stdout=subprocess.PIPE, text=True)
+    assert writer.stdout.readline().strip() == "ready"
+    time.sleep(0.4)  # the writer now holds its window open
+    got = [r["message"] for r in aa.collect(root, "sessX", "abc123")]
+    assert writer.wait(timeout=60) == 0
+    got += [r["message"] for r in aa.collect(root, "sessX", "abc123")]
+    assert sorted(got) == ["first", "second"], "every row delivered exactly once"
+
+
+def test_stale_delivery_claim_is_readopted(tmp_path: Path) -> None:
+    """R4c-6: a delivery killed after its claim leaves
+    `<file>.delivering.<pid>`; the next delivery appends it back (act). A
+    live, young claim is another delivery in flight (leave-alone)."""
+    aa = _agent_alerts()
+    root = str(tmp_path)
+    path = aa.append_alert(root, "s1", "lane1", "coder", "credential", "lost?")
+    dead = path.with_name(f"{path.name}.delivering.{_dead_pid()}")
+    path.replace(dead)
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        p2 = aa.append_alert(root, "s1", "lane2", "coder", "credential", "in flight")
+        live = p2.with_name(f"{p2.name}.delivering.{holder.pid}")
+        p2.replace(live)
+        got = aa.collect(root, "s1", "lane1")
+        assert [r["message"] for r in got] == ["lost?"]
+        assert not dead.exists()
+        assert aa.collect(root, "s1", "lane2") == [] and live.exists()
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_claim_is_removed_only_after_the_envelope_is_out(tmp_path: Path) -> None:
+    """R4c-6: the claimed file still exists when the envelope is emitted
+    (a kill before that point re-adopts it); it is gone afterwards."""
+    aa = _agent_alerts()
+    root = str(tmp_path)
+    aa.append_alert(root, "s1", "lane1", "coder", "credential", "x")
+    state = tmp_path / ".claude" / "state"
+    seen: list = []
+
+    def emit(text: str) -> None:
+        seen.append((text, [p.name for p in state.glob("*.delivering.*")]))
+
+    out = aa.deliver_for_payload(root, {"hook_event_name": "PostToolUse", "tool_name": "Agent",
+                                        "session_id": "s1",
+                                        "tool_response": {"agentId": "lane1"}}, emit=emit)
+    assert out and seen and seen[0][0] == out and seen[0][1], "claim alive at emit time"
+    assert not list(state.glob("*.delivering.*")) and not list(state.glob("agent_alerts_*.jsonl"))
+
+
+class TestAnyToolDelivery:
+    """R4c-10: a main-chat PostToolUse of ANY tool delivers the session's
+    pending rows; a subagent's own event delivers nothing."""
+
+    def test_python_decision(self, tmp_path: Path) -> None:
+        aa = _agent_alerts()
+        root = str(tmp_path)
+        aa.append_alert(root, "s1", "lane1", "coder", "worktree_kept", "late job row")
+        sub = {"hook_event_name": "PostToolUse", "tool_name": "Read", "session_id": "s1",
+               "agent_id": "lane7"}
+        assert aa.deliver_for_payload(root, sub) == "", "a subagent's event never delivers"
+        out = aa.deliver_for_payload(root, {"hook_event_name": "PostToolUse", "tool_name": "Read",
+                                            "session_id": "s1"})
+        assert "late job row" in json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        # background launch (no agent named) now sweeps the session too
+        aa.append_alert(root, "s1", "lane2", "coder", "credential", "bg row")
+        out = aa.deliver_for_payload(root, {
+            "hook_event_name": "PostToolUse", "tool_name": "Agent", "session_id": "s1",
+            "tool_response": {"status": "async_launched"}})
+        assert "bg row" in out
+
+    @pytest.mark.parametrize("flavour", FLAVOURS)
+    def test_hook(self, tmp_path: Path, flavour: str) -> None:
+        _need(flavour)
+        project = _project(tmp_path)
+        env = _venv_env(project)
+        payload = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": "s1",
+                   "tool_input": {"command": "ls"}}
+        _agent_alerts().append_alert(str(project), "s1", "lane1", "coder", "credential", "row A")
+        r = _run_hook("agent-alerts-deliver", flavour, dict(payload, agent_id="lane1"),
+                      project, env=env)
+        assert r.returncode == 0 and r.stdout.strip() == "", "subagent event: nothing"
+        r = _run_hook("agent-alerts-deliver", flavour, payload, project, env=env)
+        assert r.returncode == 0, r.stderr
+        assert "row A" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    @pytest.mark.parametrize("flavour", FLAVOURS)
+    def test_pending_with_broken_venv_is_loud(self, tmp_path: Path, flavour: str) -> None:
+        _need(flavour)
+        project = _project(tmp_path)
+        _agent_alerts().append_alert(str(project), "s1", "lane1", "coder", "credential", "row A")
+        hooks = _hooks_copy_without(tmp_path, [])
+        env = _env(project, VCT_VENV=str(tmp_path / "no-venv"),
+                   VCT_INSTALL_ROOT=str(tmp_path / "no-root"))
+        r = _run_hook("agent-alerts-deliver", flavour,
+                      {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "prompt": "x"},
+                      project, env=env, hooks_dir=hooks)
+        assert r.returncode == 0
+        ctx = json.loads(r.stdout)["hookSpecificOutput"]
+        assert ctx["hookEventName"] == "UserPromptSubmit"
+        assert "cannot be read" in ctx["additionalContext"] and "broken VCO install" in r.stderr
+
+    @pytest.mark.parametrize("flavour", FLAVOURS)
+    def test_no_pending_path_cost(self, tmp_path: Path, flavour: str) -> None:
+        """The cost every tool call now pays: no alert file -> no
+        interpreter. Measured as wall time vs the bare shell startup; the
+        assertion is the structural one (no venv is even resolved: a bogus
+        VCT_VENV still yields silence, not the broken-install notice)."""
+        _need(flavour)
+        project = _project(tmp_path)
+        env = _env(project, VCT_VENV=str(tmp_path / "no-venv"),
+                   VCT_INSTALL_ROOT=str(tmp_path / "no-root"))
+        payload = {"hook_event_name": "PostToolUse", "tool_name": "Read", "session_id": "s1"}
+        t0 = time.monotonic()
+        for _ in range(5):
+            r = _run_hook("agent-alerts-deliver", flavour, payload, project, env=env)
+            assert r.returncode == 0 and r.stdout == "" and r.stderr == ""
+        per_call = (time.monotonic() - t0) / 5
+        print(f"agent-alerts-deliver no-pending {flavour}: {per_call * 1000:.0f} ms/call")
+
+
+def test_append_cli_exit_codes(tmp_path: Path) -> None:
+    """The writer CLI the shell hooks call: 0 filed / nothing to file, 2 bad
+    input, 1 a write that failed — never a silent 0 for a lost alert."""
+    def run(stdin: str, root: Path) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-m", "vco_lib.agent_alerts", "append",
+                               "--project-root", str(root)], input=stdin, capture_output=True,
+                              text=True, env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+                              timeout=60)
+    ok = run(json.dumps({"session_id": "s1", "agent_id": "lane1", "kind": "k", "message": "m"}),
+             tmp_path)
+    assert ok.returncode == 0 and _agent_alerts().alert_file(str(tmp_path), "s1", "lane1").exists()
+    assert run(json.dumps({"session_id": "s1", "agent_id": "", "message": "m"}), tmp_path).returncode == 0
+    bad = run("not json", tmp_path)
+    assert bad.returncode == 2 and "NOT filed" in bad.stderr
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / ".claude").write_text("a file where a directory must be")
+    fail = run(json.dumps({"session_id": "s1", "agent_id": "lane1", "message": "m"}), blocked)
+    assert fail.returncode == 1 and "NOT filed" in fail.stderr
+
+
+# ── R4c-4: the detached reconcile really is detached ──────────────────────
+
+
+def _slow_git_path(tmp_path: Path, delay: float) -> str:
+    real = shutil.which("git")
+    d = tmp_path / "slowbin"
+    d.mkdir()
+    g = d / "git"
+    g.write_text(f'#!/bin/sh\nsleep {delay}\nexec "{real}" "$@"\n', encoding="utf-8")
+    g.chmod(0o755)
+    return f"{d}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX fake git")
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_reconcile_runs_detached(tmp_path: Path, flavour: str) -> None:
+    """L1/F6 (act): with a SLOW job (every git call sleeps 4 s; the F7
+    worktree diff and the reap both call git), the hook returns before the
+    job has written anything, and the job finishes later on its own. A run
+    that waited for the job could not pass the timing assertion."""
+    _need(flavour)
+    delay = 4.0
+    project, wt = _worktree_project(tmp_path, flavour)
+    payload = {"session_id": "sessR", "agent_id": "lane7", "agent_type": "coder"}
+    _run_hook("subagent-start-kg-inject", flavour, payload, project)
+    (wt / "src" / "leak.py").write_text(f"k = '{AWS_KEY}'\n")
+    env = _venv_env(project, PATH=_slow_git_path(tmp_path, delay))
+    env.pop("VCO_SUBAGENT_RECONCILE_INLINE", None)
+    files_log = project / ".claude" / "logs" / "subagent-reconcile-files.jsonl"
+    t0 = time.monotonic()
+    r = _run_hook("subagent-stop-reconcile", flavour, payload, project, env=env)
+    elapsed = time.monotonic() - t0
+    assert r.returncode == 0, r.stderr
+    assert elapsed < delay, f"the hook waited for the job ({elapsed:.1f}s)"
+    assert not files_log.exists(), "the job's work must not be done in the foreground"
+    audit = project / ".claude" / "logs" / "subagent-reconciliation.jsonl"
+    assert audit.exists(), "the audit row is written in the foreground"
+    assert _wait_for(files_log.exists, 120), "the detached job never finished"
+    row = json.loads(files_log.read_text().splitlines()[-1])
+    assert row["attribution"] == "agent_worktree"
+    assert _wait_for(lambda: (project / ".claude" / "state" /
+                              "agent_alerts_sessR__lane7.jsonl").exists(), 60)
+    assert len(audit.read_text().splitlines()) == 1, "the job writes no second audit row"
+    assert not list((project / ".claude" / "state").glob("subagent-reconcile-job.*"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX fake git")
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_reconcile_inline_switch_runs_in_the_foreground(tmp_path: Path, flavour: str) -> None:
+    """Leave-alone of the above: VCO_SUBAGENT_RECONCILE_INLINE=1 does the
+    work before returning, so the same slow git makes the hook slow."""
+    _need(flavour)
+    delay = 4.0
+    project, wt = _worktree_project(tmp_path, flavour)
+    payload = {"session_id": "sessR", "agent_id": "lane7", "agent_type": "coder"}
+    _run_hook("subagent-start-kg-inject", flavour, payload, project)
+    (wt / "src" / "leak.py").write_text("x = 1\n")
+    env = _venv_env(project, PATH=_slow_git_path(tmp_path, delay),
+                    VCO_SUBAGENT_RECONCILE_INLINE="1")
+    t0 = time.monotonic()
+    r = _run_hook("subagent-stop-reconcile", flavour, payload, project, env=env)
+    assert r.returncode == 0, r.stderr
+    assert time.monotonic() - t0 >= delay
+    assert (project / ".claude" / "logs" / "subagent-reconcile-files.jsonl").exists()
+
+
+# ── R4c-5: the ps1 Step-5 lock never deletes a lock it did not take ───────
+
+
+def test_ps1_work_record_respects_a_held_lock(tmp_path: Path) -> None:
+    """A pre-existing `kg_update_tokens.jsonl.lock` (the nudge holds it):
+    the ps1 gives up after its bounded spin, writes the counter row
+    best-effort (act), and the lock file is STILL there afterwards — it
+    deletes only a lock it acquired (leave-alone)."""
+    _need("ps1")
+    project = _project(tmp_path)
+    vct = tmp_path / "vct"
+    (vct / "metrics").mkdir(parents=True)
+    counter = vct / "metrics" / "kg_update_tokens.jsonl"
+    counter.write_text(json.dumps({"session_id": "sessL", "baseline": 7}) + "\n")
+    lock = Path(str(counter) + ".lock")
+    lock.write_text("held by the nudge")
+    env = _env(project, VCT_STATE_DIR=str(vct))
+    payload = {"session_id": "sessL", "agent_id": "lane1"}
+    _run_hook("subagent-start-kg-inject", "ps1", payload, project, env=env)
+    (project / "src" / "main.py").write_text("x = 3\n")
+    r = _run_hook("subagent-stop-reconcile", "ps1", payload, project, env=env)
+    assert r.returncode == 0, r.stderr
+    row = json.loads(counter.read_text().splitlines()[-1])
+    assert row["subagent_work_units"] > 0 and row["baseline"] == 7
+    assert lock.exists() and lock.read_text() == "held by the nudge"
+    # Found by this test: both ps1 writers emitted a UTF-8 BOM, which the
+    # Python readers (the nudge's json.loads per line; the drain's path list)
+    # glue onto the first row.
+    bom = b"\xef\xbb\xbf"
+    assert not counter.read_bytes().startswith(bom)
+    queue = project / ".claude" / "state" / "codegraph_drain_shared.txt"
+    assert queue.exists() and not queue.read_bytes().startswith(bom)
+
+
+# ── R4c-7: a worktree file with a space in its name ───────────────────────
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_changed_files_handles_spaces(tmp_path: Path, flavour: str) -> None:
+    _need(flavour)
+    project, wt = _worktree_project(tmp_path, flavour)
+    (wt / "src" / "a b.py").write_text("x = 1\n")
+    (wt / "src" / "main.py").write_text("x = 9\n")
+    _git(wt, "mv", "knowledge/intro.md", "knowledge/new intro.md")
+    if flavour == "sh":
+        r = subprocess.run(["bash", "-c", f'. "{HOOKS_LIB}/find-python.sh"; '
+                            f'. "{HOOKS_LIB}/worktree-records.sh"; '
+                            f'wtrec_changed_files "{project}" lane7'],
+                           capture_output=True, text=True, timeout=60)
+    else:
+        r = subprocess.run(["pwsh", *PWSH_BASE_FLAGS, "-Command",
+                            f'. "{HOOKS_LIB}/worktree-records.ps1"; '
+                            f'Get-WtrecChangedFiles "{project}" lane7 | ForEach-Object {{ $_ }}'],
+                           capture_output=True, text=True, timeout=120)
+    got = sorted(ln for ln in r.stdout.splitlines() if ln.strip())
+    assert got == sorted([f"{wt}/knowledge/new intro.md", f"{wt}/src/a b.py",
+                          f"{wt}/src/main.py"]), r.stderr
+    assert all(Path(p).exists() for p in got), "every path names a real file"
+
+
+# ── R4c-9: --job reads only its own job files ─────────────────────────────
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_job_flag_refuses_foreign_paths(tmp_path: Path, flavour: str) -> None:
+    _need(flavour)
+    project = _project(tmp_path)
+    state = project / ".claude" / "state"
+    victim = tmp_path / "victim.json"
+    victim.write_text(json.dumps({"session_id": "s", "agent_id": "lane1"}))
+    nested = state / "sub" / "subagent-reconcile-job.x.1.json"
+    nested.parent.mkdir()
+    nested.write_text("{}")
+    script = HOOKS / f"subagent-stop-reconcile.{flavour}"
+    for target in (victim, nested):
+        argv = (["bash", str(script)] if flavour == "sh"
+                else ["pwsh", *PWSH_BASE_FLAGS, "-File", str(script)])
+        r = subprocess.run([*argv, "--job", str(target)], capture_output=True, text=True,
+                           env=_env(project), timeout=120, stdin=subprocess.DEVNULL)
+        assert r.returncode == 0
+        assert target.exists(), f"{target} must never be read-and-deleted"
+        assert "--job accepts only" in r.stderr
+    assert not (project / ".claude" / "logs" / "subagent-reconcile-files.jsonl").exists()
+    # act: a real job file in the state dir is consumed
+    job = state / "subagent-reconcile-job.lane1.9.json"
+    job.write_text(json.dumps({"session_id": "s", "agent_id": "lane1"}))
+    argv = (["bash", str(script)] if flavour == "sh"
+            else ["pwsh", *PWSH_BASE_FLAGS, "-File", str(script)])
+    r = subprocess.run([*argv, "--job", str(job)], capture_output=True, text=True,
+                       env=_env(project), timeout=120, stdin=subprocess.DEVNULL)
+    assert r.returncode == 0, r.stderr
+    assert not job.exists()

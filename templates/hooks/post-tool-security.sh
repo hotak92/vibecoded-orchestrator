@@ -203,28 +203,19 @@ sys.stdout.write(json.dumps({
     fi
     # v0.2.102 W6-C2 (census F8): on a SUBAGENT's edit the additionalContext
     # below reaches only the subagent. File the alert for the PARENT too —
-    # agent-alerts-deliver hands it over when the agent returns (reader +
-    # row format: vco_lib/agent_alerts.py). Main-chat edits file nothing.
-    # shellcheck source=_lib/session-id.sh disable=SC1091
-    [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
-    if [ -n "$AGENT_ID" ] && command -v vco_agent_alerts_file >/dev/null 2>&1; then
-        _PTS_AF="$(vco_agent_alerts_file "$PROJECT_ROOT" "$SESSION_ID" "$AGENT_ID")"
-        if [ -n "$_PTS_AF" ] && mkdir -p "$(dirname "$_PTS_AF")" 2>/dev/null; then
-            MSG_FOR_PY="$MSG" FILE_FOR_PY="$REL_FILE" SESSION_ID_FOR_PY="$SESSION_ID" \
-            AGENT_ID_FOR_PY="$AGENT_ID" AGENT_TYPE_FOR_PY="$AGENT_TYPE" "$PY" -c '
-import json, os, sys
-from datetime import datetime, timezone
-e = os.environ
-sys.stdout.write(json.dumps({
-    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "kind": "credential",
-    "message": e.get("MSG_FOR_PY", "") + " (review it before committing)",
-    "file": e.get("FILE_FOR_PY", ""),
-    "session_id": e.get("SESSION_ID_FOR_PY", ""),
-    "agent_id": e.get("AGENT_ID_FOR_PY", ""),
-    "agent_type": e.get("AGENT_TYPE_FOR_PY", ""),
-}) + "\n")
-' >> "$_PTS_AF" 2>/dev/null || true
+    # agent-alerts-deliver hands it over when the agent returns. One writer
+    # (fix round, review R4c-2/R4c-3): _lib/agent-alerts.sh -> python -m
+    # vco_lib.agent_alerts append, which owns the path, the row format and
+    # the lock. Main-chat edits file nothing. A failure is never silent: the
+    # helper says so on stderr and the envelope below tells the subagent.
+    _PTS_PARENT_FAIL=""
+    if [ -n "$AGENT_ID" ]; then
+        # shellcheck source=_lib/agent-alerts.sh disable=SC1091
+        [ -f "$SCRIPT_DIR/_lib/agent-alerts.sh" ] && . "$SCRIPT_DIR/_lib/agent-alerts.sh"
+        if ! command -v vco_agent_alert_append >/dev/null 2>&1 || \
+            ! vco_agent_alert_append "$SCRIPT_DIR" "$PROJECT_ROOT" "$SESSION_ID" "$AGENT_ID" \
+                "$AGENT_TYPE" credential "$MSG (review it before committing)" "$REL_FILE"; then
+            _PTS_PARENT_FAIL=1
         fi
     fi
     # Cross-platform notification (Linux/macOS/Windows). See audit F2.
@@ -262,6 +253,11 @@ text this edit introduced (or on a line it changed) in ${REL_FILE}. If it is
 a deliberate test placeholder, mark its line with the comment
 \`${CREDSHAPES_TEST_PLACEHOLDER_MARKER:-}\`; if it leaked from real input, redact
 it before any further git operations or external sharing."
+    if [ -n "$_PTS_PARENT_FAIL" ]; then
+        REMINDER="${REMINDER}
+This alert could NOT be filed for your parent agent (the VCO venv is not
+resolvable: a broken VCO install). Repeat it in your final report."
+    fi
     if command -v emit_additional_context >/dev/null 2>&1; then
         emit_additional_context "$REMINDER" PostToolUse
     fi

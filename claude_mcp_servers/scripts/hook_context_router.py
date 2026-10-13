@@ -1707,6 +1707,16 @@ def _main(argv: List[str]) -> int:
         os.environ["VCT_AGENT_ID"] = agent_id
     else:
         os.environ.pop("VCT_AGENT_ID", None)
+    # W6-C2 fix round (review R4c-8): the `agent` surface retrieves for a
+    # subagent that does not exist yet (PreToolUse:Agent), so its staged
+    # citation carries the CALLER's tag. Mark it with the Agent call's
+    # tool_use_id; PostToolUse:Agent (stop-drain-citations) re-tags it with
+    # tool_response.agentId (citation_pending.adopt_brief_citations).
+    brief_tuid = str(payload.get("tool_use_id") or "") if surface == "agent" else ""
+    if brief_tuid:
+        os.environ["VCT_BRIEF_TOOL_USE_ID"] = brief_tuid
+    else:
+        os.environ.pop("VCT_BRIEF_TOOL_USE_ID", None)
 
     plan = _PLAN_BUILDERS[surface](payload, cwd)
     # W6-C2 (census F9): the agent surface also carries keyword suggestions.

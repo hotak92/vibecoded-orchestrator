@@ -83,6 +83,27 @@ $JobFile = ""
 if ($args.Count -ge 2 -and [string]$args[0] -eq "--job" -and $args[1]) { $JobFile = [string]$args[1] }
 $HookStdin = ""
 if ($JobFile) {
+    # Only a job file this hook writes is read (and then deleted): a plain
+    # file named subagent-reconcile-job.*.json directly in $StateDir. Any
+    # other path (a manual run, a diagnostic) is refused (review R4c-9).
+    $jobOk = $false
+    try {
+        $jobFull = [System.IO.Path]::GetFullPath($JobFile)
+        $stateFull = [System.IO.Path]::GetFullPath($StateDir).TrimEnd('\', '/')
+        $jobName = [System.IO.Path]::GetFileName($jobFull)
+        if (([System.IO.Path]::GetDirectoryName($jobFull).TrimEnd('\', '/') -eq $stateFull) -and
+            ($jobName -like 'subagent-reconcile-job.*.json')) {
+            $jobItem = Get-Item -LiteralPath $jobFull -Force -ErrorAction Stop
+            if (-not $jobItem.PSIsContainer -and -not ($jobItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                $jobOk = $true
+                $JobFile = $jobFull
+            }
+        }
+    } catch { $jobOk = $false }
+    if (-not $jobOk) {
+        [Console]::Error.WriteLine("subagent-stop-reconcile: --job accepts only $StateDir/subagent-reconcile-job.*.json; ignored: $JobFile")
+        exit 0
+    }
     try { $HookStdin = [System.IO.File]::ReadAllText($JobFile) } catch { $HookStdin = "" }
     try { Remove-Item -LiteralPath $JobFile -Force -ErrorAction SilentlyContinue } catch { }
 } else {
@@ -171,10 +192,27 @@ if (-not $JobFile -and -not $Inline) {
     $safeJobId = [regex]::Replace($AgentId, '[^a-zA-Z0-9_-]', '_')
     if ($safeJobId.Length -gt 64) { $safeJobId = $safeJobId.Substring(0, 64) }
     $job = Join-Path $StateDir ("subagent-reconcile-job.{0}.{1}.json" -f $safeJobId, $PID)
+    # The job's own output goes to a per-job log, never the hook's stdout /
+    # stderr: a child that inherits those keeps the harness's pipe open until
+    # the job ends (measured: the foreground "returned" only after the whole
+    # job). Per job, so concurrent jobs never share a file; swept after a
+    # week. Must match the .sh sibling.
+    $jobLogDir = Join-Path $LogDir "subagent-reconcile-jobs"
+    $redirect = @{}
+    try {
+        if (-not (Test-Path -LiteralPath $jobLogDir)) {
+            New-Item -ItemType Directory -Force -Path $jobLogDir -ErrorAction Stop | Out-Null
+        }
+        Get-ChildItem -LiteralPath $jobLogDir -Filter "job.*" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        $redirect["RedirectStandardOutput"] = Join-Path $jobLogDir ("job.{0}.{1}.out" -f $safeJobId, $PID)
+        $redirect["RedirectStandardError"] = Join-Path $jobLogDir ("job.{0}.{1}.err" -f $safeJobId, $PID)
+    } catch { }
     try {
         [System.IO.File]::WriteAllText($job, $HookStdin, (New-Object System.Text.UTF8Encoding($false)))
         $env:CLAUDE_PROJECT_DIR = $ProjectRoot
-        Start-VcoDetachedProcess -FilePath $PsExe -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "--job", $job) | Out-Null
+        Start-VcoDetachedProcess -FilePath $PsExe -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "--job", $job) @redirect | Out-Null
     } catch { }
     exit 0
 }
@@ -183,26 +221,31 @@ if (-not $JobFile -and -not $Inline) {
 $SessionIdLib = Join-Path $ScriptDir "_lib/session-id.ps1"
 if (Test-Path -LiteralPath $SessionIdLib) { . $SessionIdLib }
 
-# File one PARENT-facing alert (census F8). Reader + row format:
-# vco_lib/agent_alerts.py. No-op without an agent id. Must match the .sh.
+# File one PARENT-facing alert (census F8). One writer: _lib/agent-alerts.ps1
+# -> python -m vco_lib.agent_alerts append (row format + locking live there;
+# review R4c-2/R4c-3). No-op without an agent id. A failure (broken install:
+# no VCO venv) is never silent: stderr plus a desktop notification carrying
+# the alert. Must match the .sh.
+$AgentAlertsLib = Join-Path $ScriptDir "_lib/agent-alerts.ps1"
+if (Test-Path -LiteralPath $AgentAlertsLib) { . $AgentAlertsLib }
 function Add-ReconcileParentAlert([string]$Kind, [string]$Message, [string]$File = "") {
-    if (-not (Get-Command Get-VcoAgentAlertsFile -ErrorAction SilentlyContinue)) { return }
-    $af = Get-VcoAgentAlertsFile -ProjectRoot $ProjectRoot -SessionId $SessionId -AgentId $AgentId
-    if (-not $af) { return }
-    try {
-        $dir = Split-Path $af -Parent
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-        $row = [ordered]@{
-            timestamp  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-            kind       = $Kind
-            message    = $Message
-            session_id = $SessionId
-            agent_id   = $AgentId
-            agent_type = $AgentType
-        }
-        if ($File) { $row["file"] = $File }
-        Add-Content -LiteralPath $af -Value ($row | ConvertTo-Json -Compress -Depth 4) -ErrorAction Stop
-    } catch { }
+    if (-not $AgentId) { return }
+    if ((Get-Command Add-VcoAgentAlert -ErrorAction SilentlyContinue) -and
+        (Add-VcoAgentAlert -ScriptDir $ScriptDir -ProjectRoot $ProjectRoot -SessionId $SessionId `
+            -AgentId $AgentId -AgentType $AgentType -Kind $Kind -Message $Message -File $File)) {
+        return
+    }
+    [Console]::Error.WriteLine("subagent-stop-reconcile: alert NOT delivered to the parent: $Message")
+    $notify = Join-Path $ProjectRoot ".claude/scripts/notify.py"
+    $findPy = Join-Path $ScriptDir "_lib/find-python.ps1"
+    if (-not $PY -and (Test-Path -LiteralPath $findPy)) { . $findPy }
+    $notifyPy = $PY
+    if ($notifyPy -and (Test-Path -LiteralPath $notify)) {
+        try {
+            & $notifyPy $notify "VCO: subagent alert NOT delivered (broken install)" $Message `
+                --urgency critical --icon dialog-warning 2>$null | Out-Null
+        } catch { }
+    }
 }
 
 # v0.2.102 W6-R - must match the .sh sibling: the live SubagentStop payload
@@ -428,7 +471,8 @@ if ($codeFiles.Count -gt 0) {
         try {
             $sb = New-Object System.Text.StringBuilder
             foreach ($p in $toEnqueue) { [void]$sb.AppendLine($p) }
-            [System.IO.File]::AppendAllText($CgDrainShared, $sb.ToString(), [System.Text.Encoding]::UTF8)
+            # No BOM (Encoding.UTF8 writes one into a NEW file, glued to the first path).
+            [System.IO.File]::AppendAllText($CgDrainShared, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
         } catch {}
     }
 }
@@ -594,7 +638,9 @@ if ($SessionId -and $fileCount -gt 0 -and (Test-Path -LiteralPath $MetricsLib -P
             $line = $r | ConvertTo-Json -Compress -Depth 5
             [void]$sb.AppendLine($line)
         }
-        [System.IO.File]::WriteAllText($tmp, $sb.ToString(), [System.Text.Encoding]::UTF8)
+        # No BOM: [Text.Encoding]::UTF8 writes one, and the nudge's Python reader
+        # (json.loads per line, utf-8) then drops the first row.
+        [System.IO.File]::WriteAllText($tmp, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $tmp -Destination $nudgeFile -Force -ErrorAction Stop
     } catch {
         try { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue } catch {}

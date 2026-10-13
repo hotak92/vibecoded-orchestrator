@@ -136,20 +136,6 @@ function Get-VcoHookFastAgentKey {
     return (Get-VcoAgentKeyFromIds -SessionId $sid -AgentId $agent)
 }
 
-# Get-VcoAgentAlertsFile <ProjectRoot> <SessionId> <AgentId>
-# v0.2.102 W6-C2 (census F8): the pending-alert file a SUBAGENT's alert is
-# filed in, for delivery to the PARENT (vco_lib/agent_alerts.py reads it).
-# "" for the main chat. MUST MATCH session-id.sh vco_agent_alerts_file and
-# vco_lib.agent_alerts.alert_file.
-function Get-VcoAgentAlertsFile {
-    param([string]$ProjectRoot, [string]$SessionId, [string]$AgentId)
-    $agent = Get-VcoSanitizedAgentId -Raw $AgentId
-    if (-not $ProjectRoot -or -not $agent) { return "" }
-    $key = Get-VcoAgentKeyFromIds -SessionId $SessionId -AgentId $agent
-    if (-not $key.EndsWith("__" + $agent)) { $key = "nosession__" + $agent }
-    return (Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") ("agent_alerts_" + $key + ".jsonl"))
-}
-
 # Get-VcoHookAgentKey -Stdin <HookStdin>
 # Parse session_id AND agent_id from the payload, sanitise both, compose. A
 # main-agent payload (absent/empty agent_id) yields exactly

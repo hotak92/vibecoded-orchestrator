@@ -198,29 +198,20 @@ if ($alerts.Count -gt 0) {
 
     # v0.2.102 W6-C2 (census F8): on a SUBAGENT's edit the additionalContext
     # reaches only the subagent -- file the alert for the PARENT too
-    # (agent-alerts-deliver; reader + row format: vco_lib/agent_alerts.py).
+    # (agent-alerts-deliver). One writer (fix round, review R4c-2/R4c-3):
+    # _lib/agent-alerts.ps1 -> python -m vco_lib.agent_alerts append, which
+    # owns the path, the row format and the lock. A failure is never silent:
+    # stderr from the helper, and the envelope below tells the subagent.
     # MUST MATCH the .sh sibling.
+    $parentAlertFailed = $false
     if ($AgentId) {
-        $sidLib = Join-Path $PSScriptRoot "_lib/session-id.ps1"
-        if (Test-Path $sidLib) { . $sidLib }
-        if (Get-Command Get-VcoAgentAlertsFile -ErrorAction SilentlyContinue) {
-            $alertsFile = Get-VcoAgentAlertsFile -ProjectRoot $ProjectRoot -SessionId $SessionId -AgentId $AgentId
-            if ($alertsFile) {
-                try {
-                    $alertsDir = Split-Path $alertsFile -Parent
-                    if (-not (Test-Path $alertsDir)) { New-Item -ItemType Directory -Force -Path $alertsDir | Out-Null }
-                    $agentRow = [ordered]@{
-                        timestamp  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-                        kind       = "credential"
-                        message    = "$msg (review it before committing)"
-                        file       = $relFile
-                        session_id = $SessionId
-                        agent_id   = $AgentId
-                        agent_type = $AgentType
-                    }
-                    Add-Content -LiteralPath $alertsFile -Value ($agentRow | ConvertTo-Json -Compress -Depth 4) -ErrorAction Stop
-                } catch { }
-            }
+        $alertsLib = Join-Path $PSScriptRoot "_lib/agent-alerts.ps1"
+        if (Test-Path -LiteralPath $alertsLib) { . $alertsLib }
+        if (-not (Get-Command Add-VcoAgentAlert -ErrorAction SilentlyContinue) -or
+            -not (Add-VcoAgentAlert -ScriptDir $PSScriptRoot -ProjectRoot $ProjectRoot -SessionId $SessionId `
+                -AgentId $AgentId -AgentType $AgentType -Kind "credential" `
+                -Message "$msg (review it before committing)" -File $relFile)) {
+            $parentAlertFailed = $true
         }
     }
 
@@ -269,6 +260,9 @@ if ($alerts.Count -gt 0) {
         $markerText = Get-CredShapesTestPlaceholderMarker
     }
     $reminder = "[Security alert] $msg`nReview the lines named above before continuing: the credential pattern is in`ntext this edit introduced (or on a line it changed) in $relFile. If it is`na deliberate test placeholder, mark its line with the comment`n``$markerText``; if it leaked from real input, redact`nit before any further git operations or external sharing."
+    if ($parentAlertFailed) {
+        $reminder += "`nThis alert could NOT be filed for your parent agent (the VCO venv is not`nresolvable: a broken VCO install). Repeat it in your final report."
+    }
     if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
         Emit-AdditionalContext $reminder PostToolUse
     }

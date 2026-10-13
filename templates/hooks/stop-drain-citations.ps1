@@ -12,6 +12,14 @@
 # agent_id + agent_transcript_path in the payload it drains ONLY that agent's
 # staged files against the agent's own transcript (--agent-id); no agent
 # transcript -> nothing drained. MUST MATCH the .sh sibling.
+#
+# W6-C2 fix round (review R4c-8): ALSO routed by the ONE async PostToolUse
+# dispatcher (post-tool-use-async ROUTE_TABLE) for Agent and Task. In the
+# MAIN chat it re-tags the citations staged for the Agent call's brief with
+# tool_response.agentId (--adopt-brief-tool-use-id, matched by tool_use_id)
+# instead of draining; --agent-finished for a foreground agent (it has
+# finished: stamped with its transcript), tag-only for a background launch.
+# MUST MATCH the .sh sibling.
 
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -34,6 +42,11 @@ $SessionId = ""
 $TranscriptPath = ""
 $AgentId = ""
 $AgentTranscript = ""
+$HookEvent = ""
+$ToolName = ""
+$ToolUseId = ""
+$RespAgent = ""
+$AgentFinished = $true
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
@@ -41,8 +54,26 @@ try {
         if ($payload.transcript_path) { $TranscriptPath = [string]$payload.transcript_path }
         if ($payload.agent_id) { $AgentId = [string]$payload.agent_id }
         if ($payload.agent_transcript_path) { $AgentTranscript = [string]$payload.agent_transcript_path }
+        if ($payload.hook_event_name) { $HookEvent = [string]$payload.hook_event_name }
+        if ($payload.tool_name) { $ToolName = [string]$payload.tool_name }
+        if ($payload.tool_use_id) { $ToolUseId = [string]$payload.tool_use_id }
+        $resp = $payload.tool_response
+        if ($resp -and ($resp -isnot [string])) {
+            if ($resp.agentId) { $RespAgent = [string]$resp.agentId }
+            if ($resp.isAsync -or ([string]$resp.status -eq "async_launched")) { $AgentFinished = $false }
+        }
     }
 } catch { }
+
+# PostToolUse:Agent (R4c-8): re-tag the brief's citations - main chat only,
+# and only when the payload names both the call and the agent.
+$Adopt = $false
+if ($HookEvent -eq "PostToolUse") {
+    if ($AgentId) { exit 0 }
+    if (@("Agent", "Task") -notcontains $ToolName) { exit 0 }
+    if (-not $ToolUseId -or -not $RespAgent) { exit 0 }
+    $Adopt = $true
+}
 
 # SubagentStop (W6-C2 F12): the answer source is the AGENT's transcript.
 if ($AgentId) {
@@ -83,7 +114,13 @@ try { New-Item -ItemType Directory -Force -Path (Split-Path $DrainLog) -ErrorAct
 # --agent-id only when set: Start-Process drops an empty element, which would
 # leave the flag without its value.
 $DrainArgs = @($Drain, "--session-id", $SessionId, "--transcript-path", $TranscriptPath)
-if ($AgentId) { $DrainArgs += @("--agent-id", $AgentId) }
+if ($Adopt) {
+    $DrainLog = Join-Path $ProjectRoot ".claude/logs/rl_drain_citations.adopt.log"
+    $DrainArgs += @("--agent-id", $RespAgent, "--adopt-brief-tool-use-id", $ToolUseId)
+    if ($AgentFinished) { $DrainArgs += @("--agent-finished") }
+} elseif ($AgentId) {
+    $DrainArgs += @("--agent-id", $AgentId)
+}
 try {
     $env:CLAUDE_PROJECT_DIR = $ProjectRoot
     # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1): an

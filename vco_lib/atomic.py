@@ -51,6 +51,16 @@ Public surface:
 * :func:`claim_once` — ``O_CREAT|O_EXCL`` "first concurrent run wins"
   claim with a stale-takeover age (v0.2.101 N2); holds on Windows too and
   outlives the winner's process.
+* :func:`portable_exclusive_lock` — a lock that HOLDS on Windows too:
+  ``flock`` where it exists, else an ``O_CREAT|O_EXCL`` sidecar spin-lock
+  (the protocol ``kg-update-nudge.ps1`` uses) with a stale takeover
+  (v0.2.102 W6-C2 fix round, review R4c-2).
+* :func:`claim_by_rename` / :func:`release_rename_claim` /
+  :func:`claim_owner_gone` — the per-pid RENAME claim (``<name><mark><pid>``)
+  two processes use to agree who owns a queue file, and the one "is this
+  claim abandoned?" rule (dead pid, or older than a stale age). Used by the
+  RL citation drain and the subagent alert channel (v0.2.102 W6-C2 fix
+  round, reviews R4c-1/R4c-2).
 
 v0.2.53 landed the module with these three exports. v0.2.54 Track J
 completed the consolidation this paragraph used to queue: the sibling
@@ -952,3 +962,142 @@ def claim_once(path: Path, *, stale_after_s: float) -> Optional[bool]:
             os.close(fd)
         return True
     return False
+
+
+# ── v0.2.102 W6-C2 fix round (review R4c-2): a lock that holds on Windows ──
+
+#: Suffix of the O_EXCL sidecar :func:`portable_exclusive_lock` uses where
+#: ``flock`` does not exist. Distinct from the flock lockfile (which is
+#: created and LEFT on disk), so the two protocols never share a name.
+EXCL_SIDECAR_SUFFIX = ".excl"
+
+
+def _flock_available() -> bool:
+    import importlib.util  # noqa: PLC0415
+
+    return importlib.util.find_spec("fcntl") is not None
+
+
+@contextlib.contextmanager
+def excl_sidecar_lock(lock_path: Path, *, spin_s: float = 5.0,
+                      stale_after_s: float = 30.0) -> Iterator[bool]:
+    """``O_CREAT|O_EXCL`` spin-lock on ``<lock_path>.excl``; yields whether
+    the lock is held. Atomic on POSIX and Windows. A sidecar older than
+    ``stale_after_s`` is a crashed holder's and is taken over; after
+    ``spin_s`` without the lock the block runs unlocked (best effort — the
+    callers' work must not be dropped because a lock was busy), exactly the
+    ``kg-update-nudge.ps1`` posture. The sidecar is removed on exit only by
+    the holder that created it."""
+    import time  # noqa: PLC0415
+
+    side = Path(str(lock_path) + EXCL_SIDECAR_SUFFIX)
+    try:
+        side.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    fd = None
+    deadline = time.monotonic() + max(0.0, float(spin_s))
+    while True:
+        try:
+            fd = os.open(str(side), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - side.stat().st_mtime >= stale_after_s:
+                    side.unlink()
+                    continue
+            except OSError:
+                pass
+        except OSError:
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    try:
+        yield fd is not None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                side.unlink()
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def portable_exclusive_lock(lock_path: Path, *, use_flock: Optional[bool] = None,
+                            spin_s: float = 5.0,
+                            stale_after_s: float = 30.0) -> Iterator[None]:
+    """Exclusive lock that holds on every OS: :func:`exclusive_file_lock`
+    (a real ``flock``, released by the kernel if the holder dies) where
+    ``fcntl`` exists, otherwise :func:`excl_sidecar_lock`. ``use_flock``
+    forces one protocol (tests drive the Windows path on POSIX with
+    ``False``); ``None`` picks by platform. Never raises for a busy lock."""
+    if use_flock is None:
+        use_flock = _flock_available()
+    if use_flock:
+        with exclusive_file_lock(Path(lock_path)):
+            yield
+    else:
+        with excl_sidecar_lock(Path(lock_path), spin_s=spin_s, stale_after_s=stale_after_s):
+            yield
+
+
+def claim_owner_gone(pid: int, age_s: float, *, stale_after_s: float) -> bool:
+    """True when a per-pid rename claim (``<name>.<tag>.<pid>``) is
+    abandoned: its pid is provably dead, or the claim is older than
+    ``stale_after_s`` (the pid was reused, or liveness cannot be decided).
+    This process's own claims are never abandoned. Never raises."""
+    if pid == os.getpid():
+        return False
+    if pid > 0:
+        try:
+            from vco_lib.update_lock import pid_alive  # noqa: PLC0415 — one liveness rule
+
+            alive = pid_alive(pid)
+        except Exception:  # noqa: BLE001 — undecidable -> age decides
+            alive = None
+        if alive is False:
+            return True
+    else:
+        return True
+    return age_s >= stale_after_s
+
+
+def claim_by_rename(path: Path, mark: str) -> Optional[Path]:
+    """Take ``path`` for this process: atomic rename to
+    ``<name><mark><pid>`` with its mtime set to now (the claim's age, read
+    by :func:`claim_owner_gone`). Of two processes racing for one file
+    exactly one wins. ``None`` when the file is gone (another process took
+    or consumed it). Never raises."""
+    src = Path(path)
+    claimed = src.with_name(f"{src.name}{mark}{os.getpid()}")
+    try:
+        os.replace(src, claimed)
+    except OSError:
+        return None
+    try:
+        os.utime(claimed, None)
+    except OSError:
+        pass
+    return claimed
+
+
+def release_rename_claim(claimed: Path, path: Path, *, newer_wins: bool = True) -> bool:
+    """Hand a :func:`claim_by_rename` claim back under its original name.
+    When a file of that name appeared meanwhile and ``newer_wins``, the
+    newer file is kept and the claim dropped. Returns ``False`` when the
+    rename failed (the claim stays on disk for a later re-adoption). Never
+    raises."""
+    claimed, path = Path(claimed), Path(path)
+    try:
+        if newer_wins and path.exists():
+            claimed.unlink()
+        else:
+            os.replace(claimed, path)
+        return True
+    except OSError:
+        return False

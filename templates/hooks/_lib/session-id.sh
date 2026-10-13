@@ -170,28 +170,6 @@ vco_hook_fast_agent_key() {
     vco_hook_agent_key_from_ids "$sid" "$agent"
 }
 
-# vco_agent_alerts_file <project_root> <session_id> <agent_id>
-# v0.2.102 W6-C2 (census F8): the pending-alert file a SUBAGENT's alert is
-# filed in, for delivery to the PARENT (vco_lib/agent_alerts.py is the reader
-# and owns the row format). Prints "" for the main chat (no agent id). An
-# untrustworthy session id files under "nosession__<agent>".
-# MUST MATCH vco_lib.agent_alerts.alert_file and session-id.ps1
-# Get-VcoAgentAlertsFile.
-vco_agent_alerts_file() {
-    local proot="${1:-}" agent key
-    agent="$(vco_hook_sanitize_agent_id "${3:-}")"
-    if [ -z "$proot" ] || [ -z "$agent" ]; then
-        printf '%s' ""
-        return 0
-    fi
-    key="$(vco_hook_agent_key_from_ids "${2:-}" "$agent")"
-    case "$key" in
-        *"__$agent") ;;
-        *) key="nosession__$agent" ;;
-    esac
-    printf '%s' "$proot/.claude/state/agent_alerts_${key}.jsonl"
-}
-
 # vco_hook_agent_key <hook-stdin-json>
 # Parse session_id AND agent_id from the payload (requires $PY, like
 # vco_hook_session_id), sanitise both, compose. The main-agent payload
