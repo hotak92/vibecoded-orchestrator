@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Parity: kept in step with lean-ctx-rewrite.ps1 (its UTF-8 BOM serves Windows
+# PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # Per-project lean-ctx PreToolUse hook for Bash tool calls.
 #
 # CONTRACT (v0.2.101 — ALLOW-LIST INVERSION + LOSSLESS TEE)

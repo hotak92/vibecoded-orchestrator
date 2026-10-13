@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: v0.2.92 fixed PowerShell parsing defects ($Label: scope qualifier inside a here-string) — parsing has no .sh analog; no sibling change required.
+﻿# Parity: kept in step with context-size-check.sh (the v0.2.92 PowerShell
+# parsing fixes were Windows-specific; every behaviour must match the .sh
+# sibling).
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars (this hook doesn't need credentials)
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with context-size-check.ps1 (the v0.2.92 PowerShell
+# parsing fixes were Windows-specific; every behaviour must match the .ps1
+# sibling).
 # Context Size Check Hook Template
 #
 # Purpose: Monitor CONTEXT_STATE.md size and trigger doc-maintainer agent when threshold exceeded

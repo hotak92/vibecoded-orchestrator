@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: 2026-07-13 one-directional align-to-sh — the 200-with-empty-value 200-handler now treats an empty-string hub value as a miss (exit 4, fall through) to MATCH vct_secrets_resolve.sh, which already does this via `[[ -z "$val" ]]`. The .sh is already correct, so there is NO Bash-side change to co-modify.
+﻿# Parity: kept in step with vct_secrets_resolve.sh - every behaviour must
+# match the .sh sibling (an empty-string hub value is a miss, exit 4,
+# on both sides).
 # vct_secrets_resolve.ps1 — agent-facing secret resolver. PowerShell
 # counterpart of `vct_secrets_resolve.sh`.
 #

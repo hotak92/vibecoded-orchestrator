@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with check-no-fork-bomb.ps1 (key incident-fix logic on
+# both sides is pinned by tests/test_hook_ps1_body_parity.py; every
+# behaviour must match the check-no-fork-bomb.ps1 sibling).
 # check-no-fork-bomb.sh — Defense-in-depth detector for lean-ctx fork-bombs.
 #
 # Background: pre-0.2.11 the BASH_ENV lean-ctx shim could trigger runaway

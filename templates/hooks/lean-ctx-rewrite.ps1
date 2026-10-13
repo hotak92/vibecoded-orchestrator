@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed.
+﻿# Parity: kept in step with lean-ctx-rewrite.sh (this file's UTF-8 BOM serves
+# Windows PowerShell 5.1 only and has no Bash-side counterpart; every
+# behaviour must match the lean-ctx-rewrite.sh sibling).
 # Per-project lean-ctx PreToolUse hook for Bash tool calls (Windows).
 # Windows sibling of templates/hooks/lean-ctx-rewrite.sh — see that file
 # for the full rationale (fork-bomb avoidance, v0.2.101 allow-list
