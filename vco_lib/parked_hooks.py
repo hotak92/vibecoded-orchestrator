@@ -737,7 +737,13 @@ def _cmd_carried(args: Any) -> int:
         _emit({"ok": True, "carried": []})
         return 0
 
-    root = resolve_install_root(args.orchestrator_root or None)
+    explicit = (args.orchestrator_root or "").strip()
+    if explicit and not Path(explicit).is_dir():
+        # A named clone that is not there is an error, never a cue to read some
+        # OTHER clone's template (v0.2.102 R11-05: it used to fall through to the
+        # ambient VCT_INSTALL_ROOT / this vco_lib's clone, silently).
+        return _fail("no_install_root", f"--orchestrator-root {explicit} is not a directory")
+    root = resolve_install_root(explicit or None)
     if root is None:
         return _fail("no_install_root", "the orchestrator clone could not be located")
     template_path = settings_template_path(root)
@@ -776,7 +782,9 @@ def build_parser() -> Any:
     )
     p_carried.add_argument(
         "--orchestrator-root", default="",
-        help="The clone whose settings template to read (default: this vco_lib's clone).")
+        help="The clone whose settings template to read. Must exist when given. "
+             "Default: $VCT_INSTALL_ROOT, then $VCT_ORCHESTRATOR_ROOT (each only when "
+             "it names an orchestrator clone), else this vco_lib's clone.")
     p_carried.set_defaults(func=_cmd_carried)
     return parser
 

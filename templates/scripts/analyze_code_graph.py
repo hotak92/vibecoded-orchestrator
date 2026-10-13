@@ -3504,7 +3504,10 @@ class CodeGraphAnalyzer:
             _ov = _extra_overlap(resolved.as_posix(), repo_path.as_posix())
             if _ov.refused:  # overlaps the project: not walked, and --prune-stale keeps its rows
                 print(f"❌ Extra path refused, not walked: {_ov.message}", file=sys.stderr)
-                self._refused_extra_sources |= _src_scope.walk_own_sources(resolved, extra.as_posix())
+                self._refused_extra_sources |= _src_scope.refused_extra_keep_sources(  # never the project's (R11-01)
+                    resolved, extra.as_posix(), repo_path, project_stamp=_src_scope.walk_source_stamp(
+                        repo_path.as_posix(), canonical_source=canonical_source,
+                        scoped=not self._analyze_whole_repo, extra_root=bool(as_extra_path)))
                 continue
             canonical_extras.append(resolved)
 
@@ -4420,9 +4423,10 @@ class CodeGraphAnalyzer:
             stale = self._get_stale_file_set()
         except Exception:  # noqa: BLE001 — stub analyzers / probe failure
             stale = None
-        result, added = _union_stale_into_changed_impl(
-            source_root, all_files, changed_files, stale,
-        )
+        _raw = getattr(self, "_analyze_repo_root_raw", "") or source_root.as_posix()  # R11-02: this root's rows only
+        result, added = _union_stale_into_changed_impl(source_root, all_files, changed_files, stale, (
+            _src_scope.walk_own_sources(source_root, source_root.as_posix()),
+            bool(getattr(self, "_strict_source", False)) or source_root.as_posix() != _raw))
         if added:
             print(
                 f"ℹ️  incremental: +{added} unchanged file(s) with stale/vectorless "
@@ -4573,7 +4577,8 @@ class CodeGraphAnalyzer:
             return None
 
     def _build_stale_file_set(self) -> Optional[frozenset]:
-        """R-1 (v0.2.73): the set of file paths owning ANY stale-revision row.
+        """R-1 (v0.2.73): the ``(project_source, path)`` keys of every stale-revision
+        row (v0.2.102 R11-02: keyed by root too — ``_src_scope.stale_hit`` reads it).
 
         Probes the three FILE-ANCHORED collections (CodeModule.path,
         CodeClass.file_path, CodeFunction.file_path) for rows whose
@@ -4659,7 +4664,7 @@ class CodeGraphAnalyzer:
         _unresolved_root = getattr(self, "_analyze_repo_root_raw", None)
         if _unresolved_root:
             _primary_sources.add(str(_unresolved_root))
-        stale: Set[str] = set()
+        stale: Set[Tuple[str, str]] = set()
         determinable = False
         orphans_cleared = 0
         orphan_failures = 0
@@ -4713,7 +4718,7 @@ class CodeGraphAnalyzer:
                     # the orphan-clear below; not_owed rows (current /
                     # extra-path) need nothing from this walk.
                     if _classify(p, path_prop) == "owed":
-                        stale.add(str(p.get(path_prop) or ""))
+                        stale.add((str(p.get("project_source") or "").strip(), str(p.get(path_prop) or "")))
                 determinable = True
             except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
                 print(
@@ -4751,15 +4756,10 @@ class CodeGraphAnalyzer:
                 )
                 orphans_cleared += deleted
                 orphan_failures += failures
-                # Any path we just deleted must NOT remain in the stale set
-                # (the set was built in the same run from the pre-delete scan;
-                # a re-walk would look for a file that no longer exists). Drop
-                # every stale path that is now unreachable-on-disk.
+                # A path just deleted must leave the stale set (built from the
+                # pre-delete scan): drop every key whose path is now unreachable.
                 if deleted:
-                    stale = {
-                        fp for fp in stale
-                        if _path_reachable_on_disk(fp, repo_root)
-                    }
+                    stale = {k for k in stale if _path_reachable_on_disk(k[1], repo_root)}
             except Exception as exc:  # noqa: BLE001 — orphan-clear soft-fails
                 print(
                     f"⚠️  orphan-clear failed on "
@@ -5052,7 +5052,7 @@ class CodeGraphAnalyzer:
             stale_files = self._get_stale_file_set()
         except Exception:  # noqa: BLE001 — stub analyzers / probe failure
             stale_files = None
-        if stale_files and path in stale_files:
+        if _src_scope.stale_hit(stale_files, path, getattr(self, "_walk_own", None)):
             # A stale Function/Class/Module row anchors to this file → the
             # file must re-walk so its entities re-embed under the current
             # revision (the per-object gates keep the re-walk cheap for the
@@ -6403,6 +6403,9 @@ def main():
                 file=sys.stderr,
             )
             return 1
+    if args.primary_root and not args.as_extra_path:  # R11-04: refused, never silently ignored
+        print("❌ --primary-root requires --as-extra-path", file=sys.stderr)
+        return 1
     if args.as_extra_path:
         _ov = _extra_overlap(repo_path.as_posix(), args.primary_root.as_posix()) if args.primary_root else None
         if _ov is not None and _ov.refused:  # W6-CGD D-4: vco_lib.codegraph_extra_overlap is the one rule
@@ -6411,9 +6414,7 @@ def main():
         if args.canonical_source:  # an extra's rows carry its own root (walk_source_stamp)
             print("ℹ️  --canonical-source ignored with --as-extra-path", file=sys.stderr)
     if args.canonical_source and args.only_file is None and args.only_files_from is None:
-        # --canonical-source only has meaning in a scoped file mode (it stamps
-        # the per-object project_source / UUID seed). Reject the lone flag so
-        # a caller isn't surprised it was silently ignored.
+        # Meaningful only in a scoped file mode (it stamps project_source): a lone flag is refused.
         print(
             "❌ --canonical-source requires --only-file or --only-files-from",
             file=sys.stderr,

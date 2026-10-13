@@ -498,7 +498,8 @@ def test_two_sided_probe_and_purge_agree_on_the_same_fixture(
     )
 
     stale_set = stub._build_stale_file_set()
-    assert stale_set == frozenset({"src/live.py"}), (
+    # R11-02: keys are (project_source, path); the owed rows are unstamped.
+    assert stale_set == frozenset({("", "src/live.py")}), (
         "exactly the owed rows' paths re-walk — no pathless '' entry, no "
         f"ignored/orphan/extra-path noise: {stale_set}"
     )

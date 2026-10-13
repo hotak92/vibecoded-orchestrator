@@ -25,6 +25,9 @@ with that keying:
 * :func:`preserve_keys` — the ``(source, path)`` keys the ``--prune-stale``
   preserve set records for a file skipped in one root. Keyed by path alone, a
   copy skipped in one tree shielded its twin in the other (D-3).
+* :func:`stale_hit` — does the per-run stale-file set (``(source, path)``
+  keys) owe the walking root a re-walk of this file? Keyed by path alone, a
+  stale row of one root made the other root re-walk its copy (R11-02).
 
 Duplicates between the project and an extra folder are EXPECTED after these
 fixes: each root owns its own rows. Recognising a duplicate on purpose is the
@@ -48,7 +51,9 @@ from vco_lib.codegraph_row_classify import source_is_owned
 
 __all__ = [
     "preserve_keys",
+    "refused_extra_keep_sources",
     "row_owned_by_walk",
+    "stale_hit",
     "walk_own_sources",
     "walk_source_stamp",
 ]
@@ -98,6 +103,28 @@ def walk_own_sources(source_root: Any, stamp: str) -> Set[str]:
     return own
 
 
+def refused_extra_keep_sources(
+    extra_root: Any,
+    extra_stamp: str,
+    project_root: Any,
+    *,
+    project_stamp: str,
+) -> Set[str]:
+    """The sources whose rows ``--prune-stale`` must keep for a REFUSED extra.
+
+    An extra folder the overlap rule refuses is not walked, so its rows are
+    kept rather than judged (W6-CGD D-4). But a refused extra can resolve to
+    the project folder itself (a moved or symlinked ``folder_path`` landing on
+    a registered extra, or a hand-run ``--extra-path <repo>``): its source
+    forms are then the PROJECT's, and keeping them would exempt every project
+    row from the prune the user asked for, silently (v0.2.102 R11-01). The
+    project's own sources — its raw and resolved forms plus the stamp this run
+    writes for it — are therefore never part of the keep set: the project root
+    IS walked this run, so its rows are judged by the visit, as always.
+    """
+    return walk_own_sources(extra_root, extra_stamp) - walk_own_sources(project_root, project_stamp)
+
+
 def row_owned_by_walk(src: Any, own_sources: Optional[Iterable[str]], *, extra_root: bool) -> bool:
     """Does a stored row (``project_source`` = ``src``) belong to this walk?
 
@@ -109,6 +136,37 @@ def row_owned_by_walk(src: Any, own_sources: Optional[Iterable[str]], *, extra_r
     """
     own = set(own_sources) if own_sources is not None else None
     return source_is_owned(src, own, strict=extra_root)
+
+
+def stale_hit(
+    stale_set: Optional[Iterable[Any]],
+    rel: str,
+    walk_own: Optional[Tuple[Iterable[str], bool]] = None,
+) -> bool:
+    """Does the stale-file set owe THIS walk a re-walk of ``rel``? (v0.2.102 R11-02)
+
+    ``stale_set`` holds ``(project_source, path)`` keys — one per stale row,
+    source ``""`` for a legacy unstamped row — built by the analyzer's
+    ``_build_stale_file_set``. ``walk_own`` is the walk's ``(own sources,
+    extra_root)`` context (the analyzer's ``_walk_own``). A key counts when its
+    source is one this walk owns: the same rule as :func:`row_owned_by_walk`
+    (a non-empty source in ``own``; ``""`` for the project's root only),
+    applied by exact key lookup so the per-file gate stays O(own forms).
+
+    A bare ``str`` entry still means "this path under any source" (callers
+    that cannot name the root), and with no walk context (a direct caller:
+    no root is known) any source counts, as before.
+    """
+    if not stale_set:
+        return False
+    if rel in stale_set:
+        return True
+    if walk_own is None:
+        return any(isinstance(e, tuple) and len(e) == 2 and e[1] == rel for e in stale_set)
+    own, extra_root = walk_own
+    if any((s, rel) in stale_set for s in own if s):
+        return True
+    return not extra_root and ("", rel) in stale_set
 
 
 def preserve_keys(own_sources: Iterable[str], rel: str, *, extra_root: bool) -> Set[Tuple[str, str]]:

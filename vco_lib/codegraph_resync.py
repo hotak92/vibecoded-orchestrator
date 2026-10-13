@@ -4555,6 +4555,7 @@ def union_stale_into_changed(
     all_files: "list[Path]",
     changed_files: "list[Path]",
     stale_set: "frozenset | set | None",
+    walk_own: "tuple | None" = None,
 ) -> "tuple[list[Path], int]":
     """v0.2.77 5c task 5 (5c-v): add stale-revision files back into an
     incremental changed-set so ``--incremental`` can HEAL vectorless rows.
@@ -4578,6 +4579,13 @@ def union_stale_into_changed(
     testing membership with the SAME relativisation matches only rows belonging
     to THIS root (primary rows vs extra-path rows key off their own root).
 
+    v0.2.102 R11-02: ``stale_set`` entries are ``(project_source, path)`` keys
+    and ``walk_own`` is the walked root's ``(own sources, extra_root)``; only a
+    stale row THIS root owns re-queues its file
+    (:func:`vco_lib.codegraph_source_scope.stale_hit`) — the project's stale
+    row of ``a.py`` no longer re-queues an extra folder's ``a.py``. A bare
+    ``str`` entry still matches the path under any source.
+
     FAIL-OPEN: a ``None`` / empty ``stale_set`` → return ``(changed_files, 0)``
     unchanged (today's behaviour exactly). Never raises: a per-file relativise
     error is skipped.
@@ -4587,6 +4595,8 @@ def union_stale_into_changed(
     """
     if not stale_set:
         return changed_files, 0
+    from vco_lib.codegraph_source_scope import stale_hit  # lazy: that module imports this one
+
     already = set(changed_files)
     result = list(changed_files)
     added = 0
@@ -4597,7 +4607,7 @@ def union_stale_into_changed(
             rel = f.relative_to(source_root).as_posix()
         except Exception:  # noqa: BLE001 — odd root: cannot key, skip
             continue
-        if rel in stale_set:
+        if stale_hit(stale_set, rel, walk_own):
             result.append(f)
             already.add(f)
             added += 1

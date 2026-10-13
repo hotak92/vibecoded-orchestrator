@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Parity: kept in step with config-change-audit.ps1 (the .ps1 parses JSON natively
 # via ConvertFrom-Json and never invokes Python; every behaviour must
-# match the .ps1 sibling).
+# match the .ps1 sibling; tests/test_v02102_w6w_hook_project_root.py runs both).
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0

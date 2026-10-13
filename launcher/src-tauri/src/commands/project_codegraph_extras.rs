@@ -366,6 +366,48 @@ fn overlap_reply_to_result(reply: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// The enabled extras the ONE overlap rule refuses for this project (v0.2.102
+/// R11-03). `check` is [`crate::services::vco_lib_bridge::codegraph_extra_overlap`]
+/// in production (a seam for tests). A check that cannot run is an `Err`: the
+/// caller then runs nothing, rather than guess which folders are walked.
+fn refused_extra_paths<F>(
+    extras: &[String],
+    folder_path: &str,
+    check: F,
+) -> Result<std::collections::HashSet<String>, String>
+where
+    F: Fn(&str, &str) -> Result<serde_json::Value, String>,
+{
+    let mut refused = std::collections::HashSet::new();
+    for extra in extras {
+        let reply = check(extra, folder_path).map_err(|e| {
+            format!("could not check code folder '{}' against this project's folder: {}", extra, e)
+        })?;
+        if overlap_reply_to_result(&reply).is_err() {
+            refused.insert(extra.clone());
+        }
+    }
+    Ok(refused)
+}
+
+/// Which extras a "Reindex all" run may mark indexed, with the HEAD read
+/// before the walk (NB-H6): every extra except those the overlap rule refused
+/// — the analyzer does not walk a refused folder, so stamping it would show
+/// it up to date and steer later incremental syncs from a commit nobody
+/// indexed (v0.2.102 R11-03).
+fn reindex_stamp_targets<'a>(
+    extras: &'a [String],
+    pre_heads: &'a [Option<String>],
+    refused: &std::collections::HashSet<String>,
+) -> Vec<(&'a str, Option<&'a str>)> {
+    extras
+        .iter()
+        .zip(pre_heads.iter())
+        .filter(|(path, _)| !refused.contains(*path))
+        .map(|(path, sha)| (path.as_str(), sha.as_deref()))
+        .collect()
+}
+
 /// Find a launcher project whose `folder_path` (post-normalisation)
 /// equals `canonical_extra`. Returns `Ok(None)` when no project
 /// matches. The match is case-insensitive on the drive letter for
@@ -770,6 +812,24 @@ pub async fn reindex_project_codegraph_after_extras_change(
     let extras = db.list_enabled_codegraph_extras(&project_id)?;
     let prefix = resolve_collection_prefix(&db, &project)?;
 
+    // v0.2.102 R11-03: which extras the ONE overlap rule refuses (blocking
+    // child off the async executor). They are still passed as `--extra-path`:
+    // the analyzer refuses them too and keeps their rows from `--prune-stale`
+    // — left out of the argv, an unvisited folder's rows would be pruned. What
+    // changes is that a refused folder is never stamped as indexed below.
+    let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db.inner());
+    let (extra_paths, folder_c) = (
+        extras.iter().map(|e| e.path.clone()).collect::<Vec<String>>(),
+        project.folder_path.clone(),
+    );
+    let refused = tokio::task::spawn_blocking(move || {
+        refused_extra_paths(&extra_paths, &folder_c, |extra, folder| {
+            crate::services::vco_lib_bridge::codegraph_extra_overlap(root.as_deref(), extra, folder)
+        })
+    })
+    .await
+    .map_err(|e| format!("overlap check: {}", e))??;
+
     // Build args: primary path first, then every --extra-path entry.
     let mut args: Vec<String> = vec![
         project.folder_path.clone(),
@@ -806,17 +866,14 @@ pub async fn reindex_project_codegraph_after_extras_change(
     .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    // After a successful reindex, refresh each extra's last_indexed_*
+    // After a successful reindex, refresh each WALKED extra's last_indexed_*
     // so subsequent incremental runs have an accurate baseline. The commit
-    // stamped is the PRE-analyze HEAD (NB-H6).
+    // stamped is the PRE-analyze HEAD (NB-H6); a refused extra is not walked
+    // and keeps its stamp (R11-03).
     let now = chrono::Utc::now().timestamp_millis();
-    for (e, sha) in extras.iter().zip(pre_heads.iter()) {
-        let _ = db.update_codegraph_extra_last_indexed(
-            &project_id,
-            &e.path,
-            now,
-            sha.as_deref(),
-        );
+    let extra_list: Vec<String> = extras.iter().map(|e| e.path.clone()).collect();
+    for (path, sha) in reindex_stamp_targets(&extra_list, &pre_heads, &refused) {
+        let _ = db.update_codegraph_extra_last_indexed(&project_id, path, now, sha);
     }
 
     // V52-Z (v0.2.52): also upsert `code_graph_builds`. The reindex
@@ -854,6 +911,8 @@ pub async fn reindex_project_codegraph_after_extras_change(
         paths: paths.clone(),
     };
 
+    let mut refused_sorted: Vec<&String> = refused.iter().collect();
+    refused_sorted.sort();
     let _ = db.audit(
         "codegraph_reindex_after_extras_change",
         Some(&project_id),
@@ -864,6 +923,7 @@ pub async fn reindex_project_codegraph_after_extras_change(
             "entities_indexed": outcome.entities_indexed,
             "duration_ms": outcome.duration_ms,
             "prune_stale": prune_stale,
+            "refused_extras": refused_sorted,
         }),
     );
 
@@ -1506,6 +1566,50 @@ mod tests {
             h.await.unwrap();
         }
         assert_eq!(counter.load(Ordering::SeqCst), n);
+    }
+
+    // ─── v0.2.102 R11-03: "Reindex all" never stamps a refused extra ─────
+
+    #[test]
+    fn reindex_refused_extras_come_from_the_one_overlap_rule() {
+        // Real bridge child (`python -m vco_lib.codegraph_extra_overlap`), the
+        // same rule the analyzer applies to a combined walk's `--extra-path`.
+        let extras = vec![
+            "/opt/myproj/sub".to_string(),
+            "/opt/sibling".to_string(),
+            "/opt/myproj".to_string(),
+        ];
+        let refused = refused_extra_paths(&extras, "/opt/myproj", |extra, folder| {
+            crate::services::vco_lib_bridge::codegraph_extra_overlap(None, extra, folder)
+        })
+        .unwrap();
+        let mut got: Vec<&String> = refused.iter().collect();
+        got.sort();
+        assert_eq!(got, vec!["/opt/myproj", "/opt/myproj/sub"]);
+    }
+
+    #[test]
+    fn reindex_overlap_check_that_cannot_run_is_an_error() {
+        let extras = vec!["/opt/sibling".to_string()];
+        let err = refused_extra_paths(&extras, "/opt/myproj", |_e, _f| Err("no python".to_string()))
+            .unwrap_err();
+        assert!(err.contains("/opt/sibling") && err.contains("no python"), "{err}");
+    }
+
+    #[test]
+    fn reindex_does_not_stamp_a_refused_extra() {
+        // ACT: the refused nested folder is not walked, so it keeps its stamp.
+        // LEAVE-ALONE: the walked folder is stamped with its PRE-analyze HEAD.
+        let extras = vec!["/opt/myproj/sub".to_string(), "/opt/sibling".to_string()];
+        let heads = vec![Some("aaa".to_string()), Some("bbb".to_string())];
+        let refused: std::collections::HashSet<String> =
+            ["/opt/myproj/sub".to_string()].into_iter().collect();
+        assert_eq!(
+            reindex_stamp_targets(&extras, &heads, &refused),
+            vec![("/opt/sibling", Some("bbb"))]
+        );
+        let none = std::collections::HashSet::new();
+        assert_eq!(reindex_stamp_targets(&extras, &heads, &none).len(), 2);
     }
 
     // ─── v0.2.102 NB-H6: the stamped commit is the PRE-analyze HEAD ──────

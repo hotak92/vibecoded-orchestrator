@@ -458,6 +458,148 @@ def test_d4_combined_walk_refuses_a_nested_extra_and_keeps_its_rows(amod, no_emb
     assert nested.as_posix() not in _module_sources(a, "same.py")
 
 
+def _stale_project_row(a, proj: Path) -> None:
+    a.functions_collection.rows["stale-project-row"] = {
+        "file_path": "pkg/gone.py", "project": a.project_name, "project_source": proj.as_posix()}
+
+
+def test_r11_01_refused_extra_equal_to_project_does_not_disable_the_prune(
+    amod, no_embed, tmp_path, capsys
+):
+    """ACT (v0.2.102 R11-01). An ``--extra-path`` that IS the project folder is
+    refused (same_as_project); before the fix its source forms — the project's
+    own — went into the refused-keep set, so ``--prune-stale`` silently kept
+    every stale project row. The stale row of a deleted project file must
+    still be pruned, and the keep set must hold none of the project's forms."""
+    proj, _extra = _trees(tmp_path)
+    a = _analyzer(amod)
+    _stale_project_row(a, proj)
+    a.analyze_repository(proj, extra_paths=[proj], prune_stale=True)
+    assert "Extra path refused, not walked" in capsys.readouterr().err
+    assert "stale-project-row" not in a.functions_collection.rows, (
+        "a refused extra equal to the project must not shield the project's stale rows")
+    assert not (a._refused_extra_sources & scope.walk_own_sources(proj, proj.as_posix()))
+
+
+def test_r11_01_symlink_to_project_refused_extra_still_prunes(amod, no_embed, tmp_path):
+    """ACT, the symlinked form: the extra resolves to the project folder."""
+    proj, _extra = _trees(tmp_path)
+    link = tmp_path / "proj-link"
+    link.symlink_to(proj, target_is_directory=True)
+    a = _analyzer(amod)
+    _stale_project_row(a, proj)
+    a.analyze_repository(proj, extra_paths=[link], prune_stale=True)
+    assert "stale-project-row" not in a.functions_collection.rows
+    assert proj.as_posix() not in a._refused_extra_sources
+
+
+def test_r11_01_refused_nested_extra_rows_still_kept_beside_a_same_as_project_one(
+    amod, no_embed, tmp_path
+):
+    """LEAVE-ALONE. In the same run, a refused NESTED extra keeps its rows
+    (it is not walked, so not judged) while the project's stale row is pruned."""
+    proj, _extra = _trees(tmp_path)
+    nested = proj / "pkg"
+    a = _analyzer(amod)
+    _stale_project_row(a, proj)
+    a.functions_collection.rows["nested-row"] = {
+        "file_path": "same.py", "project": a.project_name, "project_source": nested.as_posix()}
+    a.analyze_repository(proj, extra_paths=[proj, nested], prune_stale=True)
+    assert "nested-row" in a.functions_collection.rows, "the nested extra's rows are kept"
+    assert nested.as_posix() in a._refused_extra_sources
+    assert "stale-project-row" not in a.functions_collection.rows
+
+
+def test_r11_01_keep_sources_helper_subtracts_the_project_forms(tmp_path):
+    proj = tmp_path / "p"
+    (proj / "sub").mkdir(parents=True)
+    keep = scope.refused_extra_keep_sources(proj, proj.as_posix(), proj, project_stamp=proj.as_posix())
+    assert keep == set()
+    keep = scope.refused_extra_keep_sources(proj / "sub", (proj / "sub").as_posix(), proj,
+                                            project_stamp="/canon/main")
+    assert keep == {(proj / "sub").as_posix(), (proj / "sub").resolve().as_posix()}
+    # the project's stamp (a canonicalised worktree edit) is a project source too
+    keep = scope.refused_extra_keep_sources(Path("/canon/main"), "/canon/main", proj,
+                                            project_stamp="/canon/main")
+    assert "/canon/main" not in keep
+
+
+# ── R11-02(c): the stale-file set is keyed (source, path) ─────────────────
+
+
+def _two_root_graph_with_a_stale_project_row(amod, tmp_path):
+    proj, extra = _trees(tmp_path)
+    a = _analyzer(amod)
+    a.analyze_repository(proj, extra_paths=[extra])
+    for p in a.functions_collection.rows.values():
+        if p.get("project_source") == proj.as_posix():
+            p["embed_revision"] = amod.CODEGRAPH_EMBED_REVISION - 1
+    b = _analyzer(amod)
+    _rewire(b, a)
+    for coll in (b.modules_collection, b.functions_collection, b.classes_collection):
+        coll.writes.clear()
+    return proj, extra, b
+
+
+def _written_sources(coll) -> List[str]:
+    return sorted({coll.rows[u].get("project_source", "") for u in coll.writes if u in coll.rows})
+
+
+def test_r11_02_projects_stale_row_does_not_rewalk_the_extras_copy(amod, no_embed, tmp_path):
+    """ACT (v0.2.102 R11-02). The project's ``pkg/same.py`` owns a stale row; the
+    extra folder's identical copy is current. In a combined walk the extra's
+    copy is skipped (nothing it owns is stale). Before the fix the stale set
+    was keyed by path alone, so the project's stale row made the extra root
+    re-walk and re-write its own current rows."""
+    _proj, extra, b = _two_root_graph_with_a_stale_project_row(amod, tmp_path)
+    b.analyze_repository(_proj, extra_paths=[extra])
+    for coll in (b.modules_collection, b.functions_collection, b.classes_collection):
+        assert extra.as_posix() not in _written_sources(coll), (
+            f"{coll.name}: the extra's current copy must not re-walk on the project's stale row")
+    assert all(isinstance(k, tuple) for k in b._get_stale_file_set()), "keys are (source, path)"
+
+
+def test_r11_02_the_owning_root_still_heals_its_stale_row(amod, no_embed, tmp_path):
+    """LEAVE-ALONE. The root that owns the stale row still re-walks the file and
+    re-stamps the row at the current revision."""
+    proj, extra, b = _two_root_graph_with_a_stale_project_row(amod, tmp_path)
+    b.analyze_repository(proj, extra_paths=[extra])
+    assert _written_sources(b.functions_collection) == [proj.as_posix()]
+    revs = {p.get("embed_revision") for p in b.functions_collection.rows.values()
+            if p.get("project_source") == proj.as_posix()}
+    assert revs == {amod.CODEGRAPH_EMBED_REVISION}
+
+
+@pytest.mark.parametrize("stale,walk_own,want", [
+    ({("/p", "a.py")}, ({"/p"}, False), True),        # the walk's own stale row
+    ({("/p", "a.py")}, ({"/x"}, True), False),        # another root's stale row (R11-02 act)
+    ({("", "a.py")}, ({"/p"}, False), True),          # legacy unstamped row → the project's
+    ({("", "a.py")}, ({"/x"}, True), False),          # ... never an extra's
+    ({("/p", "b.py")}, ({"/p"}, False), False),       # another path
+    ({"a.py"}, ({"/x"}, True), True),                 # bare entry: any source (old callers)
+    ({("/p", "a.py")}, None, True),                   # no walk context: any source, as before
+    (frozenset(), ({"/p"}, False), False),
+    (None, ({"/p"}, False), False),
+])
+def test_r11_02_stale_hit(stale, walk_own, want):
+    assert scope.stale_hit(stale, "a.py", walk_own) is want
+
+
+def test_r11_02_incremental_union_requeues_only_this_roots_stale_files(amod, tmp_path):
+    """ACT + LEAVE-ALONE for the ``--incremental`` union: under the extra root
+    the project's stale ``a.py`` re-queues nothing, while the extra's own stale
+    ``b.py`` is re-queued; under the project root its own (and legacy) keys do."""
+    proj, extra = (tmp_path / "proj").resolve(), (tmp_path / "clone").resolve()
+    a = _analyzer(amod)
+    a._analyze_repo_root_raw, a._strict_source = proj.as_posix(), False
+    a._stale_file_set_cache = frozenset({
+        (proj.as_posix(), "a.py"), (extra.as_posix(), "b.py"), ("", "c.py")})
+    files = [extra / "a.py", extra / "b.py", extra / "c.py"]
+    assert a._union_stale_into_changed(extra, files, []) == [extra / "b.py"]
+    pfiles = [proj / "a.py", proj / "b.py", proj / "c.py"]
+    assert a._union_stale_into_changed(proj, pfiles, []) == [proj / "a.py", proj / "c.py"]
+
+
 def _run_analyzer_cli(args, tmp_path):
     return subprocess.run([sys.executable, str(_ANALYZER), *args], capture_output=True, text=True,
                           env=child_env(WEAVIATE_URL="http://127.0.0.1:9"), cwd=str(tmp_path),
@@ -486,6 +628,30 @@ def test_d4_cli_as_extra_path_external_is_not_refused(tmp_path):
     assert "refusing --as-extra-path" not in r.stderr
     assert r.returncode == 1 and "--canonical-source requires" in r.stderr, r.stderr[-800:]
     assert "--canonical-source ignored with --as-extra-path" in r.stderr
+
+
+def test_r11_04_lone_primary_root_is_rejected_loudly(tmp_path):
+    """ACT (v0.2.102 R11-04). ``--primary-root`` without ``--as-extra-path`` used
+    to be silently ignored (no overlap check, no warning). It is now refused
+    like a lone ``--canonical-source``: exit 1 and a stderr line, before any
+    walk — so the nested root below is never indexed as the project."""
+    proj = tmp_path / "proj"
+    (proj / "sub").mkdir(parents=True)
+    r = _run_analyzer_cli([str(proj / "sub"), "--project", "W6", "--primary-root", str(proj)],
+                          tmp_path)
+    assert r.returncode == 1, (r.returncode, r.stderr[-800:])
+    assert "--primary-root requires --as-extra-path" in r.stderr
+    assert not (tmp_path / ".claude").exists(), "refused before any walk or ledger write"
+
+
+def test_r11_04_primary_root_with_as_extra_path_is_still_honoured(tmp_path):
+    """LEAVE-ALONE: paired with ``--as-extra-path`` the flag still drives the
+    overlap check (the refusal below comes from it, not from R11-04's guard)."""
+    proj = tmp_path / "proj"
+    (proj / "sub").mkdir(parents=True)
+    r = _run_analyzer_cli([str(proj / "sub"), "--project", "W6", "--as-extra-path",
+                           "--primary-root", str(proj)], tmp_path)
+    assert r.returncode == 2 and "requires --as-extra-path" not in r.stderr
 
 
 def test_d4_refresh_skips_a_nested_row_with_a_log_line(tmp_path):

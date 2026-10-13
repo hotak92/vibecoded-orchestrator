@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import hooks_settings, parked_hooks, settings_merge  # noqa: E402
 from vco_lib.parked_hooks import ParkedHook, ParkedHooksState  # noqa: E402
 
@@ -200,7 +200,7 @@ def test_the_template_path_has_one_home() -> None:
 
 
 def _run_cli(request: dict, *, root: Path = REPO_ROOT) -> tuple[int, dict]:
-    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT), "WEAVIATE_URL": "http://127.0.0.1:9"}
+    env = child_env(WEAVIATE_URL="http://127.0.0.1:9")
     proc = subprocess.run(
         [sys.executable, "-m", "vco_lib.parked_hooks", "carried",
          "--orchestrator-root", str(root)],
@@ -263,3 +263,55 @@ def test_cli_missing_template_is_a_refusal(tmp_path: Path) -> None:
     rc, out = _run_cli({"project_folder": str(folder), "parked": [
         {"event": "Stop", "matcher": "", "command": "bash .claude/hooks/x.sh"}]}, root=fake_root)
     assert rc == 1 and out["code"] == "template_unreadable"
+
+
+# ── v0.2.102 R11-05: the root the CLI reads is the one it was told ─────────
+
+
+def _run_cli_root_arg(request: dict, root_arg: str, **env_over: str) -> tuple[int, dict]:
+    env = child_env(WEAVIATE_URL="http://127.0.0.1:9", **env_over)
+    proc = subprocess.run(
+        [sys.executable, "-m", "vco_lib.parked_hooks", "carried", "--orchestrator-root", root_arg],
+        input=json.dumps(request), capture_output=True, text=True, cwd=REPO_ROOT,
+        env=env, timeout=120, check=False)
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 1, f"one JSON object on stdout: {proc.stdout!r} {proc.stderr!r}"
+    return proc.returncode, json.loads(lines[0])
+
+
+def _drain_off_request(tmp_path: Path) -> dict:
+    from vco_lib.bundle_settings_io import settings_template_path
+
+    template = json.loads(settings_template_path(REPO_ROOT).read_text(encoding="utf-8"))
+    folder = _project(tmp_path, _parked_on_stop_everywhere_off(template)["hooks"])
+    return {"project_folder": str(folder), "parked": [
+        {"event": "Stop", "matcher": "", "command": "bash .claude/hooks/stop-drain-citations.sh"}]}
+
+
+def test_cli_a_named_root_that_does_not_exist_fails_loudly(tmp_path: Path) -> None:
+    """ACT. Before R11-05 a non-existent explicit root fell through to the
+    ambient ``VCT_INSTALL_ROOT`` (here a real clone) and answered from THAT
+    clone's template — the disagreement the explicit root exists to prevent."""
+    rc, out = _run_cli_root_arg(_drain_off_request(tmp_path), str(tmp_path / "no-such-clone"),
+                                VCT_INSTALL_ROOT=str(REPO_ROOT))
+    assert rc == 1, out
+    assert out["ok"] is False and out["code"] == "no_install_root"
+    assert "no-such-clone" in out["error"]
+
+
+def test_cli_an_empty_root_uses_the_documented_default_ladder(tmp_path: Path) -> None:
+    """LEAVE-ALONE, and the help text's promise: with no root the env var that
+    names a clone is used (then this vco_lib's clone)."""
+    rc, out = _run_cli_root_arg(_drain_off_request(tmp_path), "", VCT_INSTALL_ROOT=str(REPO_ROOT))
+    assert rc == 0 and out["ok"] is True
+    assert sorted(r["event"] for r in out["carried"]) == ["SessionEnd", "SubagentStop"]
+
+
+def test_cli_help_describes_the_real_default() -> None:
+    from vco_lib.parked_hooks import build_parser
+
+    sub = next(a for a in build_parser()._actions if a.dest == "op")
+    help_text = sub.choices["carried"].format_help()  # type: ignore[union-attr]
+    flat = " ".join(help_text.split())
+    assert "$VCT_INSTALL_ROOT" in flat and "$VCT_ORCHESTRATOR_ROOT" in flat
+    assert "Must exist when given" in flat

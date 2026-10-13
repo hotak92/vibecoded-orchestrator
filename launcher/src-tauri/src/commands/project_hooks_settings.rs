@@ -1102,21 +1102,47 @@ pub async fn park_carried_registrations(
     project_id: &str,
     parked: Vec<vct_launcher_core::db::project_hooks_settings::ParkedHook>,
 ) -> Vec<vct_launcher_core::db::project_hooks_settings::ParkedHook> {
+    let root = crate::commands::installer::resolve_install_root_sync(db);
+    park_carried_registrations_from(db, project_id, parked, root).await
+}
+
+/// [`park_carried_registrations`] with the install root already resolved —
+/// the seam its no-root arm is tested through.
+///
+/// The template is read from the SAME clone the CLI runs from (its cwd),
+/// passed explicitly so an ambient VCT_INSTALL_ROOT naming another clone
+/// cannot make the tab and this launcher's bundle update disagree. With NO
+/// resolved root the check is skipped with a warning (v0.2.102 R11-05): an
+/// empty `--orchestrator-root` would hand the choice to the CLI's own ladder,
+/// which consults that very ambient VCT_INSTALL_ROOT / VCT_ORCHESTRATOR_ROOT
+/// first. Nothing is written; the bundle merge still keeps the registrations
+/// out.
+async fn park_carried_registrations_from(
+    db: &Db,
+    project_id: &str,
+    parked: Vec<vct_launcher_core::db::project_hooks_settings::ParkedHook>,
+    root: Option<std::path::PathBuf>,
+) -> Vec<vct_launcher_core::db::project_hooks_settings::ParkedHook> {
     if parked.is_empty() {
         return parked;
     }
+    let Some(root) = root else {
+        tracing::warn!(
+            "[vct] the orchestrator clone could not be resolved — skipped the check of which \
+             events {} parked hook(s) of project {} carry to; no row added, the bundle update \
+             still keeps them off.",
+            parked.len(),
+            project_id
+        );
+        return parked;
+    };
     let Ok(folder) = project_folder(db, project_id) else {
         return parked;
     };
     let body = carried_request(&parked, &folder.to_string_lossy());
-    // The template is read from the SAME clone the CLI runs from (its cwd),
-    // passed explicitly so an ambient VCT_INSTALL_ROOT naming another clone
-    // cannot make the tab and this launcher's bundle update disagree.
-    // An unknown root is sent as "" (the CLI's own default: this vco_lib's
-    // clone). Module and argv stay literal so the argv-contract census
+    // Module and argv stay literal so the argv-contract census
     // (tests/test_v0297_vco_lib_argv_contract.py) parses this call with the
     // module's real parser — `vco_lib/parked_hooks.py` `build_parser`.
-    let root = crate::commands::installer::resolve_install_root_sync(db).unwrap_or_default();
     let answer = match run_vco_lib_json(
         db,
         "vco_lib.parked_hooks",
@@ -2686,6 +2712,26 @@ mod tests {
         assert_eq!(disabled_events(&view, DRAIN), vec!["Stop"]);
         let parked = f.db.list_parked_project_hooks(&f.pid).unwrap();
         assert_eq!(parked.len(), 1, "only the user's own Stop row");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_resolved_install_root_skips_the_carry_check_and_writes_nothing() {
+        // LEAVE-ALONE (v0.2.102 R11-05). With no resolved clone the check is
+        // skipped (warn) rather than sent with an empty `--orchestrator-root`,
+        // which the CLI would resolve through the ambient VCT_INSTALL_ROOT /
+        // this vco_lib's clone and park rows from THAT template. RED before the
+        // fix: the "" root answered from this checkout and parked 2 rows.
+        let f = Fixture::with_settings(DRAIN_OFF_SETTINGS);
+        park_drain_on_stop(&f);
+        let parked = f.db.list_parked_project_hooks(&f.pid).unwrap();
+        let before = f.raw();
+
+        let back = park_carried_registrations_from(&f.db, &f.pid, parked, None).await;
+
+        assert_eq!(back.len(), 1, "the parked rows come back unchanged");
+        assert_eq!(f.db.list_parked_project_hooks(&f.pid).unwrap().len(), 1, "no row added");
+        assert!(f.db.get_parked_project_hook_entry(&f.pid, "SessionEnd", "", DRAIN).unwrap().is_none());
+        assert_eq!(f.raw(), before);
     }
 
     #[tokio::test(flavor = "multi_thread")]
