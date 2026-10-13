@@ -123,6 +123,7 @@ if ($VcoVenvPy) {
 # Backwards-compatible: pre-v0.2.47 hubs lack the field; the resolver
 # exits 4 and the loop is a no-op.
 $ExtrasMatched = $false
+$PrimaryRoot = $RepoPath  # the project's own folder, kept for --primary-root
 if ($EditedFile -notlike "$RepoPath/*" -and $EditedFile -notlike "$RepoPath\*") {
     $ExtrasResolver = Join-Path $RepoPath ".claude/scripts/vct_project_config.ps1"
     if (Test-Path $ExtrasResolver) {
@@ -288,8 +289,8 @@ if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 # so an unchanged or trivially-edited file writes ~0 objects. No repo-wide
 # prune happens, so this can't re-introduce the V52-O.7 prune-deletes-other-
 # rows regression.
-# --canonical-source $CanonRoot dedups git-worktree edits onto the
-# main-checkout object (Bug 3 part b — mirrors the .sh sibling).
+# --canonical-source $CanonRoot dedups git-worktree edits of the PROJECT onto
+# the main-checkout object (Bug 3 part b — mirrors the .sh sibling).
 #
 # v0.2.72 (P7): the per-object skip also honors the embedding-revision gate.
 # When an edited file contains a Function/Class whose stored embed_revision is
@@ -305,13 +306,19 @@ if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 # uses the canonical main root's setting.
 $IndexDotClaude = Resolve-IndexDotClaude -Root $CanonRoot
 $DotClaudeFlag = if ($IndexDotClaude) { '--index-dot-claude' } else { '--no-index-dot-claude' }
-$analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, '--canonical-source', $CanonRoot, $DotClaudeFlag)
 # v0.2.102: an edit claimed by an extra path is analyzed with --as-extra-path,
 # like every other extra-path analyzer run (vco_lib.codegraph_extras_refresh.
 # build_extra_sync_argv): deletes are limited to rows provably stamped with
-# the extra path. MUST MATCH the .sh sibling.
+# the extra path. W6-CGD (D-2): --canonical-source is for the PROJECT's own
+# edits only; an extra's rows carry the registered extra root, as every other
+# extra producer stamps (vco_lib.codegraph_source_scope.walk_source_stamp).
+# --primary-root lets the analyzer refuse an extra that overlaps the project
+# (vco_lib.codegraph_extra_overlap). MUST MATCH the .sh sibling.
 if ($ExtrasMatched) {
-    $analyzerArgs += '--as-extra-path'
+    $analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, $DotClaudeFlag,
+        '--as-extra-path', '--primary-root', $PrimaryRoot)
+} else {
+    $analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, '--canonical-source', $CanonRoot, $DotClaudeFlag)
 }
 # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1, dot-sourced
 # at the top of this file): an unguarded `-WindowStyle Hidden` is REJECTED on

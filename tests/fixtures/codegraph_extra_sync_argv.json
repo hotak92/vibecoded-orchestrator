@@ -1,5 +1,5 @@
 {
-  "_comment": "v0.2.100 W5R-04: the ONE argv shape for syncing a single extra code-graph path. Asserted by vct-launcher-core db::codegraph_extras::extra_path_sync_args (Rust, panel Sync button) AND vco_lib.codegraph_extras_refresh.build_extra_sync_argv (Python, automatic Stop-drain refresh). Edit both sides together. The stale_cases table pins the shared 'needs a re-index' rule (Rust extra_path_is_stale / Python extra_path_is_stale): stale iff the repo HEAD is known and differs from last_indexed_commit. v0.2.100: every case carries --as-extra-path (the analyzer then never deletes a row not provably stamped with this path, e.g. a legacy primary row with an empty project_source).",
+  "_comment": "v0.2.100 W5R-04: the ONE argv shape for syncing a single extra code-graph path. Asserted by vct-launcher-core db::codegraph_extras::extra_path_sync_args (Rust, panel Sync button) AND vco_lib.codegraph_extras_refresh.build_extra_sync_argv (Python, automatic Stop-drain refresh). Edit both sides together. The stale_cases table pins the shared 'needs a re-index' rule (Rust extra_path_is_stale / Python extra_path_is_stale): stale iff the repo HEAD is known and differs from last_indexed_commit. v0.2.100: every case carries --as-extra-path (the analyzer then never deletes a row not provably stamped with this path, e.g. a legacy primary row with an empty project_source). v0.2.102 W6-CGD: a case with primary_root carries --primary-root <project folder> right after --as-extra-path, so the analyzer refuses an extra path that overlaps the project (vco_lib.codegraph_extra_overlap); primary_root null emits no flag.",
   "cases": [
     {
       "name": "full pass (incremental off)",
@@ -13,7 +13,8 @@
         "Acme",
         "--json-progress",
         "--as-extra-path"
-      ]
+      ],
+      "primary_root": null
     },
     {
       "name": "incremental with last indexed commit",
@@ -30,7 +31,8 @@
         "--incremental",
         "--since-commit",
         "abc1234"
-      ]
+      ],
+      "primary_root": null
     },
     {
       "name": "incremental without a commit",
@@ -45,7 +47,8 @@
         "--json-progress",
         "--as-extra-path",
         "--incremental"
-      ]
+      ],
+      "primary_root": null
     },
     {
       "name": "blank commit treated as absent",
@@ -60,12 +63,50 @@
         "--json-progress",
         "--as-extra-path",
         "--incremental"
-      ]
+      ],
+      "primary_root": null
+    },
+    {
+      "name": "full pass (incremental off) with the project folder",
+      "path": "/srv/clone",
+      "prefix": "Acme",
+      "incremental": false,
+      "since_commit": "abc1234",
+      "argv": [
+        "/srv/clone",
+        "--project",
+        "Acme",
+        "--json-progress",
+        "--as-extra-path",
+        "--primary-root",
+        "/srv/proj"
+      ],
+      "primary_root": "/srv/proj"
+    },
+    {
+      "name": "incremental with last indexed commit with the project folder",
+      "path": "/srv/clone",
+      "prefix": "Acme",
+      "incremental": true,
+      "since_commit": "abc1234",
+      "argv": [
+        "/srv/clone",
+        "--project",
+        "Acme",
+        "--json-progress",
+        "--as-extra-path",
+        "--primary-root",
+        "/srv/proj",
+        "--incremental",
+        "--since-commit",
+        "abc1234"
+      ],
+      "primary_root": "/srv/proj"
     }
   ],
   "queued_cases": [
     {
-      "_comment": "v0.2.102 S16-7: the per-edit queued drain (refresh_queued / --queued) runs the analyzer with the extra's OWN collection args in scoped --only-files-from mode: build_extra_sync_argv(path, prefix, False, None) + ['--only-files-from', <list file>]. The analyzer rejects --incremental combined with --only-files-from, so the queued argv never carries it; the commit is NOT recorded by the queued drain (the commit-stamp path owns last_indexed_commit).",
+      "_comment": "v0.2.102 S16-7: the per-edit queued drain (refresh_queued / --queued) runs the analyzer with the extra's OWN collection args in scoped --only-files-from mode: build_extra_sync_argv(path, prefix, False, None, primary_root) + ['--only-files-from', <list file>]. The analyzer rejects --incremental combined with --only-files-from, so the queued argv never carries it; the commit is NOT recorded by the queued drain (the commit-stamp path owns last_indexed_commit).",
       "name": "queued drain over edited files",
       "path": "/srv/clone",
       "prefix": "Acme",
@@ -76,9 +117,12 @@
         "Acme",
         "--json-progress",
         "--as-extra-path",
+        "--primary-root",
+        "/proj",
         "--only-files-from",
         "/proj/.claude/state/codegraph_drain_extra-files-<md5(path)>.txt"
-      ]
+      ],
+      "primary_root": "/proj"
     }
   ],
   "stale_cases": [

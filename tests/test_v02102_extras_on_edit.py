@@ -68,7 +68,7 @@ def test_queued_argv_matches_shared_fixture() -> None:
     cases = json.loads(FIXTURE.read_text(encoding="utf-8"))["queued_cases"]
     assert cases, "the fixture must pin the queued-drain argv"
     for c in cases:
-        got = cer.build_extra_sync_argv(c["path"], c["prefix"], False, None) + [
+        got = cer.build_extra_sync_argv(c["path"], c["prefix"], False, None, c["primary_root"]) + [
             "--only-files-from", c["list_file"],
         ]
         assert got == c["argv"], c["name"]
@@ -156,7 +156,7 @@ def test_refresh_queued_drains_with_the_extras_own_args(tmp_path: Path) -> None:
     assert out == {extra: "drained"}
     want_list = str(tmp_path / "state" / f"codegraph_drain_extra-files-{_md5(extra)}.txt")
     assert rec.runs == [
-        cer.build_extra_sync_argv(extra, "Acme", False, None) + ["--only-files-from", want_list]
+        cer.build_extra_sync_argv(extra, "Acme", False, None, str(tmp_path)) + ["--only-files-from", want_list]
     ], rec.runs
     assert rec.listed == [[f"{extra}/src/a.py", f"{extra}/src/b.py"]]
     # Queue consumed, lock released, list file removed.

@@ -26,7 +26,13 @@
 #   2. enabled extra path     → repo_path = extra, --project = the CURRENT
 #                                project's prefix, --as-extra-path (the same
 #                                ownership guard every other extra-path
-#                                analyzer run passes)
+#                                analyzer run passes), --primary-root = the
+#                                project, and NO --canonical-source (W6-CGD
+#                                D-2: an extra's rows carry its own root)
+#   2b. enabled extra that is a git worktree OF the project → still no
+#                                --canonical-source (it used to be the
+#                                project's root: the edit overwrote the
+#                                project's own rows)
 #   3. disabled extra path    → never re-pointed to the extra
 #   4. sibling project        → repo_path + --project = the sibling
 #   5. non-git scratch path   → analyzer not invoked (v0.2.66 scratch skip)
@@ -255,6 +261,7 @@ run_hook() {
 #   canon        value after --canonical-source
 #   only         value after --only-file
 #   extra_flag   "yes" when --as-extra-path was passed, else "no"
+#   primary      value after --primary-root
 #   dot_claude   the --index-dot-claude / --no-index-dot-claude flag
 argv_get() {
     python3 - "$ARGV_LOG" "$1" <<'PYEOF'
@@ -277,6 +284,7 @@ out = {
     "canon": after("--canonical-source"),
     "only": after("--only-file"),
     "extra_flag": "yes" if "--as-extra-path" in argv else "no",
+    "primary": after("--primary-root"),
     "dot_claude": next((a for a in argv if a in ("--index-dot-claude", "--no-index-dot-claude")), "<absent>"),
 }[field]
 print(out)
@@ -294,6 +302,7 @@ assert_eq "$(argv_get project)" "$HUB_PREFIX" "own-repo edit → --project is th
 assert_eq "$(argv_get only)" "$PROJECT_ROOT/src/main.py" "own-repo edit → --only-file is the edited file"
 assert_eq "$(argv_get canon)" "$PROJECT_ROOT" "own-repo edit → --canonical-source is the project's git root"
 assert_eq "$(argv_get extra_flag)" "no" "own-repo edit → no --as-extra-path"
+assert_eq "$(argv_get primary)" "<absent>" "own-repo edit → no --primary-root"
 assert_eq "$(argv_get dot_claude)" "--no-index-dot-claude" \
     "own-repo edit → user project excludes .claude/ (hub field absent, not a VCO clone)"
 
@@ -304,9 +313,33 @@ assert_eq "$(argv_get invocations)" "1" "enabled extra → analyzer invoked once
 assert_eq "$(argv_get repo)" "$EXTRA_PATH" "enabled extra → repo_path re-pointed to the extra"
 assert_eq "$(argv_get project)" "$HUB_PREFIX" \
     "enabled extra → --project stays the current project's prefix (extras index into it)"
-assert_eq "$(argv_get canon)" "$EXTRA_PATH" "enabled extra → --canonical-source is the extra's git root"
+assert_eq "$(argv_get canon)" "<absent>" \
+    "enabled extra → no --canonical-source (rows carry the extra's own root, as every other extra producer stamps)"
 assert_eq "$(argv_get extra_flag)" "yes" \
     "enabled extra → --as-extra-path (deletes limited to rows provably the extra's)"
+assert_eq "$(argv_get primary)" "$PROJECT_ROOT" \
+    "enabled extra → --primary-root is the project (the analyzer refuses an overlapping extra)"
+
+# ── Scenario 2b: the enabled extra is a git WORKTREE of the project ────
+# Its canonical git root is the PROJECT's root; passing it as
+# --canonical-source used to stamp the extra's edit with the project's
+# identity and overwrite the project's own rows.
+git -C "$PROJECT_ROOT" -c user.name=t -c user.email=t@example.invalid \
+    commit -q --allow-empty -m init >/dev/null 2>&1
+WT_EXTRA="$scratch/extras/myproject-wt"
+git -C "$PROJECT_ROOT" worktree add -q "$WT_EXTRA" >/dev/null 2>&1
+mkdir -p "$WT_EXTRA/src"
+echo "# stub" > "$WT_EXTRA/src/feature.py"
+write_fixture "code_graph_extra_paths" \
+    "{\"code_graph_extra_paths\":[{\"path\":\"$WT_EXTRA\",\"enabled\":true,\"last_indexed_commit\":null}]}"
+run_hook "$WT_EXTRA/src/feature.py"
+assert_eq "$(argv_get invocations)" "1" "worktree extra → analyzer invoked once"
+assert_eq "$(argv_get repo)" "$WT_EXTRA" "worktree extra → repo_path is the extra"
+assert_eq "$(argv_get canon)" "<absent>" \
+    "worktree extra → no --canonical-source (never the project's root)"
+assert_eq "$(argv_get extra_flag)" "yes" "worktree extra → --as-extra-path"
+write_fixture "code_graph_extra_paths" \
+    "{\"code_graph_extra_paths\":[{\"path\":\"$EXTRA_PATH\",\"enabled\":true,\"last_indexed_commit\":null}]}"
 
 # ── Scenario 3: edit under a DISABLED extra path ───────────────────────
 # Disabled rows are filtered by the resolver; the file is under no sibling

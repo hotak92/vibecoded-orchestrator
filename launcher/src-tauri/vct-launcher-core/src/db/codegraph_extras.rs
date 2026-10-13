@@ -290,11 +290,16 @@ impl Db {
 /// `--since-commit` is emitted only for an incremental run that knows the
 /// last indexed commit; without one an incremental run would diff only
 /// `HEAD~1`, so callers without a commit should run a full pass.
+///
+/// `primary_root` (the project's own folder) adds `--primary-root`, so the
+/// analyzer refuses an extra path that overlaps the project (v0.2.102 W6-CGD,
+/// the rule in `vco_lib/codegraph_extra_overlap.py`).
 pub fn extra_path_sync_args(
     path: &str,
     prefix: &str,
     incremental: bool,
     since_commit: Option<&str>,
+    primary_root: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
         path.to_string(),
@@ -306,6 +311,10 @@ pub fn extra_path_sync_args(
         // (a legacy row with an empty `project_source` is the primary's).
         "--as-extra-path".to_string(),
     ];
+    if let Some(root) = primary_root.filter(|r| !r.is_empty()) {
+        args.push("--primary-root".to_string());
+        args.push(root.to_string());
+    }
     if incremental {
         args.push("--incremental".to_string());
         if let Some(sha) = since_commit.map(str::trim).filter(|s| !s.is_empty()) {
@@ -460,6 +469,7 @@ mod tests {
                 c["prefix"].as_str().unwrap(),
                 c["incremental"].as_bool().unwrap(),
                 c["since_commit"].as_str(),
+                c["primary_root"].as_str(),
             );
             let want: Vec<String> = c["argv"]
                 .as_array()

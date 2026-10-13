@@ -488,7 +488,10 @@ try:
     # preserve exemption from the 2026-07-15 wipe incident) lives in vco_lib
     # so the analyzer monolith stays flat (P2f ratchet). `_prune_collection`
     # is a thin shim over it.
-    from vco_lib.codegraph_prune import prune_collection as _prune_collection_impl
+    from vco_lib.codegraph_prune import (
+        prune_collection as _prune_collection_impl, expand_preserve_entries as _expand_preserve)
+    from vco_lib import codegraph_source_scope as _src_scope  # W6-CGD: stamp + ownership + preserve keys
+    from vco_lib.codegraph_extra_overlap import classify as _extra_overlap  # W6-CGD D-4
     from vco_lib.codegraph_schema import (  # v0.2.102: one ensure loop + backfill
         backfill_missing_property as _backfill_missing_property,
         ensure_analyzer_properties as _ensure_analyzer_properties,
@@ -3430,22 +3433,13 @@ class CodeGraphAnalyzer:
                 ``HEAD~1..HEAD`` re-churn (dozens of files re-parsed per
                 keystroke) AND the correctness bug (the edited file is
                 uncommitted, so it was never in the diff range at all).
-            canonical_source: v0.2.66 (Bug 3, part b) — override the
-                ``project_source`` value (and the absolute-source component
-                of every object's deterministic UUID) with this canonical
-                root instead of ``source_root.as_posix()``. The per-edit
-                hook resolves the edited file's git MAIN repo root (a linked
-                worktree shares its main repo's object store) and passes it
-                here, so a worktree edit and a main-checkout edit of the
-                SAME logical file converge on ONE canonical object rather
-                than minting a per-worktree duplicate. WHY this is needed:
-                the ``file_path`` (``relative_to(repo_path)``) is already
-                identical between a worktree and its main checkout; only the
-                absolute source root differs, and that absolute root is what
-                ``_dedup_insert`` mixes into the UUID (V52-O.3). Overriding
-                it removes the divergence. ``None`` (default) preserves the
-                per-source-root behaviour. Has no effect unless ``only_file``
-                is set (whole-tree walks keep their per-root provenance).
+            canonical_source: v0.2.66 (Bug 3, part b) — stamp this root (the
+                edited file's git MAIN repo root, from the per-edit hook / the
+                primary Stop drain) as ``project_source`` and UUID seed instead
+                of ``source_root``, so a worktree edit of the project converges
+                on the main checkout's rows. Scoped file modes only, and never
+                for an extra path (W6-CGD D-2: an extra's rows always carry the
+                extra's own root) — ``_src_scope.walk_source_stamp`` decides.
 
         Returns:
             Dictionary with analysis statistics. v0.2.16 adds:
@@ -3491,6 +3485,7 @@ class CodeGraphAnalyzer:
         # caller's snapshot and now — soft-fail so a single mis-typed
         # extra doesn't wedge the whole analyze.
         canonical_extras: List[Path] = []
+        self._refused_extra_sources: Set[str] = set()  # W6-CGD D-4: nested extras, rows kept
         for extra in (extra_paths or []):
             try:
                 resolved = extra.resolve()
@@ -3505,6 +3500,11 @@ class CodeGraphAnalyzer:
                     f"⚠️  Extra path {resolved} does not exist or is not a directory — skipping",
                     file=sys.stderr,
                 )
+                continue
+            _ov = _extra_overlap(resolved.as_posix(), repo_path.as_posix())
+            if _ov.refused:  # overlaps the project: not walked, and --prune-stale keeps its rows
+                print(f"❌ Extra path refused, not walked: {_ov.message}", file=sys.stderr)
+                self._refused_extra_sources |= _src_scope.walk_own_sources(resolved, extra.as_posix())
                 continue
             canonical_extras.append(resolved)
 
@@ -3645,17 +3645,17 @@ class CodeGraphAnalyzer:
                 seen_paths.add(p)
                 fpath = Path(p)
                 if not fpath.is_file():
-                    # Vanished path → PRUNE its objects (delete), not skip. Key
-                    # the delete on the repo-relative path (same as the write
-                    # path stamps) + the canonical source when known.
+                    # Vanished path → PRUNE its objects, keyed on the repo-relative
+                    # path + the SAME source the write path stamps (W6-CGD: an extra's
+                    # queued drain never reaches the project's rows of that path).
                     try:
                         rel = fpath.resolve().relative_to(repo_path.resolve()).as_posix()
                     except Exception:  # noqa: BLE001 — outside root / unresolved
                         rel = ""
                     if rel:
-                        self._prune_deleted_file_objects(
-                            rel, canonical_source or "",
-                        )
+                        self._prune_deleted_file_objects(rel, _src_scope.walk_source_stamp(
+                            repo_path.as_posix(), canonical_source=canonical_source,
+                            scoped=True, extra_root=self._strict_source))
                     continue
                 # Existing file → route through the single-file dispatch and
                 # merge its (0-or-1) entry into the union.
@@ -3756,23 +3756,14 @@ class CodeGraphAnalyzer:
             # The dispatcher restores the prior value (in practice always "") on
             # exit so back-to-back lang_dispatch iterations don't leak state.
             self._current_language = lang_name
-            # v0.2.47 (extras): same pattern for `project_source`. POSIX
-            # path so Linux/macOS/Windows all produce a stable property
-            # value (matches the file_path_rel POSIX convention).
-            #
-            # v0.2.66 (Bug 3, part b): in single-file mode, the per-edit hook
-            # may pass a `canonical_source` (the edited file's git MAIN repo
-            # root). Stamp THAT instead of the on-disk `source_root` so a
-            # worktree edit converges on the canonical object (see the
-            # `canonical_source` arg docstring). Only honoured for a scoped
-            # file path; whole-tree walks keep per-root provenance.
-            # v0.2.73 (FIX-B): the batched drain (`only_files_from`) passes ONE
-            # canonical source for the whole batch (grouped by canonical root
-            # upstream), so honour it the same way as single-file mode.
-            if (only_file is not None or only_files_from is not None) and canonical_source:
-                self._current_source = canonical_source
-            else:
-                self._current_source = source_root.as_posix()
+            # `project_source` (POSIX) + the rows this root owns: ONE rule in
+            # vco_lib.codegraph_source_scope (W6-CGD D-1/D-2) — an extra root
+            # stamps itself; --canonical-source only for the project's scoped edits.
+            _xroot = self._strict_source or is_extra
+            self._current_source = _src_scope.walk_source_stamp(
+                source_root.as_posix(), canonical_source=canonical_source,
+                scoped=(only_file is not None or only_files_from is not None), extra_root=_xroot)
+            self._walk_own = (_src_scope.walk_own_sources(source_root, self._current_source), _xroot)
 
             for f in files:
                 if self._progress_emitter is not None and total_files > 0:
@@ -3856,7 +3847,7 @@ class CodeGraphAnalyzer:
         # v0.2.47: also clear the per-source-root context so a subsequent
         # standalone insert (cross-reference creation in the post-loop)
         # doesn't accidentally re-stamp the last extra's path.
-        self._current_source = ""
+        self._current_source, self._walk_own = "", None
 
         # v0.2.92 (Defect A): chunk-planning degrades. The per-entity warnings
         # name WHICH entities; this total makes a walk that degraded 400 of them
@@ -3982,7 +3973,8 @@ class CodeGraphAnalyzer:
         TWO call sites: the dispatch loop (every dispatched file) and the
         incremental branch's PRE-filter list (review blocker 1: unchanged
         files are dropped before dispatch — not-walked ≠ stale). Gated on
-        ``_track_visited`` so non-prune runs pay nothing.
+        ``_track_visited`` so non-prune runs pay nothing. W6-CGD (D-3): keyed
+        ``(walked root, rel)`` so one tree's skip never shields its twin.
         """
         if not self._track_visited:
             return
@@ -3990,7 +3982,7 @@ class CodeGraphAnalyzer:
             rel = f.relative_to(source_root).as_posix()
         except Exception:  # noqa: BLE001 — defensive: odd roots
             rel = str(f).replace("\\", "/")
-        self._prune_discovered_paths.add(rel)
+        self._prune_discovered_paths.add((Path(source_root).as_posix(), rel))
 
     def _prune_stale_objects(self) -> int:
         """Delete code-graph objects that were not visited this run.
@@ -4043,19 +4035,17 @@ class CodeGraphAnalyzer:
         for coll_name, uid in self.visited_uuids:
             per_collection_visited.setdefault(coll_name, set()).add(uid)
 
-        # v0.2.82 — preserve set: files the dispatcher discovered on disk but
-        # whose extraction never wrote a module row (unchanged-skip /
-        # parse-failure). Their rows are ALIVE, just not re-walked; deleting
-        # them is the 2026-07-15 whole-graph-wipe incident. Rows anchored to
-        # these paths are preserved by `_prune_collection` (a minified skip's
+        # v0.2.82 — preserve set: files discovered on disk whose module row was
+        # not re-written (unchanged-skip / parse-failure) are ALIVE; deleting
+        # them is the 2026-07-15 whole-graph-wipe incident (a minified skip's
         # rows were already pruned by the S16-3 end-of-walk policy prune).
-        preserve_paths: Set[str] = (
-            getattr(self, "_prune_discovered_paths", set())
-            - getattr(self, "_prune_walked_paths", set())
-        )
-        if preserve_paths:
+        _skipped = getattr(self, "_prune_discovered_paths", set()) - getattr(self, "_prune_walked_paths", set())
+        preserve_paths = _expand_preserve(  # W6-CGD (D-3): (source, rel) keys
+            _skipped, primary_root=getattr(self, "_analyze_repo_root_raw", "") or "",
+            strict=bool(getattr(self, "_strict_source", False)))
+        if _skipped:
             print(
-                f"🛡️  Prune-preserve: {len(preserve_paths)} skipped-but-present "
+                f"🛡️  Prune-preserve: {len(_skipped)} skipped-but-present "
                 f"file(s) — their rows are exempt from stale pruning"
             )
 
@@ -4081,6 +4071,7 @@ class CodeGraphAnalyzer:
             pruned, failures = self._prune_collection(
                 coll, visited, language_scope=scope_lang,
                 preserve_paths=preserve_paths,
+                preserve_sources=getattr(self, "_refused_extra_sources", None),
             )
             if pruned:
                 print(f"🧹 Pruned {pruned} stale objects from {coll.name}")
@@ -4108,7 +4099,8 @@ class CodeGraphAnalyzer:
         collection,
         visited_uuids: Set[str],
         language_scope: str = "",
-        preserve_paths: Optional[Set[str]] = None,
+        preserve_paths: Optional[Set[Any]] = None,
+        preserve_sources: Optional[Set[str]] = None,
     ) -> Tuple[int, int]:
         """Thin shim over ``vco_lib.codegraph_prune.prune_collection`` (the
         v0.2.82 extraction — full semantics, history and the 2026-07-15
@@ -4122,6 +4114,7 @@ class CodeGraphAnalyzer:
             canonical_lang_id=_canonical_lang_id,
             language_scope=language_scope,
             preserve_paths=preserve_paths,
+            preserve_sources=preserve_sources,
         )
 
     def _single_file_dispatch(
@@ -4902,8 +4895,8 @@ class CodeGraphAnalyzer:
         Compensation: clear ``file_hash`` and stamp ``embed_revision`` 0 on
         the module row so BOTH gate conjuncts fail on the next run → the file
         re-walks (and the R-1 stale-file probe independently sees it). Targets
-        the SAME row ``_get_existing_module`` consults (path-only filter,
-        limit=1), preferring this run's cache UUID when present.
+        the SAME row ``_get_existing_module`` consults (this root's row for
+        the path), preferring this run's cache UUID when present.
 
         Leave-alone case: when no module row exists (the failure happened
         BEFORE the module write), there is nothing to invalidate and the gate
@@ -4920,29 +4913,23 @@ class CodeGraphAnalyzer:
             if coll is None:
                 return
             cache = getattr(self, "module_cache", None) or {}
-            # C-12 (v0.2.75 P2c): module_cache is (project_source, path)-keyed.
-            # The module row was stamped with project_source = self._current_source
-            # (the source root being walked when this file's row was written), so
-            # look up by that same tuple. Fall back to a bare-path scan across
-            # sources so a stale/absent _current_source still finds the row
-            # (best-effort compensation, never worse than the Weaviate fetch).
+            # C-12: module_cache is (project_source, path)-keyed — look up the
+            # row this walk stamped; fall back to a scan / a Weaviate fetch that
+            # only ever picks a row OWNED by this walk (W6-CGD: never another
+            # root's copy of the same path — that would leave this root's row
+            # marked done). A legacy bare-path string key is still tolerated.
             current_source = getattr(self, "_current_source", "") or ""
-            uuid_to_fix = cache.get((current_source, rel))
+            ctx = getattr(self, "_walk_own", None)  # outside a walk any row counts (as the gate)
+            mine = lambda src: ctx is None or _src_scope.row_owned_by_walk(src, ctx[0], extra_root=ctx[1])  # noqa: E731
+            uuid_to_fix = cache.get((current_source, rel)) or next((
+                _u for _k, _u in cache.items() if (_k == rel) or (
+                    isinstance(_k, tuple) and len(_k) == 2 and _k[1] == rel and mine(_k[0]))), None)
             if uuid_to_fix is None:
-                for _k, _uuid in cache.items():
-                    # (project_source, path) tuple key OR a legacy bare-path
-                    # string key (older callers/tests) — tolerate both.
-                    _p = _k[1] if isinstance(_k, tuple) and len(_k) == 2 else _k
-                    if _p == rel:
-                        uuid_to_fix = _uuid
-                        break
-            if uuid_to_fix is None:
-                result = coll.query.fetch_objects(
-                    filters=Filter.by_property("path").equal(rel), limit=1
-                )
-                objs = getattr(result, "objects", None) or []
+                result = coll.query.fetch_objects(filters=Filter.by_property("path").equal(rel), limit=64)
+                objs = [o for o in (getattr(result, "objects", None) or [])
+                        if mine((getattr(o, "properties", None) or {}).get("project_source"))]
                 if not objs:
-                    return  # no module row landed → nothing to compensate
+                    return  # no module row of this root landed → nothing to compensate
                 uuid_to_fix = objs[0].uuid
             coll.data.update(
                 uuid=uuid_to_fix,
@@ -5050,6 +5037,14 @@ class CodeGraphAnalyzer:
         must yield for an EXTRACTOR-only fix to reach an existing graph (the
         file hash and the module revision are both still correct after such a
         fix, so every other signal says "skip"). Nothing downstream is relaxed.
+
+        v0.2.102 W6-CGD (D-1): only a row of the root being WALKED counts
+        (``_src_scope.row_owned_by_walk`` over ``self._walk_own``). Another
+        root's identical copy (project vs extra folder) no longer makes this
+        root skip its own file — before, the project never got rows for a file
+        an extra folder had indexed first, and removing that folder deleted
+        the only copy. Outside a walk (direct callers: no root is known) any
+        row counts, as before. Every owned match must be current to skip.
         """
         if getattr(self, "force_rewalk", False):
             return None
@@ -5067,24 +5062,17 @@ class CodeGraphAnalyzer:
             result = self.modules_collection.query.fetch_objects(
                 filters=Filter.by_property("path").equal(path) &
                         Filter.by_property("file_hash").equal(file_hash),
-                limit=1
+                limit=64,  # one row per root that holds this exact file
             )
-            if not result.objects:
-                return None
-            obj = result.objects[0]
-            stored_rev = (getattr(obj, "properties", None) or {}).get(
-                _EMBED_REVISION_PROP
-            )
-            # v0.2.82 (G1): rev-equality delegates to the ONE guard helper (the
-            # file-set probe above stays here). Skip the file ONLY when the
-            # module row is NOT stale; a stamp-owed row (floor ≤ rev < current)
-            # IS stale → re-walk, so the per-object D1 stamp can fire.
-            if not _guards.is_row_revision_stale(
-                stored_rev, CODEGRAPH_EMBED_REVISION
-            ):
-                return obj.uuid
-            # Absent / NULL / older / unparseable revision → the file's rows
-            # were embedded under a previous scheme → do NOT skip the file.
+            ctx = getattr(self, "_walk_own", None)  # (own sources, extra root) of the walk
+            owned = [o for o in result.objects if ctx is None or _src_scope.row_owned_by_walk(
+                (getattr(o, "properties", None) or {}).get("project_source"), ctx[0], extra_root=ctx[1])]
+            # v0.2.82 (G1): rev-equality delegates to the ONE guard helper. A
+            # stamp-owed / absent / NULL / older revision is stale → re-walk.
+            if owned and not any(_guards.is_row_revision_stale(
+                    (getattr(o, "properties", None) or {}).get(_EMBED_REVISION_PROP),
+                    CODEGRAPH_EMBED_REVISION) for o in owned):
+                return owned[0].uuid
             return None
         except Exception:
             return None
@@ -5152,8 +5140,8 @@ class CodeGraphAnalyzer:
         test stubs stay constructible.
         """
         _walked = getattr(self, "_prune_walked_paths", None)
-        if _walked is not None and self._track_visited and path:
-            _walked.add(path.replace("\\", "/"))
+        if _walked is not None and self._track_visited and path:  # (root, rel), as discovered
+            _walked.add((getattr(self, "_current_source", "") or "", path.replace("\\", "/")))
 
     def _create_or_update_module(self, path: str, language: str, loc: int,
                                  complexity: float, last_modified: datetime,
@@ -6226,6 +6214,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help='repo_path is one of the project\'s extra code-graph '
                              'paths: never delete a row not provably stamped with it '
                              '(legacy rows with no project_source are left alone).')
+    parser.add_argument('--primary-root', type=Path, default=None,  # W6-CGD D-4
+                        help='With --as-extra-path: the project\'s own folder. An extra '
+                             'path that overlaps it is refused (exit 2).')
     parser.add_argument('--since-commit', type=str, default=None,
                        help='With --incremental, restrict the diff to '
                             '<sha>..HEAD instead of HEAD~1..HEAD. Per source '
@@ -6412,7 +6403,14 @@ def main():
                 file=sys.stderr,
             )
             return 1
-    elif args.canonical_source:
+    if args.as_extra_path:
+        _ov = _extra_overlap(repo_path.as_posix(), args.primary_root.as_posix()) if args.primary_root else None
+        if _ov is not None and _ov.refused:  # W6-CGD D-4: vco_lib.codegraph_extra_overlap is the one rule
+            print(f"❌ refusing --as-extra-path: {_ov.message}", file=sys.stderr)
+            return 2
+        if args.canonical_source:  # an extra's rows carry its own root (walk_source_stamp)
+            print("ℹ️  --canonical-source ignored with --as-extra-path", file=sys.stderr)
+    if args.canonical_source and args.only_file is None and args.only_files_from is None:
         # --canonical-source only has meaning in a scoped file mode (it stamps
         # the per-object project_source / UUID seed). Reject the lone flag so
         # a caller isn't surprised it was silently ignored.

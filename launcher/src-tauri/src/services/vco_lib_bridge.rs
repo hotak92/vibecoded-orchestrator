@@ -68,7 +68,10 @@
 //!   * `vco_lib.service_endpoints` — [`service_endpoint_candidates`] and
 //!     [`service_endpoint_verb`] (v0.2.97: candidate detection and the
 //!     `adopt` / `use-vco-copy` / `hand-to-vco` verbs — the
-//!     `service_endpoints` rows' one writer).
+//!     `service_endpoints` rows' one writer);
+//!   * `vco_lib.codegraph_extra_overlap` — [`codegraph_extra_overlap`]
+//!     (v0.2.102 W6-CGD: may a folder be a project's extra code folder? The
+//!     one overlap rule the analyzer and the automatic refresh also use).
 
 use std::path::Path;
 use std::process::Command;
@@ -498,6 +501,35 @@ pub fn packs_status(root: &Path, project_folder: &Path) -> Result<serde_json::Va
         }
     };
     parse_ok_reply_named("packs status", &done.stdout, &done.stderr)
+}
+
+/// v0.2.102 W6-CGD (D-4): classify `extra` against the project's own folder —
+/// `python -m vco_lib.codegraph_extra_overlap --extra … --project-folder … --json`,
+/// the ONE overlap rule (rule A: the Python implementation, called from here).
+/// Returns the `ok: true` reply: `verdict` (`ok` / `same_as_project` /
+/// `inside_project` / `inside_project_ignored` / `contains_project`),
+/// `refused` and the user-facing `message`. A child that cannot run is an
+/// `Err` (a broken install), never an "allowed".
+pub fn codegraph_extra_overlap(
+    root: Option<&Path>,
+    extra: &str,
+    project_folder: &str,
+) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.codegraph_extra_overlap")
+        .arg("--extra")
+        .arg(extra)
+        .arg("--project-folder")
+        .arg(project_folder)
+        .arg("--json");
+    let folder = Path::new(project_folder);
+    let done = run_vco_lib_collect(cmd, &python, root, folder, "", VCO_LIB_SHORT_VERB_TIMEOUT)?;
+    if !done.success {
+        return Err(child_failure("code folder overlap check", &done));
+    }
+    parse_ok_reply_named("code folder overlap check", &done.stdout, &done.stderr)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

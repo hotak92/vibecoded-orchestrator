@@ -78,20 +78,40 @@ def build_extra_sync_argv(
     prefix: str,
     incremental: bool,
     since_commit: Optional[str],
+    primary_root: Optional[str] = None,
 ) -> list[str]:
     """Analyzer argv (after the script) for syncing ONE extra path.
+
+    ``primary_root`` (the project's own folder) adds ``--primary-root``, so the
+    analyzer refuses an extra path that overlaps the project (v0.2.102 W6-CGD,
+    the rule in :mod:`vco_lib.codegraph_extra_overlap`).
 
     must match vct_launcher_core::db::codegraph_extras::extra_path_sync_args
     """
     # --as-extra-path: the analyzer's repo_path IS an extra path here, so its
     # deletes must never judge a row it cannot prove is this path's (v0.2.100).
     argv = [path, "--project", prefix, "--json-progress", "--as-extra-path"]
+    if primary_root:
+        argv += ["--primary-root", primary_root]
     if incremental:
         argv.append("--incremental")
         sha = (since_commit or "").strip()
         if sha:
             argv += ["--since-commit", sha]
     return argv
+
+
+def nested_extra_refusal(path: str, project_root: str) -> str:
+    """The refusal sentence when ``path`` overlaps the project's own folder, else "".
+
+    A row registered before registration refused overlaps, or nested later by
+    a project move, is never walked as an extra (its files are the project's,
+    or excluded from it on purpose); the caller logs the sentence and skips.
+    """
+    from vco_lib.codegraph_extra_overlap import classify
+
+    v = classify(path, project_root)
+    return v.message if v.refused else ""
 
 
 def extra_path_is_stale(head: Optional[str], last_indexed_commit: Optional[str]) -> bool:
@@ -310,6 +330,11 @@ def refresh_queued(
     for extra in extras:
         path = extra.path
         key = path_key(path)
+        refusal = nested_extra_refusal(path, project_root)
+        if refusal:  # queues stay put; the row is never walked as an extra
+            outcomes[path] = "overlaps_project"
+            log(f"queued: skip path={path}: {refusal}")
+            continue
         try:
             queues = sorted(state_dir.glob(f"codegraph_drain_extra_{key}_*.txt"))
         except OSError:
@@ -377,7 +402,7 @@ def refresh_queued(
                 list_file.write_text("\n".join(files) + "\n", encoding="utf-8")
             except OSError:
                 pass
-            argv = build_extra_sync_argv(path, prefix, False, None) + [
+            argv = build_extra_sync_argv(path, prefix, False, None, project_root) + [
                 "--only-files-from", str(list_file),
             ]
             log(f"queued: drain path={path} prefix={prefix} files={len(files)}")
@@ -519,6 +544,11 @@ def refresh_extras(
     for extra in extras:
         path = extra.path
         last = extra.last_indexed_commit
+        refusal = nested_extra_refusal(path, project_root)
+        if refusal:
+            outcomes[path] = "overlaps_project"
+            log(f"skip path={path}: {refusal}")
+            continue
         head = deps.git_head(path)
         if not extra_path_is_stale(head, last):
             outcomes[path] = "up_to_date" if head else "no_git_head"
@@ -552,7 +582,7 @@ def refresh_extras(
                 stamp.write_text(str(int(now)), encoding="utf-8")
             except OSError:
                 pass
-            argv = build_extra_sync_argv(path, prefix, bool(last), last)
+            argv = build_extra_sync_argv(path, prefix, bool(last), last, project_root)
             log(f"reindex path={path} prefix={prefix} {last or 'never'}..{head[:12]}")
             res = deps.run_analyzer(python, analyzer, argv, timeout)
             if not res.ok:
