@@ -24,7 +24,16 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> every write below (snapshot, marker, force-flush flag) is skipped.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
+if [ -z "$PROJECT_DIR" ]; then
+    echo "pre-compact-save: no VCO project encloses $PWD; snapshot not saved" >&2
+    exit 0
+fi
 SNAPSHOT_FILE="$PROJECT_DIR/.claude/context/pre-compact-snapshot.md"
 
 mkdir -p "$PROJECT_DIR/.claude/context"

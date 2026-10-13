@@ -52,7 +52,13 @@ fi
 
 # Project root resolution: CLAUDE_PROJECT_DIR is the canonical signal at
 # hook fire time; fall back to PWD for ad-hoc invocations.
-PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> nothing to do (no state is written).
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_ROOT="$(vco_project_root)" || PROJECT_ROOT=""
+[ -n "$PROJECT_ROOT" ] || exit 0
 
 # Locate the matcher. Per the install-bundle layout, hooks live at
 # `<project>/.claude/hooks/` and scripts at `<project>/.claude/scripts/`,

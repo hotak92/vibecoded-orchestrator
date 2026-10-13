@@ -37,9 +37,12 @@ Cross-OS:
 - inline frontmatter parser (no PyYAML dependency)
 - Python 3.8+ stdlib only
 
-Project root resolution:
+Project root resolution (MUST MATCH vco_lib/project_root.py, see
+`_project_root` below):
 1. `$CLAUDE_PROJECT_DIR` env var (set by Claude Code at hook fire time)
-2. `os.getcwd()` fallback
+2. the nearest folder at/above the cwd with `.claude/settings.json` or
+   `.claude/env` (never the user's home; a bare `.claude/` is not a marker)
+3. none -> no suggestions, no dedup file (never a cwd-relative `.claude/`)
 """
 
 from __future__ import annotations
@@ -271,11 +274,45 @@ def any_match(keywords: Iterable[str], prompt: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _project_root() -> Path:
+def _project_root() -> Path | None:
+    """The VCO project this prompt belongs to, or None.
+
+    MUST MATCH ``vco_lib/project_root.py::resolve_project_root`` (and the hook
+    siblings ``templates/hooks/_lib/project-root.{sh,ps1}``). A C-rule mirror:
+    this script runs under the SYSTEM python3 from a hook, where vco_lib is
+    not importable, so the rule is restated here with identical data and
+    locked by ``tests/test_v02102_w6w_project_root_parity.py``.
+
+    1. ``CLAUDE_PROJECT_DIR`` when set and not blank.
+    2. The nearest folder at/above the cwd with ``.claude/settings.json`` or
+       ``.claude/env``; the walk stops at, and never accepts, the user's home
+       (``VCT_USER_HOME_OVERRIDE`` else ``Path.home()``, and ``Path.home()``).
+    3. ``None`` — the caller suggests nothing and writes no dedup file.
+    """
     env = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
     if env:
         return Path(env)
-    return Path(os.getcwd())
+    homes: set[Path] = set()
+    override = os.environ.get("VCT_USER_HOME_OVERRIDE", "").strip()
+    for probe in ((lambda: Path(override)) if override else Path.home, Path.home):
+        try:
+            homes.add(probe().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+    try:
+        here = Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        return None
+    for ancestor in (here, *here.parents):
+        if ancestor in homes:
+            return None
+        claude = ancestor / ".claude"
+        try:
+            if (claude / "settings.json").is_file() or (claude / "env").is_file():
+                return ancestor
+        except OSError:
+            continue
+    return None
 
 
 def _read_file(path: Path) -> str | None:
@@ -540,11 +577,12 @@ def format_suggestion(
 # invocations e.g. from tests).
 
 
-def _dedup_dir() -> Path:
+def _dedup_dir() -> Path | None:
     """Resolve the project-local `.claude/state/` directory.
 
-    Resolution chain mirrors the rest of this script (env-first, cwd
-    fallback). The directory is created lazily by `_persist_seen`.
+    Resolution chain is `_project_root` (env, then the marked-root walk);
+    ``None`` when no project encloses the cwd, and then no dedup state is
+    kept. The directory is created lazily by `_persist_seen`.
 
     TEST OVERRIDE: when `$VCT_KEYWORD_DEDUP_DIR` is set (any non-empty
     value), it overrides the resolved path entirely. This lets tests
@@ -554,7 +592,10 @@ def _dedup_dir() -> Path:
     override = os.environ.get("VCT_KEYWORD_DEDUP_DIR", "").strip()
     if override:
         return Path(override)
-    return _project_root() / ".claude" / "state"
+    root = _project_root()
+    if root is None:
+        return None  # no project: no dedup state anywhere (never cwd-relative)
+    return root / ".claude" / "state"
 
 
 def _dedup_file(session_id: str) -> Path | None:
@@ -566,7 +607,10 @@ def _dedup_file(session_id: str) -> Path | None:
     # a UUID, so this allow-list is conservative.
     if not re.match(r"^[A-Za-z0-9._-]+$", sid):
         return None
-    return _dedup_dir() / f"keyword_suggest_{sid}.txt"
+    d = _dedup_dir()
+    if d is None:
+        return None
+    return d / f"keyword_suggest_{sid}.txt"
 
 
 def _load_seen(session_id: str) -> set[str]:
@@ -636,6 +680,8 @@ def main(argv: list[str] | None = None) -> int:
     if not prompt or not prompt.strip():
         return 0
     root = _project_root()
+    if root is None:
+        return 0  # no VCO project encloses the cwd: nothing to suggest
     try:
         agents = collect_agents(root) if not args.skills_only else []
         skills = collect_skills(root)

@@ -67,24 +67,19 @@ for _p in (_REPO_ROOT, os.path.join(_HERE, "..")):
         sys.path.insert(0, _p)
 
 
-# ── project-root resolution (mirrors _record_rl_fallback) ───────────────
+# ── project-root resolution (shared with _bump_rl_counter) ─────────────
 
 
 def _resolve_project_root(explicit: Optional[str] = None) -> str:
-    """CLAUDE_PROJECT_DIR → server.KG_BASE_DIR → cwd. Matches the fallback
-    counter's writer so rl-doctor reads the file the pipeline wrote."""
+    """Explicit → ``search_pipeline.rl_counter_root()`` (the counter
+    writer's own resolver, so rl-doctor reads the file the pipeline wrote) →
+    the cwd, for display only: this is a read, and with no enclosing project
+    the writer never wrote a counter anywhere, which the report then shows."""
     if explicit:
         return explicit
-    root = os.environ.get("CLAUDE_PROJECT_DIR", "")
-    if root:
-        return root
-    try:
-        from claude_mcp_servers.weaviate_mcp import server as _srv
+    from claude_mcp_servers.rl_client.search_pipeline import rl_counter_root
 
-        root = getattr(_srv, "KG_BASE_DIR", "") or ""
-    except Exception:  # noqa: BLE001
-        root = ""
-    return root or os.getcwd()
+    return rl_counter_root() or os.getcwd()
 
 
 # ── individual probes (each soft-fails to a status dict) ────────────────

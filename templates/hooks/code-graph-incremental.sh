@@ -40,7 +40,15 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
 EDITED_FILE="$1"
-REPO_PATH="${2:-${CLAUDE_PROJECT_DIR:-$(pwd)}}"
+# Repo root: an explicit $2 wins; else the ONE shell rule (_lib/project-root.sh,
+# must match vco_lib/project_root.py). None -> nothing to analyze.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+REPO_PATH="${2:-}"
+if [ -z "$REPO_PATH" ]; then
+    REPO_PATH="$(vco_project_root)" || REPO_PATH=""
+fi
+[ -n "$REPO_PATH" ] || exit 0
 
 # v0.2.21 Step 18 (caller migration): when the project name arg is not
 # supplied, prefer the launcher's vct-hub over the basename fallback.

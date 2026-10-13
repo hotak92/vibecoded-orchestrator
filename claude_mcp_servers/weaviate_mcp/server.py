@@ -1195,8 +1195,20 @@ def _log_detail_choice(query: str, detail: str, result_count: int) -> None:
         "result_count": result_count,
         "rl_bonus": bonus_map.get(detail, 0.0),
     }
-    # Append to JSONL log (same dir as tool usage logs)
-    log_dir = os.path.join(KG_BASE_DIR or os.getcwd(), ".claude", "logs")
+    # Append to JSONL log (same dir as tool usage logs). Root: KG_BASE_DIR,
+    # else vco_lib.project_root (CLAUDE_PROJECT_DIR -> nearest VCO project
+    # above the cwd); no project -> no log line rather than a stray
+    # `<cwd>/.claude/logs` (v0.2.102 W6-W: the bare-cwd rung is gone).
+    base = KG_BASE_DIR
+    if not base:
+        from vco_lib.project_root import resolve_project_root  # noqa: PLC0415
+
+        found = resolve_project_root()
+        if found is None:
+            logger.debug("retrieval_expansion log skipped: no project root")
+            return
+        base = str(found)
+    log_dir = os.path.join(base, ".claude", "logs")
     try:
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, f"{datetime.now().strftime('%Y-%m-%d')}_retrieval_expansion.jsonl")

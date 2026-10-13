@@ -23,7 +23,12 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # implementation for all four context hooks; see _lib/session-id.ps1.
 . "$PSScriptRoot/_lib/session-id.ps1"
 
-$ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to do (no state is written).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectDir = Get-VcoProjectRoot
+if (-not $ProjectDir) { exit 0 }
 
 # Track C (v0.2.65): must match templates/hooks/compact-context-reinject.sh.
 # SessionStart payload carries session_id on stdin; the shared

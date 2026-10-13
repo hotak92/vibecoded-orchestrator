@@ -1580,8 +1580,10 @@ def _rootless_embedding_root_never_resolves_the_checkout():
     ``_write_failure_deferral`` on failure — and reconciling a ledger REWRITES
     ``<root>/CLAUDE.md`` (entries ⇒ the ``vco-deferral-reminder`` block is
     spliced in; none ⇒ it is stripped). ``_detect_project_root`` falls back to
-    ``Path.cwd()`` when that directory holds a ``.claude/``, and pytest's cwd
-    is this checkout — whose ``CLAUDE.md`` is TRACKED.
+    the nearest MARKED project at or above the cwd (``.claude/settings.json``
+    or ``.claude/env``; before v0.2.102 any cwd holding a ``.claude/``), and
+    pytest's cwd is a checkout — whose ``CLAUDE.md`` is TRACKED, and which is
+    marked as soon as it has been installed (a developer's checkout).
 
     So every rootless ``for_project()`` anywhere in the suite edited a
     versioned file mid-run. The guard above restores it at session END, which

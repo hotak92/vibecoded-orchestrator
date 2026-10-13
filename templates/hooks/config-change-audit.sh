@@ -12,7 +12,13 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # shellcheck source=_lib/find-python.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> nothing to do (no state is written).
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
+[ -n "$PROJECT_DIR" ] || exit 0
 LOG_FILE="$PROJECT_DIR/.claude/logs/config_changes.jsonl"
 
 mkdir -p "$(dirname "$LOG_FILE")"

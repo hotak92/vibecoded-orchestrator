@@ -45,7 +45,12 @@ if (Test-Path $EmitHelper) { . $EmitHelper }
 
 # Project root resolution: CLAUDE_PROJECT_DIR is the canonical signal at
 # hook fire time; fall back to PWD for ad-hoc invocations.
-$ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to do (no state is written).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectRoot = Get-VcoProjectRoot
+if (-not $ProjectRoot) { exit 0 }
 
 # Locate the shared matcher.
 $Matcher = Join-Path $ScriptDir "..\scripts\agent-skill-keyword-match.py"

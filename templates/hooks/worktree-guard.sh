@@ -116,10 +116,22 @@ if [ -z "${PY:-}" ]; then
     PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || command -v py 2>/dev/null || true)"
 fi
 
-PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$PWD}"
-LOG_DIR="$PROJECT_ROOT/.claude/logs"
-LOG_FILE="$LOG_DIR/worktree-guard.jsonl"
-mkdir -p "$LOG_DIR" 2>/dev/null || true
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py). Empty when no VCO project encloses the cwd: the
+# worktree decision still runs, but the log row, notices and launch records
+# (all state writes) are skipped rather than planted under the cwd.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/project-root.sh"
+PROJECT_ROOT="$(vco_project_root)" || PROJECT_ROOT=""
+LOG_DIR=""
+LOG_FILE=""
+if [ -n "$PROJECT_ROOT" ]; then
+    LOG_DIR="$PROJECT_ROOT/.claude/logs"
+    LOG_FILE="$LOG_DIR/worktree-guard.jsonl"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+else
+    echo "worktree-guard: no VCO project encloses $PWD; log, notices and launch records skipped" >&2
+fi
 
 # ── Read stdin (the WorktreeCreate payload) ───────────────────────────────
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
@@ -293,7 +305,7 @@ sanitize_id() {
 # Prefer the payload cwd hint when present, else PROJECT_ROOT. We use
 # `git -C <dir> rev-parse --show-toplevel` so monorepos / subdir-of-repo
 # layouts resolve to the REAL git toplevel.
-GIT_SCOPE_DIR="$PROJECT_ROOT"
+GIT_SCOPE_DIR="${PROJECT_ROOT:-$PWD}"  # a read: the cwd is a fine scope
 if [ -n "$REPO_HINT" ] && [ -d "$REPO_HINT" ]; then
     GIT_SCOPE_DIR="$REPO_HINT"
 fi
@@ -313,7 +325,8 @@ fi
 # repeat it in its final report, which is how the user learns why isolation
 # is off or different. Notices live in .claude/state/worktree-guard/; an
 # identifier outside [A-Za-z0-9._-] gets no notice (the log row remains).
-NOTICE_DIR="$PROJECT_ROOT/.claude/state/worktree-guard"
+NOTICE_DIR=""
+if [ -n "$PROJECT_ROOT" ]; then NOTICE_DIR="$PROJECT_ROOT/.claude/state/worktree-guard"; fi
 
 # Per-launch records (v0.2.102 W6-Q follow-up): the one home is
 # _lib/worktree-records.sh. subagent-stop-reconcile reaps an unchanged
@@ -322,9 +335,10 @@ NOTICE_DIR="$PROJECT_ROOT/.claude/state/worktree-guard"
 if [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
     # shellcheck source=_lib/worktree-records.sh disable=SC1091
     . "$SCRIPT_DIR/_lib/worktree-records.sh"
-    wtrec_prune "$PROJECT_ROOT"
+    if [ -n "$PROJECT_ROOT" ]; then wtrec_prune "$PROJECT_ROOT"; fi
 fi
 record_launch() {
+    [ -n "$PROJECT_ROOT" ] || return 0
     command -v wtrec_write >/dev/null 2>&1 || return 0
     wtrec_write "$PROJECT_ROOT" "$WT_NAME" "$@"
 }
@@ -332,6 +346,7 @@ write_notice() {
     case "$WT_NAME" in
         ''|*[!A-Za-z0-9._-]*|.*) return 0 ;;
     esac
+    [ -n "$NOTICE_DIR" ] || return 0
     mkdir -p "$NOTICE_DIR" 2>/dev/null || return 0
     printf '%s\n' "$1" > "$NOTICE_DIR/notice-$WT_NAME.txt" 2>/dev/null || true
 }

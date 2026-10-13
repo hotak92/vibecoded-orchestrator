@@ -452,18 +452,25 @@ async def _rl_compute_and_write_citations(
 def _rl_force_flush_sentinel_path() -> "Path":
     """Resolve the V52-N compaction sentinel path relative to the project root.
 
-    Path is ``<CLAUDE_PROJECT_DIR>/.claude/state/rl_monitors_force_flush.flag``
-    with a fallback to ``_SERVER_INFERRED_BASE`` when the env var isn't
-    populated (CLI invocations + tests). The sentinel is created by
-    ``templates/hooks/pre-compact-save.{sh,ps1}`` immediately before
+    Path is ``<root>/.claude/state/rl_monitors_force_flush.flag``, the root
+    being :func:`vco_lib.project_root.resolve_project_root` —
+    ``CLAUDE_PROJECT_DIR``, else the nearest VCO project above the MCP's cwd —
+    and, only when neither names a project, ``_SERVER_INFERRED_BASE`` (the
+    install this module runs from; correct for the orchestrator root itself).
+    Pre-v0.2.102 the cwd rung was missing, so a non-root project whose MCP
+    lacked ``CLAUDE_PROJECT_DIR`` polled the ORCHESTRATOR's flag. The
+    sentinel is created by ``templates/hooks/pre-compact-save.{sh,ps1}``
+    (always handed ``CLAUDE_PROJECT_DIR`` by the harness) immediately before
     Claude Code compacts the context; this monitor polls for it on every
     iteration and, when present, fires with whatever it has accumulated
-    so far.
+    so far. This is a read + unlink of an existing flag, never a write that
+    could plant a stray ``.claude/``, so the install-root last resort stays.
     """
-    from pathlib import Path as _Path
-    base = os.environ.get("CLAUDE_PROJECT_DIR", "")
-    if base:
-        return _Path(base) / server._RL_MONITOR_FORCE_FLUSH_SENTINEL
+    from vco_lib.project_root import resolve_project_root
+
+    root = resolve_project_root()
+    if root is not None:
+        return root / server._RL_MONITOR_FORCE_FLUSH_SENTINEL
     return server._SERVER_INFERRED_BASE / server._RL_MONITOR_FORCE_FLUSH_SENTINEL
 
 def _rl_check_force_flush() -> bool:

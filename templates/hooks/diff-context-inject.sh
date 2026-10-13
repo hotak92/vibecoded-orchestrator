@@ -58,7 +58,16 @@ CONTEXT_FILE=".claude/CONTEXT_STATE.md"
 # would lose the diff baseline mid-session when /tmp is wiped on boot.
 # The `ctx_` filename prefix namespaces these files within the shared
 # .claude/state/ dir (which also holds seen_kg_titles_*, reads_*, etc.).
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> nothing to diff and no snapshot written.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
+[ -n "$PROJECT_DIR" ] || exit 0
+# The live file is the PROJECT's, like every other path here (it was
+# cwd-relative, so a run whose cwd was not the project root diffed nothing).
+CONTEXT_FILE="$PROJECT_DIR/.claude/CONTEXT_STATE.md"
 SNAPSHOT_DIR="$PROJECT_DIR/.claude/state"
 SNAPSHOT_FILE="$SNAPSHOT_DIR/ctx_snapshot_${SESSION_ID}"
 COMPACT_FLAG="$SNAPSHOT_DIR/ctx_compact_flag_${SESSION_ID}"

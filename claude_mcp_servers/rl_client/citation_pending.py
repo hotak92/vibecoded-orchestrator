@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 from pathlib import Path
@@ -55,18 +54,36 @@ PENDING_TTL_SECONDS: float = 3600.0
 _SAFE_KEY = re.compile(r"[^A-Za-z0-9._-]")
 
 
-def _resolve_project_root() -> Path:
-    """Resolve the project root the same way the force-flush sentinel does:
-    ``CLAUDE_PROJECT_DIR`` env first, then a best-effort cwd fallback."""
-    base = os.environ.get("CLAUDE_PROJECT_DIR", "")
-    if base:
-        return Path(base)
-    return Path.cwd()
+def _resolve_project_root() -> Optional[Path]:
+    """``CLAUDE_PROJECT_DIR``, else the nearest VCO project above the cwd.
+
+    The ONE resolver every ``.claude/state`` writer shares
+    (:func:`vco_lib.project_root.resolve_project_root`). Before v0.2.102 this
+    fell back to the BARE cwd, so ``kg-search`` run from a subfolder (no
+    ``CLAUDE_PROJECT_DIR`` in a plain shell) staged
+    ``<subfolder>/.claude/state/rl_pending/*.json`` that no drain or TTL
+    sweep ever visits. ``None`` when no project encloses the cwd.
+    """
+    from vco_lib.project_root import resolve_project_root  # noqa: PLC0415
+
+    return resolve_project_root()
 
 
-def pending_dir(project_root: "str | Path | None" = None) -> Path:
-    """Return ``<root>/.claude/state/rl_pending`` (created on demand)."""
+def pending_dir(project_root: "str | Path | None" = None) -> Optional[Path]:
+    """Return ``<root>/.claude/state/rl_pending`` (created on demand).
+
+    ``None`` when no ``project_root`` is given and none can be resolved: there
+    is no directory the drain would ever read, so nothing is written (the
+    conservative default — an orphan under the cwd is worse than no file).
+    """
     root = Path(project_root) if project_root else _resolve_project_root()
+    if root is None:
+        logger.info(
+            "citation_pending: no VCO project encloses %s and CLAUDE_PROJECT_DIR "
+            "is unset; skipping the pending-queue write",
+            _cwd_for_log(),
+        )
+        return None
     d = root / ".claude" / "state" / "rl_pending"
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -75,13 +92,25 @@ def pending_dir(project_root: "str | Path | None" = None) -> Path:
     return d
 
 
+def _cwd_for_log() -> str:
+    try:
+        return str(Path.cwd())
+    except OSError:
+        return "<unreadable cwd>"
+
+
 def _safe(key: str) -> str:
     return _SAFE_KEY.sub("-", key or "")
 
 
-def _pending_path(session_id: str, task_id: str, root: "str | Path | None") -> Path:
+def _pending_path(
+    session_id: str, task_id: str, root: "str | Path | None"
+) -> Optional[Path]:
+    d = pending_dir(root)
+    if d is None:
+        return None
     fname = f"{_safe(session_id) or 'nosession'}__{_safe(task_id)}.json"
-    return pending_dir(root) / fname
+    return d / fname
 
 
 def stage_pending(
@@ -114,6 +143,8 @@ def stage_pending(
             "ctx": ctx,
         }
         path = _pending_path(session_id, task_id, project_root)
+        if path is None:
+            return None
         # v0.2.92: one home for tmp+os.replace. `vco_lib` is a hard
         # dependency of every MCP process (server.py imports it at
         # startup), so this import is loud, not a soft degrade.
@@ -145,7 +176,7 @@ def list_pending_for_session(
     empty session_id lists ALL pending files (the drain then matches each by its
     own ``session_id`` field + the transcript)."""
     d = pending_dir(project_root)
-    if not d.exists():
+    if d is None or not d.exists():
         return []
     safe = _safe(session_id)
     pattern = f"{safe}__*.json" if safe else "*.json"
@@ -186,7 +217,7 @@ def sweep_expired(
     Returns the count deleted. Abandoned-session GC — cheap mtime+payload
     sweep. ``now_ms`` is injectable for tests."""
     d = pending_dir(project_root)
-    if not d.exists():
+    if d is None or not d.exists():
         return 0
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     cutoff = now - int(ttl_seconds * 1000)

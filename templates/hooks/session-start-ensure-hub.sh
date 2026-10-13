@@ -167,7 +167,17 @@ fi
 # and does nothing — a no-op exactly when the ensure is needed.
 # ---------------------------------------------------------------------------
 __vco_gw_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-gateway-ensure.$$"
-__vco_gw_out="$("$RUN_PY" -m vco_lib.gateway_ensure ensure --shell --folder "${CLAUDE_PROJECT_DIR:-$PWD}" 2>"$__vco_gw_err")"
+# --folder names the project whose ledger may get an "unrunnable" row: the
+# ONE shell rule (_lib/project-root.sh, must match vco_lib/project_root.py).
+# No project -> the ensure still runs, with no folder (no ledger row).
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+__vco_gw_folder="$(vco_project_root)" || __vco_gw_folder=""
+if [ -n "$__vco_gw_folder" ]; then
+    __vco_gw_out="$("$RUN_PY" -m vco_lib.gateway_ensure ensure --shell --folder "$__vco_gw_folder" 2>"$__vco_gw_err")"
+else
+    __vco_gw_out="$("$RUN_PY" -m vco_lib.gateway_ensure ensure --shell 2>"$__vco_gw_err")"
+fi
 __vco_gw_rc=$?
 case "$__vco_gw_rc" in
     0|3|4)

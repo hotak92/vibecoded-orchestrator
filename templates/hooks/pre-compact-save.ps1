@@ -44,7 +44,15 @@ try {
 }
 if (-not $SessionId) { $SessionId = "default" }
 
-$ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> every write below (snapshot, marker, force-flush flag) is skipped.
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectDir = Get-VcoProjectRoot
+if (-not $ProjectDir) {
+    [Console]::Error.WriteLine("pre-compact-save: no VCO project encloses $((Get-Location).Path); snapshot not saved")
+    exit 0
+}
 $SnapshotFile = Join-Path $ProjectDir ".claude/context/pre-compact-snapshot.md"
 $SnapshotDir = Split-Path $SnapshotFile -Parent
 
