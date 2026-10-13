@@ -410,3 +410,28 @@ class TestPreBashPs1MissingUtf8Helper:
         assert r.returncode == 0, r.stderr
         assert self.NOTICE not in r.stderr
         assert len(rig.bash_task_files()) == 1
+
+
+
+def test_session_transcript_found_in_another_project_folder(tmp_path):
+    """A session started from another working directory lives in a sibling
+    project folder: found when exactly one file matches, never guessed."""
+    from claude_mcp_servers.rl_client.citation_pending import session_transcript_for
+
+    root = tmp_path / "projects"
+    here = root / "-home-u-proj"
+    there = root / "-home-u-proj-sub"
+    here.mkdir(parents=True)
+    there.mkdir(parents=True)
+    known = here / "11111111-1111-1111-1111-111111111111.jsonl"
+    known.write_text("{}\n", encoding="utf-8")
+    other_sid = "22222222-2222-2222-2222-222222222222"
+    (there / f"{other_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+    assert session_transcript_for(str(known), other_sid) == str(there / f"{other_sid}.jsonl")
+    # Leave-alone: two candidates (ambiguous) -> unknown, not a guess.
+    third = root / "-home-u-other"
+    third.mkdir()
+    (third / f"{other_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+    assert session_transcript_for(str(known), other_sid) == ""
+    # Leave-alone: nothing anywhere -> unknown.
+    assert session_transcript_for(str(known), "33333333-3333-3333-3333-333333333333") == ""

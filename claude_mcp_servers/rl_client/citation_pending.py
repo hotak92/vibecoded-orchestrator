@@ -540,10 +540,15 @@ def session_transcript_for(known_transcript: str, session_id: str) -> str:
     Claude Code keeps every session of a project as
     ``<project transcripts dir>/<session_id>.jsonl`` and a subagent's beside
     its parent's (:func:`agent_transcript_for`), so from either kind of
-    ``known_transcript`` the session file is a sibling of the parent. An
-    empty ``session_id`` means the known transcript's own session. ``""``
-    when the inputs are missing, the id is not filesystem-safe, or the file
-    does not exist — a caller never points a compute at a guessed path."""
+    ``known_transcript`` the session file is a sibling of the parent. A
+    session started from ANOTHER working directory lives in a sibling
+    project folder of the same transcripts root: when the sibling lookup
+    misses, ``<root>/*/<session_id>.jsonl`` is searched and accepted only
+    when exactly ONE file matches (session ids are UUIDs; zero or several
+    matches mean "unknown", never a guess). An empty ``session_id`` means the
+    known transcript's own session. ``""`` when the inputs are missing, the
+    id is not filesystem-safe, or no unique file exists — a caller never
+    points a compute at a guessed path."""
     if not known_transcript or not known_transcript.endswith(".jsonl"):
         return ""
     known = Path(known_transcript)
@@ -554,7 +559,12 @@ def session_transcript_for(known_transcript: str, session_id: str) -> str:
             return ""
         known = known.with_name(f"{session_id}.jsonl")
     try:
-        return str(known) if known.is_file() else ""
+        if known.is_file():
+            return str(known)
+        if not session_id:
+            return ""
+        matches = [m for m in known.parent.parent.glob(f"*/{session_id}.jsonl") if m.is_file()]
+        return str(matches[0]) if len(matches) == 1 else ""
     except OSError:
         return ""
 
