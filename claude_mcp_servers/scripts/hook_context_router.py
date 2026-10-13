@@ -7,7 +7,7 @@ Usage (the thin .sh/.ps1 wrappers of Wave 2 call exactly this)::
 
     hook_context_router.py <surface> [--intent-out FILE] [--claim]   # hook JSON on stdin
 
-    surfaces: bash | read | write | edit | grep | agent
+    surfaces: bash | read | write | edit | grep | agent | prompt
 
 Contract
 --------
@@ -33,12 +33,19 @@ Mechanism (one interpreter, one home):
   semantic code-graph queries from injection surfaces), with
   ``--indexed-revision`` on revision-stamped policies and ``--source-file``
   for the same-language identity check;
-* dedupe  — the SAME per-session files and key format as ``_lib/seen-store.sh``
-  (``seen_inject_<sid>.txt`` / ``seen_reads_<sid>.txt``; KG key
-  ``title#sha1(body)[:12]``, CODE key ``full_name``) — MUST MATCH that lib;
-* budget  — per-injection 2 500-char soft cap + per-turn 6 000 chars keyed by
-  ``prompt_id`` (``.claude/state/inject_budget_<sid>_<pid>``; past budget the
-  blocks degrade to titles one-liners; missing prompt_id fails OPEN);
+* dedupe  — the SAME per-agent files and key format as ``_lib/seen-store.sh``
+  (``seen_inject_<sid>.txt`` / ``seen_reads_<sid>.txt`` where ``<sid>`` is
+  the per-AGENT state key ``<sid>__<agent_id>`` for subagent calls —
+  ``vco_lib.hook_agent_key``, one home mirrored in ``_lib/session-id.*``;
+  KG key ``title#sha1(body)[:12]``, CODE key ``full_name``) — MUST MATCH
+  that lib; the ``agent`` surface (a brief) skips the dedupe, F10;
+* budget  — per-injection 2 500-char soft cap + a per-TURN budget keyed by
+  ``prompt_id`` AND the per-agent state key
+  (``.claude/state/inject_budget_<sid>[_<aid>]_<pid>``; 6 000 chars for the
+  main chat, 20 000 for a subagent run — v0.2.102 W6-C1, owner decision
+  2026-10-07, one home ``vco_lib.inject_intent.turn_budget_chars``; past
+  budget the blocks degrade to titles one-liners; missing prompt_id fails
+  OPEN; the ``agent`` surface skips the turn budget entirely, F10);
 * cache   — the shared ``.claude/state/query_cache/`` dir; the key algorithm
   (sha1 over the args joined with 0x1f) is ROUTER-OWNED since the v0.2.101
   retirement of ``_lib/query-cache.{sh,ps1}`` — the ``kgi``/``cgi``
@@ -47,7 +54,9 @@ Mechanism (one interpreter, one home):
   surfaces' keys (and vice-versa). Empty results are NEVER cached (§9).
 
 Kill switch: ``VCO_INJECT_PROFILE=off`` → exit 0 silently (checked first,
-beside the wrappers' own check).
+beside the wrappers' own check). Per-surface: ``VCO_PROMPT_INJECT=off``
+disables ONLY the ``prompt`` surface (checked beside the global switch;
+the prompt wrappers also check it before spawning anything).
 
 Env seams (tests + Wave 2):
 * ``VCO_ROUTER_KG_SCRIPT`` — path to the KG producer (default: sibling
@@ -105,7 +114,6 @@ from vco_lib.inject_intent import (  # noqa: E402
     INTENT_MECHANICAL,
     INTENT_READ,
     INTENT_SEARCH,
-    PER_TURN_BUDGET_CHARS,
     agent_task_section,
     budget_state_path,
     cap_block,
@@ -113,20 +121,25 @@ from vco_lib.inject_intent import (  # noqa: E402
     classify_bash,
     clean_identifier,
     edit_enclosing_symbols,
-    extract_symbol,
     file_pub_symbols,
     kg_gate,
     kg_query_for_targets,
     language_for_path,
     pattern_gate,
+    prompt_query,
     sanitize_session_id,
+    search_symbol_for_pattern,
     task_type_for,
     titles_one_liner,
+    turn_budget_chars,
 )
+from vco_lib.env_values import env_float, env_int  # noqa: E402
+from vco_lib.hook_agent_key import agent_state_key, sanitize_agent_id  # noqa: E402
+from vco_lib.prompt_edit_nudge import nudge_block as _prompt_nudge_block  # noqa: E402
 
 import hook_dual_search as _hds  # noqa: E402 — sibling module (sys.path above)
 
-SURFACES = ("bash", "read", "write", "edit", "grep", "agent")
+SURFACES = ("bash", "read", "write", "edit", "grep", "agent", "prompt")
 
 _BASH_PROFILE_BY_INTENT = {
     INTENT_READ: "bash_read",
@@ -138,22 +151,6 @@ _BASH_PROFILE_BY_INTENT = {
 # recovery moved INTO the classifier — inject_intent._recover_clean_symbol /
 # _DOT_EXT_TOKEN_RE — one home, so the READ demotion rule can see what was
 # recovered. The router keeps only the disk-based file_pub_symbols fallback.)
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        val = float((os.environ.get(name) or "").strip())
-        return val if val > 0 else default
-    except ValueError:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        val = int((os.environ.get(name) or "").strip())
-        return val if val > 0 else default
-    except ValueError:
-        return default
 
 
 # --- payload parsing (the pre-bash-context-inject.sh:74-94 discipline) --------
@@ -184,11 +181,20 @@ def _first_content_string(obj) -> str:
 
 
 def _resolve_project_root(payload: Dict) -> str:
-    root = (os.environ.get("CLAUDE_PROJECT_DIR") or "").strip()
-    if root:
-        return root
-    cwd = str(payload.get("cwd") or "").strip()
-    return cwd or os.getcwd()
+    """``CLAUDE_PROJECT_DIR``, else the nearest VCO project above the hook
+    payload's ``cwd`` (or the process cwd) — :func:`vco_lib.project_root.
+    resolve_project_root`, the one home every ``.claude/state`` writer shares.
+
+    ``""`` when no project encloses that directory: every state writer below
+    treats an empty root as "no state" (no cache, no seen-store, no claim,
+    no budget file). Pre-v0.2.102 the fallback was the BARE cwd, so a run
+    from a subfolder planted ``<subfolder>/.claude/state/`` there.
+    """
+    from vco_lib.project_root import resolve_project_root
+
+    start = str(payload.get("cwd") or "").strip() or None
+    root = resolve_project_root(start)
+    return str(root) if root is not None else ""
 
 
 # --- query cache (router-owned namespaces) -----------------------------------
@@ -204,6 +210,8 @@ def _resolve_project_root(payload: Dict) -> str:
 
 
 def _cache_dir(project_root: str) -> Optional[Path]:
+    if not project_root:
+        return None  # no resolvable project: never a cwd-relative cache
     try:
         d = Path(project_root) / ".claude" / "state" / "query_cache"
         d.mkdir(parents=True, exist_ok=True)
@@ -225,7 +233,7 @@ def cache_get(project_root: str, key: str) -> Optional[str]:
     try:
         if not f.is_file():
             return None
-        ttl = _env_int("VCO_QUERY_CACHE_TTL", 900)
+        ttl = env_int("VCO_QUERY_CACHE_TTL", 900, minimum=1)
         age = time.time() - f.stat().st_mtime
         if age >= ttl:
             return None
@@ -236,6 +244,16 @@ def cache_get(project_root: str, key: str) -> Optional[str]:
         return blob
     except OSError:
         return None
+
+
+def cache_leg_output(project_root: str, key: str, blob: str) -> None:
+    """Cache a producer leg's output — unless it is the embedding-outage line
+    (v0.2.102 W6-B2): that line is SHOWN once per run and never cached, so the
+    next run re-probes the backend the watchdog may have healed."""
+    from vco_lib.embed_outage import is_hook_unavailable_text
+
+    if not is_hook_unavailable_text(blob):
+        cache_put(project_root, key, blob)
 
 
 def cache_put(project_root: str, key: str, blob: str) -> None:
@@ -271,10 +289,12 @@ def cache_put(project_root: str, key: str, blob: str) -> None:
 #     absolute/repo-relative — vco_seen_src_matches);
 #   * blind mode  an untrustworthy session ("" / "default") gets NO store:
 #     every block passes, nothing is recorded.
+#   * NOTE key    "<first field>" like CODE (v0.2.102 W6-N F-8: the
+#     before-edit prompt-agent nudge, deduped per session per file).
 # tests/test_v02101_inject_gates.py::TestSeenStoreParity drives BOTH
 # implementations over one corpus.
 
-_HEADER_RE = re.compile(r"^(KG|CODE): (.+)$")
+_HEADER_RE = re.compile(r"^(KG|CODE|NOTE): (.+)$")
 
 
 def seen_store_path(kind: str, session_id: str, project_root: str) -> str:
@@ -340,9 +360,18 @@ SEEN_LOCK_TIMEOUT_S = 1.0
 
 
 def filter_seen_blocks(text: str, inject_file: str, reads_file: str,
-                       project_root: str = "") -> str:
+                       project_root: str = "",
+                       suppressed_out: Optional[List[str]] = None) -> str:
     """Mirror of vco_filter_seen_blocks. Parses the KG:/CODE: block stream,
     suppresses already-seen / already-Read blocks, records emitted keys.
+
+    ``suppressed_out`` (v0.2.102 W3R-10, Python-only seam — the filtered
+    OUTPUT is byte-identical, so the shell parity contract is unchanged):
+    an optional list that receives the dedup key of every SUPPRESSED block
+    (the capped first header field — the node title / code full_name). It
+    stays EMPTY when the whole call is silenced by lock contention (the
+    blocks were neither shown nor recorded), so a caller can tell "all
+    suppressed" apart from "decided nothing".
 
     v0.2.101 N2: the check ("is this key in the store?") and the write
     ("record it") are one critical section under an exclusive lock on the
@@ -372,7 +401,8 @@ def filter_seen_blocks(text: str, inject_file: str, reads_file: str,
       holds on every OS.
     """
     if not inject_file:
-        return _filter_seen_blocks_unlocked(text, inject_file, reads_file, project_root)
+        return _filter_seen_blocks_unlocked(text, inject_file, reads_file,
+                                            project_root, suppressed_out)
     import contextlib
 
     from vco_lib.atomic import LockTimeout, exclusive_file_lock
@@ -382,14 +412,16 @@ def filter_seen_blocks(text: str, inject_file: str, reads_file: str,
             stack.enter_context(exclusive_file_lock(
                 Path(inject_file + ".lock"), timeout_s=SEEN_LOCK_TIMEOUT_S))
         except LockTimeout:  # before OSError: LockTimeout IS an OSError
-            return ""
+            return ""  # suppressed_out stays empty — nothing was DECIDED
         except OSError:
             pass  # cannot lock at all → the unlocked pre-N2 behaviour
-        return _filter_seen_blocks_unlocked(text, inject_file, reads_file, project_root)
+        return _filter_seen_blocks_unlocked(text, inject_file, reads_file,
+                                            project_root, suppressed_out)
 
 
 def _filter_seen_blocks_unlocked(text: str, inject_file: str, reads_file: str,
-                                 project_root: str = "") -> str:
+                                 project_root: str = "",
+                                 suppressed_out: Optional[List[str]] = None) -> str:
     """The filter body — callers go through :func:`filter_seen_blocks`."""
     dedup_on = bool(inject_file)
     if dedup_on:
@@ -432,6 +464,8 @@ def _filter_seen_blocks_unlocked(text: str, inject_file: str, reads_file: str,
                         fh.write(key + "\n")
                 except OSError:
                     pass
+        elif suppressed_out is not None:
+            suppressed_out.append(cur_first)  # W3R-10: the post-decision record
         cur_prefix, cur_first, cur_src = "", "", ""
         cur_block, cur_body = [], []
 
@@ -473,7 +507,7 @@ def _cg_count_path(session_id: str, project_root: str) -> str:
 
 
 def _cg_cap() -> int:
-    return _env_int("VCO_CG_INJECT_CAP", CG_SESSION_CAP_DEFAULT)
+    return env_int("VCO_CG_INJECT_CAP", CG_SESSION_CAP_DEFAULT, minimum=1)
 
 
 def _cg_capped(count_file: str) -> bool:
@@ -543,17 +577,32 @@ def _budget_charge(path: Optional[str], chars: int) -> None:
         pass
 
 
+#: v0.2.102 W6-C2 (review R1 C2): age past which a ``warm_leg_*`` claim file
+#: is garbage. The claim is only meaningful for ``_WARM_LEG_CLAIM_TTL_S``
+#: (300 s); a week is far past any warmer that could still own it.
+WARM_LEG_GC_AGE_S = 7 * 24 * 3600.0
+
+
 def _budget_gc(project_root: str) -> None:
-    """ opportunistic 1-day GC of budget files (bounded scan)."""
+    """Opportunistic GC of the router's small state files (bounded scan):
+    per-turn budget files after 1 day, and the L4 leg-warmer's
+    ``warm_leg_*`` claim files after a week — :func:`vco_lib.atomic.claim_once`
+    leaves a claim on disk by design, so without this sweep one file per
+    distinct missed cache key accumulated forever (review R1 C2)."""
+    if not project_root:
+        return
+    now = time.time()
     try:
         state = Path(project_root) / ".claude" / "state"
-        cutoff = time.time() - BUDGET_GC_AGE_S
-        for f in list(state.glob("inject_budget_*"))[:200]:
-            try:
-                if f.is_file() and f.stat().st_mtime < cutoff:
-                    f.unlink()
-            except OSError:
-                continue
+        for pattern, max_age in (("inject_budget_*", BUDGET_GC_AGE_S),
+                                 ("warm_leg_*", WARM_LEG_GC_AGE_S)):
+            cutoff = now - max_age
+            for f in list(state.glob(pattern))[:200]:
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                except OSError:
+                    continue
     except OSError:
         pass
 
@@ -604,34 +653,35 @@ def _resolve_rev(rev: str, cwd: str) -> str:
 def _bash_plan(payload: Dict, cwd: str) -> _Plan:
     plan = _Plan()
     command = str((payload.get("tool_input") or {}).get("command") or "")
-    bi = classify_bash(command, cwd)
+    # v0.2.102 W5-D: the PowerShell tool feeds the same surface; the
+    # classifier reads its command through the Bash-equivalent translation.
+    tool = str(payload.get("tool_name") or "Bash")
+    bi = classify_bash(command, cwd, tool)
     plan.intent_out = bi.to_dict()
     if bi.intent == INTENT_MECHANICAL:
         return plan  # no query, no injection, no RL retrieval event
     profile = _BASH_PROFILE_BY_INTENT[bi.intent]
 
-    # KG leg (none on SEARCH — §2.1)
-    if kg_gate(profile) is not None:
-        if bi.write_snippet:
-            query = bi.write_snippet[:200]
-        else:
-            query = kg_query_for_targets(bi.targets, cwd)
-        if query:
-            plan.kg_query = query
-            plan.kg_profile = profile
-            plan.kg_limit = _kg_limit(profile)
-
-    # CG leg — exact symbols only (§2.1 "exact def+callers")
+    # CG symbol recovery runs BEFORE the KG leg: the in-place EDIT surface's
+    # KG query folds the same symbols in (the Edit tool's shape — v0.2.102
+    # S16-8 R5).
     policy = cg_policy(profile)
+    symbols: List[str] = []
     if policy.enabled:
-        symbols: List[str] = list(bi.symbols)
+        symbols = list(bi.symbols)
         # Wave-3: command-text symbol recovery moved INTO the classifier
         # (inject_intent._recover_clean_symbol — one home, so the READ
         # demotion rule can see what was recovered). What remains here is
         # the disk-dependent fallback: a source-file target's own top-level
         # symbols ("only if a clean symbol is recovered; else silent" —
         # recovery from the TARGET is the owner-rule shape: never from
-        # command prose).
+        # command prose). The READ fallback's 2-symbol cap is the §2.1
+        # WEAK-surface taper (bash_read: 0.75 floor, titles-only below
+        # 0.85, single_chunk above — the table's smallest surface): v0.2.102
+        # S16-8 measured full alignment with the Read surface's 5 on the
+        # replay corpus — precision 0.625 → 0.556 for NO recall gain
+        # (0.857), so the taper stays and the prefix relation is pinned in
+        # tests/test_v02102_bash_injection_parity.py instead.
         if bi.intent in (INTENT_READ, INTENT_EDIT) and not symbols:
             cap = 2 if bi.intent == INTENT_READ else 3
             for t in bi.targets:
@@ -642,6 +692,29 @@ def _bash_plan(payload: Dict, cwd: str) -> _Plan:
                         break
         if policy.require_clean_symbol:
             symbols = [s for s in symbols if clean_identifier(s)]
+
+    # KG leg (none on SEARCH — §2.1)
+    if kg_gate(profile) is not None:
+        if bi.write_snippet:
+            query = bi.write_snippet[:200]
+        else:
+            topic = kg_query_for_targets(bi.targets, cwd)
+            if bi.intent == INTENT_EDIT and bi.write_kind == "inplace":
+                # v0.2.102 S16-8 R5: an in-place edit (sed -i / perl -pi)
+                # mirrors the Edit tool's KG query — "<topic> <symbols>".
+                # Overwrite shapes (tee / redirect / cp) keep the Write
+                # tool's topic-only key.
+                parts = [p for p in (topic, " ".join(symbols[:3])) if p]
+                query = " ".join(parts)[:200]
+            else:
+                query = topic
+        if query:
+            plan.kg_query = query
+            plan.kg_profile = profile
+            plan.kg_limit = _kg_limit(profile)
+
+    # CG leg — exact symbols only (§2.1 "exact def+callers")
+    if policy.enabled:
         source_file = bi.targets[0] if bi.targets else ""
         plan.cg_symbols = [(s, source_file) for s in symbols[:3]]
         if plan.cg_symbols:
@@ -739,9 +812,12 @@ def _grep_plan(payload: Dict, cwd: str) -> _Plan:
     tool_input = payload.get("tool_input") or {}
     pattern = str(tool_input.get("pattern") or "")
     plan.intent_out = {"surface": "grep", "pattern_is_identifier": bool(pattern_gate(pattern))}
-    if not pattern or not pattern_gate(pattern):
-        return plan
-    sym = clean_identifier(extract_symbol(pattern)) or clean_identifier(pattern)
+    # v0.2.102 S16-8 R2: the symbol decision is the classifier's ONE HOME
+    # (search_symbol_for_pattern) — the bash SEARCH segment and this surface
+    # answer the same question. Before R2 the SF-3 multi-word retry was
+    # bash-only, so Grep(pattern='def foo') produced NO key where
+    # `grep -n 'def foo' f` produced 'foo'.
+    sym = search_symbol_for_pattern(pattern)
     if not sym:
         return plan  # a regex fragment is not an exact-lookup key (pub(crate) class)
     plan.intent_out["symbol"] = sym
@@ -770,6 +846,36 @@ def _agent_plan(payload: Dict, cwd: str) -> _Plan:
     return plan  # no CG leg on the agent surface (§2.1: keep the brief small)
 
 
+def _prompt_plan(payload: Dict, cwd: str) -> _Plan:
+    """v0.2.102 W6-F: the UserPromptSubmit surface — the shipped "search the
+    KG on every prompt" promise (README.md:108-113, GETTING_STARTED.md:
+    321-323). The query is the user's prompt TEXT (:func:`prompt_query`
+    owns the trim/skip rule) — the one prose query in the redesign, because
+    prose is all a prompt carries. KG leg only: §2.1 issues no semantic
+    code-graph queries from injection surfaces, and a prompt yields no
+    exact-lookup symbol.
+
+    ``prompt_id`` IS a common hook-input field and is normally PRESENT on
+    UserPromptSubmit (it names the prompt being submitted — the field the
+    per-turn budget keys on, so the budget applies per turn here as on
+    every other surface). It may be ABSENT (the vendor docs' "absent until
+    the first user input" edge, older harnesses); the budget then fails
+    OPEN for that one turn (budget_state_path's documented None-sentinel).
+    The per-injection soft cap bounds the block either way, and the
+    surface fires once per prompt by construction."""
+    plan = _Plan()
+    query = prompt_query(str(payload.get("prompt") or ""))
+    plan.intent_out = {"surface": "prompt", "has_query": bool(query)}
+    if not query:
+        return plan
+    gate = kg_gate("prompt")
+    if gate is not None:
+        plan.kg_query = query
+        plan.kg_profile = "prompt"
+        plan.kg_limit = gate.max_rows or 3
+    return plan
+
+
 _PLAN_BUILDERS = {
     "bash": _bash_plan,
     "read": _read_plan,
@@ -777,6 +883,7 @@ _PLAN_BUILDERS = {
     "edit": _edit_plan,
     "grep": _grep_plan,
     "agent": _agent_plan,
+    "prompt": _prompt_plan,
 }
 
 
@@ -849,18 +956,37 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
         plan.cg_symbols = []
 
     legs: Dict[str, Callable[[], None]] = {}
+    cg_fresh = ""  # L4: the fresh (uncached) CG run's output, "" when missed
+    # L4 (v0.2.102 W6-C1): what a detached cache-warmrer needs to RE-RUN a
+    # registered leg out-of-band (script path + pinned argv). Populated only
+    # where the leg is actually built; consumed after the join.
+    warm_kg: Dict[str, object] = {}
+    warm_cg: Dict[str, object] = {}
 
     if kg_key:
         kg_script = _resolve_kg_script()
         if kg_script.is_file():
             try:
                 kg_mod = _hds._load_cg_module(kg_script)
+                # v0.2.102 W6-F fix-round (review MEDIUM): the producer's
+                # lazy weaviate_mcp.server import runs inside the leg, i.e.
+                # in run_legs' WORKER thread, and that module registers a
+                # SIGHUP handler AT IMPORT TIME — signal.signal raises
+                # ValueError off the main thread. The original W6-F fix
+                # warmed the import here in the main thread (masked on
+                # CG-bearing surfaces by query_code_graph.py's own
+                # main-thread module-level import); the ROOT fix now lives
+                # in _lib/sighup_handler.py, whose
+                # register_sighup_exit_handler is a logged no-op off the
+                # main thread — so ANY non-main-thread importer is safe
+                # and the warm-import shim is retired (one home, not two).
                 argv = [plan.kg_query, "--limit", str(plan.kg_limit),
                         "--hook-format", "--injection-profile", plan.kg_profile,
                         "--task-type", task_type_for(plan.kg_profile)]
                 if transcript_path:
                     argv += ["--transcript", transcript_path]
                 _hds._pin_argv(kg_mod, argv)
+                warm_kg = {"script": str(kg_script), "argv": [str(a) for a in argv]}
 
                 def _kg_leg(mod=kg_mod) -> None:
                     # rl_kg_search.main is async; the VCO_ROUTER_KG_SCRIPT
@@ -881,6 +1007,15 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
         if cg_script is not None:
             try:
                 cg_mod = _hds._load_cg_module(cg_script)
+                if len(cg_keys) == 1:
+                    # L4: only the sole-symbol run is cached (mirroring the
+                    # cache write below), so only it is warmable.
+                    only_sym = next(iter(cg_keys))
+                    only_src = next(
+                        (sf for sym, sf in plan.cg_symbols if sym == only_sym), "")
+                    warm_cg = {"script": str(cg_script),
+                               "argv": [str(a) for a in _cg_argv(
+                                   only_sym, only_src, policy, plan.cg_profile)]}
 
                 def _cg_leg(mod=cg_mod, items=tuple(cg_keys.items()), pol=policy) -> None:
                     for symbol, _key in items:
@@ -896,16 +1031,17 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
 
     if legs:
         remaining = deadline - time.monotonic()
-        leg_timeout = min(_env_float("VCO_INJECT_LEG_TIMEOUT_S", 4.0),
+        leg_timeout = min(env_float("VCO_INJECT_LEG_TIMEOUT_S", 4.0, above=0),
                           max(remaining, 0.1))
         results = _hds.run_legs(legs, leg_timeout_s=leg_timeout)
         if kg_key:
             kg_text = (results.get("kg") or "").strip()
             if kg_text:
-                cache_put(project_root, kg_key, kg_text + "\n")
+                cache_leg_output(project_root, kg_key, kg_text + "\n")
                 kg_text = kg_text + "\n"
         if cg_keys:
             raw = (results.get("cg") or "").strip()
+            cg_fresh = raw
             if raw:
                 # One combined blob for the run (the per-symbol cache entries
                 # are keyed on the symbol; a combined blob is cached under
@@ -915,9 +1051,118 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                 cg_symbol_texts.append(raw + "\n")
                 if len(cg_keys) == 1:
                     only_key = next(iter(cg_keys.values()))
-                    cache_put(project_root, only_key, raw + "\n")
+                    cache_leg_output(project_root, only_key, raw + "\n")
+        # L4 (v0.2.102 W6-C1, owner ruling 2026-10-07): the interactive
+        # deadline still governs what is injected NOW, but a leg that missed
+        # it no longer dies uncached — on slow hardware the cache never
+        # warmed and injection stayed silent forever. Hand the miss to a
+        # DETACHED warmer (below) that completes the producer run and writes
+        # the cache, so the NEXT identical call is a cache hit. A leg that
+        # genuinely produced nothing also lands here once; the warmer
+        # re-runs it, gets the same nothing and caches nothing (§9 — an
+        # empty result is NEVER cached), so the next call still re-probes.
+        warm_spec: Dict[str, Dict] = {}
+        if kg_key and not kg_text and warm_kg:
+            warm_spec["kg"] = dict(warm_kg, cache_key=kg_key)
+        if cg_keys and len(cg_keys) == 1 and not cg_fresh and warm_cg:
+            warm_spec["cg"] = dict(warm_cg, cache_key=next(iter(cg_keys.values())))
+        if warm_spec:
+            _spawn_leg_warmer(project_root, warm_spec)
     cg_text = "".join(cg_symbol_texts)
     return kg_text, cg_text
+
+
+#: L4: a warmer claim younger than this belongs to a sibling warmer for the
+#: SAME cache key — don't stack a second detached producer run on it. Well
+#: under the query-cache TTL so the claim never masks a key the cache has
+#: already aged out.
+_WARM_LEG_CLAIM_TTL_S = 300.0
+
+
+def _spawn_leg_warmer(project_root: str, legs_spec: Dict[str, Dict]) -> None:
+    """L4 (v0.2.102 W6-C1): run the missed legs DETACHED and let them fill
+    the query cache for the next identical call.
+
+    The child is this same script with the hidden ``--warm-legs`` argv; the
+    job spec (producer script, pinned argv, cache key) rides STDIN as JSON —
+    the query text never travels through argv (R31). Detach shape: a new
+    session on POSIX (the ``setsid`` discipline of stop-codegraph-drain's
+    ``_drain_spawn_detached``), plain DEVNULL'd handles elsewhere. A per-key
+    ``O_CREAT|O_EXCL`` claim (:func:`vco_lib.atomic.claim_once`) stops a
+    slow backend from stacking one warmer per interactive call. Soft-fail:
+    any spawn problem drops the warming, never the hook."""
+    from vco_lib.atomic import claim_once
+
+    claimed: Dict[str, Dict] = {}
+    for name, leg in legs_spec.items():
+        key = str(leg.get("cache_key") or "")
+        if not key or not project_root:
+            continue
+        claim = Path(project_root) / ".claude" / "state" / \
+            f"warm_leg_{hashlib.md5(key.encode('utf-8'), usedforsecurity=False).hexdigest()[:16]}"
+        if claim_once(claim, stale_after_s=_WARM_LEG_CLAIM_TTL_S) is False:
+            continue  # a sibling warmer already owns this key
+        claimed[name] = leg
+    if not claimed:
+        return
+    spec = {"project_root": project_root, "legs": claimed}
+    popen_kwargs: Dict[str, object] = {}
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(_HERE / "hook_context_router.py"), "--warm-legs"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, **popen_kwargs)
+        proc.stdin.write(json.dumps(spec).encode("utf-8"))
+        proc.stdin.close()
+    except (OSError, ValueError):
+        pass
+
+
+def _warm_legs_main() -> int:
+    """The ``--warm-legs`` child: re-run the specced producer legs with NO
+    deadline and write their output into the query cache. Emits nothing,
+    records no seen-store, charges no budget — the interactive run owns all
+    of those; this process only warms the cache. Empty output is never
+    cached (§9, via :func:`cache_leg_output`), so a permanently-empty query
+    keeps re-probing exactly as before."""
+    try:
+        spec = json.loads(sys.stdin.read() or "{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 0
+    if not isinstance(spec, dict):
+        return 0
+    project_root = str(spec.get("project_root") or "")
+    legs_spec = spec.get("legs")
+    if not project_root or not isinstance(legs_spec, dict):
+        return 0
+    for name, leg in legs_spec.items():
+        if not isinstance(leg, dict):
+            continue
+        key = str(leg.get("cache_key") or "")
+        script = Path(str(leg.get("script") or ""))
+        argv = leg.get("argv")
+        if not key or not isinstance(argv, list) or not script.is_file():
+            continue
+        if cache_get(project_root, key) is not None:
+            continue  # a sibling warmer (or the interactive run) filled it
+        try:
+            mod = _hds._load_cg_module(script)
+        except BaseException:  # noqa: BLE001 — a warmer never raises
+            continue
+        _hds._pin_argv(mod, [str(a) for a in argv])
+
+        def _run(mod=mod) -> None:
+            result = mod.main()
+            if inspect.iscoroutine(result):
+                asyncio.run(result)
+
+        out = (_hds.run_legs({str(name): _run}) or {}).get(str(name)) or ""
+        out = out.strip()
+        if out:
+            cache_leg_output(project_root, key, out + "\n")
+    return 0
 
 
 # --- emission -----------------------------------------------------------------
@@ -935,20 +1180,266 @@ def _strip_stamp_lines(text: str) -> str:
                    if not ln.startswith("CODE-REV:"))
 
 
-def _emit_agent(tool_input: Dict, prompt: str, kg_text: str) -> str:
+def _emit_agent(tool_input: Dict, prompt: str, kg_text: str,
+                suggest_text: str = "") -> str:
     """The agent envelope: EVERY original tool_input field echoed verbatim,
     only `prompt` modified, NO permissionDecision (never auto-approve).
     Budget degradation already happened upstream (the per-block titles
-    degrade) — this function must not re-transform the text."""
+    degrade) — this function must not re-transform the text. v0.2.102
+    W6-C2 (census F9): the keyword matcher's agent/skill suggestions ride
+    the SAME envelope (one PreToolUse hook, one ``updatedInput``)."""
     updated = dict(tool_input)  # JSON round-trip preserves unknown fields
+    text = prompt
     injected = kg_text.strip()
-    updated["prompt"] = f"{prompt}\n\n[KG context for this task]:\n{injected}"
+    if injected:
+        text += f"\n\n[KG context for this task]:\n{injected}"
+    suggested = suggest_text.strip()
+    if suggested:
+        text += f"\n\n[Agent/skill suggestions for this task]:\n{suggested}"
+    updated["prompt"] = text
     return json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "updatedInput": updated,
         }
     }, ensure_ascii=False)
+
+
+# --- W6-C2 (census F9): agent/skill suggestions for a subagent's brief ------
+
+#: The shared keyword matcher (one home with the UserPromptSubmit
+#: suggestions, agent-skill-keyword-suggest.{sh,ps1}).
+_KEYWORD_MATCHER = "agent-skill-keyword-match.py"
+
+
+def _resolve_keyword_matcher(project_root: str) -> Optional[Path]:
+    """The project's installed matcher first, the orchestrator's template
+    copy second (the same chain the shell wrappers use)."""
+    for cand in (Path(project_root) / ".claude" / "scripts" / _KEYWORD_MATCHER,
+                 _HERE.parent.parent / "templates" / "scripts" / _KEYWORD_MATCHER):
+        if project_root and cand.is_file():
+            return cand
+    return None
+
+
+def _definition_tools(project_root: str, agent_type: str) -> Optional[List[str]]:
+    """The ``tools:`` list of the agent definition named ``agent_type`` (its
+    ``name`` frontmatter, else file stem) in the project's then the user's
+    agents dir — ``None`` when the definition is unknown or declares no
+    ``tools:`` (it then inherits every tool)."""
+    if not agent_type:
+        return None
+    from vco_lib.paths import claude_user_dir
+
+    roots = [Path(project_root) / ".claude" / "agents", claude_user_dir() / "agents"]
+    for root in roots:
+        try:
+            files = sorted(root.glob("*.md"))
+        except OSError:
+            continue
+        for path in files:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            front: Dict[str, str] = {}
+            if text.startswith("---"):
+                end = text.find("\n---", 3)
+                for line in text[3:end if end > 0 else 0].splitlines():
+                    m = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$", line)
+                    if m:
+                        front[m.group(1)] = m.group(2).strip("\"'")
+            if front.get("name", path.stem) != agent_type:
+                continue
+            raw = front.get("tools", "")
+            if not raw:
+                return None
+            return [t for t in re.split(r"[\s,\[\]]+", raw) if t]
+    return None
+
+
+def _agent_suggestions(payload: Dict, project_root: str) -> str:
+    """Agent/skill suggestions for the subagent being launched, from its
+    brief. SubagentStart carries no launch prompt (probe 2026-10-13), so
+    this is the only place the brief and the subagent type both exist.
+
+    Agents are suggested only when the subagent can spawn one (its
+    definition's ``tools:`` lists Agent/Task, or declares no list — it then
+    inherits every tool; an unknown type over-suggests, the retired hook's
+    rule). Workflows are main-loop only. NO per-session dedupe: the reader
+    is a fresh context that has seen none of the parent's suggestions (the
+    F10 rule the KG half follows). Soft-fail to ""."""
+    tool_input = payload.get("tool_input") or {}
+    prompt = str(tool_input.get("prompt") or "")
+    if not prompt.strip() or not project_root:
+        return ""
+    matcher = _resolve_keyword_matcher(project_root)
+    if matcher is None:
+        return ""
+    try:
+        mod = _hds._load_cg_module(matcher)
+        root = Path(project_root)
+        tools = _definition_tools(project_root, str(tool_input.get("subagent_type") or ""))
+        may_spawn = tools is None or any(t.lower() in ("agent", "task") for t in tools)
+        agents = mod.collect_agents(root) if may_spawn else []
+        skills = mod.collect_skills(root)
+        hit_agents = [(n, sd) for n, kw, sd in agents if mod.any_match(kw, prompt)]
+        hit_skills = [(n, sd) for n, kw, sd in skills if mod.any_match(kw, prompt)]
+        return str(mod.format_suggestion(hit_agents, hit_skills, []) or "")
+    except Exception:  # noqa: BLE001 — a suggestion must never break the brief
+        return ""
+
+
+def _emit_agent_suggestions_only(payload: Dict, suggest_text: str) -> int:
+    """The agent surface's exit when no KG block survived: the suggestions
+    alone still ride the envelope (when there is a real ``prompt`` field to
+    append to — the router never synthesizes one)."""
+    tool_input = payload.get("tool_input") or {}
+    if suggest_text.strip() and "prompt" in tool_input:
+        print(_emit_agent(tool_input, str(tool_input.get("prompt") or ""), "",
+                          suggest_text))
+    return 0
+
+
+# --- W3R-10: the staged citation ctx must match what reached the transcript --
+
+
+def _block_titles(text: str) -> List[str]:
+    """Capped first header fields (node title / code full_name) of every
+    KG:/CODE: block in a leg-output stream — the identity the pending
+    citation ctx's node ``title`` is matched against."""
+    titles: List[str] = []
+    for line in text.splitlines():
+        m = _HEADER_RE.match(line)
+        if m:
+            titles.append(cap_key_field(m.group(2).split(" | ", 1)[0]))
+    return titles
+
+
+#: W3R-10/batch-8: the run id of the router run currently in flight in
+#: THIS process (set by :func:`main`, cleared on its exit). Empty outside
+#: a run — the staged-ctx wrapper is then a pure passthrough, so importing
+#: this module into a LONGER-LIVED process (tests do; the replay harness
+#: calls ``main()`` in-process) can never change ``citation_pending``'s
+#: behaviour for anyone else.
+_CURRENT_RUN_ID = ""
+
+
+def _install_staged_ctx_run_id_wrapper() -> None:
+    """Wrap ``citation_pending.stage_pending`` to stamp ``router_run_id``.
+
+    The staging happens inside the KG leg's producer
+    (``search_pipeline._populate_citation_cache`` →
+    ``citation_pending.stage_pending``), which imports ``stage_pending``
+    LAZILY at call time — so wrapping the attribute on the
+    ``citation_pending`` module BEFORE the legs run is the one supported
+    interception point (no producer file is touched). While a run is in
+    flight (``_CURRENT_RUN_ID`` set by :func:`main`), every ctx this
+    process stages carries ``ctx["router_run_id"]``, which
+    :func:`_amend_pending_citations` requires before it will amend a file:
+    a session + mtime window alone cannot tell a sibling concurrent
+    router's freshly staged ctx (same session, nodes it DID show) from
+    this run's own — the batch-8 review's MEDIUM. Outside a run the
+    wrapper changes NOTHING (ctx passed through untouched). Soft-fail: an
+    unpatchable staging path simply leaves files unstamped, and unstamped
+    files are never amended (the pre-fix behaviour for them).
+    """
+    try:
+        import claude_mcp_servers.rl_client.citation_pending as _cp
+    except Exception:  # noqa: BLE001 — never break the run for the stamp
+        return
+    if getattr(_cp.stage_pending, "_vco_router_run_stamped", False):
+        return  # installed already (idempotent per process)
+    _original = _cp.stage_pending
+
+    def _stage_with_run_id(**kwargs):
+        rid = _CURRENT_RUN_ID
+        if not rid:
+            return _original(**kwargs)  # no run in flight: untouched
+        ctx = kwargs.get("ctx")
+        ctx = dict(ctx) if isinstance(ctx, dict) else {}
+        ctx["router_run_id"] = rid
+        kwargs["ctx"] = ctx
+        return _original(**kwargs)
+
+    _stage_with_run_id._vco_router_run_stamped = True  # type: ignore[attr-defined]
+    _cp.stage_pending = _stage_with_run_id
+
+
+def _amend_pending_citations(project_root: str, sid: str,
+                             suppressed_titles: List[str],
+                             run_id: str) -> None:
+    """Drop never-shown nodes from the pending citation ctx this run staged.
+
+    W3R-10 (v0.2.102): the RL retrieval event + the citation pending file
+    are produced INSIDE the KG leg — before this router's seen-store
+    suppression and full-suppression exits decide. A repeat query whose
+    blocks are all already-seen therefore staged a ctx whose nodes the
+    model never saw, and the Stop-hook drain would compute citation labels
+    for them (systematic label noise on the repeat cohort). This is the
+    router-side half: after the decision, remove the suppressed nodes from
+    the ctx (the titles still shown — budget degradation keeps the header —
+    stay), record what was dropped, and delete a ctx left with no nodes
+    (nothing shown → nothing citable). Soft-fail everywhere; never raises.
+
+    Scope guard (batch-8 MEDIUM): ONLY pending files whose ctx carries
+    THIS run's ``router_run_id`` stamp (:func:`_stamp_staged_ctx_with_run_id`)
+    AND whose payload ``session_id`` matches are touched — earlier runs'
+    files, unstamped files and sibling concurrent routers' files (same
+    session, their own run id) own their own ctx.
+    """
+    if not suppressed_titles or not sid or sid == "default" or not project_root:
+        return
+    if not run_id:
+        return
+    supp = set(suppressed_titles)
+    try:
+        d = Path(project_root) / ".claude" / "state" / "rl_pending"
+        files = list(d.glob("*.json"))
+    except OSError:
+        return
+    from vco_lib.atomic import atomic_write_json
+
+    for f in files:
+        try:
+            payload = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("session_id") != sid:
+            continue
+        ctx = payload.get("ctx")
+        if not isinstance(ctx, dict) or ctx.get("router_run_id") != run_id:
+            continue
+        removed: List[str] = []
+        for key in ("nodes", "other_nodes"):
+            nodes = ctx.get(key)
+            if not isinstance(nodes, list):
+                continue
+            keep = []
+            for n in nodes:
+                if isinstance(n, dict) and \
+                        cap_key_field(str(n.get("title", ""))) in supp:
+                    removed.append(str(n.get("title", "")))
+                else:
+                    keep.append(n)
+            ctx[key] = keep
+        if not removed:
+            continue
+        prev = ctx.get("router_suppressed_titles")
+        merged = sorted(set((prev if isinstance(prev, list) else []) + removed))
+        ctx["router_suppressed_titles"] = merged
+        if not ctx.get("nodes"):
+            # No shown node left → the drain could only compute labels for
+            # never-shown context. The staged ctx is dead; remove it.
+            try:
+                f.unlink()
+            except OSError:
+                pass
+            continue
+        try:
+            atomic_write_json(f, payload, indent=None, fsync=False)
+        except OSError:
+            pass
 
 
 # --- bash double-fire claim (v0.2.101 N2) -------------------------------------
@@ -996,7 +1487,38 @@ def bash_claim_path(payload: Dict, project_root: str) -> str:
 
 
 def _bash_claim_gc(state_dir: Path) -> None:
-    """Bounded best-effort sweep of old claims (never raises)."""
+    """Bounded best-effort sweep of old claims (never raises).
+
+    L3 cost note (OD-18, S2N2 re-review): the sweep is one ``glob`` of the
+    flat ``.claude/state`` dir capped at ``_BASH_CLAIM_GC_MAX`` (200)
+    one-file ``stat`` calls — single-digit milliseconds on spinning disks,
+    no index needed because claims are one tiny file per Bash call and the
+    1 h GC age sits far above the 60 s TTL, so the GC never races a live
+    takeover decision.
+
+    OD-18 separation invariant — EPHEMERAL vs DURABLE state in this dir:
+
+    * EPHEMERAL (this GC and the wrappers' 1-day ``find`` GC may delete):
+      ``bash_claim_*`` (this sweep), ``bash_task_*`` / ``bash_intent_*``
+      (one-shot pairing + classification handoffs, both re-derivable and
+      expired by the wrapper's ``-mtime +1`` sweep).
+    * DURABLE (NO claim/pairing GC may EVER touch): the per-session
+      seen-store ``seen_inject_<sid>.txt`` / ``seen_reads_<sid>.txt`` /
+      ``seen_cginject_count_<sid>.txt`` (the record of what was already
+      injected/Read — survives across turns and reboots by design), the
+      ``rl_pending/`` citation queue (scored at its chat's end by its own
+      owner; abandoned files collected after ``RL_CITATION_ABANDONED_DAYS``) and the
+      ``inject_budget_*`` / ``query_cache`` state. The globs here are the
+      guard: they match ``bash_claim_*`` ONLY, so the durable stores are
+      unreachable from this sweep by construction.
+
+    Root cause of the double fire (OD-18 "fix the cause"): the §C1 settings
+    group registers the bash wrapper once per matching ``if`` rule
+    (``settings.json.*.template``), so ONE multi-match command spawns it
+    once per MATCHING RULE — concurrently, same payload. The per-call
+    ``O_EXCL`` claim (:func:`claim_bash_call`) is the cross-rule dedupe;
+    this GC only reclaims the claim files that mechanism leaves behind.
+    """
     try:
         cutoff = time.time() - _BASH_CLAIM_GC_AGE_S
         for f in list(state_dir.glob("bash_claim_*"))[:_BASH_CLAIM_GC_MAX]:
@@ -1033,13 +1555,71 @@ def claim_bash_call(payload: Dict, project_root: str) -> bool:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    global _CURRENT_RUN_ID
     argv = list(sys.argv[1:] if argv is None else argv)
+    # L4 (v0.2.102 W6-C1): the detached cache-warmer child. Handled BEFORE
+    # the run-id stamp — a warmer shows nothing, so nothing it stages may
+    # be treated as this-run ctx (the stamp is the amendment gate).
+    if argv and argv[0] == "--warm-legs":
+        try:
+            return _warm_legs_main()
+        except BaseException as exc:  # noqa: BLE001 — a warmer never raises
+            print(f"[hook_context_router] warm-legs soft-fail: {exc!r}",
+                  file=sys.stderr)
+            return 0
+    # W3R-10/batch-8: give THIS run an id and let the staged-ctx wrapper
+    # stamp it (passthrough outside a run — see _CURRENT_RUN_ID). Cleared
+    # on every exit so an in-process caller (tests, embedders) is never
+    # left with a stale stamp on later stage_pending calls.
+    _CURRENT_RUN_ID = f"router_{os.getpid()}_{time.time_ns()}"
+    _install_staged_ctx_run_id_wrapper()
     try:
         return _main(argv)
     except BaseException as exc:  # noqa: BLE001 — exit 0 ALWAYS; a retrieval
         # failure is silence, never a blocked tool call.
         print(f"[hook_context_router] soft-fail: {exc!r}", file=sys.stderr)
         return 0
+    finally:
+        _CURRENT_RUN_ID = ""
+
+
+def _emit_prompt_nudge(payload: Dict, sid: str, project_root: str,
+                       prompt_id: str, turn_cap: int) -> None:
+    """v0.2.102 W6-N F-8 (owner ruling 2026-10-12): before an Edit/Write of a
+    prompt-shaped file, suggest the project's ENABLED prompt-authoring agent
+    (:mod:`vco_lib.prompt_edit_nudge` decides both). Printed FIRST, as a
+    ``NOTE:`` block that went through the session seen-store, so it is shown
+    at most once per session per file — on this run and on the edit
+    wrapper's cache replay alike (the shell/PowerShell filters parse NOTE
+    too). An untrustworthy session (no store) gets no nudge: without a
+    store "at most once" cannot be kept, and silence is the safe side.
+
+    Inside the injection budgets like every other block (W6-N review
+    NIT-6): capped by the per-injection soft cap, degraded to its header
+    line (which keeps the dedup identity) once the per-turn budget is
+    spent, and CHARGED to the per-turn budget before the KG/CODE legs read
+    it, so the blocks that follow in the same run see the NOTE's cost.
+
+    ``sid``/``turn_cap`` (v0.2.102 W6-C1): the PER-AGENT state key and its
+    budget cap — a subagent's edit nudge charges the subagent's own
+    20 000-char bucket, not the main chat's 6 000."""
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    file_path = str(tool_input.get("file_path") or "")
+    block = _prompt_nudge_block(file_path, project_root, tool_input)
+    inject_file = seen_store_path("inject", sid, project_root)
+    if not block or not inject_file:
+        return
+    shown = filter_seen_blocks(block, inject_file, "", project_root)
+    if not shown.strip():
+        return
+    text = cap_block(shown.strip("\n"))
+    budget_path = budget_state_path(sid, prompt_id, project_root)
+    if _budget_used(budget_path) + len(text) > turn_cap:
+        text = text.split("\n", 1)[0]
+    print(text)
+    _budget_charge(budget_path, len(text) + 1)
 
 
 def _main(argv: List[str]) -> int:
@@ -1054,6 +1634,16 @@ def _main(argv: List[str]) -> int:
 
     # Kill switch first (beside the wrappers' own check): off → total silence.
     if (os.environ.get("VCO_INJECT_PROFILE") or "").strip().lower() == "off":
+        return 0
+
+    # v0.2.102 W6-F fix-round (review MEDIUM): per-surface kill switch for
+    # the prompt surface — VCO_PROMPT_INJECT=off disables ONLY UserPromptSubmit
+    # injection (the per-prompt python+weaviate-stack spawn is the one
+    # surface whose latency sits on the critical path of EVERY prompt).
+    # The wrappers check it too, before any spawn; THIS is the enforcement
+    # home (one code path for every caller of the router).
+    if surface == "prompt" and \
+            (os.environ.get("VCO_PROMPT_INJECT") or "").strip().lower() == "off":
         return 0
 
     try:
@@ -1071,6 +1661,17 @@ def _main(argv: List[str]) -> int:
         return 0
 
     sid = sanitize_session_id(str(payload.get("session_id") or ""))
+    # v0.2.102 W6-C1 (F1/F2/F3): subagent tool events carry agent_id while
+    # session_id / prompt_id stay the PARENT'S (probe 2026-10-13), so every
+    # per-session store keyed on sid alone was shared by the main chat and
+    # all its subagents. state_sid is the PER-AGENT key (one home:
+    # vco_lib.hook_agent_key + _lib/session-id.{sh,ps1}); it keys the
+    # seen-store, the code-graph cap counter and the per-turn budget. The
+    # RAW sid keeps keying what is genuinely session-scoped: the bash
+    # claim (per tool_use_id anyway), the VCT_SESSION_ID telemetry export
+    # and the pending-citation session match.
+    agent_id = sanitize_agent_id(str(payload.get("agent_id") or ""))
+    state_sid = agent_state_key(sid, agent_id)
     prompt_raw = str(payload.get("prompt_id") or "")
     prompt_id = prompt_raw if re.fullmatch(r"[A-Za-z0-9_-]+", prompt_raw) else ""
     transcript_path = str(payload.get("transcript_path") or "")
@@ -1081,8 +1682,35 @@ def _main(argv: List[str]) -> int:
     # the "default" sentinel — rather empty than a fake-key cohort.
     if sid and sid != "default":
         os.environ.setdefault("VCT_SESSION_ID", sid)
+    # v0.2.102 W6-C2 (census F12): the KG leg stages its pending citation in
+    # THIS process (and the L4 warmer inherits this env), and
+    # citation_pending.stage_pending reads VCT_AGENT_ID to tag the file —
+    # so the drain scores a subagent's retrieval against the SUBAGENT's
+    # transcript (SubagentStop's agent_transcript_path), never the parent's.
+    # Set from the payload on every run (popped for the main chat), never
+    # inherited from an ambient env.
+    if agent_id:
+        os.environ["VCT_AGENT_ID"] = agent_id
+    else:
+        os.environ.pop("VCT_AGENT_ID", None)
+    # W6-C2 fix round (review R4c-8): the `agent` surface retrieves for a
+    # subagent that does not exist yet (PreToolUse:Agent), so its staged
+    # citation carries the CALLER's tag. Mark it with the Agent call's
+    # tool_use_id; PostToolUse:Agent (stop-drain-citations) re-tags it with
+    # tool_response.agentId (citation_pending.adopt_brief_citations).
+    brief_tuid = str(payload.get("tool_use_id") or "") if surface == "agent" else ""
+    if brief_tuid:
+        os.environ["VCT_BRIEF_TOOL_USE_ID"] = brief_tuid
+    else:
+        os.environ.pop("VCT_BRIEF_TOOL_USE_ID", None)
 
     plan = _PLAN_BUILDERS[surface](payload, cwd)
+    # W6-C2 (census F9): the agent surface also carries keyword suggestions.
+    suggest_text = _agent_suggestions(payload, project_root) if surface == "agent" else ""
+
+    if surface in ("edit", "write"):
+        _emit_prompt_nudge(payload, state_sid, project_root, prompt_id,
+                           turn_budget_chars(bool(agent_id)))
 
     def _write_intent_out() -> None:
         """The Wave-2 wrapper's outcome-event seam (WP-D 2: intent +
@@ -1099,12 +1727,25 @@ def _main(argv: List[str]) -> int:
 
     if not plan.kg_profile and not plan.cg_profile:
         _write_intent_out()
+        if suggest_text:
+            return _emit_agent_suggestions_only(payload, suggest_text)
         return 0  # MECHANICAL / no recoverable query → no spawn, no event
 
     _budget_gc(project_root)
-    budget_path = budget_state_path(sid, prompt_id, project_root)
+    # F2 (v0.2.102 W6-C1, owner decision 2026-10-07): the budget file and its
+    # cap are PER AGENT — a subagent run is its own "turn" with a 20 000-char
+    # bucket; the main chat keeps its unchanged 6 000 (one home for the pair:
+    # vco_lib.inject_intent.turn_budget_chars). F10: the AGENT surface skips
+    # the turn budget entirely — a brief's reader has seen nothing and its
+    # own 1 500-char KgGate bound is the cap that matters.
+    if surface == "agent":
+        budget_path: Optional[str] = None
+        turn_cap: Optional[int] = None
+    else:
+        budget_path = budget_state_path(state_sid, prompt_id, project_root)
+        turn_cap = turn_budget_chars(bool(agent_id))
     used = _budget_used(budget_path)
-    over_budget = used >= PER_TURN_BUDGET_CHARS
+    over_budget = bool(turn_cap) and used >= turn_cap
 
     # Inner bounds (env-tunable). OWNER RULING 2026-10-06: interactive
     # per-tool-call injection is the DELIBERATELY-BOUNDED, silence-safe
@@ -1120,8 +1761,19 @@ def _main(argv: List[str]) -> int:
     # timeout fails OPEN to silence — accepted for this bounded class, and
     # never a licence to tighten the LONG-operation timeouts elsewhere
     # (kg-sync / code-graph analysis / install / seed stay generous).
-    deadline = time.monotonic() + _env_float("VCO_INJECT_BUDGET_S", 6.0)
-    kg_text, cg_text = _run_legs(plan, sid, prompt_id, project_root,
+    deadline = time.monotonic() + env_float("VCO_INJECT_BUDGET_S", 6.0, above=0)
+    # W3R-10: the citation pending files the legs stage during THIS run are
+    # amended after the suppression decisions below — the pre-legs snapshot
+    # bounds which files this run owns (new or re-staged since).
+    # W3R-10 (batch-8): main() set this run's id and installed the
+    # staged-ctx wrapper, so every citation ctx THIS run stages carries it
+    # and the post-decision amendment below owns ONLY its own files — a
+    # session + mtime window could not tell a sibling concurrent router's
+    # freshly staged ctx in the same session from this run's own. A DIRECT
+    # _main() call (no main()) has no run id → no stamp → no amendment
+    # (safe no-op; the production path is main()).
+    router_run_id = _CURRENT_RUN_ID
+    kg_text, cg_text = _run_legs(plan, state_sid, prompt_id, project_root,
                                  transcript_path, deadline)
     _write_intent_out()
 
@@ -1141,22 +1793,47 @@ def _main(argv: List[str]) -> int:
 
     combined = kg_text + ("\n" if kg_text and cg_text else "") + cg_text
     if not combined.strip():
+        if suggest_text:
+            return _emit_agent_suggestions_only(payload, suggest_text)
         return 0
 
-    inject_file = seen_store_path("inject", sid, project_root)
-    reads_file = seen_store_path("reads", sid, project_root)
-    filtered = filter_seen_blocks(combined, inject_file, reads_file, project_root)
-    if not filtered.strip():
-        return 0
+    # F1: the seen-store files are keyed by the PER-AGENT state key. F10
+    # (v0.2.102 W6-C1): the AGENT surface (a brief rewritten via
+    # updatedInput) SKIPS the seen-store filter/record entirely — the
+    # brief's reader (the subagent being launched) has seen nothing, so the
+    # parent's dedupe would strip exactly the most relevant blocks and then
+    # wrongly record them as seen for the parent. It keeps its own
+    # 1 500-char KgGate bound.
+    if surface == "agent":
+        inject_file = ""
+        reads_file = ""
+        filtered = combined
+    else:
+        inject_file = seen_store_path("inject", state_sid, project_root)
+        reads_file = seen_store_path("reads", state_sid, project_root)
+        suppressed: List[str] = []  # W3R-10: titles the filter dropped
+        filtered = filter_seen_blocks(combined, inject_file, reads_file,
+                                      project_root, suppressed_out=suppressed)
+        if not filtered.strip():
+            # `suppressed` non-empty = every block was already seen/Read (all
+            # dropped by decision). Lock contention ALSO returns "" but
+            # leaves `suppressed` empty — nothing was decided, so nothing is
+            # amended.
+            _amend_pending_citations(project_root, sid, suppressed,
+                                     router_run_id)
+            return 0
 
     # Per-injection soft cap + per-turn budget (degrade, never drop: past
-    # budget the blocks become titles one-liners, §2.1).
+    # budget the blocks become titles one-liners, §2.1). turn_cap None
+    # (F10, the agent surface) means NO turn budget — only the per-block
+    # soft cap applies.
     blocks = [b for b in re.split(r"\n(?=(?:KG|CODE): )", filtered) if b.strip()]
     out_blocks: List[str] = []
     emitted = 0
     for block in blocks:
         text = cap_block(block.rstrip("\n"))
-        if over_budget or used + emitted + len(text) > PER_TURN_BUDGET_CHARS:
+        if turn_cap is not None and (
+                over_budget or used + emitted + len(text) > turn_cap):
             text = titles_one_liner(text) or text
             if not text:
                 continue
@@ -1165,10 +1842,17 @@ def _main(argv: List[str]) -> int:
 
     final = "\n".join(out_blocks)
     if not final.strip():
+        # Everything degraded away past the budget — no node title reached
+        # the transcript (the budget loop keeps headers, so this is rare,
+        # but the staged ctx must not outlive the truth).
+        _amend_pending_citations(project_root, sid,
+                                 _block_titles(combined), router_run_id)
+        if suggest_text:
+            return _emit_agent_suggestions_only(payload, suggest_text)
         return 0
 
     if cg_text and any(b.startswith("CODE:") for b in out_blocks):
-        _cg_record(_cg_count_path(sid, project_root))
+        _cg_record(_cg_count_path(state_sid, project_root))
     _budget_charge(budget_path, emitted)
 
     if surface == "agent":
@@ -1178,14 +1862,21 @@ def _main(argv: List[str]) -> int:
         # field to append to; the router never synthesizes a field that did
         # not exist in the tool input.
         if "prompt" not in tool_input:
+            # No envelope is emitted — NOTHING reached the transcript.
+            _amend_pending_citations(project_root, sid,
+                                     _block_titles(combined), router_run_id)
             return 0
         prompt = str(tool_input.get("prompt") or "")
         # The agent brief's own bound (≤1 500 chars) was applied inside the
         # producer (KgGate.max_chars); the budget degradation happened in the
         # per-block loop above.
-        print(_emit_agent(tool_input, prompt, final))
+        print(_emit_agent(tool_input, prompt, final, suggest_text))
         return 0
 
+    # W3R-10 normal path: the filter's suppressed titles never reached the
+    # transcript (budget degradation keeps every block's header, so the
+    # remaining blocks' titles WERE shown).
+    _amend_pending_citations(project_root, sid, suppressed, router_run_id)
     print(final)
     return 0
 

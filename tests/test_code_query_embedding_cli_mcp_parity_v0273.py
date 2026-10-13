@@ -15,7 +15,8 @@ Regression guarded here:
     ``ACTIVE_EMBEDDING`` while the CLI unconditionally used
     ``codesage_embed``.
 
-WORKTREE FOOTGUN (wave-1 diagram-test lesson): these tests do NOT spawn
+WORKTREE FOOTGUN (a lesson first learned in the wave-1 diagram tests):
+these tests do NOT spawn
 venv-resolving hooks, but we defensively clear ambient ``VCT_VENV`` /
 ``VCT_DISABLE_HUB_RESOLVER`` at import time so a hook-spawning sibling in
 the same process can't leak state.
@@ -156,12 +157,16 @@ class CodeQueryEmbeddingParityTests(unittest.TestCase):
         self.server._get_embedding_service = lambda: None
         self.cli._get_or_create_embedding_service = lambda: None
         try:
-            self.assertEqual(
-                self.server._active_code_query_slot(),
-                self.cli._active_code_vector_slot(),
-            )
-            # CLI's documented svc-None fallback is codesage_embed.
-            self.assertEqual(self.server._active_code_query_slot(), "codesage_embed")
+            # v0.2.102 W6-B2 (owner ruling 2026-10-10): svc None is the SAME
+            # loud error on both surfaces — the old shared "codesage_embed"
+            # default named a slot the graph may not be indexed in.
+            from vco_lib.embed_outage import EmbeddingBackendUnavailable
+
+            with self.assertRaises(EmbeddingBackendUnavailable) as mcp_ctx:
+                self.server._active_code_query_slot()
+            with self.assertRaises(EmbeddingBackendUnavailable) as cli_ctx:
+                self.cli._active_code_vector_slot()
+            self.assertEqual(mcp_ctx.exception.scheme, cli_ctx.exception.scheme)
         finally:
             self.server._get_embedding_service = orig_mcp
             self.cli._get_or_create_embedding_service = orig_cli
@@ -172,7 +177,9 @@ class CodeQueryEmbeddingParityTests(unittest.TestCase):
         fake = _FakeService("qwen3_embed")
         self.server._cached_embed_service = fake
 
-        async def _fake_http(text):
+        async def _fake_http(text, tolerance_secs=None):  # noqa: ARG001
+            # tolerance_secs: W4-E review E2 threaded the interactive
+            # tolerance through get_code_embedding to the inline fallback.
             return [999.0]
 
         orig = self.server._inline_code_embed_http

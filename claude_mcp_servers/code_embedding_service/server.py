@@ -17,12 +17,50 @@ Environment variables:
   CODE_EMBED_DTYPE        "float32" | "bfloat16" | "float16"  (default: "bfloat16", gpu backend only)
   CODE_EMBED_PORT         Server port (default: 11440)
   CODE_EMBED_BATCH_SIZE   Max batch size (default: 32)
-  CODE_EMBED_MAX_CONCURRENT  Max in-flight requests before shedding with 503 (default: 4)
+  CODE_EMBED_MAX_CONCURRENT  Concurrent execution slots (default: 4). Requests
+                          beyond the slots QUEUE (FIFO-fair) instead of being
+                          shed — owner rule v0.2.102: concurrent users wait,
+                          none are dropped. The wait is bounded by
+                          CODE_EMBED_QUEUE_WAIT_SECS; only past that bound is a
+                          request refused (503 + Retry-After).
+  CODE_EMBED_QUEUE_WAIT_SECS  Max seconds a request waits for a concurrency slot
+                          before it is refused with 503 + Retry-After. Generous
+                          by design (shipped timeouts are long; a queued request
+                          is progress, not a wedge). 0 = do not queue (refuse
+                          over-capacity requests immediately — the pre-v0.2.102
+                          C-9 shed — still with Retry-After). Default: 600.
+                          Clients MUST use a request timeout above this (the
+                          bundled clients default to 660 s — see
+                          vco_lib/retry_after.py).
   CODE_EMBED_IDLE_UNLOAD_SECS  Idle seconds before the GPU model (~7.25 GB CodeSage
                           weights) is unloaded to free VRAM; the next request
                           transparently lazy-reloads it. 0 = never unload
                           (keep resident for the process lifetime). Default: 300.
                           gpu backend only — the ollama backend holds no in-process weights.
+                          The unload drops the module's strong reference, runs
+                          gc.collect() to break the SentenceTransformer/nn.Module
+                          reference cycles that otherwise pin the weights, then
+                          empty_cache(), and MEASURES the freed bytes. If the free
+                          does not actually happen (a live reference still holds the
+                          weights) it KEEPS the model loaded and logs a WARNING
+                          rather than discarding the handle — so the next request
+                          reuses the resident copy instead of allocating a second one
+                          that OOMs the GPU.
+  CODE_EMBED_LOAD_OOM_RETRIES  Retry attempts after a first CUDA-OOM model load
+                          (total attempts = retries + 1). Default: 12.
+  CODE_EMBED_LOAD_OOM_BACKOFF_SECS  Seconds to wait between CUDA-OOM load retries
+                          (after gc.collect() + empty_cache()). Generous by design —
+                          VRAM held by another process can take MINUTES to release
+                          (Ollama's keep-alive alone is 5 min), so the default
+                          budget is 12 × 30 s ≈ 6 min. When the budget is exhausted
+                          the service returns 503 + Retry-After (never a 500
+                          traceback) and starts a short cooldown in which queued
+                          loaders fail fast with the same 503 — waiters SHARE the
+                          failed outcome instead of each re-running a full budget.
+  CODE_EMBED_UNLOAD_FREED_MIN_MB  VRAM floor (MB) below which an idle-unload is
+                          treated as successful without measuring freed bytes (a
+                          cpu/mps model or a test mock holds no real VRAM, so there
+                          is nothing to OOM on reload). Default: 64.
   OLLAMA_URL              Ollama API URL (default: http://localhost:11435)
   CODE_EMBED_INSTRUCTION  OVERRIDE for the query-side instruction prefix.
                           Default "" — when unset, the service resolves the
@@ -65,11 +103,14 @@ API:
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib.util
 import logging
 import os
 import sys
+import threading
 import time
+import weakref
 from pathlib import Path
 
 import uvicorn
@@ -181,7 +222,51 @@ DEVICE = os.getenv("CODE_EMBED_DEVICE", "auto")
 DTYPE = os.getenv("CODE_EMBED_DTYPE", "bfloat16")
 PORT = int(os.getenv("CODE_EMBED_PORT", "11440"))
 BATCH_SIZE = int(os.getenv("CODE_EMBED_BATCH_SIZE", "32"))
-MAX_CONCURRENT = int(os.getenv("CODE_EMBED_MAX_CONCURRENT", "4"))  # max in-flight requests before shed
+MAX_CONCURRENT = int(os.getenv("CODE_EMBED_MAX_CONCURRENT", "4"))  # concurrent execution slots; over-capacity requests queue (QUEUE_WAIT_SECS)
+
+
+def _env_text(name: str) -> "str | None":
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _env_float(name: str, default: float, *, minimum: "float | None" = None,
+               clamp: bool = False) -> float:
+    """DOCUMENTED COPY — must match ``vco_lib/env_values.py::env_float``
+    (the ``minimum`` / ``clamp`` subset). This file also runs inside the
+    container image, where ``vco_lib`` is absent BY DESIGN (see
+    :func:`_configure_logging_for_environment`), so it cannot import the one
+    home; ``tests/test_v02102_env_values.py`` pins the parity."""
+    text = _env_text(name)
+    if text is None:
+        return default
+    try:
+        value = float(text)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return minimum if clamp else default
+    return value
+
+
+def _env_int(name: str, default: int, *, minimum: "int | None" = None,
+             clamp: bool = False) -> int:
+    """DOCUMENTED COPY — must match ``vco_lib/env_values.py::env_int`` (the
+    ``minimum`` / ``clamp`` subset); same reason and parity test as
+    :func:`_env_float`."""
+    text = _env_text(name)
+    if text is None:
+        return default
+    try:
+        value = int(text)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return minimum if clamp else default
+    return value
 
 
 def _resolve_idle_unload_secs() -> float:
@@ -189,17 +274,70 @@ def _resolve_idle_unload_secs() -> float:
     value coerces to the 300 s default (conservative: never a shorter-than-asked
     window that would thrash the reload). Read once at import — the timer honours
     it for the process lifetime."""
-    raw = os.getenv("CODE_EMBED_IDLE_UNLOAD_SECS", "300")
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        return 300.0
-    if val < 0:
-        return 300.0
-    return val
+    return _env_float("CODE_EMBED_IDLE_UNLOAD_SECS", 300.0, minimum=0)
 
 
 IDLE_UNLOAD_SECS = _resolve_idle_unload_secs()  # 0 = never unload
+
+
+def _resolve_load_oom_retries() -> int:
+    """Retry attempts after a FIRST CUDA-OOM model load (total attempts =
+    retries + 1). A bad/negative value coerces to the default. Read once at
+    import — the load path honours it for the process lifetime."""
+    return _env_int("CODE_EMBED_LOAD_OOM_RETRIES", 12, minimum=0, clamp=True)
+
+
+def _resolve_load_oom_backoff_secs() -> float:
+    """Seconds to wait between CUDA-OOM load retries (after gc.collect() +
+    empty_cache()). Generous by design: VRAM held by another process — e.g.
+    Ollama before its keep-alive expires — can take minutes to be released, and
+    a slow machine's load is not the ceiling. A bad/negative value coerces to
+    the default. Read once at import."""
+    # ``max`` (not a bound): it maps nan to 0.0, exactly as before.
+    return max(0.0, _env_float("CODE_EMBED_LOAD_OOM_BACKOFF_SECS", 30.0))
+
+
+def _resolve_unload_freed_min_mb() -> float:
+    """VRAM floor (MB) below which an idle-unload is treated as successful
+    WITHOUT measuring freed bytes. A real model holds GBs; below this floor
+    nothing substantial was allocated (a cpu/mps model, or a test mock that
+    holds no real VRAM), so there is nothing to OOM on reload and no reason to
+    keep the handle. A bad/negative value coerces to the default. Read once at
+    import."""
+    return max(0.0, _env_float("CODE_EMBED_UNLOAD_FREED_MIN_MB", 64.0))
+
+
+def _resolve_queue_wait_secs() -> float:
+    """Max seconds a request waits for a concurrency slot before it is refused
+    with 503 + Retry-After (v0.2.102 r2 — the owner rule is that concurrent
+    requests QUEUE and none are dropped; this is the ONLY bound on the wait).
+    Generous by design, per the long-timeouts doctrine. 0 is honoured and means
+    "do not queue" (the pre-v0.2.102 C-9 immediate shed, still with
+    Retry-After); a bad/negative value coerces to the 600 s default. Read once
+    at import."""
+    return _env_float("CODE_EMBED_QUEUE_WAIT_SECS", 600.0, minimum=0)
+
+
+#: Bounded CUDA-OOM load-retry budget (v0.2.102). ``LOAD_OOM_RETRIES`` extra
+#: attempts after the first, ``LOAD_OOM_BACKOFF_SECS`` apart — the default
+#: total budget is 12 × 30 s ≈ 6 MINUTES, because the VRAM a retry waits on is
+#: typically held by another process whose release cadence is minutes-scale
+#: (Ollama's keep-alive alone is 5 min). Exhausting it answers 503 +
+#: Retry-After and starts the ``_load_unavailable_until`` cooldown.
+LOAD_OOM_RETRIES = _resolve_load_oom_retries()
+LOAD_OOM_BACKOFF_SECS = _resolve_load_oom_backoff_secs()
+UNLOAD_FREED_MIN_MB = _resolve_unload_freed_min_mb()
+#: Queue bound for over-capacity requests (see ``_resolve_queue_wait_secs``).
+QUEUE_WAIT_SECS = _resolve_queue_wait_secs()
+#: With ``QUEUE_WAIT_SECS == 0`` a wait_for timeout of exactly 0 would refuse
+#: even when a slot is FREE (the coroutine never gets scheduled); this ~1 ms
+#: grace lets a free-slot acquire complete while still refusing a queued one.
+_QUEUE_ZERO_GRACE_SECS = 0.001
+#: A genuine unload of a multi-GB model frees at least HALF the VRAM it held;
+#: less means a live reference still pins the weights — keep the handle rather
+#: than discard it and allocate a second copy on the next request.
+_UNLOAD_FREED_RATIO = 0.5
+
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 INSTRUCTION = os.getenv("CODE_EMBED_INSTRUCTION", "")
 MAX_SEQ_LEN = os.getenv("CODE_EMBED_MAX_SEQ_LEN", "")
@@ -265,22 +403,70 @@ def _resolve_query_instruction(model_name: str, task: "str | None" = None) -> st
 # ---------------------------------------------------------------------------
 # Backend: GPU (sentence-transformers)
 # ---------------------------------------------------------------------------
-_st_model = None  # lazy-loaded
+_st_model = None  # lazy-loaded; the ONLY persistent strong reference to the
+# SentenceTransformer. Every other use is transient and released when its call
+# returns: the ``model`` local in ``_embed_gpu``/``_dim_gpu``, the ``model``
+# argument threaded through ``_refuse_over_window``/``_gpu_token_count``, and the
+# executor frame running ``encode``. So dropping this one global is what frees the
+# weights — BUT only after ``gc.collect()``: the SentenceTransformer/nn.Module
+# object graph is cyclic (module ↔ ``_modules``/``_parameters`` dicts, hooks), so
+# ``_st_model = None`` alone leaves the refcount above zero and the ~7.25 GB of
+# tensors still allocated when ``empty_cache()`` runs (the observed "freed 0 MB").
 # v0.2.79 §C: cache the embedding dimension the first time the model loads. It
 # is a fixed model property, so ``/health`` can report ``dim`` WITHOUT forcing a
 # reload of an idle-unloaded model — otherwise every liveness probe would
 # immediately re-materialise the 7.25 GB weights and the model would never stay
-# unloaded. Survives unload (``_st_model = None`` does not clear this).
+# unloaded. Survives unload (``_st_model = None`` does not clear this). It is an
+# ``int`` — it does NOT reference the model object, so it never pins the weights.
 _st_model_dim: int | None = None
+# v0.2.102: single-flight guard for ``_load_gpu_model``. A plain ``threading``
+# lock (NOT the asyncio ``_inference_lock``) because the load runs synchronously
+# on an executor thread; it serialises the actual construction so concurrent
+# callers produce ONE load and the waiters reuse its result.
+_load_lock = threading.Lock()
+# v0.2.102 r2: monotonic deadline set when a load EXHAUSTS its CUDA-OOM budget.
+# While it is in the future, loaders fail fast with the same
+# ``_ModelLoadUnavailable`` (→ 503 + Retry-After) — queued waiters SHARE the
+# failed attempt's outcome instead of each re-running a full multi-minute budget
+# serially. Cleared by the next successful load; its length is the Retry-After
+# the 503 carries, so a client that obeys the header arrives exactly when a
+# fresh attempt becomes possible.
+_load_unavailable_until: float = 0.0
+# v0.2.102 observability, reported on ``/health``:
+_last_unload_freed_mb: float | None = None  # MB freed by the most recent idle-unload
+_last_load_error: str | None = None         # last model-load failure (None when healthy)
 
 
-def _load_gpu_model():
-    global _st_model
-    if _st_model is not None:
-        return _st_model
+class _ModelLoadUnavailable(RuntimeError):
+    """Raised when the GPU model could not be loaded within the bounded
+    CUDA-OOM retry budget. The endpoints translate it into a 503 + Retry-After
+    rather than letting it surface as a 500 with a traceback."""
 
-    from sentence_transformers import SentenceTransformer
+    def __init__(self, message: str, retry_after: int | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
+
+def _is_cuda_oom(exc: BaseException | None) -> bool:
+    """True when ``exc`` is a CUDA out-of-memory error. Matched by class name
+    (``torch.OutOfMemoryError``) and message substring so it works with the real
+    torch AND with test fakes that carry no ``torch`` dependency. Never raises."""
+    if exc is None:
+        return False
+    if "outofmemory" in type(exc).__name__.lower():
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def _retry_after_secs() -> int:
+    """Retry-After hint (seconds) for a 503 when the model could not load. Tied
+    to the OOM backoff so a client retries on the same cadence the service uses
+    internally."""
+    return max(1, int(LOAD_OOM_BACKOFF_SECS))
+
+
+def _resolve_device() -> str:
+    """Resolve ``DEVICE`` (``auto`` probes CUDA → Apple Metal (MPS) → CPU)."""
     device = DEVICE
     if device == "auto":
         import torch
@@ -298,37 +484,141 @@ def _load_gpu_model():
             device = "mps"
         else:
             device = "cpu"
+    return device
 
+
+def _resolve_dtype() -> str:
+    """Resolve ``DTYPE`` to a sentence-transformers ``torch_dtype`` string."""
     dtype_map = {
         "float32": "float32",
         "bfloat16": "bfloat16",
         "float16": "float16",
     }
-    torch_dtype = dtype_map.get(DTYPE, "bfloat16")
+    return dtype_map.get(DTYPE, "bfloat16")
 
-    logger.info("Loading model '%s' on device='%s' dtype='%s'...", MODEL_NAME, device, torch_dtype)
-    t0 = time.time()
 
+def _load_gpu_model():
+    """Return the loaded SentenceTransformer, loading it on first use.
+
+    SINGLE-FLIGHT (v0.2.102): guarded by a dedicated ``_load_lock`` with a
+    double-check, so concurrent callers — the request path (serialised under
+    ``_inference_lock``), plus ``startup`` and ``/health`` — produce exactly ONE
+    load and the waiters reuse its result. This is the fix for the "three
+    Loading-model attempts in 16 s" defect: previously each request whose load
+    OOMed left ``_st_model`` None, so the next request retried a full load and
+    allocated a SECOND copy on top of the un-freed first one. The construction
+    and the bounded OOM retry budget live in ``_load_gpu_model_locked``.
+    """
+    global _st_model
+    if _st_model is not None:
+        return _st_model
+    with _load_lock:
+        # Double-check under the lock: a concurrent loader may have finished
+        # while we waited, in which case we reuse its result (never a 2nd load).
+        if _st_model is not None:
+            return _st_model
+        # v0.2.102 r2: share a RECENTLY-FAILED outcome too. Without this, every
+        # waiter that acquires the lock after a failed budget re-runs its own
+        # full ~6-minute budget serially (N waiters × budget) — the cooldown
+        # makes them fail fast with the same 503 + Retry-After instead.
+        cooldown = _load_unavailable_until - time.monotonic()
+        if cooldown > 0:
+            raise _ModelLoadUnavailable(
+                "GPU model unavailable: the previous load exhausted its CUDA-OOM "
+                f"budget and VRAM has not freed ({cooldown:.0f}s left in the "
+                f"fail-fast cooldown). Last error: {_last_load_error}",
+                retry_after=int(cooldown) + 1,
+            )
+        return _load_gpu_model_locked()
+
+
+def _load_gpu_model_locked():
+    """Construct the model. Runs UNDER ``_load_lock`` (single-flight).
+
+    On CUDA OOM: ``gc.collect()`` + ``empty_cache()`` (reclaim anything this
+    process can) then a bounded backoff retry — VRAM held by ANOTHER process
+    (e.g. Ollama before its keep-alive expires) can be released during the wait,
+    so a retry that seemed hopeless can succeed. Only after the budget
+    (``LOAD_OOM_RETRIES`` × ``LOAD_OOM_BACKOFF_SECS``) is exhausted does it raise
+    ``_ModelLoadUnavailable``, which the endpoints map to a 503 + Retry-After —
+    never a 500 with a traceback. A NON-OOM error (a config/import fault) is not
+    retried; it propagates immediately and is recorded on ``_last_load_error``.
+    """
+    global _st_model, _st_model_dim, _last_load_error, _load_unavailable_until
+
+    from sentence_transformers import SentenceTransformer
+
+    device = _resolve_device()
+    torch_dtype = _resolve_dtype()
     kwargs = {
         "trust_remote_code": TRUST_REMOTE,
         "device": device,
         "model_kwargs": {"torch_dtype": torch_dtype},
     }
-    # W11 (2026-09-05, verified against sentence-transformers 5.5.0's
-    # signature): CODE_EMBED_MAX_SEQ_LEN used to be plumbed into
-    # ``model_kwargs``, which SentenceTransformer forwards to
-    # ``AutoModel.from_pretrained`` — the TRANSFORMER's kwargs. The window
-    # that governs truncation is the ``max_seq_length`` ATTRIBUTE (not an
-    # init parameter at all), so the documented knob could not change it.
-    # Set the attribute directly after load instead.
-    _st_model = SentenceTransformer(MODEL_NAME, **kwargs)
-    if MAX_SEQ_LEN:
-        _st_model.max_seq_length = int(MAX_SEQ_LEN)
-    dim = _st_model.get_sentence_embedding_dimension()
-    global _st_model_dim
-    _st_model_dim = dim  # cache for /health so idle-unload survives liveness probes
-    logger.info("Model loaded in %.1fs — dim=%d, device=%s", time.time() - t0, dim, device)
-    return _st_model
+    attempts = LOAD_OOM_RETRIES + 1
+    last_exc: BaseException | None = None
+    for attempt in range(attempts):
+        try:
+            logger.info(
+                "Loading model '%s' on device='%s' dtype='%s' (attempt %d/%d)...",
+                MODEL_NAME, device, torch_dtype, attempt + 1, attempts,
+            )
+            t0 = time.time()
+            # W11 (2026-09-05, verified against sentence-transformers 5.5.0's
+            # signature): CODE_EMBED_MAX_SEQ_LEN used to be plumbed into
+            # ``model_kwargs``, which SentenceTransformer forwards to
+            # ``AutoModel.from_pretrained`` — the TRANSFORMER's kwargs. The window
+            # that governs truncation is the ``max_seq_length`` ATTRIBUTE (not an
+            # init parameter at all), so the documented knob could not change it.
+            # Set the attribute directly after load instead.
+            model = SentenceTransformer(MODEL_NAME, **kwargs)
+            if MAX_SEQ_LEN:
+                model.max_seq_length = int(MAX_SEQ_LEN)
+            dim = model.get_sentence_embedding_dimension()
+            # Publish atomically: the handle last, so a concurrent double-check
+            # under ``_load_lock`` never sees a half-initialised model.
+            _st_model_dim = dim  # cache for /health so idle-unload survives probes
+            _st_model = model
+            _last_load_error = None
+            _load_unavailable_until = 0.0  # a success ends any cooldown
+            logger.info(
+                "Model loaded in %.1fs — dim=%d, device=%s",
+                time.time() - t0, dim, device,
+            )
+            return model
+        except Exception as exc:  # noqa: BLE001 — classify, then retry or propagate
+            if not _is_cuda_oom(exc):
+                _last_load_error = f"{type(exc).__name__}: {exc}"
+                raise
+            last_exc = exc
+            # Reclaim anything this process can before waiting on an external
+            # holder (Ollama keep-alive) to release its VRAM.
+            gc.collect()
+            _empty_cuda_cache()
+            if attempt + 1 < attempts:
+                logger.warning(
+                    "CUDA OOM loading model (attempt %d/%d) — freed local caches, "
+                    "retrying in %.1fs: %s",
+                    attempt + 1, attempts, LOAD_OOM_BACKOFF_SECS, exc,
+                )
+                if LOAD_OOM_BACKOFF_SECS > 0:
+                    time.sleep(LOAD_OOM_BACKOFF_SECS)
+    _last_load_error = (
+        f"CUDA out of memory persisted through {attempts} load attempt(s) "
+        f"(~{LOAD_OOM_RETRIES * LOAD_OOM_BACKOFF_SECS:.0f}s budget): {last_exc}"
+    )
+    # v0.2.102 r2: start the fail-fast cooldown — queued waiters share THIS
+    # failed outcome (503 + Retry-After) instead of each re-running the budget.
+    # The cooldown lasts exactly as long as the Retry-After we send, so an
+    # obeying client arrives when a fresh attempt is possible.
+    _load_unavailable_until = time.monotonic() + _retry_after_secs()
+    logger.error(
+        "Model load FAILED — CUDA OOM through %d attempt(s); the GPU is occupied "
+        "by another process. Serving 503 + Retry-After (%ds fail-fast cooldown) "
+        "until VRAM frees and a lazy reload succeeds: %s",
+        attempts, _retry_after_secs(), last_exc,
+    )
+    raise _ModelLoadUnavailable(_last_load_error, retry_after=_retry_after_secs())
 
 
 def _gpu_token_count(model, text: str) -> int:
@@ -404,7 +694,14 @@ def _embed_gpu(
 
 def _dim_gpu() -> int:
     model = _load_gpu_model()
-    return model.get_sentence_embedding_dimension()
+    dim = model.get_sentence_embedding_dimension()
+    # sentence-transformers types this Optional; a LOADED model always knows its
+    # dimension, so None means a broken model — loud-fail, never guess.
+    if dim is None:
+        raise RuntimeError(
+            f"loaded model {MODEL_NAME!r} reports no embedding dimension"
+        )
+    return int(dim)
 
 
 # ---------------------------------------------------------------------------
@@ -420,20 +717,19 @@ def _embed_ollama(
     for text in texts:
         if is_query and instruction:
             text = instruction + text
-        # v0.2.92 R40: num_ctx was UNSET, so this leg inherited Ollama's 2048
-        # default regardless of the model's real window. Resolved from the one
-        # home (chunking.MODEL_TOKEN_LIMITS) so the window we REQUEST and the
-        # chunk sizes we PRODUCE cannot drift apart — when they do, Ollama
-        # truncates the tail and still answers 200.
-        from vco_lib.embedding_providers.ollama import _num_ctx_for_model
+        # v0.2.102 W4-E: the body comes from the ONE shared builder
+        # (vco_lib.embedding_providers.ollama.embed_request_body — the same
+        # home the canonical adapter uses), so this Ollama tier sends the
+        # IDENTICAL load options per model as every other VCO caller and
+        # Ollama never loads a second runner of the same model. The builder
+        # also carries keep_alive (v0.2.77 task 6, default 10m since W4-E)
+        # and resolve num_ctx from the one table (chunking.MODEL_TOKEN_LIMITS
+        # — v0.2.92 R40: unset meant Ollama's 2048 default and silent tail
+        # truncation with a 200 response).
+        from vco_lib.embedding_providers.ollama import embed_request_body
         resp = requests.post(
             f"{OLLAMA_URL}/api/embeddings",
-            json={
-                "model": MODEL_NAME,
-                "prompt": text,
-                "options": {"num_ctx": _num_ctx_for_model(MODEL_NAME)},
-                "truncate": False,  # v0.2.92: refuse, never silently drop the tail
-            },
+            json=embed_request_body(MODEL_NAME, prompt=text),
             timeout=30,
         )
         if resp.status_code != 200:
@@ -482,10 +778,13 @@ _request_semaphore: asyncio.Semaphore | None = None
 # C-9 (v0.2.75 P3b): explicit in-flight counter. Previously the code read the
 # semaphore's PRIVATE ``._value`` (CPython-internal, no stability guarantee) to
 # derive "how many are running". An explicit counter incremented/decremented in
-# a try/finally around the semaphore hold is honest, public, and identical
-# across both endpoints — so ``/embed`` and ``/api/embeddings`` shed on the SAME
-# condition (pre-fix ``/api/embeddings`` never shed, so one burst diverged the
-# two endpoints' behaviour) and ``/health`` reports the real number.
+# a try/finally around the whole endpoint body is honest, public, and identical
+# across both endpoints. v0.2.102 r2 semantics: it counts requests INSIDE the
+# endpoint — queued-waiting-for-a-slot as well as executing — so ``/health``
+# reports the real number and the idle-unload timer never unloads while any
+# request is pending. (Its former consumer, the C-9 ``_should_shed`` immediate
+# 503, was replaced by the bounded FIFO queue — the owner rule is that
+# concurrent requests QUEUE and none are dropped.)
 _in_flight: int = 0
 
 
@@ -503,21 +802,30 @@ def _get_semaphore() -> asyncio.Semaphore:
     return _request_semaphore
 
 
-def _should_shed() -> bool:
-    """True when the service is already at capacity (``MAX_CONCURRENT`` requests
-    in flight) — a new request would only queue, so shed it with a 503. ONE home
-    for the load-shed decision, shared by BOTH embed endpoints so they behave
-    identically under burst."""
-    return _in_flight >= MAX_CONCURRENT
+def _queue_retry_after_secs() -> int:
+    """Retry-After hint (seconds) for the queue-bound 503. Capped at 30 s: the
+    queue drains at request cadence (unlike a GPU recovery), so clients should
+    re-probe soon even when ``QUEUE_WAIT_SECS`` itself is huge. Floored at 5 s
+    (v0.2.102 r3, review nit): a 1 s hint — which ``QUEUE_WAIT_SECS=0`` (the
+    no-queue mode) used to yield — makes an honouring client re-probe at ~1 Hz
+    for up to its whole 503 tolerance, tighter than the cap intends; one
+    inference takes seconds, so re-probing faster than 5 s only burns slots."""
+    return max(5, min(30, int(QUEUE_WAIT_SECS)))
 
 
 # ---------------------------------------------------------------------------
-# Idle model unload (v0.2.79 §C) — release the ~7.25 GB CodeSage VRAM when idle
+# Idle model unload (v0.2.79 §C; v0.2.102 root-cause fix) — release the
+# ~7.25 GB CodeSage VRAM when idle, and PROVE it was released
 # ---------------------------------------------------------------------------
-# ``_st_model`` holds the CodeSage-Large-v2 weights (~7.25 GB VRAM) for the
-# process lifetime. On a workstation the user shares the GPU with other tools,
-# so we unload the weights after ``IDLE_UNLOAD_SECS`` of no ``/embed`` traffic
-# and lazy-reload them on the next request (``_load_gpu_model`` is already lazy).
+# ``_st_model`` holds the CodeSage-Large-v2 weights (~7.25 GB VRAM). On a
+# workstation the user shares the GPU with other tools, so we unload the weights
+# after ``IDLE_UNLOAD_SECS`` of no ``/embed`` traffic and lazy-reload them on the
+# next request (``_load_gpu_model`` is lazy, single-flighted, and OOM-bounded).
+# v0.2.102: the unload drops the reference, ``gc.collect()``s to break the
+# model's reference cycles, ``empty_cache()``s, and MEASURES the freed bytes. If
+# the free did not actually happen (a live reference still pins the weights) it
+# KEEPS the model loaded and logs a WARNING — never discarding the handle into an
+# un-freed copy that the next request would double-allocate and OOM on.
 #
 # ``_last_used`` is a MONOTONIC timestamp (``time.monotonic``, not wall clock —
 # immune to NTP steps) stamped by both endpoints on every request. It seeds to
@@ -538,7 +846,11 @@ def _stamp_used() -> None:
 async def _maybe_unload_idle_model(now: float | None = None) -> bool:
     """Unload the GPU model if it has been idle past ``IDLE_UNLOAD_SECS``.
 
-    Returns True iff a model was actually unloaded. Safe to call with any
+    Returns True iff the model was actually unloaded (its VRAM freed, or there
+    was nothing substantial to free). Returns False — and KEEPS the model loaded
+    — when a live reference still pins the weights after ``gc.collect()`` +
+    ``empty_cache()``, so the next request reuses the resident copy instead of
+    allocating a second one that OOMs the GPU (v0.2.102). Safe to call with any
     backend and whether or not a model is loaded — a no-op in every case where
     the condition isn't met.
 
@@ -551,7 +863,7 @@ async def _maybe_unload_idle_model(now: float | None = None) -> bool:
     a concurrent executor-thread ``encode`` still references → CUDA fault /
     corrupt embeddings.
     """
-    global _st_model
+    global _st_model, _last_unload_freed_mb
     if BACKEND != "gpu" or IDLE_UNLOAD_SECS <= 0:
         return False
     if _st_model is None:
@@ -586,27 +898,87 @@ async def _maybe_unload_idle_model(now: float | None = None) -> bool:
         if _st_model is None or _in_flight != 0 or (now - _last_used) <= IDLE_UNLOAD_SECS:
             return False
 
-        # C.2: log before/after allocated VRAM for observability. This frees the
-        # WEIGHTS (~7.25 GB), not the CUDA context (a few hundred MB persists
-        # per-process until exit) — an expected, documented residual.
+        # v0.2.102 root-cause fix. The old code did ``_st_model = None`` then
+        # ``empty_cache()`` and logged "freed 0 MB": the SentenceTransformer /
+        # nn.Module object graph is CYCLIC, so dropping the one global left the
+        # refcount above zero and the ~7.25 GB of tensors still allocated when
+        # empty_cache ran. The fix is the ``gc.collect()`` BETWEEN the drop and
+        # the measure — plus a weakref so we can recover the handle if the free
+        # STILL does not happen (a live reference we did not find pins it).
         before = _cuda_memory_allocated()
-        _st_model = None
-        _empty_cuda_cache()
+        model_ref = weakref.ref(_st_model)
+        _st_model = None       # drop the ONLY persistent strong reference
+        gc.collect()           # break the reference cycles pinning the weights
+        _empty_cuda_cache()    # return the freed blocks to the driver
         after = _cuda_memory_allocated()
-        if before is not None and after is not None:
+
+        # None-check FIRST so every later operand is a narrowed float (this
+        # restructure is also the pyright reportOptionalOperand fix — the old
+        # tuple-conditional left ``before``/``after`` Optional at every use).
+        if before is None or after is None:
+            # cpu/mps or no CUDA stats — no VRAM to OOM on reload; gc.collect()
+            # released what it could. Treat as unloaded. (C.2 observability.)
+            _warn_if_model_object_survived(model_ref)
             logger.info(
-                "Idle-unloaded GPU model after %.0fs idle — VRAM allocated "
-                "%.0f MB → %.0f MB (freed %.0f MB; CUDA context residual "
-                "persists until process exit)",
-                now - _last_used, before / 1e6, after / 1e6,
-                max(0.0, (before - after)) / 1e6,
-            )
-        else:
-            logger.info(
-                "Idle-unloaded GPU model after %.0fs idle (torch.cuda "
-                "memory stats unavailable — cpu/mps backend or no CUDA)",
+                "Idle-unloaded GPU model after %.0fs idle (torch.cuda memory "
+                "stats unavailable — cpu/mps backend or no CUDA)",
                 now - _last_used,
             )
+            return True
+
+        freed = before - after
+        _last_unload_freed_mb = max(0.0, freed) / 1e6
+        floor_bytes = UNLOAD_FREED_MIN_MB * 1e6
+
+        if before < floor_bytes:
+            # Nothing substantial was allocated (a cpu model, or a test mock that
+            # holds no real VRAM). gc.collect() dropped the object and there is
+            # no second-copy OOM risk, so treat as unloaded without the freed
+            # ratio check.
+            _warn_if_model_object_survived(model_ref)
+            logger.info(
+                "Idle-unloaded GPU model after %.0fs idle — no substantial VRAM "
+                "was held (%.0f MB allocated)",
+                now - _last_used, before / 1e6,
+            )
+            return True
+
+        if freed < before * _UNLOAD_FREED_RATIO:
+            # Substantial VRAM was held but NOT freed — a live reference still
+            # pins the weights. Recover the handle and STAY LOADED so the next
+            # request reuses this copy instead of allocating a second one that
+            # OOMs the GPU (the exact "freed 0 MB → reload → OutOfMemoryError"
+            # defect). Name the situation loudly so the leak can be found.
+            recovered = model_ref()
+            if recovered is not None:
+                _st_model = recovered
+                logger.warning(
+                    "Idle-unload freed only %.0f MB of %.0f MB allocated after "
+                    "gc.collect() + empty_cache() — a live reference still holds "
+                    "the model weights. KEEPING the model loaded (no second copy "
+                    "will be allocated). Investigate what retains the "
+                    "SentenceTransformer object.",
+                    max(0.0, freed) / 1e6, before / 1e6,
+                )
+                return False
+            # weakref died yet nothing was freed — unexpected (the object is gone
+            # but the allocator still counts the bytes, e.g. it lags). We cannot
+            # recover a handle and the memory is on its way out; treat as
+            # unloaded but leave a WARNING so it is visible.
+            logger.warning(
+                "Idle-unload freed only %.0f MB of %.0f MB and the model object "
+                "is already gone — the CUDA allocator may lag; treating as "
+                "unloaded.",
+                max(0.0, freed) / 1e6, before / 1e6,
+            )
+            return True
+
+        logger.info(
+            "Idle-unloaded GPU model after %.0fs idle — VRAM allocated %.0f MB → "
+            "%.0f MB (freed %.0f MB; CUDA context residual persists until process "
+            "exit)",
+            now - _last_used, before / 1e6, after / 1e6, max(0.0, freed) / 1e6,
+        )
         return True
 
 
@@ -632,6 +1004,28 @@ def _empty_cuda_cache() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001 — cuda-only op; cpu/mps → harmless no-op
+        pass
+
+
+def _warn_if_model_object_survived(model_ref) -> None:
+    """Observability for the unload arms whose free is UNMEASURABLE (no CUDA
+    stats) or below the ``UNLOAD_FREED_MIN_MB`` floor (v0.2.102 r2, review nit):
+    if the model OBJECT survived ``gc.collect()`` there, a live reference pins
+    it. Those arms still drop the handle — they carry no VRAM-OOM risk (cpu/mps:
+    host RAM; below-floor: < the floor by definition) and the unload contract
+    pinned by the lifecycle tests is to drop it — but the WARNING is the honest
+    signal that a reload would construct a second copy while the first lingers.
+    Never raises (observability must not crash the idle timer)."""
+    try:
+        if model_ref() is not None:
+            logger.warning(
+                "Idle-unload: the model object SURVIVED gc.collect() — a live "
+                "reference still holds it. Memory on this path is unmeasurable "
+                "or below the %.0f MB floor, so the handle was dropped anyway; "
+                "a reload constructs a second copy while this one lingers.",
+                UNLOAD_FREED_MIN_MB,
+            )
+    except Exception:  # noqa: BLE001 — observability must never crash the timer
         pass
 
 
@@ -675,6 +1069,129 @@ class EmbedResponse(BaseModel):
     model: str
 
 
+async def _run_embed_guarded(
+    texts: list[str], is_query: bool, task: str | None
+) -> list[list[float]]:
+    """Shared concurrency + error-mapping wrapper for BOTH embed endpoints (one
+    concern, one home — the two endpoints differ only in response shape).
+
+    B1 (v0.2.102 r2 — owner rule: concurrent requests QUEUE, none dropped):
+    a request beyond the ``MAX_CONCURRENT`` execution slots WAITS for a slot,
+    FIFO-fair (``asyncio.Semaphore`` wakes waiters in arrival order). The
+    pre-v0.2.102 C-9 immediate 503 shed dropped request N+1 on arrival; waiting
+    replaced rejecting. The wait is bounded ONLY by ``QUEUE_WAIT_SECS``
+    (generous default, env-tunable); past that bound — and only past it — the
+    request gets a 503 + ``Retry-After``. The C-9 intent stands: concurrency
+    stays capped at ``MAX_CONCURRENT`` (the GPU is protected from unbounded
+    parallel encodes).
+
+    Admitted requests then serialise under ``_inference_lock``: a request that
+    arrives while another is loading the model WAITS and reuses that single
+    load (``_load_gpu_model`` is single-flighted, with a fail-fast cooldown
+    after a failed budget so waiters share the outcome instead of each
+    re-running minutes of retries) — never dropped, never a second load.
+
+    A model load that exhausts its bounded CUDA-OOM budget raises
+    ``_ModelLoadUnavailable``; an inference that OOMs raises torch's
+    ``OutOfMemoryError``. BOTH are mapped to a clean 503 + ``Retry-After`` here —
+    never a 500 with a traceback (v0.2.102). An ``HTTPException`` (e.g. the
+    over-window 400 from ``_refuse_over_window``) propagates untouched.
+    """
+    global _in_flight
+    sem = _get_semaphore()
+    _in_flight += 1  # counts queued AND executing; /health reports it
+    _stamp_used()  # v0.2.79 §C: mark activity so the idle-unload timer resets
+    try:
+        # Bounded FIFO queue wait for one of the MAX_CONCURRENT slots.
+        #
+        # The acquire runs in its own TASK, not as a bare coroutine handed to
+        # wait_for (v0.2.102 r3, re-review SHOULD-FIX): on Python 3.11 (the
+        # container base image) wait_for can raise TimeoutError for a future
+        # that ALREADY consumed a permit in the same event-loop step — the
+        # permit would be permanently leaked and effective capacity would
+        # decay (4 → 3 → …) under exactly the sustained saturation this queue
+        # exists for, with recovery only via restart. The ``acquired`` flag
+        # lets the timeout path give a raced permit BACK; the same shape also
+        # covers client-disconnect cancellation mid-acquire. (Python 3.12
+        # reimplemented wait_for over asyncio.timeout and is race-free, but
+        # ``requires-python = ">=3.11"`` means the guard must hold on both.)
+        acquired = False
+
+        async def _acquire_slot() -> None:
+            nonlocal acquired
+            await sem.acquire()
+            acquired = True
+
+        try:
+            await asyncio.wait_for(
+                asyncio.ensure_future(_acquire_slot()),
+                timeout=(
+                    QUEUE_WAIT_SECS
+                    if QUEUE_WAIT_SECS > 0
+                    else _QUEUE_ZERO_GRACE_SECS
+                ),
+            )
+        except asyncio.CancelledError:
+            if acquired:
+                # The race: a permit was consumed despite the cancellation.
+                sem.release()
+            raise
+        except asyncio.TimeoutError:
+            if acquired:
+                # The race: a permit was consumed despite the timeout — give
+                # it back so capacity does not decay.
+                sem.release()
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Service at capacity ({MAX_CONCURRENT} concurrent "
+                    f"request(s)) and the queue wait of {QUEUE_WAIT_SECS:.0f}s "
+                    "was exceeded. Retry later."
+                ),
+                headers={"Retry-After": str(_queue_retry_after_secs())},
+            )
+        try:
+            async with _get_lock():
+                # Run sync inference in a thread pool to avoid blocking the event
+                # loop; the lock ensures only one inference (and one model load)
+                # runs at a time.
+                loop = asyncio.get_event_loop()
+                try:
+                    return await loop.run_in_executor(
+                        None, embed, texts, is_query, task
+                    )
+                except HTTPException:
+                    raise  # e.g. the over-window 400 — propagate as-is
+                except _ModelLoadUnavailable as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=str(exc),
+                        headers={
+                            "Retry-After": str(exc.retry_after or _retry_after_secs())
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 — map OOM, re-raise the rest
+                    if _is_cuda_oom(exc):
+                        # Wording kept backend-honest: ``_is_cuda_oom`` also
+                        # matches a host-RAM "out of memory", so the detail
+                        # must not claim CUDA specifically (review nit).
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                "Out of memory during embedding — GPU VRAM or "
+                                "host memory is occupied (e.g. by another "
+                                "process). Retry later."
+                            ),
+                            headers={"Retry-After": str(_retry_after_secs())},
+                        )
+                    raise
+        finally:
+            sem.release()
+    finally:
+        _in_flight -= 1
+        _stamp_used()  # re-stamp on completion — idle measured from last activity
+
+
 @app.post("/embed", response_model=EmbedResponse)
 async def embed_endpoint(req: EmbedRequest):
     if not req.texts:
@@ -682,37 +1199,9 @@ async def embed_endpoint(req: EmbedRequest):
     if len(req.texts) > 256:
         raise HTTPException(status_code=400, detail="max 256 texts per request")
 
-    global _in_flight
-    # C-9: shed at capacity (in-flight == MAX) with an HONEST message — the
-    # service runs inference under a single lock, so an over-cap request would
-    # BLOCK, not queue. Same condition on both endpoints (_should_shed).
-    if _should_shed():
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Service at capacity ({MAX_CONCURRENT} request(s) in flight). "
-                "Retry later."
-            ),
-        )
-
-    sem = _get_semaphore()
-    _in_flight += 1
-    _stamp_used()  # v0.2.79 §C: mark activity so the idle-unload timer resets
-    try:
-        async with sem:
-            t0 = time.time()
-            lock = _get_lock()
-            async with lock:
-                # Run sync inference in thread pool to avoid blocking the event
-                # loop, but the lock ensures only one inference runs at a time.
-                loop = asyncio.get_event_loop()
-                vecs = await loop.run_in_executor(
-                    None, embed, req.texts, req.is_query, req.task
-                )
-            elapsed = time.time() - t0
-    finally:
-        _in_flight -= 1
-        _stamp_used()  # re-stamp on completion — idle measured from last activity
+    t0 = time.time()
+    vecs = await _run_embed_guarded(req.texts, req.is_query, req.task)
+    elapsed = time.time() - t0
 
     dim = len(vecs[0]) if vecs else 0
     logger.info(
@@ -740,50 +1229,32 @@ async def ollama_compat_endpoint(req: OllamaEmbedRequest):
     """Ollama-compatible /api/embeddings endpoint for drop-in replacement.
 
     C-9 (v0.2.75 P3b): this is the endpoint the MCP inline fallback + the CLI
-    raw fallback hit, so it MUST shed under burst identically to ``/embed`` —
-    pre-fix it had no shed at all, so one burst made the two endpoints diverge
-    (``/embed`` 503'd while this one blocked). Shares ``_should_shed`` +
-    ``_in_flight``.
+    raw fallback hit, so it MUST behave identically under burst to ``/embed`` —
+    pre-fix it had no capacity guard at all, so one burst made the two
+    endpoints diverge (``/embed`` 503'd while this one blocked). Shares
+    ``_run_embed_guarded`` (and therefore the bounded FIFO queue + the OOM→503
+    mapping + the ``_in_flight`` counter).
     """
     if not req.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
-
-    global _in_flight
-    if _should_shed():
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Service at capacity ({MAX_CONCURRENT} request(s) in flight). "
-                "Retry later."
-            ),
-        )
-
-    _in_flight += 1
-    _stamp_used()  # v0.2.79 §C: mark activity so the idle-unload timer resets
-    try:
-        async with _get_semaphore():
-            async with _get_lock():
-                loop = asyncio.get_event_loop()
-                vecs = await loop.run_in_executor(None, embed, [req.prompt], False)
-    finally:
-        _in_flight -= 1
-        _stamp_used()  # re-stamp on completion — idle measured from last activity
+    vecs = await _run_embed_guarded([req.prompt], False, None)
     return {"embedding": vecs[0]}
 
 
 @app.get("/health")
 async def health():
     try:
-        # v0.2.79 §C: for the gpu backend, do NOT force a model reload just to
-        # report ``dim`` — a liveness probe hitting /health must not undo an
-        # idle-unload. Use the dim cached at first load; only fall through to
-        # ``get_dim()`` (which may load) when the model has never loaded yet.
+        # v0.2.79 §C / v0.2.102: for the gpu backend, do NOT force a model load
+        # just to report ``dim`` — a liveness probe must not undo an idle-unload
+        # NOR block the event loop on the single-flighted (possibly OOM-retrying)
+        # load lock. Report the dim cached at first load; it is None until the
+        # model has loaded, which is the honest answer for a probe.
         if BACKEND == "gpu":
-            dim = _st_model_dim if _st_model_dim is not None else get_dim()
+            dim = _st_model_dim
             model_loaded = _st_model is not None
         else:
-            dim = get_dim()
-            model_loaded = True  # ollama backend holds no in-process weights
+            dim = get_dim()  # ollama: cheap probe, holds no in-process weights
+            model_loaded = True
         return {
             "status": "ok",
             "backend": BACKEND,
@@ -791,14 +1262,23 @@ async def health():
             "dim": dim,
             "device": DEVICE,
             "max_concurrent": MAX_CONCURRENT,
-            # C-9: report the REAL in-flight count from the explicit counter
-            # (was ``MAX_CONCURRENT - sem._value`` — a private-API read that
-            # actually meant "in flight", not "queued"; the key was mis-named).
+            # C-9: report the REAL in-flight count from the explicit counter.
+            # v0.2.102 r2 semantics: requests INSIDE the endpoint — queued
+            # waiting for a slot as well as executing.
             "in_flight": _in_flight,
             "inference_busy": _get_lock().locked(),
             # v0.2.79 §C: idle-unload observability.
             "model_loaded": model_loaded,
             "idle_unload_secs": IDLE_UNLOAD_SECS,
+            # v0.2.102 r2: the bounded-queue bound (B1) — a client can compare
+            # its own request timeout against it (it MUST exceed this).
+            "queue_wait_secs": QUEUE_WAIT_SECS,
+            # v0.2.102: did the last unload ACTUALLY free VRAM, and did the last
+            # load fail? Cheap truthfulness for the "freed 0 MB" + OOM defects —
+            # ``last_unload_freed_mb`` near 0 with ``model_loaded`` False was the
+            # old broken shape; a non-null ``last_load_error`` names a live OOM.
+            "last_unload_freed_mb": _last_unload_freed_mb,
+            "last_load_error": _last_load_error,
             # v0.2.92 BLOCKER-1: image-vs-source staleness, made CHECKABLE.
             # This service ships as an image BUILT from the checkout, and
             # `compose up` builds only when the image is MISSING — so a
@@ -824,8 +1304,18 @@ async def startup():
     global _idle_task
     logger.info("Starting code embedding service: backend=%s model=%s port=%d", BACKEND, MODEL_NAME, PORT)
     if BACKEND == "gpu":
-        # Pre-load model on startup
-        _load_gpu_model()
+        # Pre-load model on startup. If the bounded CUDA-OOM budget is exhausted
+        # (another process holds the GPU), stay up and serve 503 + Retry-After on
+        # /embed until VRAM frees and a request's lazy reload succeeds — never
+        # crash-loop under ``restart: unless-stopped`` (v0.2.102). A NON-OOM load
+        # fault still propagates (loud-fail on a genuinely broken config).
+        try:
+            _load_gpu_model()
+        except _ModelLoadUnavailable as exc:
+            logger.warning(
+                "GPU model not loaded at startup: %s — serving 503 + Retry-After "
+                "until a lazy reload succeeds.", exc,
+            )
         # Fresh activity stamp so the idle window starts from a loaded model,
         # not from import time (which may predate the pre-load by seconds).
         _stamp_used()
@@ -905,7 +1395,7 @@ if __name__ == "__main__":
 
     # Detect import path: standalone (container) vs package (python -m ...)
     try:
-        import claude_mcp_servers.code_embedding_service.server  # noqa: F401
+        import claude_mcp_servers.code_embedding_service.server  # noqa: F401  # pyright: ignore[reportUnusedImport] — the import IS the probe
         app_path = "claude_mcp_servers.code_embedding_service.server:app"
     except ImportError:
         app_path = "server:app"

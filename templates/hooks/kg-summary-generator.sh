@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Parity: kept in step with kg-summary-generator.ps1 (its UTF-8 BOM serves Windows
+# PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # kg-summary-generator.sh — PostToolUse hook
 # Spawns a background Haiku agent to generate/update summaries for KG nodes.
 # Fires on: Edit(knowledge/**/*.md), Write(knowledge/**/*.md), mcp__weaviate-kg__store_knowledge_node

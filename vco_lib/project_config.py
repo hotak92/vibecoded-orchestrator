@@ -84,6 +84,7 @@ Caching
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import threading
@@ -134,6 +135,22 @@ HUB_DISCOVERY_TTL_SECONDS: float = 5.0
 _CONNECT_TIMEOUT_SECONDS: float = 2.0
 _READ_TIMEOUT_SECONDS: float = 5.0
 
+#: v0.2.102 (W6-AB): READ timeout for a SECRET read (``/env`` and the
+#: ``by-path`` lookup that precedes it). The hub answers a secret read from
+#: the OS keychain through its keychain worker, whose own per-operation wait
+#: is ``KEYCHAIN_OP_TIMEOUT`` = 10 s (``vct-launcher-core/src/secrets_worker.rs``)
+#: and which runs the request's lock probe plus one read per bucket that
+#: declares the key — so a hub that is slow but WORKING can legitimately take
+#: well over 10 s. The old 5 s cut such a hub off mid-answer and the miss
+#: was then reported as "no key found" (2026-10-13 incident). 30 s covers the
+#: probe + two worst-case 10 s keychain waits with margin; a refused
+#: connection (no hub running) still fails in milliseconds, because the
+#: CONNECT timeout is unchanged. Config reads keep :data:`_READ_TIMEOUT_SECONDS`.
+#: One home for this value in Python; the shell (``vct_secrets_resolve.sh``)
+#: and PowerShell (``vct_secrets_resolve.ps1``) resolvers hold the same
+#: number — MUST MATCH ``VCT_SECRET_READ_TIMEOUT_S`` / ``$SecretReadTimeoutSec``.
+SECRET_READ_TIMEOUT_SECONDS: float = 30.0
+
 
 # ─── Exception hierarchy ────────────────────────────────────────────────
 
@@ -162,6 +179,89 @@ class HubUnreachable(ResolverError):
     launcher restart), and unexpected non-2xx/4xx/5xx statuses.
     Callers typically degrade to env-var fallback on this exception.
     """
+
+
+class HubNotResponding(HubUnreachable):
+    """The hub was reached but did not answer in time (v0.2.102, W6-AB).
+
+    A read timeout, a connect timeout (the listener is there but not
+    accepting) or a connection dropped after it was established — the hub
+    process exists and is busy, typically waiting on a slow OS keychain.
+    Distinct from a REFUSED connection (no hub running), which stays a plain
+    :class:`HubUnreachable`. A subclass of :class:`HubUnreachable` so every
+    existing ``except HubUnreachable`` caller (the config resolvers' env
+    fallback) behaves exactly as before; the secrets resolver uses the
+    distinction to report "store unavailable — retry" instead of "not found".
+    """
+
+
+def _is_os_error_refused(exc: BaseException) -> bool:
+    """Structural refusal test for ONE exception object: a
+    :class:`ConnectionRefusedError`, or an :class:`OSError` whose ``errno``
+    is ``ECONNREFUSED`` (Windows: ``WSAECONNREFUSED`` — CPython maps WinError
+    10061 to :class:`ConnectionRefusedError` itself; a re-wrapped OSError
+    keeps only the ``errno``)."""
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    errno_value = getattr(exc, "errno", None)
+    if isinstance(errno_value, int):
+        if errno_value == errno.ECONNREFUSED:
+            return True
+        wsa_refused = getattr(errno, "WSAECONNREFUSED", None)
+        if wsa_refused is not None and errno_value == wsa_refused:
+            return True
+    return False
+
+
+def _is_connection_refused(exc: BaseException) -> bool:
+    """Did ``exc`` (a ``requests`` transport error) fail because nothing is
+    LISTENING — a refused connection — as opposed to a hub that accepted the
+    connection and then did not answer? Classified STRUCTURALLY, by exception
+    type and ``errno`` (v0.2.102 fix round): a
+    :class:`ConnectionRefusedError` or ``ECONNREFUSED`` anywhere in the
+    cause/context chain or nested args (urllib3 wraps the OS error in its own
+    types — ``NewConnectionError`` lands in ``MaxRetryError``'s reason — but
+    the underlying OSError stays reachable through the chain, verified
+    against the shipped urllib3), and a :class:`urllib.error.URLError` by its
+    ``.reason``. An exception whose MESSAGE mentions a refusal proves
+    nothing: proxy noise and nested vendor errors quote transport text, and
+    reading it classified a busy hub's miss as "no launcher hub running"
+    (the pre-fix false message, on a narrower path). Conservative: anything
+    not positively a refusal is "not responding"."""
+    return _is_connection_refused_walk(exc, set())
+
+
+def _is_connection_refused_walk(exc: BaseException, seen: "set[int]") -> bool:
+    """:func:`_is_connection_refused` with ONE ``seen`` set shared across the
+    chain, ``.reason`` and ``args`` legs, so a self-referential error graph
+    terminates instead of recursing without bound."""
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if _is_os_error_refused(cur):
+            return True
+        # urllib.error.URLError carries the original error in `.reason`, not
+        # in the chain every time (a bare `raise URLError(reason)` sets
+        # neither __cause__ nor __context__).
+        reason = getattr(cur, "reason", None)
+        if isinstance(reason, BaseException) and _is_connection_refused_walk(reason, seen):
+            return True
+        for arg in getattr(cur, "args", ()):
+            if isinstance(arg, BaseException) and _is_connection_refused_walk(arg, seen):
+                return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _transport_error(exc: requests.RequestException, what: str) -> HubUnreachable:
+    """Map a ``requests`` transport failure to the resolver taxonomy: a
+    refused connection (no hub) → :class:`HubUnreachable`; a timeout or a
+    connection dropped after connect (a busy hub) → :class:`HubNotResponding`."""
+    if isinstance(exc, requests.Timeout):
+        return HubNotResponding(f"{what}: {exc}")
+    if isinstance(exc, requests.ConnectionError) and not _is_connection_refused(exc):
+        return HubNotResponding(f"{what}: {exc}")
+    return HubUnreachable(f"{what}: {exc}")
 
 
 class Unauthorized(ResolverError):
@@ -374,28 +474,16 @@ class ProjectConfig:
     #: about, the client emits a one-line stderr warning and still
     #: returns the parsed body (additive fields default client-side).
     schema_version: int = RESOLVER_PROTOCOL_VERSION
-    #: Peer-project diagrams collection names (already-canonical
-    #: Weaviate class names, e.g. ``("Foo_Diagrams",)``). v0.2.34 A7
-    #: split from the KG list — pre-v0.2.34 the MCP piggybacked on
-    #: ``kg_access_list`` which had the wrong granularity. Empty tuple
-    #: when no peers granted diagram read. Pre-v0.2.34 hubs omit the
-    #: field; the parser back-fills with ``()`` so old hubs paired
-    #: with v0.2.34+ clients don't crash — the MCP env-fallback path
-    #: covers the empty-tuple sentinel by reading
-    #: ``VCT_DIAGRAMS_ACCESS_LIST``. Placed after the other defaulted
-    #: fields to keep frozen-dataclass init signature backward-compat.
-    diagrams_access_list: tuple[str, ...] = ()
-    #: Per-project Weaviate diagrams collection name (Phase 1.5 —
-    #: fix/a1-indexing-pipeline 2026-05-25). The hub derives this from
-    #: the primary KG collection via the `_KnowledgeGraph` → `_Diagrams`
-    #: suffix swap. Pre-fix hubs paired with post-fix clients omit the
-    #: field; the parser back-fills with the empty string. The MCP
-    #: server's ``_config_field("diagrams_collection", ...,
-    #: empty_means_unset=True)`` treats empty as unset and falls
-    #: through to the env-var path (``DIAGRAMS_COLLECTION``), which
-    #: preserves backward compatibility while letting newer hubs serve
-    #: the canonical name directly. Additive (declared last so callers
-    #: that construct ``ProjectConfig`` positionally don't break).
+    #: Per-project Weaviate diagrams collection name. v0.2.102: the
+    #: diagrams runtime is REMOVED; the field is kept RECOGNITION-ONLY —
+    #: the ``_KnowledgeGraph`` → ``_Diagrams`` suffix-swap derivation
+    #: still names the class an older install created, so the migrate /
+    #: drop / orphan paths keep recognising existing user collections.
+    #: Nothing creates the class any more. Older hubs paired with newer
+    #: clients may omit the field; the parser back-fills the empty
+    #: string, which consumers treat as unset. Additive (declared last
+    #: so callers that construct ``ProjectConfig`` positionally don't
+    #: break).
     diagrams_collection: str = ""
     #: v0.2.40 R2 — RL Reranker per-project flags. Until v0.2.40 the
     #: three GUI checkboxes (``set_rl_use_global`` /
@@ -502,6 +590,45 @@ class ProjectConfig:
     #: empty string, which callers treat as "unset" (fall through to the
     #: projected ``CODE_EMBED_SERVICE_URL``).
     code_embed_url: str = ""
+    #: v0.2.102 W5-A (M3) — what THIS project declared its own on the
+    #: launcher's Identity tab (``project_infra_declarations``; see
+    #: :mod:`vco_lib.infra_declarations`). Additive: a pre-v0.2.102 hub omits
+    #: them and the parser back-fills empty tuples. Machine-wide "do not
+    #: touch" decisions read launcher.db through ``infra_declarations``, not
+    #: this per-project view.
+    external_collections: tuple[str, ...] = ()
+    unmanaged_containers: tuple[str, ...] = ()
+    ssrf_extra_local_ports: tuple[int, ...] = ()
+
+
+#: The resolver fields that are plain lists of declared values (v0.2.102 M3).
+#: MUST MATCH the bash (``_is_infra_list_field``) and ps1 siblings of
+#: ``templates/scripts/vct_project_config``, which render each one value per
+#: line for ``--field``; ``tests/test_v02102_infra_boundary.py`` runs all three
+#: against one stub hub.
+INFRA_LIST_FIELDS: tuple[str, ...] = (
+    "external_collections",
+    "unmanaged_containers",
+    "ssrf_extra_local_ports",
+)
+
+
+def _str_list(raw: Any) -> tuple[str, ...]:
+    """A JSON list of strings → tuple; anything else → ``()`` (defensive,
+    like ``_parse_extra_codegraph_paths``: one bad field never wedges
+    ``resolve()``)."""
+    if not isinstance(raw, list):
+        return ()
+    return tuple(str(v) for v in raw if isinstance(v, str) and v)
+
+
+def _port_list(raw: Any) -> tuple[int, ...]:
+    if not isinstance(raw, list):
+        return ()
+    return tuple(
+        int(v) for v in raw
+        if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 65535
+    )
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -882,8 +1009,15 @@ def _get_with_401_retry(
     *,
     params: dict | None = None,
     project_id: str | None = None,
+    read_timeout: float | None = None,
 ) -> requests.Response:
     """GET a hub URL with one-shot 401 retry-with-cache-invalidation.
+
+    ``read_timeout`` overrides :data:`_READ_TIMEOUT_SECONDS` for this call —
+    the secrets resolver passes :data:`SECRET_READ_TIMEOUT_SECONDS`
+    (v0.2.102, W6-AB). A transport failure raises :class:`HubNotResponding`
+    when the hub was reached but did not answer in time, and a plain
+    :class:`HubUnreachable` when the connection was refused.
 
     ``url_builder`` is a closure that takes ``(port, token)`` and returns
     the full URL. The closure pattern is needed because the URL itself
@@ -930,6 +1064,10 @@ def _get_with_401_retry(
     text is byte-identical to pre-v0.2.91 on every one of those paths.
     ``VCT_HUB_TOKEN_STRICT=1`` disables all of it.
     """
+    timeout = (
+        _CONNECT_TIMEOUT_SECONDS,
+        _READ_TIMEOUT_SECONDS if read_timeout is None else read_timeout,
+    )
     port, token = _discover_hub()
     url = url_builder(port, token)
     bearer = _project_token(project_id, token) if project_id else token
@@ -939,10 +1077,10 @@ def _get_with_401_retry(
             url,
             params=params,
             headers=headers,
-            timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+            timeout=timeout,
         )
     except requests.RequestException as exc:
-        raise HubUnreachable(f"hub GET failed: {exc}") from exc
+        raise _transport_error(exc, "hub GET failed") from exc
 
     if resp.status_code == 403:
         # Never retried before v0.2.91 (a 403 is an authorization
@@ -958,7 +1096,7 @@ def _get_with_401_retry(
                 url,
                 params=params,
                 headers={"Authorization": f"Bearer {fallback}"},
-                timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+                timeout=timeout,
             )
         except requests.RequestException:
             # The fallback attempt could not complete — keep today's
@@ -995,10 +1133,10 @@ def _get_with_401_retry(
             url,
             params=params,
             headers=headers,
-            timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+            timeout=timeout,
         )
     except requests.RequestException as exc:
-        raise HubUnreachable(f"hub GET failed on retry: {exc}") from exc
+        raise _transport_error(exc, "hub GET failed on retry") from exc
     if fallback is None:
         # No credential swap happened — this is the pre-v0.2.91 cache
         # invalidation retry, whose response is returned as it always was.
@@ -1110,7 +1248,7 @@ def _looks_like_path(value: str) -> bool:
     return False
 
 
-def _resolve_project_id(project_arg: str) -> str:
+def _resolve_project_id(project_arg: str, *, read_timeout: float | None = None) -> str:
     """Resolve the project's id for the resolver argument.
 
     If ``project_arg`` looks like a UUID/id, return it verbatim. If it
@@ -1125,6 +1263,7 @@ def _resolve_project_id(project_arg: str) -> str:
     resp = _get_with_401_retry(
         lambda port, _token: f"http://127.0.0.1:{port}/api/v1/projects/by-path",
         params={"path": project_arg},
+        read_timeout=read_timeout,
     )
 
     if resp.status_code == 200:
@@ -1303,13 +1442,10 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             codegraph_access_list=tuple(
                 str(s) for s in body["codegraph_access_list"]
             ),
-            # v0.2.34 A7 additive field — pre-v0.2.34 hubs omit it.
-            # Empty-tuple sentinel signals "no hub-resolved peers";
-            # the MCP env-fallback path reads VCT_DIAGRAMS_ACCESS_LIST
-            # in that case.
-            diagrams_access_list=tuple(
-                str(s) for s in body.get("diagrams_access_list", [])
-            ),
+            # NOTE: the v0.2.34 A7 ``diagrams_access_list`` field was
+            # removed in v0.2.102 with the diagrams runtime. A hub body
+            # still carrying the key (an older hub) is simply ignored —
+            # unknown extra keys are tolerated by this parser.
             weaviate_url=str(body["weaviate_url"]),
             ollama_url=str(body["ollama_url"]),
             grpc_port=int(body["grpc_port"]),
@@ -1368,6 +1504,10 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             # env-resolution / disabled mode.
             rl_server_port=_coerce_optional_port(body.get("rl_server_port")),
             code_embed_url=str(body.get("code_embed_url") or ""),
+            # v0.2.102 W5-A (M3) additive declaration lists.
+            external_collections=_str_list(body.get("external_collections")),
+            unmanaged_containers=_str_list(body.get("unmanaged_containers")),
+            ssrf_extra_local_ports=_port_list(body.get("ssrf_extra_local_ports")),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(
@@ -1695,8 +1835,10 @@ __all__ = [
     "FieldNotFound",
     "Forbidden",
     "HUB_DISCOVERY_TTL_SECONDS",
+    "HubNotResponding",
     "HubUnreachable",
     "ProjectConfig",
+    "SECRET_READ_TIMEOUT_SECONDS",
     "ProjectNotFound",
     "RESOLVER_PROTOCOL_VERSION",
     "ResolverError",

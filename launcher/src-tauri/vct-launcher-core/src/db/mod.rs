@@ -60,10 +60,12 @@ pub mod orchestrator_root_helpers;
 pub mod module_ports;
 pub mod deprecation_events;
 pub mod module_db_migrations;
-// Migration 021 — diagrams (Mermaid + Excalidraw) registry, snapshots,
-// access grants, per-tool MCP grants, per-project module-active flags.
-// Phase 1.1 of the diagrams integration plan
-// (.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md).
+// Migration 022 — the diagrams integration's tables (registry, snapshots,
+// access grants, per-tool MCP grants, per-project module-active flags).
+// v0.2.102 (diagrams dropped): the diagram query functions are gone with
+// the Diagrams tab; the module keeps the per-tool grant READER (hub
+// route) and the `project_modules` functions. The migration and all its
+// tables stay — user data is never dropped.
 pub mod diagrams;
 // Migration 023 — module-shipped MCP tool allowlist defaults
 // (v0.2.34 Agent E — Phase 4 generalisation). Populated at install
@@ -118,6 +120,12 @@ pub mod chat_model_context;
 // the table's one writer. Rendering + the compiled-default fallback live in
 // `services::service_endpoints`.
 pub mod service_endpoints;
+
+// Migration 049 (v0.2.102 W5-A / M3) — what on this machine belongs to a
+// project, not to VCO (external collections, unmanaged containers, local
+// ports). Written by the launcher's Identity tab; read by the hub watchdog and
+// `/config` route here, and by `vco_lib.infra_declarations` in Python.
+pub mod infra_declarations;
 
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {

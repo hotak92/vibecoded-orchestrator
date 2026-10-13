@@ -9,8 +9,9 @@ legacy `docker-compose.override.yml` + canonical `compose.override.yaml` pair:
     BOTH files, record an auto-resolution. [REGRESSION PIN]
   * yaml-semantically-equal (comment/whitespace drift) → re-mirror the legacy
     file to the canonical bytes, no deferral, record an auto-resolution.
-  * genuinely divergent (parse failure / parsed-unequal) → keep today's
-    `compose_override_filename_conflict` deferral verbatim. [LEAVE-ALONE]
+  * genuinely divergent (parse failure / parsed-unequal) → the divergent-pair
+    deferral (`compose_override_pair_diverged` since v0.2.102, superseding
+    `compose_override_filename_conflict`). [LEAVE-ALONE]
 
 Plus compose reconciliation: a previously-deferred conflict that is now
 absent/identical clears via resolve_conditions.
@@ -55,7 +56,7 @@ def _infra(root: Path) -> Path:
 
 def _has_conflict(folder: Path) -> bool:
     report = DeferralReport.read(folder)
-    return report.has_condition("compose_override_filename_conflict")
+    return report.has_condition("compose_override_pair_diverged")
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +87,7 @@ def test_regression_pin_byte_identical_pair_auto_resolves(tmp_path: Path) -> Non
     # B-F9: an auto-resolutions.jsonl line was written.
     rows = read_auto_resolutions(tmp_path)
     assert any(
-        r["condition_id"] == "compose_override_filename_conflict"
+        r["condition_id"] == "compose_override_pair_diverged"
         and r["action"] == "kept_identical_mirror_pair"
         for r in rows
     ), rows
@@ -170,7 +171,7 @@ def test_reconciliation_clears_stale_conflict_when_legacy_removed(tmp_path: Path
     # Seed a stale conflict deferral (as if a prior run wrote it).
     report = DeferralReport.read(tmp_path)
     report.add_entry(DeferralEntry(
-        condition_id="compose_override_filename_conflict",
+        condition_id="compose_override_pair_diverged",
         title="stale",
         detected="stale",
         why_deferred="stale",
@@ -194,7 +195,7 @@ def test_reconciliation_clears_conflict_when_pair_became_identical(tmp_path: Pat
     # Seed a stale conflict.
     report = DeferralReport.read(tmp_path)
     report.add_entry(DeferralEntry(
-        condition_id="compose_override_filename_conflict",
+        condition_id="compose_override_pair_diverged",
         title="stale",
         detected="stale",
         why_deferred="stale",

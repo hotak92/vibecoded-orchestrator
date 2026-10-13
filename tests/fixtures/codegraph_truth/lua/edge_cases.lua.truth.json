@@ -1,0 +1,46 @@
+{
+ "source": "edge_cases.lua",
+ "reviewed": "W6-E 2026-10-10 (hand-written before extraction); W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Stack",
+   "start": 2,
+   "end": 2,
+   "full_name": "edge_cases.Stack",
+   "methods": [
+    "new",
+    "push",
+    "pop"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "helper",
+   "start": 17,
+   "end": 22,
+   "full_name": "edge_cases.helper"
+  },
+  {
+   "kind": "function",
+   "name": "inner",
+   "start": 18,
+   "end": 20,
+   "full_name": "edge_cases.inner"
+  },
+  {
+   "kind": "function",
+   "name": "format",
+   "start": 24,
+   "end": 26,
+   "full_name": "edge_cases.format"
+  },
+  {
+   "kind": "function",
+   "name": "trim",
+   "start": 29,
+   "end": 31,
+   "full_name": "edge_cases.utils.trim"
+  }
+ ]
+}

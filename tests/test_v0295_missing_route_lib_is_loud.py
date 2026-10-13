@@ -51,6 +51,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -452,7 +453,7 @@ def test_the_powershell_flavour_declares_the_same_set() -> None:
         "Get-VcoRequiredHookLibs | ForEach-Object { Write-Output $_ }"
     )
     out = subprocess.run(
-        [pwsh, "-NoProfile", "-Command", script],
+        [pwsh, *PWSH_BASE_FLAGS, "-Command", script],
         capture_output=True, text=True, timeout=120,
     )
     assert out.returncode == 0, out.stderr
@@ -465,7 +466,7 @@ def test_the_powershell_flavour_declares_the_same_set() -> None:
             f'. "{LIB_SRC / "emit-context.ps1"}"; Get-VcoHookLibRole "{lib}.ps1"'
         )
         role = subprocess.run(
-            [pwsh, "-NoProfile", "-Command", role_script],
+            [pwsh, *PWSH_BASE_FLAGS, "-Command", role_script],
             capture_output=True, text=True, timeout=120,
         )
         assert role.returncode == 0, role.stderr

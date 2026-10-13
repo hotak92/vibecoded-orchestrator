@@ -300,6 +300,9 @@ def test_r3_excludes_orphan_rows_from_owed_count(monkeypatch, tmp_path):
 
 def test_spawn_not_owed_when_probe_confirms_zero(monkeypatch, tmp_path):
     """POSITIVE zero from the probe → status not_owed, NOTHING spawned."""
+    # v0.2.102 (W1-C S4/S5): "converged" now also means both one-time audits
+    # are recorded for the project; this test pins the revision/cleanup gate.
+    monkeypatch.setattr(cr, "_one_time_audits_owed", lambda *a, **k: [])
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
     monkeypatch.setattr(
         cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 0}
@@ -420,6 +423,9 @@ def test_spawn_proceeds_when_cleanup_owed_despite_zero_stale(monkeypatch, tmp_pa
 def test_spawn_not_owed_when_zero_stale_and_zero_cleanup(monkeypatch, tmp_path):
     """LEAVE-ALONE: embed-stale 0 AND no deleted-primary rows → not_owed,
     NOTHING spawns (the CG-4 probe must not spawn on a fully-converged graph)."""
+    # v0.2.102 (W1-C S4/S5): "converged" now also means both one-time audits
+    # are recorded for the project; this test pins the revision/cleanup gate.
+    monkeypatch.setattr(cr, "_one_time_audits_owed", lambda *a, **k: [])
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 0})
     monkeypatch.setattr(cr, "count_cleanup_owed_rows", lambda *a, **k: 0)
@@ -443,6 +449,9 @@ def test_spawn_leaves_alone_when_cleanup_owed_undeterminable(monkeypatch, tmp_pa
     probe already reached — it does NOT authorise a spawn. Conservative here
     means "don't purge on uncertainty" (the spawned sweep would DELETE rows), so
     uncertainty must leave the graph untouched, not trigger a sweep."""
+    # v0.2.102 (W1-C S4/S5): "converged" now also means both one-time audits
+    # are recorded for the project; this test pins the revision/cleanup gate.
+    monkeypatch.setattr(cr, "_one_time_audits_owed", lambda *a, **k: [])
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 0})
     monkeypatch.setattr(cr, "count_cleanup_owed_rows", lambda *a, **k: None)

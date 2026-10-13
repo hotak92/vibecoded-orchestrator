@@ -89,6 +89,7 @@ class ModelIdParsingTests(unittest.TestCase):
         ("claude-opus-4-8", "claude-opus", (4, 8), None, False),
         ("claude-3-7-sonnet-20250219", "claude-sonnet", (3, 7), "20250219", False),
         ("claude-haiku-4-5-20251001", "claude-haiku", (4, 5), "20251001", False),
+        ("claude-haiku-5-5", "claude-haiku", (5, 5), None, False),
         ("glm-5.3", "glm", (5, 3), None, False),
         ("glm-5.3-flash", "glm-flash", (5, 3), None, False),
         ("glm-5-turbo", "glm-turbo", (5,), None, False),
@@ -725,13 +726,40 @@ class ShippedDataInvariantTests(unittest.TestCase):
         )
 
     def test_every_advertised_1m_row_really_resolves_to_1m(self) -> None:
-        """A suffix on a row that is not 1M would make the client budget five
-        times the context the model has — the inverse of the defect the
-        suffix exists to fix, and the more dangerous direction."""
+        """A suffix on a row that is not 1M-CLASS would make the client budget
+        five times the context the model has — the inverse of the defect the
+        suffix exists to fix, and the more dangerous direction.
+
+        Since v0.2.102 "1M-class" is not literally 1,000,000: a row whose
+        cited REAL ceiling sits just under 1M (qwen3.8-max, live-verified
+        983,616 — the vendor's own Claude Code ceiling for the endpoint)
+        still earns the companion, because the client budgeting 1M for it is
+        right to within one small turn, and the gateway's context guard plus
+        overflow translation handle the delta. What can NEVER carry the
+        suffix is a window at or below the client's 200K default — that is
+        the fivefold overstatement, and it fails here."""
+        seed = load_seed()
         for row in self.catalog.entries:
-            if row.id.endswith(ONE_M_SUFFIX):
-                with self.subTest(model=row.id):
-                    self.assertIn("1M context", row.description)
+            if not row.id.endswith(ONE_M_SUFFIX):
+                continue
+            with self.subTest(model=row.id):
+                seed_row = seed.lookup_id(row.id)
+                if seed_row is None:
+                    self.assertIn(
+                        "1M context", row.description,
+                        "an untabulated [1m] row must resolve to a full 1M",
+                    )
+                    continue
+                self.assertTrue(
+                    seed_row.window_1m,
+                    f"{row.id}: the companion is published but the seed row "
+                    "does not flag it",
+                )
+                self.assertGreater(
+                    seed_row.context_window, cat.CLIENT_DEFAULT_WINDOW,
+                    f"{row.id}: a [1m] companion on a default-window model "
+                    "overstates its context fivefold",
+                )
 
     def test_every_1m_model_in_the_shipped_data_is_advertised_as_one(self) -> None:
         """The other direction: a 1M model with no ``[1m]`` row anywhere is a
@@ -784,8 +812,11 @@ class ShippedDataInvariantTests(unittest.TestCase):
 
         Every 1M first-party model appears ONCE, as its ``[1m]`` row: the
         ``window_rows`` default withholds the plain spelling (which is listed
-        among the hidden ids below, not dropped). The 200K haiku row, having
-        no second spelling to choose between, is untouched by that knob.
+        among the hidden ids below, not dropped). Since Haiku 5.5 joined the
+        static snapshot (v0.2.102) the haiku family's latest is that 1M
+        model, so it too publishes only its ``[1m]`` row; the legacy 200K
+        ``claude-haiku-4-5-20251001`` is an older same-family sibling,
+        withheld by the latest filter (hidden, still routable by name).
 
         The Token-Plan rows come from the declared fallback in this fixture
         (the injected fetch answers nothing, so the row's nine declared
@@ -804,22 +835,28 @@ class ShippedDataInvariantTests(unittest.TestCase):
             [row.id for row in latest.entries],
             [
                 f"claude-fable-5-1{ONE_M_SUFFIX}",
-                "claude-haiku-4-5-20251001",
-                f"claude-opus-5{ONE_M_SUFFIX}",
-                f"claude-sonnet-5{ONE_M_SUFFIX}",
+                f"claude-haiku-5-5{ONE_M_SUFFIX}",
+                # v0.2.102 W4-G: Opus / Sonnet 5.5 joined the static
+                # snapshot, so they are their families' latest.
+                f"claude-opus-5-5{ONE_M_SUFFIX}",
+                f"claude-sonnet-5-5{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.8-max{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.8-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/glm-5.3{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/deepseek-v4.1-flash{ONE_M_SUFFIX}",
+                # Kimi Code (v0.2.102, owner ruling: K3 only), from its
+                # shipped snapshot block (the injected fetch answers
+                # nothing); its cited 1M window earns the [1m] spelling.
+                f"claude-gw/kimi/k3{ONE_M_SUFFIX}",
             ],
         )
         self.assertEqual(
             sorted(latest.hidden),
             [
-                # ``claude-fable-5-1``, ``claude-opus-5`` and
-                # ``claude-sonnet-5`` are here as the PLAIN spelling of a 1M
+                # ``claude-fable-5-1``, ``claude-opus-5-5`` and
+                # ``claude-sonnet-5-5`` are here as the PLAIN spelling of a 1M
                 # model, withheld by the ``window_rows`` default (one model,
                 # one row) rather than by the latest filter — reported, and
                 # still routable by name.
@@ -829,12 +866,23 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 "claude-gw/glm-4.6", "claude-gw/glm-4.7",
                 "claude-gw/glm-5", "claude-gw/glm-5-turbo",
                 "claude-gw/glm-5.1",
+                # Withheld by the kimi row's verified_ids (owner ruling
+                # 2026-10-07, K3 only) from its shipped snapshot block.
+                "claude-gw/kimi/k3-256k",
+                "claude-gw/kimi/kimi-for-coding",
+                "claude-gw/kimi/kimi-for-coding-highspeed",
                 f"claude-gw/qwen/deepseek-v4-pro{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.6-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.7-max{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.7-plus{ONE_M_SUFFIX}",
-                "claude-opus-4-8", "claude-opus-5",
-                "claude-sonnet-4-6", "claude-sonnet-5",
+                # The legacy Haiku (older sibling of claude-haiku-5-5) and
+                # the current Haiku's plain spelling (window_rows default).
+                "claude-haiku-4-5-20251001", "claude-haiku-5-5",
+                # v0.2.102 W4-G: claude-opus-5 / claude-sonnet-5 are now
+                # older siblings of the 5.5 rows (latest filter), and the
+                # 5.5 plain spellings are withheld by the window_rows default.
+                "claude-opus-4-8", "claude-opus-5", "claude-opus-5-5",
+                "claude-sonnet-4-6", "claude-sonnet-5", "claude-sonnet-5-5",
             ],
         )
 

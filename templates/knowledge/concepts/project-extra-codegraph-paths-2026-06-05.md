@@ -10,7 +10,7 @@ tags:
   - hub-resolver
   - low-level-implementation
 created: 2026-06-05T00:00:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-10-13T00:00:00Z
 status: active
 ---
 
@@ -18,9 +18,16 @@ status: active
 
 ## What it is
 
-A way to index **additional read-only filesystem paths** into a project's
+A way to index **additional filesystem folders** into a project's
 codegraph collection from the launcher's Identity tab — without making
-those paths launcher projects.
+those folders launcher projects. Since v0.2.102 the launcher calls them
+**code folders** ("Code folders" panel, "Add code folder" button); the
+internal names (`project_codegraph_extra_paths` table, the hub's
+`code_graph_extra_paths` field, the component file names) are unchanged.
+
+A code folder is no longer a read-only reference: lane reservations
+(`vco_lib/lane_reservation.py`) may create isolated subagent worktrees in
+the project itself or in any of its ENABLED code folders.
 
 **Canonical use case**: a user working in a private fork wants their `hybrid_search`
 + `search_code_graph` queries to see entries from a sibling
@@ -38,7 +45,7 @@ Four surfaces co-evolve:
 | Launcher (Tauri) | `commands::project_codegraph_extras` | 6 commands: list / add / remove / set_enabled / sync / reindex. Per-project mutex serialises add→reindex sequences. Disambiguation response when path is an existing launcher project |
 | Hub resolver | `code_graph_extra_paths: Vec<{path, enabled, last_indexed_commit}>` on `/api/v1/projects/{id}/config` | Additive field; older clients ignore. Only enabled rows projected |
 | GUI (Svelte) | `ExtraCodegraphPathsPanel.svelte` + `ExtrasDisambiguationModal` + `ExtrasSyncProgressModal` | Per-row sync/disable/remove. Auto-sync on add. Re-sync with `--prune-stale` on remove/disable. Hide-to-pill on long syncs |
-| Hook | `code-graph-incremental.sh` (and `.ps1` sibling) | First-match-wins ordering: own-repo → extras → siblings → no-op. Edits under extras re-index into the CURRENT project's prefix |
+| Hooks | `post-file-edit` → `_lib/route-touched-path.sh` (+ `.ps1`) queues; `stop-codegraph-drain.sh` (+ `.ps1`) drains | A code edit under an enabled code folder goes to that folder's own drain queue (never the primary queue); the Stop hook drains it as a scoped run into the CURRENT project's prefix, and periodically re-indexes folders whose HEAD moved. `code-graph-incremental.sh` keeps the first-match ordering below but ships unregistered |
 | Analyzer CLI | `--extra-path <DIR>` (repeatable) + `--since-commit <SHA>` | Walks all source roots in ONE pass; `visited_uuids` is the UNION across primary repo + all extras. Schema adds `project_source` property to all 5 code collections |
 
 ## The critical invariant
@@ -68,14 +75,14 @@ The GUI shows a modal with three buttons:
   `codegraph_grant_access` with `grantor=existing`, `grantee=current`,
   `access=read`. The current project gains read access on the
   existing project's already-maintained codegraph.
-- **"Add as path anyway"** → re-calls `add_project_codegraph_extra_path`
+- **"Add as code folder anyway"** → re-calls `add_project_codegraph_extra_path`
   with `force: true`. Persists the row, triggers auto-sync.
 - **"Cancel"** → no-op.
 
 This pattern lets the user either re-use a sibling project's continuously-
-maintained codegraph (cheaper, always-fresh) or treat the folder as a
-read-only reference under the current project (single-collection queries,
-no permission management).
+maintained codegraph (cheaper, always-fresh) or add the folder as a code
+folder of the current project (single-collection queries, no permission
+management — and lane reservations may put isolated worktrees there).
 
 ## Path canonicalisation rules
 
@@ -95,7 +102,10 @@ against `EDITED_FILE` directly.
 
 ## Hook ordering
 
-`code-graph-incremental.sh` (and `.ps1`) check order, **first match wins**:
+Live scheduling is the queue + Stop-hook drain in the Architecture table.
+The standalone `code-graph-incremental.sh` (and `.ps1`), unregistered since
+its scheduling moved to `stop-codegraph-drain.sh`, checks in this order,
+**first match wins**:
 
 1. **Own-repo fast path** — edit under current `$REPO_PATH` → no override
    (also avoids one hub RTT per Edit in the common case)
@@ -117,9 +127,8 @@ Backwards-compatible by construction.
 
 - KG syncing: extra paths' `knowledge/` subdirs are NOT auto-synced into
   the project's KG. Codegraph only.
-- Diagrams: same.
-- Hook-driven writes against extra paths: extras are READ-ONLY references.
-  `ruff`/`pyright` don't run against extras.
+- Treating code folders as read-only: since v0.2.102 lane reservations may
+  create isolated subagent worktrees in an enabled code folder.
 - Auto-drop of Weaviate entries on row delete: handled by the analyzer's
   `--prune-stale` pass in the re-analyze that fires after removal, NOT by
   destroying the collection.
@@ -129,7 +138,7 @@ Backwards-compatible by construction.
 Every transition records to `audit_log`:
 
 - `codegraph_extra_path_added` / `codegraph_extra_path_added_force` (user
-  picked "Add as path anyway" after disambiguation)
+  picked "Add as code folder anyway" after disambiguation)
 - `codegraph_extra_path_removed`
 - `codegraph_extra_path_enabled_toggled`
 - `codegraph_extra_path_synced`
@@ -153,6 +162,9 @@ Every transition records to `audit_log`:
 - `launcher/src/lib/components/ExtrasSyncProgressModal.svelte`
 - `launcher/src/lib/api/codegraph_extras.ts`
 - `launcher/src/lib/types/codegraph-extras.ts`
+- `launcher/src/lib/project-state/code-folder-labels.ts` (the user-visible "code folder" strings)
+- `vco_lib/lane_reservation.py` (enabled code folders are allowed worktree targets)
+- `templates/hooks/_lib/route-touched-path.sh` / `.ps1`, `templates/hooks/stop-codegraph-drain.sh` / `.ps1`, `vco_lib/codegraph_extras_refresh.py`
 - `templates/scripts/analyze_code_graph.py` (+ `.claude/scripts/` mirror)
 - `templates/scripts/vct_project_config.sh` / `.ps1` (+ `.claude/scripts/` mirrors)
 - `templates/hooks/code-graph-incremental.sh` / `.ps1` (+ `.claude/hooks/` mirrors)

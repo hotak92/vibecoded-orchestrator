@@ -59,6 +59,7 @@ import unittest
 import uuid
 from pathlib import Path, PureWindowsPath
 from unittest import mock
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -1038,7 +1039,7 @@ class Ps1WrapperForwardTests(unittest.TestCase):
             venv_root = Path(td) / "venv"
             _write_forwarding_shim(venv_root / "bin" / "python")
             proc = subprocess.run(
-                [_pwsh(), "-NoProfile", "-File", str(KG_SYNC_PS1), "--foo"],
+                [_pwsh(), *PWSH_BASE_FLAGS, "-File", str(KG_SYNC_PS1), "--foo"],
                 env=_wrapper_env(venv_root),
                 capture_output=True, text=True, timeout=90,
             )

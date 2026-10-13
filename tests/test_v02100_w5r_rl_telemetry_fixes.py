@@ -31,6 +31,7 @@ import urllib.error
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MCP_DIR = REPO_ROOT / "claude_mcp_servers"
@@ -358,8 +359,14 @@ def test_hook_process_latency_with_a_hung_hub(tmp_path):
     assert timings["detached_main"] < 1.0, timings
     assert timings["inline"] - timings["detached"] >= 3.5, timings
     # The worst case (wedged hub AND hung secondary) costs pre-tool-use only
-    # its 0.4 s embed cap over the fast detached run — machine-independent.
-    assert timings["pre_tool_use_worst_main"] < 0.4 + 0.5, timings
+    # its 0.4 s embed cap over the fast detached run. The cap is wall-clock;
+    # the process overhead around it is not — under a loaded machine (a full
+    # suite beside a cargo build) the detached run itself went 0.08 s -> 0.31 s
+    # and this leg 0.43 s -> 1.2 s. So the slack scales with the measured
+    # detached baseline instead of being a fixed number; a hung secondary
+    # (30 s) or a POST back on the critical path (2 s each) still fails it.
+    slack = 0.5 + 3 * timings["detached_main"]
+    assert timings["pre_tool_use_worst_main"] < 0.4 + slack, timings
     assert timings["pre_tool_use_worst"] - timings["detached"] < 0.4 + 0.5, timings
 
 
@@ -539,7 +546,7 @@ def test_each_hook_tags_its_own_task_type(tmp_path, shell, hook, expected, paylo
         pytest.skip("pwsh on POSIX")
     orch, proj, target, env = _tt_rig(tmp_path)
     argv = (["bash", str(HOOKS / f"{hook}.sh")] if shell == "sh"
-            else ["pwsh", "-NoProfile", "-File", str(HOOKS / f"{hook}.ps1")])
+            else ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / f"{hook}.ps1")])
     if hook == "pre-tool-use":
         argv += ["Edit", ""]
     if hook == "agent-brief-kg-inject":

@@ -18,14 +18,23 @@
 #
 # WHAT IT DOES
 #   1. Reads the hook stdin ONCE into a 0600 temp file (mktemp default).
-#   2. Parses the routing fields (tool_name; whether tool_input.command
-#      starts with "git commit") with the same find-python + inline-Python
-#      idiom every sub-hook uses — no second parsing mechanism.
+#   2. Parses the routing fields (tool_name; whether tool_input.command runs
+#      a `git commit` segment anywhere in its chain) with the same
+#      find-python + inline-Python idiom every sub-hook uses — no second
+#      parsing mechanism. The commit detection itself is the ONE home
+#      `vco_lib.git_commit_gate.command_has_git_commit` (the shared
+#      quote-aware chain walker, `vco_lib/bash_command_walk.py`; PowerShell
+#      commands via `vco_lib/powershell_command.py`).
 #   3. Routes over the ROUTE_TABLE below: tool equality or `*`, with the
-#      `git-commit-prefix` gate carrying the retired registration key
-#      `if: Bash(git commit *)` (word-boundary: `git commit` exactly or
-#      followed by a space — `git commit-tree` does NOT fire the review
-#      agent). The `if: Edit|Write(knowledge/**/*.md)` keys the retired
+#      `git-commit-chain` gate carrying — and WIDENING (v0.2.102 W6-F) —
+#      the retired registration key `if: Bash(git commit *)`. The retired
+#      key only matched a command STARTING with `git commit`, so
+#      `cd … && git commit` never fired the reviewer (live: its log's last
+#      run predated the widening by months). The walker fires on a
+#      `git commit` segment anywhere in the chain, keeps the word boundary
+#      (`git commit-tree` does NOT fire) and treats quoted text as data
+#      (`echo "git commit"` does NOT fire). The
+#      `if: Edit|Write(knowledge/**/*.md)` keys the retired
 #      kg-summary-generator registrations carried are enforced by that
 #      script's OWN knowledge-path validation (unchanged body — one home
 #      preserved; this file is a router, not a re-implementation. That
@@ -75,9 +84,10 @@
 # rows so a sub-hook can never be routed on one OS only.
 #
 # Routing table format: <tool_name or *>|<script stem>|<gate>
-#   gate `-`                 = always route on a tool match
-#   gate `git-commit-prefix` = only when tool_input.command starts with
-#                              "git commit" (the retired `if` key)
+#   gate `-`                = always route on a tool match
+#   gate `git-commit-chain` = only when tool_input.command runs a
+#                              `git commit` segment anywhere in its chain
+#                              (v0.2.102 W6-F; the retired `if` key widened)
 
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
@@ -91,9 +101,12 @@ Edit|kg-summary-generator|-
 Write|post-edit-outcome|-
 Write|kg-summary-generator|-
 Bash|post-bash-context-record|-
-Bash|post-git-commit-kg-sync|git-commit-prefix
-Bash|post-file-delete|-
+Bash|post-git-commit-kg-sync|git-commit-chain
+PowerShell|post-bash-context-record|-
+PowerShell|post-git-commit-kg-sync|git-commit-chain
 mcp__weaviate-kg__store_knowledge_node|kg-summary-generator|-
+Agent|stop-drain-citations|-
+Task|stop-drain-citations|-
 *|kg-update-nudge|-
 '
 
@@ -166,12 +179,29 @@ cat >"$TMP_INPUT" || exit 0
 [ -s "$TMP_INPUT" ] || exit 0
 
 # Routing fields, one Python call: line 1 = tool_name, line 2 = "1" when
-# tool_input.command starts with "git commit" (the retired registration
-# gate), else "0". A malformed payload yields an empty tool_name: only the
-# `*` row fires then, whose script soft-fails on the payload internally —
-# the same net effect the retired `*` registration had.
-_ROUTE_FIELDS=$("$PY" -c '
-import json, sys
+# tool_input.command runs a `git commit` segment anywhere in its chain (the
+# retired `if: Bash(git commit *)` registration gate, widened in v0.2.102
+# W6-F from prefix-match to the quote-aware chain walk), else "0". The walk
+# itself is vco_lib.git_commit_gate (ONE home) — imported from the
+# orchestrator root resolved by the SAME ladder every hook uses
+# (_lib/resolve-vco-venv.sh, resolve_vco_orchestrator_script). A malformed
+# payload yields an empty tool_name: only the `*` row fires then, whose
+# script soft-fails on the payload internally — the same net effect the
+# retired `*` registration had. When vco_lib is UNRESOLVABLE (broken/partial
+# install) the gate stays "0" and the python's stderr line lands in
+# $ASYNC_LOG — the dispatcher's one loud channel (the silence guarantee is
+# about the transcript, not the log).
+_PTA_VCO_ROOT=""
+if [ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ]; then
+    # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+    resolve_vco_orchestrator_script "$SCRIPT_DIR" "vco_lib/git_commit_gate.py"
+    if [ -n "${VCO_ORCHESTRATOR_SCRIPT:-}" ]; then
+        _PTA_VCO_ROOT="$(dirname "$(dirname "$VCO_ORCHESTRATOR_SCRIPT")")"
+    fi
+fi
+_ROUTE_FIELDS=$(VCO_PTA_VCO_ROOT="$_PTA_VCO_ROOT" "$PY" -c '
+import json, os, sys
 try:
     with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
         d = json.load(f)
@@ -181,12 +211,25 @@ if not isinstance(d, dict):
     d = {}
 ti = d.get("tool_input")
 cmd = (ti.get("command") or "") if isinstance(ti, dict) else ""
-c = cmd.lstrip()
-print(d.get("tool_name") or "")
-# Word-boundary match for the retired `if: Bash(git commit *)` key (review
-# N-1): `git commit` exactly or followed by a space — NOT `git commit-tree`.
-print("1" if (c == "git commit" or c.startswith("git commit ")) else "0")
-' "$TMP_INPUT" 2>/dev/null) || _ROUTE_FIELDS=""
+tool = d.get("tool_name") or ""
+is_commit = "0"
+root = os.environ.get("VCO_PTA_VCO_ROOT", "")
+if cmd and root:
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from vco_lib.git_commit_gate import command_has_git_commit
+        is_commit = "1" if command_has_git_commit(cmd, tool) else "0"
+    except Exception as exc:
+        print(f"post-tool-use-async: git-commit gate unavailable: {exc!r}",
+              file=sys.stderr)
+elif cmd and not root:
+    print("post-tool-use-async: git-commit gate unavailable: orchestrator "
+          "root not resolved (vco_lib.git_commit_gate unreachable)",
+          file=sys.stderr)
+print(tool)
+print(is_commit)
+' "$TMP_INPUT") || _ROUTE_FIELDS=""
 TOOL_NAME=$(printf '%s' "$_ROUTE_FIELDS" | sed -n '1p')
 IS_GIT_COMMIT=$(printf '%s' "$_ROUTE_FIELDS" | sed -n '2p')
 
@@ -200,7 +243,7 @@ while IFS='|' read -r _pta_tool _pta_script _pta_gate; do
     if [ "$_pta_tool" != "*" ] && [ "$_pta_tool" != "$TOOL_NAME" ]; then
         continue
     fi
-    if [ "$_pta_gate" = "git-commit-prefix" ] && [ "$IS_GIT_COMMIT" != "1" ]; then
+    if [ "$_pta_gate" = "git-commit-chain" ] && [ "$IS_GIT_COMMIT" != "1" ]; then
         continue
     fi
     case "$_PTA_DISABLED" in

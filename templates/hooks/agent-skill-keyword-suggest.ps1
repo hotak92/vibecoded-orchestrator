@@ -48,7 +48,12 @@ if (Test-Path $EmitHelper) { . $EmitHelper }
 
 # Project root resolution: CLAUDE_PROJECT_DIR is the canonical signal at
 # hook fire time; fall back to PWD for ad-hoc invocations.
-$ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to do (no state is written).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectRoot = Get-VcoProjectRoot
+if (-not $ProjectRoot) { exit 0 }
 
 # Locate the matcher. Installed layout: hooks at <project>/.claude/hooks/,
 # scripts at <project>/.claude/scripts/. Templates layout (uninstalled,
@@ -69,6 +74,15 @@ if (-not (Test-Path $Matcher)) {
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 if (-not $HookStdin) { exit 0 }
+
+# v0.2.102 W6-C1 (F14): a background subagent's completion arrives in the
+# parent as a SYNTHETIC UserPromptSubmit whose prompt starts with the
+# literal "<task-notification>" tag -- it is a harness delivery, not user
+# prose, and keyword suggestions drawn from the subagent's report body are
+# noise. Skip it BEFORE the JSON parse below, exactly like
+# inject_intent.prompt_query does for the prompt-time KG retrieval.
+# MUST MATCH agent-skill-keyword-suggest.sh.
+if ($HookStdin -match '"prompt"\s*:\s*"<task-notification') { exit 0 }
 
 $Prompt = ""
 $SessionId = ""

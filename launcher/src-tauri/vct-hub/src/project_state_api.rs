@@ -462,7 +462,9 @@ struct SetKgBindingBody {
     #[serde(default = "default_kg_role")]
     role: String,
     collection_name: String,
-    embedding_model: Option<String>,
+    // v0.2.102 W6-J: no `embedding_model` — the per-project KG model pick was
+    // retired (one global embedding setting). The DB column survives with its
+    // historical values; nothing reads or writes it now.
     embedding_dim: Option<i64>,
     kg_dir_path: Option<String>,
     weaviate_url: Option<String>,
@@ -540,7 +542,6 @@ async fn set_kg_binding(
         &project_slug,
         &body.role,
         &body.collection_name,
-        body.embedding_model.as_deref(),
         body.embedding_dim,
         body.kg_dir_path.as_deref(),
         body.weaviate_url.as_deref(),

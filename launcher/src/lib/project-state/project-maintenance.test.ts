@@ -11,7 +11,7 @@ import {
   type MaintenanceDeps,
 } from './project-maintenance';
 import {
-  NODE_ACCESS_NOT_ENFORCED_NOTICE,
+  NODE_ACCESS_ENFORCED_NOTICE,
   accessNoticeFor,
 } from '../kg/node-access-notice';
 
@@ -91,18 +91,45 @@ describe('openProjectLogsAction (#9)', () => {
   });
 });
 
-describe('node access notice (#12)', () => {
-  it('names the owner deferral and v0.2.102; only node scopes carry it', () => {
-    expect(NODE_ACCESS_NOT_ENFORCED_NOTICE).toMatch(/not enforced/);
-    expect(NODE_ACCESS_NOT_ENFORCED_NOTICE).toMatch(/v0\.2\.102/);
-    expect(accessNoticeFor('node')).toBe(NODE_ACCESS_NOT_ENFORCED_NOTICE);
-    expect(accessNoticeFor('node-bulk')).toBe(NODE_ACCESS_NOT_ENFORCED_NOTICE);
+describe('node access notice (S2, v0.2.102)', () => {
+  it('says the restriction is enforced on cross-project reads; only node scopes carry it', () => {
+    expect(NODE_ACCESS_ENFORCED_NOTICE).toMatch(/Enforced on cross-project reads/);
+    // W4-G: the notice names every enforcing read surface (each is pinned
+    // by tests/test_v02102_w4g_node_access_all_surfaces.py).
+    expect(NODE_ACCESS_ENFORCED_NOTICE).toMatch(/MCP search/);
+    expect(NODE_ACCESS_ENFORCED_NOTICE).toMatch(/kg-search \/ kg-info CLIs/);
+    expect(NODE_ACCESS_ENFORCED_NOTICE).toMatch(/hook context injection/);
+    expect(accessNoticeFor('node')).toBe(NODE_ACCESS_ENFORCED_NOTICE);
+    expect(accessNoticeFor('node-bulk')).toBe(NODE_ACCESS_ENFORCED_NOTICE);
     expect(accessNoticeFor('collection')).toBeNull();
   });
 });
 
 // Wiring: the components must actually call the helpers (a CallExpression
 // cannot be satisfied by a comment).
+function invokeCommandNames(file: string): Set<string> {
+  const src = readFileSync(resolve(here, file), 'utf8');
+  const ast = parse(src, { modern: true }) as unknown;
+  const out = new Set<string>();
+  const visit = (n: unknown): void => {
+    if (n === null || typeof n !== 'object') return;
+    if (Array.isArray(n)) return n.forEach(visit);
+    const o = n as Record<string, unknown>;
+    if (o.type === 'CallExpression') {
+      const c = o.callee as Record<string, unknown>;
+      if (c.type === 'Identifier' && c.name === 'invoke') {
+        const arg = (o.arguments as unknown[] | undefined)?.[0] as
+          Record<string, unknown> | undefined;
+        if (arg && arg.type === 'Literal' && typeof arg.value === 'string') {
+          out.add(String(arg.value));
+        }
+      }
+    }
+    for (const [k, v] of Object.entries(o)) if (k !== 'parent' && k !== 'loc') visit(v);
+  };
+  visit(ast);
+  return out;
+}
 const here = dirname(fileURLToPath(import.meta.url));
 function callNames(file: string): Set<string> {
   const src = readFileSync(resolve(here, file), 'utf8');
@@ -130,5 +157,13 @@ describe('wiring', () => {
   });
   it('the KG page feeds the notice to the access modal', () => {
     expect(callNames('../../routes/kg/+page.svelte').has('accessNoticeFor')).toBe(true);
+  });
+  // v0.2.102 S2: the per-node toggle still invokes the writer commands —
+  // the enforcement sentence must not have come unmoored from the control.
+  it('the node-access toggle still invokes the write commands', () => {
+    const cmds = invokeCommandNames('../../routes/kg/+page.svelte');
+    expect(cmds.has('kg_set_node_access_bulk')).toBe(true);
+    expect(cmds.has('kg_set_node_access')).toBe(true);
+    expect(cmds.has('kg_ensure_node_access_schema')).toBe(true);
   });
 });

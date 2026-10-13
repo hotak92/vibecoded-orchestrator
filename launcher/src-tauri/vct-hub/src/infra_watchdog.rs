@@ -56,11 +56,11 @@
 //!      this" signal a deliberate stop drops so the watchdog backs off; a
 //!      RAW external stop with no marker DOES get restarted (that is the
 //!      desired self-healing behavior), AND
-//!   4. the service is actually PART of this install — the GPU-only
-//!      `code_embed` service legitimately does not exist on a CPU-only /
-//!      `CODE_EMBED_BACKEND=ollama` host (`profiles: [gpu]` in the compose
-//!      file), so the watchdog must never try to build/start it there (see
-//!      [`code_embed_in_stack`]), AND
+//!   4. the service is actually PART of this install — the CodeSage-only
+//!      `code_embed` service legitimately does not exist where no code graph
+//!      uses CodeSage or there is no GPU (install's `CODE_EMBED_IN_STACK`
+//!      marker; `profiles: [gpu]` in the compose file), so the watchdog must
+//!      never try to build/start it there (see [`code_embed_in_stack`]), AND
 //!   5. the service has not exhausted its crash-loop budget
 //!      (see [`Backoff`]).
 //!
@@ -74,7 +74,18 @@
 //! (`vct_launcher_core::services::container_ownership`) and:
 //!   * starts (or unpauses) an existing container BY NAME only when it is
 //!     VCO's (`Owned`); never composes against it, never removes it;
-//!   * leaves a `Foreign` one alone (log + `watchdog_foreign_container`);
+//!   * leaves a `Foreign` one alone (log + `watchdog_foreign_container`) —
+//!     BY DESIGN this includes a container labelled with a LEGACY VCO compose
+//!     project (an older install's `claude_mcp_servers` home, say): the
+//!     watchdog never heals it, `python install.py --update` is what takes
+//!     such a container over, through its compose-identity guard (v0.2.102
+//!     NB-R6, recorded — no behaviour change);
+//!   * leaves a container a project DECLARED unmanaged alone before any
+//!     probe (v0.2.102 W5-A / M3 — `project_infra_declarations`, the
+//!     launcher's Identity tab): the explicit form of "not VCO's", for a
+//!     project that runs its own Weaviate / Ollama. Declared → untouched
+//!     (no inspect, no start, no create); an unreadable declaration list
+//!     heals nothing that tick ([`HealOutcome::Unmanaged`]);
 //!   * skips the tick when ownership or state cannot be read, or when only
 //!     podman's storage holds the name;
 //!   * composes ONLY a name that exists in neither `inspect` nor
@@ -93,9 +104,13 @@
 //! consecutive-failure counter. The wait between restart ATTEMPTS grows
 //! exponentially (45s → 90s → 180s → … capped at ~30 min, see
 //! [`backoff_delay_secs`]); after [`MAX_CONSECUTIVE_FAILURES`] failed
-//! restarts in a row the watchdog GIVES UP on that service and logs a
-//! single clear error (no infinite thrash). A successful restart resets
-//! the counter and clears the give-up state.
+//! restarts in a row the watchdog GIVES UP on that service, logs a single
+//! clear error (no infinite thrash) and — since v0.2.102 (P299-B3) — writes
+//! the `watchdog_gave_up` ledger row naming the service, the attempts, the
+//! last error and the remedy, so the give-up reaches the launcher's Updates
+//! page instead of only a log. A successful restart (or the service seen
+//! running again) resets the counter, clears the give-up state and resolves
+//! the row ([`record_gave_up`]).
 //!
 //! NOTE (NIT-7): because the watchdog gates attempts by counting fixed
 //! ticks (it does NOT sleep a variable amount), the backoff schedule is a
@@ -200,12 +215,11 @@ pub const CANONICAL_INFRA_SERVICES: [(&str, &str); 3] = [
     ("code_embed", "vco_code_embed"),
 ];
 
-/// The GPU-only service — gated behind `profiles: [gpu]` in the compose
-/// file. On a CPU-only / `CODE_EMBED_BACKEND=ollama` host the
-/// `vco_code_embed` container legitimately does NOT exist, and the
-/// watchdog must NEVER try to build/start it there (a stray `up code_embed`
-/// would trigger a multi-GB CodeSage image build on a CPU box). See
-/// [`code_embed_in_stack`].
+/// The CodeSage-only service — gated behind `profiles: [gpu]` in the
+/// compose file. Where no code graph uses CodeSage (or there is no GPU) the
+/// `vco_code_embed` container legitimately does NOT exist, and the watchdog
+/// must NEVER try to build/start it there (a stray `up code_embed` would
+/// trigger a multi-GB CodeSage image build). See [`code_embed_in_stack`].
 pub const GPU_ONLY_SERVICE: &str = "code_embed";
 
 /// app_state key (in launcher.db) that gates the LAUNCHER's own services
@@ -226,11 +240,11 @@ pub const APP_STATE_KEY_WATCHER_ENABLED: &str = "launcher.services_watcher_enabl
 pub const ENV_ORCHESTRATOR_ROOT: &str = "VCT_ORCHESTRATOR_ROOT";
 pub const ENV_INSTALL_ROOT: &str = "VCT_INSTALL_ROOT";
 
-/// Env override for `CODE_EMBED_BACKEND`. When `ollama` (case-insensitive)
-/// the CodeSage GPU service is NOT part of the stack — the host uses the
-/// Ollama CPU-embedding fallback and `vco_code_embed` is never built. Any
-/// other value (or unset) leaves the GPU-profile decision to the
-/// runtime/overlay signals (see [`code_embed_in_stack`]).
+/// Env `CODE_EMBED_BACKEND` — the pre-v0.2.102 stack signal, consulted only
+/// when `infrastructure/.env` carries no `CODE_EMBED_IN_STACK` marker. When
+/// `ollama` (case-insensitive) the CodeSage service is NOT part of the stack:
+/// the host's code models are served by Ollama (where jina / qwen3 run — not
+/// a fallback). See [`code_embed_in_stack`].
 pub const ENV_CODE_EMBED_BACKEND: &str = "CODE_EMBED_BACKEND";
 
 // ─── Configuration ──────────────────────────────────────────────────────
@@ -355,6 +369,9 @@ pub enum HealOutcome {
     Skipped(String),
     /// Already running when looked at (a race with another starter).
     AlreadyRunning,
+    /// A project declared this container unmanaged (v0.2.102 M3) — left
+    /// alone before any runtime call: no inspect, no start, no create.
+    Unmanaged(String),
 }
 
 /// Heal ONE stopped/missing service container (AD-5):
@@ -367,11 +384,16 @@ pub enum HealOutcome {
 /// * the name exists in neither `inspect` nor `ps -a --external` → `create`
 ///   (the guarded compose path) — the only compose the watchdog runs;
 /// * after any action, [`verify_running`] decides.
+///
+/// `declared_unmanaged` is the reason when a project declared `container`
+/// unmanaged ([`declared_unmanaged_why`]): the outcome is then
+/// [`HealOutcome::Unmanaged`] and the runtime is never called.
 pub async fn heal_service<R, C, Fut>(
     runner: &R,
     row: Option<&ServiceEndpointRow>,
     container: &str,
     installer_project: Option<&str>,
+    declared_unmanaged: Option<&str>,
     create: C,
     policy: VerifyPolicy,
 ) -> HealOutcome
@@ -380,6 +402,9 @@ where
     C: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
+    if let Some(why) = declared_unmanaged {
+        return HealOutcome::Unmanaged(why.to_string());
+    }
     let identity = read_identity(runner, container).await;
     let action: &'static str = match &identity.state {
         ContainerState::Running => return HealOutcome::AlreadyRunning,
@@ -515,47 +540,158 @@ pub fn pause_marker_path(service: &str) -> PathBuf {
     watchdog_pause::pause_marker_path(service)
 }
 
-// ─── code_embed (GPU-only) stack-membership gate (BLOCKER-2) ─────────────
+// ─── code_embed stack-membership gate (BLOCKER-2; v0.2.102 W6-B2) ────────
+
+/// The marker install / service adoption write to `infrastructure/.env`
+/// (`vco_lib.compose_env.compose_substitution_env`, decided by
+/// `vco_lib.code_embed_serving.code_embed_in_stack`): `true` when the
+/// code_embed container is part of THIS install.
+pub const INFRA_ENV_CODE_EMBED_IN_STACK: &str = "CODE_EMBED_IN_STACK";
 
 /// Should the watchdog supervise `code_embed` on THIS host?
 ///
-/// `code_embed` (the CodeSage GPU embedding service) is gated behind
-/// `profiles: [gpu]` in `infrastructure/docker-compose.yml`. On a CPU-only
-/// or `CODE_EMBED_BACKEND=ollama` host the `vco_code_embed` container
-/// legitimately does NOT exist — the host uses the Ollama CPU-embedding
-/// fallback. A blind `compose up code_embed` there would (a) try to BUILD
-/// the multi-GB CodeSage image on a CPU box and (b) fail / waste resources.
-/// So the watchdog must only target `code_embed` when the install actually
-/// includes it.
+/// The `code_embed` container serves ONE model: CodeSage (its `gpu`
+/// backend). Serving follows the model (owner rule 2026-10-10): jina / qwen3
+/// code graphs are embedded by Ollama — where those models are served, not a
+/// fallback — and OpenAI ones by OpenAI, so on a host where no code graph
+/// uses CodeSage (or with no GPU) the `vco_code_embed` container legitimately
+/// does not exist, and a blind `compose up code_embed` there would build the
+/// multi-GB CodeSage image for nothing.
 ///
-/// Resolution (any one ⇒ excluded):
-///   1. `CODE_EMBED_BACKEND=ollama` (case-insensitive) — explicit CPU
-///      fallback. This is the authoritative "not in stack" signal install.py
-///      writes to `.env` on a CPU-only host.
-///
-/// Otherwise: included. We deliberately DEFAULT-INCLUDE when the backend is
-/// unset / `gpu`, because the restart path is the GPU-aware wrapper which
-/// itself probes for NVIDIA + CDI and degrades to a CPU-only `up -d` WITHOUT
-/// the gpu profile when no GPU is present — i.e. on a GPU-less host the
-/// wrapper never enables the gpu profile, so `code_embed` is never built
-/// even if we "target" it. The hard exclusion above is the belt; the
-/// wrapper's own GPU probe is the suspenders. The container-probe also
-/// returns `false` for a never-created `vco_code_embed`, but step 1 stops us
-/// BEFORE we ever issue a build on an explicitly-CPU host.
-pub fn code_embed_in_stack() -> bool {
-    // Excluded iff CODE_EMBED_BACKEND is explicitly `ollama`
-    // (case-insensitive, trimmed). Unset / `gpu` / anything else → included.
+/// Resolution — the SAME decision install / compose make (A>B>C: one Python
+/// home, its projected value read here, never re-derived):
+///   1. `CODE_EMBED_IN_STACK` in `<infra_dir>/.env` — `true` / `false`
+///      (case-insensitive; `1` / `0` accepted) is authoritative.
+///   2. Absent (an install from before v0.2.102): the pre-W6-B2 rule —
+///      excluded iff the process env's `CODE_EMBED_BACKEND` is `ollama`,
+///      otherwise included (the restart path is the GPU-aware wrapper, which
+///      never enables the gpu profile on a GPU-less host).
+pub fn code_embed_in_stack(infra_dir: Option<&Path>) -> bool {
+    if let Some(dir) = infra_dir {
+        if let Ok(Some(v)) = vct_launcher_core::services::env_file::read_key(
+            &dir.join(".env"),
+            INFRA_ENV_CODE_EMBED_IN_STACK,
+        ) {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => return true,
+                "false" | "0" => return false,
+                _ => {}
+            }
+        }
+    }
     !std::env::var(ENV_CODE_EMBED_BACKEND)
         .map(|v| v.trim().eq_ignore_ascii_case("ollama"))
         .unwrap_or(false)
 }
 
+// ─── code_embed marker refresh on a selection change (W6-B2 last round) ───
+
+/// The launcher.db selection inputs the last refresh ran for (`None` = never
+/// ran, or the last run failed — retried next tick).
+static LAST_CODE_MODEL_INPUTS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Per-tick budget for the Python refresh.
+const CODE_EMBED_MARKER_REFRESH_TIMEOUT_SECS: u64 = 60;
+
+/// Run `refresh` when `inputs` differ from the last successful run (and on
+/// the first tick, which reconciles a marker written by an older install).
+/// `refresh` returns whether it succeeded; a failure forgets the inputs so
+/// the next tick retries. Returns whether `refresh` ran. Injectable so the
+/// select → marker → supervise chain is provable without a Python or a
+/// runtime.
+pub async fn refresh_code_embed_marker_if_changed<F, Fut>(
+    last: &std::sync::Mutex<Option<String>>,
+    inputs: Option<String>,
+    refresh: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let Some(inputs) = inputs else { return false };
+    {
+        let g = last.lock().unwrap_or_else(|p| p.into_inner());
+        if g.as_deref() == Some(inputs.as_str()) {
+            return false;
+        }
+    }
+    let ok = refresh().await;
+    let mut g = last.lock().unwrap_or_else(|p| p.into_inner());
+    *g = if ok { Some(inputs) } else { None };
+    true
+}
+
+/// The ONE decision lives in Python (`vco_lib.compose_env
+/// refresh-code-embed-marker`, the same `code_embed_in_stack` install and the
+/// session plan use); this only runs it. Selecting CodeSage on a GPU host
+/// whose install runs no container turns the marker on and the tick below
+/// creates the container; deselecting turns it off and the tick stops
+/// supervising it (the container and its volumes are never touched).
+async fn run_code_embed_marker_refresh(infra_dir: &Path) -> bool {
+    let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib() else {
+        tracing::debug!("[vct-hub] infra watchdog: no Python for the code_embed marker refresh");
+        return false;
+    };
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.compose_env")
+        .arg("refresh-code-embed-marker")
+        .arg("--infra-dir")
+        .arg(infra_dir.as_os_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(root) = infra_dir.parent() {
+        cmd.current_dir(root);
+    }
+    match tokio::time::timeout(
+        Duration::from_secs(CODE_EMBED_MARKER_REFRESH_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) if out.status.success() => {
+            let line = String::from_utf8_lossy(&out.stdout);
+            if line.contains("\"changed\": true") {
+                tracing::info!(
+                    "[vct-hub] infra watchdog: code-model selection changed — code_embed marker refreshed: {}",
+                    line.trim()
+                );
+            }
+            true
+        }
+        Ok(Ok(out)) => {
+            tracing::warn!(
+                "[vct-hub] infra watchdog: code_embed marker refresh failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("[vct-hub] infra watchdog: cannot run the code_embed marker refresh: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("[vct-hub] infra watchdog: code_embed marker refresh timed out");
+            false
+        }
+    }
+}
+
+/// The selection fingerprint: launcher.db's inputs plus the hub's own
+/// `CODE_EMBED_MODEL` override (also read by the decision).
+fn code_model_inputs(db: &LauncherDbHandle) -> Option<String> {
+    let fp = db.0.code_model_inputs_fingerprint().ok()?;
+    Some(format!("{fp}|env={}", std::env::var("CODE_EMBED_MODEL").unwrap_or_default()))
+}
+
 /// True when `service` should be supervised on this host. Always true for
-/// `weaviate` / `ollama`; for the GPU-only `code_embed` it defers to
-/// [`code_embed_in_stack`].
-pub fn service_in_stack(service: &str) -> bool {
+/// `weaviate` / `ollama`; for `code_embed` it defers to
+/// [`code_embed_in_stack`] (with the compose dir whose `.env` carries the
+/// marker).
+pub fn service_in_stack(service: &str, infra_dir: Option<&Path>) -> bool {
     if service == GPU_ONLY_SERVICE {
-        code_embed_in_stack()
+        code_embed_in_stack(infra_dir)
     } else {
         true
     }
@@ -928,6 +1064,150 @@ fn record_foreign(root: &Path, now: &BTreeMap<String, String>) {
     }
 }
 
+/// Why `container` must be left alone this tick, from the machine-wide
+/// declarations ([`Db::unmanaged_container_reasons`]): `Some(reason)` when a
+/// project declared it, or when the declarations could not be read (an
+/// unreadable "do not touch" list is not an empty one); `None` → VCO's to heal.
+pub fn declared_unmanaged_why(
+    declared: &Result<BTreeMap<String, String>, String>,
+    container: &str,
+) -> Option<String> {
+    match declared {
+        Ok(map) => map.get(container).cloned(),
+        Err(e) => Some(format!(
+            "the project infrastructure declarations could not be read ({e}), so whether a \
+             project declared it unmanaged is unknown"
+        )),
+    }
+}
+
+/// One service the watchdog has given up on (v0.2.102 P299-B3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GaveUp {
+    pub container: String,
+    pub attempts: u32,
+    pub last_error: String,
+}
+
+/// Fold one heal outcome into the per-service crash-loop state and the
+/// given-up set. Pure (no I/O) — the tick's bookkeeping, extracted so the
+/// give-up surface is testable with an injectable runner. Returns `true`
+/// when this outcome made the service cross into "given up".
+pub fn apply_heal_outcome(
+    service: &str,
+    container: &str,
+    outcome: &HealOutcome,
+    backoff: &mut Backoff,
+    gave_up: &mut BTreeMap<String, GaveUp>,
+) -> bool {
+    match outcome {
+        HealOutcome::Verified { .. } | HealOutcome::AlreadyRunning => {
+            backoff.reset_on_success();
+            gave_up.remove(service);
+            false
+        }
+        HealOutcome::Failed(e) => {
+            let was = backoff.is_given_up();
+            backoff.record_failure();
+            if backoff.is_given_up() {
+                gave_up.insert(
+                    service.to_string(),
+                    GaveUp {
+                        container: container.to_string(),
+                        attempts: backoff.consecutive_failures,
+                        last_error: e.clone(),
+                    },
+                );
+            }
+            !was && backoff.is_given_up()
+        }
+        HealOutcome::Foreign(_) | HealOutcome::Skipped(_) | HealOutcome::Unmanaged(_) => false,
+    }
+}
+
+/// The give-up record the watchdog keeps true (the [`ForeignLedger`] shape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GaveUpLedger {
+    Unchanged,
+    Emit { detected: String, command: String },
+    Resolve,
+}
+
+/// Pure: compare this tick's given-up set with the last recorded one.
+/// `prev = None` (hub just started) with an empty set resolves once, so a
+/// row left by a previous hub run does not outlive the condition.
+pub fn gave_up_ledger_change(
+    prev: Option<&BTreeMap<String, GaveUp>>,
+    now: &BTreeMap<String, GaveUp>,
+) -> GaveUpLedger {
+    if prev == Some(now) {
+        return GaveUpLedger::Unchanged;
+    }
+    if now.is_empty() {
+        return GaveUpLedger::Resolve;
+    }
+    let detected = now
+        .iter()
+        .map(|(svc, g)| {
+            format!(
+                "{svc} ('{}'): gave up after {} failed heal attempt(s); last error: {}",
+                g.container, g.attempts, g.last_error
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut command = String::from(
+        "# The hub stopped retrying. Look at why the container will not stay up:\n",
+    );
+    for (svc, g) in now {
+        command.push_str(&format!(
+            "#   {svc}: inspect `{}` (its logs: `<docker|podman> logs {}`), fix the cause, then start it.\n",
+            g.container, g.container
+        ));
+    }
+    command.push_str(
+        "# Or re-run the guarded bring-up: python install.py --update\n\
+         # This entry clears itself once the service is seen running (any start, by anyone).\n\
+         # To stop the hub supervising a service you stopped on purpose, use the launcher's\n\
+         # Services page Stop (it drops the watchdog pause marker).",
+    );
+    GaveUpLedger::Emit { detected, command }
+}
+
+/// The last given-up set written to the ledger (this hub process).
+static LAST_GAVE_UP: std::sync::Mutex<Option<BTreeMap<String, GaveUp>>> = std::sync::Mutex::new(None);
+
+/// Keep `watchdog_gave_up` true for `root` (paired-resolution: this is the
+/// site its registry row names). Best-effort.
+fn record_gave_up(root: &Path, now: &BTreeMap<String, GaveUp>) {
+    let mut last = LAST_GAVE_UP.lock().unwrap_or_else(|p| p.into_inner());
+    let change = gave_up_ledger_change(last.as_ref(), now);
+    let result = match &change {
+        GaveUpLedger::Unchanged => return,
+        GaveUpLedger::Resolve => deferral_bridge::resolve_deferral_conditions(root, root, &["watchdog_gave_up"]),
+        GaveUpLedger::Emit { detected, command } => deferral_bridge::emit_deferral_entry(
+            root,
+            root,
+            &deferral_bridge::DeferralEntryFields {
+                condition_id: "watchdog_gave_up",
+                title: "The hub watchdog gave up restarting a VCO service",
+                detected,
+                why_deferred: "Repeated heals of a VCO-managed service failed (each one verified \
+                               not running afterwards), so the watchdog stopped retrying rather \
+                               than thrash the runtime. Something keeps the container from \
+                               staying up — an image, a port, memory, a broken compose file — \
+                               and only a look at its logs says which.",
+                command_to_apply: command,
+                severity: "warning",
+            },
+        ),
+    };
+    match result {
+        Ok(()) => *last = Some(now.clone()),
+        Err(e) => tracing::warn!("[vct-hub] infra watchdog: watchdog_gave_up record not updated: {}", e),
+    }
+}
+
 // ─── Spawn + tick loop ───────────────────────────────────────────────────
 
 /// Spawn the infra watchdog as a detached `tokio` task. Called once from
@@ -995,6 +1275,9 @@ async fn run_watchdog_loop(db: LauncherDbHandle, config: WatchdogConfig) {
     // variable amounts. `attempts_since_wait[svc]` counts ticks elapsed
     // since the last restart attempt for that service.
     let mut ticks_since_attempt: HashMap<String, u64> = HashMap::new();
+    // v0.2.102 P299-B3: services given up on, kept across ticks so the
+    // `watchdog_gave_up` row stays true until each one is seen running.
+    let mut gave_up: BTreeMap<String, GaveUp> = BTreeMap::new();
 
     let base = config.interval.as_secs().max(1);
 
@@ -1018,7 +1301,7 @@ async fn run_watchdog_loop(db: LauncherDbHandle, config: WatchdogConfig) {
         // `detect_runtime_detailed()` is already non-panicking. The result is that the watchdog upholds
         // its "never crashes the hub" contract: a single bad tick logs and
         // the next tick tries again.
-        run_one_tick(&db, base, &mut backoffs, &mut ticks_since_attempt).await;
+        run_one_tick(&db, base, &mut backoffs, &mut ticks_since_attempt, &mut gave_up).await;
     }
 }
 
@@ -1059,6 +1342,7 @@ async fn run_one_tick(
     base: u64,
     backoffs: &mut HashMap<String, Backoff>,
     ticks_since_attempt: &mut HashMap<String, u64>,
+    gave_up: &mut BTreeMap<String, GaveUp>,
 ) {
     // Resolve the runtime once per tick (cached after first detect).
     let detection = detect_runtime_detailed().await;
@@ -1090,12 +1374,22 @@ async fn run_one_tick(
         }
     };
 
+    // W6-B2 last round: a code-model selection change recomputes the
+    // code_embed marker BEFORE the stack gate below reads it.
+    refresh_code_embed_marker_if_changed(&LAST_CODE_MODEL_INPUTS, code_model_inputs(db), || {
+        run_code_embed_marker_refresh(&infra_dir)
+    })
+    .await;
+
     let runner = RuntimeRunner {
         binary: runtime.binary_path.clone(),
         runtime: runtime.runtime.binary().to_string(),
     };
     let installer_project = installer_compose_project(&infra_dir);
     let mut foreign: BTreeMap<String, String> = BTreeMap::new();
+    // v0.2.102 W5-A (M3): what projects declared unmanaged, read once per
+    // tick (poison-tolerant). An Err keeps every service hands-off this tick.
+    let declared = db.0.unmanaged_container_reasons();
 
     for (service, default_container) in CANONICAL_INFRA_SERVICES.iter() {
         let service = *service;
@@ -1104,16 +1398,35 @@ async fn run_one_tick(
         // alone BEFORE any probe — its owner's stop is respected.
         let supervision = supervision_for(&db.0, service, default_container);
         if !supervision.compose_managed {
+            // No longer VCO's to supervise: a give-up about it is over.
+            gave_up.remove(service);
             continue;
         }
         let container = supervision.container.as_str();
 
+        // v0.2.102 W5-A (M3): a declared-unmanaged container is left alone
+        // BEFORE any probe — not even an inspect.
+        if let Some(why) = declared_unmanaged_why(&declared, container) {
+            if first_time(&format!("watchdog-unmanaged:{service}:{why}")) {
+                tracing::info!(
+                    service,
+                    container,
+                    why = %why,
+                    "[vct-hub] infra watchdog: NOT supervising a container a project declared \
+                     unmanaged (no inspect, no start, no create)."
+                );
+            }
+            gave_up.remove(service);
+            continue;
+        }
+
         // BLOCKER-2 gate: don't supervise a service that isn't part of THIS
-        // install. The GPU-only `code_embed` legitimately doesn't exist on a
-        // CPU-only / `CODE_EMBED_BACKEND=ollama` host; targeting it there
-        // would trigger a multi-GB image build. (Quiet — normal on CPU
-        // hosts.)
-        if !service_in_stack(service) {
+        // install. `code_embed` (CodeSage only) legitimately doesn't exist
+        // where no code graph uses CodeSage or there is no GPU — the
+        // install's `CODE_EMBED_IN_STACK` marker says so; targeting it there
+        // would trigger a multi-GB image build. (Quiet — normal there.)
+        if !service_in_stack(service, Some(infra_dir.as_path())) {
+            gave_up.remove(service);
             continue;
         }
 
@@ -1125,12 +1438,14 @@ async fn run_one_tick(
         match probe {
             ContainerProbe::Running => {
                 // Observing the service UP resets its crash-loop state
-                // (covers external recovery: a user / hook restarted it).
+                // (covers external recovery: a user / hook restarted it)
+                // and clears its give-up record (P299-B3).
                 if let Some(b) = backoffs.get_mut(service) {
                     if b.consecutive_failures > 0 || b.gave_up {
                         b.reset_on_success();
                     }
                 }
+                gave_up.remove(service);
                 ticks_since_attempt.remove(service);
                 continue;
             }
@@ -1148,7 +1463,9 @@ async fn run_one_tick(
 
         // `running == false` here (authoritative NotRunning above).
         if !service_eligible_for_restart(false, supervision.compose_managed, paused) {
-            // Down, but deliberately paused. Leave it alone.
+            // Down, but deliberately paused. Leave it alone — and a give-up
+            // about it is over: the user stopped it on purpose.
+            gave_up.remove(service);
             continue;
         }
 
@@ -1188,10 +1505,13 @@ async fn run_one_tick(
             supervision.row.as_ref(),
             container,
             installer_project.as_deref(),
+            None, // declared-unmanaged containers were skipped above
             || create_missing(&runtime, &infra_dir, service),
             VerifyPolicy::default(),
         )
         .await;
+        // Counter, give-up flag and the given-up set (P299-B3) — one pure fold.
+        let crossed = apply_heal_outcome(service, container, &outcome, backoff, gave_up);
         match outcome {
             HealOutcome::Verified { action } => {
                 tracing::info!(
@@ -1200,13 +1520,12 @@ async fn run_one_tick(
                     action,
                     "[vct-hub] infra watchdog: verified running."
                 );
-                backoff.reset_on_success();
                 ticks_since_attempt.remove(service);
             }
             HealOutcome::AlreadyRunning => {
-                backoff.reset_on_success();
                 ticks_since_attempt.remove(service);
             }
+            HealOutcome::Unmanaged(_) => {}
             HealOutcome::Foreign(why) => {
                 if first_time(&format!("watchdog-foreign:{service}:{why}")) {
                     tracing::warn!(
@@ -1228,8 +1547,7 @@ async fn run_one_tick(
                 );
             }
             HealOutcome::Failed(e) => {
-                backoff.record_failure();
-                if backoff.is_given_up() {
+                if crossed {
                     tracing::error!(
                         service,
                         container,
@@ -1239,7 +1557,8 @@ async fn run_one_tick(
                         "[vct-hub] infra watchdog: GIVING UP after repeated failed \
                          heals. The hub will NOT retry until the service is seen \
                          running again (start it manually, or `touch` the pause \
-                         marker to silence the watchdog for it)."
+                         marker to silence the watchdog for it); recorded as \
+                         watchdog_gave_up."
                     );
                 } else {
                     tracing::warn!(
@@ -1258,12 +1577,18 @@ async fn run_one_tick(
         }
     }
     if let Some(root) = infra_dir.parent() {
-        // The record spawns a bounded Python payload (W4R-05): off the
+        // The records spawn a bounded Python payload (W4R-05): off the
         // runtime's workers, so a slow interpreter never parks the tick's
         // thread — and never longer than the payload's bound.
         let root = root.to_path_buf();
-        if let Err(e) = tokio::task::spawn_blocking(move || record_foreign(&root, &foreign)).await {
-            tracing::warn!("[vct-hub] infra watchdog: foreign-container record task failed: {}", e);
+        let gave_up_now = gave_up.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            record_foreign(&root, &foreign);
+            record_gave_up(&root, &gave_up_now);
+        })
+        .await
+        {
+            tracing::warn!("[vct-hub] infra watchdog: ledger record task failed: {}", e);
         }
     }
 }
@@ -1705,21 +2030,21 @@ mod tests {
         assert_eq!(classify_probe(true, "weird-state", ""), ContainerProbe::ProbeError);
     }
 
-    // ----- BLOCKER-2: code_embed (GPU-only) stack-membership gate -----
+    // ----- BLOCKER-2 / W6-B2: code_embed stack-membership gate -----
 
     #[test]
     #[serial_test::serial]
     fn code_embed_excluded_when_backend_is_ollama() {
         let _env_lock = vct_launcher_core::test_env::env_lock();
         let prev = std::env::var_os(ENV_CODE_EMBED_BACKEND);
-        // Explicit CPU fallback → code_embed not in stack.
+        // No marker (a pre-v0.2.102 install) → the env rule.
         for v in ["ollama", "OLLAMA", " Ollama "] {
             std::env::set_var(ENV_CODE_EMBED_BACKEND, v);
-            assert!(!code_embed_in_stack(), "backend={:?} must exclude code_embed", v);
-            assert!(!service_in_stack("code_embed"));
+            assert!(!code_embed_in_stack(None), "backend={:?} must exclude code_embed", v);
+            assert!(!service_in_stack("code_embed", None));
             // weaviate / ollama are always in stack regardless.
-            assert!(service_in_stack("weaviate"));
-            assert!(service_in_stack("ollama"));
+            assert!(service_in_stack("weaviate", None));
+            assert!(service_in_stack("ollama", None));
         }
         match prev {
             Some(p) => std::env::set_var(ENV_CODE_EMBED_BACKEND, p),
@@ -1733,10 +2058,43 @@ mod tests {
         let _env_lock = vct_launcher_core::test_env::env_lock();
         let prev = std::env::var_os(ENV_CODE_EMBED_BACKEND);
         std::env::remove_var(ENV_CODE_EMBED_BACKEND);
-        assert!(code_embed_in_stack(), "unset backend defaults to in-stack");
-        assert!(service_in_stack("code_embed"));
+        assert!(code_embed_in_stack(None), "unset backend defaults to in-stack");
+        assert!(service_in_stack("code_embed", None));
         std::env::set_var(ENV_CODE_EMBED_BACKEND, "gpu");
-        assert!(code_embed_in_stack(), "gpu backend keeps code_embed in stack");
+        assert!(code_embed_in_stack(None), "gpu backend keeps code_embed in stack");
+        match prev {
+            Some(p) => std::env::set_var(ENV_CODE_EMBED_BACKEND, p),
+            None => std::env::remove_var(ENV_CODE_EMBED_BACKEND),
+        }
+    }
+
+    /// W6-B2: the install's marker decides, per host class — the SAME
+    /// decision `vco_lib.code_embed_serving.code_embed_in_stack` makes for
+    /// install / compose. A marker beats the process env both ways.
+    #[test]
+    #[serial_test::serial]
+    fn code_embed_follows_the_install_marker_per_host_class() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let prev = std::env::var_os(ENV_CODE_EMBED_BACKEND);
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        // NVIDIA >= 12 GB, CodeSage selected → in stack (even with a stale
+        // `ollama` backend in the process env).
+        std::env::set_var(ENV_CODE_EMBED_BACKEND, "ollama");
+        std::fs::write(&env_file, "CODE_EMBED_BACKEND=gpu\nCODE_EMBED_IN_STACK=true\n").unwrap();
+        assert!(code_embed_in_stack(Some(dir.path())));
+        // GPU host whose code graphs use jina / qwen3 (served by Ollama), and
+        // a CPU-only host → not in stack, even with an unset / `gpu` env.
+        std::env::remove_var(ENV_CODE_EMBED_BACKEND);
+        for marker in ["false", "FALSE", "0"] {
+            std::fs::write(&env_file, format!("CODE_EMBED_IN_STACK={marker}\n")).unwrap();
+            assert!(!code_embed_in_stack(Some(dir.path())), "marker={marker}");
+            assert!(!service_in_stack("code_embed", Some(dir.path())));
+            assert!(service_in_stack("ollama", Some(dir.path())));
+        }
+        // Unreadable / unrecognised marker → the legacy env rule.
+        std::fs::write(&env_file, "CODE_EMBED_IN_STACK=maybe\n").unwrap();
+        assert!(code_embed_in_stack(Some(dir.path())));
         match prev {
             Some(p) => std::env::set_var(ENV_CODE_EMBED_BACKEND, p),
             None => std::env::remove_var(ENV_CODE_EMBED_BACKEND),
@@ -1879,7 +2237,7 @@ mod tests {
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("vibecoded"))));
         let row = managed_row("code_embed");
         let composed = std::cell::Cell::new(false);
-        let out = heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), || {
+        let out = heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), None, || {
             composed.set(true);
             async { Ok(()) }
         }, QUICK)
@@ -1907,7 +2265,7 @@ mod tests {
         r.on("inspect", fail("Error: no such container vco_code_embed"));
         r.on("ps", ok("[]"));
         let row = managed_row("code_embed");
-        let out = heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), || async { Ok(()) }, QUICK).await;
+        let out = heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), None, || async { Ok(()) }, QUICK).await;
         assert!(matches!(&out, HealOutcome::Failed(e) if e.contains("not running")), "{out:?}");
         let mut b = Backoff::default();
         if let HealOutcome::Failed(_) = out {
@@ -1925,7 +2283,7 @@ mod tests {
         r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
         r.on("start", ok(""));
         let row = managed_row("ollama");
-        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), || async {
+        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), None, || async {
             panic!("an existing container is never composed")
         }, QUICK)
         .await;
@@ -1944,7 +2302,7 @@ mod tests {
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
         r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
         r.on("start", ok(""));
-        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), || async {
+        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), None, || async {
             panic!("an existing container is never composed")
         }, QUICK)
         .await;
@@ -1952,7 +2310,7 @@ mod tests {
 
         let r = FakeRunner::new("podman");
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("vibecoded"))));
-        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), || async {
+        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), None, || async {
             panic!("never composed")
         }, QUICK)
         .await;
@@ -1968,7 +2326,7 @@ mod tests {
         r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
         r.on("unpause", ok(""));
         let row = managed_row("weaviate");
-        let out = heal_service(&r, Some(&row), "vco_weaviate", Some("infrastructure"), || async {
+        let out = heal_service(&r, Some(&row), "vco_weaviate", Some("infrastructure"), None, || async {
             panic!("never composed")
         }, QUICK)
         .await;
@@ -1983,7 +2341,7 @@ mod tests {
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
         r.on("start", ok(""));
         let row = managed_row("ollama");
-        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), || async { Ok(()) }, QUICK).await;
+        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), None, || async { Ok(()) }, QUICK).await;
         assert!(matches!(out, HealOutcome::Failed(_)), "{out:?}");
     }
 
@@ -1996,14 +2354,187 @@ mod tests {
         let r = FakeRunner::new("podman");
         r.on("inspect", fail("Error: no such container vco_code_embed"));
         r.on("ps", ok(r#"[{"Names":["vco_code_embed"],"State":"storage"}]"#));
-        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), never, QUICK).await, HealOutcome::Skipped(_)));
+        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), None, never, QUICK).await, HealOutcome::Skipped(_)));
         let r = FakeRunner::new("podman");
         r.on("inspect", fail("Error: cannot connect to podman socket"));
-        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), never, QUICK).await, HealOutcome::Skipped(_)));
+        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), None, never, QUICK).await, HealOutcome::Skipped(_)));
         let r = FakeRunner::new("podman");
         r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
-        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", None, never, QUICK).await, HealOutcome::Skipped(_)));
+        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", None, None, never, QUICK).await, HealOutcome::Skipped(_)));
         assert_eq!(r.verbs(), vec!["inspect"]);
+    }
+
+    // ----- v0.2.102 W6-B2 last round: selection → marker → supervision -----
+
+    /// Selecting CodeSage on a GPU host whose install runs no container: the
+    /// changed selection inputs run the refresh (here a stand-in writing the
+    /// marker the Python decision would), the stack gate then admits
+    /// code_embed, and the heal path CREATES the missing container.
+    /// Deselecting drops the marker → not supervised. Unchanged inputs →
+    /// no refresh at all.
+    #[tokio::test]
+    async fn a_codesage_selection_brings_the_container_up_and_deselecting_stops_supervising_it() {
+        let last = std::sync::Mutex::new(None);
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        std::fs::write(&env_file, "CODE_EMBED_HOST_GPU=true\nCODE_EMBED_IN_STACK=false\n").unwrap();
+        assert!(!code_embed_in_stack(Some(dir.path())), "no container before the selection");
+
+        // Select CodeSage → the inputs change → the refresh turns the marker on.
+        let ran = refresh_code_embed_marker_if_changed(&last, Some("pin=codesage".into()), || async {
+            std::fs::write(&env_file, "CODE_EMBED_HOST_GPU=true\nCODE_EMBED_IN_STACK=true\n").unwrap();
+            true
+        })
+        .await;
+        assert!(ran);
+        assert!(service_in_stack("code_embed", Some(dir.path())));
+        // … and the tick's heal path creates the missing container.
+        let r = FakeRunner::new("podman");
+        r.on("inspect", fail("Error: no such container vco_code_embed"));
+        r.on("ps", ok("[]"));
+        r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+        let created = std::cell::Cell::new(false);
+        let out = heal_service(&r, Some(&managed_row("code_embed")), "vco_code_embed", Some("infrastructure"), None, || {
+            created.set(true);
+            async { Ok(()) }
+        }, QUICK)
+        .await;
+        assert!(created.get(), "the missing container is composed: {out:?}");
+        assert!(matches!(out, HealOutcome::Verified { .. }), "{out:?}");
+
+        // Same inputs next tick → no refresh run.
+        let again = refresh_code_embed_marker_if_changed(&last, Some("pin=codesage".into()), || async {
+            panic!("unchanged inputs must not re-run the refresh")
+        })
+        .await;
+        assert!(!again);
+
+        // Deselect → the marker drops → the stack gate excludes code_embed.
+        refresh_code_embed_marker_if_changed(&last, Some("pin=jina".into()), || async {
+            std::fs::write(&env_file, "CODE_EMBED_HOST_GPU=true\nCODE_EMBED_IN_STACK=false\n").unwrap();
+            true
+        })
+        .await;
+        assert!(!service_in_stack("code_embed", Some(dir.path())));
+    }
+
+    /// A failed refresh forgets the inputs, so the next tick retries.
+    #[tokio::test]
+    async fn a_failed_marker_refresh_is_retried_next_tick() {
+        let last = std::sync::Mutex::new(None);
+        assert!(refresh_code_embed_marker_if_changed(&last, Some("x".into()), || async { false }).await);
+        assert!(refresh_code_embed_marker_if_changed(&last, Some("x".into()), || async { true }).await);
+        assert!(!refresh_code_embed_marker_if_changed(&last, Some("x".into()), || async { true }).await);
+        assert!(!refresh_code_embed_marker_if_changed(&last, None, || async { true }).await);
+    }
+
+    // ----- v0.2.102 W5-A (M3): declared-unmanaged containers ------------
+
+    /// Declared → untouched: not one runtime call (no inspect, start or
+    /// create). Undeclared, the same stopped VCO container is started and
+    /// verified. Both runtimes.
+    #[tokio::test]
+    async fn a_declared_unmanaged_container_is_never_touched_and_an_undeclared_one_is_healed() {
+        for runtime in ["podman", "docker"] {
+            let mut declared = BTreeMap::new();
+            declared.insert("vco_ollama".to_string(), "declared unmanaged by project 'peer-project'".to_string());
+            let declared: Result<BTreeMap<String, String>, String> = Ok(declared);
+            let row = managed_row("ollama");
+
+            let r = FakeRunner::new(runtime);
+            let why = declared_unmanaged_why(&declared, "vco_ollama");
+            let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), why.as_deref(), || async {
+                panic!("a declared container is never created")
+            }, QUICK)
+            .await;
+            assert!(matches!(&out, HealOutcome::Unmanaged(w) if w.contains("peer-project")), "{runtime}: {out:?}");
+            assert!(r.verbs().is_empty(), "{runtime}: no runtime call at all, got {:?}", r.verbs());
+
+            let r = FakeRunner::new(runtime);
+            r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+            r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+            r.on("start", ok(""));
+            let why = declared_unmanaged_why(&declared, "vco_weaviate");
+            assert!(why.is_none());
+            let out = heal_service(&r, Some(&row), "vco_weaviate", Some("infrastructure"), why.as_deref(), || async {
+                panic!("an existing container is never composed")
+            }, QUICK)
+            .await;
+            assert_eq!(out, HealOutcome::Verified { action: "start" }, "{runtime}");
+        }
+    }
+
+    /// An unreadable declaration list keeps every container hands-off.
+    #[test]
+    fn unreadable_declarations_heal_nothing() {
+        let declared: Result<BTreeMap<String, String>, String> = Err("disk I/O error".into());
+        let why = declared_unmanaged_why(&declared, "vco_weaviate").expect("hands-off");
+        assert!(why.contains("could not be read"), "{why}");
+    }
+
+    // ----- v0.2.102 P299-B3: the give-up reaches the ledger -------------
+
+    /// A start that never sticks, MAX times in a row → the service crosses
+    /// into "given up" and the ledger change is an entry naming the service,
+    /// the attempts, the last error and a remedy. Then the leave-alone arm:
+    /// the service seen healthy again resolves it.
+    #[tokio::test]
+    async fn repeated_failed_heals_write_the_gave_up_entry_and_recovery_clears_it() {
+        let row = managed_row("ollama");
+        let mut backoff = Backoff::default();
+        let mut gave_up: BTreeMap<String, GaveUp> = BTreeMap::new();
+        let mut crossings = 0;
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            let r = FakeRunner::new("podman");
+            r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+            r.on("start", ok(""));
+            let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), None, || async { Ok(()) }, QUICK).await;
+            assert!(matches!(out, HealOutcome::Failed(_)), "{out:?}");
+            if apply_heal_outcome("ollama", "vco_ollama", &out, &mut backoff, &mut gave_up) {
+                crossings += 1;
+            }
+        }
+        assert_eq!(crossings, 1, "the crossing is reported exactly once");
+        let g = gave_up.get("ollama").expect("given up");
+        assert_eq!(g.attempts, MAX_CONSECUTIVE_FAILURES);
+        assert!(g.last_error.contains("not running"), "{g:?}");
+        match gave_up_ledger_change(None, &gave_up) {
+            GaveUpLedger::Emit { detected, command } => {
+                assert!(detected.contains("ollama") && detected.contains("vco_ollama"), "{detected}");
+                assert!(detected.contains(&format!("{} failed heal", MAX_CONSECUTIVE_FAILURES)), "{detected}");
+                assert!(command.contains("install.py --update"), "{command}");
+            }
+            other => panic!("expected an entry, got {other:?}"),
+        }
+        let recorded = gave_up.clone();
+        assert_eq!(gave_up_ledger_change(Some(&recorded), &gave_up), GaveUpLedger::Unchanged);
+
+        // Leave-alone arm: the next heal verifies → the record resolves.
+        let r = FakeRunner::new("docker");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+        r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+        r.on("start", ok(""));
+        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), None, || async { Ok(()) }, QUICK).await;
+        assert!(!apply_heal_outcome("ollama", "vco_ollama", &out, &mut backoff, &mut gave_up));
+        assert!(gave_up.is_empty() && !backoff.is_given_up());
+        assert_eq!(gave_up_ledger_change(Some(&recorded), &gave_up), GaveUpLedger::Resolve);
+    }
+
+    /// Below the budget nothing is written; skips / foreign / unmanaged never
+    /// count toward it.
+    #[test]
+    fn fewer_failures_and_non_failures_write_nothing() {
+        let mut backoff = Backoff::default();
+        let mut gave_up = BTreeMap::new();
+        for _ in 1..MAX_CONSECUTIVE_FAILURES {
+            apply_heal_outcome("weaviate", "vco_weaviate", &HealOutcome::Failed("x".into()), &mut backoff, &mut gave_up);
+        }
+        for o in [HealOutcome::Skipped("s".into()), HealOutcome::Foreign("f".into()), HealOutcome::Unmanaged("u".into())] {
+            apply_heal_outcome("weaviate", "vco_weaviate", &o, &mut backoff, &mut gave_up);
+        }
+        assert!(gave_up.is_empty());
+        assert_eq!(backoff.consecutive_failures, MAX_CONSECUTIVE_FAILURES - 1);
+        assert_eq!(gave_up_ledger_change(None, &gave_up), GaveUpLedger::Resolve);
     }
 
     #[test]

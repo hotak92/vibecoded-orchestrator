@@ -40,6 +40,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SH_HOOK = REPO_ROOT / "templates" / "hooks" / "lean-ctx-rewrite.sh"
@@ -93,6 +94,19 @@ def _make_fake_lean_ctx(bin_dir: Path) -> Path:
     return fake
 
 
+def _mark_project(cwd: Path) -> None:
+    """Stage ``cwd`` as a real VCO project.
+
+    The hook finds its project by the marked-root rule
+    (``_lib/project-root.sh`` — ``.claude/settings.json`` or ``.claude/env``;
+    v0.2.102 W6-W). An unmarked cwd is no project, and with no project there
+    is no private tee dir, so the hook correctly lets the command run raw.
+    These tests are about the wrapping decision, so the cwd is a project.
+    """
+    (cwd / ".claude").mkdir(parents=True, exist_ok=True)
+    (cwd / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+
+
 def _run_sh(cmd: str, *, cargo_bin: Path | None, strip_path: bool,
             fake_home: Path) -> subprocess.CompletedProcess:
     """Run the .sh hook. When cargo_bin is set, a fake lean-ctx is placed
@@ -108,7 +122,7 @@ def _run_sh(cmd: str, *, cargo_bin: Path | None, strip_path: bool,
         # A minimal PATH that still has bash/python but NOT the fake bindir.
         env["PATH"] = "/usr/bin:/bin"
     cwd = fake_home / "proj"
-    cwd.mkdir(parents=True, exist_ok=True)
+    _mark_project(cwd)
     return subprocess.run(
         ["bash", str(SH_HOOK)],
         input=_payload(cmd), capture_output=True, text=True,
@@ -334,9 +348,9 @@ class TestPs1Parity:
         if on_path:
             env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
         cwd = tmp_path / "proj"
-        cwd.mkdir(exist_ok=True)
+        _mark_project(cwd)
         return subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(PS1_HOOK)],
             input=_payload(cmd), capture_output=True, text=True,
             cwd=cwd, env=env, timeout=30,
         )

@@ -49,10 +49,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # The heal-owned tables. Mutations to these outside the single writer are the
 # regression we guard against. X-1 / v0.2.76 widened this to include
-# ``project_codegraph_bindings``: on the Python side that table has NO
-# legitimate writer today (the codegraph binding is analyzer/launcher-owned),
-# so the guard asserts Python NEVER mutates it. If a future Python codegraph-
-# binding writer is genuinely needed, add its module to the allowlist here.
+# ``project_codegraph_bindings``: the codegraph binding is launcher-owned
+# (Rust creates it); the ONE Python write is v0.2.102 W6-B2's model-record
+# stamp, ``kg_binding_heal.stamp_codegraph_model_record`` — inside the single
+# legal writer, so the guard still asserts no OTHER Python module mutates it.
 _HEAL_TABLES = (
     "project_kg_bindings",
     "kg_collection_access",

@@ -1,0 +1,39 @@
+{
+ "source": "broken.rb",
+ "reviewed": "W6-E 2026-10-10 (hand-written; full_name + methods scored)",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Holder",
+   "start": 2,
+   "end": 14,
+   "full_name": "broken.Holder",
+   "methods": [
+    "first",
+    "second",
+    "third"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "first",
+   "start": 3,
+   "end": 5,
+   "full_name": "Holder.first"
+  },
+  {
+   "kind": "function",
+   "name": "second",
+   "start": 7,
+   "end": 9,
+   "full_name": "Holder.second"
+  },
+  {
+   "kind": "function",
+   "name": "third",
+   "start": 11,
+   "end": 13,
+   "full_name": "Holder.third"
+  }
+ ]
+}

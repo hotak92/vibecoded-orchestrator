@@ -112,6 +112,7 @@ __all__ = [
     "clear_vocabulary_cache",
     "is_wellformed_type",
     "classify_node_type",
+    "node_type_for_folder",
     "extend_vocabulary",
 ]
 
@@ -415,6 +416,42 @@ def classify_node_type(node_type: object, vocab: KgVocabulary) -> str:
     if alias in vocab.node_types:
         return TYPE_KNOWN
     return TYPE_EXTENDABLE
+
+
+def node_type_for_folder(folder: str, vocab: KgVocabulary) -> str:
+    """The singular node type a knowledge/ FOLDER name stands for.
+
+    v0.2.102 W4-G: a node without a frontmatter ``type:`` takes its type from
+    its top-level folder, and the sync stored the folder name verbatim — so a
+    file under ``knowledge/concepts/`` got ``node_type: "concepts"``, a value
+    outside the singular vocabulary every filter and the RL type registry
+    use. Resolution, first match wins:
+
+    1. a type whose canonical folder (built-in mapping or a VOCABULARY.md
+       ``Folder`` line) IS this folder — ``concepts`` → ``concept``,
+       ``thoughts`` → ``thought``; a folder several types share resolves to
+       the one whose name is the folder's singular, else the first by name;
+    2. the folder itself, or the folder minus a trailing ``s``, when that is a
+       declared type — ``research`` → ``research``, ``patterns`` →
+       ``pattern``;
+    3. otherwise the folder name unchanged (lowercased) — an undeclared
+       folder is never guessed onto a type, and the sync's warn-only
+       folder-type path reports it as before.
+    """
+    name = str(folder or "").strip().lower()
+    if not name:
+        return name
+    singular = name[:-1] if name.endswith("s") else name
+    owners = sorted(
+        t for t, f in vocab.node_type_to_folder.items() if str(f).lower() == name
+    )
+    if owners:
+        return singular if singular in owners else owners[0]
+    if name in vocab.node_types:
+        return name
+    if singular in vocab.node_types:
+        return singular
+    return name
 
 
 # ── Auto-extend (append-only) ────────────────────────────────────────────────

@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed.
+﻿# Parity: kept in step with session-start-ensure-hub.sh (this file's UTF-8 BOM serves
+# Windows PowerShell 5.1 only and has no Bash-side counterpart; every
+# behaviour must match the session-start-ensure-hub.sh sibling).
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -36,6 +38,13 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #   $env:VCT_DISABLE_HOOKS — set to non-empty to bypass entirely.
 #   $env:VCO_HOOK_DEBUG=1  — verbose stderr, and run the spawn in the
 #                            foreground (`--wait`) so its exit code is known.
+#
+# v0.2.102 (S16-13 / OD-7): a launcher this hook starts with --start-hidden
+# and leaves in the tray RELAUNCHES ITSELF into the refreshed dist binary
+# when a launcher_binary_stale record exists, no window is visible, no
+# update is in flight and no modal is pending (the launcher's own periodic
+# check; this hook never kills GUI processes). Nothing for this hook to do
+# beyond starting it hidden.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
@@ -169,8 +178,12 @@ else {
 # safe to issue while one is already running. "not_registered" is the default
 # and a silent success: autostart is opt-in and NOTHING here registers it.
 # ---------------------------------------------------------------------------
-$GwFolder = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
-$GwArgs = @("-m", "vco_lib.gateway_ensure", "ensure", "--json", "--folder", $GwFolder)
+# --folder: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py). No project -> ensure without a folder (no ledger row).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$GwFolder = Get-VcoProjectRoot
+$GwArgs = @("-m", "vco_lib.gateway_ensure", "ensure", "--json")
+if ($GwFolder) { $GwArgs += @("--folder", $GwFolder) }
 $GwRes = $null
 $GwRc = $null
 $GwErr = [System.IO.Path]::GetTempFileName()

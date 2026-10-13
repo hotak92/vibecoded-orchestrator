@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed.
+﻿# Parity: kept in step with post-file-edit.sh (this file's UTF-8 BOM serves
+# Windows PowerShell 5.1 only and has no Bash-side counterpart; every
+# behaviour must match the post-file-edit.sh sibling).
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -19,9 +21,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #
 # Side-effects (background): KG / docs sync, code-graph incremental.
 # LLM-visible reminders (additionalContext envelope):
-#   - Code-file edits → CONTEXT_STATE / KG capture reminder
-#   - CONTEXT_STATE.md significant-changes → expert-skill update prompt
-#   - .claude/skills or .claude/hooks edits → workflow-test prompt
+#   - the routing home's report (the pending KG duplicate-scan report)
+#     and the once-per-session broken-install notice
 #
 # Plain stdout from PostToolUse hooks is silently dropped per the
 # v2.1.x contract — reminders intended for the model MUST go through
@@ -38,8 +39,8 @@ $EmitContextLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
 if (Test-Path $EmitContextLib) { . $EmitContextLib }
 
 # v0.2.95 (lane F10): the ROUTING - knowledge/ -> kg-sync, docs/ ->
-# upload_docs, .claude/diagrams/ -> the indexer, code files -> the
-# end-of-turn code-graph drain queue - plus the Phase-8 access gate and
+# upload_docs, code files -> the end-of-turn code-graph drain queue -
+# plus the Phase-8 access gate and
 # the per-file debounce now live in _lib/route-touched-path.ps1, because a
 # SECOND hook needs exactly the same decision: post-bash-file-sync.ps1,
 # which gives a CLI write (`cat > knowledge/foo.md <<EOF`, `sed -i`, `cp`)
@@ -57,6 +58,12 @@ if (Test-Path $EmitContextLib) { . $EmitContextLib }
 # Exit code is unchanged: always 0. MUST MATCH post-file-edit.sh.
 $RouteLib = Join-Path $PSScriptRoot "_lib/route-touched-path.ps1"
 if (Test-Path $RouteLib) { . $RouteLib }
+# v0.2.102 W6-C1 (F16): the per-agent key helper, for the once-per-session
+# broken-install notice below (its sentinel must not let a subagent's notice
+# silence the main chat's). Conditional source, same discipline.
+# MUST MATCH post-file-edit.sh.
+$SessionIdLib = Join-Path $PSScriptRoot "_lib/session-id.ps1"
+if (Test-Path $SessionIdLib) { . $SessionIdLib }
 
 # Accumulate LLM-visible reminders, emit one envelope at the end.
 $LlmNudge = ""
@@ -77,7 +84,10 @@ $EditedFile = ""
 # processes DO emit retrieval/sync telemetry — exporting these as env
 # vars (VCT_AGENT_ID / VCT_AGENT_TYPE / VCT_SESSION_ID) lets the
 # canonical emit path attribute those rows to the agent that triggered
-# the write.
+# the write. Readers (v0.2.102 W6-C2, census F15; MUST MATCH the .sh): the
+# debounced kg-sync runner's failure sentinel (VCT_AGENT_ID, per-agent key)
+# and its kg_sync_failures.jsonl row (agent_id + agent_type), which
+# session-start-retrieval-health names when it surfaces the failure.
 $AgentId = ""
 $AgentType = ""
 $SessionIdFromStdin = ""
@@ -121,7 +131,7 @@ $DocsDirSep = $DocsDir.TrimEnd('\','/') + [System.IO.Path]::DirectorySeparatorCh
 
 if (-not $EditedFile) { exit 0 }
 
-# === Routing: knowledge/ + docs/ + diagrams + the code-graph drain queue ===
+# === Routing: knowledge/ + docs/ + the code-graph drain queue ===
 # ONE home - _lib/route-touched-path.ps1 - shared with
 # post-bash-file-sync.ps1 so a CLI write routes identically to an
 # Edit/Write. Initialize-VcoRoute resolves the debounce helper, the
@@ -135,38 +145,27 @@ if (Get-Command Invoke-VcoRouteTouchedPath -ErrorAction SilentlyContinue) {
 } elseif (Get-Command Emit-VcoMissingHookLibNotice -ErrorAction SilentlyContinue) {
     # The routing home is absent (or unreadable) -- a broken install, not a
     # degraded mode. Say so once per session, then carry on with the nudges
-    # this hook owns; exit stays 0.
+    # this hook owns; exit stays 0. v0.2.102 W6-C1 (F16): the notice is
+    # delivered as PostToolUse context, which reaches the SUBAGENT only
+    # when this edit is a lane's -- key the sentinel per agent so the
+    # lane's notice never silences the main chat's.
+    # MUST MATCH post-file-edit.sh.
+    $noticeKey = $SessionIdFromStdin
+    if ($AgentId -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyContinue)) {
+        $noticeKey = Get-VcoAgentKeyFromIds -SessionId $SessionIdFromStdin -AgentId $AgentId
+    }
     $missingNotice = Emit-VcoMissingHookLibNotice -HooksDir $ScriptDir `
-        -ProjectRoot $ProjectRoot -SessionId $SessionIdFromStdin `
+        -ProjectRoot $ProjectRoot -SessionId $noticeKey `
         -Lib "route-touched-path.ps1"
     if ($missingNotice) { Add-Nudge $missingNotice }
 }
 
-# 4. CONTEXT_STATE.md significant-changes → expert-skill nudge.
-if ($EditedFile.EndsWith("CONTEXT_STATE.md", [StringComparison]::OrdinalIgnoreCase)) {
-    $expertSkill = Join-Path $ProjectRoot ".claude/skills/project-experts/claude-orchestrator-expert.md"
-    if (Test-Path $expertSkill) {
-        try {
-            $changes = (Select-String -Path $EditedFile -Pattern '(✅|##\s+(Status|Current Work|Next Steps|Knowledge Captured))' -ErrorAction SilentlyContinue | Measure-Object).Count
-            if ($changes -gt 5) {
-                Add-Nudge "[CONTEXT_STATE.md updated — expert-skill review] $changes significant markers detected.`nConsider updating .claude/skills/project-experts/claude-orchestrator-expert.md if any of:`n  - Major milestone completed (Skills system, knowledge graph, etc.)`n  - Architecture changed (MCP, agents, workflow)`n  - New scripts/commands added (kg-*, wrappers)`n  - Recent work section needs refresh"
-            }
-        } catch { }
-    }
-}
-
-# 5. Workflow-system edits → workflow-test nudge.
-$workflowChanged = $false
-$skillsDir = Join-Path $ProjectRoot ".claude/skills"
-$hooksDir = Join-Path $ProjectRoot ".claude/hooks"
-if ($EditedFile.StartsWith($skillsDir, [StringComparison]::OrdinalIgnoreCase) -or
-    $EditedFile.StartsWith($hooksDir,  [StringComparison]::OrdinalIgnoreCase)) {
-    $workflowChanged = $true
-}
-if ($workflowChanged) {
-    $bn = Split-Path $EditedFile -Leaf
-    Add-Nudge "[Workflow file edited] $bn was changed.`nConsider:`n  - Test the change in actual usage before assuming it works.`n  - Update documentation if the structure changed.`n  - Run /workflow-optimizer to check for optimizations.`n  - Update skills-setup-guide.md if the setup process changed."
-}
+# The after-edit workflow nudges are gone (owner-approved removal
+# 2026-10-12, v0.2.102 W6-N review round): the CONTEXT_STATE.md
+# "expert-skill review" pointer named a skill file VCO never ships, and the
+# "[Workflow file edited]" reminder pointed at a skills-setup-guide.md that
+# exists nowhere. Prompt-file advice comes BEFORE the edit, from the
+# pre-edit / pre-write context router (vco_lib/prompt_edit_nudge.py).
 
 # Emit accumulated nudges as a single PostToolUse envelope.
 if ($LlmNudge -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {

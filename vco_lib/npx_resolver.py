@@ -21,8 +21,9 @@ Four consumers now share this one home:
    ONE implementation called cross-language, never a Rust re-implementation of
    the 4-step ladder that would drift the moment a fifth step is added).
    Doctor-time only, never a hot path.
-4. The mermaid / excalidraw wrapper proxies — :func:`package_run_argv` builds
-   the upstream spawn argv with the ``npm exec`` fallback.
+4. (Historical) the mermaid / excalidraw wrapper proxies — deleted in
+   v0.2.102 with the diagrams integrations; ``package_run_argv`` remains
+   the generic spawn-argv builder for any future npx-based entry.
 
 Cross-OS
 --------

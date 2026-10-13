@@ -107,7 +107,7 @@ Get-CimInstance Win32_Process | Where-Object {
 
 ### Windows: `install.py --update` step 7c "seeding Weaviate" hangs at 40-50% (V52-AJ — FIXED in v0.2.52)
 
-**Symptom** (Windows + CPU-only, reported in v0.2.51 by users who configured `arctic` as their embedding via the launcher's Identity tab): `install.py --update` reaches step `7c/10 seeding Weaviate` and hangs for hours at 40-50% completion. The log shows `CI-10: full sync (context change: embedding=None→'qwen3', ...)` — using qwen3 (slow on CPU: ~30s/chunk) instead of the user-selected arctic.
+**Symptom** (Windows + CPU-only, reported in v0.2.51 by users who configured `arctic` as their embedding in the launcher — then the Identity tab's embedding selector, since v0.2.102 Preferences → **Embedding profile (global)**): `install.py --update` reaches step `7c/10 seeding Weaviate` and hangs for hours at 40-50% completion. The log shows `CI-10: full sync (context change: embedding=None→'qwen3', ...)` — using qwen3 (slow on CPU: ~30s/chunk) instead of the user-selected arctic.
 
 **Why it happened** (v0.2.51 root cause): `install.py` spawned `python sync_knowledge_graph.py` as a subprocess. The subprocess called `EmbeddingService.for_project()`, which read ONLY from `os.environ` (`ACTIVE_EMBEDDING` env var). It did NOT read `app_state.embedding.active_profile` from `launcher.db`, nor `.claude/settings.json`, nor `.claude/env`. Setting `ACTIVE_EMBEDDING=arctic` in `.claude/settings.json` had no effect — that file is read by Claude Code's MCP subprocesses, not by `install.py`'s sync subprocess.
 
@@ -117,7 +117,7 @@ Get-CimInstance Win32_Process | Where-Object {
 2. `EmbeddingService.for_project()` reads `launcher.db` as fallback when env unset (single canonical chain: env → launcher.db → `"qwen3"` default).
 3. This `docs/TROUBLESHOOTING.md` entry + `templates/ORCHESTRATOR-CLAUDE.md.template` documents the resolution chain so users + future Claude know which channel to use.
 
-**On v0.2.52+**: no action needed. Whatever you selected in the launcher's Identity tab → Embedding selector is what `install.py --update` will use. Setting `$env:ACTIVE_EMBEDDING` in PowerShell before running install.py still works as an override.
+**On v0.2.52+**: no action needed. Whatever you selected in the launcher's Preferences → **Embedding profile (global)** (the only embedding selector since v0.2.102 — one value for every project) is what `install.py --update` will use. Setting `$env:ACTIVE_EMBEDDING` in PowerShell before running install.py still works as an override.
 
 **Pre-v0.2.52 workaround** (if you're still on v0.2.51 and stuck): set the env var in your shell BEFORE running install.py:
 
@@ -446,9 +446,10 @@ Symptom: Claude says "MCP server weaviate-kg is not connected" or tool calls lik
 claude mcp list
 # Expected: weaviate-kg ✓ Connected, playwright ✓ Connected
 # playwright appears only when npx resolves on PATH; see "npx is not on
-# PATH" below. (v0.2.101 deleted the search MCP and stopped registering the
-# mermaid/excalidraw diagram wrappers; a legacy install keeps those entries,
-# and the launcher's Permissions tab disables a server per project via
+# PATH" below. (v0.2.101 deleted the search MCP; v0.2.102 deleted the
+# mermaid/excalidraw diagram wrapper MCPs — a legacy entry is scrubbed
+# automatically by the ordinary install/update. The launcher's Permissions
+# tab disables a server per project via
 # ~/.claude.json projects[<project>].disabledMcpServers.)
 # (lean-ctx or Pro-tier MCPs may also appear if installed.)
 ```
@@ -460,14 +461,14 @@ claude mcp list
 1. **Editor opened before containers started**: restart your Claude Code session (VS Code window reload, restart the CLI, or reopen Claude Desktop) once `docker ps` / `podman ps` shows Weaviate + Ollama running.
 2. **Wrong Python in MCP config**: `MCP_PYTHON` must point at the `install.py`-created venv, not system Python — check `.claude/settings.json` → `env` (the canonical channel; CLI / Desktop app / VS Code extension all read it, and MCP subprocesses inherit from it). Do NOT put these keys in `.vscode/settings.json` `claude-code.env` — that block does not propagate to MCP subprocesses on Linux (empirical sentinel testing confirmed). If your project has keys there, copy them into `.claude/settings.json` `env` — same shape, different file.
 3. **Embedding model mismatch**: `ACTIVE_EMBEDDING` must match a model actually loaded by Ollama. Default is `qwen3` with model `qwen3-embedding:0.6b`. Verify with `podman exec vco_ollama ollama list` (the canonical container name; legacy `ollama_claude` still works as an alias).
-4. **`npx` is not on PATH** (v0.2.91): `playwright` — and `mermaid` when you enable it — are registered as the bare command `npx`, which Claude Code resolves from the spawn PATH at MCP-launch time. With no Node.js installed there is nothing to resolve, so the server never starts and `claude mcp list` shows only "Failed to connect". This was silent for months in the field; it is now surfaced in three places:
+4. **`npx` is not on PATH** (v0.2.91): `playwright` is registered as the bare command `npx`, which Claude Code resolves from the spawn PATH at MCP-launch time. With no Node.js installed there is nothing to resolve, so the server never starts and `claude mcp list` shows only "Failed to connect". This was silent for months in the field; it is now surfaced in three places:
 
    ```bash
    vco doctor                 # names the unspawnable entries + the fix
    python -m vco_lib.npx_resolver --json   # just the resolution verdict
    ```
 
-   The launcher's MCP-registration badge turns **yellow** with the same remediation, and every install/update leaves an `npx_missing_mcp_unspawnable` entry in `.claude/context/UPDATE_DEFERRED.md` that clears itself on the first run after Node is installed. If npx is missing but **npm** is present (a common fnm/nvm shape), the VCO-owned Mermaid/Excalidraw wrappers fall back to `npm exec --yes -- <pkg>@<ver>` on their own; the registered `npx` entries cannot, because their command string is what VCO's third-party-preservation and stale-entry fingerprints match on.
+   The launcher's MCP-registration badge turns **yellow** with the same remediation, and every install/update leaves an `npx_missing_mcp_unspawnable` entry in `.claude/context/UPDATE_DEFERRED.md` that clears itself on the first run after Node is installed.
 
 ## vct-hub troubleshooting
 
@@ -488,6 +489,10 @@ curl -s http://127.0.0.1:7700/health
 ```
 
 If `--status` says `stale`, run `vct-hub --start-if-not-running` — it cleans up the dead lockfile and spawns a fresh detached instance (idempotent; safe to run any time).
+
+### `[VCO hub unreachable]` notice in the chat
+
+Hooks that need a hub answer and do not get one keep their safe default and tell the assistant. Since v0.2.102 the code-graph worktree gate (`stop-codegraph-drain`, `code-graph-incremental`) does this: when it cannot ask whether a worktree is registered, it indexes the edit anyway. The notice comes once per session per agent (for the CLI-run `code-graph-incremental`, at most once an hour). Bring the hub back with `vct-hub --start-if-not-running`. If `vct-hub` is not on `PATH`, use `python -m vco_lib.hub_ensure ensure` with the VCO venv's python. If VCO was just updated, restart the launcher and reload the editor window, since a session started before the update may hold a stale `VCT_HUB_TOKEN`. The once-per-session markers are `.claude/state/hub_unreachable_notice_<key>`.
 
 ### Hub bind posture: loopback vs all interfaces (`VCT_HUB_BIND_ALL`, module widen)
 
@@ -763,6 +768,57 @@ named by another binding row, and any run where Weaviate or `launcher.db`
 could not be read — probe failure is not evidence. To merge leftover objects
 into the class you kept: `python -m vco_lib.project_init migrate-collections
 --help`.
+
+## A project runs its own Weaviate / Ollama next to VCO's (infrastructure declarations)
+
+A project may run its own Weaviate or Ollama for its own runtime while VCO
+keeps its development KG on VCO's Weaviate. VCO classifies collections and
+containers partly by NAME SHAPE, so a runtime collection called
+`Something_KnowledgeGraph` can read as an "unclaimed" leftover
+(`kg_unclaimed_populated_classes`), and a stopped runtime container can look
+like a service to adopt. Declare what the project owns instead — launcher →
+the project's page → **Identity** tab → **Infrastructure this project owns**:
+
+- **External collections** — never reported as unclaimed or fixture-shaped,
+  never evidence for a KG binding repoint. `vco doctor` names each skipped
+  class and who declared it.
+- **Unmanaged containers** — the hub watchdog never inspects, starts or
+  re-creates them; compose recovery refuses to touch them; service detection
+  never offers them for adoption (and never takes their ports).
+- **Local ports** — WebFetch may reach them from that project (the SSRF guard
+  reads `VCT_SSRF_EXTRA_LOCAL_PORTS`), and service detection never probes them.
+
+A container or a collection is one object on the machine, so a declaration
+protects it everywhere; the WebFetch allowance is per-project. If the
+declarations cannot be read (a damaged `launcher.db`), every heal of a VCO
+container refuses until they can — an unreadable "do not touch" list is not
+an empty one.
+
+## The two compose override files disagree (`compose_override_pair_diverged`)
+
+`infrastructure/compose.override.yaml` (read by podman-compose) and
+`infrastructure/docker-compose.override.yml` (read by docker compose v1) are
+meant to be one configuration written twice. When they differ — typically one
+was fixed by hand and the other was not — the two runtimes start different
+stacks. `vco doctor` reports it with a read-only compare command (`diff`, or
+`fc` on Windows). VCO overwrites neither file while they differ: decide which
+half is right, make the other identical (or delete the stale one), then run
+`vco doctor` again — the entry clears itself once they agree. The install-time
+rename pass reports the same state under the same id (it covers the legacy
+`claude_mcp_servers/` location too); its former `compose_override_filename_conflict`
+id is retired, and an old entry of it clears on the next install or update.
+
+## The hub watchdog gave up on a service (`watchdog_gave_up`)
+
+The hub restarts a stopped VCO service with an exponential backoff and stops
+after 5 failed heals in a row, rather than thrash the runtime. The ledger entry
+names the service, its container, the attempts and the last error. Look at the
+container's logs (`docker logs <name>` / `podman logs <name>`), fix the cause
+(image, port, memory, compose file), then start it — or run
+`python install.py --update`. The entry clears itself as soon as the service is
+seen running, whoever starts it. A service you stopped on purpose from the
+launcher's Services page is not supervised (the Stop drops the watchdog's pause
+marker), and a container a project declared **unmanaged** is never supervised.
 
 ## The update badge never lights on v0.2.97/0.2.98 (fixed in v0.2.99)
 

@@ -10,6 +10,7 @@
 # Soft-fail contract: every function returns silently on error. The
 # caller is expected to be a hook that MUST exit 0 regardless.
 
+. (Join-Path $PSScriptRoot "utf8-nobom.ps1")  # BOM-free writes (review R5-8)
 # Default extensions / directories (must match the .sh sibling).
 $script:VCT_SnapshotCodeExtsDefault = @(
     'py','rs','ts','tsx','js','jsx','go','java','cs','c','cpp','h','hpp',
@@ -170,8 +171,12 @@ function Take-Snapshot {
         if (-not $hash) { continue }
         try {
             # Path.GetRelativePath is .NET Core+; fall back to manual
-            # prefix-strip for older PowerShell hosts.
-            $rel = if ([System.IO.Path]::GetType().GetMethod('GetRelativePath',
+            # prefix-strip for older PowerShell hosts. The probe is the TYPE's
+            # reflection (`[System.IO.Path].GetMethod`): the former
+            # `[System.IO.Path]::GetType()` is a static call that throws
+            # ("does not contain a method named 'GetType'"), so every file hit
+            # the catch and the snapshot was always empty (v0.2.102 W6-R).
+            $rel = if ([System.IO.Path].GetMethod('GetRelativePath',
                     [type[]]@([string],[string]))) {
                 [System.IO.Path]::GetRelativePath($resolvedRoot, $abs)
             } else {
@@ -209,8 +214,8 @@ function Take-Snapshot {
     $tmp = $snapFile + ".tmp"
     try {
         # Compact JSON to keep snapshots small.
-        $doc | ConvertTo-Json -Compress -Depth 5 `
-            | Out-File -FilePath $tmp -Encoding utf8 -ErrorAction Stop
+        # BOM-free (review R5-8): vco_lib reads the snapshot with json.load.
+        Set-VcoUtf8Content -Path $tmp -Value ($doc | ConvertTo-Json -Compress -Depth 5)
         Move-Item -LiteralPath $tmp -Destination $snapFile -Force `
             -ErrorAction Stop
         return $true
@@ -286,7 +291,7 @@ function Diff-Snapshot {
         }
         if ($info.Length -gt 5MB) { continue }
         try {
-            $rel = if ([System.IO.Path]::GetType().GetMethod('GetRelativePath',
+            $rel = if ([System.IO.Path].GetMethod('GetRelativePath',
                     [type[]]@([string],[string]))) {
                 [System.IO.Path]::GetRelativePath($resolvedRoot, $abs)
             } else {

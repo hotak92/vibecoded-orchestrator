@@ -1,12 +1,18 @@
-﻿# OS-EXEMPT-PARITY: Windows-only fix — drop the dead `$env:CLAUDE_SESSION_ID` middle branch from the SessionId resolution cascade. The .sh sibling never had this branch (audit confirmed; sh went straight from stdin-parse-fail to "default"), so there's no symmetrical change to make on the .sh side.
+﻿# Parity: kept in step with diff-context-inject.sh (the SessionId
+# resolution cascade must stay symmetrical on both sides; every behaviour
+# must match the .sh sibling).
 # Scrub sensitive env vars (this hook doesn't need credentials)
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # diff-context-inject.ps1
-# Diff-based context injection — only inject CHANGED sections of CONTEXT_STATE.md.
-# First prompt: create baseline snapshot (full injection done by SessionStart hook).
+# Diff-based context injection - only inject CHANGED sections of CONTEXT_STATE.md.
+# First prompt: create baseline snapshot. The FULL injection the baseline
+# defers is real: compact-context-reinject.ps1 (SessionStart matchers
+# startup/resume/compact, since v0.2.102 W6-F) injects CONTEXT_STATE.md in
+# full at session start, inside its per-section budgets and the shared
+# hook-output cap (_lib/reinject-budgets.txt + _lib/emit-context.ps1).
 # Subsequent prompts: output only changed sections (or nothing if unchanged).
 # After /compact: reset baseline (detected via compact flag).
 #
@@ -36,14 +42,22 @@ $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $SessionIdFromStdin = Get-VcoHookSessionId -Stdin $HookStdin
 
-$ContextFile = ".claude/CONTEXT_STATE.md"
 # Snapshot state lives under the project (gitignored .claude/state/) so it
 # survives reboots and launcher restarts — Claude Code's `resume` feature
 # can reuse a session_id across these boundaries, and a $TMPDIR-based path
 # would lose the diff baseline mid-session when /tmp is wiped on boot.
 # The `ctx_` filename prefix namespaces these files within the shared
 # .claude/state/ dir (which also holds seen_kg_titles_*, reads_*, etc.).
-if (-not $env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR = (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to diff and no snapshot written.
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$DiffProjectRoot = Get-VcoProjectRoot
+if (-not $DiffProjectRoot) { exit 0 }
+$env:CLAUDE_PROJECT_DIR = $DiffProjectRoot
+# The live file is the PROJECT's, like every other path here (it was
+# relative to the current location).
+$ContextFile = Join-Path $DiffProjectRoot ".claude/CONTEXT_STATE.md"
 $SnapshotDir = Join-Path $env:CLAUDE_PROJECT_DIR ".claude/state"
 $SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } else { "default" }
 

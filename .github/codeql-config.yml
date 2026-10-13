@@ -1,22 +1,9 @@
 # CodeQL analysis configuration for vibecoded-orchestrator.
 #
-# v0.2.42 W6 (SEC-1): Suppresses CodeQL alerts on vendored third-party
-# dist files that we do not maintain. These are compiled/minified build
-# artefacts shipped verbatim from upstream packages; any vulnerabilities
-# within them belong to the upstream maintainers, not to this repo.
-#
-# Vendored bundles excluded by this file (accounts for 8 of 9 WARNING
-# alerts as of the v0.2.42 audit):
-#
-#   vco_lib/excalidraw_mcp_fork/dist/**
-#     - Compiled Excalidraw canvas app (React + Vite bundle).
-#       Alerts: js/incomplete-sanitization (alerts #10–#15), js/clear-text-logging (#9).
-#       Source: excalidraw fork — we own the Python glue, not the canvas bundle.
-#
-#   launcher/vendor/diagrams-editor/mermaid/**
-#     - Mermaid.js vendored for the offline Mermaid editor tab.
-#       Alert: js/xss-through-dom (#19).
-#       Source: mermaid v10 pre-built bundle — not authored by us.
+# v0.2.42 W6 (SEC-1) originally suppressed CodeQL alerts on vendored
+# third-party dist bundles (the excalidraw fork and the mermaid editor);
+# both trees were removed in v0.2.102 with the diagrams integration, so
+# no vendored-bundle path exclusions remain.
 #
 # What is NOT excluded here:
 #   - vco_lib/*.py, install.py, claude_mcp_servers/**  — first-party code.
@@ -31,11 +18,7 @@
 # the secret values themselves. They are suppressed via query-filters
 # below, with inline comments in the Python source at each site.
 
-paths-ignore:
-  # Excalidraw vendored bundle — all JS artefacts under the dist tree.
-  - vco_lib/excalidraw_mcp_fork/dist
-  # Mermaid vendored bundle — the pre-built JS file for the editor tab.
-  - launcher/vendor/diagrams-editor/mermaid
+paths-ignore: []
 
 # Suppress the three false-positive py/clear-text-logging-sensitive-data
 # alerts at config_projection.py lines 2363, 2395, 2398.

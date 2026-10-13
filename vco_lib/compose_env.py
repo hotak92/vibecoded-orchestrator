@@ -35,6 +35,81 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from vco_lib.code_embed_serving import (
+    CODE_EMBED_IN_STACK_KEY,
+    code_embed_in_stack,
+    code_models_in_use,
+)
+
+
+def code_embed_service_model(embed_config: dict) -> Optional[str]:
+    """The model the code_embed container must load for this install: the
+    pairing from the ONE serving map (``vco_lib.code_embed_serving``) for the
+    backend install chose — ``gpu`` → CodeSage; ``ollama`` → the tier table's
+    Ollama code model (never CodeSage, which Ollama does not serve); nothing
+    otherwise (``openai`` runs no container)."""
+    from vco_lib.code_embed_serving import (
+        CODE_EMBED_GPU_MODEL,
+        CODE_SERVED_BY_OLLAMA,
+        code_serving_backend,
+    )
+
+    backend = str(embed_config.get("code_backend", "") or "").strip().lower()
+    model = str(embed_config.get("code_model", "") or "").strip()
+    if backend == "gpu":
+        return CODE_EMBED_GPU_MODEL
+    if backend == "ollama" and model and code_serving_backend(model) == CODE_SERVED_BY_OLLAMA:
+        return model
+    return None
+
+
+#: install's GPU verdict for this host, in ``infrastructure/.env``.
+CODE_EMBED_HOST_GPU_KEY = "CODE_EMBED_HOST_GPU"
+
+
+def _host_gpu(embed_config: dict) -> bool:
+    has_gpu = embed_config.get("has_gpu")
+    return bool(embed_config.get("gpu_vendor")) if has_gpu is None else bool(has_gpu)
+
+
+def code_embed_container_in_stack(embed_config: dict) -> bool:
+    """Whether install starts the code_embed container: a GPU host
+    (``has_gpu``, else a probed ``gpu_vendor``) where a code model in use is
+    served by it (:func:`vco_lib.code_embed_serving.code_embed_in_stack`)."""
+    has_gpu = _host_gpu(embed_config)
+    install_model = str(embed_config.get("code_model") or "").strip()
+    if not install_model:
+        # No resolved install code model (a partial config): the pre-W6-B2
+        # rule — a GPU host runs the container. Never guessed away.
+        return bool(has_gpu)
+    return code_embed_in_stack(bool(has_gpu), code_models_in_use(install_model))
+
+
+def read_code_embed_in_stack(infra_dir: Path) -> Optional[bool]:
+    """The ``CODE_EMBED_IN_STACK`` marker in ``<infra_dir>/.env``: True /
+    False, or None when absent / unreadable / unrecognised (an install from
+    before v0.2.102 — callers keep their pre-marker behaviour). MUST MATCH
+    ``infra_watchdog.rs::code_embed_in_stack`` (true/1, false/0)."""
+    try:
+        text = (Path(infra_dir) / ".env").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    value: Optional[str] = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() == CODE_EMBED_IN_STACK_KEY:
+            value = val  # last occurrence wins
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if v in ("true", "1"):
+        return True
+    if v in ("false", "0"):
+        return False
+    return None
 
 
 def compose_substitution_env(embed_config: dict) -> dict[str, str]:
@@ -52,6 +127,24 @@ def compose_substitution_env(embed_config: dict) -> dict[str, str]:
     backend = str(embed_config.get("code_backend", "") or "")
     if backend:
         env["CODE_EMBED_BACKEND"] = backend
+    # v0.2.102 W6-B2 (owner decision 6): the service's MODEL follows its
+    # backend. docker-compose.yml hardcoded `codesage/codesage-large-v2`, so an
+    # `ollama`-backend service (CPU / AMD-GPU hosts) asked Ollama for a model it
+    # does not serve. The model now comes from the SAME tier table the client
+    # resolver's install default does (`code_model` after the tier overrides —
+    # what install writes as `default_code_embedding` and the pull plan pulls).
+    model = code_embed_service_model(embed_config)
+    if model:
+        env["CODE_EMBED_MODEL"] = model
+    # v0.2.102 W6-B2: is the code_embed container part of this install at
+    # all? ONE decision (vco_lib.code_embed_serving.code_embed_in_stack),
+    # projected here so install's compose start and the hub watchdog
+    # (infra_watchdog.rs reads this key) follow it — never re-derived.
+    env[CODE_EMBED_IN_STACK_KEY] = "true" if code_embed_container_in_stack(embed_config) else "false"
+    # The host's GPU verdict install made, kept beside the marker so a later
+    # refresh (refresh_code_embed_marker — the hub, on a selection change)
+    # decides on the SAME verdict instead of re-probing the hardware.
+    env[CODE_EMBED_HOST_GPU_KEY] = "true" if _host_gpu(embed_config) else "false"
     # CUDA Dockerfile only for NVIDIA hosts (AMD ROCm / Apple / CPU stay
     # on the multi-arch CPU default — there is no ROCm code-embed image).
     if embed_config.get("gpu_vendor") == "nvidia":
@@ -91,9 +184,14 @@ def write_infrastructure_env(
     A successful no-op (no managed keys to write) returns
     ``(True, "")``.
     """
+    return _write_managed_keys(infra_dir, compose_substitution_env(embed_config))
+
+
+def _write_managed_keys(infra_dir: Path, managed: "dict[str, str]") -> "tuple[bool, str]":
+    """Replace the lines of the ``managed`` keys in ``<infra_dir>/.env``,
+    keeping every other line (and the service-endpoints block) verbatim."""
     from vco_lib.atomic import atomic_rewrite_text  # noqa: PLC0415
 
-    managed = compose_substitution_env(embed_config)
     if not managed:
         return True, ""
     infra_env = infra_dir / ".env"
@@ -494,6 +592,78 @@ def write_service_keys(
     return result
 
 
+def _read_env_keys(infra_dir: Path) -> "dict[str, str]":
+    out: "dict[str, str]" = {}
+    try:
+        text = (Path(infra_dir) / ".env").read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in line:
+            key, _, val = line.partition("=")
+            out[key.strip()] = val.strip()
+    return out
+
+
+def refresh_code_embed_marker(infra_dir: Path, *, app_state=None, binding_rows=None,
+                              environ=None) -> dict:
+    """Recompute ``CODE_EMBED_IN_STACK`` from the ONE decision
+    (:func:`vco_lib.code_embed_serving.code_embed_in_stack`) after a code-model
+    selection changed — run by the hub watchdog when the selection inputs in
+    launcher.db change (v0.2.102 W6-B2, owner ruling "projects actually use
+    the selected embedding model"): selecting CodeSage on a GPU host whose
+    install runs no container brings it up WITHOUT re-running the installer.
+
+    * GPU verdict: install's ``CODE_EMBED_HOST_GPU`` (absent on an install from
+      before this key → probed with ``vco_lib.gpu_device``).
+    * In stack → the container's pairing is CodeSage's (``gpu`` backend +
+      CodeSage id — the one model it serves), so the watchdog's compose brings
+      up a container that serves it.
+    * Out of stack → only the marker drops: the watchdog stops supervising;
+      the container and its volumes are never touched.
+
+    Returns ``{"ok", "in_stack", "changed"}``."""
+    from vco_lib.code_embed_serving import (
+        APP_STATE_KEY_DEFAULT_CODE_EMBED,
+        CODE_EMBED_GPU_MODEL,
+        code_embed_in_stack,
+        code_models_in_use,
+        container_pairing,
+    )
+
+    current = _read_env_keys(infra_dir)
+    gpu_raw = current.get(CODE_EMBED_HOST_GPU_KEY, "").lower()
+    if gpu_raw in ("true", "false"):
+        has_gpu = gpu_raw == "true"
+    else:
+        try:
+            from vco_lib import gpu_device  # noqa: PLC0415
+
+            has_gpu = bool(gpu_device.enumerate_gpus())
+        except Exception:  # noqa: BLE001 — unprobeable ⇒ no GPU claimed
+            has_gpu = False
+    reader = app_state
+    if reader is None:
+        from vco_lib.launcher_db_reader import read_app_state_value as reader  # noqa: PLC0415
+    try:
+        install_model = str(reader(APP_STATE_KEY_DEFAULT_CODE_EMBED) or "")
+    except Exception:  # noqa: BLE001
+        install_model = ""
+    in_stack = code_embed_in_stack(has_gpu, code_models_in_use(
+        install_model, environ=environ, app_state=reader, binding_rows=binding_rows))
+    managed = {CODE_EMBED_IN_STACK_KEY: "true" if in_stack else "false"}
+    if in_stack:
+        pairing = container_pairing(CODE_EMBED_GPU_MODEL)
+        if pairing is not None:
+            managed["CODE_EMBED_BACKEND"], managed["CODE_EMBED_MODEL"] = pairing
+    changed = any(current.get(k) != v for k, v in managed.items())
+    if not changed:
+        return {"ok": True, "in_stack": in_stack, "changed": False}
+    ok, msg = _write_managed_keys(Path(infra_dir), managed)
+    return {"ok": ok, "in_stack": in_stack, "changed": ok, **({"error": msg} if not ok else {})}
+
+
 def _main(argv: "list[str] | None" = None) -> int:
     """``python -m vco_lib.compose_env set --infra-dir D --key K --value V``
     — one JSON object on stdout (``{"ok": true, "action": …}`` or
@@ -507,7 +677,14 @@ def _main(argv: "list[str] | None" = None) -> int:
     p_set.add_argument("--infra-dir", required=True)
     p_set.add_argument("--key", required=True, choices=sorted(LAUNCHER_INFRA_ENV_KEYS))
     p_set.add_argument("--value", required=True)
+    p_ref = sub.add_parser("refresh-code-embed-marker",
+                           help="recompute CODE_EMBED_IN_STACK after a code-model selection change")
+    p_ref.add_argument("--infra-dir", required=True)
     args = parser.parse_args(argv)
+    if args.cmd == "refresh-code-embed-marker":
+        result = refresh_code_embed_marker(Path(args.infra_dir))
+        print(json.dumps(result))
+        return 0 if result.get("ok") else 4
     try:
         action = set_infrastructure_env_key(Path(args.infra_dir), args.key, args.value)
     except (ValueError, OSError) as exc:

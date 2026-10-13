@@ -3,13 +3,13 @@ title: Orchestrator MCP Servers
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, mcp, tools]
 created: 2026-04-27T18:30:00Z
-updated: 2026-10-05T00:00:00Z
+updated: 2026-10-13T00:00:00Z
 status: active
 ---
 
 # Orchestrator MCP Servers
 
-The orchestrator ships MCP (Model Context Protocol) servers that extend Claude Code with semantic search. All servers run as native Python processes registered in the user's MCP config and share the orchestrator root's venv (`<orchestrator-root>/.venv`; the legacy `claude_mcp_servers/.venv` location is a fallback only).
+The orchestrator ships MCP (Model Context Protocol) servers that extend Claude Code with semantic search. Its Python-backed servers run as native Python processes registered in the user's MCP config and share the orchestrator root's venv (`<orchestrator-root>/.venv`; the legacy `claude_mcp_servers/.venv` location is a fallback only).
 
 [[implements::Model Context Protocol]] [[uses::Weaviate]] [[uses::Ollama]] [[relatedTo::Orchestrator Knowledge Graph]]
 
@@ -17,12 +17,12 @@ The orchestrator ships MCP (Model Context Protocol) servers that extend Claude C
 
 | Server | Purpose | Key Tools |
 |---|---|---|
-| weaviate-kg | Semantic search + KG/code-graph management | hybrid_search, semantic_graph_search, search_code_graph, query_code_structure, store_knowledge_node, describe_excalidraw |
+| weaviate-kg | Semantic search + KG/code-graph management | hybrid_search, semantic_graph_search, search_code_graph, query_code_structure, store_knowledge_node |
 | code-embedding-service | GPU/CPU code-embedding HTTP service (port 11440) | `/embed`, `/health` (REST, not MCP) |
 
-A separately-invoked **playwright** MCP (browser automation) is enabled by default and runs via `npx -y @playwright/mcp@latest`. The code-embedding FastAPI service on port 11440 is backend infrastructure for `weaviate-kg`, not an MCP exposed to Claude.
+A separately-invoked **playwright** MCP (browser automation) is enabled by default and runs via `npx -y @playwright/mcp@<pin> --browser chromium`. The exact version is pinned in `vco_lib/bundled_mcp_versions.toml` `[npx.playwright_mcp]`; install and update pre-cache the pinned package and the Chromium revision it requests, and `vco doctor` reports a missing browser (`playwright_browser_missing`). It needs `npx` on PATH. The code-embedding FastAPI service on port 11440 is backend infrastructure for `weaviate-kg`, not an MCP exposed to Claude.
 
-v0.2.101 retired the default REGISTRATION of the diagram wrapper MCPs (`mermaid`, `excalidraw`) and deleted the `search` (paper-search) MCP outright. An install that already has a diagram entry keeps it; the Diagrams tab and `describe_excalidraw` read files on disk and never needed the MCPs. Per-project MCP enable/disable is written to `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code honours for user-scope servers.
+v0.2.101 retired the default REGISTRATION of the diagram wrapper MCPs (`mermaid`, `excalidraw`); v0.2.102 removed the diagrams integrations outright — both wrapper modules were deleted, a leftover VCO-shaped entry is auto-scrubbed on the next update, and the `describe_excalidraw` tool is gone with the fan-out. Existing `.mmd` / `.excalidraw` files and `_Diagrams` collections are untouched user data. Per-project MCP enable/disable is written to `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code honours for user-scope servers.
 
 ## Not exposed as MCP tools
 
@@ -69,12 +69,12 @@ Combines BM25 keyword + vector similarity (hybrid fusion). Searches the per-proj
 semantic_graph_search(
     query: str,
     limit: int = 5,
-    depth: int = 2,   # max 3
+    depth: int = 2,   # 1 = primary only; 2+ = one hop of neighbours
     detail: str = "auto",
     include_stale: bool = False,
 )
 ```
-GraphRAG: finds seed nodes via embedding similarity, then traverses typed WikiLinks. Returns a connected subgraph rather than a flat ranked list. Primary results use per-result score tiering; connected neighbours always render at the `summary` tier.
+GraphRAG: finds seed nodes via embedding similarity, then follows their typed WikiLinks one hop (any `depth` above 1 gives the same single hop). Returns a connected subgraph rather than a flat ranked list. Primary results use per-result score tiering; connected neighbours always render at the `summary` tier.
 
 ### store_knowledge_node
 ```python
@@ -88,7 +88,7 @@ store_knowledge_node(
     scope: str = "project",     # "project" | "shared"
 )
 ```
-Writes the `.md` file and syncs to Weaviate. Upsert: skips if content identical. Preferred path is to write the `.md` file directly and let the PostToolUse hook sync; this tool exists for agents that cannot write files directly. `scope="shared"` writes to `SHARED_KG_COLLECTION` (falls back to the project KG if it is unset).
+Writes the `.md` file and syncs to Weaviate. Upsert: skips if content identical. Preferred path is to write the `.md` file directly and let the PostToolUse hook sync; this tool exists for agents that cannot write files directly. `scope="shared"` writes to `SHARED_KG_COLLECTION` (falls back to the project KG if it is unset); with `SHARED_KG_WRITE_DISABLED=true` such a write is refused, never rerouted.
 
 ### search_code_graph
 ```python
@@ -126,12 +126,12 @@ Ollama is not exposed as an MCP server. Claude's native reasoning, the `Read` to
 
 A small FastAPI server (not an MCP server — used internally by `weaviate-kg`) that wraps a code-embedding model. Exposes `/embed` and `/health`. Backend selected via `CODE_EMBED_BACKEND`:
 
-- `gpu` (default if CUDA available): [[CodeSage-Large-v2]] — 2048-dim.
+- `gpu` (the default backend): [[CodeSage-Large-v2]] via sentence-transformers — 2048-dim; `CODE_EMBED_DEVICE=auto` probes CUDA, then Apple MPS, then CPU.
 - `ollama`: `unclemusclez/jina-embeddings-v2-base-code` — 768-dim, CPU-friendly default. Override with `CODE_EMBED_MODEL` (e.g. `qwen3-embedding:0.6b`).
 
 ## Infrastructure
 
-All servers register via the user's `~/.claude.json` (or per-project MCP config). Shared venv: `claude_mcp_servers/.venv`. Activate with `source claude_mcp_servers/.venv/bin/activate`.
+All MCP servers register via the user's `~/.claude.json` (or per-project MCP config). The Python-backed ones run from the orchestrator root's venv, `<orchestrator-root>/.venv` (legacy fallback `claude_mcp_servers/.venv`).
 
 **Multi-project routing**: per-project env vars in `.claude/settings.json` `env` (`KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, code-graph prefix) determine which collections are active — this is the canonical channel that propagates to MCP subprocesses across every Claude Code surface. When the launcher is running, its `vct-hub` resolves these per-project values and takes precedence. The active workspace determines the active KG, not which project's files are being discussed.
 

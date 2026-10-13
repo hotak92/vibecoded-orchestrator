@@ -1,0 +1,151 @@
+{
+ "source": "ledger.rb",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Accounting",
+   "start": 8,
+   "end": 12,
+   "full_name": "ledger.Accounting",
+   "methods": [
+    "version"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "version",
+   "start": 9,
+   "end": 11,
+   "full_name": "Accounting.version"
+  },
+  {
+   "kind": "class",
+   "name": "Account",
+   "start": 14,
+   "end": 26,
+   "full_name": "ledger.Account",
+   "methods": [
+    "initialize",
+    "deposit",
+    "default",
+    "withdraw?"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "initialize",
+   "start": 15,
+   "end": 17,
+   "full_name": "Account.initialize"
+  },
+  {
+   "kind": "function",
+   "name": "deposit",
+   "start": 19,
+   "end": 21,
+   "full_name": "Account.deposit"
+  },
+  {
+   "kind": "function",
+   "name": "default",
+   "start": 23,
+   "end": 25,
+   "full_name": "Account.default"
+  },
+  {
+   "kind": "class",
+   "name": "Account",
+   "start": 29,
+   "end": 33,
+   "full_name": "ledger.Account",
+   "methods": [
+    "initialize",
+    "deposit",
+    "default",
+    "withdraw?"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "withdraw?",
+   "start": 30,
+   "end": 32,
+   "full_name": "Account.withdraw?"
+  },
+  {
+   "kind": "class",
+   "name": "SavingsAccount",
+   "start": 35,
+   "end": 39,
+   "full_name": "ledger.SavingsAccount",
+   "methods": [
+    "apply_interest"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "apply_interest",
+   "start": 36,
+   "end": 38,
+   "full_name": "SavingsAccount.apply_interest"
+  },
+  {
+   "kind": "class",
+   "name": "Vault",
+   "start": 43,
+   "end": 53,
+   "full_name": "ledger.Vault",
+   "methods": [
+    "store",
+    "total"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "store",
+   "start": 46,
+   "end": 49,
+   "full_name": "Vault.store"
+  },
+  {
+   "kind": "function",
+   "name": "total",
+   "start": 52,
+   "end": 52,
+   "full_name": "Vault.total"
+  },
+  {
+   "kind": "class",
+   "name": "Reporting",
+   "start": 55,
+   "end": 64,
+   "full_name": "ledger.Reporting",
+   "methods": []
+  },
+  {
+   "kind": "class",
+   "name": "Summary",
+   "start": 59,
+   "end": 63,
+   "full_name": "ledger.Summary",
+   "methods": [
+    "render"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "render",
+   "start": 60,
+   "end": 62,
+   "full_name": "Summary.render"
+  },
+  {
+   "kind": "function",
+   "name": "audit",
+   "start": 68,
+   "end": 72,
+   "full_name": "ledger.audit"
+  }
+ ]
+}

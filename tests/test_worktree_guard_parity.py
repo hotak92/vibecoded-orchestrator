@@ -36,6 +36,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SH = REPO_ROOT / "templates" / "hooks" / "worktree-guard.sh"
@@ -180,6 +181,8 @@ def test_both_share_jsonl_decision_vocabulary() -> None:
     for decision in (
         "noop",
         "not_a_repo",
+        "in_place",
+        "worktree_add_snapshot_no_head",
         "no_worktree_identifier",
         "created",
         "idempotent_existing_worktree",
@@ -300,7 +303,7 @@ def _run_ps1(payload: dict, project_dir: Path, extra_env: dict | None = None):
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        [_PS, "-NoProfile", "-File", str(PS1)],
+        [_PS, *PWSH_BASE_FLAGS, "-File", str(PS1)],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
@@ -363,12 +366,14 @@ def test_sh_and_ps1_produce_same_path(tmp_path: Path) -> None:
 
 
 @needs_ps
-def test_ps1_not_a_repo_graceful_noop(tmp_path: Path) -> None:
+def test_ps1_not_a_repo_runs_in_place(tmp_path: Path) -> None:
+    # v0.2.102 W6-Q: same in-place decision as the .sh (an empty stdout fails
+    # the harness launch).
     proc = _run_ps1(
         {"hook_event_name": "WorktreeCreate", "name": "agent-x", "cwd": str(tmp_path)}, tmp_path
     )
     assert proc.returncode == 0
-    assert proc.stdout.strip() == ""
+    assert proc.stdout.strip() == str(tmp_path.resolve())
 
 
 @needs_ps

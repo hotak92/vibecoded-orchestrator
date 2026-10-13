@@ -1,0 +1,22 @@
+{
+ "source": "edge_cases.ps1",
+ "reviewed": "W6-L 2026-10-11 (hand-written before extraction; full_name + methods written by hand from the source)",
+ "symbols": [
+  {"kind": "function", "name": "Get-Plain", "start": 7, "end": 9, "full_name": "edge_cases.Get-Plain"},
+  {"kind": "function", "name": "Set-Scoped", "start": 11, "end": 14, "full_name": "edge_cases.Set-Scoped"},
+  {"kind": "function", "name": "Invoke-Advanced", "start": 16, "end": 25, "full_name": "edge_cases.Invoke-Advanced"},
+  {"kind": "function", "name": "Add-Pair", "start": 27, "end": 27, "full_name": "edge_cases.Add-Pair"},
+  {"kind": "function", "name": "Open-NextLine", "start": 29, "end": 32, "full_name": "edge_cases.Open-NextLine"},
+  {"kind": "function", "name": "Select-Odd", "start": 34, "end": 36, "full_name": "edge_cases.Select-Odd"},
+  {"kind": "function", "name": "Outer-Work", "start": 43, "end": 48, "full_name": "edge_cases.Outer-Work"},
+  {"kind": "function", "name": "Inner-Helper", "start": 44, "end": 46, "full_name": "edge_cases.Inner-Helper"},
+  {"kind": "class", "name": "Shade", "start": 54, "end": 57, "full_name": "edge_cases.Shade", "methods": []},
+  {"kind": "class", "name": "Widget", "start": 59, "end": 73, "full_name": "edge_cases.Widget", "methods": ["Widget", "Render", "Count"]},
+  {"kind": "function", "name": "Widget", "start": 62, "end": 64, "full_name": "edge_cases.Widget.Widget"},
+  {"kind": "function", "name": "Render", "start": 66, "end": 68, "full_name": "edge_cases.Widget.Render"},
+  {"kind": "function", "name": "Count", "start": 70, "end": 72, "full_name": "edge_cases.Widget.Count"},
+  {"kind": "class", "name": "Gadget", "start": 75, "end": 81, "full_name": "edge_cases.Gadget", "methods": ["Gadget", "Spin"]},
+  {"kind": "function", "name": "Gadget", "start": 76, "end": 77, "full_name": "edge_cases.Gadget.Gadget"},
+  {"kind": "function", "name": "Spin", "start": 79, "end": 80, "full_name": "edge_cases.Gadget.Spin"}
+ ]
+}

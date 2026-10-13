@@ -27,7 +27,8 @@ Decision matrix exercised here:
   * ``worktree_name`` key (per docs) → same create behaviour.
   * idempotent re-fire (same id twice) → same path, success both times,
     JSONL ``idempotent_existing_worktree``.
-  * not-a-repo → graceful no-op (empty stdout, exit 0), JSONL ``not_a_repo``.
+  * not-a-repo → runs in place (stdout = the folder, exit 0), JSONL
+    ``in_place``/``not_a_repo`` (v0.2.102 W6-Q).
   * empty stdin / malformed JSON / no identifier → graceful no-op
     (empty stdout, exit 0) — do NOT fabricate a worktree.
   * ``git worktree add`` failure → LOUD abort (non-zero exit, reason on
@@ -344,16 +345,21 @@ def test_idempotent_refire_same_path_success(tmp_path: Path) -> None:
 # ── GRACEFUL NO-OPS (must NOT fabricate a worktree, must NOT abort) ────────
 
 
-def test_not_a_repo_graceful_noop(tmp_path: Path) -> None:
-    # No git repo anywhere → cannot isolate → echo nothing, exit 0.
+def test_not_a_repo_runs_in_place(tmp_path: Path) -> None:
+    # No git repo anywhere → cannot isolate. v0.2.102 W6-Q: echoing nothing
+    # made the harness FAIL the launch ("If the hook fails or produces no
+    # path, worktree creation fails with an error" — hooks reference), so the
+    # hook returns the folder itself (the agent runs in place) and logs it.
+    # The notice + the no-identifier no-op are pinned in
+    # test_v02102_worktree_guard_no_head.py.
     proc = _run_hook(
         {"hook_event_name": "WorktreeCreate", "name": "agent-x", "cwd": str(tmp_path)},
         tmp_path,
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == ""
+    assert proc.stdout.strip() == str(tmp_path.resolve())
     rows = _read_log_rows(tmp_path)
-    assert rows and rows[-1]["decision"] == "noop"
+    assert rows and rows[-1]["decision"] == "in_place"
     assert rows[-1]["reason"] == "not_a_repo"
 
 

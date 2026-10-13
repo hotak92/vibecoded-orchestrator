@@ -12,8 +12,20 @@
     ModelChoice,
   } from '$lib/types/embedding-catalog';
   import Dropdown from '$lib/components/Dropdown.svelte';
-  import { canRemoveKgBinding, removeKgBinding } from './kg-bindings';
-  import EnrichmentProgressModal from '$lib/components/EnrichmentProgressModal.svelte';
+  import {
+    canRemoveKgBinding,
+    codegraphBindingSaveReq,
+    codegraphSelectedModel,
+    removeKgBinding,
+  } from './kg-bindings';
+  // v0.2.102 W6-J: the duplicate scan lives on this tab (moved from
+  // Preferences → Embedding profile; owner 2026-10-11).
+  import {
+    hasSlotsText,
+    missingVectorExplanation,
+    runDuplicateScan,
+    type DuplicateScanResult,
+  } from './kg-duplicates';
   // v0.2.18 (Plan C): Re-analyze code-graph modal. Forks the enrichment
   // modal's streaming pattern against analyze_code_graph.py --json-progress.
   // Always passes --prune-stale (authoritative refresh); --language is
@@ -34,8 +46,27 @@
   // KG form
   let kgRole = $state<'primary' | 'shared' | 'archive'>('primary');
   let kgCollection = $state('');
-  let kgEmbedding = $state<string>('');
   let kgWeaviateUrl = $state('');
+
+  // v0.2.102 W6-J: the KG duplicate scan (moved from Preferences → Embedding
+  // profile). One scan per project, driven by the shipped scanner through
+  // the `kg_check_duplicates` command.
+  let dupScan = $state<DuplicateScanResult | null>(null);
+  let dupScanning = $state(false);
+  let dupScanError = $state('');
+
+  async function scanKgDuplicates() {
+    dupScanning = true;
+    dupScanError = '';
+    try {
+      dupScan = await runDuplicateScan(projectId, { invoke });
+    } catch (e) {
+      dupScan = null;
+      dupScanError = String(e);
+    } finally {
+      dupScanning = false;
+    }
+  }
 
   // Codegraph form
   let cgPrefix = $state('');
@@ -58,46 +89,24 @@
   let floorPostRerank = $state(0.22);
   let savingFloors = $state(false);
 
-  // v0.2.18 (Commit 8): embedding catalog populates both dropdowns.
-  // Loaded once on mount; refreshed on retry. Errors fall back to
-  // empty lists — the Dropdown component handles that gracefully by
-  // showing the placeholder.
+  // v0.2.18 (Commit 8): the embedding catalog populates the codegraph
+  // dropdown. (The KG side no longer picks a model — v0.2.102 W6-J retired
+  // the per-project KG model pick; one global embedding setting serves every
+  // project and the shared KG.) Loaded once on mount; refreshed on retry.
+  // Errors fall back to empty lists — the Dropdown component handles that
+  // gracefully by showing the placeholder.
   let catalog = $state<EmbeddingCatalog | null>(null);
   let catalogError = $state<string | null>(null);
 
   // Track the previously-saved binding model so the change-detected
   // event only fires on actual changes (not on the initial population).
-  let kgEmbeddingInitial = '';
   let cgEmbeddingInitial = '';
 
-  // v0.2.18 Commit 9 (+ Commit 10 multi-class fix): enrichment-modal
-  // driver state. Populated when a user changes the KG or codegraph
-  // model + clicks Save; the EnrichmentProgressModal mounts, runs the
-  // single-collection Tauri command sequentially across the list,
-  // streams vct-enrichment-progress events, and closes on completion.
-  //
-  // The shape is multi-collection because the codegraph Save path
-  // enrich-migrates 5 sibling Code* classes (CodeModule/CodeClass/
-  // CodeFunction/CodeAPI/CodeInteraction) — see CODE_COLLECTION_SUFFIXES
-  // below. The KG Save path wraps its single collection in a 1-element
-  // list to keep the modal contract uniform.
-  type CollectionTarget = { name: string; new_slot: string };
-  type EnrichmentTarget = { collections: CollectionTarget[] };
-  let enrichmentTarget = $state<EnrichmentTarget | null>(null);
-
-  // Canonical code-class suffixes, ORDER-PRESERVING (Python's
-  // `_CODE_COLLECTION_SUFFIXES` is a frozenset which has no canonical
-  // order; we mirror the order used throughout vco_lib/weaviate_schema.py
-  // docstrings + log messages: Module, Class, Function, API, Interaction.
-  // The exact order affects only the UX (which class runs first); the
-  // correctness guarantee — enriching all 5 — is order-independent.
-  const CODE_COLLECTION_SUFFIXES = [
-    'CodeModule',
-    'CodeClass',
-    'CodeFunction',
-    'CodeAPI',
-    'CodeInteraction',
-  ] as const;
+  // v0.2.102 W6-B2: the codegraph Save path no longer enriches — the next
+  // code-graph run fills the selected model's slot with the analyzer's own
+  // embed text (the enrichment filled it from a raw property, with whatever
+  // model the env resolved). The KG side's enrichment trigger left with the
+  // per-project KG model picker (W6-J).
 
   // v0.2.18 (Plan C): Re-analyze code-graph modal driver state. Populated
   // when the user clicks "Re-analyze code graph"; the modal mounts on
@@ -160,13 +169,11 @@
       if (primary) {
         kgRole = (primary.role as any) ?? 'primary';
         kgCollection = primary.collection_name;
-        kgEmbedding = primary.embedding_model ?? '';
-        kgEmbeddingInitial = kgEmbedding;
         kgWeaviateUrl = primary.weaviate_url ?? '';
       }
       if (snapshot.codegraph_binding) {
         cgPrefix = snapshot.codegraph_binding.collection_prefix;
-        cgEmbedding = snapshot.codegraph_binding.embedding_model ?? '';
+        cgEmbedding = codegraphSelectedModel(snapshot.codegraph_binding);
         cgEmbeddingInitial = cgEmbedding;
         cgEnabled = snapshot.codegraph_binding.enabled;
       }
@@ -249,37 +256,23 @@
     }
   }
 
-  /** Detect whether the user changed the model and warn them about the
-   *  enrichment migration. v0.2.18 Commit 9 wires the actual runner: a
-   *  positive confirm here causes saveKg/saveCg to populate
-   *  `enrichmentTarget`, which mounts <EnrichmentProgressModal>.
-   *  Returns true if the user confirms (or no change was detected). */
+  /** Detect whether the user changed the codegraph model and warn about the
+   *  fill. Returns true if the user confirms (or no change was detected).
+   *  (The KG arm left with the per-project KG model picker, W6-J.) */
   function confirmModelChange(
-    kind: 'kg' | 'codegraph',
     fromModel: string,
     toModel: string,
   ): boolean {
     if (fromModel === toModel) return true;
     // Empty → set: no migration needed (fresh binding).
     if (!fromModel) return true;
-    const msg = `Changing the ${kind === 'kg' ? 'KG' : 'code graph'} embedding model from
-"${fromModel}" to "${toModel}" will require re-embedding all existing
-nodes into the new vector slot. The previous slot's vectors will be
-preserved (you can revert without data loss).
+    const msg = `Changing the code graph embedding model from
+"${fromModel}" to "${toModel}" will re-embed all existing nodes into the
+new vector slot on the next code-graph run. The previous
+slot's vectors will be preserved (you can revert without data loss).
 
 Continue?`;
     return confirm(msg);
-  }
-
-  /** Resolve the slot a given model id writes to, via the catalog. */
-  function resolveSlot(
-    kind: 'kg' | 'codegraph',
-    modelId: string,
-  ): string | null {
-    if (!catalog) return null;
-    const pool = kind === 'kg' ? catalog.text_models : catalog.code_models;
-    const found = pool.find((m) => m.id === modelId);
-    return found ? found.slot : null;
   }
 
   // v0.2.100: remove a shared/archive binding (confirm first; primary is not
@@ -306,45 +299,17 @@ Continue?`;
       toast.error('Collection name required');
       return;
     }
-    if (!confirmModelChange('kg', kgEmbeddingInitial, kgEmbedding)) {
-      return;
-    }
     try {
       await invoke<ProjectKgBinding>('set_project_kg_binding', {
         projectId,
         req: {
           role: kgRole,
           collection_name: kgCollection.trim(),
-          embedding_model: kgEmbedding.trim() || null,
           weaviate_url: kgWeaviateUrl.trim() || null,
           config: {},
         },
       });
       toast.success('KG binding saved');
-      // v0.2.18 Commit 9: when the model genuinely changed, kick the
-      // enrichment migration. The modal mounts on `enrichmentTarget`
-      // population, invokes the Tauri command, streams progress, and
-      // closes itself when the user clicks Close in the done-state.
-      if (kgEmbedding && kgEmbeddingInitial && kgEmbedding !== kgEmbeddingInitial) {
-        const slot = resolveSlot('kg', kgEmbedding);
-        if (slot && kgCollection.trim()) {
-          // KG enrichment is single-collection; wrap in a 1-element
-          // list to keep the modal's multi-collection contract uniform.
-          enrichmentTarget = {
-            collections: [
-              { name: kgCollection.trim(), new_slot: slot },
-            ],
-          };
-        } else {
-          // No slot resolvable (catalog miss). Skip enrichment — the
-          // binding write still succeeded, the seed pipeline will pick
-          // up the new model on next sync.
-          toast.error(
-            `Saved binding but couldn't resolve a slot for ${kgEmbedding}; `
-            + 'manual enrichment may be needed.',
-          );
-        }
-      }
       await load();
     } catch (e) {
       toast.error(e);
@@ -356,45 +321,26 @@ Continue?`;
       toast.error('Collection prefix required');
       return;
     }
-    if (!confirmModelChange('codegraph', cgEmbeddingInitial, cgEmbedding)) {
+    if (!confirmModelChange(cgEmbeddingInitial, cgEmbedding)) {
       return;
     }
     try {
+      // v0.2.102 W6-B2: keep the record + build provenance + config; the
+      // selection goes to config.code_model_target (see kg-bindings.ts).
       await invoke<ProjectCodegraphBinding>('set_project_codegraph_binding', {
         projectId,
-        req: {
+        req: codegraphBindingSaveReq(snapshot?.codegraph_binding, {
           collection_prefix: cgPrefix.trim(),
-          embedding_model: cgEmbedding.trim() || null,
+          target_model: cgEmbedding.trim() || null,
           enabled: cgEnabled,
-          config: {},
-        },
+        }),
       });
       toast.success('Codegraph binding saved');
       if (cgEmbedding && cgEmbeddingInitial && cgEmbedding !== cgEmbeddingInitial) {
-        // Codegraph enrichment targets the per-class collections that
-        // the user's prefix expands to. v0.2.18 (Commit 9 + Commit 10):
-        // expand to ALL 5 sibling Code* classes (CodeModule, CodeClass,
-        // CodeFunction, CodeAPI, CodeInteraction). Pre-Commit-10 we
-        // only enriched CodeFunction, which silently left the 4 other
-        // classes on the old slot and made search return empty against
-        // them (because search_code_graph queries the active slot per
-        // EmbeddingService.code_vector_slot). Enriching all 5 is a
-        // correctness requirement, not a perf optimisation.
-        const slot = resolveSlot('codegraph', cgEmbedding);
-        const prefix = cgPrefix.trim();
-        if (slot && prefix) {
-          enrichmentTarget = {
-            collections: CODE_COLLECTION_SUFFIXES.map((suffix) => ({
-              name: `${prefix}${suffix}`,
-              new_slot: slot,
-            })),
-          };
-        } else {
-          toast.error(
-            `Saved binding but couldn't resolve a slot for ${cgEmbedding}; `
-            + 'manual enrichment may be needed.',
-          );
-        }
+        toast.success(
+          `The next code-graph run adds ${cgEmbedding}'s vectors beside the existing ones `
+          + 'and switches searches to it once complete (Preferences → Code Graph Embeddings shows progress).',
+        );
       }
       await load();
     } catch (e) {
@@ -402,9 +348,6 @@ Continue?`;
     }
   }
 
-  const textOptions = $derived(
-    catalog ? buildOptions(catalog.text_models) : [],
-  );
   const codeOptions = $derived(
     catalog ? buildOptions(catalog.code_models) : [],
   );
@@ -442,19 +385,15 @@ Continue?`;
           <input bind:value={kgCollection} placeholder="ClaudeKnowledgeGraph" />
         </label>
         <label>
-          <span>Embedding model</span>
-          <Dropdown
-            options={textOptions}
-            bind:value={kgEmbedding}
-            placeholder={catalog ? 'Select model…' : 'Loading…'}
-            ariaLabel="KG embedding model"
-          />
-        </label>
-        <label>
           <span>Weaviate URL</span>
           <input bind:value={kgWeaviateUrl} placeholder="http://localhost:8081" />
         </label>
       </div>
+      <p class="ps-hint">
+        The KG's embedding model is one global setting (Preferences → Embedding profile) for every
+        project and the shared KG. A newly selected model's vectors are filled in alongside the
+        existing ones automatically.
+      </p>
       <button class="ps-btn-primary" onclick={saveKg}>Save KG binding</button>
 
       {#if snapshot && snapshot.kg_bindings.length > 0}
@@ -478,6 +417,37 @@ Continue?`;
           {/each}
         </ul>
       {/if}
+
+      <!-- v0.2.102 W6-J: the KG duplicate scan lives on the project's KG tab
+           (owner 2026-10-11; moved from Preferences → Embedding profile). -->
+      <div class="ps-dupscan">
+        <button
+          type="button"
+          class="ps-btn-secondary"
+          data-testid="kg-check-duplicates"
+          disabled={dupScanning}
+          onclick={() => void scanKgDuplicates()}
+        >{dupScanning ? 'Scanning…' : 'Check for duplicates'}</button>
+        {#if dupScanError}
+          <p class="ps-hint ps-scan-warn">Duplicate scan failed: {dupScanError}</p>
+        {/if}
+        {#if dupScan}
+          <p class="ps-hint">
+            {dupScan.pairs.length} likely duplicate pair(s) at threshold {dupScan.threshold}{#if dupScan.nodes_skipped > 0}
+              · {dupScan.nodes_skipped} node(s) re-synced during the scan were not compared{/if}
+          </p>
+          {#if dupScan.objects_missing_vector.length > 0}
+            <p class="ps-hint ps-scan-warn" data-testid="kg-missing-vector-why">
+              {missingVectorExplanation(dupScan.objects_missing_vector)}
+            </p>
+            <ul class="ps-hint" data-testid="kg-missing-vector-list">
+              {#each dupScan.objects_missing_vector as o (o.uuid)}
+                <li><strong>{o.title}</strong> <code>{o.path}</code> ({hasSlotsText(o)})</li>
+              {/each}
+            </ul>
+          {/if}
+        {/if}
+      </div>
     </div>
 
     <div class="ps-section">
@@ -604,16 +574,8 @@ Continue?`;
   {/if}
 </section>
 
-{#if enrichmentTarget}
-  <EnrichmentProgressModal
-    collections={enrichmentTarget.collections}
-    projectId={projectId}
-    onClose={() => (enrichmentTarget = null)}
-  />
-{/if}
-
 <!-- v0.2.18 (Plan C): Re-analyze modal mount. Same lifecycle pattern as
-     EnrichmentProgressModal — mounts when reanalysisTarget is non-null,
+     the old enrichment modal — mounts when reanalysisTarget is non-null,
      unmounts on close. -->
 {#if reanalysisTarget}
   <CodeGraphReanalysisModal
@@ -665,6 +627,12 @@ Continue?`;
   }
   .ps-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(255,255,255,0.08); color: #ccc; }
   .ps-hint { font-size: 11px; color: #888; }
+  /* v0.2.102 W6-J: the duplicate scan block under the KG bindings list. */
+  .ps-dupscan { margin-top: 14px; }
+  .ps-dupscan .ps-hint { margin: 8px 0 0; line-height: 1.5; }
+  .ps-dupscan ul { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .ps-dupscan code { background: rgba(255,255,255,0.05); padding: 1px 5px; border-radius: 3px; font-family: ui-monospace, monospace; }
+  .ps-scan-warn { color: rgb(255,184,74); }
   .ps-bindings-title { font-size: 12px; margin: 14px 0 6px; color: #aaa; font-weight: 600; }
   .ps-bindings { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
   .ps-bindings li { display: flex; align-items: center; gap: 8px; font-size: 12px; }

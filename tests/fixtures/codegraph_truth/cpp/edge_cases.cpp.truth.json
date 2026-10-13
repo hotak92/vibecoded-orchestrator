@@ -1,0 +1,68 @@
+{
+ "source": "edge_cases.cpp",
+ "reviewed": "W6-E 2026-10-10 (hand-written before extraction); W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Widget",
+   "start": 6,
+   "end": 13,
+   "full_name": "edge_cases.Widget",
+   "methods": [
+    "Widget",
+    "~Widget",
+    "size"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "size",
+   "start": 10,
+   "end": 10,
+   "full_name": "edge_cases.Widget.size"
+  },
+  {
+   "kind": "function",
+   "name": "Widget",
+   "start": 15,
+   "end": 15,
+   "full_name": "edge_cases.Widget.Widget"
+  },
+  {
+   "kind": "function",
+   "name": "~Widget",
+   "start": 17,
+   "end": 17,
+   "full_name": "edge_cases.Widget.~Widget"
+  },
+  {
+   "kind": "class",
+   "name": "Config",
+   "start": 19,
+   "end": 21,
+   "full_name": "edge_cases.Config",
+   "methods": []
+  },
+  {
+   "kind": "function",
+   "name": "twice",
+   "start": 23,
+   "end": 26,
+   "full_name": "edge_cases.twice"
+  },
+  {
+   "kind": "function",
+   "name": "helper",
+   "start": 28,
+   "end": 31,
+   "full_name": "edge_cases.helper"
+  },
+  {
+   "kind": "function",
+   "name": "main",
+   "start": 35,
+   "end": 38,
+   "full_name": "edge_cases.main"
+  }
+ ]
+}

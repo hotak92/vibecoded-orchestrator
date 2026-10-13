@@ -111,7 +111,20 @@ DEVELOPMENT_COLLECTION_SCHEMA_VERSION = 2
 #: NEW rows; this edge removes the already-indexed garbage on update,
 #: algorithmically. Idempotent (re-run purges zero); disk reclaim is the
 #: Weaviate-side compaction that follows the deletes (2 GiB segment cap).
-CODEGRAPH_COLLECTION_SCHEMA_VERSION = 7
+#: v8: v0.2.102 S16-4/S16-5 — ``project`` (TEXT) on CodeInteraction, the one
+#: code-graph class born without it (every ``project``-scoped reader — search's
+#: self filter, the identity sweep, the stale + deleted-file prunes — failed on
+#: it or skipped it). ADDITIVE + data-preserving:
+#: ``migrations/codegraph_collection/7_to_8.py`` add_property's it and
+#: backfills the rows lacking a value with the prefix identity (per-row PATCH,
+#: resumable; NO drop, NO re-embed, no vector touched).
+#: v9: v0.2.102 W6-O — ``is_test`` (BOOL) on CodeAPI (19 of 22 VCO CodeAPI rows
+#: were test-fixture routes nothing could exclude). ADDITIVE + data-preserving:
+#: ``migrations/codegraph_collection/8_to_9.py`` add_property's it; the rows are
+#: backfilled data-side from their stored ``file_path``
+#: (``codegraph_resync.backfill_codegraph_metadata``, same as the v6 is_test) —
+#: NO drop, NO re-embed (``is_test`` is excluded from the content hash).
+CODEGRAPH_COLLECTION_SCHEMA_VERSION = 9
 
 # ===========================================================================
 # Layer 2 — KG node content schema (USER-CURATED — upgrade in place on bump)
@@ -212,6 +225,8 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 49 = migration 049_project_infra_declarations.sql (v0.2.102 W5-A / M3 —
+#: per-project external collections, unmanaged containers and local ports).
 #: 48 = migration 048_chat_model_context_text_only.sql (v0.2.101 — the
 #: image-capability flag: 1 = the vendor page states the model takes
 #: TEXT-ONLY input, so the gateway replaces image blocks routed to it with a
@@ -288,7 +303,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 48
+LAUNCHER_DB_TABLE_SET_VERSION = 49
 
 
 # ===========================================================================

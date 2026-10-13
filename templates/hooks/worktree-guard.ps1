@@ -30,6 +30,12 @@
 # the subagent silently fell back to the shared parent tree. This version
 # CREATES the worktree.
 #
+# -- Lane reservations (v0.2.102 W6-AA) ---------------------------------------
+# Before the repository checks, a pending lane reservation (vco_lib/lane_reservation.py)
+# is consumed for an `agent-*` identifier: the worktree is created in the
+# reserved repo/base/branch, or the reserved existing worktree is adopted; a
+# failed reservation aborts the create loudly. Same as worktree-guard.sh.
+#
 # ── VCT_WORKTREE_GUARD_ENFORCE (staged-enable flag — now vestigial) ───────
 # Creation is now the DEFAULT (ungated); a failed create always aborts
 # loudly. The flag only affects the belt-and-suspenders explicit-path branch:
@@ -55,10 +61,21 @@ $ScriptDir = $PSScriptRoot
 $StderrCap = Join-Path $ScriptDir "_lib/stderr-cap.ps1"
 if (Test-Path $StderrCap) { . $StderrCap }
 
-$ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
-$LogDir = Join-Path $ProjectRoot ".claude/logs"
-$LogFile = Join-Path $LogDir "worktree-guard.jsonl"
-try { New-Item -ItemType Directory -Force -Path $LogDir -ErrorAction SilentlyContinue | Out-Null } catch { }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py and _lib/project-root.sh). "" when no VCO project
+# encloses the current location: the worktree decision still runs, but the
+# log row, notices and launch records (state writes) are skipped.
+. (Join-Path $ScriptDir "_lib/project-root.ps1")
+$ProjectRoot = Get-VcoProjectRoot
+$LogDir = ""
+$LogFile = ""
+if ($ProjectRoot) {
+    $LogDir = Join-Path $ProjectRoot ".claude/logs"
+    $LogFile = Join-Path $LogDir "worktree-guard.jsonl"
+    try { New-Item -ItemType Directory -Force -Path $LogDir -ErrorAction SilentlyContinue | Out-Null } catch { }
+} else {
+    [Console]::Error.WriteLine("worktree-guard: no VCO project encloses $((Get-Location).Path); log, notices and launch records skipped")
+}
 
 # ── Read stdin (the WorktreeCreate payload) ───────────────────────────────
 $HookStdin = ""
@@ -85,6 +102,7 @@ function Log-Event([string]$decision, [string]$reason, [string]$proposed, [strin
             raw_payload   = $HookStdin
         }
         $json = $row | ConvertTo-Json -Compress -Depth 6
+        if (-not $LogFile) { return }
         Add-Content -Path $LogFile -Value $json -ErrorAction SilentlyContinue
     } catch { }
 }
@@ -161,7 +179,7 @@ function Sanitize-Id([string]$raw) {
 }
 
 # ── Resolve the git toplevel (the repo this create is scoped to) ──────────
-$GitScopeDir = $ProjectRoot
+$GitScopeDir = if ($ProjectRoot) { $ProjectRoot } else { (Get-Location).Path }  # a read
 if ($RepoHint -and (Test-Path -LiteralPath $RepoHint -PathType Container)) {
     $GitScopeDir = $RepoHint
 }
@@ -172,14 +190,187 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
     } catch { $Toplevel = "" }
 }
 
-# ── Not a git repo ⇒ graceful no-op ───────────────────────────────────────
-# Echo nothing + exit 0 so the harness does its own default — do NOT abort a
-# legitimate non-git spawn with a non-zero exit.
+# -- Isolation notices (v0.2.102 W6-Q) - must match worktree-guard.sh --------
+# The harness discards a WorktreeCreate systemMessage, so a non-default
+# create leaves a one-shot notice keyed by the identifier; the SubagentStart
+# hook subagent-start-isolation-check.ps1 hands it to the agent.
+$NoticeDir = ""
+if ($ProjectRoot) { $NoticeDir = Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "worktree-guard" }
+# Per-launch records (v0.2.102 W6-Q follow-up): one home is
+# _lib/worktree-records.ps1 (must match _lib/worktree-records.sh).
+$WtrecHelper = Join-Path $PSScriptRoot "_lib/worktree-records.ps1"
+if (Test-Path -LiteralPath $WtrecHelper) {
+    . $WtrecHelper
+    if ($ProjectRoot) { Remove-WtrecStale $ProjectRoot }
+}
+function Save-LaunchRecord([string]$mode, [string]$path, [string]$base, [string]$toplevel, [string]$extra = "") {
+    if (-not $ProjectRoot) { return }
+    if (Get-Command Write-WtrecRecord -ErrorAction SilentlyContinue) {
+        Write-WtrecRecord $ProjectRoot $WtName $mode $path $base $toplevel $extra
+    }
+}
+. (Join-Path $PSScriptRoot "_lib/utf8-nobom.ps1")  # BOM-free writes (review R5-8)
+function Write-Notice([string]$text) {
+    if (-not $NoticeDir) { return }
+    if (-not $WtName) { return }
+    if ($WtName -notmatch '^[A-Za-z0-9_-][A-Za-z0-9._-]*$') { return }
+    try {
+        New-Item -ItemType Directory -Force -Path $NoticeDir -ErrorAction Stop | Out-Null
+        Set-VcoUtf8Content -Path (Join-Path $NoticeDir "notice-$WtName.txt") -Value $text
+    } catch { }
+}
+
+# -- Lane reservation (v0.2.102 W6-AA) - must match worktree-guard.sh -------
+# A coordinator reserves this isolated agent's worktree in another repo first
+# (python -m vco_lib.lane_reservation reserve ...). The logic lives ONCE in
+# vco_lib/lane_reservation.py; this block only calls it. No pending file =>
+# nothing here runs and the guard behaves exactly as before. Consume exit 3 =
+# nothing to consume => fall through; any other failure is a LOUD abort, never
+# a silent fallback to a worktree of the project. A consume that exits 0
+# without its five non-empty lines (path, HEAD, repo, mode, extra JSON) is a
+# malformed success: the reservation is already claimed, so it is the same
+# loud abort. No VCO-side time bound: `git worktree add` on a very large repo
+# can take minutes and must never be killed mid-run; the WorktreeCreate
+# registration carries no timeout, so the harness default (600 s) is the
+# outer bound.
+# No enclosing VCO project => no reservation can exist (same as the .sh
+# sibling, whose `ls` on the root-less path fails quietly).
+$LanePending = ""
+if ($ProjectRoot) { $LanePending = Join-Path (Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "lane-reservations") "pending" }
+if ($LanePending -and $WtName -and (Test-Path -LiteralPath $LanePending -PathType Container) -and
+    @(Get-ChildItem -LiteralPath $LanePending -File -Filter "res-*.json" -ErrorAction SilentlyContinue).Count -gt 0) {
+    $VcoPy = $null
+    $VenvHelper = Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1"
+    if (Test-Path -LiteralPath $VenvHelper) {
+        . $VenvHelper
+        $VcoPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+    }
+    if (-not $VcoPy) {
+        $reason = "broken install: a lane reservation is pending in $LanePending but VCO's Python (vco_lib) cannot be resolved to consume it - repair the install (launcher: project Settings -> Update bundle), or cancel the reservation"
+        Log-Event "create_failed" $reason $ProposedPath ""
+        [Console]::Error.WriteLine("worktree-guard: ABORT - $reason")
+        exit 1
+    }
+    $LaneOut = @(& $VcoPy -m vco_lib.lane_reservation consume --project $ProjectRoot --name $WtName)
+    $LaneRc = $LASTEXITCODE
+    if ($LaneRc -eq 0) {
+        $LaneFields = @(0..4 | ForEach-Object { if ($_ -lt $LaneOut.Count) { [string]$LaneOut[$_] } else { "" } })
+        if (@($LaneFields | Where-Object { -not $_ }).Count -gt 0) {
+            $reason = "lane reservation consume reported success but its output was malformed (expected five non-empty lines: path, HEAD, repo, mode, extra JSON) - the reservation was claimed; no worktree of the project was created in its place"
+            Log-Event "create_failed" $reason $ProposedPath ""
+            [Console]::Error.WriteLine("worktree-guard: ABORT - $reason")
+            exit 1
+        }
+        $LanePath = [string]$LaneOut[0]
+        Log-Event "created" "lane_reservation" $ProposedPath $LanePath
+        Save-LaunchRecord ([string]$LaneOut[3]) $LanePath ([string]$LaneOut[1]) ([string]$LaneOut[2]) ([string]$LaneOut[4])
+        Emit-WtPath $LanePath
+        exit 0
+    } elseif ($LaneRc -ne 3) {
+        $reason = "lane reservation could not be honoured (consume exit $LaneRc; reason above) - no worktree of the project was created in its place"
+        Log-Event "create_failed" $reason $ProposedPath ""
+        [Console]::Error.WriteLine("worktree-guard: ABORT - $reason")
+        exit 1
+    }
+}
+
+# -- Not a git repo => run in place, isolation OFF, said out loud ------------
+# Echoing nothing fails the launch ("If the hook fails or produces no path,
+# worktree creation fails with an error" - hooks reference, WorktreeCreate
+# output). Return the working directory itself; the harness accepts a
+# directory with no git metadata that no repository contains. No
+# identifier => plain no-op. Same decision as worktree-guard.sh.
 if (-not $Toplevel) {
-    Log-Event "noop" "not_a_repo" $ProposedPath ""
+    if (-not $WtName) {
+        Log-Event "noop" "not_a_repo" $ProposedPath ""
+        exit 0
+    }
+    $RunDir = $GitScopeDir
+    try { $RunDir = (Resolve-Path -LiteralPath $GitScopeDir -ErrorAction Stop).ProviderPath } catch { }
+    Write-Notice "VCO worktree-guard: worktree isolation is OFF for this subagent. $RunDir is not inside a git repository, so no isolated worktree can be created; you are working DIRECTLY in the project folder and every edit lands there immediately. Say this in your final report. Isolation turns on by itself once the folder is a git repository (git init)."
+    Log-Event "in_place" "not_a_repo" $ProposedPath $RunDir
+    Save-LaunchRecord "in_place" $RunDir "" ""
+    [Console]::Error.WriteLine("worktree-guard: $RunDir is not a git repository - the subagent runs in place, without worktree isolation")
+    Emit-WtPath $RunDir
     exit 0
 }
 $ToplevelAbs = Norm-Path $Toplevel
+
+# -- No commits yet => base the worktree on a snapshot commit ----------------
+# Unborn HEAD makes `git worktree add --detach <path> HEAD` fail and the
+# harness refuses the main checkout itself, so build a commit of the working
+# tree through a throwaway index (user index/refs/HEAD untouched) and detach
+# the worktree there. Same decision as worktree-guard.sh.
+# v0.2.102 W6-R - must match the .sh: credential FILES are excluded from the
+# snapshot, by the ONE credential-file list (.claude/scripts/bash_security.py
+# --credential-file-globs). When it cannot be read (python or the script
+# missing - a broken install) the snapshot is REFUSED, never taken without
+# the exclusion.
+$BaseRef = "HEAD"
+$BaseReason = "worktree_add_detached_head"
+$SnapCredExcluded = ""
+& git -C $ToplevelAbs rev-parse --verify -q 'HEAD^{commit}' 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    $FindPy = Join-Path $ScriptDir "_lib/find-python.ps1"
+    if ((-not $PY) -and (Test-Path -LiteralPath $FindPy)) { . $FindPy }
+    $SnapSecurity = Join-Path (Join-Path (Split-Path -Parent $ScriptDir) "scripts") "bash_security.py"
+    $SnapGlobs = @()
+    if ($PY -and (Test-Path -LiteralPath $SnapSecurity)) {
+        try { $SnapGlobs = @(& $PY $SnapSecurity --credential-file-globs 2>$null | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() }) } catch { $SnapGlobs = @() }
+    }
+    if ($SnapGlobs.Count -eq 0) {
+        $pyShown = if ($PY) { $PY } else { "no python interpreter" }
+        $reason = "broken install: repository at $ToplevelAbs has no commits, and the credential-file list its snapshot must exclude could not be read ($pyShown / $SnapSecurity) - refusing to snapshot a working tree that may hold credential files; repair it with the project's bundle update (launcher: project Settings -> Update bundle)"
+        Log-Event "create_failed" $reason $ProposedPath ""
+        [Console]::Error.WriteLine("worktree-guard: ABORT - $reason")
+        exit 1
+    }
+    $SnapExcludes = @(':(exclude).claude/worktrees') + @($SnapGlobs | ForEach-Object { ":(exclude,glob)$_" })
+    $SnapCredSpecs = @($SnapGlobs | ForEach-Object { ":(glob)$_" })
+    try {
+        $SnapCredExcluded = (@(& git -C $ToplevelAbs ls-files --cached --others --exclude-standard -- @SnapCredSpecs 2>$null) |
+            Sort-Object -Unique | Select-Object -First 20) -join " "
+    } catch { $SnapCredExcluded = "" }
+    $SnapSha = ""
+    $SnapErr = ""
+    $SnapTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("vco-wtg-" + [guid]::NewGuid().ToString("N"))
+    $PrevIndex = $env:GIT_INDEX_FILE
+    $PrevNames = @($env:GIT_AUTHOR_NAME, $env:GIT_AUTHOR_EMAIL, $env:GIT_COMMITTER_NAME, $env:GIT_COMMITTER_EMAIL)
+    try {
+        New-Item -ItemType Directory -Force -Path $SnapTmp -ErrorAction Stop | Out-Null
+        $env:GIT_INDEX_FILE = Join-Path $SnapTmp "index"
+        $SnapErr = (& git -C $ToplevelAbs add -A -- . @SnapExcludes 2>&1 | Out-String)
+        if ($LASTEXITCODE -eq 0) {
+            $SnapTree = (& git -C $ToplevelAbs write-tree 2>$null | Select-Object -First 1)
+            if ($LASTEXITCODE -eq 0 -and $SnapTree) {
+                $env:GIT_AUTHOR_NAME = "VCO worktree-guard"
+                $env:GIT_AUTHOR_EMAIL = "worktree-guard@vco.invalid"
+                $env:GIT_COMMITTER_NAME = "VCO worktree-guard"
+                $env:GIT_COMMITTER_EMAIL = "worktree-guard@vco.invalid"
+                $out = (& git -C $ToplevelAbs -c commit.gpgsign=false commit-tree $SnapTree -m "VCO worktree-guard: snapshot of the working tree (repository has no commits yet)" 2>$null | Select-Object -First 1)
+                if ($LASTEXITCODE -eq 0 -and $out) { $SnapSha = ([string]$out).Trim() }
+            }
+        }
+    } catch {
+        $SnapErr = $_.Exception.Message
+    } finally {
+        $env:GIT_INDEX_FILE = $PrevIndex
+        $env:GIT_AUTHOR_NAME = $PrevNames[0]
+        $env:GIT_AUTHOR_EMAIL = $PrevNames[1]
+        $env:GIT_COMMITTER_NAME = $PrevNames[2]
+        $env:GIT_COMMITTER_EMAIL = $PrevNames[3]
+        try { Remove-Item -LiteralPath $SnapTmp -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    if (-not $SnapSha) {
+        $SnapDetail = if ($SnapErr -and $SnapErr.Trim()) { $SnapErr.Trim() } else { "git write-tree/commit-tree failed" }
+        $reason = "repository at $ToplevelAbs has no commits and a snapshot commit of its working tree could not be built: $SnapDetail"
+        Log-Event "create_failed" $reason $ProposedPath ""
+        [Console]::Error.WriteLine("worktree-guard: ABORT - $reason")
+        exit 1
+    }
+    $BaseRef = $SnapSha
+    $BaseReason = "worktree_add_snapshot_no_head"
+}
 
 # Create-Worktree: run `git worktree add --detach <target> HEAD`. Idempotent
 # (already-registered path → success). On genuine failure, emit reason to
@@ -207,12 +398,19 @@ function Create-Worktree([string]$target) {
     # agents; clean separate checkout of HEAD).
     $addErr = ""
     try {
-        $addErr = (& git -C $ToplevelAbs worktree add --detach $target HEAD 2>&1 | Out-String)
+        $addErr = (& git -C $ToplevelAbs worktree add --detach $target $BaseRef 2>&1 | Out-String)
     } catch {
         $addErr = $_.Exception.Message
     }
     if ($LASTEXITCODE -eq 0) {
-        Log-Event "created" "worktree_add_detached_head" $ProposedPath $target
+        if ($BaseRef -ne "HEAD") {
+            Write-Notice "VCO worktree-guard: this repository has no commits yet, so your isolated worktree ($target) starts from a SNAPSHOT of the project's working tree (commit $BaseRef, on no branch) instead of HEAD. The main checkout is untouched by your edits. Credential files (VCO's credential-file list: *.env, *.env.*, *.credentials, *.netrc, *.pgpass and the like) are EXCLUDED from the snapshot and are not in your worktree$(if ($SnapCredExcluded) { " - left out here: $SnapCredExcluded" }); if the task needs one, ask the caller instead of recreating it. Say this in your final report and give the user the command that brings your changes back: git -C `"$target`" add -A && git -C `"$target`" diff --binary --cached $BaseRef | git -C `"$ToplevelAbs`" apply"
+        }
+        Log-Event "created" $BaseReason $ProposedPath $target
+        $recMode = if ($BaseRef -eq "HEAD") { "head" } else { "snapshot" }
+        $recBase = ""
+        try { $recBase = ([string](& git -C $target rev-parse HEAD 2>$null | Select-Object -First 1)).Trim() } catch { }
+        Save-LaunchRecord $recMode $target $recBase $ToplevelAbs
         Emit-WtPath $target
         exit 0
     }

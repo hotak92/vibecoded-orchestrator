@@ -61,14 +61,9 @@ from .chunking import CHARS_PER_TOKEN_TEXT
 # prior hardcoded value). A malformed / <1 value falls back to the default so a
 # typo can't wedge retrieval into fetching zero candidates.
 def _resolve_overfetch(default: int = 2) -> int:
-    raw = os.getenv("KG_OVERFETCH_MULTIPLIER", "").strip()
-    if not raw:
-        return default
-    try:
-        val = int(raw)
-    except (TypeError, ValueError):
-        return default
-    return val if val >= 1 else default
+    from vco_lib.env_values import env_int  # noqa: PLC0415 — the one env-int reader
+
+    return env_int("KG_OVERFETCH_MULTIPLIER", default, minimum=1)
 
 
 _RL_OVERFETCH = _resolve_overfetch()
@@ -103,11 +98,17 @@ _rl_monitor_tasks: "set[asyncio.Task]" = set()
 # `cosine_sims` (max over answer-chunks × n_emb) + `literal_cited` and write
 # a single v3 citation event without re-fetching anything from Weaviate.
 #
-# Eviction: LRU-ish, bounded at `_RL_NODE_CACHE_MAX`. Entries are popped by
-# the monitor on success; expired-but-unwritten entries (timeout, evicted by
-# new traffic) are dropped silently — the retrieval event still got written
-# at cache-fill time, only the citation event is lost. This is the same
-# soft-fail discipline as the hub POST: no retry, no fallback.
+# Eviction: LRU-ish, bounded at `_RL_NODE_CACHE_MAX` entries AND (W6-MEM) at
+# `memory_bounds.node_cache_max_bytes()` estimated bytes (env
+# `VCO_RL_NODE_CACHE_MAX_BYTES`). Entries are popped by the monitor on fire.
+# Eviction loses no citation: a running monitor holds its own reference to its
+# ctx from its first poll (F-B), and every search also stages the durable
+# pending file the Stop-hook drain computes from (F-QUEUE).
+#
+# W6-MEM: entries are stored COMPACTED — every float vector packed into an
+# `array` buffer by `rl_client.ctx_compact.compact_ctx` (lossless) — and the
+# monitor calls `expand_ctx` before handing the ctx to any consumer, so the
+# consumers below still see plain `list[float]` values.
 #
 # Each entry shape (matches what `_rl_answer_monitor` reads):
 #   {
@@ -124,6 +125,11 @@ _rl_monitor_tasks: "set[asyncio.Task]" = set()
 #   }
 _rl_node_content_cache: dict[str, dict] = {}
 _RL_NODE_CACHE_MAX: int = 256
+# W6-MEM: estimated retained bytes per `_rl_node_content_cache` key, for the
+# byte bound. ONE home, read here directly (not re-exported): written by
+# `search_pipeline._store_compact_ctx` on store/eviction and popped by the
+# answer monitor (`rl_enrichment`) when it pops the cache entry at fire time.
+_rl_node_content_cache_sizes: dict[str, int] = {}
 
 # ─── Answer-monitor tuning ──────────────────────────────────────────────
 # NOTE (v0.2.73 M-1): the ``match_position_for_query as _match_position_for_query``
@@ -154,7 +160,9 @@ _RL_TOOL_CONTENT_LIMIT: int = 20_000         # per tool_use input, chars
 # writes ``.claude/state/rl_monitors_force_flush.flag``; the timeout is
 # now a pure safety valve for sessions that get neither (very short
 # answers, never compacted, never closed). 60 min absorbs slow agents
-# without leaking monitor tasks indefinitely.
+# without leaking monitor tasks indefinitely. v0.2.102 W6-RL2: it bounds the
+# monitor TASK only, never the citation — a monitor that times out leaves the
+# staged pending file to the Stop / SessionEnd drains (no scoring deadline).
 _RL_MONITOR_TIMEOUT: float = 3600.0           # 60 min hard ceiling (V52-N safety valve)
 # V52-N: PreCompact hook drops this sentinel; the monitor picks it up on
 # the next poll and fires with whatever's accumulated so far. After

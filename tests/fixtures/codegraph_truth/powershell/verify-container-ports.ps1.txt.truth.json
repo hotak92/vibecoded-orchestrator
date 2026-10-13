@@ -1,0 +1,18 @@
+{
+ "source": "verify-container-ports.ps1.txt",
+ "reviewed": "W6-L 2026-10-11: copy of templates/hooks/verify-container-ports.ps1. tree-sitter-powershell 0.26.4 reports a parse error at line 72 (a one-line switch with a default arm), so this file takes the REGEX fallback whole — kept as the gate's real parse-error fixture. Drafted from extractor output, every start/end line checked against the source",
+ "symbols": [
+  {"kind": "function", "name": "Get-VcoServiceOf", "start": 46, "end": 52, "full_name": "verify-container-ports.ps1.Get-VcoServiceOf"},
+  {"kind": "function", "name": "Add-VcoLogContainer", "start": 53, "end": 56, "full_name": "verify-container-ports.ps1.Add-VcoLogContainer"},
+  {"kind": "function", "name": "Add-VcoLogRecovery", "start": 57, "end": 60, "full_name": "verify-container-ports.ps1.Add-VcoLogRecovery"},
+  {"kind": "function", "name": "Write-VcoPortCheckLog", "start": 61, "end": 95, "full_name": "verify-container-ports.ps1.Write-VcoPortCheckLog"},
+  {"kind": "function", "name": "Read-VcoLifecyclePlan", "start": 192, "end": 194, "full_name": "verify-container-ports.ps1.Read-VcoLifecyclePlan"},
+  {"kind": "function", "name": "Get-VcoProbePort", "start": 196, "end": 202, "full_name": "verify-container-ports.ps1.Get-VcoProbePort"},
+  {"kind": "function", "name": "Get-VcoWatchList", "start": 219, "end": 245, "full_name": "verify-container-ports.ps1.Get-VcoWatchList"},
+  {"kind": "function", "name": "Test-PortHttp", "start": 249, "end": 257, "full_name": "verify-container-ports.ps1.Test-PortHttp"},
+  {"kind": "function", "name": "Test-PortTcp", "start": 259, "end": 272, "full_name": "verify-container-ports.ps1.Test-PortTcp"},
+  {"kind": "function", "name": "Test-ContainerRunning", "start": 274, "end": 278, "full_name": "verify-container-ports.ps1.Test-ContainerRunning"},
+  {"kind": "function", "name": "Test-ContainerPidAlive", "start": 280, "end": 291, "full_name": "verify-container-ports.ps1.Test-ContainerPidAlive"},
+  {"kind": "function", "name": "Find-VcoZombies", "start": 293, "end": 330, "full_name": "verify-container-ports.ps1.Find-VcoZombies"}
+ ]
+}

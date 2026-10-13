@@ -33,6 +33,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOK_SH = REPO / "templates" / "hooks" / "embedding-failures-surface.sh"
@@ -149,7 +150,7 @@ def _run_sh(project, state, venv, tmp_path):
 
 def _run_ps1(exe, project, state, venv, tmp_path):
     return subprocess.run(
-        [exe, "-NoProfile", "-File", str(HOOK_PS1)],
+        [exe, *PWSH_BASE_FLAGS, "-File", str(HOOK_PS1)],
         env=_env(project, state, venv, tmp_path),
         capture_output=True, text=True, timeout=120,
     )
@@ -282,7 +283,7 @@ def test_ps1_an_unresolvable_venv_is_reported_too(tmp_path):
     env = _env(project, state, tmp_path / "no-such-venv", tmp_path)
     env.pop("VCT_INSTALL_ROOT", None)
     result = subprocess.run(
-        [exe, "-NoProfile", "-File", str(hooks / HOOK_PS1.name)],
+        [exe, *PWSH_BASE_FLAGS, "-File", str(hooks / HOOK_PS1.name)],
         env=env, capture_output=True, text=True, timeout=120)
 
     assert result.returncode == 0

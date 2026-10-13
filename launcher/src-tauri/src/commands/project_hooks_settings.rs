@@ -384,7 +384,8 @@ pub async fn list_project_hooks_effective(
 }
 
 /// Testable core of [`list_project_hooks_effective`] (takes `&Db` instead of
-/// `State<Db>`) — the `create_starter_diagram_file_with_db` precedent.
+/// `State<Db>`) — the pattern the (v0.2.102-deleted)
+/// `create_starter_diagram_file_with_db` set.
 pub async fn effective_hooks_view(
     db: &Db,
     project_id: &str,
@@ -507,6 +508,9 @@ pub async fn effective_hooks_view(
     // is a control that lies until it is used. Soft-fail — anything that goes
     // wrong here keeps every parked row (see `prune_retired_parked_rows`).
     let parked = prune_retired_parked_rows(db, project_id).await;
+    // W6-HTAB: a disable that carries to a newly shipped event gets its own
+    // Disabled row (and its own Enable) — see `park_carried_registrations`.
+    let parked = park_carried_registrations(db, project_id, parked).await;
 
     // Parked (VCO-disabled) hooks: absent from the file BY OUR DOING, and
     // restorable. If one has somehow reappeared in the file (the user put the
@@ -956,6 +960,249 @@ pub async fn prune_retired_parked_rows(
     // Re-read rather than filtering the in-memory list: an unpark that failed
     // above must leave its row VISIBLE, and the DB is the only honest source
     // for which ones actually went.
+    db.list_parked_project_hooks(project_id).unwrap_or_default()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// W6-HTAB (v0.2.102): a disable that CARRIES to a newly shipped event gets
+// its own parked row at load
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Review R9 F3 taught the bundle merge that a hook parked on one event stays
+// off on events an upgrade NEWLY ships it on, while it runs on no event
+// (`vco_lib.parked_hooks.find_parked_match`, `live_identities`;
+// `stop-drain-citations` gained SubagentStop + SessionEnd). Python never
+// writes launcher.db, so those kept-out registrations had no row: the tab
+// listed only the parked Stop row, and the new events came back only at the
+// next bundle update after a re-enable.
+//
+// So the tab also ASKS, once per load and only when something is parked,
+// which registrations the user's disables carry to — and parks each one as
+// its own row, so every (hook, event) is its own toggle and Enable restores
+// exactly that registration at once (`enable_hook`, unchanged).
+//
+// The decision is Python's, and it is not a second copy of the rule: the CLI
+// runs the bundle merge itself and reads its kept-out records
+// (`vco_lib.parked_hooks.carried_registrations`). Python also builds the
+// parked entry (`hooks_settings.parked_entry_for_registration`, the blob
+// shape's one home). Rust only checks the answer against what it sent and
+// writes the rows — a write that can only ADD a disable for a registration
+// that is not running, never enable anything, and never overwrite parked
+// bytes (`park_carried_project_hook_entry`).
+
+/// One carried registration to park, checked against the rows we sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedParkRow {
+    pub event: String,
+    pub matcher: String,
+    pub command: String,
+    /// The event of the parked row whose disable carries here.
+    pub carried_from_event: String,
+    /// That row's command (an older spelling is possible).
+    pub parked_command: String,
+    /// The parked entry, verbatim as Python serialised it.
+    pub parked_json: String,
+    pub timeout_ms: Option<i64>,
+    pub source: String,
+    pub source_module: Option<String>,
+}
+
+/// The batched request: identity of every parked row, never its bytes, plus
+/// the project folder whose settings.json the merge reads.
+fn carried_request(
+    parked: &[vct_launcher_core::db::project_hooks_settings::ParkedHook],
+    project_folder: &str,
+) -> String {
+    serde_json::json!({
+        "project_folder": project_folder,
+        "parked": parked
+            .iter()
+            .map(|p| serde_json::json!({
+                "event": p.event,
+                "matcher": p.matcher,
+                "command": p.command,
+            }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+/// Which records of the CLI's `carried` array to park.
+///
+/// Pure, so the act and the leave-alone are testable without an interpreter.
+/// A record is used only when it names a source row we SENT (by
+/// `carried_from_event` + `parked_command`, never by position) and its key is
+/// not already parked — an answer about a row we did not send is ignored, the
+/// same rule `parked_rows_to_prune` applies. Malformed records are skipped.
+pub fn carried_rows_to_park(
+    parked: &[vct_launcher_core::db::project_hooks_settings::ParkedHook],
+    carried: &JsonValue,
+) -> Vec<CarriedParkRow> {
+    let Some(records) = carried.as_array() else {
+        return Vec::new();
+    };
+    let s = |v: &JsonValue, k: &str| v.get(k).and_then(JsonValue::as_str).map(str::to_string);
+    let mut out: Vec<CarriedParkRow> = Vec::new();
+    for rec in records {
+        let (Some(event), Some(command), Some(from), Some(from_cmd), Some(blob)) = (
+            s(rec, "event"),
+            s(rec, "command"),
+            s(rec, "carried_from_event"),
+            s(rec, "parked_command"),
+            s(rec, "parked_json"),
+        ) else {
+            continue;
+        };
+        let matcher = s(rec, "matcher").unwrap_or_default();
+        if event.is_empty() || command.is_empty() || blob.is_empty() {
+            continue;
+        }
+        let Some(source_row) = parked.iter().find(|p| p.event == from && p.command == from_cmd)
+        else {
+            continue;
+        };
+        let already = parked
+            .iter()
+            .any(|p| p.event == event && p.matcher == matcher && p.command == command)
+            || out
+                .iter()
+                .any(|r| r.event == event && r.matcher == matcher && r.command == command);
+        if already {
+            continue;
+        }
+        out.push(CarriedParkRow {
+            timeout_ms: rec
+                .get("timeout_seconds")
+                .and_then(JsonValue::as_i64)
+                .map(|t| t.saturating_mul(1000)),
+            source: source_row.source.clone(),
+            source_module: source_row.source_module.clone(),
+            event,
+            matcher,
+            command,
+            carried_from_event: from,
+            parked_command: from_cmd,
+            parked_json: blob,
+        });
+    }
+    out
+}
+
+/// Park every registration the project's disables carry to, then return the
+/// parked rows (re-read from the DB).
+///
+/// Soft-fail throughout, like [`prune_retired_parked_rows`]: no parked rows →
+/// returns at once and spawns NOTHING; CLI unreachable, refused (an
+/// unreadable settings.json is a refusal, never "nothing runs") or timed out
+/// → nothing is written and the view renders as before. The bundle merge
+/// keeps those registrations out either way; what fails here is only the
+/// extra rows.
+pub async fn park_carried_registrations(
+    db: &Db,
+    project_id: &str,
+    parked: Vec<vct_launcher_core::db::project_hooks_settings::ParkedHook>,
+) -> Vec<vct_launcher_core::db::project_hooks_settings::ParkedHook> {
+    let root = crate::commands::installer::resolve_install_root_sync(db);
+    park_carried_registrations_from(db, project_id, parked, root).await
+}
+
+/// [`park_carried_registrations`] with the install root already resolved —
+/// the seam its no-root arm is tested through.
+///
+/// The template is read from the SAME clone the CLI runs from (its cwd),
+/// passed explicitly so an ambient VCT_INSTALL_ROOT naming another clone
+/// cannot make the tab and this launcher's bundle update disagree. With NO
+/// resolved root the check is skipped with a warning (v0.2.102 R11-05): an
+/// empty `--orchestrator-root` would hand the choice to the CLI's own ladder,
+/// which consults that very ambient VCT_INSTALL_ROOT / VCT_ORCHESTRATOR_ROOT
+/// first. Nothing is written; the bundle merge still keeps the registrations
+/// out.
+async fn park_carried_registrations_from(
+    db: &Db,
+    project_id: &str,
+    parked: Vec<vct_launcher_core::db::project_hooks_settings::ParkedHook>,
+    root: Option<std::path::PathBuf>,
+) -> Vec<vct_launcher_core::db::project_hooks_settings::ParkedHook> {
+    if parked.is_empty() {
+        return parked;
+    }
+    let Some(root) = root else {
+        tracing::warn!(
+            "[vct] the orchestrator clone could not be resolved — skipped the check of which \
+             events {} parked hook(s) of project {} carry to; no row added, the bundle update \
+             still keeps them off.",
+            parked.len(),
+            project_id
+        );
+        return parked;
+    };
+    let Ok(folder) = project_folder(db, project_id) else {
+        return parked;
+    };
+    let body = carried_request(&parked, &folder.to_string_lossy());
+    // Module and argv stay literal so the argv-contract census
+    // (tests/test_v0297_vco_lib_argv_contract.py) parses this call with the
+    // module's real parser — `vco_lib/parked_hooks.py` `build_parser`.
+    let answer = match run_vco_lib_json(
+        db,
+        "vco_lib.parked_hooks",
+        &[
+            std::ffi::OsStr::new("carried"),
+            std::ffi::OsStr::new("--orchestrator-root"),
+            root.as_os_str(),
+        ],
+        Some(&body),
+        "the parked-hook carry check",
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "[vct] could not ask which events {} parked hook(s) of project {} carry to: \
+                 {} — no row added; the bundle update still keeps them off.",
+                parked.len(),
+                project_id,
+                e.message
+            );
+            return parked;
+        }
+    };
+    let rows = carried_rows_to_park(&parked, answer.get("carried").unwrap_or(&JsonValue::Null));
+    if rows.is_empty() {
+        return parked;
+    }
+    for row in &rows {
+        match db.park_carried_project_hook_entry(
+            project_id,
+            &row.event,
+            &row.matcher,
+            &row.command,
+            &row.parked_json,
+            &row.source,
+            row.source_module.as_deref(),
+            row.timeout_ms,
+        ) {
+            Ok(true) => audit_soft(
+                "project_hook_disabled_carried",
+                db,
+                project_id,
+                &serde_json::json!({
+                    "event": row.event,
+                    "matcher": row.matcher,
+                    "command": row.command,
+                    "carried_from_event": row.carried_from_event,
+                    "parked_command": row.parked_command,
+                    "noticed_by": "hooks_tab_load",
+                }),
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                "[vct] could not park the carried registration `{}` under {}: {}",
+                row.command, row.event, e
+            ),
+        }
+    }
     db.list_parked_project_hooks(project_id).unwrap_or_default()
 }
 
@@ -2353,5 +2600,222 @@ mod tests {
             .await
             .expect("enable must succeed");
         assert_eq!(f.raw(), before, "every rule restored byte-identically");
+    }
+
+    // ─── W6-HTAB: a carried disable gets its own row ────────────────────
+
+    /// The shipped drain command (both templates spell it this way on Linux).
+    const DRAIN: &str = r#"bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-drain-citations.sh""#;
+
+    /// A settings.json where the drain runs on NO event (the user disabled
+    /// it on Stop before v0.2.102 shipped it on SubagentStop + SessionEnd).
+    const DRAIN_OFF_SETTINGS: &str = r#"{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/notify-stop.sh", "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+    fn park_drain_on_stop(f: &Fixture) {
+        let blob = serde_json::json!({
+            "schema": 1, "event": "Stop", "matcher": "", "group_index": 0,
+            "hook_index": 1,
+            "item": {"type": "command", "command": DRAIN, "timeout": 30, "async": true},
+            "group_removed": false, "group_extra": {}, "group_key_index": null,
+            "event_index": null, "hooks_key_index": null
+        })
+        .to_string();
+        f.db.park_project_hook_entry(&f.pid, "Stop", "", DRAIN, &blob).unwrap();
+    }
+
+    fn disabled_events(view: &EffectiveHooksView, command: &str) -> Vec<String> {
+        let mut ev: Vec<String> = view
+            .hooks
+            .iter()
+            .filter(|h| h.command == command && h.state == HookState::Disabled)
+            .map(|h| h.event.clone())
+            .collect();
+        ev.sort();
+        ev
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_parked_on_stop_lists_its_new_events_as_disabled_rows() {
+        // ACT. RED at the lane's start HEAD: only the Stop row was listed.
+        let f = Fixture::with_settings(DRAIN_OFF_SETTINGS);
+        park_drain_on_stop(&f);
+        let before = f.raw();
+
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+
+        assert_eq!(
+            disabled_events(&view, DRAIN),
+            vec!["SessionEnd", "Stop", "SubagentStop"],
+            "each (hook, event) is its own Disabled row"
+        );
+        for ev in ["SessionEnd", "SubagentStop"] {
+            let blob = f.db.get_parked_project_hook_entry(&f.pid, ev, "", DRAIN).unwrap();
+            assert!(blob.is_some(), "{ev} has its own parked row");
+        }
+        assert_eq!(f.raw(), before, "the load writes the DB only — settings.json untouched");
+        assert!(view.hooks.iter().all(|h| !(h.command == DRAIN && h.state == HookState::Active)));
+
+        // Idempotent: a second load adds nothing.
+        let again = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        assert_eq!(disabled_events(&again, DRAIN), disabled_events(&view, DRAIN));
+        assert_eq!(f.db.list_parked_project_hooks(&f.pid).unwrap().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn re_enabling_a_carried_row_restores_exactly_that_registration_now() {
+        // ACT (enable). SessionEnd comes back at once — not at the next
+        // bundle update — and Stop / SubagentStop stay off.
+        let f = Fixture::with_settings(DRAIN_OFF_SETTINGS);
+        park_drain_on_stop(&f);
+        effective_hooks_view(&f.db, &f.pid).await.unwrap();
+
+        enable_hook(&f.db, &f.pid, "SessionEnd", "", DRAIN).await.expect("enable");
+
+        assert_eq!(f.commands_under("SessionEnd"), vec![DRAIN.to_string()]);
+        let entry = &f.json()["hooks"]["SessionEnd"][0]["hooks"][0];
+        assert_eq!(entry["timeout"], 5, "the shipped registration, verbatim");
+        assert!(!f.commands_under("Stop").iter().any(|c| c.contains("stop-drain-citations")));
+        assert!(f.commands_under("SubagentStop").is_empty());
+
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        assert_eq!(disabled_events(&view, DRAIN), vec!["Stop", "SubagentStop"]);
+        assert!(view
+            .hooks
+            .iter()
+            .any(|h| h.event == "SessionEnd" && h.command == DRAIN && h.state == HookState::Active));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_still_running_on_another_event_gets_no_carried_row() {
+        // LEAVE-ALONE. Disabled on Stop but running on SubagentStop: the user
+        // turned off ONE event, so nothing is carried and nothing is written.
+        let body = format!(
+            r#"{{"hooks": {{"SubagentStop": [{{"hooks": [{{"type": "command", "command": {}}}]}}]}}}}"#,
+            serde_json::to_string(DRAIN).unwrap()
+        );
+        let f = Fixture::with_settings(&body);
+        park_drain_on_stop(&f);
+
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+
+        assert_eq!(disabled_events(&view, DRAIN), vec!["Stop"]);
+        let parked = f.db.list_parked_project_hooks(&f.pid).unwrap();
+        assert_eq!(parked.len(), 1, "only the user's own Stop row");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_resolved_install_root_skips_the_carry_check_and_writes_nothing() {
+        // LEAVE-ALONE (v0.2.102 R11-05). With no resolved clone the check is
+        // skipped (warn) rather than sent with an empty `--orchestrator-root`,
+        // which the CLI would resolve through the ambient VCT_INSTALL_ROOT /
+        // this vco_lib's clone and park rows from THAT template. RED before the
+        // fix: the "" root answered from this checkout and parked 2 rows.
+        let f = Fixture::with_settings(DRAIN_OFF_SETTINGS);
+        park_drain_on_stop(&f);
+        let parked = f.db.list_parked_project_hooks(&f.pid).unwrap();
+        let before = f.raw();
+
+        let back = park_carried_registrations_from(&f.db, &f.pid, parked, None).await;
+
+        assert_eq!(back.len(), 1, "the parked rows come back unchanged");
+        assert_eq!(f.db.list_parked_project_hooks(&f.pid).unwrap().len(), 1, "no row added");
+        assert!(f.db.get_parked_project_hook_entry(&f.pid, "SessionEnd", "", DRAIN).unwrap().is_none());
+        assert_eq!(f.raw(), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_parked_writes_no_carried_row() {
+        // LEAVE-ALONE. No parked rows → the carry step returns before any
+        // spawn and the DB stays empty.
+        let f = Fixture::with_settings(DRAIN_OFF_SETTINGS);
+        assert!(park_carried_registrations(&f.db, &f.pid, Vec::new()).await.is_empty());
+        effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        assert!(f.db.list_parked_project_hooks(&f.pid).unwrap().is_empty());
+    }
+
+    fn carry_parked_row(event: &str, command: &str) -> vct_launcher_core::db::project_hooks_settings::ParkedHook {
+        vct_launcher_core::db::project_hooks_settings::ParkedHook {
+            id: 1,
+            event: event.to_string(),
+            matcher: String::new(),
+            command: command.to_string(),
+            source: "bundled".to_string(),
+            source_module: None,
+            timeout_ms: None,
+            disabled_entry_json: "{}".to_string(),
+        }
+    }
+
+    fn carried_record(event: &str, from: &str, from_cmd: &str) -> JsonValue {
+        serde_json::json!({
+            "event": event, "matcher": "", "command": DRAIN,
+            "carried_from_event": from, "parked_command": from_cmd,
+            "timeout_seconds": 5, "parked_json": "{\"schema\":1}"
+        })
+    }
+
+    #[test]
+    fn a_carried_record_naming_a_sent_row_is_parked_with_its_label() {
+        let parked = vec![carry_parked_row("Stop", "bash .claude/hooks/stop-drain-citations.sh")];
+        let rows = carried_rows_to_park(
+            &parked,
+            &serde_json::json!([carried_record(
+                "SessionEnd", "Stop", "bash .claude/hooks/stop-drain-citations.sh"
+            )]),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event, "SessionEnd");
+        assert_eq!(rows[0].source, "bundled");
+        assert_eq!(rows[0].timeout_ms, Some(5000));
+        assert_eq!(rows[0].parked_json, "{\"schema\":1}");
+    }
+
+    #[test]
+    fn a_carried_record_about_a_row_we_did_not_send_is_ignored() {
+        let parked = vec![carry_parked_row("Stop", DRAIN)];
+        let answer = serde_json::json!([
+            carried_record("SessionEnd", "Stop", "bash .claude/hooks/other.sh"),
+            carried_record("SessionEnd", "PreToolUse", DRAIN),
+        ]);
+        assert!(carried_rows_to_park(&parked, &answer).is_empty());
+    }
+
+    #[test]
+    fn an_already_parked_key_or_a_malformed_answer_parks_nothing() {
+        let parked = vec![carry_parked_row("Stop", DRAIN), carry_parked_row("SessionEnd", DRAIN)];
+        let dup = serde_json::json!([carried_record("SessionEnd", "Stop", DRAIN)]);
+        assert!(carried_rows_to_park(&parked, &dup).is_empty());
+        assert!(carried_rows_to_park(&parked, &JsonValue::Null).is_empty());
+        let mut no_blob = carried_record("SubagentStop", "Stop", DRAIN);
+        no_blob.as_object_mut().unwrap().remove("parked_json");
+        assert!(carried_rows_to_park(&parked, &serde_json::json!([no_blob])).is_empty());
+        let twice = serde_json::json!([
+            carried_record("SubagentStop", "Stop", DRAIN),
+            carried_record("SubagentStop", "Stop", DRAIN),
+        ]);
+        assert_eq!(carried_rows_to_park(&parked, &twice).len(), 1);
+    }
+
+    #[test]
+    fn the_carry_request_carries_identity_only() {
+        let parked = vec![carry_parked_row("Stop", DRAIN)];
+        let body: JsonValue = serde_json::from_str(&carried_request(&parked, "/p")).unwrap();
+        assert_eq!(body["project_folder"], "/p");
+        assert_eq!(
+            body["parked"],
+            serde_json::json!([{"event": "Stop", "matcher": "", "command": DRAIN}]),
+            "never the parked bytes"
+        );
     }
 }

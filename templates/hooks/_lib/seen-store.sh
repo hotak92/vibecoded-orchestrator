@@ -453,6 +453,9 @@ vco_seen_hash() {
 # Block shape (producers, --hook-format):
 #   KG:   <title> | <node_type> | score=<n.nn> | <body...>   [| src=<path>]
 #   CODE: <full_name> | <collection> | distance=<d> [| source=<peer>] [| src=<path>]
+#   NOTE: <advisory id> | ...   (v0.2.102 W6-N F-8: the router's before-edit
+#         prompt-agent nudge; keyed like CODE on its first field, so it is
+#         shown once per session per file, cache replays included)
 #   <indented/continuation body lines>
 #   <blank line terminates the block>
 vco_filter_seen_blocks() {
@@ -469,7 +472,7 @@ vco_filter_seen_blocks() {
     fi
 
     local filtered=""
-    local cur_prefix=""        # "KG" | "CODE" | ""
+    local cur_prefix=""        # "KG" | "CODE" | "NOTE" | ""
     local cur_first=""         # first header field (title / full_name)
     local cur_src=""           # source path from "| src=" suffix
     local cur_block=""         # full text of the block (header + body)
@@ -518,7 +521,7 @@ vco_filter_seen_blocks() {
 
     local line
     while IFS= read -r line; do
-        if [[ "$line" =~ ^(KG|CODE):\ (.+)$ ]]; then
+        if [[ "$line" =~ ^(KG|CODE|NOTE):\ (.+)$ ]]; then
             _vco_flush
             cur_prefix="${BASH_REMATCH[1]}"
             local rest="${BASH_REMATCH[2]}"

@@ -145,6 +145,14 @@ if [ "$_kg_debounce_lib_preset" = "0" ]; then
 fi
 unset _kg_debounce_lib_preset
 
+# v0.2.102 W6-C1 (F16): the per-agent key helper, for the failure-row
+# sentinel below. Conditional source (a partial install keeps the debounce
+# working; the sentinel then keys on the session alone — the pre-W6-C1
+# behaviour, reported at the next SessionStart health probe).
+# shellcheck source=session-id.sh disable=SC1091
+[ -r "$(dirname "$_KG_DEBOUNCE_LIB")/session-id.sh" ] \
+    && . "$(dirname "$_KG_DEBOUNCE_LIB")/session-id.sh"
+
 # POSIX single-quote escaper: wraps $1 so it survives `eval` even if it
 # contains spaces or single quotes. A literal ' becomes '\'' (close,
 # escaped-quote, reopen). Use this for any user-controlled path embedded
@@ -164,8 +172,8 @@ _kg_debounce_window() {
 }
 
 # State dir for pending-sync locks. Lives under the project's
-# .claude/state/ (the canonical hook state dir — same one the diagram
-# throttle and gate-skipped sentinels use). $1 = PROJECT_ROOT.
+# .claude/state/ (the canonical hook state dir — same one the
+# gate-skipped sentinels and the former diagram throttle used). $1 = PROJECT_ROOT.
 _kg_debounce_dir() {
     printf '%s/.claude/state/kg_sync_pending' "$1"
 }
@@ -190,9 +198,9 @@ _KG_DEBOUNCE_REAP_THROTTLE_SECONDS=30
 # MUST MATCH _lib/kg-sync-debounce.ps1 ($KG_DEBOUNCE_LOCK_CEILING).
 _KG_DEBOUNCE_LOCK_CEILING=64
 
-# Hash a file path → a slash-free lock key. Reuses the portable
-# md5-via-Python pattern already used by the diagram throttle in
-# post-file-edit.sh. $1 = path, $2 = python interpreter ($PY).
+# Hash a file path → a slash-free lock key. Portable md5-via-Python
+# pattern (the same one the former diagram throttle in post-file-edit.sh
+# used). $1 = path, $2 = python interpreter ($PY).
 _kg_debounce_key() {
     printf '%s' "$1" \
         | "$2" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" \
@@ -282,13 +290,25 @@ _kg_debounce_json_escape() {
 # [A-Za-z0-9_-] charset `_lib/session-id.sh` enforces, because it is
 # interpolated into a FILE NAME; anything else collapses to "default", and an
 # absent session id (a wrapper run outside a Claude session) to "nosession".
+# v0.2.102 W6-C1 (F16): when the run belongs to a SUBAGENT (the spawning
+# wrapper exported VCT_AGENT_ID), the key gains the __<agent_id> component
+# via the ONE session-id helper — the once-per-session failure notice is
+# delivered as hook context, which reaches the SUBAGENT only, so a
+# session-keyed sentinel let one lane's notice silence the row for the main
+# chat (and every sibling lane). MUST MATCH Get-KgDebounceSessionKey.
 _kg_debounce_session_key() {
     local raw="${VCT_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
     [ -n "$raw" ] || { printf '%s' "nosession"; return 0; }
+    local out
     case "$raw" in
-        *[!a-zA-Z0-9_-]*) printf '%s' "default" ;;
-        *)                printf '%s' "$raw" ;;
+        *[!a-zA-Z0-9_-]*) out="default" ;;
+        *)                out="$raw" ;;
     esac
+    if [ -n "${VCT_AGENT_ID:-}" ] \
+        && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+        out="$(vco_hook_agent_key_from_ids "$out" "$VCT_AGENT_ID")"
+    fi
+    printf '%s' "$out"
 }
 
 # Record ONE failure row for this session+channel. Best-effort in every
@@ -328,6 +348,11 @@ _kg_debounce_record_failure() {
     row="$row,\"channel\":\"$(_kg_debounce_json_escape "$chan")\""
     row="$row,\"exit\":$rc"
     row="$row,\"session\":\"$(_kg_debounce_json_escape "$(_kg_debounce_session_key)")\""
+    # v0.2.102 W6-C2 (census F15): the subagent attribution the write hooks
+    # export for this child (post-file-edit / post-bash-file-sync). Empty for
+    # the main chat; session-start-retrieval-health names the lane.
+    row="$row,\"agent_id\":\"$(_kg_debounce_json_escape "${VCT_AGENT_ID:-}")\""
+    row="$row,\"agent_type\":\"$(_kg_debounce_json_escape "${VCT_AGENT_TYPE:-}")\""
     row="$row,\"log\":\"$(_kg_debounce_json_escape "${log:-}")\""
     row="$row,\"last_stderr\":\"$(_kg_debounce_json_escape "$tail_line")\"}"
 
@@ -581,8 +606,8 @@ _kg_debounce_reap_stale() {
     now=$(date +%s 2>/dev/null) || return 0
 
     # Reaper throttle: skip the O(M^2) sweep if we ran it within the last
-    # ~30s. Mirrors the diagram-throttle stamp-file pattern in
-    # post-file-edit.sh (~line 336). A `.ts` stamp holds the epoch of the
+    # ~30s. Stamp-file pattern (as the former diagram throttle in
+    # post-file-edit.sh used). A `.ts` stamp holds the epoch of the
     # last completed reap; we no-op if it's too recent. This is SAFE for
     # coalesce-NEVER-DROP: orphans are recovered by the very NEXT
     # un-throttled reap, at most ~throttle extra delay, still well inside

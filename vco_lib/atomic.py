@@ -51,6 +51,17 @@ Public surface:
 * :func:`claim_once` — ``O_CREAT|O_EXCL`` "first concurrent run wins"
   claim with a stale-takeover age (v0.2.101 N2); holds on Windows too and
   outlives the winner's process.
+* :func:`portable_exclusive_lock` — a lock that HOLDS on Windows too:
+  ``flock`` where it exists, else an ``O_CREAT|O_EXCL`` sidecar spin-lock
+  (the protocol ``kg-update-nudge.ps1`` uses) with a stale takeover
+  (v0.2.102 W6-C2 fix round, review R4c-2).
+* :func:`claim_by_rename` / :func:`release_rename_claim` /
+  :func:`claim_owner_gone` — the per-pid RENAME claim (``<name><mark><pid>``)
+  two processes use to agree who owns a queue file, and the one "is this
+  claim abandoned?" rule (dead pid; or older than a stale age with the pid's
+  holder proven to be a REUSE — review R5-4). Used by the
+  RL citation drain and the subagent alert channel (v0.2.102 W6-C2 fix
+  round, reviews R4c-1/R4c-2).
 
 v0.2.53 landed the module with these three exports. v0.2.54 Track J
 completed the consolidation this paragraph used to queue: the sibling
@@ -139,6 +150,7 @@ def atomic_write_bytes(
     fsync: bool = True,
     mode: Optional[int] = None,
     symlink_safe: bool = False,
+    tmp_prefix: Optional[str] = None,
 ) -> Optional[Path]:
     """Write ``data`` to ``path`` atomically (binary mode).
 
@@ -162,6 +174,13 @@ def atomic_write_bytes(
             :func:`_symlink_safe_redirect_target` (same convention as
             :func:`atomic_copy_file`), and that target is returned. The
             symlink and its destination are untouched.
+        tmp_prefix: Prefix of the same-directory tempfile, in place of the
+            default ``<name>.``. For a caller whose destination name sits
+            inside a glob something else polls: the default tempfile
+            ``<name>.<rand>.tmp`` of a ``<x>.delivering.<pid>`` claim would
+            itself match ``*.delivering.*`` and, left by a crash, read as a
+            fake claim (``vco_lib.agent_alerts`` passes a dot-led prefix that
+            no ``agent_alerts_*`` glob matches).
 
     Returns:
         ``None`` on a normal write; the redirect ``Path`` when
@@ -178,7 +197,7 @@ def atomic_write_bytes(
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path_str = tempfile.mkstemp(
-        prefix=target.name + ".",
+        prefix=tmp_prefix if tmp_prefix is not None else target.name + ".",
         suffix=".tmp",
         dir=str(parent),
     )
@@ -703,6 +722,188 @@ def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -
             pass
 
 
+#: Start times closer than this are the same process (psutil ``create_time``
+#: is derived from boot time + clock ticks, so it can wobble by a tick).
+_START_TIME_TOLERANCE_S = 1.0
+
+
+def _slot_holder_path(slot_dir: Path, i: int) -> Path:
+    return Path(slot_dir) / f"slot-{i}.holder.json"
+
+
+def _slot_takeover_lock_path(slot_dir: Path, i: int) -> Path:
+    return Path(slot_dir) / f"slot-{i}.takeover.lock"
+
+
+def _this_process_holder(*, takeover: bool) -> dict:
+    from vco_lib.update_lock import process_start_time  # noqa: PLC0415
+
+    pid = os.getpid()
+    return {"pid": pid, "start_time": process_start_time(pid), "takeover": takeover}
+
+
+def _read_slot_holder(path: Path) -> Optional[dict]:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def slot_holder_provably_dead(holder: Optional[dict]) -> bool:
+    """PURE-ish (reads the process table): is the recorded slot holder PROVABLY
+    gone? True only when ``update_lock.pid_alive`` says False, when the pid now
+    belongs to a different process (start time differs from the recorded one —
+    pid reuse), or when the holder is THIS process (a re-entrant take must not
+    wait on itself). Everything unknown — no record, a malformed one, an
+    undeterminable liveness or start time — counts as ALIVE."""
+    if not isinstance(holder, dict):
+        return False
+    pid = holder.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    from vco_lib.update_lock import pid_alive, process_start_time  # noqa: PLC0415
+
+    if pid == os.getpid():
+        return True  # this process (or a dead one whose pid we now carry)
+    if pid_alive(pid) is False:
+        return True
+    recorded = holder.get("start_time")
+    if isinstance(recorded, (int, float)) and not isinstance(recorded, bool):
+        now = process_start_time(pid)
+        if now is not None and abs(float(recorded) - now) > _START_TIME_TOLERANCE_S:
+            return True
+    return False
+
+
+def _write_slot_holder(path: Path, payload: Optional[dict]) -> None:
+    """Best-effort: a holder record that cannot be written only means waiters
+    read the slot's holder as unknown (= alive) — conservative, never unsafe."""
+    try:
+        if payload is None:
+            Path(path).unlink(missing_ok=True)
+        else:
+            atomic_write_json(path, payload)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def machine_slot(
+    slot_dir: Path,
+    *,
+    slots: int,
+    wait_s: float,
+    poll_s: float = 5.0,
+    on_wait: Optional[Any] = None,
+    on_takeover: Optional[Any] = None,
+) -> Iterator[Optional[int]]:
+    """Hold ONE of ``slots`` machine-wide slots under ``slot_dir`` for the block
+    — a counting semaphore built from :func:`exclusive_file_lock` (v0.2.102
+    W1-C), one lock file per slot (``slot-<i>.lock``).
+
+    Queue, never drop:
+    * each poll tries every slot non-blocking, and the first free one is held
+      for the block; the holder records itself in ``slot-<i>.holder.json``
+      (pid + process start time) and removes the record on exit;
+    * when all are busy, ``on_wait(waited_s)`` is called (the caller logs a
+      line) — once when the wait starts, then once per further ``wait_s``
+      period ("still queued") — and the take retries every ``poll_s``;
+    * after ``wait_s`` (v0.2.102 W6-U) the driver keeps waiting while every
+      holder is alive — it does NOT run over a live holder. It takes over a
+      busy slot only when that slot's recorded holder is PROVABLY dead
+      (:func:`slot_holder_provably_dead`; unknown counts as alive). The
+      takeover happens under a non-blocking ``slot-<i>.takeover.lock`` held for
+      the block, so of N expired waiters exactly one takes a given slot, and
+      the taker rewrites the holder record with itself, so other waiters see a
+      live holder; on exit it restores the dead holder's record, so a slot
+      whose flock stays held (a lock fd leaked into a surviving child) can be
+      taken over again. ``on_takeover(slot, dead_holder)`` lets the caller log.
+
+    Known limit (narrow overlap window): the holder record is written just
+    AFTER the flock is taken. A crashed holder leaves its record behind (its
+    flock is released with the process); if a new holder takes that freed
+    flock and an expired waiter reads the stale dead record in the instant
+    before the new holder overwrites it, the waiter takes over a slot that is
+    in fact live — two drivers run on one slot until one finishes. The same
+    holds when a dead holder's lock fd survives in a child process that is
+    still working. Both need an expired wait AND a crash; the cost is one
+    over-cap run, never a lost or corrupted one.
+
+    A slot is released when the block exits. Because ``flock`` belongs to the
+    open file description, it is also released when the holder process exits
+    or crashes.
+
+    Best-effort exactly like :func:`exclusive_file_lock`: where ``flock`` does
+    not exist (Windows, or a filesystem without it) the first slot "succeeds"
+    without exclusion, so the block runs unbounded, as it did before. The
+    yielded value is always a slot index (``Optional`` only for callers typed
+    against the pre-W6-U contract, which yielded ``None`` on expiry).
+    """
+    import time  # noqa: PLC0415
+
+    n = max(1, int(slots))
+    period = max(0.0, float(wait_s))
+    started = time.monotonic()
+    deadline = started + period
+    next_notice: Optional[float] = None
+
+    def _notify(cb: Optional[Any], *args: Any) -> None:
+        if cb is None:
+            return
+        try:
+            cb(*args)
+        except Exception:  # noqa: BLE001 — a log hook never blocks the queue
+            pass
+
+    while True:
+        for i in range(n):
+            cm = exclusive_file_lock(Path(slot_dir) / f"slot-{i}.lock", timeout_s=0)
+            try:
+                cm.__enter__()
+            except LockTimeout:
+                continue
+            holder_path = _slot_holder_path(slot_dir, i)
+            mine = _this_process_holder(takeover=False)
+            _write_slot_holder(holder_path, mine)
+            try:
+                yield i
+            finally:
+                if _read_slot_holder(holder_path) == json.loads(json.dumps(mine)):
+                    _write_slot_holder(holder_path, None)
+                cm.__exit__(None, None, None)
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            for i in range(n):
+                holder_path = _slot_holder_path(slot_dir, i)
+                if not slot_holder_provably_dead(_read_slot_holder(holder_path)):
+                    continue
+                tcm = exclusive_file_lock(_slot_takeover_lock_path(slot_dir, i), timeout_s=0)
+                try:
+                    tcm.__enter__()
+                except LockTimeout:
+                    continue  # another waiter is taking this slot over
+                try:
+                    dead = _read_slot_holder(holder_path)  # re-read under the lock
+                    if not slot_holder_provably_dead(dead):
+                        continue
+                    _write_slot_holder(holder_path, _this_process_holder(takeover=True))
+                    _notify(on_takeover, i, dead)
+                    try:
+                        yield i
+                    finally:
+                        _write_slot_holder(holder_path, dead)
+                    return
+                finally:
+                    tcm.__exit__(None, None, None)
+        if next_notice is None or now >= next_notice:
+            _notify(on_wait, now - started)
+            # then "still queued" once per wait period (floored: wait_s=0 never spams)
+            next_notice = (next_notice or started) + max(period, 10 * float(poll_s))
+        time.sleep(max(0.05, float(poll_s)))
+
+
 def claim_once(path: Path, *, stale_after_s: float) -> Optional[bool]:
     """Claim *path* ATOMICALLY by creating it with ``O_CREAT | O_EXCL``.
 
@@ -770,3 +971,164 @@ def claim_once(path: Path, *, stale_after_s: float) -> Optional[bool]:
             os.close(fd)
         return True
     return False
+
+
+# ── v0.2.102 W6-C2 fix round (review R4c-2): a lock that holds on Windows ──
+
+#: Suffix of the O_EXCL sidecar :func:`portable_exclusive_lock` uses where
+#: ``flock`` does not exist. Distinct from the flock lockfile (which is
+#: created and LEFT on disk), so the two protocols never share a name.
+EXCL_SIDECAR_SUFFIX = ".excl"
+
+
+def _flock_available() -> bool:
+    import importlib.util  # noqa: PLC0415
+
+    return importlib.util.find_spec("fcntl") is not None
+
+
+@contextlib.contextmanager
+def excl_sidecar_lock(lock_path: Path, *, spin_s: float = 5.0,
+                      stale_after_s: float = 30.0) -> Iterator[bool]:
+    """``O_CREAT|O_EXCL`` spin-lock on ``<lock_path>.excl``; yields whether
+    the lock is held. Atomic on POSIX and Windows. A sidecar older than
+    ``stale_after_s`` is a crashed holder's and is taken over; after
+    ``spin_s`` without the lock the block runs unlocked (best effort — the
+    callers' work must not be dropped because a lock was busy), exactly the
+    ``kg-update-nudge.ps1`` posture. The sidecar is removed on exit only by
+    the holder that created it."""
+    import time  # noqa: PLC0415
+
+    side = Path(str(lock_path) + EXCL_SIDECAR_SUFFIX)
+    try:
+        side.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    fd = None
+    deadline = time.monotonic() + max(0.0, float(spin_s))
+    while True:
+        try:
+            fd = os.open(str(side), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - side.stat().st_mtime >= stale_after_s:
+                    side.unlink()
+                    continue
+            except OSError:
+                pass
+        except OSError:
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    try:
+        yield fd is not None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                side.unlink()
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def portable_exclusive_lock(lock_path: Path, *, use_flock: Optional[bool] = None,
+                            spin_s: float = 5.0,
+                            stale_after_s: float = 30.0) -> Iterator[None]:
+    """Exclusive lock that holds on every OS: :func:`exclusive_file_lock`
+    (a real ``flock``, released by the kernel if the holder dies) where
+    ``fcntl`` exists, otherwise :func:`excl_sidecar_lock`. ``use_flock``
+    forces one protocol (tests drive the Windows path on POSIX with
+    ``False``); ``None`` picks by platform. Never raises for a busy lock."""
+    if use_flock is None:
+        use_flock = _flock_available()
+    if use_flock:
+        with exclusive_file_lock(Path(lock_path)):
+            yield
+    else:
+        with excl_sidecar_lock(Path(lock_path), spin_s=spin_s, stale_after_s=stale_after_s):
+            yield
+
+
+def claim_owner_gone(pid: int, age_s: float, *, stale_after_s: float) -> bool:
+    """True when a per-pid rename claim (``<name>.<tag>.<pid>``) is
+    abandoned. This process's own claims are never abandoned. Never raises.
+
+    * pid provably dead (or no pid in the name) — abandoned;
+    * pid ALIVE — abandoned only when the claim is older than
+      ``stale_after_s`` AND pid reuse is PROVEN: the process now holding
+      that pid started after the claim was made (its start time is later
+      than the claim's mtime, ``now - age_s``). A live holder that is just
+      slow (a CPU-only embedding compute running past the age) keeps its
+      claim — taking it over would score the work twice (review R5-4), and
+      slow work is never killed or pre-empted here. Start time unknown ->
+      left alone (conservative default);
+    * liveness undecidable — the age alone decides."""
+    if pid == os.getpid():
+        return False
+    if pid <= 0:
+        return True
+    try:
+        from vco_lib.update_lock import pid_alive  # noqa: PLC0415 — one liveness rule
+
+        alive = pid_alive(pid)
+    except Exception:  # noqa: BLE001 — undecidable -> age decides
+        alive = None
+    if alive is False:
+        return True
+    if age_s < stale_after_s:
+        return False
+    if alive is None:
+        return True
+    try:
+        import time  # noqa: PLC0415
+
+        from vco_lib.update_lock import process_start_time  # noqa: PLC0415 — one start-time rule
+
+        started = process_start_time(pid)
+        if started is None:
+            return False
+        return float(started) > time.time() - float(age_s)
+    except Exception:  # noqa: BLE001 — unprovable reuse -> leave the claim
+        return False
+
+
+def claim_by_rename(path: Path, mark: str) -> Optional[Path]:
+    """Take ``path`` for this process: atomic rename to
+    ``<name><mark><pid>`` with its mtime set to now (the claim's age, read
+    by :func:`claim_owner_gone`). Of two processes racing for one file
+    exactly one wins. ``None`` when the file is gone (another process took
+    or consumed it). Never raises."""
+    src = Path(path)
+    claimed = src.with_name(f"{src.name}{mark}{os.getpid()}")
+    try:
+        os.replace(src, claimed)
+    except OSError:
+        return None
+    try:
+        os.utime(claimed, None)
+    except OSError:
+        pass
+    return claimed
+
+
+def release_rename_claim(claimed: Path, path: Path, *, newer_wins: bool = True) -> bool:
+    """Hand a :func:`claim_by_rename` claim back under its original name.
+    When a file of that name appeared meanwhile and ``newer_wins``, the
+    newer file is kept and the claim dropped. Returns ``False`` when the
+    rename failed (the claim stays on disk for a later re-adoption). Never
+    raises."""
+    claimed, path = Path(claimed), Path(path)
+    try:
+        if newer_wins and path.exists():
+            claimed.unlink()
+        else:
+            os.replace(claimed, path)
+        return True
+    except OSError:
+        return False

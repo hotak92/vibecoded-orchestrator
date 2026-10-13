@@ -148,10 +148,10 @@ class TestAuditEnvSecrets:
 
     def test_strips_inline_quotes(self, tmp_path: Path) -> None:
         env_path = tmp_path / ".env"
-        env_path.write_text(textwrap.dedent('''\
-            GITHUB_TOKEN="ghp_quoted"
-            OPENAI_API_KEY='sk-singlequoted'
-        '''))
+        env_path.write_text(
+            'GITHUB_TOKEN="ghp_quoted"\n'
+            "OPENAI_API_KEY='sk-singlequoted'\n"  # vco-secret-scan: test-placeholder
+        )
         result = {s.key: s.value for s in secrets_audit.audit_env_secrets(env_path)}
         assert result["GITHUB_TOKEN"] == "ghp_quoted"
         assert result["OPENAI_API_KEY"] == "sk-singlequoted"
@@ -258,7 +258,7 @@ class TestAuditEnvSecrets:
         env_path = tmp_path / ".env"
         env_path.write_text(
             "# multi-line block follows; parser only sees its first line\n"
-            "PEM_KEY='-----BEGIN PRIVATE KEY-----\n"
+            "PEM_KEY='-----BEGIN PRIVATE KEY-----\n"  # vco-secret-scan: test-placeholder
             "actual_key_material_here\n"
             "-----END PRIVATE KEY-----'\n"
         )
@@ -452,7 +452,7 @@ class TestMultiLineSecretPreservation:
         env_path = tmp_path / ".env"
         env_path.write_text(
             "# multi-line secret follows\n"
-            "GH_DEPLOY_KEY='-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "GH_DEPLOY_KEY='-----BEGIN OPENSSH PRIVATE KEY-----\n"  # vco-secret-scan: test-placeholder
             "b3BlbnNzaC1rZXktdjEAAAAA_PLACEHOLDER_BLOB\n"
             "-----END OPENSSH PRIVATE KEY-----'\n"
             "OTHER_TOKEN=ghp_normal_migrate_target\n"

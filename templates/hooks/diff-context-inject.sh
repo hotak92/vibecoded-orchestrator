@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
+# Parity: kept in step with diff-context-inject.ps1 (the SessionId
+# resolution cascade must stay symmetrical on both sides; every behaviour
+# must match the .ps1 sibling).
 # Diff-based context injection — only inject CHANGED sections of CONTEXT_STATE.md
-# First prompt: create baseline snapshot (full injection handled by session-start hooks)
+# First prompt: create baseline snapshot. The FULL injection the baseline
+# defers is real: compact-context-reinject.sh (SessionStart matchers
+# startup/resume/compact, since v0.2.102 W6-F) injects CONTEXT_STATE.md in
+# full at session start, inside its per-section budgets and the shared
+# hook-output cap (_lib/reinject-budgets.txt + _lib/emit-context.sh).
 # Subsequent prompts: output only changed sections (or nothing if unchanged)
 # After /compact: reset baseline (detected via compact flag)
 
@@ -47,14 +54,22 @@ if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "default" ]; then
     export VCT_SESSION_ID="$SESSION_ID"
 fi
 
-CONTEXT_FILE=".claude/CONTEXT_STATE.md"
 # Snapshot state lives under the project (gitignored .claude/state/) so it
 # survives reboots and launcher restarts — Claude Code's `resume` feature
 # can reuse a session_id across these boundaries, and a $TMPDIR-based path
 # would lose the diff baseline mid-session when /tmp is wiped on boot.
 # The `ctx_` filename prefix namespaces these files within the shared
 # .claude/state/ dir (which also holds seen_kg_titles_*, reads_*, etc.).
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> nothing to diff and no snapshot written.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
+[ -n "$PROJECT_DIR" ] || exit 0
+# The live file is the PROJECT's, like every other path here (it was
+# cwd-relative, so a run whose cwd was not the project root diffed nothing).
+CONTEXT_FILE="$PROJECT_DIR/.claude/CONTEXT_STATE.md"
 SNAPSHOT_DIR="$PROJECT_DIR/.claude/state"
 SNAPSHOT_FILE="$SNAPSHOT_DIR/ctx_snapshot_${SESSION_ID}"
 COMPACT_FLAG="$SNAPSHOT_DIR/ctx_compact_flag_${SESSION_ID}"
@@ -106,8 +121,9 @@ diff_context_section() {
     # If the live file doesn't exist, nothing to do.
     [ -f "$live_file" ] || return 0
 
-    # If no snapshot exists, create baseline (first prompt — full injection
-    # is done by the session-start hooks).
+    # If no snapshot exists, create baseline (first prompt — the full
+    # injection is compact-context-reinject.sh's at SessionStart, see the
+    # header comment).
     if [ ! -f "$snap_file" ]; then
         cp "$live_file" "$snap_file"
         return 0

@@ -167,6 +167,12 @@ WEAVIATE_RECLAIM_ENV_KEYS: tuple[str, ...] = (
 )
 BEHAVIOR_CRITICAL_ENV_KEYS: tuple[str, ...] = (
     "OLLAMA_KEEP_ALIVE",
+    # v0.2.102 W4-E review E3: the queue cap is behaviour-critical too —
+    # Ollama's default 512 answers a shared-model project burst with 503
+    # (owner floor: never below 1000). Without it here the reconcile loop
+    # never visits the key, and the drift detector never flags an adopted
+    # container still on the 512 default.
+    "OLLAMA_MAX_QUEUE",
     "OLLAMA_FLASH_ATTENTION",
     "OLLAMA_KV_CACHE_TYPE",
     "CODE_EMBED_BACKEND",
@@ -191,7 +197,13 @@ BEHAVIOR_CRITICAL_ENV_KEYS: tuple[str, ...] = (
 #: key the installer does not set but the live container has is carried so
 #: the service keeps behaving as it does today.
 CANONICAL_ENV_TARGETS: dict[str, dict[str, str]] = {
-    "ollama": {"OLLAMA_KEEP_ALIVE": "24h"},
+    # v0.2.102 W4-E: 24h → 10m (owner ruling 2026-10-08 — the 24h pin held
+    # 8.3 GB of VRAM idle after one KG search; 10m releases idle VRAM while
+    # consecutive calls still share the resident model). Review E3 adds
+    # OLLAMA_MAX_QUEUE so this table agrees with the compose surface
+    # (both compose files pin "1000" — owner: never lower) and the drift
+    # detector flags an adopted container on Ollama's 512 default.
+    "ollama": {"OLLAMA_KEEP_ALIVE": "10m", "OLLAMA_MAX_QUEUE": "1000"},
 }
 
 #: Marker both override generators use (storage_ux.rs
@@ -1005,7 +1017,16 @@ def render_adoption_override(plans: Sequence[ServicePlan], *,
 def write_adoption_override(infra_dir: Path, body: str) -> Optional[str]:
     """Write the override ATOMICALLY to BOTH auto-load names (the C-RT-5
     convention).  REFUSES (returns the reason) when an existing override is
-    user-authored (no managed marker) — never clobber a user's file."""
+    user-authored (no managed marker) — never clobber a user's file — and
+    (v0.2.102 P299-B2) when the two halves already DIVERGE: one of them may be
+    a hand edit that kept the marker, and writing one body to both would
+    silently discard it (the doctor reports the pair as
+    ``compose_override_pair_diverged``)."""
+    from vco_lib.compose_override_pair import divergent_pair_refusal
+
+    diverged = divergent_pair_refusal(infra_dir)
+    if diverged is not None:
+        return diverged
     for name in _OVERRIDE_FILES:
         target = infra_dir / name
         if target.is_file():
@@ -1729,9 +1750,15 @@ def adopt_services(
     return result
 
 
-def _derive_embed_config() -> dict:
+def _derive_embed_config(install_code_model: Optional[str] = None) -> dict:
     """Minimal embed config for ``compose_env.write_infrastructure_env``:
-    GPU vendor from the host probe (the ONE home), backend accordingly."""
+    GPU vendor from the host probe (the ONE home); the code model is the
+    install tier table's answer (``app_state.default_code_embedding``, what
+    install.py wrote) and the container backend FOLLOWS it (v0.2.102 W6-B2,
+    re-review LOW-7: serving follows the model — CodeSage → the container's
+    gpu backend, an Ollama model → ``ollama``, so the written
+    ``CODE_EMBED_MODEL`` is one that backend serves). With no install default
+    recorded, the pre-v0.2.102 vendor rule stands."""
     vendor = ""
     try:
         from vco_lib import gpu_device as _gpu_device
@@ -1741,6 +1768,19 @@ def _derive_embed_config() -> dict:
             vendor = str(getattr(gpus[0], "vendor", "") or "")
     except Exception:  # noqa: BLE001 — probe failure ⇒ no substitution keys
         vendor = ""
+    from vco_lib.code_embed_serving import APP_STATE_KEY_DEFAULT_CODE_EMBED, container_pairing
+
+    if install_code_model is None:
+        try:
+            from vco_lib.launcher_db_reader import read_app_state_value
+
+            install_code_model = read_app_state_value(APP_STATE_KEY_DEFAULT_CODE_EMBED)
+        except Exception:  # noqa: BLE001 — unreadable ⇒ the vendor rule
+            install_code_model = None
+    model = (install_code_model or "").strip()
+    pairing = container_pairing(model) if model else None
+    if pairing is not None:
+        return {"gpu_vendor": vendor, "code_backend": pairing[0], "code_model": model}
     return {"gpu_vendor": vendor, "code_backend": "gpu" if vendor else "ollama"}
 
 

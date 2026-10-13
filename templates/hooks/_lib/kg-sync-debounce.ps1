@@ -95,6 +95,7 @@
 # parent hook dot-sources _lib/resolve-powershell.ps1 which sets $PsExe
 # (pwsh → powershell 5.1 fallback); fall back to "pwsh" only if unset so
 # this helper is usable standalone.
+. (Join-Path $PSScriptRoot "utf8-nobom.ps1")  # BOM-free writes (review R5-8)
 function Get-KgDebouncePsExe {
     if ($script:PsExe)              { return $script:PsExe }
     if (Get-Variable -Name PsExe -Scope Global -ErrorAction SilentlyContinue) { return $global:PsExe }
@@ -172,12 +173,24 @@ function Get-KgDebounceLogPath {
 # [A-Za-z0-9_-] charset `_lib/session-id.ps1` enforces (it is interpolated
 # into a FILE NAME); anything else collapses to "default", an absent id to
 # "nosession". MUST MATCH _kg_debounce_session_key in the .sh sibling.
+# v0.2.102 W6-C1 (F16): when the run belongs to a SUBAGENT (the spawning
+# wrapper exported VCT_AGENT_ID), the key gains the __<agent_id> component
+# via the ONE session-id helper -- the once-per-session failure notice is
+# delivered as hook context, which reaches the SUBAGENT only, so a
+# session-keyed sentinel let one lane's notice silence the row for the main
+# chat (and every sibling lane).
+$VcoSessionIdLib = Join-Path $PSScriptRoot "session-id.ps1"
+if (Test-Path -LiteralPath $VcoSessionIdLib -PathType Leaf) { . $VcoSessionIdLib }
 function Get-KgDebounceSessionKey {
     $raw = $env:VCT_SESSION_ID
     if (-not $raw) { $raw = $env:CLAUDE_SESSION_ID }
     if (-not $raw) { return "nosession" }
-    if ($raw -match '^[A-Za-z0-9_-]+$') { return $raw }
-    return "default"
+    $out = "default"
+    if ($raw -match '^[A-Za-z0-9_-]+$') { $out = $raw }
+    if ($env:VCT_AGENT_ID -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyContinue)) {
+        $out = Get-VcoAgentKeyFromIds -SessionId $out -AgentId $env:VCT_AGENT_ID
+    }
+    return $out
 }
 
 # Record ONE failure row for this session+channel. Best-effort in every
@@ -223,6 +236,10 @@ function Write-KgDebounceFailureRow {
             channel      = $Channel
             exit         = $ExitCode
             session      = (Get-KgDebounceSessionKey)
+            # v0.2.102 W6-C2 (census F15): subagent attribution exported by
+            # the write hooks; empty for the main chat. MUST MATCH the .sh.
+            agent_id     = [string]$env:VCT_AGENT_ID
+            agent_type   = [string]$env:VCT_AGENT_TYPE
             log          = $LogPath
             last_stderr  = $tail
         }
@@ -407,7 +424,7 @@ function Get-KgDebounceDir {
 }
 
 # Hash a file path → slash-free lock key (MD5 hex), matching the bash
-# sibling's md5-via-Python key and the diagram-throttle MD5 pattern.
+# sibling's md5-via-Python key (the former diagram throttle's MD5 pattern).
 function Get-KgDebounceKey {
     param([string]$Path)
     $md5 = [System.Security.Cryptography.MD5]::Create()
@@ -477,8 +494,8 @@ function Invoke-KgDebounceReapStale {
     $now = Get-Date
 
     # Reaper throttle: skip the O(M^2) sweep if we ran it within the last
-    # ~30s. Mirrors the diagram-throttle stamp-file pattern in
-    # post-file-edit.sh (~line 336) and the bash sibling's `.last_reap.ts`.
+    # ~30s. Stamp-file pattern (as the former diagram throttle in
+    # post-file-edit.sh used) and the bash sibling's `.last_reap.ts`.
     # SAFE for coalesce-NEVER-DROP: orphans are recovered by the very NEXT
     # un-throttled reap (at most ~throttle extra delay), well inside the
     # eventually-consistent contract. Best-effort: a stat/write failure falls
@@ -649,9 +666,8 @@ function Invoke-KgDebounceSchedule {
     if ($claimed) {
         # Record the command so a reaper can recover it if we die.
         try {
-            Set-Content -LiteralPath (Join-Path $lock "cmd") `
-                -Value ("{0}`t{1}" -f $WorkingDir, $Command) `
-                -Encoding utf8 -ErrorAction SilentlyContinue
+            Set-VcoUtf8Content -Path (Join-Path $lock "cmd") `
+                -Value ("{0}`t{1}" -f $WorkingDir, $Command)
         } catch { }
         $base = Split-Path -Leaf $lock   # "<chan>_<md5>.lock"
         # Single flusher: a DETACHED process that sleeps the quiet-window,

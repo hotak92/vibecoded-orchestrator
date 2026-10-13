@@ -13,8 +13,9 @@ D5.1 signal contract (do NOT change): the "answer" = assistant TEXT + THINKING +
 tool_use INPUT only. Tool RETURNS are EXCLUDED — RL trains on what the LLM
 EMITS, not on shell output / file dumps / API JSON that would drown the signal.
 
-Pure functions: no I/O, no async, no server.py import. The transcript-loading
-and KG-position helpers are also here so the drain doesn't have to reach into
+Pure functions apart from the transcript loaders (file I/O plus one
+process-global, lock-guarded parse cache); no async, no server.py import. The
+transcript-loading and KG-position helpers are also here so the drain doesn't have to reach into
 server.py for them (the modularity rule: one concern, one home).
 """
 
@@ -22,8 +23,10 @@ from __future__ import annotations
 
 import json as _json
 import os as _os
+import threading as _threading
 from datetime import datetime as _datetime, timezone as _timezone
 from pathlib import Path  # used in string annotations (load_messages arg)
+from typing import Any as _Any
 
 __all__ = [
     "DEFAULT_ANSWER_THRESHOLD_TOKENS",
@@ -31,6 +34,7 @@ __all__ = [
     "KG_SEARCH_TOOLS",
     "load_messages",
     "load_messages_cached",
+    "slim_message",
     "stat_signature",
     "find_kg_positions",
     "extract_answer_window",
@@ -60,59 +64,211 @@ KG_SEARCH_TOOLS: frozenset[str] = frozenset({
 })
 
 
-def load_messages(transcript_path: "str | Path") -> list[dict]:
-    """Load all JSONL messages from a transcript file. Soft-fail to []."""
-    messages: list[dict] = []
+# Sentinel for "this line carries no message" (blank / unparseable). A JSON
+# ``null`` line IS a message to the pre-W6-MEM loader (it appended ``None``), so
+# ``None`` cannot double as the skip marker.
+_NO_MESSAGE = object()
+
+
+def _parse_line(raw: bytes) -> object:
+    """Parse ONE transcript line; ``_NO_MESSAGE`` for blank/unparseable lines.
+
+    The one line parser shared by the full loader and the incremental cache, so
+    both agree on which lines become messages. ``json.loads`` takes the raw
+    bytes (UTF-8/16/32 auto-detected); invalid JSON *and* undecodable bytes are
+    skipped (both are ``ValueError`` subclasses) — a corrupt line never aborts
+    the rest of the transcript.
+    """
+    line = raw.strip()
+    if not line:
+        return _NO_MESSAGE
     try:
-        with open(transcript_path) as fh:
+        return _json.loads(line)
+    except ValueError:
+        return _NO_MESSAGE
+
+
+def load_messages(transcript_path: "str | Path") -> list[dict]:
+    """Load all JSONL messages from a transcript file, unmodified. Soft-fail to [].
+
+    The full, faithful parse (every field of every line). The long-lived MCP
+    monitor and the Stop-hook drain read through ``load_messages_cached``
+    instead, which keeps only the fields the answer-window consumers read.
+    """
+    messages: list = []
+    try:
+        with open(transcript_path, "rb") as fh:
             for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    messages.append(_json.loads(line))
-                except _json.JSONDecodeError:
-                    continue
+                msg = _parse_line(line)
+                if msg is not _NO_MESSAGE:
+                    messages.append(msg)
     except OSError:
         pass
     return messages
 
 
-# ---- v0.2.73 Concern-B: read-bounding, ONE shared home ---------------------
+# ---- W6-MEM: slim messages — keep only what the consumers read --------------
+#
+# The consumers of a loaded transcript are exactly the functions of this module
+# (``find_kg_positions``, ``extract_answer_window``, ``match_position_for_query``,
+# ``match_position_by_timestamp``) plus ``rl_enrichment._rl_human_turn_after``.
+# Between them they read: the message's ``type`` and ``timestamp``, and
+# ``message.content`` — a string, or a block list whose blocks are read for
+# ``type`` plus ``text`` / ``thinking`` / tool_use ``name`` + ``input``. Nothing
+# else. Tool RESULTS (user-type ``tool_result`` blocks and the top-level
+# ``toolUseResult`` echo), thinking signatures, usage, ids and every other
+# envelope field are the bulk of a long transcript's bytes and are never read.
+#
+# Block LISTS keep their length (an unread block becomes a ``{"type": ...}``
+# stub, never removed), so every (msg_idx, blk_idx) position is the same as in
+# the full parse. Message objects that are not dicts are kept as they are, so a
+# malformed transcript behaves exactly as it did under the full parse.
+_KEPT_BLOCK_FIELDS: "dict[str, tuple[str, ...]]" = {
+    "text": ("text",),
+    "thinking": ("thinking",),
+    "tool_use": ("name", "input"),
+}
+_CONTENT_MESSAGE_TYPES = frozenset({"assistant", "user"})
+
+
+def _slim_block(block: _Any) -> _Any:
+    if not isinstance(block, dict):
+        return block
+    out: dict = {}
+    if "type" in block:
+        out["type"] = block["type"]
+    btype = block.get("type")
+    for field in _KEPT_BLOCK_FIELDS.get(btype, ()) if isinstance(btype, str) else ():
+        if field in block:
+            out[field] = block[field]
+    return out
+
+
+def slim_message(msg: _Any) -> _Any:
+    """Reduce a parsed transcript message to the fields the consumers read."""
+    if not isinstance(msg, dict):
+        return msg
+    out: dict = {}
+    for key in ("type", "timestamp"):
+        if key in msg:
+            out[key] = msg[key]
+    if msg.get("type") in _CONTENT_MESSAGE_TYPES and "message" in msg:
+        inner = msg["message"]
+        if isinstance(inner, dict):
+            slim_inner: dict = {}
+            if "content" in inner:
+                content = inner["content"]
+                if isinstance(content, list):
+                    content = [_slim_block(b) for b in content]
+                slim_inner["content"] = content
+            out["message"] = slim_inner
+        else:
+            out["message"] = inner
+    return out
+
+
+# ---- v0.2.73 Concern-B + W6-MEM: read-bounding, ONE shared home -------------
 #
 # The answer monitor (rl_enrichment._rl_answer_monitor) polls every
-# _RL_MONITOR_POLL_INTERVAL seconds and, pre-Concern-B, re-read + re-JSON-parsed
-# the ENTIRE (growing) transcript on EVERY poll — O(file_size × poll_count) on a
-# long session, most of it wasted on IDLE polls where Claude produced no new
-# output. The drain (rl_drain_citations) reads once per Stop, and the paid
-# online-training path sits downstream of the same window — but per the
-# modularity ruling the read-bounding lives in ONE place all callers share, not
-# forked per caller.
+# _RL_MONITOR_POLL_INTERVAL seconds; the drain (rl_drain_citations) reads once
+# per Stop. Per the modularity ruling the read-bounding lives in ONE place all
+# callers share, not forked per caller.
 #
-# The fix is a process-global parse cache keyed on the file's (mtime, size)
-# signature: an UNCHANGED transcript returns the already-parsed message list
-# without re-reading or re-parsing a single byte; a CHANGED transcript re-parses
-# in full and refreshes the cache. Because a cache hit returns the SAME parsed
-# messages a full ``load_messages`` would, and a miss falls straight through to
-# ``load_messages``, the extracted answer window is BYTE-IDENTICAL to the
-# pre-Concern-B full-read path for every caller (monitor / drain / online).
-# Pure-stdlib; no paid-module import; identical on Windows (os.stat is portable).
+# v0.2.73 added a process-global parse cache keyed on (mtime, size) that
+# re-parsed the WHOLE file on any change and was bounded by entry COUNT only.
+# On a 1.5 GB transcript that meant a multi-GB parsed list per entry, a full
+# re-parse every time the busy transcript grew (the old list held until the new
+# one was built), and — since the monitor called it inside the event loop —
+# every MCP tool call stalled for the length of each parse (W6-MEM, 2026-10-13:
+# one MCP process at 6.5 GB). The W6-MEM cache instead:
+#
+#   * parses INCREMENTALLY: Claude Code transcripts are append-only JSONL, so an
+#     entry remembers the byte offset of the last complete line it consumed and
+#     a grown file costs only its new bytes. It re-parses from byte 0 only when
+#     the file was truncated or replaced: size below the consumed offset, a new
+#     (st_dev, st_ino), or the byte before the offset no longer a newline;
+#   * never consumes a partial final line (a writer mid-append): the fragment is
+#     parsed tentatively and returned when it is complete JSON — exactly what a
+#     full parse would return — but its bytes are re-read next time;
+#   * stores SLIM messages (``slim_message``) and is bounded in estimated BYTES
+#     (``memory_bounds.transcript_cache_max_bytes``) as well as in entries;
+#   * is thread-safe with PER-PATH locking: the monitor runs the load in a
+#     worker thread, so two threads can ask for the same transcript at once.
+#     Each path has its own lock, held for that path's whole read-and-parse,
+#     so two callers on the SAME transcript share one parse (the second waits,
+#     then finds the entry current) instead of both parsing it. A short global
+#     lock guards only the dict operations (lookup, re-insert, eviction, the
+#     per-path lock table) and is never held while reading or parsing, so a
+#     slow first parse of one transcript never delays a caller on another.
+#
+# The caller gets a fresh list (a shallow copy of the cached message list, plus
+# the tentative tail when there is one), never the cached object itself — see
+# ``load_messages_cached``. Pure-stdlib; identical on Windows (os.stat st_ino is
+# a stable file id on NTFS).
 
-# path(str) -> (mtime, size, messages). Bounded so a long-lived MCP subprocess
-# serving many transcripts can't grow it without limit (LRU-ish: insertion-order
-# pop of the oldest entry once over the cap). The cache holds parsed lists, which
-# dominate memory, so the cap is modest.
-_MESSAGE_CACHE: "dict[str, tuple[float, int, list[dict]]]" = {}
+# Entry-count cap, kept beside the byte cap: a long-lived MCP serving many small
+# subagent transcripts is bounded by this, a few huge ones by the byte cap.
 _MESSAGE_CACHE_MAX = 32
+
+
+class _CacheEntry:
+    """One transcript's incremental parse state."""
+
+    __slots__ = ("file_id", "offset", "size", "mtime", "messages", "est_bytes",
+                 "tail_msg")
+
+    def __init__(self, file_id: "tuple[int, int]") -> None:
+        self.file_id = file_id
+        self.offset = 0          # bytes consumed (end of the last complete line)
+        self.size = -1           # st_size at the last read
+        self.mtime = -1.0        # st_mtime at the last read
+        self.messages: list = []
+        self.est_bytes = 0       # estimated retained bytes of ``messages``
+        # The parsed partial final line (or _NO_MESSAGE); never counted as
+        # consumed, so its bytes are re-read once the writer completes it.
+        self.tail_msg: object = _NO_MESSAGE
+
+
+# path(str) -> _CacheEntry; dict insertion order is the LRU order (a hit moves
+# the key to the end).
+_MESSAGE_CACHE: "dict[str, _CacheEntry]" = {}
+# Guards ``_MESSAGE_CACHE`` and ``_PATH_LOCKS`` — dict operations only, never
+# held across file I/O or parsing.
+_CACHE_LOCK = _threading.Lock()
+# path(str) -> [per-path lock, number of callers holding or waiting on it]. An
+# entry exists only while some caller uses the path; the last one out removes
+# it, so the table never outgrows the number of in-flight loads.
+_PATH_LOCKS: "dict[str, list]" = {}
+
+
+def _acquire_path_lock(key: str) -> "_threading.Lock":
+    """Register as a user of ``key``'s lock and return it (not yet acquired)."""
+    with _CACHE_LOCK:
+        slot = _PATH_LOCKS.get(key)
+        if slot is None:
+            slot = _PATH_LOCKS[key] = [_threading.Lock(), 0]
+        slot[1] += 1
+        return slot[0]
+
+
+def _release_path_lock(key: str) -> None:
+    """Drop one use of ``key``'s lock; forget the lock when nobody uses it."""
+    with _CACHE_LOCK:
+        slot = _PATH_LOCKS.get(key)
+        if slot is None:
+            return
+        slot[1] -= 1
+        if slot[1] <= 0:
+            del _PATH_LOCKS[key]
 
 
 def stat_signature(transcript_path: "str | Path") -> "tuple[float, int] | None":
     """Return ``(st_mtime, st_size)`` for a transcript, or None if unstattable.
 
-    The cheap change-detector shared by the monitor's idle-poll short-circuit
-    and the cached loader below: two polls with the same signature saw the same
-    bytes, so there is nothing new to read, parse, or recount. Soft-fail to None
-    (treated as "changed / unknown" by callers so they never skip on error)."""
+    The cheap change-detector of the monitor's idle-poll short-circuit: two
+    polls with the same signature saw the same bytes, so there is nothing new
+    to read, parse, or recount. Soft-fail to None (treated as "changed /
+    unknown" by callers so they never skip on error)."""
     try:
         st = _os.stat(transcript_path)
     except OSError:
@@ -120,30 +276,122 @@ def stat_signature(transcript_path: "str | Path") -> "tuple[float, int] | None":
     return (st.st_mtime, st.st_size)
 
 
-def load_messages_cached(transcript_path: "str | Path") -> list[dict]:
-    """``load_messages`` with a process-global (mtime, size) parse cache.
+def _read_appended(entry: _CacheEntry, fh, start: int) -> None:
+    """Consume complete lines from ``start``; remember a trailing fragment."""
+    from claude_mcp_servers.rl_client.memory_bounds import approx_heap_bytes
 
-    ONE shared read-bounding home (Concern B). Returns byte-identical parsed
-    messages to ``load_messages`` — a cache HIT hands back the list a full
-    re-parse would have produced (the file is unchanged), a MISS re-parses in
-    full and refreshes the cache. All callers (MCP monitor, Stop-hook drain,
-    online-training path) route through this so none re-parses an unchanged
-    transcript. Soft-fail: an unstattable path falls back to a plain
-    ``load_messages`` (never caches, never skips).
+    fh.seek(start)
+    offset = start
+    tail = b""
+    for line in fh:
+        if not line.endswith(b"\n"):
+            tail = line
+            break
+        offset += len(line)
+        msg = _parse_line(line)
+        if msg is _NO_MESSAGE:
+            continue
+        slim = slim_message(msg)
+        entry.messages.append(slim)
+        entry.est_bytes += approx_heap_bytes(slim) + 8
+    entry.offset = offset
+    if tail:
+        msg = _parse_line(tail)
+        entry.tail_msg = _NO_MESSAGE if msg is _NO_MESSAGE else slim_message(msg)
+    else:
+        entry.tail_msg = _NO_MESSAGE
+
+
+def _evict_locked(keep_key: str) -> None:
+    """Drop least-recently-used entries over the count or byte cap.
+
+    ``keep_key`` (the entry just served) is never evicted: dropping the
+    transcript a monitor is polling would make the very next poll re-parse the
+    whole file — the same memory transiently, plus the CPU, on every poll."""
+    from claude_mcp_servers.rl_client.memory_bounds import transcript_cache_max_bytes
+
+    cap = transcript_cache_max_bytes()
+    total = sum(e.est_bytes for e in _MESSAGE_CACHE.values())
+    for key in list(_MESSAGE_CACHE):
+        if len(_MESSAGE_CACHE) <= _MESSAGE_CACHE_MAX and total <= cap:
+            break
+        if key == keep_key:
+            continue
+        total -= _MESSAGE_CACHE.pop(key).est_bytes
+
+
+def load_messages_cached(transcript_path: "str | Path") -> list[dict]:
+    """Slim transcript messages through the process-global incremental cache.
+
+    ONE shared read-bounding home (Concern B, W6-MEM). Returns
+    ``[slim_message(m) for m in load_messages(path)]`` — the same messages, in
+    the same order, with the same block positions, carrying every field the
+    answer-window consumers read — while parsing each appended byte once. All
+    callers (MCP monitor, Stop-hook drain) route through this. Soft-fail: an
+    unstattable path falls back to a plain uncached load; a read error drops
+    the entry (the next call starts over) and returns what was parsed.
+
+    Concurrency (W6-MEM R3): callers on the same path are serialised by that
+    path's lock, held across the read-and-parse, so concurrent callers on one
+    transcript cause ONE parse of its bytes, not one each. Callers on different
+    paths never wait on each other: the global ``_CACHE_LOCK`` covers only the
+    dict operations around the parse.
+
+    The result is ALWAYS a new list the caller owns (a shallow copy of the
+    cached messages, plus the tentative tail when present). The cached list
+    keeps growing in place on later appends from other threads; handing that
+    object out let a consumer's ``len()``/iteration race a concurrent append
+    and made the result's type of ownership depend on whether a partial final
+    line happened to be present. The copy is one pointer per message, made only
+    when the monitor's idle-poll short-circuit saw the file change, and is
+    small next to the parse of the new bytes. The message dicts themselves are
+    shared and must be treated as read-only (every consumer only reads them).
     """
     key = str(transcript_path)
-    sig = stat_signature(transcript_path)
-    if sig is not None:
-        cached = _MESSAGE_CACHE.get(key)
-        if cached is not None and (cached[0], cached[1]) == sig:
-            return cached[2]
-    messages = load_messages(transcript_path)
-    if sig is not None:
-        _MESSAGE_CACHE[key] = (sig[0], sig[1], messages)
-        # LRU bound — pop oldest insertion-order entry until size <= max.
-        while len(_MESSAGE_CACHE) > _MESSAGE_CACHE_MAX:
-            _MESSAGE_CACHE.pop(next(iter(_MESSAGE_CACHE)))
-    return messages
+    path_lock = _acquire_path_lock(key)
+    try:
+        with path_lock:
+            # Stat under the path lock: a caller that waited while another
+            # parsed compares against the CURRENT file, and then usually finds
+            # the entry already current — the shared parse.
+            try:
+                st = _os.stat(transcript_path)
+            except OSError:
+                return [slim_message(m) for m in load_messages(transcript_path)]
+            file_id = (st.st_dev, st.st_ino)
+            with _CACHE_LOCK:
+                # Out of the dict while it is being extended, so eviction by a
+                # caller on another path can never drop it mid-parse.
+                entry = _MESSAGE_CACHE.pop(key, None)
+            try:
+                if entry is not None and entry.size == st.st_size \
+                        and entry.mtime == st.st_mtime and entry.file_id == file_id:
+                    pass  # unchanged since the last read — nothing to parse
+                else:
+                    with open(transcript_path, "rb") as fh:
+                        reuse = (
+                            entry is not None
+                            and entry.file_id == file_id
+                            and st.st_size >= entry.offset
+                        )
+                        if reuse and entry is not None and entry.offset > 0:
+                            fh.seek(entry.offset - 1)
+                            reuse = fh.read(1) == b"\n"
+                        if not reuse or entry is None:
+                            entry = _CacheEntry(file_id)
+                        _read_appended(entry, fh, entry.offset)
+                    entry.size = st.st_size
+                    entry.mtime = st.st_mtime
+            except OSError:
+                return list(entry.messages) if entry is not None else []
+            with _CACHE_LOCK:
+                _MESSAGE_CACHE[key] = entry
+                _evict_locked(key)
+            if entry.tail_msg is _NO_MESSAGE:
+                return list(entry.messages)
+            return entry.messages + [entry.tail_msg]
+    finally:
+        _release_path_lock(key)
 
 
 def find_kg_positions(messages: list[dict]) -> list[tuple[int, int]]:

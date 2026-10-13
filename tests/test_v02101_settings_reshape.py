@@ -38,6 +38,7 @@ from vco_lib.hook_retirements import (
     PriorShippedShape,
     hook_command_key,
     match_retired_registration,
+    migrated_matcher,
     removal_envelope_rows,
     vco_hook_script_identity,
 )
@@ -132,10 +133,16 @@ def test_reshape_is_reported_and_idempotent(os_name: str) -> None:
     reshapes = [r for r in removed if isinstance(r["retirement"], PriorShippedShape)]
     assert sorted(vco_hook_script_identity(r["command"]) or "" for r in reshapes) == sorted(
         f"{s}.{OS_FLAVOURS[os_name][0]}"
-        for s in ("pre-bash-context-inject", "pre-edit-context-inject"))
+        # v0.2.102 W6-Q/W6-AA: worktree-guard's WorktreeCreate timeout 3 -> none
+        # (the harness default applies). v0.2.102 W6-C2: the same for the
+        # SubagentStop reconciler (2 s), the SubagentStart snapshot (5 s) and
+        # the PreCompact snapshot (5 s).
+        for s in ("pre-bash-context-inject", "pre-edit-context-inject", "worktree-guard",
+                  "subagent-stop-reconcile", "subagent-start-kg-inject",
+                  "pre-compact-save"))
     # The bundle envelope and audit emitters read these records too.
     rows = removal_envelope_rows(reshapes)
-    assert all(r["retired_in"] == "v0.2.101" and r["replacement"] for r in rows)
+    assert all(r["retired_in"] in ("v0.2.101", "v0.2.102") and r["replacement"] for r in rows)
 
     again: list = []
     assert settings_merge.smart_merge_settings(
@@ -166,7 +173,14 @@ def test_user_modified_prebash_entry_is_untouched(os_name: str, changes: dict) -
     removed: list = []
     merged = settings_merge.smart_merge_settings(
         user, _current(os_name), retired_removed=removed)
-    assert _handlers(merged, "PreToolUse", "pre-bash-context-inject") == before, (
+    # v0.2.102 W5-D: the handler is preserved byte-for-byte; only its GROUP
+    # matcher widens Bash -> Bash|PowerShell (MATCHER_MIGRATIONS) — the
+    # matcher names which shell tool the VCO script sees, not a knob the
+    # user tuned (a user-CHANGED matcher is never migrated: see
+    # test_prior_shape_under_a_user_matcher_is_untouched).
+    want = [(migrated_matcher("PreToolUse", m, vco_hook_script_identity(h["command"])), h)
+            for m, h in before]
+    assert _handlers(merged, "PreToolUse", "pre-bash-context-inject") == want, (
         "a user-modified registration must be preserved exactly (user-wins)")
     assert not any(isinstance(r["retirement"], PriorShippedShape)
                    and "pre-bash" in r["command"] for r in removed)
@@ -191,6 +205,91 @@ def test_prior_shape_under_a_user_matcher_is_untouched(os_name: str) -> None:
     merged = settings_merge.smart_merge_settings(user, _current(os_name))
     hs = _handlers(merged, "PreToolUse", "pre-bash-context-inject")
     assert [(m, h.get("if")) for m, h in hs] == [("Bash|Monitor", None)]
+
+
+# ── v0.2.102: the if-group GREW — an already-reshaped install gains the rules ─
+
+
+#: The eight write/chain-side rules v0.2.102 adds to the pre-bash group
+#: (S16-8 production wiring + W6-Z3's echo/printf redirect writes; the
+#: v0.2.101 group was the 21 read/search rules).
+V02102_NEW_RULES = [
+    "Bash(perl *)", "Bash(ruby *)", "Bash(cd *)",
+    "Bash(tee *)", "Bash(cp *)", "Bash(mv *)",
+    "Bash(echo *)", "Bash(printf *)",
+]
+
+
+def _v02101_shaped(os_name: str) -> dict:
+    """A settings.json exactly as the v0.2.101 reshape left it: the current
+    template's pre-bash group MINUS the eight v0.2.102 rules — i.e. the
+    21-rule v0.2.101 shape, in template order. Building it from the live
+    template (not a frozen fixture) keeps the 21 pinned to whatever the
+    template ships; the caller asserts the eight were actually removed."""
+    doc = _current(os_name)
+    for g in doc["hooks"]["PreToolUse"]:
+        if g.get("matcher") == "Bash|PowerShell":
+            # v0.2.101 shipped the group under `Bash`, with no PowerShell twins.
+            g["matcher"] = "Bash"
+            g["hooks"] = [h for h in g["hooks"]
+                          if h.get("if") not in V02102_NEW_RULES
+                          and h.get("if", "").startswith("Bash(")]
+    return doc
+
+
+def test_reshaped_install_gains_the_new_rules(os_name: str) -> None:
+    """An install the v0.2.101 reshape already brought to the if-group must
+    GAIN exactly the new rules on the next update — no duplication of the
+    21 it already carries, no touch on anything else. The bare-command
+    dedupe of the append pass used to mark the whole group "handled" (every
+    rule shares ONE command string), so a grown group never delivered its
+    new rules to an already-reshaped file."""
+    user = _v02101_shaped(os_name)
+    ifs = [h.get("if") for _m, h in
+           _handlers(user, "PreToolUse", "pre-bash-context-inject")]
+    assert len(ifs) == 21 and not set(ifs) & set(V02102_NEW_RULES), (
+        "the v0.2.101 shape synthesis is off — re-check V02102_NEW_RULES")
+    merged = settings_merge.smart_merge_settings(user, _current(os_name))
+    assert _handlers(merged, "PreToolUse", "pre-bash-context-inject") == \
+        _handlers(_current(os_name), "PreToolUse", "pre-bash-context-inject"), (
+            "an already-reshaped install must end at EXACTLY the template's "
+            "group (21 kept once each + the 6 new rules)")
+
+
+def test_rule_group_growth_is_idempotent(os_name: str) -> None:
+    """A second update over the grown file is a fixed point: nothing is
+    appended twice, nothing is removed."""
+    template = _current(os_name)
+    merged = settings_merge.smart_merge_settings(_v02101_shaped(os_name), template)
+    removed: list = []
+    again = settings_merge.smart_merge_settings(
+        copy.deepcopy(merged), template, retired_removed=removed)
+    assert again == merged, "a fully-current file is a fixed point of the merge"
+    assert removed == []
+
+
+def test_user_tuned_rule_is_not_given_a_shipped_twin(os_name: str) -> None:
+    """A rule the user TUNED (here: their own timeout on one of the new
+    rules) is theirs — the update must not append the shipped variant next
+    to it (a twin would double-spawn that one verb). Dedupe for if-rules is
+    on (command, if), not the full fingerprint."""
+    user = _v02101_shaped(os_name)
+    for g in user["hooks"]["PreToolUse"]:
+        if g.get("matcher") not in ("Bash", "Bash|PowerShell"):
+            continue
+        for h in g["hooks"]:
+            if h.get("if") == "Bash(awk *)":
+                h["timeout"] = 30
+    merged = settings_merge.smart_merge_settings(user, _current(os_name))
+    ifs = [h.get("if") for _m, h in
+           _handlers(merged, "PreToolUse", "pre-bash-context-inject")]
+    assert ifs.count("Bash(awk *)") == 1, ifs
+    tuned = [h for _m, h in _handlers(merged, "PreToolUse",
+                                      "pre-bash-context-inject")
+             if h.get("if") == "Bash(awk *)"]
+    assert tuned[0].get("timeout") == 30, "the user's tuning must survive"
+    # and the new rules still arrive beside it
+    assert all(r in ifs for r in V02102_NEW_RULES)
 
 
 # ── other eras, duplicates, partial states ──────────────────────────────────
@@ -284,8 +383,11 @@ def test_reshape_rows_are_not_retirements() -> None:
 def test_prior_shape_row_is_live(row: PriorShippedShape) -> None:
     os_name = "linux" if row.target.endswith(".sh") else "windows"
     template = _current(os_name)
+    # v0.2.102 W5-D: a row whose matcher was widened (MATCHER_MIGRATIONS)
+    # reshapes into the template's group under the widened matcher.
+    live_matcher = migrated_matcher(row.event, row.matcher, row.target)
     shipped = [h for m, h in _handlers(template, row.event, row.target.rsplit(".", 1)[0])
-               if m == row.matcher]
+               if m == live_matcher]
     assert shipped, (
         f"{row.target}: the template no longer ships it under {row.matcher!r} "
         "— the row reshapes into nothing; retire the row (or declare a "

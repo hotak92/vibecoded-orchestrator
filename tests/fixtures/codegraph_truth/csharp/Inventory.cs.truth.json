@@ -1,0 +1,73 @@
+{
+ "source": "Inventory.cs",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "IRepository",
+   "start": 10,
+   "end": 13,
+   "full_name": "Warehouse.IRepository",
+   "methods": [
+    "Find"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "Find",
+   "start": 12,
+   "end": 12,
+   "full_name": "Warehouse.IRepository.Find"
+  },
+  {
+   "kind": "class",
+   "name": "Item",
+   "start": 15,
+   "end": 15,
+   "full_name": "Warehouse.Item",
+   "methods": []
+  },
+  {
+   "kind": "class",
+   "name": "InventoryController",
+   "start": 18,
+   "end": 43,
+   "full_name": "Warehouse.InventoryController",
+   "methods": [
+    "Lookup",
+    "WrapAll",
+    "GetAll",
+    "Add",
+    "Count"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "Lookup",
+   "start": 22,
+   "end": 25,
+   "full_name": "Warehouse.InventoryController.Lookup"
+  },
+  {
+   "kind": "function",
+   "name": "WrapAll",
+   "start": 27,
+   "end": 30,
+   "full_name": "Warehouse.InventoryController.WrapAll"
+  },
+  {
+   "kind": "function",
+   "name": "GetAll",
+   "start": 33,
+   "end": 36,
+   "full_name": "Warehouse.InventoryController.GetAll"
+  },
+  {
+   "kind": "function",
+   "name": "Add",
+   "start": 39,
+   "end": 42,
+   "full_name": "Warehouse.InventoryController.Add"
+  }
+ ]
+}

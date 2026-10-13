@@ -6,9 +6,11 @@
 #
 # The content (scores, `*`/`†` markers, row order, reach-via agents, notes)
 # is copied from the maintainer's "Model selection — which model for which
-# task" grid (2026-10-03, re-scored at medium effort the same day). Scores
-# are copied EXACTLY and are pinned by tests/test_model_selection_grid.py —
-# edit both together.
+# task" grid (2026-10-03, re-scored at medium effort the same day), with the
+# owner-approved 2026-10-08 revision (Haiku 5.5 replaces Haiku 4.5, GLM-5.3
+# Review 8, DeepSeek V4.1 Flash Docs 7, the GLM-implementer bullet and the
+# measured Kimi budget). Scores are copied EXACTLY and are pinned by
+# tests/test_model_selection_grid.py — edit both together.
 #
 # `reach_via` names only agents that SHIP in templates/agents/: the gateway
 # rows name the templates/agents/module-gateway/*.md agents that pin that
@@ -19,7 +21,7 @@
 # at render time (vco_lib/model_selection.py). GLM-5.3 is served by BOTH
 # vendors (z.ai's own endpoint and the QwenCloud Token Plan both list it);
 # GLM-5.3-Flash by z.ai only; the DeepSeek and Qwen rows by the qwen vendor
-# only.
+# only; Kimi K3 by the kimi vendor (Kimi Code) only.
 #
 # A score is "1".."10" within this set, AT MEDIUM EFFORT. "*" marks an
 # assumed score (no benchmark and fewer than 3 comparison reports), "†"
@@ -71,16 +73,39 @@ scores = ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"]
 id = "glm-5.3"
 model = "GLM-5.3"
 dagger = true
-reach_via = "glm-implementer / glm-reviewer / glm-planner"
+reach_via = "glm-implementer / glm-implementer-high / glm-reviewer / glm-planner"
 providers = ["zai", "qwen"]
-scores = ["7", "6", "7", "6", "6", "6", "7*", "7", "7", "—", "8"]
+# Review 7 -> 8 (owner 2026-10-08): this setup's own reviewed-lane record now
+# has more than three rows of GLM-5.3 reviews catching blockers / HIGH
+# findings, including ones a Claude review missed. Cost 8 is due a
+# re-measure (quota burn per lane) before it is kept or changed.
+scores = ["7", "6", "8", "6", "6", "6", "7*", "7", "7", "—", "8"]
+
+# Kimi K3 (v0.2.102) is NOT from the maintainer's grid: it was scored from
+# public evidence read 2026-10-07 — Moonshot's model card and Kimi Code docs,
+# Superconductor's custom SWE-bench, Friendli's GLM-5.3 head-to-head, and
+# Artificial Analysis figures (speed, verbosity, hallucination rate).
+# Every published K3 number is at effort max (hence the dagger); VCO runs
+# medium, which Kimi Code maps to high. `*` = no benchmark and fewer than 3
+# reports (Review: no review benchmark or review report exists; Plan and
+# Instr: one user report each).
+[[row]]
+id = "kimi-k3"
+model = "Kimi K3"
+dagger = true
+reach_via = "kimi-implementer / kimi-reviewer"
+providers = ["kimi"]
+scores = ["7", "6", "6*", "6*", "3", "7", "7*", "8", "8", "8", "3"]
 
 [[row]]
 id = "deepseek-v4.1-flash"
 model = "DeepSeek V4.1 Flash"
 reach_via = "deepseek-researcher / deepseek-implementer"
 providers = ["qwen"]
-scores = ["7", "6", "6", "6", "9", "6", "7*", "8", "6", "7", "10"]
+# Docs 6 -> 7 (owner 2026-10-08): its research / synthesis lanes in this
+# setup's reviewed-lane record were verified accurate, each with an explicit
+# could-not-verify list.
+scores = ["7", "6", "6", "6", "9", "6", "7*", "8", "7", "7", "10"]
 
 [[row]]
 id = "sonnet"
@@ -93,7 +118,7 @@ scores = ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"]
 id = "qwen3.8-max"
 model = "Qwen3.8-Max"
 dagger = true
-reach_via = "qwen-implementer"
+reach_via = "qwen-implementer / qwen-implementer-high"
 providers = ["qwen"]
 scores = ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"]
 
@@ -113,12 +138,22 @@ reach_via = "qwen-flash-sweeper"
 providers = ["qwen"]
 scores = ["5*", "4", "4*", "4*", "7", "4", "8*", "7", "5*", "7", "9"]
 
+# Haiku 5.5 (v0.2.102, owner 2026-10-08) replaces Haiku 4.5, now a legacy
+# model. Scored from public evidence read 2026-10-08: the Artificial Analysis
+# Intelligence Index v4.3.2 at MEDIUM effort = 34 (Haiku 4.5: 17; Sonnet 5.5
+# medium: 41), ≈165 tok/s and ≈$0.05 per task there, plus Anthropic's model
+# card and system card, whose headline numbers are all at effort max. No
+# dagger: the AA index is a real medium-effort figure. The row rests mainly
+# on vendor numbers plus that AA composite; `*` marks the three columns no
+# benchmark covers (Review, Instr, Docs). Re-check Code when independent
+# real-repo data lands: Vals Vibe Code Bench (90.4%, level with Opus 5.5) is
+# an outlier the Code score deliberately does not follow yet.
 [[row]]
 id = "haiku"
-model = "Haiku 4.5"
+model = "Haiku 5.5"
 reach_via = "model: haiku"
 providers = ["anthropic"]
-scores = ["2", "2", "2*", "2", "5", "3", "5", "5", "2*", "4", "7"]
+scores = ["4", "4", "3*", "3", "8", "5", "6*", "7", "4*", "6", "9"]
 
 # Per-model notes, rendered (in file order) only when at least one of
 # `models` rendered. `models` entries are row `id`s. The source grid's one
@@ -133,12 +168,24 @@ models = ["sonnet"]
 text = "**Sonnet 5.5** is the most effort-sensitive model: near Opus at max, but at medium it trails GLM-5.3 and DeepSeek V4.1 Flash on coding. Not a default choice."
 
 [[note]]
+models = ["haiku"]
+text = "**Haiku 5.5** — the fastest and cheapest Claude (≈165 tok/s, ≈$0.05 per task at medium) with a 1M window: good for bulk, classification, extraction and routing. Its headline vendor scores are at effort max; at medium it sits below the flash-tier vendor lanes on code, so keep coding, planning and review on larger models."
+
+[[note]]
 models = ["deepseek-v4.1-flash"]
 text = "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s to first token) and cheapest per task: default for research, surveys, bulk and bounded implementation. Users report fragile tool calls / loops on long runs — keep tasks bounded."
 
 [[note]]
 models = ["glm-5.3"]
 text = "**GLM-5.3** — the non-Claude model users route review/audit to; text-only."
+
+[[note]]
+models = ["glm-5.3"]
+text = "**GLM-5.3 as implementer** — strong on bounded lanes whose brief names the files and the acceptance criteria. Its recurring misses are \"every call-site\" coverage claims (check them with an independent grep), line-count / ASCII gates, and stray working-tree edits while proving a test red — name each in the brief."
+
+[[note]]
+models = ["kimi-k3"]
+text = "**Kimi K3** — near-frontier code quality on real repos and strong long-context retrieval, but the slowest and most verbose lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about twice the median output tokens), so queue its work and review it later. Its measured subscription budget is ≈ one substantial lane per 5h window and ≈1–2% of the month per lane, so give it small, bounded lanes or audits. It always reasons; it can repeat the same tool call or stop on reasoning with no answer, and it guesses confidently when unsure (51% hallucination rate on uncertain questions), so demand quoted evidence in its reviews."
 
 [[note]]
 models = ["glm-5.3-flash"]

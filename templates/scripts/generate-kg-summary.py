@@ -20,9 +20,14 @@ Four-tier model selection (in order):
 
 Env overrides:
   KG_SUMMARY_BACKEND        → force "cli" | "ollama" | "api" | "openai" | "skip"
-                              (auto-detect default; "api" = Anthropic, "openai" = OpenAI)
-  KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag (default: qwen3.5:9b for 16GB+ VRAM,
-                                                          gemma4:e4b for low-VRAM/CPU)
+                              (auto-detect default; "api" = Anthropic, "openai" = OpenAI).
+                              Unset: the launcher Preferences backend pin
+  KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag. Unset: the machine's generation
+                              model (vco_lib.summary_model — Preferences pick,
+                              else the model install recorded and pulled, else
+                              the hardware tier: qwen3.5:9b at 16 GB+ VRAM,
+                              gemma4:e4b at 6-16 GB VRAM or a capable CPU,
+                              qwen3.5:0.8b floor)
   KG_SUMMARY_OLLAMA_URL     → Ollama base URL (default: http://localhost:11435)
   KG_SUMMARY_OPENAI_MODEL   → OpenAI model name (default: gpt-4o-mini — cheapest
                               summary-capable model as of 2026-05-21)
@@ -319,6 +324,13 @@ def get_chunks_from_weaviate(title: str, file_path: str = "") -> list[tuple[int,
         weaviate_host = weaviate_url.hostname or "localhost"
         weaviate_port = weaviate_url.port or 8081
         weaviate_grpc = int(os.getenv("GRPC_PORT", "50052"))
+        # v0.2.102 W4-E: no PyPI version lookup on connect (one home:
+        # weaviate_helpers.disable_weaviate_client_pypi_check; guarded).
+        try:
+            from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+            disable_weaviate_client_pypi_check()
+        except Exception:
+            pass
         client = weaviate.connect_to_local(host=weaviate_host, port=weaviate_port, grpc_port=weaviate_grpc)
         coll = client.collections.get(kg_collection)
         chunk_filter = Filter.by_property("title").equal(title)

@@ -317,6 +317,9 @@ from vco_lib.kg_truncation_tags import truncation_tag_properties  # noqa: E402 -
 # never populated — the divergence that left the duplicate scanner querying no
 # slot at all on multi-vector collections.
 from vco_lib.kg_vector_slot import active_text_vector_slot, collection_vector_slots  # noqa: E402 — must follow the AuthlibDeprecationWarning filter block above, like every import in this group
+# v0.2.102 W6-I: which model each KG collection is searched/written with
+# (recorded vs selected target, the additive fill) — one home.
+from vco_lib import kg_embed_model as _kg_embed_model  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, like every import in this group
 # v0.2.92 WP-B1 (D13): the canonical file_path shape helper. `to_posix_rel`
 # is pure + dependency-free (see its docstring); importing it loudly here
 # (never an inline copy) because every Weaviate write below must store ONE
@@ -1015,6 +1018,7 @@ def _embedding_failures_jsonl_hint() -> str:
 def _build_vector_arg(
     server: "WeaviateMCPServer",
     text: str,
+    collection_name: str = "",
 ) -> "Tuple[object, Mapping[str, List[float]], Optional[List[str]]]":
     """Embed *text* and shape it for `Weaviate.collection.data.insert(vector=)`.
 
@@ -1038,9 +1042,13 @@ def _build_vector_arg(
         Failure modes:
           - All backends fail → empty dict → raises RuntimeError so the
             caller's exception handler kicks in and counts a failure.
-          - Active backend fails but a fallback succeeds → dict only has
-            the fallback's slot. Search will still work with the
-            fallback's model. The caller logs which slots landed.
+          - Active backend fails but a secondary succeeds → RAISES
+            (v0.2.102 W6-I, ``kg_embed_model.complete_write_vectors``): a
+            row holding only another model's vector was invisible to every
+            search on the active slot (W6-H's "fallback-only write"). While
+            ``collection_name`` fills toward a newly selected model, the
+            RECORDED model's vector is added too (the carry), so a rewritten
+            node never leaves the slot searches still read.
       * ``DUAL_EMBEDDING_ENABLED=false`` (legacy) → single flat vector
         from the active backend. ``vector_arg`` is a ``list[float]``,
         ``slots_map`` is ``{slot_name: vec}`` so logging stays uniform.
@@ -1061,7 +1069,11 @@ def _build_vector_arg(
                 "No embedding backend produced a vector. "
                 f"See {_embedding_failures_jsonl_hint()} for details."
             )
-        return slots, slots, list(truncated)
+        truncated = list(truncated)
+        slots = _kg_embed_model.complete_write_vectors(
+            getattr(server, "embedding_service", None), dict(slots), text, collection_name, truncated,
+            active_slot=server.text_vector_slot)
+        return slots, slots, truncated
     # Legacy flat-vector path (DUAL_EMBEDDING_ENABLED=false).
     slots, truncated = server._get_all_kg_embeddings_tagged(text)
     active_slot = server.text_vector_slot
@@ -1458,6 +1470,21 @@ def _split_tags_string(raw: str) -> List[str]:
     return tags
 
 
+# v0.2.102 W6-Y follow-up 2: the REQUIRED frontmatter fields, as ONE code
+# definition beside the canonical-dialect shape _normalise_frontmatter's
+# docstring documents. This is the same six-field set docs/CONFIGURATION.md
+# names as the required fields ("title, type, tags, created, updated,
+# status") and the canonical dialect that docstring documents — promoted
+# from prose to
+# code so consumers (maintain_knowledge_graph's missing-field report)
+# import it instead of re-listing it. ``valid_from`` / ``valid_until`` are
+# deliberately absent: they are optional point-in-time fields (docs/
+# features/04-knowledge-and-code-graph.md "Optional frontmatter fields").
+REQUIRED_FRONTMATTER_FIELDS: tuple = (
+    "title", "type", "tags", "created", "updated", "status",
+)
+
+
 def _normalise_frontmatter(fm: Any, file_label: Optional[str] = None) -> Any:
     """Normalise parsed frontmatter so every consumer sees ONE shape.
 
@@ -1622,6 +1649,30 @@ def _parse_vocabulary_types_fallback(text: str) -> set:
         if m:
             aliases.add(m.group(1).lower())
     return aliases
+
+
+def _folder_node_type(folder: str) -> str:
+    """Singular node type for a knowledge/ folder (v0.2.102 W4-G).
+
+    One home: ``vco_lib.kg_vocabulary.node_type_for_folder``. The ImportError
+    arm is the same VERSION-SKEW case ``_load_vocabulary_node_types``
+    documents (a bundled script newer than the clone's vco_lib): it keeps the
+    pre-0.2.102 folder-name value and says so once on stderr.
+    """
+    global _VOCAB_IMPORT_WARNED
+    try:
+        from vco_lib.kg_vocabulary import load_vocabulary, node_type_for_folder
+    except ImportError as exc:
+        if not _VOCAB_IMPORT_WARNED:
+            _VOCAB_IMPORT_WARNED = True
+            print(
+                f"⚠️  vco_lib.kg_vocabulary is older than this script ({exc}) — "
+                "folder-derived node types keep the folder name. Run "
+                "`python install.py --update` from the orchestrator root.",
+                file=sys.stderr,
+            )
+        return folder
+    return node_type_for_folder(folder, load_vocabulary(PROJECT_ROOT))
 
 
 def _load_vocabulary_node_types() -> frozenset:
@@ -1981,7 +2032,14 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
         type_from_frontmatter = True
     else:
         rel_path = file_path.relative_to(KNOWLEDGE_ROOT)
-        node_type = str(rel_path.parts[0]) if len(rel_path.parts) > 1 else "general"
+        # v0.2.102 W4-G: the folder stands for a SINGULAR type
+        # (`concepts/` → `concept`), resolved by the one vocabulary home;
+        # rows stored under the plural heal on the zero-embed metadata
+        # repair (KG_METADATA_REPAIR_BUMPS gains 0.2.102).
+        node_type = (
+            _folder_node_type(str(rel_path.parts[0]))
+            if len(rel_path.parts) > 1 else "general"
+        )
         type_from_frontmatter = False
 
     # Temporal metadata from frontmatter
@@ -3094,7 +3152,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
     """Sync a single docs/ file to the development collection.
 
     Mirrors `sync_node` minus the KG-specific concerns (no frontmatter
-    parsing, no WikiLink resolution, no tag-from-typed-links inference, no
+    parsing, no WikiLink resolution, no
     cross-references). Same chunker, same active-vector-slot logic.
 
     v0.2.18 (2026-05-19): mirrors the v0.2.17 KG content_hash embed-skip
@@ -3411,7 +3469,8 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         )
 
         if _plan.is_single:
-            vec_arg, slots_written, truncated_slots = _build_vector_arg(server, content)
+            vec_arg, slots_written, truncated_slots = _build_vector_arg(
+                server, content, DEV_COLLECTION_NAME)
             data_obj = {
                 "title": doc_data["title"],
                 "content": doc_data["content"],
@@ -3446,7 +3505,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         last_slots: Mapping[str, List[float]] = {}
         for i, chunk in enumerate(chunks):
             vec_arg, last_slots, truncated_slots = _build_vector_arg(
-                server, chunk.content
+                server, chunk.content, DEV_COLLECTION_NAME
             )
             data_obj = {
                 "title": doc_data["title"],
@@ -3567,7 +3626,7 @@ def _title_target_row(collection, title: str, **fetch_kwargs):
     read that also returns every title CONTAINING the link's tokens. The row
     is confirmed in Python with ``is_same_title`` (same token sequence — the
     case/punctuation insensitivity a WikiLink relies on, minus the superset
-    matches). One home for the two WikiLink-target lookups below.
+    matches). One home for the WikiLink-target lookup (``resolve_wikilinks_to_uuids``).
     """
     if not title:
         return None
@@ -3580,89 +3639,6 @@ def _title_target_row(collection, title: str, **fetch_kwargs):
         **fetch_kwargs,
     )
     return rows[0] if rows else None
-
-
-def infer_tags_from_typed_links(
-    server: WeaviateMCPServer,
-    node_data: Dict,
-    collection_name: Optional[str] = None,
-) -> List[str]:
-    """
-    Infer tags from typed relationships BEFORE storing to Weaviate.
-
-    Inference rules:
-    1. Inherit capability tags from used/implemented tools
-    2. Propagate domain tags through relationships
-
-    Args:
-        server: Weaviate MCP server instance
-        node_data: Parsed node data with typed_links
-        collection_name: Collection to read link targets from (v0.2.89
-            BUG 6 — the node's TARGET collection so shared-scoped nodes
-            infer from shared-collection siblings). Defaults to the
-            project collection.
-
-    Returns:
-        List of inferred tags
-    """
-    typed_links = node_data.get("typed_links", [])
-    existing_tags = set(node_data.get("tags", []))
-    inferred_tags = []
-
-    if not typed_links:
-        return inferred_tags
-
-    # Relationship types that propagate properties
-    CAPABILITY_RELATIONS = ["uses", "implements", "buildsOn"]
-    TAG_RELATIONS = ["uses", "implements", "extends", "buildsOn"]
-
-    try:
-        collection = server.client.collections.get(
-            collection_name or COLLECTION_NAME
-        )
-
-        for link in typed_links:
-            relation = link.get("relation_type", "")
-            target_title = link.get("target_title", "")
-
-            # Query target node.
-            # v0.2.101 B3 follow-up: `title` is word-TOKENIZED, so `Equal`
-            # matches every title CONTAINING the link's tokens, and the old
-            # `limit=1` took whichever came first — `[[uses::Weaviate]]`
-            # inherited the tags of e.g. "Weaviate Windows Ports Gotcha".
-            # The filter now only narrows; `_title_target_row` keeps the first
-            # row whose title has the SAME token sequence as the link.
-            target_row = _title_target_row(
-                collection, target_title,
-                return_properties=["tags", "node_type", "title"],
-            )
-            if target_row is None:
-                continue
-
-            target_props = target_row.properties or {}
-            target_tags = target_props.get("tags", [])
-
-            # Rule 1: Inherit capability tags from used/implemented tools
-            if relation in CAPABILITY_RELATIONS:
-                capability_tags = [t for t in target_tags if "-" in t]
-                for cap in capability_tags:
-                    if cap not in existing_tags and cap not in inferred_tags:
-                        inferred_tags.append(cap)
-
-            # Rule 2: Propagate domain tags through relationships
-            if relation in TAG_RELATIONS:
-                domain_tags = [t for t in target_tags if t.upper() == t or len(t) < 15]
-                for tag in domain_tags:
-                    if (tag not in existing_tags and
-                        tag not in inferred_tags and
-                        tag not in ["test", "project", "concept", "tool"]):
-                        inferred_tags.append(tag)
-
-    except Exception:
-        # Inference is best-effort - don't fail sync if it errors
-        pass
-
-    return inferred_tags
 
 
 def resolve_wikilinks_to_uuids(
@@ -4314,16 +4290,13 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             if len(validation_warnings) > 3:
                 print(f"   ... and {len(validation_warnings) - 3} more warnings")
 
-        # Run inference BEFORE storing (enrich with inferred tags).
-        # v0.2.89 BUG 6: inference reads the TARGET collection so a shared-
-        # scoped node inherits tags from its shared-collection link targets.
-        inferred_tags = infer_tags_from_typed_links(
-            server, node_data, collection_name=target_collection_name
-        )
-        if inferred_tags:
-            # Add inferred tags to node data (will be stored with original tags)
-            node_data["tags"] = list(set(node_data["tags"] + inferred_tags))
-            print(f"🧠 Inferred {len(inferred_tags)} tags from typed relationships")
+        # v0.2.102 OD-1 (owner, 2026-10-07; re-confirmed 2026-10-13): the
+        # stored `tags` are EXACTLY the node's frontmatter tags. The KG is not
+        # hierarchical, so nothing propagates through typed links — the
+        # pre-v0.2.102 link-based tag inference (and the interim W4-C
+        # TAG_HIERARCHY-admitted variant) was removed with owner approval.
+        # Rows inflated by older versions converge on the zero-embed metadata
+        # repair (`_repair_stale_metadata`; `KG_METADATA_REPAIR_BUMPS` 0.2.102).
 
         print(f"🔄 Syncing node: {node_data['title']} ({node_data['node_type']})")
         print(f"   Tags: {', '.join(node_data['tags']) if node_data['tags'] else 'none'}")
@@ -4682,7 +4655,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 # DUAL_EMBEDDING_ENABLED=true (default) this fans out to every
                 # reachable text backend so multiple slots get populated.
                 vec_arg, slots_written, truncated_slots = _build_vector_arg(
-                    server, content
+                    server, content, target_collection_name
                 )
 
             # Prepare data object
@@ -4815,7 +4788,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     # v0.2.18: embed via EmbeddingService (multi-slot when
                     # DUAL_EMBEDDING_ENABLED — see _build_vector_arg).
                     vec_arg, last_slots, truncated_slots = _build_vector_arg(
-                        server, chunk.content
+                        server, chunk.content, target_collection_name
                     )
 
                 # Prepare data object (tags, links, typed_links, external_links shared across all chunks)
@@ -5489,6 +5462,10 @@ def _print_drift_sentinel(binding, report, repair_owed=None) -> None:
             "scanned": int(getattr(report, "scanned", 0) or 0) if report is not None else 0,
             "missing": len(getattr(report, "missing", ()) or ()) if report is not None else 0,
             "stale": len(getattr(report, "stale", ()) or ()) if report is not None else 0,
+            # v0.2.102 W4-C L2: the stored-only dimension rides the sentinel
+            # WITHOUT touching `status` (the Rust gate's "drift ⇒ spawn an
+            # `--all` pass" must not fire for rows a re-sync cannot clear).
+            "stored_only": len(getattr(report, "stored_only", ()) or ()) if report is not None else 0,
             "detail": (
                 getattr(report, "detail", "") if report is not None
                 else (getattr(binding, "detail", "") or "no KG binding")
@@ -5577,6 +5554,11 @@ def _run_check_drift() -> None:
     if report.stale:
         print(f"   stale in Weaviate ({len(report.stale)}):")
         for p in report.stale:
+            print(f"     - {p}")
+    if report.stored_only:
+        print(f"   stored-only in Weaviate ({len(report.stored_only)}) — "
+              "file gone, a re-sync does NOT remove these rows:")
+        for p in report.stored_only:
             print(f"     - {p}")
     if report.status == "drift":
         print(
@@ -5847,9 +5829,15 @@ def main():
 
         # Sync files
         if sys.argv[1] == "--all":
+            # v0.2.102 W6-I: a selected model that differs from a collection's
+            # recorded one is filled additively BEFORE the walk (only missing
+            # vectors embed), so unchanged nodes then skip with zero re-embeds.
+            _kg_embed_model.fill_before_walk(_fill_collections(), embedding_service)
             kg_tally = sync_all_nodes(server)
             doc_tally = sync_all_docs(server)
             total_fail = kg_tally.failed + doc_tally.failed
+            _kg_embed_model.after_walk(_fill_collections(), PROJECT_ROOT,
+                                       embedding_service, full_tree=True)
             # v0.2.89 BUG 6: surface how many nodes routed to the shared
             # collection via `scope: shared` frontmatter.
             _shared_note = (
@@ -6015,6 +6003,8 @@ def main():
             sys.exit(0 if total_fail == 0 else 1)
         elif sys.argv[1] == "--all-docs":
             doc_tally = sync_all_docs(server)
+            _kg_embed_model.after_walk(_fill_collections(), PROJECT_ROOT,
+                                       embedding_service, full_tree=False)
             print(f"📊 Docs: {doc_tally.summary_fragment()}")
             _print_run_details(doc_tally, run_kind="--all-docs")
             # v0.2.92 D17: docs-only failures are owed work too. NO clear
@@ -6057,6 +6047,8 @@ def main():
                     )
                 tally.add(outcome)
 
+            _kg_embed_model.after_walk(_fill_collections(), PROJECT_ROOT,
+                                       embedding_service, full_tree=False)
             if len(raw_args) > 1:
                 print(f"📊 List: {tally.summary_fragment()}")
             # v0.2.95: the hook path repairs metadata too (a single edited
@@ -6205,6 +6197,24 @@ def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
         # Soft-fail — don't escalate. The failure JSONL written by
         # NoEmbeddingBackendError already captures the diagnostic.
         print(f"   (deferral emit failed: {inner})", file=sys.stderr)
+
+
+_FILL_COLLECTIONS: "Optional[List[str]]" = None
+
+
+def _fill_collections() -> "List[str]":
+    """The collections this run writes (v0.2.102 W6-I fill set): the
+    project's KG, the shared KG when this project may write it, and the
+    development collection. Resolved once per process (one access-matrix
+    ask per run, also on the per-edit path)."""
+    global _FILL_COLLECTIONS
+    if _FILL_COLLECTIONS is None:
+        names = [COLLECTION_NAME, DEV_COLLECTION_NAME]
+        if (SHARED_COLLECTION_NAME and not _resolve_shared_kg_write_disabled()
+                and _shared_write_matrix_allows(SHARED_COLLECTION_NAME)[0]):
+            names.append(SHARED_COLLECTION_NAME)
+        _FILL_COLLECTIONS = [n for n in names if n]
+    return list(_FILL_COLLECTIONS)
 
 
 def _clear_sync_failures_deferral(install_root: Path) -> None:

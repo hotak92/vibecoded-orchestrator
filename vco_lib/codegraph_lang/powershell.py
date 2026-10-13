@@ -12,6 +12,12 @@ mechanical ``self.`` -> ``ctx.`` rename and the analyzer-resident
 verbatim; behaviour has since been corrected here (v0.2.92), so it is no
 longer byte-identical to the analyzer's original.
 ``tests/test_codegraph_golden.py`` pins what it does TODAY.
+
+v0.2.102 W6-L: definitions come from the tree-sitter layer
+(:func:`vco_lib.codegraph_defs.extract_definitions`, the OPTIONAL
+``tree-sitter-powershell`` parser VCO offers when a project contains
+PowerShell) when the parser is installed and the file parses cleanly; the
+regex helpers below are the fallback, unchanged.
 """
 from __future__ import annotations
 
@@ -19,11 +25,13 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from vco_lib.codegraph_defs import Definitions, extract_definitions, note_path
 from vco_lib.codegraph_entities import (
     CodeEntity,
     FileExtraction,
+    KIND_CLASS,
     KIND_FUNCTION,
     ModuleDescriptor,
 )
@@ -310,7 +318,20 @@ def extract_powershell_file(
     entities: List[CodeEntity] = []
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
-    # --- Functions / filters ---
+    # Definitions: tree-sitter first (v0.2.102 W6-L — the OPTIONAL
+    # ``tree-sitter-powershell`` parser VCO offers on demand), the regex
+    # discovery below as the fallback (parser absent, or a parse error).
+    defs = extract_definitions("powershell", content, origin=relative_path)
+    note_path("powershell", "tree-sitter" if defs is not None else "regex")
+    if defs is not None:
+        _append_treesitter_entities(defs, source_lines, file_path, relative_path,
+                                    helpers, entities, stats)
+        return FileExtraction(
+            module=module, entities=entities, interactions=[],
+            imports=[], stats=stats,
+        )
+
+    # --- Functions / filters (regex fallback) ---
     for decl in _parse_powershell_functions(content):
         name: str = decl["name"]
         scope: Optional[str] = decl["scope"]
@@ -380,6 +401,65 @@ def extract_powershell_file(
         module=module, entities=entities, interactions=[],
         imports=[], stats=stats,
     )
+
+
+def _append_treesitter_entities(
+    defs: Definitions, source_lines: List[str], file_path: Path,
+    relative_path: str, helpers: Any, entities: List[CodeEntity],
+    stats: Dict[str, int],
+) -> None:
+    """Records from the tree-sitter definitions, in source order.
+
+    Functions and filters keep the regex path's identity and signature
+    (``<stem>.<name>``; ``function [scope:]Name($a, $b)``) — the parameter
+    list now also includes an inline ``function f($a, $b)`` declaration and
+    reads only declared parameter names. Classes / enums (PowerShell 5) are
+    new rows (``<stem>.<Class>``, ``methods`` = their methods and
+    constructors); a method's identity is ``<stem>.<Class>.<method>``."""
+    stem = file_path.stem
+    rows: List[Tuple[int, int, CodeEntity]] = []
+    for c in defs.classes:
+        body = '\n'.join(source_lines[max(0, c.start_line - 1):c.end_line])
+        methods = defs.methods_of(c.name)
+        signature = f"{c.keyword} {c.name}" + (f" : {c.base}" if c.base else "")
+        rows.append((c.start_line, c.start_col, CodeEntity(
+            kind=KIND_CLASS, file_path_rel=relative_path,
+            name=c.name, full_name=f"{stem}.{c.name}",
+            body=body, signature=signature, doc="",
+            start_line=c.start_line, end_line=c.end_line,
+            project=helpers.project_name,
+            extras={"methods": methods},
+            deferred_embed=(
+                lambda sig=signature, cb=body, mth=methods:
+                helpers.embed_class(sig, cb, methods=mth, language="powershell")
+            ),
+        )))
+        stats['classes'] += 1
+    for f in defs.functions:
+        body = '\n'.join(source_lines[max(0, f.start_line - 1):f.end_line])
+        if f.container:
+            full_name = f"{stem}.{f.container}.{f.name}"
+            head = f"{'static ' if f.tag == 'static' else ''}method {f.container}.{f.name}"
+            signature = f"{head}({f.params})"
+        else:
+            full_name = f"{stem}.{f.name}"
+            scope_prefix = f"{f.tag}:" if f.tag else ""
+            signature = (f"{f.keyword} {scope_prefix}{f.name}({f.params})" if f.params
+                         else f"{f.keyword} {scope_prefix}{f.name}")
+        rows.append((f.start_line, f.start_col, CodeEntity(
+            kind=KIND_FUNCTION, file_path_rel=relative_path,
+            name=f.name, full_name=full_name,
+            body=body, signature=signature, doc="",
+            start_line=f.start_line, end_line=f.end_line,
+            is_async=False, project=helpers.project_name,
+            deferred_embed=(
+                lambda sig=signature, fb=body:
+                helpers.embed_function(sig, fb, language="python")
+            ),
+        )))
+        stats['functions'] += 1
+    rows.sort(key=lambda r: (r[0], r[1]))
+    entities.extend(e for _, _, e in rows)
 
 
 def analyze_powershell_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:

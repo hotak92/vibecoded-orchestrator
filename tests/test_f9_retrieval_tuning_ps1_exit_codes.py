@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PS1 = REPO_ROOT / "templates" / "scripts" / "vct_retrieval_tuning_set.ps1"
@@ -50,7 +51,7 @@ class Ps1ExitCodeMatrixTest(unittest.TestCase):
             "VCT_STATE_DIR": self._state,
         }
         return subprocess.run(
-            [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(PS1), *args],
+            [_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(PS1), *args],
             env=env, capture_output=True, text=True, timeout=30,
         ).returncode
 

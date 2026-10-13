@@ -35,6 +35,7 @@ import pytest
 
 from tests.test_v02101_rl_continuity import OutcomeRig
 from tests.test_v02101_router_surfaces import HOOKS, _bash_payload, needs_bash, needs_pwsh
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "claude_mcp_servers" / "scripts"
@@ -63,7 +64,7 @@ def _concurrent(rig: OutcomeRig, payload: dict, shell: str, n: int = 2) -> list:
     """Start *n* wrapper spawns at once (as the harness does for an if-group)."""
     env = rig.env()
     if shell == "ps1":
-        argv = ["pwsh", "-NoProfile", "-File", str(HOOKS / "pre-bash-context-inject.ps1")]
+        argv = ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / "pre-bash-context-inject.ps1")]
     else:
         argv = ["bash", str(HOOKS / "pre-bash-context-inject.sh")]
     procs = [

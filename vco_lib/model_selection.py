@@ -8,7 +8,7 @@ general notes). This module decides
 which PROVIDERS are reachable at render time and renders only their rows:
 
 * Anthropic/Claude rows always render.
-* A vendor row (``zai``, ``qwen``) renders only when the model gateway can
+* A vendor row (``zai``, ``qwen``, ``kimi``) renders only when the model gateway can
   resolve that vendor's key AT RENDER TIME. This is a snapshot taken during
   install/update — nothing monitors key availability afterwards; the next
   install/update re-renders the section.
@@ -46,6 +46,7 @@ __all__ = [
     "load_grid",
     "reachable_providers",
     "render_grid",
+    "vendor_key_probe",
 ]
 
 #: The .toml sits next to this loader inside the ``vco_lib`` package so it
@@ -166,8 +167,12 @@ def _warn_line(message: str) -> None:
         pass
 
 
-def _default_key_probe() -> KeyProbe:
+def vendor_key_probe() -> KeyProbe:
     """Build the real probe from the gateway's own key resolution.
+
+    The ONE home for "does this vendor's key resolve right now": the grid
+    filter below and the per-vendor leg of the gateway agent delivery gate
+    (``vco_lib.module_gated_delivery.select_gateway_agents``) both call it.
 
     ``VendorKeyResolver.resolve`` never raises for an unreachable store — it
     returns a :class:`~model_router.secrets.KeyResult` whose ``key`` is
@@ -192,7 +197,7 @@ def reachable_providers(*, key_probe: Optional[KeyProbe] = None,
     every vendor named in the grid whose key resolves.
 
     ``key_probe`` is injectable for tests; the default is the gateway's own
-    resolver (see :func:`_default_key_probe`). A probe that raises marks that
+    resolver (see :func:`vendor_key_probe`). A probe that raises marks that
     ONE vendor unavailable (soft-fail, one stderr line); a gateway package
     that cannot be imported at all leaves the Claude rows standing.
     """
@@ -204,7 +209,7 @@ def reachable_providers(*, key_probe: Optional[KeyProbe] = None,
         return frozenset(available)
     if key_probe is None:
         try:
-            key_probe = _default_key_probe()
+            key_probe = vendor_key_probe()
         except Exception as exc:  # noqa: BLE001 — reported, never fatal
             _warn_line(
                 f"model gateway not importable ({type(exc).__name__}); "

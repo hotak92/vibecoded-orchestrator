@@ -43,6 +43,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -283,7 +284,7 @@ class PowerShellCorruptDiscoveryTest(unittest.TestCase):
         try:
             cmd = f'. "{lib}"; {fn}'
             return subprocess.run(
-                [_PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd],
+                [_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", cmd],
                 env=env,
                 capture_output=True,
                 text=True,

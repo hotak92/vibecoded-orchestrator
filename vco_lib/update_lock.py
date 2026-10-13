@@ -10,18 +10,34 @@ two processes interleaving ``git pull`` and ``install.py`` on one tree.
 
 This is the ONE Python reader of that file. Its format MUST match the Rust
 writer exactly (pinned by ``tests/test_v02100_update_lock_honoured.py`` against
-the literal ``format!("{}\\n{}\\n", own_pid, timestamp)`` in single_flight.rs):
+the ``format!`` body in single_flight.rs):
 
-    <holder pid>\\n<unix seconds when claimed>\\n
+    <holder pid>\\n<unix seconds when claimed>\\n<holder start token>\\n
+
+The third line (v0.2.102 W6-Z3) is the holder's process start token in
+:func:`vco_lib.deferral_probes.process_start_token`'s format (``proc:<ticks>``
+on Linux, ``wall:<seconds>`` elsewhere); it is empty when the launcher could
+not read it, and absent from a claim written by a pre-v0.2.102 launcher.
 
 Decision (:func:`decide`), in order:
 
 * no file / empty / unparseable → PROCEED (install.py cannot tell, and a guard
   that cannot confirm a concurrent update must not block one — the launcher,
   the lock's owner, refuses malformed claims on its side);
-* holder dead, or alive but started AFTER the claim was written (a reused pid —
-  the success path leaves a claim naming a dead pid, W2R-06) → PROCEED (stale;
-  the file is the launcher's to reap, never deleted here);
+* holder dead, or alive but a DIFFERENT process than the claimant (a reused
+  pid — the success path leaves a claim naming a dead pid, W2R-06) → PROCEED
+  (stale; the file is the launcher's to reap, never deleted here). "Different"
+  is decided by the start token when the claim carries one: the pid's current
+  token differs from the recorded one. A ``wall:`` token gap in the "cannot
+  tell" band (over 1 s, under 3 s) keeps the holder alive. Only a two-line
+  (legacy) claim, or one whose token cannot be compared at all (different
+  kinds, process not inspectable), falls back to the time rule — alive but
+  started AFTER the claim was written. That rule assumes the wall clock did
+  not step between the claim and now: psutil derives a Linux start time from
+  ``/proc/stat`` ``btime``, which the kernel recomputes from the current wall
+  clock, so a forward NTP step makes a live holder look newer than its claim.
+  The token (``/proc`` start ticks, or the OS-stored creation time) does not
+  move, which is why it wins whenever it is present;
 * holder is THIS process or one of its ancestors → PROCEED: this install.py is
   the launcher's own child (``update_run.rs`` step 8 spawns it). Recognition by
   ancestry needs no cooperation from the launcher — no env token to forward
@@ -62,6 +78,9 @@ _START_SLACK_S = 2.0
 class Claim:
     pid: int
     claimed_at: Optional[float]
+    #: The holder's process start token (line 3), or ``None`` for a legacy
+    #: two-line claim / an empty third line.
+    start_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -79,7 +98,8 @@ def lock_path(vct_root: Optional[Path] = None) -> Path:
 
 
 def parse_claim(text: str) -> Optional[Claim]:
-    """Parse the Rust writer's two-line body; ``None`` when it names no pid."""
+    """Parse the Rust writer's body (two lines, or three since v0.2.102);
+    ``None`` when it names no pid."""
     lines = [ln.strip() for ln in (text or "").splitlines()]
     if not lines or not lines[0].isdigit():
         return None
@@ -89,7 +109,8 @@ def parse_claim(text: str) -> Optional[Claim]:
             ts = float(lines[1])
         except ValueError:
             ts = None
-    return Claim(pid=int(lines[0]), claimed_at=ts)
+    token = lines[2] if len(lines) > 2 and lines[2] else None
+    return Claim(pid=int(lines[0]), claimed_at=ts, start_token=token)
 
 
 # ── process facts (psutil when importable — a hard dependency of the venv —
@@ -100,8 +121,16 @@ _IS_WINDOWS = os.name == "nt"
 
 # Win32 constants (winnt.h / winerror.h / tlhelp32.h).
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+#: WaitForSingleObject needs SYNCHRONIZE on the handle — a query-limited-only
+#: handle makes the wait return WAIT_FAILED for live AND exited processes
+#: (batch-6 review C-1), which would collapse the 259 disambiguation.
+_SYNCHRONIZE = 0x00100000
 _STILL_ACTIVE = 259
 _ERROR_ACCESS_DENIED = 5
+#: WaitForSingleObject return values (winbase.h) — the 259 disambiguator.
+_WAIT_OBJECT_0 = 0x0000
+_WAIT_TIMEOUT = 0x0102
+_WAIT_FAILED = 0xFFFFFFFF
 _ERROR_INVALID_PARAMETER = 87
 _TH32CS_SNAPPROCESS = 0x00000002
 #: FILETIME epoch (1601-01-01) → Unix epoch, in seconds.
@@ -117,6 +146,8 @@ def _kernel32():
     k32.OpenProcess.restype = wintypes.HANDLE
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
     k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
     k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(ctypes.c_ulonglong)] * 4
     k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
@@ -130,7 +161,11 @@ def _win_pid_alive(pid: int) -> Optional[bool]:
         from ctypes import wintypes
 
         k32 = _kernel32()
-        handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        # SYNCHRONIZE | QUERY_LIMITED: the wait below requires SYNCHRONIZE;
+        # a denial lands in the ACCESS_DENIED arm below (alive — the
+        # conservative answer for a process we may not probe).
+        handle = k32.OpenProcess(
+            _SYNCHRONIZE | _PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             err = ctypes.get_last_error()  # type: ignore[attr-defined]
             if err == _ERROR_INVALID_PARAMETER:
@@ -142,9 +177,22 @@ def _win_pid_alive(pid: int) -> Optional[bool]:
             code = wintypes.DWORD()
             if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
                 return None
-            # A process that EXITED with code 259 reads as alive — the one
-            # documented ambiguity of this API; it errs toward refusing.
-            return code.value == _STILL_ACTIVE
+            if code.value != _STILL_ACTIVE:
+                return False  # a real exit code: the process is gone
+            # 259 is ALSO what a live process reports — the one documented
+            # ambiguity of GetExitCodeProcess. Disambiguate with a zero-timeout
+            # wait on the same handle: WAIT_TIMEOUT ⇒ the object is not yet
+            # signalled ⇒ alive; WAIT_OBJECT_0 ⇒ it exited (with code 259) and
+            # its handle is signalled. Any OTHER wait result (WAIT_FAILED, an
+            # aborted wait) cannot distinguish the two, so fall back to the
+            # BASE behaviour — treat 259 as ALIVE. decide() maps None to
+            # PROCEED-with-warning, so an unknowable 259 must NOT become None:
+            # that would let a second update through while the holder runs,
+            # the exact case this lock exists to refuse.
+            wait = k32.WaitForSingleObject(handle, 0)
+            if wait == _WAIT_OBJECT_0:
+                return False
+            return True
         finally:
             k32.CloseHandle(handle)
     except Exception:  # noqa: BLE001 — unknowable, never a crash
@@ -301,19 +349,58 @@ def ancestors(pid: Optional[int] = None, *, parent_of: Callable[[int], Optional[
     return chain
 
 
+#: :func:`same_instance`'s answer when the tokens WERE compared but landed in
+#: the "cannot tell" band (``deferral_probes.IDENTITY_BAND``): :func:`decide`
+#: keeps such a holder alive and never applies the start-time rule to it
+#: (v0.2.102 W6-LOWS, R3 C-3).
+IDENTITY_CANNOT_TELL = "cannot_tell"
+
+
+def same_instance(pid: int, recorded: str) -> "bool | str | None":
+    """Is *pid* still the process whose start token was *recorded*? The ONE
+    comparison home is :func:`vco_lib.deferral_probes.process_identity_verdict`
+    (imported lazily: that module is heavy, and this guard runs before the
+    venv relaunch). ``True`` = same, ``False`` = reused,
+    :data:`IDENTITY_CANNOT_TELL` = compared but in the cannot-tell band,
+    ``None`` = no comparison was possible."""
+    try:
+        from vco_lib import deferral_probes as dp
+    except Exception:  # noqa: BLE001 — cannot compare → the caller's fallback
+        return None
+    verdict = dp.process_identity_verdict(pid, recorded)
+    if verdict == dp.IDENTITY_SAME:
+        return True
+    if verdict == dp.IDENTITY_REUSED:
+        return False
+    if verdict == dp.IDENTITY_BAND:
+        return IDENTITY_CANNOT_TELL
+    return None
+
+
 def decide(claim: Optional[Claim], *, alive: Callable[[int], Optional[bool]] = pid_alive,
            started: Callable[[int], Optional[float]] = process_start_time,
-           lineage: Callable[[], Optional[list]] = ancestors) -> Decision:
+           lineage: Callable[[], Optional[list]] = ancestors,
+           identity: Callable[[int, str], "bool | str | None"] = same_instance) -> Decision:
     """Pure over its probes — see the module docstring for the rule."""
     if claim is None:
         return Decision(PROCEED, "no update claim")
     is_alive = alive(claim.pid)
     if is_alive is False:
         return Decision(PROCEED, f"stale claim (pid {claim.pid} is not running)")
-    if is_alive is True and claim.claimed_at is not None:
+    reused = f"stale claim (pid {claim.pid} was reused by a newer process)"
+    same: "bool | str | None" = None
+    if is_alive is True and claim.start_token:
+        same = identity(claim.pid, claim.start_token)
+        if same is False:
+            return Decision(PROCEED, reused)
+    if is_alive is True and same is None and claim.claimed_at is not None:
+        # Legacy two-line claim, or a token that cannot be compared: the
+        # wall-clock rule (see the module docstring for its clock caveat).
+        # A token compared into the cannot-tell band (IDENTITY_CANNOT_TELL)
+        # never gets here: that holder stays alive.
         began = started(claim.pid)
         if began is not None and began > claim.claimed_at + _START_SLACK_S:
-            return Decision(PROCEED, f"stale claim (pid {claim.pid} was reused by a newer process)")
+            return Decision(PROCEED, reused)
     chain = lineage()
     if chain is not None and claim.pid in chain:
         return Decision(PROCEED, f"this install.py is the child of the update holder (pid {claim.pid})")

@@ -1,0 +1,147 @@
+{
+ "source": "git_cmd.rs",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "git_program",
+   "start": 91,
+   "end": 93,
+   "full_name": "git_cmd.git_program"
+  },
+  {
+   "kind": "function",
+   "name": "git_command",
+   "start": 103,
+   "end": 105,
+   "full_name": "git_cmd.git_command"
+  },
+  {
+   "kind": "function",
+   "name": "is_network_verb",
+   "start": 116,
+   "end": 118,
+   "full_name": "git_cmd.is_network_verb"
+  },
+  {
+   "kind": "function",
+   "name": "git_network_command",
+   "start": 131,
+   "end": 135,
+   "full_name": "git_cmd.git_network_command"
+  },
+  {
+   "kind": "function",
+   "name": "run_git_command_with",
+   "start": 142,
+   "end": 150,
+   "full_name": "git_cmd.run_git_command_with"
+  },
+  {
+   "kind": "function",
+   "name": "run_git",
+   "start": 162,
+   "end": 164,
+   "full_name": "git_cmd.run_git"
+  },
+  {
+   "kind": "function",
+   "name": "run_git_with",
+   "start": 167,
+   "end": 184,
+   "full_name": "git_cmd.run_git_with"
+  },
+  {
+   "kind": "function",
+   "name": "run_git_raw",
+   "start": 204,
+   "end": 209,
+   "full_name": "git_cmd.run_git_raw"
+  },
+  {
+   "kind": "function",
+   "name": "raw_git_command",
+   "start": 214,
+   "end": 227,
+   "full_name": "git_cmd.raw_git_command"
+  },
+  {
+   "kind": "function",
+   "name": "run_git_raw_env",
+   "start": 236,
+   "end": 245,
+   "full_name": "git_cmd.run_git_raw_env"
+  },
+  {
+   "kind": "function",
+   "name": "first_arg",
+   "start": 249,
+   "end": 253,
+   "full_name": "git_cmd.first_arg"
+  },
+  {
+   "kind": "class",
+   "name": "BranchState",
+   "start": 269,
+   "end": 274,
+   "full_name": "git_cmd.BranchState",
+   "methods": []
+  },
+  {
+   "kind": "function",
+   "name": "resolve_branch",
+   "start": 298,
+   "end": 317,
+   "full_name": "git_cmd.resolve_branch"
+  },
+  {
+   "kind": "function",
+   "name": "branch_state_from_abbrev_ref",
+   "start": 329,
+   "end": 341,
+   "full_name": "git_cmd.branch_state_from_abbrev_ref"
+  },
+  {
+   "kind": "function",
+   "name": "commits_behind",
+   "start": 350,
+   "end": 362,
+   "full_name": "git_cmd.commits_behind"
+  },
+  {
+   "kind": "function",
+   "name": "remote_default_branch",
+   "start": 379,
+   "end": 397,
+   "full_name": "git_cmd.remote_default_branch"
+  },
+  {
+   "kind": "function",
+   "name": "latest_remote_tag",
+   "start": 428,
+   "end": 457,
+   "full_name": "git_cmd.latest_remote_tag"
+  },
+  {
+   "kind": "function",
+   "name": "newest_release_tag",
+   "start": 464,
+   "end": 477,
+   "full_name": "git_cmd.newest_release_tag"
+  },
+  {
+   "kind": "function",
+   "name": "tree_is_clean",
+   "start": 485,
+   "end": 488,
+   "full_name": "git_cmd.tree_is_clean"
+  },
+  {
+   "kind": "function",
+   "name": "is_ancestor",
+   "start": 495,
+   "end": 519,
+   "full_name": "git_cmd.is_ancestor"
+  }
+ ]
+}

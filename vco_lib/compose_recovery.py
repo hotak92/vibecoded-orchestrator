@@ -25,8 +25,10 @@ recovery that existed (network label) lived in one caller only.
     with no such provenance (hand-made, another project's, unreadable labels)
     is refused and ledgered, never removed: it may carry a subnet / DNS / an
     option its owner set;
-  - storage-only leftover → only for a canonical VCO container name, only
-    after BOTH mountinfo views (host and ``podman unshare``) show nothing of
+  - storage-only leftover → only for a canonical VCO container name that no
+    project declared unmanaged (v0.2.102 W5-A, M3 —
+    :mod:`vco_lib.infra_declarations`; an unreadable declaration list refuses
+    too), only after BOTH mountinfo views (host and ``podman unshare``) show nothing of
     it, then a NON-recursive ``rmdir`` of empty leftover directories under its
     ``merged/`` and ``podman rm --storage --force <id>`` — the repair verified
     by hand on 2026-09-29. A file, a symlink or a mount point under
@@ -49,7 +51,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from vco_lib import compose_provider as _cp
 from vco_lib import containers as _c
@@ -438,15 +440,37 @@ def _storage_rm_cmd(runtime: str, container_id: str) -> str:
     return f"{runtime} rm --storage --force {container_id}"
 
 
+def _declared_unmanaged_why(name: str, unmanaged: Optional[Mapping[str, str]]) -> Optional[str]:
+    """Why ``name`` must not be touched — declared unmanaged, or the
+    declarations could not be read — else ``None`` (v0.2.102 W5-A, M3).
+
+    ``unmanaged`` is ``{name: why}`` (a test seam); ``None`` reads
+    :mod:`vco_lib.infra_declarations`. An unreadable list is a refusal: a
+    "do not touch" list that cannot be read is not an empty one."""
+    if unmanaged is None:
+        from vco_lib import infra_declarations as _infra  # noqa: PLC0415
+
+        decl = _infra.load()
+        if not decl.resolvable:
+            return _infra.UNREADABLE_REASON
+        return decl.why(_infra.KIND_UNMANAGED_CONTAINER, name)
+    return unmanaged.get(name)
+
+
 def _heal_storage_leftover(
     failure: ComposeFailure, runtime: str, run: RunFn, log: LogFn, *,
     read_host_mountinfo: Callable[[], str], graphroot: Optional[Path],
+    unmanaged: Optional[Mapping[str, str]] = None,
 ) -> HealResult:
     name = failure.subject
     if runtime != "podman":
         return _refuse("storage-only leftovers are a podman state; not applicable here")
     if name not in _c.CANONICAL_CONTAINERS.values():
         return _refuse(f"{name} is not a VCO container name — never touched",
+                       CID_STORAGE_LEFTOVER_UNSAFE)
+    declared = _declared_unmanaged_why(name, unmanaged)
+    if declared is not None:
+        return _refuse(f"{name} is not VCO's to touch — {declared}",
                        CID_STORAGE_LEFTOVER_UNSAFE)
     rows = _c.list_external_containers(runtime, run=run)
     if rows is None:
@@ -536,11 +560,14 @@ def heal(
     graphroot: Optional[Path] = None,
     provider: Optional[_cp.ComposeProvider] = None,
     project: Optional[str] = None,
+    unmanaged: Optional[Mapping[str, str]] = None,
 ) -> HealResult:
     """The non-destructive repair for ``failure``'s cause (module doc).
     ``project`` — the compose project being recovered (the network heal's
     provenance check); ``provider`` — the compose that failed (the socket heal
-    probes the socket IT dialled, and skips one it never uses)."""
+    probes the socket IT dialled, and skips one it never uses);
+    ``unmanaged`` — ``{container: why}`` declared unmanaged (default: read
+    :mod:`vco_lib.infra_declarations`)."""
     _run = run or _tsd.run
     _log = log or (lambda msg: print(msg, flush=True))
     if not failure.healable:
@@ -560,7 +587,7 @@ def heal(
         return _heal_storage_leftover(
             failure, runtime, _run, _log,
             read_host_mountinfo=read_host_mountinfo or _read_host_mountinfo,
-            graphroot=graphroot,
+            graphroot=graphroot, unmanaged=unmanaged,
         )
     return _refuse(f"{failure.cause}: handled by the caller, not a heal")
 

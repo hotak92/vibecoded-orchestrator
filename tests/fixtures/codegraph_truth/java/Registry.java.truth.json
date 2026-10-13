@@ -1,0 +1,130 @@
+{
+ "source": "Registry.java",
+ "reviewed": "W6-E 2026-10-10 (hand-written; full_name + methods scored)",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Registry",
+   "start": 7,
+   "end": 38,
+   "full_name": "edge.Registry",
+   "methods": [
+    "Registry",
+    "toString",
+    "map"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "Registry",
+   "start": 10,
+   "end": 12,
+   "full_name": "Registry.Registry"
+  },
+  {
+   "kind": "function",
+   "name": "toString",
+   "start": 15,
+   "end": 17,
+   "full_name": "Registry.toString"
+  },
+  {
+   "kind": "function",
+   "name": "map",
+   "start": 19,
+   "end": 21,
+   "full_name": "Registry.map"
+  },
+  {
+   "kind": "class",
+   "name": "Node",
+   "start": 23,
+   "end": 29,
+   "full_name": "edge.Node",
+   "methods": [
+    "next"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "next",
+   "start": 26,
+   "end": 28,
+   "full_name": "Node.next"
+  },
+  {
+   "kind": "class",
+   "name": "Color",
+   "start": 31,
+   "end": 31,
+   "full_name": "edge.Color",
+   "methods": []
+  },
+  {
+   "kind": "function",
+   "name": "run",
+   "start": 34,
+   "end": 36,
+   "full_name": "Registry.run"
+  },
+  {
+   "kind": "class",
+   "name": "Point",
+   "start": 40,
+   "end": 44,
+   "full_name": "edge.Point",
+   "methods": [
+    "sum"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "sum",
+   "start": 41,
+   "end": 43,
+   "full_name": "Point.sum"
+  },
+  {
+   "kind": "class",
+   "name": "Level",
+   "start": 46,
+   "end": 52,
+   "full_name": "edge.Level",
+   "methods": [
+    "lower"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "lower",
+   "start": 49,
+   "end": 51,
+   "full_name": "Level.lower"
+  },
+  {
+   "kind": "class",
+   "name": "Marker",
+   "start": 54,
+   "end": 57,
+   "full_name": "edge.Marker",
+   "methods": [
+    "value",
+    "priority"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "value",
+   "start": 55,
+   "end": 55,
+   "full_name": "Marker.value"
+  },
+  {
+   "kind": "function",
+   "name": "priority",
+   "start": 56,
+   "end": 56,
+   "full_name": "Marker.priority"
+  }
+ ]
+}

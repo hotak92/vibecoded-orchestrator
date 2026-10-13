@@ -14,8 +14,11 @@ Three register rows, one module family:
 * NB-05 — a child that crashed before/after reading left the 0600 temp file in
   /tmp; the child now removes it in a ``finally`` (and an ``atexit`` backstop).
 * NB-06 — a CLI-only user (no hub) got one ``hub_not_running`` ledger line PER
-  SEARCH; repeated lines in an episode are now coalesced to one, with the count
-  carried as ``suppressed=<n>`` onto the next recorded line.
+  SEARCH; repeated lines in an episode are now coalesced to one. W3R-2
+  (v0.2.102) made the episode state cross-process (a state file beside the
+  ledger): repeats bump the episode line's ``suppressed`` count IN PLACE, so
+  the count is visible immediately rather than carried onto the next
+  episode's first line.
 
 The child is exercised in-process (``_child_main``); the real detached-child
 round trip (payload removed after a successful send) is already covered by
@@ -207,7 +210,7 @@ def test_unreadable_payload_is_removed_and_recorded(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_hub_down_lines_are_coalesced_and_count_carried_forward(hub, monkeypatch):
+def test_hub_down_lines_are_coalesced_and_counted_in_place(hub, monkeypatch):
     monkeypatch.setattr(hub, "_read_hub_token", lambda: None)
     for _ in range(5):
         assert hub.post_rl_event(dict(EV)) is False
@@ -215,7 +218,9 @@ def test_hub_down_lines_are_coalesced_and_count_carried_forward(hub, monkeypatch
     assert [(x["kind"], x["reason"]) for x in lines] == [
         ("hub_post_failed", "hub_not_running")
     ], "5 hub-down searches must produce exactly ONE ledger line"
-    assert "suppressed" not in lines[0], "the first line of an episode has nothing suppressed yet"
+    # W3R-2: the 4 repeats bump the episode line's suppressed count IN PLACE
+    # (cross-process state file), so the count is visible immediately.
+    assert lines[0]["suppressed"] == 4
 
     # A successful hub contact ends the episode.
     monkeypatch.setattr(hub, "_read_hub_token", lambda: "tok")
@@ -232,13 +237,13 @@ def test_hub_down_lines_are_coalesced_and_count_carried_forward(hub, monkeypatch
     monkeypatch.setattr(hub.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
     assert hub.post_rl_event(dict(EV)) is True
 
-    # The next hub-down episode's line carries the 4 that were suppressed.
+    # The next hub-down episode starts a fresh line with nothing suppressed.
     monkeypatch.setattr(hub, "_read_hub_token", lambda: None)
     assert hub.post_rl_event(dict(EV)) is False
     lines = _loss_lines()
     assert len(lines) == 2, lines
     assert lines[1]["reason"] == "hub_not_running"
-    assert lines[1]["suppressed"] == 4
+    assert "suppressed" not in lines[1], "a new episode's first line has nothing suppressed yet"
 
 
 def test_hub_down_line_keeps_the_event_fields(hub, monkeypatch):

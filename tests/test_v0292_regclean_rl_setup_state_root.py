@@ -53,6 +53,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SH = _REPO_ROOT / "templates" / "scripts" / "rl_client_setup.sh"
@@ -104,7 +105,7 @@ def _run_sh(project: Path, fake_home: Path, state: "Path | None") -> subprocess.
 def _run_ps(project: Path, fake_home: Path, state: "Path | None") -> subprocess.CompletedProcess:
     assert _PS is not None
     return subprocess.run(
-        [_PS, "-NoProfile", "-File", str(_PS1)],
+        [_PS, *PWSH_BASE_FLAGS, "-File", str(_PS1)],
         cwd=str(project),
         capture_output=True,
         text=True,

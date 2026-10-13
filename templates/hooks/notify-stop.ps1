@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed.
+﻿# Parity: kept in step with notify-stop.sh (this file's UTF-8 BOM serves
+# Windows PowerShell 5.1 only and has no Bash-side counterpart; every
+# behaviour must match the notify-stop.sh sibling).
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Parity-touch 2026-05-11: sibling .sh dropped the stale "Stop hooks don't fire in VS Code" note. Current Claude Code docs treat Stop as universal across all surfaces (CLI / VS Code extension / Desktop) — no PS1 logic change needed.
 # Scrub sensitive env vars before any subprocess spawning
@@ -12,7 +14,12 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
-$ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to do (no state is written).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectDir = Get-VcoProjectRoot
+if (-not $ProjectDir) { exit 0 }
 $ProjectName = Split-Path $ProjectDir -Leaf
 
 # Resolve a Python interpreter portably. _lib/find-python.ps1 sets $PY.

@@ -36,6 +36,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HELPER = REPO_ROOT / "scripts" / "lib" / "download-launcher-asset.ps1"
@@ -114,7 +115,7 @@ def _run_helper(dest_dir: Path, api_url: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [
             _pwsh(),
-            "-NoProfile",
+            *PWSH_BASE_FLAGS,
             "-NonInteractive",
             "-File",
             str(HELPER),

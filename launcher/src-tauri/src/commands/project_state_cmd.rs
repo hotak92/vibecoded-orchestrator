@@ -295,13 +295,41 @@ pub async fn set_project_mcp_server_enabled(
     enabled: bool,
     db: State<'_, Db>,
 ) -> Result<(), String> {
-    db.set_project_mcp_server_enabled(&project_id, &mcp_name, enabled)?;
+    set_project_mcp_server_enabled_with_claude_json(
+        &db,
+        &project_id,
+        &mcp_name,
+        enabled,
+        &crate::mcp_registration::user_claude_json(),
+    )
+}
+
+/// Testable core of [`set_project_mcp_server_enabled`] (v0.2.102 W5-B C4:
+/// the per-project MCP tab's toggle).
+///
+/// Flips the `project_mcp_servers` REGISTRY row (the bundled/user-added
+/// registration the Custom-MCP surfaces read), then routes the very same
+/// (project, server) pair through
+/// [`set_project_mcp_permission_with_claude_json`] — the ONE existing
+/// writer of `~/.claude.json projects[<path>].disabledMcpServers` — so the
+/// toggle reaches Claude Code instead of only moving a launcher-DB row
+/// Claude Code never reads. One writer, two stores, one call: the tab
+/// never hand-writes `~/.claude.json` and never spawns a second mirror.
+fn set_project_mcp_server_enabled_with_claude_json(
+    db: &Db,
+    project_id: &str,
+    mcp_name: &str,
+    enabled: bool,
+    claude_json: &Path,
+) -> Result<(), String> {
+    db.set_project_mcp_server_enabled(project_id, mcp_name, enabled)?;
     db.audit(
         "project_mcp_server_set_enabled",
-        Some(&project_id),
+        Some(project_id),
         None,
         &serde_json::json!({ "mcp": mcp_name, "enabled": enabled }),
     )?;
+    set_project_mcp_permission_with_claude_json(db, project_id, mcp_name, enabled, claude_json)?;
     Ok(())
 }
 
@@ -806,7 +834,9 @@ pub struct SetKgBindingReq {
     #[serde(default = "default_kg_role")]
     pub role: String,
     pub collection_name: String,
-    pub embedding_model: Option<String>,
+    // v0.2.102 W6-J: no `embedding_model` — the per-project KG model pick was
+    // retired (one global embedding setting). The DB column survives with its
+    // historical values; nothing reads or writes it now.
     pub embedding_dim: Option<i64>,
     pub kg_dir_path: Option<String>,
     pub weaviate_url: Option<String>,
@@ -824,25 +854,6 @@ pub async fn set_project_kg_binding(
     app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<ProjectKgBinding, String> {
-    // v0.2.18 Commit 8: when an embedding_model is supplied, verify it
-    // against the live catalog so a typo doesn't silently break the
-    // seed pipeline. Empty/None passes through unchanged (caller is
-    // explicitly clearing or leaving the existing binding alone).
-    if let Some(model_id) = req.embedding_model.as_deref().filter(|s| !s.trim().is_empty()) {
-        let result = crate::commands::embedding_catalog::validate_model_against_catalog(
-            model_id.trim().to_string(),
-            crate::commands::embedding_catalog::ModelKind::Text,
-            db.clone(),
-        )
-        .await?;
-        if let crate::commands::embedding_catalog::ValidationResult::Invalid { reason } = result {
-            return Err(format!(
-                "embedding_model '{}' not valid for KG binding: {}",
-                model_id, reason
-            ));
-        }
-    }
-
     // F3 (v0.2.72): the row write's post-projection can now be
     // machine-global (F2: orchestrator-root rebind → refresh ALL projects,
     // N serial Python subprocesses) — run the sync core on the blocking
@@ -954,9 +965,11 @@ pub fn reproject_after_kg_binding_change(
 /// collection-ensure around it.
 ///
 /// F5 (v0.2.72): `config_projection.py` resolves KG_COLLECTION /
-/// SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION (and the derived
-/// DIAGRAMS_COLLECTION) from `project_kg_bindings` rows — all
-/// `MCP_RELEVANT_ENV_KEYS` members. Re-projecting after the write is
+/// SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION from
+/// `project_kg_bindings` rows — all `MCP_RELEVANT_ENV_KEYS` members.
+/// (Until v0.2.102 it also derived DIAGRAMS_COLLECTION; that key left
+/// the projection when the diagrams integrations were dropped.)
+/// Re-projecting after the write is
 /// what lets the settings watcher's diff-guard fire the guarded MCP
 /// reload for a rebind. Soft-fail: projection warnings ride in the
 /// returned result; the binding write is never rolled back.
@@ -1032,7 +1045,6 @@ pub fn set_project_kg_binding_row_with_db(
         &project_slug,
         &req.role,
         &req.collection_name,
-        req.embedding_model.as_deref(),
         req.embedding_dim,
         req.kg_dir_path.as_deref(),
         req.weaviate_url.as_deref(),
@@ -1263,6 +1275,31 @@ pub fn set_project_codegraph_binding_row_with_db(
     Ok(row)
 }
 
+/// v0.2.102 W6-B2: which model id a codegraph-binding save must validate —
+/// the selection (`config.code_model_target`) when present, else
+/// `embedding_model` but only when it differs from the stored record. Pure
+/// over the DB read (unit-tested).
+pub(crate) fn codegraph_model_to_validate(
+    db: &Db,
+    project_id: &str,
+    req: &SetCodegraphBindingReq,
+) -> Option<String> {
+    let non_empty = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    if let Some(target) = req.config.get("code_model_target").and_then(|v| v.as_str()).and_then(non_empty) {
+        return Some(target);
+    }
+    let model = req.embedding_model.as_deref().and_then(non_empty)?;
+    let stored = db
+        .get_project_codegraph_binding(project_id)
+        .ok()
+        .flatten()
+        .and_then(|b| b.embedding_model);
+    (stored.as_deref().map(str::trim) != Some(model.as_str())).then_some(model)
+}
+
 #[command]
 pub async fn set_project_codegraph_binding(
     project_id: String,
@@ -1274,16 +1311,22 @@ pub async fn set_project_codegraph_binding(
     // `set_project_kg_binding` above, but kind=Code. Rejects unknown
     // names so the GUI dropdown's "available" set is also the only set
     // that can be persisted.
-    if let Some(model_id) = req.embedding_model.as_deref().filter(|s| !s.trim().is_empty()) {
+    //
+    // v0.2.102 W6-B2: the model the user SELECTS is `config.code_model_target`
+    // (`embedding_model` is the record of what the graph is indexed with, which
+    // the Codegraph tab now sends back unchanged). Validate the selection, and
+    // the record only when it changed — a record whose backend is down right
+    // now must not block saving an unrelated edit.
+    if let Some(model_id) = codegraph_model_to_validate(&db, &project_id, &req) {
         let result = crate::commands::embedding_catalog::validate_model_against_catalog(
-            model_id.trim().to_string(),
+            model_id.clone(),
             crate::commands::embedding_catalog::ModelKind::Code,
             db.clone(),
         )
         .await?;
         if let crate::commands::embedding_catalog::ValidationResult::Invalid { reason } = result {
             return Err(format!(
-                "embedding_model '{}' not valid for codegraph binding: {}",
+                "code-embedding model '{}' not valid for codegraph binding: {}",
                 model_id, reason
             ));
         }
@@ -1536,7 +1579,6 @@ mod tests {
         let req = SetKgBindingReq {
             role: "primary".to_string(),
             collection_name: "F5Bind_KnowledgeGraph".to_string(),
-            embedding_model: None,
             embedding_dim: None,
             kg_dir_path: None,
             weaviate_url: None,
@@ -1565,7 +1607,6 @@ mod tests {
         let req = SetKgBindingReq {
             role: "primary".to_string(),
             collection_name: "F5Unbind_KnowledgeGraph".to_string(),
-            embedding_model: None,
             embedding_dim: None,
             kg_dir_path: None,
             weaviate_url: None,
@@ -1599,11 +1640,10 @@ mod tests {
     // ─── v0.2.92 D18 follow-up: a GUI class-pick records the human ────
     // ─── choice (manual_override) on the binding row ──────────────────
 
-    fn kg_req(collection: &str, model: Option<&str>, config: JsonValue) -> SetKgBindingReq {
+    fn kg_req(collection: &str, config: JsonValue) -> SetKgBindingReq {
         SetKgBindingReq {
             role: "primary".to_string(),
             collection_name: collection.to_string(),
-            embedding_model: model.map(str::to_string),
             embedding_dim: None,
             kg_dir_path: None,
             weaviate_url: None,
@@ -1637,7 +1677,6 @@ mod tests {
             "p-d18-pick",
             "primary",
             "D18Pick_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             None,
             None,
             None,
@@ -1650,7 +1689,7 @@ mod tests {
         set_project_kg_binding_row_with_db(
             &db,
             "p-d18-pick",
-            &kg_req("Picked_KnowledgeGraph", None, serde_json::json!({})),
+            &kg_req("Picked_KnowledgeGraph", serde_json::json!({})),
         )
         .expect("binding write must succeed");
 
@@ -1663,18 +1702,18 @@ mod tests {
         );
     }
 
-    /// (b) A model-only edit (collection UNCHANGED) expresses no class
-    /// preference — the row must stay machine-repairable, so no sentinel
-    /// may be stamped by it.
+    /// (b) A same-collection edit (collection UNCHANGED) expresses no
+    /// class preference — the row must stay machine-repairable, so no
+    /// sentinel may be stamped by it. (Until W6-J this was the picker's
+    /// "model-only edit"; the model field no longer exists on the request.)
     #[test]
-    fn set_project_kg_binding_model_only_edit_is_not_stamped() {
+    fn set_project_kg_binding_same_collection_edit_is_not_stamped() {
         let db = make_db();
         seed_project(&db, "p-d18-model", "D18Model");
         db.set_project_kg_binding(
             "p-d18-model",
             "primary",
             "D18Model_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             None,
             None,
             None,
@@ -1685,37 +1724,32 @@ mod tests {
         set_project_kg_binding_row_with_db(
             &db,
             "p-d18-model",
-            &kg_req(
-                "D18Model_KnowledgeGraph",
-                Some("snowflake-arctic-embed2"),
-                serde_json::json!({}),
-            ),
+            &kg_req("D18Model_KnowledgeGraph", serde_json::json!({})),
         )
         .expect("binding write must succeed");
 
         let cfg = stored_kg_config(&db, "p-d18-model");
         assert!(
             cfg.get("manual_override").is_none(),
-            "a model-only edit is not a class pick — stamping it would \
+            "a same-collection edit is not a class pick — stamping it would \
              freeze the row against legitimate automated repair; got {}",
             cfg,
         );
     }
 
-    /// (c) A pre-existing sentinel survives a model-only edit. The GUI
-    /// always sends `config: {}`, so a write that replaced config_json
-    /// wholesale would silently strip the human pick on an embedding-model
-    /// tweak and hand the row back to the automated heal — the exact
+    /// (c) A pre-existing sentinel survives a same-collection edit. The
+    /// GUI always sends `config: {}`, so a write that replaced config_json
+    /// wholesale would silently strip the human pick on a no-class-change
+    /// save and hand the row back to the automated heal — the exact
     /// regression this pins.
     #[test]
-    fn set_project_kg_binding_manual_override_survives_model_only_edit() {
+    fn set_project_kg_binding_manual_override_survives_same_collection_edit() {
         let db = make_db();
         seed_project(&db, "p-d18-keep", "D18Keep");
         db.set_project_kg_binding(
             "p-d18-keep",
             "primary",
             "D18Keep_KnowledgeGraph",
-            None,
             None,
             None,
             None,
@@ -1726,11 +1760,7 @@ mod tests {
         set_project_kg_binding_row_with_db(
             &db,
             "p-d18-keep",
-            &kg_req(
-                "D18Keep_KnowledgeGraph",
-                Some("qwen3-embedding:0.6b"),
-                serde_json::json!({}),
-            ),
+            &kg_req("D18Keep_KnowledgeGraph", serde_json::json!({})),
         )
         .expect("binding write must succeed");
 
@@ -1738,7 +1768,7 @@ mod tests {
         assert_eq!(
             cfg.get("manual_override"),
             Some(&JsonValue::Bool(true)),
-            "the human pick must survive a model-only edit; got {}",
+            "the human pick must survive a same-collection edit; got {}",
             cfg,
         );
     }
@@ -1757,7 +1787,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &serde_json::json!({"evidence_repoint": {"from": "Old_KnowledgeGraph"}}),
         )
         .unwrap();
@@ -1767,7 +1796,6 @@ mod tests {
             "p-d18-merge",
             &kg_req(
                 "Picked_KnowledgeGraph",
-                None,
                 serde_json::json!({"user_note": "keep me"}),
             ),
         )
@@ -1825,6 +1853,28 @@ mod tests {
             .unwrap()
             .expect("binding row present");
         assert_eq!(stored.collection_prefix, "Custom_Prefix");
+    }
+
+    /// v0.2.102 W6-B2: the save validates the SELECTION (code_model_target),
+    /// and the record only when it changed — an unchanged record (whose
+    /// backend may be down) never blocks an unrelated edit.
+    #[test]
+    fn codegraph_save_validates_the_selection_not_an_unchanged_record() {
+        let db = make_db();
+        seed_project(&db, "p-sel", "Sel");
+        let mut req = codegraph_req("Sel");
+        req.embedding_model = Some("codesage-large-v2".into());
+        // No stored row yet → a (new) record is validated.
+        assert_eq!(codegraph_model_to_validate(&db, "p-sel", &req).as_deref(), Some("codesage-large-v2"));
+        set_project_codegraph_binding_row_with_db(&db, "p-sel", &req).unwrap();
+        // Same record sent back unchanged → nothing to validate.
+        assert_eq!(codegraph_model_to_validate(&db, "p-sel", &req), None);
+        // A selection → the selection is validated.
+        req.config = serde_json::json!({"code_model_target": "qwen3-embedding:0.6b"});
+        assert_eq!(
+            codegraph_model_to_validate(&db, "p-sel", &req).as_deref(),
+            Some("qwen3-embedding:0.6b")
+        );
     }
 
     /// v0.2.101 (Q4 retirement): the `delete_project_codegraph_binding`
@@ -1961,7 +2011,6 @@ mod tests {
         let req = SetKgBindingReq {
             role: "primary".to_string(),
             collection_name: "Root_KnowledgeGraph".to_string(),
-            embedding_model: None,
             embedding_dim: None,
             kg_dir_path: None,
             weaviate_url: None,
@@ -2147,6 +2196,113 @@ mod tests {
 
         std::fs::remove_dir_all(&project_dir).ok();
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// v0.2.102 (W5-B C4): the per-project MCP tab's registry toggle must
+    /// reach Claude Code through the ONE existing writer. Disabling flips
+    /// the `project_mcp_servers` registry row AND writes the name into
+    /// `~/.claude.json projects[<path>].disabledMcpServers`; re-enabling
+    /// restores the row and REMOVES the mirrored name. Red-proof: drop the
+    /// `set_project_mcp_permission_with_claude_json` call from
+    /// `set_project_mcp_server_enabled_with_claude_json` → the disabled-set
+    /// assertions fail while the registry row still flips.
+    #[test]
+    fn set_project_mcp_server_enabled_flips_row_and_mirrors_claude_json() {
+        let db = make_db();
+        let project_dir = scratch_project_dir();
+        db.insert_project(
+            "pmt1",
+            "McpTab",
+            project_dir.to_string_lossy().as_ref(),
+            ProjectHost::Base,
+            &db.generate_unique_slug("McpTab").unwrap(),
+        )
+        .unwrap();
+        db.register_project_mcp_server(
+            "pmt1",
+            "my-custom",
+            true,
+            "user",
+            None,
+            None,
+            None,
+            &serde_json::json!({"command": "x"}),
+        )
+        .unwrap();
+        let tmp =
+            std::env::temp_dir().join(format!("vct-mcptab-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let claude_json = tmp.join(".claude.json");
+        let key = crate::mcp_registration::project_key_for_claude_json(&project_dir);
+
+        // Toggle OFF: registry row flips AND the name lands in the mirror.
+        set_project_mcp_server_enabled_with_claude_json(
+            &db, "pmt1", "my-custom", false, &claude_json,
+        )
+        .unwrap();
+        let rows = db.list_project_mcp_servers("pmt1").unwrap();
+        assert!(!rows[0].enabled, "registry row must be disabled");
+        let j1: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(
+            j1["projects"][&key]["disabledMcpServers"],
+            serde_json::json!(["my-custom"]),
+            "toggling off must write the entry: {j1}",
+        );
+
+        // Toggle ON: registry row restored AND the mirrored name removed.
+        set_project_mcp_server_enabled_with_claude_json(
+            &db, "pmt1", "my-custom", true, &claude_json,
+        )
+        .unwrap();
+        let rows = db.list_project_mcp_servers("pmt1").unwrap();
+        assert!(rows[0].enabled, "registry row must be re-enabled");
+        let j2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert!(
+            j2["projects"][&key].get("disabledMcpServers").is_none(),
+            "toggling on must remove the entry (the writer drops the key on an \
+             empty list): {j2}",
+        );
+
+        std::fs::remove_dir_all(&project_dir).ok();
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// v0.2.102 (W5-B C4): unregister removes the server for THAT project
+    /// only — a sibling project's registration of the same name survives,
+    /// and neither project's `~/.claude.json` opt-out list is touched by an
+    /// unregister (it deletes a registry row, not a permission gate).
+    #[test]
+    fn unregister_project_mcp_server_removes_only_that_projects_row() {
+        let db = make_db();
+        seed_project(&db, "pU1", "U1");
+        seed_project(&db, "pU2", "U2");
+        let cfg = serde_json::json!({"command": "x"});
+        for pid in ["pU1", "pU2"] {
+            db.register_project_mcp_server(
+                pid, "searxng", true, "user", None, None, None, &cfg,
+            )
+            .unwrap();
+        }
+
+        // Same DB writes the command performs.
+        db.unregister_project_mcp_server("pU1", "searxng").unwrap();
+        db.audit(
+            "project_mcp_server_unregister",
+            Some("pU1"),
+            None,
+            &serde_json::json!({ "mcp": "searxng" }),
+        )
+        .unwrap();
+
+        assert!(
+            db.list_project_mcp_servers("pU1").unwrap().is_empty(),
+            "the unregistered project's row must be gone",
+        );
+        let other = db.list_project_mcp_servers("pU2").unwrap();
+        assert_eq!(other.len(), 1, "the other project keeps its row");
+        assert_eq!(other[0].mcp_name, "searxng");
     }
 
     /// Per-project isolation: disabling a server for project A does NOT

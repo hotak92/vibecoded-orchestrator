@@ -21,7 +21,7 @@ import pytest
 # the module's top-level setup (weaviate client, env parsing, etc.).
 #
 # The mechanism is importlib + `patch.dict("sys.modules", ...)` stubs for the
-# third-party and vco_lib imports the script performs at module scope.
+# third-party imports the script performs at module scope.
 #
 # v0.2.92 (R23, found while landing WP-15/WP-16): this comment used to say the
 # patch targeted `_resolve_mcp_servers_dir` "so the VCO-REWIRE block doesn't
@@ -40,6 +40,21 @@ import pytest
 # together with tests/test_v0292_cli_root_resolution_and_prefix.py reproduced
 # 57 collection errors that neither file produces alone. The setdefault loop
 # was redundant with `patch.dict` (identical key set) and is gone.
+#
+# HERMETICITY 2 (v0.2.102 W6-Y follow-up 2): the stub map used to ALSO stub
+# `vco_lib` + `vco_lib.embedding_service` as bare non-package modules. The
+# script's module-scope `from vco_lib.<sub> import ...` group grew past those
+# two entries (kg_truncation_tags etc., v0.2.92 W3), and a bare stub parent
+# is NOT a package — `import vco_lib.kg_truncation_tags` then succeeded only
+# when an earlier test file had already warmed the real submodules into
+# sys.modules (the import system checks sys.modules before the parent's
+# `__path__`). Cold, this file failed 8/16 with "_normalize_typed_links
+# missing" (the exec_module ImportError was swallowed); warm, it passed —
+# order-dependent. vco_lib is NOT stubbed anymore: it ships in this repo and
+# tests/conftest.py puts the repo root on sys.path, so the real package is
+# always importable here; only weaviate / weaviate_mcp (genuine third-party
+# heavy deps) stay stubbed. That makes the exec independent of ambient
+# sys.modules state, first file or not.
 # ---------------------------------------------------------------------------
 
 def _import_sync_kg() -> object:
@@ -49,22 +64,19 @@ def _import_sync_kg() -> object:
         / "templates" / "scripts" / "sync_knowledge_graph.py"
     )
     # Provide stub modules so the top-level import block doesn't fail in a
-    # unit-test environment that lacks weaviate / vco_lib / EmbeddingService.
+    # unit-test environment that lacks weaviate / weaviate_mcp. vco_lib is
+    # deliberately NOT stubbed — see the HERMETICITY 2 note above.
     stubs = {
         "weaviate": type(sys)("weaviate"),
         "weaviate.classes": type(sys)("weaviate.classes"),
         "weaviate.classes.query": type(sys)("weaviate.classes.query"),
         "weaviate_mcp": type(sys)("weaviate_mcp"),
         "weaviate_mcp.chunking": type(sys)("weaviate_mcp.chunking"),
-        "vco_lib": type(sys)("vco_lib"),
-        "vco_lib.embedding_service": type(sys)("vco_lib.embedding_service"),
     }
     # Stub Filter and chunking classes used at module level
     stubs["weaviate.classes.query"].Filter = object
     stubs["weaviate_mcp.chunking"].TokenCounter = object
     stubs["weaviate_mcp.chunking"].Chunker = object
-    stubs["vco_lib.embedding_service"].EmbeddingService = object
-    stubs["vco_lib.embedding_service"].NoEmbeddingBackendError = Exception
 
     spec = importlib.util.spec_from_file_location("sync_knowledge_graph", script_path)
     mod = importlib.util.module_from_spec(spec)

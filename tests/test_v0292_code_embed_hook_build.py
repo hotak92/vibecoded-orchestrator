@@ -26,6 +26,7 @@ from pathlib import Path
 from tests.common.launcher_db_fixture import make_launcher_db
 from tests.common.ports import free_port
 from vco_lib import service_endpoints as _se
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS = REPO_ROOT / "templates" / "hooks"
@@ -213,10 +214,9 @@ class BashHookTests(unittest.TestCase):
             self.assertIn("was NOT rebuilt", proc.stdout)
 
 
-#: The plan's code_embed port for the port-provenance tests. A fixed,
-#: non-real port (nothing in VCO or the test fixtures listens on it) so the
-#: fake health service can bind it and the hook's probe can find it.
-PLAN_ROW_PORT = 12440
+#: The plan's code_embed port for the port-provenance tests is whatever free
+#: port the OS hands the fake health service (port 0): a fixed port collided
+#: with a concurrent suite run ("Address already in use").
 
 #: The retired env input's decoy value: port 9 (discard) is unroutable
 #: locally — nothing ever answers there, so a hook that still read
@@ -228,25 +228,26 @@ RETIRED_ENV_DECOY_PORT = 9
 class BashPlanPortProbeTests(unittest.TestCase):
     """v0.2.97 — the hook probes the launcher.db plan's port, never env.
 
-    The plan (a code_embed row on port 12440, VCO-managed + enabled) says
+    The plan (a code_embed row on a free port, VCO-managed + enabled) says
     one port; env CODE_EMBED_PORT says another (unroutable). The container
     is missing, and a fake health service answers on the PLAN's port — so
-    "Port 12440 already in use" proves which port was probed, and no compose
+    "Port <that port> already in use" proves which port was probed, and no compose
     invocation proves the hook stopped there.
     """
 
     def test_the_probe_uses_the_plans_port_not_env_code_embed_port(self):
         with tempfile.TemporaryDirectory() as tmp, \
-                _HealthService({"status": "ok"}, port=PLAN_ROW_PORT):
+                _HealthService({"status": "ok"}) as svc:
+            plan_row_port = svc.port
             fx = _Fixture(Path(tmp))
-            env = fx.env(PLAN_ROW_PORT)
+            env = fx.env(plan_row_port)
             env["CODE_EMBED_PORT"] = str(RETIRED_ENV_DECOY_PORT)
             proc = subprocess.run(
                 ["bash", str(HOOKS / "ensure-code-embed-service.sh")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
             )
-            self.assertIn(f"Port {PLAN_ROW_PORT} already in use", proc.stdout,
+            self.assertIn(f"Port {plan_row_port} already in use", proc.stdout,
                           proc.stdout + proc.stderr)
             self.assertEqual(fx.compose_invocations(), [],
                              "the plan's port answered - compose must not run")
@@ -263,18 +264,19 @@ class PowerShellPlanPortProbeTests(unittest.TestCase):
 
     def test_the_probe_uses_the_plans_port_not_env_code_embed_port(self):
         with tempfile.TemporaryDirectory() as tmp, \
-                _HealthService({"status": "ok"}, port=PLAN_ROW_PORT):
+                _HealthService({"status": "ok"}) as svc:
+            plan_row_port = svc.port
             fx = _Fixture(Path(tmp))
-            env = fx.env(PLAN_ROW_PORT)
+            env = fx.env(plan_row_port)
             env["CODE_EMBED_PORT"] = str(RETIRED_ENV_DECOY_PORT)
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
             )
-            self.assertIn(f"Port {PLAN_ROW_PORT} already in use", proc.stdout,
+            self.assertIn(f"Port {plan_row_port} already in use", proc.stdout,
                           proc.stdout + proc.stderr)
             self.assertEqual(fx.compose_invocations(), [],
                              "the plan's port answered - compose must not run")
@@ -351,7 +353,7 @@ class PowerShellUnreadablePlanTests(unittest.TestCase):
             env["TEMP"] = str(fx.tmp)
             fx.marker.touch()
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -431,7 +433,7 @@ class PowerShellRefusedRuntimeTests(unittest.TestCase):
             env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -622,7 +624,7 @@ class EnsureContainersBuildGatePs1Tests(unittest.TestCase):
             env.pop("VCT_VENV", None)
             env.pop("VCT_INSTALL_ROOT", None)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-containers.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -745,7 +747,7 @@ class EnsureContainersRefusalLedgerPs1Tests(unittest.TestCase):
             env, orch = _refusal_fixture(tmp, installed_clone)
             env["TEMP"] = str(tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-containers.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -847,7 +849,7 @@ class PowerShellHookTests(unittest.TestCase):
             env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -864,7 +866,7 @@ class PowerShellHookTests(unittest.TestCase):
             env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -883,7 +885,7 @@ class PowerShellHookTests(unittest.TestCase):
             env = fx.env(svc.port)
             env["TEMP"] = str(fx.tmp)
             proc = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),
@@ -898,7 +900,7 @@ class PowerShellHookTests(unittest.TestCase):
             env = fx.env(free_port())
             env["TEMP"] = str(fx.tmp)
             subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                [self.shell, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
                  "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
                 env=env, capture_output=True, text=True, timeout=180,
                 cwd=str(REPO_ROOT),

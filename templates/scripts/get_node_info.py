@@ -113,6 +113,29 @@ def _resolve_kg_collections() -> tuple[str, str]:
 
 KG_COLLECTION, SHARED_KG_COLLECTION = _resolve_kg_collections()
 
+
+def _access_filter(objects, coll_name: str) -> list:
+    """v0.2.102 W4-G: per-node ``cross_project_access`` on every read here.
+
+    Rows from a collection other than this project's own (shared / peer)
+    that the launcher's per-node editor restricted to other projects are
+    dropped — from ``info`` lookups, ``connections`` target lookups and the
+    inbound-link scan alike. ONE home: ``vco_lib.kg_node_access`` (the same
+    verdict the MCP fan-out and the hook router apply). The import is
+    function-local, keeping this module importable without vco_lib, and
+    deliberately unguarded: a vco_lib that cannot be imported when a row
+    must be judged is a broken install and fails loudly, never by returning
+    restricted rows.
+    """
+    from vco_lib.kg_node_access import filter_cli_rows  # type: ignore[import-not-found]
+
+    return filter_cli_rows(
+        objects,
+        coll_name=coll_name,
+        self_collection=KG_COLLECTION,
+        project_root=Path(__file__).resolve().parent.parent.parent,
+    )
+
 # P1-D (2026-05-08): centralized access-matrix helper. `kg_access` lives at
 # <orchestrator>/claude_mcp_servers/scripts/kg_access.py. Self-only fallback
 # keeps the CLI functional even on a hand-edited venv that doesn't ship the
@@ -187,6 +210,14 @@ except Exception:
 
 def get_weaviate_client():
     """Get Weaviate client"""
+    # v0.2.102 W4-E: no PyPI version lookup on connect. Function-local and
+    # guarded like the rest of this file's vco_lib use — the module must
+    # stay importable without vco_lib (see the MIRROR note above).
+    try:
+        from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+        disable_weaviate_client_pypi_check()
+    except Exception:
+        pass
     http_host = WEAVIATE_URL.replace("http://", "").replace("https://", "").split(":")[0]
     http_port = int(WEAVIATE_URL.split(":")[-1]) if ":" in WEAVIATE_URL else 8081
 
@@ -256,8 +287,9 @@ def get_node_info(title: str):
                 # Peer collection may not exist (peer never indexed) —
                 # skip silently, don't fail the whole CLI.
                 continue
-            if results.objects:
-                hits.append((coll_name, results.objects[0].properties))
+            visible = _access_filter(results.objects, coll_name)
+            if visible:
+                hits.append((coll_name, visible[0].properties))
 
         if not hits:
             print(f"❌ Node not found: {title}")
@@ -352,8 +384,9 @@ def find_connections(title: str):
                 )
             except Exception:
                 continue
-            if results.objects:
-                outbound = results.objects[0].properties.get('links', []) or []
+            visible = _access_filter(results.objects, coll_name)
+            if visible:
+                outbound = visible[0].properties.get('links', []) or []
                 target_hits.append((coll_name, list(outbound)))
 
         if not target_hits:
@@ -413,7 +446,7 @@ def find_connections(title: str):
                     break
                 if not page.objects:
                     break
-                for obj in page.objects:
+                for obj in _access_filter(page.objects, coll_name):
                     if title in (obj.properties.get('links', []) or []):
                         source_id = obj.properties.get('source_node_id')
                         key = (coll_name, source_id)

@@ -1,0 +1,27 @@
+{
+ "source": "broken.go",
+ "reviewed": "W6-E 2026-10-10 (hand-written; full_name + methods scored)",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "First",
+   "start": 4,
+   "end": 6,
+   "full_name": "broken.First"
+  },
+  {
+   "kind": "function",
+   "name": "Second",
+   "start": 8,
+   "end": 10,
+   "full_name": "broken.Second"
+  },
+  {
+   "kind": "function",
+   "name": "Third",
+   "start": 12,
+   "end": 14,
+   "full_name": "broken.Third"
+  }
+ ]
+}

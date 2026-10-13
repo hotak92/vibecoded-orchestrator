@@ -25,6 +25,9 @@
 # --- Idempotent double-source guard ---------------------------------------
 if ($script:VcoRouteTouchedPathSourced) { return }
 $script:VcoRouteTouchedPathSourced = $true
+. (Join-Path $PSScriptRoot "utf8-nobom.ps1")  # BOM-free writes (review R5-8)
+# The detached dup-scan child dot-sources the same helper by absolute path.
+$script:VcoUtf8NoBomLib = Join-Path $PSScriptRoot "utf8-nobom.ps1"
 
 # Accumulates LLM-visible text the caller should emit (currently only the
 # pending duplicate-scan report).
@@ -101,9 +104,12 @@ function Initialize-VcoRoute {
     # Resolve project_id once for the access checks below. Same env-then-
     # .claude/env fallback and the SAME line rule as the bash sibling
     # (`vco_lib.envfile.parse_env_lines`): optional `export ` prefix -- the
-    # form the projection's managed block writes -- first match wins, one
-    # matching pair of quotes stripped. MUST MATCH route-touched-path.sh
-    # (parity test: tests/test_v0297_route_project_id_parity.py).
+    # form the projection's managed block writes -- LAST match wins (what
+    # `source` gives: a user's override after the managed block counts;
+    # v0.2.102, this took the first before), one matching pair of quotes
+    # stripped. MUST MATCH route-touched-path.sh and
+    # `vco_lib.envfile.env_value(..., last_wins=True)` (parity test:
+    # tests/test_v0297_route_project_id_parity.py).
     $script:VcoRouteProjectId = $Env:VCT_PROJECT_ID
     if (-not $script:VcoRouteProjectId) {
         $envFile = Join-Path $ProjectRoot ".claude/env"
@@ -116,8 +122,8 @@ function Initialize-VcoRoute {
                         if ($v.Length -ge 2 -and $v[0] -eq $v[$v.Length - 1] -and ($v[0] -eq '"' -or $v[0] -eq "'")) {
                             $v = $v.Substring(1, $v.Length - 2)
                         }
+                        # No `break`: a later assignment overrides (last wins).
                         $script:VcoRouteProjectId = $v
-                        break
                     }
                 }
             } catch { }
@@ -187,7 +193,7 @@ function Emit-KgGateSkippedMetric {
             reason      = "gate_skipped_no_project_id"
             fail_open   = $true
         } | ConvertTo-Json -Compress
-        Add-Content -Path $jsonl -Value $row -Encoding utf8 -ErrorAction SilentlyContinue
+        Add-VcoUtf8Content -Path $jsonl -Value $row
     } catch {
         # Metric-emit failure must not break the silent-allow contract.
     }
@@ -357,6 +363,167 @@ if ((`$null -eq `$lvl) -or ((([string]`$lvl).Trim()) -eq 'write')) { $SyncExpr }
 }
 
 
+# --- v0.2.102 S16-7: enabled-extra-path membership (cached list, option B) ---
+# MUST MATCH _lib/route-touched-path.sh's block of the same name. A code file
+# under an ENABLED extra code-graph path goes to a PER-EXTRA queue
+# (codegraph_drain_extra_<md5(extra)>_<session>.txt), never the primary
+# queue; the Stop hook drains it via `vco_lib.codegraph_extras_refresh
+# --queued`. The membership decision is computed by Python (the hub /config
+# resolver) and cached as a plain table both shells read -- option B of the
+# A>B>C rule, because this runs PER EDIT and the list changes only on a
+# launcher-GUI extras toggle.
+#   cache : .claude/state/codegraph_extra_paths_cache.txt (one path per line)
+#   stale : missing, older than VCO_CODEGRAPH_EXTRAS_LIST_TTL_SECONDS
+#           (default 300), or older than launcher.db
+# A failed refresh keeps the stale cache; no cache at all -> nothing routes
+# to the extra queues (the commit-stamp refresh at Stop still re-indexes).
+$script:VcoRouteExtrasCacheName = "codegraph_extra_paths_cache.txt"
+
+function Get-VcoRouteExtrasDbPath {
+    if ($Env:VCT_LAUNCHER_DB_PATH) { return $Env:VCT_LAUNCHER_DB_PATH }
+    $stateRoot = $null
+    if ($Env:VCT_STATE_DIR) { $stateRoot = $Env:VCT_STATE_DIR }
+    elseif ($Env:USERPROFILE) { $stateRoot = Join-Path $Env:USERPROFILE ".vct" }
+    elseif ($Env:HOME) { $stateRoot = Join-Path $Env:HOME ".vct" }
+    if (-not $stateRoot) { return "" }
+    return (Join-Path $stateRoot "launcher.db")
+}
+
+# $true when the cache is STALE (missing / TTL-expired / older than
+# launcher.db), $false when fresh. Soft-fail biases to "stale".
+function Test-VcoRouteExtrasCacheStale {
+    param([string]$Cache)
+    if (-not (Test-Path -LiteralPath $Cache)) { return $true }
+    $ttl = 300
+    if ($Env:VCO_CODEGRAPH_EXTRAS_LIST_TTL_SECONDS -match '^\d+$') {
+        $ttl = [int]$Env:VCO_CODEGRAPH_EXTRAS_LIST_TTL_SECONDS
+    }
+    try { $cacheItem = Get-Item -LiteralPath $Cache -ErrorAction Stop } catch { return $true }
+    $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [DateTimeOffset]::new($cacheItem.LastWriteTimeUtc).ToUnixTimeSeconds()
+    if ($age -ge $ttl) { return $true }
+    $db = Get-VcoRouteExtrasDbPath
+    if (Test-Path -LiteralPath $db) {
+        try {
+            $dbItem = Get-Item -LiteralPath $db -ErrorAction Stop
+            if ($dbItem.LastWriteTimeUtc -gt $cacheItem.LastWriteTimeUtc) { return $true }
+        } catch { }
+    }
+    return $false
+}
+
+# Best-effort cache rewrite through the ONE Python lister. Never throws: a
+# non-zero CLI exit (hub down / unregistered) leaves any previous cache.
+function Update-VcoRouteExtrasCache {
+    param([string]$Cache)
+    $venvPy = Resolve-VcoVenvPython -ScriptDir $script:VcoRouteHooksDir
+    if (-not $venvPy) { return }
+    $tmp = "$Cache.tmp.$PID"
+    try {
+        $out = & $venvPy -m vco_lib.codegraph_extras_refresh `
+            --list-enabled-extra-paths --project-root $script:VcoRouteProjectRoot 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Set-VcoUtf8Content -Path $tmp -Value ($out -join "`n")
+            Move-Item -LiteralPath $tmp -Destination $Cache -Force -ErrorAction Stop
+        } else {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Resolve symlinks component-by-component (the .sh sibling's `cd -P`
+# equivalent, v0.2.102 L-A2): registration canonicalises extras via
+# dunce::canonicalize, but the touched path arrives as the editor wrote it;
+# an edit through a symlinked directory must still prefix-match. Pure .NET,
+# no subprocess; on any failure returns the input unchanged.
+function Resolve-VcoRoutePhysicalPath {
+    param([string]$Path)
+    try {
+        $dir = [System.IO.Path]::GetDirectoryName($Path)
+        if (-not $dir) { return $Path }
+        $leaf = [System.IO.Path]::GetFileName($Path)
+        $root = [System.IO.Path]::GetPathRoot($dir)
+        if (-not $root) { return $Path }
+        $cur = $root
+        $rel = $dir.Substring($root.Length)
+        foreach ($seg in $rel.Split([System.IO.Path]::DirectorySeparatorChar, [StringSplitOptions]::RemoveEmptyEntries)) {
+            $cur = Join-Path $cur $seg
+            $di = [System.IO.DirectoryInfo]::new($cur)
+            if ($di.LinkTarget) {
+                $t = $di.ResolveLinkTarget($true)
+                if ($t) { $cur = $t.FullName }
+            }
+        }
+        return (Join-Path $cur $leaf)
+    } catch { return $Path }
+}
+
+# Route a code edit under an ENABLED extra path to its per-extra drain queue:
+# appends the PHYSICAL path to codegraph_drain_extra_<md5(extra)>_<session>.txt
+# and returns that queue path; returns $null (caller then uses the primary
+# queue) when the edit is not under any enabled extra.
+#
+# v0.2.102 fix-round (M-A1) precedence, MUST MATCH route-touched-path.sh:
+#   1. PRIMARY-ROOT CONTAINMENT WINS -- an edit inside the project root always
+#      goes to the primary queue, even when a registered extra is an ANCESTOR
+#      of the root (registration rejects ancestor extras too, but a pre-fix
+#      row can still be on disk).
+#   2. Among extras the LONGEST matching prefix wins -- nested extras route to
+#      the inner one regardless of cache order.
+#   3. Matching is on the SYMLINK-RESOLVED path; trailing separators on the
+#      cache line are ignored for the match but the RAW line is hashed (the
+#      queue name must equal vco_lib.path_key(row.path), trailing slash and
+#      all, or the Python drain's glob never finds it).
+function Add-VcoRouteExtraQueue {
+    param([string]$Path, [string]$SessionId)
+    $stateDir = Join-Path (Join-Path $script:VcoRouteProjectRoot ".claude") "state"
+
+    # 1. Primary-root containment wins -- checked on the resolved path so a
+    # symlinked route INTO the root also lands in the primary queue.
+    $resolved = Resolve-VcoRoutePhysicalPath -Path $Path
+    $projSep = $script:VcoRouteProjectRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if ($resolved.StartsWith($projSep, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+
+    $cache = Join-Path $stateDir $script:VcoRouteExtrasCacheName
+    if (Test-VcoRouteExtrasCacheStale -Cache $cache) {
+        if (-not (Test-Path -LiteralPath $stateDir)) {
+            New-Item -ItemType Directory -Path $stateDir -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        Update-VcoRouteExtrasCache -Cache $cache
+    }
+    if (-not (Test-Path -LiteralPath $cache)) { return $null }
+    $lines = @()
+    try { $lines = @(Get-Content -LiteralPath $cache -ErrorAction Stop) } catch { return $null }
+    # 2. Longest matching prefix wins.
+    $bestRaw = $null
+    $bestLen = 0
+    foreach ($ep in $lines) {
+        $ep = ([string]$ep).TrimEnd("`r")
+        if (-not $ep) { continue }
+        # 3. Trailing separators ignored for the MATCH; the raw line is hashed.
+        $epSep = $ep.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+        if ($epSep.Length -eq 1) { continue }  # the line was all separators
+        if ($resolved.StartsWith($epSep, [StringComparison]::OrdinalIgnoreCase)) {
+            if ($epSep.Length -gt $bestLen) { $bestLen = $epSep.Length; $bestRaw = $ep }
+        }
+    }
+    if (-not $bestRaw) { return $null }
+    # MD5 of the RAW extra path -- the SAME key vco_lib.path_key() computes,
+    # so the queue name matches the Python drain's glob.
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    try {
+        $digest = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($bestRaw))
+        $hash = -join ($digest | ForEach-Object { $_.ToString('x2') })
+    } finally {
+        $md5.Dispose()
+    }
+    $queue = Join-Path $stateDir ("codegraph_drain_extra_{0}_{1}.txt" -f $hash, $SessionId)
+    try { Add-Content -LiteralPath $queue -Value $resolved -ErrorAction SilentlyContinue } catch { }
+    return $queue
+}
+
+
 # Invoke-VcoRouteTouchedPath: the whole routing decision for ONE file.
 # Idempotent per file per debounce window; safe to call in a loop.
 function Invoke-VcoRouteTouchedPath {
@@ -454,8 +621,10 @@ function Invoke-VcoRouteTouchedPath {
                 if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
                 $reportEsc = $dupReport -replace "'", "''"
                 $rootEsc = $ProjectRoot -replace "'", "''"
+                $nobomEsc = $script:VcoUtf8NoBomLib -replace "'", "''"
                 $dupChild = @"
 Set-Location -LiteralPath '$rootEsc' -ErrorAction SilentlyContinue
+. '$nobomEsc'
 try {
     # ❌ kept too — the scan's failure line is what the ⚠️ "See the error
     # above." verdict points at (parity with the bash sibling's filter).
@@ -466,7 +635,7 @@ try {
     `$out = $dupExpr | Select-String -Pattern '✅|⚠️|📊|❌|^[A-Za-z0-9_-]+: ERROR' | ForEach-Object { `$_.ToString() }
     if (`$out) {
         `$ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        Set-Content -Path '$reportEsc' -Value (@("# KG duplicate scan (every-10-edits, `$ts)") + `$out) -Encoding utf8
+        Set-VcoUtf8Content -Path '$reportEsc' -Value (@("# KG duplicate scan (every-10-edits, `$ts)") + `$out)
     }
 } catch { }
 "@
@@ -523,120 +692,8 @@ try {
         }
     }
 
-    # 2b. Auto-index diagrams (Phase 1.5 — Mermaid + Excalidraw). Mirror of
-    # the .sh sibling's same-numbered branch. 60s per-file throttle, skips
-    # sidecar .meta.json writes (would infinite-loop), notifies vct-hub for
-    # UI refresh (404 silently swallowed until Phase 1.2 broadcast route).
-    $DiagramsDir = Join-Path $ProjectRoot ".claude/diagrams"
-    if ($Path.StartsWith($DiagramsDir, [StringComparison]::OrdinalIgnoreCase) `
-        -and ($Path -notlike "*.meta.json") `
-        -and (($Path -like "*.mmd") -or ($Path -like "*.excalidraw"))) {
-
-        $throttleDir = Join-Path $ProjectRoot ".claude/state"
-        if (-not (Test-Path $throttleDir)) {
-            New-Item -ItemType Directory -Path $throttleDir -Force | Out-Null
-        }
-
-        # MD5 hash of file path → throttle key (no slashes).
-        $md5 = [System.Security.Cryptography.MD5]::Create()
-        try {
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($Path)
-            $digest = $md5.ComputeHash($bytes)
-            $diagramHash = -join ($digest | ForEach-Object { $_.ToString('x2') })
-        } finally {
-            $md5.Dispose()
-        }
-        $throttleFile = Join-Path $throttleDir "diagram_idx_${diagramHash}.ts"
-
-        # TRUE Unix seconds. MUST MATCH the .sh sibling's `date +%s` — both write
-        # and read the SAME `.claude/state/diagram_idx_<hash>.ts` file, so a
-        # timezone-shifted value here breaks the throttle across siblings (on a
-        # WSL/mixed install the .ps1 read a .sh stamp as `now - last == +offset`
-        # and re-indexed on EVERY edit). `(Get-Date) - (Get-Date "1970-01-01Z")`
-        # subtracts a UTC instant from a LOCAL one and is off by the UTC offset;
-        # .NET subtracts raw ticks and ignores DateTimeKind, so mixing kinds never
-        # errors, it just silently returns the wrong number.
-        $nowTs = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        $lastTs = 0
-        if (Test-Path $throttleFile) {
-            try {
-                $raw = (Get-Content $throttleFile -Raw -ErrorAction Stop).Trim()
-                if ($raw -match '^[0-9]+$') { $lastTs = [int]$raw }
-            } catch { $lastTs = 0 }
-        }
-
-        if (($nowTs - $lastTs) -ge 60) {
-            Set-Content -Path $throttleFile -Value $nowTs -Encoding ascii -ErrorAction SilentlyContinue
-
-            # v0.2.46 post-adversarial: shared resolver (already dot-sourced
-            # above at the docs branch). Falls back to system python ONLY when
-            # no VCO venv is resolvable — never to the USER's project venv.
-            $diagVenv = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-            if (-not $diagVenv) {
-                $diagVenv = (Get-Command python -ErrorAction SilentlyContinue).Source
-            }
-
-            if ($diagVenv) {
-                # Build the indexer arguments. Pass --diagrams-collection
-                # when DIAGRAMS_COLLECTION is set in the env (fix/a1-indexing-
-                # pipeline 2026-05-25). Without this kwarg the indexer's
-                # Weaviate upsert silently skips (Bug-1 of the wiring audit).
-                # Older projects without DIAGRAMS_COLLECTION in env keep the
-                # legacy sidecar-only behaviour automatically.
-                $diagArgs = @('-m', 'vco_lib.diagram_indexer', 'index', $Path)
-                if ($env:DIAGRAMS_COLLECTION) {
-                    $diagArgs += @('--diagrams-collection', $env:DIAGRAMS_COLLECTION)
-                }
-
-                # Serialized index + snapshot in ONE detached child.
-                #
-                # R2 (code review 2026-05-25): previously two separate
-                # Start-Process calls ran in parallel; the snapshot CLI's
-                # `project_diagrams WHERE file_path=?` query returned no
-                # row on first-edit-per-file because the indexer UPSERT
-                # hadn't committed yet → first-version snapshot lost
-                # forever. SEQUENCING IS LOAD-BEARING: index must complete
-                # before snapshot runs. The two CLIs are therefore emitted
-                # as consecutive statements in a single child process.
-                #
-                # v0.2.92 R2: that fix used Start-Job, which reintroduced the
-                # loss by a different route — a job's child is torn down when
-                # the host process exits, and this hook exits within
-                # milliseconds while the indexer's Weaviate upsert takes
-                # seconds. So on Windows NEITHER CLI completed. Identical
-                # defect to the duplicate-scan branch above; same remedy, and
-                # the same one home for the spawn (`Start-VcoDetachedPwsh`).
-                # The .sh sibling's `( ... ) &` subshell already survives, so
-                # this also restores .sh/.ps1 parity.
-                $snapArgs = @(
-                    '-m', 'vco_lib.diagram_indexer',
-                    'snapshot', 'create', $Path, '--quiet'
-                )
-                $diagPyEsc = $diagVenv -replace "'", "''"
-                $diagRootEsc = $ProjectRoot -replace "'", "''"
-                $idxLit = ($diagArgs | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ','
-                $snapLit = ($snapArgs | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ','
-                $diagChild = @"
-Set-Location -LiteralPath '$diagRootEsc' -ErrorAction SilentlyContinue
-`$vp = '$diagPyEsc'
-`$ia = @($idxLit)
-`$sa = @($snapLit)
-try {
-    & `$vp @ia *> `$null
-    & `$vp @sa *> `$null
-} catch { }
-"@
-                Start-VcoDetachedPwsh -Command $diagChild -PowerShellExe $PsExe
-            }
-
-            # Live UI refresh in DiagramsTab is driven by the launcher's
-            # frontend file-watcher (chokidar) — NOT a hub broadcast. The
-            # original Phase 1.5.A design called for /api/v1/notify/diagram-changed
-            # but pub/sub from hub → frontend would need SSE/WebSocket
-            # plumbing the launcher does not have today. Re-evaluate if
-            # multi-machine notification ever becomes a real requirement.
-        }
-    }
+    # 2b. Diagram auto-index: REMOVED in v0.2.102 with the diagrams
+    # integrations (owner ruling 2026-10-07) — mirror of the .sh sibling.
 
     # 3. Code file changes: code graph incremental update + LLM nudge.
     # v0.2.21 Step 18 (caller migration): resolve the code-graph collection
@@ -697,8 +754,20 @@ try {
                 }
                 $accum = Join-Path $stateDir ("edit_reminder_{0}.txt" -f $SessionId)
                 Add-Content -LiteralPath $accum -Value $Path -ErrorAction Stop
-                $cgQueue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionId)
-                Add-Content -LiteralPath $cgQueue -Value $Path -ErrorAction SilentlyContinue
+                # v0.2.102 S16-7: a code file under an ENABLED extra code-graph
+                # path goes to the PER-EXTRA queue instead -- a path outside
+                # the primary root must never be analyzed under the primary's
+                # collection. Drained by stop-codegraph-drain.ps1 through
+                # `vco_lib.codegraph_extras_refresh --queued`. MUST MATCH the
+                # .sh sibling. Add-VcoRouteExtraQueue appends the RESOLVED path
+                # itself and returns the queue it used; $null -> primary queue.
+                # Precedence (M-A1): primary-root containment wins, then
+                # longest extra prefix.
+                $extraQueue = Add-VcoRouteExtraQueue -Path $Path -SessionId $SessionId
+                if (-not $extraQueue) {
+                    $cgQueue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionId)
+                    Add-Content -LiteralPath $cgQueue -Value $Path -ErrorAction SilentlyContinue
+                }
             } catch { }
         }
     }

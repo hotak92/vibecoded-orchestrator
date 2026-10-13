@@ -4,6 +4,7 @@ description: Qwen3.8-Flash bulk mechanical lane via the claude-gw gateway — on
 model: claude-gw/qwen/qwen3.8-flash[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
+isolation: worktree
 disallowedTools: mcp__vct-coordination__*
 ---
 

@@ -34,6 +34,7 @@ install" discipline (see CHANGELOG v0.2.41 + v0.2.42 hardening notes).
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -426,6 +427,76 @@ def _codegraph_prefix_on_conn(
     return val or None
 
 
+_BINDING_COLUMNS = (
+    "b.project_id, b.collection_prefix, b.embedding_model, b.embedding_dim, "
+    "b.last_analyzed_at, b.config_json"
+)
+
+
+def _binding_row_dict(row: sqlite3.Row) -> dict:
+    """One ``project_codegraph_bindings`` row as a plain dict (``config``
+    parsed from ``config_json``; an unparseable blob reads as ``{}``)."""
+    out = {k: row[k] for k in row.keys()}
+    try:
+        cfg = json.loads(out.pop("config_json", None) or "null")
+    except Exception:  # noqa: BLE001 — a bad blob is "no config"
+        cfg = None
+    out["config"] = cfg if isinstance(cfg, dict) else {}
+    return out
+
+
+def get_codegraph_binding_row(prefix: str) -> Optional[dict]:
+    """The ``project_codegraph_bindings`` row whose ``collection_prefix`` is
+    ``prefix`` (case-insensitive — Weaviate class names are), or ``None``.
+
+    v0.2.102 W6-B2: the code-graph model RECORD lives in this row's
+    ``embedding_model`` / ``embedding_dim`` (read by
+    :mod:`vco_lib.code_embed_model`). Read-only, soft-fail.
+    """
+    if not prefix:
+        return None
+    conn = _open_db_readonly()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            f"SELECT {_BINDING_COLUMNS} FROM project_codegraph_bindings AS b "
+            "WHERE lower(b.collection_prefix) = lower(?) LIMIT 1",
+            (prefix,),
+        ).fetchone()
+        return _binding_row_dict(row) if row else None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def list_codegraph_binding_rows() -> Optional[List[dict]]:
+    """Every registered project's code-graph binding row joined with its
+    ``name`` / ``folder_path`` (for the Preferences status), or ``None`` when
+    launcher.db is unavailable."""
+    conn = _open_db_readonly()
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute(
+            f"SELECT {_BINDING_COLUMNS}, p.name, p.folder_path "
+            "FROM project_codegraph_bindings AS b "
+            "JOIN projects AS p ON p.id = b.project_id ORDER BY p.name"
+        ).fetchall()
+        return [_binding_row_dict(r) for r in rows]
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _project_id_for_name_on_conn(
     conn: sqlite3.Connection, name: str
 ) -> Optional[str]:
@@ -635,8 +706,10 @@ def kg_binding_keep_set() -> tuple[list[str], bool]:
 # Used by EmbeddingService.for_project() + install.py's subprocess env-thread
 # layer to resolve the active embedding profile when no env var is set.
 #
-# The launcher writes ``embedding.active_profile`` from the Identity tab's
-# embedding selector + on install.py's preset choice. Mirror constant:
+# The launcher writes ``embedding.active_profile`` from Preferences →
+# "Embedding profile (global)" — the only embedding selector since v0.2.102
+# (the per-project Identity-tab selector was removed); install.py's preset
+# step seeds it when absent. Mirror constant:
 #   launcher/src-tauri/src/commands/project_env_settings.rs
 #     ::APP_STATE_KEY_ACTIVE_EMBEDDING (canonical string: "embedding.active_profile")
 #
@@ -654,28 +727,18 @@ APP_STATE_KEY_ACTIVE_EMBEDDING = "embedding.active_profile"
 #:     ::APP_STATE_DEFAULT_TEXT_EMBED (canonical string: "default_text_embedding")
 APP_STATE_KEY_DEFAULT_TEXT_EMBED = "default_text_embedding"
 
-# ─── v0.2.71 T-B-emb: per-project active-embedding marker ────────────────────
+# ─── module_settings module id shared with the Rust launcher ──────────────
 #
-# The per-project ACTIVE_EMBEDDING profile + its provenance live in
-# ``module_settings`` under module_id ``orchestrator-core``. Mirror constants:
-#   launcher/src-tauri/src/commands/project_env_settings.rs
-#     ::ORCHESTRATOR_CORE_MODULE_ID / ::ACTIVE_EMBEDDING_SETTING_KEY /
-#     ::ACTIVE_EMBEDDING_SOURCE_SETTING_KEY /
-#     ::ACTIVE_EMBEDDING_SOURCE_USER / ::ACTIVE_EMBEDDING_SOURCE_AUTO
-# The hub config_api.rs resolver + config_projection.py use the same cascade:
-# a source=="user" per-project row is sticky; "auto" / legacy-no-marker / absent
-# rows inherit the machine-global ``app_state[embedding.active_profile]``.
+# Mirror: launcher/src-tauri/vct-launcher-core/src/db/module_settings_keys.rs
+# ::ORCHESTRATOR_CORE_MODULE_ID. (v0.2.102 W6-J retired the per-project
+# ``active_embedding`` / ``active_embedding_source`` rows this module id also
+# carried: ONE global embedding profile, owner ruling 2026-10-11. The rows stay
+# in launcher.db untouched and nothing reads them — see
+# ``config_projection._resolve_active_embedding_cascade``.)
 
-#: module_settings module_id that owns the per-project active-embedding rows.
+#: module_settings module_id of the orchestrator's own per-project settings
+#: (the dual-embedding flags).
 ORCHESTRATOR_CORE_MODULE_ID = "orchestrator-core"
-#: setting_key for the per-project ACTIVE_EMBEDDING profile value.
-ACTIVE_EMBEDDING_SETTING_KEY = "active_embedding"
-#: setting_key for the provenance marker companion row.
-ACTIVE_EMBEDDING_SOURCE_SETTING_KEY = "active_embedding_source"
-#: marker value: deliberate Settings-tab user pick (sticky across updates).
-ACTIVE_EMBEDDING_SOURCE_USER = "user"
-#: marker value: startup-backfill auto-seed (inherits the global default).
-ACTIVE_EMBEDDING_SOURCE_AUTO = "auto"
 
 #: TEXT model id → ACTIVE_EMBEDDING named-vector slot ("profile").
 #:
@@ -815,8 +878,8 @@ def read_app_state_active_embedding(
     is an empty string after stripping.
 
     This is the bridge between the launcher's stored embedding choice
-    (written by the Identity-tab embedding selector + install.py's preset
-    seeding) and any subprocess (``install.py``'s ``sync_knowledge_graph.py``
+    (written by the Preferences → Embedding profile selector; install.py's preset
+    step seeds it when absent) and any subprocess (``install.py``'s ``sync_knowledge_graph.py``
     spawn, the MCP server's ``EmbeddingService.for_project()``) that
     needs to know which embedding to use when no env override is set.
 

@@ -395,33 +395,35 @@ _check_prerequisites
 echo ""
 
 # ----- Step 2: probe for an existing launcher binary --------------------------
-# Discovery order (highest-priority first):
-#   1. Locally built binary (developers running `pnpm tauri build` directly).
-#   2. Bundled prebuilt at launcher/dist/<arch>/ (default for end users).
-#   3. System install paths (~/.local/share, /usr/local, etc.) — for users who
-#      installed a launcher via apt/brew/winget at some earlier point.
+# Selection rule (v0.2.102 S16-6 + M2) — ONE rule, stated identically in
+# scripts/post-install-launcher.ps1; keep the two headers in sync:
+#   1. The bundled dist binary under launcher/dist/<arch>/ wins when it
+#      exists AND passes _bundled_binary_is_fresh. It is the binary the
+#      launcher's own restart (restart.rs::resolve_target_binary) always
+#      relaunches, so the desktop shortcut must point at it unless
+#      something is genuinely newer.
+#   2. A locally built binary (launcher/src-tauri/target/...) wins ONLY
+#      when it is NEWER than the dist binary (mtime) — or when no fresh
+#      dist binary exists. A stale target/release leftover must never pin
+#      the shortcut while a fresh dist binary sits beside it (register
+#      §16 / P300:465: a v0.2.101 update rewrote both .desktop files to a
+#      2026-06-13 target/release artifact and it won every later probe).
+#   3. The chosen candidate and WHY are logged on one line.
+#   4. System installs (~/.local/share, /usr/local, /Applications) are the
+#      last resort — for users who installed a launcher via a package
+#      manager at some earlier point.
 # See launcher/dist/README.md for the bundling layout.
-candidates_unix=(
-    # 1. Locally built (contributors)
-    "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher"
-    "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher-temp"
-    "$REPO_ROOT/launcher/src-tauri/target/release/launcher"
-    "$REPO_ROOT/launcher/src-tauri/target/debug/vct-launcher-temp"
-    # 2. Bundled-in-repo prebuilt (default for end users — sidesteps the
-    #    build-from-source path that was the launch-blocker for users
-    #    without Node + Rust + webkit2gtk-dev). 30 MB committed binaries
-    #    per arch; see launcher/dist/README.md.
+candidates_dist=(
+    # Bundled-in-repo prebuilt (default for end users — sidesteps the
+    # build-from-source path that was the launch-blocker for users
+    # without Node + Rust + webkit2gtk-dev). 30 MB committed binaries
+    # per arch; see launcher/dist/README.md. Probed on LINUX hosts only
+    # (find_binary's OS gate): a macOS checkout also carries this
+    # committed Linux binary, which is unlaunchable there and must never
+    # win the probe.
     "$REPO_ROOT/launcher/dist/linux-x64/vct-launcher"
-    # 3. System installs
-    "$HOME/.local/share/vct-launcher/vct-launcher"
-    "$HOME/.local/bin/vct-launcher"
-    "/usr/bin/vct-launcher"
-    "/usr/local/bin/vct-launcher"
 )
-candidates_mac=(
-    # Locally built (contributors)
-    "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher"
-    "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher-temp"
+candidates_dist_mac=(
     # Bundled prebuilt — canonical dist dir is `macos-arm64/` since
     # v0.2.13 (install.py:16956). Both flat-file and .app bundle modes
     # supported (release.yml emits the flat file; native Gatekeeper
@@ -440,7 +442,25 @@ candidates_mac=(
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher"
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/vct-launcher"
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/VCT Launcher"
-    # System installs
+)
+candidates_local=(
+    # Locally built (contributors). NEVER ranked above dist on existence
+    # alone — see the selection rule above; a local build wins only by
+    # mtime against the dist binary.
+    "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher"
+    "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher-temp"
+    "$REPO_ROOT/launcher/src-tauri/target/release/launcher"
+    "$REPO_ROOT/launcher/src-tauri/target/debug/vct-launcher-temp"
+)
+candidates_system=(
+    # System installs — last resort.
+    "$HOME/.local/share/vct-launcher/vct-launcher"
+    "$HOME/.local/bin/vct-launcher"
+    "/usr/bin/vct-launcher"
+    "/usr/local/bin/vct-launcher"
+)
+candidates_system_mac=(
+    # System installs — last resort.
     "/Applications/VCT Launcher.app/Contents/MacOS/VCT Launcher"
     "/Applications/VCT Launcher.app/Contents/MacOS/vct-launcher"
     "$HOME/Applications/VCT Launcher.app/Contents/MacOS/VCT Launcher"
@@ -460,29 +480,108 @@ _metadata_candidates_for_os() {
     fi
 }
 
+# Strictly-newer mtime probe, GNU stat first (Linux) then BSD stat (macOS).
+# Returns 0 only when $1 is strictly newer than $2.
+_newer_mtime() {
+    local a="$1" b="$2" ta tb
+    if ! ta="$(stat -c %Y "$a" 2>/dev/null)"; then
+        ta="$(stat -f %m "$a" 2>/dev/null)" || return 1
+    fi
+    if ! tb="$(stat -c %Y "$b" 2>/dev/null)"; then
+        tb="$(stat -f %m "$b" 2>/dev/null)" || return 1
+    fi
+    [ "$ta" -gt "$tb" ]
+}
+
+# Rule 3 of the Step 2 selection: one line saying WHAT was chosen and WHY.
+# stderr on purpose — find_binary's stdout is captured by the caller.
+_report_choice() {
+    echo "[launcher] Selected $1 ($2)" >&2
+    _log_event "binary-probe" "ok" "candidate selected" \
+        "{\"path\":\"$(_json_escape "$1")\",\"reason\":\"$(_json_escape "$2")\"}"
+}
+
 find_binary() {
-    # 1. Metadata-driven candidates win when present (matches the
-    #    binary the release CI actually shipped this version).
-    local meta_lines line
-    meta_lines="$(_metadata_candidates_for_os "$OS")"
-    if [ -n "$meta_lines" ]; then
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            if [ -x "$line" ]; then echo "$line"; return 0; fi
-        done <<META
+    # The Step 2 selection rule, implemented:
+    #   1. dist first when it exists AND passes _bundled_binary_is_fresh;
+    #   2. a local build wins only by mtime against the dist binary (or
+    #      when no fresh dist binary exists);
+    #   3. system installs are the last resort.
+    # Echoes the chosen path on stdout; the reason line goes to stderr.
+    local c dist_bin="" local_bin="" line
+    local dist_cands=()
+    # THE host gate, in ONE place (review H-C1 + the batch-5 follow-up):
+    # which dist candidates THIS machine may consider —
+    #   * macOS: the mac dist candidates only (a checkout may also carry
+    #     the committed Linux ELF, which is unlaunchable there);
+    #   * Linux: the linux-x64 candidates only on an x86_64/amd64 host —
+    #     linux-x64 is the ONLY committed Linux binary and cannot execute
+    #     on arm64/aarch64 (or any other arch), so on those hosts the dist
+    #     list is EMPTY and a local build / system install is used instead.
+    local linux_dist_ok=0
+    if [ "$OS" = "linux" ]; then
+        case "$(uname -m 2>/dev/null || true)" in
+            x86_64|amd64) linux_dist_ok=1 ;;
+        esac
+    fi
+    # Metadata-driven candidates (the binary the release CI actually
+    # shipped this version) are dist-shaped and rank first — collected
+    # under the SAME gate (their per-OS lists carry the same x64-only
+    # linux entry).
+    if [ "$OS" = "macos" ] || [ "$linux_dist_ok" -eq 1 ]; then
+        local meta_lines
+        meta_lines="$(_metadata_candidates_for_os "$OS")"
+        if [ -n "$meta_lines" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && dist_cands+=("$line")
+            done <<META
 $meta_lines
 META
+        fi
     fi
-    # 2. Hardcoded unix candidates.
-    for c in "${candidates_unix[@]}"; do
-        [ -x "$c" ] && { echo "$c"; return 0; }
-    done
-    # 3. macOS-only hardcoded candidates.
     if [ "$OS" = "macos" ]; then
-        for c in "${candidates_mac[@]}"; do
-            [ -x "$c" ] && { echo "$c"; return 0; }
+        for c in "${candidates_dist_mac[@]}"; do dist_cands+=("$c"); done
+    elif [ "$linux_dist_ok" -eq 1 ]; then
+        for c in "${candidates_dist[@]}"; do dist_cands+=("$c"); done
+    fi
+
+    # Rule 1: the first dist candidate that exists AND is fresh.
+    for c in "${dist_cands[@]}"; do
+        if [ -x "$c" ] && _bundled_binary_is_fresh "$c"; then
+            dist_bin="$c"
+            break
+        fi
+    done
+    # Rule 2's challenger: the first existing local build.
+    for c in "${candidates_local[@]}"; do
+        [ -x "$c" ] && { local_bin="$c"; break; }
+    done
+
+    if [ -n "$dist_bin" ]; then
+        if [ -n "$local_bin" ] && _newer_mtime "$local_bin" "$dist_bin"; then
+            _report_choice "$local_bin" "local build is newer than the dist binary"
+            echo "$local_bin"
+            return 0
+        fi
+        _report_choice "$dist_bin" "bundled dist binary, freshness verified"
+        echo "$dist_bin"
+        return 0
+    fi
+    if [ -n "$local_bin" ]; then
+        # No FRESH dist binary: a stale one loses to any local build.
+        _report_choice "$local_bin" "no fresh bundled dist binary available"
+        echo "$local_bin"
+        return 0
+    fi
+    # Rule 4: system installs.
+    if [ "$OS" = "macos" ]; then
+        for c in "${candidates_system_mac[@]}"; do
+            [ -x "$c" ] && { _report_choice "$c" "system install"; echo "$c"; return 0; }
         done
     fi
+    for c in "${candidates_system[@]}"; do
+        [ -x "$c" ] && { _report_choice "$c" "system install"; echo "$c"; return 0; }
+    done
     return 1
 }
 

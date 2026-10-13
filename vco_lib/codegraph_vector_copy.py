@@ -50,8 +50,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import logging
-import os
-import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +60,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 # LOUD-FAIL import (no fallback): a broken vco_lib install must surface. MUST
 # MATCH the sibling call site in vco_lib/project_init.py.
 from vco_lib.weaviate_vectors import clean_named_vector
+# v0.2.102 W6-O: the one language-compatibility rule for `imports` edges.
+from vco_lib.codegraph_imports import filter_compatible_import_rows
 
 # v0.2.91 (Decision #21): the CLI entry point below (--migrate-identity)
 # called `logging.basicConfig` directly with a hardcoded INFO level,
@@ -332,6 +332,13 @@ def _read_reference_targets(src_obj, base: str) -> Dict[str, List[str]]:
             if cross is None:
                 continue
             objs = getattr(cross, "objects", None) or []
+            if base == "CodeModule" and name == "imports":
+                # v0.2.102 W6-O review HIGH-1: a pre-W6-O wrong-language edge
+                # (both endpoint languages known and incompatible) is not
+                # carried into the copy — the analyzer would only delete it
+                # again. Unknown language on either side → kept.
+                objs = filter_compatible_import_rows(
+                    getattr(src_obj, "properties", None), objs)
             targets = [str(getattr(o, "uuid", "")) for o in objs]
             targets = [t for t in targets if t]
             if targets:
@@ -831,7 +838,42 @@ def migrate_project_identity(
     return summary
 
 
-def _distinct_stale_identities(client, prefix: str, canonical: str) -> List[str]:
+def _ensure_identity_property(client, prefix: str, base: str, coll, canonical: str) -> bool:
+    """v0.2.102 (S16-4): give ``<prefix>_<base>`` the ``project`` property the
+    sweep keys on, through the ONE schema-ensure home
+    (``vco_lib.codegraph_schema``), then backfill the existing rows lacking it
+    with ``canonical`` — the prefix family's identity, the value the analyzer
+    stamps. Returns True iff the class carries ``project`` afterwards.
+
+    Only a class the spec table declares ``project`` for can gain it here
+    (CodeInteraction); any other class lacking it is left alone (False). Never
+    raises: an ensure / backfill failure is logged and reported as False or a
+    partial backfill (the next sweep, the 7_to_8 edge or the analyzer retries).
+    """
+    from vco_lib.codegraph_schema import (
+        backfill_missing_property,
+        ensure_codegraph_properties,
+    )
+
+    try:
+        ensure_codegraph_properties(client, prefix, props_subset=("project",))
+        if "project" not in {p.name for p in coll.config.get().properties}:
+            return False
+    except Exception as exc:  # noqa: BLE001 — never wedge the sweep
+        logger.warning("identity sweep: cannot ensure 'project' on %s_%s: %s",
+                       prefix, base, exc)
+        return False
+    updated, failures = backfill_missing_property(coll, "project", canonical)
+    logger.info(
+        "identity sweep: ensured 'project' on %s_%s; backfilled %d row(s) with "
+        "%r (%d failure(s))", prefix, base, updated, canonical, failures,
+    )
+    return True
+
+
+def _distinct_stale_identities(
+    client, prefix: str, canonical: str, *, ensure: bool = False,
+) -> List[str]:
     """Discover every ``project`` value ≠ ``canonical`` present in the 5
     ``<prefix>_<base>`` code-graph classes (v0.2.84 D4 — the identity sweep).
 
@@ -850,6 +892,15 @@ def _distinct_stale_identities(client, prefix: str, canonical: str) -> List[str]
     Per-collection soft-fail: an unreadable/absent class contributes nothing
     (never a guess). Order is deterministic (sorted) so the migration order is
     stable across runs.
+
+    v0.2.102 (S16-4): PROPERTY-AWARE. CodeInteraction was born without
+    ``project``, so the ``project`` iterate failed on it and the class was
+    silently skipped on every run. Now a class whose schema lacks ``project``
+    is first given it (``ensure=True`` — :func:`_ensure_identity_property`:
+    add + backfill) and then enumerated; only a class that STILL lacks it
+    (``ensure=False`` / dry-run, or the ensure failed) is skipped, with a
+    WARNING naming the class. An unreadable schema keeps the pre-.102 path
+    (attempt the iterate; its failure is the per-collection soft-fail).
     """
     found: set = set()
     if not prefix or not canonical:
@@ -865,6 +916,18 @@ def _distinct_stale_identities(client, prefix: str, canonical: str) -> List[str]
             coll = client.collections.get(coll_name)
         except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
             logger.warning("identity sweep: cannot open %s: %s", coll_name, exc)
+            continue
+        try:
+            present: Optional[set] = {p.name for p in coll.config.get().properties}
+        except Exception:  # noqa: BLE001 — unreadable schema → try the iterate
+            present = None
+        if present is not None and "project" not in present and not (
+            ensure and _ensure_identity_property(client, prefix, base, coll, canonical)
+        ):
+            logger.warning(
+                "identity sweep: %s has no 'project' property%s — skipped",
+                coll_name, "" if ensure else " (not ensured: read-only sweep)",
+            )
             continue
         try:
             for obj in coll.iterator(return_properties=["project"]):
@@ -928,7 +991,9 @@ def sweep_stale_identities(
 
     summaries: List[MigrationSummary] = []
     try:
-        stale = _distinct_stale_identities(client, prefix, canonical)
+        stale = _distinct_stale_identities(
+            client, prefix, canonical, ensure=not dry_run,
+        )
         if not stale:
             logger.info(
                 "identity sweep: %s already single-identity (%r) — nothing to "
@@ -1234,20 +1299,13 @@ def _build_client(
 ):
     """Build a Weaviate v4 client from url/env/defaults; ``None`` on failure.
 
-    Mirrors ``codegraph_resync._build_client`` (the endorsed connection recipe)
-    — kept local to avoid importing the whole resync module for the CLI path."""
+    Mirrors ``codegraph_resync._build_client`` (the endorsed connection recipe:
+    ``weaviate_helpers.connect_v4``, the ONE factory — v0.2.102 W4-E, which
+    also disables the client's per-connect PyPI version lookup)."""
     try:
-        import weaviate
-
-        from vco_lib.weaviate_helpers import weaviate_url_default
-        url = weaviate_url or weaviate_url_default()
-        m = re.match(r"^https?://([^:/]+)(?::(\d+))?", url)
-        host = m.group(1) if m else "localhost"
-        http_port = int(m.group(2)) if (m and m.group(2)) else 8081
-        gport = int(grpc_port or os.environ.get("GRPC_PORT") or 50052)
-        return weaviate.connect_to_custom(
-            http_host=host, http_port=http_port, http_secure=False,
-            grpc_host=host, grpc_port=gport, grpc_secure=False,
+        from vco_lib.weaviate_helpers import connect_v4, weaviate_url_default
+        return connect_v4(
+            weaviate_url or weaviate_url_default(), grpc_port=grpc_port
         )
     except Exception as exc:  # noqa: BLE001 — no Weaviate → CLI degrades
         logger.error("identity migration: Weaviate unavailable: %s", exc)

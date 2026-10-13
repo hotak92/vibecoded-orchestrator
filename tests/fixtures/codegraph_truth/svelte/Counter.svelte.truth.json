@@ -1,0 +1,41 @@
+{
+ "source": "Counter.svelte",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "createStore",
+   "start": 8,
+   "end": 10,
+   "full_name": "Counter.createStore"
+  },
+  {
+   "kind": "function",
+   "name": "increment",
+   "start": 18,
+   "end": 20,
+   "full_name": "Counter.increment"
+  },
+  {
+   "kind": "function",
+   "name": "reset",
+   "start": 22,
+   "end": 24,
+   "full_name": "Counter.reset"
+  },
+  {
+   "kind": "function",
+   "name": "double",
+   "start": 26,
+   "end": 26,
+   "full_name": "Counter.double"
+  },
+  {
+   "kind": "function",
+   "name": "doubled",
+   "start": 28,
+   "end": 28,
+   "full_name": "Counter.doubled"
+  }
+ ]
+}

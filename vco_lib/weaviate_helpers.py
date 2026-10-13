@@ -577,6 +577,64 @@ def _client_host(host: str) -> str:
     return host
 
 
+_PYPI_CHECK_PATCHED = False
+
+
+def disable_weaviate_client_pypi_check() -> bool:
+    """No-op weaviate-client's PyPI version lookup (v0.2.102 W4-E).
+
+    weaviate-client 4.x's ``ConnectionV4.connect`` runs
+    ``GET https://pypi.org/pypi/weaviate-client/json`` on EVERY connect that
+    does not pass ``skip_init_checks=True`` — a network round-trip to pypi.org
+    per MCP start / CLI connect that VCO does not need (version pinning is
+    requirements' job). The client has NO dedicated flag for it (checked
+    against the installed 4.21.0 source: ``skip_init_checks`` is the only
+    knob, and it also drops the gRPC startup ping), so the NARROWEST disable
+    is replacing ``_ConnectionBase._check_package_version`` with a no-op.
+    Everything else is untouched: the server meta/version fetch, the
+    readiness checks, and — for the callers that deliberately pass
+    ``skip_init_checks=False`` (kg-sync batch paths, the query CLI) — the
+    gRPC startup ping.
+
+    Idempotent per process; returns True when the patch is (already) in
+    place. Soft-fail: an unexpected client layout returns False and the
+    connect proceeds exactly as before (the lookup is best-effort in the
+    client too — its failure changes nothing).
+    """
+    global _PYPI_CHECK_PATCHED
+    if _PYPI_CHECK_PATCHED:
+        return True
+    try:
+        from weaviate.connect import v4 as _v4
+
+        conn = getattr(_v4, "_ConnectionBase", None)
+        if conn is None or not hasattr(conn, "_check_package_version"):
+            return False
+
+        def _no_pypi_check(self, colour):  # noqa: ANN001
+            # Match the ORIGINAL's sync/async result SHAPE (review E1,
+            # v0.2.102): weaviate-client 4.x's ``connect`` runs the return
+            # value through ``executor.result`` (sync — asserts NOT an
+            # Awaitable) or ``executor.aresult`` (async — ASSERTS it IS an
+            # Awaitable). A bare ``None`` crashes every async connect with
+            # ``skip_init_checks=False``; the original returns a coroutine
+            # on the async leg (``weaviate/connect/v4.py``:
+            # ``_check_package_version``), so the no-op must too.
+            if colour == "async":
+
+                async def _done() -> None:
+                    return None  # best-effort warning skipped — see docstring
+
+                return _done()
+            return None  # best-effort warning skipped — see docstring
+
+        conn._check_package_version = _no_pypi_check  # type: ignore[method-assign]
+        _PYPI_CHECK_PATCHED = True
+        return True
+    except Exception:
+        return False
+
+
 def connect_v4(
     weaviate_url: Optional[str] = None,
     *,
@@ -592,6 +650,11 @@ def connect_v4(
     server with slightly divergent parameters. Converged here in v0.2.77
     Part 7a. The weaviate dependency is imported lazily so non-Weaviate code
     paths don't pull it.
+
+    v0.2.102 W4-E: every connect through this factory also disables the
+    client's PyPI version lookup (see
+    :func:`disable_weaviate_client_pypi_check`) — one network call per
+    connect that VCO does not need.
 
     Args:
         weaviate_url: e.g. ``http://localhost:8081``. Defaults to
@@ -609,6 +672,7 @@ def connect_v4(
     """
     import weaviate  # noqa: WPS433  (intentional lazy import)
 
+    disable_weaviate_client_pypi_check()
     url = weaviate_url or weaviate_url_default()
     scheme, host, port = _split_http_url_parts(url)
     host = _client_host(host)

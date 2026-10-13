@@ -2,7 +2,7 @@
 name: glm-reviewer
 description: GLM 5.3 read-only review lane via the claude-gw gateway — THE lane for substantive rounds on real diffs; one report. Not edits (glm-implementer), research (glm-flash-researcher) or the pre-tag ship-gate (Fable). Needs the model gateway.
 model: claude-gw/glm-5.3[1m]
-effort: medium
+effort: high
 tools: Read, Grep, Glob, Bash, Write
 disallowedTools: mcp__vct-coordination__*
 ---

@@ -1,0 +1,73 @@
+{
+ "source": "edge_cases.rs",
+ "reviewed": "W6-E 2026-10-10 (hand-written; full_name + methods scored)",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Wrapper",
+   "start": 4,
+   "end": 6,
+   "full_name": "edge_cases.Wrapper",
+   "methods": [
+    "first"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "first",
+   "start": 9,
+   "end": 11,
+   "full_name": "edge_cases.first"
+  },
+  {
+   "kind": "class",
+   "name": "Mode",
+   "start": 14,
+   "end": 17,
+   "full_name": "edge_cases.Mode",
+   "methods": []
+  },
+  {
+   "kind": "function",
+   "name": "template",
+   "start": 19,
+   "end": 21,
+   "full_name": "edge_cases.template"
+  },
+  {
+   "kind": "function",
+   "name": "production_only",
+   "start": 29,
+   "end": 31,
+   "full_name": "edge_cases.production_only"
+  },
+  {
+   "kind": "function",
+   "name": "outer",
+   "start": 33,
+   "end": 38,
+   "full_name": "edge_cases.outer"
+  },
+  {
+   "kind": "function",
+   "name": "helper",
+   "start": 34,
+   "end": 36,
+   "full_name": "edge_cases.helper"
+  },
+  {
+   "kind": "function",
+   "name": "linux_or_test",
+   "start": 69,
+   "end": 71,
+   "full_name": "edge_cases.linux_or_test"
+  },
+  {
+   "kind": "function",
+   "name": "debug_only_production",
+   "start": 85,
+   "end": 85,
+   "full_name": "edge_cases.debug_only_production"
+  }
+ ]
+}

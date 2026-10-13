@@ -215,10 +215,6 @@ class DelegatedHooksInstallIntegrationTest(unittest.TestCase):
             # test_scripts_directory_is_copied).
             scripts_dst = proj / ".claude" / "scripts"
             self.assertTrue(scripts_dst.exists())
-            self.assertTrue(
-                (scripts_dst / "precompact_prune.py").is_file(),
-                "precompact_prune.py must ship so pre-compact-save.sh works",
-            )
 
             # settings.json written from the OS-active template with bash
             # hook commands (was test_install_into_fresh_target_linux).

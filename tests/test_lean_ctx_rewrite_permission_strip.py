@@ -39,6 +39,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SH_HOOK = REPO_ROOT / "templates" / "hooks" / "lean-ctx-rewrite.sh"
@@ -90,13 +91,25 @@ def _make_fake_lean_ctx(bin_dir: Path, stdout_text: str) -> None:
     fake.chmod(0o755)
 
 
+def _mark_project(cwd: Path) -> None:
+    """Stage ``cwd`` as a real VCO project (``.claude/settings.json``).
+
+    The hook finds its project by the marked-root rule (v0.2.102 W6-W,
+    ``_lib/project-root.{sh,ps1}``); an unmarked cwd is no project, and then
+    there is no private tee dir and the command correctly runs raw. These
+    tests are about the response the hook builds, so the cwd is a project.
+    """
+    (cwd / ".claude").mkdir(parents=True, exist_ok=True)
+    (cwd / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+
+
 def _run_sh_hook(tmp_path: Path, fake_stdout: str, extra_env: dict | None = None,
                  payload: str = PAYLOAD):
     """Run the .sh hook from a clean cwd with a fake lean-ctx on PATH."""
     bin_dir = tmp_path / "fakebin"
     _make_fake_lean_ctx(bin_dir, fake_stdout)
     cwd = tmp_path / "proj"
-    cwd.mkdir(exist_ok=True)
+    _mark_project(cwd)
     env = dict(os.environ)
     env.pop("VCT_DISABLE_HOOKS", None)
     # tests/conftest.py pins CLAUDE_PROJECT_DIR to a suite-wide scratch
@@ -206,13 +219,13 @@ def test_ps1_response_is_hook_built(tmp_path):
         encoding="utf-8",
     )
     cwd = tmp_path / "proj"
-    cwd.mkdir()
+    _mark_project(cwd)
     env = dict(os.environ)
     env.pop("VCT_DISABLE_HOOKS", None)
     env.pop("CLAUDE_PROJECT_DIR", None)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
     res = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(PS1_HOOK)],
         input=PAYLOAD,
         capture_output=True,
         text=True,

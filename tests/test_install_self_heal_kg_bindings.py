@@ -120,9 +120,9 @@ def _start_stub_weaviate(classes: list[str]) -> tuple[http.server.HTTPServer, in
 
 _INSERT_BINDING_SQL = (
     "INSERT INTO project_kg_bindings "
-    "(project_id, role, collection_name, embedding_model, "
+    "(project_id, role, collection_name, "
     "embedding_dim, kg_dir_path, weaviate_url, config_json, "
-    "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)"
+    "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)"
 )
 
 
@@ -211,9 +211,10 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
-        # Also pop WEAVIATE_URL/PORT we may have set.
-        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
+        # WEAVIATE_URL / WEAVIATE_PORT set by the test are restored by
+        # `self._env_patch.stop()` above (mock.patch.dict restores the exact prior
+        # env). The old `os.environ.pop` here REMOVED the suite pin and let every
+        # later test resolve a live backend (v0.2.102 W6-B2 last round).
 
     def _set_weaviate_url(self, port: int) -> None:
         os.environ["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
@@ -426,11 +427,11 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         with mock.patch("sqlite3.connect", side_effect=_tracking_connect):
             install._self_heal_kg_bindings_on_update(report)
 
-        # RO opened for detection, RW opened to apply. FOUR RO opens, all
+        # RO opened for detection, RW opened to apply. FIVE RO opens, all
         # lock-free: the Bug-N probe, the D18 evidence-heal precondition,
-        # and — because the precondition does NOT clear here — the two the
-        # evidence scan itself makes (identity snapshot + shared-pointer
-        # exemption).
+        # and — because the precondition does NOT clear here — the three the
+        # evidence scan itself makes (identity snapshot, the v0.2.102 M3
+        # declared-external collections read, shared-pointer exemption).
         #
         # It does not clear on purpose. The binding names
         # `Vibecoded…` (lowercase c) while Weaviate holds `VibeCoded…`, so
@@ -443,9 +444,9 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         # then re-reads it under the same cursor, sees a name that is no
         # longer the one the scan measured, and refuses.
         self.assertEqual(
-            len(ro_calls), 4,
-            f"expected 4 RO probes (Bug-N detection + D18 precondition + "
-            f"2 evidence-scan reads), got {len(ro_calls)} calls: {ro_calls}",
+            len(ro_calls), 5,
+            f"expected 5 RO probes (Bug-N detection + D18 precondition + "
+            f"3 evidence-scan reads), got {len(ro_calls)} calls: {ro_calls}",
         )
         self.assertEqual(
             len(rw_calls), 1,
@@ -784,8 +785,10 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
-        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
+        # WEAVIATE_URL / WEAVIATE_PORT set by the test are restored by
+        # `self._env_patch.stop()` above (mock.patch.dict restores the exact prior
+        # env). The old `os.environ.pop` here REMOVED the suite pin and let every
+        # later test resolve a live backend (v0.2.102 W6-B2 last round).
 
     def _set_weaviate_url(self, port: int) -> None:
         os.environ["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
@@ -1363,8 +1366,10 @@ class SelfHealDeadRootRowSweepEndToEndTests(unittest.TestCase):
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
-        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
+        # WEAVIATE_URL / WEAVIATE_PORT set by the test are restored by
+        # `self._env_patch.stop()` above (mock.patch.dict restores the exact prior
+        # env). The old `os.environ.pop` here REMOVED the suite pin and let every
+        # later test resolve a live backend (v0.2.102 W6-B2 last round).
 
     def test_end_to_end_sweeps_dead_root_own_primary_row(self):
         CANON = "VCODev_KnowledgeGraph"                 # live canonical
@@ -1477,8 +1482,10 @@ class SelfHealIdentityPickRemedyEndToEndTests(unittest.TestCase):
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
-        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
+        # WEAVIATE_URL / WEAVIATE_PORT set by the test are restored by
+        # `self._env_patch.stop()` above (mock.patch.dict restores the exact prior
+        # env). The old `os.environ.pop` here REMOVED the suite pin and let every
+        # later test resolve a live backend (v0.2.102 W6-B2 last round).
 
     def test_identity_pick_then_update_clears_the_drift_entry(self):
         DEAD = "VibeCodedOrchestrator_KnowledgeGraph"  # ptr (machine default)

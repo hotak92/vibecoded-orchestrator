@@ -1,0 +1,52 @@
+// Hand-written gRPC API in the style of public proto2/proto3 service files.
+syntax = "proto3";
+
+package library.api.v2;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "example.com/library/api/v2;apiv2";
+
+// A book in the catalogue.
+message Book {
+  enum Format {
+    FORMAT_UNSPECIFIED = 0;
+    HARDCOVER = 1;
+    EBOOK = 2;
+  }
+
+  reserved 4, 7 to 9;
+  reserved "isbn10";
+
+  string name = 1;
+  string title = 2;
+  Format format = 3;
+  google.protobuf.Timestamp published = 5;
+}
+
+message ListBooksRequest {
+  string parent = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListBooksResponse {
+  repeated Book books = 1;
+  string next_page_token = 2;
+}
+
+service Library {
+  // Lists books.
+  rpc ListBooks(ListBooksRequest) returns (ListBooksResponse) {
+    option (google.api.http) = {
+      get: "/v2/{parent=shelves/*}/books"
+    };
+  }
+
+  rpc GetBook(Book) returns (Book) {
+    option (google.api.http) = { get: "/v2/{name=shelves/*/books/*}" };
+  }
+
+  rpc WatchBooks(ListBooksRequest) returns (stream Book);
+}

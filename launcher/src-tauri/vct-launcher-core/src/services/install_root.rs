@@ -148,13 +148,32 @@ fn containment_key(p: &str) -> String {
 /// Is `exe` located under `root` (or equal to it)? String-level so the
 /// Windows verbatim / UNC shapes are decidable on every host. MUST match the
 /// `containment` rows of `tests/fixtures/install_root_cases.json`.
+///
+/// v0.2.102 NB-R1: both sides are CANONICALISED first
+/// (`std::fs::canonicalize`, falling back to the raw string key when that
+/// fails — a nonexistent path, or one this process cannot resolve) so a
+/// symlinked root (POSIX) or a `subst` drive / 8.3 short name / junction
+/// (Windows) cannot make a contained exe read as OUTSIDE and refuse a
+/// legitimate self-update. The fixture rows use literal strings, and
+/// canonicalisation only ever resolves paths that exist, so those rows are
+/// unaffected.
 pub fn exe_is_inside(root: &Path, exe: &Path) -> bool {
-    let r = containment_key(&root.to_string_lossy());
-    let e = containment_key(&exe.to_string_lossy());
+    let r = canonical_containment_key(root);
+    let e = canonical_containment_key(exe);
     if r.is_empty() {
         return false;
     }
     e == r || e.starts_with(&format!("{}/", r.trim_end_matches('/')))
+}
+
+/// [`containment_key`] of `p`'s canonical form when `p` can be resolved,
+/// else of the raw string (see the NB-R1 note on [`exe_is_inside`]).
+fn canonical_containment_key(p: &Path) -> String {
+    containment_key(
+        &std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy(),
+    )
 }
 
 // ─── resolver ────────────────────────────────────────────────────────────
@@ -570,6 +589,85 @@ mod tests {
         assert_eq!(strip_windows_verbatim_prefix("/opt/vco"), "/opt/vco");
     }
 
+    // ── v0.2.102 NB-R1: containment survives path indirection ──────────
+
+    /// A symlinked root must not hide a contained exe: the launcher binary
+    /// resolves through `$REPO_ROOT/launcher/dist/...` on plenty of installs
+    /// where the root itself is reached over a symlink. Pre-fix the raw
+    /// string keys differed and the exe read as OUTSIDE (self-update
+    /// refused). ACT half of the decision.
+    #[cfg(unix)]
+    #[test]
+    fn exe_under_a_symlinked_root_is_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("clone");
+        let exe = real.join("launcher").join("dist").join("linux-x64").join("vct-launcher");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        let link = tmp.path().join("link-to-clone");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            exe_is_inside(&link, &exe),
+            "a symlinked root must canonicalise before the containment comparison"
+        );
+        // The reverse shape too: the exe reached THROUGH the symlink, root
+        // named directly.
+        let exe_via_link = link.join("launcher").join("dist").join("linux-x64").join("vct-launcher");
+        assert!(exe_is_inside(&real, &exe_via_link));
+    }
+
+    /// LEAVE-ALONE half: an exe genuinely outside the clone stays outside,
+    /// symlinked root or not.
+    #[cfg(unix)]
+    #[test]
+    fn exe_outside_a_symlinked_root_stays_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("clone");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link-to-clone");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let exe = tmp.path().join("tmpbin").join("vct-launcher");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        assert!(!exe_is_inside(&link, &exe));
+        assert!(!exe_is_inside(&real, &exe));
+    }
+
+    /// Windows junction twin of the symlink test (compile/run on Windows
+    /// only — no CI job runs `cargo test` there today; see the
+    /// verification-status note in `vct-launcher-core/src/process.rs` for
+    /// the same caveat on another guard). A junction is the shape a `subst`
+    /// drive or a mapped network root produces.
+    #[cfg(windows)]
+    #[test]
+    fn exe_behind_a_junction_is_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("clone");
+        let exe = real.join("launcher").join("dist").join("windows-x64").join("vct-launcher.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"MZ").unwrap();
+        let junction = tmp.path().join("link-to-clone");
+        let st = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &junction.to_string_lossy(),
+                &real.to_string_lossy(),
+            ])
+            .status()
+            .expect("spawn cmd for mklink /J");
+        assert!(st.success(), "mklink /J failed (junction creation requires no elevation)");
+        assert!(
+            exe_is_inside(&junction, &exe),
+            "a junction root must canonicalise before the containment comparison"
+        );
+        let outside = tmp.path().join("tmpbin").join("vct-launcher.exe");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"MZ").unwrap();
+        assert!(!exe_is_inside(&junction, &outside));
+    }
+
     // ── store-level behaviour (standby / cache write) ──────────────────
 
     /// Fake store. `standby` flips the standby probe; `cached` is the DB row;
@@ -836,111 +934,12 @@ mod tests {
         assert!(db.is_update_standby(), "a Db method issued DDL on the update stand-in");
     }
 
-    /// Census (the red-proof lever the review accepted): every production
-    /// DDL / `execute_batch` site on the launcher.db side is on this
-    /// allowlist, with the reason it cannot reach the stand-in. A new lazy
-    /// `CREATE` anywhere in the launcher crates fails here until it is
-    /// either moved into `migrations` or justified below.
-    #[test]
-    fn no_lazy_ddl_outside_migrations_census() {
-        // file (relative to launcher/src-tauri) -> why it cannot reach the stand-in
-        let allow: &[(&str, &str)] = &[
-            (
-                "vct-launcher-core/src/db/change_log.rs",
-                "ensure_change_log: called only from Db::open / open_in_memory (asserted below)",
-            ),
-            (
-                "vct-launcher-core/src/db/module_db_migrations.rs",
-                "module DDL runs after a module_db_migrations ledger read that fails on the \
-                 stand-in; the other hits are error-message strings",
-            ),
-            (
-                "vct-launcher-core/src/db/project_state.rs",
-                "BEGIN IMMEDIATE / COMMIT / ROLLBACK — transaction control, not DDL",
-            ),
-        ];
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let needles = [
-            "create table",
-            "create index",
-            "create unique index",
-            "create trigger",
-            "create view",
-            "create virtual",
-            "alter table",
-            "drop table",
-            "execute_batch(",
-        ];
-        let mut hits: std::collections::BTreeSet<String> = Default::default();
-        let mut stack = vec![base.join("vct-launcher-core/src"), base.join("src")];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-                let p = entry.path();
-                let name = p.file_name().unwrap().to_string_lossy().to_string();
-                if p.is_dir() {
-                    if name != "migrations" {
-                        stack.push(p);
-                    }
-                    continue;
-                }
-                if !name.ends_with(".rs") || name == "migrations.rs" {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&p).unwrap();
-                let rel_path = p
-                    .strip_prefix(&base)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                for line in text.lines() {
-                    if line.starts_with("#[cfg(test)]") {
-                        break; // production code only
-                    }
-                    let t = line.trim_start();
-                    if t.starts_with("//") {
-                        continue;
-                    }
-                    let norm = t.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
-                    if needles.iter().any(|n| norm.contains(n)) {
-                        hits.insert(rel_path.clone());
-                    }
-                }
-            }
-        }
-        let allowed: std::collections::BTreeSet<String> =
-            allow.iter().map(|(f, _)| f.to_string()).collect();
-        let unexpected: Vec<_> = hits.difference(&allowed).collect();
-        assert!(
-            unexpected.is_empty(),
-            "DDL / execute_batch outside migrations in {:?} — a lazy DDL on the managed \
-             connection flips the update stand-in to 'live' (W1R-16)",
-            unexpected
-        );
-        // The change_log allowance holds only while its callers are the two
-        // open paths.
-        let mod_rs = std::fs::read_to_string(base.join("vct-launcher-core/src/db/mod.rs")).unwrap();
-        let prod = mod_rs.split("\n#[cfg(test)]").next().unwrap();
-        assert_eq!(prod.matches("ensure_change_log()").count(), 2);
-        let mut callers = 0usize;
-        let mut stack = vec![base.join("vct-launcher-core/src"), base.join("src")];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().map(|e| e == "rs").unwrap_or(false) {
-                    let text = std::fs::read_to_string(&p).unwrap();
-                    let prod = text.split("\n#[cfg(test)]").next().unwrap();
-                    callers += prod
-                        .lines()
-                        .filter(|l| !l.trim_start().starts_with("//"))
-                        .filter(|l| l.contains(".ensure_change_log()"))
-                        .count();
-                }
-            }
-        }
-        assert_eq!(callers, 2, "ensure_change_log gained a caller outside Db::open / open_in_memory");
-    }
+    // W1R-16 lazy-DDL census: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_no_lazy_ddl_outside_migrations_census`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating.
+    // The Rust copy stopped each file at its first column-0 `#[cfg(test)]` — a gated
+    // `use`/helper in 20 files, and production code after the test module in 3 more.
 
     #[test]
     fn resolve_without_db_falls_back_to_the_process_cache_only_after_the_walk() {

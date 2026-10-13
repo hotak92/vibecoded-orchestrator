@@ -55,7 +55,6 @@ NOT a quiet inline-copy degrade that masks the breakage.
 from __future__ import annotations
 
 import os
-import re
 import sys
 
 
@@ -73,57 +72,24 @@ _BROKEN_INSTALL_MSG = (
 
 
 def _resolve_codegraph_prefix() -> str | None:
-    """Resolve the project's codegraph class prefix from env, mirroring
-    ``schema_migration_runner._resolve_codegraph_prefix`` /
-    ``analyze_code_graph._sanitize_collection_prefix``.
-
-    ``CODE_GRAPH_PROJECT`` (already the sanitized prefix the analyzer uses)
-    wins; else derive it from ``PROJECT_NAME`` via the SAME
-    ``canonical_class_prefix`` helper so we probe the class name the analyzer
-    actually wrote. Returns ``None`` when neither is set (the runner then has
-    nothing to patch for this project).
-
-    X-1 / v0.2.76 (ruling #1): a failing ``import vco_lib`` is a broken install
-    — it raises loudly (→ ``main`` prints + exits non-zero), never a legacy
-    regex fallback.
-    """
-    cg = (os.environ.get("CODE_GRAPH_PROJECT") or "").strip()
-    if cg:
-        return cg
-    pn = (os.environ.get("PROJECT_NAME") or "").strip()
-    if not pn:
-        return None
+    """The project's codegraph class prefix from env, through the ONE home
+    ``vco_lib.codegraph_edge_env.resolve_codegraph_prefix`` (v0.2.102 S2 — the
+    four edges and the runner used to carry their own copies). ``None`` when no
+    scope is resolvable. A failing ``import vco_lib`` is a broken install and
+    propagates (→ loud non-zero exit)."""
     sys.path.insert(0, os.getcwd())
-    from vco_lib.codegraph_naming import canonical_class_prefix
+    from vco_lib.codegraph_edge_env import resolve_codegraph_prefix
 
-    return canonical_class_prefix(pn)
+    return resolve_codegraph_prefix()
 
 
 def _connect():
-    """Connect to Weaviate the SAME way the analyzer does (custom host/port).
+    """Weaviate via the ONE connect factory (``vco_lib.codegraph_edge_env``).
+    Raises on failure (→ non-zero exit → the runner defers + retries)."""
+    sys.path.insert(0, os.getcwd())
+    from vco_lib.codegraph_edge_env import connect_from_env
 
-    Reads ``WEAVIATE_URL`` (default localhost:8081) + ``GRPC_PORT`` (default
-    50052). Returns the client, or raises on failure (→ non-zero exit → the
-    runner defers + retries).
-    """
-    import weaviate  # local import: only needed when the edge actually runs
-
-    url = os.environ.get("WEAVIATE_URL", "http://localhost:8081")
-    m = re.match(r"^(https?)://([^:/]+)(?::(\d+))?", url)
-    scheme, host, port = ("http", "localhost", 8081)
-    if m:
-        scheme = m.group(1)
-        host = m.group(2)
-        port = int(m.group(3)) if m.group(3) else (443 if scheme == "https" else 8081)
-    grpc_port = int(os.environ.get("GRPC_PORT") or os.environ.get("WEAVIATE_GRPC_PORT") or 50052)
-    return weaviate.connect_to_custom(
-        http_host=host,
-        http_port=port,
-        http_secure=(scheme == "https"),
-        grpc_host=host,
-        grpc_port=grpc_port,
-        grpc_secure=(scheme == "https"),
-    )
+    return connect_from_env()
 
 
 def _ensure_props(client, prefix: str) -> dict:

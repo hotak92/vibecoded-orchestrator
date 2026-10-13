@@ -28,8 +28,9 @@
 // DORMANT in v0.2.60: every item here is exercised only by unit tests + the
 // (not-wired) engine/bootstrap. No LIVE v0.2.60 path constructs an UpdatePlan,
 // so `dead_code` is expected and intentional until v0.3.0 wires the inverted
-// entrypoint. The `engine_entrypoint_is_not_wired_into_main` test is the
-// enforced dormancy guarantee.
+// entrypoint. `test_engine_entrypoint_is_not_wired_into_updater_main` in
+// `tests/test_v02102_rust_source_scan_gates.py` is the enforced dormancy
+// guarantee.
 #![allow(dead_code)]
 
 use std::path::PathBuf;

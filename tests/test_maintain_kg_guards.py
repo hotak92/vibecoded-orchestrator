@@ -228,6 +228,8 @@ class TestConfirmationGate:
              mock.patch.object(
                  mkg, "get_all_weaviate_objects",
                  return_value=[("uuid-dead", "Gone", "knowledge/gone.md")]), \
+             mock.patch.object(mkg, "get_all_weaviate_rows",
+                               return_value=[]), \
              mock.patch.object(sys.stdin, "isatty", return_value=False):
             stats = mkg.check_consistency(server, fix=True, assume_yes=False)
         assert stats["orphaned_weaviate"] == 1
@@ -242,7 +244,9 @@ class TestConfirmationGate:
              mock.patch.object(mkg, "get_all_knowledge_files", return_value={}), \
              mock.patch.object(
                  mkg, "get_all_weaviate_objects",
-                 return_value=[("uuid-dead", "Gone", "knowledge/gone.md")]):
+                 return_value=[("uuid-dead", "Gone", "knowledge/gone.md")]), \
+             mock.patch.object(mkg, "get_all_weaviate_rows",
+                               return_value=[]):
             stats = mkg.check_consistency(server, fix=True, assume_yes=True)
         assert stats["fixed"] == 1
         assert col.deleted == ["uuid-dead"]

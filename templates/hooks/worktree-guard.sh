@@ -40,11 +40,22 @@
 # ── Decision matrix ──────────────────────────────────────────────────────
 #   1. Global bypass (VCT_DISABLE_HOOKS) → echo nothing and no-op (harness
 #      uses its own default). Full no-op, consistent with every hook.
-#   2. cwd is NOT a git repo → this create cannot be isolated; echo nothing
-#      + exit 0 so the harness does its own default (do NOT abort a
-#      legitimate non-git spawn with a non-zero exit).
+#   1b. A lane reservation is pending (v0.2.102 W6-AA) and the identifier is
+#      an `agent-*` subagent → vco_lib/lane_reservation.py consumes the
+#      oldest unexpired one and creates the worktree in the reserved repo, at
+#      the reserved base, on the reserved branch (or adopts the reserved
+#      existing worktree); a reservation that fails validation aborts the
+#      create LOUDLY. See the "Lane reservation" block below.
+#   2. cwd is NOT a git repo → this create cannot be isolated; return the
+#      working directory itself (the agent runs in place) and leave a
+#      notice that tells the agent, and through its report the user, that
+#      isolation is OFF (v0.2.102 W6-Q — echoing nothing made the harness
+#      fail the launch). No identifier → plain no-op.
 #   3. Derive `<toplevel>/.claude/worktrees/<sanitized-id>` and run
-#      `git worktree add --detach <path> HEAD`.
+#      `git worktree add --detach <path> HEAD` — or, when the repository has
+#      no commits yet (unborn HEAD), detach it at a snapshot commit of the
+#      working tree built through a throwaway index, with a notice saying so
+#      (v0.2.102 W6-Q).
 #        • already a registered worktree (re-fire / retry) → idempotent
 #          success: echo it, exit 0.
 #        • `git worktree add` FAILS → LOUD abort: log the reason, print it
@@ -111,10 +122,22 @@ if [ -z "${PY:-}" ]; then
     PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || command -v py 2>/dev/null || true)"
 fi
 
-PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$PWD}"
-LOG_DIR="$PROJECT_ROOT/.claude/logs"
-LOG_FILE="$LOG_DIR/worktree-guard.jsonl"
-mkdir -p "$LOG_DIR" 2>/dev/null || true
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py). Empty when no VCO project encloses the cwd: the
+# worktree decision still runs, but the log row, notices and launch records
+# (all state writes) are skipped rather than planted under the cwd.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/project-root.sh"
+PROJECT_ROOT="$(vco_project_root)" || PROJECT_ROOT=""
+LOG_DIR=""
+LOG_FILE=""
+if [ -n "$PROJECT_ROOT" ]; then
+    LOG_DIR="$PROJECT_ROOT/.claude/logs"
+    LOG_FILE="$LOG_DIR/worktree-guard.jsonl"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+else
+    echo "worktree-guard: no VCO project encloses $PWD; log, notices and launch records skipped" >&2
+fi
 
 # ── Read stdin (the WorktreeCreate payload) ───────────────────────────────
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
@@ -288,7 +311,7 @@ sanitize_id() {
 # Prefer the payload cwd hint when present, else PROJECT_ROOT. We use
 # `git -C <dir> rev-parse --show-toplevel` so monorepos / subdir-of-repo
 # layouts resolve to the REAL git toplevel.
-GIT_SCOPE_DIR="$PROJECT_ROOT"
+GIT_SCOPE_DIR="${PROJECT_ROOT:-$PWD}"  # a read: the cwd is a fine scope
 if [ -n "$REPO_HINT" ] && [ -d "$REPO_HINT" ]; then
     GIT_SCOPE_DIR="$REPO_HINT"
 fi
@@ -297,23 +320,218 @@ if command -v git >/dev/null 2>&1; then
     TOPLEVEL="$(git -C "$GIT_SCOPE_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
 fi
 
-# ── Not a git repo ⇒ graceful no-op ───────────────────────────────────────
-# This create can't be isolated (no repo to base a worktree on). Echo nothing
-# and exit 0 so the harness does its own default — do NOT abort with a
-# non-zero exit, which would block a legitimate non-git spawn.
+# ── Isolation notices (v0.2.102 W6-Q) ─────────────────────────────────────
+# A successful WorktreeCreate cannot speak to anyone: the harness discards
+# the hook's systemMessage. So when this hook has to create something other
+# than an ordinary worktree of HEAD (no commits yet, or not a git repo at
+# all), it leaves a one-shot notice keyed by the worktree identifier, and
+# subagent-start-isolation-check.{sh,ps1} hands it to the subagent as
+# additionalContext (the SubagentStart `agent_id` is this `name` minus its
+# `agent-` prefix — observed on Claude Code 2.1.285). The subagent is told to
+# repeat it in its final report, which is how the user learns why isolation
+# is off or different. Notices live in .claude/state/worktree-guard/; an
+# identifier outside [A-Za-z0-9._-] gets no notice (the log row remains).
+NOTICE_DIR=""
+if [ -n "$PROJECT_ROOT" ]; then NOTICE_DIR="$PROJECT_ROOT/.claude/state/worktree-guard"; fi
+
+# Per-launch records (v0.2.102 W6-Q follow-up): the one home is
+# _lib/worktree-records.sh. subagent-stop-reconcile reaps an unchanged
+# worktree from its record; subagent-start-isolation-check uses the record to
+# tell "the guard handled this agent" from "isolation was skipped".
+if [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
+    # shellcheck source=_lib/worktree-records.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/worktree-records.sh"
+    if [ -n "$PROJECT_ROOT" ]; then wtrec_prune "$PROJECT_ROOT"; fi
+fi
+record_launch() {
+    [ -n "$PROJECT_ROOT" ] || return 0
+    command -v wtrec_write >/dev/null 2>&1 || return 0
+    wtrec_write "$PROJECT_ROOT" "$WT_NAME" "$@"
+}
+write_notice() {
+    case "$WT_NAME" in
+        ''|*[!A-Za-z0-9._-]*|.*) return 0 ;;
+    esac
+    [ -n "$NOTICE_DIR" ] || return 0
+    mkdir -p "$NOTICE_DIR" 2>/dev/null || return 0
+    printf '%s\n' "$1" > "$NOTICE_DIR/notice-$WT_NAME.txt" 2>/dev/null || true
+}
+
+# ── Lane reservation (v0.2.102 W6-AA) ─────────────────────────────────────
+# A coordinator that wants this isolated agent's worktree in ANOTHER repo (at
+# a chosen base, on a chosen branch) reserves it first:
+#   python -m vco_lib.lane_reservation reserve --project P --repo R --base B --branch N
+# The logic (FIFO claim by atomic rename, TTL, allow-list = P + P's enabled
+# code folders via the hub, `git -C R worktree add -b`, or adopting an
+# --existing-path) lives ONCE in vco_lib/lane_reservation.py; this block only
+# calls it. No pending file → nothing below runs and the guard behaves exactly
+# as before. Consume exit 3 = nothing to consume (all expired, or not an
+# agent-* launch) → fall through. Any other failure is a LOUD abort — never a
+# silent fallback to a worktree of P. A consume that exits 0 without its five
+# non-empty lines (path, HEAD, repo, mode, extra JSON) is a malformed success:
+# the reservation is already claimed, so it is the same loud abort, never an
+# empty or partial path. MUST MATCH worktree-guard.ps1.
+# No VCO-side time bound here: `git worktree add` on a very large repo can
+# take minutes and must never be killed mid-run. The WorktreeCreate
+# registration carries no `timeout`, so the harness's own command-hook
+# default (600 s) is the outer bound.
+LANE_PENDING="$PROJECT_ROOT/.claude/state/lane-reservations/pending"
+if [ -n "$WT_NAME" ] && ls "$LANE_PENDING"/res-*.json >/dev/null 2>&1; then
+    VCO_VENV_PYTHON=""
+    if [ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ]; then
+        # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+        . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+        resolve_vco_venv_python "$SCRIPT_DIR"
+    fi
+    if [ -z "$VCO_VENV_PYTHON" ]; then
+        REASON="broken install: a lane reservation is pending in $LANE_PENDING but VCO's Python (vco_lib) cannot be resolved to consume it - repair the install (launcher: project Settings -> Update bundle), or cancel the reservation"
+        log_event "create_failed" "$REASON" "$PROPOSED_PATH" ""
+        printf 'worktree-guard: ABORT - %s\n' "$REASON" >&2
+        exit 1
+    fi
+    LANE_OUT="$("$VCO_VENV_PYTHON" -m vco_lib.lane_reservation consume --project "$PROJECT_ROOT" --name "$WT_NAME")"
+    LANE_RC=$?
+    if [ "$LANE_RC" -eq 0 ]; then
+        LANE_PATH="$(printf '%s\n' "$LANE_OUT" | sed -n '1p')"
+        LANE_HEAD="$(printf '%s\n' "$LANE_OUT" | sed -n '2p')"
+        LANE_REPO="$(printf '%s\n' "$LANE_OUT" | sed -n '3p')"
+        LANE_MODE="$(printf '%s\n' "$LANE_OUT" | sed -n '4p')"
+        LANE_EXTRA="$(printf '%s\n' "$LANE_OUT" | sed -n '5p')"
+        if [ -z "$LANE_PATH" ] || [ -z "$LANE_HEAD" ] || [ -z "$LANE_REPO" ] \
+            || [ -z "$LANE_MODE" ] || [ -z "$LANE_EXTRA" ]; then
+            REASON="lane reservation consume reported success but its output was malformed (expected five non-empty lines: path, HEAD, repo, mode, extra JSON) - the reservation was claimed; no worktree of the project was created in its place"
+            log_event "create_failed" "$REASON" "$PROPOSED_PATH" ""
+            printf 'worktree-guard: ABORT - %s\n' "$REASON" >&2
+            exit 1
+        fi
+        log_event "created" "lane_reservation" "$PROPOSED_PATH" "$LANE_PATH"
+        record_launch "$LANE_MODE" "$LANE_PATH" "$LANE_HEAD" "$LANE_REPO" "$LANE_EXTRA"
+        emit_path "$LANE_PATH"
+        exit 0
+    elif [ "$LANE_RC" -ne 3 ]; then
+        REASON="lane reservation could not be honoured (consume exit $LANE_RC; reason above) - no worktree of the project was created in its place"
+        log_event "create_failed" "$REASON" "$PROPOSED_PATH" ""
+        printf 'worktree-guard: ABORT - %s\n' "$REASON" >&2
+        exit 1
+    fi
+fi
+
+# ── Not a git repo ⇒ run in place, isolation OFF, said out loud ───────────
+# No repository means nothing to base a worktree on. Echoing nothing is NOT
+# "let the harness do its default": the WorktreeCreate contract is "If the
+# hook fails or produces no path, worktree creation fails with an error"
+# (https://code.claude.com/docs/en/hooks#worktreecreate-output), and without
+# a hook the harness itself refuses ("not in a git repository and no
+# WorktreeCreate hooks are configured"). Either way every `isolation:
+# worktree` agent would be unlaunchable in a plain folder. So the hook
+# returns the working directory itself: the harness accepts a directory with
+# no git metadata when no repository contains it (docs: worktrees, "Claude
+# Code refuses to use a worktree"), the agent launches, and the notice above
+# tells it — and through its report, the user — that it edits the folder
+# directly. A degenerate payload with no identifier stays a no-op (below).
 if [ -z "$TOPLEVEL" ]; then
-    log_event "noop" "not_a_repo" "$PROPOSED_PATH" ""
+    if [ -z "$WT_NAME" ]; then
+        log_event "noop" "not_a_repo" "$PROPOSED_PATH" ""
+        exit 0
+    fi
+    RUN_DIR="$GIT_SCOPE_DIR"
+    if command -v realpath >/dev/null 2>&1; then
+        RUN_DIR="$(realpath "$RUN_DIR" 2>/dev/null || printf '%s' "$RUN_DIR")"
+    fi
+    write_notice "VCO worktree-guard: worktree isolation is OFF for this subagent. $RUN_DIR is not inside a git repository, so no isolated worktree can be created; you are working DIRECTLY in the project folder and every edit lands there immediately. Say this in your final report. Isolation turns on by itself once the folder is a git repository (git init)."
+    log_event "in_place" "not_a_repo" "$PROPOSED_PATH" "$RUN_DIR"
+    record_launch "in_place" "$RUN_DIR" "" ""
+    printf 'worktree-guard: %s is not a git repository - the subagent runs in place, without worktree isolation\n' "$RUN_DIR" >&2
+    emit_path "$RUN_DIR"
     exit 0
 fi
 TOPLEVEL_ABS="$(norm_path "$TOPLEVEL")"
 
-# create_worktree ABS_PATH — run `git worktree add --detach ABS_PATH HEAD`.
+# ── No commits yet ⇒ base the worktree on a snapshot commit ───────────────
+# A freshly `git init`-ed repository has an unborn HEAD, so
+# `git worktree add --detach <path> HEAD` fails ("fatal: invalid reference:
+# HEAD") and every isolated agent aborts — the state of EVERY brand-new
+# project until its first commit. Returning the main checkout instead is
+# refused by the harness (it is "its own repository", not a separate
+# worktree — verified live on Claude Code 2.1.285). So the hook builds a
+# commit of the current working tree through a THROWAWAY index (the user's
+# index, refs and HEAD are untouched; .gitignore is honoured; other agents'
+# worktrees are excluded) and detaches the worktree there. The commit is on
+# no branch; the notice gives the agent the exact command that carries its
+# changes back into the main checkout.
+#
+# v0.2.102 W6-R: credential FILES are excluded from the snapshot. In a new
+# project with no .gitignore, `add -A` would otherwise copy a `.env` into the
+# snapshot commit (git's object store) and into the agent's worktree. The
+# globs come from the ONE credential-file list VCO keeps
+# (.claude/scripts/bash_security.py --credential-file-globs, the same list
+# the secrets guard's `read_env_files` rule reads). When that list cannot be
+# read (python or the script missing — a broken install) the snapshot is
+# REFUSED rather than taken without the exclusion.
+BASE_REF="HEAD"
+BASE_REASON="worktree_add_detached_head"
+SNAP_CRED_EXCLUDED=""
+if ! git -C "$TOPLEVEL_ABS" rev-parse --verify -q 'HEAD^{commit}' >/dev/null 2>&1; then
+    SNAP_SECURITY="$SCRIPT_DIR/../scripts/bash_security.py"
+    SNAP_GLOBS=""
+    if [ -n "${PY:-}" ] && [ -f "$SNAP_SECURITY" ]; then
+        SNAP_GLOBS="$("$PY" "$SNAP_SECURITY" --credential-file-globs 2>/dev/null || true)"
+    fi
+    if [ -z "$SNAP_GLOBS" ]; then
+        REASON="broken install: repository at $TOPLEVEL_ABS has no commits, and the credential-file list its snapshot must exclude could not be read (${PY:-no python interpreter} / $SNAP_SECURITY) - refusing to snapshot a working tree that may hold credential files; repair it with the project's bundle update (launcher: project Settings -> Update bundle)"
+        log_event "create_failed" "$REASON" "$PROPOSED_PATH" ""
+        printf 'worktree-guard: ABORT - %s\n' "$REASON" >&2
+        exit 1
+    fi
+    SNAP_EXCLUDES=(':(exclude).claude/worktrees')
+    while IFS= read -r _g; do
+        [ -n "$_g" ] && SNAP_EXCLUDES+=(":(exclude,glob)$_g")
+    done <<EOF
+$SNAP_GLOBS
+EOF
+    SNAP_CRED_SPECS=()
+    while IFS= read -r _g; do
+        [ -n "$_g" ] && SNAP_CRED_SPECS+=(":(glob)$_g")
+    done <<EOF
+$SNAP_GLOBS
+EOF
+    # The credential files this snapshot leaves out (named in the notice).
+    SNAP_CRED_EXCLUDED="$(git -C "$TOPLEVEL_ABS" ls-files --cached --others --exclude-standard \
+        -- "${SNAP_CRED_SPECS[@]}" 2>/dev/null | sort -u | head -20 | tr '\n' ' ' || true)"
+    SNAP_TMP="$(mktemp -d 2>/dev/null || true)"
+    SNAP_SHA=""
+    SNAP_ERR=""
+    if [ -n "$SNAP_TMP" ]; then
+        SNAP_IDX="$SNAP_TMP/index"
+        if SNAP_ERR="$(GIT_INDEX_FILE="$SNAP_IDX" git -C "$TOPLEVEL_ABS" add -A -- . "${SNAP_EXCLUDES[@]}" 2>&1)"; then
+            SNAP_TREE="$(GIT_INDEX_FILE="$SNAP_IDX" git -C "$TOPLEVEL_ABS" write-tree 2>/dev/null || true)"
+            if [ -n "$SNAP_TREE" ]; then
+                SNAP_SHA="$(GIT_AUTHOR_NAME="VCO worktree-guard" GIT_AUTHOR_EMAIL="worktree-guard@vco.invalid" \
+                    GIT_COMMITTER_NAME="VCO worktree-guard" GIT_COMMITTER_EMAIL="worktree-guard@vco.invalid" \
+                    git -C "$TOPLEVEL_ABS" -c commit.gpgsign=false commit-tree "$SNAP_TREE" \
+                    -m "VCO worktree-guard: snapshot of the working tree (repository has no commits yet)" 2>/dev/null || true)"
+            fi
+        fi
+        rm -rf "$SNAP_TMP" 2>/dev/null || true
+    fi
+    if [ -z "$SNAP_SHA" ]; then
+        REASON="repository at $TOPLEVEL_ABS has no commits and a snapshot commit of its working tree could not be built: ${SNAP_ERR:-git write-tree/commit-tree failed}"
+        log_event "create_failed" "$REASON" "$PROPOSED_PATH" ""
+        printf 'worktree-guard: ABORT - %s\n' "$REASON" >&2
+        exit 1
+    fi
+    BASE_REF="$SNAP_SHA"
+    BASE_REASON="worktree_add_snapshot_no_head"
+fi
+
+# create_worktree ABS_PATH — run `git worktree add --detach ABS_PATH $BASE_REF`
+# (HEAD, or the no-commits snapshot above).
 # Idempotent: if ABS_PATH is already a registered worktree, treat as success.
 # On genuine failure, emit the reason to stderr, log it, and abort NON-ZERO
 # (per the strict contract — a failed create must be LOUD, never a silent
 # shared-tree fallback). Returns via exit; never returns normally on failure.
 create_worktree() {
-    local target="$1" reason existing add_err
+    local target="$1" reason existing add_err rec_mode
     # Already registered at this exact path? (re-fire / retry) → success.
     # `git worktree list --porcelain` emits `worktree <abs-path>` lines.
     existing="$(git -C "$TOPLEVEL_ABS" worktree list --porcelain 2>/dev/null \
@@ -327,8 +545,13 @@ create_worktree() {
     mkdir -p "$(dirname "$target")" 2>/dev/null || true
     # Detached HEAD is the safest base: no branch-name collisions across
     # parallel agents, and the agent gets a clean separate checkout of HEAD.
-    if add_err="$(git -C "$TOPLEVEL_ABS" worktree add --detach "$target" HEAD 2>&1)"; then
-        log_event "created" "worktree_add_detached_head" "$PROPOSED_PATH" "$target"
+    if add_err="$(git -C "$TOPLEVEL_ABS" worktree add --detach "$target" "$BASE_REF" 2>&1)"; then
+        if [ "$BASE_REF" != "HEAD" ]; then
+            write_notice "VCO worktree-guard: this repository has no commits yet, so your isolated worktree ($target) starts from a SNAPSHOT of the project's working tree (commit $BASE_REF, on no branch) instead of HEAD. The main checkout is untouched by your edits. Credential files (VCO's credential-file list: *.env, *.env.*, *.credentials, *.netrc, *.pgpass and the like) are EXCLUDED from the snapshot and are not in your worktree${SNAP_CRED_EXCLUDED:+ - left out here: ${SNAP_CRED_EXCLUDED% }}; if the task needs one, ask the caller instead of recreating it. Say this in your final report and give the user the command that brings your changes back: git -C \"$target\" add -A && git -C \"$target\" diff --binary --cached $BASE_REF | git -C \"$TOPLEVEL_ABS\" apply"
+        fi
+        log_event "created" "$BASE_REASON" "$PROPOSED_PATH" "$target"
+        if [ "$BASE_REF" = "HEAD" ]; then rec_mode="head"; else rec_mode="snapshot"; fi
+        record_launch "$rec_mode" "$target" "$(git -C "$target" rev-parse HEAD 2>/dev/null || true)" "$TOPLEVEL_ABS"
         emit_path "$target"
         exit 0
     fi

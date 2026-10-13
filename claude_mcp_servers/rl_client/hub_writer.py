@@ -155,45 +155,235 @@ def _read_hub_token() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# NB-06 (v0.2.101): coalesce repeated ``hub_not_running`` loss-ledger lines.
+# NB-06 (v0.2.101) + W3R-2 (v0.2.102): coalesce repeated hub-unreachable
+# loss-ledger lines — one per EPISODE, across PROCESSES.
+#
 # A CLI-only user (no hub ever running) emits one RL event per search, so the
-# old code appended one ``hub_not_running`` line PER SEARCH — a growing wall of
-# identical rows in ``vco doctor`` that carry no new information. Mirror the
-# stop-failure-notify coalescing (one per episode, count carried forward):
-#   * the FIRST hub-down observation in a process records one line;
-#   * repeats while the hub stays down only bump a counter (no line);
-#   * a successful hub contact ENDS the episode, and the next recorded line
-#     carries ``suppressed=<n>`` — the repeats that were not written.
-# The counter is deliberately NOT cleared by the success: it is carried onto
-# the next recorded line, exactly like stop-failure-notify's suppressed count.
-_hub_down_active = False
-_hub_down_suppressed = 0
+# old code appended one ``hub_not_running`` line PER SEARCH — a growing wall
+# of identical rows in ``vco doctor`` that carry no new information. NB-06
+# coalesced them per PROCESS, but hook/CLI producers are one process per
+# search, so the wall grew anyway (W3R-2: reproduced — 3 processes, 3 lines;
+# and the dominant live failure, ``timeout``, was never coalesced at all).
+# The episode state now lives in a tiny JSON file beside the ledger so the
+# Nth process in the same outage bumps a SHARED counter instead of appending
+# the Nth line:
+#   * the FIRST hub-unreachable failure of an episode appends one line,
+#     tagged with the episode id;
+#   * repeats while the hub stays unreachable bump ``suppressed`` — in the
+#     state file AND in-place on the episode's own ledger line (under the
+#     ledger's sidecar lock, so the count is visible immediately, not only
+#     after the episode ends);
+#   * a hub ANSWER (2xx or a structured HTTP error) ends the episode.
+# Reasons classed as hub-unreachable: ``hub_not_running`` (no token),
+# ``connection_refused``, ``connection_reset``, ``timeout``, ``os_error``,
+# ``url_error``. ``http_*`` answers prove the hub is UP (they end the episode
+# and are recorded per event — each is a distinct writer/hub rejection worth
+# seeing), and ``not_serializable`` never contacted the hub at all.
+_EPISODE_FILE_NAME = "hub_down_episode.json"
+
+#: Bound on waiting for the episode-file lock; mirrors the ledger's own
+#: ``_LOCK_TIMEOUT_S``. Past this the caller writes the line UNCOALESCED —
+#: an extra line beats a lost one.
+_EPISODE_LOCK_TIMEOUT_S = 1.0
+
+
+def _episode_state_path() -> Path:
+    """``<vct_root>/metrics/hub_down_episode.json`` — beside the loss ledger."""
+    from vco_lib.paths import vct_metrics_dir
+
+    return vct_metrics_dir() / _EPISODE_FILE_NAME
+
+
+def _episode_update(mutate):
+    """Read-modify-write the episode file under the repo's one file lock.
+
+    Returns ``(True, mutate(state))`` on success, ``(False, None)`` when the
+    state file could not be locked/read/written — callers then fall back to
+    writing the ledger line directly. Never raises (bookkeeping must not
+    break a write path that is already failing).
+    """
+    try:
+        from vco_lib.atomic import atomic_write_json, exclusive_file_lock
+
+        path = _episode_state_path()
+        with exclusive_file_lock(
+            path.with_name(path.name + ".lock"), timeout_s=_EPISODE_LOCK_TIMEOUT_S
+        ):
+            state: dict = {}
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    state = raw
+            except (OSError, ValueError):
+                state = {}
+            result = mutate(state)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # One-home rule: no hand-rolled tmp+os.replace outside vco_lib.atomic.
+            atomic_write_json(path, state, indent=None, fsync=False)
+            return True, result
+    except Exception:  # noqa: BLE001
+        return False, None
+
+
+def _bump_episode_ledger_line(episode_id: str, suppressed: int) -> None:
+    """Rewrite the episode's ledger line with the new ``suppressed`` count.
+
+    The ledger stays append-only for everything else; this is the ONE
+    in-place update, taken under the same sidecar lock
+    ``rl_telemetry_loss._rotate_and_append`` uses so a concurrent append or
+    rotation cannot interleave. Best-effort: if the line has rotated out of
+    the tail the count survives in the episode file and is simply not
+    visible in the ledger. Never raises.
+    """
+    try:
+        from vco_lib.atomic import atomic_write_text, exclusive_file_lock
+        from vco_lib.rl_telemetry_loss import loss_log_path
+
+        path = loss_log_path()
+        if not path.exists():
+            return
+        marker = f'"episode":"{episode_id}"'
+        with exclusive_file_lock(
+            path.with_name(path.name + ".lock"), timeout_s=_EPISODE_LOCK_TIMEOUT_S
+        ):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for i in range(len(lines) - 1, -1, -1):
+                if marker not in lines[i]:
+                    continue
+                try:
+                    rec = json.loads(lines[i])
+                except ValueError:
+                    return
+                rec["suppressed"] = suppressed
+                lines[i] = json.dumps(rec, separators=(",", ":"), default=str)
+                # One-home rule: no hand-rolled tmp+os.replace outside
+                # vco_lib.atomic. fsync stays on here — this rewrite is the
+                # ONLY place the ledger is edited in place.
+                atomic_write_text(path, "\n".join(lines) + "\n")
+                return
+    except Exception:  # noqa: BLE001
+        return
 
 
 def _reset_hub_down_bookkeeping_for_test() -> None:
-    """Reset the NB-06 coalescing state (tests share one process)."""
-    global _hub_down_active, _hub_down_suppressed
-    _hub_down_active = False
-    _hub_down_suppressed = 0
+    """Reset the hub-down episode state (tests share one state dir)."""
+    try:
+        path = _episode_state_path()
+        path.unlink(missing_ok=True)
+        path.with_name(path.name + ".lock").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _note_hub_contact() -> None:
-    """A hub POST succeeded — the hub-down episode is over (NB-06). The
-    suppressed count is kept so the next line can report it."""
-    global _hub_down_active
-    _hub_down_active = False
-
-
-def _record_hub_not_running(event: Any) -> None:
-    """Record ``hub_not_running`` at most once per process per episode (NB-06)."""
-    global _hub_down_active, _hub_down_suppressed
-    if _hub_down_active:
-        _hub_down_suppressed += 1
+    """The hub ANSWERED (a 2xx, or even a structured HTTP error) — the
+    hub-down episode is over (NB-06), cross-process (W3R-2): a short-lived
+    hook process ends the episode a long-lived MCP started, and vice versa.
+    The suppressed count was already reflected on the episode's own ledger
+    line by each in-place bump, so there is nothing to carry forward; the
+    count left in the state file is a tombstone the next episode overwrites."""
+    try:
+        if not _episode_state_path().exists():
+            return
+    except OSError:
         return
-    _hub_down_active = True
-    n = _hub_down_suppressed
-    _hub_down_suppressed = 0
-    _record_post_loss(event, "hub_not_running", **({"suppressed": n} if n else {}))
+
+    def _clear(state: dict) -> None:
+        state["active"] = False
+
+    _episode_update(_clear)
+
+
+def _record_hub_unreachable(event: Any, reason: str) -> None:
+    """Record one hub-unreachable loss, coalesced per episode ACROSS processes.
+
+    First failure of an episode → one ledger line tagged ``episode=<id>``;
+    a repeat while the episode is active → no new line, the episode's own
+    line gets its ``suppressed`` count bumped in place instead. On any
+    bookkeeping failure the line is written uncoalesced — an extra line
+    beats a lost one.
+    """
+
+    def _mutate(state: dict):
+        if state.get("active"):
+            state["suppressed"] = int(state.get("suppressed") or 0) + 1
+            return ("suppress", str(state.get("episode_id") or ""), state["suppressed"])
+        state["active"] = True
+        state["episode_id"] = f"{int(time.time() * 1000):x}-{os.getpid()}"
+        state["suppressed"] = 0
+        return ("record", state["episode_id"], 0)
+
+    ok, outcome = _episode_update(_mutate)
+    if not ok or outcome is None:
+        _record_post_loss(event, reason)
+        return
+    action, episode_id, suppressed = outcome
+    if action == "suppress":
+        if episode_id:
+            _bump_episode_ledger_line(episode_id, suppressed)
+        return
+    _record_post_loss(event, reason, episode=episode_id)
+
+
+# ---------------------------------------------------------------------------
+# Project-identity invalidation (v0.2.102, batch-8 review follow-up to W3R-9).
+# The RL identity cache lives in ``weaviate_mcp.rl_enrichment`` (which imports
+# this module, never the reverse), so the invalidation is a LAZY import at the
+# moment it is needed — the same pattern ``telemetry_emit._default_writer_
+# factory`` uses for its server import. (An import-time callback registration
+# was tried first; a test-suite ``importlib.reload`` of either module silently
+# dropped it.) When the hub rejects an event with 422 ``unknown_project_id``
+# (the rl_events FK fired — the project row backing a cached identity is
+# gone), the cached identity is dropped and the event is retried ONCE with
+# ``project_id=None`` so it lands (tagged with its project_name) instead of
+# being lost; the NEXT writer resolution re-resolves the config from the hub
+# and stamps the fresh identity.
+def _invalidate_cached_project_identity(project_id: str) -> None:
+    """Drop the cached RL writer identity carrying ``project_id`` (422
+    ``unknown_project_id``). Never raises."""
+    try:
+        from claude_mcp_servers.weaviate_mcp import rl_enrichment
+
+        rl_enrichment.invalidate_project_identity(project_id)
+    except Exception as exc:  # noqa: BLE001 — invalidation must never break a write path
+        logger.debug("project-id invalidation unavailable (%s)", exc)
+
+
+def _http_error_code(e: "urllib.error.HTTPError") -> str:
+    """The hub's structured ``error.code`` from an HTTPError body, or ""."""
+    try:
+        body = json.loads(e.read().decode("utf-8", "replace"))
+        return str(body.get("error", {}).get("code") or "")
+    except Exception:  # noqa: BLE001 — a non-JSON error body is just "no code"
+        return ""
+
+
+def _retry_without_project_id(
+    event: dict[str, Any], url: str, token: str, timeout: float
+) -> bool:
+    """ONE retry of a 422 ``unknown_project_id`` rejection with
+    ``project_id=None`` — the row lands (FK-safe) tagged by ``project_name``.
+    Returns True on 2xx, False otherwise (the caller records the loss)."""
+    retry_event = dict(event)
+    retry_event["project_id"] = None
+    try:
+        body = json.dumps(retry_event).encode("utf-8")
+    except (TypeError, ValueError):
+        return False
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except Exception:  # noqa: BLE001 — the caller records the loss
+        return False
 
 
 def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) -> bool:
@@ -246,7 +436,7 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
 
     token = _read_hub_token()
     if token is None:
-        _record_hub_not_running(event)
+        _record_hub_unreachable(event, "hub_not_running")
         return False
 
     port = _read_hub_port()
@@ -277,6 +467,10 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
                 if 200 <= resp.status < 300:
                     _note_hub_contact()
                     return True
+                # The hub ANSWERED (with a rejection) — it is up, so any
+                # hub-down episode is over. http_* lines are NOT coalesced:
+                # each is a distinct writer/hub rejection worth seeing.
+                _note_hub_contact()
                 _record_post_loss(event, f"http_{resp.status}")
                 return False
         except urllib.error.HTTPError as e:
@@ -290,6 +484,30 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
             # investigating; a 4xx/5xx otherwise signals a writer bug (e.g.
             # unknown event_type). Not retried: the same body gets the same
             # answer.
+            _note_hub_contact()
+            # W3R-9 follow-up (v0.2.102): 422 ``unknown_project_id`` means the
+            # rl_events FK fired — the project row behind a CACHED identity is
+            # gone. Drop the cached identity (the next emit re-resolves from
+            # the hub, which is up) and retry THIS event once with
+            # project_id=None so it lands instead of being lost.
+            if (
+                e.code == 422
+                and _http_error_code(e) == "unknown_project_id"
+                and isinstance(event, dict)
+                and event.get("project_id")
+            ):
+                _invalidate_cached_project_identity(str(event["project_id"]))
+                if _retry_without_project_id(event, url, token, timeout):
+                    _note_hub_contact()
+                    # Landed with degraded attribution (project_name kept,
+                    # project_id dropped): say so once per event so the
+                    # window is visible, never silent.
+                    logger.info(
+                        "rl-hub: cached project_id rejected (422 unknown_project_id); "
+                        "event %s re-posted without project_id",
+                        str(event.get("task_id", "?"))[:64],
+                    )
+                    return True
             _record_post_loss(event, f"http_{e.code}")
             return False
         except urllib.error.URLError as e:
@@ -297,17 +515,18 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
             # not up yet, or a respawn in flight): ONE bounded retry after a
             # short pause. Refused is the only case where the request provably
             # never reached the hub. A RESET may arrive after the hub already
-            # committed the INSERT (rl_events has no uniqueness), so retrying it
+            # committed the INSERT (rl_events dedupes only EXACT re-POSTs of
+            # the same (task_id, event_type, ts_ms) — W3R-7), so retrying it
             # could store the event twice and bias training (v0.2.100 W5R-06):
             # it is recorded as lost instead. Anything else (DNS, TLS, a timeout
             # wrapped in URLError) is not retried either.
             if attempt == 1 and isinstance(e.reason, ConnectionRefusedError):
                 time.sleep(_RETRY_PAUSE_S)
                 continue
-            _record_post_loss(event, _url_error_reason(e))
+            _record_hub_unreachable(event, _url_error_reason(e))
             return False
         except (OSError, TimeoutError) as exc:
-            _record_post_loss(
+            _record_hub_unreachable(
                 event, "timeout" if isinstance(exc, TimeoutError) else "os_error"
             )
             return False

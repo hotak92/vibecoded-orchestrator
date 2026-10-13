@@ -767,7 +767,7 @@ pub(crate) fn create_setup_phases(
             }
 
             // Phase 3: the V52-AF post-bundle pipeline (post-bundle populate,
-            // global-module enabled-seed, diagrams seed, codegraph spawn,
+            // global-module enabled-seed, codegraph spawn,
             // kg-sync spawn, kg-summary spawn, schema checks). Order is
             // LOAD-BEARING: it MUST run after install-bundle dropped the
             // analyzer / kg-sync / summary wrappers (the 2026-05-06
@@ -828,10 +828,14 @@ pub(crate) fn create_setup_phases(
 /// forensic trail from prior race-condition fixes:
 ///   1. populate_project_state_from_filesystem (post-bundle re-walk)
 ///   2. seed_enabled_rows_for_new_project (global modules → this project)
-///   3. set_project_module_enabled('diagrams', true) — opt-out default
-///   4. codegraph::spawn_initial_build — needs bundle's analyzer wrapper
-///   5. kg_sync::spawn_initial_sync — needs bundle's kg-sync wrapper
-///   6. kg_summary::spawn_initial_summary — needs bundle's summary script
+///   3. codegraph::spawn_initial_build — needs bundle's analyzer wrapper
+///   4. kg_sync::spawn_initial_sync — needs bundle's kg-sync wrapper
+///   5. kg_summary::spawn_initial_summary — needs bundle's summary script
+///
+/// (v0.2.102: the former step 3 — `set_project_module_enabled('diagrams',
+/// true)`, the diagrams opt-out default — was removed with the dropped
+/// diagrams integrations; the `project_modules` table stays for the
+/// generic module machinery.)
 ///
 /// Steps 4-6 each queue a `PENDING` row in launcher.db FIRST so the GUI
 /// can render an immediate "Queued" status while the background task
@@ -958,7 +962,7 @@ pub(crate) async fn apply_post_bundle_steps(
     // Soft-fail throughout: `seed_enabled_rows_for_new_project` logs
     // per-module failures and returns the success count. We audit the
     // count for forensic trace and continue regardless. Mirrors the
-    // soft-fail pattern of `set_project_module_enabled` below.
+    // soft-fail pattern of `module_enabled::set_project_module_enabled`.
     //
     // V52-AF (2026-06-09): also runs on update (AF-2 in the audit).
     // The seed is `INSERT OR IGNORE` so user-configured opt-outs
@@ -974,39 +978,21 @@ pub(crate) async fn apply_post_bundle_steps(
         );
     }
 
-    // Phase 1.1 (diagrams): seed the project-modules row for `diagrams`
-    // so the (Phase 1.5.7) conditional CLAUDE.md template renderer sees
-    // the module as active by default. The plan is opt-out — the user
-    // disables per-project via DiagramsTab → `set_project_module_enabled`
-    // (which flips `enabled` to 0; the row stays).
+    // v0.2.102 (owner ruling 2026-10-07): the `project_modules('diagrams')`
+    // seed that used to run here was removed with the dropped diagrams
+    // integrations — no shipped module is seeded default-active into
+    // `project_modules` any more. (Pre-v0.2.102 projects keep their row;
+    // it is user data and simply has no consumer left.)
     //
-    // ORDER MATTERS (mirrors the install-flow-architectural-overhaul
-    // 2026-05-06 race-condition rule): this MUST run AFTER
-    // `run_install_bundle` completes. The bundle install is allowed to
-    // drop files the conditional-block primitive expects to find; if we
-    // seeded earlier the renderer could race ahead and miss them.
-    //
-    // Soft-fail: a DB error on this insert is logged (cosmetic — the
-    // conditional CLAUDE.md section just won't render until the user
-    // re-toggles the module). Never propagated.
-    //
-    // V52-AF (2026-06-09): on UPDATE this step is a no-op when the
-    // user has previously disabled diagrams — `set_project_module_enabled`
-    // is an idempotent UPSERT that flips `enabled` back to 1 only if
-    // the row doesn't already exist with `enabled=0`. Audit recommendation
-    // AF-7 (G4.7) explicitly classified this as "no gap" because the
-    // update must not overwrite a user opt-out. Verified via
-    // `Db::set_project_module_enabled` (uses INSERT OR IGNORE pattern).
-    if let Err(e) = db.set_project_module_enabled(project_id, "diagrams", true) {
-        tracing::warn!(
-            "[vct] warning: could not seed project_modules('diagrams') for {}: {}",
-            project_id, e,
-        );
-        warnings.push(format!(
-            "seed project_modules('diagrams'): {} (CLAUDE.md diagrams section will not render until re-toggled)",
-            e
-        ));
-    }
+    // FORENSIC TRAIL (kept per the V52-AF load-bearing-comment rule):
+    // the seed ran AFTER `run_install_bundle` on purpose, mirroring the
+    // install-flow-architectural-overhaul 2026-05-06 race-condition
+    // rule — the bundle install was allowed to drop files the
+    // conditional-block primitive expected to find; seeding earlier let
+    // the renderer race ahead and miss them. On UPDATE the seed was a
+    // no-op when the user had previously disabled diagrams (INSERT OR
+    // IGNORE; audit AF-7/G4.7 classified overwriting a user opt-out as
+    // the defect to avoid).
 
     // Gap 2 (OSS launch 2026-05-12): kick off the initial code-graph
     // build in the background so `search_code_graph` returns useful
@@ -2110,8 +2096,8 @@ pub(crate) async fn run_install_bundle_update_with_root(
 /// guard a separate-process CLI race — `migrate_collections`'s top-of-call
 /// orphan-`__staging` recovery is the second line of defense for that).
 ///
-/// Mirrors the per-key in-process lock pattern used by `diagram_watcher.rs`
-/// (`LazyLock<Mutex<HashMap<...>>>`).
+/// Mirrors the per-key in-process lock pattern the (v0.2.102: deleted)
+/// `diagram_watcher.rs` used (`LazyLock<Mutex<HashMap<...>>>`).
 /// Try to claim the per-project migrate lock. `None` on contention (the
 /// caller soft-skips this cycle); the returned guard releases on drop.
 ///
@@ -3631,7 +3617,9 @@ pub async fn update_all_projects(
 ///
 /// Behaviour:
 ///   * Resolves the per-project Python interpreter via the same chain
-///     as `templates/hooks/pre-diagram-path-validation.sh`:
+///     `module_enabled::resolve_project_python` implements (documented
+///     until v0.2.102 by the deleted
+///     `templates/hooks/pre-diagram-path-validation.sh`):
 ///     `VCT_VENV` → `<VCT_INSTALL_ROOT>/.venv` →
 ///     `<VCT_INSTALL_ROOT>/claude_mcp_servers/.venv` → system `python3`.
 ///     Returns an `Err(String)` only when NO interpreter is reachable;
@@ -3803,7 +3791,9 @@ fn apply_project_env_via_python(
 }
 
 /// Resolve a Python interpreter that can `import vco_lib`. Mirrors the
-/// chain documented in `templates/hooks/pre-diagram-path-validation.sh`:
+/// chain `module_enabled::resolve_project_python` implements (documented
+/// until v0.2.102 by the deleted
+/// `templates/hooks/pre-diagram-path-validation.sh`):
 ///   1. `$VCT_VENV/bin/python` (POSIX) or `$VCT_VENV/Scripts/python.exe`
 ///      (Windows) — pinned by the launcher when it knows the venv.
 ///   2. `<VCT_INSTALL_ROOT>/.venv/bin/python` (POSIX) or
@@ -3822,7 +3812,7 @@ fn apply_project_env_via_python(
 /// embedded environment.
 ///
 /// Naming: the `_local` suffix historically differentiated this from the
-/// same-name helpers in `embedding_catalog.rs` / `embedding_enrichment.rs` /
+/// same-name helpers in `embedding_catalog.rs` / the v0.2.102-retired `embedding_enrichment.rs` /
 /// `codegraph_reanalyze.rs`. v0.2.77 hoisted the canonical ladder into
 /// `vct_launcher_core::python_resolve` (the "one home" for the RT-4 ladder);
 /// this is now a thin delegating shim kept only to avoid churning the many
@@ -3873,9 +3863,9 @@ fn resolve_python_for_vco_lib_local() -> Option<PathBuf> {
 ///   (`drop_owned_collections`, `apply_stale_derived_choice`,
 ///   `perform_hard_cut`) do their deleting INSIDE that child, so an
 ///   interpreter that cannot import `vco_lib` deletes nothing at all.
-/// * `embedding_slot_counts` (via `resolve_python_for_vco_lib_or` directly) —
-///   KEPT, and documented at that call site: a read-only count whose every
-///   other unresolvable condition already returns `SlotCounts::empty`.
+/// * (`embedding_slot_counts`, a read-only count that also used
+///   `resolve_python_for_vco_lib_or`, was retired in v0.2.102 W6-J with the
+///   per-project embedding picker's model-switch modal.)
 ///
 /// Cross-language pin: the Python half of the same ladder is
 /// `vco_lib/python_exe.py` (see its module docstring).
@@ -7403,7 +7393,6 @@ mod tests {
             &pid,
             "primary",
             "Acme_KnowledgeGraph",
-            Some("qwen3-embedding:0.6b"),
             Some(1024),
             None,
             None,
@@ -10690,95 +10679,17 @@ SHARED_KG_OPT_OUT=false\n"),
         );
     }
 
-    /// W-F5 (non-optional): the dry-run deferral warning is the rebuild-only
-    /// consent string (lockstep with the Python `why_deferred`), and the OLD
-    /// false framing is gone — neither the blanket "destructive migration was
-    /// NOT auto-applied" implication (additive is now applied) nor the
-    /// "drops the collection mid-swap" claim survives in this source file.
-    #[test]
-    fn migrate_warning_string_is_rebuild_only_consent_v0270() {
-        // The warning string spans multiple source lines via `\` line
-        // continuations, so collapse all runs of whitespace (including the
-        // backslash-newline-indent join artifacts) before substring-matching
-        // the semantic phrasing. Scope to the PRODUCTION portion of the file
-        // (before the `#[cfg(test)]` module) so the test's own assertion
-        // literals (which name the forbidden phrasing) don't false-match.
-        let raw = include_str!("projects_v2.rs");
-        let prod = match raw.find("#[cfg(test)]") {
-            Some(i) => &raw[..i],
-            None => raw,
-        };
-        let src: String = prod
-            .replace('\\', " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+    // W-F5 source gate: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_migrate_warning_string_is_rebuild_only_consent_v0270`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating. The Rust copy cut this file at a gated helper (~line 3895),
+    // leaving ~2,300 production lines unscanned, including the code after the test module.
 
-        // The new warning scopes consent to the rebuild action.
-        assert!(
-            src.contains("(`rebuild`) requires consent and was NOT auto-applied"),
-            "dry-run warning must scope consent to the rebuild action"
-        );
-        // v0.2.70 FIX-4: the additive-copy clause is still present in source,
-        // but it now lives in the CONDITIONAL `additive_clause` branch (only
-        // emitted when additive drift was actually auto-applied). Match
-        // case-insensitively since the clause now starts a sentence ("Additive
-        // `copy` ...") after the rebuild sentence's period.
-        assert!(
-            src.to_lowercase()
-                .contains("additive `copy` migrations are lossless and were applied automatically"),
-            "dry-run warning must still carry the additive-copy clause text"
-        );
-        // The old blanket phrasing ("THE destructive migration was NOT
-        // auto-applied") implied EVERYTHING defers — must be gone.
-        assert!(
-            !src.contains("the destructive migration was NOT auto-applied"),
-            "the old blanket 'destructive migration was NOT auto-applied' phrasing must be removed"
-        );
-        // The factually-false "copy drops the collection mid-swap" claim must
-        // never appear in this file either.
-        assert!(
-            !src.contains("drops the collection mid-swap"),
-            "the false 'copy drops the collection mid-swap' claim must not be present"
-        );
-    }
-
-    /// v0.2.70 FIX-4: the additive-copy "were applied automatically" clause is
-    /// gated on `auto_apply_additive` (= should_auto_apply_additive). It must
-    /// NOT be appended unconditionally — for a REBUILD-ONLY plan the predicate
-    /// is false, so the clause is empty and the toast no longer over-claims.
-    #[test]
-    fn migrate_additive_clause_is_conditional_on_auto_apply_v0270() {
-        let raw = include_str!("projects_v2.rs");
-        let prod = match raw.find("#[cfg(test)]") {
-            Some(i) => &raw[..i],
-            None => raw,
-        };
-        let src: String = prod
-            .replace('\\', " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        // The clause is selected via an `if auto_apply_additive { ... } else { "" }`.
-        assert!(
-            src.contains("let additive_clause = if auto_apply_additive"),
-            "the additive-copy clause must be gated on auto_apply_additive \
-             (conditional, not unconditional)"
-        );
-        // The empty-string else arm is what suppresses the over-claim on a
-        // rebuild-only plan.
-        assert!(
-            src.contains("} else { \"\" };"),
-            "the additive clause must fall back to an empty string when \
-             auto_apply_additive is false (rebuild-only plan)"
-        );
-        // And the wet apply reuses the SAME precomputed flag (no second
-        // should_auto_apply_additive recomputation in the Ok arm body).
-        assert!(
-            src.contains("if auto_apply_additive {"),
-            "the wet apply must reuse the precomputed auto_apply_additive flag"
-        );
-    }
+    // v0.2.70 FIX-4 source gate: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_migrate_additive_clause_is_conditional_on_auto_apply_v0270`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating. The Rust copy cut this file at a gated helper (~line 3895),
+    // leaving ~2,300 production lines unscanned, including the code after the test module.
 
     // v0.2.97: a failed post-flip env re-projection must reach the modal's
     // warning list — before, it lived only inside `post_flip.warnings`,

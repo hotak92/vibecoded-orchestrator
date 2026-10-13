@@ -172,9 +172,9 @@ def _start_stub_weaviate(
 
 _INSERT_BINDING_SQL = (
     "INSERT INTO project_kg_bindings "
-    "(project_id, role, collection_name, embedding_model, "
+    "(project_id, role, collection_name, "
     "embedding_dim, kg_dir_path, weaviate_url, config_json, "
-    "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)"
+    "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)"
 )
 
 
@@ -240,8 +240,10 @@ class CrossPrefixSelfHealTests(unittest.TestCase):
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
-        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
+        # WEAVIATE_URL / WEAVIATE_PORT set by the test are restored by
+        # `self._env_patch.stop()` above (mock.patch.dict restores the exact prior
+        # env). The old `os.environ.pop` here REMOVED the suite pin and let every
+        # later test resolve a live backend (v0.2.102 W6-B2 last round).
 
     def _set_weaviate_url(self, port: int) -> None:
         os.environ["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"

@@ -201,6 +201,17 @@ class RetiredRegistration:
             ``is_async`` argument). Callers that cannot tell pass ``None``
             and async-only rows do NOT match — no positive evidence, no
             removal.
+        group_matcher: (v0.2.102 W6-K) match ONLY registrations that sit in
+            a group whose ``matcher`` equals this value verbatim. For events
+            whose matcher selects a firing context (SessionStart's
+            ``startup`` / ``compact`` / ``resume``), retiring ONE context
+            must not touch the others: the v0.2.102 W6-F ``resume``
+            registration of ``compact-context-reinject`` was withdrawn
+            (owner 2026-10-11: a resumed chat already has CONTEXT_STATE in
+            context) while the ``startup`` and ``compact`` groups keep
+            firing. Callers that cannot see the group's matcher pass
+            ``None`` and scoped rows do NOT match — same conservative
+            no-evidence-no-removal rule as ``async_only``.
     """
 
     event: str
@@ -210,6 +221,7 @@ class RetiredRegistration:
     retired_in: str
     replacement: str
     async_only: bool = False
+    group_matcher: str = ""
 
     @property
     def audit_replacement(self) -> str:
@@ -217,20 +229,22 @@ class RetiredRegistration:
         return self.replacement or "nothing (the capability was removed)"
 
 
-#: The six scripts whose ASYNC PostToolUse registrations merged into the
-#: single ``post-tool-use-async`` dispatcher in v0.2.101 (the scripts keep
-#: shipping; the dispatcher routes to them). ONE list, three consumers: the
-#: retirement rows below, :func:`carry_parked_async_disables`, and — by
-#: derivation through the routing-table parity test — the dispatchers'
-#: ROUTE_TABLEs (tests/test_v02101_async_posttooluse_dispatcher.py pins the
-#: row set and the table stems to each other, so this list cannot drift
-#: from what the dispatcher actually routes).
+#: The five scripts whose ASYNC PostToolUse registrations merged into the
+#: single ``post-tool-use-async`` dispatcher in v0.2.101 and still ship (the
+#: dispatcher routes to them). ONE list, three consumers: the retirement
+#: rows below, :func:`carry_parked_async_disables`, and — by derivation
+#: through the routing-table parity test — the dispatchers' ROUTE_TABLEs
+#: (tests/test_v02101_async_posttooluse_dispatcher.py pins the row set and
+#: the table stems to each other, so this list cannot drift from what the
+#: dispatcher actually routes). ``post-file-delete`` was a sixth member until
+#: v0.2.102 deleted the script with the diagrams integrations — it keeps its
+#: OWN retirement rows below (retired_in ``v0.2.102``), which the parity
+#: test's ``retired_in == "v0.2.101"`` filter deliberately excludes.
 _ASYNC_MERGED_STEMS_V02101: Tuple[str, ...] = (
     "post-edit-outcome",
     "post-bash-context-record",
     "kg-summary-generator",
     "post-git-commit-kg-sync",
-    "post-file-delete",
     "kg-update-nudge",
 )
 
@@ -415,6 +429,153 @@ RETIRED_REGISTRATIONS: Tuple[RetiredRegistration, ...] = (
         for stem in _ASYNC_MERGED_STEMS_V02101
         for ext in ("sh", "ps1")
     ),
+    # ── the diagrams hooks, removed in v0.2.102 ────────────────────────────
+    #
+    # Owner ruling 2026-10-07: VCO drops the mermaid + excalidraw
+    # integrations entirely. Both hook SCRIPTS below are deleted from
+    # `templates/hooks/` in the same change, so the manifest reconcile
+    # removes the FILE from every project on the next bundle update —
+    # these rows remove the stale REGISTRATIONS that would otherwise be
+    # preserved forever as "the user's own hook" (the exact field failure
+    # mode this module was built for; see the docstring).
+    #
+    #   * `pre-diagram-path-validation` — a SYNC PreToolUse hook (two
+    #     registrations per template: matchers `Write|Edit` and
+    #     `mcp__mermaid__.*|mcp__excalidraw__.*`) that gated writes to
+    #     `.claude/diagrams/` paths. Not async_only: VCO shipped it only
+    #     as a synchronous registration, but a user's own variant under
+    #     another event is untouched by the event-scoped match anyway.
+    #   * `post-file-delete` — the diagram-delete cascade. Its whole
+    #     purpose was dropping `.mmd` / `.excalidraw` deletes across
+    #     SQLite + sidecar + Weaviate via `vco_lib.diagram_indexer`
+    #     (verified: no non-diagram behaviour to preserve). ASYNC-ONLY
+    #     (SF-3 shape): VCO shipped it under PostToolUse exclusively as
+    #     an async registration (pre-v0.2.101 directly, v0.2.101+ as a
+    #     dispatcher route), so only a positively-async registration
+    #     matches. The v0.2.101 dispatcher keeps shipping and simply no
+    #     longer routes to this stem.
+    RetiredRegistration(
+        event="PreToolUse",
+        kind=KIND_HOOK_SCRIPT,
+        target="pre-diagram-path-validation.sh",
+        reason=(
+            "the diagrams integrations (mermaid + excalidraw) were removed "
+            "in v0.2.102; the script no longer ships, so the registration "
+            "invokes a file the bundle update deletes"
+        ),
+        retired_in="v0.2.102",
+        replacement="",
+    ),
+    RetiredRegistration(
+        event="PreToolUse",
+        kind=KIND_HOOK_SCRIPT,
+        target="pre-diagram-path-validation.ps1",
+        reason=(
+            "the diagrams integrations (mermaid + excalidraw) were removed "
+            "in v0.2.102; the script no longer ships, so the registration "
+            "invokes a file the bundle update deletes"
+        ),
+        retired_in="v0.2.102",
+        replacement="",
+    ),
+    RetiredRegistration(
+        event="PostToolUse",
+        kind=KIND_HOOK_SCRIPT,
+        target="post-file-delete.sh",
+        reason=(
+            "the diagram-delete cascade hook was removed in v0.2.102 with "
+            "the diagrams integrations (async_only: a synchronous "
+            "registration of this script is the user's own and is never "
+            "matched); the script no longer ships and the dispatcher no "
+            "longer routes to it"
+        ),
+        retired_in="v0.2.102",
+        replacement="",
+        async_only=True,
+    ),
+    RetiredRegistration(
+        event="PostToolUse",
+        kind=KIND_HOOK_SCRIPT,
+        target="post-file-delete.ps1",
+        reason=(
+            "the diagram-delete cascade hook was removed in v0.2.102 with "
+            "the diagrams integrations (async_only: a synchronous "
+            "registration of this script is the user's own and is never "
+            "matched); the script no longer ships and the dispatcher no "
+            "longer routes to it"
+        ),
+        retired_in="v0.2.102",
+        replacement="",
+        async_only=True,
+    ),
+    # v0.2.102 W6-K (owner ruling 2026-10-11): the W6-F `resume`
+    # registration of the re-inject hook is withdrawn — a resumed chat
+    # already carries CONTEXT_STATE in its context, so re-injecting it
+    # duplicates the whole block. Matcher-scoped (group_matcher="resume"):
+    # the `startup` and `compact` groups of the SAME script keep firing, so
+    # this row must never match them.
+    RetiredRegistration(
+        event="SessionStart",
+        kind=KIND_HOOK_SCRIPT,
+        target="compact-context-reinject.sh",
+        reason=(
+            "the SessionStart `resume` re-inject registration was withdrawn "
+            "in v0.2.102 (owner 2026-10-11): a resumed chat already has "
+            "CONTEXT_STATE in context; only the startup and compact "
+            "groups keep firing"
+        ),
+        retired_in="v0.2.102",
+        replacement=(
+            "compact-context-reinject under the startup and compact "
+            "matchers (unchanged)"
+        ),
+        group_matcher="resume",
+    ),
+    RetiredRegistration(
+        event="SessionStart",
+        kind=KIND_HOOK_SCRIPT,
+        target="compact-context-reinject.ps1",
+        reason=(
+            "the SessionStart `resume` re-inject registration was withdrawn "
+            "in v0.2.102 (owner 2026-10-11): a resumed chat already has "
+            "CONTEXT_STATE in context; only the startup and compact "
+            "groups keep firing"
+        ),
+        retired_in="v0.2.102",
+        replacement=(
+            "compact-context-reinject under the startup and compact "
+            "matchers (unchanged)"
+        ),
+        group_matcher="resume",
+    ),
+    # v0.2.102 W6-C2 (census F9): `subagent-start-suggest` read the agent's
+    # launch prompt from the SubagentStart payload, which carries only
+    # session_id / agent_id / agent_type (probe 2026-10-13, Claude Code
+    # 2.1.285) — it exited on an empty prompt at every launch, so its
+    # promised suggestions never reached any subagent. SUPERSEDED: the same
+    # keyword matcher now runs on the PreToolUse(Agent) side, where the
+    # brief exists, and its suggestions ride the agent brief's
+    # `updatedInput` (hook_context_router.py, `agent` surface). The scripts
+    # no longer ship, so the registration would invoke a deleted file.
+    *(
+        RetiredRegistration(
+            event="SubagentStart",
+            kind=KIND_HOOK_SCRIPT,
+            target=f"subagent-start-suggest.{ext}",
+            reason=(
+                "the SubagentStart payload carries no launch prompt, so the "
+                "hook never produced a suggestion; the script no longer "
+                "ships"
+            ),
+            retired_in="v0.2.102",
+            replacement=(
+                "agent-brief-kg-inject (PreToolUse Agent|Task): the context "
+                "router appends the keyword matcher's agent/skill "
+                "suggestions to the brief it rewrites"
+            ),
+        )
+        for ext in ("sh", "ps1")
+    ),
 )
 
 
@@ -424,6 +585,7 @@ def match_retired_registration(
     *,
     hook_identity: Optional[str],
     is_async: Optional[bool] = None,
+    group_matcher: Optional[str] = None,
 ) -> Optional[RetiredRegistration]:
     """Return the retirement this ``(event, command)`` matches, or ``None``.
 
@@ -444,6 +606,11 @@ def match_retired_registration(
             ONLY on ``is_async is True``: no positive evidence, no removal.
             Callers WITH the evidence must pass it; omitting it silently
             degrades to the conservative leave-alone, never to a deletion.
+        group_matcher: (v0.2.102 W6-K) the matcher of the GROUP the
+            registration sits in, when the caller can see it (the scrub
+            walks groups); ``None`` when it cannot. Rows with a non-empty
+            ``group_matcher`` match ONLY on an exact equality — a scoped
+            retirement never fires on evidence the caller does not have.
 
     The walk is deliberately not re-implemented beside this table:
     :func:`vco_hook_script_identity` — the one home for "which token is the
@@ -464,6 +631,10 @@ def match_retired_registration(
             continue
         if entry.async_only and is_async is not True:
             continue  # SF-3: only a positively-async registration matches
+        if entry.group_matcher and group_matcher != entry.group_matcher:
+            continue  # W6-K: a matcher-scoped retirement needs the group's
+            # matcher as POSITIVE evidence — a caller that cannot see it
+            # leaves the registration alone (same rule as async_only).
         if entry.kind == KIND_HOOK_SCRIPT:
             if hook_identity and hook_identity == entry.target:
                 return entry
@@ -524,7 +695,10 @@ class PriorShippedShape:
     def matches(self, event: str, matcher: str, hook: Any) -> bool:
         """True when ``hook`` (an inner-hook dict under ``matcher`` in
         ``event``) IS this shipped shape. Never raises."""
-        if event != self.event or matcher != self.matcher:
+        # v0.2.102 W5-D: a group whose matcher the merge already widened
+        # (MATCHER_MIGRATIONS) still carries this shipped shape.
+        if event != self.event or matcher not in (
+                self.matcher, migrated_matcher(self.event, self.matcher, self.target)):
             return False
         if not isinstance(hook, dict):
             return False
@@ -600,12 +774,227 @@ def _v02101_reshape_rows() -> Tuple[PriorShippedShape, ...]:
     return tuple(rows)
 
 
+def _v02102_reshape_rows() -> Tuple[PriorShippedShape, ...]:
+    """The v0.2.102 W6-Q reshape, per OS flavour: ``worktree-guard`` under
+    ``WorktreeCreate`` (no matcher), ``{type, timeout 3}`` since v0.2.71.
+
+    v0.2.102 makes the hook build a snapshot commit of the working tree when
+    the repository has no commits yet (``git add -A`` through a throwaway
+    index), on top of the ``git worktree add`` checkout it always ran. A
+    harness kill at 3 s fails the create, and a failed WorktreeCreate means
+    the ``isolation: worktree`` agent cannot launch at all. The template
+    registration therefore carries NO ``timeout``: Claude Code's command-hook
+    default (600 s) applies, so a slow-but-working ``git worktree add`` on a
+    very large repository (including a lane reservation's, v0.2.102 W6-AA) is
+    never killed by a VCO-chosen bound (the hook only runs once per isolated
+    launch).
+    """
+    rows = []
+    flavours = (
+        ("sh", 'bash "${{CLAUDE_PROJECT_DIR:-.}}/.claude/hooks/{script}"'),
+        ("ps1", 'powershell -NoProfile -ExecutionPolicy Bypass -File '
+                '"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/{script}"'),
+    )
+    # v0.2.102 W6-C2 (census L1/L2/L5; owner ruling 2026-10-13 "never kill
+    # slow-but-working jobs"): three registrations whose explicit timeout
+    # could kill real work. The templates now carry NO timeout for them, so
+    # the harness default applies:
+    #   * subagent-stop-reconcile (SubagentStop, 2 s): the foreground now
+    #     only parses + hands the work to a detached job, but a 2 s bound
+    #     had killed the diff/reap/sync mid-run;
+    #   * subagent-start-kg-inject (SubagentStart, 5 s): the synchronous
+    #     shared-tree snapshot (up to 50 000 files) must finish before the
+    #     agent's first edit — a kill left the reconciler log-only;
+    #   * pre-compact-save (PreCompact, 5 s; group matcher `auto` before
+    #     W6-D's widening to `*`): `git status` + the recent-file walk on a
+    #     very large repository.
+    timeout_rows = (
+        ("SubagentStop", "", "subagent-stop-reconcile", 2, "through v0.2.101",
+         "a 2 s harness timeout killed the reconcile (snapshot diff, worktree "
+         "reap, KG sync) mid-run, losing its later steps and able to leave a "
+         "half-removed worktree"),
+        ("SubagentStart", "", "subagent-start-kg-inject", 5, "through v0.2.101",
+         "a 5 s harness timeout could kill the synchronous shared-tree "
+         "snapshot on a large tree or slow disk, leaving the SubagentStop "
+         "reconciler without its baseline"),
+        ("PreCompact", "auto", "pre-compact-save", 5, "through v0.2.101",
+         "a 5 s harness timeout could kill the pre-compaction snapshot "
+         "(`git status` + the recent-file walk) on a very large repository"),
+    )
+    for ext, cmd_fmt in flavours:
+        for event, matcher, stem, old_timeout, shipped, why in timeout_rows:
+            script = f"{stem}.{ext}"
+            rows.append(PriorShippedShape(
+                event=event, matcher=matcher, target=script,
+                command_key=hook_command_key(cmd_fmt.format(script=script)),
+                fields=(("timeout", old_timeout), ("type", "command")),
+                shipped=shipped,
+                retired_in="v0.2.102",
+                reason=why,
+                replacement=(
+                    f"the current template's {script} registration ({event}, "
+                    f"no explicit timeout: the harness default applies)"
+                ),
+            ))
+    for ext, cmd_fmt in flavours:
+        script = f"worktree-guard.{ext}"
+        rows.append(PriorShippedShape(
+            event="WorktreeCreate", matcher="", target=script,
+            command_key=hook_command_key(cmd_fmt.format(script=script)),
+            fields=(("timeout", 3), ("type", "command")),
+            shipped="v0.2.71–v0.2.101",
+            retired_in="v0.2.102",
+            reason=(
+                "a 3 s harness timeout can kill the worktree create (a "
+                "checkout, plus a working-tree snapshot in a repository with "
+                "no commits), and a failed create leaves the isolated agent "
+                "unlaunchable"
+            ),
+            replacement=(
+                f"the current template's {script} registration "
+                f"(WorktreeCreate, no explicit timeout: the harness default "
+                f"applies)"
+            ),
+        ))
+    return tuple(rows)
+
+
 #: The table. One row per (event, matcher, script) shape VCO shipped and
 #: has since reshaped. ``tests/test_v02101_settings_reshape.py`` pins every
 #: row to BOTH settings templates: the template must still ship the script
 #: under the row's matcher (else the row is dead), and its shape must differ
 #: from the row (else there is nothing to reshape).
-PRIOR_SHIPPED_SHAPES: Tuple[PriorShippedShape, ...] = _v02101_reshape_rows()
+PRIOR_SHIPPED_SHAPES: Tuple[PriorShippedShape, ...] = (
+    _v02101_reshape_rows() + _v02102_reshape_rows())
+
+
+# ── MIGRATED matchers (v0.2.102 W5-D) ──────────────────────────────────────
+#
+# A shipped hook whose registration keeps its script, command and keys but
+# whose GROUP MATCHER widened. v0.2.102 moves every shell-inspecting hook
+# from ``Bash`` to ``Bash|PowerShell``: Claude Code on Windows without Git
+# Bash has no Bash tool (the shell tool is ``PowerShell``), so a ``Bash``
+# registration never fires there (vendor hooks doc, "PowerShell" tool).
+# Neither table above can express that — the scrub needs a retired script,
+# a reshape row an exact old shape — and the supersede pass compares
+# commands only, so without this table an upgraded install would keep the
+# ``Bash`` group forever (and gain no PowerShell twin rules).
+
+
+@dataclass(frozen=True)
+class MatcherMigration:
+    """One group-matcher widening, as DATA.
+
+    Attributes:
+        event: the settings.json hook event.
+        old: the matcher VCO shipped the group under (verbatim).
+        new: the matcher the current template ships it under.
+        targets: the hook-script BASENAMES (both OS flavours) whose groups
+            move. A user group moves only when EVERY command in it is one
+            of these — a group that also carries the user's own hook is
+            theirs and is left exactly as it is.
+        retired_in: the release that widened the matcher.
+        reason: why, for readers of the table.
+    """
+
+    event: str
+    old: str
+    new: str
+    targets: frozenset
+    retired_in: str
+    reason: str
+
+
+def _matcher_migrations() -> Tuple[MatcherMigration, ...]:
+    reason = (
+        "Claude Code on Windows without Git Bash registers no Bash tool — "
+        "its shell tool is PowerShell — so a hook matched on Bash alone "
+        "never fired there; v0.2.102 matches Bash|PowerShell (vendor hooks "
+        "doc) and the decision modules read PowerShell syntax"
+    )
+
+    def both(*stems: str) -> frozenset:
+        return frozenset(f"{st}.{ext}" for st in stems for ext in ("sh", "ps1"))
+
+    return (
+        MatcherMigration(
+            event="PreToolUse", old="Bash", new="Bash|PowerShell",
+            # wait-guard is NOT here (review W5D-2): its Bash group keeps
+            # matcher Bash with its if rules, and the PowerShell tool gets a
+            # SEPARATE if-less `PowerShell` group, which the merge appends
+            # like any new registration.
+            targets=both("pre-vercel-token-guard", "pre-bash-context-inject"),
+            retired_in="v0.2.102", reason=reason),
+        MatcherMigration(
+            event="PostToolUse", old="Bash", new="Bash|PowerShell",
+            targets=both("post-bash-file-sync"),
+            retired_in="v0.2.102", reason=reason),
+        # v0.2.102 W6-D: PreCompact fires on BOTH triggers, but the `auto`
+        # matcher never matched a manual /compact -- so after every manual
+        # compact the reinject hook replayed a stale pre-compact snapshot
+        # (measured: three manual compacts re-injected a snapshot dated
+        # 2026-09-29). The vendor hooks doc gives PreCompact exactly two
+        # matcher values, `manual` and `auto`; an omitted or `*` matcher
+        # activates on every occurrence of the event.
+        MatcherMigration(
+            event="PreCompact", old="auto", new="*",
+            targets=both("pre-compact-save"),
+            retired_in="v0.2.102",
+            reason=(
+                "PreCompact has two matcher values, manual and auto (vendor "
+                "hooks doc); `auto` alone never fired on a manual /compact, "
+                "so the pre-compact snapshot went stale and the reinject "
+                "hook replayed it after every manual compaction"
+            )),
+    )
+
+
+#: The table. ``tests/test_v02102_powershell_hooks.py`` pins every row to
+#: BOTH settings templates (each target ships under ``new``, none under
+#: ``old``).
+MATCHER_MIGRATIONS: Tuple[MatcherMigration, ...] = _matcher_migrations()
+
+
+def migrated_matcher(event: str, matcher: str, target: Optional[str]) -> str:
+    """The matcher a ``(event, matcher, script)`` registration is migrated
+    to — ``matcher`` itself when no row covers it. Never raises."""
+    for row in MATCHER_MIGRATIONS:
+        if row.event == event and row.old == matcher and target in row.targets:
+            return row.new
+    return matcher
+
+
+def migrate_group_matcher(event: str, group: Any, template_matchers: Any) -> Optional[str]:
+    """The new matcher for a user ``group`` of ``event``, or ``None`` when it
+    must stay as it is.
+
+    Moves only when (a) a :data:`MATCHER_MIGRATIONS` row covers the group's
+    matcher, (b) EVERY inner hook is a command whose script identity is one
+    of the row's targets (a group carrying anything else is the user's),
+    and (c) ``template_matchers`` — identity → the matchers the CURRENT
+    template ships it under in this event — has each identity under the new
+    matcher (an older template is never "upgraded" past what it ships).
+    Never raises."""
+    if not isinstance(group, dict):
+        return None
+    matcher = group.get("matcher")
+    inner = group.get("hooks")
+    if not isinstance(matcher, str) or not isinstance(inner, list) or not inner:
+        return None
+    for row in MATCHER_MIGRATIONS:
+        if row.event != event or row.old != matcher:
+            continue
+        idents = []
+        for h in inner:
+            cmd = h.get("command") if isinstance(h, dict) else None
+            ident = vco_hook_script_identity(cmd) if isinstance(cmd, str) and cmd else None
+            if ident is None or ident not in row.targets:
+                idents = []
+                break
+            idents.append(ident)
+        if idents and all(row.new in (template_matchers.get(i) or ()) for i in idents):
+            return row.new
+    return None
 
 
 def match_prior_shipped_shape(
@@ -738,6 +1127,9 @@ def scrub_retired_registrations(user_hooks: dict) -> Tuple[dict, list]:
                         # SF-3: the scrub SEES the inner-hook dict, so the
                         # async-only rows get their positive evidence here.
                         is_async=None if not isinstance(_async, bool) else _async,
+                        # W6-K: the scrub walks GROUPS, so matcher-scoped
+                        # rows get their evidence here too.
+                        group_matcher=entry.get("matcher"),
                     )
                 if match is None:
                     kept_hooks.append(h)
@@ -983,10 +1375,7 @@ def _read_disabled_stems(folder: Path) -> Optional[list]:
         return []
     except OSError:
         return None
-    value: Optional[str] = None
-    for k, v in envfile.parse_env_lines(text):
-        if k == DISABLED_STEMS_ENV_KEY:
-            value = v
+    value = envfile.env_value(text, DISABLED_STEMS_ENV_KEY, last_wins=True)
     if not value:
         return []
     return [s.strip() for s in value.split(",") if s.strip()]
@@ -1378,6 +1767,8 @@ __all__ = [
     "DISABLED_STEMS_ENV_KEY",
     "KIND_COMMAND",
     "KIND_HOOK_SCRIPT",
+    "MATCHER_MIGRATIONS",
+    "MatcherMigration",
     "PRIOR_SHIPPED_SHAPES",
     "PriorShippedShape",
     "RETIRED_REGISTRATIONS",
@@ -1389,6 +1780,8 @@ __all__ = [
     "main",
     "match_prior_shipped_shape",
     "match_retired_registration",
+    "migrate_group_matcher",
+    "migrated_matcher",
     "normalize_command",
     "removal_envelope_rows",
     "scrub_retired_registrations",

@@ -157,6 +157,24 @@ use crate::secret_value_shape;
 #[cfg(not(target_os = "linux"))]
 use keyring::Entry;
 
+// v0.2.102 (review N2): the in-process pacing, cross-process flock pacing and
+// bounded keychain-worker machinery moved WHOLESALE to `secrets_worker` (pure
+// move, no behaviour change). The re-exports below keep every existing
+// `secrets::…` path — and this file's own call sites and tests — resolving;
+// `cross_process_pace` stays reachable for `test_serialize` and the tests.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(crate) use crate::secrets_worker::cross_process_pace;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub use crate::secrets_worker::TestPacePathGuard;
+#[cfg(any(test, debug_assertions))]
+pub use crate::secrets_worker::{
+    abandoned_keychain_worker_outstanding, TestKeychainTimeoutGuard, TestSpacingGuard,
+};
+pub use crate::secrets_worker::{is_keychain_unavailable_detail, KeychainTimeout};
+pub(crate) use crate::secrets_worker::{
+    paced_call, run_keychain_with_timeout, run_keychain_with_timeout_ctx, with_cross_process_pace,
+};
+
 const SERVICE_PREFIX: &str = "vct";
 
 /// The service-string prefix in force for the CURRENT thread.
@@ -426,6 +444,15 @@ struct MemoEntry {
 #[derive(Default)]
 struct SessionState {
     memo: std::collections::HashMap<(String, String), MemoEntry>,
+    /// v0.2.102: set when a read in this session failed because the keychain
+    /// was UNAVAILABLE (worker busy / op timed out / backend stuck) rather
+    /// than erroring — lets the hub answer `keychain_unavailable` (retry)
+    /// instead of `keychain_error`, and never a `key_not_active` miss. A
+    /// boolean only: no key name, no value.
+    unavailable: bool,
+    /// v0.2.102: the request's one definite lock-probe answer, reused by every
+    /// Background read in the session.
+    lock_probe: Option<Option<bool>>,
 }
 
 thread_local! {
@@ -474,6 +501,13 @@ impl SecretReadSession {
         }
     }
 
+    /// v0.2.102: did any read in THIS thread's active session fail because the
+    /// keychain was unavailable (busy / timed out / stuck)? `false` when no
+    /// session is active.
+    pub fn saw_unavailable() -> bool {
+        SECRET_SESSION.with(|cell| cell.borrow().as_ref().is_some_and(|s| s.unavailable))
+    }
+
     /// Test-only: how many distinct `(service, key)` entries this thread's
     /// active session has memoized. `None` when no session is active.
     #[cfg(any(test, debug_assertions))]
@@ -497,6 +531,33 @@ impl Drop for SecretReadSession {
             *cell.borrow_mut() = self.prev.take();
         });
     }
+}
+
+/// Record that a read in the active session hit keychain UNAVAILABILITY. No-op
+/// without an active session.
+fn session_note_unavailable() {
+    SECRET_SESSION.with(|cell| {
+        if let Some(session) = cell.borrow_mut().as_mut() {
+            session.unavailable = true;
+        }
+    });
+}
+
+/// The active session's stored lock-probe answer, if any (`None` = no session
+/// or not probed yet).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn session_lock_probe_get() -> Option<Option<bool>> {
+    SECRET_SESSION.with(|cell| cell.borrow().as_ref().and_then(|s| s.lock_probe))
+}
+
+/// Remember the request's lock-probe answer. No-op without a session.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn session_lock_probe_put(answer: Option<bool>) {
+    SECRET_SESSION.with(|cell| {
+        if let Some(session) = cell.borrow_mut().as_mut() {
+            session.lock_probe = Some(answer);
+        }
+    });
 }
 
 /// Look up `(service, key)` in the active session's memo, if any. Returns
@@ -544,6 +605,199 @@ fn session_memo_store(service: &str, key: &str, value: &Option<String>, read_gen
             );
         }
     });
+}
+
+
+// ─── Short cross-request value cache (v0.2.102 R1, owner 2026-10-07) ─────────
+//
+// The cache sits ABOVE the store switch in `get_with_context`: one lookup
+// before the store is consulted, one store after it answered — whether that
+// store is the OS keychain or the test mock. So the hermetic mock tests
+// exercise the production cache code, not a copy of it.
+
+/// Default lifetime of a cached resolved value: ~30 s (owner ruling: keep it
+/// simple — one map, fixed TTL, no sweeper, no persistence).
+const SECRET_VALUE_CACHE_TTL_SECS_DEFAULT: u64 = 30;
+
+// Thread-local (W6-P): a TTL pinned by one test never changes the cache
+// behaviour another concurrently running test observes.
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static TEST_VALUE_CACHE_TTL_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The value-cache TTL in force: the test override, else `VCT_HUB_SECRET_CACHE_SECS`
+/// (whole seconds; `0` DISABLES the cache), else the 30 s default. `None` = disabled.
+///
+/// While the test mock is the store on this thread and no TTL is pinned, the
+/// cache is OFF: the many mock tests that drive the store directly (one-shot
+/// read failures, unavailability, mid-read hooks) assume every read reaches
+/// it. A test that exercises the cache pins a TTL with
+/// [`TestValueCacheTtlGuard`] and then runs the very lookup/store code
+/// production runs.
+#[cfg(any(test, debug_assertions))]
+fn current_value_cache_ttl() -> Option<std::time::Duration> {
+    if let Some(ttl) = TEST_VALUE_CACHE_TTL_OVERRIDE.with(|c| c.get()) {
+        return (ttl.as_nanos() > 0).then_some(ttl);
+    }
+    if for_tests::mock_is_active() {
+        return None;
+    }
+    production_value_cache_ttl()
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn current_value_cache_ttl() -> Option<std::time::Duration> {
+    production_value_cache_ttl()
+}
+
+fn production_value_cache_ttl() -> Option<std::time::Duration> {
+    static TTL: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        match std::env::var("VCT_HUB_SECRET_CACHE_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) => (secs > 0).then(|| std::time::Duration::from_secs(secs)),
+                Err(_) => {
+                    tracing::debug!(
+                        value = %raw,
+                        "VCT_HUB_SECRET_CACHE_SECS is not a whole number of seconds —                          using the 30s default"
+                    );
+                    Some(std::time::Duration::from_secs(SECRET_VALUE_CACHE_TTL_SECS_DEFAULT))
+                }
+            },
+            Err(_) => Some(std::time::Duration::from_secs(SECRET_VALUE_CACHE_TTL_SECS_DEFAULT)),
+        }
+    })
+}
+
+/// Test-only RAII guard pinning the value-cache TTL for THIS thread (`0`
+/// disables). Restores the previous override on drop. Under the test mock the
+/// cache is active only while such a guard is held.
+#[cfg(any(test, debug_assertions))]
+pub struct TestValueCacheTtlGuard {
+    prev: Option<std::time::Duration>,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl TestValueCacheTtlGuard {
+    pub fn new(ttl: std::time::Duration) -> Self {
+        let prev = TEST_VALUE_CACHE_TTL_OVERRIDE.with(|c| c.replace(Some(ttl)));
+        Self { prev }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for TestValueCacheTtlGuard {
+    fn drop(&mut self) {
+        TEST_VALUE_CACHE_TTL_OVERRIDE.with(|c| c.set(self.prev));
+    }
+}
+
+/// One cached resolved value, tagged with the secret generation at which it
+/// was read (any successful `set`/`delete` bumps the generation, so a write
+/// anywhere invalidates every entry — a superset of "drop the written key",
+/// and the simplest correct rule).
+///
+/// The generation is PER-PROCESS: a write through this process (the hub's own
+/// `/env` writes, migrations) drops entries immediately; a change made through
+/// the launcher GUI (the launcher process) reaches the hub after at most the
+/// TTL. Pausing needs no invalidation at all — the active/paused gate is
+/// upstream of `get_with_context` and re-read on every request, so a paused
+/// key is never served from here, cached or not.
+struct SecretValueCacheEntry {
+    value: String,
+    fetched_at: std::time::Instant,
+    gen: u64,
+}
+
+/// THE cache: `(service, key)` → last resolved value. Process-wide, memory
+/// only, never persisted, never encrypted (owner 2026-10-07: the machine's
+/// user owns these secrets — the infrastructure protects values from AI
+/// agents reading/committing them, not from the local user). No background
+/// sweeper: an expired entry is dropped lazily when its key is next read.
+static SECRET_VALUE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String), SecretValueCacheEntry>>,
+> = std::sync::OnceLock::new();
+
+/// The one cache handle (`HashMap::new` is not `const`, hence the `OnceLock`).
+fn secret_value_cache(
+) -> &'static std::sync::Mutex<
+    std::collections::HashMap<(String, String), SecretValueCacheEntry>,
+> {
+    SECRET_VALUE_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(std::collections::HashMap::new())
+    })
+}
+
+/// The cache slot for `(service, key)` in the store currently answering reads.
+/// In production that is always the OS keychain, so the slot is the plain
+/// `(service, key)`. In test/debug builds a thread whose store is the test
+/// mock gets its own namespace (the mock is a per-thread store), so a value one
+/// thread's mock holds is never served to a thread reading the keychain or a
+/// different mock.
+fn value_cache_slot(service: &str, key: &str) -> (String, String) {
+    #[cfg(any(test, debug_assertions))]
+    if for_tests::mock_is_active() {
+        return (
+            format!("{}{}", for_tests::mock_value_cache_namespace(), service),
+            key.to_string(),
+        );
+    }
+    (service.to_string(), key.to_string())
+}
+
+/// Drop every value-cache entry whose slot starts with `namespace` (test seam:
+/// a mock store that is cleared or disabled takes its cached values with it).
+#[cfg(any(test, debug_assertions))]
+fn value_cache_forget_namespace(namespace: &str) {
+    if let Some(cache) = SECRET_VALUE_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(service, _), _| !service.starts_with(namespace));
+    }
+}
+
+/// Look up a still-fresh value. `None` when the cache is disabled, the key is
+/// absent, the entry expired, or a `set`/`delete` bumped the generation since
+/// it was stored (the stale entry is dropped on the spot).
+fn value_cache_lookup(service: &str, key: &str) -> Option<String> {
+    let ttl = current_value_cache_ttl()?;
+    let slot = value_cache_slot(service, key);
+    let mut cache = secret_value_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let fresh = |e: &SecretValueCacheEntry| {
+        e.gen == current_secret_generation() && e.fetched_at.elapsed() <= ttl
+    };
+    match cache.get(&slot) {
+        Some(e) if fresh(e) => Some(e.value.clone()),
+        Some(_) => {
+            cache.remove(&slot);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Store a SUCCESSFULLY resolved value (`Ok(Some(_))` only — misses and
+/// errors are never cached), tagged with the PRE-read generation snapshot so
+/// a write that raced the read invalidates the entry (same F2 rule the
+/// session memo obeys).
+fn value_cache_store(service: &str, key: &str, value: String, read_gen: u64) {
+    if current_value_cache_ttl().is_none() {
+        return;
+    }
+    secret_value_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            value_cache_slot(service, key),
+            SecretValueCacheEntry {
+                value,
+                fetched_at: std::time::Instant::now(),
+                gen: read_gen,
+            },
+        );
 }
 
 // v0.2.72 (P9) rationale (kept for the maintainer): `Entry::new` is itself a
@@ -694,11 +948,60 @@ pub fn probe_default_collection_locked() -> Option<bool> {
     if for_tests::mock_is_active() {
         return Some(false);
     }
+    // v0.2.102: inside a `SecretReadSession` (one hub `/env` request) the lock
+    // state is probed ONCE and reused by every read of that request. Before,
+    // each Background read ran its own probe as a separate worker job — one
+    // probe per KEY, ahead of the per-request memo — half of the worker load
+    // behind the hub keychain storm. Outside a session nothing changes.
+    if let Some(answer) = session_lock_probe_get() {
+        return answer;
+    }
     // Run the D-Bus property read on the bounded-timeout worker: a wedged
     // Secret Service must not hang the probe. A timeout / worker-stuck →
-    // UNKNOWN (None), the conservative "proceed as today" default.
-    run_keychain_with_timeout(probe_default_collection_locked_blocking).unwrap_or(None)
+    // UNKNOWN (None), the conservative "proceed as today" default; only a
+    // definite answer is kept for the rest of the request.
+    let answer =
+        run_keychain_with_timeout(probe_default_collection_locked_blocking).unwrap_or(None);
+    if answer.is_some() {
+        session_lock_probe_put(answer);
+    }
+    answer
 }
+
+/// Test-only: replace the probe's D-Bus BODY (not the whole probe, unlike
+/// `TestProbeGuard`) so the session reuse and the worker path still run.
+#[cfg(all(target_os = "linux", any(test, debug_assertions)))]
+static TEST_PROBE_BODY_OVERRIDE: std::sync::Mutex<Option<Option<bool>>> =
+    std::sync::Mutex::new(None);
+
+/// RAII guard for [`TEST_PROBE_BODY_OVERRIDE`].
+#[cfg(all(target_os = "linux", any(test, debug_assertions)))]
+pub struct TestProbeBodyGuard {
+    prev: Option<Option<bool>>,
+}
+
+#[cfg(all(target_os = "linux", any(test, debug_assertions)))]
+impl TestProbeBodyGuard {
+    pub fn new(answer: Option<bool>) -> Self {
+        let mut slot = TEST_PROBE_BODY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = *slot;
+        *slot = Some(answer);
+        Self { prev }
+    }
+}
+
+#[cfg(all(target_os = "linux", any(test, debug_assertions)))]
+impl Drop for TestProbeBodyGuard {
+    fn drop(&mut self) {
+        *TEST_PROBE_BODY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) = self.prev;
+    }
+}
+
+/// Test-only: number of REAL lock probes run (probes that reached the
+/// worker). Lets a test prove N Background reads cost one probe, not N.
+#[cfg(any(test, debug_assertions))]
+pub static LOCK_PROBE_RUNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// The blocking body of the Linux lock probe (runs on the worker thread).
 /// Separated so the timeout wrapper stays thin and the D-Bus calls are all in
@@ -715,6 +1018,15 @@ pub fn probe_default_collection_locked() -> Option<bool> {
 /// before.
 #[cfg(target_os = "linux")]
 fn probe_default_collection_locked_blocking() -> Option<bool> {
+    #[cfg(any(test, debug_assertions))]
+    LOCK_PROBE_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(any(test, debug_assertions))]
+    if let Some(forced) = *TEST_PROBE_BODY_OVERRIDE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+    {
+        return forced;
+    }
     // Preferred path: reuse the shared session. `Ok(Some/None)` is a definite
     // answer / UNKNOWN; `Err(_)` (shared connect or D-Bus failure) drops through
     // to the ephemeral fallback below.
@@ -846,779 +1158,6 @@ const BACKOFF_SCHEDULE: [std::time::Duration; 3] = [
     std::time::Duration::from_millis(1000),
 ];
 
-/// Minimum spacing between consecutive keychain calls, process-wide.
-/// 2026-05-13: introduced after a SIGTRAP crash of gnome-keyring under
-/// burst load. ~6.7 calls/sec is well below the threshold at which the
-/// daemon has been observed to crash and is invisible to any caller
-/// that doesn't burst (single-shot calls pay <1ms mutex acquisition).
-const MIN_CALL_SPACING: std::time::Duration = std::time::Duration::from_millis(150);
-
-/// Process-wide last-call timestamp. Updated by `paced_call` on every
-/// keychain hit. The `Mutex<Option<Instant>>` is initialised lazily on
-/// first call.
-static LAST_KEYRING_CALL: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
-
-/// Enforce a minimum inter-call spacing of `MIN_CALL_SPACING` and then
-/// run `f`. The mutex is held only long enough to read/update the
-/// timestamp — `f` runs OUTSIDE the lock so concurrent callers serialise
-/// on the spacing requirement, not on the closure body. The pacing is
-/// applied to every attempt inside `retry_with_backoff`, so a retry pays
-/// the 150ms gate again — that's intentional, the daemon needs the
-/// same minimum break before each request.
-///
-/// v0.2.84 (D8.3, release-gap fix): the last-call timestamp is recorded
-/// AFTER `f` COMPLETES, not before it. The pre-fix code stamped op-START,
-/// so an op that itself took ≥ `MIN_CALL_SPACING` (a slow daemon read)
-/// left ~0 idle gap between one op's END and the next op's START —
-/// sustained back-to-back daemon traffic under full pacing compliance,
-/// which is the load the P7 gnome-keyring SIGTRAP reproduced under. By
-/// stamping op-END, the NEXT call spaces off the previous op's COMPLETION
-/// so the daemon always sees ≥ `MIN_CALL_SPACING` of true idle between
-/// consecutive requests. The spacing VALUE is unchanged (150ms).
-///
-/// Test-visible: `MIN_CALL_SPACING` can be overridden inside `#[cfg(test)]`
-/// via `with_test_spacing` to keep the test suite fast. Production
-/// callers always pay the full 150ms.
-fn paced_call<T>(f: impl FnOnce() -> T) -> T {
-    let spacing = current_spacing();
-    {
-        // First lock acquisition: WAIT out the remaining spacing from the
-        // previous op's END. The wait happens under the lock so concurrent
-        // in-process callers serialise on the spacing requirement (contract
-        // unchanged). We deliberately do NOT stamp a start-time here — the
-        // stamp is written after `f` below (D8.3).
-        let last = LAST_KEYRING_CALL.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(prev) = *last {
-            let elapsed = prev.elapsed();
-            if elapsed < spacing {
-                std::thread::sleep(spacing - elapsed);
-            }
-        }
-    }
-    // `f` runs OUTSIDE the lock (contract unchanged — concurrent callers
-    // serialise on spacing, not on the closure body).
-    let result = f();
-    {
-        // Second (brief) acquisition: record the op's COMPLETION time so the
-        // NEXT call measures its idle gap from when THIS op finished, not
-        // when it started (D8.3). In production `paced_call` runs on the
-        // single-threaded keychain worker inside the held cross-process
-        // flock, so no concurrent writer races this update.
-        let mut last = LAST_KEYRING_CALL.lock().unwrap_or_else(|p| p.into_inner());
-        *last = Some(std::time::Instant::now());
-    }
-    result
-}
-
-#[cfg(any(test, debug_assertions))]
-static TEST_SPACING_OVERRIDE: std::sync::Mutex<Option<std::time::Duration>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(any(test, debug_assertions))]
-fn current_spacing() -> std::time::Duration {
-    TEST_SPACING_OVERRIDE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .unwrap_or(MIN_CALL_SPACING)
-}
-
-#[cfg(not(any(test, debug_assertions)))]
-fn current_spacing() -> std::time::Duration {
-    MIN_CALL_SPACING
-}
-
-/// Test-only RAII guard that swaps the pacing duration for the lifetime
-/// of the guard. Restores the previous value (usually `None` → production
-/// 150ms) on drop. Tests that exercise the rate-limit semantics use this
-/// to keep wall-clock cost low while still proving the contract.
-#[cfg(any(test, debug_assertions))]
-pub struct TestSpacingGuard {
-    prev: Option<std::time::Duration>,
-}
-
-#[cfg(any(test, debug_assertions))]
-impl TestSpacingGuard {
-    pub fn new(spacing: std::time::Duration) -> Self {
-        let mut slot = TEST_SPACING_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
-        let prev = *slot;
-        *slot = Some(spacing);
-        Self { prev }
-    }
-}
-
-#[cfg(any(test, debug_assertions))]
-impl Drop for TestSpacingGuard {
-    fn drop(&mut self) {
-        let mut slot = TEST_SPACING_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
-        *slot = self.prev;
-    }
-}
-
-/// Test-only RAII guard pinning the cross-process pace file to an isolated
-/// path (usually a `tempfile::TempDir` child) for the guard's lifetime.
-/// Restores the previous override on drop. Unix-only (the pace module is
-/// `cfg(unix)`).
-#[cfg(all(unix, any(test, debug_assertions)))]
-pub struct TestPacePathGuard {
-    prev: Option<std::path::PathBuf>,
-}
-
-#[cfg(all(unix, any(test, debug_assertions)))]
-impl TestPacePathGuard {
-    pub fn new(path: std::path::PathBuf) -> Self {
-        cross_process_pace::reset_warn_latch_for_test();
-        let prev = cross_process_pace::set_test_pace_path(Some(path));
-        Self { prev }
-    }
-    /// Read-back of the last-call timestamp the pace file holds (nanos).
-    pub fn pace_timestamp(&self) -> Option<u128> {
-        cross_process_pace::read_pace_timestamp_for_test()
-    }
-    /// How many degrade-warns were emitted since this guard reset the latch.
-    pub fn warn_count(&self) -> usize {
-        cross_process_pace::WARN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-#[cfg(all(unix, any(test, debug_assertions)))]
-impl Drop for TestPacePathGuard {
-    fn drop(&mut self) {
-        cross_process_pace::set_test_pace_path(self.prev.take());
-        cross_process_pace::reset_warn_latch_for_test();
-    }
-}
-
-// ─── Cross-PROCESS pacing (v0.2.82 WP-4a / G5), unix-only ─────────────────────
-//
-// `paced_call` above serializes keychain hits WITHIN one process. The G5
-// incident showed that's not enough: "Update all projects" runs the launcher
-// GUI + vct-hub (+ CLI + tests) as SEPARATE processes, each with its own
-// `LAST_KEYRING_CALL` pacer, so the daemon still saw a machine-level burst and
-// SIGTRAPed. This layer adds a kernel-level `flock(EXCLUSIVE)` on
-// `<vct_root>/keyring.pace` HELD ACROSS the keychain op, so at most ONE VCO
-// process touches gnome-keyring at a time machine-wide.
-//
-// Mechanics per call:
-//   1. flock(EXCLUSIVE) the pace file, bounded by `PACE_LOCK_ACQUIRE_DEADLINE`
-//      (LOCK_NB in a poll loop — NOT a blocking LOCK_EX; see the P0 note below).
-//   2. Read the last-call timestamp stored in the file; sleep any remaining
-//      `MIN_CALL_SPACING` (cross-process spacing, mirrors the in-process gate).
-//   3. Write the new timestamp.
-//   4. Run the op WHILE STILL HOLDING the lock (so no sibling process can
-//      interleave a concurrent daemon request).
-//   5. Drop the guard → flock(LOCK_UN). Crash-safety: the kernel releases the
-//      lock on process death, so a crashed holder never wedges the others.
-//
-// Fallbacks (each logs EXACTLY ONE warn, then degrades to in-process pacing =
-// today's behaviour):
-//   * pace file uncreatable (root dir unwritable) → per-process pacing only.
-//   * lock still held by a sibling VCO process after
-//     `PACE_LOCK_ACQUIRE_DEADLINE` → per-process pacing only.
-//   * non-unix (windows-native / apple-native have no crashy daemon) →
-//     per-process pacing only (the whole module is `cfg(unix)`; the
-//     `run_with_cross_process_pace` shim is a pass-through elsewhere).
-//
-// ─── Why the acquire is BOUNDED (P0 availability fix) ─────────────────────────
-//
-// Step 1 used to be a plain blocking `flock(fd, LOCK_EX)` justified by: "a held
-// keychain op is bounded by the caller's timeout worker, so the wait here is
-// bounded transitively." That justification was FALSE, and the failure it
-// allowed wedged the launcher AND the hub simultaneously with no self-heal:
-//
-//   * `KEYCHAIN_OP_TIMEOUT` bounds how long the CALLER waits for a result. It
-//     does NOT bound the op: `run_keychain_with_timeout` gives up on the
-//     result channel and returns `TimedOut`, but nothing cancels the job — the
-//     worker thread keeps running it, still holding this flock.
-//   * The op itself has no bound when it reaches an interactive unlock prompt.
-//     dbus-secret-service polls a prompt for `timeout.unwrap_or(ONE_YEAR)`
-//     seconds (`prompt.rs::execute_prompt`), and a human at a passphrase dialog
-//     is in any case slower than the 10s caller budget.
-//
-// So ONE unlock prompt parked the holder's single keychain worker while it held
-// this flock; every sibling VCO process then blocked FOREVER in step 1, its own
-// worker consumed, so every later keychain call in that process fast-failed
-// `WorkerStuck` permanently. Restarting the GUI did not help (it re-blocked on
-// the still-held flock); only killing the holder helped, because process death
-// is what released the lock.
-//
-// What is guaranteed NOW, and under which assumption:
-//   * GUARANTEED unconditionally: this acquire returns within
-//     `PACE_LOCK_ACQUIRE_DEADLINE`, so a waiter's worker thread is ALWAYS
-//     released — no cross-process wedge can outlive that deadline, whatever the
-//     holder is doing (prompt, wedged daemon, SIGSTOP).
-//   * ASSUMED (checkable, not inherited): that losing the lock costs only
-//     PACING, never correctness. That holds because the guard is inert data —
-//     `run_with_cross_process_pace` runs `op` identically with or without it,
-//     and only the completion STAMP is skipped when it is absent (we must not
-//     write the file we do not own). In-process `paced_call` still spaces this
-//     process's own calls. If a future change makes `op` depend on holding the
-//     guard, this deadline stops being safe and must be revisited.
-//
-// The `MIN_CALL_SPACING` test override (`with_test_spacing` / `TestSpacingGuard`)
-// extends here too via `current_spacing()`, so the suite stays fast.
-#[cfg(unix)]
-mod cross_process_pace {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::unix::io::AsRawFd;
-    use std::path::PathBuf;
-
-    /// Where the cross-process pace/lock file lives. One per user, alongside
-    /// the other launcher state (`hub.pid`, `hub.token`, …) so every VCO
-    /// process resolves the SAME path. Resolution reuses `paths::vct_root_dir`
-    /// (honours `VCT_STATE_DIR`), so a dev launcher and a prod launcher pace
-    /// against their own root — correct, since they hit distinct state but the
-    /// SAME OS keychain… note: the OS keychain is shared per-OS-user
-    /// regardless of VCT_STATE_DIR. To serialize against the daemon (not just
-    /// within one root) the lock path is intentionally NOT under vct_root when
-    /// an override is present for tests; production always uses vct_root.
-    fn pace_file_path() -> PathBuf {
-        // Test seam: let a test pin the pace file to an isolated temp path so
-        // it neither touches the user's real vct_root nor races with the
-        // process-global `VCT_STATE_DIR` env.
-        #[cfg(any(test, debug_assertions))]
-        if let Some(p) = test_pace_path_override() {
-            return p;
-        }
-        crate::paths::vct_root_dir().join("keyring.pace")
-    }
-
-    /// One-shot warn de-dup for the UNUSABLE-pace-file degrade: we emit that
-    /// warn at most once per process to avoid log spam on a persistently-
-    /// unwritable root. `false` → not yet warned.
-    static WARNED_ONCE_UNUSABLE: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
-    /// One-shot warn de-dup for the CONTENDED-lock degrade (the acquire
-    /// deadline fired). Deliberately a SEPARATE latch from
-    /// `WARNED_ONCE_UNUSABLE`: the two degrades have different causes and
-    /// different urgency, and a single shared latch would let an early,
-    /// benign, static "pace file uncreatable" warn permanently SWALLOW the
-    /// report of a real cross-process wedge — silently conflating "could not
-    /// acquire the lock" with "there was never a lock to acquire". Each cause
-    /// gets its own one-shot.
-    static WARNED_ONCE_CONTENDED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
-    /// Test-visible count of warns actually emitted (so T20 can assert
-    /// "exactly one warn" without scraping stderr). Incremented in lock-step
-    /// with the real `tracing::warn!`, for BOTH latches.
-    #[cfg(any(test, debug_assertions))]
-    pub(in crate::secrets) static WARN_COUNT: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
-
-    /// Emit `msg` at WARN exactly once per `latch`, counting it for tests.
-    fn warn_once_latched(latch: &std::sync::atomic::AtomicBool, msg: &str) {
-        if !latch.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            #[cfg(any(test, debug_assertions))]
-            WARN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            tracing::warn!("[vct-secrets] {msg}");
-        }
-    }
-
-    /// One-shot warn for "the pace file itself is unusable" (open/create
-    /// failed, or flock returned a hard error).
-    fn warn_once(msg: &str) {
-        warn_once_latched(&WARNED_ONCE_UNUSABLE, msg);
-    }
-
-    /// One-shot warn for "another VCO process still holds the pace lock past
-    /// the acquire deadline". Separate latch — see `WARNED_ONCE_CONTENDED`.
-    fn warn_once_contended(msg: &str) {
-        warn_once_latched(&WARNED_ONCE_CONTENDED, msg);
-    }
-
-    /// Test-only reset of BOTH one-shot warn latches (so consecutive test cases
-    /// each get a fresh "have we warned yet" state).
-    #[cfg(any(test, debug_assertions))]
-    pub(in crate::secrets) fn reset_warn_latch_for_test() {
-        WARNED_ONCE_UNUSABLE.store(false, std::sync::atomic::Ordering::SeqCst);
-        WARNED_ONCE_CONTENDED.store(false, std::sync::atomic::Ordering::SeqCst);
-        WARN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Upper bound on how long [`acquire_and_space`] waits for the exclusive
-    /// pace lock before degrading to in-process pacing.
-    ///
-    /// Chosen to sit BETWEEN the two timescales it has to separate:
-    ///   * ABOVE legitimate contention. A healthy holder keeps the lock for one
-    ///     `retry_with_backoff` chain — worst case 4 attempts × (150ms pacing +
-    ///     a ≤2s D-Bus call) + 1.3s of backoff ≈ 10s, and a realistic
-    ///     "Update all projects" burst queues a few seconds of short ops. 30s
-    ///     leaves ~3× headroom, so ordinary contention still WAITS and pacing
-    ///     is preserved — the G5 gnome-keyring SIGTRAP protection is not
-    ///     traded away for the common case.
-    ///   * BELOW human scale. The wedge this bounds is a holder parked on an
-    ///     interactive unlock prompt (or a hung daemon), which lasts tens of
-    ///     seconds to forever. 30s means a sibling process's keychain worker is
-    ///     released long before a person finishes at a passphrase dialog.
-    ///
-    /// Deliberately SHORTER than `SHARED_MAX_PROMPT_TIMEOUT_SECS` (the holder's
-    /// prompt bound, 120s): when a human really is typing, the right outcome is
-    /// that the SIBLING degrades to unpaced — which costs nothing real, since a
-    /// process sitting on a modal prompt is generating no daemon traffic to
-    /// pace against — rather than that the human gets cut off.
-    ///
-    /// Note this is NOT the "no global install timeout" rule's territory: that
-    /// rule forbids deadlines on WORK of unpredictable length. This bounds a
-    /// WAIT FOR A LOCK, where the fallback (proceed unpaced) is a documented,
-    /// correctness-preserving degrade.
-    const PACE_LOCK_ACQUIRE_DEADLINE: std::time::Duration =
-        std::time::Duration::from_secs(30);
-
-    /// Poll interval while waiting for the contended pace lock. `LOCK_NB` never
-    /// parks, so we sleep between attempts instead of busy-spinning. The
-    /// uncontended path never sleeps (the first attempt succeeds), and a
-    /// contended holder keeps the lock ≥ `MIN_CALL_SPACING` (150ms), so a 25ms
-    /// granularity adds no measurable latency while costing ≤1200 wakeups
-    /// across the full 30s deadline.
-    const PACE_LOCK_ACQUIRE_POLL: std::time::Duration =
-        std::time::Duration::from_millis(25);
-
-    #[cfg(any(test, debug_assertions))]
-    static TEST_PACE_DEADLINE: std::sync::Mutex<Option<std::time::Duration>> =
-        std::sync::Mutex::new(None);
-
-    #[cfg(any(test, debug_assertions))]
-    fn current_pace_lock_deadline() -> std::time::Duration {
-        TEST_PACE_DEADLINE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .unwrap_or(PACE_LOCK_ACQUIRE_DEADLINE)
-    }
-
-    #[cfg(not(any(test, debug_assertions)))]
-    fn current_pace_lock_deadline() -> std::time::Duration {
-        PACE_LOCK_ACQUIRE_DEADLINE
-    }
-
-    /// Test-only RAII guard shortening the pace-lock acquire deadline so the
-    /// contention tests run in milliseconds instead of 30s. Restores the
-    /// previous value on drop.
-    ///
-    /// `#[cfg(test)]`, not `any(test, debug_assertions)`: the only callers are
-    /// this file's tests, so a plain debug build would report it dead. The READ
-    /// side (`TEST_PACE_DEADLINE` / `current_pace_lock_deadline`) stays
-    /// `any(test, debug_assertions)` so a debug build still compiles — it just
-    /// always observes `None`, i.e. exactly the production deadline.
-    #[cfg(test)]
-    pub(in crate::secrets) struct TestPaceDeadlineGuard {
-        prev: Option<std::time::Duration>,
-    }
-
-    #[cfg(test)]
-    impl TestPaceDeadlineGuard {
-        pub(in crate::secrets) fn new(deadline: std::time::Duration) -> Self {
-            let mut slot = TEST_PACE_DEADLINE.lock().unwrap_or_else(|p| p.into_inner());
-            let prev = std::mem::replace(&mut *slot, Some(deadline));
-            Self { prev }
-        }
-    }
-
-    #[cfg(test)]
-    impl Drop for TestPaceDeadlineGuard {
-        fn drop(&mut self) {
-            let mut slot = TEST_PACE_DEADLINE.lock().unwrap_or_else(|p| p.into_inner());
-            *slot = self.prev.take();
-        }
-    }
-
-    /// Outcome of a bounded exclusive-flock acquire. Three states, deliberately
-    /// distinct: "I own it", "someone else still owns it" and "the lock itself
-    /// is broken" are different facts and the caller warns differently for each.
-    /// Collapsing `Contended` into `Failed` would report a healthy-but-busy
-    /// sibling as a broken pace file.
-    #[derive(Debug)]
-    pub(in crate::secrets) enum FlockAcquire {
-        /// `fd` now holds LOCK_EX. Caller owns the unlock.
-        Acquired,
-        /// Still held by another open file description when the deadline
-        /// expired. Nothing was acquired; there is nothing to unlock.
-        Contended,
-        /// `flock` returned a real error (EBADF / EINVAL / ENOLCK …). Carries
-        /// the OS error for the warn message.
-        Failed(std::io::Error),
-    }
-
-    /// Take LOCK_EX on `fd`, waiting at most `deadline`.
-    ///
-    /// SSOT for every exclusive pace-lock acquire in this module (the runtime
-    /// path and the test-harness holder both call it), so the bound cannot
-    /// regress on one path while the other keeps it — and so the unit tests
-    /// that drive this function cover both call sites.
-    ///
-    /// Uses `LOCK_EX | LOCK_NB` in a poll loop rather than a blocking `LOCK_EX`
-    /// precisely because a blocking acquire is uninterruptible from user space:
-    /// once parked there is no deadline, no signal handling, and no way to give
-    /// up — which is how one held lock turned into a permanent two-process
-    /// wedge (see the module header). `EINTR` retries immediately (a signal is
-    /// not contention) but still respects the same deadline.
-    pub(in crate::secrets) fn flock_exclusive_within(
-        fd: std::os::unix::io::RawFd,
-        deadline: std::time::Duration,
-        poll: std::time::Duration,
-    ) -> FlockAcquire {
-        let start = std::time::Instant::now();
-        loop {
-            let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-            if rc == 0 {
-                return FlockAcquire::Acquired;
-            }
-            let err = std::io::Error::last_os_error();
-            let code = err.raw_os_error().unwrap_or(0);
-            let interrupted = code == libc::EINTR;
-            if !interrupted && code != libc::EWOULDBLOCK && code != libc::EAGAIN {
-                // A genuine flock failure (bad fd, no lock support on this fs).
-                return FlockAcquire::Failed(err);
-            }
-            // Held by someone else (or we were signalled). Either way we are
-            // still waiting — and the DEADLINE APPLIES TO BOTH. An `EINTR`
-            // fast-path that skipped this check would be an unbounded spin
-            // under a signal storm: the very shape being removed here. (In
-            // practice `LOCK_NB` has nothing to interrupt, but "shouldn't
-            // happen in practice" is what the previous comment on this code
-            // assumed, and it was wrong.)
-            if start.elapsed() >= deadline {
-                return FlockAcquire::Contended;
-            }
-            // Retry immediately after a signal (no contention was observed);
-            // back off politely when the lock is genuinely held.
-            if !interrupted {
-                std::thread::sleep(poll);
-            }
-        }
-    }
-
-    #[cfg(any(test, debug_assertions))]
-    static TEST_PACE_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-
-    #[cfg(any(test, debug_assertions))]
-    fn test_pace_path_override() -> Option<PathBuf> {
-        TEST_PACE_PATH.lock().unwrap_or_else(|p| p.into_inner()).clone()
-    }
-
-    /// Test-only: pin the pace file path (RAII via [`super::TestPacePathGuard`]).
-    #[cfg(any(test, debug_assertions))]
-    pub(in crate::secrets) fn set_test_pace_path(p: Option<PathBuf>) -> Option<PathBuf> {
-        let mut slot = TEST_PACE_PATH.lock().unwrap_or_else(|p| p.into_inner());
-        std::mem::replace(&mut *slot, p)
-    }
-
-    /// Test-only: read back the stored last-call timestamp (nanos) from the
-    /// pace file, so T20 can assert two paced calls wrote monotonic stamps.
-    #[cfg(any(test, debug_assertions))]
-    pub(in crate::secrets) fn read_pace_timestamp_for_test() -> Option<u128> {
-        let path = pace_file_path();
-        std::fs::read_to_string(path).ok()?.trim().parse::<u128>().ok()
-    }
-
-    /// RAII holder of the exclusive cross-process file lock. Dropping releases
-    /// it (explicit LOCK_UN, kernel also releases on close/death). The `_file`
-    /// handle is held only to keep `fd` valid for the guard's lifetime — the
-    /// fd is a borrow of it (mirrors `test_serialize::file_lock::FileLock`).
-    struct PaceLock {
-        _file: std::fs::File,
-        fd: std::os::unix::io::RawFd,
-    }
-
-    impl Drop for PaceLock {
-        fn drop(&mut self) {
-            unsafe {
-                libc::flock(self.fd, libc::LOCK_UN);
-            }
-        }
-    }
-
-    impl PaceLock {
-        /// Stamp the pace file with the CURRENT time (nanos since the UNIX
-        /// epoch), overwriting the previous value. Called by
-        /// `run_with_cross_process_pace` AFTER the keychain op completes, while
-        /// the flock is STILL HELD, so the next process (which reads this stamp
-        /// under its own flock acquisition) spaces off when WE FINISHED the op
-        /// — a true daemon idle gap between one op's END and the next op's
-        /// START (v0.2.84 D8.3). The pre-fix code stamped op-START inside
-        /// `acquire_and_space`, so a slow op (≥ spacing) left ~0 gap.
-        fn record_completion_timestamp(&mut self) {
-            if let Ok(since_epoch) =
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            {
-                let _ = self._file.seek(SeekFrom::Start(0));
-                let _ = self._file.set_len(0);
-                let _ = write!(self._file, "{}", since_epoch.as_nanos());
-                let _ = self._file.flush();
-            }
-        }
-    }
-
-    /// T-1 (v0.2.83), TEST/DEBUG ONLY: set true while a keychain test holds the
-    /// production `keyring.pace` flock via `test_serialize::keychain_serialize_lock`.
-    /// `acquire_and_space` then SKIPS re-acquiring the (non-reentrant) flock so a
-    /// test that holds the lock AND calls the real `secrets::set` — which runs
-    /// `with_cross_process_pace` on the worker thread — does NOT deadlock against
-    /// its own held lock. Compiled out entirely in release builds (the whole
-    /// `if` below is `#[cfg(any(test, debug_assertions))]`), so PRODUCTION paths
-    /// are byte-identical to pre-T-1.
-    #[cfg(any(test, debug_assertions))]
-    pub(in crate::secrets) static TEST_HOLDS_PRODUCTION_PACE:
-        std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-    /// Acquire the exclusive lock and enforce cross-process spacing. Returns
-    /// the held lock guard on success, or `None` when we could not take the
-    /// lock — the pace file is uncreatable, `flock` failed outright, or another
-    /// VCO process still held it at `PACE_LOCK_ACQUIRE_DEADLINE`. The caller
-    /// then degrades to in-process pacing.
-    ///
-    /// `None` is a SUPPORTED degrade, not an error path: it costs cross-process
-    /// PACING only. `run_with_cross_process_pace` runs the op identically
-    /// either way, and the only other effect is that the completion stamp is
-    /// skipped — correctly, since a process that does not hold the lock must
-    /// not write the file another process is reading under it.
-    ///
-    /// `spacing` is threaded in (not read from the parent module directly) so
-    /// the test override applies identically to the cross-process gate.
-    fn acquire_and_space(spacing: std::time::Duration) -> Option<PaceLock> {
-        let path = pace_file_path();
-        // T-1 reentrancy skip (test/debug only; compiled out in release). If a
-        // keychain test already holds the production pace flock (via
-        // `keychain_serialize_lock`) AND this call resolves to the SAME real
-        // production file, re-acquiring it here (on the worker thread, a
-        // different fd) would block forever — flock is not reentrant across fds.
-        // Skip only in that exact case: a test that pins the pace path to its own
-        // temp file (`TestPacePathGuard`) is exercising the REAL pacing on an
-        // ISOLATED file and must NOT be skipped (no deadlock — different file).
-        #[cfg(any(test, debug_assertions))]
-        if TEST_HOLDS_PRODUCTION_PACE.load(std::sync::atomic::Ordering::SeqCst)
-            && test_pace_path_override().is_none()
-        {
-            return None;
-        }
-        // The pace file lives under vct_root; create the dir if absent so a
-        // fresh install (root not yet mkdir'd) still paces rather than warning.
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut file = match std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                warn_once(&format!(
-                    "cannot open keyring pace file {path:?}: {e} — cross-process \
-                     keyring pacing disabled (in-process pacing still active)"
-                ));
-                return None;
-            }
-        };
-        let fd = file.as_raw_fd();
-        // BOUNDED exclusive acquire (P0). What this guarantees: we return
-        // within `deadline` no matter what the current holder is doing — the
-        // calling keychain worker thread is therefore always released, so one
-        // process parked on an unlock prompt can never wedge another. What it
-        // does NOT guarantee: that we got the lock. On expiry we degrade to
-        // in-process pacing, which is safe ONLY because the guard is inert
-        // data (see the module header's "what is guaranteed NOW" note) — a
-        // future change that makes `op` depend on holding it invalidates this.
-        //
-        // A blocking `LOCK_EX` here was the wedge: it cannot be deadlined from
-        // user space, and the comment that justified it ("bounded transitively
-        // by the caller's timeout worker") confused the CALLER's 10s wait for
-        // a result with a bound on the OP — `run_keychain_with_timeout` gives
-        // up on the channel but never cancels the job, so the holder kept this
-        // lock for as long as its prompt stayed open.
-        let deadline = current_pace_lock_deadline();
-        match flock_exclusive_within(fd, deadline, PACE_LOCK_ACQUIRE_POLL) {
-            FlockAcquire::Acquired => {}
-            FlockAcquire::Contended => {
-                // NOT "nothing to pace" — we know a sibling VCO process holds
-                // the lock and we chose to give up waiting. Say exactly that,
-                // on its own one-shot latch so this can never be swallowed by
-                // an earlier unrelated degrade warn.
-                warn_once_contended(&format!(
-                    "another VCO process has held the keyring pace lock \
-                     {path:?} for more than {}s (typically a keychain unlock \
-                     prompt awaiting the user, or a wedged Secret Service) — \
-                     proceeding WITHOUT cross-process pacing for this \
-                     operation so this process is not blocked (in-process \
-                     pacing still active). This warns once per process.",
-                    deadline.as_secs_f32()
-                ));
-                return None;
-            }
-            FlockAcquire::Failed(err) => {
-                warn_once(&format!(
-                    "flock(LOCK_EX) failed on {path:?}: {err} — cross-process \
-                     keyring pacing disabled (in-process pacing still active)"
-                ));
-                return None;
-            }
-        }
-        // We do all I/O on the ORIGINAL `file` (whose fd `fd` we locked), then
-        // MOVE it into the guard so the very fd holding the flock stays open
-        // for the guard's whole lifetime and `Drop` LOCK_UNs that same fd.
-        // (A dup'd clone would share the lock but leave `Drop` unlocking a
-        // closed fd — a silent no-op — so we deliberately don't clone.)
-        //
-        // Read the stored last-call timestamp (nanos since the UNIX epoch, a
-        // process-shared reference) and sleep the remaining spacing.
-        let now = std::time::SystemTime::now();
-        let mut buf = String::new();
-        let _ = file.seek(SeekFrom::Start(0));
-        if file.read_to_string(&mut buf).is_ok() {
-            if let Ok(prev_nanos) = buf.trim().parse::<u128>() {
-                if let Ok(now_since_epoch) = now.duration_since(std::time::UNIX_EPOCH) {
-                    let now_nanos = now_since_epoch.as_nanos();
-                    if now_nanos > prev_nanos {
-                        let elapsed = std::time::Duration::from_nanos(
-                            (now_nanos - prev_nanos).min(u64::MAX as u128) as u64,
-                        );
-                        if elapsed < spacing {
-                            std::thread::sleep(spacing - elapsed);
-                        }
-                    }
-                    // If now <= prev (clock skew / same instant), fall through:
-                    // the completion stamp written after the op (below) still
-                    // records a fresh timestamp, spacing best-effort.
-                }
-            }
-        }
-        // v0.2.84 (D8.3): we DELIBERATELY do NOT write a timestamp here. The
-        // pre-fix code stamped op-START at this point, which — for an op that
-        // itself took ≥ MIN_CALL_SPACING — left ~0 idle gap between one op's
-        // END and the next op's START. The stamp is now written by
-        // `run_with_cross_process_pace` AFTER the op completes (op-END), while
-        // this same flock is still held, via `PaceLock::record_completion_timestamp`.
-        Some(PaceLock { _file: file, fd })
-    }
-
-    /// Run `op` under the cross-process pace/lock. The lock is HELD for the
-    /// whole `op` so no sibling VCO process interleaves a concurrent daemon
-    /// request. When the lock could not be taken — file unusable, flock error,
-    /// or a sibling still holding it at the acquire deadline — `op` still runs
-    /// (degraded to in-process pacing): a soft-fail, never a hard block on the
-    /// user's secret read, and never a skipped or repeated op. The op runs
-    /// EXACTLY ONCE and its value is returned verbatim on both paths; the only
-    /// difference is that the degraded path writes no completion stamp,
-    /// because we do not own the file.
-    pub(super) fn run_with_cross_process_pace<T>(op: impl FnOnce() -> T) -> T {
-        let spacing = super::current_spacing();
-        // Hold the guard across `op`; drop (unlock) after.
-        let mut guard = acquire_and_space(spacing);
-        let result = op();
-        // v0.2.84 (D8.3): stamp the pace file with the op's COMPLETION time
-        // WHILE the flock is still held, so the next process spaces off when we
-        // FINISHED (true daemon idle gap), not when we started. On the degraded
-        // path (`acquire_and_space` returned `None` — unwritable pace file or
-        // the T-1 reentrancy skip) there is no stamp to write; in-process
-        // pacing carries the gap (unchanged soft-fail behaviour).
-        if let Some(g) = guard.as_mut() {
-            g.record_completion_timestamp();
-        }
-        // `guard` drops here → flock(LOCK_UN), after the completion stamp.
-        result
-    }
-
-    /// T-1 (v0.2.83), TEST/DEBUG ONLY: RAII holder of the PRODUCTION
-    /// `<vct_root>/keyring.pace` flock for a keychain test's whole lifetime, so a
-    /// `cargo test --workspace` process serializes against a RUNNING launcher
-    /// (which paces on that SAME file via `run_with_cross_process_pace`) — the
-    /// live-launcher-vs-test race that flaked `github_pat_keychain_tests`.
-    ///
-    /// While held, `TEST_HOLDS_PRODUCTION_PACE` is set so the test's OWN real
-    /// `secrets::set` (which runs `acquire_and_space` on the worker thread) skips
-    /// re-acquiring the non-reentrant flock instead of self-deadlocking. Drop
-    /// clears the flag and releases the flock (kernel also releases on close).
-    ///
-    /// Returns `None` on any flock failure (unwritable root / no flock support)
-    /// AND when a live launcher still holds the production lock at
-    /// `PACE_LOCK_ACQUIRE_DEADLINE` — the caller degrades to the test lockfile
-    /// + in-process serialization (pre-T-1 behaviour; a soft degrade, never a
-    /// block, and never an unbounded hang).
-    #[cfg(any(test, debug_assertions))]
-    pub(in crate::secrets) struct TestProductionPaceGuard {
-        _lock: PaceLock,
-    }
-
-    #[cfg(any(test, debug_assertions))]
-    impl Drop for TestProductionPaceGuard {
-        fn drop(&mut self) {
-            // Clear the reentrancy flag FIRST, then `_lock`'s Drop LOCK_UNs.
-            TEST_HOLDS_PRODUCTION_PACE
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    #[cfg(any(test, debug_assertions))]
-    pub(in crate::secrets) fn acquire_production_pace_lock_for_test(
-    ) -> Option<TestProductionPaceGuard> {
-        use std::os::unix::io::AsRawFd;
-        // The REAL production pace path (bypass any test path override — the
-        // live launcher only ever locks this file).
-        let path = crate::paths::vct_root_dir().join("keyring.pace");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .ok()?;
-        let fd = file.as_raw_fd();
-        // BOUNDED exclusive lock via the SAME acquire SSOT the launcher's
-        // `acquire_and_space` uses, so we queue behind its held-lock windows
-        // but — like it — give up rather than park forever. This path had the
-        // identical blocking-`LOCK_EX` defect: a `cargo test` run started while
-        // a live launcher sat on an unlock prompt would hang here with no
-        // deadline and no output. `Contended` / `Failed` both degrade to the
-        // documented `None` (test lockfile + in-process serialization only).
-        match flock_exclusive_within(
-            fd,
-            current_pace_lock_deadline(),
-            PACE_LOCK_ACQUIRE_POLL,
-        ) {
-            FlockAcquire::Acquired => {}
-            FlockAcquire::Contended | FlockAcquire::Failed(_) => return None,
-        }
-        // Now that WE hold it, set the flag so this process's nested
-        // `acquire_and_space` (the test's own `set`) skips re-acquisition.
-        TEST_HOLDS_PRODUCTION_PACE.store(true, std::sync::atomic::Ordering::SeqCst);
-        Some(TestProductionPaceGuard {
-            _lock: PaceLock { _file: file, fd },
-        })
-    }
-}
-
-/// Cross-process pacing shim. On unix, serializes the keychain op across ALL
-/// VCO processes via a held flock (see `cross_process_pace`). On non-unix it's
-/// a pass-through (those platforms lack the crashy daemon). Called from inside
-/// the bounded-timeout worker, wrapping the full `retry_with_backoff` op.
-///
-/// CORRECTION (P0): this used to claim "so a wedged flock or op is still
-/// bounded by `KEYCHAIN_OP_TIMEOUT`". It is not. `KEYCHAIN_OP_TIMEOUT` bounds
-/// how long the CALLER waits on the result channel; `run_keychain_with_timeout`
-/// abandons the result but never cancels the job, so a wedged flock or op keeps
-/// running on the worker thread — which is exactly how a single held lock
-/// wedged two processes indefinitely. What actually bounds the worker is the
-/// acquire deadline inside `cross_process_pace` (30s) plus, on Linux, the
-/// Secret-Service prompt bound (`SHARED_MAX_PROMPT_TIMEOUT_SECS`, 120s). The
-/// caller-side timeout only bounds the caller.
-#[inline]
-fn with_cross_process_pace<T>(op: impl FnOnce() -> T) -> T {
-    #[cfg(unix)]
-    {
-        cross_process_pace::run_with_cross_process_pace(op)
-    }
-    #[cfg(not(unix))]
-    {
-        op()
-    }
-}
-
 /// Run `f` with rate-limiting + progressive-backoff retries on transient
 /// `keyring::Error`. Each attempt goes through `paced_call`, so the
 /// daemon sees a steady-state ≤6.7 ops/sec even when many callers are
@@ -1632,7 +1171,7 @@ fn with_cross_process_pace<T>(op: impl FnOnce() -> T) -> T {
 /// API call — there is no shared state captured between attempts.
 /// Test seam: callers can pass a closure whose body counts invocations
 /// to verify "at most 4 attempts" without standing up a real keychain.
-fn retry_with_backoff<T>(mut f: impl FnMut() -> keyring::Result<T>) -> keyring::Result<T> {
+pub(crate) fn retry_with_backoff<T>(mut f: impl FnMut() -> keyring::Result<T>) -> keyring::Result<T> {
     let mut last_err: Option<keyring::Error> = None;
     for attempt in 0..=BACKOFF_SCHEDULE.len() {
         if attempt > 0 {
@@ -1651,200 +1190,19 @@ fn retry_with_backoff<T>(mut f: impl FnMut() -> keyring::Result<T>) -> keyring::
     Err(last_err.expect("loop runs at least once"))
 }
 
-// ─── Bounded-timeout execution primitive (v0.2.76 A4) ─────────────────────────
-//
-// The pacing/backoff layers above serialize and retry keychain calls, but the
-// underlying `keyring` op (`Entry::new` D-Bus negotiation, `set_password`,
-// `get_password`, `delete_credential`) can block UNBOUNDEDLY when the OS Secret
-// Service is slow or wedged (observed live: gnome-keyring hanging a keychain
-// call for 13+ minutes at ~0% CPU). A blocked op hangs whatever called it — the
-// hub `/env` value read, a launcher GUI keychain command, or a test — with no
-// timeout anywhere in the stack.
-//
-// This primitive wraps keychain execution in a bounded timeout, running the op
-// on ONE dedicated long-lived worker thread fed by a request channel. Design
-// points:
-//
-//   * ONE worker thread (not thread-per-op): a timed-out op leaves its job
-//     stuck ON THE WORKER; we do NOT spawn a fresh thread per call (that would
-//     leak one abandoned thread per timeout). Instead, while the worker is
-//     stuck the NEXT op fails FAST with a distinct "keychain worker stuck"
-//     error until the wedged op returns and the worker drains.
-//   * The timeout wraps OUTSIDE pacing/backoff (v0.2.72 P9 semantics
-//     unchanged) — the job closure IS the full retry_with_backoff call.
-//   * On timeout the caller gets an `Err`; every caller already handles `Err`
-//     (hub /env → key not served; GUI set → error toast; never a panic).
-
-/// Per-op keychain timeout. Generous: a healthy Secret Service answers in
-/// milliseconds; the pacing + backoff worst case is ~1.45s, so 10s leaves
-/// ample headroom for a slow-but-alive daemon while still bounding a wedged
-/// one. A wedged daemon crosses this and the op fails loudly instead of
-/// hanging forever.
-const KEYCHAIN_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Error returned when a keychain op could not complete within the bound.
-#[derive(Debug)]
-pub enum KeychainTimeout {
-    /// This op itself exceeded `KEYCHAIN_OP_TIMEOUT`.
-    TimedOut,
-    /// A PRIOR op is still stuck on the worker (the Secret Service has not
-    /// unwedged); this op failed fast rather than queue behind it.
-    WorkerStuck,
-    /// The worker thread/channel is unavailable (should not happen in
-    /// practice; treated conservatively as a failure).
-    WorkerUnavailable,
-}
-
-impl std::fmt::Display for KeychainTimeout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KeychainTimeout::TimedOut => write!(
-                f,
-                "keychain operation timed out — Secret Service unresponsive \
-                 (exceeded {}s)",
-                KEYCHAIN_OP_TIMEOUT.as_secs()
-            ),
-            KeychainTimeout::WorkerStuck => write!(
-                f,
-                "keychain worker stuck — a prior keychain operation is still \
-                 blocked on an unresponsive Secret Service; try again once it \
-                 recovers"
-            ),
-            KeychainTimeout::WorkerUnavailable => {
-                write!(f, "keychain worker unavailable")
-            }
-        }
-    }
-}
-
-type KeychainJob = Box<dyn FnOnce() + Send + 'static>;
-
-/// Lazily-started worker: owns the single thread that actually touches the OS
-/// keychain. `in_flight` > 0 means a job is currently executing (possibly
-/// wedged); a new caller checks it to fast-fail rather than queue behind a
-/// stuck op.
-struct KeychainWorker {
-    tx: std::sync::mpsc::Sender<KeychainJob>,
-    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
-fn keychain_worker() -> &'static KeychainWorker {
-    use std::sync::OnceLock;
-    static WORKER: OnceLock<KeychainWorker> = OnceLock::new();
-    WORKER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<KeychainJob>();
-        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let worker_in_flight = in_flight.clone();
-        // Detached; lives for the process. A wedged op parks THIS thread (not a
-        // fresh one per call) until the daemon unwedges, then it drains the
-        // queue.
-        std::thread::Builder::new()
-            .name("vct-keychain-worker".into())
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    worker_in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    job();
-                    worker_in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            })
-            .expect("spawn keychain worker thread");
-        KeychainWorker { tx, in_flight }
-    })
-}
-
-/// Run a keychain op with a bounded timeout on the shared worker thread.
-///
-/// `f` is the full op INCLUDING pacing/backoff — the timeout wraps outside
-/// them (A4d). Returns `Ok(f())` when it completes within
-/// `KEYCHAIN_OP_TIMEOUT`; `Err(WorkerStuck)` immediately if a prior op is
-/// still blocked; `Err(TimedOut)` if this op exceeds the bound.
-pub(crate) fn run_keychain_with_timeout<T, F>(f: F) -> Result<T, KeychainTimeout>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    use std::sync::atomic::Ordering;
-
-    let worker = keychain_worker();
-    // Fast-fail if the worker is already busy on a (possibly wedged) prior op.
-    // Single-worker means a queued job would otherwise inherit the prior op's
-    // stall; failing fast keeps callers responsive until the daemon recovers.
-    if worker.in_flight.load(Ordering::SeqCst) > 0 {
-        return Err(KeychainTimeout::WorkerStuck);
-    }
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<T>(1);
-    let job: KeychainJob = Box::new(move || {
-        let value = f();
-        // Ignore send error: if the caller already timed out and dropped the
-        // receiver, the result is simply discarded.
-        let _ = result_tx.send(value);
-    });
-    if worker.tx.send(job).is_err() {
-        return Err(KeychainTimeout::WorkerUnavailable);
-    }
-    match result_rx.recv_timeout(current_keychain_timeout()) {
-        Ok(value) => Ok(value),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(KeychainTimeout::TimedOut),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(KeychainTimeout::WorkerUnavailable)
-        }
-    }
-}
-
-#[cfg(any(test, debug_assertions))]
-static TEST_KEYCHAIN_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<std::time::Duration>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(any(test, debug_assertions))]
-fn current_keychain_timeout() -> std::time::Duration {
-    TEST_KEYCHAIN_TIMEOUT_OVERRIDE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .unwrap_or(KEYCHAIN_OP_TIMEOUT)
-}
-
-#[cfg(not(any(test, debug_assertions)))]
-fn current_keychain_timeout() -> std::time::Duration {
-    KEYCHAIN_OP_TIMEOUT
-}
-
-/// Test-only RAII guard shortening the keychain timeout so timeout tests run
-/// fast. Restores the previous value on drop.
-#[cfg(any(test, debug_assertions))]
-pub struct TestKeychainTimeoutGuard {
-    prev: Option<std::time::Duration>,
-}
-
-#[cfg(any(test, debug_assertions))]
-impl TestKeychainTimeoutGuard {
-    pub fn new(timeout: std::time::Duration) -> Self {
-        let mut slot = TEST_KEYCHAIN_TIMEOUT_OVERRIDE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = *slot;
-        *slot = Some(timeout);
-        Self { prev }
-    }
-}
-
-#[cfg(any(test, debug_assertions))]
-impl Drop for TestKeychainTimeoutGuard {
-    fn drop(&mut self) {
-        let mut slot = TEST_KEYCHAIN_TIMEOUT_OVERRIDE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        *slot = self.prev;
-    }
-}
-
-/// ONE shared public probe: is the OS keychain backend reachable *and
+/// ONE shared probe for TESTS: is the OS keychain backend reachable *and
 /// responsive*? Writes + deletes a canary under a private namespace, bounded
 /// by the same timeout primitive (a wedged Secret Service → `false`, the
 /// conservative default). Replaces the three duplicated `keyring_available()`
-/// test copies (installer.rs / openai_cmd.rs / vct-hub modules_api.rs) and is
-/// safe to call from any crate that depends on vct-launcher-core.
+/// test copies (installer.rs / openai_cmd.rs / vct-hub modules_api.rs).
+///
+/// v0.2.102: this is NOT a production policy input any more. It WRITES to the
+/// keychain and it answers `false` whenever the worker is merely busy — which
+/// is how the hub's memoized "backend available" flag got pinned to `false`
+/// for a whole process (every degraded read then answered `key_not_active`).
+/// Production asks [`keychain_backend_available`], which is read-only.
 pub fn keyring_probe_available() -> bool {
-    run_keychain_with_timeout(|| {
+    run_keychain_with_timeout_ctx(CallContext::Interactive, || {
         // v0.3.0 (WP-K): the probe uses the SAME `KeychainEntry` primitive as
         // the real ops, so on Linux it exercises the persistent Secret-Service
         // connection (and reflects its reachability) rather than opening a
@@ -1862,16 +1220,21 @@ pub fn keyring_probe_available() -> bool {
     .unwrap_or(false)
 }
 
-// ─── Backend availability (v0.2.82 CI fix) ───────────────────────────────
+// ─── Backend availability (v0.2.82 CI fix; read-only + definite-only v0.2.102) ─
 //
-// "keychain_degraded" (hub /env → 503 `keychain_error`) means a keychain
-// that NORMALLY WORKS failed a read. On hosts with NO Secret Service
-// backend at all (headless CI, servers), every keychain read errors by
-// construction — that is not degradation, it is the pre-v0.2.82
-// no-keychain reality: consumers must fall through to the legacy miss path
-// (file store / `key_not_active`). Memoized once per process: backend
-// availability is a property of the host session, not of individual reads
-// (a daemon that dies mid-run is real degradation and stays reported).
+// "keychain_degraded" (hub /env → 503) means a keychain that NORMALLY WORKS
+// failed a read. On hosts with NO Secret Service backend at all (headless CI,
+// servers), every keychain read errors by construction — that is not
+// degradation, it is the pre-v0.2.82 no-keychain reality: consumers must fall
+// through to the legacy miss path (file store / `key_not_active`).
+//
+// v0.2.102: the answer comes from a READ-ONLY session-bus question (is
+// `org.freedesktop.secrets` owned or activatable?) — never a canary write, and
+// never routed through the keychain worker, so a busy worker cannot answer it.
+// Only a DEFINITE "no backend" is memoized for the process; "present" and
+// "could not tell" are re-asked each time and both count as available — the
+// conservative direction, because wrongly claiming "no backend" turns an
+// honest 503 into a false `key_not_active`.
 
 #[cfg(any(test, debug_assertions))]
 static TEST_BACKEND_AVAILABILITY_OVERRIDE: std::sync::Mutex<Option<bool>> =
@@ -1908,9 +1271,8 @@ impl Drop for TestBackendAvailabilityGuard {
     }
 }
 
-/// Whether this host has a WORKING keychain backend at all (memoized).
-/// See the module-section comment above for the degraded-vs-no-backend
-/// distinction this powers.
+/// Whether this host has a WORKING keychain backend at all. Read-only; only a
+/// definite "no backend" is memoized (see the section comment above).
 pub fn keychain_backend_available() -> bool {
     #[cfg(any(test, debug_assertions))]
     {
@@ -1921,8 +1283,122 @@ pub fn keychain_backend_available() -> bool {
             return v;
         }
     }
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(keyring_probe_available)
+    #[cfg(any(test, debug_assertions))]
+    {
+        let forced = *TEST_BACKEND_PRESENCE_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(presence) = forced {
+            // Policy exercised against a fixed probe answer, private memo.
+            return backend_availability_decision(&std::sync::OnceLock::new(), || presence);
+        }
+    }
+    static DEFINITELY_ABSENT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if DEFINITELY_ABSENT.get().is_some() {
+        return false;
+    }
+    backend_availability_decision(&DEFINITELY_ABSENT, backend_presence)
+}
+
+#[cfg(any(test, debug_assertions))]
+static TEST_BACKEND_PRESENCE_OVERRIDE: std::sync::Mutex<Option<BackendPresence>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only RAII guard fixing the read-only presence probe's answer (unlike
+/// [`TestBackendAvailabilityGuard`], the memo POLICY still runs).
+#[cfg(any(test, debug_assertions))]
+pub struct TestBackendPresenceGuard {
+    prev: Option<BackendPresence>,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl TestBackendPresenceGuard {
+    pub fn new(presence: BackendPresence) -> Self {
+        let mut slot = TEST_BACKEND_PRESENCE_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = *slot;
+        *slot = Some(presence);
+        Self { prev }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for TestBackendPresenceGuard {
+    fn drop(&mut self) {
+        *TEST_BACKEND_PRESENCE_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = self.prev;
+    }
+}
+
+/// Outcome of the read-only backend-presence question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendPresence {
+    /// The Secret Service name is owned or activatable on the session bus.
+    Present,
+    /// Definitely no backend: no session bus, or the bus answered and the name
+    /// is neither owned nor activatable.
+    Absent,
+    /// The question could not be answered (bus call failed / timed out).
+    Unknown,
+}
+
+/// The memo policy, separated from the probe so it is unit-testable: only
+/// `Absent` is recorded; `Present` and `Unknown` answer `true` unrecorded.
+pub fn backend_availability_decision(
+    memo: &std::sync::OnceLock<()>,
+    probe: impl FnOnce() -> BackendPresence,
+) -> bool {
+    match probe() {
+        BackendPresence::Absent => {
+            let _ = memo.set(());
+            false
+        }
+        BackendPresence::Present | BackendPresence::Unknown => true,
+    }
+}
+
+/// Read-only probe: ask the session bus whether `org.freedesktop.secrets` is
+/// owned (running) or activatable (starts on demand). Two plain bus-daemon
+/// method calls with a 2s timeout each — the Secret Service itself is never
+/// contacted, nothing is written, nothing can prompt.
+#[cfg(target_os = "linux")]
+fn backend_presence() -> BackendPresence {
+    use dbus::blocking::Connection;
+    const NAME: &str = "org.freedesktop.secrets";
+    let conn = match Connection::new_session() {
+        Ok(c) => c,
+        // No session bus at all (headless CI / server): definitely no backend.
+        Err(_) => return BackendPresence::Absent,
+    };
+    let bus = conn.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        std::time::Duration::from_secs(2),
+    );
+    let owned: Result<(bool,), dbus::Error> =
+        bus.method_call("org.freedesktop.DBus", "NameHasOwner", (NAME,));
+    let owned = match owned {
+        Ok((o,)) => o,
+        Err(_) => return BackendPresence::Unknown,
+    };
+    if owned {
+        return BackendPresence::Present;
+    }
+    let activatable: Result<(Vec<String>,), dbus::Error> =
+        bus.method_call("org.freedesktop.DBus", "ListActivatableNames", ());
+    match activatable {
+        Ok((names,)) if names.iter().any(|n| n == NAME) => BackendPresence::Present,
+        Ok(_) => BackendPresence::Absent,
+        Err(_) => BackendPresence::Unknown,
+    }
+}
+
+/// macOS / Windows always have their native keychain backend.
+#[cfg(not(target_os = "linux"))]
+fn backend_presence() -> BackendPresence {
+    BackendPresence::Present
 }
 
 // ─── Write chokepoint (v0.2.80 A4) ────────────────────────────────────────
@@ -2060,7 +1536,7 @@ fn set_raw(
     let service = scope.service_name(module_id);
     let key = key.to_string();
     let value = value.to_string();
-    run_keychain_with_timeout(move || {
+    run_keychain_with_timeout_ctx(ctx, move || {
         with_cross_process_pace(|| {
             // v0.2.72 (P9): build the entry INSIDE the closure so construction
             // shares the same paced_call + backoff as the op. v0.3.0 (WP-K): on
@@ -2147,6 +1623,21 @@ pub fn get_with_context(
     if let Some(cached) = session_memo_lookup(&service, key) {
         return Ok(cached);
     }
+    // v0.2.102 (R1, owner 2026-10-07): short cross-request value cache.
+    // Background reads only — the hub `/env`, `?key=` and spawn resolution
+    // paths, every one of which has ALREADY passed its permission gate
+    // (active/paused flag) before reaching this read; the gate is upstream of
+    // `get_with_context` and runs on EVERY call, so a paused key is never
+    // served from here. Consulted AFTER the lock gate and the request memo and
+    // BEFORE the store switch below (mock or OS keychain), so the hermetic
+    // mock tests prove this exact code. A hit reads no store at all (pinned by
+    // `value_cache_second_read_within_ttl_skips_the_store`).
+    let value_cache_eligible = ctx == CallContext::Background;
+    if value_cache_eligible {
+        if let Some(v) = value_cache_lookup(&service, key) {
+            return Ok(Some(v));
+        }
+    }
     // v0.2.84 (review F2 — TOCTOU close): SNAPSHOT the generation NOW, BEFORE the
     // underlying keychain read starts, and tag the memo entry with this value.
     // A concurrent `set`/`delete` that bumps the generation DURING the read then
@@ -2163,49 +1654,31 @@ pub fn get_with_context(
     // proceeding call.
     #[cfg(any(test, debug_assertions))]
     note_entry_construction();
+    // THE store switch (W6-P): the test mock when it is active on this thread,
+    // else the OS keychain. Both arms produce `outcome`; the mid-read hook, the
+    // session memo store and the value-cache store below run once, for either
+    // arm — so the mock tests exercise exactly the production post-read path.
     #[cfg(any(test, debug_assertions))]
-    if let Some(result) = for_tests::mock_get(scope, module_id, key) {
-        let outcome = result.map_err(KeychainError::Other)?;
-        // v0.2.84 (review F2): fire the mid-read hook AFTER the value has been
-        // read but BEFORE the memo store — the exact TOCTOU window. A test
-        // installs a hook that performs a concurrent `set`/`delete` (bumping the
-        // generation) to prove the entry, tagged with the PRE-read generation,
-        // is invalidated even though `outcome` already captured the pre-write
-        // value. No-op in prod.
-        #[cfg(any(test, debug_assertions))]
-        for_tests::fire_mid_read_hook();
-        // Cache the successful mock outcome (value or genuine miss) so the
-        // session memo path is exercised under the test mock exactly as it is
-        // against the real keychain. Tagged with the PRE-read generation (F2).
-        session_memo_store(&service, key, &outcome, read_gen);
-        return Ok(outcome);
-    }
-    // v0.2.76 (A4): own (service, key) → 'static + Send job → bounded-timeout
-    // worker. keyring::Error is not Send-safe to carry across the channel
-    // uniformly, so classify NoEntry INSIDE the job and return a plain
-    // Result<Option<String>, String>. v0.2.84 (D8.2): the outer `service`
-    // String + `key` &str are retained for the post-read memo store, so the
-    // closure gets its OWN shadowed owned copies (spelling `Entry::new(&service,
-    // &key)` preserved verbatim for the P9 structural guard).
-    let outcome = {
-        let service = service.clone();
-        let key = key.to_string();
-        run_keychain_with_timeout(move || {
-            with_cross_process_pace(|| {
-                // v0.2.72 (P9): build the entry INSIDE the closure. v0.3.0
-                // (WP-K): `KeychainEntry` = persistent connection on Linux.
-                match retry_with_backoff(|| KeychainEntry::new(&service, &key)?.get_password()) {
-                    Ok(v) => Ok(Some(v)),
-                    Err(keyring::Error::NoEntry) => Ok(None),
-                    Err(err) => Err(format!("keyring get: {}", err)),
-                }
-            })
-        })
-        .map_err(|to| KeychainError::Other(format!("keyring get: {}", to)))?
-        .map_err(KeychainError::Other)?
+    let mock_result = for_tests::mock_get(scope, module_id, key);
+    #[cfg(not(any(test, debug_assertions)))]
+    let mock_result: Option<Result<Option<String>, String>> = None;
+    let outcome = match mock_result {
+        // v0.2.102: a mock error carrying an unavailability detail is
+        // classified exactly like the real worker path's (session flag set).
+        Some(result) => result.map_err(|e| {
+            if is_keychain_unavailable_detail(&e) {
+                session_note_unavailable();
+            }
+            KeychainError::Other(e)
+        })?,
+        None => read_keychain_value(ctx, &service, key, read_gen)?,
     };
-    // v0.2.84 (review F2): mid-read hook, real-keychain path — same TOCTOU
-    // window (value read, not yet stored). No-op in prod / when unarmed.
+    // v0.2.84 (review F2): fire the mid-read hook AFTER the value has been
+    // read but BEFORE the memo store — the exact TOCTOU window. A test
+    // installs a hook that performs a concurrent `set`/`delete` (bumping the
+    // generation) to prove the entry, tagged with the PRE-read generation, is
+    // invalidated even though `outcome` already captured the pre-write value.
+    // No-op in prod / when unarmed.
     #[cfg(any(test, debug_assertions))]
     for_tests::fire_mid_read_hook();
     // Memoize the SUCCESSFUL outcome only (errors already propagated via `?`, so
@@ -2214,6 +1687,78 @@ pub fn get_with_context(
     // the PRE-read generation snapshot (F2) so a write that raced this read
     // invalidates the entry rather than being masked by it.
     session_memo_store(&service, key, &outcome, read_gen);
+    if value_cache_eligible {
+        if let Some(v) = outcome.as_ref() {
+            value_cache_store(&service, key, v.clone(), read_gen);
+        }
+    }
+    Ok(outcome)
+}
+
+/// The OS-keychain arm of `get_with_context`'s store switch: one bounded,
+/// paced, retried `get_password`. `Ok(None)` is a genuine key-not-present miss.
+///
+/// v0.2.102 (W6-AB, owner rule "never terminate something that is working,
+/// just slowly"): the caller waits at most `KEYCHAIN_OP_TIMEOUT` for the
+/// result, but the read itself keeps running on the worker. A Background read
+/// that completes AFTER its caller gave up stores its value in the value cache
+/// from the worker thread — tagged with the caller's PRE-read generation
+/// (`read_gen`, the F2 rule), so a write that raced it still invalidates it —
+/// and the client's one retry is answered from there instead of queueing a
+/// second slow read. Before, the late value was dropped with the result
+/// channel. Interactive reads are never value-cached (unchanged).
+fn read_keychain_value(
+    ctx: CallContext,
+    service: &str,
+    key: &str,
+    read_gen: u64,
+) -> Result<Option<String>, KeychainError> {
+    let keep_completed = ctx == CallContext::Background;
+    // v0.2.76 (A4): own (service, key) → 'static + Send job → bounded-timeout
+    // worker. keyring::Error is not Send-safe to carry across the channel
+    // uniformly, so classify NoEntry INSIDE the job and return a plain
+    // Result<Option<String>, String>. The closure gets its OWN shadowed owned
+    // copies of `service` / `key` (spelling `Entry::new(&service, &key)`
+    // preserved verbatim for the P9 structural guard).
+    let outcome = {
+        let service = service.to_string();
+        let key = key.to_string();
+        run_keychain_with_timeout_ctx(ctx, move || {
+            let read: Result<Option<String>, String> = with_cross_process_pace(|| {
+                // Test seam (W6-AB): a slow stand-in for the keychain call, so
+                // the late-completion path below is provable without an OS
+                // keychain. Inert unless a test installed one.
+                #[cfg(any(test, debug_assertions))]
+                if let Some(body) = for_tests::get_body_override() {
+                    return body(&service, &key);
+                }
+                // v0.2.72 (P9): build the entry INSIDE the closure. v0.3.0
+                // (WP-K): `KeychainEntry` = persistent connection on Linux.
+                match retry_with_backoff(|| KeychainEntry::new(&service, &key)?.get_password()) {
+                    Ok(v) => Ok(Some(v)),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(err) => Err(format!("keyring get: {}", err)),
+                }
+            });
+            // W6-AB: keep a completed value even when the caller already gave
+            // up (see the doc comment). The caller's own store after a timely
+            // answer is then a same-value overwrite.
+            if keep_completed {
+                if let Ok(Some(v)) = &read {
+                    value_cache_store(&service, &key, v.clone(), read_gen);
+                }
+            }
+            read
+        })
+        .map_err(|to| {
+            // v0.2.102: tell the active request session the keychain was
+            // UNAVAILABLE (busy / timed out / stuck) — the hub answers
+            // `keychain_unavailable` for it, never a miss.
+            session_note_unavailable();
+            KeychainError::Other(format!("keyring get: {}", to))
+        })?
+        .map_err(KeychainError::Other)?
+    };
     Ok(outcome)
 }
 
@@ -2260,7 +1805,7 @@ pub fn delete_with_context(
     // worker. NoEntry (already gone) is treated as success INSIDE the job.
     let service = scope.service_name(module_id);
     let key = key.to_string();
-    run_keychain_with_timeout(move || {
+    run_keychain_with_timeout_ctx(ctx, move || {
         with_cross_process_pace(|| {
             // v0.2.72 (P9): build the entry INSIDE the closure. v0.3.0 (WP-K):
             // `KeychainEntry` = persistent connection on Linux.
@@ -2385,20 +1930,27 @@ pub mod test_serialize {
 
     static KEYCHAIN_SERIALIZE: Mutex<()> = Mutex::new(());
 
-    /// Combined guard holding the in-process mutex, the test-only cross-process
-    /// file lock, AND (T-1, v0.2.83) the PRODUCTION `<vct_root>/keyring.pace`
-    /// flock so a `cargo test --workspace` process serializes against a RUNNING
-    /// launcher (which paces on that same file), not just against sibling test
-    /// binaries.
+    /// Combined guard holding the in-process mutex and the test-only
+    /// cross-process file lock, plus two redirects: the hermetic keychain
+    /// namespace and (v0.2.102 W6-KC) the test pace file.
+    ///
+    /// It NEVER touches the production `<vct_root>/keyring.pace`. v0.2.83
+    /// (T-1) held that production flock for the whole test, to serialize
+    /// against a running launcher writing the same `github_pat` slot; the
+    /// hermetic namespace removed the shared slot (2026-09-17), and holding
+    /// the production flock for a whole test stalled the user's live hub
+    /// (its keychain ops waited up to 30s for the flock but answered callers
+    /// after 10s). Now the test's keychain ops pace on
+    /// `<temp_dir>/vct-keychain-test.pace`, one op at a time, so concurrent
+    /// test binaries still space their daemon calls against each other and a
+    /// running launcher or hub never waits on a test.
     ///
     /// Drop order in Rust is field-declaration order — `_namespace` drops first
     /// (2026-09-17: restores the production service prefix while this thread
-    /// still holds every baton), then `_proc_lock` (releases the in-process
-    /// mutex), then `_file_lock` (the test lockfile), then `_prod_pace_guard`
-    /// (the production pace flock + reentrancy flag) LAST. Correct order: leave
-    /// the prefix as we found it, let in-process readers proceed next, hand the
-    /// test-binary baton on after that, and only THEN release the production
-    /// baton to a waiting launcher.
+    /// still holds every baton), then `_pace_baton` (the pace-file redirect,
+    /// cleared while the in-process mutex is still held so the next holder
+    /// installs it on a clean slot), then `_proc_lock` (releases the in-process
+    /// mutex), then `_file_lock` (the test lockfile) LAST.
     pub struct KeychainGuard {
         /// 2026-09-17: FIRST field on purpose — Rust drops in declaration
         /// order, so the hermetic `vct-test-<pid>` namespace is restored
@@ -2406,13 +1958,13 @@ pub mod test_serialize {
         /// runs against a test namespace instead of the real user's keychain
         /// slots; see `for_tests`'s "Hermetic keychain namespace" section.
         _namespace: super::for_tests::KeychainNamespaceGuard,
+        /// v0.2.102 W6-KC: this process's keychain ops pace on the test pace
+        /// file while held (unix only — the `cross_process_pace` module is
+        /// `cfg(unix)`; elsewhere there is no cross-process pacing at all).
+        #[cfg(unix)]
+        _pace_baton: super::cross_process_pace::TestBatonPaceGuard,
         _proc_lock: MutexGuard<'static, ()>,
         _file_lock: Option<file_lock::FileLock>,
-        /// T-1: production keyring.pace flock (unix; `None` on any flock
-        /// failure — degrades to the test lockfile only). Field only exists on
-        /// unix (the `cross_process_pace` module is `cfg(unix)`).
-        #[cfg(unix)]
-        _prod_pace_guard: Option<super::cross_process_pace::TestProductionPaceGuard>,
     }
 
     /// Acquire the process-wide keychain-test mutex. Recovers from
@@ -2448,18 +2000,7 @@ pub mod test_serialize {
     /// pattern-match on the guard type, the field is also called `_lock`
     /// in the test modules' EnvGuard structs which take this by value.
     pub fn keychain_serialize_lock() -> KeychainGuard {
-        // T-1 (v0.2.83): acquire the PRODUCTION keyring.pace flock FIRST so we
-        // serialize against a running launcher before taking the test-side
-        // batons. This is safe against self-deadlock: while held it sets
-        // `TEST_HOLDS_PRODUCTION_PACE`, so the test's OWN real `secrets::set`
-        // (which runs `acquire_and_space` on the worker thread) SKIPS the nested
-        // flock re-acquire instead of blocking on it. (unix only; `None` on
-        // flock failure → degrades to the test lockfile.)
-        #[cfg(unix)]
-        let prod_pace_guard =
-            super::cross_process_pace::acquire_production_pace_lock_for_test();
-
-        // Acquire the cross-process test lockfile next. If we acquired
+        // Acquire the cross-process test lockfile first. If we acquired
         // the in-process mutex first and then blocked on flock(), we'd
         // hold the in-process mutex across the blocking-syscall wait,
         // pinning every other sibling-test thread in the same binary
@@ -2469,15 +2010,19 @@ pub mod test_serialize {
         let proc_lock = KEYCHAIN_SERIALIZE
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        // Installed LAST (so it covers only the window in which this thread
-        // actually holds the baton) and dropped FIRST (field order above).
+        // Both redirects are installed only now, while this thread holds the
+        // in-process mutex (so they cover only the window in which it holds
+        // the baton, and a waiting thread can never clear the holder's), and
+        // are dropped before it is released (field order above).
+        #[cfg(unix)]
+        let pace_baton = super::cross_process_pace::TestBatonPaceGuard::install();
         let namespace = super::for_tests::KeychainNamespaceGuard::install();
         KeychainGuard {
             _namespace: namespace,
+            #[cfg(unix)]
+            _pace_baton: pace_baton,
             _proc_lock: proc_lock,
             _file_lock: file_lock,
-            #[cfg(unix)]
-            _prod_pace_guard: prod_pace_guard,
         }
     }
 
@@ -2685,6 +2230,37 @@ pub mod for_tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// A stand-in for the OS-keychain `get_password` call inside
+    /// `read_keychain_value` (v0.2.102, W6-AB). Process-global (the call runs
+    /// on the keychain WORKER thread, so a thread-local could not reach it).
+    pub type GetBody = fn(&str, &str) -> Result<Option<String>, String>;
+
+    static GET_BODY_OVERRIDE: std::sync::Mutex<Option<GetBody>> = std::sync::Mutex::new(None);
+
+    pub(super) fn get_body_override() -> Option<GetBody> {
+        *GET_BODY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// RAII guard installing a [`GetBody`] stand-in; restores the previous
+    /// one on drop.
+    pub struct TestGetBodyGuard {
+        prev: Option<GetBody>,
+    }
+
+    impl TestGetBodyGuard {
+        pub fn new(body: GetBody) -> Self {
+            let mut slot = GET_BODY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
+            let prev = slot.replace(body);
+            Self { prev }
+        }
+    }
+
+    impl Drop for TestGetBodyGuard {
+        fn drop(&mut self) {
+            *GET_BODY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) = self.prev;
+        }
+    }
+
     /// True when an error string positively identifies a keychain-op
     /// timeout / worker unavailability — the deterministic `Display`
     /// strings of [`super::KeychainTimeout`], embedded verbatim in the
@@ -2701,9 +2277,8 @@ pub mod for_tests {
     /// `commands::secrets_cmd` / `commands::dashboard` real-keychain
     /// tests, `vct-hub::modules_api` resolver tests.
     pub fn is_keychain_unavailable_err(e: &str) -> bool {
-        e.contains("keychain operation timed out")
-            || e.contains("keychain worker stuck")
-            || e.contains("keychain worker unavailable")
+        // v0.2.102: delegates to the production predicate (one home).
+        super::is_keychain_unavailable_detail(e)
     }
 
     // ─── Hermetic keychain namespace (2026-09-17) ────────────────────────
@@ -2856,6 +2431,19 @@ pub mod for_tests {
         static MOCK_FAIL_GET_KEYS: RefCell<HashSet<String>> =
             RefCell::new(HashSet::new());
 
+        // v0.2.102: keys whose next mock `get` fails as keychain
+        // UNAVAILABILITY (op timed out) — the hub `/env` `keychain_unavailable`
+        // (503) path. One-shot, consumed on fire.
+        static MOCK_UNAVAILABLE_GET_KEYS: RefCell<HashSet<String>> =
+            RefCell::new(HashSet::new());
+
+        // W6-P: how many reads reached the mock STORE on this thread (every
+        // `mock_get` while the mock is active, injected failures included).
+        // The hermetic "did this read touch the store?" probe — thread-local,
+        // so concurrently running tests never perturb each other's count.
+        // Reset by `MockGuard::new` / `clear_mock`.
+        static MOCK_READ_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
         // v0.2.84 (review F2): a one-shot callback fired by `get_with_context`
         // in the TOCTOU window between its pre-read generation snapshot and the
         // memo store. A test installs a hook that performs a concurrent
@@ -2919,8 +2507,11 @@ pub mod for_tests {
         MOCK_STORE.with(|cell| {
             *cell.borrow_mut() = None;
         });
+        // W6-P: values this thread's mock put in the value cache go with it.
+        super::value_cache_forget_namespace(&mock_value_cache_namespace());
         MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
         MOCK_FAIL_GET_KEYS.with(|cell| cell.borrow_mut().clear());
+        MOCK_UNAVAILABLE_GET_KEYS.with(|cell| cell.borrow_mut().clear());
         // v0.2.84 (F2): drop any un-fired mid-read hook so it never leaks into
         // a subsequent mock session on this thread.
         MID_READ_HOOK.with(|cell| *cell.borrow_mut() = None);
@@ -2938,10 +2529,23 @@ pub mod for_tests {
                 map.clear();
             }
         });
+        // W6-P: an emptied store must not keep answering from the value cache.
+        super::value_cache_forget_namespace(&mock_value_cache_namespace());
+        MOCK_READ_COUNT.with(|c| c.set(0));
         MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
         MOCK_FAIL_GET_KEYS.with(|cell| cell.borrow_mut().clear());
+        MOCK_UNAVAILABLE_GET_KEYS.with(|cell| cell.borrow_mut().clear());
         // v0.2.84 (F2): also drop any pending mid-read hook.
         MID_READ_HOOK.with(|cell| *cell.borrow_mut() = None);
+    }
+
+    /// v0.2.102: register `key` so the **next** mock `secrets::get` targeting it
+    /// fails exactly as a real read does when the keychain is UNAVAILABLE (the
+    /// same `KeychainTimeout::TimedOut` detail, the same session flag). One-shot.
+    pub fn make_next_get_unavailable(key: &str) {
+        MOCK_UNAVAILABLE_GET_KEYS.with(|cell| {
+            cell.borrow_mut().insert(key.to_string());
+        });
     }
 
     /// Register `key` to make the **next** `secrets::get` (any context) targeting
@@ -2996,6 +2600,23 @@ pub mod for_tests {
     /// the store" and skip the host entirely.
     pub fn mock_is_active() -> bool {
         MOCK_STORE.with(|cell| cell.borrow().is_some())
+    }
+
+    /// W6-P: number of reads that reached the mock STORE on this thread since
+    /// the last `MockGuard::new` / `clear_mock` — a read served by the value
+    /// cache (or the session memo) does not count. The hermetic replacement
+    /// for counting real `keyring::Entry` constructions.
+    pub fn mock_read_count() -> usize {
+        MOCK_READ_COUNT.with(|c| c.get())
+    }
+
+    /// W6-P: the value-cache namespace of this thread's mock store. The mock
+    /// is a per-thread store, so its cached values are keyed apart from the OS
+    /// keychain's and from every other thread's mock (`ThreadId`s are never
+    /// reused within a process). The leading NUL cannot start a real service
+    /// name.
+    pub(super) fn mock_value_cache_namespace() -> String {
+        format!("\u{0}mock-{:?}\u{0}", std::thread::current().id())
     }
 
     /// Snapshot all entries currently in the mock store.
@@ -3083,8 +2704,14 @@ pub mod for_tests {
         MOCK_STORE.with(|cell| {
             let slot = cell.borrow();
             slot.as_ref().map(|map| {
+                MOCK_READ_COUNT.with(|c| c.set(c.get() + 1));
                 // v0.2.82: injected one-shot read failure (models a transient
                 // daemon error mid-request, NOT a miss). Consumed on fire.
+                let unavailable =
+                    MOCK_UNAVAILABLE_GET_KEYS.with(|fc| fc.borrow_mut().remove(key));
+                if unavailable {
+                    return Err(format!("keyring get: {}", super::KeychainTimeout::TimedOut));
+                }
                 let should_fail = MOCK_FAIL_GET_KEYS.with(|fc| fc.borrow_mut().remove(key));
                 if should_fail {
                     return Err(format!(
@@ -3201,7 +2828,7 @@ mod tests {
             },
             "user",
             "github_pat",
-            "ghp_0123456789abcdef0123456789abcdef0123",
+            "ghp_0123456789abcdef0123456789abcdef0123", // vco-secret-scan: test-placeholder
         );
     }
 
@@ -3231,7 +2858,7 @@ mod tests {
         let scope = SecretScope::Shared {
             project_id: "_user_shared_",
         };
-        set(scope, "user", "github_pat", "ghp_0123456789abcdef0123456789abcdef0123")
+        set(scope, "user", "github_pat", "ghp_0123456789abcdef0123456789abcdef0123") // vco-secret-scan: test-placeholder
             .expect("a hermetic write at the production tuple must succeed");
         assert!(get(scope, "user", "github_pat").unwrap().is_some());
         delete(scope, "user", "github_pat").expect("hermetic delete");
@@ -3455,48 +3082,6 @@ mod tests {
         );
     }
 
-    /// `paced_call`: enforces the spacing between consecutive calls. We
-    /// use a 50ms test override and run two calls back-to-back; the
-    /// second must wait ≥40ms (giving a 10ms scheduler-jitter margin).
-    #[test]
-    fn paced_call_enforces_min_spacing() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let _g = TestSpacingGuard::new(std::time::Duration::from_millis(50));
-        // Burn the first slot — establishes LAST_KEYRING_CALL.
-        paced_call(|| 0);
-        let start = std::time::Instant::now();
-        paced_call(|| 0);
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed >= std::time::Duration::from_millis(40),
-            "expected ≥40ms gap, got {:?}",
-            elapsed
-        );
-    }
-
-    /// `paced_call`: a single call after a quiescent gap pays no
-    /// spacing cost — only consecutive bursts trigger the pacing. This
-    /// is the dominant production case (user clicks a button; one secret
-    /// read happens; no pacing needed). Uses a small override + small
-    /// sleep so the test doesn't pollute the scheduler for timing-
-    /// sensitive sibling tests (kg_sync subprocess watchdogs).
-    #[test]
-    fn paced_call_skips_spacing_when_idle() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let _g = TestSpacingGuard::new(std::time::Duration::from_millis(20));
-        // Establish a baseline, then wait past the spacing window.
-        paced_call(|| 0);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        let start = std::time::Instant::now();
-        paced_call(|| 0);
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_millis(10),
-            "post-idle call must not pay spacing cost; got {:?}",
-            elapsed
-        );
-    }
-
     /// Backoff schedule shape is fixed: 3 entries, monotonically
     /// increasing, last entry ≥1s. Catches a regression where someone
     /// shortens the tail and the daemon-respawn case stops being covered.
@@ -3511,16 +3096,6 @@ mod tests {
                 >= std::time::Duration::from_millis(1000),
             "tail must be ≥1s to cover gnome-keyring SIGTRAP respawn"
         );
-    }
-
-    /// Production spacing must be ≥150ms. The constant is the
-    /// load-bearing one — `paced_call` reads it via `current_spacing()`
-    /// outside `#[cfg(test)]`. Pinned so a future "speed up production"
-    /// patch has to come back and re-evaluate the daemon-load
-    /// trade-off.
-    #[test]
-    fn min_call_spacing_is_at_least_150ms() {
-        assert!(MIN_CALL_SPACING >= std::time::Duration::from_millis(150));
     }
 
     // ─── Mock keychain seam tests (v0.2.42 W5-TEST3a) ─────────────────────
@@ -3795,92 +3370,198 @@ mod tests {
 
     // ─── v0.2.76 (A4): bounded-timeout worker primitive ───────────────────
 
-    /// Normal op passes through unchanged: a fast closure completes and its
-    /// value is returned (leave-alone case).
-    #[test]
-    fn keychain_timeout_passes_through_fast_op() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let out = run_keychain_with_timeout(|| 40 + 2);
-        assert!(matches!(out, Ok(42)), "fast op must pass through: {:?}", out);
-    }
-
-    /// ACT: a deliberately-blocking op times out within the (shortened) bound
-    /// and returns `TimedOut`; the NEXT op fast-fails `WorkerStuck` while the
-    /// prior job is still parked on the worker. Then the blocking op is
-    /// released so the worker drains (no cross-test pollution).
-    #[test]
-    fn keychain_timeout_blocks_then_worker_stuck_then_recovers() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(100));
-
-        // The blocking op parks on this channel until the test releases it.
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let release_rx = std::sync::Mutex::new(release_rx);
-
-        let blocked = run_keychain_with_timeout(move || {
-            // Block until released — models a wedged Secret Service call.
-            let _ = release_rx.lock().unwrap().recv();
-            7
-        });
-        assert!(
-            matches!(blocked, Err(KeychainTimeout::TimedOut)),
-            "blocking op must time out: {:?}",
-            blocked
-        );
-
-        // The worker is still parked on the prior job → the next op fast-fails.
-        let stuck = run_keychain_with_timeout(|| 1);
-        assert!(
-            matches!(stuck, Err(KeychainTimeout::WorkerStuck)),
-            "a queued op must fast-fail while the worker is stuck: {:?}",
-            stuck
-        );
-
-        // Release the parked job; the worker drains and recovers.
-        release_tx.send(()).unwrap();
-        // Poll until the worker is idle again (in_flight back to 0), then a
-        // fresh op must pass through. Bounded loop so a regression can't hang.
-        let mut recovered = false;
-        for _ in 0..200 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            if let Ok(v) = run_keychain_with_timeout(|| 99) {
-                assert_eq!(v, 99);
-                recovered = true;
-                break;
-            }
-        }
-        assert!(recovered, "worker must recover after the wedged op drains");
-    }
-
     /// The shared probe returns `false` (conservative default) when the
-    /// underlying op would exceed the bound — proven here by driving the
-    /// timeout primitive with a blocking closure under a short bound. (The
-    /// real `keyring_probe_available` uses the same primitive; we don't touch
-    /// the OS keychain in unit tests.)
+    /// underlying op exceeds the bound — driven by a blocking closure under a
+    /// short bound through the same primitive (no OS keychain touched).
     #[test]
     fn keychain_probe_timeout_is_false() {
         let _lock = test_serialize::keychain_serialize_lock();
         let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(80));
-
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = std::sync::Mutex::new(release_rx);
-
-        // Same shape as keyring_probe_available's body: op → bool, timeout → false.
         let probe = run_keychain_with_timeout(move || {
             let _ = release_rx.lock().unwrap().recv();
             true
         })
         .unwrap_or(false);
         assert!(!probe, "a probe that exceeds the bound must be false");
-
-        // Drain so the worker recovers for later tests.
         release_tx.send(()).unwrap();
-        for _ in 0..200 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            if run_keychain_with_timeout(|| ()).is_ok() {
-                break;
+        crate::secrets_worker::tests::wait_worker_recovered();
+    }
+
+    /// v0.2.102 — an Interactive op may sit on a user unlock prompt for the
+    /// shared connection's prompt bound; it must never be treated as hung
+    /// before that bound expires. Kept HERE (not in `secrets_worker`) because
+    /// it pins a cross-module relationship — the worker's stuck threshold vs
+    /// `secrets_ss_connection`'s prompt bound — and the K-3 guard confines
+    /// the `secrets_ss_connection::` path to this file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_stuck_threshold_outlasts_prompt_bound() {
+        use crate::secrets_worker::{KEYCHAIN_INTERACTIVE_STUCK_AFTER, KEYCHAIN_OP_TIMEOUT};
+        assert!(
+            KEYCHAIN_INTERACTIVE_STUCK_AFTER.as_secs()
+                > crate::secrets_ss_connection::SHARED_MAX_PROMPT_TIMEOUT_SECS,
+            "the Interactive stuck threshold must exceed the prompt bound"
+        );
+        assert!(KEYCHAIN_INTERACTIVE_STUCK_AFTER > KEYCHAIN_OP_TIMEOUT);
+    }
+
+    /// v0.2.102 T5 — the "has a keychain backend" memo records ONLY a definite
+    /// absence (red-first: pre-v0.2.102 a busy worker made the probe answer
+    /// `false`, memoized for the process, so every degraded read thereafter
+    /// answered `key_not_active`). Unknown and Present answer `true`, unmemoized.
+    #[test]
+    fn backend_availability_memoizes_only_definite_absence() {
+        let memo = std::sync::OnceLock::new();
+        assert!(backend_availability_decision(&memo, || BackendPresence::Unknown));
+        assert!(memo.get().is_none(), "a transient/unknown answer must never be memoized");
+        assert!(backend_availability_decision(&memo, || BackendPresence::Present));
+        assert!(memo.get().is_none(), "presence is re-asked, never pinned");
+        assert!(!backend_availability_decision(&memo, || BackendPresence::Absent));
+        assert!(memo.get().is_some(), "a definite absence is memoized");
+    }
+
+    /// v0.2.102 T5b — the backend check never touches the keychain worker or
+    /// writes a canary: it answers while the worker is parked on a hung op
+    /// (red-first: pre-v0.2.102 it went through the busy worker and got
+    /// `false`). With the presence probe overridden to Present, a hung worker
+    /// must not change the answer.
+    #[test]
+    fn backend_available_is_independent_of_a_busy_worker() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(100));
+        let _presence = TestBackendPresenceGuard::new(BackendPresence::Present);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::thread::spawn(move || {
+            run_keychain_with_timeout(crate::secrets_worker::tests::parked_op(release_rx, 0))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            keychain_backend_available(),
+            "a busy/hung worker must not make the host look keychain-less"
+        );
+        let _ = parked.join();
+        release_tx.send(()).unwrap();
+        crate::secrets_worker::tests::wait_worker_recovered();
+    }
+
+    /// v0.2.102 T7 — inside one `SecretReadSession` (one hub request) the lock
+    /// state is probed ONCE, however many Background reads follow (red-first:
+    /// pre-v0.2.102 every read ran its own probe job). Outside a session each
+    /// call still probes (unchanged behaviour).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lock_state_probed_once_per_session() {
+        use std::sync::atomic::Ordering;
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _body = TestProbeBodyGuard::new(Some(false));
+        let base = LOCK_PROBE_RUNS.load(Ordering::SeqCst);
+        {
+            let _session = SecretReadSession::new();
+            for _ in 0..5 {
+                assert_eq!(probe_default_collection_locked(), Some(false));
             }
         }
+        assert_eq!(
+            LOCK_PROBE_RUNS.load(Ordering::SeqCst) - base,
+            1,
+            "five reads in one session must cost ONE lock probe"
+        );
+        let base = LOCK_PROBE_RUNS.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            assert_eq!(probe_default_collection_locked(), Some(false));
+        }
+        assert_eq!(LOCK_PROBE_RUNS.load(Ordering::SeqCst) - base, 3);
+    }
+
+    /// v0.2.102 (W6-AB) — a SLOW keychain read is waited for, not dropped.
+    /// The caller's bounded wait (`KEYCHAIN_OP_TIMEOUT`) gives up on a read
+    /// that is still running; the read itself completes on the worker. Its
+    /// value must land in the hub's value cache so the client's ONE retry
+    /// (`agent_secrets._hub_get`, the shell/PS resolvers) is answered
+    /// without a second keychain round-trip. Red-first: before W6-AB the late
+    /// result was discarded with the dropped result channel and the retry had
+    /// to queue another slow read. Drives the REAL `get_with_context` →
+    /// `read_keychain_value` → worker path; only the keychain call itself is
+    /// replaced by a slow stand-in (no OS keychain is touched).
+    #[cfg(unix)]
+    #[test]
+    fn slow_background_read_lands_in_the_value_cache_after_its_caller_gave_up() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BODY_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn slow_body(_service: &str, _key: &str) -> Result<Option<String>, String> {
+            BODY_CALLS.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(Some("w6ab-synthetic-late-value".to_string()))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let _pace = TestPacePathGuard::new(dir.path().join("keyring.pace"));
+        let _probe = TestProbeGuard::new(Some(false));
+        let _ttl = TestValueCacheTtlGuard::new(std::time::Duration::from_secs(60));
+        let _body = for_tests::TestGetBodyGuard::new(slow_body);
+        let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(60));
+        let module = "w6ab-late-read-module";
+        let key = "W6AB_LATE_READ_KEY";
+        BODY_CALLS.store(0, Ordering::SeqCst);
+
+        let first = get_with_context(SecretScope::Global, module, key, CallContext::Background);
+        let err = first.expect_err("the caller must give up on a read slower than its wait");
+        assert!(is_keychain_unavailable_detail(&err.to_string()), "got: {err}");
+
+        // Let the read finish on the worker, then ask again: answered from the
+        // value cache, no second keychain call.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let second = get_with_context(SecretScope::Global, module, key, CallContext::Background)
+            .expect("the retry must be served the late value");
+        assert_eq!(second.as_deref(), Some("w6ab-synthetic-late-value"));
+        assert_eq!(BODY_CALLS.load(Ordering::SeqCst), 1, "the retry must not re-read the keychain");
+        drop(_tg);
+        crate::secrets_worker::tests::wait_worker_recovered();
+    }
+
+    /// The leave-alone case: an INTERACTIVE read (a user click) is never
+    /// value-cached, late or not — the cache is for Background reads only.
+    #[cfg(unix)]
+    #[test]
+    fn slow_interactive_read_is_not_kept_in_the_value_cache() {
+        fn slow_body(_service: &str, _key: &str) -> Result<Option<String>, String> {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(Some("w6ab-synthetic-interactive".to_string()))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let _pace = TestPacePathGuard::new(dir.path().join("keyring.pace"));
+        let _ttl = TestValueCacheTtlGuard::new(std::time::Duration::from_secs(60));
+        let _body = for_tests::TestGetBodyGuard::new(slow_body);
+        let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(40));
+        let module = "w6ab-interactive-module";
+        let key = "W6AB_INTERACTIVE_KEY";
+        assert!(get_with_context(SecretScope::Global, module, key, CallContext::Interactive).is_err());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let service = SecretScope::Global.service_name(module);
+        assert!(value_cache_lookup(&service, key).is_none());
+        drop(_tg);
+        crate::secrets_worker::tests::wait_worker_recovered();
+    }
+
+    /// v0.2.102 — a mock read failing as UNAVAILABILITY flags the active
+    /// session (the hub turns that into 503 `keychain_unavailable`); an
+    /// ordinary read error does not.
+    #[test]
+    fn unavailable_read_flags_the_session_but_plain_error_does_not() {
+        let _g = for_tests::MockGuard::new();
+        {
+            let _session = SecretReadSession::new();
+            for_tests::fail_next_get("plain");
+            assert!(get_with_context(SecretScope::Global, "m", "plain", CallContext::Background).is_err());
+            assert!(!SecretReadSession::saw_unavailable());
+            for_tests::make_next_get_unavailable("busy");
+            let err = get_with_context(SecretScope::Global, "m", "busy", CallContext::Background)
+                .unwrap_err();
+            assert!(is_keychain_unavailable_detail(&err.to_string()));
+            assert!(SecretReadSession::saw_unavailable());
+        }
+        assert!(!SecretReadSession::saw_unavailable(), "no session → false");
     }
 
     /// K-2 STRUCTURAL PIN: the Background lock probe must route through the
@@ -4038,7 +3719,7 @@ mod tests {
         // LEAVE-ALONE: a legit multi-line PEM passes the allowlist under the
         // DEFAULT guard (no opt-out needed) and is written verbatim.
         let pem =
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n-----END RSA PRIVATE KEY-----";
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n-----END RSA PRIVATE KEY-----"; // vco-secret-scan: test-placeholder
         set(scope, "deploy", "deploy_key", pem).unwrap();
         assert_eq!(get(scope, "deploy", "deploy_key").unwrap().as_deref(), Some(pem));
     }
@@ -4544,463 +4225,6 @@ mod tests {
         assert!(!is_transient(&keyring::Error::NoEntry));
     }
 
-    /// T20 — cross-process flock pacing: two sequential paced calls through the
-    /// file gate write MONOTONIC timestamps to the pace file, and the second
-    /// pays the (test-shrunk) spacing. Uses an isolated temp pace path so no
-    /// real vct_root is touched.
-    #[cfg(unix)]
-    #[test]
-    fn cross_process_pace_writes_monotonic_timestamps() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let guard = TestPacePathGuard::new(dir.path().join("keyring.pace"));
-        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(30));
-
-        // First paced op establishes a timestamp.
-        with_cross_process_pace(|| ());
-        let t1 = guard.pace_timestamp().expect("pace file has a timestamp");
-
-        // Second op back-to-back must pay ≥~20ms spacing and write a later ts.
-        let start = std::time::Instant::now();
-        with_cross_process_pace(|| ());
-        let elapsed = start.elapsed();
-        let t2 = guard.pace_timestamp().expect("pace file still has a timestamp");
-
-        assert!(t2 >= t1, "pace timestamps must be monotonic: {t2} >= {t1}");
-        assert!(
-            elapsed >= std::time::Duration::from_millis(20),
-            "back-to-back paced op must wait ~spacing; got {:?}",
-            elapsed
-        );
-        assert_eq!(guard.warn_count(), 0, "healthy pace path must not warn");
-    }
-
-    /// T20 (fallback leg) — an UNWRITABLE pace path degrades to in-process
-    /// pacing with EXACTLY ONE warn, and the op still runs (soft-fail, never a
-    /// hard block on the user's secret read).
-    #[cfg(unix)]
-    #[test]
-    fn cross_process_pace_unwritable_path_warns_once_and_proceeds() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        // A file used AS a directory parent → create_dir_all + open both fail.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let blocker = dir.path().join("iamafile");
-        std::fs::write(&blocker, b"x").unwrap();
-        // pace path = <file>/sub/keyring.pace — parent creation fails because
-        // `blocker` is a regular file, not a directory.
-        let guard = TestPacePathGuard::new(blocker.join("sub").join("keyring.pace"));
-
-        let mut ran = false;
-        with_cross_process_pace(|| ran = true);
-        assert!(ran, "op must still run when the pace file is unwritable");
-        assert_eq!(
-            guard.warn_count(),
-            1,
-            "an unwritable pace path must warn exactly once (one-shot latch)"
-        );
-
-        // A second attempt must NOT warn again (one-shot).
-        with_cross_process_pace(|| ());
-        assert_eq!(guard.warn_count(), 1, "the degrade warn is one-shot per latch");
-    }
-
-    // ─── P0: the pace-lock acquire must be BOUNDED ────────────────────────────
-    //
-    // A blocking `flock(LOCK_EX)` here let ONE process holding the lock (parked
-    // on an interactive unlock prompt, which dbus-secret-service polls for up
-    // to a YEAR) permanently wedge every OTHER VCO process: their keychain
-    // worker threads blocked in the acquire forever, so every later keychain
-    // call in those processes fast-failed `WorkerStuck` with no self-heal.
-    // Restarting the GUI did not help — only killing the lock HOLDER did,
-    // because process death is what released the lock.
-    //
-    // These pins cover the decision on BOTH sides: acquire when the lock is (or
-    // becomes) available, degrade when it does not — and prove the degrade
-    // costs pacing only, never the caller's result.
-
-    /// Hold an exclusive flock on `path` for `hold` on a background thread,
-    /// from a SEPARATE open file description (flock locks are per-OFD, so a
-    /// second `open()` in this same process contends exactly like a sibling
-    /// launcher/hub process would — the same technique the T-1 test uses).
-    ///
-    /// The returned receiver fires once the lock is genuinely held, so a test
-    /// never races the holder's startup. The holder releases on its OWN timer
-    /// rather than on a signal from the test: that way a REGRESSION to the
-    /// blocking acquire makes the test FAIL (it waits out the hold, then
-    /// acquires, then busts the assertions) instead of deadlocking the suite.
-    #[cfg(unix)]
-    fn hold_flock_for(
-        path: std::path::PathBuf,
-        hold: std::time::Duration,
-    ) -> (
-        std::thread::JoinHandle<()>,
-        std::sync::mpsc::Receiver<()>,
-    ) {
-        use std::os::unix::io::AsRawFd;
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let handle = std::thread::spawn(move || {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .expect("holder opens the pace file");
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            assert_eq!(rc, 0, "holder must take the exclusive lock");
-            tx.send(()).expect("signal that the lock is held");
-            std::thread::sleep(hold);
-            unsafe {
-                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-            }
-        });
-        (handle, rx)
-    }
-
-    /// LEAVE-ALONE leg: with the lock FREE, the bounded acquire behaves exactly
-    /// as the blocking one did — it takes the lock immediately, paces, stamps
-    /// the completion timestamp, and does NOT warn. Guards against
-    /// over-correcting into a fix that degrades eagerly (a bare `LOCK_NB` with
-    /// no poll loop, or a zero deadline) and quietly loses cross-process pacing
-    /// for everyone.
-    #[cfg(unix)]
-    #[test]
-    fn pace_lock_uncontended_acquires_promptly_and_stamps() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let guard = TestPacePathGuard::new(dir.path().join("keyring.pace"));
-        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(5));
-        let deadline = std::time::Duration::from_millis(400);
-        let _dl = cross_process_pace::TestPaceDeadlineGuard::new(deadline);
-
-        let mut calls = 0u32;
-        let start = std::time::Instant::now();
-        let out = with_cross_process_pace(|| {
-            calls += 1;
-            "value".to_string()
-        });
-        let elapsed = start.elapsed();
-
-        assert_eq!(out, "value", "the op's value is returned verbatim");
-        assert_eq!(calls, 1, "the op runs exactly once");
-        assert!(
-            elapsed < deadline,
-            "an UNCONTENDED acquire must succeed on the first non-blocking \
-             attempt, not wait out the deadline; took {elapsed:?}"
-        );
-        assert!(
-            guard.pace_timestamp().is_some(),
-            "holding the lock must still stamp the completion timestamp"
-        );
-        assert_eq!(
-            guard.warn_count(),
-            0,
-            "a healthy uncontended acquire must not warn (no phantom degrade)"
-        );
-    }
-
-    /// ACT leg (the P0 fix): when another process holds the lock past the
-    /// acquire deadline, we WAIT the deadline, then DEGRADE — we do not block
-    /// until the holder releases. The op still runs exactly once, its value is
-    /// returned verbatim, the degrade is reported exactly once, and the pace
-    /// file we do NOT own is left byte-identical.
-    ///
-    /// RED-PROOF: restore the blocking `flock(fd, libc::LOCK_EX)` in
-    /// `acquire_and_space` and this test fails on three counts — `elapsed`
-    /// reaches the full 2.5s hold (busting the `elapsed < HOLD` bound), the
-    /// warn count is 0 (the wedge was silent), and the pace file is
-    /// overwritten with a real completion stamp.
-    #[cfg(unix)]
-    #[test]
-    fn pace_lock_contended_past_deadline_degrades_bounded_and_warns_once() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pace = dir.path().join("keyring.pace");
-        // Seed a recognisable stamp so we can prove the degraded path does not
-        // write a file it does not hold the lock on.
-        std::fs::write(&pace, b"12345").expect("seed the pace file");
-        let guard = TestPacePathGuard::new(pace.clone());
-        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(5));
-        let deadline = std::time::Duration::from_millis(300);
-        let _dl = cross_process_pace::TestPaceDeadlineGuard::new(deadline);
-
-        // Hold far longer than the deadline — this stands in for a sibling
-        // process parked on an unlock prompt.
-        const HOLD: std::time::Duration = std::time::Duration::from_millis(2500);
-        let (holder, held) = hold_flock_for(pace.clone(), HOLD);
-        held.recv_timeout(std::time::Duration::from_secs(5))
-            .expect("holder thread must take the lock");
-
-        let mut calls = 0u32;
-        let start = std::time::Instant::now();
-        let out = with_cross_process_pace(|| {
-            calls += 1;
-            "secret-shaped-value".to_string()
-        });
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed >= deadline,
-            "the acquire must genuinely WAIT its budget before degrading \
-             (ordinary contention should still get paced); waited {elapsed:?}"
-        );
-        assert!(
-            elapsed < HOLD,
-            "the acquire must give up at the deadline, NOT block until the \
-             holder releases; waited {elapsed:?} against a {HOLD:?} hold — \
-             this is the wedge that took down both the launcher and the hub"
-        );
-        assert_eq!(
-            out, "secret-shaped-value",
-            "the degrade must not alter the caller's result"
-        );
-        assert_eq!(calls, 1, "the degrade must not skip or repeat the op");
-        assert_eq!(
-            guard.warn_count(),
-            1,
-            "giving up on the lock must be OBSERVABLE — 'could not acquire' is \
-             not the same fact as 'nothing to pace'"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&pace).expect("read pace file"),
-            "12345",
-            "the degraded path must NOT write the pace file — another process \
-             holds the lock and is reading it under that lock"
-        );
-
-        // One-shot: a second degrade in the same process does not warn again.
-        let out2 = with_cross_process_pace(|| "again".to_string());
-        assert_eq!(out2, "again");
-        assert_eq!(
-            guard.warn_count(),
-            1,
-            "the contended-degrade warn is one-shot per process"
-        );
-
-        holder.join().expect("holder thread joins");
-    }
-
-    /// LEAVE-ALONE leg: a lock held only BRIEFLY (released well within the
-    /// deadline) must be waited for and then acquired NORMALLY — no degrade, no
-    /// warn, and a real completion stamp proving we held it. This is what keeps
-    /// the G5 gnome-keyring protection intact for ordinary contention, which is
-    /// the overwhelmingly common case.
-    ///
-    /// RED-PROOF: shrink the deadline to `Duration::ZERO` (i.e. a bare
-    /// `LOCK_NB` with no poll loop) and this fails — warn count 1, no stamp.
-    #[cfg(unix)]
-    #[test]
-    fn pace_lock_released_within_deadline_acquires_without_degrading() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pace = dir.path().join("keyring.pace");
-        // A stamp of 1ns-since-epoch: any REAL completion stamp is astronomically
-        // larger, so a strict `>` proves the acquired path wrote it.
-        std::fs::write(&pace, b"1").expect("seed the pace file");
-        let guard = TestPacePathGuard::new(pace.clone());
-        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(5));
-        let deadline = std::time::Duration::from_secs(5);
-        let _dl = cross_process_pace::TestPaceDeadlineGuard::new(deadline);
-
-        const HOLD: std::time::Duration = std::time::Duration::from_millis(400);
-        let (holder, held) = hold_flock_for(pace.clone(), HOLD);
-        held.recv_timeout(std::time::Duration::from_secs(5))
-            .expect("holder thread must take the lock");
-
-        let mut calls = 0u32;
-        let start = std::time::Instant::now();
-        let out = with_cross_process_pace(|| {
-            calls += 1;
-            7u32
-        });
-        let elapsed = start.elapsed();
-
-        assert_eq!(out, 7);
-        assert_eq!(calls, 1);
-        assert!(
-            elapsed >= HOLD - std::time::Duration::from_millis(80),
-            "the acquire must WAIT for a briefly-held lock rather than \
-             degrading on first contention; returned after only {elapsed:?}"
-        );
-        assert!(
-            elapsed < deadline,
-            "and it must acquire as soon as the holder releases, well inside \
-             the deadline; took {elapsed:?}"
-        );
-        assert_eq!(
-            guard.warn_count(),
-            0,
-            "a lock released inside the deadline is NOT a degrade — warning \
-             here would cry wolf on ordinary contention"
-        );
-        assert!(
-            guard.pace_timestamp().unwrap_or(0) > 1,
-            "we really held the lock, so the completion stamp must have been \
-             written (proving this was an acquire, not a silent degrade)"
-        );
-
-        holder.join().expect("holder thread joins");
-    }
-
-    /// The contended-degrade warn must have its OWN one-shot latch: an earlier,
-    /// unrelated "pace file unusable" warn must not silently swallow the report
-    /// of a real cross-process wedge. Same conflation family as `[]`-on-
-    /// transport-failure meaning "absent" — two different facts must not share
-    /// one suppression bit.
-    ///
-    /// RED-PROOF: point the contended branch at the shared `warn_once` (one
-    /// latch for both causes) and the final count stays 1 instead of 2.
-    #[cfg(unix)]
-    #[test]
-    fn contended_degrade_warn_is_not_swallowed_by_unusable_pace_warn() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(5));
-        let deadline = std::time::Duration::from_millis(200);
-        let _dl = cross_process_pace::TestPaceDeadlineGuard::new(deadline);
-
-        // (1) Trip the UNUSABLE-pace-file degrade: a regular file used as a
-        // directory parent makes both create_dir_all and open fail.
-        let blocker = dir.path().join("iamafile");
-        std::fs::write(&blocker, b"x").expect("write blocker file");
-        let guard = TestPacePathGuard::new(blocker.join("sub").join("keyring.pace"));
-        with_cross_process_pace(|| ());
-        assert_eq!(
-            guard.warn_count(),
-            1,
-            "the unusable-pace-file degrade warns once"
-        );
-
-        // (2) WITHOUT resetting the latches (that is the whole point), switch to
-        // a usable but CONTENDED pace file and degrade again.
-        let pace = dir.path().join("keyring.pace");
-        let prev = cross_process_pace::set_test_pace_path(Some(pace.clone()));
-        let (holder, held) = hold_flock_for(pace.clone(), std::time::Duration::from_millis(1500));
-        held.recv_timeout(std::time::Duration::from_secs(5))
-            .expect("holder thread must take the lock");
-        with_cross_process_pace(|| ());
-        let after = cross_process_pace::WARN_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-        // Restore the path override before asserting so a failure still leaves
-        // the global seam in the state `guard`'s Drop expects.
-        cross_process_pace::set_test_pace_path(prev);
-        holder.join().expect("holder thread joins");
-
-        assert_eq!(
-            after, 2,
-            "a contended-lock degrade must still report itself after an \
-             unrelated degrade warn already fired — separate one-shot latches"
-        );
-    }
-
-    /// CALLER-LEVEL: the degrade must cost pacing ONLY. Drives the exact
-    /// production sandwich `with_cross_process_pace(|| retry_with_backoff(op))`
-    /// — the middle layer is the only thing that differs between the acquired
-    /// and degraded paths — and asserts the caller receives an IDENTICAL
-    /// outcome either way, for a hit, a genuine miss, and a transient blip that
-    /// recovers on retry. A degrade that dropped, duplicated, or reclassified
-    /// the op would show up here as a difference between the two columns.
-    #[cfg(unix)]
-    #[test]
-    fn degraded_pace_gives_the_caller_identical_results_to_the_acquired_path() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pace = dir.path().join("keyring.pace");
-        let _guard = TestPacePathGuard::new(pace.clone());
-        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(1));
-        let _dl = cross_process_pace::TestPaceDeadlineGuard::new(
-            std::time::Duration::from_millis(150),
-        );
-
-        // The three outcomes a real keychain op can produce, exercised through
-        // the real `retry_with_backoff` (so pacing, classification and the
-        // attempt budget are the production ones).
-        fn exercise() -> (
-            (keyring::Result<String>, u32),
-            (keyring::Result<String>, u32),
-            (keyring::Result<String>, u32),
-        ) {
-            let mut hit_calls = 0u32;
-            let hit = with_cross_process_pace(|| {
-                retry_with_backoff(|| {
-                    hit_calls += 1;
-                    Ok("s3cret-value".to_string())
-                })
-            });
-            let mut miss_calls = 0u32;
-            let miss = with_cross_process_pace(|| {
-                retry_with_backoff(|| {
-                    miss_calls += 1;
-                    Err(keyring::Error::NoEntry)
-                })
-            });
-            let mut blip_calls = 0u32;
-            let blip = with_cross_process_pace(|| {
-                retry_with_backoff(|| {
-                    blip_calls += 1;
-                    if blip_calls == 1 {
-                        Err(keyring::Error::PlatformFailure(Box::new(
-                            std::io::Error::other("daemon hiccup"),
-                        )))
-                    } else {
-                        Ok("recovered-value".to_string())
-                    }
-                })
-            });
-            (
-                (hit, hit_calls),
-                (miss, miss_calls),
-                (blip, blip_calls),
-            )
-        }
-
-        // Column A: lock free → acquired path.
-        let (a_hit, a_miss, a_blip) = exercise();
-
-        // Column B: lock held for the whole run → degraded path.
-        let (holder, held) = hold_flock_for(pace.clone(), std::time::Duration::from_secs(3));
-        held.recv_timeout(std::time::Duration::from_secs(5))
-            .expect("holder thread must take the lock");
-        let (b_hit, b_miss, b_blip) = exercise();
-        holder.join().expect("holder thread joins");
-
-        assert_eq!(
-            a_hit.0.as_deref().ok(),
-            Some("s3cret-value"),
-            "acquired path returns the value"
-        );
-        assert_eq!(
-            b_hit.0.as_deref().ok(),
-            a_hit.0.as_deref().ok(),
-            "the DEGRADED path must return the same value — losing the pace \
-             lock must never lose or alter a secret"
-        );
-        assert_eq!(
-            (a_hit.1, b_hit.1),
-            (1, 1),
-            "one attempt on both paths (no dropped or duplicated keychain op)"
-        );
-
-        assert!(
-            matches!(a_miss.0, Err(keyring::Error::NoEntry))
-                && matches!(b_miss.0, Err(keyring::Error::NoEntry)),
-            "a genuine miss stays a miss on both paths — a degrade must not \
-             turn 'absent' into an error or vice versa"
-        );
-        assert_eq!((a_miss.1, b_miss.1), (1, 1), "a miss is not retried");
-
-        assert_eq!(
-            b_blip.0.as_deref().ok(),
-            a_blip.0.as_deref().ok(),
-            "a transient blip recovers identically on both paths"
-        );
-        assert_eq!(
-            (a_blip.1, b_blip.1),
-            (2, 2),
-            "same attempt budget on both paths (degrading must not change \
-             retry semantics)"
-        );
-    }
-
     /// PROMPT-TIMEOUT SEMANTICS (the second half of the P0 fix). When the
     /// shared Secret-Service connection's `SHARED_MAX_PROMPT_TIMEOUT_SECS`
     /// expires, dbus-secret-service returns `Error::Prompt`, which
@@ -5047,95 +4271,156 @@ mod tests {
         );
     }
 
-    /// T-1 (v0.2.83): `keychain_serialize_lock()` holds the PRODUCTION
-    /// `keyring.pace` flock while alive (serializing against a running launcher),
-    /// and sets `TEST_HOLDS_PRODUCTION_PACE` so a nested `acquire_and_space`
-    /// (the test's own real `set`, run on the worker thread) does NOT deadlock.
+    /// v0.2.102 W6-KC (replaces the v0.2.83 T-1 pin, which asserted the
+    /// opposite): a keychain test holding `keychain_serialize_lock()` NEVER
+    /// holds the production `keyring.pace` flock, so a running hub or launcher
+    /// is never made to wait on a test (the 2026-10-13 stall: the hub waited up
+    /// to 30s for the flock a test held for its whole duration, and answered
+    /// its callers "keychain busy" after 10s).
     ///
-    /// Proof of exclusivity: with the guard held, a NON-BLOCKING flock on the
-    /// same real pace file from a separate fd fails (EWOULDBLOCK); after drop it
-    /// succeeds. Proof of no-self-deadlock: while the guard is held,
-    /// `with_cross_process_pace(op)` (the SAME wrapper `secrets::set` uses)
-    /// returns promptly — the reentrancy skip fires — rather than hanging on the
-    /// held flock. The pace file is the real `<vct_root>/keyring.pace`; touching
-    /// it is benign (the launcher creates/locks it anyway) and the keychain lock
-    /// serializes every keychain test so only one holds it at a time.
+    /// Proved three ways while the guard is held: (a) this process's keychain
+    /// ops resolve the TEST pace file; (b) the wrapper `secrets::set/get/delete`
+    /// run on the worker (`with_cross_process_pace`) runs and stamps that test
+    /// file — pacing is kept, per op, not skipped; (c) Linux: the kernel's lock
+    /// table (`/proc/locks`) shows NO flock on the production file held by this
+    /// process. Red on the T-1 code: (c) finds this process's pid on it.
+    ///
+    /// (c) reads the lock table instead of contending for the flock, because a
+    /// contention probe cannot tell WHO holds it: on a machine whose live hub is
+    /// itself mid-keychain-op (or wedged on one — observed while writing this
+    /// test), a probe would blame the test for the hub's own hold. It inspects
+    /// the production file as this test's environment resolves it — the file a
+    /// live hub locks — without opening or locking it.
     #[cfg(unix)]
     #[test]
-    fn keychain_serialize_lock_holds_pace_and_is_reentrant_for_nested_ops() {
-        use std::os::unix::io::AsRawFd;
+    fn keychain_serialize_lock_never_holds_the_production_pace_lock() {
+        let _guard = test_serialize::keychain_serialize_lock();
 
-        let pace_path = crate::paths::vct_root_dir().join("keyring.pace");
+        // (a) the redirect is in force.
+        let test_file = cross_process_pace::test_baton_pace_file_path();
+        let production = cross_process_pace::production_pace_file_path();
+        assert_ne!(test_file, production, "the test pace file must not be the production one");
+        assert_eq!(
+            cross_process_pace::pace_file_path(),
+            test_file,
+            "while a keychain test holds the baton, keychain ops pace on the test file"
+        );
 
-        let probe_blocked;
-        let nested_ran;
+        // (b) a nested paced op runs and stamps the TEST file.
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut ran = false;
+        with_cross_process_pace(|| ran = true);
+        assert!(ran, "the paced op must run under the held guard");
+        let stamp = std::fs::read_to_string(&test_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u128>().ok());
+        assert!(
+            matches!(stamp, Some(t) if t >= before),
+            "the op's completion stamp must land in the test pace file {test_file:?}; got {stamp:?}"
+        );
+
+        // (c) no flock on the production file belongs to this process.
+        #[cfg(target_os = "linux")]
         {
-            let _guard = test_serialize::keychain_serialize_lock();
-            if !pace_path.exists() {
-                eprintln!(
-                    "[vct-tests] keyring.pace absent after guard (root unwritable) \
-                     — skipping T-1 exclusivity assertion"
-                );
-                return;
-            }
-            // (a) A separate fd cannot take the exclusive lock while we hold it.
-            let probe = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&pace_path)
-                .expect("open pace file for probe");
-            let rc = unsafe {
-                libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+            use std::os::unix::fs::MetadataExt;
+            let Ok(meta) = std::fs::metadata(&production) else {
+                return; // absent: nothing can hold a lock on it
             };
-            probe_blocked = rc != 0;
-            if rc == 0 {
-                unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) };
-            }
-
-            // (b) NO self-deadlock: the SAME wrapper secrets::set uses runs
-            // promptly under the held guard (reentrancy skip fires). If the skip
-            // were absent, this call would block forever on the held flock and
-            // the test would hang (caught by the harness timeout, but the assert
-            // documents intent).
-            let mut ran = false;
-            with_cross_process_pace(|| ran = true);
-            nested_ran = ran;
-            // _guard drops here → clears the flag, releases the flock.
+            let me = std::process::id();
+            let holders = flock_holder_pids(meta.dev(), meta.ino());
+            assert!(
+                !holders.contains(&me),
+                "this process (pid {me}) holds the production pace flock {production:?} while a \
+                 keychain test holds its guard — a live hub would stall on it (holders: {holders:?})"
+            );
         }
+    }
 
-        // After drop, the flag is cleared and the flock is free.
-        assert!(
-            !cross_process_pace::TEST_HOLDS_PRODUCTION_PACE
-                .load(std::sync::atomic::Ordering::SeqCst),
-            "the reentrancy flag must be cleared once the guard drops"
-        );
-        let probe = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&pace_path)
-            .expect("open pace file post-drop");
-        let rc_after =
-            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        let probe_after = rc_after == 0;
-        if rc_after == 0 {
-            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) };
+    /// Pids holding a granted FLOCK on device `dev` + inode `ino`, from
+    /// `/proc/locks` (`<n>: FLOCK  ADVISORY  WRITE <pid> <maj>:<min>:<ino> 0
+    /// EOF`; blocked waiters are `<n>: -> FLOCK …` lines and are not
+    /// holders). BOTH the device (maj:min) and the inode must match:
+    /// inode numbers are unique only per-filesystem, so an inode-only
+    /// match can blame an unrelated lock on a file with the same inode on
+    /// another device (W6-KC R3, K3).
+    #[cfg(target_os = "linux")]
+    fn flock_holder_pids(dev: u64, ino: u64) -> Vec<u32> {
+        let (want_maj, want_min) = unsafe {
+            (
+                libc::major(dev as libc::dev_t),
+                libc::minor(dev as libc::dev_t),
+            )
+        };
+        let table = std::fs::read_to_string("/proc/locks").expect("read /proc/locks");
+        table
+            .lines()
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() < 6 || f[1] != "FLOCK" {
+                    return None;
+                }
+                let id: Vec<&str> = f[5].split(':').collect();
+                if id.len() != 3 {
+                    return None;
+                }
+                let (Ok(line_maj), Ok(line_min), Ok(line_ino)) = (
+                    id[0].parse::<u32>(),
+                    id[1].parse::<u32>(),
+                    id[2].parse::<u64>(),
+                ) else {
+                    return None;
+                };
+                if line_maj == want_maj && line_min == want_min && line_ino == ino {
+                    f[4].parse().ok()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// v0.2.102 W6-KC: production code keeps the production lock. With no test
+    /// layer installed, the pace file resolves to `$VCT_STATE_DIR/keyring.pace`
+    /// when that is set and to `~/.vct/keyring.pace` otherwise — the one file
+    /// every shipped VCO process paces on (a release build has no test layer
+    /// to install: `pace_file_path` compiles to `production_pace_file_path`).
+    /// Also pins the layer order: an explicit test pin beats the keychain-test
+    /// baton, which beats production.
+    ///
+    /// Uses the pure resolver so another thread's baton cannot race the "no
+    /// layer installed" case. Takes the keychain baton before the env lock —
+    /// the workspace's established order.
+    #[cfg(unix)]
+    #[test]
+    fn production_pace_lock_resolves_to_vct_root_keyring_pace() {
+        use cross_process_pace::{production_pace_file_path, resolve_pace_file_path};
+
+        let _guard = test_serialize::keychain_serialize_lock();
+        {
+            let sd = crate::test_env::state_dir_guard();
+            let want = sd.path().join("keyring.pace");
+            assert_eq!(production_pace_file_path(), want);
+            assert_eq!(resolve_pace_file_path(None, None), want, "no test layer → production");
+
+            let pin = std::path::PathBuf::from("/tmp/pin.pace");
+            let baton = std::path::PathBuf::from("/tmp/baton.pace");
+            assert_eq!(resolve_pace_file_path(None, Some(baton.clone())), baton);
+            assert_eq!(resolve_pace_file_path(Some(pin.clone()), Some(baton)), pin);
         }
-
-        assert!(
-            probe_blocked,
-            "while the guard is held, the production keyring.pace flock must be \
-             EXCLUSIVE (a concurrent launcher acquire must block)"
-        );
-        assert!(
-            nested_ran,
-            "a nested with_cross_process_pace op must run (no self-deadlock via \
-             the reentrancy skip) while the guard holds the pace flock"
-        );
-        assert!(
-            probe_after,
-            "after the guard drops, the pace flock must be free for the next \
-             acquirer (no leaked lock)"
-        );
+        {
+            let home = tempfile::tempdir().expect("tempdir");
+            let home_str = home.path().to_str().expect("utf-8 temp path");
+            let _env = crate::test_env::env_guard(&[
+                ("VCT_STATE_DIR", None),
+                ("HOME", Some(home_str)),
+            ]);
+            let want = home.path().join(".vct").join("keyring.pace");
+            assert_eq!(production_pace_file_path(), want);
+            assert_eq!(resolve_pace_file_path(None, None), want, "no test layer → ~/.vct/keyring.pace");
+        }
     }
 
     /// The Linux lock probe, run for real against whatever Secret-Service (if
@@ -5152,90 +4437,6 @@ mod tests {
         assert!(
             matches!(r, Some(true) | Some(false) | None),
             "probe returned an impossible value: {r:?}"
-        );
-    }
-
-    // ─── v0.2.84 (D8.3): pacing RELEASE-GAP regression pins ───────────────────
-    //
-    // The pre-fix code stamped the pace timestamp at op-START. An op that
-    // itself ran ≥ spacing (a slow daemon read) therefore left ~0 idle between
-    // one op's END and the next op's START — the sustained back-to-back daemon
-    // traffic the P7 SIGTRAP reproduced under. The fix stamps op-END, so the
-    // next op always spaces ≥ spacing from the previous op's COMPLETION.
-    //
-    // These pins FAIL pre-fix: pre-fix the measured gap is ~0.
-
-    /// REGRESSION PIN (cross-process): an injected op that sleeps > spacing
-    /// makes the NEXT op observe ≥ spacing of true idle measured from the FIRST
-    /// op's COMPLETION. Fails pre-fix (start-stamped ⇒ ~0 gap).
-    #[cfg(unix)]
-    #[test]
-    fn cross_process_pace_gap_measured_from_op_end_release_gap_d83() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _pace = TestPacePathGuard::new(dir.path().join("keyring.pace"));
-        let spacing = std::time::Duration::from_millis(60);
-        let _sp = TestSpacingGuard::new(spacing);
-
-        // op1 runs LONGER than spacing, then records the instant it FINISHED.
-        let mut op1_end: Option<std::time::Instant> = None;
-        with_cross_process_pace(|| {
-            std::thread::sleep(spacing * 2);
-            op1_end = Some(std::time::Instant::now());
-        });
-        let op1_end = op1_end.expect("op1 recorded its completion instant");
-
-        // op2 back-to-back records the instant its body STARTED. The pace layer
-        // must have made op2 wait ≥ spacing from op1's END before running it.
-        let mut op2_start: Option<std::time::Instant> = None;
-        with_cross_process_pace(|| {
-            op2_start = Some(std::time::Instant::now());
-        });
-        let op2_start = op2_start.expect("op2 recorded its start instant");
-
-        let gap = op2_start.saturating_duration_since(op1_end);
-        // Allow a small scheduler slack below the nominal spacing.
-        assert!(
-            gap >= spacing - std::time::Duration::from_millis(15),
-            "op2 must start ≥ ~spacing ({spacing:?}) after op1 END; \
-             gap was {gap:?} (pre-fix start-stamp regression = ~0)"
-        );
-    }
-
-    /// REGRESSION PIN (in-process `paced_call`): same release-gap semantics for
-    /// the per-process pacer. An op sleeping > spacing ⇒ the next `paced_call`
-    /// waits ≥ spacing measured from the first op's completion. Fails pre-fix.
-    #[test]
-    fn paced_call_gap_measured_from_op_end_release_gap_d83() {
-        let _lock = test_serialize::keychain_serialize_lock();
-        let spacing = std::time::Duration::from_millis(50);
-        let _sp = TestSpacingGuard::new(spacing);
-
-        // Establish a baseline op END far enough back that the FIRST op below
-        // pays no spacing (idle gap already exceeded).
-        paced_call(|| ());
-        std::thread::sleep(spacing * 2);
-
-        // op1 runs longer than spacing and records its completion instant.
-        let mut op1_end: Option<std::time::Instant> = None;
-        paced_call(|| {
-            std::thread::sleep(spacing * 2);
-            op1_end = Some(std::time::Instant::now());
-        });
-        let op1_end = op1_end.expect("op1 completion recorded");
-
-        // op2 back-to-back: its body must start ≥ spacing after op1's END.
-        let mut op2_start: Option<std::time::Instant> = None;
-        paced_call(|| {
-            op2_start = Some(std::time::Instant::now());
-        });
-        let op2_start = op2_start.expect("op2 start recorded");
-
-        let gap = op2_start.saturating_duration_since(op1_end);
-        assert!(
-            gap >= spacing - std::time::Duration::from_millis(12),
-            "in-process paced_call must space op2 ≥ ~spacing ({spacing:?}) from \
-             op1 END; gap was {gap:?} (pre-fix start-stamp regression = ~0)"
         );
     }
 
@@ -5610,6 +4811,232 @@ mod tests {
             src.contains(gen_static_needle.as_str())
                 && src.contains("fn bump_secret_generation"),
             "the write-through generation counter must exist and be bumped"
+        );
+    }
+
+    // ─── v0.2.102 R1 (owner 2026-10-07): short cross-request value cache ──────
+    //
+    // W6-P: hermetic. The test mock is the store (no OS keychain, no D-Bus),
+    // and the cache sits ABOVE the store switch in `get_with_context`, so
+    // these tests drive the production cache code. Under the mock the cache is
+    // off unless a TTL is pinned, so every test pins one; the "did this read
+    // reach the store?" probe is `for_tests::mock_read_count()`.
+
+    /// The TTL the cache tests pin: the production default.
+    fn default_cache_ttl() -> TestValueCacheTtlGuard {
+        TestValueCacheTtlGuard::new(std::time::Duration::from_secs(
+            SECRET_VALUE_CACHE_TTL_SECS_DEFAULT,
+        ))
+    }
+
+    /// WITHIN the TTL a second Background read of the same key must not touch
+    /// the store at all.
+    #[test]
+    fn value_cache_second_read_within_ttl_skips_the_store() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
+        let scope = SecretScope::PerProject { project_id: "p-r1cache" };
+        set(scope, "r1mod", "K", "v1").unwrap();
+        let base = for_tests::mock_read_count();
+        let first =
+            get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap();
+        assert_eq!(first.as_deref(), Some("v1"));
+        let after_first = for_tests::mock_read_count();
+        assert_eq!(after_first, base + 1, "precondition: the first read hit the store");
+        let second =
+            get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap();
+        assert_eq!(second.as_deref(), Some("v1"));
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_first,
+            "a read within the TTL must be served from the value cache — no store read"
+        );
+    }
+
+    /// The cache serves Background reads only: an Interactive read always
+    /// reaches the store, even with a fresh cached value present.
+    #[test]
+    fn value_cache_never_serves_an_interactive_read() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
+        let scope = SecretScope::PerProject { project_id: "p-r1cache" };
+        set(scope, "r1mod", "K", "v1").unwrap();
+        get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap();
+        let after_bg = for_tests::mock_read_count();
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Interactive)
+                .unwrap()
+                .as_deref(),
+            Some("v1")
+        );
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_bg + 1,
+            "an Interactive read must reach the store"
+        );
+    }
+
+    /// AFTER the TTL the next read refetches (same value, fresh store read).
+    #[test]
+    fn value_cache_refetches_after_the_ttl_expires() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = TestValueCacheTtlGuard::new(std::time::Duration::from_millis(60));
+        let scope = SecretScope::PerProject { project_id: "p-r1cache" };
+        set(scope, "r1mod", "K", "v1").unwrap();
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Background)
+                .unwrap()
+                .as_deref(),
+            Some("v1")
+        );
+        let after_first = for_tests::mock_read_count();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Background)
+                .unwrap()
+                .as_deref(),
+            Some("v1")
+        );
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_first + 1,
+            "an expired entry must be refetched from the store"
+        );
+    }
+
+    /// A write or a delete of the key drops its entry: the next read sees the
+    /// NEW reality, never a stale cached value.
+    #[test]
+    fn value_cache_write_or_delete_drops_the_entry() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
+        let scope = SecretScope::PerProject { project_id: "p-r1cache" };
+        set(scope, "r1mod", "K", "v1").unwrap();
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Background)
+                .unwrap()
+                .as_deref(),
+            Some("v1")
+        );
+        set(scope, "r1mod", "K", "v2").unwrap();
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Background)
+                .unwrap()
+                .as_deref(),
+            Some("v2"),
+            "a write must drop the cached entry — the new value must be served"
+        );
+        delete(scope, "r1mod", "K").unwrap();
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap(),
+            None,
+            "a delete must drop the cached entry — a miss must be observed"
+        );
+    }
+
+    /// Negative results are never cached: a miss stays a fresh store read.
+    #[test]
+    fn value_cache_never_caches_a_miss() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
+        let scope = SecretScope::PerProject { project_id: "p-r1cache" };
+        assert_eq!(
+            get_with_context(scope, "r1mod", "ABSENT", CallContext::Background).unwrap(),
+            None
+        );
+        let after_first = for_tests::mock_read_count();
+        assert_eq!(
+            get_with_context(scope, "r1mod", "ABSENT", CallContext::Background).unwrap(),
+            None
+        );
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_first + 1,
+            "a miss must not be cached — the second read hits the store again"
+        );
+    }
+
+    /// `VCT_HUB_SECRET_CACHE_SECS=0` (TTL 0) disables the cache entirely.
+    #[test]
+    fn value_cache_zero_ttl_disables_the_cache() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = TestValueCacheTtlGuard::new(std::time::Duration::from_secs(0));
+        let scope = SecretScope::PerProject { project_id: "p-r1cache" };
+        set(scope, "r1mod", "K", "v1").unwrap();
+        assert!(get_with_context(scope, "r1mod", "K", CallContext::Background).is_ok());
+        let after_first = for_tests::mock_read_count();
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Background)
+                .unwrap()
+                .as_deref(),
+            Some("v1")
+        );
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_first + 1,
+            "with the TTL at 0 every read must hit the store"
+        );
+    }
+
+    /// The lock gate stays BEFORE the cache (D8.4 posture): a locked store is
+    /// an honest terminal state, never overridden by a cached value — even a
+    /// fresh one that is served again the moment the store unlocks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn value_cache_serves_nothing_while_the_store_is_locked() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
+        let scope = SecretScope::PerProject { project_id: "p-r1cache" };
+        set(scope, "r1mod", "K", "v1").unwrap();
+        assert!(get_with_context(scope, "r1mod", "K", CallContext::Background).is_ok());
+        let after_fill = for_tests::mock_read_count();
+        {
+            let _probe = TestProbeGuard::new(Some(true));
+            assert!(
+                matches!(
+                    get_with_context(scope, "r1mod", "K", CallContext::Background),
+                    Err(KeychainError::Locked)
+                ),
+                "a locked Background read must never be answered from any cache"
+            );
+        }
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Background)
+                .unwrap()
+                .as_deref(),
+            Some("v1")
+        );
+        assert_eq!(
+            for_tests::mock_read_count(),
+            after_fill,
+            "precondition: the value was cached all along (served after unlock \
+             with no store read), so the Locked answer above beat a live entry"
+        );
+    }
+
+    /// The cache is keyed per store: a value cached from one thread's mock is
+    /// never served to a read against a different mock store, and clearing a
+    /// mock store drops what it had cached.
+    #[test]
+    fn value_cache_is_scoped_to_the_store_that_answered() {
+        let _mock = for_tests::MockGuard::new();
+        let _ttl = default_cache_ttl();
+        let scope = SecretScope::PerProject { project_id: "p-r1cache" };
+        set(scope, "r1mod", "K", "v1").unwrap();
+        get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap();
+        let other = std::thread::spawn(move || {
+            let _mock = for_tests::MockGuard::new();
+            let _ttl = default_cache_ttl();
+            get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(other, None, "another store's cached value must never be served");
+        for_tests::clear_mock();
+        assert_eq!(
+            get_with_context(scope, "r1mod", "K", CallContext::Background).unwrap(),
+            None,
+            "a cleared store must not keep answering from the value cache"
         );
     }
 }

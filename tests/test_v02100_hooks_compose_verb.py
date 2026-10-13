@@ -31,6 +31,7 @@ from tests.test_v0297_lifecycle_hooks import (
 )
 from tests.common.ports import free_port
 from tests.test_v0292_code_embed_hook_build import _Fixture
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIB_SH = HOOKS / "_lib" / "compose-dir.sh"
@@ -84,7 +85,7 @@ def _bash_resolve(repo_root: Path, env: dict) -> tuple[str, str]:
 def _pwsh_resolve(repo_root: Path, env: dict) -> tuple[str, str]:
     script = (f'. "{LIB_PS1}"; $r = Resolve-VcoComposeDir -RepoRoot $env:VCO_T_ROOT; '
               'Write-Output $r.Dir; Write-Output $r.Refusal')
-    out = subprocess.run([PWSH, "-NoProfile", "-Command", script],
+    out = subprocess.run([PWSH, *PWSH_BASE_FLAGS, "-Command", script],
                          env=_clean_env({**env, "VCO_T_ROOT": str(repo_root)}),
                          capture_output=True, text=True, timeout=60, check=True).stdout
     lines = out.split("\n")

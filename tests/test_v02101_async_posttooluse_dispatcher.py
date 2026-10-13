@@ -18,8 +18,10 @@ tool call because 3 registrations fired.
 THE FIX (plan-of-record, PLAN-V0300:1012 "merge async hooks"): ONE async
 PostToolUse registration (matcher ``*``, timeout 15) running
 ``post-tool-use-async.{sh,ps1}``. The dispatcher reads stdin ONCE to a temp
-file, routes by ``tool_name`` (plus a ``git-commit-prefix`` gate that
-carries the retired ``if: Bash(git commit *)`` registration key) to the
+file, routes by ``tool_name`` (plus a ``git-commit-chain`` gate that
+carries the retired ``if: Bash(git commit *)`` registration key, widened
+in v0.2.102 W6-F to a quote-aware CHAIN walk — ``cd x && git commit``
+fires it, quoted text does not) to the
 UNCHANGED per-concern scripts, runs the matched children CONCURRENTLY (the
 wall-time shape the separate async registrations had), and guarantees
 silence: child stdout is discarded, child stderr / non-zero exits condense
@@ -75,12 +77,14 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vco_lib import hook_retirements as hr  # noqa: E402
+from vco_lib.git_commit_gate import command_has_git_commit  # noqa: E402
 
 HOOKS = REPO_ROOT / "templates" / "hooks"
 DISPATCHER_SH = HOOKS / "post-tool-use-async.sh"
@@ -93,18 +97,33 @@ TEMPLATES = {
     "windows": REPO_ROOT / "templates" / "settings.json.windows.template",
 }
 
-#: The six scripts whose async PostToolUse REGISTRATIONS the dispatcher
+#: The five scripts whose async PostToolUse REGISTRATIONS the dispatcher
 #: supersedes (the scripts themselves still ship — the dispatcher routes to
 #: them). Used for the template-absence assertion; the routing-coverage
 #: assertion DERIVES its expectation from the retirement table instead.
+#: v0.2.102: post-file-delete left this set — the script was deleted with
+#: the diagrams integrations and now carries its OWN v0.2.102 retirement
+#: rows (see RETIRED_V02102_STEMS).
 SUPERSEDED_STEMS = (
     "post-edit-outcome",
     "post-bash-context-record",
     "kg-summary-generator",
     "post-git-commit-kg-sync",
-    "post-file-delete",
     "kg-update-nudge",
 )
+
+#: The diagram-delete cascade hook, retired outright in v0.2.102 (script
+#: deleted, dispatcher row removed): its registration must stay absent from
+#: the templates AND declared in the retirement table under v0.2.102.
+RETIRED_V02102_STEMS = ("post-file-delete",)
+
+#: Sub-hooks the dispatcher routes that were NEVER a separate async
+#: PostToolUse registration (so no retirement row backs them): new async
+#: PostToolUse work joins the ONE dispatcher instead of adding a second
+#: async registration. v0.2.102 W6-C2 fix round (review R4c-8):
+#: stop-drain-citations re-tags a subagent brief's citations on
+#: PostToolUse:Agent|Task.
+ADDED_SUBHOOK_STEMS = ("stop-drain-citations",)
 
 #: PostToolUse registrations that must stay SYNCHRONOUS and registered
 #: (they deliver stdout envelopes or gate follow-up behaviour the harness
@@ -151,7 +170,7 @@ def _parse_rows(block: str) -> list[tuple[str, str, str]]:
             continue
         m = ROUTE_ROW_RE.match(line.strip())
         assert m, f"routing-table row is not tool|stem|gate shaped: {line!r}"
-        assert m.group(3) in ("-", "git-commit-prefix"), (
+        assert m.group(3) in ("-", "git-commit-chain"), (
             f"unknown gate {m.group(3)!r} in row {line!r}"
         )
         rows.append((m.group(1), m.group(2), m.group(3)))
@@ -169,18 +188,19 @@ def _expected_subhooks(
 
     Never hand-copied: the table is the one declaration, and this function
     is the same match the dispatcher performs (tool equality or ``*``; the
-    ``git-commit-prefix`` gate keyed on ``tool_input.command`` being
-    ``git commit`` exactly or followed by a space — the word-boundary form
-    of the retired ``if: Bash(git commit *)`` key, review N-1; minus any
-    stem disabled via ``VCO_ASYNC_DISABLED_HOOKS``, review SF-2).
+    ``git-commit-chain`` gate (v0.2.102 W6-F — was ``git-commit-prefix``)
+    decided by the ONE home ``vco_lib.git_commit_gate.command_has_git_commit``:
+    a quote-aware chain walk that fires on a ``git commit`` segment ANYWHERE
+    in the command — ``cd sub && git commit`` fires, ``echo "git commit"``
+    does not; minus any stem disabled via ``VCO_ASYNC_DISABLED_HOOKS``,
+    review SF-2).
     """
-    c = command.lstrip() if command else ""
-    is_commit = c == "git commit" or c.startswith("git commit ")
+    is_commit = bool(command) and command_has_git_commit(command)
     out: set[str] = set()
     for tool, stem, gate in rows:
         if tool != "*" and tool != tool_name:
             continue
-        if gate == "git-commit-prefix" and not is_commit:
+        if gate == "git-commit-chain" and not is_commit:
             continue
         if disabled and stem in disabled:
             continue
@@ -328,7 +348,9 @@ def test_route_table_stems_equal_the_v02101_retirement_rows():
         and entry.kind == hr.KIND_HOOK_SCRIPT
         and entry.retired_in == "v0.2.101"
     }
-    routed = {stem for _tool, stem, _gate in _route_table_sh()}
+    routed = {stem for _tool, stem, _gate in _route_table_sh()} - set(ADDED_SUBHOOK_STEMS)
+    assert not (set(ADDED_SUBHOOK_STEMS) & retired), (
+        "an ADDED sub-hook must not also be a retirement")
     assert routed == retired, (
         "dispatcher routing table and the v0.2.101 PostToolUse retirement "
         f"rows disagree:\n  routed but not retired: {sorted(routed - retired)}\n"
@@ -336,7 +358,18 @@ def test_route_table_stems_equal_the_v02101_retirement_rows():
     )
     assert retired == set(SUPERSEDED_STEMS), (
         "the retirement table's v0.2.101 PostToolUse rows must cover exactly "
-        f"the six merged scripts; got {sorted(retired)}"
+        f"the five merged scripts; got {sorted(retired)}"
+    )
+    retired_v02102 = {
+        entry.target.rsplit(".", 1)[0]
+        for entry in hr.RETIRED_REGISTRATIONS
+        if entry.event == "PostToolUse"
+        and entry.kind == hr.KIND_HOOK_SCRIPT
+        and entry.retired_in == "v0.2.102"
+    }
+    assert retired_v02102 == set(RETIRED_V02102_STEMS), sorted(retired_v02102)
+    assert not (routed & retired_v02102), (
+        "a v0.2.102-retired script must not be routed by the dispatcher"
     )
 
 
@@ -348,7 +381,7 @@ def test_route_table_is_the_pre_v02101_registration_shape():
     consistently re-routed to the WRONG tool. This golden map is the
     registration shape the v0.2.100 templates shipped, transcribed once
     from the lane brief: post-edit-outcome on Edit|Write,
-    post-bash-context-record + post-file-delete on Bash,
+    post-bash-context-record on Bash (post-file-delete until v0.2.102),
     post-git-commit-kg-sync on Bash(git commit *) only, kg-summary-
     generator on Edit/Write/store_knowledge_node, kg-update-nudge on
     everything. A routing edit that moves a sub-hook to another tool must
@@ -356,7 +389,7 @@ def test_route_table_is_the_pre_v02101_registration_shape():
     instead of one silent drift.
     """
     no_commit = {
-        "post-bash-context-record", "post-file-delete", "kg-update-nudge",
+        "post-bash-context-record", "kg-update-nudge",
     }
     with_commit = no_commit | {"post-git-commit-kg-sync"}
     golden = {
@@ -364,10 +397,15 @@ def test_route_table_is_the_pre_v02101_registration_shape():
         ("Bash", "git commit -m x"): with_commit,
         # N-1 word boundary: bare `git commit` fires the retired
         # `if: Bash(git commit *)` gate; `git commit-tree` (different
-        # porcelain command) and a non-prefix compound do NOT.
+        # porcelain command) does NOT. v0.2.102 W6-F: the gate walks the
+        # CHAIN (the pre-W6-F prefix match left the reviewer dormant since
+        # 2026-06-13 — every `cd … && git commit` missed) and stays
+        # quote-aware (an echoed "git commit" is data, not a commit).
         ("Bash", "git commit"): with_commit,
         ("Bash", "git commit-tree abc123"): no_commit,
-        ("Bash", "cd sub && git commit -m x"): no_commit,
+        ("Bash", "cd sub && git commit -m x"): with_commit,
+        ("Bash", "git -C /repo commit -m x"): with_commit,
+        ("Bash", "echo 'git commit'"): no_commit,
         ("Edit", None): {
             "post-edit-outcome", "kg-summary-generator", "kg-update-nudge",
         },
@@ -379,6 +417,9 @@ def test_route_table_is_the_pre_v02101_registration_shape():
         },
         ("Read", None): {"kg-update-nudge"},
         ("", None): {"kg-update-nudge"},
+        # v0.2.102 W6-C2 (R4c-8): an ADDED sub-hook, not a pre-v0.2.101 shape.
+        ("Agent", None): {"stop-drain-citations", "kg-update-nudge"},
+        ("Task", None): {"stop-drain-citations", "kg-update-nudge"},
     }
     rows = _route_table_sh()
     for (tool, command), expected in golden.items():
@@ -407,9 +448,9 @@ def test_retirement_rows_cover_both_os_extensions():
         entry.target for entry in hr.RETIRED_REGISTRATIONS
         if entry.event == "PostToolUse"
         and entry.kind == hr.KIND_HOOK_SCRIPT
-        and entry.retired_in == "v0.2.101"
+        and entry.retired_in in ("v0.2.101", "v0.2.102")
     }
-    for stem in SUPERSEDED_STEMS:
+    for stem in (*SUPERSEDED_STEMS, *RETIRED_V02102_STEMS):
         assert f"{stem}.sh" in targets, targets
         assert f"{stem}.ps1" in targets, targets
 
@@ -494,6 +535,10 @@ def sh_rig(tmp_path):
         "TMPDIR": str(tmpdir),
         "CLAUDE_PROJECT_DIR": str(proj),
         "VCO_TEST_MARKER": str(marker),
+        # W6-F: the git-commit-chain gate imports vco_lib.git_commit_gate
+        # from the orchestrator root (the dispatcher resolves it through
+        # _lib/resolve-vco-venv's orchestrator ladder).
+        "VCT_ORCHESTRATOR_ROOT": str(REPO_ROOT),
     })
     env.pop("VCT_DISABLE_HOOKS", None)
     env.pop("KG_NUDGE_OFF", None)
@@ -548,8 +593,9 @@ def _payload(tool_name: str, command: str | None = None, **tool_input) -> dict:
 
 
 #: (case id, payload). The EXPECTED set is derived per case from the table.
-#: The two git-boundary cases pin review N-1: bare `git commit` fires the
-#: gate, `git commit-tree` (a different porcelain command) must NOT.
+#: The git-boundary cases pin review N-1 + W6-F: bare `git commit` fires the
+#: gate, `git commit-tree` (a different porcelain command) must NOT, and a
+#: CHAINED `cd sub && git commit` (the W6-F widening) fires.
 ROUTING_CASES = [
     ("bash-plain", _payload("Bash", command="ls -la")),
     ("bash-git-commit", _payload("Bash", command="git commit -m 'x'")),
@@ -594,19 +640,19 @@ def test_sh_dispatcher_failure_is_silent_and_logged_once(sh_rig):
     """A child that speaks and dies must NOT reach the harness: one line in
     the metrics-dir log instead (the 'records only on failure' promise)."""
     payload = _payload("Bash", command="ls -la")
-    proc, invoked, _body = sh_rig.run(payload, fail_stem="post-file-delete")
+    proc, invoked, _body = sh_rig.run(payload, fail_stem="post-bash-context-record")
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert proc.stdout == "" and proc.stderr == "", (
         f"a failing child leaked to the harness: {proc.stdout!r} {proc.stderr!r}"
     )
-    assert "post-file-delete" in invoked, "the failing child must still have run"
+    assert "post-bash-context-record" in invoked, "the failing child must still have run"
     logs = list(sh_rig.home.rglob("post-tool-use-async.log"))
     assert logs, "no failure log was written under the metrics home"
     content = logs[0].read_text(encoding="utf-8")
-    assert "post-file-delete" in content, content
+    assert "post-bash-context-record" in content, content
     assert "exit=3" in content, content
-    assert "boom from post-file-delete" in content.replace("\n", " ") or (
-        "boom from post-file-delete" in content
+    assert "boom from post-bash-context-record" in content.replace("\n", " ") or (
+        "boom from post-bash-context-record" in content
     ), content
 
 
@@ -640,19 +686,19 @@ def test_sh_dispatcher_skips_stems_disabled_via_the_env_file(sh_rig):
     env_dir = Path(sh_rig.env["CLAUDE_PROJECT_DIR"]) / ".claude"
     env_dir.mkdir(parents=True, exist_ok=True)
     (env_dir / "env").write_text(
-        "# user knobs\nVCO_ASYNC_DISABLED_HOOKS=post-file-delete,kg-update-nudge\n",
+        "# user knobs\nVCO_ASYNC_DISABLED_HOOKS=post-bash-context-record,kg-update-nudge\n",
         encoding="utf-8",
     )
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = sh_rig.run(payload)
     expected = _expected_subhooks(
         sh_rig.rows, "Bash", "ls -la",
-        disabled={"post-file-delete", "kg-update-nudge"},
+        disabled={"post-bash-context-record", "kg-update-nudge"},
     )
     assert proc.returncode == 0
     assert proc.stdout == "" and proc.stderr == ""
     assert set(invoked) == expected
-    assert "post-file-delete" not in invoked
+    assert "post-bash-context-record" not in invoked
     assert "kg-update-nudge" not in invoked
 
 
@@ -660,15 +706,16 @@ def test_sh_dispatcher_skips_stems_disabled_via_the_env_file(sh_rig):
 def test_sh_dispatcher_skips_stems_disabled_via_process_env(sh_rig):
     """The key also works as a plain environment variable (shell export or
     settings.json env channel), with surrounding spaces and unknown stems
-    tolerated; an exact-stem match only — `post-file` must not disable
-    `post-file-delete`."""
-    sh_rig.env["VCO_ASYNC_DISABLED_HOOKS"] = " post-file , no-such-hook ,post-bash-context-record"
+    tolerated; an exact-stem match only — `kg-update` must not disable
+    `kg-update-nudge`. (v0.2.102: the original witness stem,
+    post-file-delete, is no longer routed — the substring pair moved to
+    kg-update / kg-update-nudge.)"""
+    sh_rig.env["VCO_ASYNC_DISABLED_HOOKS"] = " kg-update , no-such-hook ,post-bash-context-record "
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = sh_rig.run(payload)
     assert proc.returncode == 0 and proc.stdout == "" and proc.stderr == ""
     assert "post-bash-context-record" not in invoked
-    assert "post-file-delete" in invoked, "substring match would over-disable"
-    assert "kg-update-nudge" in invoked
+    assert "kg-update-nudge" in invoked, "substring match would over-disable"
 
 
 @pytest.mark.skipif(not _needs_bash(), reason="bash/md5sum unavailable")
@@ -682,13 +729,13 @@ def test_sh_dispatcher_payload_survives_a_stdin_eating_env_file(sh_rig):
     env_dir.mkdir(parents=True, exist_ok=True)
     (env_dir / "env").write_text(
         "read -r _pta_eaten || true\n"
-        "VCO_ASYNC_DISABLED_HOOKS=post-file-delete\n",
+        "VCO_ASYNC_DISABLED_HOOKS=post-bash-context-record\n",
         encoding="utf-8",
     )
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = sh_rig.run(payload)
     expected = _expected_subhooks(
-        sh_rig.rows, "Bash", "ls -la", disabled={"post-file-delete"}
+        sh_rig.rows, "Bash", "ls -la", disabled={"post-bash-context-record"}
     )
     assert proc.returncode == 0 and proc.stdout == "" and proc.stderr == ""
     assert set(invoked) == expected, (
@@ -705,14 +752,14 @@ def test_sh_dispatcher_reads_a_quoted_env_value(sh_rig):
     env_dir = Path(sh_rig.env["CLAUDE_PROJECT_DIR"]) / ".claude"
     env_dir.mkdir(parents=True, exist_ok=True)
     (env_dir / "env").write_text(
-        'VCO_ASYNC_DISABLED_HOOKS="post-file-delete,kg-update-nudge"\n',
+        'VCO_ASYNC_DISABLED_HOOKS="post-bash-context-record,kg-update-nudge"\n',
         encoding="utf-8",
     )
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = sh_rig.run(payload)
     expected = _expected_subhooks(
         sh_rig.rows, "Bash", "ls -la",
-        disabled={"post-file-delete", "kg-update-nudge"},
+        disabled={"post-bash-context-record", "kg-update-nudge"},
     )
     assert proc.returncode == 0 and proc.stdout == "" and proc.stderr == ""
     assert set(invoked) == expected
@@ -757,6 +804,10 @@ def ps_rig(tmp_path):
         "TMP": str(tmpdir),
         "CLAUDE_PROJECT_DIR": str(proj),
         "VCO_TEST_MARKER": str(marker),
+        # W6-F: the git-commit-chain gate imports vco_lib.git_commit_gate
+        # from the orchestrator root (the dispatcher resolves it through
+        # _lib/resolve-vco-venv's orchestrator ladder).
+        "VCT_ORCHESTRATOR_ROOT": str(REPO_ROOT),
     })
     env.pop("VCT_DISABLE_HOOKS", None)
     env.pop("KG_NUDGE_OFF", None)
@@ -782,7 +833,7 @@ def ps_rig(tmp_path):
         for old in tmp_path.glob("marker.txt*"):
             old.unlink()
         proc = subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(hooks / DISPATCHER_PS1.name)],
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(hooks / DISPATCHER_PS1.name)],
             input=body, capture_output=True, text=True, env=env,
             timeout=120, cwd=str(proj),
         )
@@ -833,17 +884,17 @@ def test_ps1_dispatcher_routes_exactly_the_derived_set(ps_rig, case_id, payload)
 @pytest.mark.skipif(not _have_pwsh(), reason="pwsh unavailable")
 def test_ps1_dispatcher_failure_is_silent_and_logged_once(ps_rig):
     payload = _payload("Bash", command="ls -la")
-    proc, invoked, _body = ps_rig.run(payload, fail_stem="post-file-delete")
+    proc, invoked, _body = ps_rig.run(payload, fail_stem="post-bash-context-record")
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert proc.stdout.strip() == "" and proc.stderr.strip() == "", (
         f"a failing child leaked to the harness (.ps1): "
         f"{proc.stdout!r} {proc.stderr!r}"
     )
-    assert "post-file-delete" in invoked
+    assert "post-bash-context-record" in invoked
     logs = list(ps_rig.home.rglob("post-tool-use-async.log"))
     assert logs, "no failure log was written under the metrics home (.ps1)"
     content = logs[0].read_text(encoding="utf-8")
-    assert "post-file-delete" in content, content
+    assert "post-bash-context-record" in content, content
     assert "exit=3" in content, content
 
 
@@ -855,21 +906,21 @@ def test_ps1_dispatcher_skips_stems_disabled_via_the_env_file(ps_rig):
     env_dir = Path(ps_rig.env["CLAUDE_PROJECT_DIR"]) / ".claude"
     env_dir.mkdir(parents=True, exist_ok=True)
     (env_dir / "env").write_bytes(
-        b"# user knobs\r\nVCO_ASYNC_DISABLED_HOOKS=post-file-delete\r\n"
+        b"# user knobs\r\nVCO_ASYNC_DISABLED_HOOKS=post-bash-context-record\r\n"
     )
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = ps_rig.run(payload)
     expected = _expected_subhooks(
-        ps_rig.rows, "Bash", "ls -la", disabled={"post-file-delete"}
+        ps_rig.rows, "Bash", "ls -la", disabled={"post-bash-context-record"}
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == "" and proc.stderr.strip() == ""
     assert set(invoked) == expected
-    assert "post-file-delete" not in invoked
+    assert "post-bash-context-record" not in invoked
 
 
 @pytest.mark.skipif(not _have_pwsh(), reason="pwsh unavailable")
-@pytest.mark.parametrize("quoted", ['"post-file-delete"', "'post-file-delete'"])
+@pytest.mark.parametrize("quoted", ['"post-bash-context-record"', "'post-bash-context-record'"])
 def test_ps1_dispatcher_reads_a_quoted_env_value(ps_rig, quoted):
     """N-B (ps1 leg): the regex capture must strip ONE surrounding quote
     pair, so a hand-edited `VCO_ASYNC_DISABLED_HOOKS="a,b"` disables the
@@ -883,12 +934,12 @@ def test_ps1_dispatcher_reads_a_quoted_env_value(ps_rig, quoted):
     payload = _payload("Bash", command="ls -la")
     proc, invoked, _body = ps_rig.run(payload)
     expected = _expected_subhooks(
-        ps_rig.rows, "Bash", "ls -la", disabled={"post-file-delete"}
+        ps_rig.rows, "Bash", "ls -la", disabled={"post-bash-context-record"}
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == "" and proc.stderr.strip() == ""
     assert set(invoked) == expected
-    assert "post-file-delete" not in invoked
+    assert "post-bash-context-record" not in invoked
 
 
 # ---------------------------------------------------------------------------

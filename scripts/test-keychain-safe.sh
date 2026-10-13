@@ -99,7 +99,10 @@ for arg in "$@"; do
     fi
 done
 
-CMD=(cargo test --workspace --tests --manifest-path "$MANIFEST"
+# --no-fail-fast: run every crate's tests even after one crate fails, so a CI
+# round reports ALL failures (v0.2.102: a failing vct-launcher-core masked six
+# vct-launcher-temp failures until the next round).
+CMD=(cargo test --workspace --tests --no-fail-fast --manifest-path "$MANIFEST"
      ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
      -- --test-threads=1 ${TEST_ARGS[@]+"${TEST_ARGS[@]}"})
 

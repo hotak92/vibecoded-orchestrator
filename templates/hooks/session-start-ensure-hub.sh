@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Parity: kept in step with session-start-ensure-hub.ps1 (its UTF-8 BOM serves Windows
+# PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
@@ -33,6 +35,13 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   $VCT_DISABLE_HOOKS    — set to non-empty to bypass entirely.
 #   $VCO_HOOK_DEBUG=1     — verbose stderr, and run the spawn in the
 #                           foreground (`--wait`) so its exit code is known.
+#
+# v0.2.102 (S16-13 / OD-7): a launcher this hook starts with --start-hidden
+# and leaves in the tray RELAUNCHES ITSELF into the refreshed dist binary
+# when a launcher_binary_stale record exists, no window is visible, no
+# update is in flight and no modal is pending (the launcher's own periodic
+# check; this hook never kills GUI processes). Nothing for this hook to do
+# beyond starting it hidden.
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
@@ -160,7 +169,17 @@ fi
 # and does nothing — a no-op exactly when the ensure is needed.
 # ---------------------------------------------------------------------------
 __vco_gw_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-gateway-ensure.$$"
-__vco_gw_out="$("$RUN_PY" -m vco_lib.gateway_ensure ensure --shell --folder "${CLAUDE_PROJECT_DIR:-$PWD}" 2>"$__vco_gw_err")"
+# --folder names the project whose ledger may get an "unrunnable" row: the
+# ONE shell rule (_lib/project-root.sh, must match vco_lib/project_root.py).
+# No project -> the ensure still runs, with no folder (no ledger row).
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+__vco_gw_folder="$(vco_project_root)" || __vco_gw_folder=""
+if [ -n "$__vco_gw_folder" ]; then
+    __vco_gw_out="$("$RUN_PY" -m vco_lib.gateway_ensure ensure --shell --folder "$__vco_gw_folder" 2>"$__vco_gw_err")"
+else
+    __vco_gw_out="$("$RUN_PY" -m vco_lib.gateway_ensure ensure --shell 2>"$__vco_gw_err")"
+fi
 __vco_gw_rc=$?
 case "$__vco_gw_rc" in
     0|3|4)

@@ -198,13 +198,15 @@ def test_is_test_stamped_on_function_class_module(analyzer_mod):
     assert coll.data.written[0]["properties"]["is_test"] is False
 
 
-def test_is_test_not_stamped_on_api_interaction(analyzer_mod):
+def test_is_test_stamped_on_api_not_interaction(analyzer_mod):
+    """v0.2.102 W6-O (F-7): CodeAPI rows carry is_test (test-fixture routes
+    must be excludable); CodeInteraction still has no such property."""
     stub = _DedupStub(analyzer_mod)
-    for base in ("CodeAPI", "CodeInteraction"):
+    for base, want in (("CodeAPI", True), ("CodeInteraction", None)):
         coll = _FakeColl(f"P_{base}")
         params = {"properties": {"endpoint": "/x"}, "vector": [0.1]}
         stub._dedup_insert(coll, params, "GET /x", file_path_rel="tests/t.py")
-        assert "is_test" not in coll.data.written[0]["properties"], base
+        assert coll.data.written[0]["properties"].get("is_test") is want, base
 
 
 def test_is_test_preset_false_not_clobbered(analyzer_mod):
@@ -321,7 +323,8 @@ def test_ensure_is_test_scope_and_idempotence(analyzer_mod):
     assert mods.added == ["is_test"]
     assert classes.added == ["is_test"]
     assert funcs.added == ["is_test"]
-    assert apis.added == [] and inters.added == [], "API/Interaction excluded"
+    assert apis.added == ["is_test"], "CodeAPI in scope since v0.2.102 W6-O"
+    assert inters.added == [], "Interaction excluded"
 
     have = _EnsureColl(has_props=("is_test",))
     stub2 = types.SimpleNamespace(
@@ -795,7 +798,9 @@ def test_edge_scope_matches_ensure_helpers():
         cls for cls, specs in subset.items()
         if any(p == "n_callers" for p, _t, _d in specs)
     )
-    assert is_test_classes == ("CodeModule", "CodeClass", "CodeFunction")
+    # CodeAPI joined the is_test spec in v0.2.102 W6-O (owned by edge 8_to_9);
+    # the projection includes it, so a v5 install's 5_to_6 adds it too (harmless).
+    assert is_test_classes == ("CodeModule", "CodeClass", "CodeFunction", "CodeAPI")
     assert n_callers_classes == ("CodeFunction",)
 
 

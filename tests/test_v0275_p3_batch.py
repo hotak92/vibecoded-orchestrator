@@ -220,38 +220,58 @@ def test_p3f_overfetch_env(monkeypatch):
 # ─────────────────── P3b: embed-service shed parity ───────────────────
 
 
-def test_p3b_should_shed_at_capacity():
-    import claude_mcp_servers.code_embedding_service.server as es
-    es._in_flight = 0
-    assert es._should_shed() is False
-    es._in_flight = es.MAX_CONCURRENT
-    assert es._should_shed() is True
-    es._in_flight = 0  # reset for other tests
+def test_p3b_capacity_queues_then_bounded_503_with_retry_after(monkeypatch):
+    """RETARGETED (v0.2.102 r2; was: ``test_p3b_should_shed_at_capacity`` +
+    ``test_p3b_both_endpoints_shed_on_the_same_condition``, pinning the C-9
+    immediate shed that the owner rule replaced: concurrent requests QUEUE,
+    none are dropped).
 
+    An over-capacity request now WAITS for a slot (FIFO, bounded by
+    ``CODE_EMBED_QUEUE_WAIT_SECS``) instead of being refused on arrival. The
+    C-9 parity intent survives: both endpoints share the ONE
+    ``_run_embed_guarded`` wrapper, so when the queue bound IS exceeded both
+    ``/embed`` and ``/api/embeddings`` answer the identical 503 — which must
+    now carry a Retry-After header (the pre-fix capacity 503 said "Retry
+    later." while omitting the header that would make it actionable).
+    """
+    import time as _time
 
-def test_p3b_both_endpoints_shed_on_the_same_condition(monkeypatch):
-    """Under a saturated in-flight count, BOTH /embed and /api/embeddings 503
-    (pre-fix /api/embeddings never shed → divergence)."""
     import claude_mcp_servers.code_embedding_service.server as es
     from fastapi import HTTPException
 
-    es._in_flight = es.MAX_CONCURRENT  # saturated
+    monkeypatch.setattr(es, "MAX_CONCURRENT", 1)
+    monkeypatch.setattr(es, "QUEUE_WAIT_SECS", 0.05)  # tiny bound keeps it fast
+    monkeypatch.setattr(es, "_request_semaphore", None)  # rebuild at MAX=1
+    monkeypatch.setattr(es, "_inference_lock", None)
+    monkeypatch.setattr(es, "_in_flight", 0)
 
     async def _run():
-        with pytest.raises(HTTPException) as e1:
-            await es.embed_endpoint(es.EmbedRequest(texts=["x"]))
-        assert e1.value.status_code == 503
-        assert "capacity" in e1.value.detail.lower()
+        sem = es._get_semaphore()
+        await sem.acquire()  # occupy the only slot
+        try:
+            t0 = _time.monotonic()
+            with pytest.raises(HTTPException) as e1:
+                await es.embed_endpoint(es.EmbedRequest(texts=["x"]))
+            waited = _time.monotonic() - t0
+            assert e1.value.status_code == 503
+            assert "capacity" in e1.value.detail.lower()
+            assert "Retry-After" in (e1.value.headers or {}), (
+                "the capacity 503 must carry the actionable Retry-After"
+            )
+            assert waited >= 0.04, (
+                "must WAIT (queue) for a slot up to the bound, not refuse "
+                "on arrival"
+            )
 
-        with pytest.raises(HTTPException) as e2:
-            await es.ollama_compat_endpoint(es.OllamaEmbedRequest(prompt="x"))
-        assert e2.value.status_code == 503
-        assert "capacity" in e2.value.detail.lower()
+            with pytest.raises(HTTPException) as e2:
+                await es.ollama_compat_endpoint(es.OllamaEmbedRequest(prompt="x"))
+            assert e2.value.status_code == 503
+            assert "capacity" in e2.value.detail.lower()
+            assert "Retry-After" in (e2.value.headers or {})
+        finally:
+            sem.release()
 
-    try:
-        asyncio.run(_run())
-    finally:
-        es._in_flight = 0
+    asyncio.run(_run())
 
 
 def test_p3b_health_reports_in_flight_not_private_value():

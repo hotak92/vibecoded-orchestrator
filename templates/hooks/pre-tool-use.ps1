@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed. 2026-07-13 (v0.2.80): block-reason messages routed to stderr via [Console]::Error.WriteLine to MATCH the .sh sibling (which already writes these to stderr) — one-directional align-to-sh, no Bash-side change to co-modify.
+﻿# Parity: kept in step with pre-tool-use.sh (this file's UTF-8 BOM serves
+# Windows PowerShell 5.1 only; block-reason messages go to stderr on both
+# sides; every behaviour must match the .sh sibling).
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
@@ -122,6 +124,18 @@ if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
     $SessionIdRaw = ($SessionIdFromStdin -replace '[^A-Za-z0-9_-]', '')
 }
 $SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } elseif ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { (Get-Date).ToString("yyyyMMdd_HH") }
+# v0.2.102 W6-C1 (F11): the Build-Anchor reads ledger is per AGENT. The
+# payload's $AgentId (parsed above) is set exactly when this tool call
+# belongs to a SUBAGENT -- whose context never saw the parent's Reads (and
+# vice versa), so sharing reads_<sid>.txt let a subagent overwrite with
+# Write a file only the parent Read (the gate failed open across agents).
+# The composite key comes from the ONE session-id helper; the main agent's
+# key is byte-identical to the pre-W6-C1 name (this branch only adds the
+# __<agent_id> component when $AgentId is non-empty). MUST MATCH pre-tool-use.sh.
+$AnchorSessionKey = $SessionId
+if ($AgentId -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyContinue)) {
+    $AnchorSessionKey = Get-VcoAgentKeyFromIds -SessionId $SessionId -AgentId $AgentId
+}
 # Per-session dedup state lives under the project's .claude/state/ rather
 # than $env:TMPDIR / $env:TEMP so it survives reboots + launcher restarts
 # (Claude Code persists session_id across restarts via the resume feature).
@@ -129,7 +143,7 @@ $SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } elseif ($env:CLAUD
 # and wiped only by PostCompact (correct semantic — context truly resets
 # at compaction).
 $SessionStateDir = Join-Path $ProjectRoot ".claude/state"
-$SessionReadsFile = Join-Path $SessionStateDir "reads_$SessionId.txt"
+$SessionReadsFile = Join-Path $SessionStateDir "reads_$AnchorSessionKey.txt"
 $BackupDir = Join-Path $SessionStateDir "tool_backups"
 $SecurityLog = Join-Path $ProjectRoot ".claude/logs/security_events.jsonl"
 
@@ -147,6 +161,10 @@ New-Item -ItemType Directory -Force -Path $BackupDir -ErrorAction SilentlyContin
 # HK-4 (v0.2.75) accepted-scatter: one of 4 per-hook GC sweeps (uniform 14d);
 # a shared sweeper is optional and deliberately SKIPPED to keep hooks
 # single-file. MUST MATCH the .sh sibling. See pre-edit-context-inject.ps1.
+# v0.2.102 W6-C1 (F1/F11): the per-agent names reads_<sid>__<agent>.txt and
+# seen_reads_<sid>__<agent>.txt are already covered by these two filters
+# (the wildcard spans the '__<agent_id>' component), so the GC needs no new
+# pattern.
 try {
     Get-ChildItem -Path $SessionStateDir -Filter 'reads_*.txt' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
@@ -209,6 +227,18 @@ if ($ToolName -eq "WebFetch") {
     if ($payload -and $payload.tool_input -and $null -ne $payload.tool_input.url) {
         $url = ([string]$payload.tool_input.url).Trim()
     }
+    if (-not $url) {
+        # v0.2.102 NB-H1 (FRR:64): an empty URL here means the payload's url
+        # field could not be extracted (malformed tool_input, a parser
+        # error) — a WebFetch the guard cannot judge went out UNGUARDED
+        # before this arm. A security guard that cannot read its input fails
+        # CLOSED (the no-Python arm's contract). MUST MATCH the .sh sibling.
+        # Non-WebFetch tools are unaffected (this branch is WebFetch-only).
+        [Console]::Error.WriteLine("SSRF guard: the WebFetch payload's 'url' field could not be extracted (malformed payload or a parser error), so the call cannot be checked and is blocked.")
+        [Console]::Error.WriteLine("   Retry; if it persists this is a broken VCO install - re-run the orchestrator's update (``python install.py --update`` in the orchestrator root, or the launcher's Update).")
+        Write-SecurityLine "{""timestamp"":""$ts"",""event"":""ssrf_blocked"",""url"":"""",""reason"":""url_extraction_failed""}"
+        exit 2
+    }
     if ($url) {
         # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
         # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both
@@ -257,8 +287,10 @@ if ($ToolName -eq "WebFetch") {
     }
 }
 
-# === 2. SHELL INJECTION SCAN ===
-if ($ToolName -eq "Bash") {
+# === 2. SHELL INJECTION SCAN (Bash, and the PowerShell tool -- v0.2.102 W5-D:
+# the only shell tool on Windows without Git Bash; the scanner's
+# `--shell powershell` rule set reads its syntax) ===
+if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
     $cmd = Get-Field "command"
     $injection = ""
     if ($cmd -match '(?i)(curl|wget)\s[^|]+\|\s*(ba)?sh\b') { $injection = "network fetch piped to shell" }
@@ -268,7 +300,7 @@ if ($ToolName -eq "Bash") {
     if ($injection) {
         # Route the block message to STDERR (matches pre-tool-use.sh) —
         # see the SSRF-guard branch above for why plain stdout is dropped.
-        [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in Bash command.")
+        [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in $ToolName command.")
         $preview = if ($cmd.Length -gt 120) { $cmd.Substring(0, 120) } else { $cmd }
         [Console]::Error.WriteLine("   Blocked command preview: $preview")
         [Console]::Error.WriteLine("   If this is intentional, run the command manually in a terminal.")
@@ -286,13 +318,14 @@ if ($ToolName -eq "Bash") {
     }
     if ((Test-Path $SecurityScript) -and $PY) {
         try {
-            $secOut = $cmd | & $PY $SecurityScript 2>&1
+            $secShell = if ($ToolName -eq "PowerShell") { "powershell" } else { "bash" }
+            $secOut = $cmd | & $PY $SecurityScript --shell $secShell 2>&1
             $secExit = $LASTEXITCODE
             if ($secExit -eq 2) {
                 # Route to STDERR (matches pre-tool-use.sh's bash-security
                 # branch) — same stdout-discard rationale as the SSRF /
                 # injection guards above.
-                [Console]::Error.WriteLine("Bash security scanner blocked this command:")
+                [Console]::Error.WriteLine("$ToolName security scanner blocked this command:")
                 [Console]::Error.WriteLine("   $secOut")
                 $detail = if ("$secOut".Length -gt 200) { "$secOut".Substring(0,200) } else { "$secOut" }
                 $detailEsc = $detail -replace '\\', '\\\\' -replace '"', '\"'
@@ -336,7 +369,16 @@ if ($ToolName -eq "Read") {
             $relFp = ConvertTo-VcoRepoRelative -Path $filePath -ProjectRoot $ProjectRoot
         }
         if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-            $unifiedReads = Get-VcoSeenStorePath -Kind "reads" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+            # v0.2.102 W6-C1 (F1): the injector reads-ledger is per AGENT --
+            # a subagent's Read must not mark sources "already in context"
+            # for the parent (whose window never saw them), nor be silenced
+            # by the parent's Reads. Same composite key as the router's.
+            # MUST MATCH pre-tool-use.sh.
+            $storeSid = $SessionIdRaw
+            if ($AgentId -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyContinue)) {
+                $storeSid = Get-VcoAgentKeyFromIds -SessionId $SessionIdRaw -AgentId $AgentId
+            }
+            $unifiedReads = Get-VcoSeenStorePath -Kind "reads" -SessionId $storeSid -ProjectRoot $ProjectRoot
             if ($unifiedReads) {
                 try { Add-Content -Path $unifiedReads -Value $relFp -ErrorAction Stop } catch { }
             }

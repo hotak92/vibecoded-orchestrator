@@ -30,6 +30,7 @@ from vco_lib.atomic import exclusive_file_lock
 from vco_lib.deferral_emit import LOCK_REL, emit
 from vco_lib.deferral_report import DeferralEntry, DeferralReport
 from vco_lib.gate_skipped_deferral import CONDITION_ID, build_entry
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -71,7 +72,7 @@ def _argv(impl: str, hooks: Path, proj: Path) -> list:
         "$script:VcoRouteProjectRoot = $Proj\n"
         "Emit-KgGateSkippedDeferral -Collection 'Demo_KnowledgeGraph'\n",
         encoding="utf-8")
-    return [PWSH, "-NoProfile", "-NonInteractive", "-File", str(driver),
+    return [PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(driver),
             "-Hooks", str(hooks), "-Proj", str(proj)]
 
 

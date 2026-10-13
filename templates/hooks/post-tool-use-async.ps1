@@ -18,14 +18,22 @@
 #
 # WHAT IT DOES (mirrors the .sh sibling step for step)
 #   1. Reads the hook stdin ONCE into a temp file every child shares.
-#   2. Parses the routing fields (tool_name; whether tool_input.command
-#      starts with "git commit") with the same find-python + inline-Python
-#      idiom every sub-hook uses - no second parsing mechanism.
+#   2. Parses the routing fields (tool_name; whether tool_input.command runs
+#      a "git commit" segment anywhere in its chain) with the same
+#      find-python + inline-Python idiom every sub-hook uses - no second
+#      parsing mechanism. The commit detection itself is the ONE home
+#      vco_lib.git_commit_gate.command_has_git_commit (the shared
+#      quote-aware chain walker, vco_lib/bash_command_walk.py; PowerShell
+#      commands via vco_lib/powershell_command.py).
 #   3. Routes over the $RouteTable below: tool equality or *, with the
-#      git-commit-prefix gate carrying the retired registration key
-#      "if: Bash(git commit *)" (word-boundary: "git commit" exactly or
-#      followed by a space - "git commit-tree" does NOT fire the review
-#      agent). The retired "if: Edit|Write(knowledge/**.md)" keys are
+#      git-commit-chain gate carrying - and WIDENING (v0.2.102 W6-F) -
+#      the retired registration key "if: Bash(git commit *)". The retired
+#      key only matched a command STARTING with "git commit", so
+#      "cd ... && git commit" never fired the reviewer. The walker fires on
+#      a "git commit" segment anywhere in the chain, keeps the word
+#      boundary ("git commit-tree" does NOT fire) and treats quoted text as
+#      data (''echo "git commit"'' does NOT fire).
+#      The retired "if: Edit|Write(knowledge/**.md)" keys are
 #      enforced by kg-summary-generator's OWN knowledge-path validation
 #      (unchanged body - one home preserved; this file is a router, not a
 #      re-implementation. That delegation costs one short-lived no-op
@@ -74,9 +82,10 @@
 # rows so a sub-hook can never be routed on one OS only.
 #
 # Routing table format: <tool_name or *>|<script stem>|<gate>
-#   gate -                 = always route on a tool match
-#   gate git-commit-prefix = only when tool_input.command starts with
-#                            "git commit" (the retired "if" key)
+#   gate -                = always route on a tool match
+#   gate git-commit-chain = only when tool_input.command runs a
+#                           "git commit" segment anywhere in its chain
+#                           (v0.2.102 W6-F; the retired "if" key widened)
 
 # Scrub sensitive env vars before any subprocess spawning.
 $secretEnvNames = @(
@@ -104,9 +113,12 @@ Edit|kg-summary-generator|-
 Write|post-edit-outcome|-
 Write|kg-summary-generator|-
 Bash|post-bash-context-record|-
-Bash|post-git-commit-kg-sync|git-commit-prefix
-Bash|post-file-delete|-
+Bash|post-git-commit-kg-sync|git-commit-chain
+PowerShell|post-bash-context-record|-
+PowerShell|post-git-commit-kg-sync|git-commit-chain
 mcp__weaviate-kg__store_knowledge_node|kg-summary-generator|-
+Agent|stop-drain-citations|-
+Task|stop-drain-citations|-
 *|kg-update-nudge|-
 '
 
@@ -228,13 +240,30 @@ try {
     New-Item -ItemType Directory -Force -Path $WorkDir -ErrorAction Stop | Out-Null
 
     # Routing fields, one Python call (same idiom as the sub-hooks):
-    # line 1 = tool_name, line 2 = "1" when tool_input.command starts with
-    # "git commit" (the retired registration gate), else "0".
+    # line 1 = tool_name, line 2 = "1" when tool_input.command runs a
+    # "git commit" segment anywhere in its chain (the retired
+    # "if: Bash(git commit *)" registration gate, widened in v0.2.102 W6-F
+    # from prefix-match to the quote-aware chain walk), else "0". The walk
+    # itself is vco_lib.git_commit_gate (ONE home), imported from the
+    # orchestrator root resolved by the SAME ladder every hook uses
+    # (_lib/resolve-vco-venv.ps1, Resolve-VcoOrchestratorScript). When
+    # vco_lib is UNRESOLVABLE the gate stays "0" and the python's stderr
+    # line lands in the dispatcher log - the one loud channel.
     $FindPy = Join-Path $ScriptDir "_lib/find-python.ps1"
     if (Test-Path -LiteralPath $FindPy -PathType Leaf) { . $FindPy }
     if (-not $PY) { exit 0 }  # No Python - cannot route; sub-hooks need it too
+    $VcoRoot = ""
+    $ResolveVenv = Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1"
+    if (Test-Path -LiteralPath $ResolveVenv -PathType Leaf) {
+        . $ResolveVenv
+        if (Get-Command Resolve-VcoOrchestratorScript -ErrorAction SilentlyContinue) {
+            $gateScript = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "vco_lib/git_commit_gate.py"
+            if ($gateScript) { $VcoRoot = Split-Path (Split-Path $gateScript -Parent) -Parent }
+        }
+    }
+    $env:VCO_PTA_VCO_ROOT = $VcoRoot
     $parseSrc = @'
-import json, sys
+import json, os, sys
 try:
     with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
         d = json.load(f)
@@ -244,11 +273,28 @@ if not isinstance(d, dict):
     d = {}
 ti = d.get("tool_input")
 cmd = (ti.get("command") or "") if isinstance(ti, dict) else ""
-c = cmd.lstrip()
-print(d.get("tool_name") or "")
-print("1" if (c == "git commit" or c.startswith("git commit ")) else "0")
+tool = d.get("tool_name") or ""
+is_commit = "0"
+root = os.environ.get("VCO_PTA_VCO_ROOT", "")
+if cmd and root:
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from vco_lib.git_commit_gate import command_has_git_commit
+        is_commit = "1" if command_has_git_commit(cmd, tool) else "0"
+    except Exception as exc:
+        print(f"post-tool-use-async: git-commit gate unavailable: {exc!r}",
+              file=sys.stderr)
+elif cmd and not root:
+    print("post-tool-use-async: git-commit gate unavailable: orchestrator "
+          "root not resolved (vco_lib.git_commit_gate unreachable)",
+          file=sys.stderr)
+print(tool)
+print(is_commit)
 '@
-    $fields = @(& $PY -c $parseSrc $TmpInput 2>$null)
+    # No 2>$null: the gate's loud line (vco_lib unresolvable) must reach
+    # the dispatcher log, mirroring the .sh sibling.
+    $fields = @(& $PY -c $parseSrc $TmpInput)
     $ToolName = if ($fields.Count -ge 1) { [string]$fields[0] } else { "" }
     $IsGitCommit = if ($fields.Count -ge 2) { [string]$fields[1] } else { "0" }
 
@@ -277,7 +323,7 @@ print("1" if (c == "git commit" or c.startswith("git commit ")) else "0")
         $scriptStem = $parts[1]
         $gate = $parts[2]
         if ($tool -ne '*' -and $tool -ne $ToolName) { continue }
-        if ($gate -eq 'git-commit-prefix' -and $IsGitCommit -ne '1') { continue }
+        if ($gate -eq 'git-commit-chain' -and $IsGitCommit -ne '1') { continue }
         if ($DisabledStems -contains $scriptStem) { continue }  # per-sub-hook disable (SF-2)
         $childPath = Join-Path $ScriptDir ($scriptStem + ".ps1")
         if (-not (Test-Path -LiteralPath $childPath -PathType Leaf)) {

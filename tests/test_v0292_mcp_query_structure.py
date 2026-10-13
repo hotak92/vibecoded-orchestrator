@@ -284,10 +284,12 @@ class TestReturnReferencesArgumentShape(unittest.TestCase):
         )
 
     def test_no_return_references_call_site_passes_strings(self):
-        """Cross-site guard: neither call site may regress to ``list[str]``.
+        """Cross-site guard: no call site may regress to ``list[str]``.
 
         Comment lines are excluded — the fix's own explanatory comment quotes
-        the defective form on purpose.
+        the defective form on purpose. THREE live call sites since v0.2.102
+        W4-C L4 (the reverse-imports branch gained one — it now reads the
+        importers' references back to confirm the target path in Python).
         """
         source = (
             REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
@@ -302,11 +304,11 @@ class TestReturnReferencesArgumentShape(unittest.TestCase):
                 f"{bad} is the exact pre-v0.2.92 defect — build the argument "
                 f"with _code_return_references()",
             )
-        # And the two live call sites both route through the helper.
+        # And every live call site routes through the helper.
         self.assertEqual(
             code.count('_code_return_references("imports")')
             + code.count('_code_return_references("extends")'),
-            2,
+            3,
         )
 
 

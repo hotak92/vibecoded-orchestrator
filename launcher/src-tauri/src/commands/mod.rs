@@ -18,8 +18,8 @@ pub mod claude_env;
 pub mod gpu;
 pub mod gpu_policy;
 pub mod codegraph;
-// v0.2.18 (Plan C): Re-analyze runner. Forks the Tauri-streaming pattern
-// from `embedding_enrichment` against `analyze_code_graph.py
+// v0.2.18 (Plan C): Re-analyze runner. Forked the Tauri-streaming pattern
+// from the (v0.2.102-retired) `embedding_enrichment` command against `analyze_code_graph.py
 // --json-progress`. Re-analyze always passes `--prune-stale` (it's the
 // "authoritative refresh" path); `--language` is optional and scopes the
 // re-walk + prune to one language.
@@ -46,36 +46,24 @@ pub mod desktop_shortcut;
 // commands in `rl_settings` stay registered; both surfaces resolve through
 // `vct_launcher_core::db::settings::resolve_dual_flags`.
 pub mod dual_flags;
-// Phase 1.1 of the diagrams (Mermaid + Excalidraw) integration plan
-// (.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md).
-// Sibling Phase 1.2/1.3/1.5 agents stub these command names — keep
-// stable; the merge wires their tabs/wrappers against these.
-pub mod diagrams_cmd;
-// v0.2.34 Agent D — `subscribe_to_diagram_changes` + filesystem watcher
-// that emits `diagram-changed` Tauri events. Split from `diagrams_cmd`
-// because it owns process-wide state (`HashMap<project_id,
-// RecommendedWatcher>` + debounce slots) that doesn't belong on the
-// per-command shape. See
-// `.claude/context/plans/diagrams-frontend-wiring-handoff-2026-05-25.md`.
-pub mod diagram_watcher;
-// v0.2.36 Agent R — local HTTP server that serves the vendored
-// Mermaid/Excalidraw editors at 127.0.0.1:<free-port>. Lazy-started
-// on the first `open_diagrams_editor` Tauri command. Replaces the
-// embedded Excalidraw editor (broken on Wayland+webkit2gtk) and adds
-// a visual Mermaid editor alongside the existing text-only one.
-pub mod diagrams_local_server;
+// v0.2.102 W5-A (M3): the Identity tab's "Infrastructure this project owns"
+// panel — external collections, unmanaged containers, local ports
+// (`vct_launcher_core::db::infra_declarations`, migration 049).
+pub mod infra_declarations;
+// v0.2.102 (owner ruling 2026-10-07): the diagrams integrations were
+// dropped entirely — `diagrams_cmd`, `diagram_watcher` and
+// `diagrams_local_server` are deleted. The GENERIC `project_modules`
+// machinery that lived in `diagrams_cmd` (set_project_module_enabled /
+// clear_project_module + the re-render and bundle-update spawns) moved
+// to `module_enabled.rs`. The `is_project_module_active` READ command
+// moved with them, then was REMOVED (owner decision 2026-10-08): zero
+// callers remained after the Diagrams tab went.
 pub mod embed_admission;
 pub mod embedding_catalog;
-pub mod embedding_enrichment;
 // v0.2.75 P2 — pure `.env` audit + sentinel-rewrite (Rust mirror of
 // vco_lib/secrets_audit.py) backing the launcher-side "Migrate from .env"
 // button. Consumed by secrets_cmd::migrate_env_secrets_from_dotenv.
 pub mod env_secrets_migrate;
-// v0.2.71 Track T-C-modal — per-slot populated-vector COUNTS for a project's
-// KG collection. Powers the RegenerateOrDeferModal "keep previous model"
-// option (smart default = most-populated slot). Thin shell-out to
-// `vco_lib.embedding_enrichment slot-counts`; no duplicate count logic.
-pub mod embedding_slot_counts;
 // v0.2.92 WP-13: the ONE git runner + the ONE branch resolver. `installer.rs`
 // normalised a detached `"HEAD"` → `main` at five inline sites while
 // `self_update.rs` did it at zero, so the two update surfaces gave OPPOSITE
@@ -122,6 +110,10 @@ pub mod model_gateway;
 // restart ends every agent session routed through the gateway. The verdict
 // lives in `python -m vco_lib.gateway_freshness`.
 pub mod gateway_freshness;
+// v0.2.102 W6-L: code-graph parsers on demand — which missing tree-sitter
+// parsers to offer for the registered projects, "Not now", and the install.
+// Every decision lives in `python -m vco_lib.codegraph_parsers`.
+pub mod codegraph_parsers;
 // v0.2.97: subscription usage windows for the home-page card. The numbers
 // are the gateway's (`GET /usage/windows`), read through
 // `python -m vco_lib.gateway_usage` so the host token never enters Rust.

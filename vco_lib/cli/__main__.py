@@ -21,13 +21,10 @@ import argparse
 import sys
 from typing import Optional, Sequence
 
-from vco_lib.cli import codegraph_diagram as _codegraph_diagram
 from vco_lib.cli import doctor as _doctor
 from vco_lib.cli import fix_transcript as _fix_transcript
 from vco_lib.cli import project_cmd as _project_cmd
-from vco_lib.cli import rebuild_diagram_index as _rebuild_diagram_index
 from vco_lib.cli import verify as _verify
-from vco_lib.cli import verify_diagrams as _verify_diagrams
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -36,17 +33,15 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "VibeCoded Orchestrator CLI. Each subcommand maps to an "
             "operational verifier or maintenance helper. Phase 0 ships "
-            "verify-pins + verify-env-projection; Phase 1.5 adds "
-            "rebuild-diagram-index; v0.2.91 adds doctor; v0.2.92 adds the "
-            "`project` family (move, rename-collections); v0.2.94 adds "
-            "fix-transcript."
+            "verify-pins + verify-env-projection; v0.2.91 adds doctor; "
+            "v0.2.92 adds the `project` family (move, rename-collections); "
+            "v0.2.94 adds fix-transcript. v0.2.102 removes the diagram "
+            "CLIs (rebuild-diagram-index, verify-diagrams, "
+            "codegraph-diagram) with the diagrams integrations."
         ),
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
     _verify.add_subparsers(sub)
-    _verify_diagrams.add_subparsers(sub)
-    _rebuild_diagram_index.add_subparsers(sub)
-    _codegraph_diagram.add_subparsers(sub)
     _doctor.add_subparsers(sub)
     _project_cmd.add_subparsers(sub)
     _fix_transcript.add_subparsers(sub)

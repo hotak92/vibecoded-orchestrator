@@ -37,10 +37,19 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 set -euo pipefail
 
+# shellcheck source=_lib/stderr-cap.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
 EDITED_FILE="$1"
-REPO_PATH="${2:-${CLAUDE_PROJECT_DIR:-$(pwd)}}"
+# Repo root: an explicit $2 wins; else the ONE shell rule (_lib/project-root.sh,
+# must match vco_lib/project_root.py). None -> nothing to analyze.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+REPO_PATH="${2:-}"
+if [ -z "$REPO_PATH" ]; then
+    REPO_PATH="$(vco_project_root)" || REPO_PATH=""
+fi
+[ -n "$REPO_PATH" ] || exit 0
 
 # v0.2.21 Step 18 (caller migration): when the project name arg is not
 # supplied, prefer the launcher's vct-hub over the basename fallback.
@@ -129,6 +138,7 @@ fi
 # runs unchanged. The resolver script is the same one we already called
 # above for PROJECT_NAME; if it isn't executable we silently skip extras.
 EXTRAS_MATCHED=0
+_PRIMARY_ROOT="$REPO_PATH"  # the project's own folder, kept for --primary-root
 # Check (1) first: don't even query extras for the trivial own-repo case.
 # This avoids one hub round-trip per Edit in the common case and matches
 # the spec's "first match wins" ordering.
@@ -304,6 +314,18 @@ if [ "$EXTRAS_MATCHED" -eq 0 ]; then
         echo "ℹ️  code-graph: skipped worktree edit (ephemeral/unregistered) $EDITED_FILE" >&2
         exit 0
     fi
+    # v0.2.102 W6-ALERTS2 (owner ruling 3): the gate indexed on doubt because
+    # the hub did not answer. Say so (stderr — this script is run from the CLI
+    # or by a caller, with no hook event to answer), once per session/hour.
+    # MUST MATCH the .ps1 sibling.
+    if [ "${VCO_WORKTREE_GATE_HUB_UNREACHABLE:-}" = "1" ]; then
+        # shellcheck source=_lib/emit-context.sh disable=SC1091
+        [ -f "$SCRIPT_DIR/_lib/emit-context.sh" ] && . "$SCRIPT_DIR/_lib/emit-context.sh"
+        if command -v vco_report_hub_unreachable >/dev/null 2>&1; then
+            vco_report_hub_unreachable "$SCRIPT_DIR" "$REPO_PATH" "" "code-graph-incremental" \
+                "It indexed $EDITED_FILE anyway (the safe default when it cannot confirm that a worktree is unregistered), so throwaway worktrees may be indexed until the hub is back."
+        fi
+    fi
 fi
 
 # Resolve python: prefer venv, fall back to system python (cross-OS).
@@ -368,6 +390,31 @@ else
     _DOT_CLAUDE_FLAG="--no-index-dot-claude"
 fi
 
+# v0.2.102: an edit claimed by an extra path is analyzed with --as-extra-path,
+# like every other extra-path analyzer run (the panel's Sync button, the
+# automatic refresh and the queued Stop drain build their argv through
+# vco_lib.codegraph_extras_refresh.build_extra_sync_argv or its Rust mirror
+# extra_path_sync_args). It limits the
+# analyzer's deletes to rows provably stamped with the extra path, so a
+# single-file run under an extra never removes a primary-root row of the same
+# collection. MUST MATCH the .ps1 sibling.
+#
+# W6-CGD (D-2): the --canonical-source worktree convergence is for the
+# PROJECT's own edits only. An extra path's rows carry the registered extra
+# root, the value the Sync button, the automatic refresh and the queued drain
+# stamp (one rule: vco_lib.codegraph_source_scope.walk_source_stamp, which the
+# analyzer applies even if a caller still passes the flag). Stamping a
+# worktree extra with its git main root gave one file two identities, and for
+# a worktree OF the project it overwrote the project's own rows.
+# --primary-root lets the analyzer refuse an extra that overlaps the project
+# (vco_lib.codegraph_extra_overlap). MUST MATCH the .ps1 sibling.
+_EXTRA_PATH_FLAG=()
+_CANON_FLAG=(--canonical-source "$_CANON_ROOT")
+if [ "$EXTRAS_MATCHED" -eq 1 ]; then
+    _EXTRA_PATH_FLAG=(--as-extra-path --primary-root "$_PRIMARY_ROOT")
+    _CANON_FLAG=()
+fi
+
 # Run single-file analysis in background (no internal debounce — the
 # per-file coalescing is handled by post-file-edit.sh's debounce layer).
 # In single-file mode the analyzer scopes analysis to the one edited file,
@@ -407,8 +454,9 @@ fi
         "$REPO_PATH" \
         --project "$PROJECT_NAME" \
         --only-file "$EDITED_FILE" \
-        --canonical-source "$_CANON_ROOT" \
+        ${_CANON_FLAG[@]+"${_CANON_FLAG[@]}"} \
         "$_DOT_CLAUDE_FLAG" \
+        ${_EXTRA_PATH_FLAG[@]+"${_EXTRA_PATH_FLAG[@]}"} \
         2>&1 | tail -5
 ) &
 

@@ -3,7 +3,7 @@ title: Orchestrator Hook System
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, hooks, automation, workflow]
 created: 2026-04-27T18:30:00Z
-updated: 2026-10-06T09:00:00Z
+updated: 2026-10-13T00:00:00Z
 status: active
 ---
 
@@ -33,7 +33,7 @@ User action / Claude turn
 [UserPromptSubmit]      — may inject diff context, show reminders
         |
         v
-[PreToolUse]            — security scan, logging, KG search suggestion
+[PreToolUse]            — security scan, logging, KG / code-graph context injection
         |
    Tool executes
         |
@@ -128,13 +128,18 @@ Context nearing limit
 
 ### SubagentStart
 
-**subagent-start-suggest.sh** / **subagent-start-kg-inject.sh**
-- Suggest relevant capabilities; keep the V52-L.1 filesystem snapshot the SubagentStop reconciler diffs against. (v0.2.101: the KG-injection half was retired — a SubagentStart payload carries no prompt text, so its query could never fire. KG context for subagents is injected PARENT-side by `agent-brief-kg-inject.sh` below.)
+**subagent-start-kg-inject.sh**
+- Keeps the V52-L.1 filesystem snapshot the SubagentStop reconciler diffs against — for agents WITHOUT their own worktree (an isolated agent is reconciled from its worktree's git state). (v0.2.101: the KG-injection half was retired — a SubagentStart payload carries no prompt text, so its query could never fire. v0.2.102: `subagent-start-suggest.sh` was retired for the same reason. KG context AND agent/skill suggestions for subagents are injected PARENT-side by `agent-brief-kg-inject.sh` below.)
 
 ### SubagentStop (blocking)
 
-**subagent-stop-reconcile.sh**
-- Reconciles subagent output (worktree diffs, KG-write discipline) before the subagent is allowed to stop.
+**subagent-stop-reconcile.sh** / **stop-drain-citations.sh** (async)
+- Reconciles subagent output in a DETACHED job (v0.2.102): reaps an unchanged worktree, scans and indexes what the agent changed (its own worktree when it had one, else the shared-tree snapshot diff, recorded as unattributed), and files alerts for the PARENT. The citation drain scores the RL citations staged by the subagent's injections against the subagent's own transcript (`agent_transcript_path`).
+
+### SessionEnd
+
+**stop-drain-citations.sh** (synchronous, timeout 5; v0.2.102)
+- The main chat's end: records it, then scores the session's pending RL citations with the terminal and soft-label floors in a DETACHED drain. RL citations have no scoring deadline — a citation below the full token gate waits for its own chat to end and is scored against that chat's transcript only. A file is removed before then only when provably abandoned (`RL_CITATION_ABANDONED_DAYS`, default 7, and no live owner), scored first or logged as unscored.
 
 ### PreToolUse
 
@@ -158,8 +163,6 @@ Context nearing limit
 - All six are THIN wrappers around one Python router (`claude_mcp_servers/scripts/hook_context_router.py`; pure decision core in `vco_lib/inject_intent.py`): the wrapper pipes the hook payload to `hook_context_router.py <surface>` and envelopes whatever it prints. The router classifies Bash commands (READ/EDIT/SEARCH/MECHANICAL — mechanical spawns no producer), builds queries ONLY from target paths/symbols (never command or `new_string` text), applies the per-surface score-floor/tier table (titles-only below 0.85, floors 0.65–0.75), runs exact code-graph `structure callers` lookups instead of semantic code search (with an indexed-revision stamp that silences the leg on pinned `git show <rev>` reads, and a same-language identity check), dedupes through the shared seen-store files, enforces a 2 500-char per-injection cap and a 6 000-char per-turn budget (`prompt_id`-keyed), and caches under `.claude/state/query_cache/` (`kgi`/`cgi` namespaces) where an EMPTY result is never cached. Kill switch: `VCO_INJECT_PROFILE=off`. The retired `VCT_BASH_KG_THRESHOLD_CHARS` threshold was replaced by the classification.
 - `agent-brief-kg-inject` emits a PreToolUse `updatedInput` envelope (every original field echoed, only `prompt` extended, never a `permissionDecision`); `pre-edit` keeps its per-file replay cache (router output replays through current seen-state with no spawn). RL continuity: KG legs carry `--injection-profile` + per-surface `--task-type`; the pre-bash wrapper keeps the `bash_task_*` state file + `pre_bash` outcome event for classified commands (intent/targets/symbols in the payload; one event per tool call even when several `if` rules match).
 
-**pre-diagram-path-validation.sh** (matcher: `Write|Edit` and `mcp__mermaid__.*|mcp__excalidraw__.*`)
-- Validates that diagram outputs land in an indexed path before the write proceeds.
 
 ### PostToolUse (non-blocking)
 
@@ -172,7 +175,7 @@ Context nearing limit
 
 **post-tool-use-async.sh** (matcher: `*`, async — the ONE async PostToolUse registration, v0.2.101)
 - Dispatcher for every background PostToolUse concern. Reads the hook payload once, routes it by `tool_name` to the unchanged per-concern scripts and runs them concurrently, guaranteeing silence: child stdout is discarded and child stderr / non-zero exits condense to one line per failure in `<VCO metrics dir>/post-tool-use-async.log`, so a tool call can no longer write up to three `async_hook_response` transcript records (measured pre-fix: 700k records / 462 MB in one transcript).
-- Routes: `Edit|Write` → **post-edit-outcome.sh** (edit-outcome telemetry for the RL retrieval pipeline) + **kg-summary-generator.sh** (background summary refresh of `knowledge/.node_formats.json` for knowledge-path edits — its own path validation is the gate; see [[KG-Summary Three-Tier Generation Pipeline]] for backend selection); `Bash` → **post-bash-context-record.sh** (bash-outcome telemetry) + **post-file-delete.sh** (diagram-delete cascade) + **post-git-commit-kg-sync.sh** (commit-review agent, behind a `git commit` command-prefix gate reproducing the retired `if: Bash(git commit *)` key); `mcp__weaviate-kg__store_knowledge_node` → **kg-summary-generator.sh**; every tool → **kg-update-nudge.sh** (work-unit bookkeeping so the next-prompt nudge fires at the right threshold).
+- Routes: `Edit|Write` → **post-edit-outcome.sh** (edit-outcome telemetry for the RL retrieval pipeline) + **kg-summary-generator.sh** (background summary refresh of `knowledge/.node_formats.json` for knowledge-path edits — its own path validation is the gate; see [[KG-Summary Three-Tier Generation Pipeline]] for backend selection); `Bash` → **post-bash-context-record.sh** (bash-outcome telemetry) + **post-git-commit-kg-sync.sh** (commit-review agent, behind a `git commit` command-prefix gate reproducing the retired `if: Bash(git commit *)` key); `mcp__weaviate-kg__store_knowledge_node` → **kg-summary-generator.sh**; every tool → **kg-update-nudge.sh** (work-unit bookkeeping so the next-prompt nudge fires at the right threshold).
 - Per-sub-hook on/off survives the merge: a stem listed in `VCO_ASYNC_DISABLED_HOOKS` (`<project>/.claude/env`, comma-separated — the lean-ctx knob's own channel, written by the launcher Hooks tab's sub-hook checkboxes via `set_claude_env_value`) is skipped by both siblings, and a disable parked before the merge is carried into that key by the bundle update (a failed carry write defers as `async_subhook_disable_carry_failed` and keeps the parked bytes protected until it lands).
 - Pre-v0.2.101 these six scripts held eight individual async registrations; those are declared retired (event-scoped to PostToolUse, async-only) in `vco_lib/hook_retirements.py`, so an existing install loses them at the next bundle update while the nudge's SYNC UserPromptSubmit / SessionStart(compact) registrations survive.
 

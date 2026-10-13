@@ -713,32 +713,76 @@ def process_start_token(pid: int) -> Optional[str]:
     return None if started is None else f"wall:{started:.3f}"
 
 
+#: :func:`process_identity_verdict` outcomes. ``band`` and ``unknown`` both
+#: read as None through :func:`process_identity_matches`; a caller that must
+#: tell them apart (``vco_lib.update_lock.decide``, v0.2.102 W6-LOWS R3 C-3)
+#: asks for the verdict.
+IDENTITY_SAME = "same"
+IDENTITY_REUSED = "reused"
+IDENTITY_BAND = "band"
+IDENTITY_UNKNOWN = "unknown"
+
+
+def process_identity_verdict(pid: int, recorded: Optional[str]) -> str:
+    """Compare *pid*'s current :func:`process_start_token` with *recorded*.
+
+    ``IDENTITY_SAME`` — same instance; ``IDENTITY_REUSED`` — the pid now names
+    a DIFFERENT process; ``IDENTITY_BAND`` — both are ``wall:`` tokens and the
+    gap is over 1 s but under ``_WALL_REUSED_MIN_DELTA_S``: compared, and
+    could not be told apart; ``IDENTITY_UNKNOWN`` — no comparison was possible
+    (nothing recorded, the process cannot be inspected, the token kinds
+    differ, or a token is malformed).
+    """
+    if not recorded:
+        return IDENTITY_UNKNOWN
+    current = process_start_token(pid)
+    if current is None:
+        return IDENTITY_UNKNOWN
+    rec_kind, _, rec_val = recorded.partition(":")
+    cur_kind, _, cur_val = current.partition(":")
+    if rec_kind != cur_kind:
+        return IDENTITY_UNKNOWN
+    if rec_kind == "proc":
+        return IDENTITY_SAME if rec_val == cur_val else IDENTITY_REUSED
+    try:
+        delta = abs(float(rec_val) - float(cur_val))
+    except ValueError:
+        return IDENTITY_UNKNOWN
+    # Both readers take the same OS creation timestamp, but the Rust writer
+    # (vct-launcher-core process.rs) truncates it to whole seconds, so a live
+    # holder can differ by up to (strictly under) 1 s. A gap between that and
+    # _WALL_REUSED_MIN_DELTA_S is "cannot tell" — callers then treat the holder
+    # as still alive, the safe direction for a lock — so a future reader drift
+    # can never turn a LIVE holder into "pid reused".
+    if delta <= 1.0:
+        return IDENTITY_SAME
+    if delta < _WALL_REUSED_MIN_DELTA_S:
+        return IDENTITY_BAND
+    return IDENTITY_REUSED
+
+
 def process_identity_matches(pid: int, recorded: Optional[str]) -> Optional[bool]:
     """Is *pid* still the process whose :func:`process_start_token` was *recorded*?
 
     ``True``  — same instance; ``False`` — the pid now names a DIFFERENT
     process (it was reused); ``None`` — cannot tell (nothing recorded, the
-    process cannot be inspected, or the token kinds differ). Callers that
-    guard against a second concurrent run treat ``None`` as "still the same"
-    — the conservative direction, matching :func:`pid_is_alive`.
+    process cannot be inspected, the token kinds differ, or a wall-token gap
+    in the "cannot tell" band). Callers that guard against a second concurrent
+    run treat ``None`` as "still the same" — the conservative direction,
+    matching :func:`pid_is_alive`. The comparison itself is
+    :func:`process_identity_verdict`.
     """
-    if not recorded:
-        return None
-    current = process_start_token(pid)
-    if current is None:
-        return None
-    rec_kind, _, rec_val = recorded.partition(":")
-    cur_kind, _, cur_val = current.partition(":")
-    if rec_kind != cur_kind:
-        return None
-    if rec_kind == "proc":
-        return rec_val == cur_val
-    try:
-        # A stored creation timestamp is exact; the tolerance only absorbs
-        # float formatting between two readers.
-        return abs(float(rec_val) - float(cur_val)) <= 1.0
-    except ValueError:
-        return None
+    verdict = process_identity_verdict(pid, recorded)
+    if verdict == IDENTITY_SAME:
+        return True
+    if verdict == IDENTITY_REUSED:
+        return False
+    return None
+
+
+# A wall-clock start token differing by at least this much names a different
+# process (see process_identity_matches).
+_WALL_REUSED_MIN_DELTA_S = 3.0
 
 
 def kg_binding_evidence_still_mismatched(ctx: ProbeContext) -> Optional[bool]:
@@ -913,6 +957,28 @@ def kg_unclaimed_classes_still_present(ctx: ProbeContext) -> Optional[bool]:
     return bool(scan.unclaimed)
 
 
+def compose_override_pair_still_diverged(ctx: ProbeContext) -> Optional[bool]:
+    """``compose_override_pair_diverged`` — do the two override halves in the
+    install's ``infrastructure/`` still hold different configurations?
+
+    The SAME reading both emitters use — the doctor's probe and the
+    install-time rename pass (:func:`vco_lib.compose_override_pair.divergent_pairs`
+    over every directory the pass walks). True: a pair still diverges.
+    False: every pair is equal, single or absent — the state is over.
+    None: ``ctx.folder`` is not an install root (no ``vco_lib/``), so the pairs
+    it would read are not the ones the entry named.
+    """
+    from vco_lib import compose_override_pair as cop
+
+    folder = Path(ctx.folder)
+    if not (folder / "vco_lib" / "__init__.py").is_file():
+        return None
+    try:
+        return bool(cop.divergent_pairs(folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def service_endpoint_still_unreachable(ctx: ProbeContext) -> Optional[bool]:
     """``service_endpoint_unreachable`` — do the named rows still not answer?
 
@@ -1059,6 +1125,25 @@ def gateway_exec_still_unrunnable(ctx: ProbeContext) -> Optional[bool]:
     ):
         return False
     return None
+
+
+def playwright_browser_still_missing(ctx: ProbeContext) -> Optional[bool]:
+    """``playwright_browser_missing`` — is the pinned Playwright MCP's browser
+    revision still absent?
+
+    The SAME reading both emitters use
+    (:func:`vco_lib.playwright_mcp.browser_state`, via
+    :func:`vco_lib.playwright_mcp.browser_still_missing`). True: still absent.
+    False: installed — the state is over. None: the revision cannot be read
+    (pinned package not in the npx cache) or ``ctx.folder`` is not an install
+    root.
+    """
+    from vco_lib import playwright_mcp
+
+    try:
+        return playwright_mcp.browser_still_missing(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
 
 
 def former_launcher_cli_still_on_path(ctx: ProbeContext) -> Optional[bool]:
@@ -1232,6 +1317,7 @@ PROBES: dict[str, ProbeFn] = {
     "env_reprojection_still_owed": env_reprojection_still_owed,
     "kg_binding_evidence_still_mismatched": kg_binding_evidence_still_mismatched,
     "kg_unclaimed_classes_still_present": kg_unclaimed_classes_still_present,
+    "compose_override_pair_still_diverged": compose_override_pair_still_diverged,
     "parked_hook_conflict_still_present": parked_hook_conflict_still_present,
     "async_subhook_disable_carry_still_owed": async_subhook_disable_carry_still_owed,
     "project_hooks_relative_paths_still_present": project_hooks_relative_paths_still_present,
@@ -1239,6 +1325,7 @@ PROBES: dict[str, ProbeFn] = {
     "user_owned_secret_values_still_present": user_owned_secret_values_still_present,
     "code_embed_image_still_stale": code_embed_image_still_stale,
     "former_launcher_cli_still_on_path": former_launcher_cli_still_on_path,
+    "playwright_browser_still_missing": playwright_browser_still_missing,
     "service_endpoint_still_unreachable": service_endpoint_still_unreachable,
     "service_endpoint_still_ambiguous": service_endpoint_still_ambiguous,
     "adopted_service_config_drift_persists": adopted_service_config_drift_persists,

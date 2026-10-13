@@ -114,11 +114,11 @@ _UNTABLED_STEMS_SNAPSHOT = frozenset({
     "ACMEWidgetKnowledgeGraph", "ACMEWidgetOld", "ACMEWidgetry",
     "ACMEWidgetShell", "ACMEWidgetTeam", "Actual", "AgapeTest",
     "Alphabet", "AlphaBeta", "AmbientProject", "Anything", "ArcAgi",
-    "B", "Bazquux", "Big", "Bystander", "C", "Canon",
+    "B", "Bazquux", "Big", "Bystander", "Canon",
     "CanonicalShared", "ClaudeOrchestrator", "Client_b_portal", "ClientA",
     "ClientAlpha", "ClientApp", "CsRoute", "Cur", "Decoy", "Demo",
-    "Demo_project", "Drifted", "Dst", "E2EProject", "Empty", "EnvOnly",
-    "EnvProj", "EnvSaid", "Existing", "ExplicitOverride", "ExplicitProj",
+    "Demo_project", "Drifted", "Dst", "Empty", "EnvOnly",
+    "EnvSaid", "Existing",
     "Fallback", "Foo_Bar", "ForkBrand", "Fresh", "FreshCreate", "FromDb",
     "FromEnv", "G", "Ghost_Prefix", "GhostA", "GhostB", "Gone",
     "GuardPrefix", "Hub", "Hub_Shared", "HubSaid", "ImageDataset", "Kept",
@@ -406,12 +406,55 @@ def test_default_decision_is_the_sentinel():
     )
 
 
-def test_opt_out_decision_restores_the_ambient_value():
+def test_opt_out_decision_restores_the_ambient_value_only_when_opted_in(monkeypatch):
+    """v0.2.102 W6-B2 last round: the WRITE-capable stand-aside needs
+    VCO_TEST_LIVE_WEAVIATE=1. Red before: a listed file got the ambient value
+    unconditionally, so a plain run from a shell exporting WEAVIATE_URL
+    reached the live Weaviate."""
+    monkeypatch.setattr(_conftest, "_ALLOW_REAL_STATE", False)
+    monkeypatch.setattr(_conftest, "_LIVE_WEAVIATE_OPTED_IN", True)
     for name in sorted(_conftest._LIVE_WEAVIATE_OPT_OUT_FILES):
         assert (
             _conftest._weaviate_url_pin_for(name)
             == _conftest._AMBIENT_WEAVIATE_URL
-        ), f"{name} must see the ambient WEAVIATE_URL, not the pin"
+        ), f"{name} must see the ambient WEAVIATE_URL when opted in"
+    monkeypatch.setattr(_conftest, "_LIVE_WEAVIATE_OPTED_IN", False)
+    write_capable = sorted(
+        _conftest._LIVE_WEAVIATE_OPT_OUT_FILES
+        - _conftest._LIVE_WEAVIATE_READONLY_FILES
+    )
+    assert write_capable, "the read-only carve-out must not swallow the list"
+    for name in write_capable:
+        assert (
+            _conftest._weaviate_url_pin_for(name) == fcg.UNROUTABLE_SENTINEL_URL
+        ), f"{name} must be pinned without the explicit opt-in"
+
+
+def test_readonly_smoke_files_see_the_ambient_url_without_any_opt_in(monkeypatch):
+    """v0.2.102 W6-K (owner 2026-10-11: read-only live access is SAFE): the
+    read-only members are ambient UNCONDITIONALLY — a plain full-suite run
+    from a session exporting WEAVIATE_URL may query the live backend, and
+    that is the sanctioned behaviour again."""
+    monkeypatch.setattr(_conftest, "_ALLOW_REAL_STATE", False)
+    monkeypatch.setattr(_conftest, "_LIVE_WEAVIATE_OPTED_IN", False)
+    for name in sorted(_conftest._LIVE_WEAVIATE_READONLY_FILES):
+        assert (
+            _conftest._weaviate_url_pin_for(name)
+            == _conftest._AMBIENT_WEAVIATE_URL
+        ), f"read-only {name} must see the ambient WEAVIATE_URL with no opt-in"
+        assert name in _conftest._LIVE_WEAVIATE_OPT_OUT_FILES, (
+            f"{name} must stay in the collection-time carve-out list too")
+
+
+def test_the_leak_guard_names_a_changed_or_removed_url(monkeypatch):
+    """The per-test guard: anything but the pin after a test is a loud leak."""
+    sentinel = fcg.UNROUTABLE_SENTINEL_URL
+    assert _conftest._weaviate_url_leak("test_x.py", sentinel) is None
+    monkeypatch.setenv("WEAVIATE_URL", "http://localhost:8081")
+    msg = _conftest._weaviate_url_leak("test_x.py", sentinel)
+    assert msg and "test_x.py" in msg and "localhost:8081" in msg
+    monkeypatch.delenv("WEAVIATE_URL")
+    assert "None" in _conftest._weaviate_url_leak("test_x.py", sentinel)
 
 
 def test_the_preship_live_gate_file_is_in_the_opt_out_list():
@@ -613,28 +656,6 @@ def test_sync_lets_a_real_target_through(monkeypatch, sync_mod):
     sync_mod._refuse_fixture_shaped_targets()  # must not raise or exit
 
 
-def _diagram_row():
-    from vco_lib.diagram_indexer import DiagramRow
-
-    return DiagramRow(
-        project_id="p1",
-        diagram_name="x",
-        diagram_type="mermaid",
-        file_path="docs/diagrams/x.mmd",
-        category_path="docs/diagrams",
-        enabled=1,
-        inferred_title="X",
-        diagram_kind="graph",
-        content_text="graph TD;",
-        node_count=1,
-        edge_count=0,
-        chat_id=None,
-        linked_session_summary=None,
-        config_json=None,
-        created_at=0,
-        updated_at=0,
-    )
-
 
 @pytest.fixture(scope="module")
 def analyzer_mod() -> types.ModuleType:
@@ -766,65 +787,6 @@ def test_project_init_creates_a_real_projects_class(monkeypatch):
 # here would be the duplication this repo's own rule forbids.
 
 
-def test_diagram_upsert_refuses_a_fixture_collection(monkeypatch, caplog):
-    """The diagram indexer's ONE write seam.
-
-    Live evidence for this seam specifically: an empty `Foo_Diagrams` class on
-    the maintainer's Weaviate — the incident's shape caught one step earlier,
-    at creation, with nothing written yet.
-    """
-    from vco_lib import diagram_indexer
-
-    monkeypatch.delenv(fcg.ALLOW_FIXTURE_WRITES_ENV, raising=False)
-
-    def _explode(**kwargs):  # pragma: no cover - must never be reached
-        raise AssertionError("the indexer connected to a fixture-named class")
-
-    import weaviate  # type: ignore
-
-    monkeypatch.setattr(weaviate, "connect_to_custom", _explode)
-
-    with caplog.at_level("ERROR"):
-        wrote = diagram_indexer._weaviate_upsert(
-            _diagram_row(),
-            weaviate_url="http://localhost:8081",
-            collection_name="Foo_Diagrams",
-        )
-    assert wrote is False
-    # Refused, not silently skipped: the log names the class and the escape.
-    assert any(
-        "Foo_Diagrams" in r.message and fcg.ALLOW_FIXTURE_WRITES_ENV in r.message
-        for r in caplog.records
-    ), [r.message for r in caplog.records]
-
-
-def test_diagram_upsert_reaches_the_client_for_a_real_collection(monkeypatch):
-    """The leave-alone half: a real project's diagrams still index."""
-    from vco_lib import diagram_indexer
-
-    monkeypatch.delenv(fcg.ALLOW_FIXTURE_WRITES_ENV, raising=False)
-    reached: list[str] = []
-
-    def _connect(**kwargs):
-        reached.append("connected")
-        raise RuntimeError("stop here — past the guard is all we assert")
-
-    import weaviate  # type: ignore
-
-    monkeypatch.setattr(weaviate, "connect_to_custom", _connect)
-
-    with pytest.raises(RuntimeError):
-        diagram_indexer._weaviate_upsert(
-            _diagram_row(),
-            weaviate_url="http://localhost:8081",
-            collection_name="VCODev_Diagrams",
-        )
-    assert reached == ["connected"]
-
-
-# ---------------------------------------------------------------------------
-# 6. The doctor: a fixture-shaped ghost reads DIFFERENTLY from a leftover
-# ---------------------------------------------------------------------------
 
 
 def _unclaimed(*pairs):
@@ -959,3 +921,30 @@ def test_deferral_entry_unchanged_for_a_non_fixture_ghost():
     entry = doctor._kg_unclaimed_entry(finding)
     assert "FIXTURE-SHAPED" not in entry.why_deferred
     assert entry.why_deferred.startswith("This is a diagnosis, not a defect report")
+
+
+def test_the_guard_fails_a_leaking_test_loudly(tmp_path):
+    """WIRING (v0.2.102 W6-B2 last round): a real child pytest loading this
+    suite's conftest; a test that REMOVES WEAVIATE_URL errors by name, and a
+    clean one passes. Red before: no guard — the removal went unnoticed."""
+    import subprocess
+
+    from tests.common.child_env import child_env
+
+    (tmp_path / "test_leaky_probe.py").write_text(
+        "import os\n"
+        "def test_leaks():\n    os.environ.pop('WEAVIATE_URL', None)\n"
+        "def test_clean(monkeypatch):\n    monkeypatch.setenv('WEAVIATE_URL', 'http://x:1')\n",
+        encoding="utf-8",
+    )
+    env = child_env()
+    env.pop("VCO_TEST_ALLOW_REAL_STATE", None)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "-p", "tests.conftest", str(tmp_path / "test_leaky_probe.py")],
+        cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=300,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out[-2000:]
+    assert "WeaviateUrlLeak" in out and "test_leaky_probe.py left WEAVIATE_URL=None" in out
+    assert "2 passed, 1 error" in out, out[-800:]  # the leaking test passes its call, errors at teardown

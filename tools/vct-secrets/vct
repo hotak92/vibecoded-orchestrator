@@ -248,9 +248,98 @@ _hub_stale_env_fallback_token() {
 #   3  confirmed PAUSED (v0.2.101) — a 404 whose body code is `key_paused`:
 #      the key EXISTS on PROJECT but its active flag is off. NOT an
 #      absence — `vct set` would shadow a deliberate pause (see die_miss).
-#   1  soft-fail — no curl / no hub / no token / any OTHER non-200. Treat
-#      as "hub couldn't answer"; caller falls back to the file-store hint.
-# Bounded (--max-time 3), localhost-only, token off argv (`--header @-`).
+#   4  hub reachable but it could not check the keychain RIGHT NOW
+#      (v0.2.102: a 503 whose body code is `keychain_unavailable` — a keychain
+#      op timed out; W6-AB: or the hub accepted the connection and did not
+#      answer in time, or answered any other 5xx). The KEY STATE IS UNKNOWN;
+#      retry shortly. NOT an absence — `vct set` could fork a divergent copy
+#      (see die_miss).
+#   1  soft-fail — no curl / no hub (connection refused) / no token / any
+#      OTHER non-200. Treat as "hub couldn't answer"; caller falls back to
+#      the file-store hint.
+# Bounded (connect 2 s, read _VCT_HUB_PROBE_READ_TIMEOUT_S), localhost-only,
+# token off argv (`--header @-`).
+#
+# v0.2.102 (W6-AB): the read cap was 3 s. The hub answers this probe from the
+# OS keychain, whose own per-op wait is 10 s, so a busy-but-working hub was
+# cut off and the miss printed `vct set` — the false remedy for a key that is
+# in the keychain. MUST MATCH `vco_lib/project_config.py::SECRET_READ_TIMEOUT_SECONDS`
+# and `_SECRET_READ_TIMEOUT_S` in templates/scripts/vct_secrets_resolve.sh
+# (pinned by tests/test_secret_read_timeout_parity.py). A refused connection
+# (no hub) still fails at once: only the connect phase can refuse.
+_VCT_HUB_PROBE_READ_TIMEOUT_S=30
+_VCT_HUB_PROBE_CONNECT_TIMEOUT_S=2
+
+# Wait before the ONE probe retry after a 503 keychain_unavailable: the hub's
+# own Retry-After when the header is numeric, clamped to [0, cap]; the hub
+# default below when it is absent or unparseable. MUST MATCH
+# `agent_secrets.HUB_RETRY_AFTER_CAP_SECONDS` /
+# `_HUB_RETRY_AFTER_DEFAULT_SECONDS` (via `_retry_wait_seconds`),
+# `_HUB_RETRY_AFTER_CAP_S` / `_HUB_RETRY_WAIT_S` in
+# templates/scripts/vct_secrets_resolve.sh and `$script:HubRetryAfterCapMs` /
+# `$script:HubRetryWaitMs` in vct_secrets_resolve.ps1 -- pinned for every
+# language by tests/test_secret_read_timeout_parity.py.
+_VCT_HUB_RETRY_WAIT_S=2
+_VCT_HUB_RETRY_AFTER_CAP_S=5
+
+# Response headers of the MOST RECENT probe request, captured so the retry
+# above can honour Retry-After (`--dump-header` works on every curl we ship
+# against; the newer `%header{}` / `%{retry_after}` write-out variables are
+# rejected by older curls and would FAIL the whole call). One private file
+# per vct process, removed on exit; when it cannot be created the header is
+# simply unread (fallback wait).
+_VCT_HUB_HEADER_FILE=""
+if _VCT_HUB_HEADER_FILE=$(mktemp "${TMPDIR:-/tmp}/vct_probe_headers.XXXXXX" 2>/dev/null); then
+    trap '_VCT_HUB_HEADER_FILE="${_VCT_HUB_HEADER_FILE:-}"; [ -n "$_VCT_HUB_HEADER_FILE" ] && rm -f "$_VCT_HUB_HEADER_FILE"' EXIT
+else
+    _VCT_HUB_HEADER_FILE=""
+fi
+
+# The wait before the one probe retry, from the LAST response's Retry-After
+# header: numeric -> clamped to [0, _VCT_HUB_RETRY_AFTER_CAP_S]; absent or
+# not a plain number -> _VCT_HUB_RETRY_WAIT_S. MUST MATCH
+# `agent_secrets._retry_wait_seconds`, `_hub_retry_wait_seconds` in the .sh
+# resolver and `Get-HubRetryWaitMs` in the .ps1.
+_vct_hub_retry_wait_s() {
+    local raw=""
+    if [ -n "${_VCT_HUB_HEADER_FILE:-}" ] && [ -r "${_VCT_HUB_HEADER_FILE:-}" ]; then
+        raw=$(sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*//p' "$_VCT_HUB_HEADER_FILE" \
+              2>/dev/null | tr -d '\r' | tail -n 1)
+    fi
+    if printf '%s' "$raw" | grep -Eq '^-?[0-9]+([.][0-9]+)?$'; then
+        awk -v v="$raw" -v cap="$_VCT_HUB_RETRY_AFTER_CAP_S" \
+            'BEGIN { if (v < 0) v = 0; if (v > cap) v = cap; printf "%.3f", v }'
+    else
+        printf '%s' "$_VCT_HUB_RETRY_WAIT_S"
+    fi
+}
+
+# One probe request: echoes the curl output (body + "\n<status>"); returns 0,
+# 4 when the hub was reached but did not answer in time (curl 28 timeout, 52
+# empty reply, 55/56 send/recv failure after connect), 1 on any other failure
+# (refused, no curl).
+_hub_probe_curl() {
+    local url="$1" token="$2" out crc=0
+    local probe_args=(--silent --show-error \
+                      --connect-timeout "$_VCT_HUB_PROBE_CONNECT_TIMEOUT_S" \
+                      --max-time "$_VCT_HUB_PROBE_READ_TIMEOUT_S")
+    if [ -n "${_VCT_HUB_HEADER_FILE:-}" ]; then
+        # Truncate first so a FAILED request never leaves the PREVIOUS
+        # answer's Retry-After behind (the file outlives each curl).
+        : >"$_VCT_HUB_HEADER_FILE" 2>/dev/null || true
+        probe_args+=(--dump-header "$_VCT_HUB_HEADER_FILE")
+    fi
+    out=$(curl "${probe_args[@]}" \
+                --header @- --output - --write-out '\n%{http_code}' "$url" \
+                <<<"Authorization: Bearer ${token}" 2>/dev/null) || crc=$?
+    if [ "$crc" -ne 0 ]; then
+        case "$crc" in
+            28|52|55|56) return 4 ;;
+            *) return 1 ;;
+        esac
+    fi
+    printf '%s' "$out"
+}
 hub_has_key() {
     local project="$1" key="$2"
     command -v curl >/dev/null 2>&1 || return 1
@@ -261,10 +350,35 @@ hub_has_key() {
     token=$(_hub_token "$project")
     [ -n "$token" ] || return 1
     local url="http://127.0.0.1:${port}/api/v1/projects/${project}/env?key=${key}"
-    local body status
-    body=$(curl --silent --show-error --max-time 3 \
-                --header @- --output - --write-out '\n%{http_code}' "$url" \
-                <<<"Authorization: Bearer ${token}" 2>/dev/null) || return 1
+    # v0.2.102 fix round: code 4 (the hub is RUNNING but could not answer --
+    # timeout, 5xx, or a temporarily unavailable keychain) gets ONE retry,
+    # after the hub's Retry-After when it sent one. MUST MATCH
+    # `read_key_hub` in templates/scripts/vct_secrets_resolve.sh and
+    # `Read-KeyHub` in the .ps1: the retry is usually answered at once
+    # because the slow keychain op's result lands in the hub's cache.
+    local rc=0
+    _hub_has_key_once "$url" "$token" && return 0
+    rc=$?
+    [ "$rc" -eq 4 ] || return "$rc"
+    sleep "${_VCT_HUB_RETRY_WAIT:-0}"
+    _hub_has_key_once "$url" "$token" && return 0
+    rc=$?
+    # A retry that could not even connect (the hub went away between
+    # attempts) does not erase what the first attempt proved: the key state
+    # is still UNKNOWN, never a confirmed absence.
+    [ "$rc" -eq 1 ] && rc=4
+    return "$rc"
+}
+
+# One probe attempt. Sets _VCT_HUB_RETRY_WAIT (0 for an immediate retry --
+# timeout / other 5xx; the Retry-After-derived wait for a 503
+# keychain_unavailable, mirroring the .sh resolver's `_HUB_RETRY_WAIT`).
+_hub_has_key_once() {
+    local url="$1" token="$2"
+    _VCT_HUB_RETRY_WAIT=0
+    local body status prc=0
+    body=$(_hub_probe_curl "$url" "$token") || prc=$?
+    [ "$prc" -eq 0 ] || return "$prc"
     status="${body##*$'\n'}"
     body="${body%$'\n'*}"
     # v0.2.91 (WP-D item 4): before classifying a refusal, give the ONE
@@ -276,9 +390,7 @@ hub_has_key() {
         403|401)
             local fallback retry retry_status
             if fallback=$(_hub_stale_env_fallback_token "$project"); then
-                if retry=$(curl --silent --show-error --max-time 3 \
-                                --header @- --output - --write-out '\n%{http_code}' "$url" \
-                                <<<"Authorization: Bearer ${fallback}" 2>/dev/null); then
+                if retry=$(_hub_probe_curl "$url" "$fallback"); then
                     retry_status="${retry##*$'\n'}"
                     # ADOPT only an answer that PROVES the fallback
                     # credential was accepted: 2xx, or 404 (the hub answers
@@ -320,6 +432,18 @@ hub_has_key() {
             *'"code":"key_paused"'*) return 3 ;;
         esac
     fi
+    if [ "$status" = "503" ]; then
+        case "$body" in
+            *'"code":"keychain_unavailable"'*)
+                _VCT_HUB_RETRY_WAIT=$(_vct_hub_retry_wait_s)
+                return 4 ;;
+        esac
+    fi
+    # v0.2.102 (W6-AB): any other 5xx — the hub is running but could not
+    # answer; the key state is UNKNOWN, never "absent".
+    case "$status" in
+        5??) return 4 ;;
+    esac
     [ "$status" = "200" ] || return 1
     # A 200 with an empty/absent value for the key is NOT a hit.
     case "$body" in
@@ -388,6 +512,13 @@ Do NOT 'vct set' it blindly — that risks a second, divergent copy on disk."
 but it is PAUSED for that requester. Resume it in the launcher's Secrets panel (Preferences → Secrets) — \
 Do NOT 'vct set' it: a file-store copy would shadow the deliberate pause and serve every resolver tier 2."
     fi
+    if [ "$probe" -eq 4 ]; then
+        die_code "$code" "$verb: not in the file store, and the hub could not check the launcher keychain right now \
+(secret store busy: its OS keychain is temporarily unavailable or the hub did not answer in time). The keychain MAY hold \
+project=$project key=$key — retry in a few seconds, or resolve it via \
+'.claude/scripts/vct_secrets_resolve.sh <project_folder> $key' (or vco_lib.agent_secrets.get('$key')). \
+Do NOT 'vct set' it blindly — that risks a second, divergent copy on disk."
+    fi
     die_code "$code" "$verb: secret not found — project=$project key=$key. Fix: vct set --project $project --key $key"
 }
 
@@ -426,7 +557,10 @@ Do NOT 'vct set' it: a file-store copy would shadow the deliberate pause and ser
 # re-enables the exact hazard. A false positive has a real remedy that keeps
 # the guard intact — pick a name that is not credential-shaped (names are
 # arbitrary; prefix it) — and the error message says so.
-_VCT_CREDENTIAL_NAME_SHAPES="$_CREDSHAPES_ARGV_NAME_RE"
+# The name carries no CRED / KEY / TOKEN / SECRET / PASS stem: bash_security's
+# echo rules block echoing any `$NAME` that does (v0.2.102 W6-LOWS, R3 V-c;
+# pinned by tests/test_credential_shapes_parity.py `_SHELL_NAME_FILES`).
+_VCT_CSHAPES_ARGV_NAME_RE="$_CSHAPES_ARGV_NAME_RE"
 
 # The placeholder that stands in for a credential-shaped name in any message,
 # audit row or report. Never interpolate the name itself alongside it.
@@ -436,7 +570,7 @@ _VCT_REDACTED_NAME='<redacted:credential-shaped-name>'
 # credential, 1 otherwise. NEVER prints the input (not even truncated).
 # Pure predicate: no side effects, no logging, safe to call anywhere.
 is_credential_shaped_name() {
-    printf '%s' "${1:-}" | LC_ALL=C grep -qE "$_VCT_CREDENTIAL_NAME_SHAPES"
+    printf '%s' "${1:-}" | LC_ALL=C grep -qE "$_VCT_CSHAPES_ARGV_NAME_RE"
 }
 
 # redact_name NAME → echo NAME, or the fixed placeholder when NAME is

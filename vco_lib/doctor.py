@@ -238,6 +238,15 @@ CID_INSTALL_MARKER_UNBACKED = "install_manifest_attests_uninstalled_source"
 #: the copy it installed itself.
 CID_FORMER_LAUNCHER_CLI = "former_launcher_cli_on_path"
 
+#: v0.2.102 W5-A (P299-B2): the install's two override auto-load names hold
+#: different configurations. Probe + entry live in :mod:`vco_lib.doctor_infra`.
+CID_COMPOSE_OVERRIDE_PAIR_DIVERGED = "compose_override_pair_diverged"
+
+#: v0.2.102 W6-Z4: the pinned Playwright MCP's browser revision is not on
+#: disk. Probe, entry and the cid itself live in :mod:`vco_lib.playwright_mcp`
+#: (stdlib-only at import time, so importing it here costs nothing).
+from vco_lib.playwright_mcp import CID_BROWSER_MISSING as CID_PLAYWRIGHT_BROWSER_MISSING  # noqa: E402
+
 #: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
 #: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
 #: doctor but emitted by its owner — re-emitting it here would fork its
@@ -247,6 +256,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
     CID_KG_BINDING_EVIDENCE_MISMATCH, CID_KG_UNCLAIMED,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
     CID_INSTALL_MARKER_UNBACKED, CID_FORMER_LAUNCHER_CLI,
+    CID_COMPOSE_OVERRIDE_PAIR_DIVERGED, CID_PLAYWRIGHT_BROWSER_MISSING,
 )
 
 #: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
@@ -257,6 +267,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
 DOCTOR_SELF_RESOLVING_CIDS: tuple[str, ...] = (
     CID_DISK_SPACE_LOW, CID_KG_BINDING_EVIDENCE_MISMATCH,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
+    CID_COMPOSE_OVERRIDE_PAIR_DIVERGED, CID_PLAYWRIGHT_BROWSER_MISSING,
 )
 
 #: Env override for the free-space floor, in GiB (float). Default
@@ -440,6 +451,34 @@ class DoctorResolvers:
     #: ``last_kg_sync_at`` app_state rows). Injected so the last-KG-sync probe
     #: is driven from described rows, no launcher.db.
     kg_sync_rows: Optional[Callable[[], dict]] = None
+    #: () -> :class:`vco_lib.infra_declarations.Declarations` (v0.2.102 M3).
+    #: Injected so the declaration-honouring probes are driven from described
+    #: declarations, no launcher.db.
+    infra_declarations: Optional[Callable[[], Any]] = None
+    #: () -> :class:`vco_lib.playwright_mcp.BrowserState` (v0.2.102 W6-Z4).
+    #: Injected so the browser probe is driven from a described cache, no
+    #: npx cache and no browser registry on disk.
+    playwright_browser_state: Optional[Callable[[], Any]] = None
+
+    def resolve_playwright_browser_state(self):
+        """Is the pinned Playwright MCP's browser installed? —
+        :func:`vco_lib.playwright_mcp.browser_state`, the ONE reader (shared
+        with the install-time pre-cache and the registry clear probe)."""
+        if self.playwright_browser_state is not None:
+            return self.playwright_browser_state()
+        from vco_lib import playwright_mcp  # noqa: PLC0415
+
+        return playwright_mcp.browser_state()
+
+    def resolve_infra_declarations(self):
+        """What projects declared their own — :mod:`vco_lib.infra_declarations`,
+        the ONE reader. Never raises (the reader soft-fails to
+        ``resolvable=False``)."""
+        if self.infra_declarations is not None:
+            return self.infra_declarations()
+        from vco_lib import infra_declarations  # noqa: PLC0415
+
+        return infra_declarations.load()
 
     def resolve_kg_sync_rows(self) -> dict:
         """The ``app_state`` rows behind the last-certified-KG-sync report.
@@ -779,9 +818,7 @@ def probe_mcp_commands_spawnable(folder: Path, res: DoctorResolvers, ctx: dict) 
 
     * ``npx_resolvable`` — the ladder's verdict on npx itself, reported even
       when no entry needs it (it is the prerequisite VCO's own bundled
-      playwright entry assumes — and the legacy diagram wrappers on
-      pre-v0.2.101 installs that still have them, whose proxy spawns npx
-      as a child; fresh installs register no wrapper).
+      playwright entry assumes).
     * ``mcp_commands_spawnable`` — the per-entry verdict.
 
     The problem finding is ``defer``: installing Node.js is not something VCO
@@ -1383,8 +1420,8 @@ def probe_npm_pins(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Findin
         ]
     # DRIFT (installed at the wrong version) is a problem. MISSING is not:
     # a bundled npm package can be legitimately absent from the global store
-    # (an opt-out env var at install time, a `file:` pin installed elsewhere,
-    # a default-disabled diagram MCP the user never enabled). Reporting those
+    # (an opt-out env var at install time, a `file:` pin installed
+    # elsewhere). Reporting those
     # as problems would make the doctor cry wolf on a healthy machine — and a
     # report that cries wolf is one nobody reads, which is the failure this
     # whole work package exists to end.
@@ -1435,15 +1472,11 @@ def disk_min_free_bytes() -> tuple[int, float, bool]:
     default rather than disabling the probe: a fat-fingered value must not
     silently turn the check off (the same policy as ``VCO_CG_INJECT_CAP``).
     """
-    raw = os.environ.get(DISK_MIN_FREE_ENV, "").strip()
-    if raw:
-        try:
-            gib = float(raw)
-        except ValueError:
-            gib = DISK_MIN_FREE_GB_DEFAULT
-        else:
-            if gib > 0:
-                return int(gib * _GIB), gib, True
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    gib = env_float(DISK_MIN_FREE_ENV, None, above=0)
+    if gib is not None:
+        return int(gib * _GIB), gib, True
     return int(DISK_MIN_FREE_GB_DEFAULT * _GIB), DISK_MIN_FREE_GB_DEFAULT, False
 
 
@@ -1911,6 +1944,20 @@ def probe_code_embed_image(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
             )
         ]
     if getattr(state, "verdict", None) == code_embed_image.STALE:
+        # v0.2.102 W5-A (M3): a code-embed container a project declared
+        # unmanaged is not VCO's to rebuild — report the fact, print no
+        # rebuild, emit no entry.
+        declared = _declared_unmanaged_reason(res, "code_embed")
+        if declared is not None:
+            return [
+                Finding(
+                    probe="code_embed_image",
+                    status=STATUS_OK,
+                    summary=(f"{state.summary} The container is {declared}, so VCO "
+                             "prints no rebuild for it and leaves it alone."),
+                    detail=dict(detail, declared_unmanaged=declared),
+                )
+            ]
         return [
             Finding(
                 probe="code_embed_image",
@@ -1940,6 +1987,22 @@ def probe_code_embed_image(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
             detail=detail,
         )
     ]
+
+
+def _declared_unmanaged_reason(res: DoctorResolvers, service: str) -> Optional[str]:
+    """Why VCO's container for ``service`` is not VCO's to touch — a project
+    declared it unmanaged — else ``None``. Soft-fail: an unreadable list is
+    ``None`` here (this only phrases a report; it never gates an action)."""
+    try:
+        from vco_lib import containers as _containers  # noqa: PLC0415
+        from vco_lib import infra_declarations as _infra  # noqa: PLC0415
+
+        decl = res.resolve_infra_declarations()
+        if decl is None:
+            return None
+        return decl.why(_infra.KIND_UNMANAGED_CONTAINER, _containers.canonical_name(service))
+    except Exception:  # noqa: BLE001 — phrasing must never cost the finding
+        return None
 
 
 def probe_model_gateway_runnable(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
@@ -2113,7 +2176,14 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
     scan = res.resolve_kg_binding_evidence()
     if scan is None:
         return []
-    from vco_lib.kg_binding_doctor import jsonable_verdicts, render_three_values
+    from vco_lib.kg_binding_doctor import external_note, jsonable_verdicts, render_three_values
+
+    # v0.2.102 W5-A (M3): declared-external classes left the scan before any
+    # leg looked at them; every finding below says which, and who declared it.
+    skipped = external_note(scan)
+    external_detail = [
+        {"class": e.name, "why": e.why} for e in (getattr(scan, "external", ()) or ())
+    ]
 
     mismatches = list(scan.mismatches)
     unclaimed = list(scan.unclaimed)
@@ -2135,9 +2205,9 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
             summary=(
                 f"{checked} registered project(s) with a primary KG "
                 "binding: every one matches where its data demonstrably "
-                "lives"
+                "lives" + skipped
             ),
-            detail={"unclaimed": [u.name for u in unclaimed]},
+            detail={"unclaimed": [u.name for u in unclaimed], "external": external_detail},
         )
         extra_fixture = list(getattr(scan, "fixture_shaped", ()) or ())
         if not unclaimed and not extra_fixture:
@@ -2153,7 +2223,7 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
             Finding(
                 probe="kg_binding_evidence",
                 status=STATUS_PROBLEM,
-                summary=_kg_unclaimed_summary(unclaimed, extra_fixture),
+                summary=_kg_unclaimed_summary(unclaimed, extra_fixture) + skipped,
                 fix=FIX_DEFER,
                 condition_id=CID_KG_UNCLAIMED,
                 command=_kg_unclaimed_remediation(unclaimed, extra_fixture),
@@ -2162,6 +2232,7 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
                         {"class": u.name, "count": u.count} for u in unclaimed
                     ],
                     "fixture_shaped": extra_fixture,
+                    "external": external_detail,
                     "verdicts": jsonable_verdicts(scan),
                 },
             ),
@@ -2179,7 +2250,7 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
             status=STATUS_PROBLEM,
             summary=(
                 f"{len(mismatches)} project(s) whose KG data lives in a class "
-                f"the primary binding does not name — {lines}"
+                f"the primary binding does not name — {lines}" + skipped
             ),
             fix=FIX_DEFER,
             condition_id=CID_KG_BINDING_EVIDENCE_MISMATCH,
@@ -2194,6 +2265,7 @@ def probe_kg_binding_evidence(folder: Path, res: DoctorResolvers, ctx: dict) -> 
                 # contract) — the dedicated finding + entry come on the
                 # first pass clean of mismatches.
                 "unclaimed": [u.name for u in scan.unclaimed],
+                "external": external_detail,
             },
         )
     ]
@@ -2319,6 +2391,10 @@ def _kg_unclaimed_remediation(unclaimed, extra_fixture=()) -> str:
         "#   collection (the picker does not move existing objects).\n"
         "# To move objects between collections:\n"
         "#   python -m vco_lib.project_init migrate-collections --help\n"
+        "# If the class is a project's OWN data (its runtime, not VCO's KG):\n"
+        "#   declare it external — launcher -> that project's page -> Identity\n"
+        "#   tab -> Infrastructure this project owns -> External collections.\n"
+        "#   Every VCO reading skips a declared class from then on.\n"
         "# If the leftover is expected: dismiss this entry — the dismissal\n"
         "#   records that choice.\n"
         "# Then confirm: vco doctor\n"
@@ -2377,8 +2453,9 @@ def _kg_unclaimed_entry(finding: Finding):
             "and no registered project's folder anchors their sampled "
             "paths — data with no reader, typically a removed project's "
             "leftover. Choosing what unclaimed data is (re-add the project, "
-            "re-bind it to a current project, migrate the objects, or "
-            "accept the leftover) is the user's call, and VCO never "
+            "re-bind it to a current project, migrate the objects, declare "
+            "it a project's own external collection on that project's "
+            "Identity tab, or accept the leftover) is the user's call, and VCO never "
             "proposes deleting it — a populated collection is hours of "
             "work and the printed remedy intentionally offers no drop "
             "command. The entry clears itself via the registered clear "
@@ -2420,6 +2497,177 @@ def _kg_binding_evidence_remediation(mismatches) -> str:
         "# Then confirm: vco doctor\n"
         "# This entry CLEARS ITSELF when the comparison agrees again."
     )
+
+
+def probe_kg_drift_census(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Per registered project: do the on-disk ``knowledge/`` nodes match Weaviate?
+
+    v0.2.102 W4-C L2 (B3 report :164-172): ``vco_lib.kg_sync_drift.scan_drift``
+    existed (the ``--check-drift`` CLI leg and the bundle-update gate) but the
+    doctor — the authoritative end-of-update report — never ran it, so stored-
+    vs-disk drift was invisible exactly where a user looks for "what is wrong
+    with my install". This census is the read-only doctor leg: for every
+    registered project (the SAME enumeration ``scan_kg_binding_evidence`` uses
+    — ``vco_lib.project_identity.resolve_snapshot``, one read-only launcher.db
+    open through ``launcher_db_reader``) with a binding-sourced primary KG
+    collection, run ``scan_drift`` and report the counts (disk-only,
+    stored-only, changed) with the per-project remedy command.
+
+    REPORTED-not-owned (the ``summary_pending`` shape): the per-project
+    ``kg_sync_drift_detected`` ledger entry belongs to
+    :func:`vco_lib.kg_sync_drift.surface_drift`, whose lifecycle the doctor
+    must not fork — the finding carries the cid for identification only.
+
+    Soft-fail per project by construction: ``scan_drift`` answers ``unknown``
+    (never "drift") when Weaviate is unreachable or the hash query fails —
+    each unknown project becomes ONE warning line in an ``unknown`` finding,
+    and a per-project exception is caught the same way. A census that cannot
+    enumerate (launcher.db unreadable → ``resolvable=False``) or finds no
+    binding-sourced projects emits NOTHING — not "all agreed": the
+    ``kg_binding_evidence`` probe owns the unbound/mismatch questions.
+
+    ``full`` scope only: one class listing per project collection (network
+    reads) and the scan's own reachability probe — the same cost/promises
+    reasoning as ``kg_binding_evidence`` above.
+    """
+    import logging  # noqa: PLC0415
+
+    from vco_lib import kg_sync_drift  # noqa: PLC0415
+    from vco_lib.knowledge_residue import project_env_value  # noqa: PLC0415
+    from vco_lib.project_identity import SOURCE_BINDING, resolve_snapshot  # noqa: PLC0415
+    from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: PLC0415
+
+    try:
+        snapshot = resolve_snapshot()
+    except Exception:  # noqa: BLE001 — could not enumerate is not a verdict
+        return []
+    if not getattr(snapshot, "resolvable", False):
+        return []
+    rows = [
+        ident for ident in snapshot.projects
+        if getattr(ident, "kg_primary_source", "") == SOURCE_BINDING
+        and (getattr(ident, "kg_primary", "") or "").strip()
+        and (getattr(ident, "folder_path", "") or "").strip()
+    ]
+    if not rows:
+        return []
+
+    weaviate_url = weaviate_url_default()
+    drifted: list = []
+    unknowns: list = []
+    verified = 0
+    for ident in rows:
+        project_root = Path(ident.folder_path)  # type: ignore[arg-type]
+        collection = (ident.kg_primary or "").strip()  # type: ignore[union-attr]
+        try:
+            shared = (project_env_value(project_root, "SHARED_KG_COLLECTION") or "").strip()
+        except Exception:  # noqa: BLE001 — local file read, best-effort
+            shared = ""
+        try:
+            report = kg_sync_drift.scan_drift(
+                project_root / "knowledge",
+                weaviate_url=weaviate_url,
+                kg_collection=collection,
+                shared_kg_collection=shared,
+            )
+        except Exception as exc:  # noqa: BLE001 — one project must not kill the census
+            reason = f"scan failed: {type(exc).__name__}: {exc}"
+            logging.getLogger(__name__).warning(
+                "kg_drift_census: project '%s' could not be scanned (%s)",
+                ident.name, reason,
+            )
+            unknowns.append((ident.name, reason))
+            continue
+        if report.status == "drift" or report.stored_only:
+            # ``status`` stays "ok" for a stored-only shape (the bundle-update
+            # gate must not spawn an uncurable re-sync — see scan_drift), so
+            # the census judges on the dimension itself.
+            drifted.append((ident, report))
+        elif report.status == "unknown":
+            reason = report.detail or "drift could not be determined"
+            logging.getLogger(__name__).warning(
+                "kg_drift_census: project '%s' unknown (%s)", ident.name, reason,
+            )
+            unknowns.append((ident.name, reason))
+        else:
+            verified += 1
+
+    if drifted:
+        disk_only = sum(len(r.missing) for _i, r in drifted)
+        stored_only = sum(len(getattr(r, "stored_only", ()) or ()) for _i, r in drifted)
+        changed = sum(len(r.stale) for _i, r in drifted)
+        names = ", ".join(sorted(i.name for i, _r in drifted))
+        remedy_lines = [
+            "# Re-run the sync for each affected project (content-hash gated —\n"
+            "# unaffected nodes are skipped, nothing is deleted). Stored-only\n"
+            "# rows (their file is gone) are NOT removed by a re-sync: inspect\n"
+            "# them before removing anything.",
+        ]
+        for ident, report in drifted:
+            remedy_lines.append(
+                f"cd {ident.folder_path} && .claude/scripts/kg-sync --all"
+                f"   # {len(report.missing)} disk-only, "
+                f"{len(getattr(report, 'stored_only', ()) or ())} stored-only, "
+                f"{len(report.stale)} changed"
+            )
+        return [
+            Finding(
+                probe="kg_drift_census",
+                status=STATUS_PROBLEM,
+                summary=(
+                    f"{len(drifted)} registered project(s) with KG drift "
+                    f"({disk_only} disk-only, {stored_only} stored-only, "
+                    f"{changed} changed): {names}"
+                ),
+                fix=FIX_DEFER,
+                # Reported-not-owned: the per-project ledger entry is
+                # surface_drift's to emit and clear (see the docstring).
+                condition_id=kg_sync_drift.CID_DRIFT,
+                command="\n".join(remedy_lines),
+                detail={
+                    "projects": [
+                        {
+                            "project": ident.name,
+                            "folder": ident.folder_path,
+                            "collection": (ident.kg_primary or "").strip(),
+                            "disk_only": len(report.missing),
+                            "stored_only": len(
+                                getattr(report, "stored_only", ()) or ()
+                            ),
+                            "changed": len(report.stale),
+                            "drifted": sorted(report.drifted),
+                        }
+                        for ident, report in drifted
+                    ],
+                    "unknown": [name for name, _reason in unknowns],
+                },
+            )
+        ]
+    if unknowns:
+        lines = "; ".join(f"{name}: {reason}" for name, reason in unknowns)
+        return [
+            Finding(
+                probe="kg_drift_census",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    f"KG drift could not be determined for {len(unknowns)} "
+                    f"project(s) — {lines}"
+                ),
+                detail={"unknown": [[name, reason] for name, reason in unknowns]},
+            )
+        ]
+    return [
+        Finding(
+            probe="kg_drift_census",
+            status=STATUS_OK,
+            summary=(
+                f"{verified} registered project(s) scanned: every on-disk "
+                "knowledge/ node matches its stored row (no disk-only, "
+                "stored-only or changed nodes)"
+            ),
+            detail={"verified": verified},
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -4321,6 +4569,14 @@ def probe_retired_endpoint_env(folder: Path, res: DoctorResolvers, ctx: dict) ->
     )]
 
 
+def probe_codegraph_insert_failures(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.codegraph_extractor_generation`
+    (v0.2.102 W6-U): code graphs certified with an accepted failing set."""
+    from vco_lib import codegraph_extractor_generation  # noqa: PLC0415
+
+    return codegraph_extractor_generation.doctor_insert_failures(folder)
+
+
 def probe_agent_model_ids(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
     """Does every agent definition name a gateway model id the router knows?
 
@@ -4369,6 +4625,39 @@ def probe_agent_model_ids(folder: Path, res: DoctorResolvers, ctx: dict) -> list
     )]
 
 
+def probe_infra_declarations(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.doctor_infra` (v0.2.102 M3)."""
+    from vco_lib import doctor_infra  # noqa: PLC0415
+
+    return doctor_infra.probe_infra_declarations(folder, res, ctx)
+
+
+def probe_compose_override_pair(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.doctor_infra` (v0.2.102 P299-B2)."""
+    from vco_lib import doctor_infra  # noqa: PLC0415
+
+    return doctor_infra.probe_compose_override_pair(folder, res, ctx)
+
+
+def _compose_override_pair_entry(finding: Finding):
+    from vco_lib import doctor_infra  # noqa: PLC0415
+
+    return doctor_infra.compose_override_pair_entry(finding)
+
+
+def probe_playwright_browser(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.playwright_mcp` (v0.2.102 W6-Z4)."""
+    from vco_lib import playwright_mcp  # noqa: PLC0415
+
+    return playwright_mcp.probe_browser(folder, res, ctx)
+
+
+def _playwright_browser_entry(finding: Finding):
+    from vco_lib import playwright_mcp  # noqa: PLC0415
+
+    return playwright_mcp.doctor_entry(finding)
+
+
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
@@ -4414,10 +4703,30 @@ PROBES: dict = {
     # by the same reading (self-resolving + the registry probe
     # `kg_binding_evidence_still_mismatched`).
     "kg_binding_evidence": (probe_kg_binding_evidence, (SCOPE_FULL,)),
+    # v0.2.102 W4-C L2: full-only — per registered project, one Weaviate
+    # reachability probe + one hash query per populated collection (network
+    # reads; same cost reasoning as kg_binding_evidence). REPORTED-not-owned:
+    # the per-project kg_sync_drift_detected ledger entry belongs to
+    # kg_sync_drift.surface_drift, so no boot-scope promise is touched (this
+    # probe never runs at boot and emits/resolve nothing itself).
+    "kg_drift_census": (probe_kg_drift_census, (SCOPE_FULL,)),
     # v0.2.92 BLOCKER-1: full-only — one localhost /health call. See the
     # probe's docstring for why this is the only service whose IMAGE can go
     # stale under a healthy update.
     "code_embed_image": (probe_code_embed_image, (SCOPE_FULL,)),
+    # v0.2.102 W5-A (M3): full-only, informational — one read-only launcher.db
+    # open listing what projects declared their own. No registered condition.
+    "infra_declarations": (probe_infra_declarations, (SCOPE_FULL,)),
+    # v0.2.102 W5-A (P299-B2): full-only — two file reads + a YAML compare.
+    # Doctor-owned, self-resolving `compose_override_pair_diverged`; full-only
+    # for the boot-promise reason (the pair changes only through an
+    # install/update or a hand edit the next full run reads).
+    "compose_override_pair": (probe_compose_override_pair, (SCOPE_FULL,)),
+    # v0.2.102 W6-Z4: full-only — a directory scan of the npx cache + two
+    # small JSON reads + one marker stat. Doctor-owned, self-resolving
+    # `playwright_browser_missing`; full-only for the same boot-promise reason
+    # (the browser changes through an install/update or the printed command).
+    "playwright_browser": (probe_playwright_browser, (SCOPE_FULL,)),
     # v0.2.95 R5c: full-only — it RUNS the registered entry point
     # (`--version`), and it reports nothing at all on the majority of machines,
     # where the gateway's login-time autostart was never opted into.
@@ -4438,6 +4747,10 @@ PROBES: dict = {
     # entry can clear), so the boot counter must never point at it. It runs
     # where it is read: `vco doctor` and install/update's end-of-run report.
     "retired_endpoint_env": (probe_retired_endpoint_env, (SCOPE_FULL,)),
+    # v0.2.102 W6-U: full-only for the same promise reason — no registered
+    # condition (only a clean force walk clears it). Names the files a graph
+    # was certified without, so the accepted-failure state is never silent.
+    "codegraph_insert_failures": (probe_codegraph_insert_failures, (SCOPE_FULL,)),
     # v0.2.100 F1/F4: full-only, informational — the RL telemetry loss
     # ledger's surface (lost hub POSTs, skipped dual-log twins). No registered
     # condition: a loss is a count to watch, not a ledger entry to clear.
@@ -4655,10 +4968,8 @@ def _npx_entry(finding: Finding):
         why_deferred=(
             "Installing Node.js changes the user's machine, so VCO "
             "never does it unattended. Until npx resolves, every MCP "
-            "registered as `npx` (playwright by default; the diagram "
-            "wrappers on legacy installs that still have them — the "
-            "wrappers are optional since v0.2.101 and absent on fresh "
-            "installs) fails to start — Claude Code shows only "
+            "registered as `npx` (playwright by default) fails to "
+            "start — Claude Code shows only "
             "'Failed to connect', with no indication that the cause is "
             "a missing binary. This entry clears itself on the first "
             "install/update run that finds npx."
@@ -4931,6 +5242,8 @@ _ENTRY_BUILDERS: dict = {
     CID_GATEWAY_UNRUNNABLE: _gateway_unrunnable_entry,
     CID_INSTALL_MARKER_UNBACKED: _install_marker_unbacked_entry,
     CID_FORMER_LAUNCHER_CLI: _former_launcher_cli_entry,
+    CID_COMPOSE_OVERRIDE_PAIR_DIVERGED: _compose_override_pair_entry,
+    CID_PLAYWRIGHT_BROWSER_MISSING: _playwright_browser_entry,
 }
 
 
@@ -5209,6 +5522,7 @@ __all__ = [
     "CID_INSTALL_MARKER_UNBACKED",
     "CID_KG_BINDING_EVIDENCE_MISMATCH",
     "CID_NPX_MISSING",
+    "CID_PLAYWRIGHT_BROWSER_MISSING",
     "CID_VCO_LIB_SHADOWED",
     "DISK_CRITICAL_FREE_BYTES",
     "DISK_MIN_FREE_ENV",

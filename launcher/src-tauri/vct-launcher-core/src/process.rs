@@ -310,6 +310,52 @@ pub fn epoch_secs_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// An opaque token naming the process INSTANCE running as `pid`, or `None`
+/// when it cannot be inspected (gone, no permission, sentinel pid).
+///
+/// v0.2.102 (W6-Z3): written as the third line of `<vct_root>/update.lock`
+/// so `vco_lib/update_lock.py::decide` can tell the claimant from a newer
+/// process handed the same pid WITHOUT comparing wall clocks (an NTP step
+/// after the claim shifts a wall-clock-derived start time and read a live
+/// holder as "pid reused").
+///
+/// MUST MATCH `vco_lib/deferral_probes.py::process_start_token` — the Python
+/// home of the format; the readers compare the two:
+///
+/// * `proc:<ticks>` on Linux — field 22 of `/proc/<pid>/stat` (start time in
+///   clock ticks since boot; not wall-clock based, so it never drifts);
+/// * `wall:<seconds>.000` elsewhere — the creation timestamp the OS stored
+///   when the process started, via `sysinfo` (whole seconds; the Python
+///   reader `process_identity_matches` takes <= 1 s as the same process,
+///   < 3 s as "cannot tell" and >= 3 s as a reused pid).
+pub fn process_start_token(pid: u32) -> Option<String> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        let raw = String::from_utf8_lossy(&raw);
+        // comm may hold spaces/parens: the fields after the LAST ')' are
+        // fixed — state is field 3, so starttime (field 22) is index 19.
+        let (_, tail) = raw.rsplit_once(')')?;
+        let ticks: u64 = tail.split_whitespace().nth(19)?.parse().ok()?;
+        Some(format!("proc:{ticks}"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use sysinfo::{Pid, ProcessesToUpdate, System};
+        let target = Pid::from_u32(pid);
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::Some(&[target]), true);
+        let secs = sys.process(target)?.start_time();
+        if secs == 0 {
+            return None;
+        }
+        Some(format!("wall:{secs}.000"))
+    }
+}
+
 /// Why [`output_bounded`] produced no [`std::process::Output`].
 #[derive(Debug)]
 pub enum BoundedError {
@@ -358,7 +404,9 @@ pub struct BoundedOutput {
 /// exits, on the hub's watchdog tick a supervision loop that never ticks
 /// again. This spawns `cmd` with piped stdout/stderr (drained on their own
 /// threads, so a chatty child cannot deadlock on a full pipe), writes
-/// `stdin` when given (then closes it; `None` = the null device), polls for
+/// `stdin` when given on its OWN thread — the write sits under the same
+/// `limit` as the wait, so a child that never reads a large body cannot
+/// block the caller (v0.2.102 NB-R4; `None` = the null device) — polls for
 /// exit, and at `limit` kills and reaps the child.
 ///
 /// Blocking: call it from a sync context, or from async code through
@@ -406,9 +454,29 @@ pub fn output_bounded(
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let out_buf = drain(child.stdout.take(), done_tx.clone());
     let err_buf = drain(child.stderr.take(), done_tx);
-    // Written, then dropped: the child reads its stdin to EOF.
-    let stdin_error = match (stdin, child.stdin.take()) {
-        (Some(body), Some(mut sink)) => sink.write_all(body).err(),
+    // The stdin write runs on its OWN thread, under the same deadline as
+    // the wait below (v0.2.102 NB-R4): pre-fix `sink.write_all(body)` ran
+    // on the calling thread BEFORE the deadline loop, so a child that never
+    // reads stdin, handed a body larger than the pipe buffer (≥ 64 KiB on
+    // Linux), blocked the caller forever — the output drains were threaded,
+    // the write was not. The write's Result is collected after the outcome
+    // (a child that exits without reading its input surfaces EPIPE there,
+    // the same evidence the inline write used to carry); a write still
+    // blocked when the deadline fires is part of the SAME timeout — the
+    // child is killed, which closes the pipe and unblocks the writer.
+    let stdin_write = match (stdin, child.stdin.take()) {
+        (Some(body), Some(mut sink)) => {
+            // The thread must own its data (`'static`); the body is copied
+            // once, bounded by the caller's input size.
+            let body = body.to_vec();
+            let (write_tx, write_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+            std::thread::spawn(move || {
+                let r = sink.write_all(&body);
+                drop(sink); // close the child's stdin (EOF for the child)
+                let _ = write_tx.send(r);
+            });
+            Some(write_rx)
+        }
         _ => None,
     };
 
@@ -439,7 +507,20 @@ pub fn output_bounded(
     let take = |b: &Shared| std::mem::take(&mut *b.lock().unwrap_or_else(|e| e.into_inner()));
     let (stdout, stderr) = (take(&out_buf), take(&err_buf));
     match outcome {
-        Ok(status) => Ok(BoundedOutput { status, stdout, stderr, stdin_error }),
+        Ok(status) => {
+            // Collect the stdin-write result: the child has exited by now,
+            // which closes the read end and unblocks the writer. Bounded
+            // wait for safety; a writer still stuck past the grace period
+            // carries no error (the child side is gone — nothing to report).
+            let stdin_error = match stdin_write {
+                Some(rx) => match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                    Ok(Err(e)) => Some(e),
+                    Ok(Ok(())) | Err(_) => None,
+                },
+                None => None,
+            };
+            Ok(BoundedOutput { status, stdout, stderr, stdin_error })
+        }
         Err(None) => Err(BoundedError::TimedOut { after: limit, stdout, stderr }),
         Err(Some(e)) => Err(BoundedError::Wait(e)),
     }
@@ -509,6 +590,30 @@ mod tests {
         // Windows OpenProcess(0) returns NULL. Either way the sentinel
         // must short-circuit to false.
         assert!(!pid_is_alive(0));
+    }
+
+    #[test]
+    fn start_token_is_stable_for_a_live_process_and_none_for_sentinels() {
+        let me = std::process::id();
+        let a = process_start_token(me).expect("own token readable");
+        assert_eq!(process_start_token(me).as_deref(), Some(a.as_str()), "stable");
+        assert!(a.starts_with("proc:") || a.starts_with("wall:"), "{a}");
+        assert_eq!(process_start_token(0), None);
+        assert_eq!(process_start_token(u32::MAX), None);
+    }
+
+    /// The `/proc/<pid>/stat` index matches the Python twin's
+    /// (`rsplit(')', 1)[1].split()[19]`) — including a comm holding `)`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_token_reads_field_22_after_the_last_paren() {
+        let raw = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let tail = raw.rsplit_once(')').unwrap().1;
+        let want = tail.split_whitespace().nth(19).unwrap();
+        assert_eq!(
+            process_start_token(std::process::id()).unwrap(),
+            format!("proc:{want}")
+        );
     }
 
     #[test]
@@ -700,6 +805,50 @@ mod bounded_tests {
     fn stdin_is_delivered_and_closed() {
         let out = output_bounded(&mut sh("cat"), Some(b"body"), Duration::from_secs(20)).expect("ran");
         assert_eq!(out.stdout, b"body");
+    }
+
+    /// v0.2.102 NB-R4: pre-fix, `sink.write_all(body)` ran on the CALLING
+    /// thread before the deadline loop — a child that never reads stdin,
+    /// handed a body larger than the pipe buffer (≥ 64 KiB on Linux),
+    /// parked the caller forever while the output drains were threaded.
+    /// The write now runs under the same deadline: the call must return a
+    /// `TimedOut` of the same shape as the output timeout. The hard outer
+    /// guard (thread + channel) turns a pre-fix infinite hang into a FAILED
+    /// TEST instead of a hung suite — 15 s is far above the 600 ms bound
+    /// and far below "forever".
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_never_reads_stdin_does_not_block_the_caller() {
+        let body = vec![b'x'; 256 * 1024]; // > the 64 KiB Linux pipe buffer
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = output_bounded(&mut sh("sleep 30"), Some(&body), Duration::from_millis(600));
+            let _ = tx.send(r);
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("output_bounded never returned — the stdin write is blocking the caller");
+        let err = result.expect_err("a sleeping child must hit the deadline");
+        match err {
+            BoundedError::TimedOut { after, .. } => {
+                assert_eq!(after, Duration::from_millis(600));
+            }
+            other => panic!("expected TimedOut, got {other}"),
+        }
+    }
+
+    /// LEAVE-ALONE half of NB-R4: a child that DOES read stdin to EOF is
+    /// unaffected by the threaded write — the body is delivered in full and
+    /// no stdin error is reported (the existing `stdin_is_delivered_and_
+    /// closed` covers the small body; this one is larger than the pipe
+    /// buffer, so it exercises the writer thread's chunked progress).
+    #[cfg(unix)]
+    #[test]
+    fn a_large_stdin_body_is_delivered_to_a_reading_child() {
+        let body = vec![b'y'; 256 * 1024];
+        let out = output_bounded(&mut sh("cat"), Some(&body), Duration::from_secs(20)).expect("ran");
+        assert_eq!(out.stdout, body);
+        assert!(out.stdin_error.is_none(), "stdin error: {:?}", out.stdin_error);
     }
 
     #[cfg(unix)]

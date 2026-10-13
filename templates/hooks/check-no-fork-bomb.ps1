@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: PR-32 ports the .sh-side env-scrub (already present in .sh, missing here) — Windows-only fix to add defence-in-depth secret scrub before subprocess spawning; no .sh change required.
+﻿# Parity: kept in step with check-no-fork-bomb.sh (key incident-fix logic on
+# both sides is pinned by tests/test_hook_ps1_body_parity.py; every
+# behaviour must match the check-no-fork-bomb.sh sibling).
 # check-no-fork-bomb.ps1 — Windows sibling of check-no-fork-bomb.sh.
 #
 # See check-no-fork-bomb.sh for the full incident background and
@@ -85,12 +87,16 @@ if ($remaining -eq 0) {
 # Best-effort desktop notification via the cross-platform helper at
 # .claude/scripts/notify.py (uses BurntToast / balloon on Windows).
 # Non-fatal if Python or the helper is missing.
-$projectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
-$notifyHelper = Join-Path $projectDir ".claude/scripts/notify.py"
+# Project root (only to find notify.py): the ONE rule (_lib/project-root.ps1,
+# must match vco_lib/project_root.py). None -> no helper, no notification.
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$projectDir = Get-VcoProjectRoot
+$notifyHelper = ""
+if ($projectDir) { $notifyHelper = Join-Path $projectDir ".claude/scripts/notify.py" }
 $notifyTitle = "VCO fork-bomb killed"
 $notifyBody = "Killed $count runaway lean-ctx processes (remaining: $remaining)"
 
-if (Test-Path $notifyHelper) {
+if ($notifyHelper -and (Test-Path $notifyHelper)) {
     # Resolve Python via the existing helper that sets $PY.
     $libDir = Join-Path $PSScriptRoot "_lib"
     $findPy = Join-Path $libDir "find-python.ps1"

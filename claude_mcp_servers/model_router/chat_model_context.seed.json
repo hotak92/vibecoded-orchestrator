@@ -19,8 +19,9 @@
       "max_output": 128000,
       "window_1m": true,
       "text_only": false,
+      "clear_thinking": false,
       "source": "https://docs.z.ai/guides/vlm/glm-5.3-flash",
-      "source_note": "Documented under /guides/vlm/ (the /guides/llm/ path 308-redirects there). text_only=false: the VLM page states 'Native multimodal input supporting images, videos, and files' — GLM-5.3-Flash SEES images, so image blocks are forwarded untouched (unlike glm-5.3)."
+      "source_note": "Documented under /guides/vlm/ (the /guides/llm/ path 308-redirects there). text_only=false: the VLM page states 'Native multimodal input supporting images, videos, and files' — GLM-5.3-Flash SEES images, so image blocks are forwarded untouched (unlike glm-5.3). clear_thinking=false (v0.2.102 A8, OD-10, P299:149): requests that carry a thinking param get thinking.clear_thinking=false, per the z.ai thinking guide (https://docs.z.ai/guides/capabilities/thinking — the same page effort.py cites); the field is sent ONLY on rows that carry it (default absent = not sent) and only when the request already has a thinking param."
     },
     "glm-5.1": {
       "vendor": "zai",
@@ -74,12 +75,12 @@
     },
     "qwen3.8-max": {
       "vendor": "qwen",
-      "context_window": 1000000,
+      "context_window": 983616,
       "max_output": 128000,
       "window_1m": true,
       "text_only": false,
       "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
-      "source_note": "Window and output are the vendor's PER-MODEL figures on the cited page. The 200000 this row carried until v0.2.98 came from the Claude Code integration page's sentence about the CLIENT's default window, which is not a per-model spec; that citation is gone. The vendor writes output as '128k'/'64k' without expanding it — its DeepSeek '384k' expands to 393,216 (= 384*1024) — so the decimal readings are the non-overstating choice. The same vendor's Claude Code config for this endpoint sets CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616 (1,000,000 - 16,384) with no stated rationale, but VCO writes no such knob (docs/CONFIGURATION.md, 'Panel mode'), so the 1M here is the documented model window. (Qwen3.8 table.) text_only=false: QwenCloud's Vision page (developer-guides/multimodal/vision) uses qwen3.8-max throughout its image_url / video / MultiModalConversation examples, so it accepts image input; image blocks are forwarded untouched."
+      "source_note": "Window 983616 is the endpoint's REAL Claude Code ceiling, not the page's architectural 1M: the vendor's own Claude Code config for this endpoint sets CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616 (1,000,000 - 16,384), and a live request above it (2026-10-06, 983,981 ledger tokens) was refused HTTP 400 InvalidParameter with 'Range of input length should be [1, 983616]'. Figure history, so a future editor does not 'correct' the row backwards: until v0.2.98 this row read 200000 — the Claude Code integration page's sentence about the CLIENT's default window, which is not a per-model spec; v0.2.98 moved it to the vendor's per-model 1M on the cited page; v0.2.102 (S16-10) moved it to the live-verified ceiling above. window_1m stays true: 983,616 is far above the 200K the client would otherwise budget, so it still earns the [1m] companion, and the gateway's context guard plus the overflow translation enforce the 16,384 the client over-budgets. VCO itself writes no CLAUDE_CODE_MAX_CONTEXT_TOKENS knob (docs/CONFIGURATION.md, 'Panel mode'). The other QwenCloud rows keep the cited page's 1M: the config value is stated for the endpoint as a whole but only this model is live-verified against it, and the guard protects the rest. max_output 128000 and text_only=false unchanged (Qwen3.8 table; Vision page uses qwen3.8-max throughout its image_url / video examples, so it accepts image input)."
     },
     "qwen3.8-flash": {
       "vendor": "qwen",
@@ -141,6 +142,15 @@
       "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
       "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024. Present on the subscription's live compatible-model list (probe 2026-09-22), which the previously cited integration page predates. text_only=false: the QwenCloud DeepSeek page states verbatim 'deepseek-v4.1-flash has native visual understanding and accepts both text and image input, returning text. All other DeepSeek models accept text input only.' — so this model SEES images and its blocks are forwarded untouched."
     },
+    "k3": {
+      "vendor": "kimi",
+      "context_window": 1048576,
+      "max_output": 0,
+      "window_1m": true,
+      "text_only": false,
+      "source": "https://www.kimi.com/code/docs/kimi-code/models.html",
+      "source_note": "Window: the vendor's per-model table gives k3 1048576 (read 2026-10-07), and the live /v1/models probe 2026-10-07 (owner's key) reports context_length 1048576 for k3 — so the row is 1M with the [1m] companion, like every other 1M model (owner: K3 = 1M). PLAN CAVEAT, from the same docs: the per-plan table on the Claude Code page (https://www.kimi.com/code/docs/third-party-tools/claude-code.html) caps k3 at 262144 on Plus/Moderato and unlocks 1048576 on Pro-and-above, and the error reference documents HTTP 401 'Your current plan supports only k3 up to 256K context' for a Plus request past 256K. A Plus subscriber whose sessions hit that 401 lowers this row to 262144 with window_1m false in the launcher (Preferences -> Chat model context; the export wins per row). max_output 0 = not stated (neither the docs nor the live list carry an output figure). text_only=false: the models page lists k3's 多模态输入 as '支持图片、视频' and the live list reports supports_image_in true."
+    },
     "claude-fable-5-1": {
       "vendor": "anthropic",
       "context_window": 1000000,
@@ -164,6 +174,30 @@
       "window_1m": true,
       "source": "https://platform.claude.com/docs/en/models/opus-5/overview.md",
       "source_note": "First-party row; its own per-model page is cited. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
+    },
+    "claude-opus-5-5": {
+      "vendor": "anthropic",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "source_note": "Citation is the Anthropic models-OVERVIEW index page on platform.claude.com: no per-model page for this model is published, so the index page is cited and named as such (the same convention as claude-fable-5-1). The 1M window / 128K output figures are its 5.0 sibling's (claude-opus-5 / claude-sonnet-5, own per-model pages) and were confirmed for the 5.5 generation by the owner, 2026-10-07. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
+    },
+    "claude-sonnet-5-5": {
+      "vendor": "anthropic",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "source_note": "Citation is the Anthropic models-OVERVIEW index page on platform.claude.com: no per-model page for this model is published, so the index page is cited and named as such (the same convention as claude-fable-5-1). The 1M window / 128K output figures are its 5.0 sibling's (claude-opus-5 / claude-sonnet-5, own per-model pages) and were confirmed for the 5.5 generation by the owner, 2026-10-07. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
+    },
+    "claude-haiku-5-5": {
+      "vendor": "anthropic",
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "source_note": "Citation is the Anthropic models-OVERVIEW index page on platform.claude.com, which states this model's row directly (read 2026-10-08): API id and alias claude-haiku-5-5, 1M context window, 128K max output, adaptive thinking with default effort medium. No per-model page is published, so the index page is cited and named as such (the claude-fable-5-1 convention). Its predecessor claude-haiku-4-5-20251001 (200K, now legacy) deliberately has NO row: the client knows that window natively. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
     },
     "claude-sonnet-5": {
       "vendor": "anthropic",

@@ -75,6 +75,10 @@ def _minimal_hub_body(extra: dict | None = None) -> dict:
         },
         "kg_access_list": [],
         "codegraph_access_list": [],
+        # v0.2.102: the hub no longer emits ``diagrams_access_list``
+        # (removed with the diagrams runtime). Kept here ON PURPOSE: a
+        # pre-v0.2.102 hub still sends it, and the parser must tolerate
+        # the unknown extra key rather than crash.
         "diagrams_access_list": [],
         "weaviate_url": "http://localhost:8081",
         "ollama_url": "http://localhost:11435",

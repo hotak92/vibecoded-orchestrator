@@ -46,13 +46,16 @@ from typing import (
     Callable,
     Dict,
     FrozenSet,
+    Iterable,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
     Tuple,
 )
 
+from vco_lib.codegraph_defs import regex_fallback_hash_salt
 from vco_lib.codegraph_entities import CodeEntity, KIND_API
 
 
@@ -131,6 +134,7 @@ def run_pure_extractor(
     repo_root: Path,
     extract: Callable[[str, Path, Path, "ExtractorHelpers"], Any],
     empty_stats: Dict[str, int],
+    file_hash_fn: Optional[Callable[[str, Path, Path], str]] = None,
 ) -> Dict[str, int]:
     """The shared thin-shim body for a pure ``extract_<lang>_file`` producer.
 
@@ -138,7 +142,14 @@ def run_pure_extractor(
     BEFORE extraction (preserving today's short-circuit economics — the pure
     producer is only invoked when the file is NOT skipped):
 
-      1. CG-5 minified-content skip (skip + log, never deletes rows);
+      1. CG-5 minified-content skip (skip + log). v0.2.102 (S16-3): the skip
+         is a POLICY decision that the file is out of the graph, so it now
+         retires what it advertises — the path is handed to
+         ``ctx._note_policy_skipped_file`` and the analyzer prunes that file's
+         existing rows once at the end of the walk
+         (:func:`prune_policy_skipped_files`). Before, the skipped file's old
+         rows stayed behind un-re-embeddable and un-prunable, and the resync
+         census counted them as owed on every walk, forever;
       2. the unchanged-file gate ``ctx._get_existing_module`` (path + hash +
          embed-revision aware).
 
@@ -150,24 +161,127 @@ def run_pure_extractor(
     ``empty_stats`` is the language's own zero-stats dict (they differ:
     js/csharp/proto also carry ``apis``) so the returned shape stays identical
     to the pre-Part-6 body on the skip paths.
+
+    ``file_hash_fn(content, file_path, repo_root)`` replaces the plain
+    ``sha256(content)`` for a language whose extraction depends on OTHER files
+    (Rust: a test-gated ``mod x;`` elsewhere — v0.2.102 W6-G). Since W6-L the
+    gate's hash (salted for a regex-fallback file) is written onto the module
+    row HERE, so the gate and the stored value cannot disagree.
     """
     content = file_path.read_text(encoding="utf-8", errors="ignore")
     if _is_minified_content(content):
         try:
             _rel_min = file_path.relative_to(repo_root).as_posix()
         except Exception:  # noqa: BLE001
-            _rel_min = str(file_path)
-        print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            _rel_min = ""
+        print(f"⏭️  Skipping {_rel_min or file_path} (looks minified/generated)")
+        # S16-3: a relative path is the only anchor the stored rows carry; an
+        # unresolvable one prunes nothing (never guess a path to delete).
+        _note = getattr(ctx, "_note_policy_skipped_file", None)
+        if _rel_min and callable(_note):
+            _note(_rel_min)
         return dict(empty_stats)
 
-    file_hash = hashlib.sha256(content.encode()).hexdigest()
+    file_hash = (file_hash_fn(content, file_path, repo_root) if file_hash_fn is not None
+                 else hashlib.sha256(content.encode()).hexdigest())
+    # v0.2.102 W6-L: a file extracted by the REGEX fallback (its tree-sitter
+    # grammar cannot load) carries a salted hash, so installing the parser
+    # later re-extracts exactly that language's unchanged files on the next
+    # walk (see codegraph_defs.regex_fallback_hash_salt). The ONE value is
+    # stamped on the module row below, whatever the extractor computed.
+    salt = regex_fallback_hash_salt(file_path)
+    if salt:
+        file_hash = hashlib.sha256((file_hash + salt).encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
     if ctx._get_existing_module(relative_path, file_hash):
         print(f"⏭️  Skipping {relative_path} (unchanged)")
         return dict(empty_stats)
 
     fx = extract(content, file_path, repo_root, ExtractorHelpers(ctx))
+    if fx.module is not None:
+        fx.module.file_hash = file_hash
     return ctx.write_file_extraction(fx)
+
+
+def prune_policy_skipped_files(
+    targets: Sequence[Tuple[Any, str]],
+    skipped: Mapping[str, Iterable[str]],
+    *,
+    project: str,
+    primary_sources: Optional[Iterable[str]],
+    deleter: Callable[..., Tuple[int, int]],
+    narrow: Optional[Callable[[str, Sequence[str]], Any]] = None,
+    strict: bool = False,
+) -> Tuple[int, int]:
+    """S16-3 (v0.2.102): delete the stored rows of files the walk deliberately
+    skipped as minified/generated. Returns ``(deleted, failures)``.
+
+    The skip is a policy ruling that the file is OUT of the graph, so its rows
+    from before the ruling (or from before a heuristic change) are not "alive
+    but unwalked" — they are owed nothing and must not stay behind as rows the
+    walk can neither re-embed nor prune (the resync census counted them owed
+    forever). Prune, rather than excluding them from the census: the walk is
+    the only place that positively knows the file is skipped (the census would
+    have to re-read and re-judge every file's content), and a pruned row stops
+    being served by search too.
+
+    One home for the delete: the per-collection loop is
+    :func:`vco_lib.codegraph_deleted_files.prune_file_rows` (the deleted-file
+    prune), each delete goes through the tokenization-safe ``deleter``
+    (``codegraph_resync.delete_file_rows_exact``: exact Python compare of the
+    raw stored path), and ``narrow`` (``codegraph_resync._narrow_filter_for_paths``)
+    only narrows WHICH rows are read back.
+
+    ``skipped`` maps the walk's ``project_source`` (the value stamped on rows)
+    to the repo-relative paths skipped under it. Scoping: ``project`` must match
+    exactly, and row ownership is decided by THE one ownership rule,
+    :func:`vco_lib.codegraph_row_classify.source_is_owned`, against the source
+    the file was skipped under. When that source is the walked primary root,
+    its primary forms are the owned set, and an EMPTY (legacy, pre-provenance)
+    source counts as owned — unless ``strict``. ``--as-extra-path`` walks set
+    ``strict``: their "primary" root is an extra path, so an unstamped row is
+    most likely the real primary project's and must never be judged from there
+    (W1-C B1). Any other source owns exactly itself, and an empty source is
+    never owned. An empty source KEY prunes nothing (no guessing).
+    """
+    from vco_lib.codegraph_deleted_files import prune_file_rows
+    from vco_lib.codegraph_row_classify import source_is_owned
+
+    primaries = set(primary_sources or ())
+    deleted_total = failures_total = 0
+    for source, rels in skipped.items():
+        paths = sorted({r for r in rels if r})
+        if not source or not paths:
+            continue
+        is_primary = source in primaries
+        owned_set = primaries if is_primary else {source}
+        row_strict = strict or not is_primary
+
+        def _scoped(coll, path_prop, match, *, project, project_source, log_prefix,
+                    _owned=owned_set, _strict=row_strict, _paths=paths):
+            del project_source  # ownership is decided below, by source_is_owned
+            return deleter(
+                coll, path_prop,
+                lambda raw, props: bool(match(raw, props))
+                and source_is_owned(props.get("project_source"), _owned, strict=_strict),
+                project=project, project_source="", extra_props=["project_source"],
+                narrow_filter=narrow(path_prop, _paths) if narrow else None,
+                log_prefix=log_prefix,
+            )
+
+        deleted, failures = prune_file_rows(
+            targets, paths, project=project, project_source=source,
+            deleter=_scoped, log_prefix="generated-file prune",
+        )
+        deleted_total += deleted
+        failures_total += failures
+        if deleted or failures:
+            print(
+                f"   🗑️  {len(paths)} minified/generated file(s) skipped under "
+                f"{source}: removed {deleted} stale entit(ies)"
+                + (f"; {failures} delete(s) FAILED" if failures else "")
+            )
+    return deleted_total, failures_total
 
 
 # ── v0.2.92: the ONE CodeAPI entity constructor ─────────────────────────────
@@ -409,13 +523,41 @@ def blank_block_comments_preserving_lines(
 # (``*.min.js`` …). Vendored / generated files that DON'T carry the suffix
 # (a bundled ``vendor.js``, a generated ``schema.js``, a one-line CSS-in-JS
 # blob) still get walked, and their single-giant-line bodies produce garbage
-# entities that pollute retrieval. This content check skips a file whose lines
-# are pathologically long — the signature of minification — regardless of name.
-# Skip + log ONLY; NEVER deletes existing rows (a genuine long-line first-party
-# file simply isn't re-indexed; the orphan-clear owns deletion).
-_MINIFIED_MAX_LINE_LEN = 2000      # any single line this long → almost certainly minified
-_MINIFIED_MEDIAN_LINE_LEN = 400    # typical hand-written code medians well under 100
-_MINIFIED_MIN_CONTENT_LEN = 4000   # don't judge tiny files (a short dense config is fine)
+# entities that pollute retrieval. This content check skips a file whose
+# SHAPE is machine output, regardless of name.
+#
+# v0.2.102 (S16-3): judge by SHAPE, never by one line. The pre-.102 rule
+# ("any single line >= 2000 chars") skipped a hand-written 3,500-line Rust
+# file because ONE SQL line was 2,007 characters (2,021 bytes) long — the skip
+# stranded that file's rows forever (never re-embedded, never pruned). The
+# shape rules below were calibrated on real samples (measured 2026-10-07;
+# share = fraction of the file's characters that live in lines >= 1000 chars):
+#
+#   sample (kind)                          lines   median  share   verdict
+#   immutable.min.js       (minified)         56     2036   0.98    skip
+#   cytoscape.min.js       (minified)         32       73   0.997   skip
+#   mermaid.min.js         (minified)       3637       24   0.958   skip
+#   tailwindcss dist/lib.js (bundled)         39       92   0.99    skip
+#   react-dom.production.min.js (minified)   268      505   0.012   skip (median)
+#   react-dom-test-utils.production.min.js    41      326   0.0     skip (median)
+#   scheduler-unstable_mock.production.min.js 21      285   0.0     skip (median)
+#   mermaid.js       (unminified bundle)  193183       33   0.048   keep
+#   descriptor_pb2.py (generated, readable) 3370       49   0.12    keep
+#   api_pb2.py        (generated, readable)   48       40   0.45    keep
+#   db/migrations.rs (hand-written, one 2007-char line)
+#                                           3562       38   0.09    keep
+#
+# A fraction-of-LINES rule cannot separate these: mermaid.min.js has only
+# 3.9% long lines (thousands of short lines around 140 giant ones), so the
+# measure is the share of CHARACTERS in long lines. Minified samples sit at
+# >= 0.95, readable ones at <= 0.45 → the 0.7 cut leaves margin on both sides.
+# The median cut is 250: two minified react builds sit at 285 / 326 with NO long
+# line (a 400 cut missed them), while no first-party source file in this repo
+# has a median above 150 (readable code medians are 30–60).
+_MINIFIED_LONG_LINE_LEN = 1000      # a line this long counts toward the long-line share
+_MINIFIED_LONG_SHARE = 0.7          # >= this share of chars in long lines → minified
+_MINIFIED_MEDIAN_LINE_LEN = 250     # readable code medians 30–60; minified builds >= 285
+_MINIFIED_MIN_CONTENT_LEN = 4000    # don't judge tiny files (a short dense config is fine)
 
 
 def _is_minified_content(content: str) -> bool:
@@ -423,23 +565,24 @@ def _is_minified_content(content: str) -> bool:
 
     Heuristic (conservative — errs toward KEEPING first-party code):
       * only judged for non-trivial files (>= ``_MINIFIED_MIN_CONTENT_LEN``);
-      * flagged when the MAX line length is huge (a bundler's single-line output)
-        OR the MEDIAN line length is far above what hand-written code produces.
+      * flagged when the MEDIAN line length is far above what hand-written code
+        produces, OR when most of the file's characters
+        (>= ``_MINIFIED_LONG_SHARE``) live in lines of
+        >= ``_MINIFIED_LONG_LINE_LEN`` chars (a bundler's giant lines).
+    One long line in an otherwise normal file is NOT minification (S16-3).
     Empty / short / unreadable content → False (never skip on uncertainty).
     """
     if not content or len(content) < _MINIFIED_MIN_CONTENT_LEN:
         return False
     try:
-        lines = content.split("\n")
-        lengths = [len(ln) for ln in lines]
+        lengths = [len(ln) for ln in content.split("\n")]
         if not lengths:
             return False
-        max_len = max(lengths)
-        if max_len >= _MINIFIED_MAX_LINE_LEN:
-            return True
         srt = sorted(lengths)
-        median = srt[len(srt) // 2]
-        return median >= _MINIFIED_MEDIAN_LINE_LEN
+        if srt[len(srt) // 2] >= _MINIFIED_MEDIAN_LINE_LEN:
+            return True
+        in_long = sum(n for n in lengths if n >= _MINIFIED_LONG_LINE_LEN)
+        return in_long / max(1, sum(lengths)) >= _MINIFIED_LONG_SHARE
     except Exception:  # noqa: BLE001 — a heuristic must never crash the walk
         return False
 

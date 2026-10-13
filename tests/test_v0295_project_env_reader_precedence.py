@@ -43,6 +43,7 @@ import pytest
 
 from tests.common.wrapper_staging import stage_scripts
 from tests.test_v0294_wrapper_venv_ladder_parity import _stripped_env
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LADDER_PS1 = REPO_ROOT / "templates" / "scripts" / "vct_venv_ladder.ps1"
@@ -90,7 +91,7 @@ def _read_via_pwsh(scripts_dir: Path) -> str | None:
         pytest.skip("pwsh not on PATH — the .ps1 reader is source-gated instead")
     proc = subprocess.run(
         [
-            exe, "-NoProfile", "-Command",
+            exe, *PWSH_BASE_FLAGS, "-Command",
             f'. "{scripts_dir}/vct_venv_ladder.ps1"; '
             f'$v = Get-VctLadderOrchestratorRootFromProjectEnv -ScriptDir "{scripts_dir}"; '
             'if ($null -eq $v) { Write-Output "<NO-ROOT>" } '

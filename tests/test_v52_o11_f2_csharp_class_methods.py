@@ -24,6 +24,8 @@ V52-O.11.F.2-GO (``_go_methods_for_struct``).
 
 from __future__ import annotations
 
+import re
+
 from pathlib import Path
 
 # P2f stage 2 (v0.2.76): `_csharp_methods_for_class` moved verbatim to
@@ -514,8 +516,14 @@ def test_no_unconditional_method_finditer_in_csharp_class_loop() -> None:
     _hdr = "for cname, start_line, _class_end_line in class_decls:"
     _hdr_pos = src.rfind(_hdr, 0, anchor_pos)
     window_start = _hdr_pos if _hdr_pos != -1 else max(0, anchor_pos - 1500)
-    next_for = src.find("\n    for ", anchor_pos)
-    window_end = next_for if next_for != -1 else min(len(src), anchor_pos + 200)
+    # v0.2.102 W6-E: end at the first statement DEDENTED to the loop's own
+    # level (4 spaces) — the class loop's real terminator. The next sibling is
+    # now the method-records block, whose regex fallback legitimately nests
+    # `for m in method_pattern.finditer(...)` deeper, so "next `    for `"
+    # would sweep it in.
+    _dedent = re.compile(r"\n    (?=[^ \n#])")
+    _m_end = _dedent.search(src, anchor_pos)
+    window_end = _m_end.start() if _m_end else min(len(src), anchor_pos + 200)
     window = src[window_start:window_end]
 
     # Sanity: window must contain the C# class-loop's `for cname` header.

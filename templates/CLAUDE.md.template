@@ -113,7 +113,7 @@ This section is here because **model-gateway routing is usable for this project*
 
 **The rule that outranks the table: a model name must name the model that answers.** Never point a Claude tier slot (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) or the subagent slot (`CLAUDE_CODE_SUBAGENT_MODEL`) at a vendor model. Dispatching under one name and answering with another makes every later "which model wrote this?" unanswerable, and it is why the gateway namespaces vendor ids as `claude-gw/<id>` instead of relabelling them. VCO never writes any of those slots — not even when it points the VS Code panel at the gateway; an override already present in your settings is preserved and reported, never silently honoured (the one permitted edit is appending the `[1m]` context-window hint to the SAME model id, disclosed in the done message — the model a slot names is never changed).
 
-**Name the model on every subagent dispatch** — via the Agent-tool `model` parameter or `model:` in the agent definition's frontmatter; never rely on a subagent inheriting the session's model. When several sources name a model, the resolution order is: Agent-tool parameter > definition frontmatter > `CLAUDE_CODE_SUBAGENT_MODEL` env var > session model; `/tasks` shows the model each subagent actually ran on. When you need to wait for something to finish (a test suite, a build, a background agent), start it with `run_in_background` and continue or end your turn — its completion notification wakes you when it is done. To spawn a gateway subagent, dispatch it by definition name and pass no model override: the Agent tool's own model enum cannot carry `claude-gw/*` ids, but a definition's frontmatter can. This module delivers eight definitions across two lanes — on the next bundle update, whenever the model gateway is configured on this machine (a project switched off in Services → Model gateway receives none). The z.ai lane — `@glm-implementer`, `@glm-reviewer`, `@glm-planner`, `@glm-flash-researcher` — covers implementation, review, planning and investigation on `claude-gw/glm-5.3[1m]`, with the flash variant kept for research. The qwen-vendor lane covers execution and research on `claude-gw/qwen/*[1m]`: `@deepseek-implementer` and `@qwen-implementer` for implementation that needs several files in view at once, `@deepseek-researcher` for read-only research that returns a lead rather than a verdict (including cheap bulk surveys), and `@qwen-flash-sweeper` for applying one mechanical rule across many items — including fully-specified mechanical edits. There is deliberately **no reviewer and no planner on the qwen vendor** — those two roles stay on the z.ai lane and on the Anthropic tiers.
+**Name the model on every subagent dispatch** — via the Agent-tool `model` parameter or `model:` in the agent definition's frontmatter; never rely on a subagent inheriting the session's model. When several sources name a model, the resolution order is: Agent-tool parameter > definition frontmatter > `CLAUDE_CODE_SUBAGENT_MODEL` env var > session model; `/tasks` shows the model each subagent actually ran on. When you need to wait for something to finish (a test suite, a build, a background agent), start it with `run_in_background` and continue or end your turn — its completion notification wakes you when it is done; the VCO wait-loop guard blocks waiting by polling (foreground `sleep`/`tail -f` loops and repeated identical log checks are denied with the same instruction). To spawn a gateway subagent, dispatch it by definition name and pass no model override: the Agent tool's own model enum cannot carry `claude-gw/*` ids, but a definition's frontmatter can. This module delivers up to twelve definitions across three vendor lanes — on the next bundle update, whenever the model gateway is configured on this machine (a project switched off in Services → Model gateway receives none), and each lane only once its vendor's key resolves (a lane whose key is missing is held back, never deleted). The z.ai lane — `@glm-implementer`, `@glm-implementer-high`, `@glm-reviewer`, `@glm-planner`, `@glm-flash-researcher` — covers implementation (the `-high` sibling at effort high for the most difficult bounded fixes), review, planning and investigation on `claude-gw/glm-5.3[1m]`, with the flash variant kept for research. The qwen-vendor lane covers execution and research on `claude-gw/qwen/*[1m]`: `@deepseek-implementer`, `@qwen-implementer` and `@qwen-implementer-high` (effort high — QwenCloud runs it at xhigh — for reviews and the most difficult fixes) for implementation that needs several files in view at once, `@deepseek-researcher` for read-only research that returns a lead rather than a verdict (including cheap bulk surveys), and `@qwen-flash-sweeper` for applying one mechanical rule across many items — including fully-specified mechanical edits. There is deliberately **no dedicated reviewer or planner definition on the qwen vendor** — those roles default to the z.ai lane and the Anthropic tiers; `@qwen-implementer-high` may still take a review round when the z.ai lane is unavailable. The kimi-vendor lane runs Kimi K3 on `claude-gw/kimi/k3[1m]`: `@kimi-implementer` for bounded multi-file, long-context or visual/frontend work where quality matters more than speed, and `@kimi-reviewer` for an independent second-family review round on a large diff. K3 always reasons and is slow; brief both for work you queue and review later.
 
 {{MODEL_SELECTION_GRID}}
 
@@ -133,9 +133,10 @@ model id, each with its vendor citation) is the source of truth: `glm-5.3`
 and `glm-5.3-flash` are 1M/128K; `glm-5.1`, `glm-5`, `glm-5-turbo`,
 `glm-4.7` and `glm-4.6` are 200K/128K; `glm-4.5` and `glm-4.5-air` are 128K/96K.
 So `glm-5.3` has **five times** the window of `glm-5.1` — which is exactly why a
-`glm-5*` wildcard is forbidden. Four **first-party** Claude 5 rows ARE in that
-table (`claude-fable-5-1`, `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`,
-all 1M): they are what lets the client's own `[1m]` hint be appended to a slot
+`glm-5*` wildcard is forbidden. The **first-party** Claude 5 and 5.5 rows ARE in
+that table (`claude-fable-5-1`, `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`,
+`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, all 1M): they are
+what lets the client's own `[1m]` hint be appended to a slot
 naming one of them, and lets the gateway publish its `[1m]` companion. Older
 Claude families are deliberately absent: the client already knows their windows
 natively, and a row for them could only introduce drift.
@@ -163,23 +164,21 @@ treat the window itself as unknown, because it is not.
 
 {{/if_module_active}}
 
-{{#if_module_active diagrams}}
-## Diagrams (Mermaid + Excalidraw)
+## Parallel agents on the same git repo
 
-This project has the diagrams module active. When you sketch a flowchart, architecture diagram, GUI mockup, or any other visual:
+When 2+ agents edit the same working tree, either give each one an isolated git worktree (Agent-tool `isolation: "worktree"`) OR assign strictly disjoint file sets and forbid ALL git commands in their briefs (the coordinator runs git): concurrent `git checkout` / `stash` / staging operations are tree-global and clobber each other.
 
-- Write the diagram FILE directly under `.claude/diagrams/<category>/<name>.mmd` (Mermaid) or `.claude/diagrams/<category>/<name>.excalidraw` (Excalidraw JSON). The launcher's Diagrams tab previews and edits these; a hook indexes each change (see below).
-- Category is the primary tag (e.g. `gui/auth/`, `architecture/data-flow/`). Pick a sensible category path and filename.
-- Don't worry about metadata: the file-edit hook auto-derives title, tags, and indexes the diagram for retrieval. Just pick a sensible category path and filename.
-- To find an earlier diagram, use `hybrid_search("topic")` — diagrams are indexed alongside the KG. Results with `result_kind="diagram"` are diagrams; open them via `Read(file_path)` for Mermaid or `describe_excalidraw(file_path)` for Excalidraw.
-- Snapshots are automatic on every save (throttled 1/min, deduplicated). Delete a diagram via `rm` and the SQLite row + sidecar + Weaviate object cascade-clean automatically.
-- **Sidecars `<file>.meta.json` are git-tracked** by default — they're the portable metadata that travels with diagrams across machines. If you prefer not to track them, add `.claude/diagrams/**/*.meta.json` to `.gitignore`; sidecars regenerate deterministically from SQLite + file content via `vco rebuild-diagram-index`.
+**Isolated agents in another repo (lane reservations)**: an `isolation: "worktree"` agent normally gets a detached worktree of THIS project's repo at HEAD. When a lane's work belongs in another repo — this project itself on a chosen branch, or one of its enabled code folders (launcher: Identity tab → **Add code folder**) — reserve the worktree first, then dispatch the isolated agent:
 
-To disable diagrams for this project, toggle it off in the launcher's DiagramsTab — CLAUDE.md will re-render and this section will disappear.
+1. `python -m vco_lib.lane_reservation reserve --project <this project> --repo <repo> --base <commit> --branch <new-branch>` — prints a reservation id (`--id` to choose one, `--existing-path` to adopt a worktree of that repo you already created on that branch; `list` / `cancel --id` manage pending ones). The repo must be the project itself or an ENABLED code folder, checked through the launcher hub — with the hub down, reservations are refused (ordinary isolation is unaffected).
+2. Put the id in the lane's brief and dispatch **one isolated agent per message**: `worktree-guard` hands the OLDEST pending reservation to the next isolated launch, creating `<repo parent>/<repo name>.vco-lanes/<branch>-<id>` with `git worktree add -b <branch> … <base>`. A reservation expires after 15 minutes unused; one that fails validation at launch aborts the launch with the reason, never falling back to a worktree of this project.
+3. The agent is told its reservation id, worktree, repo, branch and base when it starts, and stops if its brief names a different id.
+4. Review the result. When the agent finishes, a worktree with changes or commits is KEPT for you to review and merge; an unchanged one is removed together with its new branch. An adopted (`--existing-path`) worktree is never removed.
+
+The harness holds only Edit/Write to the worktree — **Bash is not confined** — so the brief must keep every Bash command (`cd`, redirects, `git`) inside the worktree path.
 
 ---
 
-{{/if_module_active}}
 ## VCO-Managed Files
 
 This project's `.claude/hooks/`, `.claude/scripts/`, `.claude/agents/`, `.claude/skills/`, and `.claude/settings.json` are shipped by VCO (the orchestrator). To update them, use the launcher (this project's Settings page → **Update bundle**, or the Projects page → **⟳ Update all** for every project — Update all skips the orchestrator root when its bundle is already current, while this project's own Update bundle always runs) or run from the orchestrator root:

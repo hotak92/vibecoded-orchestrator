@@ -41,10 +41,11 @@ What this test pins
 
 The wrapper-MCP spawn (``python -m claude_mcp_servers.wrappers.mermaid_proxy``)
 is NOT exercised here because ``claude_mcp_servers/`` is not in the
-wheel by design (the wrappers are launcher-MCP infrastructure, not
-library code). The wrapper IS exercised by ``test_mermaid_proxy.py``
-and ``test_excalidraw_proxy.py``; the regression that THIS test guards
-is the import-time ``load_bundled_versions()`` failure, which is the
+wheel by design (the wrappers were launcher-MCP infrastructure, not
+library code). The wrapper WAS exercised, while the diagram wrappers
+still shipped (removed in v0.2.102), by ``test_mermaid_proxy.py`` and
+``test_excalidraw_proxy.py``; the regression that THIS test guards
+is the import-time ``load_bundled_versions()`` failure, which was the
 proximate cause of the wrapper ``SystemExit(1)``.
 
 Build mechanics
@@ -177,36 +178,6 @@ class WheelPackagingTests(unittest.TestCase):
             "it, vco_lib.install_mcp raises RuntimeError at import (it reads "
             "the table for the env allowlist, secret needles, default entry "
             "names, and deprecated registry).",
-        )
-
-    def test_wheel_includes_excalidraw_vendored_entrypoint(self) -> None:
-        """The Excalidraw wrapper proxy spawns Node on
-        ``vco_lib/excalidraw_mcp_fork/dist/mcp/index.js``. That file
-        must be in the wheel (vendored tree shipped along with vco_lib
-        per the v0.2.34 packaging fix)."""
-        assert self.wheel_path is not None
-        with zipfile.ZipFile(self.wheel_path) as z:
-            names = z.namelist()
-        self.assertIn(
-            "vco_lib/excalidraw_mcp_fork/dist/mcp/index.js", names,
-            "vco_lib/excalidraw_mcp_fork/dist/mcp/index.js MUST be in "
-            "the wheel — it's the Node entry point that "
-            "`claude_mcp_servers.wrappers.excalidraw_proxy` spawns. "
-            "Without it, the Excalidraw MCP can't start post-install.",
-        )
-
-    def test_wheel_includes_excalidraw_package_json(self) -> None:
-        """``install.py::_install_pinned_npm`` reads
-        ``<vendor-dir>/package.json`` for the file: pin path. The
-        vendored package.json must travel inside the wheel."""
-        assert self.wheel_path is not None
-        with zipfile.ZipFile(self.wheel_path) as z:
-            names = z.namelist()
-        self.assertIn(
-            "vco_lib/excalidraw_mcp_fork/package.json", names,
-            "vco_lib/excalidraw_mcp_fork/package.json MUST be in the "
-            "wheel — install.py reads it to resolve the vendored npm "
-            "package name + version for the file: pin install path.",
         )
 
     def test_wheel_does_NOT_ship_repo_root_bundled_toml_copy(self) -> None:
@@ -365,17 +336,20 @@ class WheelInstallRuntimeTests(unittest.TestCase):
         sibling of bundled_versions.py inside the wheel, so the
         default-path branch finds it and tomllib parses it cleanly.
 
-        Asserts non-empty parsed dict so a future regression that
+        Asserts a non-empty parsed dict so a future regression that
         ships an empty .toml (or the .toml at the wrong path inside the
-        wheel) also trips this test.
+        wheel) also trips this test. (v0.2.102: the [npm] table is
+        legitimately EMPTY — the four diagram pins were removed with the
+        diagrams integrations — so only the document being non-empty and
+        the [npx.playwright_mcp] pin surviving are asserted.)
         """
         code = (
             "from vco_lib.bundled_versions import load_bundled_versions; "
             "v = load_bundled_versions(); "
             "assert isinstance(v, dict), 'not a dict'; "
-            "assert 'npm' in v, 'no npm section'; "
-            "assert v['npm'], 'empty npm section'; "
-            "print('OK', len(v['npm']))"
+            "assert v, 'empty manifest'; "
+            "assert 'playwright_mcp' in v.get('npx', {}), 'no npx pin'; "
+            "print('OK', len(v))"
         )
         rc, stdout, stderr = self._run_in_venv(code)
         self.assertEqual(
@@ -406,25 +380,26 @@ class WheelInstallRuntimeTests(unittest.TestCase):
             f"stderr:\n{stderr}\nstdout:\n{stdout}",
         )
 
-    def test_resolve_pinned_package_works_post_wheel_install(self) -> None:
-        """End-to-end: simulate the FIRST thing the wrapper MCP does
-        in ``_resolve_upstream_argv`` — look up the mermaid_mcp pin
-        out of the loaded manifest. Pre-fix this failed with a
-        SystemExit(1) on RuntimeError; post-fix it should return the
-        pinned (package, version) tuple cleanly.
+    def test_playwright_mcp_pin_round_trips_post_wheel_install(self) -> None:
+        """End-to-end round-trip on the one pin left: the wheel-installed
+        ``vco_lib.playwright_mcp`` reads ``[npx.playwright_mcp]`` from the
+        wheel's manifest and composes the pinned registration argv. (The
+        former mermaid_mcp leg died with the diagram pins in v0.2.102, and
+        the ``[chromium] reuse_playwright`` leg with that retired marker.)
         """
         code = (
             "from vco_lib.bundled_versions import load_bundled_versions; "
-            "v = load_bundled_versions(); "
-            "spec = v['npm']['mermaid_mcp']; "
-            "assert spec['package'], 'no package field'; "
-            "assert spec['version'], 'no version field'; "
-            "print('OK', spec['package'], spec['version'])"
+            "from vco_lib import playwright_mcp; "
+            "spec = load_bundled_versions()['npx']['playwright_mcp']; "
+            "args = playwright_mcp.registration_entry()['args']; "
+            "assert args == ['-y', spec['package'] + '@' + spec['version'], "
+            "'--browser', spec['browser']], args; "
+            "print('OK', args)"
         )
         rc, stdout, stderr = self._run_in_venv(code)
         self.assertEqual(
             rc, 0,
-            f"mermaid_mcp pin resolution failed post-wheel-install: "
+            f"playwright_mcp pin round-trip failed post-wheel-install: "
             f"exit={rc}, stderr:\n{stderr}\nstdout:\n{stdout}",
         )
         self.assertIn("OK", stdout, f"unexpected stdout: {stdout!r}")

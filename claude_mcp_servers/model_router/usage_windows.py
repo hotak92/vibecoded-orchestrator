@@ -22,6 +22,10 @@ QwenCloud  none — no quota source       the gateway ledger's routed-token tota
                                         for the current month, COLLECTED into
                                         the snapshot's ``tokens`` block and
                                         never rendered (owner ruling 2026-09-28)
+Kimi Code  5h, monthly, monthly code    ``Vendor.quota_url`` (``x-api-key``
+                                        raw, the relayed client user-agent —
+                                        the same Cloudflare edge gate as its
+                                        messages endpoint, live 2026-10-07)
 ========== ============================ ======================================
 
 Four rules shape everything below.
@@ -83,7 +87,12 @@ from typing import Any, Awaitable, Callable, Mapping, Optional
 
 import aiohttp
 
-from .vendors import OAUTH_BETA, Vendor, vendor_display_name
+from .vendors import (
+    DEFAULT_ANTHROPIC_VERSION,
+    OAUTH_BETA,
+    Vendor,
+    vendor_display_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +116,7 @@ ANTHROPIC_USAGE_PATH = "/api/oauth/usage"
 SOURCE_OAUTH_USAGE = "oauth_usage"
 SOURCE_UNIFIED_HEADERS = "unified_headers"
 SOURCE_ZAI_QUOTA = "zai_quota"
+SOURCE_KIMI_USAGES = "kimi_usages"
 SOURCE_LEDGER = "gateway_ledger"
 
 #: Vendor states. ``pending`` = no refresh has completed yet; ``unconfigured``
@@ -155,6 +165,41 @@ def _percent(value: Any) -> Optional[float]:
     if not math.isfinite(number) or number < 0:
         return None
     return round(number, 1)
+
+
+def _number(value: Any) -> Optional[float]:
+    """Like :func:`_percent` but also accepts a NUMERIC STRING, unrounded.
+
+    Kimi's usages endpoint reports ``used`` / ``limit`` as strings ("9",
+    "100" — probe 2026-10-07), and the percent derived from them must not
+    be rounded before the division.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _fraction_percent(value: Any) -> Optional[float]:
+    """A 0–1 fraction (Kimi's ``used_ratio``) as a percent, else ``None``.
+
+    Two decimals, not :func:`_percent`'s one: a monthly ratio as small as
+    the probe's 0.0029 must survive as 0.29 % rather than round to 0.3.
+    """
+    number = _number(value)
+    if number is None:
+        return None
+    return round(number * 100.0, 2)
 
 
 def _reset_epoch(value: Any, *, millis: bool = False) -> Optional[float]:
@@ -381,6 +426,150 @@ def parse_zai_quota(payload: Any, *, now: float) -> "tuple[Optional[str], list[W
     return level, windows
 
 
+#: Kimi window identity, in snapshot/render order. The 5h id/label match the
+#: Z.ai convention (``("5h", "5h")``) so every consumer that already renders
+#: that window — the status line, the picker suffix, the launcher card —
+#: renders Kimi's the same way.
+_KIMI_WINDOWS: tuple[tuple[str, str], ...] = (
+    ("5h", "5h"),
+    ("monthly", "mo"),
+    ("monthly_code", "mo-code"),
+)
+#: The 5h window's ``window`` block in Kimi's answer: duration 300 with
+#: ``TIME_UNIT_MINUTE`` (5 x 60 minutes — probe 2026-10-07).
+_KIMI_5H_DURATION_MINUTES = 300
+_KIMI_TIME_UNIT_MINUTE = "TIME_UNIT_MINUTE"
+
+
+def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list[Window]]":
+    """``(None, windows)`` from Kimi Code's usages endpoint. Always yields
+    ``5h``, ``monthly`` and ``monthly_code``.
+
+    The live shape (probe 2026-10-07 with the owner's key, saved verbatim as
+    ``tests/fixtures/model_router/kimi-usages.json``): ``limits[]`` carries
+    the 5h window — ``window.duration`` 300, ``timeUnit TIME_UNIT_MINUTE``
+    — whose ``detail`` reports ``used`` / ``limit`` as STRINGS and a
+    ``resetTime``; ``usages.limit_month_total`` / ``limit_month_code``
+    carry a ``used_ratio`` FRACTION (x100 here) and a ``reset_time``. The
+    two 5h readings DISAGREED in the probe — ``usages.limit_5h.used_ratio``
+    read 0 while ``limits[0].detail`` read 9 of 100 used — so the 5h percent
+    is derived from ``limits[].detail`` and ``usages.limit_5h`` is
+    deliberately NOT read; the monthly windows have only the one reading.
+    Like every quota source this is undocumented, so each field is read
+    defensively: a missing or unparseable window is present and unknown,
+    never absent, never 0 %.
+    """
+    found: dict[str, Window] = {}
+    if isinstance(payload, Mapping):
+        limits = payload.get("limits")
+        if isinstance(limits, list):
+            for item in limits:
+                if not isinstance(item, Mapping):
+                    continue
+                window = item.get("window")
+                if not isinstance(window, Mapping):
+                    continue
+                if window.get("timeUnit") != _KIMI_TIME_UNIT_MINUTE:
+                    continue
+                if _number(window.get("duration")) != _KIMI_5H_DURATION_MINUTES:
+                    continue
+                detail = item.get("detail")
+                if not isinstance(detail, Mapping):
+                    continue
+                used = _number(detail.get("used"))
+                cap = _number(detail.get("limit"))
+                pct = (
+                    round(used * 100.0 / cap, 1)
+                    if used is not None and cap is not None and cap > 0
+                    else None
+                )
+                found.setdefault("5h", Window(
+                    "5h", "5h", pct,
+                    _reset_epoch(detail.get("resetTime")),
+                    SOURCE_KIMI_USAGES, now,
+                    None if pct is not None else UNKNOWN_NOT_REPORTED,
+                ))
+        usages = payload.get("usages")
+        if isinstance(usages, Mapping):
+            for key, window_id, label in (
+                ("limit_month_total", "monthly", "mo"),
+                ("limit_month_code", "monthly_code", "mo-code"),
+            ):
+                block = usages.get(key)
+                if not isinstance(block, Mapping):
+                    continue
+                pct = _fraction_percent(block.get("used_ratio"))
+                found.setdefault(window_id, Window(
+                    window_id, label, pct,
+                    _reset_epoch(block.get("reset_time")),
+                    SOURCE_KIMI_USAGES, now,
+                    None if pct is not None else UNKNOWN_NOT_REPORTED,
+                ))
+    windows = [
+        found.get(window_id) or _unknown(window_id, label, SOURCE_KIMI_USAGES, now)
+        for window_id, label in _KIMI_WINDOWS
+    ]
+    return None, windows
+
+
+# ── the per-vendor quota dialect (how each endpoint is asked and read) ────
+def _zai_quota_headers(key: str, user_agent: Optional[str]) -> Optional[dict[str, str]]:
+    """Z.ai's monitor endpoint: the RAW key in ``Authorization``, no scheme.
+
+    The documented community usage and the 2026-09-23 probe agree, and the
+    endpoint is not the vendor's Anthropic-shaped API, so ``auth_scheme``
+    does not apply. The relayed client user-agent is not sent: this
+    endpoint has no user-agent gate.
+    """
+    return {"Authorization": key, "Accept-Language": "en-US,en"}
+
+
+def _kimi_quota_headers(key: str, user_agent: Optional[str]) -> Optional[dict[str, str]]:
+    """Kimi's usages endpoint: ``x-api-key`` raw, plus the relayed client UA.
+
+    The vendor row's own auth shape. The endpoint sits behind the same
+    Cloudflare gate as the vendor's messages endpoint (403 "error code:
+    1010" to a library user-agent, 200 to a client one — live probe
+    2026-10-07, and the intermittent 403s the background refresh drew
+    07:48-08:25 that day), and the vendor's terms forbid passing the
+    gateway off as a different client, so a user-agent is RELAYED, never
+    invented. ``None`` — the skip signal — when no client user-agent has
+    been relayed yet (v0.2.102, X2): a UA-less fetch is a fetch the edge
+    refuses, so it is not sent at all and the vendor reads unknown with the
+    reason beside it, instead of 403-ing on every refresh until the first
+    chat or read relays one.
+    """
+    if not user_agent:
+        return None
+    return {
+        "x-api-key": key,
+        "anthropic-version": DEFAULT_ANTHROPIC_VERSION,
+        "User-Agent": user_agent,
+    }
+
+
+#: One dialect per quota vendor, keyed by vendor id: ``(headers builder,
+#: payload parser)``. The headers builder answers ``None`` when there is no
+#: HONEST way to ask right now (a user-agent-gated endpoint before any
+#: client user-agent has been relayed — the fetch is then SKIPPED, see
+#: :meth:`UsageWindows._refresh_quota_vendor`). A vendor with a
+#: ``quota_url`` and no entry speaks the
+#: Z.ai dialect — the one shape this module had before there was a second,
+#: and the shape a synthetic test row still exercises. Vendor names are
+#: allowed HERE (not in routing/catalog/secrets): this module is where the
+#: quota shapes live, beside ``parse_zai_quota``.
+_QUOTA_DIALECTS: Mapping[
+    str,
+    tuple[
+        Callable[[str, Optional[str]], Optional[dict[str, str]]],
+        Callable[..., "tuple[Optional[str], list[Window]]"],
+    ],
+] = {
+    "kimi": (_kimi_quota_headers, parse_kimi_usages),
+}
+_ZAI_QUOTA_DIALECT = (_zai_quota_headers, parse_zai_quota)
+
+
 # ── the ledger's month (for vendors with no quota source) ────────────────
 def month_start(now: float) -> float:
     """Local midnight on the first of the current month, as epoch seconds."""
@@ -543,6 +732,7 @@ class UsageWindows:
         self._next_due = 0.0
         self._last_refresh: Optional[float] = None
         self._last_activity: Optional[float] = None
+        self._client_user_agent: Optional[str] = None
         self._header_windows: dict[str, Window] = {}
         self._usage: dict[str, VendorUsage] = {
             ANTHROPIC_ID: VendorUsage(ANTHROPIC_ID, ANTHROPIC_LABEL, "Claude subscription"),
@@ -565,20 +755,41 @@ class UsageWindows:
     def refreshing(self) -> bool:
         return self._task is not None and not self._task.done()
 
-    def request_refresh(self) -> bool:
+    def request_refresh(self, user_agent: Optional[str] = None) -> bool:
         """A READ wants the numbers: schedule a background refresh if one is
-        due. Returns whether it did; never awaits the refresh."""
+        due. ``user_agent`` is the reading client's own, when the read is an
+        HTTP request — relayed onto a quota fetch whose vendor gates on it
+        (see :func:`_kimi_quota_headers`). Returns whether it scheduled a
+        refresh; never awaits it.
+        """
+        self._remember_client_user_agent(user_agent)
         return self._schedule_if_due()
 
-    def note_activity(self) -> bool:
+    def note_activity(self, user_agent: Optional[str] = None) -> bool:
         """Chat traffic just passed through: keep the cache warm.
 
         Called synchronously from ``/v1/messages`` on every request, so it is
         O(1) and never awaits: a timestamp, the due-check, and at most once
-        per interval a ``create_task``. Returns whether it scheduled one.
+        per interval a ``create_task``. ``user_agent`` is that client's own,
+        relayed as for :meth:`request_refresh`. Returns whether it scheduled
+        one.
         """
         self._last_activity = self._clock()
+        self._remember_client_user_agent(user_agent)
         return self._schedule_if_due()
+
+    def _remember_client_user_agent(self, user_agent: Optional[str]) -> None:
+        """Keep the most recent client user-agent a refresh signal carried.
+
+        A quota endpoint behind a client-identity gate (the kimi row) is
+        asked as the client whose read or traffic scheduled the refresh —
+        the same relay rule as the catalog fetch, and the honest one: the
+        gateway never invents a user-agent. Last writer wins; a signal
+        carrying none keeps what an earlier one saw. Never logged, never
+        snapshotted.
+        """
+        if user_agent:
+            self._client_user_agent = user_agent
 
     def _schedule_if_due(self) -> bool:
         """The ONE gate both signals go through. Due means: never refreshed,
@@ -652,16 +863,28 @@ class UsageWindows:
                 usage.state = STATE_UNCONFIGURED
             return
         assert vendor.quota_url is not None  # noqa: S101 — caller filters on it
-        status, payload = await self._fetch(
-            vendor.quota_url,
-            # RAW key, no scheme: the documented community usage and the
-            # 2026-09-23 probe agree, and the endpoint is not the vendor's
-            # Anthropic-shaped API, so ``auth_scheme`` does not apply.
-            {"Authorization": key, "Accept-Language": "en-US,en"},
+        headers_for, parse = _QUOTA_DIALECTS.get(
+            vendor.vendor_id, _ZAI_QUOTA_DIALECT,
         )
+        headers = headers_for(key, self._client_user_agent)
+        if headers is None:
+            # The dialect declined to ask: a user-agent-gated endpoint with
+            # no client user-agent relayed yet (v0.2.102, X2). Sending the
+            # UA-less fetch would 403 at the edge on every refresh until
+            # the first chat or read relays one — and a user-agent is
+            # relayed, never invented (vendor ToS), so the honest answer
+            # until then is unknown-with-a-reason, not a refusal loop.
+            _note_problem(
+                usage,
+                f"{vendor.vendor_id} usage source not asked: no client "
+                "user-agent relayed yet, and the vendor's edge refuses "
+                "library user-agents",
+            )
+            return
+        status, payload = await self._fetch(vendor.quota_url, headers)
         self._apply(
             usage, status, payload, vendor.vendor_id,
-            lambda body: parse_zai_quota(body, now=self._clock()),
+            lambda body: parse(body, now=self._clock()),
         )
 
     def _apply(
@@ -925,6 +1148,7 @@ __all__ = [
     "label_suffixes",
     "month_start",
     "parse_anthropic_usage",
+    "parse_kimi_usages",
     "parse_unified_headers",
     "parse_zai_quota",
     "render_line",

@@ -49,6 +49,7 @@ import pytest
 
 from vco_lib.codegraph_entities import KIND_CLASS, KIND_FUNCTION
 from vco_lib.codegraph_lang.cpp import extract_cpp_file
+from tests._codegraph_truth_harness import force_regex_definitions, treesitter_available
 
 
 class _Helpers:
@@ -360,7 +361,7 @@ def test_the_out_of_line_member_is_captured_exactly_once(tmp_path) -> None:
 
 
 def test_an_out_of_line_constructor_with_a_member_init_list_has_no_row(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     """THE ONE DOCUMENTED GAP THIS PACKAGE LEAVES OPEN — labelled.
 
@@ -376,14 +377,30 @@ def test_an_out_of_line_constructor_with_a_member_init_list_has_no_row(
     This is the assertion to INVERT if that call is reversed — it is the
     only one in this file that encodes the gap rather than the guard, and
     the ``count_`` / ``items_`` absences above stay correct either way.
+
+    v0.2.102: the gap is now REGEX-FALLBACK-ONLY. The tree-sitter definitions
+    layer (the shipped default) parses the constructor like any other
+    definition, so this test pins both: no row on the regex path, exactly one
+    row (owned by ``Gadget``) on the tree-sitter path. The corpus README's
+    'Known uncaptured shapes' section says the same.
     """
+    force_regex_definitions(monkeypatch)
     fx = _extract(tmp_path)
     ctors = [e for e in _functions(fx) if e.name == "Gadget"]
     assert ctors == [], (
-        "an out-of-line constructor now produces a row — intended? then "
-        "update the corpus README's 'Known uncaptured shapes' section in "
-        "the same change (R16), and invert this test"
+        "an out-of-line constructor now produces a row on the regex fallback — "
+        "intended? then update the corpus README's 'Known uncaptured shapes' "
+        "section in the same change (R16), and invert this assertion"
     )
+
+
+def test_an_out_of_line_constructor_is_captured_by_treesitter(tmp_path) -> None:
+    """The tree-sitter half of the gap above — the promise made true."""
+    if not treesitter_available("cpp"):
+        pytest.skip("codegraph-ts extra not installed")
+    fx = _extract(tmp_path)
+    ctors = [e.full_name for e in _functions(fx) if e.name == "Gadget"]
+    assert ctors == ["negatives.Gadget.Gadget"], ctors
 
 
 # ═══════════════════════════════════════════════════════════════════════════

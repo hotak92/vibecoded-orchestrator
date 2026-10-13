@@ -881,7 +881,8 @@ echo ""
 # recurring re-embed bug by running the diff-gate code path against a real
 # Weaviate (V46-B's live integration tests), not just unit tests with
 # mocked _batch_query_weaviate_content_hashes. SKIPs cleanly when Weaviate
-# is unreachable (CI without Weaviate).
+# is unreachable (CI without Weaviate). VCO_TEST_LIVE_WEAVIATE=1 is the
+# suite's explicit live opt-in (tests/conftest.py): without it the pin holds.
 LIVE_GATE_TEST="tests/test_v0246_v46b_live_ci10_diff_gate.py"
 if [ -f "$LIVE_GATE_TEST" ]; then
     echo "--- Live re-embed regression protection (V46-C) ---"
@@ -890,7 +891,7 @@ if [ -f "$LIVE_GATE_TEST" ]; then
         gate_warn "Live re-embed regression protection (V46-C)" \
             "SKIP — Weaviate not reachable at ${_WEAVIATE_PROBE_URL}; only enforced when Weaviate is up. This gate MUST pass on the release machine before tagging."
     else
-        if "${_PYTEST_CMD[@]}" -q "$LIVE_GATE_TEST" \
+        if VCO_TEST_LIVE_WEAVIATE=1 "${_PYTEST_CMD[@]}" -q "$LIVE_GATE_TEST" \
                 -k "V46BLiveDiffGateTest and three_rows_returns_three_entries" \
                 > /tmp/preship-live-diff.log 2>&1; then
             gate_pass "live diff-gate fetches stored hashes correctly"
@@ -899,7 +900,7 @@ if [ -f "$LIVE_GATE_TEST" ]; then
                 "See /tmp/preship-live-diff.log. The v0.2.42-v0.2.45 recurring re-embed bug is back."
         fi
 
-        if "${_PYTEST_CMD[@]}" -q "$LIVE_GATE_TEST" \
+        if VCO_TEST_LIVE_WEAVIATE=1 "${_PYTEST_CMD[@]}" -q "$LIVE_GATE_TEST" \
                 -k "V46BLivePruneTest and finds_and_deletes" \
                 > /tmp/preship-live-prune.log 2>&1; then
             gate_pass "live prune deletes stale rows"

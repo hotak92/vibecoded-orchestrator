@@ -1,6 +1,6 @@
 {
   "name": "vct-launcher",
-  "version": "0.2.101",
+  "version": "0.2.102",
   "description": "",
   "type": "module",
   "scripts": {
@@ -11,23 +11,18 @@
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "test": "vitest run",
     "test:watch": "vitest",
-    "build:excalidraw-editor": "node vendor/diagrams-editor/excalidraw/src/build.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
   },
   "license": "AGPL-3.0-or-later",
   "dependencies": {
-    "@excalidraw/excalidraw": "^0.18.1",
     "@supabase/supabase-js": "^2.106.2",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "graphology": "^0.26.0",
     "marked": "^18.0.4",
-    "mermaid": "11.17.2",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
     "sigma": "^3.0.3"
   },
   "devDependencies": {
@@ -49,9 +44,6 @@
     "devalue": ">=5.8.1",
     "lodash-es": "^4.18.1",
     "dompurify": ">=3.4.14",
-    "nanoid@3": "3.3.18",
-    "@excalidraw/mermaid-to-excalidraw": {
-      "nanoid": ">=5.0.9"
-    }
+    "nanoid@3": "3.3.18"
   }
 }

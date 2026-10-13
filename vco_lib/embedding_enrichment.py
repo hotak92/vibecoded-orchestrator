@@ -2,10 +2,11 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Idempotent enrichment migration for embed-slot changes (v0.2.18, Commit 9).
 
-When the user switches a project's KG or codegraph embedding model in the GUI
-dropdown (Commit 8), the schema-migration step (Commit 4) has already added
-the new named-vector slot to the live collection — but every existing object
-in that collection still has the OLD slot populated and the new slot empty.
+When the active embedding model changes (v0.2.18: a project's GUI dropdown;
+since v0.2.102: the one global Preferences embedding profile), the
+schema-migration step has already added the new named-vector slot to the live
+collection — but every existing object in that collection still has the OLD
+slot populated and the new slot empty.
 
 This module bridges the gap. It walks one Weaviate collection and, for each
 object whose target slot is empty, computes a vector via ``EmbeddingService``
@@ -44,10 +45,14 @@ Locked design decisions (from the v0.2.18 plan):
     what WOULD be enriched + skipped without making any writes. Failures
     are still raised during pre-flight (so the user gets a real signal
     rather than "well, it would have failed").
-  * **Progress streaming via callback**: the Tauri command wraps the CLI
-    invocation and parses ``--stream-progress`` JSON lines into
-    ``vct-enrichment-progress`` Tauri events. The Python side stays pure
-    and testable; the streaming logic is just a stdout printer.
+  * **Progress streaming via callback**: ``--stream-progress`` prints one
+    JSON progress line per batch to stdout before the final report. The
+    Python side stays pure and testable; the streaming logic is just a
+    stdout printer. (Historically the v0.2.18 Tauri wrapper parsed these
+    lines into ``vct-enrichment-progress`` events for a Svelte progress
+    modal; that wrapper, that event and that modal were retired in
+    v0.2.102 W6-J — the lines are now a plain operator affordance with no
+    in-repo consumer.)
 
 CLI entry::
 
@@ -81,9 +86,16 @@ report::
     {"progress": 0.16, "message": "..."}
     ...
 
-The Rust Tauri wrapper (``launcher/src-tauri/src/commands/embedding_enrichment.rs``)
-parses these lines and re-emits them as ``vct-enrichment-progress`` events for
-the Svelte progress modal.
+The ``--stream-progress`` lines are a generic operator affordance; nothing
+in this repo parses them anymore. The v0.2.18 Rust Tauri wrapper
+(``launcher/src-tauri/src/commands/embedding_enrichment.rs``) that
+re-emitted them as ``vct-enrichment-progress`` events for the Svelte
+progress modal was retired in v0.2.102 W6-J together with the model-switch
+modal. Enrichment is now triggered headless, superseded by the W6-I
+automatic additive fill (``vco_lib/kg_embed_model.py`` /
+``vco_lib/embed_slot_fill.py``) and install.py's CI-10 leg
+(:func:`enrich_collections_for_slot_change` below), which call this module
+without ``--stream-progress``.
 """
 
 from __future__ import annotations
@@ -324,11 +336,10 @@ def _weaviate_url() -> str:
 
 
 def _grpc_port() -> int:
-    """Default Weaviate gRPC port from env."""
-    try:
-        return int(os.environ.get("GRPC_PORT", "50052"))
-    except ValueError:
-        return 50052
+    """Default Weaviate gRPC port from env (any int; garbage -> 50052)."""
+    from vco_lib.env_values import env_int  # noqa: PLC0415 — the one env-int reader
+
+    return env_int("GRPC_PORT", 50052)
 
 
 def _http_get_schema(collection: str, base_url: str) -> Optional[dict]:
@@ -478,9 +489,12 @@ def enrich_collection_vectors(
         project_root: Forwarded to ``EmbeddingService.for_project()`` so
             the per-project env (KG_COLLECTION etc.) is picked up.
         progress_callback: Called with ``(pct, message)`` after each
-            batch. ``pct`` in ``[0.0, 1.0]``. Used by the Tauri shell-out
-            with ``--stream-progress`` to emit
-            ``vct-enrichment-progress`` events.
+            batch. ``pct`` in ``[0.0, 1.0]``. Used by the CLI's
+            ``--stream-progress`` flag to print one JSON progress line
+            per batch. No in-repo caller passes it anymore (the Tauri
+            shell-out was retired in v0.2.102 W6-J; the W6-I additive
+            fill and install.py's CI-10 leg run headless) — it stays as
+            the CLI's streaming hook.
         dry_run: When True, no writes happen. Counts what WOULD be
             enriched and skipped. The would-have-enriched count is
             returned via ``failures[0]["dry_run_count"]``.
@@ -540,11 +554,22 @@ def enrich_collection_vectors(
     live_vc = schema.get("vectorConfig") or {}
     if new_slot not in live_vc:
         present = sorted(live_vc.keys())
+        # v0.2.102 W6-B2: migrate-collections only plans CODE collections for
+        # an index-type change, so for them the remedy that actually adds the
+        # slot (additively) and fills it is the analyzer's explicit apply.
+        remedy = (
+            "Select the model in launcher Preferences → Code Graph Embeddings "
+            "(or the project's Codegraph tab) and re-run `.claude/scripts/"
+            f"code-graph-analyze . --project {collection_name.rpartition('_')[0]}` "
+            "— the analyzer adds the slot non-destructively and embeds only the "
+            "rows without it."
+            if is_code_collection(collection_name) else
+            "Run `python -m vco_lib.project_init migrate-collections "
+            "--name <project>` first to add the slot non-destructively."
+        )
         raise SlotNotInSchemaError(
             f"Slot {new_slot!r} is in the catalog but not in the live "
-            f"schema of {collection_name!r}. Live slots: {present}. "
-            f"Run `python -m vco_lib.project_init migrate-collections "
-            f"--name <project>` first to add the slot non-destructively."
+            f"schema of {collection_name!r}. Live slots: {present}. {remedy}"
         )
 
     # ── Pre-flight 4: EmbeddingService + backend reachability ───────────
@@ -554,7 +579,16 @@ def enrich_collection_vectors(
         # is reachable AND captures the failure into the JSONL log +
         # EMBEDDING_FAILURES.md hint. We don't catch — that's the
         # signal the user is supposed to see.
-        embedding_service = EmbeddingService.for_project(project_root=project_root)
+        # v0.2.102 W6-B2: a code collection is filled with ITS graph's TARGET
+        # model (the one resolver, write role); the walk below refuses a
+        # new_slot that is not that model's slot (it used to fill any slot
+        # with whatever model the env resolved).
+        prefix, _sep, _base = collection_name.rpartition("_")
+        embedding_service = EmbeddingService.for_project(
+            project_root=project_root,
+            codegraph_prefix=prefix if is_code_collection(collection_name) and _sep else None,
+            code_model_role="write",
+        )
 
     try:
         kind = "code" if is_code_collection(collection_name) else "text"
@@ -590,6 +624,13 @@ def enrich_collection_vectors(
             else embedding_service.text_vector_slot
         )
         same_active = active_slot == new_slot
+        if kind == "code" and not same_active:
+            raise SlotNotInSchemaError(
+                f"{collection_name!r}: slot {new_slot!r} is not the slot of this "
+                f"graph's selected code model ({getattr(embedding_service, 'code_model_id', '?')} → "
+                f"{active_slot!r}); a slot is only ever filled with its own "
+                "model's vectors. Select that model first."
+            )
 
         # ── Open Weaviate client ────────────────────────────────────
         if weaviate_client_factory is not None:
@@ -979,7 +1020,9 @@ def _estimate_object_count(collection: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Per-slot populated counts (powers the "keep previous model" modal option)
+# Per-slot populated counts (the read-only `slot-counts` CLI; its historical
+# GUI consumer, the "keep previous model" modal option, was retired in
+# v0.2.102 W6-J)
 # ---------------------------------------------------------------------------
 
 # Canonical text-slot -> embedding profile map.
@@ -990,11 +1033,14 @@ def _estimate_object_count(collection: str) -> int:
 # to its user-selectable profile id, and the profile ids must match the
 # ACTIVE_EMBEDDING profiles `active_profile_for_model` yields
 # (qwen3 / arctic / openai). TEXT_SLOT_MAP is model-substr -> slot -> dim;
-# THIS map is the inverse-ish slot -> profile projection the modal needs (we
-# only have a raw slot name from the Weaviate object, not a model id). Keep
-# them in sync — diverging them would mis-label the modal's "keep previous
-# model" default and write the wrong profile through
-# `set_project_active_embedding`. (An earlier version of this comment named
+# THIS map is the inverse-ish slot -> profile projection the `slot-counts`
+# CLI needs (we only have a raw slot name from the Weaviate object, not a
+# model id). Keep them in sync — diverging them would mis-label the
+# profile a populated slot belongs to in the `slot-counts` report. (Its
+# historical writers — the model-switch modal's "keep previous model"
+# default and `set_project_active_embedding` — were retired in v0.2.102
+# W6-J; nothing writes a profile from this map anymore, superseded by the
+# W6-I automatic additive fill. An earlier version of this comment named
 # `_text_partition_tag`, which does not exist — corrected v0.2.71.)
 _TEXT_SLOT_TO_PROFILE: dict[str, str] = {
     "qwen3_embed": "qwen3",
@@ -1014,7 +1060,7 @@ def _text_slot_to_profile(slot_name: str) -> Optional[str]:
 
     None means the slot is not a user-selectable text profile (e.g. a code
     slot, or an unknown future slot). The caller drops such slots from the
-    "keep previous model" choice set.
+    `slot-counts` report.
     """
     return _TEXT_SLOT_TO_PROFILE.get(slot_name)
 
@@ -1023,10 +1069,11 @@ def _text_slot_to_profile(slot_name: str) -> Optional[str]:
 # in `vco_lib/embedding_service.py` so it can never drift from it. For each
 # selectable profile we take the model id `_model_id_for_active` yields, then
 # resolve that model's slot via `text_slot_for_model` (the same resolver the
-# enrichment/embed path uses). This is the FORWARD direction the model-switch
-# "Regenerate now" needs: given the profile the user switched TO, which slot
-# must we enrich into. (The `_TEXT_SLOT_TO_PROFILE` map above is the reverse
-# projection used by the "keep previous" chooser.)
+# enrichment/embed path uses). This is the FORWARD direction
+# `slot-counts --for-profile` reports: given the profile being switched TO,
+# which slot must be enriched into. (The `_TEXT_SLOT_TO_PROFILE` map above is
+# the reverse projection; its historical "keep previous" chooser and the
+# model-switch "Regenerate now" button were retired in v0.2.102 W6-J.)
 def _profile_to_active_slot(profile: str) -> Optional[str]:
     """Return the CURRENT text named-vector slot a profile embeds into.
 
@@ -1102,13 +1149,15 @@ def count_populated_slots(
         }
 
     Only slots that map to a user-selectable text profile (see
-    ``_text_slot_to_profile``) are reported, so the modal's "keep previous
-    model" choice never proposes a code-only or legacy-opaque slot.
+    ``_text_slot_to_profile``) are reported, so the report never proposes
+    a code-only or legacy-opaque slot.
 
     Soft-fail: on any transport/connection failure returns the same shape
-    with ``total=0``, ``slots=[]`` and ``most_populated_profile=None`` so the
-    modal degrades to its 2-option form (no smart default) rather than
-    erroring. Counting must never gate the user's update flow.
+    with ``total=0``, ``slots=[]`` and ``most_populated_profile=None``
+    rather than erroring — counting is a read-only operator view and must
+    never block anything. (Historically this fed the retired model-switch
+    modal's smart default; v0.2.102 W6-J kept the CLI and dropped the
+    modal, superseded by the W6-I automatic additive fill.)
     """
     total = _estimate_object_count(collection)
 
@@ -1175,7 +1224,8 @@ def count_populated_slots(
                 "populated": populated,
             }
         )
-    # Most-populated profile drives the modal's smart default. Ties resolve
+    # Most-populated profile — the "keep previous model" smart default the
+    # retired modal used; still reported for operator visibility. Ties resolve
     # to the catalog order (stable) since `slots_out` preserves it.
     most_populated_profile: Optional[str] = None
     if slots_out:
@@ -1191,7 +1241,10 @@ def count_populated_slots(
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point (consumed by the Tauri shell-out)
+# CLI entry point (invoked as a subprocess by
+# `enrich_collections_for_slot_change` / install.py's CI-10 leg, and
+# directly by operators; the Tauri shell-out consumer was retired in
+# v0.2.102 W6-J)
 # ---------------------------------------------------------------------------
 
 
@@ -1376,8 +1429,9 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--stream-progress", action="store_true", default=False,
         help=(
             "Emit one JSON progress line per batch on stdout. The final "
-            "report is also a JSON line at end of stream. Tauri "
-            "wrapper consumes both."
+            "report is also a JSON line at end of stream. Operator "
+            "affordance: no in-repo consumer parses the progress lines "
+            "(the Tauri wrapper was retired in v0.2.102)."
         ),
     )
     enrich.add_argument(
@@ -1386,7 +1440,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
 
     # `slot-counts` — read-only per-slot populated counts for one collection.
-    # Powers the RegenerateOrDeferModal "keep previous model" smart default.
+    # An operator CLI since v0.2.102 W6-J retired its last GUI consumer (the
+    # model-switch modal's "keep previous model" smart default), superseded
+    # by the W6-I automatic additive fill.
     counts = sub.add_parser(
         "slot-counts",
         help="Per-slot populated-vector counts for one collection (read-only)",
@@ -1398,11 +1454,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     counts.add_argument(
         "--for-profile", default=None,
         help=(
-            "Optional: the profile the user is switching TO. When given, the "
-            "output also carries `target_slot` — the named-vector slot that "
-            "profile embeds into — so the model-switch modal's 'Regenerate "
-            "now' can enrich the collection into it without re-deriving the "
-            "profile->slot map on the frontend."
+            "Optional: the profile being switched TO. When given, the "
+            "output also carries `target_slot` — the named-vector slot "
+            "that profile embeds into — so a caller enriching into that "
+            "profile (an operator; historically the retired model-switch "
+            "modal's 'Regenerate now') doesn't re-derive the "
+            "profile->slot map."
         ),
     )
     return parser
@@ -1417,10 +1474,10 @@ def _cli_slot_counts(args: argparse.Namespace) -> int:
     """
     result = count_populated_slots(args.collection)
     # When the caller names the profile they're switching TO, resolve its
-    # current target slot (single-sourced from TEXT_SLOT_MAP) so the modal's
-    # "Regenerate now" can enrich into it. Soft: None on an unresolvable
-    # profile (unimportable embedding_service) — the modal then can't
-    # regenerate, only keep/defer, which it already handles.
+    # current target slot (single-sourced from TEXT_SLOT_MAP) so the caller
+    # can enrich into it without re-deriving the profile->slot map. Soft:
+    # None on an unresolvable profile (unimportable embedding_service) —
+    # the report then simply omits `target_slot`.
     if getattr(args, "for_profile", None):
         result["target_slot"] = _profile_to_active_slot(args.for_profile)
     sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")

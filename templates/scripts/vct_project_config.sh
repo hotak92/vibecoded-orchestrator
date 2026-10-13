@@ -798,6 +798,55 @@ sys.exit(0)
     return 1
 }
 
+# ── v0.2.102 W5-A (M3): infrastructure-declaration list renderer ────────
+# The three per-project declaration lists (`external_collections`,
+# `unmanaged_containers`, `ssrf_extra_local_ports`) are plain JSON arrays on
+# the wire; callers get one value per line, like code_graph_extra_paths.
+# Empty list → no stdout + exit 0. A pre-v0.2.102 hub does not know the key
+# and answers 404 field_not_found (exit 4), like any unknown field.
+# MUST MATCH the ps1 sibling and vco_lib/project_config.py::INFRA_LIST_FIELDS.
+_is_infra_list_field() {
+    case "$1" in
+        external_collections|unmanaged_containers|ssrf_extra_local_ports) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_render_value_list() {
+    local body="$1" field="$2"
+    if command -v jq >/dev/null 2>&1; then
+        local out
+        out=$(printf '%s' "$body" | jq -r --arg f "$field" \
+            '(.[$f] // []) | .[] | select(. != null) | tostring' 2>/dev/null) || {
+            _emit_warning "field_decode_failed" "jq failed to decode $field; body=$body"
+            return 4
+        }
+        if [[ -n "$out" ]]; then
+            printf '%s\n' "$out"
+        fi
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$body" | VCT_RENDER_FIELD="$field" python3 -c '
+import json, os, sys
+field = os.environ.get("VCT_RENDER_FIELD", "")
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(4)
+items = data.get(field) if isinstance(data, dict) else None
+if isinstance(items, list):
+    for v in items:
+        if v is not None:
+            sys.stdout.write(str(v) + "\n")
+sys.exit(0)
+'
+        return $?
+    fi
+    err "neither jq nor python3 found on PATH; cannot render $field"
+    return 1
+}
+
 # ── Main: fetch config ──────────────────────────────────────────────────
 fetch_config() {
     local pid="$1" field="${2:-}"
@@ -847,6 +896,10 @@ fetch_config() {
                 # observable behaviour as an explicit empty array.
                 if [[ "$field" == "code_graph_extra_paths" ]]; then
                     _render_extra_paths "$body" "$field"
+                    return $?
+                fi
+                if _is_infra_list_field "$field"; then
+                    _render_value_list "$body" "$field"
                     return $?
                 fi
                 # Single-field envelope: {"<field>": <value>}. Unwrap.

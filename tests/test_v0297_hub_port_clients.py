@@ -13,7 +13,7 @@ per ladder:
 
 * ``expect`` — a CLIENT's ladder (env pin → file → 7700): the Python reader
   ``vco_lib.hub_ensure.resolve_hub_port`` and its callers
-  (``vco verify-diagrams`` since R7b F3), every sh / ps1 client below, and
+  every sh / ps1 client below, and
   ``vct-cli`` (its own Rust test runs the same file).
 * ``expect_running`` — DESCRIBING the running hub (file → env → 7700):
   ``hub_ensure.running_hub_port`` (``install.py --bootstrap --json``, R7b F7)
@@ -38,6 +38,7 @@ from pathlib import Path
 import pytest
 
 from vco_lib import hub_ensure
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -130,18 +131,6 @@ def test_python_strict_file_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.parametrize("case", TABLE, ids=_IDS)
-def test_verify_diagrams_hub_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case) -> None:
-    """R7b F3(a): ``vco verify-diagrams`` check 5 used ``$VCT_HUB_PORT`` else
-    7700 and never read ``hub.port``."""
-    from vco_lib.cli import verify_diagrams
-
-    state = _state(tmp_path, case["file_port"])
-    _set_env_port(monkeypatch, case["env_port"])
-    monkeypatch.setenv("VCT_STATE_DIR", str(state))
-    assert verify_diagrams._vct_hub_base_url() == f"http://127.0.0.1:{case['expect']}"
-
-
-@pytest.mark.parametrize("case", TABLE, ids=_IDS)
 def test_install_hub_health_probe_port(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case) -> None:
     """R7b F3(b): install.py's health probe reads ``hub.port`` STRICTLY (no
     file / not a port → no probe at all). It gated on ``str.isdigit()``, which
@@ -209,7 +198,7 @@ def test_ps1_clients(tmp_path: Path, script, function, extra, stub, env_port, fi
     lib = tmp_path / "lib.ps1"
     lib.write_text(body, encoding="utf-8")
     assert _PWSH is not None
-    r = subprocess.run([_PWSH, "-NoProfile", "-NonInteractive", "-Command", f'. "{lib}"; {function}'],
+    r = subprocess.run([_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", f'. "{lib}"; {function}'],
                        env=_env(state, env_port), capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == str(expected), (script, r.stdout, r.stderr)

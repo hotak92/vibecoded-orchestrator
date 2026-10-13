@@ -45,6 +45,11 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11435")
 # Use 9B+ models only (quality matters for summaries)
 MODEL_CANDIDATES = ["qwen3.5:9b", "granite4:7b"]
 
+# The model `--provider haiku` sends to the Anthropic API — the current Haiku
+# (Haiku 4.5 is legacy since Haiku 5.5). One home: call_haiku() sends it and
+# main() records it as the run's model, so the two can never disagree.
+HAIKU_MODEL = "claude-haiku-5-5"
+
 # Knowledge base root (two levels up from this script, overridable via --knowledge-dir)
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
@@ -119,6 +124,11 @@ def get_available_models() -> list[str]:
         sys.exit(1)
 
 
+def _generation_candidates() -> list[str]:
+    """``MODEL_CANDIDATES`` led by the ladder's model (``_sb.OLLAMA_DEFAULT_MODEL``)."""
+    return list(dict.fromkeys([_sb.OLLAMA_DEFAULT_MODEL, *MODEL_CANDIDATES]))
+
+
 def pick_model(candidates: list[str], available: list[str]) -> str:
     """Pick the first candidate model that is available."""
     for model in candidates:
@@ -138,17 +148,26 @@ def call_ollama(model: str, prompt: str, num_predict: int) -> str:
     Uses think=False to disable chain-of-thought for models that support it
     (qwen3.x series). Without this, thinking tokens consume the budget and
     the response field is empty.
+
+    v0.2.102 W4-G: the body comes from the ONE generate-body builder
+    (``vco_lib.ollama_generate.generate_request_body``) — the shared
+    load-time options (``num_ctx``) keep the model ONE resident copy across
+    every VCO caller, and the shared keep_alive policy rides along. The
+    import is unguarded: a missing vco_lib is a broken install and must
+    fail loudly, not load a second runner with divergent options.
     """
+    from vco_lib.ollama_generate import generate_request_body
+
+    body = generate_request_body(
+        model,
+        prompt=prompt,
+        options={"temperature": 0.3, "num_predict": num_predict},
+        think=False,
+    )
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "think": False,
-                "options": {"temperature": 0.3, "num_predict": num_predict},
-            },
+            json=body,
             timeout=120,
         )
         resp.raise_for_status()
@@ -180,9 +199,16 @@ def call_haiku(prompt: str, max_tokens: int) -> str:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-haiku-4-5-20251001",
+                "model": HAIKU_MODEL,
                 "max_tokens": max_tokens,
-                "temperature": 0.3,
+                # v0.2.102 W4-G: NO `temperature`. The Claude 5.5 generation
+                # rejects non-default sampling params with a 400 (Opus 5.5:
+                # removed; Sonnet 5.5: non-default values rejected — Anthropic
+                # models reference as cached in the Claude API skill,
+                # 2026-09-25). Haiku 5.5 is not listed there, so its behaviour
+                # is unverified offline; the API default is sent instead of a
+                # value that may 400, matching the KG-summary API tier
+                # (summary_backends.call_api), which never sent one.
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=60,
@@ -292,6 +318,15 @@ def get_chunks_from_weaviate(title: str, file_path: str = "") -> list[tuple[int,
             )
         except Exception:
             kg_collection = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
+        # v0.2.102 W4-E: disable the weaviate-client PyPI version lookup
+        # (one home: weaviate_helpers.disable_weaviate_client_pypi_check —
+        # no dedicated client flag exists; the patch keeps every server
+        # health check intact). Guarded so a vco_lib-less run is unchanged.
+        try:
+            from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+            disable_weaviate_client_pypi_check()
+        except Exception:
+            pass
         client = weaviate.connect_to_local(host="localhost", port=8081, grpc_port=50052)
         try:
             coll = client.collections.get(kg_collection)
@@ -708,11 +743,14 @@ def main() -> None:
         if not os.environ.get("ANTHROPIC_API_KEY"):
             print("ERROR: ANTHROPIC_API_KEY not set. Required for --provider haiku.", file=sys.stderr)
             sys.exit(1)
-        model = "claude-haiku-4-5"
+        model = HAIKU_MODEL
         print("Using provider: Haiku (API)")
     else:
         available = get_available_models()
-        model = pick_model(MODEL_CANDIDATES, available)
+        # v0.2.102 W4-G: the machine's generation model as the KG-summary
+        # ladder resolves it comes FIRST, so node formats reuse the model the
+        # ladder keeps resident instead of loading a second one.
+        model = pick_model(_generation_candidates(), available)
         _ollama_model = model
         print(f"Using provider: Ollama ({model})")
 

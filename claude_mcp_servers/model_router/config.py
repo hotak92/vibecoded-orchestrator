@@ -103,7 +103,7 @@ Environment knobs (all optional; every one is read by code in this package)
     not a request ceiling — a body past it is forwarded upstream as a stream,
     unrewritten, never refused — so lowering it trades the rewrite for
     memory, and raising it does the reverse. A non-numeric or non-positive
-    value falls back to the default (:func:`_env_int`): an unbounded buffer
+    value falls back to the default (:func:`vco_lib.env_values.env_int`): an unbounded buffer
     is not a state a typo should be able to reach.
 """
 
@@ -116,6 +116,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from vco_lib.env_values import env_int
 from vco_lib.intfile import read_int_line
 from vco_lib.paths import claude_user_dir, vct_root_dir
 
@@ -231,6 +232,32 @@ UPSTREAM_CONNECT_TIMEOUT_S = 30
 #: two meanings.
 REWRITE_BUFFER_LIMIT_BYTES = 32 * 1024 * 1024
 
+#: The context guard's default safety margin, in tokens. The guard refuses a
+#: vendor-routed request whose ESTIMATED input exceeds ``context_window -
+#: margin`` with Anthropic's ``prompt is too long`` envelope, so the client
+#: compacts instead of retrying a request the vendor will always refuse (the
+#: 2026-10-06 incident: 983,981 tokens against qwen3.8-max's real 983,616
+#: ceiling, agent stuck). The margin exists because the guard's estimate is a
+#: FLOOR-biased figure (the previous turn's vendor-reported context, else a
+#: bytes/4 body estimate), not a token count: 8192 is one small turn of
+#: headroom. Env-tunable through :data:`CONTEXT_GUARD_MARGIN_ENV` because the
+#: right headroom is a per-workload judgement, not a constant the gateway can
+#: measure. Documented in ``docs/CONFIGURATION.md`` (gateway section).
+CONTEXT_GUARD_MARGIN_DEFAULT = 8192
+
+#: The env var that overrides :data:`CONTEXT_GUARD_MARGIN_DEFAULT`.
+CONTEXT_GUARD_MARGIN_ENV = "VCT_GATEWAY_CONTEXT_GUARD_MARGIN"
+
+
+def context_guard_margin() -> int:
+    """The context guard's margin, in tokens. Never raises.
+
+    An unset, non-numeric or non-positive value answers the default — the
+    knob is a tuning surface, and a typo in it must not turn the guard off
+    (``0`` would refuse at exactly the ceiling) or into an always-fire trap.
+    """
+    return env_int(CONTEXT_GUARD_MARGIN_ENV, CONTEXT_GUARD_MARGIN_DEFAULT, minimum=1)
+
 _TOKEN_BASENAME = "model-gateway.token"
 _PID_BASENAME = "model-gateway.pid"
 _PORT_BASENAME = "model-gateway.port"
@@ -276,17 +303,6 @@ FALLBACK_PORT_RANGE = range(11460, 11469)
 _STATE_SUBDIR = "model-gateway"
 _EXPORT_BASENAME = "chat_model_context.json"
 _LOG_BASENAME = "model-gateway.log"
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
 
 
 def token_path() -> Path:
@@ -344,14 +360,7 @@ def explicit_port() -> Optional[int]:
     is load-bearing: an explicit port is a pin and is never moved, while a
     RESOLVED one is a best guess and may fall back.
     """
-    raw = (os.environ.get("VCT_MODEL_GATEWAY_PORT") or "").strip()
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    return value if 1 <= value <= 65535 else None
+    return env_int("VCT_MODEL_GATEWAY_PORT", None, minimum=1, maximum=65535)
 
 
 def _read_port_file(path: Path) -> Optional[int]:
@@ -425,7 +434,7 @@ def resolve_catalog_filter() -> str:
     implements — a typo REFUSES to start rather than running as ``latest``
     and leaving the user to discover, some hours later, that the setting they
     made never took. That is the same judgement :func:`resolve_host` makes
-    and the opposite of :func:`_env_int`'s, deliberately: a bad number has a
+    and the opposite of :func:`vco_lib.env_values.env_int`'s, deliberately: a bad number has a
     safe value to fall back to, while a bad ENUM has only a wrong one.
 
     Case and surrounding space are forgiven; ``LATEST`` from a shell script
@@ -611,19 +620,21 @@ class GatewayConfig:
             token=token,
             credentials_file=credentials_path(),
             context_table_file=export_path(),
-            catalog_ttl_s=_env_int(
-                "VCT_MODEL_GATEWAY_CATALOG_TTL", DEFAULT_CATALOG_TTL_S,
+            # Positive ints; 0, negatives and garbage keep the default.
+            catalog_ttl_s=env_int(
+                "VCT_MODEL_GATEWAY_CATALOG_TTL", DEFAULT_CATALOG_TTL_S, minimum=1,
             ),
-            static_retry_ttl_s=_env_int(
-                "VCT_MODEL_GATEWAY_STATIC_RETRY_TTL", DEFAULT_STATIC_RETRY_TTL_S,
+            static_retry_ttl_s=env_int(
+                "VCT_MODEL_GATEWAY_STATIC_RETRY_TTL", DEFAULT_STATIC_RETRY_TTL_S, minimum=1,
             ),
-            key_ttl_s=_env_int("VCT_MODEL_GATEWAY_KEY_TTL", DEFAULT_KEY_TTL_S),
-            key_stale_max_age_s=_env_int(
-                "VCT_MODEL_GATEWAY_KEY_STALE_MAX_S", DEFAULT_SERVE_STALE_MAX_AGE_S,
+            key_ttl_s=env_int("VCT_MODEL_GATEWAY_KEY_TTL", DEFAULT_KEY_TTL_S, minimum=1),
+            key_stale_max_age_s=env_int(
+                "VCT_MODEL_GATEWAY_KEY_STALE_MAX_S", DEFAULT_SERVE_STALE_MAX_AGE_S, minimum=1,
             ),
-            rewrite_buffer_bytes=_env_int(
+            rewrite_buffer_bytes=env_int(
                 "VCT_MODEL_GATEWAY_REWRITE_BUFFER_BYTES",
                 REWRITE_BUFFER_LIMIT_BYTES,
+                minimum=1,
             ),
             secret_project=(
                 (os.environ.get("VCT_MODEL_GATEWAY_SECRET_PROJECT") or "").strip()
@@ -662,11 +673,14 @@ __all__ = [
     "FALLBACK_PORT_RANGE",
     "DEFAULT_UPSTREAM_IDLE_TIMEOUT_S",
     "REWRITE_BUFFER_LIMIT_BYTES",
+    "CONTEXT_GUARD_MARGIN_DEFAULT",
+    "CONTEXT_GUARD_MARGIN_ENV",
     "UPSTREAM_CONNECT_TIMEOUT_S",
     "SERVICE_NAME",
     "LAST_PORT_BASENAME",
     "GatewayConfig",
     "HostNotLoopbackError",
+    "context_guard_margin",
     "credentials_path",
     "explicit_port",
     "export_path",

@@ -302,26 +302,6 @@ def test_dev_collection_doc_delete_spares_token_superset_doc(
         assert removed == 1 and paths == ["docs/setup/README.md"]
 
 
-def test_tag_inference_reads_only_the_exactly_titled_link_target(sync_env):
-    """B3 follow-up: `[[uses::Weaviate]]` used to inherit the tags of whichever
-    title CONTAINING "weaviate" came first."""
-    mod, server, _root = sync_env
-    coll = server.client.collections.get(mod.COLLECTION_NAME)
-    coll.data.insert(properties={"title": "Weaviate Windows Ports Gotcha",
-                                 "chunk_num": 1, "tags": ["windows", "ports"]})
-    coll.data.insert(properties={"title": "Weaviate", "chunk_num": 1,
-                                 "tags": ["vector-db"]})
-    node = {"tags": [], "typed_links": [
-        {"relation_type": "uses", "target_title": "weaviate"},
-    ]}
-    assert mod.infer_tags_from_typed_links(server, node) == ["vector-db"]
-    # And no tags at all when only a CONTAINING title exists.
-    node_only_superset = {"tags": [], "typed_links": [
-        {"relation_type": "uses", "target_title": "Ports"},
-    ]}
-    assert mod.infer_tags_from_typed_links(server, node_only_superset) == []
-
-
 def test_wikilink_resolution_points_at_the_exact_title(sync_env):
     mod, server, _root = sync_env
     coll = server.client.collections.get(mod.COLLECTION_NAME)
@@ -402,28 +382,3 @@ class _DiagColl:
         self.rows.pop(uid, None)
 
 
-@pytest.mark.parametrize("mutated", [False, True], ids=["shipped", "red-proof"])
-def test_diagram_delete_spares_token_superset_diagram(mutate_exact_check, mutated):
-    from unittest import mock
-
-    from vco_lib import diagram_indexer as di
-
-    short = ".claude/diagrams/auth.mmd"
-    longer = ".claude/diagrams/auth-flow.mmd"
-    coll = _DiagColl([
-        SimpleNamespace(uuid="a", properties={"file_path": short}),
-        SimpleNamespace(uuid="b", properties={"file_path": longer}),
-    ])
-    client = SimpleNamespace(
-        collections=SimpleNamespace(get=lambda _name: coll), close=lambda: None,
-    )
-    if mutated:
-        mutate_exact_check()
-    with mock.patch("weaviate.connect_to_custom", return_value=client), \
-            mock.patch("weaviate.classes.query.Filter", _TokFilter):
-        assert di._weaviate_delete_by_file_path(
-            short, weaviate_url="http://localhost:8081",
-            collection_name="Proj_Diagrams",
-        )
-    remaining = sorted(r.properties["file_path"] for r in coll.rows.values())
-    assert remaining == ([] if mutated else [longer])

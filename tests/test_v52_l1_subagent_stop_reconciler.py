@@ -47,6 +47,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS_DIR = REPO_ROOT / "templates" / "hooks"
@@ -296,8 +297,13 @@ def _install_kg_sync_mock(project_root: Path, sidecar: Path) -> Path:
 
 def test_kg_sync_invoked_for_modified_knowledge_md(tmp_path):
     """When the diff includes a `knowledge/**/*.md` file, the reconciler
-    must invoke the project's `.claude/scripts/kg-sync` with the
-    absolute path of that file as the first argument."""
+    must invoke the project's `.claude/scripts/kg-sync` with that file.
+
+    v0.2.102 W6-C2 (census L1): the sync goes through the ONE routing home
+    (`_lib/route-touched-path.sh`: access gate + debounce + DETACHED runner,
+    no timeout) instead of an inline `timeout 30 kg-sync`, so the call lands
+    shortly AFTER the hook returns — the test polls for it (debounce window
+    pinned to 0 so it fires at once)."""
     project = _setup_project(tmp_path)
     agent_id = "T03-agent"
     sidecar = tmp_path / "kg_sync_calls.log"
@@ -327,12 +333,20 @@ def test_kg_sync_invoked_for_modified_knowledge_md(tmp_path):
             "stop_reason": "stop",
         },
         project,
+        extra_env={"VCO_KG_SYNC_DEBOUNCE_SECONDS": "0"},
     )
     assert stop_result.returncode == 0, (
         f"reconcile exited {stop_result.returncode}; "
         f"stderr={stop_result.stderr!r}")
 
-    calls = sidecar.read_text(encoding="utf-8").strip().splitlines()
+    import time as _time
+    deadline = _time.monotonic() + 30
+    calls: list = []
+    while _time.monotonic() < deadline:
+        calls = sidecar.read_text(encoding="utf-8").strip().splitlines()
+        if calls:
+            break
+        _time.sleep(0.2)
     assert calls, (
         "kg-sync mock was never invoked; "
         f"reconcile stdout={stop_result.stdout!r} stderr={stop_result.stderr!r}"
@@ -603,10 +617,10 @@ def test_credential_scan_emits_alert_on_aws_key(tmp_path):
 
     # 2. Subagent writes a file with the canonical AWS-test-key.
     leak = project / "src" / "leak.py"
-    # AKIAIOSFODNN7EXAMPLE is the AWS documentation example key —
+    # AKIAIOSFODNN7EXAMPLE is the AWS documentation example key —  # vco-secret-scan: test-placeholder
     # matches the `AKIA[A-Z0-9]{16}` pattern in credscan.sh.
     leak.write_text(
-        "AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'\n",
+        "AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'\n",  # vco-secret-scan: test-placeholder
         encoding="utf-8",
     )
 
@@ -943,7 +957,7 @@ def test_powershell_syntax_clean(ps1_file):
         "else { exit 0 }"
     )
     result = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command", probe],
+        ["pwsh", *PWSH_BASE_FLAGS, "-Command", probe],
         capture_output=True,
         text=True,
         timeout=15,
@@ -998,7 +1012,7 @@ def test_snapshot_schema_parity_sh_ps1(tmp_path):
         f"-SnapshotDir '{ps1_snap_dir}' | Out-Null"
     )
     ps1_result = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command", cmd],
+        ["pwsh", *PWSH_BASE_FLAGS, "-Command", cmd],
         capture_output=True,
         text=True,
         timeout=30,

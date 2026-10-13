@@ -878,6 +878,30 @@
           autocomplete="off"
         />
       </div>
+      {#if scope === 'per_project'}
+        <!-- v0.2.102 (OD-4 refinement, owner 2026-10-09): the ONE dedicated
+             name a project gives VCO its own OpenAI key under. A per-project
+             `openai_api_key` (the slot's own name) is never read for VCO, so
+             the sanctioned per-project name needs to be spelled FOR the user,
+             not discovered by them. The hint copy is pinned by
+             tests/test_v02102_per_project_openai_key.py (PANEL_HINT) and
+             SecretsPanel.wiring.test.ts — change all three together. -->
+        <div class="add-row key-suggest">
+          <button
+            type="button"
+            class="chip"
+            onclick={() => {
+              newKey = 'vco_openai_api_key';
+            }}
+            disabled={busy}
+            title="Fill the KEY field with the dedicated per-project name VCO reads"
+          >VCO OpenAI key</button>
+          <span class="key-suggest-hint">
+            <code>vco_openai_api_key</code> — used by VCO's OpenAI embedding
+            slot for this project; falls back to the shared VCO key
+          </span>
+        </div>
+      {/if}
       <div class="add-row">
         <input
           type="password"
@@ -1562,6 +1586,40 @@
     gap: 6px;
     margin-bottom: 6px;
     align-items: center;
+  }
+
+  /* v0.2.102 (OD-4 refinement): the "VCO OpenAI key" suggested-key row in
+     the per-project add form. A chip-shaped button + one hint line. */
+  .key-suggest {
+    flex-wrap: wrap;
+  }
+  .chip {
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(0, 191, 166, 0.4);
+    background: rgba(0, 191, 166, 0.12);
+    color: var(--color-teal, #00bfa6);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .chip:hover:not(:disabled) {
+    background: rgba(0, 191, 166, 0.22);
+  }
+  .chip:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .key-suggest-hint {
+    font-size: 11px;
+    color: #94a3b8;
+    line-height: 1.5;
+  }
+  .key-suggest-hint code {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    background: rgba(255, 255, 255, 0.06);
+    padding: 1px 4px;
+    border-radius: 3px;
   }
 
   .form-input {

@@ -38,6 +38,7 @@ from typing import Optional
 import pytest
 
 from vco_lib import codegraph_extras_refresh as cer
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = REPO_ROOT / "tests" / "fixtures" / "codegraph_extra_sync_argv.json"
@@ -52,7 +53,8 @@ def test_argv_matches_shared_fixture() -> None:
     cases = json.loads(FIXTURE.read_text(encoding="utf-8"))["cases"]
     assert len(cases) >= 4
     for c in cases:
-        got = cer.build_extra_sync_argv(c["path"], c["prefix"], c["incremental"], c["since_commit"])
+        got = cer.build_extra_sync_argv(
+            c["path"], c["prefix"], c["incremental"], c["since_commit"], c["primary_root"])
         assert got == c["argv"], c["name"]
 
 
@@ -121,7 +123,7 @@ def test_behind_reindexes_with_sync_argv_and_records_commit(tmp_path: Path) -> N
     rec = _Recorder({"/srv/clone": "b" * 40})
     out, lines = _drive(tmp_path, [_Extra("/srv/clone", True, "a" * 40)], rec)
     assert out == {"/srv/clone": "recorded"}
-    assert rec.runs == [cer.build_extra_sync_argv("/srv/clone", "Acme", True, "a" * 40)]
+    assert rec.runs == [cer.build_extra_sync_argv("/srv/clone", "Acme", True, "a" * 40, str(tmp_path))]
     assert rec.records == [("pid-1", "/srv/clone", "b" * 40, 3)]
     assert any(line.startswith("done path=/srv/clone") for line in lines), lines
     # The per-path lock is released.
@@ -131,7 +133,8 @@ def test_behind_reindexes_with_sync_argv_and_records_commit(tmp_path: Path) -> N
 def test_never_indexed_path_runs_a_full_pass(tmp_path: Path) -> None:
     rec = _Recorder({"/srv/new": "c" * 40})
     _drive(tmp_path, [_Extra("/srv/new", True, None)], rec)
-    assert rec.runs == [["/srv/new", "--project", "Acme", "--json-progress", "--as-extra-path"]]
+    assert rec.runs == [["/srv/new", "--project", "Acme", "--json-progress", "--as-extra-path",
+                         "--primary-root", str(tmp_path)]]
 
 
 def test_up_to_date_does_nothing(tmp_path: Path) -> None:
@@ -254,7 +257,9 @@ def test_end_to_end_real_git_and_runner(tmp_path: Path) -> None:
     cfg = _Cfg("pid-1", "Acme", (_Extra(str(clone), True, first),))
     lines: list = []
     out = cer.refresh_extras(
-        str(tmp_path), str(stub), sys.executable, tmp_path / "state", lines.append,
+        # The project's own folder sits BESIDE the clone (an extra nested in
+        # the project is refused by vco_lib.codegraph_extra_overlap).
+        str(tmp_path / "proj"), str(stub), sys.executable, tmp_path / "state", lines.append,
         deps=cer.Deps(
             resolve=lambda _r: cfg,
             record=lambda pid, p, c, res: (recorded.append((pid, p, c, res)) or (True, "recorded")),
@@ -263,7 +268,7 @@ def test_end_to_end_real_git_and_runner(tmp_path: Path) -> None:
     assert out == {str(clone): "recorded"}, lines
     assert json.loads(log.read_text().splitlines()[0]) == [
         str(clone), "--project", "Acme", "--json-progress", "--as-extra-path",
-        "--incremental", "--since-commit", first,
+        "--primary-root", str(tmp_path / "proj"), "--incremental", "--since-commit", first,
     ]
     (pid, p, c, res) = recorded[0]
     assert (pid, p, c) == ("pid-1", str(clone), head)
@@ -411,4 +416,4 @@ def test_sh_hook_spawns_refresh_without_a_queue(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not shutil.which("pwsh") or os.name == "nt", reason="pwsh (POSIX) required")
 def test_ps1_hook_spawns_refresh_without_a_queue(tmp_path: Path) -> None:
-    _hook_case(tmp_path, ["pwsh", "-NoProfile", "-File", str(DRAIN_PS1)])
+    _hook_case(tmp_path, ["pwsh", *PWSH_BASE_FLAGS, "-File", str(DRAIN_PS1)])

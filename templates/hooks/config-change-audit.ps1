@@ -1,4 +1,6 @@
-﻿# Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
+﻿# Parity: kept in step with config-change-audit.sh (this side parses JSON natively
+# via ConvertFrom-Json and never invokes Python; every behaviour must
+# match the .sh sibling; tests/test_v02102_w6w_hook_project_root.py runs both).
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -38,7 +40,12 @@ try {
     $payloadJson = (@{ _parse_error = $parseError; _raw_preview = $preview } | ConvertTo-Json -Compress)
 }
 
-$ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to do (no state is written).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectDir = Get-VcoProjectRoot
+if (-not $ProjectDir) { exit 0 }
 $LogFile = Join-Path $ProjectDir ".claude/logs/config_changes.jsonl"
 
 $LogDir = Split-Path $LogFile -Parent

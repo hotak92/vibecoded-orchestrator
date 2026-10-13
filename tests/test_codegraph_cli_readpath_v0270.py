@@ -520,10 +520,17 @@ class _FakeResponse:
 
 
 def _filter_matches(flt, props: dict) -> bool:
-    """Evaluate the two filter shapes the CLI builds. ``None`` matches
-    everything — which is precisely what the pre-fix candidate scan did."""
+    """Evaluate the filter shapes the CLI builds. ``None`` matches
+    everything — which is precisely what the pre-fix candidate scan did.
+    v0.2.102 L5: also the AND shape the exact-identity lookups build
+    (``full_name``/``path`` AND ``project``)."""
     if flt is None:
         return True
+    # _FilterAnd carries its operands on `.filters` (verified against
+    # weaviate-client 4.x) — recurse; None operands match everything.
+    operands = getattr(flt, "filters", None)
+    if operands is not None:
+        return all(_filter_matches(sub, props) for sub in operands)
     target = getattr(flt, "target", None)
     operator = str(getattr(flt, "operator", ""))
     value = getattr(flt, "value", None)

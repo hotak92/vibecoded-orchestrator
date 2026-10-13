@@ -64,10 +64,10 @@ RL_SECTION = "**RL retrieval reranking is active for this project**"
 # v0.2.101: the root template's diagrams bullet ("**mermaid** /
 # **excalidraw**" as registered MCP servers) was REMOVED — the wrapper MCPs
 # are no longer registered on install, so the bullet's claim was false on
-# every fresh install. The root template carries no diagrams conditional
-# any more (the PROJECT template keeps its true one — the Diagrams-tab
-# workflow section — and the `diagrams` module row stays default-on), so
-# the pinned expectation is now the bullet's ABSENCE.
+# every fresh install. v0.2.102 went further: the whole diagrams runtime is
+# dropped — neither template carries a diagrams conditional any more, and
+# the `diagrams` feature id left the resolver's vocabulary (the default-on
+# module set is now EMPTY). The pinned expectation is the bullet's ABSENCE.
 RETIRED_DIAGRAMS_MCP_BULLET = "- **mermaid** / **excalidraw**"
 
 
@@ -160,7 +160,7 @@ class TestRootRenderConditionalSections:
         never leak silently into the file every agent on the install reads."""
         root = _synthetic_root(tmp_path, template=(
             "<!-- BEGIN: AUTO -->\n"
-            "{{#if_module_active diagrams}}\n"
+            "{{#if_module_active some_module}}\n"
             "unclosed body\n"
             "<!-- END: AUTO -->\n").encode("utf-8"))
         # A pre-existing target must be left byte-identical (no partial write).
@@ -175,7 +175,7 @@ class TestRootRenderConditionalSections:
 
     def test_malformed_conditional_on_a_fresh_root_writes_nothing(self, tmp_path):
         root = _synthetic_root(tmp_path, template=(
-            "{{#if_module_active diagrams}}\nunclosed\n").encode("utf-8"))
+            "{{#if_module_active some_module}}\nunclosed\n").encode("utf-8"))
         with contextlib.redirect_stderr(io.StringIO()):
             outcome = rrf.render_entry(root, _root_entry())
         assert outcome.status == "failed"
@@ -203,9 +203,19 @@ class TestConservativeProbeFailures:
         settings.parent.mkdir(parents=True)
         settings.mkdir()
 
-        sections = cms.active_sections(folder)
+        sections = cms.active_sections(
+            folder,
+            # v0.2.102: ALL_FEATURES no longer contains a row-driven name
+            # (the ``diagrams`` id is gone), so the modules verdict only
+            # fires when the template actually carries such a tag — pass
+            # one explicitly, the way ``tagged_features`` would.
+            needed={"some_module", cms.MODEL_GATEWAY, cms.LEAN_CTX,
+                    cms.RL_RETRIEVAL},
+        )
         err = capsys.readouterr().err
-        assert {"diagrams", cms.MODEL_GATEWAY, cms.LEAN_CTX, cms.RL_RETRIEVAL} <= set(
+        # v0.2.102: the modules-verdict fallback is the (now EMPTY)
+        # default-on set, so only the three dedicated features render.
+        assert {cms.MODEL_GATEWAY, cms.LEAN_CTX, cms.RL_RETRIEVAL} <= set(
             sections)
         assert err.count("[vco] claude-md-sections:") == 4
         assert "project_modules probe failed" in err
@@ -476,29 +486,34 @@ class TestGatewaySectionRendersPayload:
 
 
 class TestModulesVerdictSource:
-    def test_diagrams_disabled_row_drops_it(self, tmp_path):
+    def test_disabled_row_keeps_module_out(self, tmp_path):
+        # v0.2.102: with an EMPTY default-on set (the ``diagrams`` member
+        # was removed), this pins the explicit-row path: a ``0`` row keeps
+        # the module out of the verdict.
         folder = tmp_path / "proj"
         folder.mkdir()
-        db = _db(tmp_path, "db-diag", folder, [("diagrams", 0)])
+        db = _db(tmp_path, "db-diag", folder, [("some_module", 0)])
         assert cms.active_sections(
-            folder, db_path=db, needed={"diagrams"}) == frozenset()
+            folder, db_path=db, needed={"some_module"}) == frozenset()
 
     def test_unregistered_folder_gets_the_default_on_set(self, tmp_path):
         folder = tmp_path / "proj"
         folder.mkdir()
         db = _db(tmp_path, "db-other", tmp_path, [])  # another folder registered
-        assert "diagrams" in cms.active_sections(
-            folder, db_path=db, needed={"diagrams"})
+        # v0.2.102: the default-on set is EMPTY — an unregistered folder
+        # resolves to no modules at all.
+        assert cms.active_sections(
+            folder, db_path=db, needed={"some_module"}) == frozenset()
 
     def test_project_id_override_skips_folder_resolution(self, tmp_path):
         folder = tmp_path / "proj"
         folder.mkdir()
-        db = _db(tmp_path, "db-pid", folder, [("diagrams", 0)])
+        db = _db(tmp_path, "db-pid", folder, [("some_module", 0)])
         # The override names the registered UUID directly — the row applies
         # even though nothing resolved the folder.
         assert cms.active_sections(
             folder, db_path=db, project_id=UUID,
-            needed={"diagrams"}) == frozenset()
+            needed={"some_module"}) == frozenset()
 
 
 class TestNeededFilter:
@@ -534,9 +549,9 @@ class TestNeededFilter:
 
     def test_tagged_features_reads_both_polarities(self):
         assert cms.tagged_features(
-            "{{#if_module_active diagrams}}\n{{/if_module_active}}\n"
+            "{{#if_module_active some_module}}\n{{/if_module_active}}\n"
             "{{#if_module_inactive model_gateway}}\n{{/if_module_inactive}}\n"
-            "plain {{UPPER_SNAKE}} stays out") == {"diagrams", "model_gateway"}
+            "plain {{UPPER_SNAKE}} stays out") == {"some_module", "model_gateway"}
 
 
 # ---------------------------------------------------------------------------
@@ -569,18 +584,23 @@ class TestBundlePathResolvesProjectUuid:
         assert "## Model routing" in text
         assert "{{#" not in text and "{{/if_" not in text
 
-    def test_diagrams_disabled_row_drops_the_section(self, tmp_path, monkeypatch):
+    def test_gateway_skip_row_drops_the_section(self, tmp_path, monkeypatch):
+        # v0.2.102 rewrite of the old diagrams-row test: with the diagrams
+        # section gone from the template, the live section an explicit
+        # ``project_modules`` row can DROP is the model-gateway routing
+        # section. Machine signal says configured (it would render); the
+        # explicit SKIP row must win through the UUID-resolved key.
         orch = _project_orch(tmp_path)
         project = tmp_path / "proj"
         project.mkdir()
-        db = _db(tmp_path, "db-diag", project, [("diagrams", 0)])
+        db = _db(tmp_path, "db-gw-off", project, [("model_gateway", 0)])
         monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(db))
-        _pin_machine_signal(monkeypatch, False)  # keep the gateway leg moot
+        _pin_machine_signal(monkeypatch, True)  # would render without the row
         pt.install_project_level_templates(
             project, orchestrator_root=orch, project_name="Proj", dry_run=False)
         text = (project / "CLAUDE.md").read_text(encoding="utf-8")
-        assert "## Diagrams (Mermaid + Excalidraw)" not in text
         assert "## Model routing" not in text
+        assert "{{#" not in text and "{{/if_" not in text
         # The rest of the managed body rendered.
         assert "## VCO Paths" in text
 
@@ -590,14 +610,14 @@ class TestBundlePathResolvesProjectUuid:
         orch = _project_orch(tmp_path)
         project = tmp_path / "proj"
         project.mkdir()
-        db = _db(tmp_path, "db-launcher", tmp_path, [("diagrams", 0)])
+        db = _db(tmp_path, "db-launcher", tmp_path, [("some_module", 0)])
         with contextlib.redirect_stderr(io.StringIO()):
             result = pt.render_claude_md(
                 project, orchestrator_root=orch, project_name="Proj",
                 project_id=UUID, db_path=db)
-        assert "diagrams" not in result["active_modules"]
+        assert "some_module" not in result["active_modules"]
         text = (project / "CLAUDE.md").read_text(encoding="utf-8")
-        assert "## Diagrams (Mermaid + Excalidraw)" not in text
+        assert "## VCO Paths" in text  # the managed body still rendered
 
 
 if __name__ == "__main__":

@@ -155,6 +155,7 @@ from vco_lib import deferral_dismissal as _deferral_dismissal  # noqa: E402
 from vco_lib import deferral_probes as _deferral_probes  # noqa: E402
 from vco_lib import deferral_registry as _deferral_registry  # noqa: E402
 from vco_lib import doctor as _doctor  # noqa: E402
+from vco_lib import playwright_mcp as _playwright_mcp  # noqa: E402
 from vco_lib import install_companions as _install_companions  # noqa: E402
 from vco_lib import manifest_paths as _manifest_paths  # noqa: E402
 from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
@@ -229,7 +230,7 @@ from vco_lib.symlink_handler import (  # noqa: E402
 # so in-module callers AND external importers (`install.select_*`, used by
 # tests/test_hardware_auto_selection.py +
 # tests/test_inference_pull_list_matches_summary_backend.py) keep working.
-# The five names carrying a per-line `pyright: ignore[reportUnusedImport]`
+# The names carrying a per-line `pyright: ignore[reportUnusedImport]`
 # have no in-module caller — they are RE-EXPORTS this module's public surface
 # owes to `tests/test_hardware_auto_selection.py`, which imports all sixteen
 # `from install import …`. Deleting them would break that suite and shrink a
@@ -244,7 +245,8 @@ from vco_lib.embedding_selection import (  # noqa: E402,F401
     _cpu_meets,  # pyright: ignore[reportUnusedImport] — re-export for tests
     select_code_embedding_backend,
     select_kg_embedding_backend,
-    select_summary_backend,
+    select_summary_backend,  # pyright: ignore[reportUnusedImport] — re-export (tests/test_hardware_auto_selection.py)
+    summary_model_for_hardware,
     _CODE_BACKEND_CODESAGE,
     _CODE_BACKEND_QWEN3,
     _CODE_BACKEND_JINA,  # pyright: ignore[reportUnusedImport] — re-export
@@ -253,10 +255,12 @@ from vco_lib.embedding_selection import (  # noqa: E402,F401
     _KG_BACKEND_ARCTIC,
     _KG_BACKEND_OPENAI,
     _SUMMARY_BACKEND_CLI,  # pyright: ignore[reportUnusedImport] — re-export
-    _SUMMARY_BACKEND_QWEN35_9B,
-    _SUMMARY_BACKEND_GEMMA,
+    _SUMMARY_BACKEND_QWEN35_9B,  # pyright: ignore[reportUnusedImport] — re-export
+    _SUMMARY_BACKEND_GEMMA,  # pyright: ignore[reportUnusedImport] — re-export
     _SUMMARY_BACKEND_OPENAI,  # pyright: ignore[reportUnusedImport] — re-export
 )
+from vco_lib.host_probe import (  # noqa: E402 — stdlib-only leaf (pre-venv safe)
+    probe_cpu_cores as _probe_cpu_cores, probe_system_ram_gb as _probe_system_ram_gb)
 # v0.2.77 5c task 2: install-time projection of the concurrency budget.
 from vco_lib.install_embed_concurrency import (  # noqa: E402
     finalize_embed_config_for_host as _finalize_embed_config_for_host,
@@ -504,8 +508,12 @@ class SystemInfo(NamedTuple):
 # Resume state (vco_lib.install_resume), loaded at the start of main(): the
 # last session's per-step phases + recorded data. Only "ok"/"skip" steps are
 # candidates, and each skip also needs its side-effect verifier to pass.
+# NB-10 (v0.2.102): the session is the ONE holder of the phases — the
+# import-time `_RESUME_STATE = _RESUME_SESSION.phases` alias is gone. It
+# snapshot the empty dict at import, so any reader that ran before main()
+# reloaded the session (tests, helpers) answered from stale state. Every
+# reader now goes through `_RESUME_SESSION` (reassigned, never copied).
 _RESUME_SESSION = _install_resume.Session()
-_RESUME_STATE: dict[str, str] = _RESUME_SESSION.phases
 _RESUME_ENABLED: bool = True
 
 # In-memory buffer for events emitted BEFORE Step 8 creates state/logs/.
@@ -1355,7 +1363,8 @@ def _bootstrap_compute_missing_prereqs(system_block: dict) -> list[dict]:
                 ),
             })
 
-    # Node/npm — required for Claude Code MCP layer + diagram MCP.
+    # Node/npm — required for the Claude Code MCP layer (npx-spawned
+    # playwright MCP).
     if not system_block["node"]["ok"]:
         out.append({
             "name": "node",
@@ -1726,8 +1735,12 @@ def _load_resume_state() -> dict[str, str]:
 
 def _should_skip_step(step: str) -> bool:
     """True iff resume is enabled AND the log says ``step`` completed (ok/skip).
-    A HINT only: :func:`_resume_verified` adds the side-effect verifier."""
-    return _install_resume.Session(enabled=_RESUME_ENABLED, phases=_RESUME_STATE).completed(step)
+    A HINT only: :func:`_resume_verified` adds the side-effect verifier.
+    NB-10: reads the LIVE ``_RESUME_SESSION`` (main() replaces it whole; its
+    ``enabled`` flag already carries ``_RESUME_ENABLED``), never a copy of its
+    phases — a copy taken at import would answer from the empty pre-main dict.
+    """
+    return _RESUME_SESSION.completed(step)
 
 
 def _resume_verified(step: str, label: str, verify) -> bool:
@@ -3249,12 +3262,17 @@ def _read_project_name_from_envfile(env_path: Path) -> str | None:
     ``export `` prefix — the form VCO's own ``.claude/env`` managed block
     writes, which the hand-rolled parse here missed until v0.2.97. The parse
     is the ONE line-level env parser (:func:`vco_lib.envfile.env_value`).
+
+    Read last-assignment-wins, like every other consumer of these files
+    (each shell that sources them, the hooks, the launcher's Rust reader): a
+    user's override after the ``.claude/env`` managed block is the name used
+    here too (v0.2.102; this took the FIRST before).
     """
     from vco_lib.envfile import env_value
 
     try:
         return env_value(env_path.read_text(encoding="utf-8", errors="replace"),
-                         "PROJECT_NAME") or None
+                         "PROJECT_NAME", last_wins=True) or None
     except OSError:  # includes a missing file
         return None
 
@@ -5385,12 +5403,14 @@ def main() -> int:
                              "package whose version drifted from "
                              "bundled_mcp_versions.toml back to the pinned "
                              "version. Without this flag, drift is detected and "
-                             "reported via UPDATE_DEFERRED.md (Phase 0 of "
-                             "the diagrams-integration plan, 2026-05-24) but "
-                             "the user's installed version is left untouched. "
-                             "Use this when you intentionally want VCO to "
-                             "overwrite an out-of-band `npm install -g` your "
-                             "shell history shows you ran.")
+                             "reported via UPDATE_DEFERRED.md but the user's "
+                             "installed version is left untouched. (v0.2.102: "
+                             "the [npm.*] pin set is currently EMPTY — the "
+                             "diagram wrappers were the last pins — so today "
+                             "this flag matches nothing; it stays for the next "
+                             "npm pin.) Use this when you intentionally want "
+                             "VCO to overwrite an out-of-band `npm install -g` "
+                             "your shell history shows you ran.")
     parser.add_argument("--rewrite-stale-mcps", action="store_true", default=False,
                         help="On --update, prompt for consent to rewrite any "
                              "~/.claude.json mcpServers entries whose paths point "
@@ -5861,10 +5881,9 @@ def main() -> int:
     # individual step functions can consult _should_skip_step(). The log
     # is at state/logs/install.jsonl — only present once Step 8 has run
     # at least once (i.e. on second+ install attempts on this checkout).
-    global _RESUME_ENABLED, _RESUME_STATE, _RESUME_SESSION
+    global _RESUME_ENABLED, _RESUME_SESSION
     _RESUME_ENABLED = not args.no_resume
     _RESUME_SESSION = _install_resume.load_session(_install_log_path(), enabled=_RESUME_ENABLED)
-    _RESUME_STATE = _RESUME_SESSION.phases
 
     print()
     print("=" * 62)
@@ -6311,39 +6330,18 @@ def main() -> int:
     # Step 10: Check Claude CLI
     _check_claude_cli()
 
-    # Cache Playwright MCP + Chromium so the default-enabled `playwright`
-    # MCP entry doesn't stall on first browser-launch with a 150 MB
-    # download. Non-fatal: only the CHROMIUM skip lazy-installs later; a
-    # missing-npx skip means the entry cannot spawn (see the docstring).
-    _install_playwright_browsers()
+    # Cache the PINNED Playwright MCP + the browser revision it requests, so
+    # the default-enabled `playwright` entry can launch a browser at all. A
+    # failed download defers `playwright_browser_missing`; a missing-npx skip
+    # means the entry cannot spawn (doctor: npx_missing_mcp_unspawnable).
+    _install_playwright_browsers(_deferral_report)
     _install_codegraph_treesitter(venv_python)  # Part 5: optional TS grammars
 
-    # Phase 1.2 (diagrams plan): pre-pin the `claude-mermaid` npm
-    # package at the version declared in `bundled_mcp_versions.toml`
-    # so the first Mermaid invocation doesn't pay the cold-install
-    # cost. Default-disabled per project (see BUNDLED_MCP_DEFAULT_
-    # DISABLED in vct-launcher-core); pre-installing here means
-    # opt-in is one click in the launcher, not a 30 s wait.
-    # Opt-out: VCT_SKIP_MERMAID=1.
-    # Non-fatal: returns False on skip / npm missing / pin mismatch; the
-    # VCO-owned wrapper then spawns upstream via `npx_resolver.
-    # package_run_argv` (npx ladder → `npm exec`), or exits 1 if neither.
-    _install_pinned_npm("mermaid_mcp", skip_env_var="VCT_SKIP_MERMAID")
-
-    # Phase 2 (diagrams plan): pre-pin the vendored Excalidraw MCP
-    # (see `bundled_mcp_versions.toml::[npm.excalidraw_mcp]`). The pin
-    # is a `file:` URL pointing at
-    # `vco_lib/excalidraw_mcp_fork/` (moved from
-    # `claude_mcp_servers/excalidraw_mcp_fork/` in v0.2.34 so the
-    # vendored tree ships in the Python wheel); the install branch in
-    # `_install_pinned_npm` calls `npm install -g <vendor-dir>` rather
-    # than fetching from the registry. Default-disabled per project
-    # (same posture as Mermaid). Opt-out: VCT_SKIP_EXCALIDRAW=1.
-    # Non-fatal: returns False on skip / npm missing / vendor missing;
-    # the wrapper still works at runtime via `node <vendor-entry>`
-    # because the wrapper spawns Node directly on the vendored path,
-    # bypassing the global install entirely if it didn't land.
-    _install_pinned_npm("excalidraw_mcp", skip_env_var="VCT_SKIP_EXCALIDRAW")
+    # v0.2.102: the mermaid / excalidraw diagram-MCP pre-pins were removed
+    # with the diagrams integrations (owner ruling 2026-10-07) — the wrapper
+    # modules, the vendored excalidraw fork and the `bundled_mcp_versions.toml`
+    # pins they consumed were all deleted. `_install_pinned_npm` itself stays
+    # (generic machinery; `vco verify-pins --fix` drives the same core).
 
     # Step 11: Initial code graph analysis (if repo has code)
     # Skipped on first install — user runs manually after setup
@@ -8045,49 +8043,9 @@ def _decide_gpu_mode(
     return "cpu"
 
 
-def _probe_system_ram_gb() -> float:
-    """Best-effort system RAM probe across Linux/macOS/Windows.
-
-    Uses `psutil` if available (fastest and most portable). Falls back
-    to /proc/meminfo on Linux, `sysctl hw.memsize` on macOS, and `wmic`
-    on Windows. Returns 0.0 on any failure — caller handles gracefully.
-    """
-    try:
-        import psutil  # type: ignore
-        return round(psutil.virtual_memory().total / (1024.0 ** 3), 2)
-    except ImportError:
-        pass
-    except Exception:
-        return 0.0
-
-    system = platform.system()
-    try:
-        if system == "Linux":
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        kb = int(line.split()[1])
-                        return round(kb / (1024.0 ** 2), 2)
-        elif system == "Darwin":
-            result = subprocess.run(
-                ["sysctl", "-n", "hw.memsize"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return round(int(result.stdout.strip()) / (1024.0 ** 3), 2)
-        elif system == "Windows":
-            result = subprocess.run(
-                ["wmic", "ComputerSystem", "get", "TotalPhysicalMemory"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    s = line.strip()
-                    if s.isdigit():
-                        return round(int(s) / (1024.0 ** 3), 2)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
-        pass
-    return 0.0
+# `_probe_cpu_cores` / `_probe_system_ram_gb` moved to vco_lib.host_probe
+# (v0.2.102 W5-D, second caller: the runtime summary-model resolver);
+# re-bound at the import block near the top under their historical names.
 
 
 # Inference model pull list for install-time.
@@ -8112,15 +8070,8 @@ def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
     uses (v0.2.23 C10), local tier only (CLI/OpenAI are not Ollama models):
     ``qwen3.5:9b`` / ``gemma4:e4b``, else the always-fits floor ``qwen3.5:0.8b``.
     """
-    summary_pick = select_summary_backend(
-        gpu_vram_gb=float(sysinfo.vram_gb or 0.0), ram_gb=float(sysinfo.ram_gb or 0.0),
-        cores=_probe_cpu_cores(), claude_cli_available=False,
-        openai_consent=False, openai_key_available=False)
-    if summary_pick == _SUMMARY_BACKEND_QWEN35_9B:
-        return ["qwen3.5:9b"]
-    if summary_pick == _SUMMARY_BACKEND_GEMMA:
-        return ["gemma4:e4b"]
-    return ["qwen3.5:0.8b"]
+    return [summary_model_for_hardware(
+        float(sysinfo.vram_gb or 0.0), float(sysinfo.ram_gb or 0.0), _probe_cpu_cores())]
 
 
 # ---------------------------------------------------------------------------
@@ -8148,52 +8099,6 @@ def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _probe_cpu_cores() -> int:
-    """Best-effort PHYSICAL CPU-core count, cross-OS.
-
-    v0.2.49: switched from logical=True (counts SMT threads) to
-    logical=False (counts physical cores) after post-update validation on a
-    contributor's Windows box showed the embedding-model auto-selector tier-up'd to
-    qwen3 on a host where the logical count (16) crossed the >=8
-    threshold even though the actual physical cores (8) were exactly at
-    the boundary — qwen3-embedding on CPU-only Ollama takes ~30s per
-    embedding, so the selector should require margin, not just count
-    HyperThreads. Embedding throughput on CPU is gated by physical
-    arithmetic units, not thread count.
-
-    Prefers `psutil.cpu_count(logical=False)` (returns the PHYSICAL
-    core count; cross-OS, handles cgroup limits on Linux containers,
-    docs explicitly: "the number of physical cores only"). Falls back to
-    `os.cpu_count() // 2` (a conservative estimate assuming SMT, which
-    is true on most modern Intel/AMD desktops + Apple Silicon's
-    performance/efficiency split where logical count overstates
-    embedding-capable cores). Returns 0 on any probe failure — the
-    selectors treat 0 as "low-end CPU" (drops to the smaller-model
-    tier), which is the conservative direction (better to under-spec
-    than over-promise).
-    """
-    try:
-        import psutil  # type: ignore
-        n = psutil.cpu_count(logical=False)
-        if n and n > 0:
-            return int(n)
-        # psutil returns None on some hypervisors / containers when
-        # physical-core probing isn't supported. Fall through to
-        # os.cpu_count() // 2 as a conservative estimate.
-    except ImportError:
-        pass
-    except Exception:
-        return 0
-    try:
-        n = os.cpu_count()
-        if n and n > 0:
-            # Conservative: assume SMT/HT, halve the logical count.
-            # On non-SMT hardware this under-counts by 2x, which is the
-            # safer direction (we drop to a smaller model tier).
-            return max(1, int(n) // 2)
-        return 0
-    except Exception:
-        return 0
 
 
 def _lspci_has_vendor(vendor_substr: str) -> bool:
@@ -9698,7 +9603,8 @@ def _write_preset_defaults_to_app_state(
 ) -> None:
     """Seed the launcher's `app_state` table with the install-time
     embedding-model defaults so the GUI dropdowns pre-populate for
-    brand-new projects.
+    brand-new projects, plus the global `embedding.active_profile` when no
+    profile is set yet (v0.2.102 W6-R).
 
     Ordering constraint: if install.py runs BEFORE the launcher has
     ever been started (fresh first-install), the launcher.db file does
@@ -9794,6 +9700,23 @@ def _write_preset_defaults_to_app_state(
                 (_APP_STATE_KEY_DEFAULT_CODE_EMBED, code_model, now_ms),
             )
             code_inserted = cur.rowcount > 0
+            # v0.2.102 W6-R: also seed the ONE global embedding profile
+            # (`embedding.active_profile`) from the text model chosen above,
+            # mapped through the shared model→profile table. Same DO NOTHING
+            # semantic: a profile the user set in Preferences is never
+            # overwritten; an unmapped model seeds nothing (never a guess).
+            from vco_lib.launcher_db_reader import (
+                APP_STATE_KEY_ACTIVE_EMBEDDING, profile_for_text_model,
+            )
+            profile = profile_for_text_model(text_model)
+            profile_inserted = False
+            if profile:
+                cur.execute(
+                    "INSERT INTO app_state (key, value, updated_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING",
+                    (APP_STATE_KEY_ACTIVE_EMBEDDING, profile, now_ms),
+                )
+                profile_inserted = cur.rowcount > 0
             # v0.2.77 5c task 2: seed the hardware-derived concurrency knobs.
             _seed_concurrency_app_state(cur, embed_config, now_ms)
             conn.commit()
@@ -9814,13 +9737,16 @@ def _write_preset_defaults_to_app_state(
             "preset_defaults", "ok",
             f"app_state defaults seeded "
             f"(active={active}, text={text_model}, code={code_model}, "
-            f"text_inserted={text_inserted}, code_inserted={code_inserted})",
+            f"text_inserted={text_inserted}, code_inserted={code_inserted}, "
+            f"profile={profile}, profile_inserted={profile_inserted})",
             data={
                 "active_embedding": active,
                 "default_text_embedding": text_model,
                 "default_code_embedding": code_model,
                 "text_inserted": text_inserted,
                 "code_inserted": code_inserted,
+                "active_profile": profile,
+                "profile_inserted": profile_inserted,
                 "db_path": str(db_path),
             },
         )
@@ -10056,8 +9982,8 @@ def _read_active_embedding_from_app_state() -> "str | None":
     """v0.2.52 V52-AJ: return the launcher's active embedding profile, or None.
 
     Reads ``app_state[embedding.active_profile]`` (canonical key written by
-    the launcher's Identity-tab embedding selector + install.py's preset
-    seeding). ``None`` when the DB / table / key is absent, the stored
+    the launcher's Preferences → "Embedding profile (global)" selector, the
+    only embedding selector since v0.2.102). ``None`` when the DB / table / key is absent, the stored
     value is empty after stripping, or any sqlite error fires (soft-fail
     throughout — callers treat ``None`` as "use env or default").
 
@@ -10253,7 +10179,7 @@ def _reconcile_install_active_embedding(
         or getattr(args, "low_resource", False)
         or getattr(args, "cpu_only", False)
     )
-    #   (b) a launcher.db embedding.active_profile value (GUI Identity tab)
+    #   (b) a launcher.db embedding.active_profile value (Preferences → Embedding profile (global))
     db_choice = _read_active_embedding_from_app_state()
     deliberate = cli_flag or bool(db_choice)
 
@@ -10651,7 +10577,7 @@ def _pip_install_flags() -> list[str]:
 #   - _install_requirements: pip upgrade, pip install -r, pip install -e
 #     (root), pip install -e (claude_mcp_servers)  [4 sites]
 #   - _install_pinned_npm: npm install -g                                [1]
-#   - _install_playwright_browsers: npx + playwright install             [2]
+#   - _install_playwright_browsers: pinned MCP fetch + its browser install [2]
 #   - _compile_python_modules: python -m compileall                      [1]
 #
 # Other ~30 sites can migrate incrementally in v0.2.54+ as they're touched
@@ -11031,7 +10957,7 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 
 def _materialize_orchestrator_self_claude_md(
     install_root: Path,
-    deferral_report: "Optional[DeferralReport]" = None,
+    deferral_report: "DeferralReport | None" = None,
 ) -> None:
     """v0.2.50 Track A / v0.2.95 R1 — step 4c: render every RENDERED ROOT FILE.
 
@@ -11771,9 +11697,16 @@ def _start_services(
                     print(f"    [start] {label}: not detected")
 
     # Determine which compose services need to start.
-    # If --gpu, we additionally bring up code_embed (gated on the gpu profile +
-    # overlay file). On CPU-only setups the service uses Ollama as code embed
-    # backend and code_embed is intentionally skipped.
+    # v0.2.102 W6-B2 (owner rule 2026-10-10 — serving follows the model): the
+    # code_embed container serves ONLY CodeSage, so it is started on a GPU
+    # host where a code model in use is CodeSage; jina / qwen3 graphs are
+    # embedded by Ollama directly. ONE decision
+    # (vco_lib.code_embed_serving.code_embed_in_stack), also projected to
+    # infrastructure/.env as CODE_EMBED_IN_STACK for the hub watchdog.
+    from vco_lib.compose_env import code_embed_container_in_stack  # noqa: PLC0415
+
+    code_embed_wanted = code_embed_container_in_stack(
+        {**embed_config, "has_gpu": bool(sysinfo.has_gpu)})
     services_to_start: list[str] = []
     # v0.2.61: our OWN vct-managed adopts are force-recreated so a changed
     # compose config applies on --update; foreign adopts NEVER are. A recreate
@@ -11786,7 +11719,7 @@ def _start_services(
         from vco_lib.service_lifecycle import compose_services  # noqa: PLC0415
         services_to_start = [
             s for s in compose_services(_SERVICE_ENDPOINTS["rows"])
-            if s != "code_embed" or sysinfo.has_gpu
+            if s != "code_embed" or code_embed_wanted
         ]
     elif decisions:
         # Decision-driven: only bring up services where the action is start
@@ -11794,7 +11727,7 @@ def _start_services(
         # do NOT get a compose START — but a vct-managed adopt DOES get a
         # force-recreate so a changed compose config is applied (v0.2.61).
         for svc in ("weaviate", "ollama", "code_embed"):
-            if svc == "code_embed" and not sysinfo.has_gpu:
+            if svc == "code_embed" and not code_embed_wanted:
                 continue
             d = decisions.get(svc, {})
             disposition = _classify_service_compose_action(
@@ -12157,11 +12090,6 @@ _development_class_definition = _project_init._development_class_definition
 _SAFE_CLASS_RE = _project_init._SAFE_CLASS_RE
 _derive_project_kg_name = _project_init._derive_project_kg_name
 _derive_project_dev_name = _project_init._derive_project_dev_name
-# fix/a1-indexing-pipeline (2026-05-25) — path-based Diagrams name
-# derivation, matching the KG / Dev helper shape so _ensure_collections
-# can include the diagrams class in its bootstrap pass.
-_derive_project_diagrams_name = _project_init._derive_project_diagrams_name
-_diagrams_class_definition = _project_init._diagrams_class_definition
 
 
 def _derive_orchestrator_project_name() -> str:
@@ -12456,10 +12384,9 @@ def _weaviate_ready_deadline_seconds() -> float:
     user who overrode the env sees the deadline that actually applied.
     Explicit-empty / garbage env values fall back to the default.
     """
-    try:
-        return float(os.environ.get("WEAVIATE_READY_TIMEOUT") or WEAVIATE_READY_TIMEOUT)
-    except (TypeError, ValueError):
-        return float(WEAVIATE_READY_TIMEOUT)
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    return env_float("WEAVIATE_READY_TIMEOUT", float(WEAVIATE_READY_TIMEOUT))
 
 
 def _wait_for_weaviate_ready(
@@ -12577,14 +12504,9 @@ def _ensure_collections(embed_config: dict,
     else:
         dev_name = _derive_project_dev_name(PROJECT_ROOT)
 
-    # Per-project Diagrams collection (Phase 1.5 — fix/a1-indexing-
-    # pipeline 2026-05-25). Resolution mirrors KG / Dev: env var
-    # overrides, else path-based derivation.
-    env_diagrams = os.environ.get("DIAGRAMS_COLLECTION")
-    if env_diagrams:
-        diagrams_name = env_diagrams
-    else:
-        diagrams_name = _derive_project_diagrams_name(PROJECT_ROOT)
+    # v0.2.102: the per-project Diagrams collection resolution was removed
+    # with the diagrams integrations — the install no longer creates or
+    # projects `<Project>_Diagrams`. Existing collections stay untouched.
 
     # Cross-project shared KG. All vibecoded installs read from the same shared
     # collection name (default "VibeCodedOrchestrator_KnowledgeGraph" since
@@ -12677,7 +12599,6 @@ def _ensure_collections(embed_config: dict,
 
     kg_name = _resolve_existing_casing(kg_name)
     dev_name = _resolve_existing_casing(dev_name)
-    diagrams_name = _resolve_existing_casing(diagrams_name)
     if shared_name:
         shared_name = _resolve_existing_casing(shared_name)
 
@@ -12694,7 +12615,6 @@ def _ensure_collections(embed_config: dict,
     # casing so .env writes and binding rows match what Weaviate actually has.
     os.environ["KG_COLLECTION"] = kg_name
     os.environ["DEVELOPMENT_COLLECTION"] = dev_name
-    os.environ["DIAGRAMS_COLLECTION"] = diagrams_name
     if shared_name:
         os.environ["SHARED_KG_COLLECTION"] = shared_name
 
@@ -12706,11 +12626,6 @@ def _ensure_collections(embed_config: dict,
     required: list[tuple[str, "Callable[..., dict]"]] = [
         (kg_name, _kg_class_definition),
         (dev_name, _development_class_definition),
-        # fix/a1-indexing-pipeline (2026-05-25): include the Diagrams
-        # class in the self-install bootstrap so the orchestrator clone
-        # has somewhere to write when the user starts saving .mmd /
-        # .excalidraw files. Symmetric with project_init.bootstrap_collections.
-        (diagrams_name, _diagrams_class_definition),
     ]
     # Shared cross-project KG. Same schema as the per-project KG (the MCP
     # server reads them with the same shape). Created once per Weaviate
@@ -12857,79 +12772,11 @@ def _ensure_collections(embed_config: dict,
                   "failed": [{"name": n, "error": e[:200]} for n, e in failed]},
         )
 
-    # V0243-18: warn when the Diagrams collection was just created (or
-    # already existed) but no .mmd / .excalidraw sources are present in
-    # the project. Users won't get useful results from describe_excalidraw
-    # or diagram-search skills until diagrams exist on disk.
-    _warn_if_diagrams_empty(diagrams_name, weaviate_url)
-
-
-def _warn_if_diagrams_empty(diagrams_name: str, weaviate_url: str) -> None:
-    """V0243-18 — Emit an install-log warning when the Diagrams collection
-    has been bootstrapped but contains 0 rows and no .mmd / .excalidraw
-    source files exist under ``.claude/diagrams/``.
-
-    Skills like ``describe_excalidraw`` and diagram-search will return
-    nothing until diagrams are created. The warning surfaces this so the
-    user understands why the feature appears "empty" on a fresh install.
-
-    Soft-fail throughout: transport errors, missing collection, or a
-    Weaviate count-query failure are all treated as "unknown" and the
-    warning is suppressed (we don't want false positives).
-
-    Idempotent: emits only a log line (no deferral entry — this is
-    informational, not actionable in the same way as a schema drift).
-    """
-    if not diagrams_name:
-        return
-
-    # Count .mmd + .excalidraw files under .claude/diagrams/.
-    diagrams_dir = PROJECT_ROOT / ".claude" / "diagrams"
-    source_count = 0
-    if diagrams_dir.is_dir():
-        for ext in ("*.mmd", "*.excalidraw"):
-            source_count += len(list(diagrams_dir.rglob(ext)))
-
-    if source_count > 0:
-        # Sources exist — collection will be populated; no warning needed.
-        _log_install_event(
-            "7b/10", "info",
-            f"diagrams_empty_check: {source_count} source file(s) found under "
-            f".claude/diagrams/ — no empty-collection warning",
-            data={"diagrams_collection": diagrams_name,
-                  "source_count": source_count},
-        )
-        return
-
-    # No sources. Try to get the Weaviate object count to distinguish
-    # "just created / genuinely empty" from "creation failed" (failed →
-    # count unknown → skip warning).
-    from vco_lib.project_init import _http_count_objects
-    count = _http_count_objects(diagrams_name, weaviate_url=weaviate_url)
-
-    if count is None:
-        # Unknown — Weaviate unreachable or collection absent; skip.
-        return
-
-    if count > 0:
-        # Has objects but no on-disk sources (e.g. reinstall after manual
-        # diagram creation). Not a problem — no warning.
-        return
-
-    # count == 0 AND no on-disk sources → user hasn't created diagrams yet.
-    print(
-        f"  WARN [7b/10] Diagrams collection `{diagrams_name}` is empty: "
-        f"no .mmd / .excalidraw sources found under .claude/diagrams/. "
-        f"Skills like describe_excalidraw will return nothing until you "
-        f"save diagrams there (via the mermaid or excalidraw MCP tools)."
-    )
-    _log_install_event(
-        "7b/10", "warn",
-        "Diagrams collection empty: no .mmd sources found",
-        data={"diagrams_collection": diagrams_name,
-              "source_count": 0,
-              "weaviate_count": 0},
-    )
+    # v0.2.102: the Diagrams collection bootstrap + empty-collection warning
+    # were removed with the diagrams integrations (owner ruling 2026-10-07).
+    # Existing `<Project>_Diagrams` collections on user machines are D-data —
+    # never dropped, still recognised by the migration/naming paths — but the
+    # install no longer creates or projects them.
 
 
 # ---------------------------------------------------------------------------
@@ -13721,7 +13568,7 @@ _SEED_OWED_WORK_CONDITION_ID = _install_weaviate.SEED_OWED_WORK_CONDITION_ID
 
 def _seed_weaviate(
     args: argparse.Namespace,
-    deferral_report: "Optional[DeferralReport]" = None,
+    deferral_report: "DeferralReport | None" = None,
 ) -> "Optional[str]":
     """v0.2.44 V44-I: thin wrapper around :func:`_seed_weaviate_impl`
     that guarantees the ``_DUAL_CLONE_DETECTED_THIS_RUN`` module-level
@@ -13749,7 +13596,7 @@ def _seed_weaviate(
 
 def _seed_weaviate_impl(
     args: argparse.Namespace,
-    deferral_report: "Optional[DeferralReport]" = None,
+    deferral_report: "DeferralReport | None" = None,
 ) -> None:
     """Seed Weaviate with bundled knowledge/ + docs/.
 
@@ -19526,8 +19373,9 @@ def _auto_scrub_removed_mcp_entries(
     Owner ruling (PLAN-V0300 item 15): ``search`` was DELETED, so its
     now-orphaned registration is removed automatically — no consent prompt —
     because the module it pointed at no longer exists (a leftover entry
-    guarantees a failing MCP subprocess every session). ``mermaid`` /
-    ``excalidraw`` are NOT auto-scrubbed (owner: users keep those). Idempotent
+    guarantees a failing MCP subprocess every session). v0.2.102 (owner
+    ruling 2026-10-07) adds ``mermaid`` / ``excalidraw`` to the auto-scrub
+    set: both diagram wrapper modules were deleted outright. Idempotent
     and soft-fail: no entry → no write, no print.
 
     Returns the removed names.
@@ -21227,7 +21075,8 @@ def _check_claude_cli() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bundled-versions pinning (Phase 0, diagrams-integration plan 2026-05-24)
+# Bundled-versions pinning (introduced by the 2026-05-24 diagrams plan;
+# the diagrams pins themselves were removed in v0.2.102 with the modules)
 # ---------------------------------------------------------------------------
 #
 # All external npm packages that ship-as-default with VCO are pinned to
@@ -21387,127 +21236,60 @@ def _find_npm() -> Optional[str]:
 # Playwright MCP + Chromium pre-cache
 # ---------------------------------------------------------------------------
 
-def _install_playwright_browsers() -> None:
-    """Pre-cache `@playwright/mcp` + Chromium so the default-enabled
-    Playwright MCP doesn't stall on first browser launch.
+def _install_playwright_browsers(
+    deferral_report: "DeferralReport | None" = None,
+) -> None:
+    """Pre-cache the PINNED `@playwright/mcp` + the browser revision it will
+    request. Thin shim over :func:`vco_lib.playwright_mcp.precache` (v0.2.102
+    W6-Z4), which owns the plan; this shim supplies install.py's runner
+    (``_run_logged_subprocess`` — dot-cycle + stderr tail), npx resolution and
+    logging.
 
-    Behaviour:
-      - Skipped entirely if `VCT_SKIP_PLAYWRIGHT=1` is set in the env.
-      - Skipped if `npx` is unresolvable — and in that case the MCP
-        CANNOT RUN AT ALL (see below).
-      - Runs `npx -y @playwright/mcp@latest --version` to populate the
-        npx cache (~few MB).
-      - Runs `npx playwright install chromium` to fetch the Chromium
-        binary (~150 MB).
+    Until v0.2.102 this ran ``npx -y @playwright/mcp@latest --version`` and
+    then ``npx playwright install chromium`` — the revision of a SEPARATELY
+    resolved ``playwright``, which drifted from the MCP's own bundled
+    playwright-core, for an MCP registered without ``--browser`` that
+    launched the system-Chrome channel anyway. Now: the pinned package
+    (``bundled_mcp_versions.toml`` [npx.playwright_mcp]) installs its own
+    browser, so the revision is the one the registration requests.
 
-    Non-fatal: any failure logs a warn event and prints a short notice,
-    but never aborts the install.
-
-    v0.2.91 WP-D — the no-npx message was WRONG for four releases. It said
-    the MCP "will lazy-install when first invoked", but the registered entry
-    is ``{"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}``: with
-    no npx there is nothing to invoke and therefore nothing to lazy-install
-    into. Claude Code shows "Failed to connect" and the user has no way to
-    learn why. The honest statement is "the MCP cannot spawn until npx
-    exists" — and the doctor phase at the end of this run emits
-    ``npx_missing_mcp_unspawnable`` so the fact reaches the ledger instead of
-    scrolling past in stdout. Only the CHROMIUM pre-cache is a genuine
-    lazy-install-later optimisation (the `--version` step above populates the
-    npx cache; the browser download can happen on first browser call).
+    Opt out with ``VCT_SKIP_PLAYWRIGHT=1``. Non-fatal throughout; a download
+    that does not leave the browser on disk adds ``playwright_browser_missing``
+    to ``deferral_report`` with the exact repair command. A missing npx is
+    reported by the doctor phase (``npx_missing_mcp_unspawnable``): the
+    registered entry cannot spawn at all without it.
     """
-    print("[playwright] Pre-caching Playwright MCP + Chromium ... ",
+    print("[playwright] Pre-caching Playwright MCP + browser ... ",
           end="", flush=True)
     _log_install_event("playwright", "start",
-                       "caching @playwright/mcp + chromium")
-
-    if os.environ.get("VCT_SKIP_PLAYWRIGHT") == "1":
-        print("SKIPPED (VCT_SKIP_PLAYWRIGHT=1)")
-        _log_install_event("playwright", "skip",
-                           "VCT_SKIP_PLAYWRIGHT=1 in env")
-        return
-
-    # v0.2.51 Bug E: use _find_npx() instead of shutil.which("npx") so
-    # fnm/nvm setups (where the user symlinked only `npm` to PATH but
-    # left `npx` in the version manager's bin dir) work without manual
-    # PATH fiddling. See _find_npx() docstring for the rationale.
-    npx_path = _find_npx()
-    if not npx_path:
-        print("SKIPPED (npx not found)")
-        print("  Node.js / npx not detected. The Playwright MCP is registered")
-        print("  as `npx …`, so it CANNOT SPAWN until npx exists — Claude Code")
-        print("  will show it as 'Failed to connect'. Install Node.js 18+")
-        print("  (https://nodejs.org), then re-run this install.")
-        _log_install_event("playwright", "skip",
-                           "npx not on PATH and not adjacent to npm — "
-                           "playwright MCP cannot spawn (doctor phase emits "
-                           "npx_missing_mcp_unspawnable)")
-        return
-
-    print("(this may take ~30s, ~150 MB)")
-
-    # 1) Cache the MCP package itself (small).
-    # v0.2.53 DEDUP-1: route through _run_logged_subprocess for dot-cycle
-    # animation. Soft-fail (on_failure="return") because the MCP can
-    # lazy-install at runtime.
+                       "caching pinned @playwright/mcp + its browser")
     try:
-        result = _run_logged_subprocess(
-            [npx_path, "-y", "@playwright/mcp@latest", "--version"],
-            step="playwright", phase_label="playwright-mcp-version",
-            timeout=180,
-            on_failure="return",
-            fail_message="  WARN: @playwright/mcp version check failed.",
+        _playwright_mcp.precache(
+            npx_path=_find_npx(),
+            runner=_run_logged_subprocess,
+            log_event=_log_install_event,
+            report=deferral_report,
         )
-        if result.returncode != 0:
-            return
-    except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"  WARN: @playwright/mcp version check failed: {e}")
-        _log_install_event("playwright", "warn",
-                           f"npx -y @playwright/mcp version check failed: {e}")
-        return
-
-    # 2) Cache the Chromium browser binary (~150 MB). This is the
-    #    expensive step; we only do chromium (not firefox/webkit) to
-    #    keep the install size down. Users who need other browsers can
-    #    `npx playwright install firefox` etc. manually.
-    # v0.2.53 DEDUP-1: 10-min download is the canonical M-P1-7
-    # "user thinks install hung" case — dot-cycle animation is the fix.
-    try:
-        result = _run_logged_subprocess(
-            [npx_path, "playwright", "install", "chromium"],
-            step="playwright", phase_label="playwright-chromium-download",
-            timeout=600,
-            on_failure="return",
-            fail_message="  WARN: chromium install exited non-zero.",
-            user_hint_lines=[
-                "The MCP will lazy-install Chromium on first browser call.",
-            ],
-        )
-        if result.returncode == 0:
-            print("[playwright] Chromium cached OK.")
-            _log_install_event("playwright", "ok",
-                               "Playwright MCP + Chromium cached")
-    except subprocess.TimeoutExpired:
-        print("  WARN: chromium install timed out after 10 min.")
-        print("  The MCP will lazy-install Chromium on first browser call.")
-        _log_install_event("playwright", "warn",
-                           "npx playwright install chromium timed out (600s)")
-    except OSError as e:
-        print(f"  WARN: chromium install failed: {e}")
-        _log_install_event("playwright", "warn",
-                           f"npx playwright install chromium failed: {e}")
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        print(f"  WARN: Playwright pre-cache raised: {exc}")
+        _log_install_event("playwright", "warn", f"pre-cache raised: {exc}")
 
 
 def _install_codegraph_treesitter(venv_python: Path) -> None:
     """Install the OPTIONAL ``codegraph-ts`` extra (tree-sitter grammars) so the
-    code-graph analyzer's cross-reference pass extracts call edges for
-    non-Python languages. Best-effort soft-fail (mirrors
-    ``_install_playwright_browsers``): the analyzer degrades to Python-only
-    ``ast`` call extraction without it — every grammar import in
-    ``vco_lib/codegraph_calls.py`` is guarded.
+    code-graph analyzer parses non-Python DEFINITIONS (v0.2.102) and call edges
+    with tree-sitter. Best-effort soft-fail (mirrors
+    ``_install_playwright_browsers``): without it the analyzer degrades to the
+    regex definitions extractors + Python-only call edges — every grammar
+    import in ``vco_lib/codegraph_grammars.py`` is guarded.
 
     The skip/argv DECISION lives in
     ``vco_lib.install_companions.codegraph_ts_install_plan`` (pure + tested);
-    this shim owns only the subprocess run + logging glue (opt out with
+    the install runs through the ONE parser installer helper
+    ``vco_lib.codegraph_parsers.install`` (shared with the launcher's parser
+    modal, v0.2.102 W6-L — PowerShell / proto are NOT in this default extra,
+    they are offered per detected language); this shim supplies only
+    install.py's runner + logging glue (opt out with
     ``VCT_SKIP_CODEGRAPH_TS=1``; pip target ``-e <root>[codegraph-ts]``, whose
     ``-e`` is LOAD-BEARING — without it pip replaces step 4's editable install
     with a frozen copy of vco_lib; see that docstring for the v0.2.92 evidence).
@@ -21529,31 +21311,42 @@ def _install_codegraph_treesitter(venv_python: Path) -> None:
         _log_install_event("codegraph-ts", "skip", _note)
         return
 
-    print("[codegraph-ts] Installing tree-sitter call-extraction extra "
+    print("[codegraph-ts] Installing tree-sitter code-graph grammars "
           "(this may take ~20s) ... ", flush=True)
     # Soft-fail (on_failure="return"): the analyzer degrades to Python-only when
     # the extra is absent. Reuse the pip robustness flags + subprocess env.
-    try:
-        result = _run_logged_subprocess(
-            [str(venv_python), "-m", "pip", "install",
-             *_pip_install_flags(), *(pip_target or [])],
-            step="codegraph-ts", phase_label="pip-install-codegraph-ts",
-            timeout=600, cwd=str(PROJECT_ROOT), env=_pip_subprocess_env(),
+    # v0.2.102 W6-L: through the ONE parser installer helper the launcher's
+    # parser modal also uses (vco_lib.codegraph_parsers.install); this shim
+    # only supplies install.py's runner, flags and env.
+    from vco_lib.codegraph_parsers import install as _install_parsers, install_log_path
+
+    def _runner(argv, timeout):
+        r = _run_logged_subprocess(
+            list(argv), step="codegraph-ts", phase_label="pip-install-codegraph-ts",
+            timeout=timeout, cwd=str(PROJECT_ROOT), env=_pip_subprocess_env(),
             on_failure="return",
             fail_message="  WARN: codegraph-ts extra install exited non-zero.",
             user_hint_lines=[
-                "Cross-language code-graph call edges stay Python-only until "
-                "this succeeds. Retry: pip install -e '.[codegraph-ts]' (orch "
-                "venv; -e required). Skip with VCT_SKIP_CODEGRAPH_TS=1.",
+                "Non-Python code-graph definitions stay regex, call edges Python-"
+                "only, until this succeeds. Retry: pip install -e '.[codegraph-ts]' (orch "
+                "venv; -e required), or accept the launcher's parser offer. Skip with "
+                "VCT_SKIP_CODEGRAPH_TS=1.",
             ],
         )
-        if result.returncode == 0:
-            print("[codegraph-ts] tree-sitter grammars installed OK.")
-            _log_install_event("codegraph-ts", "ok", "codegraph-ts installed")
-    except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"  WARN: codegraph-ts extra install failed: {e}")
+        return r.returncode, r.stdout or "", r.stderr or ""
+
+    result = _install_parsers(
+        python=venv_python, targets=[*(pip_target or [])],
+        label="tree-sitter code-graph grammars", runner=_runner,
+        pip_flags=_pip_install_flags(), log_path=install_log_path(), pip_timeout=600,
+    )
+    if result.ok:
+        print("[codegraph-ts] tree-sitter grammars installed OK.")
+        _log_install_event("codegraph-ts", "ok", "codegraph-ts installed")
+    elif not result.log_tail:  # timeout / unstartable pip (a pip exit printed its own tail)
+        print(f"  WARN: codegraph-ts extra install failed: {result.message}")
         _log_install_event("codegraph-ts", "warn",
-                           f"pip install -e .[codegraph-ts] failed: {e}")
+                           f"pip install -e .[codegraph-ts] failed: {result.message}")
 
 
 # ---------------------------------------------------------------------------
@@ -21883,9 +21676,10 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     # Step 2: remove volumes.
     #
     # Defense-in-depth: this uninstaller does NOT shell out to remove
-    # container volumes. Per the launcher's `volume_rm_only_callable_from_migrate_volumes`
-    # audit (commands/storage_ux.rs — moved there from volumes.rs in
-    # v0.2.101), only `migrate_volumes` is allowed to invoke
+    # container volumes. Per the `volume rm` source audit
+    # (tests/test_v02102_rust_source_scan_gates.py,
+    # `test_volume_rm_only_callable_from_migrate_volumes`), only the launcher's
+    # `migrate_volumes` (commands/storage_ux.rs) is allowed to invoke
     # `<runtime> volume rm ...`. Instead, we delegate volume cleanup to
     # `compose down --volumes`, which is also forbidden in the install
     # path — so we PRINT the exact commands the user can run themselves.

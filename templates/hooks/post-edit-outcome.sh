@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with post-edit-outcome.ps1 (both siblings' Unix-epoch
+# stamps are pinned by tests/test_v0292_ps1_unix_epoch_parity.py; every
+# behaviour must match the post-edit-outcome.ps1 sibling).
 # Post-edit outcome event hook (V52-M, v0.2.52)
 # Fires AFTER Edit OR Write tool executes. Emits an edit_outcome event
 # with diff size + whether the file existed before + (best-effort)
@@ -12,18 +15,31 @@
 #   and let the offline trainer JOIN on (session_id, file_path,
 #   ts_window) — that's lossy but enough for training-pair construction
 #   (the trainer sorts retrieval events + outcome events by ts and
-#   pairs adjacent same-(session,file) entries).
+#   pairs adjacent same-(session,file) entries). v0.2.102: rows also carry
+#   `agent_id` ("" = main chat) — a subagent's session_id is the parent's,
+#   so the join must include it to keep parallel lanes' rows apart.
 #
-#   FOLLOW-UP (V52-M.2 candidate): refactor pre-edit to write its
-#   task_id to .claude/state/edit_task_<session>_<filehash>.json so
-#   we can do exact task_id pairing like pre-bash/post-bash. Out of
-#   scope for the V52-M initial ship to keep blast radius small.
+#   Pairing is by that time window, not by an exact task_id handoff:
+#   unlike pre-bash/post-bash, the pre-edit/pre-write context router
+#   serves many edits from its query cache and warm replay without
+#   minting a retrieval task_id, so there is no id to hand over for
+#   those edits. The window join covers every edit the same way.
 #
-# Compile/test success-within-N-seconds is implemented as a forked
-# background poller (N=20s default, VCT_EDIT_POST_CHECK_SECS env
-# override). The poller watches .claude/state/last_compile_status_
-# <file_basename>.json for a status update emitted by ruff / py_compile
-# / cargo PostToolUse siblings; default-empty means "no signal".
+# Compile success-within-N-seconds (v0.2.102 W6-PCHK; the ONE home is
+# vco_lib/edit_post_check.py). The PostToolUse checkers write a status
+# record per check to .claude/state/last_compile_status_<pathkey>_
+# <agentkey>.json: <pathkey> hashes the ABSOLUTE path, so same-named
+# files in different directories never collide, and <agentkey> keeps a
+# subagent's check apart from the main chat's. The only shipped checker
+# is py-compile-check (Write of a *.py file); there is no ruff, cargo or
+# tsc PostToolUse checker. When a checker covers the edited file, this
+# hook writes the row as a pending record and starts a DETACHED poller
+# that waits up to VCT_EDIT_POST_CHECK_SECS (default 20) for a status
+# newer than the edit, then emits the row once with post_check filled
+# (ok / fail / no_signal on timeout). A file no checker covers is
+# emitted at once with post_check no_signal, no wait. The row is never
+# dropped: a poller that cannot start or fails leaves post_check None,
+# and a poller that dies outright is swept by the next run of this hook.
 # Soft-fail throughout.
 
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
@@ -57,15 +73,29 @@ try:
         new_str = content
     print(len(old_str or ''))
     print(len(new_str or ''))
+    print(d.get('agent_id', '') or '')
 except Exception:
-    print(''); print(''); print(''); print(0); print(0)
-" 2>/dev/null || printf '\n\n\n0\n0\n')
+    print(''); print(''); print(''); print(0); print(0); print('')
+" 2>/dev/null || printf '\n\n\n0\n0\n\n')
 
 TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '1p')
 SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
 FILE_PATH=$(printf '%s' "$_PARSED" | sed -n '3p')
 OLD_LEN=$(printf '%s' "$_PARSED" | sed -n '4p')
 NEW_LEN=$(printf '%s' "$_PARSED" | sed -n '5p')
+# v0.2.102 W6-C2 (census F13): the subagent that made the edit. Subagent tool
+# events carry agent_id while session_id stays the PARENT's, so the offline
+# join on (session_id, file_path, ts) mixed the parent's rows with every
+# lane's that edited the same file. Sanitised by the ONE agent-id rule
+# (_lib/session-id.sh): hex ids pass, anything else -> "default"; empty = the
+# main chat. Interpolated below only after that allow-list.
+AGENT_ID_RAW=$(printf '%s' "$_PARSED" | sed -n '6p')
+AGENT_ID=""
+if [ -n "$AGENT_ID_RAW" ] && [ -f "$SCRIPT_DIR/_lib/session-id.sh" ]; then
+    # shellcheck source=_lib/session-id.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/session-id.sh"
+    AGENT_ID="$(vco_hook_sanitize_agent_id "$AGENT_ID_RAW")"
+fi
 
 # Only fire for Edit and Write
 if [[ "$TOOL_NAME" != "Edit" ]] && [[ "$TOOL_NAME" != "Write" ]]; then
@@ -111,8 +141,12 @@ resolve_vco_venv_python "$SCRIPT_DIR"
 VENV="${VCO_VENV_PYTHON:-}"
 
 if [ -n "$VENV" ] && [ -f "$VENV" ]; then
+    # v0.2.102 W6-PCHK: the fields travel as key=value argv items, never
+    # interpolated into the Python source (a quote in a file path used to
+    # break the snippet). The row itself, the poller and the sweep live in
+    # vco_lib/edit_post_check.py (MUST MATCH the .ps1 sibling's call).
     "$VENV" -c "
-import os, json, sys, uuid
+import os, sys
 # v0.2.94: pin the project root the hook already resolved for THIS child.
 # A rootless embedding_service._detect_project_root() falls through to
 # Path.cwd() (rule 4) and reconciles THAT directory's deferral ledger,
@@ -123,38 +157,26 @@ import os, json, sys, uuid
 _vco_project_root = r'''$PROJECT_ROOT'''
 if _vco_project_root:
     os.environ.setdefault('KG_BASE_DIR', _vco_project_root)
-# Mint our own task_id; offline trainer joins by (session_id, file_path, ts).
-task_id = f'edit_outcome_{uuid.uuid4().hex[:8]}'
-
 project_id = None
 try:
     from vco_lib.project_config import resolve_for_project
-    cfg = resolve_for_project(os.environ.get('CLAUDE_PROJECT_DIR', '$PROJECT_ROOT'))
+    cfg = resolve_for_project(os.environ.get('CLAUDE_PROJECT_DIR', r'''$PROJECT_ROOT'''))
     project_id = cfg.get('project_id') if isinstance(cfg, dict) else None
 except Exception:
     pass
-
 try:
     from claude_mcp_servers.rl_client.outcome_emit import emit_outcome_event
-    emit_outcome_event(
-        event_type='edit_outcome',
-        task_id=task_id,
-        task_type='edit_outcome',
-        payload={
-            'tool_name': '$TOOL_NAME',
-            'file_path': '$FILE_PATH',
-            'diff_size': int('$DIFF_SIZE'),
-            'file_existed_before': bool(int('$FILE_EXISTED_BEFORE')),
-            'ts_ms': $NOW_TS_MS,
-            # post_check populated by the background poller below (optional)
-            'post_check': None,
-        },
-        session_id='$SESSION_ID',
-        project_id=project_id,
-    )
-except Exception:
-    pass
-" 2>/dev/null || true
+    from vco_lib.edit_post_check import record_edit_outcome_from_argv
+except Exception as exc:
+    sys.stderr.write('post-edit-outcome: edit_outcome not recorded, VCO install is broken: %r\n' % (exc,))
+else:
+    try:
+        record_edit_outcome_from_argv(sys.argv[1:], project_root=_vco_project_root, emit=emit_outcome_event, project_id=project_id)
+    except Exception as exc:
+        sys.stderr.write('post-edit-outcome: edit_outcome failed: %r\n' % (exc,))
+" "tool=$TOOL_NAME" "file=$FILE_PATH" "diff=$DIFF_SIZE" \
+      "existed=$FILE_EXISTED_BEFORE" "ts=$NOW_TS_MS" "agent=$AGENT_ID" \
+      "session=$SESSION_ID" 2>/dev/null || true
 fi
 
 exit 0

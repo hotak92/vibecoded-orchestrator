@@ -681,6 +681,26 @@ pub fn run() {
         std::process::exit(exit_code);
     }
 
+    // v0.2.102 review fix 3 (coordinator ruling): when THIS process was
+    // started as a relaunch child (`--vct-relaunch-parent=<pid>`, appended
+    // by the one relaunch path in `commands::restart`), wait — bounded,
+    // env-tunable — for the exiting parent to be GONE before the Tauri
+    // builder (and with it the single-instance plugin, registered first)
+    // runs. Without this, a child that reaches plugin setup while the old
+    // process still holds the per-user lock hands its argv to a launcher
+    // that is about to exit and dies — leaving NO launcher running. A
+    // normal second launch carries no flag and keeps today's immediate
+    // hand-off. Soft-fail: on wait expiry we log one line and fall through
+    // to the ordinary single-instance behaviour.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if let Some(parent_pid) =
+            commands::restart::relaunch_parent_pid(&argv)
+        {
+            commands::restart::wait_for_relaunch_parent_before_lock(parent_pid);
+        }
+    }
+
     // v0.2.49: reap any stale install.py.lock left behind by a crashed
     // launcher (segfault / OOM-kill / kill -9 — none of which run
     // Rust destructors, so `.kill_on_drop(true)` can't help). Without
@@ -1155,16 +1175,41 @@ pub fn run() {
             // consume so this isn't a per-boot cost — only once per
             // install/update boundary.
             //
+            // v0.2.102 (L6 / OD-6) — boot order vs the settings.json
+            // watcher: when this refresh runs, `settings_json_watcher`
+            // (spawned further down in this same `setup()`) MUST NOT arm
+            // until it completes, else its detached writes would land on
+            // an armed watcher and turn the silent boot refresh into a
+            // global MCP SIGHUP. That ordering used to be incidental (the
+            // refresh simply sat earlier in `setup()`, and the pull-in R
+            // report 2026-10-06 documented "the refresh must not be
+            // detached" as an exception). It is now STRUCTURAL: the
+            // refresh completes a oneshot handed to the watcher spawn,
+            // which awaits it (bounded, env-tunable — see
+            // `settings_json_watcher::await_refresh_gate`) before
+            // registering a single watch. A refresh that outlives the
+            // bound arms the watcher anyway with a WARNING.
+            //
             // Soft-fail throughout: any error here MUST NOT block boot.
             // The walk-up resolver remains a working fallback for the
             // common case (binary inside the clone).
+            let mut install_boundary_refresh_done: Option<
+                tokio::sync::oneshot::Receiver<()>,
+            > = None;
             {
                 use tauri::Manager;
                 if let Some(db) = app.try_state::<db::Db>() {
                     let consumed = consume_install_path_seed_if_present(db.inner());
                     if consumed {
+                        let (refresh_done_tx, refresh_done_rx) =
+                            tokio::sync::oneshot::channel::<()>();
+                        install_boundary_refresh_done = Some(refresh_done_rx);
                         let report = commands::projects_v2::
                             refresh_all_projects_env_with_db(db.inner());
+                        // Release the watcher gate on every path out of the
+                        // refresh (a dropped sender releases it too; sending
+                        // keeps the intent explicit).
+                        let _ = refresh_done_tx.send(());
                         if !report.refreshed.is_empty()
                             || !report.refreshed_with_warnings.is_empty()
                             || !report.failed.is_empty()
@@ -2188,6 +2233,18 @@ pub fn run() {
             // has new commits — never auto-applies.
             commands::self_update::spawn_daily_check(app.handle().clone());
 
+            // v0.2.102 (S16-13 / OD-7) review fix 4: the hidden-idle
+            // stale-binary self-relaunch check, as its OWN background loop —
+            // deliberately NOT in `tray.rs`, so it keeps running when the
+            // system tray failed to build (a session with no
+            // StatusNotifier host). One periodic check
+            // (`VCT_LAUNCHER_STALE_IDLE_CHECK_SECS`, default 10 min) that
+            // leaves the launcher alone unless a `launcher_binary_stale`
+            // record exists, this process started `--start-hidden`, no
+            // window is visible, no update is in flight and no modal is
+            // pending; the act is the restart modal's own guarded relaunch.
+            commands::restart::spawn_stale_idle_checks(app.handle().clone());
+
             // v0.2.97: materialize the bundled core-module manifests into the
             // state dir (the hub does the same at its own start) — every
             // manifest reader looks there, and nothing used to write it.
@@ -2446,7 +2503,17 @@ pub fn run() {
             // the mcp-instability audit. POSIX-only (skipped on
             // Windows; the manual McpMaintenanceSection button stays
             // available as the cross-OS fallback).
-            services::settings_json_watcher::spawn(app.handle().clone());
+            //
+            // v0.2.102 (L6 / OD-6): the spawn carries the
+            // install-boundary refresh gate resolved above — the watcher
+            // arms only after that refresh completes (bounded,
+            // env-tunable wait, WARNING + arm-anyway at the bound), so
+            // the boundary refresh's own settings.json writes can never
+            // SIGHUP the live MCPs.
+            services::settings_json_watcher::spawn(
+                app.handle().clone(),
+                install_boundary_refresh_done,
+            );
 
             // Resume background tasks left behind by a previous launcher
             // process (crash, force-quit, OOM). Two-phase, soft-fail —
@@ -2774,9 +2841,6 @@ pub fn run() {
             // version floor, which never trips in v0.2.60).
             commands::projects_v2::probe_stale_derived_collections,
             commands::projects_v2::apply_stale_derived_choice,
-            // v0.2.71: per-slot populated-entry counts (T-C-modal) — powers the
-            // model-switch modal's "keep previous model" smart default.
-            commands::embedding_slot_counts::project_embedding_slot_counts,
             commands::projects_v2::perform_hard_cut,
             commands::projects_v2::rename_project_v2,
             commands::projects_v2::rename_collections_v2,
@@ -2880,7 +2944,10 @@ pub fn run() {
             // lifecycle (Phase 1E) + weights-update polling (Phase 3C)
             // + fine-tune-after-download (Phase 4A) + dashboard widget
             // (Phase 4B scaffolding). Wired commands:
-            commands::module_service::restart_rl_container,
+            // v0.2.102 (W5-B OD-11): the RL-specific `restart_rl_container`
+            // is retired — subsumed by the generic per-module Restart below
+            // (same restart_container_with pipeline, any installed module).
+            commands::module_service::restart_module_container,
             // NEW-3 (2026-05-28): generic start for service/container modules
             // whose container_name is NULL (auto-start was skipped).
             commands::module_service::start_module_container,
@@ -2965,10 +3032,6 @@ pub fn run() {
             commands::rl_settings::get_rl_online_training_disabled,
             commands::rl_settings::get_rl_global_training_source_flag,
             commands::rl_settings::list_rl_global_training_source_projects,
-            // v0.2.71: per-project active-embedding profile picker (T-B-emb) —
-            // writes active_embedding_source=user (sticky per-project choice).
-            commands::project_env_settings::set_project_active_embedding,
-            commands::project_env_settings::get_project_active_embedding,
             // v0.2.71: per-project dual-embedding-write + dual-RL-log flags
             // (T-B-flags) — launcher.db-as-truth, projected to .claude/env.
             commands::rl_settings::set_dual_embedding_write_all_slots,
@@ -2988,6 +3051,9 @@ pub fn run() {
             commands::dual_flags::set_dual_flag_for_project,
             commands::dual_flags::get_dual_flags_global_defaults,
             commands::dual_flags::set_dual_flag_global_default,
+            // v0.2.102 W5-A (M3): what a project declared its own (Identity tab).
+            commands::infra_declarations::get_project_infra_declarations,
+            commands::infra_declarations::set_project_infra_declarations,
             // v0.2.91 WP-L (decision #21): the machine-global diagnostic log
             // level. Consumed by `crate::logging::apply_stored_level` (this
             // process, live) and projected to every project as VCO_LOG_LEVEL.
@@ -3076,6 +3142,8 @@ pub fn run() {
             // only in a log line.
             commands::chat_model_context::chat_model_context_list,
             commands::chat_model_context::chat_model_context_status,
+            // v0.2.102 (OD-3): the pane's per-row edited-vs-shipped badge.
+            commands::chat_model_context::chat_model_context_edited_diff,
             commands::chat_model_context::chat_model_context_upsert,
             commands::chat_model_context::chat_model_context_delete,
             commands::chat_model_context::chat_model_context_reseed,
@@ -3100,6 +3168,9 @@ pub fn run() {
             commands::model_gateway::model_gateway_routing_guidance,
             commands::gateway_freshness::model_gateway_freshness,
             commands::gateway_freshness::model_gateway_restart_stale,
+            commands::codegraph_parsers::codegraph_parser_offers,
+            commands::codegraph_parsers::codegraph_parsers_decline,
+            commands::codegraph_parsers::codegraph_parsers_install,
             commands::gateway_usage::model_gateway_usage_windows,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
@@ -3124,30 +3195,18 @@ pub fn run() {
             // --remove-pack) behind the per-folder single-flight turn.
             commands::packs_cmd::list_project_packs,
             commands::packs_cmd::set_project_pack_enabled,
-            // Phase 1.1 — Diagrams (Mermaid + Excalidraw) registry,
-            // snapshots, cross-project access grants, per-tool MCP
-            // allowlists, and per-project module-active flags. Schema:
-            // migration 021. Sibling agents (1.2 wrapper MCP, 1.3
-            // DiagramsTab, 1.5 indexer) consume these EXACT command
-            // names; renaming would break their stubs at merge time.
-            commands::diagrams_cmd::list_project_diagrams,
-            commands::diagrams_cmd::register_project_diagram,
-            commands::diagrams_cmd::create_starter_diagram_file,
-            commands::diagrams_cmd::unregister_project_diagram,
-            commands::diagrams_cmd::set_project_diagram_enabled,
-            commands::diagrams_cmd::list_diagram_snapshots,
-            commands::diagrams_cmd::create_diagram_snapshot,
-            commands::diagrams_cmd::restore_diagram_snapshot,
-            commands::diagrams_cmd::delete_diagram_snapshot,
-            commands::diagrams_cmd::diagram_grant_access,
-            commands::diagrams_cmd::list_diagram_access,
-            // v0.2.101: the per-tool MCP-grant commands
-            // (list_project_mcp_tools / set_project_mcp_tool_enabled /
-            // seed_project_mcp_tool_grants) were removed with the retired
-            // diagram wrapper MCPs' GUI surface. The DB layer + the hub's
-            // tool-grant route stay for existing wrapper registrations.
-            commands::diagrams_cmd::set_project_module_enabled,
-            commands::diagrams_cmd::clear_project_module,
+            // v0.2.102 (owner ruling 2026-10-07): the diagrams integrations
+            // were dropped entirely. Every diagram command formerly
+            // registered here (registry/snapshots/access grants, starter
+            // file, read/write/resolve path helpers, the watcher
+            // subscription, the two editor-open commands) is deleted with
+            // `commands/diagrams_cmd.rs` + `diagram_watcher.rs` +
+            // `diagrams_local_server.rs`, the Diagrams tab and the
+            // vendored editors. The launcher DB tables (migration 022/023)
+            // stay — user data is never dropped. The GENERIC
+            // `project_modules` machinery moved to `module_enabled.rs`:
+            commands::module_enabled::set_project_module_enabled,
+            commands::module_enabled::clear_project_module,
             // v0.2.49 Stream B: per-project enable toggle for global-
             // scope modules. Bare-bool surface, kept because it is
             // shipped IPC — but it cannot express PROVENANCE and has no
@@ -3178,35 +3237,15 @@ pub fn run() {
             commands::module_enabled::rl_events_count,
             // v0.2.100 W5R-02: the RL scoring lock every RL scoring control renders.
             commands::module_enabled::rl_scoring_lock,
-            // Phase 1.5.7 wire-up: DiagramsTab calls
-            // `is_project_module_active` on mount to decide whether to
-            // render the diagrams UI or the "module disabled" overlay.
-            // Missing → tab silently treats every project as inactive.
-            commands::diagrams_cmd::is_project_module_active,
-            // v0.2.34 Agent D — four commands the DiagramsTab invokes for
-            // its core load/save/open/live-push paths. Pre-v0.2.34 each
-            // call threw "command not found" and the frontend silently
-            // degraded (empty preview, 5s polling fallback). See
-            // `.claude/context/plans/diagrams-frontend-wiring-handoff-2026-05-25.md`.
-            commands::diagrams_cmd::read_project_diagram_source,
-            commands::diagrams_cmd::write_text_file,
-            commands::diagrams_cmd::resolve_project_path,
-            commands::diagram_watcher::subscribe_to_diagram_changes,
-            // v0.2.36 Agent R — opens a vendored Mermaid/Excalidraw
-            // editor in the user's default browser via the launcher's
-            // local diagrams-editor HTTP server (lazy-started). Replaces
-            // the embedded Excalidraw editor (broken on Wayland +
-            // webkit2gtk) and ships a self-hosted visual Mermaid editor
-            // alongside the existing text-only one.
-            commands::diagrams_cmd::open_diagrams_editor,
-            commands::diagrams_cmd::open_diagram_editor_for_path,
+            // v0.2.102 (owner decision 2026-10-08): `is_project_module_active`
+            // was REMOVED from here — after the Diagrams tab went it had zero
+            // callers (the invoke census recorded it as an open finding). The
+            // generic `project_modules` WRITES (`set_project_module_enabled`,
+            // `clear_project_module`) stay registered (see above).
             // PR-6 (v0.2.11): per-project .claude/env key reader+writer
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,
             commands::claude_env::set_claude_env_value,
-            // C8 wire-up (2026-05-25): read-only process env lookup, with
-            // a credential-name blocklist. DiagramsTab calls this for the
-            // Wayland-fallback decision (XDG_SESSION_TYPE).
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,
@@ -3349,15 +3388,16 @@ pub fn run() {
             // now" button instead of a copy/paste instruction.
             commands::installer::launch_installer_terminal,
             // Durable install log reader. Backs the OnboardingWizard's
-            // skip-if-installed path + a future Settings → Install
-            // Diagnostics panel. Pull-only: the FE invokes on demand.
+            // skip-if-installed path + the project Settings "Install log"
+            // panel (v0.2.102). Pull-only: the FE invokes on demand.
             commands::installer::read_install_log,
-            // TODO(safety): wire preflight_install_safety_check to the
-            //   OnboardingWizard's confirm-step (owner-deferred to v0.2.102).
-            //   `install_orchestrator` runs `diff_install` itself and refuses
-            //   with `InstallConflictError`; preflight returns the richer
-            //   SafetyReport (volumes, collections, services classification)
-            //   and should run before clicking Install on a fresh path.
+            // v0.2.102 (W5-B C7): wired to the OnboardingWizard's
+            // install-confirm panel — the FE runs this read-only check
+            // when the modal opens, renders the SafetyReport (volumes,
+            // collections, services classification) and blocks Install on
+            // a refusal. `install_orchestrator` remains the authority: it
+            // runs `diff_install` itself and refuses with
+            // `InstallConflictError`.
             commands::installer::preflight_install_safety_check,
             commands::storage_ux::get_volumes_config,
             commands::storage_ux::set_volumes_config_for_install,
@@ -3450,15 +3490,9 @@ pub fn run() {
             commands::embedding_catalog::get_embedding_catalog,
             commands::embedding_catalog::set_default_embedding_models,
             commands::embedding_catalog::get_default_embedding_models,
+            commands::embedding_catalog::get_code_embed_model_status,
+            commands::embedding_catalog::get_kg_embed_model_status,
             commands::embedding_catalog::validate_model_against_catalog,
-            // Embedding enrichment migration (v0.2.18, Commit 9). Spawns
-            // `python -m vco_lib.embedding_enrichment enrich` with
-            // --stream-progress and re-emits per-batch progress as
-            // `vct-enrichment-progress` Tauri events for the
-            // KgCodegraphTab progress modal. Idempotent: re-running on
-            // an already-enriched collection produces 0 enriched + the
-            // full skipped count. Never deletes existing slot data.
-            commands::embedding_enrichment::enrich_collection_vectors,
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
             commands::kg::kg_set_node_access,
@@ -3502,6 +3536,7 @@ pub fn run() {
             // edit each node in a Claude session for the PostToolUse hook
             // to backfill it lazily.
             commands::kg_summary::get_kg_summary_status,
+            commands::kg_summary::get_summary_model_info,
             commands::kg_summary::retry_kg_summary,
             // v0.2.96 WP-7b: the GUI "Recheck summary backend now" action
             // (Preferences → KG Summaries) — shells to

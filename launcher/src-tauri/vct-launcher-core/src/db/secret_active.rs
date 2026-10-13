@@ -859,6 +859,25 @@ pub fn resolve_active_user_secret_pairs_for_requester_with_degraded(
     project_id: &str,
     requester_project_id: &str,
 ) -> (Vec<(String, String)>, bool) {
+    resolve_active_user_secret_pairs_for_requester_with_degraded_for_key(
+        own_db,
+        project_id,
+        requester_project_id,
+        None,
+    )
+}
+
+/// v0.2.102: [`resolve_active_user_secret_pairs_for_requester_with_degraded`]
+/// restricted to ONE key name when `only_key` is `Some` — the hub's `?key=`
+/// lookup reads that key's buckets only instead of every user secret. Bucket
+/// order, gating and first-wins are identical; only the enumeration is
+/// filtered (`None` = every key, the historical behaviour).
+pub fn resolve_active_user_secret_pairs_for_requester_with_degraded_for_key(
+    own_db: &Db,
+    project_id: &str,
+    requester_project_id: &str,
+    only_key: Option<&str>,
+) -> (Vec<(String, String)>, bool) {
     fn resolve_one_bucket(
         own_db: &Db,
         keys: &[String],
@@ -921,9 +940,15 @@ pub fn resolve_active_user_secret_pairs_for_requester_with_degraded(
         }
     }
 
-    let per_project_keys = own_db.list_user_secret_keys_for_project(project_id);
-    let shared_keys = own_db.list_shared_user_secret_keys();
-    let global_keys = own_db.list_global_user_secret_keys();
+    let keep = |keys: Vec<String>| -> Vec<String> {
+        match only_key {
+            Some(want) => keys.into_iter().filter(|k| k == want).collect(),
+            None => keys,
+        }
+    };
+    let per_project_keys = keep(own_db.list_user_secret_keys_for_project(project_id));
+    let shared_keys = keep(own_db.list_shared_user_secret_keys());
+    let global_keys = keep(own_db.list_global_user_secret_keys());
 
     let mut out: Vec<(String, String)> =
         Vec::with_capacity(per_project_keys.len() + shared_keys.len() + global_keys.len());

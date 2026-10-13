@@ -486,30 +486,44 @@ def test_search_knowledge_cli_uses_text_query_method(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _fake_similarity_client(rec: dict, ref, other):
+def _fake_similarity_client(rec: dict, ref, other, *, explode_vector=False,
+                            ref_vectors=None):
+    """A weaviate-v4-SHAPED fake (v0.2.102 W6-Z3).
+
+    In weaviate 4.x ``coll.query.near_vector`` / ``near_object`` EXECUTE on
+    call and return a ``QueryReturn`` — an object with ``.objects`` and NO
+    v3 builder methods (``.where`` / ``.do``). The pre-W6-Z3 fake returned a
+    v3 builder, so the tests could not see that the real command always
+    failed. Every call's kwargs are bound against the INSTALLED client's real
+    signature, so a kwarg the client does not accept fails the test too."""
+    import inspect
     from types import SimpleNamespace
 
-    class _QB:
-        def __init__(self, res):
-            self._res = res
+    from weaviate.collections.queries.near_object import _NearObjectQuery
+    from weaviate.collections.queries.near_vector import _NearVectorQuery
 
-        def where(self, *a, **k):
-            return self
-
-        def do(self):
-            return self._res
+    def _bind(real, kw):
+        inspect.signature(real).bind(None, **kw)   # TypeError on a bad kwarg
 
     class _Q:
         def fetch_objects(self, **kw):
             return SimpleNamespace(objects=[ref])
 
+        def fetch_object_by_id(self, uuid, include_vector=False, **kw):
+            rec.setdefault("fetch_by_id", []).append((uuid, include_vector))
+            return SimpleNamespace(uuid=uuid, vector=ref_vectors or {})
+
         def near_vector(self, **kw):
+            _bind(_NearVectorQuery.near_vector, kw)
             rec["near_vector"] = kw
-            return _QB(SimpleNamespace(objects=[ref, other]))
+            if explode_vector:
+                raise RuntimeError("vector dimension mismatch")   # execution-time
+            return SimpleNamespace(objects=[ref, other], query_profile=None)
 
         def near_object(self, **kw):
+            _bind(_NearObjectQuery.near_object, kw)
             rec["near_object"] = kw
-            return _QB(SimpleNamespace(objects=[ref, other]))
+            return SimpleNamespace(objects=[ref, other], query_profile=None)
 
     class _Coll:
         def __init__(self):
@@ -544,23 +558,41 @@ def _similarity_objs():
     return ref, other
 
 
-def test_code_graph_similar_path_uses_code_similarity_task(monkeypatch):
+class _SimSvc:
+    """A minimal EmbeddingService stand-in for the ``similar`` tests."""
+
+    code_vector_slot = "codesage_embed"
+
+    def __init__(self, captured=None):
+        self._captured = captured if captured is not None else {}
+
+    def embed_code_query(self, text, task=None):
+        self._captured["text"] = text
+        self._captured["task"] = task
+        return [0.1, 0.2, 0.3]
+
+
+def _assert_printed_one_result(capsys):
+    out, err = capsys.readouterr()
+    assert "Error finding similar code" not in err, err
+    assert "Found 1 similar items" in out, (out, err)
+    assert "pkg.g" in out
+    # return_metadata reached the query → the real distance is printed, not -1.
+    assert "(distance: 0.400)" in out, out
+    return out, err
+
+
+def test_code_graph_similar_path_uses_code_similarity_task(monkeypatch, capsys):
     """SF-2: the code-graph ``similar`` subcommand is the code→code path — it
     must embed the reference entity as a QUERY with the ``code_similarity``
-    wording (not ``code_nl``), then search by vector."""
+    wording (not ``code_nl``), then search by vector, and PRINT the result
+    (W6-Z3: the v4 return is used directly)."""
     mod = _load_script("_qcg_similar_v02101", "templates/scripts/query_code_graph.py")
     ref, other = _similarity_objs()
     rec: dict = {}
     captured: dict = {}
 
-    class _Svc:
-        def embed_code_query(self, text, task=None):
-            captured["text"] = text
-            captured["task"] = task
-            return [0.1, 0.2, 0.3]
-
-    monkeypatch.setattr(mod, "_get_or_create_embedding_service", lambda: _Svc())
-    monkeypatch.setattr(mod, "_active_code_vector_slot", lambda: "codesage_embed")
+    monkeypatch.setattr(mod, "_get_or_create_embedding_service", lambda: _SimSvc(captured))
 
     q = mod.CodeGraphQuery(project=None)
     q.client = _fake_similarity_client(rec, ref, other)
@@ -570,11 +602,39 @@ def test_code_graph_similar_path_uses_code_similarity_task(monkeypatch):
     assert "near_vector" in rec, "the similarity path must embed + search by vector"
     assert "near_object" not in rec
     assert rec["near_vector"]["target_vector"] == "codesage_embed"
+    assert rec["near_vector"]["limit"] == 6
+    assert "filters" not in rec["near_vector"], "no project → no filter"
+    _assert_printed_one_result(capsys)
 
 
-def test_code_graph_similar_falls_back_to_near_object_without_a_backend(monkeypatch):
+def test_code_graph_similar_project_filter_is_the_v4_filters_kwarg(monkeypatch, capsys):
+    """W6-Z3: with a project set, the filter travels as ``filters=`` (the v4
+    kwarg) on the query call — not a v3 ``.where()`` chained afterwards."""
+    from weaviate.classes.query import Filter
+
+    mod = _load_script("_qcg_similar_proj_v02102", "templates/scripts/query_code_graph.py")
+    ref, other = _similarity_objs()
+    rec: dict = {}
+    monkeypatch.setattr(mod, "_get_or_create_embedding_service", lambda: _SimSvc())
+
+    q = mod.CodeGraphQuery(project=None)
+    q.project = "proj-x"
+    q.client = _fake_similarity_client(rec, ref, other)
+    q.find_similar("pkg.f", "CodeFunction", 5)
+
+    flt = rec["near_vector"]["filters"]
+    expected = Filter.by_property("project").equal("proj-x")
+    assert type(flt) is type(expected)
+    assert (flt.target, flt.value, flt.operator) == (
+        expected.target, expected.value, expected.operator)
+    _assert_printed_one_result(capsys)
+
+
+def test_code_graph_similar_falls_back_to_near_object_without_a_backend(monkeypatch, capsys):
     """No embedding backend → the historical ``near_object`` path (the command
-    keeps working on a half-migrated install)."""
+    keeps working on a half-migrated install), aimed at the ONE slot the
+    reference is stored in (every code collection has several named vectors,
+    and Weaviate refuses a vector query that names none)."""
     mod = _load_script("_qcg_similar_fb_v02101", "templates/scripts/query_code_graph.py")
     ref, other = _similarity_objs()
     rec: dict = {}
@@ -582,72 +642,54 @@ def test_code_graph_similar_falls_back_to_near_object_without_a_backend(monkeypa
     monkeypatch.setattr(mod, "_get_or_create_embedding_service", lambda: None)
 
     q = mod.CodeGraphQuery(project=None)
-    q.client = _fake_similarity_client(rec, ref, other)
+    q.client = _fake_similarity_client(
+        rec, ref, other,
+        ref_vectors={"codesage_embed": [], "jina_embed": [0.5, 0.5], "openai_embed": []},
+    )
     q.find_similar("pkg.f", "CodeFunction", 5)
 
     assert "near_object" in rec
     assert "near_vector" not in rec
+    assert rec["near_object"]["near_object"] == "ref-uuid"
+    assert rec["near_object"]["target_vector"] == "jina_embed"
+    _assert_printed_one_result(capsys)
 
 
-def test_code_graph_similar_falls_back_when_near_vector_execution_fails(monkeypatch):
+def test_code_graph_similar_without_backend_and_ambiguous_slot_fails_loudly(monkeypatch, capsys):
+    """No backend AND the reference is stored in two slots → which slot the
+    graph searches is unknown; the command fails LOUDLY naming the outage
+    rather than guessing a slot (never another model's vectors)."""
+    mod = _load_script("_qcg_similar_amb_v02102", "templates/scripts/query_code_graph.py")
+    ref, other = _similarity_objs()
+    rec: dict = {}
+    monkeypatch.setattr(mod, "_get_or_create_embedding_service", lambda: None)
+
+    q = mod.CodeGraphQuery(project=None)
+    q.client = _fake_similarity_client(
+        rec, ref, other, ref_vectors={"codesage_embed": [0.1], "jina_embed": [0.2]},
+    )
+    q.find_similar("pkg.f", "CodeFunction", 5)
+
+    assert "near_object" not in rec and "near_vector" not in rec
+    out, err = capsys.readouterr()
+    assert "Error finding similar code" in err
+    assert "Code search unavailable" in err
+
+
+def test_code_graph_similar_falls_back_when_near_vector_execution_fails(monkeypatch, capsys):
     """SF-2 nit: ``near_vector`` can fail at EXECUTION time — a dimension/slot
-    mismatch against the collection's named vector — not only while the query
-    is built. The command must catch that and fall back to the historical
-    ``near_object`` path, which always worked on a half-migrated install,
-    rather than error out a call that used to succeed."""
-    from types import SimpleNamespace
-
+    mismatch against the collection's named vector. In weaviate v4 the call
+    itself executes, so that is where it raises. The command must catch it
+    and fall back to ``near_object`` (same active slot), rather than error
+    out a call that used to succeed."""
     mod = _load_script("_qcg_similar_exec_v02101", "templates/scripts/query_code_graph.py")
     ref, other = _similarity_objs()
     rec: dict = {}
 
-    class _QB:
-        def __init__(self, res=None, explode=False):
-            self._res = res
-            self._explode = explode
-
-        def where(self, *a, **k):
-            return self
-
-        def do(self):
-            if self._explode:
-                raise RuntimeError("vector dimension mismatch")
-            return self._res
-
-    class _Q:
-        def fetch_objects(self, **kw):
-            return SimpleNamespace(objects=[ref])
-
-        def near_vector(self, **kw):
-            rec["near_vector"] = kw
-            return _QB(explode=True)          # builds fine, FAILS on execute
-
-        def near_object(self, **kw):
-            rec["near_object"] = kw
-            return _QB(SimpleNamespace(objects=[ref, other]))
-
-    class _Coll:
-        def __init__(self):
-            self.query = _Q()
-
-    class _Client:
-        class _Colls:
-            @staticmethod
-            def get(_name):
-                return _Coll()
-
-        def __init__(self):
-            self.collections = self._Colls()
-
-    class _Svc:
-        def embed_code_query(self, text, task=None):
-            return [0.1, 0.2, 0.3]
-
-    monkeypatch.setattr(mod, "_get_or_create_embedding_service", lambda: _Svc())
-    monkeypatch.setattr(mod, "_active_code_vector_slot", lambda: "codesage_embed")
+    monkeypatch.setattr(mod, "_get_or_create_embedding_service", lambda: _SimSvc())
 
     q = mod.CodeGraphQuery(project=None)
-    q.client = _Client()
+    q.client = _fake_similarity_client(rec, ref, other, explode_vector=True)
     q.find_similar("pkg.f", "CodeFunction", 5)   # must NOT raise
 
     assert "near_vector" in rec, "the vector path must be attempted first"
@@ -655,6 +697,9 @@ def test_code_graph_similar_falls_back_when_near_vector_execution_fails(monkeypa
         "a near_vector EXECUTION failure must fall back to near_object, "
         "not error out the command"
     )
+    assert rec["near_object"]["target_vector"] == "codesage_embed"
+    assert "fetch_by_id" not in rec, "the active slot is known; no stored-slot probe"
+    _assert_printed_one_result(capsys)
 
 
 # ---------------------------------------------------------------------------

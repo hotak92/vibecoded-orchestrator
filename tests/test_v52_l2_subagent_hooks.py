@@ -133,7 +133,7 @@ def test_post_tool_security_includes_agent_id_on_alert(tmp_path, monkeypatch):
     # .sh sibling only auto-suppresses on VCT_HOOK_LEAK_PROBE=1; without
     # that env var the JSONL line IS written.
     leak_file.write_text(
-        "# sample\nAPI_KEY = 'VCT_HOOK_LEAK_PROBE_a3f7c2'\n",
+        "# sample\nAPI_KEY = 'VCT_HOOK_LEAK_PROBE_a3f7c2'\n",  # vco-secret-scan: test-placeholder
         encoding="utf-8",
     )
     payload = {
@@ -154,7 +154,16 @@ def test_post_tool_security_includes_agent_id_on_alert(tmp_path, monkeypatch):
     assert alert["agent_id"] == "agent-Y"
     assert alert["agent_type"] == "@agent-security"
     # Original fields must still be present.
-    assert alert["file"] == str(leak_file)
+    # v0.2.102 W6-N (owner ruling 2026-10-12): the ledger names the
+    # PROJECT-RELATIVE path and the line of each finding, never the value.
+    assert alert["file"] == "leaked.py"
+    # W6-V: `API_KEY = '<literal>'` is ALSO a generic secret now (a quoted  # vco-secret-scan: test-placeholder
+    # literal of any length under a secret-shaped key), reported first in
+    # SSOT declaration order.
+    assert alert["findings"] == [
+        {"line": 2, "id": "generic_secret_quoted", "label": "Generic secret"},
+        {"line": 2, "id": "leak_probe", "label": "Hook leak-test marker"},
+    ]
     assert "Hook leak-test marker" in alert["patterns"]
 
 

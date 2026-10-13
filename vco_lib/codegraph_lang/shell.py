@@ -15,7 +15,7 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from vco_lib.codegraph_entities import (
     CodeEntity,
@@ -24,11 +24,42 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_definitions, note_path
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
     run_pure_extractor,
 )
+
+
+_HEREDOC_START_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
+_SHELL_COMMENT_RE = re.compile(r"(?:^|(?<=\s))#.*$")
+_SHELL_STATEMENT_SPLIT_RE = re.compile(r";|&&|\|\||\|")
+_SHELL_SOURCE_RE = re.compile(
+    r"^\s*(?:(?:then|do|else|\{|\(|!|[\w:.-]+\s*\(\s*\)\s*\{)\s+)*(?:source|\.)\s+(\S+)")
+
+
+def regex_shell_sources(content: str) -> List[str]:
+    """Regex fallback for a script the bash grammar cannot parse: the first
+    argument of each ``source``/``.`` command at a statement start, skipping
+    comments and heredoc bodies (the same shapes the tree-sitter walker
+    stores — the argument text as written)."""
+    out: List[str] = []
+    heredoc_end = ""
+    for line in content.split("\n"):
+        if heredoc_end:
+            if line.strip() == heredoc_end:
+                heredoc_end = ""
+            continue
+        code = _SHELL_COMMENT_RE.sub("", line)
+        for stmt in _SHELL_STATEMENT_SPLIT_RE.split(code):
+            m = _SHELL_SOURCE_RE.match(stmt)
+            if m:
+                out.append(m.group(1))
+        start = _HEREDOC_START_RE.search(code)
+        if start:
+            heredoc_end = start.group(2)
+    return out
 
 
 def extract_shell_file(
@@ -43,9 +74,6 @@ def extract_shell_file(
     relative_path = file_path.relative_to(repo_root).as_posix()
 
     content_clean = re.sub(r'#.*$', '', content, flags=re.MULTILINE)
-
-    # source / . file
-    imports = re.findall(r'(?:source|\.)\s+([\w./${}/_-]+)', content)
 
     # Functions: name() { or function name {
     func_pattern = re.compile(
@@ -68,6 +96,17 @@ def extract_shell_file(
     complexity = float(1 + sum(content_clean.count(kw)
                                for kw in ['if [', 'if [[', 'while ', 'for ', 'case ']))
 
+    # Definitions: tree-sitter (bash grammar) first (v0.2.102) — it also
+    # finds `name()` with the brace on the next line and subshell bodies
+    # `name() ( … )`, which the regex cannot; regex fallback otherwise.
+    #   fn_records: (name, start_line, end_line)
+    defs = extract_definitions("shell", content, origin=relative_path)
+    note_path("shell", "tree-sitter" if defs is not None else "regex")
+    # Imports (v0.2.102 W6-O): the first argument of every real `source` / `.`
+    # command — never a comment word (the old regex matched ". Replaces" in
+    # every sentence-ending comment) nor a heredoc line.
+    imports = defs.imports if defs is not None else regex_shell_sources(content)
+
     module = ModuleDescriptor(
         path=relative_path, language="Shell", loc=loc, complexity=complexity,
         last_modified=datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc),
@@ -76,12 +115,19 @@ def extract_shell_file(
     entities: List[CodeEntity] = []
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
-    for m in func_pattern.finditer(content_clean):
-        fname = m.group(1) or m.group(2)
-        if not fname:
-            continue
-        start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line, language="shell")  # V52-O.11.E (was: start_line + 30)
+    fn_records: List[Tuple[str, int, int]] = []
+    if defs is not None:
+        fn_records = [(f.name, f.start_line, f.end_line) for f in defs.functions]
+    else:
+        for m in func_pattern.finditer(content_clean):
+            fname = m.group(1) or m.group(2)
+            if not fname:
+                continue
+            start_line = content_clean[:m.start()].count('\n') + 1
+            end_line = _extract_balanced_block(source_lines, start_line, language="shell")  # V52-O.11.E (was: start_line + 30)
+            fn_records.append((fname, start_line, end_line))
+
+    for fname, start_line, end_line in fn_records:
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{fname}"
         signature = f"{fname}()"

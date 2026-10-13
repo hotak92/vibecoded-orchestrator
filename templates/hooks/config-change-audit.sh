@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# OS-EXEMPT-PARITY: bash-side-only fix — switched bare `python3` to `"$PY"` via _lib/find-python.sh. The .ps1 sibling parses the audit-event JSON via ConvertFrom-Json (no Python invocation) and is already cross-OS-correct.
+# Parity: kept in step with config-change-audit.ps1 (the .ps1 parses JSON natively
+# via ConvertFrom-Json and never invokes Python; every behaviour must
+# match the .ps1 sibling; tests/test_v02102_w6w_hook_project_root.py runs both).
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
@@ -12,7 +14,13 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # shellcheck source=_lib/find-python.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> nothing to do (no state is written).
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
+[ -n "$PROJECT_DIR" ] || exit 0
 LOG_FILE="$PROJECT_DIR/.claude/logs/config_changes.jsonl"
 
 mkdir -p "$(dirname "$LOG_FILE")"

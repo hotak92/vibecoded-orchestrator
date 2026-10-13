@@ -169,24 +169,15 @@ def test_provenance_parse_and_persist_wired() -> None:
     assert "parse_codegraph_provenance(&stdout_str)" in content
 
 
-def test_force_recreate_gated_on_profile_change_only() -> None:
-    """--force-recreate is pushed ONLY under the force_recreate_for_profile_change
-    gate (task 5a), never unconditionally."""
+def test_profile_change_never_forces_a_recreate() -> None:
+    """v0.2.102 W6-B2 (owner ruling 2026-10-10): the v0.2.82 task-5a branch —
+    a changed configured profile pushed --force-recreate (drop + re-embed every
+    collection) — is SUPERSEDED by the additive fill in vco_lib.code_embed_model.
+    The launcher build must not drop a graph for a model change any more."""
     content = _read(_CODEGRAPH_RS)
-    assert 'args.push("--force-recreate".to_string())' in content, (
-        "run_build_task must be able to pass --force-recreate for a profile change"
-    )
-    # It must sit inside the `if force_recreate_for_profile_change {` block.
-    m = re.search(
-        r"if force_recreate_for_profile_change\s*\{[^}]*"
-        r'args\.push\("--force-recreate"\.to_string\(\)\)',
-        content,
-        re.DOTALL,
-    )
-    assert m is not None, (
-        "--force-recreate must be gated on force_recreate_for_profile_change, "
-        "not pushed unconditionally."
-    )
+    assert 'args.push("--force-recreate".to_string())' not in content
+    assert "force_recreate_for_profile_change" not in content
+    assert "SUPERSEDED by the additive fill in `vco_lib.code_embed_model`" in content
 
 
 def test_backfill_rider_gated_on_non_root() -> None:

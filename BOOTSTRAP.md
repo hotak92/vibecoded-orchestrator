@@ -172,7 +172,7 @@ The three orchestrator volumes — `weaviate_data`, `ollama_data`, `code_embed_c
 
 **Safe-rollback guarantee**: every error branch past the override-write removes the override and brings the OLD volumes back up. The legacy volumes are removed only after the new bind-mounts are verified healthy. If the migration fails halfway, your data stays where it was.
 
-`migrate_volumes` is the ONLY function in the launcher allowed to invoke `podman volume rm`. The non-destructive audit guard `test_no_destructive_subprocess_calls_in_install_path` enforces this at the source level — no install-path file may shell out to `volume rm`.
+`migrate_volumes` is the ONLY function in the launcher allowed to invoke `podman volume rm`. Two source-level audits in `tests/test_v02102_rust_source_scan_gates.py` enforce this: `test_volume_rm_only_callable_from_migrate_volumes` (no install-path file, and nothing else in `storage_ux.rs`, may invoke `volume rm`) and `test_no_destructive_subprocess_calls_in_install_path` (no `volume rm` / `volume prune` / `compose down` in the install path).
 
 ### When you decide you want the launcher
 

@@ -81,7 +81,7 @@ def _assistant_entry(uuid, text=None, thinking=None, tool_use=None):
     if text is not None:
         blocks.append({"type": "text", "text": text})
     if tool_use is not None:
-        blocks.append({"type": "tool_use", "name": tool_use, "input": {"secret": "SHOULD_NEVER_SURFACE"}})
+        blocks.append({"type": "tool_use", "name": tool_use, "input": {"secret": "SHOULD_NEVER_SURFACE"}})  # vco-secret-scan: test-placeholder
     return {"type": "assistant", "uuid": uuid, "message": {"role": "assistant", "content": blocks}}
 
 

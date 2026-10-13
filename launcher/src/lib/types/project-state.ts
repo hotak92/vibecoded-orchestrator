@@ -80,7 +80,9 @@ export interface ProjectKgBinding {
   project_id: string;
   role: string; // primary | shared | archive
   collection_name: string;
-  embedding_model: string | null;
+  // v0.2.102 W6-J: no `embedding_model` — the per-project KG model pick was
+  // retired (one global embedding setting). The DB column survives; nothing
+  // reads or writes it.
   embedding_dim: number | null;
   kg_dir_path: string | null;
   weaviate_url: string | null;
@@ -287,68 +289,12 @@ export interface TelemetryEventView {
   payload_summary: string;
 }
 
-// ─── Diagrams (Phase 1 of the diagrams-integration plan, 2026-05-24) ─────
+// (v0.2.102) The Diagrams tab and every diagram type it alone used
+// (`DiagramType`, `DiagramRow`, `DiagramSnapshotRow`, `DiagramChangedPayload`,
+// `SnapshotTrigger`) were removed with the dropped mermaid/excalidraw
+// integrations (owner ruling 2026-10-07). The launcher DB tables behind them
+// (migration 022) stay — user data is never dropped.
 //
-// Mirrors the Rust types in the (forthcoming) Phase 1.1 sibling commit:
-//   launcher/src-tauri/src/commands/diagrams_cmd.rs
-//   launcher/src-tauri/vct-launcher-core/src/db/project_diagrams.rs
-//
-// These types are written to spec; until Phase 1.1 lands the `invoke<...>`
-// calls fail at runtime with a clear "not implemented" error which the UI
-// shows as a toast. The merge integrator wires the live commands in.
-
-export type DiagramType = 'mermaid' | 'excalidraw';
-export type SnapshotTrigger =
-  | 'manual'
-  | 'auto_pre_edit_save'
-  | 'auto_interval';
-
-export interface DiagramRow {
-  id: number;
-  project_id: string;
-  diagram_name: string;
-  diagram_type: DiagramType;
-  file_path: string; // relative to project root
-  category_path: string; // e.g. "gui/auth"
-  enabled: boolean;
-  // Derived metadata (recomputed on save by diagram_indexer.py — Phase 1.5.A)
-  inferred_title: string | null;
-  diagram_kind: string | null; // flowchart / classDiagram / sequenceDiagram / excalidraw
-  node_count: number | null;
-  edge_count: number | null;
-  // Runtime context — nullable when not authored via Claude
-  chat_id: string | null;
-  linked_session_summary: string | null;
-  // Snapshot rollup for the row badge
-  snapshot_count: number;
-  // Standard timestamps
-  created_at: number;
-  updated_at: number;
-}
-
-export interface DiagramSnapshotRow {
-  id: number;
-  diagram_id: number;
-  content_hash: string;
-  trigger: SnapshotTrigger;
-  label: string | null;
-  created_at: number;
-  // `content` (gzipped BLOB) is NOT included in list responses to keep
-  // them small — fetched separately via `restore_diagram_snapshot` or
-  // a future `get_diagram_snapshot_content` command.
-}
-
-export interface DiagramChangedPayload {
-  project_id: string;
-  diagram_id: number;
-  file_path: string;
-  // Discriminator the backend will set so the UI can route the refresh:
-  // - "edit" → re-fetch list + re-render preview if matching
-  // - "create" / "delete" → re-fetch list
-  // - "snapshot" → re-fetch snapshots only
-  kind: 'edit' | 'create' | 'delete' | 'snapshot';
-}
-
 // (v0.2.101) `McpToolGrant` removed: its only consumer was the PermissionsTab
 // "MCP Tools" sub-section, removed with the retired diagram wrapper MCPs.
 

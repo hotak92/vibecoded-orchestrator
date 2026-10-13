@@ -30,6 +30,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS = REPO_ROOT / "templates" / "hooks"
@@ -232,7 +233,7 @@ def test_sh_wrapper_kill_switch_spawns_nothing(tmp_path):
 def test_ps1_wrapper_envelope_echoes_all_fields_and_modifies_only_prompt(tmp_path):
     root, stub_out = _sandbox(tmp_path)
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(HOOKS / "agent-brief-kg-inject.ps1")],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / "agent-brief-kg-inject.ps1")],
         input=json.dumps(_payload()), capture_output=True, text=True,
         env=_env(root, stub_out), timeout=120, cwd=str(root))
     env_doc = _parse_envelope(proc)
@@ -256,7 +257,7 @@ def test_ps1_wrapper_briefless_prompt_emits_nothing(tmp_path):
     # and the description carry no task text.
     payload["tool_input"] = {"prompt": "", "description": "", "model": "m"}
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(HOOKS / "agent-brief-kg-inject.ps1")],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / "agent-brief-kg-inject.ps1")],
         input=json.dumps(payload), capture_output=True, text=True,
         env=_env(root, stub_out), timeout=120, cwd=str(root))
     assert proc.returncode == 0, proc.stderr

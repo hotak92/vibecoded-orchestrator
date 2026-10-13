@@ -1,0 +1,427 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Part of VibeCoded Orchestrator.
+//! Shared helpers for the source-scanning integration tests in `tests/`.
+//!
+//! ONE home for "which lines of this Rust file are production code?" on the
+//! Rust side (v0.2.102 W6-Z2). The Python lints answer the same question with
+//! `tests/common/rust_source.py` (`cfg_test_spans` / `production_source`);
+//! these two are the only implementations, and both blank test-gated ITEMS
+//! instead of cutting the file at the first `#[cfg(test)]`. Cutting at the
+//! first marker is the defect this module exists to retire: a gated `use`, a
+//! gated helper, a test module followed by more production code, or a comment
+//! that quotes the marker all end the scan early, and the gate then fails
+//! toward GREEN.
+//!
+//! Users: `command_silent_gate.rs`, `spawn_evidence_lint.rs` (each declares
+//! `mod support;`). Files under a `tests/` SUBdirectory are not compiled as
+//! test crates of their own, so this module is only ever built as a child of
+//! those.
+
+/// Strip `//` line comments and `/* */` block comments and the contents
+/// of string/char literals from a single source file, producing a parallel
+/// vector of "code-only" lines. We keep line count identical so reported
+/// line numbers match the original file. Anything removed is replaced by a
+/// space so column-insensitive substring checks (`Command::new`,
+/// `.silent()`) only ever match real code.
+///
+/// This is a small hand-rolled lexer — good enough for Rust source where
+/// the only constructs that could hide a spurious `Command::new` are
+/// comments and string literals. It is deliberately conservative: raw
+/// strings (`r#"..."#`) are handled; nested block comments are handled.
+pub fn strip_comments_and_strings(src: &str) -> Vec<String> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out_line = String::new();
+    let mut lines: Vec<String> = Vec::new();
+
+    let mut i = 0usize;
+    let n = chars.len();
+
+    // Lexer state.
+    let mut block_depth: u32 = 0; // /* */ nesting
+    let mut in_line_comment = false;
+    let mut in_string = false;
+    let mut in_char = false;
+    // Raw string: Some(hashes) while inside r#"..."# with `hashes` #'s.
+    let mut raw_string_hashes: Option<usize> = None;
+
+    let push_char = |out_line: &mut String, lines: &mut Vec<String>, c: char| {
+        if c == '\n' {
+            lines.push(std::mem::take(out_line));
+        } else {
+            out_line.push(c);
+        }
+    };
+    // When inside a removed region we still must emit the newlines so line
+    // numbers stay aligned; non-newline chars become a single space.
+    let push_blank = |out_line: &mut String, lines: &mut Vec<String>, c: char| {
+        if c == '\n' {
+            lines.push(std::mem::take(out_line));
+        } else {
+            out_line.push(' ');
+        }
+    };
+
+    while i < n {
+        let c = chars[i];
+
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+                push_char(&mut out_line, &mut lines, c);
+            } else {
+                push_blank(&mut out_line, &mut lines, c);
+            }
+            i += 1;
+            continue;
+        }
+
+        if block_depth > 0 {
+            if c == '/' && i + 1 < n && chars[i + 1] == '*' {
+                block_depth += 1;
+                push_blank(&mut out_line, &mut lines, ' ');
+                push_blank(&mut out_line, &mut lines, ' ');
+                i += 2;
+                continue;
+            }
+            if c == '*' && i + 1 < n && chars[i + 1] == '/' {
+                block_depth -= 1;
+                push_blank(&mut out_line, &mut lines, ' ');
+                push_blank(&mut out_line, &mut lines, ' ');
+                i += 2;
+                continue;
+            }
+            push_blank(&mut out_line, &mut lines, c);
+            i += 1;
+            continue;
+        }
+
+        if let Some(hashes) = raw_string_hashes {
+            // Look for the terminating "###... sequence of the same length.
+            if c == '"' {
+                let mut matched = true;
+                for k in 0..hashes {
+                    if i + 1 + k >= n || chars[i + 1 + k] != '#' {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    raw_string_hashes = None;
+                    push_blank(&mut out_line, &mut lines, ' '); // the closing quote
+                    for _ in 0..hashes {
+                        push_blank(&mut out_line, &mut lines, ' ');
+                    }
+                    i += 1 + hashes;
+                    continue;
+                }
+            }
+            push_blank(&mut out_line, &mut lines, c);
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            if c == '\\' && i + 1 < n {
+                // Escaped char: blank both, keep newline handling correct.
+                push_blank(&mut out_line, &mut lines, ' ');
+                push_blank(&mut out_line, &mut lines, chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            push_blank(&mut out_line, &mut lines, if c == '\n' { '\n' } else { c });
+            // Note: a normal (non-raw) string literal cannot span a raw
+            // newline without a `\` continuation in Rust, but tolerating
+            // it here only over-blanks — never under-blanks — so it stays
+            // conservative.
+            i += 1;
+            continue;
+        }
+
+        if in_char {
+            if c == '\\' && i + 1 < n {
+                push_blank(&mut out_line, &mut lines, ' ');
+                push_blank(&mut out_line, &mut lines, chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_char = false;
+            }
+            push_blank(&mut out_line, &mut lines, c);
+            i += 1;
+            continue;
+        }
+
+        // Not in any special region: detect region starts.
+        if c == '/' && i + 1 < n && chars[i + 1] == '/' {
+            in_line_comment = true;
+            push_blank(&mut out_line, &mut lines, ' ');
+            push_blank(&mut out_line, &mut lines, ' ');
+            i += 2;
+            continue;
+        }
+        if c == '/' && i + 1 < n && chars[i + 1] == '*' {
+            block_depth = 1;
+            push_blank(&mut out_line, &mut lines, ' ');
+            push_blank(&mut out_line, &mut lines, ' ');
+            i += 2;
+            continue;
+        }
+        // Raw string start: r"..." or r#"..."# (and br"...", etc.).
+        if c == 'r' || c == 'b' {
+            // Detect r, br, r#, br# … followed by the opening quote.
+            let mut j = i;
+            if chars[j] == 'b' {
+                j += 1;
+            }
+            if j < n && chars[j] == 'r' {
+                let mut k = j + 1;
+                let mut hashes = 0usize;
+                while k < n && chars[k] == '#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if k < n && chars[k] == '"' {
+                    // Confirmed raw string opener.
+                    raw_string_hashes = Some(hashes);
+                    for _ in i..=k {
+                        push_blank(&mut out_line, &mut lines, ' ');
+                    }
+                    i = k + 1;
+                    continue;
+                }
+            }
+        }
+        if c == '"' {
+            in_string = true;
+            push_blank(&mut out_line, &mut lines, ' ');
+            i += 1;
+            continue;
+        }
+        if c == '\'' {
+            // Could be a char literal or a lifetime (`'a`). Lifetimes are
+            // identifiers, not quoted — only enter char mode if this looks
+            // like a quoted literal (next-next char is a closing quote, or
+            // an escape). Over-conservatism here would blank a lifetime,
+            // which is harmless for our `Command::new` detection.
+            let is_charlit =
+                (i + 2 < n && chars[i + 2] == '\'') || (i + 1 < n && chars[i + 1] == '\\');
+            if is_charlit {
+                in_char = true;
+                push_blank(&mut out_line, &mut lines, ' ');
+                i += 1;
+                continue;
+            }
+        }
+
+        push_char(&mut out_line, &mut lines, c);
+        i += 1;
+    }
+    // Flush the final line (files may not end in newline).
+    lines.push(out_line);
+    lines
+}
+
+/// Whether an attribute line gates its item to test builds: `#[cfg(test)]`
+/// or `#[cfg(all(..., test, ...))]` where `test` is one of `all`'s top-level
+/// arguments (so the item exists only when compiling tests).
+/// `#[cfg(any(test, feature = "x"))]`, `not(test)` and
+/// `#[cfg(any(test, debug_assertions))]` are NOT test-only and do not match:
+/// a debug build compiles the last one, so — like the Python strict reading in
+/// `tests/common/rust_source.py` — it is production code here.
+pub fn is_test_cfg_attr(s: &str) -> bool {
+    let t = s.replace(char::is_whitespace, "");
+    if t.contains("#[cfg(test)]") {
+        return true;
+    }
+    if let Some(start) = t.find("#[cfg(all(") {
+        let inner = &t[start + "#[cfg(all(".len()..];
+        let mut depth = 0i32;
+        let mut arg = String::new();
+        for c in inner.chars() {
+            match c {
+                '(' => {
+                    depth += 1;
+                    arg.push(c);
+                }
+                ')' if depth == 0 => return arg == "test",
+                ')' => {
+                    depth -= 1;
+                    arg.push(c);
+                }
+                ',' if depth == 0 => {
+                    if arg == "test" {
+                        return true;
+                    }
+                    arg.clear();
+                }
+                _ => arg.push(c),
+            }
+        }
+    }
+    false
+}
+
+/// Compute, for each line index, whether it sits inside a test-gated item
+/// (an attribute [`is_test_cfg_attr`] accepts).
+///
+/// The item is delimited the way the compiler delimits it: from the
+/// attribute, the FIRST of
+///   * a `;` before any `{` — a one-line item (`#[cfg(test)] use x;`,
+///     `#[cfg(test)] mod tests;`, `#[cfg(test)] const X: u8 = 1;`), or
+///   * the `}` that balances the item's first `{`.
+///
+/// Operates on [`strip_comments_and_strings`] output, so a brace or a `;`
+/// inside a string or comment is not counted, and a comment that merely
+/// QUOTES `#[cfg(test)]` is not an attribute.
+///
+/// v0.2.102 (W6-Z2): the previous version counted braces only. A gated
+/// `use …;` therefore ran on to the NEXT production item's braces and marked
+/// that whole item as test code — about 210 production lines across the
+/// three crates (e.g. `installer.rs`'s gated `use` hid the item after it),
+/// so a `Command::new` there would never have been reported. An item that
+/// never terminates before EOF now gates NOTHING (fail closed: the gate can
+/// only get noisier, never blind), where it used to gate the rest of the
+/// file.
+pub fn test_gated_lines(stripped: &[String]) -> Vec<bool> {
+    gated_lines_by(stripped, is_test_cfg_attr)
+}
+
+/// [`is_test_cfg_attr`] OR an item compiled only into test-or-debug builds
+/// (`#[cfg(any(test, debug_assertions))]`, `#[cfg(all(unix, any(test,
+/// debug_assertions)))]`). For gates whose question is "can this run in a
+/// user's RELEASE build?" (`command_silent_gate.rs`); a scan that must see
+/// every line a dev build runs uses the strict [`is_test_cfg_attr`].
+// Used by command_silent_gate.rs only; each test crate compiles its own copy
+// of this module, so the other crate would warn.
+#[allow(dead_code)]
+pub fn is_test_or_debug_cfg_attr(s: &str) -> bool {
+    if is_test_cfg_attr(s) {
+        return true;
+    }
+    let t = s.replace(char::is_whitespace, "");
+    t.contains("#[cfg(") && t.contains("test") && t.contains("debug_assertions")
+}
+
+/// [`test_gated_lines`] with the release-build reading
+/// ([`is_test_or_debug_cfg_attr`]).
+#[allow(dead_code)] // command_silent_gate.rs only (see above)
+pub fn test_or_debug_gated_lines(stripped: &[String]) -> Vec<bool> {
+    gated_lines_by(stripped, is_test_or_debug_cfg_attr)
+}
+
+/// A file-level `#![cfg(test)]` makes the WHOLE file test code (the Python
+/// helper `tests/common/rust_source.py::cfg_test_spans` returns a whole-file
+/// span for the same attribute). It is file-level only BEFORE the file's first
+/// item: only whitespace (comments are already stripped) and other inner
+/// attributes may precede it. The same attribute inside an inline
+/// `mod x { #![cfg(test)] ... }` gates that module, not the file, and must
+/// not blank the production code around it (v0.2.102 W6-LOWS, R3 C-4).
+fn is_whole_file_test_cfg(stripped: &[String]) -> bool {
+    let text: Vec<char> = stripped.join("\n").chars().collect();
+    let mut pos = 0usize;
+    // A shebang on the very first line (`#!` not opening `[`) is skipped by
+    // the Rust lexer, so an inner attribute after it is still file-level.
+    if text.len() >= 2 && text[0] == '#' && text[1] == '!' {
+        let mut k = 2;
+        while k < text.len() && text[k].is_whitespace() && text[k] != '\n' {
+            k += 1;
+        }
+        if k >= text.len() || text[k] != '[' {
+            pos = text.iter().position(|c| *c == '\n').unwrap_or(text.len());
+        }
+    }
+    loop {
+        while pos < text.len() && text[pos].is_whitespace() {
+            pos += 1;
+        }
+        if pos + 1 >= text.len() || text[pos] != '#' || text[pos + 1] != '!' {
+            return false; // EOF, or the first item
+        }
+        let mut open = pos + 2;
+        while open < text.len() && text[open].is_whitespace() {
+            open += 1;
+        }
+        if open >= text.len() || text[open] != '[' {
+            return false; // `#!` not opening an inner attribute
+        }
+        let mut depth = 0i64;
+        let mut end = None;
+        for (k, c) in text.iter().enumerate().skip(open) {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { return false };
+        let attr: String = text[pos..=end].iter().filter(|c| !c.is_whitespace()).collect();
+        if attr == "#![cfg(test)]" {
+            return true;
+        }
+        pos = end + 1;
+    }
+}
+
+fn gated_lines_by(stripped: &[String], is_gate: fn(&str) -> bool) -> Vec<bool> {
+    let n = stripped.len();
+    if is_whole_file_test_cfg(stripped) {
+        return vec![true; n];
+    }
+    let mut gated = vec![false; n];
+
+    let mut i = 0usize;
+    while i < n {
+        if !is_gate(&stripped[i]) {
+            i += 1;
+            continue;
+        }
+        match gated_item_end(stripped, i) {
+            Some(end) => {
+                for g in gated.iter_mut().take(end + 1).skip(i) {
+                    *g = true;
+                }
+                i = end + 1;
+            }
+            None => i += 1,
+        }
+    }
+    gated
+}
+
+/// 0-based last line of the item whose test-gate attribute is on
+/// `stripped[attr]`, or `None` when it does not terminate before EOF.
+/// The attribute text itself carries no `{`, `}` or `;`, so scanning from the
+/// attribute's own line also handles an item written on the same line.
+fn gated_item_end(stripped: &[String], attr: usize) -> Option<usize> {
+    let mut depth: i64 = 0;
+    let mut started = false;
+    for (k, line) in stripped.iter().enumerate().skip(attr) {
+        for c in line.chars() {
+            match c {
+                ';' if !started => return Some(k),
+                '{' => {
+                    depth += 1;
+                    started = true;
+                }
+                '}' if started => {
+                    depth -= 1;
+                    if depth <= 0 {
+                        return Some(k);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}

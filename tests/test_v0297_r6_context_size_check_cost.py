@@ -32,6 +32,7 @@ from typing import Iterator
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -139,7 +140,7 @@ def _resolve(kind: str, tmp_path: Path, args: list[str], port: int = 9,
     if kind == "sh":
         cmd = [str(BASH), str(SCRIPTS / "vct_secrets_resolve.sh"), *args]
     else:
-        cmd = [str(PWSH), "-NoProfile", "-File", str(SCRIPTS / "vct_secrets_resolve.ps1"), *args]
+        cmd = [str(PWSH), *PWSH_BASE_FLAGS, "-File", str(SCRIPTS / "vct_secrets_resolve.ps1"), *args]
     start = time.monotonic()
     done = subprocess.run(cmd, capture_output=True, text=True,
                           env=_resolver_env(tmp_path, port, **extra), timeout=120)
@@ -222,7 +223,10 @@ def test_the_budget_bounds_a_hanging_hub_and_asks_it_once(kind: str, tmp_path: P
         done, elapsed = _resolve(kind, tmp_path, ["resolve-many", str(proj), *KEYS],
                                  port=port, VCT_RESOLVE_MAX_TIME="1")
     assert done.stdout.splitlines() == ["CONTEXT_STATE_MAX_LINES=120"]
-    assert done.returncode == 1
+    # v0.2.102 (W6-AB): a hub that ACCEPTS the connection and never answers is
+    # running but busy — the retryable "store unavailable" exit 7, not exit 1
+    # ("hub unreachable"); the budget leaves no room for the one retry.
+    assert done.returncode == 7
     assert count[0] == 1, f"the hub was asked {count[0]} times"
     # 1 s budget + interpreter start-up; the old ceiling was 2 x 5 s.
     assert elapsed < (2.5 if kind == "sh" else 4.0), elapsed
@@ -230,8 +234,8 @@ def test_the_budget_bounds_a_hanging_hub_and_asks_it_once(kind: str, tmp_path: P
 
 @needs_bash
 def test_without_a_budget_a_slow_live_hub_is_still_waited_for(tmp_path: Path) -> None:
-    """Leave-alone half: VCT_RESOLVE_MAX_TIME unset keeps the 5 s per-request
-    cap, so a hub that takes 0.6 s per request answers; with a 1 s budget the
+    """Leave-alone half: VCT_RESOLVE_MAX_TIME unset keeps the per-request cap
+    (30 s since v0.2.102), so a hub that takes 0.6 s per request answers; with a 1 s budget the
     same hub (two requests, 1.2 s) is given up on and the .env answers."""
     proj = _project(tmp_path, "CONTEXT_STATE_MAX_LINES=120\n")
     with slow_hub({"CONTEXT_STATE_MAX_LINES": "333"}, delay_s=0.6) as port:
@@ -316,7 +320,7 @@ def _run_hook(kind: str, proj: Path, tmp_path: Path, port: int = 9, **extra: str
     if kind == "sh":
         cmd = [str(BASH), str(proj / ".claude" / "hooks" / "context-size-check.sh")]
     else:
-        cmd = [str(PWSH), "-NoProfile", "-File", str(proj / ".claude" / "hooks" / "context-size-check.ps1")]
+        cmd = [str(PWSH), *PWSH_BASE_FLAGS, "-File", str(proj / ".claude" / "hooks" / "context-size-check.ps1")]
     start = time.monotonic()
     done = subprocess.run(cmd, input="{}", capture_output=True, text=True, cwd=proj, env=env, timeout=120)
     elapsed = time.monotonic() - start

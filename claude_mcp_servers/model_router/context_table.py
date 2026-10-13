@@ -197,6 +197,18 @@ class ModelContext:
     #: therefore carries the seed's value onto whatever row it returns (review
     #: S3); read the flag through ``is_text_only``, never off a raw row.
     text_only: bool = False
+    #: v0.2.102 (A8, OD-10): the ``thinking.clear_thinking`` value the vendor
+    #: documents for this model — the request-shaping knob that says whether
+    #: the endpoint may clear (drop) reasoning blocks from the conversation.
+    #: ``None`` (absent) is the DEFAULT and means "not sent": only a row whose
+    #: cited ``source``/``source_note`` backs a value carries one, and the
+    #: gateway adds the field ONLY to a request that already carries a
+    #: ``thinking`` param (never invents the param itself). Like ``text_only``
+    #: it is a property of the MODEL, so the SHIPPED SEED row is its only
+    #: authority and :meth:`ContextTable.clear_thinking` its only reader; a
+    #: launcher export (no column) cannot reset it — :meth:`ContextTable.lookup`
+    #: carries the seed's value onto whatever row answers.
+    clear_thinking: Optional[bool] = None
     #: v0.2.100 (F-W1-19): per-VENDOR figures for a model that more than one
     #: vendor serves at DIFFERENT windows (``vendor_id -> ModelContext``, each
     #: cited). The row's own figures stay the model's; a vendor that caps it
@@ -319,6 +331,12 @@ class ContextTable:
         seed_text_only = bool(seed_row.text_only) if seed_row is not None else False
         if resolved.text_only != seed_text_only:
             resolved = replace(resolved, text_only=seed_text_only)
+        # ``clear_thinking`` (v0.2.102 A8) gets the same carry for the same
+        # reason: an export row predating the field reads ``None`` and would
+        # silently stop the request-shaping the seed row curates.
+        seed_clear = seed_row.clear_thinking if seed_row is not None else None
+        if resolved.clear_thinking != seed_clear:
+            resolved = replace(resolved, clear_thinking=seed_clear)
         return resolved
 
     def _seed_row(self, model_id: str) -> Optional[ModelContext]:
@@ -355,6 +373,24 @@ class ContextTable:
         # either spelling of an id answers.
         row = self.lookup(parse_model_id(model_id.strip()).bare_id)
         return bool(row.text_only) if row is not None else False
+
+    def clear_thinking(self, model_id: str) -> Optional[bool]:
+        """The ``thinking.clear_thinking`` value the seed curates, or ``None``.
+
+        The one reader of :attr:`ModelContext.clear_thinking` (v0.2.102 A8,
+        OD-10) and the entry point the gateway's request-shaping uses. The
+        carry discipline is :meth:`is_text_only`'s: resolved through
+        :meth:`lookup`, so a launcher export that predates the field cannot
+        silently stop the shaping. ``None`` — the default for a row the seed
+        does not flag — means "not sent", and a model no row names gets the
+        same answer rather than a guess: only a CITED row may opt a model in.
+        ``[1m]`` and a vendor namespace are tolerated, same as
+        :meth:`is_text_only`.
+        """
+        if not isinstance(model_id, str):
+            return None
+        row = self.lookup(parse_model_id(model_id.strip()).bare_id)
+        return row.clear_thinking if row is not None else None
 
     def assume_window(self, model_id: str) -> AssumedWindow:
         """The window to ASSUME for ``model_id``. Always answers.
@@ -422,6 +458,32 @@ class ContextTable:
         if row is not None and row.context_window > 0:
             return AssumedWindow(row.context_window, ASSUMED_FROM_TABLE)
 
+        best = self.older_sibling_floor(model_id)
+        if best is not None:
+            return AssumedWindow(
+                best.context_window, ASSUMED_FROM_FAMILY, best.model_id,
+            )
+        return AssumedWindow(UNKNOWN_FAMILY_WINDOW, ASSUMED_FLOOR)
+
+    def older_sibling_floor(self, model_id: str) -> Optional[ModelContext]:
+        """The highest-window STRICTLY-OLDER sibling of ``model_id``'s family.
+
+        The table-only family floor, extracted from :meth:`assume_window`
+        because a second caller now needs the same scan: the usage ledger's
+        ``window_actual`` (:func:`model_router.server._actual_window`) feeds
+        this row to :func:`model_router.catalog.resolve_window` as the family
+        floor, so a first-party id the seed has not tabulated yet (a model
+        that shipped after the last seed edit) inherits its predecessor's
+        window exactly as the picker's own floor rule would give it — without
+        building a catalog, which must never happen on the request path.
+
+        Same restrictions as :meth:`assume_window`'s step 2, because they are
+        that step: same family stem, strictly older version, a positive
+        window, tombstoned rows excluded (via :meth:`_known_rows`), and — when
+        the id carries a vendor namespace — only that vendor's rows.
+        ``None`` when no sibling qualifies.
+        """
+        parts = parse_model_id(model_id)
         vendor, _remainder = split_namespace(model_id, VENDORS)
         vendor_id = vendor.vendor_id if vendor is not None else None
         best: Optional[ModelContext] = None
@@ -443,11 +505,7 @@ class ContextTable:
                 )
             ):
                 best = candidate
-        if best is not None:
-            return AssumedWindow(
-                best.context_window, ASSUMED_FROM_FAMILY, best.model_id,
-            )
-        return AssumedWindow(UNKNOWN_FAMILY_WINDOW, ASSUMED_FLOOR)
+        return best
 
     def _known_rows(self) -> tuple[ModelContext, ...]:
         """Every row a lookup could answer with: export first, seed behind it.
@@ -591,6 +649,10 @@ def _parse(
             source=source,
             source_note=str(raw.get("source_note") or ""),
             text_only=bool(raw.get("text_only")),
+            # A8 (OD-10): strictly boolean or absent — any other shape is
+            # dropped to "not sent" rather than guessed at, because this
+            # value reaches the request bytes.
+            clear_thinking=_bool_or_none(raw.get("clear_thinking")),
             vendor_overrides=overrides,
         )
     return rows, tuple(uncited), tombstones
@@ -640,6 +702,11 @@ def _parse_override(
 
 class _UnsupportedSchema(ValueError):
     """The document parsed but declares a schema this reader does not know."""
+
+
+def _bool_or_none(value: object) -> Optional[bool]:
+    """A strictly boolean seed field, else ``None`` (meaning "not sent")."""
+    return value if isinstance(value, bool) else None
 
 
 def load_seed() -> ContextTable:

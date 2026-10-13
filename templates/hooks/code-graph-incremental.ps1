@@ -1,10 +1,10 @@
-﻿# OS-EXEMPT-PARITY: .sh sibling uses the hub resolver
-#   (vct_project_config.sh --field code_graph_collection_prefix); this
-#   .ps1 uses a different design path (`detect-project.ps1` helper +
-#   `Split-Path -Leaf` fallback), so the v0.2.23 W1 slug-vs-prefix
-#   resolver-field switch in the .sh has no corresponding change here.
-#   Marking the exemption explicitly so the OS-parity CI gate accepts
-#   the asymmetric modification.
+﻿# Parity (v0.2.102): this hook and its .sh sibling resolve the same way -
+#   hub `code_graph_collection_prefix` with a folder-name fallback, extra
+#   paths, sibling detection, canonical git root, worktree gate - and pass the
+#   same analyzer argv. tests/test_code_graph_incremental_hook.sh runs ONE
+#   scenario set against both (`sh` and `ps1` flavors). The OS-EXEMPT-PARITY
+#   marker that used to sit here claimed this file did not use the hub
+#   resolver; it did, and the exemption only hid the two from the parity gate.
 # parity-confirmation 2026-05-10: .sh sibling now uses _lib/find-python.sh; this .ps1 already used _lib/find-python.ps1 — true parity, no asymmetric fix.
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
@@ -40,9 +40,13 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
 . "$PSScriptRoot/_lib/resolve-powershell.ps1"
 
+# Repo root: an explicit -RepoPath wins; else the ONE rule (_lib/project-root.ps1,
+# must match vco_lib/project_root.py). None -> nothing to analyze.
 if (-not $RepoPath) {
-    $RepoPath = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+    . (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+    $RepoPath = Get-VcoProjectRoot
 }
+if (-not $RepoPath) { exit 0 }
 
 # v0.2.66 (Bug 3): resolve the code-graph collection prefix for a root via
 # the vct-hub resolver (code_graph_collection_prefix), else the basename of
@@ -119,6 +123,7 @@ if ($VcoVenvPy) {
 # Backwards-compatible: pre-v0.2.47 hubs lack the field; the resolver
 # exits 4 and the loop is a no-op.
 $ExtrasMatched = $false
+$PrimaryRoot = $RepoPath  # the project's own folder, kept for --primary-root
 if ($EditedFile -notlike "$RepoPath/*" -and $EditedFile -notlike "$RepoPath\*") {
     $ExtrasResolver = Join-Path $RepoPath ".claude/scripts/vct_project_config.ps1"
     if (Test-Path $ExtrasResolver) {
@@ -141,10 +146,16 @@ if ($EditedFile -notlike "$RepoPath/*" -and $EditedFile -notlike "$RepoPath\*") 
 
 # Auto-detect project (best-effort; helper may not exist on Windows).
 # v0.2.47: skip when extras already claimed the edited file.
+# v0.2.102: detect-project.ps1 is a function LIBRARY (it only defines
+# Get-ProjectForFile, mirroring the `source` + detect_project_for_file use of
+# the .sh sibling). Running it as a script with positional args, as this hook
+# did since v0.2.50, printed nothing, so sibling detection was dead on Windows.
+# Dot-source it and call the function, like the .sh hook. MUST MATCH the .sh.
 $DetectPs1 = Join-Path $DefaultRepoRoot ".claude/scripts/detect-project.ps1"
 if (-not $ExtrasMatched -and (Test-Path $DetectPs1)) {
     try {
-        $detected = (& $PsExe -NoProfile -File $DetectPs1 $EditedFile $RepoPath 2>$null).Trim()
+        . $DetectPs1
+        $detected = ("" + (Get-ProjectForFile -FilePath $EditedFile -CurrentRoot $RepoPath)).Trim()
         if ($detected) {
             $ProjectName = $detected
             $RepoPath = Join-Path (Split-Path $RepoPath -Parent) $detected
@@ -225,6 +236,19 @@ if (-not $ExtrasMatched) {
             [Console]::Error.WriteLine("code-graph: skipped worktree edit (ephemeral/unregistered) $EditedFile")
             exit 0
         }
+        # v0.2.102 W6-ALERTS2 (owner ruling 3): the gate indexed on doubt
+        # because the hub did not answer. Say so (stderr -- this script is run
+        # from the CLI or by a caller, with no hook event to answer), once per
+        # session/hour. MUST MATCH the .sh sibling.
+        if ($script:WorktreeGateHubUnreachable) {
+            $emitLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
+            if (Test-Path -LiteralPath $emitLib) { . $emitLib }
+            if (Get-Command Get-VcoHubUnreachableNotice -ErrorAction SilentlyContinue) {
+                $null = Get-VcoHubUnreachableNotice -HooksDir $PSScriptRoot -ProjectRoot $RepoPath -AgentKey "" `
+                    -Who "code-graph-incremental" `
+                    -What "It indexed $EditedFile anyway (the safe default when it cannot confirm that a worktree is unregistered), so throwaway worktrees may be indexed until the hub is back."
+            }
+        }
     }
 }
 
@@ -265,8 +289,8 @@ if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 # so an unchanged or trivially-edited file writes ~0 objects. No repo-wide
 # prune happens, so this can't re-introduce the V52-O.7 prune-deletes-other-
 # rows regression.
-# --canonical-source $CanonRoot dedups git-worktree edits onto the
-# main-checkout object (Bug 3 part b — mirrors the .sh sibling).
+# --canonical-source $CanonRoot dedups git-worktree edits of the PROJECT onto
+# the main-checkout object (Bug 3 part b — mirrors the .sh sibling).
 #
 # v0.2.72 (P7): the per-object skip also honors the embedding-revision gate.
 # When an edited file contains a Function/Class whose stored embed_revision is
@@ -282,7 +306,20 @@ if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 # uses the canonical main root's setting.
 $IndexDotClaude = Resolve-IndexDotClaude -Root $CanonRoot
 $DotClaudeFlag = if ($IndexDotClaude) { '--index-dot-claude' } else { '--no-index-dot-claude' }
-$analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, '--canonical-source', $CanonRoot, $DotClaudeFlag)
+# v0.2.102: an edit claimed by an extra path is analyzed with --as-extra-path,
+# like every other extra-path analyzer run (vco_lib.codegraph_extras_refresh.
+# build_extra_sync_argv): deletes are limited to rows provably stamped with
+# the extra path. W6-CGD (D-2): --canonical-source is for the PROJECT's own
+# edits only; an extra's rows carry the registered extra root, as every other
+# extra producer stamps (vco_lib.codegraph_source_scope.walk_source_stamp).
+# --primary-root lets the analyzer refuse an extra that overlaps the project
+# (vco_lib.codegraph_extra_overlap). MUST MATCH the .sh sibling.
+if ($ExtrasMatched) {
+    $analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, $DotClaudeFlag,
+        '--as-extra-path', '--primary-root', $PrimaryRoot)
+} else {
+    $analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, '--canonical-source', $CanonRoot, $DotClaudeFlag)
+}
 # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1, dot-sourced
 # at the top of this file): an unguarded `-WindowStyle Hidden` is REJECTED on
 # non-Windows PowerShell editions, so the analyzer spawn never happens and the

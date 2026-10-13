@@ -52,7 +52,13 @@ fi
 
 # Project root resolution: CLAUDE_PROJECT_DIR is the canonical signal at
 # hook fire time; fall back to PWD for ad-hoc invocations.
-PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> nothing to do (no state is written).
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_ROOT="$(vco_project_root)" || PROJECT_ROOT=""
+[ -n "$PROJECT_ROOT" ] || exit 0
 
 # Locate the matcher. Per the install-bundle layout, hooks live at
 # `<project>/.claude/hooks/` and scripts at `<project>/.claude/scripts/`,
@@ -73,6 +79,17 @@ fi
 # already-suggested items across prompts in the same session.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 [ -z "$HOOK_STDIN" ] && exit 0
+
+# v0.2.102 W6-C1 (F14): a background subagent's completion arrives in the
+# parent as a SYNTHETIC UserPromptSubmit whose prompt starts with the
+# literal "<task-notification>" tag — it is a harness delivery, not user
+# prose, and keyword suggestions drawn from the subagent's report body are
+# noise. Skip it BEFORE the Python parse below (the pattern probe needs no
+# interpreter), exactly like inject_intent.prompt_query does for the
+# prompt-time KG retrieval. MUST MATCH the .ps1 sibling and that Python home.
+if printf '%s' "$HOOK_STDIN" | grep -Eq '"prompt"[[:space:]]*:[[:space:]]*"<task-notification>'; then
+    exit 0
+fi
 
 PROMPT_AND_SID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys

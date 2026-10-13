@@ -20,7 +20,7 @@
 # OS support: pure PowerShell — no Python or external tools required.
 
 # ---------------------------------------------------------------------------
-# Limit-VcoHookContext -Text <s> [-Pointer <s>]
+# Limit-VcoHookContext -Text <s> [-Pointer <s>] [-Limit <n>]
 #
 # v0.2.100 WP-17 -- THE cap for text a hook injects into the model's context.
 # Claude Code's hooks contract: injected hook output past 10 000 characters is
@@ -31,6 +31,12 @@
 # saying what was cut and where the rest is. .Length counts UTF-16 code units
 # (>= characters), so the limit holds; a surrogate pair split by the cut is
 # dropped. MUST MATCH _lib/emit-context.sh's vco_cap_context.
+#
+# v0.2.102 W6-D: the optional -Limit overrides the global cap for ONE call --
+# the value the caller computed as a SECTION budget inside the global cap
+# (compact-context-reinject truncates each of its sections within itself so
+# no section is dropped wholesale). The marker is the same: the section cut
+# exists to keep the whole stream under the 10 000-character injection limit.
 function Get-VcoHookContextCap {
     $cap = 9500
     $raw = [string]$env:VCO_HOOK_CONTEXT_CAP
@@ -46,9 +52,9 @@ function Get-VcoHookContextCap {
 }
 
 function Limit-VcoHookContext {
-    param([string]$Text, [string]$Pointer = '')
+    param([string]$Text, [string]$Pointer = '', [int]$Limit = 0)
     if (-not $Text) { return $Text }
-    $cap = Get-VcoHookContextCap
+    $cap = if ($Limit -gt 0) { $Limit } else { Get-VcoHookContextCap }
     $total = $Text.Length
     if ($total -le $cap) { return $Text }
     $suffix = if ($Pointer) { " $Pointer" } else { "" }
@@ -139,7 +145,7 @@ function Get-VcoHookLibRole {
     $base = $base -replace '\.(sh|ps1)$', ''
     switch ($base) {
         "route-touched-path" {
-            return "routing a touched path to kg-sync (knowledge/), the development collection (docs/), the diagram indexer and the code-graph queue, so every Edit, Write and CLI write is being parsed and then dropped"
+            return "routing a touched path to kg-sync (knowledge/), the development collection (docs/) and the code-graph queue, so every Edit, Write and CLI write is being parsed and then dropped"
         }
         "bash-write-targets" {
             return "recovering the paths a shell command wrote, so no CLI write is even looked at -- a redirect, a heredoc, sed -i or patch into knowledge/ or docs/ now reaches Weaviate never"
@@ -197,6 +203,77 @@ Restore it by updating this project's bundle:
             }
             $sentinel = Join-Path $sentinelDir ("route_lib_missing_{0}_{1}" -f $key, $Lib)
             if (Test-Path $sentinel) { return "" }   # already reported
+        } catch {
+            $sentinel = ""
+        }
+    }
+
+    [Console]::Error.WriteLine($notice)
+    if ($sentinel) {
+        try { New-Item -ItemType File -Force -Path $sentinel -ErrorAction Stop | Out-Null } catch { }
+    }
+    return $notice
+}
+
+
+# ---------------------------------------------------------------------------
+# Get-VcoHubUnreachableNotice -HooksDir <dir> -ProjectRoot <dir> -AgentKey <key>
+#                             -Who <text> -What <text>
+#
+# v0.2.102 W6-ALERTS2 (owner ruling 3): a hook that NEEDED the vct-hub and
+# could not reach it keeps its conservative default (the shared worktree gate
+# indexes on doubt, FIX-A') -- but the model is told, so it can bring the hub
+# back. Same two channels and the same once-per-session discipline as
+# Emit-VcoMissingHookLibNotice above: stderr (for the human, and for a CLI
+# caller whose stderr the model reads), and the RETURNED string for the
+# caller's own additionalContext envelope ("" when already reported).
+#
+# Once per session PER AGENT KEY (vco_lib/hook_agent_key; session-id.ps1
+# composes it), keyed by .claude/state/hub_unreachable_notice_<key> -- ONE
+# sentinel shared by every hub-dependent hook. No trustworthy session (empty /
+# "default" key: a standalone CLI run) -> keyed by the UTC hour, so at most
+# once an hour. A failed sentinel write repeats the notice rather than losing
+# it. MUST MATCH `_lib/emit-context.sh`'s vco_report_hub_unreachable.
+function Get-VcoHubUnreachableNotice {
+    param(
+        [string]$HooksDir = "",
+        [string]$ProjectRoot = "",
+        [string]$AgentKey = "",
+        [string]$Who = "a VCO hook",
+        [string]$What = ""
+    )
+    $key = $AgentKey
+    $sessionLib = Join-Path $HooksDir "_lib/session-id.ps1"
+    if ($HooksDir -and (Test-Path $sessionLib)) { . $sessionLib }
+    if (Get-Command Get-VcoSanitizedSessionId -ErrorAction SilentlyContinue) {
+        $key = Get-VcoSanitizedSessionId $key
+    } elseif ($key -and ($key -notmatch '^[A-Za-z0-9_-]+$')) {
+        $key = "default"
+    }
+    $cadence = "(Shown once per session.)"
+    if (-not $key -or $key -eq "default") {
+        $key = "nosession-" + [DateTime]::UtcNow.ToString("yyyyMMddHH")
+        $cadence = "(Shown at most once an hour: this caller has no session.)"
+    }
+
+    $whatPart = if ($What) { " $What" } else { "" }
+    $notice = @"
+[VCO hub unreachable] $Who needed the vct-hub and could not reach it (stopped, or a stale token after a launcher restart).$whatPart
+Bring it back with:
+  vct-hub --start-if-not-running
+(if vct-hub is not on PATH: python -m vco_lib.hub_ensure ensure, with the VCO venv's python). Hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN).
+$cadence
+"@
+
+    $sentinel = ""
+    if ($ProjectRoot) {
+        $sentinelDir = Join-Path $ProjectRoot ".claude/state"
+        try {
+            if (-not (Test-Path $sentinelDir)) {
+                New-Item -ItemType Directory -Force -Path $sentinelDir -ErrorAction Stop | Out-Null
+            }
+            $sentinel = Join-Path $sentinelDir ("hub_unreachable_notice_{0}" -f $key)
+            if (Test-Path -LiteralPath $sentinel) { return "" }   # already reported
         } catch {
             $sentinel = ""
         }

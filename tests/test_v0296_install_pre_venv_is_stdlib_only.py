@@ -244,20 +244,10 @@ def test_no_third_party_import_is_reachable_before_the_venv():
             "the reason and returns False, and the caller then re-embeds the "
             "expensive way (the behaviour of every release before v0.2.95)."
         ),
-        # Both of these run from _detect_system — genuinely pre-venv — and are safe for
-        # the reason the rule allows: psutil only REFINES an answer the stdlib
-        # can already give, and `except ImportError: pass` falls through to it.
-        # Verified by reading both bodies, not by their names.
-        "_probe_system_ram_gb": (
-            "`import psutil` under `except ImportError: pass`, falling through "
-            "to /proc/meminfo (Linux), `sysctl hw.memsize` (macOS) and wmic "
-            "(Windows). The stdlib path is the real implementation."
-        ),
-        "_probe_cpu_cores": (
-            "same shape: `except ImportError: pass` falls through to "
-            "`os.cpu_count() // 2`, deliberately conservative. psutil only "
-            "improves physical-vs-logical accuracy."
-        ),
+        # `_probe_system_ram_gb` / `_probe_cpu_cores` were listed here until
+        # v0.2.102 W5-D moved them to the stdlib-only leaf vco_lib.host_probe
+        # (psutil imported lazily under `except ImportError`), which install.py
+        # imports at module scope — so they no longer live in install.py.
     }
 
     local_imports: dict[str, set[str]] = {}

@@ -137,7 +137,7 @@ class TestClassification:
     def test_signal_is_a_keyword_never_raw_text(self, sb):
         """Privacy: only the matched token is recorded, never the failure
         text (which on these paths can quote node content)."""
-        secret = "usage limit reached; context was: SECRET-NODE-BODY"
+        secret = "usage limit reached; context was: SECRET-NODE-BODY"  # vco-secret-scan: test-placeholder
         reason, signal = sb.classify_backend_failure(text=secret)
         assert reason == "quota"
         assert "SECRET-NODE-BODY" not in signal

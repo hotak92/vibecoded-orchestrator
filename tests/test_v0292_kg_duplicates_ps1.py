@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.wrapper_staging import stage_scripts
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parent.parent
 WRAPPER_PS1 = REPO / "templates" / "scripts" / "kg-duplicates.ps1"
@@ -63,7 +64,7 @@ def test_refusal_is_on_stderr_with_exit_1(tmp_path: Path) -> None:
         if k not in ("VCT_VENV", "VCT_INSTALL_ROOT", "VCT_ORCHESTRATOR_ROOT")
     }
     proc = subprocess.run(
-        [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        [exe, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File",
          str(proj / ".claude" / "scripts" / "kg-duplicates.ps1")],
         capture_output=True, text=True, env=env, cwd=str(proj), timeout=120,
     )
@@ -122,7 +123,7 @@ def test_forwards_every_argument_to_detect_duplicates(tmp_path: Path) -> None:
         "VCT_ORCHESTRATOR_ROOT": "",
     }
     proc = subprocess.run(
-        [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        [exe, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-File",
          str(scripts / "kg-duplicates.ps1"), "-threshold", "0.90",
          "-output", "report.md"],
         capture_output=True, text=True, env=env, cwd=str(proj), timeout=120,

@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed.
+﻿# Parity: kept in step with lean-ctx-rewrite.sh (this file's UTF-8 BOM serves
+# Windows PowerShell 5.1 only and has no Bash-side counterpart; every
+# behaviour must match the lean-ctx-rewrite.sh sibling).
 # Per-project lean-ctx PreToolUse hook for Bash tool calls (Windows).
 # Windows sibling of templates/hooks/lean-ctx-rewrite.sh — see that file
 # for the full rationale (fork-bomb avoidance, v0.2.101 allow-list
@@ -55,7 +57,9 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 # 2. Per-project knobs. Read .claude/env if it exists; look for the
 #    VCO_LEAN_CTX_DEFAULT / VCO_LEAN_CTX_TEE_TTL_HOURS lines (KEY=VALUE
-#    syntax). Anything else in the file is ignored — this script doesn't
+#    syntax, optional `export ` prefix, LAST assignment wins -- what the .sh
+#    sibling's `source` gives; the shared rule is vco_lib/envfile.py). Anything
+#    else in the file is ignored — this script doesn't
 #    `Invoke-Expression` user env files (avoids arbitrary code-exec from a
 #    malformed .claude/env).
 # One-quote-pair rule for the raw .claude/env scan -- SHARED home
@@ -75,14 +79,14 @@ $leanCtxTtl = "168"
 if (Test-Path -LiteralPath $envFile) {
     try {
         foreach ($line in Get-Content -LiteralPath $envFile -ErrorAction Stop) {
-            if ($line -match '^\s*VCO_LEAN_CTX_DEFAULT\s*=\s*(.+?)\s*$') {
+            if ($line -match '^\s*(?:export\s+)?VCO_LEAN_CTX_DEFAULT\s*=\s*(.+?)\s*$') {
                 $leanCtxDefault = $Matches[1]
                 if (Get-Command Strip-OneQuotePair -ErrorAction SilentlyContinue) {
                     $leanCtxDefault = Strip-OneQuotePair $leanCtxDefault
                 }
                 $leanCtxDefault = $leanCtxDefault.ToLowerInvariant()
             }
-            if ($line -match '^\s*VCO_LEAN_CTX_TEE_TTL_HOURS\s*=\s*(.+?)\s*$') {
+            if ($line -match '^\s*(?:export\s+)?VCO_LEAN_CTX_TEE_TTL_HOURS\s*=\s*(.+?)\s*$') {
                 $leanCtxTtl = $Matches[1]
                 if (Get-Command Strip-OneQuotePair -ErrorAction SilentlyContinue) {
                     $leanCtxTtl = Strip-OneQuotePair $leanCtxTtl
@@ -149,6 +153,12 @@ if (-not (Test-Path -LiteralPath $teePath)) { exit 0 }
 # 4. Allow-list decision. Every failure arm exits 0 with NO stdout → the
 #    original command runs raw under the normal permission flow.
 try { $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop } catch { exit 0 }
+# v0.2.102 W5-D: lean-ctx compression is Bash-only (coordinator decision 2026-10-09, accepted in review).
+# The wrapper re-runs the command through a POSIX shell
+# (lean-ctx -c), which cannot run PowerShell syntax, so this hook stays
+# registered on matcher Bash and any other tool name (a PowerShell-tool call
+# reaching it through a user-widened matcher) runs raw.
+if ($payload -and $payload.tool_name -and [string]$payload.tool_name -ne "Bash") { exit 0 }
 $cmd = ""
 if ($payload -and $payload.tool_input -and $payload.tool_input.command) {
     $cmd = [string]$payload.tool_input.command
@@ -222,7 +232,12 @@ if (-not $matched) { exit 0 }
 # Allow-listed → cmd file (verbatim) + wrapper rewrite. Any failure →
 # exit 0 with no stdout → raw.
 if ($leanCtxTtl -notmatch '^[0-9]+$') { $leanCtxTtl = "168" }
-$proj = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> no tee dir, so the command runs raw (the documented arm for a state dir that cannot be made).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$proj = Get-VcoProjectRoot
+if (-not $proj) { exit 0 }
 $rawDir = Join-Path $proj ".claude/state/lean-ctx-tee"
 try { New-Item -ItemType Directory -Path $rawDir -Force -ErrorAction Stop | Out-Null } catch { exit 0 }
 # SF-1 (v0.2.101 review) + NF-4 (re-review): the tee dir holds raw command

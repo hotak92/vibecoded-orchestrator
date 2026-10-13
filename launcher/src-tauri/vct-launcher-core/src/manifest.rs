@@ -1947,12 +1947,13 @@ pub struct McpRegistration {
     /// per-project overrides in `project_mcp_tool_grants`. Per-project
     /// rows always win; absent rows fall through to `default_enabled`.
     ///
-    /// Empty `Vec` and `None` are semantically equivalent here — the hub
-    /// returns the hardcoded fallback allowlist (diagrams-era constants)
-    /// when no rows are registered for `mcp_name`. This means an
-    /// orchestrator-bundled MCP (mermaid/excalidraw) that ships WITHOUT
-    /// a manifest still gets sensible defaults; a paid module that ships
-    /// WITH a manifest declares its own.
+    /// Empty `Vec` and `None` are semantically equivalent here — with no
+    /// rows registered for `mcp_name` the hub returns an EMPTY grants
+    /// map: failsafe-DENY for an unregistered MCP, never failsafe-ALLOW
+    /// (v0.2.102 removed the hardcoded bundled-MCP fallback that used to
+    /// fill this arm, along with the deleted diagram wrappers). Defaults
+    /// exist only when a module manifest declares them; a paid module
+    /// that ships WITH a manifest declares its own.
     ///
     /// Reconciliation contract on module update: tools added in the new
     /// version are inserted with their declared `default_enabled`. Tools
@@ -1975,7 +1976,7 @@ pub struct McpRegistration {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct ToolAllowlistEntry {
     /// Tool name as exposed by the wrapper's upstream MCP (e.g.
-    /// `"render"`, `"save_diagram"`, `"export_png"`). Case-sensitive.
+    /// `"search"`, `"fetch"`, `"export"`). Case-sensitive.
     pub tool: String,
     /// Whether the wrapper allows this tool when no per-project
     /// override exists. Defaults to `true` so an absent value in the
@@ -5115,12 +5116,12 @@ mod tests {
         let entry = ToolAllowlistEntry {
             tool: "render".into(),
             default_enabled: true,
-            description: Some("renders mermaid".into()),
+            description: Some("renders output".into()),
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"tool\":\"render\""));
         assert!(json.contains("\"default_enabled\":true"));
-        assert!(json.contains("\"description\":\"renders mermaid\""));
+        assert!(json.contains("\"description\":\"renders output\""));
         let parsed: ToolAllowlistEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, entry);
     }

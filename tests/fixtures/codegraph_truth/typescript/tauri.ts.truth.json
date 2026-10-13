@@ -1,0 +1,41 @@
+{
+ "source": "tauri.ts",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "tauriAvailable",
+   "start": 11,
+   "end": 13,
+   "full_name": "tauri.tauriAvailable"
+  },
+  {
+   "kind": "function",
+   "name": "isTauriRuntime",
+   "start": 16,
+   "end": 18,
+   "full_name": "tauri.isTauriRuntime"
+  },
+  {
+   "kind": "function",
+   "name": "invoke",
+   "start": 26,
+   "end": 35,
+   "full_name": "tauri.invoke"
+  },
+  {
+   "kind": "function",
+   "name": "safeInvoke",
+   "start": 55,
+   "end": 69,
+   "full_name": "tauri.safeInvoke"
+  },
+  {
+   "kind": "function",
+   "name": "listen",
+   "start": 71,
+   "end": 79,
+   "full_name": "tauri.listen"
+  }
+ ]
+}

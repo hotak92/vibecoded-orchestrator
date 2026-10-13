@@ -958,15 +958,9 @@ def resolve_gateway_ports() -> tuple[int, ...]:
 
 def _read_port_env(env: Optional[Mapping[str, str]] = None) -> Optional[int]:
     """``VCT_MODEL_GATEWAY_PORT``, when it names a usable port."""
-    env = os.environ if env is None else env
-    raw = (env.get(PORT_ENV) or "").strip()
-    if not raw:
-        return None
-    try:
-        port = int(raw)
-    except ValueError:
-        return None
-    return port if 0 < port < 65536 else None
+    from vco_lib.env_values import env_int  # noqa: PLC0415
+
+    return env_int(PORT_ENV, None, env=env, minimum=1, maximum=65535)
 
 
 def panel_endpoint_port(base_url: Optional[str]) -> Optional[int]:
@@ -1476,9 +1470,26 @@ def _version_tuple(text: str) -> "Optional[tuple[int, int, int]]":
     leading digit run (``0.2.95rc1`` == ``0.2.95``). Both ranked a string
     nobody should have produced; now it is not ranked at all, and the caller
     reports freshness as unknown.
+
+    The ONE exception (v0.2.102 NB-07): a PEP 440 LOCAL suffix
+    (``0.2.102+local``) is stripped before the parse and the RELEASE part is
+    compared, so a suffixed dev build reads as equal-or-newer than its bare
+    release instead of "unrankable". That is not a loosening of the strict
+    parser — ``parse_version`` still refuses the suffixed string, and every
+    other malformed shape (pre-releases, fourth numbers, junk) still answers
+    ``None``; it is a rule about what a dev build IS, applied at this
+    consumer because the gateway self-test is the one place a suffixed build
+    is legitimate (``pip install -e`` after a local ``+local`` version bump).
     """
     from vco_lib.version_compare import VersionParseError, parse_version
 
+    if isinstance(text, str):
+        release, _sep, local = text.partition("+")
+        # Only a NON-EMPTY local part earns the strip; a trailing bare "+"
+        # (``0.2.102+``) is malformed and stays for the strict parser to
+        # refuse, so no suffix-shaped string is silently repaired.
+        if local.strip():
+            text = release
     try:
         return parse_version(text)
     except VersionParseError:

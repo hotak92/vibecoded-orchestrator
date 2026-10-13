@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed.
+﻿# Parity: kept in step with session-start-kg-loader.sh (this file's UTF-8 BOM serves
+# Windows PowerShell 5.1 only and has no Bash-side counterpart; every
+# behaviour must match the session-start-kg-loader.sh sibling).
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
@@ -21,7 +23,12 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
 . "$PSScriptRoot/_lib/resolve-powershell.ps1"
 
-$ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to do (no state is written).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectDir = Get-VcoProjectRoot
+if (-not $ProjectDir) { exit 0 }
 
 $LibDir = Join-Path $PSScriptRoot "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"

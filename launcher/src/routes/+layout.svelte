@@ -93,6 +93,14 @@
   import GatewayRestartModal from '$lib/components/GatewayRestartModal.svelte';
   import { gatewayFreshness } from '$lib/stores/gateway-freshness';
   import { scheduleStartupCheck } from '$lib/gateway-freshness';
+  // v0.2.102 W6-L: code-graph parsers on demand — when a registered project
+  // contains a language whose parser is missing, ask (modal) before installing.
+  import CodegraphParsersModal from '$lib/components/CodegraphParsersModal.svelte';
+  import { codegraphParsers } from '$lib/stores/codegraph-parsers';
+  // v0.2.102 W6-J: the KG duplicate re-scan alert (the bell; see
+  // kg-rescan-alerts.ts for the candidacy rule).
+  import { syncKgRescanAlert } from '$lib/kg-rescan-alerts';
+  import { notifications } from '$lib/stores/notifications';
   import { invoke, listen } from '$lib/tauri';
   // M-P1-5: per-install-root scoping for localStorage flags. See
   // `install-state-store.ts` for the migration rationale (two clones
@@ -226,6 +234,14 @@
     // Cancelled on teardown (review R1 F15) so a remount never stacks checks.
     const cancelFreshnessCheck = scheduleStartupCheck(() => gatewayFreshness.check());
 
+    // v0.2.102 W6-J: after boot settles, list the projects whose KG may need
+    // a duplicate re-scan into the notification bell (read-only; a failed
+    // status read changes nothing). Same cancel-on-teardown discipline as
+    // the freshness check above.
+    const cancelKgRescanCheck = scheduleStartupCheck(() =>
+      syncKgRescanAlert({ invoke, store: notifications }),
+    );
+
     // Check onboarding / changelog gates once per app load.
     //
     // Bug 14 fix (2026-05-05): the `onboarding_complete` flag now lives in
@@ -357,12 +373,33 @@
       stopStatusPolling();
       stopShellListeners?.();
       cancelFreshnessCheck();
+      cancelKgRescanCheck();
     };
   });
 
   // Routes that render outside the chrome shell (no MenuBar / Sidebar /
   // StatusBar). Auth pages are the only such case today.
   const fullBleed = $derived($page.url.pathname.startsWith('/auth'));
+
+  // v0.2.102 W6-L: code-graph parser offers, asked at PROJECT STARTUP — (a)
+  // when the registered project list loads or changes (launcher start, a
+  // newly added project): every project; (b) when a project is opened: that
+  // project, re-detected (a blank project may have gained a language since).
+  // Each ask is cheap (Python caches languages by a directory-mtime
+  // signature) and never installs anything; the modal asks first.
+  const registeredPathsKey = $derived(
+    $projects.projects.map((p) => p.folder_path).join('\n'),
+  );
+  $effect(() => {
+    const key = registeredPathsKey;
+    if (!key) return;
+    void codegraphParsers.check(key.split('\n'));
+  });
+  $effect(() => {
+    const sel = $selectedProject;
+    if (!sel?.folder_path) return;
+    void codegraphParsers.check([sel.folder_path]);
+  });
 
   // Remember the last "section" (top-level path segment) the user visited
   // while a project was selected. /p/<slug>/+page.svelte reads this on
@@ -530,6 +567,7 @@
        toast store. Renders nothing on its own (pure side-effect mount). -->
   <UpdateToast />
   <GatewayRestartModal />
+  <CodegraphParsersModal />
 {/if}
 
 <style>

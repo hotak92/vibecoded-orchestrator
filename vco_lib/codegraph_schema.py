@@ -10,9 +10,13 @@ same "add this skip-vectorized property if missing" loop:
      chunk_num + total_chunks (v0.2.72 P3/P7);
   2. ``migrations/codegraph_collection/5_to_6.py`` — is_test + n_callers
      (v0.2.73 M1/M4);
-  3. ``templates/scripts/analyze_code_graph.py`` — the ``_ensure_*_property``
+  3. ``migrations/codegraph_collection/7_to_8.py`` — ``project`` on
+     CodeInteraction + its backfill (v0.2.102 S16-4);
+     ``migrations/codegraph_collection/8_to_9.py`` — ``is_test`` on CodeAPI
+     + its backfill from the stored ``file_path`` (v0.2.102 W6-O);
+  4. ``templates/scripts/analyze_code_graph.py`` — the ``_ensure_*_property``
      belt-and-suspenders helpers that fire on every analyze run (covering
-     Weaviate-down / standalone-analyzer windows the edges can't).
+     Weaviate-down windows the edges can't).
 
 This module is the ONE home for the property SPECS and the ensure loop:
 
@@ -20,11 +24,12 @@ This module is the ONE home for the property SPECS and the ensure loop:
     (X-1 / v0.2.76, ruling #1: the previous inline fallback copies were
     removed — a missing ``vco_lib`` is a broken install that fails loudly, not
     a silent inline-copy degrade).
-  * The analyzer template keeps its inline ``_ensure_*`` helpers (it must
-    run standalone at user sites), but
-    ``tests/test_codegraph_schema_parity.py`` asserts its ensured
-    ``(class, prop, type)`` set is EQUAL to :data:`CODEGRAPH_PROPERTY_SPECS`
-    — the test is the lock.
+  * The analyzer template's ``_ensure_*`` helpers are thin delegators to
+    :func:`ensure_analyzer_properties` (v0.2.102 — the inline copies were a
+    second home for the same loop; the analyzer already imports ``vco_lib``
+    everywhere and a failing import is a broken install).
+    ``tests/test_codegraph_schema_parity.py`` asserts the helpers jointly
+    ensure EXACTLY :data:`CODEGRAPH_PROPERTY_SPECS` — the test is the lock.
 
 NEW PROPS: add them HERE first, then mirror into the analyzer's
 ``_ensure_*`` helper and the new migration edge (the parity test fails
@@ -36,7 +41,10 @@ embedding inputs.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, Optional, Tuple
+import logging
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Canonical property descriptions (shared by the migration edges; the
@@ -58,6 +66,7 @@ _N_CALLERS_DESC = (
     "Inbound call count (Python-resolved, project-internal; "
     "render-time context)"
 )
+_PROJECT_DESC = "Project name"
 
 #: One spec row: (property name, Weaviate DataType member name, description).
 PropSpec = Tuple[str, str, str]
@@ -91,10 +100,30 @@ CODEGRAPH_PROPERTY_SPECS: Dict[str, Tuple[PropSpec, ...]] = {
     ),
     "CodeAPI": (
         ("embed_revision", "INT", _EMBED_REVISION_DESC),
+        # v0.2.102 W6-O (edge 8_to_9): test-fixture routes (19 of 22 VCO rows)
+        # were indistinguishable from production endpoints.
+        ("is_test", "BOOL", _IS_TEST_DESC),
     ),
     "CodeInteraction": (
         ("embed_revision", "INT", _EMBED_REVISION_DESC),
+        # v0.2.102 (S16-4/S16-5, edge 7_to_8): the other four classes were born
+        # with `project`; CodeInteraction only ever carried `source_project`.
+        # Every `project`-scoped reader (the identity sweep, the stale prune,
+        # the deleted-file prune, search_code_graph's self filter) failed or
+        # silently skipped this class. Same name/type/tokenization as the
+        # other four classes' creation-time property.
+        ("project", "TEXT", _PROJECT_DESC),
     ),
+}
+
+#: Class suffix → the analyzer attribute holding that collection handle (the
+#: analyzer's belt-and-suspenders ensure path, :func:`ensure_analyzer_properties`).
+ANALYZER_COLLECTION_ATTRS: Dict[str, str] = {
+    "CodeModule": "modules_collection",
+    "CodeClass": "classes_collection",
+    "CodeFunction": "functions_collection",
+    "CodeAPI": "apis_collection",
+    "CodeInteraction": "interactions_collection",
 }
 
 
@@ -189,3 +218,97 @@ def ensure_codegraph_properties(
             # the edge's log line names it and the runner does NOT advance.
             raise CodegraphPropertyEnsureError(class_name, str(exc)) from exc
     return results
+
+
+def ensure_analyzer_properties(analyzer: Any, props: Iterable[str]) -> List[str]:
+    """The analyzer's belt-and-suspenders ensure: add the spec'd ``props`` to
+    whichever of its collection handles lack them. Returns the
+    ``"<suffix>.<prop>"`` adds that happened this call.
+
+    Differs from :func:`ensure_codegraph_properties` only in failure posture,
+    which is the analyzer's contract since v0.2.61: SOFT-FAIL per (collection,
+    property) with a debug log — an analyze run must never wedge on a 422 here
+    (the readers treat an absent property conservatively), whereas a migration
+    edge must fail loudly so the runner does not advance its version. A missing
+    handle attribute (``None`` / absent on a stub) is skipped.
+    """
+    from weaviate.classes.config import DataType, Property  # local: only when running
+
+    added: List[str] = []
+    for suffix, specs in specs_subset(props).items():
+        coll = getattr(analyzer, ANALYZER_COLLECTION_ATTRS[suffix], None)
+        if coll is None:
+            continue
+        try:
+            existing = {p.name for p in coll.config.get().properties}
+        except Exception as exc:  # noqa: BLE001 — soft-fail (see docstring)
+            logger.debug("codegraph ensure: config read on %s skipped: %s", suffix, exc)
+            continue
+        for prop_name, dtype_name, desc in specs:
+            if prop_name in existing:
+                continue
+            try:
+                coll.config.add_property(
+                    Property(
+                        name=prop_name,
+                        data_type=getattr(DataType, dtype_name),
+                        description=desc,
+                        skip_vectorization=True,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — soft-fail (see docstring)
+                logger.debug(
+                    "codegraph ensure: %s on %s skipped: %s", prop_name, suffix, exc
+                )
+                continue
+            added.append(f"{suffix}.{prop_name}")
+            print(f"   Added {prop_name} property to {suffix} schema")
+    return added
+
+
+def backfill_missing_property(coll: Any, prop: str, value: str) -> Tuple[int, int]:
+    """Set ``prop = value`` on every row of ``coll`` where it is NULL / empty.
+    Returns ``(updated, failures)``.
+
+    The write side of an additive property that carries a value (v0.2.102:
+    ``project`` on CodeInteraction, filled from the collection's canonical
+    identity — a per-project-prefix class holds only that project's rows).
+
+    * ONLY rows lacking the value are touched — a populated row is never
+      rewritten, whatever it holds (a stale identity is the identity sweep's
+      to migrate, not this function's to overwrite).
+    * Resumable: each row is one independent ``data.update`` (a PATCH of that
+      one property — no vector, no other property touched), so an interrupted
+      run leaves a clean prefix done and the next run continues with the rest.
+    * Soft-fail: a per-row update error is counted and the scan continues; an
+      unreadable class (config / iterator error) is ONE failure. The caller
+      decides what a failure means (an edge exits non-zero so the runner
+      retries; the analyzer logs and lets the next run retry).
+    * A class without the property, or an empty ``value``, backfills nothing.
+    """
+    if not value:
+        return 0, 0
+    try:
+        if prop not in {p.name for p in coll.config.get().properties}:
+            return 0, 0
+    except Exception as exc:  # noqa: BLE001 — unreadable class → one failure
+        logger.warning("backfill %s: config read on %s failed: %s",
+                       prop, getattr(coll, "name", "?"), exc)
+        return 0, 1
+    updated = failures = 0
+    try:
+        for obj in coll.iterator(return_properties=[prop]):
+            if (getattr(obj, "properties", None) or {}).get(prop) not in (None, ""):
+                continue
+            try:
+                coll.data.update(uuid=obj.uuid, properties={prop: value})
+                updated += 1
+            except Exception as exc:  # noqa: BLE001 — per-row soft-fail
+                failures += 1
+                logger.warning("backfill %s: update %s in %s failed: %s",
+                               prop, obj.uuid, getattr(coll, "name", "?"), exc)
+    except Exception as exc:  # noqa: BLE001 — enumerate failure → one failure
+        logger.warning("backfill %s: enumerate %s failed: %s",
+                       prop, getattr(coll, "name", "?"), exc)
+        failures += 1
+    return updated, failures

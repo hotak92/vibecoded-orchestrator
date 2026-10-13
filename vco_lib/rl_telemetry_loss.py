@@ -25,6 +25,11 @@ collected. Two ways a log can go missing were invisible until now:
   them (v0.2.101 NB-04: a loader/emit crash, a writer that raised, a validation
   failure). Recorded apart from ``hub_post_failed`` because no POST was ever
   attempted for these events, so nothing else names them.
+* ``writer_unavailable`` — an event was dropped because no telemetry writer
+  could be constructed for it (v0.2.102 W3R-5: the writer factory raised or
+  returned None — a broken install — or the deferred-emit parent could not
+  resolve the writer's construction params and dropped the event before
+  spawning the child). Previously these paths were DEBUG-log-only.
 
 Every such loss appends ONE JSON line to
 ``<vct_root>/metrics/rl_telemetry_loss.jsonl`` (the shared metrics home, beside
@@ -65,6 +70,22 @@ KIND_DUAL_PARTIAL = "dual_partial"
 #: and failed is recorded per event under :data:`KIND_HUB_POST_FAILED`
 #: instead, so the two never count the same event twice.
 KIND_DEFERRED_UNSENT = "deferred_unsent"
+#: An RL event was dropped because NO TELEMETRY WRITER could be constructed
+#: for it — the writer factory raised or returned None (a broken install:
+#: ``RLTelemetryWriter`` unimportable), or the deferred-emit parent could not
+#: resolve the writer's construction params and dropped the event before the
+#: child ever saw it (v0.2.102 W3R-5). Exactly the install state where
+#: visibility matters most, so it is ledgered rather than DEBUG-logged.
+KIND_WRITER_UNAVAILABLE = "writer_unavailable"
+#: A ``bash_outcome`` emit died BEFORE the hub POST was attempted
+#: (v0.2.102 W3R-4): the post-bash hook's emit child could not run (missing
+#: / bogus venv), crashed, raised, or read a corrupt pairing state file —
+#: pre-fix the pairing file was then deleted unconditionally and the loss
+#: was invisible (``hub_post_failed`` only fires once a POST is attempted).
+#: Recorded by the hook itself (the child when it can run, the wrapper via
+#: the orchestrator checkout otherwise); the pairing file is only deleted
+#: once the emit succeeded OR the loss is ledgered here.
+KIND_OUTCOME_UNSENT = "outcome_unsent"
 
 #: Once the ledger passes ``_MAX_BYTES`` it is cut to its newest
 #: ``_KEEP_LINES`` lines (through the repo's one rotation home,
@@ -209,6 +230,8 @@ __all__ = [
     "KIND_DUAL_PARTIAL",
     "KIND_DUAL_SKIP",
     "KIND_HUB_POST_FAILED",
+    "KIND_WRITER_UNAVAILABLE",
+    "KIND_OUTCOME_UNSENT",
     "LOSS_FILE_NAME",
     "loss_log_path",
     "record_loss",

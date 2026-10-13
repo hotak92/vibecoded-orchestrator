@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Parity: kept in step with stop-codegraph-drain.ps1 (its v0.2.92 PowerShell-only
+# detached-spawn hardening is the Windows twin of the setsid / nohup spawn below;
+# every other behaviour must match the .ps1 sibling).
 # stop-codegraph-drain.sh — Stop hook (v0.2.73 FIX-B)
 #
 # END-OF-TURN BATCHED code-graph sync. Replaces the per-EDIT
@@ -144,14 +147,23 @@ _drain_resolve_runtime() {
 
 # Run a `sh -c` snippet fully detached (new session when possible) — the ONE
 # spawn shape of this hook, so a Stop hook never waits on an analyzer.
+#
+# v0.2.102 NB-H5: the command string is $1; any further arguments are passed
+# to `sh -c` as POSITIONAL PARAMETERS ($0, $1, … inside the snippet). Data
+# (paths, interpreters) must travel as argv, NEVER interpolated into the
+# snippet: a path containing `$`, backticks or `"` inside a double-quoted
+# `sh -c` string is re-parsed by the shell — command substitution / word
+# splitting / injection. With argv the shell never re-parses the data.
 _drain_spawn_detached() {
+    local _cmd="$1"
+    shift || true
     if command -v setsid >/dev/null 2>&1; then
-        setsid sh -c "$1" >/dev/null 2>&1 < /dev/null &
+        setsid sh -c "$_cmd" "$@" >/dev/null 2>&1 < /dev/null &
     elif command -v nohup >/dev/null 2>&1; then
-        nohup sh -c "$1" >/dev/null 2>&1 < /dev/null &
+        nohup sh -c "$_cmd" "$@" >/dev/null 2>&1 < /dev/null &
         disown 2>/dev/null || true
     else
-        ( sh -c "$1" ) >/dev/null 2>&1 < /dev/null &
+        ( sh -c "$_cmd" "$@" ) >/dev/null 2>&1 < /dev/null &
     fi
 }
 
@@ -190,8 +202,47 @@ if [ -d "$STATE_DIR" ]; then
             _CG_EXTRAS_LOG="$_CG_EXTRAS_LOG_DIR/codegraph_extras_refresh.log"
             # The child's own stderr (an import failure, a crash) lands in the
             # same log the module writes, so a broken refresh is never silent.
-            _drain_spawn_detached "\"$ANALYZER_PY\" -m vco_lib.codegraph_extras_refresh --project-root \"$PROJECT_ROOT\" --analyzer \"$ANALYZER\" --state-dir \"$STATE_DIR\" >>\"$_CG_EXTRAS_LOG\" 2>&1"
+            # NB-H5 (v0.2.102): every path travels as a POSITIONAL PARAMETER —
+            # interpolating "$PROJECT_ROOT" into the sh -c string re-parsed
+            # `$`, backticks and `"` in the path (command injection).
+            _drain_spawn_detached '"$0" -m vco_lib.codegraph_extras_refresh --project-root "$1" --analyzer "$2" --state-dir "$3" >>"$4" 2>&1' \
+                "$ANALYZER_PY" "$PROJECT_ROOT" "$ANALYZER" "$STATE_DIR" "$_CG_EXTRAS_LOG"
         fi
+    fi
+fi
+
+# ── EXTRA EDIT QUEUES: drain on Stop (v0.2.102 S16-7) ─────────────────────
+# route-touched-path.sh queues a code edit under an ENABLED extra path to
+# codegraph_drain_extra_<md5(extra)>_<session>.txt (never the primary queue —
+# an extra path must not be analyzed under the primary's collection). Drain
+# those queues here through `vco_lib.codegraph_extras_refresh --queued`, a
+# scoped --only-files-from run with the extra's OWN --project prefix.
+# Deliberately OUTSIDE both throttles: the 120 s primary rate limit below and
+# the 600 s commit-stamp interval above protect the analyzer from repeated
+# FULL walks; a queued scoped drain is cheap, so a queued extra is drained on
+# every Stop. The per-path root lock inside refresh_queued still serialises
+# runs over the same checkout. MUST MATCH the .ps1 sibling.
+shopt -s nullglob 2>/dev/null || true
+_CG_EXTRA_QUEUES=( "$STATE_DIR"/codegraph_drain_extra_*_*.txt )
+shopt -u nullglob 2>/dev/null || true
+# Skip the pre-fix-round-2 TRANSIENT analyzer input
+# (codegraph_drain_extra_list_<md5>.txt): a process killed mid-drain could
+# leak one, and it is not a queue (v0.2.102 I-A5). The current transient name
+# (codegraph_drain_extra-files-<md5>.txt) does not match the glob at all.
+_CG_EXTRA_QUEUES_REAL=()
+for _f in "${_CG_EXTRA_QUEUES[@]}"; do
+    case "$_f" in
+        */codegraph_drain_extra_list_*.txt) continue ;;
+    esac
+    _CG_EXTRA_QUEUES_REAL+=("$_f")
+done
+if [ "${#_CG_EXTRA_QUEUES_REAL[@]}" -gt 0 ]; then
+    if _drain_resolve_runtime; then
+        _CG_EXTRAS_LOG_DIR="$PROJECT_ROOT/.claude/logs"
+        mkdir -p "$_CG_EXTRAS_LOG_DIR" 2>/dev/null || true
+        _CG_EXTRAS_LOG="$_CG_EXTRAS_LOG_DIR/codegraph_extras_refresh.log"
+        _drain_spawn_detached '"$0" -m vco_lib.codegraph_extras_refresh --queued --project-root "$1" --analyzer "$2" --state-dir "$3" >>"$4" 2>&1' \
+            "$ANALYZER_PY" "$PROJECT_ROOT" "$ANALYZER" "$STATE_DIR" "$_CG_EXTRAS_LOG"
     fi
 fi
 
@@ -326,6 +377,32 @@ while IFS= read -r _p; do
     printf '%s\n' "$_p" >> "$BATCH_DIR/$_h.paths"
 done < "$CONSUMED"
 
+# v0.2.102 W6-ALERTS2 (owner ruling 3): a gate probe found the hub unreachable
+# and indexed on doubt (FIX-A' unchanged). Tell the model once per session per
+# agent key so it can bring the hub back. This hook runs async on Stop, so
+# Claude Code hands the additionalContext over on the next turn (vendor hooks
+# doc, "How async hooks execute"). MUST MATCH stop-codegraph-drain.ps1.
+if [ "${VCO_WORKTREE_GATE_HUB_UNREACHABLE:-}" = "1" ]; then
+    # shellcheck source=_lib/emit-context.sh disable=SC1091
+    [ -f "$SCRIPT_DIR/_lib/emit-context.sh" ] && . "$SCRIPT_DIR/_lib/emit-context.sh"
+    # shellcheck source=_lib/session-id.sh disable=SC1091
+    [ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
+    _hub_key="$SESSION_ID"
+    if command -v vco_hook_fast_agent_key >/dev/null 2>&1; then
+        _hub_key="$(vco_hook_fast_agent_key "$HOOK_STDIN")"
+    fi
+    if command -v vco_report_hub_unreachable >/dev/null 2>&1; then
+        vco_report_hub_unreachable "$SCRIPT_DIR" "$PROJECT_ROOT" "$_hub_key" \
+            "The end-of-turn code-graph drain (stop-codegraph-drain)" \
+            "It still indexed this turn's worktree edits (the safe default when it cannot confirm that a worktree is unregistered), so throwaway worktrees may be indexed until the hub is back."
+        if [ -n "$VCO_HUB_DOWN_NOTICE" ] && command -v emit_additional_context >/dev/null 2>&1; then
+            _hub_event="Stop"
+            case "$HOOK_STDIN" in *'"SubagentStop"'*) _hub_event="SubagentStop" ;; esac
+            emit_additional_context "$VCO_HUB_DOWN_NOTICE" "$_hub_event"
+        fi
+    fi
+fi
+
 # Nothing survived the gate → clean up + record the drain ts (so a turn of
 # pure-worktree edits still advances the rate-limit clock) and exit.
 _ANY=0
@@ -423,8 +500,16 @@ for _pf in "$BATCH_DIR"/*.paths; do
     # run from a DEAD holder via `kill -0` — a slow-but-healthy full pass keeps
     # its lock past 30 min instead of being broken into a 2nd concurrent run
     # (Stage-1 SEV-2 #3).
-    _snip="printf '%s' \"\$\$\" > \"$_lock/pid\" 2>/dev/null; \"$ANALYZER_PY\" \"$ANALYZER\" \"$_canon\" --project \"$_project\" --only-files-from \"$_list\" --canonical-source \"$_canon\" $_dot_flag >/dev/null 2>&1; rm -f \"$_list\" 2>/dev/null; rm -rf \"$_lock\" 2>/dev/null"
-    _drain_spawn_detached "$_snip"
+    #
+    # NB-H5 (v0.2.102 fix-round 2): every path travels as a POSITIONAL
+    # PARAMETER, exactly like the extras spawns above — interpolating
+    # "$_canon" & co. into the sh -c string re-parsed `$`, backticks and `"`
+    # in a canonical root. $6 is the dot-claude flag (one fixed token from
+    # _drain_index_dot_claude) and stays UNQUOTED so an empty value disappears
+    # instead of reaching the analyzer as an empty argument.
+    # shellcheck disable=SC2086
+    _drain_spawn_detached 'printf "%s" "$$" > "$0/pid" 2>/dev/null; "$1" "$2" "$3" --project "$4" --only-files-from "$5" --canonical-source "$3" $6 >/dev/null 2>&1; rm -f "$5" 2>/dev/null; rm -rf "$0" 2>/dev/null' \
+        "$_lock" "$ANALYZER_PY" "$ANALYZER" "$_canon" "$_project" "$_list" "$_dot_flag"
 done
 
 # Record the drain timestamp (rate-limit clock) + clean up.

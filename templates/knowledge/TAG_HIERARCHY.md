@@ -324,37 +324,11 @@ Tags: [#workflow, #knowledge-graph, #claude-orchestrator, #idea, #mid-level-arch
 
 ---
 
-## Tag Inference Rules
+## How Tags Are Stored
 
-These rules are used by the automated inference engine to derive tags from relationships:
-
-### Rule 1: Domain Tag Propagation
-
-When a node has a typed relationship to another node:
-- **Uses/Implements relationship** → Inherit domain tags from target
-  - Project [[uses::Weaviate]] → Inherits `#database`, `#vector-db`
-  - Concept [[implements::RAG]] → Inherits `#AI`, `#retrieval`
-
-### Rule 2: Capability Tag Inheritance
-
-When a node uses a tool:
-- **Uses relationship** → Inherit capability tags (hyphenated tags)
-  - Project [[uses::Weaviate]] → Inherits `#vector-search`, `#semantic-search`
-  - Project [[uses::FastAPI]] → Inherits `#async`, `#type-hints`
-
-### Rule 3: Pattern Tag Propagation
-
-When a node implements a pattern:
-- **Implements relationship** → Inherit pattern tag
-  - Project [[implements::RAG Pattern]] → Gets `#RAG`
-  - Tool [[implements::MCP Pattern]] → Gets `#MCP`
-
-### Rule 4: Technology Stack Inference
-
-When multiple related tools are used:
-- Detect common stacks and add meta-tag
-  - Uses [FastAPI, Pydantic, Uvicorn] → Add `#python-stack`
-  - Uses [React, NextJS, TypeScript] → Add `#react-stack`
+- A node's tags are exactly the `tags:` list in its own frontmatter, stored as written.
+- No tag is inferred from links: a `[[uses::Weaviate]]` link does not add `#weaviate` or any other tag. If a node should carry a tag, write it in the frontmatter.
+- This file is a reference document for authors. No sync, search or validation logic reads it, and nothing enforces it.
 
 ---
 
@@ -426,7 +400,7 @@ When reviewing node tags, ensure:
 - [ ] All tags are lowercase (except acronyms)
 - [ ] Multi-word tags use hyphens
 - [ ] No duplicate/overlapping tags
-- [ ] Tags match relationships (e.g., if [[uses::Weaviate]], has `#weaviate`)
+- [ ] Tags match relationships (e.g., if [[uses::Weaviate]], the frontmatter lists `#weaviate` — links never add tags by themselves)
 - [ ] Status tag is current (matches actual state)
 
 ---

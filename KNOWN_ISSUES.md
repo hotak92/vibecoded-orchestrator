@@ -103,13 +103,16 @@ flagging for early adopters and the next iteration.
       ``tests/test_kg_seed_nodes_have_abstraction_tags.py``, and
       ``tests/test_kg_seed_nodes_use_kebab_case_tags.py``.*
 
-- [ ] **First-install grew by ~150 MB for Playwright MCP** — the default-enabled
-      `playwright` MCP entry pre-caches Chromium during `install.py` so the first
-      browser-automation call doesn't stall on a 150 MB download. Bandwidth-constrained
-      users can opt out by exporting `VCT_SKIP_PLAYWRIGHT=1` before running
-      `first-install.sh` / `install.py`; the MCP will then lazy-install Chromium on
-      its first browser-launch instead. The pre-cache is non-fatal — if `npx` is
-      missing or the download fails, the install logs a warn event and continues.
+- [ ] **First-install grew by ~170 MB for Playwright MCP** — the default-enabled
+      `playwright` MCP (pinned, launched with `--browser chromium`) needs Playwright's
+      own Chromium at the revision its playwright-core requests, so `install.py`
+      downloads it through the pinned package's installer. Bandwidth-constrained users
+      can opt out by exporting `VCT_SKIP_PLAYWRIGHT=1` before running
+      `first-install.sh` / `install.py`; the MCP's browser tools then fail at launch
+      until `npx -y @playwright/mcp@<pin> install-browser chromium` is run (`vco doctor`
+      prints the exact command). The pre-cache is non-fatal — if `npx` is missing or
+      the download fails, the install continues and defers `playwright_browser_missing`
+      with that command.
 
 - [ ] **KG summaries may be empty on add-project if no summariser backend is
       reachable** (0.2.3, `commands::kg_summary`). The KG-summary background task
@@ -117,7 +120,8 @@ flagging for early adopters and the next iteration.
       to `templates/scripts/generate-kg-summary.py`. That script picks the first
       available backend in order — `claude` CLI on PATH → Ollama at
       `KG_SUMMARY_OLLAMA_URL` (default `http://localhost:11435`, model
-      `KG_SUMMARY_OLLAMA_MODEL`, default `qwen3.5:9b`) → `ANTHROPIC_API_KEY`
+      `KG_SUMMARY_OLLAMA_MODEL`, default the machine's generation model —
+      `vco_lib.summary_model`) → `ANTHROPIC_API_KEY`
       direct. If none of the three is reachable, the script logs
       `KG-summary: no backend available` and exits 0; the launcher detects this
       marker on the first node, hard-stops the walk, and transitions the

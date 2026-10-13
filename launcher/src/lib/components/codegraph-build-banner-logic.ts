@@ -3,7 +3,9 @@
 
 // v0.2.75 P2d (C-11b) — pure decision logic for the CodeGraphBuildBanner's
 // prune-failure escalation. Extracted so it is unit-testable without mounting
-// the Svelte component (mirrors regenerate-modal-logic.ts).
+// the Svelte component (mirrors deferral-ledger.ts; the former
+// regenerate-modal-logic.ts sibling was retired in v0.2.102 W6-J with the
+// model-switch modal).
 
 import type { CodeGraphBuildView } from '$lib/types/launcher';
 

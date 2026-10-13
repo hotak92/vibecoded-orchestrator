@@ -2,12 +2,15 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Give VCO a key in its OWN OpenAI slot for one test — the ONE home (v0.2.98).
 
-VCO's consumers resolve the shared ``openai_api_key`` slot and NOTHING else
-(owner ruling 2026-09-26): ``$OPENAI_API_KEY`` is not read, a per-project
-secret binding is not read, and a project's own ``.env`` is not read. So a
-test that needs the OpenAI path to be *reachable* has to seed the slot;
-setting the env var has no effect, and a test still setting it is pinning the
-OLD rule by accident.
+VCO's consumers resolve the project's DEDICATED ``vco_openai_api_key``
+first, then the shared ``openai_api_key`` slot (owner decision OD-4 + its
+2026-10-09 refinement): ``$OPENAI_API_KEY`` is not read, a per-project
+``openai_api_key`` is not read, and a project's own ``.env`` is not read
+(the matrix is the store). So a test that needs the OpenAI path to be
+*reachable* has to seed a slot (this fixture seeds the SHARED file-store
+copy, which answers for every requester without a dedicated per-project
+copy); setting the env var has no effect, and a test still setting it is
+pinning the OLD rule by accident.
 
 Two forms, both hermetic and both usable from a ``unittest.TestCase`` (this
 repo's suite is mostly unittest, where the ``monkeypatch`` fixture is not
@@ -52,12 +55,16 @@ def _slot(value: str | None) -> Iterator[Path]:
             stored.chmod(0o600)
         openai_key._resolved.clear()
         openai_key._warned_env_var = False
+        openai_key._warned_paused = False
+        openai_key._warned_leg1 = False
         try:
             with patch.dict(os.environ, {"VCT_SECRETS_DIR": str(root)}):
                 yield root
         finally:
             openai_key._resolved.clear()
             openai_key._warned_env_var = False
+            openai_key._warned_paused = False
+            openai_key._warned_leg1 = False
 
 
 @contextlib.contextmanager

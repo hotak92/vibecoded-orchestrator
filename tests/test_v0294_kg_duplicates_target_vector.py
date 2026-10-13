@@ -53,12 +53,24 @@ class _Meta:
 
 
 class _Obj:
-    """One Weaviate object as the scanner consumes it."""
+    """One Weaviate object as the scanner consumes it.
 
-    def __init__(self, uid: str, title: str, path: str) -> None:
+    ``vector`` is what ``fetch_object_by_id(include_vector=True)`` would
+    return (v0.2.102 doubles): a ``{slot: [floats]}`` dict on a
+    named-vector class, ``None`` when the object carries no vector at all.
+    """
+
+    def __init__(
+        self,
+        uid: str,
+        title: str,
+        path: str,
+        vector: "dict | None" = None,
+    ) -> None:
         self.uuid = uid
         self.properties = {"title": title, "file_path": path, "node_type": "concept"}
         self.metadata = _Meta(0.0)
+        self.vector = vector
 
 
 class _Page:
@@ -597,19 +609,23 @@ def test_a_failure_with_the_object_still_present_still_fails_the_scan(
 ) -> None:
     """The dangerous direction stays closed.
 
-    An EMPTY-SLOT failure carries nearly the same sentence as a vanished
-    object (they differ only by ``for target: <slot>``), and it means the scan
-    is querying a vector nothing ever wrote. If the tolerance swallowed that,
-    the scanner would report "0 duplicates" for a graph it never searched —
-    the precise lie v0.2.92 and v0.2.94 each closed once.
+    An EMPTY-SLOT failure on an object that is still there AND still carries
+    the queried slot's vector means the scan's query itself is broken (wrong
+    slot resolution, dead transport). If the v0.2.102 tolerance swallowed
+    THAT, the scanner would report "0 duplicates" for a graph it never
+    searched — the precise lie v0.2.92 and v0.2.94 each closed once. The
+    object-short-of-the-slot shape (the v0.2.101 field defect, covered below)
+    is the ONE tolerated case; this test pins everything else shut.
 
-    Red-proof: replace the ``if not self._node_is_gone(node_uuid): raise``
-    guard with an unconditional ``continue`` and this fails: the scan reports
-    a clean graph with ``scan_error is None``.
+    Red-proof: make the except branch skip unconditionally and this fails:
+    the scan reports a clean graph with ``scan_error is None``.
     """
     _pin_active_embedding(monkeypatch, "qwen3")
     mod = _load(SCANNER)
     nodes = _nodes(3)
+    # The failing object CARRIES the target slot's vector — so the failure
+    # is not "this object lacks the vector", and must stay fatal.
+    nodes[1].vector = {"qwen3_embed": [0.1, 0.2]}
     coll = _Collection(
         MULTI_VECTOR, nodes=nodes, still_present_failures={str(nodes[1].uuid)}
     )
@@ -686,6 +702,7 @@ class _StubDetector:
         self.threshold = similarity_threshold
         self.scan_error = None
         self.nodes_skipped = 2
+        self.objects_missing_vector = ()
         _StubDetector.instances.append(self)
 
     def find_duplicates(self):
@@ -797,3 +814,205 @@ def test_the_scanner_connects_to_the_env_resolved_instance(
         )
     finally:
         det.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v0.2.102 — the THIRD field defect on this same mechanism (2026-10-10)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Observed live on a v0.2.101 install, via the every-10-edits hook::
+#
+#     ❌ Error during duplicate detection: … nearObject params: vector not
+#        found for target: qwen3_embed.
+#     ⚠️  Scan did NOT complete — no verdict.
+#
+# The trailing ``for target: <slot>`` is the OTHER meaning of Weaviate's one
+# sentence: the object IS there, but it carries no vector in the slot the
+# scan queries. One such object — written while a different embedding profile
+# was active, or by a sync whose active backend failed and only a fallback
+# slot landed — aborted the WHOLE scan. The v0.2.96 tolerance confirmed the
+# object was still present and then re-raised, so exactly this shape had no
+# path but "no verdict".
+#
+# The contract now: skip-and-report PER OBJECT (count + titles + the slots
+# each object does carry), scan completes with a verdict; anything that
+# cannot be POSITIVELY established still fails the scan.
+
+
+def test_one_object_lacking_the_target_vector_is_skipped_not_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The field defect, pinned: the scan survives and says what it skipped.
+
+    Red-proof: revert the ``present_slots`` branch in ``find_duplicates``
+    (the pre-fix tree) and this fails — ``scan_error`` names ``vector not
+    found`` and a 3-object scan produces no verdict, exactly as the live
+    v0.2.101 run did.
+    """
+    _pin_active_embedding(monkeypatch, "qwen3")
+    mod = _load(SCANNER)
+    nodes = _nodes(3)
+    # Node 1 is present but carries only a FALLBACK slot — the
+    # active-backend-failed shape `_build_vector_arg` documents.
+    nodes[1].vector = {"openai_embed": [0.3, 0.4]}
+    coll = _Collection(
+        MULTI_VECTOR, nodes=nodes, still_present_failures={str(nodes[1].uuid)}
+    )
+
+    duplicates, det = _scan(mod, coll)
+
+    assert det.scan_error is None, (
+        "one object short of the target vector is a per-object skip, not a "
+        f"scan failure: {det.scan_error}"
+    )
+    assert duplicates == []
+    assert det.nodes_skipped == 0  # a DIFFERENT counter than the vanished race
+    assert len(det.objects_missing_vector) == 1
+    entry = det.objects_missing_vector[0]
+    assert entry["title"] == "Node 1"
+    assert entry["target_vector"] == "qwen3_embed"
+    assert entry["has_slots"] == ["openai_embed"]
+    # All three were attempted; the survivors were really compared.
+    assert len(coll.recorded) == 3
+
+
+def test_the_missing_vector_skip_is_announced_with_title_and_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tolerance must not become silence — and must say WHY.
+
+    The count, the TITLE, and the slots the object does carry all reach the
+    ⚠️ line, because that is the line the hook's report grep keys on
+    (``route-touched-path.sh``: ``✅|⚠️|📊|❌``).
+    """
+    _pin_active_embedding(monkeypatch, "qwen3")
+    mod = _load(SCANNER)
+    nodes = _nodes(2)
+    nodes[0].vector = {}  # present, NO vector in any slot
+    coll = _Collection(
+        MULTI_VECTOR, nodes=nodes, still_present_failures={str(nodes[0].uuid)}
+    )
+
+    det = mod.DuplicateDetector.__new__(mod.DuplicateDetector)
+    det.threshold = 0.95
+    det.scan_error = None
+    det.collection = coll
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        det.find_duplicates()
+
+    printed = out.getvalue()
+    assert "⚠️" in printed, f"the skip must announce itself: {printed!r}"
+    assert "1 of 2" in printed
+    assert "'Node 0'" in printed, "the TITLE of the skipped object must appear"
+    assert "no vector at all" in printed, (
+        "the WHY must appear: an object with no slot at all is a different "
+        "defect from one carrying a fallback slot"
+    )
+
+
+def test_every_object_lacking_the_vector_is_no_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing compared is the ABSENCE of a verdict, in this shape too.
+
+    A collection embedded entirely under another profile must not produce
+    "0 duplicates" — the same rule the all-vanished shape follows.
+    """
+    _pin_active_embedding(monkeypatch, "qwen3")
+    mod = _load(SCANNER)
+    nodes = _nodes(3)
+    for node in nodes:
+        node.vector = {"arctic2_embed": [0.5]}
+    coll = _Collection(
+        MULTI_VECTOR,
+        nodes=nodes,
+        still_present_failures={str(n.uuid) for n in nodes},
+    )
+
+    duplicates, det = _scan(mod, coll)
+
+    assert duplicates == []
+    assert det.scan_error, "zero objects compared is no verdict"
+    assert "target vector" in det.scan_error
+
+
+def test_json_payload_carries_the_missing_vector_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The machine verdict — the launcher modal gets the same skip list."""
+    import json as _json
+
+    mod = _load(SCANNER)
+    _StubDetector.instances = []
+
+    class _MissingVectorStub(_StubDetector):
+        def __init__(self, similarity_threshold: float = 0.95) -> None:
+            super().__init__(similarity_threshold)
+            self.nodes_skipped = 0
+            self.objects_missing_vector = (
+                {
+                    "uuid": "u-1",
+                    "title": "Legacy Node",
+                    "path": "knowledge/legacy.md",
+                    "target_vector": "qwen3_embed",
+                    "has_slots": ["openai_embed"],
+                },
+            )
+
+    monkeypatch.setattr(mod, "DuplicateDetector", _MissingVectorStub)
+    monkeypatch.setattr(
+        sys, "argv", ["detect_duplicates.py", "--json"],
+    )
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = mod.main()
+
+    payload = _json.loads(out.getvalue())
+    assert payload["objects_missing_vector"] == [
+        {
+            "uuid": "u-1",
+            "title": "Legacy Node",
+            "path": "knowledge/legacy.md",
+            "target_vector": "qwen3_embed",
+            "has_slots": ["openai_embed"],
+        }
+    ]
+    assert payload["count"] == 0
+    assert code == 0
+
+
+def test_main_never_prints_clean_over_a_missing_vector_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The human verdict: a skip of this shape is not "clean" either."""
+    mod = _load(SCANNER)
+    _StubDetector.instances = []
+
+    class _MissingVectorStub(_StubDetector):
+        def __init__(self, similarity_threshold: float = 0.95) -> None:
+            super().__init__(similarity_threshold)
+            self.nodes_skipped = 0
+            self.objects_missing_vector = (
+                {
+                    "uuid": "u-1",
+                    "title": "Legacy Node",
+                    "path": "knowledge/legacy.md",
+                    "target_vector": "qwen3_embed",
+                    "has_slots": ["openai_embed"],
+                },
+            )
+
+    monkeypatch.setattr(mod, "DuplicateDetector", _MissingVectorStub)
+    monkeypatch.setattr(sys, "argv", ["detect_duplicates.py"])
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = mod.main()
+
+    printed = out.getvalue()
+    assert code == 0
+    assert "clean" not in printed.lower(), (
+        f"a partial scan must not read as clean: {printed!r}"
+    )
+    assert "⚠️" in printed and "PARTIAL" in printed
+    assert "'Legacy Node'" in printed

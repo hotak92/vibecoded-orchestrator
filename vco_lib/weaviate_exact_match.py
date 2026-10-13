@@ -29,9 +29,10 @@ harmless once this module's predicate rejects the extras — but never miss.
 ``delete_file_rows_exact`` stays the code graph's deleter (predicate + full
 scan fallback + per-row failure accounting — a different shape); this module
 is the KG-side home for "select the exact rows from a narrowing read", shared
-by ``templates/scripts/sync_knowledge_graph.py``,
-``claude_mcp_servers/weaviate_mcp/server.py`` (``store_knowledge_node``) and
-``vco_lib/diagram_indexer.py`` (the ``<Project>_Diagrams`` delete/upsert).
+by ``templates/scripts/sync_knowledge_graph.py`` and
+``claude_mcp_servers/weaviate_mcp/server.py`` (``store_knowledge_node``); a
+third consumer, the ``<Project>_Diagrams`` delete/upsert in the diagram
+indexer, was removed with the diagrams runtime in v0.2.102.
 
 v0.2.101 pull-in ③ extends the same rule to the MCP's READ-ONLY lookups
 (chunk windows, neighbour chunks, WikiLink targets, code-entity chunks and
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "PAGE_SIZE",
     "MAX_PAGES",
+    "names_same_path",
     "path_spellings",
     "path_narrowing_filter",
     "is_exact_path",
@@ -79,6 +81,34 @@ PAGE_SIZE = 100
 MAX_PAGES = 100
 
 _WORD_TOKEN_RE = re.compile(r"[^\W_]+")
+
+
+def names_same_path(a: Any, b: Any) -> bool:
+    """Tolerant path IDENTITY for a user-typed code-graph target (v0.2.102 L4).
+
+    Code-graph rows hold repo-relative POSIX paths, but a caller types
+    whatever it has — ``./a/b.py``, a trailing slash, Windows separators, or
+    an ABSOLUTE editor path for a repo-relative row. Equal after POSIX
+    normalisation (``./`` / ``..`` / trailing slash / backslashes all fold),
+    or one path is the other's whole-segment suffix (relative vs absolute).
+
+    The ONE home for the rule: the CLI's ``--exclude-file`` filter
+    (``query_code_graph.py::_same_source_file``) delegates here, and the
+    MCP's reverse-imports lookup (``query_code_structure("imports", …)``)
+    confirms each candidate importer's referenced paths with it. A missing /
+    empty / non-string side is never a match.
+    """
+    import posixpath
+
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    na = posixpath.normpath(a.replace("\\", "/"))
+    nb = posixpath.normpath(b.replace("\\", "/"))
+    if not na or not nb or na in (".", "..") or nb in (".", ".."):
+        return False
+    if na == nb:
+        return True
+    return na.endswith("/" + nb) or nb.endswith("/" + na)
 
 
 def path_spellings(canonical: str) -> Tuple[str, ...]:
@@ -160,11 +190,14 @@ def fetch_matching_rows(
     page_size: int = PAGE_SIZE,
     max_pages: int = MAX_PAGES,
     max_matches: Optional[int] = None,
+    accept_object: bool = False,
     **fetch_kwargs: Any,
 ) -> list:
     """Page a narrowing ``fetch_objects`` read; keep only rows *accept* confirms.
 
-    *accept* receives the row's raw ``properties`` dict; a predicate that raises
+    *accept* receives the row's raw ``properties`` dict (the whole row object
+    when *accept_object* is set — e.g. to read its resolved references); a
+    predicate that raises
     REJECTS the row (an error must never select a row for deletion). Paging
     stops at the first short page, at *max_matches* accepted rows, or at the
     page cap (logged — the result is then a confirmed SUBSET, never a guess).
@@ -196,7 +229,7 @@ def fetch_matching_rows(
                 if key in seen:
                     continue
                 seen.add(key)
-            props = getattr(obj, "properties", None) or {}
+            props = obj if accept_object else (getattr(obj, "properties", None) or {})
             try:
                 hit = bool(accept(props))
             except Exception:  # noqa: BLE001 — a predicate error never selects

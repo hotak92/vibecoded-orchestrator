@@ -54,12 +54,30 @@ export interface UsageVendor {
   tokens?: UsageTokens;
 }
 
+/**
+ * Mirrors one row of the `agents` block of `GET /usage/windows`
+ * (`UsageLedger.agent_rows`, v0.2.102 G3): the model that ANSWERED that
+ * (session, agent) identity's last turn. `agent` is `null` for the main
+ * chat, which is an identity like any other.
+ */
+export interface UsageAgentRow {
+  session: string | null;
+  agent: string | null;
+  parent_agent: string | null;
+  model: string;
+  route: string;
+  fallback_from: string;
+  at: string;
+}
+
 export interface UsageSnapshot {
   generated_at: string;
   last_refresh_at: string | null;
   refreshing: boolean;
   refresh_interval_s: number;
   vendors: UsageVendor[];
+  /** Absent from a gateway older than v0.2.102 — rendered as nothing. */
+  agents?: UsageAgentRow[];
 }
 
 /** Mirrors `vco_lib.gateway_usage` / `commands::gateway_usage`. */
@@ -221,4 +239,31 @@ export function visibleVendors(snapshot: UsageSnapshot): UsageVendor[] {
 export function nextPollMs(result: UsageBridgeResult | null): number {
   if (result?.ok && result.snapshot.refreshing) return USAGE_RETRY_WHILE_REFRESHING_MS;
   return USAGE_POLL_MS;
+}
+
+/**
+ * The identities worth a row in the card's attribution list (v0.2.102, G3).
+ * The harness's agents GUI shows the SESSION model for every lane
+ * (anthropics/claude-code#93324), so this is where VCO says which model
+ * actually answered each. A gateway older than v0.2.102 sends no `agents`
+ * block — that reads as an empty list, never as an error.
+ */
+export function visibleAgents(snapshot: UsageSnapshot): UsageAgentRow[] {
+  return snapshot.agents ?? [];
+}
+
+/** The identity's name: the agent id, or "main chat" for the null agent. */
+export function agentIdentity(row: UsageAgentRow): string {
+  return row.agent ?? 'main chat';
+}
+
+/**
+ * What answered, and how it was reached: the ANSWERING model — never the
+ * requested id — with the fallback escape beside it when the owner's ladder
+ * served the turn (no hidden remaps).
+ */
+export function agentAnswer(row: UsageAgentRow): string {
+  return row.fallback_from
+    ? `${row.model} (fallback from ${row.fallback_from})`
+    : row.model;
 }

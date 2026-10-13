@@ -28,10 +28,10 @@
 //! See `bundled_mcp_versions.toml` itself for the canonical schema doc.
 //! For Rust callers: every `[npm.<key>]` table parses into a
 //! [`PinnedPackage`] with `package`, `version`, and `shasum` strings.
-//! Unknown top-level sections (e.g. `[chromium]`) are tolerated by the
-//! TOML parser but not exposed here — Rust callers today only need the
-//! npm slice. Add an accessor when a new section grows a real Rust
-//! consumer.
+//! `[npx.<key>]` tables parse separately into [`NpxLaunchPin`] (see
+//! `parse_npx_str`). Unknown top-level sections are tolerated by the
+//! TOML parser but not exposed here. Add an accessor when a new section
+//! grows a real Rust consumer.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -129,7 +129,7 @@ pub struct PinnedPackage {
 }
 
 /// Top-level TOML schema. Only the `npm` table is modelled in Rust
-/// today; unknown sections (e.g. `[chromium]`) are tolerated by serde's
+/// here; other sections (`[npx.*]`, anything unknown) are tolerated by serde's
 /// default behaviour (`deny_unknown_fields` is NOT set).
 #[derive(Debug, Deserialize)]
 struct BundledManifestRaw {
@@ -214,9 +214,203 @@ pub static BUNDLED_NPM: LazyLock<HashMap<String, PinnedPackage>> = LazyLock::new
     })
 });
 
+// ── [npx.*] — packages VCO REGISTERS as an `npx` launch (v0.2.102 W6-Z4) ──
+
+/// One `[npx.<key>]` row: an npm package VCO registers as an `npx` launch
+/// (never `npm install -g`, so it is kept out of the `[npm.*]` set that
+/// `vco verify-pins` asks `npm ls -g` about). Same exact-version + shasum
+/// discipline as [`PinnedPackage`], plus the `--browser` value the
+/// registration passes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpxLaunchPin {
+    /// The table key inside `[npx.<key>]` (e.g. `playwright_mcp`).
+    pub key: String,
+    /// npm package name (e.g. `@playwright/mcp`).
+    pub package: String,
+    /// Exact version — no `^` / `~`.
+    pub version: String,
+    /// `dist.shasum` (SHA-1, 40 lowercase hex).
+    pub shasum: String,
+    /// The `--browser` value of the registration (e.g. `chromium`).
+    pub browser: String,
+}
+
+impl NpxLaunchPin {
+    /// `<package>@<version>` — the npx package spec.
+    pub fn spec(&self) -> String {
+        format!("{}@{}", self.package, self.version)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BundledNpxRaw {
+    #[serde(default)]
+    npx: HashMap<String, NpxLaunchPinRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NpxLaunchPinRaw {
+    package: String,
+    version: String,
+    shasum: String,
+    browser: String,
+}
+
+/// The `[npx.<key>]` key of the default Playwright MCP.
+pub const PLAYWRIGHT_MCP_KEY: &str = "playwright_mcp";
+
+/// Parse the `[npx.*]` tables of a manifest string.
+pub fn parse_npx_str(toml_text: &str) -> Result<HashMap<String, NpxLaunchPin>, BundledVersionsError> {
+    let raw: BundledNpxRaw = toml::from_str(toml_text).map_err(|e| {
+        BundledVersionsError::ParseFailed {
+            path: "<embedded>".to_string(),
+            message: e.to_string(),
+        }
+    })?;
+    Ok(raw
+        .npx
+        .into_iter()
+        .map(|(key, p)| {
+            (
+                key.clone(),
+                NpxLaunchPin {
+                    key,
+                    package: p.package,
+                    version: p.version,
+                    shasum: p.shasum,
+                    browser: p.browser,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Compile-time-embedded `[npx.*]` pins. Same panic-on-malformed contract as
+/// [`BUNDLED_NPM`]; the unit tests below parse it on every CI run.
+pub static BUNDLED_NPX: LazyLock<HashMap<String, NpxLaunchPin>> = LazyLock::new(|| {
+    parse_npx_str(BUNDLED_VERSIONS_TOML).unwrap_or_else(|e| {
+        panic!(
+            "embedded bundled_mcp_versions.toml [npx] failed to parse: {}. \
+             Rebuild the launcher binary against a fixed manifest.",
+            e
+        )
+    })
+});
+
+/// The Playwright MCP pin to register for an install rooted at
+/// `install_root`: the install's ON-DISK manifest
+/// (`<install_root>/vco_lib/bundled_mcp_versions.toml`, the file install.py's
+/// Python writer reads) when it parses and carries the row, else the
+/// compile-time-embedded copy. Reading the tree's file first means the
+/// launcher and the Python fallback writer register the SAME pin even when
+/// the binary was built from an older tree.
+pub fn playwright_mcp_pin(install_root: Option<&Path>) -> NpxLaunchPin {
+    if let Some(root) = install_root {
+        let path = root.join("vco_lib").join("bundled_mcp_versions.toml");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            match parse_npx_str(&text) {
+                Ok(map) => {
+                    if let Some(pin) = map.get(PLAYWRIGHT_MCP_KEY) {
+                        return pin.clone();
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "[vct] {} unparseable ({}); registering the embedded Playwright MCP pin",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+    }
+    BUNDLED_NPX
+        .get(PLAYWRIGHT_MCP_KEY)
+        .cloned()
+        .expect("embedded bundled_mcp_versions.toml carries [npx.playwright_mcp]")
+}
+
+/// The registered argv after `npx` for the Playwright MCP:
+/// `-y <package>@<version> --browser <browser>`.
+///
+/// MUST match `vco_lib/playwright_mcp.py::registration_args` (the Python
+/// fallback writer + uninstall fingerprint + doctor probe). Both build from
+/// the same `[npx.playwright_mcp]` row; each side's unit test pins this
+/// element order.
+pub fn playwright_mcp_launch_args(pin: &NpxLaunchPin) -> Vec<String> {
+    vec![
+        "-y".to_string(),
+        pin.spec(),
+        "--browser".to_string(),
+        pin.browser.clone(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The embedded manifest carries the Playwright MCP pin with an exact
+    /// version (no floating tag) and a 40-hex shasum.
+    #[test]
+    fn bundled_npx_carries_the_playwright_mcp_pin() {
+        let pin = BUNDLED_NPX.get(PLAYWRIGHT_MCP_KEY).expect("playwright_mcp pin");
+        assert_eq!(pin.package, "@playwright/mcp");
+        assert_eq!(pin.browser, "chromium");
+        assert!(
+            pin.version.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "exact version expected, got {:?}",
+            pin.version
+        );
+        assert_ne!(pin.version, "latest");
+        assert_eq!(pin.shasum.len(), 40);
+        assert!(pin.shasum.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    /// Element order of the registered argv (parity with the Python side).
+    #[test]
+    fn playwright_launch_args_shape() {
+        let pin = NpxLaunchPin {
+            key: "playwright_mcp".into(),
+            package: "@playwright/mcp".into(),
+            version: "9.9.9".into(),
+            shasum: "0".repeat(40),
+            browser: "chromium".into(),
+        };
+        assert_eq!(
+            playwright_mcp_launch_args(&pin),
+            vec!["-y", "@playwright/mcp@9.9.9", "--browser", "chromium"]
+        );
+    }
+
+    /// The install root's on-disk manifest wins over the embedded copy; an
+    /// unreadable / row-less file falls back to the embedded pin.
+    #[test]
+    fn playwright_pin_prefers_the_install_roots_manifest() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("vco_lib");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("bundled_mcp_versions.toml"),
+            r#"
+[npx.playwright_mcp]
+package = "@playwright/mcp"
+version = "1.2.3"
+shasum  = "1111111111111111111111111111111111111111"
+browser = "chromium"
+"#,
+        )
+        .unwrap();
+        assert_eq!(playwright_mcp_pin(Some(root.path())).version, "1.2.3");
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            playwright_mcp_pin(Some(empty.path())),
+            BUNDLED_NPX.get(PLAYWRIGHT_MCP_KEY).cloned().unwrap()
+        );
+        assert_eq!(
+            playwright_mcp_pin(None),
+            BUNDLED_NPX.get(PLAYWRIGHT_MCP_KEY).cloned().unwrap()
+        );
+    }
 
     /// Sanity check: the embedded .toml loads without panic and exposes
     /// the expected pinned-package keys. If a future bump renames a
@@ -227,15 +421,18 @@ mod tests {
         let map = &*BUNDLED_NPM;
         let mut keys: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
         keys.sort();
-        assert_eq!(
-            keys,
-            vec![
-                "excalidraw_lib",
-                "excalidraw_mcp",
-                "mermaid_lib",
-                "mermaid_mcp",
-            ],
-        );
+        // v0.2.102 (diagrams dropped): the four diagram pins
+        // (excalidraw_lib / excalidraw_mcp / mermaid_lib / mermaid_mcp)
+        // were the ONLY npm pins — the [npm] table is now legitimately
+        // empty ([npx.playwright_mcp] is a separate top-level table, not an
+        // npm pin).
+        // The empty `vec![]` literal is load-bearing:
+        // `tests/test_bundled_versions_parity.py::
+        // test_rust_unit_test_pins_same_key_set` greps it. The type
+        // anchor sits on the binding (an unanchored `vec![]` does not
+        // infer through the assert macro).
+        let expected: Vec<&str> = vec![];
+        assert_eq!(keys, expected);
     }
 
     #[test]
@@ -262,16 +459,20 @@ shasum  = "a5f1050ef7af6dc2595f5507366006489fef2879"
 
     #[test]
     fn unknown_top_level_sections_are_tolerated() {
-        // Forward-compat: `[chromium]` is present in the real file and
-        // not modelled by Rust today. Must not error.
+        // Forward-compat: a top-level section the npm reader does not model
+        // (the real file's `[npx.*]`, or one not invented yet) must not error
+        // and must not leak into the npm map.
         let sample = r#"
 [npm.mermaid_mcp]
 package = "claude-mermaid"
 version = "1.6.3"
 shasum  = "a5f1050ef7af6dc2595f5507366006489fef2879"
 
-[chromium]
-reuse_playwright = true
+[npx.playwright_mcp]
+package = "@playwright/mcp"
+version = "9.9.9"
+shasum  = "0000000000000000000000000000000000000000"
+browser = "chromium"
 
 [future_section_we_have_not_invented_yet]
 foo = "bar"

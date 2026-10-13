@@ -12,6 +12,8 @@
 //!   * `set_default_embedding_models`  — write new-project defaults
 //!   * `validate_model_against_catalog`— pre-save check for binding writes
 //!   * `get_default_embedding_models`  — read app_state.default_*_embedding
+//!   * `get_code_embed_model_status`   — per-project recorded vs configured
+//!     code-graph model (`python -m vco_lib.code_embed_model status`)
 //!
 //! ─── Caching ─────────────────────────────────────────────────────────
 //!
@@ -47,9 +49,11 @@
 //!
 //! Note: the GUI's "model id" string (e.g. `"qwen3-embedding:0.6b"` or
 //! `"openai-text-embedding-3-small"`) is what gets written to
-//! `project_kg_bindings.embedding_model` and to
-//! `app_state.default_text_embedding`. The slot name is metadata that the
-//! Python sync scripts derive from the id.
+//! `app_state.default_text_embedding` (and, for the code graph, to the
+//! codegraph binding). The slot name is metadata that the Python sync
+//! scripts derive from the id. (The per-project KG binding's
+//! `embedding_model` column was retired in v0.2.102 W6-J — one global
+//! embedding setting; nothing reads or writes it anymore.)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -68,6 +72,10 @@ use vct_launcher_core::process::CommandExt as _;
 /// Subprocess timeout for the Python `discover` call. 5s headroom on the
 /// observed ~200-400ms warm path, accommodates a cold-Ollama first-probe.
 const DISCOVER_TIMEOUT_SECS: u64 = 5;
+/// The code-embed status asks Weaviate for object counts (five aggregates per
+/// project whose target model is still filling) — long by design, it runs off
+/// the UI thread.
+const CODE_EMBED_STATUS_TIMEOUT_SECS: u64 = 120;
 
 /// In-memory cache TTL — see module docstring for rationale.
 const CACHE_TTL_SECS: u64 = 30;
@@ -213,70 +221,75 @@ async fn run_discover(
     project_root: Option<PathBuf>,
     install_root: Option<PathBuf>,
 ) -> Result<EmbeddingCatalog, String> {
+    let mut args: Vec<std::ffi::OsString> =
+        vec!["vco_lib.embedding_service".into(), "discover".into(), "--json".into()];
+    if let Some(root) = project_root {
+        args.push("--project-root".into());
+        args.push(root.into_os_string());
+    }
+    let stdout = run_vco_lib_cli(&args, install_root, DISCOVER_TIMEOUT_SECS, "discover").await?;
+    serde_json::from_str::<EmbeddingCatalog>(&stdout)
+        .map_err(|e| format!("parse discover JSON: {}", e))
+}
+
+/// Run `python -m <args…>` with the vco_lib interpreter and return stdout —
+/// the ONE subprocess shape this module's commands share (v0.2.102 W6-B2
+/// extracted it from `run_discover` for `get_code_embed_model_status`).
+///
+/// cwd MUST be the orchestrator clone root so `python -m vco_lib.…` finds
+/// the in-tree namespace package (v0.2.24.1); with no root discoverable it
+/// runs without a cwd and fails with ModuleNotFoundError rather than
+/// crashing the launcher. Null stdin, piped output, CREATE_NO_WINDOW.
+async fn run_vco_lib_cli(
+    args: &[std::ffi::OsString],
+    install_root: Option<PathBuf>,
+    timeout_secs: u64,
+    label: &str,
+) -> Result<String, String> {
     let python = resolve_python_for_vco_lib()
         .ok_or_else(|| "no python interpreter found for vco_lib".to_string())?;
 
     let mut cmd = tokio::process::Command::new(&python).silent();
-    cmd.arg("-m")
-        .arg("vco_lib.embedding_service")
-        .arg("discover")
-        .arg("--json");
-    if let Some(root) = project_root {
-        cmd.arg("--project-root").arg(root.as_os_str());
-    }
-    // v0.2.24.1: cwd MUST be the orchestrator clone root so
-    // `python -m vco_lib.embedding_service` finds the in-tree
-    // namespace package. Best-effort: if no clone root is
-    // discoverable, fall through with no cwd set — the subprocess
-    // will still fail with ModuleNotFoundError but at least the
-    // launcher doesn't crash, and the failing-by-default state
-    // matches the pre-v0.2.24.1 behaviour rather than degrading
-    // further.
+    cmd.arg("-m").args(args);
     if let Some(root) = install_root {
         cmd.current_dir(&root);
     }
-    // The subprocess doesn't need a TTY or inherited stdin; null it so the
-    // python side gets EOF immediately on read.
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    // CREATE_NO_WINDOW on Windows so the subprocess doesn't flash a
-    // console window when the user opens a dropdown.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
     }
 
-    let exec_fut = cmd.output();
-    let output = match timeout(
-        Duration::from_secs(DISCOVER_TIMEOUT_SECS),
-        exec_fut,
-    )
-    .await
-    {
+    let output = match timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
         Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(format!("spawn discover: {}", e)),
-        Err(_) => {
-            return Err(format!(
-                "discover timed out after {}s",
-                DISCOVER_TIMEOUT_SECS
-            ))
-        }
+        Ok(Err(e)) => return Err(format!("spawn {}: {}", label, e)),
+        Err(_) => return Err(format!("{} timed out after {}s", label, timeout_secs)),
     };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "discover exit {}: {}",
+            "{} exit {}: {}",
+            label,
             output.status.code().unwrap_or(-1),
             stderr.chars().take(500).collect::<String>()
         ));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str::<EmbeddingCatalog>(&stdout)
-        .map_err(|e| format!("parse discover JSON: {}", e))
+/// The status CLI prints ONE JSON object line; take the last non-empty line
+/// so a stray log line above it cannot break the parse.
+fn parse_last_json_line(stdout: &str, label: &str) -> Result<serde_json::Value, String> {
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .ok_or_else(|| format!("{} printed nothing", label))?;
+    serde_json::from_str(line).map_err(|e| format!("parse {} JSON: {}", label, e))
 }
 
 // ─── Tauri commands ──────────────────────────────────────────────────────
@@ -325,10 +338,12 @@ pub async fn get_embedding_catalog(
 /// "change text default but not code default" call passes
 /// `text_model=Some(...), code_model=None`).
 ///
-/// This command intentionally does NOT trigger an enrichment migration —
-/// changing the DEFAULT only affects projects created from now on. Per-
-/// project bindings continue to point at whatever model they were bound
-/// to at create time.
+/// This command intentionally does NOT trigger an enrichment migration.
+/// For the CODE default (v0.2.102 W6-B2, `vco_lib/code_embed_model.py`): it is
+/// a selection like the Preferences pin (below it in precedence) — a code graph
+/// indexed with another model gets the new model's named vector added and
+/// filled on its next analyzer run, keeping the old vectors; searches switch
+/// when the new slot is complete. Nothing is dropped.
 #[command]
 pub async fn set_default_embedding_models(
     text_model: Option<String>,
@@ -386,9 +401,51 @@ pub async fn get_default_embedding_models(
     })
 }
 
-/// Check a model id against the live catalog. Used by the project-binding
-/// save path (`set_project_kg_binding`, `set_project_codegraph_binding`)
-/// to reject names the machine can't currently serve.
+/// Per-project code-graph embedding model status for the Preferences "Code
+/// Graph Embeddings" section (v0.2.102 W6-B2): the model each project's code
+/// graph is RECORDED as indexed with (what searches use), the selected target,
+/// the target's fill progress (rows filled / total, or complete — a selection
+/// is applied automatically, so there is no apply step to show) and whether it
+/// is OpenAI-billed. The answer is computed by the ONE resolver,
+/// `python -m vco_lib.code_embed_model status` (rung A of the cross-language
+/// ladder) — this command only transports it. Errors surface to the section
+/// verbatim; nothing is guessed.
+#[command]
+pub async fn get_code_embed_model_status(
+    db: State<'_, Db>,
+) -> Result<serde_json::Value, String> {
+    let install_root = crate::commands::installer::resolve_install_root_sync(&db);
+    let args: Vec<std::ffi::OsString> =
+        vec!["vco_lib.code_embed_model".into(), "status".into(), "--json".into()];
+    let stdout =
+        run_vco_lib_cli(&args, install_root, CODE_EMBED_STATUS_TIMEOUT_SECS, "code-embed status")
+            .await?;
+    parse_last_json_line(&stdout, "code-embed status")
+}
+
+/// Per-project KG embedding model status (v0.2.102 W6-I): for each of a
+/// project's KG collections (its KG, the shared KG, the development
+/// collection) the model the collection is RECORDED as complete in (what
+/// searches use), the selected target, and the target's fill progress. The
+/// answer is computed by `python -m vco_lib.kg_embed_model status` (the ONE
+/// resolver, rung A) — this command only transports it, verbatim.
+#[command]
+pub async fn get_kg_embed_model_status(
+    db: State<'_, Db>,
+) -> Result<serde_json::Value, String> {
+    let install_root = crate::commands::installer::resolve_install_root_sync(&db);
+    let args: Vec<std::ffi::OsString> =
+        vec!["vco_lib.kg_embed_model".into(), "status".into(), "--json".into()];
+    let stdout =
+        run_vco_lib_cli(&args, install_root, CODE_EMBED_STATUS_TIMEOUT_SECS, "kg-embed status")
+            .await?;
+    parse_last_json_line(&stdout, "kg-embed status")
+}
+
+/// Check a model id against the live catalog. Used by the codegraph
+/// binding save path (`set_project_codegraph_binding`) to reject names the
+/// machine can't currently serve. (The KG binding save no longer takes a
+/// model — v0.2.102 W6-J retired the per-project KG model pick.)
 ///
 /// "Currently serve" is `available_now=true` AND the model id is present
 /// in the relevant list (text vs code). An entry whose
@@ -429,6 +486,25 @@ pub async fn validate_model_against_catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_embed_status_takes_the_last_json_line() {
+        let out = "[vct] a log line\n{\"pick\":\"codesage-large-v2\",\"projects\":[]}\n\n";
+        let v = parse_last_json_line(out, "code-embed status").expect("parses");
+        assert_eq!(v["pick"], "codesage-large-v2");
+        assert!(parse_last_json_line("", "code-embed status").is_err());
+        assert!(parse_last_json_line("not json", "code-embed status").is_err());
+    }
+
+    /// v0.2.102 W6-I: the KG status transport names ITS command in errors.
+    #[test]
+    fn kg_embed_status_parse_errors_name_the_kg_command() {
+        let v = parse_last_json_line("{\"target\":\"qwen3-embedding:0.6b\",\"projects\":[]}", "kg-embed status")
+            .expect("parses");
+        assert_eq!(v["target"], "qwen3-embedding:0.6b");
+        let err = parse_last_json_line("", "kg-embed status").unwrap_err();
+        assert!(err.contains("kg-embed status"), "{err}");
+    }
 
     fn dummy_catalog() -> EmbeddingCatalog {
         EmbeddingCatalog {

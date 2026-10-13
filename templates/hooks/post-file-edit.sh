@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Parity: kept in step with post-file-edit.ps1 (its UTF-8 BOM serves Windows
+# PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # Parity note (v0.2.54 Track G G-6): the .ps1 sibling now resolves its
 # child-spawn PowerShell binary via _lib/resolve-powershell.ps1 (pwsh ->
 # powershell fallback for PS 5.1-only machines). No bash-side logic
@@ -25,9 +27,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   3. Queue code-graph incremental update for code files
 #
 # LLM-visible reminders (routed through additionalContext envelope):
-#   4. CONTEXT_STATE.md significant-changes → expert-skill update prompt
-#   5. .claude/skills or .claude/hooks edits → workflow-test prompt
-#   6. Code-file edits → CONTEXT_STATE / KG capture reminder
+#   4. the routing home's report ($VCO_ROUTE_NUDGE: the pending KG
+#      duplicate-scan report) and the once-per-session broken-install notice
 #
 # Plain stdout from PostToolUse hooks is silently dropped per the
 # v2.1.x contract (see `.claude/context/hook-audit-2026-05-10.md`),
@@ -55,8 +56,8 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"
 
 # v0.2.95 (lane F10): the ROUTING — knowledge/ -> kg-sync, docs/ -> the
-# development collection, .claude/diagrams/ -> the indexer, code files ->
-# the end-of-turn code-graph drain queue — plus the Phase-8 access gate and
+# development collection, code files -> the end-of-turn code-graph drain
+# queue — plus the Phase-8 access gate and
 # the per-file debounce now live in _lib/route-touched-path.sh, because a
 # SECOND hook needs exactly the same decision: post-bash-file-sync.sh, which
 # gives a CLI write (`cat > knowledge/foo.md <<EOF`, `sed -i`, `cp`) the
@@ -77,6 +78,11 @@ KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"
 if [ -f "$SCRIPT_DIR/_lib/route-touched-path.sh" ]; then
     . "$SCRIPT_DIR/_lib/route-touched-path.sh"
 fi
+# v0.2.102 W6-C1 (F16): the per-agent key helper, for the once-per-session
+# broken-install notice below (its sentinel must not let a subagent's notice
+# silence the main chat's). Conditional source, same discipline.
+# shellcheck source=_lib/session-id.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
 
 # Accumulate LLM-visible reminders here, emit one envelope at the end.
 LLM_NUDGE=""
@@ -140,8 +146,11 @@ sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 # below so the kg-sync / code-graph-incremental subprocesses we spawn can
 # attribute their retrieval / sync telemetry to the originating subagent;
 # SESSION_ID feeds VCT_SESSION_ID for the same 3-layer telemetry chain.
-# Export for child processes (kg-sync, code-graph-incremental.sh, etc.)
-# so their emit paths can attribute telemetry to the originating agent.
+# Export for child processes so they can attribute their work to the
+# originating agent. Readers (v0.2.102 W6-C2, census F15): the debounced
+# kg-sync runner's once-per-session failure sentinel (VCT_AGENT_ID, via the
+# per-agent key) and its kg_sync_failures.jsonl row (agent_id + agent_type),
+# which session-start-retrieval-health names when it surfaces the failure.
 # Skip empty-string exports — downstream readers treat unset and empty
 # identically, but unset keeps `env` listings clean for debugging.
 [ -n "$AGENT_ID" ]   && export VCT_AGENT_ID="$AGENT_ID"
@@ -155,7 +164,7 @@ sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 
 [ -z "$EDITED_FILE" ] && exit 0
 
-# === Routing: knowledge/ + docs/ + diagrams + the code-graph drain queue ===
+# === Routing: knowledge/ + docs/ + the code-graph drain queue ===
 # ONE home — _lib/route-touched-path.sh — shared with post-bash-file-sync.sh
 # so a CLI write routes identically to an Edit/Write. vco_route_init resolves
 # the debounce helper, the code-extension helper, VCT_PROJECT_ID and the
@@ -170,44 +179,27 @@ if command -v vco_route_touched_path >/dev/null 2>&1; then
 elif command -v vco_report_missing_hook_lib >/dev/null 2>&1; then
     # The routing home is absent (or unreadable) — a broken install, not a
     # degraded mode. Say so once per session, then carry on with the nudges
-    # this hook owns; exit stays 0.
+    # this hook owns; exit stays 0. v0.2.102 W6-C1 (F16): the notice is
+    # delivered as PostToolUse context, which reaches the SUBAGENT only
+    # when this edit is a lane's — key the sentinel per agent so the lane's
+    # notice never silences the main chat's.
+    _NOTICE_KEY="$SESSION_ID_FROM_STDIN"
+    if [ -n "$AGENT_ID" ] && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+        _NOTICE_KEY="$(vco_hook_agent_key_from_ids "$SESSION_ID_FROM_STDIN" "$AGENT_ID")"
+    fi
     vco_report_missing_hook_lib "$SCRIPT_DIR" "$PROJECT_ROOT" \
-        "$SESSION_ID_FROM_STDIN" "route-touched-path.sh"
+        "$_NOTICE_KEY" "route-touched-path.sh"
     if [ -n "${VCO_MISSING_LIB_NOTICE:-}" ]; then
         _add_nudge "$VCO_MISSING_LIB_NOTICE"
     fi
 fi
 
-# 4. CONTEXT_STATE.md significant-changes → expert-skill nudge.
-if [[ "$EDITED_FILE" == *"CONTEXT_STATE.md" ]]; then
-    EXPERT_SKILL="$PROJECT_ROOT/.claude/skills/project-experts/claude-orchestrator-expert.md"
-    if [ -f "$EXPERT_SKILL" ]; then
-        CHANGES=$(grep -E "(✅|##\s+(Status|Current Work|Next Steps|Knowledge Captured))" "$EDITED_FILE" | wc -l)
-        if [ "$CHANGES" -gt 5 ]; then
-            _add_nudge "[CONTEXT_STATE.md updated — expert-skill review] ${CHANGES} significant markers detected.
-Consider updating .claude/skills/project-experts/claude-orchestrator-expert.md if any of:
-  - Major milestone completed (Skills system, knowledge graph, etc.)
-  - Architecture changed (MCP, agents, workflow)
-  - New scripts/commands added (kg-*, wrappers)
-  - Recent work section needs refresh"
-        fi
-    fi
-fi
-
-# 5. Workflow-system edits (Skills/Agents/hooks) → workflow-test nudge.
-WORKFLOW_CHANGED=false
-if [[ "$EDITED_FILE" == "$PROJECT_ROOT/.claude/skills"* ]] || \
-   [[ "$EDITED_FILE" == "$PROJECT_ROOT/.claude/hooks"* ]]; then
-    WORKFLOW_CHANGED=true
-fi
-if [ "$WORKFLOW_CHANGED" = true ]; then
-    _add_nudge "[Workflow file edited] $(basename "$EDITED_FILE") was changed.
-Consider:
-  - Test the change in actual usage before assuming it works.
-  - Update documentation if the structure changed.
-  - Run /workflow-optimizer to check for optimizations.
-  - Update skills-setup-guide.md if the setup process changed."
-fi
+# The after-edit workflow nudges are gone (owner-approved removal
+# 2026-10-12, v0.2.102 W6-N review round): the CONTEXT_STATE.md
+# "expert-skill review" pointer named a skill file VCO never ships, and the
+# "[Workflow file edited]" reminder pointed at a skills-setup-guide.md that
+# exists nowhere. Prompt-file advice comes BEFORE the edit, from the
+# pre-edit / pre-write context router (vco_lib/prompt_edit_nudge.py).
 
 # Emit accumulated nudges as a single PostToolUse envelope.
 if [ -n "$LLM_NUDGE" ] && command -v emit_additional_context >/dev/null 2>&1; then

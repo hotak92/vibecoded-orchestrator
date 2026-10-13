@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -871,7 +872,7 @@ def _ps_src_matches(tmp_path: Path, name: str, ledger: list, src: str, root: str
         encoding="utf-8",
     )
     proc = subprocess.run(
-        [_PWSH, "-NoProfile", "-File", str(script), str(reads), src, root],
+        [_PWSH, *PWSH_BASE_FLAGS, "-File", str(script), str(reads), src, root],
         capture_output=True,
         text=True,
         timeout=60,

@@ -32,6 +32,7 @@
   import LegacyCollectionsModal from '$lib/components/LegacyCollectionsModal.svelte';
   import SharedKgPicker from '$lib/components/SharedKgPicker.svelte';
   import ExtraCodegraphPathsPanel from '$lib/project-state/ExtraCodegraphPathsPanel.svelte';
+  import InfraDeclarationsPanel from '$lib/project-state/InfraDeclarationsPanel.svelte';
   import type {
     ProjectIdentity,
     UpdateProjectIdentityRequest,
@@ -629,11 +630,18 @@
       </div>
     {/if}
 
-    <!-- v0.2.47: extra codegraph paths panel. Read-only folders that
+    <!-- v0.2.47: extra codegraph paths panel, shown as "Add code folder"
+         since v0.2.102 W6-AA (folders also allow-listed for lane-reservation
+         worktrees). Read-only folders that
          contribute to this project's codegraph collection without being
          launcher projects themselves. Self-contained: loads its own
          data and renders its own modals. -->
     <ExtraCodegraphPathsPanel {projectId} />
+
+    <!-- v0.2.102 W5-A (M3): what this project runs for itself (external
+         collections, unmanaged containers, local ports) — VCO leaves it
+         alone. Self-contained: loads and saves its own data. -->
+    <InfraDeclarationsPanel {projectId} />
   {/if}
 </section>
 

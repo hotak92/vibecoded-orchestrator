@@ -83,6 +83,7 @@ try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $ToolName = ""
 $SessionId = ""
 $Command = ""
+$ToolUseId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
@@ -91,10 +92,14 @@ try {
         if ($payload.tool_input -and $payload.tool_input.command) {
             $Command = [string]$payload.tool_input.command
         }
+        if ($payload.tool_use_id) { $ToolUseId = [string]$payload.tool_use_id }
     }
 } catch { }
 
-if ($ToolName -ne "Bash") { exit 0 }
+# Bash, or the PowerShell tool (v0.2.102 W5-D -- the only shell tool on
+# Windows without Git Bash; the router reads its command through
+# vco_lib.powershell_command's Bash-equivalent translation).
+if ($ToolName -ne "Bash" -and $ToolName -ne "PowerShell") { exit 0 }
 if (-not $Command) { exit 0 }
 
 if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
@@ -116,6 +121,13 @@ if (-not $CmdHash) {
     if ($CmdHash.Length -gt 32) { $CmdHash = $CmdHash.Substring(0, 32) }
 }
 $CmdLen = $Command.Length
+
+# v0.2.102 W3R-3: the pairing state is keyed by the CALL, not the command
+# (two concurrent identical calls, distinct tool_use_ids, used to share one
+# state file). Same sanitize ladder as the router's bash_claim_path. MUST
+# MATCH the .sh sibling and post-bash-context-record.ps1.
+$Tuid = ($ToolUseId -replace '[^A-Za-z0-9_-]', '')
+if ($Tuid.Length -gt 64) { $Tuid = $Tuid.Substring(0, 64) }
 
 $StateDir = Join-Path $ProjectRoot ".claude/state"
 if (-not (Test-Path $StateDir)) {
@@ -182,6 +194,11 @@ Get-ChildItem -File $StateDir -Filter "bash_intent_*.json" -ErrorAction Silently
 # === State file + pre_bash outcome event: READ/EDIT/SEARCH only ===
 if ($Intent -eq "READ" -or $Intent -eq "EDIT" -or $Intent -eq "SEARCH") {
     $StateFile = Join-Path $StateDir "bash_task_${SessionId}_${CmdHash}.json"
+    # v0.2.102 W3R-3: per-CALL pairing when the harness names the call
+    # (post-bash derives the same suffix); legacy hash-only name otherwise.
+    if ($Tuid) {
+        $StateFile = Join-Path $StateDir "bash_task_${SessionId}_${CmdHash}_${Tuid}.json"
+    }
     # Multi-match double spawns (wave-2 review nit-5) cannot reach here twice:
     # only the spawn that won the router's --claim gets an intent (v0.2.101
     # N2 -- the pre-N2 "fresh state file" guard here was a check-then-write
@@ -199,12 +216,25 @@ if ($Intent -eq "READ" -or $Intent -eq "EDIT" -or $Intent -eq "SEARCH") {
         intent = $Intent
         targets = @()
         symbols = @()
+        # W3R-3 additive key (empty when the payload carried no tool_use_id).
+        tool_use_id = $Tuid
     }
     try { $state.targets = @($TargetsJson | ConvertFrom-Json) } catch { }
     try { $state.symbols = @($SymbolsJson | ConvertFrom-Json) } catch { }
-    try {
-        $state | ConvertTo-Json -Compress | Set-Content -Path $StateFile -Encoding UTF8 -NoNewline
-    } catch { }
+    # BOM-free (review R5-8). A MISSING helper is a broken install: say so on
+    # stderr (review R6-3) instead of letting the dot-source throw into the
+    # catch below, where the skipped pairing write was silent. The hook still
+    # never fails. The .sh sibling writes this file inline from Python and
+    # sources no helper for it, so it has no such case.
+    $Utf8NoBomLib = Join-Path $PSScriptRoot "_lib/utf8-nobom.ps1"
+    if (Test-Path -LiteralPath $Utf8NoBomLib) {
+        try {
+            . $Utf8NoBomLib
+            Set-VcoUtf8Content -Path $StateFile -Value ($state | ConvertTo-Json -Compress) -NoNewline
+        } catch { }
+    } else {
+        [Console]::Error.WriteLine("[VCO broken install] .claude/hooks/_lib/utf8-nobom.ps1 is missing; the pre_bash pairing state was not written, so this command's bash_outcome event cannot be paired (re-run the bundle update).")
+    }
 
     # === F-LOG (v0.2.70): the pre_bash pairing event (WP-D 2 payload) ===
     $QuerySnippet = if ($Command.Length -gt 120) { $Command.Substring(0, 120) } else { $Command }

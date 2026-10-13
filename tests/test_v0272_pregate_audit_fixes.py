@@ -914,15 +914,17 @@ class _PruneColl:
     def __init__(self, rows):
         # rows: list of (uuid, props)
         self._rows = rows
-        self.data = types.SimpleNamespace(delete_many=self._delete)
-        self.deleted_filters = []
+        # v0.2.102 (W1-C S5): the purge deletes through the ONE exact
+        # primitive (`delete_file_rows_exact` → per-row `delete_by_id`).
+        self.data = types.SimpleNamespace(delete_by_id=self._delete)
+        self.deleted_filters = []  # kept name: now the deleted UUIDs
 
     def iterator(self, return_properties=None):
         for uuid, props in self._rows:
             yield types.SimpleNamespace(uuid=uuid, properties=props)
 
-    def _delete(self, where=None):
-        self.deleted_filters.append(where)
+    def _delete(self, uuid=None):
+        self.deleted_filters.append(uuid)
 
 
 class _PruneClient:
@@ -957,7 +959,8 @@ def test_f9_prune_deletes_wt_and_bundle_rows_only():
     counts = resync.prune_ignored_rows("TProj", client=client)
     assert counts["TProj_CodeFunction"] == 3, "u1 (.wt), u3 (vendor), u4 (bundle suffix)"
     assert counts["TProj_CodeModule"] == 1, "node_modules row"
-    assert len(fn_coll.deleted_filters) == 1 and len(mod_coll.deleted_filters) == 1
+    assert sorted(fn_coll.deleted_filters) == [u[1], u[3], u[4]]
+    assert mod_coll.deleted_filters == [u[5]]
 
 
 def test_f9_normal_rows_untouched():

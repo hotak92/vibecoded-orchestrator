@@ -68,6 +68,7 @@ from test_v0291_no_bare_prints_in_rust_crates import (  # noqa: E402
     _ST_CODE,
     _strip_line,
 )
+from tests.common.rust_source import cfg_test_line_numbers  # noqa: E402
 
 PROJECTS_V2 = (
     REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "projects_v2.rs"
@@ -634,14 +635,13 @@ class InstallPyRunnerDbGuardWiring(unittest.TestCase):
         callers = []
         for rs in sorted(src_dir.rglob("*.rs")):
             lines = code_only_lines(rs)
-            # Production code only: cut at the first test module.
-            cut = next(
-                (i for i, ln in enumerate(lines) if ln.startswith("mod tests")
-                 or ln.startswith("pub(crate) mod tests")),
-                len(lines),
-            )
+            # Production code only: every test-gated item is skipped, and
+            # nothing else. (Until v0.2.102 this cut at the first column-0
+            # `mod tests`, so production code after a test module — 7 files
+            # in this tree have some — was never checked.)
+            gated = cfg_test_line_numbers(rs.read_text(encoding="utf-8"))
             if any("run_install_py_update(" in ln and "fn run_install_py_update(" not in ln
-                   for ln in lines[:cut]):
+                   for n, ln in enumerate(lines, start=1) if n not in gated):
                 callers.append(rs.name)
         self.assertEqual(callers, ["update_run.rs"])
 

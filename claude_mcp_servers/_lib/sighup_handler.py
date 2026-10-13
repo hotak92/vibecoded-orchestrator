@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import signal
 import sys
+import threading
 from logging import Logger
 
 
@@ -61,16 +62,43 @@ def register_sighup_exit_handler(logger: Logger) -> bool:
             stdio pipe" apart from "launcher asked us to reload env".
 
     Returns:
-        ``True`` when the handler was installed, ``False`` on platforms
-        where ``signal.SIGHUP`` is unavailable (Windows native).
+        ``True`` when the handler was installed, ``False`` when it was
+        not: platforms without ``signal.SIGHUP`` (Windows native) OR a
+        call from anything other than the main thread.
 
     Exit code 0 is deliberate: this is an EXPECTED clean exit, not an
     error. Claude Code's spawn-on-demand path treats exit 0 the same as
     never-spawned and re-launches the MCP on the next tool call.
+
+    v0.2.102 W6-F fix-round (review MEDIUM): the guard is at THIS root,
+    not in callers. ``signal.signal`` raises ``ValueError`` off the main
+    thread, and ``weaviate_mcp.server`` registers this handler AT IMPORT
+    TIME — so any non-main-thread importer of that module (the context
+    router's worker-thread legs were the first; a test, a plugin or a
+    future lane could be next) used to die on the import. Off the main
+    thread the registration is now a LOGGED no-op returning ``False``:
+    the import succeeds, and the env-reload SIGHUP UX simply does not
+    apply to that embedding (a short-lived hook subprocess has no env to
+    reload anyway; long-lived MCP servers import on their main thread and
+    keep the handler).
     """
     if not hasattr(signal, "SIGHUP"):
         # Windows native — no SIGHUP. Caller should fall back to a
         # different reload mechanism (kill+respawn or session restart).
+        return False
+
+    if threading.current_thread() is not threading.main_thread():
+        # signal.signal() accepts only the main thread (ValueError
+        # otherwise). Importing weaviate_mcp.server from a worker thread
+        # (the context router does, by design) must not crash the import.
+        logger.warning(
+            "register_sighup_exit_handler: SIGHUP handler NOT installed — "
+            "called from thread %r, but signal.signal() accepts only the "
+            "main thread. The import is supported; the env-reload SIGHUP "
+            "path stays active only for main-thread imports (long-lived "
+            "MCP servers).",
+            threading.current_thread().name,
+        )
         return False
 
     def _exit_for_env_reload(_signum: int, _frame: object) -> None:

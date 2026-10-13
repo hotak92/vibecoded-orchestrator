@@ -99,7 +99,10 @@ CLASS_RATE_LIMITED = "rate_limited"
 #: JSON ``code`` field and last as bracketed text, so
 #: ``[1310] Weekly/Monthly Limit Exhausted`` with a 30-second ``retry-after``
 #: came out rate-limited while ``{"code":"1310"}`` with the same header came
-#: out exhausted.
+#: out exhausted. ``usage limit`` joined in the v0.2.102 fix round: a vendor
+#: answers "You've reached your 5-hour usage limit" — with HTTP 403, not
+#: 429 — and that wording is quota evidence whichever status carried it (see
+#: :func:`is_quota_refusal`).
 _EXHAUSTION_MARKERS: tuple[str, ...] = (
     "limit exhausted",
     "quota exhausted",
@@ -110,6 +113,7 @@ _EXHAUSTION_MARKERS: tuple[str, ...] = (
     "insufficient credits",
     "out of credits",
     "no remaining credits",
+    "usage limit",
 )
 
 #: JSON keys that carry a vendor's own error code. Not ``type``: in an
@@ -395,6 +399,34 @@ def classify_quota(
     return CLASS_RATE_LIMITED
 
 
+def is_quota_refusal(
+    status: int,
+    body: bytes = b"",
+    headers: Mapping[str, str] | None = None,
+) -> bool:
+    """Is this refusal a QUOTA refusal, whichever HTTP status carried it?
+
+    A status in :data:`QUOTA_STATUSES` is one by definition. For any OTHER
+    status (the case that matters: a vendor that answers **403** to a
+    used-up allowance — observed live, "You've reached your 5-hour usage
+    limit", four times 2026-10-07..11), the answer is YES exactly when the
+    body carries positive quota evidence: an exhaustion CODE, exhaustion
+    MARKERS, or a readable reset time. The same evidence helpers
+    :func:`classify_quota` reads — deliberately NOT a second keyword list —
+    so "what counts as quota" can never drift between the classifier and
+    this detector. Absent evidence the answer is NO, which keeps the
+    key-level reading of an unrecognised 403 untouched (an invalid key must
+    still strike).
+    """
+    if status in QUOTA_STATUSES:
+        return True
+    if _find_exhaustion_code(body) is not None:
+        return True
+    if _reset_distance_s(_find_reset_value(body, headers)) is not None:
+        return True
+    return _mentions_exhaustion_words(body, headers)
+
+
 def quota_evidence_fields(
     body: bytes = b"", headers: Mapping[str, str] | None = None,
 ) -> str:
@@ -491,6 +523,7 @@ __all__ = [
     "QUOTA_STATUSES",
     "classify_quota",
     "find_reset_hint",
+    "is_quota_refusal",
     "quota_error_body",
     "quota_evidence_fields",
     "quota_message",

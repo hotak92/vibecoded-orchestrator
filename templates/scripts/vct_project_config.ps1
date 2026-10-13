@@ -194,7 +194,12 @@ function Invoke-RWMaybeRotate {
     try {
         $tail = Get-Content -LiteralPath $Path -Tail 100 -ErrorAction Stop
         $tmp = "$Path.rot.tmp"
-        Set-Content -LiteralPath $tmp -Value $tail -Encoding utf8 -NoNewline:$false
+        # BOM-free on 5.1 and 7+ (review R5-8). The same write as Set-VcoUtf8Content
+        # in hooks/_lib/utf8-nobom.ps1 - spelled out here because this script is
+        # self-contained (its functions are also run standalone) and does not
+        # dot-source hooks/_lib.
+        $tailText = (@($tail) | ForEach-Object { [string]$_ + [Environment]::NewLine }) -join ''
+        [System.IO.File]::WriteAllText($tmp, $tailText, (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $tmp -Destination $Path -Force
     } catch {
         try { Remove-Item -LiteralPath "$Path.rot.tmp" -ErrorAction SilentlyContinue } catch { }
@@ -287,7 +292,12 @@ function Emit-Warning {
         }
     }
     try {
-        Add-Content -LiteralPath $jsonl -Value $row -Encoding utf8 -ErrorAction Stop
+        # BOM-free on 5.1 and 7+ (review R5-8). The same write as Add-VcoUtf8Content
+        # in hooks/_lib/utf8-nobom.ps1 - spelled out here because this script is
+        # self-contained (its functions are also run standalone) and does not
+        # dot-source hooks/_lib.
+        [System.IO.File]::AppendAllText($jsonl, $row + [Environment]::NewLine,
+            (New-Object System.Text.UTF8Encoding($false)))
     } catch {
         # Append failed (disk full etc.) — warning was already emitted.
     } finally {
@@ -797,6 +807,18 @@ function Get-Config {
                                 -and $null -ne $rowPath -and $rowPath.Value) {
                                 [Console]::Out.WriteLine([string]$rowPath.Value)
                             }
+                        }
+                    }
+                    return 0
+                }
+                # v0.2.102 W5-A (M3): the three infrastructure-declaration
+                # lists render one value per line (the bash sibling's shape;
+                # MUST MATCH vco_lib/project_config.py::INFRA_LIST_FIELDS).
+                # Empty list -> no stdout + exit 0.
+                if ($FieldName -in @("external_collections", "unmanaged_containers", "ssrf_extra_local_ports")) {
+                    if ($val -is [System.Collections.IEnumerable] -and -not ($val -is [string])) {
+                        foreach ($item in $val) {
+                            if ($null -ne $item) { [Console]::Out.WriteLine([string]$item) }
                         }
                     }
                     return 0

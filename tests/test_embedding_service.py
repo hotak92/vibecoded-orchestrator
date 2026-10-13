@@ -814,294 +814,70 @@ class ConstructionPresetTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class CodeFallbackChainTests(unittest.TestCase):
-    """Locked fallback chain: codesage → qwen3 → jina.
+class NoCrossModelFallbackTests(unittest.TestCase):
+    """Owner ruling 2026-10-10 — "falling back to a different embedding model
+    should never be done": the v0.2.18 codesage → qwen3 → jina chain (opt-in
+    since v0.2.100 as ``VCO_CODE_EMBED_ALLOW_FALLBACK``) is REMOVED. A CodeSage
+    graph whose container is down keeps CodeSage and fails loudly; even the old
+    opt-in variable switches nothing."""
 
-    Verifies the v0.2.18 correctness follow-up to Commit 2: when
-    ``CODE_EMBED_BACKEND=service`` (default) AND the CodeEmbed service
-    is DOWN, ``for_project()`` falls back through Ollama qwen3 then
-    Ollama jina before giving up.
-
-    v0.2.100 (L1-F13): that switch is no longer the default — a down
-    CodeEmbed now raises for code embeds; the ``code_embed_backend_unavailable``
-    row is install.py step 7's, never construction's (W3R-04 —
-    tests/test_v02100_embedding_pull_plan.py).
-    The chain survives as the explicit developer opt-in
-    ``VCO_CODE_EMBED_ALLOW_FALLBACK=1``, which this class sets.
-    """
-
-    def setUp(self):
-        opt_in = patch.dict(os.environ, {"VCO_CODE_EMBED_ALLOW_FALLBACK": "1"})
-        opt_in.start()
-        self.addCleanup(opt_in.stop)
-
-    def _patch_adapters(
-        self,
-        *,
-        ollama_ready: bool,
-        ollama_model_names: list[str] | None = None,
-        code_ready: bool,
-        openai_valid: bool = False,
-    ):
-        """Helper: build adapter mocks for ``for_project`` patching.
-
-        ``ollama_model_names`` controls what ``list_models()`` returns
-        (used by ``_ollama_has_model`` in the fallback chain).
-        """
+    def _adapters(self, *, code_ready: bool):
         ollama_mock = MagicMock(spec=OllamaAdapter)
-        ollama_mock.is_reachable.return_value = ollama_ready
+        ollama_mock.is_reachable.return_value = True
         ollama_mock.list_embedding_models.return_value = []
         ollama_mock.list_models.return_value = [
-            {"name": n} for n in (ollama_model_names or [])
+            {"name": "qwen3-embedding:0.6b"},
+            {"name": "unclemusclez/jina-embeddings-v2-base-code:latest"},
         ]
         ollama_mock.embed.return_value = [0.1] * 4
-
         code_mock = MagicMock(spec=CodeEmbedAdapter)
         code_mock.is_reachable.return_value = code_ready
-        # Used by the fallback chain's reason string (``codeembed.base_url``).
         code_mock.base_url = "http://localhost:11440"
-
         openai_mock = MagicMock(spec=OpenAIAdapter)
-        openai_mock.validate.return_value = ValidationResult(
-            valid=openai_valid,
-            reason=None if openai_valid else "no key",
-        )
+        openai_mock.validate.return_value = ValidationResult(valid=False, reason="no key")
         return ollama_mock, code_mock, openai_mock
 
-    # --- 1. CodeEmbed up: chain is a no-op, codesage path preserved. --
+    def _service(self, *, code_ready: bool, env=None):
+        ollama_m, code_m, oa_m = self._adapters(code_ready=code_ready)
+        with patch.dict(os.environ, env or {}), \
+             patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
+             patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
+             patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
+            return EmbeddingService.for_project(), ollama_m
 
-    def test_code_fallback_codeembed_up(self):
+    def test_codeembed_up_serves_codesage(self):
         with _EnvIsolation():
-            ollama_m, code_m, oa_m = self._patch_adapters(
-                ollama_ready=True,
-                ollama_model_names=["qwen3-embedding:0.6b"],
-                code_ready=True,
-            )
-            with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
-                 patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
-                 patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
-                svc = EmbeddingService.for_project()
+            svc, _o = self._service(code_ready=True)
+            try:
+                self.assertEqual(svc.code_model_id, "codesage-large-v2")
+                self.assertEqual(svc.code_vector_slot, "codesage_embed")
+                self.assertTrue(svc.code_backend_ready())
+            finally:
+                svc.close()
+
+    def test_codeembed_down_never_switches_embedder_and_fails_loudly(self):
+        for env in ({}, {"VCO_CODE_EMBED_ALLOW_FALLBACK": "1"}):
+            with _EnvIsolation():
+                svc, ollama_m = self._service(code_ready=False, env=env)
                 try:
-                    self.assertEqual(svc.code_model_id, "codesage-large-v2")
-                    self.assertEqual(svc.code_vector_slot, "codesage_embed")
-                    self.assertEqual(svc.code_dim, 2048)
-                    self.assertTrue(svc.code_backend_ready())
+                    self.assertEqual(svc.code_model_id, "codesage-large-v2", env)
+                    self.assertEqual(svc.code_vector_slot, "codesage_embed", env)
+                    self.assertFalse(svc.code_backend_ready())
+                    with self.assertRaises(NoEmbeddingBackendError) as ctx:
+                        svc.embed_code("def f(): pass")
+                    self.assertIn("vco_code_embed", str(ctx.exception))
+                    self.assertIn("never queried with a different embedding model",
+                                  str(ctx.exception))
+                    ollama_m.embed.assert_not_called()
                 finally:
                     svc.close()
 
-    # --- 2. CodeEmbed down, qwen3 present → qwen3 wins. ---------------
+    def test_the_fallback_chain_is_gone(self):
+        from vco_lib import embedding_service as es
 
-    def test_code_fallback_codeembed_down_qwen3_present(self):
-        with _EnvIsolation():
-            ollama_m, code_m, oa_m = self._patch_adapters(
-                ollama_ready=True,
-                ollama_model_names=["qwen3-embedding:0.6b", "llama3:8b"],
-                code_ready=False,
-            )
-            with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
-                 patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
-                 patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
-                svc = EmbeddingService.for_project()
-                try:
-                    self.assertEqual(svc.code_model_id, "qwen3-embedding:0.6b")
-                    self.assertEqual(svc.code_vector_slot, "qwen3_embed")
-                    self.assertEqual(svc.code_dim, 1024)
-                    self.assertTrue(
-                        svc.code_backend_ready(),
-                        "qwen3_embed slot should be ready when Ollama responds",
-                    )
-                finally:
-                    svc.close()
-
-    # --- 3. CodeEmbed down, qwen3 missing, jina present → jina wins. --
-
-    def test_code_fallback_codeembed_down_qwen3_missing_jina_present(self):
-        with _EnvIsolation():
-            ollama_m, code_m, oa_m = self._patch_adapters(
-                ollama_ready=True,
-                ollama_model_names=[
-                    "unclemusclez/jina-embeddings-v2-base-code:latest",
-                ],
-                code_ready=False,
-            )
-            with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
-                 patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
-                 patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
-                svc = EmbeddingService.for_project()
-                try:
-                    self.assertEqual(
-                        svc.code_model_id,
-                        "unclemusclez/jina-embeddings-v2-base-code:latest",
-                    )
-                    self.assertEqual(svc.code_vector_slot, "jina_embed")
-                    self.assertEqual(svc.code_dim, 768)
-                finally:
-                    svc.close()
-
-    # --- 4. All down: keep requested triple, code_backend_ready==False. -
-
-    def test_code_fallback_all_down(self):
-        # Steer BOTH state roots at a tempdir so the JSONL failure log
-        # doesn't touch the user's real telemetry. v0.2.92 W7 moved the
-        # stream from ~/.claude/metrics to <VCT_STATE_DIR>/metrics, so both
-        # levers are pinned; the CLAUDE one still steers the frozen archive
-        # a reader may consult. Before that: this
-        # used to patch `vco_lib.embedding_service.Path.home` — a bet on
-        # WHICH symbol resolves the path, which expired the moment the
-        # resolution moved into `vco_lib.paths.claude_metrics_dir()`.
-        # `$VCT_CLAUDE_DIR` steers the RESOURCE, so it keeps working
-        # wherever the resolution lives (and, unlike the old patch, does
-        # not monkeypatch `Path.home` process-wide as a side effect).
-        import tempfile
-        with _EnvIsolation(), tempfile.TemporaryDirectory() as home_dir, \
-             patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(Path(home_dir) / ".claude"),
-                              "VCT_STATE_DIR": str(Path(home_dir) / ".vct")}):
-            # Ollama up but lacking qwen3 + jina; CodeEmbed down.
-            # Text backend still works (Ollama responds to /api/tags),
-            # so for_project() succeeds — but code_backend_ready==False
-            # because no code model is present on Ollama AND CodeEmbed is
-            # unreachable.
-            ollama_m, code_m, oa_m = self._patch_adapters(
-                ollama_ready=True,
-                ollama_model_names=["llama3:8b"],
-                code_ready=False,
-            )
-            with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
-                 patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
-                 patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
-                svc = EmbeddingService.for_project()
-                try:
-                    # No fallback was selected — requested codesage triple
-                    # is preserved, but code_backend_ready() reports False
-                    # because CodeEmbed is unreachable (slot semantics).
-                    self.assertEqual(svc.code_model_id, "codesage-large-v2")
-                    self.assertEqual(svc.code_vector_slot, "codesage_embed")
-                    # codesage_embed routes via either codeembed.is_reachable
-                    # OR ollama.is_reachable — Ollama IS reachable (just
-                    # missing the model), so the existing slot-level gate
-                    # returns True. The actual failure surfaces only at
-                    # embed-call time. This matches pre-fallback behaviour
-                    # and is gated to False by analyze_code_graph.py's
-                    # additional sanity checks (the slot+model combo is
-                    # what the consumer migrates on).
-                    # Document the actual state so future-readers know:
-                    self.assertFalse(code_m.is_reachable())
-                finally:
-                    svc.close()
-
-    # --- 5. Fallback log fires exactly once at construction. ---------
-
-    def test_code_fallback_logs_one_line(self):
-        from io import StringIO
-        captured = StringIO()
-        with _EnvIsolation():
-            ollama_m, code_m, oa_m = self._patch_adapters(
-                ollama_ready=True,
-                ollama_model_names=["qwen3-embedding:0.6b"],
-                code_ready=False,
-            )
-            with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
-                 patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
-                 patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m), \
-                 patch("vco_lib.embedding_service.sys.stderr", captured):
-                svc = EmbeddingService.for_project()
-                try:
-                    output = captured.getvalue()
-                    # Exactly one fallback-reason line in stderr.
-                    fallback_lines = [
-                        ln for ln in output.splitlines()
-                        if "CodeEmbed service unreachable" in ln
-                    ]
-                    self.assertEqual(
-                        len(fallback_lines), 1,
-                        f"expected exactly one fallback log line, got: {output!r}",
-                    )
-                    self.assertIn("qwen3-embedding:0.6b", fallback_lines[0])
-                    self.assertIn("slot=qwen3_embed", fallback_lines[0])
-                finally:
-                    svc.close()
-
-    # --- 6. Text resolution unchanged by code fallback. ---------------
-
-    def test_code_fallback_preserves_text_resolution(self):
-        with _EnvIsolation():
-            ollama_m, code_m, oa_m = self._patch_adapters(
-                ollama_ready=True,
-                ollama_model_names=["qwen3-embedding:0.6b"],
-                code_ready=False,
-            )
-            with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
-                 patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
-                 patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
-                svc = EmbeddingService.for_project()
-                try:
-                    # Code falls back to qwen3, but text resolution is
-                    # entirely independent and stays at the default.
-                    self.assertEqual(svc.text_model_id, "qwen3-embedding:0.6b")
-                    self.assertEqual(svc.text_vector_slot, "qwen3_embed")
-                    self.assertEqual(svc.text_dim, 1024)
-                    # And the code fallback DID land on qwen3 as expected.
-                    self.assertEqual(svc.code_vector_slot, "qwen3_embed")
-                finally:
-                    svc.close()
-
-    # --- 7. OpenAI explicit code path: chain doesn't fire. ------------
-
-    def test_code_fallback_respects_openai_when_set_as_default(self):
-        # User has explicitly set OPENAI_API_KEY + CODE_EMBED_MODEL =
-        # an OpenAI model. The chain only activates for the codesage_embed
-        # slot, so the openai_code_embed path is left untouched even if
-        # the CodeEmbed service is unreachable.
-        with _EnvIsolation(), patch.dict(os.environ, {
-            "OPENAI_API_KEY": "sk-test",
-            "CODE_EMBED_MODEL": "text-embedding-3-small",
-        }, clear=False):
-            ollama_m, code_m, oa_m = self._patch_adapters(
-                ollama_ready=True,
-                ollama_model_names=["qwen3-embedding:0.6b"],
-                code_ready=False,
-                openai_valid=True,
-            )
-            with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
-                 patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
-                 patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
-                svc = EmbeddingService.for_project()
-                try:
-                    # OpenAI choice respected — no fallback to qwen3/jina.
-                    self.assertEqual(svc.code_model_id, "text-embedding-3-small")
-                    self.assertEqual(svc.code_vector_slot, "openai_code_embed")
-                    self.assertEqual(svc.code_dim, 1536)
-                finally:
-                    svc.close()
-
-    # --- 8. Idempotency: re-running for_project gives the same answer. -
-
-    def test_code_fallback_idempotent_resolution(self):
-        with _EnvIsolation():
-            ollama_m, code_m, oa_m = self._patch_adapters(
-                ollama_ready=True,
-                ollama_model_names=["qwen3-embedding:0.6b"],
-                code_ready=False,
-            )
-            with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
-                 patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
-                 patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
-                svc1 = EmbeddingService.for_project()
-                try:
-                    first = (svc1.code_model_id, svc1.code_vector_slot, svc1.code_dim)
-                finally:
-                    svc1.close()
-                svc2 = EmbeddingService.for_project()
-                try:
-                    second = (svc2.code_model_id, svc2.code_vector_slot, svc2.code_dim)
-                finally:
-                    svc2.close()
-                self.assertEqual(first, second)
-
-
-# ---------------------------------------------------------------------------
-# NoEmbeddingBackendError — failure capture
-# ---------------------------------------------------------------------------
+        for name in ("_resolve_code_model_with_fallback", "_code_fallback_opted_in",
+                     "CODE_EMBED_ALLOW_FALLBACK_ENV", "_FALLBACK_QWEN3_MODEL"):
+            self.assertFalse(hasattr(es, name), name)
 
 
 class FailureCaptureTests(unittest.TestCase):
@@ -1443,16 +1219,17 @@ class EmbeddingServiceMethodTests(unittest.TestCase):
         finally:
             svc.close()
 
-    def test_embed_code_falls_back_to_ollama_when_service_down(self):
+    def test_embed_code_never_falls_back_to_ollama_when_service_down(self):
+        """Owner ruling 2026-10-10: a CodeSage graph whose container is down
+        fails loudly — Ollama (a different embedding model) is never used."""
         svc, _ = _make_service_with_mocks(
             code_model="codesage-large-v2", code_ready=False
         )
         try:
-            vec = svc.embed_code("def foo(): pass")
-            # Ollama returns [0.1, 0.2, 0.3] from the mock — service is
-            # down so the dispatcher routes there instead.
-            self.assertEqual(vec, [0.1, 0.2, 0.3])
-            svc.ollama.embed.assert_called_once()
+            with self.assertRaises(NoEmbeddingBackendError) as ctx:
+                svc.embed_code("def foo(): pass")
+            self.assertIn("vco_code_embed", str(ctx.exception))
+            svc.ollama.embed.assert_not_called()
         finally:
             svc.close()
 
@@ -1676,7 +1453,7 @@ class DiscoveryTests(unittest.TestCase):
         with _EnvIsolation():
             choices = EmbeddingService.discover_text_models(
                 ollama_url="http://localhost:11435",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
         # We should see openai choices available
@@ -1747,7 +1524,7 @@ class DiscoveryTests(unittest.TestCase):
             choices = EmbeddingService.discover_code_models(
                 ollama_url="http://localhost:11435",
                 code_embed_url="http://localhost:11440",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
         backends_with_avail = {c.backend for c in choices if c.available_now}
@@ -1832,7 +1609,7 @@ class DiscoverEmitsPrefixedOpenAIIdTests(unittest.TestCase):
         with _EnvIsolation():
             choices = EmbeddingService.discover_text_models(
                 ollama_url="http://localhost:11435",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
         openai_choices = [c for c in choices if c.backend == "openai"]
@@ -1879,7 +1656,7 @@ class DiscoverEmitsPrefixedOpenAIIdTests(unittest.TestCase):
             choices = EmbeddingService.discover_code_models(
                 ollama_url="http://localhost:11435",
                 code_embed_url="http://localhost:11440",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
         openai_choices = [c for c in choices if c.backend == "openai"]
@@ -1918,7 +1695,7 @@ class DiscoverEmitsPrefixedOpenAIIdTests(unittest.TestCase):
         with _EnvIsolation():
             EmbeddingService.discover_text_models(
                 ollama_url="http://localhost:11435",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
         # FakeSession records every GET it answered as (method, url, kwargs).
@@ -1974,7 +1751,7 @@ class OpenAIHttpBoundaryStripsPrefixTests(unittest.TestCase):
             code_embed_url="http://localhost:11440",
             text_model_id=text_model_id,
             code_model_id=code_model_id,
-            openai_api_key="sk-test",
+            openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
             session=session,
         )
         return svc, session
@@ -2073,7 +1850,7 @@ class OpenAIHttpBoundaryStripsPrefixTests(unittest.TestCase):
                 code_embed_url="http://localhost:11440",
                 text_model_id="qwen3-embedding:0.6b",
                 code_model_id="codesage-large-v2",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
             try:
@@ -2199,10 +1976,20 @@ class EmbedRequestTimeoutResolutionTests(unittest.TestCase):
                 DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
             )
 
-    def test_default_is_180(self):
-        # The default must be generous (~6x the ~30s/chunk arctic-on-CPU
-        # boundary) so a slow re-embed never trips it.
-        self.assertEqual(DEFAULT_EMBED_REQUEST_TIMEOUT_SECS, 180.0)
+    def test_default_exceeds_the_code_embed_server_queue_wait(self):
+        # RETARGETED (v0.2.102 r2; was test_default_is_180). The CodeEmbed
+        # service now QUEUES over-capacity requests up to its
+        # CODE_EMBED_QUEUE_WAIT_SECS bound (server default 600 s) instead of
+        # shedding them, so the client deadline MUST exceed that bound — a
+        # shorter timeout would abort a request the server is still
+        # legitimately holding (a drop by another name). One home for the
+        # floor: vco_lib.retry_after.CODE_EMBED_CLIENT_TIMEOUT_SECS.
+        from vco_lib.retry_after import CODE_EMBED_CLIENT_TIMEOUT_SECS
+
+        self.assertEqual(
+            DEFAULT_EMBED_REQUEST_TIMEOUT_SECS, CODE_EMBED_CLIENT_TIMEOUT_SECS
+        )
+        self.assertGreater(DEFAULT_EMBED_REQUEST_TIMEOUT_SECS, 600.0)
 
     def test_env_override_honoured(self):
         with patch.dict(os.environ, {EMBED_REQUEST_TIMEOUT_ENV: "42"}):
@@ -2548,7 +2335,8 @@ class SubprocessEnvThreadsRequestTimeoutTests(unittest.TestCase):
     per-chunk bound, never a process kill). For that override to reach the
     ``sync_knowledge_graph.py`` subprocess, install.py must thread the env var
     through when it is set in the install shell. When unset, the subprocess
-    falls back to the 180s default — so install.py must NOT inject a value.
+    falls back to the shipped default (660s since v0.2.102 r2) — so install.py
+    must NOT inject a value.
     """
 
     def _load_install_module(self):

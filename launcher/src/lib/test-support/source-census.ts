@@ -230,18 +230,27 @@ export function sourceFile(rel: string, raw: string, lang: Lang): SourceFile {
   return { rel, text: blankRanges(text, tests), code: blankRanges(code, tests) };
 }
 
+// Parsed once per test worker: the source tree does not change during a run,
+// and re-walking + re-stripping every file on each call made census tests
+// exceed vitest's 5 s default on slower CI runners. Callers only read the
+// returned arrays.
+let rustCache: SourceFile[] | undefined;
+let frontendCache: SourceFile[] | undefined;
+
 /** Every non-test `.rs` under `src-tauri/` (all crates), comments and
  *  inline test modules stripped. `rel` is relative to `src-tauri/`. */
 export function loadRust(): SourceFile[] {
-  return walkFiles(TAURI_ROOT, /\.rs$/)
+  rustCache ??= walkFiles(TAURI_ROOT, /\.rs$/)
     .filter((abs) => !relPath(TAURI_ROOT, abs).split('/').includes('tests'))
     .map((abs) => sourceFile(relPath(TAURI_ROOT, abs), readFileSync(abs, 'utf-8'), 'rust'));
+  return rustCache;
 }
 
 /** Every non-test `.ts`/`.svelte` under `launcher/src/`, comments stripped.
  *  `rel` is relative to `src/`. */
 export function loadFrontend(): SourceFile[] {
-  return walkFiles(FRONTEND_SRC, /\.(ts|svelte)$/).map((abs) =>
+  frontendCache ??= walkFiles(FRONTEND_SRC, /\.(ts|svelte)$/).map((abs) =>
     sourceFile(relPath(FRONTEND_SRC, abs), readFileSync(abs, 'utf-8'), 'ts'),
   );
+  return frontendCache;
 }

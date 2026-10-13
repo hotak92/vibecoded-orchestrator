@@ -13,7 +13,7 @@
 //!   - `commands::embedding_catalog::resolve_python_for_vco_lib` — exe-walk +
 //!     PATH.
 //!   - `commands::embedding_enrichment::resolve_python_for_vco_lib` — exe-walk
-//!     + PATH.
+//!     + PATH (module retired in v0.2.102 W6-J with its command).
 //!
 //! Consolidating to one home (the "search before you add, extract before you
 //! duplicate" rule) means the missing-tiers bug in `codegraph_reanalyze` is

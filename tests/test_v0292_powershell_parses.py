@@ -31,6 +31,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # v0.2.92 delivery audit m6: the gate scanned templates/** only — the
@@ -101,7 +102,7 @@ def test_every_shipped_ps1_parses(tmp_path: Path) -> None:
     )
 
     proc = subprocess.run(
-        [exe, "-NoProfile", "-File", str(probe), *[str(p) for p in SHIPPED_PS1]],
+        [exe, *PWSH_BASE_FLAGS, "-File", str(probe), *[str(p) for p in SHIPPED_PS1]],
         capture_output=True,
         text=True,
         timeout=600,

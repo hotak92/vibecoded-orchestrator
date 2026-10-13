@@ -259,7 +259,45 @@ jobs:
           # the repo only on cwd that probe fails here while passing on any
           # real install, and the spawn-guard tests went red for the runner,
           # not the code.
-          pip install -e .
+          # v0.2.102: WITH the codegraph-ts extra — install.py installs it by
+          # default, the code graph's tree-sitter definitions layer is the
+          # shipped path, and the definitions correctness gate
+          # (tests/test_codegraph_definitions_truth.py) skips without it.
+          pip install -e ".[codegraph-ts]"
+      - name: Resolve the language-pack cache dir + pinned version
+        # v0.2.102 fix round: the parser install below downloads a ~22 MB
+        # per-platform grammar bundle from GitHub Releases into the
+        # interpreter's own prefix (<sys.prefix>/share/vco-codegraph-parsers
+        # — pack_cache_base()). Resolve that dir and the pinned pack version
+        # (through the shipped pin reader, no second version list) so the
+        # cache step can key on them.
+        id: packcache
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import sys
+          from vco_lib.codegraph_parsers import requirement_specs
+          pack = next(s for s in requirement_specs(["proto"])
+                      if s.startswith("tree-sitter-language-pack"))
+          print(f"dir={sys.prefix}/share/vco-codegraph-parsers")
+          print(f"version={pack.split('==')[1].strip()}")
+          PY
+      - name: Cache the tree-sitter language pack grammar bundle
+        # Without this, every pytest run re-downloads the 22 MB bundle and
+        # CI goes red on a GitHub-Releases outage. The cache dir is
+        # version-scoped INSIDE (tree-sitter-language-pack/v<version>/), so
+        # a restore across setup-python patch bumps is still correct.
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.packcache.outputs.dir }}
+          key: codegraph-language-pack-${{ steps.packcache.outputs.version }}-${{ runner.os }}
+      - name: Install the optional code-graph parsers
+        # v0.2.102 W6-L: the OPTIONAL PowerShell / proto parsers (never in a
+        # default install; VCO offers them per detected language) through the
+        # same installer helper the launcher uses — pins from pyproject, the
+        # language pack's proto grammar pre-fetched (from the cache above on
+        # warm runs), every grammar verified.
+        # The definitions gate and the tree-sitter golden cover them.
+        run: python -m vco_lib.codegraph_parsers install --all
       - name: pytest
         run: pytest tests/ -q
 

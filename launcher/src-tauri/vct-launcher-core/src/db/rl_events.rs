@@ -314,7 +314,18 @@ fn archive_stem(project_id: Option<&str>, rows: &[RlEvent]) -> String {
 
 impl Db {
     /// Insert one RL event. Always appends; rl_events is never updated in
-    /// place. Returns the new row's `id`.
+    /// place. Returns the row's `id`.
+    ///
+    /// W3R-7 (v0.2.102): duplicate-tolerant ingest WITHOUT a schema
+    /// migration. The table deliberately has no UNIQUE constraint (adding
+    /// one could fail on existing duplicate rows in user DBs), so exact
+    /// re-POSTs of the same `(task_id, event_type, ts_ms)` triple — a
+    /// migrator crash between POST and rename, a retried send — are
+    /// deduplicated HERE: the existing row's id is returned and nothing is
+    /// inserted. `task_id` ALONE is deliberately not the dedupe key:
+    /// retrieval/citation pairs and dual-log twins share one task_id by
+    /// design; only a same-triple re-POST of one serialized event is a
+    /// duplicate.
     ///
     /// Soft-fail discipline: any DB error returns `Err(String)` to the
     /// caller. The hub handler logs + responds 5xx; the Python writer
@@ -341,6 +352,19 @@ impl Db {
         payload_json: &str,
     ) -> Result<i64, String> {
         let guard = self.lock();
+        let existing: Option<i64> = guard
+            .query_row(
+                "SELECT id FROM rl_events
+                  WHERE task_id = ?1 AND event_type = ?2 AND ts = ?3
+                  ORDER BY id LIMIT 1",
+                params![task_id, event_type, ts_ms],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("rl_event dedupe probe: {}", e))?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
         guard
             .execute(
                 "INSERT INTO rl_events
@@ -1182,6 +1206,73 @@ mod tests {
             )
             .expect("insert");
         assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn insert_dedupes_exact_repost_of_same_triple() {
+        // W3R-7 (v0.2.102): an exact re-POST of the same
+        // (task_id, event_type, ts_ms) — a migrator crash between POST and
+        // rename, a retried send — returns the EXISTING row id and inserts
+        // nothing. No schema migration: the check is a pre-insert SELECT.
+        let db = fresh_db();
+        let first = db
+            .insert_rl_event(
+                "retrieval",
+                3,
+                1_700_000_000_000,
+                None,
+                Some("VCO_dev"),
+                "task-dup",
+                Some("mcp_interactive"),
+                Some("qwen3"),
+                Some(1024),
+                Some("qwen3-embedding:0.6b"),
+                r#"{"event":"retrieval","schema_version":3}"#,
+            )
+            .expect("first insert");
+        let second = db
+            .insert_rl_event(
+                "retrieval",
+                3,
+                1_700_000_000_000,
+                None,
+                Some("VCO_dev"),
+                "task-dup",
+                Some("mcp_interactive"),
+                Some("qwen3"),
+                Some(1024),
+                Some("qwen3-embedding:0.6b"),
+                r#"{"event":"retrieval","schema_version":3}"#,
+            )
+            .expect("re-post must not error");
+        assert_eq!(first, second, "a re-post returns the existing row id");
+        let rows = db.list_rl_events(None, None, None, None, 10, false).unwrap();
+        assert_eq!(rows.len(), 1, "an exact re-post must not double-insert");
+    }
+
+    #[test]
+    fn insert_keeps_distinct_events_sharing_a_task_id() {
+        // W3R-7 guard rail: task_id ALONE is not the dedupe key — a
+        // retrieval/citation pair (same task_id, different event_type) and a
+        // re-emitted event with a fresh ts_ms must both survive.
+        let db = fresh_db();
+        db.insert_rl_event(
+            "retrieval", 4, 1_700_000_000_000, None, None, "task-pair",
+            Some("mcp_interactive"), None, None, None, r#"{"event":"retrieval"}"#,
+        )
+        .unwrap();
+        db.insert_rl_event(
+            "citation", 4, 1_700_000_001_000, None, None, "task-pair",
+            Some("mcp_interactive"), None, None, None, r#"{"event":"citation"}"#,
+        )
+        .unwrap();
+        db.insert_rl_event(
+            "retrieval", 4, 1_700_000_002_000, None, None, "task-pair",
+            Some("mcp_interactive"), None, None, None, r#"{"event":"retrieval"}"#,
+        )
+        .unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 10, false).unwrap();
+        assert_eq!(rows.len(), 3, "distinct events sharing a task_id must all land");
     }
 
     #[test]

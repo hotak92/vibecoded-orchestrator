@@ -179,8 +179,8 @@ export interface DualFlagBadge {
   label: string;
   /**
    * `user` = teal ("explicitly chosen here"), `auto` = purple ("inherited").
-   * Matches `ActiveEmbeddingPicker`'s hue mapping, which is the semantically
-   * closest shipped surface.
+   * (The hue mapping came from the per-project embedding picker, removed in
+   * v0.2.102 W6-J; this panel now owns it.)
    */
   kind: 'user' | 'auto';
 }

@@ -300,15 +300,16 @@ def test_record_discovered_path_gated_and_normalized(analyzer_mod) -> None:
     analyzer._record_discovered_path(root / "src" / "a.py", root)
     assert analyzer._prune_discovered_paths == set()
 
-    # Gated on → POSIX rel recorded (the stored-anchor shape).
+    # Gated on → (walked root, POSIX rel) recorded — the stored-anchor shape,
+    # keyed by root since W6-CGD (D-3) so one tree's skip never shields the other's.
     analyzer._track_visited = True
     analyzer._record_discovered_path(root / "src" / "a.py", root)
-    assert analyzer._prune_discovered_paths == {"src/a.py"}
+    assert analyzer._prune_discovered_paths == {("/repo", "src/a.py")}
 
     # File outside the root (relative_to raises) → normalized fallback,
     # never an exception (a bad path must not break the walk).
     analyzer._record_discovered_path(Path("/elsewhere/b.py"), root)
-    assert "/elsewhere/b.py" in analyzer._prune_discovered_paths
+    assert ("/repo", "/elsewhere/b.py") in analyzer._prune_discovered_paths
 
 
 def test_incremental_branch_records_prefilter_discovery_source_shape() -> None:
@@ -367,7 +368,7 @@ def test_module_write_failure_keeps_rows_preserved(analyzer_mod) -> None:
             "src/broken.py", "python", 1, 1.0,
             datetime.now(tz=timezone.utc), "hash", [], "summary",
         )
-    assert "src/broken.py" not in analyzer._prune_walked_paths
+    assert not any(p == "src/broken.py" for _src, p in analyzer._prune_walked_paths)
 
     # The file is discovered-but-not-walked → in the preserve set → its rows
     # survive the prune.

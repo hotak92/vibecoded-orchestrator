@@ -271,9 +271,12 @@ class TestReconciliationWithMarkdown(unittest.TestCase):
             self.skipTest("launcher sources not present in this checkout")
         src = rs.read_text(encoding="utf-8")
         # Every production strip_section call (skip `fn strip_section` and
-        # test-module usages, which exercise the helper directly).
-        in_tests = src.find("mod tests")
-        production = src[: in_tests if in_tests != -1 else len(src)]
+        # test-module usages, which exercise the helper directly). Test items
+        # are blanked one by one rather than cutting at the first
+        # `mod tests`, which also matched that text in a comment and hid any
+        # production code after the module (v0.2.102 W6-Z2).
+        from tests.common.rust_source import production_source
+        production = production_source(src)
         import re
         stripped_cids = set(re.findall(
             r'strip_section\(&?\w+,\s*"([^"]+)"\)', production

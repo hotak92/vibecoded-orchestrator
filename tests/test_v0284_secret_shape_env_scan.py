@@ -136,7 +136,7 @@ class SecretShapeEnvScanTests(unittest.TestCase):
     def test_secret_shaped_key_with_value_is_flagged(self):
         """A genuine secret-shaped key WITH a value in the env managed block is
         still flagged (deferral emitted exactly as v0.2.83)."""
-        lines = _config_only_lines() + ['export OPENAI_API_KEY="sk-realish-value"']
+        lines = _config_only_lines() + ['export OPENAI_API_KEY="sk-realish-value"']  # vco-secret-scan: test-placeholder
         env_path = _write_env(self.tmp, lines)
         self.assertTrue(
             project_init._has_user_secret_shaped_line(env_path),

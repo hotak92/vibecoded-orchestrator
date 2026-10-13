@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Parity: kept in step with stop-failure-notify.ps1 (its UTF-8 BOM serves Windows
+# PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
@@ -31,8 +33,14 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
-PROJECT_NAME=$(basename "$PROJECT_DIR")
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py). It only labels the ledger row and locates
+# notify.py; the ledger (metrics dir) is written either way. None -> the
+# label falls back to the cwd's name and no notification is sent.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
+PROJECT_NAME=$(basename "${PROJECT_DIR:-$PWD}")
 
 # Resolve a Python interpreter portably (python3 → python → py).
 # See audit finding F6, 2026-04-30. _lib/find-python.sh sets $PY.
@@ -295,7 +303,7 @@ if [ "${VCO_STOP_FAILURE_NOTIFY:-1}" = "0" ]; then
 fi
 
 # Cross-platform urgent desktop notification (Linux/macOS/Windows). See audit F2.
-if [ "$NOTIFY_FLAG" = "1" ] && [ -n "${PY:-}" ] && [ -f "$PROJECT_DIR/.claude/scripts/notify.py" ]; then
+if [ "$NOTIFY_FLAG" = "1" ] && [ -n "${PY:-}" ] && [ -n "$PROJECT_DIR" ] && [ -f "$PROJECT_DIR/.claude/scripts/notify.py" ]; then
     "$PY" "$PROJECT_DIR/.claude/scripts/notify.py" \
         "Claude API Error — $PROJECT_NAME" "$NOTIFY_MSG" \
         --urgency critical --icon dialog-error --expire-time 15000 \

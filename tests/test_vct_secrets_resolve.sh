@@ -134,13 +134,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 status = int(f.read().strip())
         with open(body_path) as f:
             body = f.read().encode()
+        # v0.2.102 (W6-AB) fixture knobs: `<fixture>.hits` counts requests;
+        # `<fixture>.delay` (seconds) delays EVERY answer (a hub busy on a
+        # slow keychain); `<fixture>.once_status` + `.once_body` answer the
+        # NEXT request only, then vanish (a transient 503 then success).
+        hits_path = body_path + ".hits"
+        hits = 0
+        if os.path.exists(hits_path):
+            with open(hits_path) as f:
+                hits = int(f.read().strip() or 0)
+        with open(hits_path, "w") as f:
+            f.write(str(hits + 1))
+        once_status = body_path + ".once_status"
+        if os.path.exists(once_status):
+            with open(once_status) as f:
+                status = int(f.read().strip())
+            os.remove(once_status)
+            once_body = body_path + ".once_body"
+            if os.path.exists(once_body):
+                with open(once_body) as f:
+                    body = f.read().encode()
+                os.remove(once_body)
+        delay_path = body_path + ".delay"
+        if os.path.exists(delay_path):
+            import time
+            with open(delay_path) as f:
+                time.sleep(float(f.read().strip()))
+        # v0.2.102 fix-round knob: `<fixture>.retry_after` sends that literal
+        # Retry-After header on every answer for the fixture (the value the
+        # resolver's ONE retry must honour).
+        retry_after_path = body_path + ".retry_after"
+        retry_after = None
+        if os.path.exists(retry_after_path):
+            with open(retry_after_path) as f:
+                retry_after = f.read().strip() or None
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if retry_after is not None:
+            self.send_header("Retry-After", retry_after)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+# Threading: a request parked on a `.delay` fixture must not block the
+# resolver's retry (or the next test) behind it.
+server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
 server.serve_forever()
 PYEOF
     echo $! >"$pid_file"
@@ -212,6 +250,21 @@ out=$(VCT_HUB_PORT="$no_hub_port" "$RESOLVER" some-project-id GITHUB_TOKEN 2>/de
 rc=$?
 set -e
 assert_eq "$rc" "1" "test_vct_secrets_resolve_exits_1_when_hub_unreachable"
+
+# ── Test 1-fast (v0.2.102 W6-AB): a REFUSED connection falls through at once ──
+# The long secret read timeout and the one retry are for a hub that is
+# RUNNING but slow; no hub at all must still answer in well under a second
+# or two (connect refused, no retry, no wait).
+t0=$(date +%s)
+set +e
+VCT_HUB_PORT="$no_hub_port" "$RESOLVER" some-project-id GITHUB_TOKEN >/dev/null 2>&1
+set -e
+t1=$(date +%s)
+if (( t1 - t0 <= 2 )); then
+    assert_eq "0" "0" "test_vct_secrets_resolve_refused_falls_through_fast"
+else
+    assert_eq "$(( t1 - t0 ))s" "<=2s" "test_vct_secrets_resolve_refused_falls_through_fast"
+fi
 
 # ── Test 1b: token file missing AND env override unset → exit 1 ─────────
 # Mirrors the "hub.token doesn't exist yet" path (launcher hasn't
@@ -353,6 +406,178 @@ case "$unreadable_err" in
     *) assert_eq "1" "0" "test_vct_secrets_resolve_keychain_error_msg_is_honest (got: $unreadable_err)" ;;
 esac
 
+# ── Test 4d2 (v0.2.102): 503 keychain_unavailable → exit 7, "retry" msg ──
+# A keychain op timed out on the hub: the retryable "store unavailable"
+# code 7 (W6-AB; distinct from exit 6 = locked, unlock it), after exactly
+# ONE retry, and the message says the keychain is TEMPORARILY unavailable
+# and to retry — nothing to unlock, nothing to add.
+cat >"$scratch/responses/GET_projects_p1_env_key=BUSY_KEY.json.status" <<'STATUS'
+503
+STATUS
+cat >"$scratch/responses/GET_projects_p1_env_key=BUSY_KEY.json" <<'JSON'
+{"error": {"code": "keychain_unavailable", "message": "timed out"}}
+JSON
+
+set +e
+busy_err=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 BUSY_KEY 2>&1 1>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "7" "test_vct_secrets_resolve_exits_7_when_keychain_unavailable"
+case "$busy_err" in
+    *"temporarily unavailable"*"retry"*) assert_eq "0" "0" "test_vct_secrets_resolve_keychain_unavailable_msg_says_retry" ;;
+    *) assert_eq "1" "0" "test_vct_secrets_resolve_keychain_unavailable_msg_says_retry (got: $busy_err)" ;;
+esac
+assert_eq "$(cat "$scratch/responses/GET_projects_p1_env_key=BUSY_KEY.json.hits")" "2" \
+    "test_vct_secrets_resolve_keychain_unavailable_is_retried_exactly_once"
+case "$busy_err" in
+    *"vct set"*|*"add the key"*) assert_eq "1" "0" "test_vct_secrets_resolve_unavailable_never_says_add_the_key (got: $busy_err)" ;;
+    *) assert_eq "0" "0" "test_vct_secrets_resolve_unavailable_never_says_add_the_key" ;;
+esac
+
+# ── Test 4d3 (v0.2.102 W6-AB): a slow keychain completes on the retry ──
+# First answer 503 keychain_unavailable, second 200: the ONE retry (after
+# the hub's Retry-After) returns the value — exit 0.
+cat >"$scratch/responses/GET_projects_p1_env_key=SLOW_KEY.json" <<'JSON'
+{"SLOW_KEY": "synthetic-slow-keychain-value"}
+JSON
+printf '503' >"$scratch/responses/GET_projects_p1_env_key=SLOW_KEY.json.once_status"
+printf '%s' '{"error": {"code": "keychain_unavailable", "message": "timed out"}}' \
+    >"$scratch/responses/GET_projects_p1_env_key=SLOW_KEY.json.once_body"
+set +e
+slow_out=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 SLOW_KEY 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_vct_secrets_resolve_slow_keychain_completes_on_retry_rc"
+assert_eq "$slow_out" "synthetic-slow-keychain-value" "test_vct_secrets_resolve_slow_keychain_completes_on_retry_value"
+
+# ── Test 4d3b (v0.2.102 fix round): the retry waits the hub's Retry-After ──
+# The ONE retry after a 503 keychain_unavailable must honour a NUMERIC
+# Retry-After (clamped at 5 s) the way agent_secrets._retry_wait_seconds
+# does — not a fixed 2 s wait. Elapsed is asserted in ms so the honoured
+# wait (4 s) is distinguishable from the old fixed 2 s.
+_now_ms_test() {
+    # Same ladder as the resolver's _now_ms: EPOCHREALTIME → GNU date +%s%3N
+    # → whole seconds (coarser, still bounds the waits above).
+    local t="${EPOCHREALTIME:-}"
+    if [[ -n "$t" ]]; then
+        t="${t/,/.}"
+        local whole="${t%%.*}" frac="${t#*.}000"
+        printf '%s' "$(( 10#$whole * 1000 + 10#${frac:0:3} ))"
+        return 0
+    fi
+    t=$(date +%s%3N 2>/dev/null || true)
+    if [[ "$t" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$t"
+        return 0
+    fi
+    printf '%s' "$(( $(date +%s) * 1000 ))"
+}
+cat >"$scratch/responses/GET_projects_p1_env_key=RA_KEY.json" <<'JSON'
+{"RA_KEY": "synthetic-retry-after-value"}
+JSON
+printf '503' >"$scratch/responses/GET_projects_p1_env_key=RA_KEY.json.once_status"
+printf '%s' '{"error": {"code": "keychain_unavailable", "message": "timed out"}}' \
+    >"$scratch/responses/GET_projects_p1_env_key=RA_KEY.json.once_body"
+printf '4' >"$scratch/responses/GET_projects_p1_env_key=RA_KEY.json.retry_after"
+t0=$(_now_ms_test)
+set +e
+ra_out=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 RA_KEY 2>/dev/null)
+ra_rc=$?
+set -e
+ra_ms=$(( $(_now_ms_test) - t0 ))
+assert_eq "$ra_rc" "0" "test_vct_secrets_resolve_retry_honours_retry_after_rc"
+assert_eq "$ra_out" "synthetic-retry-after-value" "test_vct_secrets_resolve_retry_honours_retry_after_value"
+if (( ra_ms >= 3500 && ra_ms <= 8000 )); then
+    assert_eq "0" "0" "test_vct_secrets_resolve_retry_honours_retry_after_waited_4s (took ${ra_ms}ms)"
+else
+    assert_eq "${ra_ms}ms" "3500..8000ms" "test_vct_secrets_resolve_retry_honours_retry_after_waited_4s"
+fi
+
+# ── Test 4d3c (v0.2.102 fix round): Retry-After above the cap is CLAMPED ──
+# Same shape with Retry-After: 9 — the wait is the 5 s cap, so the whole
+# resolve finishes well inside the 9 s the hub asked for.
+cat >"$scratch/responses/GET_projects_p1_env_key=RA_CAP_KEY.json" <<'JSON'
+{"RA_CAP_KEY": "synthetic-capped-value"}
+JSON
+printf '503' >"$scratch/responses/GET_projects_p1_env_key=RA_CAP_KEY.json.once_status"
+printf '%s' '{"error": {"code": "keychain_unavailable", "message": "timed out"}}' \
+    >"$scratch/responses/GET_projects_p1_env_key=RA_CAP_KEY.json.once_body"
+printf '9' >"$scratch/responses/GET_projects_p1_env_key=RA_CAP_KEY.json.retry_after"
+t0=$(_now_ms_test)
+set +e
+cap_out=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 RA_CAP_KEY 2>/dev/null)
+cap_rc=$?
+set -e
+cap_ms=$(( $(_now_ms_test) - t0 ))
+assert_eq "$cap_rc" "0" "test_vct_secrets_resolve_retry_after_is_capped_rc"
+assert_eq "$cap_out" "synthetic-capped-value" "test_vct_secrets_resolve_retry_after_is_capped_value"
+if (( cap_ms >= 4500 && cap_ms <= 8000 )); then
+    assert_eq "0" "0" "test_vct_secrets_resolve_retry_after_cap_is_5s_not_9s (took ${cap_ms}ms)"
+else
+    assert_eq "${cap_ms}ms" "4500..8000ms" "test_vct_secrets_resolve_retry_after_cap_is_5s_not_9s"
+fi
+
+# ── Test 4d3d (v0.2.102 fix round): an unparseable Retry-After → 2 s ──────
+# "soon" is not a number of seconds: the wait falls back to the hub default
+# (2 s), never an error and never a long sleep on garbage.
+cat >"$scratch/responses/GET_projects_p1_env_key=RA_BAD_KEY.json" <<'JSON'
+{"RA_BAD_KEY": "synthetic-fallback-value"}
+JSON
+printf '503' >"$scratch/responses/GET_projects_p1_env_key=RA_BAD_KEY.json.once_status"
+printf '%s' '{"error": {"code": "keychain_unavailable", "message": "timed out"}}' \
+    >"$scratch/responses/GET_projects_p1_env_key=RA_BAD_KEY.json.once_body"
+printf 'soon' >"$scratch/responses/GET_projects_p1_env_key=RA_BAD_KEY.json.retry_after"
+t0=$(_now_ms_test)
+set +e
+bad_out=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 RA_BAD_KEY 2>/dev/null)
+bad_rc=$?
+set -e
+bad_ms=$(( $(_now_ms_test) - t0 ))
+assert_eq "$bad_rc" "0" "test_vct_secrets_resolve_unparseable_retry_after_falls_back_rc"
+assert_eq "$bad_out" "synthetic-fallback-value" "test_vct_secrets_resolve_unparseable_retry_after_falls_back_value"
+if (( bad_ms <= 4500 )); then
+    assert_eq "0" "0" "test_vct_secrets_resolve_unparseable_retry_after_waits_the_2s_default (took ${bad_ms}ms)"
+else
+    assert_eq "${bad_ms}ms" "<=4500ms" "test_vct_secrets_resolve_unparseable_retry_after_waits_the_2s_default"
+fi
+
+# ── Test 4d4 (v0.2.102 W6-AB): a hub that does not answer in time → exit 7 ──
+# The 2026-10-13 incident shape: the hub accepts the connection but its
+# answer does not arrive in time (here: inside a 1 s VCT_RESOLVE_MAX_TIME
+# budget). Exit 7 (retryable, "store unavailable") — NOT 3/4 "not found",
+# NOT 1 "hub unreachable" — and no add-the-key remedy.
+cat >"$scratch/responses/GET_projects_p1_env_key=TIMEOUT_KEY.json" <<'JSON'
+{"TIMEOUT_KEY": "never-delivered"}
+JSON
+printf '3' >"$scratch/responses/GET_projects_p1_env_key=TIMEOUT_KEY.json.delay"
+set +e
+to_err=$(VCT_RESOLVE_MAX_TIME=1 VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 TIMEOUT_KEY 2>&1 1>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "7" "test_vct_secrets_resolve_exits_7_when_hub_does_not_answer_in_time"
+case "$to_err" in
+    *"did not answer in time"*"retrying is safe"*) assert_eq "0" "0" "test_vct_secrets_resolve_timeout_msg_says_retry" ;;
+    *) assert_eq "1" "0" "test_vct_secrets_resolve_timeout_msg_says_retry (got: $to_err)" ;;
+esac
+case "$to_err" in
+    *"vct set"*|*"add the key"*|*"hub unreachable"*) assert_eq "1" "0" "test_vct_secrets_resolve_timeout_is_not_unreachable_or_absent (got: $to_err)" ;;
+    *) assert_eq "0" "0" "test_vct_secrets_resolve_timeout_is_not_unreachable_or_absent" ;;
+esac
+
+# ── Test 4d5 (v0.2.102 W6-AB): a hub 5xx → exit 7 after one retry ──
+cat >"$scratch/responses/GET_projects_p1_env_key=HUB500_KEY.json.status" <<'STATUS'
+500
+STATUS
+printf '%s' '{"error": {"code": "internal", "message": "boom"}}' \
+    >"$scratch/responses/GET_projects_p1_env_key=HUB500_KEY.json"
+set +e
+VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 HUB500_KEY >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "$rc" "7" "test_vct_secrets_resolve_exits_7_on_hub_5xx"
+assert_eq "$(cat "$scratch/responses/GET_projects_p1_env_key=HUB500_KEY.json.hits")" "2" \
+    "test_vct_secrets_resolve_hub_5xx_is_retried_exactly_once"
+
 # ── Test 4e (v0.2.82 WP-4a): 503 keychain_locked still falls to store ───
 # The keychain is an INDEPENDENT store from ~/.vct-secrets, so a locked
 # keychain must NOT strand a file-store copy — tier 2 still answers (exit 0).
@@ -365,9 +590,11 @@ assert_eq "$rc" "0" "test_chain_keychain_locked_falls_to_file_store/exit_code"
 assert_eq "$out" "synthetic-store-copy-while-locked" "test_chain_keychain_locked_falls_to_file_store/value"
 rm -f "$VCT_SECRETS_DIR/shared/LOCKED_KEY"
 
-# ── Test 4f (v0.2.82 WP-4a): other 503 stays exit 1 (hub unreachable) ───
-# Only keychain_locked / keychain_error map to exit 6; any OTHER 503 keeps
-# the catch-all exit 1.
+# ── Test 4f (v0.2.82 WP-4a; v0.2.102 W6-AB): other 503 → exit 7 ─────────
+# Only keychain_locked / keychain_error map to exit 6. Any OTHER 503 was the
+# catch-all exit 1 ("hub unreachable") until v0.2.102; the hub answered, so
+# it is running — the retryable "store unavailable" exit 7 is the honest
+# code (never "not found", never "unreachable").
 cat >"$scratch/responses/GET_projects_p1_env_key=MISCONF_KEY.json.status" <<'STATUS'
 503
 STATUS
@@ -379,7 +606,7 @@ set +e
 VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 MISCONF_KEY 2>/dev/null
 rc=$?
 set -e
-assert_eq "$rc" "1" "test_vct_secrets_resolve_other_503_stays_exit_1"
+assert_eq "$rc" "7" "test_vct_secrets_resolve_other_503_is_retryable_exit_7"
 
 # ── Test 5: by-path resolution, then read ───────────────────────────────
 # Encode the test path the way the resolver does.
@@ -415,9 +642,7 @@ cat >"$scratch/responses/${fixture_name}" <<JSON
 JSON
 
 # Then the env lookup once we have the id:
-cat >"$scratch/responses/GET_projects_p-resolved-id_env_key=API_KEY.json" <<'JSON'
-{"API_KEY": "sk-canary-abc"}
-JSON
+printf '%s\n' '{"API_KEY": "sk-canary-abc"}' >"$scratch/responses/GET_projects_p-resolved-id_env_key=API_KEY.json"  # vco-secret-scan: test-placeholder
 
 set +e
 out=$(VCT_HUB_PORT="$HUB_PORT" "$RESOLVER" "$test_folder" API_KEY 2>/dev/null)

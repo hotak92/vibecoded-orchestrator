@@ -940,6 +940,9 @@ def test_spawn_marker_overrides_zero_stale_not_owed(
     The marker overrides the short-circuit; without it, behavior is
     byte-for-byte the pre-M-2 not_owed."""
     monkeypatch.delenv("VCT_RESYNC_SPAWN_DISABLED", raising=False)
+    # v0.2.102 (W1-C S4/S5): "converged" now also means both one-time audits
+    # are recorded for the project; this test pins the revision/cleanup gate.
+    monkeypatch.setattr(cr, "_one_time_audits_owed", lambda *a, **k: [])
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
     _set_verdict(monkeypatch, "current")
     monkeypatch.setattr(
@@ -1361,6 +1364,9 @@ def test_spawn_gate_is_per_project(state_dir, tmp_path, monkeypatch):
     keeps the pre-M-2 not_owed short-circuit (zero extra embeds) while an
     unhealed sibling still spawns despite the positive zero stale count."""
     monkeypatch.delenv("VCT_RESYNC_SPAWN_DISABLED", raising=False)
+    # v0.2.102 (W1-C S4/S5): "converged" now also means both one-time audits
+    # are recorded for the project; this test pins the revision/cleanup gate.
+    monkeypatch.setattr(cr, "_one_time_audits_owed", lambda *a, **k: [])
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
     _set_verdict(monkeypatch, "current")
     monkeypatch.setattr(

@@ -5,12 +5,13 @@
 ``vco_lib/codegraph_schema.py`` is the ONE home for the additive property
 specs that three writer families must agree on:
 
-  1. the analyzer template's ``_ensure_*_property`` helpers (inline —
-     the template must run standalone at user sites, so it cannot import
-     vco_lib there);
+  1. the analyzer template's ``_ensure_*_property`` helpers (v0.2.102:
+     thin delegators to ``codegraph_schema.ensure_analyzer_properties`` —
+     this file still proves they jointly cover EXACTLY the table);
   2. migration edge ``migrations/codegraph_collection/4_to_5.py``
      (embed_revision + chunk props) — imports the shared home DIRECTLY;
-  3. migration edge ``5_to_6.py`` (is_test + n_callers) — same shape.
+  3. migration edge ``5_to_6.py`` (is_test + n_callers) — same shape;
+  4. migration edge ``7_to_8.py`` (CodeInteraction.project, v0.2.102).
 
 THIS FILE IS THE LOCK. It asserts:
   * the analyzer's ensured ``(class, prop, type)`` set is EQUAL to the
@@ -57,6 +58,8 @@ from vco_lib.codegraph_schema import (  # noqa: E402
 _ANALYZER_PATH = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 _EDGE_4_TO_5 = REPO_ROOT / "migrations" / "codegraph_collection" / "4_to_5.py"
 _EDGE_5_TO_6 = REPO_ROOT / "migrations" / "codegraph_collection" / "5_to_6.py"
+_EDGE_7_TO_8 = REPO_ROOT / "migrations" / "codegraph_collection" / "7_to_8.py"
+_EDGE_8_TO_9 = REPO_ROOT / "migrations" / "codegraph_collection" / "8_to_9.py"
 
 
 def _load_module(name: str, path: Path) -> types.ModuleType:
@@ -100,6 +103,7 @@ _P2D_ENSURE_METHODS = (
     "_ensure_embed_revision_property",
     "_ensure_is_test_property",
     "_ensure_n_callers_property",
+    "_ensure_interaction_project_property",  # v0.2.102 S16-4
 )
 
 
@@ -175,10 +179,12 @@ def test_analyzer_helpers_idempotent_when_props_present(analyzer_mod):
 
 # Every edge that owns table props, with its subset attribute. A NEW table
 # prop must appear in exactly one NEW (or existing) edge subset — extend
-# this tuple when the 7_to_8 edge lands.
+# this tuple when a new edge lands (7_to_8 landed in v0.2.102).
 _EDGE_SUBSETS = (
     ("4_to_5", _EDGE_4_TO_5, "_V5_PROPS"),
     ("5_to_6", _EDGE_5_TO_6, "_V6_PROPS"),
+    ("7_to_8", _EDGE_7_TO_8, "_V8_PROPS"),
+    ("8_to_9", _EDGE_8_TO_9, "_V9_PROPS"),
 )
 
 
@@ -209,7 +215,52 @@ def test_edge_has_no_inline_fallback_after_x1(label, path, subset_attr):
         )
     # The edge DOES import the shared home directly now.
     assert "from vco_lib.codegraph_schema import" in text
-    assert "from vco_lib.codegraph_naming import canonical_class_prefix" in text
+
+
+_ALL_CODEGRAPH_EDGES = tuple(
+    sorted((REPO_ROOT / "migrations" / "codegraph_collection").glob("*_to_*.py"))
+)
+
+
+@pytest.mark.parametrize("path", _ALL_CODEGRAPH_EDGES, ids=lambda p: p.stem)
+def test_every_codegraph_edge_resolves_scope_and_connects_through_the_one_home(
+    path, monkeypatch,
+):
+    """v0.2.102 (W1-C S2): the prefix rule and the connect recipe live ONCE, in
+    ``vco_lib.codegraph_edge_env`` — behaviourally proven by swapping the home's
+    functions: every edge's ``_resolve_codegraph_prefix`` / ``_connect`` must
+    return what the home returns (a private copy would ignore the swap)."""
+    from vco_lib import codegraph_edge_env
+
+    sentinel_client = object()
+    monkeypatch.setattr(codegraph_edge_env, "resolve_codegraph_prefix",
+                        lambda env=None: "FromTheOneHome")
+    monkeypatch.setattr(codegraph_edge_env, "connect_from_env", lambda: sentinel_client)
+    edge = _load_module(f"_s2_edge_{path.stem}", path)
+    assert edge._resolve_codegraph_prefix() == "FromTheOneHome"
+    assert edge._connect() is sentinel_client
+    assert not hasattr(edge, "re"), f"{path.name}: a private URL/regex copy is back"
+
+
+def test_runner_prefix_rule_is_the_edge_home(monkeypatch):
+    from vco_lib import codegraph_edge_env
+    from vco_lib import schema_migration_runner as smr
+
+    monkeypatch.setattr(codegraph_edge_env, "resolve_codegraph_prefix",
+                        lambda env=None: "FromTheOneHome")
+    assert smr._resolve_codegraph_prefix({"CODE_GRAPH_PROJECT": "X"}) == "FromTheOneHome"
+
+
+@pytest.mark.parametrize("env,expected", [
+    ({"CODE_GRAPH_PROJECT": "Acme_X"}, "Acme_X"),
+    ({"PROJECT_NAME": "VibeCoded Orchestrator"}, "VibeCodedOrchestrator"),
+    ({"PROJECT_NAME": "foo-bar"}, "Foo_bar"),
+    ({}, None),
+])
+def test_edge_home_prefix_rule(env, expected):
+    from vco_lib.codegraph_edge_env import resolve_codegraph_prefix
+
+    assert resolve_codegraph_prefix(env) == expected
 
 
 @pytest.mark.parametrize("label,path,subset_attr", _EDGE_SUBSETS)
@@ -349,20 +400,22 @@ def test_ensure_skips_present_props_and_absent_classes():
 
 
 def test_ensure_subset_filter_never_probes_out_of_scope_classes():
-    """5_to_6 shape: with the is_test/n_callers subset, CodeAPI and
-    CodeInteraction have no spec'd props → they are never even probed
-    (mirrors the pre-P2d edge, which never touched them)."""
+    """5_to_6 shape: with the is_test/n_callers subset, CodeInteraction has no
+    spec'd props → it is never even probed (mirrors the pre-P2d edge, which
+    never touched it). CodeAPI is in scope since v9 (W6-O: is_test on CodeAPI)
+    and receives is_test only."""
     probed: list = []
     colls = {f"P_{s}": _UnitColl() for s in CODEGRAPH_PROPERTY_SPECS}
     results = ensure_codegraph_properties(
         _client(colls, probed), "P", props_subset=("is_test", "n_callers")
     )
-    assert set(results) == {"P_CodeModule", "P_CodeClass", "P_CodeFunction"}
-    assert "P_CodeAPI" not in probed and "P_CodeInteraction" not in probed
+    assert set(results) == {"P_CodeModule", "P_CodeClass", "P_CodeFunction", "P_CodeAPI"}
+    assert "P_CodeInteraction" not in probed
     assert [p.name for p in colls["P_CodeFunction"].added] == [
         "is_test", "n_callers",
     ]
-    assert [p.name for p in colls["P_CodeAPI"].added] == []
+    assert [p.name for p in colls["P_CodeAPI"].added] == ["is_test"]
+    assert [p.name for p in colls["P_CodeInteraction"].added] == []
 
 
 def test_ensure_error_carries_failing_class():

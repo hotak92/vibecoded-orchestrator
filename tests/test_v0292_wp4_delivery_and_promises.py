@@ -481,11 +481,16 @@ class DeliveryAuditTests(unittest.TestCase):
         resume sentinel to ``vco_lib/bundle_sentinel.py`` and the two hash
         helpers to ``vco_lib/hashing.py`` (all leaving same-name aliases here),
         so the file NET shrank despite the additions.
+
+        v0.2.102 (W5-A) — LOWERED 15_164 -> 15_136: the install-time
+        ``compose_override_filename_conflict`` emitter was retired as superseded
+        by ``compose_override_pair_diverged``, whose one reading lives in
+        ``vco_lib/compose_override_pair.py``.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_164,
+            n, 15_136,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

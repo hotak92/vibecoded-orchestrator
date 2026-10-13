@@ -3,7 +3,7 @@ title: Orchestrator Knowledge Graph
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, knowledge-graph, weaviate, semantic-search]
 created: 2026-04-27T18:30:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-10-13T00:00:00Z
 status: active
 ---
 
@@ -67,7 +67,7 @@ knowledge/
 ```
 
 Supporting files at `knowledge/` root:
-- `TAG_HIERARCHY.md` — canonical tag list with hierarchy (prevents tag fragmentation)
+- `TAG_HIERARCHY.md` — a reference tag list with hierarchy for authors choosing tags. Nothing reads or enforces it: a node's tags are exactly its frontmatter `tags:` list, and no tag is inferred from links
 - `VOCABULARY.md` — project-specific terminology definitions
 - `.node_formats.json` — auto-generated sidecar with per-node titles, descriptions, summaries (see [[KG-Summary Three-Tier Generation Pipeline]])
 
@@ -180,11 +180,10 @@ Preferred workflow: write `.md` file directly → PostToolUse hook auto-syncs. `
 
 ## Maintenance
 
-**Integrity checks** (`maintain_knowledge_graph.py`):
+**Integrity checks** (`maintain_knowledge_graph.py --check`; `--fix` repairs, `--rebuild` re-syncs everything, both asking before anything destructive):
 - Detects broken WikiLinks (references to non-existent nodes).
-- Finds nodes missing required frontmatter fields.
-- Checks tag-vocabulary violations.
-- Reports orphaned nodes (no incoming or outgoing links).
+- Finds orphaned Weaviate entries (no matching `.md` file) and orphaned files (not in Weaviate).
+- Does not check tags: tags are stored exactly as each node's frontmatter lists them.
 
 **Duplicate detection** (`kg-duplicates`):
 - Runs every 10 file edits (triggered by PostToolUse hook).

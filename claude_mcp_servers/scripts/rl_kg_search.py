@@ -2,16 +2,20 @@
 """
 Quick KG search with RL reranking — uses the same pipeline as the weaviate MCP.
 
-Called by the pre-edit hook for context injection with RL-reranked results.
-Uses the MCP server's functions directly (same Weaviate client, same RL server,
-same score-driven verbosity tiers).
+Called by the hook router for context injection with RL-reranked results.
+Runs the MCP server's OWN query/format code (same collections fan-out, access
+filter, RL pipeline, score-driven verbosity tiers) — since v0.2.102 W6-M
+through ``weaviate_mcp.kg_host.host()``: the server module when one is already
+loaded, otherwise the light ``weaviate_mcp.kg_query_core`` host, which reads
+Weaviate over plain HTTP (``weaviate_mcp.kg_http``) instead of paying ~0.7 s
+to import weaviate-client + the MCP SDK on every hook run.
 
 Usage:
     python rl_kg_search.py "query text" [--limit 1]
 
 Output: human-readable text with title | type | score=X.XX | content,
 formatted per the score-driven tier system in
-claude_mcp_servers/weaviate_mcp/server.py (_get_result_verbosity_by_score and
+claude_mcp_servers/weaviate_mcp/kg_query_core.py (_get_result_verbosity_by_score and
 _format_result_by_tier).
 """
 import asyncio
@@ -25,8 +29,9 @@ from typing import Any
 # v0.2.100 F3: hooks in EVERY project now run THIS file from the orchestrator
 # root (located via VCT_ORCHESTRATOR_ROOT / VCT_INSTALL_ROOT), with cwd in the
 # calling project — so the cwd can no longer be assumed to be the root.
-# Identity is NOT taken from this file's location: `weaviate_mcp.server`
-# resolves the project from CLAUDE_PROJECT_DIR (the calling project), and the
+# Identity is NOT taken from this file's location: the KG host
+# (`weaviate_mcp.kg_query_core`, or the server when loaded) resolves the
+# project from CLAUDE_PROJECT_DIR (the calling project), and the
 # collections/permissions come from that project's hub config and env.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, ".."))
@@ -76,6 +81,9 @@ KNOWN_TASK_TYPES = (
     "pre_write_kg_search",
     "pre_search_kg_search",
     "agent_brief_kg_search",
+    # v0.2.102 W6-F: the UserPromptSubmit surface (the router's `prompt`
+    # profile) — its own partition, never free text in the corpus key.
+    "prompt_kg_search",
 )
 
 
@@ -90,7 +98,73 @@ def resolve_task_type(arg: "str | None") -> str:
     return DEFAULT_TASK_TYPE
 
 
-async def embed_hook_query(text: str):
+def stage_no_results_event(
+    args,
+    task_type: str,
+    vector,
+    deferred_events: tuple,
+    *,
+    embedding_source: str,
+    embedding_model: str,
+    embedding_dim: int,
+) -> tuple:
+    """Build the degraded retrieval event for a ZERO-RESULT search (W3R-6,
+    v0.2.102).
+
+    Pre-fix the hook-KG path returned early on empty results with NO event,
+    so "no event" was indistinguishable from "no search" — censoring the
+    query-distribution + failure-rate signal (the MCP ``hybrid_search`` path
+    has always emitted a degraded ``failure_mode`` event on total failure).
+    The event (``nodes=[]``, ``failure_mode="no_results"``) goes through the
+    same consumer gate (``_retrieval_emit_has_consumer`` — local logging off
+    AND no upload consent ⇒ no event) and the same emit machinery as a
+    populated search; ``emit_rl_event`` treats that shape as the SKIPPED
+    validation tier and writes it.
+
+    Hook path: returns ``deferred_events`` with the event appended — the
+    caller's ``finally`` hands it off AFTER stdout is flushed, so the hook
+    never waits on the POST. CLI path: emits inline (interactive; the
+    populated path emits inline there too). Returns the input unchanged on
+    any error — telemetry never breaks a search that found nothing.
+    """
+    try:
+        from claude_mcp_servers.rl_client.search_pipeline import (
+            _retrieval_emit_has_consumer,
+        )
+
+        if not _retrieval_emit_has_consumer():
+            return deferred_events
+        import uuid as _uuid
+
+        from claude_mcp_servers.rl_client.deferred_emit import DeferredEmit
+        from claude_mcp_servers.rl_client.telemetry_emit import (
+            RetrievalEvent,
+            emit_rl_event,
+            resolve_session_id,
+        )
+
+        ev = RetrievalEvent(
+            query=args.query,
+            query_emb=list(vector) if vector else None,
+            embedding_source=embedding_source,
+            embedding_dim=embedding_dim,
+            embedding_model=embedding_model,
+            nodes=[],
+            task_id=f"{task_type.removesuffix('_kg_search')}_{_uuid.uuid4().hex[:8]}",
+            task_type=task_type,
+            session_id=resolve_session_id(""),
+            failure_mode="no_results",
+        )
+        if getattr(args, "hook_format", False):
+            return tuple(deferred_events) + (DeferredEmit(ev),)
+        emit_rl_event(ev)
+        return deferred_events
+    except Exception as exc:  # noqa: BLE001 — telemetry never breaks a search
+        print(f"rl_kg_search: no-results event not emitted ({exc})", file=sys.stderr)
+        return deferred_events
+
+
+async def embed_hook_query(text: str, collection: str | None = None):
     """Embed the hook's retrieval query through the MCP QUERY-side method.
 
     v0.2.101: every search path must embed its QUERY through
@@ -102,10 +176,43 @@ async def embed_hook_query(text: str):
     Kept as a named helper so the hook↔query-method wiring is asserted
     BEHAVIOURALLY (mutate this task or the wiring and the test goes red),
     rather than by a source scan.
-    """
-    from weaviate_mcp.server import _get_search_vector
 
-    return await _get_search_vector(text, task="hook_injection")
+    ``collection`` (v0.2.102 W6-I; default: the project's own KG): embed with
+    the model that KG collection is RECORDED as complete in — the selected
+    model once its slot is complete (``weaviate_mcp.server._kg_search_vector``,
+    which IS ``_get_search_vector`` in the steady state).
+    """
+    kg = _kg_host()
+    return await kg._kg_search_vector(
+        text, kg.KG_COLLECTION if collection is None else collection, task="hook_injection",
+        steady=kg._get_search_vector)
+
+
+def _kg_host():
+    """The module the KG search reads its query/format code from (v0.2.102 W6-M).
+
+    ``weaviate_mcp.server`` whenever a server module is already loaded in this
+    process (a code-graph leg that imported it, the test suite — so every
+    ``patch("weaviate_mcp.server.X")`` still applies here); otherwise the light
+    ``weaviate_mcp.kg_query_core``, the SAME code moved out of the server, whose
+    Weaviate client is the plain-HTTP read adapter. One resolver, one home:
+    ``weaviate_mcp.kg_host.host``.
+    """
+    from weaviate_mcp.kg_host import host
+
+    return host("weaviate_mcp")
+
+
+def _rl_model_name(collection: str, default: str) -> str:
+    """The model the RL log records for ``collection``'s query (W6-I): the
+    recorded model while a newly selected one fills, else ``default`` (the
+    pre-W6-I label, unchanged in the steady state)."""
+    try:
+        from vco_lib.kg_embed_model import recorded_query_model
+
+        return recorded_query_model(collection) or default
+    except Exception:  # noqa: BLE001 — a label, never a search failure
+        return default
 
 
 async def main():
@@ -175,21 +282,24 @@ async def main():
     # + project_id propagation fixes). Caller still owns Weaviate fan-out
     # because the pipeline is intentionally orthogonal to retrieval
     # strategy.
-    from weaviate_mcp.server import (
-        get_weaviate_client,
-        _format_obj,
-        _enrich_with_adjacent_chunks,
-        _get_result_verbosity_by_score,
-        _format_result_by_tier,
-        _kg_collections_to_search,
-        _embedding_dim_for,
-        _collapse_to_one_per_node,
-        resolve_and_enrich_dual,
-        KG_COLLECTION,
-        EMBEDDING_SOURCE,
-        EMBEDDING_MODEL,
-        _RL_OVERFETCH,
-    )
+    # v0.2.102 W6-M: the same names, read off the KG host — the server module
+    # when one is loaded (identical to the former `from weaviate_mcp.server
+    # import …`), else the light `kg_query_core` (plain-HTTP Weaviate client).
+    kg = _kg_host()
+    get_weaviate_client = kg.get_weaviate_client
+    _format_obj = kg._format_obj
+    _enrich_with_adjacent_chunks = kg._enrich_with_adjacent_chunks
+    _get_result_verbosity_by_score = kg._get_result_verbosity_by_score
+    _format_result_by_tier = kg._format_result_by_tier
+    _kg_collections_to_search = kg._kg_collections_to_search
+    _filter_cross_project_access = kg._filter_cross_project_access
+    _embedding_dim_for = kg._embedding_dim_for
+    _collapse_to_one_per_node = kg._collapse_to_one_per_node
+    resolve_and_enrich_dual = kg.resolve_and_enrich_dual
+    KG_COLLECTION = kg.KG_COLLECTION
+    EMBEDDING_SOURCE = kg.EMBEDDING_SOURCE
+    EMBEDDING_MODEL = kg.EMBEDDING_MODEL
+    _RL_OVERFETCH = kg._RL_OVERFETCH
     from claude_mcp_servers.rl_client.search_pipeline import (
         RerankRequest,
         dual_log_request_fields,
@@ -237,7 +347,23 @@ async def main():
             vector = None
             target_name = None
         else:
-            vector, target_name = await embed_hook_query(effective_query)
+            from vco_lib.embed_outage import (
+                EmbeddingBackendUnavailable,
+                hook_unavailable_line,
+            )
+
+            try:
+                vector, target_name = await embed_hook_query(effective_query)
+            except EmbeddingBackendUnavailable as exc:
+                # v0.2.102 W6-B2 (owner ruling 2026-10-10): the embedder that
+                # serves the KG's model stayed down past the transient retry.
+                # A hook shows ONE visible line (never a silent empty result,
+                # never another model's vector); the CLI fails loudly.
+                if args.hook_format:
+                    print(hook_unavailable_line("kg"))
+                    return
+                print(f"❌ {exc}", file=sys.stderr)
+                raise SystemExit(1) from exc
         # F-G (v0.2.70): the active named-vector slot (e.g. "qwen3_embed"). The
         # hook path historically attached NO node vector at all, so EVERY
         # hook-driven retrieval (≈72% of all events) carried no n_emb → cosine
@@ -248,6 +374,25 @@ async def main():
         # Per-(query-text, vector) KG fan-out across all granted collections.
         # Extracted as a reusable closure so the single-query path AND the
         # oversized-query per-chunk path share ONE fan-out (no duplication).
+        # W6-I: a collection still recorded in another model (a selected one
+        # whose slot is not complete yet) is searched with ITS model's vector
+        # — one embed per (query text, slot); the given vector serves every
+        # collection recorded in the project KG's model (the steady state).
+        _per_slot: dict = {}
+
+        async def _vector_for(coll_name: str, q_text: str, q_vector):
+            if EMBEDDING_SOURCE == "weaviate" or q_vector is None:
+                return q_vector, query_target
+            from vco_lib.kg_embed_model import recorded_query_slot, target_text_model, text_model_slot
+
+            slot = recorded_query_slot(coll_name) or text_model_slot(target_text_model())[0]
+            if not query_target or slot == query_target:
+                return q_vector, query_target
+            key = (q_text, slot)
+            if key not in _per_slot:
+                _per_slot[key] = await embed_hook_query(q_text, coll_name)
+            return _per_slot[key]
+
         async def _retrieve_for_vector(q_text: str, q_vector, q_limit: int) -> list[dict]:
             out: list[dict] = []
             for coll_name in collections_to_search:
@@ -256,6 +401,7 @@ async def main():
                 except Exception:
                     # Collection may not exist (peer never indexed yet) — skip.
                     continue
+                c_vector, c_target = await _vector_for(coll_name, q_text, q_vector)
                 try:
                     if EMBEDDING_SOURCE == "weaviate":
                         primary = coll.query.near_text(
@@ -265,31 +411,40 @@ async def main():
                         )
                     else:
                         nv_kwargs: dict[str, Any] = dict(
-                            near_vector=q_vector,
+                            near_vector=c_vector,
                             limit=q_limit,
                             return_metadata=["distance"],
                             # F-G: ask Weaviate to return the per-object vector so
                             # we can attach `emb` (and thus n_emb) on the hook path.
                             include_vector=True,
                         )
-                        if q_target := query_target:
+                        if q_target := c_target:
                             nv_kwargs["target_vector"] = q_target
                         primary = coll.query.near_vector(**nv_kwargs)
                 except Exception:
                     continue
-                if not primary.objects:
+                # v0.2.102 W4-G: per-node `cross_project_access` — a row
+                # from a NON-SELF collection (shared / peer) restricted to
+                # another project never reaches an injection. One home:
+                # `vco_lib.kg_node_access` via the server wrapper, the same
+                # filter the MCP fan-out applies.
+                primary_objects = _filter_cross_project_access(
+                    list(primary.objects or []),
+                    is_self=(coll_name == KG_COLLECTION),
+                )
+                if not primary_objects:
                     continue
                 coll_formatted = [
                     _format_obj(obj, coll_name, obj.metadata.distance)
-                    for obj in primary.objects
+                    for obj in primary_objects
                 ]
                 # F-G: attach the matched node's active-slot vector (mirrors the
                 # MCP emb-enrichment block). Soft-fail per result.
                 if q_vector is not None:
-                    from weaviate_mcp.server import _extract_obj_vector
-                    for r, obj in zip(coll_formatted, primary.objects):
+                    _extract_obj_vector = kg._extract_obj_vector
+                    for r, obj in zip(coll_formatted, primary_objects):
                         try:
-                            node_emb = _extract_obj_vector(obj, query_target)
+                            node_emb = _extract_obj_vector(obj, c_target)
                             if node_emb:
                                 r["emb"] = node_emb
                         except Exception:
@@ -340,6 +495,15 @@ async def main():
             # v0.2.101 WP-B1: injection-profile mode stays SILENT on empty
             # (the router reads silence as "nothing above the floor"; a
             # no-results line would be injected noise).
+            # W3R-6 (v0.2.102): the USER-FACING silence stays — but a degraded
+            # retrieval event (failure_mode="no_results") is now emitted so
+            # "no event" is no longer indistinguishable from "no search".
+            deferred_events = stage_no_results_event(
+                args, task_type, vector, deferred_events,
+                embedding_source=EMBEDDING_SOURCE,
+                embedding_model=EMBEDDING_MODEL,
+                embedding_dim=_embedding_dim_for(EMBEDDING_MODEL),
+            )
             if args.hook_format and gate is None:
                 print(f"KG: no-results | query='{args.query}' | limit={args.limit}")
             return
@@ -383,9 +547,7 @@ async def main():
         dual_inputs = None
         if vector is not None:
             if oversized:
-                from weaviate_mcp.server import _dual_rl_log_expected
-
-                if _dual_rl_log_expected():
+                if kg._dual_rl_log_expected():
                     from vco_lib.rl_telemetry_loss import KIND_DUAL_SKIP, record_loss
 
                     record_loss(KIND_DUAL_SKIP, "oversized_query", task_type=task_type)
@@ -396,7 +558,7 @@ async def main():
                         query=effective_query,
                         query_vector=vector,
                         active_slot=query_target,
-                        model_name=EMBEDDING_MODEL,
+                        model_name=_rl_model_name(KG_COLLECTION, EMBEDDING_MODEL),
                         embed_budget_s=dual_embed_budget_s(task_type),
                         backfill_other=False,
                         task_type=task_type,
@@ -407,11 +569,9 @@ async def main():
                         query_task="hook_injection",
                     )
                 else:
-                    from weaviate_mcp.server import _rl_enrich_nodes_with_linked_embs
-
-                    _rl_enrich_nodes_with_linked_embs(
+                    kg._rl_enrich_nodes_with_linked_embs(
                         all_formatted, query_emb=vector, active_slot=query_target,
-                        model_name=EMBEDDING_MODEL,
+                        model_name=_rl_model_name(KG_COLLECTION, EMBEDDING_MODEL),
                     )
             except Exception:
                 # Soft-fail: enrichment is best-effort telemetry; never break

@@ -40,12 +40,20 @@
 //!
 //! Spawned once from `lib.rs::run()` setup hook. Owns a tokio task
 //! that:
-//!   1. Probes the launcher DB every 30 s for the project list.
-//!   2. Maintains a `RecommendedWatcher` registered to each project's
+//!   1. Awaits the install-boundary refresh gate (v0.2.102 L6 / OD-6 —
+//!      see [`await_refresh_gate`]): on a boot that consumed an
+//!      install-path seed, the watcher does not register a single watch
+//!      until `refresh_all_projects_env_with_db` has completed, so the
+//!      boundary refresh's N settings.json writes can never land on an
+//!      armed watcher and SIGHUP every live MCP. A no-boundary boot arms
+//!      immediately; a refresh that outlives the bounded wait (env-
+//!      tunable, generous) arms anyway with a WARNING.
+//!   2. Probes the launcher DB every 30 s for the project list.
+//!   3. Maintains a `RecommendedWatcher` registered to each project's
 //!      `.claude/settings.json` parent dir.
-//!   3. Re-syncs the watch list when the project list changes (added,
+//!   4. Re-syncs the watch list when the project list changes (added,
 //!      removed, folder moved).
-//!   4. On every Modify event whose path ends in `.claude/settings.json`,
+//!   5. On every Modify event whose path ends in `.claude/settings.json`,
 //!      schedules a debounced reload — sleep 500 ms, then call
 //!      `reload_mcps_with(...)` directly (NOT through the Tauri
 //!      command, which would need a State<Db> we don't have in the
@@ -77,6 +85,87 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
 const PROJECT_LIST_RE_POLL: Duration = Duration::from_secs(30);
 
 // ═══════════════════════════════════════════════════════════════════════
+// v0.2.102 (L6 / OD-6): the install-boundary refresh gate.
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Boot-order rule: `settings_json_watcher` is ARMED only after the
+// install-boundary bulk settings.json refresh
+// (`refresh_all_projects_env_with_db`, run from `lib.rs` setup when the
+// install-path seed is consumed — once per install/update boundary) has
+// completed. Before this gate the ordering was incidental: the refresh ran
+// synchronously earlier in the same `setup()` closure, and the pull-in R
+// report (2026-10-06) had to document "the refresh must NOT be detached,
+// because its writes would land after the watcher arms and turn the silent
+// boot refresh into a global MCP SIGHUP". The gate makes the order
+// STRUCTURAL: `lib.rs` hands the watcher spawn a oneshot receiver that the
+// refresh completes, the watcher awaits it before creating ANY watch, and a
+// bounded (env-tunable, generous) wait expires into arm-anyway with a
+// WARNING — a wedged refresh must not leave the install without a
+// settings.json watcher forever.
+
+/// Bounded wait for the install-boundary refresh, when one is in flight.
+/// Env-tunable via `VCT_SETTINGS_WATCHER_REFRESH_WAIT_SECS` (positive
+/// integer seconds). Generous by design: the refresh is N serial
+/// `vco_lib.config_projection` subprocesses with a 300 s per-project cap
+/// (v0.2.101 owner ruling), so the bound must cover a large project list
+/// on slow hardware — 30 minutes — not a single fast projection.
+pub(crate) const DEFAULT_REFRESH_GATE_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// Env knob for [`DEFAULT_REFRESH_GATE_WAIT`], in seconds.
+pub(crate) const ENV_REFRESH_GATE_WAIT_SECS: &str = "VCT_SETTINGS_WATCHER_REFRESH_WAIT_SECS";
+
+/// The gate wait: `VCT_SETTINGS_WATCHER_REFRESH_WAIT_SECS` seconds when set
+/// to a positive integer, the generous default otherwise.
+pub(crate) fn refresh_gate_wait() -> Duration {
+    refresh_gate_wait_from(std::env::var(ENV_REFRESH_GATE_WAIT_SECS).ok().as_deref())
+}
+
+/// Pure core of [`refresh_gate_wait`] (env reads are process-global).
+fn refresh_gate_wait_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_REFRESH_GATE_WAIT)
+}
+
+/// How the watcher came to be armed, for logging + tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshGateOutcome {
+    /// No boundary refresh this boot — armed immediately (every ordinary
+    /// boot; the leave-alone arm).
+    NoRefresh,
+    /// The boundary refresh completed — armed after it (the structural
+    /// boot-order rule).
+    RefreshCompleted,
+    /// The bounded wait expired with the refresh unresolved — armed anyway,
+    /// with a WARNING (the refresh's writes may still land on the armed
+    /// watcher; the diff-guard's seeded baselines decide whether they
+    /// signal).
+    TimedOut(Duration),
+}
+
+/// Await the install-boundary refresh gate before arming. `None` means no
+/// boundary refresh is in flight this boot. A sender that is DROPPED (rather
+/// than sending) also counts as completion — the refresh is synchronous
+/// today, and both "done" and "gave up without a value" release the watcher.
+///
+/// PURE-ish core (no watcher, no Tauri state): injectable in tests via the
+/// oneshot, so the arm/leave-alone arms are provable without a boot.
+pub(crate) async fn await_refresh_gate(
+    gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    wait: Duration,
+) -> RefreshGateOutcome {
+    let Some(rx) = gate else {
+        return RefreshGateOutcome::NoRefresh;
+    };
+    match tokio::time::timeout(wait, rx).await {
+        // Send or drop both resolve the receiver: the refresh is over.
+        Ok(_) => RefreshGateOutcome::RefreshCompleted,
+        Err(_elapsed) => RefreshGateOutcome::TimedOut(wait),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // v0.2.72 (C-P8): diff-guard — skip needless SIGHUP on idempotent writes.
 // ═══════════════════════════════════════════════════════════════════════
 //
@@ -102,6 +191,23 @@ const PROJECT_LIST_RE_POLL: Duration = Duration::from_secs(30);
 //   * hash UNCHANGED → SKIP (the whole fix).
 //   * NO baseline yet (first event / cache miss / unreadable file) →
 //     fail-OPEN: reload + seed the cache.
+//
+// v0.2.102 (W4-F defect A): the fail-open above was reachable on EVERY
+// launcher boot — the baseline cache is born EMPTY, so the FIRST
+// settings.json event per project after start (typically the launcher's
+// own env re-projection, `refresh_all_projects_env_with_db`) SIGHUPped
+// every live MCP even when the write was a no-op for MCP-relevant env
+// (launcher log 2026-10-08 14:21:59: "auto-reload: signaled 1 MCP
+// process(es)" with no user-visible change). Fix at the root: `sync_watches`
+// SEEDS the baseline for every settings.json newly added to the watch set
+// (see `seed_baselines` / `seed_new_watch_baselines`), so only a REAL
+// change of MCP-relevant env AFTER that point signals. The fail-open
+// `old_hash == None` arm stays for the residual cases where seeding could
+// not produce a baseline: the file did not exist / was unreadable at watch
+// time, or its body is neither strict JSON nor readable by the JSONC
+// bridge — for those we still cannot PROVE MCP-irrelevance, and a needless
+// reload is the benign failure compared to a live MCP silently keeping
+// stale env (DENYLIST discipline above).
 //
 // The manual "Reload MCPs" button (the `reload_mcps_sighup` Tauri command)
 // stays UNCONDITIONAL — only this watcher-auto path gets the diff-guard.
@@ -403,6 +509,12 @@ struct WatchState {
     /// seeded a baseline for) this file. Keyed by the canonical
     /// `.claude/settings.json` PathBuf from the modify event. A cache miss
     /// (first-ever event for a path) fails OPEN — see `mcp_env_changed`.
+    ///
+    /// v0.2.102 (W4-F defect A): `sync_watches` seeds an entry for every
+    /// settings.json newly added to the watch set (at watcher start and on
+    /// each 30 s re-poll that picks up a new project), so the first event
+    /// after boot is DIFFED, not fail-opened. A cache miss now means the
+    /// file was absent/unreadable at seed time — still fail-open.
     last_mcp_env_hash: Mutex<HashMap<PathBuf, u64>>,
     /// v0.2.72 (F1) per-path pending set: every settings.json modify event
     /// inserts its path here (and bumps `last_event`). The surviving
@@ -448,7 +560,16 @@ impl WatchState {
 /// Idempotent at the API level — `lib.rs::run()` calls this once per
 /// launcher process. Soft-fails on `notify` init errors (logs +
 /// returns); the manual "Reload MCPs" button stays as the fallback.
-pub fn spawn<R: Runtime + 'static>(app: AppHandle<R>) {
+///
+/// v0.2.102 (L6 / OD-6): `refresh_done` is the install-boundary refresh
+/// gate — `Some(rx)` when this boot consumed an install-path seed and its
+/// `refresh_all_projects_env_with_db` is (or will be) running; the watcher
+/// arms only after the gate resolves or the bounded wait expires (WARNING).
+/// `None` on every ordinary boot arms immediately.
+pub fn spawn<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    refresh_done: Option<tokio::sync::oneshot::Receiver<()>>,
+) {
     // Windows skip: the OS-level file watcher works, but the
     // downstream `reload_mcps_with` call will short-circuit because
     // `kill -HUP` is POSIX-only. No point burning a task on a no-op.
@@ -461,6 +582,22 @@ pub fn spawn<R: Runtime + 'static>(app: AppHandle<R>) {
     }
 
     tauri::async_runtime::spawn(async move {
+        match await_refresh_gate(refresh_done, refresh_gate_wait()).await {
+            RefreshGateOutcome::NoRefresh => {}
+            RefreshGateOutcome::RefreshCompleted => {
+                tracing::debug!(
+                    "[settings_json_watcher] install-boundary refresh completed — arming"
+                );
+            }
+            RefreshGateOutcome::TimedOut(waited) => {
+                tracing::warn!(
+                    "[settings_json_watcher] install-boundary refresh did not complete \
+                     within {:?} — arming anyway (the refresh's writes may still land on \
+                     the armed watcher)",
+                    waited
+                );
+            }
+        }
         if let Err(e) = run_loop(app).await {
             tracing::warn!("[settings_json_watcher] loop exited: {} (manual reload still available)", e);
         }
@@ -584,16 +721,44 @@ async fn sync_watches<R: Runtime + 'static>(
     let mut watched = state.watched.lock().await;
 
     // Add new.
+    // v0.2.102 (W4-F review F1): the settings.json body is captured BEFORE
+    // the watch is registered, per dir, so the seeded baseline is the TRUE
+    // pre-watch body. Reading it after `watch()` left a window in which a
+    // REAL MCP-relevant write landed between registration and the seed
+    // read: the seed cached the POST-write hash, the queued event drained
+    // to the same body → "unchanged" → skip, and the live MCPs silently
+    // kept stale env. With a pre-watch baseline any post-registration write
+    // is always a diff: a real change reloads, a no-op write skips.
+    let mut added: HashMap<PathBuf, String> = HashMap::new();
     for dir in desired.difference(&watched) {
-        if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
-            tracing::warn!(
-                "[settings_json_watcher] watch({}) failed: {} (skipping)",
-                dir.display(),
-                e
-            );
-            continue;
+        match capture_pre_watch_body(
+            dir,
+            |p| std::fs::read_to_string(p).unwrap_or_default(),
+            |d| {
+                watcher
+                    .watch(d, RecursiveMode::NonRecursive)
+                    .map_err(|e| e.to_string())
+            },
+        ) {
+            Err(e) => {
+                tracing::warn!(
+                    "[settings_json_watcher] watch({}) failed: {} (skipping)",
+                    dir.display(),
+                    e
+                );
+                continue;
+            }
+            Ok(pre_watch_body) => {
+                added.insert(dir.clone(), pre_watch_body);
+            }
         }
     }
+    // v0.2.102 (W4-F defect A): seed the diff-guard baseline for every
+    // settings.json we just started watching — from the PRE-watch bodies —
+    // so the FIRST event after watcher start (typically the launcher's own
+    // env re-projection) is DIFFED against the on-disk body instead of
+    // failing open into a SIGHUP of every live MCP.
+    seed_new_watch_baselines(&app, &state, &added).await;
     // Remove gone.
     let removed: Vec<PathBuf> = watched.difference(&desired).cloned().collect();
     for dir in &removed {
@@ -605,6 +770,66 @@ async fn sync_watches<R: Runtime + 'static>(
     // (and any not-yet-drained pending events) alongside the unwatch.
     state.prune_removed_dirs(&removed).await;
     Ok(())
+}
+
+/// v0.2.102 (W4-F review F1): the add-loop step for ONE newly watched dir,
+/// extracted so the ORDERING is provable in a unit test. The settings.json
+/// body is read BEFORE the watch is registered (both are injected closures
+/// — `read_body` is `fs::read_to_string`, `watch` is `watcher.watch`), so
+/// the returned baseline is the TRUE pre-watch body. Reading it after
+/// `watch()` instead left a window in which a real MCP-relevant write
+/// landed between registration and the seed read: the seed cached the
+/// post-write hash, the queued event drained the same body → "unchanged" →
+/// skip, and the live MCPs silently kept stale env. With a pre-watch
+/// baseline, any write after registration is always a diff.
+fn capture_pre_watch_body(
+    dir: &Path,
+    read_body: impl Fn(&Path) -> String,
+    mut watch: impl FnMut(&Path) -> Result<(), String>,
+) -> Result<String, String> {
+    let body = read_body(&dir.join("settings.json"));
+    watch(dir)?;
+    Ok(body)
+}
+
+/// v0.2.102 (W4-F defect A): IO/lock wrapper around [`seed_baselines`] for
+/// the dirs `sync_watches` just added to the watch set, keyed on the watch
+/// DIR with the body captured BEFORE `watcher.watch(dir)` registered (the
+/// pre-watch baseline — see `sync_watches`). Maps each dir to its
+/// `<project>/.claude/settings.json` path (absent file → empty body → no
+/// seed → that path keeps the fail-open first event), hashes non-strict-JSON
+/// bodies through the SAME bridge rule as fire-time, and seeds the cache
+/// under its lock. Soft-fail throughout: a bridge error just seeds fewer
+/// paths.
+async fn seed_new_watch_baselines<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &WatchState,
+    pre_watch_bodies: &HashMap<PathBuf, String>,
+) {
+    if pre_watch_bodies.is_empty() {
+        return;
+    }
+    let bodies: HashMap<PathBuf, String> = pre_watch_bodies
+        .iter()
+        .map(|(dir, body)| (dir.join("settings.json"), body.clone()))
+        .collect();
+    let root = app
+        .try_state::<Db>()
+        .and_then(|db| crate::services::vco_lib_bridge::resolve_orchestrator_root(&db));
+    let jsonc = {
+        let bodies = bodies.clone();
+        tokio::task::spawn_blocking(move || jsonc_hashes(root.as_deref(), &bodies))
+            .await
+            .unwrap_or_default()
+    };
+    let mut cache = state.last_mcp_env_hash.lock().await;
+    let seeded = seed_baselines(&bodies, &jsonc, &mut cache);
+    if !seeded.is_empty() {
+        tracing::debug!(
+            "[settings_json_watcher] seeded {} diff-guard baseline(s) for newly watched settings.json (first no-op write after start will NOT SIGHUP)",
+            seeded.len()
+        );
+    }
 }
 
 /// `<project>/.claude/` — the parent dir of settings.json. We watch
@@ -751,6 +976,46 @@ fn evaluate_drained_paths(
         }
     }
     decision
+}
+
+/// v0.2.102 (W4-F defect A): seed diff-guard baselines for the settings.json
+/// files of newly watched project dirs, from the body ON DISK at watch time.
+///
+/// Pre-fix, `last_mcp_env_hash` was born empty and the first event per
+/// project after every launcher boot fail-opened into a SIGHUP of every
+/// live MCP — including for the launcher's own byte-idempotent env
+/// re-projection (`config_projection.apply_project_env`, pinned
+/// byte-idempotent by
+/// `tests/test_config_projection.py::test_apply_settings_json_idempotent`).
+///
+/// Semantics (pure core, injected readers for unit tests):
+///   * an ALREADY-CACHED path is left untouched (a re-poll that re-sees an
+///     existing watch must not clobber a baseline advanced by later events);
+///   * a body that is strict JSON is hashed with `hash_mcp_env`;
+///   * a body that is not strict JSON is hashed from `jsonc` (the bridge
+///     map, same rule as `evaluate_drained_paths`);
+///   * a missing/unreadable/unbridgeable body seeds NOTHING — that path
+///     keeps the fail-open reload for its first event (DENYLIST discipline:
+///     we cannot prove MCP-irrelevance without reading the file).
+///
+/// Returns the paths actually seeded (for logging / tests).
+fn seed_baselines(
+    bodies: &HashMap<PathBuf, String>,
+    jsonc: &HashMap<PathBuf, u64>,
+    cache: &mut HashMap<PathBuf, u64>,
+) -> Vec<PathBuf> {
+    let mut seeded = Vec::new();
+    for (path, body) in bodies {
+        if cache.contains_key(path) {
+            continue;
+        }
+        let Some(hash) = hash_mcp_env(body).or_else(|| jsonc.get(path).copied()) else {
+            continue;
+        };
+        cache.insert(path.clone(), hash);
+        seeded.push(path.clone());
+    }
+    seeded
 }
 
 /// Invoke the same `reload_mcps_with` core that the Tauri command
@@ -1456,6 +1721,376 @@ mod tests {
         assert_eq!(
             state.last_mcp_env_hash.lock().await.get(&p).copied(),
             Some(7u64)
+        );
+    }
+
+    // ─── v0.2.102 (W4-F defect A) baseline seeding at watch time ─────────
+    //
+    // These pin the fix for the boot-time fail-open: pre-fix,
+    // `last_mcp_env_hash` was born empty, so the FIRST settings.json
+    // event per project after every launcher boot (typically the
+    // launcher's own env re-projection) SIGHUPped every live MCP even
+    // when MCP-relevant env did not move. Post-fix, `sync_watches` seeds
+    // a baseline per newly watched settings.json, so that first no-op
+    // write is DIFFED and skipped.
+
+    /// LEAVE-ALONE (the defect itself): watcher starts (seeds the baseline
+    /// from the on-disk body), then the first event is a byte-idempotent
+    /// re-projection write → must NOT reload. Pre-fix the empty cache
+    /// fail-opened this exact sequence into a SIGHUP.
+    #[test]
+    fn seeded_first_noop_write_after_watcher_start_does_not_reload() {
+        let path = PathBuf::from("/proj/.claude/settings.json");
+        let body = settings_with_env(&[("KG_COLLECTION", "MyKG")], "stable");
+
+        // Watcher start: seed the baseline from the body on disk.
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        let seeded = seed_baselines(
+            &[(path.clone(), body.clone())].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        assert_eq!(seeded, vec![path.clone()], "the new watch must be seeded");
+        assert!(
+            cache.contains_key(&path),
+            "baseline must exist before any event"
+        );
+
+        // First event after start: the same MCP-relevant env re-written.
+        let decision =
+            evaluate_drained_paths(&[path.clone()], &mut cache, |_| body.clone(), |_| None);
+        assert!(
+            !decision.reload,
+            "the first no-op settings.json write after watcher start must NOT SIGHUP"
+        );
+    }
+
+    /// ACT: a REAL MCP-relevant env change after the seeded baseline →
+    /// still reloads (seeding must not over-suppress).
+    #[test]
+    fn seeded_real_env_change_after_watcher_start_reloads() {
+        let path = PathBuf::from("/proj/.claude/settings.json");
+        let at_start = settings_with_env(&[("KG_COLLECTION", "MyKG")], "s");
+        let changed = settings_with_env(&[("KG_COLLECTION", "OtherKG")], "s");
+
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        seed_baselines(
+            &[(path.clone(), at_start.clone())].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+
+        let decision =
+            evaluate_drained_paths(&[path.clone()], &mut cache, |_| changed.clone(), |_| None);
+        assert!(
+            decision.reload,
+            "a real MCP-relevant env change after start must still reload"
+        );
+    }
+
+    /// A newly watched project whose settings.json is JSONC gets seeded too
+    /// (through the same bridge-hash rule fire-time uses), not left to
+    /// fail-open on its first event.
+    #[test]
+    fn newly_watched_jsonc_project_is_seeded_through_the_bridge_hash() {
+        let path = PathBuf::from("/proj/.claude/settings.json");
+        let jsonc = "// team settings\n{\n  \"env\": { \"KG_COLLECTION\": \"MyKG\", },\n}\n";
+        assert_eq!(hash_mcp_env(jsonc), None, "fixture is not strict JSON");
+        let strict = settings_with_env(&[("KG_COLLECTION", "MyKG")], "x");
+        let bridge: HashMap<PathBuf, u64> = [(path.clone(), hash_mcp_env(&strict).unwrap())].into();
+
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        let seeded = seed_baselines(
+            &[(path.clone(), jsonc.to_string())].into(),
+            &bridge,
+            &mut cache,
+        );
+        assert_eq!(seeded, vec![path.clone()], "the JSONC watch must be seeded");
+
+        // Idempotent JSONC rewrite → skipped, exactly like strict JSON.
+        let decision = evaluate_drained_paths(
+            &[path.clone()],
+            &mut cache,
+            |_| jsonc.to_string(),
+            |p| bridge.get(p).copied(),
+        );
+        assert!(
+            !decision.reload,
+            "an idempotent JSONC write must not SIGHUP"
+        );
+    }
+
+    /// Leave-alone for the cache itself: re-seeding a path that already has
+    /// a baseline (a 30 s re-poll that re-sees an existing watch, or a
+    /// project re-added at the same path before prune) must NOT clobber the
+    /// advanced baseline — only genuinely cache-missing paths are seeded.
+    #[test]
+    fn seeding_skips_already_cached_paths() {
+        let path = PathBuf::from("/proj/.claude/settings.json");
+        let at_start = settings_with_env(&[("KG_COLLECTION", "MyKG")], "s");
+        let advanced = settings_with_env(&[("KG_COLLECTION", "NewerKG")], "s");
+
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        seed_baselines(
+            &[(path.clone(), at_start.clone())].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        // A later event advanced the baseline to `advanced`.
+        let _ = evaluate_drained_paths(&[path.clone()], &mut cache, |_| advanced.clone(), |_| None);
+        assert_eq!(cache.get(&path).copied(), hash_mcp_env(&advanced));
+
+        // Re-seed pass offers the STALE body again → cache must not regress.
+        let seeded = seed_baselines(
+            &[(path.clone(), at_start)].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        assert!(
+            seeded.is_empty(),
+            "an already-cached path must not be re-seeded"
+        );
+        assert_eq!(
+            cache.get(&path).copied(),
+            hash_mcp_env(&advanced),
+            "the advanced baseline must survive a re-seed pass"
+        );
+    }
+
+    /// Residual fail-open, by design (DENYLIST discipline): a settings.json
+    /// that is absent / unreadable at watch time seeds NO baseline, so its
+    /// first event still fails OPEN — we cannot prove MCP-irrelevance
+    /// without reading the file.
+    #[test]
+    fn seeding_absent_settings_json_keeps_fail_open_first_event() {
+        let path = PathBuf::from("/fresh-proj/.claude/settings.json");
+
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        // Absent file → read_to_string fails → empty body → no strict-JSON
+        // hash, nothing in the bridge map → no seed.
+        let seeded = seed_baselines(
+            &[(path.clone(), String::new())].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        assert!(seeded.is_empty());
+        assert!(!cache.contains_key(&path));
+
+        let first_body = settings_with_env(&[("KG_COLLECTION", "MyKG")], "s");
+        let decision = evaluate_drained_paths(
+            &[path.clone()],
+            &mut cache,
+            |_| first_body.clone(),
+            |_| None,
+        );
+        assert!(
+            decision.reload,
+            "an unseedable file must keep the fail-open first event"
+        );
+    }
+
+    // ─── v0.2.102 (W4-F review F1): pre-watch baseline capture ───────────
+    //
+    // The seeding race the review found: `sync_watches` registered the
+    // watch FIRST and read the body inside the seeding step. A real
+    // MCP-relevant write landing in between was folded INTO the baseline
+    // (the seed cached the post-write hash) and its drained event skipped —
+    // silent stale env. The fix captures the body BEFORE `watch()`, per
+    // dir; these tests pin the ordering and both diff directions.
+
+    /// The ordering itself + the non-benign direction: capture → write →
+    /// event ⇒ signal. The injected readers record their invocation order,
+    /// the captured (pre-watch) body is seeded, and the event drains the
+    /// POST-write body → the write must be a diff → reload fires.
+    #[test]
+    fn pre_watch_capture_reads_before_watch_and_a_post_write_event_fires() {
+        use std::cell::RefCell;
+
+        let dir = Path::new("/proj/.claude");
+        let at_start = settings_with_env(&[("KG_COLLECTION", "MyKG")], "s");
+        let after_write = settings_with_env(&[("KG_COLLECTION", "OtherKG")], "s");
+
+        let calls: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+        let read_body = |p: &Path| {
+            assert_eq!(p, dir.join("settings.json"));
+            calls.borrow_mut().push("read");
+            at_start.clone()
+        };
+        let watch = |d: &Path| {
+            assert_eq!(d, dir);
+            calls.borrow_mut().push("watch");
+            Ok(()) // registration succeeds; the write lands right after it
+        };
+        let captured = capture_pre_watch_body(dir, read_body, watch).expect("watch must succeed");
+        assert_eq!(
+            *calls.borrow(),
+            vec!["read", "watch"],
+            "the baseline body MUST be captured BEFORE the watch is registered"
+        );
+
+        // Seeding uses the PRE-watch body; the drained event reads the
+        // POST-write body → changed → the SIGHUP fires (never a skip).
+        let path = dir.join("settings.json");
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        seed_baselines(
+            &[(path.clone(), captured)].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        assert!(cache.contains_key(&path), "the pre-watch body must seed");
+        let decision = evaluate_drained_paths(
+            &[path.clone()],
+            &mut cache,
+            |_| after_write.clone(),
+            |_| None,
+        );
+        assert!(
+            decision.reload,
+            "a real MCP-env write between watch() and the seed must reload, not skip"
+        );
+    }
+
+    /// The benign direction: a NO-OP (byte-idempotent) write landing in the
+    /// same window is still skipped — the pre-watch capture must not turn
+    /// into a needless-reload fail-open.
+    #[test]
+    fn pre_watch_capture_still_skips_a_noop_write_in_the_window() {
+        use std::cell::RefCell;
+
+        let dir = Path::new("/proj/.claude");
+        let body = settings_with_env(&[("KG_COLLECTION", "MyKG")], "s");
+
+        let calls: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+        let read_body = |p: &Path| {
+            calls.borrow_mut().push("read");
+            assert_eq!(p, dir.join("settings.json"));
+            body.clone()
+        };
+        let watch = |d: &Path| {
+            calls.borrow_mut().push("watch");
+            assert_eq!(d, dir);
+            Ok(())
+        };
+        let captured = capture_pre_watch_body(dir, read_body, watch).expect("watch must succeed");
+        assert_eq!(*calls.borrow(), vec!["read", "watch"]);
+
+        let path = dir.join("settings.json");
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        seed_baselines(
+            &[(path.clone(), captured)].into(),
+            &HashMap::new(),
+            &mut cache,
+        );
+        // The idempotent re-projection writes the SAME MCP-relevant env.
+        let decision = evaluate_drained_paths(&[path], &mut cache, |_| body.clone(), |_| None);
+        assert!(
+            !decision.reload,
+            "a no-op write in the window must still be skipped (no needless SIGHUP)"
+        );
+    }
+
+    // ─── v0.2.102 (L6 / OD-6): the install-boundary refresh gate ─────────
+    //
+    // The watcher must not arm (create ANY watch, hence see ANY event)
+    // until the boundary refresh has finished writing. These pin the gate
+    // core; the run_loop itself is entered only after it, so "first event
+    // is after the refresh's writes" holds structurally — no watch exists
+    // to observe the refresh's writes.
+
+    /// ACT: a refresh that resolves LATE holds the gate closed until its
+    /// writes are done — the gate task is still pending while the refresh
+    /// is mid-write, and completes only after the refresh signals.
+    #[tokio::test]
+    async fn refresh_gate_late_refresh_holds_arming_until_its_writes_land() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let gate_task = tokio::spawn(async move {
+            let started = Instant::now();
+            let outcome = await_refresh_gate(Some(rx), Duration::from_secs(30)).await;
+            (outcome, started.elapsed())
+        });
+
+        // The boundary refresh is still writing settings.json files —
+        // arming must NOT have happened yet.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !gate_task.is_finished(),
+            "the watcher must not arm while the boundary refresh is still writing",
+        );
+
+        // The refresh finishes its writes and completes the gate.
+        let _ = tx.send(());
+        let (outcome, waited) = gate_task.await.expect("gate task joins");
+        assert_eq!(
+            outcome,
+            RefreshGateOutcome::RefreshCompleted,
+            "a completed boundary refresh releases the gate",
+        );
+        assert!(
+            waited >= Duration::from_millis(60),
+            "the gate must have waited for the late refresh (waited {waited:?})",
+        );
+    }
+
+    /// LEAVE-ALONE (the ordinary boot): no boundary refresh in flight —
+    /// the gate arms immediately, with no wait at all.
+    #[tokio::test]
+    async fn refresh_gate_absent_arms_immediately() {
+        let started = Instant::now();
+        let outcome = await_refresh_gate(None, Duration::from_secs(30)).await;
+        assert_eq!(outcome, RefreshGateOutcome::NoRefresh);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a no-refresh boot must not wait",
+        );
+    }
+
+    /// Bounded wait: a refresh that never resolves must not leave the
+    /// install without a settings.json watcher forever — the gate expires
+    /// into arm-anyway (the caller logs the WARNING).
+    #[tokio::test]
+    async fn refresh_gate_times_out_and_arms_anyway() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>(); // held, never sends
+        let outcome = await_refresh_gate(Some(rx), Duration::from_millis(80)).await;
+        assert_eq!(
+            outcome,
+            RefreshGateOutcome::TimedOut(Duration::from_millis(80)),
+            "an unresolved refresh expires into arm-anyway",
+        );
+    }
+
+    /// A DROPPED sender counts as completion: the refresh is synchronous
+    /// today and every path out of it (early return included) drops the
+    /// sender — the watcher must never wait out the bound for a refresh
+    /// that already ended.
+    #[tokio::test]
+    async fn refresh_gate_dropped_sender_counts_as_completion() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        drop(tx);
+        let outcome = await_refresh_gate(Some(rx), Duration::from_secs(30)).await;
+        assert_eq!(outcome, RefreshGateOutcome::RefreshCompleted);
+    }
+
+    /// The env knob: positive seconds win; absent / malformed / zero /
+    /// fractional fall back to the generous default.
+    #[test]
+    fn refresh_gate_wait_parsing() {
+        assert_eq!(refresh_gate_wait_from(Some("7")), Duration::from_secs(7));
+        assert_eq!(
+            refresh_gate_wait_from(Some(" 7 ")),
+            Duration::from_secs(7),
+            "surrounding whitespace is tolerated",
+        );
+        for raw in [None, Some(""), Some("abc"), Some("0"), Some("-1"), Some("1.5")] {
+            assert_eq!(
+                refresh_gate_wait_from(raw),
+                DEFAULT_REFRESH_GATE_WAIT,
+                "{raw:?} must fall back to the generous default",
+            );
+        }
+        assert_eq!(
+            DEFAULT_REFRESH_GATE_WAIT,
+            Duration::from_secs(30 * 60),
+            "the default must stay generous (N serial projections at a 300 s cap each)",
         );
     }
 }

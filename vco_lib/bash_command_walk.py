@@ -3,10 +3,11 @@
 """Shared chain-walker for Bash command strings (v0.2.95, lane F10).
 
 ONE home for "split a shell command into independently-walkable
-segments". Extracted from ``vco_lib/diagram_delete_parser`` when a
-SECOND consumer appeared (``vco_lib.bash_write_targets``, which needs
-the same chain / wrapper / env-prefix / ``bash -c`` handling to find
-WRITE targets rather than DELETE targets).
+segments". Extracted from the diagram-delete parser (a module v0.2.102
+removed with the diagrams runtime) when a SECOND consumer appeared
+(``vco_lib.bash_write_targets``, which needs the same chain / wrapper /
+env-prefix / ``bash -c`` handling to find WRITE targets rather than
+DELETE targets).
 
 Per the project's A>B>C rule the two consumers now share this
 implementation instead of mirroring it: a fix to the chain splitter or
@@ -14,7 +15,9 @@ the wrapper peeler lands once and both parsers get it.
 
 What the walker does, per command string:
 
-  1. ``shlex.split`` the command (POSIX mode).
+  1. ``shlex.split`` the command (POSIX mode) and peel glued UNQUOTED
+     separator tails into standalone tokens (``log;`` → ``log``, ``;``)
+     — quote-aware, via a posix=False shadow pass (see :func:`tokenize`).
   2. Split the token list on top-level ``;`` ``&&`` ``||`` ``|`` ``&``.
   3. Per segment: drop leading ``KEY=val`` env assignments, then peel
      wrapper verbs (``sudo``, ``nice -n 10``, ``env``, ``time``, ...).
@@ -33,6 +36,7 @@ source order, left to right, which is what makes that legal.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from typing import Callable, List, Optional
 
@@ -113,12 +117,22 @@ def is_env_assignment(tok: str) -> bool:
 def split_chain(tokens: List[str]) -> List[List[str]]:
     """Split a token list into segments at top-level chain operators.
 
-    `shlex.split` keeps `;`, `&&`, `||`, `|`, `&` as standalone tokens
-    when they appear unquoted in the source. We just iterate and slice
-    on those. Sub-commands inside `bash -c "..."` survive as ONE string
-    token (because the quotes preserved them), so they are NOT split
-    here -- they're re-parsed by `parse_dash_c` when the walker
-    recognises a `bash -c` wrapper.
+    Matching is token-equal on :data:`CHAIN_SEPARATORS` — ``shlex.split``
+    keeps ``;``, ``&&``, ``||``, ``|``, ``&`` as standalone tokens when
+    they appear SURROUNDED BY SPACES in the source. Glued UNQUOTED tails
+    (``do tail log; sleep 5; done`` keeps ``log;`` as one shlex token)
+    are peeled at :func:`tokenize` time, NOT here: quote information is
+    gone by the time tokens reach this function, so a QUOTED tail
+    (``echo "done;"`` — the ``;`` is data, and the real shell would not
+    split there) is indistinguishable from a glued separator at this
+    level (v0.2.102 W4-D LOW 2). ``|`` / ``||`` glued to a word end are
+    left alone everywhere: the piped shapes real commands use put spaces
+    around them.
+
+    Sub-commands inside `bash -c "..."` survive as ONE string token
+    (because the quotes preserved them), so they are NOT split here --
+    they're re-parsed by `parse_dash_c` when the walker recognises a
+    `bash -c` wrapper.
 
     Empty segments (e.g. trailing `;`) are dropped to keep downstream
     iteration tight.
@@ -135,6 +149,39 @@ def split_chain(tokens: List[str]) -> List[List[str]]:
     if current:
         segments.append(current)
     return segments
+
+
+#: A token with a glued trailing ``;`` / ``&`` run (``log;``, ``foo&&``).
+#: The word may be empty (a leading separator); the separator run is
+#: re-emitted as the standalone token(s) :data:`CHAIN_SEPARATORS` knows.
+#: Applied by :func:`tokenize` only to tokens whose tail was NOT quoted
+#: (posix=False shadow pass) — a quoted tail is data, not a separator.
+_GLUED_RE = re.compile(r"^(?P<word>.*?)(?P<sep>[;&][;&]*)$")
+
+
+def _split_glued(token: str) -> List[str]:
+    """``['log;', 'sleep']`` → ``['log', ';', 'sleep']`` (separator runs of
+    two identical characters stay one token — ``foo&&`` → ``foo``, ``&&``).
+    Tokens without a glued trailing ``;`` / ``&`` pass through untouched."""
+    if len(token) <= 1 or token in CHAIN_SEPARATORS:
+        return [token]
+    m = _GLUED_RE.match(token)
+    if m is None:
+        return [token]
+    out: List[str] = []
+    word = m.group("word")
+    if word:
+        out.append(word)
+    seps = m.group("sep")
+    i = 0
+    while i < len(seps):
+        if seps[i : i + 2] == "&&":
+            out.append("&&")
+            i += 2
+            continue
+        out.append(seps[i])
+        i += 1
+    return out
 
 
 def strip_env_assignments(tokens: List[str]) -> List[str]:
@@ -197,16 +244,60 @@ def peel_wrapper_verbs(tokens: List[str]) -> List[str]:
     return out
 
 
+def _quoted_token_views(command: str) -> Optional[List[str]]:
+    """Posix=False shadow tokenization of `command`: same whitespace
+    boundaries :func:`tokenize` produces, but with quote characters
+    RETAINED — so a token whose tail was quoted still ENDS in ``'`` or
+    ``"`` here, which is exactly the information the posix=True split
+    destroys.
+
+    Returns None when the shadow pass fails; callers then fall back to
+    the peel-everything semantics rather than guess.
+    """
+    try:
+        lex = shlex.shlex(command, posix=False)
+        lex.whitespace_split = True
+        lex.commenters = ""  # mirror shlex.split(comments=False)
+        return list(lex)
+    except ValueError:
+        return None
+
+
+def _tail_quoted(raw_token: str) -> bool:
+    """True when a posix=False raw token ends in a closing quote — i.e.
+    the corresponding posix=True token's tail was QUOTED, so a trailing
+    ``;`` / ``&`` in it is data, not a chain separator."""
+    return raw_token.endswith(("'", '"'))
+
+
 def tokenize(command: str) -> Optional[List[str]]:
     """`shlex.split` the command, returning None on malformed quoting.
+
+    Glued UNQUOTED separator tails (``log;``) are peeled HERE, not in
+    :func:`split_chain` (v0.2.102 W4-D LOW 2): quote information is
+    already gone once ``shlex.split`` returns, so the peel is driven by
+    a :func:`_quoted_token_views` shadow pass that keeps the quotes —
+    ``log;`` → ``log``, ``;`` while ``echo "done;"`` keeps ``done;`` as
+    ONE token. When the two tokenizations do not align token-for-token
+    (pathological shapes such as mid-word quotes or ``$(...)``), the
+    pre-v0.2.102 peel-everything semantics apply as a conservative
+    fallback.
 
     Callers treat None as "unparseable -- collect nothing", which keeps
     every consumer's soft-fail contract identical.
     """
     try:
-        return shlex.split(command, posix=True)
+        tokens = shlex.split(command, posix=True)
     except ValueError:
         return None
+    raws = _quoted_token_views(command)
+    if raws is None or len(raws) != len(tokens):
+        return [piece for tok in tokens for piece in _split_glued(tok)]
+    return [
+        piece
+        for tok, raw in zip(tokens, raws)
+        for piece in ((tok,) if _tail_quoted(raw) else _split_glued(tok))
+    ]
 
 
 def parse_dash_c(tokens: List[str], depth: int, collect: Collector) -> List[str]:

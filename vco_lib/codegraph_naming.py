@@ -58,6 +58,7 @@ from typing import Optional
 __all__ = [
     "sanitize_for_weaviate_class",
     "canonical_class_prefix",
+    "sanitize_collection_prefix",
     "worktree_segment_in_value",
     "FALLBACK_PREFIX",
     "WORKTREE_PATH_SEGMENTS",
@@ -235,6 +236,33 @@ def canonical_class_prefix(project_name: str) -> str:
         )
 
     return cleaned
+
+
+def sanitize_collection_prefix(name: str) -> str:
+    """NEVER-RAISING wrapper around :func:`canonical_class_prefix`.
+
+    v0.2.102 home: this wrapper used to live in
+    ``vco_lib.codegraph_to_mermaid._sanitize_collection_prefix`` (deleted
+    with the mermaid exporter); it moved here — the ONE naming home —
+    together with its importers (``project_identity``,
+    ``codegraph_prefix_record``, ``codegraph_resync``, the
+    ``generate-code-summary`` template script).
+
+    Semantics (unchanged from the codegraph_to_mermaid form): return
+    ``canonical_class_prefix(name)``; on ``ValueError`` (out-of-domain
+    input: empty / all-non-alnum / leading-digit) fall back to the legacy
+    regex behaviour — replace every non-``[a-zA-Z0-9_]`` character with
+    ``_`` and uppercase a leading letter — so the function never raises.
+    Callers that WANT the loud ValueError should call
+    ``canonical_class_prefix`` directly.
+    """
+    try:
+        return canonical_class_prefix(name)
+    except ValueError:
+        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name or "")
+        if sanitized and sanitized[0].isalpha() and not sanitized[0].isupper():
+            sanitized = sanitized[0].upper() + sanitized[1:]
+        return sanitized
 
 
 # ---------------------------------------------------------------------------

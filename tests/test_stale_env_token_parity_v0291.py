@@ -42,6 +42,7 @@ from pathlib import Path
 from unittest import mock
 
 from vco_lib import project_config
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -69,10 +70,8 @@ ACCESS_MIRRORS = {
 MESSAGE_MIRRORS = [
     REPO_ROOT / "vco_lib" / "project_config.py",
     REPO_ROOT / "vco_lib" / "access_resolver.py",
-    REPO_ROOT / "vco_lib" / "cli" / "verify_diagrams.py",
     REPO_ROOT / "vco_lib" / "codegraph_resync.py",
     REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py",
-    REPO_ROOT / "claude_mcp_servers" / "wrappers" / "_base.py",
     SCRIPTS / "vct_secrets_resolve.sh",
     SCRIPTS / "vct_secrets_resolve.ps1",
     SCRIPTS / "vct_project_config.sh",
@@ -132,7 +131,8 @@ def _bash_library_truncated(path: Path, marker: str) -> str:
 def _ps1_library(path: Path) -> str:
     """The script with the ``[CmdletBinding()] param(...)`` header and the
     ``# ── Main`` tail removed, so it can be dot-sourced (F-8 pattern)."""
-    src = path.read_text(encoding="utf-8")
+    # utf-8-sig drops a leading BOM, so re-adding one below never doubles it.
+    src = path.read_text(encoding="utf-8-sig")
     cb_idx = src.find("[CmdletBinding")
     if cb_idx != -1:
         after = src.find("\n)\n", cb_idx)
@@ -182,7 +182,7 @@ def _run_ps1(script: Path, snippet: str, *, env_extra: dict, state: str):
     lib = _ps1_library(script)
     try:
         return subprocess.run(
-            [_PWSH, "-NoProfile", "-NonInteractive", "-Command",
+            [_PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command",
              f'. "{lib}"; {snippet}'],
             env=env, capture_output=True, text=True, timeout=60,
         )
@@ -582,9 +582,8 @@ ADOPT_GATE_MIRRORS = {
          "status_code == 404"],
     REPO_ROOT / "vco_lib" / "access_resolver.py":
         ["def _retry_answer_is_definitive", "attempt.code == 404"],
-    REPO_ROOT / "claude_mcp_servers" / "wrappers" / "_base.py":
-        ["def _retry_answer_is_definitive", "200 <= status < 300",
-         "status == 404"],
+    # (claude_mcp_servers/wrappers/_base.py carried a mirror until v0.2.102,
+    # when the wrapper package was deleted with the diagrams integrations.)
     REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py":
         ["def _retry_answer_is_definitive", "200 <= status < 300",
          "status == 404"],

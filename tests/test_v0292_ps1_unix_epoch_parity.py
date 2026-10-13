@@ -40,6 +40,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -64,7 +65,7 @@ def _eval_ps(exe: str, expression: str, tmp_path: Path) -> int:
     script = tmp_path / "epoch.ps1"
     script.write_text(f"Write-Output ({expression})\n", encoding="utf-8")
     out = subprocess.run(
-        [exe, "-NoProfile", "-File", str(script)],
+        [exe, *PWSH_BASE_FLAGS, "-File", str(script)],
         capture_output=True, text=True, timeout=60,
     )
     assert out.returncode == 0, out.stderr
@@ -89,7 +90,10 @@ def _extract_assignment(path: Path, variable: str) -> str:
     [
         # v0.2.95 (lane F10): the diagram-throttle stamp moved with the
         # rest of the routing into the ONE home both write hooks call.
-        ("_lib/route-touched-path.ps1", "nowTs"),
+        # v0.2.102: the route-touched-path `nowTs` stamp was removed with
+        # the diagrams integrations (the diagram throttle is gone); the
+        # debounce's `nowEpoch` reap stamp still pins the Unix-epoch
+        # discipline this file exists for.
         ("_lib/kg-sync-debounce.ps1", "nowEpoch"),
         # v0.2.92 final sweep: the three telemetry hooks write MILLISECONDS
         # ($*TsMs) into the same JSONL their .sh siblings write

@@ -154,7 +154,13 @@ def combine_kg_results(
     with ``oversized_query_score``.
     """
     if cosine_fn is None:
-        from claude_mcp_servers.weaviate_mcp.server import _cosine as cosine_fn
+        # v0.2.102 W6-M: through the host resolver — the server's ``_cosine``
+        # when a server is loaded, the light host's (the same function,
+        # ``rl_enrichment._cosine``) in the hook producer.
+        from claude_mcp_servers.weaviate_mcp.kg_host import host as _kg_host
+
+        host_cosine: Callable[..., float] = _kg_host("claude_mcp_servers.weaviate_mcp")._cosine
+        cosine_fn = host_cosine
 
     from claude_mcp_servers.rl_client.content_dedup import dedup_by_content_identity
 

@@ -213,8 +213,8 @@ def test_pre_edit_sh_filter_seen_is_block_atomic() -> None:
     assert "_vco_flush()" in lib, (
         "seen-store.sh must flush blocks atomically at boundaries."
     )
-    assert "^(KG|CODE):" in lib, (
-        "seen-store.sh missing the (KG|CODE): header regex — block "
+    assert "^(KG|CODE|NOTE):" in lib, (
+        "seen-store.sh missing the (KG|CODE|NOTE): header regex — block "
         "boundary detection broken."
     )
 

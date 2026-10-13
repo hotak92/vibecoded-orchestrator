@@ -226,8 +226,11 @@ def derive_project_diagrams_name(project_name: str) -> str:
     project name string.
 
     Mirrors the naming convention of the KG / Development collections —
-    `<sanitized>_Diagrams`. Used by `vco_lib.diagram_indexer` (Phase
-    1.5) when upserting Mermaid + Excalidraw entries into Weaviate.
+    `<sanitized>_Diagrams`. v0.2.102: the diagrams integrations (the
+    indexer that consumed this) were removed; the derivation is KEPT so
+    existing `<Project>_Diagrams` user collections keep being recognised
+    (D-protection — the migrate / rename / orphan paths still derive the
+    name).
     """
     return f"{sanitize_for_weaviate_class(project_name)}_Diagrams"
 
@@ -251,12 +254,11 @@ def derive_project_collection_names(project_name: str) -> dict:
     writes are gated). Default "false" (writes allowed). Stored as a
     string so all 4 env surfaces can pass it through unchanged.
 
-    `diagrams_collection` is the per-project Weaviate class that holds
-    Mermaid/Excalidraw diagrams indexed by `vco_lib.diagram_indexer`
-    (Phase 1.5 of the Diagrams Integration). Auto-paired with the KG
-    collection on project init by `derive_project_diagrams_name`
-    callers; reads are unconditional, writes flow through the indexer
-    module only.
+    `diagrams_collection` names the per-project Weaviate class an older
+    install created for diagrams. v0.2.102 removed the diagrams runtime
+    (and `vco_lib.diagram_indexer`); the field is RECOGNITION-ONLY —
+    `derive_project_diagrams_name` callers still name the class so
+    migrate/drop/orphan paths recognise existing user collections.
     """
     basename = sanitize_for_weaviate_class(project_name)
     # Canonical shared KG class name. Aligned across:
@@ -428,14 +430,15 @@ def derive_project_code_prefix(project_name: str) -> str:
     underscores). Consolidated here so the drop-collections / migrate /
     orphan-detector paths all agree on the code prefix.
 
-    Delegates to the shared sanitizer in ``codegraph_to_mermaid`` (itself a
-    thin wrapper over ``canonical_class_prefix`` with the legacy-fallback
-    that never raises), so a single home owns the rule. Returns "" only when
-    the sanitizer yields an empty/unusable string.
+    Delegates to the shared sanitizer in ``codegraph_naming``
+    (``sanitize_collection_prefix``, itself a thin wrapper over
+    ``canonical_class_prefix`` with the legacy-fallback that never raises),
+    so a single home owns the rule. Returns "" only when the sanitizer
+    yields an empty/unusable string.
     """
     try:
-        from vco_lib.codegraph_to_mermaid import _sanitize_collection_prefix
-        return _sanitize_collection_prefix(project_name or "") or ""
+        from vco_lib.codegraph_naming import sanitize_collection_prefix
+        return sanitize_collection_prefix(project_name or "") or ""
     except Exception:
         # Last-resort: never raise into a caller building a drop plan.
         return ""
@@ -719,8 +722,8 @@ def development_class_definition(name: str) -> dict:
     EXPLICITLY NOT MIRRORED from the KG schema (user direction 2026-05-19):
 
     * ``tags`` / ``links`` / ``typed_links`` — KG-only graph metadata;
-      Dev rows have no WikiLink resolution, no typed relationships, no
-      tag-from-typed-link inference. The corresponding fields in
+      Dev rows have no WikiLink resolution and no typed relationships.
+      The corresponding fields in
       ``parse_doc_file`` synthesize empty values for symmetry, but they
       are never written into the Dev collection.
     * ``node_type`` — redundant: every row in a Development collection is
@@ -2940,18 +2943,11 @@ def bootstrap_collections(
         targets.append(
             (derived["development_collection"], development_class_definition),
         )
-        # Phase 1.5 — Diagrams collection (fix/a1-indexing-pipeline
-        # 2026-05-25). Auto-paired with the KG collection on every
-        # bootstrap so `vco_lib.diagram_indexer::_weaviate_upsert` has a
-        # class to write into the first time the user saves a .mmd /
-        # .excalidraw file (otherwise upsert fails with "no such class"
-        # — Bug-3 of the wiring audit). The class is also unconditionally
-        # bootstrapped on every existing project's next session because
-        # the existence check + POST-on-absent path below makes the
-        # bootstrap idempotent.
-        targets.append(
-            (derived["diagrams_collection"], diagrams_class_definition),
-        )
+        # v0.2.102: the Diagrams collection is NO LONGER bootstrapped —
+        # the diagrams integrations were removed (owner ruling 2026-10-07).
+        # Existing `<Project>_Diagrams` collections on user machines are
+        # untouched (still recognised by the migration / naming paths
+        # below); nothing writes into them anymore.
     # Shared KG: always created when missing (per coordinator: shared KG is
     # READ by every project regardless of per-project opt-out, so creation
     # is unconditional). The opt-out toggle is purely a write-gate enforced
@@ -3195,18 +3191,16 @@ def _write_bootstrap_deferral(
         cmd_lines[-1] += " --kg-only"
 
     # Compose the list of expected collections for the deferral message.
-    # In kg_only mode we skip Dev and Diagrams (matching the bootstrap
-    # target tuple); otherwise list all three per-project collections
-    # plus the shared KG. fix/a1-indexing-pipeline (2026-05-25): added
-    # `<Project>_Diagrams` so users see all collections that didn't get
-    # created and can plan the re-run accordingly.
+    # In kg_only mode we skip Dev (matching the bootstrap target tuple);
+    # otherwise list the two per-project collections plus the shared KG.
+    # (v0.2.102: `<Project>_Diagrams` dropped from the list — the diagrams
+    # bootstrap was removed with the diagrams integrations.)
     if kg_only:
         _collections_human = f"{derived['kg_collection']}, {_SHARED_KG_NAME}"
     else:
         _collections_human = (
             f"{derived['kg_collection']}, "
             f"{derived['development_collection']}, "
-            f"{derived['diagrams_collection']}, "
             f"{_SHARED_KG_NAME}"
         )
     entry = DeferralEntry(
@@ -3442,15 +3436,9 @@ def _hook_globs_for_os() -> tuple[str, ...]:
     return hook_globs()
 
 
-def _settings_template_path(orchestrator_root: Path) -> Path:
-    """Pick the OS-specific settings.json template file."""
-    import platform
-    name = (
-        "settings.json.windows.template"
-        if platform.system() == "Windows"
-        else "settings.json.linux.template"
-    )
-    return orchestrator_root / "templates" / name
+# v0.2.102 (W6-HTAB): the OS template pick moved to its one home beside the
+# merge I/O, so the launcher's parked-hook carry check reads the same file.
+from vco_lib.bundle_settings_io import settings_template_path as _settings_template_path  # noqa: E402
 
 
 # v0.2.92: `_prune_now_empty_parents` moved to `vco_lib.fs_prune`. This module
@@ -3720,17 +3708,17 @@ def _enumerate_bundle_files(
     # `free/`. v0.2.100 AD-7: a TRI-STATE gate on the machine signal (explicit
     # per-project row wins); the verdict goes to `gate_outcomes` so the orphan
     # loop carries an UNKNOWN bucket forward and the run records every skip.
-    # The table and rationale live in `vco_lib.module_gated_delivery`. Root
-    # installs (`project_root is None`) go through the same gate.
+    # The tables (incl. the v0.2.102 per-vendor key leg) live in
+    # `vco_lib.module_gated_delivery`; root installs go through the same gate.
     from vco_lib import module_gated_delivery as _mgd
     gateway_agents_src = templates / "agents" / _mgd.GATEWAY_AGENTS_DIR
     if gateway_agents_src.exists():
         verdict = _mgd.gateway_agents_gate(
             orchestrator_root if project_root is None else project_root)
+        gw_files, gw_held = _mgd.select_gateway_agents(gateway_agents_src, verdict)
         if gate_outcomes is not None:
-            gate_outcomes.append((_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict))
-        for agent_file in (sorted(gateway_agents_src.glob("*.md"))
-                           if verdict.delivers else ()):
+            gate_outcomes += [(_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict), *gw_held]
+        for agent_file in gw_files:
             _gw_dest = str(Path(".claude") / "agents" / agent_file.name)
             ops.append(_BundleFileOp(
                 dest_rel=_gw_dest,
@@ -4639,9 +4627,9 @@ def _render_project_template(template_text: str, **kwargs: Any) -> str:
 #
 # Mustache-style sections that the project-template renderer strips BEFORE
 # the dict-based `{{KEY}}` placeholder pass. Designed for the "is this
-# module active for this project?" question — diagrams ships as default-on
-# with a user-toggleable opt-out in the launcher's DiagramsTab; future
-# modules (RL, MAO, paid packs) reuse the same primitive.
+# module active for this project?" question — default-on modules carry a
+# per-project opt-out row in launcher.db ``project_modules``; modules
+# (model gateway, RL, MAO, paid packs) reuse the same primitive.
 #
 # Syntax (whole-line tags):
 #
@@ -4722,7 +4710,7 @@ def render_conditional_blocks(
     Args:
         template: Raw template text (UTF-8 decoded already).
         active_modules: Set of module-name strings considered "on" for
-            this project (e.g. ``{"diagrams"}``).
+            this project (e.g. ``{"model_gateway"}``).
 
     Returns:
         The template with conditional blocks resolved. When a block is
@@ -5002,7 +4990,7 @@ def resolve_active_modules(
 ) -> set[str]:
     """Return the set of active module names for ``project_id``.
 
-    ``_DEFAULT_ACTIVE_MODULES`` (today: ``{"diagrams"}``) plus every module
+    ``_DEFAULT_ACTIVE_MODULES`` (empty since v0.2.102) plus every module
     with an ``enabled=1`` row in launcher.db ``project_modules``, minus every
     default-on module with an ``enabled=0`` row. **A module with NO row is
     active only if it is in :data:`_DEFAULT_ACTIVE_MODULES`** (v0.2.96 F-N5;
@@ -6078,6 +6066,7 @@ def _trigger_extractor_generation_reindex(
         update re-triggers (no stamp is written).
     """
     from vco_lib import codegraph_extractor_generation as _ceg
+    from vco_lib.codegraph_resync import bundle_update_audit_step as _cg_audit_step
 
     project_name = _resolve_codegraph_project_name(folder)
     if not project_name:
@@ -6107,7 +6096,6 @@ def _trigger_extractor_generation_reindex(
               "project": project_name})
 
     if outcome.status == "launched":
-        result.setdefault("extractor_reindex", {})
         result["extractor_reindex"] = {
             "status": outcome.status, "reason": outcome.reason,
             "generation": outcome.generation, "pid": outcome.pid,
@@ -6149,11 +6137,13 @@ def _trigger_extractor_generation_reindex(
             f"{outcome.message}"
         )
     else:
-        result.setdefault("extractor_reindex", {})
         result["extractor_reindex"] = {
             "status": outcome.status, "reason": outcome.reason,
             "generation": outcome.generation,
         }
+
+    if outcome.status != "launched":  # W1-C r4: one-time audits (a launched re-index runs them)
+        _cg_audit_step(Path(folder), project_name, index_dot_claude=bool(is_root_target), log=log)
 
 
 def current_chunker_revision() -> str:
@@ -6267,8 +6257,8 @@ def _emit_chunker_revision_resync_deferral(
 #     in place, emit a `compose_override_renamed` deferral so the operator
 #     can see the migration on next session.
 #   - Both present → conflict; do NOT rename, emit
-#     `compose_override_filename_conflict` so the operator resolves
-#     manually.
+#     `compose_override_pair_diverged` (v0.2.102; superseded
+#     `compose_override_filename_conflict`) so the operator resolves.
 #
 # Idempotent + soft-fail: subsequent runs find the legacy file gone and
 # silently no-op. Permission / disk errors are caught and surfaced as a
@@ -6278,12 +6268,12 @@ def _emit_chunker_revision_resync_deferral(
 
 _LEGACY_COMPOSE_OVERRIDE_NAME = "docker-compose.override.yml"
 _CANONICAL_COMPOSE_OVERRIDE_NAME = "compose.override.yaml"
-_COMPOSE_OVERRIDE_SEARCH_SUBDIRS = ("infrastructure", "claude_mcp_servers")
 
 # v0.2.83 PLAN-v0283 B-F2 + N-2: the compose-override conditions the
 # reconciliation clears when they NO LONGER HOLD this run.
 #
-# B-F2 (original scope): `compose_override_filename_conflict` — the
+# B-F2 (original scope): the divergent-pair deferral (`compose_override_pair_diverged`
+# since v0.2.102, superseding `compose_override_filename_conflict`) — the
 # HUMAN-JUDGEMENT deferral that pre-.83 persisted FOREVER after the user
 # resolved the pair (the incident this fix targets).
 #
@@ -6307,7 +6297,9 @@ _COMPOSE_OVERRIDE_SEARCH_SUBDIRS = ("infrastructure", "claude_mcp_servers")
 # the third run (record already gone). See `test_idempotent_after_rename`
 # (updated with an N-2 comment).
 _COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS = (
-    "compose_override_filename_conflict",
+    # v0.2.102: the divergent-pair state is `compose_override_pair_diverged`;
+    # the retired id stays listed so a pre-v0.2.102 entry drains on this pass.
+    "compose_override_pair_diverged", "compose_override_filename_conflict",
     "compose_override_renamed",
     "compose_override_rename_failed",
 )
@@ -6316,6 +6308,9 @@ _COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS = (
 # v0.2.100: the pair classifiers (B-F2 + U16) live in vco_lib.compose_override_pair
 # (project_init.py is past its line ratchet); these names keep their call sites.
 from vco_lib.compose_override_pair import (  # noqa: E402
+    CID_PAIR_DIVERGED as _CID_PAIR_DIVERGED,
+    SEARCH_SUBDIRS as _COMPOSE_OVERRIDE_SEARCH_SUBDIRS,
+    divergent_pairs_entry as _divergent_pairs_entry,
     classify_pair as _classify_compose_override_conflict,
     reconcile_vco_generated_pair as _reconcile_vco_generated_override_pair,
 )
@@ -6332,8 +6327,8 @@ def _reconcile_compose_override_deferrals(
     run — i.e. it is NOT in ``active_condition_ids``, the set this run re-emitted
     from its own path walk — resolve the on-disk entry. Scope
     (``_COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS``):
-      * ``compose_override_filename_conflict`` — the pair became absent /
-        identical / re-mirrored (B-F2).
+      * ``compose_override_pair_diverged`` (and the retired
+        ``compose_override_filename_conflict``) — the pair converged (B-F2).
       * ``compose_override_renamed`` — the rename is complete (legacy path gone
         this run → not re-emitted) (N-2).
       * ``compose_override_rename_failed`` — the failure no longer recurs
@@ -6395,7 +6390,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
           the legacy file to the canonical bytes (canonical wins), no deferral,
           record an auto-resolution.
         * genuinely divergent (parse failure / parsed-unequal / yaml missing)
-          → keep today's `compose_override_filename_conflict` deferral verbatim.
+          → the `compose_override_pair_diverged` deferral (v0.2.102).
       Do NOT rename in any conflict case.
     - Else: rename via `Path.rename()`. Emit a `compose_override_renamed`
       deferral entry naming both the old and new absolute paths so the
@@ -6469,13 +6464,13 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                 )
                 _de.record_auto_resolution(
                     install_root,
-                    "compose_override_filename_conflict",
+                    _CID_PAIR_DIVERGED,
                     "kept_identical_mirror_pair",
                     detail,
                     log=_log_auto,
                 )
                 auto_resolved.append(detail)
-                auto_resolved_condition_ids.add("compose_override_filename_conflict")
+                auto_resolved_condition_ids.add(_CID_PAIR_DIVERGED)
                 continue
             if classification == "semantic_equal":
                 # B-F2(ii): comment/whitespace drift only. Canonical content
@@ -6502,13 +6497,13 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                 )
                 _de.record_auto_resolution(
                     install_root,
-                    "compose_override_filename_conflict",
+                    _CID_PAIR_DIVERGED,
                     "remirrored_semantic_equal_override",
                     detail,
                     log=_log_auto,
                 )
                 auto_resolved.append(detail)
-                auto_resolved_condition_ids.add("compose_override_filename_conflict")
+                auto_resolved_condition_ids.add(_CID_PAIR_DIVERGED)
                 continue
             # U16 (v0.2.100): both halves are VCO's own generated output →
             # reconcile them here; never ask the user to pick between them.
@@ -6516,10 +6511,10 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                 install_root, legacy_path, target_path, backup_ts)
             if detail is not None:
                 _de.record_auto_resolution(
-                    install_root, "compose_override_filename_conflict",
+                    install_root, _CID_PAIR_DIVERGED,
                     "reconciled_vco_generated_pair", detail, log=_log_auto)
                 auto_resolved.append(detail)
-                auto_resolved_condition_ids.add("compose_override_filename_conflict")
+                auto_resolved_condition_ids.add(_CID_PAIR_DIVERGED)
                 continue
             # B-F2(iii): genuinely divergent — keep today's deferral. Don't
             # overwrite the canonical file with the legacy one (or vice versa).
@@ -6542,7 +6537,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
     if renamed:
         active_ids.add("compose_override_renamed")
     if conflicts:
-        active_ids.add("compose_override_filename_conflict")
+        active_ids.add(_CID_PAIR_DIVERGED)
     if errors:
         active_ids.add("compose_override_rename_failed")
     reconciled = _reconcile_compose_override_deferrals(
@@ -6612,40 +6607,8 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
         ))
 
     if conflicts:
-        conflict_lines = "\n".join(
-            f"- legacy: `{old}` -- canonical: `{new}`"
-            for old, new in conflicts
-        )
-        _pending_entries.append(DeferralEntry(
-            condition_id="compose_override_filename_conflict",
-            title="Both legacy and canonical compose override files present",
-            detected=(
-                "Detected a legacy `docker-compose.override.yml` AND a "
-                "canonical `compose.override.yaml` in the same directory. "
-                "The rename was NOT applied (the canonical file may already "
-                "carry user changes that differ from the legacy file). "
-                "Conflicting pairs:\n"
-                f"{conflict_lines}"
-            ),
-            why_deferred=(
-                "Auto-merging override YAML is unsafe — the two files may "
-                "encode different volume sources, ports, or service "
-                "additions. The operator must compare them and pick one."
-            ),
-            command_to_apply=(
-                "# Compare each conflicting pair, then delete whichever "
-                "is stale:\n"
-                + "\n".join(
-                    f"diff -u {old} {new}\n"
-                    f"# Then `rm` the one you do NOT want to keep."
-                    for old, new in conflicts
-                )
-            ),
-            severity="warning",
-            kg_node_refs=[
-                "knowledge/concepts/podman-compose-override-comment-yaml-drift-footgun.md",
-            ],
-        ))
+        # v0.2.102: the ONE divergent-pair entry, shared with the doctor's probe.
+        _pending_entries.append(_divergent_pairs_entry(conflicts))
 
     if errors:
         error_lines = "\n".join(
@@ -9983,8 +9946,9 @@ def install_project_bundle(
     result["actions"]["orphan-preserved"] = orphan_preserved
     # v0.2.100 AD-7 (L5-F04): every gated skip is visible (log + ledger row).
     from vco_lib.module_gated_delivery import record_gate_outcomes
-    record_gate_outcomes(folder, _gate_outcomes, dry_run=dry_run,
-                         log=lambda m: _log("4.bundle.gated", "info", m))
+    record_gate_outcomes(folder, _gate_outcomes, dry_run=dry_run, log=lambda m: _log("4.bundle.gated", "info", m))
+    from vco_lib.embed_slot_fill import reconcile_folder_embeddings  # v0.2.102 W6-B2/W6-I: code + KG model self-heal
+    reconcile_folder_embeddings(folder, dry_run=dry_run)
     result["actions"]["orphan-retired"] = orphan_retired
     result["actions"]["knowledge-retired"] = knowledge_retired
     # v0.2.83 B-F5: one honest auto-resolution record per retired orphan (file
@@ -10003,8 +9967,7 @@ def install_project_bundle(
                     log=_log_auto,
                 )
         except Exception as _exc:  # noqa: BLE001 — bookkeeping is best-effort
-            _log("4.bundle.orphan_retired", "warn",
-                 f"orphan-retire auto-resolution record failed: {_exc}")
+            _log("4.bundle.orphan_retired", "warn", f"orphan-retire auto-resolution record failed: {_exc}")
     if orphan_retired:
         _log("4.bundle.orphan_retired", "info",
              f"retired {len(orphan_retired)} user-modified orphan manifest "
@@ -12092,7 +12055,8 @@ def _apply_standalone_env(
     # binding-first; this path only ever runs when they can't.
     kg_collection = f"{sanitized}_KnowledgeGraph"
     dev_collection = f"{sanitized}_Development"
-    diagrams_collection = f"{sanitized}_Diagrams"
+    # (the `<sanitized>_Diagrams` sibling was scaffolded here until v0.2.102,
+    # when the diagrams integrations were removed; it is no longer projected)
     # v0.2.92 F-12(a): resolve the shared-KG name instead of hardcoding the
     # generic literal. The literal is VCO's LAST-RESORT default, not a fact
     # about this machine — and on an adopt-and-route install (where the
@@ -12115,7 +12079,11 @@ def _apply_standalone_env(
         "CODE_GRAPH_PROJECT": code_graph_project,
         "KG_COLLECTION": kg_collection,
         "DEVELOPMENT_COLLECTION": dev_collection,
-        "DIAGRAMS_COLLECTION": diagrams_collection,
+        # v0.2.102: DIAGRAMS_COLLECTION is no longer scaffolded — it left
+        # the canonical key set with the diagrams integrations, and the
+        # apply drops keys the bundle does not carry from the managed
+        # block. (The diagrams collection NAME derivation above still runs
+        # so existing `_Diagrams` user collections stay recognisable.)
         "SHARED_KG_COLLECTION": shared_kg,
         "SHARED_KG_WRITE_DISABLED": "false",
         "SHARED_KG_OPT_OUT": "false",

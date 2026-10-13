@@ -181,7 +181,7 @@ static CONNECTION: Mutex<Option<SecretService>> = Mutex::new(None);
 /// from `new_proxy`. A prompt therefore parked the single keychain worker
 /// thread for what is, operationally, forever — and because the worker holds
 /// the cross-process pace flock across the op, that parked worker also wedged
-/// every OTHER VCO process (see `secrets.rs::cross_process_pace`). This bound
+/// every OTHER VCO process (see `secrets_worker.rs::cross_process_pace`). This bound
 /// makes the holder's own worker recover on its own.
 ///
 /// Why 120s and not something tight: the timeout must never be the reason a
@@ -205,7 +205,7 @@ static CONNECTION: Mutex<Option<SecretService>> = Mutex::new(None);
 /// sibling process should degrade to unpaced (harmless — a process sitting on a
 /// modal prompt generates no daemon traffic) rather than the human being cut
 /// off. The two timeouts bound different things and are not interchangeable.
-const SHARED_MAX_PROMPT_TIMEOUT_SECS: u64 = 120;
+pub(crate) const SHARED_MAX_PROMPT_TIMEOUT_SECS: u64 = 120;
 
 /// Open a new shared Secret-Service session with the bounded prompt timeout.
 /// SSOT for the connection factory so the bound cannot be lost by someone
@@ -302,23 +302,62 @@ fn run_reusing_connection<C, T>(
 /// duration of `op` (Collection / Item handles borrow `&SecretService`), so all
 /// D-Bus work happens inside the mutex-guarded scope. `op` receives
 /// `&SecretService` and returns `Result<T, SsOpError>`.
+///
+/// v0.2.102: the shared slot is taken with a BOUNDED wait
+/// (`SHARED_CONNECTION_WAIT`). In normal operation exactly one keychain worker
+/// exists, so the slot is uncontended. It stays held only when a HUNG op on an
+/// abandoned worker still owns it (`secrets_worker::submit_keychain_job` started a
+/// replacement worker); the replacement then runs its op on a private,
+/// short-lived session instead of inheriting the hang.
 fn with_connection<T>(
     op: impl FnMut(&SecretService) -> Result<T, SsOpError>,
 ) -> Result<T, SsOpError> {
-    let mut guard = CONNECTION.lock().unwrap_or_else(|p| p.into_inner());
-
     #[cfg(any(test, debug_assertions))]
     let inject = INJECT_BROKEN_ONCE.swap(false, Ordering::SeqCst);
     #[cfg(not(any(test, debug_assertions)))]
     let inject = false;
 
-    run_reusing_connection(
-        &mut guard,
-        &CONNECTION_FACTORY_COUNT,
-        inject,
-        connect_shared,
-        op,
-    )
+    with_slot_or_private(&CONNECTION, SHARED_CONNECTION_WAIT, |slot| {
+        run_reusing_connection(slot, &CONNECTION_FACTORY_COUNT, inject, connect_shared, op)
+    })
+}
+
+/// How long an op waits for the shared connection slot before falling back to
+/// a private session. Far above an uncontended acquire (nanoseconds), far
+/// below the caller's 10s op timeout.
+const SHARED_CONNECTION_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Run `run` against the shared `slot` if it can be locked within `wait`, else
+/// against a fresh private (initially empty) slot that is dropped afterwards.
+/// Generic over the connection type so the daemon-free tests drive the exact
+/// control flow `with_connection` uses.
+fn with_slot_or_private<C, T>(
+    slot: &Mutex<Option<C>>,
+    wait: std::time::Duration,
+    run: impl FnOnce(&mut Option<C>) -> T,
+) -> T {
+    enum Acquired<'a, C> {
+        Shared(std::sync::MutexGuard<'a, Option<C>>),
+        Private(Option<C>),
+    }
+    let deadline = std::time::Instant::now() + wait;
+    let mut acquired = loop {
+        match slot.try_lock() {
+            Ok(guard) => break Acquired::Shared(guard),
+            Err(std::sync::TryLockError::Poisoned(p)) => break Acquired::Shared(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    break Acquired::Private(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    };
+    let target: &mut Option<C> = match &mut acquired {
+        Acquired::Shared(guard) => guard,
+        Acquired::Private(private) => private,
+    };
+    run(target)
 }
 
 /// Best-effort graceful close of the persistent connection. Drops the held
@@ -902,6 +941,51 @@ mod tests {
     /// connect factory is invoked exactly ONCE — the held connection is reused.
     /// FAIL-ON-PER-OP: if `with_connection` reconstructed per op (the pre-WP-K
     /// churn), this factory count would be N, not 1.
+    /// v0.2.102 T6 — a replacement worker never inherits a hung op's grip on
+    /// the shared connection: with the slot held elsewhere (the abandoned
+    /// worker), the op runs on a PRIVATE session (its own connect) and leaves
+    /// the held slot untouched. Leave-alone case: an uncontended slot is the
+    /// one used (and keeps the connection for reuse).
+    #[test]
+    fn held_shared_slot_falls_back_to_private_connection() {
+        let slot: Mutex<Option<u32>> = Mutex::new(None);
+        let factory = AtomicU64::new(0);
+        let wait = std::time::Duration::from_millis(50);
+
+        // Uncontended: the shared slot is used and retains the connection.
+        let v = with_slot_or_private(&slot, wait, |s| {
+            run_reusing_connection(s, &factory, false, || Ok(1u32), |c| Ok::<u32, SsOpError>(*c))
+        })
+        .unwrap();
+        assert_eq!(v, 1);
+        assert_eq!(*slot.lock().unwrap(), Some(1), "uncontended op keeps the shared connection");
+
+        // Held by a "hung" op on another thread: the op must still complete,
+        // on its own private connection, within roughly the wait bound.
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let slot_ref = &slot;
+            scope.spawn(move || {
+                let _g = slot_ref.lock().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            held_rx.recv().unwrap();
+            let started = std::time::Instant::now();
+            let v = with_slot_or_private(slot_ref, wait, |s| {
+                assert!(s.is_none(), "the fallback slot is a fresh private one");
+                run_reusing_connection(s, &factory, false, || Ok(2u32), |c| Ok::<u32, SsOpError>(*c))
+            })
+            .unwrap();
+            assert_eq!(v, 2, "the op ran on the private connection");
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            release_tx.send(()).unwrap();
+        });
+        assert_eq!(*slot.lock().unwrap(), Some(1), "the held shared connection was not touched");
+        assert_eq!(factory.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn factory_invoked_once_across_many_ops() {
         let mut slot: Option<FakeConn> = None;

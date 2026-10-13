@@ -18,7 +18,7 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 from vco_lib.codegraph_entities import (
     CodeEntity,
@@ -28,6 +28,7 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_definitions, note_path
 from vco_lib.codegraph_lang._shared import (
     _extract_external_calls,
     extract_end_keyword_block,
@@ -49,12 +50,19 @@ def extract_lua_file(
     # Imports: require('mod') or require "mod"
     imports = re.findall(r"require\s*[(\s]*[\"']([^\"']+)[\"']", content)
 
+    # Definitions: tree-sitter first (v0.2.102), regex fallback.
+    defs = extract_definitions("lua", content, origin=relative_path)
+    note_path("lua", "tree-sitter" if defs is not None else "regex")
+
     # Detect table-based classes: uppercase Name = {} or Name.__index = Name
-    class_names: Set[str] = set()
-    for m in re.finditer(r'^([A-Z][\w]*)\s*=\s*\{\}', content, re.MULTILINE):
-        class_names.add(m.group(1))
-    for m in re.finditer(r'^([\w]+)\.__index\s*=\s*\1', content, re.MULTILINE):
-        class_names.add(m.group(1))
+    if defs is not None:
+        class_names: Set[str] = {c.name for c in defs.classes}
+    else:
+        class_names = set()
+        for m in re.finditer(r'^([A-Z][\w]*)\s*=\s*\{\}', content, re.MULTILINE):
+            class_names.add(m.group(1))
+        for m in re.finditer(r'^([\w]+)\.__index\s*=\s*\1', content, re.MULTILINE):
+            class_names.add(m.group(1))
 
     # Function pattern: covers function f(), local function f(), Obj.f = function()
     func_pattern = re.compile(
@@ -63,9 +71,12 @@ def extract_lua_file(
         re.MULTILINE
     )
     all_func_names = []
-    for m in func_pattern.finditer(content):
-        name = m.group(1) if m.group(1) else f'{m.group(3)}.{m.group(4)}'
-        all_func_names.append(name)
+    if defs is not None:
+        all_func_names = [f.tag for f in defs.functions]
+    else:
+        for m in func_pattern.finditer(content):
+            name = m.group(1) if m.group(1) else f'{m.group(3)}.{m.group(4)}'
+            all_func_names.append(name)
 
     # Module summary from leading comments
     first_comments: List[str] = []
@@ -96,18 +107,25 @@ def extract_lua_file(
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
     # Extract classes (table-OOP pattern)
-    for class_name in class_names:
-        methods: List[str] = []
-        for m in re.finditer(
-            rf'(?:function\s+{re.escape(class_name)}[.:]([\w]+)\s*\(|'
-            rf'{re.escape(class_name)}\.([\w]+)\s*=\s*function\s*\()',
-            content
-        ):
-            methods.append(m.group(1) or m.group(2))
+    #: (name, start_line, methods) per table class.
+    class_rows: List[Tuple[str, int, List[str]]] = []
+    if defs is not None:
+        class_rows = [(c.name, c.start_line, defs.methods_of(c.name)) for c in defs.classes]
+    else:
+        for class_name in class_names:
+            methods: List[str] = []
+            for m in re.finditer(
+                rf'(?:function\s+{re.escape(class_name)}[.:]([\w]+)\s*\(|'
+                rf'{re.escape(class_name)}\.([\w]+)\s*=\s*function\s*\()',
+                content
+            ):
+                methods.append(m.group(1) or m.group(2))
 
-        class_match = re.search(rf'^{re.escape(class_name)}\s*=\s*\{{', content, re.MULTILINE)
-        start_line = content[:class_match.start()].count('\n') + 1 if class_match else 1
+            class_match = re.search(rf'^{re.escape(class_name)}\s*=\s*\{{', content, re.MULTILINE)
+            start_line = content[:class_match.start()].count('\n') + 1 if class_match else 1
+            class_rows.append((class_name, start_line, methods))
 
+    for class_name, start_line, methods in class_rows:
         body = f"{class_name} = {{}}\n" + '\n'.join(
             f"function {class_name}.{mth}(...) end" for mth in methods
         )
@@ -136,23 +154,35 @@ def extract_lua_file(
     # Extract standalone functions (skip class methods already indexed)
     class_prefixes = tuple(cn + '.' for cn in class_names) + tuple(cn + ':' for cn in class_names)
 
-    for m in func_pattern.finditer(content):
-        if m.group(1):
-            func_name, args_str = m.group(1), m.group(2)
-        else:
-            func_name, args_str = f'{m.group(3)}.{m.group(4)}', m.group(5) or ''
+    #: (qualified name, args, start_line, end_line) — class methods excluded
+    #: (they are listed on their class row).
+    fn_records: List[Tuple[str, str, int, int]] = []
+    if defs is not None:
+        fn_records = [
+            (f.tag, f.params, f.start_line, f.end_line)
+            for f in defs.functions if f.container is None
+        ]
+    else:
+        for m in func_pattern.finditer(content):
+            if m.group(1):
+                func_name, args_str = m.group(1), m.group(2)
+            else:
+                func_name, args_str = f'{m.group(3)}.{m.group(4)}', m.group(5) or ''
 
-        if any(func_name.startswith(p) for p in class_prefixes):
-            continue
+            if any(func_name.startswith(p) for p in class_prefixes):
+                continue
 
-        start_line = content[:m.start()].count('\n') + 1
-        # v0.2.92 WP-5b: the `end`-keyword scanner. This call used to be
-        # `_extract_balanced_block(language="lua")`, which counts `{`/`}` — a
-        # `function … end` body has no brace at all, so the scan found no
-        # opener and took the runaway branch. Measured on the golden corpus:
-        # `vector.lua`'s `clamp` (a 10-line function closing on line 38) was
-        # stored ending at 39, the last line of the file.
-        end_line = extract_end_keyword_block(source_lines, start_line, language="lua")
+            start_line = content[:m.start()].count('\n') + 1
+            # v0.2.92 WP-5b: the `end`-keyword scanner. This call used to be
+            # `_extract_balanced_block(language="lua")`, which counts `{`/`}` — a
+            # `function … end` body has no brace at all, so the scan found no
+            # opener and took the runaway branch. Measured on the golden corpus:
+            # `vector.lua`'s `clamp` (a 10-line function closing on line 38) was
+            # stored ending at 39, the last line of the file.
+            end_line = extract_end_keyword_block(source_lines, start_line, language="lua")
+            fn_records.append((func_name, args_str, start_line, end_line))
+
+    for func_name, args_str, start_line, end_line in fn_records:
         body = '\n'.join(source_lines[start_line - 1:end_line])
 
         func_full_name = f"{file_path.stem}.{func_name}"

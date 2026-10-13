@@ -182,6 +182,24 @@ async fn post_event(
         Ok(id) => (StatusCode::OK, Json(PostEventResponse { ok: true, id })).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "[vct-hub] post_rl_event insert failed");
+            // v0.2.102 (W3R-9 follow-up): an FK failure with a non-null
+            // project_id means the referenced project row is gone (deleted /
+            // re-registered) — the writer's CACHED identity is stale. Answer
+            // 422 with a machine-readable code so the writer drops the cached
+            // identity and re-resolves, instead of losing events as generic
+            // 500s for the rest of the identity-cache TTL.
+            if body.project_id.is_some() && e.contains("FOREIGN KEY") {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "unknown_project_id",
+                            "message": "project_id does not reference a registered project",
+                        }
+                    })),
+                )
+                    .into_response();
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -476,6 +494,116 @@ mod tests {
         assert_eq!(arr.as_array().unwrap().len(), 1);
         assert_eq!(arr[0]["task_id"], "abc");
         assert_eq!(arr[0]["embedding_model"], "qwen3-embedding:0.6b");
+    }
+
+    #[tokio::test]
+    async fn post_event_with_unknown_project_id_returns_422_named_code() {
+        // W3R-9 follow-up (v0.2.102): a dangling project_id trips the
+        // rl_events FK (launcher.db opens with foreign_keys=ON) and must
+        // surface as 422 with the machine-readable `unknown_project_id`
+        // code — not a generic 500 — so the writer side drops its stale
+        // cached identity and re-resolves instead of losing events for the
+        // rest of the identity-cache TTL.
+        let base = spawn_test_hub().await;
+        let client = reqwest::Client::new();
+
+        let body = serde_json::json!({
+            "event_type": "retrieval",
+            "schema_version": 4,
+            "ts_ms": 1_700_000_000_000_i64,
+            "project_id": "deleted-project-id",
+            "project_name": "ghost",
+            "task_id": "fk-task",
+            "task_type": "mcp_interactive",
+            "payload_json": "{\"event\":\"retrieval\"}",
+        });
+        let resp = client
+            .post(format!("{}/rl/events", base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["error"]["code"], "unknown_project_id");
+
+        // The writer's retry shape (project_id stripped) must land.
+        let retry = serde_json::json!({
+            "event_type": "retrieval",
+            "schema_version": 4,
+            "ts_ms": 1_700_000_000_001_i64,
+            "project_id": null,
+            "project_name": "ghost",
+            "task_id": "fk-task",
+            "task_type": "mcp_interactive",
+            "payload_json": "{\"event\":\"retrieval\"}",
+        });
+        let resp = client
+            .post(format!("{}/rl/events", base))
+            .json(&retry)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn post_event_deduplicates_exact_repost() {
+        // W3R-7 (v0.2.102): POSTing the same (task_id, event_type, ts_ms)
+        // twice — the migrator's crash-between-POST-and-rename re-run, or a
+        // retried send — must NOT double-insert: both calls return 200, the
+        // second returns the EXISTING row id, and the table holds one row.
+        // No UNIQUE constraint is added (existing user DBs may already carry
+        // duplicates, which would make one fail); the dedupe is an
+        // insert-time existence check in `Db::insert_rl_event`.
+        let base = spawn_test_hub().await;
+        let client = reqwest::Client::new();
+
+        let body = serde_json::json!({
+            "event_type": "retrieval",
+            "schema_version": 4,
+            "ts_ms": 1_700_000_000_000_i64,
+            "project_name": "VCO_dev",
+            "task_id": "dup-task",
+            "task_type": "mcp_interactive",
+            "embedding_source": "qwen3",
+            "embedding_dim": 1024,
+            "embedding_model": "qwen3-embedding:0.6b",
+            "payload_json": "{\"event\":\"retrieval\",\"schema_version\":4}",
+        });
+        let first = client
+            .post(format!("{}/rl/events", base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+        let first_id = first.json::<serde_json::Value>().await.unwrap()["id"].as_i64().unwrap();
+
+        let second = client
+            .post(format!("{}/rl/events", base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            reqwest::StatusCode::OK,
+            "an exact re-POST is idempotent, not an error"
+        );
+        let second_id = second.json::<serde_json::Value>().await.unwrap()["id"].as_i64().unwrap();
+        assert_eq!(first_id, second_id, "a re-POST returns the existing row id");
+
+        let resp = client
+            .get(format!("{}/rl/events?limit=10", base))
+            .send()
+            .await
+            .unwrap();
+        let arr: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            arr.as_array().unwrap().len(),
+            1,
+            "an exact re-POST must not double-insert"
+        );
     }
 
     /// v0.2.100 W5R-02 / W5R-09: event INGEST is independent of the RL

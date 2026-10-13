@@ -50,15 +50,18 @@ STAMP.
 """
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from vco_lib import git_meta
 
+logger = logging.getLogger(__name__)
+
 
 def provenance_line(
-    model: Any, dim: Any, embed_revision: int, repo_path: Any,
+    model: Any, dim: Any, embed_revision: int, repo_path: Any, *, filling: bool = False,
 ) -> str:
     """v0.2.82 (G6): build the ONE machine-readable provenance line WP-3 parses.
 
@@ -91,9 +94,14 @@ def provenance_line(
             commit = sha
     except Exception:  # noqa: BLE001 — non-git tree / git absent → none
         pass
+    # v0.2.102 W6-B2 (review F3): ``filling=1`` marks a run that embedded a
+    # TARGET still being filled — its model is NOT a complete slot, so the
+    # launcher must never promote it to the record (an extra key=value token;
+    # the parser ignores keys it does not know, so older launchers are safe).
     return (
         f"CODEGRAPH_PROVENANCE model={model_s} dim={dim_i} "
         f"embed_revision={embed_revision} analyzed_commit={commit}"
+        + (" filling=1" if filling else "")
     )
 
 
@@ -131,11 +139,128 @@ def _coerce_rev(stored_rev: Any) -> Optional[int]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# v0.2.102 W6-B2 (re-review MEDIUM b): the FILL TALLY — the fill walk's own
+# counters. While a code-model fill walks the graph, every fingerprint read
+# against the TARGET slot is recorded per object (the ONE point-read every
+# skip/stamp/embed decision goes through), so the walk knows how many rows it
+# visited and how many lacked the target vector — completeness without a
+# second scan of every object. ``vco_lib.code_embed_model`` starts/stops it.
+# ---------------------------------------------------------------------------
+
+_FILL_TALLY: Optional[Dict[str, Any]] = None
+
+
+def start_fill_tally(slot: str) -> None:
+    global _FILL_TALLY
+    _FILL_TALLY = {"slot": slot, "rows": {}}
+
+
+def stop_fill_tally() -> Optional[Dict[str, Any]]:
+    """End the tally: ``{"slot", "visited", "lacking"}`` (rows read against the
+    slot, and how many of them had no vector there), or None when none ran."""
+    global _FILL_TALLY
+    tally, _FILL_TALLY = _FILL_TALLY, None
+    if tally is None:
+        return None
+    rows = tally["rows"]
+    return {"slot": tally["slot"], "visited": len(rows),
+            "lacking": sum(1 for present in rows.values() if present is not True)}
+
+
+def _tally_read(collection: Any, det_uuid: str, vector_slot: Optional[str],
+                present: Optional[bool]) -> None:
+    tally = _FILL_TALLY
+    if tally is not None and vector_slot == tally["slot"]:
+        key = (str(getattr(collection, "name", "") or id(collection)), str(det_uuid))
+        tally["rows"][key] = present
+
+
+#: v0.2.102 W6-O: hash-EXCLUDED metadata a SKIPPED (content-identical) row
+#: still has to receive. ``file_path`` and ``is_test`` are excluded from the
+#: content hash (they never feed the vector), so a row written before the stamp
+#: existed hash-matches forever and the write that would stamp them never runs
+#: — measured: CodeAPI rows of a pre-v0.2.82 graph with ``file_path = null``
+#: whose route carries no ``handler`` reference for the anchor backfill to
+#: follow, and every CodeAPI row's ``is_test``. Scoped to the small classes
+#: whose rows predate these props; the read adds these names to the ONE
+#: fingerprint point-read (no extra request).
+ANCHOR_HEAL_PROPS: Dict[str, Tuple[str, ...]] = {
+    "CodeAPI": ("file_path", "is_test"),
+    "CodeInteraction": ("file_path",),
+}
+
+
+def anchor_heal_props_for(collection: Any,
+                          declared_cache: Optional[Dict[str, Any]] = None) -> Tuple[str, ...]:
+    """The :data:`ANCHOR_HEAL_PROPS` entry for ``collection``'s class.
+
+    With ``declared_cache`` (a dict the caller keeps for the run), only the
+    props the class actually DECLARES are returned: asking a fingerprint read
+    for an undeclared property fails the read, and a failed read falls through
+    to a full write that re-embeds (W6-O review LOW-5 — e.g. CodeAPI without
+    ``is_test`` when edge 8_to_9 was deferred and the analyzer's ensure
+    soft-failed). The class schema is read once per collection name and
+    cached; an unreadable schema yields ``()`` — no heal, never a failed read.
+    """
+    name = str(getattr(collection, "name", "") or "")
+    wanted: Tuple[str, ...] = ()
+    for suffix, props in ANCHOR_HEAL_PROPS.items():
+        if name.endswith(suffix):
+            wanted = props
+            break
+    if not wanted or declared_cache is None:
+        return wanted
+    if name not in declared_cache:
+        try:
+            declared_cache[name] = frozenset(
+                p.name for p in collection.config.get().properties)
+        except Exception as exc:  # noqa: BLE001 — unreadable schema → no heal
+            logger.debug("anchor heal: schema read on %s failed: %s", name, exc)
+            declared_cache[name] = frozenset()
+    declared = declared_cache[name]
+    return tuple(p for p in wanted if p in declared)
+
+
+def anchor_heal_patch(stored: Optional[Mapping[str, Any]], props: Any) -> Dict[str, Any]:
+    """PURE: the properties a skipped row lacks and this walk can supply.
+
+    Only a NULL/empty stored value is filled (a stored ``False`` is a value);
+    never overwrites. ``stored`` is the fingerprint's ``"heal"`` mapping —
+    ``None`` (props not read) yields ``{}``.
+    """
+    if not stored or not isinstance(props, dict):
+        return {}
+    patch: Dict[str, Any] = {}
+    for name, old in stored.items():
+        new = props.get(name)
+        if (old is None or old == "") and new is not None and new != "":
+            patch[name] = new
+    return patch
+
+
+def heal_skipped_row(collection: Any, det_uuid: str, props: Any,
+                     stored: Optional[Mapping[str, Any]]) -> bool:
+    """PATCH :func:`anchor_heal_patch` onto a skipped row. One ``data.update``
+    of metadata only (no vector, no tombstone); soft-fails. True on a write."""
+    patch = anchor_heal_patch(stored, props)
+    if not patch:
+        return False
+    try:
+        collection.data.update(uuid=det_uuid, properties=patch)
+        return True
+    except Exception as exc:  # noqa: BLE001 — metadata heal never wedges a walk
+        logger.debug("anchor heal on %s failed: %s", det_uuid, exc)
+        return False
+
+
 def read_object_fingerprint(
     collection: Any,
     det_uuid: str,
     embed_revision_prop: str,
     want_total_chunks: bool = False,
+    vector_slot: Optional[str] = None,
+    heal_props: Sequence[str] = (),
 ) -> Optional[dict]:
     """Point-read an object's tombstone-skip fingerprint by UUID (I/O helper).
 
@@ -150,17 +275,34 @@ def read_object_fingerprint(
     ``total_chunks`` (valid only for chunkable Function/Class collections;
     Module/API/Interaction schemas lack it and an unknown return_property errors
     the read).
+
+    v0.2.102 (P299-B5): ``vector_slot`` (a named-vector slot the caller has
+    confirmed the class DECLARES) adds ``include_vector=[vector_slot]`` to the
+    SAME fetch and a ``"vector_present"`` key to the result: ``False`` only when
+    the slot positively came back empty/missing, ``True`` when it holds a
+    vector, ``None`` when the payload could not be judged. Omitted (default) →
+    the read and the returned dict are exactly the pre-.102 ones.
+
+    v0.2.102 (W6-O): ``heal_props`` (:func:`anchor_heal_props_for`) rides the
+    SAME read and returns as ``"heal": {name: stored value}`` for
+    :func:`heal_skipped_row`. Empty (default) → no extra key, no extra prop.
     """
     try:
         query = getattr(collection, "query", None)
         fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
         if not callable(fetch_by_id):
             return None
-        read_props = ["content_hash", embed_revision_prop]
+        read_props = ["content_hash", embed_revision_prop, *heal_props]
         if want_total_chunks:
             read_props.append("total_chunks")
-        existing = fetch_by_id(det_uuid, return_properties=read_props)
+        if vector_slot:
+            existing = fetch_by_id(
+                det_uuid, return_properties=read_props, include_vector=[vector_slot],
+            )
+        else:
+            existing = fetch_by_id(det_uuid, return_properties=read_props)
         if existing is None:
+            _tally_read(collection, det_uuid, vector_slot, None)  # a new row
             return None
         existing_props = getattr(existing, "properties", None) or {}
         total_chunks: Optional[int] = None
@@ -169,12 +311,38 @@ def read_object_fingerprint(
                 total_chunks = int(existing_props.get("total_chunks") or 1)
             except (TypeError, ValueError):
                 total_chunks = 1
-        return {
+        fingerprint = {
             "content_hash": existing_props.get("content_hash") or "",
             "embed_revision": existing_props.get(embed_revision_prop),
             "total_chunks": total_chunks,
         }
+        if heal_props:
+            fingerprint["heal"] = {p: existing_props.get(p) for p in heal_props}
+        if vector_slot:
+            fingerprint["vector_present"] = slot_vector_present(
+                getattr(existing, "vector", None), vector_slot,
+            )
+            _tally_read(collection, det_uuid, vector_slot, fingerprint["vector_present"])
+        return fingerprint
     except Exception:  # noqa: BLE001 — any read failure → unknown → write
+        return None
+
+
+def slot_vector_present(vector_field: Any, slot: str) -> Optional[bool]:
+    """PURE: does a fetched object's ``vector`` payload hold a vector in ``slot``?
+
+    ``True`` = populated; ``False`` = positively empty (the slot is missing from
+    a named-vector dict, or maps to ``[]`` / ``None`` — weaviate's shape for a
+    declared-but-never-written slot); ``None`` = cannot judge (no dict at all —
+    an older client or a double that drops vectors). Callers treat ``None`` as
+    "no veto" so an unjudgeable read never forces a re-embed.
+    """
+    if not isinstance(vector_field, dict):
+        return None
+    vec = vector_field.get(slot)
+    try:
+        return bool(vec) and len(vec) > 0
+    except Exception:  # noqa: BLE001 — unreadable payload → cannot judge
         return None
 
 

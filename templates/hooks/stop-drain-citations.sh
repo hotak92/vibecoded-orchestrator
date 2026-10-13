@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with stop-drain-citations.ps1 (its PowerShell-only
+# detached spawn, Start-VcoDetachedProcess, is the Windows twin of the setsid /
+# nohup detach below; every other behaviour must match the .ps1 sibling).
 # Stop-hook deferred-citation drain (F-QUEUE, v0.2.70)
 # Fires at turn-end (Stop). Reads session_id + transcript_path from stdin JSON
 # and runs the python drain, which recovers hook-path RL citations the doomed
@@ -6,8 +9,40 @@
 #
 # ACCUMULATE-DON'T-DROP: the drain computes+writes ONLY when a pending task's
 # cumulative answer window reaches the token gate; below-gate windows are left
-# for the next Stop so they keep accumulating. It also TTL-sweeps abandoned
-# pending files. Soft-fail throughout — telemetry must never break the turn.
+# for the next Stop so they keep accumulating. No time limit scores or deletes
+# a pending file: the drain garbage-collects only PROVABLY abandoned files
+# (transcript idle for RL_CITATION_ABANDONED_DAYS, default 7 days, and no live
+# owner), each scored first when its transcript is readable, else recorded as
+# unscored. Soft-fail throughout — telemetry must never break the turn.
+#
+# v0.2.102 W6-C2 (census F12): ALSO registered on SubagentStop (async). A
+# subagent's hook events carry the PARENT's session_id/transcript_path, so the
+# retrievals injected into a subagent were scored against the PARENT's answer.
+# On SubagentStop (payload carries agent_id + agent_transcript_path, the only
+# event that has the latter) this hook drains ONLY that agent's staged files
+# against the agent's own transcript (`--agent-id`); no agent transcript ->
+# nothing is drained (never the parent's). The Stop path is unchanged and
+# routes agent-tagged files to their stamped agent transcript.
+#
+# W6-C2 fix round (review R4c-8): ALSO routed by the ONE async PostToolUse
+# dispatcher (post-tool-use-async ROUTE_TABLE) for Agent and Task. The KG
+# block injected into a subagent's BRIEF is retrieved at PreToolUse:Agent by
+# the caller, before the subagent exists, so it was staged as a main-chat
+# citation. PostToolUse:Agent is the first event that names the subagent
+# (tool_response.agentId): in the MAIN chat this hook re-tags that brief's
+# citations (--adopt-brief-tool-use-id, matched by the Agent call's
+# tool_use_id) instead of draining. A foreground agent has finished by then
+# (--agent-finished: stamped with its transcript); a background launch is
+# tagged only, for its own SubagentStop drain.
+#
+# v0.2.102 W6-RL2 (owner ruling R7-4): ALSO registered on SessionEnd. There
+# is no scoring deadline: a main-chat citation below the token gate waits
+# for its own chat to END, and SessionEnd is that end. The drain runs with
+# --session-end: it first records the end (so a drain that cannot finish
+# leaves it for the next session's drain, never deleting an unscored file), then
+# scores the session's files with the final floors. SessionEnd hooks get a
+# short harness budget; this hook only parses stdin and spawns the DETACHED
+# drain (setsid below), so the drain itself outlives the session's exit.
 #
 # Constraints:
 #   - Stop hooks' plain stdout is discarded by the harness; this hook only
@@ -42,12 +77,48 @@ try:
     d = json.loads(sys.stdin.read())
     print(d.get('session_id', ''))
     print(d.get('transcript_path', ''))
+    print(d.get('agent_id', '') or '')
+    print(d.get('agent_transcript_path', '') or '')
+    ev = str(d.get('hook_event_name', '') or '')
+    resp = d.get('tool_response')
+    resp = resp if isinstance(resp, dict) else {}
+    print(ev)
+    print(str(d.get('tool_name', '') or ''))
+    print(str(d.get('tool_use_id', '') or ''))
+    print(str(resp.get('agentId', '') or ''))
+    print('0' if (resp.get('isAsync') or resp.get('status') == 'async_launched') else '1')
 except Exception:
-    print(''); print('')
-" 2>/dev/null || printf '\n\n')
+    print(''); print(''); print(''); print('')
+" 2>/dev/null || printf '\n\n\n\n')
 
 SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '1p')
 TRANSCRIPT_PATH=$(printf '%s' "$_PARSED" | sed -n '2p')
+AGENT_ID=$(printf '%s' "$_PARSED" | sed -n '3p')
+AGENT_TRANSCRIPT=$(printf '%s' "$_PARSED" | sed -n '4p')
+HOOK_EVENT=$(printf '%s' "$_PARSED" | sed -n '5p')
+TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '6p')
+TOOL_USE_ID=$(printf '%s' "$_PARSED" | sed -n '7p')
+RESP_AGENT=$(printf '%s' "$_PARSED" | sed -n '8p')
+AGENT_FINISHED=$(printf '%s' "$_PARSED" | sed -n '9p')
+# PostToolUse:Agent (R4c-8): re-tag the brief's citations — main chat only
+# (a subagent's own Agent call is not a brief the parent staged), and only
+# when the payload names both the call and the agent.
+ADOPT_ARGS=""
+if [ "$HOOK_EVENT" = "PostToolUse" ]; then
+    [ -z "$AGENT_ID" ] || exit 0
+    case "$TOOL_NAME" in Agent|Task) ;; *) exit 0 ;; esac
+    [ -n "$TOOL_USE_ID" ] && [ -n "$RESP_AGENT" ] || exit 0
+    ADOPT_ARGS="1"
+fi
+# SubagentStop (W6-C2 F12): the answer source is the AGENT's transcript; a
+# subagent event without one drains nothing (the parent's is the wrong one).
+if [ -n "$AGENT_ID" ]; then
+    [ -n "$AGENT_TRANSCRIPT" ] || exit 0
+    TRANSCRIPT_PATH="$AGENT_TRANSCRIPT"
+fi
+# SessionEnd (W6-RL2): the main chat has ended -> final floors.
+END_ARGS=""
+[ "$HOOK_EVENT" = "SessionEnd" ] && [ -z "$AGENT_ID" ] && END_ARGS=" --session-end"
 
 # Resolve the project venv python (the drain imports claude_mcp_servers.*).
 # v0.2.70 FIX-2 (sibling-divergence): require the RESOLVED VCO venv on BOTH
@@ -102,12 +173,25 @@ fi
 # internally (always exit 0) and prints a "soft-fail (...)" line on any
 # exception; that line lands in the log for post-hoc debugging.
 DRAIN_LOG="$PROJECT_ROOT/.claude/logs/rl_drain_citations.log"
+# A SubagentStop drain logs beside the Stop drain's (own bounded file, so a
+# lane finishing during a Stop drain cannot truncate its log mid-run).
+[ -n "$AGENT_ID" ] && DRAIN_LOG="$PROJECT_ROOT/.claude/logs/rl_drain_citations.agent.log"
+# The SessionEnd drain likewise (it may still run when the next session's
+# first Stop drain starts).
+[ -n "$END_ARGS" ] && DRAIN_LOG="$PROJECT_ROOT/.claude/logs/rl_drain_citations.end.log"
 mkdir -p "$PROJECT_ROOT/.claude/logs" 2>/dev/null || true
 # Build the detached command. Args are embedded via a single-quoted snippet run
 # through `sh -c`; SESSION_ID / TRANSCRIPT_PATH are shell-quoted so a path with
 # spaces survives the extra sh -c layer.
 _shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
-_DRAIN_SNIP="CLAUDE_PROJECT_DIR=$(_shq "$PROJECT_ROOT") $(_shq "$VENV") $(_shq "$DRAIN") --session-id $(_shq "$SESSION_ID") --transcript-path $(_shq "$TRANSCRIPT_PATH") > $(_shq "$DRAIN_LOG") 2>&1"
+if [ -n "$ADOPT_ARGS" ]; then
+    DRAIN_LOG="$PROJECT_ROOT/.claude/logs/rl_drain_citations.adopt.log"
+    _FIN=""
+    [ "$AGENT_FINISHED" = "1" ] && _FIN=" --agent-finished"
+    _DRAIN_SNIP="CLAUDE_PROJECT_DIR=$(_shq "$PROJECT_ROOT") $(_shq "$VENV") $(_shq "$DRAIN") --session-id $(_shq "$SESSION_ID") --transcript-path $(_shq "$TRANSCRIPT_PATH") --agent-id $(_shq "$RESP_AGENT") --adopt-brief-tool-use-id $(_shq "$TOOL_USE_ID")$_FIN > $(_shq "$DRAIN_LOG") 2>&1"
+else
+    _DRAIN_SNIP="CLAUDE_PROJECT_DIR=$(_shq "$PROJECT_ROOT") $(_shq "$VENV") $(_shq "$DRAIN") --session-id $(_shq "$SESSION_ID") --transcript-path $(_shq "$TRANSCRIPT_PATH") --agent-id $(_shq "$AGENT_ID")$END_ARGS > $(_shq "$DRAIN_LOG") 2>&1"
+fi
 if command -v setsid >/dev/null 2>&1; then
     setsid sh -c "$_DRAIN_SNIP" >/dev/null 2>&1 < /dev/null &
 elif command -v nohup >/dev/null 2>&1; then

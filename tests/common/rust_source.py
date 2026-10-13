@@ -107,6 +107,7 @@ __all__ = [
     "cfg_test_line_numbers",
     "cfg_test_gate_indices",
     "cfg_test_item_resume_index",
+    "production_source",
 ]
 
 _RUST_SYNTAX = _syntax_for("rust")
@@ -325,6 +326,47 @@ def _item_end_line(code: Sequence[str], attr_index: int) -> Optional[int]:
     return None
 
 
+def _leading_inner_attrs(code: Sequence[str]) -> List[str]:
+    """The file's LEADING inner attributes, each as one line of text.
+
+    ``code`` is scrubbed (comments and strings gone). Only whitespace, a
+    first-line shebang (``#!`` not opening ``[``, skipped by the Rust lexer)
+    and other inner attributes (``#![...]``, possibly spanning lines) may
+    precede a file-level inner attribute; the first other token is the file's
+    first item, and nothing after it is returned.
+    """
+    text = "\n".join(code)
+    attrs: List[str] = []
+    pos = 0
+    if text.startswith("#!") and not text[2:].lstrip(" \t\r").startswith("["):
+        nl = text.find("\n")
+        pos = len(text) if nl < 0 else nl
+    while True:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if not text.startswith("#!", pos):
+            return attrs
+        open_at = pos + 2
+        while open_at < len(text) and text[open_at].isspace():
+            open_at += 1
+        if open_at >= len(text) or text[open_at] != "[":
+            return attrs
+        depth = 0
+        end = None
+        for k in range(open_at, len(text)):
+            if text[k] == "[":
+                depth += 1
+            elif text[k] == "]":
+                depth -= 1
+                if depth == 0:
+                    end = k
+                    break
+        if end is None:
+            return attrs
+        attrs.append(text[pos:end + 1].replace("\n", " "))
+        pos = end + 1
+
+
 def cfg_test_spans(
     source: str, *, include_any_test: bool = False,
 ) -> List[Tuple[int, int]]:
@@ -338,10 +380,13 @@ def cfg_test_spans(
     spans: List[Tuple[int, int]] = []
 
     # `#![cfg(test)]` is an INNER attribute: it gates the whole enclosing
-    # module, i.e. this entire file.
-    for i, line in enumerate(code):
-        if _INNER_CFG_ATTR_RE.search(line) and _predicate_mentions_test_only(
-            code, i, include_any_test=include_any_test,
+    # module. Only one that precedes the file's first item gates THIS file;
+    # inside an inline `mod x { #![cfg(test)] ... }` it gates that module only
+    # and is not a whole-file span (v0.2.102 W6-LOWS, R3 C-4; MUST MATCH
+    # `is_whole_file_test_cfg` in launcher/src-tauri/tests/support/mod.rs).
+    for attr in _leading_inner_attrs(code):
+        if _INNER_CFG_ATTR_RE.match(attr) and _predicate_mentions_test_only(
+            [attr], 0, include_any_test=include_any_test,
         ):
             return [(1, len(raw))]
 
@@ -410,3 +455,42 @@ def cfg_test_item_resume_index(
         if first - 1 == gate_index:
             return last
     return None
+
+
+def production_source(
+    source: str, *, include_any_test: bool = False, strip_comments: bool = False,
+) -> str:
+    """``source`` with every test-gated ITEM blanked, line-for-line.
+
+    The answer to "what is the production text of this file?" for a lint that
+    scans it for a forbidden or required literal. Each line inside a span from
+    :func:`cfg_test_spans` becomes an empty string; every other line —
+    comments and string literals included — is reproduced verbatim, so the
+    caller still decides how to treat prose, and line numbers survive for
+    error reports.
+
+    v0.2.102 (W6-Z2): this replaces the "cut at the first ``#[cfg(test)]``"
+    idiom that a dozen gates (Rust ``content.find("#[cfg(test)]")`` /
+    ``split("mod tests")`` and their Python twins) used. That idiom stops at
+    whatever carries the marker text FIRST — a gated ``use``, a gated helper
+    fn, or a comment that merely quotes the marker — and every production line
+    below it goes unscanned, so the gate fails toward GREEN. Blanking per item
+    keeps everything after a gated item in scope and still removes the test
+    module, whose assertions quote the very needles the gate forbids.
+
+    An item that cannot be delimited is NOT blanked (fail closed, see
+    :func:`cfg_test_spans`): a lexer slip can only make a gate noisier, never
+    blind. ``include_any_test`` has the same meaning as there.
+
+    ``strip_comments=True`` additionally removes comments the way
+    :func:`strip_rust_comments` does (string literals stay verbatim), for a
+    gate whose needles may legitimately appear in prose.
+    """
+    gated = cfg_test_line_numbers(source, include_any_test=include_any_test)
+    lines = strip_rust_comments(source) if strip_comments else source.splitlines()
+    if not gated and not strip_comments:
+        return source
+    return "\n".join(
+        "" if n in gated else line
+        for n, line in enumerate(lines, start=1)
+    )

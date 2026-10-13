@@ -17,8 +17,9 @@
 // DESIGN §1.4 / R6).
 //
 // The engine entrypoint (`run_engine`) is NOT wired into `main()` — there is
-// no `EngineArgs::from_argv` dispatch in main.rs (proven by
-// `engine_entrypoint_is_not_wired_into_main`). v0.3.0 adds that dispatch
+// no `EngineArgs::from_argv` dispatch in main.rs (enforced by
+// `test_engine_entrypoint_is_not_wired_into_updater_main` in
+// `tests/test_v02102_rust_source_scan_gates.py`). v0.3.0 adds that dispatch
 // (`vct-updater --engine <plan.json>`); until then the engine exists only to
 // be unit-tested and audited.
 //
@@ -49,7 +50,8 @@
 // The orchestration AROUND the swap (the new unified part) is `run_plan`.
 
 // DORMANT in v0.2.60: the engine has NO live caller (no `--engine` dispatch
-// in main.rs — see `engine_entrypoint_is_not_wired_into_main`). dead_code is
+// in main.rs — see `test_engine_entrypoint_is_not_wired_into_updater_main`
+// in `tests/test_v02102_rust_source_scan_gates.py`). dead_code is
 // intentional until v0.3.0 wires the inverted entrypoint.
 #![allow(dead_code)]
 
@@ -455,8 +457,9 @@ fn python_cmd() -> String {
 /// the plan, then `run_plan` with the `RealRunner`.
 ///
 /// NOT marked `#[allow(dead_code)]` carelessly: it is genuinely unreachable in
-/// v0.2.60 by design, and the `engine_entrypoint_is_not_wired_into_main` test
-/// asserts main.rs contains no call to it.
+/// v0.2.60 by design, and `test_engine_entrypoint_is_not_wired_into_updater_main`
+/// (`tests/test_v02102_rust_source_scan_gates.py`) asserts main.rs contains no
+/// call to it.
 #[allow(dead_code)]
 pub fn run_engine(plan_path: &Path) -> Result<EngineRunResult, String> {
     let content = std::fs::read_to_string(plan_path)

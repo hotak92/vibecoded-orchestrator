@@ -297,6 +297,21 @@ def _noisy_migrations_dir(root: Path) -> Path:
         "print('EDGE_APPLIED=1')\n"
         "sys.exit(0)\n"
     )
+    # v0.2.102: canonical codegraph_collection is v8, so the ladder from the
+    # seeded v6 also walks a 7→8 edge (same noisy-stdout shape).
+    (d / "7_to_8.py").write_text(
+        "import sys\n"
+        "print('7_to_8: GuardPrefix_CodeInteraction has `project`; backfilled 0 row(s)')\n"
+        "print('EDGE_APPLIED=1')\n"
+        "sys.exit(0)\n"
+    )
+    # v0.2.102 W6-O: canonical is v9 — the ladder also walks 8→9.
+    (d / "8_to_9.py").write_text(
+        "import sys\n"
+        "print('8_to_9: GuardPrefix_CodeAPI carries `is_test` (present or added)')\n"
+        "print('EDGE_APPLIED=1')\n"
+        "sys.exit(0)\n"
+    )
     return root / "migrations"
 
 

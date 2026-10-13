@@ -25,14 +25,18 @@ if str(REPO_ROOT) not in sys.path:
 from vco_lib.codegraph_references import (  # noqa: E402
     NON_PROJECT_BASE_CLASSES,
     add_missing_reference_edges,
-    build_module_name_index,
     build_short_name_index,
     dedup_ref_targets,
     normalize_reference_targets,
     read_cross_reference,
     reference_target_uuids,
     resolve_base_class_targets,
-    resolve_import_target_path,
+)
+# v0.2.102 W6-O: import resolution moved to its own, language-aware home; the
+# Python rule these tests pin is unchanged (now scoped to Python modules).
+from vco_lib.codegraph_imports import (  # noqa: E402
+    build_import_index,
+    resolve_import_targets,
 )
 
 _CrossReference = pytest.importorskip(
@@ -333,26 +337,26 @@ def test_short_name_index_groups_by_last_segment() -> None:
 
 
 def test_module_name_index_indexes_stem_and_dotted_tail() -> None:
-    index = build_module_name_index(["src/foo/bar.py", "top.py"])
-    assert index["bar"] == ["src/foo/bar.py"]
-    assert index["foo.bar"] == ["src/foo/bar.py"]
-    assert index["top"] == ["top.py"]
+    names = build_import_index(["src/foo/bar.py", "top.py"]).names["python"]
+    assert names["bar"] == ["src/foo/bar.py"]
+    assert names["foo.bar"] == ["src/foo/bar.py"]
+    assert names["top"] == ["top.py"]
     # A single-segment path has no dotted form to index.
-    assert "top.top" not in index
+    assert "top.top" not in names
 
 
 def test_resolve_import_prefers_the_name_as_written() -> None:
-    index = {"foo.bar": ["src/foo/bar.py"], "bar": ["other/bar.py"]}
-    assert resolve_import_target_path("foo.bar", index) == "src/foo/bar.py"
+    index = build_import_index(["other/bar.py", "src/foo/bar.py"])
+    assert resolve_import_targets("app.py", "foo.bar", index) == ["src/foo/bar.py"]
 
 
 def test_resolve_import_falls_back_to_the_last_component() -> None:
-    index = {"bar": ["src/foo/bar.py"]}
-    assert resolve_import_target_path("pkg.deep.bar", index) == "src/foo/bar.py"
+    index = build_import_index(["src/foo/bar.py"])
+    assert resolve_import_targets("app.py", "pkg.deep.bar", index) == ["src/foo/bar.py"]
 
 
 def test_resolve_import_unknown_name_is_none() -> None:
-    assert resolve_import_target_path("os.path", {}) is None
+    assert resolve_import_targets("app.py", "os.path", build_import_index([])) == []
 
 
 def test_resolve_bases_exact_match_wins() -> None:

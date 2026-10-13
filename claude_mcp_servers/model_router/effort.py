@@ -52,7 +52,12 @@ Every vendor measured either ignores it (z.ai: probe-identical at 512 and 8192
 — ``zai-budget-{512,8192}.body``) or deprecates it in favour of
 ``output_config.effort`` (QwenCloud, DeepSeek). None REJECTS it, so there is
 no failure to prevent and no honest integer→integer mapping to apply; the
-gateway leaves it exactly as the client sent it.
+gateway leaves it exactly as the client sent it. The OTHER per-row thinking
+knob, ``thinking.clear_thinking`` (v0.2.102 A8), is a different mechanism
+with a different home: a cited per-row SEED field read by
+:meth:`model_router.context_table.ContextTable.clear_thinking` and applied in
+``server.py`` (:func:`model_router.server._apply_clear_thinking`) — it shapes
+the param, it does not translate a value.
 
 Vendor-doc backing (re-checked 2026-10-03/04; the URL is cited per row):
 
@@ -71,6 +76,10 @@ Vendor-doc backing (re-checked 2026-10-03/04; the URL is cited per row):
   https://docs.z.ai/guides/capabilities/thinking
   (``medium`` is NOT in the documented set but was ACCEPTED live — HTTP 200 —
   so it is recorded as accepted and never rewritten.)
+* Kimi Code (k3): low/high/max; the vendor maps
+  ``medium``→``high`` and ``xhigh``→``max`` itself and 400s only on values
+  outside its documented list (read 2026-10-07, not yet probed live).
+  https://www.kimi.com/code/docs/kimi-code/models.html
 """
 
 from __future__ import annotations
@@ -201,6 +210,30 @@ EFFORT_POLICIES: Mapping[tuple[str, str], EffortPolicy] = {
             "(z.ai thinking guide); nothing is rewritten."
         ),
     ),
+    # ── Kimi Code route (doc-only, read 2026-10-07; no live capture yet) ──
+    # The vendor documents an effort mapping for third-party tools that
+    # ACCEPTS every value Claude Code sends and collapses two of them itself
+    # ("ultra / max / xhigh → max", "high / medium → high",
+    # "low / minimum / light → low"; "其它未知取值 → HTTP 400"). So nothing is
+    # rejected and nothing is rewritten — the collapses are recorded as data.
+    # Only k3 is offered (owner ruling 2026-10-07, see the kimi vendor row),
+    # so only it carries a row. The live /v1/models probe (2026-10-07) agrees:
+    # think_efforts valid low/high/max, default_effort high.
+    ("kimi", "k3"): EffortPolicy(
+        accepted=frozenset({"low", "medium", "high", "xhigh", "max"}),
+        translate={},
+        collapses={"medium": "high", "xhigh": "max"},
+        doc_url="https://www.kimi.com/code/docs/kimi-code/models.html",
+        note=(
+            "Kimi models page, 'effort 映射' table: low/high/max are the "
+            "model's levels (k3 default high); medium collapses to high and "
+            "xhigh to max vendor-side; only values outside the documented "
+            "list return HTTP 400, and Claude Code sends none of those. The "
+            "live /v1/models probe (2026-10-07) confirms the levels and the "
+            "high default; that medium/xhigh are ACCEPTED on /v1/messages is "
+            "documented, not yet probed live."
+        ),
+    ),
 }
 
 
@@ -249,10 +282,51 @@ def translate_effort(
     return new_payload, True
 
 
+def requested_effort(payload: Any) -> Optional[str]:
+    """The effort selector one payload carries, in the spelling it carries it.
+
+    The OBSERVABILITY reader behind the access line's and the usage ledger's
+    ``effort_requested`` / ``effort_forwarded`` fields (v0.2.102, register
+    item 2026-10-10): Claude Code puts its selector in ONE of two places
+    depending on the build (see the module docstring), and this answers
+    whichever is present —
+
+    * ``output_config.effort`` — returned verbatim (a string like ``medium``);
+    * ``thinking.budget_tokens`` — the older spelling, returned as
+      ``budget_tokens=<n>`` so the recorded field stays a string and the two
+      spellings can never be confused with each other;
+    * neither — ``None``, which the ledger stores as ``null``. Never a guess
+      and never a default: an absent selector is an observation about the
+      client build, not a hole to fill.
+
+    The SAME reader serves both directions of the observation: called on the
+    client's parsed body it is what was REQUESTED; called on the forwarded
+    payload (after :func:`translate_effort` and the other shaping passes) it
+    is what was FORWARDED — so the two can only ever disagree through a
+    rewrite the gateway actually made, which is precisely what the pair
+    exists to make visible.
+    """
+    if not isinstance(payload, dict):
+        return None
+    output_config = payload.get("output_config")
+    if isinstance(output_config, dict):
+        effort = output_config.get("effort")
+        if isinstance(effort, str) and effort:
+            return effort
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict):
+        budget = thinking.get("budget_tokens")
+        # bool is an int subclass; True is not a token budget.
+        if isinstance(budget, int) and not isinstance(budget, bool):
+            return f"budget_tokens={budget}"
+    return None
+
+
 __all__ = [
     "EFFORT_POLICIES",
     "EFFORT_VALUES",
     "EffortPolicy",
     "effort_policy",
+    "requested_effort",
     "translate_effort",
 ]

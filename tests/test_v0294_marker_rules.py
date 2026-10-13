@@ -42,10 +42,17 @@ def _vendor_ids(vendor_id: str, vendor: Vendor) -> list[str]:
     the row's declared ids win over the shipped snapshot block, so a vendor
     whose fallback is its own row (a no-discovery row, or a ``catalog_url``
     row in its keyless/fetch-failed moment) is covered from there, not from
-    a snapshot block it deliberately does not have."""
-    if vendor.static_ids:
-        return list(vendor.static_ids)
-    return _static_families().get(vendor_id, [])
+    a snapshot block it deliberately does not have.
+
+    A ``forward_verified_only`` row (v0.2.102) is narrowed to its
+    ``verified_ids``: the picker withholds the rest of its snapshot block,
+    and the router REFUSES them by design (its endpoint answers any name with
+    200), so they are not ids a user can be handed."""
+    ids = list(vendor.static_ids) or _static_families().get(vendor_id, [])
+    if vendor.forward_verified_only:
+        verified = {v.lower() for v in vendor.verified_ids}
+        ids = [i for i in ids if i.lower() in verified]
+    return ids
 
 
 class ShippedCatalogRoutingTests(unittest.TestCase):

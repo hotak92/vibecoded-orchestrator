@@ -52,9 +52,11 @@ this module must therefore exercise the REAL
 ``weaviate.collections.classes.internal._CrossReference``; see
 ``tests/test_v0292_codegraph_reference_normalise.py``.
 
-Beyond the read path this module also owns the analyzer's pure edge
-RESOLUTION (name → target id) and the add-if-absent WRITE — see the section
-banners below. Those moved out of ``analyze_code_graph.py`` in v0.2.92: the
+Beyond the read path this module also owns the analyzer's pure call/base
+edge RESOLUTION (name → target id) and the add-if-absent WRITE — see the
+section banners below. IMPORT resolution (import name → module path) moved to
+``vco_lib.codegraph_imports`` in v0.2.102 W6-O, where it became
+language-aware. Those moved out of ``analyze_code_graph.py`` in v0.2.92: the
 analyzer is a 7.3k-line bundled template script where the same logic could not
 be unit-tested, and the repo's ratchet on that file is downward-only.
 
@@ -64,8 +66,7 @@ in any environment and its tests need no client.
 from __future__ import annotations
 
 import re
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 __all__ = [
     "normalize_reference_targets",
@@ -74,9 +75,7 @@ __all__ = [
     "dedup_ref_targets",
     "add_missing_reference_edges",
     "build_short_name_index",
-    "build_module_name_index",
     "resolve_base_class_targets",
-    "resolve_import_target_path",
     "NON_PROJECT_BASE_CLASSES",
 ]
 
@@ -117,22 +116,6 @@ def build_short_name_index(full_names: Iterable[str]) -> Dict[str, List[str]]:
     return index
 
 
-def build_module_name_index(paths: Iterable[str]) -> Dict[str, List[str]]:
-    """``import name -> [module paths]``.
-
-    Each path is indexed twice: by stem (``src/foo/bar.py`` → ``bar``) and by
-    its last two dotted segments (→ ``foo.bar``), so both ``import bar`` and
-    ``import foo.bar`` resolve.
-    """
-    index: Dict[str, List[str]] = {}
-    for path in paths:
-        index.setdefault(Path(path).stem, []).append(path)
-        parts = Path(path).with_suffix("").parts
-        if len(parts) > 1:
-            index.setdefault(".".join(parts[-2:]), []).append(path)
-    return index
-
-
 def resolve_base_class_targets(
     signature: str,
     class_cache: Mapping[str, str],
@@ -161,21 +144,6 @@ def resolve_base_class_targets(
             continue
         out.append(class_cache[candidates[0]])
     return out
-
-
-def resolve_import_target_path(
-    imp_name: str, module_name_to_path: Mapping[str, List[str]]
-) -> Optional[str]:
-    """Module path an import name points at, or ``None``.
-
-    Tries the name as written, then its last dotted component (``foo.bar`` →
-    ``bar``). First candidate wins — cross-ref linking is best-effort and a
-    name shared by two modules resolves to A valid row.
-    """
-    candidates = module_name_to_path.get(imp_name, [])
-    if not candidates:
-        candidates = module_name_to_path.get(imp_name.rsplit(".", 1)[-1], [])
-    return candidates[0] if candidates else None
 
 
 def normalize_reference_targets(value: Any) -> List[Any]:

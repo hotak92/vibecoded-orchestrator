@@ -9,7 +9,9 @@
 // off" rather than a checkbox that silently lies.
 
 import { readFileSync } from 'node:fs';
+import { parse } from 'svelte/compiler';
 import { describe, expect, it } from 'vitest';
+import { isIdent, walk } from '../test-support/wiring-ast';
 import {
   ASYNC_DISABLED_KEY,
   ASYNC_SUBHOOK_DESCRIPTIONS,
@@ -35,6 +37,8 @@ import {
   parseAsyncDisabled,
   parseTimeoutSeconds,
   registerBlockedReason,
+  routedSubhookNote,
+  routedSubhookStem,
   settingsErrorBanner,
   stateLabel,
   stateTooltip,
@@ -103,6 +107,21 @@ describe('state labels and tooltips are specific, not generic', () => {
     const t = stateTooltip('disabled', SETTINGS);
     expect(t).toMatch(/restores it exactly/);
     expect(t).toMatch(/script file was not touched/);
+  });
+
+  it('says a disable also keeps the hook off on an event an update newly ships it on', () => {
+    // v0.2.102 review R9 F3 — vco_lib.parked_hooks.find_parked_match (live_identities).
+    const t = stateTooltip('disabled', SETTINGS);
+    expect(t).toMatch(/ships it on a new event keeps that one off too/);
+  });
+
+  it('says a carried event gets its own row, not that it waits for the next update', () => {
+    // v0.2.102 lane W6-HTAB — the tab load parks each carried registration as
+    // its own row (park_carried_registrations), so the old "after you
+    // re-enable it here, the next bundle update adds it" is no longer true.
+    const t = stateTooltip('disabled', SETTINGS);
+    expect(t).toMatch(/gets its own Disabled row here/);
+    expect(t).not.toMatch(/next bundle update/);
   });
 
   it('tells the orphan story honestly: it does not run and cannot be restored', () => {
@@ -428,7 +447,7 @@ describe('async sub-hook toggles — list semantics', () => {
   it('tells whether a stem is off — exact stems only', () => {
     expect(isAsyncSubhookDisabled('a,b', 'b')).toBe(true);
     expect(isAsyncSubhookDisabled('a,b', 'c')).toBe(false);
-    expect(isAsyncSubhookDisabled('post-file', 'post-file-delete')).toBe(false);
+    expect(isAsyncSubhookDisabled('post-git', 'post-git-commit-kg-sync')).toBe(false);
   });
 
   it('computes the value to persist; null REMOVES the key', () => {
@@ -441,8 +460,8 @@ describe('async sub-hook toggles — list semantics', () => {
   });
 
   it('confirms with what changed', () => {
-    expect(asyncSubhookToastText('post-file-delete', true)).toMatch(/skipped/);
-    expect(asyncSubhookToastText('post-file-delete', false)).toMatch(/runs again/);
+    expect(asyncSubhookToastText('kg-update-nudge', true)).toMatch(/skipped/);
+    expect(asyncSubhookToastText('kg-update-nudge', false)).toMatch(/runs again/);
   });
 
   it('explains the channel and the carried-over pre-merge disables', () => {
@@ -593,5 +612,72 @@ describe('lean-ctx toggle — HooksTab wiring (structural)', () => {
 
   it('shows the accurate hint text', () => {
     expect(svelte).toContain('LEAN_CTX_HINT');
+  });
+});
+
+describe('routed sub-hook note on a disabled row (v0.2.102 W6-HTAB)', () => {
+  const dispatcher = hook({
+    event: 'PostToolUse',
+    matcher: '',
+    command: 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-tool-use-async.sh"',
+  });
+  const drain = hook({
+    event: 'SessionEnd',
+    matcher: '',
+    command: 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-drain-citations.sh"',
+    state: 'disabled',
+  });
+
+  it('names the stem only as a .claude/hooks script file, on both OS spellings', () => {
+    expect(routedSubhookStem(drain.command)).toBe('stop-drain-citations');
+    expect(
+      routedSubhookStem(
+        'powershell -NoProfile -File "${CLAUDE_PROJECT_DIR}\\.claude\\hooks\\stop-drain-citations.ps1"',
+      ),
+    ).toBe('stop-drain-citations');
+    expect(routedSubhookStem('bash .claude/hooks/post-git.sh')).toBeNull();
+    expect(routedSubhookStem('bash .claude/hooks/notify-stop.sh')).toBeNull();
+  });
+
+  it('points a disabled routed hook at its separate dispatcher switch', () => {
+    const note = routedSubhookNote(drain, [dispatcher, drain]);
+    expect(note).toMatch(/also runs stop-drain-citations/);
+    expect(note).toMatch(/its own switch/);
+  });
+
+  it('says nothing for a running row, a non-routed hook, or without the dispatcher', () => {
+    expect(routedSubhookNote({ ...drain, state: 'active' }, [dispatcher, drain])).toBe('');
+    const other = hook({ state: 'disabled', command: 'bash .claude/hooks/notify-stop.sh' });
+    expect(routedSubhookNote(other, [dispatcher, other])).toBe('');
+    expect(routedSubhookNote(drain, [drain])).toBe('');
+  });
+
+  it('is wired into a row `title` of HooksTab.svelte (parsed, not grepped)', () => {
+    // Svelte-compiler AST, so a mention in a comment or string cannot
+    // satisfy it (the wiring-ast shape mcp-tab.wiring.test.ts uses).
+    const ast = parse(
+      readFileSync(new URL('./HooksTab.svelte', import.meta.url), 'utf8'),
+      { modern: true },
+    ) as unknown;
+    const titled = [...walk(ast)].filter(
+      (n) => n.type === 'Attribute' && n.name === 'title',
+    );
+    const calls = titled.flatMap((attr) =>
+      [...walk(attr.value)].filter(
+        (n) => n.type === 'CallExpression' && isIdent(n.callee, 'routedSubhookNote'),
+      ),
+    );
+    expect(calls.length).toBe(1);
+  });
+
+  it('every carried event renders as its own toggleable Disabled row', () => {
+    // The backend lists one row per (hook, event); each must carry a live
+    // toggle so Enable restores exactly that registration.
+    const rows = ['Stop', 'SubagentStop', 'SessionEnd'].map((event) => ({ ...drain, event }));
+    for (const r of rows) {
+      expect(isChecked(r)).toBe(false);
+      expect(canToggle(r, true)).toBe(true);
+      expect(stateLabel(r.state)).toBe('Disabled');
+    }
   });
 });

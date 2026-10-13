@@ -197,7 +197,7 @@ def select_code_embedding_backend(
           shouldn't tier-up to qwen3 — qwen3-embedding on CPU-only
           Ollama is ~30s per embedding even at the boundary, confirmed
           on a contributor's 24 GB Windows box. Cores threshold stays >=8 but
-          now counts PHYSICAL cores via `_probe_cpu_cores` — see its
+          now counts PHYSICAL cores via `vco_lib.host_probe.probe_cpu_cores` — see its
           docstring for the SMT-counting fix.)
         - else → Jina
       OpenAI: optional override (caller passes prefer_openai=True), not
@@ -241,7 +241,7 @@ def select_code_embedding_backend(
     # 24 GB shouldn't tier-up to qwen3 — qwen3-embedding on CPU-only
     # Ollama is ~30s per embedding even at the boundary. cores
     # comparison stays `>=8` but now counts PHYSICAL cores (see
-    # `_probe_cpu_cores` docstring for the v0.2.49 SMT-counting fix).
+    # `vco_lib.host_probe.probe_cpu_cores` docstring for the v0.2.49 SMT-counting fix).
     if _cpu_meets(ram_gb, cores, min_ram=24.0, min_cores=8, strict_ram=True):
         return _CODE_BACKEND_QWEN3
     return _CODE_BACKEND_JINA
@@ -272,7 +272,7 @@ def select_kg_embedding_backend(
           exactly 24 GB shouldn't tier-up to qwen3 — qwen3-embedding
           on CPU-only Ollama is ~30s per embedding at the boundary,
           confirmed on a contributor's 24 GB Windows box. Cores threshold stays
-          `>=8` but now counts PHYSICAL cores via `_probe_cpu_cores`
+          `>=8` but now counts PHYSICAL cores via `vco_lib.host_probe.probe_cpu_cores`
           — see its docstring for the SMT-counting fix.)
         - else → arctic2
       OpenAI: optional, not auto-selected.
@@ -286,7 +286,7 @@ def select_kg_embedding_backend(
         gpu_vram_gb: Detected VRAM (GB). 0.0 means "no usable GPU".
         ram_gb:      System RAM (GB).
         cores:       Physical CPU cores (v0.2.49 — was logical/SMT;
-                     see `_probe_cpu_cores` docstring for the switch).
+                     see `vco_lib.host_probe.probe_cpu_cores` docstring for the switch).
         openai_key_available: True if an OpenAI API key is configured.
         prefer_openai: True when the caller wants OpenAI explicitly.
 
@@ -313,6 +313,16 @@ def select_kg_embedding_backend(
     if _cpu_meets(ram_gb, cores, min_ram=24.0, min_cores=8, strict_ram=True):
         return _KG_BACKEND_QWEN3
     return _KG_BACKEND_ARCTIC
+
+
+#: The local summary tiers' thresholds — the ONE table: the selector below
+#: decides with them and :func:`summary_model_tiers` describes them (the
+#: launcher's Preferences hint renders that description), so the two cannot
+#: drift (v0.2.102 W5-D).
+SUMMARY_VRAM_QWEN35_9B_GB = 16.0
+SUMMARY_VRAM_GEMMA_GB = 6.0
+SUMMARY_CPU_MIN_RAM_GB = 12.0
+SUMMARY_CPU_MIN_CORES = 6
 
 
 def select_summary_backend(
@@ -378,16 +388,17 @@ def select_summary_backend(
     vram = float(gpu_vram_gb or 0.0)
 
     # GPU tiers.
-    if vram >= 16.0:
+    if vram >= SUMMARY_VRAM_QWEN35_9B_GB:
         return _SUMMARY_BACKEND_QWEN35_9B
-    if vram >= 6.0:
+    if vram >= SUMMARY_VRAM_GEMMA_GB:
         return _SUMMARY_BACKEND_GEMMA
 
     # CPU tier (only when GPU is sub-6 GB or absent).
     # NOTE: inclusive (`>=`) RAM boundary here — a 12 GB host CAN run
     # gemma4:e4b — unlike the code/KG selectors' strict-> 24 GB rule.
     # `strict_ram=False` parameterises that distinction. See `_cpu_meets`.
-    if _cpu_meets(ram_gb, cores, min_ram=12.0, min_cores=6, strict_ram=False):
+    if _cpu_meets(ram_gb, cores, min_ram=SUMMARY_CPU_MIN_RAM_GB,
+                  min_cores=SUMMARY_CPU_MIN_CORES, strict_ram=False):
         return _SUMMARY_BACKEND_GEMMA
 
     # No local path viable. Last resort: OpenAI, only if the user
@@ -396,6 +407,47 @@ def select_summary_backend(
         return _SUMMARY_BACKEND_OPENAI
 
     return None
+
+
+#: The always-fits local generation model: the floor of the summary tier
+#: table below, pulled by install when no local tier fits (v0.2.100).
+SUMMARY_FLOOR_MODEL = "qwen3.5:0.8b"
+
+
+def summary_model_for_hardware(gpu_vram_gb: float, ram_gb: float, cores: int) -> str:
+    """The ONE local text-generation model a host's hardware tier uses —
+    the model install pulls AND the model the runtime summary ladder asks
+    Ollama for (v0.2.102 W5-D: one table, both callers).
+
+    Derived from :func:`select_summary_backend`'s LOCAL tiers (CLI and
+    OpenAI are not Ollama models, so they are taken as absent):
+    ``qwen3.5:9b`` (VRAM >= 16 GB), ``gemma4:e4b`` (VRAM >= 6 GB, or a
+    capable CPU), else :data:`SUMMARY_FLOOR_MODEL`."""
+    pick = select_summary_backend(
+        gpu_vram_gb=gpu_vram_gb, ram_gb=ram_gb, cores=cores,
+        claude_cli_available=False, openai_consent=False, openai_key_available=False)
+    if pick in (_SUMMARY_BACKEND_QWEN35_9B, _SUMMARY_BACKEND_GEMMA):
+        return pick
+    return SUMMARY_FLOOR_MODEL
+
+
+def summary_model_tiers() -> list:
+    """The local generation tiers as data, strongest first: ``[{"model",
+    "when"}]`` — built from the SAME thresholds :func:`select_summary_backend`
+    decides with, for surfaces that must name the tier models (the launcher's
+    "No Ollama models installed" hint). Pinned against
+    :func:`summary_model_for_hardware` by test."""
+    def gb(v: float) -> str:
+        return f"{v:g} GB"
+
+    return [
+        {"model": _SUMMARY_BACKEND_QWEN35_9B,
+         "when": f"{gb(SUMMARY_VRAM_QWEN35_9B_GB)}+ VRAM"},
+        {"model": _SUMMARY_BACKEND_GEMMA,
+         "when": (f"{gb(SUMMARY_VRAM_GEMMA_GB)}+ VRAM, or a CPU with "
+                  f"{gb(SUMMARY_CPU_MIN_RAM_GB)}+ RAM and {SUMMARY_CPU_MIN_CORES}+ cores")},
+        {"model": SUMMARY_FLOOR_MODEL, "when": "any other machine"},
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────

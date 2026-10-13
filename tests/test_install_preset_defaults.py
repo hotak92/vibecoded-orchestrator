@@ -420,6 +420,52 @@ class WritePresetDefaultsTests(unittest.TestCase):
             self.assertFalse(data.get("text_inserted"))
             self.assertTrue(data.get("code_inserted"))
 
+    # v0.2.102 W6-R: the preset step also seeds the ONE global embedding
+    # profile (`embedding.active_profile`) — only when it is absent.
+
+    def test_seeds_active_profile_when_absent(self):
+        for preset, expected in (("gpu", "qwen3"), ("low_resource", "arctic")):
+            with self.subTest(preset=preset), _LogFixture() as log_fix, _DbFixture() as db_fix:
+                _create_db_with_app_state(db_fix.db_path)
+                install._write_preset_defaults_to_app_state(
+                    dict(install.EMBEDDING_CONFIGS[preset]),
+                    openai_set_as_default=False,
+                )
+                state = _read_app_state(db_fix.db_path)
+                self.assertEqual(state.get("embedding.active_profile"), expected)
+                data = log_fix.events_for_step("preset_defaults")[0].get("data", {})
+                self.assertEqual(data.get("active_profile"), expected)
+                self.assertTrue(data.get("profile_inserted"))
+
+    def test_existing_active_profile_is_never_overwritten(self):
+        # The user picked a profile in Preferences: the preset must not touch it.
+        with _LogFixture() as log_fix, _DbFixture() as db_fix:
+            _create_db_with_app_state(db_fix.db_path)
+            set_app_state(db_fix.db_path, "embedding.active_profile", "arctic")
+            install._write_preset_defaults_to_app_state(
+                dict(install.EMBEDDING_CONFIGS["gpu"]),
+                openai_set_as_default=False,
+            )
+            state = _read_app_state(db_fix.db_path)
+            self.assertEqual(state.get("embedding.active_profile"), "arctic")
+            # The other defaults are still seeded around it.
+            self.assertEqual(state.get("default_text_embedding"), "qwen3-embedding:0.6b")
+            data = log_fix.events_for_step("preset_defaults")[0].get("data", {})
+            self.assertFalse(data.get("profile_inserted"))
+
+    def test_unmapped_text_model_seeds_no_profile(self):
+        # A model the shared model→profile table does not know seeds NOTHING
+        # (never a guessed profile — the wrong slot indexes the wrong vector).
+        with _LogFixture(), _DbFixture() as db_fix:
+            _create_db_with_app_state(db_fix.db_path)
+            install._write_preset_defaults_to_app_state(
+                {"active_embedding": "custom", "text_model": "some-unknown-model:1b",
+                 "code_model": "codesage-large-v2"},
+                openai_set_as_default=False,
+            )
+            state = _read_app_state(db_fix.db_path)
+            self.assertNotIn("embedding.active_profile", state)
+
     def test_never_raises_on_arbitrary_sqlite_error(self):
         # Pass an embed_config with no `text_model` / `code_model`
         # keys — helper falls back to qwen3 defaults; not a crash case

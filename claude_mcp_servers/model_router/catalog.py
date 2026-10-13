@@ -100,6 +100,12 @@ from .vendors import (
 
 logger = logging.getLogger(__name__)
 
+#: The request header a client's identity travels in. Relayed onto the vendor
+#: model-list fetch a client's ``/v1/models`` triggers (see
+#: :meth:`CatalogService.union`); the server reads the client's value under
+#: the same name.
+USER_AGENT_HEADER = "User-Agent"
+
 #: Shipped snapshot, beside this module (so it travels inside the wheel).
 STATIC_CATALOG_PATH = Path(__file__).resolve().parent / "static_catalog.json"
 
@@ -581,7 +587,9 @@ def _window_qualifier(*, window: Optional[int], one_m_row: bool) -> str:
 
     The band between (a window above the default but below 1M, on a plain
     row) is deliberately silent: the client under-budgets there, but there is
-    no second row to point at — this module only advertises ``[1m]`` at 1M —
+    no second row to point at — this module advertises ``[1m]`` only at a
+    full 1M or on a row whose flag curates a sub-1M real ceiling into the
+    companion (v0.2.102: a live-verified 983,616 ceiling on a cited row) —
     and neither sentence above would be true of it.
     """
     usable = _positive(window)
@@ -634,25 +642,43 @@ def _warn_on_table_disagreement(
     disagree, and the disagreement is invisible: the flag used to decide the
     advert on its own, so a row reading ``{context_window: 200000,
     window_1m: true}`` advertised a 1M variant of a 200K model and nothing
-    said so. The advert now follows the WINDOW — the number that is cited —
-    and the contradiction is reported rather than resolved silently.
+    said so.
+
+    Since v0.2.102 the flag and the window answer DIFFERENT questions and
+    need not be equal: the window is the model's real ceiling (a cited row
+    can carry a live-verified 983,616 where the page's architectural figure
+    is 1M) and the flag says "budget ~1M, not the 200K default" — true at
+    983,616. The advert follows the FLAG for a row the table names (the
+    curated decision) and the WINDOW otherwise. What is still a
+    contradiction, both directions
+    of it, is reported rather than resolved silently:
+
+    * the flag ON with a window at or below the client's 200K default — the
+      5x overstatement this check was built for, unchanged;
+    * the flag OFF with a window of a full 1M or more — an understatement
+      that hides the ``[1m]`` row the user is paying for, unchanged.
     """
     row = table.lookup(bare_id, vendor_id)
     if row is None:
         return
-    derived = (window or 0) >= ONE_M_WINDOW
-    if row.window_1m == derived:
+    overstates = row.window_1m and row.context_window <= CLIENT_DEFAULT_WINDOW
+    understates = (
+        not row.window_1m and row.context_window >= ONE_M_WINDOW
+    )
+    if not overstates and not understates:
         return
     _log_once(
         LOG_ONCE_WINDOW_DISAGREEMENT,
         bare_id,
         logging.WARNING,
         "model-gateway: chat-model context row %r says window_1m=%s but "
-        "context_window=%s; the advertised %s suffix follows the WINDOW "
-        "(%s). Fix the row in %s — one of the two fields is wrong.",
+        "context_window=%s; the advertised %s suffix follows the flag for a "
+        "tabulated row, and this pair is wrong: %s. Fix the row in %s — "
+        "one of the two fields is wrong.",
         bare_id, row.window_1m, row.context_window,
         ONE_M_DISPLAY_SUFFIX.strip(),
-        "advertised" if derived else "withheld",
+        "a 1M flag on a default-window model" if overstates
+        else "a 1M window the flag hides",
         table.path,
     )
 
@@ -807,7 +833,26 @@ def _publish_family(
     candidates: list[_Candidate] = []
     for entry in entries:
         answer = resolved[entry.id]
-        one_m = (answer.window or 0) >= ONE_M_WINDOW
+        # The [1m] advert. A window of a full 1M always earns the companion;
+        # BELOW 1M the row's own FLAG is what earns it, and only when the
+        # window is genuinely beyond the client's 200K default. That middle
+        # band is v0.2.102's case: a cited row's real ceiling can be a
+        # live-verified 983,616 where the page's architectural figure is 1M,
+        # and the flag says "budget ~1M, not 200K" — true at 983,616, so the
+        # companion stays. The ``> CLIENT_DEFAULT_WINDOW`` guard keeps the
+        # overstate contradiction protected: a 1M flag on a 200K row still
+        # publishes no companion and still warns
+        # (:func:`_warn_on_table_disagreement`).
+        row = table.lookup(
+            parts[entry.id].bare_id,
+            vendor.vendor_id if vendor is not None else None,
+        )
+        window_pos = answer.window or 0
+        one_m = window_pos >= ONE_M_WINDOW or (
+            row is not None
+            and bool(row.window_1m)
+            and window_pos > CLIENT_DEFAULT_WINDOW
+        )
         if vendor is not None and entry.id.lower() in hide:
             # Curated-hidden spells the id the way the picker would have
             # advertised it ([1m] when the resolved window is 1M), mirroring
@@ -1162,7 +1207,15 @@ class CatalogService:
                 CatalogEntry(
                     id=model_id,
                     display_name=str(row.get("display_name") or model_id),
-                    max_input_tokens=cls._upstream_int(row.get("max_input_tokens")),
+                    # Anthropic's list names the window ``max_input_tokens``;
+                    # an OpenAI-style list (one vendor row's) names it
+                    # ``context_length``. Same quantity, the publisher's own
+                    # figure — read the second only when the first is absent,
+                    # and still BELOW a cited table row (``resolve_window``).
+                    max_input_tokens=(
+                        cls._upstream_int(row.get("max_input_tokens"))
+                        or cls._upstream_int(row.get("context_length"))
+                    ),
                     max_tokens=cls._upstream_int(row.get("max_tokens")),
                     created_at=(
                         created_at.strip()
@@ -1203,7 +1256,9 @@ class CatalogService:
         self._cache[self._anthropic.family_id] = result
         return result
 
-    async def _vendor_entries(self, vendor: Vendor) -> _FamilyCache:
+    async def _vendor_entries(
+        self, vendor: Vendor, user_agent: Optional[str] = None,
+    ) -> _FamilyCache:
         cached = self._fresh(vendor.vendor_id)
         if cached is not None:
             return cached
@@ -1230,13 +1285,21 @@ class CatalogService:
             else:
                 # Not None here: the no-discovery branch above returned.
                 url = f"{vendor.upstream}{vendor.catalog_path}"
-            payload = await self._fetch_json(
-                url,
-                {
-                    vendor.auth_header: f"{vendor.auth_scheme}{key}",
-                    "anthropic-version": DEFAULT_ANTHROPIC_VERSION,
-                },
-            )
+            headers = {
+                vendor.auth_header: f"{vendor.auth_scheme}{key}",
+                "anthropic-version": DEFAULT_ANTHROPIC_VERSION,
+            }
+            if user_agent:
+                # The CLIENT's user-agent, relayed — never one this process
+                # makes up. The fetch exists because a client asked for the
+                # picker, so it goes out as that client, exactly like the
+                # /v1/messages relay. Load-bearing for a vendor whose edge
+                # refuses library user-agents (see that vendor's row in
+                # ``vendors.py``); without a client value the HTTP library's
+                # default goes out and such a vendor falls back to its
+                # declared list.
+                headers[USER_AGENT_HEADER] = user_agent
+            payload = await self._fetch_json(url, headers)
         entries = self._parse_models(payload)
         if entries and vendor.catalog_exclude_prefixes:
             entries = _exclude_by_prefix(
@@ -1273,6 +1336,7 @@ class CatalogService:
         table: ContextTable,
         catalog_filter: str = DEFAULT_CATALOG_FILTER,
         window_rows: str = DEFAULT_WINDOW_ROWS,
+        user_agent: Optional[str] = None,
     ) -> CatalogUnion:
         """Build the picker list.
 
@@ -1312,6 +1376,12 @@ class CatalogService:
         publishes everything, which is the escape hatch for anyone who needs
         a previous version and the reason the filter is a knob rather than a
         rule.
+
+        ``user_agent`` is the user-agent of the client request that asked for
+        the picker. Each VENDOR model-list fetch this call makes carries it
+        (a cache hit makes none), so the gateway's own fetch reaches the
+        vendor as the client it is acting for. ``None`` sends no header and
+        leaves the HTTP library's default in place.
         """
         sources: dict[str, str] = {}
         entries: list[CatalogEntry] = []
@@ -1330,7 +1400,7 @@ class CatalogService:
         vendors = list(self._vendors.values())
         first, *vendor_families = await asyncio.gather(
             self._anthropic_entries(),
-            *(self._vendor_entries(vendor) for vendor in vendors),
+            *(self._vendor_entries(vendor, user_agent) for vendor in vendors),
         )
 
         sources[self._anthropic.family_id] = first.source
@@ -1489,6 +1559,7 @@ __all__ = [
     "CatalogUnion",
     "FamilyFloor",
     "JsonFetcher",
+    "USER_AGENT_HEADER",
     "WindowResolution",
     "describe_row",
     "resolve_family_windows",

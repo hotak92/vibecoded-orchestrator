@@ -321,6 +321,10 @@ def _drive_single(analyzer_mod, inst, base, current, floor, stored_rev):
     coll.query.stored[det] = {
         "content_hash": stored_hash, "embed_revision": stored_rev,
         "total_chunks": 1,
+        # v0.2.102 W6-O: a post-v0.2.82 row carries its hash-excluded anchor
+        # metadata, so the skipped-row heal has nothing to add (a legacy row
+        # without it is covered by tests/test_v02102_w6o_codegraph_imports.py).
+        "file_path": "src/a.py", "is_test": False,
     }
     calls = {"n": 0}
 
@@ -660,7 +664,7 @@ def test_T7_module_write_failure_preserves_file(analyzer_mod):
             "src/broken.py", "python", 1, 1.0,
             datetime.now(tz=timezone.utc), "hash", [], "summary",
         )
-    assert "src/broken.py" not in inst._prune_walked_paths, (
+    assert not any(p == "src/broken.py" for _src, p in inst._prune_walked_paths), (
         "a file whose module write RAISED must stay OUT of the walked set "
         "(preserve set), never pruned (rider b)"
     )
@@ -683,7 +687,8 @@ def test_T7_module_write_success_marks_walked(analyzer_mod):
         "src/ok.py", "python", 1, 1.0,
         datetime.now(tz=timezone.utc), "hash", [], "summary",
     )
-    assert "src/ok.py" in inst._prune_walked_paths
+    # W6-CGD (D-3): entries are (walked root, rel) — the stub walks no root.
+    assert ("", "src/ok.py") in inst._prune_walked_paths
 
 
 # ── eager→deferred conversion source-shape (the extractor-wiring half of T1) ─

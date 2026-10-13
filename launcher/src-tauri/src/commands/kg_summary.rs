@@ -133,6 +133,26 @@ pub async fn get_kg_summary_status(
     Ok(db.get_kg_summary(&project_id)?.map(KgSummaryView::from_row))
 }
 
+/// v0.2.102 W5-D: the machine's local summary model and the tier table it is
+/// chosen from, as `python -m vco_lib.summary_model --json` reports them
+/// (`{"model", "source", "tiers": [{"model", "when"}]}`). The Preferences
+/// page renders `tiers` as its "No Ollama models installed" hint, so the
+/// models it names come from the ONE tier table
+/// (`vco_lib.embedding_selection.summary_model_tiers`) and never from a
+/// literal list in the UI.
+#[command]
+pub async fn get_summary_model_info(db: State<'_, Db>) -> Result<serde_json::Value, String> {
+    crate::commands::project_hooks_settings::run_vco_lib_json(
+        &db,
+        "vco_lib.summary_model",
+        &[std::ffi::OsStr::new("--json")],
+        None,
+        "the summary-model resolver",
+    )
+    .await
+    .map_err(String::from)
+}
+
 /// Re-run the KG-summary backfill for an existing project. Marks the row
 /// as `pending` and re-spawns the background task. Safe to call while a
 /// previous run is still in flight — the new spawn will overwrite the
@@ -185,7 +205,7 @@ pub async fn retry_kg_summary(
 
 /// Deadline for the recheck subprocess. The recheck spawns one generator
 /// child per pending row (each an LLM call), so the honest budget is the
-/// enrichment precedent (`embedding_enrichment::ENRICHMENT_TIMEOUT_SECS`
+/// enrichment precedent (the retired `embedding_enrichment::ENRICHMENT_TIMEOUT_SECS`
 /// = 30 min), not the 30 s gateway-CLI one. A kill at the deadline is
 /// safe: the operation is idempotent and soft-fail per row — anything not
 /// regenerated stays pending for the next recheck.

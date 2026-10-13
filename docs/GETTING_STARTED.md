@@ -18,8 +18,8 @@ What gets auto-installed when missing:
   - macOS: `brew install node`
   - Windows: `winget install OpenJS.NodeJS.LTS`
   - Or: <https://nodejs.org/>
-  - Note: on fnm/nvm setups where you've hand-symlinked just `npm` to `~/.local/bin/`, the installer finds `npx` via `dirname(realpath(npm))/npx` automatically — no manual PATH fiddling needed. The ladder lives in `vco_lib/npx_resolver.py` and is shared by the installer, `vco doctor`, the launcher badge, and the diagram wrappers.
-  - If npx is genuinely absent (Node not installed at all), the npx-based MCPs **cannot spawn** — `vco doctor` reports it and the install leaves an `npx_missing_mcp_unspawnable` entry in `UPDATE_DEFERRED.md` that clears itself once Node is installed. The Mermaid/Excalidraw wrappers additionally fall back to `npm exec` when only npm is present.
+  - Note: on fnm/nvm setups where you've hand-symlinked just `npm` to `~/.local/bin/`, the installer finds `npx` via `dirname(realpath(npm))/npx` automatically — no manual PATH fiddling needed. The ladder lives in `vco_lib/npx_resolver.py` and is shared by the installer, `vco doctor`, and the launcher badge.
+  - If npx is genuinely absent (Node not installed at all), the npx-based MCPs **cannot spawn** — `vco doctor` reports it and the install leaves an `npx_missing_mcp_unspawnable` entry in `UPDATE_DEFERRED.md` that clears itself once Node is installed.
 - **Podman** (preferred — no commercial license, native on Linux/macOS/Windows). Docker is accepted as an alternative if already installed.
   - Linux: `sudo apt install podman` (Ubuntu/Debian), `sudo dnf install podman` (Fedora), `sudo pacman -S podman` (Arch), `sudo zypper install podman` (openSUSE), `sudo apk add podman` (Alpine)
   - macOS: `brew install podman`, then `podman machine init && podman machine start` (one-time prereq — both commands must complete before re-running the installer)
@@ -103,7 +103,7 @@ python3 install.py --bootstrap                            # human-readable summa
 4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs; the code backend's fallback chain is CodeSage → qwen3 → Jina, picked at construction time)
 5. Writes `.env`, `.claude/settings.json` (canonical MCP-env channel — propagates to MCP subprocesses on every Claude Code surface), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is touched only for VS Code editor preferences (Pylance/watcher excludes); `.vscode/tasks.json` is written so that opening the folder in VS Code runs the same `session-start-ensure-hub` hook Claude Code runs on `SessionStart` — which ensures `vct-hub`, the model gateway (when one is registered) and the launcher GUI (when session-autostart is on)
 6. Copies 44 agent templates into `.claude/agents/` and 54 skill templates into `.claude/skills/`; renders 51 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
-7. Registers two MCP servers in `~/.claude.json`: `weaviate-kg` (semantic + graph search) is **enabled by default per project**, and `playwright` (browser automation) is **enabled by default** and invoked separately via `npx -y @playwright/mcp@latest`; install.py pre-caches it at `_install_playwright_browsers`. Opt out with `VCT_SKIP_PLAYWRIGHT=1`. Being registered as a bare `npx` command, it is only spawnable when `npx` resolves on PATH — the doctor phase at the end of every install/update checks exactly that and defers `npx_missing_mcp_unspawnable` when it does not. Disable either server for a single project in the launcher's Permissions tab: it writes `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code honours for user-scope servers. (v0.2.101 removed the `search` paper MCP and stopped registering the `mermaid`/`excalidraw` diagram wrappers by default; a legacy install keeps those entries.) The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama.
+7. Registers two MCP servers in `~/.claude.json`: `weaviate-kg` (semantic + graph search) is **enabled by default per project**, and `playwright` (browser automation) is **enabled by default** and invoked separately via `npx -y @playwright/mcp@<pin> --browser chromium` (pinned in `vco_lib/bundled_mcp_versions.toml`); install.py pre-caches the pinned package and the Chromium revision it requests at `_install_playwright_browsers`, deferring `playwright_browser_missing` if the browser is still absent. Opt out with `VCT_SKIP_PLAYWRIGHT=1`. Being registered as a bare `npx` command, it is only spawnable when `npx` resolves on PATH — the doctor phase at the end of every install/update checks exactly that and defers `npx_missing_mcp_unspawnable` when it does not. Disable either server for a single project in the launcher's Permissions tab: it writes `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code honours for user-scope servers. (v0.2.101 removed the `search` paper MCP; v0.2.102 removed the `mermaid`/`excalidraw` diagram wrapper MCPs entirely — a leftover entry from an older install is scrubbed automatically by the ordinary install/update, with one notice line.) The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama.
 8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
 
 ### Code-embedding backend by host
@@ -250,8 +250,9 @@ claude mcp list
 # Both register as Connected and are enabled per project. Disable one for a
 # single project in the launcher's Permissions tab — it writes
 # ~/.claude.json projects[<project>].disabledMcpServers, the channel Claude Code
-# honours. (v0.2.101 deleted the search MCP and stopped registering the diagram
-# wrapper MCPs; a legacy entry you already have keeps working.)
+# honours. (v0.2.101 deleted the search MCP; v0.2.102 deleted the mermaid/
+# excalidraw diagram wrapper MCPs — a legacy entry is scrubbed automatically
+# by the ordinary install/update.)
 # Ollama runs as embedding infrastructure (Weaviate vectorizer + code-embed CPU
 # fallback) — visible in `podman ps` / `docker ps`, no MCP wrapper. Pro-tier MCPs
 # are excluded from the default install.
@@ -289,7 +290,7 @@ The `create_project_v2` Tauri command returns the moment bundle install finishes
 
 1. **Code graph build** (`commands::codegraph::spawn_initial_build`) — runs `code-graph-analyze` over the project root.
 2. **KG sync** (`commands::kg_sync::spawn_initial_sync`) — runs `.claude/scripts/kg-sync --all` against `knowledge/**/*.md` and `docs/**/*.md`. Idempotent at the Weaviate layer (UUIDs derived from node title); safe to re-run.
-3. **KG summaries** (`commands::kg_summary::spawn_initial_summary`) — runs `.claude/scripts/generate-kg-summary.py` per file. Picks the first available backend: `claude` CLI on PATH → Ollama at `KG_SUMMARY_OLLAMA_URL` (default `http://localhost:11435`, model `KG_SUMMARY_OLLAMA_MODEL`, default `qwen3.5:9b`) → `ANTHROPIC_API_KEY` direct → silent skip. Content-hashes each node, so re-runs are a cheap no-op for unchanged nodes.
+3. **KG summaries** (`commands::kg_summary::spawn_initial_summary`) — runs `.claude/scripts/generate-kg-summary.py` per file. Picks the first available backend: `claude` CLI on PATH → Ollama at `KG_SUMMARY_OLLAMA_URL` (default `http://localhost:11435`, model `KG_SUMMARY_OLLAMA_MODEL`, default: the machine's generation model — the launcher Preferences pick, else the one install pulled for the hardware tier) → `ANTHROPIC_API_KEY` direct → silent skip. Content-hashes each node, so re-runs are a cheap no-op for unchanged nodes.
 
 Each task surfaces its progress in the GUI:
 
@@ -325,7 +326,7 @@ Once a project is configured, here is what fires on normal use:
 - Files under `knowledge/` sync to Weaviate (per-project `<KG_COLLECTION>`; content-hash skip on unchanged nodes)
 - Files under `docs/` sync to the development collection (per-project `<DEVELOPMENT_COLLECTION>`; same content-hash + status handling as the KG — unchanged content is a cheap no-op)
 - Code files are queued for code graph re-analysis (`code-graph-incremental.{sh,ps1}` — invokes `analyze --incremental --language <lang> --prune-stale`, scoped per-language so deleted files in one language never wipe rows from another)
-- A credential scan runs on the written file (`post-tool-security.sh`)
+- A credential scan runs on the text the edit introduced (`post-tool-security.sh`; it reports path, line and shape, never the value)
 
 **On every explicit retrieval** (`PostToolUse` hook on `mcp__weaviate-kg__hybrid_search` / `semantic_graph_search` / `search_code_graph`, v0.2.91):
 - `post-mcp-retrieval-record.{sh,ps1}` records what the retrieval already put in the context window into the same per-session stores the injecting hooks consult, so a node or entity you deliberately fetched is not re-injected minutes later by the pre-edit hook
@@ -363,7 +364,7 @@ Run `code-graph-analyze` to index a codebase:
 .claude/scripts/code-graph-analyze ~/dev/my-api --project "MyAPI"
 ```
 
-This extracts `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, and `CodeInteraction` entities (per-language structural analysis) and stores them in Weaviate. Function call edges are extracted with Python's `ast`; installing the optional `codegraph-ts` extra (`pip install '.[codegraph-ts]'`) adds tree-sitter grammars so call edges also cover rust, go, javascript/typescript, java, c#, c/c++, ruby, lua, and bash — without it those languages just get no call edges. Claude can then answer structural questions without reading every file:
+This extracts `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, and `CodeInteraction` entities (per-language structural analysis) and stores them in Weaviate. Definitions and call edges are AST-parsed — Python with `ast`, and rust, go, javascript/typescript (incl. Svelte scripts), java, c#, c/c++, ruby, lua and bash with the tree-sitter grammars of the `codegraph-ts` extra, which the installer adds by default. Without the extra (`VCT_SKIP_CODEGRAPH_TS=1`, or a failed install — add it with `pip install -e '.[codegraph-ts]'`) those languages fall back to regex definitions and get no call edges. PowerShell and proto use two optional tree-sitter parsers that are not installed by default: when a registered project contains those languages the launcher offers them (Install / Not now), and until then they are regex-parsed. Claude can then answer structural questions without reading every file:
 
 ```bash
 .claude/scripts/code-graph-query search "auth middleware"

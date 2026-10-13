@@ -599,7 +599,7 @@ class OAuthRereadTests(ChaosBase):
         # The retry re-sends the SAME turn, so it owes the SAME row: identity
         # and numbers ride on `facts`, which the re-send used to be built
         # without — leaving a repaired, billed turn absent from the record.
-        await self.client.app[srv.APP_KEY].usage.drain()
+        await self.client.app[srv.APP_KEY].quiesce()  # handlers finished + appends drained
         rows = [
             json.loads(line)
             for line in self.usage_ledger_path.read_text(
@@ -798,7 +798,7 @@ class QuotaReprobeTests(ChaosBase):
         self.assertEqual(resp.status, 200, await resp.text())
         self.assertEqual(len(self.vendor_up.message_requests), 2)
 
-        await self.client.app[srv.APP_KEY].usage.drain()
+        await self.client.app[srv.APP_KEY].quiesce()  # handlers finished + appends drained
         self.assertTrue(
             self.usage_ledger_path.is_file(),
             "the successful re-probe wrote no ledger row at all",

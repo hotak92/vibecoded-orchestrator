@@ -74,6 +74,58 @@ class SighupHandlerNoopOnWindowsTest(unittest.TestCase):
 
 
 @unittest.skipIf(_IS_WINDOWS, "SIGHUP is POSIX-only; Windows uses kill+respawn fallback")
+class SighupHandlerWorkerThreadTest(unittest.TestCase):
+    """v0.2.102 W6-F fix-round (review MEDIUM): the guard at the ROOT.
+
+    ``signal.signal`` accepts only the main thread (ValueError otherwise),
+    and ``weaviate_mcp.server`` registers this handler AT IMPORT TIME — so
+    any NON-main-thread importer of that module used to die on the import
+    (the context router's worker-thread legs were the live case). The
+    registration must now be a logged no-op returning False from a worker
+    thread (the import succeeds; the env-reload UX simply does not apply to
+    that embedding), and must keep installing normally on the main thread.
+    """
+
+    def test_worker_thread_registration_is_a_logged_noop(self) -> None:
+        import logging
+        import threading
+
+        before = signal.getsignal(signal.SIGHUP)
+        outcome: dict = {}
+
+        def _register_off_main() -> None:
+            logger = logging.getLogger("test-pr42-worker")
+            logger.addHandler(logging.NullHandler())  # swallow the WARNING
+            try:
+                outcome["ret"] = register_sighup_exit_handler(logger)
+            except BaseException as exc:  # noqa: BLE001 — recorded, asserted below
+                outcome["exc"] = exc
+
+        worker = threading.Thread(target=_register_off_main, name="leg-worker")
+        worker.start()
+        worker.join(timeout=10)
+        self.assertNotIn("exc", outcome,
+                         f"worker-thread call must not raise: {outcome.get('exc')!r}")
+        self.assertIs(outcome.get("ret"), False,
+                      "off-main-thread call must report not-installed")
+        self.assertEqual(signal.getsignal(signal.SIGHUP), before,
+                         "the process's SIGHUP disposition must be untouched")
+
+    def test_main_thread_registration_still_installs(self) -> None:
+        import logging
+
+        before = signal.getsignal(signal.SIGHUP)
+        try:
+            installed = register_sighup_exit_handler(
+                logging.getLogger("test-pr42-main"))
+            self.assertTrue(installed)
+            self.assertNotEqual(signal.getsignal(signal.SIGHUP), before,
+                                "main-thread call must replace the disposition")
+        finally:
+            signal.signal(signal.SIGHUP, before)
+
+
+@unittest.skipIf(_IS_WINDOWS, "SIGHUP is POSIX-only; Windows uses kill+respawn fallback")
 class SighupTriggersCleanExitTest(unittest.TestCase):
     """End-to-end: spawn a real Python subprocess that imports the
     helper, send it SIGHUP, assert it exits within a few seconds.

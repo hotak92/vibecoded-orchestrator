@@ -103,3 +103,20 @@ export function retiredBadgeText(row: ProjectMcpServerView): string {
 export function isUserReEnabledAfterRetirement(row: ProjectMcpServerView): boolean {
   return retiredRows([row]).length === 1 && row.enabled;
 }
+
+/**
+ * One notice line per deprecated MCP entry the repair action scrubbed
+ * from ~/.claude.json (v0.2.102 L-1). The GUI "Re-register MCPs" path
+ * must not scrub silently: the Rust `rerun_mcp_registration` report
+ * carries the same `removed_deprecated` names the CLI prints, and the
+ * component toasts each line here. Empty list → nothing to say.
+ *
+ * Wording mirrors the CLI notice in lib.rs (`register-mcps`) on purpose —
+ * one sentence shape for the same fact on every surface.
+ */
+export function removedDeprecatedNotices(names: string[] | null | undefined): string[] {
+  if (!names) return [];
+  return names
+    .filter((n) => typeof n === 'string' && n.length > 0)
+    .map((n) => `removed obsolete MCP entry \`${n}\` — that module no longer ships`);
+}

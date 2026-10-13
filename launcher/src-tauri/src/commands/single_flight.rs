@@ -76,6 +76,11 @@ pub const OP_UPDATE_ALL_PROJECTS: &str = "update_all_projects";
 /// one restart is in flight would end every agent session a second time.
 pub const OP_GATEWAY_RESTART: &str = "model_gateway_restart";
 
+/// Operation key: a code-graph parser install into the orchestrator venv
+/// (`codegraph_parsers::codegraph_parsers_install`). Two concurrent pip runs
+/// into one venv can interleave and leave it half-installed.
+pub const OP_CODEGRAPH_PARSERS_INSTALL: &str = "codegraph_parsers_install";
+
 /// Operation key: an in-place update of the ORCHESTRATOR CLONE — held by
 /// `update_run::run_update` (every surface and every kind since v0.2.100) and
 /// by the conflict resolvers that hand their claim over to it
@@ -295,7 +300,19 @@ pub fn acquire_update_lock_at(
     for _ in 0..2 {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => {
-                let body = format!("{}\n{}\n", own_pid, chrono::Utc::now().timestamp());
+                // Line 3 (v0.2.102 W6-Z3): the holder's process start token
+                // — `vco_lib/update_lock.py::decide` compares it to tell a
+                // reused pid from the claimant without a wall-clock rule.
+                // Empty when it cannot be read: the reader then falls back to
+                // the two-line (time) rule. MUST MATCH the Python parser.
+                let token = vct_launcher_core::process::process_start_token(own_pid)
+                    .unwrap_or_default();
+                let body = format!(
+                    "{}\n{}\n{}\n",
+                    own_pid,
+                    chrono::Utc::now().timestamp(),
+                    token
+                );
                 if let Err(e) = file.write_all(body.as_bytes()) {
                     let _ = std::fs::remove_file(path);
                     return Err(format!("could not write {}: {}", path.display(), e));
@@ -529,6 +546,34 @@ mod tests {
         let again = acquire_update_lock_at(&path, 777, &alive_4242)
             .expect("a sequential claim succeeds once the holder released");
         drop(again);
+    }
+
+    /// v0.2.102 W6-Z3: the claim carries the holder's process start token
+    /// as its third line, in `vco_lib/deferral_probes.py::process_start_token`'s
+    /// format, and the first line still names the pid the reaper reads.
+    #[test]
+    fn update_lock_writes_the_holders_start_token_as_line_three() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join(UPDATE_LOCK_BASENAME);
+        let me = std::process::id();
+        let g = acquire_update_lock_at(&path, me, &|_| false).expect("claim");
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "pid, timestamp, start token: {body:?}");
+        assert_eq!(lines[0], me.to_string());
+        assert!(lines[1].parse::<i64>().is_ok(), "unix seconds: {body:?}");
+        let token = vct_launcher_core::process::process_start_token(me)
+            .expect("this process's own start token is readable");
+        assert_eq!(lines[2], token);
+        #[cfg(target_os = "linux")]
+        assert!(
+            token.strip_prefix("proc:").is_some_and(|t| t.parse::<u64>().is_ok()),
+            "{token}"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(token.starts_with("wall:") && token.ends_with(".000"), "{token}");
+        assert_eq!(lock_holder_pid(&path), Some(me), "the reaper still reads line 1");
+        drop(g);
     }
 
     /// A malformed claim cannot be proven stale — refuse, touch nothing.

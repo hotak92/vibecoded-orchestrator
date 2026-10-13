@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Parity: kept in step with lean-ctx-rewrite.ps1 (its UTF-8 BOM serves Windows
+# PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # Per-project lean-ctx PreToolUse hook for Bash tool calls.
 #
 # CONTRACT (v0.2.101 — ALLOW-LIST INVERSION + LOSSLESS TEE)
@@ -146,7 +148,13 @@ _lc_allowlist="$_lc_hook_dir/_lib/lean-ctx-allowlist.txt"
 _lc_tee="$_lc_hook_dir/_lib/lean-ctx-tee.sh"
 [ -f "$_lc_allowlist" ] || exit 0
 [ -f "$_lc_tee" ] || exit 0
-_lc_proj="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> no tee dir, so the command runs raw (the documented arm for a state dir that cannot be made).
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+_lc_proj="$(vco_project_root)" || _lc_proj=""
+[ -n "$_lc_proj" ] || exit 0
 _lc_rawdir="$_lc_proj/.claude/state/lean-ctx-tee"
 
 export _LC_ALLOWLIST="$_lc_allowlist"
@@ -171,6 +179,13 @@ try:
     ti = d.get("tool_input") or {}
     cmd = ti.get("command", "")
 except Exception:
+    nothing()
+# v0.2.102 W5-D: lean-ctx compression is Bash-only (coordinator decision 2026-10-09, accepted in review).
+# The wrapper re-runs the command through a POSIX shell
+# (lean-ctx -c), which cannot run PowerShell syntax, so this hook stays
+# registered on matcher Bash and any other tool name (a PowerShell-tool
+# call reaching it through a user-widened matcher) runs raw.
+if d.get("tool_name", "Bash") != "Bash":
     nothing()
 if not isinstance(cmd, str) or not cmd.strip():
     nothing()

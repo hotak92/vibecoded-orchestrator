@@ -30,6 +30,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -74,6 +75,13 @@ def _env(home: Path, project: Path, **extra: str) -> dict:
         CLAUDE_PROJECT_DIR=str(project),
         # No desktop toast from a test run.
         VCO_STOP_FAILURE_NOTIFY="0",
+        # v0.2.102 NB-H2: this suite's PATH scenarios (the no-python dir, the
+        # crashing-python shim) must drive the interpreter resolution.
+        # find-python now probes the orchestrator venv FIRST — and CI both
+        # exports VCT_VENV and creates a checkout .venv, either of which
+        # would hijack the shim arms — so the lib's documented opt-out pins
+        # the pre-NB-H2 PATH-only behaviour for every run here.
+        VCO_FIND_PYTHON_PATH_ONLY="1",
     )
     env.update(extra)
     return env
@@ -83,7 +91,7 @@ def _run(flavour: str, hooks: Path, payload: str, env: dict) -> subprocess.Compl
     if flavour == "sh":
         argv = ["bash", str(hooks / "stop-failure-notify.sh")]
     else:
-        argv = [PWSH, "-NoProfile", "-NonInteractive", "-File", str(hooks / "stop-failure-notify.ps1")]
+        argv = [PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(hooks / "stop-failure-notify.ps1")]
     return subprocess.run(argv, input=payload.encode("utf-8"), env=env,
                           capture_output=True, timeout=120)
 

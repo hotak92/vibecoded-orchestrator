@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.child_env import child_env
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -63,7 +64,7 @@ def _project(tmp_path: Path) -> Path:
 
 def _run(impl: str, proj: Path, command: str, env: dict, sid: str = "s1") -> subprocess.CompletedProcess:
     argv = ([BASH, str(HOOKS / "pre-tool-use.sh")] if impl == "sh" else
-            [PWSH, "-NoProfile", "-NonInteractive", "-File", str(HOOKS / "pre-tool-use.ps1")])
+            [PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(HOOKS / "pre-tool-use.ps1")])
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "session_id": sid})
     env = dict(env, CLAUDE_PROJECT_DIR=str(proj))
     return subprocess.run(argv, input=payload, capture_output=True, text=True,
@@ -77,6 +78,11 @@ def _env(tmp_path: Path, *, no_python: bool) -> dict:
     env.update(HOME=str(tmp_path / "home"), VCT_STATE_DIR=str(tmp_path / "state"))
     if no_python:
         env["PATH"] = _no_python_path(tmp_path)
+        # v0.2.102 NB-H2: "no Python ANYWHERE" must also defeat find-python's
+        # NEW orchestrator-venv probe — its clone-relative tier cannot be
+        # unset away when the checkout under test carries its own .venv
+        # (CI creates exactly that), so the lib's documented opt-out is set.
+        env["VCO_FIND_PYTHON_PATH_ONLY"] = "1"
     return env
 
 

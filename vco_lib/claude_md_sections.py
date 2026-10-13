@@ -12,13 +12,14 @@ is deliberately no second place that computes "which sections render here".
 
 Feature ids (the conditional-tag vocabulary of both templates):
 
-``diagrams``
-    the ``project_modules`` verdict for this folder's project (default-on;
-    an explicit row can disable it) — ``module_gated_delivery
-    .active_modules_verdict``, reached through the folder→UUID resolution
-    the old bundle path skipped (plan D4: it passed ``str(folder)`` where
-    launcher.db keys on the project UUID, so explicit rows never reached
-    the render).
+Any ``project_modules`` name (v0.2.102: the retired ``diagrams`` id used to
+be one; with no default-on modules left, only an explicit ``enabled=1`` row
+can light such a tag) is answered by the ``project_modules`` verdict for
+this folder's project — ``module_gated_delivery.active_modules_verdict``,
+reached through the folder→UUID resolution the old bundle path skipped
+(plan D4: it passed ``str(folder)`` where launcher.db keys on the project
+UUID, so explicit rows never reached the render).
+
 ``model_gateway``
     the SAME tri-state verdict that decides delivery of the gateway agent
     definitions (``module_gated_delivery.gateway_agents_gate``): an explicit
@@ -68,7 +69,6 @@ from vco_lib.module_gated_delivery import GATEWAY_MODULE_NAME
 
 __all__ = [
     "ALL_FEATURES",
-    "DIAGRAMS",
     "LEAN_CTX",
     "MODEL_GATEWAY",
     "RL_RETRIEVAL",
@@ -76,10 +76,6 @@ __all__ = [
     "gateway_section_renders",
     "tagged_features",
 ]
-
-#: The diagrams feature id — the default-on module of
-#: ``module_gated_delivery.DEFAULT_ACTIVE_MODULES``.
-DIAGRAMS = "diagrams"
 
 #: The gateway feature id IS the delivery gate's module name (one spelling,
 #: one home: GUI toggle, template tag and delivery gate all share it).
@@ -95,11 +91,11 @@ RL_RETRIEVAL = "rl_retrieval"
 #: (``tests/test_template_materialization_complete.py``) renders every
 #: shipped template under this full set AND under the empty set.
 ALL_FEATURES: frozenset[str] = frozenset(
-    {DIAGRAMS, MODEL_GATEWAY, LEAN_CTX, RL_RETRIEVAL}
+    {MODEL_GATEWAY, LEAN_CTX, RL_RETRIEVAL}
 )
 
-#: Features with a dedicated probe below (everything else — ``diagrams`` and
-#: any future ``project_modules`` name — is answered by the modules verdict).
+#: Features with a dedicated probe below (everything else — any
+#: ``project_modules`` name — is answered by the modules verdict).
 _DEDICATED = frozenset({MODEL_GATEWAY, LEAN_CTX, RL_RETRIEVAL})
 
 #: The per-project settings file the lean-ctx probe reads.
@@ -301,7 +297,7 @@ def active_sections(
     probe = set(ALL_FEATURES) if needed is None else set(needed)
     sections: set[str] = set()
 
-    # The modules verdict answers `diagrams` and any other row-driven name.
+    # The modules verdict answers any row-driven (non-dedicated) name.
     if probe - _DEDICATED:
         sections |= _module_sections(folder, db_path=db_path, project_id=project_id)
 

@@ -138,7 +138,7 @@ Global settings: profile, about. Backed by `db::settings` table (key/value JSON 
 `module_settings` table stores per-(project, module) non-secret settings as JSON-encoded values. Unique constraint on `(project_id, module_id, setting_key)`.
 
 ### Per-project KG Binding
-`project_kg_bindings` table maps a project to its primary Weaviate collection name, embedding model, embedding dim, `knowledge/` dir path, and optional Weaviate URL override. Role can be `primary`, `shared`, or `archive`.
+`project_kg_bindings` table maps a project to its primary Weaviate collection name, embedding dim, `knowledge/` dir path, and optional Weaviate URL override. Role can be `primary`, `shared`, or `archive`. (The `embedding_model` column survives in the schema with its historical values but is retired — v0.2.102 removed the per-binding KG model pick; the KG embeds with the one global embedding profile (Preferences → Embedding profile), for every project and the shared KG.)
 
 ### Per-project Code Graph Binding
 `project_codegraph_bindings` tracks collection prefix, embedding model, last analyzed git SHA, and an `enabled` toggle. Used by the `/codegraph` UI to show analysis currency.
@@ -313,7 +313,7 @@ Migration emits phase-level `volumes://migrate-progress` Tauri events so the UI 
 </details>
 
 ### Zero-Destruction Install Guard
-`installer.rs` includes an audit test (`test_no_destructive_subprocess_calls_in_install_path`) that greps install-path files for banned commands (`rm -rf`, `docker volume rm`, `podman volume rm`). Prevents accidental destructive commands from slipping into the install path.
+An audit test (`test_no_destructive_subprocess_calls_in_install_path` in `tests/test_v02102_rust_source_scan_gates.py`) scans the production code of the install-path files (`install.py`, `install.sh`, `installer.rs`, `projects_v2.rs`) for banned commands: `podman`/`docker volume rm`, `podman`/`docker volume prune`, `compose down --volumes` / `-v`, `podman-compose down` and `docker-compose down`. Test-gated Rust items are blanked one by one, so every production line is scanned. Prevents accidental destructive commands from slipping into the install path.
 
 ### Service Lifecycle on Launcher Start/Stop
 `commands/lifecycle.rs` ties the backing services (Weaviate, Ollama, code-embed) to the launcher's own lifecycle:
@@ -324,6 +324,7 @@ Migration emits phase-level `volumes://migrate-progress` Tauri events so the UI 
 - **Service endpoints rows** (v0.2.97): the launcher.db `service_endpoints` table (migration 047) is the one source of truth for where each service runs — mode (`vco_managed` / `adopted_container` / `adopted_external`), host/port, container identity and data mount. When detection finds a foreign Weaviate or Ollama, `ExternalServicesDialog.svelte` prompts with the candidates from `python -m vco_lib.service_endpoints candidates --json` (name, compose project, image, port, whether VCO data was found, compatibility verdict); the actions are **Use this one** and **Run VCO's own copy**, landing in the row via `service_endpoints adopt` / `use-vco-copy`. The Services page shows a "Where it runs" column with the mode badge, a **Change…** action, and — for adopted containers — the opt-in **Let VCO manage it** transfer (`hand-to-vco`, with the data mount named and verified).
 - **Frontend events**: `vct-services-lifecycle` (start/stop/restart progress) and `vct-external-services-detected` (adoption prompt trigger). Lets the UI render real-time state without polling.
 - **Zombie recovery**: when a service's runtime state reports `zombie: true` (a container stuck in a wedged state), the Services route renders a **"stuck"** badge in the Status cell and a **Recover** button (shown only when the service is zombie and has a container name). Recover calls `recover_zombie`; on failure it surfaces a page banner and refreshes the services snapshot. Recover removes and re-creates a stuck container only when its own labels prove it is VCO's (and its data guard passes); any other stuck container is only **started**, by name, with a message naming why VCO will not remove it. The per-service Stop and Restart buttons act on the container **by the name its row records** without consulting its labels — they are your explicit action on whatever container carries that name (the label check is the hub watchdog's rule, which only ever acts on containers it can prove are VCO's).
+- **What the watchdog never heals** (v0.2.102): a stopped container whose compose labels name another project — **including a legacy VCO compose project** (an older install's home): by design it is recorded as `watchdog_foreign_container` and left alone, and `python install.py --update` is what takes such a container over, through its compose-identity guard. A container a project **declared unmanaged** on its Identity tab ("Infrastructure this project owns") is the explicit form of the same rule: the watchdog does not even inspect it. When the watchdog gives up on a VCO service after repeated failed heals, it writes the `watchdog_gave_up` ledger entry (service, attempts, last error, remedy), cleared once the service is seen running.
 
 ### Model Gateway Supervision (hub-side, v0.2.95)
 
@@ -437,7 +438,7 @@ Lists which other projects can read this project's code graph (or none).
 Sets the access level (`read` / `none`) between two projects. Audits the grant.
 
 ### Reading access and counts
-`codegraph_list_projects` returns every project card with its per-class counts and the acting project's access level (read / none), and drives the `/codegraph` dashboard. There is no per-call access-check command: cross-project code-graph reads are enforced by the weaviate-kg MCP through `VCT_CODE_GRAPH_ACCESS_LIST`, which the launcher projects from the `codegraph_access` table. The retired v0.2.100 commands `codegraph_check_access`, `codegraph_summary`, `codegraph_load_graph` (the in-launcher force-layout graph; a subgraph is available through the `vco codegraph-diagram` CLI) and `codegraph_set_entity_access_bulk` (per-entity access was project-level by design, and nothing read the property it wrote) are gone.
+`codegraph_list_projects` returns every project card with its per-class counts and the acting project's access level (read / none), and drives the `/codegraph` dashboard. There is no per-call access-check command: cross-project code-graph reads are enforced by the weaviate-kg MCP through `VCT_CODE_GRAPH_ACCESS_LIST`, which the launcher projects from the `codegraph_access` table. The retired v0.2.100 commands `codegraph_check_access`, `codegraph_summary`, `codegraph_load_graph` (the in-launcher force-layout graph) and `codegraph_set_entity_access_bulk` (per-entity access was project-level by design, and nothing read the property it wrote) are gone.
 
 ---
 
@@ -590,7 +591,7 @@ The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/
 - `DELETE /api/v1/projects/{project_id}/secrets/{secret_key}` — clear a secret ref.
 - `POST /api/v1/projects/{project_id}/kg-binding` — set the project's primary KG binding.
 - `POST /api/v1/projects/{project_id}/codegraph-binding` — set the code graph binding.
-- `POST /api/v1/projects/{project_id}/codegraph/extras/indexed` — record that an extra code-graph path was re-indexed at a commit (`{path, commit, files_analyzed?, entities_indexed?, duration_ms?}`; 404 unknown path, 409 disabled path). Written by the Stop hook's automatic extra-path refresh so the hook never opens launcher.db.
+- `POST /api/v1/projects/{project_id}/codegraph/extras/indexed` — record that an extra code-graph path (a folder from the Identity tab's **Add code folder** list) was re-indexed at a commit (`{path, commit, files_analyzed?, entities_indexed?, duration_ms?}`; 404 unknown path, 409 disabled path). Written by the Stop hook's automatic extra-path refresh so the hook never opens launcher.db.
 
 ### CLI-facing endpoints (`hub/cli_api.rs`)
 Mirror of Tauri commands so the headless `vct-cli` can drive the launcher without IPC into the Tauri app. All actions audit with `via: "cli"` tagged in the detail JSON.
@@ -775,12 +776,12 @@ Twenty-one Tauri commands mutate or read the per-project Claude Code registry. E
 #### Agent / skill / hook mutations
 - `register_project_agent(project_id, name, source)` / `set_project_agent_enabled(agent_id, enabled)` / `unregister_project_agent(agent_id)`.
 - `register_project_skill(project_id, name, source)` / `set_project_skill_enabled(skill_id, enabled)` / `unregister_project_skill(skill_id)`.
-- `register_project_hook(project_id, req)` / `set_project_hook_enabled(project_id, event, matcher, command, enabled)` / `unregister_project_hook(project_id, event, matcher, command)` — these live in `commands/project_hooks_settings.rs` (not `project_state_cmd.rs`) and edit `.claude/settings.json`. Identity is the natural key `(event, matcher, command)`, not a row id, because a hook can exist in `settings.json` with no mirror row at all. `register` optionally seeds the hook script when the command points at one that does not exist (never overwriting an existing file, the `create_starter_diagram_file` rule).
+- `register_project_hook(project_id, req)` / `set_project_hook_enabled(project_id, event, matcher, command, enabled)` / `unregister_project_hook(project_id, event, matcher, command)` — these live in `commands/project_hooks_settings.rs` (not `project_state_cmd.rs`) and edit `.claude/settings.json`. Identity is the natural key `(event, matcher, command)`, not a row id, because a hook can exist in `settings.json` with no mirror row at all. `register` optionally seeds the hook script when the command points at one that does not exist, never overwriting an existing file.
 
 #### Permissions / secrets / bindings
 - `add_project_permission(project_id, kind, pattern)` / `delete_project_permission(perm_id)`.
 - `set_project_secret_ref(project_id, key_name, resolution)` / `delete_project_secret_ref(ref_id)`.
-- `set_project_kg_binding(project_id, collection, embedding_model, ...)`.
+- `set_project_kg_binding(project_id, collection, ...)`.
 - `set_project_codegraph_binding(project_id, collection_prefix, embedding_model, last_sha, enabled)`.
 
 ### change_log Polling for Concurrency Invalidation
@@ -800,6 +801,9 @@ Before v0.2.91 the handler matched `TrayIconEvent::Click { .. }`, i.e. *every* b
 
 ### Live Service Status Pill
 The "Running services" line is polled every 5s and updated in-place (`MenuItem::set_text` rather than full menu rebuild — avoids flicker and OS-level menu re-grab). States: `Services: N/M running`, `No services running`, `managed externally`. The probe reads the endpoints from the `service_endpoints` rows (same resolution as install.py); foreign services on those endpoints are counted as "running" for the headline count, with the externally-managed case surfaced when a service's row is `adopted_*`.
+
+### Hidden idle launcher self-relaunch on a stale binary (v0.2.102)
+A standalone background loop (its own task, deliberately not tied to the system tray so it keeps running when the tray failed to build — e.g. a session with no StatusNotifier host) runs a periodic check (default every 10 minutes, `VCT_LAUNCHER_STALE_IDLE_CHECK_SECS` to tune): when a `launcher_binary_stale` deferral record exists AND this process was started `--start-hidden` AND no launcher window is visible AND no update pipeline/apply is running (the update-gate lockfile) AND no modal-pending file exists (an unconsumed update-handoff outcome), the launcher relaunches itself into the dist binary through the restart modal's own guarded path (`commands/restart.rs`), passing `--start-hidden` so a tray-only launcher never flashes a window. This is what heals the tray-only launcher the session-start hook starts with `--start-hidden`, which previously kept running yesterday's binary until reboot because the `binary_stale` restart modal is only ever seen when a window opens; the hook itself never kills GUI processes. Any guard failing leaves the running launcher alone (a visible-mode launcher the user merely hid to the tray keeps the modal path), and the `launcher_binary_stale` record itself clears through its existing boot probe once the relaunched process sees a fresh binary. Two race hardenings: the guards are RE-VALIDATED immediately before the process exit (a window that opened while the child was spawning aborts the exit — the spawned child then gives up its bounded wait and exits cleanly), and every relaunch child (modal Continue and idle tick alike) is started with `--vct-relaunch-parent=<pid>`, under which it waits — bounded, `VCT_LAUNCHER_RELAUNCH_LOCK_WAIT_SECS` (default 30 s) — for the exiting parent to release the single-instance lock instead of handing its argv to a process about to exit. A normal second launch keeps the immediate hand-off.
 
 ### Window-button semantics (changed in v0.2.91)
 **The X / Cmd+W button reduces the launcher to the tray by default** — it no longer prompts. This is a user-visible behavior change (user decision #2): the `tray_close_to_tray` preference had shipped with default `true` and a Preferences label saying exactly that for months, while nothing consumed the value, so the label was false. Wiring the pref honors the shipped default rather than inventing a new one. Real exit is **tray → Quit**. A one-time native notice fires the first time the window hides this way, so the default is discoverable rather than surprising.

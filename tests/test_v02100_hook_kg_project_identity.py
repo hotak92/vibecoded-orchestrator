@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.child_env import child_env
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS = REPO_ROOT / "templates" / "hooks"
@@ -117,7 +118,7 @@ def test_powershell_locator_matches_the_shell_one(tmp_path):
     env = {k: v for k, v in os.environ.items() if k not in ("VCT_INSTALL_ROOT", "VCT_ORCHESTRATOR_ROOT")}
     env["VCT_ORCHESTRATOR_ROOT"] = str(orch)
     out = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command",
+        ["pwsh", *PWSH_BASE_FLAGS, "-Command",
          f'. "{HOOKS}/_lib/resolve-vco-venv.ps1"; '
          f'Resolve-VcoOrchestratorScript -ScriptDir "{proj}/.claude/hooks" -RelPath "{RL_REL}" -ProjectRoot "{proj}"'],
         env=env, capture_output=True, text=True, timeout=60,
@@ -195,7 +196,7 @@ def test_subagent_hook_ps1_runs_the_root_script_with_the_project_identity(tmp_pa
                "tool_input": {"prompt": "Task: implement the widget reranker ps",
                               "description": "coder lane", "model": "m"}}
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(HOOKS / "agent-brief-kg-inject.ps1")],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / "agent-brief-kg-inject.ps1")],
         input=json.dumps(payload), capture_output=True, text=True,
         env=_hook_env(orch, proj), cwd=str(orch), timeout=120,
     )

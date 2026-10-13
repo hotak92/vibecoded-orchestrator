@@ -41,7 +41,6 @@ Today it defaults to ``vco_lib.project_init.detect_kg_schema_drift``.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import sqlite3
 import subprocess
@@ -255,14 +254,13 @@ _CODEGRAPH_CLASS_SUFFIXES: tuple[str, ...] = (
 #: a working-path deadline. Override per-machine: ``VCT_EDGE_TIMEOUT_SECS=0``
 #: disables the cap entirely (None → subprocess.run waits indefinitely).
 def _resolve_edge_timeout() -> "Optional[int]":
-    raw = os.environ.get("VCT_EDGE_TIMEOUT_SECS", "").strip()
-    if raw:
-        try:
-            v = int(raw)
-            return None if v <= 0 else v
-        except ValueError:
-            pass  # malformed → fall through to the default
-    return 3600
+    """``VCT_EDGE_TIMEOUT_SECS``: unset / blank / malformed -> 3600; ``<= 0``
+    -> ``None`` (no timeout, this reader's extra meaning); else the value.
+    The parse is the one env-int reader's (:func:`vco_lib.env_values.env_int`)."""
+    from vco_lib.env_values import env_int  # noqa: PLC0415
+
+    v = env_int("VCT_EDGE_TIMEOUT_SECS", 3600)
+    return None if v <= 0 else v
 
 
 _EDGE_SUBPROCESS_TIMEOUT = _resolve_edge_timeout()
@@ -890,46 +888,19 @@ _TYPE_ENV_VAR: dict[str, str] = {
 
 
 def _resolve_codegraph_prefix(env: Mapping[str, str]) -> Optional[str]:
-    """Resolve the project's codegraph Weaviate class prefix (e.g. ``VCODev``).
+    """Resolve the project's codegraph Weaviate class prefix (e.g. ``VCODev``)
+    from an already-resolved env (no hub round-trip): ``CODE_GRAPH_PROJECT``
+    verbatim, else ``PROJECT_NAME`` through the analyzer's own
+    ``canonical_class_prefix`` rule (NIT-C, 2026-06-16).
 
-    Priority mirrors ``vco_lib.paths.resolve_project_name`` but stays env-only
-    (no hub round-trip — the runner is called from install/post-bundle with a
-    fully-resolved env): ``CODE_GRAPH_PROJECT`` (already the sanitized prefix,
-    used verbatim by the analyzer) → ``PROJECT_NAME``.
-
-    NIT-C (2026-06-16): the PROJECT_NAME *fallback* MUST derive the prefix the
-    SAME way the code-graph analyzer does — via
-    ``analyze_code_graph._sanitize_collection_prefix`` →
-    ``vco_lib.project_naming.canonical_class_prefix`` (underscore-PRESERVING),
-    NOT ``sanitize_for_weaviate_class`` (underscore-DROPPING, used for KG/Dev/
-    Diagrams). Reusing the analyzer's exact helper (``canonical_class_prefix``
-    + its legacy-regex fallback on ``ValueError``) guarantees a future
-    codegraph edge probes the class name the analyzer actually wrote, even for
-    names containing ``_``/``-``. Returns ``None`` only when neither env is set
-    (the runner then skips codegraph). In practice CODE_GRAPH_PROJECT is set
-    at install/post-bundle time, so the fallback is the unlikely path.
+    v0.2.102 (S2): delegates to the ONE home,
+    ``vco_lib.codegraph_edge_env.resolve_codegraph_prefix``, which the
+    codegraph migration edges call too — so the runner and the edge it spawns
+    can never resolve different prefixes.
     """
-    cg = (env.get("CODE_GRAPH_PROJECT") or "").strip()
-    if cg:
-        return cg
-    pn = (env.get("PROJECT_NAME") or "").strip()
-    if not pn:
-        return None
-    # Same helper + fallback the analyzer uses for class-prefix derivation.
-    from .project_naming import canonical_class_prefix
+    from .codegraph_edge_env import resolve_codegraph_prefix
 
-    try:
-        return canonical_class_prefix(pn)
-    except ValueError:
-        # Legacy fallback identical to analyze_code_graph._sanitize_
-        # collection_prefix / codegraph_to_mermaid._sanitize_collection_prefix:
-        # replace non-alnum-underscore with underscore, uppercase a leading
-        # lowercase letter. Never raises; keeps the runner in lock-step with
-        # whatever the analyzer wrote.
-        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", pn)
-        if sanitized and sanitized[0].isalpha() and not sanitized[0].isupper():
-            sanitized = sanitized[0].upper() + sanitized[1:]
-        return sanitized or None
+    return resolve_codegraph_prefix(env)
 
 
 def codegraph_class_names_for_prefix(prefix: str) -> list[str]:

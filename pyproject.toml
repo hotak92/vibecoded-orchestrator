@@ -19,7 +19,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vibecoded-orchestrator"
-version = "0.2.101"
+version = "0.2.102"
 description = "VibeCoded Orchestrator — local-first agentic infrastructure for Claude Code"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -48,10 +48,9 @@ classifiers = [
 # CLI-only runtime deps. Heavy deps (MCP SDK, Weaviate client, sentence-
 # transformers, torch) live in the `mcp` optional-dependency group so the
 # bare `vco` CLI doesn't drag them in: `verify-pins` and `verify-env-
-# projection` only need stdlib + tomllib (3.11+), and `rebuild-diagram-
-# index` / `codegraph-diagram` import Weaviate lazily inside guarded
-# `try/except ImportError` blocks. Users who want the full stack do
-# `pip install -e .[mcp]` (install.py picks this path automatically).
+# projection` only need stdlib + tomllib (3.11+). Users who want the full
+# stack do `pip install -e .[mcp]` (install.py picks this path
+# automatically).
 dependencies = [
     # tomllib is stdlib on 3.11+ (our minimum), so no backport pin is
     # needed at runtime. Listed here only as a sentinel for future
@@ -84,10 +83,13 @@ mcp = [
     "uvicorn >= 0.46.0",
     "psutil >= 7.2.2",
 ]
-# Cross-language code-graph CALL extraction (CG-2 / Part 5). OPTIONAL — the
-# analyzer's cross-reference pass falls back to Python-only ``ast`` call
-# extraction when this extra is absent (vco_lib/codegraph_calls.py soft-fails
-# per-language on ImportError). Every package below ships wheels for
+# Code-graph tree-sitter grammars: non-Python DEFINITIONS (v0.2.102,
+# vco_lib/codegraph_defs.py) and CALL extraction (CG-2 / Part 5,
+# vco_lib/codegraph_calls.py), both loaded through vco_lib/codegraph_grammars.py.
+# install.py installs this extra by default (opt out: VCT_SKIP_CODEGRAPH_TS=1).
+# OPTIONAL — when it is absent each language soft-falls back to the regex
+# definitions extractors and to Python-only ``ast`` call edges (logged once
+# per language). Every package below ships wheels for
 # linux x86_64 + macOS arm64 + Windows amd64 (verified 2026-07-10), so the
 # extra resolves on all three OSes.
 #
@@ -111,6 +113,29 @@ codegraph-ts = [
     "tree-sitter-lua == 0.5.0",
     "tree-sitter-bash == 0.25.1",
 ]
+# OPTIONAL code-graph parsers (v0.2.102 W6-L) — NOT installed by default.
+# VCO detects the languages each registered project contains and the launcher
+# offers the missing parsers in a modal; the ONE installer helper
+# (vco_lib/codegraph_parsers.py) installs the checked ones into VCO's venv,
+# reading these exact pins from here. Same core pin as codegraph-ts (an
+# install that would move tree-sitter is refused by the pin itself).
+#   tree-sitter-powershell 0.26.4  MIT  (airbus-cert/tree-sitter-powershell),
+#     language ABI 15; wheels for linux x86_64/aarch64 (glibc + musl),
+#     macOS x86_64/arm64, Windows amd64/arm64.
+#   tree-sitter-language-pack 1.21.3  MIT  (xberg-io) — used ONLY for its
+#     `proto` grammar (coder3101/tree-sitter-proto, MIT), ABI 14; wheels for
+#     manylinux_2_34 x86_64/aarch64, macOS x86_64/arm64, Windows amd64/arm64.
+#     It downloads one ~22 MB per-platform parser bundle (sha256-checked) from
+#     GitHub Releases at INSTALL time only (codegraph_parsers pre-fetches into
+#     <venv>/share/vco-codegraph-parsers); a walk never downloads.
+codegraph-ts-powershell = [
+    "tree-sitter == 0.26.0",
+    "tree-sitter-powershell == 0.26.4",
+]
+codegraph-ts-proto = [
+    "tree-sitter == 0.26.0",
+    "tree-sitter-language-pack == 1.21.3",
+]
 # Test/dev tools — mirrors requirements-dev.txt.
 test = [
     "pytest >= 9.0.3",
@@ -128,10 +153,10 @@ dev = [
 
 [project.scripts]
 # Single CLI entry point. Resolves to `vco_lib.cli.__main__:main`,
-# which dispatches to verify-pins / verify-env-projection / rebuild-
-# diagram-index / codegraph-diagram (and future subcommands as Phase 1+
-# adds them — each subcommand registers itself onto a shared argparse
-# subparsers action via its module's `add_subparsers(sub)` hook).
+# which dispatches to verify-pins / verify-env-projection (and future
+# subcommands as they are added — each subcommand registers itself onto a
+# shared argparse subparsers action via its module's `add_subparsers(sub)`
+# hook).
 vco = "vco_lib.cli.__main__:main"
 
 [project.urls]

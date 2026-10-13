@@ -1,0 +1,49 @@
+{
+ "source": "tauri-error-payload.ts",
+ "reviewed": "W6-E 2026-10-10; review round: TS type aliases are definitions (policy LOW-4); W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "parseTaggedErrorPayload",
+   "start": 27,
+   "end": 52,
+   "full_name": "tauri-error-payload.parseTaggedErrorPayload"
+  },
+  {
+   "kind": "function",
+   "name": "tryParseObject",
+   "start": 54,
+   "end": 64,
+   "full_name": "tauri-error-payload.tryParseObject"
+  },
+  {
+   "kind": "function",
+   "name": "escapeRe",
+   "start": 66,
+   "end": 68,
+   "full_name": "tauri-error-payload.escapeRe"
+  },
+  {
+   "kind": "function",
+   "name": "errorText",
+   "start": 71,
+   "end": 73,
+   "full_name": "tauri-error-payload.errorText"
+  },
+  {
+   "kind": "class",
+   "name": "OrchestratorConflictPayload",
+   "start": 82,
+   "end": 88,
+   "full_name": "tauri-error-payload.OrchestratorConflictPayload",
+   "methods": []
+  },
+  {
+   "kind": "function",
+   "name": "parseOrchestratorConflictError",
+   "start": 91,
+   "end": 97,
+   "full_name": "tauri-error-payload.parseOrchestratorConflictError"
+  }
+ ]
+}

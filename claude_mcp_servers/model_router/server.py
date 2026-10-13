@@ -43,9 +43,12 @@ Relay policy: upstream 4xx/5xx are relayed VERBATIM (status and body) so the
 vendor's own error text reaches the user. Only four statuses are the
 gateway's own: 401 (host token or Claude login), 400 (routing or an unreadable
 body), 403 (non-loopback peer), 502/503 (upstream unreachable, or no vendor
-key resolvable) — plus ONE documented exception, a vendor 402/429, which
-becomes a 429 naming the vendor (:mod:`model_router.quota` has the incident
-that bought it).
+key resolvable) — plus ONE documented exception, a quota refusal from a
+vendor: a 402/429, or a 403 whose body carries quota evidence (a vendor that
+answers "You've reached your 5-hour usage limit" with HTTP 403 — the shape
+that used to be misread as a bad key and strike it). Whichever status carried
+it, the refusal becomes a 429 naming the vendor (:mod:`model_router.quota`
+has the incident that bought it).
 
 Bodies are otherwise not EDITED, with two exceptions, both in the same spirit
 and both confined to a vendor route:
@@ -146,8 +149,10 @@ from aiohttp import web
 from . import __version__
 from .auth import OAuthReader, host_token_stamp, token_matches
 from .catalog import (
+    USER_AGENT_HEADER,
     CatalogEntry,
     CatalogService,
+    FamilyFloor,
     resolve_window,
     to_models_response,
     with_usage_labels,
@@ -157,20 +162,35 @@ from .config import (
     SERVICE_NAME,
     UPSTREAM_CONNECT_TIMEOUT_S,
     GatewayConfig,
+    context_guard_margin,
 )
-from .context_table import ContextTableLoader
+from .context_table import (
+    ONE_M_WINDOW,
+    ContextTable,
+    ContextTableLoader,
+    ModelContext,
+    load_seed,
+)
 from .fileperms import OwnerOnlyState
 from .quota import (
     CLASS_EXHAUSTED,
     CLIENT_QUOTA_STATUS,
     QUOTA_STATUSES,
+    _find_reset_value,
+    _reset_distance_s,
     classify_quota,
     find_reset_hint,
+    is_quota_refusal,
     quota_error_body,
     quota_evidence_fields,
 )
-from .routing import Route, RouteError, route as route_model
-from .secrets import VendorKeyResolver
+from .routing import (
+    Route,
+    RouteError,
+    fallback_route,
+    route as route_model,
+)
+from .secrets import TRANSIENT_RETRY_S, VendorKeyResolver
 from .source_identity import source_sha as _package_source_sha
 from .usage_windows import (
     UsageWindows,
@@ -179,26 +199,16 @@ from .usage_windows import (
     session_fetcher,
 )
 from .usage import (
+    ESTIMATE_BYTES_PER_TOKEN,
     UsageAccumulator,
     UsageLedger,
     access_extra,
     build_record,
     count_tokens_estimate,
+    effort_extra,
     guard_count_tokens,
     note_count_substitution,
     read_identity,
-)
-from .effort import translate_effort
-from .tool_ids import (
-    COMPACT_JSON,
-    JSON_BUFFER_LIMIT_BYTES,
-    BoundedIdMap,
-    RepairStats,
-    SseIdRewriter,
-    normalise_vendor_response,
-    restore_vendor_ids,
-    sanitise_for_anthropic,
-    unmark_thinking_signatures,
 )
 from .vendors import (
     ANTHROPIC_FAMILY,
@@ -207,8 +217,22 @@ from .vendors import (
     VENDORS,
     AnthropicFamily,
     Vendor,
+    context_overflow_maximum,
     validate_registry,
     vendor_display_name,
+)
+from .effort import requested_effort, translate_effort
+from .tool_ids import (
+    COMPACT_JSON,
+    JSON_BUFFER_LIMIT_BYTES,
+    BoundedIdMap,
+    RepairStats,
+    SseIdRewriter,
+    complete_cache_fields,
+    normalise_vendor_response,
+    restore_vendor_ids,
+    sanitise_for_anthropic,
+    unmark_thinking_signatures,
 )
 
 logger = logging.getLogger(__name__)
@@ -277,6 +301,13 @@ _STREAM_CHUNK_HINT = "event-stream"
 #: carried the suffix and the client did not send the header itself.
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
 
+#: The prefix every spelling of the 1M beta shares, including future-dated
+#: ones. How the client's OWN request for the window is recognised — both on
+#: the forward path (does the gateway need to add the header?) and on the
+#: ledger path (did the client BUDGET 1M this turn?), so the two never drift
+#: into two different spellings of the same question.
+CONTEXT_1M_BETA_MARKER = "context-1m"
+
 #: Passed to aiohttp as the application's ``client_max_size``. Zero is
 #: aiohttp's "no limit" (``web_request.BaseRequest.read`` guards the size
 #: check with ``if self._client_max_size:``), and no limit is the correct
@@ -321,6 +352,78 @@ _QUOTA_BODY_PEEK_BYTES = 64 * 1024
 #: discarded but streamed verbatim past the bound; the limit bounds memory,
 #: not the relay).
 _AUTH_BODY_LIMIT_BYTES = 64 * 1024
+
+#: Same hold-and-relay bound, for a vendor 4xx body that may need
+#: TRANSLATING (a native context-overflow refusal on a streamed answer —
+#: see :func:`_vendor_stream_error_response`). Its own constant rather than
+#: a share of :data:`_AUTH_BODY_LIMIT_BYTES` for the same reason that one
+#: has: the two bound different decisions, and the day one moves is not the
+#: day the other does.
+_VENDOR_ERROR_BODY_LIMIT_BYTES = 64 * 1024
+
+#: The fallback ladder's retry-after threshold, in seconds (OD-9): a 429 that
+#: carries ``retry-after`` at or below this is retried ONCE on the same rung
+#: before the ladder falls back; one without a retry-after, or with a
+#: quota-exhausted body, falls back immediately. Above the threshold the
+#: window is too long to hold a chat request for, so it falls back too — the
+#: reading of OD-9 that keeps the ladder what it is for (chat continuity),
+#: recorded here rather than in the ruling. Env-tunable because the right
+#: wait is a per-workload judgement, like the context guard's margin.
+FALLBACK_RETRY_AFTER_MAX_DEFAULT_S = 30
+
+#: The env var that overrides :data:`FALLBACK_RETRY_AFTER_MAX_DEFAULT_S`.
+FALLBACK_RETRY_AFTER_MAX_ENV = "VCT_GATEWAY_FALLBACK_RETRY_AFTER_MAX_S"
+
+
+def fallback_retry_after_max_s() -> float:
+    """The ladder's retry-after threshold, in seconds. Never raises.
+
+    An unset, non-numeric or non-positive value answers the default — a typo
+    in the knob must not disable the same-rung retry (which a ``0`` would:
+    every short rate limit would fall straight through to the next vendor).
+    """
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    return env_float(FALLBACK_RETRY_AFTER_MAX_ENV, FALLBACK_RETRY_AFTER_MAX_DEFAULT_S, above=0)
+
+
+#: The two answers :func:`_ladder_verdict` can give.
+LADDER_FALLBACK = "fallback"
+LADDER_RETRY = "retry"
+
+
+def _ladder_verdict(
+    status: int,
+    body: bytes,
+    headers: "Mapping[str, str] | None",
+) -> "tuple[str, Optional[float]]":
+    """OD-9's trigger, as one decision for a quota-status answer.
+
+    Returns ``(LADDER_FALLBACK, None)`` or ``(LADDER_RETRY, delay_s)``. The
+    owner's rule (2026-10-07): fall back when the answer is a 429 WITHOUT a
+    readable ``retry-after``, or with a quota-exhausted body; on a 429 WITH
+    ``retry-after`` <= :func:`fallback_retry_after_max_s`, retry the same
+    rung once and fall back if it refuses again (the "once" is the caller's
+    recursion bound, not this function's). A window LONGER than the threshold
+    also falls back — waiting it out is what the ladder exists to spare the
+    chat. The evidence reading is :mod:`model_router.quota`'s, through the
+    same helpers ``_quota_response`` uses, so the ladder and the substituted
+    quota message can never disagree about what a vendor said. 402 is a
+    balance condition and classifies exhausted, so it falls back with the
+    rest.
+    """
+    if classify_quota(status, body, headers) == CLASS_EXHAUSTED:
+        return LADDER_FALLBACK, None
+    distance = _reset_distance_s(_find_reset_value(body, headers))
+    # ``0 <=`` on purpose (batch-6 B-2): a ``retry-after: 0`` means "retry
+    # immediately" — a free same-rung retry — and must not be read as
+    # no-retry-after, which would spend the next rung's quota where the same
+    # vendor offered to serve a moment later. A NEGATIVE distance (a reset
+    # epoch already in the past) still falls back: it is not a delay the
+    # vendor quoted for a retry.
+    if distance is None or not 0 <= distance <= fallback_retry_after_max_s():
+        return LADDER_FALLBACK, None
+    return LADDER_RETRY, distance
 
 
 #: What a GATEWAY-side 502 carries. Anthropic's SDKs read ``x-should-retry``
@@ -410,6 +513,22 @@ def _peer_is_loopback(request: web.Request) -> Optional[bool]:
     if mapped is not None:
         address = mapped
     return bool(address.is_loopback)
+
+
+@web.middleware
+async def inflight_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], Any],
+) -> web.StreamResponse:
+    """Count the request as in flight until its handler has fully returned —
+    i.e. past its terminal point, where the usage row is submitted
+    (:meth:`Gateway.quiesce`)."""
+    gateway = request.app[APP_KEY]
+    gateway.request_started()
+    try:
+        return await handler(request)
+    finally:
+        gateway.request_finished()
 
 
 @web.middleware
@@ -507,6 +626,15 @@ class Gateway:
         #: of shared state, and so a test can swap it on the gateway object.
         #: It resolves its own file path lazily and never on the request path.
         self.usage = UsageLedger()
+        #: v0.2.102 W6-B2 last round: handlers still running. A request's
+        #: ledger row is submitted at its terminal point, which runs AFTER the
+        #: client has the whole body — so "drain the queued appends" alone
+        #: could run before that submit and miss the row (a shutdown racing a
+        #: last turn; the gateway tests' flake). :meth:`quiesce` waits for
+        #: these first. Counted by :func:`inflight_middleware`.
+        self._inflight = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
         self.catalog = CatalogService(
             vendors=vendors,
             anthropic=anthropic,
@@ -534,13 +662,32 @@ class Gateway:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
 
+    def request_started(self) -> None:
+        self._inflight += 1
+        self._idle.clear()
+
+    def request_finished(self) -> None:
+        self._inflight = max(0, self._inflight - 1)
+        if self._inflight == 0:
+            self._idle.set()
+
+    async def quiesce(self, timeout_s: float = 10.0) -> None:
+        """Wait for in-flight handlers (bounded), then for queued ledger
+        appends — after this every finished request's row is on disk."""
+        try:
+            await asyncio.wait_for(self._idle.wait(), timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning("model-gateway: %d request(s) still in flight after %.0fs; "
+                           "draining the ledger without them", self._inflight, timeout_s)
+        await self.usage.drain()
+
     async def stop(self) -> None:
         # Queued ledger appends first: they are scheduled on the loop's
         # executor and a shutdown that tore the loop down under them would
         # drop the last rows of the session — the ones a user looking at a
-        # context monitor cares most about. Bounded by the number of requests
-        # still in flight, which at shutdown is none or nearly none.
-        await self.usage.drain()
+        # context monitor cares most about. In-flight handlers are waited for
+        # first (bounded): their rows are submitted after their responses.
+        await self.quiesce()
         # Before the session closes: an in-flight usage refresh holds it.
         await self.usage_windows.stop()
         if self._session is not None and not self._session.closed:
@@ -983,6 +1130,15 @@ async def usage_windows_handler(request: web.Request) -> web.Response:
     user's subscription plan and consumption. Answers from MEMORY: a read that
     finds the cache due schedules one background refresh and returns what is
     cached now, so this route can never wait on a vendor.
+
+    The JSON also carries ``agents`` (v0.2.102, G3): one compact attribution
+    row per (session, agent) identity from the usage ledger
+    (:meth:`model_router.usage.UsageLedger.agent_rows`), naming the model
+    that ANSWERED each identity's last turn — the per-agent model the
+    harness's agents GUI cannot show (its row displays the session model for
+    every lane, anthropics/claude-code#93324). It rides THIS route because
+    the launcher's usage card already polls it; it is absent from the
+    ``?format=line`` rendering, which is a windows-only one-liner.
     """
     gateway: Gateway = request.app[APP_KEY]
     started = time.monotonic()
@@ -990,10 +1146,19 @@ async def usage_windows_handler(request: web.Request) -> web.Response:
         _log_unauthorised(gateway, request, started=started)
         return _unauthorised()
     windows = gateway.usage_windows
-    windows.request_refresh()
+    windows.request_refresh(
+        # The reading client's own user-agent, relayed — a quota vendor
+        # whose edge gates on it (the kimi row) is asked as this client.
+        request.headers.get(USER_AGENT_HEADER) or None,
+    )
     snapshot = windows.snapshot()
     if request.query.get("format") == "line":
         return web.Response(text=render_line(snapshot), content_type="text/plain")
+    try:
+        snapshot["agents"] = gateway.usage.agent_rows()
+    except Exception as exc:  # a monitor read must never fail the route
+        logger.warning("usage/windows: agent attribution rows unavailable: %s", exc)
+        snapshot["agents"] = []
     return web.json_response(snapshot)
 
 
@@ -1020,13 +1185,20 @@ async def models_handler(request: web.Request) -> web.Response:
         _log_unauthorised(gateway, request, started=started)
         return _unauthorised()
     usage_labels = gateway.config.picker_usage == PICKER_USAGE_ON
+    # The picker fetch goes out as the client that asked for it — the
+    # same identity the /v1/messages relay forwards. A vendor whose edge
+    # refuses library user-agents (the kimi row) answers its list only
+    # to that; it is relayed, never invented. The usage refresh scheduled
+    # by the same request relays it too, for the same reason.
+    client_user_agent = request.headers.get(USER_AGENT_HEADER) or None
     if usage_labels:
-        gateway.usage_windows.request_refresh()
+        gateway.usage_windows.request_refresh(client_user_agent)
     table = gateway.context.current()
     catalog = await gateway.catalog.union(
         table=table,
         catalog_filter=gateway.config.catalog_filter,
         window_rows=gateway.config.window_rows,
+        user_agent=client_user_agent,
     )
     entries = catalog.entries
     if usage_labels:
@@ -1096,6 +1268,21 @@ class RequestFacts:
     #: is nothing to count, when the body was never parsed (the over-buffer
     #: path), or when this request has no reader for it.
     count_estimate: Optional[int]
+    #: The client budgeted the 1M window this turn: the requested id carried
+    #: the ``[1m]`` suffix OR the request's OWN ``anthropic-beta`` header (as
+    #: the client sent it, before the gateway adds anything) carried a
+    #: ``context-1m`` token. Read off the INCOMING headers, not the forwarded
+    #: ones — the gateway's own :data:`CONTEXT_1M_BETA` addition must never
+    #: count as the client's choice. Carried because ``requested`` alone
+    #: cannot answer it: Claude Code strips the suffix itself and signals the
+    #: window with the header, on every route, first-party and vendor alike.
+    one_m_client: bool = False
+    #: The parsed body carries image/document (base64) blocks. The context
+    #: guard's density calibration is a text property; a body like this is
+    #: estimated UNCALIBRATED and is not recorded as a calibration sample
+    #: (:func:`_carries_binary_blocks`, review batch-2 MEDIUM-1). ``False``
+    #: when the body was not parsed — the ordinary text path.
+    binary_body: bool = False
 
 
 def _route_label(decision: Route) -> str:
@@ -1114,16 +1301,34 @@ def _actual_window(
     the picker.
 
     The entry is SYNTHETIC — id only — which confines the answer to the
-    resolver's first two steps: the tombstone check and the table. That is
-    deliberate. The upstream and family-floor steps need a built catalog, and
-    building one can fetch two upstreams; a request path that could do that
-    would put a vendor's outage inside every user turn. A model the table does
-    not name therefore reads ``unknown`` and the row's ``pct_actual`` is
-    ``null``, which is the honest answer rather than a guessed one.
+    table steps: the tombstone check, the exact row, and (v0.2.102) the
+    family floor, supplied TABLE-ONLY through
+    :meth:`model_router.context_table.ContextTable.older_sibling_floor`. That
+    closes the first-party gap this function shipped with: a brand-new Claude
+    id the seed has not tabulated yet read ``unknown`` here — ``null``
+    ``window_actual`` on every one of its rows — while the picker, whose floor
+    is built over a fetched catalog, advertised the inherited window. The
+    floor here reads the SAME table the resolver already holds, so it still
+    fetches nothing. Only the upstream step stays out of reach, deliberately:
+    it needs a built catalog, and building one can fetch two upstreams; a
+    request path that could do that would put a vendor's outage inside every
+    user turn. A model the table knows nothing about AT ALL therefore still
+    reads ``unknown`` and the row's ``pct_actual`` is ``null``, which is the
+    honest answer rather than a guessed one.
     """
     table = gateway.context.current()
     entry = CatalogEntry(id=requested, display_name=requested)
-    resolution = resolve_window(entry, table=table, family_floor=None)
+    floor_row = table.older_sibling_floor(requested)
+    family_floor = (
+        FamilyFloor(
+            model_id=floor_row.model_id,
+            window=floor_row.context_window,
+            max_output=floor_row.max_output or None,
+        )
+        if floor_row is not None
+        else None
+    )
+    resolution = resolve_window(entry, table=table, family_floor=family_floor)
     return resolution.window, resolution.source
 
 
@@ -1138,6 +1343,10 @@ def _submit_usage(
     stream: bool,
     totals: Mapping[str, int],
     usage_complete: bool,
+    request_bytes: int = 0,
+    fallback_from: str = "",
+    effort_requested: Optional[str] = None,
+    effort_forwarded: Optional[str] = None,
 ) -> None:
     """Write one ledger row for a finished request, or decline to.
 
@@ -1165,12 +1374,59 @@ def _submit_usage(
         usage_complete=usage_complete,
         window_actual=window_actual,
         window_source=window_source,
+        one_m_client=facts.one_m_client,
+        one_m_table=_one_m_table(gateway, decision, facts, requested),
+        request_bytes=request_bytes,
+        fallback_from=fallback_from,
+        effort_requested=effort_requested,
+        effort_forwarded=effort_forwarded,
     )
     try:
         loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
     except RuntimeError:  # pragma: no cover — handlers always have a loop
         loop = None
     gateway.usage.submit(record, loop=loop)
+
+
+def _one_m_table(
+    gateway: "Gateway",
+    decision: Route,
+    facts: RequestFacts,
+    requested: str,
+) -> bool:
+    """Should the TABLE answer for the client's 1M budget? (v0.2.102, X1.)
+
+    The case: Claude Code budgets 1M for a first-party 1M-native model
+    (``claude-opus-5-5``) while sending NEITHER the ``[1m]`` suffix nor the
+    ``context-1m`` beta — the two explicit signals are blind to it, and the
+    ledger recorded ``window_client: 200000`` for a session that reached
+    791K. When no explicit signal fired, the context table is the gateway's
+    one cited source for "the client natively knows this model is 1M", so
+    its answer is derived here: a row whose flag or window says 1M widens
+    the recorded client window.
+
+    Two guards, both the point:
+
+    * **first-party routes only.** Behind a custom base URL the client
+      budgets an id it does not natively know at 200K unless the id carries
+      the suffix — a vendor route's row must therefore NEVER be widened by
+      the table, whatever the model's real window is. The derivation stands
+      in for the client's NATIVE knowledge, which exists on the first-party
+      route alone.
+    * **an explicit signal wins.** When the client said something itself
+      (``facts.one_m_client``) there is nothing to derive — and the
+      derivation only ever widens, so a table row saying 200K, or no row,
+      keeps the 200K default rather than guessing.
+    """
+    if facts.one_m_client or not decision.is_anthropic:
+        return False
+    try:
+        row = gateway.context.current().lookup_id(requested)
+    except Exception:  # noqa: BLE001 — a monitor may never break a relay
+        return False
+    if row is None:
+        return False
+    return bool(row.window_1m) or row.context_window >= ONE_M_WINDOW
 
 
 def _message_start_usage_estimate(
@@ -1207,6 +1463,280 @@ def _message_start_usage_estimate(
     if facts.count_estimate is not None and facts.count_estimate > 0:
         candidates.append(facts.count_estimate)
     return max(candidates) if candidates else None
+
+
+def _prompt_too_long_error(used: int, maximum: int, note: str) -> web.Response:
+    """Anthropic's prompt-too-long refusal, HTTP 400, verbatim in shape.
+
+    This exact envelope — ``invalid_request_error`` with the message
+    ``prompt is too long: N tokens > M maximum`` — is what Claude Code's
+    error classifier maps to its ``prompt_too_long`` class and answers with a
+    REACTIVE compaction (once per turn). A vendor's native overflow error
+    does not match the class, which is how a subagent ran to 983,981 tokens
+    against a 983,616 ceiling and then retried the same request forever
+    (2026-10-06): no compaction, no way out. Both the guard and the vendor
+    overflow translation answer through THIS one builder so the shape cannot
+    drift between them.
+
+    ``note`` is appended AFTER ``maximum`` and must stay free of the
+    ``N tokens > M`` shape — the client parses the message with a regex that
+    stops at the second number, so anything after ``maximum`` is commentary.
+    """
+    return _json_error(
+        400,
+        "invalid_request_error",
+        f"prompt is too long: {used} tokens > {maximum} maximum {note}",
+    )
+
+
+def _context_guard_estimate(
+    gateway: "Gateway",
+    facts: Optional[RequestFacts],
+    payload: Optional[dict],
+    raw: bytes,
+) -> "tuple[Optional[int], bool]":
+    """THIS request's estimated input tokens, and whether it is calibrated.
+
+    The estimate must describe the request on the wire, not the chat's
+    history: the previous turn's vendor-reported ``context_after`` is an
+    ABSOLUTE that only ever rises (a refused request writes no record), so
+    keying the guard on it deadlocks a session the moment one turn crosses
+    the ceiling — it refuses the post-compaction request and the compaction
+    request itself, forever (review CRITICAL-1, probe-verified). What the
+    ledger DOES provide honestly is a DENSITY: the last accepted turn's
+    vendor-reported input tokens over that turn's own body bytes
+    (:meth:`model_router.usage.UsageLedger.token_ratio`, clamped to a sane
+    band, stored beside the floor in the same record — no parallel tracker).
+    This request's estimate is its OWN body size times that ratio, so a
+    compaction — whose request body shrinks with the conversation — shrinks
+    the estimate on the very next request and the guard is self-correcting.
+
+    Returns ``(estimate, calibrated)``. Uncalibrated — no ledger row, no
+    measurable body, OR a body carrying image/document blocks
+    (:attr:`RequestFacts.binary_body`: base64 bytes are ~1000× denser than
+    the text the ratio was measured on, so a text calibration applied to a
+    vision request is a false refusal by construction, review batch-2
+    MEDIUM-1) — falls back to the bytes/4 floor
+    (:func:`model_router.usage.count_tokens_estimate`; on the over-buffer
+    path the whole body's length over the same divisor) and the caller
+    applies a LOOSER threshold — the fallback over-estimates, and the
+    vendor-overflow translation is the safety net for what it lets through.
+    ``(None, False)`` when nothing can be said: forward.
+    """
+    body_bytes = len(raw) if raw else 0
+    if (
+        facts is not None
+        and body_bytes > 0
+        and not facts.binary_body
+    ):
+        ratio = gateway.usage.token_ratio(
+            session=facts.session, agent=facts.agent,
+        )
+        if ratio is not None:
+            return int(body_bytes * ratio), True
+    estimate = count_tokens_estimate(payload, raw=raw)
+    if estimate is None and raw:
+        return (
+            max(
+                1,
+                (len(raw) + ESTIMATE_BYTES_PER_TOKEN - 1)
+                // ESTIMATE_BYTES_PER_TOKEN,
+            ),
+            False,
+        )
+    return estimate, False
+
+
+#: Log-once topic for the guard's table-vs-seed note (see
+#: :func:`_note_guard_table_override`).
+LOG_ONCE_GUARD_TABLE_OVERRIDE = "guard_table_override"
+
+#: The shipped seed, read once for :func:`_note_guard_table_override`. The
+#: seed is a static file that ships with the process, so caching it is a
+#: property of the install, not of any request.
+_SEED_TABLE: Optional[ContextTable] = None
+
+
+def _note_guard_table_override(
+    gateway: "Gateway", requested_model: str, row: ModelContext,
+) -> None:
+    """Say ONCE when the active table's guard window differs from the seed's.
+
+    The guard reads ``gateway.context.current()`` — the ACTIVE table — and
+    on an upgraded install the launcher's exported table (Preferences →
+    Chat model context) can still carry a pre-v0.2.102 figure for a model
+    the seed has since corrected (qwen3.8-max: an export with 1,000,000
+    guards at 991,808 where the shipped seed says 975,424). The export wins
+    per row BY DESIGN and the converge pass will refresh it on the next
+    launcher boot; this note only makes the state visible, once per model
+    per process, naming both values. It changes nothing.
+    """
+    global _SEED_TABLE
+    from .catalog import _log_once  # noqa: PLC0415 — same deliberate lazy import as usage.py
+
+    if _SEED_TABLE is None:
+        _SEED_TABLE = load_seed()
+    seed_row = _SEED_TABLE.lookup_id(requested_model)
+    if seed_row is None or seed_row.context_window == row.context_window:
+        return
+    _log_once(
+        LOG_ONCE_GUARD_TABLE_OVERRIDE,
+        requested_model.lower(),
+        logging.INFO,
+        "model-gateway: context guard: the active chat-model context table "
+        "gives %s a window of %d, but the shipped seed says %d — the "
+        "launcher's exported table (Preferences -> Chat model context) wins "
+        "per row, so the guard is using %d. Correct the row in the launcher "
+        "to change this.",
+        requested_model, row.context_window, seed_row.context_window,
+        row.context_window,
+        logger_=logger,
+    )
+
+
+def _context_guard(
+    gateway: "Gateway",
+    decision: Route,
+    requested_model: str,
+    payload: Optional[dict],
+    raw: bytes,
+    facts: Optional[RequestFacts],
+) -> Optional[web.Response]:
+    """Refuse, BEFORE the vendor is called, a request that cannot fit.
+
+    Vendor-routed only, and only for a model whose REAL window the context
+    table cites: the client budgets 1,000,000 tokens for any ``[1m]`` id, a
+    vendor's real ceiling can be lower (qwen3.8-max: 983,616), and the delta
+    is invisible until the vendor refuses it in a shape the client cannot
+    recover from. The first-party route is NEVER guarded — the upstream
+    answers natively with this very envelope. ``count_tokens`` calls are
+    exempt too: they are questions about the conversation, not turns in it,
+    and refusing one would break the client's own context probing rather
+    than save a request.
+
+    The refusal IS the recovery: the exact prompt-too-long envelope, so the
+    client compacts this turn instead of spending it on a vendor 400 it will
+    replay unchanged. The bias is toward FORWARDING, because the
+    vendor-overflow translation (:func:`_translate_context_overflow`) is the
+    safety net for what the guard lets through: a CALIBRATED estimate (this
+    body's size times the chat's measured tokens-per-byte) is refused past
+    ``window − margin``; an UNCALIBRATED one (bytes/4, which over-estimates
+    on code) only past the RAW window. A body carrying image/document
+    (base64) blocks is NOT JUDGED AT ALL — every estimate the guard can make
+    for it is a text arithmetic that over-states base64 by orders of
+    magnitude, so on a 200K-window model a single screenshot would be
+    falsely refused and compaction cannot shrink an image to fix it (review
+    batch-3 MEDIUM-R; "when in doubt, forward"). And the guard STANDS DOWN
+    for a body that follows a guard refusal without meaningfully shrinking —
+    the shape of the client's reactive compaction, whose body carries ≈ the
+    refused history; refusing it would block this very recovery path (review
+    batch-2 MEDIUM-2). Returns ``None`` to forward, response to refuse.
+    """
+    vendor = decision.vendor
+    if vendor is None or decision.is_anthropic:
+        return None
+    if facts is not None and facts.count_tokens:
+        return None
+    row = gateway.context.current().lookup_id(requested_model)
+    if row is None or row.context_window <= 0:
+        return None
+    _note_guard_table_override(gateway, requested_model, row)
+    if facts is not None and facts.binary_body:
+        # Not judged: see the docstring. Checked BEFORE the stand-down so an
+        # intervening image turn does not consume a text refusal's evidence.
+        return None
+    body_bytes = len(raw) if raw else 0
+    if facts is not None and body_bytes > 0:
+        if gateway.usage.guard_stands_down(
+            session=facts.session, agent=facts.agent, body_bytes=body_bytes,
+        ):
+            logger.info(
+                "model-gateway: context guard stood down for %s on %s: the "
+                "previous request for this chat was refused and this body "
+                "has not shrunk — forwarding, likely the client's compaction "
+                "or a retry; a vendor overflow refusal will be translated",
+                _log_safe(requested_model), _log_safe(vendor.vendor_id),
+            )
+            return None
+    estimate, calibrated = _context_guard_estimate(
+        gateway, facts, payload, raw,
+    )
+    if estimate is None:
+        return None
+    margin = context_guard_margin()
+    ceiling = row.context_window - margin if calibrated else row.context_window
+    if estimate <= ceiling:
+        return None
+    if facts is not None:
+        gateway.usage.note_guard_refusal(
+            session=facts.session, agent=facts.agent, body_bytes=body_bytes,
+        )
+    logger.warning(
+        "model-gateway: context guard refused %s on %s: estimated %d input "
+        "tokens (%s) against a cited window of %d, threshold %d — answering "
+        "prompt_too_long so the client compacts; a vendor refusal that "
+        "still comes back is translated",
+        _log_safe(requested_model), _log_safe(vendor.vendor_id),
+        estimate,
+        "calibrated: this body's bytes x the chat's token density"
+        if calibrated else "uncalibrated bytes/4 floor",
+        row.context_window, ceiling,
+    )
+    return _prompt_too_long_error(
+        estimate, ceiling,
+        f"(gateway guard: {vendor.short_name or vendor.vendor_id} serves "
+        f"{_log_safe(decision.forward_model)} at a real ceiling of "
+        f"{row.context_window} tokens — compact now)",
+    )
+
+
+def _translate_context_overflow(
+    vendor: Vendor,
+    body: bytes,
+    *,
+    gateway: "Gateway",
+    facts: Optional[RequestFacts],
+) -> Optional[web.Response]:
+    """Re-emit a vendor's native context-overflow refusal as prompt-too-long.
+
+    The second half of the incident's fix, for the requests the guard's
+    estimate let through: the vendor DID refuse, in its own words
+    (QwenCloud: ``"Range of input length should be [1, 983616]"``), and that
+    shape is not one Claude Code maps to ``prompt_too_long`` — so without
+    this translation the client retries a request the vendor will always
+    refuse. Detection and the ceiling figure come from the vendor row
+    (:func:`model_router.vendors.context_overflow_maximum`) — a shape this
+    module never spells inline. ``None`` means "not an overflow refusal":
+    the caller relays the vendor's own answer verbatim, the behaviour every
+    unlisted vendor keeps.
+
+    ``N tokens`` is the BEST known estimate — the previous turn's
+    vendor-reported ``context_after`` for this ``(session, agent)`` when the
+    ledger has one, else the vendor's own ceiling, which is at least a true
+    sentence about the request ("at least this big") and always parses.
+    """
+    maximum = context_overflow_maximum(vendor, body)
+    if maximum is None:
+        return None
+    used: Optional[int] = None
+    if facts is not None:
+        used = gateway.usage.context_floor(
+            session=facts.session, agent=facts.agent,
+        )
+    if used is None or used <= 0:
+        used = maximum
+    logger.warning(
+        "model-gateway: translated %s's native context-overflow refusal "
+        "(ceiling %d per the vendor's own message) into the prompt-too-long "
+        "envelope so the client compacts",
+        _log_safe(vendor.vendor_id), maximum,
+    )
+    return _prompt_too_long_error(
+        used, maximum,
+        f"(gateway: {vendor.short_name or vendor.vendor_id} refused the "
+        f"context size; this model's real ceiling is {maximum} tokens — "
+        "compact now)",
+    )
 
 
 def _log_safe(value: object) -> str:
@@ -1248,8 +1778,9 @@ def _log_safe(value: object) -> str:
 IMAGES_UNCOUNTED = "images=?"
 
 
-def _count_image_blocks(blocks: Any) -> int:
-    """Count ``type == "image"`` blocks, walking into every nested ``content``.
+def _count_blocks_of_type(blocks: Any, types: tuple[str, ...]) -> int:
+    """Count blocks whose ``type`` is in ``types``, walking every nested
+    ``content``.
 
     A subagent that read an image file does not put the block at the top of a
     message: it arrives inside a ``tool_result`` block's own ``content[]``
@@ -1264,11 +1795,47 @@ def _count_image_blocks(blocks: Any) -> int:
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "image":
+        if block.get("type") in types:
             total += 1
         if "content" in block:
-            total += _count_image_blocks(block["content"])
+            total += _count_blocks_of_type(block["content"], types)
     return total
+
+
+def _count_image_blocks(blocks: Any) -> int:
+    """Count ``type == "image"`` blocks (the access line's ``images=N``)."""
+    return _count_blocks_of_type(blocks, ("image",))
+
+
+#: Content-block types whose payload is base64/binary rather than text — a
+#: handful of bytes of base64 per token, where a text body carries ~2-4. The
+#: context guard's density calibration is a TEXT property, so a body carrying
+#: any of these is estimated UNCALIBRATED and never used to calibrate
+#: (review batch-2 MEDIUM-1: a text-calibrated density applied to a vision
+#: request over-estimates its tokens by orders of magnitude and refuses a
+#: request the vendor would serve).
+BINARY_BLOCK_TYPES = ("image", "document")
+
+
+def _carries_binary_blocks(payload: Any) -> bool:
+    """Whether the parsed request carries image/document (base64) blocks.
+
+    ``False`` on anything but a positive count — this feeds a forwarding
+    decision, and it must fail toward the ordinary text path; the
+    vendor-overflow translation remains the net for whatever the raw-window
+    rule lets through. Nested blocks are walked by the shared counter
+    (:func:`_count_blocks_of_type`), so a ``tool_result``-nested screenshot
+    counts too.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return False
+        return (
+            _count_blocks_of_type(payload.get("messages"), BINARY_BLOCK_TYPES)
+            > 0
+        )
+    except Exception:  # noqa: BLE001 — see _images_field: never cost a chat
+        return False
 
 
 def _images_field(payload: Any) -> str:
@@ -1376,6 +1943,37 @@ def _apply_text_only_images(
     if not gateway.context.current().is_text_only(model_id):
         return payload, 0
     return _strip_images_for_text_only(payload, model_id)
+
+
+def _apply_clear_thinking(
+    payload: Any, gateway: "Gateway", model_id: str,
+) -> "tuple[Any, bool]":
+    """Set ``thinking.clear_thinking`` IFF a cited seed row carries the field.
+
+    v0.2.102 item A8 (OD-10): the value comes from the shipped seed row —
+    :meth:`model_router.context_table.ContextTable.clear_thinking`, the same
+    carry discipline as ``text_only`` — and ``None`` (the default, a row the
+    seed does not flag) means NOT SENT. The field is only ever MERGED into a
+    ``thinking`` param the request already carries: adding a ``thinking``
+    param to a request that had none would turn a plain completion into a
+    thinking one (and trip every validator that comes with that), which is a
+    different request, not a shaping of it. Returns ``(payload, changed)``.
+    """
+    if not isinstance(payload, dict):
+        return payload, False
+    value = gateway.context.current().clear_thinking(model_id)
+    if value is None:
+        return payload, False
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict):
+        return payload, False
+    if thinking.get("clear_thinking") == value:
+        return payload, False
+    new_thinking = dict(thinking)
+    new_thinking["clear_thinking"] = value
+    new_payload = dict(payload)
+    new_payload["thinking"] = new_thinking
+    return new_payload, True
 
 
 def _access_line(
@@ -1696,6 +2294,197 @@ async def _stream_after(
         yield chunk
 
 
+def _ladder_escalation(
+    *,
+    request: web.Request,
+    gateway: "Gateway",
+    decision: Route,
+    payload: Optional[dict],
+    requested_model: str,
+    stream_requested: bool,
+    started: float,
+    images: str,
+    facts: Optional[RequestFacts],
+    fallback_from: str = "",
+) -> "Optional[Callable[[str], Awaitable[Optional[web.StreamResponse]]]]":
+    """The OD-9 escalation for one rung, as a callable the proxy can invoke.
+
+    Returns ``None`` when this route has no next rung
+    (:func:`model_router.routing.fallback_route`), the body was never parsed
+    (an unparseable or over-buffer request cannot be re-shaped for a different
+    model, so the ladder stands down and the refusal is relayed), or — batch-6
+    B-1, coordinator 2026-10-07 — the route is a VENDOR route the request did
+    not arrive at by fallback (``fallback_from`` empty): the vendor→vendor
+    edges belong to the ladder's own chain, never to a model the user picked.
+    The returned
+    callable takes the failed rung's quota EVIDENCE (``quota_evidence_fields``
+    plus the upstream status, as one string) and answers the NEXT rung's
+    response, or ``None`` when the rung could not be served at all — no vendor
+    key, or the context guard refuses the request for the rung's model — in
+    which case the caller falls back to its own refusal path. Never raises
+    past ``_guarded``: a shaping failure sends the UNshaped bytes on rather
+    than failing the rung.
+
+    The escalation re-runs the SAME vendor shaping the ordinary path runs
+    (id restoration, thinking-signature restoration, effort translation,
+    ``clear_thinking``, text-only images, context guard) against the RUNG's
+    model — a fallback request is a full request, not a patched relay — and
+    it carries ITS OWN escalation for the rung after it, so the ladder is
+    walked to its end or not at all. R15: the escalated attempt's access
+    line and ledger row both say it was a fallback (``fallback_from`` names
+    the rung that was left; ``forward`` names the model that answered), so no
+    remap is ever silent.
+    """
+    next_decision = fallback_route(decision, vendors=gateway.vendors)
+    if next_decision is None or payload is None:
+        return None
+    if facts is not None and facts.count_tokens:
+        # A count_tokens call is a question about the conversation, not a
+        # turn in it (the same exemption the context guard makes): spending
+        # another vendor's quota to answer one is a cost with no reader.
+        return None
+    if decision.vendor is not None and not fallback_from:
+        # Batch-6 B-1 (coordinator, 2026-10-07): the vendor→vendor edges are
+        # the LADDER's, not a general proxy. A vendor route is armed only
+        # when the attempt ARRIVED there by fallback (``fallback_from`` is
+        # the rung it escaped); a user who PICKED this vendor model made a
+        # deliberate capability/cost choice, and its refusal is relayed for
+        # the client's own retry to own. The first-party haiku-slot entry
+        # edge above stays route-keyed, so the ladder's chain is walked in
+        # full for the slot it exists for.
+        return None
+    vendor = next_decision.vendor
+    assert vendor is not None  # noqa: S101 — guaranteed by fallback_route
+    from_label = f"{_route_label(decision)}:{decision.forward_model}"
+
+    async def escalate(evidence: str) -> "Optional[web.StreamResponse]":
+        key_result = await gateway.keys.aresolve(vendor)
+        if not key_result.key:
+            logger.info(
+                "model-gateway: fallback ladder cannot use %s %s for %s: no "
+                "vendor key resolved (%s); relaying the original refusal",
+                vendor.vendor_id, next_decision.forward_model,
+                _log_safe(requested_model), key_result.problem or "-",
+            )
+            return None
+        shaped = dict(payload)
+        shaped["model"] = next_decision.forward_model
+        headers = gateway.forward_headers(request)
+        headers[vendor.auth_header] = f"{vendor.auth_scheme}{key_result.key}"
+        headers["Content-Type"] = "application/json"
+        headers.setdefault("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
+        # The same guarded passes the ordinary vendor path runs, against the
+        # RUNG's model and id map. Each degrades to "send the client's bytes"
+        # on failure — a fallback that shapes worse than the main path would
+        # be a fallback that fails differently, not better.
+        restored = _guarded(
+            restore_vendor_ids, shaped, gateway.id_map(vendor),
+            what="fallback vendor id restoration",
+        )
+        if restored is not _ABANDON:
+            shaped, _changed = restored
+        unmarked = _guarded(
+            unmark_thinking_signatures, shaped,
+            what="fallback thinking-signature restoration",
+        )
+        if unmarked is not _ABANDON:
+            shaped, _changed = unmarked
+        effort = _guarded(
+            translate_effort, shaped, vendor.vendor_id,
+            next_decision.forward_model, what="fallback effort translation",
+        )
+        if effort is not _ABANDON:
+            shaped, _changed = effort
+        cleared = _guarded(
+            _apply_clear_thinking, shaped, gateway,
+            next_decision.forward_model, what="fallback clear_thinking shaping",
+        )
+        if cleared is not _ABANDON:
+            shaped, _changed = cleared
+        images_pair = _guarded(
+            _apply_text_only_images, shaped, gateway,
+            next_decision.forward_model,
+            what="fallback text-only image replacement",
+        )
+        if images_pair is not _ABANDON:
+            shaped, _changed = images_pair
+        # The guard judges the request against the RUNG's real window, before
+        # the rung is called — the same pre-emption the ordinary path gives
+        # every vendor request. A refusal here means the rung cannot serve
+        # this conversation at its size; the caller relays the ORIGINAL
+        # refusal rather than swapping one dead end for another.
+        raw = json.dumps(shaped, **COMPACT_JSON).encode("utf-8")
+        guard = _context_guard(
+            gateway, next_decision, next_decision.forward_model, shaped, raw,
+            facts,
+        )
+        if guard is not None:
+            logger.info(
+                "model-gateway: fallback ladder skipped %s %s for %s: the "
+                "context guard refuses the request at that model's window",
+                vendor.vendor_id, next_decision.forward_model,
+                _log_safe(requested_model),
+            )
+            return None
+        url = f"{next_decision.upstream}{_canonical_path(request)}"
+        if request.query_string:
+            url = f"{url}?{request.query_string}"
+        # v0.2.102: the escalated attempt gets its OWN effort pair — the
+        # request is the client's (``payload``), but the rung's shaping above
+        # (including ITS effort translation) is what goes upstream, and a
+        # fallback row must not record the rung the request escaped.
+        escalation_effort_requested = _guarded(
+            requested_effort, payload, what="effort observability",
+        )
+        escalation_effort_forwarded = _guarded(
+            requested_effort, shaped, what="effort observability",
+        )
+        return await _proxy(
+            request,
+            gateway,
+            next_decision,
+            url,
+            headers,
+            raw,
+            requested_model=requested_model,
+            stream_requested=stream_requested,
+            started=started,
+            note=(
+                f"note=model_fallback fallback_from={from_label} {evidence}"
+            ).strip(),
+            images=images,
+            facts=facts,
+            allow_oauth_retry=False,
+            effort_requested=(
+                escalation_effort_requested
+                if escalation_effort_requested is not _ABANDON
+                else None
+            ),
+            effort_forwarded=(
+                escalation_effort_forwarded
+                if escalation_effort_forwarded is not _ABANDON
+                else None
+            ),
+            ladder_escalate=_ladder_escalation(
+                request=request,
+                gateway=gateway,
+                decision=next_decision,
+                payload=shaped,
+                requested_model=requested_model,
+                stream_requested=stream_requested,
+                started=started,
+                images=images,
+                facts=facts,
+                # The rung attempt DID arrive by fallback — this is what arms
+                # its own next edge (B-1): the chain continues from here.
+                fallback_from=from_label,
+            ),
+            fallback_from=from_label,
+        )
+
+    return escalate
+
+
 async def messages_handler(request: web.Request) -> web.StreamResponse:
     """Proxy ``/v1/messages`` and ``/v1/messages/count_tokens``.
 
@@ -1740,8 +2529,14 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     # "Warm while chats flow" (owner, 2026-09-23): a synchronous O(1) signal
     # that may schedule ONE background usage refresh per interval. Nothing is
     # awaited here, and a defect in it is guarded like every optional pass —
-    # it can never delay, fail or alter this request.
-    _guarded(gateway.usage_windows.note_activity, what="usage-window activity signal")
+    # it can never delay, fail or alter this request. The client's own
+    # user-agent rides along, relayed: a quota vendor whose edge gates on it
+    # (the kimi row) is asked as the client whose chat scheduled the refresh.
+    _guarded(
+        gateway.usage_windows.note_activity,
+        request.headers.get(USER_AGENT_HEADER) or None,
+        what="usage-window activity signal",
+    )
 
     buffer_limit = gateway.config.rewrite_buffer_bytes
     raw, over_buffer = await _buffer_bounded(request.content, buffer_limit)
@@ -1757,6 +2552,13 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     #: says otherwise: an over-buffer or unparseable body is never parsed a
     #: second time just to count it, and "not counted" must not read as "0".
     images_field = IMAGES_UNCOUNTED
+    #: The effort selector the CLIENT sent (v0.2.102, register item
+    #: 2026-10-10), read off the parsed body BEFORE any shaping pass can
+    #: touch it — this is the observation, and ``effort_forwarded`` below is
+    #: what actually goes upstream after the rewrites. ``None`` until a
+    #: parsed body says otherwise: the over-buffer and unparseable paths
+    #: never learn it, and absent stays absent rather than becoming a guess.
+    effort_requested: Optional[str] = None
     if over_buffer:
         # Deliberately NOT parsed and deliberately NOT refused: the body is
         # past what this daemon will hold, so it goes upstream as a stream and
@@ -1828,6 +2630,14 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             # Counted from the ALREADY-PARSED body — no second parse, and the
             # bytes that go upstream are untouched by it either way.
             images_field = _images_field(payload)
+            # Same discipline: read the effort off the body the CLIENT sent,
+            # before the shaping passes below can rewrite it. A defect in the
+            # reader costs the OBSERVATION (stays None), never the request.
+            effort_read = _guarded(
+                requested_effort, payload, what="effort observability",
+            )
+            if effort_read is not _ABANDON:
+                effort_requested = effort_read
 
     decision: "Route | RouteError"
     if unparseable:
@@ -1919,6 +2729,18 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             )
             else None
         ),
+        # The client's OWN 1M signal, read off the INCOMING headers: the
+        # suffix half the router already caught, plus the beta header the
+        # client sends on ordinary traffic (it resolves the suffix itself).
+        # Both spellings, every route — a vendor id is budgeted against the
+        # same client arithmetic.
+        one_m_client=(
+            decision.one_m_requested
+            or CONTEXT_1M_BETA_MARKER in request.headers.get(
+                "anthropic-beta", "",
+            )
+        ),
+        binary_body=_carries_binary_blocks(payload),
     )
 
     headers = gateway.forward_headers(request)
@@ -1937,6 +2759,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     #: over-buffer path, where the vendor transforms do not run.
     effort_translated = False
     text_only_images_omitted = 0
+    clear_thinking_applied = False
     if decision.is_anthropic:
         oauth = gateway.oauth.read()
         if oauth.token is None:
@@ -1949,7 +2772,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         # The 1M window is a beta header, not a model name (routing strips the
         # suffix). Every beta the client sent is kept; this only ADDS, and only
         # when the client did not already ask for the window itself.
-        if decision.one_m_requested and "context-1m" not in beta:
+        if decision.one_m_requested and CONTEXT_1M_BETA_MARKER not in beta:
             beta = f"{beta},{CONTEXT_1M_BETA}" if beta else CONTEXT_1M_BETA
         if beta:
             headers["anthropic-beta"] = beta
@@ -1984,6 +2807,18 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         vendor = decision.vendor
         assert vendor is not None  # noqa: S101 — guaranteed by Route
 
+        # The context guard, BEFORE the vendor is called: a request the
+        # table says cannot fit the model's real window is refused here, in
+        # the envelope the client can recover from by compacting, instead of
+        # becoming a vendor 400 it would retry unchanged (see
+        # :func:`_context_guard` for the incident).
+        guard = _context_guard(
+            gateway, decision, requested_model, payload, raw, facts,
+        )
+        if guard is not None:
+            log_local(400, "context_guard")
+            return guard
+
         # Anthropic server tools (``web_search_*`` and friends) are forwarded
         # to the vendor UNCHANGED, and the vendor's own answer — including any
         # error — is relayed verbatim. Live evidence 2026-10-04 overturns the
@@ -1996,8 +2831,16 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         key_result = await gateway.keys.aresolve(vendor)
         if not key_result.key:
             log_local(503, "vendor_key_unavailable")
+            # v0.2.102 (W6-AB): a TRANSIENT miss (the secret store was busy —
+            # keychain or hub — not a missing key) carries Retry-After, so the
+            # client's own retry (Anthropic SDK / Claude Code honour it on a
+            # 503) lands once the gateway has asked the store again.
             return _json_error(
                 503, "api_error", key_result.problem or "no vendor key available",
+                headers=(
+                    {"Retry-After": str(TRANSIENT_RETRY_S)}
+                    if key_result.transient else None
+                ),
             )
         headers[vendor.auth_header] = f"{vendor.auth_scheme}{key_result.key}"
         # Hand the vendor back its OWN ids: we rewrote them on the way out.
@@ -2065,6 +2908,41 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                     mutated = True
                     text_only_images_omitted = omitted
 
+            # item (g) (A8, OD-10): a cited seed row's clear_thinking value
+            # rides the request's own thinking param. Only rows that carry
+            # the field; a request without a thinking param is untouched.
+            clear_pair = _guarded(
+                _apply_clear_thinking,
+                forward_payload,
+                gateway,
+                decision.forward_model,
+                what="clear_thinking shaping",
+            )
+            if clear_pair is _ABANDON:
+                rewrite_failed = True
+            else:
+                forward_payload, clear_changed = clear_pair
+                if clear_changed:
+                    mutated = True
+                    clear_thinking_applied = True
+
+    # The effort selector as it stands AFTER every shaping pass — this is the
+    # value the upstream is about to receive, read off the same payload the
+    # bytes below are serialised from, so the recorded pair can only ever
+    # disagree through a rewrite the gateway actually made (translation, or a
+    # first-party thinking-param drop). ``None`` on the over-buffer and
+    # unparseable paths, where there is no parsed payload to read: unknown,
+    # never guessed.
+    effort_forwarded: Optional[str] = (
+        _guarded(
+            requested_effort, forward_payload, what="effort observability",
+        )
+        if forward_payload is not None
+        else None
+    )
+    if effort_forwarded is _ABANDON:
+        effort_forwarded = None
+
     headers["Content-Type"] = "application/json"
     headers.setdefault("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
 
@@ -2075,6 +2953,8 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     # byte. Assembled here so they ride EVERY access line this request writes.
     if effort_translated:
         note = f"{note} note=effort_translated".strip()
+    if clear_thinking_applied:
+        note = f"{note} note=clear_thinking_applied".strip()
     if text_only_images_omitted:
         note = (
             f"{note} "
@@ -2126,6 +3006,21 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     if request.query_string:
         url = f"{url}?{request.query_string}"
 
+    # The fallback ladder (OD-9): armed only for a route with a next rung AND
+    # a parsed body the escalation can re-shape. ``None`` for every ordinary
+    # request, so the proxy's ladder branch is unreachable and behaviour is
+    # byte-for-byte what it was.
+    ladder_hook = _ladder_escalation(
+        request=request,
+        gateway=gateway,
+        decision=decision,
+        payload=payload,
+        requested_model=str(requested_model),
+        stream_requested=stream_requested,
+        started=started,
+        images=images_field,
+        facts=facts,
+    )
     return await _proxy(
         request,
         gateway,
@@ -2139,6 +3034,9 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         note=note,
         images=images_field,
         facts=facts,
+        ladder_escalate=ladder_hook,
+        effort_requested=effort_requested,
+        effort_forwarded=effort_forwarded,
     )
 
 
@@ -2186,6 +3084,11 @@ async def _proxy(
     allow_oauth_retry: bool = True,
     allow_quota_reprobe: bool = True,
     facts: Optional[RequestFacts] = None,
+    ladder_escalate: Optional[Callable[[str], Awaitable[Optional[web.StreamResponse]]]] = None,
+    fallback_from: str = "",
+    allow_ladder_retry: bool = True,
+    effort_requested: Optional[str] = None,
+    effort_forwarded: Optional[str] = None,
 ) -> web.StreamResponse:
     """Forward one request upstream and relay the answer.
 
@@ -2207,6 +3110,18 @@ async def _proxy(
     bounds: each retried call clears its own, so a genuinely dead login, and
     a vendor that answers "exhausted" to every attempt alike, answer the
     client instead of looping.
+
+    A third, bounded recovery exists beside those two: the owner's fallback
+    ladder (OD-9, ``ladder_escalate``). On a quota-status answer for a route
+    that has a next rung, with the body still in hand as bytes, the ladder
+    branch (:func:`_ladder_quota_branch`) retries the same rung once on a
+    short ``retry-after`` and otherwise escalates to the rung
+    :func:`model_router.routing.fallback_route` names — every escalation
+    visible in the access line and the ledger (``fallback_from``), and the
+    last rung's refusal passed to the client unchanged. The entry edge is the
+    first-party haiku slot; a vendor→vendor edge is armed only for an attempt
+    that reached its rung BY fallback (batch-6 B-1), so a vendor model the
+    user picked is never rerouted.
 
     On a stream, the SSE rewriter's held tail is flushed after the last
     upstream chunk — except on the client-disconnect path, where it is
@@ -2247,6 +3162,12 @@ async def _proxy(
         # saying the same thing twice reads as two events.
         if rewrite_failed and "note=rewrite_failed" not in note:
             parts.append("note=rewrite_failed")
+        # v0.2.102: the effort pair, in the ONE shape every proxied line
+        # carries (``effort_req=… effort_fwd=…``, ``-`` for absent). Here
+        # rather than in the handler so the recursive paths below — the
+        # oauth retry, a quota reprobe, a ladder escalation — each record
+        # the pair for THEIR attempt without every caller re-adding it.
+        parts.append(effort_extra(effort_requested, effort_forwarded))
         # THE terminal point of this request, so it is also where the
         # accounting is closed: one access line and at most one ledger row,
         # written from the same place, can never disagree about how a request
@@ -2290,6 +3211,28 @@ async def _proxy(
                     stream=stream,
                     totals=totals,
                     usage_complete=complete,
+                    # The body's own size, for the context guard's
+                    # tokens-per-byte calibration (UsageRecord.request_bytes).
+                    # Zero when it cannot be measured (the over-buffer path,
+                    # where the body is a consumed iterator) AND when the
+                    # body carried image/document blocks — base64 bytes are
+                    # not a text-density sample, and a turn that carried them
+                    # must not calibrate later text turns (batch-2 MEDIUM-1).
+                    # Either way the guard then runs uncalibrated for that
+                    # chat.
+                    request_bytes=(
+                        len(body)
+                        if isinstance(body, (bytes, bytearray))
+                        and not (facts is not None and facts.binary_body)
+                        else 0
+                    ),
+                    # R15: the rung this request escaped, when the ladder
+                    # served it — empty (never omitted) on ordinary rows.
+                    fallback_from=fallback_from,
+                    # v0.2.102: the effort pair for THIS attempt, the same
+                    # observation the access line above just recorded.
+                    effort_requested=effort_requested,
+                    effort_forwarded=effort_forwarded,
                 ),
                 what="usage ledger",
             )
@@ -2372,8 +3315,97 @@ async def _proxy(
                         # the client but vanished from the usage record.
                         facts=facts,
                         allow_oauth_retry=False,
+                        ladder_escalate=ladder_escalate,
+                        fallback_from=fallback_from,
+                        allow_ladder_retry=allow_ladder_retry,
+                        effort_requested=effort_requested,
+                        effort_forwarded=effort_forwarded,
                     )
             vendor = decision.vendor
+            # The owner's fallback ladder (OD-9). Armed only for a route
+            # with a next rung and a body that can be re-sent. Defined before
+            # the branches that may need it — the quota-status arm below and
+            # the quota-in-disguise route a vendor 403 can take through
+            # ``_auth_rejection_response``. ``allow_ladder_retry`` is the
+            # same-rung retry's recursion bound, cleared in the retry below
+            # exactly as the oauth and quota bounds are.
+            async def _ladder_retry(evidence: str) -> web.StreamResponse:
+                return await _proxy(
+                    request,
+                    gateway,
+                    decision,
+                    url,
+                    headers,
+                    body,
+                    requested_model=requested_model,
+                    stream_requested=stream_requested,
+                    started=started,
+                    note=f"{note} note=ladder_retry {evidence}".strip(),
+                    images=images,
+                    facts=facts,
+                    allow_oauth_retry=False,
+                    allow_quota_reprobe=False,
+                    ladder_escalate=ladder_escalate,
+                    fallback_from=fallback_from,
+                    allow_ladder_retry=False,
+                    effort_requested=effort_requested,
+                    effort_forwarded=effort_forwarded,
+                )
+
+            async def _quota_in_disguise(
+                held: bytes,
+            ) -> web.StreamResponse:
+                # v0.2.102 fix round: what a vendor 403 carrying quota
+                # evidence gets — EXACTLY what a 429/402 gets. The ladder
+                # when armed and the body is re-sendable bytes; else the
+                # substituted envelope, with the held body handed over (the
+                # stream is consumed by the classification that routed here,
+                # and a second read would answer empty).
+                assert vendor is not None  # noqa: S101 — the auth branch runs only for a vendor route
+                if (
+                    ladder_escalate is not None
+                    and isinstance(body, (bytes, bytearray))
+                ):
+                    return await _ladder_quota_branch(
+                        upstream,
+                        gateway,
+                        decision,
+                        access,
+                        stream_requested=stream_requested,
+                        escalate=ladder_escalate,
+                        retry=_ladder_retry if allow_ladder_retry else None,
+                        raw=held,
+                    )
+                return await _quota_response(
+                    upstream,
+                    vendor,
+                    stream_requested,
+                    access,
+                    reprobe=(
+                        _quota_reprobe(
+                            request,
+                            gateway,
+                            decision,
+                            url,
+                            headers,
+                            body,
+                            requested_model=requested_model,
+                            stream_requested=stream_requested,
+                            started=started,
+                            note=note,
+                            images=images,
+                            facts=facts,
+                            fallback_from=fallback_from,
+                            effort_requested=effort_requested,
+                            effort_forwarded=effort_forwarded,
+                        )
+                        if allow_quota_reprobe
+                        and isinstance(body, (bytes, bytearray))
+                        else None
+                    ),
+                    raw=held,
+                )
+
             # WP-6 review MAJOR-1, refined by the no-discovery-vendor
             # addendum: a vendor 401/403 must be CLASSIFIED before it can
             # touch the strike counter, and classifying means reading the
@@ -2382,13 +3414,33 @@ async def _proxy(
             # invalidate the last-good key; any 2xx resets via the elif
             # below), exempts the documented model-level access-denial
             # shape, and relays the vendor's own answer verbatim either
-            # way. Status sets here are disjoint from the quota branch's.
+            # way. Status sets here are disjoint from the quota branch's —
+            # with ONE carve-out, decided INSIDE from the held body: a 403
+            # whose body carries quota evidence is routed to the quota
+            # machinery above (``_quota_in_disguise``) with no strike.
             if vendor is not None and upstream.status in (401, 403):
                 return await _auth_rejection_response(
                     request, gateway, vendor, upstream, access,
+                    quota_route=_quota_in_disguise,
                 )
             if vendor is not None and 200 <= upstream.status < 300:
                 gateway.note_vendor_success(vendor.vendor_id)
+            if (
+                ladder_escalate is not None
+                and isinstance(body, (bytes, bytearray))
+                and upstream.status in QUOTA_STATUSES
+            ):
+                # The ladder branch owns the response because deciding means
+                # reading the body.
+                return await _ladder_quota_branch(
+                    upstream,
+                    gateway,
+                    decision,
+                    access,
+                    stream_requested=stream_requested,
+                    escalate=ladder_escalate,
+                    retry=_ladder_retry if allow_ladder_retry else None,
+                )
             if vendor is not None and upstream.status in QUOTA_STATUSES:
                 return await _quota_response(
                     upstream,
@@ -2414,6 +3466,9 @@ async def _proxy(
                             note=note,
                             images=images,
                             facts=facts,
+                            fallback_from=fallback_from,
+                            effort_requested=effort_requested,
+                            effort_forwarded=effort_forwarded,
                         )
                         if allow_quota_reprobe
                         and isinstance(body, (bytes, bytearray))
@@ -2457,6 +3512,22 @@ async def _proxy(
                     decision=decision,
                     facts=facts,
                     accumulator=accumulator,
+                )
+
+            # A streamed vendor 4xx may be a native context-overflow refusal
+            # wearing an ``event: error`` body. Reading it to find out means
+            # owning the response, so this branch (vendors with a DECLARED
+            # overflow shape only) translates when it is one and relays the
+            # vendor's own bytes verbatim when it is not — the same
+            # own-the-response shape the 401/403 branch below uses.
+            if (
+                vendor is not None
+                and is_stream
+                and 400 <= upstream.status < 500
+                and vendor.context_overflow_markers
+            ):
+                return await _vendor_stream_error_response(
+                    request, gateway, vendor, upstream, access, facts=facts,
                 )
 
             rewriter = None
@@ -2741,12 +3812,81 @@ def _auth_rejection_is_key_level(status: int, raw: bytes) -> bool:
     return "access_denied" not in (code, error_type)
 
 
+async def _vendor_stream_error_response(
+    request: web.Request,
+    gateway: "Gateway",
+    vendor: Vendor,
+    upstream: aiohttp.ClientResponse,
+    access: Callable[..., None],
+    *,
+    facts: Optional[RequestFacts] = None,
+) -> web.StreamResponse:
+    """A streamed vendor 4xx: translated if it is a context overflow, else
+    the vendor's own bytes verbatim.
+
+    An SSE ``event: error`` body cannot be classified without reading it,
+    and an aiohttp ``StreamReader`` cannot be un-read — so this branch owns
+    the response end to end, the same shape
+    :func:`_auth_rejection_response` uses for 401/403. Reached only for a
+    vendor that DECLARES an overflow shape
+    (:attr:`Vendor.context_overflow_markers`); every other vendor's streamed
+    4xx takes the ordinary relay below, byte for byte as before.
+
+    Past :data:`_VENDOR_ERROR_BODY_LIMIT_BYTES` the held bytes are written
+    and the remainder streamed verbatim: the bound is on what is HELD, not
+    on the relay, and a body that large is not an error envelope anyone
+    recognises anyway.
+    """
+    relay = gateway.relay_headers(upstream)
+    raw, overflowed = await _buffer_bounded(
+        upstream.content, _VENDOR_ERROR_BODY_LIMIT_BYTES,
+    )
+    translated = (
+        None if overflowed else _translate_context_overflow(
+            vendor, raw, gateway=gateway, facts=facts,
+        )
+    )
+    if translated is not None:
+        access(
+            400,
+            stream=True,
+            extra=(
+                f"bytes={len(raw)} note=context_overflow "
+                f"upstream_status={upstream.status}"
+            ),
+        )
+        return translated
+    if overflowed:
+        logger.warning(
+            "model-gateway: %s streamed error exceeds %d bytes; relayed "
+            "verbatim without overflow translation",
+            vendor.vendor_id, _VENDOR_ERROR_BODY_LIMIT_BYTES,
+        )
+    response = web.StreamResponse(status=upstream.status, headers=relay)
+    response.enable_chunked_encoding()
+    await response.prepare(request)
+    total = len(raw)
+    await response.write(raw)
+    async for chunk in upstream.content.iter_any():
+        await response.write(chunk)
+        total += len(chunk)
+    await response.write_eof()
+    access(
+        upstream.status,
+        stream=True,
+        extra=f"bytes={total} note=vendor_error_relayed",
+    )
+    return response
+
+
 async def _auth_rejection_response(
     request: web.Request,
     gateway: "Gateway",
     vendor: Vendor,
     upstream: aiohttp.ClientResponse,
     access: Callable[..., None],
+    *,
+    quota_route: Optional[Callable[[bytes], Awaitable[web.StreamResponse]]] = None,
 ) -> web.StreamResponse:
     """Classify a vendor 401/403, then relay the vendor's own answer verbatim.
 
@@ -2758,11 +3898,42 @@ async def _auth_rejection_response(
     relay shape :func:`_relay_vendor_json` uses for oversized bodies: the
     classification is ours, the answer is the vendor's, and neither editing
     the other is the bug this whole function avoids.
+
+    BEFORE the auth classification, a 403 whose held body reads as a QUOTA
+    refusal (``is_quota_refusal`` — the same evidence helpers the classifier
+    uses) is a quota refusal in disguise and takes ``quota_route`` — the
+    exact route a 429/402 takes (fallback ladder when armed, else the
+    substituted envelope) with NO auth strike: a "You've reached your 5-hour
+    usage limit" 403 is about the ALLOWANCE, not the credential, and
+    striking the key would disable a healthy one (observed live with a
+    vendor answering that shape four times, 2026-10-07..11). A 401 is never
+    quota-routed, a 403 without quota evidence classifies exactly as
+    before, and the documented MODEL-level shape (``access_denied``) keeps
+    its verbatim relay even if its message happens to use quota words: the
+    model exemption takes precedence over the quota carve-out.
     """
     relay = gateway.relay_headers(upstream)
     raw, overflowed = await _buffer_bounded(
         upstream.content, _AUTH_BODY_LIMIT_BYTES,
     )
+    if (
+        upstream.status == 403
+        and quota_route is not None
+        and not overflowed
+        and _auth_rejection_is_key_level(403, raw)
+        and is_quota_refusal(403, raw, upstream.headers)
+    ):
+        # Overflow stays OUT of this branch: past the hold bound the body is
+        # a prefix, and the auth relay below streams it whole — the quota
+        # evidence in a giant body is not worth losing the verbatim relay
+        # for. The one access line is quota_route's to write.
+        logger.info(
+            "model-gateway: vendor %s answered 403 with quota evidence "
+            "(a quota refusal in disguise) — routed to the quota answer, "
+            "no auth strike",
+            _log_safe(vendor.vendor_id),
+        )
+        return await quota_route(raw)
     key_level = _auth_rejection_is_key_level(upstream.status, raw)
     if key_level:
         gateway.note_vendor_auth_rejection(vendor.vendor_id)
@@ -2803,18 +3974,82 @@ async def _auth_rejection_response(
     return web.Response(status=upstream.status, headers=relay, body=raw)
 
 
+def _quota_answer(
+    status: int,
+    raw: bytes,
+    headers: "Mapping[str, str]",
+    vendor: Vendor,
+    stream_requested: bool,
+    access: Callable[..., None],
+) -> web.Response:
+    """The ONE quota answer builder, from ``(status, body, headers)``.
+
+    Substituted envelope (naming the vendor, carrying the reset hint) +
+    access line + the vendor's own machine-readable wait relayed. Shared by
+    :func:`_quota_response` (which owns the body read, the DEBUG log and the
+    re-probe) and the quota-in-disguise route a vendor 403 can take through
+    :func:`_auth_rejection_response`, so the sentence a user receives cannot
+    depend on WHICH status carried the quota evidence.
+    """
+    hint = find_reset_hint(raw, headers)
+    classification = classify_quota(status, raw, headers)
+    body = quota_error_body(
+        vendor_display_name(vendor),
+        hint,
+        status=status,
+        classification=classification,
+    )
+    access(
+        CLIENT_QUOTA_STATUS,
+        stream=stream_requested,
+        # The classification is in the LOG as well as in the message: when a
+        # user reports "it told me to switch models", the line says whether
+        # the gateway had evidence for that or fell back to the weaker
+        # sentence, without needing the body it deliberately did not keep.
+        extra=" ".join(
+            part
+            for part in (
+                f"note=vendor_quota upstream_status={status} "
+                f"quota_class={classification}",
+                # WHICH evidence carried the verdict, beside the verdict
+                # itself — see quota_evidence_fields. A support question
+                # ("it told me to switch models") is answerable from this
+                # line alone, without the body deliberately not kept.
+                quota_evidence_fields(raw, headers),
+            )
+            if part
+        ),
+    )
+    # The vendor's own wait, relayed: the BODY is replaced (that is this
+    # builder's whole job), but "when may I try again?" is machine-readable
+    # advice the client acts on, and dropping it turns a 30 s rate limit into
+    # a guess. ``x-should-retry`` says the same thing to an SDK that reads it
+    # rather than the header.
+    quota_headers = dict(RETRYABLE_HEADERS)
+    retry_after = headers.get("Retry-After")
+    if retry_after:
+        quota_headers["Retry-After"] = retry_after
+    return web.json_response(
+        body, status=CLIENT_QUOTA_STATUS, headers=quota_headers,
+    )
+
+
 async def _quota_response(
     upstream: aiohttp.ClientResponse,
     vendor: Vendor,
     stream_requested: bool,
     access: Callable[..., None],
     reprobe: Optional[Callable[[str], Awaitable[web.StreamResponse]]] = None,
+    *,
+    raw: Optional[bytes] = None,
 ) -> web.StreamResponse:
     """Replace a vendor's quota refusal with one that names the vendor.
 
-    The ONE documented exception to relaying a vendor's ERROR verbatim, and
-    the only place a status is rewritten (see :mod:`model_router.quota` for
-    the incident). The upstream body is read —
+    ONE of the two documented exceptions to relaying a vendor's ERROR
+    verbatim (the other is the context-overflow translation,
+    :func:`_translate_context_overflow`, which swaps a native "input too
+    long" shape for the prompt-too-long envelope the client recovers from).
+    The upstream body is read —
     bounded — for a reset hint and then logged at DEBUG, so support can still
     see the vendor's own words without them reaching a user who would read
     them as an Anthropic limit.
@@ -2848,11 +4083,13 @@ async def _quota_response(
     The retried attempt writes the access line (with ``note=quota_reprobe``),
     so the caller must not also write one: one client request, one line.
     """
-    # A PEEK, deliberately, and the one place ``read(n)``'s real semantics
-    # (what has ARRIVED, trimmed to n — see :func:`_buffer_bounded`) are
-    # harmless: this body is never relayed, so a short read costs at most a
-    # reset hint that was still in flight.
-    raw = await upstream.content.read(_QUOTA_BODY_PEEK_BYTES)
+    # A PEEK via the ONE shared home (:func:`_peek_quota_body`); ``raw`` lets
+    # a caller that already read the body (the fallback ladder's branch,
+    # which had to read it to decide) hand it over — reading a consumed
+    # stream back would answer empty and silently downgrade the
+    # classification below.
+    if raw is None:
+        raw = await _peek_quota_body(upstream)
     logger.debug(
         "model-gateway: %s quota refusal HTTP %d body=%s",
         vendor.vendor_id, upstream.status,
@@ -2860,7 +4097,6 @@ async def _quota_response(
         # as a client-controlled model id, one actor further out.
         _log_safe(raw.decode("utf-8", "replace")),
     )
-    hint = find_reset_hint(raw, upstream.headers)
     classification = classify_quota(upstream.status, raw, upstream.headers)
     if reprobe is not None and classification == CLASS_EXHAUSTED:
         # No delay, deliberately. What is stale here is the VERDICT, not the
@@ -2876,44 +4112,120 @@ async def _quota_response(
         # client request and one line: the evidence joins the line the
         # re-probe writes rather than opening a second one.
         return await reprobe(quota_evidence_fields(raw, upstream.headers))
-    body = quota_error_body(
-        vendor_display_name(vendor),
-        hint,
-        status=upstream.status,
-        classification=classification,
+    return _quota_answer(
+        upstream.status, raw, upstream.headers, vendor, stream_requested, access,
+    )
+
+
+async def _peek_quota_body(upstream: aiohttp.ClientResponse) -> bytes:
+    """The ONE bounded quota-body read, shared by every reader that mines a
+    refusal for evidence (:func:`_quota_response`, :func:`_ladder_quota_branch`).
+
+    A PEEK, deliberately, and the one place ``read(n)``'s real semantics (what
+    has ARRIVED, trimmed to n — see :func:`_buffer_bounded`) are harmless:
+    these bodies are mined and logged, not relayed whole (the first-party
+    ladder terminal relays what it read — bounded, and the rarer case by far),
+    so a short read costs at most a hint that was still in flight. Kept as
+    ONE home so the "no unbounded read of a discarded body" asymmetry stays
+    checkable (``tests/test_v0294_gateway_relay_buffer.py``).
+    """
+    return await upstream.content.read(_QUOTA_BODY_PEEK_BYTES)
+
+
+async def _ladder_quota_branch(
+    upstream: aiohttp.ClientResponse,
+    gateway: "Gateway",
+    decision: Route,
+    access: Callable[..., None],
+    *,
+    stream_requested: bool,
+    escalate: Callable[[str], Awaitable[Optional[web.StreamResponse]]],
+    retry: Optional[Callable[[str], Awaitable[web.StreamResponse]]],
+    raw: Optional[bytes] = None,
+) -> web.StreamResponse:
+    """Own a quota-status answer on a fallback-ladder-armed attempt (OD-9).
+
+    Entered only when the caller armed the ladder AND holds the body as bytes
+    (a streamed body cannot be re-sent, so its refusal goes to the client,
+    exactly like the quota re-probe's own bound). This branch therefore OWNS
+    the response: it reads the body to decide, and a body read is a body
+    consumed. Also entered — with the body handed over in ``raw`` — for a
+    vendor 403 whose body carries quota evidence (the quota-in-disguise
+    route through :func:`_auth_rejection_response`): such an answer gets
+    EXACTLY the ladder a 429/402 would have got.
+
+    The order of its three outcomes is OD-9 verbatim:
+
+    * a rate-limited 429 with ``retry-after`` within the threshold and a
+      retry still available → sleep the STATED delay, then re-send the same
+      bytes to the same rung (the caller's ``retry`` carries the recursion
+      bound; the second refusal comes back here with ``retry=None`` and
+      falls through);
+    * otherwise → escalate to the next rung (``escalate``), which answers the
+      next rung's response or ``None`` when it could not be served;
+    * neither possible → the rung's OWN refusal, unchanged: the vendor quota
+      envelope via :func:`_quota_response` (no re-probe — this request's
+      recovery budget already went to the escalation attempt that failed, and
+      a second same-rung send after that would be a third upstream request
+      for one client turn), or — on the first-party route, which has no
+      vendor to name — the original status and body relayed as read. Never a
+      fabricated success.
+
+    One access line per client request still holds: a retry or escalation
+    writes the line that answers, carrying the verdict it repaired on its
+    ``note`` (the ``quota_reprobe`` discipline); only the terminal case where
+    this branch answers writes its own.
+    """
+    # A PEEK via the ONE shared home, unless a caller that already had to
+    # read the body (the 403-in-disguise route through
+    # ``_auth_rejection_response``, which classifies before it can know)
+    # hands it over — reading a consumed stream back would answer empty and
+    # silently downgrade the classification below.
+    if raw is None:
+        raw = await _peek_quota_body(upstream)
+    classification = classify_quota(upstream.status, raw, upstream.headers)
+    evidence = " ".join(
+        part
+        for part in (
+            f"upstream_status={upstream.status}",
+            f"quota_class={classification}",
+            quota_evidence_fields(raw, upstream.headers),
+        )
+        if part
+    )
+    action, delay = _ladder_verdict(upstream.status, raw, upstream.headers)
+    if action == LADDER_RETRY and retry is not None and delay is not None:
+        # The vendor said when it will serve again and the window is short;
+        # the sleep is the STATED delay (never longer than the threshold the
+        # verdict already applied) so the retry is not spent against a limit
+        # that is still in force.
+        await asyncio.sleep(delay)
+        return await retry(evidence)
+    escalated = await escalate(evidence)
+    if escalated is not None:
+        return escalated
+    if decision.vendor is not None:
+        return await _quota_response(
+            upstream, decision.vendor, stream_requested, access, raw=raw,
+        )
+    # First-party terminal: the original refusal, relayed as read. The peek
+    # is bounded, so an error body longer than the bound truncates — logged,
+    # and rarer than the case it serves (the ladder ended because the next
+    # rung had no key, and the honest answer is the one the upstream gave).
+    logger.info(
+        "model-gateway: fallback ladder exhausted at the first-party rung "
+        "(%s); relaying the original refusal %s",
+        _log_safe(decision.forward_model), evidence,
     )
     access(
-        CLIENT_QUOTA_STATUS,
+        upstream.status,
         stream=stream_requested,
-        # The classification is in the LOG as well as in the message: when a
-        # user reports "it told me to switch models", the line says whether
-        # the gateway had evidence for that or fell back to the weaker
-        # sentence, without needing the body it deliberately did not keep.
-        extra=" ".join(
-            part
-            for part in (
-                f"note=vendor_quota upstream_status={upstream.status} "
-                f"quota_class={classification}",
-                # WHICH evidence carried the verdict, beside the verdict
-                # itself — see quota_evidence_fields. A support question
-                # ("it told me to switch models") is answerable from this
-                # line alone, without the body deliberately not kept.
-                quota_evidence_fields(raw, upstream.headers),
-            )
-            if part
-        ),
+        extra=f"note=ladder_exhausted {evidence}".strip(),
     )
-    # The vendor's own wait, relayed: the BODY is replaced (that is this
-    # function's whole job), but "when may I try again?" is machine-readable
-    # advice the client acts on, and dropping it turns a 30 s rate limit into
-    # a guess. ``x-should-retry`` says the same thing to an SDK that reads it
-    # rather than the header.
-    quota_headers = dict(RETRYABLE_HEADERS)
-    retry_after = upstream.headers.get("Retry-After")
-    if retry_after:
-        quota_headers["Retry-After"] = retry_after
-    return web.json_response(
-        body, status=CLIENT_QUOTA_STATUS, headers=quota_headers,
+    return web.Response(
+        status=upstream.status,
+        body=raw,
+        headers=gateway.relay_headers(upstream),
     )
 
 
@@ -2931,6 +4243,9 @@ def _quota_reprobe(
     note: str,
     images: str = IMAGES_UNCOUNTED,
     facts: Optional[RequestFacts] = None,
+    fallback_from: str = "",
+    effort_requested: Optional[str] = None,
+    effort_forwarded: Optional[str] = None,
 ) -> Callable[[str], Awaitable[web.StreamResponse]]:
     """A single re-send of a request whose quota refusal is being re-checked.
 
@@ -2963,7 +4278,13 @@ def _quota_reprobe(
     attempt: it is the evidence :func:`_submit_usage` counts FROM, so a
     re-probe that SUCCEEDS is a real turn for the user and must land in the
     usage ledger. Dropping it here made the repair invisible — the request
-    answered, and the record said nothing happened.
+    answered, and the record said nothing happened. ``fallback_from`` rides
+    along for the same reason (batch-7 B-1R): the re-probe is reachable from
+    a fallback-ladder rung (the LAST rung has no escalation, so its exhausted
+    verdict takes the shipped re-probe), and a re-probe that succeeds there
+    is still the remapped request — without the field its ledger row would
+    say an ordinary qwen turn answered, the one place a fallback could land
+    invisible (R15).
     """
     async def resend(first_verdict: str) -> web.StreamResponse:
         return await _proxy(
@@ -2981,6 +4302,9 @@ def _quota_reprobe(
             facts=facts,
             allow_oauth_retry=False,
             allow_quota_reprobe=False,
+            fallback_from=fallback_from,
+            effort_requested=effort_requested,
+            effort_forwarded=effort_forwarded,
         )
 
     return resend
@@ -3070,18 +4394,60 @@ async def _relay_vendor_json(
         access(upstream.status, stream=False, extra=f"bytes={total}")
         return response
 
+    # A native context-overflow refusal is TRANSLATED before anything else
+    # touches the body: the vendor's own envelope is not one the client can
+    # recover from, and no id normalisation or usage read of a refusal
+    # matters once the answer is being replaced. Vendors without a declared
+    # overflow shape (:attr:`Vendor.context_overflow_markers`) never enter
+    # the branch — their 4xx bodies relay exactly as before.
+    if 400 <= upstream.status < 500 and vendor.context_overflow_markers:
+        translated = _translate_context_overflow(
+            vendor, raw, gateway=gateway, facts=facts,
+        )
+        if translated is not None:
+            access(
+                400,
+                stream=False,
+                extra=(
+                    f"bytes={len(raw)} note=context_overflow "
+                    f"upstream_status={upstream.status}"
+                ),
+            )
+            return translated
+
     out = raw
     try:
         payload = json.loads(raw) if raw else None
     except ValueError:
         payload = None
-    if accumulator is not None:
-        # The bytes are already in hand, so this is a parse and not a copy.
-        _guarded(accumulator.observe_body, raw, what="usage accounting")
-    #: The body as it currently stands, through both edits below. ``out`` is
+    #: The body as it currently stands, through the edits below. ``out`` is
     #: only re-serialised when this object stops being the one ``raw``
     #: decoded to, which is what keeps an untouched response byte-identical.
     body_obj: Any = payload
+    if (
+        isinstance(payload, dict)
+        and 200 <= upstream.status < 300
+        and not (facts is not None and facts.count_tokens)
+    ):
+        # v0.2.102 (G2): the SAME cache-field completion the SSE rewriter
+        # applies to message_start/message_delta, so a buffered vendor body
+        # tells the client's prompt-cache indicator what the vendor said —
+        # its figures, its other cache dialect mapped, zeros when it said
+        # nothing. Done BEFORE the usage accounting below so the ledger and
+        # the client see the same block, the invariant the streamed path
+        # already keeps (the accumulator feeds on post-rewrite bytes there).
+        usage_block = payload.get("usage")
+        if isinstance(usage_block, dict):
+            completed = _guarded(
+                complete_cache_fields, usage_block,
+                what="cache-field completion",
+            )
+            if completed is True:
+                body_obj = payload
+                out = json.dumps(payload, **COMPACT_JSON).encode("utf-8")
+    if accumulator is not None:
+        # The bytes are already in hand, so this is a parse and not a copy.
+        _guarded(accumulator.observe_body, out, what="usage accounting")
     normalised = _guarded(
         normalise_vendor_response,
         payload,
@@ -3177,7 +4543,7 @@ def create_app(
         token_file_stamp=token_file_stamp,
     )
     app = web.Application(
-        middlewares=[loopback_only_middleware],
+        middlewares=[loopback_only_middleware, inflight_middleware],
         client_max_size=UNBOUNDED_CLIENT_MAX_SIZE,
     )
     app[APP_KEY] = gateway

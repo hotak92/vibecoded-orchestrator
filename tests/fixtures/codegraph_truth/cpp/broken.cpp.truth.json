@@ -1,0 +1,27 @@
+{
+ "source": "broken.cpp",
+ "reviewed": "W6-E 2026-10-10 (hand-written; full_name + methods scored)",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "first",
+   "start": 2,
+   "end": 4,
+   "full_name": "broken.first"
+  },
+  {
+   "kind": "function",
+   "name": "second",
+   "start": 6,
+   "end": 8,
+   "full_name": "broken.second"
+  },
+  {
+   "kind": "function",
+   "name": "third",
+   "start": 10,
+   "end": 12,
+   "full_name": "broken.third"
+  }
+ ]
+}

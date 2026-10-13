@@ -679,7 +679,7 @@ class ContentPropertyTests(_BaseEnrichmentTest):
         ]
         collection = _FakeCollection(objs)
         client = _FakeClient({self.CODE_COLL: collection})
-        svc = _FakeEmbeddingService()
+        svc = _FakeEmbeddingService(code_vector_slot="jina_embed")
         ee.enrich_collection_vectors(
             collection_name=self.CODE_COLL,
             new_slot="jina_embed",
@@ -705,7 +705,7 @@ class ContentPropertyTests(_BaseEnrichmentTest):
         ]
         collection = _FakeCollection(objs)
         client = _FakeClient({coll_name: collection})
-        svc = _FakeEmbeddingService()
+        svc = _FakeEmbeddingService(code_vector_slot="jina_embed")
         ee.enrich_collection_vectors(
             collection_name=coll_name,
             new_slot="jina_embed",
@@ -728,7 +728,7 @@ class ContentPropertyTests(_BaseEnrichmentTest):
         ]
         collection = _FakeCollection(objs)
         client = _FakeClient({coll_name: collection})
-        svc = _FakeEmbeddingService()
+        svc = _FakeEmbeddingService(code_vector_slot="jina_embed")
         ee.enrich_collection_vectors(
             collection_name=coll_name,
             new_slot="jina_embed",
@@ -1029,15 +1029,16 @@ class CliTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # v0.2.18 Commit 10 — multi-class sibling enrichment (GUI Save sweep).
 #
-# The codegraph Save flow in the launcher (KgCodegraphTab.svelte) enriches
-# all five sibling Code* classes (CodeModule / CodeClass / CodeFunction /
-# CodeAPI / CodeInteraction) sequentially by calling the existing single-
-# collection `enrich_collection_vectors` once per class. The Python side
-# stays single-collection — the multi-class loop is the Svelte modal's
-# responsibility. These tests verify the underlying assumption: the
-# single-collection enrichment IS independently invocable on every code-
-# class suffix variant (including project-prefixed forms), with the
-# expected content-property routing per class.
+# The v0.2.18 codegraph Save flow in the launcher (KgCodegraphTab.svelte)
+# enriched all five sibling Code* classes (CodeModule / CodeClass /
+# CodeFunction / CodeAPI / CodeInteraction) sequentially by calling the
+# existing single-collection `enrich_collection_vectors` once per class.
+# That Svelte sweep was retired in v0.2.102 W6-J with its modal; the
+# Python side stays single-collection — the loop, where one is needed, is
+# the caller's responsibility. These tests verify the underlying
+# assumption: the single-collection enrichment IS independently invocable
+# on every code-class suffix variant (including project-prefixed forms),
+# with the expected content-property routing per class.
 # ---------------------------------------------------------------------------
 
 
@@ -1053,8 +1054,9 @@ CODE_COLLECTION_SUFFIXES_ORDERED = (
 class MultiClassInvocationTests(_BaseEnrichmentTest):
     """Each of the 5 code-class suffix variants is independently enrichable.
 
-    The Svelte sweep in v0.2.18 Commit 10 expands a project prefix
-    (e.g. ``"MyProj_"``) into the 5 sibling Code* class names and invokes
+    The Svelte sweep in v0.2.18 Commit 10 (retired v0.2.102 W6-J with its
+    modal) expanded a project prefix (e.g. ``"MyProj_"``) into the 5
+    sibling Code* class names and invoked
     ``enrich_collection_vectors`` per class. The Python primitive doesn't
     know about the sweep — it just handles one class at a time. These
     tests pin the per-class behaviour the sweep depends on:
@@ -1134,7 +1136,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
                 )
                 collection = _FakeCollection([obj])
                 client = _FakeClient({coll_name: collection})
-                svc = _FakeEmbeddingService()
+                svc = _FakeEmbeddingService(code_vector_slot="jina_embed")
 
                 report = ee.enrich_collection_vectors(
                     collection_name=coll_name,
@@ -1185,7 +1187,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
                 )
 
     def test_sequential_sweep_each_class_independently(self):
-        """Simulate the Svelte modal's sequential loop: 5 successive
+        """Simulate the retired Svelte sweep's sequential loop: 5 successive
         ``enrich_collection_vectors`` calls, one per sibling class, each
         with its own client/collection/service. Verifies state from one
         call doesn't bleed into the next."""
@@ -1208,7 +1210,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
                 for i in range(3)
             ]
             client = _FakeClient({coll_name: _FakeCollection(objs)})
-            svc = _FakeEmbeddingService()
+            svc = _FakeEmbeddingService(code_vector_slot="jina_embed")
 
             report = ee.enrich_collection_vectors(
                 collection_name=coll_name,
@@ -1232,11 +1234,11 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
             )
 
     def test_per_class_failure_does_not_taint_other_classes(self):
-        """Simulate the Svelte modal's soft-fail-per-class contract: one
-        sibling raises a pre-flight error, the others still succeed.
+        """Simulate the retired Svelte sweep's soft-fail-per-class contract:
+        one sibling raises a pre-flight error, the others still succeed.
 
-        The Python side raises (CollectionNotFoundError); it's the Svelte
-        loop that catches + continues. Here we just verify that an error
+        The Python side raises (CollectionNotFoundError); it was the Svelte
+        loop that caught + continued. Here we just verify that an error
         on one class doesn't corrupt internal module state such that the
         next call also fails."""
 
@@ -1262,7 +1264,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
         r_mod = ee.enrich_collection_vectors(
             collection_name="SoftFail_CodeModule",
             new_slot="jina_embed",
-            embedding_service=_FakeEmbeddingService(),
+            embedding_service=_FakeEmbeddingService(code_vector_slot="jina_embed"),
             weaviate_client_factory=lambda: client_mod,
         )
         self.assertEqual(r_mod.enriched, 1)
@@ -1272,7 +1274,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
             ee.enrich_collection_vectors(
                 collection_name="SoftFail_CodeAPI",
                 new_slot="jina_embed",
-                embedding_service=_FakeEmbeddingService(),
+                embedding_service=_FakeEmbeddingService(code_vector_slot="jina_embed"),
                 weaviate_client_factory=lambda: _FakeClient({}),
             )
 
@@ -1290,7 +1292,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
         r_fn = ee.enrich_collection_vectors(
             collection_name="SoftFail_CodeFunction",
             new_slot="jina_embed",
-            embedding_service=_FakeEmbeddingService(),
+            embedding_service=_FakeEmbeddingService(code_vector_slot="jina_embed"),
             weaviate_client_factory=lambda: client_fn,
         )
         self.assertEqual(r_fn.enriched, 1)
@@ -1322,8 +1324,10 @@ class SlotCountTests(unittest.TestCase):
         self.assertIsNone(ee._text_slot_to_profile("future_embed"))
 
     def test_profile_to_active_slot_forward_map(self):
-        # v0.2.71 R1 HIGH fix: the FORWARD profile→current-slot resolver the
-        # model-switch "Regenerate now" uses to know which slot to enrich into.
+        # v0.2.71 R1 HIGH fix: the FORWARD profile→current-slot resolver
+        # `slot-counts --for-profile` uses to name the slot to enrich into
+        # (its historical GUI consumer, the model-switch "Regenerate now"
+        # button, was retired in v0.2.102 W6-J).
         # Single-sourced from TEXT_SLOT_MAP via _model_id_for_active +
         # _resolve_text_slot, so these assertions also pin that the canonical
         # map still yields the expected current slots.
@@ -1338,9 +1342,11 @@ class SlotCountTests(unittest.TestCase):
         self.assertEqual(ee._profile_to_active_slot("nonsense"), "qwen3_embed")
 
     def test_slot_counts_cli_includes_target_slot_when_for_profile(self):
-        # The --for-profile arg must add `target_slot` to the JSON so the Rust
-        # command + modal can enrich into it. Mock count_populated_slots so the
-        # test is offline; assert the CLI merges target_slot on top.
+        # The --for-profile arg must add `target_slot` to the JSON so the
+        # caller can enrich into it (historically the Rust command + modal,
+        # retired v0.2.102 W6-J; today an operator). Mock
+        # count_populated_slots so the test is offline; assert the CLI
+        # merges target_slot on top.
         import argparse
         import io
         import json as _json
@@ -1453,7 +1459,7 @@ class SlotCountTests(unittest.TestCase):
                 "My_KnowledgeGraph",
                 weaviate_client_factory=_boom,
             )
-        # Soft-fail: empty result, no raise — the modal degrades gracefully.
+        # Soft-fail: empty result, no raise — the report degrades gracefully.
         self.assertEqual(result["total"], 0)
         self.assertEqual(result["slots"], [])
         self.assertIsNone(result["most_populated_profile"])

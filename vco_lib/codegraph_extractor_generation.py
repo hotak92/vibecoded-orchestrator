@@ -130,7 +130,51 @@ logger = logging.getLogger(__name__)
 #:          declaring the stranded projects finished — permanently, silently,
 #:          and with no error anywhere. The asymmetry that decides it is the
 #:          same one :func:`decide` is built on.
-EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92", "0.2.93", "0.2.94")
+#: 0.2.102 — tree-sitter DEFINITIONS (``vco_lib.codegraph_defs``) became the
+#:          default for TypeScript, JavaScript, Svelte ``<script>`` blocks,
+#:          Rust, Go, Java, C#, C++, Ruby, Lua and shell; the regex extractors
+#:          remain only as the fallback when a grammar cannot load. Output
+#:          changed from unchanged source for every one of those languages
+#:          (new symbols: TS generic functions / interfaces / annotated
+#:          arrows, Go generics, C++ out-of-line constructors, shell
+#:          next-line-brace functions …; dropped phantoms: Rust ``fn`` in
+#:          string literals, ``#[tokio::test]`` / ``#[cfg(test)] mod`` code;
+#:          corrected line ranges and therefore bodies; and — W6-G — every
+#:          class/function of a Rust file loaded only through a test-gated
+#:          ``#[cfg(test)] mod x;`` in ANOTHER file, which
+#:          ``vco_lib.codegraph_rust_modules`` now resolves; such a file's
+#:          module ``file_hash`` is salted, so this rung's re-walk also
+#:          re-stamps it). W6-L, same rung: PowerShell (functions /
+#:          filters, PowerShell 5 classes, enums and methods) and Protocol
+#:          Buffers (messages and enums at any depth, services as classes,
+#:          streaming rpcs as CodeAPI rows) gained tree-sitter definitions
+#:          through OPTIONAL parsers VCO offers on demand; and a module row's
+#:          ``file_hash`` is now salted while its file is extracted by the
+#:          regex FALLBACK (grammar unavailable —
+#:          ``codegraph_defs.regex_fallback_hash_salt``), so a parser
+#:          installed LATER re-extracts that language's unchanged files on the
+#:          next walk without another rung. W6-O, same rung: Rust module
+#:          rows' ``import_names`` come from the parse (multi-line ``use``
+#:          trees, out-of-line ``mod x;`` as ``"mod x"``, ``use`` inside
+#:          test-gated code dropped) and shell rows' from real ``source``/``.``
+#:          commands only (the regex stored comment words); the cross-reference
+#:          pass resolves imports language-aware (``vco_lib.codegraph_imports``)
+#:          and adds the Rust/TS/Svelte/shell edges it never found; CodeAPI rows
+#:          gain ``is_test`` and a skipped row's missing ``file_path``/``is_test``
+#:          is PATCHed (``codegraph_guards.heal_skipped_row``). W6-O's OWN
+#:          delta, measured on this repository: 178 Rust and 133 shell module
+#:          rows change content and re-embed once, and W6-O re-embeds nothing
+#:          else (its Python change is edge resolution only). The W6-E, W6-G
+#:          and W6-L output changes above re-embed further rows in the
+#:          languages they name. The per-entity content-hash
+#:          gate re-embeds only rows whose extracted text changed;
+#:          ``CODEGRAPH_EMBED_REVISION`` is NOT bumped (model, chunking and
+#:          embed text construction are unchanged). W6-CGD, same rung: the
+#:          unchanged-file gate counts only the walked root's own rows (D-1),
+#:          so this rung's forced re-walk also writes the project rows an
+#:          identical, earlier-indexed extra-code-folder copy had shadowed
+#:          (those files embed once under the project; nothing is deleted).
+EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92", "0.2.93", "0.2.94", "0.2.102")
 
 #: Releases DELIBERATELY not added to the ladder, each with the evidence that
 #: decided it. A release must appear in EXACTLY ONE of these two structures —
@@ -478,6 +522,134 @@ def resolve_force_rewalk(cli_value: bool,
     }
 
 
+# ---------------------------------------------------------------------------
+# Persistently failing inserts (v0.2.102 W6-U, ship-gate finding #1)
+#
+# A walk with ANY insert error used to be refused the stamp, so a project with
+# one row Weaviate rejects every time (a 422 on an oversized row is enough)
+# stayed owed and re-walked on EVERY bundle update, forever, silently. The
+# rule now: a failing set is ACCEPTED (the stamp is written, the set recorded
+# beside it) only when the previous forced walk recorded the SAME fingerprint
+# for the SAME generation — a failure seen twice in a row is persistent, not a
+# transient outage. The first sighting is held back as ``pending_failing_set``
+# (the old ``generation`` is kept, so the project stays owed); an accepted set
+# is surfaced by the ``codegraph_insert_failures`` doctor probe, so the
+# accepted state is visible rather than silent.
+# ---------------------------------------------------------------------------
+
+#: Stamp keys for the two failing-set records.
+PENDING_FAILING_SET_KEY = "pending_failing_set"
+ACCEPTED_FAILING_SET_KEY = "accepted_failing_set"
+
+#: How many failing rows the resync log names before "… and N more".
+FAILING_ROWS_LOG_CAP = 20
+
+#: :func:`failing_set_verdict` reason codes (stable strings — logged, tested).
+FAILING_SET_STABLE = "stable"
+FAILING_SET_FIRST_SIGHTING = "first_sighting"
+FAILING_SET_CHANGED = "changed"
+FAILING_SET_UNATTRIBUTED = "unattributed"
+
+_ROW_FIELDS = ("file", "collection", "uuid", "reason")
+
+
+def _attributed_insert_error(exc: object) -> object:
+    """The analyzer's ``_DedupInsertError`` on ``exc``'s cause chain (duck
+    typed on ``collection_name`` + ``uuid``), or ``None``. Bounded walk, the
+    same cap as the analyzer's own chain search."""
+    cur = exc
+    for _ in range(8):
+        if cur is None:
+            return None
+        if getattr(cur, "collection_name", None) and getattr(cur, "uuid", None):
+            return cur
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return None
+
+
+def insert_failure_reason(exc: object) -> str:
+    """Stable reason for an insert failure: the ORIGINAL exception's type, plus
+    its HTTP status when it carries one (``UnexpectedStatusCodeError:422``).
+
+    Never the free text: messages embed request ids, timings and payload
+    excerpts that differ run to run, and a reason that changes on every walk
+    would make every failing set look "changed" — never accepted, the very loop
+    this closes.
+    """
+    attributed = _attributed_insert_error(exc)
+    original = getattr(attributed, "original", None) if attributed is not None else None
+    target = original if original is not None else exc
+    reason = type(target).__name__
+    for attr in ("status_code", "status"):
+        code = getattr(target, attr, None)
+        if isinstance(code, int) and not isinstance(code, bool):
+            return f"{reason}:{code}"
+    return reason
+
+
+def insert_failure_row(file_rel: object, exc: object) -> dict:
+    """One failing-insert row: file, collection, the row's deterministic uuid,
+    and :func:`insert_failure_reason`. ``collection`` / ``uuid`` are ``""``
+    when the exception carries no attribution — such a row makes the whole set
+    unattributed, and an unattributed set is never accepted."""
+    attributed = _attributed_insert_error(exc)
+    return {
+        "file": str(file_rel or "").replace("\\", "/"),
+        "collection": str(getattr(attributed, "collection_name", "") or ""),
+        "uuid": str(getattr(attributed, "uuid", "") or ""),
+        "reason": insert_failure_reason(exc),
+    }
+
+
+def _row_is_attributed(row: object) -> bool:
+    return isinstance(row, dict) and all(
+        isinstance(row.get(k), str) and row.get(k, "").strip() for k in _ROW_FIELDS)
+
+
+def failing_set_fingerprint(rows: Sequence[dict]) -> str:
+    """Order-independent sha256 over the failing rows' identifying fields."""
+    import hashlib  # noqa: PLC0415
+
+    canon = sorted(
+        json.dumps([str((r or {}).get(k, "")) for k in _ROW_FIELDS], ensure_ascii=False)
+        for r in rows
+    )
+    return hashlib.sha256("\n".join(canon).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class FailingSetVerdict:
+    """Outcome of :func:`failing_set_verdict`."""
+
+    stable: bool
+    reason: str
+    fingerprint: Optional[str] = None
+
+
+def failing_set_verdict(rows: Sequence[dict], prior: object,
+                        generation: str = CURRENT_EXTRACTOR_GENERATION,
+                        *, insert_errors: Optional[int] = None) -> FailingSetVerdict:
+    """PURE: is this walk's failing set the SAME one the previous forced walk
+    recorded, for the same generation?
+
+    * never stable on the first sighting (``prior`` absent / malformed);
+    * never stable when any row is unattributed, or when ``insert_errors``
+      counted more failures than there are rows (a failure the analyzer could
+      not name is not a set we can claim to know);
+    * stable only when ``prior`` carries this fingerprint AND this generation.
+    """
+    rows = list(rows or [])
+    if not rows or not all(_row_is_attributed(r) for r in rows) or (
+            insert_errors is not None and int(insert_errors) != len(rows)):
+        return FailingSetVerdict(False, FAILING_SET_UNATTRIBUTED, None)
+    fp = failing_set_fingerprint(rows)
+    if not isinstance(prior, dict) or not prior.get("fingerprint"):
+        return FailingSetVerdict(False, FAILING_SET_FIRST_SIGHTING, fp)
+    if prior.get("fingerprint") == fp and prior.get("generation") == generation:
+        return FailingSetVerdict(True, FAILING_SET_STABLE, fp)
+    return FailingSetVerdict(False, FAILING_SET_CHANGED, fp)
+
+
 def walk_certifies_generation(
     force_rewalk: bool,
     *,
@@ -486,14 +658,16 @@ def walk_certifies_generation(
     language: "Optional[str]" = None,
     insert_errors: int = 0,
     files_analyzed: int = 0,
+    failing_set_stable: bool = False,
 ) -> bool:
     """PURE: may this analyzer run's outcome certify the extractor generation?
 
     Only a run that (a) actually bypassed the per-file gate, (b) covered the
     WHOLE repo (not ``--only-file`` / ``--only-files-from``), (c) covered EVERY
-    language (not ``--language``), (d) hit zero insert errors and (e) analyzed
-    at least one file can claim that every file was re-extracted by the current
-    producers.
+    language (not ``--language``), (d) hit zero insert errors — or a failing
+    set :func:`failing_set_verdict` found stable (``failing_set_stable``) — and
+    (e) analyzed at least one file can claim that every file was re-extracted
+    by the current producers.
 
     Anything else leaves the stamp absent, which :func:`decide` reads as OWED.
     That direction is deliberate: a missing stamp costs one more cheap
@@ -506,9 +680,32 @@ def walk_certifies_generation(
         return False
     if language:
         return False
-    if int(insert_errors or 0) > 0:
+    if int(insert_errors or 0) > 0 and not failing_set_stable:
         return False
     return int(files_analyzed or 0) > 0
+
+
+def _failing_set_record(rows: Sequence[dict], fingerprint: str, generation: str,
+                        *, project: str, first_seen: str) -> dict:
+    return {
+        "fingerprint": fingerprint,
+        "generation": generation,
+        "rows": [{k: r.get(k, "") for k in _ROW_FIELDS} for r in rows],
+        "count": len(rows),
+        "first_seen": first_seen,
+        "project": project,
+    }
+
+
+def _report_failing_rows(rows: Sequence[dict], insert_errors: int, emit) -> None:
+    emit(f"   Insert failures this walk: {insert_errors}")
+    shown = list(rows)[:FAILING_ROWS_LOG_CAP]
+    for r in shown:
+        emit(f"     - {r.get('file') or '?'} [{r.get('collection') or '?'}] "
+             f"{r.get('reason') or '?'}")
+    more = max(int(insert_errors or 0), len(rows)) - len(shown)
+    if more > 0:
+        emit(f"     … and {more} more")
 
 
 def stamp_after_walk(
@@ -520,24 +717,84 @@ def stamp_after_walk(
     language: "Optional[str]" = None,
     insert_errors: int = 0,
     files_analyzed: int = 0,
+    project: str = "",
+    failing_rows: "Optional[Sequence[dict]]" = None,
+    emit=None,
 ) -> Optional[str]:
     """Write the completion stamp iff this run certifies it. Soft-fail always.
 
     Returns the generation recorded, or ``None`` when nothing was written (not
-    certified, or the write failed). The analyzer calls this AFTER the walk
-    returns — never earlier — so a run that dies mid-walk leaves no stamp and
-    the project stays owed.
+    certified, held back, or the write failed). The analyzer calls this AFTER
+    the walk returns — never earlier — so a run that dies mid-walk leaves no
+    stamp and the project stays owed.
+
+    A whole-repo force walk WITH insert failures names each failing file +
+    collection + reason through ``emit`` (default: ``print`` — the analyzer's
+    stdout is the resync log), capped at :data:`FAILING_ROWS_LOG_CAP`, and says
+    whether the stamp was held back or recorded:
+
+    * first sighting / changed set → ``pending_failing_set`` written, the
+      prior ``generation`` KEPT (the project stays owed); a prior generation
+      that rested on a DIFFERENT accepted set is dropped, since that
+      acceptance no longer describes the graph;
+    * same set as the previous forced walk → stamp written with
+      ``accepted_failing_set``;
+    * unattributed → nothing recorded, never stamped.
+
+    A clean walk rewrites the stamp from scratch, dropping both records.
     """
+    say = emit if emit is not None else (lambda line: print(line, flush=True))
     try:
         if not walk_certifies_generation(
             force_rewalk, only_file=only_file, only_files_from=only_files_from,
-            language=language, insert_errors=insert_errors,
-            files_analyzed=files_analyzed,
+            language=language, insert_errors=0, files_analyzed=files_analyzed,
         ):
             return None
-        if write_stamp(repo_path, CURRENT_EXTRACTOR_GENERATION,
-                       note="force-rewalk completed"):
-            return CURRENT_EXTRACTOR_GENERATION
+        errors = int(insert_errors or 0)
+        if errors <= 0:
+            if write_stamp(repo_path, CURRENT_EXTRACTOR_GENERATION,
+                           note="force-rewalk completed"):
+                return CURRENT_EXTRACTOR_GENERATION
+            return None
+        rows = list(failing_rows or [])
+        payload = read_stamp_payload(repo_path) or {}
+        prior = payload.get(PENDING_FAILING_SET_KEY) or payload.get(ACCEPTED_FAILING_SET_KEY)
+        verdict = failing_set_verdict(rows, prior, CURRENT_EXTRACTOR_GENERATION,
+                                      insert_errors=errors)
+        _report_failing_rows(rows, errors, say)
+        if verdict.reason == FAILING_SET_UNATTRIBUTED:
+            say("   Extractor generation: stamp held back — the failing inserts "
+                 "could not all be attributed to a row; the project stays owed")
+            return None
+        assert verdict.fingerprint is not None
+        first_seen = (prior.get("first_seen") if verdict.stable and isinstance(prior, dict)
+                      else "") or _utc_now()
+        record = _failing_set_record(rows, verdict.fingerprint,
+                                     CURRENT_EXTRACTOR_GENERATION,
+                                     project=project, first_seen=first_seen)
+        if verdict.stable and walk_certifies_generation(
+            force_rewalk, only_file=only_file, only_files_from=only_files_from,
+            language=language, insert_errors=errors, files_analyzed=files_analyzed,
+            failing_set_stable=True,
+        ):
+            if write_stamp(repo_path, CURRENT_EXTRACTOR_GENERATION,
+                           note="force-rewalk completed with an accepted failing set",
+                           extra={ACCEPTED_FAILING_SET_KEY: record}):
+                say(f"   Extractor generation: recorded — the same {errors} insert "
+                     f"failure(s) as the previous forced walk are accepted "
+                     f"(`vco doctor` lists them)")
+                return CURRENT_EXTRACTOR_GENERATION
+            return None
+        held = {k: v for k, v in payload.items()
+                if k not in (PENDING_FAILING_SET_KEY, ACCEPTED_FAILING_SET_KEY)}
+        if payload.get(ACCEPTED_FAILING_SET_KEY):
+            held.pop("generation", None)  # its acceptance no longer holds
+        held[PENDING_FAILING_SET_KEY] = record
+        held["written_at"] = _utc_now()
+        held["written_by"] = "vco_lib.codegraph_extractor_generation"
+        _write_stamp_payload(repo_path, held)
+        say(f"   Extractor generation: stamp held back ({verdict.reason}) — "
+             f"recorded as pending; the same set on the next forced walk is accepted")
     except Exception as exc:  # noqa: BLE001 — a stamp never gates a build
         logger.warning("extractor-generation stamp not written for %s: %s",
                        repo_path, exc)
@@ -553,11 +810,8 @@ def stamp_path(folder: Path) -> Path:
     return Path(folder) / STAMP_REL
 
 
-def read_stamp_generation(folder: Path) -> Optional[str]:
-    """Generation recorded for ``folder``; ``None`` when absent/unreadable.
-
-    An unreadable stamp reads as ABSENT (→ owed), never as current.
-    """
+def read_stamp_payload(folder: Path) -> Optional[dict]:
+    """The whole stamp object; ``None`` when absent/unreadable/not an object."""
     try:
         raw = stamp_path(folder).read_text(encoding="utf-8")
     except Exception:  # noqa: BLE001 — absent / unreadable ⇒ unknown ⇒ owed
@@ -566,22 +820,32 @@ def read_stamp_generation(folder: Path) -> Optional[str]:
         payload = json.loads(raw)
     except Exception:  # noqa: BLE001
         return None
-    if not isinstance(payload, dict):
+    return payload if isinstance(payload, dict) else None
+
+
+def read_stamp_generation(folder: Path) -> Optional[str]:
+    """Generation recorded for ``folder``; ``None`` when absent/unreadable.
+
+    An unreadable stamp reads as ABSENT (→ owed), never as current.
+    """
+    payload = read_stamp_payload(folder)
+    if payload is None:
         return None
     gen = payload.get("generation")
     return gen if isinstance(gen, str) and gen.strip() else None
 
 
 def write_stamp(folder: Path, generation: str = CURRENT_EXTRACTOR_GENERATION,
-                *, note: str = "") -> bool:
+                *, note: str = "", extra: Optional[dict] = None) -> bool:
     """Record that ``folder``'s code graph satisfies ``generation``.
 
     Atomic (``vco_lib.atomic.atomic_write_json``) so a crash mid-write can
     never leave a truncated stamp that parses as a DIFFERENT generation.
     Returns True on success; False on any failure (a failed stamp only means
     the project is asked again next update — never a corrupt state).
+    A clean write carries no failing-set record: ``extra`` (the accepted set)
+    is the only way one lands beside a generation.
     """
-    target = stamp_path(folder)
     payload = {
         "generation": generation,
         "written_at": _utc_now(),
@@ -589,6 +853,14 @@ def write_stamp(folder: Path, generation: str = CURRENT_EXTRACTOR_GENERATION,
     }
     if note:
         payload["note"] = note
+    if extra:
+        payload.update(extra)
+    return _write_stamp_payload(folder, payload)
+
+
+def _write_stamp_payload(folder: Path, payload: dict) -> bool:
+    """Atomically write ``payload`` as ``folder``'s stamp. Soft-fail → False."""
+    target = stamp_path(folder)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         from vco_lib.atomic import atomic_write_json
@@ -929,3 +1201,90 @@ __all__ = [
     "walk_certifies_generation",
     "write_stamp",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Doctor probe body (the `codegraph_insert_failures` shim in vco_lib.doctor)
+# ---------------------------------------------------------------------------
+
+#: Probe name in ``vco_lib.doctor.PROBES``.
+DOCTOR_PROBE = "codegraph_insert_failures"
+
+
+def _doctor_roots(folder: Path) -> "list[Path]":
+    """``folder`` plus every registered project folder (the same read-only
+    launcher.db enumeration the KG census uses). Enumeration failure is not a
+    verdict: the folder itself is still checked."""
+    roots: "list[Path]" = [Path(folder)]
+    try:
+        from vco_lib.project_identity import resolve_snapshot  # noqa: PLC0415
+
+        snapshot = resolve_snapshot()
+        if getattr(snapshot, "resolvable", False):
+            for ident in snapshot.projects:
+                fp = (getattr(ident, "folder_path", "") or "").strip()
+                if fp:
+                    roots.append(Path(fp))
+    except Exception:  # noqa: BLE001 — could not enumerate ⇒ folder only
+        pass
+    seen: set = set()
+    out: "list[Path]" = []
+    for r in roots:
+        try:
+            key = str(r.resolve())
+        except OSError:
+            key = str(r)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def accepted_failing_sets(roots: "Sequence[Path]") -> "list[tuple[Path, dict]]":
+    """``(root, accepted_failing_set)`` for every root whose stamp carries one."""
+    found = []
+    for root in roots:
+        payload = read_stamp_payload(root) or {}
+        acc = payload.get(ACCEPTED_FAILING_SET_KEY)
+        if isinstance(acc, dict) and acc.get("rows"):
+            found.append((Path(root), acc))
+    return found
+
+
+def doctor_insert_failures(folder: Path, *, roots: "Optional[Sequence[Path]]" = None) -> list:
+    """Findings for the ``codegraph_insert_failures`` doctor probe.
+
+    A PROBLEM (the ``retired_endpoint_env`` shape — no registered condition,
+    full scope only) whenever a code graph was certified with an accepted
+    failing set: those rows are missing from the graph and nothing else says
+    so. The command names every failing file and the analyzer run that
+    re-tries them once the cause is fixed (a clean force walk drops the
+    record). Read-only: one small JSON read per root.
+    """
+    from vco_lib.doctor import (  # noqa: PLC0415
+        FIX_DEFER, STATUS_OK, STATUS_PROBLEM, Finding,
+    )
+
+    hits = accepted_failing_sets(list(roots) if roots is not None else _doctor_roots(folder))
+    if not hits:
+        return [Finding(
+            probe=DOCTOR_PROBE, status=STATUS_OK,
+            summary="no code graph was certified with persistently failing inserts",
+        )]
+    parts, lines, detail = [], [], {}
+    for root, acc in hits:
+        rows = [r for r in acc.get("rows") or [] if isinstance(r, dict)]
+        name = str(acc.get("project") or "").strip() or root.name
+        parts.append(f"{name}: {len(rows)} row(s) not in the graph since "
+                     f"{acc.get('first_seen') or '?'}")
+        lines.append(f"# {name} ({root}) — fix the cause, then re-walk:")
+        for r in rows:
+            lines.append(f"#   {r.get('file')} [{r.get('collection')}] {r.get('reason')}")
+        lines.append(f".claude/scripts/code-graph-analyze {root} --project {name} --force-rewalk")
+        detail[str(root)] = acc
+    return [Finding(
+        probe=DOCTOR_PROBE, status=STATUS_PROBLEM,
+        summary="code graph certified with persistently failing inserts — "
+                + "; ".join(parts),
+        fix=FIX_DEFER, command="\n".join(lines), detail={"accepted": detail},
+    )]

@@ -3,7 +3,7 @@ title: Model Context Protocol
 type: concept
 tags: [MCP, AI, protocol, tools, integration, Anthropic, agentic, mid-level-architecture]
 created: 2026-02-26T00:00:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-10-13T00:00:00Z
 status: active
 ---
 
@@ -90,19 +90,21 @@ if __name__ == "__main__":
 ## Configuration in Claude Code
 
 ```json
-// ~/.claude.json
+// .mcp.json (project scope)
 {
   "mcpServers": {
     "my-server": {
       "command": "/path/to/venv/bin/python",
       "args": ["/path/to/server.py"],
       "env": {
-        "API_KEY": "..."
+        "API_KEY": "${API_KEY}"
       }
     }
   }
 }
 ```
+
+`${API_KEY}` is expanded from the environment when Claude Code loads `.mcp.json`, so the key's value never has to be written into the file.
 
 ## Ecosystem
 

@@ -472,8 +472,8 @@
     text-align: right;
     max-width: 34ch;
   }
-  /* Hue convention, copied verbatim from ActiveEmbeddingPicker (the
-     semantically closest surface): teal = chosen here, purple = inherited. */
+  /* Hue convention: teal = chosen here, purple = inherited (first used by
+     the per-project embedding picker, removed in v0.2.102 W6-J). */
   .df-badge {
     display: inline-block;
     margin-left: 0.4rem;

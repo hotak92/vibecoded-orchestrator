@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Parity: kept in step with session-start-kg-loader.ps1 (its UTF-8 BOM serves Windows
+# PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # Parity note (v0.2.54 Track G G-6): the .ps1 sibling now resolves its
 # child-spawn PowerShell binary via _lib/resolve-powershell.ps1 (pwsh ->
 # powershell fallback for PS 5.1-only machines). No bash-side logic
@@ -24,7 +26,13 @@ set -euo pipefail
 # Configuration
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> nothing to do (no state is written).
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
+[ -n "$PROJECT_DIR" ] || exit 0
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 
 # Resolve a Python interpreter portably (python3 → python → py).

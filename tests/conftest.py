@@ -401,6 +401,17 @@ if not _ALLOW_REAL_STATE:
         [sys.executable, "-c", 'print(\'{"schema": 1, "rows": {}, "entries": []}\')'])
 
 
+# ─── W6-C2 (v0.2.102): the SubagentStop reconciler runs INLINE under pytest ──
+#
+# In production `subagent-stop-reconcile.{sh,ps1}` hands its work (diff,
+# worktree reap, KG sync, credential scan) to a DETACHED job, so a slow
+# reconcile is never killed by the harness timeout. A test asserting those
+# effects right after the hook returns needs them done by then: every
+# subprocess the suite spawns inherits this documented diagnostic switch. The
+# test that proves the detached spawn deletes it from its own child env.
+os.environ.setdefault("VCO_SUBAGENT_RECONCILE_INLINE", "1")
+
+
 # ─── W-ENDPOINTS (v0.2.97): the machine resolvers answer an unroutable port ──
 #
 # The two pins above cover CLIENTS (they read `WEAVIATE_URL` /
@@ -549,7 +560,6 @@ _SCRATCH_PROJECT_DIR = _VCO_TEST_STATE / "scratch_project"
 _AMBIENT_CLAUDE_PROJECT_DIR = os.environ.get("CLAUDE_PROJECT_DIR")
 _CLAUDE_PROJECT_DIR_OPT_OUT_FILES: frozenset = frozenset({
     "test_project_resolution.py",
-    "test_post_file_edit_diagrams_branch.py",
     "test_pre_edit_hook_dedup_regression.py",
     "test_v0291_perf_quickwins.py",
 })
@@ -643,11 +653,18 @@ def _redirect_user_state_dir(request):
     install_root_keys = {"VCT_INSTALL_ROOT": str(_REPO_ROOT)}
     # W-TOOL-DIRS: unconditional, like W-INSTALL-ROOT (see the block above).
     install_root_keys[TOOL_SEARCH_DIRS_ENV] = ""
+    # W1-C (v0.2.102 R5) / W6-U: shorten the resync-driver slot wait period so
+    # a slot left by a DEAD (or this-process) holder in a test is taken over in
+    # seconds instead of after the 6 h production default (an apparent hang).
+    # A live holder is still waited for. A test that cares about the wait sets
+    # its own value after this fixture — monkeypatch.setenv runs later and wins.
+    resync_keys = {"VCO_RESYNC_DRIVER_WAIT_S": "5"}
     self_isolated = (
         request.node.fspath.basename in _SELF_ISOLATED_STATE_DIR_FILES
     )
     prev = {
-        k: os.environ.get(k) for k in (*keys, *claude_keys, *install_root_keys)
+        k: os.environ.get(k)
+        for k in (*keys, *claude_keys, *install_root_keys, *resync_keys)
     }
     if self_isolated:
         # Stand aside DETERMINISTICALLY (pop, don't restore the ambient value)
@@ -662,6 +679,7 @@ def _redirect_user_state_dir(request):
         _seed_unroutable_service_endpoints(_VCO_STATE_REDIRECT)
     os.environ.update(claude_keys)
     os.environ.update(install_root_keys)
+    os.environ.update(resync_keys)
     try:
         yield
     finally:
@@ -1573,8 +1591,10 @@ def _rootless_embedding_root_never_resolves_the_checkout():
     ``_write_failure_deferral`` on failure — and reconciling a ledger REWRITES
     ``<root>/CLAUDE.md`` (entries ⇒ the ``vco-deferral-reminder`` block is
     spliced in; none ⇒ it is stripped). ``_detect_project_root`` falls back to
-    ``Path.cwd()`` when that directory holds a ``.claude/``, and pytest's cwd
-    is this checkout — whose ``CLAUDE.md`` is TRACKED.
+    the nearest MARKED project at or above the cwd (``.claude/settings.json``
+    or ``.claude/env``; before v0.2.102 any cwd holding a ``.claude/``), and
+    pytest's cwd is a checkout — whose ``CLAUDE.md`` is TRACKED, and which is
+    marked as soon as it has been installed (a developer's checkout).
 
     So every rootless ``for_project()`` anywhere in the suite edited a
     versioned file mid-run. The guard above restores it at session END, which
@@ -1795,9 +1815,38 @@ def _disable_rl_hub_writes_in_tests(request):
 # command line named the sentinel. Containing them by default is the point.
 # A developer who wants them live runs with `VCO_TEST_ALLOW_REAL_STATE=1`, the
 # one hatch for "run against my real install".
+#
+# v0.2.102 W6-B2 last round — the stand-aside is OPT-IN, never ambient. Before,
+# a listed file got the ambient value unconditionally, and a developer shell
+# (or a Claude Code session, whose `.claude/settings.json` env exports
+# `WEAVIATE_URL=http://localhost:8081`) therefore reached the LIVE Weaviate on
+# every plain full-suite run — measured: `test_codegraph_retrieval_quality_smoke`
+# queried localhost:8081. A listed file now sees the ambient value ONLY when
+# the run sets `VCO_TEST_LIVE_WEAVIATE=1` (the installer-smoke X-2 step and
+# `scripts/pre-ship-check.sh` Section 5 do) or `VCO_TEST_ALLOW_REAL_STATE=1`;
+# otherwise it is pinned like every other file and its live legs skip.
+#
+# v0.2.102 W6-K (owner ruling 2026-10-11) — the READ-ONLY smoke files are
+# exempt from that opt-in again: read-only access to the live Weaviate is
+# SAFE, so `test_codegraph_retrieval_quality_smoke` (queries only, creates
+# nothing — asserted by a schema-class snapshot around its live leg) and the
+# opt-in canary see the ambient value UNCONDITIONALLY, on a plain full-suite
+# run included. The two write-capable files (they create + drop their own
+# uniquely-named classes) KEEP the opt-in requirement — the W6-B2 concern
+# stands for anything that can CREATE state on a live backend.
+_LIVE_WEAVIATE_OPTIN_ENV = "VCO_TEST_LIVE_WEAVIATE"
+_LIVE_WEAVIATE_OPTED_IN = os.environ.get(_LIVE_WEAVIATE_OPTIN_ENV, "") not in ("", "0", "false")
+
 _LIVE_WEAVIATE_OPT_OUT_FILES: frozenset = frozenset({
     "test_v0246_v46b_live_ci10_diff_gate.py",
     "test_v0246_kg_sync_live.py",
+    "test_codegraph_retrieval_quality_smoke.py",
+    "test_v0294_live_weaviate_optin_canary.py",
+})
+
+#: The READ-ONLY members of the list above (owner 2026-10-11: read-only live
+#: access is safe; the ambient URL reaches them without any opt-in env).
+_LIVE_WEAVIATE_READONLY_FILES: frozenset = frozenset({
     "test_codegraph_retrieval_quality_smoke.py",
     "test_v0294_live_weaviate_optin_canary.py",
 })
@@ -1809,9 +1858,32 @@ def _weaviate_url_pin_for(test_file: str) -> "str | None":
     Pure and importable, so both branches are provable without a backend
     (`tests/test_v0294_fixture_class_guard.py` drives it directly).
     """
-    if _ALLOW_REAL_STATE or test_file in _LIVE_WEAVIATE_OPT_OUT_FILES:
+    if test_file in _LIVE_WEAVIATE_READONLY_FILES:
+        return _AMBIENT_WEAVIATE_URL
+    if _ALLOW_REAL_STATE or (_LIVE_WEAVIATE_OPTED_IN and test_file in _LIVE_WEAVIATE_OPT_OUT_FILES):
         return _AMBIENT_WEAVIATE_URL
     return _fixture_guard.UNROUTABLE_SENTINEL_URL
+
+
+class WeaviateUrlLeak(AssertionError):
+    """A test left ``WEAVIATE_URL`` at a value the pin did not give it."""
+
+
+def _weaviate_url_leak(test_file: str, expected: "str | None") -> "str | None":
+    """The loud message when the process env no longer carries *expected* —
+    the pin's decision for *test_file* — or None when it does. Pure, so the
+    guard is provable without a failing test (``tests/test_v0294_fixture_
+    class_guard.py``)."""
+    seen = os.environ.get("WEAVIATE_URL")
+    if seen == expected:
+        return None
+    return (
+        f"{test_file} left WEAVIATE_URL={seen!r} (the pin is {expected!r}). A test "
+        "that changes it must restore it exactly (monkeypatch / mock.patch.dict, or "
+        "pop the key it added) — a leaked or REMOVED value lets every later test, "
+        "and every child it spawns, resolve a live backend. Live tests opt in with "
+        f"{_LIVE_WEAVIATE_OPTIN_ENV}=1."
+    )
 
 
 @contextlib.contextmanager
@@ -1966,15 +2038,23 @@ def _pin_weaviate_url(request):
     whatever classes they create.
     """
     prev_allow = os.environ.get(_fixture_guard.ALLOW_FIXTURE_WRITES_ENV)
-    with _weaviate_url_applied_for(request.node.fspath.basename):
+    test_file = request.node.fspath.basename
+    leak = None
+    with _weaviate_url_applied_for(test_file) as target:
         os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = "1"
         try:
             yield
         finally:
+            # v0.2.102 W6-B2 last round: the GUARD. Every other fixture (and
+            # monkeypatch) has torn down by now, so anything but the pin is a
+            # leak this test caused — fail it loudly, by name.
+            leak = None if _ALLOW_REAL_STATE else _weaviate_url_leak(test_file, target)
             if prev_allow is None:
                 os.environ.pop(_fixture_guard.ALLOW_FIXTURE_WRITES_ENV, None)
             else:
                 os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = prev_allow
+    if leak:
+        raise WeaviateUrlLeak(leak)
 
 
 # Test files that EXPLICITLY exercise `spawn_background_resync`'s launch path
@@ -2088,3 +2168,28 @@ def _disable_resync_spawn_in_tests(request):
             os.environ.pop(key, None)
         else:
             os.environ[key] = prev
+
+
+# ── Gateway vendor keys (v0.2.102 per-vendor agent leg) ─────────────────────
+# `vco_lib.module_gated_delivery.select_gateway_agents` asks the gateway's own
+# key resolver whether each vendor's key resolves before it delivers that
+# vendor's agent definitions. Left alone, every bundle-delivery test would
+# consult THIS machine's hub / keychain / file store — non-hermetic, and the
+# verdict would depend on which keys the developer happens to hold. The
+# default here answers "every vendor key resolves", which keeps every
+# pre-existing delivery test meaning what it meant before the leg existed;
+# the tests that pin the leg itself pass `vendor_probe=` or patch
+# `_default_vendor_probe` (monkeypatch/mock run after this fixture, so they win).
+@pytest.fixture(autouse=True)
+def _gateway_vendor_keys_all_resolve():
+    try:
+        from vco_lib import module_gated_delivery as _mgd
+    except Exception:  # noqa: BLE001 — a suite without vco_lib has no leg to pin
+        yield
+        return
+    saved = _mgd._default_vendor_probe
+    _mgd._default_vendor_probe = lambda: (lambda _vendor_id: True)
+    try:
+        yield
+    finally:
+        _mgd._default_vendor_probe = saved

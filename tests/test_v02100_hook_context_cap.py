@@ -22,6 +22,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 HOOKS = REPO / "templates" / "hooks"
@@ -43,7 +44,7 @@ def _env(project: Path, **extra: str) -> dict:
 
 def _hook(impl: str, name: str, project: Path, payload: str, **extra: str) -> str:
     argv = (["bash", str(HOOKS / f"{name}.sh")] if impl == "sh" else
-            [PWSH, "-NoProfile", "-NonInteractive", "-File", str(HOOKS / f"{name}.ps1")])
+            [PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(HOOKS / f"{name}.ps1")])
     res = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=120,
                          env=_env(project, **extra), cwd=str(project))
     assert res.returncode == 0, res.stderr
@@ -80,7 +81,7 @@ def _pwsh_script(body: str, *args: str, env: dict | None = None) -> bytes:
     with tempfile.TemporaryDirectory() as tmp:
         script = Path(tmp) / "drive.ps1"
         script.write_text(body, encoding="utf-8")
-        res = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(script), *args],
+        res = subprocess.run([PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(script), *args],
                              capture_output=True, timeout=60, env=env or dict(os.environ))
         return res.stdout
 

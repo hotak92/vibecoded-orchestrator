@@ -306,6 +306,13 @@ def main() -> int:
 
     logger.info("Connecting to Weaviate at %s (gRPC port %d)", WEAVIATE_URL, GRPC_PORT)
     try:
+        # v0.2.102 W4-E: no PyPI version lookup on connect (one home:
+        # weaviate_helpers.disable_weaviate_client_pypi_check; guarded).
+        try:
+            from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+            disable_weaviate_client_pypi_check()
+        except Exception:
+            pass
         client = weaviate.connect_to_local(
             port=int(WEAVIATE_URL.rsplit(":", 1)[-1]) if ":" in WEAVIATE_URL.split("//", 1)[-1] else 8081,
             grpc_port=GRPC_PORT,

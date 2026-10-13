@@ -8,18 +8,54 @@ Ensures consistency between markdown files and Weaviate:
 1. Finds orphaned Weaviate entries (no corresponding file)
 2. Finds orphaned files (not in Weaviate)
 3. Validates WikiLinks (no broken links)
-4. Updates node timestamps
-5. Rebuilds missing cross-references
+4. Checks node timestamps: reports nodes whose stored ``updated``
+   property disagrees with the file's frontmatter ``updated:`` (the
+   field the sync writer stores into that property). A file that
+   declares no frontmatter ``updated:`` is NEVER a timestamp finding:
+   the pre-rework fallback compared file mtime against the stored
+   ``updated_at``, but mtime churns on every git checkout / branch
+   switch / copy (the exact comparison vco_lib.kg_metadata_repair
+   deliberately excludes — "mtime churns, so comparing them would
+   write on every run"), so that branch was noise, not signal, and is
+   gone. With --fix the flagged rows are repaired IN PLACE
+   (``collection.data.update(uuid, properties=...)``) — no deletion,
+   no re-embed (property drift needs no re-embedding), and the source
+   .md files are never rewritten.
+5. Rebuilds missing cross-references: reports nodes whose WikiLinks in
+   the file are missing from the stored ``links`` / ``typed_links``
+   and, with --fix, repairs them the same in-place way (writing the
+   file-derived lists, exactly what the sync writer would store).
+   Broken links whose target node does not exist stay item 3's report
+   — --fix never invents nodes.
+   Items 4-5 key every comparison by the row's stored ``file_path``
+   (each row is compared only with the file at that path — duplicate
+   H1s across files can never be cross-flagged or collateral-damaged),
+   delete NOTHING (a failed update leaves the row exactly as it was),
+   and isolate failures per row (one failing update never aborts the
+   rest).
+6. Checks required frontmatter fields: reports nodes whose frontmatter
+   is missing any of the required fields (the ONE definition lives in
+   sync_knowledge_graph.REQUIRED_FRONTMATTER_FIELDS). REPORT-ONLY in
+   BOTH modes — a missing field can only be fixed by editing the .md,
+   and KG files are user data this script never rewrites, so --fix
+   keeps reporting them (with the exact field names) and writes
+   nothing.
 
 Usage:
-    python .claude/scripts/maintain_knowledge_graph.py --check    # Check only
+    python .claude/scripts/maintain_knowledge_graph.py --check    # Check only — writes nothing
     python .claude/scripts/maintain_knowledge_graph.py --fix      # Check and fix
     python .claude/scripts/maintain_knowledge_graph.py --rebuild  # Full rebuild
 
 Destructive paths (--fix orphan deletion, --rebuild) prompt for
 confirmation; pass --yes for non-interactive runs (CI, agents). On a
 non-interactive shell without --yes the destructive step is SKIPPED
-(exit 3) — never silently applied.
+(exit 3) — never silently applied. The items 4-5 repair is an IN-PLACE
+property update on the flagged rows (nothing is deleted, so a failed
+update can never lose a node, and no re-embed happens) and runs in
+--fix without a further prompt; it touches only the flagged nodes'
+Weaviate properties, never the source .md files. Item 6 is report-only
+even under --fix: the missing fields are named so the user can add
+them to the .md.
 
 DATA-SAFETY (v0.2.54 Track D / audit P0-2): when the resolved
 KNOWLEDGE_COLLECTION is the SHARED KG collection (orchestrator-root
@@ -32,8 +68,9 @@ VCO_MAINTAIN_SHARED_KG_CONSENT=1 to override (accepting that loss).
 
 import sys
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import re
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -231,6 +268,10 @@ def get_all_weaviate_objects(
     the exact object identity. Pre-fix the delete step re-queried by
     TITLE equality (limit 10) and deleted every match — a live node that
     happened to share a title with an orphan was collateral damage.
+
+    v0.2.102 W6-Y R4b (Y4b-1): a FAILED fetch raises (after one clear
+    error line) instead of returning [] — a dead read used to look
+    identical to a clean pass all the way to "All checks passed".
     """
     try:
         collection = server.client.collections.get(KNOWLEDGE_COLLECTION)
@@ -247,7 +288,7 @@ def get_all_weaviate_objects(
 
     except Exception as e:
         print(f"❌ Error fetching Weaviate nodes: {e}")
-        return []
+        raise
 
 
 def get_all_weaviate_nodes(server: WeaviateMCPServer) -> Dict[str, str]:
@@ -257,6 +298,350 @@ def get_all_weaviate_nodes(server: WeaviateMCPServer) -> Dict[str, str]:
         title: file_path
         for _uuid, title, file_path in get_all_weaviate_objects(server)
     }
+
+
+def get_all_weaviate_rows(
+    server: WeaviateMCPServer,
+) -> List[Tuple[str, str, str, Dict[str, Any]]]:
+    """Get all KG rows as (uuid, title, file_path, properties) 4-tuples.
+
+    v0.2.102 W6-Y (docstring items 4-5): the timestamp and
+    cross-reference checks compare STORED properties (``updated`` /
+    ``updated_at`` / ``links`` / ``typed_links``) against the source
+    files, so they need the full property dicts, not just the identity
+    triples :func:`get_all_weaviate_objects` returns. Kept as a second
+    named fetch (same pagination) rather than widening the triple
+    contract — the triple shape is a patch point the existing guard
+    tests monkeypatch.
+
+    v0.2.102 W6-Y R4b (Y4b-1): a FAILED fetch raises (after one clear
+    error line) instead of returning [] — a dead read must never reach
+    "✓ No stale timestamps" / "All checks passed".
+    """
+    try:
+        collection = server.client.collections.get(KNOWLEDGE_COLLECTION)
+        objects = _fetch_all_objects_paginated(collection)
+
+        rows = []
+        for obj in objects:
+            title = obj.properties.get("title")
+            file_path = obj.properties.get("file_path")
+            if title and file_path:
+                rows.append(
+                    (str(obj.uuid), title, file_path, dict(obj.properties or {}))
+                )
+
+        return rows
+
+    except Exception as e:
+        print(f"❌ Error fetching Weaviate node properties: {e}")
+        raise
+
+
+def _parse_file_node(file_path: Path) -> Optional[Dict[str, Any]]:
+    """Parse one KG file with the ONE parser the sync writer uses
+    (``sync_knowledge_graph.parse_markdown_node`` — no second parser).
+
+    Returns the parsed node dict, or None (with a note) when the file
+    cannot be parsed. Unparseable is unjudgeable: never a finding, and
+    the node is left alone by --fix.
+    """
+    from sync_knowledge_graph import parse_markdown_node
+
+    try:
+        return parse_markdown_node(
+            file_path.read_text(encoding="utf-8"), file_path
+        )
+    except Exception as e:  # noqa: BLE001 — any parse failure skips the node
+        print(f"  ⚠️  Cannot parse {file_path.name} for the "
+              f"timestamp/link checks: {e}")
+        return None
+
+
+def _parse_instant(value: Any) -> Optional[datetime]:
+    """Parse a timestamp (stored property or parsed frontmatter value)
+    into an aware UTC datetime, or None when unparseable."""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip() if value is not None else ""
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def check_stale_timestamps(
+    rows: List[Tuple[str, str, str, Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Find rows whose stored ``updated`` property disagrees with the
+    source file (docstring item 4).
+
+    Y-1 (batch review R3): keyed by the row's STORED ``file_path`` —
+    each row is parsed against, and compared with, the file at exactly
+    that path. Title-keying (the H1 map) is gone: when two files share
+    an H1, title-keying compared BOTH rows against one file's parse and
+    the fix step then damaged the other file's row.
+
+    The expected value derives EXACTLY as the sync writer derives it
+    (:func:`_parse_file_node` → ``parse_markdown_node``): the
+    frontmatter ``updated:`` compared against the stored ``updated``
+    property, which is what the sync writes from that field, at second
+    granularity. A file that declares no frontmatter ``updated:`` is
+    never a finding (the docstring's mtime-fallback removal).
+
+    Returns one finding dict per flagged row: ``uuid`` / ``title`` /
+    ``file_path`` / ``detail`` (for the report) and ``properties``
+    (``{"updated": …}`` — what --fix writes in place). Conservative on
+    every uncertainty: a row whose file no longer exists (item 1's
+    territory), a stored property the row does not declare, or a value
+    that will not parse, is unjudgeable — never a finding.
+    """
+    parsed: Dict[str, Optional[Dict[str, Any]]] = {}
+    findings: List[Dict[str, Any]] = []
+
+    for row_uuid, title, weaviate_path, props in rows:
+        file_path = PROJECT_ROOT / weaviate_path
+        if not file_path.exists():
+            continue  # missing file = the orphan check's finding, not ours
+        if str(file_path) not in parsed:
+            parsed[str(file_path)] = _parse_file_node(file_path)
+        node_data = parsed[str(file_path)]
+        if not node_data or "updated" not in node_data:
+            continue
+        expected_dt = _parse_instant(node_data["updated"])
+        if expected_dt is None or "updated" not in props:
+            continue
+        stored_dt = _parse_instant(props["updated"])
+        if stored_dt is None:
+            continue
+        if expected_dt.replace(microsecond=0) != stored_dt.replace(microsecond=0):
+            findings.append({
+                "uuid": row_uuid,
+                "title": title,
+                "file_path": weaviate_path,
+                "detail": (f"stored updated {props['updated']} ≠ "
+                           f"file {node_data['updated']}"),
+                "properties": {"updated": node_data["updated"]},
+            })
+
+    return findings
+
+
+def _stored_link_sets(
+    props: Dict[str, Any],
+) -> Tuple[Optional[Set[str]], Optional[Set[Tuple[str, str]]]]:
+    """(untyped link targets, typed (relation, target) pairs) read from
+    one stored row — either side None when that aspect is unjudgeable.
+
+    A None-valued property is a POSITIVE fact ("unset"), the same
+    reading :func:`vco_lib.kg_metadata_repair._normalised_stored` gives
+    it; a property the row does not declare at all is unjudgeable.
+    Legacy list-of-strings ``typed_links`` items (``"uses::Redis"``)
+    are read too.
+    """
+    raw_links = props.get("links")
+    if "links" not in props:
+        untyped: Optional[Set[str]] = None
+    elif raw_links is None:
+        untyped = set()
+    elif isinstance(raw_links, list) and all(
+        isinstance(item, str) for item in raw_links
+    ):
+        untyped = set(raw_links)
+    else:
+        untyped = None
+
+    raw_typed = props.get("typed_links")
+    typed: Optional[Set[Tuple[str, str]]] = None
+    if "typed_links" in props:
+        if raw_typed is None:
+            typed = set()
+        elif isinstance(raw_typed, list):
+            typed = set()
+            for item in raw_typed:
+                if (
+                    isinstance(item, dict)
+                    and item.get("relation_type")
+                    and item.get("target_title")
+                ):
+                    typed.add(
+                        (str(item["relation_type"]), str(item["target_title"]))
+                    )
+                elif isinstance(item, str) and "::" in item:
+                    relation, _, target = item.partition("::")
+                    typed.add((relation, target))
+                else:
+                    typed = None  # unjudgeable item shape
+                    break
+    return untyped, typed
+
+
+def check_missing_links(
+    rows: List[Tuple[str, str, str, Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Find rows whose WikiLinks in the file at the row's stored
+    ``file_path`` are missing from the stored ``links`` /
+    ``typed_links`` (docstring item 5). Keyed by file_path exactly as
+    :func:`check_stale_timestamps` (Y-1) — never by title.
+
+    The file side derives from the ONE sync parser, so what is compared
+    against — and what --fix writes back in place — is exactly what a
+    re-sync through the writer would store. Missing-only: stored extras
+    are not a finding (this rebuilds references, it does not prune
+    them).
+
+    Returns one finding dict per flagged row (same shape as
+    :func:`check_stale_timestamps`, plus ``missing`` — the missing items
+    as a LIST, joined into ``detail`` for display only so a target
+    containing ``", "`` cannot inflate the report's "… and N more"
+    count; ``properties`` carries the file-derived ``links`` /
+    ``typed_links``).
+    """
+    parsed: Dict[str, Optional[Dict[str, Any]]] = {}
+    findings: List[Dict[str, Any]] = []
+
+    for row_uuid, title, weaviate_path, props in rows:
+        file_path = PROJECT_ROOT / weaviate_path
+        if not file_path.exists():
+            continue
+        if str(file_path) not in parsed:
+            parsed[str(file_path)] = _parse_file_node(file_path)
+        node_data = parsed[str(file_path)]
+        if not node_data:
+            continue
+        stored_untyped, stored_typed = _stored_link_sets(props)
+        miss: List[str] = []
+        if stored_untyped is not None:
+            miss.extend(sorted(set(node_data["links"]) - stored_untyped))
+        if stored_typed is not None:
+            file_typed = {
+                (item["relation_type"], item["target_title"])
+                for item in node_data["typed_links"]
+            }
+            for relation, target in sorted(file_typed - stored_typed):
+                miss.append(f"{relation}::{target}")
+        if miss:
+            findings.append({
+                "uuid": row_uuid,
+                "title": title,
+                "file_path": weaviate_path,
+                # Y4b-3: the missing items ride as a LIST — the report
+                # joins for display only, so a target containing ", "
+                # cannot inflate the "… and N more" count.
+                "missing": list(miss),
+                "detail": ", ".join(miss),
+                "properties": {
+                    "links": list(node_data["links"]),
+                    "typed_links": list(node_data["typed_links"]),
+                },
+            })
+
+    return findings
+
+
+def apply_property_updates(
+    server: WeaviateMCPServer,
+    findings: List[Dict[str, Any]],
+) -> int:
+    """Repair the flagged rows IN PLACE (docstring items 4-5, Y-2/Y-3).
+
+    ``collection.data.update(uuid, properties=...)`` merges the named
+    properties into the stored row: no deletion (a failed update leaves
+    the row exactly as it was — a down embedding backend can never lose
+    a node, because no re-embed happens at all), no re-embedding
+    (property drift does not change the content the vectors encode).
+
+    A row flagged by BOTH checks is updated once, with the merged
+    property set. Failures are isolated per row (Y-3): one failing
+    update prints an error and the loop continues with the rest.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    for finding in findings:
+        entry = merged.setdefault(
+            finding["uuid"],
+            {"title": finding["title"], "properties": {}},
+        )
+        entry["properties"].update(finding["properties"])
+
+    updated = 0
+    try:
+        collection = server.client.collections.get(KNOWLEDGE_COLLECTION)
+    except Exception as e:  # noqa: BLE001 — cannot even resolve the collection
+        print(f"  ❌ Error reaching collection for in-place updates: {e}")
+        return 0
+
+    for row_uuid, entry in merged.items():
+        try:
+            collection.data.update(
+                uuid=row_uuid, properties=entry["properties"]
+            )
+            updated += 1
+            print(f"  ✓ Updated in place: {entry['title']} ({row_uuid})")
+        except Exception as e:  # noqa: BLE001 — one row never aborts the rest
+            print(f"  ❌ Failed to update {entry['title']} ({row_uuid}): {e} "
+                  f"— row left as-is")
+
+    return updated
+
+
+def check_missing_frontmatter_fields(
+    knowledge_root: Optional[Path] = None,
+) -> Dict[str, List[str]]:
+    """Find KG files whose frontmatter is missing required fields
+    (docstring item 6). REPORT-ONLY by design: the caller never feeds
+    these files into any fix path — a missing field can only be fixed
+    by editing the .md, and KG files are user data this script never
+    rewrites.
+
+    Iterates the FILES under ``knowledge/`` (never the title-keyed H1
+    map — two files can share an H1, and each file is judged on its
+    own). The ontology meta-files at the knowledge root
+    (``VOCABULARY.md``, ``TAG_HIERARCHY.md``) are not KG nodes and are
+    skipped. "Required" has ONE definition — ``sync_knowledge_graph
+    .REQUIRED_FRONTMATTER_FIELDS`` — and each file is read with the
+    ONE frontmatter parser (``parse_frontmatter``), so the nested
+    ``metadata:`` dialect and ``name:``-for-``title:`` promotion count
+    as declared fields, exactly as the sync writer reads them. A file
+    with no frontmatter block at all is missing every required field.
+
+    Returns {file path (POSIX, relative to the knowledge root's
+    parent): [missing field names]} for the report.
+    """
+    from sync_knowledge_graph import (
+        REQUIRED_FRONTMATTER_FIELDS,
+        parse_frontmatter,
+    )
+
+    root = knowledge_root if knowledge_root is not None else KNOWLEDGE_ROOT
+    meta_files = {"vocabulary.md", "tag_hierarchy.md"}
+    missing: Dict[str, List[str]] = {}
+    for md_file in sorted(root.rglob("*.md")):
+        if md_file.parent == root and md_file.name.lower() in meta_files:
+            continue
+        try:
+            frontmatter, _body = parse_frontmatter(
+                md_file.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"  ⚠️  Cannot read {md_file.name} for the "
+                  f"frontmatter check: {e}")
+            continue
+        declared = frontmatter or {}
+        absent = [f for f in REQUIRED_FRONTMATTER_FIELDS if f not in declared]
+        if absent:
+            try:
+                key = md_file.relative_to(root.parent).as_posix()
+            except ValueError:
+                key = str(md_file)
+            missing[key] = absent
+
+    return missing
 
 
 def extract_wikilinks(content: str) -> Set[str]:
@@ -410,6 +795,9 @@ def check_consistency(
         "orphaned_weaviate": 0,
         "orphaned_files": 0,
         "broken_links": 0,
+        "stale_timestamps": 0,
+        "missing_links": 0,
+        "missing_frontmatter_fields": 0,
         "fixed": 0
     }
 
@@ -492,6 +880,74 @@ def check_consistency(
     else:
         print("  ✓ No broken links")
 
+    # v0.2.102 W6-Y (docstring items 4-5): timestamp + cross-reference
+    # checks. `rows` is fetched AFTER the orphan steps so it reflects
+    # any nodes this run already synced (those are current by
+    # construction). Both checks key by the row's stored file_path
+    # (Y-1) and --fix repairs the flagged rows IN PLACE (Y-2/Y-3):
+    # nothing is deleted, nothing re-embeds, and one failing update
+    # never aborts the rest.
+    print("\n🕒 Checking node timestamps...")
+    rows = get_all_weaviate_rows(server)
+    stale_timestamps = check_stale_timestamps(rows)
+    stats["stale_timestamps"] = len(stale_timestamps)
+
+    if stale_timestamps:
+        print(f"  ⚠️  Found {len(stale_timestamps)} node(s) with a stale stored timestamp:")
+        for finding in stale_timestamps[:10]:
+            print(f"    - {finding['title']}: {finding['detail']}")
+        if len(stale_timestamps) > 10:
+            print(f"    ... and {len(stale_timestamps) - 10} more")
+    else:
+        print("  ✓ No stale timestamps")
+
+    print("\n🔗 Checking stored cross-references...")
+    missing_links = check_missing_links(rows)
+    stats["missing_links"] = len(missing_links)
+
+    if missing_links:
+        print(f"  ⚠️  Found {len(missing_links)} node(s) with WikiLinks missing from Weaviate:")
+        for finding in missing_links[:5]:
+            print(f"    {finding['title']} ({finding['file_path']}):")
+            # Y4b-3: count from the finding's item LIST, never from a
+            # ", "-split of the joined detail — a target containing
+            # ", " would otherwise inflate the "… and N more" count.
+            for link in finding["missing"][:3]:
+                print(f"      - [[{link}]]")
+            if len(finding["missing"]) > 3:
+                print(f"      ... and {len(finding['missing']) - 3} more")
+        if len(missing_links) > 5:
+            print(f"    ... and {len(missing_links) - 5} more files")
+    else:
+        print("  ✓ No missing cross-references")
+
+    # v0.2.102 W6-Y follow-up 2 (docstring item 6): required-frontmatter
+    # check. REPORT-ONLY in BOTH modes — these files are deliberately
+    # NOT added to the --fix update set below: a missing field can only
+    # be fixed by editing the .md, and this script never rewrites the
+    # user's KG files.
+    print("\n📝 Checking required frontmatter fields...")
+    missing_fields = check_missing_frontmatter_fields()
+    stats["missing_frontmatter_fields"] = len(missing_fields)
+
+    if missing_fields:
+        print(f"  ⚠️  Found {len(missing_fields)} file(s) missing required "
+              f"frontmatter fields (report-only, also under --fix — add "
+              f"the fields to the .md yourself):")
+        for file_key, absent in list(missing_fields.items())[:10]:
+            print(f"    {file_key}: missing {', '.join(absent)}")
+        if len(missing_fields) > 10:
+            print(f"    ... and {len(missing_fields) - 10} more")
+    else:
+        print("  ✓ No missing required frontmatter fields")
+
+    if fix:
+        findings = stale_timestamps + missing_links
+        if findings:
+            print(f"\n  Updating {len(findings)} flagged row(s) in place "
+                  "(no deletion, no re-embed)...")
+            stats["fixed"] += apply_property_updates(server, findings)
+
     return stats
 
 
@@ -558,6 +1014,13 @@ def main():
         print("Usage: maintain_knowledge_graph.py --check")
         print("       maintain_knowledge_graph.py --fix     [--yes]")
         print("       maintain_knowledge_graph.py --rebuild [--yes]")
+        print("Checks: orphaned Weaviate entries, orphaned files, broken")
+        print("WikiLinks, stale node timestamps, WikiLinks missing from")
+        print("stored cross-references, missing required frontmatter")
+        print("fields (report-only in every mode). --check writes nothing;")
+        print("--fix also repairs the rows flagged by the timestamp and")
+        print("cross-reference checks IN PLACE (no deletion, no re-embed,")
+        print("never rewriting the .md files).")
         sys.exit(1)
 
     mode = argv[0]
@@ -646,6 +1109,10 @@ def main():
             print(f"Orphaned Weaviate entries: {stats['orphaned_weaviate']}")
             print(f"Orphaned files: {stats['orphaned_files']}")
             print(f"Broken links: {stats['broken_links']}")
+            print(f"Stale timestamps: {stats['stale_timestamps']}")
+            print(f"Missing cross-references: {stats['missing_links']}")
+            print("Missing required frontmatter fields: "
+                  f"{stats['missing_frontmatter_fields']}")
             # v0.2.18: surface the active named-vector slot so operators
             # can sanity-check which model maintain is using for write
             # paths (--fix / --rebuild). Read-only check doesn't depend
@@ -655,9 +1122,23 @@ def main():
             if fix:
                 print(f"Fixed: {stats['fixed']}")
                 print("\n✅ Maintenance complete")
+                if stats['missing_frontmatter_fields'] > 0:
+                    print("⚠️  Frontmatter findings are report-only — add "
+                          "the missing fields to the .md files yourself.")
             else:
-                if stats['orphaned_weaviate'] + stats['orphaned_files'] > 0:
+                if (
+                    stats['orphaned_weaviate'] + stats['orphaned_files']
+                    + stats['stale_timestamps'] + stats['missing_links'] > 0
+                ):
                     print("\n⚠️  Run with --fix to repair issues")
+                    if stats['missing_frontmatter_fields'] > 0:
+                        print("⚠️  Frontmatter findings are report-only — "
+                              "add the missing fields to the .md files "
+                              "yourself.")
+                elif stats['missing_frontmatter_fields'] > 0:
+                    print("\n⚠️  Frontmatter findings only — report-only in "
+                          "every mode; add the missing fields to the .md "
+                          "files yourself.")
                 else:
                     print("\n✅ All checks passed")
 

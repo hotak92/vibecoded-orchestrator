@@ -16,8 +16,10 @@
 //!
 //! ## The rule
 //!
-//! In PRODUCTION code (everything before a file's column-zero `#[cfg(test)]`
-//! module) of the three crates, every line that still contains the phrase
+//! In PRODUCTION code of the three crates — every line outside a test-gated
+//! item (`support::test_gated_lines`: the gated `mod tests`, and also gated
+//! helpers and `use`s, with production code AFTER them still in scope) —
+//! every line that still contains the phrase
 //! `no stderr` must have, within its window (12 lines before, 6 after):
 //!   * a reference to the process status (the token `status`), and
 //!   * NONE of the lossy renderings: `.code().unwrap_or(…)`,
@@ -29,6 +31,8 @@
 //! both directions of the rule.
 
 use std::path::{Path, PathBuf};
+
+mod support;
 
 const PHRASE: &str = "no stderr";
 const BEFORE: usize = 12;
@@ -45,26 +49,27 @@ fn strip_line_comments(src: &str) -> Vec<String> {
         .collect()
 }
 
-/// Index of the first column-zero `#[cfg(test)]` / `#[cfg(all(test, …))]`
-/// whose next non-blank line opens a `mod` — the file's test module. Items
-/// gated by a lone `#[cfg(test)]` above production code are not the cut.
-fn test_module_start(lines: &[String]) -> usize {
-    for (i, l) in lines.iter().enumerate() {
-        if l.starts_with("#[cfg(") && l.contains("test") {
-            let next = lines[i + 1..].iter().find(|n| !n.trim().is_empty());
-            if next.is_some_and(|n| n.trim_start().starts_with("mod ")) {
-                return i;
-            }
-        }
-    }
-    lines.len()
+/// The lines of `src` that are production code: `//` comments stripped
+/// (strings kept — the phrase lives in a string literal), and every line of a
+/// test-gated item blanked. Line count is preserved.
+///
+/// v0.2.102 (W6-Z2): this used to cut the file at its first column-zero
+/// `#[cfg(test)]` MODULE, which blinded every production line after it —
+/// 7 files in these crates carry production code below their test module
+/// (`projects_v2.rs`, `secrets_cmd.rs`, `storage_ux.rs`, `cli_api.rs`, …).
+fn production_lines(src: &str) -> Vec<String> {
+    let gated = support::test_gated_lines(&support::strip_comments_and_strings(src));
+    strip_line_comments(src)
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| if gated.get(i).copied().unwrap_or(false) { String::new() } else { l })
+        .collect()
 }
 
 /// Every violation in `src` as `name:line: reason`.
 fn check_source(name: &str, src: &str) -> Vec<String> {
-    let lines = strip_line_comments(src);
-    let end = test_module_start(&lines);
-    let prod = &lines[..end];
+    let lines = production_lines(src);
+    let prod = &lines[..];
     let mut out = Vec::new();
     for (i, line) in prod.iter().enumerate() {
         if !line.to_ascii_lowercase().contains(PHRASE) {
@@ -134,8 +139,7 @@ fn every_no_stderr_fallback_carries_the_exit_status() {
     for f in &files {
         let src = std::fs::read_to_string(f).unwrap();
         let name = f.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(f).display().to_string();
-        let lines = strip_line_comments(&src);
-        let prod = &lines[..test_module_start(&lines)];
+        let prod = production_lines(&src);
         if prod.iter().any(|l| l.to_ascii_lowercase().contains(PHRASE)) {
             homes.insert(name.replace('\\', "/").trim_start_matches('/').to_string());
         }
@@ -206,6 +210,26 @@ mod tests {
 }
 "#;
     let only_in_comment = "// a failure used to read `no stderr`\nfn f() {}\n";
+    // v0.2.102 W6-Z2: production code BELOW the test module, and below a
+    // gated `use`, is still production — the old first-module cut hid both.
+    let after_test_module = r#"
+#[cfg(test)]
+mod tests {
+    fn g() {}
+}
+
+fn f(out: Output) -> String {
+    format!("x exited {}: {}", out.status.code().unwrap_or(-1), "no stderr")
+}
+"#;
+    let after_gated_use = r#"
+#[cfg(test)]
+use std::fmt::Debug;
+
+fn f(stderr: &str) -> String {
+    format!("x failed: {}", if stderr.is_empty() { "no stderr" } else { stderr })
+}
+"#;
 
     assert!(!check_source("lossy_code", lossy_code).is_empty());
     assert!(!check_source("lossy_map", lossy_map).is_empty());
@@ -213,4 +237,6 @@ mod tests {
     assert_eq!(check_source("fixed", fixed), Vec::<String>::new());
     assert_eq!(check_source("only_in_tests", only_in_tests), Vec::<String>::new());
     assert_eq!(check_source("only_in_comment", only_in_comment), Vec::<String>::new());
+    assert!(!check_source("after_test_module", after_test_module).is_empty());
+    assert!(!check_source("after_gated_use", after_gated_use).is_empty());
 }

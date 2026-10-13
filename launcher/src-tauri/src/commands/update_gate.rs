@@ -362,6 +362,169 @@ impl Drop for UpdateInProgressGuard {
     }
 }
 
+// ─── Process-table refresh contract (one home) ───────────────────────────
+//
+// Every process-identity sweep in this file (the pre-update MCP kill sweep,
+// the steady-state orphan reaper, the hub backstop sweep, the exe-by-pid
+// lookup) reads one shared snapshot shape, built by ONE helper:
+// [`refresh_with_cmdlines`].
+//
+// WHY one home (v0.2.102, S16-1): in sysinfo 0.38 `System::refresh_processes`
+// refreshes memory / cpu / disk usage / exe / tasks ONLY — it never reads a
+// process's command line. On a fresh `System::new()` every `Process::cmd()`
+// slice is therefore EMPTY, so a sweep that refreshed that way and then
+// matched on the joined cmdline matched NOTHING. That is exactly how the MCP
+// kill sweep and the orphan reaper shipped: silent no-ops (no "kill-sweep:
+// terminating" line on a live update, MCPs days old surviving it) while their
+// pure-helper unit tests stayed green. Cmdlines are only populated when the
+// refresh asks for them with `ProcessRefreshKind::with_cmd`; this helper is
+// the one place that does it, and the real-process tests below pin it.
+
+/// Refresh `sys` with every process attribute the sweeps in this file read.
+///
+/// Read by the callers: pid, `cmd()` (needs `with_cmd`), `exe()` (needs
+/// `with_exe`), `parent()`, `run_time()` and `name()` (the last three are
+/// populated on every refresh, whatever the kind — sysinfo reads them from
+/// the same stat record that identifies the process). Tasks (Linux threads,
+/// which sysinfo otherwise lists as processes of their own with the owning
+/// process's cmdline) are deliberately NOT refreshed: a sweep must count and
+/// signal processes, not every thread of each.
+pub(crate) fn refresh_with_cmdlines(sys: &mut sysinfo::System) {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .without_tasks(),
+    );
+}
+
+/// A fresh process-table snapshot built through [`refresh_with_cmdlines`].
+fn process_table_with_cmdlines() -> sysinfo::System {
+    let mut sys = sysinfo::System::new();
+    refresh_with_cmdlines(&mut sys);
+    sys
+}
+
+/// A process's argv joined with single spaces (lossy for non-UTF-8 args).
+/// Empty when the snapshot was refreshed without `with_cmd`, or when the OS
+/// withholds the cmdline (kernel threads, another user's process on some
+/// platforms).
+fn joined_cmdline(proc: &sysinfo::Process) -> String {
+    proc.cmd()
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How much of the process table a sweep actually saw. Logged by every
+/// cmdline-matching sweep so a regression of the refresh contract reads as
+/// "enumerated 312, with a cmdline 0" in the log instead of silence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EnumerationStats {
+    /// Processes in the snapshot.
+    pub enumerated: usize,
+    /// Of those, how many carried a non-empty cmdline.
+    pub with_cmdline: usize,
+}
+
+fn enumeration_stats(sys: &sysinfo::System) -> EnumerationStats {
+    let mut stats = EnumerationStats::default();
+    for proc in sys.processes().values() {
+        stats.enumerated += 1;
+        if !proc.cmd().is_empty() {
+            stats.with_cmdline += 1;
+        }
+    }
+    stats
+}
+
+/// Log the enumeration counters for `sweep`; WARN when the table is non-empty
+/// but no process carried a cmdline (the refresh contract has regressed and
+/// the MCP filter is blind).
+fn log_enumeration(sweep: &str, stats: EnumerationStats, matched: usize) {
+    tracing::info!(
+        "[update_gate] {}: enumerated {} process(es), {} with a cmdline, {} matched",
+        sweep,
+        stats.enumerated,
+        stats.with_cmdline,
+        matched
+    );
+    if stats.enumerated > 0 && stats.with_cmdline == 0 {
+        tracing::warn!(
+            "[update_gate] {}: no enumerated process carried a cmdline — the \
+             process table was refreshed without `with_cmd`, so the MCP \
+             filter cannot see anything (see refresh_with_cmdlines)",
+            sweep
+        );
+    }
+}
+
+/// Terminate ONE process: SIGTERM (graceful) on POSIX; on Windows, which has
+/// no SIGTERM (sysinfo 0.38's `kill_with(Term)` returns `None` there), the
+/// fallback `kill()` runs `taskkill /PID <pid> /F` — a forced kill of that
+/// process only. Used by the hub backstop sweep, where a tree kill is NOT
+/// wanted. Best-effort: never escalates to SIGKILL on POSIX, never waits.
+fn terminate_process(proc: &sysinfo::Process) {
+    if proc.kill_with(sysinfo::Signal::Term).is_none() {
+        proc.kill();
+    }
+}
+
+/// Terminate an MCP server process — the terminate step of the pre-update
+/// kill sweep and of the orphan reaper.
+///
+/// V52-AI's purpose is to free the files an MCP holds open and to stop a
+/// respawn storm, so on each OS this takes down what actually holds them:
+/// - **POSIX**: SIGTERM to the matched process (as [`terminate_process`]),
+///   no tree walk. What happens to a matched host's children:
+///   * `npm exec` / `npx` forward SIGINT/SIGTERM to the child they spawn
+///     (npm's `@npmcli/run-script/lib/signal-manager.js`, read in the npm 10
+///     that ships with node 20). That child is `sh -c <bin>`, which does NOT
+///     forward — but the node process under it is itself an MCP server argv
+///     ([`is_mcp_server_argv`] matches `node …/.bin/playwright-mcp`), so the
+///     sweep signals it directly.
+///   * The python wrapper MCPs (`-m claude_mcp_servers.wrappers.*`) install a
+///     SIGTERM handler that terminates and reaps the upstream they host,
+///     so e.g. the excalidraw node server — not itself matched — goes down
+///     with them. (v0.2.102: the wrappers are deleted, but a machine
+///     updating FROM ≤v0.2.101 can still have those processes running —
+///     they remain sweep targets precisely so the update can delete the
+///     files underneath them.)
+/// - **Windows**: `taskkill /PID <pid> /T /F` — the process AND its child
+///   tree, forced. Windows has no SIGTERM to forward, so killing only the
+///   `npm exec` / `cmd /c` host leaves its node child running and holding the
+///   very file locks the sweep exists to release. Falls back to the
+///   single-process kill when `taskkill` cannot be run. MCP servers do not
+///   spawn the hub (they only resolve its port), so the tree is the MCP's
+///   own helpers.
+fn terminate_mcp_server(proc: &sysinfo::Process) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let tree_killed = std::process::Command::new("taskkill")
+            .args(["/PID", &proc.pid().as_u32().to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !tree_killed {
+            proc.kill();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        terminate_process(proc);
+    }
+}
+
 // ─── Pre-update MCP kill sweep ───────────────────────────────────────────
 //
 // Before the launcher writes the lockfile + starts git pull, do a
@@ -372,111 +535,446 @@ impl Drop for UpdateInProgressGuard {
 //
 // CRITICAL: this sweep MUST NOT fire outside an orchestrator update
 // (`update_run::run_update`). We
-// don't want to kill the user's other Python or Node processes.
-// The filter pattern is strict — only commands matching:
-//   * `claude_mcp_servers/` (path substring) — our own MCPs
-//   * `@modelcontextprotocol/` — npx-spawned MCP packages
-//   * `@upstash/context7-mcp` — the specific MCP the user reported
+// don't want to kill the user's other Python or Node processes — nor an
+// editor, `tail`, `grep` or shell that merely CITES an MCP path. The filter
+// is [`is_mcp_server_argv`]: the process must be EXECUTING an MCP server
+// (a runtime running a `claude_mcp_servers` script/module, or an npm MCP
+// package), never just mentioning one.
 //
-// On Windows the sweep uses taskkill with /FI filters. On POSIX it
-// enumerates /proc and sends SIGTERM. Either way, failure is soft —
-// logged but doesn't block the update (the lockfile + MCP-side gate
-// catches whatever the sweep missed).
+// Enumeration is the shared snapshot from `refresh_with_cmdlines` (the
+// filter needs argv, which only that refresh populates) on every OS;
+// termination is `terminate_mcp_server` (SIGTERM on POSIX, a `taskkill /T /F`
+// tree kill on Windows). Either way, failure is soft — logged but doesn't
+// block the update (the lockfile + MCP-side gate catches whatever the sweep
+// missed).
 
-const MCP_PATTERN_SUBSTRINGS: &[&str] = &[
-    "claude_mcp_servers",
-    "@modelcontextprotocol",
-    "@upstash/context7",
-];
+/// One process the MCP kill sweep would terminate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SweepCandidate {
+    pub pid: u32,
+    pub cmdline: String,
+}
+
+/// A process's argv as owned strings (lossy for non-UTF-8 args).
+fn argv_of(proc: &sysinfo::Process) -> Vec<String> {
+    proc.cmd()
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The ONE candidate decision of the pre-update MCP kill sweep, for one row
+/// of the snapshot: an MCP server argv, never `my_pid`.
+fn mcp_sweep_candidate(
+    pid: sysinfo::Pid,
+    proc: &sysinfo::Process,
+    my_pid: u32,
+) -> Option<SweepCandidate> {
+    if pid.as_u32() == my_pid || !is_mcp_server_argv(&argv_of(proc)) {
+        return None;
+    }
+    Some(SweepCandidate {
+        pid: pid.as_u32(),
+        cmdline: joined_cmdline(proc),
+    })
+}
+
+/// The candidate filter of the pre-update MCP kill sweep over a snapshot.
+/// Pure over the snapshot — it decides, it does not signal.
+pub(crate) fn mcp_kill_sweep_candidates(sys: &sysinfo::System, my_pid: u32) -> Vec<SweepCandidate> {
+    sys.processes()
+        .iter()
+        .filter_map(|(pid, proc)| mcp_sweep_candidate(*pid, proc, my_pid))
+        .collect()
+}
+
+/// The MCP kill sweep over an existing snapshot, with the terminate step
+/// injected (production passes [`terminate_mcp_server`]; tests pass a closure
+/// that only ever terminates the child they spawned). Returns the number of
+/// candidates handed to `terminate`.
+fn run_mcp_kill_sweep(
+    sys: &sysinfo::System,
+    my_pid: u32,
+    terminate: &mut dyn FnMut(&sysinfo::Process),
+) -> usize {
+    let hits: Vec<(&sysinfo::Process, SweepCandidate)> = sys
+        .processes()
+        .iter()
+        .filter_map(|(pid, proc)| mcp_sweep_candidate(*pid, proc, my_pid).map(|c| (proc, c)))
+        .collect();
+    log_enumeration("kill-sweep", enumeration_stats(sys), hits.len());
+    for (proc, cand) in &hits {
+        tracing::info!(
+            "[update_gate] kill-sweep: terminating PID {} (cmd: {})",
+            cand.pid,
+            cand.cmdline.chars().take(120).collect::<String>()
+        );
+        // No wait for exit in this best-effort sweep — the lockfile gate
+        // prevents respawns.
+        terminate(proc);
+    }
+    hits.len()
+}
 
 /// Run a pre-update MCP kill sweep. Best-effort, soft-fail.
 ///
 /// Returns the number of processes that were targeted (informational
 /// only — even if 0, the gate still protects future respawns).
-pub fn pre_update_mcp_kill_sweep() -> usize {
-    #[cfg(target_os = "windows")]
-    {
-        pre_update_mcp_kill_sweep_windows()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        pre_update_mcp_kill_sweep_posix()
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn pre_update_mcp_kill_sweep_posix() -> usize {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    let my_pid = std::process::id();
-    let mut count = 0usize;
-    for (pid, proc) in sys.processes() {
-        // Never kill ourselves or our parent (the launcher).
-        if pid.as_u32() == my_pid {
-            continue;
-        }
-        let cmdline = proc
-            .cmd()
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !mcp_pattern_match(&cmdline) {
-            continue;
-        }
-        tracing::info!(
-            "[update_gate] kill-sweep: terminating PID {} (cmd: {})",
-            pid.as_u32(),
-            cmdline.chars().take(120).collect::<String>()
-        );
-        // SIGTERM first; we don't wait for SIGKILL in this best-effort
-        // sweep. The lockfile gate prevents respawns.
-        proc.kill_with(sysinfo::Signal::Term);
-        count += 1;
-    }
-    count
-}
-
-#[cfg(target_os = "windows")]
-fn pre_update_mcp_kill_sweep_windows() -> usize {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    let my_pid = std::process::id();
-    let mut count = 0usize;
-    for (pid, proc) in sys.processes() {
-        if pid.as_u32() == my_pid {
-            continue;
-        }
-        let cmdline = proc
-            .cmd()
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !mcp_pattern_match(&cmdline) {
-            continue;
-        }
-        tracing::info!(
-            "[update_gate] kill-sweep: terminating PID {} (cmd: {})",
-            pid.as_u32(),
-            cmdline.chars().take(120).collect::<String>()
-        );
-        proc.kill();
-        count += 1;
-    }
-    count
-}
-
-/// Return true if `cmdline` matches an MCP pattern we should sweep.
 ///
-/// Pure helper, isolated for unit testing — process enumeration is
-/// hard to mock but the pattern logic is deterministic.
-pub fn mcp_pattern_match(cmdline: &str) -> bool {
-    MCP_PATTERN_SUBSTRINGS
-        .iter()
-        .any(|pat| cmdline.contains(pat))
+/// Refuses under a cargo test binary: the sweep matches the argv of EVERY
+/// process on the machine, so a test reaching it would terminate the
+/// developer's live MCP servers. Tests drive [`run_mcp_kill_sweep`] with an
+/// injected terminate step instead.
+pub fn pre_update_mcp_kill_sweep() -> usize {
+    if crate::hub_launcher::running_under_test_harness() {
+        tracing::warn!(
+            "[update_gate] kill-sweep: refusing to terminate MCP processes — \
+             this process is a cargo test binary and the sweep would reach the \
+             developer's live MCP servers"
+        );
+        return 0;
+    }
+    let sys = process_table_with_cmdlines();
+    run_mcp_kill_sweep(&sys, std::process::id(), &mut terminate_mcp_server)
+}
+
+// ─── "Is this process EXECUTING an MCP server?" ──────────────────────────
+//
+// v0.2.102: the filter used to be "the joined cmdline CONTAINS one of
+// `claude_mcp_servers` / `@modelcontextprotocol` / `@upstash/context7`". While
+// the sweep was blind that was harmless; once it worked, it would SIGTERM a
+// `vim …/claude_mcp_servers/x.py`, a `tail -f …/claude_mcp_servers/…log`, a
+// `grep -r claude_mcp_servers`, or a `bash -c` whose text cites the path. The
+// predicate now reads argv structurally: argv[0] must be a runtime, and the
+// thing that runtime EXECUTES must be an MCP server.
+
+/// npm package names (version suffix stripped) that are MCP servers. The
+/// two original V52-AI entries plus `@playwright/mcp`, which VCO registers
+/// itself (`npx -y @playwright/mcp@latest`, `mcp_registration.rs`).
+fn is_mcp_npm_package(spec: &str) -> bool {
+    let name = npm_package_name(spec);
+    name.starts_with("@modelcontextprotocol/")
+        || name.starts_with("@upstash/context7")
+        || name == "@playwright/mcp"
+}
+
+/// Executable names those packages install under `node_modules/.bin`
+/// (what `npx` / `npm exec` actually runs).
+fn is_mcp_npm_bin(name: &str) -> bool {
+    matches!(name, "playwright-mcp" | "context7-mcp") || name.starts_with("mcp-server-")
+}
+
+/// `@scope/name@1.2` → `@scope/name`; `name@latest` → `name`.
+fn npm_package_name(spec: &str) -> &str {
+    let search_from = usize::from(spec.starts_with('@'));
+    match spec[search_from..].find('@') {
+        Some(i) => &spec[..search_from + i],
+        None => spec,
+    }
+}
+
+/// Path components, split on both separators (a Windows argv uses `\`).
+fn path_components(path: &str) -> Vec<&str> {
+    path.split(['/', '\\']).filter(|c| !c.is_empty()).collect()
+}
+
+/// Lowercased basename with a Windows executable suffix removed:
+/// `C:\Python312\python.exe` → `python`, `/usr/bin/npx` → `npx`.
+fn exe_stem(path: &str) -> String {
+    let base = path_components(path).last().copied().unwrap_or("").to_ascii_lowercase();
+    for suffix in [".exe", ".cmd", ".bat"] {
+        if let Some(stem) = base.strip_suffix(suffix) {
+            return stem.to_string();
+        }
+    }
+    base
+}
+
+/// A script path inside a `claude_mcp_servers` directory (the directory is a
+/// component, not the last one).
+fn is_claude_mcp_script_path(path: &str) -> bool {
+    let comps = path_components(path);
+    comps.len() >= 2 && comps[..comps.len() - 1].contains(&"claude_mcp_servers")
+}
+
+/// `claude_mcp_servers` or `claude_mcp_servers.<…>` as a `python -m` module.
+fn is_claude_mcp_module(module: &str) -> bool {
+    module == "claude_mcp_servers" || module.starts_with("claude_mcp_servers.")
+}
+
+/// A node script that is an MCP server: an npm MCP package's file or bin,
+/// or a script under `claude_mcp_servers`.
+fn is_mcp_node_script(path: &str) -> bool {
+    let comps = path_components(path);
+    let stem = |c: &str| {
+        let c = c.to_ascii_lowercase();
+        ["js", "cjs", "mjs"]
+            .iter()
+            .find_map(|ext| c.strip_suffix(&format!(".{ext}")).map(str::to_string))
+            .unwrap_or(c)
+    };
+    comps.iter().enumerate().any(|(i, c)| {
+        let next = comps.get(i + 1).copied().unwrap_or("");
+        *c == "@modelcontextprotocol"
+            || (*c == "@upstash" && next.starts_with("context7"))
+            || (*c == "@playwright" && next == "mcp")
+            || (*c == ".bin" && i + 2 == comps.len() && is_mcp_npm_bin(&stem(next)))
+    }) || is_claude_mcp_script_path(path)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Runtime {
+    Python,
+    Node,
+    Npx,
+    Npm,
+    Uv,
+    Shell,
+    PowerShell,
+}
+
+fn runtime_of(argv0: &str) -> Option<Runtime> {
+    let stem = exe_stem(argv0);
+    let python_versioned = stem
+        .strip_prefix("python")
+        .map(|rest| {
+            let rest = rest.strip_suffix('w').unwrap_or(rest);
+            rest.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+        })
+        .unwrap_or(false);
+    Some(match stem.as_str() {
+        _ if python_versioned => Runtime::Python,
+        "py" => Runtime::Python,
+        "node" | "nodejs" => Runtime::Node,
+        "npx" => Runtime::Npx,
+        "npm" => Runtime::Npm,
+        "uv" => Runtime::Uv,
+        "sh" | "bash" | "dash" | "zsh" => Runtime::Shell,
+        "pwsh" | "powershell" => Runtime::PowerShell,
+        _ => return None,
+    })
+}
+
+/// Python: `-m claude_mcp_servers.…` or a script under `claude_mcp_servers`.
+/// `-c <code>` executes text, not a server file → never a match.
+fn python_executes_mcp(args: &[&str]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" {
+            return args.get(i + 1).is_some_and(|s| is_claude_mcp_script_path(s));
+        }
+        if a == "-" {
+            return false; // script from stdin
+        }
+        if let Some(flags) = a.strip_prefix('-').filter(|_| !a.starts_with("--")) {
+            for (pos, ch) in flags.char_indices() {
+                let rest = &flags[pos + ch.len_utf8()..];
+                match ch {
+                    'm' => {
+                        let module = if rest.is_empty() { args.get(i + 1).copied() } else { Some(rest) };
+                        return module.is_some_and(is_claude_mcp_module);
+                    }
+                    'c' => return false,
+                    'W' | 'X' => {
+                        if rest.is_empty() {
+                            i += 1; // the option's value
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1; // long options (`--check-hash-based-pycs` takes a value; harmless to over-skip a flag)
+            continue;
+        }
+        return is_claude_mcp_script_path(a);
+    }
+    false
+}
+
+/// npx / `npm exec`: the command that actually RUNS — the first positional
+/// (or the token after `--`) — must be an MCP package or bin. A `-p` /
+/// `--package` value only installs a package for that command, so
+/// `npx --package=@playwright/mcp eslint .` runs eslint and is NOT a match,
+/// while `npx --package=@playwright/mcp playwright-mcp` is. `-c <shell text>`
+/// executes text → never a match.
+fn npx_executes_mcp(args: &[&str]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" {
+            return args.get(i + 1).is_some_and(|s| is_mcp_npm_package(s) || is_mcp_npm_bin(s));
+        }
+        if a == "-c" || a == "--call" || a.starts_with("--call=") {
+            return false;
+        }
+        if a == "-p" || a == "--package" {
+            i += 2; // the value names a package to install, not the command run
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return is_mcp_npm_package(a) || is_mcp_npm_bin(a);
+    }
+    false
+}
+
+/// Node: `-e/-p` evaluate text (never a match); otherwise the first non-option
+/// token is the script. npm's own CLIs (`npx-cli.js` / `npm-cli.js`, how
+/// Windows runs `npx`) hand the rest to the npx / npm rules.
+fn node_executes_mcp(args: &[&str], depth: u8) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        match a {
+            "-e" | "--eval" | "-p" | "--print" => return false,
+            "-r" | "--require" | "--import" | "--loader" | "--experimental-loader" => {
+                i += 2;
+                continue;
+            }
+            _ if a.starts_with('-') => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let rest = &args[i + 1..];
+        return match exe_stem(a).as_str() {
+            "npx-cli.js" => npx_executes_mcp(rest),
+            "npm-cli.js" => npm_executes_mcp(rest, depth),
+            _ => is_mcp_node_script(a),
+        };
+    }
+    false
+}
+
+/// npm: only `npm exec` / `npm x` executes a package (`npm install
+/// @modelcontextprotocol/x` and `npm list …` are left alone).
+fn npm_executes_mcp(args: &[&str], _depth: u8) -> bool {
+    let Some(sub) = args.iter().position(|a| !a.starts_with('-')) else {
+        return false;
+    };
+    matches!(args[sub], "exec" | "x") && npx_executes_mcp(&args[sub + 1..])
+}
+
+/// uv: `uv run [opts] <command…>` — the command is judged like a top-level
+/// argv; a bare `.py` script is run by Python.
+fn uv_executes_mcp(args: &[&str], depth: u8) -> bool {
+    const VALUED: &[&str] = &[
+        "--with", "--python", "-p", "--project", "--directory", "--from", "--env-file",
+        "--extra", "--group", "--index", "--with-requirements",
+    ];
+    let Some(run) = args.iter().position(|a| !a.starts_with('-')) else {
+        return false;
+    };
+    if args[run] != "run" {
+        return false;
+    }
+    let mut i = run + 1;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if VALUED.contains(&a) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let rest = &args[i.min(args.len())..];
+    match rest.first() {
+        Some(first) if first.ends_with(".py") => is_claude_mcp_script_path(first),
+        Some(_) => argv_executes_mcp(rest, depth + 1),
+        None => false,
+    }
+}
+
+/// sh/bash/dash/zsh running a script FILE under `claude_mcp_servers` (a
+/// shebang wrapper). Any `-c` (incl. `-lc`, `-ec`) executes text → no match.
+fn shell_executes_mcp(args: &[&str]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" {
+            return args.get(i + 1).is_some_and(|s| is_claude_mcp_script_path(s));
+        }
+        if (a.starts_with('-') || a.starts_with('+')) && a.len() > 1 {
+            if !a.starts_with("--") && a[1..].contains('c') {
+                return false;
+            }
+            i += if a == "-o" || a == "+o" { 2 } else { 1 };
+            continue;
+        }
+        return is_claude_mcp_script_path(a);
+    }
+    false
+}
+
+/// pwsh/powershell `-File <script>` under `claude_mcp_servers`; `-Command`
+/// executes text → no match.
+fn powershell_executes_mcp(args: &[&str]) -> bool {
+    let lower: Vec<String> = args.iter().map(|a| a.to_ascii_lowercase()).collect();
+    for (i, a) in lower.iter().enumerate() {
+        match a.as_str() {
+            "-command" | "-c" | "-encodedcommand" | "-e" | "-ec" => return false,
+            "-file" | "-f" => return args.get(i + 1).is_some_and(|s| is_claude_mcp_script_path(s)),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn argv_executes_mcp(argv: &[&str], depth: u8) -> bool {
+    if depth > 2 {
+        return false;
+    }
+    let Some((argv0, args)) = argv.split_first() else {
+        return false;
+    };
+    match runtime_of(argv0) {
+        Some(Runtime::Python) => python_executes_mcp(args),
+        Some(Runtime::Node) => node_executes_mcp(args, depth),
+        Some(Runtime::Npx) => npx_executes_mcp(args),
+        Some(Runtime::Npm) => npm_executes_mcp(args, depth),
+        Some(Runtime::Uv) => uv_executes_mcp(args, depth),
+        Some(Runtime::Shell) => shell_executes_mcp(args),
+        Some(Runtime::PowerShell) => powershell_executes_mcp(args),
+        None => false,
+    }
+}
+
+/// Is this argv a process EXECUTING an MCP server? The ONE filter of the
+/// pre-update kill sweep and the orphan reaper.
+///
+/// True only when argv[0] is a runtime (python*/py, node, npx, npm, uv, a
+/// POSIX shell, pwsh) AND what it executes is an MCP server: a script under a
+/// `claude_mcp_servers` directory, `-m claude_mcp_servers[.…]`, or an npm MCP
+/// package / its bin (`@modelcontextprotocol/*`, `@upstash/context7*`,
+/// `@playwright/mcp`). A process that only CITES such a path — an editor,
+/// `tail`, `grep`, `code`, `python -c`/`bash -c` text, `npm install` — is
+/// never a match. Pure, table-tested; the enumeration side is pinned by the
+/// real-process tests.
+///
+/// Out of scope, as before this change: the excalidraw MCP's node server
+/// (`node …/vco_lib/excalidraw_mcp_fork/dist/mcp/index.bundled.js` — a
+/// pre-v0.2.102 shape; the fork is deleted now) — its
+/// `-m claude_mcp_servers.wrappers.excalidraw_proxy` parent IS matched.
+pub fn is_mcp_server_argv<S: AsRef<str>>(argv: &[S]) -> bool {
+    let argv: Vec<&str> = argv.iter().map(AsRef::as_ref).collect();
+    argv_executes_mcp(&argv, 0)
 }
 
 /// Minimum age (seconds) an MCP process must have before the steady-state
@@ -494,7 +992,8 @@ pub const STEADY_STATE_MCP_MIN_AGE_SECS: u64 = 60;
 /// the orchestrator's "test the decision that gates a destructive action" rule).
 ///
 /// We reap ONLY when we can POSITIVELY confirm the process is orphaned. After
-/// the MCP-pattern + age gates, EITHER orphan signal qualifies:
+/// the MCP-server ([`is_mcp_server_argv`]) + age gates, EITHER orphan signal
+/// qualifies:
 ///   (a) its known parent pid is now DEAD (`parent_alive == Some(false)`), OR
 ///   (b) it has been REPARENTED to a subreaper (`parent_is_subreaper == true`).
 ///
@@ -520,35 +1019,79 @@ pub const STEADY_STATE_MCP_MIN_AGE_SECS: u64 = 60;
 /// nothing.
 ///
 /// `is_self` short-circuits to false so the launcher never reaps itself.
-pub fn steady_state_mcp_should_reap(
+/// The MCP gate is [`is_mcp_server_argv`] over the process's argv.
+pub fn steady_state_mcp_should_reap<S: AsRef<str>>(
     is_self: bool,
-    cmdline: &str,
+    argv: &[S],
     run_time_secs: u64,
     parent_pid: Option<u32>,
     parent_alive: Option<bool>,
     parent_is_subreaper: bool,
 ) -> bool {
-    if is_self {
-        return false;
+    steady_state_orphan_signal(
+        is_self,
+        argv,
+        run_time_secs,
+        parent_pid,
+        parent_alive,
+        parent_is_subreaper,
+    )
+    .is_some()
+}
+
+/// WHICH orphan signal made the reaper's decision — so the log line states
+/// the actual reason instead of always claiming a dead parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanSignal {
+    /// Signal (a): the known, non-subreaper parent is dead (the Windows case).
+    ParentDead,
+    /// Signal (b): reparented to a live subreaper (the POSIX case).
+    ReparentedToSubreaper,
+}
+
+impl OrphanSignal {
+    /// Human-readable reason for the reap log line.
+    pub fn describe(self, parent_pid: Option<u32>) -> String {
+        let ppid = parent_pid.map_or_else(|| "?".to_string(), |p| p.to_string());
+        match self {
+            OrphanSignal::ParentDead => format!("parent PID {ppid} is dead"),
+            OrphanSignal::ReparentedToSubreaper => {
+                format!("reparented to subreaper PID {ppid}")
+            }
+        }
     }
-    if !mcp_pattern_match(cmdline) {
-        return false;
+}
+
+/// The orphan decision with its reason: `Some(signal)` when the process is
+/// an orphaned MCP to reap, `None` to leave it alone. Same gates, in the
+/// same order, as documented on [`steady_state_mcp_should_reap`].
+pub fn steady_state_orphan_signal<S: AsRef<str>>(
+    is_self: bool,
+    argv: &[S],
+    run_time_secs: u64,
+    parent_pid: Option<u32>,
+    parent_alive: Option<bool>,
+    parent_is_subreaper: bool,
+) -> Option<OrphanSignal> {
+    if is_self {
+        return None;
+    }
+    if !is_mcp_server_argv(argv) {
+        return None;
     }
     if run_time_secs < STEADY_STATE_MCP_MIN_AGE_SECS {
-        return false;
+        return None;
     }
     // No known parent → can't positively confirm orphanhood → leave alone.
-    if parent_pid.is_none() {
-        return false;
-    }
+    parent_pid?;
     // Orphan signal (b): reparented to a subreaper (the POSIX orphan case —
     // a healthy session-attached MCP is never parented to a subreaper).
     if parent_is_subreaper {
-        return true;
+        return Some(OrphanSignal::ReparentedToSubreaper);
     }
     // Orphan signal (a): we definitively know the (non-subreaper) parent is dead
     // (the Windows case — Windows does not reparent orphans).
-    matches!(parent_alive, Some(false))
+    matches!(parent_alive, Some(false)).then_some(OrphanSignal::ParentDead)
 }
 
 /// Is `parent_pid` a subreaper to which the OS reparents orphans? Cross-OS:
@@ -582,6 +1125,134 @@ pub fn parent_pid_is_subreaper(parent_pid: u32, parent_comm: &str) -> bool {
     }
 }
 
+/// Everything [`steady_state_mcp_should_reap`] needs about one process, read
+/// from a [`refresh_with_cmdlines`] snapshot. Split from the reaper loop so a
+/// real-process test can assert what the reaper actually sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReapInputs {
+    pub pid: u32,
+    pub is_self: bool,
+    /// The argv the MCP gate reads.
+    pub argv: Vec<String>,
+    /// `argv` joined, for the log line.
+    pub cmdline: String,
+    pub run_time_secs: u64,
+    pub parent_pid: Option<u32>,
+    pub parent_alive: Option<bool>,
+    pub parent_is_subreaper: bool,
+}
+
+impl ReapInputs {
+    /// Apply the orphan predicate to these inputs.
+    pub(crate) fn should_reap(&self) -> bool {
+        self.orphan_signal().is_some()
+    }
+
+    /// The orphan decision with its reason.
+    pub(crate) fn orphan_signal(&self) -> Option<OrphanSignal> {
+        steady_state_orphan_signal(
+            self.is_self,
+            &self.argv,
+            self.run_time_secs,
+            self.parent_pid,
+            self.parent_alive,
+            self.parent_is_subreaper,
+        )
+    }
+}
+
+/// Read the reaper's inputs for `proc` out of the snapshot `sys`.
+pub(crate) fn reap_inputs(
+    sys: &sysinfo::System,
+    pid: sysinfo::Pid,
+    proc: &sysinfo::Process,
+    my_pid: u32,
+) -> ReapInputs {
+    use vct_launcher_core::process::pid_is_alive;
+
+    let parent_pid = proc.parent().map(|p| p.as_u32());
+    // Only probe parent liveness when there IS a parent — and never treat
+    // the launcher's own pid as a "dead parent" (an MCP whose parent is the
+    // launcher is NOT orphaned; we just don't spawn MCPs, but be defensive).
+    let parent_alive = parent_pid.map(|ppid| {
+        if ppid == my_pid {
+            true
+        } else {
+            pid_is_alive(ppid)
+        }
+    });
+    // Orphan signal (b) — POSIX reparenting. Resolve whether the parent is a
+    // subreaper (PID 1 / systemd / launchd). On POSIX an orphan is reparented
+    // to a live subreaper the instant its real parent exits, so signal (a)
+    // (dead parent) is unreachable there; (b) catches it. A live session-
+    // attached MCP's parent is the Claude process, never a subreaper, so this
+    // never reaps a healthy MCP. Look up the parent process's exe basename
+    // from the same snapshot; "" when the parent row isn't in the table
+    // (then only the PID-1 check inside parent_pid_is_subreaper applies).
+    let parent_is_subreaper = parent_pid
+        .map(|ppid| {
+            let comm = sys
+                .process(sysinfo::Pid::from_u32(ppid))
+                .map(|pp| {
+                    pp.exe()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| pp.name().to_string_lossy().into_owned())
+                })
+                .unwrap_or_default();
+            // The launcher itself is never a subreaper for our MCPs.
+            ppid != my_pid && parent_pid_is_subreaper(ppid, &comm)
+        })
+        .unwrap_or(false);
+
+    ReapInputs {
+        pid: pid.as_u32(),
+        is_self: pid.as_u32() == my_pid,
+        argv: argv_of(proc),
+        cmdline: joined_cmdline(proc),
+        run_time_secs: proc.run_time(),
+        parent_pid,
+        parent_alive,
+        parent_is_subreaper,
+    }
+}
+
+/// The orphan reaper over an existing snapshot, terminate step injected (see
+/// [`run_mcp_kill_sweep`]). Returns the number of orphans handed to
+/// `terminate`.
+fn run_orphaned_mcp_reap(
+    sys: &sysinfo::System,
+    my_pid: u32,
+    terminate: &mut dyn FnMut(&sysinfo::Process),
+) -> usize {
+    let mut matched = 0usize;
+    let mut orphans: Vec<(&sysinfo::Process, ReapInputs, OrphanSignal)> = Vec::new();
+    for (pid, proc) in sys.processes() {
+        let inputs = reap_inputs(sys, *pid, proc, my_pid);
+        if is_mcp_server_argv(&inputs.argv) {
+            matched += 1;
+        }
+        if let Some(signal) = inputs.orphan_signal() {
+            orphans.push((proc, inputs, signal));
+        }
+    }
+    // Counters first, so they are on record even if a terminate misbehaves.
+    log_enumeration("steady-state reap", enumeration_stats(sys), matched);
+
+    for (proc, inputs, signal) in &orphans {
+        tracing::warn!(
+            "[update_gate] steady-state reap: terminating ORPHANED MCP PID {} \
+             ({}, age {}s, cmd: {})",
+            inputs.pid,
+            signal.describe(inputs.parent_pid),
+            inputs.run_time_secs,
+            inputs.cmdline.chars().take(120).collect::<String>()
+        );
+        terminate(proc);
+    }
+    orphans.len()
+}
+
 /// v0.2.71 (P6): best-effort steady-state reaper for ORPHANED coordination /
 /// MCP processes whose controlling Claude session is gone.
 ///
@@ -598,91 +1269,25 @@ pub fn parent_pid_is_subreaper(parent_pid: u32, parent_comm: &str) -> bool {
 /// reaps ALL matching MCPs because the whole MCP fleet is about to respawn
 /// against a fresh binary), this runs in STEADY STATE (e.g. launcher startup)
 /// and must NOT touch MCPs with a live parent session. The orphan predicate
-/// ([`steady_state_mcp_should_reap`]) enforces that.
+/// ([`steady_state_mcp_should_reap`]) enforces that. Its argv match reads
+/// the [`refresh_with_cmdlines`] snapshot (argv exists only there).
 ///
-/// Posture: SIGTERM (graceful) + soft-fail, never SIGKILL, never blocks boot.
-/// Returns the number of orphans signalled (informational).
+/// Posture: [`terminate_mcp_server`] (SIGTERM on POSIX, never SIGKILL; a
+/// `taskkill /T /F` tree kill on Windows) + soft-fail, never blocks boot.
+/// Returns the number of orphans signalled (informational). Refuses under a
+/// cargo test binary — a real orphaned MCP on the developer's machine is not
+/// the test's to reap; tests drive [`run_orphaned_mcp_reap`] with an injected
+/// terminate step.
 pub fn steady_state_orphaned_mcp_reap() -> usize {
-    use sysinfo::System;
-    use vct_launcher_core::process::pid_is_alive;
-
-    let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    let my_pid = std::process::id();
-    let mut count = 0usize;
-
-    for (pid, proc) in sys.processes() {
-        let is_self = pid.as_u32() == my_pid;
-        let cmdline = proc
-            .cmd()
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let parent_pid = proc.parent().map(|p| p.as_u32());
-        // Only probe parent liveness when there IS a parent — and never treat
-        // the launcher's own pid as a "dead parent" (an MCP whose parent is the
-        // launcher is NOT orphaned; we just don't spawn MCPs, but be defensive).
-        let parent_alive = parent_pid.map(|ppid| {
-            if ppid == my_pid {
-                true
-            } else {
-                pid_is_alive(ppid)
-            }
-        });
-        // Orphan signal (b) — POSIX reparenting. Resolve whether the parent is a
-        // subreaper (PID 1 / systemd / launchd). On POSIX an orphan is reparented
-        // to a live subreaper the instant its real parent exits, so signal (a)
-        // (dead parent) is unreachable there; (b) catches it. A live session-
-        // attached MCP's parent is the Claude process, never a subreaper, so this
-        // never reaps a healthy MCP. Look up the parent process's exe basename
-        // from the same snapshot; "" when the parent row isn't in the table
-        // (then only the PID-1 check inside parent_pid_is_subreaper applies).
-        let parent_is_subreaper = parent_pid
-            .map(|ppid| {
-                let comm = sys
-                    .process(sysinfo::Pid::from_u32(ppid))
-                    .map(|pp| {
-                        pp.exe()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| pp.name().to_string_lossy().into_owned())
-                    })
-                    .unwrap_or_default();
-                // The launcher itself is never a subreaper for our MCPs.
-                ppid != my_pid && parent_pid_is_subreaper(ppid, &comm)
-            })
-            .unwrap_or(false);
-
-        if !steady_state_mcp_should_reap(
-            is_self,
-            &cmdline,
-            proc.run_time(),
-            parent_pid,
-            parent_alive,
-            parent_is_subreaper,
-        ) {
-            continue;
-        }
-
+    if crate::hub_launcher::running_under_test_harness() {
         tracing::warn!(
-            "[update_gate] steady-state reap: terminating ORPHANED MCP PID {} \
-             (parent {:?} dead, age {}s, cmd: {})",
-            pid.as_u32(),
-            parent_pid,
-            proc.run_time(),
-            cmdline.chars().take(120).collect::<String>()
+            "[update_gate] steady-state reap: refusing to terminate MCP \
+             processes — this process is a cargo test binary"
         );
-        // SIGTERM (graceful) + soft-fail, mirroring pre_update_mcp_kill_sweep.
-        match proc.kill_with(sysinfo::Signal::Term) {
-            Some(_) => {}
-            None => {
-                proc.kill();
-            }
-        }
-        count += 1;
+        return 0;
     }
-    count
+    let sys = process_table_with_cmdlines();
+    run_orphaned_mcp_reap(&sys, std::process::id(), &mut terminate_mcp_server)
 }
 
 /// v0.2.59: return true if a process's executable BASENAME identifies it
@@ -709,6 +1314,37 @@ pub fn hub_exe_basename_match(exe_basename: &str) -> bool {
     }
 }
 
+/// One process the hub backstop sweep would terminate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HubSweepCandidate {
+    pub pid: u32,
+    pub exe_basename: String,
+    /// For the log line only — the match is on `exe_basename`.
+    pub cmdline: String,
+}
+
+/// The candidate filter of the hub backstop sweep: every process in `sys`
+/// whose executable basename is a hub binary, never `my_pid`.
+pub(crate) fn hub_sweep_candidates(sys: &sysinfo::System, my_pid: u32) -> Vec<HubSweepCandidate> {
+    sys.processes()
+        .iter()
+        .filter(|(pid, _)| pid.as_u32() != my_pid)
+        .filter_map(|(pid, proc)| {
+            // Identify by executable basename, not cmdline substring.
+            let exe_basename = proc
+                .exe()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            hub_exe_basename_match(&exe_basename).then(|| HubSweepCandidate {
+                pid: pid.as_u32(),
+                exe_basename,
+                cmdline: joined_cmdline(proc),
+            })
+        })
+        .collect()
+}
+
 /// v0.2.59: backstop sweep for `vct-hub` processes the single-`hub.pid`
 /// stop path (`ensure_hub_stopped_for_update`) could not see.
 ///
@@ -720,13 +1356,15 @@ pub fn hub_exe_basename_match(exe_basename: &str) -> bool {
 ///   * a hub from a SECOND install root (different `VCT_STATE_DIR` →
 ///     different `hub.pid`),
 ///   * a hub that survived a crash which cleared/overwrote the pid.
+///
 /// Any such hub keeps `~/.vct/launcher.db` open (blocking DB writes)
 /// and, on Windows, keeps `vct-hub.exe` locked (blocking the binary
 /// swap). This sweep is the process-identity backstop: after the
 /// lockfile-driven stop, terminate any REMAINING hub binary.
 ///
-/// Posture (per the 2026-06-15 decision): SIGTERM (graceful) + soft-fail
-/// — mirrors `pre_update_mcp_kill_sweep`. We never SIGKILL here and we
+/// Posture (per the 2026-06-15 decision): [`terminate_process`] — SIGTERM
+/// (graceful) on POSIX, a single-process forced kill on Windows, never the
+/// tree (unlike the MCP sweep) — + soft-fail. We never SIGKILL here and we
 /// never block the update if one survives; the pre-pull binary rename +
 /// the update-gate lockfile already backstop the Windows path, and
 /// SQLite is crash-safe so a surviving reader is at worst a transient
@@ -763,54 +1401,29 @@ pub fn pre_update_hub_kill_sweep() -> usize {
         );
         return 0;
     }
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    let my_pid = std::process::id();
+    let sys = process_table_with_cmdlines();
+    let candidates = hub_sweep_candidates(&sys, std::process::id());
     let mut count = 0usize;
-    for (pid, proc) in sys.processes() {
-        // Never signal ourselves (the launcher) or our parent.
-        if pid.as_u32() == my_pid {
+    for cand in &candidates {
+        let Some(proc) = sys.process(sysinfo::Pid::from_u32(cand.pid)) else {
             continue;
-        }
-        // Identify by executable basename, not cmdline substring.
-        let exe_basename = proc
-            .exe()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if !hub_exe_basename_match(&exe_basename) {
-            continue;
-        }
-        let cmdline = proc
-            .cmd()
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
+        };
         tracing::info!(
             "[update_gate] hub-sweep: terminating stray vct-hub PID {} (exe: {}, cmd: {})",
-            pid.as_u32(),
-            exe_basename,
-            cmdline.chars().take(120).collect::<String>()
+            cand.pid,
+            cand.exe_basename,
+            cand.cmdline.chars().take(120).collect::<String>()
         );
-        // SIGTERM (graceful) + soft-fail. `kill_with` returns None when
-        // the platform lacks the signal — fall back to the default
-        // terminate in that case. We do NOT escalate to SIGKILL or wait.
-        match proc.kill_with(sysinfo::Signal::Term) {
-            Some(_) => {}
-            None => {
-                proc.kill();
-            }
-        }
+        terminate_process(proc);
         count += 1;
     }
     count
 }
 
 /// v0.2.63: resolve a running process's executable PATH by pid, via the same
-/// sysinfo backend `pre_update_hub_kill_sweep` uses. Returns `None` if the pid
-/// is gone or the platform won't expose the exe path (permissions, etc.).
+/// snapshot (`refresh_with_cmdlines`) the sweeps above use. Returns `None` if
+/// the pid is gone or the platform won't expose the exe path (permissions,
+/// etc.).
 ///
 /// Used by the launcher's boot-time hub-identity check
 /// ([`crate::hub_launcher::ensure_hub_running`]) to decide whether a running
@@ -818,18 +1431,11 @@ pub fn pre_update_hub_kill_sweep() -> usize {
 /// `cargo run`, a different checkout, an old install) that must be swapped.
 /// Callers MUST treat `None` as "can't tell — leave it alone" (no false kills).
 pub fn process_exe_by_pid(pid: u32) -> Option<std::path::PathBuf> {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    // Mirror pre_update_hub_kill_sweep's iteration shape rather than the
-    // single-pid refresh API, so behaviour stays identical across sysinfo
-    // versions already validated by the sweep.
-    for (p, proc) in sys.processes() {
-        if p.as_u32() == pid {
-            return proc.exe().map(|e| e.to_path_buf());
-        }
-    }
-    None
+    // Whole-table refresh through the one helper rather than the single-pid
+    // refresh API, so this lookup sees exactly what the sweeps see.
+    let sys = process_table_with_cmdlines();
+    sys.process(sysinfo::Pid::from_u32(pid))
+        .and_then(|proc| proc.exe().map(|e| e.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -1054,56 +1660,107 @@ mod tests {
         drop(guard);
     }
 
-    // ── mcp_pattern_match ───────────────────────────────────────────────
+    // ── is_mcp_server_argv: EXECUTING an MCP vs merely citing one ────────
+
+    fn words(cmd: &str) -> Vec<&str> {
+        cmd.split_whitespace().collect()
+    }
+
+    /// Real MCP server launches — every one must match. Includes the shapes
+    /// running on a dev machine today and what VCO registers. The
+    /// `wrappers.*` rows are pre-v0.2.102 shapes (the wrappers are deleted)
+    /// kept on purpose: a machine updating from ≤v0.2.101 can still have
+    /// those processes alive, and the sweep must match them to free the
+    /// files the update deletes.
+    const MCP_SERVER_SHAPES: &[&[&str]] = &[
+        &["/home/x/.venv/bin/python", "/home/x/claude_mcp_servers/weaviate_mcp/server.py"],
+        &["/home/x/.venv/bin/python", "/home/x/claude_mcp_servers/vct_coordination_mcp/server.py"],
+        &["/home/x/.venv/bin/python", "-m", "claude_mcp_servers.wrappers.mermaid_proxy"],
+        &["/home/x/.venv/bin/python", "-m", "claude_mcp_servers.wrappers.excalidraw_proxy"],
+        &["python3", "-u", "-m", "claude_mcp_servers.wrappers.mermaid_proxy"],
+        &["python3.12", "-X", "utf8", "/x/claude_mcp_servers/weaviate_mcp/server.py"],
+        &["python", "-um", "claude_mcp_servers.wrappers.mermaid_proxy"],
+        &[r"C:\vco\.venv\Scripts\python.exe", r"C:\vco\claude_mcp_servers\weaviate_mcp\server.py"],
+        &["npx", "-y", "@playwright/mcp@latest"],
+        &["npm", "exec", "@playwright/mcp@latest"],
+        &["npx", "--package=@playwright/mcp", "playwright-mcp"],
+        &["npm", "exec", "-p", "@upstash/context7-mcp", "--", "context7-mcp"],
+        &["node", "/home/x/.npm/_npx/9833c18b2d85bc59/node_modules/.bin/playwright-mcp"],
+        &["npx", "-y", "@upstash/context7-mcp@latest"],
+        &["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        &["node", "/usr/lib/node_modules/@modelcontextprotocol/server-everything/dist/index.js"],
+        &[
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Program Files\nodejs\node_modules\npm\bin\npx-cli.js",
+            "-y",
+            "@playwright/mcp@latest",
+        ],
+        &["/bin/bash", "/home/x/claude_mcp_servers/search_mcp/wrapper.sh"],
+        &["uv", "run", "--directory", "/x", "/x/claude_mcp_servers/weaviate_mcp/server.py"],
+        &["uv", "run", "python", "-m", "claude_mcp_servers.wrappers.mermaid_proxy"],
+        &["pwsh", "-NoProfile", "-File", r"C:\vco\claude_mcp_servers\x\wrapper.ps1"],
+    ];
+
+    /// Processes that only CITE an MCP path or package, or are unrelated —
+    /// none may match.
+    const LEAVE_ALONE_SHAPES: &[&[&str]] = &[
+        &["vim", "/home/x/claude_mcp_servers/weaviate_mcp/server.py"],
+        &["tail", "-f", "/home/x/claude_mcp_servers/logs/mcp.log"],
+        &["less", "/home/x/claude_mcp_servers/README.md"],
+        &["grep", "-r", "claude_mcp_servers", "/home/x"],
+        &["code", "/home/x/claude_mcp_servers"],
+        &["bash", "-c", "cd /home/x/claude_mcp_servers && ls"],
+        &["/bin/sh", "-lc", "python /home/x/claude_mcp_servers/weaviate_mcp/server.py"],
+        &["python3", "-c", "import claude_mcp_servers.wrappers.mermaid_proxy"],
+        &["node", "-e", "require('@modelcontextprotocol/sdk')"],
+        &["npm", "install", "@modelcontextprotocol/server-filesystem"],
+        &["npm", "list", "file:vco_lib/excalidraw_mcp_fork"],
+        &["sh", "-c", "playwright-mcp"],
+        &["npx", "-c", "playwright-mcp"],
+        &["npx", "--package=@playwright/mcp", "eslint", "."],
+        &["npm", "exec", "-p", "@upstash/context7-mcp", "--", "prettier", "x.js"],
+        &["npx", "-p", "@modelcontextprotocol/inspector"],
+        &["/usr/bin/python3", "/home/user/myproject/main.py", "--port", "8000"],
+        &["/usr/bin/python3", "-m", "http.server"],
+        &["python3", "/home/x/notes/claude_mcp_servers.py"],
+        &["node", "/home/user/another-app/server.js"],
+        &["/home/x/.vct/dist/vct-launcher"],
+        &["/home/x/.vct/dist/vct-hub", "--start-if-not-running"],
+        &["pwsh", "-Command", r"Get-Content C:\vco\claude_mcp_servers\x.log"],
+        &["/home/x/.venv/bin/python", "/x/claude_mcp_servers"],
+        &[],
+    ];
 
     #[test]
-    fn pattern_matches_claude_mcp_servers() {
-        assert!(mcp_pattern_match(
-            "/home/x/.venv/bin/python /home/x/claude_mcp_servers/weaviate_mcp/server.py"
-        ));
+    fn mcp_server_argv_matches_every_real_mcp_launch_shape() {
+        for argv in MCP_SERVER_SHAPES {
+            assert!(is_mcp_server_argv(argv), "should match (executes an MCP): {argv:?}");
+        }
     }
 
     #[test]
-    fn pattern_matches_modelcontextprotocol() {
-        assert!(mcp_pattern_match(
-            "node /usr/lib/node_modules/@modelcontextprotocol/server-everything/dist/index.js"
-        ));
+    fn mcp_server_argv_leaves_citing_and_unrelated_processes_alone() {
+        for argv in LEAVE_ALONE_SHAPES {
+            assert!(!is_mcp_server_argv(argv), "must NOT match (only cites / unrelated): {argv:?}");
+        }
     }
 
     #[test]
-    fn pattern_matches_upstash_context7() {
-        assert!(mcp_pattern_match(
-            "npx -y @upstash/context7-mcp@latest"
-        ));
+    fn mcp_server_argv_excalidraw_node_server_stays_out_of_scope() {
+        // Behaviour kept after v0.2.102 deleted the fork: the excalidraw
+        // node server was never a sweep target (no pattern in its argv);
+        // its python proxy is.
+        assert!(!is_mcp_server_argv(&words(
+            "/home/x/.local/bin/node /home/x/VCO/vco_lib/excalidraw_mcp_fork/dist/mcp/index.bundled.js"
+        )));
     }
 
     #[test]
-    fn pattern_does_not_match_unrelated_python() {
-        // User's other Python projects MUST survive the sweep.
-        assert!(!mcp_pattern_match(
-            "/usr/bin/python3 /home/user/myproject/main.py --port 8000"
-        ));
-    }
-
-    #[test]
-    fn pattern_does_not_match_unrelated_node() {
-        assert!(!mcp_pattern_match(
-            "node /home/user/another-app/server.js"
-        ));
-    }
-
-    #[test]
-    fn pattern_does_not_match_launcher_itself() {
-        assert!(!mcp_pattern_match(
-            "/home/x/.vct/dist/vct-launcher"
-        ));
-    }
-
-    #[test]
-    fn pattern_does_not_match_hub_itself() {
-        assert!(!mcp_pattern_match(
-            "/home/x/.vct/dist/vct-hub --start-if-not-running"
-        ));
+    fn npm_package_name_strips_the_version() {
+        assert_eq!(npm_package_name("@playwright/mcp@latest"), "@playwright/mcp");
+        assert_eq!(npm_package_name("@playwright/mcp"), "@playwright/mcp");
+        assert_eq!(npm_package_name("left-pad@1.0.0"), "left-pad");
+        assert!(!is_mcp_npm_package("@playwright/mcp-extra@1"));
     }
 
     // ── hub_exe_basename_match (v0.2.59 backstop sweep) ─────────────────
@@ -1151,13 +1808,14 @@ mod tests {
     // rule): an orphaned MCP IS reaped; every non-orphan / can't-confirm case
     // is LEFT ALONE.
 
-    const COORD_CMD: &str =
-        "/x/.venv/bin/python /x/claude_mcp_servers/vct_coordination_mcp/server.py";
+    const COORD_CMD: &[&str] =
+        &["/x/.venv/bin/python", "/x/claude_mcp_servers/vct_coordination_mcp/server.py"];
+    const USER_PY: &[&str] = &["/usr/bin/python3", "/home/user/myproject/main.py"];
 
     #[test]
     fn reap_when_parent_dead_and_old_enough() {
         // Signal (a) — dead parent (the Windows case; POSIX reparents so this is
-        // rare there). Matches MCP pattern, past the grace window, parent dead → REAP.
+        // rare there). An MCP server argv, past the grace window, parent dead → REAP.
         assert!(steady_state_mcp_should_reap(
             false,
             COORD_CMD,
@@ -1221,7 +1879,7 @@ mod tests {
         // self process parented to a subreaper is STILL left alone.
         assert!(!steady_state_mcp_should_reap(
             false,
-            "/usr/bin/python3 /home/user/myproject/main.py", // not an MCP
+            USER_PY, // not an MCP
             6 * 3600,
             Some(1),
             Some(true),
@@ -1296,7 +1954,7 @@ mod tests {
         // Unrelated user processes must survive even when orphaned + old.
         assert!(!steady_state_mcp_should_reap(
             false,
-            "/usr/bin/python3 /home/user/myproject/main.py",
+            USER_PY,
             6 * 3600,
             Some(424242),
             Some(false),
@@ -1342,45 +2000,471 @@ mod tests {
 
     // ── steady_state_orphaned_mcp_reap runner: soft-fail / no-panic ──────
     //
-    // The runner enumerates the live process table via sysinfo and applies the
-    // predicate above. We can't inject a fake process table at this seam, but the
-    // contract that matters for boot safety is: it NEVER panics and is a no-op on
-    // a healthy system (no orphaned MCPs). The test environment has no MCP whose
-    // parent is dead, so the sweep must complete and return a count without
-    // touching any process. This proves the best-effort/soft-fail posture
-    // end-to-end (no `.unwrap()`/`.expect()` on the sysinfo path, graceful
-    // `kill_with` fallback) — exactly what the startup-block call relies on.
+    // The public runner refuses under a cargo test binary (a real orphaned MCP
+    // on the developer's machine is not the suite's to reap), so these drive
+    // the same core it runs — `run_orphaned_mcp_reap` over a live
+    // `refresh_with_cmdlines` snapshot — with a terminate step that RECORDS and
+    // never signals. That keeps the contract that matters for boot safety (no
+    // panic over the real process table, never targets itself) without letting
+    // the suite kill anything.
 
     #[test]
     fn reaper_runner_is_no_panic_and_returns_count() {
-        // Must not panic. On a healthy install (no orphaned MCPs) this is 0;
-        // we only assert it returns a usize without unwinding — the boot path
-        // must never crash the launcher even if sysinfo behaves oddly.
-        let reaped = steady_state_orphaned_mcp_reap();
-        // The pid-sanity / parent-alive guards mean a sane sandbox yields 0;
-        // assert the count is a plausible non-pathological value rather than
-        // pinning it to exactly 0 (a CI runner could conceivably have a real
-        // orphan). `usize` is always >= 0; this documents the no-op intent.
+        let sys = process_table_with_cmdlines();
+        let mut targeted = Vec::new();
+        let reaped = run_orphaned_mcp_reap(&sys, std::process::id(), &mut |p| {
+            targeted.push(p.pid().as_u32())
+        });
+        assert_eq!(reaped, targeted.len());
         assert!(
-            reaped == 0 || reaped < 100_000,
+            reaped < 100_000,
             "reaper returned an implausible count ({reaped}) — likely a runaway match"
         );
     }
 
     #[test]
     fn reaper_runner_never_reaps_own_process() {
-        // Calling the reaper from the test binary must not signal the test
-        // process itself (is_self short-circuit + the launcher cmdline never
-        // matches an MCP pattern). If it did, the test harness would die mid-run
-        // rather than completing — reaching the assertion proves we survived.
-        let _ = steady_state_orphaned_mcp_reap();
-        // Reaching here means the test process was not SIGTERM'd by its own call.
+        let me = std::process::id();
+        let sys = process_table_with_cmdlines();
+        let mut targeted = Vec::new();
+        let _ = run_orphaned_mcp_reap(&sys, me, &mut |p| targeted.push(p.pid().as_u32()));
+        assert!(!targeted.contains(&me), "the reaper targeted its own process");
         assert!(pid_alive_self_sanity());
+    }
+
+    #[test]
+    fn public_sweeps_refuse_under_the_test_harness() {
+        // Both entry points match every process on the machine; under a cargo
+        // test binary they must sweep nothing (the developer's live MCPs).
+        assert!(crate::hub_launcher::running_under_test_harness());
+        assert_eq!(pre_update_mcp_kill_sweep(), 0);
+        assert_eq!(steady_state_orphaned_mcp_reap(), 0);
     }
 
     /// Local helper: confirm our own pid still reports alive after the reaper
     /// ran (re-uses the same liveness probe the runner uses for parents).
     fn pid_alive_self_sanity() -> bool {
         vct_launcher_core::process::pid_is_alive(std::process::id())
+    }
+
+    // ── v0.2.102 (S16-1): the sweeps see REAL processes' cmdlines ────────
+    //
+    // The pure-helper tests above stayed green while every sweep was a silent
+    // no-op (the snapshot carried no cmdlines). These spawn a real child —
+    // this test binary itself, re-run as a long sleeper — and drive the
+    // enumeration the sweeps use. An "MCP server" child is the test binary
+    // linked under a runtime name (`python3` / `python.exe`) whose first
+    // argument is a `claude_mcp_servers/…/server.py` path, so its argv has
+    // exactly the shape `is_mcp_server_argv` accepts. Same code on every OS
+    // (the Windows CI leg runs them unchanged). They only ever terminate the
+    // processes they spawned.
+
+    const PROBE_SLEEP_ENV: &str = "VCT_W1B_PROBE_SLEEP";
+    const PROBE_GRANDCHILD_PIDFILE_ENV: &str = "VCT_W1B_PROBE_GRANDCHILD_PIDFILE";
+    const PROBE_TEST_NAME: &str = "commands::update_gate::tests::w1b_probe_sleeper";
+    const PROBE_HARNESS_ARGS: &[&str] =
+        &["--ignored", "--exact", "--test-threads", "1", "-q", PROBE_TEST_NAME];
+
+    /// Not a test of its own: the body of the probe child. A no-op unless the
+    /// spawning test set the env var. With the pidfile env var it first spawns
+    /// one grandchild sleeper and writes that pid to the file.
+    #[test]
+    #[ignore = "probe child body for the real-process sweep tests"]
+    // The grandchild is deliberately never waited on: this process sleeps
+    // until the test kills it, and the test reaps the grandchild by pid.
+    #[allow(clippy::zombie_processes)]
+    fn w1b_probe_sleeper() {
+        if std::env::var_os(PROBE_SLEEP_ENV).is_none() {
+            return;
+        }
+        if let Some(pidfile) = std::env::var_os(PROBE_GRANDCHILD_PIDFILE_ENV) {
+            let grandchild = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("w1b-grandchild")
+                .args(PROBE_HARNESS_ARGS)
+                .env(PROBE_SLEEP_ENV, "1")
+                .env_remove(PROBE_GRANDCHILD_PIDFILE_ENV)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn grandchild");
+            std::fs::write(pidfile, grandchild.id().to_string()).expect("write pidfile");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(300));
+    }
+
+    /// A spawned probe child, terminated and reaped on drop.
+    struct ProbeChild(std::process::Child);
+
+    impl ProbeChild {
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        /// Wait up to 10 s for the child to exit.
+        fn wait_exit(&mut self) -> Option<std::process::ExitStatus> {
+            for _ in 0..100 {
+                if let Some(s) = self.0.try_wait().expect("try_wait") {
+                    return Some(s);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            None
+        }
+    }
+
+    impl Drop for ProbeChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A process we did not spawn directly (a grandchild): killed on drop.
+    struct PidGuard(u32);
+
+    impl Drop for PidGuard {
+        fn drop(&mut self) {
+            let mut sys = sysinfo::System::new();
+            let pid = sysinfo::Pid::from_u32(self.0);
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            if let Some(p) = sys.process(pid) {
+                p.kill();
+            }
+        }
+    }
+
+    /// This test binary hard-linked (copied as a fallback) under `name`, in a
+    /// temp dir next to it so the link stays on one filesystem. Declare it
+    /// BEFORE the child that runs it, so the child drops (dies) first.
+    struct LinkedExe {
+        path: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    fn linked_test_exe(name: &str) -> LinkedExe {
+        let exe = std::env::current_exe().expect("current_exe");
+        let dir = tempfile::tempdir_in(exe.parent().expect("exe dir")).expect("tempdir");
+        let path = dir.path().join(name);
+        if std::fs::hard_link(&exe, &path).is_err() {
+            std::fs::copy(&exe, &path).expect("copy linked exe");
+        }
+        LinkedExe { path, _dir: dir }
+    }
+
+    /// Spawn `exe` as the sleeper with `marker` as its FIRST argument (where a
+    /// runtime's script path goes); libtest treats it as one more filter.
+    fn spawn_probe_from(exe: &std::path::Path, marker: &str, env: &[(&str, &str)]) -> ProbeChild {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg(marker)
+            .args(PROBE_HARNESS_ARGS)
+            .env(PROBE_SLEEP_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        ProbeChild(cmd.spawn().expect("spawn probe child"))
+    }
+
+    /// The test binary under its own (non-runtime) name.
+    fn spawn_probe(marker: &str) -> ProbeChild {
+        spawn_probe_from(&std::env::current_exe().expect("current_exe"), marker, &[])
+    }
+
+    /// A `claude_mcp_servers/<probe>/server.py` path, unique to this test.
+    fn mcp_script_marker(tag: &str) -> String {
+        let m = format!("/w1b/claude_mcp_servers/w1b_probe_{}_{}/server.py", tag, std::process::id());
+        assert!(is_claude_mcp_script_path(&m));
+        m
+    }
+
+    fn non_mcp_marker(tag: &str) -> String {
+        format!("w1b-leave-alone-probe-{}-{}", tag, std::process::id())
+    }
+
+    /// The test binary linked as a Python runtime.
+    fn python_runtime_exe() -> LinkedExe {
+        linked_test_exe(if cfg!(windows) { "python.exe" } else { "python3" })
+    }
+
+    /// Spawn an "MCP server": the Python-named link running an MCP script path.
+    fn spawn_mcp_probe(py: &LinkedExe, marker: &str, env: &[(&str, &str)]) -> ProbeChild {
+        let argv0 = py.path.to_string_lossy().into_owned();
+        assert!(is_mcp_server_argv(&[argv0.as_str(), marker]));
+        spawn_probe_from(&py.path, marker, env)
+    }
+
+    /// Take snapshots (through the sweeps' own helper) until `pid` shows the
+    /// expected cmdline marker, or give up after ~5 s and return the last one.
+    fn snapshot_seeing(pid: u32, marker: &str) -> sysinfo::System {
+        let mut sys = process_table_with_cmdlines();
+        for _ in 0..50 {
+            let seen = sys
+                .process(sysinfo::Pid::from_u32(pid))
+                .map(|p| joined_cmdline(p).contains(marker))
+                .unwrap_or(false);
+            if seen {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            sys = process_table_with_cmdlines();
+        }
+        sys
+    }
+
+    #[test]
+    fn mcp_kill_sweep_enumeration_sees_matching_child_cmdline() {
+        let py = python_runtime_exe();
+        let marker = mcp_script_marker("act");
+        let child = spawn_mcp_probe(&py, &marker, &[]);
+        let sys = snapshot_seeing(child.pid(), &marker);
+
+        let stats = enumeration_stats(&sys);
+        assert!(
+            stats.with_cmdline > 0,
+            "snapshot carries no cmdlines at all ({stats:?}) — refresh_with_cmdlines \
+             does not request them"
+        );
+        let candidates = mcp_kill_sweep_candidates(&sys, std::process::id());
+        let hit = candidates.iter().find(|c| c.pid == child.pid());
+        assert!(
+            hit.is_some(),
+            "the kill sweep's candidate set misses a live child executing an MCP \
+             server script ({} candidates, {stats:?})",
+            candidates.len()
+        );
+        assert!(hit.unwrap().cmdline.contains(&marker));
+        assert!(
+            !candidates.iter().any(|c| c.pid == std::process::id()),
+            "the sweep must never list its own process"
+        );
+    }
+
+    #[test]
+    fn mcp_kill_sweep_leaves_a_non_interpreter_citing_an_mcp_path_alone() {
+        // The editor/`tail` case, as a real process: argv[1] IS a
+        // claude_mcp_servers script path (the old substring filter would have
+        // killed it), but argv[0] is not a runtime — nothing executes it.
+        let marker = mcp_script_marker("cite");
+        let child = spawn_probe(&marker);
+        let sys = snapshot_seeing(child.pid(), &marker);
+
+        // Not vacuous: the sweep DID read this child's argv, and rejected it.
+        let proc = sys
+            .process(sysinfo::Pid::from_u32(child.pid()))
+            .expect("child present in the snapshot");
+        assert!(
+            joined_cmdline(proc).contains(&marker),
+            "the snapshot did not read the child's cmdline, so the leave-alone \
+             decision was never actually made"
+        );
+        let candidates = mcp_kill_sweep_candidates(&sys, std::process::id());
+        assert!(
+            !candidates.iter().any(|c| c.pid == child.pid()),
+            "a process that only cites an MCP path must not be a candidate"
+        );
+    }
+
+    #[test]
+    fn mcp_kill_sweep_terminate_step_reaches_matching_child() {
+        let py = python_runtime_exe();
+        let marker = mcp_script_marker("term");
+        let mut child = spawn_mcp_probe(&py, &marker, &[]);
+        let child_pid = child.pid();
+        let sys = snapshot_seeing(child_pid, &marker);
+
+        // Terminate ONLY our own child through the production terminate step;
+        // every other candidate (a real MCP on this machine) is just recorded.
+        let mut terminated = Vec::new();
+        let count = run_mcp_kill_sweep(&sys, std::process::id(), &mut |p| {
+            if p.pid().as_u32() == child_pid {
+                terminate_mcp_server(p);
+                terminated.push(child_pid);
+            }
+        });
+        assert_eq!(terminated, vec![child_pid], "terminate step never reached the child");
+        assert!(count >= 1);
+
+        let status = child
+            .wait_exit()
+            .expect("child still running 10 s after the sweep terminated it");
+        assert!(!status.success());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(15), "expected SIGTERM, got {status:?}");
+        }
+    }
+
+    /// Spawn an MCP probe that has one grandchild; return both.
+    fn spawn_mcp_probe_with_grandchild(py: &LinkedExe, tag: &str) -> (ProbeChild, PidGuard, String) {
+        let marker = mcp_script_marker(tag);
+        let pidfile = py.path.with_file_name(format!("grandchild-{tag}.pid"));
+        let pidfile_s = pidfile.to_string_lossy().into_owned();
+        let child = spawn_mcp_probe(py, &marker, &[(PROBE_GRANDCHILD_PIDFILE_ENV, &pidfile_s)]);
+        let mut grandchild = None;
+        for _ in 0..100 {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|t| t.trim().parse::<u32>().ok())
+            {
+                grandchild = Some(pid);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let grandchild = PidGuard(grandchild.expect("probe never reported its grandchild"));
+        (child, grandchild, marker)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_mcp_server_posix_signals_only_the_matched_process() {
+        // The documented POSIX contract: SIGTERM to the matched process, no
+        // tree walk (npm exec forwards SIGTERM; its node child is matched on
+        // its own). The grandchild must survive this call.
+        use vct_launcher_core::process::pid_is_alive;
+        let py = python_runtime_exe();
+        let (mut child, grandchild, marker) = spawn_mcp_probe_with_grandchild(&py, "posix");
+        let sys = snapshot_seeing(child.pid(), &marker);
+        let proc = sys.process(sysinfo::Pid::from_u32(child.pid())).expect("child");
+        terminate_mcp_server(proc);
+        let status = child.wait_exit().expect("child survived SIGTERM");
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(15));
+        }
+        assert!(pid_is_alive(grandchild.0), "POSIX terminate must not walk the tree");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminate_mcp_server_windows_kills_the_process_tree() {
+        // V52-AI on Windows: the host AND its children (they hold the locks).
+        use vct_launcher_core::process::pid_is_alive;
+        let py = python_runtime_exe();
+        let (mut child, grandchild, marker) = spawn_mcp_probe_with_grandchild(&py, "win");
+        let sys = snapshot_seeing(child.pid(), &marker);
+        let proc = sys.process(sysinfo::Pid::from_u32(child.pid())).expect("child");
+        terminate_mcp_server(proc);
+        assert!(child.wait_exit().is_some(), "child survived taskkill /T /F");
+        let mut gone = false;
+        for _ in 0..100 {
+            if !pid_is_alive(grandchild.0) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(gone, "taskkill /T must take the MCP's child tree down too");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_lists_processes_not_their_threads() {
+        // `without_tasks()`: a thread must never be a sweep row of its own.
+        let _held = std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_secs(3)));
+        let sys = process_table_with_cmdlines();
+        assert!(
+            sys.processes()
+                .values()
+                .all(|p| p.thread_kind() != Some(sysinfo::ThreadKind::Userland)),
+            "the snapshot lists userland threads as processes"
+        );
+        let me = std::process::id();
+        let tids: Vec<u32> = std::fs::read_dir("/proc/self/task")
+            .expect("/proc/self/task")
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|tid| *tid != me)
+            .collect();
+        assert!(!tids.is_empty(), "the test process should have more than one thread");
+        for tid in tids {
+            assert!(
+                sys.process(sysinfo::Pid::from_u32(tid)).is_none(),
+                "thread {tid} of the test process is listed as a process"
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_reaper_sees_child_cmdline_and_leaves_live_parented_mcp_alone() {
+        let me = std::process::id();
+        let py = python_runtime_exe();
+        let marker = mcp_script_marker("reap");
+        let child = spawn_mcp_probe(&py, &marker, &[]);
+        let sys = snapshot_seeing(child.pid(), &marker);
+
+        let pid = sysinfo::Pid::from_u32(child.pid());
+        let proc = sys.process(pid).expect("child present in the snapshot");
+        let inputs = reap_inputs(&sys, pid, proc, me);
+        assert!(
+            inputs.cmdline.contains(&marker),
+            "the reaper read an empty cmdline for a live MCP child: {inputs:?}"
+        );
+        assert!(is_mcp_server_argv(&inputs.argv));
+        assert_eq!(inputs.parent_pid, Some(me));
+        assert_eq!(inputs.parent_alive, Some(true));
+        assert!(!inputs.parent_is_subreaper);
+        // An MCP, but its parent (us) is alive: leave it alone.
+        assert!(!inputs.should_reap());
+        assert_eq!(inputs.orphan_signal(), None);
+
+        let mut targeted = Vec::new();
+        let _ = run_orphaned_mcp_reap(&sys, me, &mut |p| targeted.push(p.pid().as_u32()));
+        assert!(!targeted.contains(&child.pid()));
+    }
+
+    #[test]
+    fn orphan_signal_names_the_reason_that_fired() {
+        // Signal (a): known non-subreaper parent dead.
+        let dead = steady_state_orphan_signal(false, COORD_CMD, 3600, Some(4242), Some(false), false);
+        assert_eq!(dead, Some(OrphanSignal::ParentDead));
+        assert_eq!(dead.unwrap().describe(Some(4242)), "parent PID 4242 is dead");
+        // Signal (b): reparented to a LIVE subreaper — must not say "dead".
+        let reparented = steady_state_orphan_signal(false, COORD_CMD, 3600, Some(1), Some(true), true);
+        assert_eq!(reparented, Some(OrphanSignal::ReparentedToSubreaper));
+        let text = reparented.unwrap().describe(Some(1));
+        assert_eq!(text, "reparented to subreaper PID 1");
+        assert!(!text.contains("dead"));
+        // Leave-alone: live real parent.
+        assert_eq!(
+            steady_state_orphan_signal(false, COORD_CMD, 3600, Some(4242), Some(true), false),
+            None
+        );
+    }
+
+    #[test]
+    fn hub_sweep_enumeration_sees_hub_decoy_cmdline() {
+        // A decoy whose EXE BASENAME is a hub binary.
+        let decoy = linked_test_exe(if cfg!(windows) { "vct-hub.exe" } else { "vct-hub" });
+        let marker = non_mcp_marker("hub");
+        let child = spawn_probe_from(&decoy.path, &marker, &[]);
+        let sys = snapshot_seeing(child.pid(), &marker);
+
+        let candidates = hub_sweep_candidates(&sys, std::process::id());
+        let hit = candidates
+            .iter()
+            .find(|c| c.pid == child.pid())
+            .expect("hub sweep misses a live process whose exe basename is vct-hub");
+        assert!(hub_exe_basename_match(&hit.exe_basename));
+        assert!(
+            hit.cmdline.contains(&marker),
+            "hub sweep candidate carries no cmdline: {hit:?}"
+        );
+    }
+
+    #[test]
+    fn process_exe_by_pid_resolves_spawned_child() {
+        let marker = non_mcp_marker("exe");
+        let child = spawn_probe(&marker);
+        let _ = snapshot_seeing(child.pid(), &marker);
+        let got = process_exe_by_pid(child.pid()).expect("child exe resolves");
+        let want = std::env::current_exe().expect("current_exe");
+        assert_eq!(
+            std::fs::canonicalize(&got).unwrap_or(got),
+            std::fs::canonicalize(&want).unwrap_or(want)
+        );
     }
 }

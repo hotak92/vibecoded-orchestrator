@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with pre-tool-use.ps1 (its UTF-8 BOM serves Windows
+# PowerShell 5.1 only; block-reason messages go to stderr on both sides;
+# every behaviour must match the .ps1 sibling).
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
@@ -64,7 +67,7 @@ if [ -z "${PY:-}" ]; then
     # stderr on exit 0 never reaches it). Non-blocking: blocking every Bash
     # call would make a Python-less machine unusable, and the notice names the
     # fix. MUST MATCH pre-tool-use.ps1's Write-VcoNoPythonNotice.
-    if printf '%s' "$_NOPY_STDIN" | grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"Bash"'; then
+    if printf '%s' "$_NOPY_STDIN" | grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"(Bash|PowerShell)"'; then
         _NOPY_MSG="[VCO broken install] The Bash security scans (shell-injection guard + .claude/scripts/bash_security.py) did NOT run: no Python interpreter was found (python3 / python / py on PATH). Put Python 3 on PATH or re-run the orchestrator's install / update (python install.py --update in the orchestrator root, or the launcher's Update), then retry."
         echo "$_NOPY_MSG" >&2
         _NOPY_SID="$(printf '%s' "$_NOPY_STDIN" | grep -Eo '"session_id"[[:space:]]*:[[:space:]]*"[A-Za-z0-9_-]+"' | head -n 1 | sed 's/.*"\([A-Za-z0-9_-]*\)"$/\1/')"
@@ -190,6 +193,18 @@ else
     SESSION_ID_RAW="$(printf '%s' "$SESSION_ID_FROM_STDIN" | tr -cd 'A-Za-z0-9_-')"
 fi
 SESSION_ID="${SESSION_ID_FROM_STDIN:-${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}}"
+# v0.2.102 W6-C1 (F11): the Build-Anchor reads ledger is per AGENT. The
+# payload's AGENT_ID (parsed above) is set exactly when this tool call
+# belongs to a SUBAGENT — whose context never saw the parent's Reads (and
+# vice versa), so sharing reads_<sid>.txt let a subagent overwrite with
+# Write a file only the parent Read (the gate failed open across agents).
+# The composite key comes from the ONE session-id helper; the main agent's
+# key is byte-identical to the pre-W6-C1 name (this branch only adds the
+# __<agent_id> component when AGENT_ID is non-empty).
+ANCHOR_SESSION_KEY="$SESSION_ID"
+if [ -n "$AGENT_ID" ] && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+    ANCHOR_SESSION_KEY="$(vco_hook_agent_key_from_ids "$SESSION_ID" "$AGENT_ID")"
+fi
 # Per-session dedup state lives under the project's .claude/state/ rather
 # than $TMPDIR so it survives reboots + launcher restarts (Claude Code
 # persists session_id across restarts via the resume feature). $TMPDIR may
@@ -197,7 +212,7 @@ SESSION_ID="${SESSION_ID_FROM_STDIN:-${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}}"
 # gitignored and wiped only by PostCompact (correct semantic — context
 # truly resets at compaction).
 SESSION_STATE_DIR="$PROJECT_ROOT/.claude/state"
-SESSION_READS_FILE="$SESSION_STATE_DIR/reads_${SESSION_ID}.txt"
+SESSION_READS_FILE="$SESSION_STATE_DIR/reads_${ANCHOR_SESSION_KEY}.txt"
 BACKUP_DIR="$SESSION_STATE_DIR/tool_backups"
 SECURITY_LOG="$PROJECT_ROOT/.claude/logs/security_events.jsonl"
 
@@ -212,6 +227,9 @@ mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 # HK-4 (v0.2.75) accepted-scatter: one of 4 per-hook GC sweeps (uniform 14d);
 # a shared sweeper is optional and deliberately SKIPPED to keep hooks
 # single-file. See pre-edit-context-inject.sh for the full rationale.
+# v0.2.102 W6-C1 (F1/F11): the per-agent names reads_<sid>__<agent>.txt and
+# seen_reads_<sid>__<agent>.txt are already covered by these two globs (the
+# '*' spans the '__<agent_id>' component), so the GC needs no new pattern.
 find "$SESSION_STATE_DIR" -maxdepth 1 -name 'reads_*.txt' -mtime +14 -delete 2>/dev/null || true
 # v0.2.70 Stream E (SF-1): same 14-day GC for the INJECTOR reads store
 # (seen_reads_*.txt — distinct from the Build-Anchor reads_*.txt above).
@@ -232,6 +250,20 @@ except Exception:
 # === 1. SSRF GUARD ===
 if [[ "$TOOL_NAME" == "WebFetch" ]]; then
     URL=$(_get_field "url")
+    if [[ -z "$URL" ]]; then
+        # v0.2.102 NB-H1 (FRR:64): an empty URL here means the payload's url
+        # field could not be extracted (malformed tool_input, a parser
+        # error) — a WebFetch the guard cannot judge went out UNGUARDED
+        # before this arm. A security guard that cannot read its input fails
+        # CLOSED, the same contract as the no-Python arm above. Non-WebFetch
+        # tools are unaffected (this branch is WebFetch-only).
+        {
+            echo "🔒 SSRF guard: the WebFetch payload's 'url' field could not be extracted (malformed payload or a parser error), so the call cannot be checked and is blocked."
+            echo "   Retry; if it persists this is a broken VCO install — re-run the orchestrator's update (\`python install.py --update\` in the orchestrator root, or the launcher's Update)."
+        } >&2
+        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"\",\"reason\":\"url_extraction_failed\"}" >> "$SECURITY_LOG" 2>/dev/null || true
+        exit 2
+    fi
     if [[ -n "$URL" ]]; then
         # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
         # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both
@@ -281,8 +313,10 @@ if [[ "$TOOL_NAME" == "WebFetch" ]]; then
     fi
 fi
 
-# === 2. SHELL INJECTION SCAN (Bash tool) ===
-if [[ "$TOOL_NAME" == "Bash" ]]; then
+# === 2. SHELL INJECTION SCAN (Bash tool, and the PowerShell tool — v0.2.102
+# W5-D: the only shell tool on Windows without Git Bash; the scanner's
+# `--shell powershell` rule set reads its syntax) ===
+if [[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "PowerShell" ]]; then
     CMD=$(_get_field "command")
     INJECTION_FOUND=""
 
@@ -304,7 +338,7 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
     if [[ -n "$INJECTION_FOUND" ]]; then
         # Block messages route to stderr — see bash-security branch.
         {
-            echo "🚨 Shell injection guard: detected '$INJECTION_FOUND' in Bash command."
+            echo "🚨 Shell injection guard: detected '$INJECTION_FOUND' in $TOOL_NAME command."
             echo "   Blocked command preview: ${CMD:0:120}"
             echo "   If this is intentional, run the command manually in a terminal."
         } >&2
@@ -315,7 +349,9 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
     # Extended security scan via bash_security.py
     SECURITY_SCRIPT="$PROJECT_ROOT/.claude/scripts/bash_security.py"
     if [[ -f "$SECURITY_SCRIPT" ]]; then
-        SECURITY_RESULT=$(echo "$CMD" | "$PY" "$SECURITY_SCRIPT" 2>&1)
+        _SEC_SHELL="bash"
+        [[ "$TOOL_NAME" == "PowerShell" ]] && _SEC_SHELL="powershell"
+        SECURITY_RESULT=$(echo "$CMD" | "$PY" "$SECURITY_SCRIPT" --shell "$_SEC_SHELL" 2>&1)
         SECURITY_EXIT=$?
         if [[ "$SECURITY_EXIT" -eq 2 ]]; then
             # Emit the block message to STDERR (not stdout). Claude
@@ -328,7 +364,7 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
             # 2026-05-20 hook-spam report described. Route the human-
             # readable message to stderr so the harness displays it.
             {
-                echo "🚨 Bash security scanner blocked this command:"
+                echo "🚨 $TOOL_NAME security scanner blocked this command:"
                 echo "   $SECURITY_RESULT"
             } >&2
             echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"bash_security_blocked\",\"detail\":\"${SECURITY_RESULT:0:200}\",\"cmd_preview\":\"${CMD:0:80}\"}" >> "$SECURITY_LOG" 2>/dev/null || true
@@ -372,7 +408,15 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
             _REL_FP="$(vco_to_repo_relative "$FILE_PATH" "$PROJECT_ROOT")"
         fi
         if command -v vco_seen_store_path >/dev/null 2>&1; then
-            _UNIFIED_READS="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+            # v0.2.102 W6-C1 (F1): the injector reads-ledger is per AGENT —
+            # a subagent's Read must not mark sources "already in context"
+            # for the parent (whose window never saw them), nor be silenced
+            # by the parent's Reads. Same composite key as the router's.
+            _STORE_SID="$SESSION_ID_RAW"
+            if [ -n "$AGENT_ID" ] && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+                _STORE_SID="$(vco_hook_agent_key_from_ids "$SESSION_ID_RAW" "$AGENT_ID")"
+            fi
+            _UNIFIED_READS="$(vco_seen_store_path reads "$_STORE_SID" "$PROJECT_ROOT")"
             if [ -n "$_UNIFIED_READS" ]; then
                 printf '%s\n' "$_REL_FP" >> "$_UNIFIED_READS" 2>/dev/null || true
             fi

@@ -20,9 +20,9 @@ Installed by default in every project. ONE definition per agent: the dispatcher 
 | `code-reviewer` | fable | Adversarial read-only review; findings with `file:line` evidence |
 | `agent-author` | sonnet | Agent/skill definitions and helper scripts |
 
-## Gateway agents — `agents/module-gateway/` (8 agents)
+## Gateway agents — `agents/module-gateway/` (12 agents)
 
-Delivered ONLY when the model gateway is configured on the machine (tri-state module gate); they pin `claude-gw/*` model ids in frontmatter and are dispatched by name with no model override. The z.ai lane: `glm-implementer`, `glm-reviewer`, `glm-planner`, `glm-flash-researcher`. The qwen-vendor lane: `deepseek-implementer`, `qwen-implementer`, `deepseek-researcher`, `qwen-flash-sweeper`. There is deliberately no reviewer and no planner on the qwen vendor.
+Delivered ONLY when the model gateway is configured on the machine (tri-state module gate); they pin `claude-gw/*` model ids in frontmatter and are dispatched by name with no model override. The z.ai lane: `glm-implementer`, `glm-implementer-high` (effort-high sibling), `glm-reviewer`, `glm-planner`, `glm-flash-researcher`. The qwen-vendor lane: `deepseek-implementer`, `qwen-implementer`, `qwen-implementer-high` (effort high, run by QwenCloud at xhigh), `deepseek-researcher`, `qwen-flash-sweeper`. There is deliberately no dedicated reviewer or planner definition on the qwen vendor (`qwen-implementer-high` can still be dispatched for a review round). The kimi-vendor lane (Kimi K3): `kimi-implementer`, `kimi-reviewer`. Each lane is delivered only when its vendor's key resolves at bundle time; a lane whose key is missing is held back (an earlier copy is kept, never deleted).
 
 ## Default skills — `skills/` (6 skills)
 

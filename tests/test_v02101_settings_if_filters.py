@@ -48,6 +48,28 @@ WINDOWS = TEMPLATES / "settings.json.windows.template"
 #: branch review's S1: every remaining verb of the classifier's READ/SEARCH
 #: tables (less/more/diff/bat/nl/awk, ag/ack/egrep/fgrep, git blame) — the
 #: set equality with the classifier is pinned by TestIfRulesMatchClassifier.
+#: v0.2.102 (S16-8 production wiring): the write/chain-side rules the
+#: classifier's new branches need. ``perl``/``ruby`` are the grouped
+#: in-place-edit shapes (R1), ``tee``/``cp``/``mv`` the overwrite shapes the
+#: classifier has always classified EDIT, and ``cd`` exists for the R4
+#: chain re-rooting — ``cd dir && cat f`` starts with ``cd``, so without
+#: the rule the read behind it never reached the classifier either.
+#: Appended after the 21 read/search rules, brief order. W6-Z3:
+#: ``echo``/``printf`` follow — ``echo x > f`` / ``printf … > f`` are the
+#: commonest Bash writes, and the classifier always read them EDIT, but no
+#: rule started with their verb, so the CHANGELOG's "same pre-tool injection
+#: as the tool-call equivalents" was false for exactly that shape.
+V02102_RULES = [
+    "Bash(perl *)",
+    "Bash(ruby *)",
+    "Bash(cd *)",
+    "Bash(tee *)",
+    "Bash(cp *)",
+    "Bash(mv *)",
+    "Bash(echo *)",
+    "Bash(printf *)",
+]
+
 C1_IF_RULES = [
     "Bash(cat *)",
     "Bash(head *)",
@@ -108,12 +130,16 @@ class TestSettingsRegistrations:
 
     def test_bash_pretooluse_is_the_c1_if_group(self, tpl: Path) -> None:
         doc = _load(tpl)
+        # v0.2.102 W5-D: the group matches Bash|PowerShell; its Bash rules
+        # come first, unchanged (the PowerShell twins are pinned in
+        # tests/test_v02102_powershell_hooks.py).
         groups = [g for g in _groups(doc, "PreToolUse")
-                  if g.get("matcher") == "Bash"
+                  if g.get("matcher") == "Bash|PowerShell"
                   and any("pre-bash-context-inject" in h for h in _hook_basenames(g))]
         assert len(groups) == 1, "exactly one Bash group hosts pre-bash-context-inject"
         hooks = groups[0]["hooks"]
-        assert [h.get("if") for h in hooks] == C1_IF_RULES, (
+        assert [h.get("if") for h in hooks
+                if h.get("if", "").startswith("Bash(")] == C1_IF_RULES + V02102_RULES, (
             "the §C1 if-rules must be one handler per rule, in plan order")
         for h in hooks:
             # SF-1 (wave-2 GLM review): 10, not 8 — at review time the
@@ -138,11 +164,11 @@ class TestSettingsRegistrations:
         alongside the group would double-spawn every matching command."""
         doc = _load(tpl)
         for g in _groups(doc, "PreToolUse"):
-            if g.get("matcher") != "Bash":
+            if g.get("matcher") not in ("Bash", "Bash|PowerShell"):
                 continue
             for h in g["hooks"]:
                 if "pre-bash-context-inject" in h.get("command", ""):
-                    assert h.get("if") in C1_IF_RULES
+                    assert h.get("if"), "every pre-bash handler carries an if rule"
 
     # --- §C2: Read on PostToolUse -----------------------------------------
 
@@ -214,7 +240,8 @@ class TestSettingsRegistrations:
         router = (REPO_ROOT / "claude_mcp_servers" / "scripts" /
                   "hook_context_router.py").read_text(encoding="utf-8")
         m = re.search(
-            r'_env_float\("VCO_INJECT_BUDGET_S", ([0-9.]+)\)', router)
+            # v0.2.102 W6-R5FIX: read through the one env_float reader.
+            r'\benv_float\("VCO_INJECT_BUDGET_S", ([0-9.]+)[,)]', router)
         assert m, "router budget default not found"
         budget = float(m.group(1))
         #: The router-spawning surfaces only — `diff-context-inject`
@@ -246,7 +273,7 @@ class TestSettingsRegistrations:
         lost rows vs the pre-redesign 500-char regime)."""
         doc = _load(tpl)
         groups = [g for g in _groups(doc, "PreToolUse")
-                  if g.get("matcher") == "Bash"
+                  if g.get("matcher") == "Bash|PowerShell"
                   and any("pre-bash-context-inject" in n
                           for n in _hook_basenames(g))]
         assert groups, "the §C1 bash group is missing"
@@ -269,11 +296,14 @@ class TestSettingsRegistrations:
 
 
 def _bash_group_rules(doc: dict) -> list[str]:
-    """The `if` rules of the pre-bash-context-inject Bash group(s), in order."""
+    """The Bash `if` rules of the pre-bash-context-inject group(s), in order
+    (v0.2.102 W5-D: the group matches Bash|PowerShell; its PowerShell twin
+    rules are locked by tests/test_v02102_powershell_hooks.py)."""
     return [h.get("if") for g in _groups(doc, "PreToolUse")
-            if g.get("matcher") == "Bash"
+            if g.get("matcher") == "Bash|PowerShell"
             for h in g.get("hooks", [])
-            if "pre-bash-context-inject" in h.get("command", "")]
+            if "pre-bash-context-inject" in h.get("command", "")
+            and h.get("if", "").startswith("Bash(")]
 
 
 def _classifier_rule_set() -> set[str]:
@@ -284,7 +314,8 @@ def _classifier_rule_set() -> set[str]:
     ``Bash(git s*)`` (the §C1 git-rule family, probe-verified incl. double
     spaces between ``git`` and the subcommand)."""
     from vco_lib import inject_intent as ii
-    plain = ii._READ_VERBS | ii._SEARCH_VERBS
+    plain = (ii._READ_VERBS | ii._SEARCH_VERBS
+             | ii._EDIT_RULE_VERBS | ii._CHAIN_RULE_VERBS)
     git = ii._GIT_READ_SUBS | ii._GIT_SEARCH_SUBS
     return {f"Bash({v} *)" for v in plain} | {f"Bash(git {s}*)" for s in git}
 
@@ -317,18 +348,76 @@ class TestIfRulesMatchClassifier:
 
     def test_every_rule_reaches_a_live_classifier_branch(self, tpl: Path) -> None:
         """Behavioural half: a representative command for each rule
-        classifies READ or SEARCH — the rule names a branch that answers."""
+        classifies READ, SEARCH or EDIT — the rule names a branch that
+        answers (v0.2.102: the write-side rules answer EDIT, and ``cd``
+        answers through the chain it unlocks)."""
         from vco_lib.inject_intent import classify_bash
+        edit_samples = {
+            "perl": 'perl -pi -e "s/a/b/" vco_lib/packs.py',
+            "ruby": "ruby -pi -e g vco_lib/packs.py",
+            "tee": "tee vco_lib/packs.py",
+            "cp": "cp vco_lib/packs.py /tmp/packs.py",
+            "mv": "mv vco_lib/packs.py /tmp/packs.py",
+            "echo": "echo 'x = 1' > vco_lib/packs.py",
+            "printf": "printf 'x = 1\\n' >> vco_lib/packs.py",
+        }
         for rule in _bash_group_rules(_load(tpl)):
             m = re.fullmatch(r"Bash\((git \w+|\w+)\*?(?: \*)?\)", rule)
             assert m, f"unexpected rule shape {rule!r}"
             verb = m.group(1)
-            sample = (f"{verb} build_parser" if verb in
-                      ("grep", "rg", "ag", "ack", "egrep", "fgrep", "git grep")
-                      else f"{verb} vco_lib/packs.py")
+            if verb in edit_samples:
+                sample, want = edit_samples[verb], ("EDIT",)
+            elif verb == "cd":
+                # `cd` ALONE is MECHANICAL (pinned below) — the rule buys the
+                # chain: `cd dir && cat f` re-roots and classifies READ.
+                sample, want = "cd vco_lib && cat packs.py", ("READ",)
+            else:
+                sample = (f"{verb} build_parser" if verb in
+                          ("grep", "rg", "ag", "ack", "egrep", "fgrep",
+                           "git grep")
+                          else f"{verb} vco_lib/packs.py")
+                want = ("READ", "SEARCH")
             intent = classify_bash(sample).intent
-            assert intent in ("READ", "SEARCH"), (
+            assert intent in want, (
                 f"{rule!r}: sample {sample!r} classifies {intent!r}")
+
+
+
+@pytest.mark.parametrize("tpl", [LINUX, WINDOWS], ids=["linux", "windows"])
+@pytest.mark.parametrize("cmd", [
+    "echo 'x = 1' > vco_lib/packs.py",
+    "echo hi >> docs/notes.md",
+    "printf '%s\\n' a > vco_lib/packs.py",
+])
+def test_redirect_writes_reach_the_hook(tpl: Path, cmd: str) -> None:
+    """W6-Z3: a redirect write that STARTS with ``echo``/``printf`` — the
+    commonest Bash write — is matched by an ``if`` rule (a ``Bash(v *)``
+    prefix glob) AND classifies EDIT, so the hook spawns and answers."""
+    from vco_lib.inject_intent import classify_bash
+    rules = _bash_group_rules(_load(tpl))
+    verbs = [m.group(1) for r in rules
+             if (m := re.fullmatch(r"Bash\((\w+) \*\)", r))]
+    assert any(cmd.startswith(v + " ") for v in verbs), (cmd, rules)
+    assert classify_bash(cmd).intent == "EDIT"
+
+
+@pytest.mark.parametrize("cmd", ["echo hi", "printf 'done\\n'", "echo $PATH",
+                                 "echo hi > /dev/null", "echo hi 2>&1"])
+def test_echo_printf_without_a_file_target_stay_mechanical(cmd: str) -> None:
+    """The ``Bash(echo *)`` / ``Bash(printf *)`` rules spawn the hook for
+    every echo, but one with no file target classifies MECHANICAL — no
+    query, no producer spawn, no injection (the same contract as ``cd``)."""
+    from vco_lib.inject_intent import classify_bash
+    bi = classify_bash(cmd)
+    assert bi.intent == "MECHANICAL" and not bi.targets, bi
+
+def test_cd_rule_stays_cheap_cd_alone_is_mechanical() -> None:
+    """The ``Bash(cd *)`` rule must not turn navigation into injection:
+    ``cd /tmp && ls`` has no read/edit/search segment, classifies
+    MECHANICAL and produces no query, no producer spawn, no RL event —
+    the router's contract for MECHANICAL commands."""
+    from vco_lib.inject_intent import classify_bash
+    assert classify_bash("cd /tmp && ls").intent == "MECHANICAL"
 
 
 class TestLinuxWindowsParity:

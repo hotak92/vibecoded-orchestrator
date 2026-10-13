@@ -2,37 +2,66 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #
-# v0.2.47 (extras): integration tests for the code-graph-incremental.sh
-# hook's new extras-path detection. The hook normally shells out to the
-# analyzer in the background; we override that via VCT_PYTHON +
-# VCT_ANALYZER_SCRIPT to point at a Python stub that just records its
-# argv. The assertion compares the recorded (REPO_PATH, --project value)
-# pair against the expected match-target for each scenario.
+# Integration tests for the STANDALONE code-graph-incremental.sh hook
+# (templates/hooks/code-graph-incremental.sh). The hook ships unregistered —
+# its scheduling moved to stop-codegraph-drain.sh in v0.2.73 — and is kept for
+# users who wire it themselves, so it must still pick the right analyzer
+# arguments on its own. Run by tests/test_shell_suites_runner.py under pytest.
 #
-# Scenarios exercised:
-#   1. Edit under current $REPO_PATH                 → existing behaviour
-#                                                     (REPO_PATH unchanged)
-#   2. Edit under an enabled extra path              → REPO_PATH=extra,
-#                                                     project unchanged
-#   3. Edit under a disabled extra path              → falls through to
-#                                                     sibling detection,
-#                                                     then no-match exit 0
-#   4. Edit under a sibling-but-not-extra            → sibling detection
-#                                                     re-points REPO_PATH
-#                                                     to the sibling AND
-#                                                     project name
-#   5. Edit under no known root (no extras, no sib)  → exit 0 silently
-#   6. Pre-v0.2.47 hub (no extras field at all)      → existing behaviour
-#                                                     (sibling detection
-#                                                     runs, no-match exit)
+# The hook is installed into a fixture project exactly as a bundle install
+# lays it out (<project>/.claude/hooks/ + _lib/, <project>/.claude/scripts/),
+# and the fixture repos are real git repositories: since v0.2.66 the hook
+# resolves the edited file's canonical git root and SKIPS a non-git path under
+# the temp dir as transient scratch, so a non-git /tmp fixture never reaches
+# the analyzer at all (that is how the pre-v0.2.102 version of this file
+# failed 9 of 11 asserts without anyone noticing — nothing ran it).
 #
-# Hub is faked via a tiny python http.server; the resolver picks it up
-# through $VCT_HUB_PORT + $VCT_HUB_TOKEN.
+# The analyzer is replaced via VCT_ANALYZER_SCRIPT + VCT_PYTHON by a stub that
+# records its argv to a JSONL file; nothing here touches Weaviate. The hub is a
+# tiny python http.server fake reached through $VCT_HUB_PORT.
+#
+# Decisions asserted (each against the parsed argv, not a substring):
+#   1. own-repo edit          → repo_path = project, --project = hub prefix,
+#                                --canonical-source = project, no --as-extra-path
+#   2. enabled extra path     → repo_path = extra, --project = the CURRENT
+#                                project's prefix, --as-extra-path (the same
+#                                ownership guard every other extra-path
+#                                analyzer run passes), --primary-root = the
+#                                project, and NO --canonical-source (W6-CGD
+#                                D-2: an extra's rows carry its own root)
+#   2b. enabled extra that is a git worktree OF the project → still no
+#                                --canonical-source (it used to be the
+#                                project's root: the edit overwrote the
+#                                project's own rows)
+#   3. disabled extra path    → never re-pointed to the extra
+#   4. sibling project        → repo_path + --project = the sibling
+#   5. non-git scratch path   → analyzer not invoked (v0.2.66 scratch skip)
+#   6. pre-v0.2.47 hub        → sibling detection still fires
+#   7. hub unreachable        → --project falls back to the root's basename
+#   8. non-code file          → analyzer not invoked
+
+#
+# Usage: test_code_graph_incremental_hook.sh [sh|ps1]
+#   sh  (default) the bash hook with the bash resolver + detect-project.sh
+#   ps1 the PowerShell sibling under pwsh, with the .ps1 resolver and
+#       detect-project.ps1 — the SAME scenarios, so the pair stays in parity.
 
 set -euo pipefail
 
+FLAVOR="${1:-sh}"
+case "$FLAVOR" in
+    sh|ps1) ;;
+    *) echo "usage: $0 [sh|ps1]" >&2; exit 2 ;;
+esac
+if [[ "$FLAVOR" == "ps1" ]] && ! command -v pwsh >/dev/null 2>&1; then
+    echo "SKIP: pwsh not on PATH (ps1 flavor)"
+    exit 0
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HOOK="$REPO_ROOT/.claude/hooks/code-graph-incremental.sh"
+SRC_HOOK="$REPO_ROOT/templates/hooks/code-graph-incremental.$FLAVOR"
+SRC_HOOK_LIB="$REPO_ROOT/templates/hooks/_lib"
+SRC_SCRIPTS="$REPO_ROOT/templates/scripts"
 PASS=0
 FAIL=0
 
@@ -58,7 +87,10 @@ class H(http.server.BaseHTTPRequestHandler):
         p = urllib.parse.urlparse(self.path)
         path = p.path.removeprefix("/api/v1/").rstrip("/")
         k = path.replace("/", "_")
-        if p.query: k += "_" + p.query.replace("/", "_")
+        # Decode first: the .ps1 resolver percent-encodes the by-path query
+        # (`/` -> %2F) where the bash one leaves `/` literal; both must map
+        # to the same fixture file.
+        if p.query: k += "_" + urllib.parse.unquote(p.query).replace("/", "_")
         bp = os.path.join(responses_dir, f"GET_{k}.json")
         sp = bp + ".status"
         if not os.path.exists(bp):
@@ -98,6 +130,17 @@ assert_eq() {
     fi
 }
 
+assert_ne() {
+    local got="$1" unwanted="$2" desc="$3"
+    if [[ "$got" != "$unwanted" ]]; then
+        printf '  PASS  %s\n' "$desc"; PASS=$((PASS + 1))
+    else
+        printf '  FAIL  %s\n' "$desc" >&2
+        printf '         got the unwanted value: %q\n' "$got" >&2
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 assert_contains() {
     local got="$1" needle="$2" desc="$3"
     if [[ "$got" == *"$needle"* ]]; then
@@ -110,51 +153,46 @@ assert_contains() {
     fi
 }
 
-scratch="$(mktemp -d)"
-trap "stop_fake_hub '$scratch/hub.pid' || true; rm -rf '$scratch'" EXIT
+# Physical path: the hook compares against `pwd -P`-normalized git roots.
+scratch="$(cd "$(mktemp -d)" && pwd -P)"
+trap 'stop_fake_hub "$scratch/hub.pid" || true; rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/responses"
 
-# Project root: pretend this is an installed-into-user-project tree.
+# A git repo with no commits is enough: the hook only asks
+# `git rev-parse --git-common-dir` for the canonical root.
+git_init() { git init -q "$1" >/dev/null 2>&1; }
+
+# ── Fixture project: the bundle-install layout ─────────────────────────
 PROJECT_ROOT="$scratch/projects/MyProject"
-mkdir -p "$PROJECT_ROOT/.claude/scripts" "$PROJECT_ROOT/src"
+mkdir -p "$PROJECT_ROOT/.claude/hooks" "$PROJECT_ROOT/.claude/scripts" "$PROJECT_ROOT/src"
+git_init "$PROJECT_ROOT"
+cp "$SRC_HOOK" "$PROJECT_ROOT/.claude/hooks/code-graph-incremental.$FLAVOR"
+cp -R "$SRC_HOOK_LIB" "$PROJECT_ROOT/.claude/hooks/_lib"
+for s in "vct_project_config.$FLAVOR" "detect-project.$FLAVOR"; do
+    cp "$SRC_SCRIPTS/$s" "$PROJECT_ROOT/.claude/scripts/$s"
+    chmod +x "$PROJECT_ROOT/.claude/scripts/$s"
+done
+HOOK="$PROJECT_ROOT/.claude/hooks/code-graph-incremental.$FLAVOR"
 
-# Drop in the project's resolver + the hook + a python-resolver stub
-# that the hook can find. The hook resolves the analyzer via
-# VCT_ANALYZER_SCRIPT / VCT_PYTHON env vars, so we pin those below.
-cp "$REPO_ROOT/.claude/scripts/vct_project_config.sh" \
-   "$PROJECT_ROOT/.claude/scripts/vct_project_config.sh"
-chmod +x "$PROJECT_ROOT/.claude/scripts/vct_project_config.sh"
-# Sibling-detection helper — required by the hook's existing path.
-mkdir -p "$PROJECT_ROOT/.claude/scripts"
-cp "$REPO_ROOT/.claude/scripts/detect-project.sh" \
-   "$PROJECT_ROOT/.claude/scripts/detect-project.sh"
-chmod +x "$PROJECT_ROOT/.claude/scripts/detect-project.sh"
-
-# Sibling project (used by scenario 4).
+# Sibling project (scenarios 4 + 6): a separate git repo next to the project.
 SIBLING_ROOT="$scratch/projects/SiblingProject"
 mkdir -p "$SIBLING_ROOT/src"
+git_init "$SIBLING_ROOT"
 
-# Extra path target (used by scenario 2 + 3).
+# Extra path target (scenarios 2 + 3): a separate clone outside projects/.
 EXTRA_PATH="$scratch/extras/vibecoded-orchestrator"
 mkdir -p "$EXTRA_PATH/launcher/src-tauri/src"
+git_init "$EXTRA_PATH"
 
-# Analyzer stub: records (cwd, --project value, REPO_PATH arg) to a JSONL
-# file. The first positional arg is the repo_path the hook hands us.
+# Analyzer stub: records argv (argv[0] = the repo_path the hook hands over).
 ANALYZER_STUB="$scratch/analyzer_stub.py"
 ARGV_LOG="$scratch/argv.jsonl"
-cat > "$ANALYZER_STUB" <<PYEOF
-#!/usr/bin/env python3
+cat > "$ANALYZER_STUB" <<'PYEOF'
 import json, os, sys
-row = {
-    "argv": sys.argv[1:],
-    "cwd": os.getcwd(),
-}
 with open(os.environ["VCT_ARGV_LOG"], "a") as f:
-    f.write(json.dumps(row) + "\n")
+    f.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd()}) + "\n")
 PYEOF
-chmod +x "$ANALYZER_STUB"
 
-# Pin the hub for the resolver.
 export VCT_STATE_DIR="$scratch/state-dir"
 mkdir -p "$VCT_STATE_DIR"
 export VCT_HUB_TOKEN="canary-hook-test-v0247"
@@ -163,188 +201,206 @@ HUB_PORT=$(cat "$scratch/hub.port")
 export VCT_HUB_PORT="$HUB_PORT"
 
 PROJECT_ID="abc-12345-extras"
+# Deliberately NOT the folder basename, so a hub-resolved prefix and the
+# basename fallback (scenario 7) are distinguishable.
+HUB_PREFIX="MyProjectPrefix"
 
-# Resolver fixtures — two paths the hook calls:
-#   1) `--field code_graph_collection_prefix` to pick up PROJECT_NAME
-#   2) `--field code_graph_extra_paths` to pick up extras
-# We provide BOTH so the hook's existing PROJECT_NAME flow is also
-# exercised, not just the new extras flow.
 write_fixture() {
     local key="$1" body="$2" status="${3:-200}"
     local path="$scratch/responses/GET_projects_${PROJECT_ID}_config_key=${key}.json"
     printf '%s' "$body" > "$path"
+    rm -f "${path}.status"
     if [[ "$status" != "200" ]]; then
         printf '%s' "$status" > "${path}.status"
     fi
 }
 
-# by-path lookup so the resolver maps the project root → PROJECT_ID.
-# The bash resolver's url_encode keeps `/` unescaped (safe set
-# `[a-zA-Z0-9._~/-]`); the fake hub then converts `/` → `_` over the
-# entire path+query key string. Mirror that here so the fixture
-# filename matches what the fake hub looks up at request time.
+# by-path lookup so the resolver maps the project root → PROJECT_ID. The bash
+# resolver's url_encode keeps `/` unescaped; the fake hub converts `/` → `_`
+# over the whole path+query key, so mirror that for the fixture filename.
 qkey_filename=$(printf '%s' "projects_by-path_path=${PROJECT_ROOT}" | tr '/' '_')
 cat > "$scratch/responses/GET_${qkey_filename}.json" <<EOF
 {"id":"$PROJECT_ID"}
 EOF
 
-write_fixture "code_graph_collection_prefix" '{"code_graph_collection_prefix":"MyProject"}'
+write_fixture "code_graph_collection_prefix" "{\"code_graph_collection_prefix\":\"$HUB_PREFIX\"}"
 
-# Helper: clear the argv log between scenarios.
-reset_argv_log() { : > "$ARGV_LOG"; }
-read_argv_log() { cat "$ARGV_LOG" 2>/dev/null || true; }
+# ── Running the hook + reading what the analyzer was handed ────────────
+HOOK_OUT="$scratch/hook.stdout"
+HOOK_ERR="$scratch/hook.stderr"
 
 run_hook() {
-    # The hook spawns the analyzer in the background (`( ... ) &`). We
-    # need to wait for the background job before reading the log, so we
-    # also set VCT_PYTHON to a wrapper that's synchronous and the
-    # outer hook's `&` only delays a few ms. We poll for the log line
-    # afterward instead of relying on `wait`.
     local edited_file="$1"
+    : > "$ARGV_LOG"
+    local runner=(bash "$HOOK")
+    [[ "$FLAVOR" == "ps1" ]] && runner=(pwsh -NoProfile -NonInteractive -File "$HOOK")
     set +e
     VCT_ANALYZER_SCRIPT="$ANALYZER_STUB" \
     VCT_PYTHON="$(command -v python3)" \
     VCT_ARGV_LOG="$ARGV_LOG" \
-        bash "$HOOK" "$edited_file" "$PROJECT_ROOT" 2>/dev/null
-    local rc=$?
+        "${runner[@]}" "$edited_file" "$PROJECT_ROOT" >"$HOOK_OUT" 2>"$HOOK_ERR"
     set -e
-    # Wait up to 2s for the background analyzer to write its row.
-    for _ in $(seq 1 40); do
-        if [[ -s "$ARGV_LOG" ]]; then break; fi
-        sleep 0.05
-    done
-    return $rc
+    if [[ -n "${CGI_TEST_DEBUG:-}" ]]; then
+        printf '  [debug] %s\n    stdout: %s\n    stderr: %s\n' "$edited_file" \
+            "$(cat "$HOOK_OUT")" "$(cat "$HOOK_ERR")" >&2
+    fi
+    # The analyzer runs in a background subshell. Only wait for its row when
+    # the hook says it queued one; a hook that bailed early spawned nothing.
+    if grep -q "Code graph incremental update queued" "$HOOK_OUT"; then
+        for _ in $(seq 1 100); do
+            [[ -s "$ARGV_LOG" ]] && break
+            sleep 0.05
+        done
+    fi
 }
 
-# ── Scenario 1: edit under current $REPO_PATH (own repo) ───────────────
-reset_argv_log
-# Extras list is non-empty but the edited file is under the project's own
-# repo — the early-return case (1) skips the extras query entirely.
+# argv_get <field>: read the single recorded analyzer row.
+#   invocations  number of analyzer runs recorded ("0" when none)
+#   repo         positional repo_path
+#   project      value after --project
+#   canon        value after --canonical-source
+#   only         value after --only-file
+#   extra_flag   "yes" when --as-extra-path was passed, else "no"
+#   primary      value after --primary-root
+#   dot_claude   the --index-dot-claude / --no-index-dot-claude flag
+argv_get() {
+    python3 - "$ARGV_LOG" "$1" <<'PYEOF'
+import json, sys
+log, field = sys.argv[1], sys.argv[2]
+try:
+    rows = [json.loads(l) for l in open(log) if l.strip()]
+except FileNotFoundError:
+    rows = []
+if field == "invocations":
+    print(len(rows)); sys.exit(0)
+if not rows:
+    print("<no-invocation>"); sys.exit(0)
+argv = rows[-1]["argv"]
+def after(flag):
+    return argv[argv.index(flag) + 1] if flag in argv else "<absent>"
+out = {
+    "repo": argv[0] if argv else "<absent>",
+    "project": after("--project"),
+    "canon": after("--canonical-source"),
+    "only": after("--only-file"),
+    "extra_flag": "yes" if "--as-extra-path" in argv else "no",
+    "primary": after("--primary-root"),
+    "dot_claude": next((a for a in argv if a in ("--index-dot-claude", "--no-index-dot-claude")), "<absent>"),
+}[field]
+print(out)
+PYEOF
+}
+
+# ── Scenario 1: edit under the project's own repo ──────────────────────
 write_fixture "code_graph_extra_paths" \
     "{\"code_graph_extra_paths\":[{\"path\":\"$EXTRA_PATH\",\"enabled\":true,\"last_indexed_commit\":null}]}"
 echo "# stub" > "$PROJECT_ROOT/src/main.py"
-run_hook "$PROJECT_ROOT/src/main.py" || true
-log=$(read_argv_log)
-# argv[0] = repo_path. For own-repo edits, repo_path stays = PROJECT_ROOT.
-assert_contains "$log" "\"$PROJECT_ROOT\"" \
-    "own-repo edit → analyzer cwd is the primary repo"
-assert_contains "$log" '"--project", "MyProject"' \
-    "own-repo edit → analyzer --project is MyProject"
-# Extras query should NOT have been wired in (the case branch short-
-# circuited). We don't have a direct way to assert "no hub call to
-# extras" from inside the hook, but we DO know the REPO_PATH stayed at
-# PROJECT_ROOT and the analyzer got that path.
-assert_contains "$log" "\"$PROJECT_ROOT\"" "REPO_PATH unchanged for own-repo edit"
+run_hook "$PROJECT_ROOT/src/main.py"
+assert_eq "$(argv_get invocations)" "1" "own-repo edit → analyzer invoked once"
+assert_eq "$(argv_get repo)" "$PROJECT_ROOT" "own-repo edit → repo_path is the project root"
+assert_eq "$(argv_get project)" "$HUB_PREFIX" "own-repo edit → --project is the hub's collection prefix"
+assert_eq "$(argv_get only)" "$PROJECT_ROOT/src/main.py" "own-repo edit → --only-file is the edited file"
+assert_eq "$(argv_get canon)" "$PROJECT_ROOT" "own-repo edit → --canonical-source is the project's git root"
+assert_eq "$(argv_get extra_flag)" "no" "own-repo edit → no --as-extra-path"
+assert_eq "$(argv_get primary)" "<absent>" "own-repo edit → no --primary-root"
+assert_eq "$(argv_get dot_claude)" "--no-index-dot-claude" \
+    "own-repo edit → user project excludes .claude/ (hub field absent, not a VCO clone)"
 
-# ── Scenario 2: edit under an enabled extra path ───────────────────────
-reset_argv_log
+# ── Scenario 2: edit under an ENABLED extra path ───────────────────────
+echo "// stub" > "$EXTRA_PATH/launcher/src-tauri/src/main.rs"
+run_hook "$EXTRA_PATH/launcher/src-tauri/src/main.rs"
+assert_eq "$(argv_get invocations)" "1" "enabled extra → analyzer invoked once"
+assert_eq "$(argv_get repo)" "$EXTRA_PATH" "enabled extra → repo_path re-pointed to the extra"
+assert_eq "$(argv_get project)" "$HUB_PREFIX" \
+    "enabled extra → --project stays the current project's prefix (extras index into it)"
+assert_eq "$(argv_get canon)" "<absent>" \
+    "enabled extra → no --canonical-source (rows carry the extra's own root, as every other extra producer stamps)"
+assert_eq "$(argv_get extra_flag)" "yes" \
+    "enabled extra → --as-extra-path (deletes limited to rows provably the extra's)"
+assert_eq "$(argv_get primary)" "$PROJECT_ROOT" \
+    "enabled extra → --primary-root is the project (the analyzer refuses an overlapping extra)"
+
+# ── Scenario 2b: the enabled extra is a git WORKTREE of the project ────
+# Its canonical git root is the PROJECT's root; passing it as
+# --canonical-source used to stamp the extra's edit with the project's
+# identity and overwrite the project's own rows.
+git -C "$PROJECT_ROOT" -c user.name=t -c user.email=t@example.invalid \
+    commit -q --allow-empty -m init >/dev/null 2>&1
+WT_EXTRA="$scratch/extras/myproject-wt"
+git -C "$PROJECT_ROOT" worktree add -q "$WT_EXTRA" >/dev/null 2>&1
+mkdir -p "$WT_EXTRA/src"
+echo "# stub" > "$WT_EXTRA/src/feature.py"
+write_fixture "code_graph_extra_paths" \
+    "{\"code_graph_extra_paths\":[{\"path\":\"$WT_EXTRA\",\"enabled\":true,\"last_indexed_commit\":null}]}"
+run_hook "$WT_EXTRA/src/feature.py"
+assert_eq "$(argv_get invocations)" "1" "worktree extra → analyzer invoked once"
+assert_eq "$(argv_get repo)" "$WT_EXTRA" "worktree extra → repo_path is the extra"
+assert_eq "$(argv_get canon)" "<absent>" \
+    "worktree extra → no --canonical-source (never the project's root)"
+assert_eq "$(argv_get extra_flag)" "yes" "worktree extra → --as-extra-path"
 write_fixture "code_graph_extra_paths" \
     "{\"code_graph_extra_paths\":[{\"path\":\"$EXTRA_PATH\",\"enabled\":true,\"last_indexed_commit\":null}]}"
-echo "// stub" > "$EXTRA_PATH/launcher/src-tauri/src/main.rs"
-run_hook "$EXTRA_PATH/launcher/src-tauri/src/main.rs" || true
-log=$(read_argv_log)
-# REPO_PATH should now be the extra path, project still MyProject.
-assert_contains "$log" "\"$EXTRA_PATH\"" \
-    "edit under enabled extra → REPO_PATH re-pointed to extra"
-assert_contains "$log" '"--project", "MyProject"' \
-    "edit under enabled extra → --project stays MyProject (extras index into current project)"
 
 # ── Scenario 3: edit under a DISABLED extra path ───────────────────────
-# Disabled rows are filtered out by the resolver. Without an extras
-# match, sibling detection runs; the file ISN'T under any sibling either
-# (it's under $scratch/extras, not $scratch/projects), so the hook
-# returns silently — analyzer not invoked.
-reset_argv_log
+# Disabled rows are filtered by the resolver; the file is under no sibling
+# either. Whatever the hook does next, the extra must not become repo_path
+# and the run must not be flagged as an extra-path run.
 write_fixture "code_graph_extra_paths" \
     "{\"code_graph_extra_paths\":[{\"path\":\"$EXTRA_PATH\",\"enabled\":false,\"last_indexed_commit\":null}]}"
-# Same file as scenario 2 — different fixture state.
-run_hook "$EXTRA_PATH/launcher/src-tauri/src/main.rs" || true
-log=$(read_argv_log)
-# Background analyzer may have been spawned but with REPO_PATH still =
-# PROJECT_ROOT (file isn't actually under it, but sibling detection's
-# dirname approach picks up parent_dir = $scratch/projects; the file's
-# under $scratch/extras so detect_project_for_file returns ""). The
-# analyzer still runs against PROJECT_ROOT.
-# We accept either "log is empty" (the hook bailed early) OR "log shows
-# PROJECT_ROOT" (analyzer ran against the project's own repo because no
-# match was found). Both are graceful — the key invariant is that
-# REPO_PATH does NOT become the disabled extra path.
-if [[ -z "$log" ]]; then
-    printf '  PASS  disabled extra → hook bailed early (no analyzer invocation)\n'
-    PASS=$((PASS + 1))
-else
-    if [[ "$log" == *"\"$EXTRA_PATH\""* ]]; then
-        printf '  FAIL  disabled extra was incorrectly used as REPO_PATH\n' >&2
-        printf '         log: %q\n' "$log" >&2
-        FAIL=$((FAIL + 1))
-    else
-        printf '  PASS  disabled extra → REPO_PATH not re-pointed to it\n'
-        PASS=$((PASS + 1))
-    fi
-fi
+run_hook "$EXTRA_PATH/launcher/src-tauri/src/main.rs"
+assert_ne "$(argv_get repo)" "$EXTRA_PATH" "disabled extra → repo_path never re-pointed to it"
+assert_ne "$(argv_get extra_flag)" "yes" "disabled extra → never analyzed as an extra path"
+# Positive pins (review R8): the hook must reach its worktree gate and skip
+# the edit — a crash before that point would also satisfy the two asserts above.
+assert_eq "$(argv_get invocations)" "0" "disabled extra → analyzer NOT invoked"
+assert_contains "$(cat "$HOOK_ERR")" "skipped worktree edit" \
+    "disabled extra → the worktree-gate skip is announced on stderr"
 
-# ── Scenario 4: sibling-but-not-extra → existing sibling detection ─────
-reset_argv_log
-# Empty extras list — sibling detection should fire.
+# ── Scenario 4: sibling project (no extras) ────────────────────────────
 write_fixture "code_graph_extra_paths" '{"code_graph_extra_paths":[]}'
 echo "# stub" > "$SIBLING_ROOT/src/lib.py"
-run_hook "$SIBLING_ROOT/src/lib.py" || true
-log=$(read_argv_log)
-# detect-project.sh: SIBLING_ROOT is a sibling of PROJECT_ROOT under
-# $scratch/projects/. The helper detects it and re-points REPO_PATH +
-# PROJECT_NAME to the sibling.
-assert_contains "$log" "\"$SIBLING_ROOT\"" \
-    "sibling-but-not-extra → REPO_PATH re-pointed to sibling"
-assert_contains "$log" '"--project", "SiblingProject"' \
-    "sibling-but-not-extra → --project becomes sibling name"
+run_hook "$SIBLING_ROOT/src/lib.py"
+assert_eq "$(argv_get invocations)" "1" "sibling edit → analyzer invoked once"
+assert_eq "$(argv_get repo)" "$SIBLING_ROOT" "sibling edit → repo_path re-pointed to the sibling"
+assert_eq "$(argv_get project)" "SiblingProject" "sibling edit → --project becomes the sibling's name"
+assert_eq "$(argv_get canon)" "$SIBLING_ROOT" "sibling edit → --canonical-source is the sibling's git root"
+assert_eq "$(argv_get extra_flag)" "no" "sibling edit → no --as-extra-path"
 
-# ── Scenario 5: edit under unknown root (no match anywhere) ────────────
-reset_argv_log
-write_fixture "code_graph_extra_paths" '{"code_graph_extra_paths":[]}'
+# ── Scenario 5: non-git path under the temp dir → scratch skip ─────────
 unknown_root="$scratch/unknown/somewhere/else"
 mkdir -p "$unknown_root"
 echo "# stub" > "$unknown_root/foo.py"
-run_hook "$unknown_root/foo.py" || true
-log=$(read_argv_log)
-# The hook STILL invokes the analyzer with PROJECT_ROOT as cwd (the
-# pre-v0.2.47 fallback). The analyzer would either find no files OR
-# analyze PROJECT_ROOT's own contents — neither is harmful. The
-# invariant we care about is "REPO_PATH was NOT silently re-pointed to
-# something under $scratch/unknown/".
-if [[ "$log" == *"\"$scratch/unknown"* ]]; then
-    printf '  FAIL  unknown-root edit was treated as a match\n' >&2
-    printf '         log: %q\n' "$log" >&2
-    FAIL=$((FAIL + 1))
-else
-    printf '  PASS  unknown-root edit → REPO_PATH unchanged (falls through gracefully)\n'
-    PASS=$((PASS + 1))
-fi
+run_hook "$unknown_root/foo.py"
+assert_eq "$(argv_get invocations)" "0" "non-git temp-dir edit → analyzer NOT invoked"
+assert_contains "$(cat "$HOOK_ERR")" "transient scratch path" \
+    "non-git temp-dir edit → the skip is announced on stderr"
 
 # ── Scenario 6: pre-v0.2.47 hub (no code_graph_extra_paths field) ──────
-reset_argv_log
-# Return 404 field_not_found — the bash resolver maps this to exit 4
-# and the hook's EXTRAS_LIST stays empty. Sibling detection then runs
-# normally. Use the sibling file so we see the sibling-rewrite happen.
-fpath="$scratch/responses/GET_projects_${PROJECT_ID}_config_key=code_graph_extra_paths.json"
-cat > "$fpath" <<'JSON'
-{"error":{"code":"field_not_found","message":"unknown field"}}
-JSON
-echo "404" > "$fpath.status"
-run_hook "$SIBLING_ROOT/src/lib.py" || true
-log=$(read_argv_log)
-# Pre-v0.2.47 hub: sibling detection still fires for the sibling file.
-assert_contains "$log" "\"$SIBLING_ROOT\"" \
-    "pre-v0.2.47 hub → sibling detection still fires (back-compat)"
-assert_contains "$log" '"--project", "SiblingProject"' \
-    "pre-v0.2.47 hub → --project becomes sibling name (back-compat)"
+write_fixture "code_graph_extra_paths" \
+    '{"error":{"code":"field_not_found","message":"unknown field"}}' 404
+run_hook "$SIBLING_ROOT/src/lib.py"
+assert_eq "$(argv_get repo)" "$SIBLING_ROOT" "pre-v0.2.47 hub → sibling detection still fires"
+assert_eq "$(argv_get project)" "SiblingProject" "pre-v0.2.47 hub → --project becomes the sibling's name"
+
+# ── Scenario 7: hub unreachable → basename fallback ────────────────────
+stop_fake_hub "$scratch/hub.pid"
+run_hook "$PROJECT_ROOT/src/main.py"
+assert_eq "$(argv_get invocations)" "1" "hub down → own-repo edit still analyzed"
+assert_eq "$(argv_get repo)" "$PROJECT_ROOT" "hub down → repo_path is the project root"
+assert_eq "$(argv_get project)" "MyProject" "hub down → --project falls back to the root's basename"
+
+# ── Scenario 8: non-code file → no analyzer run ────────────────────────
+echo "notes" > "$PROJECT_ROOT/README.md"
+run_hook "$PROJECT_ROOT/README.md"
+assert_eq "$(argv_get invocations)" "0" "non-code file → analyzer NOT invoked"
 
 # ── Summary ────────────────────────────────────────────────────────────
 echo
 echo "─────────────────────────────────────────────"
 if (( FAIL == 0 )); then
-    echo "OK: $PASS tests passed"
+    echo "OK ($FLAVOR): $PASS tests passed"
     exit 0
 else
-    echo "FAIL: $PASS passed, $FAIL failed"
+    echo "FAIL ($FLAVOR): $PASS passed, $FAIL failed"
     exit 1
 fi

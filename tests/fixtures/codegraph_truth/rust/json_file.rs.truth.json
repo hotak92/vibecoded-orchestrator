@@ -1,0 +1,87 @@
+{
+ "source": "json_file.rs",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "BackupPolicy",
+   "start": 49,
+   "end": 61,
+   "full_name": "json_file.BackupPolicy",
+   "methods": []
+  },
+  {
+   "kind": "function",
+   "name": "sibling_path",
+   "start": 70,
+   "end": 77,
+   "full_name": "json_file.sibling_path"
+  },
+  {
+   "kind": "function",
+   "name": "lock_path",
+   "start": 79,
+   "end": 81,
+   "full_name": "json_file.lock_path"
+  },
+  {
+   "kind": "function",
+   "name": "acquire_lock",
+   "start": 85,
+   "end": 126,
+   "full_name": "json_file.acquire_lock"
+  },
+  {
+   "kind": "function",
+   "name": "pid_alive",
+   "start": 128,
+   "end": 132,
+   "full_name": "json_file.pid_alive"
+  },
+  {
+   "kind": "class",
+   "name": "LockGuard",
+   "start": 134,
+   "end": 137,
+   "full_name": "json_file.LockGuard",
+   "methods": [
+    "drop"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "drop",
+   "start": 140,
+   "end": 142,
+   "full_name": "json_file.drop"
+  },
+  {
+   "kind": "function",
+   "name": "read_json_or_empty",
+   "start": 151,
+   "end": 160,
+   "full_name": "json_file.read_json_or_empty"
+  },
+  {
+   "kind": "function",
+   "name": "read_object_or_empty",
+   "start": 169,
+   "end": 178,
+   "full_name": "json_file.read_object_or_empty"
+  },
+  {
+   "kind": "function",
+   "name": "atomic_write_json",
+   "start": 182,
+   "end": 198,
+   "full_name": "json_file.atomic_write_json"
+  },
+  {
+   "kind": "function",
+   "name": "write_backup",
+   "start": 201,
+   "end": 219,
+   "full_name": "json_file.write_backup"
+  }
+ ]
+}

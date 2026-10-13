@@ -553,7 +553,9 @@ DB; the binding row is the launcher's record of what those should be.
   - `primary` row → `collection_name = sanitize_kg_collection(project_name) + "_KnowledgeGraph"`. For a project named `Acme` that's `Acme_KnowledgeGraph`. The sanitizer strips non-alphanumerics and TitleCases (`my project name` → `MyProjectName`).
   - `shared` row → `collection_name = "VibeCodedOrchestrator_KnowledgeGraph"` (cross-project shared KG used by all projects; renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12 — see the Identity tab "Manage shared KG collection" picker for migration).
   - Both default to `weaviate_url = http://localhost:8081`,
-    `embedding_model = qwen3-embedding:0.6b`, `embedding_dim = 1024`.
+    `embedding_dim = 1024`. (They no longer record an embedding model:
+    v0.2.102 retired the per-binding KG model pick — the KG embeds with the
+    one global embedding profile, for every project and the shared KG.)
 - Idempotence: populate **only inserts a binding if no row exists for that role**. User edits to the row survive re-onboarding (in contrast to agents/skills/hooks where `model/file_path/source` get overwritten).
 
 #### Primary vs shared
@@ -599,11 +601,27 @@ Both toggles load on mount and on project change and revert the checkbox on a fa
 |---|---|
 | `role` | `primary` / `shared` / `archive`. Validated against `VALID_KG_ROLE`. |
 | `collection_name` | Weaviate collection. Must satisfy Weaviate's "starts with [A-Z], alphanumeric only" rule — `sanitize_kg_collection` enforces this. |
-| `embedding_model` | Default `qwen3-embedding:0.6b`. Display/reference; the actual embedding model is determined at runtime by `ACTIVE_EMBEDDING` env. |
 | `embedding_dim` | Default 1024 (qwen3, also matches snowflake-arctic-embed2). |
 | `kg_dir_path` | Optional override of the `knowledge/` directory. Usually `null` (defaults to `<project>/knowledge/`). |
 | `weaviate_url` | Default `http://localhost:8081`. |
 | `config` | Reserved JSON blob. |
+
+(The table also has an `embedding_model` column, retired in v0.2.102: the
+per-binding KG model pick is gone — the KG embeds with the one global
+embedding profile (Preferences → Embedding profile). Existing values are kept in the DB, but nothing reads or writes
+them.)
+
+#### Duplicate scan
+
+**Check for duplicates** runs the shipped semantic duplicate scan
+(`detect_duplicates.py` via the launcher's `kg_check_duplicates`) against this
+project's KG and lists the likely pairs. Objects the scan could not compare
+(because they carry no vector in the searched slot) are listed with the slots
+they DO carry and why — the next whole-tree sync embeds them. The launcher's
+notification bell also lists the projects whose KG may need a fresh scan
+(a model fill running/owed, or a collection that holds objects but has no
+recorded model — no slot complete on every object) with a per-project scan
+button that reports the verdict (v0.2.102).
 
 #### Common operations
 
@@ -690,8 +708,12 @@ same function as KG bindings.
 
 - Disable code graph for a project (e.g. it's not a code project):
   toggle `enabled = false` and skip running the analyzer.
-- Switch embedding model: change `embedding_model` and
-  `embedding_dim`, then run `code-graph-analyze` to re-embed.
+- Switch embedding model: pick it here (or in Preferences → Code Graph
+  Embeddings). The choice is applied automatically: the next code-graph run
+  adds the new model's named vector beside the old one and embeds only the
+  rows without it (it logs the object count, and whether it is OpenAI-billed,
+  before it starts). `embedding_model` stays the RECORD searches use until the
+  new slot is complete; switching back to a still-complete model is instant.
 
 #### Gotchas
 
@@ -699,12 +721,14 @@ same function as KG bindings.
   you change `collection_prefix`, you must rebuild the code graph
   from scratch — the old `Acme_CodeFunction` collection won't be
   queried under the new prefix.
-- `embedding_dim` mismatches with `embedding_model` will produce
-  garbage results silently. The launcher does not validate the
-  pairing.
-- The CodeSage service (port 11440) must be running. If you set
-  `CODE_EMBED_BACKEND=ollama` in the env, the launcher row is
-  display-only — actual embeddings come from Ollama.
+- The model each code graph embeds and searches with is resolved in ONE place
+  (`vco_lib/code_embed_model.py`): this row's recorded model once the graph is
+  built, otherwise the selected target (`CODE_EMBED_MODEL` env → this tab's
+  selection → Preferences pin → install default). A model whose
+  RECORDED named vector the existing collections do not declare is refused
+  with exit 6, never written as silent 422s.
+- The CodeSage service (port 11440) must be running when the recorded model
+  is CodeSage.
 
 ---
 

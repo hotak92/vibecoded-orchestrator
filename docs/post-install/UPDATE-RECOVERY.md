@@ -139,8 +139,12 @@ Scope and caveats:
 
 ### `<vct_root>/update.lock` (one update at a time, v0.2.100)
 
-- Written by the launcher while it runs an orchestrator update: two lines,
-  the launcher's pid and the Unix time of the claim. Removed when the
+- Written by the launcher while it runs an orchestrator update: the
+  launcher's pid, the Unix time of the claim and (since v0.2.102) the
+  launcher's process start token, one per line. `install.py` uses the token
+  to tell a pid reused by a newer process from the claimant without trusting
+  the wall clock; a two-line claim from an older launcher falls back to
+  comparing start time with claim time. Removed when the
   update ends inside that launcher; an update that ends by relaunching the
   launcher can leave it behind naming the exited pid, and such a stale
   claim (dead pid, or a pid reused by a newer process) is reaped by the

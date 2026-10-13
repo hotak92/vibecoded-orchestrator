@@ -30,9 +30,9 @@ import os
 import re
 import subprocess
 import sys
-import requests
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional, List
 
 try:
@@ -181,6 +181,9 @@ from vco_lib.codegraph_references import (  # noqa: E402 — must follow the
     normalize_reference_targets,
     read_cross_reference,
 )
+# v0.2.102 W6-O: hide stored `imports` edges of a language the source module
+# cannot import (written by a pre-W6-O, language-blind resolver).
+from vco_lib.codegraph_imports import filter_compatible_import_rows  # noqa: E402
 
 # P1-D (2026-05-08): centralized access-matrix helper. `kg_access` lives at
 # <orchestrator>/claude_mcp_servers/scripts/kg_access.py; the editable install
@@ -279,6 +282,12 @@ from vco_lib.paths import claude_user_dir  # noqa: E402 — see import disciplin
 # ONE home; the file is consulted only when the env is silent.
 from vco_lib import weaviate_helpers as _wh  # noqa: E402 — see import discipline above
 from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 — see import discipline above
+from vco_lib.codegraph_lookup import (  # noqa: E402 — the ONE code-graph identity home (v0.2.102 L5)
+    code_identity_rows,
+    confirmed_entity_rows,
+    pick_canonical_chunk,
+)
+from vco_lib.weaviate_exact_match import names_same_path  # noqa: E402 — the ONE tolerant path-identity home (v0.2.102 L4)
 
 CONFIG_PATH = claude_user_dir() / "workflow" / "config" / "mcp-config.json"
 
@@ -355,9 +364,9 @@ def _collection_name(base: str, project: str = None) -> str:
 
 
 # Code embedding configuration — v0.2.18: centralised via
-# EmbeddingService. Pre-v0.2.18 read CODE_EMBED_BACKEND / CODE_EMBED_-
-# SERVICE_URL / CODE_EMBED_MODEL directly and hardcoded the slot.
-CODE_EMBED_SERVICE_URL = _env_str("CODE_EMBED_SERVICE_URL") or "http://localhost:11440"
+# EmbeddingService, which reads CODE_EMBED_SERVICE_URL itself. v0.2.102
+# W6-B2: this CLI's own copy fed only the raw CodeEmbed query fallback,
+# which is gone (owner ruling 2026-10-10 — no other embedding model).
 
 # Import EmbeddingService — graceful fallback for half-installed venvs.
 #
@@ -387,6 +396,11 @@ except Exception:
 
 
 _cached_embedding_service: "EmbeddingService | None" = None
+#: The code graph this run queries (set by main()); the service resolves THAT
+#: graph's recorded code model (v0.2.102 W6-B2, vco_lib.code_embed_model).
+_embedding_codegraph_prefix: "str | None" = None
+#: Why the service could not be built (quoted by the loud outage error).
+_embedding_construction_error: str = ""
 
 
 def _get_or_create_embedding_service():
@@ -397,20 +411,46 @@ def _get_or_create_embedding_service():
     if not HAS_EMBEDDING_SERVICE:
         return None
     try:
-        _cached_embedding_service = EmbeddingService.for_project()
+        _cached_embedding_service = EmbeddingService.for_project(
+            codegraph_prefix=_embedding_codegraph_prefix)
         return _cached_embedding_service
     except Exception as e:
+        global _embedding_construction_error
+        _embedding_construction_error = str(e)
         print(f"⚠️  EmbeddingService construction failed: {e}", file=sys.stderr)
         return None
 
 
 def _active_code_vector_slot() -> str:
-    """Return the active code-vector slot. Falls back to codesage_embed
-    when EmbeddingService isn't available (pre-v0.2.18 default)."""
+    """Return the active code-vector slot (the graph's RECORDED model's).
+
+    v0.2.102 W6-B2: no ``codesage_embed`` default when the service is
+    unavailable — it named a slot the graph may not be indexed in. Raises the
+    loud ``vco_lib.embed_outage.EmbeddingBackendUnavailable`` instead.
+    MUST MATCH ``weaviate_mcp/embeddings.py::_active_code_query_slot``."""
     svc = _get_or_create_embedding_service()
     if svc is None:
-        return "codesage_embed"
+        from vco_lib.embed_outage import query_unavailable
+
+        raise query_unavailable("code", None, construction_error=_embedding_construction_error)
     return svc.code_vector_slot
+
+
+def _single_populated_slot(coll, uuid) -> str:
+    """The ONE named-vector slot object ``uuid`` has a stored vector in, or
+    ``""`` when there is none or more than one (ambiguous → the caller fails
+    loudly instead of picking). Used only by ``find_similar``'s no-service
+    ``near_object`` leg, which compares stored vectors and so needs no
+    embedding backend — just the slot those vectors live in."""
+    try:
+        obj = coll.query.fetch_object_by_id(uuid, include_vector=True)
+    except Exception:  # noqa: BLE001 — unresolvable → caller fails loudly
+        return ""
+    vectors = getattr(obj, "vector", None) if obj is not None else None
+    if not isinstance(vectors, dict):
+        return ""
+    populated = [name for name, vec in vectors.items() if vec]
+    return populated[0] if len(populated) == 1 else ""
 
 
 # v0.2.72 T-FLOOR (P1) + integration: the two-stage per-slot floor table,
@@ -457,36 +497,21 @@ except ImportError as exc:  # pragma: no cover — surface a clear error
 
 
 def generate_code_embedding(text: str) -> Optional[List[float]]:
-    """Generate code embedding via EmbeddingService.
+    """Embed a SEARCH QUERY with the code graph's recorded model.
 
-    v0.2.18: routes through EmbeddingService.embed_code (which picks
-    CodeEmbed / Ollama / OpenAI from env). Falls back to direct
-    CodeEmbed-service HTTP call when the service isn't available.
-
-    v0.2.101: this embeds a SEARCH QUERY, so it routes through
-    ``embed_code_query`` (the MCP's ``get_code_query_embedding`` does the
-    same — CLI≡MCP invariant). Documents/backfill still use ``embed_code``.
+    v0.2.102 W6-B2 (owner ruling 2026-10-10): through the ONE query-embed
+    entry ``vco_lib.embed_outage.embed_query_or_raise`` — the interactive 503
+    bound, the restart wait, and NO raw CodeEmbed fallback (that endpoint
+    serves CodeSage, whatever the graph is indexed in). A backend that stays
+    down raises ``EmbeddingBackendUnavailable`` (the caller prints it loudly).
+    MUST MATCH ``weaviate_mcp/embeddings.py::get_code_query_embedding``.
     """
-    svc = _get_or_create_embedding_service()
-    if svc is not None:
-        try:
-            return svc.embed_code_query(text)
-        except Exception as e:
-            print(f"⚠️  EmbeddingService.embed_code_query failed: {e}", file=sys.stderr)
-    # Legacy fallback: direct CodeEmbed HTTP call.
-    try:
-        response = requests.post(
-            f"{CODE_EMBED_SERVICE_URL}/api/embeddings",
-            json={"model": "", "prompt": text},
-            timeout=60,
-        )
-        if response.status_code == 200:
-            return response.json()["embedding"]
-        print(f"❌ Embedding generation failed: HTTP {response.status_code}")
-        return None
-    except Exception as e:
-        print(f"❌ Embedding error: {e}")
-        return None
+    from vco_lib.embed_outage import embed_query_or_raise
+
+    return embed_query_or_raise(
+        "code", _get_or_create_embedding_service(), text,
+        construction_error=_embedding_construction_error,
+    )
 
 
 def _reference_code_text(props: dict) -> str:
@@ -561,10 +586,48 @@ class CodeGraphQuery:
             anchor = str(anchor).strip()
             if not anchor:
                 return None
-            attempts = [
-                Filter.by_property("full_name").equal(anchor),
-                Filter.by_property("file_path").equal(anchor),
-            ]
+            # v0.2.102 L5: the first two attempts are IDENTITY reads and are
+            # now EXACT-confirmed through the ONE shared home — `full_name` /
+            # `file_path` are word-TOKENIZED, so the old `Equal + limit=4`
+            # could anchor the rerank on a token-superset sibling
+            # (`a.run` → `a.run_all`). The tolerant LIKE ladder below keeps
+            # serving path-shaped / bare-symbol anchors exactly as before.
+            for _prop, _kw in (
+                ("full_name", {"full_name": anchor}),
+                ("file_path", {"file_path": anchor}),
+            ):
+                best: Optional[dict] = None
+                best_chunk = 0
+                for base in ("CodeFunction", "CodeClass"):
+                    try:
+                        coll_obj = self.client.collections.get(self._coll(base))
+                        # CONFIRMED-only identity read (the ONE shared home):
+                        # a token-superset sibling (`a.run` → `a.run_all`) can
+                        # no longer anchor the rerank, and the read budget the
+                        # F10 tests pin (ONE fetch per attempt) is kept — the
+                        # tolerant LIKE ladder below is this path's tolerance,
+                        # exactly as before.
+                        rows = confirmed_entity_rows(
+                            coll_obj, filter_cls=Filter,
+                            project=self.project or "", max_matches=4,
+                            **_kw,
+                        )
+                    except Exception:
+                        continue
+                    for obj in rows:
+                        p = obj.properties or {}
+                        try:
+                            cn = int(p.get("chunk_num") or 0)
+                        except (TypeError, ValueError):
+                            cn = 0
+                        if best is None or cn < best_chunk:
+                            best, best_chunk = p, cn
+                if best is not None:
+                    return best
+
+            # Tolerant LIKE ladder (unchanged): path-shaped anchors and bare
+            # symbols the exact pass could not resolve.
+            attempts = []
             norm = anchor.replace("\\", "/")
             if "/" in norm:
                 parts = [p for p in norm.split("/") if p]
@@ -726,12 +789,20 @@ class CodeGraphQuery:
             print(f"⚠️  Query enrichment skipped: {_exc}", file=sys.stderr)
             effective_query = query
 
+        from vco_lib.embed_outage import EmbeddingBackendUnavailable, hook_unavailable_line
+
         try:
-            # Generate query embedding
             query_embedding = generate_code_embedding(effective_query)
-            if not query_embedding:
-                print("❌ Failed to generate query embedding")
+        except EmbeddingBackendUnavailable as exc:
+            # Loud (owner ruling 2026-10-10): one visible line for a hook,
+            # the full text + a non-zero exit for the CLI.
+            if hook_format:
+                print(hook_unavailable_line("code"))
                 return
+            print(f"❌ {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+
+        try:
 
             # Build per-(collection_name, project_filter_value) fan-out
             # list. Self comes first; peers appear in
@@ -934,17 +1005,22 @@ class CodeGraphQuery:
                 collected = []  # (start_line, c_name, properties)
                 for coll_obj, c_name in ((fn_coll, "CodeFunction"), (cls_coll, "CodeClass")):
                     try:
-                        sib_filter = Filter.by_property("file_path").equal(file_path)
-                        if self.project:
-                            sib_filter = sib_filter & Filter.by_property("project").equal(self.project)
+                        # v0.2.102 L5: EXACT-path-confirmed rows through the ONE
+                        # shared home — `file_path` is word-TOKENIZED, so the
+                        # old `Equal` also returned other files' token-superset
+                        # rows (a/b.py → a/b/c.py) into the sibling window.
                         # v0.2.46 V46-D: limit=64 is an intentional top-N cap
                         # (siblings are sorted by proximity AFTER the fetch).
                         # We don't emit a per-call truncation signal here
                         # because the caller (`_format_code_result_by_rank`)
                         # already only uses up to `max_total - 1` results.
                         SIBLING_FETCH_LIMIT = 64
-                        sib_resp = coll_obj.query.fetch_objects(filters=sib_filter, limit=SIBLING_FETCH_LIMIT)
-                        for obj in sib_resp.objects:
+                        sib_rows = confirmed_entity_rows(
+                            coll_obj, filter_cls=Filter, project=self.project or "",
+                            file_path=file_path,
+                            max_matches=SIBLING_FETCH_LIMIT,
+                        )
+                        for obj in sib_rows:
                             sp = obj.properties or {}
                             if sp.get("full_name") == exclude_full_name:
                                 continue
@@ -1033,13 +1109,17 @@ class CodeGraphQuery:
                 for base in ("CodeFunction", "CodeClass"):
                     try:
                         coll_obj = self.client.collections.get(self._coll(base))
-                        flt = Filter.by_property("full_name").equal(full_name)
-                        if self.project:
-                            flt = flt & Filter.by_property("project").equal(self.project)
-                        if file_path:
-                            flt = flt & Filter.by_property("file_path").equal(file_path)
-                        resp = coll_obj.query.fetch_objects(filters=flt, limit=max(total, max_chunks) + 4)
-                        for obj in resp.objects:
+                        # v0.2.102 L5: EXACT-confirmed rows through the ONE
+                        # shared home (`confirmed_entity_rows`) — MUST MATCH
+                        # the MCP's `_fetch_code_chunks`, which calls the same
+                        # helper (CLI≡MCP parity; a token-superset sibling can
+                        # interleave chunk bodies on neither surface).
+                        resp_rows = confirmed_entity_rows(
+                            coll_obj, filter_cls=Filter, project=self.project or "",
+                            full_name=full_name, file_path=file_path,
+                            max_matches=max(total, max_chunks) + 4,
+                        )
+                        for obj in resp_rows:
                             cp = obj.properties or {}
                             cn = cp.get("chunk_num", 0) or 0
                             try:
@@ -1332,11 +1412,13 @@ class CodeGraphQuery:
         try:
             coll = self.client.collections.get(self._coll(collection))
 
-            # Get reference object
-            ref_query = coll.query.fetch_objects(
-                filters=Filter.by_property("full_name").equal(reference_name),
-                limit=1
-            )
+            # Get reference object — v0.2.102 L5: exact-then-tolerant
+            # identity (ONE shared home); a token-superset sibling
+            # (`foo.bar` → `foo.bar_baz`) can no longer seed the similarity.
+            ref_query = SimpleNamespace(objects=code_identity_rows(
+                coll, "full_name", reference_name, "",
+                filter_cls=Filter, tolerant_limit=1,
+            ))
 
             if not ref_query.objects:
                 print(f"❌ Reference '{reference_name}' not found in {collection}")
@@ -1354,23 +1436,28 @@ class CodeGraphQuery:
             # entity carries no body, or the vector search cannot run — so the
             # command keeps working on a half-migrated install.
             #
-            # ``_run`` is the ONE place the project filter + execution happen,
-            # shared by BOTH legs. It is called INSIDE the try for the vector
-            # leg: ``near_vector`` can fail at EXECUTION time (a dimension/slot
-            # mismatch against the collection's named vector), not only while
-            # the query is built, and that must fall back to ``near_object``
-            # rather than fail a call that used to succeed (v0.2.101 SF-2 nit).
-            def _run(query):
-                if self.project:
-                    query = query.where(
-                        Filter.by_property("project").equal(self.project)
-                    )
-                return query.do()
+            # v0.2.102 W6-Z3: weaviate v4 ONLY. ``coll.query.near_vector`` /
+            # ``near_object`` EXECUTE on call and return a ``QueryReturn``
+            # (``.objects``); the project filter is the ``filters=`` kwarg and
+            # the distance needs ``return_metadata`` — exactly the working
+            # ``search`` path above. The pre-v0.2.102 body chained the v3
+            # builder (``.where()`` / ``.do()``), which a ``QueryReturn`` does
+            # not have, so every call failed. ``base_kwargs`` is the ONE place
+            # the shared kwargs are built, for BOTH legs. Every code collection
+            # carries several named vectors, so Weaviate refuses a vector query
+            # without ``target_vector`` — both legs name the slot.
+            base_kwargs: dict = dict(
+                limit=limit + 1,
+                return_metadata=MetadataQuery(distance=True),
+            )
+            if self.project:
+                base_kwargs["filters"] = Filter.by_property("project").equal(self.project)
 
-            similar_query = None
             response = None
+            slot = ""
             svc = _get_or_create_embedding_service()
             if svc is not None:
+                slot = _active_code_vector_slot()
                 ref_text = _reference_code_text(dict(ref_obj.properties or {}))
                 if ref_text:
                     try:
@@ -1380,25 +1467,39 @@ class CodeGraphQuery:
                             ref_text, task=QUERY_TASK_CODE_SIMILARITY
                         )
                         if vec:
-                            nv_kwargs: dict = dict(near_vector=vec, limit=limit + 1)
-                            slot = _active_code_vector_slot()
-                            if slot:
-                                nv_kwargs["target_vector"] = slot
-                            similar_query = coll.query.near_vector(**nv_kwargs)
-                            response = _run(similar_query)
+                            # Called INSIDE the try: ``near_vector`` can fail
+                            # at EXECUTION time (a dimension/slot mismatch
+                            # against the collection's named vector), and that
+                            # must fall back to ``near_object`` rather than
+                            # fail a call that used to succeed (v0.2.101 SF-2).
+                            response = coll.query.near_vector(
+                                near_vector=vec, target_vector=slot, **base_kwargs
+                            )
                     except Exception as e:
                         print(
                             f"⚠️  query-vector similarity unavailable ({e}); "
                             f"falling back to near_object",
                             file=sys.stderr,
                         )
-                        similar_query = None
                         response = None
-            if similar_query is None:
-                response = _run(coll.query.near_object(
-                    near_object=ref_obj.uuid,
-                    limit=limit + 1
-                ))
+            if response is None:
+                if not slot:
+                    # No embedding service → the active slot is unknown. Use
+                    # the slot the REFERENCE itself is stored in, but only when
+                    # that is unambiguous (exactly one populated slot): a
+                    # stored-vector comparison inside one slot never mixes
+                    # models. Anything else fails loudly — never a guess.
+                    slot = _single_populated_slot(coll, ref_obj.uuid)
+                    if not slot:
+                        from vco_lib.embed_outage import query_unavailable
+
+                        raise query_unavailable(
+                            "code", None,
+                            construction_error=_embedding_construction_error,
+                        )
+                response = coll.query.near_object(
+                    near_object=ref_obj.uuid, target_vector=slot, **base_kwargs
+                )
 
             # Format and print results (the reference itself is excluded).
             others = [o for o in response.objects if o.uuid != ref_obj.uuid]
@@ -1444,11 +1545,15 @@ class CodeGraphQuery:
             if query_type == "dependencies":
                 # Module imports
                 coll = self.client.collections.get(self._coll("CodeModule"))
-                response = coll.query.fetch_objects(
-                    filters=Filter.by_property("path").equal(target),
-                    limit=1,
-                    return_references=QueryReference(link_on="imports")
+                # v0.2.102 L5: exact-then-tolerant module-path identity (the
+                # ONE shared home) — a tokenized `Equal + limit=1` could
+                # answer for `src/a_b.py` when asked for `src/a.py`.
+                dep_rows = code_identity_rows(
+                    coll, "path", target, "",
+                    filter_cls=Filter, tolerant_limit=1,
+                    return_references=QueryReference(link_on="imports"),
                 )
+                response = SimpleNamespace(objects=dep_rows)
 
                 if not response.objects:
                     if hook_format:
@@ -1476,8 +1581,11 @@ class CodeGraphQuery:
                 # beacons on a single module). Printing them raw answers "what
                 # does X import?" with N copies of the same path.
                 _refs = response.objects[0].references or {}
-                imports = dedup_ref_targets(
-                    normalize_reference_targets(_refs.get("imports")), ("path",)
+                imports = filter_compatible_import_rows(
+                    response.objects[0].properties,
+                    dedup_ref_targets(
+                        normalize_reference_targets(_refs.get("imports")), ("path",)
+                    ),
                 )
 
                 if hook_format:
@@ -1537,11 +1645,14 @@ class CodeGraphQuery:
                     ["full_name", "name", "file_path", "start_line", "language"]
                     if hook_format else ["full_name"]
                 )
-                response = coll.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(target),
-                    limit=TARGET_ROWS_LIMIT,
+                # v0.2.102 L5: exact-then-tolerant identity through the ONE
+                # shared home — a token-superset sibling (`foo.bar` →
+                # `foo.bar_baz`) can no longer stand in for the target.
+                response = SimpleNamespace(objects=code_identity_rows(
+                    coll, "full_name", target, "",
+                    filter_cls=Filter, tolerant_limit=TARGET_ROWS_LIMIT,
                     return_properties=target_props,
-                )
+                ))
 
                 if not response.objects and hook_format:
                     # WP-B2 leaf-name fallback: injection surfaces extract
@@ -1549,11 +1660,11 @@ class CodeGraphQuery:
                     # `mod::Foo::bar`), so an exact full_name miss retries on
                     # `name`. Interactive callers keep full_name-exact-only
                     # (behaviour unchanged).
-                    response = coll.query.fetch_objects(
-                        filters=Filter.by_property("name").equal(target),
-                        limit=TARGET_ROWS_LIMIT,
+                    response = SimpleNamespace(objects=code_identity_rows(
+                        coll, "name", target, "",
+                        filter_cls=Filter, tolerant_limit=TARGET_ROWS_LIMIT,
                         return_properties=target_props,
-                    )
+                    ))
 
                 if not response.objects:
                     if hook_format:
@@ -1604,40 +1715,92 @@ class CodeGraphQuery:
 
                 if hook_format:
                     # WP-B2 injection block: one CODE: row per matched target
-                    # entity (<= 5), callers <= 5 each, edge-confirmed callers
+                    # ENTITY (<= 5), callers <= 5 each, edge-confirmed callers
                     # first, symbol+file:line ONLY. The language identity
                     # filter and the revision stamp are applied by the shared
                     # pure helpers (hermetically tested).
-                    ordered_callers = sorted(
-                        callers,
-                        key=lambda c: 0 if ((c.properties or {}).get("full_name") in confirmed_names) else 1,
-                    )
-                    caller_items = [
-                        {
-                            "full_name": (c.properties or {}).get("full_name") or "",
-                            "file": (c.properties or {}).get("file_path") or "",
-                            "line": (c.properties or {}).get("start_line"),
-                        }
-                        for c in ordered_callers
-                    ]
-                    if exclude_file:
-                        # §2.1 Edit row: self-file callers are context the
-                        # model already has (it is editing that file).
-                        caller_items = [
-                            c for c in caller_items
-                            if not _same_source_file(c.get("file") or "", exclude_file)
+                    #
+                    # v0.2.102 W6-K (item 9): the callers list is computed PER
+                    # DISTINCT matched full_name, never shared across rows.
+                    # The identity lookup above is exact-then-TOLERANT, so a
+                    # bare-leaf target ("prompt") can resolve to several
+                    # DIFFERENT functions — pre-fix, the ONE callers list
+                    # built from the requested target's name terms was
+                    # stamped on every row (live v0.2.101 symptom: five
+                    # different functions each carrying the same
+                    # "callers: ... (+43)" line). A group whose terms equal
+                    # the requested target's reuses the already-fetched
+                    # caller_response (the common exact-match case costs
+                    # exactly what it did before); every other group runs its
+                    # own contains_any fetch, corroborated against ITS rows'
+                    # uuids. Chunked rows of one function collapse to a
+                    # single entity (the canonical chunk's def line), which
+                    # is what "one row per matched entity" always meant.
+                    def _hook_caller_items(terms, uuids, preloaded=None):
+                        resp = preloaded
+                        if resp is None:
+                            resp = coll.query.fetch_objects(
+                                filters=Filter.by_property("call_names").contains_any(
+                                    terms
+                                ),
+                                limit=CALLERS_FETCH_LIMIT,
+                                return_references=QueryReference(link_on="calls"),
+                            )
+                        group_confirmed = set()
+                        for obj in resp.objects:
+                            for ref in read_cross_reference(obj, "calls"):
+                                if str(getattr(ref, "uuid", "")) in uuids:
+                                    group_confirmed.add(
+                                        (obj.properties or {}).get("full_name") or ""
+                                    )
+                                    break
+                        ordered = sorted(
+                            _dedup_objects_by_full_name(resp.objects),
+                            key=lambda c: 0
+                            if ((c.properties or {}).get("full_name") in group_confirmed)
+                            else 1,
+                        )
+                        items = [
+                            {
+                                "full_name": (c.properties or {}).get("full_name") or "",
+                                "file": (c.properties or {}).get("file_path") or "",
+                                "line": (c.properties or {}).get("start_line"),
+                            }
+                            for c in ordered
                         ]
-                    entities = []
+                        if exclude_file:
+                            # §2.1 Edit row: self-file callers are context the
+                            # model already has (it is editing that file).
+                            items = [
+                                c for c in items
+                                if not _same_source_file(c.get("file") or "", exclude_file)
+                            ]
+                        return items
+
+                    target_terms = _caller_match_terms(target)
+                    groups: "dict[str, list]" = {}
                     for row in response.objects[:HOOK_FORMAT_MAX_ROWS]:
-                        p = row.properties or {}
+                        fn = (row.properties or {}).get("full_name") or target
+                        groups.setdefault(fn, []).append(row)
+                    entities = []
+                    for fn, fn_rows in groups.items():
+                        terms = _caller_match_terms(fn)
+                        if terms == target_terms:
+                            items = _hook_caller_items(
+                                terms, target_uuids, preloaded=caller_response)
+                        else:
+                            items = _hook_caller_items(
+                                terms, {str(r.uuid) for r in fn_rows})
+                        canonical = pick_canonical_chunk(fn_rows)
+                        p = (canonical.properties or {}) if canonical is not None else {}
                         entities.append({
-                            "full_name": p.get("full_name") or target,
+                            "full_name": fn,
                             "kind": "function",
                             "language": p.get("language") or "",
                             "file": p.get("file_path") or "",
                             "line": p.get("start_line"),
                             "rel": "callers",
-                            "callers": caller_items,
+                            "callers": items,
                         })
                     entities = filter_same_language(entities, target, source_file)
                     block = format_structure_hook_block(
@@ -1676,9 +1839,16 @@ class CodeGraphQuery:
             elif query_type == "methods":
                 # List class methods
                 coll = self.client.collections.get(self._coll("CodeClass"))
-                response = coll.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(target),
-                    limit=1
+                # v0.2.102 L5: exact-then-tolerant identity + the canonical
+                # chunk (the MCP's own selection) — the methods list lives on
+                # chunk 0, and a tokenized `limit=1` could hand back a
+                # sibling class or a non-canonical chunk.
+                methods_obj = pick_canonical_chunk(code_identity_rows(
+                    coll, "full_name", target, "",
+                    filter_cls=Filter, tolerant_limit=8,
+                ))
+                response = SimpleNamespace(
+                    objects=[methods_obj] if methods_obj is not None else []
                 )
 
                 if not response.objects:
@@ -1715,10 +1885,15 @@ class CodeGraphQuery:
             elif query_type == "extends":
                 # Find base classes
                 coll = self.client.collections.get(self._coll("CodeClass"))
-                response = coll.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(target),
-                    limit=1,
-                    return_references=QueryReference(link_on="extends")
+                # v0.2.102 L5: exact-then-tolerant identity + canonical chunk
+                # (the `extends` references live on chunk 0).
+                extends_obj = pick_canonical_chunk(code_identity_rows(
+                    coll, "full_name", target, "",
+                    filter_cls=Filter, tolerant_limit=8,
+                    return_references=QueryReference(link_on="extends"),
+                ))
+                response = SimpleNamespace(
+                    objects=[extends_obj] if extends_obj is not None else []
                 )
 
                 if not response.objects:
@@ -1768,10 +1943,11 @@ class CodeGraphQuery:
                 # Find outbound cross-service interactions for a function or module
                 interactions_coll = self.client.collections.get(self._coll("CodeInteraction"))
                 func_coll = self.client.collections.get(self._coll("CodeFunction"))
-                func_resp = func_coll.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(target),
-                    limit=1
-                )
+                # v0.2.102 L5: exact-then-tolerant identity (ONE shared home).
+                func_resp = SimpleNamespace(objects=code_identity_rows(
+                    func_coll, "full_name", target, "",
+                    filter_cls=Filter, tolerant_limit=1,
+                ))
                 # v0.2.46 V46-D: emit truncation signal (Pattern B). The
                 # `limit=50` is an intentional top-N cap, but previously
                 # the user had no way to know when the cap was hit.
@@ -1784,10 +1960,10 @@ class CodeGraphQuery:
                     )
                 else:
                     mod_coll = self.client.collections.get(self._coll("CodeModule"))
-                    mod_resp = mod_coll.query.fetch_objects(
-                        filters=Filter.by_property("path").equal(target),
-                        limit=1
-                    )
+                    mod_resp = SimpleNamespace(objects=code_identity_rows(
+                        mod_coll, "path", target, "",
+                        filter_cls=Filter, tolerant_limit=1,
+                    ))
                     if not mod_resp.objects:
                         if hook_format:
                             return
@@ -1920,15 +2096,11 @@ def format_structure_hook_block(
 def _same_source_file(a: str, b: str) -> bool:
     """Path identity for the --exclude-file filter: graph rows hold
     repo-relative POSIX paths while the hook passes whatever the Edit
-    tool_input carried (often absolute). Equal after normpath, or one is the
-    other's ``/``-separated suffix. Pure + hermetically testable."""
-    if not a or not b:
-        return False
-    na = os.path.normpath(a).replace(os.sep, "/")
-    nb = os.path.normpath(b).replace(os.sep, "/")
-    if na == nb:
-        return True
-    return na.endswith("/" + nb) or nb.endswith("/" + na)
+    tool_input carried (often absolute). Delegates to the ONE home
+    (``vco_lib.weaviate_exact_match.names_same_path``) — the same rule the
+    MCP's reverse-imports lookup confirms with (v0.2.102 L4). Pure +
+    hermetically testable."""
+    return names_same_path(a, b)
 
 
 def filter_same_language(
@@ -2155,6 +2327,13 @@ def main(argv=None):
             effective_project = None
     if not effective_project:
         effective_project = os.getenv("CODE_GRAPH_PROJECT") or os.getenv("PROJECT_NAME") or None
+
+    # The query embedding must be in the space THIS graph is indexed in.
+    global _embedding_codegraph_prefix, _cached_embedding_service
+    if effective_project != _embedding_codegraph_prefix:
+        if _cached_embedding_service is not None:
+            _cached_embedding_service.close()
+        _embedding_codegraph_prefix, _cached_embedding_service = effective_project, None
 
     # Create query interface
     querier = CodeGraphQuery(project=effective_project)

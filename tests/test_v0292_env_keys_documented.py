@@ -25,8 +25,10 @@ language — a mention of ``VCT_FOO`` in a comment does NOT count:
   - identifier reads: ``os.environ.get(CONST)`` / ``<any>.get(CONST)`` where
     ``CONST = "VCT_..."`` is a constant defined in the same file;
   - param-forwarding wrappers: a module-level ``def f(name, ...)`` whose body
-    reads ``os.environ.get(name)``, called as ``f("VCT_...")`` (the
-    ``_env_int("VCT_MODEL_GATEWAY_CATALOG_TTL", ...)`` shape).
+    reads ``os.environ.get(name)``, called as ``f("VCT_...")`` in the SAME
+    file;
+  - the shared reader ``vco_lib.env_values.env_int("VCT_...", ...)`` (or a
+    same-file constant), called from any file (``SHARED_READERS``).
 * **Shell** (``.sh``): ``$KEY`` / ``${KEY...}`` expansions after full-line
   ``#`` comments are stripped. ``export KEY=...`` (no ``$``) is a write and
   does not count; ``KEY="$OTHER"`` on the right-hand side IS a read of OTHER.
@@ -116,6 +118,16 @@ PY_IDENT = re.compile(
 PY_CONST = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[\"'](" + KEY + r")[\"']" + BOUNDARY, re.M,
 )
+#: Calls to the SHARED env readers in ``vco_lib`` (``vco_lib/env_values.py``):
+#: the per-file wrapper scan below cannot see a reader defined in another
+#: module, so the one home is named here. Literal key or same-file constant.
+SHARED_READERS = ("env_int", "env_float")
+PY_SHARED_LITERAL = re.compile(
+    r"\b(?:" + "|".join(SHARED_READERS) + r")\(\s*[\"'](" + KEY + r")[\"']" + BOUNDARY
+)
+PY_SHARED_IDENT = re.compile(
+    r"\b(?:" + "|".join(SHARED_READERS) + r")\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,"
+)
 #: ``def f(params...`` — no trailing ``:`` so ``-> Type`` annotations match.
 PY_FUNC = re.compile(r"^[ \t]*def\s+([A-Za-z_]\w*)\s*\(([^)]*)\)", re.M)
 FUNC_SPLIT = re.compile(r"(?=^[ \t]*def\s)", re.M)
@@ -163,11 +175,14 @@ def _scan_python_text(text: str, origin: str, reads: dict[str, set[str]]) -> Non
         key = next(g for g in match.groups() if g)
         reads.setdefault(key, set()).add(origin)
 
+    for match in PY_SHARED_LITERAL.finditer(text):
+        reads.setdefault(match.group(1), set()).add(origin)
+
     constants = {m.group(1): m.group(2) for m in PY_CONST.finditer(text)}
     if constants:
         identifiers = {
             m.group(1) or m.group(2) for m in PY_IDENT.finditer(text)
-        }
+        } | {m.group(1) for m in PY_SHARED_IDENT.finditer(text)}
         for identifier in identifiers & set(constants):
             reads.setdefault(constants[identifier], set()).add(origin)
 
@@ -187,6 +202,9 @@ def _scan_python_text(text: str, origin: str, reads: dict[str, set[str]]) -> Non
             m.group(1) or m.group(2)
             for m in PY_IDENT.finditer(block)
             if (m.group(1) or m.group(2)) in param_names
+        } | {  # a wrapper forwarding its param to a shared reader
+            m.group(1) for m in PY_SHARED_IDENT.finditer(block)
+            if m.group(1) in param_names
         }
         if not body_reads:
             continue
@@ -270,7 +288,6 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCT_ANALYZER_SCRIPT": "code-graph hooks hand the analyzer path to their child",
     "VCT_AUTO_RESTART_LAUNCHER": "post-install launcher relaunch loop guard",
     "VCT_COMPOSE_CMD": "container-hook plumbing (compose command handoff)",
-    "VCT_DIAGRAMS_ACCESS_LIST": "per-project access snapshot the launcher writes into .claude/env; the launcher GUI is the user surface",
     "VCT_FIELD": "hook-script -> embedded-python value channel (vct_project_config.sh)",
     "VCT_FORCE_RESTART_DEFERRAL": "install.py internal escape hatch (support tooling)",
     "VCT_INSTALL_ROOT": "install-root handoff consumed by venv resolution in bundled hooks",

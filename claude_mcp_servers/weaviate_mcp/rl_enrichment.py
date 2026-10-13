@@ -53,6 +53,7 @@ module-level binding is both sufficient and cheaper than 29 in-function imports.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
 import os
 from pathlib import Path
@@ -91,7 +92,8 @@ from vco_lib.kg_truncation_tags import (  # noqa: E402
 #     path the caller imported is the one the moved functions observe.
 import sys as _sys
 import types as _types
-import importlib as _importlib
+
+from . import kg_host as _kg_host  # noqa: E402 — stdlib-only resolver, no server import
 
 # Sibling ``server`` module name(s) to resolve, current package first. Two keys
 # exist when the package is imported under both path prefixes; prefer the one
@@ -124,21 +126,21 @@ class _LazyServerProxy(_types.ModuleType):
         # under a shared test runner ``__main__`` is pytest, and a loose
         # attribute check would resolve the pytest process for every subsequent
         # test once anything set that attr on it (an ordering-pollution trap).
-        _main = _sys.modules.get("__main__")
+        # (The strict check lives in ONE home, ``kg_host._bare_script_server``,
+        # shared with the light-host resolver.)
+        _main = _kg_host._bare_script_server()
         if _main is not None and _main is not self:
-            _mf = getattr(_main, "__file__", None) or ""
-            _mf = _mf.replace("\\", "/")
-            if _mf.endswith("weaviate_mcp/server.py") and hasattr(
-                _main, "_rl_client_instances"
-            ):
-                return _main
+            return _main
         for _name in _SERVER_MOD_NAMES:
             mod = _sys.modules.get(_name)
             if mod is not None and mod is not self:
                 return mod
-        # Not yet in sys.modules under any known key → import the canonical
-        # sibling (this module's own package first).
-        return _importlib.import_module(_SERVER_MOD_NAMES[0])
+        # No server module under any known key. v0.2.102 W6-M: that is the hook
+        # KG producer's process — answer with the LIGHT host
+        # (``kg_query_core``), which serves the KG/RL state itself and imports
+        # the server only for a name it does not carry. Pre-W6-M this imported
+        # ``server`` here (~0.7 s per hook run).
+        return _kg_host.host(__package__)
 
     def __getattr__(self, name):
         return getattr(self._live(), name)
@@ -164,9 +166,12 @@ def _rl_load_messages(transcript_path: "Path") -> list[dict]:
     parsed messages without re-reading or re-JSON-parsing a single byte. The
     monitor polls every ``_RL_MONITOR_POLL_INTERVAL`` and, pre-Concern-B, this
     re-parsed the whole (growing) transcript on EVERY poll — O(file × polls).
-    A cache HIT is byte-identical to a full re-parse (the file didn't change),
-    so the extracted answer window is unchanged; the drain uses the same shared
-    loader (mirror-don't-fork).
+    W6-MEM: a GROWN transcript costs only its appended bytes (incremental
+    parse), the messages are slimmed to the fields the answer-window consumers
+    read, and the monitor calls this from a worker thread
+    (``_rl_scan_candidate`` via ``_rl_scan_off_loop``). The extracted answer
+    window is unchanged; the drain uses the same shared loader
+    (mirror-don't-fork).
     """
     from claude_mcp_servers.rl_client.answer_window import load_messages_cached
     return load_messages_cached(transcript_path)
@@ -451,18 +456,25 @@ async def _rl_compute_and_write_citations(
 def _rl_force_flush_sentinel_path() -> "Path":
     """Resolve the V52-N compaction sentinel path relative to the project root.
 
-    Path is ``<CLAUDE_PROJECT_DIR>/.claude/state/rl_monitors_force_flush.flag``
-    with a fallback to ``_SERVER_INFERRED_BASE`` when the env var isn't
-    populated (CLI invocations + tests). The sentinel is created by
-    ``templates/hooks/pre-compact-save.{sh,ps1}`` immediately before
+    Path is ``<root>/.claude/state/rl_monitors_force_flush.flag``, the root
+    being :func:`vco_lib.project_root.resolve_project_root` —
+    ``CLAUDE_PROJECT_DIR``, else the nearest VCO project above the MCP's cwd —
+    and, only when neither names a project, ``_SERVER_INFERRED_BASE`` (the
+    install this module runs from; correct for the orchestrator root itself).
+    Pre-v0.2.102 the cwd rung was missing, so a non-root project whose MCP
+    lacked ``CLAUDE_PROJECT_DIR`` polled the ORCHESTRATOR's flag. The
+    sentinel is created by ``templates/hooks/pre-compact-save.{sh,ps1}``
+    (always handed ``CLAUDE_PROJECT_DIR`` by the harness) immediately before
     Claude Code compacts the context; this monitor polls for it on every
     iteration and, when present, fires with whatever it has accumulated
-    so far.
+    so far. This is a read + unlink of an existing flag, never a write that
+    could plant a stray ``.claude/``, so the install-root last resort stays.
     """
-    from pathlib import Path as _Path
-    base = os.environ.get("CLAUDE_PROJECT_DIR", "")
-    if base:
-        return _Path(base) / server._RL_MONITOR_FORCE_FLUSH_SENTINEL
+    from vco_lib.project_root import resolve_project_root
+
+    root = resolve_project_root()
+    if root is not None:
+        return root / server._RL_MONITOR_FORCE_FLUSH_SENTINEL
     return server._SERVER_INFERRED_BASE / server._RL_MONITOR_FORCE_FLUSH_SENTINEL
 
 def _rl_check_force_flush() -> bool:
@@ -517,27 +529,145 @@ def _rl_human_turn_after(messages: list[dict], start_msg_idx: int) -> bool:
                         return True
     return False
 
-def _rl_delete_own_pending_file(task_id: str) -> None:
-    """F-QUEUE: delete THIS retrieval's pending file when the MCP monitor fires.
+def _rl_claim_own_pending_file(
+    task_id: str, staged_path: "str | None",
+) -> "tuple[str, Path | None, Path | None]":
+    """F-QUEUE / v0.2.102 W6-FIN: claim THIS retrieval's pending file before
+    the monitor computes its citation.
 
-    The MCP path stages a pending file (as a backstop) AND keeps in-memory ctx;
-    when the monitor fires successfully it deletes its own file so the Stop-hook
-    drain only processes survivors (orphans = monitor never fired → drain
-    recovers them). Soft-fail — a missing file is the common, fine case.
+    The MCP path stages a pending file (the drain's backstop) AND keeps the
+    ctx in memory, so a Stop-hook drain that runs while the monitor computes
+    used to score the same citation a second time. The monitor now takes the
+    drains' own claim (``citation_pending.claim_task_pending`` — one claim
+    rule for all three consumers) and computes only while it holds it, or
+    when nothing was ever staged. Returns ``(state, claimed, pending_path)``
+    as documented there; on a soft failure of the lookup itself the state is
+    ``"unstaged"`` only when no path was staged, else ``"taken"`` — never a
+    second write.
     """
     try:
-        from claude_mcp_servers.rl_client.citation_pending import (
-            list_pending_for_session,
-            delete_pending,
-        )
-        # We don't know the session_id here, so match by the task_id suffix
-        # across all pending files for the project (list with empty session
-        # returns all). Cheap — the pending dir is tiny.
-        for p in list_pending_for_session(""):
-            if p.name.endswith(f"__{task_id}.json"):
-                delete_pending(p)
+        from claude_mcp_servers.rl_client.citation_pending import claim_task_pending
+
+        return claim_task_pending(task_id, staged_path=staged_path)
     except Exception as exc:  # noqa: BLE001
-        server.logger.debug("RL monitor: pending-file cleanup failed (%s)", exc)
+        server.logger.info("RL monitor %s: pending-file claim failed (%s)", task_id[:8], exc)
+        return ("taken", None, None) if staged_path else ("unstaged", None, None)
+
+
+def _rl_release_own_pending_file(
+    task_id: str, claimed: "Path | None", pending_path: "Path | None", landed: bool,
+) -> None:
+    """Leave path of a claim taken by :func:`_rl_claim_own_pending_file`: a
+    landed write consumes the file through the one finish rule every scorer
+    shares (``citation_pending.finish_scored``, which also consumes a
+    re-stage of the task that landed during the compute — review R7-1);
+    EVERY other outcome (no result, an error, a cancellation) renames it
+    back so the Stop-hook drain scores it. No-op without a claim. Never
+    raises."""
+    if claimed is None:
+        return
+    try:
+        from claude_mcp_servers.rl_client.citation_pending import (
+            delete_pending,
+            finish_scored,
+            release_claim,
+        )
+
+        if landed:
+            if pending_path is not None:
+                finish_scored(claimed, pending_path)
+            else:
+                delete_pending(claimed)
+        elif pending_path is not None:
+            release_claim(claimed, pending_path)
+    except Exception as exc:  # noqa: BLE001 — a stuck claim is re-adopted by the next drain
+        server.logger.info(
+            "RL monitor %s: could not hand the pending file back (%s); "
+            "the next Stop-hook drain re-adopts it", task_id[:8], exc,
+        )
+
+def _rl_scan_candidate(
+    candidate: "Path", query_snippet: str, pos_idx: int,
+) -> "tuple[str, bool, bool] | None":
+    """Load one candidate transcript and locate this retrieval's answer window.
+
+    The synchronous half of one monitor poll, run on the dedicated scan
+    executor (``_rl_scan_off_loop``) so neither the transcript parse nor the
+    O(messages) scans block the event loop (W6-MEM). Returns None when the query is not found in this transcript, else
+    ``(answer, complete, human_turn)`` — ``human_turn`` is whether a human turn
+    follows the search, evaluated only when it can matter (an incomplete,
+    non-empty window), exactly as the inline code it replaces did.
+    """
+    messages = server._rl_load_messages(candidate)
+    kg_positions = server._rl_find_kg_positions(messages)
+
+    # Find matching position by query fingerprint + seq tiebreak.
+    # v0.2.70 (S2): the matcher lives in rl_client.answer_window so the
+    # MCP monitor and the Stop-hook drain agree byte-for-byte on which
+    # answer window belongs to which retrieval (one home).
+    matched_pos = _match_position_for_query(
+        messages, kg_positions, query_snippet, pos_idx
+    )
+    if matched_pos is None:
+        return None
+
+    start_msg_idx, start_blk_idx = matched_pos
+    # Right transcript — check if answer is complete
+    answer, complete = server._rl_extract_answer_window(messages, start_msg_idx, start_blk_idx)
+    human_turn = False
+    if not complete and answer.strip():
+        human_turn = bool(server._rl_human_turn_after(messages, start_msg_idx))
+    return answer, complete, human_turn
+
+# W6-MEM R3: the monitor's transcript scans run on their OWN small executor,
+# never on the loop's default executor. A first parse of a GB-scale transcript
+# takes seconds; on the default executor (min(32, cpu+4) workers) dozens of
+# live monitors could fill it, and every ``asyncio.to_thread`` call in the
+# server (query embeddings for hybrid_search, ``embeddings.py``) would queue
+# behind them. Two workers: scans of two different transcripts proceed side by
+# side, and monitors beyond that wait for a scan slot instead of a tool call
+# waiting for them. Created lazily; its threads are ordinary (non-daemon)
+# executor workers, so a scan in progress is always allowed to finish — nothing
+# here cancels or abandons work.
+_RL_SCAN_WORKERS = 2
+_rl_scan_pool: "concurrent.futures.ThreadPoolExecutor | None" = None
+# path(str) -> [asyncio.Lock, users]. Monitors on the SAME transcript take
+# turns in the event loop (free) rather than each occupying a scan worker that
+# would then block on the transcript's cache lock; the last user removes the
+# entry. Touched only from the event-loop thread, so no thread lock is needed.
+_rl_scan_gates: "dict[str, list]" = {}
+
+
+def _rl_get_scan_pool() -> "concurrent.futures.ThreadPoolExecutor":
+    global _rl_scan_pool
+    if _rl_scan_pool is None:
+        _rl_scan_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_RL_SCAN_WORKERS, thread_name_prefix="vco-rl-scan",
+        )
+    return _rl_scan_pool
+
+
+async def _rl_scan_off_loop(
+    candidate: "Path", query_snippet: str, pos_idx: int,
+) -> "tuple[str, bool, bool] | None":
+    """Run ``_rl_scan_candidate`` on the dedicated scan executor, one scan per
+    transcript at a time (see ``_rl_scan_pool`` / ``_rl_scan_gates``)."""
+    key = str(candidate)
+    slot = _rl_scan_gates.get(key)
+    if slot is None:
+        slot = _rl_scan_gates[key] = [asyncio.Lock(), 0]
+    slot[1] += 1
+    try:
+        async with slot[0]:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                _rl_get_scan_pool(),
+                functools.partial(_rl_scan_candidate, candidate, query_snippet, pos_idx),
+            )
+    finally:
+        slot[1] -= 1
+        if slot[1] <= 0 and _rl_scan_gates.get(key) is slot:
+            del _rl_scan_gates[key]
 
 async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     """
@@ -552,7 +682,10 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
         less than the threshold) and deletes the sentinel so subsequent
         compactions re-arm.
       - Hard timeout ``_RL_MONITOR_TIMEOUT`` seconds (60 min safety valve,
-        raised from 10 min pre-V52-N).
+        raised from 10 min pre-V52-N). This is the MONITOR's own lifetime,
+        not a scoring deadline (v0.2.102 W6-RL2): a monitor that gives up
+        has taken no claim, so the staged pending file stays for the
+        Stop / SessionEnd drains, which score it when its chat ends.
 
     v0.2.70 (F-B): two lifecycle fixes:
       1. ``ctx`` is captured into THIS task's closure (``held_ctx``) on the
@@ -606,7 +739,9 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
 
         # F-B: snapshot the ctx into the closure as soon as it's available.
         # We do NOT pop here — the populate path manages the cache size; we
-        # only need a private reference that eviction can't strand.
+        # only need a private reference that eviction can't strand. W6-MEM:
+        # the reference held is the COMPACT entry (expanded only at fire), so
+        # a monitor polling for up to an hour pins ~1/8 of the old bytes.
         if held_ctx is None:
             _staged = server._rl_node_content_cache.get(task_id)
             if _staged is not None:
@@ -655,23 +790,15 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             _last_stat_sig = {str(c): _stat_sig(c) for c in candidates}
 
         for candidate in candidates:
-            messages = server._rl_load_messages(candidate)
-            kg_positions = server._rl_find_kg_positions(messages)
-
-            # Find matching position by query fingerprint + seq tiebreak.
-            # v0.2.70 (S2): the matcher lives in rl_client.answer_window so the
-            # MCP monitor and the Stop-hook drain agree byte-for-byte on which
-            # answer window belongs to which retrieval (one home).
-            matched_pos = _match_position_for_query(
-                messages, kg_positions, query_snippet, pos_idx
-            )
-
-            if matched_pos is None:
+            # W6-MEM: the transcript load (a parse of every new byte) and the
+            # O(messages) scans run in a worker thread — on a GB-scale
+            # transcript they take seconds, and inside the event loop they
+            # stalled every concurrent MCP tool call for that long. R3: on the
+            # dedicated scan executor, so they never fill the default one.
+            scanned = await _rl_scan_off_loop(candidate, query_snippet, pos_idx)
+            if scanned is None:
                 continue
-
-            start_msg_idx, start_blk_idx = matched_pos
-            # Right transcript — check if answer is complete
-            answer, complete = server._rl_extract_answer_window(messages, start_msg_idx, start_blk_idx)
+            answer, complete, human_turn = scanned
             fire_reason = "threshold" if complete else ""
             # V52-N: the sentinel forces fire even when the extractor returned
             # complete=False (i.e. we haven't accumulated enough yet but compaction
@@ -689,7 +816,7 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             # monitor fire promptly. Gated on the same token floor as the
             # threshold path so we don't fire on a noisy preamble.
             if not complete and answer.strip():
-                if server._rl_human_turn_after(messages, start_msg_idx):
+                if human_turn:
                     try:
                         from claude_mcp_servers.weaviate_mcp.chunking import TokenCounter
                         _tok = TokenCounter.count_tokens(answer)
@@ -733,12 +860,25 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                 # so a late fire is not stranded by LRU eviction. Fall back to
                 # the cache for the (rare) case the very first poll already had
                 # a complete answer. We still pop the cache to free the slot.
-                ctx = held_ctx or server._rl_node_content_cache.get(task_id)
+                #
+                # W6-MEM: the cache stores the ctx COMPACTED (vectors packed in
+                # ``array`` buffers); ``expand_ctx`` hands every consumer below
+                # — the citation compute, the ``ctx`` riders, the /rl_update
+                # payload — a plain-list copy with the identical values. A ctx
+                # that was never compacted (a plain-list entry) passes through.
+                from claude_mcp_servers.rl_client.ctx_compact import expand_ctx
+                ctx = expand_ctx(held_ctx or server._rl_node_content_cache.get(task_id))
+                # W6-FIN: the staged pending path rides in the in-memory entry
+                # only; take it out so no consumer below ever sees it.
+                from claude_mcp_servers.rl_client.citation_pending import (
+                    CTX_PENDING_PATH_KEY,
+                )
+                staged_path = ctx.pop(CTX_PENDING_PATH_KEY, None) if ctx is not None else None
                 server._rl_node_content_cache.pop(task_id, None)
-                # F-QUEUE: the MCP monitor deletes its OWN pending file on fire
-                # so the Stop-hook drain only processes survivors (no double
-                # write). Soft-fail — a missing file is fine.
-                server._rl_delete_own_pending_file(task_id)
+                # Keep the byte-bound size ledger (one home: rl_state) in step,
+                # so the next store need not reconcile it against the cache.
+                from claude_mcp_servers.weaviate_mcp import rl_state as _rl_state
+                _rl_state._rl_node_content_cache_sizes.pop(task_id, None)
                 # F-LOG: persist answer-window length + the fire reason so the
                 # "≥25k tokens" distribution and monitor lifecycle are auditable
                 # from stored data (pre-F-LOG both were un-observable).
@@ -754,26 +894,69 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                         # they existed only in the logger.info line above).
                         ctx["fire_reason"] = fire_reason
                         ctx["window_tokens"] = answer_token_count
-                        try:
-                            citation_result = await server._rl_compute_and_write_citations(
-                                task_id, answer, ctx,
+                        # v0.2.102 W6-FIN: CLAIM the pending file before the
+                        # compute — the same rename-claim both Stop-hook drains
+                        # take — so a drain running during this compute no
+                        # longer sees the file (and a drain already holding it
+                        # makes the monitor stand down). Pre-fix the monitor
+                        # computed, wrote, and only then deleted the file: a
+                        # drain in that window scored the citation twice.
+                        claim_state, claimed, pending_path = (
+                            server._rl_claim_own_pending_file(task_id, staged_path)
+                        )
+                        if claim_state == "taken":
+                            server.logger.info(
+                                "RL monitor %s: a Stop-hook drain holds or already "
+                                "scored this citation; not computing it again",
+                                task_id[:8],
                             )
-                        except Exception as exc:
-                            server.logger.debug(
-                                "RL monitor %s: citation write raised (%s); continuing",
-                                task_id[:8], exc,
-                            )
+                        else:
+                            try:
+                                citation_result = await server._rl_compute_and_write_citations(
+                                    task_id, answer, ctx,
+                                )
+                            except Exception as exc:
+                                server.logger.debug(
+                                    "RL monitor %s: citation write raised (%s); continuing",
+                                    task_id[:8], exc,
+                                )
+                            finally:
+                                # F-QUEUE (W3R-1): only a LANDED write consumes
+                                # the file; a failed/soft-failed write, an error
+                                # or a cancellation hands the claim back so the
+                                # drain retries it — never lost, never cancelled
+                                # by us.
+                                server._rl_release_own_pending_file(
+                                    task_id, claimed, pending_path,
+                                    landed=citation_result is not None,
+                                )
+                            if citation_result is None:
+                                server.logger.info(
+                                    "RL monitor %s: citation write did not land; "
+                                    "pending file (if staged) left for the Stop-hook drain",
+                                    task_id[:8],
+                                )
                     else:
                         # F-B observability: ctx genuinely unavailable (never
                         # staged) — make the skip visible instead of silent.
+                        # The pending file is KEPT (W3R-1), so the drain can
+                        # still anchor the answer by timestamp (G5) — this
+                        # "deferred to the drain" line is literally true.
                         server.logger.info(
                             "RL monitor %s: gate met but ctx unavailable; "
                             "citation deferred to Stop-hook drain",
                             task_id[:8],
                         )
                 else:
-                    server.logger.debug(
-                        "RL monitor %s: answer too short (%d tokens < %d); skip citation",
+                    # W3R-1: a sub-gate fire (force_flush on a short window)
+                    # KEEPS the pending file: the Stop-hook drain re-anchors
+                    # the answer by timestamp and applies its own floors
+                    # (25k / terminal_floor / soft_terminal), so the retrieval
+                    # is labeled at session end instead of never. INFO, not
+                    # DEBUG — this used to be the silent-loss path.
+                    server.logger.info(
+                        "RL monitor %s: answer below citation gate (%d tokens < %d); "
+                        "pending file left for the Stop-hook drain",
                         task_id[:8], answer_token_count, server._RL_MIN_ANSWER_TOKENS_FOR_CITATION,
                     )
 
@@ -1195,7 +1378,14 @@ def _resolve_code_embedding_triple(
     except Exception:  # noqa: BLE001
         pass
     if not code_model:
-        code_model = os.getenv("CODE_EMBED_MODEL", "") or code_source
+        # v0.2.102 W6-B2: the ONE code-model resolver, not a raw env read.
+        try:
+            from vco_lib.code_embed_model import resolve_code_model
+            code_model = resolve_code_model(
+                codegraph_prefix=getattr(server, "CODE_GRAPH_PROJECT", None) or None).model
+        except Exception:  # noqa: BLE001 — a label; never blocks an emit
+            code_model = ""
+        code_model = code_model or code_source
     return code_source, code_dim, code_model
 
 def _emit_code_structure_telemetry(
@@ -1377,20 +1567,16 @@ def _rl_code_recover_budget() -> "tuple[int, float]":
     """Resolve (max_nodes, deadline_seconds) for the recovery loop from env,
     falling back to conservative defaults. Malformed env values fall back
     silently (a bad tunable must never widen the budget or crash the emit)."""
-    try:
-        max_nodes = int(os.environ.get(_RL_CODE_RECOVER_MAX_ENV, "") or _RL_CODE_RECOVER_MAX_DEFAULT)
-    except (TypeError, ValueError):
-        max_nodes = _RL_CODE_RECOVER_MAX_DEFAULT
-    try:
-        deadline = float(
-            os.environ.get(_RL_CODE_RECOVER_DEADLINE_ENV, "") or _RL_CODE_RECOVER_DEADLINE_DEFAULT_S
-        )
-    except (TypeError, ValueError):
-        deadline = _RL_CODE_RECOVER_DEADLINE_DEFAULT_S
+    from vco_lib.env_values import env_float, env_int  # noqa: PLC0415
+
+    # A negative count is clamped to 0 (= never recover), as before.
+    max_nodes = env_int(_RL_CODE_RECOVER_MAX_ENV, _RL_CODE_RECOVER_MAX_DEFAULT,
+                        minimum=0, clamp=True)
+    deadline = env_float(_RL_CODE_RECOVER_DEADLINE_ENV, _RL_CODE_RECOVER_DEADLINE_DEFAULT_S)
     # Clamp to sane floors so a zero/negative tunable can't disable the recovery
     # unintentionally (0 max = never recover; but a negative deadline must not
     # loop forever — treat <=0 as "no deadline gate", the count gate still bounds).
-    return max(0, max_nodes), deadline
+    return max_nodes, deadline
 
 
 def _rl_recover_code_node_vectors(nodes: list[dict], survivors: list[dict]) -> int:
@@ -1738,7 +1924,7 @@ def _stage_code_citation_pending(
 
     No-op (returns None) when no node carries ``n_emb`` — a ctx without
     vectors can never produce a citation, so staging it would only feed the
-    TTL sweep. Soft-fail throughout; returns the staged path or None.
+    unscored ledger. Soft-fail throughout; returns the staged path or None.
     """
     if not any(isinstance(n, dict) and n.get("n_emb") for n in nodes):
         return None
@@ -1785,6 +1971,247 @@ def _stage_code_citation_pending(
     except Exception as exc:  # noqa: BLE001 — staging never breaks search
         server.logger.debug("_stage_code_citation_pending failed (%s)", exc)
         return None
+
+# ---------------------------------------------------------------------------
+# W3R-9 (v0.2.102): the telemetry writer's project identity must be STABLE.
+#
+# Pre-fix, a transient hub-config miss in the long-lived MCP process made
+# ``_get_rl_telemetry_writer_for`` fall back to the env display name with
+# ``project_id=None`` — and the writer cache then PINNED that identity for
+# the rest of the process. Live rows showed the split: a project's DISPLAY
+# name (project_id NULL) beside its SLUG (project_id set), written by the
+# same install on the same days. Those rows are stranded from every
+# project_id-keyed cohort partition.
+#
+# The fix, in precedence order (no silent identity change — each fallback is
+# logged):
+#   1. hub-resolved config (unchanged), which is ALSO remembered — in this
+#     process and on disk keyed by project root;
+#   2. the LAST RESOLVED identity for the SAME project root (this process
+#     first, then the cross-process cache) — an MCP process serves exactly
+#     one project, so a transient miss must stamp what a resolved call would,
+#     and a process that serves several roots never stamps ANOTHER root's
+#     identity (the in-process memory is keyed by root, like the disk cache);
+#   3. the env display-name fallback (unchanged), now logged at WARNING once
+#     per process because it stamps project_id=NULL.
+#
+# A stale cached ``project_id`` whose project row was deleted fails the
+# rl_events FK at insert time; the hub answers 422 ``unknown_project_id`` and
+# the writer side DROPS that cached identity (in-process, on disk, and the
+# writer cache) and re-resolves on the next emit, so a deleted-and-
+# re-registered project does not lose events for the rest of the TTL
+# (batch-8 review follow-up). The TTL bounds only the case where the hub
+# never answers at all; the entry is refreshed on every successful resolve.
+#
+# Hermeticity: the whole mechanism is OFF when ``VCT_DISABLE_HUB_RESOLVER``
+# is set — the same flag that makes ``_try_resolve_project_config`` return
+# None for test fixtures. That flag's contract is "pure env-fallback
+# behavior", and a remembered hub identity would break it (a cache entry
+# written by one test would steer every later test resolving under the same
+# project root in the shared session state dir).
+_LAST_GOOD_BY_ROOT: "dict[str, dict]" = {}
+_IDENTITY_FALLBACK_WARNED = False
+_IDENTITY_CACHE_NAME = "rl_project_identity_cache.json"
+IDENTITY_CACHE_TTL_ENV = "VCO_RL_IDENTITY_CACHE_TTL_S"
+_IDENTITY_CACHE_TTL_DEFAULT_S = 30.0 * 86400.0
+
+
+def _identity_cache_disabled() -> bool:
+    return bool(os.environ.get("VCT_DISABLE_HUB_RESOLVER"))
+
+
+def _identity_cache_ttl_s() -> float:
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    return env_float(IDENTITY_CACHE_TTL_ENV, _IDENTITY_CACHE_TTL_DEFAULT_S)
+
+
+def _identity_cache_path():
+    """``<vct_root>/rl_project_identity_cache.json`` (machine-level state)."""
+    from vco_lib.paths import vct_root_dir
+
+    return vct_root_dir() / _IDENTITY_CACHE_NAME
+
+
+def _identity_from_cfg(cfg) -> dict:
+    """Project tag + id from a resolved ProjectConfig, in the canonical order
+    (slug → code-graph project → display name)."""
+    return {
+        "project": (
+            getattr(cfg, "project_slug", "")
+            or getattr(cfg, "code_graph_project", "")
+            or getattr(cfg, "project_display_name", "")
+            or ""
+        ),
+        "project_id": getattr(cfg, "project_id", None),
+    }
+
+
+def _remember_project_identity(cfg) -> None:
+    """Remember a hub-resolved identity in-process AND on disk (keyed by the
+    project root), so a later transient resolve miss — in this process or a
+    future hook/CLI process — reuses it instead of splitting the cohort.
+    Best-effort; never raises."""
+    import json as _json
+    import time as _time
+
+    if _identity_cache_disabled():
+        return
+    ident = _identity_from_cfg(cfg)
+    if not ident["project"]:
+        return
+    try:
+        root, _kind = server._resolution_context()
+    except Exception:  # noqa: BLE001 — no root, no key; nothing to key the memory by
+        return
+    key = str(root)
+    if _LAST_GOOD_BY_ROOT.get(key) == ident:
+        return  # already remembered this identity for this root in this process
+    _LAST_GOOD_BY_ROOT[key] = ident
+    try:
+        from vco_lib.atomic import atomic_write_json, exclusive_file_lock
+
+        path = _identity_cache_path()
+        with exclusive_file_lock(path.with_name(path.name + ".lock"), timeout_s=1.0):
+            state: dict = {}
+            try:
+                raw = _json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    state = raw
+            except (OSError, ValueError):
+                state = {}
+            state.setdefault("roots", {})[key] = {
+                **ident,
+                "ts_ms": int(_time.time() * 1000),
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(path, state)
+    except Exception as exc:  # noqa: BLE001 — the cache is a hint, never a failure
+        server.logger.debug("RL identity cache write failed (%s)", exc)
+
+
+def _cached_project_identity() -> "dict | None":
+    """The last RESOLVED identity for THIS project root — this process first,
+    then the cross-process cache — or None. Freshness-bounded by
+    ``VCO_RL_IDENTITY_CACHE_TTL_S`` (default 30 days)."""
+    import json as _json
+    import time as _time
+
+    if _identity_cache_disabled():
+        return None
+    try:
+        root, _kind = server._resolution_context()
+    except Exception:  # noqa: BLE001
+        return None
+    key = str(root)
+    in_process = _LAST_GOOD_BY_ROOT.get(key)
+    if in_process is not None:
+        return in_process
+    try:
+        entry = (
+            _json.loads(_identity_cache_path().read_text(encoding="utf-8"))
+            .get("roots", {})
+            .get(key)
+        )
+        if not isinstance(entry, dict) or not entry.get("project"):
+            return None
+        ts_ms = entry.get("ts_ms")
+        if not isinstance(ts_ms, (int, float)):
+            return None
+        age_s = _time.time() - float(ts_ms) / 1000.0
+        if age_s > _identity_cache_ttl_s():
+            return None
+        ident = {"project": entry["project"], "project_id": entry.get("project_id")}
+        _LAST_GOOD_BY_ROOT[key] = ident
+        server.logger.info(
+            "RL telemetry: hub config unresolved; reusing the last resolved "
+            "project identity for this root (project=%r, %.0f h old) — set "
+            "%s to tune the freshness bound",
+            ident["project"], age_s / 3600.0, IDENTITY_CACHE_TTL_ENV,
+        )
+        return ident
+    except Exception:  # noqa: BLE001 — no cache, no identity
+        return None
+
+
+def invalidate_project_identity(project_id: str) -> None:
+    """Drop every cached writer identity carrying ``project_id`` (batch-8
+    review follow-up to W3R-9).
+
+    Called by ``rl_client.hub_writer`` when the hub REJECTS an event with 422
+    ``unknown_project_id`` — the rl_events FK fired, so the cached id's
+    project row is gone (project deleted / re-registered). The stale identity
+    is removed from all three caches (in-process last-good, the on-disk cache,
+    the writer cache), so the NEXT emit re-resolves the project config from
+    the hub — which is up, it just answered — and stamps the fresh identity
+    instead of losing events for the rest of the cache TTL. Never raises.
+    """
+    if not project_id:
+        return
+    # ``server`` goes through the lazy proxy — attribute access IMPORTS the
+    # whole server module when none is loaded. In a light hook/child process
+    # that is a heavy side effect on a telemetry failure path, and with no
+    # server loaded there is no writer cache to evict anyway — so resolve the
+    # loaded-check ONCE, up front, and gate every ``server.`` touch on it.
+    _main_file = (getattr(_sys.modules.get("__main__"), "__file__", "") or "").replace(
+        "\\", "/"
+    )
+    _server_loaded = _main_file.endswith("weaviate_mcp/server.py") or any(
+        name in _sys.modules for name in _SERVER_MOD_NAMES
+    )
+    try:
+        doomed_roots = [
+            root for root, ident in _LAST_GOOD_BY_ROOT.items()
+            if ident.get("project_id") == project_id
+        ]
+        for root in doomed_roots:
+            _LAST_GOOD_BY_ROOT.pop(root, None)
+        if _server_loaded:
+            doomed_keys = [
+                key for key, w in server._rl_telemetry_writers.items()
+                if getattr(w, "_project_id", None) == project_id
+            ]
+            for key in doomed_keys:
+                server._rl_telemetry_writers.pop(key, None)
+        import json as _json
+
+        from vco_lib.atomic import atomic_write_json, exclusive_file_lock
+
+        path = _identity_cache_path()
+        if path.exists():
+            with exclusive_file_lock(path.with_name(path.name + ".lock"), timeout_s=1.0):
+                try:
+                    state = _json.loads(path.read_text(encoding="utf-8"))
+                    if not isinstance(state, dict):
+                        state = {}
+                except (OSError, ValueError):
+                    state = {}
+                roots = state.get("roots") or {}
+                for root in [r for r, e in roots.items()
+                             if isinstance(e, dict) and e.get("project_id") == project_id]:
+                    roots.pop(root, None)
+                atomic_write_json(path, state)
+        if _server_loaded:
+            _log = server.logger
+        else:
+            import logging as _logging
+
+            _log = _logging.getLogger(__name__)
+        _log.warning(
+            "RL telemetry: hub rejected project_id=%r as unknown (project "
+            "deleted or re-registered) — dropped the cached identity; the "
+            "next event re-resolves the project config",
+            project_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — invalidation must never break a write path
+        _log = server.logger if _server_loaded else None
+        if _log is None:
+            import logging as _logging
+
+            _log = _logging.getLogger(__name__)
+        _log.debug("RL identity invalidation failed (%s)", exc)
+
+
 
 def _get_rl_telemetry_writer_for(
     embedding_source: str,
@@ -1850,14 +2277,28 @@ def _get_rl_telemetry_writer_for(
     # uses as the cohort key — so cohort analysis at training time can
     # join cleanly.
     project = ""
+    project_id = None
     _cfg_for_telemetry = server._try_resolve_project_config()
     if _cfg_for_telemetry is not None:
+        # W3R-9: a successful resolve is remembered (in-process + on disk) so
+        # a later TRANSIENT miss reuses this exact identity instead of
+        # stamping the env display name with project_id=NULL.
+        _remember_project_identity(_cfg_for_telemetry)
         project = (
             _cfg_for_telemetry.project_slug
             or _cfg_for_telemetry.code_graph_project
             or _cfg_for_telemetry.project_display_name
             or ""
         )
+        project_id = _cfg_for_telemetry.project_id
+    else:
+        # W3R-9: transient hub-config miss — reuse the LAST RESOLVED identity
+        # for this project root (an MCP process serves exactly one project),
+        # never a different one.
+        _ident = _cached_project_identity()
+        if _ident is not None:
+            project = _ident["project"]
+            project_id = _ident.get("project_id")
     if not project:
         # Env-fallback path also canonicalizes via sanitize_for_weaviate_class
         # so multi-workspace setups (same project opened with different env
@@ -1869,6 +2310,18 @@ def _get_rl_telemetry_writer_for(
                 project = sanitize_for_weaviate_class(raw_name)
             except Exception:
                 project = raw_name
+        if project:
+            # W3R-9: this fallback stamps project_id=NULL — visible, not silent.
+            global _IDENTITY_FALLBACK_WARNED
+            if not _IDENTITY_FALLBACK_WARNED:
+                _IDENTITY_FALLBACK_WARNED = True
+                server.logger.warning(
+                    "RL telemetry writer: hub project config unresolved and no "
+                    "remembered identity for this project root — events will be "
+                    "stamped project=%r with project_id=NULL until the hub "
+                    "resolves (they will not join the project_id cohort)",
+                    project,
+                )
 
     # ---- look up / construct the writer for this key ----
     key = (project, emb_source)
@@ -1881,11 +2334,7 @@ def _get_rl_telemetry_writer_for(
     # docstring for the pre-v0.2.52 baseline).
     writer = RLTelemetryWriter(
         project=project,
-        project_id=(
-            _cfg_for_telemetry.project_id
-            if _cfg_for_telemetry is not None
-            else None
-        ),
+        project_id=project_id,
         embedding_source=emb_source,
         embedding_dim=emb_dim,
         embedding_model=emb_model,
@@ -1963,9 +2412,14 @@ def _reset_rl_telemetry_writers() -> None:
     JSONL on every write via context manager — so clearing the dict is
     sufficient teardown. This helper exists so test fixtures can isolate
     state between tests and so any future shutdown hook has a single
-    canonical reset path.
+    canonical reset path. Also clears the W3R-9 remembered project identity
+    (in-process last-good + the fallback-warning latch) so tests can
+    re-exercise the resolve-miss paths.
     """
+    global _IDENTITY_FALLBACK_WARNED, _LAST_GOOD_BY_ROOT
     server._rl_telemetry_writers.clear()
+    _LAST_GOOD_BY_ROOT.clear()
+    _IDENTITY_FALLBACK_WARNED = False
 
 def _rl_pack_linked_embs_for_node(
     node: dict,
@@ -2618,10 +3072,9 @@ def _rl_enrichment_gate_open() -> bool:
     global _rl_enrich_gate_cache
     import time as _time
 
-    try:
-        ttl = float(os.environ.get(_RL_ENRICH_GATE_TTL_ENV, "") or _RL_ENRICH_GATE_DEFAULT_TTL_S)
-    except (TypeError, ValueError):
-        ttl = _RL_ENRICH_GATE_DEFAULT_TTL_S
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    ttl = env_float(_RL_ENRICH_GATE_TTL_ENV, _RL_ENRICH_GATE_DEFAULT_TTL_S)
     now = _time.monotonic()
     cached = _rl_enrich_gate_cache
     if cached is not None and (now - cached[1]) < ttl:
@@ -2760,9 +3213,12 @@ def _rl_enrich_nodes_with_linked_embs(
 
         coll_resolver = _default_coll_resolver
 
-    # Import Filter lazily; the search path already does this elsewhere.
+    # The filter builder of the live host (v0.2.102 W6-M): weaviate-client's
+    # ``Filter`` inside the MCP, the plain-HTTP adapter's in the hook producer
+    # (whose collection handles come from ``kg_http``) — never a weaviate
+    # import on the hook path.
     try:
-        from weaviate.classes.query import Filter  # type: ignore
+        Filter = server.Filter
     except Exception as exc:
         server.logger.debug("RL enrich: Filter import failed (%s); skipping", exc)
         return

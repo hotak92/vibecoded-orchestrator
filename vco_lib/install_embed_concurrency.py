@@ -55,6 +55,9 @@ def finalize_embed_config_for_host(
     """
     gpu_vendor = getattr(sysinfo, "gpu_vendor", "") or ""
     config["gpu_vendor"] = gpu_vendor
+    # v0.2.102 W6-B2: the code_embed stack decision needs the host's GPU
+    # verdict (compose_env.code_embed_container_in_stack).
+    config["has_gpu"] = bool(getattr(sysinfo, "has_gpu", False))
     try:
         budget = resolve_concurrency_for_config(
             code_backend=str(config.get("code_model") or ""),

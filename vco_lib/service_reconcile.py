@@ -350,21 +350,17 @@ def _env_statements(env: Mapping[str, str]) -> list[Statement]:
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
-    out: dict[str, str] = {}
+    """Every assignment in the sourced ``path`` (``.claude/env``), LAST one
+    per key winning — what a shell holds after ``source``. The parse is the
+    ONE line grammar (:func:`vco_lib.envfile.parse_env_lines`); this was a
+    private copy of it until v0.2.102."""
+    from vco_lib.envfile import parse_env_lines
+
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
-        return out
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        key, sep, value = line.partition("=")
-        if sep:
-            out[key.strip()] = value.strip().strip("'\"")
-    return out
+    except (OSError, ValueError):  # ValueError: a non-UTF-8 file
+        return {}
+    return dict(parse_env_lines(text))
 
 
 def _continuity(orchestrator_root: Path) -> dict[str, Statement]:
@@ -1402,9 +1398,15 @@ def reconcile(
         detection = _det.detect(runtime=runtime, installer_project=installer_project,
                                 extra_endpoints=extra, run=run, fetch=fetch, tcp_open=tcp_open)
     result.detection = detection
+    if getattr(detection, "refused", None):
+        # Review A1: no candidate is offered while the declarations are
+        # unreadable — say so in the run's output, never silently.
+        result.lines.append(f"  ! service detection offered nothing: {detection.refused}")
 
     taken = {c.port for s in SERVICES for c in detection.for_service(s) if c.port}
     taken |= {port for c in detection.containers for port in c.host_ports.values()}
+    # v0.2.102 W5-A (M3): a declared project's ports are never VCO's to take.
+    taken |= set(getattr(detection, "reserved_ports", ()) or ())
     for service in SERVICES:
         others = {r.port for s, r in result.rows.items() if s != service}
         others |= {r.grpc_port for r in result.rows.values() if r.grpc_port}
@@ -2360,6 +2362,8 @@ def cli(verb: str, args: argparse.Namespace) -> int:
     db = getattr(args, "db_path", None)
     if verb == "candidates":
         det = _det.detect(runtime=_runtime(), services=(args.service,) if args.service else SERVICES)
+        if det.refused:
+            print(f"service detection offered nothing: {det.refused}", file=sys.stderr)
         if args.json:
             print(json.dumps({"schema": 1, "candidates": det.to_json()}, indent=2, sort_keys=True))
             return 0

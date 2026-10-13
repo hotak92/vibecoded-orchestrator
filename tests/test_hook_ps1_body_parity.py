@@ -154,8 +154,8 @@ def test_pre_edit_context_inject_ps1_has_dedup_filter() -> None:
         "seen-store filter — session-level dedup would otherwise break."
     )
     lib = _read("_lib/seen-store", ".ps1")
-    assert "(KG|CODE):" in lib, (
-        "seen-store.ps1 missing the (KG|CODE): header regex — hook-format "
+    assert "(KG|CODE|NOTE):" in lib, (
+        "seen-store.ps1 missing the (KG|CODE|NOTE): header regex — hook-format "
         "dedup won't match producer output."
     )
 
@@ -170,7 +170,8 @@ def test_pre_edit_context_inject_ps1_caches_raw_pre_dedup() -> None:
     what lands in $CacheFile; the old $KgRaw/$CodeRaw reassembly died with
     the wrapper-side producer calls."""
     body = _read("pre-edit-context-inject", ".ps1")
-    assert "Set-Content -LiteralPath $CacheFile -Value $Inject" in body, (
+    # v0.2.102 W6-R5FIX (R5-8): written through the BOM-free helper.
+    assert "Set-VcoUtf8Content -Path $CacheFile -Value $Inject" in body, (
         "pre-edit-context-inject.ps1 must cache the RAW router output — "
         "replays won't apply current dedup state otherwise."
     )

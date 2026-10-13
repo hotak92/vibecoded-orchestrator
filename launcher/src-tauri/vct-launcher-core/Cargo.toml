@@ -76,9 +76,11 @@ regex = "1"
 hex = "0.4"
 
 # v0.2.54 Track I: OS CSPRNG for per-boot bearer tokens
-# (services::boot_token — shared by vct-hub's hub.token and the
-# launcher's diagrams.token surfaces). Feature set matches the
-# workspace siblings' rand declarations.
+# (services::boot_token — used by vct-hub's hub.token surface; the
+# second historical consumer, the diagrams editor server's
+# diagrams.token, was deleted with the diagrams integrations in
+# v0.2.102). Feature set matches the workspace siblings' rand
+# declarations.
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
 
 # Platform hostname
@@ -163,6 +165,13 @@ libc = "0.2"
 # `cfg(target_os = "linux")` gate (macOS uses apple-native; see DEFERRALS D4).
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus-secret-service = "4.1"
+# v0.2.102: the plain `dbus` crate dbus-secret-service is built on (already
+# resolved at 0.9.10 in the lockfile, so no new code is compiled), used
+# directly for ONE read-only session-bus question — is `org.freedesktop.secrets`
+# owned or activatable? — which decides "does this host have a keychain
+# backend at all" without contacting the Secret Service or writing anything
+# (`secrets::keychain_backend_available`).
+dbus = "0.9"
 
 # Windows-specific (pid_is_alive uses OpenProcess + CloseHandle)
 # v0.2.49: `winreg` reads HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid

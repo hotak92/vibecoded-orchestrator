@@ -64,9 +64,10 @@ separators). Two commands are the same hook when they invoke the same
 (:func:`vco_lib.hook_retirements.vco_hook_script_identity` — the identity the
 supersede pass already uses), or, for an inline command, when they are equal
 after :func:`vco_lib.hook_retirements.normalize_command` (which strips that
-guard prefix). The matcher must match too, because the template ships some
-scripts under several matchers in one event (``pre-diagram-path-validation.sh``
-under ``Write|Edit`` and the diagram MCP matchers; until v0.2.101 also
+guard prefix). The matcher must match too, because the template HAS
+SHIPPED some scripts under several matchers in one event (until v0.2.102
+``pre-diagram-path-validation.sh`` under ``Write|Edit`` and the diagram
+MCP matchers, retired with the diagrams integrations; until v0.2.101 also
 ``kg-summary-generator.sh`` under ``Edit``, ``Write`` and a store tool — those
 three async registrations merged into the ``post-tool-use-async`` dispatcher)
 and disabling one of them must not keep
@@ -105,13 +106,16 @@ __all__ = [
     "KEPT_OUT_PARKED",
     "KEPT_OUT_UNREADABLE",
     "ParkedHook",
+    "carried_registrations",
     "ParkedHooksState",
     "find_parked_match",
+    "live_hook_identities",
     "read_parked_hooks",
     "CONFLICT_CID",
     "conflict_still_present",
     "emit_conflict_deferral",
     "find_live_conflicts",
+    "main",
     "report_parked_hooks",
     "same_hook_command",
 ]
@@ -185,6 +189,8 @@ def find_parked_match(
     matcher: str,
     command: str,
     template_groups: Iterable[Any],
+    *,
+    live_identities: Optional[Iterable[str]] = None,
 ) -> Optional[ParkedHook]:
     """The parked row that covers the template registration
     ``(event, matcher, command)``, or ``None``.
@@ -192,12 +198,25 @@ def find_parked_match(
     ``template_groups`` is the template's group list for ``event``; it is only
     consulted when no row matches on the matcher, to decide whether a drifted
     matcher is unambiguous (see the module docstring).
+
+    ``live_identities`` (v0.2.102, review R9 F3 — a disable CARRIES to the
+    events a hook newly ships on): the ``.claude/hooks/<name>`` script
+    identities the user's settings.json registers on ANY event before the
+    merge. When no row is parked under ``event`` itself, a row parked under
+    ANOTHER event for the same script identity covers this registration —
+    provided that identity runs on no event at all in the user's file. That
+    is a hook the user switched off everywhere it ran; an upgrade that ships
+    it on a new event (``stop-drain-citations`` gaining ``SubagentStop`` and
+    ``SessionEnd``) must not switch it partly back on. A hook still running
+    on some event was turned off on ONE event only, so the new event is
+    added as before. Script identity only: an inline command has no identity
+    and never carries. ``None`` (the default) is the event-scoped rule alone.
     """
     candidates = [
         p for p in parked if p.event == event and same_hook_command(p.command, command)
     ]
     if not candidates:
-        return None
+        return _carried_parked_match(parked, command, live_identities)
     for p in candidates:
         if p.matcher == matcher:
             return p
@@ -207,6 +226,128 @@ def find_parked_match(
     # The template ships this hook under ONE matcher, so a parked row under a
     # matcher it no longer uses can only mean this registration.
     return candidates[0]
+
+
+def _carried_parked_match(
+    parked: Sequence[ParkedHook],
+    command: str,
+    live_identities: Optional[Iterable[str]],
+) -> Optional[ParkedHook]:
+    """The row parked under another event that carries its disable to
+    ``command`` (see :func:`find_parked_match`, ``live_identities``)."""
+    if live_identities is None:
+        return None
+    ident = vco_hook_script_identity(command)
+    if ident is None or ident in set(live_identities):
+        return None
+    for p in parked:
+        if vco_hook_script_identity(p.command) == ident:
+            return p
+    return None
+
+
+def live_hook_identities(hooks_block: Any) -> set[str]:
+    """Every ``.claude/hooks/<name>`` script identity a settings.json
+    ``hooks`` block registers, on any event — the ``live_identities`` input
+    of :func:`find_parked_match`. Malformed shapes contribute nothing."""
+    live: set[str] = set()
+    if not isinstance(hooks_block, dict):
+        return live
+    for groups in hooks_block.values():
+        for group in groups if isinstance(groups, list) else []:
+            inner = group.get("hooks") if isinstance(group, dict) else None
+            for item in inner if isinstance(inner, list) else []:
+                cmd = item.get("command") if isinstance(item, dict) else None
+                ident = vco_hook_script_identity(cmd) if isinstance(cmd, str) and cmd else None
+                if ident:
+                    live.add(ident)
+    return live
+
+
+def carried_registrations(
+    user_hooks: Any, template_hooks: Any, parked: Sequence[ParkedHook],
+) -> list[dict]:
+    """The shipped registrations a disable CARRIES to (review R9 F3), each
+    with the parked entry that lets the launcher list it as its own Disabled
+    row and restore it on its own (v0.2.102, lane W6-HTAB).
+
+    The decision is NOT re-implemented here: it is the bundle merge's own
+    (:func:`vco_lib.settings_merge.merge_hooks_block` with ``parked`` — the
+    one place :func:`find_parked_match` runs with ``live_identities``). The
+    merge's output is discarded; its kept-out records that name
+    ``carried_from_event`` ARE the answer, so "what the update keeps out by
+    carry" and "what the tab lists as newly disabled" are one set by
+    construction. Once the launcher writes the rows, the next call finds a
+    row parked under the event itself (event-scoped, not carried) and
+    returns nothing for it — idempotent.
+
+    One record per ``(event, matcher, command)``: ``carried_from_event``,
+    ``parked_command`` (the parked row whose disable carries),
+    ``timeout_seconds`` (the template's, or ``None``) and ``parked_json``
+    (:func:`vco_lib.hooks_settings.parked_entry_for_registration`,
+    serialised once here so the launcher stores these exact bytes).
+    """
+    # Lazy: settings_merge imports this module.
+    import json
+
+    from vco_lib.hooks_settings import parked_entry_for_registration
+    from vco_lib.settings_merge import merge_hooks_block
+
+    if not isinstance(template_hooks, dict) or not parked:
+        return []
+    kept: list[dict] = []
+    merge_hooks_block(
+        user_hooks if isinstance(user_hooks, dict) else {}, template_hooks,
+        parked=ParkedHooksState(readable=True, hooks=tuple(parked), source="caller"),
+        kept_out=kept,
+    )
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for rec in kept:
+        if rec.get("reason") != KEPT_OUT_PARKED or not rec.get("carried_from_event"):
+            continue
+        key = (rec["event"], rec["matcher"], rec["command"])
+        if key in seen:
+            continue
+        seen.add(key)
+        located = _template_registration(template_hooks, *key)
+        if located is None:
+            continue
+        group, items = located
+        timeout = items[0].get("timeout")
+        out.append({
+            "event": key[0],
+            "matcher": key[1],
+            "command": key[2],
+            "carried_from_event": rec["carried_from_event"],
+            "parked_command": rec.get("parked_command", ""),
+            "timeout_seconds": timeout if isinstance(timeout, int)
+            and not isinstance(timeout, bool) else None,
+            "parked_json": json.dumps(
+                parked_entry_for_registration(key[0], key[1], group, items),
+                ensure_ascii=False),
+        })
+    return out
+
+
+def _template_registration(
+    template_hooks: dict, event: str, matcher: str, command: str,
+) -> Optional[tuple[dict, list[dict]]]:
+    """The first template group under ``event``/``matcher`` that carries
+    ``command``, with every inner hook of that exact command (one, or an
+    ``if`` group's rules), or ``None``."""
+    groups = template_hooks.get(event)
+    for group in groups if isinstance(groups, list) else []:
+        if not isinstance(group, dict) or normalize_matcher(group) != matcher:
+            continue
+        inner = group.get("hooks")
+        items = [
+            h for h in (inner if isinstance(inner, list) else [])
+            if isinstance(h, dict) and h.get("command") == command
+        ]
+        if items:
+            return group, items
+    return None
 
 
 def _unreadable(db_path: Path, detail: str) -> ParkedHooksState:
@@ -541,3 +682,122 @@ def emit_conflict_deferral(
         f"recorded as {CONFLICT_CID}",
         data={"conflicts": conflicts})
     return True
+
+
+# ---------------------------------------------------------------------------
+# Machine CLI — the launcher's Hooks tab asks which registrations a disable
+# carries to (v0.2.102, lane W6-HTAB)
+# ---------------------------------------------------------------------------
+
+def _emit(payload: dict) -> None:
+    import json
+    import sys
+
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _fail(code: str, error: str) -> int:
+    _emit({"ok": False, "code": code, "error": error})
+    return 1
+
+
+def _cmd_carried(args: Any) -> int:
+    """``carried``: stdin ``{"project_folder": str, "parked": [{"event",
+    "matcher", "command"}]}`` -> ``{"ok": true, "carried": [...]}``
+    (:func:`carried_registrations`). The parked rows come from the CALLER
+    (the launcher, which owns launcher.db) — identity only, never their
+    bytes — so the answer is about the DB the caller holds. Read-only:
+    nothing is written anywhere; the launcher writes the rows."""
+    import json
+    import sys
+
+    from vco_lib.bundle_settings_io import settings_template_path
+    from vco_lib.python_exe import resolve_install_root
+
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except ValueError as exc:
+        return _fail("bad_request", f"request is not JSON: {exc}")
+    if not isinstance(req, dict):
+        return _fail("bad_request", "request is not a JSON object")
+    folder_raw = req.get("project_folder")
+    rows = req.get("parked")
+    if not isinstance(folder_raw, str) or not folder_raw or not isinstance(rows, list):
+        return _fail("bad_request", "request needs a string project_folder and a parked list")
+    parked: list[ParkedHook] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        event, matcher, command = row.get("event"), row.get("matcher", ""), row.get("command")
+        if isinstance(event, str) and event and isinstance(command, str) and command \
+                and isinstance(matcher, str):
+            parked.append(ParkedHook(event, matcher, command))
+    if not parked:
+        _emit({"ok": True, "carried": []})
+        return 0
+
+    explicit = (args.orchestrator_root or "").strip()
+    if explicit and not Path(explicit).is_dir():
+        # A named clone that is not there is an error, never a cue to read some
+        # OTHER clone's template (v0.2.102 R11-05: it used to fall through to the
+        # ambient VCT_INSTALL_ROOT / this vco_lib's clone, silently).
+        return _fail("no_install_root", f"--orchestrator-root {explicit} is not a directory")
+    root = resolve_install_root(explicit or None)
+    if root is None:
+        return _fail("no_install_root", "the orchestrator clone could not be located")
+    template_path = settings_template_path(root)
+    try:
+        template = json.loads(template_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return _fail("template_unreadable", f"{template_path}: {exc}")
+    settings_path = Path(folder_raw) / ".claude" / "settings.json"
+    loaded = load_object(settings_path)
+    if loaded is None:
+        # Unknown is not "nothing runs": an unreadable file could register the
+        # hook, so no registration is declared carried (conservative).
+        return _fail("settings_unreadable", f"{settings_path} could not be read")
+    user_hooks = loaded[0].get("hooks") or {}
+    if not isinstance(user_hooks, dict):
+        return _fail("settings_unreadable", f"{settings_path}: `hooks` is not an object")
+    template_hooks = template.get("hooks") if isinstance(template, dict) else None
+    _emit({"ok": True,
+           "carried": carried_registrations(user_hooks, template_hooks or {}, parked)})
+    return 0
+
+
+def build_parser() -> Any:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m vco_lib.parked_hooks",
+        description="Parked-hook questions the launcher asks. Machine interface: "
+                    "one JSON object on stdout, on every path.",
+    )
+    sub = parser.add_subparsers(dest="op", required=True)
+    p_carried = sub.add_parser(
+        "carried",
+        help="Which shipped registrations a parked disable carries to (the bundle "
+             "merge's own decision), each with the parked entry to store.",
+    )
+    p_carried.add_argument(
+        "--orchestrator-root", default="",
+        help="The clone whose settings template to read. Must exist when given. "
+             "Default: $VCT_INSTALL_ROOT, then $VCT_ORCHESTRATOR_ROOT (each only when "
+             "it names an orchestrator clone), else this vco_lib's clone.")
+    p_carried.set_defaults(func=_cmd_carried)
+    return parser
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = build_parser().parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":  # pragma: no cover — exercised through subprocess tests
+    # Run the IMPORTED module's main, not this `__main__` copy: settings_merge
+    # imports vco_lib.parked_hooks, and one set of classes keeps the merge's
+    # isinstance-free duck typing and any future isinstance check honest.
+    from vco_lib.parked_hooks import main as _main
+
+    raise SystemExit(_main())

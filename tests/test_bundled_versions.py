@@ -24,13 +24,15 @@ from vco_lib import bundled_versions  # noqa: E402
 
 class LoadBundledVersionsTests(unittest.TestCase):
     def test_real_manifest_loads_with_expected_npm_keys(self) -> None:
-        """The on-disk `bundled_mcp_versions.toml` parses cleanly and
-        exposes the four pinned npm keys named in the Phase-0 plan."""
+        """The on-disk `bundled_mcp_versions.toml` parses cleanly.
+        v0.2.102: the four diagram npm pins were REMOVED with the
+        diagrams integrations — the npm table is legitimately empty now;
+        the one pin left is the npx-launched Playwright MCP."""
         versions = bundled_versions.load_bundled_versions()
         npm = versions.get("npm", {})
-        expected_keys = {"mermaid_mcp", "excalidraw_mcp",
-                         "mermaid_lib", "excalidraw_lib"}
+        expected_keys: set[str] = set()
         self.assertEqual(set(npm.keys()), expected_keys)
+        self.assertIn("playwright_mcp", versions.get("npx", {}))
 
     def test_each_npm_entry_has_required_fields(self) -> None:
         versions = bundled_versions.load_bundled_versions()
@@ -50,13 +52,20 @@ class LoadBundledVersionsTests(unittest.TestCase):
                     f"{key} version must be a concrete pin, not 'latest'",
                 )
 
-    def test_chromium_section_signals_playwright_reuse(self) -> None:
+    def test_retired_chromium_reuse_marker_is_gone(self) -> None:
+        """v0.2.102 W6-Z4 fix round: ``[chromium] reuse_playwright`` was
+        RETIRED. It told the Mermaid/Excalidraw PNG exporters to reuse
+        Playwright's Chromium; both exporters were deleted with the diagrams
+        integration and nothing (Rust, Python, shell, launcher TS) read the
+        key afterwards. A marker convention needs a live reader, so the table
+        went with its last consumer. The browser the Playwright MCP needs is
+        named by ``[npx.playwright_mcp] browser`` and pre-cached by
+        ``vco_lib/playwright_mcp.py::precache``."""
         versions = bundled_versions.load_bundled_versions()
-        self.assertEqual(
-            versions.get("chromium", {}).get("reuse_playwright"),
-            True,
-            "[chromium] reuse_playwright must be true — Phase 0 design "
-            "explicitly shares Playwright's Chromium download.",
+        self.assertNotIn(
+            "chromium", versions,
+            "[chromium] was retired in v0.2.102 (no reader) — do not "
+            "reintroduce it without a consumer that reads it.",
         )
 
     def test_missing_file_raises_runtime_error(self) -> None:

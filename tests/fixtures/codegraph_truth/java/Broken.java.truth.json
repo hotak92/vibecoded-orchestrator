@@ -1,0 +1,39 @@
+{
+ "source": "Broken.java",
+ "reviewed": "W6-E 2026-10-10 (hand-written; full_name + methods scored)",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Broken",
+   "start": 4,
+   "end": 14,
+   "full_name": "broken.Broken",
+   "methods": [
+    "first",
+    "second",
+    "third"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "first",
+   "start": 5,
+   "end": 7,
+   "full_name": "Broken.first"
+  },
+  {
+   "kind": "function",
+   "name": "second",
+   "start": 8,
+   "end": 10,
+   "full_name": "Broken.second"
+  },
+  {
+   "kind": "function",
+   "name": "third",
+   "start": 11,
+   "end": 13,
+   "full_name": "Broken.third"
+  }
+ ]
+}

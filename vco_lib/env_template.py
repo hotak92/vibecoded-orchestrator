@@ -2,8 +2,9 @@
 # Copyright (c) 2026 VibeCoded Tools
 """DB-as-source-of-truth contract for the per-project ``.env`` template.
 
-This module is **Phase 0.D** of the diagrams-integration plan (2026-05-24,
-see ``.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md``).
+Historical provenance: this module began as Phase 0.D of the
+diagrams-integration plan (2026-05-24 — that plan's runtime was removed
+in v0.2.102, but this env surface is plan-independent and stays).
 It is the parallel of :mod:`vco_lib.config_projection` for the FOURTH
 per-project env surface that Phase 0.B explicitly carved out as out-of-
 scope:
@@ -799,10 +800,10 @@ def replace_values_with_sentinel(
     .. code-block:: text
 
        # before
-       export OPENAI_API_KEY="sk-abc123"  # team key
+       export OPENAI_API_KEY="sk-abc123"  # team key  vco-secret-scan: test-placeholder
 
        # after (with sentinel = "__vco_keychain__")
-       export OPENAI_API_KEY=__vco_keychain__  # team key
+       export OPENAI_API_KEY=__vco_keychain__  # team key  vco-secret-scan: test-placeholder
 
     Comments preserved; ``export`` prefix preserved; quotes stripped (the
     sentinel doesn't need quoting and quotes-around-sentinel would just
@@ -1289,8 +1290,8 @@ def _atomic_write_text(path: Path, content: str) -> None:
     Thin delegate to :func:`vco_lib.atomic.atomic_write_text` (v0.2.54
     Track J closed the consolidation that :mod:`vco_lib.atomic`'s
     module docstring queued when it landed in v0.2.53 — this module,
-    ``config_projection``, ``deferral_report`` and
-    ``cli/codegraph_diagram`` each carried their own copy of the
+    ``config_projection`` and ``deferral_report`` (and the removed
+    ``cli/codegraph_diagram``) each carried their own copy of the
     mkstemp + fsync + ``os.replace`` recipe).
 
     The name is kept because install.py's ``.claude.json`` write site

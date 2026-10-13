@@ -311,6 +311,7 @@ def test_an_unrunnable_registration_writes_the_ledger_row(sandbox, tools, tmp_pa
     _register("Linux", home, state, argv=("/usr/bin/python3.12", "-m", "model_router"))
     project = tmp_path / "project"
     (project / ".claude" / "context").mkdir(parents=True)
+    (project / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
 
     ge.ensure_running(
         home=home, system="Linux", state_dir=state, folder=project,
@@ -340,6 +341,23 @@ def test_nothing_is_written_into_a_folder_that_is_not_a_managed_project(
     )
 
     assert list(stranger.iterdir()) == []
+
+
+def test_a_bare_claude_dir_is_not_a_managed_project(sandbox, tools, tmp_path):
+    """LEAVE-ALONE (v0.2.102 W6-W): a `.claude/` with no marker — the stray
+    `<sub>/.claude/state` a bare-cwd writer used to plant — gets no ledger."""
+    home, state = sandbox
+    _register("Linux", home, state, argv=("/usr/bin/python3.12", "-m", "model_router"))
+    stray = tmp_path / "stray"
+    (stray / ".claude" / "state").mkdir(parents=True)
+
+    ge.ensure_running(
+        home=home, system="Linux", state_dir=state, folder=stray,
+        runner=_runs(1, "No module named 'model_router'"),
+        command_runner=lambda cmd, timeout=15: None,
+    )
+
+    assert not (stray / ".claude" / "context").exists()
 
 
 def test_a_registration_naming_no_entry_point_at_all_is_unrunnable(sandbox, tools):

@@ -19,9 +19,11 @@
     APP_STATE_KEY_CODE_EMBED_OVERRIDE,
     APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL,
     APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL,
+    APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT,
     APP_STATE_KEY_ACTIVE_EMBEDDING,
     OLLAMA_URL,
   } from '$lib/preferences/loaders';
+  import { parseSummaryTiers, type SummaryTier } from '$lib/preferences/summary_tiers';
   import { get } from 'svelte/store';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
@@ -38,6 +40,7 @@
   // with scope="global" for the HOST-WIDE DEFAULTS, and on each project's
   // Settings tab with scope="project" for that project's own choices.
   import DualWriteFlagsPanel from '$lib/project-state/DualWriteFlagsPanel.svelte';
+  import KgEmbedStatus from '$lib/preferences/KgEmbedStatus.svelte';
   // Machine-global Artifact-tool switch. Own component (this page is already
   // ~4k lines) and, unlike everything else here, it edits CLAUDE CODE's own
   // user-scope settings file rather than launcher.db — see
@@ -420,6 +423,13 @@
   let embCatalogError = $state<string | null>(null);
   let defaultTextModel = $state<string>('');
   let defaultCodeModel = $state<string>('');
+  // v0.2.102 W6-B (F4): the "Detected backend" readout in the Code Graph
+  // Embeddings section renders THIS snapshot of the code row, captured at
+  // load — never `defaultCodeModel`, which is the same row BUT also the
+  // live value of the "Default code embedding" Dropdown above, so binding
+  // the readout to it made the "install-time detected" line follow the
+  // user's in-progress dropdown pick.
+  let detectedCodeModel = $state<string>('');
 
   function buildEmbOptions(models: ModelChoice[]) {
     return models.map((m) => ({
@@ -442,26 +452,43 @@
     if (r.defaults) {
       defaultTextModel = r.defaults.text_model ?? '';
       defaultCodeModel = r.defaults.code_model ?? '';
+      detectedCodeModel = defaultCodeModel;
     }
   }
 
   /** Save the user's pick for the text-embedding default. Per the
    *  v0.2.18 locked rule, this is the EXPLICIT consent surface — no
-   *  auto-switch fires elsewhere when an OpenAI key validates. */
+   *  auto-switch fires elsewhere when an OpenAI key validates.
+   *
+   *  v0.2.102 W6-B (F3): the backend helper also stamps the CANONICAL
+   *  `embedding.active_profile` (v0.2.68 Defect D) — the row the
+   *  "Embedding profile (global)" select displays — so a successful save
+   *  MUST re-read that select, or it keeps showing the stale profile
+   *  while the row on disk changed. `refresh` re-runs the loader only if
+   *  its section was already activated; if it wasn't, the section's own
+   *  first activation reads the fresh row anyway.
+   *  (F5): the text save fans into a machine-wide env re-projection (N
+   *  serial subprocesses, on the blocking pool) — the busy state below
+   *  keeps the Dropdown visibly disabled for the whole sweep. */
   async function saveDefaultTextEmbedding(value: string) {
+    defaultTextSaving = true;
     try {
       await invoke('set_default_embedding_models', {
         textModel: value || null,
         codeModel: null,
       });
       defaultTextModel = value;
+      loaders.refresh('activeEmbedding');
       toast.success('Default text embedding saved');
     } catch (e) {
       toast.error(e);
+    } finally {
+      defaultTextSaving = false;
     }
   }
 
   async function saveDefaultCodeEmbedding(value: string) {
+    defaultCodeSaving = true;
     try {
       await invoke('set_default_embedding_models', {
         textModel: null,
@@ -471,8 +498,18 @@
       toast.success('Default code embedding saved');
     } catch (e) {
       toast.error(e);
+    } finally {
+      defaultCodeSaving = false;
     }
   }
+
+  // v0.2.102 W6-B (F5): busy states for the two default-embedding
+  // Dropdowns. The TEXT path is a machine-wide sweep (every project's env
+  // re-projected, N serial Python subprocesses) and can take a while on a
+  // many-project machine; the CODE path is a single app_state write. Both
+  // now disable their control + show a saving placeholder for the duration.
+  let defaultTextSaving = $state(false);
+  let defaultCodeSaving = $state(false);
 
   /**
    * v0.2.18 Commit 7 (2026-05-19): styled-modal confirmation for
@@ -1166,6 +1203,9 @@
   let kgSummaryModel = $state<string>(KG_SUMMARY_DEFAULT_MODEL);
   let kgSummaryOverride = $state<KgSummaryOverride>('');
   let kgSummaryOllamaModel = $state<string>('');
+  // v0.2.102 W5-D: the local tier models (from the ONE tier table, via
+  // `get_summary_model_info`) — named by the "No Ollama models" hint.
+  let summaryTiers = $state<SummaryTier[]>([]);
   let kgSummaryLoading = $state(false);
   let kgSummarySaving = $state(false);
   let kgSummaryError = $state<string | null>(null);
@@ -1210,7 +1250,8 @@
     kgSummaryLoading = true;
     kgSummaryError = null;
     try {
-      const [consentRes, modelRes, overrideRes, ollamaRes] = await PREF_LOADERS.kgSummary.load();
+      const [consentRes, modelRes, overrideRes, ollamaRes, modelInfo] = await PREF_LOADERS.kgSummary.load();
+      summaryTiers = parseSummaryTiers(modelInfo);
       kgSummaryConsent = consentRes === true;
       kgSummaryModel = (modelRes.is_set && modelRes.value)
         ? modelRes.value
@@ -1410,6 +1451,7 @@
       });
       codeEmbedOverride = next;
       codeEmbedSaved = true;
+      loaders.refresh('codeEmbedStatus');
       setTimeout(() => { codeEmbedSaved = false; }, 2000);
     } catch (e) {
       codeEmbedError = String(e);
@@ -1429,6 +1471,7 @@
       });
       codeEmbedOpenaiModel = next;
       codeEmbedSaved = true;
+      loaders.refresh('codeEmbedStatus');
       setTimeout(() => { codeEmbedSaved = false; }, 2000);
     } catch (e) {
       codeEmbedError = String(e);
@@ -1448,11 +1491,106 @@
       });
       codeEmbedOllamaModel = next;
       codeEmbedSaved = true;
+      loaders.refresh('codeEmbedStatus');
       setTimeout(() => { codeEmbedSaved = false; }, 2000);
     } catch (e) {
       codeEmbedError = String(e);
     } finally {
       codeEmbedSaving = false;
+    }
+  }
+
+  // v0.2.102 W6-B2: per-project truth for the section — the model each code
+  // graph is RECORDED as indexed with (searches use it), the selected target
+  // and its fill progress. Shape: `python -m vco_lib.code_embed_model status`.
+  interface CodeEmbedProjectStatus {
+    project_id: string | null;
+    name: string | null;
+    prefix: string;
+    recorded_model: string | null;
+    target_model: string;
+    target_source: string;
+    filling: boolean;
+    filled: number | null;
+    total: number | null;
+    complete: boolean;
+    cost_bearing: boolean;
+    target_refused: boolean;
+    record_refused: boolean;
+  }
+  interface CodeEmbedStatus {
+    target: string;
+    target_source: string;
+    target_cost_bearing: boolean;
+    openai_embeddings_consent: boolean;
+    projects: CodeEmbedProjectStatus[];
+  }
+  let codeEmbedStatus = $state<CodeEmbedStatus | null>(null);
+  let codeEmbedStatusLoading = $state(false);
+  let codeEmbedStatusError = $state<string | null>(null);
+
+  async function loadCodeEmbedStatus() {
+    codeEmbedStatusLoading = true;
+    codeEmbedStatusError = null;
+    try {
+      codeEmbedStatus = await PREF_LOADERS.codeEmbedStatus.load<CodeEmbedStatus>();
+    } catch (e) {
+      codeEmbedStatus = null;
+      codeEmbedStatusError = String(e);
+    } finally {
+      codeEmbedStatusLoading = false;
+    }
+  }
+
+  /** Fill progress, truthful: "n of N", "starts on the next code-graph run",
+   *  or "complete". */
+  function codeEmbedFillText(p: CodeEmbedProjectStatus): string {
+    if (p.complete) return 'complete';
+    if (p.target_refused) return 'not filled — OpenAI embeddings are not allowed';
+    if (p.record_refused) return 'blocked — the indexed OpenAI vectors need "Allow OpenAI for embeddings"';
+    if (!p.recorded_model) return 'not indexed yet — its first run embeds the target';
+    if (p.filled !== null && p.total !== null) return `${p.filled} of ${p.total} filled`;
+    const n = p.total === null ? '' : ` (${p.total} objects)`;
+    return `fill starts on the next code-graph run${n}`;
+  }
+
+  // v0.2.102 W6-B2: the OpenAI EMBEDDINGS consent (KG text + code graph) —
+  // separate from the summaries consent (owner ruling 2026-10-10). null =
+  // never set: the reader then follows the active embedding profile
+  // (vco_lib/openai_consent.py); nothing is written on the user's behalf.
+  let openaiEmbeddingsConsent = $state<boolean | null>(null);
+  // Re-review LOW-9: the EFFECTIVE consent — the row when set, else the
+  // Python reader's answer (it follows the active profile), carried on the
+  // status payload; never re-derived here (one reader, vco_lib/openai_consent.py).
+  const openaiEmbeddingsEffective = $derived(
+    openaiEmbeddingsConsent ?? codeEmbedStatus?.openai_embeddings_consent ?? false,
+  );
+  let openaiEmbeddingsSaving = $state(false);
+  let openaiEmbeddingsError = $state<string | null>(null);
+
+  async function loadOpenAiEmbeddingsConsent() {
+    openaiEmbeddingsError = null;
+    try {
+      openaiEmbeddingsConsent = await PREF_LOADERS.openAiEmbeddingsConsent.load();
+    } catch (e) {
+      openaiEmbeddingsError = String(e);
+    }
+  }
+
+  async function saveOpenAiEmbeddingsConsent(next: boolean) {
+    openaiEmbeddingsSaving = true;
+    openaiEmbeddingsError = null;
+    try {
+      await invoke<void>('app_state_set_bool', {
+        key: APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT,
+        value: next,
+      });
+      openaiEmbeddingsConsent = next;
+      loaders.refresh('codeEmbedStatus');
+    } catch (e) {
+      openaiEmbeddingsError = String(e);
+    } finally {
+      openaiEmbeddingsSaving = false;
     }
   }
 
@@ -2039,6 +2177,8 @@
     artifactTool: () => { shownPanels.artifactTool = true; },
     kgSummary: loadKgSummarySettings,
     codeEmbed: loadCodeEmbedSettings,
+    codeEmbedStatus: loadCodeEmbedStatus,
+    openAiEmbeddingsConsent: loadOpenAiEmbeddingsConsent,
     ollamaModels: fetchOllamaModels,
     stateDir: loadStateDir,
     pat: loadPat,
@@ -2155,8 +2295,9 @@
 
     <!--
       Default embedding models for new projects (v0.2.18 Commit 8).
-      App-level — applies to projects created from now on. Existing
-      projects keep their per-binding model. Populated from the live
+      App-level. (v0.2.102 W6-J: the text default no longer seeds a
+      per-binding KG model — that column is retired; the KG embeds with the
+      global profile this save also stamps.) Populated from the live
       catalog so users can only pick what their machine can serve;
       unavailable models render greyed-out with a tooltip explaining
       why. Per the v0.2.18 locked rule (no-auto-switch), this is the
@@ -2177,19 +2318,28 @@
       {/if}
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
-          <strong>Default text embedding for new projects</strong>
+          <strong>Text embedding (KG, every project)</strong>
           <span class="pr-onboarding-hint">
-            Applied to the KG binding when you create a new project. Existing
-            projects are not affected. Greyed-out options are unreachable
-            from this machine.
+            The KG embedding model is one global setting for every project
+            and the shared KG. Greyed-out options are unreachable from this
+            machine.
+            <!-- v0.2.102 W6-B (F3/F5): the save is NOT local — the backend
+                 also stamps the global embedding profile and re-projects
+                 every project's env (a machine-wide sweep that can take a
+                 while). -->
+            Saving also sets the global embedding profile (see "Embedding
+            profile (global)" below) and refreshes every project's
+            environment — this can take a while on machines with many
+            projects.
           </span>
         </div>
         <div class="pr-dd">
           <Dropdown
             options={embCatalog ? buildEmbOptions(embCatalog.text_models) : []}
             value={defaultTextModel}
-            placeholder={embCatalog ? 'Select model…' : 'Loading…'}
+            placeholder={defaultTextSaving ? 'Saving…' : embCatalog ? 'Select model…' : 'Loading…'}
             ariaLabel="Default text embedding"
+            disabled={defaultTextSaving}
             onChange={(v: string) => void saveDefaultTextEmbedding(v)}
           />
         </div>
@@ -2206,8 +2356,9 @@
           <Dropdown
             options={embCatalog ? buildEmbOptions(embCatalog.code_models) : []}
             value={defaultCodeModel}
-            placeholder={embCatalog ? 'Select model…' : 'Loading…'}
+            placeholder={defaultCodeSaving ? 'Saving…' : embCatalog ? 'Select model…' : 'Loading…'}
             ariaLabel="Default code embedding"
+            disabled={defaultCodeSaving}
             onChange={(v: string) => void saveDefaultCodeEmbedding(v)}
           />
         </div>
@@ -2408,7 +2559,7 @@
               }}
               disabled={kgSummarySaving || !openaiPresent}
             />
-            <span>Allow OpenAI for summaries &amp; embeddings (incurs cost)</span>
+            <span>Allow OpenAI for KG summaries (incurs cost)</span>
           </label>
           {#if !openaiPresent}
             <p class="pr-hint pr-kgsum-warn">
@@ -2421,8 +2572,9 @@
               Heads-up: each summary or embedding triggers an API call
               against the model picked below. Cost is small per call
               (≈$0.0001 with gpt-4o-mini, ≈$0.005 with gpt-4o) but adds
-              up across a large KG. Switch to Claude CLI or Local
-              Ollama any time to stop the spend.
+              up across a large KG. Switch to Claude CLI or Local Ollama any
+              time to stop the spend. OpenAI <em>embeddings</em> have their own
+              toggle under <strong>OpenAI API key</strong>.
             </p>
           {/if}
         </div>
@@ -2472,9 +2624,9 @@
             </p>
           {:else if ollamaModels.length === 0}
             <p class="pr-hint pr-kgsum-warn">
-              No Ollama models installed. Run
-              <code>ollama pull qwen3.5:9b</code> (16 GB+ VRAM) or
-              <code>ollama pull gemma4:e4b</code> (low-VRAM / CPU) then
+              No Ollama models installed. Pull the model for this machine's tier{#if summaryTiers.length}:
+              {#each summaryTiers as tier, i}{i > 0 ? (i === summaryTiers.length - 1 ? ' or ' : ', ') : ' '}<code>ollama pull {tier.model}</code> ({tier.when}){/each}{/if}
+              (re-running the orchestrator update pulls it for you), then
               <button class="pr-link-btn" onclick={() => void fetchOllamaModels()}>retry</button>.
             </p>
           {:else}
@@ -2540,26 +2692,73 @@
          dropdown layout, different app_state keys. Read-only "detected"
          row reflects `default_code_embedding` (set by install.py during
          hardware selection). -->
-    <section class="pr-section" use:lazySection={{ loaders, keys: ['codeEmbed', 'ollamaModels'] }} aria-labelledby="pr-codeembed-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['codeEmbed', 'codeEmbedStatus', 'openAiEmbeddingsConsent', 'ollamaModels'] }} aria-labelledby="pr-codeembed-title">
       <h2 class="pr-section-title" id="pr-codeembed-title">Code Graph Embeddings</h2>
       <p class="pr-hint" style="margin-bottom: 10px;">
-        Override the backend the code-graph indexer uses for code-entity
-        embeddings (functions, classes, modules, APIs). Defaults to the
-        install-time detected backend; pin a specific one when you want
-        to evaluate alternatives or fall back from a paid model.
+        Choose the model code-entity embeddings (functions, classes,
+        modules, APIs) should use. Defaults to the install-time detected
+        backend; pin a specific one to evaluate alternatives or fall back
+        from a paid model.
+        <!-- v0.2.102 W6-B2 (owner ruling 2026-10-10): applied automatically
+             and additively by vco_lib/code_embed_model.py. -->
+        A change is applied automatically: each project's next code-graph run
+        adds the new model's vectors beside the existing ones (nothing is
+        dropped) and embeds only what is missing; searches keep using the
+        model a graph is indexed with until the new one is complete, then
+        switch. Switching back to a model that is still complete is instant.
+        A per-project choice on the project's Codegraph tab, or an explicit
+        <code>CODE_EMBED_MODEL</code> environment variable, wins over this pick.
       </p>
 
       {#if codeEmbedLoading}
         <p class="pr-hint">Loading…</p>
       {:else}
-        <!-- Read-only detected backend. We reuse the same
-             defaultCodeModel state populated by loadEmbeddingCatalog()
-             above — single source of truth. -->
+        <!-- Read-only detected backend. v0.2.102 W6-B (F4): bound to
+             detectedCodeModel — the snapshot captured at load — never
+             defaultCodeModel, which is the live value of the mutable
+             "Default code embedding" Dropdown above. -->
         <div class="pr-kgsum-block">
           <p class="pr-kgsum-block-label">Detected backend</p>
           <p class="pr-hint">
-            <code>{defaultCodeModel || '(unset — install hasn\'t run hardware selection)'}</code>
+            <code>{detectedCodeModel || '(unset — install hasn\'t run hardware selection)'}</code>
           </p>
+        </div>
+
+        <!-- v0.2.102 W6-B2: per project — the recorded (searched) model, the
+             target, its fill progress and whether it is OpenAI-billed. -->
+        <div class="pr-kgsum-block" data-testid="code-embed-status">
+          <p class="pr-kgsum-block-label">Per-project code graphs</p>
+          {#if codeEmbedStatusLoading}
+            <p class="pr-hint">Reading each project's code-graph model…</p>
+          {:else if codeEmbedStatusError}
+            <p class="pr-hint pr-kgsum-warn">Couldn't read the code-graph models: {codeEmbedStatusError}</p>
+          {:else if codeEmbedStatus && codeEmbedStatus.projects.length > 0}
+            {#each codeEmbedStatus.projects as p (p.prefix)}
+              <div class="pr-codeembed-project">
+                <p class="pr-hint">
+                  <strong>{p.name ?? p.prefix}</strong> — searching
+                  <code>{p.recorded_model ?? '—'}</code>; target
+                  <code>{p.target_model}</code>: {codeEmbedFillText(p)}
+                  · {p.cost_bearing ? 'OpenAI-billed' : 'no API cost'}
+                </p>
+                {#if p.record_refused}
+                  <p class="pr-hint pr-kgsum-warn">
+                    This graph is indexed with an OpenAI model and "Allow OpenAI for embeddings" is
+                    off — its searches are refused and no switch starts (its vectors would be lost)
+                    until the toggle is on.
+                  </p>
+                {/if}
+                {#if p.target_refused}
+                  <p class="pr-hint pr-kgsum-warn">
+                    The target is an OpenAI model but "Allow OpenAI for embeddings" is off —
+                    it is not filled and no API call is made.
+                  </p>
+                {/if}
+              </div>
+            {/each}
+          {:else}
+            <p class="pr-hint">No project has a code graph yet.</p>
+          {/if}
         </div>
 
         <div class="pr-kgsum-block">
@@ -2615,9 +2814,9 @@
               value="openai"
               checked={codeEmbedOverride === 'openai'}
               onchange={() => void saveCodeEmbedOverride('openai')}
-              disabled={codeEmbedSaving || !kgSummaryConsent}
+              disabled={codeEmbedSaving || !openaiEmbeddingsEffective}
             />
-            <span>OpenAI embeddings (requires the consent above; cost per call)</span>
+            <span>OpenAI embeddings (requires "Allow OpenAI for embeddings"; billed per call — the switch embeds the graph once)</span>
           </label>
           <label class="pr-kgsum-radio">
             <input
@@ -2935,7 +3134,7 @@
          breadcrumbs. Per the v0.2.18 locked rule, post-Apply success
          shows a styled-modal consent prompt before flipping the new-
          project defaults to openai-*. -->
-    <section class="pr-section" use:lazySection={{ loaders, keys: ['openAi'] }} aria-labelledby="pr-openai-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['openAi', 'openAiEmbeddingsConsent', 'codeEmbedStatus'] }} aria-labelledby="pr-openai-title">
       <h2 class="pr-section-title" id="pr-openai-title">OpenAI API key (optional)</h2>
       <div class="pr-pat-row">
         <div class="pr-onboarding-text">
@@ -2954,6 +3153,28 @@
             probe (no tokens consumed). Leaving this blank keeps the launcher on
             local models (recommended for most users).
           </span>
+          <!-- v0.2.102 W6-B2: the EMBEDDINGS consent (KG text + code graph). -->
+          <label class="pr-kgsum-checkbox" data-testid="openai-embeddings-consent">
+            <input
+              type="checkbox"
+              checked={openaiEmbeddingsEffective}
+              onchange={(e) => {
+                const t = e.currentTarget as HTMLInputElement;
+                void saveOpenAiEmbeddingsConsent(t.checked);
+              }}
+              disabled={openaiEmbeddingsSaving}
+            />
+            <span>Allow OpenAI for embeddings (KG + code graph; incurs cost)</span>
+          </label>
+          {#if openaiEmbeddingsConsent === null}
+            <span class="pr-onboarding-hint">
+              Not set — following your embedding profile ({openaiEmbeddingsEffective
+                ? 'on: OpenAI is your active embedding profile' : 'off'}). Tick or untick to decide.
+            </span>
+          {/if}
+          {#if openaiEmbeddingsError}
+            <span class="pr-onboarding-hint pr-kgsum-warn">{openaiEmbeddingsError}</span>
+          {/if}
         </div>
         <div class="pr-pat-actions">
           {#if openaiPresent}
@@ -3582,8 +3803,10 @@
           <span class="pr-onboarding-hint">
             Which model the launcher uses for KG / Codegraph embeddings.
             Changing this affects every project created or refreshed from
-            now on; existing collections keep their stored embeddings
-            until re-synced.
+            now on. Existing KG collections keep their stored embeddings and
+            stay searchable with the model they are complete in; the new
+            model's vectors are filled in alongside on the next whole-tree
+            sync, and searches move to it once complete (status below).
             <br /><br />
             Note: this is distinct from the per-new-project
             <strong>Default embedding models</strong> section above. That
@@ -3617,6 +3840,10 @@
       {#if activeEmbeddingError}
         <p class="pr-error">Couldn't save: {activeEmbeddingError}</p>
       {/if}
+      <!-- v0.2.102 W6-I: per project, each KG collection's recorded (searched)
+           model vs the selected one + fill progress, and the duplicate scan
+           with its "objects missing the vector" list. -->
+      <KgEmbedStatus />
     </section>
 
     <!-- v0.2.23 F2 wave 2b: Volume location. Relocated from the popover.
@@ -3885,6 +4112,12 @@
      Boxy block layout that mirrors the rest of the page (.pr-onboarding-row
      style: subtle border + tinted background) so the new sections don't
      feel like a foreign body. */
+  .pr-codeembed-project {
+    margin: 4px 0 8px;
+  }
+  .pr-codeembed-project code {
+    word-break: break-all;
+  }
   .pr-kgsum-block {
     padding: 10px 14px; background: rgba(255,255,255,0.03);
     border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;

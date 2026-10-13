@@ -1,0 +1,30 @@
+{
+ "source": "broken.ts",
+ "reviewed": "W6-E 2026-10-10 (hand-written; full_name + methods scored)",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "first",
+   "start": 2,
+   "end": 4,
+   "full_name": "broken.first"
+  },
+  {
+   "kind": "function",
+   "name": "third",
+   "start": 7,
+   "end": 9,
+   "full_name": "broken.third"
+  },
+  {
+   "kind": "class",
+   "name": "Fourth",
+   "start": 11,
+   "end": 15,
+   "full_name": "broken.Fourth",
+   "methods": [
+    "run"
+   ]
+  }
+ ]
+}

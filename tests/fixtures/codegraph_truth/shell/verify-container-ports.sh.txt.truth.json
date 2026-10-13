@@ -1,0 +1,83 @@
+{
+ "source": "verify-container-ports.sh.txt",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "json_str",
+   "start": 62,
+   "end": 70,
+   "full_name": "verify-container-ports.sh.json_str"
+  },
+  {
+   "kind": "function",
+   "name": "log_services_json",
+   "start": 73,
+   "end": 88,
+   "full_name": "verify-container-ports.sh.log_services_json"
+  },
+  {
+   "kind": "function",
+   "name": "log_recovery_json",
+   "start": 89,
+   "end": 96,
+   "full_name": "verify-container-ports.sh.log_recovery_json"
+  },
+  {
+   "kind": "function",
+   "name": "log_run",
+   "start": 97,
+   "end": 105,
+   "full_name": "verify-container-ports.sh.log_run"
+  },
+  {
+   "kind": "function",
+   "name": "service_of",
+   "start": 106,
+   "end": 113,
+   "full_name": "verify-container-ports.sh.service_of"
+  },
+  {
+   "kind": "function",
+   "name": "log_container",
+   "start": 114,
+   "end": 114,
+   "full_name": "verify-container-ports.sh.log_container"
+  },
+  {
+   "kind": "function",
+   "name": "log_recovered",
+   "start": 115,
+   "end": 115,
+   "full_name": "verify-container-ports.sh.log_recovered"
+  },
+  {
+   "kind": "function",
+   "name": "probe_port",
+   "start": 280,
+   "end": 291,
+   "full_name": "verify-container-ports.sh.probe_port"
+  },
+  {
+   "kind": "function",
+   "name": "container_running",
+   "start": 293,
+   "end": 297,
+   "full_name": "verify-container-ports.sh.container_running"
+  },
+  {
+   "kind": "function",
+   "name": "container_pid_alive",
+   "start": 304,
+   "end": 312,
+   "full_name": "verify-container-ports.sh.container_pid_alive"
+  },
+  {
+   "kind": "function",
+   "name": "zombie_policy",
+   "start": 380,
+   "end": 389,
+   "full_name": "verify-container-ports.sh.zombie_policy"
+  }
+ ]
+}

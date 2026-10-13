@@ -166,7 +166,14 @@ def entry_key(file_path: str, full_name: str) -> str:
 
 def resolve_max_per_run(cli_value: "int | None", env: "dict | None" = None) -> int:
     """CLI flag → env override → default. Empty-string / unparseable env
-    values fall through (v0.2.27 coercion discipline)."""
+    values fall through (v0.2.27 coercion discipline).
+
+    The env leg is a DOCUMENTED COPY — must match
+    ``vco_lib/env_values.py::env_int(name, default, env=env)``: this script
+    runs as ``.claude/scripts/`` in user projects and imports ``vco_lib`` only
+    after resolving the orchestrator root (:func:`atomic_write_json`), which a
+    pure resolver must not trigger. Parity: ``tests/test_v02102_env_values.py``.
+    """
     if cli_value is not None:
         return cli_value
     raw = (env if env is not None else os.environ).get(_ENV_MAX_PER_RUN)
@@ -181,7 +188,12 @@ def resolve_max_per_run(cli_value: "int | None", env: "dict | None" = None) -> i
 
 
 def resolve_batch_size(env: "dict | None" = None) -> int:
-    """Env override → default; values below 1 / unparseable fall through."""
+    """Env override → default; values below 1 / unparseable fall through.
+
+    DOCUMENTED COPY — must match ``vco_lib/env_values.py::env_int(name,
+    default, env=env, minimum=1)`` (see :func:`resolve_max_per_run` for why
+    it is not imported). Parity: ``tests/test_v02102_env_values.py``.
+    """
     raw = (env if env is not None else os.environ).get(_ENV_BATCH_SIZE)
     if raw is not None and str(raw).strip():
         try:
@@ -472,8 +484,8 @@ def build_entry(row: dict, collection: str, *, one_liner: str, summary: str,
 # ──────────────────────────────────────────────────────────────────────
 def _collection_prefix(project_name: str) -> "str | None":
     """Project name → Weaviate class prefix via the ENDORSED SSOT wrapper
-    (``codegraph_to_mermaid._sanitize_collection_prefix`` →
-    ``project_naming.canonical_class_prefix``). No new sanitizer copy —
+    (``codegraph_naming.sanitize_collection_prefix`` →
+    ``canonical_class_prefix``). No new sanitizer copy —
     mirrors ``vco_lib.codegraph_resync._collection_prefix``. ``None`` when
     unresolvable (the caller then does NOTHING — never guess a prefix)."""
     env_root = os.getenv("VCT_ORCHESTRATOR_ROOT", "").strip()
@@ -481,8 +493,8 @@ def _collection_prefix(project_name: str) -> "str | None":
         if root and (Path(root) / "vco_lib").is_dir() and root not in sys.path:
             sys.path.insert(0, root)
     try:
-        from vco_lib.codegraph_to_mermaid import (  # type: ignore
-            _sanitize_collection_prefix as _sanitize,
+        from vco_lib.codegraph_naming import (  # type: ignore
+            sanitize_collection_prefix as _sanitize,
         )
     except Exception as exc:  # noqa: BLE001 — partial install
         log(f"  code-summary: prefix resolver unavailable: {exc}")
@@ -520,6 +532,13 @@ def _connect_weaviate():
         import weaviate
         from urllib.parse import urlparse
 
+        # v0.2.102 W4-E: no PyPI version lookup on connect (one home:
+        # weaviate_helpers.disable_weaviate_client_pypi_check; guarded).
+        try:
+            from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+            disable_weaviate_client_pypi_check()
+        except Exception:
+            pass
         url = urlparse(weaviate_url_default())
         return weaviate.connect_to_local(
             host=url.hostname or "localhost",

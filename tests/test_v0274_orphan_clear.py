@@ -262,7 +262,8 @@ def test_orphan_row_deleted_reachable_kept(analyzer_mod, tmp_path):
     # The orphan row was deleted by-id; the live row was not.
     assert functions.data.deleted == ["orphan"]
     # The reachable stale file stays in the set; the orphan does not.
-    assert result == frozenset({"pkg/live.py"})
+    # R11-02: keyed (project_source, path); an unstamped row reads source "".
+    assert result == frozenset({("", "pkg/live.py")})
 
 
 def test_orphan_clear_over_delete_guard(analyzer_mod, tmp_path):
@@ -284,7 +285,7 @@ def test_orphan_clear_over_delete_guard(analyzer_mod, tmp_path):
     result = stub._build_stale_file_set()
 
     assert functions.data.deleted == ["bar"], "only the deleted-file row"
-    assert result == frozenset({"src/foo/baz.py"})
+    assert result == frozenset({("", "src/foo/baz.py")})
 
 
 def test_orphan_clear_never_deletes_extra_path_rows(analyzer_mod, tmp_path):
@@ -428,7 +429,7 @@ def test_orphan_clear_fail_safe_when_repo_root_none(analyzer_mod, tmp_path):
     result = stub._build_stale_file_set()
 
     assert functions.data.deleted == [], "no deletes without a repo root"
-    assert result == frozenset({"pkg/deleted.py"}), "orphan path retained"
+    assert result == frozenset({("", "pkg/deleted.py")}), "orphan path retained"
 
 
 def test_orphan_clear_fail_safe_when_exists_raises(analyzer_mod, tmp_path, monkeypatch):

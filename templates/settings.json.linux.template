@@ -41,6 +41,9 @@
       "Bash(wget * | sh*)"
     ]
   },
+  "skillOverrides": {
+    "loop": "user-invocable-only"
+  },
   "hooks": {
     "SessionStart": [
       {
@@ -99,6 +102,11 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/context-size-check.sh\"",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/compact-context-reinject.sh\"",
+            "timeout": 5
           }
         ]
       },
@@ -120,12 +128,11 @@
     ],
     "PreCompact": [
       {
-        "matcher": "auto",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-compact-save.sh\"",
-            "timeout": 5
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-compact-save.sh\""
           }
         ]
       }
@@ -164,6 +171,27 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-skill-keyword-suggest.sh\"",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/prompt-context-inject.sh\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-alerts-deliver.sh\""
+          }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "matcher": "loop|schedule",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" record-expansion",
+            "timeout": 10
           }
         ]
       }
@@ -173,13 +201,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-start-suggest.sh\"",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-start-kg-inject.sh\"",
-            "timeout": 5
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-start-kg-inject.sh\""
           },
           {
             "type": "command",
@@ -194,8 +216,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-stop-reconcile.sh\"",
-            "timeout": 2
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-stop-reconcile.sh\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-drain-citations.sh\"",
+            "timeout": 30,
+            "async": true
           }
         ]
       }
@@ -205,15 +232,14 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/worktree-guard.sh\"",
-            "timeout": 3
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/worktree-guard.sh\""
           }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -233,7 +259,7 @@
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -360,6 +386,237 @@
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
             "timeout": 10,
             "if": "Bash(git blame*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(perl *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(ruby *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(cd *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(tee *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(cp *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(mv *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(echo *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(printf *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Get-Content *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Select-String *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Set-Location *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Push-Location *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Copy-Item *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Move-Item *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Set-Content *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Add-Content *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Out-File *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Tee-Object *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Write-Output *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(rg *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(git show*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(git grep*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(git diff*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(git log*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(git blame*)"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(sleep *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(watch *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(tail *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(while *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(until *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(timeout *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(cat *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(head *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(ls *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(wc *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(grep *)"
+          }
+        ]
+      },
+      {
+        "matcher": "PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10
           }
         ]
       },
@@ -416,22 +673,23 @@
         ]
       },
       {
-        "matcher": "Write|Edit",
+        "matcher": "Read",
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-diagram-path-validation.sh\"",
-            "timeout": 3
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Read(*)"
           }
         ]
       },
       {
-        "matcher": "mcp__mermaid__.*|mcp__excalidraw__.*",
+        "matcher": "ScheduleWakeup|CronCreate|Monitor",
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-diagram-path-validation.sh\"",
-            "timeout": 3
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10
           }
         ]
       }
@@ -490,6 +748,17 @@
         ]
       }
     ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-drain-citations.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
@@ -502,7 +771,7 @@
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -559,6 +828,15 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/post-mcp-retrieval-record.sh\"",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-alerts-deliver.sh\""
           }
         ]
       }

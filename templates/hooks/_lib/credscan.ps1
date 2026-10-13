@@ -49,7 +49,10 @@ function Scan-FileForCredentials {
     }
 
     try {
-        $info = Get-Item -LiteralPath $FilePath -ErrorAction Stop
+        # -Force: without it Get-Item throws on a hidden item (every dotfile
+        # on Linux/macOS, e.g. .env), and the catch below would skip the
+        # scan silently.
+        $info = Get-Item -LiteralPath $FilePath -Force -ErrorAction Stop
         # Skip >5 MB files (mirrors .sh sibling).
         if ($info.Length -gt 5MB) { return }
     } catch {
@@ -60,7 +63,7 @@ function Scan-FileForCredentials {
     # Skip files that fail to read as text (likely binaries).
     $content = $null
     try {
-        $content = Get-Content -LiteralPath $FilePath -Raw -ErrorAction Stop
+        $content = Get-Content -LiteralPath $FilePath -Raw -Force -ErrorAction Stop
     } catch {
         return
     }
@@ -79,9 +82,30 @@ function Scan-FileForCredentials {
 
     # One pass per shape, in SSOT declaration order so the reported label
     # sequence matches the .sh sibling exactly.
-    foreach ($shape in (Get-CredShapes -Context 'content_scan')) {
-        if ($content -match $shape.Re) {
-            $alerts.Add($shape.Label) | Out-Null
+    # The ONE explicit opt-out (owner ruling 2026-10-12): a line carrying
+    # the test-placeholder marker is a declared fixture and is not reported;
+    # the marker covers its own line only, and nothing is inferred from how
+    # a value looks. Same rule, same marker (credshapes.ps1 mirror of
+    # vco_lib/credential_shapes.TEST_PLACEHOLDER_MARKER) as post-tool-security.
+    if (-not (Get-Command Get-CredShapesTestPlaceholderMarker -ErrorAction SilentlyContinue)) {
+        Write-Output "credential scanner UNAVAILABLE (test-placeholder marker missing from _lib/credshapes.ps1)"
+        return
+    }
+    $marker = Get-CredShapesTestPlaceholderMarker
+    $lines = $content -split "`r?`n"
+    # -Path: shapes restricted to another file kind (the unquoted generic
+    # secret serves env/config files only) are dropped, as in the .sh sibling.
+    foreach ($shape in (Get-CredShapes -Context 'content_scan' -Path $FilePath)) {
+        foreach ($ln in $lines) {
+            # -cmatch, not -match: .NET -match is case-INSENSITIVE, while the
+            # .sh sibling (grep -E) and post-tool-security (Python re) match
+            # case-sensitively. The vocabulary spells out case where it wants
+            # it ([Pp][Aa]... in the generic-secret keys); -match would make
+            # e.g. a lowercased AKIA run alert on Windows only.
+            if (($ln -cmatch $shape.Re) -and (-not $ln.Contains($marker))) {
+                $alerts.Add($shape.Label) | Out-Null
+                break
+            }
         }
     }
 

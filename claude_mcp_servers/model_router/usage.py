@@ -90,7 +90,11 @@ USAGE_FIELDS: tuple[str, ...] = (
 #: The window the CLIENT budgets against, keyed on the id it requested. Claude
 #: Code reads nothing else from a gateway's catalog to size its context bar:
 #: an ``[1m]`` suffix means one million, anything else behind a custom base URL
-#: means two hundred thousand. Both are the CLIENT's arithmetic, which is why
+#: means two hundred thousand. On ordinary traffic the client resolves the
+#: suffix itself and signals the window with the ``anthropic-beta`` header
+#: instead (a ``context-1m`` token) — that half of the detection is threaded
+#: into :func:`build_record` as ``one_m_client``, since a pure function of the
+#: id cannot see a header. Both are the CLIENT's arithmetic, which is why
 #: they are constants here and not a lookup — a record that reported the real
 #: window only could not answer "why did compaction fire at 20%?".
 CLIENT_WINDOW_1M = 1_000_000
@@ -107,21 +111,35 @@ LEDGER_BASENAME = "gateway-usage.jsonl"
 #: disk-usage decision the user never made.
 LEDGER_MAX_BYTES = 50 * 1024 * 1024
 
-#: One fully-populated row, measured — every field set, a UUID session id and
-#: a UUID agent id, a namespaced ``[1m]`` model id. Used only to turn a byte
-#: cap into a LINE count for :func:`vco_lib.atomic.rotate_tail_lines`, which
-#: keeps lines rather than bytes.
-LEDGER_ROW_BYTES = 545
+#: One fully-populated row, measured — the LONGEST realistic row across every
+#: route (anthropic, zai, qwen, kimi — the qwen/deepseek model id is the
+#: longest namespaced ``[1m]`` spelling), every field set at its realistic
+#: maximum: UUID session/agent/parent-agent ids, 7-digit token counts on a
+#: 1M-window chat, ``window_actual`` 1 000 000, an 8-digit
+#: ``request_bytes``, the longest ``fallback_from`` label
+#: (``vendor:qwen:deepseek-v4.1-flash``), and the LONGEST effort spelling
+#: (``budget_tokens=8192`` on both sides of the pair; a named tier is
+#: shorter). That case serialises to 776 bytes + the newline. Used only to
+#: turn a byte cap into a LINE count for
+#: :func:`vco_lib.atomic.rotate_tail_lines`, which keeps lines rather than
+#: bytes — a TYPICAL row is smaller, so the surviving tail is at most about a
+#: quarter of the cap, never more. Re-measured at v0.2.102 when the effort
+#: pair (``effort_requested`` / ``effort_forwarded``) joined the row; the
+#: pre-pair figure of 545 was itself a derived underestimate.
+LEDGER_ROW_BYTES = 777
 
 #: What fraction of :data:`LEDGER_MAX_BYTES` survives a rotation. A quarter:
 #: enough recent history that a monitor restarted after a rotation still has
 #: context to show, and small enough that rotations are rare rather than one
-#: per write. At the default cap that is ``(52428800 // 4) // 545`` =
-#: **24 049 lines**, about 13.1 MiB — a quarter of the cap, as intended.
+#: per write. At the default cap that is ``(52428800 // 4) // 777`` =
+#: **16 868 lines**, about 12.5 MiB when every row is a maximal
+#: :data:`LEDGER_ROW_BYTES` row — at most a quarter of the cap, as intended;
+#: typical (smaller) rows keep the same LINE count and proportionally fewer
+#: bytes.
 #:
-#: The ratio holds for a TYPICAL row. An atypically long client-supplied model
-#: id makes the surviving tail proportionally larger; the file is still
-#: bounded, because the next append re-checks the cap.
+#: The ratio holds for a MAXIMAL row. An atypically long client-supplied model
+#: id beyond even that makes the surviving tail proportionally larger; the
+#: file is still bounded, because the next append re-checks the cap.
 LEDGER_KEEP_FRACTION = 4
 
 #: How many sessions the in-memory "last row per chat" map holds. Bounded and
@@ -148,6 +166,29 @@ USAGE_BODY_LIMIT_BYTES = 8 * 1024 * 1024
 #: which is why the substituted figure is LABELLED
 #: (:data:`COUNT_SOURCE_ESTIMATE`) rather than passed off as a vendor count.
 ESTIMATE_BYTES_PER_TOKEN = 4
+
+#: How much smaller a body must be than the last guard-REFUSED body for the
+#: same identity before the guard resumes refusing (v0.2.102, review batch-2
+#: MEDIUM-2). A reactive-compaction request carries ≈ the refused body — the
+#: same history, the same density — so a guard that kept refusing it would
+#: block its own recovery path. When the previous request for the identity
+#: was refused by the guard and this body has NOT shrunk by at least
+#: ``1 - GUARD_STAND_DOWN_FRACTION`` (5%), the guard stands down once and
+#: lets the vendor answer; the overflow translation is the net. Read through
+#: :meth:`UsageLedger.guard_stands_down`.
+GUARD_STAND_DOWN_FRACTION = 0.95
+
+#: The sane band a calibrated tokens-per-byte ratio is clamped to (v0.2.102
+#: context guard). The calibration — the previous accepted turn's
+#: vendor-reported input tokens over that turn's request-body bytes — is a
+#: DENSITY, and a density measured on one turn can be skewed by a body that
+#: was mostly tools, or mostly base64, or mostly cache. The band keeps a
+#: skewed measurement from becoming an absurd estimate: English text sits
+#: near 0.25 (:data:`ESTIMATE_BYTES_PER_TOKEN`), token-dense code can run
+#: higher, and nothing real lives outside 0.15-0.5. Read through
+#: :meth:`UsageLedger.token_ratio`.
+TOKEN_RATIO_MIN = 0.15
+TOKEN_RATIO_MAX = 0.5
 
 #: The ``count_tokens`` provenance label. Present on a VENDOR answer only —
 #: the first-party route is relayed verbatim, because adding a field to an
@@ -430,10 +471,17 @@ class UsageAccumulator:
         """Is this row the LAST WORD on the turn's usage?
 
         Two conditions, and the second is the one a field census alone
-        misses. Every field must have been reported at least once — a vendor
-        that never emits the cache fields reads False, correctly, because the
-        zeros in such a row are this module's default and not the upstream's
-        statement. AND the response must have stated its final usage: a
+        misses. Every field must have been reported at least once — and
+        since v0.2.102 (G2) that census runs on the bytes the CLIENT
+        received, which carry the gateway's cache-field completion: a cache
+        field the vendor left unstated is present as an explicit 0
+        (:func:`model_router.tool_ids.complete_cache_fields`), so a vendor
+        whose cache model simply has no creation half no longer reads
+        "incomplete" forever — the 0 is what the client was told, and this
+        accumulator's covenant is to record the client's view. The value
+        merge still cannot be poisoned by those zeros (a later positive
+        replaces an earlier zero), so the FIGURES stay the vendor's own.
+        AND the response must have stated its final usage: a
         non-streamed body always has, a stream has once ``message_delta``
         arrives.
 
@@ -485,12 +533,20 @@ class UsageRecord:
     disagree about the same request.
 
     Two windows, deliberately, and they answer different questions.
-    ``window_client`` is what the CLIENT budgeted — keyed purely on the id it
-    asked for, so it is 1M exactly when that id carried ``[1m]``.
-    ``window_actual`` is what the model really has, per
-    :func:`model_router.catalog.resolve_window`. When they disagree the client
-    is compacting at the wrong point, and ``pct_client`` versus ``pct_actual``
-    is that disagreement in one line.
+    ``window_client`` is what the CLIENT budgeted, detected from the id it
+    asked for (an ``[1m]`` suffix, :func:`client_window`), from the
+    ``anthropic-beta`` header it sent (a ``context-1m`` token — the spelling
+    Claude Code actually uses on ordinary traffic, since it resolves the
+    suffix itself and signals the window with the header; see
+    :mod:`model_router.routing`'s docstring) or — v0.2.102, X1, first-party
+    routes only — derived from the context table when neither signal is
+    present, because the client budgets 1M for 1M-native first-party models
+    without saying so on the wire. The header and table halves are threaded
+    in as ``one_m_client`` / ``one_m_table`` by the caller, because this
+    module never sees a request. ``window_actual`` is what the model really
+    has, per :func:`model_router.catalog.resolve_window`. When they disagree
+    the client is compacting at the wrong point, and ``pct_client`` versus
+    ``pct_actual`` is that disagreement in one line.
     """
 
     ts: str
@@ -519,6 +575,34 @@ class UsageRecord:
     pct_client: Optional[float]
     pct_actual: Optional[float]
     usage_complete: bool
+    #: The request's own body size in BYTES (0 when the body was a consumed
+    #: stream and could not be measured). Paired with ``context_tokens`` it
+    #: is the context guard's CALIBRATION — how token-dense this chat's
+    #: bodies are — read through :meth:`UsageLedger.token_ratio`. It rides
+    #: the same record rather than a parallel store so the calibration, the
+    #: floor and the row can never disagree about which turn they describe.
+    request_bytes: int = 0
+    #: v0.2.102 (A4/F2, OD-9): the rung this request ESCAPED, when the owner's
+    #: fallback ladder served it — ``"<route label>:<forward model>"`` of the
+    #: route whose qualifying refusal triggered the fallback. R15: no hidden
+    #: remaps — ``requested`` stays the id the client asked for, ``forward``
+    #: names the model that actually answered, and this field says the two
+    #: differ because of a fallback (and from where). Empty on every ordinary
+    #: row, so its absence means "no fallback", never "unknown".
+    fallback_from: str = ""
+    #: v0.2.102 (register item 2026-10-10): the effort selector this request
+    #: carried, both directions. ``effort_requested`` is what the CLIENT sent
+    #: (``output_config.effort``, or the older ``thinking.budget_tokens`` as
+    #: ``budget_tokens=<n>``); ``effort_forwarded`` is what the gateway sent
+    #: UPSTREAM after its per-vendor translation
+    #: (:func:`model_router.effort.translate_effort`) and the other shaping
+    #: passes. ``None`` — stored as ``null`` — when the payload carries no
+    #: selector or was never parsed (over-buffer / unparseable bodies): absent
+    #: is an observation, never a guess. Read through the ONE reader
+    #: :func:`model_router.effort.requested_effort`, on both sides, so the
+    #: pair can only disagree through a rewrite the gateway actually made.
+    effort_requested: Optional[str] = None
+    effort_forwarded: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
@@ -561,8 +645,33 @@ def build_record(
     window_actual: Optional[int],
     window_source: str,
     now: Optional[datetime] = None,
+    one_m_client: bool = False,
+    one_m_table: bool = False,
+    request_bytes: int = 0,
+    fallback_from: str = "",
+    effort_requested: Optional[str] = None,
+    effort_forwarded: Optional[str] = None,
 ) -> UsageRecord:
-    """Assemble one row. Pure — no clock unless the caller declines to pass one."""
+    """Assemble one row. Pure — no clock unless the caller declines to pass one.
+
+    ``one_m_client`` is the half of the client-window detection this module
+    cannot derive from ``requested``: the INCOMING request's ``anthropic-beta``
+    header carried a ``context-1m`` token. It only ever WIDENS the window to
+    :data:`CLIENT_WINDOW_1M` — :func:`client_window` still answers the
+    suffix half — so the two detections are one OR and cannot contradict.
+
+    ``one_m_table`` (v0.2.102, X1) is the third detection, for the case the
+    first two are blind to: Claude Code sends NEITHER the suffix nor the
+    beta for a first-party 1M-native model (``claude-opus-5-5``) yet budgets
+    1M against it — a session reached 791K while every row recorded
+    ``window_client: 200000``. The caller computes it from the context
+    table (a cited row whose flag or window says 1M), on the FIRST-PARTY
+    route only: behind a custom base URL the client budgets a vendor id at
+    200K unless it carries the suffix, whatever the model's real window is,
+    so the table may never widen a vendor route's row. Like
+    ``one_m_client`` it only ever widens: a table row saying 200K, or no
+    row, keeps :data:`CLIENT_WINDOW_DEFAULT`.
+    """
     moment = now or datetime.now(timezone.utc)
     input_tokens = int(totals.get("input_tokens", 0))
     cache_creation = int(totals.get("cache_creation_input_tokens", 0))
@@ -570,7 +679,11 @@ def build_record(
     output_tokens = int(totals.get("output_tokens", 0))
     context_tokens = input_tokens + cache_creation + cache_read
     context_after = context_tokens + output_tokens
-    window_c = client_window(requested)
+    window_c = (
+        CLIENT_WINDOW_1M
+        if one_m_client or one_m_table
+        else client_window(requested)
+    )
     return UsageRecord(
         ts=moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
         session=session,
@@ -593,6 +706,10 @@ def build_record(
         pct_client=_pct(context_after, window_c),
         pct_actual=_pct(context_after, window_actual),
         usage_complete=usage_complete,
+        request_bytes=max(0, int(request_bytes)),
+        fallback_from=str(fallback_from or ""),
+        effort_requested=effort_requested,
+        effort_forwarded=effort_forwarded,
     )
 
 
@@ -642,6 +759,27 @@ def access_extra(totals: Mapping[str, int], *, seen: bool) -> str:
         f"cache_r={show('cache_read_input_tokens')} "
         f"out={show('output_tokens')} "
         f"ctx={context}"
+    )
+
+
+def effort_extra(
+    effort_requested: Optional[str], effort_forwarded: Optional[str],
+) -> str:
+    """The effort pair on the access line, in ONE shape (v0.2.102).
+
+    ``effort_req=<value|-> effort_fwd=<value|->`` — both fields always
+    present on a proxied line, for the same reason :func:`access_extra`
+    always prints its five: an absent field could not be told apart from a
+    counter that never ran, and ``-`` is the honest spelling of "this
+    request carried no effort selector" (or its body was never parsed — the
+    over-buffer and unparseable paths, where neither value is known). The
+    ``budget_tokens=<n>`` spelling is the older client build's selector, so
+    a value that is not one of :data:`model_router.effort.EFFORT_VALUES` is
+    still an observation, never a formatting error.
+    """
+    return (
+        f"effort_req={effort_requested or '-'} "
+        f"effort_fwd={effort_forwarded or '-'}"
     )
 
 
@@ -843,6 +981,13 @@ class UsageLedger:
         self._last_by_identity: (
             "OrderedDict[tuple[str, Optional[str]], UsageRecord]"
         ) = OrderedDict()
+        #: Last guard-refused body size per identity, for the guard's
+        #: stand-down (:meth:`guard_stands_down`). Bounded by the SAME
+        #: ``max_sessions`` LRU cap as the row maps — a daemon that outlives
+        #: its chats must not grow an unbounded refusal memory either.
+        self._guard_refusals: (
+            "OrderedDict[tuple[str, Optional[str]], int]"
+        ) = OrderedDict()
         self._pending: set = set()
 
     # ── paths ────────────────────────────────────────────────────────────
@@ -1017,6 +1162,40 @@ class UsageLedger:
             if only is None or key == only
         }
 
+    def agent_rows(self) -> "list[dict[str, Any]]":
+        """One compact attribution row per (session, agent) identity.
+
+        The v0.2.102 (G3) answer to the harness's agents-GUI row showing the
+        SESSION model for every lane (anthropics/claude-code#93324): each
+        entry names the model that actually ANSWERED this identity's last
+        turn — ``forward``, with ``fallback_from`` beside it when the
+        owner's ladder served the turn (R15: no hidden remaps) — so a
+        surface that cannot see the wire can still say which model did the
+        work. ``agent`` is ``None`` for the main chat, which is an identity
+        like any other.
+
+        A PROJECTION of the same in-memory rows :meth:`sessions` serves,
+        keyed by identity rather than by chat, and reduced to the fields
+        attribution needs: who (session, agent), what answered (model,
+        route, fallback_from) and when (at). Newest last, LRU-bounded with
+        the rest of the ledger's memory. Reads the lock-protected map only;
+        never touches the file.
+        """
+        with self._lock:
+            items: Iterable[UsageRecord] = list(self._last_by_identity.values())
+        return [
+            {
+                "session": record.session,
+                "agent": record.agent,
+                "parent_agent": record.parent_agent,
+                "model": record.forward,
+                "route": record.route,
+                "fallback_from": record.fallback_from,
+                "at": record.ts,
+            }
+            for record in items
+        ]
+
     def context_floor(
         self, *, session: Optional[str], agent: Optional[str],
     ) -> Optional[int]:
@@ -1050,6 +1229,80 @@ class UsageLedger:
         if record is None or record.context_after <= 0:
             return None
         return record.context_after
+
+    def token_ratio(
+        self, *, session: Optional[str], agent: Optional[str],
+    ) -> Optional[float]:
+        """This identity's tokens-per-byte calibration, or ``None``.
+
+        The previous accepted turn's vendor-reported ``context_tokens``
+        divided by that turn's ``request_bytes``, clamped to the
+        :data:`TOKEN_RATIO_MIN`/:data:`TOKEN_RATIO_MAX` band. The context
+        guard multiplies it by the CURRENT request's own body size to
+        estimate that request — a DENSITY, not an absolute, so a compaction
+        (whose request body shrinks with the conversation) shrinks the
+        estimate on the very next request, which an absolute floor
+        (``context_after``) cannot do: it only ever rises, because a refused
+        request writes no record. Exact identity match, same rule as
+        :meth:`context_floor`; ``None`` when nothing calibrated exists, and
+        the caller falls back to its own estimate rather than guessing here.
+        """
+        if session is None:
+            return None
+        with self._lock:
+            record = self._last_by_identity.get((session, agent))
+        if record is None or record.request_bytes <= 0:
+            return None
+        if record.context_tokens <= 0:
+            return None
+        ratio = record.context_tokens / record.request_bytes
+        return min(max(ratio, TOKEN_RATIO_MIN), TOKEN_RATIO_MAX)
+
+    def note_guard_refusal(
+        self, *, session: Optional[str], agent: Optional[str],
+        body_bytes: int,
+    ) -> None:
+        """Record that the context guard REFUSED a body of this size.
+
+        The guard's stand-down evidence: the NEXT request for this identity
+        is compared against this size (:meth:`guard_stands_down`). Last
+        refusal wins, LRU-bounded like the row maps.
+        """
+        if session is None:
+            return
+        with self._lock:
+            self._guard_refusals.pop((session, agent), None)
+            self._guard_refusals[(session, agent)] = max(0, int(body_bytes))
+            while len(self._guard_refusals) > self._max_sessions:
+                self._guard_refusals.popitem(last=False)
+
+    def guard_stands_down(
+        self, *, session: Optional[str], agent: Optional[str],
+        body_bytes: int,
+    ) -> bool:
+        """Should the guard stand down for this body? CONSUMES the evidence.
+
+        True when the PREVIOUS request for this identity was refused by the
+        guard and this body is not at least
+        ``1 - :data:`GUARD_STAND_DOWN_FRACTION`` smaller — the shape of the
+        client's reactive compaction, which carries ≈ the refused history.
+        Standing down forwards the request to the vendor, whose own overflow
+        refusal is then translated into the envelope the client recovers
+        from; a guard that refused its own recovery request would brick the
+        session it exists to save (review batch-2 MEDIUM-2).
+
+        The evidence is consumed either way, so "previous request" always
+        means the immediately preceding one: a stand-down forwards, and a
+        genuinely smaller body has simply moved on — a NEW refusal re-notes
+        itself.
+        """
+        if session is None or body_bytes <= 0:
+            return False
+        with self._lock:
+            refused_bytes = self._guard_refusals.pop((session, agent), None)
+        if refused_bytes is None or refused_bytes <= 0:
+            return False
+        return body_bytes >= refused_bytes * GUARD_STAND_DOWN_FRACTION
 
     def health(self) -> "dict[str, Any]":
         """The ``/health`` block. Cached state only — never touches the disk."""
@@ -1105,6 +1358,7 @@ __all__ = [
     "CLIENT_WINDOW_1M",
     "CLIENT_WINDOW_DEFAULT",
     "COUNT_SOURCE_ESTIMATE",
+    "GUARD_STAND_DOWN_FRACTION",
     "COUNT_SOURCE_FIELD",
     "COUNT_SOURCE_VENDOR",
     "LEDGER_BASENAME",
@@ -1114,6 +1368,8 @@ __all__ = [
     "LEDGER_SESSIONS",
     "PARENT_AGENT_HEADER",
     "SESSION_HEADER",
+    "TOKEN_RATIO_MAX",
+    "TOKEN_RATIO_MIN",
     "USAGE_BODY_LIMIT_BYTES",
     "USAGE_FIELDS",
     "UsageAccumulator",
@@ -1123,6 +1379,7 @@ __all__ = [
     "build_record",
     "client_window",
     "count_tokens_estimate",
+    "effort_extra",
     "event_payload",
     "guard_count_tokens",
     "note_count_substitution",

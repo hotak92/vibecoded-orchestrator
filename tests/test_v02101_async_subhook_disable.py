@@ -13,7 +13,8 @@ bundle update CARRIES the disable forward: a retired async registration
 that was parked (disabled) in launcher.db lands its stem in that key, so
 the merge never silently re-enables what the user had switched off.
 
-SF-3 (narrowing): the twelve v0.2.101 retirement rows match ONLY
+SF-3 (narrowing): the v0.2.101 retirement rows (ten since v0.2.102
+removed post-file-delete's pair in favour of its own v0.2.102 rows) match ONLY
 registrations that carry ``"async": true`` — a user's OWN synchronous
 PostToolUse registration of one of the six scripts is left alone by the
 scrub, by the parked re-enable refusal, and by the launcher's prune
@@ -176,7 +177,9 @@ def _retired_stem_rows():
 
 def test_the_v02101_rows_are_declared_async_only():
     rows = _retired_stem_rows()
-    assert len(rows) == 12
+    # v0.2.102: post-file-delete.{sh,ps1} left the v0.2.101 set (10 rows);
+    # its OWN v0.2.102 rows are async-only too, asserted below.
+    assert len(rows) == 10
     assert all(e.async_only for e in rows), (
         "the v0.2.101 rows must be async-only: a user's own SYNC "
         "registration of these scripts is theirs, not VCO's to retire"
@@ -197,6 +200,10 @@ def test_async_registration_of_every_stem_matches(is_async):
                 is_async=is_async,
             )
             assert m is not None, (target, is_async)
+            # post-file-delete now matches its v0.2.102 row (script deleted
+            # with the diagrams integrations) instead of the merged row.
+            if stem == "post-file-delete":
+                assert m.retired_in == "v0.2.102", (target, m.retired_in)
 
 
 @pytest.mark.parametrize("is_async", [False, None])

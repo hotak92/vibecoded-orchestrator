@@ -130,5 +130,152 @@ class PullListMatchesSummaryBackendTests(unittest.TestCase):
                              f"vram={sysinfo.vram_gb} ram={sysinfo.ram_gb} cores={cores}")
 
 
+# ── v0.2.102 W5-D: the RUNTIME model agrees with the install pull, per tier ──
+
+#: (vram_gb, ram_gb, cores, the one model) — every tier of the shared table.
+TIERS = [
+    (24.0, 64.0, 8, "qwen3.5:9b"),     # >= 16 GB VRAM
+    (16.0, 32.0, 8, "qwen3.5:9b"),
+    (8.0, 64.0, 8, "gemma4:e4b"),      # 6-16 GB VRAM
+    (0.0, 64.0, 8, "gemma4:e4b"),      # capable CPU
+    (0.0, 16.0, 4, "qwen3.5:0.8b"),    # floor
+    (4.0, 8.0, 2, "qwen3.5:0.8b"),
+]
+
+
+class RuntimeResolverMatchesInstallPullTests(unittest.TestCase):
+    """The summary ladder used to ask Ollama for a hard-coded `qwen3.5:9b`
+    while install pulled the tier's model — on 6-16 GB VRAM / CPU hosts the
+    local tier asked for a model that was never pulled (red before W5-D:
+    `summary_backends.OLLAMA_DEFAULT_MODEL` was the constant)."""
+
+    def test_hardware_rung_matches_the_pull_list_for_every_tier(self):
+        from vco_lib import summary_model
+
+        for vram, ram, cores, want in TIERS:
+            sysinfo = _sysinfo(has_gpu=vram > 0, vram_gb=vram, ram_gb=ram)
+            with patch.object(install, "_probe_cpu_cores", return_value=cores):
+                pulled = _inference_models_for_capability(sysinfo)
+            with patch("vco_lib.host_probe.probe_gpu_vram_gb", return_value=vram), \
+                    patch("vco_lib.host_probe.probe_system_ram_gb", return_value=ram), \
+                    patch("vco_lib.host_probe.probe_cpu_cores", return_value=cores):
+                model, source = summary_model.resolve(
+                    {}, preferences=lambda: None, recorded=lambda: None)
+            self.assertEqual(pulled, [want])
+            self.assertEqual((model, source), (want, summary_model.SOURCE_HARDWARE),
+                             f"vram={vram} ram={ram} cores={cores}")
+
+    def test_install_record_rung_names_exactly_what_install_pulled(self):
+        """The record install step 7 writes is read back as the runtime model."""
+        import tempfile
+
+        from vco_lib import summary_model
+        from vco_lib.embedding_pull_plan import record_profile
+
+        for vram, ram, cores, want in TIERS:
+            sysinfo = _sysinfo(has_gpu=vram > 0, vram_gb=vram, ram_gb=ram)
+            with patch.object(install, "_probe_cpu_cores", return_value=cores):
+                tier = _inference_models_for_capability(sysinfo)
+            with tempfile.TemporaryDirectory() as root:
+                record_profile(Path(root), {"text_model": "qwen3"}, tier)
+                got = summary_model.recorded_generation_model([Path(root)])
+            self.assertEqual(got, want)
+
+    def test_profile_cap_wins_in_the_record(self):
+        import tempfile
+
+        from vco_lib import summary_model
+        from vco_lib.embedding_pull_plan import record_profile
+
+        with tempfile.TemporaryDirectory() as root:
+            record_profile(Path(root), {"inference_models_override": ["qwen3.5:0.8b"]},
+                           ["qwen3.5:9b"])
+            self.assertEqual(summary_model.recorded_generation_model([Path(root)]),
+                             "qwen3.5:0.8b")
+
+    def test_precedence(self):
+        from vco_lib import summary_model as sm
+
+        hw = lambda: "qwen3.5:0.8b"  # noqa: E731
+        self.assertEqual(sm.resolve({sm.ENV_OLLAMA_MODEL: "mymodel:7b"},
+                                    preferences=lambda: "gemma4:e4b",
+                                    recorded=lambda: "qwen3.5:9b", hardware=hw),
+                         ("mymodel:7b", sm.SOURCE_ENV))
+        self.assertEqual(sm.resolve({}, preferences=lambda: "gemma4:e4b",
+                                    recorded=lambda: "qwen3.5:9b", hardware=hw),
+                         ("gemma4:e4b", sm.SOURCE_PREFERENCES))
+        self.assertEqual(sm.resolve({}, preferences=lambda: None,
+                                    recorded=lambda: "qwen3.5:9b", hardware=hw),
+                         ("qwen3.5:9b", sm.SOURCE_INSTALL_RECORD))
+        self.assertEqual(sm.resolve({sm.ENV_OLLAMA_MODEL: "  "}, preferences=lambda: None,
+                                    recorded=lambda: None, hardware=hw),
+                         ("qwen3.5:0.8b", sm.SOURCE_HARDWARE))
+
+    def test_preferences_rung_reads_the_launcher_key(self):
+        """The launcher's Preferences page writes `kg_summary_ollama_model`
+        (preferences/loaders.ts); before W5-D nothing read it."""
+        import sqlite3
+        import tempfile
+
+        from vco_lib import summary_model as sm
+
+        loaders = (REPO_ROOT / "launcher" / "src" / "lib" / "preferences" / "loaders.ts"
+                   ).read_text(encoding="utf-8")
+        self.assertIn(f"'{sm.APP_STATE_KEY_OLLAMA_MODEL}'", loaders)
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "launcher.db"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE app_state (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER)")
+            conn.execute("INSERT INTO app_state VALUES (?, ?, 0)",
+                         (sm.APP_STATE_KEY_OLLAMA_MODEL, "gemma4:e4b"))
+            conn.commit()
+            conn.close()
+            with patch.dict("os.environ", {"VCT_LAUNCHER_DB_PATH": str(db)}):
+                self.assertEqual(sm.resolve({}, recorded=lambda: "qwen3.5:9b"),
+                                 ("gemma4:e4b", sm.SOURCE_PREFERENCES))
+
+    def test_tier_table_data_matches_the_selector(self):
+        """`summary_model_tiers()` (what the launcher's "No Ollama models"
+        hint renders, via `get_summary_model_info`) names exactly the models
+        the selector returns, strongest first, floor included."""
+        from vco_lib import embedding_selection as es
+        from vco_lib import summary_model
+
+        tiers = es.summary_model_tiers()
+        self.assertEqual([t["model"] for t in tiers],
+                         ["qwen3.5:9b", "gemma4:e4b", es.SUMMARY_FLOOR_MODEL])
+        self.assertEqual(sorted({w for _v, _r, _c, w in TIERS}),
+                         sorted(t["model"] for t in tiers))
+        self.assertIn(f"{es.SUMMARY_VRAM_QWEN35_9B_GB:g} GB", tiers[0]["when"])
+        self.assertIn(f"{es.SUMMARY_CPU_MIN_CORES}+ cores", tiers[1]["when"])
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with patch.object(summary_model, "resolve", return_value=("m", "env")), \
+                redirect_stdout(buf):
+            summary_model.main(["--json"])
+        self.assertEqual(json.loads(buf.getvalue())["tiers"], tiers)
+
+    def test_summary_backends_takes_the_resolved_model(self):
+        """Every generate caller reads `summary_backends.OLLAMA_DEFAULT_MODEL`
+        (process_documents, generate_node_formats) — its value IS the
+        resolver's, and the env override still wins."""
+        import importlib
+
+        scripts = str(REPO_ROOT / "templates" / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        sb = importlib.import_module("summary_backends")
+        with patch.dict("os.environ", {}, clear=False) as env:
+            env.pop("KG_SUMMARY_OLLAMA_MODEL", None)
+            with patch("vco_lib.summary_model.resolve_model", return_value="gemma4:e4b"):
+                self.assertEqual(sb._resolve_ollama_model(), "gemma4:e4b")
+            env["KG_SUMMARY_OLLAMA_MODEL"] = "custom:1b"
+            with patch("vco_lib.summary_model.resolve_model", return_value="gemma4:e4b"):
+                self.assertEqual(sb._resolve_ollama_model(), "custom:1b")
+
+
 if __name__ == "__main__":
     unittest.main()

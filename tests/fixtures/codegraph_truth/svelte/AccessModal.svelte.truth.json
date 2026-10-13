@@ -1,0 +1,20 @@
+{
+ "source": "AccessModal.svelte",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "toggle",
+   "start": 39,
+   "end": 43,
+   "full_name": "AccessModal.toggle"
+  },
+  {
+   "kind": "function",
+   "name": "save",
+   "start": 45,
+   "end": 60,
+   "full_name": "AccessModal.save"
+  }
+ ]
+}

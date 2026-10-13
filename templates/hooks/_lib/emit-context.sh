@@ -32,7 +32,7 @@
 # on Windows (provided $PY resolution from find-python.sh has run).
 
 # ───────────────────────────────────────────────────────────────────────────
-# vco_cap_context <text> [pointer]   /   ... | vco_cap_context_stream [pointer]
+# vco_cap_context <text> [pointer] [limit]   /   ... | vco_cap_context_stream [pointer]
 #
 # v0.2.100 WP-17 — THE cap for text a hook injects into the model's context.
 # Claude Code's hooks contract: injected hook output past 10 000 characters is
@@ -45,6 +45,13 @@
 # characters (default 9 500, clamped to 1 000..10 000; headroom for the
 # harness's own wrapper) and ENDS with a marker that says what was cut and
 # where the rest is, so the model can Read it.
+#
+# v0.2.102 W6-D: the optional third argument (a per-call `limit`) overrides
+# the global cap for ONE call — the value the caller computed as a SECTION
+# budget inside the global cap (compact-context-reinject truncates each of
+# its sections within itself so no section is dropped wholesale). The marker
+# is the same: the section cut exists to keep the whole stream under the
+# 10 000-character hook-injection limit.
 #
 # Counted in the shell's locale (characters under UTF-8, bytes under C —
 # bytes >= characters, so the limit holds either way); a multi-byte sequence
@@ -64,8 +71,12 @@ vco_hook_context_cap() {
 }
 
 vco_cap_context() {
-    local text="$1" pointer="${2:-}" cap total marker keep head
-    cap="$(vco_hook_context_cap)"
+    local text="$1" pointer="${2:-}" limit="${3:-}" cap total marker keep head
+    if [ -n "$limit" ]; then
+        cap="$limit"
+    else
+        cap="$(vco_hook_context_cap)"
+    fi
     total=${#text}
     if [ "$total" -le "$cap" ]; then
         printf '%s' "$text"
@@ -201,7 +212,7 @@ vco_hook_lib_role() {
     base="${base%.ps1}"
     case "$base" in
         route-touched-path)
-            printf '%s' "routing a touched path to kg-sync (knowledge/), the development collection (docs/), the diagram indexer and the code-graph queue, so every Edit, Write and CLI write is being parsed and then dropped" ;;
+            printf '%s' "routing a touched path to kg-sync (knowledge/), the development collection (docs/) and the code-graph queue, so every Edit, Write and CLI write is being parsed and then dropped" ;;
         bash-write-targets)
             printf '%s' "recovering the paths a shell command wrote, so no CLI write is even looked at — a redirect, a heredoc, sed -i or patch into knowledge/ or docs/ now reaches Weaviate never" ;;
         code-extensions)
@@ -255,5 +266,76 @@ Restore it by updating this project's bundle:
     printf '%s\n' "$notice" >&2
     VCO_MISSING_LIB_NOTICE="$notice"
     [ -n "${sentinel:-}" ] && { : > "$sentinel" 2>/dev/null || true; }
+    return 0
+}
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# vco_report_hub_unreachable <hooks_dir> <project_root> <agent_key> <who> <consequence>
+#
+# v0.2.102 W6-ALERTS2 (owner ruling 3): a hook that NEEDED the vct-hub and
+# could not reach it keeps its conservative default (the shared worktree gate
+# indexes on doubt, FIX-A') — but the model is told, so it can bring the hub
+# back. Same two channels and the same once-per-session discipline as
+# vco_report_missing_hook_lib above:
+#
+#   * stderr — for the human (and for a CLI caller such as a Bash tool run of
+#     code-graph-incremental.sh, whose stderr the model does read);
+#   * `$VCO_HUB_DOWN_NOTICE` — text for the CALLER's own additionalContext
+#     envelope (the caller knows its event); "" when already reported.
+#
+# Once per session PER AGENT KEY (vco_lib/hook_agent_key; session-id.sh
+# composes it), keyed by `.claude/state/hub_unreachable_notice_<key>` — ONE
+# sentinel shared by every hub-dependent hook, so the main chat hears it once
+# however many hooks hit the outage. A caller with no trustworthy session
+# (empty / "default" key: a standalone CLI run has no payload) is keyed by the
+# UTC hour, so it is told at most once an hour instead of once ever. A failed
+# sentinel write repeats the notice rather than losing it.
+#
+# The restart hint is the resolver's own user-facing text
+# (vct_project_config.sh "hub unreachable; is the launcher running? ...",
+# vco_lib/project_config.py _POST_UPDATE_HINT) plus the hub's own CLI.
+# MUST MATCH `_lib/emit-context.ps1`'s Get-VcoHubUnreachableNotice.
+VCO_HUB_DOWN_NOTICE=""
+
+vco_report_hub_unreachable() {
+    local hooks_dir="${1:-}" proot="${2:-}" key="${3:-}" who="${4:-a VCO hook}" what="${5:-}"
+    VCO_HUB_DOWN_NOTICE=""
+    if [ -n "$hooks_dir" ] && [ -f "$hooks_dir/_lib/session-id.sh" ]; then
+        # shellcheck source=session-id.sh disable=SC1091
+        . "$hooks_dir/_lib/session-id.sh"
+    fi
+    if command -v vco_hook_sanitize_session_id >/dev/null 2>&1; then
+        key="$(vco_hook_sanitize_session_id "$key")"
+    else
+        case "$key" in *[!A-Za-z0-9_-]*) key="default" ;; esac
+    fi
+    local cadence="(Shown once per session.)"
+    if [ -z "$key" ] || [ "$key" = "default" ]; then
+        key="nosession-$(date -u +%Y%m%d%H 2>/dev/null || echo 0)"
+        cadence="(Shown at most once an hour: this caller has no session.)"
+    fi
+
+    local notice
+    notice="[VCO hub unreachable] ${who} needed the vct-hub and could not reach it (stopped, or a stale token after a launcher restart).${what:+ $what}
+Bring it back with:
+  vct-hub --start-if-not-running
+(if vct-hub is not on PATH: python -m vco_lib.hub_ensure ensure, with the VCO venv's python). Hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN).
+${cadence}"
+
+    local sentinel=""
+    if [ -n "$proot" ]; then
+        sentinel="$proot/.claude/state/hub_unreachable_notice_${key}"
+        if mkdir -p "$proot/.claude/state" 2>/dev/null && [ -e "$sentinel" ]; then
+            return 0   # already reported this session
+        fi
+    fi
+
+    printf '%s\n' "$notice" >&2
+    # shellcheck disable=SC2034  # read by the sourcing hook
+    VCO_HUB_DOWN_NOTICE="$notice"
+    if [ -n "$sentinel" ]; then
+        : > "$sentinel" 2>/dev/null || true
+    fi
     return 0
 }

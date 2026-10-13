@@ -191,7 +191,8 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
         // infrastructure (Weaviate vectorizers) is unchanged; it continues
         // to run as a container service. The `search` (paper-search) MCP was
         // deleted outright in v0.2.101; the `mermaid`/`excalidraw` diagram
-        // wrappers were retired from default registration in the same release.
+        // wrappers were retired from default registration in the same release
+        // and deleted outright in v0.2.102 (diagrams dropped).
         // See docs/features/02-mcps-and-agents.md.
         // NOTE: `code-embed` (CodeSage-Large-v2 container at port 11440) is
         // NOT an MCP — it's a backend HTTP service consumed by `weaviate-kg`
@@ -205,10 +206,14 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
         McpServerConfig {
             id: "playwright".to_string(),
             name: "Browser automation".to_string(),
-            description: "Browser automation, screenshots, and GUI testing via @playwright/mcp (Microsoft, Apache-2.0). Auto-installed via npx; Chromium (~150 MB) is cached during first-install. Set VCT_SKIP_PLAYWRIGHT=1 to skip the eager browser download.".to_string(),
+            description: "Browser automation, screenshots, and GUI testing via @playwright/mcp (Microsoft, Apache-2.0), pinned and launched with Playwright's own Chromium. The MCP runs via npx; install/update downloads the Chromium revision it needs (~170 MB) and `vco doctor` reports it if missing. Set VCT_SKIP_PLAYWRIGHT=1 to skip the eager browser download.".to_string(),
             enabled: true, // Default-enabled — Playwright is generally useful and Chromium is cached during first-install
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@playwright/mcp@latest".to_string()],
+            // v0.2.102 W6-Z4: the pinned launch from bundled_mcp_versions.toml
+            // [npx.playwright_mcp] — the same argv the registration builders write.
+            args: crate::bundled_versions::playwright_mcp_launch_args(
+                &crate::bundled_versions::playwright_mcp_pin(None),
+            ),
             env: HashMap::new(),
             min_tier: OrchestratorTier::Free, // Available to all tiers
             port: None, // stdio-based MCP, no HTTP port
@@ -218,10 +223,10 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
         // NOTE (v0.2.101): the `mermaid` / `excalidraw` diagram wrapper MCPs
         // were removed from this catalog. Their default registration was
         // retired (mcp_registration.rs / install_mcp.py) and the Permissions
-        // tab no longer ships toggle cards for them; an install that already
-        // has the entries keeps them. The launcher's Diagrams tab never used
-        // these MCPs (it renders Mermaid in the webview and lists diagrams via
-        // Tauri commands), so it is unaffected.
+        // tab no longer ships toggle cards for them. v0.2.102: the wrappers
+        // themselves were deleted (diagrams dropped, owner ruling
+        // 2026-10-07) and leftover VCO-shaped entries are auto-scrubbed on
+        // update — no install keeps them.
     ]
 }
 
@@ -261,6 +266,20 @@ mod tests {
             assert!(entry.port.is_none(), "{} is stdio MCP, port must be None", entry.id);
             assert!(!entry.command.is_empty(), "{} command should be set", entry.id);
         }
+    }
+
+    /// v0.2.102 W6-Z4: the catalog's playwright argv is the pinned
+    /// `--browser chromium` launch the registration builders write, never the
+    /// floating `@latest` (which launched the system-Chrome channel).
+    #[test]
+    fn playwright_catalog_args_are_the_pinned_launch() {
+        let servers = default_mcp_servers();
+        let pw = servers.iter().find(|s| s.id == "playwright").expect("playwright");
+        let pin = crate::bundled_versions::playwright_mcp_pin(None);
+        assert_eq!(pw.command, "npx");
+        assert_eq!(pw.args, crate::bundled_versions::playwright_mcp_launch_args(&pin));
+        assert!(!pw.args.iter().any(|a| a.ends_with("@latest")), "{:?}", pw.args);
+        assert!(pw.args.windows(2).any(|w| w[0] == "--browser" && w[1] == "chromium"));
     }
 }
 

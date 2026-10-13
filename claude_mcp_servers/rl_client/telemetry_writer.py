@@ -140,11 +140,9 @@ def _resolve_hub_payload_max_bytes() -> int:
     """Resolve the payload byte cap from env, else the conservative default.
     A malformed/zero/negative override falls back to the default (a bad tunable
     must never disable the guard)."""
-    try:
-        val = int(os.environ.get(_HUB_PAYLOAD_MAX_BYTES_ENV, "") or _HUB_PAYLOAD_MAX_BYTES_DEFAULT)
-    except (TypeError, ValueError):
-        return _HUB_PAYLOAD_MAX_BYTES_DEFAULT
-    return val if val > 0 else _HUB_PAYLOAD_MAX_BYTES_DEFAULT
+    from vco_lib.env_values import env_int  # noqa: PLC0415 — vco_lib is a hard dependency of rl_client
+
+    return env_int(_HUB_PAYLOAD_MAX_BYTES_ENV, _HUB_PAYLOAD_MAX_BYTES_DEFAULT, minimum=1)
 
 
 def _serialized_len(event_json: Dict[str, Any]) -> int:
@@ -406,7 +404,7 @@ class RLTelemetryWriter:
         # HOUSEKEEPING, not telemetry — a user who opts out of collecting NEW
         # events still wants their pre-existing rl_events rows to age out (the
         # opt-out promise is "stop recording me", not "keep my old rows
-        # forever"). The 6-h in-flight-citation floor inside the retention plan
+        # forever"). The in-flight-citation floor inside the retention plan
         # applies identically in both branches.
         self._maybe_prune_rl_events()
 

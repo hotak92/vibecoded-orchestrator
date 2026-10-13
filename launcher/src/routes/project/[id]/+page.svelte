@@ -12,6 +12,14 @@
   import PacksTab from '$lib/project-state/PacksTab.svelte';
   import HooksTab from '$lib/project-state/HooksTab.svelte';
   import PermissionsTab from '$lib/project-state/PermissionsTab.svelte';
+  // v0.2.102 (W5-B C4): the per-project MCP REGISTRY tab — the rows the
+  // populate step mirrors from the project's .claude/settings.json and
+  // .mcp.json, with the registry toggle (mirrored into ~/.claude.json's
+  // disabledMcpServers by the backend through the one existing writer)
+  // and the user-added Unregister action. Sits after Permissions, which
+  // hosts the complementary per-project gate over the orchestrator's
+  // configured servers.
+  import McpTab from '$lib/project-state/McpTab.svelte';
   import SecretsTab from '$lib/project-state/SecretsTab.svelte';
   import KgCodegraphTab from '$lib/project-state/KgCodegraphTab.svelte';
   // PR-8 (v0.2.11 / 2026-05-15): per-project Identity tab + cross-project
@@ -37,12 +45,6 @@
   // is treated as a special project rather than a separate sidebar
   // surface. See OrchestratorCoreTab.svelte for the rationale.
   import OrchestratorCoreTab from '$lib/project-state/OrchestratorCoreTab.svelte';
-  // diagrams-integration plan Phase 1 (2026-05-24): Diagrams tab is
-  // conditionally rendered when the per-project `diagrams` module is
-  // active (project_modules.enabled=1). The tab sits between Permissions
-  // and Settings so it lives next to its sibling permission-shaped
-  // controls (the new "MCP Tools" sub-section is in PermissionsTab).
-  import DiagramsTab from '$lib/project-state/DiagramsTab.svelte';
   import CodeGraphBuildBanner from '$lib/components/CodeGraphBuildBanner.svelte';
   import KgSyncBanner from '$lib/components/KgSyncBanner.svelte';
   import KgSummaryBanner from '$lib/components/KgSummaryBanner.svelte';
@@ -86,7 +88,7 @@
   // when the active project's host is `orchestrator_root`. Pinned to
   // the end of the tab strip so it doesn't shift existing tab indices
   // for muscle-memory users on normal projects.
-  let activeTab = $state<'identity' | 'agents' | 'skills' | 'packs' | 'hooks' | 'permissions' | 'access' | 'secrets' | 'kg' | 'diagrams' | 'settings' | 'orchestrator_core'>('agents');
+  let activeTab = $state<'identity' | 'agents' | 'skills' | 'packs' | 'hooks' | 'permissions' | 'mcp' | 'access' | 'secrets' | 'kg' | 'settings' | 'orchestrator_core'>('agents');
 
   // v0.2.23 F2: the orchestrator-root project is treated as a special
   // project — same tab template, plus one extra "Orchestrator core"
@@ -110,14 +112,6 @@
   let rebuilding = $state(false);
   let resyncingKg = $state(false);
   let rebuildingSummaries = $state(false);
-
-  // diagrams-integration plan Phase 1.5.7: conditionally show the
-  // Diagrams tab only when the per-project `diagrams` module is active
-  // (project_modules.enabled=1). Fetched alongside the project; the
-  // result drives both the tab-strip entry and the body render guard.
-  // Defaults to `false` until Phase 1.1 lands so the tab stays hidden
-  // for projects that haven't been migrated to project_modules yet.
-  let diagramsModuleActive = $state(false);
 
   // v0.2.71 Track T-WT — subagent-git modal state. `showSubagentGitModal`
   // is set true only after `maybeOfferSubagentGitRepo` finds the project
@@ -189,23 +183,6 @@
     showSubagentGitModal = false;
   }
 
-  async function checkDiagramsModule(id: string) {
-    try {
-      diagramsModuleActive = await invoke<boolean>('is_project_module_active', {
-        projectId: id,
-        moduleName: 'diagrams',
-      });
-    } catch (e) {
-      // Defensive — Tauri command is wired since v0.2.33 and v0.2.34
-      // added orchestrator-bundled backfill so the absent-row case
-      // returns true instead of throwing. Reach this branch only on
-      // IPC-level failures; log without toasting (every page load
-      // would surface it).
-      console.warn('[project-page] is_project_module_active failed:', e);
-      diagramsModuleActive = false;
-    }
-  }
-
   async function rebuildCodeGraph() {
     if (!project) return;
     rebuilding = true;
@@ -270,10 +247,6 @@
       } catch (e) {
         console.error('inspect_orchestrator_at failed', e);
       }
-      // Diagrams module gate — runs in parallel-ish (already awaiting
-      // orchState above; this one is non-critical for the rest of the
-      // page so don't block on errors).
-      void checkDiagramsModule(project.id);
       // v0.2.71 Track T-WT: surface the subagent-git modal if this
       // project's root is repo-less + undecided (best-effort, non-blocking).
       void maybeOfferSubagentGitRepo(project.id, project.folder_path);
@@ -285,14 +258,6 @@
   onMount(loadProject);
   $effect(() => {
     if (projectId) void loadProject();
-  });
-  // If the user disables the diagrams module from within the tab body
-  // (or the module gate flips false for any other reason), bounce them
-  // back to a safe default instead of leaving a dead-tab branch.
-  $effect(() => {
-    if (activeTab === 'diagrams' && !diagramsModuleActive) {
-      activeTab = 'agents';
-    }
   });
 
   // v0.2.23 F2 (2026-05-21): converted from a static `const tabs` to a
@@ -315,17 +280,10 @@
     { id: 'packs', label: 'Packs' },
     { id: 'hooks', label: 'Hooks' },
     { id: 'permissions', label: 'Permissions' },
+    { id: 'mcp', label: 'MCP servers' },
     { id: 'access', label: 'Cross-project access' },
     { id: 'secrets', label: 'Secret refs' },
     { id: 'kg', label: 'KG / Codegraph' },
-    // diagrams-integration plan Phase 1: tab is conditional on the
-    // per-project `diagrams` module being active (plan §1.5.7). Plan
-    // says "AFTER Permissions, BEFORE Settings" — placed immediately
-    // before Settings since there are intervening permission-shaped
-    // tabs (access, secrets, kg) that grew up between them.
-    ...(diagramsModuleActive
-      ? [{ id: 'diagrams' as const, label: 'Diagrams' }]
-      : []),
     { id: 'settings', label: 'Settings' },
     // Orchestrator-root-only tab — pinned to the end. Hosts the
     // schema-rendered controls from the repo-root vct-module.json
@@ -455,20 +413,14 @@
       <HooksTab projectId={project.id} />
     {:else if activeTab === 'permissions'}
       <PermissionsTab projectId={project.id} />
+    {:else if activeTab === 'mcp'}
+      <McpTab projectId={project.id} />
     {:else if activeTab === 'access'}
       <CrossProjectAccessTab projectId={project.id} />
     {:else if activeTab === 'secrets'}
       <SecretsTab projectId={project.id} />
     {:else if activeTab === 'kg'}
       <KgCodegraphTab projectId={project.id} />
-    {:else if activeTab === 'diagrams' && diagramsModuleActive}
-      <!-- diagrams-integration plan Phase 1: gated by both activeTab
-           AND the module-active flag. Defensive: if the user disables
-           the module from inside the tab the next is_project_module_active
-           call will flip diagramsModuleActive=false and this branch
-           stops rendering (the user is bounced back to the default
-           tab via the effect below). -->
-      <DiagramsTab projectId={project.id} />
     {:else if activeTab === 'settings'}
       <!-- v0.2.22 Item #14: inlined. SettingsTab is the extracted body of
            the /project/[id]/settings route, mounted directly so users

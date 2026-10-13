@@ -65,7 +65,6 @@ Exit codes (the runner keys the version advance on exit 0):
 from __future__ import annotations
 
 import os
-import re
 import sys
 
 
@@ -105,57 +104,24 @@ _TRANSIENT_MARKER = ".claude/state/"
 
 
 def _resolve_codegraph_prefix() -> str | None:
-    """Resolve the project's codegraph class prefix from env, mirroring
-    ``schema_migration_runner._resolve_codegraph_prefix`` /
-    ``analyze_code_graph._sanitize_collection_prefix`` (kept identical to
-    ``5_to_6._resolve_codegraph_prefix`` — same resolution, do not diverge).
+    """The project's codegraph class prefix from env, through the ONE home
+    ``vco_lib.codegraph_edge_env.resolve_codegraph_prefix`` (v0.2.102 S2 — the
+    four edges and the runner used to carry their own copies). ``None`` when no
+    scope is resolvable. A failing ``import vco_lib`` is a broken install and
+    propagates (→ loud non-zero exit)."""
+    sys.path.insert(0, os.getcwd())
+    from vco_lib.codegraph_edge_env import resolve_codegraph_prefix
 
-    ``CODE_GRAPH_PROJECT`` (already the sanitized prefix the analyzer uses)
-    wins; else derive it from ``PROJECT_NAME`` via the SAME
-    ``canonical_class_prefix`` helper + legacy regex fallback so we probe the
-    class name the analyzer actually wrote. Returns ``None`` when neither is set.
-    """
-    cg = (os.environ.get("CODE_GRAPH_PROJECT") or "").strip()
-    if cg:
-        return cg
-    pn = (os.environ.get("PROJECT_NAME") or "").strip()
-    if not pn:
-        return None
-    try:
-        sys.path.insert(0, os.getcwd())
-        from vco_lib.project_naming import canonical_class_prefix
-
-        return canonical_class_prefix(pn)
-    except Exception:
-        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", pn)
-        if sanitized and sanitized[0].isalpha() and not sanitized[0].isupper():
-            sanitized = sanitized[0].upper() + sanitized[1:]
-        return sanitized or None
+    return resolve_codegraph_prefix()
 
 
 def _connect():
-    """Connect to Weaviate the SAME way the analyzer + 5_to_6 do (custom
-    host/port). Reads ``WEAVIATE_URL`` (default localhost:8081) + ``GRPC_PORT``
-    (default 50052). Raises on failure (→ non-zero exit → runner defers/retries).
-    """
-    import weaviate  # local import: only needed when the edge actually runs
+    """Weaviate via the ONE connect factory (``vco_lib.codegraph_edge_env``).
+    Raises on failure (→ non-zero exit → the runner defers + retries)."""
+    sys.path.insert(0, os.getcwd())
+    from vco_lib.codegraph_edge_env import connect_from_env
 
-    url = os.environ.get("WEAVIATE_URL", "http://localhost:8081")
-    m = re.match(r"^(https?)://([^:/]+)(?::(\d+))?", url)
-    scheme, host, port = ("http", "localhost", 8081)
-    if m:
-        scheme = m.group(1)
-        host = m.group(2)
-        port = int(m.group(3)) if m.group(3) else (443 if scheme == "https" else 8081)
-    grpc_port = int(os.environ.get("GRPC_PORT") or os.environ.get("WEAVIATE_GRPC_PORT") or 50052)
-    return weaviate.connect_to_custom(
-        http_host=host,
-        http_port=port,
-        http_secure=(scheme == "https"),
-        grpc_host=host,
-        grpc_port=grpc_port,
-        grpc_secure=(scheme == "https"),
-    )
+    return connect_from_env()
 
 
 def _purge_transient_rows(coll, path_prop: str) -> "tuple[int, int]":
@@ -210,8 +176,22 @@ def _purge_transient_rows(coll, path_prop: str) -> "tuple[int, int]":
     return deleted, failures
 
 
+_BROKEN_INSTALL_MSG = (
+    "6_to_7: vco_lib not importable — VCO install is broken; run install.py. "
+    "(The migration runner executes this edge from the project root where "
+    "vco_lib is editable-installed on every healthy install.)"
+)
+
+
 def main() -> int:
-    prefix = _resolve_codegraph_prefix()
+    # v0.2.102 (S2): the prefix + connection come from vco_lib.codegraph_edge_env;
+    # the pre-.102 silent regex fallback on a failed import is gone (a broken
+    # install fails loudly → non-zero exit → the runner defers + retries).
+    try:
+        prefix = _resolve_codegraph_prefix()
+    except ImportError as exc:
+        print(f"{_BROKEN_INSTALL_MSG} ({exc})", file=sys.stderr)
+        return 1
     if not prefix:
         # v0.2.74 HIGH-2: print the EDGE_NOOP_NO_PREFIX sentinel so the runner
         # does NOT falsely advance the recorded version on a rc=0 that purged

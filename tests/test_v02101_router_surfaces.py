@@ -38,6 +38,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS = REPO_ROOT / "templates" / "hooks"
@@ -127,7 +128,7 @@ class Rig:
             env_overrides: dict | None = None) -> subprocess.CompletedProcess:
         env = self.env(**(env_overrides or {}))
         if shell == "ps1":
-            argv = ["pwsh", "-NoProfile", "-File", str(HOOKS / f"{hook}.ps1")]
+            argv = ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / f"{hook}.ps1")]
         else:
             argv = ["bash", str(HOOKS / f"{hook}.sh")]
         return subprocess.run(

@@ -1,0 +1,37 @@
+{
+ "source": "service.go",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Greeter",
+   "start": 7,
+   "end": 9,
+   "full_name": "golden.Greeter",
+   "methods": [
+    "Greet"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "Greet",
+   "start": 12,
+   "end": 14,
+   "full_name": "golden.Greet"
+  },
+  {
+   "kind": "function",
+   "name": "NewGreeter",
+   "start": 17,
+   "end": 19,
+   "full_name": "golden.NewGreeter"
+  },
+  {
+   "kind": "function",
+   "name": "addNumbers",
+   "start": 21,
+   "end": 23,
+   "full_name": "golden.addNumbers"
+  }
+ ]
+}

@@ -328,41 +328,84 @@ fn basename_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Reject a path that overlaps with the project's own folder_path:
-///   * exact match
-///   * sub-path of folder_path
+/// Reject a path that overlaps the project's own folder: the same folder,
+/// a folder INSIDE it (already indexed — or excluded on purpose — as part of
+/// the project), or a folder CONTAINING it (every primary edit would be
+/// drained with the extra's argv and the whole tree double-walked).
 ///
-/// Returns the user-facing error string when overlap detected.
-fn reject_self_overlap(extra: &str, folder_path: &str) -> Result<(), String> {
-    let extra_norm = extra.trim_end_matches('/');
-    // Normalise folder_path to forward slashes too (Windows DB rows
-    // may have raw backslashes; we don't canonicalise at DB read time
-    // so the comparison MUST be tolerant).
-    let folder_norm: String = folder_path.replace('\\', "/").trim_end_matches('/').to_string();
+/// v0.2.102 W6-CGD (D-4): the rule has ONE home, the Python
+/// `vco_lib.codegraph_extra_overlap` (rule A — the analyzer and the automatic
+/// extra-folder refresh call the same function); this wrapper runs it through
+/// [`crate::services::vco_lib_bridge::codegraph_extra_overlap`] and maps its
+/// verdict onto the command's error channel, which the Add dialog shows as
+/// is. A check that cannot run refuses the add (a broken install must not
+/// register an unchecked folder). Both sides are realpath-ed by the rule, so
+/// a symlinked or non-canonical `folder_path` row compares correctly.
+fn reject_self_overlap(
+    root: Option<&std::path::Path>,
+    extra: &str,
+    folder_path: &str,
+) -> Result<(), String> {
+    let reply = crate::services::vco_lib_bridge::codegraph_extra_overlap(root, extra, folder_path)
+        .map_err(|e| format!("could not check '{}' against this project's folder: {}", extra, e))?;
+    overlap_reply_to_result(&reply)
+}
 
-    if extra_norm.eq_ignore_ascii_case(&folder_norm) {
-        return Err(format!(
-            "the path '{}' is this project's own folder — it's already covered \
-             by the main codegraph analysis, no need to add it as an extra",
-            extra
-        ));
+/// Map the overlap reply to the command's result: `refused` → the rule's own
+/// sentence as the error; anything else → allowed. Split out so the mapping is
+/// unit-testable without a child.
+fn overlap_reply_to_result(reply: &serde_json::Value) -> Result<(), String> {
+    if reply.get("refused").and_then(serde_json::Value::as_bool) == Some(true) {
+        let msg = reply
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .filter(|m| !m.is_empty())
+            .unwrap_or("this folder overlaps the project's own folder");
+        return Err(msg.to_string());
     }
-
-    // Sub-path check. We require the prefix to be followed by a `/`
-    // so `/opt/foo` does NOT shadow `/opt/foobar`.
-    let prefix_with_sep = format!("{}/", folder_norm);
-    if extra_norm
-        .to_ascii_lowercase()
-        .starts_with(&prefix_with_sep.to_ascii_lowercase())
-    {
-        return Err(format!(
-            "the path '{}' is INSIDE this project's own folder ('{}') — it's already \
-             covered by the main codegraph analysis",
-            extra, folder_path
-        ));
-    }
-
     Ok(())
+}
+
+/// The enabled extras the ONE overlap rule refuses for this project (v0.2.102
+/// R11-03). `check` is [`crate::services::vco_lib_bridge::codegraph_extra_overlap`]
+/// in production (a seam for tests). A check that cannot run is an `Err`: the
+/// caller then runs nothing, rather than guess which folders are walked.
+fn refused_extra_paths<F>(
+    extras: &[String],
+    folder_path: &str,
+    check: F,
+) -> Result<std::collections::HashSet<String>, String>
+where
+    F: Fn(&str, &str) -> Result<serde_json::Value, String>,
+{
+    let mut refused = std::collections::HashSet::new();
+    for extra in extras {
+        let reply = check(extra, folder_path).map_err(|e| {
+            format!("could not check code folder '{}' against this project's folder: {}", extra, e)
+        })?;
+        if overlap_reply_to_result(&reply).is_err() {
+            refused.insert(extra.clone());
+        }
+    }
+    Ok(refused)
+}
+
+/// Which extras a "Reindex all" run may mark indexed, with the HEAD read
+/// before the walk (NB-H6): every extra except those the overlap rule refused
+/// — the analyzer does not walk a refused folder, so stamping it would show
+/// it up to date and steer later incremental syncs from a commit nobody
+/// indexed (v0.2.102 R11-03).
+fn reindex_stamp_targets<'a>(
+    extras: &'a [String],
+    pre_heads: &'a [Option<String>],
+    refused: &std::collections::HashSet<String>,
+) -> Vec<(&'a str, Option<&'a str>)> {
+    extras
+        .iter()
+        .zip(pre_heads.iter())
+        .filter(|(path, _)| !refused.contains(*path))
+        .map(|(path, sha)| (path.as_str(), sha.as_deref()))
+        .collect()
 }
 
 /// Find a launcher project whose `folder_path` (post-normalisation)
@@ -476,8 +519,13 @@ pub async fn add_project_codegraph_extra_path(
     // Step 1: canonicalise.
     let canonical = canonicalise_for_storage(&path)?;
 
-    // Step 2: reject self-overlap.
-    reject_self_overlap(&canonical, &project.folder_path)?;
+    // Step 2: reject self-overlap (the one rule, `vco_lib.codegraph_extra_overlap`;
+    // blocking child off the async executor).
+    let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db.inner());
+    let (extra_c, folder_c) = (canonical.clone(), project.folder_path.clone());
+    tokio::task::spawn_blocking(move || reject_self_overlap(root.as_deref(), &extra_c, &folder_c))
+        .await
+        .map_err(|e| format!("overlap check: {}", e))??;
 
     // Step 3: launcher-project disambiguation. Only the EXACT
     // folder_path match triggers the modal — a sub-path of another
@@ -668,26 +716,30 @@ pub async fn sync_project_codegraph_extra_path(
         &prefix,
         incremental,
         row.last_indexed_commit.as_deref(),
+        // W6-CGD (D-4): the analyzer refuses an extra overlapping the project.
+        Some(project.folder_path.as_str()),
     );
 
     let started = std::time::Instant::now();
-    let report = run_analyzer_with_stream(
-        &project.folder_path,
-        &project_id,
-        &label,
-        &args,
-        &app,
+    // v0.2.102 NB-H6: the HEAD is read BEFORE the analyzer runs — a commit
+    // landing mid-walk must NOT be stamped as indexed (its files were never
+    // walked). The ordering lives in the one injectable seam below so a unit
+    // test can pin it.
+    let head_path = row.path.clone();
+    let (report, sha) = analyze_with_pre_read_stamp(
+        || run_analyzer_with_stream(&project.folder_path, &project_id, &label, &args, &app),
+        move || git_head_sha(&head_path),
     )
     .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     // Record through the ONE writer shared with the hub route
     // (`record_codegraph_extra_indexed`): last_indexed_* on the row, the
-    // V52-Z `code_graph_builds` upsert, and the audit row. SHA: best-effort;
-    // `None` for a non-git extra path (clears any prior value). A row that
-    // vanished mid-run is not resurrected — the sync outcome still returns
-    // (the entities are already in Weaviate; only bookkeeping is skipped).
-    let sha = git_head_sha(&row.path);
+    // V52-Z `code_graph_builds` upsert, and the audit row. SHA: the
+    // PRE-analyze HEAD (NB-H6); `None` for a non-git extra path (clears any
+    // prior value). A row that vanished mid-run is not resurrected — the
+    // sync outcome still returns (the entities are already in Weaviate;
+    // only bookkeeping is skipped).
     let entities_indexed = report.modules + report.classes + report.functions + report.apis;
     if let Err(e) = db.record_codegraph_extra_indexed(
         &project_id,
@@ -760,6 +812,24 @@ pub async fn reindex_project_codegraph_after_extras_change(
     let extras = db.list_enabled_codegraph_extras(&project_id)?;
     let prefix = resolve_collection_prefix(&db, &project)?;
 
+    // v0.2.102 R11-03: which extras the ONE overlap rule refuses (blocking
+    // child off the async executor). They are still passed as `--extra-path`:
+    // the analyzer refuses them too and keeps their rows from `--prune-stale`
+    // — left out of the argv, an unvisited folder's rows would be pruned. What
+    // changes is that a refused folder is never stamped as indexed below.
+    let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db.inner());
+    let (extra_paths, folder_c) = (
+        extras.iter().map(|e| e.path.clone()).collect::<Vec<String>>(),
+        project.folder_path.clone(),
+    );
+    let refused = tokio::task::spawn_blocking(move || {
+        refused_extra_paths(&extra_paths, &folder_c, |extra, folder| {
+            crate::services::vco_lib_bridge::codegraph_extra_overlap(root.as_deref(), extra, folder)
+        })
+    })
+    .await
+    .map_err(|e| format!("overlap check: {}", e))??;
+
     // Build args: primary path first, then every --extra-path entry.
     let mut args: Vec<String> = vec![
         project.folder_path.clone(),
@@ -778,27 +848,32 @@ pub async fn reindex_project_codegraph_after_extras_change(
     }
 
     let started = std::time::Instant::now();
-    let report = run_analyzer_with_stream(
-        &project.folder_path,
-        &project_id,
-        &project.name,
-        &args,
-        &app,
+    // v0.2.102 fix-round (NB-H6, reindex arm): every extra's HEAD is read
+    // BEFORE the multi-root analyze — the pre-fix loop below read them AFTER,
+    // so a commit landing mid-walk was stamped as indexed although its files
+    // were never walked. Same injectable seam as the single-path Sync.
+    let head_paths: Vec<String> = extras.iter().map(|e| e.path.clone()).collect();
+    let (report, pre_heads) = analyze_with_pre_read_stamp(
+        || run_analyzer_with_stream(
+            &project.folder_path,
+            &project_id,
+            &project.name,
+            &args,
+            &app,
+        ),
+        move || head_paths.iter().map(|p| git_head_sha(p)).collect::<Vec<Option<String>>>(),
     )
     .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    // After a successful reindex, refresh each extra's last_indexed_*
-    // so subsequent incremental runs have an accurate baseline.
+    // After a successful reindex, refresh each WALKED extra's last_indexed_*
+    // so subsequent incremental runs have an accurate baseline. The commit
+    // stamped is the PRE-analyze HEAD (NB-H6); a refused extra is not walked
+    // and keeps its stamp (R11-03).
     let now = chrono::Utc::now().timestamp_millis();
-    for e in &extras {
-        let sha = git_head_sha(&e.path);
-        let _ = db.update_codegraph_extra_last_indexed(
-            &project_id,
-            &e.path,
-            now,
-            sha.as_deref(),
-        );
+    let extra_list: Vec<String> = extras.iter().map(|e| e.path.clone()).collect();
+    for (path, sha) in reindex_stamp_targets(&extra_list, &pre_heads, &refused) {
+        let _ = db.update_codegraph_extra_last_indexed(&project_id, path, now, sha);
     }
 
     // V52-Z (v0.2.52): also upsert `code_graph_builds`. The reindex
@@ -836,6 +911,8 @@ pub async fn reindex_project_codegraph_after_extras_change(
         paths: paths.clone(),
     };
 
+    let mut refused_sorted: Vec<&String> = refused.iter().collect();
+    refused_sorted.sort();
     let _ = db.audit(
         "codegraph_reindex_after_extras_change",
         Some(&project_id),
@@ -846,6 +923,7 @@ pub async fn reindex_project_codegraph_after_extras_change(
             "entities_indexed": outcome.entities_indexed,
             "duration_ms": outcome.duration_ms,
             "prune_stale": prune_stale,
+            "refused_extras": refused_sorted,
         }),
     );
 
@@ -931,6 +1009,36 @@ struct AnalyzerFinalReport {
     pub functions: u64,
     #[serde(default)]
     pub apis: u64,
+}
+
+/// v0.2.102 NB-H6 — run the analyzer and return the commit stamp(s) to
+/// record, with the HEAD read(s) BEFORE the analyze.
+///
+/// Reading `git rev-parse HEAD` AFTER the walk stamps a commit that landed
+/// mid-run as "indexed" although its files were never walked — the row then
+/// looks current and neither the incremental `--since-commit` path nor the
+/// panel's stale badge ever revisits those files. The stamp must be the
+/// PRE-analyze HEAD: if HEAD moved during the walk, the post-walk comparison
+/// (`extra_path_is_stale`) still sees the delta and the next sync walks it.
+///
+/// The stamp type is generic: the single-path Sync uses `Option<String>`;
+/// `reindex_project_codegraph_after_extras_change` collects one
+/// `Option<String>` per extra (`Vec<Option<String>>`) before its multi-root
+/// analyze (same mid-walk race, fix-round 2). Both legs are injectable so a
+/// unit test can advance "HEAD" mid-run and pin the ordering. `read_head`
+/// is called exactly once, before `run_analyzer` is awaited.
+async fn analyze_with_pre_read_stamp<Run, Fut, ReadHead, Stamp>(
+    run_analyzer: Run,
+    read_head: ReadHead,
+) -> Result<(AnalyzerFinalReport, Stamp), String>
+where
+    Run: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<AnalyzerFinalReport, String>>,
+    ReadHead: FnOnce() -> Stamp,
+{
+    let stamp = read_head();
+    let report = run_analyzer().await?;
+    Ok((report, stamp))
 }
 
 /// Resolve `python` to use for the analyzer. Mirrors
@@ -1249,31 +1357,53 @@ mod tests {
     }
 
     // ─── reject_self_overlap ────────────────────────────────────────────
+    // W6-CGD (D-4): these drive the ONE rule end-to-end through the bridge
+    // child (`python -m vco_lib.codegraph_extra_overlap`, this checkout's
+    // vco_lib under cfg(test)); the rule's own cases live in
+    // tests/test_v02102_codegraph_source_scope.py.
+
+    #[test]
+    fn reject_self_overlap_names_an_ignored_subfolder() {
+        // A folder under an ignore-set dir is NOT indexed by the project, so the
+        // refusal must not claim it is "already indexed".
+        let err = reject_self_overlap(None, "/opt/myproj/vendor/lib", "/opt/myproj").unwrap_err();
+        assert!(err.contains("never indexes"), "got: {}", err);
+        assert!(!err.contains("already indexed"), "got: {}", err);
+    }
+
+    #[test]
+    fn overlap_reply_mapping_refused_and_allowed() {
+        let refused = serde_json::json!({"ok": true, "verdict": "inside_project", "refused": true,
+                                         "message": "nope"});
+        assert_eq!(overlap_reply_to_result(&refused).unwrap_err(), "nope");
+        let allowed = serde_json::json!({"ok": true, "verdict": "ok", "refused": false, "message": ""});
+        overlap_reply_to_result(&allowed).unwrap();
+    }
 
     #[test]
     fn reject_self_overlap_rejects_exact_match() {
-        let err = reject_self_overlap("/opt/myproj", "/opt/myproj").unwrap_err();
+        let err = reject_self_overlap(None, "/opt/myproj", "/opt/myproj").unwrap_err();
         assert!(err.contains("project's own folder"), "got: {}", err);
     }
 
     #[test]
     fn reject_self_overlap_rejects_sub_path() {
-        let err = reject_self_overlap("/opt/myproj/sub/dir", "/opt/myproj").unwrap_err();
-        assert!(err.contains("INSIDE this project"), "got: {}", err);
+        let err = reject_self_overlap(None, "/opt/myproj/sub/dir", "/opt/myproj").unwrap_err();
+        assert!(err.contains("inside this project's folder"), "got: {}", err);
     }
 
     #[test]
     fn reject_self_overlap_accepts_sibling_paths() {
         // sibling of project: NOT inside.
-        reject_self_overlap("/opt/sibling", "/opt/myproj").unwrap();
+        reject_self_overlap(None, "/opt/sibling", "/opt/myproj").unwrap();
         // sub-path that doesn't share a full segment boundary.
-        reject_self_overlap("/opt/myprojz/sub", "/opt/myproj").unwrap();
+        reject_self_overlap(None, "/opt/myprojz/sub", "/opt/myproj").unwrap();
     }
 
     #[test]
     fn reject_self_overlap_handles_trailing_slash() {
         // Both with trailing slash + one without → still detect overlap.
-        let err = reject_self_overlap("/opt/myproj/", "/opt/myproj/").unwrap_err();
+        let err = reject_self_overlap(None, "/opt/myproj/", "/opt/myproj/").unwrap_err();
         assert!(err.contains("project's own folder"), "got: {}", err);
     }
 
@@ -1281,8 +1411,8 @@ mod tests {
     fn reject_self_overlap_normalises_backslashes() {
         // Folder path stored with backslashes (Windows DB row). Extra
         // path is already forward-slash form (post-canonicalisation).
-        let err = reject_self_overlap("c:/opt/myproj/sub", "c:\\opt\\myproj").unwrap_err();
-        assert!(err.contains("INSIDE this project"), "got: {}", err);
+        let err = reject_self_overlap(None, "c:/opt/myproj/sub", "c:\\opt\\myproj").unwrap_err();
+        assert!(err.contains("inside this project's folder"), "got: {}", err);
     }
 
     // ─── find_project_owning_path ───────────────────────────────────────
@@ -1436,6 +1566,154 @@ mod tests {
             h.await.unwrap();
         }
         assert_eq!(counter.load(Ordering::SeqCst), n);
+    }
+
+    // ─── v0.2.102 R11-03: "Reindex all" never stamps a refused extra ─────
+
+    #[test]
+    fn reindex_refused_extras_come_from_the_one_overlap_rule() {
+        // Real bridge child (`python -m vco_lib.codegraph_extra_overlap`), the
+        // same rule the analyzer applies to a combined walk's `--extra-path`.
+        let extras = vec![
+            "/opt/myproj/sub".to_string(),
+            "/opt/sibling".to_string(),
+            "/opt/myproj".to_string(),
+        ];
+        let refused = refused_extra_paths(&extras, "/opt/myproj", |extra, folder| {
+            crate::services::vco_lib_bridge::codegraph_extra_overlap(None, extra, folder)
+        })
+        .unwrap();
+        let mut got: Vec<&String> = refused.iter().collect();
+        got.sort();
+        assert_eq!(got, vec!["/opt/myproj", "/opt/myproj/sub"]);
+    }
+
+    #[test]
+    fn reindex_overlap_check_that_cannot_run_is_an_error() {
+        let extras = vec!["/opt/sibling".to_string()];
+        let err = refused_extra_paths(&extras, "/opt/myproj", |_e, _f| Err("no python".to_string()))
+            .unwrap_err();
+        assert!(err.contains("/opt/sibling") && err.contains("no python"), "{err}");
+    }
+
+    #[test]
+    fn reindex_does_not_stamp_a_refused_extra() {
+        // ACT: the refused nested folder is not walked, so it keeps its stamp.
+        // LEAVE-ALONE: the walked folder is stamped with its PRE-analyze HEAD.
+        let extras = vec!["/opt/myproj/sub".to_string(), "/opt/sibling".to_string()];
+        let heads = vec![Some("aaa".to_string()), Some("bbb".to_string())];
+        let refused: std::collections::HashSet<String> =
+            ["/opt/myproj/sub".to_string()].into_iter().collect();
+        assert_eq!(
+            reindex_stamp_targets(&extras, &heads, &refused),
+            vec![("/opt/sibling", Some("bbb"))]
+        );
+        let none = std::collections::HashSet::new();
+        assert_eq!(reindex_stamp_targets(&extras, &heads, &none).len(), 2);
+    }
+
+    // ─── v0.2.102 NB-H6: the stamped commit is the PRE-analyze HEAD ──────
+
+    #[tokio::test]
+    async fn analyze_with_pre_read_stamp_reads_head_before_the_analyze() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // "HEAD" advances mid-run: the first read (pre-analyze) is `aaa…`,
+        // every later read is `bbb…` (a commit landed during the walk). The
+        // stamp must be the PRE-analyze value — the post-walk stale check
+        // (`extra_path_is_stale`) then still sees `bbb…` as unindexed.
+        let head_reads = AtomicUsize::new(0);
+        let events = std::sync::Mutex::new(Vec::new());
+        let (report, sha) = analyze_with_pre_read_stamp(
+            || async {
+                events.lock().unwrap().push("analyze");
+                Ok(AnalyzerFinalReport {
+                    files_analyzed: 3,
+                    modules: 1,
+                    classes: 1,
+                    functions: 2,
+                    apis: 0,
+                })
+            },
+            || {
+                events.lock().unwrap().push("read_head");
+                match head_reads.fetch_add(1, Ordering::SeqCst) {
+                    0 => Some("a".repeat(40)),
+                    _ => Some("b".repeat(40)),
+                }
+            },
+        )
+        .await
+        .expect("analyzer ok");
+        assert_eq!(sha.as_deref(), Some("a".repeat(40).as_str()),
+            "the stamp must be the PRE-analyze HEAD, not a commit that landed mid-run");
+        assert_eq!(head_reads.load(Ordering::SeqCst), 1,
+            "HEAD is read exactly once — before the analyze, never again after it");
+        assert_eq!(events.lock().unwrap().as_slice(), ["read_head", "analyze"],
+            "the read must precede the analyzer run");
+        assert_eq!(report.files_analyzed, 3);
+    }
+
+    #[tokio::test]
+    async fn analyze_with_pre_read_stamp_propagates_analyzer_failure() {
+        let (report, sha) = match analyze_with_pre_read_stamp(
+            || async { Err::<AnalyzerFinalReport, String>("analyzer exited 1".to_string()) },
+            || Some("c".repeat(40)),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                assert!(e.contains("analyzer exited 1"));
+                return;
+            }
+        };
+        panic!("analyzer failure must propagate, got ({report:?}, {sha:?})");
+    }
+
+    #[tokio::test]
+    async fn analyze_with_pre_read_stamp_collects_every_stamp_before_the_analyze() {
+        // The reindex arm's shape (fix-round 2, NB-H6): ONE read_head call
+        // collects a stamp per extra BEFORE the multi-root analyze; a commit
+        // landing mid-walk must surface in NONE of the stamps.
+        let events = std::sync::Mutex::new(Vec::new());
+        let (report, stamps) = analyze_with_pre_read_stamp(
+            || async {
+                events.lock().unwrap().push("analyze");
+                Ok(AnalyzerFinalReport::default())
+            },
+            || {
+                events.lock().unwrap().push("read_head");
+                vec![Some("a".repeat(40)), None, Some("b".repeat(40))]
+            },
+        )
+        .await
+        .expect("analyzer ok");
+        assert_eq!(events.lock().unwrap().as_slice(), ["read_head", "analyze"],
+            "every extra's HEAD must be collected before the analyze starts");
+        assert_eq!(stamps,
+            vec![Some("a".repeat(40)), None, Some("b".repeat(40))],
+            "the stamps are the PRE-analyze reads, verbatim and in extras order");
+        let _ = report;
+    }
+
+    // ─── reject_self_overlap: ancestor arm (v0.2.102 M-A1) ───────────────
+
+    #[test]
+    fn reject_self_overlap_rejects_ancestor_of_project_root() {
+        // An extra that CONTAINS the project root would hijack every primary
+        // edit into the extra queue / wrong argv shape. Registration must
+        // refuse it — the GUI's Add flow reaches this validator through
+        // `add_project_codegraph_extra_path`, the only registration path.
+        let err = reject_self_overlap(None, "/opt/work", "/opt/work/app").unwrap_err();
+        assert!(err.contains("contains this project's own folder"), "got: {}", err);
+        let err = reject_self_overlap(None, "/opt", "/opt/work/app").unwrap_err();
+        assert!(err.contains("contains this project's own folder"), "got: {}", err);
+        // Same boundary rule as the sub-path arm: /opt/work2 is NOT an
+        // ancestor of /opt/work/app.
+        reject_self_overlap(None, "/opt/work2", "/opt/work/app").unwrap();
+        // Case-insensitive, mirroring the existing arms.
+        let err = reject_self_overlap(None, "/OPT/WORK", "/opt/work/app").unwrap_err();
+        assert!(err.contains("contains this project's own folder"), "got: {}", err);
     }
 
     // ─── from_row / display_label ───────────────────────────────────────

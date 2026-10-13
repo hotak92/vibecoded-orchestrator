@@ -48,8 +48,9 @@
 //! The route layout intentionally mirrors the Tauri-side surface in
 //! `src/commands/lifecycle.rs` (services_status, services_start_all,
 //! services_stop_all, services_restart_all, service_{start,stop,restart})
-//! and `src/commands/module_service.rs` (restart_rl_container, the
-//! per-project module surface that Step 24 / Stream B generalises).
+//! and `src/commands/module_service.rs` (restart_module_container, the
+//! generic per-module Restart that subsumes the retired RL-specific
+//! command — v0.2.102 W5-B OD-11).
 //! Step 24's body-fill will be mechanical — same input args, same
 //! output shapes — because the contracts were designed in lockstep
 //! here.
@@ -292,7 +293,7 @@ async fn service_restart(
 // ─── Module-lifecycle handlers (Step 24 commit b) ─────────────────
 //
 // Filled in by Step 24's Stream B port. The launcher's Tauri-side
-// commands (`commands::module_service::restart_rl_container`;
+// commands (`commands::module_service::restart_module_container`;
 // the launcher's running-state read is `module_health_snapshot`) proxy here via the `hub_proxy_module_*` helpers
 // in `launcher/src-tauri/src/commands/module_service.rs`. The supervisor
 // logic lives in `module_supervisor.rs`.
@@ -525,7 +526,8 @@ async fn module_stop(
 /// DECISION (v0.2.75 RL-15), not by omission.
 ///
 /// DECIDED POSTURE: GUI-alive in-process restart is the SUPPORTED path —
-/// the launcher's `restart_rl_container` command drives
+/// the launcher's `restart_module_container` command (the module tile's
+/// Restart, since v0.2.102 W5-B OD-11) drives
 /// `module_supervisor` in-process via `commands/module_service.rs`, with
 /// the launcher's full manifest context in hand. A hub-side restart would
 /// need its own manifest CATALOG RESOLVER (manifest discovery + variant
@@ -546,8 +548,9 @@ async fn module_restart(
         StatusCode::NOT_IMPLEMENTED,
         "not_implemented_supervisor_restart",
         "Hub-side restart needs a manifest catalog resolver — landed in a \
-         Phase 3+ step. Launcher's restart_rl_container command continues \
-         to call module_supervisor in-process via commands/module_service.rs.",
+         Phase 3+ step. The launcher's restart_module_container command \
+         (the module tile's Restart) continues to call module_supervisor \
+         in-process via commands/module_service.rs.",
     )
 }
 
@@ -840,13 +843,20 @@ mod tests {
 
     /// v0.2.75 RL-15 (DECIDED, was "not yet implemented"): module_restart
     /// returns 501 BY DESIGN. GUI-alive in-process restart
-    /// (`restart_rl_container` → module_supervisor via
+    /// (`restart_module_container` → module_supervisor via
     /// commands/module_service.rs) is the supported posture until the
     /// Phase 3+ manifest catalog resolver exists — a partial hub-side
     /// resolver would fork the launcher's manifest resolution and drift.
     /// This test PINS the deliberate 501; if it starts failing because the
     /// route grew an implementation, verify the implementation routes
     /// through the SHARED catalog resolver, then update this pin.
+    ///
+    /// v0.2.102 (W5-B review B1): the pin also asserts the 501's REMEDY
+    /// text names a command that EXISTS. The remedy used to point users
+    /// at `restart_rl_container`, retired in v0.2.102 — a remedy naming a
+    /// dead command is worse than none. Red-proof: rename the command in
+    /// the error body back to the retired name and the contains-assert
+    /// fails.
     #[tokio::test]
     async fn module_restart_returns_501_supervisor_restart() {
         let (base, _h) = spawn_lifecycle_api_hub().await;
@@ -864,6 +874,20 @@ mod tests {
         assert_eq!(
             body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
             Some("not_implemented_supervisor_restart"),
+        );
+        // The remedy must name the LIVE command (and never the retired one).
+        let message = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            message.contains("restart_module_container"),
+            "the 501 remedy must name the live restart command: {message}",
+        );
+        assert!(
+            !message.contains("restart_rl_container"),
+            "the 501 remedy names the RETIRED command: {message}",
         );
     }
 

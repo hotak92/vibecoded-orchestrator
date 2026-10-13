@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SH_HOOK = REPO_ROOT / "templates" / "hooks" / "lean-ctx-rewrite.sh"
@@ -153,6 +154,18 @@ def _make_fake_lean_ctx(bin_dir: Path, *, failing: bool = False) -> Path:
     return fake
 
 
+def _mark_project(proj: Path) -> None:
+    """Stage ``proj`` as a real VCO project (``.claude/settings.json``).
+
+    The hook finds its project by the marked-root rule (v0.2.102 W6-W,
+    ``_lib/project-root.{sh,ps1}``). An unmarked cwd is no project, and with
+    no project there is no private tee dir, so the command runs raw — which
+    would make every "raw" assertion here pass for the wrong reason.
+    """
+    (proj / ".claude").mkdir(parents=True, exist_ok=True)
+    (proj / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+
+
 def _run_sh_hook(cmd: str, tmp_path: Path, *, env_file: str | None = None,
                  extra_tool_input: dict | None = None,
                  extra_env: dict | None = None,
@@ -173,7 +186,7 @@ def _run_sh_hook(cmd: str, tmp_path: Path, *, env_file: str | None = None,
     if extra_env:
         env.update(extra_env)
     proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
+    _mark_project(proj)
     if env_file is not None:
         (proj / ".claude").mkdir(exist_ok=True)
         (proj / ".claude" / "env").write_text(env_file, encoding="utf-8")
@@ -198,12 +211,12 @@ def _run_ps1_hook(cmd: str, tmp_path: Path, *, env_file: str | None = None,
     env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
     env["FAKE_ARGV_LOG"] = str(tmp_path / "argv.log")
     proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
+    _mark_project(proj)
     if env_file is not None:
         (proj / ".claude").mkdir(exist_ok=True)
         (proj / ".claude" / "env").write_text(env_file, encoding="utf-8")
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(PS1_HOOK)],
         input=_payload(cmd, **(extra_tool_input or {})),
         capture_output=True, text=True, cwd=proj, env=env, timeout=60,
     )
@@ -336,7 +349,7 @@ class TestShAllowListGate:
 
     def test_binary_absent_everywhere_clean_noop(self, tmp_path):
         home = tmp_path / "home"
-        (home / "proj").mkdir(parents=True)
+        _mark_project(home / "proj")
         env = dict(os.environ)
         env.pop("VCT_DISABLE_HOOKS", None)
         env["HOME"] = str(home)
@@ -718,6 +731,22 @@ class TestPs1HookParity:
         assert res.stdout.strip(), "wrap expected"
         assert len(list(_rawdir(proj).glob("*.cmd"))) == 1
 
+    @pytest.mark.parametrize("runner", ["sh", "ps1"])
+    def test_export_prefix_and_last_assignment_win(self, runner, tmp_path):
+        """v0.2.102: `.claude/env` lines may carry `export ` (the managed block
+        writes that form) and the LAST assignment wins — the .sh sibling gets
+        both from `source`; the .ps1 raw scan must read the file the same way."""
+        run = _run_sh_hook if runner == "sh" else _run_ps1_hook
+        res = run("npm install", tmp_path / "off",
+                  env_file="export VCO_LEAN_CTX_DEFAULT=off\n")
+        assert res.stdout.strip() == "", f"{runner}: exported off must disable"
+        res = run("npm install", tmp_path / "ttl",
+                  env_file="VCO_LEAN_CTX_TEE_TTL_HOURS=24\n"
+                           "export VCO_LEAN_CTX_TEE_TTL_HOURS=48\n")
+        wrapped = json.loads(
+            res.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert wrapped.rstrip().split()[-1].strip("'") == "48", wrapped
+
     @pytest.mark.parametrize("val", ["Off", "OFF"])
     def test_default_off_is_case_insensitive(self, val, tmp_path):
         """SF-3 parity: the .ps1 already lowercased; pinned so the pair
@@ -753,9 +782,9 @@ class TestPs1HookParity:
         env.pop("CLAUDE_PROJECT_DIR", None)
         env["PATH"] = f"{shim}{os.pathsep}{bin_dir}{os.pathsep}{env.get('PATH', '')}"
         proj = tmp_path / "proj"
-        proj.mkdir(parents=True, exist_ok=True)
+        _mark_project(proj)
         res = subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(PS1_HOOK)],
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(PS1_HOOK)],
             input=_payload("npm install"), capture_output=True, text=True,
             cwd=proj, env=env, timeout=60,
         )
@@ -782,7 +811,7 @@ class TestTeeWrapperPs1:
         cmdfile.write_text(cmd_text, encoding="utf-8")
         env = dict(os.environ)
         return subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(TEE_PS1),
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(TEE_PS1),
              str(fake), str(rawdir), str(cmdfile), ttl],
             capture_output=True, text=True, cwd=tmp_path, env=env,
             timeout=120,
@@ -847,7 +876,7 @@ class TestTeeWrapperPs1:
         cmdfile = tmp_path / "run.cmd"
         cmdfile.write_text("seq 1 5", encoding="utf-8")
         res = subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(TEE_PS1),
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(TEE_PS1),
              str(fake), str(blocker / "sub"), str(cmdfile), "168"],
             capture_output=True, text=True, cwd=tmp_path, timeout=120,
         )
@@ -870,7 +899,7 @@ class TestTeeWrapperPs1:
         env = dict(os.environ)
         env["PATH"] = f"{shim}{os.pathsep}{env.get('PATH', '')}"
         res = subprocess.run(
-            ["pwsh", "-NoProfile", "-File", str(TEE_PS1),
+            ["pwsh", *PWSH_BASE_FLAGS, "-File", str(TEE_PS1),
              str(fake), str(rawdir), str(cmdfile), "168"],
             capture_output=True, text=True, cwd=tmp_path, env=env,
             timeout=120,
@@ -1030,7 +1059,7 @@ class TestOneQuotePairSharedHelper:
             "[Console]::Out.Write((Strip-OneQuotePair $raw))"
         )
         res = subprocess.run(
-            ["pwsh", "-NoProfile", "-Command", script],
+            ["pwsh", *PWSH_BASE_FLAGS, "-Command", script],
             input=raw, capture_output=True, text=True, cwd=tmp_path,
             timeout=60,
         )
@@ -1160,7 +1189,7 @@ def _run_lib(lib: Path, cmd_text: str, tmp_path: Path):
     cmdfile.write_text(cmd_text, encoding="utf-8")
     env = dict(os.environ)
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(lib),
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(lib),
          str(fake), str(rawdir), str(cmdfile), "168"],
         capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120,
     )
@@ -1175,7 +1204,7 @@ def _run_harness(harness_src: str, tmp_path: Path, target: Path):
     env["ACL_MARKER"] = str(marker)
     env["ACL_PATH"] = str(target)
     res = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(harness)],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(harness)],
         capture_output=True, text=True, cwd=tmp_path, env=env, timeout=60,
     )
     return res, marker
@@ -1367,12 +1396,11 @@ class TestS5OneHomeAndPromiseTexts:
         assert "owner-only ACL" in tpl
         assert "skips compression" in tpl
         ch = CHANGELOG.read_text(encoding="utf-8-sig")
-        # The FIRST VERSIONED block (the release being cut) — the entry
-        # moved out of [Unreleased] at tag time, so anchor on the version
-        # header, not the (now empty) Unreleased section.
-        first_versioned = ch.split("## [", 3)[2]
-        assert "owner-only ACL" in first_versioned
-        assert "skips compression if it cannot make them private" in first_versioned
+        # The entry shipped in v0.2.101: anchor on THAT version's block (a
+        # "first versioned block" anchor broke when v0.2.102 was cut).
+        block = ch.split("## [0.2.101]", 1)[1].split("\n## [", 1)[0]
+        assert "owner-only ACL" in block
+        assert "skips compression if it cannot make them private" in block
 
 
 if __name__ == "__main__":

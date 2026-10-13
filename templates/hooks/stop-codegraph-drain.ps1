@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: v0.2.92 hardened the PowerShell detached-spawn path (-WindowStyle guard / Start-Job teardown) — windowed-process concerns have no POSIX analog in the .sh sibling.
+﻿# Parity: kept in step with stop-codegraph-drain.sh (the v0.2.92 PowerShell-only
+# detached-spawn hardening, Start-VcoDetachedPwsh, is Windows-specific; every
+# other behaviour must match the .sh sibling).
 # stop-codegraph-drain.ps1 -- Stop hook (v0.2.73 FIX-B)
 # OS-PARITY: ports templates/hooks/stop-codegraph-drain.sh. END-OF-TURN BATCHED
 # code-graph sync. Replaces the per-EDIT code-graph-incremental scheduling that
@@ -129,11 +131,42 @@ if (Test-Path -LiteralPath $stateDir -PathType Container) {
             $extrasLog = Join-Path $extrasLogDir "codegraph_extras_refresh.log"
             $q = { param($v) "'" + ($v -replace "'","''") + "'" }
             # The child's own output/errors land in the same log the module
-            # writes, so a broken refresh is never silent.
+            # writes, so a broken refresh is never silent. PowerShell single
+            # quotes are LITERAL ('' escapes a quote), so paths with $ or
+            # backticks cannot re-parse here -- the .sh sibling's NB-H5 class
+            # does not exist on this surface.
             $extrasInner = "& " + (& $q $script:python) + " -m vco_lib.codegraph_extras_refresh --project-root " + (& $q $ProjectRoot) +
                 " --analyzer " + (& $q $script:analyzer) + " --state-dir " + (& $q $stateDir) + " *>> " + (& $q $extrasLog)
             Start-VcoDetachedPwsh -Command $extrasInner -PowerShellExe $PsExe
         }
+    }
+}
+
+# --- EXTRA EDIT QUEUES: drain on Stop (v0.2.102 S16-7) ---
+# MUST MATCH the .sh block of the same name: route-touched-path queues a code
+# edit under an ENABLED extra path to codegraph_drain_extra_<md5>_<sid>.txt
+# (never the primary queue). Drain those queues through
+# `vco_lib.codegraph_extras_refresh --queued` (scoped --only-files-from with
+# the extra's OWN --project prefix). Deliberately OUTSIDE both throttles (the
+# 120 s primary rate limit below, the 600 s commit-stamp interval above):
+# those protect the analyzer from repeated FULL walks; a queued scoped drain
+# is cheap, so a queued extra is drained on every Stop. The per-path root
+# lock inside refresh_queued still serialises runs over the same checkout.
+$extraQueues = @(Get-ChildItem -LiteralPath $stateDir -Filter 'codegraph_drain_extra_*_*.txt' -File -ErrorAction SilentlyContinue |
+    # Skip the pre-fix-round-2 TRANSIENT analyzer input
+    # (codegraph_drain_extra_list_<md5>.txt): a process killed mid-drain could
+    # leak one, and it is not a queue (v0.2.102 I-A5). The current transient
+    # name (codegraph_drain_extra-files-<md5>.txt) does not match the filter.
+    Where-Object { $_.Name -notlike 'codegraph_drain_extra_list_*' })
+if ($extraQueues.Count -gt 0) {
+    if ((Resolve-DrainRuntime) -eq 0) {
+        $extrasLogDir = Join-Path (Join-Path $ProjectRoot ".claude") "logs"
+        try { New-Item -ItemType Directory -Path $extrasLogDir -Force -ErrorAction Stop | Out-Null } catch { }
+        $extrasLog = Join-Path $extrasLogDir "codegraph_extras_refresh.log"
+        $q2 = { param($v) "'" + ($v -replace "'","''") + "'" }
+        $queuedInner = "& " + (& $q2 $script:python) + " -m vco_lib.codegraph_extras_refresh --queued --project-root " + (& $q2 $ProjectRoot) +
+            " --analyzer " + (& $q2 $script:analyzer) + " --state-dir " + (& $q2 $stateDir) + " *>> " + (& $q2 $extrasLog)
+        Start-VcoDetachedPwsh -Command $queuedInner -PowerShellExe $PsExe
     }
 }
 
@@ -242,6 +275,31 @@ foreach ($p in $lines) {
     $rootForHash[$h] = $canon
     if (-not $byRoot.ContainsKey($h)) { $byRoot[$h] = New-Object System.Collections.Generic.List[string] }
     [void]$byRoot[$h].Add($p)
+}
+
+# v0.2.102 W6-ALERTS2 (owner ruling 3): a gate probe found the hub unreachable
+# and indexed on doubt (FIX-A' unchanged). Tell the model once per session per
+# agent key so it can bring the hub back. This hook runs async on Stop, so
+# Claude Code hands the additionalContext over on the next turn (vendor hooks
+# doc, "How async hooks execute"). MUST MATCH stop-codegraph-drain.sh.
+if ($script:WorktreeGateHubUnreachable) {
+    $emitLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
+    if (Test-Path -LiteralPath $emitLib) { . $emitLib }
+    $sidLib = Join-Path $PSScriptRoot "_lib/session-id.ps1"
+    if (Test-Path -LiteralPath $sidLib) { . $sidLib }
+    $hubKey = $SessionId
+    if (Get-Command Get-VcoHookFastAgentKey -ErrorAction SilentlyContinue) {
+        $hubKey = Get-VcoHookFastAgentKey -HookStdin $HookStdin
+    }
+    if (Get-Command Get-VcoHubUnreachableNotice -ErrorAction SilentlyContinue) {
+        $hubNotice = Get-VcoHubUnreachableNotice -HooksDir $PSScriptRoot -ProjectRoot $ProjectRoot -AgentKey $hubKey `
+            -Who "The end-of-turn code-graph drain (stop-codegraph-drain)" `
+            -What "It still indexed this turn's worktree edits (the safe default when it cannot confirm that a worktree is unregistered), so throwaway worktrees may be indexed until the hub is back."
+        if ($hubNotice -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
+            $hubEvent = if ($HookStdin -match '"SubagentStop"') { "SubagentStop" } else { "Stop" }
+            Emit-AdditionalContext $hubNotice $hubEvent
+        }
+    }
 }
 
 # Nothing survived -> advance the rate-limit clock + clean up.

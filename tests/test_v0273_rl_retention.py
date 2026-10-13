@@ -88,12 +88,29 @@ def test_row_bound_when_configured(_clean_env):
 
 
 def test_age_older_than_floor_is_not_clamped(_clean_env):
-    # A 1-day cutoff (now - 24h) is OLDER than the 6h in-flight floor, so it is
-    # already safe and must pass through un-clamped.
+    # A 30-day cutoff is OLDER than the in-flight floor (the citation
+    # collector's 7-day abandoned bound + 1 day), so it is already safe and
+    # must pass through un-clamped.
+    os.environ["RL_EVENTS_RETENTION_MAX_AGE_DAYS"] = "30"
+    plan = rl_retention.compute_retention_plan(now_ms=_NOW_MS)
+    assert plan.cutoff_ms == _NOW_MS - 30 * _DAY_MS
+    assert "clamped" not in plan.reason
+
+
+def test_inflight_floor_follows_the_citation_collector_bound(_clean_env, monkeypatch):
+    """v0.2.102 W6-RL2: pending citations no longer expire after an hour; one
+    can wait until its chat ends and the collector removes an abandoned one
+    only after RL_CITATION_ABANDONED_DAYS. A 1-day age bound would prune
+    retrieval events whose citations are still pending, so it is clamped to
+    that bound plus a day — and follows the bound when it is tuned."""
+    monkeypatch.delenv("RL_CITATION_ABANDONED_DAYS", raising=False)
     os.environ["RL_EVENTS_RETENTION_MAX_AGE_DAYS"] = "1"
     plan = rl_retention.compute_retention_plan(now_ms=_NOW_MS)
-    assert plan.cutoff_ms == _NOW_MS - 1 * _DAY_MS
-    assert "clamped" not in plan.reason
+    assert plan.cutoff_ms == _NOW_MS - 8 * _DAY_MS
+    assert "clamped-to-inflight-floor" in plan.reason
+    monkeypatch.setenv("RL_CITATION_ABANDONED_DAYS", "13")
+    plan = rl_retention.compute_retention_plan(now_ms=_NOW_MS)
+    assert plan.cutoff_ms == _NOW_MS - 14 * _DAY_MS
 
 
 def test_inflight_floor_clamps_subfloor_age():

@@ -2438,8 +2438,10 @@ fn list_user_paths_under(path: &Path, cap: usize) -> Vec<String> {
 }
 
 /// Pre-flight safety check: the report for a "you're about to install"
-/// panel. NOTE: no launcher screen calls this yet; the panel is deferred by
-/// the owner to v0.2.102, and this command does NOT gate installs. The
+/// panel. Since v0.2.102 (W5-B C7) the OnboardingWizard's install-confirm
+/// modal runs this when it opens and renders the findings; a refusal line
+/// (the volumes step's runtime-ownership refusal) blocks the modal's
+/// Install action. This command still does NOT gate installs itself — the
 /// actual refusal lives in `install_orchestrator` (`diff_install` conflict
 /// check). Fully read-only — never mutates Weaviate, container
 /// state, or files at `install_path`.
@@ -9459,8 +9461,10 @@ mod tests {
             "infrastructure",
             "vct-module.json",
             "orchestrator-managed-paths.txt",
-            // Phase 0 of the diagrams-integration plan (2026-05-24):
-            // pinning manifest for external npm packages. Listed here
+            // Pinning manifest for external packages (introduced as
+            // Phase 0 of the v0.2.102-dropped diagrams-integration plan,
+            // 2026-05-24; its [npm] table is empty since that removal —
+            // [npx.playwright_mcp] remains). Listed here
             // so a copy install carries new editions of the manifest
             // along — same fail-safe
             // self-reference shape used for
@@ -10064,71 +10068,12 @@ MemAvailable:   23456789 kB
 
     // ─── Bug 32: non-destructive install safety guarantees ────────
 
-    /// Bug 32 #1 + #2: the install path must never invoke any
-    /// volume-removal or compose-down command. Source-level audit:
-    /// grep the install scripts for forbidden subprocess invocations.
-    /// If this test ever fails it means someone added a destructive
-    /// shell-out — gate it behind `--force-clean` or remove it.
-    #[test]
-    fn test_no_destructive_subprocess_calls_in_install_path() {
-        let repo_root = find_local_repo_root().expect("repo root resolves in tests");
-        let install_py = repo_root.join("install.py");
-        let install_sh = repo_root.join("install.sh");
-        let installer_rs = repo_root.join("launcher/src-tauri/src/commands/installer.rs");
-        let projects_v2_rs = repo_root.join("launcher/src-tauri/src/commands/projects_v2.rs");
-
-        // Forbidden literal substrings. We use simple substring matching
-        // because anything more clever (e.g. `volume\s+rm`) would also
-        // match comments referring to the forbidden form. Comments are
-        // scrubbed below.
-        let forbidden = [
-            "podman volume rm",
-            "docker volume rm",
-            "podman volume prune",
-            "docker volume prune",
-            "compose down --volumes",
-            "compose down -v",
-            "podman-compose down",
-            "docker-compose down",
-        ];
-
-        for path in [&install_py, &install_sh, &installer_rs, &projects_v2_rs] {
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue, // optional file
-            };
-
-            // Production-only slice: everything before the test module marker.
-            // The Rust files contain `#[cfg(test)]` declaring the test mod;
-            // the audit must NOT scan that section because the test code
-            // legitimately contains the forbidden literals as needles.
-            let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
-            let production = &content[..scan_end];
-
-            // Strip line-comments to avoid false positives from docs that
-            // mention the forbidden command (e.g. "# Stop: podman-compose down"
-            // in compose.yaml-adjacent comments).
-            let stripped: String = production
-                .lines()
-                .map(|line| {
-                    // Python/shell `#` comment, or Rust `//` comment.
-                    let cut = line.find("//").or_else(|| line.find('#')).unwrap_or(line.len());
-                    &line[..cut]
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            for needle in &forbidden {
-                assert!(
-                    !stripped.contains(needle),
-                    "FORBIDDEN: '{}' found in {} (would destroy user data on install). \
-                     If genuinely needed, gate behind --force-clean and update this test.",
-                    needle,
-                    path.display()
-                );
-            }
-        }
-    }
+    // Bug 32 #1 + #2 destructive-subprocess audit: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_no_destructive_subprocess_calls_in_install_path`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating.
+    // The Rust copy cut installer.rs at the gated `use` on line 21 and projects_v2.rs
+    // at a gated helper, so it checked ~20 production lines of this file.
 
     /// Bug 32 #3 (audit form): `_ensure_collections` in install.py must
     /// only POST to /v1/schema. It must NEVER call PUT, DELETE, or
@@ -11782,7 +11727,8 @@ MemAvailable:   23456789 kB
         // `migrate_github_pat_audit_log_records_file_removed_false` with a bare
         // `assert!(report.migrated)`. Root cause: every keychain op runs on ONE
         // worker thread with a 10s caller-side bound (`KEYCHAIN_OP_TIMEOUT` in
-        // vct-launcher-core::secrets) and fast-fails with `WorkerStuck` while a
+        // vct-launcher-core::secrets_worker, re-exported by `secrets`) and
+        // fast-fails with `WorkerStuck` while a
         // prior op is wedged — under load a delete or set can fail there. The
         // old `delete_keychain()` swallowed delete errors (`let _ =`), so a
         // failed CLEANUP delete left residue that the NEXT test's migration
@@ -14003,6 +13949,33 @@ MemAvailable:   23456789 kB
     mod hardware_snapshot_freshness_tests {
         use super::super::*;
         use crate::commands::gpu_policy::GpuMode;
+
+        /// v0.2.102 W6-B2 (owner decision 5): the Preferences key
+        /// `launcher.hardware_snapshot` has a behavioural reader — set the
+        /// row, the decided GPU mode the module start path reads
+        /// (`read_persisted_hardware_snapshot` → `read_persisted_gpu_mode`)
+        /// follows it; change the value, the answer changes.
+        #[test]
+        fn hardware_snapshot_key_value_drives_the_read_gpu_mode() {
+            let db = crate::db::Db::open_in_memory().unwrap();
+            assert!(read_persisted_hardware_snapshot(&db).unwrap().is_none());
+            let row = |mode: &str| {
+                format!(
+                    r#"{{"has_nvidia_gpu":true,"gpu_name":"g","has_apple_silicon":false,"ram_gb":32,"use_gpu":true,"low_resource":false,"vram_gb":16.0,"gpu_mode_decided":"{}"}}"#,
+                    mode
+                )
+            };
+            db.app_state_set("launcher.hardware_snapshot", &row("cuda")).unwrap();
+            assert_eq!(
+                read_persisted_hardware_snapshot(&db).unwrap().unwrap().gpu_mode_decided,
+                GpuMode::Cuda
+            );
+            db.app_state_set("launcher.hardware_snapshot", &row("cpu")).unwrap();
+            assert_eq!(
+                read_persisted_hardware_snapshot(&db).unwrap().unwrap().gpu_mode_decided,
+                GpuMode::Cpu
+            );
+        }
 
         /// Build a `SystemDetection` fixture that mimics the RTX 4080
         /// SUPER host the validation pass produced — `has_nvidia_gpu`

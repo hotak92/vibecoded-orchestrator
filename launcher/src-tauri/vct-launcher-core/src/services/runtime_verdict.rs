@@ -283,8 +283,24 @@ impl VerdictOpts<'_> {
     }
 }
 
-type CacheKey = (String, String, String);
+type CacheKey = (String, String, String, String, String, String);
 
+/// The cache key for one verdict: the WHO (install root, mode, purpose)
+/// plus — v0.2.102 (W5-B follow-up) — the decision INPUTS that can differ
+/// between two asks in one process: the `VCT_CONTAINER_RUNTIME` pin, the
+/// `VCT_TOOL_SEARCH_DIRS` table and the thread-local injected lookup path.
+///
+/// WHY the inputs joined the key: in PRODUCTION they never change inside
+/// one launcher process, so the key stays effectively one entry per
+/// (root, mode, purpose) — behaviour unchanged. But in the TEST BINARY
+/// they differ per test (fake runtimes on per-test PATHs, pinned env under
+/// the workspace env lock), and the old key let one test's resolve answer
+/// another's: `storage_ux::migration_refuses_a_volume_only_the_other_
+/// runtime_owns` resolved podman out of a concurrent real-podman resolve's
+/// cache entry DESPITE its docker pin, ran a real `cp -a`, and wrote a
+/// deferral ledger INTO THE CHECKOUT. A cache that can be keyed by inputs
+/// its callers vary is the order-dependence itself; the inputs are part
+/// of the identity of an answer.
 fn cache_key(
     install_root: Option<&Path>,
     mode: Mode,
@@ -294,6 +310,11 @@ fn cache_key(
         install_root?.display().to_string(),
         mode.as_str().to_string(),
         purpose.as_str().to_string(),
+        std::env::var("VCT_CONTAINER_RUNTIME").unwrap_or_default(),
+        std::env::var("VCT_TOOL_SEARCH_DIRS").unwrap_or_default(),
+        crate::paths::current_injected_lookup_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     ))
 }
 
@@ -694,6 +715,48 @@ pub(crate) mod contract_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.2.102 (W5-B follow-up): the cache key must separate the decision
+    /// INPUTS — the runtime pin, the tool-search table and the injected
+    /// lookup path. Before they joined the key, one test's resolve answered
+    /// another's (the storage_ux order-flake that wrote a deferral ledger
+    /// into the checkout). Red-proof: drop any one input from `cache_key`
+    /// and the corresponding `assert_ne` fails.
+    #[test]
+    fn cache_key_separates_the_decision_inputs() {
+        use crate::paths::with_lookup_path;
+        use std::ffi::OsStr;
+
+        let root = std::path::Path::new("/tmp/key-root");
+        let base = |pin: Option<&str>| {
+            let mut key = None;
+            crate::test_env::with_env_vars(
+                &[("VCT_CONTAINER_RUNTIME", pin), ("VCT_TOOL_SEARCH_DIRS", Some(""))],
+                || {
+                    key = cache_key(Some(root), Mode::ReadOnly, Purpose::Module);
+                },
+            );
+            key.expect("Some root is cacheable")
+        };
+
+        // Different pin → different key (the flake's exact case: docker pin
+        // must never read an unpinned/podman entry).
+        assert_ne!(base(Some("docker")), base(Some("podman")));
+        assert_ne!(base(Some("docker")), base(None));
+
+        // Different injected lookup path → different key, on the same pin.
+        let dir_a = std::env::temp_dir().join("vct-key-a");
+        let dir_b = std::env::temp_dir().join("vct-key-b");
+        let key_a = with_lookup_path(Some(OsStr::new(&dir_a)), || base(Some("podman")));
+        let key_b = with_lookup_path(Some(OsStr::new(&dir_b)), || base(Some("podman")));
+        assert_ne!(key_a, key_b);
+        // Same inputs → same key (cache still shares within one context).
+        let key_c = with_lookup_path(Some(OsStr::new(&dir_b)), || base(Some("podman")));
+        assert_eq!(key_b, key_c);
+
+        // A None install root is still never cached.
+        assert!(cache_key(None, Mode::ReadOnly, Purpose::Module).is_none());
+    }
 
     /// R12-bis N4 wiring test (decide-child call-site): the decide child's
     /// env is EXACTLY the ONE child-env table's present pairs (minus the

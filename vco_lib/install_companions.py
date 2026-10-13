@@ -46,7 +46,7 @@ def codegraph_ts_install_plan(
     project_root: str,
 ) -> Tuple[bool, Optional[str], Optional[List[str]]]:
     """Decide whether install.py should install the optional ``codegraph-ts``
-    extra (tree-sitter call-extraction grammars), and with what pip argv.
+    extra (tree-sitter code-graph grammars), and with what pip argv.
 
     Pure decision function (no I/O, no subprocess) — the testable core of
     install.py's ``_install_codegraph_treesitter`` soft-fail step. install.py
@@ -717,11 +717,9 @@ def adopt_relaunch(argv: List[str]) -> bool:
 
 def waiting_parent_pid() -> Optional[int]:
     """The pid in :data:`ENV_PARENT_WAITS`, or None when no install.py waits."""
-    try:
-        pid = int(os.environ.get(ENV_PARENT_WAITS, "").strip())
-    except ValueError:
-        return None
-    return pid if pid > 0 else None
+    from vco_lib.env_values import env_int  # noqa: PLC0415 — the one env-int reader
+
+    return env_int(ENV_PARENT_WAITS, None, minimum=1)
 
 
 def start_parent_watch() -> bool:

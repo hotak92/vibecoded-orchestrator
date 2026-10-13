@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 
 import aiohttp
 
@@ -79,81 +80,30 @@ from vco_lib.code_embed_image import service_base_url  # noqa: E402
 CODE_EMBED_SERVICE_URL = service_base_url()
 
 
-# ─── EmbeddingService accessor ──────────────────────────────────────────
+# ─── EmbeddingService accessor + query-embed entries (v0.2.102 W6-M) ────
 #
-# v0.2.18: Lazy + cached EmbeddingService accessor.
-#
-# Why lazy: the MCP server is long-running (one process per Claude Code
-# session). Constructing at import time would probe backends before the
-# Weaviate/Ollama containers have settled, producing a stale
-# NoEmbeddingBackendError that survives until the next session restart.
-#
-# Why cached: the service owns an HTTP connection pool; one instance
-# amortises TLS+keep-alive across every embed call this MCP makes for
-# the rest of the session.
-#
-# Why not module-level singleton: per the v0.2.18 locked design
-# decision, EmbeddingService is per-project — but this MCP server IS
-# pinned to one project for its lifetime (KG_COLLECTION env is set per-
-# project by the launcher), so "per-MCP-instance" satisfies the
-# per-project constraint.
-#
-# Concurrency: the cached service is initialised under the asyncio
-# event loop's natural serialisation. Two near-simultaneous tool calls
-# may both try to construct the service; the second's `for_project()`
-# is a few-ms re-probe of already-running backends, and the cache write
-# is idempotent. No lock needed.
-#
-# M-1 coupling: the cache globals ``_cached_embed_service`` /
-# ``_embed_service_construction_failed_at`` / ``_EMBED_SERVICE_RETRY_WINDOW``
-# live on ``server`` (tests poke ``server._cached_embed_service``), so this
-# accessor reads/writes them via the ``server`` module object.
+# ``_get_embedding_service`` (+ its record re-check helper),
+# ``_get_search_vector`` and ``_kg_search_vector`` moved VERBATIM to
+# ``kg_query_core`` so the hook KG producer embeds its query through them
+# without importing this module (aiohttp + the OpenAI-key resolution). Their
+# only edit: the ``from . import server`` lookup is ``kg_host.host()`` — the
+# SAME server module whenever one is loaded, the light host otherwise. They
+# are re-exported AND rebound into THIS namespace (``bind_into``), so
+# ``server``'s ``from .embeddings import …`` and every patch on
+# ``embeddings.<name>`` behave exactly as before.
+from . import kg_query_core as _kg_query_core  # noqa: E402
+from .kg_query_core import (  # noqa: E402 — re-export (block comment above)
+    _RECORD_RECHECK_SECS as _RECORD_RECHECK_SECS,
+    _code_record_changed as _code_record_changed,
+    _get_embedding_service as _get_embedding_service,
+    _get_search_vector as _get_search_vector,
+    _kg_search_vector as _kg_search_vector,
+)
 
-
-def _get_embedding_service():
-    """Return a cached EmbeddingService instance for this MCP session.
-
-    Returns None when:
-      * vco_lib isn't importable (HAS_EMBEDDING_SERVICE=False), OR
-      * Construction raised NoEmbeddingBackendError recently (within the
-        10-second retry window — avoids hammering already-down services).
-
-    On None, the legacy inline helpers below fall through to their
-    original HTTP-call bodies, which preserves backward compatibility
-    for half-migrated installs and lets each helper produce its own
-    "service unreachable" error rather than masking it with a generic
-    one.
-    """
-    from . import server
-    if not server.HAS_EMBEDDING_SERVICE:
-        return None
-    if server._cached_embed_service is not None:
-        return server._cached_embed_service
-
-    import time as _time
-    if (_time.monotonic() - server._embed_service_construction_failed_at) < server._EMBED_SERVICE_RETRY_WINDOW:
-        return None  # in the retry window — don't probe again yet
-
-    try:
-        server._cached_embed_service = server.EmbeddingService.for_project()
-        return server._cached_embed_service
-    except server.NoEmbeddingBackendError as e:
-        server.logger.warning(
-            "EmbeddingService construction failed (NoEmbeddingBackendError): %s. "
-            "Falling back to legacy inline helpers for the next %.0fs.",
-            e,
-            server._EMBED_SERVICE_RETRY_WINDOW,
-        )
-        server._embed_service_construction_failed_at = _time.monotonic()
-        return None
-    except Exception as e:
-        server.logger.warning(
-            "EmbeddingService construction failed (%s) — falling back to "
-            "legacy inline helpers.",
-            e,
-        )
-        server._embed_service_construction_failed_at = _time.monotonic()
-        return None
+_kg_query_core.bind_into(globals(), (
+    '_code_record_changed', '_get_embedding_service', '_get_search_vector',
+    '_kg_search_vector',
+))
 
 
 async def get_ollama_embedding(text: str) -> list[float] | None:
@@ -177,46 +127,29 @@ async def get_ollama_embedding(text: str) -> list[float] | None:
         except Exception as e:
             server.logger.warning("EmbeddingService.embed_text failed (%s); falling back to inline Ollama", e)
     # Inline fallback: direct Ollama call (preserves pre-v0.2.18 path).
-    # R40 (2026-09-04): num_ctx must be EXPLICIT on every Ollama embed
-    # request — unset means Ollama's small default and silent truncation of
-    # chunk tails. The window is resolved per model from the ONE table that
-    # also sizes the chunks (R40 RESOLVED: 10 240 for qwen3), not hardcoded —
-    # two independent windows for one model is the drifted-duplicate-table
-    # shape that caused a live 4x over-budget bug earlier this cycle.
-    # v0.2.77 Part 9 task 6: keep_alive pins the model resident so the hook
-    # path's inline embed doesn't re-pay the ~1.9 s model reload after any idle
-    # gap. Reuse the ONE resolver in vco_lib.embedding_providers.ollama (no
-    # inline copy). Import is soft — a broken vco_lib is loud elsewhere; here we
-    # degrade to "no keep_alive" rather than break the embed.
+    # v0.2.102 W4-E: the body comes from the ONE shared builder
+    # (vco_lib.embedding_providers.ollama.embed_request_body) so this leg
+    # sends the IDENTICAL load options per model as the canonical adapter —
+    # one runner shared across projects, never a second copy. Import is
+    # soft — a broken vco_lib is loud elsewhere; here we degrade to the
+    # pre-R40 conservative shape rather than break the embed.
     try:
-        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
-        from vco_lib.embedding_providers.ollama import _num_ctx_for_model as _nctx
+        from vco_lib.embedding_providers.ollama import embed_request_body
     except Exception:
-        def _ka(body):  # type: ignore[misc]
-            return body
-
-        def _nctx(model: str) -> int:  # type: ignore[misc]
-            # v0.2.92 R40: never return None here. An UNSET num_ctx means
-            # Ollama's 2048 default, which silently truncates any longer input
-            # and returns HTTP 200 — the failure this fix exists to remove.
-            # 2048 is the conservative floor: it is what we would have got
-            # anyway, but now it is a stated choice rather than an omission.
-            return 2048
+        def embed_request_body(model: str, *, prompt=None, input=None, num_ctx=None):  # type: ignore[misc,assignment]
+            # Degraded standalone shape (vco_lib missing = broken install):
+            # explicit 2048 floor (stated choice, not an omission — an UNSET
+            # num_ctx means Ollama's 2048 default and silent tail loss).
+            return {
+                "model": model,
+                "prompt": prompt,
+                "options": {"num_ctx": num_ctx if num_ctx is not None else 2048},
+                "truncate": False,
+            }
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{server.OLLAMA_URL}/api/embeddings",
-            # v0.2.92 round-3: was a HARDCODED 8192 with no `truncate`, which
-            # (a) contradicted R40 — the window must come from the one home
-            # that also sizes the chunks, or the two drift — and (b) let this
-            # path silently drop the tail, since qwen3 and jina truncate at
-            # HTTP 200 by default. Both corrected here rather than only
-            # reported, which is what an earlier pass did.
-            json=_ka({
-                "model": server.EMBEDDING_MODEL,
-                "prompt": text,
-                "options": {"num_ctx": _nctx(server.EMBEDDING_MODEL)},
-                "truncate": False,
-            }),
+            json=embed_request_body(server.EMBEDDING_MODEL, prompt=text),
             timeout=aiohttp.ClientTimeout(total=30)
         ) as response:
             if response.status != 200:
@@ -232,34 +165,23 @@ async def get_legacy_text_embedding(text: str) -> list[float] | None:
     Used to populate the old 'ollama_embed' named vector for backward compatibility.
     """
     from . import server
+    # v0.2.102 W4-E: ONE shared body builder — identical load options per
+    # model as the canonical adapter (see get_ollama_embedding).
     try:
-        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
-        from vco_lib.embedding_providers.ollama import _num_ctx_for_model as _nctx
+        from vco_lib.embedding_providers.ollama import embed_request_body
     except Exception:
-        def _ka(body):  # type: ignore[misc]
-            return body
-
-        def _nctx(model: str) -> int:  # type: ignore[misc]
-            # v0.2.92 R40: never return None here. An UNSET num_ctx means
-            # Ollama's 2048 default, which silently truncates any longer input
-            # and returns HTTP 200 — the failure this fix exists to remove.
-            # 2048 is the conservative floor: it is what we would have got
-            # anyway, but now it is a stated choice rather than an omission.
-            return 2048
+        def embed_request_body(model: str, *, prompt=None, input=None, num_ctx=None):  # type: ignore[misc,assignment]
+            return {
+                "model": model,
+                "prompt": prompt,
+                "options": {"num_ctx": num_ctx if num_ctx is not None else 2048},
+                "truncate": False,
+            }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{server.OLLAMA_URL}/api/embeddings",
-                # task 6: keep_alive on the legacy text embed too.
-                # v0.2.92 R40: num_ctx was UNSET here, so this legacy path
-                # inherited Ollama's 2048 default while the arctic budget is
-                # 3200 — every longer input lost its tail with a 200 response.
-                json=_ka({
-                    "model": server.LEGACY_TEXT_EMBEDDING_MODEL,
-                    "prompt": text,
-                    "options": {"num_ctx": _nctx(server.LEGACY_TEXT_EMBEDDING_MODEL)},
-                    "truncate": False,  # v0.2.92: refuse, never silently drop the tail
-                }),
+                json=embed_request_body(server.LEGACY_TEXT_EMBEDDING_MODEL, prompt=text),
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 if response.status != 200:
@@ -336,11 +258,15 @@ async def get_embedding(text: str) -> list[float] | None:
         return None  # Let Weaviate's text2vec module handle it
 
     if server.ACTIVE_EMBEDDING == "openai":
+        # Owner ruling 2026-10-10: never another embedding model — an OpenAI
+        # failure is NOT answered with an Ollama vector (a different space
+        # stored under the OpenAI slot). None = the caller's loud degrade.
         vec = await server.get_openai_embedding(text)
-        if vec:
-            return vec
-        # Fall back to Ollama if OpenAI fails
-        server.logger.warning("OpenAI embedding failed, falling back to Ollama")
+        if not vec:
+            server.logger.error(
+                "OpenAI embedding failed; no other embedding model is used "
+                "(the vectors would not be comparable)")
+        return vec or None
 
     return await server.get_ollama_embedding(text)
 
@@ -431,6 +357,29 @@ async def _get_all_kg_embeddings_tagged(
     return (await _get_all_kg_embeddings(text)), []
 
 
+async def complete_kg_write_vectors(
+    vectors: "dict[str, list[float]]", truncated: "list[str]", text: str, collection: str,
+) -> "dict[str, list[float]]":
+    """v0.2.102 W6-I — finish a KG write's vectors (``store_knowledge_node``):
+    through ``vco_lib.kg_embed_model.complete_write_vectors`` whenever a
+    service is in hand. The ACTIVE (target) slot is REQUIRED — a row holding
+    only another model's vector is never stored (``KgWriteVectorMissing``
+    propagates, loud; W6-H's "fallback-only write") — and while ``collection``
+    fills toward a newly selected model the RECORDED model's vector rides
+    along, so the rewritten node stays in the slot searches read.
+    ``truncated`` (the call's truncation record) gains the carry slot when
+    its vector came from a bounded window. No service → returned as-is (the
+    inline transport fallback names no target)."""
+    from vco_lib.kg_embed_model import complete_write_vectors
+
+    from . import server
+    svc = server._get_embedding_service()
+    if svc is None:
+        return vectors
+    return await asyncio.to_thread(
+        complete_write_vectors, svc, dict(vectors or {}), text, collection, truncated)
+
+
 async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
     """Get all KG embedding variants — every reachable text backend.
 
@@ -475,30 +424,43 @@ async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
     # ALWAYS populated every reachable slot, so a project that deliberately
     # left dual-write OFF still got the secondary slots written whenever the
     # service happened to be down — an inconsistency with the primary path.
-    # The active slot (qwen3_embed here) is ALWAYS written; only the secondary
-    # fan-out is gated.
+    # The active slot is ALWAYS written; only the secondary fan-out is gated.
+    #
+    # W6-J (review F2): the active vector is labelled with the slot of the
+    # model that PRODUCED it. `get_ollama_embedding` embeds
+    # `server.EMBEDDING_MODEL` — qwen3 only on a qwen3 profile — so the
+    # hardcoded "qwen3_embed" label this leg used to write stored another
+    # model's vector under the qwen3 slot on a non-qwen3 profile. A failure
+    # of that call raises (it answers a vector or nothing), so a row whose
+    # active slot never came back is never stored here either. The label
+    # comes from the ONE text slot map (`kg_embed_model.text_model_slot`,
+    # the same resolver the record/fill machinery uses), and a secondary
+    # vector never overwrites the active slot (a profile whose model maps to
+    # the legacy `ollama_embed` slot — mxbai, nomic — would otherwise have
+    # its own vector replaced by the legacy arctic one).
     from vco_lib.embedding_service import _resolve_write_all_slots
+    from vco_lib.kg_embed_model import text_model_slot
     _write_all = _resolve_write_all_slots()
 
     if _write_all:
-        qwen3_vec, legacy_vec, openai_vec = await asyncio.gather(
-            server.get_ollama_embedding(text),         # qwen3-embedding (new primary)
+        active_vec, legacy_vec, openai_vec = await asyncio.gather(
+            server.get_ollama_embedding(text),         # the ACTIVE text model
             server.get_legacy_text_embedding(text),     # snowflake-arctic-embed2 (legacy)
             server.get_openai_embedding(text),
         )
     else:
         # Toggle OFF: only the active slot. Mirrors the primary path's
         # single-entry return.
-        qwen3_vec = await server.get_ollama_embedding(text)
+        active_vec = await server.get_ollama_embedding(text)
         legacy_vec = None
         openai_vec = None
     vectors: dict[str, list[float]] = {}
-    if qwen3_vec:
-        vectors["qwen3_embed"] = qwen3_vec
+    if active_vec:
+        vectors[text_model_slot(server.EMBEDDING_MODEL)[0]] = active_vec
     if legacy_vec:
-        vectors["ollama_embed"] = legacy_vec
+        vectors.setdefault("ollama_embed", legacy_vec)
     if openai_vec:
-        vectors["openai_embed"] = openai_vec
+        vectors.setdefault("openai_embed", openai_vec)
     return vectors
 
 
@@ -565,87 +527,6 @@ def _primary_named_vector(scheme: str) -> str:
     return next(iter(server.VECTOR_SCHEMES[scheme]))
 
 
-async def _get_search_vector(
-    text: str, scheme: str = "kg", task: str | None = None
-) -> tuple[list[float] | None, str]:
-    """Get embedding for search, returns (vector, target_vector_name).
-
-    v0.2.18: routes through EmbeddingService which resolves BOTH the
-    embedding backend AND the named-vector slot from env in one place.
-    Pre-v0.2.18 this branched on ACTIVE_EMBEDDING here, which duplicated
-    the slot-resolution logic already living in the Wave-A
-    EmbeddingService TEXT_SLOT_MAP / CODE_SLOT_MAP.
-
-    v0.2.101: this is a SEARCH path, so it embeds through the QUERY-side
-    methods (``embed_text_query`` / ``embed_code_query``) which apply the
-    active model's query-prefix — documents still go through ``embed_text`` /
-    ``embed_code`` unprefixed. ``task`` selects the per-use instruction
-    sentence (see ``chunking.QUERY_TASKS``); ``None`` uses the scheme default.
-
-    Falls through to the legacy ACTIVE_EMBEDDING-branching path when
-    the service is unavailable (that path is UNPREFIXED — a half-migrated
-    install's degraded fallback; the prefix table needs the resolved model).
-
-    Args:
-        text: Text to embed.
-        scheme: 'kg' or 'code' — determines text vs code backend.
-        task: QUERY_TASKS key (KG search / hook injection / code-nl / code-sim).
-    """
-    from . import server
-    svc = server._get_embedding_service()
-    if svc is not None:
-        try:
-            if scheme == "code":
-                vec = await asyncio.to_thread(svc.embed_code_query, text, task)
-                target = svc.code_vector_slot
-            else:
-                vec = await asyncio.to_thread(svc.embed_text_query, text, task)
-                target = svc.text_vector_slot
-            return vec, target
-        except Exception as e:
-            server.logger.warning(
-                "_get_search_vector via EmbeddingService failed (%s); "
-                "falling back to legacy ACTIVE_EMBEDDING branching", e
-            )
-
-    # Legacy fallback path (pre-v0.2.18): branches on ACTIVE_EMBEDDING.
-    if server.ACTIVE_EMBEDDING == "openai" and server.OPENAI_API_KEY:
-        vec = await server.get_openai_embedding(text)
-        if vec:
-            return vec, "openai_embed"
-        # Audit fix (2026-04-30): on openai failure, do NOT silently fall
-        # through to qwen3/arctic below — that mixes embedding spaces and
-        # surfaces poor results without any signal to the caller. Log the
-        # failure and return None; the caller will see a clear error.
-        server.logger.warning(
-            "_get_search_vector: ACTIVE_EMBEDDING=openai but OpenAI call "
-            "failed; refusing to fall back to legacy embedder (would "
-            "produce results from a different vector space). Caller will "
-            "receive None."
-        )
-        return None, ""
-
-    if scheme == "code":
-        if server.ACTIVE_EMBEDDING in ("codesage", "qwen3"):
-            # Use new CodeSage model (default for code)
-            vec = await server.get_code_embedding(text)
-            target = "codesage_embed"
-        else:
-            # Legacy: Jina via Ollama
-            vec = await server.get_legacy_code_embedding(text)
-            target = "ollama_code_embed"
-    else:
-        if server.ACTIVE_EMBEDDING in ("qwen3", "codesage"):
-            # Use new Qwen3-Embedding (default for KG)
-            vec = await server.get_ollama_embedding(text)
-            target = "qwen3_embed"
-        else:
-            # Legacy: Arctic via Ollama
-            vec = await server.get_legacy_text_embedding(text)
-            target = "ollama_embed"
-    return vec, target
-
-
 async def count_tokens_async(text: str) -> int:
     """
     Count tokens in the chunker's ONE budget unit (D16, v0.2.92).
@@ -661,7 +542,9 @@ async def count_tokens_async(text: str) -> int:
     return TokenCounter.count_tokens(text)
 
 
-async def get_code_embedding(text: str) -> list[float] | None:
+async def get_code_embedding(
+    text: str, tolerance_secs: float | None = None
+) -> list[float] | None:
     """Get a CodeSage-space code embedding.
 
     This helper is the CODESAGE-SPECIFIC provider used by the
@@ -692,33 +575,173 @@ async def get_code_embedding(text: str) -> list[float] | None:
                 "EmbeddingService.embed_code failed (%s); falling back to inline CodeEmbed call",
                 e,
             )
-    return await server._inline_code_embed_http(text)
+    # v0.2.102 W6-B2 (owner ruling 2026-10-10): this vector lands in the
+    # CodeSage slot, so the container must SERVE CodeSage — on a 6-12 GB / AMD
+    # host its ``backend=ollama`` proxies another model, whose vector would be
+    # stored as CodeSage's. An unreported name (down / restarting) is not
+    # judged here: the inline leg's transient retry owns that.
+    served = await asyncio.to_thread(_container_model_name, server.CODE_EMBED_SERVICE_URL)
+    if served and "codesage" not in served.lower():
+        server.logger.error(
+            "get_code_embedding: the code_embed container at %s serves %r, not "
+            "CodeSage — no CodeSage vector is produced (never another model's)",
+            server.CODE_EMBED_SERVICE_URL, served,
+        )
+        return None
+    return await server._inline_code_embed_http(text, tolerance_secs=tolerance_secs)
 
 
-async def _inline_code_embed_http(text: str) -> list[float] | None:
+def _container_model_name(url: str) -> "str | None":
+    """The model the code_embed container reports on ``/health`` (None when
+    it does not answer). Soft-fails to None."""
+    try:
+        import requests
+
+        from vco_lib.embedding_providers.codeembed import CodeEmbedAdapter
+
+        with requests.Session() as session:
+            return CodeEmbedAdapter(url, session, timeout=5.0).model_name
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _inline_code_embed_http(
+    text: str, tolerance_secs: float | None = None
+) -> list[float] | None:
     """Direct CodeEmbed HTTP call (pre-v0.2.18 fallback path).
 
     Shared by ``get_code_embedding`` (codesage backfill) and
-    ``get_code_query_embedding`` (svc-None fallback) so the raw-HTTP
+    ``get_code_query_embedding`` (svc-None / non-503 fallback) so the raw-HTTP
     fallback has ONE home.
+
+    v0.2.102 r2: honours the service's 503 + Retry-After contract through the
+    ONE shared retry helper (:mod:`vco_lib.retry_after` — the SAME module
+    ``EmbeddingService._retry_once_on_503`` uses; no second copy of the
+    policy). A 503 (the server's queue wait was exceeded, or its CUDA-OOM load
+    budget is exhausted / cooling down) is retried until the tolerance elapses
+    instead of surfacing "Failed to generate query embedding" on the first
+    shot. A non-503 HTTP status and any connection error still return None
+    immediately (the service is down or refuses the input — retrying changes
+    nothing). The per-request timeout MUST exceed the server's queue wait
+    (``CODE_EMBED_QUEUE_WAIT_SECS``, default 600 s) — one home:
+    ``CODE_EMBED_CLIENT_TIMEOUT_SECS`` (660 s).
+
+    v0.2.102 r3: ``tolerance_secs`` lets the caller pick WHICH tolerance —
+    batch callers (``get_code_embedding``, the analyzer / backfill gather)
+    pass nothing and get ``VCO_EMBED_503_TOLERANCE_SECS`` (default 420 s);
+    the INTERACTIVE query path passes the interactive bound
+    (``VCO_EMBED_503_INTERACTIVE_TOLERANCE_SECS``, default 90 s) so a
+    persistently-503 backend fails the tool call fast instead of blocking
+    the user's turn for minutes.
     """
     from . import server
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{server.CODE_EMBED_SERVICE_URL}/api/embeddings",
-                json={"model": "", "prompt": text},
-                timeout=aiohttp.ClientTimeout(total=60)
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data["embedding"]
-                else:
-                    server.logger.error("Code embedding service failed: HTTP %s", response.status)
-                    return None
-    except Exception as e:
-        server.logger.error("Code embedding service error: %s", e)
-        return None
+    # vco_lib import is a hard requirement of the whole MCP process (the
+    # loud-fail discipline — server.py itself imports vco_lib.embedding_service);
+    # deliberately OUTSIDE the try below so a broken install is never masked as
+    # a None embedding.
+    from vco_lib.retry_after import (
+        CODE_EMBED_CLIENT_TIMEOUT_SECS,
+        DEFAULT_503_FALLBACK_BACKOFFS,
+        compute_503_delay,
+        is_connection_error,
+        parse_retry_after,
+        resolve_503_delay_scale,
+        resolve_503_tolerance,
+        resolve_refused_tolerance,
+    )
+
+    scale = resolve_503_delay_scale()
+    legacy_bounded = scale == 0.0
+    tolerance = (
+        resolve_503_tolerance() if tolerance_secs is None else tolerance_secs
+    )
+    started = time.monotonic()
+    deadline = started + tolerance
+    # v0.2.102 W4-G (coordinator ruling 2026-10-09): the service being DOWN
+    # (refused / no listener) is not the service being BUSY (503, queued).
+    # An interactive caller — every caller that passes `tolerance_secs` (see
+    # r3 above) — waits on a refusal only for the short bound from the ONE
+    # policy home (`resolve_refused_tolerance`), then fails loudly; batch
+    # callers keep the long tolerance for both kinds.
+    refused_tolerance = min(
+        tolerance, resolve_refused_tolerance(interactive=tolerance_secs is not None)
+    )
+    refused_deadline = started + refused_tolerance
+    attempt = 0
+    while True:
+        attempt += 1
+        retry_after: "float | None" = None
+        refused = False
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{server.CODE_EMBED_SERVICE_URL}/api/embeddings",
+                    json={"model": "", "prompt": text},
+                    timeout=aiohttp.ClientTimeout(total=CODE_EMBED_CLIENT_TIMEOUT_SECS)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data["embedding"]
+                    if response.status != 503:
+                        server.logger.error(
+                            "Code embedding service failed: HTTP %s", response.status
+                        )
+                        return None
+                    retry_after = parse_retry_after(
+                        response.headers.get("Retry-After")
+                    )
+                    server.logger.info(
+                        "Code embedding service returned 503 (queued past the "
+                        "wait bound / GPU busy?): attempt %d, Retry-After=%s",
+                        attempt, retry_after,
+                    )
+        except Exception as e:
+            # v0.2.102 W4-E item 6: a CONNECTION error (service restarting,
+            # e.g. mid model-load) is transient-retryable on the same bounded
+            # schedule as a 503 — never a silent first-shot drop. Any other
+            # exception still fails immediately (the service refused the
+            # input; retrying changes nothing).
+            if not is_connection_error(e):
+                server.logger.error("Code embedding service error: %s", e)
+                return None
+            server.logger.info(
+                "Code embedding service connection error (restarting?): "
+                "attempt %d — %s", attempt, e,
+            )
+            refused = True
+        # 503 → bounded retry on the shared policy (same helper + knobs as
+        # EmbeddingService._retry_once_on_503).
+        if legacy_bounded:
+            if attempt > len(DEFAULT_503_FALLBACK_BACKOFFS):
+                server.logger.error(
+                    "Code embedding service still 503 after %d attempts "
+                    "(zero-delay mode); giving up",
+                    attempt,
+                )
+                return None
+            delay = 0.0
+        else:
+            if time.monotonic() >= deadline:
+                server.logger.error(
+                    "Code embedding service still 503 after %.0fs of retries; "
+                    "giving up",
+                    tolerance,
+                )
+                return None
+            if refused and time.monotonic() >= refused_deadline:
+                server.logger.error(
+                    "Code embedding service unreachable (connection refused / "
+                    "no listener) for %.0fs; giving up",
+                    refused_tolerance,
+                )
+                return None
+            delay = compute_503_delay(
+                attempt, retry_after, DEFAULT_503_FALLBACK_BACKOFFS, scale
+            )
+            if refused:
+                delay = min(delay, max(0.0, refused_deadline - time.monotonic()))
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
 async def get_code_query_embedding(text: str, task: str | None = None) -> list[float] | None:
@@ -739,37 +762,43 @@ async def get_code_query_embedding(text: str, task: str | None = None) -> list[f
     Documents still embed through ``embed_code`` (unprefixed).
 
     MUST MATCH ``templates/scripts/query_code_graph.py::generate_code_embedding``.
+
+    v0.2.102 W6-B2 (owner ruling 2026-10-10): ONE entry,
+    ``vco_lib.embed_outage.embed_query_or_raise`` — the interactive 503
+    bound, the restart wait, and NO inline CodeEmbed fallback (that endpoint
+    serves CodeSage; a jina/qwen3/OpenAI-indexed graph queried with it
+    searches noise). A backend that stays down raises
+    ``EmbeddingBackendUnavailable`` — ``search_code_graph`` returns its loud
+    text instead of "Failed to generate query embedding".
     """
+    from vco_lib.embed_outage import embed_query_or_raise
+
     from . import server
     svc = server._get_embedding_service()
-    if svc is not None:
-        try:
-            return await asyncio.to_thread(svc.embed_code_query, text, task)
-        except Exception as e:
-            server.logger.warning(
-                "EmbeddingService.embed_code_query failed (%s); falling back to inline CodeEmbed call",
-                e,
-            )
-    # Legacy fallback (svc unavailable): direct CodeEmbed HTTP call.
-    return await server._inline_code_embed_http(text)
+    return await asyncio.to_thread(
+        embed_query_or_raise, "code", svc, text, task,
+        construction_error=getattr(server, "_embed_service_construction_error", ""),
+    )
 
 
 def _active_code_query_slot() -> str:
     """Return the active code-vector slot for a query's ``target_vector``.
 
     v0.2.73 C-6: mirrors the CLI's
-    ``query_code_graph.py::_active_code_vector_slot`` EXACTLY — svc present
-    → its resolved ``code_vector_slot``; svc None → ``"codesage_embed"``
-    (the CLI's unconditional pre-v0.2.18 fallback). Kept as a named helper
-    so both search + any future code-query call site cannot re-fork the
-    fallback.
+    ``query_code_graph.py::_active_code_vector_slot`` EXACTLY. svc None
+    raises the loud ``EmbeddingBackendUnavailable`` (v0.2.102 W6-B2: the old
+    ``"codesage_embed"`` default named a slot the graph may not be indexed in).
 
     MUST MATCH ``templates/scripts/query_code_graph.py::_active_code_vector_slot``.
     """
     from . import server
     svc = server._get_embedding_service()
     if svc is None:
-        return "codesage_embed"
+        from vco_lib.embed_outage import query_unavailable
+
+        raise query_unavailable(
+            "code", None,
+            construction_error=getattr(server, "_embed_service_construction_error", ""))
     return svc.code_vector_slot
 
 
@@ -779,42 +808,26 @@ async def get_legacy_code_embedding(text: str) -> list[float] | None:
     Used to populate the old 'ollama_code_embed' named vector for backward compatibility.
     """
     from . import server
+    # v0.2.102 W4-E: ONE shared body builder — identical load options per
+    # model as the canonical adapter (see get_ollama_embedding).
     try:
-        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
-        from vco_lib.embedding_providers.ollama import _num_ctx_for_model as _nctx
+        from vco_lib.embedding_providers.ollama import embed_request_body
     except Exception:
-        def _ka(body):  # type: ignore[misc]
-            return body
-
-        def _nctx(model: str) -> int:  # type: ignore[misc]
-            # v0.2.92 R40: never return None here. An UNSET num_ctx means
-            # Ollama's 2048 default, which silently truncates any longer input
-            # and returns HTTP 200 — the failure this fix exists to remove.
-            # 2048 is the conservative floor: it is what we would have got
-            # anyway, but now it is a stated choice rather than an omission.
-            return 2048
+        def embed_request_body(model: str, *, prompt=None, input=None, num_ctx=None):  # type: ignore[misc,assignment]
+            return {
+                "model": model,
+                "prompt": prompt,
+                "options": {"num_ctx": num_ctx if num_ctx is not None else 2048},
+                "truncate": False,
+            }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{server.OLLAMA_URL}/api/embeddings",
-                # task 6: keep_alive on the legacy code embed too.
-                # v0.2.92 R40: num_ctx was UNSET. jina's 1600 budget happens to
-                # fit under Ollama's 2048 default — by luck, not by design. Set
-                # it so a future budget change cannot silently start truncating.
-                json=_ka({
-                    "model": "unclemusclez/jina-embeddings-v2-base-code:latest",
-                    "prompt": text,
-                    "options": {
-                        "num_ctx": _nctx(
-                            "unclemusclez/jina-embeddings-v2-base-code:latest"
-                        )
-                    },
-                    # R45: refuse rather than silently drop the tail. jina is
-                    # one of the models MEASURED to truncate at HTTP 200 with
-                    # `truncate` unset, so without this the caller cannot tell
-                    # a full vector from a partial one.
-                    "truncate": False,
-                }),
+                json=embed_request_body(
+                    "unclemusclez/jina-embeddings-v2-base-code:latest",
+                    prompt=text,
+                ),
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 if response.status == 200:

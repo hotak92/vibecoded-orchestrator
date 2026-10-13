@@ -74,6 +74,26 @@ NEGATIVE_TTL_CAP_S = 30
 #: neither ``os`` nor ``subprocess``.
 DEFAULT_SERVE_STALE_MAX_AGE_S = 6 * 3600
 
+#: How long a TRANSIENT failure (the hub answered 503 ``keychain_unavailable``:
+#: a keychain operation timed out, the key may well exist) is cached before the
+#: next request asks again. Matches the hub's ``Retry-After``. Deliberately not
+#: ``NEGATIVE_TTL_CAP_S``: that cap is for "no such key", and holding a busy
+#: keychain's answer for 30 s is what kept a brand-new key unservable (v0.2.102).
+TRANSIENT_RETRY_S = 2
+
+#: Class names of the resolver's RETRYABLE "could not look" errors:
+#: ``vco_lib.agent_secrets.SecretStoreUnavailable`` (v0.2.102 W6-AB — the hub
+#: is running but did not answer in time, or answered 5xx) and its subclass
+#: ``KeychainUnavailable`` (the hub's 503 ``keychain_unavailable``). Matched by
+#: name across the exception's MRO rather than imported: the resolver is
+#: imported lazily (``_default_getter``) and tests inject their own getters.
+_STORE_UNAVAILABLE_TYPES = frozenset({"SecretStoreUnavailable", "KeychainUnavailable"})
+
+
+def _is_store_unavailable(exc: BaseException) -> bool:
+    """Is ``exc`` one of the resolver's TRANSIENT store-unavailability errors?"""
+    return any(c.__name__ in _STORE_UNAVAILABLE_TYPES for c in type(exc).__mro__)
+
 SecretGetter = Callable[..., str]
 
 #: Maps a project PATH (or id) to the hub's project id. Raises on every
@@ -107,6 +127,10 @@ class KeyResult:
     state: str = "missing"
     #: Which declared key name answered. Names are not secrets.
     resolved_from: Optional[str] = None
+    #: v0.2.102: the failure was TRANSIENT — the OS keychain was temporarily
+    #: unavailable (hub 503 ``keychain_unavailable``), so this is NOT a "no key"
+    #: answer. Cached for ``TRANSIENT_RETRY_S`` only, and never logged as a miss.
+    transient: bool = False
 
     def __repr__(self) -> str:  # pragma: no cover - exercised via assertions
         # Never let a value reach a traceback, a pytest diff or a log record
@@ -274,6 +298,11 @@ class VendorKeyResolver:
         #: storm rebuilt as a WARN storm, which is what issue 12 set out to
         #: stop.
         self._no_key_logged: set[str] = set()
+        #: v0.2.102: vendors whose TRANSIENT keychain-unavailable line was logged.
+        self._transient_logged: set[str] = set()
+        #: v0.2.102 (W6-AB): in-flight BACKGROUND refreshes, one per vendor
+        #: (single flight). See :meth:`aresolve`.
+        self._refreshing: dict[str, "asyncio.Task[KeyResult]"] = {}
         self._serve_stale_max_age_s = max(1, int(serve_stale_max_age_s))
         self._scope_prober = scope_prober
         #: Resolves the DEFAULT scope when nothing is pinned. Memoized on
@@ -536,12 +565,14 @@ class VendorKeyResolver:
             self._serving_stale.clear()
             self._past_stale_bound.clear()
             self._no_key_logged.clear()
+            self._transient_logged.clear()
         else:
             self._cache.pop(vendor_id, None)
             self._last_good.pop(vendor_id, None)
             self._serving_stale.discard(vendor_id)
             self._past_stale_bound.discard(vendor_id)
             self._no_key_logged.discard(vendor_id)
+            self._transient_logged.discard(vendor_id)
 
     def _serve_stale(
         self, vendor: Vendor, now: float, *, fresh: KeyResult
@@ -558,7 +589,11 @@ class VendorKeyResolver:
 
         The serve is bounded — past ``_serve_stale_max_age_s`` the resolver
         answers failures again, so a key REVOKED this morning stops being
-        served the same day. Both WARNs are EDGE-TRIGGERED per vendor: one
+        served the same day. EXCEPT when the fresh failure is TRANSIENT
+        (v0.2.102, W6-AB: the store could not be ASKED — hub timed out, keychain
+        busy): a store that could not answer said nothing about revocation, so
+        the last-known-good key keeps being served whatever its age. (A key
+        revoked at the VENDOR is refused by the vendor either way.) Both WARNs are EDGE-TRIGGERED per vendor: one
         line entering stale service, one line leaving it. Per-request
         warnings would rebuild the 503 storm as a WARN storm.
         """
@@ -570,7 +605,7 @@ class VendorKeyResolver:
             # while the TTL checks elsewhere ask "is the entry YOUNGER than
             # its TTL" and are therefore exclusive. Two questions, two
             # comparisons — not a drift to normalise away.
-            if age <= self._serve_stale_max_age_s:
+            if age <= self._serve_stale_max_age_s or fresh.transient:
                 if vendor.vendor_id not in self._serving_stale:
                     self._serving_stale.add(vendor.vendor_id)
                     logger.warning(
@@ -618,6 +653,7 @@ class VendorKeyResolver:
         self._serving_stale.discard(vendor_id)
         self._past_stale_bound.discard(vendor_id)
         self._no_key_logged.discard(vendor_id)
+        self._transient_logged.discard(vendor_id)
         if recovered:
             logger.info(
                 "model-gateway: vendor %s key resolves again%s",
@@ -631,7 +667,12 @@ class VendorKeyResolver:
         now = self._clock()
         entry = self._cache.get(vendor.vendor_id)
         if entry is not None:
-            ttl = self._ttl_s if entry.result.key else min(self._ttl_s, NEGATIVE_TTL_CAP_S)
+            if entry.result.key:
+                ttl = self._ttl_s
+            elif entry.result.transient:
+                ttl = min(self._ttl_s, TRANSIENT_RETRY_S)
+            else:
+                ttl = min(self._ttl_s, NEGATIVE_TTL_CAP_S)
             if now - entry.fetched_at < ttl:
                 if entry.result.key:
                     return KeyResult(
@@ -673,7 +714,62 @@ class VendorKeyResolver:
                     state="cached",
                     resolved_from=entry.result.resolved_from,
                 )
+        # v0.2.102 (W6-AB): STALE-WHILE-REVALIDATE. When a last-known-good key
+        # exists, a request never waits on the store: the expired entry is
+        # refreshed on a background thread (one per vendor) and this request
+        # is answered with the key it would have been served anyway if the
+        # store were slow. A secret read may take tens of seconds on a busy
+        # keychain (``SECRET_READ_TIMEOUT_SECONDS``) — that wait belongs to
+        # the refresh, never to a chat. Only a vendor with NO good key yet
+        # waits for its first resolution. Scoped to an entry that merely
+        # EXPIRED (a key) or whose last attempt was TRANSIENT: after a
+        # DEFINITE miss the synchronous path below runs, so the serve-stale
+        # bound still stops serving a key the store says is gone.
+        good = self._last_good.get(vendor.vendor_id)
+        if (
+            entry is not None
+            and (entry.result.key or entry.result.transient)
+            and good is not None
+            and good.result.key
+        ):
+            self._start_refresh(vendor)
+            return KeyResult(
+                key=good.result.key,
+                state="cached",
+                resolved_from=good.result.resolved_from,
+            )
         return await asyncio.to_thread(self.resolve, vendor)
+
+    def _start_refresh(self, vendor: Vendor) -> None:
+        """Start (at most one) background re-resolution for ``vendor``."""
+        task = self._refreshing.get(vendor.vendor_id)
+        if task is not None and not task.done():
+            return
+        task = asyncio.get_running_loop().create_task(
+            asyncio.to_thread(self.resolve, vendor),
+            name=f"model-gateway-key-refresh-{vendor.vendor_id}",
+        )
+        self._refreshing[vendor.vendor_id] = task
+
+        def _done(t: "asyncio.Task[KeyResult]", vendor_id: str = vendor.vendor_id) -> None:
+            if self._refreshing.get(vendor_id) is t:
+                del self._refreshing[vendor_id]
+            if not t.cancelled() and t.exception() is not None:
+                # `resolve` reports its own failures; an exception escaping it
+                # is a bug — logged, never raised into the event loop.
+                logger.error(
+                    "model-gateway: background key refresh for vendor %s failed: %s",
+                    vendor_id,
+                    t.exception(),
+                )
+
+        task.add_done_callback(_done)
+
+    async def wait_for_refreshes(self) -> None:
+        """Await every in-flight background refresh (tests, shutdown)."""
+        pending = [t for t in self._refreshing.values() if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _resolve_uncached(self, vendor: Vendor) -> KeyResult:
         getter = self._getter
@@ -706,10 +802,17 @@ class VendorKeyResolver:
         # keys in the same request answer from two different scopes.
         scope_arg = self.effective_project
         failures: list[str] = []
+        unavailable: list[str] = []
         for key_name in vendor.secret_keys:
             try:
                 value = getter(key_name, project=scope_arg)
             except Exception as exc:  # noqa: BLE001 — every resolver error is a miss
+                if _is_store_unavailable(exc):
+                    # v0.2.102: NOT a miss — the store could not be read right
+                    # now (hub timed out / keychain busy). The next name is still tried (it may live in
+                    # the file store), but a total failure is reported as
+                    # transient below, never as "no key found".
+                    unavailable.append(key_name)
                 # agent_secrets raises a family of typed errors (not found,
                 # access denied, hub unreachable, keychain locked). All of them
                 # mean "no key from this name"; the TYPE is preserved in the
@@ -732,6 +835,9 @@ class VendorKeyResolver:
                     resolved_from=key_name,
                 )
             failures.append(f"{key_name}: resolved but empty")
+
+        if unavailable:
+            return self._transient_result(vendor, unavailable, failures)
 
         scope = self.describe_scope()
         # The scope is diagnosed only HERE, on the miss: a resolution that
@@ -775,6 +881,34 @@ class VendorKeyResolver:
             )
         return KeyResult(problem=problem)
 
+    def _transient_result(
+        self, vendor: Vendor, unavailable: list[str], failures: list[str]
+    ) -> KeyResult:
+        """The answer for "the secret store could not be asked right now" (the
+        hub's 503 ``keychain_unavailable``, or — v0.2.102 W6-AB — a hub that did
+        not answer in time) — a retryable condition, not a missing key. Logged
+        once per vendor until it resolves again, like the miss line."""
+        if vendor.vendor_id not in self._transient_logged:
+            self._transient_logged.add(vendor.vendor_id)
+            logger.warning(
+                "model-gateway: vendor %s key: secret store temporarily unavailable "
+                "(the OS keychain is busy or vct-hub did not answer in time); "
+                "retrying every %ds. Said once per vendor until it resolves again.",
+                vendor.vendor_id,
+                TRANSIENT_RETRY_S,
+            )
+        return KeyResult(
+            problem=(
+                f"vendor {vendor.vendor_id!r} key: secret store busy — the store "
+                "is temporarily unavailable (the OS keychain is busy or vct-hub did "
+                "not answer in time), so the key may well exist; retrying is safe "
+                f"(asked for {', '.join(repr(k) for k in unavailable)}); the gateway "
+                f"asks the store again within {TRANSIENT_RETRY_S}s. "
+                f"Resolver detail: {'; '.join(failures)}"
+            ),
+            transient=True,
+        )
+
 
 __all__ = [
     "DEFAULT_SERVE_STALE_MAX_AGE_S",
@@ -785,5 +919,6 @@ __all__ = [
     "ScopeProber",
     "ScopeStatus",
     "SecretGetter",
+    "TRANSIENT_RETRY_S",
     "VendorKeyResolver",
 ]

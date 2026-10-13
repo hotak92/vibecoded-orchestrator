@@ -60,6 +60,7 @@ from typing import Any, Optional
 
 from vco_lib.hook_retirements import (
     match_prior_shipped_shape,
+    migrate_group_matcher,
     scrub_retired_registrations,
     vco_hook_script_identity,
 )
@@ -69,6 +70,7 @@ from vco_lib.parked_hooks import (
     KEPT_OUT_UNREADABLE,
     ParkedHooksState,
     find_parked_match,
+    live_hook_identities,
 )
 
 __all__ = ["merge_hooks_block", "smart_merge_settings"]
@@ -152,7 +154,10 @@ def merge_hooks_block(
     as a whole event the user lacks — is first checked against ``parked``.
     Readable state: a registration a parked row covers
     (:func:`vco_lib.parked_hooks.find_parked_match`, identity-based) is left
-    out. Unreadable state: NO registration is added, since any of them could
+    out. v0.2.102 (review R9 F3): that includes a registration on an event
+    the hook NEWLY ships on, when the same script is parked under another
+    event and runs on no event in the user's file — the disable carries
+    (its kept-out record names ``carried_from_event``). Unreadable state: NO registration is added, since any of them could
     be one the user switched off. Either way one record per left-out
     registration goes to ``kept_out``. Only additions are filtered: a
     registration already present is superseded/kept exactly as before, and a
@@ -185,6 +190,20 @@ def merge_hooks_block(
     and the append pass skips every template handler of the group — upgraded
     installs would never receive the new shape.
 
+    v0.2.102 (S16-8 follow-up — a GROWN if-group): every rule of an
+    if-filtered group shares ONE command string, so the append pass's
+    bare-command dedupe (``existing_cmds``) marked the whole group
+    "handled" as soon as ONE rule was present — a template that grows the
+    group (v0.2.101's 21 read/search rules + the 6 write/chain rules)
+    never delivered the new rules to an already-reshaped file. For an
+    if-bearing template handler the append pass therefore dedupes on the
+    RULE identity — ``(matcher, command, if)`` — instead of the command
+    string: a rule the user's matcher already carries under that command
+    is handled whatever its other keys (a user-tuned timeout is theirs, no
+    shipped twin is appended beside it), and a rule that is genuinely new
+    is appended. Non-if registrations keep the exact pre-v0.2.102
+    behaviour.
+
     v0.2.70 (Stream G — supersede-not-stack): historically this was APPEND-ONLY
     by exact command-STRING identity, so when a VCO-shipped hook's command form
     changed (e.g. a path-separator fix `...\\hooks\\x.ps1` -> `.../hooks/x.ps1`,
@@ -214,6 +233,10 @@ def merge_hooks_block(
     out, scrub_removals = scrub_retired_registrations(user_hooks)
     if retired_removed is not None:
         retired_removed.extend(scrub_removals)
+    # Review R9 F3: what runs in the user's file BEFORE anything is added, so
+    # a disable parked under one event carries to an event the hook newly
+    # ships on (find_parked_match, live_identities) — order-independent.
+    live_idents = live_hook_identities(out)
 
     def _keep_out(event: str, group: Any, command: str) -> bool:
         """True (and recorded) when adding this registration must not happen."""
@@ -226,10 +249,13 @@ def merge_hooks_block(
         else:
             hit = find_parked_match(
                 parked.hooks, event, matcher, command, template_hooks.get(event) or [],
+                live_identities=live_idents,
             )
             if hit is None:
                 return False
             record.update(reason=KEPT_OUT_PARKED, parked_command=hit.command)
+            if hit.event != event:
+                record["carried_from_event"] = hit.event
         if kept_out is not None:
             kept_out.append(record)
         return True
@@ -287,6 +313,20 @@ def merge_hooks_block(
                 ident = vco_hook_script_identity(c)
                 if ident:
                     template_matchers.setdefault(ident, set()).add(normalize_matcher(t_entry))
+
+        # v0.2.102 W5-D (MATCHER_MIGRATIONS): a group of shipped shell hooks
+        # still under the old `Bash` matcher is moved to the template's
+        # `Bash|PowerShell` BEFORE anything below keys on matchers — so the
+        # reshape, supersede and append passes see it under the matcher the
+        # template ships, and the append pass adds only the PowerShell twin
+        # rules the group lacks (folded into this same group, below).
+        # A group that also holds a user's own hook is left alone.
+        u_entries = [
+            {**entry, "matcher": new_m}
+            if (new_m := migrate_group_matcher(event, entry, template_matchers))
+            else entry
+            for entry in u_entries
+        ]
         present_idents: set[tuple[str, str]] = set()
         present_cmds: set[tuple[str, str]] = set()
 
@@ -309,6 +349,18 @@ def merge_hooks_block(
             for entry in u_entries if isinstance(entry, dict)
             for h in entry.get("hooks", []) if isinstance(h, dict)
         }
+        # v0.2.102: the template's if-RULES per (matcher, command) — the
+        # group identity the append pass dedupes a grown if-group by.
+        template_if_rules: dict[tuple[str, str], set[str]] = {}
+        for t_entry in t_entries:
+            if not isinstance(t_entry, dict):
+                continue
+            t_matcher = normalize_matcher(t_entry)
+            for h in t_entry.get("hooks", []):
+                if (isinstance(h, dict) and isinstance(h.get("command"), str)
+                        and isinstance(h.get("if"), str)):
+                    template_if_rules.setdefault(
+                        (t_matcher, h["command"]), set()).add(h["if"])
 
         merged_entries: list = []
         superseded_identities: set[str] = set()
@@ -369,6 +421,19 @@ def merge_hooks_block(
             new_entry["hooks"] = new_hooks
             merged_entries.append(new_entry)
 
+        # v0.2.102: the (matcher, command, if) rules the user's file already
+        # carries AFTER the supersede/reshape pass above — computed from
+        # ``merged_entries`` so a group a reshape just delivered also counts
+        # (the append pass must not duplicate it rule by rule).
+        present_if_rules: set[tuple[str, str, str]] = {
+            (normalize_matcher(entry), h["command"], h["if"])
+            for entry in merged_entries if isinstance(entry, dict)
+            for h in entry.get("hooks", [])
+            if isinstance(h, dict)
+            and isinstance(h.get("command"), str)
+            and isinstance(h.get("if"), str)
+        }
+
         # Second pass: APPEND genuinely-new template hooks at PER-COMMAND
         # (inner-hook) granularity. A template command is "handled" (so it
         # must NOT be re-appended) when EITHER its exact string is already
@@ -399,7 +464,22 @@ def merge_hooks_block(
         # uses. A script the template ships under ONE matcher keeps the
         # event-wide rule, so a user who regrouped it under their own matcher
         # does not get a second, duplicate invocation.
-        def _cmd_handled(c: str, t_matcher: str) -> bool:
+        def _cmd_handled(c: str, t_matcher: str, t_hook: Optional[dict] = None) -> bool:
+            # v0.2.102: an if-bearing registration's identity is its RULE —
+            # (matcher, command, if) — not the bare command string every
+            # rule of the group shares. Per-rule dedupe applies ONLY when
+            # the user's matcher already carries (at least one rule of) the
+            # shipped group under the same command: a user carrying some
+            # rules is a partially-updated shipped group and gains the rest;
+            # a user whose same-command registration is NOT a shipped rule
+            # (an if-less handler, their own filter, another matcher, a
+            # custom command spelling) keeps the exact pre-v0.2.102
+            # behaviour — the group is theirs and nothing is appended.
+            # See the docstring's v0.2.102 note.
+            if isinstance(t_hook, dict) and isinstance(t_hook.get("if"), str):
+                group_rules = template_if_rules.get((t_matcher, c), set())
+                if any((t_matcher, c, r) in present_if_rules for r in group_rules):
+                    return (t_matcher, c, t_hook["if"]) in present_if_rules
             ident = vco_hook_script_identity(c)
             if ident is not None and len(template_matchers.get(ident, ())) > 1:
                 return (t_matcher, ident) in present_idents or (t_matcher, c) in present_cmds
@@ -419,10 +499,18 @@ def merge_hooks_block(
                 for h in t_entry.get("hooks", [])
                 if isinstance(h, dict)
                 and h.get("command")
-                and not _cmd_handled(h["command"], normalize_matcher(t_entry))
+                and not _cmd_handled(h["command"], normalize_matcher(t_entry), h)
                 and not _keep_out(event, t_entry, h["command"])
             ]
             if not new_inner:
+                continue
+            # v0.2.102: rules of an if-group the user's file already carries
+            # (same matcher, same command) JOIN that group instead of
+            # opening a second one — a grown group (or the PowerShell twins
+            # of a migrated one) then has the fresh-install shape.
+            host = _if_group_host(merged_entries, normalize_matcher(t_entry), new_inner)
+            if host is not None:
+                host["hooks"] = list(host.get("hooks", [])) + new_inner
                 continue
             appended = dict(t_entry)
             appended["hooks"] = new_inner
@@ -430,6 +518,27 @@ def merge_hooks_block(
 
         out[event] = merged_entries
     return out
+
+
+def _if_group_host(entries: list, matcher: str, new_inner: list) -> Optional[dict]:
+    """The merged entry an appended batch of ``if`` rules should join, or
+    ``None``. Only when EVERY appended hook carries an ``if`` and an entry
+    under the same matcher is an if-group (every hook has an ``if``) of the
+    same command — never for if-less registrations, whose append behaviour
+    is unchanged."""
+    if not new_inner or not all(isinstance(h.get("if"), str) for h in new_inner):
+        return None
+    cmds = {h.get("command") for h in new_inner}
+    for entry in entries:
+        if not isinstance(entry, dict) or normalize_matcher(entry) != matcher:
+            continue
+        inner = entry.get("hooks")
+        if not isinstance(inner, list) or not inner:
+            continue
+        if all(isinstance(h, dict) and isinstance(h.get("if"), str) for h in inner) \
+                and any(h.get("command") in cmds for h in inner):
+            return entry
+    return None
 
 
 def _hook_fingerprint(hook: dict) -> str:

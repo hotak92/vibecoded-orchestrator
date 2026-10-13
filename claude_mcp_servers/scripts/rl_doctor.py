@@ -35,7 +35,7 @@ ONE deliberate exception (v0.2.75 NEW-2): ``--prune`` runs a single
 ``rl_events`` retention pass NOW, bypassing the hourly throttle. It exists as
 the explicit trigger for opted-out users (whose search path only drives the
 throttled opportunistic prune) and for operators who just tightened
-``RL_EVENTS_RETENTION_MAX_AGE_DAYS``. Deletion bounds and the 6-h
+``RL_EVENTS_RETENTION_MAX_AGE_DAYS``. Deletion bounds and the
 in-flight-citation floor are identical to the automatic path
 (``rl_retention.maybe_run_retention`` — one home).
 
@@ -67,24 +67,19 @@ for _p in (_REPO_ROOT, os.path.join(_HERE, "..")):
         sys.path.insert(0, _p)
 
 
-# ── project-root resolution (mirrors _record_rl_fallback) ───────────────
+# ── project-root resolution (shared with _bump_rl_counter) ─────────────
 
 
 def _resolve_project_root(explicit: Optional[str] = None) -> str:
-    """CLAUDE_PROJECT_DIR → server.KG_BASE_DIR → cwd. Matches the fallback
-    counter's writer so rl-doctor reads the file the pipeline wrote."""
+    """Explicit → ``search_pipeline.rl_counter_root()`` (the counter
+    writer's own resolver, so rl-doctor reads the file the pipeline wrote) →
+    the cwd, for display only: this is a read, and with no enclosing project
+    the writer never wrote a counter anywhere, which the report then shows."""
     if explicit:
         return explicit
-    root = os.environ.get("CLAUDE_PROJECT_DIR", "")
-    if root:
-        return root
-    try:
-        from claude_mcp_servers.weaviate_mcp import server as _srv
+    from claude_mcp_servers.rl_client.search_pipeline import rl_counter_root
 
-        root = getattr(_srv, "KG_BASE_DIR", "") or ""
-    except Exception:  # noqa: BLE001
-        root = ""
-    return root or os.getcwd()
+    return rl_counter_root() or os.getcwd()
 
 
 # ── individual probes (each soft-fails to a status dict) ────────────────
@@ -516,7 +511,7 @@ def main(argv: Optional[list] = None) -> int:
 
 def _run_prune_now() -> Dict[str, Any]:
     """NEW-2 (v0.2.75): one forced retention pass. Same single home as the
-    automatic drivers (``rl_retention.maybe_run_retention``) — the 6-h
+    automatic drivers (``rl_retention.maybe_run_retention``) — the
     in-flight-citation floor and the no-bounds no-op guard apply identically.
     Soft-fails to a status dict; never raises."""
     try:

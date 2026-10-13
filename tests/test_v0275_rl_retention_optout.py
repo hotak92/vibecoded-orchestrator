@@ -17,7 +17,7 @@ not "keep my old rows forever"):
 
   * ``log_retrieval`` drives the throttled prune in BOTH branches.
   * ``rerank_and_emit``'s no-consumer skip branch drives the same single-home
-    ``maybe_run_retention`` (hourly throttle + 6-h in-flight floor identical).
+    ``maybe_run_retention`` (hourly throttle + in-flight floor identical).
   * rl-doctor grows ``--prune`` — the explicit, throttle-bypassing trigger
     (the tool's single mutating exception).
 
@@ -149,7 +149,7 @@ def test_opted_out_skip_branch_drives_retention(monkeypatch):
     assert len(calls) == 1, "the skip branch must drive the retention pass"
 
 
-# ── the 6-h in-flight clamp is identical through both drivers ───────────
+# ── the in-flight clamp is identical through both drivers ───────────────
 
 
 def _clamp_capture(monkeypatch) -> list:

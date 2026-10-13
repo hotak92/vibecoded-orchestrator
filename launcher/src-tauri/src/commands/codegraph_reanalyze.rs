@@ -57,7 +57,7 @@ use vct_launcher_core::process::CommandExt as _;
 // ─── Constants ───────────────────────────────────────────────────────────
 
 /// Hard ceiling on the analyzer subprocess lifetime. 30min is the locked
-/// design number — same as embedding_enrichment.rs.
+/// design number — the same as the (v0.2.102-retired) embedding_enrichment.rs had.
 const REANALYSIS_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Tauri event name re-emitted from each Python `{"progress":...}` line.

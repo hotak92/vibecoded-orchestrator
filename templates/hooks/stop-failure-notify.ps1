@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed.
+﻿# Parity: kept in step with stop-failure-notify.sh (this file's UTF-8 BOM serves
+# Windows PowerShell 5.1 only and has no Bash-side counterpart; every
+# behaviour must match the stop-failure-notify.sh sibling).
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
@@ -29,8 +31,14 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
-$ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
-$ProjectName = Split-Path $ProjectDir -Leaf
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py). It only labels the ledger row and locates
+# notify.py; the ledger is written either way. None -> the label falls back
+# to the current location's name and no notification is sent.
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+. (Join-Path $PSScriptRoot "_lib/utf8-nobom.ps1")  # the one BOM-free writer (review R5-8)
+$ProjectDir = Get-VcoProjectRoot
+$ProjectName = Split-Path $(if ($ProjectDir) { $ProjectDir } else { (Get-Location).Path }) -Leaf
 
 $LibDir = Join-Path $PSScriptRoot "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
@@ -277,7 +285,7 @@ if (-not $CoreRan) {
         $sfLedger = Join-Path $LogDir "failures.jsonl"
         try {
             $sfLine = ($sfRow | ConvertTo-Json -Compress -Depth 3)
-            [System.IO.File]::AppendAllText($sfLedger, $sfLine + "`n", (New-Object System.Text.UTF8Encoding $false))
+            Add-VcoUtf8Content -Path $sfLedger -Value ($sfLine + "`n") -NoNewline
         } catch {
             [Console]::Error.WriteLine("stop-failure-notify: ledger line NOT written to $sfLedger ($sfWhy; $($_.Exception.Message)).")
         }
@@ -293,8 +301,8 @@ if (-not $CoreRan) {
 if ($env:VCO_STOP_FAILURE_NOTIFY -eq "0") { exit 0 }
 
 # Urgent cross-platform notification.
-$NotifyScript = Join-Path $ProjectDir ".claude/scripts/notify.py"
-if ($NotifyFlag -eq "1" -and $PY -and (Test-Path $NotifyScript)) {
+$NotifyScript = if ($ProjectDir) { Join-Path $ProjectDir ".claude/scripts/notify.py" } else { "" }
+if ($NotifyFlag -eq "1" -and $PY -and $NotifyScript -and (Test-Path $NotifyScript)) {
     try {
         & $PY $NotifyScript "Claude API Error -- $ProjectName" "$NotifyMsg" `
             --urgency critical --icon dialog-error --expire-time 15000 2>$null | Out-Null

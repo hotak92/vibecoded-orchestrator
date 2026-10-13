@@ -1,0 +1,27 @@
+{
+ "source": "routes.js",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "function",
+   "name": "registerRoutes",
+   "start": 3,
+   "end": 6,
+   "full_name": "routes.registerRoutes"
+  },
+  {
+   "kind": "function",
+   "name": "createItem",
+   "start": 8,
+   "end": 10,
+   "full_name": "routes.createItem"
+  },
+  {
+   "kind": "function",
+   "name": "listItems",
+   "start": 12,
+   "end": 14,
+   "full_name": "routes.listItems"
+  }
+ ]
+}

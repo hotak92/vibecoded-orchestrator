@@ -104,3 +104,22 @@ export interface ChatModelContextStatus {
   seed_available: boolean;
   seed_problem: string | null;
 }
+
+/** One field that differs between the stored row and the shipped seed row.
+ *  Values ride at their native JSON type (number / boolean / string). */
+export interface ChatModelContextFieldDiff {
+  field: string;
+  shipped: string | number | boolean;
+  yours: string | number | boolean;
+}
+
+/** Per-row edited-vs-shipped verdict (v0.2.102, OD-3), computed in Rust
+ *  from the embedded seed. `edited: false` means "matches the shipped row"
+ *  (or no seed was readable — the status card names that case). A row the
+ *  seed does not list is `edited: true` with the single whole-row entry
+ *  `'(row not in shipped defaults)'`. */
+export interface ChatModelContextEditedDiff {
+  model_id: string;
+  edited: boolean;
+  diff: ChatModelContextFieldDiff[];
+}

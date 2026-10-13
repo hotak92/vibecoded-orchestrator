@@ -34,7 +34,12 @@ if (Test-Path $StderrCap) { . $StderrCap }
 $EmitHelper = Join-Path $ScriptDir "_lib/emit-context.ps1"
 if (Test-Path $EmitHelper) { . $EmitHelper }
 
-$ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to do (no state is written).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectRoot = Get-VcoProjectRoot
+if (-not $ProjectRoot) { exit 0 }
 
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
@@ -44,6 +49,7 @@ if (-not $HookStdin) { exit 0 }
 $IsoFlag = $false
 $CwdField = ""
 $AgentId = ""
+$AgentType = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
@@ -69,9 +75,83 @@ try {
             if ($payload.PSObject.Properties[$f] -and $payload.$f) { $CwdField = [string]$payload.$f; break }
         }
         if ($payload.PSObject.Properties['agent_id'] -and $payload.agent_id) { $AgentId = [string]$payload.agent_id }
+        if ($payload.PSObject.Properties['agent_type'] -and $payload.agent_type) { $AgentType = [string]$payload.agent_type }
     }
 } catch {
     exit 0
+}
+
+function Emit-Ctx([string]$text) {
+    if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+        Emit-AdditionalContext $text 'SubagentStart'
+    } else {
+        $envelope = [ordered]@{
+            hookSpecificOutput = [ordered]@{
+                hookEventName     = 'SubagentStart'
+                additionalContext = $text
+            }
+        }
+        Write-Output ($envelope | ConvertTo-Json -Compress -Depth 8)
+    }
+}
+
+# -- worktree-guard notice (v0.2.102 W6-Q) - must match the .sh --------------
+# worktree-guard.ps1 leaves .claude/state/worktree-guard/notice-<name>.txt
+# when the agent runs in place (not a git repo) or on a snapshot base (no
+# commits yet). WorktreeCreate `name` is `agent-<agent_id>`; the bare id is
+# accepted too. Delivered once, then removed; independent of the isolation
+# flag (the live SubagentStart payload does not carry one).
+if ($AgentId -and ($AgentId -match '^[A-Za-z0-9_-][A-Za-z0-9._-]*$')) {
+    $NoticeDir = Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "worktree-guard"
+    foreach ($nm in @("notice-agent-$AgentId.txt", "notice-$AgentId.txt")) {
+        $np = Join-Path $NoticeDir $nm
+        if (Test-Path -LiteralPath $np -PathType Leaf) {
+            $nt = ""
+            try { $nt = (Get-Content -LiteralPath $np -Raw -ErrorAction Stop) } catch { }
+            try { Remove-Item -LiteralPath $np -Force -ErrorAction SilentlyContinue } catch { }
+            if ($nt -and ($nt -match '\S')) {
+                Emit-Ctx $nt.TrimEnd()
+                exit 0
+            }
+        }
+    }
+}
+
+# -- Lane reservation binding (v0.2.102 W6-AA) - must match the .sh ---------
+# worktree-guard's launch record carries the reservation id, target repo,
+# branch and base when the worktree came from a lane reservation
+# (vco_lib/lane_reservation.py). Tell the agent, on every SubagentStart.
+$WtrecLaneHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
+if ($AgentId -and (Test-Path -LiteralPath $WtrecLaneHelper)) {
+    . $WtrecLaneHelper
+    $laneFile = Find-WtrecRecord $ProjectRoot $AgentId
+    if ($laneFile) {
+        $laneRec = Read-WtrecRecord $laneFile
+        if ($laneRec -and [string]$laneRec.reservation_id) {
+            Emit-Ctx "VCO lane reservation $([string]$laneRec.reservation_id): your worktree is $([string]$laneRec.path) (repo $([string]$laneRec.repo), branch $([string]$laneRec.branch), base $([string]$laneRec.base_sha)). If your brief names a different reservation id, STOP and report. Only Edit/Write are held to this worktree by the harness: keep every Bash command (cd, redirects, git) inside it too."
+            exit 0
+        }
+    }
+}
+
+# -- Skipped-isolation detection (v0.2.102 W6-Q follow-up) - must match .sh --
+# A definition (found by agent_type = frontmatter `name`, in the project's or
+# the user's .claude/agents) that declares `isolation: worktree`, with NO
+# worktree-guard record for this agent id while the guard is registered,
+# means the harness started the agent without a worktree (e.g. an
+# agent-teams teammate). Unknown definition / plugin-scoped type => no-op.
+# A record that outlived its reaped worktree still counts (a resumed agent):
+# Remove-WtrecStale keeps records until idle past max(30, cleanupPeriodDays)
+# + 30 days, and this lookup (Find-WtrecRecord) restarts the idle clock.
+# The decision lives in _lib/worktree-records.ps1 :: Test-WtrecIsolationSkipped,
+# shared with subagent-stop-reconcile's post-hoc alert (Layer 3b).
+$WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
+if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
+    . $WtrecHelper
+    if (Test-WtrecIsolationSkipped $ProjectRoot $AgentId $AgentType) {
+        Emit-Ctx "ISOLATION SKIPPED - the definition of ``$AgentType`` declares ``isolation: worktree``, but no isolated worktree was created for this launch: you are running in the parent's working directory and every edit lands in the shared checkout (this happens, for example, when the agent is started as an agent-teams teammate). BEFORE any edit or git write: stop and report this to the caller, or work only on what the brief explicitly allows in the shared tree. Do NOT commit from the parent checkout."
+        exit 0
+    }
 }
 
 # No-op: isolation not requested, or no cwd exposed. Don't guess.
@@ -98,17 +178,6 @@ $Msg = "WARNING: ISOLATION VIOLATION SUSPECTED - this subagent requested ``isola
 
 if (-not ($Msg -match '\S')) { exit 0 }
 
-if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
-    Emit-AdditionalContext $Msg 'SubagentStart'
-} else {
-    $envelope = [ordered]@{
-        hookSpecificOutput = [ordered]@{
-            hookEventName     = 'SubagentStart'
-            additionalContext = $Msg
-        }
-    }
-    $json = $envelope | ConvertTo-Json -Compress -Depth 8
-    Write-Output $json
-}
+Emit-Ctx $Msg
 
 exit 0

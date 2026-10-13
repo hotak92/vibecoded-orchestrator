@@ -6,10 +6,22 @@
 # into the project's KG / code-graph / credential-scan / nudge-counter
 # state, plus the V52-L.2 JSONL audit row.
 #
-# V52-L.1 (v0.2.52): five side effects, all soft-fail. See .sh sibling
-# for the full design rationale.
-#
-# Performance budget: <2s no-modifications, <10s with modifications.
+# V52-L.1 (v0.2.52): side effects, all soft-fail. See .sh sibling for the
+# full design rationale. MUST MATCH the .sh sibling, in particular
+# (v0.2.102 W6-C2):
+#   * DETACHED (census F6/L1): the foreground parses, writes the audit row
+#     and hands the payload (0600-style job file under .claude/state) to ONE
+#     detached run of this script (`--job <file>`, Start-VcoDetachedProcess).
+#     VCO_SUBAGENT_RECONCILE_INLINE=1 runs the job in the foreground.
+#   * Step 2 routes knowledge/** + docs/**.md through route-touched-path.ps1
+#     (access gate, debounce, detached runner, no timeout) -- no more
+#     WaitForExit(30000) + Kill (census L1).
+#   * ATTRIBUTION (census F7): an agent with its own worktree is reconciled
+#     from that worktree's git state (Get-WtrecChangedFiles); otherwise the
+#     shared-tree snapshot diff, recorded as unattributed_shared_tree.
+#   * PARENT ALERTS (census F8): kept worktree / violation / credential hit
+#     are filed under .claude/state/agent_alerts_<sid>__<agent>.jsonl.
+#   * Step 5 holds the nudge's sidecar lock (census F5).
 
 # Scrub sensitive env vars before any subprocess spawning.
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
@@ -22,6 +34,7 @@ $ScriptDir = $PSScriptRoot
 # v0.2.54 Track G (G-6): child spawns used a hardcoded `pwsh` (absent on
 # PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
 . (Join-Path $ScriptDir "_lib/resolve-powershell.ps1")
+. (Join-Path $ScriptDir "_lib/utf8-nobom.ps1")  # the one BOM-free writer (review R5-8)
 $StderrCap = Join-Path $ScriptDir "_lib/stderr-cap.ps1"
 if (Test-Path $StderrCap) { . $StderrCap }
 
@@ -66,8 +79,37 @@ try {
     }
 } catch {}
 
+# --job <file>: the DETACHED half. The payload rides a job file, never argv.
+$JobFile = ""
+if ($args.Count -ge 2 -and [string]$args[0] -eq "--job" -and $args[1]) { $JobFile = [string]$args[1] }
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+if ($JobFile) {
+    # Only a job file this hook writes is read (and then deleted): a plain
+    # file named subagent-reconcile-job.*.json directly in $StateDir. Any
+    # other path (a manual run, a diagnostic) is refused (review R4c-9).
+    $jobOk = $false
+    try {
+        $jobFull = [System.IO.Path]::GetFullPath($JobFile)
+        $stateFull = [System.IO.Path]::GetFullPath($StateDir).TrimEnd('\', '/')
+        $jobName = [System.IO.Path]::GetFileName($jobFull)
+        if (([System.IO.Path]::GetDirectoryName($jobFull).TrimEnd('\', '/') -eq $stateFull) -and
+            ($jobName -like 'subagent-reconcile-job.*.json')) {
+            $jobItem = Get-Item -LiteralPath $jobFull -Force -ErrorAction Stop
+            if (-not $jobItem.PSIsContainer -and -not ($jobItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                $jobOk = $true
+                $JobFile = $jobFull
+            }
+        }
+    } catch { $jobOk = $false }
+    if (-not $jobOk) {
+        [Console]::Error.WriteLine("subagent-stop-reconcile: --job accepts only $StateDir/subagent-reconcile-job.*.json; ignored: $JobFile")
+        exit 0
+    }
+    try { $HookStdin = [System.IO.File]::ReadAllText($JobFile) } catch { $HookStdin = "" }
+    try { Remove-Item -LiteralPath $JobFile -Force -ErrorAction SilentlyContinue } catch { }
+} else {
+    try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+}
 if (-not $HookStdin) { exit 0 }
 
 # Parse the SubagentStop payload. Field-synonym tolerance for
@@ -120,7 +162,7 @@ try {
     exit 0
 }
 
-# Step 1 (V52-L.2 preserved): emit the audit row.
+# Step 1 (V52-L.2 preserved): emit the audit row -- FOREGROUND only.
 $entry = [ordered]@{
     timestamp       = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     session_id      = $SessionId
@@ -129,18 +171,149 @@ $entry = [ordered]@{
     transcript_path = $TranscriptPath
     stop_reason     = $StopReason
 }
-try {
-    $line = $entry | ConvertTo-Json -Compress -Depth 5
-    Add-Content -Path $LogFile -Value $line -ErrorAction Stop
-} catch { }
+if (-not $JobFile) {
+    try {
+        $line = $entry | ConvertTo-Json -Compress -Depth 5
+        Add-Content -Path $LogFile -Value $line -ErrorAction Stop
+    } catch { }
+}
+
 
 # ----------------------------------------------------------------------
-# Steps 2-5 (V52-L.1): only when we have a usable AgentId AND the
-# snapshot helper sourced successfully. Otherwise short-circuit to
-# logging-only mode.
+# DETACH (v0.2.102 W6-C2, census F6/L1) - must match the .sh sibling.
+# ----------------------------------------------------------------------
+$inlineRaw = [string]$env:VCO_SUBAGENT_RECONCILE_INLINE
+$Inline = @("1", "true", "yes", "on") -contains $inlineRaw.Trim().ToLowerInvariant()
+if (-not $JobFile -and -not $Inline) {
+    if (-not $AgentId) { exit 0 }
+    # A job file whose job never started is garbage after a day.
+    Get-ChildItem -LiteralPath $StateDir -Filter "subagent-reconcile-job.*.json" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    $safeJobId = [regex]::Replace($AgentId, '[^a-zA-Z0-9_-]', '_')
+    if ($safeJobId.Length -gt 64) { $safeJobId = $safeJobId.Substring(0, 64) }
+    $job = Join-Path $StateDir ("subagent-reconcile-job.{0}.{1}.json" -f $safeJobId, $PID)
+    # The job's own output goes to a per-job log, never the hook's stdout /
+    # stderr: a child that inherits those keeps the harness's pipe open until
+    # the job ends (measured: the foreground "returned" only after the whole
+    # job). Per job, so concurrent jobs never share a file; swept after a
+    # week. Must match the .sh sibling.
+    $jobLogDir = Join-Path $LogDir "subagent-reconcile-jobs"
+    $redirect = @{}
+    try {
+        if (-not (Test-Path -LiteralPath $jobLogDir)) {
+            New-Item -ItemType Directory -Force -Path $jobLogDir -ErrorAction Stop | Out-Null
+        }
+        Get-ChildItem -LiteralPath $jobLogDir -Filter "job.*" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        $redirect["RedirectStandardOutput"] = Join-Path $jobLogDir ("job.{0}.{1}.out" -f $safeJobId, $PID)
+        $redirect["RedirectStandardError"] = Join-Path $jobLogDir ("job.{0}.{1}.err" -f $safeJobId, $PID)
+    } catch { }
+    try {
+        Set-VcoUtf8Content -Path $job -Value $HookStdin -NoNewline
+        $env:CLAUDE_PROJECT_DIR = $ProjectRoot
+        Start-VcoDetachedProcess -FilePath $PsExe -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "--job", $job) @redirect | Out-Null
+    } catch { }
+    exit 0
+}
+
+# ---- the job (detached; inline under VCO_SUBAGENT_RECONCILE_INLINE) ----
+$SessionIdLib = Join-Path $ScriptDir "_lib/session-id.ps1"
+if (Test-Path -LiteralPath $SessionIdLib) { . $SessionIdLib }
+
+# File one PARENT-facing alert (census F8). One writer: _lib/agent-alerts.ps1
+# -> python -m vco_lib.agent_alerts append (row format + locking live there;
+# review R4c-2/R4c-3). No-op without an agent id. A failure (broken install:
+# no VCO venv) is never silent: stderr plus a desktop notification carrying
+# the alert. Must match the .sh.
+$AgentAlertsLib = Join-Path $ScriptDir "_lib/agent-alerts.ps1"
+if (Test-Path -LiteralPath $AgentAlertsLib) { . $AgentAlertsLib }
+function Add-ReconcileParentAlert([string]$Kind, [string]$Message, [string]$File = "") {
+    if (-not $AgentId) { return }
+    if ((Get-Command Add-VcoAgentAlert -ErrorAction SilentlyContinue) -and
+        (Add-VcoAgentAlert -ScriptDir $ScriptDir -ProjectRoot $ProjectRoot -SessionId $SessionId `
+            -AgentId $AgentId -AgentType $AgentType -Kind $Kind -Message $Message -File $File)) {
+        return
+    }
+    [Console]::Error.WriteLine("subagent-stop-reconcile: alert NOT delivered to the parent: $Message")
+    $notify = Join-Path $ProjectRoot ".claude/scripts/notify.py"
+    $findPy = Join-Path $ScriptDir "_lib/find-python.ps1"
+    if (-not $PY -and (Test-Path -LiteralPath $findPy)) { . $findPy }
+    $notifyPy = $PY
+    if ($notifyPy -and (Test-Path -LiteralPath $notify)) {
+        try {
+            & $notifyPy $notify "VCO: subagent alert NOT delivered (broken install)" $Message `
+                --urgency critical --icon dialog-warning 2>$null | Out-Null
+        } catch { }
+    }
+}
+
+# v0.2.102 W6-R - must match the .sh sibling: the live SubagentStop payload
+# carries none of the isolation fields parsed above, so derive the flag from
+# worktree-guard's record + the agent's definition (_lib/worktree-records.ps1,
+# shared with subagent-start-isolation-check):
+#   * record with mode head|snapshot|reservation|reservation_existing =>
+#     isolated: stay silent ($IsoFlag off);
+#   * no record, guard registered, definition declares `isolation: worktree`
+#     => skipped: $IsoFlag on, cwd treated as the parent checkout;
+#   * anything else => the payload-derived value stands.
+# Read BEFORE Step 1b's reap, which rewrites the record's status.
+$WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
+if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
+    . $WtrecHelper
+    try {
+        $isoRecFile = Find-WtrecRecord $ProjectRoot $AgentId
+        if ($isoRecFile) {
+            $isoRec = Read-WtrecRecord $isoRecFile
+            if ($isoRec -and (@("head", "snapshot", "reservation", "reservation_existing") -contains [string]$isoRec.mode)) {
+                $IsoFlag = $false
+                # W6-C2 F7: this agent worked in its OWN worktree.
+                $AgentWtIsolated = $true
+            }
+        } elseif (Test-WtrecIsolationSkipped $ProjectRoot $AgentId $AgentType) {
+            $IsoFlag = $true
+            $IsoCwd = ""
+        }
+    } catch { }
+}
+
+# Step 1b (v0.2.102 W6-Q follow-up) - must match the .sh sibling: reap the
+# agent's worktree when it is provably unchanged (the harness neither removes
+# a hook-created worktree nor runs WorktreeRemove when a subagent finishes).
+# Conditions live in _lib/worktree-records.ps1 :: Invoke-WtrecReap. A kept
+# worktree is logged with path + reason and named on stderr. Never blocks.
+$WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
+if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
+    . $WtrecHelper
+    $reap = $null
+    try { $reap = Invoke-WtrecReap $ProjectRoot $AgentId } catch { $reap = $null }
+    if ($reap) {
+        try {
+            $row = [ordered]@{
+                timestamp     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                hook          = "subagent-stop-reconcile"
+                decision      = "reap_" + $reap.Decision
+                reason        = $reap.Reason
+                agent_id      = $AgentId
+                resolved_path = $reap.Path
+            }
+            Add-Content -Path (Join-Path $LogDir "worktree-guard.jsonl") -Value ($row | ConvertTo-Json -Compress) -ErrorAction Stop
+        } catch { }
+        if ($reap.Decision -eq "kept") {
+            [Console]::Error.WriteLine("subagent-stop-reconcile: worktree of agent $AgentId KEPT at $($reap.Path) ($($reap.Reason)) - review, merge or remove it")
+            # census F8: file it for the PARENT, which must review/merge/remove it.
+            Add-ReconcileParentAlert "worktree_kept" "worktree KEPT at $($reap.Path) ($($reap.Reason)): review its changes, then merge or remove it" ([string]$reap.Path)
+        }
+    }
+}
+
+# ----------------------------------------------------------------------
+# Steps 2-5 (V52-L.1): only with a usable AgentId. W6-C2 F7: the changed-
+# file set comes from the agent's OWN worktree when it had one, else from
+# the shared-tree snapshot diff (unattributed). Must match the .sh sibling.
 # ----------------------------------------------------------------------
 if (-not $AgentId) { exit 0 }
-if (-not (Get-Command Diff-Snapshot -ErrorAction SilentlyContinue)) { exit 0 }
 
 # Sanitize agent_id for snapshot filename (must match _Get-SafeAgentId
 # in snapshot.ps1; we duplicate the sanitization here so the file
@@ -148,22 +321,36 @@ if (-not (Get-Command Diff-Snapshot -ErrorAction SilentlyContinue)) { exit 0 }
 $safeId = [regex]::Replace($AgentId, '[^a-zA-Z0-9_-]', '_')
 if ($safeId.Length -gt 64) { $safeId = $safeId.Substring(0, 64) }
 $snapFile = Join-Path $StateDir "subagent-snapshot-$safeId.json"
-if (-not (Test-Path -LiteralPath $snapFile -PathType Leaf)) { exit 0 }
 
-# Compute the diff. Cap to MAX_DIFF_FILES (default 500).
+# Cap to MAX_DIFF_FILES (default 500).
 $maxDiff = if ($env:VCT_SUBAGENT_MAX_DIFF) {
     try { [int]$env:VCT_SUBAGENT_MAX_DIFF } catch { 500 }
 } else { 500 }
 
-$changedFiles = @()
-try {
-    $diffOut = Diff-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot -SnapshotDir $StateDir
-    if ($diffOut) {
-        $changedFiles = @($diffOut | Select-Object -First $maxDiff)
+$Attribution = ""
+$changedFiles = @()   # project-relative (shared tree) - Layer 3b lists these
+$changedAbs = @()     # absolute - every step below reads these
+if ($AgentWtIsolated -and (Get-Command Get-WtrecChangedFiles -ErrorAction SilentlyContinue)) {
+    $Attribution = "agent_worktree"
+    try { $changedAbs = @(Get-WtrecChangedFiles $ProjectRoot $AgentId | Select-Object -First $maxDiff) } catch { $changedAbs = @() }
+    # A snapshot from an older SubagentStart is not this agent's evidence.
+    if (Get-Command Cleanup-Snapshot -ErrorAction SilentlyContinue) {
+        try { Cleanup-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot -SnapshotDir $StateDir } catch {}
     }
-} catch { }
+} else {
+    if (-not (Get-Command Diff-Snapshot -ErrorAction SilentlyContinue)) { exit 0 }
+    if (-not (Test-Path -LiteralPath $snapFile -PathType Leaf)) { exit 0 }
+    $Attribution = "unattributed_shared_tree"
+    try {
+        $diffOut = Diff-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot -SnapshotDir $StateDir
+        if ($diffOut) {
+            $changedFiles = @($diffOut | Select-Object -First $maxDiff)
+        }
+    } catch { }
+    $changedAbs = @($changedFiles | Where-Object { $_ } | ForEach-Object { Join-Path $ProjectRoot $_ })
+}
 
-if (-not $changedFiles -or $changedFiles.Count -eq 0) {
+if (-not $changedAbs -or $changedAbs.Count -eq 0) {
     # Happy path: nothing changed. Clean up snapshot + exit.
     if (Get-Command Cleanup-Snapshot -ErrorAction SilentlyContinue) {
         try { Cleanup-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot -SnapshotDir $StateDir } catch {}
@@ -174,63 +361,71 @@ if (-not $changedFiles -or $changedFiles.Count -eq 0) {
 # Tally + classify. Mirrors the .sh sibling's bookkeeping.
 $fileCount = 0
 $totalBytes = [int64]0
-$kgFiles = New-Object System.Collections.Generic.List[string]
-$codeFiles = New-Object System.Collections.Generic.List[string]
-$allFiles = New-Object System.Collections.Generic.List[string]
+$kgFiles = New-Object System.Collections.Generic.List[string]    # absolute; shared tree only
+$codeFiles = New-Object System.Collections.Generic.List[string]  # relative; shared tree only
+$allFiles = New-Object System.Collections.Generic.List[string]   # absolute; credential scan
 
 $codeExtRe = '\.(py|rs|ts|tsx|js|jsx|go|java|cs|c|cpp|h|hpp|rb|php|swift|kt|scala|sh|ps1|sql)$'
 
-foreach ($rel in $changedFiles) {
-    if (-not $rel) { continue }
+foreach ($abs in $changedAbs) {
+    if (-not $abs) { continue }
     $fileCount++
-    $abs = Join-Path $ProjectRoot $rel
     if (Test-Path -LiteralPath $abs -PathType Leaf) {
         try {
             $totalBytes += (Get-Item -LiteralPath $abs -ErrorAction Stop).Length
         } catch {}
     }
-    $allFiles.Add($rel) | Out-Null
-    if ($rel -match '^knowledge/.*\.md$') {
-        $kgFiles.Add($rel) | Out-Null
+    $allFiles.Add($abs) | Out-Null
+    # Indexing for SHARED-TREE files only: a worktree agent's files reach the
+    # KG / code graph when its work is merged.
+    if ($Attribution -eq "agent_worktree") { continue }
+    $rel = $abs.Substring($ProjectRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+    if ($rel -match '^knowledge/.*\.md$' -or $rel -match '^docs/.*\.md$') {
+        $kgFiles.Add($abs) | Out-Null
     }
     if ($rel -match $codeExtRe) {
         $codeFiles.Add($rel) | Out-Null
     }
 }
 
-# -------------------- Step 2: KG sync --------------------
-# Per-project kg-sync script. On Windows this is typically a .ps1, but
-# we accept the unprefixed file too in case the project shipped a sh
-# wrapper that's invoked via bash. Soft-fail on any error.
-$kgSyncScript = ""
-foreach ($candidate in @("kg-sync.ps1", "kg-sync.cmd", "kg-sync.bat", "kg-sync")) {
-    $p = Join-Path $ProjectRoot ".claude/scripts/$candidate"
-    if (Test-Path -LiteralPath $p -PathType Leaf) {
-        $kgSyncScript = $p
-        break
+# Reconciliation row: what was found and HOW it is attributed (census F7).
+# Its own log, so the V52-L.2 audit log keeps exactly one row per stop.
+$FilesLog = Join-Path $LogDir "subagent-reconcile-files.jsonl"
+try {
+    $recon = [ordered]@{
+        timestamp     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        event         = "reconciled"
+        session_id    = $SessionId
+        agent_id      = $AgentId
+        agent_type    = $AgentType
+        attribution   = $Attribution
+        file_count    = $changedAbs.Count
+        changed_files = @($changedAbs | Select-Object -First 50)
     }
-}
-if ($kgSyncScript -and $kgFiles.Count -gt 0) {
-    foreach ($kf in $kgFiles) {
-        $kfAbs = Join-Path $ProjectRoot $kf
+    Add-Content -LiteralPath $FilesLog -Value ($recon | ConvertTo-Json -Compress -Depth 4) -ErrorAction Stop
+} catch { }
+
+# -------------------- Step 2: KG / docs sync --------------------
+# Through the ONE routing home (route-touched-path.ps1): access gate,
+# per-file debounce, detached runner, no timeout. The subagent identity is
+# exported for the failure sentinel / row (census F15/F16).
+if ($kgFiles.Count -gt 0) {
+    $RouteLib = Join-Path $ScriptDir "_lib/route-touched-path.ps1"
+    if (Test-Path -LiteralPath $RouteLib) {
+        . $RouteLib
+        $env:VCT_AGENT_ID = $AgentId
+        if ($AgentType) { $env:VCT_AGENT_TYPE = $AgentType }
+        if ($SessionId) { $env:VCT_SESSION_ID = $SessionId }
+        Initialize-VcoRoute -HooksDir $ScriptDir -ProjectRoot $ProjectRoot
+        foreach ($kf in $kgFiles) {
+            try { Invoke-VcoRouteTouchedPath -Path $kf -SessionId $SessionId } catch { }
+        }
+    } else {
+        # A missing routing lib is a BROKEN install, not "nothing to sync".
         try {
-            # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1):
-            # an unguarded `-WindowStyle Hidden` is REJECTED on non-Windows
-            # PowerShell editions, so the spawn never happens and every KG file
-            # this subagent touched goes un-synced. -PassThru is kept — this
-            # site WAITS on the child (30s cap) rather than detaching.
-            $proc = if ($kgSyncScript.EndsWith(".ps1")) {
-                Start-VcoDetachedProcess -FilePath $PsExe -ArgumentList @("-NoProfile","-File",$kgSyncScript,$kfAbs) -PassThru
-            } else {
-                Start-VcoDetachedProcess -FilePath $kgSyncScript -ArgumentList @($kfAbs) -PassThru
-            }
-            if ($proc) {
-                # 30s timeout per kg-sync invocation.
-                if (-not $proc.WaitForExit(30000)) {
-                    try { $proc.Kill() } catch {}
-                }
-            }
-        } catch {}
+            $skip = [ordered]@{ event = "kg_sync_skipped"; reason = "_lib/route-touched-path.ps1 missing"; agent_id = $safeId }
+            Add-Content -LiteralPath $FilesLog -Value ($skip | ConvertTo-Json -Compress) -ErrorAction Stop
+        } catch { }
     }
 }
 
@@ -277,7 +472,8 @@ if ($codeFiles.Count -gt 0) {
         try {
             $sb = New-Object System.Text.StringBuilder
             foreach ($p in $toEnqueue) { [void]$sb.AppendLine($p) }
-            [System.IO.File]::AppendAllText($CgDrainShared, $sb.ToString(), [System.Text.Encoding]::UTF8)
+            # No BOM (Encoding.UTF8 writes one into a NEW file, glued to the first path).
+            Add-VcoUtf8Content -Path $CgDrainShared -Value $sb.ToString() -NoNewline
         } catch {}
     }
 }
@@ -285,8 +481,7 @@ if ($codeFiles.Count -gt 0) {
 # -------------------- Step 4: Credential scan --------------------
 if ((Get-Command Scan-FileForCredentials -ErrorAction SilentlyContinue) -and $allFiles.Count -gt 0) {
     $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    foreach ($f in $allFiles) {
-        $abs = Join-Path $ProjectRoot $f
+    foreach ($abs in $allFiles) {
         if (-not (Test-Path -LiteralPath $abs -PathType Leaf)) { continue }
         try {
             $hits = @(Scan-FileForCredentials -FilePath $abs)
@@ -299,15 +494,26 @@ if ((Get-Command Scan-FileForCredentials -ErrorAction SilentlyContinue) -and $al
                     agent_id   = $AgentId
                     agent_type = $AgentType
                     source     = "subagent_stop_reconciler"
+                    attribution = $Attribution
                 }
                 $alertLine = $alert | ConvertTo-Json -Compress -Depth 5
                 Add-Content -Path $AlertLog -Value $alertLine -ErrorAction SilentlyContinue
+                # census F8: the PARENT must hear about it (pattern NAMES only).
+                $relShown = $abs
+                if ($abs.StartsWith($ProjectRoot)) { $relShown = $abs.Substring($ProjectRoot.Length).TrimStart('\', '/') }
+                Add-ReconcileParentAlert "credential" ("possible credential in {0} (patterns: {1}; found by the SubagentStop scan, {2}): review it before committing" -f $relShown, ($hits -join " "), $Attribution) $abs
             }
         } catch {}
     }
 }
 
-# -------------------- Step 5: Nudge counter --------------------
+# -------------------- Step 5: Subagent work record --------------------
+# Records subagent work on the parent session's row as subagent_work_units
+# (+ subagent_count / subagent_ids), for the per-subagent KG nudge the owner
+# scheduled for v0.2.103 (each subagent nudged on its own work). The
+# main-chat kg-update-nudge deliberately does NOT read these fields (owner
+# ruling 2026-10-13: the main-chat nudge ignores subagent work). Must match
+# the .sh sibling.
 # The counter file lives under the machine-wide metrics dir (not the project's
 # .claude/) because nudge state is per-session, not per-project;
 # kg-update-nudge.ps1 resolves the same path through the same
@@ -340,6 +546,23 @@ if ($SessionId -and $fileCount -gt 0 -and (Test-Path -LiteralPath $MetricsLib -P
         }
     }
 
+    # W6-C2 (census F5): hold the SAME sidecar lock kg-update-nudge.ps1 takes
+    # (O_CREAT|O_EXCL on kg_update_tokens.jsonl.lock, 50 x 20 ms, deleted on
+    # release) for the whole read-modify-write. Lock unavailable ->
+    # best-effort unlocked, like the nudge. MUST MATCH the .sh sibling.
+    $nudgeLock = $nudgeFile + ".lock"
+    $lockStream = $null
+    for ($try = 0; $try -lt 50; $try++) {
+        try {
+            $lockStream = [System.IO.File]::Open($nudgeLock, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            break
+        } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 20
+        } catch {
+            break
+        }
+    }
+    try {
     # Read existing rows, find/upsert ours, atomic rewrite.
     $rows = @()
     if (Test-Path -LiteralPath $nudgeFile -PathType Leaf) {
@@ -416,10 +639,18 @@ if ($SessionId -and $fileCount -gt 0 -and (Test-Path -LiteralPath $MetricsLib -P
             $line = $r | ConvertTo-Json -Compress -Depth 5
             [void]$sb.AppendLine($line)
         }
-        [System.IO.File]::WriteAllText($tmp, $sb.ToString(), [System.Text.Encoding]::UTF8)
+        # No BOM: [Text.Encoding]::UTF8 writes one, and the nudge's Python reader
+        # (json.loads per line, utf-8) then drops the first row.
+        Set-VcoUtf8Content -Path $tmp -Value $sb.ToString() -NoNewline
         Move-Item -LiteralPath $tmp -Destination $nudgeFile -Force -ErrorAction Stop
     } catch {
         try { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue } catch {}
+    }
+    } finally {
+        if ($lockStream) {
+            try { $lockStream.Dispose() } catch { }
+            try { Remove-Item -LiteralPath $nudgeLock -Force -ErrorAction SilentlyContinue } catch { }
+        }
     }
 }
 
@@ -430,7 +661,9 @@ if ($SessionId -and $fileCount -gt 0 -and (Test-Path -LiteralPath $MetricsLib -P
 # fell back to the shared tree. Write a `worktree_violation` row to
 # .claude/logs/worktree-guard.jsonl. Non-blocking, soft-fail.
 #
-# Guard conditions (all must hold): isolation flag present, >0 changed files,
+# Guard conditions (all must hold): isolation requested and skipped ($IsoFlag,
+# derived after the payload parse from the guard record + the definition via
+# Test-WtrecIsolationSkipped, or a payload flag), >0 changed files,
 # and the reported cwd was NOT a separate worktree (cwd == parent toplevel OR
 # cwd absent).
 if ($IsoFlag -and $fileCount -gt 0) {
@@ -475,6 +708,7 @@ if ($IsoFlag -and $fileCount -gt 0) {
             Add-Content -Path $wtLog -Value $line -ErrorAction SilentlyContinue
         } catch { }
         [Console]::Error.WriteLine("subagent-stop-reconcile: WORKTREE VIOLATION - $reason")
+        Add-ReconcileParentAlert "worktree_violation" "WORKTREE VIOLATION: $reason"
     }
 }
 

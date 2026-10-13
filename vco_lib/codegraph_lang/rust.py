@@ -18,7 +18,6 @@ TODAY.
 """
 from __future__ import annotations
 
-import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +31,8 @@ from vco_lib.codegraph_entities import (
     KIND_FUNCTION,
     ModuleDescriptor,
 )
+from vco_lib.codegraph_defs import extract_definitions, note_path
+from vco_lib.codegraph_rust_modules import rust_effective_file_hash, rust_file_is_test_only
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
@@ -39,6 +40,18 @@ from vco_lib.codegraph_lang._shared import (
     run_pure_extractor,
     scan_to_declaration_terminator,
 )
+
+_RUST_USE_RE = re.compile(r'\buse\s+([^;]+);')
+_RUST_MOD_DECL_RE = re.compile(r'^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(\w+)\s*;', re.MULTILINE)
+
+
+def regex_rust_imports(content_clean: str) -> List[str]:
+    """Regex fallback for a file the Rust grammar cannot parse: every ``use``
+    tree (multi-line ones too, whitespace-collapsed) then every out-of-line
+    ``mod x;`` as ``"mod x"`` — the same shapes the tree-sitter walker stores.
+    ``content_clean`` must already have its comments blanked."""
+    uses = [" ".join(m.group(1).split()) for m in _RUST_USE_RE.finditer(content_clean)]
+    return uses + [f"mod {m.group(1)}" for m in _RUST_MOD_DECL_RE.finditer(content_clean)]
 
 
 def _rust_methods_for_struct(
@@ -248,6 +261,93 @@ def _is_rust_test_fn(content: str, fn_offset: int) -> bool:
     return False
 
 
+def _regex_rust_definitions(
+    content_clean: str, source_lines: List[str],
+) -> Tuple[List[Tuple[str, int, int, List[str]]], List[Tuple[str, str, int, int, bool]]]:
+    """REGEX definitions discovery — the FALLBACK when the tree-sitter Rust
+    grammar cannot load (``vco_lib.codegraph_defs``). Returns
+    ``(types, functions)``: types ``(name, start_line, end_line, methods)``,
+    functions ``(name, args, start_line, end_line, is_async)``. Behaviour is
+    the pre-v0.2.102 regex extractor's, unchanged (pinned by the golden
+    regex snapshots)."""
+    # struct, enum, trait types
+    type_pattern = re.compile(
+        r'(?:pub\s+)?(?:struct|enum|trait)\s+([\w]+)', re.MULTILINE
+    )
+    # v0.2.92 WP-5b: a LIST of (name, start_line), not a dict keyed by name —
+    # see the same change in `ruby.py`, where the fixture proves the loss.
+    # Two same-named types in ONE file are legal inside different
+    # `mod` blocks (`mod tests { struct Cfg; }` beside a top-level
+    # `struct Cfg;`), and this extractor ignores `mod` when building
+    # `full_name`, so the dict silently kept only the last.
+    # The writer's occurrence disambiguator keys on `(kind, identity_key)` and
+    # already covers KIND_CLASS, so the second declaration lands as `<name>#2`.
+    struct_decls: List[Tuple[str, int]] = []
+    for m in type_pattern.finditer(content_clean):
+        name = m.group(1)
+        start_line = content_clean[:m.start()].count('\n') + 1
+        struct_decls.append((name, start_line))
+
+    # Functions: fn name(...)
+    # V52-O.11.G (v0.2.52, 2026-06-09): expand prefix regex to capture the
+    # full Rust modifier set — `pub`, `pub(crate)`, `pub(super)`,
+    # `pub(in path)`, `async`, `unsafe`, `const`, `extern "ABI"`,
+    # `default` — in any order, any combination. Pre-V52-O.11.G this
+    # regex only matched `pub` + `async`, silently dropping every
+    # `unsafe fn`, `const fn`, `extern "C" fn`, `pub(crate) fn`, and
+    # `default fn` in the codebase. Mirrors the modifier-set used in
+    # `_rust_methods_for_struct`'s inner method pattern (V52-O.11.F).
+    func_pattern = re.compile(
+        # Zero or more modifier tokens, any order. Each token is one of:
+        #   pub | pub(crate) | pub(super) | pub(in path::to::mod)
+        #   async | unsafe | const | extern | extern "ABI" | default
+        r'(?:(?:pub(?:\s*\([^)]*\))?|async|unsafe|const|default'
+        r'|extern(?:\s+"[^"]*")?)\s+)*'
+        r'fn\s+([\w]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)',
+        re.MULTILINE
+    )
+
+    types_out: List[Tuple[str, int, int, List[str]]] = []
+    for sname, start_line in struct_decls:
+        _class_end_line = _extract_balanced_block(source_lines, start_line, language="rust")  # V52-O.11.E (was: start_line + 40)
+        # V52-O.11.F (v0.2.52): `methods` scoped to `impl <sname>` /
+        # `impl <Trait> for <sname>` blocks (audit a79152).
+        methods = _rust_methods_for_struct(content_clean, sname, source_lines)
+        types_out.append((sname, start_line, _class_end_line, methods))
+
+    funcs_out: List[Tuple[str, str, int, int, bool]] = []
+    for m in func_pattern.finditer(content_clean):
+        fname, args_str = m.group(1), m.group(2)
+        # V52-O.11.J (v0.2.52, 2026-06-09): skip functions gated by
+        # `#[cfg(test)]` / `#[test]` / `#[cfg(any(test, ...))]` /
+        # `#[cfg(all(test, ...))]` — test functions are not production
+        # code and indexing them confuses the offline trainer + bloats
+        # the CodeFunction collection. Audit a79152.
+        if _is_rust_test_fn(content_clean, m.start()):
+            continue
+        is_async = bool(re.search(rf'async\s+fn\s+{re.escape(fname)}', content_clean))
+        start_line = content_clean[:m.start()].count('\n') + 1
+        # v0.2.92: branch on whether the declaration OPENS A BLOCK. A trait
+        # method (`fn reset(&mut self);`) and an `extern` declaration have no
+        # body; running a brace scan from them finds no opener on their own
+        # line and latches onto the NEXT item's braces. Measured on the golden
+        # corpus: `engine.rs`'s trait `fn reset` (line 26) was stored as lines
+        # 26-32 — the trait's `}`, the `impl Resettable for Counter` header and
+        # the impl's own `reset` body — so the two `reset` rows that the
+        # duplicate-identity fix had just separated carried nearly the same
+        # text. `func_pattern` ends at the argument `)`, so the terminator is
+        # found by scanning past any `-> T` / `where` clause at depth 0.
+        _term, _term_pos = scan_to_declaration_terminator(content_clean, m.end())
+        if _term == '{':
+            end_line = _extract_balanced_block(source_lines, start_line, language="rust")  # V52-O.11.E (was: start_line + 40)
+        elif _term == ';':
+            end_line = content_clean[:_term_pos + 1].count('\n') + 1
+        else:  # no terminator inside the scan bound — keep the legacy scan
+            end_line = _extract_balanced_block(source_lines, start_line, language="rust")
+        funcs_out.append((fname, args_str, start_line, end_line, is_async))
+    return types_out, funcs_out
+
+
 def extract_rust_file(
     source_text: str,
     file_path: Path,
@@ -268,54 +368,44 @@ def extract_rust_file(
     source_lines = content.split('\n')
     loc = len([line for line in source_lines
                if line.strip() and not line.strip().startswith('//')])
-    file_hash = hashlib.sha256(content.encode()).hexdigest()
+    # v0.2.102 W6-G: salted for a file only a test-gated `mod x;` elsewhere
+    # loads, so the unchanged-file gate re-walks it when that gate flips.
+    file_hash = rust_effective_file_hash(content, file_path, repo_root)
     relative_path = file_path.relative_to(repo_root).as_posix()
 
     content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
     content_clean = blank_block_comments_preserving_lines(content_clean)
 
-    # use statements
-    imports = re.findall(r'use\s+([\w::{}, ]+);', content)
-
-    # struct, enum, trait types
-    type_pattern = re.compile(
-        r'(?:pub\s+)?(?:struct|enum|trait)\s+([\w]+)', re.MULTILINE
-    )
-    # v0.2.92 WP-5b: a LIST of (name, start_line), not a dict keyed by name —
-    # see the same change in `ruby.py`, where the fixture proves the loss.
-    # Two same-named types in ONE file are legal inside different
-    # `mod` blocks (`mod tests { struct Cfg; }` beside a top-level
-    # `struct Cfg;`), and this extractor ignores `mod` when building
-    # `full_name`, so the dict silently kept only the last.
-    # The writer's occurrence disambiguator keys on `(kind, identity_key)` and
-    # already covers KIND_CLASS, so the second declaration lands as `<name>#2`.
-    struct_decls: List[Tuple[str, int]] = []
-    for m in type_pattern.finditer(content_clean):
-        name = m.group(1)
-        start_line = content_clean[:m.start()].count('\n') + 1
-        struct_decls.append((name, start_line))
+    # Types + functions: tree-sitter first (v0.2.102), regex fallback.
+    # Records the storage loops below consume, whichever path produced them:
+    #   types: (name, start_line, end_line, methods)
+    #   funcs: (name, args, start_line, end_line, is_async)
+    # The tree-sitter path skips test code by the V52-O.11.J policy
+    # (`#[test]`-family attributes incl. `#[tokio::test]`, and `#[cfg(test)]`
+    # on the item or on any enclosing `mod`/`impl`) and never mints a symbol
+    # from a string literal.
+    # A file loaded only through a test-gated `mod x;` in ANOTHER file
+    # (`#[cfg(test)] mod tests;` in lib.rs → tests.rs) is test code as a
+    # whole (v0.2.102 W6-G, vco_lib.codegraph_rust_modules): no classes or
+    # functions; the module row stays, as for a file under `#![cfg(test)]`.
+    test_only_file = rust_file_is_test_only(file_path, repo_root)
+    defs = None if test_only_file else extract_definitions("rust", content, origin=relative_path)
+    # Imports (v0.2.102 W6-O): `use` trees + out-of-line `mod x;` as "mod x",
+    # from the same parse when it ran (test-gated items excluded); the
+    # comment-stripped regex otherwise (a test-only file keeps its imports).
+    imports = defs.imports if defs is not None else regex_rust_imports(content_clean)
+    if test_only_file:
+        types, funcs = [], []
+    elif defs is not None:
+        note_path("rust", "tree-sitter")
+        types = [(c.name, c.start_line, c.end_line, defs.methods_of(c.name)) for c in defs.classes]
+        funcs = [(f.name, f.params, f.start_line, f.end_line, f.is_async) for f in defs.functions]
+    else:
+        note_path("rust", "regex")
+        types, funcs = _regex_rust_definitions(content_clean, source_lines)
 
     #: Unique type names in source order — what the module summary lists.
-    struct_names: List[str] = list(dict.fromkeys(n for n, _ in struct_decls))
-
-    # Functions: fn name(...)
-    # V52-O.11.G (v0.2.52, 2026-06-09): expand prefix regex to capture the
-    # full Rust modifier set — `pub`, `pub(crate)`, `pub(super)`,
-    # `pub(in path)`, `async`, `unsafe`, `const`, `extern "ABI"`,
-    # `default` — in any order, any combination. Pre-V52-O.11.G this
-    # regex only matched `pub` + `async`, silently dropping every
-    # `unsafe fn`, `const fn`, `extern "C" fn`, `pub(crate) fn`, and
-    # `default fn` in the codebase. Mirrors the modifier-set used in
-    # `_rust_methods_for_struct`'s inner method pattern (V52-O.11.F).
-    func_pattern = re.compile(
-        # Zero or more modifier tokens, any order. Each token is one of:
-        #   pub | pub(crate) | pub(super) | pub(in path::to::mod)
-        #   async | unsafe | const | extern | extern "ABI" | default
-        r'(?:(?:pub(?:\s*\([^)]*\))?|async|unsafe|const|default'
-        r'|extern(?:\s+"[^"]*")?)\s+)*'
-        r'fn\s+([\w]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)',
-        re.MULTILINE
-    )
+    struct_names: List[str] = list(dict.fromkeys(n for n, _, _, _ in types))
 
     # Module summary
     crate_comment = ''
@@ -349,20 +439,10 @@ def extract_rust_file(
     # `start_line + len(class_lines)`, which is that line PLUS ONE, while the
     # FUNCTION loop below already used the returned value directly. One
     # convention now; the golden corpus had ratified the +1 across 7 languages.
-    for sname, start_line in struct_decls:
-        _class_end_line = _extract_balanced_block(source_lines, start_line, language="rust")  # V52-O.11.E (was: start_line + 40)
+    for sname, start_line, _class_end_line, methods in types:
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
         signature = f"struct/enum/trait {sname}"
-        # V52-O.11.F (v0.2.52, 2026-06-09): scope `methods` to functions
-        # declared INSIDE `impl <sname>` blocks (or `impl <Trait> for
-        # <sname>` blocks). Pre-V52-O.11.F this line iterated
-        # func_pattern over the WHOLE file's content_clean, attributing
-        # EVERY fn in the file to EVERY struct — audit a79152 reproduced:
-        # a 50-fn file with 3 structs produced 150 incorrect method
-        # attributions, drowning real signal in noise for the
-        # `query_code_structure(methods, StructName)` MCP path.
-        methods = _rust_methods_for_struct(content_clean, sname, source_lines)
         # Bind the loop-varying values so each closure captures ITS OWN
         # signature/body (a bare `lambda` would close over the loop variable
         # and every deferred embed would fire with the LAST struct's text).
@@ -380,34 +460,7 @@ def extract_rust_file(
         ))
         stats['classes'] += 1
 
-    for m in func_pattern.finditer(content_clean):
-        fname, args_str = m.group(1), m.group(2)
-        # V52-O.11.J (v0.2.52, 2026-06-09): skip functions gated by
-        # `#[cfg(test)]` / `#[test]` / `#[cfg(any(test, ...))]` /
-        # `#[cfg(all(test, ...))]` — test functions are not production
-        # code and indexing them confuses the offline trainer + bloats
-        # the CodeFunction collection. Audit a79152.
-        if _is_rust_test_fn(content_clean, m.start()):
-            continue
-        is_async = bool(re.search(rf'async\s+fn\s+{re.escape(fname)}', content_clean))
-        start_line = content_clean[:m.start()].count('\n') + 1
-        # v0.2.92: branch on whether the declaration OPENS A BLOCK. A trait
-        # method (`fn reset(&mut self);`) and an `extern` declaration have no
-        # body; running a brace scan from them finds no opener on their own
-        # line and latches onto the NEXT item's braces. Measured on the golden
-        # corpus: `engine.rs`'s trait `fn reset` (line 26) was stored as lines
-        # 26-32 — the trait's `}`, the `impl Resettable for Counter` header and
-        # the impl's own `reset` body — so the two `reset` rows that the
-        # duplicate-identity fix had just separated carried nearly the same
-        # text. `func_pattern` ends at the argument `)`, so the terminator is
-        # found by scanning past any `-> T` / `where` clause at depth 0.
-        _term, _term_pos = scan_to_declaration_terminator(content_clean, m.end())
-        if _term == '{':
-            end_line = _extract_balanced_block(source_lines, start_line, language="rust")  # V52-O.11.E (was: start_line + 40)
-        elif _term == ';':
-            end_line = content_clean[:_term_pos + 1].count('\n') + 1
-        else:  # no terminator inside the scan bound — keep the legacy scan
-            end_line = _extract_balanced_block(source_lines, start_line, language="rust")
+    for fname, args_str, start_line, end_line, is_async in funcs:
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{fname}"
         signature = f"fn {fname}({args_str})"
@@ -449,4 +502,5 @@ def analyze_rust_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, i
     return run_pure_extractor(
         ctx, file_path, repo_root, extract_rust_file,
         {'modules': 0, 'classes': 0, 'functions': 0},
+        file_hash_fn=rust_effective_file_hash,
     )

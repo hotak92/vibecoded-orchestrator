@@ -134,15 +134,18 @@ pub(crate) fn git_network_command(program: &OsStr) -> TokioCommand {
     cmd
 }
 
-/// The command [`run_git`] spawns. Factored out so the `kill_on_drop` wiring
-/// is unit-testable without spawning anything.
-fn run_git_command(repo: &Path, args: &[&str]) -> TokioCommand {
-    let mut cmd = git_command();
+/// The command [`run_git`] spawns, over a program the caller resolved
+/// EARLIER (see [`git_program`] — a future polled on a later tick must
+/// resolve at call time, which is also what lets a test inject a fake git
+/// for every attempt). Factored out so the `kill_on_drop` wiring is
+/// unit-testable without spawning anything.
+fn run_git_command_with(program: &OsStr, repo: &Path, args: &[&str]) -> TokioCommand {
     // `run_git` ALWAYS runs under `GIT_TIMEOUT`. A timed-out child must not
     // outlive the Err it produced: the caller has already been told "failed"
     // and moves on; an orphan finishing the operation later (or holding its
     // lock files) contradicts that answer.
-    cmd.kill_on_drop(true).args(args).current_dir(repo);
+    let mut cmd = git_network_command(program);
+    cmd.args(args).current_dir(repo);
     cmd
 }
 
@@ -157,7 +160,12 @@ fn run_git_command(repo: &Path, args: &[&str]) -> TokioCommand {
 /// Output is captured, never inherited — `.silent()` also suppresses the
 /// console window Windows would otherwise flash for every invocation.
 pub(crate) async fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let fut = run_git_command(repo, args).output();
+    run_git_with(&git_program(), repo, args).await
+}
+
+/// [`run_git`] over a pre-resolved program (see [`run_git_command_with`]).
+async fn run_git_with(program: &OsStr, repo: &Path, args: &[&str]) -> Result<String, String> {
+    let fut = run_git_command_with(program, repo, args).output();
     let output = tokio::time::timeout(GIT_TIMEOUT, fut)
         .await
         .map_err(|_| format!("git {} timed out", args.join(" ")))?
@@ -408,19 +416,44 @@ pub(crate) async fn remote_default_branch(
 /// stray `v1.2`, `v0.2.100.1` or `-rc1` tag could have been reported as
 /// "the latest release". The sort flag is kept only as a cheap pre-order.
 ///
+/// v0.2.102 NB-R5: `--sort` on `ls-remote` needs git ≥ 2.18 — an older git
+/// exits 129 with `error: unknown option \`sort'` on stderr. Because the
+/// flag is only a pre-order, on that exact error the command is re-run
+/// WITHOUT it and [`newest_release_tag`]'s client-side pass (the one
+/// version comparator) orders the rows. Any other failure propagates.
+///
 /// `Ok(None)` when the remote has no strict release tag. `Err` when the
 /// remote could not be reached — the caller renders "couldn't check",
 /// never its own tag.
-pub(crate) async fn latest_remote_tag(
-    repo: &Path,
-    remote: &str,
-) -> Result<Option<String>, String> {
-    let out = run_git(
-        repo,
-        &["ls-remote", "--tags", "--refs", "--sort=-v:refname", remote],
-    )
-    .await?;
-    Ok(newest_release_tag(&out))
+pub(crate) fn latest_remote_tag<'a>(
+    repo: &'a Path,
+    remote: &'a str,
+) -> impl std::future::Future<Output = Result<Option<String>, String>> + Send + 'a {
+    // Resolved at CALL time, not poll time ([`git_program`]'s documented
+    // pattern for callers that build commands inside a future): the NB-R5
+    // fallback below re-invokes git from within the future, and both
+    // attempts must resolve the same program.
+    let program = git_program();
+    async move {
+        let sorted = run_git_with(
+            &program,
+            repo,
+            &["ls-remote", "--tags", "--refs", "--sort=-v:refname", remote],
+        )
+        .await;
+        let out = match sorted {
+            Ok(out) => out,
+            Err(e) if e.contains("unknown option") => {
+                tracing::info!(
+                    "[git] ls-remote rejected --sort (git < 2.18); re-running \
+                     without it — ordering is client-side anyway"
+                );
+                run_git_with(&program, repo, &["ls-remote", "--tags", "--refs", remote]).await?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(newest_release_tag(&out))
+    }
 }
 
 /// The newest strict `vX.Y.Z` tag named in `git ls-remote --tags` output.
@@ -928,6 +961,127 @@ mod tests {
         assert_eq!(newest_release_tag(out), None);
     }
 
+    // ── v0.2.102 NB-R5: `--sort` needs git ≥ 2.18 ──────────────────────
+    //
+    // A fake git on the thread-local lookup PATH (paths::with_lookup_path,
+    // never the process PATH — v0.2.97 R6). Sibling of upstream_fetch's
+    // `fake_git`; test-local on purpose: its recording contract differs
+    // (arg-per-line for call-order assertions).
+
+    /// Plant a fake `git` in a fresh dir. `body` runs AFTER the call is
+    /// recorded. Tags are emitted in ASCENDING order so a missing
+    /// client-side sort would answer v0.0.2, not v0.0.10.
+    #[cfg(unix)]
+    fn fake_git_recording(dir: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let calls = dir.join("calls");
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\n{}\n",
+            calls.display(),
+            body
+        );
+        let git = dir.join("git");
+        std::fs::write(&git, script).unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The remote's rows arrive in ascending version order (and git never
+    /// sorted them): the fallback re-run without `--sort` must still answer
+    /// the NEWEST strict tag, via the one client-side comparator. The fake
+    /// rejects `--sort` exactly the way a pre-2.18 git does (exit 129 +
+    /// "error: unknown option" on stderr). Pre-fix this was a plain Err.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn latest_remote_tag_falls_back_when_git_rejects_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_git_recording(
+            dir.path(),
+            // In the shell body, "\\`" inside double quotes is a LITERAL
+            // backtick — the exact shape git's parser prints.
+            "for a in \"$@\"; do [ \"$a\" = \"--sort=-v:refname\" ] && { printf '%s\\n' \"error: unknown option \\`sort'\" >&2; exit 129; }; done; \
+             printf 'sha1\\trefs/tags/v0.0.2\\nsha2\\trefs/tags/v0.0.10\\n'",
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let fut = vct_launcher_core::paths::with_lookup_path(
+            Some(dir.path().as_os_str()),
+            || latest_remote_tag(repo.path(), "vco_upstream"),
+        );
+        let tag = fut.await.expect("the --sort fallback must succeed").expect("tags present");
+        assert_eq!(tag, "v0.0.10", "client-side ordering by the version comparator");
+        let calls: Vec<String> = std::fs::read_to_string(dir.path().join("calls"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            calls.iter().filter(|l| *l == "ls-remote").count(),
+            2,
+            "exactly one retry without --sort, got args log: {calls:?}"
+        );
+    }
+
+    /// LEAVE-ALONE: a git that accepts `--sort` is called exactly ONCE, with
+    /// the flag — the fallback must not become the primary path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn latest_remote_tag_calls_a_sort_aware_git_once() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_git_recording(
+            dir.path(),
+            "printf 'sha1\\trefs/tags/v0.0.2\\nsha2\\trefs/tags/v0.0.10\\n'",
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let fut = vct_launcher_core::paths::with_lookup_path(
+            Some(dir.path().as_os_str()),
+            || latest_remote_tag(repo.path(), "vco_upstream"),
+        );
+        let tag = fut.await.expect("ls-remote").expect("tags present");
+        assert_eq!(tag, "v0.0.10");
+        let calls: Vec<String> = std::fs::read_to_string(dir.path().join("calls"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            calls.iter().filter(|l| *l == "ls-remote").count(),
+            1,
+            "a sort-aware git must not be re-invoked, got args log: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|l| l == "--sort=-v:refname"),
+            "the single call must carry --sort, got args log: {calls:?}"
+        );
+    }
+
+    /// A non-`--sort` failure (here: a garbage remote ref) is NOT retried —
+    /// the fallback matches the "unknown option" stderr only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn latest_remote_tag_does_not_fallback_on_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_git_recording(
+            dir.path(),
+            "echo 'fatal: could not read from remote repository' >&2; exit 128",
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let fut = vct_launcher_core::paths::with_lookup_path(
+            Some(dir.path().as_os_str()),
+            || latest_remote_tag(repo.path(), "vco_upstream"),
+        );
+        let err = fut.await.expect_err("a genuine failure must stay an error");
+        assert!(err.contains("could not read from remote repository"), "got: {err}");
+        let calls: Vec<String> = std::fs::read_to_string(dir.path().join("calls"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            calls.iter().filter(|l| *l == "ls-remote").count(),
+            1,
+            "no retry on an unrelated failure, got args log: {calls:?}"
+        );
+    }
+
     #[tokio::test]
     async fn latest_remote_tag_is_none_when_the_remote_has_no_tags() {
         skip_if_no_git!();
@@ -1030,7 +1184,10 @@ mod tests {
     fn network_commands_are_kill_on_drop() {
         let git = git_program();
         assert!(git_network_command(&git).get_kill_on_drop());
-        assert!(run_git_command(Path::new("."), &["rev-parse", "HEAD"]).get_kill_on_drop());
+        assert!(
+            run_git_command_with(&git_program(), Path::new("."), &["rev-parse", "HEAD"])
+                .get_kill_on_drop()
+        );
         for verb in NETWORK_VERBS {
             assert!(
                 raw_git_command(Path::new("."), &[*verb, "x"], &[]).get_kill_on_drop(),

@@ -1,0 +1,78 @@
+{
+ "source": "engine.rs",
+ "reviewed": "W6-E 2026-10-10; W6-G 2026-10-11: full_name + methods added by hand from the source",
+ "symbols": [
+  {
+   "kind": "class",
+   "name": "Counter",
+   "start": 6,
+   "end": 8,
+   "full_name": "engine.Counter",
+   "methods": [
+    "new",
+    "increment",
+    "value",
+    "reset"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "new",
+   "start": 11,
+   "end": 13,
+   "full_name": "engine.new"
+  },
+  {
+   "kind": "function",
+   "name": "increment",
+   "start": 15,
+   "end": 17,
+   "full_name": "engine.increment"
+  },
+  {
+   "kind": "function",
+   "name": "value",
+   "start": 19,
+   "end": 21,
+   "full_name": "engine.value"
+  },
+  {
+   "kind": "class",
+   "name": "Resettable",
+   "start": 25,
+   "end": 27,
+   "full_name": "engine.Resettable",
+   "methods": [
+    "reset"
+   ]
+  },
+  {
+   "kind": "function",
+   "name": "reset",
+   "start": 26,
+   "end": 26,
+   "full_name": "engine.reset"
+  },
+  {
+   "kind": "function",
+   "name": "reset",
+   "start": 30,
+   "end": 32,
+   "full_name": "engine.reset"
+  },
+  {
+   "kind": "function",
+   "name": "build_registry",
+   "start": 35,
+   "end": 39,
+   "full_name": "engine.build_registry"
+  },
+  {
+   "kind": "function",
+   "name": "fetch_remote",
+   "start": 41,
+   "end": 43,
+   "full_name": "engine.fetch_remote"
+  }
+ ]
+}

@@ -61,9 +61,16 @@ class _FakeProc:
 
 
 def _seed_hub_env(monkeypatch, tmp_path: Path) -> None:
-    """Point the wire helper at a stubbable hub (tmp state dir + token)."""
+    """Point the wire helper at a stubbable hub (tmp state dir + token).
+
+    v0.2.102: the port is the suite's UNROUTABLE sentinel, never the real
+    default 7700. Only `urllib.request.urlopen` is stubbed here, but the
+    driver also resolves secrets (`_active_code_slot` → `EmbeddingService.
+    for_project` → `resolve_openai_api_key` → `agent_secrets.get`) through
+    `requests`, which reached — and kept a pooled keep-alive connection to —
+    the developer's LIVE hub for minutes after the test ended."""
     monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path))
-    (tmp_path / "hub.port").write_text("7700", encoding="utf-8")
+    (tmp_path / "hub.port").write_text("9", encoding="utf-8")
     (tmp_path / "hub.token").write_text("tok-not-a-real-secret", encoding="utf-8")
     monkeypatch.delenv("VCT_HUB_TOKEN", raising=False)
     monkeypatch.delenv("VCT_HUB_PORT", raising=False)

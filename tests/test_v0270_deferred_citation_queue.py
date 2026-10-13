@@ -3,7 +3,8 @@
 """v0.2.70 Stream F — deferred citation queue (F-QUEUE) + shared modules.
 
 Covers:
-  * citation_pending stage/read/list/delete roundtrip + TTL sweep.
+  * citation_pending stage/read/list/delete roundtrip (the TTL sweep this once covered was replaced in
+    v0.2.102 by end-event scoring and the abandoned-file collector).
   * answer_window extraction + position matching (shared with the MCP monitor).
   * rl_drain_citations ACCUMULATE-DON'T-DROP: a sub-gate pending file SURVIVES a
     Stop (not computed, not deleted); an at/above-gate pending file is computed
@@ -66,7 +67,9 @@ class TestPendingRoundtrip:
         payload = cp.read_pending(path)
         assert len(payload["query"]) == 120
 
-    def test_sweep_expired(self, tmp_path) -> None:
+    def test_collect_abandoned(self, tmp_path) -> None:
+        """v0.2.102 W6-RL2: the only time bound left is the abandoned-file
+        collector (no transcript here, so the stage time is the age)."""
         path = cp.stage_pending(session_id="s", task_id="old", seq=1, query="q",
                                 ctx={"nodes": []}, project_root=tmp_path)
         # Force a stale ts_ms by rewriting the file.
@@ -76,7 +79,7 @@ class TestPendingRoundtrip:
         # A fresh one stays.
         cp.stage_pending(session_id="s", task_id="fresh", seq=1, query="q",
                          ctx={"nodes": []}, project_root=tmp_path)
-        deleted = cp.sweep_expired(tmp_path, ttl_seconds=3600)
+        deleted = cp.collect_abandoned(tmp_path)
         assert deleted == 1
         remaining = {p.name for p in cp.list_pending_for_session("", tmp_path)}
         assert any("fresh" in n for n in remaining)
@@ -273,10 +276,10 @@ class TestSharedModuleImports:
 
     def test_citation_pending_importable(self) -> None:
         from claude_mcp_servers.rl_client.citation_pending import (
-            stage_pending, read_pending, delete_pending, sweep_expired,
+            stage_pending, read_pending, delete_pending, collect_abandoned,
             list_pending_for_session, pending_dir,
         )
-        for fn in (stage_pending, read_pending, delete_pending, sweep_expired,
+        for fn in (stage_pending, read_pending, delete_pending, collect_abandoned,
                    list_pending_for_session, pending_dir):
             assert callable(fn), fn
 
