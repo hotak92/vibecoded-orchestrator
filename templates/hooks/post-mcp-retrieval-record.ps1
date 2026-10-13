@@ -49,8 +49,17 @@ if (-not $HookStdin) { exit 0 }
 # Untrustworthy session id ("" / "default") -> EMPTY store paths -> record
 # nothing, exactly like the injectors' inject-blind policy. Never compose a
 # shared bucket that could bleed one chat's suppression into another.
+# v0.2.102 W6-C1 (F1): the key is the PER-AGENT composite -- the shared
+# recorder's "the model has these exact bytes" is only true for the agent
+# whose tool call this is (a subagent's explicit retrieval reaches the
+# subagent's context, never the parent's), so the record must land in THAT
+# agent's store. Get-VcoHookAgentKey sanitises both components and yields
+# exactly Get-VcoHookSessionId's answer on a main-agent payload.
+# MUST MATCH post-mcp-retrieval-record.sh.
 $SessionIdRaw = ""
-if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
+if (Get-Command Get-VcoHookAgentKey -ErrorAction SilentlyContinue) {
+    $SessionIdRaw = Get-VcoHookAgentKey -Stdin $HookStdin
+} elseif (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
     $SessionIdRaw = Get-VcoHookSessionId -Stdin $HookStdin
 }
 if (-not $SessionIdRaw -or $SessionIdRaw -eq "default") { exit 0 }

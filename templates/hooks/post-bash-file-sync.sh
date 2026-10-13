@@ -106,6 +106,10 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 # carried a comment restating the finding that forbids it).
 # shellcheck source=_lib/bash-write-targets.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/bash-write-targets.sh" ] && . "$SCRIPT_DIR/_lib/bash-write-targets.sh"
+# v0.2.102 W6-C1 (F16): the per-agent key helper for the once-per-session
+# notices below. Conditional source, same discipline as the libs above.
+# shellcheck source=_lib/session-id.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
 
 # ---------------------------------------------------------------------------
 # Hook input
@@ -113,18 +117,24 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 [ -z "$HOOK_STDIN" ] && exit 0
 
-# ONE decoder for tool_name + command + session_id (a PostToolUse(Bash)
-# turn fires several sibling hooks; each extra `$PY -c` is a full
-# interpreter start). NUL-delimited so a newline-bearing command survives.
+# ONE decoder for tool_name + command + session_id + agent_id (a
+# PostToolUse(Bash) turn fires several sibling hooks; each extra `$PY -c`
+# is a full interpreter start). NUL-delimited so a newline-bearing command
+# survives. v0.2.102 W6-C1 (F16): agent_id joined the decode so the
+# once-per-session notices below key per agent and the telemetry export can
+# attribute a lane's CLI writes to the lane (same shape as
+# post-file-edit.sh's decoder).
 COMMAND=""
 SESSION_ID=""
 TOOL_NAME=""
+AGENT_ID=""
 _PBFS_IDX=0
 while IFS= read -r -d '' _PBFS_VAL; do
     case "$_PBFS_IDX" in
         0) TOOL_NAME="$_PBFS_VAL" ;;
         1) COMMAND="$_PBFS_VAL" ;;
         2) SESSION_ID="$_PBFS_VAL" ;;
+        3) AGENT_ID="$_PBFS_VAL" ;;
     esac
     _PBFS_IDX=$((_PBFS_IDX + 1))
 done < <(printf '%s' "$HOOK_STDIN" | "$PY" -c "
@@ -136,9 +146,10 @@ try:
         d.get('tool_name', '') or '',
         ti.get('command', '') or '',
         d.get('session_id', '') or '',
+        d.get('agent_id', '') or '',
     ]
 except Exception:
-    fields = ['', '', '']
+    fields = ['', '', '', '']
 sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 " 2>/dev/null)
 
@@ -158,8 +169,16 @@ case "$TOOL_NAME" in Bash|PowerShell) ;; *) exit 0 ;; esac
 # broken is the point, and the healthy path is unchanged.
 if ! command -v vco_bash_write_prefilter >/dev/null 2>&1; then
     if command -v vco_report_missing_hook_lib >/dev/null 2>&1; then
+        # v0.2.102 W6-C1 (F16): the notice reaches the SUBAGENT only when
+        # this write is a lane's — key its sentinel per agent (the ONE
+        # session-id helper) so the lane's notice never silences the main
+        # chat's. Same for the second notice below. MUST MATCH the .ps1.
+        _NOTICE_KEY="$SESSION_ID"
+        if [ -n "$AGENT_ID" ] && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+            _NOTICE_KEY="$(vco_hook_agent_key_from_ids "$SESSION_ID" "$AGENT_ID")"
+        fi
         vco_report_missing_hook_lib "$SCRIPT_DIR" "$PROJECT_ROOT" \
-            "$SESSION_ID" "bash-write-targets.sh"
+            "$_NOTICE_KEY" "bash-write-targets.sh"
         if [ -n "${VCO_MISSING_LIB_NOTICE:-}" ] \
             && command -v emit_additional_context >/dev/null 2>&1; then
             emit_additional_context "$VCO_MISSING_LIB_NOTICE" PostToolUse
@@ -172,8 +191,11 @@ vco_bash_write_prefilter "$COMMAND" "$TOOL_NAME" || exit 0
 
 # Telemetry attribution for the children we spawn (same 3-layer chain as
 # post-file-edit.sh: an empty VCT_SESSION_ID makes every CLI-emitted event
-# from a hook-triggered sync unattributable).
+# from a hook-triggered sync unattributable). v0.2.102 W6-C1 (F16):
+# VCT_AGENT_ID joins the export so the debounced runner's kg-sync-failure
+# sentinel keys per agent (same attribution chain as post-file-edit.sh).
 [ -n "$SESSION_ID" ] && export VCT_SESSION_ID="$SESSION_ID"
+[ -n "$AGENT_ID" ] && export VCT_AGENT_ID="$AGENT_ID"
 
 # ---------------------------------------------------------------------------
 # Command → written paths
@@ -195,8 +217,12 @@ if ! command -v vco_route_touched_path >/dev/null 2>&1; then
     # one of them is about to be dropped; report once per session on stderr
     # + one additionalContext envelope, then exit 0 as the contract requires.
     if command -v vco_report_missing_hook_lib >/dev/null 2>&1; then
+        _NOTICE_KEY="$SESSION_ID"
+        if [ -n "$AGENT_ID" ] && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+            _NOTICE_KEY="$(vco_hook_agent_key_from_ids "$SESSION_ID" "$AGENT_ID")"
+        fi
         vco_report_missing_hook_lib "$SCRIPT_DIR" "$PROJECT_ROOT" \
-            "$SESSION_ID" "route-touched-path.sh"
+            "$_NOTICE_KEY" "route-touched-path.sh"
         if [ -n "${VCO_MISSING_LIB_NOTICE:-}" ] \
             && command -v emit_additional_context >/dev/null 2>&1; then
             emit_additional_context "$VCO_MISSING_LIB_NOTICE" PostToolUse

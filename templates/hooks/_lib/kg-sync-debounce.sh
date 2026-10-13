@@ -145,6 +145,14 @@ if [ "$_kg_debounce_lib_preset" = "0" ]; then
 fi
 unset _kg_debounce_lib_preset
 
+# v0.2.102 W6-C1 (F16): the per-agent key helper, for the failure-row
+# sentinel below. Conditional source (a partial install keeps the debounce
+# working; the sentinel then keys on the session alone — the pre-W6-C1
+# behaviour, reported at the next SessionStart health probe).
+# shellcheck source=session-id.sh disable=SC1091
+[ -r "$(dirname "$_KG_DEBOUNCE_LIB")/session-id.sh" ] \
+    && . "$(dirname "$_KG_DEBOUNCE_LIB")/session-id.sh"
+
 # POSIX single-quote escaper: wraps $1 so it survives `eval` even if it
 # contains spaces or single quotes. A literal ' becomes '\'' (close,
 # escaped-quote, reopen). Use this for any user-controlled path embedded
@@ -282,13 +290,25 @@ _kg_debounce_json_escape() {
 # [A-Za-z0-9_-] charset `_lib/session-id.sh` enforces, because it is
 # interpolated into a FILE NAME; anything else collapses to "default", and an
 # absent session id (a wrapper run outside a Claude session) to "nosession".
+# v0.2.102 W6-C1 (F16): when the run belongs to a SUBAGENT (the spawning
+# wrapper exported VCT_AGENT_ID), the key gains the __<agent_id> component
+# via the ONE session-id helper — the once-per-session failure notice is
+# delivered as hook context, which reaches the SUBAGENT only, so a
+# session-keyed sentinel let one lane's notice silence the row for the main
+# chat (and every sibling lane). MUST MATCH Get-KgDebounceSessionKey.
 _kg_debounce_session_key() {
     local raw="${VCT_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
     [ -n "$raw" ] || { printf '%s' "nosession"; return 0; }
+    local out
     case "$raw" in
-        *[!a-zA-Z0-9_-]*) printf '%s' "default" ;;
-        *)                printf '%s' "$raw" ;;
+        *[!a-zA-Z0-9_-]*) out="default" ;;
+        *)                out="$raw" ;;
     esac
+    if [ -n "${VCT_AGENT_ID:-}" ] \
+        && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+        out="$(vco_hook_agent_key_from_ids "$out" "$VCT_AGENT_ID")"
+    fi
+    printf '%s' "$out"
 }
 
 # Record ONE failure row for this session+channel. Best-effort in every

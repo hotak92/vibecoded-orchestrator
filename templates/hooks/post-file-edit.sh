@@ -76,6 +76,11 @@ KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"
 if [ -f "$SCRIPT_DIR/_lib/route-touched-path.sh" ]; then
     . "$SCRIPT_DIR/_lib/route-touched-path.sh"
 fi
+# v0.2.102 W6-C1 (F16): the per-agent key helper, for the once-per-session
+# broken-install notice below (its sentinel must not let a subagent's notice
+# silence the main chat's). Conditional source, same discipline.
+# shellcheck source=_lib/session-id.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
 
 # Accumulate LLM-visible reminders here, emit one envelope at the end.
 LLM_NUDGE=""
@@ -169,9 +174,16 @@ if command -v vco_route_touched_path >/dev/null 2>&1; then
 elif command -v vco_report_missing_hook_lib >/dev/null 2>&1; then
     # The routing home is absent (or unreadable) — a broken install, not a
     # degraded mode. Say so once per session, then carry on with the nudges
-    # this hook owns; exit stays 0.
+    # this hook owns; exit stays 0. v0.2.102 W6-C1 (F16): the notice is
+    # delivered as PostToolUse context, which reaches the SUBAGENT only
+    # when this edit is a lane's — key the sentinel per agent so the lane's
+    # notice never silences the main chat's.
+    _NOTICE_KEY="$SESSION_ID_FROM_STDIN"
+    if [ -n "$AGENT_ID" ] && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+        _NOTICE_KEY="$(vco_hook_agent_key_from_ids "$SESSION_ID_FROM_STDIN" "$AGENT_ID")"
+    fi
     vco_report_missing_hook_lib "$SCRIPT_DIR" "$PROJECT_ROOT" \
-        "$SESSION_ID_FROM_STDIN" "route-touched-path.sh"
+        "$_NOTICE_KEY" "route-touched-path.sh"
     if [ -n "${VCO_MISSING_LIB_NOTICE:-}" ]; then
         _add_nudge "$VCO_MISSING_LIB_NOTICE"
     fi

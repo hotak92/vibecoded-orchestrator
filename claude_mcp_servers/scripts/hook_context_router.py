@@ -33,12 +33,19 @@ Mechanism (one interpreter, one home):
   semantic code-graph queries from injection surfaces), with
   ``--indexed-revision`` on revision-stamped policies and ``--source-file``
   for the same-language identity check;
-* dedupe  — the SAME per-session files and key format as ``_lib/seen-store.sh``
-  (``seen_inject_<sid>.txt`` / ``seen_reads_<sid>.txt``; KG key
-  ``title#sha1(body)[:12]``, CODE key ``full_name``) — MUST MATCH that lib;
-* budget  — per-injection 2 500-char soft cap + per-turn 6 000 chars keyed by
-  ``prompt_id`` (``.claude/state/inject_budget_<sid>_<pid>``; past budget the
-  blocks degrade to titles one-liners; missing prompt_id fails OPEN);
+* dedupe  — the SAME per-agent files and key format as ``_lib/seen-store.sh``
+  (``seen_inject_<sid>.txt`` / ``seen_reads_<sid>.txt`` where ``<sid>`` is
+  the per-AGENT state key ``<sid>__<agent_id>`` for subagent calls —
+  ``vco_lib.hook_agent_key``, one home mirrored in ``_lib/session-id.*``;
+  KG key ``title#sha1(body)[:12]``, CODE key ``full_name``) — MUST MATCH
+  that lib; the ``agent`` surface (a brief) skips the dedupe, F10;
+* budget  — per-injection 2 500-char soft cap + a per-TURN budget keyed by
+  ``prompt_id`` AND the per-agent state key
+  (``.claude/state/inject_budget_<sid>[_<aid>]_<pid>``; 6 000 chars for the
+  main chat, 20 000 for a subagent run — v0.2.102 W6-C1, owner decision
+  2026-10-07, one home ``vco_lib.inject_intent.turn_budget_chars``; past
+  budget the blocks degrade to titles one-liners; missing prompt_id fails
+  OPEN; the ``agent`` surface skips the turn budget entirely, F10);
 * cache   — the shared ``.claude/state/query_cache/`` dir; the key algorithm
   (sha1 over the args joined with 0x1f) is ROUTER-OWNED since the v0.2.101
   retirement of ``_lib/query-cache.{sh,ps1}`` — the ``kgi``/``cgi``
@@ -107,7 +114,6 @@ from vco_lib.inject_intent import (  # noqa: E402
     INTENT_MECHANICAL,
     INTENT_READ,
     INTENT_SEARCH,
-    PER_TURN_BUDGET_CHARS,
     agent_task_section,
     budget_state_path,
     cap_block,
@@ -125,7 +131,9 @@ from vco_lib.inject_intent import (  # noqa: E402
     search_symbol_for_pattern,
     task_type_for,
     titles_one_liner,
+    turn_budget_chars,
 )
+from vco_lib.hook_agent_key import agent_state_key, sanitize_agent_id  # noqa: E402
 from vco_lib.prompt_edit_nudge import nudge_block as _prompt_nudge_block  # noqa: E402
 
 import hook_dual_search as _hds  # noqa: E402 — sibling module (sys.path above)
@@ -950,6 +958,12 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
         plan.cg_symbols = []
 
     legs: Dict[str, Callable[[], None]] = {}
+    cg_fresh = ""  # L4: the fresh (uncached) CG run's output, "" when missed
+    # L4 (v0.2.102 W6-C1): what a detached cache-warmrer needs to RE-RUN a
+    # registered leg out-of-band (script path + pinned argv). Populated only
+    # where the leg is actually built; consumed after the join.
+    warm_kg: Dict[str, object] = {}
+    warm_cg: Dict[str, object] = {}
 
     if kg_key:
         kg_script = _resolve_kg_script()
@@ -974,6 +988,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                 if transcript_path:
                     argv += ["--transcript", transcript_path]
                 _hds._pin_argv(kg_mod, argv)
+                warm_kg = {"script": str(kg_script), "argv": [str(a) for a in argv]}
 
                 def _kg_leg(mod=kg_mod) -> None:
                     # rl_kg_search.main is async; the VCO_ROUTER_KG_SCRIPT
@@ -994,6 +1009,15 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
         if cg_script is not None:
             try:
                 cg_mod = _hds._load_cg_module(cg_script)
+                if len(cg_keys) == 1:
+                    # L4: only the sole-symbol run is cached (mirroring the
+                    # cache write below), so only it is warmable.
+                    only_sym = next(iter(cg_keys))
+                    only_src = next(
+                        (sf for sym, sf in plan.cg_symbols if sym == only_sym), "")
+                    warm_cg = {"script": str(cg_script),
+                               "argv": [str(a) for a in _cg_argv(
+                                   only_sym, only_src, policy, plan.cg_profile)]}
 
                 def _cg_leg(mod=cg_mod, items=tuple(cg_keys.items()), pol=policy) -> None:
                     for symbol, _key in items:
@@ -1019,6 +1043,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                 kg_text = kg_text + "\n"
         if cg_keys:
             raw = (results.get("cg") or "").strip()
+            cg_fresh = raw
             if raw:
                 # One combined blob for the run (the per-symbol cache entries
                 # are keyed on the symbol; a combined blob is cached under
@@ -1029,8 +1054,117 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                 if len(cg_keys) == 1:
                     only_key = next(iter(cg_keys.values()))
                     cache_leg_output(project_root, only_key, raw + "\n")
+        # L4 (v0.2.102 W6-C1, owner ruling 2026-10-07): the interactive
+        # deadline still governs what is injected NOW, but a leg that missed
+        # it no longer dies uncached — on slow hardware the cache never
+        # warmed and injection stayed silent forever. Hand the miss to a
+        # DETACHED warmer (below) that completes the producer run and writes
+        # the cache, so the NEXT identical call is a cache hit. A leg that
+        # genuinely produced nothing also lands here once; the warmer
+        # re-runs it, gets the same nothing and caches nothing (§9 — an
+        # empty result is NEVER cached), so the next call still re-probes.
+        warm_spec: Dict[str, Dict] = {}
+        if kg_key and not kg_text and warm_kg:
+            warm_spec["kg"] = dict(warm_kg, cache_key=kg_key)
+        if cg_keys and len(cg_keys) == 1 and not cg_fresh and warm_cg:
+            warm_spec["cg"] = dict(warm_cg, cache_key=next(iter(cg_keys.values())))
+        if warm_spec:
+            _spawn_leg_warmer(project_root, warm_spec)
     cg_text = "".join(cg_symbol_texts)
     return kg_text, cg_text
+
+
+#: L4: a warmer claim younger than this belongs to a sibling warmer for the
+#: SAME cache key — don't stack a second detached producer run on it. Well
+#: under the query-cache TTL so the claim never masks a key the cache has
+#: already aged out.
+_WARM_LEG_CLAIM_TTL_S = 300.0
+
+
+def _spawn_leg_warmer(project_root: str, legs_spec: Dict[str, Dict]) -> None:
+    """L4 (v0.2.102 W6-C1): run the missed legs DETACHED and let them fill
+    the query cache for the next identical call.
+
+    The child is this same script with the hidden ``--warm-legs`` argv; the
+    job spec (producer script, pinned argv, cache key) rides STDIN as JSON —
+    the query text never travels through argv (R31). Detach shape: a new
+    session on POSIX (the ``setsid`` discipline of stop-codegraph-drain's
+    ``_drain_spawn_detached``), plain DEVNULL'd handles elsewhere. A per-key
+    ``O_CREAT|O_EXCL`` claim (:func:`vco_lib.atomic.claim_once`) stops a
+    slow backend from stacking one warmer per interactive call. Soft-fail:
+    any spawn problem drops the warming, never the hook."""
+    from vco_lib.atomic import claim_once
+
+    claimed: Dict[str, Dict] = {}
+    for name, leg in legs_spec.items():
+        key = str(leg.get("cache_key") or "")
+        if not key or not project_root:
+            continue
+        claim = Path(project_root) / ".claude" / "state" / \
+            f"warm_leg_{hashlib.md5(key.encode('utf-8'), usedforsecurity=False).hexdigest()[:16]}"
+        if claim_once(claim, stale_after_s=_WARM_LEG_CLAIM_TTL_S) is False:
+            continue  # a sibling warmer already owns this key
+        claimed[name] = leg
+    if not claimed:
+        return
+    spec = {"project_root": project_root, "legs": claimed}
+    popen_kwargs: Dict[str, object] = {}
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(_HERE / "hook_context_router.py"), "--warm-legs"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, **popen_kwargs)
+        proc.stdin.write(json.dumps(spec).encode("utf-8"))
+        proc.stdin.close()
+    except (OSError, ValueError):
+        pass
+
+
+def _warm_legs_main() -> int:
+    """The ``--warm-legs`` child: re-run the specced producer legs with NO
+    deadline and write their output into the query cache. Emits nothing,
+    records no seen-store, charges no budget — the interactive run owns all
+    of those; this process only warms the cache. Empty output is never
+    cached (§9, via :func:`cache_leg_output`), so a permanently-empty query
+    keeps re-probing exactly as before."""
+    try:
+        spec = json.loads(sys.stdin.read() or "{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 0
+    if not isinstance(spec, dict):
+        return 0
+    project_root = str(spec.get("project_root") or "")
+    legs_spec = spec.get("legs")
+    if not project_root or not isinstance(legs_spec, dict):
+        return 0
+    for name, leg in legs_spec.items():
+        if not isinstance(leg, dict):
+            continue
+        key = str(leg.get("cache_key") or "")
+        script = Path(str(leg.get("script") or ""))
+        argv = leg.get("argv")
+        if not key or not isinstance(argv, list) or not script.is_file():
+            continue
+        if cache_get(project_root, key) is not None:
+            continue  # a sibling warmer (or the interactive run) filled it
+        try:
+            mod = _hds._load_cg_module(script)
+        except BaseException:  # noqa: BLE001 — a warmer never raises
+            continue
+        _hds._pin_argv(mod, [str(a) for a in argv])
+
+        def _run(mod=mod) -> None:
+            result = mod.main()
+            if inspect.iscoroutine(result):
+                asyncio.run(result)
+
+        out = (_hds.run_legs({str(name): _run}) or {}).get(str(name)) or ""
+        out = out.strip()
+        if out:
+            cache_leg_output(project_root, key, out + "\n")
+    return 0
 
 
 # --- emission -----------------------------------------------------------------
@@ -1319,6 +1453,16 @@ def claim_bash_call(payload: Dict, project_root: str) -> bool:
 def main(argv: Optional[List[str]] = None) -> int:
     global _CURRENT_RUN_ID
     argv = list(sys.argv[1:] if argv is None else argv)
+    # L4 (v0.2.102 W6-C1): the detached cache-warmer child. Handled BEFORE
+    # the run-id stamp — a warmer shows nothing, so nothing it stages may
+    # be treated as this-run ctx (the stamp is the amendment gate).
+    if argv and argv[0] == "--warm-legs":
+        try:
+            return _warm_legs_main()
+        except BaseException as exc:  # noqa: BLE001 — a warmer never raises
+            print(f"[hook_context_router] warm-legs soft-fail: {exc!r}",
+                  file=sys.stderr)
+            return 0
     # W3R-10/batch-8: give THIS run an id and let the staged-ctx wrapper
     # stamp it (passthrough outside a run — see _CURRENT_RUN_ID). Cleared
     # on every exit so an in-process caller (tests, embedders) is never
@@ -1336,7 +1480,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 def _emit_prompt_nudge(payload: Dict, sid: str, project_root: str,
-                       prompt_id: str) -> None:
+                       prompt_id: str, turn_cap: int) -> None:
     """v0.2.102 W6-N F-8 (owner ruling 2026-10-12): before an Edit/Write of a
     prompt-shaped file, suggest the project's ENABLED prompt-authoring agent
     (:mod:`vco_lib.prompt_edit_nudge` decides both). Printed FIRST, as a
@@ -1350,7 +1494,11 @@ def _emit_prompt_nudge(payload: Dict, sid: str, project_root: str,
     NIT-6): capped by the per-injection soft cap, degraded to its header
     line (which keeps the dedup identity) once the per-turn budget is
     spent, and CHARGED to the per-turn budget before the KG/CODE legs read
-    it, so the blocks that follow in the same run see the NOTE's cost."""
+    it, so the blocks that follow in the same run see the NOTE's cost.
+
+    ``sid``/``turn_cap`` (v0.2.102 W6-C1): the PER-AGENT state key and its
+    budget cap — a subagent's edit nudge charges the subagent's own
+    20 000-char bucket, not the main chat's 6 000."""
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
         tool_input = {}
@@ -1364,7 +1512,7 @@ def _emit_prompt_nudge(payload: Dict, sid: str, project_root: str,
         return
     text = cap_block(shown.strip("\n"))
     budget_path = budget_state_path(sid, prompt_id, project_root)
-    if _budget_used(budget_path) + len(text) > PER_TURN_BUDGET_CHARS:
+    if _budget_used(budget_path) + len(text) > turn_cap:
         text = text.split("\n", 1)[0]
     print(text)
     _budget_charge(budget_path, len(text) + 1)
@@ -1409,6 +1557,17 @@ def _main(argv: List[str]) -> int:
         return 0
 
     sid = sanitize_session_id(str(payload.get("session_id") or ""))
+    # v0.2.102 W6-C1 (F1/F2/F3): subagent tool events carry agent_id while
+    # session_id / prompt_id stay the PARENT'S (probe 2026-10-13), so every
+    # per-session store keyed on sid alone was shared by the main chat and
+    # all its subagents. state_sid is the PER-AGENT key (one home:
+    # vco_lib.hook_agent_key + _lib/session-id.{sh,ps1}); it keys the
+    # seen-store, the code-graph cap counter and the per-turn budget. The
+    # RAW sid keeps keying what is genuinely session-scoped: the bash
+    # claim (per tool_use_id anyway), the VCT_SESSION_ID telemetry export
+    # and the pending-citation session match.
+    agent_id = sanitize_agent_id(str(payload.get("agent_id") or ""))
+    state_sid = agent_state_key(sid, agent_id)
     prompt_raw = str(payload.get("prompt_id") or "")
     prompt_id = prompt_raw if re.fullmatch(r"[A-Za-z0-9_-]+", prompt_raw) else ""
     transcript_path = str(payload.get("transcript_path") or "")
@@ -1423,7 +1582,8 @@ def _main(argv: List[str]) -> int:
     plan = _PLAN_BUILDERS[surface](payload, cwd)
 
     if surface in ("edit", "write"):
-        _emit_prompt_nudge(payload, sid, project_root, prompt_id)
+        _emit_prompt_nudge(payload, state_sid, project_root, prompt_id,
+                           turn_budget_chars(bool(agent_id)))
 
     def _write_intent_out() -> None:
         """The Wave-2 wrapper's outcome-event seam (WP-D 2: intent +
@@ -1443,9 +1603,20 @@ def _main(argv: List[str]) -> int:
         return 0  # MECHANICAL / no recoverable query → no spawn, no event
 
     _budget_gc(project_root)
-    budget_path = budget_state_path(sid, prompt_id, project_root)
+    # F2 (v0.2.102 W6-C1, owner decision 2026-10-07): the budget file and its
+    # cap are PER AGENT — a subagent run is its own "turn" with a 20 000-char
+    # bucket; the main chat keeps its unchanged 6 000 (one home for the pair:
+    # vco_lib.inject_intent.turn_budget_chars). F10: the AGENT surface skips
+    # the turn budget entirely — a brief's reader has seen nothing and its
+    # own 1 500-char KgGate bound is the cap that matters.
+    if surface == "agent":
+        budget_path: Optional[str] = None
+        turn_cap: Optional[int] = None
+    else:
+        budget_path = budget_state_path(state_sid, prompt_id, project_root)
+        turn_cap = turn_budget_chars(bool(agent_id))
     used = _budget_used(budget_path)
-    over_budget = used >= PER_TURN_BUDGET_CHARS
+    over_budget = bool(turn_cap) and used >= turn_cap
 
     # Inner bounds (env-tunable). OWNER RULING 2026-10-06: interactive
     # per-tool-call injection is the DELIBERATELY-BOUNDED, silence-safe
@@ -1473,7 +1644,7 @@ def _main(argv: List[str]) -> int:
     # _main() call (no main()) has no run id → no stamp → no amendment
     # (safe no-op; the production path is main()).
     router_run_id = _CURRENT_RUN_ID
-    kg_text, cg_text = _run_legs(plan, sid, prompt_id, project_root,
+    kg_text, cg_text = _run_legs(plan, state_sid, prompt_id, project_root,
                                  transcript_path, deadline)
     _write_intent_out()
 
@@ -1495,26 +1666,43 @@ def _main(argv: List[str]) -> int:
     if not combined.strip():
         return 0
 
-    inject_file = seen_store_path("inject", sid, project_root)
-    reads_file = seen_store_path("reads", sid, project_root)
-    suppressed: List[str] = []  # W3R-10: titles the filter dropped (never shown)
-    filtered = filter_seen_blocks(combined, inject_file, reads_file,
-                                  project_root, suppressed_out=suppressed)
-    if not filtered.strip():
-        # `suppressed` non-empty = every block was already seen/Read (all
-        # dropped by decision). Lock contention ALSO returns "" but leaves
-        # `suppressed` empty — nothing was decided, so nothing is amended.
-        _amend_pending_citations(project_root, sid, suppressed, router_run_id)
-        return 0
+    # F1: the seen-store files are keyed by the PER-AGENT state key. F10
+    # (v0.2.102 W6-C1): the AGENT surface (a brief rewritten via
+    # updatedInput) SKIPS the seen-store filter/record entirely — the
+    # brief's reader (the subagent being launched) has seen nothing, so the
+    # parent's dedupe would strip exactly the most relevant blocks and then
+    # wrongly record them as seen for the parent. It keeps its own
+    # 1 500-char KgGate bound.
+    if surface == "agent":
+        inject_file = ""
+        reads_file = ""
+        filtered = combined
+    else:
+        inject_file = seen_store_path("inject", state_sid, project_root)
+        reads_file = seen_store_path("reads", state_sid, project_root)
+        suppressed: List[str] = []  # W3R-10: titles the filter dropped
+        filtered = filter_seen_blocks(combined, inject_file, reads_file,
+                                      project_root, suppressed_out=suppressed)
+        if not filtered.strip():
+            # `suppressed` non-empty = every block was already seen/Read (all
+            # dropped by decision). Lock contention ALSO returns "" but
+            # leaves `suppressed` empty — nothing was decided, so nothing is
+            # amended.
+            _amend_pending_citations(project_root, sid, suppressed,
+                                     router_run_id)
+            return 0
 
     # Per-injection soft cap + per-turn budget (degrade, never drop: past
-    # budget the blocks become titles one-liners, §2.1).
+    # budget the blocks become titles one-liners, §2.1). turn_cap None
+    # (F10, the agent surface) means NO turn budget — only the per-block
+    # soft cap applies.
     blocks = [b for b in re.split(r"\n(?=(?:KG|CODE): )", filtered) if b.strip()]
     out_blocks: List[str] = []
     emitted = 0
     for block in blocks:
         text = cap_block(block.rstrip("\n"))
-        if over_budget or used + emitted + len(text) > PER_TURN_BUDGET_CHARS:
+        if turn_cap is not None and (
+                over_budget or used + emitted + len(text) > turn_cap):
             text = titles_one_liner(text) or text
             if not text:
                 continue
@@ -1531,7 +1719,7 @@ def _main(argv: List[str]) -> int:
         return 0
 
     if cg_text and any(b.startswith("CODE:") for b in out_blocks):
-        _cg_record(_cg_count_path(sid, project_root))
+        _cg_record(_cg_count_path(state_sid, project_root))
     _budget_charge(budget_path, emitted)
 
     if surface == "agent":

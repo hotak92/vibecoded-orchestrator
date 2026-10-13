@@ -101,3 +101,73 @@ vco_hook_fast_session_id() {
         | head -n 1 \
         | sed 's/.*"\([A-Za-z0-9_-]*\)"$/\1/'
 }
+
+# ─── v0.2.102 W6-C1 (F1/F2/F3/F11): the per-AGENT state key ──────────────────
+# Harness fact (probe 2026-10-13): subagent tool events carry agent_id while
+# session_id / prompt_id / transcript_path stay the PARENT's — so state keyed
+# on session_id alone was shared by the main chat and every subagent. These
+# helpers compose the key every per-agent store uses:
+#   main agent (no agent_id)   → <sid>
+#   subagent (agent_id set)    → <sid>__<agent_id>
+# Policy (identical in all three legs — see the comments in each):
+#   * the agent id is sanitised with the SAME allow-list as the session id
+#     ([A-Za-z0-9_-]); hostile → the literal "default" component (its OWN
+#     bucket, never the main store, never raw bytes in a file name);
+#   * an untrustworthy session id ("" / "default") passes through UNCHANGED —
+#     composing "default__<agent>" would re-create the cross-session bleed
+#     the seen-store's inject-blind guard exists to prevent.
+# MUST MATCH: session-id.ps1 (Get-VcoSanitizedAgentId / Get-VcoAgentKeyFromIds
+# / Get-VcoHookAgentKey) and vco_lib/hook_agent_key.py — parity pinned by
+# tests/test_v02102_w6c1_agent_keyed_hook_state.py.
+
+# vco_hook_sanitize_agent_id: same guard as vco_hook_sanitize_session_id, for
+# the agent component. Empty stays empty; anything outside [A-Za-z0-9_-]
+# collapses to "default".
+vco_hook_sanitize_agent_id() {
+    local raw="$1"
+    [ -n "$raw" ] || { printf '%s' ""; return 0; }
+    case "$raw" in
+        *[!a-zA-Z0-9_-]*) printf '%s' "default" ;;
+        *)                printf '%s' "$raw" ;;
+    esac
+}
+
+# vco_hook_agent_key_from_ids <session_id> <agent_id>
+# Compose the per-agent key from an (already-sanitised, or trusted-legacy)
+# session id and a RAW agent id. Both are sanitised here, so a legacy caller
+# passing an unsanitised session id cannot smuggle path-hostile bytes into
+# the composite either. No subshell to Python — cheap and dependency-free.
+vco_hook_agent_key_from_ids() {
+    local sid agent
+    sid="$(vco_hook_sanitize_session_id "$1")"
+    agent="$(vco_hook_sanitize_agent_id "$2")"
+    if [ -z "$agent" ] || [ -z "$sid" ] || [ "$sid" = "default" ]; then
+        printf '%s' "$sid"
+        return 0
+    fi
+    printf '%s' "${sid}__${agent}"
+}
+
+# vco_hook_agent_key <hook-stdin-json>
+# Parse session_id AND agent_id from the payload (requires $PY, like
+# vco_hook_session_id), sanitise both, compose. The main-agent payload
+# (absent/empty agent_id) yields exactly vco_hook_session_id's answer.
+vco_hook_agent_key() {
+    local stdin_payload="$1"
+    local sid="" agent=""
+    if [ -n "${PY:-}" ]; then
+        parsed=$(printf '%s' "$stdin_payload" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('session_id', '') or '')
+    print(d.get('agent_id', '') or '')
+except Exception:
+    print('')
+    print('')
+" 2>/dev/null || printf '\n\n')
+        sid="$(printf '%s' "$parsed" | sed -n '1p')"
+        agent="$(printf '%s' "$parsed" | sed -n '2p')"
+    fi
+    vco_hook_agent_key_from_ids "$sid" "$agent"
+}

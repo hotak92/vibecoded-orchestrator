@@ -172,12 +172,24 @@ function Get-KgDebounceLogPath {
 # [A-Za-z0-9_-] charset `_lib/session-id.ps1` enforces (it is interpolated
 # into a FILE NAME); anything else collapses to "default", an absent id to
 # "nosession". MUST MATCH _kg_debounce_session_key in the .sh sibling.
+# v0.2.102 W6-C1 (F16): when the run belongs to a SUBAGENT (the spawning
+# wrapper exported VCT_AGENT_ID), the key gains the __<agent_id> component
+# via the ONE session-id helper -- the once-per-session failure notice is
+# delivered as hook context, which reaches the SUBAGENT only, so a
+# session-keyed sentinel let one lane's notice silence the row for the main
+# chat (and every sibling lane).
+$VcoSessionIdLib = Join-Path $PSScriptRoot "session-id.ps1"
+if (Test-Path -LiteralPath $VcoSessionIdLib -PathType Leaf) { . $VcoSessionIdLib }
 function Get-KgDebounceSessionKey {
     $raw = $env:VCT_SESSION_ID
     if (-not $raw) { $raw = $env:CLAUDE_SESSION_ID }
     if (-not $raw) { return "nosession" }
-    if ($raw -match '^[A-Za-z0-9_-]+$') { return $raw }
-    return "default"
+    $out = "default"
+    if ($raw -match '^[A-Za-z0-9_-]+$') { $out = $raw }
+    if ($env:VCT_AGENT_ID -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyContinue)) {
+        $out = Get-VcoAgentKeyFromIds -SessionId $out -AgentId $env:VCT_AGENT_ID
+    }
+    return $out
 }
 
 # Record ONE failure row for this session+channel. Best-effort in every

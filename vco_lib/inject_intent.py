@@ -1099,11 +1099,17 @@ def prompt_query(prompt: str) -> str:
 
     "" when the prompt is not worth a retrieval: empty, a slash command
     (``/compact …`` — harness directives, not knowledge queries), a bang
-    shell passthrough (``!ls``), or trivially short (below the
-    :data:`PROMPT_MIN_CHARS` threshold, overridable via
-    :data:`PROMPT_MIN_CHARS_ENV`)."""
+    shell passthrough (``!ls``), a ``<task-notification>`` background-agent
+    completion (v0.2.102 W6-C1 F14 — the harness delivers a finished
+    background subagent's report as a SYNTHETIC UserPromptSubmit whose
+    prompt starts with that literal tag; it is not user prose, and querying
+    the KG on the head of the report text is noise), or trivially short
+    (below the :data:`PROMPT_MIN_CHARS` threshold, overridable via
+    :data:`PROMPT_MIN_CHARS_ENV`). MUST MATCH the skip in
+    agent-skill-keyword-suggest.{sh,ps1} (same synthetic prompt, same
+    reason)."""
     text = _WS_RUN_RE.sub(" ", (prompt or "").strip())
-    if not text or text.startswith(("/", "!")):
+    if not text or text.startswith(("/", "!", "<task-notification>")):
         return ""
     if len(text) < _prompt_min_chars():
         return ""
@@ -1241,6 +1247,23 @@ def task_type_for(profile: str) -> str:
 PER_INJECTION_SOFT_CAP = 2500
 #: per-turn budget across ALL surfaces, counted at emit time
 PER_TURN_BUDGET_CHARS = 6000
+#: v0.2.102 W6-C1 (F2, owner decision 2026-10-07): a subagent run's whole
+#: lifetime is its "turn" (the probe showed prompt_id stays the PARENT's for
+#: the entire run, so the per-prompt_id key cannot split it). Its budget is
+#: therefore its OWN, and larger — 20 000 chars — because one bucket now has
+#: to cover a full lane run instead of one main-chat turn. One constant per
+#: class, resolved in ONE place by :func:`turn_budget_chars`; the state file
+#: is keyed by the per-agent key (`inject_budget_<sid>__<agent>_<pid>`).
+SUBAGENT_PER_TURN_BUDGET_CHARS = 20000
+
+
+def turn_budget_chars(is_subagent: bool) -> int:
+    """The per-turn budget cap for the caller: the subagent constant when
+    the payload carried a non-empty ``agent_id`` (a lane run = one turn),
+    the main-chat constant otherwise. ONE home for the pair — callers must
+    not branch on the constants directly."""
+    return (SUBAGENT_PER_TURN_BUDGET_CHARS if is_subagent
+            else PER_TURN_BUDGET_CHARS)
 #: budget state files older than this are GC'd
 BUDGET_GC_AGE_S = 86400
 #: per-session code-graph inject cap default — the seen-store's

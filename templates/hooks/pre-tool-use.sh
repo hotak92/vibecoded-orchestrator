@@ -190,6 +190,18 @@ else
     SESSION_ID_RAW="$(printf '%s' "$SESSION_ID_FROM_STDIN" | tr -cd 'A-Za-z0-9_-')"
 fi
 SESSION_ID="${SESSION_ID_FROM_STDIN:-${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}}"
+# v0.2.102 W6-C1 (F11): the Build-Anchor reads ledger is per AGENT. The
+# payload's AGENT_ID (parsed above) is set exactly when this tool call
+# belongs to a SUBAGENT — whose context never saw the parent's Reads (and
+# vice versa), so sharing reads_<sid>.txt let a subagent overwrite with
+# Write a file only the parent Read (the gate failed open across agents).
+# The composite key comes from the ONE session-id helper; the main agent's
+# key is byte-identical to the pre-W6-C1 name (this branch only adds the
+# __<agent_id> component when AGENT_ID is non-empty).
+ANCHOR_SESSION_KEY="$SESSION_ID"
+if [ -n "$AGENT_ID" ] && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+    ANCHOR_SESSION_KEY="$(vco_hook_agent_key_from_ids "$SESSION_ID" "$AGENT_ID")"
+fi
 # Per-session dedup state lives under the project's .claude/state/ rather
 # than $TMPDIR so it survives reboots + launcher restarts (Claude Code
 # persists session_id across restarts via the resume feature). $TMPDIR may
@@ -197,7 +209,7 @@ SESSION_ID="${SESSION_ID_FROM_STDIN:-${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}}"
 # gitignored and wiped only by PostCompact (correct semantic — context
 # truly resets at compaction).
 SESSION_STATE_DIR="$PROJECT_ROOT/.claude/state"
-SESSION_READS_FILE="$SESSION_STATE_DIR/reads_${SESSION_ID}.txt"
+SESSION_READS_FILE="$SESSION_STATE_DIR/reads_${ANCHOR_SESSION_KEY}.txt"
 BACKUP_DIR="$SESSION_STATE_DIR/tool_backups"
 SECURITY_LOG="$PROJECT_ROOT/.claude/logs/security_events.jsonl"
 
@@ -212,6 +224,9 @@ mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 # HK-4 (v0.2.75) accepted-scatter: one of 4 per-hook GC sweeps (uniform 14d);
 # a shared sweeper is optional and deliberately SKIPPED to keep hooks
 # single-file. See pre-edit-context-inject.sh for the full rationale.
+# v0.2.102 W6-C1 (F1/F11): the per-agent names reads_<sid>__<agent>.txt and
+# seen_reads_<sid>__<agent>.txt are already covered by these two globs (the
+# '*' spans the '__<agent_id>' component), so the GC needs no new pattern.
 find "$SESSION_STATE_DIR" -maxdepth 1 -name 'reads_*.txt' -mtime +14 -delete 2>/dev/null || true
 # v0.2.70 Stream E (SF-1): same 14-day GC for the INJECTOR reads store
 # (seen_reads_*.txt — distinct from the Build-Anchor reads_*.txt above).
@@ -390,7 +405,15 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
             _REL_FP="$(vco_to_repo_relative "$FILE_PATH" "$PROJECT_ROOT")"
         fi
         if command -v vco_seen_store_path >/dev/null 2>&1; then
-            _UNIFIED_READS="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+            # v0.2.102 W6-C1 (F1): the injector reads-ledger is per AGENT —
+            # a subagent's Read must not mark sources "already in context"
+            # for the parent (whose window never saw them), nor be silenced
+            # by the parent's Reads. Same composite key as the router's.
+            _STORE_SID="$SESSION_ID_RAW"
+            if [ -n "$AGENT_ID" ] && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+                _STORE_SID="$(vco_hook_agent_key_from_ids "$SESSION_ID_RAW" "$AGENT_ID")"
+            fi
+            _UNIFIED_READS="$(vco_seen_store_path reads "$_STORE_SID" "$PROJECT_ROOT")"
             if [ -n "$_UNIFIED_READS" ]; then
                 printf '%s\n' "$_REL_FP" >> "$_UNIFIED_READS" 2>/dev/null || true
             fi
