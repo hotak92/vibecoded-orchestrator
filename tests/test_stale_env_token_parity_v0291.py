@@ -131,7 +131,8 @@ def _bash_library_truncated(path: Path, marker: str) -> str:
 def _ps1_library(path: Path) -> str:
     """The script with the ``[CmdletBinding()] param(...)`` header and the
     ``# ── Main`` tail removed, so it can be dot-sourced (F-8 pattern)."""
-    src = path.read_text(encoding="utf-8")
+    # utf-8-sig drops a leading BOM, so re-adding one below never doubles it.
+    src = path.read_text(encoding="utf-8-sig")
     cb_idx = src.find("[CmdletBinding")
     if cb_idx != -1:
         after = src.find("\n)\n", cb_idx)
