@@ -30,6 +30,12 @@
 # the subagent silently fell back to the shared parent tree. This version
 # CREATES the worktree.
 #
+# -- Lane reservations (v0.2.102 W6-AA) ---------------------------------------
+# Before the repository checks, a pending lane reservation (vco_lib/lane_reservation.py)
+# is consumed for an `agent-*` identifier: the worktree is created in the
+# reserved repo/base/branch, or the reserved existing worktree is adopted; a
+# failed reservation aborts the create loudly. Same as worktree-guard.sh.
+#
 # ── VCT_WORKTREE_GUARD_ENFORCE (staged-enable flag — now vestigial) ───────
 # Creation is now the DEFAULT (ungated); a failed create always aborts
 # loudly. The flag only affects the belt-and-suspenders explicit-path branch:
@@ -184,9 +190,9 @@ if (Test-Path -LiteralPath $WtrecHelper) {
     . $WtrecHelper
     Remove-WtrecStale $ProjectRoot
 }
-function Save-LaunchRecord([string]$mode, [string]$path, [string]$base, [string]$toplevel) {
+function Save-LaunchRecord([string]$mode, [string]$path, [string]$base, [string]$toplevel, [string]$extra = "") {
     if (Get-Command Write-WtrecRecord -ErrorAction SilentlyContinue) {
-        Write-WtrecRecord $ProjectRoot $WtName $mode $path $base $toplevel
+        Write-WtrecRecord $ProjectRoot $WtName $mode $path $base $toplevel $extra
     }
 }
 function Write-Notice([string]$text) {
@@ -196,6 +202,44 @@ function Write-Notice([string]$text) {
         New-Item -ItemType Directory -Force -Path $NoticeDir -ErrorAction Stop | Out-Null
         Set-Content -LiteralPath (Join-Path $NoticeDir "notice-$WtName.txt") -Value $text -Encoding UTF8 -ErrorAction Stop
     } catch { }
+}
+
+# -- Lane reservation (v0.2.102 W6-AA) - must match worktree-guard.sh -------
+# A coordinator reserves this isolated agent's worktree in another repo first
+# (python -m vco_lib.lane_reservation reserve ...). The logic lives ONCE in
+# vco_lib/lane_reservation.py; this block only calls it. No pending file =>
+# nothing here runs and the guard behaves exactly as before. Consume exit 3 =
+# nothing to consume => fall through; any other failure is a LOUD abort, never
+# a silent fallback to a worktree of the project.
+$LanePending = Join-Path (Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "lane-reservations") "pending"
+if ($WtName -and (Test-Path -LiteralPath $LanePending -PathType Container) -and
+    @(Get-ChildItem -LiteralPath $LanePending -File -Filter "res-*.json" -ErrorAction SilentlyContinue).Count -gt 0) {
+    $VcoPy = $null
+    $VenvHelper = Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1"
+    if (Test-Path -LiteralPath $VenvHelper) {
+        . $VenvHelper
+        $VcoPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+    }
+    if (-not $VcoPy) {
+        $reason = "broken install: a lane reservation is pending in $LanePending but VCO's Python (vco_lib) cannot be resolved to consume it - repair the install (launcher: project Settings -> Update bundle), or cancel the reservation"
+        Log-Event "create_failed" $reason $ProposedPath ""
+        [Console]::Error.WriteLine("worktree-guard: ABORT - $reason")
+        exit 1
+    }
+    $LaneOut = @(& $VcoPy -m vco_lib.lane_reservation consume --project $ProjectRoot --name $WtName)
+    $LaneRc = $LASTEXITCODE
+    if ($LaneRc -eq 0 -and $LaneOut.Count -ge 5) {
+        $LanePath = [string]$LaneOut[0]
+        Log-Event "created" "lane_reservation" $ProposedPath $LanePath
+        Save-LaunchRecord ([string]$LaneOut[3]) $LanePath ([string]$LaneOut[1]) ([string]$LaneOut[2]) ([string]$LaneOut[4])
+        Emit-WtPath $LanePath
+        exit 0
+    } elseif ($LaneRc -ne 3) {
+        $reason = "lane reservation could not be honoured (consume exit $LaneRc; reason above) - no worktree of the project was created in its place"
+        Log-Event "create_failed" $reason $ProposedPath ""
+        [Console]::Error.WriteLine("worktree-guard: ABORT - $reason")
+        exit 1
+    }
 }
 
 # -- Not a git repo => run in place, isolation OFF, said out loud ------------

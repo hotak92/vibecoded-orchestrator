@@ -535,6 +535,25 @@ With this on, asking the orchestrator to refactor 30 files or analyze 5 director
 
 This is the only global env var worth setting; everything else is per-project.
 
+### Isolated agents in another repo — lane reservations (v0.2.102)
+
+An `isolation: worktree` agent gets a worktree that VCO's `worktree-guard` hook creates — by default a detached checkout of the project's own repo at HEAD under `.claude/worktrees/`. A coordinator whose lane belongs in another repo, at a chosen base on a chosen branch, reserves the worktree first:
+
+```bash
+python -m vco_lib.lane_reservation reserve --project <project> --repo <repo> --base <commit> --branch <new-branch> \
+    [--id <id>] [--existing-path <worktree>] [--ttl <seconds>]   # prints the reservation id
+python -m vco_lib.lane_reservation list   --project <project> [--json]
+python -m vco_lib.lane_reservation cancel --project <project> --id <id>
+```
+
+- **Allowed repos**: the project itself, or one of its ENABLED code folders (launcher: Identity tab → **Add code folder**; stored in `project_codegraph_extra_paths`, served by the hub's `/config` as `code_graph_extra_paths`). Normalized real paths are compared. The list comes from the hub, so with the hub down reservations are refused at reserve AND at launch time; ordinary isolation never asks the hub.
+- **Validation at reserve**: the repo is a git repository; `--base` resolves to a commit; `--branch` is a valid branch name that does not exist yet and is not checked out anywhere (or, with `--existing-path`, the path is a registered, non-main worktree of the repo, on that branch, clean, and containing the base); the id is unique among pending reservations, and no other pending reservation targets the same branch.
+- **Consumption**: the next isolated launch whose identifier starts with `agent-` (a subagent — `claude --worktree <name>` never consumes) takes the OLDEST pending, unexpired reservation, by an atomic rename, so two launches can never take the same one. Dispatch one isolated agent per message. The allow-list is checked again, then the worktree is created at `<parent of the repo>/<repo name>.vco-lanes/<branch-slug>-<id>` (outside the repo's working tree) with `git -C <repo> worktree add -b <branch> <path> <base>`, or the existing worktree is adopted. A reservation that fails at launch aborts the launch with the reason on stderr — it never falls back to a worktree of the project.
+- **TTL**: 15 minutes by default (`--ttl`); an expired reservation is moved aside and never consumed.
+- **State**: `<project>/.claude/state/lane-reservations/{pending,claimed,expired,cancelled}/res-<created_ns>-<id>.json` (claimed/expired/cancelled kept 30 days for audit). The agent's launch record (`.claude/state/worktree-guard/wt-agent-<id>.json`) carries the binding: mode `reservation` (or `reservation_existing`), `reservation_id`, `repo`, `branch`, `base_sha`.
+- **When the agent starts**, `subagent-start-isolation-check` tells it its reservation id, worktree, repo, branch and base, and to stop if its brief names a different id. **When it stops**, `subagent-stop-reconcile` keeps a worktree with changes or new commits for review, and removes an unchanged one (in the target repo) together with its new branch — the branch only while it still points at the base. An adopted worktree is never removed.
+- **Bash is not confined**: the harness holds only Edit/Write to the worktree, so a lane brief must keep its Bash commands inside the worktree path.
+
 ## Install-time env knobs
 
 Set these before running `bash first-install.sh` (or export them for the duration of a CI run):

@@ -124,7 +124,8 @@ try {
 # carries none of the isolation fields parsed above, so derive the flag from
 # worktree-guard's record + the agent's definition (_lib/worktree-records.ps1,
 # shared with subagent-start-isolation-check):
-#   * record with mode head|snapshot => isolated: stay silent ($IsoFlag off);
+#   * record with mode head|snapshot|reservation|reservation_existing =>
+#     isolated: stay silent ($IsoFlag off);
 #   * no record, guard registered, definition declares `isolation: worktree`
 #     => skipped: $IsoFlag on, cwd treated as the parent checkout;
 #   * anything else => the payload-derived value stands.
@@ -136,7 +137,7 @@ if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
         $isoRecFile = Find-WtrecRecord $ProjectRoot $AgentId
         if ($isoRecFile) {
             $isoRec = Read-WtrecRecord $isoRecFile
-            if ($isoRec -and (@("head", "snapshot") -contains [string]$isoRec.mode)) { $IsoFlag = $false }
+            if ($isoRec -and (@("head", "snapshot", "reservation", "reservation_existing") -contains [string]$isoRec.mode)) { $IsoFlag = $false }
         } elseif (Test-WtrecIsolationSkipped $ProjectRoot $AgentId $AgentType) {
             $IsoFlag = $true
             $IsoCwd = ""
@@ -359,7 +360,13 @@ if ((Get-Command Scan-FileForCredentials -ErrorAction SilentlyContinue) -and $al
     }
 }
 
-# -------------------- Step 5: Nudge counter --------------------
+# -------------------- Step 5: Subagent work record --------------------
+# Records subagent work on the parent session's row as subagent_work_units
+# (+ subagent_count / subagent_ids), for the per-subagent KG nudge the owner
+# scheduled for v0.2.103 (each subagent nudged on its own work). The
+# main-chat kg-update-nudge deliberately does NOT read these fields (owner
+# ruling 2026-10-13: the main-chat nudge ignores subagent work). Must match
+# the .sh sibling.
 # The counter file lives under the machine-wide metrics dir (not the project's
 # .claude/) because nudge state is per-session, not per-project;
 # kg-update-nudge.ps1 resolves the same path through the same

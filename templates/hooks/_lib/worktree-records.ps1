@@ -4,8 +4,9 @@
 # worktree-records.ps1 -- the one home for worktree-guard's per-agent records
 # (v0.2.102 W6-Q follow-up). MUST MATCH _lib/worktree-records.sh: same record
 # file names (.claude/state/worktree-guard/wt-<name>.json), same fields
-# (name, mode head|snapshot|in_place, path, base, toplevel, status,
-# created_at), same reap conditions and decision/reason vocabulary. See the
+# (name, mode head|snapshot|in_place|reservation|reservation_existing, path,
+# base, toplevel, status, created_at; plus a lane reservation's binding,
+# v0.2.102 W6-AA), same reap conditions and decision/reason vocabulary. See the
 # .sh sibling for the full WHY: the harness keeps a hook-created worktree and
 # runs no WorktreeRemove when a subagent finishes, so VCO reaps the provably
 # unchanged ones itself.
@@ -17,20 +18,29 @@ function Test-WtrecName([string]$name) {
     return ($name -match '^[A-Za-z0-9_-][A-Za-z0-9._-]*$')
 }
 
-function Write-WtrecRecord([string]$root, [string]$name, [string]$mode, [string]$path, [string]$base, [string]$toplevel) {
+# $extra (v0.2.102 W6-AA): optional one-line JSON object of STRING fields
+# merged into the record (a lane reservation's binding); the fixed fields
+# always win. Must match wtrec_write in the .sh sibling.
+function Write-WtrecRecord([string]$root, [string]$name, [string]$mode, [string]$path, [string]$base, [string]$toplevel, [string]$extra = "") {
     if (-not (Test-WtrecName $name)) { return }
     try {
         $dir = Join-Path $root $script:WtrecSubdir
         New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
-        $rec = [ordered]@{
-            name       = $name
-            mode       = $mode
-            path       = $path
-            base       = $base
-            toplevel   = $toplevel
-            status     = "created"
-            created_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $rec = [ordered]@{}
+        if ($extra) {
+            $x = $null
+            try { $x = $extra | ConvertFrom-Json -ErrorAction Stop } catch { $x = $null }
+            if ($x -is [System.Management.Automation.PSCustomObject]) {
+                foreach ($p in $x.PSObject.Properties) { if ($p.Value -is [string]) { $rec[$p.Name] = $p.Value } }
+            }
         }
+        $rec["name"] = $name
+        $rec["mode"] = $mode
+        $rec["path"] = $path
+        $rec["base"] = $base
+        $rec["toplevel"] = $toplevel
+        $rec["status"] = "created"
+        $rec["created_at"] = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         Set-Content -LiteralPath (Join-Path $dir "wt-$name.json") -Value ($rec | ConvertTo-Json -Compress) -Encoding UTF8 -ErrorAction Stop
     } catch { }
 }
@@ -204,7 +214,8 @@ function Invoke-WtrecReap([string]$root, [string]$id) {
         return [pscustomobject]@{ Decision = $d; Reason = $r; Path = $path }
     }
     if ($mode -eq "in_place") { return (& $out "skipped" "in_place_never_removed") }
-    if ($mode -ne "head" -and $mode -ne "snapshot") { return (& $out "skipped" "unknown_mode") }
+    if ($mode -eq "reservation_existing") { return (& $out "skipped" "reservation_existing_never_removed") }
+    if (@("head", "snapshot", "reservation") -notcontains $mode) { return (& $out "skipped" "unknown_mode") }
     if ([string]$rec.status -ne "created") { return (& $out "skipped" "already_handled") }
     if (-not $path -or -not $base -or -not $top -or $path -eq $top) { return (& $out "kept" "incomplete_record") }
     if (-not (Test-Path -LiteralPath $path -PathType Container)) { return (& $out "removed" "already_gone") }
@@ -226,7 +237,19 @@ function Invoke-WtrecReap([string]$root, [string]$id) {
     if ($LASTEXITCODE -ne 0) { return (& $out "kept" "status_unreadable") }
     if ($st.Trim()) { return (& $out "kept" "has_changes") }
     $err = (& git -C $top worktree remove $path 2>&1 | Out-String)
-    if ($LASTEXITCODE -eq 0) { return (& $out "removed" "clean") }
+    if ($LASTEXITCODE -eq 0) {
+        # A reservation worktree's NEW branch goes too, but only while it still
+        # points at the recorded base (update-ref compare-and-delete).
+        if ($mode -eq "reservation" -and [string]$rec.branch_created -eq "yes") {
+            $br = [string]$rec.branch
+            if ($br) {
+                & git -C $top update-ref -d "refs/heads/$br" $base 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) { return (& $out "removed" "clean") }
+            }
+            return (& $out "removed" "clean_branch_kept")
+        }
+        return (& $out "removed" "clean")
+    }
     $msg = ($err -replace '[\t\r\n]+', ' ').Trim()
     if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) }
     return (& $out "kept" "git_refused: $msg")
