@@ -415,6 +415,29 @@ t_die_miss_hit_points_at_resolver() {
     esac
 }
 
+# --- Test (v0.2.102 W6-AB): a hub 5xx must NOT suggest `vct set` ---------
+# The hub is running but could not answer (a 500, or a 503 other than the
+# keychain codes): the key state is UNKNOWN — a `vct set` would fork a
+# second copy of a key the keychain may well hold. Retry is the remedy.
+t_die_miss_hub_5xx_withholds_vct_set() {
+    local sd="$TMP/hub500"
+    _start_fake_hub 500 "$sd" '{"error":{"code":"internal","message":"boom"}}'
+    local rc=$?
+    [ "$rc" -eq 2 ] && { echo "    (skipped: no python3)"; return 0; }
+    [ "$rc" -eq 0 ] || { echo "    fake hub failed to start"; return 1; }
+    local err
+    err=$(VCT_STATE_DIR="$sd" VCT_HUB_PORT="$(cat "$sd/hub.port")" \
+          "$VCT" get --project busy-miss-proj --key SOMEKEY 2>&1 >/dev/null)
+    _stop_fake_hub "$sd"
+    case "$err" in
+        *"Fix: vct set"*) echo "    5xx miss wrongly RECOMMENDED 'vct set': $err"; return 1 ;;
+    esac
+    case "$err" in
+        *"retry"*) : ;;
+        *) echo "    5xx miss did not say retry: $err"; return 1 ;;
+    esac
+}
+
 # --- Test (4b, v0.2.101 Q7/S1): a key_paused 404 must NOT suggest `vct set` -
 # The hub answered that the key EXISTS but is paused for this requester.
 # Recommending `vct set` here would plant a file-store copy over a
@@ -701,6 +724,7 @@ run_test "doctor github_pat shape check (S-3)" t_doctor_token_shape
 run_test "die_miss 403 withholds 'vct set' (4b)" t_die_miss_403_withholds_vct_set
 run_test "die_miss hit points at resolver (4b)"  t_die_miss_hit_points_at_resolver
 run_test "die_miss key_paused withholds 'vct set' (Q7/S1)" t_die_miss_key_paused_withholds_vct_set
+run_test "die_miss hub 5xx withholds 'vct set' (W6-AB)" t_die_miss_hub_5xx_withholds_vct_set
 
 # v0.2.80 Part A/B/C — secret-shape guard + recover-blob + doctor taxonomy.
 # These run LAST: several set their own isolated VCT_SECRETS_DIR.

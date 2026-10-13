@@ -45,9 +45,12 @@
 #         4  key not found in hub response
 #         5  forbidden (hub refused the token on /env; scoped token required)
 #         6  keychain locked/unreadable (hub 503 keychain_locked or
-#            keychain_error; unlock the login keychain or open the launcher),
-#            or temporarily unavailable (v0.2.102 keychain_unavailable;
-#            retry in a few seconds)
+#            keychain_error; unlock the login keychain or open the launcher)
+#         7  secret store UNAVAILABLE, retryable (v0.2.102): the hub is
+#            running but did not answer in time (timeout, dropped
+#            connection, a 5xx) or its keychain is temporarily unavailable
+#            (hub 503 keychain_unavailable). The key may well exist -- retry;
+#            never add it again. Tier 1 is retried ONCE before this code.
 #       Non-zero codes mean the key ALSO missed the file store and the
 #       project `.env`.
 #
@@ -88,9 +91,17 @@
 # Time budget (v0.2.97): $Env:VCT_RESOLVE_MAX_TIME=<seconds> (up to three
 #   decimals) bounds the TOTAL time this invocation spends on the hub --
 #   connect + read, across every request. Each request is capped at what is
-#   left (and at the usual 5 s); once nothing is left the hub is treated as
-#   unreachable. Unset: each request keeps its own 5 s cap. A value that is
-#   not a number is ignored with one stderr line.
+#   left (and at the usual per-request cap); once nothing is left the hub is
+#   treated as unreachable. Unset: each request keeps its own cap. A value
+#   that is not a number is ignored with one stderr line.
+#
+# Per-request timeout (v0.2.102, W6-AB): 30 s ($script:SecretReadTimeoutMs).
+#   The hub answers a secret read from the OS keychain, whose own per-op wait
+#   is 10 s, so a slow-but-working hub can take well over the former 5 s;
+#   cutting it off turned a busy keychain into a false "not found". A REFUSED
+#   connection (no hub) still fails at once. A hub that does not answer in
+#   time (or answers 5xx / 503 keychain_unavailable) is asked ONCE more,
+#   then exit 7.
 #
 # Hub discovery:
 #   1. $Env:VCT_HUB_PORT
@@ -180,14 +191,50 @@ if ($env:VCT_RESOLVE_MAX_TIME) {
     }
 }
 
+# v0.2.102 (W6-AB) per-request read cap. MUST MATCH
+# `vco_lib/project_config.py::SECRET_READ_TIMEOUT_SECONDS` and
+# `_SECRET_READ_TIMEOUT_S` in vct_secrets_resolve.sh (pinned by
+# tests/test_secret_read_timeout_parity.py).
+$script:SecretReadTimeoutMs = 30000
+# Wait before the ONE retry after a 503 keychain_unavailable: the hub's own
+# Retry-After (`KEYCHAIN_UNAVAILABLE_RETRY_AFTER_SECS` in modules_api.rs).
+$script:HubRetryWaitMs = 2000
+$script:HubRetryWait = 0
+# The hub accepted the connection but did not answer in time: it is RUNNING
+# and busy (typically a slow OS keychain). Never a "not found".
+$script:HubNotRespondingMsg = "hub did not answer in time (it is running but busy -- typically a slow OS keychain); the key may well be stored -- retrying is safe."
+
 function Get-HubRequestTimeoutMs {
-    # 5000, or what is left of the budget when that is less; 0 when the
-    # budget is spent (the caller then treats the hub as unreachable).
-    if ($null -eq $script:BudgetMs) { return 5000 }
+    # $script:SecretReadTimeoutMs, or what is left of the budget when that is
+    # less; 0 when the budget is spent (the caller then treats the hub as
+    # unreachable).
+    if ($null -eq $script:BudgetMs) { return $script:SecretReadTimeoutMs }
     $left = $script:BudgetMs - $script:BudgetClock.ElapsedMilliseconds
     if ($left -le 0) { return 0 }
-    if ($left -ge 5000) { return 5000 }
+    if ($left -ge $script:SecretReadTimeoutMs) { return $script:SecretReadTimeoutMs }
     return [int]$left
+}
+
+function Test-ConnectionRefused {
+    # v0.2.102 (W6-AB): did this HttpClient failure happen because nothing is
+    # LISTENING (connection refused -- no hub running), as opposed to a hub
+    # that accepted the connection and then did not answer (timeout / reset)?
+    # Walks the InnerException chain for a SocketException whose code is
+    # ConnectionRefused. Conservative: anything not positively a refusal is
+    # "not responding". MUST MATCH `_is_connection_refused` in
+    # vco_lib/project_config.py.
+    param($Err)
+    $ex = $Err
+    while ($null -ne $ex) {
+        if ($ex -is [System.Net.Sockets.SocketException]) {
+            if ($ex.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionRefused) {
+                return $true
+            }
+        }
+        if ("$($ex.Message)" -match '(?i)connection refused|actively refused') { return $true }
+        $ex = $ex.InnerException
+    }
+    return $false
 }
 
 # A valid hub port is an integer in 1..65535; an invalid VCT_HUB_PORT falls
@@ -403,9 +450,10 @@ function Invoke-Hub {
 }
 
 function Invoke-HubWithToken {
-    # ONE request with an explicit bearer. Returns @{Status;Body} or
-    # $null on a connection-level failure (refused / DNS / timeout) or when
-    # the time budget is spent.
+    # ONE request with an explicit bearer. Returns @{Status;Body}, $null on
+    # a connection that could not be made (refused / DNS) or when the time
+    # budget is spent, and -- v0.2.102 -- @{Status=-1} when the hub was
+    # reached but did not answer in time (timeout / dropped connection).
     #
     # HttpClient answers every HTTP status as a response (no exception), so
     # the 403 / 404 / 503 bodies reach their switch arms directly -- the
@@ -440,7 +488,12 @@ function Invoke-HubWithToken {
             Body   = $body
         }
     } catch {
-        return $null  # refused / DNS / timeout
+        # v0.2.102 (W6-AB): a refusal (no hub) stays $null -> exit 1 and
+        # falls through at once; anything else -- a timeout (the HttpClient
+        # cancels the task), a reset after connect -- is a RUNNING hub that
+        # could not answer yet: the Status=-1 sentinel -> exit 7 (retry).
+        if (Test-ConnectionRefused $_.Exception) { return $null }
+        return @{ Status = -1; Body = "hub did not answer in time" }
     } finally {
         if ($null -ne $response) { $response.Dispose() }
         if ($null -ne $request) { $request.Dispose() }
@@ -472,6 +525,15 @@ function Resolve-ProjectId {
     if ($null -eq $result) {
         Write-Err "hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return @{ ExitCode = 1 }
+    }
+    if ($result.Status -eq -1) {
+        Write-Err $script:HubNotRespondingMsg
+        return @{ ExitCode = 7 }
+    }
+    if ($result.Status -ge 500 -and $result.Status -le 599) {
+        # v0.2.102: the hub is running but failed to answer -- retryable.
+        Write-Err "hub returned status $($result.Status) for by-path lookup (the hub is running but could not answer -- retrying is safe); body=$($result.Body)"
+        return @{ ExitCode = 7 }
     }
     switch ($result.Status) {
         0 {
@@ -520,12 +582,44 @@ function Read-KeyHub {
     # not registered, 3=key_not_active, 4=key missing from a 200 body).
     # The chain caller remembers this code and reuses it as the final
     # exit when tiers 2 and 3 also miss.
+    #
+    # v0.2.102 (W6-AB): code 7 (the hub is running but did not answer in
+    # time / answered 5xx / its keychain is temporarily unavailable) gets
+    # exactly ONE retry of the whole tier-1 attempt. MUST MATCH read_key_hub
+    # in vct_secrets_resolve.sh and agent_secrets._hub_get.
     param([string]$ProjectArg, [string]$Key)
+    $first = Read-KeyHubAttempt -ProjectArg $ProjectArg -Key $Key
+    if ($first.ExitCode -ne 7) { return $first }
+    # No budget left for a retry: report what the first attempt proved.
+    if ((Get-HubRequestTimeoutMs) -le 0) { return $first }
+    if ($script:HubRetryWait -gt 0) { Start-Sleep -Milliseconds $script:HubRetryWait }
+    $second = Read-KeyHubAttempt -ProjectArg $ProjectArg -Key $Key
+    if ($second.ExitCode -eq 1) { return @{ ExitCode = 7 } }
+    return $second
+}
+
+function Read-KeyHubAttempt {
+    param([string]$ProjectArg, [string]$Key)
+    $script:HubRetryWait = 0
     $resolved = Resolve-ProjectId -ArgValue $ProjectArg
     if ($resolved.ExitCode -ne 0) {
         return @{ ExitCode = $resolved.ExitCode }
     }
     return Read-KeyHubEnv -ProjectId $resolved.Value -Key $Key
+}
+
+function Read-KeyHubEnvRetrying {
+    # Read-KeyHubEnv with Read-KeyHub's ONE retry on code 7 (resolve-many's
+    # per-key tier 1). MUST MATCH read_key_hub_env_retrying in the .sh.
+    param([string]$ProjectId, [string]$Key)
+    $script:HubRetryWait = 0
+    $first = Read-KeyHubEnv -ProjectId $ProjectId -Key $Key
+    if ($first.ExitCode -ne 7) { return $first }
+    if ((Get-HubRequestTimeoutMs) -le 0) { return $first }
+    if ($script:HubRetryWait -gt 0) { Start-Sleep -Milliseconds $script:HubRetryWait }
+    $second = Read-KeyHubEnv -ProjectId $ProjectId -Key $Key
+    if ($second.ExitCode -eq 1) { return @{ ExitCode = 7 } }
+    return $second
 }
 
 function Read-KeyHubEnv {
@@ -541,6 +635,16 @@ function Read-KeyHubEnv {
     if ($null -eq $result) {
         Write-Err "hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return @{ ExitCode = 1 }
+    }
+    if ($result.Status -eq -1) {
+        Write-Err $script:HubNotRespondingMsg
+        return @{ ExitCode = 7 }
+    }
+    if ($result.Status -ge 500 -and $result.Status -le 599 -and $result.Status -ne 503) {
+        # v0.2.102: the hub is running but failed to answer -- retryable.
+        # (503 has its own arm below: keychain_locked/keychain_error = 6.)
+        Write-Err "hub returned status $($result.Status) (the hub is running but could not answer -- retrying is safe); body=$($result.Body)"
+        return @{ ExitCode = 7 }
     }
     switch ($result.Status) {
         0 {
@@ -644,15 +748,19 @@ function Read-KeyHubEnv {
                 }
                 "keychain_unavailable" {
                     # v0.2.102: TEMPORARY -- a keychain op timed out / the hub's
-                    # keychain worker is stuck. Nothing to unlock: retry after
-                    # the hub's Retry-After. Same exit 6, distinct message.
-                    # Mirrors the .sh `keychain_unavailable)` arm.
-                    Write-Err "hub could not read the OS keychain for $Key (project $pid_): the keychain is temporarily unavailable (a keychain operation timed out) — retry in a few seconds."
-                    return @{ ExitCode = 6 }
+                    # keychain worker is stuck. Nothing to unlock: Read-KeyHub
+                    # retries ONCE after the hub's Retry-After, then exit 7 (the
+                    # retryable "store unavailable" code, distinct from 6 =
+                    # locked). Mirrors the .sh `keychain_unavailable)` arm.
+                    Write-Err "hub could not read the OS keychain for $Key (project $pid_): the keychain is temporarily unavailable (a keychain operation timed out) -- retry in a few seconds."
+                    $script:HubRetryWait = $script:HubRetryWaitMs
+                    return @{ ExitCode = 7 }
                 }
                 Default {
-                    Write-Err "hub returned status 503 (code $code503); body=$($result.Body)"
-                    return @{ ExitCode = 1 }
+                    # v0.2.102: any other 503 -- the hub is running but could
+                    # not answer. Retryable (exit 7), never a "not found".
+                    Write-Err "hub returned status 503 (code $code503; the hub is running but could not answer -- retrying is safe); body=$($result.Body)"
+                    return @{ ExitCode = 7 }
                 }
             }
         }
@@ -897,7 +1005,7 @@ function Read-Key {
             return 0
         }
         # Honest miss diagnostic: names ONLY the tiers this mode consulted.
-        Write-Err "key $Key unresolved after hub (tier 1) and the shared file store (tier 2, --shared-only; the projects/ leg and the project .env (tier 3) are not consulted in this mode)"
+        Write-Err ("key $Key unresolved after hub (tier 1) and the shared file store (tier 2, --shared-only; the projects/ leg and the project .env (tier 3) are not consulted in this mode)" + (Get-StoreUnavailableNote $tier1.ExitCode))
         return $tier1.ExitCode
     }
     $local = Get-LocalValue -ProjectArg $ProjectArg -Key $Key
@@ -905,8 +1013,16 @@ function Read-Key {
         [Console]::Out.Write($local.Value)
         return 0
     }
-    Write-Err "key $Key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)"
+    Write-Err ("key $Key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)" + (Get-StoreUnavailableNote $tier1.ExitCode))
     return $tier1.ExitCode
+}
+
+function Get-StoreUnavailableNote {
+    # Suffix for an all-miss line when tier 1 could not be ASKED (exit 7): the
+    # miss proves nothing. MUST MATCH _store_unavailable_note in the .sh.
+    param([int]$Code)
+    if ($Code -ne 7) { return "" }
+    return " -- but the hub could not be asked (secret store busy), so the key may well exist; retrying is safe"
 }
 
 function Read-Many {
@@ -922,17 +1038,24 @@ function Read-Many {
     # until a key's own tier-1 answer says otherwise.
     $resolved = Resolve-ProjectId -ArgValue $ProjectArg
     $hubRc = $resolved.ExitCode
+    if ($hubRc -eq 7 -and (Get-HubRequestTimeoutMs) -gt 0) {
+        # v0.2.102: the ONE retry (see Read-KeyHub).
+        $resolved = Resolve-ProjectId -ArgValue $ProjectArg
+        $hubRc = $resolved.ExitCode
+        if ($hubRc -eq 1) { $hubRc = 7 }
+    }
     $firstMiss = 0
     foreach ($key in $Keys) {
         $rc = $hubRc
         $value = $null
         if ($hubRc -eq 0) {
-            $tier1 = Read-KeyHubEnv -ProjectId $resolved.Value -Key $key
+            $tier1 = Read-KeyHubEnvRetrying -ProjectId $resolved.Value -Key $key
             $rc = $tier1.ExitCode
             $value = $tier1.Value
-            # The hub stopped answering (or the budget is spent): do not
-            # wait on it again for the remaining keys.
-            if ($rc -eq 1) { $hubRc = 1 }
+            # The hub stopped answering (or the budget is spent), or it is
+            # running but could not answer even after its one retry
+            # (v0.2.102: 7): do not wait on it again for the remaining keys.
+            if ($rc -eq 1 -or $rc -eq 7) { $hubRc = $rc }
         }
         if ($rc -ne 0) {
             $local = Get-LocalValue -ProjectArg $ProjectArg -Key $key
@@ -940,7 +1063,7 @@ function Read-Many {
                 $rc = 0
                 $value = $local.Value
             } else {
-                Write-Err "key $key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)"
+                Write-Err ("key $key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)" + (Get-StoreUnavailableNote $rc))
             }
         }
         if ($rc -eq 0 -and ("$value".Contains("`n") -or "$value".Contains("`r"))) {

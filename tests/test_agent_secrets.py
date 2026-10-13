@@ -278,7 +278,7 @@ def test_hub_404_key_paused_code_parses_to_secret_paused(monkeypatch):
         agent_secrets, "_get_with_401_retry", lambda *a, **kw: FakeResp()
     )
     monkeypatch.setattr(
-        agent_secrets, "_resolve_project_id", lambda p: "proj-1"
+        agent_secrets, "_resolve_project_id", lambda p, **_kw: "proj-1"
     )
     with pytest.raises(SecretPaused):
         agent_secrets._hub_get("paused_key", "proj-1")

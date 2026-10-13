@@ -1671,7 +1671,7 @@ pub fn get_with_context(
             }
             KeychainError::Other(e)
         })?,
-        None => read_keychain_value(ctx, &service, key)?,
+        None => read_keychain_value(ctx, &service, key, read_gen)?,
     };
     // v0.2.84 (review F2): fire the mid-read hook AFTER the value has been
     // read but BEFORE the memo store — the exact TOCTOU window. A test
@@ -1697,11 +1697,23 @@ pub fn get_with_context(
 
 /// The OS-keychain arm of `get_with_context`'s store switch: one bounded,
 /// paced, retried `get_password`. `Ok(None)` is a genuine key-not-present miss.
+///
+/// v0.2.102 (W6-AB, owner rule "never terminate something that is working,
+/// just slowly"): the caller waits at most `KEYCHAIN_OP_TIMEOUT` for the
+/// result, but the read itself keeps running on the worker. A Background read
+/// that completes AFTER its caller gave up stores its value in the value cache
+/// from the worker thread — tagged with the caller's PRE-read generation
+/// (`read_gen`, the F2 rule), so a write that raced it still invalidates it —
+/// and the client's one retry is answered from there instead of queueing a
+/// second slow read. Before, the late value was dropped with the result
+/// channel. Interactive reads are never value-cached (unchanged).
 fn read_keychain_value(
     ctx: CallContext,
     service: &str,
     key: &str,
+    read_gen: u64,
 ) -> Result<Option<String>, KeychainError> {
+    let keep_completed = ctx == CallContext::Background;
     // v0.2.76 (A4): own (service, key) → 'static + Send job → bounded-timeout
     // worker. keyring::Error is not Send-safe to carry across the channel
     // uniformly, so classify NoEntry INSIDE the job and return a plain
@@ -1712,7 +1724,14 @@ fn read_keychain_value(
         let service = service.to_string();
         let key = key.to_string();
         run_keychain_with_timeout_ctx(ctx, move || {
-            with_cross_process_pace(|| {
+            let read: Result<Option<String>, String> = with_cross_process_pace(|| {
+                // Test seam (W6-AB): a slow stand-in for the keychain call, so
+                // the late-completion path below is provable without an OS
+                // keychain. Inert unless a test installed one.
+                #[cfg(any(test, debug_assertions))]
+                if let Some(body) = for_tests::get_body_override() {
+                    return body(&service, &key);
+                }
                 // v0.2.72 (P9): build the entry INSIDE the closure. v0.3.0
                 // (WP-K): `KeychainEntry` = persistent connection on Linux.
                 match retry_with_backoff(|| KeychainEntry::new(&service, &key)?.get_password()) {
@@ -1720,7 +1739,16 @@ fn read_keychain_value(
                     Err(keyring::Error::NoEntry) => Ok(None),
                     Err(err) => Err(format!("keyring get: {}", err)),
                 }
-            })
+            });
+            // W6-AB: keep a completed value even when the caller already gave
+            // up (see the doc comment). The caller's own store after a timely
+            // answer is then a same-value overwrite.
+            if keep_completed {
+                if let Ok(Some(v)) = &read {
+                    value_cache_store(&service, &key, v.clone(), read_gen);
+                }
+            }
+            read
         })
         .map_err(|to| {
             // v0.2.102: tell the active request session the keychain was
@@ -2201,6 +2229,37 @@ pub mod for_tests {
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A stand-in for the OS-keychain `get_password` call inside
+    /// `read_keychain_value` (v0.2.102, W6-AB). Process-global (the call runs
+    /// on the keychain WORKER thread, so a thread-local could not reach it).
+    pub type GetBody = fn(&str, &str) -> Result<Option<String>, String>;
+
+    static GET_BODY_OVERRIDE: std::sync::Mutex<Option<GetBody>> = std::sync::Mutex::new(None);
+
+    pub(super) fn get_body_override() -> Option<GetBody> {
+        *GET_BODY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// RAII guard installing a [`GetBody`] stand-in; restores the previous
+    /// one on drop.
+    pub struct TestGetBodyGuard {
+        prev: Option<GetBody>,
+    }
+
+    impl TestGetBodyGuard {
+        pub fn new(body: GetBody) -> Self {
+            let mut slot = GET_BODY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
+            let prev = slot.replace(body);
+            Self { prev }
+        }
+    }
+
+    impl Drop for TestGetBodyGuard {
+        fn drop(&mut self) {
+            *GET_BODY_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) = self.prev;
+        }
+    }
 
     /// True when an error string positively identifies a keychain-op
     /// timeout / worker unavailability — the deterministic `Display`
@@ -3414,6 +3473,75 @@ mod tests {
             assert_eq!(probe_default_collection_locked(), Some(false));
         }
         assert_eq!(LOCK_PROBE_RUNS.load(Ordering::SeqCst) - base, 3);
+    }
+
+    /// v0.2.102 (W6-AB) — a SLOW keychain read is waited for, not dropped.
+    /// The caller's bounded wait (`KEYCHAIN_OP_TIMEOUT`) gives up on a read
+    /// that is still running; the read itself completes on the worker. Its
+    /// value must land in the hub's value cache so the client's ONE retry
+    /// (`agent_secrets._hub_get`, the shell/PS resolvers) is answered
+    /// without a second keychain round-trip. Red-first: before W6-AB the late
+    /// result was discarded with the dropped result channel and the retry had
+    /// to queue another slow read. Drives the REAL `get_with_context` →
+    /// `read_keychain_value` → worker path; only the keychain call itself is
+    /// replaced by a slow stand-in (no OS keychain is touched).
+    #[cfg(unix)]
+    #[test]
+    fn slow_background_read_lands_in_the_value_cache_after_its_caller_gave_up() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BODY_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn slow_body(_service: &str, _key: &str) -> Result<Option<String>, String> {
+            BODY_CALLS.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(Some("w6ab-synthetic-late-value".to_string()))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let _pace = TestPacePathGuard::new(dir.path().join("keyring.pace"));
+        let _probe = TestProbeGuard::new(Some(false));
+        let _ttl = TestValueCacheTtlGuard::new(std::time::Duration::from_secs(60));
+        let _body = for_tests::TestGetBodyGuard::new(slow_body);
+        let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(60));
+        let module = "w6ab-late-read-module";
+        let key = "W6AB_LATE_READ_KEY";
+        BODY_CALLS.store(0, Ordering::SeqCst);
+
+        let first = get_with_context(SecretScope::Global, module, key, CallContext::Background);
+        let err = first.expect_err("the caller must give up on a read slower than its wait");
+        assert!(is_keychain_unavailable_detail(&err.to_string()), "got: {err}");
+
+        // Let the read finish on the worker, then ask again: answered from the
+        // value cache, no second keychain call.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let second = get_with_context(SecretScope::Global, module, key, CallContext::Background)
+            .expect("the retry must be served the late value");
+        assert_eq!(second.as_deref(), Some("w6ab-synthetic-late-value"));
+        assert_eq!(BODY_CALLS.load(Ordering::SeqCst), 1, "the retry must not re-read the keychain");
+        drop(_tg);
+        crate::secrets_worker::tests::wait_worker_recovered();
+    }
+
+    /// The leave-alone case: an INTERACTIVE read (a user click) is never
+    /// value-cached, late or not — the cache is for Background reads only.
+    #[cfg(unix)]
+    #[test]
+    fn slow_interactive_read_is_not_kept_in_the_value_cache() {
+        fn slow_body(_service: &str, _key: &str) -> Result<Option<String>, String> {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(Some("w6ab-synthetic-interactive".to_string()))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let _pace = TestPacePathGuard::new(dir.path().join("keyring.pace"));
+        let _ttl = TestValueCacheTtlGuard::new(std::time::Duration::from_secs(60));
+        let _body = for_tests::TestGetBodyGuard::new(slow_body);
+        let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(40));
+        let module = "w6ab-interactive-module";
+        let key = "W6AB_INTERACTIVE_KEY";
+        assert!(get_with_context(SecretScope::Global, module, key, CallContext::Interactive).is_err());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let service = SecretScope::Global.service_name(module);
+        assert!(value_cache_lookup(&service, key).is_none());
+        drop(_tg);
+        crate::secrets_worker::tests::wait_worker_recovered();
     }
 
     /// v0.2.102 — a mock read failing as UNAVAILABILITY flags the active

@@ -248,13 +248,47 @@ _hub_stale_env_fallback_token() {
 #   3  confirmed PAUSED (v0.2.101) — a 404 whose body code is `key_paused`:
 #      the key EXISTS on PROJECT but its active flag is off. NOT an
 #      absence — `vct set` would shadow a deliberate pause (see die_miss).
-#   4  hub reachable but its OS keychain is TEMPORARILY unavailable
+#   4  hub reachable but it could not check the keychain RIGHT NOW
 #      (v0.2.102: a 503 whose body code is `keychain_unavailable` — a keychain
-#      op timed out). The KEY STATE IS UNKNOWN; retry shortly. NOT an
-#      absence — `vct set` could fork a divergent copy (see die_miss).
-#   1  soft-fail — no curl / no hub / no token / any OTHER non-200. Treat
-#      as "hub couldn't answer"; caller falls back to the file-store hint.
-# Bounded (--max-time 3), localhost-only, token off argv (`--header @-`).
+#      op timed out; W6-AB: or the hub accepted the connection and did not
+#      answer in time, or answered any other 5xx). The KEY STATE IS UNKNOWN;
+#      retry shortly. NOT an absence — `vct set` could fork a divergent copy
+#      (see die_miss).
+#   1  soft-fail — no curl / no hub (connection refused) / no token / any
+#      OTHER non-200. Treat as "hub couldn't answer"; caller falls back to
+#      the file-store hint.
+# Bounded (connect 2 s, read _VCT_HUB_PROBE_READ_TIMEOUT_S), localhost-only,
+# token off argv (`--header @-`).
+#
+# v0.2.102 (W6-AB): the read cap was 3 s. The hub answers this probe from the
+# OS keychain, whose own per-op wait is 10 s, so a busy-but-working hub was
+# cut off and the miss printed `vct set` — the false remedy for a key that is
+# in the keychain. MUST MATCH `vco_lib/project_config.py::SECRET_READ_TIMEOUT_SECONDS`
+# and `_SECRET_READ_TIMEOUT_S` in templates/scripts/vct_secrets_resolve.sh
+# (pinned by tests/test_secret_read_timeout_parity.py). A refused connection
+# (no hub) still fails at once: only the connect phase can refuse.
+_VCT_HUB_PROBE_READ_TIMEOUT_S=30
+_VCT_HUB_PROBE_CONNECT_TIMEOUT_S=2
+
+# One probe request: echoes the curl output (body + "\n<status>"); returns 0,
+# 4 when the hub was reached but did not answer in time (curl 28 timeout, 52
+# empty reply, 55/56 send/recv failure after connect), 1 on any other failure
+# (refused, no curl).
+_hub_probe_curl() {
+    local url="$1" token="$2" out crc=0
+    out=$(curl --silent --show-error \
+                --connect-timeout "$_VCT_HUB_PROBE_CONNECT_TIMEOUT_S" \
+                --max-time "$_VCT_HUB_PROBE_READ_TIMEOUT_S" \
+                --header @- --output - --write-out '\n%{http_code}' "$url" \
+                <<<"Authorization: Bearer ${token}" 2>/dev/null) || crc=$?
+    if [ "$crc" -ne 0 ]; then
+        case "$crc" in
+            28|52|55|56) return 4 ;;
+            *) return 1 ;;
+        esac
+    fi
+    printf '%s' "$out"
+}
 hub_has_key() {
     local project="$1" key="$2"
     command -v curl >/dev/null 2>&1 || return 1
@@ -265,10 +299,9 @@ hub_has_key() {
     token=$(_hub_token "$project")
     [ -n "$token" ] || return 1
     local url="http://127.0.0.1:${port}/api/v1/projects/${project}/env?key=${key}"
-    local body status
-    body=$(curl --silent --show-error --max-time 3 \
-                --header @- --output - --write-out '\n%{http_code}' "$url" \
-                <<<"Authorization: Bearer ${token}" 2>/dev/null) || return 1
+    local body status prc=0
+    body=$(_hub_probe_curl "$url" "$token") || prc=$?
+    [ "$prc" -eq 0 ] || return "$prc"
     status="${body##*$'\n'}"
     body="${body%$'\n'*}"
     # v0.2.91 (WP-D item 4): before classifying a refusal, give the ONE
@@ -280,9 +313,7 @@ hub_has_key() {
         403|401)
             local fallback retry retry_status
             if fallback=$(_hub_stale_env_fallback_token "$project"); then
-                if retry=$(curl --silent --show-error --max-time 3 \
-                                --header @- --output - --write-out '\n%{http_code}' "$url" \
-                                <<<"Authorization: Bearer ${fallback}" 2>/dev/null); then
+                if retry=$(_hub_probe_curl "$url" "$fallback"); then
                     retry_status="${retry##*$'\n'}"
                     # ADOPT only an answer that PROVES the fallback
                     # credential was accepted: 2xx, or 404 (the hub answers
@@ -329,6 +360,11 @@ hub_has_key() {
             *'"code":"keychain_unavailable"'*) return 4 ;;
         esac
     fi
+    # v0.2.102 (W6-AB): any other 5xx — the hub is running but could not
+    # answer; the key state is UNKNOWN, never "absent".
+    case "$status" in
+        5??) return 4 ;;
+    esac
     [ "$status" = "200" ] || return 1
     # A 200 with an empty/absent value for the key is NOT a hit.
     case "$body" in
@@ -399,7 +435,7 @@ Do NOT 'vct set' it: a file-store copy would shadow the deliberate pause and ser
     fi
     if [ "$probe" -eq 4 ]; then
         die_code "$code" "$verb: not in the file store, and the hub could not check the launcher keychain right now \
-(its OS keychain is temporarily unavailable — a keychain operation timed out). The keychain MAY hold \
+(secret store busy: its OS keychain is temporarily unavailable or the hub did not answer in time). The keychain MAY hold \
 project=$project key=$key — retry in a few seconds, or resolve it via \
 '.claude/scripts/vct_secrets_resolve.sh <project_folder> $key' (or vco_lib.agent_secrets.get('$key')). \
 Do NOT 'vct set' it blindly — that risks a second, divergent copy on disk."

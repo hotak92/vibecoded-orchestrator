@@ -47,8 +47,14 @@
 #                   6=keychain locked/unreadable (hub 503 keychain_locked
 #                   or keychain_error — the OS keychain is locked or a
 #                   per-key read failed; unlock the login keychain or open
-#                   the launcher — or v0.2.102 keychain_unavailable — a
-#                   keychain op timed out; retry in a few seconds).
+#                   the launcher),
+#                   7=secret store UNAVAILABLE — retryable (v0.2.102): the
+#                   hub is running but did not answer in time (read
+#                   timeout, dropped connection, a 5xx) or its keychain
+#                   is temporarily unavailable (hub 503
+#                   keychain_unavailable). The key may well exist — retry;
+#                   never add it again. Tier 1 was retried ONCE before
+#                   this code is returned.
 #                   Non-zero codes mean the key ALSO missed the file
 #                   store and the project `.env`.
 #
@@ -89,10 +95,18 @@
 # Time budget (v0.2.97): VCT_RESOLVE_MAX_TIME=<seconds>, up to three
 #   decimals (e.g. `1` or `0.5`), bounds the TOTAL time this invocation
 #   spends on the hub — connect + read, across every request it makes. Each
-#   request is capped at what is left (and at the usual 5 s); once nothing
-#   is left the hub is treated as unreachable and tiers 2 and 3 answer.
-#   Unset: every request keeps its own 5 s cap, as before. A value that is
-#   not a number is ignored with one stderr line.
+#   request is capped at what is left (and at the usual per-request cap);
+#   once nothing is left the hub is treated as unreachable and tiers 2 and 3
+#   answer. Unset: every request keeps its own cap. A value that is not a
+#   number is ignored with one stderr line.
+#
+# Per-request timeouts (v0.2.102, W6-AB): connect 2 s (a REFUSED connection
+#   — no hub running — fails at once and falls through to tiers 2/3), read
+#   30 s (_SECRET_READ_TIMEOUT_S). The hub answers a secret read from the OS
+#   keychain, whose own per-op wait is 10 s, so a slow-but-working hub can
+#   take well over the former 5 s cap; cutting it off turned a busy keychain
+#   into a false "not found". A hub that does not answer in time (or answers
+#   5xx / 503 keychain_unavailable) is asked ONCE more, then exit 7.
 #
 # Hub discovery:
 #   1. $VCT_HUB_PORT env var (set by tests / dev launchers)
@@ -163,6 +177,11 @@ set -euo pipefail
 
 err() { printf '[vct-secrets-resolve] %s\n' "$*" >&2; }
 
+# v0.2.102 (W6-AB): the hub accepted the connection but did not answer in
+# time — it is RUNNING and busy (typically a slow OS keychain). Never a
+# "not found": the key may well be stored.
+_HUB_NOT_RESPONDING_MSG="hub did not answer in time (it is running but busy — typically a slow OS keychain); the key may well be stored — retrying is safe."
+
 # ── Time budget (VCT_RESOLVE_MAX_TIME) ──────────────────────────────────
 # Milliseconds since the epoch. $EPOCHREALTIME (bash 5+; its decimal mark
 # follows the locale) → GNU `date +%s%3N` → whole seconds (macOS's bash 3.2
@@ -196,20 +215,42 @@ if [[ -n "${VCT_RESOLVE_MAX_TIME:-}" ]]; then
     fi
 fi
 
-# The --max-time for the next hub request: 5 s, or what is left of the
-# budget when that is less. Returns 1 (nothing printed) when the budget is
-# spent — the caller treats that exactly like an unreachable hub.
+# v0.2.102 (W6-AB) per-request caps, seconds. MUST MATCH
+# `vco_lib/project_config.py::SECRET_READ_TIMEOUT_SECONDS` /
+# `_CONNECT_TIMEOUT_SECONDS` and `$script:SecretReadTimeoutMs` in
+# vct_secrets_resolve.ps1 (pinned by tests/test_secret_read_timeout_parity.py).
+_SECRET_READ_TIMEOUT_S=30
+_HUB_CONNECT_TIMEOUT_S=2
+# Wait before the ONE retry after a 503 keychain_unavailable: the hub's own
+# Retry-After (`KEYCHAIN_UNAVAILABLE_RETRY_AFTER_SECS` in modules_api.rs).
+_HUB_RETRY_WAIT_S=2
+
+# The --max-time for the next hub request: _SECRET_READ_TIMEOUT_S, or what
+# is left of the budget when that is less. Returns 1 (nothing printed) when
+# the budget is spent — the caller treats that exactly like an unreachable
+# hub.
 _hub_request_max_time() {
     if [[ -z "$_RESOLVE_DEADLINE_MS" ]]; then
-        printf '5'
+        printf '%s' "$_SECRET_READ_TIMEOUT_S"
         return 0
     fi
     local left=$(( _RESOLVE_DEADLINE_MS - $(_now_ms) ))
     (( left > 0 )) || return 1
-    if (( left >= 5000 )); then
-        printf '5'
+    if (( left >= _SECRET_READ_TIMEOUT_S * 1000 )); then
+        printf '%s' "$_SECRET_READ_TIMEOUT_S"
     else
         printf '%d.%03d' $(( left / 1000 )) $(( left % 1000 ))
+    fi
+}
+
+# The --connect-timeout for a request whose --max-time is $1: the 2 s
+# connect cap, or $1 when that is smaller (a nearly-spent budget).
+_hub_connect_timeout() {
+    local whole="${1%%.*}"
+    if (( 10#$whole >= _HUB_CONNECT_TIMEOUT_S )); then
+        printf '%s' "$_HUB_CONNECT_TIMEOUT_S"
+    else
+        printf '%s' "$1"
     fi
 }
 
@@ -385,21 +426,28 @@ hub_stale_env_fallback_token() {
 # /proc/<pid>/cmdline.
 _hub_curl() {
     # $1 = full url, $2 = bearer token.
-    # echoes "<status>\t<body>"; returns 1 when curl itself fails.
+    # echoes "<status>\t<body>"; returns 1 when curl itself fails because
+    # nothing answered the connection (refused / budget spent), 3 when the
+    # hub was reached but did not answer in time (v0.2.102: curl 28
+    # timeout, 52 empty reply, 55/56 send/recv failure after connect).
     #
     # `--header @-` reads the header line from stdin. We feed exactly
     # one line: "Authorization: Bearer <token>". This keeps the token
     # off argv. The `<<<` here-string gives us a single-line stdin
     # without an extra subshell.
     local url="$1" token="$2"
-    local body status max_time
+    local body status max_time crc=0
     max_time=$(_hub_request_max_time) || return 1
-    if ! body=$(curl --silent --show-error --max-time "$max_time" \
-                     --connect-timeout "$max_time" \
-                     --header @- \
-                     --output - --write-out '\n%{http_code}' "$url" \
-                     <<<"Authorization: Bearer ${token}" 2>&1); then
-        return 1
+    body=$(curl --silent --show-error --max-time "$max_time" \
+                --connect-timeout "$(_hub_connect_timeout "$max_time")" \
+                --header @- \
+                --output - --write-out '\n%{http_code}' "$url" \
+                <<<"Authorization: Bearer ${token}" 2>&1) || crc=$?
+    if (( crc != 0 )); then
+        case "$crc" in
+            28|52|55|56) return 3 ;;
+            *) return 1 ;;
+        esac
     fi
     # Last line is the status; everything before is the body.
     status="${body##*$'\n'}"
@@ -410,7 +458,8 @@ _hub_curl() {
 hub_get() {
     # $1 = path-with-query (no leading slash)
     # echoes "<status>\t<body>" on stdout; exit non-zero only when curl
-    # itself fails (e.g. connection refused, not 4xx). Returns exit 2
+    # itself fails (1 = connection refused / budget spent, 3 = the hub did
+    # not answer in time — v0.2.102), not on 4xx. Returns exit 2
     # specifically when no token file exists (so caller can map it
     # to "hub unreachable" without trying the request).
     local path="$1"
@@ -426,7 +475,7 @@ hub_get() {
     fi
     local url="http://127.0.0.1:${port}/api/v1/${path}"
     local result status
-    result=$(_hub_curl "$url" "$token") || return 1
+    result=$(_hub_curl "$url" "$token") || return $?
     status="${result%%$'\t'*}"
     # v0.2.91 (WP-D item 4): a PROVABLE credential refusal is the ONLY
     # trigger for the one-shot on-disk-token retry. Every other status —
@@ -565,6 +614,10 @@ resolve_project_id() {
         err "hub.token missing; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
     fi
+    if [[ $rc -eq 3 ]]; then
+        err "$_HUB_NOT_RESPONDING_MSG"
+        return 7
+    fi
     if [[ $rc -ne 0 ]]; then
         err "hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
@@ -598,6 +651,11 @@ resolve_project_id() {
             err "hub rejected path query: $body"
             return 2
             ;;
+        5??)
+            # v0.2.102: the hub is running but failed to answer — retryable.
+            err "hub returned status $status for by-path lookup (the hub is running but could not answer — retrying is safe); body=$body"
+            return 7
+            ;;
         *)
             err "hub returned status $status for by-path lookup; body=$body"
             return 1
@@ -626,17 +684,58 @@ read_key_hub() {
     # 2=project not registered, 3=key_not_active, 4=key missing from a
     # 200 body) — the chain caller remembers this code and reuses it as
     # the final exit when tiers 2 and 3 also miss.
+    #
+    # v0.2.102 (W6-AB): code 7 (the hub is running but did not answer in
+    # time / answered 5xx / its keychain is temporarily unavailable) gets
+    # exactly ONE retry of the whole tier-1 attempt — a slow keychain op
+    # keeps running on the hub and its value lands in the hub's cache, so
+    # the retry is usually answered at once. MUST MATCH
+    # `agent_secrets._hub_get` and `Read-KeyHub` in the .ps1.
+    local pid_arg="$1" key="$2" rc
+    _read_key_hub_attempt "$pid_arg" "$key" && return 0
+    rc=$?
+    [[ $rc -eq 7 ]] || return $rc
+    # No budget left for a retry: report what the first attempt proved.
+    _hub_request_max_time >/dev/null || return 7
+    sleep "${_HUB_RETRY_WAIT:-0}"
+    _read_key_hub_attempt "$pid_arg" "$key" && return 0
+    rc=$?
+    # A retry that could not even connect (the budget ran out, or the hub
+    # went away between attempts) does not erase what the first attempt
+    # proved: a running hub that could not answer yet.
+    [[ $rc -eq 1 ]] && rc=7
+    return $rc
+}
+
+_read_key_hub_attempt() {
     local pid_arg="$1" key="$2"
     local pid rc
+    _HUB_RETRY_WAIT=0
     set +e
     pid=$(resolve_project_id "$pid_arg")
     rc=$?
     set -e
     if [[ $rc -ne 0 ]]; then
-        # resolve_project_id already printed the diagnostic (1 or 2).
+        # resolve_project_id already printed the diagnostic (1, 2 or 7).
         return $rc
     fi
     read_key_hub_env "$pid" "$key"
+}
+
+# read_key_hub_env with read_key_hub's ONE retry on code 7 (resolve-many's
+# per-key tier 1). MUST MATCH read_key_hub's retry rule.
+read_key_hub_env_retrying() {
+    local rc
+    _HUB_RETRY_WAIT=0
+    read_key_hub_env "$1" "$2" && return 0
+    rc=$?
+    [[ $rc -eq 7 ]] || return $rc
+    _hub_request_max_time >/dev/null || return 7
+    sleep "${_HUB_RETRY_WAIT:-0}"
+    read_key_hub_env "$1" "$2" && return 0
+    rc=$?
+    [[ $rc -eq 1 ]] && rc=7
+    return $rc
 }
 
 # Tier 1 for an ALREADY-RESOLVED project id (resolve-many looks the project
@@ -653,6 +752,10 @@ read_key_hub_env() {
     if [[ $rc -eq 2 ]]; then
         err "hub.token missing; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
+    fi
+    if [[ $rc -eq 3 ]]; then
+        err "$_HUB_NOT_RESPONDING_MSG"
+        return 7
     fi
     if [[ $rc -ne 0 ]]; then
         err "hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
@@ -751,21 +854,30 @@ read_key_hub_env() {
                     ;;
                 keychain_unavailable)
                     # v0.2.102: TEMPORARY — a keychain op timed out / the hub's
-                    # keychain worker is stuck. Nothing to unlock: retry after
-                    # the hub's Retry-After. Same exit 6 (keychain unreadable
-                    # family, exit-code contract unchanged), distinct message.
+                    # keychain worker is stuck. Nothing to unlock: the caller
+                    # (read_key_hub) retries ONCE after the hub's Retry-After,
+                    # then exit 7 — the retryable "store unavailable" code,
+                    # distinct from exit 6 (locked/unreadable: unlock it).
                     err "hub could not read the OS keychain for $key (project $pid): the keychain is temporarily unavailable (a keychain operation timed out) — retry in a few seconds."
-                    return 6
+                    _HUB_RETRY_WAIT=$_HUB_RETRY_WAIT_S
+                    return 7
                     ;;
                 *)
-                    err "hub returned status 503 (code $code503); body=$body"
-                    return 1
+                    # v0.2.102: any other 503 — the hub is running but could
+                    # not answer. Retryable (exit 7), never a "not found".
+                    err "hub returned status 503 (code $code503; the hub is running but could not answer — retrying is safe); body=$body"
+                    return 7
                     ;;
             esac
             ;;
         400)
             err "hub rejected request: $body"
             return 4
+            ;;
+        5??)
+            # v0.2.102: the hub is running but failed to answer — retryable.
+            err "hub returned status $status (the hub is running but could not answer — retrying is safe); body=$body"
+            return 7
             ;;
         *)
             err "hub returned status $status; body=$body"
@@ -976,8 +1088,15 @@ read_key() {
         printf '%s' "$val"
         return 0
     fi
-    err "key $key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)"
+    err "key $key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)$(_store_unavailable_note "$tier1_rc")"
     return $tier1_rc
+}
+
+# Suffix for an all-miss line when tier 1 could not be ASKED (exit 7): the
+# miss proves nothing, so the line must not read as "the key is absent".
+_store_unavailable_note() {
+    [[ "$1" -eq 7 ]] || return 0
+    printf '%s' " — but the hub could not be asked (secret store busy), so the key may well exist; retrying is safe"
 }
 
 # ── Shared-only mode (v0.2.98) ──────────────────────────────────────────
@@ -1030,7 +1149,7 @@ read_key_shared_only() {
         printf '%s' "$val"
         return 0
     fi
-    err "key $key unresolved after hub (tier 1) and the shared file store (tier 2, --shared-only; the projects/ leg and the project .env (tier 3) are not consulted in this mode)"
+    err "key $key unresolved after hub (tier 1) and the shared file store (tier 2, --shared-only; the projects/ leg and the project .env (tier 3) are not consulted in this mode)$(_store_unavailable_note "$tier1_rc")"
     return $tier1_rc
 }
 
@@ -1052,6 +1171,12 @@ read_many() {
     set +e
     pid=$(resolve_project_id "$pid_arg")
     hub_rc=$?
+    if [[ $hub_rc -eq 7 ]] && _hub_request_max_time >/dev/null; then
+        # v0.2.102: the ONE retry (see read_key_hub).
+        pid=$(resolve_project_id "$pid_arg")
+        hub_rc=$?
+        [[ $hub_rc -eq 1 ]] && hub_rc=7
+    fi
     set -e
     local first_miss=0 val rc
     for key in "$@"; do
@@ -1059,12 +1184,13 @@ read_many() {
         val=""
         if [[ $hub_rc -eq 0 ]]; then
             set +e
-            val=$(read_key_hub_env "$pid" "$key")
+            val=$(read_key_hub_env_retrying "$pid" "$key")
             rc=$?
             set -e
-            # The hub stopped answering (or the budget is spent): do not
-            # wait on it again for the remaining keys.
-            [[ $rc -eq 1 ]] && hub_rc=1
+            # The hub stopped answering (or the budget is spent), or it is
+            # running but could not answer even after its one retry
+            # (v0.2.102: 7): do not wait on it again for the remaining keys.
+            [[ $rc -eq 1 || $rc -eq 7 ]] && hub_rc=$rc
         fi
         if [[ $rc -ne 0 ]]; then
             set +e
@@ -1074,7 +1200,7 @@ read_many() {
             if [[ $rc_local -eq 0 ]]; then
                 rc=0
             else
-                err "key $key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)"
+                err "key $key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)$(_store_unavailable_note "$rc")"
             fi
         fi
         if [[ $rc -eq 0 && ( "$val" == *$'\n'* || "$val" == *$'\r'* ) ]]; then
@@ -1115,8 +1241,10 @@ Exit codes (non-zero = key ALSO missed the file store + project .env):
   3  key not active for this project
   4  key not found in hub response
   5  forbidden (hub refused the token on /env; scoped token required)
-  6  keychain locked/unreadable (hub 503; unlock login keychain / open launcher),
-     or temporarily unavailable (hub 503 keychain_unavailable; retry shortly)
+  6  keychain locked/unreadable (hub 503; unlock login keychain / open launcher)
+  7  secret store unavailable, retryable (the hub is running but did not answer
+     in time, answered 5xx, or its keychain is temporarily unavailable; the
+     key may exist — retry, do not add it again)
 EOF
         exit 64
     fi

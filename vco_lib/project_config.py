@@ -134,6 +134,22 @@ HUB_DISCOVERY_TTL_SECONDS: float = 5.0
 _CONNECT_TIMEOUT_SECONDS: float = 2.0
 _READ_TIMEOUT_SECONDS: float = 5.0
 
+#: v0.2.102 (W6-AB): READ timeout for a SECRET read (``/env`` and the
+#: ``by-path`` lookup that precedes it). The hub answers a secret read from
+#: the OS keychain through its keychain worker, whose own per-operation wait
+#: is ``KEYCHAIN_OP_TIMEOUT`` = 10 s (``vct-launcher-core/src/secrets_worker.rs``)
+#: and which runs the request's lock probe plus one read per bucket that
+#: declares the key — so a hub that is slow but WORKING can legitimately take
+#: well over 10 s. The old 5 s cut such a hub off mid-answer and the miss
+#: was then reported as "no key found" (2026-10-13 incident). 30 s covers the
+#: probe + two worst-case 10 s keychain waits with margin; a refused
+#: connection (no hub running) still fails in milliseconds, because the
+#: CONNECT timeout is unchanged. Config reads keep :data:`_READ_TIMEOUT_SECONDS`.
+#: One home for this value in Python; the shell (``vct_secrets_resolve.sh``)
+#: and PowerShell (``vct_secrets_resolve.ps1``) resolvers hold the same
+#: number — MUST MATCH ``VCT_SECRET_READ_TIMEOUT_S`` / ``$SecretReadTimeoutSec``.
+SECRET_READ_TIMEOUT_SECONDS: float = 30.0
+
 
 # ─── Exception hierarchy ────────────────────────────────────────────────
 
@@ -162,6 +178,67 @@ class HubUnreachable(ResolverError):
     launcher restart), and unexpected non-2xx/4xx/5xx statuses.
     Callers typically degrade to env-var fallback on this exception.
     """
+
+
+class HubNotResponding(HubUnreachable):
+    """The hub was reached but did not answer in time (v0.2.102, W6-AB).
+
+    A read timeout, a connect timeout (the listener is there but not
+    accepting) or a connection dropped after it was established — the hub
+    process exists and is busy, typically waiting on a slow OS keychain.
+    Distinct from a REFUSED connection (no hub running), which stays a plain
+    :class:`HubUnreachable`. A subclass of :class:`HubUnreachable` so every
+    existing ``except HubUnreachable`` caller (the config resolvers' env
+    fallback) behaves exactly as before; the secrets resolver uses the
+    distinction to report "store unavailable — retry" instead of "not found".
+    """
+
+
+def _is_connection_refused(exc: BaseException) -> bool:
+    """Did ``exc`` (a ``requests`` transport error) fail because nothing is
+    LISTENING — a refused connection — as opposed to a hub that accepted the
+    connection and then did not answer? Walks the cause/context chain for a
+    :class:`ConnectionRefusedError`; falls back to the message text urllib3
+    builds for a refused ``NewConnectionError`` (``[Errno 111]`` / ``[WinError
+    10061]`` / "Connection refused"), since urllib3 wraps the OSError in its
+    own exception types. Conservative: anything not positively a refusal is
+    "not responding"."""
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ConnectionRefusedError):
+            return True
+        for arg in getattr(cur, "args", ()):
+            if isinstance(arg, ConnectionRefusedError):
+                return True
+            if isinstance(arg, BaseException) and _is_connection_refused_text(str(arg)):
+                return True
+        if _is_connection_refused_text(str(cur)):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _is_connection_refused_text(text: str) -> bool:
+    low = text.lower()
+    return (
+        "connection refused" in low
+        or "errno 111" in low
+        or "winerror 10061" in low
+        or "actively refused" in low
+    )
+
+
+def _transport_error(exc: requests.RequestException, what: str) -> HubUnreachable:
+    """Map a ``requests`` transport failure to the resolver taxonomy: a
+    refused connection (no hub) → :class:`HubUnreachable`; a timeout or a
+    connection dropped after connect (a busy hub) → :class:`HubNotResponding`."""
+    if isinstance(exc, requests.Timeout):
+        return HubNotResponding(f"{what}: {exc}")
+    if isinstance(exc, requests.ConnectionError) and not _is_connection_refused(exc):
+        return HubNotResponding(f"{what}: {exc}")
+    return HubUnreachable(f"{what}: {exc}")
 
 
 class Unauthorized(ResolverError):
@@ -909,8 +986,15 @@ def _get_with_401_retry(
     *,
     params: dict | None = None,
     project_id: str | None = None,
+    read_timeout: float | None = None,
 ) -> requests.Response:
     """GET a hub URL with one-shot 401 retry-with-cache-invalidation.
+
+    ``read_timeout`` overrides :data:`_READ_TIMEOUT_SECONDS` for this call —
+    the secrets resolver passes :data:`SECRET_READ_TIMEOUT_SECONDS`
+    (v0.2.102, W6-AB). A transport failure raises :class:`HubNotResponding`
+    when the hub was reached but did not answer in time, and a plain
+    :class:`HubUnreachable` when the connection was refused.
 
     ``url_builder`` is a closure that takes ``(port, token)`` and returns
     the full URL. The closure pattern is needed because the URL itself
@@ -957,6 +1041,10 @@ def _get_with_401_retry(
     text is byte-identical to pre-v0.2.91 on every one of those paths.
     ``VCT_HUB_TOKEN_STRICT=1`` disables all of it.
     """
+    timeout = (
+        _CONNECT_TIMEOUT_SECONDS,
+        _READ_TIMEOUT_SECONDS if read_timeout is None else read_timeout,
+    )
     port, token = _discover_hub()
     url = url_builder(port, token)
     bearer = _project_token(project_id, token) if project_id else token
@@ -966,10 +1054,10 @@ def _get_with_401_retry(
             url,
             params=params,
             headers=headers,
-            timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+            timeout=timeout,
         )
     except requests.RequestException as exc:
-        raise HubUnreachable(f"hub GET failed: {exc}") from exc
+        raise _transport_error(exc, "hub GET failed") from exc
 
     if resp.status_code == 403:
         # Never retried before v0.2.91 (a 403 is an authorization
@@ -985,7 +1073,7 @@ def _get_with_401_retry(
                 url,
                 params=params,
                 headers={"Authorization": f"Bearer {fallback}"},
-                timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+                timeout=timeout,
             )
         except requests.RequestException:
             # The fallback attempt could not complete — keep today's
@@ -1022,10 +1110,10 @@ def _get_with_401_retry(
             url,
             params=params,
             headers=headers,
-            timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+            timeout=timeout,
         )
     except requests.RequestException as exc:
-        raise HubUnreachable(f"hub GET failed on retry: {exc}") from exc
+        raise _transport_error(exc, "hub GET failed on retry") from exc
     if fallback is None:
         # No credential swap happened — this is the pre-v0.2.91 cache
         # invalidation retry, whose response is returned as it always was.
@@ -1137,7 +1225,7 @@ def _looks_like_path(value: str) -> bool:
     return False
 
 
-def _resolve_project_id(project_arg: str) -> str:
+def _resolve_project_id(project_arg: str, *, read_timeout: float | None = None) -> str:
     """Resolve the project's id for the resolver argument.
 
     If ``project_arg`` looks like a UUID/id, return it verbatim. If it
@@ -1152,6 +1240,7 @@ def _resolve_project_id(project_arg: str) -> str:
     resp = _get_with_401_retry(
         lambda port, _token: f"http://127.0.0.1:{port}/api/v1/projects/by-path",
         params={"path": project_arg},
+        read_timeout=read_timeout,
     )
 
     if resp.status_code == 200:
@@ -1723,8 +1812,10 @@ __all__ = [
     "FieldNotFound",
     "Forbidden",
     "HUB_DISCOVERY_TTL_SECONDS",
+    "HubNotResponding",
     "HubUnreachable",
     "ProjectConfig",
+    "SECRET_READ_TIMEOUT_SECONDS",
     "ProjectNotFound",
     "RESOLVER_PROTOCOL_VERSION",
     "ResolverError",

@@ -187,7 +187,7 @@ from .routing import (
     fallback_route,
     route as route_model,
 )
-from .secrets import VendorKeyResolver
+from .secrets import TRANSIENT_RETRY_S, VendorKeyResolver
 from .source_identity import source_sha as _package_source_sha
 from .usage_windows import (
     UsageWindows,
@@ -2831,8 +2831,16 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         key_result = await gateway.keys.aresolve(vendor)
         if not key_result.key:
             log_local(503, "vendor_key_unavailable")
+            # v0.2.102 (W6-AB): a TRANSIENT miss (the secret store was busy —
+            # keychain or hub — not a missing key) carries Retry-After, so the
+            # client's own retry (Anthropic SDK / Claude Code honour it on a
+            # 503) lands once the gateway has asked the store again.
             return _json_error(
                 503, "api_error", key_result.problem or "no vendor key available",
+                headers=(
+                    {"Retry-After": str(TRANSIENT_RETRY_S)}
+                    if key_result.transient else None
+                ),
             )
         headers[vendor.auth_header] = f"{vendor.auth_scheme}{key_result.key}"
         # Hand the vendor back its OWN ids: we rewrote them on the way out.

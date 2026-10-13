@@ -68,11 +68,11 @@ class _FakeResponse:
 def _stub_hub_http(monkeypatch, status_code: int, body: dict):
     """Make the REAL ``_hub_get`` run its status dispatch against a canned
     HTTP response, with project-id resolution short-circuited."""
-    monkeypatch.setattr(agent_secrets, "_resolve_project_id", lambda arg: "pid-x")
+    monkeypatch.setattr(agent_secrets, "_resolve_project_id", lambda arg, **_kw: "pid-x")
     monkeypatch.setattr(
         agent_secrets,
         "_get_with_401_retry",
-        lambda url_builder, params=None, project_id=None: _FakeResponse(
+        lambda url_builder, params=None, project_id=None, **_kw: _FakeResponse(
             status_code, body
         ),
     )
