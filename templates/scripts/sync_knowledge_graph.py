@@ -1470,6 +1470,21 @@ def _split_tags_string(raw: str) -> List[str]:
     return tags
 
 
+# v0.2.102 W6-Y follow-up 2: the REQUIRED frontmatter fields, as ONE code
+# definition beside the canonical-dialect shape _normalise_frontmatter's
+# docstring documents. This is the same six-field set docs/CONFIGURATION.md
+# names as the required fields ("title, type, tags, created, updated,
+# status") and the canonical dialect that docstring documents — promoted
+# from prose to
+# code so consumers (maintain_knowledge_graph's missing-field report)
+# import it instead of re-listing it. ``valid_from`` / ``valid_until`` are
+# deliberately absent: they are optional point-in-time fields (docs/
+# features/04-knowledge-and-code-graph.md "Optional frontmatter fields").
+REQUIRED_FRONTMATTER_FIELDS: tuple = (
+    "title", "type", "tags", "created", "updated", "status",
+)
+
+
 def _normalise_frontmatter(fm: Any, file_label: Optional[str] = None) -> Any:
     """Normalise parsed frontmatter so every consumer sees ONE shape.
 

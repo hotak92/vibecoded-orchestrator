@@ -891,7 +891,7 @@ Every headless `claude -p` call made by the summary generators (KG and code) sta
 
 The code generator exits **1** when Weaviate is unreachable or a collection scan fails (the failing collection is named in its last log line, and that collection's existing summaries are kept, never pruned against an empty scan); otherwise **0**, including when no backend is available. Each collection is read with only the properties its own schema declares, so a property only functions carry (`n_callers`) no longer makes the class scan fail.
 
-A separate `PreToolUse` hook validates frontmatter on every write to `knowledge/**/*.md` and blocks writes missing required fields (`title`, `type`, `tags`, `created`, `updated`, `status`). The summary generator depends on these.
+The summary generator depends on the required frontmatter fields (`title`, `type`, `tags`, `created`, `updated`, `status`; one list, `REQUIRED_FRONTMATTER_FIELDS` in `sync_knowledge_graph.py`). Today nothing blocks a write that lacks them: `maintain_knowledge_graph.py --check` reports such files. A hook that validates frontmatter on every write to `knowledge/**/*.md` (Write, Edit and shell writes) is scheduled for v0.2.103 by the project owner.
 
 ## Manual operator scripts
 
