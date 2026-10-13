@@ -7,7 +7,8 @@
 //!   spacing) and its test seam (`TestSpacingGuard`),
 //! * the cross-process flock pacer (`cross_process_pace`, one
 //!   `<vct_root>/keyring.pace` lock across every VCO process) and its
-//!   test seams (`TestPacePathGuard`, `TestProductionPaceGuard`),
+//!   test seams (`TestPacePathGuard`, and `TestBatonPaceGuard`, which moves a
+//!   keychain test's pacing off the production file — v0.2.102 W6-KC),
 //! * the bounded keychain worker: a single worker thread fed by a channel,
 //!   busy-vs-hung classification (`KEYCHAIN_OP_TIMEOUT` /
 //!   `KEYCHAIN_INTERACTIVE_STUCK_AFTER`), abandoned-worker recycling
@@ -247,14 +248,43 @@ pub(crate) mod cross_process_pace {
     /// regardless of VCT_STATE_DIR. To serialize against the daemon (not just
     /// within one root) the lock path is intentionally NOT under vct_root when
     /// an override is present for tests; production always uses vct_root.
-    fn pace_file_path() -> PathBuf {
-        // Test seam: let a test pin the pace file to an isolated temp path so
-        // it neither touches the user's real vct_root nor races with the
-        // process-global `VCT_STATE_DIR` env.
-        #[cfg(any(test, debug_assertions))]
-        if let Some(p) = test_pace_path_override() {
-            return p;
-        }
+    ///
+    /// Resolution order (the two test layers exist only in test/debug builds,
+    /// and both are empty unless a test installed them):
+    ///   1. an explicit test pin ([`super::TestPacePathGuard`]) — a test that
+    ///      exercises the real pacing on its own temp file;
+    ///   2. the keychain-test baton's file ([`TEST_BATON_PACE_FILE_NAME`],
+    ///      installed by `secrets::test_serialize::keychain_serialize_lock`
+    ///      while a keychain test holds it — v0.2.102 W6-KC);
+    ///   3. the production file, [`production_pace_file_path`].
+    ///
+    /// A release build has no test layer at all: it compiles to the production
+    /// file only.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn pace_file_path() -> PathBuf {
+        resolve_pace_file_path(test_pace_path_override(), test_baton_pace_path())
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    pub(crate) fn pace_file_path() -> PathBuf {
+        production_pace_file_path()
+    }
+
+    /// The resolution rule of [`pace_file_path`], given the two test layers'
+    /// current values (pure, so a test can pin "no layer installed → the
+    /// production file" without racing another thread's baton).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn resolve_pace_file_path(
+        explicit_pin: Option<PathBuf>,
+        baton: Option<PathBuf>,
+    ) -> PathBuf {
+        explicit_pin.or(baton).unwrap_or_else(production_pace_file_path)
+    }
+
+    /// THE production pace/lock file: `<vct_root>/keyring.pace`, i.e.
+    /// `~/.vct/keyring.pace`, or `$VCT_STATE_DIR/keyring.pace` when set. Every
+    /// shipped VCO process (launcher, hub, CLI) paces on this one file.
+    pub(crate) fn production_pace_file_path() -> PathBuf {
         crate::paths::vct_root_dir().join("keyring.pace")
     }
 
@@ -417,10 +447,10 @@ pub(crate) mod cross_process_pace {
 
     /// Take LOCK_EX on `fd`, waiting at most `deadline`.
     ///
-    /// SSOT for every exclusive pace-lock acquire in this module (the runtime
-    /// path and the test-harness holder both call it), so the bound cannot
-    /// regress on one path while the other keeps it — and so the unit tests
-    /// that drive this function cover both call sites.
+    /// SSOT for every exclusive pace-lock acquire in this module, so the bound
+    /// lives in one place and the unit tests that drive this function cover
+    /// the runtime path. (v0.2.102 W6-KC retired the second caller, the T-1
+    /// test harness that held the production flock for a whole test.)
     ///
     /// Uses `LOCK_EX | LOCK_NB` in a poll loop rather than a blocking `LOCK_EX`
     /// precisely because a blocking acquire is uninterruptible from user space:
@@ -479,6 +509,71 @@ pub(crate) mod cross_process_pace {
         std::mem::replace(&mut *slot, p)
     }
 
+    // ── Keychain-test baton pace file (v0.2.102 W6-KC) ─────────────────────
+    //
+    // A keychain test (one holding `keychain_serialize_lock`) paces its keychain
+    // ops on a TEST file, never on the production `keyring.pace`. The file is
+    // per-host (the OS temp dir), so concurrent test binaries — parallel lanes,
+    // two checkouts — still space their real daemon calls against EACH OTHER,
+    // one op at a time, exactly the way the shipped processes pace against each
+    // other on the production file.
+    //
+    // Why not the production file (what v0.2.83 T-1 did — it held the
+    // production flock for the WHOLE test): the hub waits up to
+    // `PACE_LOCK_ACQUIRE_DEADLINE` (30s) for that flock but answers its caller
+    // after `KEYCHAIN_OP_TIMEOUT` (10s), so any test run stalled the user's
+    // live hub and its clients saw a busy keychain (2026-10-13 incident:
+    // gateway 503s). T-1's original reason — tests and a running launcher
+    // writing the SAME keychain slot — is gone since the hermetic
+    // `vct-test-<pid>` service namespace (2026-09-17), so tests and the user's
+    // processes no longer share any keychain entry to serialize on.
+
+    /// File name of the keychain-test baton's pace file, in the OS temp dir.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) const TEST_BATON_PACE_FILE_NAME: &str = "vct-keychain-test.pace";
+
+    #[cfg(any(test, debug_assertions))]
+    static TEST_BATON_PACE_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+    #[cfg(any(test, debug_assertions))]
+    fn test_baton_pace_path() -> Option<PathBuf> {
+        TEST_BATON_PACE_PATH.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Where the keychain-test baton paces: `<temp_dir>/vct-keychain-test.pace`.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn test_baton_pace_file_path() -> PathBuf {
+        std::env::temp_dir().join(TEST_BATON_PACE_FILE_NAME)
+    }
+
+    /// RAII: while alive, this process's keychain ops pace on
+    /// [`test_baton_pace_file_path`] instead of the production file. Held by
+    /// `secrets::test_serialize::KeychainGuard`, installed only once that guard
+    /// holds the in-process keychain mutex (so two waiting tests can never
+    /// clear each other's slot). It takes NO lock itself: each keychain op
+    /// still takes the (test) flock around that one op, as in production.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) struct TestBatonPaceGuard {
+        prev: Option<PathBuf>,
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    impl TestBatonPaceGuard {
+        pub(crate) fn install() -> Self {
+            let mut slot = TEST_BATON_PACE_PATH.lock().unwrap_or_else(|p| p.into_inner());
+            let prev = slot.replace(test_baton_pace_file_path());
+            Self { prev }
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    impl Drop for TestBatonPaceGuard {
+        fn drop(&mut self) {
+            let mut slot = TEST_BATON_PACE_PATH.lock().unwrap_or_else(|p| p.into_inner());
+            *slot = self.prev.take();
+        }
+    }
+
     /// Test-only: read back the stored last-call timestamp (nanos) from the
     /// pace file, so T20 can assert two paced calls wrote monotonic stamps.
     #[cfg(any(test, debug_assertions))]
@@ -525,18 +620,6 @@ pub(crate) mod cross_process_pace {
         }
     }
 
-    /// T-1 (v0.2.83), TEST/DEBUG ONLY: set true while a keychain test holds the
-    /// production `keyring.pace` flock via `test_serialize::keychain_serialize_lock`.
-    /// `acquire_and_space` then SKIPS re-acquiring the (non-reentrant) flock so a
-    /// test that holds the lock AND calls the real `secrets::set` — which runs
-    /// `with_cross_process_pace` on the worker thread — does NOT deadlock against
-    /// its own held lock. Compiled out entirely in release builds (the whole
-    /// `if` below is `#[cfg(any(test, debug_assertions))]`), so PRODUCTION paths
-    /// are byte-identical to pre-T-1.
-    #[cfg(any(test, debug_assertions))]
-    pub(crate) static TEST_HOLDS_PRODUCTION_PACE:
-        std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
     /// Acquire the exclusive lock and enforce cross-process spacing. Returns
     /// the held lock guard on success, or `None` when we could not take the
     /// lock — the pace file is uncreatable, `flock` failed outright, or another
@@ -553,20 +636,6 @@ pub(crate) mod cross_process_pace {
     /// the test override applies identically to the cross-process gate.
     fn acquire_and_space(spacing: std::time::Duration) -> Option<PaceLock> {
         let path = pace_file_path();
-        // T-1 reentrancy skip (test/debug only; compiled out in release). If a
-        // keychain test already holds the production pace flock (via
-        // `keychain_serialize_lock`) AND this call resolves to the SAME real
-        // production file, re-acquiring it here (on the worker thread, a
-        // different fd) would block forever — flock is not reentrant across fds.
-        // Skip only in that exact case: a test that pins the pace path to its own
-        // temp file (`TestPacePathGuard`) is exercising the REAL pacing on an
-        // ISOLATED file and must NOT be skipped (no deadlock — different file).
-        #[cfg(any(test, debug_assertions))]
-        if TEST_HOLDS_PRODUCTION_PACE.load(std::sync::atomic::Ordering::SeqCst)
-            && test_pace_path_override().is_none()
-        {
-            return None;
-        }
         // The pace file lives under vct_root; create the dir if absent so a
         // fresh install (root not yet mkdir'd) still paces rather than warning.
         if let Some(parent) = path.parent() {
@@ -686,85 +755,15 @@ pub(crate) mod cross_process_pace {
         // v0.2.84 (D8.3): stamp the pace file with the op's COMPLETION time
         // WHILE the flock is still held, so the next process spaces off when we
         // FINISHED (true daemon idle gap), not when we started. On the degraded
-        // path (`acquire_and_space` returned `None` — unwritable pace file or
-        // the T-1 reentrancy skip) there is no stamp to write; in-process
-        // pacing carries the gap (unchanged soft-fail behaviour).
+        // path (`acquire_and_space` returned `None` — unusable pace file,
+        // flock error, or a sibling still holding it at the deadline) there is
+        // no stamp to write; in-process pacing carries the gap (unchanged
+        // soft-fail behaviour).
         if let Some(g) = guard.as_mut() {
             g.record_completion_timestamp();
         }
         // `guard` drops here → flock(LOCK_UN), after the completion stamp.
         result
-    }
-
-    /// T-1 (v0.2.83), TEST/DEBUG ONLY: RAII holder of the PRODUCTION
-    /// `<vct_root>/keyring.pace` flock for a keychain test's whole lifetime, so a
-    /// `cargo test --workspace` process serializes against a RUNNING launcher
-    /// (which paces on that SAME file via `run_with_cross_process_pace`) — the
-    /// live-launcher-vs-test race that flaked `github_pat_keychain_tests`.
-    ///
-    /// While held, `TEST_HOLDS_PRODUCTION_PACE` is set so the test's OWN real
-    /// `secrets::set` (which runs `acquire_and_space` on the worker thread) skips
-    /// re-acquiring the non-reentrant flock instead of self-deadlocking. Drop
-    /// clears the flag and releases the flock (kernel also releases on close).
-    ///
-    /// Returns `None` on any flock failure (unwritable root / no flock support)
-    /// AND when a live launcher still holds the production lock at
-    /// `PACE_LOCK_ACQUIRE_DEADLINE` — the caller degrades to the test lockfile
-    /// + in-process serialization (pre-T-1 behaviour; a soft degrade, never a
-    /// block, and never an unbounded hang).
-    #[cfg(any(test, debug_assertions))]
-    pub(crate) struct TestProductionPaceGuard {
-        _lock: PaceLock,
-    }
-
-    #[cfg(any(test, debug_assertions))]
-    impl Drop for TestProductionPaceGuard {
-        fn drop(&mut self) {
-            // Clear the reentrancy flag FIRST, then `_lock`'s Drop LOCK_UNs.
-            TEST_HOLDS_PRODUCTION_PACE
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    #[cfg(any(test, debug_assertions))]
-    pub(crate) fn acquire_production_pace_lock_for_test(
-    ) -> Option<TestProductionPaceGuard> {
-        use std::os::unix::io::AsRawFd;
-        // The REAL production pace path (bypass any test path override — the
-        // live launcher only ever locks this file).
-        let path = crate::paths::vct_root_dir().join("keyring.pace");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .ok()?;
-        let fd = file.as_raw_fd();
-        // BOUNDED exclusive lock via the SAME acquire SSOT the launcher's
-        // `acquire_and_space` uses, so we queue behind its held-lock windows
-        // but — like it — give up rather than park forever. This path had the
-        // identical blocking-`LOCK_EX` defect: a `cargo test` run started while
-        // a live launcher sat on an unlock prompt would hang here with no
-        // deadline and no output. `Contended` / `Failed` both degrade to the
-        // documented `None` (test lockfile + in-process serialization only).
-        match flock_exclusive_within(
-            fd,
-            current_pace_lock_deadline(),
-            PACE_LOCK_ACQUIRE_POLL,
-        ) {
-            FlockAcquire::Acquired => {}
-            FlockAcquire::Contended | FlockAcquire::Failed(_) => return None,
-        }
-        // Now that WE hold it, set the flag so this process's nested
-        // `acquire_and_space` (the test's own `set`) skips re-acquisition.
-        TEST_HOLDS_PRODUCTION_PACE.store(true, std::sync::atomic::Ordering::SeqCst);
-        Some(TestProductionPaceGuard {
-            _lock: PaceLock { _file: file, fd },
-        })
     }
 }
 
@@ -1585,7 +1584,7 @@ pub(crate) mod tests {
     /// Hold an exclusive flock on `path` for `hold` on a background thread,
     /// from a SEPARATE open file description (flock locks are per-OFD, so a
     /// second `open()` in this same process contends exactly like a sibling
-    /// launcher/hub process would — the same technique the T-1 test uses).
+    /// launcher/hub process would).
     ///
     /// The returned receiver fires once the lock is genuinely held, so a test
     /// never races the holder's startup. The holder releases on its OWN timer

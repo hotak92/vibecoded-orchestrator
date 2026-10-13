@@ -4700,6 +4700,11 @@ mod tests {
 
     /// Build an in-memory Db pre-populated with a single base-host project.
     fn open_db_with_resume_project() -> (Db, String) {
+        open_db_with_resume_project_slug("rs-slug")
+    }
+
+    /// [`open_db_with_resume_project`] with an explicit project slug.
+    fn open_db_with_resume_project_slug(slug: &str) -> (Db, String) {
         use rusqlite::params;
         let db = Db::open_in_memory().expect("DB");
         let pid = "proj-rs".to_string();
@@ -4709,12 +4714,83 @@ mod tests {
             guard
                 .execute(
                     "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
-                     VALUES (?1, 'rs', '/tmp/rs', 'base', 'rs-slug', ?2, ?2)",
-                    params!["proj-rs", now],
+                     VALUES (?1, 'rs', '/tmp/rs', 'base', ?2, ?3, ?3)",
+                    params!["proj-rs", slug, now],
                 )
                 .expect("insert resume project");
         }
         (db, pid)
+    }
+
+    /// Host isolation for the resume tests that can reach a REAL `podman run`
+    /// (v0.2.102 W6-KC — the root cause of the
+    /// `v0252_d_resume_named_container_drift_persists_resolved_name` flake).
+    ///
+    /// On a host with podman and the cached fixture image, the resume sweep
+    /// really starts a container, and everything it touches outside this
+    /// process was host-global: the container NAME (`vct-rl-reranker-rs-slug`,
+    /// the same in every test binary, every worktree and every run), the bound
+    /// host PORT (random in the shared 11500-11900 window), and the
+    /// `{VCT_DATA}` bind dir under the developer's real `~/.vct`. Two test
+    /// processes on one host — parallel lanes, a contributor running two
+    /// checkouts — raced on the name: one `podman run` won, the other failed
+    /// (name in use, or refused because the other checkout's launcher label
+    /// owns it), the start returned `Err`, the stale name stayed in the DB and
+    /// the drift assert failed. Measured: 0/20 serial failures, 16/24 with
+    /// three processes at once. A sibling test also left its container
+    /// behind, which a later run in another checkout then tripped over.
+    ///
+    /// So each fixture gets: a slug unique to this process AND call (hence a
+    /// unique container name), a port the OS just handed out (not the shared
+    /// window a real reranker container may hold), a scratch `VCT_STATE_DIR`
+    /// (so `{VCT_DATA}` dirs, the GPU snapshot read and `runtime.txt` are the
+    /// test's own, never the user's), the runtime-pin env cleared under the
+    /// workspace env lock (the W5-B order-flake fix, kept), and removal of its
+    /// container on drop — on a failed assert too.
+    struct RealPodmanResumeFixture {
+        db: Db,
+        pid: String,
+        slug: String,
+        _state: vct_launcher_core::test_env::StateDirGuard,
+    }
+
+    impl RealPodmanResumeFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let state = vct_launcher_core::test_env::state_dir_guard_with(&[
+                ("VCT_CONTAINER_RUNTIME", None),
+                ("VCT_TOOL_SEARCH_DIRS", None),
+            ]);
+            vct_launcher_core::services::runtime_verdict::invalidate();
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let slug = format!("rs-{}-{}", std::process::id(), n);
+            let (db, pid) = open_db_with_resume_project_slug(&slug);
+            // Pin the RL port to one the OS just reported free, so the
+            // `ensure_project_rl_port` random pick in the shared window is
+            // never reached.
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .map(|a| a.port())
+                .expect("free loopback port");
+            db.set_project_rl_port(&pid, port).expect("pin rl_port");
+            Self { db, pid, slug, _state: state }
+        }
+
+        /// The container name the fixture manifest's template resolves to.
+        fn container_name(&self) -> String {
+            format!("vct-rl-reranker-{}", self.slug)
+        }
+    }
+
+    impl Drop for RealPodmanResumeFixture {
+        fn drop(&mut self) {
+            // Idempotent: a missing container (no podman, or the start
+            // failed) is a silent no-op. Runs before `_state` drops, so the
+            // bind-mounted scratch dir outlives the container.
+            let _ = std::process::Command::new("podman")
+                .args(["rm", "-f", &self.container_name()])
+                .output();
+        }
     }
 
     /// Manifest with the supplied runtime type + install method.
@@ -4759,7 +4835,9 @@ mod tests {
     /// rows in the first place.
     #[tokio::test]
     async fn resume_null_container_service_routes_through_start_after_install() {
-        let (db, pid) = open_db_with_resume_project();
+        // Can reach a real `podman run` (podman + cached image): host-isolated.
+        let fx = RealPodmanResumeFixture::new();
+        let (db, pid) = (&fx.db, fx.pid.clone());
 
         // Insert the row — install completed but auto-start never
         // wrote a container_name (the v0.2.40 bug case).
@@ -4855,7 +4933,11 @@ mod tests {
     /// name, never something unrelated".
     #[tokio::test]
     async fn resume_named_container_row_uses_existing_path_no_lasterror() {
-        let (db, pid) = open_db_with_resume_project();
+        // Can reach a real `podman run` (podman + cached image): host-isolated,
+        // and its container is removed on drop (it used to be left running).
+        let fx = RealPodmanResumeFixture::new();
+        let (db, pid) = (&fx.db, fx.pid.clone());
+        let slug = fx.slug.clone();
 
         db.insert_module_install(
             "install-id-t23",
@@ -4869,7 +4951,8 @@ mod tests {
             .expect("set installed");
         // Pre-populate container_name (the existing path's
         // precondition).
-        db.set_module_container_name(&pid, "some-future-service", "some-future-service-rs-slug")
+        let prepopulated = format!("some-future-service-{slug}");
+        db.set_module_container_name(&pid, "some-future-service", &prepopulated)
             .expect("set container_name");
 
         let mut manifests = HashMap::new();
@@ -4911,10 +4994,11 @@ mod tests {
             .resolve_container_name_template(
                 "vct-rl-reranker", // matches make_manifest's id
             );
-        let resolved_name = resolved_template.replace("{project_slug}", "rs-slug");
+        let resolved_name = resolved_template.replace("{project_slug}", &slug);
+        assert_eq!(resolved_name, fx.container_name(), "fixture name matches the template");
         let observed = row_after.container_name.as_deref().unwrap_or("");
         assert!(
-            observed == "some-future-service-rs-slug" || observed == resolved_name.as_str(),
+            observed == prepopulated || observed == resolved_name.as_str(),
             "container_name must be either the pre-populated value (no-podman regime) \
              or the V52-D-resolved value ({}); got '{}', row={:?}",
             resolved_name, observed, row_after,
@@ -4942,116 +5026,106 @@ mod tests {
     /// empties `VCT_TOOL_SEARCH_DIRS` process-wide under the env lock, and
     /// its resolves land in the shared cache keyed without those inputs).
     /// Co-run, the resume path resolved against a fake docker pin or a
-    /// poisoned cache and the drift assert failed. Now the whole body runs
-    /// under `with_env_vars` (both vars CLEARED — the prod default, the
-    /// real podman via the real PATH) which both stabilises the reads AND
-    /// serialises this test against every env-mutating test on the
-    /// workspace env lock, and the verdict cache is dropped at entry so an
-    /// earlier test's answer cannot decide this one's runtime.
+    /// poisoned cache and the drift assert failed. The fixture clears both
+    /// vars (the prod default, the real podman via the real PATH) under the
+    /// workspace env lock for the whole body and drops the verdict cache at
+    /// entry, so an earlier test's answer cannot decide this one's runtime.
+    ///
+    /// v0.2.102 (W6-KC) — the CROSS-PROCESS flake: the container name, host
+    /// port and `{VCT_DATA}` dir were host-global, so two test processes on
+    /// one host raced on them; see [`RealPodmanResumeFixture`].
     #[test]
     fn v0252_d_resume_named_container_drift_persists_resolved_name() {
-        vct_launcher_core::test_env::with_env_vars(
-            &[
-                ("VCT_CONTAINER_RUNTIME", None),
-                ("VCT_TOOL_SEARCH_DIRS", None),
-            ],
-            || {
-                vct_launcher_core::services::runtime_verdict::invalidate();
-                let rt =
-                    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                rt.block_on(async {
-        // Gate on a real podman + cached image. Skip cleanly on
-        // headless CI.
-        let podman_ok = std::process::Command::new("podman")
-            .args(["--version"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !podman_ok {
-            eprintln!(
-                "[v0252_d_resume_named_container_drift_persists_resolved_name] \
-                 skipping: no podman in PATH"
+        let fx = RealPodmanResumeFixture::new();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // Gate on a real podman + cached image. Skip cleanly on
+            // headless CI.
+            let podman_ok = std::process::Command::new("podman")
+                .args(["--version"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !podman_ok {
+                eprintln!(
+                    "[v0252_d_resume_named_container_drift_persists_resolved_name] \
+                     skipping: no podman in PATH"
+                );
+                return;
+            }
+            // Check the test fixture's image is cached. If not, skip
+            // (we don't want this test to fail just because the host
+            // doesn't have a paid-module image pulled).
+            let img_check = std::process::Command::new("podman")
+                .args(["image", "exists", "ghcr.io/hotak92/vct-rl-reranker:0.1.0"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !img_check {
+                eprintln!(
+                    "[v0252_d_resume_named_container_drift_persists_resolved_name] \
+                     skipping: fixture image ghcr.io/hotak92/vct-rl-reranker:0.1.0 \
+                     not cached on this host"
+                );
+                return;
+            }
+
+            let (db, pid) = (&fx.db, fx.pid.clone());
+            let expected_name = fx.container_name();
+
+            db.insert_module_install(
+                "install-id-v52d",
+                &pid,
+                "vct-rl-reranker",
+                "0.1.0",
+                "/tmp/vct-rl-reranker",
+            )
+            .expect("insert");
+            db.set_module_status(&pid, "vct-rl-reranker", ModuleStatus::Installed, None)
+                .expect("set installed");
+            // Seed a STALE container_name that doesn't match the
+            // manifest's resolved template. Pre-V52-D this would trigger
+            // the respawn loop.
+            db.set_module_container_name(&pid, "vct-rl-reranker", "vct-rl-reranker-manual")
+                .expect("set stale container_name");
+            // Also seed a stale last_error to verify V52-W clearing.
+            db.set_module_last_error(&pid, "vct-rl-reranker", Some("stale: prior boot error"))
+                .expect("set stale last_error");
+
+            let mut manifests = HashMap::new();
+            manifests.insert(
+                "vct-rl-reranker".to_string(),
+                make_manifest_for_gate("service", InstallMethod::ContainerPull),
             );
-            return;
-        }
-        // Check the test fixture's image is cached. If not, skip
-        // (we don't want this test to fail just because the host
-        // doesn't have a paid-module image pulled).
-        let img_check = std::process::Command::new("podman")
-            .args(["image", "exists", "ghcr.io/hotak92/vct-rl-reranker:0.1.0"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !img_check {
-            eprintln!(
-                "[v0252_d_resume_named_container_drift_persists_resolved_name] \
-                 skipping: fixture image ghcr.io/hotak92/vct-rl-reranker:0.1.0 \
-                 not cached on this host"
+            let (resolver, _visited) = tracking_resolver(manifests);
+
+            resume_containers_on_startup_with_resolver(db, resolver).await;
+
+            let row_after = db
+                .get_module_install(&pid, "vct-rl-reranker")
+                .unwrap()
+                .unwrap();
+
+            // V52-D contract: the stale name was overwritten with the
+            // template-resolved name (`vct-rl-reranker-<fixture slug>`).
+            assert_eq!(
+                row_after.container_name.as_deref(),
+                Some(expected_name.as_str()),
+                "V52-D: container_name must be updated from stale ('vct-rl-reranker-manual') \
+                 to resolved ('{}'); got {:?}",
+                expected_name,
+                row_after.container_name,
             );
-            return;
-        }
-
-        let (db, pid) = open_db_with_resume_project();
-
-        db.insert_module_install(
-            "install-id-v52d",
-            &pid,
-            "vct-rl-reranker",
-            "0.1.0",
-            "/tmp/vct-rl-reranker",
-        )
-        .expect("insert");
-        db.set_module_status(&pid, "vct-rl-reranker", ModuleStatus::Installed, None)
-            .expect("set installed");
-        // Seed a STALE container_name that doesn't match the
-        // manifest's resolved template. Pre-V52-D this would trigger
-        // the respawn loop.
-        db.set_module_container_name(&pid, "vct-rl-reranker", "vct-rl-reranker-manual")
-            .expect("set stale container_name");
-        // Also seed a stale last_error to verify V52-W clearing.
-        db.set_module_last_error(&pid, "vct-rl-reranker", Some("stale: prior boot error"))
-            .expect("set stale last_error");
-
-        let mut manifests = HashMap::new();
-        manifests.insert(
-            "vct-rl-reranker".to_string(),
-            make_manifest_for_gate("service", InstallMethod::ContainerPull),
-        );
-        let (resolver, _visited) = tracking_resolver(manifests);
-
-        resume_containers_on_startup_with_resolver(&db, resolver).await;
-
-        let row_after = db
-            .get_module_install(&pid, "vct-rl-reranker")
-            .unwrap()
-            .unwrap();
-
-        // V52-D contract: the stale name was overwritten with the
-        // template-resolved name (`vct-rl-reranker-rs-slug` here).
-        assert_eq!(
-            row_after.container_name.as_deref(),
-            Some("vct-rl-reranker-rs-slug"),
-            "V52-D: container_name must be updated from stale ('vct-rl-reranker-manual') \
-             to resolved ('vct-rl-reranker-rs-slug'); got {:?}",
-            row_after.container_name,
-        );
-        // V52-W contract: stale last_error is cleared on successful
-        // restart.
-        assert!(
-            row_after.last_error.is_none(),
-            "V52-W: stale last_error must be cleared on successful resume restart; \
-             got {:?}",
-            row_after.last_error,
-        );
-
-        // Cleanup: stop + remove the container the test started so we
-        // don't leak state across test runs.
-        let _ = std::process::Command::new("podman")
-            .args(["rm", "-f", "vct-rl-reranker-rs-slug"])
-            .output();
-                })
-            },
-        )
+            // V52-W contract: stale last_error is cleared on successful
+            // restart.
+            assert!(
+                row_after.last_error.is_none(),
+                "V52-W: stale last_error must be cleared on successful resume restart; \
+                 got {:?}",
+                row_after.last_error,
+            );
+            // The container `fx` removes on drop (also on a failed assert).
+        })
     }
 
     /// T4 (gate): a `status='installed'` row whose manifest declares a
