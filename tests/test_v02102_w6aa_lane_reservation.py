@@ -32,6 +32,23 @@ from tests.common.pwsh import PWSH_BASE_FLAGS
 from vco_lib import lane_reservation as lr
 from vco_lib import project_config
 
+
+def _clear_resolver_caches() -> None:
+    """Clear the hub-discovery cache of EVERY live copy of project_config.
+
+    lane_reservation imports project_config lazily (inside the function), so
+    when another test has purged ``vco_lib.project_config`` from sys.modules
+    (tests/test_caller_migration_step18.py does), lane_reservation resolves
+    through a NEWER module object than the one imported above. Clearing only
+    the stale copy left the live one serving the previous test's fake-hub
+    port for the 5 s discovery TTL, so the next test got "connection refused".
+    """
+    import importlib  # noqa: PLC0415
+
+    live = importlib.import_module("vco_lib.project_config")
+    for mod in {id(project_config): project_config, id(live): live}.values():
+        mod._test_clear_cache()
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS = REPO_ROOT / "templates" / "hooks"
 _PS = shutil.which("pwsh") or shutil.which("powershell")
@@ -127,12 +144,13 @@ def hub(monkeypatch: pytest.MonkeyPatch):
     for k, v in h.env().items():
         monkeypatch.setenv(k, v)
     monkeypatch.delenv("VCT_DISABLE_HUB_RESOLVER", raising=False)
-    project_config._test_clear_cache()
+    _clear_resolver_caches()
     try:
         yield h
     finally:
         h.server.shutdown()
-        project_config._test_clear_cache()
+        h.server.server_close()
+        _clear_resolver_caches()
 
 
 @pytest.fixture
@@ -317,7 +335,7 @@ def test_project_itself_allowed(pr) -> None:
 def test_hub_unreachable_refuses(pr, monkeypatch: pytest.MonkeyPatch) -> None:
     p, r = pr
     monkeypatch.setenv("VCT_HUB_PORT", "9")
-    project_config._test_clear_cache()
+    _clear_resolver_caches()
     proc = _cli("reserve", "--project", str(p), "--repo", str(r), "--base", "HEAD",
                 "--branch", "b-down", env={**_env(None, p), "VCT_HUB_PORT": "9", "VCT_HUB_TOKEN": "tok"})
     assert proc.returncode == lr.EXIT_FAILED
