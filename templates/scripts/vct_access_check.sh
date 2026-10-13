@@ -195,6 +195,10 @@ emit_metric() {
     mkdir -p "$cache_dir" 2>/dev/null || return 0
     local ts
     ts=$(date +%s 2>/dev/null) || ts=0
+    # printf writes plain UTF-8 with no BOM — the encoding the .ps1 sibling's
+    # Write-AccessMetric now spells out explicitly (v0.2.102 review R5-8), so
+    # the jsonl's Python reader (vco_lib/access_resolver.py) sees the same
+    # first row from either OS. Must match vct_access_check.ps1.
     printf '{"ts":%d,"project_id":"%s","collection":"%s","reason":"%s","fail_open":true}\n' \
         "$ts" "$project_id" "$collection" "$reason" \
         >> "$jsonl" 2>/dev/null || true

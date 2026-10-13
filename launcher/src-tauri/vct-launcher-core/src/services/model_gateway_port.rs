@@ -194,8 +194,9 @@ mod tests {
             format!("LAST_PORT_BASENAME = \"{}\"", LAST_PORT_BASENAME),
             format!("SERVICE_NAME = \"{}\"", GATEWAY_SERVICE),
             // The env name is read inline rather than declared as a constant,
-            // so this pins the expression the daemon actually evaluates.
-            format!("os.environ.get(\"{}\")", PORT_ENV),
+            // so this pins the expression the daemon actually evaluates (the
+            // shared reader `vco_lib.env_values.env_int` since v0.2.102).
+            format!("env_int(\"{}\"", PORT_ENV),
         ] {
             assert!(
                 py.contains(&needle),
