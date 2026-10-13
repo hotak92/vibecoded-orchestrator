@@ -2062,54 +2062,12 @@ mod tests {
         assert_eq!(db.get_tier_cache().unwrap().orchestrator_tier, "admin");
     }
 
-    /// Bug 33 audit: the licensing module must NOT contain any local
-    /// bypass paths. Source-level grep: assert no symbols matching
-    /// `_verify_maintainer_token`, `MAINTAINER_TOKEN`, `ed25519`,
-    /// `bypass_token`, etc. appear anywhere in the licensing surface.
-    #[test]
-    fn no_local_bypass_paths_in_licensing_or_validator() {
-        // We can't import the Python validator from Rust — instead we
-        // walk the file and grep its source. Same for licensing.rs.
-        // v0.2.49: also scans the promoted `vct-launcher-core::licensing`
-        // module — both halves of the moved code must remain
-        // bypass-free.
-        let repo_root = super::super::installer::find_local_repo_root().expect("repo root");
-        let licensing_rs = repo_root.join("launcher/src-tauri/src/commands/licensing.rs");
-        let core_licensing_rs =
-            repo_root.join("launcher/src-tauri/vct-launcher-core/src/licensing.rs");
-        let validator_py = repo_root.join("VCThelpers/license/validator.py");
-
-        let forbidden = [
-            "MAINTAINER_TOKEN",
-            "_verify_maintainer_token",
-            "_verify_maintainer",
-            "VCT_MAINTAINER_TOKEN",
-            "ed25519_dalek",
-            "Ed25519",
-            "maintainer_token",
-            "maintainer_signing_key",
-        ];
-
-        for path in [&licensing_rs, &core_licensing_rs, &validator_py] {
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            // Strip Rust /// doc comments + Python triple-quoted
-            // docstrings + line comments, since prose is allowed.
-            let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
-            let production = &content[..scan_end];
-            let cleaned = strip_for_audit(production);
-            for needle in &forbidden {
-                assert!(
-                    !cleaned.contains(needle),
-                    "FORBIDDEN: '{}' found in {} — Bug 33 dropped local bypass paths",
-                    needle,
-                    path.display()
-                );
-            }
-        }
-    }
+    // Bug 33 maintainer-token bypass audit: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_no_local_bypass_paths_in_licensing_or_validator`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating.
+    // The Rust copy cut this file at a COMMENT quoting `#[cfg(test)]` (line 11), so
+    // this file's production code was effectively unscanned.
 
     // -----------------------------------------------------------------
     // Bug #22 (v0.2.31): token-gateway license cache file.
@@ -2385,55 +2343,6 @@ mod tests {
         assert_eq!(row.orchestrator_tier, "free");
         assert_eq!(row.module_licenses, serde_json::json!({}));
         assert!(row.last_error.is_some());
-    }
-
-    /// Replace Python triple-quoted blocks AND Rust /// doc comments
-    /// with whitespace so the audit only sees executable source. Match
-    /// the helper used in the volumes module's audit.
-    fn strip_for_audit(src: &str) -> String {
-        let mut out = String::with_capacity(src.len());
-        let bytes = src.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            let three_double = i + 3 <= bytes.len() && &bytes[i..i + 3] == b"\"\"\"";
-            let three_single = i + 3 <= bytes.len() && &bytes[i..i + 3] == b"'''";
-            if three_double || three_single {
-                let marker: &[u8] = if three_double { b"\"\"\"" } else { b"'''" };
-                let start = i + 3;
-                let mut j = start;
-                while j + 3 <= bytes.len() {
-                    if &bytes[j..j + 3] == marker {
-                        break;
-                    }
-                    j += 1;
-                }
-                let end = (j + 3).min(bytes.len());
-                for k in i..end {
-                    if bytes[k] == b'\n' {
-                        out.push('\n');
-                    } else {
-                        out.push(' ');
-                    }
-                }
-                i = end;
-                continue;
-            }
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-        // Strip line comments after multiline scrubbing.
-        out.lines()
-            .map(|line| {
-                // Rust doc /// or // and Python/sh #
-                let cut = line
-                    .find("///")
-                    .or_else(|| line.find("//"))
-                    .or_else(|| line.find('#'))
-                    .unwrap_or(line.len());
-                &line[..cut]
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     // -----------------------------------------------------------------

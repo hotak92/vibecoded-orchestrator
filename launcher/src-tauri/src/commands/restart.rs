@@ -1427,23 +1427,12 @@ condition_ids: [launcher_restart_required]
         )
     }
 
-    /// The cid must be SHARED with its emitter, not retyped. A literal here
-    /// looks identical today and silently stops matching the day the emitter
-    /// renames the condition — the banner would then just never appear again,
-    /// with no failing test and no error anywhere.
-    #[test]
-    fn the_stale_cid_is_imported_not_retyped() {
-        let src = include_str!("restart.rs");
-        let code = src.split("mod tests").next().unwrap();
-        assert!(
-            code.contains(concat!("binary_freshness::CID_BINARY", "_STALE")),
-            "restart.rs must read the cid from its emitter",
-        );
-        assert!(
-            !code.contains(concat!("\"launcher_binary", "_stale\"")),
-            "a hardcoded cid literal can drift away from the emitter unnoticed",
-        );
-    }
+    // Imported-cid gate: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_the_stale_cid_is_imported_not_retyped`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating.
+    // The Rust copy cut this file at `mod tests` — correct today, but blind to any
+    // production code added after the test module.
 
     #[test]
     fn binary_stale_section_is_extracted_by_the_emitters_own_cid() {

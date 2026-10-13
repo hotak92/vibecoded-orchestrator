@@ -67,6 +67,7 @@ from typing import Optional, Iterable
 
 import pytest
 
+from tests.common.rust_source import production_source
 from vco_lib.config_projection import list_canonical_keys
 from vco_lib.env_template import list_canonical_env_template_keys
 
@@ -646,68 +647,23 @@ def _read_text_safely(path: Path) -> str:
 
 
 def _strip_rust_test_modules(content: str) -> str:
-    """Remove ``#[cfg(test)] mod ... { ... }`` blocks from Rust source.
+    """Blank every ``#[cfg(test)]``-gated ITEM in a Rust source.
 
     Inline test modules are Rust's analogue of Python's ``tests/`` dir —
     they're test code, not production. Writes to env surfaces inside
     them are test fixtures (building fake repo trees, exercising
     downstream readers) and don't violate the contract.
 
-    Brace-counting: starts at the ``{`` after ``#[cfg(test)]`` mod
-    declaration, accumulates depth, terminates at the matching ``}``.
-
-    Strings and comments containing literal braces COULD throw off the
-    counter, but Rust test modules don't typically contain literal
-    braces in raw strings around test blocks. Worst case: a stray brace
-    truncates the strip early, leaving SOME test code in scope — that
-    would be a false positive (the lint would flag legitimate test
-    writes), but it can be fixed by adding the file to the dirs
-    allowlist OR refactoring the offending raw string. We accept the
-    trade-off for the simplicity of brace-counting vs full Rust parser
-    integration.
-
-    Returns the content with test modules replaced by blank lines (so
-    line numbers in error reports stay accurate).
-
-    Implementation note: operates on the raw string char-by-char with
-    a single linear scan. For a 9000-line file (~300KB) this is well
-    under 200ms; the per-line nested loop in an earlier draft was
-    quadratic when many test modules nested deeply.
+    Delegates to ``tests.common.rust_source.production_source`` (v0.2.102
+    W6-Z2). The private brace counter this replaced jumped from each marker
+    to the NEXT ``{`` in the file: a gated ``use …;`` therefore blanked the
+    production item after it, and a comment quoting the marker blanked
+    whatever block followed — false NEGATIVES, the direction its docstring
+    said could not happen. The shared helper ends an item at its own ``;`` or
+    balanced braces, with a Rust lexer that ignores braces in strings and
+    comments, and keeps line numbers (gated lines become empty).
     """
-    if "#[cfg(test)]" not in content:
-        return content
-
-    out = list(content)
-    n = len(content)
-    i = 0
-    # Each pass: find the next "#[cfg(test)]", advance to the opening
-    # `{`, brace-count to the closing `}`, blank that range.
-    needle = "#[cfg(test)]"
-    while i < n:
-        idx = content.find(needle, i)
-        if idx == -1:
-            break
-        # Find the first `{` after idx.
-        brace = content.find("{", idx + len(needle))
-        if brace == -1:
-            break
-        # Brace-count from brace.
-        depth = 1
-        j = brace + 1
-        while j < n and depth > 0:
-            ch = content[j]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-            j += 1
-        # Blank from idx to j (inclusive of the closing brace), but
-        # keep newlines so line numbers stay aligned.
-        for k in range(idx, j):
-            if out[k] != "\n":
-                out[k] = " "
-        i = j
-    return "".join(out)
+    return production_source(content)
 
 
 def _path_is_under(p: Path, root: Path) -> bool:

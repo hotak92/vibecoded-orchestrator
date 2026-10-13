@@ -45,6 +45,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tests.common.launcher_db_fixture import make_launcher_db  # noqa: E402
+from tests.common.rust_source import production_source  # noqa: E402
 from vco_lib import config_projection as cp  # noqa: E402
 
 _RUST_CASCADE_SRC = (
@@ -128,8 +129,10 @@ def test_hub_resolver_has_no_raw_dual_flag_row_reads() -> None:
     which collapses "no per-project row" into false and cannot express the
     host-wide default tier. It must not come back."""
     src = _RUST_HUB_SRC.read_text(encoding="utf-8")
-    # Ignore the test module: its fixtures legitimately seed raw rows.
-    body = src.split("mod tests {")[0]
+    # Ignore test-gated items: the test module's fixtures legitimately seed
+    # raw rows. Blanked per item, not cut at the first `mod tests {`, so
+    # production code after a test module is still checked (v0.2.102 W6-Z2).
+    body = production_source(src)
     for key in (
         cp._DUAL_SETTING_KEY_WRITE_ALL_SLOTS,
         cp._DUAL_SETTING_KEY_RL_LOG,

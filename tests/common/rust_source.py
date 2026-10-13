@@ -107,6 +107,7 @@ __all__ = [
     "cfg_test_line_numbers",
     "cfg_test_gate_indices",
     "cfg_test_item_resume_index",
+    "production_source",
 ]
 
 _RUST_SYNTAX = _syntax_for("rust")
@@ -410,3 +411,42 @@ def cfg_test_item_resume_index(
         if first - 1 == gate_index:
             return last
     return None
+
+
+def production_source(
+    source: str, *, include_any_test: bool = False, strip_comments: bool = False,
+) -> str:
+    """``source`` with every test-gated ITEM blanked, line-for-line.
+
+    The answer to "what is the production text of this file?" for a lint that
+    scans it for a forbidden or required literal. Each line inside a span from
+    :func:`cfg_test_spans` becomes an empty string; every other line —
+    comments and string literals included — is reproduced verbatim, so the
+    caller still decides how to treat prose, and line numbers survive for
+    error reports.
+
+    v0.2.102 (W6-Z2): this replaces the "cut at the first ``#[cfg(test)]``"
+    idiom that a dozen gates (Rust ``content.find("#[cfg(test)]")`` /
+    ``split("mod tests")`` and their Python twins) used. That idiom stops at
+    whatever carries the marker text FIRST — a gated ``use``, a gated helper
+    fn, or a comment that merely quotes the marker — and every production line
+    below it goes unscanned, so the gate fails toward GREEN. Blanking per item
+    keeps everything after a gated item in scope and still removes the test
+    module, whose assertions quote the very needles the gate forbids.
+
+    An item that cannot be delimited is NOT blanked (fail closed, see
+    :func:`cfg_test_spans`): a lexer slip can only make a gate noisier, never
+    blind. ``include_any_test`` has the same meaning as there.
+
+    ``strip_comments=True`` additionally removes comments the way
+    :func:`strip_rust_comments` does (string literals stay verbatim), for a
+    gate whose needles may legitimately appear in prose.
+    """
+    gated = cfg_test_line_numbers(source, include_any_test=include_any_test)
+    lines = strip_rust_comments(source) if strip_comments else source.splitlines()
+    if not gated and not strip_comments:
+        return source
+    return "\n".join(
+        "" if n in gated else line
+        for n, line in enumerate(lines, start=1)
+    )
