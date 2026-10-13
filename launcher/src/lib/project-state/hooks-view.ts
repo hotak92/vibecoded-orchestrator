@@ -79,10 +79,13 @@ export function stateTooltip(state: HookState, settingsPath: string): string {
     case 'active':
       return `Declared in ${settingsPath} — Claude Code runs it on every matching event.`;
     case 'disabled':
-      // v0.2.102 (review R9 F3): the bundle merge carries this disable to an
-      // event VCO newly ships the same script on, while the script runs on no
-      // event (vco_lib.parked_hooks.find_parked_match, live_identities).
-      return `Removed from ${settingsPath} by the launcher. The entry is stored here, so re-enabling restores it exactly. The hook script file was not touched. While this script runs on no event, a VCO update that ships it on a new event keeps that one off too; after you re-enable it here, the next bundle update adds it.`;
+      // v0.2.102 (review R9 F3 + lane W6-HTAB): the bundle merge carries this
+      // disable to an event VCO newly ships the same script on, while the
+      // script runs on no event (vco_lib.parked_hooks.find_parked_match,
+      // live_identities); the tab load then parks that registration as its
+      // own row (park_carried_registrations), so it has its own toggle and
+      // re-enabling it restores it at once.
+      return `Removed from ${settingsPath} by the launcher. The entry is stored here, so re-enabling restores it exactly. The hook script file was not touched. While this script runs on no event, a VCO update that ships it on a new event keeps that one off too, and it gets its own Disabled row here.`;
     case 'orphan':
       return `The launcher has a record of this hook, but ${settingsPath} does not declare it — so it does not run. It was removed outside the launcher (a hand edit, a bundle update, another tool). There is nothing stored to restore; Delete clears the stale record.`;
   }
@@ -348,6 +351,43 @@ export function dispatcherRowPresent(hooks: EffectiveHook[]): boolean {
   return hooks.some(
     (h) => h.event === 'PostToolUse' && h.command.includes('post-tool-use-async'),
   );
+}
+
+/**
+ * The routed sub-hook a hook row's command invokes, or null.
+ *
+ * Display only: it decides whether a row's tooltip mentions the
+ * dispatcher route, never what runs — the same kind of literal check
+ * {@link dispatcherRowPresent} makes. A stem matches only as the script
+ * file name under `.claude/hooks/` (`/` or `\`), so `post-git` never
+ * matches `post-git-commit-kg-sync`.
+ */
+export function routedSubhookStem(command: string): string | null {
+  for (const stem of ASYNC_SUBHOOK_STEMS) {
+    for (const ext of ['.sh', '.ps1']) {
+      if (
+        command.includes(`.claude/hooks/${stem}${ext}`) ||
+        command.includes(`.claude\\hooks\\${stem}${ext}`)
+      ) {
+        return stem;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The extra tooltip sentence for a DISABLED row whose script the async
+ * dispatcher also routes (v0.2.102, lane W6-HTAB). Disabling the row parks
+ * that event's registration only; the dispatcher's Agent/Task route is a
+ * different event with its own switch in the section below, which this
+ * points at instead of flipping it behind the user's back. '' otherwise.
+ */
+export function routedSubhookNote(hook: EffectiveHook, hooks: EffectiveHook[]): string {
+  if (hook.state !== 'disabled' || !dispatcherRowPresent(hooks)) return '';
+  const stem = routedSubhookStem(hook.command);
+  if (stem === null) return '';
+  return ` The async dispatcher also runs ${stem} on matching tool calls; turn that off with its own switch under "Async PostToolUse sub-hooks".`;
 }
 
 /** The copy under the section. */
