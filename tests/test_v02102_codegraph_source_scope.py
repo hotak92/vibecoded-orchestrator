@@ -600,6 +600,19 @@ def test_r11_02_incremental_union_requeues_only_this_roots_stale_files(amod, tmp
     assert a._union_stale_into_changed(proj, pfiles, []) == [proj / "a.py", proj / "c.py"]
 
 
+def test_r12_1_incremental_union_uses_the_walks_canonical_stamp(amod, tmp_path):
+    """R12-1: a scoped worktree run stamping the MAIN root (--canonical-source)
+    re-queues a stale row written under that main-root form (act); without the
+    stamp only the worktree's own forms count (leave-alone)."""
+    wt, main = (tmp_path / "wt").resolve(), (tmp_path / "main").resolve()
+    a = _analyzer(amod)
+    a._analyze_repo_root_raw, a._strict_source = wt.as_posix(), False
+    a._stale_file_set_cache = frozenset({(main.as_posix(), "a.py")})
+    files = [wt / "a.py"]
+    assert a._union_stale_into_changed(wt, files, []) == []
+    assert a._union_stale_into_changed(wt, files, [], stamp=main.as_posix()) == [wt / "a.py"]
+
+
 def _run_analyzer_cli(args, tmp_path):
     return subprocess.run([sys.executable, str(_ANALYZER), *args], capture_output=True, text=True,
                           env=child_env(WEAVIATE_URL="http://127.0.0.1:9"), cwd=str(tmp_path),

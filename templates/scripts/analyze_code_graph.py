@@ -3478,6 +3478,7 @@ class CodeGraphAnalyzer:
         # files and MUST NOT sweep the whole collection (they'd delete rows for
         # files simply not in this narrow batch). See `_build_stale_file_set`.
         self._analyze_whole_repo = (only_file is None and only_files_from is None)
+        self._stamp_scope = (canonical_source, not self._analyze_whole_repo)  # for _root_stamp
 
         # v0.2.47 (extras): validate + canonicalise extras up-front so
         # downstream loops can assume each entry is an existing absolute
@@ -3725,7 +3726,7 @@ class CodeGraphAnalyzer:
                             # re-embed them otherwise). Fail-open on a None probe.
                             # Rationale: `union_stale_into_changed` docstring.
                             files = self._union_stale_into_changed(
-                                source_root, all_files, files,
+                                source_root, all_files, files, self._root_stamp(source_root, is_extra_root),
                             )
                             if not files:
                                 # Quiet skip — the typical case for clean repos
@@ -3763,9 +3764,7 @@ class CodeGraphAnalyzer:
             # vco_lib.codegraph_source_scope (W6-CGD D-1/D-2) — an extra root
             # stamps itself; --canonical-source only for the project's scoped edits.
             _xroot = self._strict_source or is_extra
-            self._current_source = _src_scope.walk_source_stamp(
-                source_root.as_posix(), canonical_source=canonical_source,
-                scoped=(only_file is not None or only_files_from is not None), extra_root=_xroot)
+            self._current_source = self._root_stamp(source_root, is_extra)
             self._walk_own = (_src_scope.walk_own_sources(source_root, self._current_source), _xroot)
 
             for f in files:
@@ -4412,20 +4411,17 @@ class CodeGraphAnalyzer:
         source_root: Path,
         all_files: List[Path],
         changed_files: List[Path],
+        stamp: str = "",
     ) -> List[Path]:
-        """v0.2.77 5c task 5 (5c-v): thin shim over
-        ``vco_lib.codegraph_resync.union_stale_into_changed`` (pure logic +
-        rationale there — P2f ratchet). Resolves the per-run stale-file set and
-        delegates so an UNCHANGED file owning a stale/vectorless row is re-queued
-        under ``--incremental`` (rev-0 heal). Fail-open on a ``None`` stale set.
-        """
+        """Shim over ``vco_lib.codegraph_resync.union_stale_into_changed`` (logic + rationale there):
+        re-queue UNCHANGED files owning stale/vectorless rows under ``--incremental``; fail-open."""
         try:
             stale = self._get_stale_file_set()
         except Exception:  # noqa: BLE001 — stub analyzers / probe failure
             stale = None
         _raw = getattr(self, "_analyze_repo_root_raw", "") or source_root.as_posix()  # R11-02: this root's rows only
         result, added = _union_stale_into_changed_impl(source_root, all_files, changed_files, stale, (
-            _src_scope.walk_own_sources(source_root, source_root.as_posix()),
+            _src_scope.walk_own_sources(source_root, stamp or source_root.as_posix()),  # R12-1: walk's own stamp
             bool(getattr(self, "_strict_source", False)) or source_root.as_posix() != _raw))
         if added:
             print(
@@ -4433,6 +4429,10 @@ class CodeGraphAnalyzer:
                 f"rows re-queued under {source_root} (rev-0 heal)"
             )
         return result
+
+    def _root_stamp(self, root: Path, is_extra: bool) -> str:  # one rule: codegraph_source_scope
+        cs, scoped = getattr(self, "_stamp_scope", (None, False))
+        return _src_scope.walk_source_stamp(root.as_posix(), canonical_source=cs, scoped=scoped, extra_root=self._strict_source or is_extra)
 
     def _analyze_lua_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
         """P2f stage 2 (v0.2.76): moved verbatim to
