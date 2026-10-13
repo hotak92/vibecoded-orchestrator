@@ -69,7 +69,8 @@ class SummaryBackendSendsTheCurrentHaiku(unittest.TestCase):
             body = {"content": [{"type": "text", "text": "a summary"}]}
             return _Resp(json.dumps(body).encode("utf-8"))
 
-        with mock.patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-not-a-key"}), \
+        env = {"ANTHROPIC_API_KEY": "test-not-a-key"}  # vco-secret-scan: test-placeholder
+        with mock.patch.dict("os.environ", env), \
                 mock.patch.object(sb.urllib.request, "urlopen", fake_urlopen):
             self.assertEqual(sb.call_api("summarise this"), "a summary")
         self.assertEqual(len(sent), 1)
@@ -93,7 +94,8 @@ class NodeFormatGeneratorSendsTheCurrentHaiku(unittest.TestCase):
             captured.update(kwargs["json"])
             return _Ok()
 
-        with mock.patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-not-a-key"}), \
+        env = {"ANTHROPIC_API_KEY": "test-not-a-key"}  # vco-secret-scan: test-placeholder
+        with mock.patch.dict("os.environ", env), \
                 mock.patch.object(gnf.requests, "post", fake_post):
             self.assertEqual(gnf.call_haiku("p", 64), "formats")
         self.assertEqual(captured["model"], CURRENT_HAIKU)

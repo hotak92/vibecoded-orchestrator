@@ -97,7 +97,7 @@ def _write_dirty_env(folder: Path) -> None:
     claude.mkdir(parents=True, exist_ok=True)
     (claude / "env").write_text(
         f"{CLAUDE_ENV_MANAGED_BEGIN}\n"
-        'export STALE_SECRET="synthetic-value"\n'
+        'export STALE_SECRET="synthetic-value"\n'  # vco-secret-scan: test-placeholder
         f"{CLAUDE_ENV_MANAGED_END}\n",
         encoding="utf-8",
     )

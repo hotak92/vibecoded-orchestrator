@@ -54,7 +54,7 @@ def project_with_secret_in_env(tmp_path: Path) -> Path:
         'export KG_COLLECTION="Test_KnowledgeGraph"\n'
         "\n"
         "# user secrets (per-project; managed via launcher GUI Secrets panel)\n"
-        'export STALE_SECRET="synthetic-secret-value-pre-fix"\n'
+        'export STALE_SECRET="synthetic-secret-value-pre-fix"\n'  # vco-secret-scan: test-placeholder
         f"{CLAUDE_ENV_MANAGED_END}\n"
     )
     return tmp_path
@@ -123,7 +123,7 @@ def test_clears_after_value_removed(project_with_secret_in_env: Path) -> Path:
     env_text = env_path.read_text()
     # Remove the secret-shaped line (the refresh strips the entire export line).
     cleaned = env_text.replace(
-        'export STALE_SECRET="synthetic-secret-value-pre-fix"\n', ""
+        'export STALE_SECRET="synthetic-secret-value-pre-fix"\n', ""  # vco-secret-scan: test-placeholder
     )
     env_path.write_text(cleaned)
 

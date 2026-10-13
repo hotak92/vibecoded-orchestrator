@@ -472,7 +472,7 @@ class DogfoodTests(unittest.TestCase):
         log = self.install_fake_claude("ok")
         # A stale key in the caller's shell must not reach the CLI: it would
         # outrank the host token and send the wrong credential.
-        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "stale-key"}):
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "stale-key"}):  # vco-secret-scan: test-placeholder
             out = self.run_proof(cost_free_only=False)
         self.assertEqual(out["status"], "ok", out)
         lines = log.read_text(encoding="utf-8").splitlines()

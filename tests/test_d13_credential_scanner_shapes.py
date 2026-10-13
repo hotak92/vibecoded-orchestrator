@@ -49,9 +49,9 @@ FAKE_GITHUB_PAT = "github_pat_" + ("a" * 22) + "_" + ("b" * 59)
 # Legacy classic PAT: gh?_ + 36 alnum (still-must-fire regression).
 FAKE_CLASSIC_PAT = "ghp_" + ("c" * 36)
 # .env-style UNQUOTED assignment, >=32 secret-alphabet chars.
-FAKE_UNQUOTED_ENV = "API_KEY=" + ("d" * 40)
+FAKE_UNQUOTED_ENV = "API_KEY=" + ("d" * 40)  # vco-secret-scan: test-placeholder
 # Legacy QUOTED generic secret (must still fire).
-FAKE_QUOTED_SECRET = 'API_KEY="' + ("e" * 40) + '"'
+FAKE_QUOTED_SECRET = 'API_KEY="' + ("e" * 40) + '"'  # vco-secret-scan: test-placeholder
 # PEM fixtures. v0.2.82 gated a PEM alert on a >=120-char base64 body; the
 # owner ruling of 2026-10-12 (W6-T) removed that floor -- "secrets may not just
 # be keys, but also passwords, ports, IPs, whatever, potentially shorter than
@@ -79,7 +79,8 @@ PEM_EC_P256 = (
 # The stub with the explicit marker on its BEGIN line: the ONE way to silence it.
 PEM_STUB_MARKED = PEM_STUB.replace("-----\n", "----- # vco-secret-scan: test-placeholder\n", 1)
 
-def _run_sh_scanner(tmp_path: Path, file_body: str) -> str:
+def _run_sh_scanner(tmp_path: Path, file_body: str,
+                    name: str = "leak_candidate.txt") -> str:
     """Write ``file_body`` to a temp file, run the .sh scanner over it via
     the PostToolUse stdin envelope, return the harvested alert JSONL.
 
@@ -95,7 +96,7 @@ def _run_sh_scanner(tmp_path: Path, file_body: str) -> str:
     """
     proj = tmp_path / "proj"
     (proj / ".claude" / "logs").mkdir(parents=True, exist_ok=True)
-    target = proj / "leak_candidate.txt"
+    target = proj / name
     target.write_text(file_body, encoding="utf-8")
     payload = (
         '{"hook_event_name":"PostToolUse","tool_name":"Write",'
@@ -157,7 +158,9 @@ class TestShScannerShapes:
         assert alerts.strip() == "", f"vendored locale asset name flagged: {alerts}"
 
     def test_unquoted_env_assignment_fires(self, tmp_path):
-        alerts = _run_sh_scanner(tmp_path, FAKE_UNQUOTED_ENV)
+        # The unquoted shape serves env/config-style files only (owner
+        # ruling 2026-10-13, W6-V review F2), so the probe is a .env file.
+        alerts = _run_sh_scanner(tmp_path, FAKE_UNQUOTED_ENV, ".env")
         assert "Generic secret (unquoted)" in alerts, alerts
 
     def test_legacy_classic_pat_still_fires(self, tmp_path):
@@ -168,11 +171,15 @@ class TestShScannerShapes:
         alerts = _run_sh_scanner(tmp_path, FAKE_QUOTED_SECRET)
         assert "Generic secret" in alerts, alerts
 
-    def test_benign_short_config_line_does_not_fire(self, tmp_path):
-        # `API_KEY=on` is a legit config toggle — must NOT alert
-        # (leave-alone case).
+    def test_unquoted_value_is_decided_by_file_kind(self, tmp_path):
+        # Owner ruling 2026-10-13 (W6-V review F2): never by how a value
+        # looks. Outside an env/config-style file an unquoted RHS is an
+        # expression (leave-alone); in a .env file even `API_KEY=on` is a
+        # literal and alerts.
         alerts = _run_sh_scanner(tmp_path, "API_KEY=on\nDEBUG=true\n")
         assert "Generic secret" not in alerts, alerts
+        alerts = _run_sh_scanner(tmp_path / "env", "API_KEY=on\nDEBUG=true\n", ".env")
+        assert "Generic secret (unquoted)" in alerts, alerts
 
 
 @pytest.mark.skipif(_IS_WINDOWS, reason="bash hook; .ps1 covered separately")
@@ -1895,10 +1902,11 @@ class TestSingleQuotedSkeletonBackstopRound4:
 class TestPs1ScannerParity:
     """Behavioural parity for the Windows sibling (pwsh-gated)."""
 
-    def _run_ps1(self, tmp_path: Path, file_body: str) -> str:
+    def _run_ps1(self, tmp_path: Path, file_body: str,
+                 name: str = "leak_candidate.txt") -> str:
         proj = tmp_path / "proj"
         (proj / ".claude" / "logs").mkdir(parents=True, exist_ok=True)
-        target = proj / "leak_candidate.txt"
+        target = proj / name
         target.write_text(file_body, encoding="utf-8")
         payload = (
             '{"hook_event_name":"PostToolUse","tool_name":"Write",'
@@ -1919,7 +1927,7 @@ class TestPs1ScannerParity:
         assert "GitHub fine-grained PAT" in alerts, alerts
 
     def test_ps1_unquoted_env_assignment_fires(self, tmp_path):
-        alerts = self._run_ps1(tmp_path, FAKE_UNQUOTED_ENV)
+        alerts = self._run_ps1(tmp_path, FAKE_UNQUOTED_ENV, ".env")
         assert "Generic secret (unquoted)" in alerts, alerts
 
     def test_ps1_pem_stub_body_alerts(self, tmp_path):

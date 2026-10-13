@@ -44,8 +44,16 @@ if str(REPO) not in sys.path:
 
 from vco_lib.credential_shapes import (  # noqa: E402
     CONTEXTS,
+    BACKTICK_CODE_NAME_SUFFIXES,
+    ENV_CONFIG_EXACT_NAMES,
+    ENV_CONFIG_NAME_INFIXES,
+    ENV_CONFIG_NAME_PREFIXES,
+    ENV_CONFIG_NAME_SUFFIXES,
+    FILE_KINDS,
     SHAPES,
+    YAML_NAME_SUFFIXES,
     combined_pattern,
+    file_kind,
     matching_labels,
     patterns_for_context,
 )
@@ -62,9 +70,14 @@ def _cases() -> list[dict]:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))["cases"]
 
 
-def _ids_for(text: str, context: str) -> list[str]:
-    """Shape ids matching ``text`` in ``context``, per the Python SSOT."""
-    labels = set(matching_labels(text, context))
+def _file_kinds() -> list[dict]:
+    return json.loads(FIXTURE.read_text(encoding="utf-8"))["file_kinds"]
+
+
+def _ids_for(text: str, context: str, path: "str | None" = None) -> list[str]:
+    """Shape ids matching ``text`` in ``context`` (for the file ``path`` when
+    given), per the Python SSOT."""
+    labels = set(matching_labels(text, context, path))
     return [s.id for s in SHAPES if context in s.patterns and s.label in labels]
 
 
@@ -109,7 +122,7 @@ def test_fixture_contains_no_real_looking_token_literals():
 
 @pytest.mark.parametrize("case", _cases(), ids=lambda c: c["name"])
 def test_python_ssot_matches_fixture(case):
-    got = _ids_for(case["text"], case["context"])
+    got = _ids_for(case["text"], case["context"], case.get("path"))
     assert got == case["expect_ids"], (
         f"{case['name']} [{case['context']}]: expected {case['expect_ids']}, got {got}"
     )
@@ -122,7 +135,11 @@ def test_python_ssot_matches_fixture(case):
 _BASH_EVAL = r"""
 set -u
 . "$MIRROR"
-credshapes_for_context "$CS_CTX" || { echo "__BAD_CONTEXT__"; exit 0; }
+if [ -n "${CS_HAS_PATH:-}" ]; then
+    credshapes_for_context "$CS_CTX" "$CS_PATH" || { echo "__BAD_CONTEXT__"; exit 0; }
+else
+    credshapes_for_context "$CS_CTX" || { echo "__BAD_CONTEXT__"; exit 0; }
+fi
 for i in "${!CREDSHAPES_PATTERNS[@]}"; do
     if printf '%s' "$CS_TEXT" | LC_ALL=C grep -qE -- "${CREDSHAPES_PATTERNS[$i]}"; then
         printf '%s\n' "${CREDSHAPES_IDS[$i]}"
@@ -131,8 +148,11 @@ done
 """
 
 
-def _bash_ids(mirror: Path, text: str, context: str) -> list[str]:
+def _bash_ids(mirror: Path, text: str, context: str,
+              path: "str | None" = None) -> list[str]:
     env = dict(os.environ, MIRROR=str(mirror), CS_TEXT=text, CS_CTX=context)
+    if path is not None:
+        env.update(CS_HAS_PATH="1", CS_PATH=path)
     out = subprocess.run(
         ["bash", "-c", _BASH_EVAL], env=env, capture_output=True, text=True, timeout=60
     )
@@ -142,7 +162,7 @@ def _bash_ids(mirror: Path, text: str, context: str) -> list[str]:
 
 @pytest.mark.parametrize("case", _cases(), ids=lambda c: c["name"])
 def test_bash_mirror_matches_fixture(case):
-    got = _bash_ids(BASH_MIRROR, case["text"], case["context"])
+    got = _bash_ids(BASH_MIRROR, case["text"], case["context"], case.get("path"))
     assert got == case["expect_ids"], (
         f"bash mirror drifted on {case['name']} [{case['context']}]: "
         f"expected {case['expect_ids']}, got {got}"
@@ -161,8 +181,13 @@ $ErrorActionPreference = 'Stop'
 $doc = Get-Content -LiteralPath $env:FIXTURE -Raw | ConvertFrom-Json
 foreach ($case in $doc.cases) {
     $ids = @()
-    foreach ($s in (Get-CredShapes -Context $case.context)) {
-        if ($case.text -match $s.Re) { $ids += $s.Id }
+    if ($case.PSObject.Properties.Name -contains 'path') {
+        $shapes = Get-CredShapes -Context $case.context -Path $case.path
+    } else {
+        $shapes = Get-CredShapes -Context $case.context
+    }
+    foreach ($s in $shapes) {
+        if ($case.text -cmatch $s.Re) { $ids += $s.Id }
     }
     Write-Output ("{0}`t{1}" -f $case.name, ($ids -join ','))
 }
@@ -189,6 +214,90 @@ def test_powershell_mirror_matches_fixture():
         if got[case["name"]] != case["expect_ids"]:
             mismatches.append((case["name"], case["context"], case["expect_ids"], got[case["name"]]))
     assert not mismatches, f"PowerShell mirror drifted: {mismatches}"
+
+
+# ---------------------------------------------------------------------------
+# File kinds (owner ruling 2026-10-13, W6-V review F2) — every leg agrees on
+# file_kind(path), and the mirrors carry the SSOT's table verbatim.
+# ---------------------------------------------------------------------------
+
+
+def test_fixture_file_kinds_cover_both_kinds():
+    kinds = {r["kind"] for r in _file_kinds()}
+    assert kinds == set(FILE_KINDS)
+    assert len(_file_kinds()) >= 20
+
+
+@pytest.mark.parametrize("row", _file_kinds(), ids=lambda r: r["path"] or "<empty>")
+def test_python_file_kind_matches_fixture(row):
+    assert file_kind(row["path"]) == row["kind"]
+
+
+@pytest.mark.parametrize("row", _file_kinds(), ids=lambda r: r["path"] or "<empty>")
+def test_bash_file_kind_matches_fixture(row):
+    out = subprocess.run(
+        ["bash", "-c", 'set -u; . "$1"; credshapes_file_kind "$2"', "_",
+         str(BASH_MIRROR), row["path"]],
+        capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr[:400]
+    assert out.stdout == row["kind"], row
+
+
+@pytest.mark.skipif(_PWSH is None, reason="PowerShell not available on this host")
+def test_powershell_file_kind_matches_fixture():
+    script = r"""
+$ErrorActionPreference = 'Stop'
+. $env:MIRROR
+$doc = Get-Content -LiteralPath $env:FIXTURE -Raw | ConvertFrom-Json
+foreach ($r in $doc.file_kinds) {
+    Write-Output ("{0}`t{1}" -f $r.path, (Get-CredShapeFileKind -Path $r.path))
+}
+"""
+    env = dict(os.environ, MIRROR=str(PS1_MIRROR), FIXTURE=str(FIXTURE))
+    out = subprocess.run([_PWSH, *PWSH_BASE_FLAGS, "-Command", script],
+                         env=env, capture_output=True, text=True, timeout=180)
+    assert out.returncode == 0, out.stderr[:800]
+    got = [ln.split("\t", 1) for ln in out.stdout.splitlines() if "\t" in ln]
+    want = [[r["path"], r["kind"]] for r in _file_kinds()]
+    assert got == want
+
+
+def _sh_array(text: str, name: str) -> tuple:
+    m = re.search(name + r"=\(([^)]*)\)", text)
+    assert m, f"{name} not found in the bash mirror"
+    return tuple(re.findall(r"'([^']*)'", m.group(1)))
+
+
+def _ps_array(text: str, name: str) -> tuple:
+    m = re.search(r"\$" + name + r" = @\(([^)]*)\)", text)
+    assert m, f"${name} not found in the PowerShell mirror"
+    return tuple(re.findall(r"'([^']*)'", m.group(1)))
+
+
+def test_mirrors_carry_the_ssot_file_kind_table():
+    sh = BASH_MIRROR.read_text(encoding="utf-8")
+    ps = PS1_MIRROR.read_text(encoding="utf-8-sig")
+    for ssot, sh_name, ps_name in (
+        (ENV_CONFIG_EXACT_NAMES, "CREDSHAPES_ENV_CONFIG_EXACT_NAMES", "exact"),
+        (ENV_CONFIG_NAME_PREFIXES, "CREDSHAPES_ENV_CONFIG_NAME_PREFIXES", "prefixes"),
+        (ENV_CONFIG_NAME_INFIXES, "CREDSHAPES_ENV_CONFIG_NAME_INFIXES", "infixes"),
+        (ENV_CONFIG_NAME_SUFFIXES, "CREDSHAPES_ENV_CONFIG_NAME_SUFFIXES", "suffixes"),
+        (YAML_NAME_SUFFIXES, "CREDSHAPES_YAML_NAME_SUFFIXES", "yaml"),
+        (BACKTICK_CODE_NAME_SUFFIXES, "CREDSHAPES_BACKTICK_CODE_NAME_SUFFIXES", "backtick"),
+    ):
+        assert _sh_array(sh, sh_name) == ssot, sh_name
+        assert _ps_array(ps, ps_name) == ssot, ps_name
+    # Each restricted shape serves exactly one kind, and both mirrors carry
+    # the same id -> kind table.
+    restricted = tuple((s.id, s.file_kinds[0]) for s in SHAPES if s.file_kinds)
+    assert all(s.file_kinds is None or len(s.file_kinds) == 1 for s in SHAPES)
+    assert restricted == (("generic_secret_backtick", "backtick_code"),
+                          ("generic_secret_unquoted", "env_config"),
+                          ("generic_secret_unquoted_yaml", "yaml"))
+    assert _sh_array(sh, "CREDSHAPES_KIND_RESTRICTED") == tuple(
+        f"{i}:{k}" for i, k in restricted)
+    ps_pairs = tuple(re.findall(r"\$r\['([^']+)'\] = '([^']+)'", ps))
+    assert ps_pairs == restricted
 
 
 # ---------------------------------------------------------------------------

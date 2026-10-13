@@ -101,7 +101,7 @@ def test_review_r3_f23_a_user_line_above_a_vco_line_keeps_the_user_line(tmp_path
 
     assert env.read_bytes() == f"OPENAI_API_KEY={TYPED}\r\nOTHER=1\r\n".encode(), "CRLF kept too"
     assert result["removed"] == {".env": ["OPENAI_API_KEY"]}
-    assert result["left"] == {".env": {"OPENAI_API_KEY": "not_vco"}}
+    assert result["left"] == {".env": {"OPENAI_API_KEY": "not_vco"}}  # vco-secret-scan: test-placeholder
 
 
 def test_a_vco_line_above_a_user_line_likewise(tmp_path, stored):
@@ -164,7 +164,7 @@ def test_the_user_owned_entry_gives_the_paused_reason(tmp_path, stored, monkeypa
     (tmp_path / ".claude" / "settings.json").write_text(json.dumps({"env": {"OPENAI_API_KEY": TYPED}}))
     monkeypatch.setattr(cp, "known_user_secret_keys_for_folder", lambda _f: ["OPENAI_API_KEY"])
     assert user_owned_secrets.found_with_reasons(tmp_path) == {
-        ".claude/settings.json": {"OPENAI_API_KEY": "paused"},
+        ".claude/settings.json": {"OPENAI_API_KEY": "paused"},  # vco-secret-scan: test-placeholder
     }
     user_owned_secrets.emit_deferral(tmp_path)
     from vco_lib.deferral_report import DeferralReport

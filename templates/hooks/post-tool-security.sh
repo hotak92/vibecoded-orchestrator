@@ -128,7 +128,7 @@ done
 # shellcheck source=_lib/credshapes.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/credshapes.sh" ] && . "$SCRIPT_DIR/_lib/credshapes.sh"
 if ! command -v credshapes_for_context >/dev/null 2>&1 \
-   || ! credshapes_for_context content_scan \
+   || ! credshapes_for_context content_scan "$EDITED_FILE" \
    || [ "${#CREDSHAPES_PATTERNS[@]}" -eq 0 ] \
    || [ -z "${CREDSHAPES_TEST_PLACEHOLDER_MARKER:-}" ]; then
     # A MISSING vocabulary must not look like a clean file. Downstream treats an

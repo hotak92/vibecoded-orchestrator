@@ -136,7 +136,7 @@ def test_the_probe_clears_once_the_key_is_gone_or_empty(project, fix):
 
 
 def test_an_unreadable_file_is_unknown_not_reported(project):
-    (project / ".claude" / "settings.json").write_text('{"env": {"STALE_SECRET": "x"},, }')
+    (project / ".claude" / "settings.json").write_text('{"env": {"STALE_SECRET": "x"},, }')  # vco-secret-scan: test-placeholder
     assert user_owned_secrets.found(project) == {}
 
 

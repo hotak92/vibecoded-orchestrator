@@ -127,7 +127,7 @@ if (-not (Get-Command Get-CredShapes -ErrorAction SilentlyContinue) -or
 } else {
     $spec = [ordered]@{
         marker = (Get-CredShapesTestPlaceholderMarker)
-        shapes = @(Get-CredShapes -Context 'content_scan' | ForEach-Object { ,@($_.Id, $_.Label, $_.Re) })
+        shapes = @(Get-CredShapes -Context 'content_scan' -Path $EditedFile | ForEach-Object { ,@($_.Id, $_.Label, $_.Re) })
     }
     # The vocabulary rides an environment variable, not argv: Windows
     # PowerShell 5.1 mangles a native argument that holds a double quote, and

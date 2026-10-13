@@ -429,7 +429,7 @@ def test_a_run_that_stores_nothing_refuses_the_flag_loudly(stores, monkeypatch, 
 
 @pytest.mark.parametrize("line", [
     f'OPENAI_API_KEY="{CANARY}"\n',          # the reviewer's probe B
-    f"OPENAI_API_KEY='{CANARY}'\n",
+    f"OPENAI_API_KEY='{CANARY}'\n",  # vco-secret-scan: test-placeholder
     f"export OPENAI_API_KEY={CANARY}\n",
     f'export OPENAI_API_KEY="{CANARY}"\n',
     f"OPENAI_API_KEY={CANARY}\r\n",          # CRLF file

@@ -141,14 +141,17 @@ mod tests {
 
     #[test]
     fn audit_flags_secret_shaped_keys_with_real_values() {
-        let env = "\
-# a comment
-export GITHUB_TOKEN=ghp_realvalue
-OPENAI_API_KEY=\"sk-abc123\"
-PLAIN_VAR=not-a-secret
-DB_PASSWORD='hunter2'
-NOT_A_KEY_HERE=whatever
-";
+        // One line per literal so the DB_PASSWORD fixture can carry the
+        // credential-scan test-placeholder marker outside the string (a
+        // quoted .env value keeps any trailing text, so it cannot go inside).
+        let env = concat!(
+            "# a comment\n",
+            "export GITHUB_TOKEN=ghp_realvalue\n",
+            "OPENAI_API_KEY=\"sk-abc123\"\n",
+            "PLAIN_VAR=not-a-secret\n",
+            "DB_PASSWORD='hunter2'\n", // vco-secret-scan: test-placeholder
+            "NOT_A_KEY_HERE=whatever\n",
+        );
         let got = audit_env_secrets(env);
         assert_eq!(
             got,

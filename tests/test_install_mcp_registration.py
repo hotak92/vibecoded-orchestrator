@@ -122,7 +122,7 @@ class FilterEnvTests(unittest.TestCase):
             "WEAVIATE_URL": "http://localhost:8081",
             "OLLAMA_URL": "http://localhost:11435",
             "GITHUB_TOKEN": "ghp_super_secret_xxx",
-            "OPENAI_API_KEY": "sk-xyz",
+            "OPENAI_API_KEY": "sk-xyz",  # vco-secret-scan: test-placeholder
         }
         safe, dropped = install._filter_env_for_global_json(candidate)
         self.assertIn("WEAVIATE_URL", safe)

@@ -124,7 +124,7 @@ return labels and booleans only.
 from __future__ import annotations
 
 import re
-from typing import Dict, Mapping, Tuple
+from typing import Dict, Mapping, Optional, Tuple
 
 __all__ = [
     "CONTEXTS",
@@ -136,6 +136,15 @@ __all__ = [
     "matching_labels",
     "is_credential_shaped_name",
     "TEST_PLACEHOLDER_MARKER",
+    "FILE_KINDS",
+    "ENV_CONFIG_EXACT_NAMES",
+    "ENV_CONFIG_NAME_PREFIXES",
+    "ENV_CONFIG_NAME_INFIXES",
+    "ENV_CONFIG_NAME_SUFFIXES",
+    "YAML_NAME_SUFFIXES",
+    "BACKTICK_CODE_NAME_SUFFIXES",
+    "file_kind",
+    "patterns_for_file",
 ]
 
 #: The ONE explicit opt-out a content scanner honours (owner ruling
@@ -149,6 +158,65 @@ __all__ = [
 #: parity test pins both to this value.
 TEST_PLACEHOLDER_MARKER = "vco-secret-scan: test-placeholder"
 
+#: File kinds for the content scanners (owner ruling 2026-10-13, W6-V review
+#: F2, refined in re-review 2): the kind is decided by the file's NAME, never
+#: by how a value looks.
+#:
+#: * ``env_config`` -- an unquoted value is a literal: .env / .env.* / *.env.*,
+#:   .ini / .cnf, .properties, .conf / .cfg, shell scripts and rc files,
+#:   Dockerfile / Containerfile (``ENV``), .pypirc and .npmrc (ini syntax).
+#: * ``yaml`` -- the same, with YAML's own value syntax (``null``, ``~``,
+#:   ``*alias``, flow / template braces) silent: its own unquoted shape.
+#: * ``backtick_code`` -- a language with backtick STRING literals (JS / TS and
+#:   their component formats, Go raw strings); the only kind where a backtick
+#:   literal is a value. In shell / env files a backtick is command
+#:   substitution and in prose (markdown, rst) inline-code syntax.
+#: * ``code`` -- everything else: an unquoted value is an expression.
+FILE_KINDS: Tuple[str, ...] = ("env_config", "yaml", "backtick_code", "code")
+
+#: The ONE file-kind table. Matched against the LOWER-CASED basename, in this
+#: order: env_config (exact name, prefix, infix, suffix), yaml, backtick_code,
+#: else code. Mirrored as data in ``_lib/credshapes.sh`` / ``.ps1`` (they
+#: classify a path with a basename ``case``, no Python needed) and pinned by
+#: ``tests/test_credential_shapes_parity.py`` -- both the literal lists and a
+#: behaviour table in the parity fixture.
+#:
+#: ``.npmrc`` is env_config: npm config is ini syntax and its credential keys
+#: (``_password``, ``//host/:_password``) hold literal values; a
+#: ``${NPM_TOKEN}`` reference stays silent like any ``$`` reference.
+ENV_CONFIG_EXACT_NAMES: Tuple[str, ...] = (
+    ".env", "env", ".envrc", "dockerfile", "containerfile",
+    ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".zshenv", ".profile",
+    ".pypirc", ".npmrc",
+)
+ENV_CONFIG_NAME_PREFIXES: Tuple[str, ...] = ("dockerfile.", "containerfile.")
+ENV_CONFIG_NAME_INFIXES: Tuple[str, ...] = (".env.",)
+ENV_CONFIG_NAME_SUFFIXES: Tuple[str, ...] = (
+    ".env", ".ini", ".cnf", ".properties", ".conf", ".cfg",
+    ".sh", ".bash", ".zsh", ".dockerfile",
+)
+YAML_NAME_SUFFIXES: Tuple[str, ...] = (".yaml", ".yml")
+BACKTICK_CODE_NAME_SUFFIXES: Tuple[str, ...] = (
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
+    ".vue", ".svelte", ".go",
+)
+
+
+def file_kind(path: str) -> str:
+    """The :data:`FILE_KINDS` entry for ``path``, from its basename only."""
+    name = (path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if (name in ENV_CONFIG_EXACT_NAMES
+            or name.startswith(ENV_CONFIG_NAME_PREFIXES)
+            or any(i in name for i in ENV_CONFIG_NAME_INFIXES)
+            or name.endswith(ENV_CONFIG_NAME_SUFFIXES)):
+        return "env_config"
+    if name.endswith(YAML_NAME_SUFFIXES):
+        return "yaml"
+    if name.endswith(BACKTICK_CODE_NAME_SUFFIXES):
+        return "backtick_code"
+    return "code"
+
+
 #: The four haystacks, each with its own documented bias. A caller MUST name one.
 CONTEXTS: Tuple[str, ...] = ("repo_scan", "content_scan", "command_scan", "argv_name")
 
@@ -160,24 +228,113 @@ class CredentialShape:
     ABSENT from the mapping means this shape deliberately does not participate
     in that context (see the module docstring for why ``aws_access_key_id`` is
     absent from ``repo_scan``). Absence is a design statement, not an omission.
+
+    ``file_kinds`` (``None`` = every kind) restricts the shape to files of
+    those :data:`FILE_KINDS` when a scanner knows the path
+    (:func:`patterns_for_file`).
     """
 
-    __slots__ = ("id", "label", "patterns", "note")
+    __slots__ = ("id", "label", "patterns", "note", "file_kinds")
 
     def __init__(
-        self, id: str, label: str, patterns: Mapping[str, str], note: str = ""
+        self, id: str, label: str, patterns: Mapping[str, str], note: str = "",
+        file_kinds: Optional[Tuple[str, ...]] = None,
     ) -> None:
         self.id = id
         self.label = label
         self.patterns: Dict[str, str] = dict(patterns)
         self.note = note
+        self.file_kinds = file_kinds
         for ctx in self.patterns:
             if ctx not in CONTEXTS:
                 raise ValueError(f"{id}: unknown context {ctx!r}")
+        for kind in file_kinds or ():
+            if kind not in FILE_KINDS:
+                raise ValueError(f"{id}: unknown file kind {kind!r}")
+        # The mirrors encode a restriction as ONE kind per shape id.
+        if file_kinds is not None and len(file_kinds) != 1:
+            raise ValueError(f"{id}: a restricted shape names exactly one kind")
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return f"CredentialShape({self.id!r}, contexts={sorted(self.patterns)})"
 
+
+#: Key names of the two generic-secret shapes (``content_scan`` only). Each
+#: letter is a ``[Xx]`` pair because the three regex engines disagree on case:
+#: ``grep -E`` and Python ``re`` are case-sensitive, .NET ``-match`` is not,
+#: and there is no inline-flag syntax common to all three. Matched unanchored,
+#: so compounds such as ``DB_PASSWORD`` / ``client_secret`` / ``MYSQL_PWD``
+#: are covered. PASSWORD / PASSWD / PWD / PASSPHRASE joined the list with the
+#: W6-V owner ruling (2026-10-12). The mirrors carry the expanded literal.
+_GENERIC_KEY = (
+    "("
+    "[Ss][Ee][Cc][Rr][Ee][Tt]"
+    "|[Aa][Pp][Ii]_[Kk][Ee][Yy]"
+    "|[Aa][Cc][Cc][Ee][Ss][Ss]_[Tt][Oo][Kk][Ee][Nn]"
+    "|[Pp][Rr][Ii][Vv][Aa][Tt][Ee]_[Kk][Ee][Yy]"
+    "|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]"
+    "|[Pp][Aa][Ss][Ss][Ww][Dd]"
+    "|[Pp][Ww][Dd]"
+    "|[Pp][Aa][Ss][Ss][Pp][Hh][Rr][Aa][Ss][Ee]"
+    ")"
+)
+
+#: In front of the key (re-review 2 #2): the compound key (``DB_PASSWORD``,
+#: ``db.password``, ``--password``) must start at line start, after a ``{`` not
+#: preceded by ``$``, or after any char that is not ``$``, an identifier char
+#: or ``{``. A key that is itself a ``$`` / ``${`` reference (``"$PWD:/app"``,
+#: ``PYTHONPATH=$PWD:/x``, ``"${SECRET}"``) is syntax, not a key.
+_GENERIC_KEY_BOUNDARY = "(^|[^$A-Za-z0-9_{]|(^|[^$])\\{)[A-Za-z0-9_.-]*"
+
+#: Between the key and a quoted value (W6-V review F1, re-review 2 #4): an
+#: optional closing quote (a JSON / dict key), an optional ``?`` (a TS optional
+#: member), an optional type annotation, then ``=``, ``:`` or ``:=``. The
+#: annotation is either ``: TYPE`` -- with an optional ``&`` and Rust lifetime
+#: (``&str``, ``&'static str``), dotted / ``::`` paths and one ``<...>`` or
+#: ``[...]`` suffix (``Option<&str>``, ``Optional[str]``) -- or Go's bare
+#: ``NAME TYPE =`` form. The key must END right there, so prefix compounds
+#: match and suffix compounds (``password_hint``) do not: key matching, not a
+#: judgement on the value. ``==`` / ``!=`` never match.
+_GENERIC_SEP = (
+    "[\"']?\\??\\s*"
+    "(:\\s*&?('[A-Za-z_]+\\s+)?[A-Za-z_][A-Za-z0-9_.:]*"
+    "(<[A-Za-z0-9_., &'<>]*>|\\[[A-Za-z0-9_., ]*\\])?\\s*"
+    "|\\s+[A-Za-z_][A-Za-z0-9_.]*\\s*)?"
+    ":?[:=]\\s*"
+)
+
+#: A quoted literal of ANY non-empty length (owner ruling 2026-10-12): single,
+#: double or triple quotes with an optional string prefix (``r`` ``b`` ``u``
+#: ``f``, up to two letters). The only skips are SYNTAX, never the look of a
+#: value: a DOUBLE-quoted value opening with ``$`` or ``{`` (shell / template
+#: expansion, a format template, an f-string ``f"{x}"``), and an ``f``-prefixed
+#: single-quoted value opening with ``{`` (Python ``f'{x}'``). A plain
+#: single-quoted ``'$x'`` / ``'{x}'`` is a literal (review F3).
+_GENERIC_QUOTED_VALUE = (
+    "([rRbBuUfF]{0,2}\"\"\"[^\"${][^\"]*\"\"\""
+    "|[rRbBuU]{0,2}'''[^'][^']*'''"
+    "|[rRfF]{1,2}'''[^'{][^']*'''"
+    "|[rRbBuUfF]{0,2}\"[^\"${][^\"]*\""
+    "|[rRbBuU]{0,2}'[^'][^']*'"
+    "|[rRfF]{1,2}'[^'{][^']*')"
+)
+
+#: A backtick literal without ``${`` interpolation: its own shape, restricted
+#: to ``backtick_code`` files (coordinator decision 2026-10-13 + re-review 2
+#: #1): elsewhere a backtick is shell command substitution or markdown inline
+#: code -- syntax, so silent.
+_GENERIC_BACKTICK_VALUE = "`([^`$]|\\$[^`{])+\\$?`"
+
+#: YAML unquoted value: as the env/config arm, plus YAML's own value syntax
+#: silent (coordinator decision 2026-10-13 under the owner's rules): ``null``
+#: (any case), ``~``, an ``*alias``, flow ``{...}`` / ``[...]`` and
+#: ``{{ template }}``. Block-scalar indicators ``|`` / ``>`` (with ``-`` /
+#: ``+``) ALERT -- a literal follows on the next line -- and so does an anchored
+#: value ``&a hunter2``.
+_GENERIC_YAML_VALUE = (
+    "([^\"'$`~*{\\[nN #]|[nN]($|[^uU])|[nN][uU]($|[^lL])"
+    "|[nN][uU][lL]($|[^lL])|[nN][uU][lL][lL][^ ])"
+)
 
 # ---------------------------------------------------------------------------
 # The vocabulary. Mirrors reproduce these EXACTLY (id, label and per-context
@@ -361,16 +518,76 @@ SHAPES: Tuple[CredentialShape, ...] = (
     CredentialShape(
         "generic_secret_quoted",
         "Generic secret",
-        {"content_scan": "(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\\s*[:=]\\s*[\"'][a-zA-Z0-9+/=_\\-]{32,}"},
+        {"content_scan": (_GENERIC_KEY_BOUNDARY + _GENERIC_KEY + _GENERIC_SEP
+                          + _GENERIC_QUOTED_VALUE)},
+        note=(
+            "Owner ruling 2026-10-12 (W6-V): a secret may be a password, a "
+            "port or an IP, far shorter than an API key, so ANY non-empty "
+            "QUOTED literal under a secret-shaped key alerts -- no length "
+            "floor (it was 32+ chars of a base64-ish alphabet). The forms are "
+            "documented on _GENERIC_SEP (JSON keys, type annotations, `:=`) "
+            "and _GENERIC_QUOTED_VALUE (prefixes, triple quotes). "
+            "A literal must be closed on the same line. Not literals, so not "
+            "matched: an unquoted RHS (`getenv(...)`, `os.environ[...]`, "
+            "`$PASS`), a DOUBLE-quoted value or an f-prefixed single-quoted "
+            "value that opens with `$` / `{` -- syntax, not a value -- a key "
+            "that is itself a `$` reference, and the empty string. Only the "
+            "OPENING character is read: `\"pre$X\"` alerts while "
+            "`\"${X}suffix\"` does not; telling them apart would need a "
+            "judgement on the rest of the value, which the owner rules out. "
+            "Nothing about the value itself "
+            "is judged (a `<YOUR_...>` placeholder, a single-quoted `'$x'` "
+            "alert too): only TEST_PLACEHOLDER_MARKER on the line silences it."
+        ),
+    ),
+    CredentialShape(
+        "generic_secret_backtick",
+        "Generic secret (backtick literal)",
+        {"content_scan": (_GENERIC_KEY_BOUNDARY + _GENERIC_KEY + _GENERIC_SEP
+                          + _GENERIC_BACKTICK_VALUE)},
+        note=(
+            "A JS / TS / Go backtick literal assigned to a secret-shaped key, "
+            "any non-empty length, unless it contains `${` (interpolation is "
+            "syntax). backtick_code files only: in shell / env files a "
+            "backtick is command substitution and in prose inline code."
+        ),
+        file_kinds=("backtick_code",),
     ),
     CredentialShape(
         "generic_secret_unquoted",
         "Generic secret (unquoted)",
-        {"content_scan": "(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\\s*[:=]\\s*[a-zA-Z0-9+/=_\\-]{32,}"},
+        {"content_scan": (
+            _GENERIC_KEY_BOUNDARY + _GENERIC_KEY
+            + "[\"']?\\s*[:=]([^\"'$` ]|\\s+[^\"'$`# ])"
+            "|ENV\\s+[A-Za-z0-9_]*" + _GENERIC_KEY + "\\s+[\"']?[^\"'$`# ]"
+        )},
         note=(
-            "The dotenv shape `API_KEY=abc…` with no quotes. The quoted variant "
-            "requires an opening quote after `=` and misses it entirely."
+            "Owner ruling 2026-10-13 (W6-V review F2): an unquoted value is a "
+            "literal in an env/config-style file and an expression in code, so "
+            "this shape serves ONLY file_kind() == 'env_config' (dropped by "
+            "patterns_for_file for every other path), and there it matches ANY "
+            "non-empty unquoted value -- the 32-char floor is gone. Skipped as "
+            "syntax, never by how a value looks: a `$` reference (`$X`, "
+            "`${X}`, `$(...)`), a backtick command substitution, a quoted "
+            "value (generic_secret_quoted's job), and `#` AFTER whitespace (a "
+            "comment; directly after `=` it is part of the value), and a key "
+            "that is itself a `$` reference (`$PWD:/app`). A quoted key "
+            "(`\"password\": x`) counts. The second arm is Dockerfile's legacy "
+            "`ENV KEY value` form. YAML files use generic_secret_unquoted_yaml."
         ),
+        file_kinds=("env_config",),
+    ),
+    CredentialShape(
+        "generic_secret_unquoted_yaml",
+        "Generic secret (unquoted, YAML)",
+        {"content_scan": (_GENERIC_KEY_BOUNDARY + _GENERIC_KEY
+                          + "[\"']?\\s*[:=]\\s*" + _GENERIC_YAML_VALUE)},
+        note=(
+            "generic_secret_unquoted for YAML files: any non-empty unquoted "
+            "scalar under a secret-shaped key, with YAML's value syntax silent "
+            "(see _GENERIC_YAML_VALUE). A `#` always opens a comment here."
+        ),
+        file_kinds=("yaml",),
     ),
     CredentialShape(
         "leak_probe",
@@ -420,6 +637,18 @@ def patterns_for_context(context: str) -> Tuple[Tuple[str, str, str], ...]:
     )
 
 
+def patterns_for_file(context: str, path: str) -> Tuple[Tuple[str, str, str], ...]:
+    """:func:`patterns_for_context`, restricted to the shapes that serve the
+    :func:`file_kind` of ``path``. Every content scanner knows the path it
+    scans and must use this (or its mirror), not the unrestricted list."""
+    kind = file_kind(path)
+    _require_context(context)
+    return tuple(
+        (s.id, s.label, s.patterns[context]) for s in SHAPES
+        if context in s.patterns and (s.file_kinds is None or kind in s.file_kinds)
+    )
+
+
 def combined_pattern(context: str) -> str:
     """Return one ``|``-joined alternation of every pattern in ``context``.
 
@@ -431,14 +660,20 @@ def combined_pattern(context: str) -> str:
     return "|".join(p for _id, _label, p in patterns_for_context(context))
 
 
-def matching_labels(text: str, context: str) -> Tuple[str, ...]:
+def matching_labels(
+    text: str, context: str, path: Optional[str] = None
+) -> Tuple[str, ...]:
     """Return the labels whose ``context`` pattern matches ``text``.
 
-    Never returns, logs or echoes any part of ``text`` itself — only labels.
+    With ``path``, only the shapes serving that file's kind are tried
+    (:func:`patterns_for_file`). Never returns, logs or echoes any part of
+    ``text`` itself — only labels.
     """
     _require_context(context)
+    shapes = (patterns_for_context(context) if path is None
+              else patterns_for_file(context, path))
     out = []
-    for _id, label, pattern in patterns_for_context(context):
+    for _id, label, pattern in shapes:
         if re.search(pattern, text):
             out.append(label)
     return tuple(out)
