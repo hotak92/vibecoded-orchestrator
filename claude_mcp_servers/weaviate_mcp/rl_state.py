@@ -103,11 +103,17 @@ _rl_monitor_tasks: "set[asyncio.Task]" = set()
 # `cosine_sims` (max over answer-chunks × n_emb) + `literal_cited` and write
 # a single v3 citation event without re-fetching anything from Weaviate.
 #
-# Eviction: LRU-ish, bounded at `_RL_NODE_CACHE_MAX`. Entries are popped by
-# the monitor on success; expired-but-unwritten entries (timeout, evicted by
-# new traffic) are dropped silently — the retrieval event still got written
-# at cache-fill time, only the citation event is lost. This is the same
-# soft-fail discipline as the hub POST: no retry, no fallback.
+# Eviction: LRU-ish, bounded at `_RL_NODE_CACHE_MAX` entries AND (W6-MEM) at
+# `memory_bounds.node_cache_max_bytes()` estimated bytes (env
+# `VCO_RL_NODE_CACHE_MAX_BYTES`). Entries are popped by the monitor on fire.
+# Eviction loses no citation: a running monitor holds its own reference to its
+# ctx from its first poll (F-B), and every search also stages the durable
+# pending file the Stop-hook drain computes from (F-QUEUE).
+#
+# W6-MEM: entries are stored COMPACTED — every float vector packed into an
+# `array` buffer by `rl_client.ctx_compact.compact_ctx` (lossless) — and the
+# monitor calls `expand_ctx` before handing the ctx to any consumer, so the
+# consumers below still see plain `list[float]` values.
 #
 # Each entry shape (matches what `_rl_answer_monitor` reads):
 #   {
@@ -124,6 +130,10 @@ _rl_monitor_tasks: "set[asyncio.Task]" = set()
 #   }
 _rl_node_content_cache: dict[str, dict] = {}
 _RL_NODE_CACHE_MAX: int = 256
+# W6-MEM: estimated retained bytes per `_rl_node_content_cache` key, maintained
+# by `search_pipeline._store_compact_ctx` for the byte bound (kept in step with
+# the cache on every store, so a key the monitor popped is forgotten there).
+_rl_node_content_cache_sizes: dict[str, int] = {}
 
 # ─── Answer-monitor tuning ──────────────────────────────────────────────
 # NOTE (v0.2.73 M-1): the ``match_position_for_query as _match_position_for_query``

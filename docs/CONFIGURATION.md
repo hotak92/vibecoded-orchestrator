@@ -407,6 +407,16 @@ The `rl_events` table in `launcher.db` is written on every ranked retrieval rega
 
 Since v0.2.91 the prune is **archive-then-delete**: victim rows are written to a compressed, loader-readable sidecar and verified before any `DELETE` runs, and a failed archive aborts the prune so nothing is deleted. See [`features/04-knowledge-and-code-graph.md`](features/04-knowledge-and-code-graph.md#retention-archive-then-delete-v0291) for the archive format and how to read one back.
 
+### RL memory bounds in the weaviate-kg MCP (v0.2.102)
+
+The weaviate-kg MCP process lives as long as your Claude Code session, so its RL caches are bounded in bytes as well as in entries. All three knobs are read on every use, live in `claude_mcp_servers/rl_client/memory_bounds.py`, and fall back to the default on an unset, non-numeric, zero or negative value. None of them drops training data: an evicted cache entry is re-read or recomputed, and a deferred monitor's citation is computed by the Stop-hook drain from the pending file every search stages.
+
+| Var | Default | What it does |
+|---|---|---|
+| `VCO_RL_TRANSCRIPT_CACHE_MAX_BYTES` | `268435456` (256 MiB) | Estimated memory the answer monitor's parsed-transcript cache may hold. Least-recently-used transcripts are evicted first. The transcript just read is always kept, because re-parsing it on every poll would cost the same memory plus the CPU. |
+| `VCO_RL_NODE_CACHE_MAX_BYTES` | `67108864` (64 MiB) | Estimated memory of the per-search citation cache. Oldest entries are evicted first, and a running monitor keeps its own copy. |
+| `VCO_RL_MONITOR_MAX_CONCURRENT` | `64` | How many answer monitors may run at once. When the cap is reached, no running monitor is cancelled: the new search starts no monitor, and its citation is computed from its pending file at the next Stop. |
+
 ## Container runtime
 
 `vco_lib/containers.py` resolves the runtime via:

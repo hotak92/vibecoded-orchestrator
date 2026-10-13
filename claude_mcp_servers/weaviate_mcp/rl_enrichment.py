@@ -165,9 +165,12 @@ def _rl_load_messages(transcript_path: "Path") -> list[dict]:
     parsed messages without re-reading or re-JSON-parsing a single byte. The
     monitor polls every ``_RL_MONITOR_POLL_INTERVAL`` and, pre-Concern-B, this
     re-parsed the whole (growing) transcript on EVERY poll — O(file × polls).
-    A cache HIT is byte-identical to a full re-parse (the file didn't change),
-    so the extracted answer window is unchanged; the drain uses the same shared
-    loader (mirror-don't-fork).
+    W6-MEM: a GROWN transcript costs only its appended bytes (incremental
+    parse), the messages are slimmed to the fields the answer-window consumers
+    read, and the monitor calls this from a worker thread
+    (``_rl_scan_candidate`` via ``asyncio.to_thread``). The extracted answer
+    window is unchanged; the drain uses the same shared loader
+    (mirror-don't-fork).
     """
     from claude_mcp_servers.rl_client.answer_window import load_messages_cached
     return load_messages_cached(transcript_path)
@@ -544,6 +547,39 @@ def _rl_delete_own_pending_file(task_id: str) -> None:
     except Exception as exc:  # noqa: BLE001
         server.logger.debug("RL monitor: pending-file cleanup failed (%s)", exc)
 
+def _rl_scan_candidate(
+    candidate: "Path", query_snippet: str, pos_idx: int,
+) -> "tuple[str, bool, bool] | None":
+    """Load one candidate transcript and locate this retrieval's answer window.
+
+    The synchronous half of one monitor poll, run via ``asyncio.to_thread`` so
+    neither the transcript parse nor the O(messages) scans block the event loop
+    (W6-MEM). Returns None when the query is not found in this transcript, else
+    ``(answer, complete, human_turn)`` — ``human_turn`` is whether a human turn
+    follows the search, evaluated only when it can matter (an incomplete,
+    non-empty window), exactly as the inline code it replaces did.
+    """
+    messages = server._rl_load_messages(candidate)
+    kg_positions = server._rl_find_kg_positions(messages)
+
+    # Find matching position by query fingerprint + seq tiebreak.
+    # v0.2.70 (S2): the matcher lives in rl_client.answer_window so the
+    # MCP monitor and the Stop-hook drain agree byte-for-byte on which
+    # answer window belongs to which retrieval (one home).
+    matched_pos = _match_position_for_query(
+        messages, kg_positions, query_snippet, pos_idx
+    )
+    if matched_pos is None:
+        return None
+
+    start_msg_idx, start_blk_idx = matched_pos
+    # Right transcript — check if answer is complete
+    answer, complete = server._rl_extract_answer_window(messages, start_msg_idx, start_blk_idx)
+    human_turn = False
+    if not complete and answer.strip():
+        human_turn = bool(server._rl_human_turn_after(messages, start_msg_idx))
+    return answer, complete, human_turn
+
 async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     """
     Background asyncio task: poll the session transcript until Claude's answer
@@ -611,7 +647,9 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
 
         # F-B: snapshot the ctx into the closure as soon as it's available.
         # We do NOT pop here — the populate path manages the cache size; we
-        # only need a private reference that eviction can't strand.
+        # only need a private reference that eviction can't strand. W6-MEM:
+        # the reference held is the COMPACT entry (expanded only at fire), so
+        # a monitor polling for up to an hour pins ~1/8 of the old bytes.
         if held_ctx is None:
             _staged = server._rl_node_content_cache.get(task_id)
             if _staged is not None:
@@ -660,23 +698,16 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             _last_stat_sig = {str(c): _stat_sig(c) for c in candidates}
 
         for candidate in candidates:
-            messages = server._rl_load_messages(candidate)
-            kg_positions = server._rl_find_kg_positions(messages)
-
-            # Find matching position by query fingerprint + seq tiebreak.
-            # v0.2.70 (S2): the matcher lives in rl_client.answer_window so the
-            # MCP monitor and the Stop-hook drain agree byte-for-byte on which
-            # answer window belongs to which retrieval (one home).
-            matched_pos = _match_position_for_query(
-                messages, kg_positions, query_snippet, pos_idx
+            # W6-MEM: the transcript load (a parse of every new byte) and the
+            # O(messages) scans run in a worker thread — on a GB-scale
+            # transcript they take seconds, and inside the event loop they
+            # stalled every concurrent MCP tool call for that long.
+            scanned = await asyncio.to_thread(
+                _rl_scan_candidate, candidate, query_snippet, pos_idx,
             )
-
-            if matched_pos is None:
+            if scanned is None:
                 continue
-
-            start_msg_idx, start_blk_idx = matched_pos
-            # Right transcript — check if answer is complete
-            answer, complete = server._rl_extract_answer_window(messages, start_msg_idx, start_blk_idx)
+            answer, complete, human_turn = scanned
             fire_reason = "threshold" if complete else ""
             # V52-N: the sentinel forces fire even when the extractor returned
             # complete=False (i.e. we haven't accumulated enough yet but compaction
@@ -694,7 +725,7 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             # monitor fire promptly. Gated on the same token floor as the
             # threshold path so we don't fire on a noisy preamble.
             if not complete and answer.strip():
-                if server._rl_human_turn_after(messages, start_msg_idx):
+                if human_turn:
                     try:
                         from claude_mcp_servers.weaviate_mcp.chunking import TokenCounter
                         _tok = TokenCounter.count_tokens(answer)
@@ -738,7 +769,14 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                 # so a late fire is not stranded by LRU eviction. Fall back to
                 # the cache for the (rare) case the very first poll already had
                 # a complete answer. We still pop the cache to free the slot.
-                ctx = held_ctx or server._rl_node_content_cache.get(task_id)
+                #
+                # W6-MEM: the cache stores the ctx COMPACTED (vectors packed in
+                # ``array`` buffers); ``expand_ctx`` hands every consumer below
+                # — the citation compute, the ``ctx`` riders, the /rl_update
+                # payload — a plain-list copy with the identical values. A ctx
+                # that was never compacted (a plain-list entry) passes through.
+                from claude_mcp_servers.rl_client.ctx_compact import expand_ctx
+                ctx = expand_ctx(held_ctx or server._rl_node_content_cache.get(task_id))
                 server._rl_node_content_cache.pop(task_id, None)
                 # F-LOG: persist answer-window length + the fire reason so the
                 # "≥25k tokens" distribution and monitor lifecycle are auditable

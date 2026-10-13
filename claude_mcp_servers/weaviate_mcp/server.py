@@ -1121,6 +1121,7 @@ _RL_MAX_LINKED = _rl_state._RL_MAX_LINKED
 _rl_call_seq = _rl_state._rl_call_seq  # re-export of the counter's current value
 _rl_monitor_tasks = _rl_state._rl_monitor_tasks  # by-reference (set, mutated in place)
 _rl_node_content_cache = _rl_state._rl_node_content_cache  # by-reference (dict)
+_rl_node_content_cache_sizes = _rl_state._rl_node_content_cache_sizes  # by-reference (dict)
 _RL_NODE_CACHE_MAX = _rl_state._RL_NODE_CACHE_MAX
 _RL_MONITOR_POLL_INTERVAL = _rl_state._RL_MONITOR_POLL_INTERVAL
 _RL_MONITOR_ANSWER_THRESHOLD_TOKENS = _rl_state._RL_MONITOR_ANSWER_THRESHOLD_TOKENS
