@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Running the Rust tests no longer stalls the user's live hub** (W6-KC; owner question #38). Keychain tests used to hold the production `~/.vct/keyring.pace` lock for their whole run, so the hub's keychain reads waited on them and its clients saw a busy keychain; tests now pace each keychain op on their own `vct-keychain-test.pace` file in the temp dir and never take the production lock.
+- **Running the Rust tests no longer stalls the user's live hub** (W6-KC; owner question #38). Keychain tests used to hold the production `~/.vct/keyring.pace` lock for their whole run, so the hub's keychain reads waited on them and its clients saw a busy keychain; tests that hold the keychain test guard (`keychain_serialize_lock`) now pace each keychain op on their own `vct-keychain-test.pace` file in the temp dir and never take the production lock. The guarantee is scoped to guard holders: a paced keychain op in a test that does NOT hold the guard still paces on the production file (no such test exists today — the guard remains the one home for every keychain-touching test).
 
 - **The V52-D container-resume test no longer flakes when two test runs share a host** (W6-KC). It and two sibling tests started a real container under one fixed name (`vct-rl-reranker-rs-slug`), so concurrent runs collided; each run now gets its own container name, a free port and a scratch state dir, and removes its container even when it fails.
 

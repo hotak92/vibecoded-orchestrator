@@ -518,6 +518,13 @@ pub(crate) mod cross_process_pace {
     // one op at a time, exactly the way the shipped processes pace against each
     // other on the production file.
     //
+    // The redirect is per-guard, not per-binary: a test that runs a paced
+    // keychain op WITHOUT holding the guard (or code compiled outside this
+    // crate's `cfg(test)`, where the baton layer does not exist) still
+    // resolves to the production file. Every keychain-touching test takes
+    // the guard; `keychain_serialize_lock_never_holds_the_production_pace_lock`
+    // pins the redirect for those that do.
+    //
     // Why not the production file (what v0.2.83 T-1 did — it held the
     // production flock for the WHOLE test): the hub waits up to
     // `PACE_LOCK_ACQUIRE_DEADLINE` (30s) for that flock but answers its caller

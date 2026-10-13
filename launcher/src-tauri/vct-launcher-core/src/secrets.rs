@@ -4330,7 +4330,7 @@ mod tests {
                 return; // absent: nothing can hold a lock on it
             };
             let me = std::process::id();
-            let holders = flock_holder_pids(meta.ino());
+            let holders = flock_holder_pids(meta.dev(), meta.ino());
             assert!(
                 !holders.contains(&me),
                 "this process (pid {me}) holds the production pace flock {production:?} while a \
@@ -4339,11 +4339,21 @@ mod tests {
         }
     }
 
-    /// Pids holding a granted FLOCK on inode `ino`, from `/proc/locks`
-    /// (`<n>: FLOCK  ADVISORY  WRITE <pid> <maj>:<min>:<ino> 0 EOF`; blocked
-    /// waiters are `<n>: -> FLOCK …` lines and are not holders).
+    /// Pids holding a granted FLOCK on device `dev` + inode `ino`, from
+    /// `/proc/locks` (`<n>: FLOCK  ADVISORY  WRITE <pid> <maj>:<min>:<ino> 0
+    /// EOF`; blocked waiters are `<n>: -> FLOCK …` lines and are not
+    /// holders). BOTH the device (maj:min) and the inode must match:
+    /// inode numbers are unique only per-filesystem, so an inode-only
+    /// match can blame an unrelated lock on a file with the same inode on
+    /// another device (W6-KC R3, K3).
     #[cfg(target_os = "linux")]
-    fn flock_holder_pids(ino: u64) -> Vec<u32> {
+    fn flock_holder_pids(dev: u64, ino: u64) -> Vec<u32> {
+        let (want_maj, want_min) = unsafe {
+            (
+                libc::major(dev as libc::dev_t),
+                libc::minor(dev as libc::dev_t),
+            )
+        };
         let table = std::fs::read_to_string("/proc/locks").expect("read /proc/locks");
         table
             .lines()
@@ -4352,8 +4362,18 @@ mod tests {
                 if f.len() < 6 || f[1] != "FLOCK" {
                     return None;
                 }
-                let line_ino: u64 = f[5].rsplit(':').next()?.parse().ok()?;
-                if line_ino == ino {
+                let id: Vec<&str> = f[5].split(':').collect();
+                if id.len() != 3 {
+                    return None;
+                }
+                let (Ok(line_maj), Ok(line_min), Ok(line_ino)) = (
+                    id[0].parse::<u32>(),
+                    id[1].parse::<u32>(),
+                    id[2].parse::<u64>(),
+                ) else {
+                    return None;
+                };
+                if line_maj == want_maj && line_min == want_min && line_ino == ino {
                     f[4].parse().ok()
                 } else {
                     None

@@ -3740,7 +3740,23 @@ mod tests {
         }
     }
 
-    fn make_manifest(tag_from_version: bool, auto_restart: bool) -> ModuleManifest {
+    /// The production logs-volume host template. `{HOME}` resolves to the
+    /// OS home, so once placeholders substitute this is the user's REAL
+    /// `~/.claude/retrieval_rl_data` — where the launcher's RL importer
+    /// reads training events from. Only manifests that never reach a real
+    /// `podman run` (arg-building / resolver tests) may use it; see
+    /// [`FIXTURE_RL_LOGS_HOST`] for the container-starting fixture.
+    const PROD_RL_LOGS_HOST: &str = "{HOME}/.claude/retrieval_rl_data";
+
+    /// The resume fixture's logs-volume host template. `{VCT_DATA}`
+    /// resolves under the fixture's scratch `VCT_STATE_DIR` (see
+    /// [`RealPodmanResumeFixture`]), so a really-started container's
+    /// `--log-path /data/logs/...` can only ever write inside the
+    /// fixture's scratch dir — never a new `rl_events_rs-*.jsonl` in the
+    /// user's real RL data dir (W6-KC R3, finding K1).
+    const FIXTURE_RL_LOGS_HOST: &str = "{VCT_DATA}/retrieval_rl_data";
+
+    fn make_manifest(tag_from_version: bool, auto_restart: bool, logs_host: &str) -> ModuleManifest {
         let mut env_fixed = HashMap::new();
         env_fixed.insert("RL_SERVER_PORT".into(), "11438".into());
         env_fixed.insert("PYTHONUNBUFFERED".into(), "1".into());
@@ -3831,7 +3847,7 @@ mod tests {
                         mode: Some("rw".into()),
                     },
                     VolumeMount {
-                        host: "{HOME}/.claude/retrieval_rl_data".into(),
+                        host: logs_host.into(),
                         container: "/data/logs".into(),
                         mode: Some("rw".into()),
                     },
@@ -3899,7 +3915,7 @@ mod tests {
     fn prepared_start_carries_the_claimed_installs_recorded_mounts() {
         let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
         let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
-        let manifest = make_manifest(true, true);
+        let manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         assert!(!manifest.runtime.volumes.is_empty(), "precondition: the manifest mounts something");
         let (db, pid) = open_db_with_resume_project();
         let mut project = make_project();
@@ -3925,7 +3941,7 @@ mod tests {
     async fn a_refused_restart_stops_and_removes_nothing() {
         let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
         let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
-        let mut manifest = make_manifest(true, true);
+        let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         manifest.secrets = serde_json::from_value(serde_json::json!([
             { "key": "RL_API_TOKEN", "scope": "per-project" }
         ]))
@@ -3996,7 +4012,7 @@ mod tests {
     #[tokio::test]
     async fn w4r01_restart_refused_by_another_installs_label_stops_nothing() {
         let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
-        let manifest = make_manifest(true, true);
+        let manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         let project = make_project();
         let db = Db::open_in_memory().unwrap();
         let ctx = PlaceholderCtx::new(&manifest.id);
@@ -4042,7 +4058,7 @@ mod tests {
 
     #[test]
     fn resolve_image_ref_uses_manifest_container_image_and_version() {
-        let manifest = make_manifest(true, true);
+        let manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         let got = resolve_image_ref(
             "{install.container.image}:{install.container.tag}",
             &manifest,
@@ -4054,7 +4070,7 @@ mod tests {
 
     #[test]
     fn resolve_image_ref_uses_install_ref_when_tag_from_version_false() {
-        let mut manifest = make_manifest(false, true);
+        let mut manifest = make_manifest(false, true, PROD_RL_LOGS_HOST);
         manifest.install.r#ref = Some("latest".into());
         let got = resolve_image_ref(
             "{install.container.image}:{install.container.tag}",
@@ -4069,7 +4085,7 @@ mod tests {
 
     #[test]
     fn build_podman_run_args_includes_port_mapping() {
-        let manifest = make_manifest(true, true);
+        let manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
         let args = build_podman_run_args(
@@ -4126,7 +4142,7 @@ mod tests {
                 21435,
             ))
             .unwrap();
-        let manifest = make_manifest(true, true);
+        let manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
         let args = build_podman_run_args(&manifest, &ctx, &project, 11533, "x", "img:tag", "podman", None)
@@ -4149,7 +4165,7 @@ mod tests {
 
     #[test]
     fn build_podman_run_args_resolves_volume_placeholders() {
-        let manifest = make_manifest(true, true);
+        let manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
         let args = build_podman_run_args(&manifest, &ctx, &project, 11533, "x", "img:tag", "podman", None)
@@ -4168,9 +4184,53 @@ mod tests {
         assert!(!logs_vol.starts_with("{HOME}"), "{{HOME}} must be resolved");
     }
 
+    /// W6-KC R3 (K1): the resume fixture's manifest must NEVER bind-mount
+    /// the user's real `~/.claude/retrieval_rl_data` into the container the
+    /// fixture may really start — the server's `--log-path` under
+    /// `/data/logs` could create a new `rl_events_rs-*.jsonl` there, which
+    /// the launcher imports as training data. The fixture manifests use
+    /// [`FIXTURE_RL_LOGS_HOST`] (`{VCT_DATA}`-based), so the resolved mount
+    /// source must sit inside the fixture's scratch `VCT_STATE_DIR` and
+    /// must not touch `~/.claude`. Contrast with
+    /// [`build_podman_run_args_resolves_volume_placeholders`], which pins
+    /// the PRODUCTION `{HOME}` form for the placeholder-resolution check.
+    #[test]
+    fn fixture_manifest_logs_mount_stays_inside_scratch_state_dir() {
+        let fx = RealPodmanResumeFixture::new();
+        let manifest = make_manifest_for_gate("service", InstallMethod::ContainerPull);
+        let project = make_project();
+        // PlaceholderCtx::new reads VCT_STATE_DIR, which the fixture's
+        // guard points at its scratch dir — the same resolution the real
+        // resume path performs inside the fixture.
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args =
+            build_podman_run_args(&manifest, &ctx, &project, 11533, "x", "img:tag", "podman", None)
+                .expect("build args");
+
+        let logs_vol = args
+            .iter()
+            .find(|a| a.contains(":/data/logs:rw"))
+            .expect("fixture logs volume must be present in {args:?}");
+        let source = logs_vol.split(":/data/logs").next().unwrap_or("");
+        let scratch = fx.state_dir();
+        assert!(
+            std::path::Path::new(source).starts_with(scratch),
+            "the fixture's logs mount source {source:?} must resolve inside the fixture's \
+             scratch state dir {scratch:?}, never the user's real RL data dir"
+        );
+        assert!(
+            !source.contains("/.claude"),
+            "the fixture's logs mount source {source:?} must never point under ~/.claude"
+        );
+        assert!(
+            !source.contains("{"),
+            "the fixture's logs mount source {source:?} must be fully placeholder-resolved"
+        );
+    }
+
     #[test]
     fn build_podman_run_args_uses_unless_stopped_when_auto_restart_true() {
-        let manifest = make_manifest(true, true);
+        let manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
         let args =
@@ -4181,7 +4241,7 @@ mod tests {
 
     #[test]
     fn build_podman_run_args_omits_restart_flag_when_auto_restart_false() {
-        let manifest = make_manifest(true, false);
+        let manifest = make_manifest(true, false, PROD_RL_LOGS_HOST);
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
         let args =
@@ -4192,7 +4252,7 @@ mod tests {
 
     #[test]
     fn build_podman_run_args_rejects_non_container_runtime() {
-        let mut manifest = make_manifest(true, true);
+        let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         manifest.runtime.r#type = "mcp_stdio".into();
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
@@ -4208,7 +4268,7 @@ mod tests {
     /// but with `type = "service"` to guard against future regressions.
     #[test]
     fn build_podman_run_args_accepts_service_runtime_type() {
-        let mut manifest = make_manifest(true, true);
+        let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         manifest.runtime.r#type = "service".into();
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
@@ -4225,7 +4285,7 @@ mod tests {
     /// replaced with the synthesizing helpers.
     #[test]
     fn start_container_for_module_succeeds_with_synthesized_defaults() {
-        let mut manifest = make_manifest(true, true);
+        let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         manifest.runtime.r#type = "service".into();
         // Remove explicitly-declared fields to exercise the synthesis path.
         manifest.runtime.container_name_template = None;
@@ -4262,7 +4322,7 @@ mod tests {
 
     #[test]
     fn build_podman_run_args_resolves_project_slug_in_command_args() {
-        let manifest = make_manifest(true, true);
+        let manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
         let args =
@@ -4743,10 +4803,14 @@ mod tests {
     /// So each fixture gets: a slug unique to this process AND call (hence a
     /// unique container name), a port the OS just handed out (not the shared
     /// window a real reranker container may hold), a scratch `VCT_STATE_DIR`
-    /// (so `{VCT_DATA}` dirs, the GPU snapshot read and `runtime.txt` are the
-    /// test's own, never the user's), the runtime-pin env cleared under the
-    /// workspace env lock (the W5-B order-flake fix, kept), and removal of its
-    /// container on drop — on a failed assert too.
+    /// (so `{VCT_DATA}` dirs — INCLUDING the fixture manifests' logs mount,
+    /// [`FIXTURE_RL_LOGS_HOST`] (W6-KC R3 K1: it previously bind-mounted the
+    /// user's REAL `~/.claude/retrieval_rl_data` rw, and the server's
+    /// `--log-path` could drop a new `rl_events_rs-*.jsonl` there on every
+    /// run) — the GPU snapshot read and `runtime.txt` are the test's own,
+    /// never the user's), the runtime-pin env cleared under the workspace env
+    /// lock (the W5-B order-flake fix, kept), and removal of its container on
+    /// drop — on a failed assert too.
     struct RealPodmanResumeFixture {
         db: Db,
         pid: String,
@@ -4780,6 +4844,14 @@ mod tests {
         fn container_name(&self) -> String {
             format!("vct-rl-reranker-{}", self.slug)
         }
+
+        /// The fixture's scratch `VCT_STATE_DIR` — the root every
+        /// `{VCT_DATA}` placeholder resolves under while the fixture
+        /// lives. Every host path the really-started container touches
+        /// must be inside it.
+        fn state_dir(&self) -> &std::path::Path {
+            self._state.path()
+        }
     }
 
     impl Drop for RealPodmanResumeFixture {
@@ -4796,9 +4868,11 @@ mod tests {
     /// Manifest with the supplied runtime type + install method.
     /// Reuses `make_manifest`'s container block so the synthesis
     /// helpers (resolve_container_name_template / resolve_image_ref)
-    /// have everything they need.
+    /// have everything they need. The logs volume is the FIXTURE host
+    /// ([`FIXTURE_RL_LOGS_HOST`]): these manifests feed the resume
+    /// tests, whose fixture can really start the container.
     fn make_manifest_for_gate(runtime_type: &str, method: InstallMethod) -> ModuleManifest {
-        let mut m = make_manifest(true, true);
+        let mut m = make_manifest(true, true, FIXTURE_RL_LOGS_HOST);
         m.runtime.r#type = runtime_type.into();
         m.install.method = method;
         m
@@ -5504,7 +5578,7 @@ mod tests {
     #[test]
     fn v0247_resolve_image_ref_cuda_variant_end_to_end() {
         use crate::manifest::GpuImageVariants;
-        let mut manifest = make_manifest(true, true);
+        let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         manifest.version = "0.2.8".into();
         manifest.runtime.gpu_image_variants = Some(GpuImageVariants {
             cpu: "{version}-cpu".into(),
@@ -5529,7 +5603,7 @@ mod tests {
     #[test]
     fn v0247_resolve_image_ref_cpu_variant_end_to_end() {
         use crate::manifest::GpuImageVariants;
-        let mut manifest = make_manifest(true, true);
+        let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         manifest.version = "0.2.8".into();
         manifest.runtime.gpu_image_variants = Some(GpuImageVariants {
             cpu: "{version}-cpu".into(),
@@ -5555,7 +5629,7 @@ mod tests {
     /// install + start the same way they always did.
     #[test]
     fn v0247_resolve_image_ref_legacy_no_variants_block_unchanged() {
-        let mut manifest = make_manifest(true, true);
+        let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
         manifest.version = "0.2.7".into();
         // no gpu_image_variants on this manifest fixture
         assert!(manifest.runtime.gpu_image_variants.is_none());
@@ -5621,7 +5695,7 @@ mod tests {
                 .expect("set installed");
 
             // Resolver returns a manifest with scope=PerProject (default).
-            let manifest = make_manifest(true, true);
+            let manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
             auto_migrate_per_project_to_global(&db, |id: &str| {
                 if id == "vct-rl-reranker" {
                     Some(manifest.clone())
@@ -5676,7 +5750,7 @@ mod tests {
             }
 
             // Manifest now declares scope=global.
-            let mut manifest = make_manifest(true, true);
+            let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
             manifest.install.scope = crate::manifest::InstallScope::Global;
             auto_migrate_per_project_to_global(&db, |id: &str| {
                 if id == "vct-rl-reranker" {
@@ -5740,7 +5814,7 @@ mod tests {
             )
             .expect("set installed");
 
-            let mut manifest = make_manifest(true, true);
+            let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
             manifest.install.scope = crate::manifest::InstallScope::Global;
 
             // First run.
