@@ -68,8 +68,16 @@ HOOK_STDIN=$(cat 2>/dev/null || echo "")
 # Untrustworthy session id ("" / "default") → EMPTY store paths → record
 # nothing, exactly like the injectors' inject-blind policy. Never compose a
 # shared bucket that could bleed one chat's suppression into another.
+# v0.2.102 W6-C1 (F1): the key is the PER-AGENT composite — the module
+# docstring's "the model has these exact bytes" is only true for the agent
+# whose tool call this is (a subagent's explicit retrieval reaches the
+# subagent's context, never the parent's), so the record must land in THAT
+# agent's store. vco_hook_agent_key sanitises both components and yields
+# exactly vco_hook_session_id's answer on a main-agent payload.
 SESSION_ID_RAW=""
-if command -v vco_hook_session_id >/dev/null 2>&1; then
+if command -v vco_hook_agent_key >/dev/null 2>&1; then
+    SESSION_ID_RAW="$(vco_hook_agent_key "$HOOK_STDIN")"
+elif command -v vco_hook_session_id >/dev/null 2>&1; then
     SESSION_ID_RAW="$(vco_hook_session_id "$HOOK_STDIN")"
 fi
 [ -n "$SESSION_ID_RAW" ] || exit 0

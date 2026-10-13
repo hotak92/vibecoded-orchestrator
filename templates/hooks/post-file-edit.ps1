@@ -56,6 +56,12 @@ if (Test-Path $EmitContextLib) { . $EmitContextLib }
 # Exit code is unchanged: always 0. MUST MATCH post-file-edit.sh.
 $RouteLib = Join-Path $PSScriptRoot "_lib/route-touched-path.ps1"
 if (Test-Path $RouteLib) { . $RouteLib }
+# v0.2.102 W6-C1 (F16): the per-agent key helper, for the once-per-session
+# broken-install notice below (its sentinel must not let a subagent's notice
+# silence the main chat's). Conditional source, same discipline.
+# MUST MATCH post-file-edit.sh.
+$SessionIdLib = Join-Path $PSScriptRoot "_lib/session-id.ps1"
+if (Test-Path $SessionIdLib) { . $SessionIdLib }
 
 # Accumulate LLM-visible reminders, emit one envelope at the end.
 $LlmNudge = ""
@@ -134,9 +140,17 @@ if (Get-Command Invoke-VcoRouteTouchedPath -ErrorAction SilentlyContinue) {
 } elseif (Get-Command Emit-VcoMissingHookLibNotice -ErrorAction SilentlyContinue) {
     # The routing home is absent (or unreadable) -- a broken install, not a
     # degraded mode. Say so once per session, then carry on with the nudges
-    # this hook owns; exit stays 0.
+    # this hook owns; exit stays 0. v0.2.102 W6-C1 (F16): the notice is
+    # delivered as PostToolUse context, which reaches the SUBAGENT only
+    # when this edit is a lane's -- key the sentinel per agent so the
+    # lane's notice never silences the main chat's.
+    # MUST MATCH post-file-edit.sh.
+    $noticeKey = $SessionIdFromStdin
+    if ($AgentId -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyContinue)) {
+        $noticeKey = Get-VcoAgentKeyFromIds -SessionId $SessionIdFromStdin -AgentId $AgentId
+    }
     $missingNotice = Emit-VcoMissingHookLibNotice -HooksDir $ScriptDir `
-        -ProjectRoot $ProjectRoot -SessionId $SessionIdFromStdin `
+        -ProjectRoot $ProjectRoot -SessionId $noticeKey `
         -Lib "route-touched-path.ps1"
     if ($missingNotice) { Add-Nudge $missingNotice }
 }

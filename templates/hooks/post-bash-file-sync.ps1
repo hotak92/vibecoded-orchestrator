@@ -62,6 +62,11 @@ if ($Env:CLAUDE_PROJECT_DIR) {
 # not skipped in silence (v0.2.95 ship-gate review MAJOR-2).
 $WriteTargetsLib = Join-Path $PSScriptRoot "_lib/bash-write-targets.ps1"
 if (Test-Path $WriteTargetsLib) { . $WriteTargetsLib }
+# v0.2.102 W6-C1 (F16): the per-agent key helper for the once-per-session
+# notices below. Conditional source, same discipline as the libs above.
+# MUST MATCH post-bash-file-sync.sh.
+$SessionIdLib = Join-Path $PSScriptRoot "_lib/session-id.ps1"
+if (Test-Path $SessionIdLib) { . $SessionIdLib }
 
 # --- Hook input -----------------------------------------------------------
 $HookStdin = ""
@@ -71,17 +76,31 @@ if (-not $HookStdin) { exit 0 }
 $ToolName = ""
 $Command = ""
 $SessionId = ""
+# v0.2.102 W6-C1 (F16): agent_id joined the parse so the once-per-session
+# notices below key per agent and the telemetry export can attribute a
+# lane's CLI writes to the lane (same shape as post-file-edit.ps1).
+$AgentId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
         if ($payload.tool_name) { $ToolName = [string]$payload.tool_name }
         if ($payload.session_id) { $SessionId = [string]$payload.session_id }
+        if ($payload.agent_id) { $AgentId = [string]$payload.agent_id }
         if ($payload.tool_input -and $payload.tool_input.command) {
             $Command = [string]$payload.tool_input.command
         }
     }
 } catch {
     # Empty/malformed stdin -- keep variables at defaults.
+}
+
+# v0.2.102 W6-C1 (F16): the notices reach the SUBAGENT only when this write
+# is a lane's -- key their sentinels per agent (the ONE session-id helper)
+# so the lane's notice never silences the main chat's. MUST MATCH the .sh
+# sibling (both notice sites use the same key).
+$NoticeKey = $SessionId
+if ($AgentId -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyContinue)) {
+    $NoticeKey = Get-VcoAgentKeyFromIds -SessionId $SessionId -AgentId $AgentId
 }
 
 # Bash, or the PowerShell tool (v0.2.102 W5-D -- the only shell tool on
@@ -97,7 +116,7 @@ if (-not $Command) { exit 0 }
 if (-not (Get-Command Test-VcoWriteSuspicious -ErrorAction SilentlyContinue)) {
     if (Get-Command Emit-VcoMissingHookLibNotice -ErrorAction SilentlyContinue) {
         $missingNotice = Emit-VcoMissingHookLibNotice -HooksDir $ScriptDir `
-            -ProjectRoot $ProjectRoot -SessionId $SessionId `
+            -ProjectRoot $ProjectRoot -SessionId $NoticeKey `
             -Lib "bash-write-targets.ps1"
         if ($missingNotice -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
             Emit-AdditionalContext $missingNotice PostToolUse
@@ -108,8 +127,10 @@ if (-not (Get-Command Test-VcoWriteSuspicious -ErrorAction SilentlyContinue)) {
 if (-not (Test-VcoWriteSuspicious -Command $Command -Tool $ToolName)) { exit 0 }
 
 # Telemetry attribution for the children we spawn (same 3-layer chain as
-# post-file-edit.ps1).
+# post-file-edit.ps1). v0.2.102 W6-C1 (F16): VCT_AGENT_ID joins the export
+# so the debounced runner's kg-sync-failure sentinel keys per agent.
 if ($SessionId) { $Env:VCT_SESSION_ID = $SessionId }
+if ($AgentId) { $Env:VCT_AGENT_ID = $AgentId }
 
 # --- Command -> written paths --------------------------------------------
 Initialize-VcoBashWriteTargets -HooksDir $ScriptDir
@@ -125,7 +146,7 @@ if (-not (Get-Command Invoke-VcoRouteTouchedPath -ErrorAction SilentlyContinue))
     # + one additionalContext envelope, then exit 0 as the contract requires.
     if (Get-Command Emit-VcoMissingHookLibNotice -ErrorAction SilentlyContinue) {
         $missingNotice = Emit-VcoMissingHookLibNotice -HooksDir $ScriptDir `
-            -ProjectRoot $ProjectRoot -SessionId $SessionId `
+            -ProjectRoot $ProjectRoot -SessionId $NoticeKey `
             -Lib "route-touched-path.ps1"
         if ($missingNotice -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
             Emit-AdditionalContext $missingNotice PostToolUse

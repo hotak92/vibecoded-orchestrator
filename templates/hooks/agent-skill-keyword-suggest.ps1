@@ -70,6 +70,15 @@ $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 if (-not $HookStdin) { exit 0 }
 
+# v0.2.102 W6-C1 (F14): a background subagent's completion arrives in the
+# parent as a SYNTHETIC UserPromptSubmit whose prompt starts with the
+# literal "<task-notification>" tag -- it is a harness delivery, not user
+# prose, and keyword suggestions drawn from the subagent's report body are
+# noise. Skip it BEFORE the JSON parse below, exactly like
+# inject_intent.prompt_query does for the prompt-time KG retrieval.
+# MUST MATCH agent-skill-keyword-suggest.sh.
+if ($HookStdin -match '"prompt"\s*:\s*"<task-notification') { exit 0 }
+
 $Prompt = ""
 $SessionId = ""
 try {

@@ -45,6 +45,18 @@ $SessionId = if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue)
 } else {
     ""
 }
+# v0.2.102 W6-C1 (F17): if PostCompact fires for a SUBAGENT'S own
+# auto-compaction (harness behaviour UNVERIFIED by the probe, but the
+# payload would carry agent_id exactly like every other tool event), the
+# reset must touch ONLY that agent's stores -- the parent's context did NOT
+# reset, so wiping its dedupe/read state would re-suppress or double-inject
+# for the main chat. Get-VcoHookAgentKey yields the per-agent composite
+# key; a main-chat compaction (no agent_id) keeps the plain session id, so
+# every wipe below is byte-identical to the pre-W6-C1 names for the main
+# agent. MUST MATCH post-compact.sh.
+if (Get-Command Get-VcoHookAgentKey -ErrorAction SilentlyContinue) {
+    $SessionId = Get-VcoHookAgentKey -Stdin $Payload
+}
 
 # Wipe the KG/codegraph injection dedup state for this session — the LLM
 # just lost the context that included those previously-injected nodes, so

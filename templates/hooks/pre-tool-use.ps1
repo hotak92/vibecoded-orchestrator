@@ -122,6 +122,18 @@ if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
     $SessionIdRaw = ($SessionIdFromStdin -replace '[^A-Za-z0-9_-]', '')
 }
 $SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } elseif ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { (Get-Date).ToString("yyyyMMdd_HH") }
+# v0.2.102 W6-C1 (F11): the Build-Anchor reads ledger is per AGENT. The
+# payload's $AgentId (parsed above) is set exactly when this tool call
+# belongs to a SUBAGENT -- whose context never saw the parent's Reads (and
+# vice versa), so sharing reads_<sid>.txt let a subagent overwrite with
+# Write a file only the parent Read (the gate failed open across agents).
+# The composite key comes from the ONE session-id helper; the main agent's
+# key is byte-identical to the pre-W6-C1 name (this branch only adds the
+# __<agent_id> component when $AgentId is non-empty). MUST MATCH pre-tool-use.sh.
+$AnchorSessionKey = $SessionId
+if ($AgentId -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyContinue)) {
+    $AnchorSessionKey = Get-VcoAgentKeyFromIds -SessionId $SessionId -AgentId $AgentId
+}
 # Per-session dedup state lives under the project's .claude/state/ rather
 # than $env:TMPDIR / $env:TEMP so it survives reboots + launcher restarts
 # (Claude Code persists session_id across restarts via the resume feature).
@@ -129,7 +141,7 @@ $SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } elseif ($env:CLAUD
 # and wiped only by PostCompact (correct semantic — context truly resets
 # at compaction).
 $SessionStateDir = Join-Path $ProjectRoot ".claude/state"
-$SessionReadsFile = Join-Path $SessionStateDir "reads_$SessionId.txt"
+$SessionReadsFile = Join-Path $SessionStateDir "reads_$AnchorSessionKey.txt"
 $BackupDir = Join-Path $SessionStateDir "tool_backups"
 $SecurityLog = Join-Path $ProjectRoot ".claude/logs/security_events.jsonl"
 
@@ -147,6 +159,10 @@ New-Item -ItemType Directory -Force -Path $BackupDir -ErrorAction SilentlyContin
 # HK-4 (v0.2.75) accepted-scatter: one of 4 per-hook GC sweeps (uniform 14d);
 # a shared sweeper is optional and deliberately SKIPPED to keep hooks
 # single-file. MUST MATCH the .sh sibling. See pre-edit-context-inject.ps1.
+# v0.2.102 W6-C1 (F1/F11): the per-agent names reads_<sid>__<agent>.txt and
+# seen_reads_<sid>__<agent>.txt are already covered by these two filters
+# (the wildcard spans the '__<agent_id>' component), so the GC needs no new
+# pattern.
 try {
     Get-ChildItem -Path $SessionStateDir -Filter 'reads_*.txt' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
@@ -351,7 +367,16 @@ if ($ToolName -eq "Read") {
             $relFp = ConvertTo-VcoRepoRelative -Path $filePath -ProjectRoot $ProjectRoot
         }
         if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-            $unifiedReads = Get-VcoSeenStorePath -Kind "reads" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+            # v0.2.102 W6-C1 (F1): the injector reads-ledger is per AGENT --
+            # a subagent's Read must not mark sources "already in context"
+            # for the parent (whose window never saw them), nor be silenced
+            # by the parent's Reads. Same composite key as the router's.
+            # MUST MATCH pre-tool-use.sh.
+            $storeSid = $SessionIdRaw
+            if ($AgentId -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyContinue)) {
+                $storeSid = Get-VcoAgentKeyFromIds -SessionId $SessionIdRaw -AgentId $AgentId
+            }
+            $unifiedReads = Get-VcoSeenStorePath -Kind "reads" -SessionId $storeSid -ProjectRoot $ProjectRoot
             if ($unifiedReads) {
                 try { Add-Content -Path $unifiedReads -Value $relFp -ErrorAction Stop } catch { }
             }

@@ -82,6 +82,22 @@ set -uo pipefail
 INPUT="$(cat 2>/dev/null || true)"
 [ -z "$INPUT" ] && exit 0
 
+# v0.2.102 W6-C1 (F4): on the PostToolUse path, exit IMMEDIATELY when the
+# payload carries a non-empty agent_id — this is a SUBAGENT's tool call.
+# The probe (2026-10-13) showed Pre/PostToolUse fire inside subagents with
+# agent_id set while session_id/transcript stay the PARENT'S, so before
+# this guard: (a) a lane writing a KG node reset the MAIN chat's nudge
+# baseline (silencing the nudge for work the main chat did), and (b) every
+# subagent tool call paid one Python start plus a contended lock on the
+# machine-wide kg_update_tokens.jsonl for a row only the parent should own.
+# The UserPromptSubmit counting path NEVER carries agent_id (it fires in
+# the parent only) and is unchanged; the pattern probe below needs no JSON
+# parser, so the exit costs nothing. MUST MATCH kg-update-nudge.ps1.
+if printf '%s' "$INPUT" | grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    && printf '%s' "$INPUT" | grep -Eq '"agent_id"[[:space:]]*:[[:space:]]*"[^"]+"'; then
+    exit 0
+fi
+
 FIRST_THRESHOLD="${KG_NUDGE_FIRST:-175000}"
 INTERVAL="${KG_NUDGE_INTERVAL:-50000}"
 METRIC_VERSION="v10"

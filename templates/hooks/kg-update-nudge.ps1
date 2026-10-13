@@ -54,6 +54,20 @@ if ($env:KG_NUDGE_OFF -eq "1") { exit 0 }
 $input_json = [Console]::In.ReadToEnd()
 if (-not $input_json) { exit 0 }
 
+# v0.2.102 W6-C1 (F4): on the PostToolUse path, exit IMMEDIATELY when the
+# payload carries a non-empty agent_id -- this is a SUBAGENT'S tool call.
+# The probe (2026-10-13) showed Pre/PostToolUse fire inside subagents with
+# agent_id set while session_id/transcript stay the PARENT'S, so before
+# this guard: (a) a lane writing a KG node reset the MAIN chat's nudge
+# baseline, and (b) every subagent tool call paid one Python start plus a
+# contended lock on the machine-wide kg_update_tokens.jsonl for a row only
+# the parent should own. The UserPromptSubmit counting path NEVER carries
+# agent_id and is unchanged; the pattern probe below needs no JSON parser.
+# MUST MATCH kg-update-nudge.sh.
+if ($input_json -match '"tool_name"\s*:\s*"[^"]+"' -and $input_json -match '"agent_id"\s*:\s*"[^"]+"') {
+    exit 0
+}
+
 # Defaults — match the .sh sibling exactly.
 $FIRST_THRESHOLD = if ($env:KG_NUDGE_FIRST) { $env:KG_NUDGE_FIRST } else { "175000" }
 $INTERVAL        = if ($env:KG_NUDGE_INTERVAL) { $env:KG_NUDGE_INTERVAL } else { "50000" }
