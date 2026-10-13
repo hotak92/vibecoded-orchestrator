@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with vct_secrets_resolve.ps1 (an empty-string hub
+# value is a miss - exit 4 - on both sides; every behaviour must match
+# the .ps1 sibling).
 # vct_secrets_resolve.sh — agent-facing secret resolver.
 #
 # ONE RESOLUTION CHAIN (v0.2.73 unification — MUST MATCH the other two

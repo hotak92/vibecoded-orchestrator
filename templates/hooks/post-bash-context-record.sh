@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with post-bash-context-record.ps1 (both siblings' Unix-epoch
+# stamps are pinned by tests/test_v0292_ps1_unix_epoch_parity.py; every
+# behaviour must match the post-bash-context-record.ps1 sibling).
 # Post-bash context record hook (V52-M, v0.2.52)
 # Fires AFTER Bash tool executes. Emits a bash_outcome event with
 # exit code + output length + duration, paired via task_id with the

@@ -1,4 +1,7 @@
-﻿# parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full body parity
+﻿# Parity: kept in step with pre-vercel-token-guard.sh (this side parses JSON natively
+# via ConvertFrom-Json and never invokes Python; every behaviour must
+# match the .sh sibling).
+# parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full body parity
 # audit confirmed — every .sh-side guard check is present in this .ps1 sibling:
 #   - Sensitive env-var scrub (foreach loop below, lines 3-5) mirrors .sh
 #     `unset SUPABASE_KEY ...` (line 4 of sibling).

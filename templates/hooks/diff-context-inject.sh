@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with diff-context-inject.ps1 (the SessionId
+# resolution cascade must stay symmetrical on both sides; every behaviour
+# must match the .ps1 sibling).
 # Diff-based context injection — only inject CHANGED sections of CONTEXT_STATE.md
 # First prompt: create baseline snapshot. The FULL injection the baseline
 # defers is real: compact-context-reinject.sh (SessionStart matchers

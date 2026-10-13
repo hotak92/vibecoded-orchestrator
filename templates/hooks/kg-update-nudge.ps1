@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: PR-32 body-parity audit + parity-confirmation comments only — no .sh change required (every .sh-side incident fix is already present in this .ps1 sibling; see audit notes below).
+﻿# Parity: kept in step with kg-update-nudge.sh (key incident-fix logic on
+# both sides is pinned by tests/test_hook_ps1_body_parity.py; every
+# behaviour must match the kg-update-nudge.sh sibling).
 # parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full v10.1 body parity
 # audit confirmed — every .sh-side incident fix is present in this .ps1 sibling:
 #   - stdout-vs-stderr fix (commit f4ebe3e2): nudge text is printed via `print()`

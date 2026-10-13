@@ -1,5 +1,7 @@
 ﻿# SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
+# Parity: kept in step with vct_retrieval_tuning_set.sh (every behaviour
+# must match the .sh sibling).
 #
 # vct_retrieval_tuning_set.ps1 — write a single retrieval tuning value
 # (or reset the whole block to defaults) into

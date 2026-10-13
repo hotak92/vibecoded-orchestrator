@@ -1,4 +1,6 @@
-﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed.
+﻿# Parity: kept in step with session-start-ensure-hub.sh (this file's UTF-8 BOM serves
+# Windows PowerShell 5.1 only and has no Bash-side counterpart; every
+# behaviour must match the session-start-ensure-hub.sh sibling).
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }

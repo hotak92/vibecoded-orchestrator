@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# OS-EXEMPT-PARITY: v0.2.92 added a comment-only duplication-provenance note (documented copy of vco_lib.atomic.atomic_write_text) — no behaviour change, no .ps1 mirror required.
+# Parity: kept in step with vct_retrieval_tuning_set.ps1 (every behaviour
+# must match the .ps1 sibling; the atomic-write duplication-provenance
+# note below documents the .sh implementation).
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #

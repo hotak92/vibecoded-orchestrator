@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with pre-tool-use.ps1 (its UTF-8 BOM serves Windows
+# PowerShell 5.1 only; block-reason messages go to stderr on both sides;
+# every behaviour must match the .ps1 sibling).
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0

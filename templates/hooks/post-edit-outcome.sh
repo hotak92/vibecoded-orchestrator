@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Parity: kept in step with post-edit-outcome.ps1 (both siblings' Unix-epoch
+# stamps are pinned by tests/test_v0292_ps1_unix_epoch_parity.py; every
+# behaviour must match the post-edit-outcome.ps1 sibling).
 # Post-edit outcome event hook (V52-M, v0.2.52)
 # Fires AFTER Edit OR Write tool executes. Emits an edit_outcome event
 # with diff size + whether the file existed before + (best-effort)

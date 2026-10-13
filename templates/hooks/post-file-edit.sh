@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Parity: kept in step with post-file-edit.ps1 (its UTF-8 BOM serves Windows
+# PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # Parity note (v0.2.54 Track G G-6): the .ps1 sibling now resolves its
 # child-spawn PowerShell binary via _lib/resolve-powershell.ps1 (pwsh ->
 # powershell fallback for PS 5.1-only machines). No bash-side logic
