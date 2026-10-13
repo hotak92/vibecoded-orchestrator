@@ -415,6 +415,13 @@ print(
     "KG sync FAILED %d time(s) since the last session (channel(s): %s; last exit %s)."
     % (len(rows), ", ".join(channels), last.get("exit", "?"))
 )
+# v0.2.102 W6-C2 (census F15): rows written by a SUBAGENT's sync carry the
+# agent the write hooks exported (VCT_AGENT_ID / VCT_AGENT_TYPE) -- name them,
+# so the failure is attributed to the lane that made the edit.
+agents = sorted({str(r.get("agent_type") or r.get("agent_id"))
+                 for r in rows if r.get("agent_id")})
+if agents:
+    print("  from subagent edit(s): %s" % ", ".join(agents))
 detail = str(last.get("last_stderr", "") or "").strip()
 if detail:
     print("  last error: %s" % detail)

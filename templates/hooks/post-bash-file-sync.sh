@@ -128,6 +128,7 @@ COMMAND=""
 SESSION_ID=""
 TOOL_NAME=""
 AGENT_ID=""
+AGENT_TYPE=""
 _PBFS_IDX=0
 while IFS= read -r -d '' _PBFS_VAL; do
     case "$_PBFS_IDX" in
@@ -135,6 +136,7 @@ while IFS= read -r -d '' _PBFS_VAL; do
         1) COMMAND="$_PBFS_VAL" ;;
         2) SESSION_ID="$_PBFS_VAL" ;;
         3) AGENT_ID="$_PBFS_VAL" ;;
+        4) AGENT_TYPE="$_PBFS_VAL" ;;
     esac
     _PBFS_IDX=$((_PBFS_IDX + 1))
 done < <(printf '%s' "$HOOK_STDIN" | "$PY" -c "
@@ -147,9 +149,10 @@ try:
         ti.get('command', '') or '',
         d.get('session_id', '') or '',
         d.get('agent_id', '') or '',
+        d.get('agent_type', '') or '',
     ]
 except Exception:
-    fields = ['', '', '', '']
+    fields = ['', '', '', '', '']
 sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 " 2>/dev/null)
 
@@ -196,6 +199,9 @@ vco_bash_write_prefilter "$COMMAND" "$TOOL_NAME" || exit 0
 # sentinel keys per agent (same attribution chain as post-file-edit.sh).
 [ -n "$SESSION_ID" ] && export VCT_SESSION_ID="$SESSION_ID"
 [ -n "$AGENT_ID" ] && export VCT_AGENT_ID="$AGENT_ID"
+# v0.2.102 W6-C2 (census F15): the agent type rides along for the debounced
+# runner's kg_sync_failures.jsonl row (as post-file-edit.sh exports it).
+[ -n "$AGENT_TYPE" ] && export VCT_AGENT_TYPE="$AGENT_TYPE"
 
 # ---------------------------------------------------------------------------
 # Command → written paths

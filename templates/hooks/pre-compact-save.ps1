@@ -44,6 +44,14 @@ try {
 }
 if (-not $SessionId) { $SessionId = "default" }
 
+# v0.2.102 W6-C2: a SUBAGENT's compaction (UNVERIFIED whether PreCompact
+# fires for one) must not touch the MAIN chat's snapshot or last-compact
+# marker -- agent_id present -> nothing to save. Correct either way.
+# MUST MATCH pre-compact-save.sh.
+try {
+    if ($payload -and $payload.agent_id) { exit 0 }
+} catch { }
+
 # Project root: the ONE rule (_lib/project-root.ps1, must match
 # vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
 # project above the current location. None -> every write below (snapshot, marker, force-flush flag) is skipped.

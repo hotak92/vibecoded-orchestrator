@@ -9,6 +9,15 @@
 # for the next Stop so they keep accumulating. It also TTL-sweeps abandoned
 # pending files. Soft-fail throughout — telemetry must never break the turn.
 #
+# v0.2.102 W6-C2 (census F12): ALSO registered on SubagentStop (async). A
+# subagent's hook events carry the PARENT's session_id/transcript_path, so the
+# retrievals injected into a subagent were scored against the PARENT's answer.
+# On SubagentStop (payload carries agent_id + agent_transcript_path, the only
+# event that has the latter) this hook drains ONLY that agent's staged files
+# against the agent's own transcript (`--agent-id`); no agent transcript ->
+# nothing is drained (never the parent's). The Stop path is unchanged and
+# routes agent-tagged files to their stamped agent transcript.
+#
 # Constraints:
 #   - Stop hooks' plain stdout is discarded by the harness; this hook only
 #     writes telemetry.
@@ -42,12 +51,22 @@ try:
     d = json.loads(sys.stdin.read())
     print(d.get('session_id', ''))
     print(d.get('transcript_path', ''))
+    print(d.get('agent_id', '') or '')
+    print(d.get('agent_transcript_path', '') or '')
 except Exception:
-    print(''); print('')
-" 2>/dev/null || printf '\n\n')
+    print(''); print(''); print(''); print('')
+" 2>/dev/null || printf '\n\n\n\n')
 
 SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '1p')
 TRANSCRIPT_PATH=$(printf '%s' "$_PARSED" | sed -n '2p')
+AGENT_ID=$(printf '%s' "$_PARSED" | sed -n '3p')
+AGENT_TRANSCRIPT=$(printf '%s' "$_PARSED" | sed -n '4p')
+# SubagentStop (W6-C2 F12): the answer source is the AGENT's transcript; a
+# subagent event without one drains nothing (the parent's is the wrong one).
+if [ -n "$AGENT_ID" ]; then
+    [ -n "$AGENT_TRANSCRIPT" ] || exit 0
+    TRANSCRIPT_PATH="$AGENT_TRANSCRIPT"
+fi
 
 # Resolve the project venv python (the drain imports claude_mcp_servers.*).
 # v0.2.70 FIX-2 (sibling-divergence): require the RESOLVED VCO venv on BOTH
@@ -102,12 +121,15 @@ fi
 # internally (always exit 0) and prints a "soft-fail (...)" line on any
 # exception; that line lands in the log for post-hoc debugging.
 DRAIN_LOG="$PROJECT_ROOT/.claude/logs/rl_drain_citations.log"
+# A SubagentStop drain logs beside the Stop drain's (own bounded file, so a
+# lane finishing during a Stop drain cannot truncate its log mid-run).
+[ -n "$AGENT_ID" ] && DRAIN_LOG="$PROJECT_ROOT/.claude/logs/rl_drain_citations.agent.log"
 mkdir -p "$PROJECT_ROOT/.claude/logs" 2>/dev/null || true
 # Build the detached command. Args are embedded via a single-quoted snippet run
 # through `sh -c`; SESSION_ID / TRANSCRIPT_PATH are shell-quoted so a path with
 # spaces survives the extra sh -c layer.
 _shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
-_DRAIN_SNIP="CLAUDE_PROJECT_DIR=$(_shq "$PROJECT_ROOT") $(_shq "$VENV") $(_shq "$DRAIN") --session-id $(_shq "$SESSION_ID") --transcript-path $(_shq "$TRANSCRIPT_PATH") > $(_shq "$DRAIN_LOG") 2>&1"
+_DRAIN_SNIP="CLAUDE_PROJECT_DIR=$(_shq "$PROJECT_ROOT") $(_shq "$VENV") $(_shq "$DRAIN") --session-id $(_shq "$SESSION_ID") --transcript-path $(_shq "$TRANSCRIPT_PATH") --agent-id $(_shq "$AGENT_ID") > $(_shq "$DRAIN_LOG") 2>&1"
 if command -v setsid >/dev/null 2>&1; then
     setsid sh -c "$_DRAIN_SNIP" >/dev/null 2>&1 < /dev/null &
 elif command -v nohup >/dev/null 2>&1; then

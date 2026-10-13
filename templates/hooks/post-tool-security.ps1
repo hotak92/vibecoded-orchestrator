@@ -196,6 +196,34 @@ if ($alerts.Count -gt 0) {
     $line = $entry | ConvertTo-Json -Compress -Depth 5
     try { Add-Content -Path $AlertLog -Value $line -ErrorAction Stop } catch { }
 
+    # v0.2.102 W6-C2 (census F8): on a SUBAGENT's edit the additionalContext
+    # reaches only the subagent -- file the alert for the PARENT too
+    # (agent-alerts-deliver; reader + row format: vco_lib/agent_alerts.py).
+    # MUST MATCH the .sh sibling.
+    if ($AgentId) {
+        $sidLib = Join-Path $PSScriptRoot "_lib/session-id.ps1"
+        if (Test-Path $sidLib) { . $sidLib }
+        if (Get-Command Get-VcoAgentAlertsFile -ErrorAction SilentlyContinue) {
+            $alertsFile = Get-VcoAgentAlertsFile -ProjectRoot $ProjectRoot -SessionId $SessionId -AgentId $AgentId
+            if ($alertsFile) {
+                try {
+                    $alertsDir = Split-Path $alertsFile -Parent
+                    if (-not (Test-Path $alertsDir)) { New-Item -ItemType Directory -Force -Path $alertsDir | Out-Null }
+                    $agentRow = [ordered]@{
+                        timestamp  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                        kind       = "credential"
+                        message    = "$msg (review it before committing)"
+                        file       = $relFile
+                        session_id = $SessionId
+                        agent_id   = $AgentId
+                        agent_type = $AgentType
+                    }
+                    Add-Content -LiteralPath $alertsFile -Value ($agentRow | ConvertTo-Json -Compress -Depth 4) -ErrorAction Stop
+                } catch { }
+            }
+        }
+    }
+
     # v0.2.82: desktop-toast DEDUP - same (file, findings) key notifies at
     # most once per 6h. JSONL log + model envelope stay per-event (forensics
     # and agent awareness are never rate-limited — only the human toast).

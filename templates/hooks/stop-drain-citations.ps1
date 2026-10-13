@@ -7,6 +7,11 @@
 # ACCUMULATE-DON'T-DROP: the drain computes+writes ONLY when a pending task's
 # cumulative answer window reaches the token gate; below-gate windows are left
 # for the next Stop. Soft-fail throughout; always exit 0.
+#
+# v0.2.102 W6-C2 (census F12): ALSO registered on SubagentStop (async). With
+# agent_id + agent_transcript_path in the payload it drains ONLY that agent's
+# staged files against the agent's own transcript (--agent-id); no agent
+# transcript -> nothing drained. MUST MATCH the .sh sibling.
 
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -27,13 +32,23 @@ try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 
 $SessionId = ""
 $TranscriptPath = ""
+$AgentId = ""
+$AgentTranscript = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
         if ($payload.session_id) { $SessionId = [string]$payload.session_id }
         if ($payload.transcript_path) { $TranscriptPath = [string]$payload.transcript_path }
+        if ($payload.agent_id) { $AgentId = [string]$payload.agent_id }
+        if ($payload.agent_transcript_path) { $AgentTranscript = [string]$payload.agent_transcript_path }
     }
 } catch { }
+
+# SubagentStop (W6-C2 F12): the answer source is the AGENT's transcript.
+if ($AgentId) {
+    if (-not $AgentTranscript) { exit 0 }
+    $TranscriptPath = $AgentTranscript
+}
 
 # Resolve the project venv python (the drain imports claude_mcp_servers.*).
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
@@ -63,14 +78,19 @@ if (-not $VenvPy -or -not (Test-Path $VenvPy)) { exit 0 }
 # than $null. rl_drain_citations soft-fails internally and prints a
 # "soft-fail (...)" line on any exception, which lands in the log.
 $DrainLog = Join-Path $ProjectRoot ".claude/logs/rl_drain_citations.log"
+if ($AgentId) { $DrainLog = Join-Path $ProjectRoot ".claude/logs/rl_drain_citations.agent.log" }
 try { New-Item -ItemType Directory -Force -Path (Split-Path $DrainLog) -ErrorAction SilentlyContinue | Out-Null } catch { }
+# --agent-id only when set: Start-Process drops an empty element, which would
+# leave the flag without its value.
+$DrainArgs = @($Drain, "--session-id", $SessionId, "--transcript-path", $TranscriptPath)
+if ($AgentId) { $DrainArgs += @("--agent-id", $AgentId) }
 try {
     $env:CLAUDE_PROJECT_DIR = $ProjectRoot
     # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1): an
     # unguarded `-WindowStyle Hidden` is REJECTED on non-Windows PowerShell
     # editions and takes the whole detached drain with it.
     Start-VcoDetachedProcess -FilePath $VenvPy `
-        -ArgumentList @($Drain, "--session-id", $SessionId, "--transcript-path", $TranscriptPath) `
+        -ArgumentList $DrainArgs `
         -RedirectStandardOutput $DrainLog `
         -RedirectStandardError "$DrainLog.err"
 } catch { }

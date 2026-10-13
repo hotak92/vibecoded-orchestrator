@@ -106,10 +106,25 @@ def _soft_label_floor_tokens() -> int:
         return 200
 
 
+def _stamp_agent_transcript(path, payload: dict, transcript_path: str) -> None:
+    """Record the agent's own transcript in its pending file, so a later
+    (parent) Stop drain can retry the file against the RIGHT answer source.
+    Best-effort: a failed write only means the parent drain leaves the file
+    for the TTL sweep."""
+    try:
+        from vco_lib.atomic import atomic_write_json
+
+        payload["agent_transcript_path"] = transcript_path
+        atomic_write_json(path, payload, indent=None, fsync=False)
+    except Exception:  # noqa: BLE001 — telemetry must not break the drain
+        pass
+
+
 def drain_session(
     session_id: str,
     transcript_path: "str | None",
     *,
+    agent_id: str = "",
     project_root: "str | None" = None,
     compute_fn=None,
     token_count_fn=None,
@@ -120,6 +135,22 @@ def drain_session(
         session_id: From Stop stdin (the per-conversation key).
         transcript_path: From Stop stdin; the JSONL to read the answer from.
             When None we cannot compute (no answer source) — only TTL-sweep.
+        agent_id: (v0.2.102 W6-C2, census F12) set by a SubagentStop drain:
+            drain ONLY that subagent's pending files, against
+            ``transcript_path`` = the payload's ``agent_transcript_path``.
+            A subagent's hook events carry the PARENT's session_id and
+            transcript_path, so its staged retrievals used to be scored
+            against the parent's answer. Routing rules, per pending file:
+
+            * agent drain (``agent_id`` set): files tagged with that agent
+              only; the transcript is FINAL (the subagent has stopped), so a
+              below-gate window takes the terminal/soft floors immediately
+              instead of waiting to accumulate — no later turn will add to
+              it. A file left behind is stamped with the agent transcript.
+            * parent drain (``agent_id`` empty): untagged files as before;
+              an agent-tagged file is scored ONLY against its stamped
+              ``agent_transcript_path`` (final semantics) and is otherwise
+              left for the TTL sweep — never against the parent's.
         project_root: Override for tests; defaults to CLAUDE_PROJECT_DIR / cwd.
         compute_fn: Injectable ``(task_id, answer, ctx) -> result|None`` for
             tests; defaults to the shared ``citation_compute.compute_citation``.
@@ -148,6 +179,13 @@ def drain_session(
     if token_count_fn is None:
         token_count_fn = token_estimate
 
+    if agent_id:
+        # The staged tag went through the ONE agent-id rule; compare like
+        # with like (a raw hook value could differ only by sanitisation).
+        from vco_lib.hook_agent_key import sanitize_agent_id
+
+        agent_id = sanitize_agent_id(agent_id)
+
     gate = _gate_tokens()
     summary = {"computed": 0, "left": 0, "swept": 0, "skipped": 0}
 
@@ -162,8 +200,15 @@ def drain_session(
     # the drain reads once per Stop so the (mtime,size) cache is mostly a miss
     # here, but routing through the SAME function keeps the parsed-message shape
     # — and thus the extracted answer window — byte-identical across both paths.
-    messages = load_messages_cached(transcript_path) if transcript_path else []
-    kg_positions = find_kg_positions(messages) if messages else []
+    # W6-C2 F12: one parse per DISTINCT transcript (the parent's, and each
+    # stamped subagent transcript a parent drain meets).
+    _loaded: dict = {}
+
+    def _load(tp: str):
+        if tp not in _loaded:
+            msgs = load_messages_cached(tp) if tp else []
+            _loaded[tp] = (msgs, find_kg_positions(msgs) if msgs else [])
+        return _loaded[tp]
 
     for path in pending:
         payload = read_pending(path)
@@ -175,6 +220,28 @@ def drain_session(
         # returns all; each must self-identify).
         if session_id and payload.get("session_id") not in (session_id, ""):
             continue
+
+        # W6-C2 F12: pick the answer source by WHO staged the retrieval.
+        file_agent = str(payload.get("agent_id") or "")
+        final_window = False
+        if agent_id:
+            if file_agent != agent_id:
+                continue  # another agent's (or the main chat's) file
+            answer_source = transcript_path or ""
+            final_window = True
+            if answer_source and payload.get("agent_transcript_path") != answer_source:
+                _stamp_agent_transcript(path, payload, answer_source)
+        elif file_agent:
+            answer_source = str(payload.get("agent_transcript_path") or "")
+            if not answer_source:
+                # The agent's own drain never ran: its transcript is unknown,
+                # and the parent's is the WRONG answer. Leave it (TTL sweep).
+                summary["left"] += 1
+                continue
+            final_window = True
+        else:
+            answer_source = transcript_path or ""
+        messages, kg_positions = _load(answer_source)
 
         ctx = payload.get("ctx")
         task_id = payload.get("task_id") or ""
@@ -242,10 +309,11 @@ def drain_session(
             _ts_ms = payload.get("ts_ms")
             if isinstance(_ts_ms, (int, float)) and _ts_ms > 0:
                 _age_s = (time.time() * 1000.0 - float(_ts_ms)) / 1000.0
-            _aged = (
-                answer.strip()
-                and _age_s is not None
-                and _age_s >= _terminal_age_seconds()
+            # W6-C2 F12: a stopped subagent's window is FINAL — nothing will
+            # accumulate into it, so it takes the terminal floors now.
+            _aged = bool(answer.strip()) and (
+                final_window
+                or (_age_s is not None and _age_s >= _terminal_age_seconds())
             )
             _terminal = _aged and tok >= _terminal_floor_tokens()
             if _terminal:
@@ -302,12 +370,17 @@ def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(description="Drain deferred RL citations at turn-end")
     parser.add_argument("--session-id", default="", help="Stop-hook session_id")
     parser.add_argument("--transcript-path", default="", help="Stop-hook transcript_path")
+    parser.add_argument(
+        "--agent-id", default="",
+        help="SubagentStop: drain only this subagent's files (with "
+             "--transcript-path = its agent_transcript_path)")
     args = parser.parse_args(argv)
 
     try:
         summary = drain_session(
             args.session_id,
             args.transcript_path or None,
+            agent_id=args.agent_id,
         )
         # Stdout is discarded by the async Stop hook; print for manual runs.
         print(

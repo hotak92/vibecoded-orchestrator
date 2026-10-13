@@ -73,7 +73,8 @@ def emit_outcome_event(
                 duration_ms (int), cmd_len (int).
               * edit_outcome → tool_name (str), file_path (str),
                 diff_size (int), file_existed_before (bool), ts_ms (int),
-                post_check (None | dict).
+                post_check (None | dict), agent_id (str: "" for the main
+                chat, the subagent's sanitised id otherwise — v0.2.102).
               * pre_bash → cmd_len (int), query (str truncated), ts_ms (int).
         session_id: Layer-1 input for session resolution (the 3-layer
             chain in telemetry_emit.resolve_session_id matches).

@@ -235,6 +235,10 @@ function Write-KgDebounceFailureRow {
             channel      = $Channel
             exit         = $ExitCode
             session      = (Get-KgDebounceSessionKey)
+            # v0.2.102 W6-C2 (census F15): subagent attribution exported by
+            # the write hooks; empty for the main chat. MUST MATCH the .sh.
+            agent_id     = [string]$env:VCT_AGENT_ID
+            agent_type   = [string]$env:VCT_AGENT_TYPE
             log          = $LogPath
             last_stderr  = $tail
         }

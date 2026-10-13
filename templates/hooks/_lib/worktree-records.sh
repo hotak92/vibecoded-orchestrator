@@ -264,6 +264,31 @@ for n in os.listdir(d):
 ' 2>/dev/null || true
 }
 
+# wtrec_changed_files PROJECT_ROOT AGENT_ID — v0.2.102 W6-C2 (census F7):
+# print, one ABSOLUTE path per line, the files the agent changed in ITS OWN
+# worktree: uncommitted (modified/added/untracked) plus everything committed
+# since the recorded base. Attribution is exact here — nobody else writes in
+# that worktree — unlike the shared-tree snapshot diff, which also sees the
+# parent's and sibling lanes' edits. Prints nothing when the agent has no
+# record or its worktree is gone (reaped = unchanged). Read-only.
+# MUST MATCH Get-WtrecChangedFiles in the .ps1.
+wtrec_changed_files() {
+    local rec path base
+    rec="$(wtrec_find "$1" "$2")" || return 0
+    path="$(wtrec_get "$rec" path)"
+    base="$(wtrec_get "$rec" base)"
+    [ -n "$path" ] && [ -d "$path" ] || return 0
+    {
+        git -C "$path" -c core.quotepath=off status --porcelain --untracked-files=all 2>/dev/null \
+            | sed -E 's/^...//; s/^.* -> //'
+        if [ -n "$base" ]; then
+            git -C "$path" -c core.quotepath=off diff --name-only "$base" HEAD 2>/dev/null
+        fi
+    } | sed '/^$/d' | sort -u | while IFS= read -r _wtrec_rel; do
+        printf '%s/%s\n' "$path" "$_wtrec_rel"
+    done
+}
+
 # _wtrec_rmdir_lanes_parent TOPLEVEL PATH — after the reap removed a lane
 # reservation's worktree, remove its now-EMPTY parent `<R>.vco-lanes/`
 # (vco_lib/lane_reservation.py's path convention: sibling of R's toplevel).

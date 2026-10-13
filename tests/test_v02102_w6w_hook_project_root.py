@@ -42,7 +42,6 @@ BASH = shutil.which("bash")
 #: hook -> stdin payload. Hooks safe to run in a sandbox.
 SAFE_HOOKS = {
     "agent-skill-keyword-suggest": '{"prompt": "review this code", "session_id": "w6w"}',
-    "subagent-start-suggest": '{"prompt": "review this code", "agent_id": "a1", "session_id": "w6w"}',
     "subagent-start-isolation-check": '{"agent_id": "a1", "agent_type": "x", "session_id": "w6w"}',
     "kg-sync-on-edit": '{"tool_input": {"file_path": "knowledge/x.md"}}',
     "compact-context-reinject": '{"session_id": "w6w"}',

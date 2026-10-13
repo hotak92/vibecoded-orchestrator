@@ -348,6 +348,11 @@ _kg_debounce_record_failure() {
     row="$row,\"channel\":\"$(_kg_debounce_json_escape "$chan")\""
     row="$row,\"exit\":$rc"
     row="$row,\"session\":\"$(_kg_debounce_json_escape "$(_kg_debounce_session_key)")\""
+    # v0.2.102 W6-C2 (census F15): the subagent attribution the write hooks
+    # export for this child (post-file-edit / post-bash-file-sync). Empty for
+    # the main chat; session-start-retrieval-health names the lane.
+    row="$row,\"agent_id\":\"$(_kg_debounce_json_escape "${VCT_AGENT_ID:-}")\""
+    row="$row,\"agent_type\":\"$(_kg_debounce_json_escape "${VCT_AGENT_TYPE:-}")\""
     row="$row,\"log\":\"$(_kg_debounce_json_escape "${log:-}")\""
     row="$row,\"last_stderr\":\"$(_kg_debounce_json_escape "$tail_line")\"}"
 

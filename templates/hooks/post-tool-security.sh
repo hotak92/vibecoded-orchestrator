@@ -201,6 +201,32 @@ sys.stdout.write(json.dumps({
     if [ -n "$JSONL" ]; then
         printf '%s\n' "$JSONL" >> "$ALERT_LOG" 2>/dev/null || true
     fi
+    # v0.2.102 W6-C2 (census F8): on a SUBAGENT's edit the additionalContext
+    # below reaches only the subagent. File the alert for the PARENT too —
+    # agent-alerts-deliver hands it over when the agent returns (reader +
+    # row format: vco_lib/agent_alerts.py). Main-chat edits file nothing.
+    # shellcheck source=_lib/session-id.sh disable=SC1091
+    [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
+    if [ -n "$AGENT_ID" ] && command -v vco_agent_alerts_file >/dev/null 2>&1; then
+        _PTS_AF="$(vco_agent_alerts_file "$PROJECT_ROOT" "$SESSION_ID" "$AGENT_ID")"
+        if [ -n "$_PTS_AF" ] && mkdir -p "$(dirname "$_PTS_AF")" 2>/dev/null; then
+            MSG_FOR_PY="$MSG" FILE_FOR_PY="$REL_FILE" SESSION_ID_FOR_PY="$SESSION_ID" \
+            AGENT_ID_FOR_PY="$AGENT_ID" AGENT_TYPE_FOR_PY="$AGENT_TYPE" "$PY" -c '
+import json, os, sys
+from datetime import datetime, timezone
+e = os.environ
+sys.stdout.write(json.dumps({
+    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "kind": "credential",
+    "message": e.get("MSG_FOR_PY", "") + " (review it before committing)",
+    "file": e.get("FILE_FOR_PY", ""),
+    "session_id": e.get("SESSION_ID_FOR_PY", ""),
+    "agent_id": e.get("AGENT_ID_FOR_PY", ""),
+    "agent_type": e.get("AGENT_TYPE_FOR_PY", ""),
+}) + "\n")
+' >> "$_PTS_AF" 2>/dev/null || true
+        fi
+    fi
     # Cross-platform notification (Linux/macOS/Windows). See audit F2.
     # v0.2.82: desktop-toast DEDUP — the SAME (file, findings) alert notifies
     # at most once per 6h window. Forensics are NOT rate-limited: the JSONL

@@ -74,11 +74,13 @@ try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $ToolName = ""
 $SessionId = ""
 $FilePath = ""
+$AgentId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
         if ($payload.tool_name)  { $ToolName = [string]$payload.tool_name }
         if ($payload.session_id) { $SessionId = [string]$payload.session_id }
+        if ($payload.agent_id)   { $AgentId = [string]$payload.agent_id }
         if ($payload.tool_input -and $payload.tool_input.file_path) {
             $FilePath = [string]$payload.tool_input.file_path
         }
@@ -125,11 +127,17 @@ Get-ChildItem -File $StateDir -Filter "seen_inject_*.txt" -ErrorAction SilentlyC
 Get-ChildItem -File $StateDir -Filter "seen_kg_titles_*.txt" -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
     Remove-Item -Force -ErrorAction SilentlyContinue
+# v0.2.102 W6-C2 (C1 residual F1): the replay filters through the PER-AGENT
+# seen-store -- the SAME key the router reads/writes. MUST MATCH the .sh.
+$StoreKey = $SessionIdRaw
+if ($AgentId -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyContinue)) {
+    $StoreKey = Get-VcoAgentKeyFromIds -SessionId $SessionIdRaw -AgentId $AgentId
+}
 $SeenInjectFile = ""
 $SeenReadsFile = ""
 if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-    $SeenInjectFile = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-    $SeenReadsFile = Get-VcoSeenStorePath -Kind "reads" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+    $SeenInjectFile = Get-VcoSeenStorePath -Kind "inject" -SessionId $StoreKey -ProjectRoot $ProjectRoot
+    $SeenReadsFile = Get-VcoSeenStorePath -Kind "reads" -SessionId $StoreKey -ProjectRoot $ProjectRoot
 }
 
 # === Cache key from the file path (.NET MD5; the .sh sibling uses hashlib) ===
@@ -193,7 +201,12 @@ if ($CacheHit) {
         $ReplayClaim = ""
         $ReplayClaimStaleS = 15
         if ($SeenInjectFile -and (Get-Command Invoke-VcoSeenClaim -ErrorAction SilentlyContinue)) {
+            # Per agent too (W6-C2): parent and subagent stores differ, so
+            # they must not share the replay claim. MUST MATCH the .sh.
             $ReplayClaim = "$CacheFile.claim"
+            if ($StoreKey -ne $SessionIdRaw) {
+                $ReplayClaim = "$CacheFile.claim." + ($StoreKey -replace '^.*__', '')
+            }
             $claimVerdict = Invoke-VcoSeenClaim -ClaimFile $ReplayClaim -StaleAfterSeconds $ReplayClaimStaleS
             if ($claimVerdict -eq "held") { exit 0 }
             if ($claimVerdict -ne "claimed") { $ReplayClaim = "" }

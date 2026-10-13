@@ -53,7 +53,12 @@ $VcoSid = ""
 $FastSidLib = Join-Path $PSScriptRoot "_lib/session-id.ps1"
 if (Test-Path $FastSidLib) {
     . $FastSidLib
-    if (Get-Command Get-VcoHookFastSessionId -ErrorAction SilentlyContinue) {
+    # v0.2.102 W6-C2: keyed PER AGENT (<sid>__<agent_id> for a subagent's
+    # call) so a subagent's notice cannot consume the parent's sentinel.
+    # MUST MATCH the .sh sibling.
+    if (Get-Command Get-VcoHookFastAgentKey -ErrorAction SilentlyContinue) {
+        $VcoSid = Get-VcoHookFastAgentKey -HookStdin $HookStdin
+    } elseif (Get-Command Get-VcoHookFastSessionId -ErrorAction SilentlyContinue) {
         $VcoSid = Get-VcoHookFastSessionId -HookStdin $HookStdin
     }
 }

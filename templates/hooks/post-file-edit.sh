@@ -144,8 +144,11 @@ sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 # below so the kg-sync / code-graph-incremental subprocesses we spawn can
 # attribute their retrieval / sync telemetry to the originating subagent;
 # SESSION_ID feeds VCT_SESSION_ID for the same 3-layer telemetry chain.
-# Export for child processes (kg-sync, code-graph-incremental.sh, etc.)
-# so their emit paths can attribute telemetry to the originating agent.
+# Export for child processes so they can attribute their work to the
+# originating agent. Readers (v0.2.102 W6-C2, census F15): the debounced
+# kg-sync runner's once-per-session failure sentinel (VCT_AGENT_ID, via the
+# per-agent key) and its kg_sync_failures.jsonl row (agent_id + agent_type),
+# which session-start-retrieval-health names when it surfaces the failure.
 # Skip empty-string exports — downstream readers treat unset and empty
 # identically, but unset keeps `env` listings clean for debugging.
 [ -n "$AGENT_ID" ]   && export VCT_AGENT_ID="$AGENT_ID"

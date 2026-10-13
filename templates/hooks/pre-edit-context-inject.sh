@@ -101,14 +101,17 @@ try:
     print(d.get('tool_name', ''))
     print(d.get('session_id', ''))
     print((d.get('tool_input') or {}).get('file_path', ''))
+    print(d.get('agent_id', '') or '')
 except Exception:
     print('')
     print('')
     print('')
-" 2>/dev/null || printf '\n\n\n')
+    print('')
+" 2>/dev/null || printf '\n\n\n\n')
 TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '1p')
 SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
 FILE_PATH=$(printf '%s' "$_PARSED" | sed -n '3p')
+AGENT_ID=$(printf '%s' "$_PARSED" | sed -n '4p')
 
 # Only fire for Edit tool (the Write surface has its own wrapper:
 # pre-write-context-inject.sh)
@@ -159,11 +162,20 @@ mkdir -p "$SEEN_DIR" 2>/dev/null
 find "$SEEN_DIR" -maxdepth 1 -type f -name "seen_inject_*.txt" -mtime +14 -delete 2>/dev/null || true
 find "$SEEN_DIR" -maxdepth 1 -type f -name "seen_kg_titles_*.txt" -mtime +14 -delete 2>/dev/null || true
 
+# v0.2.102 W6-C2 (C1 residual F1): the replay filters through the PER-AGENT
+# seen-store -- the SAME key the router reads/writes (<sid>__<agent_id> for a
+# subagent's edit, the plain session id for the main chat). A session-keyed
+# filter here suppressed a subagent's replay with blocks only the parent saw
+# (and vice versa). Untrustworthy ids pass through unchanged (inject blind).
+STORE_KEY="$SESSION_ID_RAW"
+if [ -n "$AGENT_ID" ] && command -v vco_hook_agent_key_from_ids >/dev/null 2>&1; then
+    STORE_KEY="$(vco_hook_agent_key_from_ids "$SESSION_ID_RAW" "$AGENT_ID")"
+fi
 SEEN_INJECT_FILE=""
 SEEN_READS_FILE=""
 if command -v vco_seen_store_path >/dev/null 2>&1; then
-    SEEN_INJECT_FILE="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
-    SEEN_READS_FILE="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+    SEEN_INJECT_FILE="$(vco_seen_store_path inject "$STORE_KEY" "$PROJECT_ROOT")"
+    SEEN_READS_FILE="$(vco_seen_store_path reads "$STORE_KEY" "$PROJECT_ROOT")"
 fi
 
 # === Cache key from the file path (md5; portable fallback) ===
@@ -239,7 +251,14 @@ if [[ "$CACHE_HIT" == "1" ]]; then
         REPLAY_CLAIM=""
         REPLAY_CLAIM_STALE_S=15
         if [ -n "$SEEN_INJECT_FILE" ] && command -v vco_seen_claim >/dev/null 2>&1; then
+            # Per agent too (W6-C2): the replay cache dir is per session, so
+            # a parent and a subagent editing one file must not share a
+            # claim -- their stores differ, so the loser's replay is NOT the
+            # winner's. The main chat's claim name is unchanged.
             REPLAY_CLAIM="${CACHE_FILE}.claim"
+            if [ "$STORE_KEY" != "$SESSION_ID_RAW" ]; then
+                REPLAY_CLAIM="${CACHE_FILE}.claim.${STORE_KEY##*__}"
+            fi
             vco_seen_claim "$REPLAY_CLAIM" "$REPLAY_CLAIM_STALE_S"
             case $? in
                 0) ;;

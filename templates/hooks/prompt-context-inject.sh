@@ -88,7 +88,11 @@ _VCO_SID=""
 if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/session-id.sh" ]; then
     # shellcheck source=_lib/session-id.sh disable=SC1091
     . "$(dirname "${BASH_SOURCE[0]}")/_lib/session-id.sh"
-    if command -v vco_hook_fast_session_id >/dev/null 2>&1; then
+    # v0.2.102 W6-C2: keyed PER AGENT (<sid>__<agent_id> for a subagent's
+    # call) so a subagent's notice cannot consume the parent's sentinel.
+    if command -v vco_hook_fast_agent_key >/dev/null 2>&1; then
+        _VCO_SID="$(vco_hook_fast_agent_key "$HOOK_STDIN")"
+    elif command -v vco_hook_fast_session_id >/dev/null 2>&1; then
         _VCO_SID="$(vco_hook_fast_session_id "$HOOK_STDIN")"
     fi
 fi

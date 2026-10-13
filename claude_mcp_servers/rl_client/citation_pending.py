@@ -26,6 +26,7 @@ force-flush) or TTL expiry.
 from __future__ import annotations
 
 import json
+import os
 import logging
 import re
 import time
@@ -122,6 +123,7 @@ def stage_pending(
     ctx: dict,
     source: str = "hook",
     project_root: "str | Path | None" = None,
+    agent_id: Optional[str] = None,
 ) -> Optional[Path]:
     """Persist the staged citation ctx as a pending file. Returns the path
     (or None on soft-fail). Idempotent per (session_id, task_id): a re-stage
@@ -130,9 +132,25 @@ def stage_pending(
     Adds the queue-routing fields the drain needs: ``session_id``, ``task_id``,
     ``seq`` (1-based KG-call counter, or None for the hook path which has no
     process-global seq), ``query`` snippet (for transcript matching),
-    ``ts_ms`` (TTL), and ``source`` ("hook" | "mcp").
+    ``ts_ms`` (TTL), ``source`` ("hook" | "mcp") and ``agent_id``.
+
+    ``agent_id`` (v0.2.102 W6-C2, census F12): the subagent whose tool call
+    staged this retrieval — ``""`` for the main chat. A subagent's hook
+    events carry the PARENT's session_id and transcript_path, so without it
+    the parent's Stop drain scored a lane's injection against the PARENT's
+    answer. ``None`` reads ``VCT_AGENT_ID``, which the context router sets
+    for a subagent's call (the hook-path KG leg runs in the router's
+    process); the drain routes agent-tagged files to the agent's own
+    transcript (``rl_drain_citations.drain_session``).
     """
+    if agent_id is None:
+        agent_id = os.environ.get("VCT_AGENT_ID", "")
     try:
+        # One agent-id rule (vco_lib is a hard dependency here, exactly like
+        # the atomic writer below — a failed import fails the stage).
+        from vco_lib.hook_agent_key import sanitize_agent_id  # noqa: PLC0415
+
+        agent_id = sanitize_agent_id(agent_id or "")
         payload = {
             "session_id": session_id or "",
             "task_id": task_id,
@@ -140,6 +158,7 @@ def stage_pending(
             "query": (query or "")[:120],
             "ts_ms": int(time.time() * 1000),
             "source": source,
+            "agent_id": agent_id,
             "ctx": ctx,
         }
         path = _pending_path(session_id, task_id, project_root)

@@ -134,8 +134,12 @@ def test_reshape_is_reported_and_idempotent(os_name: str) -> None:
     assert sorted(vco_hook_script_identity(r["command"]) or "" for r in reshapes) == sorted(
         f"{s}.{OS_FLAVOURS[os_name][0]}"
         # v0.2.102 W6-Q/W6-AA: worktree-guard's WorktreeCreate timeout 3 -> none
-        # (the harness default applies).
-        for s in ("pre-bash-context-inject", "pre-edit-context-inject", "worktree-guard"))
+        # (the harness default applies). v0.2.102 W6-C2: the same for the
+        # SubagentStop reconciler (2 s), the SubagentStart snapshot (5 s) and
+        # the PreCompact snapshot (5 s).
+        for s in ("pre-bash-context-inject", "pre-edit-context-inject", "worktree-guard",
+                  "subagent-stop-reconcile", "subagent-start-kg-inject",
+                  "pre-compact-save"))
     # The bundle envelope and audit emitters read these records too.
     rows = removal_envelope_rows(reshapes)
     assert all(r["retired_in"] in ("v0.2.101", "v0.2.102") and r["replacement"] for r in rows)

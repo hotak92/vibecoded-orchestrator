@@ -297,8 +297,13 @@ def _install_kg_sync_mock(project_root: Path, sidecar: Path) -> Path:
 
 def test_kg_sync_invoked_for_modified_knowledge_md(tmp_path):
     """When the diff includes a `knowledge/**/*.md` file, the reconciler
-    must invoke the project's `.claude/scripts/kg-sync` with the
-    absolute path of that file as the first argument."""
+    must invoke the project's `.claude/scripts/kg-sync` with that file.
+
+    v0.2.102 W6-C2 (census L1): the sync goes through the ONE routing home
+    (`_lib/route-touched-path.sh`: access gate + debounce + DETACHED runner,
+    no timeout) instead of an inline `timeout 30 kg-sync`, so the call lands
+    shortly AFTER the hook returns — the test polls for it (debounce window
+    pinned to 0 so it fires at once)."""
     project = _setup_project(tmp_path)
     agent_id = "T03-agent"
     sidecar = tmp_path / "kg_sync_calls.log"
@@ -328,12 +333,20 @@ def test_kg_sync_invoked_for_modified_knowledge_md(tmp_path):
             "stop_reason": "stop",
         },
         project,
+        extra_env={"VCO_KG_SYNC_DEBOUNCE_SECONDS": "0"},
     )
     assert stop_result.returncode == 0, (
         f"reconcile exited {stop_result.returncode}; "
         f"stderr={stop_result.stderr!r}")
 
-    calls = sidecar.read_text(encoding="utf-8").strip().splitlines()
+    import time as _time
+    deadline = _time.monotonic() + 30
+    calls: list = []
+    while _time.monotonic() < deadline:
+        calls = sidecar.read_text(encoding="utf-8").strip().splitlines()
+        if calls:
+            break
+        _time.sleep(0.2)
     assert calls, (
         "kg-sync mock was never invoked; "
         f"reconcile stdout={stop_result.stdout!r} stderr={stop_result.stderr!r}"

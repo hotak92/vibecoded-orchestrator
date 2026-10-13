@@ -128,13 +128,13 @@ Context nearing limit
 
 ### SubagentStart
 
-**subagent-start-suggest.sh** / **subagent-start-kg-inject.sh**
-- Suggest relevant capabilities; keep the V52-L.1 filesystem snapshot the SubagentStop reconciler diffs against. (v0.2.101: the KG-injection half was retired — a SubagentStart payload carries no prompt text, so its query could never fire. KG context for subagents is injected PARENT-side by `agent-brief-kg-inject.sh` below.)
+**subagent-start-kg-inject.sh**
+- Keeps the V52-L.1 filesystem snapshot the SubagentStop reconciler diffs against — for agents WITHOUT their own worktree (an isolated agent is reconciled from its worktree's git state). (v0.2.101: the KG-injection half was retired — a SubagentStart payload carries no prompt text, so its query could never fire. v0.2.102: `subagent-start-suggest.sh` was retired for the same reason. KG context AND agent/skill suggestions for subagents are injected PARENT-side by `agent-brief-kg-inject.sh` below.)
 
 ### SubagentStop (blocking)
 
-**subagent-stop-reconcile.sh**
-- Reconciles subagent output (worktree diffs, KG-write discipline) before the subagent is allowed to stop.
+**subagent-stop-reconcile.sh** / **stop-drain-citations.sh** (async)
+- Reconciles subagent output in a DETACHED job (v0.2.102): reaps an unchanged worktree, scans and indexes what the agent changed (its own worktree when it had one, else the shared-tree snapshot diff, recorded as unattributed), and files alerts for the PARENT. The citation drain scores the RL citations staged by the subagent's injections against the subagent's own transcript (`agent_transcript_path`).
 
 ### PreToolUse
 

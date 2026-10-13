@@ -12,7 +12,9 @@
 #   and let the offline trainer JOIN on (session_id, file_path,
 #   ts_window) — that's lossy but enough for training-pair construction
 #   (the trainer sorts retrieval events + outcome events by ts and
-#   pairs adjacent same-(session,file) entries).
+#   pairs adjacent same-(session,file) entries). v0.2.102: rows also carry
+#   `agent_id` ("" = main chat) — a subagent's session_id is the parent's,
+#   so the join must include it to keep parallel lanes' rows apart.
 #
 #   FOLLOW-UP (V52-M.2 candidate): refactor pre-edit to write its
 #   task_id to .claude/state/edit_task_<session>_<filehash>.json so
@@ -57,15 +59,29 @@ try:
         new_str = content
     print(len(old_str or ''))
     print(len(new_str or ''))
+    print(d.get('agent_id', '') or '')
 except Exception:
-    print(''); print(''); print(''); print(0); print(0)
-" 2>/dev/null || printf '\n\n\n0\n0\n')
+    print(''); print(''); print(''); print(0); print(0); print('')
+" 2>/dev/null || printf '\n\n\n0\n0\n\n')
 
 TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '1p')
 SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
 FILE_PATH=$(printf '%s' "$_PARSED" | sed -n '3p')
 OLD_LEN=$(printf '%s' "$_PARSED" | sed -n '4p')
 NEW_LEN=$(printf '%s' "$_PARSED" | sed -n '5p')
+# v0.2.102 W6-C2 (census F13): the subagent that made the edit. Subagent tool
+# events carry agent_id while session_id stays the PARENT's, so the offline
+# join on (session_id, file_path, ts) mixed the parent's rows with every
+# lane's that edited the same file. Sanitised by the ONE agent-id rule
+# (_lib/session-id.sh): hex ids pass, anything else -> "default"; empty = the
+# main chat. Interpolated below only after that allow-list.
+AGENT_ID_RAW=$(printf '%s' "$_PARSED" | sed -n '6p')
+AGENT_ID=""
+if [ -n "$AGENT_ID_RAW" ] && [ -f "$SCRIPT_DIR/_lib/session-id.sh" ]; then
+    # shellcheck source=_lib/session-id.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/session-id.sh"
+    AGENT_ID="$(vco_hook_sanitize_agent_id "$AGENT_ID_RAW")"
+fi
 
 # Only fire for Edit and Write
 if [[ "$TOOL_NAME" != "Edit" ]] && [[ "$TOOL_NAME" != "Write" ]]; then
@@ -148,6 +164,8 @@ try:
             'ts_ms': $NOW_TS_MS,
             # post_check populated by the background poller below (optional)
             'post_check': None,
+            # W6-C2 F13: '' for the main chat, the subagent's id otherwise.
+            'agent_id': '$AGENT_ID',
         },
         session_id='$SESSION_ID',
         project_id=project_id,

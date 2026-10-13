@@ -80,12 +80,14 @@ $SessionId = ""
 # notices below key per agent and the telemetry export can attribute a
 # lane's CLI writes to the lane (same shape as post-file-edit.ps1).
 $AgentId = ""
+$AgentType = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
         if ($payload.tool_name) { $ToolName = [string]$payload.tool_name }
         if ($payload.session_id) { $SessionId = [string]$payload.session_id }
         if ($payload.agent_id) { $AgentId = [string]$payload.agent_id }
+        if ($payload.agent_type) { $AgentType = [string]$payload.agent_type }
         if ($payload.tool_input -and $payload.tool_input.command) {
             $Command = [string]$payload.tool_input.command
         }
@@ -131,6 +133,9 @@ if (-not (Test-VcoWriteSuspicious -Command $Command -Tool $ToolName)) { exit 0 }
 # so the debounced runner's kg-sync-failure sentinel keys per agent.
 if ($SessionId) { $Env:VCT_SESSION_ID = $SessionId }
 if ($AgentId) { $Env:VCT_AGENT_ID = $AgentId }
+# v0.2.102 W6-C2 (census F15): the agent type for the debounced runner's
+# failure row. MUST MATCH the .sh sibling.
+if ($AgentType) { $Env:VCT_AGENT_TYPE = $AgentType }
 
 # --- Command -> written paths --------------------------------------------
 Initialize-VcoBashWriteTargets -HooksDir $ScriptDir

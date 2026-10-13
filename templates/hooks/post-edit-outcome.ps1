@@ -5,6 +5,7 @@
 # file existed before. Pairing strategy: trainer joins on (session_id,
 # file_path, ts_window) since pre-edit's task_id isn't shared via a
 # state file (see .sh sibling for the rationale + future cleanup note).
+# v0.2.102: rows also carry agent_id ("" = main chat), as in the .sh.
 
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -32,11 +33,13 @@ $SessionId = ""
 $FilePath = ""
 $OldLen = 0
 $NewLen = 0
+$AgentIdRaw = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
         if ($payload.tool_name) { $ToolName = [string]$payload.tool_name }
         if ($payload.session_id) { $SessionId = [string]$payload.session_id }
+        if ($payload.agent_id) { $AgentIdRaw = [string]$payload.agent_id }
         if ($payload.tool_input) {
             if ($payload.tool_input.file_path) { $FilePath = [string]$payload.tool_input.file_path }
             $oldStr = if ($payload.tool_input.old_string) { [string]$payload.tool_input.old_string } else { '' }
@@ -52,6 +55,16 @@ try {
 if ($ToolName -ne "Edit" -and $ToolName -ne "Write") { exit 0 }
 if (-not $FilePath) { exit 0 }
 if (-not $SessionId) { $SessionId = "default" }
+
+# v0.2.102 W6-C2 (census F13): the subagent that made the edit, sanitised by
+# the ONE agent-id rule (_lib/session-id.ps1); empty = the main chat.
+# MUST MATCH the .sh sibling.
+$AgentId = ""
+$SessionIdLibPath = Join-Path $ScriptDir "_lib/session-id.ps1"
+if ($AgentIdRaw -and (Test-Path $SessionIdLibPath)) {
+    . $SessionIdLibPath
+    $AgentId = Get-VcoSanitizedAgentId -Raw $AgentIdRaw
+}
 
 # === file_existed_before heuristic ===
 # Edit always operates on existing files; Write can create or overwrite.
@@ -119,6 +132,8 @@ try:
             'file_existed_before': bool($FileExistedBefore),
             'ts_ms': $NowTsMs,
             'post_check': None,
+            # W6-C2 F13: '' for the main chat, the subagent's id otherwise.
+            'agent_id': r'''$AgentId''',
         },
         session_id=r'''$SessionId''',
         project_id=project_id,

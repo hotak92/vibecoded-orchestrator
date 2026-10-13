@@ -203,6 +203,38 @@ function Remove-WtrecStale([string]$root) {
 # recursive: a directory still holding another lane's worktree or any stray
 # file is left exactly as it is, and only that exact directory is touched.
 # Must match _wtrec_rmdir_lanes_parent in the .sh sibling.
+# Get-WtrecChangedFiles ROOT ID -- v0.2.102 W6-C2 (census F7): the ABSOLUTE
+# paths of the files the agent changed in ITS OWN worktree (uncommitted +
+# committed since the recorded base). Exact attribution, unlike the shared-
+# tree snapshot diff. Empty when there is no record or the worktree is gone.
+# Read-only. MUST MATCH wtrec_changed_files in the .sh.
+function Get-WtrecChangedFiles([string]$root, [string]$id) {
+    $file = Find-WtrecRecord $root $id
+    if (-not $file) { return @() }
+    $rec = Read-WtrecRecord $file
+    if (-not $rec) { return @() }
+    $path = [string]$rec.path
+    $base = [string]$rec.base
+    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Container)) { return @() }
+    $rels = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($line in @(& git -C $path -c core.quotepath=off status --porcelain --untracked-files=all 2>$null)) {
+            if (-not $line -or $line.Length -lt 4) { continue }
+            $rel = $line.Substring(3)
+            $arrow = $rel.LastIndexOf(" -> ")
+            if ($arrow -ge 0) { $rel = $rel.Substring($arrow + 4) }
+            if ($rel) { $rels.Add($rel) }
+        }
+        if ($base) {
+            foreach ($line in @(& git -C $path -c core.quotepath=off diff --name-only $base HEAD 2>$null)) {
+                if ($line) { $rels.Add([string]$line) }
+            }
+        }
+    } catch { }
+    $out = @($rels | Sort-Object -Unique -CaseSensitive | ForEach-Object { "$path/$_" })
+    return $out
+}
+
 function Remove-WtrecLanesParent([string]$top, [string]$path) {
     try {
         $parent = Split-Path -Parent $path
