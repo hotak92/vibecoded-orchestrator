@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
+from typing import Any
 
 # Path resolution: ``__file__`` → ``vco_lib/bundled_versions.py``;
 # ``.parent`` is the ``vco_lib/`` package directory, where the .toml
@@ -73,7 +74,7 @@ def manifest_path() -> Path:
     return _DEFAULT_MANIFEST_PATH
 
 
-def load_bundled_versions(path: Path | None = None) -> dict[str, dict[str, str]]:
+def load_bundled_versions(path: Path | None = None) -> dict[str, dict[str, Any]]:
     """Parse ``bundled_mcp_versions.toml``.
 
     Args:

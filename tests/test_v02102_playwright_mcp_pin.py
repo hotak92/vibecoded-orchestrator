@@ -189,6 +189,7 @@ class BrowserStateTests(_Machine):
     def test_fallback_install_argv_when_install_browser_absent(self) -> None:
         nm = _npx_pkg(self.cache, core="1.70.0", install_browser=False)
         cached = pm.cached_package(PIN, npm_cache=self.cache)
+        assert cached is not None
         self.assertEqual(cached.node_modules, nm)
         self.assertEqual(pm.browser_install_argv(PIN, cached),
                          ["npx", "-y", "playwright@1.70.0", "install", "chromium"])
