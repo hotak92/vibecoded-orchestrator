@@ -150,6 +150,7 @@ def atomic_write_bytes(
     fsync: bool = True,
     mode: Optional[int] = None,
     symlink_safe: bool = False,
+    tmp_prefix: Optional[str] = None,
 ) -> Optional[Path]:
     """Write ``data`` to ``path`` atomically (binary mode).
 
@@ -173,6 +174,13 @@ def atomic_write_bytes(
             :func:`_symlink_safe_redirect_target` (same convention as
             :func:`atomic_copy_file`), and that target is returned. The
             symlink and its destination are untouched.
+        tmp_prefix: Prefix of the same-directory tempfile, in place of the
+            default ``<name>.``. For a caller whose destination name sits
+            inside a glob something else polls: the default tempfile
+            ``<name>.<rand>.tmp`` of a ``<x>.delivering.<pid>`` claim would
+            itself match ``*.delivering.*`` and, left by a crash, read as a
+            fake claim (``vco_lib.agent_alerts`` passes a dot-led prefix that
+            no ``agent_alerts_*`` glob matches).
 
     Returns:
         ``None`` on a normal write; the redirect ``Path`` when
@@ -189,7 +197,7 @@ def atomic_write_bytes(
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path_str = tempfile.mkstemp(
-        prefix=target.name + ".",
+        prefix=tmp_prefix if tmp_prefix is not None else target.name + ".",
         suffix=".tmp",
         dir=str(parent),
     )

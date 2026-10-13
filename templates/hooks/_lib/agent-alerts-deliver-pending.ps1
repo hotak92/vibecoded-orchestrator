@@ -14,16 +14,15 @@
 # this file has no .sh sibling (PS1_ONLY_LIB in check_hook_parity.py and
 # tests/test_v0292_sibling_parity_blind_spots.py).
 #
-# Expects the hook's $ScriptDir, $ProjectRoot and $StateDir. Never throws;
+# Expects the hook's $ScriptDir, $ProjectRoot and $StateDir, and an env the
+# hook has ALREADY scrubbed of secrets (its inline scrub runs right after the
+# fast path, before this file is dot-sourced, so the gate
+# tests/test_scrub_env_parity_v0273.py sees it in the hook). Never throws;
 # the hook exits 0 after it returns. MUST MATCH agent-alerts-deliver.sh
 # (everything after its fast path).
 
 function Invoke-AgentAlertsPendingDelivery {
     param([string]$ScriptDir, [string]$ProjectRoot, [string]$StateDir)
-
-    foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
-        if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
-    }
 
     if (-not $env:CLAUDE_PROJECT_DIR) {
         $ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path

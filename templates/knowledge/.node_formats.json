@@ -355,11 +355,11 @@
   },
   "knowledge/concepts/orchestrator-hook-system.md": {
     "title": "Orchestrator Hook System",
-    "description": "The Orchestrator Hook System intercepts Claude Code lifecycle events—such as session start, tool use, and file edits—to transform it into an automated workflow engine. Hooks are shell scripts registered in `.claude/settings.json` that bind to specific events, with blocking hooks capable of aborting operations. Key functions include security enforcement (command scanning), automatic knowledge-graph synchronization, and state preservation across context compaction. Use this system to implement structured, controlled agentic workflows that require pre- and post-execution validation or context management.",
-    "summary": "Hooks are shell scripts registered in `.claude/settings.json` that intercept Claude Code lifecycle events (e.g., `PreToolUse`, `SessionStart`) to implement automated workflows. The most important fact is that these hooks allow for granular interception points to enforce security scanning, manage context state, and trigger knowledge-graph synchronization before or after core operations.",
-    "generated_at": "2026-10-13T09:04:37.998668+00:00",
+    "description": "The Orchestrator Hook System intercepts Claude Code lifecycle events (e.g., tool use, file edits, session start) to function as an automated workflow engine. Hooks, implemented as shell scripts or Python helpers registered in `.claude/settings.json`, bind to specific events and optionally tool names. These hooks enable critical functions such as security scanning, automatic knowledge graph synchronization, and context state preservation. They are essential for implementing complex agentic patterns, enforcing quality gates, and maintaining system state across autonomous workflows.",
+    "summary": "Hooks, registered in `.claude/settings.json`, intercept Claude Code lifecycle events (e.g., `PreToolUse`, `PostToolUse`) to enable automated workflows, security enforcement, and context management. The most important fact is that hooks allow for the programmatic interception and manipulation of the system state during core operations like tool execution and context compaction.",
+    "generated_at": "2026-10-13T15:20:52.020754+00:00",
     "backend": "ollama",
-    "content_hash": "8063239beeb32830",
+    "content_hash": "37b720b7443c9d17",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-knowledge-graph.md": {

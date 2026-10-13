@@ -79,12 +79,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from vco_lib.atomic import claim_by_rename, claim_owner_gone, portable_exclusive_lock
+from vco_lib.atomic import (
+    atomic_write_bytes,
+    claim_by_rename,
+    claim_owner_gone,
+    portable_exclusive_lock,
+)
 from vco_lib.hook_agent_key import agent_state_key, sanitize_agent_id
 
 #: File prefix/suffix of a pending alert file under ``.claude/state``.
@@ -259,25 +263,16 @@ def _read_rows(path: Path) -> List[Dict[str, Any]]:
 
 
 def _rewrite_rows(path: Path, rows: List[Dict[str, Any]]) -> None:
-    """Replace ``path``'s content with ``rows`` atomically (temp file +
-    ``os.replace``). Not :func:`vco_lib.atomic.atomic_write_bytes`: its temp
-    name is ``<name>.<rand>.tmp``, which for a claim matches the
-    ``*.delivering.*`` glob — a crash would leave a fake claim. The caller
-    holds the lock. Raises ``OSError`` (the temp file is removed)."""
-    tmp = path.parent / f"{_REWRITE_TMP_PREFIX}{os.getpid()}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            for r in rows:
-                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+    """Replace ``path``'s content with ``rows`` atomically through the one
+    atomic-write home (:func:`vco_lib.atomic.atomic_write_bytes`: same-dir
+    temp file, fsync, ``os.replace``). Its DEFAULT temp name is
+    ``<name>.<rand>.tmp``, which for a claim matches the ``*.delivering.*``
+    glob — a crash would leave a fake claim — so the temp file is named with
+    :data:`_REWRITE_TMP_PREFIX`, which no ``agent_alerts_*`` glob matches.
+    The caller holds the lock. Raises ``OSError`` (the temp file is
+    removed)."""
+    body = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+    atomic_write_bytes(path, body.encode("utf-8"), tmp_prefix=_REWRITE_TMP_PREFIX)
 
 
 def _move_rows_to_log(claim: Path, all_rows: List[Dict[str, Any]],

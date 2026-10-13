@@ -45,6 +45,17 @@ try {
 } catch { $hasPending = $false }
 if (-not $hasPending) { exit 0 }
 
+# Env scrub (canonical list: _lib/scrub-env.ps1; parity gate
+# tests/test_scrub_env_parity_v0273.py). It sits HERE, after the fast path
+# and before anything below can start a child process (the venv Python in
+# _lib/agent-alerts-deliver-pending.ps1). The no-pending path above starts
+# no child, so it never runs these lines: it pays their parse (four lines)
+# but not the Test-Path/Remove-Item module autoload. Inline in the hook file,
+# not in the dot-sourced lib, so the gate reads it where every hook has it.
+foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
+    if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+}
+
 # Something is pending: the rest lives in _lib/ so PowerShell does not parse
 # it on every no-pending call (see that file). A missing lib is a broken
 # install: said on stderr AND to the model (plain PostToolUse stderr never
