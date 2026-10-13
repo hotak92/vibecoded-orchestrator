@@ -9,16 +9,19 @@
   //      the current project as grantee, so this project's codegraph
   //      reads see entries from the OTHER project's already-maintained
   //      collections. No row is added to project_codegraph_extra_paths.
-  //   2. "Add as path anyway" — re-calls add_project_codegraph_extra_path
-  //      with `force: true` so the launcher-project detection is
-  //      bypassed and the path is persisted as a regular extra. The
-  //      panel's auto-sync flow proceeds normally afterwards.
+  //   2. "Add as code folder anyway" — re-calls
+  //      add_project_codegraph_extra_path with `force: true` so the
+  //      launcher-project detection is bypassed and the folder is persisted
+  //      as a regular code folder. The panel's auto-sync flow proceeds
+  //      normally afterwards. (v0.2.102 W6-AA: wording from
+  //      code-folder-labels.ts, one home with the panel.)
   //   3. "Cancel" — no-op.
   //
   // NOT minimisable per spec §14.4. The user must pick.
 
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import type { ProjectMeta } from '$lib/types/codegraph-extras';
+  import { CODE_FOLDER_DISAMBIG } from '$lib/project-state/code-folder-labels';
 
   let {
     open = $bindable<boolean>(true),
@@ -39,7 +42,7 @@
     /** Invoked when the user picks "Add as project". The handler must
      *  call codegraph_grant_access; the modal closes itself first. */
     onAddAsProject: () => Promise<void> | void;
-    /** Invoked when the user picks "Add as path anyway". The handler
+    /** Invoked when the user picks "Add as code folder anyway". The handler
      *  must call addExtraPath with force=true and then proceed to
      *  auto-sync. The modal closes itself first. */
     onAddAsPathAnyway: () => Promise<void> | void;
@@ -69,7 +72,7 @@
   async function pickAddAsPath() {
     if (working) return;
     working = true;
-    workingLabel = 'Adding path...';
+    workingLabel = CODE_FOLDER_DISAMBIG.addAnywayBusy;
     try {
       await onAddAsPathAnyway();
       open = false;
@@ -108,7 +111,7 @@
         <strong>{existingProject.name}</strong>.
       </p>
       <p>
-        Instead of indexing it as a read-only path, you can grant
+        {CODE_FOLDER_DISAMBIG.insteadLead}
         <strong>{currentProjectName}</strong> codegraph read-access to
         <strong>{existingProject.name}</strong> via the access matrix.
         That way you benefit from
@@ -117,9 +120,8 @@
         separately.
       </p>
       <p class="extras-disambig-hint">
-        Picking "Add as path anyway" indexes the folder into this
-        project's own codegraph collection. Both choices show results
-        in this project's <code>search_code_graph</code> queries; the
+        {CODE_FOLDER_DISAMBIG.hint}
+        <code>search_code_graph</code> queries; the
         access-matrix grant avoids duplicating analyze work.
       </p>
     </div>
@@ -132,7 +134,7 @@
         class="ps-btn-primary"
         onclick={pickAddAsProject}
         disabled={working}
-        aria-label="Grant access matrix instead of indexing path"
+        aria-label={CODE_FOLDER_DISAMBIG.grantAria}
       >
         {working && workingLabel === 'Granting access...'
           ? workingLabel
@@ -143,11 +145,11 @@
         class="ps-btn-secondary"
         onclick={pickAddAsPath}
         disabled={working}
-        aria-label="Index this folder anyway"
+        aria-label={CODE_FOLDER_DISAMBIG.addAnywayAria}
       >
-        {working && workingLabel === 'Adding path...'
+        {working && workingLabel === CODE_FOLDER_DISAMBIG.addAnywayBusy
           ? workingLabel
-          : 'Add as path anyway'}
+          : CODE_FOLDER_DISAMBIG.addAnywayButton}
       </button>
       <button
         type="button"

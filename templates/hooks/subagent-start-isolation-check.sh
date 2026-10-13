@@ -168,6 +168,25 @@ case "$AGENT_ID" in
         ;;
 esac
 
+# ── Lane reservation binding (v0.2.102 W6-AA) ─────────────────────────────
+# When worktree-guard created this agent's worktree from a lane reservation
+# (vco_lib/lane_reservation.py), its launch record carries the reservation id,
+# target repo, branch and base. Tell the agent, so a brief that names a
+# different reservation (two isolated dispatches in one message, or a stale
+# reservation) is caught by the agent before it edits anything. Delivered on
+# every SubagentStart of the agent (a resume included). MUST MATCH the .ps1.
+if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
+    # shellcheck source=_lib/worktree-records.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/worktree-records.sh"
+    if LANE_REC="$(wtrec_find "$PROJECT_ROOT" "$AGENT_ID")"; then
+        LANE_ID="$(wtrec_get "$LANE_REC" reservation_id)"
+        if [ -n "$LANE_ID" ]; then
+            emit_ctx "VCO lane reservation $LANE_ID: your worktree is $(wtrec_get "$LANE_REC" path) (repo $(wtrec_get "$LANE_REC" repo), branch $(wtrec_get "$LANE_REC" branch), base $(wtrec_get "$LANE_REC" base_sha)). If your brief names a different reservation id, STOP and report. Only Edit/Write are held to this worktree by the harness: keep every Bash command (cd, redirects, git) inside it too."
+            exit 0
+        fi
+    fi
+fi
+
 # ── Skipped-isolation detection (v0.2.102 W6-Q follow-up) ─────────────────
 # The live SubagentStart payload carries no isolation flag, so the payload
 # branch further down can never fire on its own. What IS knowable: the

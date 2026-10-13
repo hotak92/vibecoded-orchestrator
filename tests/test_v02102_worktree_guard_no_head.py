@@ -253,7 +253,7 @@ def test_isolation_check_silent_without_a_notice(flavour: str, tmp_path: Path) -
     assert proc.returncode == 0 and proc.stdout.strip() == ""
 
 
-# ── settings: the raised WorktreeCreate timeout reaches upgraded installs ───
+# ── settings: the 3 s WorktreeCreate timeout is lifted on upgraded installs ─
 
 _TEMPLATES = {
     "linux": REPO_ROOT / "templates" / "settings.json.linux.template",
@@ -269,12 +269,15 @@ def _guard_hooks(doc: dict) -> list[dict]:
 
 @pytest.mark.parametrize("os_name", sorted(_TEMPLATES))
 def test_upgraded_install_receives_the_raised_timeout(os_name: str) -> None:
+    """The shipped 3 s is reshaped away; v0.2.102 W6-AA review A1: the
+    registration then carries NO timeout, so the harness default (600 s)
+    applies and a slow `git worktree add` is never killed by a VCO bound."""
     template = json.loads(_TEMPLATES[os_name].read_text(encoding="utf-8"))
     old = json.loads((_V02100 / f"{os_name}.json").read_text(encoding="utf-8"))
     assert [h["timeout"] for h in _guard_hooks(old)] == [3]
     merged = settings_merge.smart_merge_settings(old, template)
     assert _guard_hooks(merged) == _guard_hooks(template)
-    assert [h["timeout"] for h in _guard_hooks(merged)] == [60]
+    assert ["timeout" in h for h in _guard_hooks(merged)] == [False]
 
 
 @pytest.mark.parametrize("os_name", sorted(_TEMPLATES))

@@ -15,8 +15,14 @@
 # hooks share one record per launch:
 #
 #   worktree-guard            writes  .claude/state/worktree-guard/wt-<name>.json
-#                             {name, mode: head|snapshot|in_place, path, base,
-#                              toplevel, status: created, created_at}
+#                             {name, mode: head|snapshot|in_place|reservation|
+#                              reservation_existing, path, base, toplevel,
+#                              status: created, created_at}
+#                             A lane-reservation launch (v0.2.102 W6-AA,
+#                             vco_lib/lane_reservation.py) adds reservation_id,
+#                             repo, branch, base_ref, base_sha, branch_created;
+#                             its `toplevel` is the TARGET repo R, so the reap
+#                             below runs `git -C R`, never against the project.
 #   subagent-stop-reconcile   reaps the worktree when it is provably unchanged
 #                             (wtrec_reap) and records the outcome in `status`
 #   subagent-start-isolation-check
@@ -44,20 +50,31 @@ wtrec_valid_name() {
     return 0
 }
 
-# wtrec_write PROJECT_ROOT NAME MODE PATH BASE TOPLEVEL
+# wtrec_write PROJECT_ROOT NAME MODE PATH BASE TOPLEVEL [EXTRA_JSON]
+# EXTRA_JSON (v0.2.102 W6-AA): an optional one-line JSON object of STRING
+# fields merged into the record — a lane reservation's binding
+# (reservation_id, repo, branch, base_ref, base_sha, branch_created). The
+# fixed fields above always win over an extra key of the same name.
 wtrec_write() {
     local root="$1" name="$2"
     wtrec_valid_name "$name" || return 0
     [ -n "${PY:-}" ] || return 0
     mkdir -p "$root/$WTREC_SUBDIR" 2>/dev/null || return 0
     WTREC_OUT="$root/$WTREC_SUBDIR/wt-$name.json" WTREC_NAME="$name" WTREC_MODE="$3" \
-    WTREC_PATH="$4" WTREC_BASE="$5" WTREC_TOP="$6" "$PY" -c '
+    WTREC_PATH="$4" WTREC_BASE="$5" WTREC_TOP="$6" WTREC_EXTRA="${7:-}" "$PY" -c '
 import json, os
 from datetime import datetime, timezone
 e = os.environ
-rec = {"name": e["WTREC_NAME"], "mode": e["WTREC_MODE"], "path": e["WTREC_PATH"],
+rec = {}
+try:
+    extra = json.loads(e.get("WTREC_EXTRA") or "{}")
+except ValueError:
+    extra = {}
+if isinstance(extra, dict):
+    rec.update({str(k): v for k, v in extra.items() if isinstance(v, str)})
+rec.update({"name": e["WTREC_NAME"], "mode": e["WTREC_MODE"], "path": e["WTREC_PATH"],
        "base": e["WTREC_BASE"], "toplevel": e["WTREC_TOP"], "status": "created",
-       "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+       "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
 with open(e["WTREC_OUT"], "w", encoding="utf-8") as fh:
     json.dump(rec, fh)
 ' 2>/dev/null || true
@@ -247,13 +264,28 @@ for n in os.listdir(d):
 ' 2>/dev/null || true
 }
 
+# _wtrec_rmdir_lanes_parent TOPLEVEL PATH — after the reap removed a lane
+# reservation's worktree, remove its now-EMPTY parent `<R>.vco-lanes/`
+# (vco_lib/lane_reservation.py's path convention: sibling of R's toplevel).
+# rmdir only: never recursive, so a directory still holding another lane's
+# worktree or any stray file is left exactly as it is. Only that exact
+# directory is ever touched. MUST MATCH Remove-WtrecLanesParent in the .ps1.
+_wtrec_rmdir_lanes_parent() {
+    local top="$1" path="$2" parent lanes
+    parent="$(dirname "$path")"
+    lanes="$(dirname "$top")/$(basename "$top").vco-lanes"
+    [ "$parent" = "$lanes" ] || return 0
+    rmdir "$lanes" 2>/dev/null || true
+}
+
 # wtrec_reap PROJECT_ROOT AGENT_ID — remove the agent's worktree when it is
 # provably unchanged; keep it otherwise. Prints one line:
 #   "<decision>\t<reason>\t<path>"  decision ∈ removed|kept|skipped
 # and prints nothing when the agent has no record (the guard never ran).
 #
 # Removed ONLY when ALL hold (conservative — any doubt keeps the worktree):
-#   * mode is head or snapshot (in_place = the user's own folder: NEVER);
+#   * mode is head, snapshot or reservation (in_place = the user's own
+#     folder, reservation_existing = a worktree the coordinator made: NEVER);
 #   * the path exists, is a registered worktree of the record's toplevel and
 #     is not that toplevel;
 #   * HEAD equals the recorded base (so no commits beyond it, and no switch);
@@ -263,9 +295,13 @@ for n in os.listdir(d):
 #     under a git-excluded `.claude/`);
 #   * `git worktree remove` (no --force) agrees — git refuses an unclean or
 #     locked worktree on its own.
-# worktree-guard always creates DETACHED worktrees, so there is no branch to
-# delete. A snapshot base commit is on no ref once the worktree is gone;
-# git's normal gc collects it.
+# worktree-guard creates DETACHED worktrees for head/snapshot, so there is no
+# branch to delete; a reservation worktree's new branch is deleted with it
+# (compare-and-delete against the base, above), and the lanes directory it
+# lived in goes too once it is empty (_wtrec_rmdir_lanes_parent). A snapshot
+# base commit is on no ref once the worktree is gone; git's normal gc
+# collects it.
+
 wtrec_reap() {
     local root="$1" id="$2" rec mode path base top head st err listed
     rec="$(wtrec_find "$root" "$id")" || return 0
@@ -278,8 +314,9 @@ wtrec_reap() {
         [ "$1" = "skipped" ] || wtrec_set "$rec" "$1" "$2"
     }
     case "$mode" in
-        head|snapshot) ;;
+        head|snapshot|reservation) ;;
         in_place) _wtrec_out skipped in_place_never_removed; return 0 ;;
+        reservation_existing) _wtrec_out skipped reservation_existing_never_removed; return 0 ;;
         *) _wtrec_out skipped unknown_mode; return 0 ;;
     esac
     if [ "$(wtrec_get "$rec" status)" != "created" ]; then
@@ -292,6 +329,7 @@ wtrec_reap() {
     fi
     if [ ! -d "$path" ]; then
         _wtrec_out removed already_gone
+        [ "$mode" = "reservation" ] && _wtrec_rmdir_lanes_parent "$top" "$path"
         return 0
     fi
     listed="$(git -C "$top" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')"
@@ -313,6 +351,22 @@ wtrec_reap() {
         return 0
     fi
     if err="$(git -C "$top" worktree remove "$path" 2>&1)"; then
+        # A lane reservation's worktree (mode reservation) was created on a
+        # NEW branch (`worktree add -b`); remove that branch too, but only
+        # while it still points at the recorded base (`update-ref -d <ref>
+        # <old>` is git's compare-and-delete), so a branch that gained work
+        # elsewhere is never lost.
+        if [ "$mode" = "reservation" ] && [ "$(wtrec_get "$rec" branch_created)" = "yes" ]; then
+            local br
+            br="$(wtrec_get "$rec" branch)"
+            if [ -n "$br" ] && git -C "$top" update-ref -d "refs/heads/$br" "$base" >/dev/null 2>&1; then
+                _wtrec_out removed clean
+            else
+                _wtrec_out removed clean_branch_kept
+            fi
+            _wtrec_rmdir_lanes_parent "$top" "$path"
+            return 0
+        fi
         _wtrec_out removed clean
     else
         _wtrec_out kept "git_refused: $(printf '%s' "$err" | tr '\t\n' '  ' | cut -c1-200)"

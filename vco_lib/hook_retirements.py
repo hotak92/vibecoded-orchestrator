@@ -754,8 +754,12 @@ def _v02102_reshape_rows() -> Tuple[PriorShippedShape, ...]:
     the repository has no commits yet (``git add -A`` through a throwaway
     index), on top of the ``git worktree add`` checkout it always ran. A
     harness kill at 3 s fails the create, and a failed WorktreeCreate means
-    the ``isolation: worktree`` agent cannot launch at all — so the timeout
-    rises to 60 s (the hook only runs once per isolated launch).
+    the ``isolation: worktree`` agent cannot launch at all. The template
+    registration therefore carries NO ``timeout``: Claude Code's command-hook
+    default (600 s) applies, so a slow-but-working ``git worktree add`` on a
+    very large repository (including a lane reservation's, v0.2.102 W6-AA) is
+    never killed by a VCO-chosen bound (the hook only runs once per isolated
+    launch).
     """
     rows = []
     flavours = (
@@ -779,7 +783,8 @@ def _v02102_reshape_rows() -> Tuple[PriorShippedShape, ...]:
             ),
             replacement=(
                 f"the current template's {script} registration "
-                f"(WorktreeCreate, raised timeout)"
+                f"(WorktreeCreate, no explicit timeout: the harness default "
+                f"applies)"
             ),
         ))
     return tuple(rows)

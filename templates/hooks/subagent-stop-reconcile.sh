@@ -28,12 +28,16 @@
 #      every modified file. On hit, append an entry to
 #      `.claude/logs/credential_alerts.jsonl` with the same schema
 #      post-tool-security.sh uses.
-#   5. Nudge counter — bump the parent session's row in the shared
-#      `kg_update_tokens.jsonl` (metrics dir resolved by
-#      `_lib/metrics-dir.sh`; v0.2.92 W7 moved it out of ~/.claude) so
-#      the kg-update-nudge hook's threshold accounts for subagent work.
-#      Work-unit estimate = file_count * 50 + total_diff_size_bytes/4
-#      (rough proxy for output tokens).
+#   5. Subagent work record — bump `subagent_work_units` (+ count/ids) on
+#      the parent session's row in the shared `kg_update_tokens.jsonl`
+#      (metrics dir resolved by `_lib/metrics-dir.sh`; v0.2.92 W7 moved it
+#      out of ~/.claude). The field records each subagent's work for the
+#      per-subagent KG nudge the owner scheduled for v0.2.103 (each
+#      subagent nudged on its own work). The main-chat kg-update-nudge
+#      deliberately does NOT read it (owner ruling 2026-10-13: the
+#      main-chat nudge ignores subagent work). Work-unit estimate =
+#      file_count * 50 + total_diff_size_bytes/4 (rough proxy for output
+#      tokens).
 #
 # File-modification discovery (V52-L.1 spec, Option 2):
 #   - SubagentStart hook (subagent-start-kg-inject.sh) writes a
@@ -163,8 +167,9 @@ ISO_CWD="$(printf '%s' "$PARSED" | sed -n '7p')"
 # could never fire. Derive it the way subagent-start-isolation-check does,
 # from worktree-guard's per-launch record and the agent's definition
 # (_lib/worktree-records.sh — one home for both hooks):
-#   * a record with mode head|snapshot → the guard gave this agent its own
-#     worktree: isolation happened, so stay silent (ISO_FLAG=0);
+#   * a record with mode head|snapshot|reservation|reservation_existing → the
+#     guard gave this agent its own worktree: isolation happened, so stay
+#     silent (ISO_FLAG=0);
 #   * no record, guard registered, definition declares `isolation: worktree`
 #     → isolation was skipped: ISO_FLAG=1 and the working directory is the
 #     parent checkout (ISO_CWD cleared, so the cwd exemption cannot apply);
@@ -176,7 +181,9 @@ if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
     . "$SCRIPT_DIR/_lib/worktree-records.sh"
     if ISO_REC="$(wtrec_find "$PROJECT_ROOT" "$AGENT_ID")"; then
         case "$(wtrec_get "$ISO_REC" mode)" in
-            head|snapshot) ISO_FLAG=0 ;;
+            # reservation*: a lane-reservation worktree in the target repo
+            # (v0.2.102 W6-AA) — isolated too.
+            head|snapshot|reservation|reservation_existing) ISO_FLAG=0 ;;
         esac
     elif wtrec_isolation_skipped "$PROJECT_ROOT" "$AGENT_ID" "$AGENT_TYPE"; then
         ISO_FLAG=1
@@ -465,9 +472,14 @@ sys.stdout.write(json.dumps({
     done
 fi
 
-# -------------------- Step 5: Nudge counter increment --------------------
-# Add subagent work to the parent session's row in the kg-update-nudge
-# counter file. The counter file lives under the machine-wide metrics dir
+# -------------------- Step 5: Subagent work record --------------------
+# Record subagent work on the parent session's row in the kg-update-nudge
+# counter file, as `subagent_work_units` (+ subagent_count / subagent_ids).
+# The field is for the per-subagent KG nudge the owner scheduled for
+# v0.2.103 (each subagent nudged on its own work); the main-chat
+# kg-update-nudge deliberately does NOT read it (owner ruling 2026-10-13:
+# the main-chat nudge ignores subagent work), so today it changes no
+# nudge. The counter file lives under the machine-wide metrics dir
 # (not the project's .claude/) because nudge state is per-session, not
 # per-project; kg-update-nudge.sh resolves the same path through the same
 # `_lib/metrics-dir.sh` helper. v0.2.92 W7 moved that home out of
@@ -476,8 +488,7 @@ fi
 # Work-unit estimate proxy: file_count * 50 + total_bytes / 4. 50 per
 # file approximates the "agent had to think about it" overhead;
 # bytes/4 approximates output tokens (~4 chars/token English).
-# This is a rough metric — the nudge hook's threshold (175k first,
-# 50k interval) is order-of-magnitude-tolerant by design.
+# This is a rough, order-of-magnitude metric.
 _SSR_LIB="$(dirname "${BASH_SOURCE[0]}")/_lib/metrics-dir.sh"
 if [ -n "$SESSION_ID" ] && [ "$FILE_COUNT" -gt 0 ] && [ -f "$_SSR_LIB" ]; then
     # shellcheck source=_lib/metrics-dir.sh disable=SC1091
@@ -524,8 +535,9 @@ if not session_id or not nudge_path or work_units <= 0:
 # baseline / last_seen_total / fired_once / etc.
 #
 # When no row exists for our session yet, we synthesize a minimal row
-# carrying just the subagent contribution. The nudge hook gracefully
-# merges this on its next read.
+# carrying just the subagent contribution. The main-chat nudge does not
+# read the subagent_* fields (owner ruling 2026-10-13); they wait for the
+# per-subagent nudge scheduled for v0.2.103.
 rows = []
 existing = None
 try:
