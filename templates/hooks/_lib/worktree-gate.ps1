@@ -13,6 +13,14 @@
 # (exit 2); on registered (0) OR hub-uncertain (1) we INDEX -- never drop a
 # legit index on doubt.
 
+# v0.2.102 W6-ALERTS2 (owner ruling 3): set to $true when a probe answered
+# "hub unreachable" (exit 1). The decision does not change -- still INDEX on
+# doubt -- but the caller tells the model, once per session, so it can bring
+# the hub back (Get-VcoHubUnreachableNotice in _lib/emit-context.ps1). Reset
+# when this lib is dot-sourced. MUST MATCH worktree-gate.sh's
+# VCO_WORKTREE_GATE_HUB_UNREACHABLE.
+$script:WorktreeGateHubUnreachable = $false
+
 # Return $true (SKIP the edit) when the edit is in an EPHEMERAL/unregistered
 # worktree; return $false (INDEX the edit) otherwise.
 #
@@ -71,6 +79,9 @@ function Test-EphemeralWorktreeEdit {
     if ($rc -eq 2) {
         return $true   # definitively unregistered worktree -> SKIP
     }
+    # exit 1 = hub unreachable (or a stale token): flag it for the caller's
+    # once-per-session notice; the decision stays INDEX.
+    if ($rc -eq 1) { $script:WorktreeGateHubUnreachable = $true }
     # exit 0 (registered) OR exit 1 (uncertain / launcher off) -> INDEX.
     return $false
 }

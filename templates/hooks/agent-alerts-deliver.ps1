@@ -9,65 +9,56 @@
 # every pending row of the session (background completions, late
 # SubagentStop jobs). A subagent's own events deliver nothing (vco_lib
 # decides). The reader, the row format and the locking live in ONE place:
-# vco_lib/agent_alerts.py. Cost when nothing is pending: two directory
-# listings, no interpreter. Always exits 0. Alerts pending with no resolvable
+# vco_lib/agent_alerts.py. Cost when nothing is pending: one .NET directory
+# listing and no cmdlet, so close to the bare PowerShell start; no Python.
+# Always exits 0. Alerts pending with no resolvable
 # VCO venv (a broken install) are said out loud, never skipped in silence.
 #
 # MUST MATCH agent-alerts-deliver.sh.
 
-foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
-    if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
-}
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
-$ScriptDir = $PSScriptRoot
-
-$ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
-    $env:CLAUDE_PROJECT_DIR
-} else {
-    (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
-}
-$StateDir = Join-Path $ProjectRoot ".claude/state"
-
-$HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
-if (-not $HookStdin) { exit 0 }
-
-# Fast path: nothing pending -> no interpreter start. "Pending" includes an
+# Fast path FIRST: nothing pending -> exit before any cmdlet runs (owner
+# ruling on the v0.2.102 Fable re-check, W6-ALERTS2). This hook runs on EVERY
+# main-chat tool call (matcher *), and the first use of a cmdlet such as
+# Get-ChildItem / Test-Path / Join-Path autoloads its module: measured on
+# pwsh 7.4 (Linux), the old fast path (env scrub via Test-Path Env:, stdin
+# read, Join-Path, two Get-ChildItem) cost ~87 ms on top of the bare ~175 ms
+# interpreter start; this one (plain .NET calls, string paths, the pending
+# path moved to _lib/) costs ~29 ms (medians: 262 -> 204 ms). The env
+# scrub and the stdin read move below the check: nothing before it starts a
+# child process, and the scrub exists for the child. "Pending" includes an
 # orphaned delivery claim (<file>.jsonl.delivering.<pid>, left by a delivery
 # killed mid-way): only Python re-adopts it, so it must not be hidden behind
-# this exit (review R5-1). MUST MATCH the .sh.
-$pending = @(Get-ChildItem -LiteralPath $StateDir -Filter "agent_alerts_*.jsonl" -File -ErrorAction SilentlyContinue)
-$claims = @(Get-ChildItem -LiteralPath $StateDir -Filter "agent_alerts_*.jsonl.delivering.*" -File -ErrorAction SilentlyContinue)
-if (($pending.Count + $claims.Count) -eq 0) { exit 0 }
-
-# The stderr cap compiles a C# writer (Add-Type, ~165 ms measured): taken
-# only once there is something to say, so the per-tool-call no-pending path
-# above stays at bare interpreter startup (the matcher is `*`).
-$StderrCap = Join-Path $ScriptDir "_lib/stderr-cap.ps1"
-if (Test-Path $StderrCap) { . $StderrCap }
-
-# vco_lib is needed, so the VCO venv (a bare system python cannot import it).
-$VenvLib = Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1"
-$VenvPy = $null
-if (Test-Path $VenvLib) {
-    . $VenvLib
-    $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-}
-if (-not $VenvPy -or -not (Test-Path $VenvPy)) {
-    $adMsg = "[Subagent alerts] Alerts your subagents hit are pending in $StateDir/agent_alerts_*.jsonl* but cannot be read: the VCO venv is not resolvable (a broken VCO install - repair it with the orchestrator update). Read those files directly."
-    [Console]::Error.WriteLine("agent-alerts-deliver: $adMsg")
-    $adEvent = if ($HookStdin -match '"UserPromptSubmit"') { "UserPromptSubmit" } else { "PostToolUse" }
-    $emitLib = Join-Path $ScriptDir "_lib/emit-context.ps1"
-    if (Test-Path $emitLib) { . $emitLib }
-    if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
-        Emit-AdditionalContext $adMsg $adEvent
+# this exit (review R5-1); the one pattern agent_alerts_*.jsonl* covers both.
+# An unlistable state dir counts as nothing pending, as the .sh glob does.
+# MUST MATCH the .sh.
+$ScriptDir = $PSScriptRoot
+$ProjectRoot = $env:CLAUDE_PROJECT_DIR
+if (-not $ProjectRoot) { $ProjectRoot = $ScriptDir + '/../..' }
+$StateDir = $ProjectRoot + '/.claude/state'
+$hasPending = $false
+try {
+    if ([System.IO.Directory]::Exists($StateDir)) {
+        $hasPending = [System.IO.Directory]::GetFiles($StateDir, 'agent_alerts_*.jsonl*').Length -gt 0
     }
+} catch { $hasPending = $false }
+if (-not $hasPending) { exit 0 }
+
+# Something is pending: the rest lives in _lib/ so PowerShell does not parse
+# it on every no-pending call (see that file). A missing lib is a broken
+# install: said on stderr AND to the model (plain PostToolUse stderr never
+# reaches it), never skipped in silence.
+$PendingLib = $ScriptDir + '/_lib/agent-alerts-deliver-pending.ps1'
+if (-not [System.IO.File]::Exists($PendingLib)) {
+    $plMsg = "[Subagent alerts] Alerts your subagents hit are pending in $StateDir/agent_alerts_*.jsonl* but cannot be read: .claude/hooks/_lib/agent-alerts-deliver-pending.ps1 is missing (a broken VCO install - repair it with the orchestrator update). Read those files directly."
+    [Console]::Error.WriteLine("agent-alerts-deliver: $plMsg")
+    $plStdin = ""
+    try { $plStdin = [Console]::In.ReadToEnd() } catch { }
+    $plEvent = if ($plStdin -match '"UserPromptSubmit"') { "UserPromptSubmit" } else { "PostToolUse" }
+    Write-Output (@{ hookSpecificOutput = @{ hookEventName = $plEvent; additionalContext = $plMsg } } | ConvertTo-Json -Compress -Depth 4)
     exit 0
 }
-
-try {
-    $out = ($HookStdin | & $VenvPy -m vco_lib.agent_alerts deliver --project-root $ProjectRoot 2>$null) -join "`n"
-    if ($out -and $out.Trim()) { Write-Output $out }
-} catch { }
+. $PendingLib
+Invoke-AgentAlertsPendingDelivery -ScriptDir $ScriptDir -ProjectRoot $ProjectRoot -StateDir $StateDir
 exit 0

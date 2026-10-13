@@ -20,7 +20,7 @@
 #     subagent's own events deliver nothing (vco_lib decides).
 # The reader, the row format and the locking live in ONE place:
 # vco_lib/agent_alerts.py. Cost when nothing is pending — every tool call
-# once the * matcher is in place — is two globs, no interpreter. Always exits
+# once the * matcher is in place — is one glob, no interpreter. Always exits
 # 0. Alerts pending with no resolvable VCO venv (a broken install) are said
 # out loud — stderr and the context — never skipped in silence.
 #
@@ -34,18 +34,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 STATE_DIR="$PROJECT_ROOT/.claude/state"
 
-HOOK_STDIN=$(cat 2>/dev/null || echo "")
-[ -z "$HOOK_STDIN" ] && exit 0
-
-# Fast path: nothing pending -> no interpreter start. "Pending" includes an
-# orphaned delivery claim (`<file>.jsonl.delivering.<pid>`, left by a
-# delivery killed mid-way): only Python re-adopts it, so it must not be
-# hidden behind this exit (review R5-1). MUST MATCH the .ps1.
+# Fast path FIRST: nothing pending -> no interpreter start, and the payload
+# is not even read (W6-ALERTS2: the .ps1 checks before any cmdlet, this
+# keeps the same order). "Pending" includes an orphaned delivery claim
+# (`<file>.jsonl.delivering.<pid>`, left by a delivery killed mid-way): only
+# Python re-adopts it, so it must not be hidden behind this exit (review
+# R5-1); the one pattern agent_alerts_*.jsonl* covers both. MUST MATCH the .ps1.
 _pending=0
-for _f in "$STATE_DIR"/agent_alerts_*.jsonl "$STATE_DIR"/agent_alerts_*.jsonl.delivering.*; do
+for _f in "$STATE_DIR"/agent_alerts_*.jsonl*; do
     [ -f "$_f" ] && { _pending=1; break; }
 done
 [ "$_pending" = "1" ] || exit 0
+
+HOOK_STDIN=$(cat 2>/dev/null || echo "")
+[ -z "$HOOK_STDIN" ] && exit 0
 
 # The stderr cap only once there is something to say: the per-tool-call
 # no-pending path above stays a glob (matcher `*`). MUST MATCH the .ps1.

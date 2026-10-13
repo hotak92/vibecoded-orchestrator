@@ -94,6 +94,10 @@ PS1_ONLY_LIB = frozenset({
     # it is given, so there is nothing to mirror. Must also be listed in the
     # ratchet test's PS1_ONLY_LIB.
     "utf8-nobom.ps1",
+    # v0.2.102 W6-ALERTS2: the pending path of agent-alerts-deliver.ps1, out
+    # of the hook file so PowerShell does not parse it on every tool call
+    # (matcher *). bash reads a script as it runs it — nothing to split.
+    "agent-alerts-deliver-pending.ps1",
 })
 MAGIC_COMMENT_PREFIX = "# OS-EXEMPT-PARITY:"
 MAGIC_COMMENT_LINE_LIMIT = 5

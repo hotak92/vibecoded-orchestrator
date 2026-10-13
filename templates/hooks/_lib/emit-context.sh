@@ -268,3 +268,74 @@ Restore it by updating this project's bundle:
     [ -n "${sentinel:-}" ] && { : > "$sentinel" 2>/dev/null || true; }
     return 0
 }
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# vco_report_hub_unreachable <hooks_dir> <project_root> <agent_key> <who> <consequence>
+#
+# v0.2.102 W6-ALERTS2 (owner ruling 3): a hook that NEEDED the vct-hub and
+# could not reach it keeps its conservative default (the shared worktree gate
+# indexes on doubt, FIX-A') — but the model is told, so it can bring the hub
+# back. Same two channels and the same once-per-session discipline as
+# vco_report_missing_hook_lib above:
+#
+#   * stderr — for the human (and for a CLI caller such as a Bash tool run of
+#     code-graph-incremental.sh, whose stderr the model does read);
+#   * `$VCO_HUB_DOWN_NOTICE` — text for the CALLER's own additionalContext
+#     envelope (the caller knows its event); "" when already reported.
+#
+# Once per session PER AGENT KEY (vco_lib/hook_agent_key; session-id.sh
+# composes it), keyed by `.claude/state/hub_unreachable_notice_<key>` — ONE
+# sentinel shared by every hub-dependent hook, so the main chat hears it once
+# however many hooks hit the outage. A caller with no trustworthy session
+# (empty / "default" key: a standalone CLI run has no payload) is keyed by the
+# UTC hour, so it is told at most once an hour instead of once ever. A failed
+# sentinel write repeats the notice rather than losing it.
+#
+# The restart hint is the resolver's own user-facing text
+# (vct_project_config.sh "hub unreachable; is the launcher running? ...",
+# vco_lib/project_config.py _POST_UPDATE_HINT) plus the hub's own CLI.
+# MUST MATCH `_lib/emit-context.ps1`'s Get-VcoHubUnreachableNotice.
+VCO_HUB_DOWN_NOTICE=""
+
+vco_report_hub_unreachable() {
+    local hooks_dir="${1:-}" proot="${2:-}" key="${3:-}" who="${4:-a VCO hook}" what="${5:-}"
+    VCO_HUB_DOWN_NOTICE=""
+    if [ -n "$hooks_dir" ] && [ -f "$hooks_dir/_lib/session-id.sh" ]; then
+        # shellcheck source=session-id.sh disable=SC1091
+        . "$hooks_dir/_lib/session-id.sh"
+    fi
+    if command -v vco_hook_sanitize_session_id >/dev/null 2>&1; then
+        key="$(vco_hook_sanitize_session_id "$key")"
+    else
+        case "$key" in *[!A-Za-z0-9_-]*) key="default" ;; esac
+    fi
+    local cadence="(Shown once per session.)"
+    if [ -z "$key" ] || [ "$key" = "default" ]; then
+        key="nosession-$(date -u +%Y%m%d%H 2>/dev/null || echo 0)"
+        cadence="(Shown at most once an hour: this caller has no session.)"
+    fi
+
+    local notice
+    notice="[VCO hub unreachable] ${who} needed the vct-hub and could not reach it (stopped, or a stale token after a launcher restart).${what:+ $what}
+Bring it back with:
+  vct-hub --start-if-not-running
+(if vct-hub is not on PATH: python -m vco_lib.hub_ensure ensure, with the VCO venv's python). Hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN).
+${cadence}"
+
+    local sentinel=""
+    if [ -n "$proot" ]; then
+        sentinel="$proot/.claude/state/hub_unreachable_notice_${key}"
+        if mkdir -p "$proot/.claude/state" 2>/dev/null && [ -e "$sentinel" ]; then
+            return 0   # already reported this session
+        fi
+    fi
+
+    printf '%s\n' "$notice" >&2
+    # shellcheck disable=SC2034  # read by the sourcing hook
+    VCO_HUB_DOWN_NOTICE="$notice"
+    if [ -n "$sentinel" ]; then
+        : > "$sentinel" 2>/dev/null || true
+    fi
+    return 0
+}

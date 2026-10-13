@@ -235,6 +235,19 @@ if (-not $ExtrasMatched) {
             [Console]::Error.WriteLine("code-graph: skipped worktree edit (ephemeral/unregistered) $EditedFile")
             exit 0
         }
+        # v0.2.102 W6-ALERTS2 (owner ruling 3): the gate indexed on doubt
+        # because the hub did not answer. Say so (stderr -- this script is run
+        # from the CLI or by a caller, with no hook event to answer), once per
+        # session/hour. MUST MATCH the .sh sibling.
+        if ($script:WorktreeGateHubUnreachable) {
+            $emitLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
+            if (Test-Path -LiteralPath $emitLib) { . $emitLib }
+            if (Get-Command Get-VcoHubUnreachableNotice -ErrorAction SilentlyContinue) {
+                $null = Get-VcoHubUnreachableNotice -HooksDir $PSScriptRoot -ProjectRoot $RepoPath -AgentKey "" `
+                    -Who "code-graph-incremental" `
+                    -What "It indexed $EditedFile anyway (the safe default when it cannot confirm that a worktree is unregistered), so throwaway worktrees may be indexed until the hub is back."
+            }
+        }
     }
 }
 

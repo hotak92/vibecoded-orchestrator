@@ -374,6 +374,32 @@ while IFS= read -r _p; do
     printf '%s\n' "$_p" >> "$BATCH_DIR/$_h.paths"
 done < "$CONSUMED"
 
+# v0.2.102 W6-ALERTS2 (owner ruling 3): a gate probe found the hub unreachable
+# and indexed on doubt (FIX-A' unchanged). Tell the model once per session per
+# agent key so it can bring the hub back. This hook runs async on Stop, so
+# Claude Code hands the additionalContext over on the next turn (vendor hooks
+# doc, "How async hooks execute"). MUST MATCH stop-codegraph-drain.ps1.
+if [ "${VCO_WORKTREE_GATE_HUB_UNREACHABLE:-}" = "1" ]; then
+    # shellcheck source=_lib/emit-context.sh disable=SC1091
+    [ -f "$SCRIPT_DIR/_lib/emit-context.sh" ] && . "$SCRIPT_DIR/_lib/emit-context.sh"
+    # shellcheck source=_lib/session-id.sh disable=SC1091
+    [ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
+    _hub_key="$SESSION_ID"
+    if command -v vco_hook_fast_agent_key >/dev/null 2>&1; then
+        _hub_key="$(vco_hook_fast_agent_key "$HOOK_STDIN")"
+    fi
+    if command -v vco_report_hub_unreachable >/dev/null 2>&1; then
+        vco_report_hub_unreachable "$SCRIPT_DIR" "$PROJECT_ROOT" "$_hub_key" \
+            "The end-of-turn code-graph drain (stop-codegraph-drain)" \
+            "It still indexed this turn's worktree edits (the safe default when it cannot confirm that a worktree is unregistered), so throwaway worktrees may be indexed until the hub is back."
+        if [ -n "$VCO_HUB_DOWN_NOTICE" ] && command -v emit_additional_context >/dev/null 2>&1; then
+            _hub_event="Stop"
+            case "$HOOK_STDIN" in *'"SubagentStop"'*) _hub_event="SubagentStop" ;; esac
+            emit_additional_context "$VCO_HUB_DOWN_NOTICE" "$_hub_event"
+        fi
+    fi
+fi
+
 # Nothing survived the gate → clean up + record the drain ts (so a turn of
 # pure-worktree edits still advances the rate-limit clock) and exit.
 _ANY=0
