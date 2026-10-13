@@ -33,10 +33,10 @@
 
 # Locate the vocabulary next to this helper. ${BASH_SOURCE[0]} is THIS file
 # even when sourced, so the lookup follows the deployed _lib/ directory.
-_CREDSCAN_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-if [ -r "$_CREDSCAN_LIB_DIR/credshapes.sh" ]; then
+_CSCAN_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -r "$_CSCAN_LIB_DIR/credshapes.sh" ]; then
     # shellcheck source=credshapes.sh disable=SC1091
-    . "$_CREDSCAN_LIB_DIR/credshapes.sh"
+    . "$_CSCAN_LIB_DIR/credshapes.sh"
 fi
 
 scan_file_for_credentials() {
@@ -83,7 +83,9 @@ scan_file_for_credentials() {
 
     # One pass per shape, in SSOT declaration order so the reported label
     # sequence is stable.
-    if ! credshapes_for_context content_scan; then
+    # With the path: shapes restricted to another file kind (the unquoted
+    # generic secret serves env/config files only) are dropped.
+    if ! credshapes_for_context content_scan "$file_path"; then
         printf '%s\n' "credential scanner UNAVAILABLE (content_scan context rejected)"
         return 0
     fi
@@ -92,21 +94,23 @@ scan_file_for_credentials() {
     # the marker covers its own line only, and nothing is inferred from how
     # a value looks. Same rule, same marker (credshapes.sh mirror of
     # vco_lib/credential_shapes.TEST_PLACEHOLDER_MARKER) as post-tool-security.
-    local marker="${CREDSHAPES_TEST_PLACEHOLDER_MARKER:-}"
+    local marker="${CSHAPES_TEST_PLACEHOLDER_MARKER:-}"
     if [ -z "$marker" ]; then
         printf '%s\n' "credential scanner UNAVAILABLE (test-placeholder marker missing from _lib/credshapes.sh)"
         return 0
     fi
     local i n
-    for i in "${!CREDSHAPES_PATTERNS[@]}"; do
+    for i in "${!CSHAPES_PATTERNS[@]}"; do
         # Count the matching lines that do NOT carry the marker. `-c` reads
         # all input (a `-q` early exit would SIGPIPE the first grep, which a
         # pipefail caller misreads as "no match"); only a count is printed,
         # never a line.
-        n=$(grep -E -- "${CREDSHAPES_PATTERNS[$i]}" "$file_path" 2>/dev/null \
+        # CRs stripped first: grep keeps a CRLF line's `\r`, which would read
+        # as a value after `KEY=`; the .ps1 sibling and Python split it off.
+        n=$(tr -d '\r' < "$file_path" 2>/dev/null | grep -E -- "${CSHAPES_PATTERNS[$i]}" 2>/dev/null \
             | grep -cvF -- "$marker" 2>/dev/null || true)
         if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
-            alerts+=("${CREDSHAPES_LABELS[$i]}")
+            alerts+=("${CSHAPES_LABELS[$i]}")
         fi
     done
 

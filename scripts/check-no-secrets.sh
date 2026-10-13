@@ -104,8 +104,8 @@ if ! credshapes_for_context repo_scan; then
   echo "check-no-secrets: FATAL — credshapes_for_context rejected 'repo_scan'" >&2
   exit 2
 fi
-TOKEN_SHAPES=("${CREDSHAPES_PATTERNS[@]}")
-if [ -z "${CREDSHAPES_TEST_PLACEHOLDER_MARKER:-}" ]; then
+TOKEN_SHAPES=("${CSHAPES_PATTERNS[@]}")
+if [ -z "${CSHAPES_TEST_PLACEHOLDER_MARKER:-}" ]; then
   # The shape passes need the marker to tell a declared test placeholder
   # from a leak; without it they could only over- or under-report.
   echo "check-no-secrets: FATAL — test-placeholder marker missing from" >&2
@@ -170,7 +170,7 @@ scan_files() {
     if [ "$mode" = "-E" ] && [ -n "$matches" ]; then
       # Credential SHAPES honour the ONE explicit test-placeholder opt-out
       # (owner ruling 2026-10-12, same rule as the hook scanners): a line
-      # carrying CREDSHAPES_TEST_PLACEHOLDER_MARKER is a declared fixture,
+      # carrying CSHAPES_TEST_PLACEHOLDER_MARKER is a declared fixture,
       # so a file is reported only when a matching line WITHOUT the marker
       # remains. The marker covers its own line only; nothing is inferred
       # from how a value looks. The -F passes (the historical leaked-token
@@ -181,7 +181,7 @@ scan_files() {
       while IFS= read -r f; do
         [ -z "$f" ] && continue
         n=$(grep -E -- "$token" "$f" 2>/dev/null \
-            | grep -cvF -- "$CREDSHAPES_TEST_PLACEHOLDER_MARKER" 2>/dev/null || true)
+            | grep -cvF -- "$CSHAPES_TEST_PLACEHOLDER_MARKER" 2>/dev/null || true)
         if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
           kept="${kept}${f}"$'\n'
         fi

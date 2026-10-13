@@ -436,9 +436,7 @@ cat >"$scratch/responses/${fixture_name}" <<JSON
 JSON
 
 # Then the env lookup once we have the id:
-cat >"$scratch/responses/GET_projects_p-resolved-id_env_key=API_KEY.json" <<'JSON'
-{"API_KEY": "sk-canary-abc"}
-JSON
+printf '%s\n' '{"API_KEY": "sk-canary-abc"}' >"$scratch/responses/GET_projects_p-resolved-id_env_key=API_KEY.json"  # vco-secret-scan: test-placeholder
 
 set +e
 out=$(VCT_HUB_PORT="$HUB_PORT" "$RESOLVER" "$test_folder" API_KEY 2>/dev/null)

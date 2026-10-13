@@ -800,10 +800,10 @@ def replace_values_with_sentinel(
     .. code-block:: text
 
        # before
-       export OPENAI_API_KEY="sk-abc123"  # team key
+       export OPENAI_API_KEY="sk-abc123"  # team key  vco-secret-scan: test-placeholder
 
        # after (with sentinel = "__vco_keychain__")
-       export OPENAI_API_KEY=__vco_keychain__  # team key
+       export OPENAI_API_KEY=__vco_keychain__  # team key  vco-secret-scan: test-placeholder
 
     Comments preserved; ``export`` prefix preserved; quotes stripped (the
     sentinel doesn't need quoting and quotes-around-sentinel would just

@@ -112,7 +112,7 @@ mkdir -p "$(dirname "$ALERT_LOG")"
 # vco_lib/credential_shapes.py via _lib/credshapes.sh, `content_scan`
 # context -- the SAME vocabulary _lib/credscan.sh consumes -- and are handed
 # to the scan helper on argv. The test-placeholder marker comes from the
-# same mirror (CREDSHAPES_TEST_PLACEHOLDER_MARKER). Add shapes to the SSOT,
+# same mirror (CSHAPES_TEST_PLACEHOLDER_MARKER). Add shapes to the SSOT,
 # never here.
 ALERTS=()
 FINDINGS_JSON="[]"
@@ -128,9 +128,9 @@ done
 # shellcheck source=_lib/credshapes.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/credshapes.sh" ] && . "$SCRIPT_DIR/_lib/credshapes.sh"
 if ! command -v credshapes_for_context >/dev/null 2>&1 \
-   || ! credshapes_for_context content_scan \
-   || [ "${#CREDSHAPES_PATTERNS[@]}" -eq 0 ] \
-   || [ -z "${CREDSHAPES_TEST_PLACEHOLDER_MARKER:-}" ]; then
+   || ! credshapes_for_context content_scan "$EDITED_FILE" \
+   || [ "${#CSHAPES_PATTERNS[@]}" -eq 0 ] \
+   || [ -z "${CSHAPES_TEST_PLACEHOLDER_MARKER:-}" ]; then
     # A MISSING vocabulary must not look like a clean file. Downstream treats an
     # empty ALERTS array as "nothing found", so degrading silently here would
     # turn a broken install into a permanent all-clear. Raise it as a real
@@ -140,10 +140,10 @@ elif [ -z "$SCAN_HELPER" ]; then
     ALERTS+=("credential scanner UNAVAILABLE (scripts/credscan_introduced.py missing)")
 else
     _PTS_SHAPE_ARGS=()
-    for _PTS_SHAPE_I in "${!CREDSHAPES_PATTERNS[@]}"; do
-        _PTS_SHAPE_ARGS+=("${CREDSHAPES_IDS[$_PTS_SHAPE_I]}"
-                          "${CREDSHAPES_LABELS[$_PTS_SHAPE_I]}"
-                          "${CREDSHAPES_PATTERNS[$_PTS_SHAPE_I]}")
+    for _PTS_SHAPE_I in "${!CSHAPES_PATTERNS[@]}"; do
+        _PTS_SHAPE_ARGS+=("${CSHAPES_IDS[$_PTS_SHAPE_I]}"
+                          "${CSHAPES_LABELS[$_PTS_SHAPE_I]}"
+                          "${CSHAPES_PATTERNS[$_PTS_SHAPE_I]}")
     done
     _PTS_COUNT=""
     _PTS_IDX=0
@@ -158,7 +158,7 @@ else
         _PTS_IDX=$((_PTS_IDX + 1))
     done < <(printf '%s' "$HOOK_STDIN" | "$PY" "$SCAN_HELPER" \
                 --root "$PROJECT_ROOT" \
-                --marker "$CREDSHAPES_TEST_PLACEHOLDER_MARKER" \
+                --marker "$CSHAPES_TEST_PLACEHOLDER_MARKER" \
                 --format nul -- "${_PTS_SHAPE_ARGS[@]}" 2>/dev/null)
     case "$_PTS_COUNT" in
         '') ALERTS+=("credential scanner UNAVAILABLE (scripts/credscan_introduced.py failed)") ;;
@@ -234,7 +234,7 @@ sys.stdout.write(json.dumps({
 Review the lines named above before continuing: the credential pattern is in
 text this edit introduced (or on a line it changed) in ${REL_FILE}. If it is
 a deliberate test placeholder, mark its line with the comment
-\`${CREDSHAPES_TEST_PLACEHOLDER_MARKER:-}\`; if it leaked from real input, redact
+\`${CSHAPES_TEST_PLACEHOLDER_MARKER:-}\`; if it leaked from real input, redact
 it before any further git operations or external sharing."
     if command -v emit_additional_context >/dev/null 2>&1; then
         emit_additional_context "$REMINDER" PostToolUse

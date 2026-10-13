@@ -157,8 +157,13 @@ def test_post_tool_security_includes_agent_id_on_alert(tmp_path, monkeypatch):
     # v0.2.102 W6-N (owner ruling 2026-10-12): the ledger names the
     # PROJECT-RELATIVE path and the line of each finding, never the value.
     assert alert["file"] == "leaked.py"
-    assert alert["findings"] == [{"line": 2, "id": "leak_probe",
-                                  "label": "Hook leak-test marker"}]
+    # W6-V: `API_KEY = '<literal>'` is ALSO a generic secret now (a quoted  # vco-secret-scan: test-placeholder
+    # literal of any length under a secret-shaped key), reported first in
+    # SSOT declaration order.
+    assert alert["findings"] == [
+        {"line": 2, "id": "generic_secret_quoted", "label": "Generic secret"},
+        {"line": 2, "id": "leak_probe", "label": "Hook leak-test marker"},
+    ]
     assert "Hook leak-test marker" in alert["patterns"]
 
 

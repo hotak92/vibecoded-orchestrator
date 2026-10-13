@@ -1043,7 +1043,7 @@ def test_a_secret_shaped_key_is_never_folded(tmp_path: Path) -> None:
         "OPENAI_API_KEY=sk-canary-not-real-9a1b\n"
     )
     env_path.write_text(original)
-    apply_env_template({"OPENAI_API_KEY": "x"}, project_folder=tmp_path)
+    apply_env_template({"OPENAI_API_KEY": "x"}, project_folder=tmp_path)  # vco-secret-scan: test-placeholder
     text = env_path.read_text()
     assert text.startswith(original)
     assert "OPENAI_API_KEY_old" not in text

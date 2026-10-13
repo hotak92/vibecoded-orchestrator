@@ -49,7 +49,10 @@ function Scan-FileForCredentials {
     }
 
     try {
-        $info = Get-Item -LiteralPath $FilePath -ErrorAction Stop
+        # -Force: without it Get-Item throws on a hidden item (every dotfile
+        # on Linux/macOS, e.g. .env), and the catch below would skip the
+        # scan silently.
+        $info = Get-Item -LiteralPath $FilePath -Force -ErrorAction Stop
         # Skip >5 MB files (mirrors .sh sibling).
         if ($info.Length -gt 5MB) { return }
     } catch {
@@ -60,7 +63,7 @@ function Scan-FileForCredentials {
     # Skip files that fail to read as text (likely binaries).
     $content = $null
     try {
-        $content = Get-Content -LiteralPath $FilePath -Raw -ErrorAction Stop
+        $content = Get-Content -LiteralPath $FilePath -Raw -Force -ErrorAction Stop
     } catch {
         return
     }
@@ -90,9 +93,16 @@ function Scan-FileForCredentials {
     }
     $marker = Get-CredShapesTestPlaceholderMarker
     $lines = $content -split "`r?`n"
-    foreach ($shape in (Get-CredShapes -Context 'content_scan')) {
+    # -Path: shapes restricted to another file kind (the unquoted generic
+    # secret serves env/config files only) are dropped, as in the .sh sibling.
+    foreach ($shape in (Get-CredShapes -Context 'content_scan' -Path $FilePath)) {
         foreach ($ln in $lines) {
-            if (($ln -match $shape.Re) -and (-not $ln.Contains($marker))) {
+            # -cmatch, not -match: .NET -match is case-INSENSITIVE, while the
+            # .sh sibling (grep -E) and post-tool-security (Python re) match
+            # case-sensitively. The vocabulary spells out case where it wants
+            # it ([Pp][Aa]... in the generic-secret keys); -match would make
+            # e.g. a lowercased AKIA run alert on Windows only.
+            if (($ln -cmatch $shape.Re) -and (-not $ln.Contains($marker))) {
                 $alerts.Add($shape.Label) | Out-Null
                 break
             }

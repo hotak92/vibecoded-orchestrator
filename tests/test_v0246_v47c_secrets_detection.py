@@ -148,10 +148,10 @@ class TestAuditEnvSecrets:
 
     def test_strips_inline_quotes(self, tmp_path: Path) -> None:
         env_path = tmp_path / ".env"
-        env_path.write_text(textwrap.dedent('''\
-            GITHUB_TOKEN="ghp_quoted"
-            OPENAI_API_KEY='sk-singlequoted'
-        '''))
+        env_path.write_text(
+            'GITHUB_TOKEN="ghp_quoted"\n'
+            "OPENAI_API_KEY='sk-singlequoted'\n"  # vco-secret-scan: test-placeholder
+        )
         result = {s.key: s.value for s in secrets_audit.audit_env_secrets(env_path)}
         assert result["GITHUB_TOKEN"] == "ghp_quoted"
         assert result["OPENAI_API_KEY"] == "sk-singlequoted"

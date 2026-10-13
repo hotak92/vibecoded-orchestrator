@@ -1453,7 +1453,7 @@ class DiscoveryTests(unittest.TestCase):
         with _EnvIsolation():
             choices = EmbeddingService.discover_text_models(
                 ollama_url="http://localhost:11435",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
         # We should see openai choices available
@@ -1524,7 +1524,7 @@ class DiscoveryTests(unittest.TestCase):
             choices = EmbeddingService.discover_code_models(
                 ollama_url="http://localhost:11435",
                 code_embed_url="http://localhost:11440",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
         backends_with_avail = {c.backend for c in choices if c.available_now}
@@ -1609,7 +1609,7 @@ class DiscoverEmitsPrefixedOpenAIIdTests(unittest.TestCase):
         with _EnvIsolation():
             choices = EmbeddingService.discover_text_models(
                 ollama_url="http://localhost:11435",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
         openai_choices = [c for c in choices if c.backend == "openai"]
@@ -1656,7 +1656,7 @@ class DiscoverEmitsPrefixedOpenAIIdTests(unittest.TestCase):
             choices = EmbeddingService.discover_code_models(
                 ollama_url="http://localhost:11435",
                 code_embed_url="http://localhost:11440",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
         openai_choices = [c for c in choices if c.backend == "openai"]
@@ -1695,7 +1695,7 @@ class DiscoverEmitsPrefixedOpenAIIdTests(unittest.TestCase):
         with _EnvIsolation():
             EmbeddingService.discover_text_models(
                 ollama_url="http://localhost:11435",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
         # FakeSession records every GET it answered as (method, url, kwargs).
@@ -1751,7 +1751,7 @@ class OpenAIHttpBoundaryStripsPrefixTests(unittest.TestCase):
             code_embed_url="http://localhost:11440",
             text_model_id=text_model_id,
             code_model_id=code_model_id,
-            openai_api_key="sk-test",
+            openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
             session=session,
         )
         return svc, session
@@ -1850,7 +1850,7 @@ class OpenAIHttpBoundaryStripsPrefixTests(unittest.TestCase):
                 code_embed_url="http://localhost:11440",
                 text_model_id="qwen3-embedding:0.6b",
                 code_model_id="codesage-large-v2",
-                openai_api_key="sk-test",
+                openai_api_key="sk-test",  # vco-secret-scan: test-placeholder
                 session=session,
             )
             try:
