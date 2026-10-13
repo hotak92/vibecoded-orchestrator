@@ -35,7 +35,7 @@ ONE deliberate exception (v0.2.75 NEW-2): ``--prune`` runs a single
 ``rl_events`` retention pass NOW, bypassing the hourly throttle. It exists as
 the explicit trigger for opted-out users (whose search path only drives the
 throttled opportunistic prune) and for operators who just tightened
-``RL_EVENTS_RETENTION_MAX_AGE_DAYS``. Deletion bounds and the 6-h
+``RL_EVENTS_RETENTION_MAX_AGE_DAYS``. Deletion bounds and the
 in-flight-citation floor are identical to the automatic path
 (``rl_retention.maybe_run_retention`` — one home).
 
@@ -511,7 +511,7 @@ def main(argv: Optional[list] = None) -> int:
 
 def _run_prune_now() -> Dict[str, Any]:
     """NEW-2 (v0.2.75): one forced retention pass. Same single home as the
-    automatic drivers (``rl_retention.maybe_run_retention``) — the 6-h
+    automatic drivers (``rl_retention.maybe_run_retention``) — the
     in-flight-citation floor and the no-bounds no-op guard apply identically.
     Soft-fails to a status dict; never raises."""
     try:

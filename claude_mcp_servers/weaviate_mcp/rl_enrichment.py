@@ -558,19 +558,26 @@ def _rl_release_own_pending_file(
     task_id: str, claimed: "Path | None", pending_path: "Path | None", landed: bool,
 ) -> None:
     """Leave path of a claim taken by :func:`_rl_claim_own_pending_file`: a
-    landed write consumes the file; EVERY other outcome (no result, an
-    error, a cancellation) renames it back so the Stop-hook drain scores it.
-    No-op without a claim. Never raises."""
+    landed write consumes the file through the one finish rule every scorer
+    shares (``citation_pending.finish_scored``, which also consumes a
+    re-stage of the task that landed during the compute — review R7-1);
+    EVERY other outcome (no result, an error, a cancellation) renames it
+    back so the Stop-hook drain scores it. No-op without a claim. Never
+    raises."""
     if claimed is None:
         return
     try:
         from claude_mcp_servers.rl_client.citation_pending import (
             delete_pending,
+            finish_scored,
             release_claim,
         )
 
         if landed:
-            delete_pending(claimed)
+            if pending_path is not None:
+                finish_scored(claimed, pending_path)
+            else:
+                delete_pending(claimed)
         elif pending_path is not None:
             release_claim(claimed, pending_path)
     except Exception as exc:  # noqa: BLE001 — a stuck claim is re-adopted by the next drain
@@ -675,7 +682,10 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
         less than the threshold) and deletes the sentinel so subsequent
         compactions re-arm.
       - Hard timeout ``_RL_MONITOR_TIMEOUT`` seconds (60 min safety valve,
-        raised from 10 min pre-V52-N).
+        raised from 10 min pre-V52-N). This is the MONITOR's own lifetime,
+        not a scoring deadline (v0.2.102 W6-RL2): a monitor that gives up
+        has taken no claim, so the staged pending file stays for the
+        Stop / SessionEnd drains, which score it when its chat ends.
 
     v0.2.70 (F-B): two lifecycle fixes:
       1. ``ctx`` is captured into THIS task's closure (``held_ctx``) on the
@@ -1914,7 +1924,7 @@ def _stage_code_citation_pending(
 
     No-op (returns None) when no node carries ``n_emb`` — a ctx without
     vectors can never produce a citation, so staging it would only feed the
-    TTL sweep. Soft-fail throughout; returns the staged path or None.
+    unscored ledger. Soft-fail throughout; returns the staged path or None.
     """
     if not any(isinstance(n, dict) and n.get("n_emb") for n in nodes):
         return None

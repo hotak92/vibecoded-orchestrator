@@ -20,6 +20,14 @@
 # instead of draining; --agent-finished for a foreground agent (it has
 # finished: stamped with its transcript), tag-only for a background launch.
 # MUST MATCH the .sh sibling.
+#
+# v0.2.102 W6-RL2 (owner ruling R7-4): ALSO registered on SessionEnd. No
+# scoring deadline: a main-chat citation below the gate waits for its chat to
+# END. On SessionEnd the drain runs with --session-end (records the end first,
+# then scores the session's files with the final floors; nothing unscored is
+# deleted).
+# This hook only parses stdin and spawns the DETACHED drain, so the short
+# SessionEnd budget never cuts the drain off. MUST MATCH the .sh sibling.
 
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -80,6 +88,8 @@ if ($AgentId) {
     if (-not $AgentTranscript) { exit 0 }
     $TranscriptPath = $AgentTranscript
 }
+# SessionEnd (W6-RL2): the main chat has ended -> final floors.
+$SessionEnd = ($HookEvent -eq "SessionEnd") -and (-not $AgentId)
 
 # Resolve the project venv python (the drain imports claude_mcp_servers.*).
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
@@ -110,6 +120,7 @@ if (-not $VenvPy -or -not (Test-Path $VenvPy)) { exit 0 }
 # "soft-fail (...)" line on any exception, which lands in the log.
 $DrainLog = Join-Path $ProjectRoot ".claude/logs/rl_drain_citations.log"
 if ($AgentId) { $DrainLog = Join-Path $ProjectRoot ".claude/logs/rl_drain_citations.agent.log" }
+if ($SessionEnd) { $DrainLog = Join-Path $ProjectRoot ".claude/logs/rl_drain_citations.end.log" }
 try { New-Item -ItemType Directory -Force -Path (Split-Path $DrainLog) -ErrorAction SilentlyContinue | Out-Null } catch { }
 # --agent-id only when set: Start-Process drops an empty element, which would
 # leave the flag without its value.
@@ -120,6 +131,8 @@ if ($Adopt) {
     if ($AgentFinished) { $DrainArgs += @("--agent-finished") }
 } elseif ($AgentId) {
     $DrainArgs += @("--agent-id", $AgentId)
+} elseif ($SessionEnd) {
+    $DrainArgs += @("--session-end")
 }
 try {
     $env:CLAUDE_PROJECT_DIR = $ProjectRoot

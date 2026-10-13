@@ -29,6 +29,15 @@
 # (--agent-finished: stamped with its transcript); a background launch is
 # tagged only, for its own SubagentStop drain.
 #
+# v0.2.102 W6-RL2 (owner ruling R7-4): ALSO registered on SessionEnd. There
+# is no scoring deadline: a main-chat citation below the token gate waits
+# for its own chat to END, and SessionEnd is that end. The drain runs with
+# --session-end: it first records the end (so a drain that cannot finish
+# leaves it for the next session's drain, never deleting an unscored file), then
+# scores the session's files with the final floors. SessionEnd hooks get a
+# short harness budget; this hook only parses stdin and spawns the DETACHED
+# drain (setsid below), so the drain itself outlives the session's exit.
+#
 # Constraints:
 #   - Stop hooks' plain stdout is discarded by the harness; this hook only
 #     writes telemetry.
@@ -101,6 +110,9 @@ if [ -n "$AGENT_ID" ]; then
     [ -n "$AGENT_TRANSCRIPT" ] || exit 0
     TRANSCRIPT_PATH="$AGENT_TRANSCRIPT"
 fi
+# SessionEnd (W6-RL2): the main chat has ended -> final floors.
+END_ARGS=""
+[ "$HOOK_EVENT" = "SessionEnd" ] && [ -z "$AGENT_ID" ] && END_ARGS=" --session-end"
 
 # Resolve the project venv python (the drain imports claude_mcp_servers.*).
 # v0.2.70 FIX-2 (sibling-divergence): require the RESOLVED VCO venv on BOTH
@@ -158,6 +170,9 @@ DRAIN_LOG="$PROJECT_ROOT/.claude/logs/rl_drain_citations.log"
 # A SubagentStop drain logs beside the Stop drain's (own bounded file, so a
 # lane finishing during a Stop drain cannot truncate its log mid-run).
 [ -n "$AGENT_ID" ] && DRAIN_LOG="$PROJECT_ROOT/.claude/logs/rl_drain_citations.agent.log"
+# The SessionEnd drain likewise (it may still run when the next session's
+# first Stop drain starts).
+[ -n "$END_ARGS" ] && DRAIN_LOG="$PROJECT_ROOT/.claude/logs/rl_drain_citations.end.log"
 mkdir -p "$PROJECT_ROOT/.claude/logs" 2>/dev/null || true
 # Build the detached command. Args are embedded via a single-quoted snippet run
 # through `sh -c`; SESSION_ID / TRANSCRIPT_PATH are shell-quoted so a path with
@@ -169,7 +184,7 @@ if [ -n "$ADOPT_ARGS" ]; then
     [ "$AGENT_FINISHED" = "1" ] && _FIN=" --agent-finished"
     _DRAIN_SNIP="CLAUDE_PROJECT_DIR=$(_shq "$PROJECT_ROOT") $(_shq "$VENV") $(_shq "$DRAIN") --session-id $(_shq "$SESSION_ID") --transcript-path $(_shq "$TRANSCRIPT_PATH") --agent-id $(_shq "$RESP_AGENT") --adopt-brief-tool-use-id $(_shq "$TOOL_USE_ID")$_FIN > $(_shq "$DRAIN_LOG") 2>&1"
 else
-    _DRAIN_SNIP="CLAUDE_PROJECT_DIR=$(_shq "$PROJECT_ROOT") $(_shq "$VENV") $(_shq "$DRAIN") --session-id $(_shq "$SESSION_ID") --transcript-path $(_shq "$TRANSCRIPT_PATH") --agent-id $(_shq "$AGENT_ID") > $(_shq "$DRAIN_LOG") 2>&1"
+    _DRAIN_SNIP="CLAUDE_PROJECT_DIR=$(_shq "$PROJECT_ROOT") $(_shq "$VENV") $(_shq "$DRAIN") --session-id $(_shq "$SESSION_ID") --transcript-path $(_shq "$TRANSCRIPT_PATH") --agent-id $(_shq "$AGENT_ID")$END_ARGS > $(_shq "$DRAIN_LOG") 2>&1"
 fi
 if command -v setsid >/dev/null 2>&1; then
     setsid sh -c "$_DRAIN_SNIP" >/dev/null 2>&1 < /dev/null &

@@ -414,7 +414,7 @@ The `rl_events` table in `launcher.db` is written on every ranked retrieval rega
 
 | Var | Default | What it does |
 |---|---|---|
-| `RL_EVENTS_RETENTION_MAX_AGE_DAYS` | `90` | Delete events older than N days. `0`/negative disables the age bound. Read fresh on every pass. |
+| `RL_EVENTS_RETENTION_MAX_AGE_DAYS` | `90` | Delete events older than N days. `0`/negative disables the age bound. Read fresh on every pass. Never closer than `RL_CITATION_ABANDONED_DAYS` + 1 day (8 days by default): a retrieval that recent may still have a pending citation (see RL citation scoring below). |
 | `RL_EVENTS_RETENTION_MAX_ROWS` | `0` (disabled) | Keep at most N most-recent rows; age is the primary bound. |
 | `RL_EVENTS_RETENTION_DISABLED` | unset | Truthy → never prune (offline-training operators who want the full corpus). |
 | `RL_EVENTS_RETENTION_MIN_INTERVAL_S` | `3600` | Minimum seconds between prune passes **for one process**. Throttle only; a fresh process always allows the first pass. |
@@ -432,6 +432,19 @@ The weaviate-kg MCP process lives as long as your Claude Code session, so its RL
 | `VCO_RL_TRANSCRIPT_CACHE_MAX_BYTES` | `268435456` (256 MiB) | Estimated memory the answer monitor's parsed-transcript cache may hold. Least-recently-used transcripts are evicted first. The transcript just read is always kept, because re-parsing it on every poll would cost the same memory plus the CPU. |
 | `VCO_RL_NODE_CACHE_MAX_BYTES` | `67108864` (64 MiB) | Estimated memory of the per-search citation cache. Oldest entries are evicted first, and a running monitor keeps its own copy. |
 | `VCO_RL_MONITOR_MAX_CONCURRENT` | `64` | How many answer monitors may run at once. When the cap is reached, no running monitor is cancelled: the new search starts no monitor, and its citation is computed from its pending file at the next Stop. |
+
+### RL citation scoring (v0.2.102)
+
+A retrieval's citation label is scored from the answer that followed it, by the turn-end drain (`stop-drain-citations` on Stop, SubagentStop and SessionEnd) or the MCP answer monitor. Each citation is scored against the transcript of the chat that produced it, never another chat's, and there is no scoring deadline: a subagent's citations are scored when it stops, however long it runs; the main chat's at the full token gate on any Stop, and with the lower floors below only once the chat has ended (its SessionEnd drain, or a later drain finalizing a session whose end was recorded). A citation removed without a score is recorded in `.claude/logs/rl-citations-unscored.jsonl`. All four knobs are read through `vco_lib/env_values`; an unset, blank or unparseable value keeps the default.
+
+| Var | Default | What it does |
+|---|---|---|
+| `RL_MIN_ANSWER_TOKENS_FOR_CITATION` | `25000` | The full gate: an answer window at least this long is scored on any drain, also while the chat is still running. Shared with the MCP monitor. |
+| `RL_TERMINAL_CITATION_MIN_TOKENS` | `2000` | Once the chat has ended, a shorter window that clears this floor is scored (`fire_reason=terminal_floor`). |
+| `RL_SOFT_CITATION_MIN_TOKENS` | `200` | Once the chat has ended, a window below the terminal floor but above this one is scored as a soft label (`fire_reason=soft_terminal`, `soft_label: true`) the trainer can down-weight. |
+| `RL_CITATION_ABANDONED_DAYS` | `7` | The only time bound: a pending citation whose chat's transcript has not been written for this many days, and which no drain or monitor holds, is garbage-collected — scored first when its transcript is readable, otherwise logged as unscored. Positive values only. |
+
+`RL_TERMINAL_CITATION_AGE_SECONDS` is no longer read (v0.2.102): it applied the lower floors to a file 30 minutes old even while its chat was still running, and the chat-end events replaced it.
 
 ## Container runtime
 

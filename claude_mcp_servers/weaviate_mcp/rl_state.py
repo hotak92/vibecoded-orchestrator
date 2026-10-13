@@ -160,7 +160,9 @@ _RL_TOOL_CONTENT_LIMIT: int = 20_000         # per tool_use input, chars
 # writes ``.claude/state/rl_monitors_force_flush.flag``; the timeout is
 # now a pure safety valve for sessions that get neither (very short
 # answers, never compacted, never closed). 60 min absorbs slow agents
-# without leaking monitor tasks indefinitely.
+# without leaking monitor tasks indefinitely. v0.2.102 W6-RL2: it bounds the
+# monitor TASK only, never the citation — a monitor that times out leaves the
+# staged pending file to the Stop / SessionEnd drains (no scoring deadline).
 _RL_MONITOR_TIMEOUT: float = 3600.0           # 60 min hard ceiling (V52-N safety valve)
 # V52-N: PreCompact hook drops this sentinel; the monitor picks it up on
 # the next poll and fires with whatever's accumulated so far. After

@@ -1,5 +1,5 @@
 # Copyright (C) 2026 VibeCoded Tools — AGPL-3.0-or-later
-"""Deferred citation pending-queue — stage / read / accumulate / delete + TTL.
+"""Deferred citation pending-queue — stage / read / accumulate / delete / collect.
 
 F-QUEUE (v0.2.70, maintainer ruled NO DEFER): hook-path citations are recovered
 by persisting the staged retrieval ctx to disk at retrieval time, then a Stop
@@ -19,12 +19,23 @@ Pending file path::
 ACCUMULATOR. At turn-end, if the cumulative answer window is still < the token
 threshold the drain LEAVES the file for the next Stop (``delete_pending`` is NOT
 called) so it keeps accumulating into subsequent turns. Compute+write+delete
-happen only at a genuine threshold or a true terminal (session-end / compaction
-force-flush) or TTL expiry.
+happen only at a genuine threshold or when the OWNING chat has really ended.
+
+v0.2.102 W6-RL2 (owner rulings R7-3 / R7-4): there is NO scoring deadline. A
+pending citation waits for its own chat's end events — the main chat's Stop
+drains and its SessionEnd drain, a subagent's SubagentStop drain — however
+long that chat runs; the final-window floors apply only once that chat has
+ended (SubagentStop fired, SessionEnd fired and was recorded with
+:func:`mark_session_ended`). It is scored only against the transcript of the
+chat that produced it. The one remaining time bound is a garbage collector
+for PROVABLY abandoned files (:func:`collect_abandoned`: its transcript idle
+for :func:`abandoned_after_seconds`, default 7 days, and no live owner),
+which scores a file before removing it, or records it as unscored.
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import logging
@@ -41,31 +52,49 @@ __all__ = [
     "read_pending",
     "list_pending_for_session",
     "delete_pending",
-    "sweep_expired",
+    "collect_abandoned",
+    "abandoned_after_seconds",
     "claim_pending",
     "claim_task_pending",
     "release_claim",
+    "finish_scored",
     "readopt_stale_claims",
     "adopt_brief_citations",
     "agent_transcript_for",
     "session_transcript_for",
-    "PENDING_TTL_SECONDS",
+    "mark_session_ended",
+    "clear_session_ended",
+    "ended_sessions",
+    "session_ended_marker",
+    "session_has_pending",
+    "NO_SESSION_PREFIX",
+    "record_unscored",
+    "ABANDONED_AFTER_ENV",
+    "ABANDONED_AFTER_DAYS_DEFAULT",
     "UNSCORED_LOG_REL",
     "CLAIM_MARK",
     "CTX_PENDING_PATH_KEY",
     "AGENT_WINDOW_FINAL_KEY",
 ]
 
-# Abandoned-session TTL: a pending file with no turn-end (session killed) is
-# garbage after this. Mirrors _RL_MONITOR_TIMEOUT (60 min). v0.2.102
-# W6-R6FIX (review R6-2): at the TTL the sweep SCORES the file through the
-# drain's one scoring path when its transcript is readable, and only then
-# removes it (:func:`sweep_expired`).
-PENDING_TTL_SECONDS: float = 3600.0
+# v0.2.102 W6-RL2 (owner ruling, R7-4): the ONLY time bound left on a pending
+# file — a garbage collector, never a scoring deadline. A file is collected
+# only when its chat's transcript has not been written for this long AND it
+# has no live owner (:func:`collect_abandoned`). Agents have run for hours, so
+# the bound is long; it is read through the one env reader
+# (``vco_lib.env_values``). Replaces the 60-minute ``PENDING_TTL_SECONDS``.
+ABANDONED_AFTER_ENV = "RL_CITATION_ABANDONED_DAYS"
+ABANDONED_AFTER_DAYS_DEFAULT: float = 7.0
 
-# Where an expired citation that could NOT be scored is recorded (relative to
-# the project), one JSON row per file, so the loss is counted, not silent.
+# Where a citation removed WITHOUT a score is recorded (relative to the
+# project), one JSON row per file, so the loss is counted, not silent.
 UNSCORED_LOG_REL = Path(".claude") / "logs" / "rl-citations-unscored.jsonl"
+
+# v0.2.102 W6-RL2: ``<session>`` + this suffix, beside the pending files,
+# records that the session's SessionEnd drain ran: the chat has really ended,
+# so any drain may finalize its leftover files (final floors). Not a
+# ``*.json`` name, so no pending-file glob ever sees it.
+SESSION_ENDED_SUFFIX = ".session_ended"
 
 # v0.2.102 W6-C2 fix round (review R4c-1): a drain CLAIMS a pending file
 # before it computes it, by renaming ``<name>.json`` to
@@ -88,8 +117,14 @@ CTX_PENDING_PATH_KEY = "pending_path"
 # when its pid is alive but provably REUSED (the process holding it started
 # after the claim; review R5-4, :func:`vco_lib.atomic.claim_owner_gone`). A
 # live holder that is merely slow keeps its claim: taking it over would let
-# two drains score one citation.
-CLAIM_STALE_SECONDS: float = PENDING_TTL_SECONDS
+# two drains score one citation. (Its own value: until W6-RL2 it was an alias
+# of the retired 60-minute pending TTL, and it keeps that hour.)
+CLAIM_STALE_SECONDS: float = 3600.0
+
+# R7-1: how many passes :func:`finish_scored` makes at most while re-stages
+# or standing-down claims keep appearing. Each pass needs a NEW file to
+# appear, so the bound is a guard against a pathological loop, not a timer.
+_FINISH_MAX_PASSES = 64
 
 # v0.2.102 W6-R5FIX (review R5-9): a brief citation stamped with a subagent
 # transcript while that agent may still be running carries this key set to
@@ -97,6 +132,11 @@ CLAIM_STALE_SECONDS: float = PENDING_TTL_SECONDS
 # rather than the final-window floors. Absent (or true) = the stamped
 # transcript is a finished agent's final answer.
 AGENT_WINDOW_FINAL_KEY = "agent_window_final"
+
+# The file-name prefix of a retrieval staged without a session id (the MCP
+# path: the server is not told which chat calls it). Such a file belongs to
+# the chat whose transcript holds its query (the drain's attribution rule).
+NO_SESSION_PREFIX = "nosession"
 
 # Filesystem-safe key sanitiser. session_id / task_id come from Claude Code +
 # our own uuid hex, but a defensive scrub keeps a stray path separator from
@@ -111,8 +151,8 @@ def _resolve_project_root() -> Optional[Path]:
     (:func:`vco_lib.project_root.resolve_project_root`). Before v0.2.102 this
     fell back to the BARE cwd, so ``kg-search`` run from a subfolder (no
     ``CLAUDE_PROJECT_DIR`` in a plain shell) staged
-    ``<subfolder>/.claude/state/rl_pending/*.json`` that no drain or TTL
-    sweep ever visits. ``None`` when no project encloses the cwd.
+    ``<subfolder>/.claude/state/rl_pending/*.json`` that no drain ever
+    visits. ``None`` when no project encloses the cwd.
     """
     from vco_lib.project_root import resolve_project_root  # noqa: PLC0415
 
@@ -159,7 +199,7 @@ def _pending_path(
     d = pending_dir(root)
     if d is None:
         return None
-    fname = f"{_safe(session_id) or 'nosession'}__{_safe(task_id)}.json"
+    fname = f"{_safe(session_id) or NO_SESSION_PREFIX}__{_safe(task_id)}.json"
     return d / fname
 
 
@@ -181,7 +221,8 @@ def stage_pending(
     Adds the queue-routing fields the drain needs: ``session_id``, ``task_id``,
     ``seq`` (1-based KG-call counter, or None for the hook path which has no
     process-global seq), ``query`` snippet (for transcript matching),
-    ``ts_ms`` (TTL), ``source`` ("hook" | "mcp") and ``agent_id``.
+    ``ts_ms`` (stage time: the timestamp anchor, and the collector's age
+    when no transcript is found), ``source`` ("hook" | "mcp") and ``agent_id``.
 
     ``agent_id`` (v0.2.102 W6-C2, census F12): the subagent whose tool call
     staged this retrieval — ``""`` for the main chat. A subagent's hook
@@ -282,96 +323,165 @@ def delete_pending(path: "str | Path") -> None:
         logger.debug("delete_pending: unlink failed (%s)", exc)
 
 
-def sweep_expired(
+def abandoned_after_seconds() -> float:
+    """The garbage-collection bound, in seconds: ``RL_CITATION_ABANDONED_DAYS``
+    (default 7 days; a non-positive or unparseable value keeps the default),
+    read through the one env reader."""
+    from vco_lib.env_values import env_float  # noqa: PLC0415
+
+    return env_float(ABANDONED_AFTER_ENV, ABANDONED_AFTER_DAYS_DEFAULT, above=0.0) * 86400.0
+
+
+def collect_abandoned(
     project_root: "str | Path | None" = None,
-    ttl_seconds: float = PENDING_TTL_SECONDS,
     *,
-    now_ms: Optional[int] = None,
-    score_fn: "Optional[Callable[[Path, dict], Optional[str]]]" = None,
+    idle_after_s: Optional[float] = None,
+    now: Optional[float] = None,
+    live_session: str = "",
+    source_fn: "Optional[Callable[[dict], str]]" = None,
+    score_fn: "Optional[Callable[[Path, dict, str], Optional[str]]]" = None,
     counts: Optional[dict] = None,
 ) -> int:
-    """Remove pending files whose ``ts_ms`` is older than ``ttl_seconds``,
-    scoring each one first. Returns the count removed; ``now_ms`` is
-    injectable for tests.
+    """Garbage-collect PROVABLY abandoned pending files; returns the count
+    removed. Not a scoring deadline (v0.2.102 W6-RL2, owner ruling R7-4).
 
-    v0.2.102 W6-R6FIX (review R6-2): an expiring file is a retrieval whose
-    answer window no Stop drain scored (a background brief whose parent got
-    no further Stop, a main-chat session that ended). It is not dropped
-    blind any more:
+    A file is abandoned only when BOTH hold:
 
-    1. CLAIMED through :func:`claim_pending` — the one claim the Stop drains
-       and the MCP answer monitor take — so a file a live drain or the
-       monitor holds is never touched here, and a file this sweep holds is
-       never scored by them. Two sweeps cannot both take it either.
-    2. ``score_fn(claimed, payload)`` — the drain's scorer, which reads the
-       file's transcript and computes through the drain's ONE scoring
-       function under the soft/terminal floors — returns ``None`` when a
-       citation was written, else a short reason.
-    3. Removed. A file with no score (no ``score_fn``, unreadable payload,
-       no readable transcript, below every floor, compute failure) is
-       recorded in :data:`UNSCORED_LOG_REL` and logged as an unscored
-       expiry, so the loss is counted.
+    * its chat's transcript (``source_fn(payload)``: the recorded agent
+      transcript, or its session's transcript in the same folder) has not
+      been written for ``idle_after_s`` (default
+      :func:`abandoned_after_seconds`, 7 days). With no locatable transcript
+      the file's own stage time stands in;
+    * it has no live owner: it is not claimed (a claim is invisible to the
+      ``*.json`` listing), and it does not belong to ``live_session`` (the
+      session whose drain is running, alive by definition).
 
-    ``counts`` (optional) receives ``scored`` / ``unscored``. A file
-    re-staged between the listing and the claim (fresh ``ts_ms``) is
-    handed back untouched."""
+    Each abandoned file is CLAIMED (:func:`claim_pending`, the one claim all
+    scorers take), re-checked on the claimed payload (a re-stage or a fresh
+    transcript write hands it back untouched), then scored with
+    ``score_fn(claimed, payload, transcript)`` — the drain's one scoring path
+    under the final floors, since nothing will be added to a transcript idle
+    that long — which returns ``None`` when a citation was written, else a
+    reason. Scored files finish through :func:`finish_scored`; an unscored
+    one (no transcript, below every floor, compute failure, no scorer) is
+    removed and recorded in :data:`UNSCORED_LOG_REL`. ``counts`` receives
+    ``scored`` / ``unscored``. ``now`` is injectable for tests."""
     d = pending_dir(project_root)
-    if d is None or not d.exists():
-        return 0
-    now = now_ms if now_ms is not None else int(time.time() * 1000)
-    cutoff = now - int(ttl_seconds * 1000)
     tally = counts if counts is not None else {}
     tally.setdefault("scored", 0)
     tally.setdefault("unscored", 0)
-    deleted = 0
+    if d is None or not d.exists():
+        return 0
+    idle = abandoned_after_seconds() if idle_after_s is None else float(idle_after_s)
+    now_s = time.time() if now is None else float(now)
+    live = _safe(live_session)
+    removed = 0
     try:
-        candidates = list(d.glob("*.json"))
+        candidates = sorted(d.glob("*.json"))
     except OSError:
         return 0
     for p in candidates:
-        if not _expired(p, read_pending(p), cutoff):
+        if live and p.name.startswith(f"{live}__"):
+            continue  # the running session's own file: it has a live owner
+        before = read_pending(p)
+        stage_mtime = _safe_mtime(p)
+        transcript = _source_for(source_fn, before)
+        if not _abandoned(p, before, transcript, now_s, idle):
             continue
         claimed = claim_pending(p)
         if claimed is None:
-            continue  # a drain / the monitor / another sweep owns it now
+            continue  # a drain / the monitor holds it now: it has an owner
         payload = read_pending(claimed)
-        if not _expired(claimed, payload, cutoff):
-            release_claim(claimed, p)  # re-staged meanwhile: not ours to end
+        transcript = _source_for(source_fn, payload)
+        restaged = (isinstance(before, dict) and isinstance(payload, dict)
+                    and before.get("ts_ms") != payload.get("ts_ms"))
+        if restaged or not _abandoned(claimed, payload, transcript, now_s, idle,
+                                      stage_mtime=stage_mtime):
+            release_claim(claimed, p)  # re-staged, or its chat wrote meanwhile
             continue
         if not isinstance(payload, dict):
             reason: Optional[str] = "unreadable_payload"
         elif score_fn is None:
             reason = "no_scorer"
+        elif not transcript:
+            reason = "no_transcript"
         else:
             try:
-                reason = score_fn(claimed, payload)
-            except Exception as exc:  # noqa: BLE001 — one bad file never stops the sweep
+                reason = score_fn(claimed, payload, transcript)
+            except Exception as exc:  # noqa: BLE001 — one bad file never stops the pass
                 reason = f"score_error:{type(exc).__name__}"
-        delete_pending(claimed)
-        deleted += 1
+        removed += 1
         if reason is None:
+            finish_scored(claimed, p)
             tally["scored"] += 1
         else:
+            delete_pending(claimed)
             tally["unscored"] += 1
-            _record_unscored(d, p.name, payload, reason)
-    return deleted
+            record_unscored(d, p.name, payload, reason, when="abandoned")
+    _collect_stale_markers(d, now_s, idle)
+    return removed
 
 
-def _expired(p: Path, payload: object, cutoff: int) -> bool:
-    ts = payload.get("ts_ms") if isinstance(payload, dict) else None
-    # Fall back to mtime when the payload is unreadable / ts missing.
-    if not isinstance(ts, (int, float)):
-        ts = int(_safe_mtime(p) * 1000)
-    return ts < cutoff
+def _source_for(source_fn: "Optional[Callable[[dict], str]]", payload: object) -> str:
+    if source_fn is None or not isinstance(payload, dict):
+        return ""
+    try:
+        return str(source_fn(payload) or "")
+    except Exception:  # noqa: BLE001 — an unresolvable source is "no transcript"
+        return ""
 
 
-def _record_unscored(pdir: Path, name: str, payload: object, reason: str) -> None:
-    """One row per unscored expiry in ``<project>/`` :data:`UNSCORED_LOG_REL`
-    plus a WARNING log line. Never raises: a failed row only leaves the
-    log line."""
+def _abandoned(
+    p: Path, payload: object, transcript: str, now_s: float, idle: float,
+    *, stage_mtime: Optional[float] = None,
+) -> bool:
+    """True when the file's chat has been silent for ``idle`` seconds: the
+    transcript's mtime when it exists, else the stage time (``ts_ms``, else
+    the file's mtime — ``stage_mtime`` for a claimed file, whose own mtime
+    the claim refreshed)."""
+    ref: Optional[float] = None
+    if transcript:
+        try:
+            ref = Path(transcript).stat().st_mtime
+        except OSError:
+            ref = None
+    if ref is None:
+        ts = payload.get("ts_ms") if isinstance(payload, dict) else None
+        if isinstance(ts, (int, float)) and ts > 0:
+            ref = float(ts) / 1000.0
+        else:
+            ref = stage_mtime if stage_mtime is not None else _safe_mtime(p)
+    return (now_s - ref) >= idle
+
+
+def _collect_stale_markers(d: Path, now_s: float, idle: float) -> None:
+    """Remove ended-session markers older than the bound whose session has no
+    pending file or claim left (the marker has nothing more to say)."""
+    try:
+        markers = list(d.glob(f"*{SESSION_ENDED_SUFFIX}"))
+    except OSError:
+        return
+    for m in markers:
+        sid = m.name[: -len(SESSION_ENDED_SUFFIX)]
+        if (now_s - _safe_mtime(m)) >= idle and not _session_has_files(d, sid):
+            try:
+                m.unlink()
+            except OSError:
+                pass
+
+
+def record_unscored(
+    pdir: Path, name: str, payload: object, reason: str, *, when: str,
+) -> None:
+    """One row per citation removed without a score in ``<project>/``
+    :data:`UNSCORED_LOG_REL` plus a WARNING log line. ``when`` names the
+    removal: ``"session_ended"`` (finalized after its chat ended) or
+    ``"abandoned"`` (garbage-collected). Never raises: a failed row only
+    leaves the log line."""
     info = payload if isinstance(payload, dict) else {}
     row = {
-        "expired_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "removed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "when": when,
         "file": name,
         "reason": reason,
         "session_id": str(info.get("session_id") or ""),
@@ -381,15 +491,15 @@ def _record_unscored(pdir: Path, name: str, payload: object, reason: str) -> Non
         "ts_ms": info.get("ts_ms"),
     }
     logger.warning(
-        "citation_pending: unscored expiry %s (%s) -- the citation for task %s "
-        "was removed at the TTL without a score", name, reason, row["task_id"][:16])
+        "citation_pending: unscored citation %s (%s, %s) -- the citation for task "
+        "%s was removed without a score", name, when, reason, row["task_id"][:16])
     try:
         log = pdir.parent.parent.parent / UNSCORED_LOG_REL
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     except OSError as exc:
-        logger.warning("citation_pending: could not record the unscored expiry (%s)", exc)
+        logger.warning("citation_pending: could not record the unscored citation (%s)", exc)
 
 
 # ── claims (v0.2.102 W6-C2 fix round, review R4c-1) ───────────────────────
@@ -399,10 +509,78 @@ def claim_pending(path: "str | Path") -> Optional[Path]:
     """Take ``path`` for this process (``<name>.json.draining.<pid>``, the
     one rename-claim primitive :func:`vco_lib.atomic.claim_by_rename`).
     Returns the claimed path, or ``None`` when another process took (or
-    deleted) it first. Never raises."""
+    deleted) it first. Never raises.
+
+    v0.2.102 W6-RL2 (review R7-1): a claim taken while ANOTHER claim of the
+    same name exists stands down (handed back, ``None``). That other claim
+    holds an earlier stage of the same task — a re-stage landed while it was
+    being scored — and :func:`finish_scored` consumes the re-stage once that
+    score lands, so one retrieval never yields two citation events. Of two
+    claims of one name, at most one passes this check: each is created
+    before its own check, so the later one always sees the earlier."""
     from vco_lib.atomic import claim_by_rename  # noqa: PLC0415
 
-    return claim_by_rename(Path(path), CLAIM_MARK)
+    src = Path(path)
+    claimed = claim_by_rename(src, CLAIM_MARK)
+    if claimed is None:
+        return None
+    if _other_claims(src, claimed):
+        release_claim(claimed, src)
+        return None
+    return claimed
+
+
+def _other_claims(path: Path, own: Path) -> "list[Path]":
+    try:
+        return [c for c in path.parent.glob(glob.escape(path.name) + CLAIM_MARK + "*")
+                if c != own]
+    except OSError:
+        return []
+
+
+def finish_scored(claimed: "str | Path", path: "str | Path") -> int:
+    """Consume a claim whose citation was WRITTEN — the one finish rule of
+    every scorer (Stop / SubagentStop / SessionEnd drains, the collector,
+    the MCP answer monitor; v0.2.102 W6-RL2, review R7-1).
+
+    A re-stage of the same task that landed while the score was computing
+    is the same retrieval (re-stages overwrite by contract), and its event
+    was just written. So before the claim is deleted, every newer stage is
+    consumed too, while the claim still stands (any scorer that tries to
+    take the re-stage meanwhile stands down, :func:`claim_pending`): a
+    re-staged ``<name>.json`` is taken with the same rename-claim primitive
+    (:func:`vco_lib.atomic.claim_by_rename` — from this process it folds
+    into this claim, atomically), and a standing-down claim of the same
+    name is removed (its hand-back then finds nothing, harmlessly). Passes
+    repeat until one finds nothing new. A stage that lands after the last
+    pass, in the instant before the claim is deleted, is a genuinely later
+    stage and is scored on its own. Returns the count consumed. Never
+    raises."""
+    from vco_lib.atomic import claim_by_rename  # noqa: PLC0415
+
+    src, own = Path(path), Path(claimed)
+    consumed = 0
+    for _ in range(_FINISH_MAX_PASSES):
+        found = False
+        for other in _other_claims(src, own):
+            found = True
+            try:
+                other.unlink()
+                consumed += 1
+            except OSError:
+                pass  # it was just handed back: the next pass sees <name>.json
+        if src.exists():
+            found = True
+            if claim_by_rename(src, CLAIM_MARK) is not None:
+                consumed += 1
+        if not found:
+            break
+    delete_pending(own)
+    if consumed:
+        logger.info(
+            "citation_pending: %s was re-staged while it was scored; the "
+            "re-stage was consumed (one citation event)", src.name)
+    return consumed
 
 
 def release_claim(claimed: "str | Path", path: "str | Path") -> None:
@@ -534,21 +712,20 @@ def agent_transcript_for(parent_transcript: str, agent_id: str) -> str:
 
 def session_transcript_for(known_transcript: str, session_id: str) -> str:
     """The main-chat transcript of ``session_id``, found beside a transcript
-    this process already knows (review R6-2: the TTL sweep scores an expiring
-    main-chat file against its OWN session's answer).
+    this process already knows: ``<same folder>/<session_id>.jsonl``.
 
     Claude Code keeps every session of a project as
     ``<project transcripts dir>/<session_id>.jsonl`` and a subagent's beside
     its parent's (:func:`agent_transcript_for`), so from either kind of
-    ``known_transcript`` the session file is a sibling of the parent. A
-    session started from ANOTHER working directory lives in a sibling
-    project folder of the same transcripts root: when the sibling lookup
-    misses, ``<root>/*/<session_id>.jsonl`` is searched and accepted only
-    when exactly ONE file matches (session ids are UUIDs; zero or several
-    matches mean "unknown", never a guess). An empty ``session_id`` means the
-    known transcript's own session. ``""`` when the inputs are missing, the
-    id is not filesystem-safe, or no unique file exists — a caller never
-    points a compute at a guessed path."""
+    ``known_transcript`` the session file is a sibling of the parent. ONLY
+    that folder is looked at: a VCO chat is always started in the project's
+    root, so its sessions share one transcripts folder, and a citation is
+    scored against its OWN chat or not at all (owner ruling R7-3 — the
+    cross-folder search the R6-2 coordinator commit added is gone). An empty
+    ``session_id`` means the known transcript's own session. ``""`` when the
+    inputs are missing, the id is not filesystem-safe, or the file does not
+    exist — a caller never points a compute at a guessed path; it leaves the
+    citation unscored and logs it."""
     if not known_transcript or not known_transcript.endswith(".jsonl"):
         return ""
     known = Path(known_transcript)
@@ -559,14 +736,88 @@ def session_transcript_for(known_transcript: str, session_id: str) -> str:
             return ""
         known = known.with_name(f"{session_id}.jsonl")
     try:
-        if known.is_file():
-            return str(known)
-        if not session_id:
-            return ""
-        matches = [m for m in known.parent.parent.glob(f"*/{session_id}.jsonl") if m.is_file()]
-        return str(matches[0]) if len(matches) == 1 else ""
+        return str(known) if known.is_file() else ""
     except OSError:
         return ""
+
+
+# ── chat end records (v0.2.102 W6-RL2, owner ruling R7-4) ──────────────────
+
+
+def session_ended_marker(
+    session_id: str, project_root: "str | Path | None" = None,
+) -> Optional[Path]:
+    """``<pending dir>/<session>.session_ended``, or ``None`` without a
+    session id or a pending dir."""
+    safe = _safe(session_id)
+    d = pending_dir(project_root) if safe else None
+    return d / f"{safe}{SESSION_ENDED_SUFFIX}" if d is not None else None
+
+
+def mark_session_ended(session_id: str, project_root: "str | Path | None" = None) -> bool:
+    """Record that ``session_id`` ended (its SessionEnd drain runs). Written
+    FIRST by that drain, so a drain that could not finish still leaves the
+    record: the next drain of any session then finalizes the leftovers.
+    Returns whether the record exists. Never raises."""
+    m = session_ended_marker(session_id, project_root)
+    if m is None:
+        return False
+    try:
+        m.touch()
+        return True
+    except OSError as exc:
+        logger.info("citation_pending: could not record the end of %s (%s)",
+                    session_id[:16], exc)
+        return False
+
+
+def clear_session_ended(
+    session_id: str,
+    project_root: "str | Path | None" = None,
+    *,
+    older_than: Optional[float] = None,
+) -> None:
+    """Drop the end record of a session that is live again (a resumed chat's
+    Stop drain). ``older_than`` (epoch seconds): only a record written before
+    then — a record newer than the calling drain's own start belongs to a
+    SessionEnd that followed this turn, and stands. Never raises."""
+    m = session_ended_marker(session_id, project_root)
+    if m is None:
+        return
+    try:
+        if older_than is not None and m.stat().st_mtime >= older_than:
+            return
+        m.unlink()
+    except OSError:
+        pass
+
+
+def ended_sessions(project_root: "str | Path | None" = None) -> "list[str]":
+    """The (filesystem-safe) ids of every session with an end record."""
+    d = pending_dir(project_root)
+    if d is None or not d.exists():
+        return []
+    try:
+        return sorted(m.name[: -len(SESSION_ENDED_SUFFIX)]
+                      for m in d.glob(f"*{SESSION_ENDED_SUFFIX}"))
+    except OSError:
+        return []
+
+
+def session_has_pending(session_id: str, project_root: "str | Path | None" = None) -> bool:
+    """Whether ``session_id`` still has a pending file or claim. ``True`` when
+    that cannot be told (keep its end record rather than lose it)."""
+    d = pending_dir(project_root)
+    if d is None or not d.exists():
+        return False
+    return _session_has_files(d, _safe(session_id))
+
+
+def _session_has_files(d: Path, safe_sid: str) -> bool:
+    try:
+        return any(d.glob(f"{glob.escape(safe_sid)}__*.json*"))
+    except OSError:
+        return True
 
 
 def adopt_brief_citations(
@@ -599,16 +850,16 @@ def adopt_brief_citations(
       detached adopt job lands; review R5-9) it is ALSO stamped, with
       ``agent_window_final: false``: a parent Stop drain then scores it
       against the subagent's answer under the main chat's
-      accumulate-don't-drop rules (25k gate, or the terminal floors once
-      the file ages) instead of the final-window floors, because the agent
-      may still be running. Without the stamp a tagged file whose agent
-      drain already ran had no transcript and died at the TTL sweep. The
-      agent's own drain, when it comes, clears the flag (its window is
-      final).
+      accumulate-don't-drop rules (the 25k gate) instead of the
+      final-window floors, because the agent may still be running; the
+      final floors apply once the session has ended. Without the stamp a
+      tagged file whose agent drain already ran had no transcript and could
+      never be scored. The agent's own drain, when it comes, clears the
+      flag (its window is final).
 
     A finished agent whose transcript cannot be located re-tags nothing:
-    a tagged file without a transcript would be left to the TTL sweep, and
-    the parent's answer is a better label than none. Files are claimed
+    a tagged file without a transcript could never be scored, and the
+    parent's answer is a better label than none. Files are claimed
     while rewritten, so a concurrent drain never sees a half state.
     Returns the count re-tagged. Never raises."""
     from vco_lib.hook_agent_key import sanitize_agent_id  # noqa: PLC0415

@@ -100,11 +100,28 @@ _DEFAULT_MAX_ROWS = 0  # 0 = disabled (age is the primary bound)
 _DEFAULT_MIN_INTERVAL_S = 3600.0  # hourly cadence throttle
 
 # The in-flight-citation protection window. A retrieval event younger than this
-# may still have an un-drained citation (RL-4 keeps pending files alive up to
-# PENDING_TTL_SECONDS = 3600s; we add generous headroom so a retention cutoff
-# never races the drain). The age bound is clamped so the cutoff is NEVER more
-# recent than (now - this floor), regardless of how small MAX_AGE_DAYS is set.
-_INFLIGHT_PROTECT_SECONDS = 6 * 3600.0  # 6h — 6× the pending TTL, generous.
+# may still have an un-drained citation. The age bound is clamped so the cutoff
+# is NEVER more recent than (now - the floor), regardless of how small
+# MAX_AGE_DAYS is set. v0.2.102 W6-RL2: pending citations no longer expire
+# after an hour — they wait for their chat's end, and the citation collector
+# removes an abandoned one only after ``RL_CITATION_ABANDONED_DAYS`` without a
+# transcript write — so the floor is that bound plus a day of headroom
+# (:func:`_inflight_protect_seconds`). This constant is only its lower limit.
+# (A chat that keeps writing for longer than that bound can still hold a
+# citation older than the floor; under the default 90-day age bound that never
+# matters.)
+_INFLIGHT_PROTECT_SECONDS = 6 * 3600.0
+_INFLIGHT_HEADROOM_SECONDS = 86400.0
+
+
+def _inflight_protect_seconds() -> float:
+    """The in-flight floor: the citation collector's abandoned-file bound
+    (one home: ``citation_pending.abandoned_after_seconds``) plus a day,
+    never below :data:`_INFLIGHT_PROTECT_SECONDS`."""
+    from .citation_pending import abandoned_after_seconds  # noqa: PLC0415
+
+    return max(_INFLIGHT_PROTECT_SECONDS,
+               abandoned_after_seconds() + _INFLIGHT_HEADROOM_SECONDS)
 
 _ENV_MAX_AGE_DAYS = "RL_EVENTS_RETENTION_MAX_AGE_DAYS"
 _ENV_MAX_ROWS = "RL_EVENTS_RETENTION_MAX_ROWS"
@@ -147,7 +164,7 @@ def compute_retention_plan(now_ms: Optional[int] = None) -> RetentionPlan:
     """Resolve the age + row-count cutoffs from env, applying the in-flight floor.
 
     The age cutoff is CLAMPED so it is never more recent than
-    ``now - _INFLIGHT_PROTECT_SECONDS`` — even if the user sets
+    ``now - _inflight_protect_seconds()`` — even if the user sets
     ``RL_EVENTS_RETENTION_MAX_AGE_DAYS=0.001`` the retention pass will not delete
     an event that could still have an un-drained citation. ``now_ms`` is
     injectable for tests.
@@ -167,7 +184,7 @@ def compute_retention_plan(now_ms: Optional[int] = None) -> RetentionPlan:
     # In-flight protection floor: never let the cutoff cross into the window
     # where a citation might still be pending. This bounds the age cutoff from
     # ABOVE (more recent) — a too-aggressive age setting is silently made safe.
-    inflight_floor_ms = now - int(_INFLIGHT_PROTECT_SECONDS * 1000)
+    inflight_floor_ms = now - int(_inflight_protect_seconds() * 1000)
     if cutoff_ms is not None and cutoff_ms > inflight_floor_ms:
         cutoff_ms = inflight_floor_ms
         reasons.append("clamped-to-inflight-floor")
