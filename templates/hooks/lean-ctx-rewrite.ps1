@@ -55,7 +55,9 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 # 2. Per-project knobs. Read .claude/env if it exists; look for the
 #    VCO_LEAN_CTX_DEFAULT / VCO_LEAN_CTX_TEE_TTL_HOURS lines (KEY=VALUE
-#    syntax). Anything else in the file is ignored — this script doesn't
+#    syntax, optional `export ` prefix, LAST assignment wins -- what the .sh
+#    sibling's `source` gives; the shared rule is vco_lib/envfile.py). Anything
+#    else in the file is ignored — this script doesn't
 #    `Invoke-Expression` user env files (avoids arbitrary code-exec from a
 #    malformed .claude/env).
 # One-quote-pair rule for the raw .claude/env scan -- SHARED home
@@ -75,14 +77,14 @@ $leanCtxTtl = "168"
 if (Test-Path -LiteralPath $envFile) {
     try {
         foreach ($line in Get-Content -LiteralPath $envFile -ErrorAction Stop) {
-            if ($line -match '^\s*VCO_LEAN_CTX_DEFAULT\s*=\s*(.+?)\s*$') {
+            if ($line -match '^\s*(?:export\s+)?VCO_LEAN_CTX_DEFAULT\s*=\s*(.+?)\s*$') {
                 $leanCtxDefault = $Matches[1]
                 if (Get-Command Strip-OneQuotePair -ErrorAction SilentlyContinue) {
                     $leanCtxDefault = Strip-OneQuotePair $leanCtxDefault
                 }
                 $leanCtxDefault = $leanCtxDefault.ToLowerInvariant()
             }
-            if ($line -match '^\s*VCO_LEAN_CTX_TEE_TTL_HOURS\s*=\s*(.+?)\s*$') {
+            if ($line -match '^\s*(?:export\s+)?VCO_LEAN_CTX_TEE_TTL_HOURS\s*=\s*(.+?)\s*$') {
                 $leanCtxTtl = $Matches[1]
                 if (Get-Command Strip-OneQuotePair -ErrorAction SilentlyContinue) {
                     $leanCtxTtl = Strip-OneQuotePair $leanCtxTtl

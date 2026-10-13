@@ -1727,30 +1727,20 @@ pub fn read_active_embedding_source(project: &ProjectRow) -> Option<String> {
 }
 
 /// File-path-driven variant of `read_active_embedding_source` for unit
-/// tests. Parses a `.env`-style file looking for a non-comment line
-/// `ACTIVE_EMBEDDING=<value>` (whitespace trimmed; surrounding double
-/// quotes stripped). Returns None when:
+/// tests. The value of `ACTIVE_EMBEDDING` under the ONE env-file read grammar,
+/// `vct_launcher_core::services::env_file::read_key` (MUST MATCH
+/// `vco_lib/envfile.py`: `export ` prefix dropped — the form VCO's own managed
+/// block writes, which this reader never matched before v0.2.102 — one
+/// matching quote pair stripped, LAST assignment wins as under `source`).
+/// Returns None when:
 ///   * file doesn't exist OR can't be read
 ///   * no ACTIVE_EMBEDDING line found
-///   * value is the empty string
+///   * the last assignment's value is the empty string
 pub fn parse_active_embedding_from_env_file(path: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if key.trim() == "ACTIVE_EMBEDDING" {
-            let v = value.trim().trim_matches('"').trim_matches('\'').to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
+    vct_launcher_core::services::env_file::read_key(path, "ACTIVE_EMBEDDING")
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
 }
 
 /// v0.2.32 (L7): Tauri command exposing the per-project text-embedding-source
@@ -4439,6 +4429,24 @@ mod tests {
         std::fs::write(&empty, "FOO=bar\n").expect("write");
         assert!(parse_active_embedding_from_env_file(&empty).is_none());
         let _ = std::fs::remove_file(&empty);
+    }
+
+    /// v0.2.102 W6-Z1: VCO's own managed block writes
+    /// `export ACTIVE_EMBEDDING="…"`; the old reader never stripped `export `
+    /// and so never matched it. A user override after the block wins (last
+    /// assignment, as under `source`).
+    #[test]
+    fn parse_active_embedding_reads_the_managed_block_and_the_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("env");
+        let block = "# vco-managed-begin\n# header\nexport ACTIVE_EMBEDDING=\"qwen3\"\n# vco-managed-end\n";
+        std::fs::write(&path, block).expect("write");
+        assert_eq!(parse_active_embedding_from_env_file(&path).as_deref(), Some("qwen3"));
+        std::fs::write(&path, format!("{block}\nexport ACTIVE_EMBEDDING='arctic'\n")).expect("write");
+        assert_eq!(parse_active_embedding_from_env_file(&path).as_deref(), Some("arctic"));
+        // An empty last assignment leaves the shell with an empty value → None.
+        std::fs::write(&path, format!("{block}ACTIVE_EMBEDDING=\n")).expect("write");
+        assert!(parse_active_embedding_from_env_file(&path).is_none());
     }
 
     #[test]

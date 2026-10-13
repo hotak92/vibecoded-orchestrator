@@ -448,11 +448,14 @@ vco_route_init() {
         # `vco_lib.envfile.parse_env_lines`: an optional `export ` prefix (the
         # form the projection's managed block WRITES — v0.2.97: the old
         # pattern required the bare `VCT_PROJECT_ID=` form and never matched
-        # it), first match wins, one matching pair of quotes stripped.
-        # MUST MATCH route-touched-path.ps1 (parity test:
+        # it), LAST match wins (what `source` gives — a user's override after
+        # the managed block counts; v0.2.102, this took the first before), one
+        # matching pair of quotes stripped.
+        # MUST MATCH route-touched-path.ps1 and
+        # `vco_lib.envfile.env_value(..., last_wins=True)` (parity test:
         # tests/test_v0297_route_project_id_parity.py).
         VCT_PROJECT_ID=$(grep -E '^[[:space:]]*(export[[:space:]]+)?VCT_PROJECT_ID=' "$_VCO_ROUTE_PROJECT_ROOT/.claude/env" 2>/dev/null \
-            | head -1 \
+            | tail -n 1 \
             | sed -E -e 's/^[[:space:]]*(export[[:space:]]+)?VCT_PROJECT_ID=[[:space:]]*//' -e 's/[[:space:]]+$//' \
                      -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'\$/\\1/")
     fi

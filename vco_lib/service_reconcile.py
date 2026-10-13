@@ -350,21 +350,17 @@ def _env_statements(env: Mapping[str, str]) -> list[Statement]:
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
-    out: dict[str, str] = {}
+    """Every assignment in the sourced ``path`` (``.claude/env``), LAST one
+    per key winning — what a shell holds after ``source``. The parse is the
+    ONE line grammar (:func:`vco_lib.envfile.parse_env_lines`); this was a
+    private copy of it until v0.2.102."""
+    from vco_lib.envfile import parse_env_lines
+
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
-        return out
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        key, sep, value = line.partition("=")
-        if sep:
-            out[key.strip()] = value.strip().strip("'\"")
-    return out
+    except (OSError, ValueError):  # ValueError: a non-UTF-8 file
+        return {}
+    return dict(parse_env_lines(text))
 
 
 def _continuity(orchestrator_root: Path) -> dict[str, Statement]:

@@ -731,6 +731,22 @@ class TestPs1HookParity:
         assert res.stdout.strip(), "wrap expected"
         assert len(list(_rawdir(proj).glob("*.cmd"))) == 1
 
+    @pytest.mark.parametrize("runner", ["sh", "ps1"])
+    def test_export_prefix_and_last_assignment_win(self, runner, tmp_path):
+        """v0.2.102: `.claude/env` lines may carry `export ` (the managed block
+        writes that form) and the LAST assignment wins — the .sh sibling gets
+        both from `source`; the .ps1 raw scan must read the file the same way."""
+        run = _run_sh_hook if runner == "sh" else _run_ps1_hook
+        res = run("npm install", tmp_path / "off",
+                  env_file="export VCO_LEAN_CTX_DEFAULT=off\n")
+        assert res.stdout.strip() == "", f"{runner}: exported off must disable"
+        res = run("npm install", tmp_path / "ttl",
+                  env_file="VCO_LEAN_CTX_TEE_TTL_HOURS=24\n"
+                           "export VCO_LEAN_CTX_TEE_TTL_HOURS=48\n")
+        wrapped = json.loads(
+            res.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert wrapped.rstrip().split()[-1].strip("'") == "48", wrapped
+
     @pytest.mark.parametrize("val", ["Off", "OFF"])
     def test_default_off_is_case_insensitive(self, val, tmp_path):
         """SF-3 parity: the .ps1 already lowercased; pinned so the pair

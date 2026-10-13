@@ -3261,12 +3261,17 @@ def _read_project_name_from_envfile(env_path: Path) -> str | None:
     ``export `` prefix — the form VCO's own ``.claude/env`` managed block
     writes, which the hand-rolled parse here missed until v0.2.97. The parse
     is the ONE line-level env parser (:func:`vco_lib.envfile.env_value`).
+
+    Read last-assignment-wins, like every other consumer of these files
+    (each shell that sources them, the hooks, the launcher's Rust reader): a
+    user's override after the ``.claude/env`` managed block is the name used
+    here too (v0.2.102; this took the FIRST before).
     """
     from vco_lib.envfile import env_value
 
     try:
         return env_value(env_path.read_text(encoding="utf-8", errors="replace"),
-                         "PROJECT_NAME") or None
+                         "PROJECT_NAME", last_wins=True) or None
     except OSError:  # includes a missing file
         return None
 
