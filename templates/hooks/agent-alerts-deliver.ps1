@@ -16,6 +16,16 @@
 #
 # MUST MATCH agent-alerts-deliver.sh.
 
+# Env scrub FIRST (canonical list: _lib/scrub-env.ps1; parity gate
+# tests/test_scrub_env_parity_v0273.py; order gate tests/test_hooks_disable_guard.py:
+# the scrub precedes the VCT_DISABLE_HOOKS guard in every hook). Plain .NET calls,
+# no Test-Path/Remove-Item, so the no-pending fast path below pays no cmdlet
+# module autoload for it. Setting a variable to $null removes it for this process
+# and every child it starts.
+foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
+    [System.Environment]::SetEnvironmentVariable($v, $null)
+}
+
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 # Fast path FIRST: nothing pending -> exit before any cmdlet runs (owner
@@ -26,8 +36,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # read, Join-Path, two Get-ChildItem) cost ~87 ms on top of the bare ~175 ms
 # interpreter start; this one (plain .NET calls, string paths, the pending
 # path moved to _lib/) costs ~29 ms (medians: 262 -> 204 ms). The env
-# scrub and the stdin read move below the check: nothing before it starts a
-# child process, and the scrub exists for the child. "Pending" includes an
+# scrub (above, .NET only) costs no autoload; the stdin read moves below the
+# check. "Pending" includes an
 # orphaned delivery claim (<file>.jsonl.delivering.<pid>, left by a delivery
 # killed mid-way): only Python re-adopts it, so it must not be hidden behind
 # this exit (review R5-1); the one pattern agent_alerts_*.jsonl* covers both.
@@ -44,17 +54,6 @@ try {
     }
 } catch { $hasPending = $false }
 if (-not $hasPending) { exit 0 }
-
-# Env scrub (canonical list: _lib/scrub-env.ps1; parity gate
-# tests/test_scrub_env_parity_v0273.py). It sits HERE, after the fast path
-# and before anything below can start a child process (the venv Python in
-# _lib/agent-alerts-deliver-pending.ps1). The no-pending path above starts
-# no child, so it never runs these lines: it pays their parse (four lines)
-# but not the Test-Path/Remove-Item module autoload. Inline in the hook file,
-# not in the dot-sourced lib, so the gate reads it where every hook has it.
-foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
-    if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
-}
 
 # Something is pending: the rest lives in _lib/ so PowerShell does not parse
 # it on every no-pending call (see that file). A missing lib is a broken
