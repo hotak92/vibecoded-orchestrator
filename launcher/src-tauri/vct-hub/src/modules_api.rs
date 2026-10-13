@@ -1450,7 +1450,7 @@ async fn project_env(
                     format!(
                         "key {:?} is not active for project {} (not declared by any installed \
                          module, or not granted to this project; a paused key answers the \
-                         distinct `key_paused` code)",
+                         distinct key_paused code)",
                         want, project.id
                     ),
                 )

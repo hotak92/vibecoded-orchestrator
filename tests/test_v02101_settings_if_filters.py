@@ -54,7 +54,11 @@ WINDOWS = TEMPLATES / "settings.json.windows.template"
 #: classifier has always classified EDIT, and ``cd`` exists for the R4
 #: chain re-rooting — ``cd dir && cat f`` starts with ``cd``, so without
 #: the rule the read behind it never reached the classifier either.
-#: Appended after the 21 read/search rules, brief order.
+#: Appended after the 21 read/search rules, brief order. W6-Z3:
+#: ``echo``/``printf`` follow — ``echo x > f`` / ``printf … > f`` are the
+#: commonest Bash writes, and the classifier always read them EDIT, but no
+#: rule started with their verb, so the CHANGELOG's "same pre-tool injection
+#: as the tool-call equivalents" was false for exactly that shape.
 V02102_RULES = [
     "Bash(perl *)",
     "Bash(ruby *)",
@@ -62,6 +66,8 @@ V02102_RULES = [
     "Bash(tee *)",
     "Bash(cp *)",
     "Bash(mv *)",
+    "Bash(echo *)",
+    "Bash(printf *)",
 ]
 
 C1_IF_RULES = [
@@ -351,6 +357,8 @@ class TestIfRulesMatchClassifier:
             "tee": "tee vco_lib/packs.py",
             "cp": "cp vco_lib/packs.py /tmp/packs.py",
             "mv": "mv vco_lib/packs.py /tmp/packs.py",
+            "echo": "echo 'x = 1' > vco_lib/packs.py",
+            "printf": "printf 'x = 1\\n' >> vco_lib/packs.py",
         }
         for rule in _bash_group_rules(_load(tpl)):
             m = re.fullmatch(r"Bash\((git \w+|\w+)\*?(?: \*)?\)", rule)
@@ -372,6 +380,35 @@ class TestIfRulesMatchClassifier:
             assert intent in want, (
                 f"{rule!r}: sample {sample!r} classifies {intent!r}")
 
+
+
+@pytest.mark.parametrize("tpl", [LINUX, WINDOWS], ids=["linux", "windows"])
+@pytest.mark.parametrize("cmd", [
+    "echo 'x = 1' > vco_lib/packs.py",
+    "echo hi >> docs/notes.md",
+    "printf '%s\\n' a > vco_lib/packs.py",
+])
+def test_redirect_writes_reach_the_hook(tpl: Path, cmd: str) -> None:
+    """W6-Z3: a redirect write that STARTS with ``echo``/``printf`` — the
+    commonest Bash write — is matched by an ``if`` rule (a ``Bash(v *)``
+    prefix glob) AND classifies EDIT, so the hook spawns and answers."""
+    from vco_lib.inject_intent import classify_bash
+    rules = _bash_group_rules(_load(tpl))
+    verbs = [m.group(1) for r in rules
+             if (m := re.fullmatch(r"Bash\((\w+) \*\)", r))]
+    assert any(cmd.startswith(v + " ") for v in verbs), (cmd, rules)
+    assert classify_bash(cmd).intent == "EDIT"
+
+
+@pytest.mark.parametrize("cmd", ["echo hi", "printf 'done\\n'", "echo $PATH",
+                                 "echo hi > /dev/null", "echo hi 2>&1"])
+def test_echo_printf_without_a_file_target_stay_mechanical(cmd: str) -> None:
+    """The ``Bash(echo *)`` / ``Bash(printf *)`` rules spawn the hook for
+    every echo, but one with no file target classifies MECHANICAL — no
+    query, no producer spawn, no injection (the same contract as ``cd``)."""
+    from vco_lib.inject_intent import classify_bash
+    bi = classify_bash(cmd)
+    assert bi.intent == "MECHANICAL" and not bi.targets, bi
 
 def test_cd_rule_stays_cheap_cd_alone_is_mechanical() -> None:
     """The ``Bash(cd *)`` rule must not turn navigation into injection:

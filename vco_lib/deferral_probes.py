@@ -734,11 +734,25 @@ def process_identity_matches(pid: int, recorded: Optional[str]) -> Optional[bool
     if rec_kind == "proc":
         return rec_val == cur_val
     try:
-        # A stored creation timestamp is exact; the tolerance only absorbs
-        # float formatting between two readers.
-        return abs(float(rec_val) - float(cur_val)) <= 1.0
+        delta = abs(float(rec_val) - float(cur_val))
     except ValueError:
         return None
+    # Both readers take the same OS creation timestamp, but the Rust writer
+    # (vct-launcher-core process.rs) truncates it to whole seconds, so a live
+    # holder can differ by up to (strictly under) 1 s. A gap between that and
+    # _WALL_REUSED_MIN_DELTA_S is "cannot tell" — callers then treat the holder
+    # as still alive, the safe direction for a lock — so a future reader drift
+    # can never turn a LIVE holder into "pid reused".
+    if delta <= 1.0:
+        return True
+    if delta < _WALL_REUSED_MIN_DELTA_S:
+        return None
+    return False
+
+
+# A wall-clock start token differing by at least this much names a different
+# process (see process_identity_matches).
+_WALL_REUSED_MIN_DELTA_S = 3.0
 
 
 def kg_binding_evidence_still_mismatched(ctx: ProbeContext) -> Optional[bool]:

@@ -1824,14 +1824,16 @@ pub(crate) async fn run_install_py_update(
                 Ok(Some(line)) => {
                     buf.extend_from_slice(line.as_bytes());
                     buf.push(b'\n');
-                    // ANY stdout line is heartbeat. install.py itself is
-                    // silent while it blocks on the seed child — the
-                    // producer there is the CHILD's own throttled
-                    // `[VCO-EVENT] kg-sync …` ticks (emitted by
+                    // ANY stdout line is heartbeat. install.py blocks on a
+                    // seed child only for the inline per-file diffs (or
+                    // when the whole-tree seed's detach fails); there it
+                    // is silent itself and the producer is the CHILD's own
+                    // throttled `[VCO-EVENT] kg-sync …` ticks (emitted by
                     // sync_knowledge_graph.py under VCO_PROGRESS_STREAM,
                     // relayed onto install.py's stdout by
                     // vco_lib/child_process.py), which is what keeps a
-                    // slow but healthy re-embed from looking stalled.
+                    // slow but healthy re-embed from looking stalled. See
+                    // the stall-watchdog block below (WP-8) for the rest.
                     if let Some(state) = watchdog_state.as_ref() {
                         state
                             .lock()

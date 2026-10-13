@@ -17,6 +17,7 @@ Two tiers:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -293,6 +294,46 @@ def test_hub_404_key_paused_code_parses_to_secret_paused(monkeypatch):
     with pytest.raises(AccessDenied) as ei:
         agent_secrets._hub_get("absent_key", "proj-1")
     assert not isinstance(ei.value, SecretPaused)
+
+
+#: The `key_not_active` contract clause — the hub (modules_api.rs) and both
+#: shell resolvers (vct_secrets_resolve.sh / .ps1) word it exactly so.
+_KEY_NOT_ACTIVE_CLAUSE = (
+    "not declared by any installed module, or not granted to this project; "
+    "a paused key answers the distinct key_paused code"
+)
+
+
+def test_hub_404_key_not_active_message_uses_the_contract_wording(monkeypatch):
+    """W6-Z3: `key_not_active` means not declared / not granted — a PAUSED
+    key answers the distinct `key_paused` code (SecretPaused above). The
+    pre-v0.2.102 message still told the user the key might be "paused in the
+    launcher", sending them to resume a key that was never paused."""
+
+    class FakeResp:
+        status_code = 404
+
+        def json(self):
+            return {"error": {"code": "key_not_active", "message": "nope"}}
+
+    monkeypatch.setattr(
+        agent_secrets, "_get_with_401_retry", lambda *a, **kw: FakeResp()
+    )
+    with pytest.raises(AccessDenied) as ei:
+        agent_secrets._hub_get("absent_key", "proj-1")
+    msg = str(ei.value)
+    assert _KEY_NOT_ACTIVE_CLAUSE in msg, msg
+    assert "paused in the launcher" not in msg
+    # The shell resolvers carry the same clause — one contract, three surfaces.
+    root = Path(__file__).resolve().parents[1] / "templates" / "scripts"
+    for name in ("vct_secrets_resolve.sh", "vct_secrets_resolve.ps1"):
+        assert _KEY_NOT_ACTIVE_CLAUSE in (root / name).read_text(encoding="utf-8"), name
+    # ...and so does the hub that emits the code (its string is split across
+    # Rust line continuations: `\<newline><indent>` joins with nothing).
+    hub = (Path(__file__).resolve().parents[1] / "launcher" / "src-tauri" / "vct-hub"
+           / "src" / "modules_api.rs").read_text(encoding="utf-8")
+    joined = re.sub(r"\\\n\s*", "", hub)
+    assert _KEY_NOT_ACTIVE_CLAUSE in joined, "vct-hub modules_api.rs key_not_active text"
 
 
 def test_lookup_stored_reports_paused_distinctly(tmp_path, monkeypatch):

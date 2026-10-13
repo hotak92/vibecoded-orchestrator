@@ -161,9 +161,17 @@ _GIT_SEARCH_SUBS = frozenset({"grep"})
 #: (``cat f | tee x`` already fires via ``Bash(cat *)``). ``cd`` itself
 #: classifies MECHANICAL — a cheap spawn that usually injects nothing —
 #: and the rule exists to deliver ``cd dir && cat f`` to the R4 re-rooting.
+#: ``echo``/``printf`` (v0.2.102 W6-Z3) are the redirect writes —
+#: ``echo x > f`` / ``printf … >> f``, the commonest Bash write: the
+#: classifier has always read them EDIT, but no rule started with their
+#: verb, so the hook never spawned for them. An ``echo`` with no file target
+#: (``echo hi``, ``> /dev/null``) classifies MECHANICAL — a cheap spawn that
+#: injects nothing, like ``cd``. A redirect behind an arbitrary verb
+#: (``python gen.py > f``) still matches no rule: a prefix-glob ``if`` rule
+#: cannot see a redirect, and a catch-all would spawn on every command.
 #: ``touch``/``dd`` also classify EDIT but ship NO rule: a file they
 #: produce carries no content to key a retrieval query on.
-_EDIT_RULE_VERBS = frozenset({"perl", "ruby", "tee", "cp", "mv"})
+_EDIT_RULE_VERBS = frozenset({"perl", "ruby", "tee", "cp", "mv", "echo", "printf"})
 _CHAIN_RULE_VERBS = frozenset({"cd"})
 
 #: v0.2.102 W5-D — the PowerShell twin rules of the same group. A single

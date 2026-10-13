@@ -426,6 +426,18 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
             "timeout": 10,
+            "if": "Bash(echo *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "Bash(printf *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
             "if": "PowerShell(Get-Content *)"
           },
           {
@@ -481,6 +493,12 @@
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
             "timeout": 10,
             "if": "PowerShell(Tee-Object *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-bash-context-inject.sh\"",
+            "timeout": 10,
+            "if": "PowerShell(Write-Output *)"
           },
           {
             "type": "command",

@@ -310,6 +310,52 @@ pub fn epoch_secs_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// An opaque token naming the process INSTANCE running as `pid`, or `None`
+/// when it cannot be inspected (gone, no permission, sentinel pid).
+///
+/// v0.2.102 (W6-Z3): written as the third line of `<vct_root>/update.lock`
+/// so `vco_lib/update_lock.py::decide` can tell the claimant from a newer
+/// process handed the same pid WITHOUT comparing wall clocks (an NTP step
+/// after the claim shifts a wall-clock-derived start time and read a live
+/// holder as "pid reused").
+///
+/// MUST MATCH `vco_lib/deferral_probes.py::process_start_token` — the Python
+/// home of the format; the readers compare the two:
+///
+/// * `proc:<ticks>` on Linux — field 22 of `/proc/<pid>/stat` (start time in
+///   clock ticks since boot; not wall-clock based, so it never drifts);
+/// * `wall:<seconds>.000` elsewhere — the creation timestamp the OS stored
+///   when the process started, via `sysinfo` (whole seconds; the Python
+///   reader `process_identity_matches` takes <= 1 s as the same process,
+///   < 3 s as "cannot tell" and >= 3 s as a reused pid).
+pub fn process_start_token(pid: u32) -> Option<String> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        let raw = String::from_utf8_lossy(&raw);
+        // comm may hold spaces/parens: the fields after the LAST ')' are
+        // fixed — state is field 3, so starttime (field 22) is index 19.
+        let (_, tail) = raw.rsplit_once(')')?;
+        let ticks: u64 = tail.split_whitespace().nth(19)?.parse().ok()?;
+        Some(format!("proc:{ticks}"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use sysinfo::{Pid, ProcessesToUpdate, System};
+        let target = Pid::from_u32(pid);
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::Some(&[target]), true);
+        let secs = sys.process(target)?.start_time();
+        if secs == 0 {
+            return None;
+        }
+        Some(format!("wall:{secs}.000"))
+    }
+}
+
 /// Why [`output_bounded`] produced no [`std::process::Output`].
 #[derive(Debug)]
 pub enum BoundedError {
@@ -544,6 +590,30 @@ mod tests {
         // Windows OpenProcess(0) returns NULL. Either way the sentinel
         // must short-circuit to false.
         assert!(!pid_is_alive(0));
+    }
+
+    #[test]
+    fn start_token_is_stable_for_a_live_process_and_none_for_sentinels() {
+        let me = std::process::id();
+        let a = process_start_token(me).expect("own token readable");
+        assert_eq!(process_start_token(me).as_deref(), Some(a.as_str()), "stable");
+        assert!(a.starts_with("proc:") || a.starts_with("wall:"), "{a}");
+        assert_eq!(process_start_token(0), None);
+        assert_eq!(process_start_token(u32::MAX), None);
+    }
+
+    /// The `/proc/<pid>/stat` index matches the Python twin's
+    /// (`rsplit(')', 1)[1].split()[19]`) — including a comm holding `)`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_token_reads_field_22_after_the_last_paren() {
+        let raw = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let tail = raw.rsplit_once(')').unwrap().1;
+        let want = tail.split_whitespace().nth(19).unwrap();
+        assert_eq!(
+            process_start_token(std::process::id()).unwrap(),
+            format!("proc:{want}")
+        );
     }
 
     #[test]

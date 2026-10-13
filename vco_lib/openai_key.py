@@ -352,9 +352,11 @@ def env_var_no_longer_read() -> str:
 
     * ``SecretNotFound`` — every tier was consulted and none held the key.
       Proven: this is the claim.
-    * ``AccessDenied`` — the hub says the key is not ACTIVE for this requester
-      (paused in the launcher). That is the user's own choice and NOT an empty
-      slot, so it makes no claim.
+    * ``AccessDenied`` — the hub says the key is not ACTIVE for this requester:
+      not declared by any installed module, or not granted to this project
+      (``key_not_active``), or — its ``SecretPaused`` subclass — present but
+      paused in the launcher (the distinct ``key_paused`` code). Each is a
+      launcher-side decision, NOT an empty slot, so it makes no claim.
     * ``KeychainLocked`` — the keychain could not be read at all, so the slot
       may well hold the key. A claim here would invent a finding from a failed
       probe.

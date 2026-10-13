@@ -205,21 +205,22 @@ def test_prior_shape_under_a_user_matcher_is_untouched(os_name: str) -> None:
 # ── v0.2.102: the if-group GREW — an already-reshaped install gains the rules ─
 
 
-#: The six write/chain-side rules v0.2.102 adds to the pre-bash group
-#: (S16-8 production wiring; the v0.2.101 group was the 21
-#: read/search rules).
+#: The eight write/chain-side rules v0.2.102 adds to the pre-bash group
+#: (S16-8 production wiring + W6-Z3's echo/printf redirect writes; the
+#: v0.2.101 group was the 21 read/search rules).
 V02102_NEW_RULES = [
     "Bash(perl *)", "Bash(ruby *)", "Bash(cd *)",
     "Bash(tee *)", "Bash(cp *)", "Bash(mv *)",
+    "Bash(echo *)", "Bash(printf *)",
 ]
 
 
 def _v02101_shaped(os_name: str) -> dict:
     """A settings.json exactly as the v0.2.101 reshape left it: the current
-    template's pre-bash group MINUS the six v0.2.102 rules — i.e. the
+    template's pre-bash group MINUS the eight v0.2.102 rules — i.e. the
     21-rule v0.2.101 shape, in template order. Building it from the live
     template (not a frozen fixture) keeps the 21 pinned to whatever the
-    template ships; the caller asserts the six were actually removed."""
+    template ships; the caller asserts the eight were actually removed."""
     doc = _current(os_name)
     for g in doc["hooks"]["PreToolUse"]:
         if g.get("matcher") == "Bash|PowerShell":
