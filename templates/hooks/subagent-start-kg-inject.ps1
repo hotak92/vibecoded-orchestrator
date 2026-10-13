@@ -46,8 +46,25 @@ try {
     # Empty/malformed stdin -- keep the default
 }
 
+# v0.2.102 W6-C2 (census L2/F7): an agent with its OWN worktree (a
+# worktree-guard record with mode head|snapshot|reservation|
+# reservation_existing) is reconciled from that worktree's git state: skip
+# the shared-tree snapshot. MUST MATCH the .sh sibling.
+$SkipSnapshot = $false
+$WtrecLib = Join-Path $ScriptDir "_lib/worktree-records.ps1"
+if ($AgentId -and (Test-Path -LiteralPath $WtrecLib)) {
+    . $WtrecLib
+    try {
+        $isoRecFile = Find-WtrecRecord $ProjectRoot $AgentId
+        if ($isoRecFile) {
+            $isoRec = Read-WtrecRecord $isoRecFile
+            if ($isoRec -and (@("head", "snapshot", "reservation", "reservation_existing") -contains [string]$isoRec.mode)) { $SkipSnapshot = $true }
+        }
+    } catch { }
+}
+
 # Take the filesystem snapshot. Soft-fail. MUST MATCH the .sh sibling.
-if ($AgentId -and (Get-Command Take-Snapshot -ErrorAction SilentlyContinue)) {
+if (-not $SkipSnapshot -and $AgentId -and (Get-Command Take-Snapshot -ErrorAction SilentlyContinue)) {
     try { Take-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot | Out-Null } catch {}
 }
 

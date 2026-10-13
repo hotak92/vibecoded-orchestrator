@@ -82,7 +82,10 @@ $EditedFile = ""
 # processes DO emit retrieval/sync telemetry — exporting these as env
 # vars (VCT_AGENT_ID / VCT_AGENT_TYPE / VCT_SESSION_ID) lets the
 # canonical emit path attribute those rows to the agent that triggered
-# the write.
+# the write. Readers (v0.2.102 W6-C2, census F15; MUST MATCH the .sh): the
+# debounced kg-sync runner's failure sentinel (VCT_AGENT_ID, per-agent key)
+# and its kg_sync_failures.jsonl row (agent_id + agent_type), which
+# session-start-retrieval-health names when it surfaces the failure.
 $AgentId = ""
 $AgentType = ""
 $SessionIdFromStdin = ""

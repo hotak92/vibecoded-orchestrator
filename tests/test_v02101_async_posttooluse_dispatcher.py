@@ -117,6 +117,14 @@ SUPERSEDED_STEMS = (
 #: the templates AND declared in the retirement table under v0.2.102.
 RETIRED_V02102_STEMS = ("post-file-delete",)
 
+#: Sub-hooks the dispatcher routes that were NEVER a separate async
+#: PostToolUse registration (so no retirement row backs them): new async
+#: PostToolUse work joins the ONE dispatcher instead of adding a second
+#: async registration. v0.2.102 W6-C2 fix round (review R4c-8):
+#: stop-drain-citations re-tags a subagent brief's citations on
+#: PostToolUse:Agent|Task.
+ADDED_SUBHOOK_STEMS = ("stop-drain-citations",)
+
 #: PostToolUse registrations that must stay SYNCHRONOUS and registered
 #: (they deliver stdout envelopes or gate follow-up behaviour the harness
 #: reads in-turn — none of them is part of the async merge).
@@ -340,7 +348,9 @@ def test_route_table_stems_equal_the_v02101_retirement_rows():
         and entry.kind == hr.KIND_HOOK_SCRIPT
         and entry.retired_in == "v0.2.101"
     }
-    routed = {stem for _tool, stem, _gate in _route_table_sh()}
+    routed = {stem for _tool, stem, _gate in _route_table_sh()} - set(ADDED_SUBHOOK_STEMS)
+    assert not (set(ADDED_SUBHOOK_STEMS) & retired), (
+        "an ADDED sub-hook must not also be a retirement")
     assert routed == retired, (
         "dispatcher routing table and the v0.2.101 PostToolUse retirement "
         f"rows disagree:\n  routed but not retired: {sorted(routed - retired)}\n"
@@ -407,6 +417,9 @@ def test_route_table_is_the_pre_v02101_registration_shape():
         },
         ("Read", None): {"kg-update-nudge"},
         ("", None): {"kg-update-nudge"},
+        # v0.2.102 W6-C2 (R4c-8): an ADDED sub-hook, not a pre-v0.2.101 shape.
+        ("Agent", None): {"stop-drain-citations", "kg-update-nudge"},
+        ("Task", None): {"stop-drain-citations", "kg-update-nudge"},
     }
     rows = _route_table_sh()
     for (tool, command), expected in golden.items():

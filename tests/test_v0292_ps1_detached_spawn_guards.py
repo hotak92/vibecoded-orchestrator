@@ -348,11 +348,13 @@ Start-VcoDetachedProcess -FilePath '{child}' `
 
 
 def test_passthru_returns_a_waitable_process(tmp_path):
-    """``subagent-stop-reconcile.ps1`` WAITS on its child (30 s cap).
+    """``-PassThru`` must keep returning a waitable process object.
 
-    Routing it through the shared helper must keep ``-PassThru`` returning the
-    process object, or the wait degrades to "fire and hope" and a kg-sync that
-    hangs is never killed.
+    The helper documents that contract for any caller that needs to wait on
+    (or inspect) its child. (Its first caller, ``subagent-stop-reconcile.ps1``,
+    stopped waiting in v0.2.102 W6-C2: the reconcile now runs detached and
+    routes KG syncs through the debounced runner, so nothing is killed at
+    30 s any more — the contract itself stays pinned here.)
     """
     exe = _require_pwsh()
     child = _stage_child_script(tmp_path, "slow.sh", "sleep 0.3\n")

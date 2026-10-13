@@ -12,22 +12,26 @@
 # row to .claude/logs/subagent-reconciliation.jsonl (the V52-L.2
 # logging-only baseline — preserved exactly).
 #
-# V52-L.1 (v0.2.52): belt-and-suspenders reconciler. Five side effects:
-#   1. JSONL audit log (V52-L.2 baseline; format unchanged).
-#   2. KG sync — for any modified `knowledge/**/*.md` file, queue an
-#      incremental kg-sync run. Best-effort, 30s timeout per file.
+# V52-L.1 (v0.2.52): belt-and-suspenders reconciler. Side effects:
+#   1. JSONL audit log (V52-L.2 baseline; format unchanged). FOREGROUND.
+#   1b. Reap the agent's worktree when it is provably unchanged.
+#   2. KG/docs sync — every changed `knowledge/**` / `docs/**.md` file goes
+#      through `_lib/route-touched-path.sh`, the ONE home for "a file was
+#      touched" (access-matrix gate + per-file debounce + detached runner
+#      with no timeout). v0.2.102 W6-C2 (census L1): it ran
+#      `timeout 30 kg-sync` (and a `sleep 30 && kill -9` fallback) inline,
+#      killing slow-but-working syncs and bypassing the access matrix.
 #   3. Code-graph drain enqueue — for any modified code file, apply the
 #      FIX-A' worktree gate (drop edits in ephemeral/unregistered
 #      worktrees) and append the gated-IN paths to the SESSION-AGNOSTIC
 #      drain queue `.claude/state/codegraph_drain_shared.txt` that the
 #      Stop-hook batched drain (stop-codegraph-drain.{sh,ps1}) consumes.
-#      We never run analyze synchronously (embedding-model init is too
-#      slow) and we never write the old orphan
+#      We never run analyze synchronously and we never write the old orphan
 #      code-graph-queue.jsonl (nothing ever drained it — v0.2.73 HIGH-2).
 #   4. Credential scan — run the shared `_lib/credscan.sh` scanner on
 #      every modified file. On hit, append an entry to
-#      `.claude/logs/credential_alerts.jsonl` with the same schema
-#      post-tool-security.sh uses.
+#      `.claude/logs/credential_alerts.jsonl` (post-tool-security's schema)
+#      AND file it for the PARENT (census F8, below).
 #   5. Subagent work record — bump `subagent_work_units` (+ count/ids) on
 #      the parent session's row in the shared `kg_update_tokens.jsonl`
 #      (metrics dir resolved by `_lib/metrics-dir.sh`; v0.2.92 W7 moved it
@@ -37,22 +41,55 @@
 #      deliberately does NOT read it (owner ruling 2026-10-13: the
 #      main-chat nudge ignores subagent work). Work-unit estimate =
 #      file_count * 50 + total_diff_size_bytes/4 (rough proxy for output
-#      tokens).
+#      tokens). v0.2.102 W6-C2 (census F5): the read-modify-write holds the
+#      SAME sidecar lock (`kg_update_tokens.jsonl.lock`, flock) the nudge
+#      takes, so it can no longer drop a concurrent nudge update.
+#
+# DETACHED (v0.2.102 W6-C2, census F6/L1; owner rulings 2026-10-13: never
+# kill slow-but-working jobs — detach them). The registered SubagentStop
+# timeout was 2 s, while the snapshot diff alone measured ~1.4 s, plus the
+# reap's `git status --ignored` / `git worktree remove` and the kg-sync. A
+# kill mid-run lost Steps 3-5 and could leave a half-removed worktree. Now the
+# FOREGROUND only parses the payload, writes the audit row and hands the
+# payload (via a 0600 job file under .claude/state) to ONE detached run of
+# this same script (`--job <file>`; setsid → nohup → `&`, the
+# stop-codegraph-drain `_drain_spawn_detached` discipline, data as argv
+# only). That job does steps 1b-5 and Layer 3b with no harness deadline.
+# `VCO_SUBAGENT_RECONCILE_INLINE=1` runs the job in the foreground instead
+# (diagnostics; the test suite pins it for determinism).
+#
+# ATTRIBUTION (v0.2.102 W6-C2, census F7). An agent that ran in its OWN
+# worktree (a worktree-guard record with mode head|snapshot|reservation*)
+# is reconciled from THAT worktree's git state (`wtrec_changed_files`):
+# exact attribution, and the files were missed entirely before (the shared-
+# tree snapshot never walks `.claude/worktrees/`). Those files are only
+# credential-scanned: their KG/code-graph indexing happens when the work is
+# merged into the main tree. Every other agent is reconciled from the
+# shared-tree snapshot diff, which ALSO sees edits the parent or a sibling
+# lane made meanwhile — so that diff is recorded as
+# `attribution: unattributed_shared_tree` (the per-call PostToolUse hooks
+# already attribute every Edit/Write the agent made as it happened).
+#
+# PARENT ALERTS (v0.2.102 W6-C2, census F8). A kept worktree, a worktree
+# violation and a credential hit are also filed for the PARENT under
+# .claude/state/agent_alerts_<sid>__<agent>.jsonl (vco_lib/agent_alerts.py);
+# agent-alerts-deliver surfaces them on the parent's PostToolUse(Agent) or
+# next prompt. Never via SubagentStop context: that keeps the subagent
+# running. (The stderr lines below remain for an inline/diagnostic run.)
 #
 # File-modification discovery (V52-L.1 spec, Option 2):
 #   - SubagentStart hook (subagent-start-kg-inject.sh) writes a
 #     SHA-256 snapshot of watched paths to
-#     `.claude/state/subagent-snapshot-<agent_id>.json`.
+#     `.claude/state/subagent-snapshot-<agent_id>.json` — for a NON-isolated
+#     agent only (an isolated one is reconciled from its worktree).
 #   - This hook diffs against the snapshot to identify modified files.
 #   - When the snapshot is missing (SubagentStart hook not installed,
-#     state dir wiped, etc.), the reconciler degrades to logging-only
-#     and exits without doing any of the new side effects.
+#     state dir wiped, etc.), the reconciler degrades to logging-only.
 #
 # Soft-fail contract: every step is wrapped to never raise. The hook
 # MUST exit 0 even when every side effect fails — the subagent has
 # already terminated, so blocking on this hook would only hurt the
-# user. Performance budget: <2s in the happy path (no modifications),
-# <10s with modifications.
+# user.
 
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
@@ -100,7 +137,33 @@ CG_DRAIN_SHARED="$STATE_DIR/codegraph_drain_shared.txt"
 mkdir -p "$LOG_DIR" 2>/dev/null || exit 0
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
-HOOK_STDIN=$(cat 2>/dev/null || echo "")
+# --job <file>: the DETACHED half (spawned below). The payload rides a 0600
+# job file — never argv (it is the harness payload; R31 discipline).
+JOB_FILE=""
+if [ "${1:-}" = "--job" ] && [ -n "${2:-}" ]; then
+    JOB_FILE="$2"
+fi
+if [ -n "$JOB_FILE" ]; then
+    # Only a job file this hook writes is read (and then deleted): a plain
+    # file named subagent-reconcile-job.*.json directly in $STATE_DIR. Any
+    # other path on argv (a manual run, a diagnostic) is refused, so --job
+    # can never read or delete an arbitrary file (review R4c-9).
+    case "$JOB_FILE" in
+        "$STATE_DIR"/subagent-reconcile-job.*.json) ;;
+        *) echo "subagent-stop-reconcile: --job accepts only $STATE_DIR/subagent-reconcile-job.*.json; ignored: $JOB_FILE" >&2
+           exit 0 ;;
+    esac
+    case "${JOB_FILE#"$STATE_DIR"/}" in
+        */*) echo "subagent-stop-reconcile: --job path not directly in $STATE_DIR; ignored" >&2; exit 0 ;;
+    esac
+    if [ -L "$JOB_FILE" ] || [ ! -f "$JOB_FILE" ]; then
+        exit 0
+    fi
+    HOOK_STDIN=$(cat "$JOB_FILE" 2>/dev/null || echo "")
+    rm -f "$JOB_FILE" 2>/dev/null || true
+else
+    HOOK_STDIN=$(cat 2>/dev/null || echo "")
+fi
 [ -z "$HOOK_STDIN" ] && exit 0
 
 # Parse the SubagentStop payload — we need agent_id + session_id +
@@ -162,6 +225,108 @@ STOP_REASON="$(printf '%s' "$PARSED" | sed -n '5p')"
 ISO_FLAG="$(printf '%s' "$PARSED" | sed -n '6p')"
 ISO_CWD="$(printf '%s' "$PARSED" | sed -n '7p')"
 
+# Step 1 (preserved from V52-L.2): emit the audit row — FOREGROUND only
+# (the detached job re-parses the payload but never writes a second row).
+# Build the JSONL line in Python so every field is properly escaped.
+JSONL=$(SESSION_ID_FOR_PY="$SESSION_ID" \
+        AGENT_ID_FOR_PY="$AGENT_ID" \
+        AGENT_TYPE_FOR_PY="$AGENT_TYPE" \
+        TRANSCRIPT_FOR_PY="$TRANSCRIPT_PATH" \
+        STOP_REASON_FOR_PY="$STOP_REASON" \
+        "$PY" -c '
+import json, os, sys
+from datetime import datetime, timezone
+sys.stdout.write(json.dumps({
+    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "session_id": os.environ.get("SESSION_ID_FOR_PY", ""),
+    "agent_id": os.environ.get("AGENT_ID_FOR_PY", ""),
+    "agent_type": os.environ.get("AGENT_TYPE_FOR_PY", ""),
+    "transcript_path": os.environ.get("TRANSCRIPT_FOR_PY", ""),
+    "stop_reason": os.environ.get("STOP_REASON_FOR_PY", ""),
+}))
+' 2>/dev/null)
+if [ -n "$JSONL" ] && [ -z "$JOB_FILE" ]; then
+    printf '%s\n' "$JSONL" >> "$LOG_FILE" 2>/dev/null || true
+fi
+
+
+# ---------------------------------------------------------------------------
+# DETACH (v0.2.102 W6-C2, census F6/L1): everything below runs in ONE
+# detached job — no harness deadline can kill the diff, the reap or a sync.
+# ---------------------------------------------------------------------------
+_vco_reconcile_inline() {
+    case "${VCO_SUBAGENT_RECONCILE_INLINE:-}" in
+        1|true|TRUE|True|yes|YES|Yes|on|ON|On) return 0 ;;
+    esac
+    return 1
+}
+if [ -z "$JOB_FILE" ] && ! _vco_reconcile_inline; then
+    # Nothing below can act without an agent id (reap, snapshot, alerts).
+    [ -n "$AGENT_ID" ] || exit 0
+    # A job file whose job never started (spawn failed, machine went down)
+    # is garbage after a day; a younger one may still be about to be read.
+    find "$STATE_DIR" -maxdepth 1 -type f -name 'subagent-reconcile-job.*.json' \
+        -mtime +0 -delete 2>/dev/null || true
+    _SAFE_JOB_ID="$(printf '%s' "$AGENT_ID" | tr -c 'a-zA-Z0-9_-' '_' | head -c 64)"
+    JOB="$STATE_DIR/subagent-reconcile-job.${_SAFE_JOB_ID}.$$.json"
+    # The job's own output goes to a per-job log (never the hook's stdout /
+    # stderr: a child holding those keeps the harness's pipe open until the
+    # job ends, which is not detached at all). Per job, so concurrent jobs
+    # never share a file; swept after a week. A failure the job reports on
+    # stderr (an alert it could not file) is kept there.
+    JOB_LOG_DIR="$LOG_DIR/subagent-reconcile-jobs"
+    mkdir -p "$JOB_LOG_DIR" 2>/dev/null || JOB_LOG_DIR=""
+    JOB_OUT=/dev/null
+    JOB_ERR=/dev/null
+    if [ -n "$JOB_LOG_DIR" ]; then
+        find "$JOB_LOG_DIR" -maxdepth 1 -type f -name 'job.*' -mtime +6 -delete 2>/dev/null || true
+        JOB_OUT="$JOB_LOG_DIR/job.${_SAFE_JOB_ID}.$$.out"
+        JOB_ERR="$JOB_LOG_DIR/job.${_SAFE_JOB_ID}.$$.err"
+    fi
+    if ( umask 077; printf '%s' "$HOOK_STDIN" > "$JOB" ) 2>/dev/null; then
+        if command -v setsid >/dev/null 2>&1; then
+            CLAUDE_PROJECT_DIR="$PROJECT_ROOT" setsid bash "$SCRIPT_DIR/subagent-stop-reconcile.sh" \
+                --job "$JOB" >"$JOB_OUT" 2>"$JOB_ERR" < /dev/null &
+        elif command -v nohup >/dev/null 2>&1; then
+            CLAUDE_PROJECT_DIR="$PROJECT_ROOT" nohup bash "$SCRIPT_DIR/subagent-stop-reconcile.sh" \
+                --job "$JOB" >"$JOB_OUT" 2>"$JOB_ERR" < /dev/null &
+            disown 2>/dev/null || true
+        else
+            ( CLAUDE_PROJECT_DIR="$PROJECT_ROOT" bash "$SCRIPT_DIR/subagent-stop-reconcile.sh" \
+                --job "$JOB" ) >"$JOB_OUT" 2>"$JOB_ERR" < /dev/null &
+        fi
+    fi
+    exit 0
+fi
+
+# ---- the job (detached; inline under VCO_SUBAGENT_RECONCILE_INLINE) ------
+# shellcheck source=_lib/session-id.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
+
+# File one PARENT-facing alert (census F8). $1 kind, $2 message, $3 optional
+# file. One writer: _lib/agent-alerts.sh -> python -m vco_lib.agent_alerts
+# append (row format + locking live there; review R4c-2/R4c-3). No-op for no
+# agent. When the alert cannot be filed (broken install: no VCO venv) it is
+# never dropped silently: stderr, plus a desktop notification carrying the
+# alert itself, since a detached job's stderr reaches nobody.
+# shellcheck source=_lib/agent-alerts.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/agent-alerts.sh" ] && . "$SCRIPT_DIR/_lib/agent-alerts.sh"
+_reconcile_parent_alert() {
+    [ -n "$AGENT_ID" ] || return 0
+    if command -v vco_agent_alert_append >/dev/null 2>&1 && \
+        vco_agent_alert_append "$SCRIPT_DIR" "$PROJECT_ROOT" "$SESSION_ID" "$AGENT_ID" \
+            "$AGENT_TYPE" "$1" "$2" "${3:-}"; then
+        return 0
+    fi
+    echo "subagent-stop-reconcile: alert NOT delivered to the parent: $2" >&2
+    if [ -n "${PY:-}" ] && [ -f "$PROJECT_ROOT/.claude/scripts/notify.py" ]; then
+        "$PY" "$PROJECT_ROOT/.claude/scripts/notify.py" \
+            "VCO: subagent alert NOT delivered (broken install)" "$2" \
+            --urgency critical --icon dialog-warning 2>/dev/null || true
+    fi
+    return 1
+}
+
 # v0.2.102 W6-R: the live SubagentStop payload carries none of the isolation
 # fields parsed above, so on its own ISO_FLAG never becomes 1 and Layer 3b
 # could never fire. Derive it the way subagent-start-isolation-check does,
@@ -183,35 +348,15 @@ if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
         case "$(wtrec_get "$ISO_REC" mode)" in
             # reservation*: a lane-reservation worktree in the target repo
             # (v0.2.102 W6-AA) — isolated too.
-            head|snapshot|reservation|reservation_existing) ISO_FLAG=0 ;;
+            head|snapshot|reservation|reservation_existing)
+                ISO_FLAG=0
+                # W6-C2 F7: this agent worked in its OWN worktree.
+                AGENT_WT_ISOLATED=1 ;;
         esac
     elif wtrec_isolation_skipped "$PROJECT_ROOT" "$AGENT_ID" "$AGENT_TYPE"; then
         ISO_FLAG=1
         ISO_CWD=""
     fi
-fi
-
-# Step 1 (preserved from V52-L.2): emit the audit row.
-# Build the JSONL line in Python so every field is properly escaped.
-JSONL=$(SESSION_ID_FOR_PY="$SESSION_ID" \
-        AGENT_ID_FOR_PY="$AGENT_ID" \
-        AGENT_TYPE_FOR_PY="$AGENT_TYPE" \
-        TRANSCRIPT_FOR_PY="$TRANSCRIPT_PATH" \
-        STOP_REASON_FOR_PY="$STOP_REASON" \
-        "$PY" -c '
-import json, os, sys
-from datetime import datetime, timezone
-sys.stdout.write(json.dumps({
-    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "session_id": os.environ.get("SESSION_ID_FOR_PY", ""),
-    "agent_id": os.environ.get("AGENT_ID_FOR_PY", ""),
-    "agent_type": os.environ.get("AGENT_TYPE_FOR_PY", ""),
-    "transcript_path": os.environ.get("TRANSCRIPT_FOR_PY", ""),
-    "stop_reason": os.environ.get("STOP_REASON_FOR_PY", ""),
-}))
-' 2>/dev/null)
-if [ -n "$JSONL" ]; then
-    printf '%s\n' "$JSONL" >> "$LOG_FILE" 2>/dev/null || true
 fi
 
 # Step 1b (v0.2.102 W6-Q follow-up): reap the agent's worktree when it is
@@ -248,34 +393,52 @@ with open(e["OUT_FOR_PY"], "a", encoding="utf-8") as fh:
         if [ "$REAP_DECISION" = "kept" ]; then
             printf 'subagent-stop-reconcile: worktree of agent %s KEPT at %s (%s) - review, merge or remove it\n' \
                 "$AGENT_ID" "$REAP_PATH" "$REAP_REASON" >&2
+            # census F8: SubagentStop stderr on exit 0 reaches no model —
+            # file it for the PARENT, which must review/merge/remove it.
+            _reconcile_parent_alert worktree_kept \
+                "worktree KEPT at $REAP_PATH ($REAP_REASON): review its changes, then merge or remove it" \
+                "$REAP_PATH"
         fi
     fi
 fi
 
 # ---------------------------------------------------------------------------
-# Steps 2-5 (V52-L.1 reconciler): only when we have a usable AGENT_ID
-# AND the snapshot helper sourced successfully. Otherwise short-circuit
-# silently to logging-only mode.
+# Steps 2-5 (V52-L.1 reconciler): only with a usable AGENT_ID. W6-C2 F7: the
+# changed-file set comes from the agent's OWN worktree when it had one,
+# else from the shared-tree snapshot diff (unattributed).
 # ---------------------------------------------------------------------------
-if [ -z "$AGENT_ID" ] || ! command -v diff_snapshot >/dev/null 2>&1; then
-    exit 0
-fi
+[ -n "$AGENT_ID" ] || exit 0
 
 SNAP_FILE="$STATE_DIR/subagent-snapshot-$(printf '%s' "$AGENT_ID" | tr -c 'a-zA-Z0-9_-' '_' | head -c 64).json"
-[ ! -f "$SNAP_FILE" ] && exit 0
-
-# Compute the diff. The diff function emits one relative path per line.
 # Cap to MAX_DIFF_FILES to protect against runaway scans on a subagent
 # that touched thousands of files (rare but possible — e.g. an agent
 # that did a tree-wide formatter pass). Default 500 files; tunable via
 # VCT_SUBAGENT_MAX_DIFF env var.
 MAX_DIFF_FILES="${VCT_SUBAGENT_MAX_DIFF:-500}"
 
-CHANGED_FILES=$(diff_snapshot "$AGENT_ID" "$PROJECT_ROOT" "$STATE_DIR" 2>/dev/null \
-    | head -n "$MAX_DIFF_FILES")
+ATTRIBUTION=""
+CHANGED_FILES=""    # project-relative (shared tree) — Layer 3b lists these
+CHANGED_ABS=""      # absolute, one per line — every step below reads these
+if [ "${AGENT_WT_ISOLATED:-0}" = "1" ] && command -v wtrec_changed_files >/dev/null 2>&1; then
+    ATTRIBUTION="agent_worktree"
+    CHANGED_ABS="$(wtrec_changed_files "$PROJECT_ROOT" "$AGENT_ID" 2>/dev/null | head -n "$MAX_DIFF_FILES")"
+    # A snapshot from an older SubagentStart is not this agent's evidence.
+    if command -v cleanup_snapshot >/dev/null 2>&1; then
+        cleanup_snapshot "$AGENT_ID" "$PROJECT_ROOT" "$STATE_DIR" 2>/dev/null || true
+    fi
+else
+    if ! command -v diff_snapshot >/dev/null 2>&1 || [ ! -f "$SNAP_FILE" ]; then
+        exit 0
+    fi
+    ATTRIBUTION="unattributed_shared_tree"
+    CHANGED_FILES=$(diff_snapshot "$AGENT_ID" "$PROJECT_ROOT" "$STATE_DIR" 2>/dev/null \
+        | head -n "$MAX_DIFF_FILES")
+    CHANGED_ABS="$(printf '%s\n' "$CHANGED_FILES" | sed '/^$/d' | while IFS= read -r _rel; do
+        printf '%s/%s\n' "$PROJECT_ROOT" "$_rel"; done)"
+fi
 
 # Quick exit when nothing changed — happy path. Cleanup + exit.
-if [ -z "$CHANGED_FILES" ]; then
+if [ -z "$CHANGED_ABS" ]; then
     if command -v cleanup_snapshot >/dev/null 2>&1; then
         cleanup_snapshot "$AGENT_ID" "$PROJECT_ROOT" "$STATE_DIR" 2>/dev/null || true
     fi
@@ -288,18 +451,17 @@ fi
 # step 5.
 FILE_COUNT=0
 TOTAL_BYTES=0
-KG_FILES=()
-CODE_FILES=()
-ALL_FILES=()
+KG_FILES=()     # absolute; shared tree only (knowledge/** and docs/**.md)
+CODE_FILES=()   # project-relative; shared tree only
+ALL_FILES=()    # absolute; every changed file (credential scan)
 
 # Code-file extension set (mirrors snapshot.sh's _SNAPSHOT_CODE_EXTS_DEFAULT).
 # Used here to classify which queue/sync path each modified file lands in.
 _CODE_EXT_RE='\.(py|rs|ts|tsx|js|jsx|go|java|cs|c|cpp|h|hpp|rb|php|swift|kt|scala|sh|ps1|sql)$'
 
-while IFS= read -r rel; do
-    [ -z "$rel" ] && continue
+while IFS= read -r abs; do
+    [ -z "$abs" ] && continue
     FILE_COUNT=$((FILE_COUNT + 1))
-    abs="$PROJECT_ROOT/$rel"
     # Compute file size for the nudge weight; missing/deleted files
     # contribute 0 bytes (which is the correct accounting — deletion is
     # also a work signal, but a small one).
@@ -307,51 +469,66 @@ while IFS= read -r rel; do
         sz=$(stat -c '%s' "$abs" 2>/dev/null || stat -f '%z' "$abs" 2>/dev/null || echo "0")
         TOTAL_BYTES=$((TOTAL_BYTES + ${sz:-0}))
     fi
-    ALL_FILES+=("$rel")
-    # Classify: knowledge/**/*.md → KG-sync, code-extension → code-
-    # graph queue. A file can in principle land in both (rare); the
-    # two queues are independent. Use regex rather than case-glob so
-    # the rule is consistent regardless of bash globstar setting.
-    if printf '%s' "$rel" | grep -qE '^knowledge/.*\.md$'; then
-        KG_FILES+=("$rel")
+    ALL_FILES+=("$abs")
+    # Indexing happens for SHARED-TREE files only: a worktree agent's files
+    # reach the KG / code graph when its work is merged (and the FIX-A' gate
+    # drops ephemeral-worktree edits anyway).
+    [ "$ATTRIBUTION" = "agent_worktree" ] && continue
+    rel="${abs#"$PROJECT_ROOT"/}"
+    # Classify: knowledge/** or docs/**.md → KG/docs sync, code-extension →
+    # code-graph queue. Regex rather than case-glob so the rule is consistent
+    # regardless of bash globstar setting.
+    if printf '%s' "$rel" | grep -qE '^knowledge/.*\.md$|^docs/.*\.md$'; then
+        KG_FILES+=("$abs")
     fi
     if printf '%s' "$rel" | grep -qE "$_CODE_EXT_RE"; then
         CODE_FILES+=("$rel")
     fi
-done <<EOF
-$CHANGED_FILES
-EOF
+done <<CHANGEDEOF
+$CHANGED_ABS
+CHANGEDEOF
 
-# -------------------- Step 2: KG sync --------------------
-# For each modified knowledge/**/*.md file: queue a kg-sync run. We
-# use the per-project script at `.claude/scripts/kg-sync` when
-# available (the canonical entry point that auto-activates the right
-# venv) and fall back to the orchestrator's bundled wrapper otherwise.
-# Each invocation gets a 30s timeout; if kg-sync doesn't exist we no-op.
-KG_SYNC_SCRIPT=""
-if [ -x "$PROJECT_ROOT/.claude/scripts/kg-sync" ]; then
-    KG_SYNC_SCRIPT="$PROJECT_ROOT/.claude/scripts/kg-sync"
-fi
+# Reconciliation row: what was found and HOW it is attributed (census F7).
+# Its own log, so the V52-L.2 audit log keeps exactly one row per stop.
+FILES_LOG="$LOG_DIR/subagent-reconcile-files.jsonl"
+FILES_FOR_PY="$CHANGED_ABS" AGENT_ID_FOR_PY="$AGENT_ID" SESSION_ID_FOR_PY="$SESSION_ID" \
+AGENT_TYPE_FOR_PY="$AGENT_TYPE" ATTR_FOR_PY="$ATTRIBUTION" "$PY" -c '
+import json, os, sys
+from datetime import datetime, timezone
+e = os.environ
+files = [f for f in e.get("FILES_FOR_PY", "").splitlines() if f.strip()]
+sys.stdout.write(json.dumps({
+    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "event": "reconciled", "session_id": e.get("SESSION_ID_FOR_PY", ""),
+    "agent_id": e.get("AGENT_ID_FOR_PY", ""), "agent_type": e.get("AGENT_TYPE_FOR_PY", ""),
+    "attribution": e.get("ATTR_FOR_PY", ""), "file_count": len(files),
+    "changed_files": files[:50]}) + "\n")
+' >> "$FILES_LOG" 2>/dev/null || true
 
-if [ -n "$KG_SYNC_SCRIPT" ] && [ "${#KG_FILES[@]}" -gt 0 ]; then
-    for kf in "${KG_FILES[@]}"; do
-        kf_abs="$PROJECT_ROOT/$kf"
-        # The kg-sync script accepts a file path or `--all`. We pass
-        # the absolute path; soft-fail on timeout / error. Run in the
-        # background with a wait+kill timeout so we don't accumulate
-        # 30s-per-file if many files changed. The launcher's batch
-        # sync will catch anything we miss.
-        # `timeout` may not be on PATH on minimal busybox — fall back
-        # to a backgrounded process with manual kill.
-        if command -v timeout >/dev/null 2>&1; then
-            timeout 30 "$KG_SYNC_SCRIPT" "$kf_abs" >/dev/null 2>&1 || true
-        else
-            ( "$KG_SYNC_SCRIPT" "$kf_abs" >/dev/null 2>&1 ) &
-            local_pid=$!
-            ( sleep 30 && kill -9 "$local_pid" 2>/dev/null ) &
-            wait "$local_pid" 2>/dev/null || true
-        fi
-    done
+# -------------------- Step 2: KG / docs sync --------------------
+# Every changed knowledge/** / docs/**.md file goes through the ONE routing
+# home (_lib/route-touched-path.sh): the access-matrix gate, the per-file
+# debounce and the detached runner (no timeout — a slow sync finishes).
+# The subagent's identity is exported so a failed sync's once-per-session
+# sentinel and its failure row are attributed to it (census F15/F16).
+if [ "${#KG_FILES[@]}" -gt 0 ]; then
+    if [ -f "$SCRIPT_DIR/_lib/route-touched-path.sh" ]; then
+        # shellcheck source=_lib/route-touched-path.sh disable=SC1091
+        . "$SCRIPT_DIR/_lib/route-touched-path.sh"
+        export VCT_AGENT_ID="$AGENT_ID"
+        [ -n "$AGENT_TYPE" ] && export VCT_AGENT_TYPE="$AGENT_TYPE"
+        [ -n "$SESSION_ID" ] && export VCT_SESSION_ID="$SESSION_ID"
+        vco_route_init "$SCRIPT_DIR" "$PROJECT_ROOT" "$PY"
+        for kf in "${KG_FILES[@]}"; do
+            vco_route_touched_path "$kf" "$SESSION_ID"
+        done
+        cd "$PROJECT_ROOT" 2>/dev/null || true
+    else
+        # A missing routing lib is a BROKEN install, not "nothing to sync":
+        # record it where the reconciliation is recorded.
+        printf '{"event":"kg_sync_skipped","reason":"_lib/route-touched-path.sh missing","agent_id":"%s"}\n' \
+            "$(printf '%s' "$AGENT_ID" | tr -c 'a-zA-Z0-9_-' '_')" >> "$FILES_LOG" 2>/dev/null || true
+    fi
 fi
 
 # -------------------- Step 3: Code-graph drain enqueue --------------------
@@ -438,8 +615,7 @@ fi
 # security.sh so existing consumers (the launcher Security tab) see
 # the alerts without needing schema-aware code.
 if command -v scan_file_for_credentials >/dev/null 2>&1 && [ "${#ALL_FILES[@]}" -gt 0 ]; then
-    for f in "${ALL_FILES[@]}"; do
-        abs="$PROJECT_ROOT/$f"
+    for abs in "${ALL_FILES[@]}"; do
         # Skip deleted files (they cannot have credentials anymore;
         # the file-existence check inside scan_file_for_credentials
         # already short-circuits, but skipping early saves the call).
@@ -452,6 +628,7 @@ if command -v scan_file_for_credentials >/dev/null 2>&1 && [ "${#ALL_FILES[@]}" 
                           AGENT_ID_FOR_PY="$AGENT_ID" \
                           AGENT_TYPE_FOR_PY="$AGENT_TYPE" \
                           SOURCE_FOR_PY="subagent_stop_reconciler" \
+                          ATTR_FOR_PY="$ATTRIBUTION" \
                           "$PY" -c '
 import json, os, sys
 from datetime import datetime, timezone
@@ -463,11 +640,16 @@ sys.stdout.write(json.dumps({
     "agent_id": os.environ.get("AGENT_ID_FOR_PY", ""),
     "agent_type": os.environ.get("AGENT_TYPE_FOR_PY", ""),
     "source": os.environ.get("SOURCE_FOR_PY", "subagent_stop_reconciler"),
+    "attribution": os.environ.get("ATTR_FOR_PY", ""),
 }))
 ' 2>/dev/null)
             if [ -n "$JSONL_ALERT" ]; then
                 printf '%s\n' "$JSONL_ALERT" >> "$ALERT_LOG" 2>/dev/null || true
             fi
+            # census F8: the PARENT must hear about it (pattern NAMES only).
+            _reconcile_parent_alert credential \
+                "possible credential in ${abs#"$PROJECT_ROOT"/} (patterns: ${hits//|/ }; found by the SubagentStop scan, $ATTRIBUTION): review it before committing" \
+                "$abs"
         fi
     done
 fi
@@ -517,6 +699,11 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 
+try:
+    import fcntl
+except ImportError:  # no flock on this platform: proceed unlocked
+    fcntl = None
+
 session_id = os.environ.get("SESSION_ID_FOR_PY", "")
 nudge_path = os.environ.get("NUDGE_FILE_FOR_PY", "")
 try:
@@ -538,6 +725,19 @@ if not session_id or not nudge_path or work_units <= 0:
 # carrying just the subagent contribution. The main-chat nudge does not
 # read the subagent_* fields (owner ruling 2026-10-13); they wait for the
 # per-subagent nudge scheduled for v0.2.103.
+# W6-C2 (census F5): hold the SAME stable sidecar lock kg-update-nudge.sh
+# takes (flock on kg_update_tokens.jsonl.lock) for the whole read-modify-
+# write — unlocked, this rewrite could drop a concurrent nudge update of
+# baseline / fired_once (a background completion fires UserPromptSubmit right
+# around SubagentStop). Lock unavailable → best-effort unlocked, like the nudge.
+_lock_fd = None
+if fcntl is not None:
+    try:
+        _lock_fd = os.open(nudge_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX)
+    except OSError:
+        _lock_fd = None
+
 rows = []
 existing = None
 try:
@@ -609,9 +809,15 @@ try:
             os.unlink(tmp)
         except OSError:
             pass
-        sys.exit(0)
 except OSError:
-    sys.exit(0)
+    pass
+finally:
+    if _lock_fd is not None:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            os.close(_lock_fd)
+        except OSError:
+            pass
 ' 2>/dev/null || true
 fi
 
@@ -704,6 +910,7 @@ except OSError:
     pass
 ' 2>/dev/null || true
         printf 'subagent-stop-reconcile: WORKTREE VIOLATION — %s\n' "$REASON" >&2
+        _reconcile_parent_alert worktree_violation "WORKTREE VIOLATION: $REASON"
     fi
 fi
 

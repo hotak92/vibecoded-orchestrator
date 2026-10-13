@@ -60,7 +60,9 @@ def _has_pwsh() -> bool:
 #: composing — that ordering is part of the contract), so the shell/ps1
 #: legs' internal re-sanitise must be a no-op on these inputs.
 KEY_FIXTURES = [
-    ("sess-1", "ag_2", "sess-1__ag_2"),
+    ("sess-1", "ag-2", "sess-1__ag-2"),
+    # v0.2.102 W6-C2 (R1 C1): "_" is outside the agent charset -> own bucket.
+    ("sess-1", "ag_2", "sess-1__default"),
     ("sess-1", "", "sess-1"),
     ("sess-1", "hostile/id!", "sess-1__default"),
     # Untrustworthy session id passes through UNCHANGED (never a shared
@@ -155,7 +157,10 @@ class TestBudgetCaps:
         assert turn_budget_chars(True) == SUBAGENT_PER_TURN_BUDGET_CHARS
 
     def test_agent_id_sanitisation(self) -> None:
-        assert sanitize_agent_id("lane-1_X") == "lane-1_X"
+        assert sanitize_agent_id("lane-1X") == "lane-1X"
+        # v0.2.102 W6-C2 (R1 C1): "_" is outside the agent charset, so the
+        # composite <sid>__<agent> key decodes uniquely.
+        assert sanitize_agent_id("lane-1_X") == "default"
         assert sanitize_agent_id("") == ""
         assert sanitize_agent_id("bad/id") == "default"
 

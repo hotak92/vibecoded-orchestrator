@@ -110,9 +110,10 @@ vco_hook_fast_session_id() {
 #   main agent (no agent_id)   → <sid>
 #   subagent (agent_id set)    → <sid>__<agent_id>
 # Policy (identical in all three legs — see the comments in each):
-#   * the agent id is sanitised with the SAME allow-list as the session id
-#     ([A-Za-z0-9_-]); hostile → the literal "default" component (its OWN
-#     bucket, never the main store, never raw bytes in a file name);
+#   * the agent id is sanitised with the session allow-list MINUS "_"
+#     ([A-Za-z0-9-], v0.2.102 W6-C2: keeps the composite decodable); hostile
+#     → the literal "default" component (its OWN bucket, never the main
+#     store, never raw bytes in a file name);
 #   * an untrustworthy session id ("" / "default") passes through UNCHANGED —
 #     composing "default__<agent>" would re-create the cross-session bleed
 #     the seen-store's inject-blind guard exists to prevent.
@@ -120,15 +121,18 @@ vco_hook_fast_session_id() {
 # / Get-VcoHookAgentKey) and vco_lib/hook_agent_key.py — parity pinned by
 # tests/test_v02102_w6c1_agent_keyed_hook_state.py.
 
-# vco_hook_sanitize_agent_id: same guard as vco_hook_sanitize_session_id, for
-# the agent component. Empty stays empty; anything outside [A-Za-z0-9_-]
-# collapses to "default".
+# vco_hook_sanitize_agent_id: the agent component's guard. Allow-list
+# [A-Za-z0-9-] -- the session charset MINUS "_" (v0.2.102 W6-C2, review R1
+# C1): with "_" allowed on both sides, ("a__b","c") and ("a","b__c") composed
+# the same key. Without it the composite decodes uniquely (agent = text after
+# the last "_"). Real agent ids are hex, so real keys are unchanged. Empty
+# stays empty; anything else (an "_" included) collapses to "default".
 vco_hook_sanitize_agent_id() {
     local raw="$1"
     [ -n "$raw" ] || { printf '%s' ""; return 0; }
     case "$raw" in
-        *[!a-zA-Z0-9_-]*) printf '%s' "default" ;;
-        *)                printf '%s' "$raw" ;;
+        *[!a-zA-Z0-9-]*) printf '%s' "default" ;;
+        *)               printf '%s' "$raw" ;;
     esac
 }
 
@@ -146,6 +150,24 @@ vco_hook_agent_key_from_ids() {
         return 0
     fi
     printf '%s' "${sid}__${agent}"
+}
+
+# vco_hook_fast_agent_key <hook-stdin-json>
+# The pattern-way (no JSON parser) per-agent key, for the injection wrappers'
+# once-per-session broken-install notices: they key their sentinel BEFORE any
+# interpreter runs, and the notice must work when a lib is missing. Same
+# extraction discipline as vco_hook_fast_session_id; the agent value is
+# sanitised by vco_hook_agent_key_from_ids (hostile -> "default").
+# v0.2.102 W6-C2 (C1 residual): a subagent's notice used to consume the
+# parent's session sentinel. MUST MATCH session-id.ps1 Get-VcoHookFastAgentKey.
+vco_hook_fast_agent_key() {
+    local sid agent
+    sid="$(vco_hook_fast_session_id "${1:-}")"
+    agent="$(printf '%s' "${1:-}" \
+        | grep -Eo '"agent_id"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | head -n 1 \
+        | sed 's/.*"\([^"]*\)"$/\1/')"
+    vco_hook_agent_key_from_ids "$sid" "$agent"
 }
 
 # vco_hook_agent_key <hook-stdin-json>

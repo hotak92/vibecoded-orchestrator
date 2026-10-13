@@ -548,6 +548,34 @@ RETIRED_REGISTRATIONS: Tuple[RetiredRegistration, ...] = (
         ),
         group_matcher="resume",
     ),
+    # v0.2.102 W6-C2 (census F9): `subagent-start-suggest` read the agent's
+    # launch prompt from the SubagentStart payload, which carries only
+    # session_id / agent_id / agent_type (probe 2026-10-13, Claude Code
+    # 2.1.285) — it exited on an empty prompt at every launch, so its
+    # promised suggestions never reached any subagent. SUPERSEDED: the same
+    # keyword matcher now runs on the PreToolUse(Agent) side, where the
+    # brief exists, and its suggestions ride the agent brief's
+    # `updatedInput` (hook_context_router.py, `agent` surface). The scripts
+    # no longer ship, so the registration would invoke a deleted file.
+    *(
+        RetiredRegistration(
+            event="SubagentStart",
+            kind=KIND_HOOK_SCRIPT,
+            target=f"subagent-start-suggest.{ext}",
+            reason=(
+                "the SubagentStart payload carries no launch prompt, so the "
+                "hook never produced a suggestion; the script no longer "
+                "ships"
+            ),
+            retired_in="v0.2.102",
+            replacement=(
+                "agent-brief-kg-inject (PreToolUse Agent|Task): the context "
+                "router appends the keyword matcher's agent/skill "
+                "suggestions to the brief it rewrites"
+            ),
+        )
+        for ext in ("sh", "ps1")
+    ),
 )
 
 
@@ -767,6 +795,47 @@ def _v02102_reshape_rows() -> Tuple[PriorShippedShape, ...]:
         ("ps1", 'powershell -NoProfile -ExecutionPolicy Bypass -File '
                 '"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/{script}"'),
     )
+    # v0.2.102 W6-C2 (census L1/L2/L5; owner ruling 2026-10-13 "never kill
+    # slow-but-working jobs"): three registrations whose explicit timeout
+    # could kill real work. The templates now carry NO timeout for them, so
+    # the harness default applies:
+    #   * subagent-stop-reconcile (SubagentStop, 2 s): the foreground now
+    #     only parses + hands the work to a detached job, but a 2 s bound
+    #     had killed the diff/reap/sync mid-run;
+    #   * subagent-start-kg-inject (SubagentStart, 5 s): the synchronous
+    #     shared-tree snapshot (up to 50 000 files) must finish before the
+    #     agent's first edit — a kill left the reconciler log-only;
+    #   * pre-compact-save (PreCompact, 5 s; group matcher `auto` before
+    #     W6-D's widening to `*`): `git status` + the recent-file walk on a
+    #     very large repository.
+    timeout_rows = (
+        ("SubagentStop", "", "subagent-stop-reconcile", 2, "through v0.2.101",
+         "a 2 s harness timeout killed the reconcile (snapshot diff, worktree "
+         "reap, KG sync) mid-run, losing its later steps and able to leave a "
+         "half-removed worktree"),
+        ("SubagentStart", "", "subagent-start-kg-inject", 5, "through v0.2.101",
+         "a 5 s harness timeout could kill the synchronous shared-tree "
+         "snapshot on a large tree or slow disk, leaving the SubagentStop "
+         "reconciler without its baseline"),
+        ("PreCompact", "auto", "pre-compact-save", 5, "through v0.2.101",
+         "a 5 s harness timeout could kill the pre-compaction snapshot "
+         "(`git status` + the recent-file walk) on a very large repository"),
+    )
+    for ext, cmd_fmt in flavours:
+        for event, matcher, stem, old_timeout, shipped, why in timeout_rows:
+            script = f"{stem}.{ext}"
+            rows.append(PriorShippedShape(
+                event=event, matcher=matcher, target=script,
+                command_key=hook_command_key(cmd_fmt.format(script=script)),
+                fields=(("timeout", old_timeout), ("type", "command")),
+                shipped=shipped,
+                retired_in="v0.2.102",
+                reason=why,
+                replacement=(
+                    f"the current template's {script} registration ({event}, "
+                    f"no explicit timeout: the harness default applies)"
+                ),
+            ))
     for ext, cmd_fmt in flavours:
         script = f"worktree-guard.{ext}"
         rows.append(PriorShippedShape(

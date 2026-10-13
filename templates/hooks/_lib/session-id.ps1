@@ -88,9 +88,10 @@ function Get-VcoHookFastSessionId {
 #   main agent (no agent_id)   -> <sid>
 #   subagent (agent_id set)    -> <sid>__<agent_id>
 # Policy (identical in all three legs):
-#   * the agent id is sanitised with the SAME allow-list as the session id
-#     ([A-Za-z0-9_-]); hostile -> the literal "default" component (its OWN
-#     bucket, never the main store, never raw bytes in a file name);
+#   * the agent id is sanitised with the session allow-list MINUS "_"
+#     ([A-Za-z0-9-], v0.2.102 W6-C2: keeps the composite decodable); hostile
+#     -> the literal "default" component (its OWN bucket, never the main
+#     store, never raw bytes in a file name);
 #   * an untrustworthy session id ("" / "default") passes through UNCHANGED --
 #     composing "default__<agent>" would re-create the cross-session bleed
 #     the seen-store's inject-blind guard exists to prevent.
@@ -99,13 +100,14 @@ function Get-VcoHookFastSessionId {
 # vco_lib/hook_agent_key.py -- parity pinned by
 # tests/test_v02102_w6c1_agent_keyed_hook_state.py.
 
-# Get-VcoSanitizedAgentId: same guard as Get-VcoSanitizedSessionId, for the
-# agent component. Empty stays empty; anything outside [A-Za-z0-9_-]
-# collapses to "default".
+# Get-VcoSanitizedAgentId: the agent component's guard. Allow-list
+# [A-Za-z0-9-] -- the session charset MINUS "_" (v0.2.102 W6-C2, review R1
+# C1), so the composite key decodes uniquely. Empty stays empty; anything
+# else (an "_" included) collapses to "default". MUST MATCH session-id.sh.
 function Get-VcoSanitizedAgentId {
     param([string]$Raw)
     if (-not $Raw) { return "" }
-    if ($Raw -match '[^A-Za-z0-9_-]') { return "default" }
+    if ($Raw -cmatch '[^A-Za-z0-9-]') { return "default" }
     return $Raw
 }
 
@@ -119,6 +121,19 @@ function Get-VcoAgentKeyFromIds {
     $agent = Get-VcoSanitizedAgentId -Raw $AgentId
     if (-not $agent -or -not $sid -or $sid -eq "default") { return $sid }
     return "${sid}__${agent}"
+}
+
+# Get-VcoHookFastAgentKey -HookStdin <HookStdin>
+# The pattern-way per-agent key for the injection wrappers' broken-install
+# notice sentinels (no JSON parse; must work when a lib is missing).
+# v0.2.102 W6-C2 (C1 residual). MUST MATCH session-id.sh
+# vco_hook_fast_agent_key.
+function Get-VcoHookFastAgentKey {
+    param([string]$HookStdin)
+    $sid = Get-VcoHookFastSessionId -HookStdin $HookStdin
+    $agent = ""
+    if ($HookStdin -and ($HookStdin -match '"agent_id"\s*:\s*"([^"]*)"')) { $agent = $Matches[1] }
+    return (Get-VcoAgentKeyFromIds -SessionId $sid -AgentId $agent)
 }
 
 # Get-VcoHookAgentKey -Stdin <HookStdin>

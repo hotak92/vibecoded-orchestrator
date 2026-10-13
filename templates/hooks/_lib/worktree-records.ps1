@@ -197,6 +197,43 @@ function Remove-WtrecStale([string]$root) {
     } catch { }
 }
 
+# Get-WtrecChangedFiles ROOT ID -- v0.2.102 W6-C2 (census F7): the ABSOLUTE
+# paths of the files the agent changed in ITS OWN worktree (uncommitted +
+# committed since the recorded base). Exact attribution, unlike the shared-
+# tree snapshot diff. Empty when there is no record or the worktree is gone.
+# Read-only. MUST MATCH wtrec_changed_files in the .sh.
+function Get-WtrecChangedFiles([string]$root, [string]$id) {
+    $file = Find-WtrecRecord $root $id
+    if (-not $file) { return @() }
+    $rec = Read-WtrecRecord $file
+    if (-not $rec) { return @() }
+    $path = [string]$rec.path
+    $base = [string]$rec.base
+    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Container)) { return @() }
+    $rels = New-Object System.Collections.Generic.List[string]
+    # NUL-separated (-z): porcelain QUOTES a path with a space even under
+    # core.quotepath=off (review R4c-7). Every -z entry is `XY <path>`; a
+    # rename/copy (R/C) is followed by its ORIGIN path (skipped).
+    try {
+        $raw = (@(& git -C $path status --porcelain -z --untracked-files=all 2>$null) -join "`n")
+        $skip = $false
+        foreach ($e in ($raw -split "`0")) {
+            if ($skip) { $skip = $false; continue }
+            if (-not $e -or $e.Length -lt 4) { continue }
+            if ($e[0] -eq 'R' -or $e[0] -eq 'C') { $skip = $true }
+            $rels.Add($e.Substring(3))
+        }
+        if ($base) {
+            $raw = (@(& git -C $path diff --name-only -z $base HEAD 2>$null) -join "`n")
+            foreach ($e in ($raw -split "`0")) {
+                if ($e) { $rels.Add([string]$e) }
+            }
+        }
+    } catch { }
+    $out = @($rels | Sort-Object -Unique -CaseSensitive | ForEach-Object { "$path/$_" })
+    return $out
+}
+
 # Remove-WtrecLanesParent: after the reap removed a lane reservation's
 # worktree, remove its now-EMPTY parent `<R>.vco-lanes` (the path convention
 # of vco_lib/lane_reservation.py: sibling of R's toplevel). Empty-only, never

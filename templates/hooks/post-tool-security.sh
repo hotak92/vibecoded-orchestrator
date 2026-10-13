@@ -201,6 +201,23 @@ sys.stdout.write(json.dumps({
     if [ -n "$JSONL" ]; then
         printf '%s\n' "$JSONL" >> "$ALERT_LOG" 2>/dev/null || true
     fi
+    # v0.2.102 W6-C2 (census F8): on a SUBAGENT's edit the additionalContext
+    # below reaches only the subagent. File the alert for the PARENT too —
+    # agent-alerts-deliver hands it over when the agent returns. One writer
+    # (fix round, review R4c-2/R4c-3): _lib/agent-alerts.sh -> python -m
+    # vco_lib.agent_alerts append, which owns the path, the row format and
+    # the lock. Main-chat edits file nothing. A failure is never silent: the
+    # helper says so on stderr and the envelope below tells the subagent.
+    _PTS_PARENT_FAIL=""
+    if [ -n "$AGENT_ID" ]; then
+        # shellcheck source=_lib/agent-alerts.sh disable=SC1091
+        [ -f "$SCRIPT_DIR/_lib/agent-alerts.sh" ] && . "$SCRIPT_DIR/_lib/agent-alerts.sh"
+        if ! command -v vco_agent_alert_append >/dev/null 2>&1 || \
+            ! vco_agent_alert_append "$SCRIPT_DIR" "$PROJECT_ROOT" "$SESSION_ID" "$AGENT_ID" \
+                "$AGENT_TYPE" credential "$MSG (review it before committing)" "$REL_FILE"; then
+            _PTS_PARENT_FAIL=1
+        fi
+    fi
     # Cross-platform notification (Linux/macOS/Windows). See audit F2.
     # v0.2.82: desktop-toast DEDUP — the SAME (file, findings) alert notifies
     # at most once per 6h window. Forensics are NOT rate-limited: the JSONL
@@ -236,6 +253,11 @@ text this edit introduced (or on a line it changed) in ${REL_FILE}. If it is
 a deliberate test placeholder, mark its line with the comment
 \`${CSHAPES_TEST_PLACEHOLDER_MARKER:-}\`; if it leaked from real input, redact
 it before any further git operations or external sharing."
+    if [ -n "$_PTS_PARENT_FAIL" ]; then
+        REMINDER="${REMINDER}
+This alert could NOT be filed for your parent agent (the VCO venv is not
+resolvable: a broken VCO install). Repeat it in your final report."
+    fi
     if command -v emit_additional_context >/dev/null 2>&1; then
         emit_additional_context "$REMINDER" PostToolUse
     fi

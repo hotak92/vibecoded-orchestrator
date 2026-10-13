@@ -279,6 +279,7 @@ export const ASYNC_SUBHOOK_STEMS: readonly string[] = [
   'kg-summary-generator',
   'post-bash-context-record',
   'post-git-commit-kg-sync',
+  'stop-drain-citations',
   'kg-update-nudge',
 ];
 
@@ -288,6 +289,8 @@ export const ASYNC_SUBHOOK_DESCRIPTIONS: Record<string, string> = {
   'kg-summary-generator': 'KG node summary refresh after knowledge edits and node writes',
   'post-bash-context-record': 'Bash outcome telemetry paired with the pre-bash injection',
   'post-git-commit-kg-sync': 'Background KG review agent after a git commit',
+  'stop-drain-citations':
+    'RL: hand the KG citations of a subagent brief to that subagent, so they are scored against its answer',
   'kg-update-nudge': 'Per-tool-call work-unit bookkeeping behind the KG-write nudge',
 };
 

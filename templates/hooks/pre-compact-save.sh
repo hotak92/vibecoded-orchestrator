@@ -52,6 +52,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_lib/find-python.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 
+# v0.2.102 W6-C2: a SUBAGENT's compaction must not touch the MAIN chat's
+# snapshot or its last-compact marker. Whether PreCompact fires for a
+# subagent's auto-compaction is UNVERIFIED (census, probe 2026-10-13); if it
+# does, its payload carries agent_id like every other subagent event, and
+# the snapshot below (re-injected by the main chat's SessionStart(compact),
+# which never fires for a subagent) would overwrite the parent's with no
+# reader for it. So: agent_id present -> nothing to save. Correct whether or
+# not the harness fires the event. MUST MATCH pre-compact-save.ps1.
+if [ -n "${PY:-}" ] && printf '%s' "$HOOK_STDIN" | "$PY" -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and d.get("agent_id") else 1)
+' 2>/dev/null; then
+    exit 0
+fi
+
 {
     echo "# Pre-Compaction Snapshot"
     echo "Saved: $(date -Iseconds)"

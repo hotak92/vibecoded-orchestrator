@@ -592,19 +592,32 @@ def _budget_charge(path: Optional[str], chars: int) -> None:
         pass
 
 
+#: v0.2.102 W6-C2 (review R1 C2): age past which a ``warm_leg_*`` claim file
+#: is garbage. The claim is only meaningful for ``_WARM_LEG_CLAIM_TTL_S``
+#: (300 s); a week is far past any warmer that could still own it.
+WARM_LEG_GC_AGE_S = 7 * 24 * 3600.0
+
+
 def _budget_gc(project_root: str) -> None:
-    """ opportunistic 1-day GC of budget files (bounded scan)."""
+    """Opportunistic GC of the router's small state files (bounded scan):
+    per-turn budget files after 1 day, and the L4 leg-warmer's
+    ``warm_leg_*`` claim files after a week — :func:`vco_lib.atomic.claim_once`
+    leaves a claim on disk by design, so without this sweep one file per
+    distinct missed cache key accumulated forever (review R1 C2)."""
     if not project_root:
         return
+    now = time.time()
     try:
         state = Path(project_root) / ".claude" / "state"
-        cutoff = time.time() - BUDGET_GC_AGE_S
-        for f in list(state.glob("inject_budget_*"))[:200]:
-            try:
-                if f.is_file() and f.stat().st_mtime < cutoff:
-                    f.unlink()
-            except OSError:
-                continue
+        for pattern, max_age in (("inject_budget_*", BUDGET_GC_AGE_S),
+                                 ("warm_leg_*", WARM_LEG_GC_AGE_S)):
+            cutoff = now - max_age
+            for f in list(state.glob(pattern))[:200]:
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                except OSError:
+                    continue
     except OSError:
         pass
 
@@ -1182,20 +1195,125 @@ def _strip_stamp_lines(text: str) -> str:
                    if not ln.startswith("CODE-REV:"))
 
 
-def _emit_agent(tool_input: Dict, prompt: str, kg_text: str) -> str:
+def _emit_agent(tool_input: Dict, prompt: str, kg_text: str,
+                suggest_text: str = "") -> str:
     """The agent envelope: EVERY original tool_input field echoed verbatim,
     only `prompt` modified, NO permissionDecision (never auto-approve).
     Budget degradation already happened upstream (the per-block titles
-    degrade) — this function must not re-transform the text."""
+    degrade) — this function must not re-transform the text. v0.2.102
+    W6-C2 (census F9): the keyword matcher's agent/skill suggestions ride
+    the SAME envelope (one PreToolUse hook, one ``updatedInput``)."""
     updated = dict(tool_input)  # JSON round-trip preserves unknown fields
+    text = prompt
     injected = kg_text.strip()
-    updated["prompt"] = f"{prompt}\n\n[KG context for this task]:\n{injected}"
+    if injected:
+        text += f"\n\n[KG context for this task]:\n{injected}"
+    suggested = suggest_text.strip()
+    if suggested:
+        text += f"\n\n[Agent/skill suggestions for this task]:\n{suggested}"
+    updated["prompt"] = text
     return json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "updatedInput": updated,
         }
     }, ensure_ascii=False)
+
+
+# --- W6-C2 (census F9): agent/skill suggestions for a subagent's brief ------
+
+#: The shared keyword matcher (one home with the UserPromptSubmit
+#: suggestions, agent-skill-keyword-suggest.{sh,ps1}).
+_KEYWORD_MATCHER = "agent-skill-keyword-match.py"
+
+
+def _resolve_keyword_matcher(project_root: str) -> Optional[Path]:
+    """The project's installed matcher first, the orchestrator's template
+    copy second (the same chain the shell wrappers use)."""
+    for cand in (Path(project_root) / ".claude" / "scripts" / _KEYWORD_MATCHER,
+                 _HERE.parent.parent / "templates" / "scripts" / _KEYWORD_MATCHER):
+        if project_root and cand.is_file():
+            return cand
+    return None
+
+
+def _definition_tools(project_root: str, agent_type: str) -> Optional[List[str]]:
+    """The ``tools:`` list of the agent definition named ``agent_type`` (its
+    ``name`` frontmatter, else file stem) in the project's then the user's
+    agents dir — ``None`` when the definition is unknown or declares no
+    ``tools:`` (it then inherits every tool)."""
+    if not agent_type:
+        return None
+    from vco_lib.paths import claude_user_dir
+
+    roots = [Path(project_root) / ".claude" / "agents", claude_user_dir() / "agents"]
+    for root in roots:
+        try:
+            files = sorted(root.glob("*.md"))
+        except OSError:
+            continue
+        for path in files:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            front: Dict[str, str] = {}
+            if text.startswith("---"):
+                end = text.find("\n---", 3)
+                for line in text[3:end if end > 0 else 0].splitlines():
+                    m = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$", line)
+                    if m:
+                        front[m.group(1)] = m.group(2).strip("\"'")
+            if front.get("name", path.stem) != agent_type:
+                continue
+            raw = front.get("tools", "")
+            if not raw:
+                return None
+            return [t for t in re.split(r"[\s,\[\]]+", raw) if t]
+    return None
+
+
+def _agent_suggestions(payload: Dict, project_root: str) -> str:
+    """Agent/skill suggestions for the subagent being launched, from its
+    brief. SubagentStart carries no launch prompt (probe 2026-10-13), so
+    this is the only place the brief and the subagent type both exist.
+
+    Agents are suggested only when the subagent can spawn one (its
+    definition's ``tools:`` lists Agent/Task, or declares no list — it then
+    inherits every tool; an unknown type over-suggests, the retired hook's
+    rule). Workflows are main-loop only. NO per-session dedupe: the reader
+    is a fresh context that has seen none of the parent's suggestions (the
+    F10 rule the KG half follows). Soft-fail to ""."""
+    tool_input = payload.get("tool_input") or {}
+    prompt = str(tool_input.get("prompt") or "")
+    if not prompt.strip() or not project_root:
+        return ""
+    matcher = _resolve_keyword_matcher(project_root)
+    if matcher is None:
+        return ""
+    try:
+        mod = _hds._load_cg_module(matcher)
+        root = Path(project_root)
+        tools = _definition_tools(project_root, str(tool_input.get("subagent_type") or ""))
+        may_spawn = tools is None or any(t.lower() in ("agent", "task") for t in tools)
+        agents = mod.collect_agents(root) if may_spawn else []
+        skills = mod.collect_skills(root)
+        hit_agents = [(n, sd) for n, kw, sd in agents if mod.any_match(kw, prompt)]
+        hit_skills = [(n, sd) for n, kw, sd in skills if mod.any_match(kw, prompt)]
+        return str(mod.format_suggestion(hit_agents, hit_skills, []) or "")
+    except Exception:  # noqa: BLE001 — a suggestion must never break the brief
+        return ""
+
+
+def _emit_agent_suggestions_only(payload: Dict, suggest_text: str) -> int:
+    """The agent surface's exit when no KG block survived: the suggestions
+    alone still ride the envelope (when there is a real ``prompt`` field to
+    append to — the router never synthesizes one)."""
+    tool_input = payload.get("tool_input") or {}
+    if suggest_text.strip() and "prompt" in tool_input:
+        print(_emit_agent(tool_input, str(tool_input.get("prompt") or ""), "",
+                          suggest_text))
+    return 0
 
 
 # --- W3R-10: the staged citation ctx must match what reached the transcript --
@@ -1578,8 +1696,31 @@ def _main(argv: List[str]) -> int:
     # the "default" sentinel — rather empty than a fake-key cohort.
     if sid and sid != "default":
         os.environ.setdefault("VCT_SESSION_ID", sid)
+    # v0.2.102 W6-C2 (census F12): the KG leg stages its pending citation in
+    # THIS process (and the L4 warmer inherits this env), and
+    # citation_pending.stage_pending reads VCT_AGENT_ID to tag the file —
+    # so the drain scores a subagent's retrieval against the SUBAGENT's
+    # transcript (SubagentStop's agent_transcript_path), never the parent's.
+    # Set from the payload on every run (popped for the main chat), never
+    # inherited from an ambient env.
+    if agent_id:
+        os.environ["VCT_AGENT_ID"] = agent_id
+    else:
+        os.environ.pop("VCT_AGENT_ID", None)
+    # W6-C2 fix round (review R4c-8): the `agent` surface retrieves for a
+    # subagent that does not exist yet (PreToolUse:Agent), so its staged
+    # citation carries the CALLER's tag. Mark it with the Agent call's
+    # tool_use_id; PostToolUse:Agent (stop-drain-citations) re-tags it with
+    # tool_response.agentId (citation_pending.adopt_brief_citations).
+    brief_tuid = str(payload.get("tool_use_id") or "") if surface == "agent" else ""
+    if brief_tuid:
+        os.environ["VCT_BRIEF_TOOL_USE_ID"] = brief_tuid
+    else:
+        os.environ.pop("VCT_BRIEF_TOOL_USE_ID", None)
 
     plan = _PLAN_BUILDERS[surface](payload, cwd)
+    # W6-C2 (census F9): the agent surface also carries keyword suggestions.
+    suggest_text = _agent_suggestions(payload, project_root) if surface == "agent" else ""
 
     if surface in ("edit", "write"):
         _emit_prompt_nudge(payload, state_sid, project_root, prompt_id,
@@ -1600,6 +1741,8 @@ def _main(argv: List[str]) -> int:
 
     if not plan.kg_profile and not plan.cg_profile:
         _write_intent_out()
+        if suggest_text:
+            return _emit_agent_suggestions_only(payload, suggest_text)
         return 0  # MECHANICAL / no recoverable query → no spawn, no event
 
     _budget_gc(project_root)
@@ -1664,6 +1807,8 @@ def _main(argv: List[str]) -> int:
 
     combined = kg_text + ("\n" if kg_text and cg_text else "") + cg_text
     if not combined.strip():
+        if suggest_text:
+            return _emit_agent_suggestions_only(payload, suggest_text)
         return 0
 
     # F1: the seen-store files are keyed by the PER-AGENT state key. F10
@@ -1716,6 +1861,8 @@ def _main(argv: List[str]) -> int:
         # but the staged ctx must not outlive the truth).
         _amend_pending_citations(project_root, sid,
                                  _block_titles(combined), router_run_id)
+        if suggest_text:
+            return _emit_agent_suggestions_only(payload, suggest_text)
         return 0
 
     if cg_text and any(b.startswith("CODE:") for b in out_blocks):
@@ -1737,7 +1884,7 @@ def _main(argv: List[str]) -> int:
         # The agent brief's own bound (≤1 500 chars) was applied inside the
         # producer (KgGate.max_chars); the budget degradation happened in the
         # per-block loop above.
-        print(_emit_agent(tool_input, prompt, final))
+        print(_emit_agent(tool_input, prompt, final, suggest_text))
         return 0
 
     # W3R-10 normal path: the filter's suppressed titles never reached the

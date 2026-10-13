@@ -196,6 +196,25 @@ if ($alerts.Count -gt 0) {
     $line = $entry | ConvertTo-Json -Compress -Depth 5
     try { Add-Content -Path $AlertLog -Value $line -ErrorAction Stop } catch { }
 
+    # v0.2.102 W6-C2 (census F8): on a SUBAGENT's edit the additionalContext
+    # reaches only the subagent -- file the alert for the PARENT too
+    # (agent-alerts-deliver). One writer (fix round, review R4c-2/R4c-3):
+    # _lib/agent-alerts.ps1 -> python -m vco_lib.agent_alerts append, which
+    # owns the path, the row format and the lock. A failure is never silent:
+    # stderr from the helper, and the envelope below tells the subagent.
+    # MUST MATCH the .sh sibling.
+    $parentAlertFailed = $false
+    if ($AgentId) {
+        $alertsLib = Join-Path $PSScriptRoot "_lib/agent-alerts.ps1"
+        if (Test-Path -LiteralPath $alertsLib) { . $alertsLib }
+        if (-not (Get-Command Add-VcoAgentAlert -ErrorAction SilentlyContinue) -or
+            -not (Add-VcoAgentAlert -ScriptDir $PSScriptRoot -ProjectRoot $ProjectRoot -SessionId $SessionId `
+                -AgentId $AgentId -AgentType $AgentType -Kind "credential" `
+                -Message "$msg (review it before committing)" -File $relFile)) {
+            $parentAlertFailed = $true
+        }
+    }
+
     # v0.2.82: desktop-toast DEDUP - same (file, findings) key notifies at
     # most once per 6h. JSONL log + model envelope stay per-event (forensics
     # and agent awareness are never rate-limited — only the human toast).
@@ -241,6 +260,9 @@ if ($alerts.Count -gt 0) {
         $markerText = Get-CredShapesTestPlaceholderMarker
     }
     $reminder = "[Security alert] $msg`nReview the lines named above before continuing: the credential pattern is in`ntext this edit introduced (or on a line it changed) in $relFile. If it is`na deliberate test placeholder, mark its line with the comment`n``$markerText``; if it leaked from real input, redact`nit before any further git operations or external sharing."
+    if ($parentAlertFailed) {
+        $reminder += "`nThis alert could NOT be filed for your parent agent (the VCO venv is not`nresolvable: a broken VCO install). Repeat it in your final report."
+    }
     if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
         Emit-AdditionalContext $reminder PostToolUse
     }

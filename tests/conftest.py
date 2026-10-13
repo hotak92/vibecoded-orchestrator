@@ -401,6 +401,17 @@ if not _ALLOW_REAL_STATE:
         [sys.executable, "-c", 'print(\'{"schema": 1, "rows": {}, "entries": []}\')'])
 
 
+# ─── W6-C2 (v0.2.102): the SubagentStop reconciler runs INLINE under pytest ──
+#
+# In production `subagent-stop-reconcile.{sh,ps1}` hands its work (diff,
+# worktree reap, KG sync, credential scan) to a DETACHED job, so a slow
+# reconcile is never killed by the harness timeout. A test asserting those
+# effects right after the hook returns needs them done by then: every
+# subprocess the suite spawns inherits this documented diagnostic switch. The
+# test that proves the detached spawn deletes it from its own child env.
+os.environ.setdefault("VCO_SUBAGENT_RECONCILE_INLINE", "1")
+
+
 # ─── W-ENDPOINTS (v0.2.97): the machine resolvers answer an unroutable port ──
 #
 # The two pins above cover CLIENTS (they read `WEAVIATE_URL` /

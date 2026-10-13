@@ -77,7 +77,25 @@ AGENT_ID="$PARSED"
 # Take the filesystem snapshot BEFORE anything else. Soft-fail: if the
 # snapshot helper is missing or take_snapshot returns non-zero, the
 # SubagentStop reconciler falls back to logging-only mode.
-if [ -n "$AGENT_ID" ] && command -v take_snapshot >/dev/null 2>&1; then
+# v0.2.102 W6-C2 (census L2/F7): an agent worktree-guard gave its OWN
+# worktree (record mode head|snapshot|reservation|reservation_existing —
+# WorktreeCreate runs before SubagentStart) is reconciled from that
+# worktree's git state, so the shared-tree hash snapshot is neither needed
+# nor its evidence: skip it. That removes the whole synchronous walk (up to
+# 50 000 files) from every isolated launch. The hook carries no explicit
+# registered timeout any more (harness default), so a slow walk for a
+# shared-tree agent finishes instead of being killed. MUST MATCH the .ps1.
+_SKIP_SNAPSHOT=0
+if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
+    # shellcheck source=_lib/worktree-records.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/worktree-records.sh"
+    if _ISO_REC="$(wtrec_find "$PROJECT_ROOT" "$AGENT_ID")"; then
+        case "$(wtrec_get "$_ISO_REC" mode)" in
+            head|snapshot|reservation|reservation_existing) _SKIP_SNAPSHOT=1 ;;
+        esac
+    fi
+fi
+if [ "$_SKIP_SNAPSHOT" = "0" ] && [ -n "$AGENT_ID" ] && command -v take_snapshot >/dev/null 2>&1; then
     # Run in a subshell so any state leakage / `set -e` from sourced
     # helpers cannot escape into the rest of the hook. Synchronous (not
     # backgrounded) so the snapshot cannot race the subagent's first
