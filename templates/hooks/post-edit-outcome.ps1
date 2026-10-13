@@ -4,8 +4,15 @@
 # executes. Emits an edit_outcome event with diff size + whether the
 # file existed before. Pairing strategy: trainer joins on (session_id,
 # file_path, ts_window) since pre-edit's task_id isn't shared via a
-# state file (see .sh sibling for the rationale + future cleanup note).
+# state file (the context router serves many edits from its cache without
+# minting a task_id; see the .sh sibling).
 # v0.2.102: rows also carry agent_id ("" = main chat), as in the .sh.
+# v0.2.102 W6-PCHK: post_check is filled by a detached poller from the
+# checkers' status records (.claude/state/last_compile_status_<pathkey>_
+# <agentkey>.json, written by py-compile-check); a file no checker covers
+# gets no_signal at once; the row is never dropped. Window:
+# VCT_EDIT_POST_CHECK_SECS (default 20). ONE home:
+# vco_lib/edit_post_check.py. MUST MATCH the .sh sibling.
 
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -97,8 +104,12 @@ $NowTsMs = [long][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 
 if ($VenvPy -and (Test-Path $VenvPy)) {
+    # v0.2.102 W6-PCHK: the fields travel as key=value argv items, never
+    # interpolated into the Python source, and never as an empty argv item
+    # (Windows PowerShell 5.1 drops those). The row, the poller and the
+    # sweep live in vco_lib/edit_post_check.py. MUST MATCH the .sh sibling.
     $pyCode = @"
-import os, json, sys, uuid
+import os, sys
 # v0.2.94: pin the project root the hook already resolved for THIS child.
 # A rootless embedding_service._detect_project_root() falls through to
 # Path.cwd() (rule 4) and reconciles THAT directory's deferral ledger,
@@ -109,8 +120,6 @@ import os, json, sys, uuid
 _vco_project_root = r'''$ProjectRoot'''
 if _vco_project_root:
     os.environ.setdefault('KG_BASE_DIR', _vco_project_root)
-task_id = f'edit_outcome_{uuid.uuid4().hex[:8]}'
-
 project_id = None
 try:
     from vco_lib.project_config import resolve_for_project
@@ -118,31 +127,24 @@ try:
     project_id = cfg.get('project_id') if isinstance(cfg, dict) else None
 except Exception:
     pass
-
 try:
     from claude_mcp_servers.rl_client.outcome_emit import emit_outcome_event
-    emit_outcome_event(
-        event_type='edit_outcome',
-        task_id=task_id,
-        task_type='edit_outcome',
-        payload={
-            'tool_name': r'''$ToolName''',
-            'file_path': r'''$FilePath''',
-            'diff_size': $DiffSize,
-            'file_existed_before': bool($FileExistedBefore),
-            'ts_ms': $NowTsMs,
-            'post_check': None,
-            # W6-C2 F13: '' for the main chat, the subagent's id otherwise.
-            'agent_id': r'''$AgentId''',
-        },
-        session_id=r'''$SessionId''',
-        project_id=project_id,
-    )
-except Exception:
-    pass
+    from vco_lib.edit_post_check import record_edit_outcome_from_argv
+except Exception as exc:
+    sys.stderr.write('post-edit-outcome: edit_outcome not recorded, VCO install is broken: %r\n' % (exc,))
+else:
+    try:
+        record_edit_outcome_from_argv(sys.argv[1:], project_root=_vco_project_root, emit=emit_outcome_event, project_id=project_id)
+    except Exception as exc:
+        sys.stderr.write('post-edit-outcome: edit_outcome failed: %r\n' % (exc,))
 "@
+    $pyArgs = @(
+        "tool=$ToolName", "file=$FilePath", "diff=$DiffSize",
+        "existed=$FileExistedBefore", "ts=$NowTsMs", "agent=$AgentId",
+        "session=$SessionId"
+    )
     try {
-        $pyCode | & $VenvPy - 2>$null
+        $pyCode | & $VenvPy - @pyArgs 2>$null
     } catch { }
 }
 

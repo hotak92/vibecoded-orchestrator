@@ -75,6 +75,10 @@ def emit_outcome_event(
                 diff_size (int), file_existed_before (bool), ts_ms (int),
                 post_check (None | dict), agent_id (str: "" for the main
                 chat, the subagent's sanitised id otherwise — v0.2.102).
+                The payload is built ONLY by
+                ``vco_lib.edit_post_check.edit_outcome_payload``; its
+                docstring defines the ``post_check`` values (ok / fail /
+                no_signal dicts, ``None`` when the poller could not run).
               * pre_bash → cmd_len (int), query (str truncated), ts_ms (int).
         session_id: Layer-1 input for session resolution (the 3-layer
             chain in telemetry_emit.resolve_session_id matches).
