@@ -206,9 +206,16 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # online ``/rl_update`` training POST. When ``capture_citations`` is False
     # (local logging off AND no upload AND online training off/absent) spawning
     # it would embed + compute + train + stage for a result nothing reads.
+    # W6-MEM: a search over the concurrent-monitor cap is DEFERRED, never
+    # dropped — ``_spawn_answer_monitor`` returns False, no monitor starts, and
+    # the citation is computed from the pending file staged just below by the
+    # Stop-hook drain (``scripts/rl_drain_citations.drain_session``), the same
+    # backstop that serves every monitor that times out. No running monitor is
+    # ever cancelled to make room.
+    monitor_deferred = False
     if capture_citations and req.spawn_answer_monitor and req.candidates:
         try:
-            _spawn_answer_monitor(task_id, req.query)
+            monitor_deferred = not _spawn_answer_monitor(task_id, req.query)
         except Exception as exc:
             logger.debug("rerank_and_emit: answer monitor spawn failed (%s)", exc)
 
@@ -238,6 +245,9 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
                 session_id=req.session_id,
                 query=req.query,
                 stage_pending_file=True,
+                # W6-MEM: a deferred search has no in-process monitor to read
+                # the in-memory entry; only its pending file is staged.
+                cache_in_memory=not monitor_deferred,
                 # v0.2.71 Sweep-C: carry the dual-log decision + other-slot triple
                 # into the staged ctx so the citation second-event (suffixed task_id)
                 # can be emitted at fire time alongside the active citation.
@@ -835,7 +845,7 @@ def _bump_rl_counter(field: str, reason: "Optional[str]" = None) -> None:
 _WARNED_RL_FALLBACK = False
 
 
-def _spawn_answer_monitor(task_id: str, query: str) -> None:
+def _spawn_answer_monitor(task_id: str, query: str) -> bool:
     """Schedule the citation answer-monitor as a background task.
 
     Lazy-imports ``_rl_answer_monitor`` + the module-level
@@ -846,6 +856,18 @@ def _spawn_answer_monitor(task_id: str, query: str) -> None:
     compaction-sentinel (V52-N) then writes the citation event. We keep
     a strong ref in the module-level set so the GC cannot drop the task
     mid-poll; the done-callback discards on completion.
+
+    W6-MEM: each monitor polls for up to ``_RL_MONITOR_TIMEOUT`` (an hour)
+    and pins its staged ctx, so the number running at once is capped
+    (``memory_bounds.monitor_max_concurrent``, env
+    ``VCO_RL_MONITOR_MAX_CONCURRENT``). At the cap NO running monitor is
+    cancelled (slow-but-working work is never killed); the new search is
+    deferred instead: no task starts, ``False`` is returned, and the caller
+    stages only the durable pending file, which the Stop-hook drain computes.
+    The call counter is advanced either way — the pending file records this
+    search's ``seq``, and the drain uses it as its position tiebreak.
+
+    Returns True when a monitor was started, False when deferred.
     """
     from claude_mcp_servers.weaviate_mcp import server as srv
 
@@ -856,10 +878,22 @@ def _spawn_answer_monitor(task_id: str, query: str) -> None:
     # ``rl_state`` incrementer so the counter has a single authoritative store.
     from claude_mcp_servers.weaviate_mcp import rl_state as _rl_state
 
+    from .memory_bounds import monitor_max_concurrent
+
     seq = _rl_state.next_rl_call_seq()
+    cap = monitor_max_concurrent()
+    live = len(srv._rl_monitor_tasks)  # done-callback discards finished tasks
+    if live >= cap:
+        logger.info(
+            "RL monitor cap reached (%d running, cap %d); citation for %s "
+            "deferred to the Stop-hook drain via its pending file",
+            live, cap, task_id[:8],
+        )
+        return False
     monitor = asyncio.create_task(srv._rl_answer_monitor(task_id, seq, query))
     srv._rl_monitor_tasks.add(monitor)
     monitor.add_done_callback(srv._rl_monitor_tasks.discard)
+    return True
 
 
 def _populate_citation_cache(
@@ -875,6 +909,7 @@ def _populate_citation_cache(
     session_id: Optional[str] = None,
     query: str = "",
     stage_pending_file: bool = False,
+    cache_in_memory: bool = True,
     dual_log: bool = False,
     other_embedding_source: str = "",
     other_embedding_dim: int = 0,
@@ -884,8 +919,15 @@ def _populate_citation_cache(
     """Write the per-task entry the answer monitor reads at citation time.
 
     Same entry shape as the pre-v0.2.52 inline write at
-    ``server.py:4763``. Bounded by ``_RL_NODE_CACHE_MAX``; LRU-ish
-    eviction via insertion-order pop.
+    ``server.py:4763``, stored COMPACTED (W6-MEM): float vectors packed into
+    ``array`` buffers by ``ctx_compact.compact_ctx`` (lossless; the monitor
+    expands before use). Bounded by ``_RL_NODE_CACHE_MAX`` entries AND by
+    ``memory_bounds.node_cache_max_bytes`` estimated bytes; LRU-ish eviction
+    via insertion-order pop. Eviction loses no citation: a running monitor
+    holds its own reference from its first poll, and the pending file below is
+    staged regardless. ``cache_in_memory=False`` (a search whose monitor was
+    deferred by the concurrency cap) skips the in-memory entry — nothing would
+    read it — and stages only the pending file.
 
     F-QUEUE (v0.2.70): when ``stage_pending_file`` is True, ALSO persist the
     ctx to ``.claude/state/rl_pending/<session>__<task_id>.json`` so the
@@ -947,11 +989,8 @@ def _populate_citation_cache(
                     list(other_query_emb) if other_query_emb else None
                 )
                 ctx_dict["other_nodes"] = other_nodes
-        srv._rl_node_content_cache[task_id] = ctx_dict
-        # LRU bound — pop oldest insertion-order entry until size <= max.
-        max_size = getattr(srv, "_RL_NODE_CACHE_MAX", 256)
-        while len(srv._rl_node_content_cache) > max_size:
-            srv._rl_node_content_cache.pop(next(iter(srv._rl_node_content_cache)))
+        if cache_in_memory:
+            _store_compact_ctx(srv, task_id, ctx_dict)
     except Exception as exc:
         logger.debug("_populate_citation_cache: write failed (%s)", exc)
 
@@ -985,6 +1024,56 @@ def _populate_citation_cache(
             )
         except Exception as exc:
             logger.debug("_populate_citation_cache: stage_pending failed (%s)", exc)
+
+
+def _store_compact_ctx(srv: Any, task_id: str, ctx_dict: dict) -> None:
+    """Store ``ctx_dict`` compacted in the citation cache, then enforce bounds.
+
+    W6-MEM: ``rl_state._rl_node_content_cache`` held 256 entries of 5-9 MB of
+    float lists each. Entries are now compacted (``ctx_compact``) and the cache
+    is bounded by estimated BYTES (``memory_bounds.node_cache_max_bytes``) as
+    well as by ``_RL_NODE_CACHE_MAX`` entries. Oldest entries are evicted first;
+    the entry just stored is never evicted (a single oversized ctx still serves
+    its own monitor).
+
+    The per-key sizes live in ONE home, ``rl_state._rl_node_content_cache_sizes``
+    (W6-MEM R3: read there directly, no local fallback). Every writer keeps it
+    in step — this function on store and eviction, the monitor on its pop at
+    fire time — so a store costs one size estimate (the new entry) plus one
+    pass of dict lookups over the at most ``_RL_NODE_CACHE_MAX`` keys to total
+    the bytes; nothing already sized is re-estimated. Keys the ledger has never
+    seen (an entry stored by another path) are sized once and recorded, and
+    ledger keys absent from the cache are pruned only when the ledger is larger
+    than the cache, the one state that can leave stale keys behind.
+    """
+    from claude_mcp_servers.weaviate_mcp import rl_state
+
+    from .ctx_compact import compact_ctx
+    from .memory_bounds import approx_heap_bytes, node_cache_max_bytes
+
+    cache = srv._rl_node_content_cache
+    sizes = rl_state._rl_node_content_cache_sizes
+    compact = compact_ctx(ctx_dict)
+    cache[task_id] = compact
+    sizes[task_id] = approx_heap_bytes(compact)
+    total = 0
+    for key, value in cache.items():
+        size = sizes.get(key)
+        if size is None:
+            size = sizes[key] = approx_heap_bytes(value)
+        total += size
+    if len(sizes) > len(cache):
+        for stale in [k for k in sizes if k not in cache]:
+            del sizes[stale]
+    max_entries = getattr(srv, "_RL_NODE_CACHE_MAX", 256)
+    max_bytes = node_cache_max_bytes()
+    for key in list(cache):
+        if len(cache) <= max_entries and total <= max_bytes:
+            break
+        if key == task_id:
+            continue
+        cache.pop(key, None)
+        total -= sizes.pop(key, 0)
 
 
 def _clamp_unit_score(value: Any) -> float:

@@ -158,10 +158,10 @@ def drain_session(
     if not pending:
         return summary
 
-    # v0.2.73 (Concern-B): shared cached loader (one home with the MCP monitor);
-    # the drain reads once per Stop so the (mtime,size) cache is mostly a miss
-    # here, but routing through the SAME function keeps the parsed-message shape
-    # — and thus the extracted answer window — byte-identical across both paths.
+    # v0.2.73 (Concern-B) / W6-MEM: shared cached loader (one home with the MCP
+    # monitor); the drain is a one-shot process so its cache starts empty, but
+    # routing through the SAME function keeps the (slim) parsed-message shape —
+    # and thus the extracted answer window — byte-identical across both paths.
     messages = load_messages_cached(transcript_path) if transcript_path else []
     kg_positions = find_kg_positions(messages) if messages else []
 
