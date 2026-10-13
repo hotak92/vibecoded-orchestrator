@@ -22,9 +22,10 @@
 #   4. Nothing found -> "". Callers that WRITE skip the write; they never fall
 #      back to the current location.
 #
-# Known, documented difference: Python resolves symlinks (Path.resolve());
-# this file walks the full path as given. Both name the same directory; the
-# parity test compares real paths.
+# Symlinks and junctions: like Python's Path.resolve() and the .sh mirror's
+# `cd -P`, the start dir and both homes are resolved to their real paths
+# (Resolve-VcoPrRealPath) before the walk, so a link above the project cannot
+# hide its marker.
 #
 # Sourced, never executed. Not a hook; not registered in settings.json.
 
@@ -43,6 +44,42 @@ function ConvertTo-VcoPrFullPath {
     return $trimmed
 }
 
+# Resolve-VcoPrRealPath <path> - every symlink/junction in an existing path
+# resolved, component by component (Path.resolve() semantics). A component that
+# cannot be inspected is kept as given; a link loop (>40 hops) returns the
+# unresolved full path.
+function Resolve-VcoPrRealPath {
+    param([string]$Path)
+    $full = ConvertTo-VcoPrFullPath $Path
+    if (-not $full) { return "" }
+    $acc = [System.IO.Path]::GetPathRoot($full)
+    $queue = [System.Collections.Generic.List[string]]::new()
+    foreach ($seg in ($full.Substring($acc.Length) -split '[\\/]')) { if ($seg) { $queue.Add($seg) } }
+    $hops = 0
+    while ($queue.Count -gt 0) {
+        $seg = $queue[0]
+        $queue.RemoveAt(0)
+        $next = Join-Path $acc $seg
+        $item = $null
+        try { $item = Get-Item -LiteralPath $next -Force -ErrorAction Stop } catch { $item = $null }
+        $target = $null
+        if ($item) {
+            if ($item.PSObject.Properties['LinkTarget']) { $target = $item.LinkTarget }
+            if (-not $target -and $item.PSObject.Properties['Target']) { $target = @($item.Target)[0] }
+        }
+        if (-not $target) { $acc = $next; continue }
+        $hops++
+        if ($hops -gt 40) { return $full }
+        if (-not [System.IO.Path]::IsPathRooted($target)) { $target = Join-Path $acc $target }
+        $tfull = ConvertTo-VcoPrFullPath $target
+        if (-not $tfull) { return $full }
+        $acc = [System.IO.Path]::GetPathRoot($tfull)
+        $tsegs = @($tfull.Substring($acc.Length) -split '[\\/]' | Where-Object { $_ })
+        for ($i = $tsegs.Count - 1; $i -ge 0; $i--) { $queue.Insert(0, $tsegs[$i]) }
+    }
+    return (ConvertTo-VcoPrFullPath $acc)
+}
+
 function Get-VcoPrHomes {
     $osHome = [System.Environment]::GetFolderPath('UserProfile')
     if (-not $osHome) { $osHome = $env:HOME }
@@ -53,7 +90,7 @@ function Get-VcoPrHomes {
     $homes = @()
     foreach ($h in @($homeA, $osHome)) {
         if ($h) {
-            $full = ConvertTo-VcoPrFullPath $h
+            $full = Resolve-VcoPrRealPath $h
             if ($full) { $homes += $full }
         }
     }
@@ -65,7 +102,7 @@ function Find-VcoProjectRoot {
     param([string]$Start = "")
     if (-not $Start) { $Start = (Get-Location).Path }
     if (-not (Test-Path -LiteralPath $Start -PathType Container)) { return "" }
-    $dir = ConvertTo-VcoPrFullPath $Start
+    $dir = Resolve-VcoPrRealPath $Start
     if (-not $dir) { return "" }
     $homes = Get-VcoPrHomes
     $cmp = if ($IsWindows -or $env:OS -eq 'Windows_NT') { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }

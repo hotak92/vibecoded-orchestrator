@@ -40,7 +40,6 @@ $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $SessionIdFromStdin = Get-VcoHookSessionId -Stdin $HookStdin
 
-$ContextFile = ".claude/CONTEXT_STATE.md"
 # Snapshot state lives under the project (gitignored .claude/state/) so it
 # survives reboots and launcher restarts — Claude Code's `resume` feature
 # can reuse a session_id across these boundaries, and a $TMPDIR-based path

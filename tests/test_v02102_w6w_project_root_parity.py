@@ -213,3 +213,45 @@ def test_every_mirror_names_its_ssot():
         text = path.read_text(encoding="utf-8")
         assert "vco_lib/project_root.py" in text, path
         assert "MUST MATCH" in text, path
+
+
+@pytest.mark.skipif(PWSH is None, reason="pwsh not on PATH")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("via", ["start", "home"])
+def test_ps1_resolves_symlinks_like_the_ssot(via, tmp_path):
+    """A symlink above the project must not hide its marker from the .ps1 walk.
+
+    ``via=start``: the start dir is given through a link (``link -> real``);
+    Python's Path.resolve() finds ``real/proj``, and so must the .ps1 mirror.
+    ``via=home``: HOME is given through a link to the real home that holds the
+    project's parent — the home boundary must be compared on real paths, so the
+    walk from inside the real home still stops there.
+    """
+    sb = tmp_path / "sb"
+    (sb / "real" / "proj" / ".claude").mkdir(parents=True)
+    (sb / "real" / "proj" / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+    (sb / "real" / "proj" / "a").mkdir()
+    (sb / "link").symlink_to(sb / "real", target_is_directory=True)
+    if via == "start":
+        home, start, want = sb / "home", sb / "link" / "proj" / "a", sb / "real" / "proj"
+        home.mkdir()
+    else:
+        # HOME spelled through the link names the project dir itself, so the
+        # project IS home and must not be accepted as a root.
+        home, start, want = sb / "link" / "proj", sb / "real" / "proj" / "a", None
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CLAUDE_PROJECT_DIR", "VCT_USER_HOME_OVERRIDE", "HOME", "USERPROFILE")}
+    env["HOME"] = str(home)
+    code = ("import sys\nfrom vco_lib.project_root import find_vco_project_root as f\n"
+            "x = f(sys.argv[1])\nprint('' if x is None else x)\n")
+    py = subprocess.run([sys.executable, "-c", code, str(start)], env=child_env(env),
+                        capture_output=True, text=True, timeout=60, cwd=sb)
+    assert py.returncode == 0, py.stderr
+    script = (f". '{PS1_LIB}'; $r = Find-VcoProjectRoot -Start '{start}'; "
+              "[Console]::Out.WriteLine($r)")
+    ps = subprocess.run([PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", script],
+                        env=child_env(env), capture_output=True, text=True, timeout=60, cwd=sb)
+    assert ps.returncode == 0, ps.stderr
+    expected = "" if want is None else os.path.realpath(want)
+    assert py.stdout.strip() == expected
+    assert ps.stdout.strip() == expected, f"ps1 got {ps.stdout.strip()!r}"
