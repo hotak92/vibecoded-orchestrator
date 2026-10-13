@@ -60,6 +60,7 @@ Pieces (each has exactly one home here):
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -541,16 +542,22 @@ def record_edit_outcome_from_argv(argv: Sequence[str], *, project_root: str,
         project_id=project_id)
 
 
+def build_parser() -> argparse.ArgumentParser:
+    """The module's CLI (pinned by tests/test_v0297_vco_lib_argv_contract.py)."""
+    parser = argparse.ArgumentParser(prog="python -m vco_lib.edit_post_check")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    poll = sub.add_parser("poll", help="detached poller: fill post_check for one pending row")
+    poll.add_argument("pending", help="path of the pending row record (.json)")
+    return parser
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) == 2 and args[0] == "poll":
-        try:
-            run_poller(Path(args[1]))
-        except Exception:  # noqa: BLE001 — detached child: nothing to tell
-            return 1
-        return 0
-    print("usage: python -m vco_lib.edit_post_check poll <pending.json>", file=sys.stderr)
-    return 2
+    args = build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    try:
+        run_poller(Path(args.pending))
+    except Exception:  # noqa: BLE001 — detached child: nothing to tell
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
