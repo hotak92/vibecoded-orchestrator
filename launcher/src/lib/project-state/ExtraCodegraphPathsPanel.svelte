@@ -13,7 +13,7 @@
   //
   // Behaviour summary:
   //   - List shown newest-first (added_at DESC).
-  //   - "Add path" → native directory picker → add command.
+  //   - "Add code folder" → native directory picker → add command.
   //   - If add returns disambiguation_required, render the
   //     ExtrasDisambiguationModal so the user picks between access-
   //     matrix grant vs forced add.
@@ -29,6 +29,14 @@
   // Reactive: re-runs `load()` whenever `projectId` changes.
 
   import { onMount, onDestroy } from 'svelte';
+  // v0.2.102 W6-AA: user-visible wording ("Add code folder") lives in one home.
+  import {
+    CODE_FOLDER,
+    disabledTitle,
+    reenabledTitle,
+    removeConfirm,
+    removedTitle,
+  } from './code-folder-labels';
   import { invoke, listen } from '$lib/tauri';
   import { pickDirectory } from '$lib/dialog';
   import { toast } from '$lib/stores/toast';
@@ -266,7 +274,7 @@
     adding = true;
     try {
       const picked = await pickDirectory({
-        title: 'Select extra codegraph folder',
+        title: CODE_FOLDER.pickerTitle,
       });
       if (!picked) return; // user cancelled
       await tryAddPath(picked, false);
@@ -375,8 +383,8 @@
       const pruneStale = !newEnabled;
       await runSyncOp({
         title: newEnabled
-          ? `Re-syncing after re-enabling path`
-          : `Re-syncing ${currentProjectName} codegraph after disabling path`,
+          ? reenabledTitle()
+          : disabledTitle(currentProjectName),
         body: newEnabled
           ? `Re-indexing ${row.path} into the codegraph.`
           : `Removing entries originally sourced from ${row.display_label}.`,
@@ -399,18 +407,14 @@
 
   async function clickRemove(row: ExtraPath) {
     if (rowBusy[row.path]) return;
-    const ok = confirm(
-      `Remove extra path '${row.path}' from this project?\n\n` +
-        `Codegraph entries originally sourced from this folder will be ` +
-        `pruned in the follow-up re-sync.`,
-    );
+    const ok = confirm(removeConfirm(row.path));
     if (!ok) return;
     setRowBusy(row.path, true);
     try {
       await removeExtraPath(projectId, row.path);
       await load();
       await runSyncOp({
-        title: `Re-syncing ${currentProjectName} codegraph after path removal`,
+        title: removedTitle(currentProjectName),
         body: `Removing entries originally sourced from ${row.display_label}.`,
         pillPath: row.path,
         op: () => reindexAfterExtrasChange(projectId, true),
@@ -435,35 +439,27 @@
 <section class="ps-section extras-panel">
   <header class="extras-panel-head">
     <div>
-      <h4>Extra codegraph paths</h4>
-      <p class="ps-form-hint">
-        Index additional folders into this project's codegraph without
-        making them launcher projects. Useful for read-only reference
-        clones (e.g. a sibling git repo you want to query alongside your
-        own code). Edits to files in these folders are auto-indexed.
-        Symlinks are resolved on add — paths show their real on-disk
-        location.
-      </p>
+      <h4>{CODE_FOLDER.heading}</h4>
+      <p class="ps-form-hint">{CODE_FOLDER.help}</p>
+      <p class="ps-form-hint">{CODE_FOLDER.details}</p>
     </div>
     <button
       type="button"
       class="ps-btn-primary"
       onclick={clickAddPath}
       disabled={loading || adding}
-      aria-label="Add a new extra codegraph path"
+      aria-label={CODE_FOLDER.addAria}
     >
-      {adding ? 'Picking…' : 'Add path'}
+      {adding ? CODE_FOLDER.addButtonBusy : CODE_FOLDER.addButton}
     </button>
   </header>
 
   {#if loading}
     <p class="extras-loading">Loading paths…</p>
   {:else if rows.length === 0}
-    <p class="extras-empty">
-      No extra paths added. Click "Add path" to index a reference folder.
-    </p>
+    <p class="extras-empty">{CODE_FOLDER.empty}</p>
   {:else}
-    <ul class="extras-list" aria-label="Extra codegraph paths">
+    <ul class="extras-list" aria-label={CODE_FOLDER.listAria}>
       {#each rows as row (row.path)}
         {@const busy = !!rowBusy[row.path]}
         {@const staleBadge = extraPathStaleBadge(row)}
@@ -474,7 +470,7 @@
               {#if !row.enabled}
                 <span
                   class="extras-row-badge"
-                  aria-label="This path is currently disabled"
+                  aria-label={CODE_FOLDER.disabledAria}
                 >
                   disabled
                 </span>

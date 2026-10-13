@@ -164,6 +164,21 @@ treat the window itself as unknown, because it is not.
 
 {{/if_module_active}}
 
+## Parallel agents on the same git repo
+
+When 2+ agents edit the same working tree, either give each one an isolated git worktree (Agent-tool `isolation: "worktree"`) OR assign strictly disjoint file sets and forbid ALL git commands in their briefs (the coordinator runs git): concurrent `git checkout` / `stash` / staging operations are tree-global and clobber each other.
+
+**Isolated agents in another repo (lane reservations)**: an `isolation: "worktree"` agent normally gets a detached worktree of THIS project's repo at HEAD. When a lane's work belongs in another repo — this project itself on a chosen branch, or one of its enabled code folders (launcher: Identity tab → **Add code folder**) — reserve the worktree first, then dispatch the isolated agent:
+
+1. `python -m vco_lib.lane_reservation reserve --project <this project> --repo <repo> --base <commit> --branch <new-branch>` — prints a reservation id (`--id` to choose one, `--existing-path` to adopt a worktree of that repo you already created on that branch; `list` / `cancel --id` manage pending ones). The repo must be the project itself or an ENABLED code folder, checked through the launcher hub — with the hub down, reservations are refused (ordinary isolation is unaffected).
+2. Put the id in the lane's brief and dispatch **one isolated agent per message**: `worktree-guard` hands the OLDEST pending reservation to the next isolated launch, creating `<repo parent>/<repo name>.vco-lanes/<branch>-<id>` with `git worktree add -b <branch> … <base>`. A reservation expires after 15 minutes unused; one that fails validation at launch aborts the launch with the reason, never falling back to a worktree of this project.
+3. The agent is told its reservation id, worktree, repo, branch and base when it starts, and stops if its brief names a different id.
+4. Review the result. When the agent finishes, a worktree with changes or commits is KEPT for you to review and merge; an unchanged one is removed together with its new branch. An adopted (`--existing-path`) worktree is never removed.
+
+The harness holds only Edit/Write to the worktree — **Bash is not confined** — so the brief must keep every Bash command (`cd`, redirects, `git`) inside the worktree path.
+
+---
+
 ## VCO-Managed Files
 
 This project's `.claude/hooks/`, `.claude/scripts/`, `.claude/agents/`, `.claude/skills/`, and `.claude/settings.json` are shipped by VCO (the orchestrator). To update them, use the launcher (this project's Settings page → **Update bundle**, or the Projects page → **⟳ Update all** for every project — Update all skips the orchestrator root when its bundle is already current, while this project's own Update bundle always runs) or run from the orchestrator root:

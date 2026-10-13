@@ -475,9 +475,9 @@ KG and code graph look similar on the surface (both are per-project Weaviate col
 | **Shared collection auto-merged on read** | **YES** — unconditional, via `SHARED_KG_COLLECTION`                   | **NO** — there is no `SHARED_CODE_GRAPH_COLLECTION`; the concept doesn't exist                                                   |
 | Cross-project read via access matrix      | `VCT_KG_ACCESS_LIST` env, resolved from `kg_collection_access` table  | `VCT_CODE_GRAPH_ACCESS_LIST` env, resolved from `codegraph_access` table (**separate table**, separate launcher GUI surface)     |
 | Cross-project write                       | `store_knowledge_node(scope="shared", ...)`                           | N/A — code graph is analyzer-generated, not user-authored                                                                        |
-| Custom paths into your own collection     | N/A (KG is markdown nodes, not source-walked)                         | YES — `project_codegraph_extra_paths` lets you add e.g. a public-repo clone to your private project's code graph                 |
+| Custom paths into your own collection     | N/A (KG is markdown nodes, not source-walked)                         | YES — "Add code folder" (`project_codegraph_extra_paths`) adds e.g. a public-repo clone to your private project's code graph; isolated subagents may also get worktrees there (lane reservations) |
 | Backing tables (launcher.db)              | per-project KG class + `VibeCodedOrchestrator_KnowledgeGraph` (shared) | `project_codegraph_bindings` (per-project) + `codegraph_access` (matrix) + `project_codegraph_extra_paths` (path injection)      |
-| GUI surface                               | Identity tab → KG access matrix                                       | Codegraph page → CrossProjectAccessTab + ExtraCodegraphPathsPanel                                                                |
+| GUI surface                               | Identity tab → KG access matrix                                       | Codegraph page → CrossProjectAccessTab + Identity tab → "Add code folder" (ExtraCodegraphPathsPanel)                            |
 
 **Why the asymmetry?** Knowledge graph nodes are intentionally cross-project value: a pattern you learned debugging one app is almost certainly useful in another app on the same machine. So the shared KG (`VibeCodedOrchestrator_KnowledgeGraph` by default) is auto-merged into every `hybrid_search` / `semantic_graph_search` call across all projects on this install — read access is unconditional, no opt-in required. The cost (a few extra results in your search output) is much smaller than the cost of missing a relevant pattern you wrote yesterday in a different project.
 
@@ -550,6 +550,15 @@ Output: Where to save
 ```
 
 **Parallel agents on the same git repo**: when spawning 2+ agents that will edit the same working tree, either give each one an isolated git worktree (Agent-tool `isolation: "worktree"`, or instruct the agent to `git worktree add` and work there) OR assign strictly disjoint file sets and forbid ALL git commands in their briefs (the coordinator runs git). Concurrent `git checkout` / `stash` / staging operations are tree-global and clobber each other — that is the failure the rule prevents. The cap of 3 concurrent agents applies to agents that EDIT the same tree; read-only agents (audits, searches) and agents on different repos may fan out wider.
+
+**Isolated agents in another repo (lane reservations)**: an `isolation: "worktree"` agent normally gets a detached worktree of THIS project's repo at HEAD. When a lane's work belongs in another repo — this project itself on a chosen branch, or one of its enabled code folders (launcher: Identity tab → **Add code folder**) — reserve the worktree first, then dispatch the isolated agent:
+
+1. `python -m vco_lib.lane_reservation reserve --project <this project> --repo <repo> --base <commit> --branch <new-branch>` — prints a reservation id (`--id` to choose one, `--existing-path` to adopt a worktree of that repo you already created on that branch; `list` / `cancel --id` manage pending ones). The repo must be the project itself or an ENABLED code folder, checked through the launcher hub — with the hub down, reservations are refused (ordinary isolation is unaffected).
+2. Put the id in the lane's brief and dispatch **one isolated agent per message**: `worktree-guard` hands the OLDEST pending reservation to the next isolated launch, creating `<repo parent>/<repo name>.vco-lanes/<branch>-<id>` with `git worktree add -b <branch> … <base>`. A reservation expires after 15 minutes unused; one that fails validation at launch aborts the launch with the reason, never falling back to a worktree of this project.
+3. The agent is told its reservation id, worktree, repo, branch and base when it starts, and stops if its brief names a different id.
+4. Review the result. When the agent finishes, a worktree with changes or commits is KEPT for you to review and merge; an unchanged one is removed together with its new branch. An adopted (`--existing-path`) worktree is never removed.
+
+The harness holds only Edit/Write to the worktree — **Bash is not confined** — so the brief must keep every Bash command (`cd`, redirects, `git`) inside the worktree path.
 
 **Waiting on long-running work**: when you need to wait for something to finish (a test suite, a build, a background agent), start it with `run_in_background` and continue or end your turn — its completion notification wakes you when it is done.
 

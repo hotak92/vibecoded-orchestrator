@@ -117,6 +117,23 @@ if ($AgentId -and ($AgentId -match '^[A-Za-z0-9_-][A-Za-z0-9._-]*$')) {
     }
 }
 
+# -- Lane reservation binding (v0.2.102 W6-AA) - must match the .sh ---------
+# worktree-guard's launch record carries the reservation id, target repo,
+# branch and base when the worktree came from a lane reservation
+# (vco_lib/lane_reservation.py). Tell the agent, on every SubagentStart.
+$WtrecLaneHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
+if ($AgentId -and (Test-Path -LiteralPath $WtrecLaneHelper)) {
+    . $WtrecLaneHelper
+    $laneFile = Find-WtrecRecord $ProjectRoot $AgentId
+    if ($laneFile) {
+        $laneRec = Read-WtrecRecord $laneFile
+        if ($laneRec -and [string]$laneRec.reservation_id) {
+            Emit-Ctx "VCO lane reservation $([string]$laneRec.reservation_id): your worktree is $([string]$laneRec.path) (repo $([string]$laneRec.repo), branch $([string]$laneRec.branch), base $([string]$laneRec.base_sha)). If your brief names a different reservation id, STOP and report. Only Edit/Write are held to this worktree by the harness: keep every Bash command (cd, redirects, git) inside it too."
+            exit 0
+        }
+    }
+}
+
 # -- Skipped-isolation detection (v0.2.102 W6-Q follow-up) - must match .sh --
 # A definition (found by agent_type = frontmatter `name`, in the project's or
 # the user's .claude/agents) that declares `isolation: worktree`, with NO

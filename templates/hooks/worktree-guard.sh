@@ -40,6 +40,12 @@
 # ── Decision matrix ──────────────────────────────────────────────────────
 #   1. Global bypass (VCT_DISABLE_HOOKS) → echo nothing and no-op (harness
 #      uses its own default). Full no-op, consistent with every hook.
+#   1b. A lane reservation is pending (v0.2.102 W6-AA) and the identifier is
+#      an `agent-*` subagent → vco_lib/lane_reservation.py consumes the
+#      oldest unexpired one and creates the worktree in the reserved repo, at
+#      the reserved base, on the reserved branch (or adopts the reserved
+#      existing worktree); a reservation that fails validation aborts the
+#      create LOUDLY. See the "Lane reservation" block below.
 #   2. cwd is NOT a git repo → this create cannot be isolated; return the
 #      working directory itself (the agent runs in place) and leave a
 #      notice that tells the agent, and through its report the user, that
@@ -350,6 +356,65 @@ write_notice() {
     mkdir -p "$NOTICE_DIR" 2>/dev/null || return 0
     printf '%s\n' "$1" > "$NOTICE_DIR/notice-$WT_NAME.txt" 2>/dev/null || true
 }
+
+# ── Lane reservation (v0.2.102 W6-AA) ─────────────────────────────────────
+# A coordinator that wants this isolated agent's worktree in ANOTHER repo (at
+# a chosen base, on a chosen branch) reserves it first:
+#   python -m vco_lib.lane_reservation reserve --project P --repo R --base B --branch N
+# The logic (FIFO claim by atomic rename, TTL, allow-list = P + P's enabled
+# code folders via the hub, `git -C R worktree add -b`, or adopting an
+# --existing-path) lives ONCE in vco_lib/lane_reservation.py; this block only
+# calls it. No pending file → nothing below runs and the guard behaves exactly
+# as before. Consume exit 3 = nothing to consume (all expired, or not an
+# agent-* launch) → fall through. Any other failure is a LOUD abort — never a
+# silent fallback to a worktree of P. A consume that exits 0 without its five
+# non-empty lines (path, HEAD, repo, mode, extra JSON) is a malformed success:
+# the reservation is already claimed, so it is the same loud abort, never an
+# empty or partial path. MUST MATCH worktree-guard.ps1.
+# No VCO-side time bound here: `git worktree add` on a very large repo can
+# take minutes and must never be killed mid-run. The WorktreeCreate
+# registration carries no `timeout`, so the harness's own command-hook
+# default (600 s) is the outer bound.
+LANE_PENDING="$PROJECT_ROOT/.claude/state/lane-reservations/pending"
+if [ -n "$WT_NAME" ] && ls "$LANE_PENDING"/res-*.json >/dev/null 2>&1; then
+    VCO_VENV_PYTHON=""
+    if [ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ]; then
+        # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+        . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+        resolve_vco_venv_python "$SCRIPT_DIR"
+    fi
+    if [ -z "$VCO_VENV_PYTHON" ]; then
+        REASON="broken install: a lane reservation is pending in $LANE_PENDING but VCO's Python (vco_lib) cannot be resolved to consume it - repair the install (launcher: project Settings -> Update bundle), or cancel the reservation"
+        log_event "create_failed" "$REASON" "$PROPOSED_PATH" ""
+        printf 'worktree-guard: ABORT - %s\n' "$REASON" >&2
+        exit 1
+    fi
+    LANE_OUT="$("$VCO_VENV_PYTHON" -m vco_lib.lane_reservation consume --project "$PROJECT_ROOT" --name "$WT_NAME")"
+    LANE_RC=$?
+    if [ "$LANE_RC" -eq 0 ]; then
+        LANE_PATH="$(printf '%s\n' "$LANE_OUT" | sed -n '1p')"
+        LANE_HEAD="$(printf '%s\n' "$LANE_OUT" | sed -n '2p')"
+        LANE_REPO="$(printf '%s\n' "$LANE_OUT" | sed -n '3p')"
+        LANE_MODE="$(printf '%s\n' "$LANE_OUT" | sed -n '4p')"
+        LANE_EXTRA="$(printf '%s\n' "$LANE_OUT" | sed -n '5p')"
+        if [ -z "$LANE_PATH" ] || [ -z "$LANE_HEAD" ] || [ -z "$LANE_REPO" ] \
+            || [ -z "$LANE_MODE" ] || [ -z "$LANE_EXTRA" ]; then
+            REASON="lane reservation consume reported success but its output was malformed (expected five non-empty lines: path, HEAD, repo, mode, extra JSON) - the reservation was claimed; no worktree of the project was created in its place"
+            log_event "create_failed" "$REASON" "$PROPOSED_PATH" ""
+            printf 'worktree-guard: ABORT - %s\n' "$REASON" >&2
+            exit 1
+        fi
+        log_event "created" "lane_reservation" "$PROPOSED_PATH" "$LANE_PATH"
+        record_launch "$LANE_MODE" "$LANE_PATH" "$LANE_HEAD" "$LANE_REPO" "$LANE_EXTRA"
+        emit_path "$LANE_PATH"
+        exit 0
+    elif [ "$LANE_RC" -ne 3 ]; then
+        REASON="lane reservation could not be honoured (consume exit $LANE_RC; reason above) - no worktree of the project was created in its place"
+        log_event "create_failed" "$REASON" "$PROPOSED_PATH" ""
+        printf 'worktree-guard: ABORT - %s\n' "$REASON" >&2
+        exit 1
+    fi
+fi
 
 # ── Not a git repo ⇒ run in place, isolation OFF, said out loud ───────────
 # No repository means nothing to base a worktree on. Echoing nothing is NOT
