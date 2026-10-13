@@ -207,8 +207,8 @@ pub fn strip_comments_and_strings(src: &str) -> Vec<String> {
             // like a quoted literal (next-next char is a closing quote, or
             // an escape). Over-conservatism here would blank a lifetime,
             // which is harmless for our `Command::new` detection.
-            let is_charlit = (i + 2 < n && chars[i + 2] == '\'')
-                || (i + 1 < n && chars[i + 1] == '\\');
+            let is_charlit =
+                (i + 2 < n && chars[i + 2] == '\'') || (i + 1 < n && chars[i + 1] == '\\');
             if is_charlit {
                 in_char = true;
                 push_blank(&mut out_line, &mut lines, ' ');
@@ -225,17 +225,16 @@ pub fn strip_comments_and_strings(src: &str) -> Vec<String> {
     lines
 }
 
-/// Whether an attribute line gates its item to test builds: `#[cfg(test)]`,
-/// `#[cfg(any(test, debug_assertions))]`, or `#[cfg(all(..., test, ...))]`
-/// where `test` is one of `all`'s top-level arguments (so the item exists
-/// only when compiling tests). `#[cfg(any(test, feature = "x"))]` and
-/// `not(test)` are NOT test-only and do not match.
+/// Whether an attribute line gates its item to test builds: `#[cfg(test)]`
+/// or `#[cfg(all(..., test, ...))]` where `test` is one of `all`'s top-level
+/// arguments (so the item exists only when compiling tests).
+/// `#[cfg(any(test, feature = "x"))]`, `not(test)` and
+/// `#[cfg(any(test, debug_assertions))]` are NOT test-only and do not match:
+/// a debug build compiles the last one, so — like the Python strict reading in
+/// `tests/common/rust_source.py` — it is production code here.
 pub fn is_test_cfg_attr(s: &str) -> bool {
     let t = s.replace(char::is_whitespace, "");
     if t.contains("#[cfg(test)]") {
-        return true;
-    }
-    if t.contains("#[cfg(") && t.contains("test") && t.contains("debug_assertions") {
         return true;
     }
     if let Some(start) = t.find("#[cfg(all(") {
@@ -288,12 +287,51 @@ pub fn is_test_cfg_attr(s: &str) -> bool {
 /// only get noisier, never blind), where it used to gate the rest of the
 /// file.
 pub fn test_gated_lines(stripped: &[String]) -> Vec<bool> {
+    gated_lines_by(stripped, is_test_cfg_attr)
+}
+
+/// [`is_test_cfg_attr`] OR an item compiled only into test-or-debug builds
+/// (`#[cfg(any(test, debug_assertions))]`, `#[cfg(all(unix, any(test,
+/// debug_assertions)))]`). For gates whose question is "can this run in a
+/// user's RELEASE build?" (`command_silent_gate.rs`); a scan that must see
+/// every line a dev build runs uses the strict [`is_test_cfg_attr`].
+// Used by command_silent_gate.rs only; each test crate compiles its own copy
+// of this module, so the other crate would warn.
+#[allow(dead_code)]
+pub fn is_test_or_debug_cfg_attr(s: &str) -> bool {
+    if is_test_cfg_attr(s) {
+        return true;
+    }
+    let t = s.replace(char::is_whitespace, "");
+    t.contains("#[cfg(") && t.contains("test") && t.contains("debug_assertions")
+}
+
+/// [`test_gated_lines`] with the release-build reading
+/// ([`is_test_or_debug_cfg_attr`]).
+#[allow(dead_code)] // command_silent_gate.rs only (see above)
+pub fn test_or_debug_gated_lines(stripped: &[String]) -> Vec<bool> {
+    gated_lines_by(stripped, is_test_or_debug_cfg_attr)
+}
+
+/// A file-level `#![cfg(test)]` makes the WHOLE file test code (the Python
+/// helper returns a whole-file span for the same attribute).
+fn is_whole_file_test_cfg(stripped: &[String]) -> bool {
+    stripped.iter().any(|l| {
+        l.replace(char::is_whitespace, "")
+            .starts_with("#![cfg(test)]")
+    })
+}
+
+fn gated_lines_by(stripped: &[String], is_gate: fn(&str) -> bool) -> Vec<bool> {
     let n = stripped.len();
+    if is_whole_file_test_cfg(stripped) {
+        return vec![true; n];
+    }
     let mut gated = vec![false; n];
 
     let mut i = 0usize;
     while i < n {
-        if !is_test_cfg_attr(&stripped[i]) {
+        if !is_gate(&stripped[i]) {
             i += 1;
             continue;
         }

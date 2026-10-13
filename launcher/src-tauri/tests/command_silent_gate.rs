@@ -85,7 +85,10 @@
 use std::path::{Path, PathBuf};
 
 mod support;
-use support::{is_test_cfg_attr, strip_comments_and_strings, test_gated_lines};
+use support::{
+    is_test_cfg_attr, is_test_or_debug_cfg_attr, strip_comments_and_strings, test_gated_lines,
+    test_or_debug_gated_lines,
+};
 
 /// The launcher's `CARGO_MANIFEST_DIR` is `<repo>/launcher/src-tauri/`.
 /// Every scanned tree is relative to that.
@@ -254,7 +257,9 @@ fn every_production_command_new_is_silent() {
         };
         let original: Vec<String> = src.lines().map(|s| s.to_string()).collect();
         let stripped = strip_comments_and_strings(&src);
-        let gated = test_gated_lines(&stripped);
+        // Release-build question: test-or-debug-only items cannot print in a
+        // user's release run, so they are blanked too.
+        let gated = test_or_debug_gated_lines(&stripped);
 
         let rel = file
             .strip_prefix(&base)
@@ -409,7 +414,11 @@ let out = std::process::Command::new(\"ioreg\").output();"
 #[test]
 fn test_cfg_attribute_recognition() {
     assert!(is_test_cfg_attr("#[cfg(test)]"));
-    assert!(is_test_cfg_attr("#[cfg(any(test, debug_assertions))]"));
+    assert!(!is_test_cfg_attr("#[cfg(any(test, debug_assertions))]"));
+    assert!(is_test_or_debug_cfg_attr("#[cfg(any(test, debug_assertions))]"));
+    assert!(is_test_or_debug_cfg_attr("#[cfg(all(unix, any(test, debug_assertions)))]"));
+    assert!(is_test_or_debug_cfg_attr("#[cfg(test)]"));
+    assert!(!is_test_or_debug_cfg_attr("#[cfg(debug_assertions)]"));
     assert!(is_test_cfg_attr("#[cfg(all(test, unix))]"));
     assert!(is_test_cfg_attr("#[cfg(all(unix, test))]"));
     assert!(is_test_cfg_attr("#[cfg(all(target_os = \"linux\", test))]"));
@@ -472,4 +481,21 @@ fn same_line_item_follows() {}
         .map(|s| s.to_string())
         .collect();
     assert_eq!(test_gated_lines(&unterminated), vec![false, false, false]);
+
+    // A file-level `#![cfg(test)]` gates the whole file (both readings).
+    let whole: Vec<String> = ["#![cfg(test)]", "fn f() {", "    let _ = 1;", "}"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(test_gated_lines(&whole), vec![true; 4]);
+    assert_eq!(test_or_debug_gated_lines(&whole), vec![true; 4]);
+
+    // Debug-gated items: production for the strict reading, blanked for the
+    // release-build reading.
+    let dbg: Vec<String> = ["#[cfg(any(test, debug_assertions))]", "fn d() {", "}"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(test_gated_lines(&dbg), vec![false; 3]);
+    assert_eq!(test_or_debug_gated_lines(&dbg), vec![true; 3]);
 }
