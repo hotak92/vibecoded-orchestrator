@@ -103,7 +103,7 @@ Environment knobs (all optional; every one is read by code in this package)
     not a request ceiling — a body past it is forwarded upstream as a stream,
     unrewritten, never refused — so lowering it trades the rewrite for
     memory, and raising it does the reverse. A non-numeric or non-positive
-    value falls back to the default (:func:`_env_int`): an unbounded buffer
+    value falls back to the default (:func:`vco_lib.env_values.env_int`): an unbounded buffer
     is not a state a typo should be able to reach.
 """
 
@@ -116,6 +116,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from vco_lib.env_values import env_int
 from vco_lib.intfile import read_int_line
 from vco_lib.paths import claude_user_dir, vct_root_dir
 
@@ -255,7 +256,7 @@ def context_guard_margin() -> int:
     knob is a tuning surface, and a typo in it must not turn the guard off
     (``0`` would refuse at exactly the ceiling) or into an always-fire trap.
     """
-    return _env_int(CONTEXT_GUARD_MARGIN_ENV, CONTEXT_GUARD_MARGIN_DEFAULT)
+    return env_int(CONTEXT_GUARD_MARGIN_ENV, CONTEXT_GUARD_MARGIN_DEFAULT, minimum=1)
 
 _TOKEN_BASENAME = "model-gateway.token"
 _PID_BASENAME = "model-gateway.pid"
@@ -302,17 +303,6 @@ FALLBACK_PORT_RANGE = range(11460, 11469)
 _STATE_SUBDIR = "model-gateway"
 _EXPORT_BASENAME = "chat_model_context.json"
 _LOG_BASENAME = "model-gateway.log"
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
 
 
 def token_path() -> Path:
@@ -451,7 +441,7 @@ def resolve_catalog_filter() -> str:
     implements — a typo REFUSES to start rather than running as ``latest``
     and leaving the user to discover, some hours later, that the setting they
     made never took. That is the same judgement :func:`resolve_host` makes
-    and the opposite of :func:`_env_int`'s, deliberately: a bad number has a
+    and the opposite of :func:`vco_lib.env_values.env_int`'s, deliberately: a bad number has a
     safe value to fall back to, while a bad ENUM has only a wrong one.
 
     Case and surrounding space are forgiven; ``LATEST`` from a shell script
@@ -637,19 +627,21 @@ class GatewayConfig:
             token=token,
             credentials_file=credentials_path(),
             context_table_file=export_path(),
-            catalog_ttl_s=_env_int(
-                "VCT_MODEL_GATEWAY_CATALOG_TTL", DEFAULT_CATALOG_TTL_S,
+            # Positive ints; 0, negatives and garbage keep the default.
+            catalog_ttl_s=env_int(
+                "VCT_MODEL_GATEWAY_CATALOG_TTL", DEFAULT_CATALOG_TTL_S, minimum=1,
             ),
-            static_retry_ttl_s=_env_int(
-                "VCT_MODEL_GATEWAY_STATIC_RETRY_TTL", DEFAULT_STATIC_RETRY_TTL_S,
+            static_retry_ttl_s=env_int(
+                "VCT_MODEL_GATEWAY_STATIC_RETRY_TTL", DEFAULT_STATIC_RETRY_TTL_S, minimum=1,
             ),
-            key_ttl_s=_env_int("VCT_MODEL_GATEWAY_KEY_TTL", DEFAULT_KEY_TTL_S),
-            key_stale_max_age_s=_env_int(
-                "VCT_MODEL_GATEWAY_KEY_STALE_MAX_S", DEFAULT_SERVE_STALE_MAX_AGE_S,
+            key_ttl_s=env_int("VCT_MODEL_GATEWAY_KEY_TTL", DEFAULT_KEY_TTL_S, minimum=1),
+            key_stale_max_age_s=env_int(
+                "VCT_MODEL_GATEWAY_KEY_STALE_MAX_S", DEFAULT_SERVE_STALE_MAX_AGE_S, minimum=1,
             ),
-            rewrite_buffer_bytes=_env_int(
+            rewrite_buffer_bytes=env_int(
                 "VCT_MODEL_GATEWAY_REWRITE_BUFFER_BYTES",
                 REWRITE_BUFFER_LIMIT_BYTES,
+                minimum=1,
             ),
             secret_project=(
                 (os.environ.get("VCT_MODEL_GATEWAY_SECRET_PROJECT") or "").strip()

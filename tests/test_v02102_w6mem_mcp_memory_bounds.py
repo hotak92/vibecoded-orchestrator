@@ -696,7 +696,6 @@ def test_monitor_fire_hands_consumers_plain_lists_from_a_compact_entry(monkeypat
          patch.object(srv, "_rl_check_force_flush", return_value=True), \
          patch.object(srv, "_rl_clear_force_flush", return_value=None), \
          patch.object(srv, "_rl_compute_and_write_citations", _compute), \
-         patch.object(srv, "_rl_delete_own_pending_file", lambda t: None), \
          patch.object(srv, "_get_rl_client", return_value=None), \
          patch.object(srv, "_rl_node_content_cache", {"tid-fire": compact_ctx(ctx)}):
         _run(rlmod._rl_answer_monitor("tid-fire", 1, "alpha 0"))

@@ -45,6 +45,7 @@ from vco_lib import containers as _containers
 from vco_lib import gpu_verify as _gv
 from vco_lib import install_services_guard as _svc_guard
 from vco_lib.deferral_report import DeferralEntry
+from vco_lib.env_values import env_int
 
 __all__ = ["Step5Plan", "Step5Hooks", "compose_up_step", "OK", "NOTHING", "CONTINUE", "FAIL",
            "compose_timeout_s"]
@@ -108,13 +109,7 @@ class Step5Hooks:
 def compose_timeout_s(env: Optional[dict] = None) -> int:
     """15 min default cap (first-run image pulls on slow links); override with
     ``VCT_INSTALL_DOCKER_TIMEOUT`` seconds, floor 60."""
-    raw = ((os.environ if env is None else env).get("VCT_INSTALL_DOCKER_TIMEOUT") or "").strip()
-    if raw:
-        try:
-            return max(60, int(raw))
-        except ValueError:
-            pass
-    return 900
+    return env_int("VCT_INSTALL_DOCKER_TIMEOUT", 900, env=env, minimum=60, clamp=True)
 
 
 # ---------------------------------------------------------------------------

@@ -90,6 +90,8 @@ import os
 import time
 from typing import Optional
 
+from vco_lib.env_values import env_int
+
 logger = logging.getLogger(__name__)
 
 # ── defaults ────────────────────────────────────────────────────────────
@@ -116,16 +118,6 @@ _last_prune_ts: float = 0.0
 
 def _truthy(v: Optional[str]) -> bool:
     return (v or "").strip().lower() in ("true", "1", "yes", "on")
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except (ValueError, TypeError):
-        return default
 
 
 def _env_float(name: str, default: float) -> float:
@@ -172,8 +164,9 @@ def compute_retention_plan(now_ms: Optional[int] = None) -> RetentionPlan:
     """
     now = now_ms if now_ms is not None else int(time.time() * 1000)
 
-    max_age_days = _env_int(_ENV_MAX_AGE_DAYS, _DEFAULT_MAX_AGE_DAYS)
-    max_rows = _env_int(_ENV_MAX_ROWS, _DEFAULT_MAX_ROWS)
+    # Any int: 0 / negative is the documented "bound disabled" setting.
+    max_age_days = env_int(_ENV_MAX_AGE_DAYS, _DEFAULT_MAX_AGE_DAYS)
+    max_rows = env_int(_ENV_MAX_ROWS, _DEFAULT_MAX_ROWS)
 
     cutoff_ms: Optional[int] = None
     reasons = []

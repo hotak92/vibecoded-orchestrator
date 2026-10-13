@@ -529,31 +529,55 @@ def _rl_human_turn_after(messages: list[dict], start_msg_idx: int) -> bool:
                         return True
     return False
 
-def _rl_delete_own_pending_file(task_id: str) -> None:
-    """F-QUEUE: delete THIS retrieval's pending file when the MCP monitor's
-    citation write has LANDED.
+def _rl_claim_own_pending_file(
+    task_id: str, staged_path: "str | None",
+) -> "tuple[str, Path | None, Path | None]":
+    """F-QUEUE / v0.2.102 W6-FIN: claim THIS retrieval's pending file before
+    the monitor computes its citation.
 
-    The MCP path stages a pending file (as a backstop) AND keeps in-memory ctx;
-    when the monitor fires successfully it deletes its own file so the Stop-hook
-    drain only processes survivors (orphans = monitor never fired → drain
-    recovers them). W3R-1 (v0.2.102): the delete moved AFTER the token gate and
-    is skipped when the write did not land — a sub-gate force_flush or a failed
-    write leaves the file for the drain instead of losing the citation.
-    Soft-fail — a missing file is the common, fine case.
+    The MCP path stages a pending file (the drain's backstop) AND keeps the
+    ctx in memory, so a Stop-hook drain that runs while the monitor computes
+    used to score the same citation a second time. The monitor now takes the
+    drains' own claim (``citation_pending.claim_task_pending`` — one claim
+    rule for all three consumers) and computes only while it holds it, or
+    when nothing was ever staged. Returns ``(state, claimed, pending_path)``
+    as documented there; on a soft failure of the lookup itself the state is
+    ``"unstaged"`` only when no path was staged, else ``"taken"`` — never a
+    second write.
     """
     try:
-        from claude_mcp_servers.rl_client.citation_pending import (
-            list_pending_for_session,
-            delete_pending,
-        )
-        # We don't know the session_id here, so match by the task_id suffix
-        # across all pending files for the project (list with empty session
-        # returns all). Cheap — the pending dir is tiny.
-        for p in list_pending_for_session(""):
-            if p.name.endswith(f"__{task_id}.json"):
-                delete_pending(p)
+        from claude_mcp_servers.rl_client.citation_pending import claim_task_pending
+
+        return claim_task_pending(task_id, staged_path=staged_path)
     except Exception as exc:  # noqa: BLE001
-        server.logger.debug("RL monitor: pending-file cleanup failed (%s)", exc)
+        server.logger.info("RL monitor %s: pending-file claim failed (%s)", task_id[:8], exc)
+        return ("taken", None, None) if staged_path else ("unstaged", None, None)
+
+
+def _rl_release_own_pending_file(
+    task_id: str, claimed: "Path | None", pending_path: "Path | None", landed: bool,
+) -> None:
+    """Leave path of a claim taken by :func:`_rl_claim_own_pending_file`: a
+    landed write consumes the file; EVERY other outcome (no result, an
+    error, a cancellation) renames it back so the Stop-hook drain scores it.
+    No-op without a claim. Never raises."""
+    if claimed is None:
+        return
+    try:
+        from claude_mcp_servers.rl_client.citation_pending import (
+            delete_pending,
+            release_claim,
+        )
+
+        if landed:
+            delete_pending(claimed)
+        elif pending_path is not None:
+            release_claim(claimed, pending_path)
+    except Exception as exc:  # noqa: BLE001 — a stuck claim is re-adopted by the next drain
+        server.logger.info(
+            "RL monitor %s: could not hand the pending file back (%s); "
+            "the next Stop-hook drain re-adopts it", task_id[:8], exc,
+        )
 
 def _rl_scan_candidate(
     candidate: "Path", query_snippet: str, pos_idx: int,
@@ -834,6 +858,12 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                 # that was never compacted (a plain-list entry) passes through.
                 from claude_mcp_servers.rl_client.ctx_compact import expand_ctx
                 ctx = expand_ctx(held_ctx or server._rl_node_content_cache.get(task_id))
+                # W6-FIN: the staged pending path rides in the in-memory entry
+                # only; take it out so no consumer below ever sees it.
+                from claude_mcp_servers.rl_client.citation_pending import (
+                    CTX_PENDING_PATH_KEY,
+                )
+                staged_path = ctx.pop(CTX_PENDING_PATH_KEY, None) if ctx is not None else None
                 server._rl_node_content_cache.pop(task_id, None)
                 # Keep the byte-bound size ledger (one home: rl_state) in step,
                 # so the next store need not reconcile it against the cache.
@@ -854,33 +884,48 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                         # they existed only in the logger.info line above).
                         ctx["fire_reason"] = fire_reason
                         ctx["window_tokens"] = answer_token_count
-                        try:
-                            citation_result = await server._rl_compute_and_write_citations(
-                                task_id, answer, ctx,
-                            )
-                        except Exception as exc:
-                            server.logger.debug(
-                                "RL monitor %s: citation write raised (%s); continuing",
-                                task_id[:8], exc,
-                            )
-                        # F-QUEUE (v0.2.102 W3R-1): the MCP monitor deletes its
-                        # OWN pending file only once the citation write has
-                        # LANDED, so the Stop-hook drain only processes
-                        # survivors (no double write). Pre-W3R-1 the delete ran
-                        # BEFORE the token gate below, so a sub-gate fire (a
-                        # force_flush on a short window) discarded the pending
-                        # file and skipped with a DEBUG line — the citation was
-                        # permanently lost with no ledger line and no drain
-                        # recovery. A failed/soft-failed write likewise KEEPS
-                        # the file now: the drain retries it at session end.
-                        if citation_result is not None:
-                            server._rl_delete_own_pending_file(task_id)
-                        else:
+                        # v0.2.102 W6-FIN: CLAIM the pending file before the
+                        # compute — the same rename-claim both Stop-hook drains
+                        # take — so a drain running during this compute no
+                        # longer sees the file (and a drain already holding it
+                        # makes the monitor stand down). Pre-fix the monitor
+                        # computed, wrote, and only then deleted the file: a
+                        # drain in that window scored the citation twice.
+                        claim_state, claimed, pending_path = (
+                            server._rl_claim_own_pending_file(task_id, staged_path)
+                        )
+                        if claim_state == "taken":
                             server.logger.info(
-                                "RL monitor %s: citation write did not land; "
-                                "pending file left for the Stop-hook drain",
+                                "RL monitor %s: a Stop-hook drain holds or already "
+                                "scored this citation; not computing it again",
                                 task_id[:8],
                             )
+                        else:
+                            try:
+                                citation_result = await server._rl_compute_and_write_citations(
+                                    task_id, answer, ctx,
+                                )
+                            except Exception as exc:
+                                server.logger.debug(
+                                    "RL monitor %s: citation write raised (%s); continuing",
+                                    task_id[:8], exc,
+                                )
+                            finally:
+                                # F-QUEUE (W3R-1): only a LANDED write consumes
+                                # the file; a failed/soft-failed write, an error
+                                # or a cancellation hands the claim back so the
+                                # drain retries it — never lost, never cancelled
+                                # by us.
+                                server._rl_release_own_pending_file(
+                                    task_id, claimed, pending_path,
+                                    landed=citation_result is not None,
+                                )
+                            if citation_result is None:
+                                server.logger.info(
+                                    "RL monitor %s: citation write did not land; "
+                                    "pending file (if staged) left for the Stop-hook drain",
+                                    task_id[:8],
+                                )
                     else:
                         # F-B observability: ctx genuinely unavailable (never
                         # staged) — make the skip visible instead of silent.
@@ -1512,10 +1557,11 @@ def _rl_code_recover_budget() -> "tuple[int, float]":
     """Resolve (max_nodes, deadline_seconds) for the recovery loop from env,
     falling back to conservative defaults. Malformed env values fall back
     silently (a bad tunable must never widen the budget or crash the emit)."""
-    try:
-        max_nodes = int(os.environ.get(_RL_CODE_RECOVER_MAX_ENV, "") or _RL_CODE_RECOVER_MAX_DEFAULT)
-    except (TypeError, ValueError):
-        max_nodes = _RL_CODE_RECOVER_MAX_DEFAULT
+    from vco_lib.env_values import env_int  # noqa: PLC0415
+
+    # A negative count is clamped to 0 (= never recover), as before.
+    max_nodes = env_int(_RL_CODE_RECOVER_MAX_ENV, _RL_CODE_RECOVER_MAX_DEFAULT,
+                        minimum=0, clamp=True)
     try:
         deadline = float(
             os.environ.get(_RL_CODE_RECOVER_DEADLINE_ENV, "") or _RL_CODE_RECOVER_DEADLINE_DEFAULT_S
@@ -1525,7 +1571,7 @@ def _rl_code_recover_budget() -> "tuple[int, float]":
     # Clamp to sane floors so a zero/negative tunable can't disable the recovery
     # unintentionally (0 max = never recover; but a negative deadline must not
     # loop forever — treat <=0 as "no deadline gate", the count gate still bounds).
-    return max(0, max_nodes), deadline
+    return max_nodes, deadline
 
 
 def _rl_recover_code_node_vectors(nodes: list[dict], survivors: list[dict]) -> int:

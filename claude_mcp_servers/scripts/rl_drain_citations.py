@@ -47,14 +47,13 @@ for _p in (_REPO_ROOT, os.path.join(_HERE, "..")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from vco_lib.env_values import env_int  # noqa: E402 — after the path bootstrap above
+
 
 def _gate_tokens() -> int:
     """Resolve the citation token gate, honouring the same env override the
     MCP monitor uses so a tuned floor applies to both paths."""
-    try:
-        return int(os.getenv("RL_MIN_ANSWER_TOKENS_FOR_CITATION", "25000"))
-    except (TypeError, ValueError):
-        return 25000
+    return env_int("RL_MIN_ANSWER_TOKENS_FOR_CITATION", 25000)
 
 
 # v0.2.73 RL-4 — terminal-session citation floor.
@@ -81,10 +80,7 @@ def _terminal_age_seconds() -> float:
 
 
 def _terminal_floor_tokens() -> int:
-    try:
-        return int(os.getenv("RL_TERMINAL_CITATION_MIN_TOKENS", "2000"))
-    except (TypeError, ValueError):
-        return 2000
+    return env_int("RL_TERMINAL_CITATION_MIN_TOKENS", 2000)
 
 
 # G5 (2026-07-22) — soft-label floor for dying-but-tiny answer windows.
@@ -100,10 +96,7 @@ def _terminal_floor_tokens() -> int:
 # weaker signal than a full-window label) while still learning the retrieval's
 # below-threshold cosine maxima instead of seeing nothing.
 def _soft_label_floor_tokens() -> int:
-    try:
-        return int(os.getenv("RL_SOFT_CITATION_MIN_TOKENS", "200"))
-    except (TypeError, ValueError):
-        return 200
+    return env_int("RL_SOFT_CITATION_MIN_TOKENS", 200)
 
 
 def _stamp_agent_transcript(path, payload: dict, transcript_path: str) -> None:

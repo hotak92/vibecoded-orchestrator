@@ -43,12 +43,14 @@ __all__ = [
     "delete_pending",
     "sweep_expired",
     "claim_pending",
+    "claim_task_pending",
     "release_claim",
     "readopt_stale_claims",
     "adopt_brief_citations",
     "agent_transcript_for",
     "PENDING_TTL_SECONDS",
     "CLAIM_MARK",
+    "CTX_PENDING_PATH_KEY",
 ]
 
 # Abandoned-session TTL: a pending file with no turn-end (session killed) is
@@ -64,6 +66,13 @@ PENDING_TTL_SECONDS: float = 3600.0
 # back. A claim whose owner died is re-adopted (:func:`readopt_stale_claims`),
 # so a crash mid-compute never loses the citation.
 CLAIM_MARK = ".draining."
+
+# v0.2.102 W6-FIN: the key under which the MCP populate path records, in the
+# IN-MEMORY citation ctx only, the pending file it staged for the same task.
+# The answer monitor hands it to :func:`claim_task_pending`, which can then
+# tell "a drain consumed it" (staged, now gone: do not compute again) from
+# "never staged" (compute, or the citation is lost). Never written to disk.
+CTX_PENDING_PATH_KEY = "pending_path"
 
 # A claim older than this is re-adopted even when its pid looks alive (the
 # pid was reused) or liveness cannot be decided. Generous on purpose: one
@@ -311,6 +320,59 @@ def release_claim(claimed: "str | Path", path: "str | Path") -> None:
 
     if not release_rename_claim(Path(claimed), Path(path)):
         logger.debug("release_claim: could not hand back %s", Path(claimed).name)
+
+
+def claim_task_pending(
+    task_id: str,
+    *,
+    staged_path: "str | Path | None" = None,
+    project_root: "str | Path | None" = None,
+) -> "tuple[str, Optional[Path], Optional[Path]]":
+    """Claim THIS task's pending file before an in-process compute.
+
+    The MCP answer monitor's entry to the SAME claim the Stop-hook drains
+    take (:func:`claim_pending`), so a drain running while the monitor
+    computes cannot score the citation a second time, and vice versa
+    (v0.2.102 W6-FIN). Returns ``(state, claimed, pending_path)``:
+
+    * ``"claimed"`` — this process now owns ``claimed``; compute it, then
+      :func:`delete_pending` it on a landed write or :func:`release_claim`
+      it back to ``pending_path`` on EVERY other leave path.
+    * ``"taken"`` — the file exists only as another process's claim, or a
+      file that was staged is gone: a drain owns it or already scored it.
+      Do NOT compute (that would be the second write). Nothing is lost: a
+      drain that does not score it renames it back for the next drain.
+    * ``"unstaged"`` — no pending file was ever staged for this task (the
+      stage soft-failed, or no project root resolved). No drain can see the
+      retrieval, so the caller computes it directly; skipping would lose it.
+
+    ``staged_path`` is the path :func:`stage_pending` returned (the populate
+    path records it in the cached ctx); it makes "staged, now gone" — a
+    drain consumed it — distinguishable from "never staged". Without it the
+    task's file is looked up by its ``__<task_id>.json`` suffix. Never raises.
+    """
+    if staged_path:
+        path = Path(staged_path)
+        claimed = claim_pending(path)
+        return ("claimed", claimed, path) if claimed is not None else ("taken", None, path)
+    d = pending_dir(project_root)
+    if d is None or not d.exists():
+        return ("unstaged", None, None)
+    suffix = f"__{_safe(task_id)}.json"
+    try:
+        names = [p for p in d.iterdir() if suffix in p.name]
+    except OSError:
+        return ("unstaged", None, None)
+    for p in names:
+        if p.name.endswith(suffix):
+            claimed = claim_pending(p)
+            if claimed is not None:
+                return ("claimed", claimed, p)
+            return ("taken", None, p)
+    for p in names:
+        if CLAIM_MARK in p.name and p.name.rpartition(CLAIM_MARK)[0].endswith(suffix):
+            return ("taken", None, p.with_name(p.name.rpartition(CLAIM_MARK)[0]))
+    return ("unstaged", None, None)
 
 
 def readopt_stale_claims(

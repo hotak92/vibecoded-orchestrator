@@ -87,6 +87,7 @@ from vco_lib.powershell_command import (
     SHELL_TOOLS,
     command_for_bash_readers,
 )
+from vco_lib.env_values import env_int
 
 __all__ = [
     "DEFAULT_REPEAT_MAX",
@@ -136,17 +137,6 @@ _MAX_TIMEOUT_SCAN_DEPTH = 4
 
 def _disabled(env: Dict[str, str]) -> bool:
     return str(env.get(_KILL_SWITCH_ENV, "")).strip().lower() in _OFF_VALUES
-
-
-def _env_int(env: Dict[str, str], name: str, default: int) -> int:
-    raw = env.get(name)
-    if raw is None or not str(raw).strip():
-        return default
-    try:
-        value = int(str(raw).strip())
-    except ValueError:
-        return default
-    return value if value > 0 else default
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -471,9 +461,9 @@ def _repeat_check(
     payload: Dict[str, Any], key: str, env: Dict[str, str],
     state_root: Optional[Path], now: float, tool: str = "",
 ) -> Optional[str]:
-    window_s = _env_int(env, "VCO_WAIT_GUARD_REPEAT_WINDOW_S",
-                        DEFAULT_REPEAT_WINDOW_S)
-    max_n = _env_int(env, "VCO_WAIT_GUARD_REPEAT_MAX", DEFAULT_REPEAT_MAX)
+    window_s = env_int("VCO_WAIT_GUARD_REPEAT_WINDOW_S", DEFAULT_REPEAT_WINDOW_S,
+                        env=env, minimum=1)
+    max_n = env_int("VCO_WAIT_GUARD_REPEAT_MAX", DEFAULT_REPEAT_MAX, env=env, minimum=1)
     path = _state_path(payload, state_root)
     state = _load_state(path, now, window_s, SLASH_TTL_S)
     stamps = state["checks"].setdefault(key, [])
@@ -508,8 +498,8 @@ def evaluate(
     if tool in SELF_WAKE_TOOLS:
         if payload.get("agent_id"):
             return self_wake_subagent_reason(str(tool))
-        window_s = _env_int(env, "VCO_WAIT_GUARD_REPEAT_WINDOW_S",
-                            DEFAULT_REPEAT_WINDOW_S)
+        window_s = env_int("VCO_WAIT_GUARD_REPEAT_WINDOW_S", DEFAULT_REPEAT_WINDOW_S,
+                            env=env, minimum=1)
         path = _state_path(payload, state_root)
         state = _load_state(path, now, window_s, SLASH_TTL_S)
         if state["slash"]:
@@ -582,8 +572,8 @@ def record_expansion_event(
     if not isinstance(name, str) or name not in UNLOCK_COMMANDS:
         return False
     now = time.time() if now is None else now
-    window_s = _env_int(env, "VCO_WAIT_GUARD_REPEAT_WINDOW_S",
-                        DEFAULT_REPEAT_WINDOW_S)
+    window_s = env_int("VCO_WAIT_GUARD_REPEAT_WINDOW_S", DEFAULT_REPEAT_WINDOW_S,
+                        env=env, minimum=1)
     path = _state_path(payload, state_root)
     state = _load_state(path, now, window_s, SLASH_TTL_S)
     state["slash"][name] = now

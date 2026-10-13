@@ -591,6 +591,14 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _int_env(name: str, default: int) -> int:
+    """A positive int tunable; unset / empty / garbage / below 1 → ``default``.
+
+    DOCUMENTED COPY — must match ``vco_lib/env_values.py::env_int(name,
+    default, minimum=1)``. This module is stdlib-only by contract (it runs as
+    ``.claude/scripts/`` inside user projects, with no ``vco_lib`` on
+    ``sys.path`` — see :func:`_save_breaker_file`), so it cannot import the
+    one home; ``tests/test_v02102_env_values.py`` pins the parity.
+    """
     raw = os.getenv(name, "").strip()
     if not raw:
         return default

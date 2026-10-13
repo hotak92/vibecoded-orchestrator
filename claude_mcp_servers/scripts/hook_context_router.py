@@ -133,6 +133,7 @@ from vco_lib.inject_intent import (  # noqa: E402
     titles_one_liner,
     turn_budget_chars,
 )
+from vco_lib.env_values import env_int  # noqa: E402
 from vco_lib.hook_agent_key import agent_state_key, sanitize_agent_id  # noqa: E402
 from vco_lib.prompt_edit_nudge import nudge_block as _prompt_nudge_block  # noqa: E402
 
@@ -155,14 +156,6 @@ _BASH_PROFILE_BY_INTENT = {
 def _env_float(name: str, default: float) -> float:
     try:
         val = float((os.environ.get(name) or "").strip())
-        return val if val > 0 else default
-    except ValueError:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        val = int((os.environ.get(name) or "").strip())
         return val if val > 0 else default
     except ValueError:
         return default
@@ -248,7 +241,7 @@ def cache_get(project_root: str, key: str) -> Optional[str]:
     try:
         if not f.is_file():
             return None
-        ttl = _env_int("VCO_QUERY_CACHE_TTL", 900)
+        ttl = env_int("VCO_QUERY_CACHE_TTL", 900, minimum=1)
         age = time.time() - f.stat().st_mtime
         if age >= ttl:
             return None
@@ -522,7 +515,7 @@ def _cg_count_path(session_id: str, project_root: str) -> str:
 
 
 def _cg_cap() -> int:
-    return _env_int("VCO_CG_INJECT_CAP", CG_SESSION_CAP_DEFAULT)
+    return env_int("VCO_CG_INJECT_CAP", CG_SESSION_CAP_DEFAULT, minimum=1)
 
 
 def _cg_capped(count_file: str) -> bool:

@@ -166,7 +166,14 @@ def entry_key(file_path: str, full_name: str) -> str:
 
 def resolve_max_per_run(cli_value: "int | None", env: "dict | None" = None) -> int:
     """CLI flag → env override → default. Empty-string / unparseable env
-    values fall through (v0.2.27 coercion discipline)."""
+    values fall through (v0.2.27 coercion discipline).
+
+    The env leg is a DOCUMENTED COPY — must match
+    ``vco_lib/env_values.py::env_int(name, default, env=env)``: this script
+    runs as ``.claude/scripts/`` in user projects and imports ``vco_lib`` only
+    after resolving the orchestrator root (:func:`atomic_write_json`), which a
+    pure resolver must not trigger. Parity: ``tests/test_v02102_env_values.py``.
+    """
     if cli_value is not None:
         return cli_value
     raw = (env if env is not None else os.environ).get(_ENV_MAX_PER_RUN)
@@ -181,7 +188,12 @@ def resolve_max_per_run(cli_value: "int | None", env: "dict | None" = None) -> i
 
 
 def resolve_batch_size(env: "dict | None" = None) -> int:
-    """Env override → default; values below 1 / unparseable fall through."""
+    """Env override → default; values below 1 / unparseable fall through.
+
+    DOCUMENTED COPY — must match ``vco_lib/env_values.py::env_int(name,
+    default, env=env, minimum=1)`` (see :func:`resolve_max_per_run` for why
+    it is not imported). Parity: ``tests/test_v02102_env_values.py``.
+    """
     raw = (env if env is not None else os.environ).get(_ENV_BATCH_SIZE)
     if raw is not None and str(raw).strip():
         try:

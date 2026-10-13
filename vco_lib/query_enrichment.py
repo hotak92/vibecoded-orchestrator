@@ -43,6 +43,7 @@ from claude_mcp_servers.weaviate_mcp.chunking import (
     _num_ctx_for_model,  # noqa: SLF001 -- shared lookup rule, see comment below
     chunking_preset_for_models,
 )
+from vco_lib.env_values import env_int
 from vco_lib.paths import vct_metrics_dir
 from vco_lib.transcript_context import last_turn_context
 
@@ -123,16 +124,6 @@ def _approx_chars_per_token() -> int:
 
 def _env_off(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() == "off"
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        return int(raw.strip())
-    except ValueError:
-        return default
 
 
 def _env_float(name: str, default: float) -> float:
@@ -291,7 +282,7 @@ def build_query(
     budget_tokens, target_tokens, conservative = _resolve_budget(embedding_models)
 
     effective_enabled = enabled and not _env_off(ENV_ENABLE)
-    effective_threshold = _env_int(ENV_SHORT_THRESHOLD, short_threshold_tokens)
+    effective_threshold = env_int(ENV_SHORT_THRESHOLD, short_threshold_tokens)
     effective_share = min(max(_env_float(ENV_SHARE, share), SHARE_MIN), SHARE_MAX)
 
     def _unenriched() -> EnrichedQuery:

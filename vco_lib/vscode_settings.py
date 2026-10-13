@@ -958,15 +958,9 @@ def resolve_gateway_ports() -> tuple[int, ...]:
 
 def _read_port_env(env: Optional[Mapping[str, str]] = None) -> Optional[int]:
     """``VCT_MODEL_GATEWAY_PORT``, when it names a usable port."""
-    env = os.environ if env is None else env
-    raw = (env.get(PORT_ENV) or "").strip()
-    if not raw:
-        return None
-    try:
-        port = int(raw)
-    except ValueError:
-        return None
-    return port if 0 < port < 65536 else None
+    from vco_lib.env_values import env_int  # noqa: PLC0415
+
+    return env_int(PORT_ENV, None, env=env, minimum=1, maximum=65535)
 
 
 def panel_endpoint_port(base_url: Optional[str]) -> Optional[int]:

@@ -989,8 +989,6 @@ def _populate_citation_cache(
                     list(other_query_emb) if other_query_emb else None
                 )
                 ctx_dict["other_nodes"] = other_nodes
-        if cache_in_memory:
-            _store_compact_ctx(srv, task_id, ctx_dict)
     except Exception as exc:
         logger.debug("_populate_citation_cache: write failed (%s)", exc)
 
@@ -999,8 +997,11 @@ def _populate_citation_cache(
     # path threads its resolved session_id through RerankRequest and relies on
     # this stage exclusively (no separate hook-side re-stage). ``source`` is
     # derived from task_type: only the long-lived MCP path runs an in-process
-    # monitor that deletes its own pending file on fire, so only it is tagged
+    # monitor, so only it is tagged
     # "mcp"; hook-path tasks are "hook" (no monitor → drain always processes).
+    # The monitor CLAIMS its own file before computing (W6-FIN) and deletes
+    # it once the write lands, so monitor and drain never both score it.
+    staged_path = None
     if stage_pending_file and ctx_dict is not None:
         try:
             from claude_mcp_servers.rl_client.citation_pending import stage_pending
@@ -1014,7 +1015,7 @@ def _populate_citation_cache(
             except Exception:  # noqa: BLE001 — soft-fail, staging is best-effort
                 staged_seq = getattr(srv, "_rl_call_seq", None)
             source = "mcp" if task_type == "mcp_interactive" else "hook"
-            stage_pending(
+            staged_path = stage_pending(
                 session_id=resolve_session_id(session_id or ""),
                 task_id=task_id,
                 seq=staged_seq if source == "mcp" else None,
@@ -1024,6 +1025,22 @@ def _populate_citation_cache(
             )
         except Exception as exc:
             logger.debug("_populate_citation_cache: stage_pending failed (%s)", exc)
+
+    # The in-memory entry the answer monitor reads. Stored AFTER the stage
+    # (v0.2.102 W6-FIN) so it can carry the staged path: the monitor claims
+    # that file before it computes — the same claim the Stop-hook drains
+    # take — and "staged, now gone" then means a drain already scored it.
+    # The key lives only in memory; the pending file's own ctx never has it.
+    if cache_in_memory and ctx_dict is not None:
+        try:
+            from claude_mcp_servers.rl_client.citation_pending import CTX_PENDING_PATH_KEY
+
+            entry = dict(ctx_dict)
+            if staged_path is not None:
+                entry[CTX_PENDING_PATH_KEY] = str(staged_path)
+            _store_compact_ctx(srv, task_id, entry)
+        except Exception as exc:
+            logger.debug("_populate_citation_cache: write failed (%s)", exc)
 
 
 def _store_compact_ctx(srv: Any, task_id: str, ctx_dict: dict) -> None:

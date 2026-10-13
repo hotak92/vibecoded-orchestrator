@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
 from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -809,8 +810,6 @@ def _suggest_project(tmp_path: Path, tools_line: str) -> Path:
 
 
 def _router(project: Path, payload: dict, tmp_path: Path) -> subprocess.CompletedProcess:
-    from tests.common.child_env import child_env
-
     stub = tmp_path / "kg_stub.py"
     stub.write_text("import sys\ndef main():\n    sys.stdout.write('')\n")
     env = child_env(CLAUDE_PROJECT_DIR=str(project), VCO_ROUTER_KG_SCRIPT=str(stub),
@@ -918,7 +917,7 @@ def test_pre_compact_save_ignores_subagent_compaction(tmp_path: Path, flavour: s
 
 def _dead_pid() -> int:
     """The pid of a process that has exited (and been reaped)."""
-    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc = subprocess.Popen([sys.executable, "-c", "pass"], env=child_env())
     proc.wait()
     return proc.pid
 
@@ -1022,7 +1021,8 @@ class TestDrainClaim:
         import rl_drain_citations as drain
 
         f = _stage(tmp_path, "sessD", "t-live", "lane4", ts_ms=_young())
-        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                  env=child_env())
         try:
             live = f.with_name(f"{f.name}.draining.{holder.pid}")
             f.replace(live)
@@ -1228,7 +1228,7 @@ def test_writer_racing_a_delivery_loses_no_row(tmp_path: Path, monkeypatch, prot
     root = str(tmp_path)
     aa.append_alert(root, "sessX", "abc123", "coder", "credential", "first")
     writer = subprocess.Popen([sys.executable, "-c", _SLOW_WRITER, str(REPO_ROOT), root, protocol],
-                              stdout=subprocess.PIPE, text=True)
+                              stdout=subprocess.PIPE, text=True, env=child_env())
     assert writer.stdout.readline().strip() == "ready"
     time.sleep(0.4)  # the writer now holds its window open
     got = [r["message"] for r in aa.collect(root, "sessX", "abc123")]
@@ -1246,7 +1246,8 @@ def test_stale_delivery_claim_is_readopted(tmp_path: Path) -> None:
     path = aa.append_alert(root, "s1", "lane1", "coder", "credential", "lost?")
     dead = path.with_name(f"{path.name}.delivering.{_dead_pid()}")
     path.replace(dead)
-    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                              env=child_env())
     try:
         p2 = aa.append_alert(root, "s1", "lane2", "coder", "credential", "in flight")
         live = p2.with_name(f"{p2.name}.delivering.{holder.pid}")
@@ -1356,7 +1357,7 @@ def test_append_cli_exit_codes(tmp_path: Path) -> None:
     def run(stdin: str, root: Path) -> subprocess.CompletedProcess:
         return subprocess.run([sys.executable, "-m", "vco_lib.agent_alerts", "append",
                                "--project-root", str(root)], input=stdin, capture_output=True,
-                              text=True, env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+                              text=True, env=child_env(),
                               timeout=60)
     ok = run(json.dumps({"session_id": "s1", "agent_id": "lane1", "kind": "k", "message": "m"}),
              tmp_path)

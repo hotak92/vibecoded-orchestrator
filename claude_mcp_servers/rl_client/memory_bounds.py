@@ -23,8 +23,9 @@ typo must never turn a bound into "unbounded" or into "cache nothing":
 
 from __future__ import annotations
 
-import os
 from array import array
+
+from vco_lib.env_values import env_int
 
 __all__ = [
     "approx_heap_bytes",
@@ -65,28 +66,16 @@ DEFAULT_NODE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_MONITOR_MAX_CONCURRENT = 64
 
 
-def _positive_int_env(name: str, default: int) -> int:
-    """Read ``name`` as a positive int; anything else yields ``default``."""
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        val = int(raw)
-    except ValueError:
-        return default
-    return val if val > 0 else default
-
-
 def transcript_cache_max_bytes() -> int:
-    return _positive_int_env(TRANSCRIPT_CACHE_MAX_BYTES_ENV, DEFAULT_TRANSCRIPT_CACHE_MAX_BYTES)
+    return env_int(TRANSCRIPT_CACHE_MAX_BYTES_ENV, DEFAULT_TRANSCRIPT_CACHE_MAX_BYTES, minimum=1)
 
 
 def node_cache_max_bytes() -> int:
-    return _positive_int_env(NODE_CACHE_MAX_BYTES_ENV, DEFAULT_NODE_CACHE_MAX_BYTES)
+    return env_int(NODE_CACHE_MAX_BYTES_ENV, DEFAULT_NODE_CACHE_MAX_BYTES, minimum=1)
 
 
 def monitor_max_concurrent() -> int:
-    return _positive_int_env(MONITOR_MAX_CONCURRENT_ENV, DEFAULT_MONITOR_MAX_CONCURRENT)
+    return env_int(MONITOR_MAX_CONCURRENT_ENV, DEFAULT_MONITOR_MAX_CONCURRENT, minimum=1)
 
 
 def approx_heap_bytes(obj: object) -> int:

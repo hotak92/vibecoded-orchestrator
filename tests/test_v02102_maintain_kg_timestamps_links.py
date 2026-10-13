@@ -58,7 +58,7 @@ def _load_module():
     env = {
         "CLAUDE_PROJECT_ROOT": _TMP_PROJECT,
         "VCT_ORCHESTRATOR_ROOT": str(REPO_ROOT),
-        "KG_COLLECTION": "W6YProj_KnowledgeGraph",
+        "KG_COLLECTION": "ProjA_KnowledgeGraph",
         "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph",
         "WEAVIATE_URL": "http://127.0.0.1:9",
     }
