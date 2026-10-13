@@ -29,7 +29,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.common.rust_source import cfg_test_line_numbers
+from tests.common.rust_source import production_source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER_SRC = REPO_ROOT / "launcher" / "src"
@@ -109,8 +109,9 @@ def _production_source(src: str) -> str:
        hold.
 
     So the span question is answered by the ONE home for it —
-    `cfg_test_line_numbers`, per-item and brace-balanced, with the Rust lexer
-    that knows a brace inside a string is not a brace — and the gated lines
+    `cfg_test_line_numbers` (via `production_source`), per-item and
+    brace-balanced, with the Rust lexer that knows a brace inside a string
+    is not a brace — and the gated lines
     are BLANKED rather than removed so line-for-line correspondence (and the
     ordering `_command_bodies_from_src` slices by) survives.
 
@@ -118,13 +119,7 @@ def _production_source(src: str) -> str:
     debug_assertions))]` compiles into a debug build, so such a command is
     reachable by a user running one and must keep being policed.
     """
-    gated = cfg_test_line_numbers(src)
-    if not gated:
-        return src
-    return "\n".join(
-        "" if n in gated else line
-        for n, line in enumerate(src.splitlines(), start=1)
-    )
+    return production_source(src)
 
 
 def _command_bodies(path: Path) -> dict[str, str]:

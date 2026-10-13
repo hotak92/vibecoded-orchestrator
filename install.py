@@ -21742,9 +21742,10 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     # Step 2: remove volumes.
     #
     # Defense-in-depth: this uninstaller does NOT shell out to remove
-    # container volumes. Per the launcher's `volume_rm_only_callable_from_migrate_volumes`
-    # audit (commands/storage_ux.rs — moved there from volumes.rs in
-    # v0.2.101), only `migrate_volumes` is allowed to invoke
+    # container volumes. Per the `volume rm` source audit
+    # (tests/test_v02102_rust_source_scan_gates.py,
+    # `test_volume_rm_only_callable_from_migrate_volumes`), only the launcher's
+    # `migrate_volumes` (commands/storage_ux.rs) is allowed to invoke
     # `<runtime> volume rm ...`. Instead, we delegate volume cleanup to
     # `compose down --volumes`, which is also forbidden in the install
     # path — so we PRINT the exact commands the user can run themselves.

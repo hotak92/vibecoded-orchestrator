@@ -10068,71 +10068,12 @@ MemAvailable:   23456789 kB
 
     // ─── Bug 32: non-destructive install safety guarantees ────────
 
-    /// Bug 32 #1 + #2: the install path must never invoke any
-    /// volume-removal or compose-down command. Source-level audit:
-    /// grep the install scripts for forbidden subprocess invocations.
-    /// If this test ever fails it means someone added a destructive
-    /// shell-out — gate it behind `--force-clean` or remove it.
-    #[test]
-    fn test_no_destructive_subprocess_calls_in_install_path() {
-        let repo_root = find_local_repo_root().expect("repo root resolves in tests");
-        let install_py = repo_root.join("install.py");
-        let install_sh = repo_root.join("install.sh");
-        let installer_rs = repo_root.join("launcher/src-tauri/src/commands/installer.rs");
-        let projects_v2_rs = repo_root.join("launcher/src-tauri/src/commands/projects_v2.rs");
-
-        // Forbidden literal substrings. We use simple substring matching
-        // because anything more clever (e.g. `volume\s+rm`) would also
-        // match comments referring to the forbidden form. Comments are
-        // scrubbed below.
-        let forbidden = [
-            "podman volume rm",
-            "docker volume rm",
-            "podman volume prune",
-            "docker volume prune",
-            "compose down --volumes",
-            "compose down -v",
-            "podman-compose down",
-            "docker-compose down",
-        ];
-
-        for path in [&install_py, &install_sh, &installer_rs, &projects_v2_rs] {
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue, // optional file
-            };
-
-            // Production-only slice: everything before the test module marker.
-            // The Rust files contain `#[cfg(test)]` declaring the test mod;
-            // the audit must NOT scan that section because the test code
-            // legitimately contains the forbidden literals as needles.
-            let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
-            let production = &content[..scan_end];
-
-            // Strip line-comments to avoid false positives from docs that
-            // mention the forbidden command (e.g. "# Stop: podman-compose down"
-            // in compose.yaml-adjacent comments).
-            let stripped: String = production
-                .lines()
-                .map(|line| {
-                    // Python/shell `#` comment, or Rust `//` comment.
-                    let cut = line.find("//").or_else(|| line.find('#')).unwrap_or(line.len());
-                    &line[..cut]
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            for needle in &forbidden {
-                assert!(
-                    !stripped.contains(needle),
-                    "FORBIDDEN: '{}' found in {} (would destroy user data on install). \
-                     If genuinely needed, gate behind --force-clean and update this test.",
-                    needle,
-                    path.display()
-                );
-            }
-        }
-    }
+    // Bug 32 #1 + #2 destructive-subprocess audit: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_no_destructive_subprocess_calls_in_install_path`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating.
+    // The Rust copy cut installer.rs at the gated `use` on line 21 and projects_v2.rs
+    // at a gated helper, so it checked ~20 production lines of this file.
 
     /// Bug 32 #3 (audit form): `_ensure_collections` in install.py must
     /// only POST to /v1/schema. It must NEVER call PUT, DELETE, or

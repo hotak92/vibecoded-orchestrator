@@ -329,35 +329,12 @@ mod tests {
     // engine/bootstrap are wired by v0.3.0 (a `--engine` arg dispatch), never
     // in v0.2.60. This mirrors Piece 4's
     // `test_perform_hard_cut_not_wired_into_update_orchestrator`.
-    #[test]
-    fn engine_entrypoint_is_not_wired_into_main() {
-        // Read this file's source and isolate the LIVE code (everything
-        // before the `#[cfg(test)]` test module) so we don't match the
-        // assertion strings in this very test.
-        let src = include_str!("main.rs");
-        let live = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("source has a live (pre-test) section");
-
-        // The live `main()` must not dispatch to the engine entrypoint…
-        assert!(
-            !live.contains("run_engine") && !live.contains("engine::run_plan"),
-            "main.rs LIVE code must NOT call the cross-OS engine in v0.2.60 — \
-             the engine is DORMANT until v0.3.0 wires a --engine dispatch"
-        );
-        // …nor to the bootstrap stub's decide()…
-        assert!(
-            !live.contains("bootstrap::decide"),
-            "main.rs LIVE code must NOT invoke the bootstrap stub in v0.2.60 — \
-             update_orchestrator stays the live path"
-        );
-        // …nor parse an `--engine` flag (the v0.3.0 dispatch arg).
-        assert!(
-            !live.contains("--engine"),
-            "main.rs LIVE code must NOT parse a --engine arg in v0.2.60"
-        );
-    }
+    // v0.2.60 Piece 6 dormant-engine gate: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_engine_entrypoint_is_not_wired_into_updater_main`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating.
+    // The Rust copy cut this file at its first `#[cfg(test)]` — correct today (the test
+    // module is the only gated item) but blind the day a gated helper lands above `main()`.
 
     #[test]
     fn lock_roundtrip_minimal() {

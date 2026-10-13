@@ -877,12 +877,11 @@ pub(crate) fn set_deferral_root_for_tests(root: Option<PathBuf>) {
 
 /// The current override, if any (the getter half of the test seam; pins
 /// the panic-safety of [`fake_runtime_support::with_fake_runtimes`]'s
-/// restore). Always compiled like the setter — the module's own
-/// `volume_rm_only_callable_from_migrate_volumes` guard scans the source
-/// up to the file's first test-only attribute marker, and a test-gated
-/// item this early would truncate that scan before `migrate_volumes` is
-/// even defined (this is why the marker string does not appear here
-/// verbatim, either).
+/// restore). Always compiled like the setter. Until v0.2.102 that was also
+/// forced by this module's `volume rm` source audit, which stopped reading at
+/// the file's first test-only attribute; the audit now blanks test-gated
+/// items one by one (`tests/test_v02102_rust_source_scan_gates.py`), so a
+/// gated item here would no longer hide `migrate_volumes` from it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn deferral_root_override_for_tests() -> Option<PathBuf> {
     DEFERRAL_ROOT_OVERRIDE.with(|r| r.borrow().clone())
@@ -3868,46 +3867,6 @@ mod volumes_tests {
         assert_eq!(list(None)[0].mountpoint, "/fake/docker/weaviate_data");
     }
 
-    /// Replace every Python triple-quoted docstring (both """ and ''')
-    /// with whitespace of the same length. Used by the source-level
-    /// `volume rm` audit so docstrings explaining the command's
-    /// semantics don't false-positive as actual invocations.
-    fn strip_python_docstrings(src: &str) -> String {
-        let mut out = String::with_capacity(src.len());
-        let bytes = src.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            let three_double = i + 3 <= bytes.len() && &bytes[i..i + 3] == b"\"\"\"";
-            let three_single = i + 3 <= bytes.len() && &bytes[i..i + 3] == b"'''";
-            if three_double || three_single {
-                let marker: &[u8] = if three_double { b"\"\"\"" } else { b"'''" };
-                // Find closing marker.
-                let start = i + 3;
-                let mut j = start;
-                while j + 3 <= bytes.len() {
-                    if &bytes[j..j + 3] == marker {
-                        break;
-                    }
-                    j += 1;
-                }
-                // Replace from i..end with spaces (preserve newlines).
-                let end = (j + 3).min(bytes.len());
-                for k in i..end {
-                    if bytes[k] == b'\n' {
-                        out.push('\n');
-                    } else {
-                        out.push(' ');
-                    }
-                }
-                i = end;
-            } else {
-                out.push(bytes[i] as char);
-                i += 1;
-            }
-        }
-        out
-    }
-
     #[test]
     fn launcher_config_roundtrip_with_detected_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -4075,111 +4034,12 @@ mod volumes_tests {
         }
     }
 
-    /// Bug 31 + Bug 32 #4: only the migrate-volumes function may invoke
-    /// `volume rm`. Source-level audit: scan the install-path files +
-    /// projects_v2.rs + this storage module itself, and assert that any
-    /// occurrence of `volume rm` outside this module's `migrate_volumes`
-    /// fails the test. Production scan only — test code can mention the
-    /// forbidden literal for documentation.
-    #[test]
-    fn volume_rm_only_callable_from_migrate_volumes() {
-        let repo_root = super::super::installer::find_local_repo_root().expect("repo root");
-        let volumes_rs = repo_root.join("launcher/src-tauri/src/commands/storage_ux.rs");
-        let install_py = repo_root.join("install.py");
-        let install_sh = repo_root.join("install.sh");
-        let installer_rs = repo_root.join("launcher/src-tauri/src/commands/installer.rs");
-
-        // 1. install-path files MUST NOT invoke `volume rm`. We scan
-        //    for actual subprocess-call shapes, not raw substrings: a
-        //    docstring/comment that uses the words "volume rm" for
-        //    documentation purposes is fine — what matters is whether
-        //    the runtime actually executes it. Forbidden shapes:
-        //      "volume", "rm"   — Rust Command::args slice (e.g.
-        //                          ["podman", "volume", "rm", ...])
-        //      "volume rm"      — a single Bash/sh-quoted command line
-        //                          (e.g. `podman volume rm ...` after
-        //                          a shebang or eval)
-        //      However, plain prose in docstrings is OK. We approximate
-        //      "subprocess call" by looking for the literal `volume rm`
-        //      OUTSIDE Python triple-quoted strings and Rust /// doc
-        //      comments — both are non-executing forms.
-        for path in [&install_py, &install_sh, &installer_rs] {
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
-            let production = &content[..scan_end];
-            // Strip Python triple-quoted docstrings (both """ and ''') —
-            // they're prose, not executable code.
-            let no_pydocs = strip_python_docstrings(production);
-            // Strip line-comments (Rust // and Python/shell #).
-            let stripped: String = no_pydocs
-                .lines()
-                .map(|line| {
-                    let cut = line.find("//").or_else(|| line.find('#')).unwrap_or(line.len());
-                    &line[..cut]
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                !stripped.contains("volume rm") && !stripped.contains("\"volume\", \"rm\""),
-                "FORBIDDEN: 'volume rm' invocation found in {} — \
-                 only migrate_volumes may invoke it",
-                path.display()
-            );
-        }
-
-        // 2. this module may mention `volume rm` — but ONLY inside
-        //    migrate_volumes. Find the function body and check the rest
-        //    of the file is clean.
-        let content = std::fs::read_to_string(&volumes_rs).expect("storage_ux.rs");
-        let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
-        let production = &content[..scan_end];
-        let fn_start = production
-            .find("pub async fn migrate_volumes(")
-            .expect("migrate_volumes defined");
-        // Walk braces from `{` after the signature to find the matching close.
-        let body_open = fn_start + production[fn_start..].find('{').expect("body open") + 1;
-        let mut depth = 1usize;
-        let mut idx = body_open;
-        for ch in production[body_open..].chars() {
-            idx += ch.len_utf8();
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let migrate_body = &production[body_open..idx];
-        let outside_migrate =
-            production[..fn_start].to_string() + &production[idx..];
-        // Strip comments outside the function so doc-comments mentioning
-        // the forbidden form don't fail the audit.
-        let stripped_outside: String = outside_migrate
-            .lines()
-            .map(|line| {
-                let cut = line.find("//").or_else(|| line.find('#')).unwrap_or(line.len());
-                &line[..cut]
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !stripped_outside.contains("\"volume\", \"rm\"")
-                && !stripped_outside.contains("volume rm"),
-            "FORBIDDEN: 'volume rm' outside migrate_volumes in this module"
-        );
-        // Sanity: migrate_volumes IS the function that calls it.
-        assert!(
-            migrate_body.contains("\"volume\", \"rm\""),
-            "expected migrate_volumes to invoke `volume rm` (it's the destructive cleanup step)"
-        );
-    }
+    // Bug 31 + Bug 32 #4 `volume rm` audit: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_volume_rm_only_callable_from_migrate_volumes`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating.
+    // The Rust copy cut this file at a gated helper (~line 2218) and installer.rs at
+    // its gated `use`, so most production code went unscanned.
 
     /// Bug 31 dry-run: simulates a migration plan without mutating
     /// anything. We can't easily inject fake volumes (the detector

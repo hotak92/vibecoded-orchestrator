@@ -10679,95 +10679,17 @@ SHARED_KG_OPT_OUT=false\n"),
         );
     }
 
-    /// W-F5 (non-optional): the dry-run deferral warning is the rebuild-only
-    /// consent string (lockstep with the Python `why_deferred`), and the OLD
-    /// false framing is gone — neither the blanket "destructive migration was
-    /// NOT auto-applied" implication (additive is now applied) nor the
-    /// "drops the collection mid-swap" claim survives in this source file.
-    #[test]
-    fn migrate_warning_string_is_rebuild_only_consent_v0270() {
-        // The warning string spans multiple source lines via `\` line
-        // continuations, so collapse all runs of whitespace (including the
-        // backslash-newline-indent join artifacts) before substring-matching
-        // the semantic phrasing. Scope to the PRODUCTION portion of the file
-        // (before the `#[cfg(test)]` module) so the test's own assertion
-        // literals (which name the forbidden phrasing) don't false-match.
-        let raw = include_str!("projects_v2.rs");
-        let prod = match raw.find("#[cfg(test)]") {
-            Some(i) => &raw[..i],
-            None => raw,
-        };
-        let src: String = prod
-            .replace('\\', " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+    // W-F5 source gate: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_migrate_warning_string_is_rebuild_only_consent_v0270`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating. The Rust copy cut this file at a gated helper (~line 3895),
+    // leaving ~2,300 production lines unscanned, including the code after the test module.
 
-        // The new warning scopes consent to the rebuild action.
-        assert!(
-            src.contains("(`rebuild`) requires consent and was NOT auto-applied"),
-            "dry-run warning must scope consent to the rebuild action"
-        );
-        // v0.2.70 FIX-4: the additive-copy clause is still present in source,
-        // but it now lives in the CONDITIONAL `additive_clause` branch (only
-        // emitted when additive drift was actually auto-applied). Match
-        // case-insensitively since the clause now starts a sentence ("Additive
-        // `copy` ...") after the rebuild sentence's period.
-        assert!(
-            src.to_lowercase()
-                .contains("additive `copy` migrations are lossless and were applied automatically"),
-            "dry-run warning must still carry the additive-copy clause text"
-        );
-        // The old blanket phrasing ("THE destructive migration was NOT
-        // auto-applied") implied EVERYTHING defers — must be gone.
-        assert!(
-            !src.contains("the destructive migration was NOT auto-applied"),
-            "the old blanket 'destructive migration was NOT auto-applied' phrasing must be removed"
-        );
-        // The factually-false "copy drops the collection mid-swap" claim must
-        // never appear in this file either.
-        assert!(
-            !src.contains("drops the collection mid-swap"),
-            "the false 'copy drops the collection mid-swap' claim must not be present"
-        );
-    }
-
-    /// v0.2.70 FIX-4: the additive-copy "were applied automatically" clause is
-    /// gated on `auto_apply_additive` (= should_auto_apply_additive). It must
-    /// NOT be appended unconditionally — for a REBUILD-ONLY plan the predicate
-    /// is false, so the clause is empty and the toast no longer over-claims.
-    #[test]
-    fn migrate_additive_clause_is_conditional_on_auto_apply_v0270() {
-        let raw = include_str!("projects_v2.rs");
-        let prod = match raw.find("#[cfg(test)]") {
-            Some(i) => &raw[..i],
-            None => raw,
-        };
-        let src: String = prod
-            .replace('\\', " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        // The clause is selected via an `if auto_apply_additive { ... } else { "" }`.
-        assert!(
-            src.contains("let additive_clause = if auto_apply_additive"),
-            "the additive-copy clause must be gated on auto_apply_additive \
-             (conditional, not unconditional)"
-        );
-        // The empty-string else arm is what suppresses the over-claim on a
-        // rebuild-only plan.
-        assert!(
-            src.contains("} else { \"\" };"),
-            "the additive clause must fall back to an empty string when \
-             auto_apply_additive is false (rebuild-only plan)"
-        );
-        // And the wet apply reuses the SAME precomputed flag (no second
-        // should_auto_apply_additive recomputation in the Ok arm body).
-        assert!(
-            src.contains("if auto_apply_additive {"),
-            "the wet apply must reuse the precomputed auto_apply_additive flag"
-        );
-    }
+    // v0.2.70 FIX-4 source gate: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_migrate_additive_clause_is_conditional_on_auto_apply_v0270`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating. The Rust copy cut this file at a gated helper (~line 3895),
+    // leaving ~2,300 production lines unscanned, including the code after the test module.
 
     // v0.2.97: a failed post-flip env re-projection must reach the modal's
     // warning list — before, it lived only inside `post_flip.warnings`,

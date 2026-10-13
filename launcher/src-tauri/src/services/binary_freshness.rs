@@ -1788,56 +1788,12 @@ mod tests {
         }
     }
 
-    /// `condition_is_recorded` asks `body.contains(cid)` — a SUBSTRING test.
-    ///
-    /// That is safe for the two cids it serves today (neither is a substring of
-    /// the other) and its failure direction is benign anyway: a false positive
-    /// only spends a python subprocess, because resolving an id that is not
-    /// recorded is a no-op. It stops being safe the moment it is pointed at a
-    /// cid that is a PREFIX of another registered one — the registry already
-    /// contains such a pair (`deprecated_mcp_` vs
-    /// `deprecated_mcp_removal_summary`), where a sibling's record would be
-    /// read as this one's and an `action_required` entry could be retired while
-    /// its condition still holds.
-    ///
-    /// So the substring semantics are allowed to stay only while the call set
-    /// stays scoped. This pins that scope: generalising the helper to a third
-    /// cid fails here and forces the anchored-match decision to be made
-    /// deliberately rather than inherited by accident. (Raised by WP-B on the
-    /// registry review, 2026-08-26.)
-    #[test]
-    fn the_record_presence_check_stays_scoped_to_its_two_cids() {
-        let src = include_str!("binary_freshness.rs");
-        // Production call sites only — the fixtures below legitimately call it
-        // with the same two constants.
-        let production = src.split("mod tests {").next().expect("module has tests");
-        let needle = concat!("condition_is_", "recorded(install_path, ");
-        let call_args: Vec<&str> = production
-            .match_indices(needle)
-            .map(|(idx, _)| {
-                production[idx + needle.len()..]
-                    .split(')')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-            })
-            .collect();
-
-        assert!(
-            !call_args.is_empty(),
-            "expected the probe-driven clears to consult the presence helper",
-        );
-        for arg in &call_args {
-            assert!(
-                matches!(*arg, "CID_BINARY_STALE" | "CID_HANDOFF_SKIPPED"),
-                "`condition_is_recorded` does a SUBSTRING match, which is only \
-                 sound for cids that are not prefixes of another registered id. \
-                 Called with `{arg}` — either anchor the match (`## {{cid}} (` in \
-                 the markdown, `\"condition_id\": \"{{cid}}\"` in the JSON) or keep \
-                 the call set to the two ids this was reasoned about.",
-            );
-        }
-    }
+    // Presence-check scope gate: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_the_record_presence_check_stays_scoped_to_its_two_cids`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating.
+    // The Rust copy cut this file at `mod tests {` — correct today, but blind to any
+    // production code added after the test module.
 
     // -- WP-B registry pairing: the handoff-skipped record's probe-driven clear --
 

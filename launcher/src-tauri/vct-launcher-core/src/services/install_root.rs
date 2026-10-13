@@ -934,111 +934,12 @@ mod tests {
         assert!(db.is_update_standby(), "a Db method issued DDL on the update stand-in");
     }
 
-    /// Census (the red-proof lever the review accepted): every production
-    /// DDL / `execute_batch` site on the launcher.db side is on this
-    /// allowlist, with the reason it cannot reach the stand-in. A new lazy
-    /// `CREATE` anywhere in the launcher crates fails here until it is
-    /// either moved into `migrations` or justified below.
-    #[test]
-    fn no_lazy_ddl_outside_migrations_census() {
-        // file (relative to launcher/src-tauri) -> why it cannot reach the stand-in
-        let allow: &[(&str, &str)] = &[
-            (
-                "vct-launcher-core/src/db/change_log.rs",
-                "ensure_change_log: called only from Db::open / open_in_memory (asserted below)",
-            ),
-            (
-                "vct-launcher-core/src/db/module_db_migrations.rs",
-                "module DDL runs after a module_db_migrations ledger read that fails on the \
-                 stand-in; the other hits are error-message strings",
-            ),
-            (
-                "vct-launcher-core/src/db/project_state.rs",
-                "BEGIN IMMEDIATE / COMMIT / ROLLBACK — transaction control, not DDL",
-            ),
-        ];
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let needles = [
-            "create table",
-            "create index",
-            "create unique index",
-            "create trigger",
-            "create view",
-            "create virtual",
-            "alter table",
-            "drop table",
-            "execute_batch(",
-        ];
-        let mut hits: std::collections::BTreeSet<String> = Default::default();
-        let mut stack = vec![base.join("vct-launcher-core/src"), base.join("src")];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-                let p = entry.path();
-                let name = p.file_name().unwrap().to_string_lossy().to_string();
-                if p.is_dir() {
-                    if name != "migrations" {
-                        stack.push(p);
-                    }
-                    continue;
-                }
-                if !name.ends_with(".rs") || name == "migrations.rs" {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&p).unwrap();
-                let rel_path = p
-                    .strip_prefix(&base)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                for line in text.lines() {
-                    if line.starts_with("#[cfg(test)]") {
-                        break; // production code only
-                    }
-                    let t = line.trim_start();
-                    if t.starts_with("//") {
-                        continue;
-                    }
-                    let norm = t.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
-                    if needles.iter().any(|n| norm.contains(n)) {
-                        hits.insert(rel_path.clone());
-                    }
-                }
-            }
-        }
-        let allowed: std::collections::BTreeSet<String> =
-            allow.iter().map(|(f, _)| f.to_string()).collect();
-        let unexpected: Vec<_> = hits.difference(&allowed).collect();
-        assert!(
-            unexpected.is_empty(),
-            "DDL / execute_batch outside migrations in {:?} — a lazy DDL on the managed \
-             connection flips the update stand-in to 'live' (W1R-16)",
-            unexpected
-        );
-        // The change_log allowance holds only while its callers are the two
-        // open paths.
-        let mod_rs = std::fs::read_to_string(base.join("vct-launcher-core/src/db/mod.rs")).unwrap();
-        let prod = mod_rs.split("\n#[cfg(test)]").next().unwrap();
-        assert_eq!(prod.matches("ensure_change_log()").count(), 2);
-        let mut callers = 0usize;
-        let mut stack = vec![base.join("vct-launcher-core/src"), base.join("src")];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().map(|e| e == "rs").unwrap_or(false) {
-                    let text = std::fs::read_to_string(&p).unwrap();
-                    let prod = text.split("\n#[cfg(test)]").next().unwrap();
-                    callers += prod
-                        .lines()
-                        .filter(|l| !l.trim_start().starts_with("//"))
-                        .filter(|l| l.contains(".ensure_change_log()"))
-                        .count();
-                }
-            }
-        }
-        assert_eq!(callers, 2, "ensure_change_log gained a caller outside Db::open / open_in_memory");
-    }
+    // W1R-16 lazy-DDL census: moved in v0.2.102 (W6-Z2) to
+    // `tests/test_v02102_rust_source_scan_gates.py::RealTreeGates::test_no_lazy_ddl_outside_migrations_census`,
+    // which blanks each test-gated item (`tests/common/rust_source.production_source`)
+    // instead of truncating.
+    // The Rust copy stopped each file at its first column-0 `#[cfg(test)]` — a gated
+    // `use`/helper in 20 files, and production code after the test module in 3 more.
 
     #[test]
     fn resolve_without_db_falls_back_to_the_process_cache_only_after_the_walk() {

@@ -32,7 +32,7 @@ import re
 import unittest
 from pathlib import Path
 
-from tests.common.rust_source import read_rust_code
+from tests.common.rust_source import production_source, read_rust_code
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "launcher" / "src-tauri" / "src"
@@ -685,8 +685,9 @@ class Wi7ObservabilityTests(unittest.TestCase):
         helper = src[helper_start:helper_end]
 
         # Production code only — `#[cfg(test)]` fixtures legitimately write
-        # their own throwaway report files under a tempdir.
-        production = src[: src.index("mod tests {")].replace(helper, "")
+        # their own throwaway report files under a tempdir. Blanked per item,
+        # not cut at the first `mod tests {` (v0.2.102 W6-Z2).
+        production = production_source(src).replace(helper, "")
         for name in ("UPDATE_DEFERRED.md", "UPDATE_DEFERRED.json"):
             self.assertNotIn(
                 name,

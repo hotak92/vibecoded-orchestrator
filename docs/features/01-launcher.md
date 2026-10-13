@@ -313,7 +313,7 @@ Migration emits phase-level `volumes://migrate-progress` Tauri events so the UI 
 </details>
 
 ### Zero-Destruction Install Guard
-`installer.rs` includes an audit test (`test_no_destructive_subprocess_calls_in_install_path`) that greps install-path files for banned commands (`rm -rf`, `docker volume rm`, `podman volume rm`). Prevents accidental destructive commands from slipping into the install path.
+An audit test (`test_no_destructive_subprocess_calls_in_install_path` in `tests/test_v02102_rust_source_scan_gates.py`) scans the production code of the install-path files (`install.py`, `install.sh`, `installer.rs`, `projects_v2.rs`) for banned commands: `podman`/`docker volume rm`, `podman`/`docker volume prune`, `compose down --volumes` / `-v`, `podman-compose down` and `docker-compose down`. Test-gated Rust items are blanked one by one, so every production line is scanned. Prevents accidental destructive commands from slipping into the install path.
 
 ### Service Lifecycle on Launcher Start/Stop
 `commands/lifecycle.rs` ties the backing services (Weaviate, Ollama, code-embed) to the launcher's own lifecycle:
