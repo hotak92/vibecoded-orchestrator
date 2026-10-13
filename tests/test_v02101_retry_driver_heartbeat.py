@@ -241,3 +241,17 @@ class TestIdentity:
         assert deferral_probes.process_identity_matches(os.getpid(), None) is None
         assert deferral_probes.process_identity_matches(os.getpid(), "other:1") is None
         assert deferral_probes.process_start_token(0) is None
+
+
+def test_wall_token_tolerance_has_a_cannot_tell_band(monkeypatch):
+    """W6-Z3 review N3: a live holder's wall token can differ by < 1 s (Rust
+    truncates to whole seconds); a gap past that but under 3 s is "cannot
+    tell" (None, treated as still alive), never "reused"; >= 3 s is reused."""
+    monkeypatch.setattr(deferral_probes, "process_start_token", lambda pid: "wall:1000.000")
+    m = deferral_probes.process_identity_matches
+    assert m(1, "wall:1000.999") is True
+    assert m(1, "wall:999.000") is True
+    assert m(1, "wall:1001.500") is None
+    assert m(1, "wall:997.100") is None
+    assert m(1, "wall:1003.000") is False
+    assert m(1, "wall:900.000") is False

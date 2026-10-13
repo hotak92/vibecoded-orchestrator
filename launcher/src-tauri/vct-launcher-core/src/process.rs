@@ -326,7 +326,8 @@ pub fn epoch_secs_now() -> u64 {
 ///   clock ticks since boot; not wall-clock based, so it never drifts);
 /// * `wall:<seconds>.000` elsewhere — the creation timestamp the OS stored
 ///   when the process started, via `sysinfo` (whole seconds; the Python
-///   reader compares `wall:` tokens with a 1 s tolerance).
+///   reader `process_identity_matches` takes <= 1 s as the same process,
+///   < 3 s as "cannot tell" and >= 3 s as a reused pid).
 pub fn process_start_token(pid: u32) -> Option<String> {
     if pid == 0 || pid > i32::MAX as u32 {
         return None;
