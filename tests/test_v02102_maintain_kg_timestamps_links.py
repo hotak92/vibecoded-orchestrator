@@ -647,6 +647,106 @@ class TestMissingFrontmatterFields:
 
 
 # ---------------------------------------------------------------------------
+# R4b follow-ups — Y4b-1 (a failed read is never a clean pass) and
+# Y4b-3 (the "… and N more" count survives targets containing ", ")
+# ---------------------------------------------------------------------------
+
+
+class TestFailedFetchIsNotAPass:
+    """Y4b-1: pre-fix both fetchers swallowed the fetch exception and
+    returned [], so a dead Weaviate read printed "✓ No stale
+    timestamps" / "✓ No missing cross-references" and — with no other
+    findings — "✅ All checks passed" on a read that never happened."""
+
+    @staticmethod
+    def _run_check_main(mkg, project, collection):
+        server = mock.MagicMock()
+        server.client.collections.get.return_value = collection
+        with mock.patch.object(mkg, "KNOWLEDGE_ROOT", project / "knowledge"), \
+             mock.patch.object(mkg, "EmbeddingService") as emb_cls, \
+             mock.patch.object(mkg, "WeaviateMCPServer", return_value=server), \
+             mock.patch.object(sys, "argv",
+                               ["maintain_knowledge_graph.py", "--check"]):
+            mkg.main()
+            emb_cls.for_project.assert_called_once()
+
+    @staticmethod
+    def _empty_page_collection():
+        collection = mock.MagicMock()
+        empty_page = mock.MagicMock()
+        empty_page.objects = []
+        collection.query.fetch_objects.return_value = empty_page
+        return collection
+
+    def test_failed_fetch_exits_nonzero_and_never_says_passed(
+            self, mkg, project, capsys):
+        # THE ACT: a fetch failure must surface as a clear error + a
+        # non-zero exit, and "All checks passed" must NOT be printed.
+        collection = mock.MagicMock()
+        collection.query.fetch_objects.side_effect = RuntimeError(
+            "simulated dead backend")
+        with pytest.raises(SystemExit) as exc:
+            self._run_check_main(mkg, project, collection)
+        assert exc.value.code not in (0, None), \
+            "a failed Weaviate read must exit non-zero"
+        captured = capsys.readouterr()
+        output = captured.out + captured.err
+        assert "All checks passed" not in output
+        assert "simulated dead backend" in output, \
+            "the fetch failure must be reported as an error, not swallowed"
+
+    def test_successful_empty_fetch_still_passes(self, mkg, project, capsys):
+        # LEAVE-ALONE: an EMPTY collection is a legitimate clean pass —
+        # the empty read must still print "All checks passed" and exit 0
+        # (main() returns without SystemExit).
+        self._run_check_main(mkg, project, self._empty_page_collection())
+        captured = capsys.readouterr()
+        assert "All checks passed" in captured.out
+
+
+class TestMissingLinksDisplayCount:
+    def test_comma_in_target_keeps_and_n_more_count_correct(
+            self, mkg, project, capsys):
+        # Y4b-3: pre-fix the report split finding["detail"] on ", " to
+        # count the shown/hidden items, so a target like "Aaa, with comma"
+        # was counted as TWO items and inflated the "… and N more" count.
+        # 5 missing links (one containing ", ") → show 3 + "... and 2
+        # more"; the pre-fix split counted 6 and printed "... and 3 more"
+        # (and showed "Aaa" / "with comma" as two separate links).
+        # Asserted ONLY on the cross-references section: the broken-links
+        # section above prints its own "... and 2 more" (the targets do
+        # not exist as files), which would mask the pre-fix behaviour.
+        _write_node(
+            project, "Comma Node",
+            ["title: Comma Node", "type: concept",
+             "updated: 2026-10-01T00:00:00Z"],
+            "[[Alpha]] [[Beta]] [[Gamma]] [[Delta]] [[Aaa, with comma]]",
+        )
+        rows = [_row("uuid-c", "Comma Node", "knowledge/Comma Node.md",
+                     links=[], typed_links=[])]
+        triples = [(uuid, title, rel) for uuid, title, rel, _ in rows]
+        col = _FakeCollection()
+        server = _FakeServer(col)
+        with mock.patch.object(mkg, "PROJECT_ROOT", project), \
+             mock.patch.object(mkg, "KNOWLEDGE_ROOT", project / "knowledge"), \
+             mock.patch.object(mkg, "get_all_weaviate_objects",
+                               return_value=triples), \
+             mock.patch.object(mkg, "get_all_weaviate_rows",
+                               return_value=rows):
+            stats = mkg.check_consistency(server, fix=False, assume_yes=False)
+        assert stats["missing_links"] == 1
+        section = capsys.readouterr().out.split(
+            "Checking stored cross-references")[1]
+        assert "[[Aaa, with comma]]" in section, \
+            "the comma-bearing target is ONE link, shown whole"
+        assert "... and 2 more" in section, \
+            "5 missing links = 3 shown + 2 more, even when one target " \
+            "contains ', ' (pre-fix split counted it as two and said " \
+            "'... and 3 more')"
+        assert "... and 3 more" not in section
+
+
+# ---------------------------------------------------------------------------
 # Shared-collection refusal still applies
 # ---------------------------------------------------------------------------
 

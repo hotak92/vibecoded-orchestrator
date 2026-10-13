@@ -268,6 +268,10 @@ def get_all_weaviate_objects(
     the exact object identity. Pre-fix the delete step re-queried by
     TITLE equality (limit 10) and deleted every match — a live node that
     happened to share a title with an orphan was collateral damage.
+
+    v0.2.102 W6-Y R4b (Y4b-1): a FAILED fetch raises (after one clear
+    error line) instead of returning [] — a dead read used to look
+    identical to a clean pass all the way to "All checks passed".
     """
     try:
         collection = server.client.collections.get(KNOWLEDGE_COLLECTION)
@@ -284,7 +288,7 @@ def get_all_weaviate_objects(
 
     except Exception as e:
         print(f"❌ Error fetching Weaviate nodes: {e}")
-        return []
+        raise
 
 
 def get_all_weaviate_nodes(server: WeaviateMCPServer) -> Dict[str, str]:
@@ -309,6 +313,10 @@ def get_all_weaviate_rows(
     named fetch (same pagination) rather than widening the triple
     contract — the triple shape is a patch point the existing guard
     tests monkeypatch.
+
+    v0.2.102 W6-Y R4b (Y4b-1): a FAILED fetch raises (after one clear
+    error line) instead of returning [] — a dead read must never reach
+    "✓ No stale timestamps" / "All checks passed".
     """
     try:
         collection = server.client.collections.get(KNOWLEDGE_COLLECTION)
@@ -327,7 +335,7 @@ def get_all_weaviate_rows(
 
     except Exception as e:
         print(f"❌ Error fetching Weaviate node properties: {e}")
-        return []
+        raise
 
 
 def _parse_file_node(file_path: Path) -> Optional[Dict[str, Any]]:
@@ -396,11 +404,8 @@ def check_stale_timestamps(
     """
     parsed: Dict[str, Optional[Dict[str, Any]]] = {}
     findings: List[Dict[str, Any]] = []
-    seen: Set[str] = set()
 
     for row_uuid, title, weaviate_path, props in rows:
-        if row_uuid in seen:
-            continue
         file_path = PROJECT_ROOT / weaviate_path
         if not file_path.exists():
             continue  # missing file = the orphan check's finding, not ours
@@ -416,7 +421,6 @@ def check_stale_timestamps(
         if stored_dt is None:
             continue
         if expected_dt.replace(microsecond=0) != stored_dt.replace(microsecond=0):
-            seen.add(row_uuid)
             findings.append({
                 "uuid": row_uuid,
                 "title": title,
@@ -493,16 +497,16 @@ def check_missing_links(
     them).
 
     Returns one finding dict per flagged row (same shape as
-    :func:`check_stale_timestamps`; ``properties`` carries the
-    file-derived ``links`` / ``typed_links``).
+    :func:`check_stale_timestamps`, plus ``missing`` — the missing items
+    as a LIST, joined into ``detail`` for display only so a target
+    containing ``", "`` cannot inflate the report's "… and N more"
+    count; ``properties`` carries the file-derived ``links`` /
+    ``typed_links``).
     """
     parsed: Dict[str, Optional[Dict[str, Any]]] = {}
     findings: List[Dict[str, Any]] = []
-    seen: Set[str] = set()
 
     for row_uuid, title, weaviate_path, props in rows:
-        if row_uuid in seen:
-            continue
         file_path = PROJECT_ROOT / weaviate_path
         if not file_path.exists():
             continue
@@ -523,11 +527,14 @@ def check_missing_links(
             for relation, target in sorted(file_typed - stored_typed):
                 miss.append(f"{relation}::{target}")
         if miss:
-            seen.add(row_uuid)
             findings.append({
                 "uuid": row_uuid,
                 "title": title,
                 "file_path": weaviate_path,
+                # Y4b-3: the missing items ride as a LIST — the report
+                # joins for display only, so a target containing ", "
+                # cannot inflate the "… and N more" count.
+                "missing": list(miss),
                 "detail": ", ".join(miss),
                 "properties": {
                     "links": list(node_data["links"]),
@@ -902,10 +909,13 @@ def check_consistency(
         print(f"  ⚠️  Found {len(missing_links)} node(s) with WikiLinks missing from Weaviate:")
         for finding in missing_links[:5]:
             print(f"    {finding['title']} ({finding['file_path']}):")
-            for link in finding["detail"].split(", ")[:3]:
+            # Y4b-3: count from the finding's item LIST, never from a
+            # ", "-split of the joined detail — a target containing
+            # ", " would otherwise inflate the "… and N more" count.
+            for link in finding["missing"][:3]:
                 print(f"      - [[{link}]]")
-            if len(finding["detail"].split(", ")) > 3:
-                print(f"      ... and {len(finding['detail'].split(', ')) - 3} more")
+            if len(finding["missing"]) > 3:
+                print(f"      ... and {len(finding['missing']) - 3} more")
         if len(missing_links) > 5:
             print(f"    ... and {len(missing_links) - 5} more files")
     else:
