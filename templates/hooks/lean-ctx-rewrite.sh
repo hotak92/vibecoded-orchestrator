@@ -146,7 +146,13 @@ _lc_allowlist="$_lc_hook_dir/_lib/lean-ctx-allowlist.txt"
 _lc_tee="$_lc_hook_dir/_lib/lean-ctx-tee.sh"
 [ -f "$_lc_allowlist" ] || exit 0
 [ -f "$_lc_tee" ] || exit 0
-_lc_proj="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> no tee dir, so the command runs raw (the documented arm for a state dir that cannot be made).
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+_lc_proj="$(vco_project_root)" || _lc_proj=""
+[ -n "$_lc_proj" ] || exit 0
 _lc_rawdir="$_lc_proj/.claude/state/lean-ctx-tee"
 
 export _LC_ALLOWLIST="$_lc_allowlist"

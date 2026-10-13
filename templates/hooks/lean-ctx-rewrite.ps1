@@ -228,7 +228,12 @@ if (-not $matched) { exit 0 }
 # Allow-listed → cmd file (verbatim) + wrapper rewrite. Any failure →
 # exit 0 with no stdout → raw.
 if ($leanCtxTtl -notmatch '^[0-9]+$') { $leanCtxTtl = "168" }
-$proj = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> no tee dir, so the command runs raw (the documented arm for a state dir that cannot be made).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$proj = Get-VcoProjectRoot
+if (-not $proj) { exit 0 }
 $rawDir = Join-Path $proj ".claude/state/lean-ctx-tee"
 try { New-Item -ItemType Directory -Path $rawDir -Force -ErrorAction Stop | Out-Null } catch { exit 0 }
 # SF-1 (v0.2.101 review) + NF-4 (re-review): the tee dir holds raw command

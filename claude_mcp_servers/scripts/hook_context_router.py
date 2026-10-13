@@ -188,11 +188,20 @@ def _first_content_string(obj) -> str:
 
 
 def _resolve_project_root(payload: Dict) -> str:
-    root = (os.environ.get("CLAUDE_PROJECT_DIR") or "").strip()
-    if root:
-        return root
-    cwd = str(payload.get("cwd") or "").strip()
-    return cwd or os.getcwd()
+    """``CLAUDE_PROJECT_DIR``, else the nearest VCO project above the hook
+    payload's ``cwd`` (or the process cwd) — :func:`vco_lib.project_root.
+    resolve_project_root`, the one home every ``.claude/state`` writer shares.
+
+    ``""`` when no project encloses that directory: every state writer below
+    treats an empty root as "no state" (no cache, no seen-store, no claim,
+    no budget file). Pre-v0.2.102 the fallback was the BARE cwd, so a run
+    from a subfolder planted ``<subfolder>/.claude/state/`` there.
+    """
+    from vco_lib.project_root import resolve_project_root
+
+    start = str(payload.get("cwd") or "").strip() or None
+    root = resolve_project_root(start)
+    return str(root) if root is not None else ""
 
 
 # --- query cache (router-owned namespaces) -----------------------------------
@@ -208,6 +217,8 @@ def _resolve_project_root(payload: Dict) -> str:
 
 
 def _cache_dir(project_root: str) -> Optional[Path]:
+    if not project_root:
+        return None  # no resolvable project: never a cwd-relative cache
     try:
         d = Path(project_root) / ".claude" / "state" / "query_cache"
         d.mkdir(parents=True, exist_ok=True)
@@ -575,6 +586,8 @@ def _budget_charge(path: Optional[str], chars: int) -> None:
 
 def _budget_gc(project_root: str) -> None:
     """ opportunistic 1-day GC of budget files (bounded scan)."""
+    if not project_root:
+        return
     try:
         state = Path(project_root) / ".claude" / "state"
         cutoff = time.time() - BUDGET_GC_AGE_S

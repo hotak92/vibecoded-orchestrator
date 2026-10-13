@@ -55,10 +55,21 @@ $ScriptDir = $PSScriptRoot
 $StderrCap = Join-Path $ScriptDir "_lib/stderr-cap.ps1"
 if (Test-Path $StderrCap) { . $StderrCap }
 
-$ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
-$LogDir = Join-Path $ProjectRoot ".claude/logs"
-$LogFile = Join-Path $LogDir "worktree-guard.jsonl"
-try { New-Item -ItemType Directory -Force -Path $LogDir -ErrorAction SilentlyContinue | Out-Null } catch { }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py and _lib/project-root.sh). "" when no VCO project
+# encloses the current location: the worktree decision still runs, but the
+# log row, notices and launch records (state writes) are skipped.
+. (Join-Path $ScriptDir "_lib/project-root.ps1")
+$ProjectRoot = Get-VcoProjectRoot
+$LogDir = ""
+$LogFile = ""
+if ($ProjectRoot) {
+    $LogDir = Join-Path $ProjectRoot ".claude/logs"
+    $LogFile = Join-Path $LogDir "worktree-guard.jsonl"
+    try { New-Item -ItemType Directory -Force -Path $LogDir -ErrorAction SilentlyContinue | Out-Null } catch { }
+} else {
+    [Console]::Error.WriteLine("worktree-guard: no VCO project encloses $((Get-Location).Path); log, notices and launch records skipped")
+}
 
 # ── Read stdin (the WorktreeCreate payload) ───────────────────────────────
 $HookStdin = ""
@@ -85,6 +96,7 @@ function Log-Event([string]$decision, [string]$reason, [string]$proposed, [strin
             raw_payload   = $HookStdin
         }
         $json = $row | ConvertTo-Json -Compress -Depth 6
+        if (-not $LogFile) { return }
         Add-Content -Path $LogFile -Value $json -ErrorAction SilentlyContinue
     } catch { }
 }
@@ -161,7 +173,7 @@ function Sanitize-Id([string]$raw) {
 }
 
 # ── Resolve the git toplevel (the repo this create is scoped to) ──────────
-$GitScopeDir = $ProjectRoot
+$GitScopeDir = if ($ProjectRoot) { $ProjectRoot } else { (Get-Location).Path }  # a read
 if ($RepoHint -and (Test-Path -LiteralPath $RepoHint -PathType Container)) {
     $GitScopeDir = $RepoHint
 }
@@ -176,20 +188,23 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
 # The harness discards a WorktreeCreate systemMessage, so a non-default
 # create leaves a one-shot notice keyed by the identifier; the SubagentStart
 # hook subagent-start-isolation-check.ps1 hands it to the agent.
-$NoticeDir = Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "worktree-guard"
+$NoticeDir = ""
+if ($ProjectRoot) { $NoticeDir = Join-Path (Join-Path (Join-Path $ProjectRoot ".claude") "state") "worktree-guard" }
 # Per-launch records (v0.2.102 W6-Q follow-up): one home is
 # _lib/worktree-records.ps1 (must match _lib/worktree-records.sh).
 $WtrecHelper = Join-Path $PSScriptRoot "_lib/worktree-records.ps1"
 if (Test-Path -LiteralPath $WtrecHelper) {
     . $WtrecHelper
-    Remove-WtrecStale $ProjectRoot
+    if ($ProjectRoot) { Remove-WtrecStale $ProjectRoot }
 }
 function Save-LaunchRecord([string]$mode, [string]$path, [string]$base, [string]$toplevel) {
+    if (-not $ProjectRoot) { return }
     if (Get-Command Write-WtrecRecord -ErrorAction SilentlyContinue) {
         Write-WtrecRecord $ProjectRoot $WtName $mode $path $base $toplevel
     }
 }
 function Write-Notice([string]$text) {
+    if (-not $NoticeDir) { return }
     if (-not $WtName) { return }
     if ($WtName -notmatch '^[A-Za-z0-9_-][A-Za-z0-9._-]*$') { return }
     try {

@@ -40,14 +40,22 @@ $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $SessionIdFromStdin = Get-VcoHookSessionId -Stdin $HookStdin
 
-$ContextFile = ".claude/CONTEXT_STATE.md"
 # Snapshot state lives under the project (gitignored .claude/state/) so it
 # survives reboots and launcher restarts — Claude Code's `resume` feature
 # can reuse a session_id across these boundaries, and a $TMPDIR-based path
 # would lose the diff baseline mid-session when /tmp is wiped on boot.
 # The `ctx_` filename prefix namespaces these files within the shared
 # .claude/state/ dir (which also holds seen_kg_titles_*, reads_*, etc.).
-if (-not $env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR = (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to diff and no snapshot written.
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$DiffProjectRoot = Get-VcoProjectRoot
+if (-not $DiffProjectRoot) { exit 0 }
+$env:CLAUDE_PROJECT_DIR = $DiffProjectRoot
+# The live file is the PROJECT's, like every other path here (it was
+# relative to the current location).
+$ContextFile = Join-Path $DiffProjectRoot ".claude/CONTEXT_STATE.md"
 $SnapshotDir = Join-Path $env:CLAUDE_PROJECT_DIR ".claude/state"
 $SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } else { "default" }
 

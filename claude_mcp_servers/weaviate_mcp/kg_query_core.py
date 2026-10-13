@@ -101,13 +101,14 @@ except ImportError as _embed_import_err:
 HAS_EMBEDDING_SERVICE = True
 
 
-# v0.2.94: the user's HOME, for the boundary in `_resolution_context()` below.
-# Resolved through the ONE resolver (`VCT_USER_HOME_OVERRIDE` -> `Path.home()`)
+# v0.2.94: the user's HOME (re-exported by ``server``). The boundary in
+# `_resolution_context()` now reads it inside ``vco_lib.project_root``
+# (v0.2.102 W6-W), from the same resolver. Resolved through the ONE resolver (`VCT_USER_HOME_OVERRIDE` -> `Path.home()`)
 # and never reconstructed inline — an inline `Path.home()` is exactly the shape
 # that let the doctor read the developer's real global config from the test
 # suite (v0.2.92 W-CLAUDE), because nothing could steer it.
 try:
-    from vco_lib.paths import user_home as _user_home
+    from vco_lib.paths import user_home as _user_home  # noqa: F401  # pyright: ignore[reportUnusedImport] — re-exported by server
 except ImportError as _user_home_import_err:
     _reraise_vco_lib_import(_user_home_import_err, "paths.user_home")
 
@@ -183,52 +184,25 @@ _CTX_MODULE = "module"        # last resort: where server.py happens to live
 _MODULE_OWN_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+# The marker test and the home boundary live in ONE home since v0.2.102 W6-W
+# (``vco_lib.project_root``), shared with every ``.claude/state`` writer that
+# used to fall back to a bare cwd. The historical names stay as thin
+# delegates so ``server`` keeps re-exporting (and ``bind_into``-rebinding)
+# them unchanged. ``.claude/settings.json`` or ``.claude/env`` marks a project
+# (a bare ``.claude/`` does not); the walk stops at, and never accepts,
+# either home this process could have.
 def _looks_like_vco_project(path: Path) -> bool:
-    """True when ``path`` carries the marker files a bundled VCO project has.
+    """Delegate: :func:`vco_lib.project_root.looks_like_vco_project`."""
+    from vco_lib.project_root import looks_like_vco_project
 
-    ``.claude/settings.json`` is the canonical per-project env channel (the
-    file Claude Code itself reads); ``.claude/env`` is its shell sibling.
-    Both are written unconditionally by ``install-bundle`` — including under
-    safe-add — so either one present means "this directory is a VCO project".
-    Pure filesystem check: no hub call, no import, cheap enough to run on
-    every ancestor.
-    """
-    claude = path / ".claude"
-    try:
-        return (claude / "settings.json").is_file() or (claude / "env").is_file()
-    except OSError:
-        return False
+    return looks_like_vco_project(path)
 
 
 def _home_boundaries() -> "frozenset[Path]":
-    """Every directory this process could mean by "the user's home".
+    """Delegate: :func:`vco_lib.project_root.home_boundaries`."""
+    from vco_lib.project_root import home_boundaries
 
-    TWO members, deliberately — this is a SAFETY boundary, not a config read,
-    and the two answers can differ:
-
-      * :func:`vco_lib.paths.user_home` — the ONE config resolver
-        (``VCT_USER_HOME_OVERRIDE`` -> ``Path.home()``). Whatever VCO has been
-        told to treat as home.
-      * ``Path.home()`` — the OS home, which keeps holding the real
-        ``~/.claude/settings.json`` no matter what the override says.
-
-    Using only the first would let ``VCT_USER_HOME_OVERRIDE`` — a shipped,
-    user-settable knob — point away from the real home and re-open the very
-    bug this boundary closes; using only the second would ignore the override
-    a sandbox or the test suite legitimately sets. A home is out of bounds if
-    it is EITHER, so neither answer can defeat the guard.
-
-    Never raises: an unresolvable home (no ``$HOME``, no passwd entry) simply
-    contributes no boundary, and :func:`_resolution_context` then walks as it
-    did before rather than inventing one.
-    """
-    found: "set[Path]" = set()
-    for probe in (_user_home, Path.home):
-        try:
-            found.add(probe().resolve())
-        except (OSError, RuntimeError, ValueError):
-            continue
-    return frozenset(found)
+    return home_boundaries()
 
 
 def _resolution_context() -> "tuple[Path, str]":
@@ -267,17 +241,11 @@ def _resolution_context() -> "tuple[Path, str]":
                 return candidate.resolve(), _CTX_WORKSPACE
         except OSError:
             pass
-    try:
-        here = Path.cwd().resolve()
-    except OSError:
-        here = None
-    if here is not None:
-        homes = _home_boundaries()
-        for ancestor in (here, *here.parents):
-            if ancestor in homes:
-                break  # home, and everything above it, is out of bounds
-            if _looks_like_vco_project(ancestor):
-                return ancestor, _CTX_CWD
+    from vco_lib.project_root import find_vco_project_root
+
+    found = find_vco_project_root()  # home-bounded walk, one home
+    if found is not None:
+        return found, _CTX_CWD
     return _MODULE_OWN_ROOT, _CTX_MODULE
 
 

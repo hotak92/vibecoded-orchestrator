@@ -38,7 +38,12 @@ try {
     $payloadJson = (@{ _parse_error = $parseError; _raw_preview = $preview } | ConvertTo-Json -Compress)
 }
 
-$ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to do (no state is written).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectDir = Get-VcoProjectRoot
+if (-not $ProjectDir) { exit 0 }
 $LogFile = Join-Path $ProjectDir ".claude/logs/config_changes.jsonl"
 
 $LogDir = Split-Path $LogFile -Parent

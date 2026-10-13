@@ -15,7 +15,12 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 $ContextFile = ".claude/CONTEXT_STATE.md"
 
-$ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the current location. None -> nothing to do (no state is written).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectDir = Get-VcoProjectRoot
+if (-not $ProjectDir) { exit 0 }
 
 # v0.2.97: the thresholds are the bundled session-state module's settings
 # (launcher/bundled_manifests/vct-session-state.json) — CONTEXT_STATE_MAX_LINES

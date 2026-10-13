@@ -40,9 +40,13 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
 . "$PSScriptRoot/_lib/resolve-powershell.ps1"
 
+# Repo root: an explicit -RepoPath wins; else the ONE rule (_lib/project-root.ps1,
+# must match vco_lib/project_root.py). None -> nothing to analyze.
 if (-not $RepoPath) {
-    $RepoPath = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
+    . (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+    $RepoPath = Get-VcoProjectRoot
 }
+if (-not $RepoPath) { exit 0 }
 
 # v0.2.66 (Bug 3): resolve the code-graph collection prefix for a root via
 # the vct-hub resolver (code_graph_collection_prefix), else the basename of

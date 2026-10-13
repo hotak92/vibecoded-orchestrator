@@ -15,8 +15,14 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
-PROJECT_NAME=$(basename "$PROJECT_DIR")
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py). None -> the compaction log (metrics dir) is still
+# written, labelled with the cwd's name; the per-session state resets and the
+# notification (both under the project) are skipped.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
+PROJECT_NAME=$(basename "${PROJECT_DIR:-$PWD}")
 
 # Resolve a Python interpreter portably (python3 → python → py).
 # See audit finding F6, 2026-04-30. _lib/find-python.sh sets $PY.
@@ -65,7 +71,7 @@ fi
 # (renamed from the pre-v0.2.70 seen_kg_titles_<id>.txt; both are wiped here so
 # a session straddling the upgrade still gets a clean reset). MUST MATCH the
 # seen_inject name in _lib/seen-store.sh and post-compact.ps1.
-if [ -n "$SESSION_ID" ]; then
+if [ -n "$SESSION_ID" ] && [ -n "$PROJECT_DIR" ]; then
     SEEN_INJECT_FILE="$PROJECT_DIR/.claude/state/seen_inject_${SESSION_ID}.txt"
     [ -f "$SEEN_INJECT_FILE" ] && rm -f "$SEEN_INJECT_FILE"
     # Legacy name (pre-v0.2.70) — wipe too for upgrade-straddling sessions.
@@ -96,7 +102,7 @@ fi
 # Note: we do NOT wipe $PROJECT_DIR/.claude/state/tool_backups/ — those
 # have a different lifecycle (tool-call rollback, not dedup), and the
 # pre-tool-use hook runs its own 24h GC there.
-if [ -n "$SESSION_ID" ]; then
+if [ -n "$SESSION_ID" ] && [ -n "$PROJECT_DIR" ]; then
     READS_FILE="$PROJECT_DIR/.claude/state/reads_${SESSION_ID}.txt"
     [ -f "$READS_FILE" ] && rm -f "$READS_FILE" 2>/dev/null || true
     # v0.2.70 Stream E (SF-1): also wipe the INJECTOR reads store
@@ -116,7 +122,7 @@ fi
 # Matches what `agent-skill-keyword-match.py::_dedup_file` writes to
 # (moved from $TMPDIR/claude_keyword_suggest/ to project-local state for
 # the same resume-across-reboot reasoning as the ctx_snapshot block below).
-if [ -n "$SESSION_ID" ]; then
+if [ -n "$SESSION_ID" ] && [ -n "$PROJECT_DIR" ]; then
     KW_SEEN="$PROJECT_DIR/.claude/state/keyword_suggest_${SESSION_ID}.txt"
     [ -f "$KW_SEEN" ] && rm -f "$KW_SEEN"
 fi
@@ -128,7 +134,7 @@ fi
 # anchored to the pre-compact baseline, which is incoherent (the LLM no
 # longer has the pre-compact view of CONTEXT_STATE.md). pre-compact-save.sh
 # touches the compact flag as the cross-hook signal; this is the actual wipe.
-if [ -n "$SESSION_ID" ]; then
+if [ -n "$SESSION_ID" ] && [ -n "$PROJECT_DIR" ]; then
     CTX_SNAPSHOT="$PROJECT_DIR/.claude/state/ctx_snapshot_${SESSION_ID}"
     CTX_COMPACT_FLAG="$PROJECT_DIR/.claude/state/ctx_compact_flag_${SESSION_ID}"
     [ -f "$CTX_SNAPSHOT" ] && rm -f "$CTX_SNAPSHOT"
@@ -159,7 +165,7 @@ if [ -f "$_PC_LIB" ]; then
 fi
 
 # Cross-platform desktop notification (Linux/macOS/Windows). See audit F2.
-if [ -n "${PY:-}" ] && [ -f "$PROJECT_DIR/.claude/scripts/notify.py" ]; then
+if [ -n "${PY:-}" ] && [ -n "$PROJECT_DIR" ] && [ -f "$PROJECT_DIR/.claude/scripts/notify.py" ]; then
     "$PY" "$PROJECT_DIR/.claude/scripts/notify.py" \
         "Context compacted — $PROJECT_NAME" "Trigger: $TRIGGER. Context re-injected." \
         --urgency low --icon dialog-information --expire-time 5000 \

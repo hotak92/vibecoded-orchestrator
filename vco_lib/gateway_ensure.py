@@ -538,11 +538,16 @@ def _record_unrunnable(folder: Optional[Path], result: GatewayEnsureResult) -> N
 
     Only into a folder that is already a managed project — a session-start
     hook must never create ``.claude/`` somewhere the user did not ask for.
+    "Managed" is the marked-project rule (``vco_lib.project_root``:
+    ``.claude/settings.json`` or ``.claude/env``); a bare ``.claude/`` — such
+    as a stray ``<sub>/.claude/state`` — does not qualify (v0.2.102 W6-W).
     """
     if folder is None:
         return
     root = Path(folder)
-    if not (root / ".claude").is_dir():
+    from vco_lib.project_root import looks_like_vco_project  # noqa: PLC0415
+
+    if not looks_like_vco_project(root):
         return
     try:
         from vco_lib.deferral_emit import emit

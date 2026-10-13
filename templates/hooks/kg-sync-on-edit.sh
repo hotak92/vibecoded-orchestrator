@@ -82,7 +82,13 @@ esac
 # Route through the venv-resolving kg-sync wrapper (the ONE home for the
 # weaviate/yaml import-resolution). Prefer the project-local wrapper; fall
 # back to the templates copy if the project hasn't been bundled yet.
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+# Project root: the ONE shell rule (_lib/project-root.sh, must match
+# vco_lib/project_root.py): CLAUDE_PROJECT_DIR, else the nearest marked VCO
+# project above the cwd. None -> nothing to do (no state is written).
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
+[ -n "$PROJECT_DIR" ] || exit 0
 KG_SYNC="$PROJECT_DIR/.claude/scripts/kg-sync"
 [ -x "$KG_SYNC" ] || KG_SYNC=""
 

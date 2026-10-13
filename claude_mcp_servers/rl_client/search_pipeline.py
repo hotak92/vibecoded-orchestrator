@@ -756,27 +756,55 @@ def _record_rl_success() -> None:
     _bump_rl_counter("success_count")
 
 
+def rl_counter_root() -> "Optional[str]":
+    """Project root of the on-disk rerank outcome counter (one home).
+
+    ``CLAUDE_PROJECT_DIR`` → ``server.KG_BASE_DIR`` → the nearest VCO project
+    above the cwd (:func:`vco_lib.project_root.find_vco_project_root`) →
+    ``None``. The writer (:func:`_bump_rl_counter`) skips on ``None``;
+    rl-doctor's reader calls this same function so both sides name one file.
+    Pre-v0.2.102 the last rung was the BARE cwd, which planted
+    ``<subfolder>/.claude/state/`` wherever a CLI happened to stand.
+    """
+    import os as _os
+
+    root = (_os.environ.get("CLAUDE_PROJECT_DIR") or "").strip()
+    if root:
+        return root
+    try:
+        root = getattr(_kg_server(), "KG_BASE_DIR", "") or ""
+    except Exception:  # noqa: BLE001
+        root = ""
+    if root:
+        return root
+    from vco_lib.project_root import find_vco_project_root  # noqa: PLC0415
+
+    found = find_vco_project_root()
+    return str(found) if found is not None else None
+
+
 def _bump_rl_counter(field: str, reason: "Optional[str]" = None) -> None:
     """Shared writer for the on-disk rerank outcome counter (one home).
 
-    Root resolution: CLAUDE_PROJECT_DIR → server.KG_BASE_DIR → cwd (matches
-    rl-doctor's reader). Atomic tmp-write-then-replace. ``reason`` (when
-    given) updates ``last_reason``; ``last_ts`` always refreshes. Soft-fail
-    throughout — the counter must never break a search.
+    Root resolution: :func:`rl_counter_root` (shared with rl-doctor's
+    reader); no resolvable project → no write, one debug line. Atomic
+    tmp-write-then-replace. ``reason`` (when given) updates ``last_reason``;
+    ``last_ts`` always refreshes. Soft-fail throughout — the counter must
+    never break a search.
     """
     try:
         import json as _json
         import os as _os
         import time as _time
 
-        root = _os.environ.get("CLAUDE_PROJECT_DIR", "")
-        if not root:
-            try:
-                root = getattr(_kg_server(), "KG_BASE_DIR", "") or ""
-            except Exception:  # noqa: BLE001
-                root = ""
-        if not root:
-            root = _os.getcwd()
+        root = rl_counter_root()
+        if root is None:
+            logger.debug(
+                "_bump_rl_counter(%s): no VCO project encloses the cwd and "
+                "CLAUDE_PROJECT_DIR/KG_BASE_DIR are unset; counter not written",
+                field,
+            )
+            return
         state_dir = _os.path.join(root, ".claude", "state")
         _os.makedirs(state_dir, exist_ok=True)
         path = _os.path.join(state_dir, "rl_fallback_counter.json")

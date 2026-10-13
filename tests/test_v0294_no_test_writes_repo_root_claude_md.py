@@ -10,9 +10,13 @@ that shows up in ``git status`` while a suite run is in flight):
      ``_write_failure_deferral`` on failure.
   2. Reconciling a ledger REWRITES ``<root>/CLAUDE.md``: entries present ⇒ the
      ``vco-deferral-reminder`` block is spliced in; none ⇒ it is stripped.
-  3. ``_detect_project_root`` falls back to ``Path.cwd()`` when that directory
-     holds a ``.claude/`` — and pytest's cwd is this checkout, whose
-     ``CLAUDE.md`` is TRACKED.
+  3. ``_detect_project_root`` falls back to the cwd's project — before
+     v0.2.102 any cwd holding a ``.claude/``, since then the nearest
+     MARKED project (``.claude/settings.json`` or ``.claude/env``) at or
+     above it — and pytest's cwd is a checkout whose ``CLAUDE.md`` is
+     TRACKED. A bare checkout no longer qualifies; a developer's installed
+     checkout (it has ``.claude/settings.json``) still does, so the
+     containment below stays.
 
 ``tests/conftest.py`` had a session-scoped guard that RESTORED the file at
 session end, which is why a completed run looked clean; an interrupted run, or
@@ -142,22 +146,63 @@ def test_ledger_reconcile_rewrites_only_the_root_it_is_given(tmp_path):
     assert "# Sentinel project" in sentinel_text, "body outside the block lost"
 
 
-def test_unpatched_resolver_really_would_pick_this_checkout(monkeypatch):
+def test_unpatched_resolver_really_would_pick_a_marked_checkout(tmp_path, monkeypatch):
     """Name the hazard executably, using the pre-patch resolver.
 
-    This is why the containment exists. If this ever stops being true — say
-    ``_detect_project_root`` grows a "never the orchestrator root" rule of its
-    own — the conftest fixture can be simplified; read this test first.
+    This is why the containment exists. A checkout that has been installed
+    (it carries ``.claude/settings.json``, as a developer's orchestrator root
+    does) IS resolved by a rootless ``for_project()`` — from its root or any
+    folder under it — so its ledger reconcile would rewrite that tracked
+    ``CLAUDE.md``. If this ever stops being true, the conftest fixture can be
+    simplified; read this test first.
+
+    v0.2.102 W6-W: this test used to assert that THIS checkout, with a bare
+    ``.claude/``, was picked. That pinned the defect (any ``.claude/`` counted,
+    so a stray ``<sub>/.claude/state`` became an install root), not the
+    protection; the hazard it exists to name holds for marked checkouts, and
+    is asserted on one here.
     """
     for var in ("KG_BASE_DIR", "VCT_ORCHESTRATOR_ROOT"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.chdir(REPO_ROOT)
+    monkeypatch.setenv("VCT_USER_HOME_OVERRIDE", str(tmp_path / "home"))
+    checkout = tmp_path / "checkout"
+    (checkout / ".claude").mkdir(parents=True)
+    (checkout / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+    sub = checkout / "docs" / "deep"
+    sub.mkdir(parents=True)
 
-    assert (REPO_ROOT / ".claude").is_dir(), "premise: checkout has .claude/"
-    assert _REAL_DETECT() == REPO_ROOT.resolve(), (
-        "a rootless EmbeddingService.for_project() resolves THIS checkout, so "
-        "its ledger reconcile writes the tracked CLAUDE.md."
+    monkeypatch.chdir(checkout)
+    assert _REAL_DETECT() == checkout.resolve()
+    monkeypatch.chdir(sub)
+    assert _REAL_DETECT() == checkout.resolve(), (
+        "a rootless EmbeddingService.for_project() resolves the enclosing "
+        "installed checkout, so its ledger reconcile writes the tracked CLAUDE.md."
     )
+
+
+def test_unpatched_resolver_never_takes_a_bare_claude_dir(tmp_path, monkeypatch):
+    """A ``.claude/`` with no marker is not an install root (v0.2.102 W6-W).
+
+    The stray ``<sub>/.claude/state`` the bare-cwd state writers used to
+    plant must not attract a deferral ledger; the walk passes through it to
+    the real project above, or to nothing.
+    """
+    for var in ("KG_BASE_DIR", "VCT_ORCHESTRATOR_ROOT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("VCT_USER_HOME_OVERRIDE", str(tmp_path / "home"))
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / ".claude" / "env").write_text("", encoding="utf-8")
+    stray = proj / "reviews"
+    (stray / ".claude" / "state").mkdir(parents=True)
+
+    monkeypatch.chdir(stray)
+    assert _REAL_DETECT() == proj.resolve()
+
+    lone = tmp_path / "lone"
+    (lone / ".claude" / "state").mkdir(parents=True)
+    monkeypatch.chdir(lone)
+    assert _REAL_DETECT() is None
 
 
 def test_suite_wide_containment_reroutes_rootless_resolution(tmp_path, monkeypatch):
@@ -228,8 +273,9 @@ def test_real_post_edit_hook_reconciles_its_own_project_not_the_checkout(tmp_pat
     same mechanism runs there: ``templates/hooks/post-edit-outcome.sh`` spawns
     a Python child that calls ``emit_outcome_event``, and downstream of it
     ``EmbeddingService.for_project()`` is reached with no root, so
-    ``_detect_project_root`` falls to ``Path.cwd()`` — whatever directory the
-    harness handed the hook, which is not guaranteed to be the project. It
+    ``_detect_project_root`` falls to the project enclosing the cwd —
+    whatever directory the harness handed the hook, which is not guaranteed
+    to be the hook's project. It
     then writes THAT root's ledger (``EMBEDDING_FAILURES.md`` /
     ``UPDATE_DEFERRED.*``) and rewrites its ``CLAUDE.md``.
 

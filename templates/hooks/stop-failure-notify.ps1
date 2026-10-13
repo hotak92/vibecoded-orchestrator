@@ -29,8 +29,13 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
-$ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
-$ProjectName = Split-Path $ProjectDir -Leaf
+# Project root: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py). It only labels the ledger row and locates
+# notify.py; the ledger is written either way. None -> the label falls back
+# to the current location's name and no notification is sent.
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$ProjectDir = Get-VcoProjectRoot
+$ProjectName = Split-Path $(if ($ProjectDir) { $ProjectDir } else { (Get-Location).Path }) -Leaf
 
 $LibDir = Join-Path $PSScriptRoot "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
@@ -293,8 +298,8 @@ if (-not $CoreRan) {
 if ($env:VCO_STOP_FAILURE_NOTIFY -eq "0") { exit 0 }
 
 # Urgent cross-platform notification.
-$NotifyScript = Join-Path $ProjectDir ".claude/scripts/notify.py"
-if ($NotifyFlag -eq "1" -and $PY -and (Test-Path $NotifyScript)) {
+$NotifyScript = if ($ProjectDir) { Join-Path $ProjectDir ".claude/scripts/notify.py" } else { "" }
+if ($NotifyFlag -eq "1" -and $PY -and $NotifyScript -and (Test-Path $NotifyScript)) {
     try {
         & $PY $NotifyScript "Claude API Error -- $ProjectName" "$NotifyMsg" `
             --urgency critical --icon dialog-error --expire-time 15000 2>$null | Out-Null

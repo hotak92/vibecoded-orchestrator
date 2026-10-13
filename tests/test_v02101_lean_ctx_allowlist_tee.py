@@ -154,6 +154,18 @@ def _make_fake_lean_ctx(bin_dir: Path, *, failing: bool = False) -> Path:
     return fake
 
 
+def _mark_project(proj: Path) -> None:
+    """Stage ``proj`` as a real VCO project (``.claude/settings.json``).
+
+    The hook finds its project by the marked-root rule (v0.2.102 W6-W,
+    ``_lib/project-root.{sh,ps1}``). An unmarked cwd is no project, and with
+    no project there is no private tee dir, so the command runs raw — which
+    would make every "raw" assertion here pass for the wrong reason.
+    """
+    (proj / ".claude").mkdir(parents=True, exist_ok=True)
+    (proj / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+
+
 def _run_sh_hook(cmd: str, tmp_path: Path, *, env_file: str | None = None,
                  extra_tool_input: dict | None = None,
                  extra_env: dict | None = None,
@@ -174,7 +186,7 @@ def _run_sh_hook(cmd: str, tmp_path: Path, *, env_file: str | None = None,
     if extra_env:
         env.update(extra_env)
     proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
+    _mark_project(proj)
     if env_file is not None:
         (proj / ".claude").mkdir(exist_ok=True)
         (proj / ".claude" / "env").write_text(env_file, encoding="utf-8")
@@ -199,7 +211,7 @@ def _run_ps1_hook(cmd: str, tmp_path: Path, *, env_file: str | None = None,
     env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
     env["FAKE_ARGV_LOG"] = str(tmp_path / "argv.log")
     proj = tmp_path / "proj"
-    proj.mkdir(parents=True, exist_ok=True)
+    _mark_project(proj)
     if env_file is not None:
         (proj / ".claude").mkdir(exist_ok=True)
         (proj / ".claude" / "env").write_text(env_file, encoding="utf-8")
@@ -337,7 +349,7 @@ class TestShAllowListGate:
 
     def test_binary_absent_everywhere_clean_noop(self, tmp_path):
         home = tmp_path / "home"
-        (home / "proj").mkdir(parents=True)
+        _mark_project(home / "proj")
         env = dict(os.environ)
         env.pop("VCT_DISABLE_HOOKS", None)
         env["HOME"] = str(home)
@@ -754,7 +766,7 @@ class TestPs1HookParity:
         env.pop("CLAUDE_PROJECT_DIR", None)
         env["PATH"] = f"{shim}{os.pathsep}{bin_dir}{os.pathsep}{env.get('PATH', '')}"
         proj = tmp_path / "proj"
-        proj.mkdir(parents=True, exist_ok=True)
+        _mark_project(proj)
         res = subprocess.run(
             ["pwsh", *PWSH_BASE_FLAGS, "-File", str(PS1_HOOK)],
             input=_payload("npm install"), capture_output=True, text=True,

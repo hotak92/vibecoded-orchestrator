@@ -100,13 +100,19 @@ fi
 # helper at .claude/scripts/notify.py (Linux notify-send / macOS osascript /
 # Windows toast); fall back to a direct notify-send / osascript call if
 # the helper is absent.
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
-notify_helper="${PROJECT_DIR}/.claude/scripts/notify.py"
+# Project root (only to find notify.py): the ONE shell rule
+# (_lib/project-root.sh, must match vco_lib/project_root.py). None -> the
+# direct notify-send / osascript fallback below.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
+PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
+notify_helper=""
+if [ -n "$PROJECT_DIR" ]; then notify_helper="${PROJECT_DIR}/.claude/scripts/notify.py"; fi
 notify_title="VCO fork-bomb killed"
 notify_body="Killed ${LEAN_CTX_COUNT} runaway lean-ctx processes (remaining: ${REMAINING})"
 
 notified=0
-if [ -f "${notify_helper}" ]; then
+if [ -n "${notify_helper}" ] && [ -f "${notify_helper}" ]; then
     # Resolve a Python interpreter portably via the existing helper.
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     # shellcheck source=_lib/find-python.sh disable=SC1091

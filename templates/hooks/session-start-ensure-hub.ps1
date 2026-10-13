@@ -176,8 +176,12 @@ else {
 # safe to issue while one is already running. "not_registered" is the default
 # and a silent success: autostart is opt-in and NOTHING here registers it.
 # ---------------------------------------------------------------------------
-$GwFolder = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
-$GwArgs = @("-m", "vco_lib.gateway_ensure", "ensure", "--json", "--folder", $GwFolder)
+# --folder: the ONE rule (_lib/project-root.ps1, must match
+# vco_lib/project_root.py). No project -> ensure without a folder (no ledger row).
+. (Join-Path $PSScriptRoot "_lib/project-root.ps1")
+$GwFolder = Get-VcoProjectRoot
+$GwArgs = @("-m", "vco_lib.gateway_ensure", "ensure", "--json")
+if ($GwFolder) { $GwArgs += @("--folder", $GwFolder) }
 $GwRes = $null
 $GwRc = $null
 $GwErr = [System.IO.Path]::GetTempFileName()

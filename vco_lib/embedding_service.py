@@ -723,8 +723,13 @@ def _detect_project_root(explicit: Path | None = None) -> Path | None:
          to the workspace root).
       3. ``VCT_ORCHESTRATOR_ROOT`` env var (set by the launcher when
          spawning the bundled scripts).
-      4. ``Path.cwd()`` if it contains a ``.claude/`` directory
-         (heuristic — the current dir IS a VCO project).
+      4. The nearest VCO project at or above ``Path.cwd()`` —
+         :func:`vco_lib.project_root.find_vco_project_root`: a folder with
+         ``.claude/settings.json`` or ``.claude/env``, never the user's
+         home. Pre-v0.2.102 this was "the cwd, if it holds any ``.claude/``",
+         so a stray ``<sub>/.claude/state`` (planted by the bare-cwd state
+         writers W6-W fixed) was taken for an install root and got a
+         deferral ledger + a rewritten ``CLAUDE.md``.
       5. None — caller is responsible for handling "no project context"
          (currently means the failure-markdown hint isn't written).
     """
@@ -738,10 +743,9 @@ def _detect_project_root(explicit: Path | None = None) -> Path | None:
             if p.exists():
                 return p
 
-    cwd = Path.cwd().resolve()
-    if (cwd / ".claude").is_dir():
-        return cwd
-    return None
+    from vco_lib.project_root import find_vco_project_root  # noqa: PLC0415
+
+    return find_vco_project_root()
 
 
 # ---------------------------------------------------------------------------
