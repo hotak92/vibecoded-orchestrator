@@ -33,7 +33,7 @@ User action / Claude turn
 [UserPromptSubmit]      — may inject diff context, show reminders
         |
         v
-[PreToolUse]            — security scan, logging, KG search suggestion
+[PreToolUse]            — security scan, logging, KG / code-graph context injection
         |
    Tool executes
         |

@@ -355,15 +355,12 @@
   },
   "knowledge/concepts/orchestrator-hook-system.md": {
     "title": "Orchestrator Hook System",
-    "description": "The Orchestrator Hook System functions as the core mechanism intercepting Claude Code lifecycle events to transform it into an automated workflow engine. Hooks are scripts registered in `.claude/settings.json` that bind to specific events, such as tool use, compaction, or session start, running either synchronously or in the background. Functionally, they facilitate security enforcement, automate knowledge-graph synchronization, and manage context preservation across various operations. This system is critical for implementing complex agentic workflows by adding necessary quality gates and external service integration points into the execution flow.",
-    "summary": "Hooks, registered in `.claude/settings.json`, intercept Claude Code lifecycle events (e.g., `PreToolUse`, `PostToolUse`, `PreCompact`) to automate workflows, enabling security enforcement, knowledge-graph synchronization, and context preservation. The most critical function is the structured reinjection of context state during compaction via `compact-context-reinject.sh`, which places the unconstrained `.claude/CONTEXT_STATE.md` at the start of the payload to mitigate Lost-In-The-Middle (LITM) ordering issues.",
-    "generated_at": "2026-10-07T20:21:11.611389+00:00",
+    "description": "The Orchestrator Hook System intercepts Claude Code lifecycle events—such as session start, tool use, and file edits—to transform it into an automated workflow engine. Hooks are shell scripts registered in `.claude/settings.json` that bind to specific events, with blocking hooks capable of aborting operations. Key functions include security enforcement (command scanning), automatic knowledge-graph synchronization, and state preservation across context compaction. Use this system to implement structured, controlled agentic workflows that require pre- and post-execution validation or context management.",
+    "summary": "Hooks are shell scripts registered in `.claude/settings.json` that intercept Claude Code lifecycle events (e.g., `PreToolUse`, `SessionStart`) to implement automated workflows. The most important fact is that these hooks allow for granular interception points to enforce security scanning, manage context state, and trigger knowledge-graph synchronization before or after core operations.",
+    "generated_at": "2026-10-13T09:04:37.998668+00:00",
     "backend": "ollama",
-    "chunk_summaries": {
-      "1.0": "The hook system intercepts specific Claude Code lifecycle events (e.g., prompt submit, tool use, compaction, stop) to transform the CLI into a workflow engine that manages context, security, cost tracking, and state synchronization."
-    },
-    "content_hash": "b45b407b3b030231",
-    "total_chunks": 3
+    "content_hash": "8063239beeb32830",
+    "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-knowledge-graph.md": {
     "title": "Orchestrator Knowledge Graph",
