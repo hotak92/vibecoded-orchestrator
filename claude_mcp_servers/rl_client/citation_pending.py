@@ -31,7 +31,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -48,15 +48,24 @@ __all__ = [
     "readopt_stale_claims",
     "adopt_brief_citations",
     "agent_transcript_for",
+    "session_transcript_for",
     "PENDING_TTL_SECONDS",
+    "UNSCORED_LOG_REL",
     "CLAIM_MARK",
     "CTX_PENDING_PATH_KEY",
     "AGENT_WINDOW_FINAL_KEY",
 ]
 
 # Abandoned-session TTL: a pending file with no turn-end (session killed) is
-# garbage after this. Mirrors _RL_MONITOR_TIMEOUT (60 min).
+# garbage after this. Mirrors _RL_MONITOR_TIMEOUT (60 min). v0.2.102
+# W6-R6FIX (review R6-2): at the TTL the sweep SCORES the file through the
+# drain's one scoring path when its transcript is readable, and only then
+# removes it (:func:`sweep_expired`).
 PENDING_TTL_SECONDS: float = 3600.0
+
+# Where an expired citation that could NOT be scored is recorded (relative to
+# the project), one JSON row per file, so the loss is counted, not silent.
+UNSCORED_LOG_REL = Path(".claude") / "logs" / "rl-citations-unscored.jsonl"
 
 # v0.2.102 W6-C2 fix round (review R4c-1): a drain CLAIMS a pending file
 # before it computes it, by renaming ``<name>.json`` to
@@ -278,32 +287,109 @@ def sweep_expired(
     ttl_seconds: float = PENDING_TTL_SECONDS,
     *,
     now_ms: Optional[int] = None,
+    score_fn: "Optional[Callable[[Path, dict], Optional[str]]]" = None,
+    counts: Optional[dict] = None,
 ) -> int:
-    """Delete pending files whose ``ts_ms`` is older than ``ttl_seconds``.
-    Returns the count deleted. Abandoned-session GC — cheap mtime+payload
-    sweep. ``now_ms`` is injectable for tests."""
+    """Remove pending files whose ``ts_ms`` is older than ``ttl_seconds``,
+    scoring each one first. Returns the count removed; ``now_ms`` is
+    injectable for tests.
+
+    v0.2.102 W6-R6FIX (review R6-2): an expiring file is a retrieval whose
+    answer window no Stop drain scored (a background brief whose parent got
+    no further Stop, a main-chat session that ended). It is not dropped
+    blind any more:
+
+    1. CLAIMED through :func:`claim_pending` — the one claim the Stop drains
+       and the MCP answer monitor take — so a file a live drain or the
+       monitor holds is never touched here, and a file this sweep holds is
+       never scored by them. Two sweeps cannot both take it either.
+    2. ``score_fn(claimed, payload)`` — the drain's scorer, which reads the
+       file's transcript and computes through the drain's ONE scoring
+       function under the soft/terminal floors — returns ``None`` when a
+       citation was written, else a short reason.
+    3. Removed. A file with no score (no ``score_fn``, unreadable payload,
+       no readable transcript, below every floor, compute failure) is
+       recorded in :data:`UNSCORED_LOG_REL` and logged as an unscored
+       expiry, so the loss is counted.
+
+    ``counts`` (optional) receives ``scored`` / ``unscored``. A file
+    re-staged between the listing and the claim (fresh ``ts_ms``) is
+    handed back untouched."""
     d = pending_dir(project_root)
     if d is None or not d.exists():
         return 0
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     cutoff = now - int(ttl_seconds * 1000)
+    tally = counts if counts is not None else {}
+    tally.setdefault("scored", 0)
+    tally.setdefault("unscored", 0)
     deleted = 0
     try:
         candidates = list(d.glob("*.json"))
     except OSError:
         return 0
     for p in candidates:
-        payload = read_pending(p)
-        ts = None
-        if isinstance(payload, dict):
-            ts = payload.get("ts_ms")
-        # Fall back to mtime when the payload is unreadable / ts missing.
-        if not isinstance(ts, (int, float)):
-            ts = int(_safe_mtime(p) * 1000)
-        if ts < cutoff:
-            delete_pending(p)
-            deleted += 1
+        if not _expired(p, read_pending(p), cutoff):
+            continue
+        claimed = claim_pending(p)
+        if claimed is None:
+            continue  # a drain / the monitor / another sweep owns it now
+        payload = read_pending(claimed)
+        if not _expired(claimed, payload, cutoff):
+            release_claim(claimed, p)  # re-staged meanwhile: not ours to end
+            continue
+        if not isinstance(payload, dict):
+            reason: Optional[str] = "unreadable_payload"
+        elif score_fn is None:
+            reason = "no_scorer"
+        else:
+            try:
+                reason = score_fn(claimed, payload)
+            except Exception as exc:  # noqa: BLE001 — one bad file never stops the sweep
+                reason = f"score_error:{type(exc).__name__}"
+        delete_pending(claimed)
+        deleted += 1
+        if reason is None:
+            tally["scored"] += 1
+        else:
+            tally["unscored"] += 1
+            _record_unscored(d, p.name, payload, reason)
     return deleted
+
+
+def _expired(p: Path, payload: object, cutoff: int) -> bool:
+    ts = payload.get("ts_ms") if isinstance(payload, dict) else None
+    # Fall back to mtime when the payload is unreadable / ts missing.
+    if not isinstance(ts, (int, float)):
+        ts = int(_safe_mtime(p) * 1000)
+    return ts < cutoff
+
+
+def _record_unscored(pdir: Path, name: str, payload: object, reason: str) -> None:
+    """One row per unscored expiry in ``<project>/`` :data:`UNSCORED_LOG_REL`
+    plus a WARNING log line. Never raises: a failed row only leaves the
+    log line."""
+    info = payload if isinstance(payload, dict) else {}
+    row = {
+        "expired_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "file": name,
+        "reason": reason,
+        "session_id": str(info.get("session_id") or ""),
+        "task_id": str(info.get("task_id") or ""),
+        "agent_id": str(info.get("agent_id") or ""),
+        "source": str(info.get("source") or ""),
+        "ts_ms": info.get("ts_ms"),
+    }
+    logger.warning(
+        "citation_pending: unscored expiry %s (%s) -- the citation for task %s "
+        "was removed at the TTL without a score", name, reason, row["task_id"][:16])
+    try:
+        log = pdir.parent.parent.parent / UNSCORED_LOG_REL
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("citation_pending: could not record the unscored expiry (%s)", exc)
 
 
 # ── claims (v0.2.102 W6-C2 fix round, review R4c-1) ───────────────────────
@@ -442,6 +528,33 @@ def agent_transcript_for(parent_transcript: str, agent_id: str) -> str:
     cand = Path(parent_transcript[: -len(".jsonl")]) / "subagents" / f"agent-{agent}.jsonl"
     try:
         return str(cand) if cand.is_file() else ""
+    except OSError:
+        return ""
+
+
+def session_transcript_for(known_transcript: str, session_id: str) -> str:
+    """The main-chat transcript of ``session_id``, found beside a transcript
+    this process already knows (review R6-2: the TTL sweep scores an expiring
+    main-chat file against its OWN session's answer).
+
+    Claude Code keeps every session of a project as
+    ``<project transcripts dir>/<session_id>.jsonl`` and a subagent's beside
+    its parent's (:func:`agent_transcript_for`), so from either kind of
+    ``known_transcript`` the session file is a sibling of the parent. An
+    empty ``session_id`` means the known transcript's own session. ``""``
+    when the inputs are missing, the id is not filesystem-safe, or the file
+    does not exist — a caller never points a compute at a guessed path."""
+    if not known_transcript or not known_transcript.endswith(".jsonl"):
+        return ""
+    known = Path(known_transcript)
+    if known.parent.name == "subagents":
+        known = Path(str(known.parent.parent) + ".jsonl")
+    if session_id:
+        if _safe(session_id) != session_id:
+            return ""
+        known = known.with_name(f"{session_id}.jsonl")
+    try:
+        return str(known) if known.is_file() else ""
     except OSError:
         return ""
 

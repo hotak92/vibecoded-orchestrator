@@ -221,10 +221,20 @@ if ($Intent -eq "READ" -or $Intent -eq "EDIT" -or $Intent -eq "SEARCH") {
     }
     try { $state.targets = @($TargetsJson | ConvertFrom-Json) } catch { }
     try { $state.symbols = @($SymbolsJson | ConvertFrom-Json) } catch { }
-    try {
-        . (Join-Path $PSScriptRoot "_lib/utf8-nobom.ps1")  # BOM-free (review R5-8)
-        Set-VcoUtf8Content -Path $StateFile -Value ($state | ConvertTo-Json -Compress) -NoNewline
-    } catch { }
+    # BOM-free (review R5-8). A MISSING helper is a broken install: say so on
+    # stderr (review R6-3) instead of letting the dot-source throw into the
+    # catch below, where the skipped pairing write was silent. The hook still
+    # never fails. The .sh sibling writes this file inline from Python and
+    # sources no helper for it, so it has no such case.
+    $Utf8NoBomLib = Join-Path $PSScriptRoot "_lib/utf8-nobom.ps1"
+    if (Test-Path -LiteralPath $Utf8NoBomLib) {
+        try {
+            . $Utf8NoBomLib
+            Set-VcoUtf8Content -Path $StateFile -Value ($state | ConvertTo-Json -Compress) -NoNewline
+        } catch { }
+    } else {
+        [Console]::Error.WriteLine("[VCO broken install] .claude/hooks/_lib/utf8-nobom.ps1 is missing; the pre_bash pairing state was not written, so this command's bash_outcome event cannot be paired (re-run the bundle update).")
+    }
 
     # === F-LOG (v0.2.70): the pre_bash pairing event (WP-D 2 payload) ===
     $QuerySnippet = if ($Command.Length -gt 120) { $Command.Substring(0, 120) } else { $Command }

@@ -59,6 +59,8 @@ Orphans (review R5-5): an alert file untouched for 7 days is never going to
 be delivered (its session ended, or its rows carry no session id). Every
 delivery moves such a file's rows to ``.claude/logs/agent-alerts-undelivered.jsonl``
 and removes it, so the no-pending fast path stays an interpreter-free glob.
+A delivery claim nobody re-adopted for 7 days (its pid alive but its reuse
+unprovable) is swept the same way (review R6-1).
 """
 from __future__ import annotations
 
@@ -263,12 +265,26 @@ def sweep_orphan_alerts(project_root: str,
     younger than the age (another session's, still deliverable) is left
     alone. The file is claimed first, so a delivery racing the sweep never
     sees it half-moved; when the log cannot be written the rows go back to
-    the alert file (never lost). Returns the count swept. Never raises."""
+    the alert file (never lost).
+
+    v0.2.102 W6-R6FIX (review R6-1): an abandoned delivery CLAIM
+    (``<name>.delivering.<pid>``) older than ``older_than_s`` is swept the
+    same way. :func:`readopt_stale_deliveries` keeps a claim whose pid is
+    alive when it cannot prove the pid reused (start time unknown); after
+    seven days such a claim is an orphan too, and while it exists the
+    deliver hooks' fast path counts it as pending. A claim is fresh-stamped
+    when taken (:func:`vco_lib.atomic.claim_by_rename`), so a live delivery
+    never holds one this old. Its rows go to the log tagged
+    ``orphaned_delivery_claim`` under the lock; an unwritable log leaves the
+    claim in place (never lost). Returns the count swept (files + claims).
+    Never raises."""
     if not project_root:
         return 0
     state = _state_dir(project_root)
     try:
         files = sorted(state.glob(f"{ALERT_FILE_PREFIX}*{ALERT_FILE_SUFFIX}"))
+        claims = sorted(state.glob(
+            f"{ALERT_FILE_PREFIX}*{ALERT_FILE_SUFFIX}{DELIVERING_MARK}*"))
     except OSError:
         return 0
     import time  # noqa: PLC0415
@@ -286,15 +302,10 @@ def sweep_orphan_alerts(project_root: str,
         if claimed is None:
             continue
         rows = _read_rows(claimed)
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             log.parent.mkdir(parents=True, exist_ok=True)
             with _lock(project_root):
-                with open(log, "a", encoding="utf-8") as fh:
-                    for r in rows:
-                        fh.write(json.dumps(dict(r, undelivered_reason="orphaned_alert_file",
-                                                 swept_at=stamp),
-                                            ensure_ascii=False) + "\n")
+                _log_undelivered(log, rows, "orphaned_alert_file")
         except OSError:
             # The log is unwritable: hand the rows back (never lost). If even
             # that fails, the claim stays on disk and is re-adopted later.
@@ -303,7 +314,34 @@ def sweep_orphan_alerts(project_root: str,
             continue
         _finish([claimed])
         swept += 1
+    for claim in claims:
+        # Review R6-1: a delivery claim nobody re-adopted in seven days.
+        try:
+            if now - claim.stat().st_mtime < older_than_s:
+                continue
+        except OSError:
+            continue
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with _lock(project_root):
+                if not claim.exists():
+                    continue  # re-adopted or swept meanwhile
+                _log_undelivered(log, _read_rows(claim), "orphaned_delivery_claim")
+                claim.unlink()
+        except OSError:
+            continue  # log unwritable (or unlink refused): the claim stays, never lost
+        swept += 1
     return swept
+
+
+def _log_undelivered(log: Path, rows: List[Dict[str, Any]], reason: str) -> None:
+    """Append ``rows`` to the undelivered log, each tagged with ``reason`` and
+    the sweep time. The caller holds the lock. Raises ``OSError``."""
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(log, "a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(dict(r, undelivered_reason=reason, swept_at=stamp),
+                                ensure_ascii=False) + "\n")
 
 
 def _row_matches(row: Dict[str, Any], session_id: str, agent_id: str) -> bool:
