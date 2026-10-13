@@ -43,14 +43,76 @@ if (-not $fp) { exit 0 }
 # (final-review B1). MUST MATCH py-compile-check.sh.
 if (-not $fp.EndsWith('.py')) { exit 0 }
 
-# Run py_compile via the resolved interpreter; capture stdout+stderr and the
-# real exit code. A non-zero exit is a genuine compile error -> surface the
-# actual message (never a "Syntax error" lie for, e.g., a missing file).
-$compileOut = & $PY -m py_compile $fp 2>&1
-$compileExit = $LASTEXITCODE
-if ($compileExit -ne 0) {
-    $msg = ("$compileOut").Trim()
-    if (-not $msg) { $msg = "py_compile failed (exit $compileExit)" }
+# v0.2.102 W6-PCHK: compile AND record the compile STATUS in ONE Python
+# child, exactly like the .sh sibling. The status (file path, checker, ok,
+# exit code, timestamp; never file contents) is what post-edit-outcome's
+# detached poller turns into the edit_outcome row's post_check. The writer
+# is vco_lib.edit_post_check.write_status (the ONE home: atomic write,
+# path-hash + per-agent key), imported from the orchestrator root resolved
+# by the SAME ladder every hook uses. Unresolved root or a failed write ->
+# one stderr line; the check result is still reported. The code goes in on
+# stdin and the values as argv (never interpolated into the source, never
+# an empty argv item, which Windows PowerShell 5.1 drops).
+# MUST MATCH py-compile-check.sh.
+$ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
+    $env:CLAUDE_PROJECT_DIR
+} else {
+    (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+}
+$PccVcoRoot = ""
+$ResolveLib = Join-Path $PSScriptRoot "_lib/resolve-vco-venv.ps1"
+if (Test-Path $ResolveLib) {
+    . $ResolveLib
+    $pccScript = Resolve-VcoOrchestratorScript -ScriptDir $PSScriptRoot -RelPath "vco_lib/edit_post_check.py"
+    if ($pccScript) { $PccVcoRoot = Split-Path (Split-Path $pccScript -Parent) -Parent }
+}
+$PccSession = if ($payload.session_id) { [string]$payload.session_id } else { "default" }
+$PccAgent = if ($payload.agent_id) { [string]$payload.agent_id } else { "" }
+$PccTool = if ($payload.tool_name) { [string]$payload.tool_name } else { "Write" }
+
+$pyCode = @'
+import sys, py_compile
+
+def record_status(fp, exit_code):
+    kv = dict(a.split('=', 1) for a in sys.argv[2:] if '=' in a)
+    vco_root = kv.get('vco_root', '')
+    if not vco_root:
+        sys.stderr.write('py-compile-check: compile status not recorded: VCO root not resolved\n')
+        return
+    if vco_root not in sys.path:
+        sys.path.insert(0, vco_root)
+    try:
+        from vco_lib.edit_post_check import write_status
+        write_status(project_root=kv.get('project', ''), file_path=fp, checker='py_compile',
+                     tool_name=kv.get('tool', '') or 'Write', exit_code=exit_code,
+                     session_id=kv.get('session', '') or 'default',
+                     agent_id=kv.get('agent', ''))
+    except Exception as exc:
+        sys.stderr.write('py-compile-check: compile status not recorded: %r\n' % (exc,))
+
+fp = sys.argv[1]
+try:
+    py_compile.compile(fp, doraise=True)
+    sys.stdout.write('OK')
+    record_status(fp, 0)
+except py_compile.PyCompileError as e:
+    sys.stdout.write('ERR:' + str(e).strip().replace('\n', ' '))
+    record_status(fp, 1)
+except FileNotFoundError:
+    sys.exit(0)
+except Exception as e:
+    sys.stdout.write('ERR:' + str(e).strip().replace('\n', ' '))
+    record_status(fp, 1)
+'@
+$pyArgs = @(
+    $fp, "vco_root=$PccVcoRoot", "project=$ProjectRoot", "tool=$PccTool",
+    "session=$PccSession", "agent=$PccAgent"
+)
+$compileOut = ""
+try { $compileOut = ($pyCode | & $PY - @pyArgs) -join " " } catch { }
+if ($compileOut -like 'ERR:*') {
+    $msg = $compileOut.Substring(4).Trim()
+    if (-not $msg) { $msg = "py_compile failed" }
     Write-Output "py_compile: $msg"
 }
 exit 0

@@ -312,7 +312,12 @@ def test_warm_leg_claims_swept_after_a_week(tmp_path: Path) -> None:
 
 
 def _fake_venv(tmp_path: Path, module_rel: str, body: str) -> Path:
-    """A VCT_VENV whose python records what a hook hands a module."""
+    """A VCT_VENV whose python records what a hook hands a module.
+
+    THIS checkout follows the fake packages on PYTHONPATH (v0.2.102
+    W6-PCHK): post-edit-outcome builds its row through
+    ``vco_lib.edit_post_check``, which a healthy install always provides; the
+    fake module still shadows the real one because it comes first."""
     fake = tmp_path / "fakepkgs"
     mod = fake / module_rel
     mod.parent.mkdir(parents=True, exist_ok=True)
@@ -323,7 +328,8 @@ def _fake_venv(tmp_path: Path, module_rel: str, body: str) -> Path:
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
     py = venv / "bin" / "python"
-    py.write_text(f'#!/bin/sh\nPYTHONPATH="{fake}" exec "{sys.executable}" "$@"\n', encoding="utf-8")
+    py.write_text(f'#!/bin/sh\nPYTHONPATH="{fake}{os.pathsep}{REPO_ROOT}" '
+                  f'exec "{sys.executable}" "$@"\n', encoding="utf-8")
     py.chmod(0o755)
     return venv
 

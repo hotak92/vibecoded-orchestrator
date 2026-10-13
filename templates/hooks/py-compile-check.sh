@@ -27,6 +27,28 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 
+# v0.2.102 W6-PCHK: after each check the child records a compile STATUS
+# (file path, checker, ok, exit code, timestamp; never file contents) that
+# post-edit-outcome's detached poller turns into the edit_outcome row's
+# post_check. The writer is vco_lib.edit_post_check.write_status (the ONE
+# home: atomic write, path-hash + per-agent key), imported from the
+# orchestrator root resolved by the SAME ladder every hook uses. Unresolved
+# root or a failed write -> one stderr line, the check result is still
+# printed as before. The child's stderr is no longer discarded so that line
+# reaches the hook log (stderr of an exit-0 PostToolUse hook is not shown
+# to the model). MUST MATCH py-compile-check.ps1.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+PCC_VCO_ROOT=""
+if [ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ]; then
+    # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+    resolve_vco_orchestrator_script "$SCRIPT_DIR" "vco_lib/edit_post_check.py"
+    if [ -n "${VCO_ORCHESTRATOR_SCRIPT:-}" ]; then
+        PCC_VCO_ROOT="$(dirname "$(dirname "$VCO_ORCHESTRATOR_SCRIPT")")"
+    fi
+fi
+
 # Parse the edited file_path AND distinguish the two failure classes the
 # inline version conflated:
 #   * MALFORMED STDIN (not valid JSON / no file_path) → nothing to compile,
@@ -38,6 +60,23 @@ HOOK_STDIN=$(cat 2>/dev/null || echo "")
 #   "ERR:<msg>"   → real syntax/compile error with the true message
 RESULT=$(printf '%s' "$HOOK_STDIN" | "$PY" -c '
 import json, sys, py_compile
+
+def record_status(d, fp, exit_code):
+    vco_root, project_root = sys.argv[1], sys.argv[2]
+    if not vco_root:
+        sys.stderr.write("py-compile-check: compile status not recorded: VCO root not resolved\n")
+        return
+    if vco_root not in sys.path:
+        sys.path.insert(0, vco_root)
+    try:
+        from vco_lib.edit_post_check import write_status
+        write_status(project_root=project_root, file_path=fp, checker="py_compile",
+                     tool_name=str(d.get("tool_name") or "Write"), exit_code=exit_code,
+                     session_id=str(d.get("session_id") or "default"),
+                     agent_id=str(d.get("agent_id") or ""))
+    except Exception as exc:
+        sys.stderr.write("py-compile-check: compile status not recorded: %r\n" % (exc,))
+
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
@@ -56,15 +95,18 @@ if not fp.endswith(".py"):
 try:
     py_compile.compile(fp, doraise=True)
     sys.stdout.write("OK")
+    record_status(d, fp, 0)
 except py_compile.PyCompileError as e:
     # Real syntax/compile error — surface the TRUE message, not a lie.
     sys.stdout.write("ERR:" + str(e).strip().replace("\n", " "))
+    record_status(d, fp, 1)
 except FileNotFoundError:
     # File vanished between write and hook — nothing to report.
     sys.exit(0)
 except Exception as e:
     sys.stdout.write("ERR:" + str(e).strip().replace("\n", " "))
-' 2>/dev/null || echo "")
+    record_status(d, fp, 1)
+' "$PCC_VCO_ROOT" "$PROJECT_ROOT" || echo "")
 
 case "$RESULT" in
     ERR:*)
