@@ -155,6 +155,7 @@ from vco_lib import deferral_dismissal as _deferral_dismissal  # noqa: E402
 from vco_lib import deferral_probes as _deferral_probes  # noqa: E402
 from vco_lib import deferral_registry as _deferral_registry  # noqa: E402
 from vco_lib import doctor as _doctor  # noqa: E402
+from vco_lib import playwright_mcp as _playwright_mcp  # noqa: E402
 from vco_lib import install_companions as _install_companions  # noqa: E402
 from vco_lib import manifest_paths as _manifest_paths  # noqa: E402
 from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
@@ -6329,18 +6330,18 @@ def main() -> int:
     # Step 10: Check Claude CLI
     _check_claude_cli()
 
-    # Cache Playwright MCP + Chromium so the default-enabled `playwright`
-    # MCP entry doesn't stall on first browser-launch with a 150 MB
-    # download. Non-fatal: only the CHROMIUM skip lazy-installs later; a
-    # missing-npx skip means the entry cannot spawn (see the docstring).
-    _install_playwright_browsers()
+    # Cache the PINNED Playwright MCP + the browser revision it requests, so
+    # the default-enabled `playwright` entry can launch a browser at all. A
+    # failed download defers `playwright_browser_missing`; a missing-npx skip
+    # means the entry cannot spawn (doctor: npx_missing_mcp_unspawnable).
+    _install_playwright_browsers(_deferral_report)
     _install_codegraph_treesitter(venv_python)  # Part 5: optional TS grammars
 
     # v0.2.102: the mermaid / excalidraw diagram-MCP pre-pins were removed
     # with the diagrams integrations (owner ruling 2026-10-07) — the wrapper
     # modules, the vendored excalidraw fork and the `bundled_mcp_versions.toml`
     # pins they consumed were all deleted. `_install_pinned_npm` itself stays
-    # (generic machinery, used by the playwright browser pre-cache above).
+    # (generic machinery; `vco verify-pins --fix` drives the same core).
 
     # Step 11: Initial code graph analysis (if repo has code)
     # Skipped on first install — user runs manually after setup
@@ -10576,7 +10577,7 @@ def _pip_install_flags() -> list[str]:
 #   - _install_requirements: pip upgrade, pip install -r, pip install -e
 #     (root), pip install -e (claude_mcp_servers)  [4 sites]
 #   - _install_pinned_npm: npm install -g                                [1]
-#   - _install_playwright_browsers: npx + playwright install             [2]
+#   - _install_playwright_browsers: pinned MCP fetch + its browser install [2]
 #   - _compile_python_modules: python -m compileall                      [1]
 #
 # Other ~30 sites can migrate incrementally in v0.2.54+ as they're touched
@@ -10956,7 +10957,7 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 
 def _materialize_orchestrator_self_claude_md(
     install_root: Path,
-    deferral_report: "Optional[DeferralReport]" = None,
+    deferral_report: "DeferralReport | None" = None,
 ) -> None:
     """v0.2.50 Track A / v0.2.95 R1 — step 4c: render every RENDERED ROOT FILE.
 
@@ -13568,7 +13569,7 @@ _SEED_OWED_WORK_CONDITION_ID = _install_weaviate.SEED_OWED_WORK_CONDITION_ID
 
 def _seed_weaviate(
     args: argparse.Namespace,
-    deferral_report: "Optional[DeferralReport]" = None,
+    deferral_report: "DeferralReport | None" = None,
 ) -> "Optional[str]":
     """v0.2.44 V44-I: thin wrapper around :func:`_seed_weaviate_impl`
     that guarantees the ``_DUAL_CLONE_DETECTED_THIS_RUN`` module-level
@@ -13596,7 +13597,7 @@ def _seed_weaviate(
 
 def _seed_weaviate_impl(
     args: argparse.Namespace,
-    deferral_report: "Optional[DeferralReport]" = None,
+    deferral_report: "DeferralReport | None" = None,
 ) -> None:
     """Seed Weaviate with bundled knowledge/ + docs/.
 
@@ -21236,114 +21237,43 @@ def _find_npm() -> Optional[str]:
 # Playwright MCP + Chromium pre-cache
 # ---------------------------------------------------------------------------
 
-def _install_playwright_browsers() -> None:
-    """Pre-cache `@playwright/mcp` + Chromium so the default-enabled
-    Playwright MCP doesn't stall on first browser launch.
+def _install_playwright_browsers(
+    deferral_report: "DeferralReport | None" = None,
+) -> None:
+    """Pre-cache the PINNED `@playwright/mcp` + the browser revision it will
+    request. Thin shim over :func:`vco_lib.playwright_mcp.precache` (v0.2.102
+    W6-Z4), which owns the plan; this shim supplies install.py's runner
+    (``_run_logged_subprocess`` — dot-cycle + stderr tail), npx resolution and
+    logging.
 
-    Behaviour:
-      - Skipped entirely if `VCT_SKIP_PLAYWRIGHT=1` is set in the env.
-      - Skipped if `npx` is unresolvable — and in that case the MCP
-        CANNOT RUN AT ALL (see below).
-      - Runs `npx -y @playwright/mcp@latest --version` to populate the
-        npx cache (~few MB).
-      - Runs `npx playwright install chromium` to fetch the Chromium
-        binary (~150 MB).
+    Until v0.2.102 this ran ``npx -y @playwright/mcp@latest --version`` and
+    then ``npx playwright install chromium`` — the revision of a SEPARATELY
+    resolved ``playwright``, which drifted from the MCP's own bundled
+    playwright-core, for an MCP registered without ``--browser`` that
+    launched the system-Chrome channel anyway. Now: the pinned package
+    (``bundled_mcp_versions.toml`` [npx.playwright_mcp]) installs its own
+    browser, so the revision is the one the registration requests.
 
-    Non-fatal: any failure logs a warn event and prints a short notice,
-    but never aborts the install.
-
-    v0.2.91 WP-D — the no-npx message was WRONG for four releases. It said
-    the MCP "will lazy-install when first invoked", but the registered entry
-    is ``{"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}``: with
-    no npx there is nothing to invoke and therefore nothing to lazy-install
-    into. Claude Code shows "Failed to connect" and the user has no way to
-    learn why. The honest statement is "the MCP cannot spawn until npx
-    exists" — and the doctor phase at the end of this run emits
-    ``npx_missing_mcp_unspawnable`` so the fact reaches the ledger instead of
-    scrolling past in stdout. Only the CHROMIUM pre-cache is a genuine
-    lazy-install-later optimisation (the `--version` step above populates the
-    npx cache; the browser download can happen on first browser call).
+    Opt out with ``VCT_SKIP_PLAYWRIGHT=1``. Non-fatal throughout; a download
+    that does not leave the browser on disk adds ``playwright_browser_missing``
+    to ``deferral_report`` with the exact repair command. A missing npx is
+    reported by the doctor phase (``npx_missing_mcp_unspawnable``): the
+    registered entry cannot spawn at all without it.
     """
-    print("[playwright] Pre-caching Playwright MCP + Chromium ... ",
+    print("[playwright] Pre-caching Playwright MCP + browser ... ",
           end="", flush=True)
     _log_install_event("playwright", "start",
-                       "caching @playwright/mcp + chromium")
-
-    if os.environ.get("VCT_SKIP_PLAYWRIGHT") == "1":
-        print("SKIPPED (VCT_SKIP_PLAYWRIGHT=1)")
-        _log_install_event("playwright", "skip",
-                           "VCT_SKIP_PLAYWRIGHT=1 in env")
-        return
-
-    # v0.2.51 Bug E: use _find_npx() instead of shutil.which("npx") so
-    # fnm/nvm setups (where the user symlinked only `npm` to PATH but
-    # left `npx` in the version manager's bin dir) work without manual
-    # PATH fiddling. See _find_npx() docstring for the rationale.
-    npx_path = _find_npx()
-    if not npx_path:
-        print("SKIPPED (npx not found)")
-        print("  Node.js / npx not detected. The Playwright MCP is registered")
-        print("  as `npx …`, so it CANNOT SPAWN until npx exists — Claude Code")
-        print("  will show it as 'Failed to connect'. Install Node.js 18+")
-        print("  (https://nodejs.org), then re-run this install.")
-        _log_install_event("playwright", "skip",
-                           "npx not on PATH and not adjacent to npm — "
-                           "playwright MCP cannot spawn (doctor phase emits "
-                           "npx_missing_mcp_unspawnable)")
-        return
-
-    print("(this may take ~30s, ~150 MB)")
-
-    # 1) Cache the MCP package itself (small).
-    # v0.2.53 DEDUP-1: route through _run_logged_subprocess for dot-cycle
-    # animation. Soft-fail (on_failure="return") because the MCP can
-    # lazy-install at runtime.
+                       "caching pinned @playwright/mcp + its browser")
     try:
-        result = _run_logged_subprocess(
-            [npx_path, "-y", "@playwright/mcp@latest", "--version"],
-            step="playwright", phase_label="playwright-mcp-version",
-            timeout=180,
-            on_failure="return",
-            fail_message="  WARN: @playwright/mcp version check failed.",
+        _playwright_mcp.precache(
+            npx_path=_find_npx(),
+            runner=_run_logged_subprocess,
+            log_event=_log_install_event,
+            report=deferral_report,
         )
-        if result.returncode != 0:
-            return
-    except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"  WARN: @playwright/mcp version check failed: {e}")
-        _log_install_event("playwright", "warn",
-                           f"npx -y @playwright/mcp version check failed: {e}")
-        return
-
-    # 2) Cache the Chromium browser binary (~150 MB). This is the
-    #    expensive step; we only do chromium (not firefox/webkit) to
-    #    keep the install size down. Users who need other browsers can
-    #    `npx playwright install firefox` etc. manually.
-    # v0.2.53 DEDUP-1: 10-min download is the canonical M-P1-7
-    # "user thinks install hung" case — dot-cycle animation is the fix.
-    try:
-        result = _run_logged_subprocess(
-            [npx_path, "playwright", "install", "chromium"],
-            step="playwright", phase_label="playwright-chromium-download",
-            timeout=600,
-            on_failure="return",
-            fail_message="  WARN: chromium install exited non-zero.",
-            user_hint_lines=[
-                "The MCP will lazy-install Chromium on first browser call.",
-            ],
-        )
-        if result.returncode == 0:
-            print("[playwright] Chromium cached OK.")
-            _log_install_event("playwright", "ok",
-                               "Playwright MCP + Chromium cached")
-    except subprocess.TimeoutExpired:
-        print("  WARN: chromium install timed out after 10 min.")
-        print("  The MCP will lazy-install Chromium on first browser call.")
-        _log_install_event("playwright", "warn",
-                           "npx playwright install chromium timed out (600s)")
-    except OSError as e:
-        print(f"  WARN: chromium install failed: {e}")
-        _log_install_event("playwright", "warn",
-                           f"npx playwright install chromium failed: {e}")
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        print(f"  WARN: Playwright pre-cache raised: {exc}")
+        _log_install_event("playwright", "warn", f"pre-cache raised: {exc}")
 
 
 def _install_codegraph_treesitter(venv_python: Path) -> None:

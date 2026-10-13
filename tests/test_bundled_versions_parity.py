@@ -169,6 +169,22 @@ class BundledVersionsParityTests(unittest.TestCase):
             f"to match the other.",
         )
 
+    def test_npx_section_matches_both_readers(self) -> None:
+        """v0.2.102 W6-Z4: the ``[npx.*]`` set (npx-launched registrations)
+        is exactly the Playwright MCP, with the four fields BOTH readers
+        deserialise — Python ``vco_lib.playwright_mcp.load_pin`` and Rust
+        ``NpxLaunchPinRaw`` (``package``/``version``/``shasum``/``browser``,
+        all required there). The Rust key constant names the same row."""
+        parsed = _independent_parse(self.text)
+        self.assertEqual(set(parsed.get("npx", {})), {"playwright_mcp"})
+        self.assertEqual(set(parsed["npx"]["playwright_mcp"]),
+                         {"package", "version", "shasum", "browser"})
+        rust = RUST_SRC_PATH.read_text(encoding="utf-8")
+        self.assertIn('pub const PLAYWRIGHT_MCP_KEY: &str = "playwright_mcp";', rust)
+        from vco_lib import playwright_mcp
+        self.assertEqual(playwright_mcp.PIN_SECTION, "npx")
+        self.assertEqual(playwright_mcp.PIN_KEY, "playwright_mcp")
+
     def test_self_reference_in_managed_paths(self) -> None:
         """`bundled_mcp_versions.toml` is listed in
         `orchestrator-managed-paths.txt` so a copy install

@@ -341,14 +341,14 @@ class WheelInstallRuntimeTests(unittest.TestCase):
         wheel) also trips this test. (v0.2.102: the [npm] table is
         legitimately EMPTY — the four diagram pins were removed with the
         diagrams integrations — so only the document being non-empty and
-        the chromium section surviving are asserted.)
+        the [npx.playwright_mcp] pin surviving are asserted.)
         """
         code = (
             "from vco_lib.bundled_versions import load_bundled_versions; "
             "v = load_bundled_versions(); "
             "assert isinstance(v, dict), 'not a dict'; "
             "assert v, 'empty manifest'; "
-            "assert 'chromium' in v, 'no chromium section'; "
+            "assert 'playwright_mcp' in v.get('npx', {}), 'no npx pin'; "
             "print('OK', len(v))"
         )
         rc, stdout, stderr = self._run_in_venv(code)
@@ -380,23 +380,26 @@ class WheelInstallRuntimeTests(unittest.TestCase):
             f"stderr:\n{stderr}\nstdout:\n{stdout}",
         )
 
-    def test_chromium_pin_section_round_trips_post_wheel_install(self) -> None:
-        """End-to-end loader round-trip on the section that still pins
-        something: [chromium]'s reuse flag. (The former mermaid_mcp
-        end-to-end leg died with the diagram pins in v0.2.102; the
-        wrappers that consumed the pins are gone with them.)
+    def test_playwright_mcp_pin_round_trips_post_wheel_install(self) -> None:
+        """End-to-end round-trip on the one pin left: the wheel-installed
+        ``vco_lib.playwright_mcp`` reads ``[npx.playwright_mcp]`` from the
+        wheel's manifest and composes the pinned registration argv. (The
+        former mermaid_mcp leg died with the diagram pins in v0.2.102, and
+        the ``[chromium] reuse_playwright`` leg with that retired marker.)
         """
         code = (
             "from vco_lib.bundled_versions import load_bundled_versions; "
-            "v = load_bundled_versions(); "
-            "spec = v['chromium']; "
-            "assert spec['reuse_playwright'] is True, 'chromium flag lost'; "
-            "print('OK', spec)"
+            "from vco_lib import playwright_mcp; "
+            "spec = load_bundled_versions()['npx']['playwright_mcp']; "
+            "args = playwright_mcp.registration_entry()['args']; "
+            "assert args == ['-y', spec['package'] + '@' + spec['version'], "
+            "'--browser', spec['browser']], args; "
+            "print('OK', args)"
         )
         rc, stdout, stderr = self._run_in_venv(code)
         self.assertEqual(
             rc, 0,
-            f"chromium pin round-trip failed post-wheel-install: "
+            f"playwright_mcp pin round-trip failed post-wheel-install: "
             f"exit={rc}, stderr:\n{stderr}\nstdout:\n{stdout}",
         )
         self.assertIn("OK", stdout, f"unexpected stdout: {stdout!r}")

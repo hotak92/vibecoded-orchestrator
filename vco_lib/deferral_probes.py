@@ -1097,6 +1097,25 @@ def gateway_exec_still_unrunnable(ctx: ProbeContext) -> Optional[bool]:
     return None
 
 
+def playwright_browser_still_missing(ctx: ProbeContext) -> Optional[bool]:
+    """``playwright_browser_missing`` — is the pinned Playwright MCP's browser
+    revision still absent?
+
+    The SAME reading both emitters use
+    (:func:`vco_lib.playwright_mcp.browser_state`, via
+    :func:`vco_lib.playwright_mcp.browser_still_missing`). True: still absent.
+    False: installed — the state is over. None: the revision cannot be read
+    (pinned package not in the npx cache) or ``ctx.folder`` is not an install
+    root.
+    """
+    from vco_lib import playwright_mcp
+
+    try:
+        return playwright_mcp.browser_still_missing(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def former_launcher_cli_still_on_path(ctx: ProbeContext) -> Optional[bool]:
     """``former_launcher_cli_on_path`` — is an old copy of the launcher CLI
     still there?
@@ -1276,6 +1295,7 @@ PROBES: dict[str, ProbeFn] = {
     "user_owned_secret_values_still_present": user_owned_secret_values_still_present,
     "code_embed_image_still_stale": code_embed_image_still_stale,
     "former_launcher_cli_still_on_path": former_launcher_cli_still_on_path,
+    "playwright_browser_still_missing": playwright_browser_still_missing,
     "service_endpoint_still_unreachable": service_endpoint_still_unreachable,
     "service_endpoint_still_ambiguous": service_endpoint_still_ambiguous,
     "adopted_service_config_drift_persists": adopted_service_config_drift_persists,

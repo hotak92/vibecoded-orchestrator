@@ -82,11 +82,13 @@
 #     buys little and risks divergent interpretation. Left mirrored; noted for
 #     a possible future pass if they ever grow.
 #   • Per-MCP ENTRY SHAPES (command/args/env for weaviate-kg, search's
-#     wrapper.sh-vs-python OS branch, the wrapper `-m module` args, playwright
-#     npx args): these are BUILD LOGIC with OS branching + path composition,
-#     not flat rule data. build_default_mcp_entries / _build_python_mcp_entries
-#     stay mirrored (already parity-tested by shape assertions); only their
-#     NAME LIST + ordering is sourced from [entries].default_names.
+#     wrapper.sh-vs-python OS branch, the wrapper `-m module` args): these
+#     are BUILD LOGIC with OS branching + path composition, not flat rule
+#     data. build_default_mcp_entries / _build_python_mcp_entries stay
+#     mirrored (already parity-tested by shape assertions); only their NAME
+#     LIST + ordering is sourced from [entries].default_names. The playwright
+#     npx args (v0.2.102 W6-Z4) are data: both builders compose them from
+#     bundled_mcp_versions.toml [npx.playwright_mcp].
 #   • Default service PORTS (DEFAULT_WEAVIATE_PORT etc.): owned by the
 #     installer.rs / install.py port-resolution subsystem (FORBIDDEN file
 #     installer.rs), out of WP-B4 scope. Not moved.

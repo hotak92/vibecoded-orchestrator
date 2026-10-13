@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
+from typing import Any
 
 # Path resolution: ``__file__`` → ``vco_lib/bundled_versions.py``;
 # ``.parent`` is the ``vco_lib/`` package directory, where the .toml
@@ -73,7 +74,7 @@ def manifest_path() -> Path:
     return _DEFAULT_MANIFEST_PATH
 
 
-def load_bundled_versions(path: Path | None = None) -> dict[str, dict[str, str]]:
+def load_bundled_versions(path: Path | None = None) -> dict[str, dict[str, Any]]:
     """Parse ``bundled_mcp_versions.toml``.
 
     Args:
@@ -89,11 +90,16 @@ def load_bundled_versions(path: Path | None = None) -> dict[str, dict[str, str]]
               "npm": {
                 "<key>": {"package": "...", "version": "...", "shasum": "..."},
               },
-              "chromium": {"reuse_playwright": True},
+              "npx": {
+                "<key>": {"package": "...", "version": "...", "shasum": "...",
+                          "browser": "..."},
+              },
             }
 
         (The npm table is currently EMPTY — the four diagram pins were
-        removed in v0.2.102 with the diagrams integrations.)
+        removed in v0.2.102 with the diagrams integrations, and the
+        ``[chromium] reuse_playwright`` marker was retired with its last
+        reader; ``[npx.playwright_mcp]`` is the one pin left.)
 
         Unknown sections and extra keys are preserved (forward-compat).
 

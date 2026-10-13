@@ -158,6 +158,14 @@ class TestActScrubsVcoShapedEntries(_ScrubTestBase):
         })
         self.assertIn("playwright", self._scrub())
 
+    def test_vco_shaped_pinned_playwright_fingerprint_removed(self) -> None:
+        # v0.2.102 W6-Z4: VCO now registers the PINNED launch
+        # `npx -y @playwright/mcp@<pin> --browser chromium`; that exact
+        # fingerprint is VCO's own too → scrubbed on uninstall.
+        from vco_lib import playwright_mcp
+        self._write({"playwright": playwright_mcp.registration_entry()})
+        self.assertIn("playwright", self._scrub())
+
     def test_full_vco_install_all_eight_scrubbed(self) -> None:
         # A realistic post-install ~/.claude.json: every VCO entry present +
         # VCO-shaped → all removed, none left behind.

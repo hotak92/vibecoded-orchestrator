@@ -206,10 +206,14 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
         McpServerConfig {
             id: "playwright".to_string(),
             name: "Browser automation".to_string(),
-            description: "Browser automation, screenshots, and GUI testing via @playwright/mcp (Microsoft, Apache-2.0). Auto-installed via npx; Chromium (~150 MB) is cached during first-install. Set VCT_SKIP_PLAYWRIGHT=1 to skip the eager browser download.".to_string(),
+            description: "Browser automation, screenshots, and GUI testing via @playwright/mcp (Microsoft, Apache-2.0), pinned and launched with Playwright's own Chromium. The MCP runs via npx; install/update downloads the Chromium revision it needs (~170 MB) and `vco doctor` reports it if missing. Set VCT_SKIP_PLAYWRIGHT=1 to skip the eager browser download.".to_string(),
             enabled: true, // Default-enabled — Playwright is generally useful and Chromium is cached during first-install
             command: "npx".to_string(),
-            args: vec!["-y".to_string(), "@playwright/mcp@latest".to_string()],
+            // v0.2.102 W6-Z4: the pinned launch from bundled_mcp_versions.toml
+            // [npx.playwright_mcp] — the same argv the registration builders write.
+            args: crate::bundled_versions::playwright_mcp_launch_args(
+                &crate::bundled_versions::playwright_mcp_pin(None),
+            ),
             env: HashMap::new(),
             min_tier: OrchestratorTier::Free, // Available to all tiers
             port: None, // stdio-based MCP, no HTTP port
@@ -262,6 +266,20 @@ mod tests {
             assert!(entry.port.is_none(), "{} is stdio MCP, port must be None", entry.id);
             assert!(!entry.command.is_empty(), "{} command should be set", entry.id);
         }
+    }
+
+    /// v0.2.102 W6-Z4: the catalog's playwright argv is the pinned
+    /// `--browser chromium` launch the registration builders write, never the
+    /// floating `@latest` (which launched the system-Chrome channel).
+    #[test]
+    fn playwright_catalog_args_are_the_pinned_launch() {
+        let servers = default_mcp_servers();
+        let pw = servers.iter().find(|s| s.id == "playwright").expect("playwright");
+        let pin = crate::bundled_versions::playwright_mcp_pin(None);
+        assert_eq!(pw.command, "npx");
+        assert_eq!(pw.args, crate::bundled_versions::playwright_mcp_launch_args(&pin));
+        assert!(!pw.args.iter().any(|a| a.ends_with("@latest")), "{:?}", pw.args);
+        assert!(pw.args.windows(2).any(|w| w[0] == "--browser" && w[1] == "chromium"));
     }
 }
 

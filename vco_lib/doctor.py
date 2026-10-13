@@ -242,6 +242,11 @@ CID_FORMER_LAUNCHER_CLI = "former_launcher_cli_on_path"
 #: different configurations. Probe + entry live in :mod:`vco_lib.doctor_infra`.
 CID_COMPOSE_OVERRIDE_PAIR_DIVERGED = "compose_override_pair_diverged"
 
+#: v0.2.102 W6-Z4: the pinned Playwright MCP's browser revision is not on
+#: disk. Probe, entry and the cid itself live in :mod:`vco_lib.playwright_mcp`
+#: (stdlib-only at import time, so importing it here costs nothing).
+from vco_lib.playwright_mcp import CID_BROWSER_MISSING as CID_PLAYWRIGHT_BROWSER_MISSING  # noqa: E402
+
 #: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
 #: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
 #: doctor but emitted by its owner — re-emitting it here would fork its
@@ -251,7 +256,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
     CID_KG_BINDING_EVIDENCE_MISMATCH, CID_KG_UNCLAIMED,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
     CID_INSTALL_MARKER_UNBACKED, CID_FORMER_LAUNCHER_CLI,
-    CID_COMPOSE_OVERRIDE_PAIR_DIVERGED,
+    CID_COMPOSE_OVERRIDE_PAIR_DIVERGED, CID_PLAYWRIGHT_BROWSER_MISSING,
 )
 
 #: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
@@ -262,7 +267,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
 DOCTOR_SELF_RESOLVING_CIDS: tuple[str, ...] = (
     CID_DISK_SPACE_LOW, CID_KG_BINDING_EVIDENCE_MISMATCH,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
-    CID_COMPOSE_OVERRIDE_PAIR_DIVERGED,
+    CID_COMPOSE_OVERRIDE_PAIR_DIVERGED, CID_PLAYWRIGHT_BROWSER_MISSING,
 )
 
 #: Env override for the free-space floor, in GiB (float). Default
@@ -450,6 +455,20 @@ class DoctorResolvers:
     #: Injected so the declaration-honouring probes are driven from described
     #: declarations, no launcher.db.
     infra_declarations: Optional[Callable[[], Any]] = None
+    #: () -> :class:`vco_lib.playwright_mcp.BrowserState` (v0.2.102 W6-Z4).
+    #: Injected so the browser probe is driven from a described cache, no
+    #: npx cache and no browser registry on disk.
+    playwright_browser_state: Optional[Callable[[], Any]] = None
+
+    def resolve_playwright_browser_state(self):
+        """Is the pinned Playwright MCP's browser installed? —
+        :func:`vco_lib.playwright_mcp.browser_state`, the ONE reader (shared
+        with the install-time pre-cache and the registry clear probe)."""
+        if self.playwright_browser_state is not None:
+            return self.playwright_browser_state()
+        from vco_lib import playwright_mcp  # noqa: PLC0415
+
+        return playwright_mcp.browser_state()
 
     def resolve_infra_declarations(self):
         """What projects declared their own — :mod:`vco_lib.infra_declarations`,
@@ -4630,6 +4649,19 @@ def _compose_override_pair_entry(finding: Finding):
     return doctor_infra.compose_override_pair_entry(finding)
 
 
+def probe_playwright_browser(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.playwright_mcp` (v0.2.102 W6-Z4)."""
+    from vco_lib import playwright_mcp  # noqa: PLC0415
+
+    return playwright_mcp.probe_browser(folder, res, ctx)
+
+
+def _playwright_browser_entry(finding: Finding):
+    from vco_lib import playwright_mcp  # noqa: PLC0415
+
+    return playwright_mcp.doctor_entry(finding)
+
+
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
@@ -4694,6 +4726,11 @@ PROBES: dict = {
     # for the boot-promise reason (the pair changes only through an
     # install/update or a hand edit the next full run reads).
     "compose_override_pair": (probe_compose_override_pair, (SCOPE_FULL,)),
+    # v0.2.102 W6-Z4: full-only — a directory scan of the npx cache + two
+    # small JSON reads + one marker stat. Doctor-owned, self-resolving
+    # `playwright_browser_missing`; full-only for the same boot-promise reason
+    # (the browser changes through an install/update or the printed command).
+    "playwright_browser": (probe_playwright_browser, (SCOPE_FULL,)),
     # v0.2.95 R5c: full-only — it RUNS the registered entry point
     # (`--version`), and it reports nothing at all on the majority of machines,
     # where the gateway's login-time autostart was never opted into.
@@ -5210,6 +5247,7 @@ _ENTRY_BUILDERS: dict = {
     CID_INSTALL_MARKER_UNBACKED: _install_marker_unbacked_entry,
     CID_FORMER_LAUNCHER_CLI: _former_launcher_cli_entry,
     CID_COMPOSE_OVERRIDE_PAIR_DIVERGED: _compose_override_pair_entry,
+    CID_PLAYWRIGHT_BROWSER_MISSING: _playwright_browser_entry,
 }
 
 
@@ -5488,6 +5526,7 @@ __all__ = [
     "CID_INSTALL_MARKER_UNBACKED",
     "CID_KG_BINDING_EVIDENCE_MISMATCH",
     "CID_NPX_MISSING",
+    "CID_PLAYWRIGHT_BROWSER_MISSING",
     "CID_VCO_LIB_SHADOWED",
     "DISK_CRITICAL_FREE_BYTES",
     "DISK_MIN_FREE_ENV",

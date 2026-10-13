@@ -816,6 +816,27 @@ run, so installing Node makes the entry disappear by itself. The launcher's \
 registration badge renders the same fact (gui_badge) via \
 `python -m vco_lib.npx_resolver --json`."""
 
+[conditions.playwright_browser_missing]
+class = "action_required"
+owner = "vco_lib.doctor + install.py (playwright pre-cache)"
+clear_probe = "probe:py:playwright_browser_still_missing"
+emit_surfaces = ["ledger"]
+notes = """v0.2.102 W6-Z4. The default `playwright` MCP is registered as \
+`npx -y @playwright/mcp@<pin> --browser chromium` (pin: \
+`bundled_mcp_versions.toml` [npx.playwright_mcp]), so it launches Playwright's \
+own Chromium at the revision the pinned package's playwright-core names in its \
+`browsers.json`. This entry says that revision's \
+`<ms-playwright>/chromium-<rev>/INSTALLATION_COMPLETE` is absent. Two emitters, \
+one builder (`vco_lib.playwright_mcp.browser_missing_entry`): the install-time \
+pre-cache when its download did not leave the browser on disk, and the doctor's \
+`playwright_browser` probe (install roots, full scope). The printed command is \
+the pinned package's own installer (`npx -y @playwright/mcp@<pin> \
+install-browser chromium`; `playwright@<its exact playwright-core> install \
+chromium` for a pin without that subcommand), so the revision cannot drift. \
+Clears via `playwright_browser_still_missing` (the same reading) on every \
+`--update` re-probe, and the doctor resolves it on its own OK reading. A reading \
+that cannot LOOK (the pinned package not in the npx cache) keeps the entry."""
+
 [conditions.gateway_registered_but_unrunnable]
 class = "action_required"
 owner = "vco_lib.gateway_ensure"

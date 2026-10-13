@@ -328,12 +328,16 @@ class NpmPinProbeTests(unittest.TestCase):
         with reality."""
         from vco_lib.cli import verify
 
-        section = verify._npm_pin_section(verify._load_bundled_versions())
+        document = verify._load_bundled_versions()
+        section = verify._npm_pin_section(document)
         # v0.2.102: the npm pin table is legitimately EMPTY (the four diagram
-        # pins were removed with the diagrams integrations) — the assertion
-        # is now that the section NEVER contains a phantom table-name row
-        # (the original defect), whatever pins exist.
-        self.assertNotIn("chromium", section)
+        # pins were removed with the diagrams integrations, and the
+        # `[chromium]` marker was retired) — the assertion is now that the
+        # section NEVER contains a phantom table-name row (the original
+        # defect), whatever tables and pins the document holds.
+        for table_name in document:
+            if table_name != "npm":
+                self.assertNotIn(table_name, section)
         for key in section:
             self.assertNotIn("<missing-package-for-", key)
         rows = verify._collect_pin_rows(section, npm_path=None)
