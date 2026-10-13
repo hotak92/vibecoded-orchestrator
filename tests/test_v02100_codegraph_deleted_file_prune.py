@@ -313,7 +313,9 @@ def test_refresh_does_not_record_when_the_deleted_file_prune_failed(
             path=str(clone), enabled=True, last_indexed_commit=first),),
     )
     out = cer.refresh_extras(
-        str(tmp_path), str(stub), sys.executable, tmp_path / "state", lines.append,
+        # The project's own folder sits BESIDE the clone (an extra nested in
+        # the project is refused by vco_lib.codegraph_extra_overlap).
+        str(tmp_path / "proj"), str(stub), sys.executable, tmp_path / "state", lines.append,
         deps=cer.Deps(resolve=lambda _r: cfg,
                       record=lambda *a: (recorded.append(a) or (True, "recorded"))),
     )
@@ -336,7 +338,9 @@ def test_refresh_log_reports_the_deleted_file_counts(tmp_path):
             path=str(clone), enabled=True, last_indexed_commit=first),),
     )
     out = cer.refresh_extras(
-        str(tmp_path), str(stub), sys.executable, tmp_path / "state", lines.append,
+        # The project's own folder sits BESIDE the clone (an extra nested in
+        # the project is refused by vco_lib.codegraph_extra_overlap).
+        str(tmp_path / "proj"), str(stub), sys.executable, tmp_path / "state", lines.append,
         deps=cer.Deps(resolve=lambda _r: cfg, record=lambda *a: (True, "recorded")),
     )
     assert out == {str(clone): "recorded"}

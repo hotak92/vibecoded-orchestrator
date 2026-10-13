@@ -328,66 +328,41 @@ fn basename_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Reject a path that overlaps with the project's own folder_path:
-///   * exact match
-///   * sub-path of folder_path
-///   * ANCESTOR of folder_path (v0.2.102 M-A1)
+/// Reject a path that overlaps the project's own folder: the same folder,
+/// a folder INSIDE it (already indexed — or excluded on purpose — as part of
+/// the project), or a folder CONTAINING it (every primary edit would be
+/// drained with the extra's argv and the whole tree double-walked).
 ///
-/// Returns the user-facing error string when overlap detected.
-///
-/// The ancestor arm: an extra that CONTAINS the project root would hijack
-/// every primary-root edit into the extra queue / wrong argv shape
-/// (`--as-extra-path` with the parent as repo root) and double-walk the
-/// whole tree. Routing gives primary-root containment precedence, and this
-/// validator is the registration-side home of the same rule — the launcher's
-/// GUI Add flow (`add_project_codegraph_extra_path`, the ONLY registration
-/// path — the frontend calls this command via `invoke`) runs it, so GUI and
-/// any future caller stay consistent.
-fn reject_self_overlap(extra: &str, folder_path: &str) -> Result<(), String> {
-    let extra_norm = extra.trim_end_matches('/');
-    // Normalise folder_path to forward slashes too (Windows DB rows
-    // may have raw backslashes; we don't canonicalise at DB read time
-    // so the comparison MUST be tolerant).
-    let folder_norm: String = folder_path.replace('\\', "/").trim_end_matches('/').to_string();
+/// v0.2.102 W6-CGD (D-4): the rule has ONE home, the Python
+/// `vco_lib.codegraph_extra_overlap` (rule A — the analyzer and the automatic
+/// extra-folder refresh call the same function); this wrapper runs it through
+/// [`crate::services::vco_lib_bridge::codegraph_extra_overlap`] and maps its
+/// verdict onto the command's error channel, which the Add dialog shows as
+/// is. A check that cannot run refuses the add (a broken install must not
+/// register an unchecked folder). Both sides are realpath-ed by the rule, so
+/// a symlinked or non-canonical `folder_path` row compares correctly.
+fn reject_self_overlap(
+    root: Option<&std::path::Path>,
+    extra: &str,
+    folder_path: &str,
+) -> Result<(), String> {
+    let reply = crate::services::vco_lib_bridge::codegraph_extra_overlap(root, extra, folder_path)
+        .map_err(|e| format!("could not check '{}' against this project's folder: {}", extra, e))?;
+    overlap_reply_to_result(&reply)
+}
 
-    if extra_norm.eq_ignore_ascii_case(&folder_norm) {
-        return Err(format!(
-            "the path '{}' is this project's own folder — it's already covered \
-             by the main codegraph analysis, no need to add it as an extra",
-            extra
-        ));
+/// Map the overlap reply to the command's result: `refused` → the rule's own
+/// sentence as the error; anything else → allowed. Split out so the mapping is
+/// unit-testable without a child.
+fn overlap_reply_to_result(reply: &serde_json::Value) -> Result<(), String> {
+    if reply.get("refused").and_then(serde_json::Value::as_bool) == Some(true) {
+        let msg = reply
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .filter(|m| !m.is_empty())
+            .unwrap_or("this folder overlaps the project's own folder");
+        return Err(msg.to_string());
     }
-
-    // Sub-path check. We require the prefix to be followed by a `/`
-    // so `/opt/foo` does NOT shadow `/opt/foobar`.
-    let prefix_with_sep = format!("{}/", folder_norm);
-    if extra_norm
-        .to_ascii_lowercase()
-        .starts_with(&prefix_with_sep.to_ascii_lowercase())
-    {
-        return Err(format!(
-            "the path '{}' is INSIDE this project's own folder ('{}') — it's already \
-             covered by the main codegraph analysis",
-            extra, folder_path
-        ));
-    }
-
-    // Ancestor check (v0.2.102 M-A1): the mirror image — folder_path INSIDE
-    // the extra. Same `/`-boundary rule so `/opt/foobar` is not shadowed by
-    // an `/opt/foo` extra.
-    let extra_with_sep = format!("{}/", extra_norm);
-    if folder_norm
-        .to_ascii_lowercase()
-        .starts_with(&extra_with_sep.to_ascii_lowercase())
-    {
-        return Err(format!(
-            "the path '{}' CONTAINS this project's own folder ('{}') — every primary \
-             edit would be drained with the extra's argv instead of the primary \
-             codegraph's; register a sibling subtree instead",
-            extra, folder_path
-        ));
-    }
-
     Ok(())
 }
 
@@ -502,8 +477,13 @@ pub async fn add_project_codegraph_extra_path(
     // Step 1: canonicalise.
     let canonical = canonicalise_for_storage(&path)?;
 
-    // Step 2: reject self-overlap.
-    reject_self_overlap(&canonical, &project.folder_path)?;
+    // Step 2: reject self-overlap (the one rule, `vco_lib.codegraph_extra_overlap`;
+    // blocking child off the async executor).
+    let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db.inner());
+    let (extra_c, folder_c) = (canonical.clone(), project.folder_path.clone());
+    tokio::task::spawn_blocking(move || reject_self_overlap(root.as_deref(), &extra_c, &folder_c))
+        .await
+        .map_err(|e| format!("overlap check: {}", e))??;
 
     // Step 3: launcher-project disambiguation. Only the EXACT
     // folder_path match triggers the modal — a sub-path of another
@@ -694,6 +674,8 @@ pub async fn sync_project_codegraph_extra_path(
         &prefix,
         incremental,
         row.last_indexed_commit.as_deref(),
+        // W6-CGD (D-4): the analyzer refuses an extra overlapping the project.
+        Some(project.folder_path.as_str()),
     );
 
     let started = std::time::Instant::now();
@@ -1315,31 +1297,53 @@ mod tests {
     }
 
     // ─── reject_self_overlap ────────────────────────────────────────────
+    // W6-CGD (D-4): these drive the ONE rule end-to-end through the bridge
+    // child (`python -m vco_lib.codegraph_extra_overlap`, this checkout's
+    // vco_lib under cfg(test)); the rule's own cases live in
+    // tests/test_v02102_codegraph_source_scope.py.
+
+    #[test]
+    fn reject_self_overlap_names_an_ignored_subfolder() {
+        // A folder under an ignore-set dir is NOT indexed by the project, so the
+        // refusal must not claim it is "already indexed".
+        let err = reject_self_overlap(None, "/opt/myproj/vendor/lib", "/opt/myproj").unwrap_err();
+        assert!(err.contains("never indexes"), "got: {}", err);
+        assert!(!err.contains("already indexed"), "got: {}", err);
+    }
+
+    #[test]
+    fn overlap_reply_mapping_refused_and_allowed() {
+        let refused = serde_json::json!({"ok": true, "verdict": "inside_project", "refused": true,
+                                         "message": "nope"});
+        assert_eq!(overlap_reply_to_result(&refused).unwrap_err(), "nope");
+        let allowed = serde_json::json!({"ok": true, "verdict": "ok", "refused": false, "message": ""});
+        overlap_reply_to_result(&allowed).unwrap();
+    }
 
     #[test]
     fn reject_self_overlap_rejects_exact_match() {
-        let err = reject_self_overlap("/opt/myproj", "/opt/myproj").unwrap_err();
+        let err = reject_self_overlap(None, "/opt/myproj", "/opt/myproj").unwrap_err();
         assert!(err.contains("project's own folder"), "got: {}", err);
     }
 
     #[test]
     fn reject_self_overlap_rejects_sub_path() {
-        let err = reject_self_overlap("/opt/myproj/sub/dir", "/opt/myproj").unwrap_err();
-        assert!(err.contains("INSIDE this project"), "got: {}", err);
+        let err = reject_self_overlap(None, "/opt/myproj/sub/dir", "/opt/myproj").unwrap_err();
+        assert!(err.contains("inside this project's folder"), "got: {}", err);
     }
 
     #[test]
     fn reject_self_overlap_accepts_sibling_paths() {
         // sibling of project: NOT inside.
-        reject_self_overlap("/opt/sibling", "/opt/myproj").unwrap();
+        reject_self_overlap(None, "/opt/sibling", "/opt/myproj").unwrap();
         // sub-path that doesn't share a full segment boundary.
-        reject_self_overlap("/opt/myprojz/sub", "/opt/myproj").unwrap();
+        reject_self_overlap(None, "/opt/myprojz/sub", "/opt/myproj").unwrap();
     }
 
     #[test]
     fn reject_self_overlap_handles_trailing_slash() {
         // Both with trailing slash + one without → still detect overlap.
-        let err = reject_self_overlap("/opt/myproj/", "/opt/myproj/").unwrap_err();
+        let err = reject_self_overlap(None, "/opt/myproj/", "/opt/myproj/").unwrap_err();
         assert!(err.contains("project's own folder"), "got: {}", err);
     }
 
@@ -1347,8 +1351,8 @@ mod tests {
     fn reject_self_overlap_normalises_backslashes() {
         // Folder path stored with backslashes (Windows DB row). Extra
         // path is already forward-slash form (post-canonicalisation).
-        let err = reject_self_overlap("c:/opt/myproj/sub", "c:\\opt\\myproj").unwrap_err();
-        assert!(err.contains("INSIDE this project"), "got: {}", err);
+        let err = reject_self_overlap(None, "c:/opt/myproj/sub", "c:\\opt\\myproj").unwrap_err();
+        assert!(err.contains("inside this project's folder"), "got: {}", err);
     }
 
     // ─── find_project_owning_path ───────────────────────────────────────
@@ -1596,16 +1600,16 @@ mod tests {
         // edit into the extra queue / wrong argv shape. Registration must
         // refuse it — the GUI's Add flow reaches this validator through
         // `add_project_codegraph_extra_path`, the only registration path.
-        let err = reject_self_overlap("/opt/work", "/opt/work/app").unwrap_err();
-        assert!(err.contains("CONTAINS"), "got: {}", err);
-        let err = reject_self_overlap("/opt", "/opt/work/app").unwrap_err();
-        assert!(err.contains("CONTAINS"), "got: {}", err);
+        let err = reject_self_overlap(None, "/opt/work", "/opt/work/app").unwrap_err();
+        assert!(err.contains("contains this project's own folder"), "got: {}", err);
+        let err = reject_self_overlap(None, "/opt", "/opt/work/app").unwrap_err();
+        assert!(err.contains("contains this project's own folder"), "got: {}", err);
         // Same boundary rule as the sub-path arm: /opt/work2 is NOT an
         // ancestor of /opt/work/app.
-        reject_self_overlap("/opt/work2", "/opt/work/app").unwrap();
+        reject_self_overlap(None, "/opt/work2", "/opt/work/app").unwrap();
         // Case-insensitive, mirroring the existing arms.
-        let err = reject_self_overlap("/OPT/WORK", "/opt/work/app").unwrap_err();
-        assert!(err.contains("CONTAINS"), "got: {}", err);
+        let err = reject_self_overlap(None, "/OPT/WORK", "/opt/work/app").unwrap_err();
+        assert!(err.contains("contains this project's own folder"), "got: {}", err);
     }
 
     // ─── from_row / display_label ───────────────────────────────────────

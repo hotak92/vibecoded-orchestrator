@@ -27,7 +27,7 @@ Extracted from the analyzer monolith (P2f line-count ratchet:
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,8 @@ def prune_collection(
     project_name: str,
     canonical_lang_id: Callable[[Any], str],
     language_scope: str = "",
-    preserve_paths: Optional[Set[str]] = None,
+    preserve_paths: Optional[Set[Any]] = None,
+    preserve_sources: Optional[Set[str]] = None,
 ) -> Tuple[int, int]:
     """Delete every object in ``collection`` whose project matches
     ``project_name`` AND whose UUID is not in ``visited_uuids``.
@@ -69,6 +70,19 @@ def prune_collection(
     gone from disk) is additionally owned by the deleted-primary sweep in
     the analyzer's ``_build_stale_file_set``.
 
+    v0.2.102 W6-CGD (D-3): a ``preserve_paths`` entry is a ``(source, path)``
+    tuple — the walk records which ROOT skipped the file
+    (:func:`expand_preserve_entries`), and only rows whose stored
+    ``project_source`` and anchor both match are exempt. Keyed by path alone,
+    a copy skipped in the project shielded the same path's rows of an extra
+    folder (and the reverse), so removing or disabling the folder left its
+    rows behind. A bare ``str`` entry still means "this path under any
+    source" (callers that cannot name the root). When the collection's schema
+    has no ``project_source`` (pre-v0.2.47) every row reads as source ``""``.
+    ``preserve_sources``: rows stamped with one of these roots are never
+    deleted by this run (an extra root the analyzer refused to walk because it
+    is nested inside the project — not walking it must not delete its rows).
+
     Why filter on the ``project`` property as well as the collection name:
     a per-project collection like ``MyProject_CodeFunction`` should always
     belong to a single project, but defensive in case the schema ever
@@ -88,6 +102,9 @@ def prune_collection(
     failures = 0
     preserved = 0
     preserve_paths = preserve_paths or set()
+    preserve_sources = preserve_sources or set()
+    keyed = {e for e in preserve_paths if isinstance(e, tuple)}
+    bare = {e for e in preserve_paths if not isinstance(e, tuple)}
 
     # v0.2.82 — resolve the file-anchor property for this collection:
     # CodeModule keys files on `path`; every other file-anchored
@@ -98,10 +115,12 @@ def prune_collection(
     anchor_prop: Optional[str] = (
         "path" if collection.name.endswith("_CodeModule") else "file_path"
     )
+    has_source = False
     try:
         _cfg_props = {p.name for p in collection.config.get().properties}
         if anchor_prop not in _cfg_props:
             anchor_prop = None
+        has_source = "project_source" in _cfg_props
     except Exception:  # noqa: BLE001 — config probe is best-effort
         anchor_prop = None
 
@@ -113,6 +132,8 @@ def prune_collection(
         return_props.append(anchor_prop)
     if language_scope:
         return_props.append("language")
+    if has_source:
+        return_props.append("project_source")
 
     try:
         for obj in collection.iterator(
@@ -142,6 +163,10 @@ def prune_collection(
 
             if str(obj.uuid) in visited_uuids:
                 continue
+            row_source = str(props.get("project_source") or "").strip()
+            if row_source and row_source in preserve_sources:
+                preserved += 1
+                continue
 
             # v0.2.82 — skipped-but-present exemption (see docstring).
             # Normalise `\` → `/` before membership: stored anchors are
@@ -150,7 +175,7 @@ def prune_collection(
             if anchor_prop is not None:
                 row_anchor = (props.get(anchor_prop) or "").replace("\\", "/")
                 if row_anchor:
-                    if row_anchor in preserve_paths:
+                    if row_anchor in bare or (row_source, row_anchor) in keyed:
                         preserved += 1
                         continue
                 elif preserve_paths:
@@ -199,3 +224,32 @@ def prune_collection(
             f"anchored to skipped-but-present files (not stale)"
         )
     return pruned, failures
+
+
+def expand_preserve_entries(
+    entries: Iterable[Any], *, primary_root: str, strict: bool,
+) -> Set[Any]:
+    """Turn the analyzer's ``discovered − walked`` set into prune-preserve keys.
+
+    v0.2.102 W6-CGD (D-3). Each entry is ``(walk_source, rel)`` — the walked
+    root's POSIX form and the file's path relative to it. It expands to one
+    ``(source, rel)`` key per source form that root owns
+    (:func:`vco_lib.codegraph_source_scope.preserve_keys`), with ``("", rel)``
+    added only for the project's own root (``primary_root``, and never under
+    ``strict`` = ``--as-extra-path``, whose root IS an extra folder). A bare
+    ``str`` entry passes through unchanged (any-source preserve).
+    """
+    from vco_lib import codegraph_source_scope as _scope
+
+    out: Set[Any] = set()
+    owned: Dict[str, Set[str]] = {}
+    for entry in entries:
+        if not isinstance(entry, tuple):
+            out.add(entry)
+            continue
+        src, rel = entry
+        if src not in owned:
+            owned[src] = _scope.walk_own_sources(src, src)
+        extra = strict or src != primary_root
+        out |= _scope.preserve_keys(owned[src], rel, extra_root=extra)
+    return out

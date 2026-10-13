@@ -138,6 +138,7 @@ fi
 # runs unchanged. The resolver script is the same one we already called
 # above for PROJECT_NAME; if it isn't executable we silently skip extras.
 EXTRAS_MATCHED=0
+_PRIMARY_ROOT="$REPO_PATH"  # the project's own folder, kept for --primary-root
 # Check (1) first: don't even query extras for the trivial own-repo case.
 # This avoids one hub round-trip per Edit in the common case and matches
 # the spec's "first match wins" ordering.
@@ -397,9 +398,21 @@ fi
 # analyzer's deletes to rows provably stamped with the extra path, so a
 # single-file run under an extra never removes a primary-root row of the same
 # collection. MUST MATCH the .ps1 sibling.
+#
+# W6-CGD (D-2): the --canonical-source worktree convergence is for the
+# PROJECT's own edits only. An extra path's rows carry the registered extra
+# root, the value the Sync button, the automatic refresh and the queued drain
+# stamp (one rule: vco_lib.codegraph_source_scope.walk_source_stamp, which the
+# analyzer applies even if a caller still passes the flag). Stamping a
+# worktree extra with its git main root gave one file two identities, and for
+# a worktree OF the project it overwrote the project's own rows.
+# --primary-root lets the analyzer refuse an extra that overlaps the project
+# (vco_lib.codegraph_extra_overlap). MUST MATCH the .ps1 sibling.
 _EXTRA_PATH_FLAG=()
+_CANON_FLAG=(--canonical-source "$_CANON_ROOT")
 if [ "$EXTRAS_MATCHED" -eq 1 ]; then
-    _EXTRA_PATH_FLAG=(--as-extra-path)
+    _EXTRA_PATH_FLAG=(--as-extra-path --primary-root "$_PRIMARY_ROOT")
+    _CANON_FLAG=()
 fi
 
 # Run single-file analysis in background (no internal debounce — the
@@ -441,7 +454,7 @@ fi
         "$REPO_PATH" \
         --project "$PROJECT_NAME" \
         --only-file "$EDITED_FILE" \
-        --canonical-source "$_CANON_ROOT" \
+        ${_CANON_FLAG[@]+"${_CANON_FLAG[@]}"} \
         "$_DOT_CLAUDE_FLAG" \
         ${_EXTRA_PATH_FLAG[@]+"${_EXTRA_PATH_FLAG[@]}"} \
         2>&1 | tail -5

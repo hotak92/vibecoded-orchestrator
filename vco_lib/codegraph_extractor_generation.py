@@ -169,7 +169,11 @@ logger = logging.getLogger(__name__)
 #:          languages they name. The per-entity content-hash
 #:          gate re-embeds only rows whose extracted text changed;
 #:          ``CODEGRAPH_EMBED_REVISION`` is NOT bumped (model, chunking and
-#:          embed text construction are unchanged).
+#:          embed text construction are unchanged). W6-CGD, same rung: the
+#:          unchanged-file gate counts only the walked root's own rows (D-1),
+#:          so this rung's forced re-walk also writes the project rows an
+#:          identical, earlier-indexed extra-code-folder copy had shadowed
+#:          (those files embed once under the project; nothing is deleted).
 EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92", "0.2.93", "0.2.94", "0.2.102")
 
 #: Releases DELIBERATELY not added to the ladder, each with the evidence that
