@@ -3911,8 +3911,10 @@ async def _auth_rejection_response(
     usage limit" 403 is about the ALLOWANCE, not the credential, and
     striking the key would disable a healthy one (observed live with a
     vendor answering that shape four times, 2026-10-07..11). A 401 is never
-    quota-routed, and a 403 without quota evidence classifies exactly as
-    before.
+    quota-routed, a 403 without quota evidence classifies exactly as
+    before, and the documented MODEL-level shape (``access_denied``) keeps
+    its verbatim relay even if its message happens to use quota words: the
+    model exemption takes precedence over the quota carve-out.
     """
     relay = gateway.relay_headers(upstream)
     raw, overflowed = await _buffer_bounded(
@@ -3922,6 +3924,7 @@ async def _auth_rejection_response(
         upstream.status == 403
         and quota_route is not None
         and not overflowed
+        and _auth_rejection_is_key_level(403, raw)
         and is_quota_refusal(403, raw, upstream.headers)
     ):
         # Overflow stays OUT of this branch: past the hold bound the body is

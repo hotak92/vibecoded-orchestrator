@@ -132,6 +132,26 @@ class Quota403Tests(GatewayTestBase):
         self.assertEqual(await response.json(), body)
         self.assertEqual(gw._vendor_auth_strikes, {})
 
+    async def test_access_denied_with_quota_words_keeps_the_verbatim_relay(
+        self,
+    ) -> None:
+        """R4a AB-2: the model-level exemption wins over the quota carve-out."""
+        body = {
+            "type": "error",
+            "error": {
+                "type": "AccessDenied",
+                "code": "access_denied",
+                "message": "You've reached your 5-hour usage limit for this model",
+            },
+        }
+        self.vendor_up.messages_status = 403
+        self.vendor_up.messages_body = body
+        gw = self.client.app[srv.APP_KEY]
+        response = await self._post()
+        self.assertEqual(response.status, 403)
+        self.assertEqual(await response.json(), body)
+        self.assertEqual(gw._vendor_auth_strikes, {})
+
     async def test_a_401_is_unaffected_even_with_quota_words(self) -> None:
         """A 401 is never quota-routed: key-level by definition, whatever the
         body says (the quota carve-out exists only for the 403 disguise)."""

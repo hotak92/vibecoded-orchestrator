@@ -228,7 +228,13 @@ def _is_connection_refused(exc: BaseException) -> bool:
     reading it classified a busy hub's miss as "no launcher hub running"
     (the pre-fix false message, on a narrower path). Conservative: anything
     not positively a refusal is "not responding"."""
-    seen: set[int] = set()
+    return _is_connection_refused_walk(exc, set())
+
+
+def _is_connection_refused_walk(exc: BaseException, seen: "set[int]") -> bool:
+    """:func:`_is_connection_refused` with ONE ``seen`` set shared across the
+    chain, ``.reason`` and ``args`` legs, so a self-referential error graph
+    terminates instead of recursing without bound."""
     cur: Optional[BaseException] = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
@@ -238,10 +244,10 @@ def _is_connection_refused(exc: BaseException) -> bool:
         # in the chain every time (a bare `raise URLError(reason)` sets
         # neither __cause__ nor __context__).
         reason = getattr(cur, "reason", None)
-        if isinstance(reason, BaseException) and _is_connection_refused(reason):
+        if isinstance(reason, BaseException) and _is_connection_refused_walk(reason, seen):
             return True
         for arg in getattr(cur, "args", ()):
-            if isinstance(arg, BaseException) and _is_connection_refused(arg):
+            if isinstance(arg, BaseException) and _is_connection_refused_walk(arg, seen):
                 return True
         cur = cur.__cause__ or cur.__context__
     return False

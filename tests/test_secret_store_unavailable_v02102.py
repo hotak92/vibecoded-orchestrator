@@ -415,3 +415,20 @@ def test_taxonomy():
     assert not issubclass(SecretStoreUnavailable, SecretNotFound)
     assert not issubclass(SecretNotFound, SecretStoreUnavailable)
     assert "SecretStoreUnavailable" in agent_secrets.__all__
+
+
+def test_connection_refused_walk_terminates_on_a_self_referential_reason():
+    """R4a AB-1: a URLError whose .reason points back at itself (or an args
+    cycle) must terminate as "not refused", never recurse to RecursionError."""
+    import urllib.error
+
+    from vco_lib import project_config as pc
+
+    err = urllib.error.URLError("x")
+    err.reason = err  # type: ignore[assignment]
+    other = OSError("wrapper")
+    other.args = (other,)
+    assert pc._is_connection_refused(err) is False
+    assert pc._is_connection_refused(other) is False
+    # Leave-alone: a refusal nested in .reason is still found.
+    assert pc._is_connection_refused(urllib.error.URLError(ConnectionRefusedError())) is True
