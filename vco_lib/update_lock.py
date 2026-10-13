@@ -10,18 +10,32 @@ two processes interleaving ``git pull`` and ``install.py`` on one tree.
 
 This is the ONE Python reader of that file. Its format MUST match the Rust
 writer exactly (pinned by ``tests/test_v02100_update_lock_honoured.py`` against
-the literal ``format!("{}\\n{}\\n", own_pid, timestamp)`` in single_flight.rs):
+the ``format!`` body in single_flight.rs):
 
-    <holder pid>\\n<unix seconds when claimed>\\n
+    <holder pid>\\n<unix seconds when claimed>\\n<holder start token>\\n
+
+The third line (v0.2.102 W6-Z3) is the holder's process start token in
+:func:`vco_lib.deferral_probes.process_start_token`'s format (``proc:<ticks>``
+on Linux, ``wall:<seconds>`` elsewhere); it is empty when the launcher could
+not read it, and absent from a claim written by a pre-v0.2.102 launcher.
 
 Decision (:func:`decide`), in order:
 
 * no file / empty / unparseable → PROCEED (install.py cannot tell, and a guard
   that cannot confirm a concurrent update must not block one — the launcher,
   the lock's owner, refuses malformed claims on its side);
-* holder dead, or alive but started AFTER the claim was written (a reused pid —
-  the success path leaves a claim naming a dead pid, W2R-06) → PROCEED (stale;
-  the file is the launcher's to reap, never deleted here);
+* holder dead, or alive but a DIFFERENT process than the claimant (a reused
+  pid — the success path leaves a claim naming a dead pid, W2R-06) → PROCEED
+  (stale; the file is the launcher's to reap, never deleted here). "Different"
+  is decided by the start token when the claim carries one: the pid's current
+  token differs from the recorded one. Only a two-line (legacy) claim, or one
+  whose token cannot be compared, falls back to the time rule — alive but
+  started AFTER the claim was written. That rule assumes the wall clock did
+  not step between the claim and now: psutil derives a Linux start time from
+  ``/proc/stat`` ``btime``, which the kernel recomputes from the current wall
+  clock, so a forward NTP step makes a live holder look newer than its claim.
+  The token (``/proc`` start ticks, or the OS-stored creation time) does not
+  move, which is why it wins whenever it is present;
 * holder is THIS process or one of its ancestors → PROCEED: this install.py is
   the launcher's own child (``update_run.rs`` step 8 spawns it). Recognition by
   ancestry needs no cooperation from the launcher — no env token to forward
@@ -62,6 +76,9 @@ _START_SLACK_S = 2.0
 class Claim:
     pid: int
     claimed_at: Optional[float]
+    #: The holder's process start token (line 3), or ``None`` for a legacy
+    #: two-line claim / an empty third line.
+    start_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -79,7 +96,8 @@ def lock_path(vct_root: Optional[Path] = None) -> Path:
 
 
 def parse_claim(text: str) -> Optional[Claim]:
-    """Parse the Rust writer's two-line body; ``None`` when it names no pid."""
+    """Parse the Rust writer's body (two lines, or three since v0.2.102);
+    ``None`` when it names no pid."""
     lines = [ln.strip() for ln in (text or "").splitlines()]
     if not lines or not lines[0].isdigit():
         return None
@@ -89,7 +107,8 @@ def parse_claim(text: str) -> Optional[Claim]:
             ts = float(lines[1])
         except ValueError:
             ts = None
-    return Claim(pid=int(lines[0]), claimed_at=ts)
+    token = lines[2] if len(lines) > 2 and lines[2] else None
+    return Claim(pid=int(lines[0]), claimed_at=ts, start_token=token)
 
 
 # ── process facts (psutil when importable — a hard dependency of the venv —
@@ -328,19 +347,40 @@ def ancestors(pid: Optional[int] = None, *, parent_of: Callable[[int], Optional[
     return chain
 
 
+def same_instance(pid: int, recorded: str) -> Optional[bool]:
+    """Is *pid* still the process whose start token was *recorded*? The ONE
+    comparison home is :func:`vco_lib.deferral_probes.process_identity_matches`
+    (imported lazily: that module is heavy, and this guard runs before the
+    venv relaunch). ``None`` = cannot tell."""
+    try:
+        from vco_lib.deferral_probes import process_identity_matches
+    except Exception:  # noqa: BLE001 — cannot tell → the caller's fallback
+        return None
+    return process_identity_matches(pid, recorded)
+
+
 def decide(claim: Optional[Claim], *, alive: Callable[[int], Optional[bool]] = pid_alive,
            started: Callable[[int], Optional[float]] = process_start_time,
-           lineage: Callable[[], Optional[list]] = ancestors) -> Decision:
+           lineage: Callable[[], Optional[list]] = ancestors,
+           identity: Callable[[int, str], Optional[bool]] = same_instance) -> Decision:
     """Pure over its probes — see the module docstring for the rule."""
     if claim is None:
         return Decision(PROCEED, "no update claim")
     is_alive = alive(claim.pid)
     if is_alive is False:
         return Decision(PROCEED, f"stale claim (pid {claim.pid} is not running)")
-    if is_alive is True and claim.claimed_at is not None:
+    reused = f"stale claim (pid {claim.pid} was reused by a newer process)"
+    same: Optional[bool] = None
+    if is_alive is True and claim.start_token:
+        same = identity(claim.pid, claim.start_token)
+        if same is False:
+            return Decision(PROCEED, reused)
+    if is_alive is True and same is None and claim.claimed_at is not None:
+        # Legacy two-line claim, or a token that cannot be compared: the
+        # wall-clock rule (see the module docstring for its clock caveat).
         began = started(claim.pid)
         if began is not None and began > claim.claimed_at + _START_SLACK_S:
-            return Decision(PROCEED, f"stale claim (pid {claim.pid} was reused by a newer process)")
+            return Decision(PROCEED, reused)
     chain = lineage()
     if chain is not None and claim.pid in chain:
         return Decision(PROCEED, f"this install.py is the child of the update holder (pid {claim.pid})")

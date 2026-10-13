@@ -426,6 +426,18 @@
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
             "timeout": 10,
+            "if": "Bash(echo *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
+            "timeout": 10,
+            "if": "Bash(printf *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
+            "timeout": 10,
             "if": "PowerShell(Get-Content *)"
           },
           {
@@ -481,6 +493,12 @@
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
             "timeout": 10,
             "if": "PowerShell(Tee-Object *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.ps1\"",
+            "timeout": 10,
+            "if": "PowerShell(Write-Output *)"
           },
           {
             "type": "command",

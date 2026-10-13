@@ -436,6 +436,23 @@ def _active_code_vector_slot() -> str:
     return svc.code_vector_slot
 
 
+def _single_populated_slot(coll, uuid) -> str:
+    """The ONE named-vector slot object ``uuid`` has a stored vector in, or
+    ``""`` when there is none or more than one (ambiguous → the caller fails
+    loudly instead of picking). Used only by ``find_similar``'s no-service
+    ``near_object`` leg, which compares stored vectors and so needs no
+    embedding backend — just the slot those vectors live in."""
+    try:
+        obj = coll.query.fetch_object_by_id(uuid, include_vector=True)
+    except Exception:  # noqa: BLE001 — unresolvable → caller fails loudly
+        return ""
+    vectors = getattr(obj, "vector", None) if obj is not None else None
+    if not isinstance(vectors, dict):
+        return ""
+    populated = [name for name, vec in vectors.items() if vec]
+    return populated[0] if len(populated) == 1 else ""
+
+
 # v0.2.72 T-FLOOR (P1) + integration: the two-stage per-slot floor table,
 # resolvers AND the retrieval pipeline live in the SINGLE SHARED home
 # ``weaviate_mcp.code_ranking`` so the CLI path and the MCP path
@@ -1419,23 +1436,28 @@ class CodeGraphQuery:
             # entity carries no body, or the vector search cannot run — so the
             # command keeps working on a half-migrated install.
             #
-            # ``_run`` is the ONE place the project filter + execution happen,
-            # shared by BOTH legs. It is called INSIDE the try for the vector
-            # leg: ``near_vector`` can fail at EXECUTION time (a dimension/slot
-            # mismatch against the collection's named vector), not only while
-            # the query is built, and that must fall back to ``near_object``
-            # rather than fail a call that used to succeed (v0.2.101 SF-2 nit).
-            def _run(query):
-                if self.project:
-                    query = query.where(
-                        Filter.by_property("project").equal(self.project)
-                    )
-                return query.do()
+            # v0.2.102 W6-Z3: weaviate v4 ONLY. ``coll.query.near_vector`` /
+            # ``near_object`` EXECUTE on call and return a ``QueryReturn``
+            # (``.objects``); the project filter is the ``filters=`` kwarg and
+            # the distance needs ``return_metadata`` — exactly the working
+            # ``search`` path above. The pre-v0.2.102 body chained the v3
+            # builder (``.where()`` / ``.do()``), which a ``QueryReturn`` does
+            # not have, so every call failed. ``base_kwargs`` is the ONE place
+            # the shared kwargs are built, for BOTH legs. Every code collection
+            # carries several named vectors, so Weaviate refuses a vector query
+            # without ``target_vector`` — both legs name the slot.
+            base_kwargs: dict = dict(
+                limit=limit + 1,
+                return_metadata=MetadataQuery(distance=True),
+            )
+            if self.project:
+                base_kwargs["filters"] = Filter.by_property("project").equal(self.project)
 
-            similar_query = None
             response = None
+            slot = ""
             svc = _get_or_create_embedding_service()
             if svc is not None:
+                slot = _active_code_vector_slot()
                 ref_text = _reference_code_text(dict(ref_obj.properties or {}))
                 if ref_text:
                     try:
@@ -1445,25 +1467,39 @@ class CodeGraphQuery:
                             ref_text, task=QUERY_TASK_CODE_SIMILARITY
                         )
                         if vec:
-                            nv_kwargs: dict = dict(near_vector=vec, limit=limit + 1)
-                            slot = _active_code_vector_slot()
-                            if slot:
-                                nv_kwargs["target_vector"] = slot
-                            similar_query = coll.query.near_vector(**nv_kwargs)
-                            response = _run(similar_query)
+                            # Called INSIDE the try: ``near_vector`` can fail
+                            # at EXECUTION time (a dimension/slot mismatch
+                            # against the collection's named vector), and that
+                            # must fall back to ``near_object`` rather than
+                            # fail a call that used to succeed (v0.2.101 SF-2).
+                            response = coll.query.near_vector(
+                                near_vector=vec, target_vector=slot, **base_kwargs
+                            )
                     except Exception as e:
                         print(
                             f"⚠️  query-vector similarity unavailable ({e}); "
                             f"falling back to near_object",
                             file=sys.stderr,
                         )
-                        similar_query = None
                         response = None
-            if similar_query is None:
-                response = _run(coll.query.near_object(
-                    near_object=ref_obj.uuid,
-                    limit=limit + 1
-                ))
+            if response is None:
+                if not slot:
+                    # No embedding service → the active slot is unknown. Use
+                    # the slot the REFERENCE itself is stored in, but only when
+                    # that is unambiguous (exactly one populated slot): a
+                    # stored-vector comparison inside one slot never mixes
+                    # models. Anything else fails loudly — never a guess.
+                    slot = _single_populated_slot(coll, ref_obj.uuid)
+                    if not slot:
+                        from vco_lib.embed_outage import query_unavailable
+
+                        raise query_unavailable(
+                            "code", None,
+                            construction_error=_embedding_construction_error,
+                        )
+                response = coll.query.near_object(
+                    near_object=ref_obj.uuid, target_vector=slot, **base_kwargs
+                )
 
             # Format and print results (the reference itself is excluded).
             others = [o for o in response.objects if o.uuid != ref_obj.uuid]

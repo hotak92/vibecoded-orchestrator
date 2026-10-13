@@ -406,6 +406,11 @@ _SPECS: Tuple[_Spec, ...] = (
           _p(filepath=("path",), literalpath=("lp", "pspath"), variable=(),
              append=(), inputobject=(), encoding=()),
           frozenset({"append"}), "tee"),
+    # v0.2.102 W6-Z3: `echo x > f`'s twin. Its `if` rule exists for the
+    # redirect write; without a file target it classifies MECHANICAL.
+    _Spec("Write-Output", ("echo", "write"), ("inputobject",),
+          _p(inputobject=(), noenumerate=()),
+          frozenset({"noenumerate"}), "echo"),
     _Spec("New-Item", ("ni",), ("path",),
           _p(path=_PATH, name=(), itemtype=("type",), value=(), force=()),
           frozenset({"force"}), "touch"),
@@ -628,6 +633,8 @@ def _emit(spec: _Spec, args: List[_Tok], depth: int) -> List[List[str]]:
     elif canon in ("Out-File", "Tee-Object"):
         targets = _paths(named.get("filepath", []) + named.get("literalpath", []))
         seg = ["tee"] + (["-a"] if "append" in sw else []) + targets
+    elif canon == "Write-Output":
+        seg = ["echo", *named.get("inputobject", []), *rest]
     elif canon == "New-Item":
         kind = (_first(named, "itemtype") or "").lower()
         name = _first(named, "name")

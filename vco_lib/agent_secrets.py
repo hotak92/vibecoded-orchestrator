@@ -474,8 +474,9 @@ def _hub_get(key: str, project: Optional[str]) -> str:
         if code == "key_not_active":
             raise AccessDenied(
                 f"key {key!r} not active for project {pid} "
-                "(paused in the launcher, or not declared by any installed "
-                "module / shared slot)"
+                "(not declared by any installed module, or not granted to "
+                "this project; a paused key answers the distinct key_paused "
+                "code)"
             )
         raise SecretNotFound(
             f"hub 404 for key {key!r} (project={pid}, code={code!r})"

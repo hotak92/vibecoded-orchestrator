@@ -158,6 +158,9 @@ class TestRegistrations:
             elif spelling.lower() in ("copy-item", "copy", "cp", "cpi",
                                       "move-item", "move", "mv", "mi"):
                 sample = f"{spelling} a.py vco_lib/packs.py"
+            elif spelling.lower() == "write-output":
+                # W6-Z3: the redirect write (`echo x > f`'s twin).
+                sample = f"{spelling} 'x = 1' > vco_lib/packs.py"
             else:
                 sample = f"{spelling} vco_lib/packs.py"
             bi = inject_intent.classify_bash(sample, str(REPO_ROOT), "PowerShell")
@@ -198,7 +201,7 @@ class TestRegistrations:
     def test_twin_counts(self, tpl):
         doc = _load(tpl)
         (g,) = _groups_of(doc, "PreToolUse", "pre-bash-context-inject")
-        assert len(_ps_rules(g)) == 16
+        assert len(_ps_rules(g)) == 17
 
     def test_twins_are_the_same_handler(self, tpl):
         doc = _load(tpl)
@@ -263,6 +266,8 @@ def test_templates_are_in_parity():
     ("Microsoft.PowerShell.Management\\Get-Content f", "cat f"),
     ("Get-Content f # trailing comment", "cat f"),
     ("<# block #> Get-Content f", "cat f"),
+    ("Write-Output 'x = 1' > src\\a.py", "echo 'x = 1' > src/a.py"),
+    ("echo hi", "echo hi"),
 ])
 def test_translation(ps, bash):
     assert to_bash_equivalent(ps) == bash
@@ -274,8 +279,10 @@ def test_loop_body_yields_its_statements():
 
 
 def test_quoted_text_is_not_a_command():
+    # W6-Z3: Write-Output translates to its Bash verb `echo`; the quoted
+    # text stays one argument, never a command.
     assert to_bash_equivalent('Write-Output "Start-Sleep 5; Wait-Job 1"') == \
-        "write-output 'Start-Sleep 5; Wait-Job 1'"
+        "echo 'Start-Sleep 5; Wait-Job 1'"
 
 
 def test_translator_never_raises_on_garbage():
