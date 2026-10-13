@@ -1434,6 +1434,16 @@ def openai_available() -> bool:
 _OPENAI_SECRET_NAME = "openai_api_key"  # must match vco_lib.openai_key.OPENAI_SECRET_NAME
 _openai_key_cache: list[str] = []
 
+#: v0.2.102 (W6-AB): how long the shipped resolver may take before this
+#: process gives up on it. The resolver waits up to 30 s per hub request
+#: (``_SECRET_READ_TIMEOUT_S`` / ``$script:SecretReadTimeoutMs`` — a busy OS
+#: keychain behind a WORKING hub can take that long), makes two requests
+#: (by-path, then /env), and retries the pair ONCE after the hub's 2 s
+#: Retry-After: 4 x 30 + 2 = 122 s worst case. The former 15 s killed a
+#: slow-but-working resolver mid-answer. Must exceed that worst case
+#: (pinned by tests/test_secret_read_timeout_parity.py).
+_SHIPPED_RESOLVER_TIMEOUT_S = 150
+
 
 def _resolve_secret_via_shipped_resolver(key: str) -> str:
     """The value the shipped resolver prints for ``key`` (stdout, exit 0), or
@@ -1461,7 +1471,9 @@ def _resolve_secret_via_shipped_resolver(key: str) -> str:
     import subprocess
 
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        done = subprocess.run(
+            argv, capture_output=True, text=True, timeout=_SHIPPED_RESOLVER_TIMEOUT_S,
+        )
     except (OSError, subprocess.SubprocessError):
         return ""
     return done.stdout.strip() if done.returncode == 0 else ""

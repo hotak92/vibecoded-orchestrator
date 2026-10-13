@@ -48,15 +48,55 @@ Every sanctioned resolver walks the SAME chain, in this order:
    or `keychain_unavailable` (v0.2.102: a keychain operation timed out
    or the hub's keychain worker is stuck on an unresponsive Secret
    Service — nothing to unlock, retry after the `Retry-After` seconds
-   the response carries). All three are tier-1 exit 6 from
-   `vct_secrets_resolve.sh` / `.ps1` (each with its own message) and
-   `KeychainLocked` from `vco_lib.agent_secrets` (`keychain_unavailable`
-   as its subclass `KeychainUnavailable`); the chain still falls
-   through to tiers 2 and 3. A full-env response that hit one of them
-   carries `X-VCT-Secrets-Degraded: keychain_error` or
+   the response carries). `keychain_locked` and `keychain_error` are
+   tier-1 exit 6 from `vct_secrets_resolve.sh` / `.ps1` (each with its
+   own message) and `KeychainLocked` from `vco_lib.agent_secrets`;
+   `keychain_unavailable` is the retryable case below. The chain still
+   falls through to tiers 2 and 3. A full-env response that hit one of
+   them carries `X-VCT-Secrets-Degraded: keychain_error` or
    `keychain_unavailable`. A temporarily unavailable keychain says
    nothing about whether the key exists, so `vct get` withholds its
    `vct set` hint on it.
+
+   **Secret store unavailable — retry, never "add the key" (v0.2.102).**
+   A hub that is RUNNING but cannot answer yet is not evidence that a key
+   is absent. Three shapes count as "unavailable": the hub accepted the
+   connection but did not answer within the secret read timeout (or
+   dropped the connection), it answered any 5xx other than
+   `keychain_locked`/`keychain_error`, or it answered
+   `503 keychain_unavailable`. Every resolver retries tier 1 exactly ONCE
+   on these (after the hub's `Retry-After`, capped at 5 s, for
+   `keychain_unavailable`), then falls through to tiers 2 and 3. When
+   those miss too, the answer is the retryable "store unavailable": the
+   exception `SecretStoreUnavailable` from `vco_lib.agent_secrets`
+   (`KeychainUnavailable` is a subclass), exit **7** from
+   `vct_secrets_resolve.sh` / `.ps1`. Neither is ever `SecretNotFound` /
+   exit 3-4, and neither message tells anyone to add the key. A REFUSED
+   connection (no hub running) is different: it falls through to tiers 2
+   and 3 at once, without waiting or retrying, and a full miss stays
+   `SecretNotFound` / exit 1. The not-found message then says the
+   launcher hub is not running, so the OS keychain was not checked.
+
+   **Timeouts.** Secret reads (`/env` and the `by-path` lookup before it)
+   use a **30 s** read timeout and a 2 s connect timeout. The hub answers
+   from the OS keychain, whose own per-operation wait is 10 s and which
+   may run a lock probe plus one read per bucket, so a slow but working
+   hub can take well over the 5 s that config reads keep. A refused
+   connection still fails in milliseconds. The value lives once per
+   language: `vco_lib.project_config.SECRET_READ_TIMEOUT_SECONDS`,
+   `_SECRET_READ_TIMEOUT_S` in `vct_secrets_resolve.sh` (and
+   `_VCT_HUB_PROBE_READ_TIMEOUT_S` in the `vct` CLI's miss probe),
+   `$script:SecretReadTimeoutMs` in `vct_secrets_resolve.ps1`.
+   `tests/test_secret_read_timeout_parity.py` keeps them equal.
+   `VCT_RESOLVE_MAX_TIME` still caps the total time a shell/PS resolver
+   invocation spends on the hub. On the hub side, a Background keychain
+   read that completes after its caller stopped waiting stores its value
+   in the hub's value cache, so the client's retry is answered from there.
+   The model gateway serves its last good key through an unavailable
+   store, whatever the key's age, and refreshes an expired key in the
+   background instead of making the request wait. With no key at all it
+   answers 503 with `Retry-After` and "secret store busy … retrying is
+   safe".
    Hub discovery: `$VCT_HUB_PORT` / `$VCT_HUB_TOKEN` env →
    `<vct_root>/hub.port` + `hub.token` → defaults (a PROVABLY-stale
    `$VCT_HUB_TOKEN` is retried once against the on-disk token — see

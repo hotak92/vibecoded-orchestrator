@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import contextlib
 import http.server
+import json
 import shutil
 import socket
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -209,6 +211,7 @@ def _run_resolver_live(
     port: int,
     *,
     shared_only: bool = False,
+    extra_env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     """Invoke the ps1 resolver against a LIVE hub on ``port`` (token via env).
 
@@ -224,6 +227,7 @@ def _run_resolver_live(
         "VCT_STATE_DIR": str(tmp_path / "empty-state"),
         "VCT_HUB_TOKEN": "canary-token",
         "VCT_SECRETS_DIR": str(secrets_dir),
+        **(extra_env or {}),
     }
     (tmp_path / "home").mkdir(exist_ok=True)
     argv = ["-SharedOnly", arg1, key] if shared_only else [arg1, key]
@@ -257,16 +261,19 @@ def test_live_503_keychain_error_exits_6(tmp_path, secrets_dir):
     assert "unreadable" in cp.stderr.lower()
 
 
-def test_live_503_keychain_unavailable_exits_6_says_retry(tmp_path, secrets_dir):
+def test_live_503_keychain_unavailable_exits_7_says_retry(tmp_path, secrets_dir):
     """v0.2.102: a 503 keychain_unavailable (a keychain op timed out on the
-    hub) → exit 6 with a "temporarily unavailable — retry" message, not the
-    unlock advice of keychain_locked/keychain_error."""
+    hub) → after ONE retry, exit 7 (W6-AB: the retryable "store unavailable"
+    code, distinct from exit 6 = locked) with a "temporarily unavailable —
+    retry" message, not the unlock advice of keychain_locked/keychain_error,
+    and never an add-the-key remedy."""
     body = '{"error": {"code": "keychain_unavailable", "message": "timed out"}}'
     with _fake_hub(503, body) as port:
         cp = _run_resolver_live(tmp_path, "p1", "BUSY_KEY", secrets_dir, port)
-    assert cp.returncode == 6, f"stderr={cp.stderr}"
+    assert cp.returncode == 7, f"stderr={cp.stderr}"
     low = cp.stderr.lower()
     assert "temporarily unavailable" in low and "retry" in low
+    assert "vct set" not in low
 
 
 def test_live_503_keychain_locked_falls_to_file_store(tmp_path, secrets_dir):
@@ -282,13 +289,159 @@ def test_live_503_keychain_locked_falls_to_file_store(tmp_path, secrets_dir):
     assert cp.stdout == "store-copy-while-locked"
 
 
-def test_live_other_503_stays_exit_1(tmp_path, secrets_dir):
-    """Only keychain_locked / keychain_error map to exit 6; any OTHER 503
-    keeps the historical exit 1."""
+def test_live_other_503_is_retryable_exit_7(tmp_path, secrets_dir):
+    """Only keychain_locked / keychain_error map to exit 6. Any OTHER 503 was
+    exit 1 ("hub unreachable") until v0.2.102; the hub answered, so it is
+    running — the retryable exit 7 is the honest code (W6-AB)."""
     body = '{"error": {"code": "service_misconfigured", "message": "no KG binding"}}'
     with _fake_hub(503, body) as port:
         cp = _run_resolver_live(tmp_path, "p1", "MISCONF_KEY", secrets_dir, port)
+    assert cp.returncode == 7, f"stderr={cp.stderr}"
+
+
+@contextlib.contextmanager
+def _scripted_hub(answers: list, *, delay_s: float = 0.0):
+    """v0.2.102 (W6-AB): answer each GET with the next ``(status, body)`` (the
+    last one repeats), optionally after ``delay_s``; yields ``(port, hits)``
+    where ``hits`` is a list the handler appends to per request. Threaded, so
+    a delayed answer never blocks the resolver's retry.
+
+    v0.2.102 fix round: an answer may also be a 3-tuple
+    ``(status, body, headers)`` with a dict of extra response headers -- the
+    Retry-After the resolver's ONE retry must honour."""
+    hits: list[str] = []
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a, **k):  # noqa: D401 — silence the fake hub
+            pass
+
+        def do_GET(self):  # noqa: N802 — http.server API
+            hits.append(self.path)
+            answer = answers[min(len(hits), len(answers)) - 1]
+            if len(answer) == 3:
+                status, body, extra_headers = answer
+            else:
+                status, body, extra_headers = *answer, {}
+            if delay_s:
+                time.sleep(delay_s)
+            payload = body.encode()
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                for name, value in (extra_headers or {}).items():
+                    self.send_header(name, str(value))
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except OSError:
+                pass  # the client gave up (timeout) — expected
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield port, hits
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_live_slow_keychain_completes_on_the_one_retry(tmp_path, secrets_dir):
+    """503 keychain_unavailable, then 200: the ONE retry returns the value."""
+    busy = '{"error": {"code": "keychain_unavailable", "message": "timed out"}}'
+    ok = '{"SLOW_KEY": "synthetic-slow-keychain-value"}'
+    with _scripted_hub([(503, busy), (200, ok)]) as (port, hits):
+        cp = _run_resolver_live(tmp_path, "p1", "SLOW_KEY", secrets_dir, port)
+    assert cp.returncode == 0, f"stderr={cp.stderr}"
+    assert cp.stdout == "synthetic-slow-keychain-value"
+    assert len(hits) == 2
+
+
+def _busy_then_ok(key: str, value: str, retry_after: str):
+    busy = '{"error": {"code": "keychain_unavailable", "message": "timed out"}}'
+    ok = json.dumps({key: value})
+    return [(503, busy, {"Retry-After": retry_after}), (200, ok, {})]
+
+
+def test_live_retry_honours_a_numeric_retry_after(tmp_path, secrets_dir):
+    """v0.2.102 fix round: the ONE retry waits the hub's OWN numeric
+    Retry-After (agent_secrets._retry_wait_seconds parity) — 4 s here, which
+    the old fixed 2 s wait cannot explain."""
+    t0 = time.monotonic()
+    with _scripted_hub(_busy_then_ok("RA_KEY", "synthetic-retry-after-value", "4")) as (
+        port, hits,
+    ):
+        cp = _run_resolver_live(tmp_path, "p1", "RA_KEY", secrets_dir, port)
+    elapsed = time.monotonic() - t0
+    assert cp.returncode == 0, f"stderr={cp.stderr}"
+    assert cp.stdout == "synthetic-retry-after-value"
+    assert len(hits) == 2
+    assert 3.5 <= elapsed <= 8.0, f"expected the honoured 4 s wait, took {elapsed:.1f}s"
+
+
+def test_live_retry_after_above_the_cap_is_clamped_to_5s(tmp_path, secrets_dir):
+    """Retry-After: 9 must wait the 5 s cap, not the 9 s the hub asked for."""
+    t0 = time.monotonic()
+    with _scripted_hub(_busy_then_ok("RA_CAP_KEY", "synthetic-capped-value", "9")) as (
+        port, hits,
+    ):
+        cp = _run_resolver_live(tmp_path, "p1", "RA_CAP_KEY", secrets_dir, port)
+    elapsed = time.monotonic() - t0
+    assert cp.returncode == 0, f"stderr={cp.stderr}"
+    assert cp.stdout == "synthetic-capped-value"
+    assert len(hits) == 2
+    assert 4.5 <= elapsed <= 8.0, f"expected the 5 s cap, took {elapsed:.1f}s"
+
+
+def test_live_unparseable_retry_after_waits_the_2s_default(tmp_path, secrets_dir):
+    """"Retry-After: soon" is not a number of seconds: the wait falls back to
+    the hub default (2 s) — never an error, never a long sleep on garbage."""
+    t0 = time.monotonic()
+    with _scripted_hub(_busy_then_ok("RA_BAD_KEY", "synthetic-fallback-value", "soon")) as (
+        port, hits,
+    ):
+        cp = _run_resolver_live(tmp_path, "p1", "RA_BAD_KEY", secrets_dir, port)
+    elapsed = time.monotonic() - t0
+    assert cp.returncode == 0, f"stderr={cp.stderr}"
+    assert cp.stdout == "synthetic-fallback-value"
+    assert len(hits) == 2
+    assert elapsed <= 4.5, f"expected the 2 s default wait, took {elapsed:.1f}s"
+
+
+def test_live_hub_that_does_not_answer_in_time_exits_7(tmp_path, secrets_dir):
+    """The 2026-10-13 incident shape: the hub accepts the connection but does
+    not answer in time (here inside a 1 s VCT_RESOLVE_MAX_TIME budget) → exit
+    7, "did not answer in time … retrying is safe" — not 1 "hub unreachable",
+    not a "not found", no add-the-key remedy."""
+    ok = '{"TIMEOUT_KEY": "never-delivered"}'
+    with _scripted_hub([(200, ok)], delay_s=3.0) as (port, _hits):
+        cp = _run_resolver_live(
+            tmp_path, "p1", "TIMEOUT_KEY", secrets_dir, port,
+            extra_env={"VCT_RESOLVE_MAX_TIME": "1"},
+        )
+    assert cp.returncode == 7, f"stderr={cp.stderr}"
+    low = cp.stderr.lower()
+    assert "did not answer in time" in low and "retrying is safe" in low
+    assert "hub unreachable" not in low
+    assert "vct set" not in low
+
+
+def test_live_hub_5xx_is_retried_once_then_exit_7(tmp_path, secrets_dir):
+    with _scripted_hub([(500, '{"error": {"code": "internal"}}')]) as (port, hits):
+        cp = _run_resolver_live(tmp_path, "p1", "HUB500_KEY", secrets_dir, port)
+    assert cp.returncode == 7, f"stderr={cp.stderr}"
+    assert len(hits) == 2
+
+
+def test_refused_connection_falls_through_fast(tmp_path, secrets_dir):
+    """No hub at all: exit 1 at once — the long read timeout and the retry
+    are only for a hub that is RUNNING but slow."""
+    t0 = time.monotonic()
+    cp = _run_resolver_live(tmp_path, "p1", "ANY_KEY", secrets_dir, _dead_port())
+    elapsed = time.monotonic() - t0
     assert cp.returncode == 1, f"stderr={cp.stderr}"
+    assert elapsed < 15, f"refused connection took {elapsed:.1f}s (pwsh startup included)"
 
 
 def test_live_404_key_not_active_still_exit_3(tmp_path, secrets_dir):

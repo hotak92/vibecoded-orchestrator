@@ -73,11 +73,14 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Mapping, Optional
 
 from vco_lib.project_config import (  # noqa: F401 — re-exported for callers
+    SECRET_READ_TIMEOUT_SECONDS,
     Forbidden,
+    HubNotResponding,
     HubUnreachable,
     ProjectNotFound,
     ResolverError,
@@ -85,9 +88,25 @@ from vco_lib.project_config import (  # noqa: F401 — re-exported for callers
     _resolve_project_id,
 )
 
+#: v0.2.102 (W6-AB): the longest ``Retry-After`` the resolver honours before
+#: its ONE retry of a hub ``503 keychain_unavailable``. The hub sends 2 s
+#: today; the cap keeps a misbehaving header from parking a caller (a hook,
+#: the gateway's resolution thread) for minutes.
+HUB_RETRY_AFTER_CAP_SECONDS: float = 5.0
+
+#: Default wait before the retry when ``Retry-After`` is absent / unreadable —
+#: the hub's own value (``KEYCHAIN_UNAVAILABLE_RETRY_AFTER_SECS`` in
+#: ``vct-hub/src/modules_api.rs``).
+_HUB_RETRY_AFTER_DEFAULT_SECONDS: float = 2.0
+
+#: Indirection so tests can observe the retry wait without sleeping.
+_sleep = time.sleep
+
 __all__ = [
     "AccessDenied",
     "Forbidden",
+    "HUB_RETRY_AFTER_CAP_SECONDS",
+    "HubNotResponding",
     "HubUnreachable",
     "KeychainLocked",
     "KeychainUnavailable",
@@ -96,6 +115,7 @@ __all__ = [
     "ProjectNotFound",
     "SecretNotFound",
     "SecretPaused",
+    "SecretStoreUnavailable",
     "exec_with_secrets",
     "get",
 ]
@@ -103,6 +123,27 @@ __all__ = [
 
 class SecretNotFound(ResolverError):
     """The key resolves nowhere (hub + file store both came up empty)."""
+
+
+class SecretStoreUnavailable(ResolverError):
+    """A secret store could not be ASKED, so the miss proves nothing —
+    RETRYABLE (v0.2.102, W6-AB).
+
+    Raised by :func:`get` when tier 1 was unavailable — the hub was running
+    but did not answer in time (:class:`HubNotResponding`: read/connect
+    timeout, a connection dropped after connect, a hub 5xx) or its OS keychain
+    was temporarily unavailable (:class:`KeychainUnavailable`, a subclass) —
+    AND tiers 2 + 3 did not hold the key either. The key may well exist in the
+    OS keychain: the remedy is to RETRY, never to add the key again, and the
+    message says exactly that. Deliberately NOT a :class:`SecretNotFound`
+    subclass — "we could not look" must never read as "it is not there"
+    (2026-10-13: a busy hub's 5 s read timeout surfaced as "no key found …
+    Put it in the SHARED scope" for a key that was in the keychain).
+
+    A REFUSED connection (no hub running at all) is not this error: the
+    resolver falls through to tiers 2 + 3 at once and a full miss stays
+    :class:`SecretNotFound`, whose message names the not-running launcher.
+    """
 
 
 class KeychainLocked(ResolverError):
@@ -134,7 +175,7 @@ class KeychainLocked(ResolverError):
     """
 
 
-class KeychainUnavailable(KeychainLocked):
+class KeychainUnavailable(KeychainLocked, SecretStoreUnavailable):
     """The hub's OS keychain was TEMPORARILY unavailable (503
     ``keychain_unavailable``, sent with ``Retry-After``) — v0.2.102.
 
@@ -144,8 +185,14 @@ class KeychainUnavailable(KeychainLocked):
     ``Retry-After`` seconds. A SUBCLASS of :class:`KeychainLocked` so every
     existing ``except KeychainLocked`` caller keeps catching it, and
     :func:`get` falls through to the file store and project ``.env`` on it
-    exactly as for ``KeychainLocked``.
+    exactly as for ``KeychainLocked``. Also a :class:`SecretStoreUnavailable`
+    (W6-AB): the one retryable "could not look" family.
+
+    ``retry_after`` carries the hub's ``Retry-After`` header verbatim (or
+    ``None``) for :func:`_hub_get`'s one retry.
     """
+
+    retry_after: Optional[str] = None
 
 
 class AccessDenied(ResolverError):
@@ -356,10 +403,45 @@ def _project_dotenv_get(key: str, project: Optional[str]) -> Optional[str]:
 # ─── Hub path ───────────────────────────────────────────────────────────
 
 
+def _retry_wait_seconds(retry_after: Optional[str]) -> float:
+    """Seconds to wait before the one retry: the hub's ``Retry-After`` (whole
+    or fractional seconds), the hub default when absent/unreadable, never
+    negative, never above :data:`HUB_RETRY_AFTER_CAP_SECONDS`."""
+    try:
+        wait = float(retry_after) if retry_after is not None else _HUB_RETRY_AFTER_DEFAULT_SECONDS
+    except (TypeError, ValueError):
+        wait = _HUB_RETRY_AFTER_DEFAULT_SECONDS
+    if wait != wait:  # NaN
+        wait = _HUB_RETRY_AFTER_DEFAULT_SECONDS
+    return max(0.0, min(wait, HUB_RETRY_AFTER_CAP_SECONDS))
+
+
 def _hub_get(key: str, project: Optional[str]) -> str:
-    """Resolve ``key`` via vct-hub. Raises on every failure mode."""
+    """Resolve ``key`` via vct-hub. Raises on every failure mode.
+
+    v0.2.102 (W6-AB): at most ONE retry, and only when the hub is running
+    but could not answer yet — :class:`HubNotResponding` (a read timeout of
+    :data:`SECRET_READ_TIMEOUT_SECONDS`, a dropped connection, a 5xx) or a
+    ``503 keychain_unavailable`` (after its ``Retry-After``, capped). A slow
+    keychain op keeps running on the hub's worker and its result lands in the
+    hub's value cache, so the retry is usually answered at once. A REFUSED
+    connection (no hub) and every definite answer (200, 404 codes, 401, 403,
+    ``keychain_locked``/``keychain_error``) are never retried.
+    """
+    try:
+        return _hub_get_attempt(key, project)
+    except KeychainUnavailable as exc:
+        _sleep(_retry_wait_seconds(exc.retry_after))
+    except HubNotResponding:
+        pass
+    return _hub_get_attempt(key, project)
+
+
+def _hub_get_attempt(key: str, project: Optional[str]) -> str:
+    """One resolution attempt against the hub (see :func:`_hub_get`)."""
     project_arg = project if project else str(Path.cwd())
-    pid = _resolve_project_id(project_arg)  # raises ProjectNotFound / HubUnreachable
+    # raises ProjectNotFound / HubUnreachable / HubNotResponding
+    pid = _resolve_project_id(project_arg, read_timeout=SECRET_READ_TIMEOUT_SECONDS)
 
     resp = _get_with_401_retry(
         lambda port, _token: (
@@ -370,6 +452,9 @@ def _hub_get(key: str, project: Optional[str]) -> str:
         # hub.token.<id> (falls back to the global hub.token). MUST MATCH
         # the sh/ps1 secrets resolvers passing the project id to hub_get.
         project_id=pid,
+        # v0.2.102 (W6-AB): a keychain-backed read may legitimately take
+        # well over the config routes' 5 s — see SECRET_READ_TIMEOUT_SECONDS.
+        read_timeout=SECRET_READ_TIMEOUT_SECONDS,
     )
     if resp.status_code == 200:
         try:
@@ -426,13 +511,16 @@ def _hub_get(key: str, project: Optional[str]) -> str:
         if code == "keychain_unavailable":
             # v0.2.102: temporary — a keychain op timed out / the hub's
             # worker is stuck. Retry, nothing to unlock.
-            retry_after = (getattr(resp, "headers", None) or {}).get("Retry-After") or "a few"
-            raise KeychainUnavailable(
+            raw_retry_after = (getattr(resp, "headers", None) or {}).get("Retry-After")
+            retry_after = raw_retry_after or "a few"
+            unavailable = KeychainUnavailable(
                 f"hub could not read the OS keychain for {key!r} "
                 f"(project={pid}, code='keychain_unavailable'): the keychain is "
                 f"temporarily unavailable (a keychain operation timed out) — "
                 f"retry in {retry_after} seconds"
             )
+            unavailable.retry_after = raw_retry_after
+            raise unavailable
         if code in ("keychain_locked", "keychain_error"):
             locked = code == "keychain_locked"
             raise KeychainLocked(
@@ -448,7 +536,7 @@ def _hub_get(key: str, project: Optional[str]) -> str:
                 "restore secret resolution"
             )
         # Fall through: any other 503 is a hub-side condition, not a keychain
-        # unavailability. Keep the historical HubUnreachable classification.
+        # unavailability — the 5xx arm below (HubNotResponding, retryable).
     if resp.status_code == 404:
         code = None
         try:
@@ -480,6 +568,14 @@ def _hub_get(key: str, project: Optional[str]) -> str:
             )
         raise SecretNotFound(
             f"hub 404 for key {key!r} (project={pid}, code={code!r})"
+        )
+    if 500 <= resp.status_code <= 599:
+        # v0.2.102 (W6-AB): the hub is running but failed to answer — an
+        # unavailability (retry), never evidence that the key is absent.
+        # Still a HubUnreachable subclass, so the historical classification
+        # every existing caller branches on is unchanged.
+        raise HubNotResponding(
+            f"hub returned status {resp.status_code} for /env lookup"
         )
     raise HubUnreachable(
         f"hub returned status {resp.status_code} for /env lookup"
@@ -542,7 +638,12 @@ def get(
             tiers 2 + 3 have no copy either. Same fallthrough semantics;
             raised as the distinct type so callers can tell a deliberate
             pause from an absence.
-        HubUnreachable: hub down AND fallback disabled.
+        SecretStoreUnavailable: RETRYABLE (v0.2.102, W6-AB) — tier 1 was
+            running but could not answer (timed out / dropped / 5xx, or the
+            hub's ``keychain_unavailable``) AND tiers 2 + 3 had no copy (or
+            fallback is disabled). The key may exist; never "add the key".
+        HubUnreachable: hub down (connection refused / no token) AND
+            fallback disabled.
         ProjectNotFound: project unknown AND fallback disabled.
         Forbidden: hub refused the bearer on /env (403 — scoped-token
             required / wrong project) AND fallback disabled. With fallback
@@ -650,6 +751,20 @@ def get(
             "retry shortly. "
             f"Underlying hub state: {hub_error}"
         ) from hub_error
+    if isinstance(hub_error, HubNotResponding):
+        # v0.2.102 (W6-AB): the hub is RUNNING but did not answer in time (a
+        # slow OS keychain behind it, a dropped connection, a 5xx) — we could
+        # not look, so the miss proves nothing. Retryable, and the message
+        # must not tell anyone to add a key that may well be stored.
+        raise SecretStoreUnavailable(
+            f"secret store unavailable: vct-hub is running but did not answer "
+            f"the read of {key!r} in time (typically a busy OS keychain) and "
+            f"the key is also absent from the file store ({tier2_desc()}) and "
+            f"project .env ({tier3_desc()}) (tiers 2+3 "
+            f"checked={allow_file_fallback}). The key may well be stored — "
+            "retrying is safe. "
+            f"Underlying hub state: {hub_error}"
+        ) from hub_error
     if isinstance(hub_error, KeychainLocked):
         # v0.2.82 WP-4a: the keychain was unreadable AND the file store +
         # project .env also missed (or fallback was disabled). Surface the
@@ -672,6 +787,15 @@ def get(
             f"`vct set --shared --key {key}`, "
             f"or add the key to the project's .env"
         )
+        if isinstance(hub_error, HubUnreachable):
+            # v0.2.102 (W6-AB): with no hub running the OS keychain was never
+            # consulted — a key stored there is invisible, not absent. Say so
+            # BEFORE the add-it remedy, so the remedy stays true.
+            _fix = (
+                "The launcher hub is not running, so the OS keychain was not "
+                "checked — if the key is stored there, start the launcher and "
+                "retry. Otherwise: " + _fix[len("Fix: "):]
+            )
         raise SecretNotFound(
             f"secret {key!r} not found (tier 1 hub: {hub_error}; tier 2 "
             f"file store: {tier2_desc()}; tier 3 project .env: "
@@ -691,7 +815,7 @@ STORED_PAUSED = "paused"          # the hub answered key_paused: the key EXISTS 
                                   # missed — a writer must NOT store a copy
 STORED_HUB_DOWN = "hub_down"      # the hub could not be asked (or knows no such
                                   # project) and tier 2 missed
-STORED_UNKNOWN = "unknown"        # the hub refused / could not read the keychain
+STORED_UNKNOWN = "unknown"        # the hub refused / could not read the keychain / did not answer in time
                                   # (403, locked) and tier 2 missed
 
 
@@ -716,6 +840,10 @@ def lookup_stored(key: str, *, project: Optional[str] = None) -> tuple[str, Opti
         state = STORED_PAUSED
     except SecretNotFound:
         state = STORED_ABSENT
+    except HubNotResponding:
+        # v0.2.102 (W6-AB): the hub is RUNNING but did not answer in time —
+        # it may hold the key, so a writer must not plant a second copy.
+        state = STORED_UNKNOWN
     except (HubUnreachable, ProjectNotFound):
         state = STORED_HUB_DOWN
     except (ResolverError, OSError, ValueError):
