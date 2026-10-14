@@ -32,13 +32,31 @@ spawns. Collectors may be stateful (``bash_write_targets`` tracks a
 running ``cd`` so a relative redirect after ``cd /tmp`` is not
 mis-attributed to the project root) -- segments are handed over in
 source order, left to right, which is what makes that legal.
+
+Structural context (v0.2.103)
+=============================
+:func:`walk_segments` is the context-exposing twin of
+:func:`walk_command` (which is now a thin adapter over it, so the two can
+never disagree): every peeled segment is handed out as a
+:data:`ChainSegment` carrying its ``position``/``chain_size`` within its OWN chain
+level (a ``bash -c`` sub-command is its own chain with its own positions)
+and ``in_loop`` — True when the segment opens a ``while``/``until``/
+``for``/``select`` loop (the condition is loop machinery too) or sits in
+its ``do``..``done`` body, propagated through ``bash -c`` recursion so a
+``while c; do echo x; bash -c '…; sleep 2; …'; done`` marks the INNER
+sleep as in-loop (the walker recurses only when the peeled verb IS the
+shell — a ``do bash -c …`` segment, whose verb is ``do``, is not recursed,
+exactly as :func:`walk_command` has always behaved). Added for the wait guard's fixed-sleep rule (a literal
+``sleep`` between other actions is allowed; a sleep in a loop, or as the
+sole/last/first segment, is not) — position and loop membership are shell
+structure, so they live here, not in a consumer's raw-string scan.
 """
 from __future__ import annotations
 
 import os
 import re
 import shlex
-from typing import Callable, List, Optional
+from typing import Callable, List, NamedTuple, Optional
 
 # --- Verb / separator vocabulary (shared by every consumer) --------------
 
@@ -89,6 +107,39 @@ CHAIN_SEPARATORS: frozenset[str] = frozenset({
 # nested chain is more likely an attacker testing the parser than a
 # legitimate user command.
 MAX_NESTING_DEPTH: int = 4
+
+#: Keywords that OPEN a loop whose body runs between ``do`` and ``done``
+#: (v0.2.103). Recognised on a segment's FIRST token (before wrapper
+#: peeling — a wrapper verb can never precede a shell keyword).
+LOOP_OPENERS: frozenset[str] = frozenset({"while", "until", "for", "select"})
+
+
+class ChainSegment(NamedTuple):
+    """One peeled chain segment plus its structural context (v0.2.103).
+
+    ``tokens``   — the peeled segment (what :func:`walk_command`'s
+                   collectors have always received).
+    ``position`` / ``chain_size`` — the segment's raw position within its OWN
+                   chain level (a ``bash -c`` sub-command is a fresh chain
+                   with its own positions; the ``bash -c`` segment itself
+                   counts at the outer level even though it is recursed
+                   rather than emitted).
+    ``in_loop``  — True when the segment OPENS a
+                   ``while``/``until``/``for``/``select`` loop (the
+                   condition runs per iteration — loop machinery too) or
+                   sits between its ``do`` and ``done``; inherited through
+                   ``bash -c`` recursion, so a sleep inside
+                   ``while c; do echo x; bash -c '…; sleep 1; …'; done``
+                   is in-loop.
+    ``depth``    — the ``bash -c`` recursion depth this chain level sits
+                   at (0 = the top-level command).
+    """
+
+    tokens: List[str]
+    position: int
+    chain_size: int
+    in_loop: bool
+    depth: int
 
 # A collector receives ONE peeled segment (tokens) and returns whatever
 # path-ish strings it found in it.
@@ -300,6 +351,27 @@ def tokenize(command: str) -> Optional[List[str]]:
     ]
 
 
+def _dash_c_subcommand(tokens: List[str]) -> Optional[str]:
+    """The ``<sub-command>`` of a ``<shell> -c <sub>`` shape, else None.
+
+    Peels the optional ``-c`` (or a combined flag whose last letter is
+    ``c``, like ``-ec``) and returns the next positional. The ONE home for
+    this shape — :func:`walk_segments` and :func:`parse_dash_c` both use
+    it."""
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "-c" and i + 1 < len(tokens):
+            return tokens[i + 1]
+        # Combined flag like `-ec` / `-xc` -- last char is `c`, so the
+        # next positional is the sub-cmd.
+        if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
+            if i + 1 < len(tokens):
+                return tokens[i + 1]
+        i += 1
+    return None
+
+
 def parse_dash_c(tokens: List[str], depth: int, collect: Collector) -> List[str]:
     """If `tokens` is shaped like `bash -c "<sub-cmd>"`, re-parse
     `<sub-cmd>` as a fresh chain with the same collector.
@@ -307,20 +379,7 @@ def parse_dash_c(tokens: List[str], depth: int, collect: Collector) -> List[str]
     Returns an empty list if the shape doesn't match, the sub-cmd is
     malformed, or the depth budget is exhausted.
     """
-    sub_cmd: Optional[str] = None
-    i = 1
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok == "-c" and i + 1 < len(tokens):
-            sub_cmd = tokens[i + 1]
-            break
-        # Combined flag like `-ec` / `-xc` -- last char is `c`, so the
-        # next positional is the sub-cmd.
-        if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
-            if i + 1 < len(tokens):
-                sub_cmd = tokens[i + 1]
-                break
-        i += 1
+    sub_cmd = _dash_c_subcommand(tokens)
     if sub_cmd is None:
         return []
     # Recurse with depth-budget so attacker-crafted nested `bash -c`
@@ -330,13 +389,21 @@ def parse_dash_c(tokens: List[str], depth: int, collect: Collector) -> List[str]
     return walk_command(sub_cmd, collect, depth=depth + 1)
 
 
-def walk_command(command: str, collect: Collector, depth: int = 0) -> List[str]:
-    """Top-level entry: parse `command` into chain segments, peel
-    wrappers off each, recurse into `bash -c`, and hand every remaining
-    peeled segment to `collect`.
+def walk_segments(command: str, depth: int = 0, *,
+                  _in_loop: bool = False) -> List[ChainSegment]:
+    """Parse `command` like :func:`walk_command` but hand out
+    :data:`ChainSegment` records — peeled tokens PLUS the structural
+    context (position within the chain level, loop membership, recursion
+    depth) that position/loop-aware consumers need (v0.2.103: the wait
+    guard's fixed-sleep rule).
 
-    Returns the flat aggregate of everything `collect` returned, in
-    source order. Bounded by `depth <= MAX_NESTING_DEPTH`.
+    Loop membership is tracked per chain level: a ``while``/``until``/
+    ``for``/``select`` opener and everything from its ``do`` up to the
+    matching ``done`` is in-loop, nested loops included; the context is
+    INHERITED by a ``bash -c`` recursion (``_in_loop``), while the
+    sub-command's positions restart at its own level. ``depth`` and the
+    ``MAX_NESTING_DEPTH`` budget behave exactly as in
+    :func:`walk_command`.
     """
     if depth > MAX_NESTING_DEPTH:
         return []
@@ -345,27 +412,65 @@ def walk_command(command: str, collect: Collector, depth: int = 0) -> List[str]:
     if not tokens:
         return []
 
-    out: List[str] = []
-    for segment in split_chain(tokens):
+    segments = split_chain(tokens)
+    chain_size = len(segments)
+    out: List[ChainSegment] = []
+    loop_depth = 0
+    for i, segment in enumerate(segments):
         if not segment:
             continue
         stripped = strip_env_assignments(segment)
         if not stripped:
             continue
+        # Loop bookkeeping reads the FIRST token before wrapper peeling:
+        # a wrapper verb can never precede a shell keyword. `do` marks the
+        # body (its own tail is body content); `done` ends it (decremented
+        # AFTER this segment, so the terminator itself is not body).
+        first = os.path.basename(stripped[0]).lower()
+        opens = first in LOOP_OPENERS
+        is_do = first == "do"
+        is_done = first == "done"
+        in_loop = _in_loop or loop_depth > 0 or opens or is_do
         peeled = peel_wrapper_verbs(stripped)
-        if not peeled:
-            continue
-        verb_basename = os.path.basename(peeled[0]).lower()
-        if verb_basename in SHELL_DASH_C_VERBS:
-            out.extend(parse_dash_c(peeled, depth, collect))
-            continue
-        out.extend(collect(peeled))
+        if peeled:
+            verb_basename = os.path.basename(peeled[0]).lower()
+            if verb_basename in SHELL_DASH_C_VERBS:
+                sub_cmd = _dash_c_subcommand(peeled)
+                if sub_cmd is not None and depth + 1 <= MAX_NESTING_DEPTH:
+                    out.extend(walk_segments(sub_cmd, depth + 1,
+                                             _in_loop=in_loop))
+            else:
+                out.append(ChainSegment(peeled, i, chain_size, in_loop, depth))
+        if is_do:
+            loop_depth += 1
+        elif is_done and loop_depth > 0:
+            loop_depth -= 1
+    return out
+
+
+def walk_command(command: str, collect: Collector, depth: int = 0) -> List[str]:
+    """Top-level entry: parse `command` into chain segments, peel
+    wrappers off each, recurse into `bash -c`, and hand every remaining
+    peeled segment to `collect`.
+
+    Returns the flat aggregate of everything `collect` returned, in
+    source order. Bounded by `depth <= MAX_NESTING_DEPTH`.
+
+    A thin adapter over :func:`walk_segments` (v0.2.103) — the collector
+    contract is byte-identical to the pre-ChainSegment walker: same
+    peeled segments, same source order, `bash -c` recursion inline.
+    """
+    out: List[str] = []
+    for seg in walk_segments(command, depth=depth):
+        out.extend(collect(seg.tokens))
     return out
 
 
 __all__ = [
     "CHAIN_SEPARATORS",
+    "ChainSegment",
     "Collector",
+    "LOOP_OPENERS",
     "MAX_NESTING_DEPTH",
     "SHELL_DASH_C_VERBS",
     "WRAPPER_VERBS",
@@ -376,4 +481,5 @@ __all__ = [
     "strip_env_assignments",
     "tokenize",
     "walk_command",
+    "walk_segments",
 ]

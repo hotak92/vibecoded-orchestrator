@@ -3,14 +3,26 @@
 """The wait-loop / polling guard (v0.2.102 lane W4-D, owner 2026-10-08).
 
 ONE home for every decision about agents "waiting" by polling: foreground
-``sleep`` / ``watch`` / ``tail -f`` / ``timeout ... bash -c '...sleep...'``
-loops, self-scheduling tools (``ScheduleWakeup`` / ``CronCreate`` /
-``Monitor``), and repeated identical status checks (``tail``/``head``/
-``cat``/``ls``/``wc``/``grep`` on the same target, ``Read`` of the same
-file_path+offset+limit). Every poll is a new request that re-sends the
-whole conversation; the sanctioned way to wait is to start the work once
-with ``run_in_background`` and end the turn — the completion notification
-wakes the agent. The guard makes that the ONLY easy path.
+``sleep`` waits, ``watch`` / ``tail -f`` / ``timeout ... bash -c
+'...sleep...'`` polling shapes, loops that wait, self-scheduling tools
+(``ScheduleWakeup`` / ``CronCreate`` / ``Monitor``), and repeated identical
+status checks (``tail``/``head``/``cat``/``ls``/``wc``/``grep`` on the same
+target, ``Read`` of the same file_path+offset+limit). Every poll is a new
+request that re-sends the whole conversation; the sanctioned way to wait
+is to start the work once with ``run_in_background`` and end the turn —
+the completion notification wakes the agent. The guard makes that the
+ONLY easy path.
+
+The fixed-sleep allowance (owner ruling 2026-10-15): a ``sleep`` with a
+LITERAL numeric duration (``sleep 3``, ``sleep 0.5``, ``sleep 2s``;
+``Start-Sleep -Seconds 2`` on PowerShell) sitting BETWEEN other segments
+of one command — ``start-x && sleep 3 && curl ...`` — is a fixed pause,
+not a poll, and is ALLOWED. Still denied: a sleep inside a loop (body or
+condition, ``bash -c`` recursion included), a non-literal duration
+(``sleep $N``, ``sleep infinity``), and a sleep that is the sole, first
+or last segment (outside a loop it only waits). Position and loop
+membership come from the ONE chain walker
+(:func:`vco_lib.bash_command_walk.walk_segments`).
 
 Shape (A>B>C, like the v0.2.101 injection surfaces): this module is the
 pure classifier + a small ephemeral-state helper; the ``.sh`` / ``.ps1``
@@ -58,9 +70,27 @@ line so the denial is visible in the transcript/logs.
 Ephemeral state
 ===============
 Per-actor file under ``$VCT_STATE_DIR/wait_guard/`` (actor =
-``session_id`` + ``agent_id``-or-main). Timestamps are pruned to the
-window on every touch and slash unlocks to their own longer TTL; an empty
-file is deleted. This NEVER touches the durable injection seen-store.
+``session_id`` + ``agent_id``-or-main). Per repeat key the file holds the
+stamps AND the ``tool_use_id`` values already counted for that key (both
+pruned to the window on every touch); slash unlocks keep their own longer
+TTL; an empty file is deleted. This NEVER touches the durable injection
+seen-store.
+
+One tool call counts ONCE
+=========================
+The settings template registers this guard once per Bash verb rule, and
+the harness evaluates each ``if`` against every subcommand — so ONE
+compound command fires this hook several times CONCURRENTLY with the same
+payload (v0.2.103; pre-fix a single call was denied as "the 4th identical
+status check" on its first run). The repeat detector therefore (a) runs
+its read-modify-write under the shared cross-OS lock
+(:func:`vco_lib.atomic.portable_exclusive_lock`), and (b) dedupes by the
+payload's ``tool_use_id``: an id already counted for the key is one call's
+fan-out, not a new check. A payload with no ``tool_use_id`` falls back to
+collapsing same-key stamps closer than :data:`_BURST_COLLAPSE_S` — real
+polling is never sub-second, every poll is a model round-trip. N DISTINCT
+calls of the same check within the window are still denied at the Nth,
+and a denied call still counts.
 """
 from __future__ import annotations
 
@@ -74,11 +104,12 @@ from typing import Any, Dict, List, Optional
 
 from vco_lib.bash_command_walk import (
     SHELL_DASH_C_VERBS,
+    ChainSegment,
     peel_wrapper_verbs,
     split_chain,
     strip_env_assignments,
     tokenize,
-    walk_command,
+    walk_segments,
 )
 from vco_lib.powershell_command import (
     POWERSHELL_TOOL,
@@ -120,6 +151,10 @@ REPEAT_VERBS = frozenset({"tail", "head", "cat", "ls", "wc", "grep"})
 
 DEFAULT_REPEAT_MAX = 4
 DEFAULT_REPEAT_WINDOW_S = 600
+#: No-``tool_use_id`` fallback (v0.2.103): same-key stamps closer than
+#: this are ONE call's registration fan-out and collapse into one stamp —
+#: real polling is never sub-second (every poll is a model round-trip).
+_BURST_COLLAPSE_S = 1.0
 #: Slash unlocks live far longer than one repeat window — a ``/loop``
 #: session routinely runs longer than 10 minutes.
 SLASH_TTL_S = 86400
@@ -152,6 +187,13 @@ _TAIL_FLAG_ALPHABET = frozenset("fnqvsc0123456789")
 #: peels ``sudo``/``nice``/... but not these).
 _SCAN_WRAPPER_VERBS = frozenset({"timeout", "nohup", "setsid"})
 
+#: A literal sleep duration (owner ruling 2026-10-15): ``sleep 3``,
+#: ``sleep 0.5``, ``sleep 2s`` (GNU suffixes s/m/h/d; ``ms`` covers the
+#: PowerShell ``Start-Sleep -Milliseconds`` reading). ``sleep $N``,
+#: ``sleep infinity``, a flag or a missing argument are NOT literal —
+#: they are waits of unknown length and stay denied everywhere.
+_LITERAL_SLEEP_RE = re.compile(r"^[0-9]+(\.[0-9]+)?(?:ms|[smhd])?$")
+
 #: Shell keywords that prefix the command inside a compound body — the
 #: chain walker splits ``do sleep 2; done`` into a ``do sleep 2`` segment
 #: and the VERB is what follows the keyword.
@@ -171,21 +213,44 @@ def _tail_follows(args: List[str]) -> bool:
     return False
 
 
-def _pattern_of_segment(tokens: List[str], depth: int) -> Optional[tuple]:
-    body = tokens
+def _sleep_pattern(body: List[str], seg: ChainSegment) -> Optional[tuple]:
+    """The fixed-sleep rule (owner ruling 2026-10-15): a ``sleep`` with a
+    LITERAL numeric duration BETWEEN other segments of one command
+    (``start-x && sleep 3 && curl ...``) is the sanctioned pause and is
+    ALLOWED. Still denied:
+
+    (a) inside a loop (opener condition or ``do``..``done`` body —
+        :data:`ChainSegment.in_loop`, inherited through ``bash -c``);
+    (b) a non-literal duration (``sleep $N``, ``sleep infinity``);
+    (c) the sleep as the sole, FIRST or LAST segment — outside a loop it
+        only waits (the ruling's allow is "BETWEEN other actions").
+    """
+    evidence = " ".join(body[:2])
+    if seg.in_loop:
+        return ("sleep", evidence)
+    args = body[1:]
+    if not args or not all(_LITERAL_SLEEP_RE.match(a) for a in args):
+        return ("sleep", evidence)
+    if seg.position == 0 or seg.position == seg.chain_size - 1:
+        return ("sleep", evidence)
+    return None
+
+
+def _pattern_of_segment(seg: ChainSegment, depth: int) -> Optional[tuple]:
+    body = seg.tokens
     while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
         body = body[1:]
     if not body:
         return None
     verb = os.path.basename(body[0]).lower()
     if verb == "sleep":
-        return ("sleep", " ".join(body[:2]))
+        return _sleep_pattern(body, seg)
     if verb == "watch":
         return ("watch", body[0])
     if verb == "tail" and _tail_follows(body[1:]):
         return ("tail --follow", " ".join(body[:3]))
     if verb in _SCAN_WRAPPER_VERBS:
-        return _scan_wrapped(body, depth)
+        return _scan_wrapped(body, depth, in_loop=seg.in_loop)
     if verb in PS_WAIT_VERBS:
         # PowerShell's foreground waits (Wait-Job / Wait-Process /
         # Wait-Event, and Receive-Job -Wait) — the translated name; no Bash
@@ -194,11 +259,16 @@ def _pattern_of_segment(tokens: List[str], depth: int) -> Optional[tuple]:
     return None
 
 
-def _scan_wrapped(tokens: List[str], depth: int) -> Optional[tuple]:
+def _scan_wrapped(tokens: List[str], depth: int, *,
+                  in_loop: bool = False) -> Optional[tuple]:
     """``timeout 30 bash -c 'sleep 30'`` and kin: the chain walker hands the
     whole segment to the collector with ``timeout`` as the verb, so the
-    wrapped tail is scanned here — pattern verbs directly, and a nested
-    ``<shell> -c '<sub>'`` recursively through :func:`static_pattern`."""
+    wrapped tail is scanned here — pattern verbs directly (a DIRECT
+    timeout-wrapped ``sleep``/``watch`` is a wait and stays denied
+    regardless of position), and a nested ``<shell> -c '<sub>'``
+    recursively through :func:`static_pattern`, where the fixed-sleep
+    rule applies to the sub-chain as at the top level (the loop context
+    propagates)."""
     if depth >= _MAX_TIMEOUT_SCAN_DEPTH:
         return None
     for i in range(1, len(tokens)):
@@ -216,33 +286,29 @@ def _scan_wrapped(tokens: List[str], depth: int) -> Optional[tuple]:
                 )
             )
             if has_c and len(rest) >= 2:
-                return static_pattern(rest[1], depth=depth + 1)
+                return static_pattern(rest[1], depth=depth + 1, _in_loop=in_loop)
     return None
 
 
-def static_pattern(command: str, depth: int = 0) -> Optional[tuple]:
+def static_pattern(command: str, depth: int = 0, *,
+                   _in_loop: bool = False) -> Optional[tuple]:
     """``(pattern_name, evidence)`` for the first polling shape in
     ``command``, else ``None``.
 
     Parsed with the ONE chain walker (:mod:`vco_lib.bash_command_walk`) —
     never a raw-string scan — so quoted text (``echo "sleep"``) cannot
     trip it and ``bash -c`` sub-commands are re-parsed. ``while``/``until``
-    loops need no rule of their own: the walker splits the loop body into
-    segments and the ``sleep`` segment inside it IS the detection."""
+    loops need no rule of their own: the walker marks loop openers and
+    bodies (:data:`ChainSegment.in_loop`), and the ``sleep`` segment inside
+    one IS the detection. ``_in_loop`` is the recursion's inherited loop
+    context; callers pass nothing."""
     if not isinstance(command, str) or not command.strip():
         return None
-
-    # The walker's Collector contract is List[str]; the finding rides as
-    # "name\x1fevidence" and is split back apart below.
-    def collect(tokens: List[str]) -> List[str]:
-        found = _pattern_of_segment(tokens, depth)
-        return ["%s\x1f%s" % found] if found else []
-
-    hits = walk_command(command, collect)
-    if not hits:
-        return None
-    name, _, evidence = hits[0].partition("\x1f")
-    return (name, evidence)
+    for seg in walk_segments(command, _in_loop=_in_loop):
+        found = _pattern_of_segment(seg, depth)
+        if found is not None:
+            return found
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -412,12 +478,34 @@ def _load_state(path: Path, now: float, window_s: int, slash_ttl: int) -> Dict:
         return {"checks": {}, "slash": {}}
     if not isinstance(data, dict):
         return {"checks": {}, "slash": {}}
+    # ``checks[key]`` is ``{"stamps": [t, ...], "ids": {tool_use_id: t}}``;
+    # a pre-v0.2.103 file holds a bare stamp list and is migrated on load.
+    # Both stamps and counted ids prune with the window.
+    checks: Dict[str, Dict[str, Any]] = {}
     raw_checks = data.get("checks")
-    checks = {
-        k: [t for t in v if isinstance(t, (int, float)) and now - t <= window_s]
-        for k, v in raw_checks.items() if isinstance(v, list)
-    } if isinstance(raw_checks, dict) else {}
-    checks = {k: v for k, v in checks.items() if v}
+    if isinstance(raw_checks, dict):
+        for k, v in raw_checks.items():
+            if isinstance(v, list):
+                stamps = [t for t in v
+                          if isinstance(t, (int, float)) and now - t <= window_s]
+                ids: Dict[str, Any] = {}
+            elif isinstance(v, dict):
+                raw_stamps = v.get("stamps")
+                stamps = (
+                    [t for t in raw_stamps
+                     if isinstance(t, (int, float)) and now - t <= window_s]
+                    if isinstance(raw_stamps, list) else []
+                )
+                raw_ids = v.get("ids")
+                ids = (
+                    {str(i): t for i, t in raw_ids.items()
+                     if isinstance(t, (int, float)) and now - t <= window_s}
+                    if isinstance(raw_ids, dict) else {}
+                )
+            else:
+                continue
+            if stamps or ids:
+                checks[k] = {"stamps": stamps, "ids": ids}
     raw_slash = data.get("slash")
     slash = {
         k: t for k, t in raw_slash.items()
@@ -465,13 +553,36 @@ def _repeat_check(
                         env=env, minimum=1)
     max_n = env_int("VCO_WAIT_GUARD_REPEAT_MAX", DEFAULT_REPEAT_MAX, env=env, minimum=1)
     path = _state_path(payload, state_root)
-    state = _load_state(path, now, window_s, SLASH_TTL_S)
-    stamps = state["checks"].setdefault(key, [])
-    stamps.append(now)
-    state["checks"][key] = [t for t in stamps if now - t <= window_s]
-    _save_state(path, state)
-    if len(state["checks"][key]) >= max_n:
-        return repeat_deny_reason(key, len(state["checks"][key]), window_s, tool)
+    tool_use_id = payload.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not tool_use_id:
+        tool_use_id = None
+    from vco_lib.atomic import portable_exclusive_lock
+
+    # The `if`-filtered registrations fire this hook CONCURRENTLY for one
+    # tool call: the read-modify-write runs under the shared cross-OS lock
+    # so the concurrent spawns serialize instead of racing the state file.
+    with portable_exclusive_lock(path.with_name(path.name + ".lock")):
+        state = _load_state(path, now, window_s, SLASH_TTL_S)
+        entry = state["checks"].setdefault(key, {"stamps": [], "ids": {}})
+        stamps = entry["stamps"]
+        ids = entry["ids"]
+        if tool_use_id is not None:
+            # One tool call counts ONCE per key, however many
+            # registrations fired for it (v0.2.103).
+            if tool_use_id in ids:
+                return None
+            ids[tool_use_id] = now
+        elif stamps and now - stamps[-1] < _BURST_COLLAPSE_S:
+            # No id to dedupe on: a sub-second repeat of the same key is
+            # one call's fan-out, not a new poll.
+            return None
+        stamps.append(now)
+        entry["stamps"] = [t for t in stamps if now - t <= window_s]
+        entry["ids"] = {i: t for i, t in ids.items() if now - t <= window_s}
+        _save_state(path, state)
+        count = len(entry["stamps"])
+    if count >= max_n:
+        return repeat_deny_reason(key, count, window_s, tool)
     return None
 
 
