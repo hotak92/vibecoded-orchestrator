@@ -951,8 +951,7 @@ class TestParameterDefaultsConsultTheEnvironment(unittest.TestCase):
                         "KG",
                         "",  # falsy → must resolve from the env
                         dry_run=False,
-                        project_root=Path(tmp),
-                        is_orchestrator_root_install=lambda: False,
+                        project_root=Path(tmp),  # markerless ⇒ non-root
                     )
 
         self.assertEqual(

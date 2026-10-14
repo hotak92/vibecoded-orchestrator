@@ -4986,6 +4986,65 @@ def sync_all_nodes(server: WeaviateMCPServer) -> "SyncTally":
 _PRUNE_PRINT_CAP = 50
 
 
+def _walked_root_not_collection_owner() -> "Optional[str]":
+    """``None`` when the prune may run; a skip REASON when it must not
+    (v0.2.103 R2, review M-3).
+
+    A lane worktree or a second clone of a project carries the same
+    ``.claude/settings.json`` ``KG_COLLECTION``, so a ``--all`` run there
+    resolves the SAME collection for a tree that is not the collection's
+    registered owner — and pruning it against that tree deletes rows whose
+    files exist only in the real checkout (uncommitted work, gitignored
+    ``knowledge/``, nodes added on main after the branch point). The rule:
+    the walked root must BE the registered folder of every registration
+    that binds ``COLLECTION_NAME``.
+
+    * no launcher.db at all (free tier, no registry) ⇒ proceed — no second
+      tree is registered to claim the collection;
+    * launcher.db present but unreadable ⇒ REFUSE — ownership is
+      unprovable this run, and a destructive path waits for proof;
+    * a registered project binds ``COLLECTION_NAME`` (any role,
+      case-insensitive): its folder IS this root ⇒ proceed; a DIFFERENT
+      folder ⇒ REFUSE, naming the owner (this tree is a worktree/clone of
+      it, or an impostor);
+    * no registration binds the name ⇒ proceed (unregistered project).
+
+    Read-only throughout. Failure polarity: a registry that is LOCATED but
+    unreadable refuses (ownership unprovable on a destructive path); a
+    registry that cannot be located at all (free tier, discovery failure)
+    proceeds — no registration exists to conflict with.
+    """
+    try:
+        from vco_lib.launcher_db_reader import (
+            _discover_db_path,
+            get_kg_binding,
+            list_registered_projects,
+        )
+        from vco_lib.module_gated_delivery import _canonical_path_eq
+    except Exception:  # noqa: BLE001 — vco_lib broken: the prune home's own
+        return None    # guards report that; nothing to prove here either way
+    if _discover_db_path() is None:
+        return None  # no registry exists ⇒ no second tree can claim it
+    projects = list_registered_projects()
+    if projects is None:
+        return ("the launcher registry exists but could not be read — "
+                "collection ownership is unprovable this run, so the prune "
+                "is refused")
+    wanted = COLLECTION_NAME.strip().lower()
+    for proj in projects:
+        for role in ("primary", "shared"):
+            bound = get_kg_binding(proj.id, role)
+            if not bound or bound.strip().lower() != wanted:
+                continue
+            if _canonical_path_eq(proj.folder, PROJECT_ROOT):
+                continue  # this root IS the registered owner
+            return (f"'{COLLECTION_NAME}' is registered to "
+                    f"{proj.folder!r} (project {proj.name!r}), not to the "
+                    f"walked root {PROJECT_ROOT} — a worktree or second "
+                    "clone must not prune another tree's collection")
+    return None
+
+
 def _prune_stored_only_rows(*, run_clean: bool, kg_total: int) -> None:
     """v0.2.103: after a full ``--all`` walk, remove rows whose source file
     is gone from this knowledge root — the mirror image of the upsert.
@@ -5014,11 +5073,22 @@ def _prune_stored_only_rows(*, run_clean: bool, kg_total: int) -> None:
       least one node (``kg_total > 0``) — a missing/empty tree is more
       likely a mis-resolved root than a deliberate bulk delete, and the
       doctor census names the leftover rows either way;
-    * SHARED-IDENTITY skip (case-insensitive, mirroring
-      ``prune_foreign_rows_for_project``): when this project's KG collection
-      IS the shared collection (the orchestrator root), "file absent
-      locally" is NORMAL — sibling projects' shared-scope rows live there —
-      so the prune never runs against it.
+    * SHARED-IDENTITY skip, decided by the prune home's ONE predicate
+      (``collection_repair.is_shared_identity_collection``, v0.2.103 R2
+      review H-2): a name match with the shared collection OR this root
+      being the orchestrator clone — the latter holds even when the shared
+      NAME is empty/unresolved (hub down, free tier), the case a
+      name-only check let through on the root, where "file absent
+      locally" is NORMAL (sibling projects' shared-scope rows live there);
+    * REGISTERED-OWNER gate (v0.2.103 R2, review M-3): the walked root
+      must be the collection's registered owner in launcher.db — a
+      worktree or second clone resolves the same collection but prunes
+      against the wrong tree (:func:`_walked_root_not_collection_owner`).
+
+    Existence inside the home is judged on the path AS THE SYNC STORES IT
+    (lexical, symlink-following), and a stored path resolving OUTSIDE the
+    root is kept — a symlinked ``knowledge/`` (vault layout) no longer
+    reads as "every file gone" (v0.2.103 R2, review H-1).
 
     Soft-fail throughout: a skipped or failed prune never changes the sync
     exit code (the rows it would have removed are named by ``vco doctor``'s
@@ -5037,14 +5107,11 @@ def _prune_stored_only_rows(*, run_clean: bool, kg_total: int) -> None:
               "nodes — refusing to prune (a mis-resolved root must not wipe "
               "the collection)")
         return
-    shared = (SHARED_COLLECTION_NAME or "").strip()
-    if shared and COLLECTION_NAME.strip().lower() == shared.lower():
-        print(f"🧹 Stored-only prune skipped: '{COLLECTION_NAME}' is the "
-              "shared collection (sibling projects' shared-scope rows live "
-              "here — never pruned)")
-        return
     try:
-        from vco_lib.collection_repair import prune_foreign_rows
+        from vco_lib.collection_repair import (
+            is_shared_identity_collection,
+            prune_foreign_rows,
+        )
     except ImportError as e:
         # Broken install (vco_lib is a shipped dependency of this script) —
         # loud on stderr, but the sync itself already succeeded; failing the
@@ -5052,12 +5119,23 @@ def _prune_stored_only_rows(*, run_clean: bool, kg_total: int) -> None:
         print(f"⚠️  Stored-only prune not run: vco_lib import failed "
               f"({e}) — broken install?", file=sys.stderr)
         return
+    if is_shared_identity_collection(
+        COLLECTION_NAME, SHARED_COLLECTION_NAME, PROJECT_ROOT,
+    ):
+        print(f"🧹 Stored-only prune skipped: '{COLLECTION_NAME}' is the "
+              "shared collection (sibling projects' shared-scope rows live "
+              "here — never pruned)")
+        return
+    not_owner = _walked_root_not_collection_owner()
+    if not_owner is not None:
+        print(f"🧹 Stored-only prune skipped: {not_owner}")
+        return
     try:
         result = prune_foreign_rows(
             PROJECT_ROOT,
             COLLECTION_NAME,
             weaviate_url=WEAVIATE_URL,
-            is_shared_identity=False,
+            shared_kg_collection=SHARED_COLLECTION_NAME,
         )
     except Exception as e:  # noqa: BLE001 — best-effort cleanup, never fatal
         print(f"⚠️  Stored-only prune failed (non-fatal): {e}")

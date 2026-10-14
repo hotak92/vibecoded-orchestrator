@@ -24,8 +24,21 @@ This file pins the new behaviour end-to-end through ``main()``:
 * the doctor census NAMES the stored-only paths and prints a true remedy
   command (a re-sync prunes them).
 
+v0.2.103 R2 (batched review 2026-10-14) adds:
+
+* H-1 — a symlinked ``knowledge/`` (vault layout) no longer makes every row
+  read as "file gone": existence is judged on the stored lexical path, and
+  a path resolving OUTSIDE the root is kept, never pruned;
+* H-2 — the shared-identity skip is the prune home's ONE predicate and arms
+  on the orchestrator-clone markers even with an EMPTY/unresolved shared
+  name;
+* M-3 — the prune is refused when the walked root is not the collection's
+  registered owner in launcher.db (a lane worktree / second clone), and
+  when the registry exists but cannot be read.
+
 Red-proof: set ``KG_SYNC_SCRIPT_UNDER_TEST`` to a pre-fix copy of the sync
-script (the prune tests fail — no prune call existed), or revert the
+script (the prune tests fail — no prune call existed; the R2 guard tests
+fail by DELETING the rows they assert kept), or revert the
 doctor / drift-scanner edits (the census and identity tests fail).
 """
 from __future__ import annotations
@@ -491,6 +504,152 @@ class GuardTests(PruneTestBase):
         self.assertEqual(code, 0, f"prune is soft-fail. stderr:\n{err}")
         self.assertEqual(fake.deleted_uuids, [])
         self.assertIn("Stored-only prune skipped: enumeration failed", out)
+
+
+class SymlinkedKnowledgeTests(PruneTestBase):
+    """H-1 (R2), end-to-end through main(): a vault-linked knowledge/ must
+    not turn every stored row into 'file gone'."""
+
+    def _vault(self) -> Path:
+        vault = tempfile.TemporaryDirectory(prefix="vct-vault-")
+        self.addCleanup(vault.cleanup)
+        return Path(vault.name)
+
+    def test_symlinked_knowledge_dir_keeps_its_rows(self):
+        vault = self._vault()
+        # setUp created a real knowledge/ dir — replace it with the vault link.
+        (self.root / "knowledge").rmdir()
+        try:
+            (self.root / "knowledge").symlink_to(vault, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlinks unavailable on this platform: {exc}")
+        _write_node(self.root / "knowledge" / "concepts" / "vault-node.md",
+                    "Vault Node")
+        code, out, err, _h, fake = self._run_all_with_rows([
+            ("u-vault", "knowledge/concepts/vault-node.md", "Vault Node"),
+        ])
+        self.assertEqual(code, 0, f"clean run. stderr:\n{err}")
+        self.assertTrue(
+            any(c[0] == "POST" for c in fake.calls),
+            "the prune RAN (enumerated) — the assertion below is a keep "
+            "decision, not a skipped leg",
+        )
+        self.assertEqual(fake.deleted_uuids, [],
+                         "a row reachable through the symlinked knowledge/ "
+                         "is NOT stale")
+
+    def test_symlinked_single_node_kept_gone_plain_row_deleted(self):
+        vault = self._vault()
+        (vault / "linked.md").write_text(
+            "---\ntitle: Linked\ntype: concept\nstatus: active\n---\nL\n",
+            encoding="utf-8",
+        )
+        _write_node(self.root / "knowledge" / "concepts" / "active.md",
+                    "Active")
+        try:
+            (self.root / "knowledge" / "concepts" / "linked.md").symlink_to(
+                vault / "linked.md")
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlinks unavailable on this platform: {exc}")
+        code, out, err, _h, fake = self._run_all_with_rows([
+            ("u-linked", "knowledge/concepts/linked.md", "Linked"),
+            ("u-gone", "knowledge/concepts/gone.md", "Gone"),
+        ])
+        self.assertEqual(code, 0, f"clean run. stderr:\n{err}")
+        self.assertNotIn("u-linked", fake.deleted_uuids,
+                         "the symlinked node's row is kept")
+        self.assertIn("u-gone", fake.deleted_uuids,
+                      "a genuinely gone plain row is still pruned")
+
+
+class OrchestratorRootIdentityTests(PruneTestBase):
+    """H-2 (R2): root ≡ shared arms on the clone markers even when the
+    shared NAME is empty/unresolved (hub down, free tier) — the case the
+    name-only pre-fix check let through on the root."""
+
+    def test_root_clone_with_empty_shared_name_prunes_nothing(self):
+        (self.root / "vct-module.json").write_text(
+            '{"id": "orchestrator"}', encoding="utf-8")
+        _write_node(self.root / "knowledge" / "concepts" / "active.md",
+                    "Active")
+        code, out, err, _h, fake = self._run_all_with_rows(
+            [("u-gone", "knowledge/concepts/gone.md", "Gone")],
+            shared="",  # unresolved shared name — the H-2 gap
+        )
+        self.assertEqual(code, 0, f"stderr:\n{err}")
+        self.assertEqual(fake.deleted_uuids, [])
+        self.assertEqual(
+            [c for c in fake.calls if c[0] == "POST"], [],
+            "shared identity must skip BEFORE enumerating",
+        )
+        self.assertIn("shared collection", out)
+        self.assertIn("never pruned", out)
+
+
+class WorktreeRootGuardTests(PruneTestBase):
+    """M-3 (R2): the prune is refused unless the walked root IS the
+    collection's registered owner in launcher.db."""
+
+    def _register(self, *, folder: str, kg: str = PROJECT_KG) -> None:
+        from tests.common.launcher_db_fixture import make_launcher_db
+
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        make_launcher_db(
+            self.state_dir / "launcher.db",
+            projects=[dict(name="Owner", folder_path=folder, kg_primary=kg)],
+        )
+
+    def test_run_from_other_tree_refused_when_collection_owned_elsewhere(self):
+        """A worktree / second clone carries the same KG_COLLECTION env, but
+        the collection is registered to the MAIN checkout — prune refused."""
+        owner = tempfile.TemporaryDirectory(prefix="vct-owner-")
+        self.addCleanup(owner.cleanup)
+        self._register(folder=owner.name)
+        _write_node(self.root / "knowledge" / "concepts" / "active.md",
+                    "Active")
+        code, out, err, _h, fake = self._run_all_with_rows([
+            ("u-gone", "knowledge/concepts/gone.md", "Gone"),
+        ])
+        self.assertEqual(code, 0, f"the prune is a skip, not a failure. "
+                                  f"stderr:\n{err}")
+        self.assertEqual(fake.deleted_uuids, [],
+                         "a non-owner tree must not prune the collection")
+        self.assertEqual(
+            [c for c in fake.calls if c[0] == "POST"], [],
+            "the refusal happens BEFORE enumerating rows",
+        )
+        self.assertIn("registered to", out)
+        self.assertIn(Path(owner.name).name, out,
+                      "the skip line names the registered owner")
+
+    def test_registered_owner_root_still_prunes(self):
+        """The owner itself prunes normally — the gate is not a blanket
+        'registered ⇒ refuse'."""
+        self._register(folder=str(self.root))
+        _write_node(self.root / "knowledge" / "concepts" / "active.md",
+                    "Active")
+        code, out, err, _h, fake = self._run_all_with_rows([
+            ("u-active", "knowledge/concepts/active.md", "Active"),
+            ("u-gone", "knowledge/concepts/gone.md", "Gone"),
+        ])
+        self.assertEqual(code, 0, f"stderr:\n{err}")
+        self.assertIn("u-gone", fake.deleted_uuids)
+        self.assertNotIn("u-active", fake.deleted_uuids)
+
+    def test_unreadable_registry_refuses_the_prune(self):
+        """launcher.db EXISTS but cannot be read ⇒ ownership unprovable ⇒
+        refuse (a destructive path waits for proof). A MISSING registry
+        (free tier) proceeds — covered by every other test here."""
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.state_dir / "launcher.db").write_bytes(b"not a sqlite db")
+        _write_node(self.root / "knowledge" / "concepts" / "active.md",
+                    "Active")
+        code, out, err, _h, fake = self._run_all_with_rows([
+            ("u-gone", "knowledge/concepts/gone.md", "Gone"),
+        ])
+        self.assertEqual(code, 0, f"stderr:\n{err}")
+        self.assertEqual(fake.deleted_uuids, [])
+        self.assertIn("could not be read", out)
 
 
 class DriftScannerTests(unittest.TestCase):

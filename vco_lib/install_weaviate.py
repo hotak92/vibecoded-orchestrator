@@ -18,8 +18,12 @@ rather than reaching into install.py's module state:
 * ``log_event`` — optional ``(step, phase, detail, *, data=None)`` logger
   (install.py passes its ``_log_install_event``; other callers pass None).
   Same shape as ``vco_lib.project_init.rebuild_collections``'s ``log_event``.
-* ``is_orchestrator_root_install`` — callable returning whether this is an
-  orchestrator self-install (drives the prune dry-run default).
+* ``shared_kg_collection`` — the install's SHARED_KG_COLLECTION name. The
+  prune's shared-identity decision itself lives in the ONE home
+  (``vco_lib.collection_repair.is_shared_identity_collection``, v0.2.103 R2
+  review H-2): name match OR ``project_root`` carrying the orchestrator-clone
+  markers — a separate ``is_orchestrator_root_install`` callable parameter
+  was retired with that consolidation.
 
 install.py keeps thin same-signature wrappers over these so its existing
 call sites — and the ``install.<name>`` accessors the test suite uses —
@@ -396,7 +400,6 @@ def _prune_stale_kg_rows(
     dry_run: bool | None = None,
     project_root: Path,
     log_event: Optional[Callable] = None,
-    is_orchestrator_root_install: Optional[Callable[[], bool]] = None,
     shared_kg_collection: Optional[str] = None,
 ) -> None:
     """Delete Weaviate objects whose ``file_path`` has no matching on-disk
@@ -421,40 +424,49 @@ def _prune_stale_kg_rows(
       root cannot provably separate its own stale rows from sibling
       projects' legitimate ones, so they are KEPT and left to ``vco
       doctor``'s ``kg_drift_census`` to report (stored-only dimension).
+      v0.2.103 R2 (review H-2): the decision is the home's ONE predicate,
+      :func:`vco_lib.collection_repair.is_shared_identity_collection` —
+      name match (case-insensitive) OR *project_root* being the
+      orchestrator clone — so the skip holds even when the shared NAME is
+      empty, unresolved or drifted.
     * **defensive classification** — rows with an empty / absolute / UNC /
       ``..`` file_path are never deleted (unresolvable to this root is not
       evidence of staleness).
     * **enumeration-failure rule** — no destructive action without an
       authoritative row list.
-    * existence check via :func:`_path_resolves_on_disk` (this module keeps
-      the one home for multi-strategy path resolution: relative, resolved
-      symlink root, absolute, worktree-prefix-stripped).
+    * existence judged on the path AS THE SYNC STORES IT (lexical,
+      symlink-following, ``(project_root / path).exists()``), with
+      "resolves outside the root" treated as KEEP — a symlinked
+      ``knowledge/`` (vault layout) no longer reads as "every file gone"
+      (v0.2.103 R2, review H-1).
+
+    Production reachability (v0.2.103 R2, review L-3): install.py only ever
+    runs AS the orchestrator self-install, so its ``PROJECT_ROOT`` always
+    carries the clone markers and the shared-identity predicate's ROOT leg
+    fires on every real run — in production this adapter always skips, and
+    the home's deleting half is exercised by the bundle update and a full
+    ``kg-sync --all``, not by install.py. The non-root branch below is the
+    home's behaviour pinned by tests (a markerless *project_root*), kept
+    as defence in depth for any future non-clone caller.
 
     Args:
         collection_name: The Weaviate collection to prune (``KG_COLLECTION``).
         weaviate_url: Base URL of the Weaviate instance; falsy values fall
                  through to the shared env-resolving default.
         dry_run: When True, report the stale count but do NOT delete.
-                 ``None`` (the install.py default) now means DELETE for a
-                 non-shared-identity collection — the pre-v0.2.103
-                 ``not is_orchestrator_root_install()`` default existed only
-                 to keep the (unguarded, destructive) root leg dry, and the
-                 root leg is now skipped outright; a non-root install prunes
-                 its own gone rows exactly like a bundle update does.
+                 ``None`` (the install.py default) means DELETE for a
+                 non-shared-identity collection — unreachable in production
+                 (see above), live only for the markerless-root tests.
         project_root: Resolved project/install root (install.py's PROJECT_ROOT).
         log_event: Optional install-time logger, same shape as install.py's
                  ``_log_install_event``.
-        is_orchestrator_root_install: Callable returning whether this is an
-                 orchestrator self-install. A root install implies shared
-                 identity (root KG ≡ shared KG — the v0.2.81 definitional
-                 invariant), so it forces the skip even when
-                 *shared_kg_collection* is absent or disagrees.
         shared_kg_collection: The install's SHARED_KG_COLLECTION name; when
                  it equals *collection_name* (case-insensitive — Weaviate
                  class names cannot differ by case only) the collection is
                  shared-identity and the prune is skipped.
 
-    Soft-fail throughout: any error is logged but never raises into the caller.
+    Soft-fail throughout: any error — including a failed import of the
+    prune home — is logged but never raises into the caller.
     """
     _log = _install_log(log_event)
 
@@ -472,34 +484,32 @@ def _prune_stale_kg_rows(
     # stored ``file_path`` fails to resolve on disk are deleted, independent
     # of embedding state.
     shared = (shared_kg_collection or "").strip()
-    is_shared_identity = (
-        bool(shared) and name.lower() == shared.lower()
-    ) or bool(
-        is_orchestrator_root_install() if is_orchestrator_root_install else False
-    )
-
-    if is_shared_identity:
-        print(
-            f"  prune skipped for {name!r}: shared-identity collection — "
-            "sibling projects' shared-scope rows live here and are kept "
-            "(vco doctor's kg_drift_census reports stored-only rows)"
-        )
-        _log(
-            "7c/10", "ok",
-            f"prune skipped for {name!r}: shared-identity collection "
-            "(other projects' shared-scoped rows legitimately have no file "
-            "under this root; never pruned — the doctor census reports "
-            "stored-only rows)",
-            data={"collection": name, "skipped": "shared-identity collection"},
-        )
-        return
-
-    from vco_lib.collection_repair import prune_foreign_rows
     try:
+        from vco_lib.collection_repair import (
+            is_shared_identity_collection,
+            prune_foreign_rows,
+        )
+
+        if is_shared_identity_collection(name, shared, project_root):
+            print(
+                f"  prune skipped for {name!r}: shared-identity collection — "
+                "sibling projects' shared-scope rows live here and are kept "
+                "(vco doctor's kg_drift_census reports stored-only rows)"
+            )
+            _log(
+                "7c/10", "ok",
+                f"prune skipped for {name!r}: shared-identity collection "
+                "(other projects' shared-scoped rows legitimately have no file "
+                "under this root; never pruned — the doctor census reports "
+                "stored-only rows)",
+                data={"collection": name, "skipped": "shared-identity collection"},
+            )
+            return
+
         result = prune_foreign_rows(
             project_root, name,
             weaviate_url=weaviate_url,
-            is_shared_identity=False,
+            shared_kg_collection=shared,
             dry_run=bool(dry_run),
             log_event=log_event,
             log_step="7c/10",

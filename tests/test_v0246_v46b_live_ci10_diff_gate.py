@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import time
 import unittest
 import urllib.error
@@ -240,10 +241,12 @@ class V46BLivePruneTest(unittest.TestCase):
     """Live tests for ``install._prune_stale_kg_rows``.
 
     The function fetches all (uuid, file_path) pairs from Weaviate, then
-    checks each ``file_path`` against ``_path_resolves_on_disk`` to
-    decide whether to prune. We exercise both branches:
+    checks each ``file_path`` for on-disk existence (v0.2.103 R2, review
+    H-1: lexically, following symlinks, in the one prune home
+    ``vco_lib.collection_repair``) to decide whether to prune. We exercise
+    both branches:
       - stale (file_path doesn't exist) → row should be deleted
-      - legitimate (file_path is a real file in this repo) → kept
+      - legitimate (file_path is a real file under the walked root) → kept
     """
 
     def setUp(self) -> None:
@@ -254,6 +257,13 @@ class V46BLivePruneTest(unittest.TestCase):
         self.test_collection = f"V46BTestPrune{uuid.uuid4().hex[:8]}"
         _create_test_collection(self.test_collection)
         time.sleep(0.3)
+        # v0.2.103 R2 (review H-2): the walked root must be provably NOT
+        # the orchestrator clone — the checkout these tests run from IS one
+        # (root ≡ shared ⇒ the prune correctly skips there) — so the
+        # adapter is driven with a markerless tmp tree as project_root.
+        self._root_tmp = tempfile.TemporaryDirectory(prefix="vct-v46b-root-")
+        self.addCleanup(self._root_tmp.cleanup)
+        self.project_root = Path(self._root_tmp.name)
 
     def tearDown(self) -> None:
         _delete_test_collection(self.test_collection)
@@ -285,14 +295,14 @@ class V46BLivePruneTest(unittest.TestCase):
         )
 
         # Run the prune with dry_run=False — this is the destructive path.
-        # v0.2.103: call the vco_lib adapter directly with the identity
-        # pinned — via install.py's wrapper, the repo checkout this test
-        # runs from IS the orchestrator root (root ≡ shared), and the
-        # shared-identity guard correctly SKIPS the prune there.
+        # v0.2.103: call the vco_lib adapter directly on the markerless tmp
+        # root from setUp — the repo checkout this test runs from IS the
+        # orchestrator clone (root ≡ shared), and the shared-identity guard
+        # correctly SKIPS the prune there (R2, review H-2: the identity now
+        # comes from the walked root's markers, not a pinned callable).
         _iw._prune_stale_kg_rows(
             self.test_collection, WEAVIATE_URL, dry_run=False,
-            project_root=install.PROJECT_ROOT,
-            is_orchestrator_root_install=lambda: False,
+            project_root=self.project_root,
             shared_kg_collection="",
         )
         # Batch-delete is also async; allow it to settle.
@@ -315,8 +325,10 @@ class V46BLivePruneTest(unittest.TestCase):
         path, plus one stale path. After prune, the legitimate row must
         survive; the stale row must be deleted.
         """
-        # ``install.py`` is at the project root — _path_resolves_on_disk
-        # will find it via strategy 1 (direct relative-to-PROJECT_ROOT).
+        # ``install.py`` must exist under the WALKED root — a stub in the
+        # markerless tmp tree — found by the lexical existence check
+        # (direct relative-to-project_root).
+        (self.project_root / "install.py").write_text("# stub\n")
         legit_fp = "install.py"
         stale_fp = f"knowledge/_v46b_stale_keep_test_{uuid.uuid4().hex[:8]}.md"
 
@@ -331,8 +343,7 @@ class V46BLivePruneTest(unittest.TestCase):
 
         _iw._prune_stale_kg_rows(
             self.test_collection, WEAVIATE_URL, dry_run=False,
-            project_root=install.PROJECT_ROOT,
-            is_orchestrator_root_install=lambda: False,
+            project_root=self.project_root,
             shared_kg_collection="",
         )
         time.sleep(0.6)
@@ -386,8 +397,7 @@ class V46BLivePruneTest(unittest.TestCase):
 
         _iw._prune_stale_kg_rows(
             self.test_collection, WEAVIATE_URL, dry_run=True,
-            project_root=install.PROJECT_ROOT,
-            is_orchestrator_root_install=lambda: False,
+            project_root=self.project_root,
             shared_kg_collection="",
         )
         time.sleep(0.4)

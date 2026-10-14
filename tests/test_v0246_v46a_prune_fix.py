@@ -14,8 +14,9 @@ beside ``vco_lib.collection_repair`` and lacked the shared-identity guard —
 a root ``--update`` could delete sibling projects' shared rows). The tests
 below keep every V46-A intent, driven through the ONE home at its
 ``collection_repair._http_request`` mock seam (the install adapter delegates
-there), with the non-shared identity pinned explicitly
-(``is_orchestrator_root_install=lambda: False``) so the adapter reaches the
+there), with a NON-root ``project_root`` (a markerless tmp dir — v0.2.103
+R2, review H-2: the shared-identity predicate's root leg fires on any
+orchestrator clone, and this checkout IS one) so the adapter reaches the
 delegation instead of the (correct, tested elsewhere) shared-identity skip.
 The shared-identity guard itself is covered by
 ``tests/test_v02103_install_prune_shared_guard.py``.
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -87,19 +89,27 @@ class _FakeRepairHTTP:
 
 def _run_prune(fake: _FakeRepairHTTP, *, dry_run: bool = True,
                path_check=None) -> mock.MagicMock:
-    """Drive ``install_weaviate._prune_stale_kg_rows`` with the fake seam."""
+    """Drive ``install_weaviate._prune_stale_kg_rows`` with the fake seam.
+
+    ``project_root`` is a markerless tmp dir: the repo checkout these tests
+    run from IS the orchestrator clone, and the home's shared-identity
+    predicate (v0.2.103 R2, review H-2) would correctly skip the prune on
+    it. The existence check is faked at the home's seam
+    (``_stored_file_exists_for_prune``, the v0.2.103 R2 / H-1 name) so the
+    tmp tree needs no fixture files.
+    """
     log_mock = mock.MagicMock()
-    with mock.patch.object(collection_repair, "_http_request", fake), \
+    with tempfile.TemporaryDirectory() as tmp, \
+         mock.patch.object(collection_repair, "_http_request", fake), \
          mock.patch.object(install, "_log_install_event", log_mock), \
          mock.patch.object(
-             collection_repair, "_path_resolves_on_disk",
+             collection_repair, "_stored_file_exists_for_prune",
              path_check or (lambda fp, root: False),
          ):
         install_weaviate._prune_stale_kg_rows(
             "TestCollection", "http://localhost:8081", dry_run=dry_run,
-            project_root=REPO_ROOT,
+            project_root=Path(tmp),
             log_event=install._log_install_event,
-            is_orchestrator_root_install=lambda: False,
         )
     return log_mock
 
@@ -160,8 +170,9 @@ class TestV46APruneFix(unittest.TestCase):
         """When Weaviate returns rows, prune MUST evaluate each one against
         the on-disk file-existence check.
 
-        ``_path_resolves_on_disk`` is faked to return False for every row so
-        the rows are flagged as stale; with ``dry_run=True`` no delete fires.
+        ``_stored_file_exists_for_prune`` is faked to return False for every
+        row so the rows are flagged as stale; with ``dry_run=True`` no delete
+        fires.
         """
         fake = _FakeRepairHTTP([
             ("uuid-a", "knowledge/orphan-a.md", "A"),

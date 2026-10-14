@@ -17,23 +17,33 @@ This file pins:
 
 * root/shared install prune KEEPS a sibling project's shared rows — absolute
   path, relative path of another project, empty path — skipping before it
-  even enumerates (both triggers: kg == shared by NAME, and the
-  root-install marker alone, root ≡ shared by construction);
+  even enumerates (both triggers of the home's ONE predicate
+  ``collection_repair.is_shared_identity_collection``, v0.2.103 R2 review
+  H-2: kg == shared by NAME, and the walked root carrying the
+  orchestrator-clone markers — root ≡ shared by construction — which holds
+  even when the shared NAME is empty/unresolved);
 * a non-root project prune still DELETES its own gone rows (through
   ``collection_repair``'s guards: existing files kept, empty / absolute /
-  ``..`` paths defensively kept);
+  ``..`` paths defensively kept) — a branch install.py never reaches in
+  production (install.py only runs AS the orchestrator clone, so the root
+  leg always fires there; review L-3), pinned here as defence in depth on a
+  markerless root;
+* a failed import of the prune home is soft-failed (logged), never raised
+  into the installer (review L-2);
 * enumeration failure ⇒ nothing deleted;
 * dry-run reports without deleting;
 * the ``install.py --update`` seed path calls the guarded home
   (behavioural drive through ``install._seed_weaviate`` — the real wrapper,
   the real adapter, only the Weaviate HTTP seam faked).
 
-Red-proof: revert ``vco_lib/install_weaviate.py`` + ``install.py`` to the
-pre-fix state (cp-aside → restore) — the shared-identity tests fail by
-DELETING the sibling rows through the old unguarded path (faked here at the
-``urllib.request.urlopen`` seam the old code used), and the non-root
-deletion test fails because the old ``dry_run=None`` default kept every
-non-root run dry.
+Red-proof: revert ``vco_lib/install_weaviate.py`` + ``install.py`` +
+``vco_lib/collection_repair.py`` to the pre-fix state (cp-aside → restore) —
+the shared-identity tests fail by DELETING the sibling rows through the old
+unguarded path (faked here at the ``urllib.request.urlopen`` seam the old
+code used), the marker-only root test fails because the pre-fix adapter
+needed the (removed) ``is_orchestrator_root_install`` callable to arm the
+skip, and the non-root deletion test fails because the old ``dry_run=None``
+default kept every non-root run dry.
 """
 from __future__ import annotations
 
@@ -172,7 +182,17 @@ class InstallPruneSharedIdentityGuardTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmpdir.cleanup()
 
+    def _mark_orchestrator_clone(self) -> None:
+        """Give the tmp root the orchestrator-clone identity markers
+        (``vco_lib.orchestrator_identity.is_orchestrator_clone``: the
+        manifest parses to ``id == "orchestrator"``)."""
+        (self.root / "vct-module.json").write_text(
+            '{"id": "orchestrator"}', encoding="utf-8",
+        )
+
     def _drive(self, *, shared_kg_collection, is_root):
+        if is_root:
+            self._mark_orchestrator_clone()
         seam = _FakeRepairHTTP(SIBLING_ROWS)
         urlopen = _FakeUrlopen(SIBLING_ROWS)
         with mock.patch.object(collection_repair, "_http_request", seam), \
@@ -183,7 +203,6 @@ class InstallPruneSharedIdentityGuardTest(unittest.TestCase):
                 dry_run=None,  # the install.py default: would DELETE pre-fix
                 project_root=self.root,
                 log_event=install._log_install_event,
-                is_orchestrator_root_install=lambda: is_root,
                 shared_kg_collection=shared_kg_collection,
             )
         return seam, urlopen
@@ -205,14 +224,17 @@ class InstallPruneSharedIdentityGuardTest(unittest.TestCase):
         self.assertEqual(seam.deleted_uuids, [])
 
     def test_root_install_marker_alone_keeps_sibling_rows(self) -> None:
-        """Root install ⇒ shared identity by CONSTRUCTION (v0.2.81 root ≡
+        """Root clone ⇒ shared identity by CONSTRUCTION (v0.2.81 root ≡
         shared), even when the shared name is unknown or has drifted.
 
-        Called WITHOUT the v0.2.103 ``shared_kg_collection`` kwarg on
-        purpose: the pre-fix signature accepted exactly this call and its
-        root leg DELETED (``dry_run=None`` → root ⇒ live delete) — this is
-        the red-proof shape for the data-destroying path.
+        Called WITHOUT the ``shared_kg_collection`` kwarg on purpose: the
+        pre-fix adapter needed its (removed) ``is_orchestrator_root_install``
+        callable to arm the skip, and the pre-0.2.103 root leg DELETED
+        (``dry_run=None`` → root ⇒ live delete) — this is the red-proof
+        shape for the data-destroying path, now armed by the clone markers
+        through the home's ONE predicate.
         """
+        self._mark_orchestrator_clone()
         seam = _FakeRepairHTTP(SIBLING_ROWS)
         urlopen = _FakeUrlopen(SIBLING_ROWS)
         with mock.patch.object(collection_repair, "_http_request", seam), \
@@ -223,13 +245,23 @@ class InstallPruneSharedIdentityGuardTest(unittest.TestCase):
                 dry_run=None,  # pre-fix root default: LIVE DELETE
                 project_root=self.root,
                 log_event=install._log_install_event,
-                is_orchestrator_root_install=lambda: True,
             )
         self.assertEqual(seam.calls, [])
         self.assertEqual(urlopen.graphql_calls, 0,
                          "a root install must not even enumerate")
         self.assertEqual(urlopen.deleted_uuids, [],
                          "a root install must never delete shared rows")
+        self.assertEqual(seam.deleted_uuids, [])
+
+    def test_root_clone_with_empty_shared_name_never_prunes(self) -> None:
+        """Review H-2's exact gap: the shared name is EMPTY (hub down, no
+        launcher.db row, free tier) and the root must STILL skip — the
+        name-only pre-fix predicate let this through and deleted."""
+        seam, urlopen = self._drive(shared_kg_collection="", is_root=True)
+        self.assertEqual(seam.calls, [],
+                         "empty shared name on the root must still skip "
+                         "before enumeration")
+        self.assertEqual(urlopen.deleted_uuids, [])
         self.assertEqual(seam.deleted_uuids, [])
 
     def test_explicit_dry_run_still_skips_on_shared_identity(self) -> None:
@@ -266,10 +298,33 @@ class InstallPruneNonRootTest(unittest.TestCase):
                 dry_run=dry_run,
                 project_root=self.root,
                 log_event=install._log_install_event,
-                is_orchestrator_root_install=lambda: False,
                 shared_kg_collection="SomeSharedStore",
             )
         return seam
+
+    def test_collection_repair_import_error_is_soft_failed_not_raised(self):
+        """Review L-2: the docstring promises "soft-fail throughout … never
+        raises", so a failed import of the prune home (broken install) is
+        LOGGED as a warn, never raised into the installer."""
+        with mock.patch.dict(sys.modules, {"vco_lib.collection_repair": None}), \
+             mock.patch.object(install, "_log_install_event") as log_mock:
+            install_weaviate._prune_stale_kg_rows(
+                "ProjKG", "http://localhost:8081",
+                dry_run=None,
+                project_root=self.root,
+                log_event=install._log_install_event,
+                shared_kg_collection="SomeSharedStore",
+            )
+        warns = [
+            c for c in log_mock.call_args_list
+            if len(c.args) >= 2 and c.args[1] == "warn"
+        ]
+        self.assertTrue(
+            warns,
+            "a failed prune-home import must surface as a WARN log, "
+            f"not a raise; calls: {log_mock.call_args_list!r}",
+        )
+        self.assertIn("ProjKG", warns[0].args[2])
 
     def test_non_root_deletes_own_gone_rows_and_keeps_the_rest(self) -> None:
         """The install-time prune deletes exactly this project's gone rows.
@@ -397,12 +452,13 @@ class InstallUpdateSeedPathPruneTest(unittest.TestCase):
         issues NO prune enumeration and NO delete — sibling projects' shared
         rows are kept.
 
-        The tmp root also carries the three orchestrator-root markers
-        (vct-module.json / install.py / vco_lib/) so the PRE-fix code —
-        whose root leg ran with ``dry_run=False`` — live-deletes through the
-        urlopen seam: this is the red-proof shape for the --update path.
+        The tmp root also carries the orchestrator-clone markers
+        (vct-module.json with id "orchestrator" / install.py / vco_lib/) so
+        the PRE-fix code — whose root leg ran with ``dry_run=False`` —
+        live-deletes through the urlopen seam: this is the red-proof shape
+        for the --update path.
         """
-        (self.tmp / "vct-module.json").write_text("{}")
+        (self.tmp / "vct-module.json").write_text('{"id": "orchestrator"}')
         (self.tmp / "install.py").write_text("# stub\n")
         (self.tmp / "vco_lib").mkdir(exist_ok=True)
         drive = _SeedDrive(self.tmp, kg="RootKG", shared="RootKG")
@@ -418,6 +474,24 @@ class InstallUpdateSeedPathPruneTest(unittest.TestCase):
             urlopen.deleted_uuids, [],
             "no batch delete may be issued for a shared-identity collection",
         )
+
+    def test_update_on_root_with_empty_shared_name_prunes_nothing(self) -> None:
+        """Review H-2 through the real --update path: the shared name is
+        EMPTY (unresolved) and the clone markers alone must skip the prune."""
+        (self.tmp / "vct-module.json").write_text('{"id": "orchestrator"}')
+        (self.tmp / "install.py").write_text("# stub\n")
+        (self.tmp / "vco_lib").mkdir(exist_ok=True)
+        drive = _SeedDrive(self.tmp, kg="RootKG", shared="")
+        self.addCleanup(drive.close)
+        seam = _FakeRepairHTTP(SIBLING_ROWS)
+        urlopen = _FakeUrlopen(SIBLING_ROWS)
+        self._run_update(drive, seam, urlopen)
+        self.assertEqual(
+            seam.calls, [],
+            "an EMPTY shared name on the orchestrator root must still skip "
+            "the prune (root ≡ shared by construction)",
+        )
+        self.assertEqual(urlopen.deleted_uuids, [])
 
     def test_update_on_non_root_deletes_gone_row_via_guarded_home(self) -> None:
         """A non-root --update prunes its own gone rows THROUGH the guarded
