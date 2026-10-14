@@ -1059,15 +1059,19 @@ pub fn build_podman_run_args_with_env(
     // always `<command> <args>`. Container runtimes exec without a
     // shell, so a multi-word `command` is split on whitespace: the
     // first word is the `--entrypoint`, the remaining words lead the
-    // CMD ahead of `runtime.args` (a single argv element containing
-    // spaces never resolved to an executable under either form).
+    // CMD ahead of `runtime.args`. The split happens on the RAW
+    // template, BEFORE placeholder resolution (v0.2.103 review R3
+    // LOW-1): a `{HOME}` that resolves to a path containing spaces
+    // must stay ONE argv element — splitting after resolution broke
+    // such paths mid-word.
     let runtime_skip_cmd = runtime.command.is_empty()
         || is_runtime_pathological(&runtime.command, &runtime.args, Some(&manifest.id));
     let mut command_words: Vec<String> = Vec::new();
     if !runtime_skip_cmd {
-        command_words = resolve_value(&runtime.command, ctx, &placeholders)
+        command_words = runtime
+            .command
             .split_whitespace()
-            .map(str::to_string)
+            .map(|w| resolve_value(w, ctx, &placeholders))
             .collect();
         if let Some(first) = command_words.first() {
             args.push("--entrypoint".into());
@@ -1268,14 +1272,18 @@ pub fn build_podman_run_args_global_inheriting(
     // so the CMD form doubled the invocation on ENTRYPOINT-bearing
     // images (argparse exit 2, crash loop). Multi-word commands split
     // on whitespace: first word is the `--entrypoint`, the rest lead
-    // the CMD ahead of `runtime.args`.
+    // the CMD ahead of `runtime.args`. The split runs on the RAW
+    // template BEFORE placeholder resolution (v0.2.103 review R3
+    // LOW-1): a `{HOME}` resolving to a path with spaces must stay
+    // ONE argv element — splitting after resolution broke such paths.
     let runtime_skip_cmd = runtime.command.is_empty()
         || is_runtime_pathological(&runtime.command, &runtime.args, Some(&manifest.id));
     let mut command_words: Vec<String> = Vec::new();
     if !runtime_skip_cmd {
-        command_words = resolve_value(&runtime.command, ctx, &placeholders)
+        command_words = runtime
+            .command
             .split_whitespace()
-            .map(str::to_string)
+            .map(|w| resolve_value(w, ctx, &placeholders))
             .collect();
         if let Some(first) = command_words.first() {
             args.push("--entrypoint".into());
@@ -6045,6 +6053,53 @@ mod tests {
             args[image_pos + 1..],
             ["-m", "rl_server.rl_server", "--port", "11450"],
             "multi-word command remainder leads the CMD; got {:?}",
+            args,
+        );
+    }
+
+    /// v0.2.103 review R3 LOW-1: the whitespace split runs on the RAW
+    /// template, BEFORE placeholder resolution — a `{HOME}` that
+    /// resolves to a path containing a space must stay ONE argv
+    /// element. The resolve-then-split order used to break
+    /// "/Users/John Smith/…" mid-path into two bogus argv words.
+    #[test]
+    fn v02103_fix5_placeholder_resolving_to_a_spaced_path_stays_one_word() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.command = "{HOME}/bin/tool".into();
+        manifest.runtime.args = vec!["--port".into(), "11450".into()];
+        let project = make_project();
+        let mut ctx = PlaceholderCtx::new(&manifest.id);
+        ctx.home = std::path::PathBuf::from("/home/test user");
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.10",
+            "podman",
+            None,
+        )
+        .expect("build args");
+        let image_pos = args
+            .iter()
+            .position(|a| a == "ghcr.io/hotak92/vct-rl-reranker:0.2.10")
+            .expect("image in argv");
+        assert_eq!(
+            args.get(image_pos - 2).map(String::as_str),
+            Some("--entrypoint")
+        );
+        assert_eq!(
+            args.get(image_pos - 1).map(String::as_str),
+            Some("/home/test user/bin/tool"),
+            "a resolved placeholder path with spaces must stay ONE argv \
+             element (split the raw template, then resolve each word); got {:?}",
+            args,
+        );
+        assert_eq!(
+            args[image_pos + 1..],
+            ["--port", "11450"],
+            "no command residue after the image; got {:?}",
             args,
         );
     }

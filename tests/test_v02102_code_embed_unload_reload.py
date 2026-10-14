@@ -678,22 +678,17 @@ def test_queue_wait_bound_exceeded_returns_503_with_retry_after():
 
 def test_queue_wait_zero_refuses_when_saturated_but_serves_a_free_slot():
     """``CODE_EMBED_QUEUE_WAIT_SECS=0`` keeps the old shed semantics for a
-    saturated service (immediate 503 — but now WITH Retry-After), while a
+    saturated service (immediate 503 — but WITH Retry-After), while a
     request that finds a free slot is still served.
 
-    v0.2.103 de-flake: the serve half used to rely on an UNCONTENDED
-    ``sem.acquire()`` beating the shipped 1 ms zero-grace timer
-    (``_QUEUE_ZERO_GRACE_SECS = 0.001``). That is a wall-clock margin
-    against OS scheduling: under heavy machine load the test process can
-    be descheduled between the acquire task's first scheduling and its
-    completion, the monotonic grace timer matures meanwhile, and
-    ``wait_for`` sheds the request with a 503 — observed once in a full
-    run. The race is removed by widening ONLY the serve half's grace to
-    5 s (the shed half keeps the shipped value, so "saturated + wait=0 →
-    503 with Retry-After" still exercises the real 1 ms path); the grace
-    magnitude is an internal tuning constant no test pins, and the
-    property under test — a request that finds a free slot is SERVED, not
-    shed — is unchanged."""
+    v0.2.103 (review R3 MEDIUM-4): both halves now run the real shipped
+    path. The old ~1 ms ``wait_for`` zero-grace made the SERVE half a
+    wall-clock race (under load the timer matured before an uncontended
+    acquire completed and the request was shed) — masked in a previous
+    pass by widening the test's grace, which stopped testing shipped
+    behaviour. The server now decides without a timer when the wait is 0
+    (``Semaphore.locked()`` → shed; otherwise a plain acquire), so both
+    halves are deterministic AND shipped."""
     _queue_env()
     es.QUEUE_WAIT_SECS = 0.0
 
@@ -707,13 +702,42 @@ def test_queue_wait_zero_refuses_when_saturated_but_serves_a_free_slot():
             assert "Retry-After" in (exc_info.value.headers or {})
         finally:
             sem.release()
-        real_grace = es._QUEUE_ZERO_GRACE_SECS
-        es._QUEUE_ZERO_GRACE_SECS = 5.0
-        try:
+        with patch.object(es, "embed", return_value=[[1.0]]):
+            return await es.embed_endpoint(es.EmbedRequest(texts=["x"]))
+
+    resp = asyncio.run(_run())
+    assert resp.embeddings == [[1.0]]
+
+
+def test_queue_wait_zero_free_slot_is_served_even_when_the_timer_fires():
+    """MEDIUM-4 red-proof (review R3 2026-10-14): with ``QUEUE_WAIT_SECS=0``
+    and a FREE slot, the admit decision must not run through
+    ``asyncio.wait_for`` at all. The old ~1 ms grace was a race against OS
+    scheduling — the timer could mature before an uncontended acquire
+    completed and shed a request that had a slot. Simulated deterministically
+    with a HOSTILE ``wait_for`` that lets the acquire COMPLETE and then
+    raises TimeoutError anyway (exactly the observed race shape): the
+    timer-free decision still serves the request; any wait_for-based path
+    sheds it with 503."""
+    _queue_env()
+    es.QUEUE_WAIT_SECS = 0.0
+
+    async def _run():
+        real_wait_for = asyncio.wait_for
+
+        async def _hostile_wait_for(coro, timeout=None):
+            # Let the wrapped acquire COMPLETE (the permit is consumed),
+            # then time out anyway — the pre-fix race.
+            fut = asyncio.ensure_future(coro)
+            try:
+                await real_wait_for(asyncio.shield(fut), timeout=5)
+            except Exception:
+                pass
+            raise asyncio.TimeoutError()
+
+        with patch.object(es.asyncio, "wait_for", _hostile_wait_for):
             with patch.object(es, "embed", return_value=[[1.0]]):
                 return await es.embed_endpoint(es.EmbedRequest(texts=["x"]))
-        finally:
-            es._QUEUE_ZERO_GRACE_SECS = real_grace
 
     resp = asyncio.run(_run())
     assert resp.embeddings == [[1.0]]

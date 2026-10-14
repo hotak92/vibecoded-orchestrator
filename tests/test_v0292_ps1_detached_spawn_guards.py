@@ -147,8 +147,8 @@ def _run_hook(
     ``capture_output=True`` block until the grandchild exits — a confound
     that would make the timing assertions below measure the child instead
     of the hook. (v0.2.103 closed the underlying .sh/.ps1 parity gap —
-    ``Start-VcoDetachedProcess`` now defaults un-redirected streams to
-    /dev/null on POSIX, pinned by
+    ``Start-VcoDetachedProcess`` detaches the child with kernel-level fd
+    redirections on POSIX, pinned by
     ``test_unredirected_detached_child_does_not_hold_the_hooks_pipes`` —
     but measuring the HOOK through files stays the right isolation.)
     """
@@ -525,6 +525,91 @@ Write-Output hook-end
         time.sleep(0.2)
     assert marker.is_file(), (
         "the detached child never ran — the spawn itself is broken"
+    )
+
+
+def test_detached_child_writing_after_hook_return_survives_and_logs_stderr(tmp_path):
+    """HIGH-1 (review R3 2026-10-14): a detached POSIX child that WRITES to
+    stdout and stderr AFTER the hook has returned must SURVIVE (no EPIPE)
+    and its stderr must land in the shared state-dir log; the hook itself
+    must return promptly with its pipes closed.
+
+    The first attempt at QUIRK 4 used ``Start-Process
+    -RedirectStandardOutput/-RedirectStandardError`` — on Unix pwsh
+    implements those by handing the child PIPES back to the parent and
+    copying them to the files, so once the hook exits nobody drains them
+    and the child's first write dies with BrokenPipeError (verified: both
+    streams, log left empty). The redesign launches the child through
+    ``/bin/sh -c 'exec "$0" "$@" </dev/null >/dev/null 2>><log>'`` so the
+    redirection is a kernel-level fd duplication the child owns outright.
+    """
+    exe = _require_pwsh()
+    if os.name == "nt":
+        pytest.skip("the EPIPE hazard is POSIX-specific; Windows behaviour is unchanged")
+    state = tmp_path / "state"
+    marker = tmp_path / "child-lived.txt"
+    #: The child writes only after the hook has had ample time to exit —
+    #: pre-redesign, exactly these writes killed it (EPIPE) and neither
+    #: the stderr log nor the marker ever appeared.
+    child = _stage_child_script(
+        tmp_path,
+        "writer.sh",
+        "sleep 3\n"
+        "printf 'progress noise on stdout'\n"
+        "printf 'vco-detached-stderr-marker\\n' 1>&2\n"
+        f"printf ran > '{marker}'\n",
+    )
+    script = f"""
+. '{PS_LIB}'
+Write-Output hook-start
+Start-VcoDetachedProcess -FilePath '{child}'
+Write-Output hook-end
+"""
+    path = tmp_path / "drive-writer.ps1"
+    path.write_text(script, encoding="utf-8")
+    env = os.environ.copy()
+    env["VCT_STATE_DIR"] = str(state)
+    proc = subprocess.Popen(
+        [exe, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
+    try:
+        out, err = proc.communicate(timeout=10.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        pytest.fail(
+            "the hook's output pipes were still open after 10s — the "
+            "detached child is holding them"
+        )
+    assert b"hook-start" in out and b"hook-end" in out, (
+        f"the hook did not run to completion: {out!r} {err!r}"
+    )
+    # The child SURVIVED its post-exit stdout+stderr writes (no EPIPE) and
+    # wrote its marker.
+    deadline = time.monotonic() + MARKER_TIMEOUT_S
+    while time.monotonic() < deadline and not marker.is_file():
+        time.sleep(0.2)
+    assert marker.is_file(), (
+        "the detached child died on its first write after the hook exited "
+        "(EPIPE) — it must own its redirections, not borrow the parent's pipes"
+    )
+    # Its stderr landed in the shared, bounded state-dir log.
+    log = state / "logs" / "detached-children.log"
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        body = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+        if "vco-detached-stderr-marker" in body:
+            break
+        time.sleep(0.2)
+    assert log.is_file() and "vco-detached-stderr-marker" in log.read_text(
+        encoding="utf-8", errors="replace"
+    ), (
+        "the detached child's stderr did not land in "
+        f"$VCT_STATE_DIR/logs/detached-children.log (exists={log.is_file()})"
     )
 
 
