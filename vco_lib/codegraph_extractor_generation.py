@@ -312,6 +312,30 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
 #: The newest generation a freshly-built graph satisfies.
 CURRENT_EXTRACTOR_GENERATION: str = EXTRACTOR_GENERATION_BUMPS[-1]
 
+#: One-line HUMAN reason per ladder rung — the text shown to the user when
+#: that rung's re-index is launched (``describe_rung`` prefixes the version).
+#: Append an entry beside every ladder append: a rung with no entry makes
+#: the user-facing message fall back to the generic wording, which is worse
+#: than naming what actually triggered the walk. Pinned to stay in lockstep
+#: with the ladder by ``tests/test_v02103_rung_reason.py``.
+EXTRACTOR_GENERATION_RUNG_REASONS: dict[str, str] = {
+    "0.2.92": (
+        "added Python API extraction and fixed C# route attribution"
+    ),
+    "0.2.93": (
+        "coverage re-walk for the extractor fixes (no extractor change that release)"
+    ),
+    "0.2.94": (
+        "recovery re-walk for background walks that never ran"
+    ),
+    "0.2.102": (
+        "made tree-sitter definitions the default extractor for most "
+        "languages — new symbols, corrected line ranges and bodies, Rust "
+        "test-gated modules, PowerShell and Protobuf support, "
+        "language-aware imports"
+    ),
+}
+
 #: Env var the analyzer honours as an alternative to ``--force-rewalk``. It
 #: exists because the background trigger reaches the analyzer through TWO
 #: process hops (``spawn_background_resync`` → ``codegraph_resync --run-resync``
@@ -402,6 +426,25 @@ def generation_is_current(generation: Optional[str],
     return have >= newest
 
 
+def describe_rung(bump: object) -> "Optional[str]":
+    """Human reason for the rung that triggered a re-index.
+
+    Returns ``"v<bump> <one-line reason>"`` (e.g. ``"v0.2.102 made
+    tree-sitter definitions the default extractor…"``) — the text the
+    bundle update shows the user when it launches a background re-index,
+    so the message names the change that ACTUALLY triggered the walk
+    instead of a hard-coded version's reason. ``None`` when the rung is
+    unknown or missing from :data:`EXTRACTOR_GENERATION_RUNG_REASONS`;
+    callers fall back to generic wording rather than guessing.
+    """
+    if not isinstance(bump, str):
+        return None
+    reason = EXTRACTOR_GENERATION_RUNG_REASONS.get(bump)
+    if reason is None:
+        return None
+    return f"v{bump} {reason}"
+
+
 # ---------------------------------------------------------------------------
 # The DECISION (pure — no I/O, fully unit-testable)
 # ---------------------------------------------------------------------------
@@ -433,6 +476,10 @@ class Verdict:
     reason: str
     stamp_now: bool = False
     generation: str = CURRENT_EXTRACTOR_GENERATION
+    #: The rung that triggered this verdict — set only when ``reason`` is
+    #: ``REASON_CROSSES_BUMP`` (the first bump the upgrade crosses).
+    #: :func:`describe_rung` turns it into the user-facing reason text.
+    bump: Optional[str] = None
 
 
 def decide(
@@ -491,7 +538,7 @@ def decide(
 
     for bump in bumps:
         if crosses_version_boundary(prev_version or "", running_version or "", bump):
-            return Verdict(True, REASON_CROSSES_BUMP, generation=newest)
+            return Verdict(True, REASON_CROSSES_BUMP, generation=newest, bump=bump)
 
     return Verdict(True, REASON_UNKNOWN_GENERATION, generation=newest)
 
@@ -942,6 +989,11 @@ class ReindexResult:
     reason: str = ""
     message: str = ""
     generation: str = CURRENT_EXTRACTOR_GENERATION
+    #: Human reason for the rung that triggered the re-index
+    #: (:func:`describe_rung`), or a generic "may predate" line when the
+    #: triggering rung is unknown. What the bundle update's user-facing
+    #: warning shows — never hard-coded to one release's reason.
+    reason_text: str = ""
     pid: Optional[int] = None
     deferral: object = None         # a DeferralEntry when status == "deferred"
     warnings: list = field(default_factory=list)
@@ -1090,13 +1142,20 @@ def ensure_extractor_generation(
             message=f"no extractor re-index owed ({verdict.reason})",
         )
 
+    # The user-facing reason for the owed walk: the triggering rung's own
+    # text when the verdict names one, generic otherwise (never one
+    # release's hard-coded reason for every rung).
+    reason_text = describe_rung(verdict.bump) or (
+        f"the graph may predate extractor generation v{verdict.generation}"
+    )
+
     if spawn is None:
         try:
             from vco_lib.codegraph_resync import spawn_background_resync as spawn
         except Exception as exc:  # noqa: BLE001
             return ReindexResult(
                 status="failed", reason=verdict.reason,
-                generation=verdict.generation,
+                generation=verdict.generation, reason_text=reason_text,
                 message=f"codegraph_resync helper unavailable: {exc}",
             )
 
@@ -1125,7 +1184,7 @@ def ensure_extractor_generation(
     except Exception as exc:  # noqa: BLE001 — a spawn failure never blocks
         return ReindexResult(
             status="failed", reason=verdict.reason,
-            generation=verdict.generation,
+            generation=verdict.generation, reason_text=reason_text,
             message=f"extractor re-index spawn raised: {exc}",
         )
 
@@ -1134,7 +1193,7 @@ def ensure_extractor_generation(
     if status == "launched":
         return ReindexResult(
             status="launched", reason=verdict.reason,
-            generation=verdict.generation,
+            generation=verdict.generation, reason_text=reason_text,
             pid=getattr(result, "pid", None),
             message=(
                 f"extractor-generation re-index launched in background for "
@@ -1144,7 +1203,7 @@ def ensure_extractor_generation(
     if status == "deferred":
         return ReindexResult(
             status="deferred", reason=verdict.reason,
-            generation=verdict.generation,
+            generation=verdict.generation, reason_text=reason_text,
             deferral=_retarget_deferral(getattr(result, "deferral", None),
                                         verdict.generation),
             message=message or "extractor re-index deferred",
@@ -1160,7 +1219,7 @@ def ensure_extractor_generation(
         # so the next bundle update retries.
         return ReindexResult(
             status="failed", reason=verdict.reason,
-            generation=verdict.generation,
+            generation=verdict.generation, reason_text=reason_text,
             message=message or "extractor re-index could not be started",
         )
 
@@ -1170,7 +1229,7 @@ def ensure_extractor_generation(
     # asks again.
     return ReindexResult(
         status="skipped", reason=verdict.reason,
-        generation=verdict.generation,
+        generation=verdict.generation, reason_text=reason_text,
         message=message or f"extractor re-index not launched ({status})",
     )
 
@@ -1178,6 +1237,7 @@ def ensure_extractor_generation(
 __all__ = [
     "CURRENT_EXTRACTOR_GENERATION",
     "EXTRACTOR_GENERATION_BUMPS",
+    "EXTRACTOR_GENERATION_RUNG_REASONS",
     "FORCE_REWALK_ENV",
     "STAMP_REL",
     "REASON_CROSSES_BUMP",
@@ -1190,6 +1250,7 @@ __all__ = [
     "code_graph_exists",
     "crosses_version_boundary",
     "decide",
+    "describe_rung",
     "ensure_extractor_generation",
     "generation_is_current",
     "parse_semver",

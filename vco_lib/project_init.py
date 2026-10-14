@@ -6102,8 +6102,8 @@ def _trigger_extractor_generation_reindex(
         }
         result["warnings"].append(
             f"code-graph re-index started in the background for "
-            f"{project_name} (v0.2.92 added Python API extraction and fixed C# "
-            f"route attribution; unchanged entities are NOT re-embedded). "
+            f"{project_name} ({outcome.reason_text or 'an extractor change'}; "
+            f"unchanged entities are NOT re-embedded). "
             f"Progress: <vct_root>/logs/resync-*.log"
         )
     elif outcome.status == "deferred" and outcome.deferral is not None:

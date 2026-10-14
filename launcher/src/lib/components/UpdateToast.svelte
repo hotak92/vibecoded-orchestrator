@@ -28,7 +28,7 @@
       reason: string | null,
     }
 
-  Toast store auto-dismisses after 4s; this component renders nothing —
+  Toast store auto-dismisses (dwell policy in stores/toast.ts); this component renders nothing —
   it is a pure side-effect mount calling `toast.success(...)` /
   `toast.error(...)` on the toast root mounted in `+layout.svelte`.
 

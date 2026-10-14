@@ -2,7 +2,7 @@
 //
 // Error-notification store — the "bell" inbox that PERSISTS error toasts.
 //
-// Why this exists: toasts auto-dismiss after 4 s (toast.ts). Important
+// Why this exists: toasts auto-dismiss (dwell policy in toast.ts). Important
 // errors (failed module install, container start failure, etc.) often
 // vanish before the user reads them. This store keeps a durable copy of
 // every error toast so the user can review them later from the bell in

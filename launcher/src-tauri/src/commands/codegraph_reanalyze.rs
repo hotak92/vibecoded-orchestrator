@@ -35,30 +35,27 @@
 //! recovers them cleanly. We discriminate progress vs final-report by
 //! checking the `final` key.
 //!
-//! ─── Timeout ─────────────────────────────────────────────────────────────
+//! ─── No wall-clock timeout ───────────────────────────────────────────────
 //!
-//! 30 minutes — large polyglot repos can take a while on first analysis,
-//! especially with Joern CFG/PDG extraction enabled. The modal's Cancel
-//! button is disabled with a "re-run is idempotent" tooltip (mirrors the
-//! enrichment modal pattern). On timeout we kill the child and surface a
-//! clean error.
+//! Deliberately NONE (owner rule 2026-10-14): no timeout may cut valid
+//! long work — a full re-analysis of a large project legitimately runs
+//! for hours, and killing a slow-but-working walk makes it look like a
+//! failure, so the user clicks again. The read loop below waits for the
+//! child however long it takes; the streamed per-file progress events
+//! ARE the liveness signal (a wedged child eventually dies on its own
+//! pipe errors). The modal's Cancel button is disabled with a "re-run is
+//! idempotent" tooltip (mirrors the enrichment modal pattern).
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::time::timeout;
 
 use crate::db::Db;
 use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ───────────────────────────────────────────────────────────
-
-/// Hard ceiling on the analyzer subprocess lifetime. 30min is the locked
-/// design number — the same as the (v0.2.102-retired) embedding_enrichment.rs had.
-const REANALYSIS_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Tauri event name re-emitted from each Python `{"progress":...}` line.
 /// The Svelte modal subscribes to this and updates the progress bar.
@@ -289,27 +286,14 @@ async fn run_reanalysis_with_stream(
         }
     };
 
-    let timed = timeout(
-        Duration::from_secs(REANALYSIS_TIMEOUT_SECS),
-        async {
-            read_fut.await;
-            child.wait().await
-        },
-    )
-    .await;
-
-    let status = match timed {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("wait analyzer: {}", e)),
-        Err(_) => {
-            let _ = child.start_kill();
-            return Err(format!(
-                "Re-analyze timed out after {}s; subprocess killed. \
-                 Re-running is safe (idempotent) — unchanged files are skipped.",
-                REANALYSIS_TIMEOUT_SECS
-            ));
-        }
-    };
+    // No wall-clock deadline (see the module doc): the wait is a bare
+    // await, however long the walk takes. The per-file progress events
+    // above are the liveness signal.
+    read_fut.await;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("wait analyzer: {}", e))?;
 
     if !status.success() {
         let stderr_text = if let Some(err_stream) = stderr {
@@ -617,5 +601,36 @@ mod tests {
         let r = report.expect("parsed");
         assert!(!r.prune_stale);
         assert_eq!(r.files_analyzed, 0);
+    }
+
+    /// v0.2.103 (field, 2026-10-14): the re-analysis wait must have NO
+    /// wall-clock kill — a 30-minute deadline was cutting valid long walks
+    /// of large projects (owner rule: never kill slow-but-working jobs; a
+    /// killed walk looks like a failure and the user clicks again).
+    ///
+    /// Pins the absence structurally (same house pattern as
+    /// `lib.rs`/`secrets_cmd.rs` self-source tests): the wait is a bare
+    /// await, so this file must contain neither the old deadline constant,
+    /// a tokio wall-clock wrapper around the wait, nor a forced kill of
+    /// the child. Split literals below so this test's own source does not
+    /// satisfy the scan.
+    #[test]
+    fn reanalysis_wait_has_no_wall_clock_kill() {
+        let src = include_str!("codegraph_reanalyze.rs");
+        let banned: [&str; 3] = [
+            // the old deadline constant name
+            concat!("REANALYSIS_", "TIMEOUT_SECS"),
+            // the tokio wrapper CALL shape (name + open paren)
+            concat!("time", "out", "("),
+            // the timeout branch's child kill
+            concat!("start_", "kill"),
+        ];
+        for needle in banned {
+            assert!(
+                !src.contains(needle),
+                "reanalyze_code_graph must not contain {:?} — no wall-clock kill on the analyzer wait",
+                needle
+            );
+        }
     }
 }

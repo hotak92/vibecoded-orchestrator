@@ -18,8 +18,8 @@
   // B's wire-up); subsequent catalog loads return
   // `dev_affordance_hint: null` and the toast stays hidden.
   //
-  // Why not reuse `Toast.svelte`: that store auto-dismisses after 4
-  // seconds. This affordance must persist until the user actively
+  // Why not reuse `Toast.svelte`: that store auto-dismisses (dwell
+  // policy in stores/toast.ts). This affordance must persist until the user actively
   // dismisses (the env var instruction needs reading time + the
   // ability to copy the path). We render in the same
   // bottom-right region so the visual language stays consistent.
