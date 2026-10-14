@@ -38,6 +38,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 import install  # noqa: E402
+from vco_lib import install_weaviate as _iw  # noqa: E402
 
 WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://localhost:8081")
 
@@ -284,8 +285,15 @@ class V46BLivePruneTest(unittest.TestCase):
         )
 
         # Run the prune with dry_run=False — this is the destructive path.
-        install._prune_stale_kg_rows(
+        # v0.2.103: call the vco_lib adapter directly with the identity
+        # pinned — via install.py's wrapper, the repo checkout this test
+        # runs from IS the orchestrator root (root ≡ shared), and the
+        # shared-identity guard correctly SKIPS the prune there.
+        _iw._prune_stale_kg_rows(
             self.test_collection, WEAVIATE_URL, dry_run=False,
+            project_root=install.PROJECT_ROOT,
+            is_orchestrator_root_install=lambda: False,
+            shared_kg_collection="",
         )
         # Batch-delete is also async; allow it to settle.
         time.sleep(0.6)
@@ -321,8 +329,11 @@ class V46BLivePruneTest(unittest.TestCase):
         seeded_count = _count_objects(self.test_collection)
         self.assertEqual(seeded_count, 2, "Seed sanity check")
 
-        install._prune_stale_kg_rows(
+        _iw._prune_stale_kg_rows(
             self.test_collection, WEAVIATE_URL, dry_run=False,
+            project_root=install.PROJECT_ROOT,
+            is_orchestrator_root_install=lambda: False,
+            shared_kg_collection="",
         )
         time.sleep(0.6)
 
@@ -373,8 +384,11 @@ class V46BLivePruneTest(unittest.TestCase):
         seeded_count = _count_objects(self.test_collection)
         self.assertEqual(seeded_count, len(stale_fps), "Seed sanity check")
 
-        install._prune_stale_kg_rows(
+        _iw._prune_stale_kg_rows(
             self.test_collection, WEAVIATE_URL, dry_run=True,
+            project_root=install.PROJECT_ROOT,
+            is_orchestrator_root_install=lambda: False,
+            shared_kg_collection="",
         )
         time.sleep(0.4)
 

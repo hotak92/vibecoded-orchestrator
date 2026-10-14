@@ -217,11 +217,15 @@ def prune_foreign_rows(
     is_shared_identity: bool = False,
     dry_run: bool = False,
     log_event: Optional[Callable[..., None]] = None,
+    log_step: str = "4.bundle.foreign_rows",
 ) -> dict:
     """Delete rows in *collection* whose ``file_path`` does not exist on disk
     under *project_root*.
 
-    See the module docstring for the guard contract. Returns a
+    See the module docstring for the guard contract. ``log_step`` is the
+    step id forwarded to ``log_event`` (the bundle-update default keeps its
+    historical value; the install-time adapter passes its own step id so the
+    forensic log names the phase that actually ran). Returns a
     JSON-serialisable dict::
 
         {
@@ -257,10 +261,10 @@ def prune_foreign_rows(
         if log_event is None:
             return
         try:
-            log_event("4.bundle.foreign_rows", phase, detail, data=data)
+            log_event(log_step, phase, detail, data=data)
         except TypeError:
             try:
-                log_event("4.bundle.foreign_rows", phase, detail)
+                log_event(log_step, phase, detail)
             except Exception:  # noqa: BLE001
                 pass
         except Exception:  # noqa: BLE001 — logging never breaks the prune

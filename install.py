@@ -10405,12 +10405,16 @@ def _prune_stale_kg_rows(
     weaviate_url: str,
     *,
     dry_run: bool | None = None,
+    shared_kg_collection: str | None = None,
 ) -> None:
     """Thin wrapper over vco_lib.install_weaviate (IN-1, v0.2.73).
 
     Threads the live ``PROJECT_ROOT``, install.py's ``_log_install_event``,
-    and ``_is_orchestrator_root_install`` (which drives the ``dry_run=None``
-    default) so behaviour is identical to the pre-extraction inline version.
+    ``_is_orchestrator_root_install`` and the resolved
+    ``SHARED_KG_COLLECTION`` name so the prune runs through the repo's ONE
+    guarded home (v0.2.103) with the shared-identity skip armed — the
+    orchestrator root's KG collection IS the shared collection, where
+    sibling projects' rows legitimately have no local file.
     """
     _install_weaviate._prune_stale_kg_rows(
         collection_name, weaviate_url,
@@ -10418,6 +10422,7 @@ def _prune_stale_kg_rows(
         project_root=PROJECT_ROOT,
         log_event=_log_install_event,
         is_orchestrator_root_install=_is_orchestrator_root_install,
+        shared_kg_collection=shared_kg_collection,
     )
 
 
@@ -14117,8 +14122,18 @@ def _seed_weaviate_impl(
     #
     # v0.2.101 item 4: an ENQUEUED (not completed) seed does not weaken this —
     # see `_prune_stale_kg_rows`'s own note. It stays on.
+    #
+    # v0.2.103: the prune itself is delegated to the repo's ONE guarded home
+    # (vco_lib.collection_repair, via the wrapper). current_shared_kg arms the
+    # shared-identity skip — on the orchestrator root the KG collection IS the
+    # shared collection, and sibling projects' shared-scope rows legitimately
+    # have no file under this root, so NOTHING is deleted there (the doctor
+    # census reports stored-only rows instead).
     if not seed_errors and current_kg_collection:
-        _prune_stale_kg_rows(current_kg_collection, weaviate_url)
+        _prune_stale_kg_rows(
+            current_kg_collection, weaviate_url,
+            shared_kg_collection=current_shared_kg,
+        )
 
     # 3. Cross-project shared KG seed (Step 7d).
     #
