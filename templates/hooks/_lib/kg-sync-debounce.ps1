@@ -22,8 +22,22 @@
 #       - A re-edit DURING the sleep window finds the lock present ->
 #         no-op; the pending flusher syncs the file. The sync command
 #         re-reads the file FROM DISK at run time -> latest content.
-#       - A re-edit AFTER the lock cleared schedules a FRESH flusher ->
-#         the post-window edit also syncs. No edit is ever lost.
+#       - A re-edit AFTER the sync FINISHED finds no lock and no claim
+#         and schedules a FRESH flusher -> the post-window edit also
+#         syncs. No edit is ever lost.
+#       - A re-edit WHILE the sync RUNS (v0.2.103 single-flight): the lock
+#         dir is gone (renamed to "<lock>.claimed.<pid>" at sync start),
+#         so the plain New-Item gate cannot see it — the field defect
+#         (2026-10-14: ONE docs edit produced FOUR concurrent
+#         sync_knowledge_graph.py children of the debounce flusher, one
+#         per re-edit, each minutes-long on a large file). The schedule
+#         path now consults Test-KgDebounceInflight: while a LIVE claim
+#         for the same key exists it creates the lock as a FOLLOW-UP
+#         marker and starts NO second sync; the running sync's child
+#         serves that marker (starts one flusher for it) after it
+#         finishes. At most ONE in-flight sync per (project, path,
+#         channel); edits during a sync coalesce into exactly one
+#         follow-up that re-reads the file fresh -> latest content.
 #   * A file edited once then left alone syncs exactly once, N seconds
 #     later. Bounded delay, never "never".
 #
@@ -341,6 +355,29 @@ if (`$cmd) {
     }
 }
 Remove-Item -LiteralPath `$claimed -Recurse -Force -ErrorAction SilentlyContinue
+# v0.2.103 SINGLE-FLIGHT follow-up serve. Edits that arrived while OUR
+# eval ran left a plain "<base>" (.lock) dir as a follow-up marker (see
+# Invoke-KgDebounceSchedule). Serve it now: start ONE flusher for it — it
+# sleeps the quiet-window, claims the lock through the same atomic
+# Move-Item and re-runs the sync, which re-reads the file fresh → the
+# latest content syncs exactly once more. ORDER MATTERS: the claim is
+# removed BEFORE this check, so any editor whose inflight probe saw our
+# claim as LIVE created its follow-up lock before our Remove-Item — and
+# therefore before this check — so it can never be missed. (An editor
+# arriving after the removal takes the ordinary schedule path; if both
+# happen the two flushers claim the same lock via the atomic Move-Item
+# and exactly one runs — no double sync.)
+`$lockDir = Join-Path `$st `$base
+if (`$dbLib -and (Test-Path -LiteralPath `$dbLib) -and (Test-Path -LiteralPath `$lockDir -PathType Container)) {
+    try {
+        . `$dbLib
+        # NOTE: single line on purpose — a backtick line-continuation
+        # inside this EXPANDING here-string is emitted as a newline in the
+        # child script, which would split the command ("-LockPath is not
+        # recognized") and silently drop the follow-up sync.
+        Start-KgDebounceFlusher -SleepSeconds (Get-KgDebounceWindow) -LockPath `$lockDir -StateDir `$st -Base `$base
+    } catch { }
+}
 "@
 }
 
@@ -421,6 +458,34 @@ function Get-KgDebounceWindow {
 function Get-KgDebounceDir {
     param([string]$ProjectRoot)
     return (Join-Path $ProjectRoot ".claude/state/kg_sync_pending")
+}
+
+# v0.2.103 SINGLE-FLIGHT PROBE: is a sync for this lock key IN FLIGHT right
+# now? A claim dir "<base>.claimed.<pid>" whose pid is ALIVE is a sync in
+# progress (each detached child is its own OS process, so $PID is
+# liveness-accurate — see the note on $PID above). A "<base>.reaping.<token>"
+# dir is the microsecond claim transition — treat any as in flight. A claim
+# whose pid is DEAD is NOT in flight (crash residual; Sweep B recovers it
+# separately), so a dead claim never blocks a fresh schedule.
+# MUST MATCH _kg_debounce_inflight in _lib/kg-sync-debounce.sh.
+function Test-KgDebounceInflight {
+    param([string]$StateDir, [string]$Base)
+    if (-not $StateDir -or -not $Base) { return $false }
+    # The base name is "<chan>_<md5hex>.lock" — hex + underscore + dots,
+    # never a -Filter wildcard character, so embedding it is safe.
+    $claims = @(Get-ChildItem -LiteralPath $StateDir -Directory `
+        -Filter "$Base.claimed.*" -ErrorAction SilentlyContinue)
+    foreach ($c in $claims) {
+        if ($c.Name -match '\.claimed\.([0-9]+)$') {
+            if (Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue) {
+                return $true
+            }
+        }
+    }
+    $reapings = @(Get-ChildItem -LiteralPath $StateDir -Directory `
+        -Filter "$Base.reaping.*" -ErrorAction SilentlyContinue)
+    if ($reapings.Count -gt 0) { return $true }
+    return $false
 }
 
 # Hash a file path → slash-free lock key (MD5 hex), matching the bash
@@ -533,6 +598,12 @@ function Invoke-KgDebounceReapStale {
         $age = ($now - $lock.LastWriteTime).TotalSeconds
         if ($age -ge $grace) {
             $base = $lock.Name                          # "kg_<md5>.lock"
+            # v0.2.103 SINGLE-FLIGHT: a follow-up lock parked while a sync
+            # of its key RUNS is not an orphan — it can legitimately
+            # outlive the grace window on a long sync, and reaping it would
+            # start a SECOND concurrent sync of the same path. The running
+            # sync's child serves it at sync end. MIRRORS the bash sibling.
+            if (Test-KgDebounceInflight -StateDir $dir -Base $base) { continue }
             $tok  = "{0}.{1}" -f $PID, (Get-Random)
             $won  = $lock.FullName + '.reaping.' + $tok
             # ATOMIC CLAIM: Move-Item on NTFS same-dir is atomic and throws
@@ -638,6 +709,45 @@ function Invoke-KgDebounceSchedule {
         return
     }
 
+    $key = "${Channel}_" + (Get-KgDebounceKey -Path $FilePath)
+    $lock = Join-Path $dir "$key.lock"
+    $base = "$key.lock"
+
+    # v0.2.103 SINGLE-FLIGHT: if a sync of THIS (path, channel) is already
+    # running, never start a second one (field defect 2026-10-14: one docs
+    # edit produced FOUR concurrent sync children, one per re-edit during a
+    # minutes-long sync — the New-Item gate below cannot see the in-flight
+    # claim because the lock was renamed at sync start). Instead record a
+    # FOLLOW-UP: the plain lock dir itself, cmd included, which the running
+    # sync's child serves (one flusher) when it finishes. This branch runs
+    # BEFORE the flusher ceiling on purpose — a follow-up lock starts NO
+    # process now, so it cannot inflate the sleeper population the ceiling
+    # bounds (it merely counts toward other keys' ceiling checks, which is
+    # correct: it is real pending work). MIRRORS the bash sibling.
+    if (Test-KgDebounceInflight -StateDir $dir -Base $base) {
+        $followupClaimed = $false
+        try {
+            New-Item -ItemType Directory -Path $lock -ErrorAction Stop | Out-Null
+            $followupClaimed = $true
+        } catch { }   # lock already held → a follow-up exists → coalesced
+        if ($followupClaimed) {
+            try {
+                Set-VcoUtf8Content -Path (Join-Path $lock "cmd") `
+                    -Value ("{0}`t{1}" -f $WorkingDir, $Command)
+            } catch { }
+            # Finish-race re-check: if the claim vanished between the probe
+            # and the New-Item, the runner may already have looked for (and
+            # missed) our follow-up lock. Serve it ourselves. If the runner
+            # DID see it, both flushers claim the same lock via the atomic
+            # Move-Item and exactly one runs — no double sync.
+            if (-not (Test-KgDebounceInflight -StateDir $dir -Base $base)) {
+                Start-KgDebounceFlusher -SleepSeconds $window -LockPath $lock `
+                    -StateDir $dir -Base $base
+            }
+        }
+        return
+    }
+
     # Item 2a (flusher cap): if too many flushers are already pending (one
     # ".lock" dir each), stop ACCUMULATING sleeping flusher processes and
     # instead sync THIS edit immediately (detached) in the background.
@@ -649,9 +759,6 @@ function Invoke-KgDebounceSchedule {
         Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command -Channel $Channel
         return
     }
-
-    $key = "${Channel}_" + (Get-KgDebounceKey -Path $FilePath)
-    $lock = Join-Path $dir "$key.lock"
 
     # Atomic claim: New-Item -ItemType Directory throws if it already
     # exists, so exactly one racer wins; the loser is a coalesced no-op.

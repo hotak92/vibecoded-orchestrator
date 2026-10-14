@@ -29,9 +29,22 @@
 #         path fresh; code-graph analyzer diffs HEAD~1..HEAD fresh), so
 #         it picks up the LATEST content, not the content at schedule
 #         time. -> latest state syncs exactly once.
-#       - A re-edit AFTER the lock cleared (i.e. the sync already started
-#         or finished) finds no lock and schedules a FRESH flusher. ->
-#         the post-window edit also syncs. No edit is ever lost.
+#       - A re-edit AFTER the sync FINISHED finds no lock and no claim and
+#         schedules a FRESH flusher. -> the post-window edit also syncs. No
+#         edit is ever lost.
+#       - A re-edit WHILE the sync RUNS (v0.2.103 single-flight): the lock
+#         dir is gone (renamed to "<lock>.claimed.<pid>" at sync start),
+#         so the plain mkdir gate cannot see it — the field defect
+#         (2026-10-14: ONE docs edit produced FOUR concurrent
+#         sync_knowledge_graph.py children of the debounce flusher, one
+#         per re-edit, each minutes-long on a large file). The schedule
+#         path now consults `_kg_debounce_inflight`: while a LIVE claim
+#         for the same key exists it creates the `.lock` as a FOLLOW-UP
+#         marker and spawns NO second sync; the running sync's runner
+#         serves that marker (spawns one flusher for it) after it
+#         finishes. At most ONE in-flight sync per (project, path,
+#         channel); edits during a sync coalesce into exactly one
+#         follow-up that re-reads the file fresh -> latest content.
 #   * A file edited once and then left alone syncs exactly once, N
 #     seconds after the edit. Bounded delay, never "never".
 #
@@ -221,14 +234,54 @@ _kg_debounce_mtime() {
 
 # Real PID of the current process, portably. In a backgrounded subshell
 # `$$` is the PARENT shell's pid, so it is useless for a liveness check on
-# the actual eval-runner. bash exposes the subshell's true pid as BASHPID;
-# the POSIX fallback reads it via a child sh whose $PPID == us.
+# the actual eval-runner. bash exposes the subshell's true pid as BASHPID.
+#
+# v0.2.103: the helper now SETS _KG_DEBOUNCE_REALPID instead of printing.
+# The previous print-shape forced callers into `_rp=$(... )`, and a command
+# substitution forks its OWN child — BASHPID inside it was the short-lived
+# substitution child's pid, not the runner subshell's, so every
+# ".claimed.<pid>" was stamped with a pid that died within milliseconds.
+# That silently defeated BOTH liveness consumers: the reaper's Sweep B
+# could "recover" a claim whose sync was still running (a second
+# concurrent sync after grace on any sync slower than window+30s), and the
+# v0.2.103 single-flight probe could not see a running sync at all.
+# Setting a variable costs no fork and reports the TRUE runner pid.
+# POSIX-sh fallback (no BASHPID): $$ — in the detached-flusher path that is
+# the flusher shell, which stays alive in `wait` for the whole sync, so
+# liveness still tracks the sync; the rare in-process fallback path may
+# stamp an already-exited parent, degrading to the pre-v0.2.103 behaviour.
 _kg_debounce_realpid() {
     if [ -n "${BASHPID:-}" ]; then
-        printf '%s' "$BASHPID"
+        _KG_DEBOUNCE_REALPID="$BASHPID"
     else
-        sh -c 'echo "$PPID"' 2>/dev/null || printf '%s' "$$"
+        _KG_DEBOUNCE_REALPID="$$"
     fi
+}
+
+# v0.2.103 SINGLE-FLIGHT PROBE: is a sync for this lock key IN FLIGHT right
+# now? A claim dir "<base>.claimed.<pid>" whose pid is ALIVE is a sync in
+# progress (the runner subshell stamped its own real pid and lives for the
+# whole eval — `_kg_debounce_run_claimed`). A "<base>.reaping.<token>" dir
+# is the microsecond claim transition — treat any as in flight. A claim
+# whose pid is DEAD is NOT in flight (crash residual; Sweep B recovers it
+# separately), so a dead claim never blocks a fresh schedule.
+# MUST MATCH Test-KgDebounceInflight in _lib/kg-sync-debounce.ps1.
+#   $1 = state dir, $2 = lock base name ("kg_<md5>.lock")
+_kg_debounce_inflight() {
+    local dir="$1" base="$2" d pid
+    for d in "$dir/$base.claimed."*; do
+        [ -e "$d" ] || continue
+        pid="${d##*.claimed.}"
+        case "$pid" in
+            ''|*[!0-9]*) ;;                    # malformed → no liveness info
+            *) kill -0 "$pid" 2>/dev/null && return 0 ;;
+        esac
+    done
+    for d in "$dir/$base.reaping."*; do
+        [ -e "$d" ] || continue
+        return 0                              # claim transition in progress
+    done
+    return 1
 }
 
 # ─── failure visibility (v0.2.95) ──────────────────────────────────────────
@@ -415,7 +468,10 @@ _kg_debounce_run_cmd() {
 _kg_debounce_run_claimed() {
     local won="$1" dir="$2" base="$3"
     (
-        _rp=$(_kg_debounce_realpid)
+        # v0.2.103: variable-set shape (no command substitution — see
+        # _kg_debounce_realpid) so the stamp is the runner's TRUE pid.
+        _kg_debounce_realpid
+        _rp="$_KG_DEBOUNCE_REALPID"
         _claimed="$dir/$base.claimed.$_rp"
         # Re-stamp to our real pid. If the rename fails (extremely unlikely
         # — we already own $won), fall back to running from $won directly
@@ -447,6 +503,22 @@ _kg_debounce_run_claimed() {
         # leaves a recoverable ".claimed.<realpid>" behind (Sweep B
         # recovers it) rather than dropping the sync.
         rm -rf "$_claimed" 2>/dev/null || true
+        # v0.2.103 SINGLE-FLIGHT follow-up serve. Edits that arrived while
+        # OUR eval ran left a plain "<base>" (.lock) dir as a follow-up
+        # marker (see _kg_debounce_schedule). Serve it now: spawn ONE
+        # flusher for it — it sleeps the quiet-window, claims the lock via
+        # the same atomic rename and re-runs the sync, which re-reads the
+        # file fresh → the latest content syncs exactly once more. ORDER
+        # MATTERS: the claim is removed BEFORE this check, so any editor
+        # whose inflight probe saw our claim as LIVE created its follow-up
+        # lock before our rm — and therefore before this check — so it can
+        # never be missed. (An editor arriving after the rm takes the
+        # ordinary schedule path and spawns its own flusher; if both
+        # happen the two flushers claim the same lock via the atomic
+        # rename and exactly one runs — no double sync.)
+        if [ -d "$dir/$base" ]; then
+            _kg_debounce_spawn_flusher "$(_kg_debounce_window)" "$dir/$base" "$dir" "$base"
+        fi
     ) &
 }
 
@@ -632,6 +704,16 @@ _kg_debounce_reap_stale() {
     for lock in "$dir"/*.lock; do
         # No-glob-match → literal pattern; skip.
         [ -e "$lock" ] || continue
+        base=$(basename "$lock")                 # e.g. "kg_<md5>.lock"
+        # v0.2.103 SINGLE-FLIGHT: a follow-up lock parked while a sync of
+        # its key RUNS is not an orphan — it can legitimately outlive the
+        # grace window on a long sync, and reaping it would start a SECOND
+        # concurrent sync of the same path. The running sync's runner
+        # serves it at sync end. (A DEAD claim does not block: the lock is
+        # then recovered here as usual.)
+        if _kg_debounce_inflight "$dir" "$base"; then
+            continue
+        fi
         mtime=$(_kg_debounce_mtime "$lock" "$now")
         age=$(( now - mtime ))
         if [ "$age" -ge "$grace" ]; then
@@ -642,7 +724,6 @@ _kg_debounce_reap_stale() {
             # (source gone) and skips. This is the single point that makes
             # double-recovery impossible — replacing the old read-cmd-then-
             # rm order whose comment promised this but did not deliver it.
-            base=$(basename "$lock")                 # e.g. "kg_<md5>.lock"
             won="$lock.reaping.$(_kg_debounce_claimtok)"
             if mv "$lock" "$won" 2>/dev/null; then
                 # Refresh mtime to NOW: rename preserves the (backdated)
@@ -734,7 +815,7 @@ _kg_debounce_reap_stale() {
 # When N==0, runs the sync immediately in the background (debounce off).
 _kg_debounce_schedule() {
     local proot="$1" fpath="$2" py="$3" wd="$4" cmd="$5" chan="${6:-kg}"
-    local window dir key lock lock_count
+    local window dir key lock base lock_count
 
     window="$(_kg_debounce_window)"
 
@@ -772,6 +853,38 @@ _kg_debounce_schedule() {
         return 0
     }
 
+    key="${chan}_$(_kg_debounce_key "$fpath" "$py")"
+    lock="$dir/$key.lock"
+    base="$key.lock"
+
+    # v0.2.103 SINGLE-FLIGHT: if a sync of THIS (path, channel) is already
+    # running, never start a second one (field defect 2026-10-14: one docs
+    # edit produced FOUR concurrent sync children, one per re-edit during a
+    # minutes-long sync — the mkdir gate below cannot see the in-flight
+    # claim because the lock was renamed at sync start). Instead record a
+    # FOLLOW-UP: the plain ".lock" dir itself, cmd included, which the
+    # running sync's runner serves (one flusher) when it finishes. This
+    # branch runs BEFORE the flusher ceiling on purpose — a follow-up lock
+    # spawns NO process now, so it cannot inflate the sleeper population
+    # the ceiling bounds (it merely counts toward other keys' ceiling
+    # checks, which is correct: it is real pending work).
+    if _kg_debounce_inflight "$dir" "$base"; then
+        if mkdir "$lock" 2>/dev/null; then
+            printf '%s\t%s\n' "$wd" "$cmd" > "$lock/cmd" 2>/dev/null || true
+            # Finish-race re-check: if the claim vanished between the probe
+            # and the mkdir, the runner may already have looked for (and
+            # missed) our follow-up lock. Serve it ourselves. If the runner
+            # DID see it, both flushers claim the same lock via the atomic
+            # rename and exactly one runs — no double sync.
+            if ! _kg_debounce_inflight "$dir" "$base"; then
+                _kg_debounce_spawn_flusher "$window" "$lock" "$dir" "$base"
+            fi
+        fi
+        # else: a follow-up lock already exists → this edit coalesces into
+        # it (the served flusher re-reads the file from disk → latest).
+        return 0
+    fi
+
     # Item 2a (flusher cap): if too many flushers are already pending
     # (one ".lock" dir each), stop ACCUMULATING sleeping flusher subshells
     # and instead sync THIS edit immediately in the (detached) background.
@@ -792,17 +905,12 @@ _kg_debounce_schedule() {
         return 0
     fi
 
-    key="${chan}_$(_kg_debounce_key "$fpath" "$py")"
-    lock="$dir/$key.lock"
-
     # Atomic claim: mkdir succeeds for exactly one racer; the loser sees
     # a non-zero exit and treats the edit as coalesced into the pending
     # flush (no-op).
     if mkdir "$lock" 2>/dev/null; then
         # Record the command so a reaper can recover it if we die.
         printf '%s\t%s\n' "$wd" "$cmd" > "$lock/cmd" 2>/dev/null || true
-        local base
-        base="$(basename "$lock")"   # "<chan>_<md5>.lock"
         # Spawn the single flusher DETACHED from the hook's process group
         # (Item 1): it sleeps the quiet-window, then claims its own lock via
         # the SAME atomic rename the reaper uses and recovers it through the

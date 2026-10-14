@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Behavioural guard for the v0.2.65 Track B debounce-hardening pass.
+"""Behavioural guard for the v0.2.65 Track B debounce-hardening pass, the
+v0.2.103 single-flight fix, and their shared invariants.
 
-Covers Items 1+2 of the kg-sync-debounce hardening:
+Covers:
 
   * Item 2a (flusher cap): when too many ".lock" dirs are already pending
     (the ceiling, 64), a fresh schedule call must NOT add a 65th sleeping
@@ -17,13 +18,19 @@ Covers Items 1+2 of the kg-sync-debounce hardening:
     throttle window the orphan is recovered (coalesce-NEVER-DROP holds —
     recovery is only delayed, never skipped).
 
+  * v0.2.103 SINGLE-FLIGHT (field defect 2026-10-14: ONE edit of a docs
+    file produced FOUR concurrent `sync_knowledge_graph.py` children of
+    the debounce flusher, one per re-edit during a minutes-long sync).
+    At most ONE in-flight sync per (project, path, channel): re-edits
+    arriving while a sync runs are coalesced into exactly ONE follow-up
+    sync that re-reads the file from disk (latest content, never lost);
+    different paths keep syncing independently. The reaper must not
+    "recover" a follow-up lock whose sync is still running.
+
 The test sources the production `_lib/kg-sync-debounce.sh` directly and
 drives `_kg_debounce_schedule` / `_kg_debounce_reap_stale` with a sync
 command that just appends a marker to a log file (no Weaviate, no venv).
-
-Linux/macOS-only: the `.ps1` sibling carries the identical logic (verified
-structurally by the hook body-parity suite + the shared "MUST MATCH"
-ceiling/throttle constants); an end-to-end pwsh run isn't in budget here.
+The .ps1 sibling is driven end-to-end the same way when pwsh exists.
 """
 from __future__ import annotations
 
@@ -38,6 +45,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB = REPO_ROOT / "templates" / "hooks" / "_lib" / "kg-sync-debounce.sh"
+LIB_PS1 = REPO_ROOT / "templates" / "hooks" / "_lib" / "kg-sync-debounce.ps1"
 
 # Keep in step with the constants in the lib (and the .ps1 sibling).
 CEILING = 64
@@ -184,3 +192,276 @@ def test_normal_schedule_flushes_once(proj: Path, tmp_path: Path):
     assert res.returncode == 0, res.stderr
     assert _wait_for(out, timeout=8.0), "normal debounce must flush once"
     assert out.read_text().count("SYNCED") == 1
+
+
+# ─── v0.2.103 single-flight (field defect 2026-10-14) ─────────────────────
+#
+# The defect: while a sync of a path RAN (lock renamed to ".claimed.<pid>"
+# at sync START), every re-edit of that path found the ".lock" absent,
+# won the mkdir gate and spawned its OWN flusher → one concurrent sync per
+# re-edit. These tests reproduce that (red on the pre-fix lib) and pin the
+# fix: peak concurrency 1, exactly one follow-up, latest content, and
+# independent behaviour across different paths.
+
+
+def _schedule(proj: Path, fpath: str, cmd: str, window: int = 1,
+              chan: str = "kg") -> subprocess.CompletedProcess:
+    script = textwrap.dedent(
+        f"""
+        set -u
+        . "{LIB}"
+        VCO_KG_SYNC_DEBOUNCE_SECONDS={window} _kg_debounce_schedule \\
+            "{proj}" "{fpath}" "$(command -v python3)" \\
+            "{proj}" "{cmd}" "{chan}"
+        """
+    )
+    return _run(script, cwd=proj)
+
+
+def _wait_for_line(path: Path, needle: str, timeout: float = 15.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if path.exists() and needle in path.read_text():
+            return True
+        time.sleep(0.1)
+    return path.exists() and needle in path.read_text()
+
+
+def _wait_quiesce(pend: Path, timeout: float = 25.0) -> None:
+    """Wait until no pending lock/claim/reaping DIR is left."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not pend.exists() or not any(p.is_dir() for p in pend.iterdir()):
+            return
+        time.sleep(0.2)
+
+
+def _max_concurrency(log: Path) -> tuple:
+    """(peak concurrent syncs, total syncs) from a START/END event log."""
+    running = peak = starts = 0
+    for line in log.read_text().splitlines():
+        if line == "START":
+            running += 1
+            starts += 1
+            if running > peak:
+                peak = running
+        elif line == "END":
+            running -= 1
+    return peak, starts
+
+
+def test_singleflight_reedit_during_sync_never_runs_concurrently(proj: Path, tmp_path: Path):
+    """THE defect repro: N re-edits of one path while its sync runs must
+    NOT start N concurrent syncs — exactly one follow-up runs after the
+    first finishes (peak concurrency 1, 2 syncs total)."""
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    out = tmp_path / "sf.log"
+    fpath = f"{proj}/docs/page.md"
+    cmd = f"echo START >> {out}; sleep 4; echo END >> {out}"
+
+    res = _schedule(proj, fpath, cmd, window=1)
+    assert res.returncode == 0, res.stderr
+    assert _wait_for_line(out, "START"), "first sync must start"
+
+    # Three re-edits of the SAME path while sync #1 runs (it sleeps 4s).
+    # Pre-fix each of these spawned its own flusher → its own concurrent
+    # sync (the 2026-10-14 field report: 4 syncs within ~45 s).
+    for _ in range(3):
+        r = _schedule(proj, fpath, cmd, window=1)
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.8)
+
+    _wait_quiesce(pend, timeout=30.0)
+    # Let any (erroneously) still-running sync append its END so the count
+    # is complete, then re-read.
+    time.sleep(1.0)
+    peak, starts = _max_concurrency(out)
+    assert starts == 2, (
+        f"re-edits during a sync must coalesce into exactly ONE follow-up "
+        f"(2 syncs total), got {starts}"
+    )
+    assert peak == 1, (
+        f"at most one in-flight sync per path — observed {peak} concurrent"
+    )
+
+
+def test_singleflight_followup_syncs_the_latest_content(proj: Path, tmp_path: Path):
+    """The follow-up re-reads the file from disk: an edit that landed
+    after the running sync READ the file is carried by exactly one
+    follow-up sync (content never dropped, never duplicated)."""
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    out = tmp_path / "late.log"
+    doc = tmp_path / "doc.md"
+    fpath = f"{proj}/docs/late.md"
+    # sleep 1 → cat → sleep 2: a 3s sync whose read happens in the middle,
+    # so a write at t≈2.5 lands AFTER the read but BEFORE the sync ends.
+    cmd = f"sleep 1; cat {doc} >> {out}; sleep 2"
+
+    doc.write_text("A\n")
+    res = _schedule(proj, fpath, cmd, window=1)
+    assert res.returncode == 0, res.stderr
+    assert _wait_for_line(out, "A"), "first sync must read and record A"
+
+    # The "edit": new content on disk + a schedule call while sync #1 is
+    # still inside its trailing sleep (claim live).
+    doc.write_text("B\n")
+    r = _schedule(proj, fpath, cmd, window=1)
+    assert r.returncode == 0, r.stderr
+
+    _wait_quiesce(pend, timeout=30.0)
+    time.sleep(1.0)
+    lines = [ln.strip() for ln in out.read_text().splitlines() if ln.strip()]
+    assert lines == ["A", "B"], (
+        f"exactly one follow-up carrying the LATEST content: got {lines}"
+    )
+
+
+def test_singleflight_different_paths_stay_independent(proj: Path, tmp_path: Path):
+    """Single-flight is per (path, channel): two different files sync
+    concurrently — the fix must not serialise unrelated paths."""
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    log = tmp_path / "par.log"
+
+    def cmd(tag: str) -> str:
+        # \\$(...) — the substitution must run at SYNC time (inside the
+        # flusher's eval), not at schedule time (the outer double quotes).
+        return (
+            f"echo {tag}-START \\$(date +%s.%N) >> {log}; "
+            f"sleep 3; "
+            f"echo {tag}-END \\$(date +%s.%N) >> {log}"
+        )
+
+    for tag, rel in (("A", "docs/alpha.md"), ("B", "docs/beta.md")):
+        res = _schedule(proj, f"{proj}/{rel}", cmd(tag), window=1)
+        assert res.returncode == 0, res.stderr
+
+    _wait_quiesce(pend, timeout=30.0)
+    time.sleep(1.0)
+    spans = {}
+    counts = {}
+    for line in log.read_text().splitlines():
+        parts = line.split()
+        tag, kind = parts[0].rsplit("-", 1)   # "A-START" → ("A", "START")
+        ts = float(parts[1])
+        spans.setdefault(tag, {})[kind] = ts
+        counts[tag] = counts.get(tag, 0) + 1
+    assert counts == {"A": 2, "B": 2}, f"each path synced exactly once: {counts}"
+    overlap = (min(spans["A"]["END"], spans["B"]["END"])
+               - max(spans["A"]["START"], spans["B"]["START"]))
+    assert overlap > 0, (
+        f"independent paths must sync in parallel (overlap={overlap}s)"
+    )
+
+
+def test_singleflight_reaper_leaves_a_followup_whose_sync_runs(proj: Path, tmp_path: Path):
+    """A follow-up ".lock" older than grace whose key has a LIVE claim is
+    NOT an orphan: reaping it would start a second concurrent sync. The
+    reaper must skip it (the running sync's runner serves it at sync end)."""
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    reaplog = tmp_path / "reap.log"
+    script = textwrap.dedent(
+        f"""
+        set -u
+        . "{LIB}"
+        NOW=$(date +%s)
+        printf '%s' "$((NOW - {THROTTLE} - 5))" > "{pend}/.last_reap.ts"
+        sleep 60 &
+        LIVE_PID=$!
+        base="kg_deadbeef.lock"
+        mkdir -p "{pend}/$base"
+        printf '%s\\t%s\\n' "{proj}" "echo REAPED >> {reaplog}" > "{pend}/$base/cmd"
+        # A LIVE in-flight claim for the same key (sync running now).
+        mkdir -p "{pend}/$base.claimed.$LIVE_PID"
+        # Backdate both well past grace: age alone would trip Sweep A.
+        touch -d '2000-01-01' "{pend}/$base" "{pend}/$base.claimed.$LIVE_PID" 2>/dev/null \\
+            || touch -t 200001010000 "{pend}/$base" "{pend}/$base.claimed.$LIVE_PID"
+        _kg_debounce_reap_stale "{proj}"
+        if [ -d "{pend}/$base" ]; then echo LOCK_PRESENT; else echo LOCK_GONE; fi
+        kill "$LIVE_PID" 2>/dev/null
+        wait "$LIVE_PID" 2>/dev/null
+        exit 0
+        """
+    )
+    res = _run(script, cwd=proj)
+    assert res.returncode == 0, res.stderr
+    assert "LOCK_PRESENT" in res.stdout, (
+        "reaper must not claim a follow-up lock whose sync still runs"
+    )
+    time.sleep(1.0)  # catch any erroneously-spawned reaper runner
+    assert not reaplog.exists(), "no second sync may be started by the reaper"
+
+
+# ─── v0.2.103 single-flight — .ps1 sibling end-to-end ──────────────────────
+#
+# The .ps1 lib carries the identical semantics (MUST MATCH). When pwsh is
+# present we drive it end-to-end the same way as the .sh: schedule a slow
+# sync, re-edit the same path while it runs, assert peak concurrency 1 and
+# exactly one follow-up.
+
+
+def _has_pwsh() -> bool:
+    return shutil.which("pwsh") is not None
+
+
+@pytest.mark.skipif(not _has_pwsh(), reason="pwsh not on PATH")
+def test_ps1_singleflight_reedit_during_sync_never_runs_concurrently(proj: Path, tmp_path: Path):
+    from tests.common.pwsh import PWSH_BASE_FLAGS
+    exe = shutil.which("pwsh")
+    assert exe is not None  # guaranteed by the skipif; narrows for pyright
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    out = tmp_path / "sfps.log"
+    fpath = f"{proj}/docs/page.md"
+    # In PowerShell `echo` is Write-Output, `sleep` is Start-Sleep, and
+    # `>>` appends — the same fake-slow-sync marker shape as the .sh test.
+    # The fake sync sleeps 8s (vs 4s in the .sh test) because each pwsh
+    # invocation costs ~1.5-2s of startup: the three re-edit schedule
+    # calls must all land while sync #1 still runs.
+    cmd = f"echo START >> '{out}'; sleep 8; echo END >> '{out}'"
+
+    def schedule() -> subprocess.CompletedProcess:
+        # The -Command value is a PS DOUBLE-quoted string: single quotes in
+        # the cmd need no escaping there (only " ` $ would, and the fake
+        # sync cmd carries none).
+        script = (
+            f". '{LIB_PS1}'\n"
+            f"$env:VCO_KG_SYNC_DEBOUNCE_SECONDS = '1'\n"
+            f"Invoke-KgDebounceSchedule -ProjectRoot '{proj}' "
+            f"-FilePath '{fpath}' -WorkingDir '{proj}' "
+            f"-Command \"{cmd}\" -Channel 'kg'\n"
+        )
+        return subprocess.run(
+            [exe, *PWSH_BASE_FLAGS, "-Command", script],
+            cwd=str(proj),
+            # NOT capture_output: Start-VcoDetachedProcess redirects nothing
+            # on POSIX, so the detached flusher child INHERITS this pipe and
+            # a captured call would block until the whole sync finishes —
+            # exactly what the single-flight test must not do. /dev/null
+            # releases the parent immediately.
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=90,
+        )
+
+    res = schedule()
+    assert res.returncode == 0, res.stderr
+    assert _wait_for_line(out, "START"), "first sync must start"
+
+    for _ in range(3):
+        r = schedule()
+        assert r.returncode == 0, r.stderr
+        time.sleep(0.8)
+
+    _wait_quiesce(pend, timeout=45.0)
+    time.sleep(1.0)
+    peak, starts = _max_concurrency(out)
+    assert starts == 2, (
+        f"[ps1] re-edits during a sync must coalesce into exactly ONE "
+        f"follow-up (2 syncs total), got {starts}"
+    )
+    assert peak == 1, (
+        f"[ps1] at most one in-flight sync per path — observed {peak} concurrent"
+    )
