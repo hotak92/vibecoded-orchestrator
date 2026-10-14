@@ -344,6 +344,13 @@ class TranscriptScanner:
             # the whole file on a hook's time budget.
             offset = max(0, size - self.tail_scan_bytes)
         result.start_offset_used = offset
+        # Nothing consumed yet ⇒ the resume point is where this scan STARTED,
+        # never 0: a scan that begins at EOF (a KG-write PostToolUse right after
+        # a prompt scan) or meets only a mid-write final line must hand back its
+        # own start. Defaulting to 0 made the hook persist scan_offset=0, so the
+        # next scan re-counted the whole transcript ON TOP of the cumulative
+        # and a fresh KG write no longer silenced the nudge (2026-10-14 report).
+        result.end_offset = offset
 
         try:
             with open(path, "rb") as f:
