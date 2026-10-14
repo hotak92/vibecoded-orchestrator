@@ -1042,46 +1042,20 @@ where
 }
 
 /// Resolve `python` to use for the analyzer. Mirrors
-/// `codegraph_reanalyze::resolve_python_for_analyzer`. Walks up from
-/// the launcher binary looking for a `.venv`; falls back to
-/// `python3` / `python.exe` on PATH.
+/// `codegraph_reanalyze::resolve_python_for_analyzer`.
+///
+/// v0.2.103: REALLY delegates to the shared RT-4 ladder now
+/// (`vct_launcher_core::python_resolve::resolve_python_for_vco_lib`) — the
+/// spawn below routes through `-m vco_lib.codegraph_walk` (the per-project
+/// walk single-flight claim), whose module must be importable by the chosen
+/// interpreter, and the ladder is the one home that resolves exactly such an
+/// interpreter. The previous inline exe-walk claimed this docstring's
+/// mirror but lacked the `$VCT_VENV` / env-root tiers, and its bare
+/// `python3` last resort could import neither `vco_lib` nor `weaviate` —
+/// it only ever produced a walk that died on import. A clean "no
+/// interpreter" refusal replaces that dead spawn.
 fn resolve_python_for_analyzer() -> Option<PathBuf> {
-    let venv_in = |root: &Path| -> Option<PathBuf> {
-        for layout in [
-            root.join(".venv"),
-            root.join("claude_mcp_servers").join(".venv"),
-        ] {
-            for candidate in [
-                layout.join("bin").join("python"),
-                layout.join("bin").join("python3"),
-                layout.join("Scripts").join("python.exe"),
-            ] {
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
-    };
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let mut cur = parent.to_path_buf();
-            for _ in 0..8 {
-                if let Some(py) = venv_in(&cur) {
-                    return Some(py);
-                }
-                if !cur.pop() {
-                    break;
-                }
-            }
-        }
-    }
-    Some(PathBuf::from(if cfg!(target_os = "windows") {
-        "python.exe"
-    } else {
-        "python3"
-    }))
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
 }
 
 /// Resolve `analyze_code_graph.py`. Tries the project folder first,
@@ -1116,6 +1090,41 @@ fn resolve_analyzer_script(project_folder: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Build the analyzer spawn for an extra-path sync.
+///
+/// v0.2.103: the analyzer is spawned THROUGH the per-project walk
+/// single-flight claim (`-m vco_lib.codegraph_walk`, the Python SSOT —
+/// [`vct_launcher_core::process::claimed_walk_args`]). The sync argv carries
+/// `--project <prefix>` (the project's own codegraph prefix), so the claim
+/// serializes this sync against a full build / Re-analyze / resync-driver
+/// walk of the SAME project — the 2026-10-14 twin-walk defect. A refusal
+/// exits 75 and maps to the "already running" message below, not a failure.
+/// The claim module re-spawns the analyzer under `sys.executable` with
+/// inherited stdio, so `--json-progress` streaming is unaffected.
+/// Extracted from `run_analyzer_with_stream` so a unit test can inspect the
+/// argv hop (`tokio::process::Command::as_std`).
+fn build_extras_analyzer_command(
+    python: &Path,
+    script: &Path,
+    args: &[String],
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(python).silent();
+    cmd.args(vct_launcher_core::process::claimed_walk_args(script));
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 /// Spawn the analyzer, stream progress events to the GUI, parse the
 /// final-report line, and return it. Mirrors the
 /// `run_reanalysis_with_stream` pattern in
@@ -1136,20 +1145,7 @@ async fn run_analyzer_with_stream(
             .to_string()
     })?;
 
-    let mut cmd = tokio::process::Command::new(&python).silent();
-    cmd.arg(&script);
-    for a in args {
-        cmd.arg(a);
-    }
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
+    let mut cmd = build_extras_analyzer_command(&python, &script, args);
 
     let mut child = cmd
         .spawn()
@@ -1197,6 +1193,12 @@ async fn run_analyzer_with_stream(
     };
 
     if !status.success() {
+        // v0.2.103: the walk-claim refusal is not a failure — the project's
+        // code graph is already being walked; say so (the Sync button's
+        // error surface shows this sentence).
+        if vct_launcher_core::process::is_walk_already_running(&status) {
+            return Err(vct_launcher_core::process::walk_already_running_message());
+        }
         let stderr_text = if let Some(err_stream) = stderr {
             read_stderr_capped(err_stream, 2048).await
         } else {
@@ -1302,6 +1304,46 @@ mod tests {
         assert!(err.contains("empty"), "got: {}", err);
         let err = canonicalise_for_storage("   ").unwrap_err();
         assert!(err.contains("empty"), "got: {}", err);
+    }
+
+    // ─── v0.2.103: walk single-flight claim ──────────────────────────────
+
+    #[test]
+    fn extras_analyzer_command_routes_through_the_walk_claim() {
+        let python = Path::new("/venv/bin/python");
+        let script = Path::new("/x/.claude/scripts/analyze_code_graph.py");
+        let sync_args = vec![
+            "/extra/checkout".to_string(),
+            "--project".to_string(),
+            "Acme".to_string(),
+            "--json-progress".to_string(),
+            "--as-extra-path".to_string(),
+        ];
+        let cmd = build_extras_analyzer_command(python, script, &sync_args);
+        let std_cmd = cmd.as_std();
+        assert_eq!(std_cmd.get_program(), std::ffi::OsStr::new("/venv/bin/python"));
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args[0], "-m", "the claim module hop comes first: {args:?}");
+        assert_eq!(args[1], "vco_lib.codegraph_walk");
+        assert_eq!(args[2], script.to_string_lossy());
+        // The sync argv follows the script, unchanged and in order.
+        assert_eq!(args[3..], sync_args[..], "analyzer args pass through verbatim");
+    }
+
+    /// Exit 75 (the vco_lib walk-claim refusal) is recognised by the shared
+    /// predicate this module's failure arm maps to the "already running"
+    /// sentence.
+    #[cfg(unix)]
+    #[test]
+    fn extras_failure_arm_recognises_the_claim_refusal() {
+        use std::os::unix::process::ExitStatusExt;
+        let refusal = std::process::ExitStatus::from_raw(75 << 8);
+        assert!(vct_launcher_core::process::is_walk_already_running(&refusal));
+        let failure = std::process::ExitStatus::from_raw(5 << 8);
+        assert!(!vct_launcher_core::process::is_walk_already_running(&failure));
     }
 
     #[test]

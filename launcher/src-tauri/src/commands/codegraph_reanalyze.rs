@@ -7,10 +7,13 @@
 //! `templates/scripts/analyze_code_graph.py`. Two responsibilities:
 //!
 //!  1. **Spawn + stream**: Run
-//!     `analyze_code_graph.py <repo> --project <name> [--language <lang>]
-//!     --prune-stale --json-progress` and re-emit each `{"progress": ...}`
-//!     line as a `vct-reanalysis-progress` Tauri event for the modal's
-//!     progress bar.
+//!     `python -m vco_lib.codegraph_walk analyze_code_graph.py <repo>
+//!     --project <name> [--language <lang>] --prune-stale --json-progress`
+//!     (v0.2.103: through the per-project walk single-flight claim — a
+//!     second walk of the same project exits 75, "already running", which
+//!     is surfaced as its own message, not a failure) and re-emit each
+//!     `{"progress": ...}` line as a `vct-reanalysis-progress` Tauri event
+//!     for the modal's progress bar.
 //!  2. **Parse final report**: The last JSON line on stdout is a
 //!     `{"final": true, ...}` object carrying counts (files_analyzed,
 //!     modules, classes, functions, apis, stale_pruned, ...). Deserialise
@@ -219,22 +222,27 @@ pub async fn reanalyze_code_graph(
     Ok(report)
 }
 
-async fn run_reanalysis_with_stream(
-    project_name: &str,
+/// Build the analyzer spawn for a Re-analyze run.
+///
+/// v0.2.103: the analyzer is spawned THROUGH the per-project walk
+/// single-flight claim (`-m vco_lib.codegraph_walk`, the Python SSOT —
+/// [`vct_launcher_core::process::claimed_walk_args`]), so clicking
+/// Re-analyze while a build / resync / extra-path sync of this project is
+/// walking exits 75 ("already running") instead of starting a twin that
+/// doubles the GPU embed load and races the other walk's `--prune-stale`.
+/// The claim module re-spawns the analyzer under `sys.executable` with
+/// inherited stdio, so the `--json-progress` stream below is unaffected.
+/// Extracted from `run_reanalysis_with_stream` so a unit test can inspect
+/// the argv hop (`tokio::process::Command::as_std`).
+fn build_reanalysis_command(
+    python: &std::path::Path,
+    script: &std::path::Path,
     folder: &std::path::Path,
+    project_name: &str,
     language: Option<&str>,
-    app: &AppHandle,
-) -> Result<ReanalysisReport, String> {
-    let python = resolve_python_for_analyzer()
-        .ok_or_else(|| "no python interpreter found for analyzer".to_string())?;
-    let script = resolve_analyzer_script(folder).ok_or_else(|| {
-        "analyze_code_graph.py not found (looked in project's .claude/scripts \
-         and the launcher's install root)"
-            .to_string()
-    })?;
-
-    let mut cmd = tokio::process::Command::new(&python).silent();
-    cmd.arg(&script)
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(python).silent();
+    cmd.args(vct_launcher_core::process::claimed_walk_args(script))
         .arg(folder.as_os_str())
         .arg("--project")
         .arg(project_name)
@@ -258,6 +266,24 @@ async fn run_reanalysis_with_stream(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
+    cmd
+}
+
+async fn run_reanalysis_with_stream(
+    project_name: &str,
+    folder: &std::path::Path,
+    language: Option<&str>,
+    app: &AppHandle,
+) -> Result<ReanalysisReport, String> {
+    let python = resolve_python_for_analyzer()
+        .ok_or_else(|| "no python interpreter found for analyzer".to_string())?;
+    let script = resolve_analyzer_script(folder).ok_or_else(|| {
+        "analyze_code_graph.py not found (looked in project's .claude/scripts \
+         and the launcher's install root)"
+            .to_string()
+    })?;
+
+    let mut cmd = build_reanalysis_command(&python, &script, folder, project_name, language);
 
     let mut child = cmd
         .spawn()
@@ -317,21 +343,7 @@ async fn run_reanalysis_with_stream(
         } else {
             String::new()
         };
-        // Map the analyzer's documented exit codes to actionable text.
-        let hint = match status.code() {
-            Some(2) => " (schema case collision — see stderr)",
-            Some(3) => " (no files indexed — check repo path / filters)",
-            Some(4) => " (insert errors — analysis incomplete; see stderr)",
-            _ => "",
-        };
-        // `ExitStatus`'s Display ("exit status: 3" / "signal: 9 (SIGKILL)"):
-        // a signal kill is evidence too, and `code().unwrap_or(-1)` erased it
-        // (v0.2.100 WP-05 / I-06).
-        return Err(format!(
-            "analyzer {}{}",
-            vct_launcher_core::process::failure_evidence(&status, &stderr_text, vct_launcher_core::process::StderrKeep::Whole),
-            hint
-        ));
+        return Err(analyzer_failure_message(&status, &stderr_text));
     }
 
     final_report.ok_or_else(|| {
@@ -339,6 +351,31 @@ async fn run_reanalysis_with_stream(
          possible bug in analyze_code_graph.py --json-progress path"
             .to_string()
     })
+}
+
+/// The Re-analyze error text for a non-zero analyzer exit. v0.2.103: the
+/// walk-claim refusal code (`vco_lib.codegraph_walk`, EX_TEMPFAIL) maps to
+/// its own sentence — the requested walk is ALREADY running, so this is a
+/// refusal the modal can show as information, not a red failure.
+fn analyzer_failure_message(status: &std::process::ExitStatus, stderr_text: &str) -> String {
+    if vct_launcher_core::process::is_walk_already_running(status) {
+        return vct_launcher_core::process::walk_already_running_message();
+    }
+    // Map the analyzer's documented exit codes to actionable text.
+    let hint = match status.code() {
+        Some(2) => " (schema case collision — see stderr)",
+        Some(3) => " (no files indexed — check repo path / filters)",
+        Some(4) => " (insert errors — analysis incomplete; see stderr)",
+        _ => "",
+    };
+    // `ExitStatus`'s Display ("exit status: 3" / "signal: 9 (SIGKILL)"):
+    // a signal kill is evidence too, and `code().unwrap_or(-1)` erased it
+    // (v0.2.100 WP-05 / I-06).
+    format!(
+        "analyzer {}{}",
+        vct_launcher_core::process::failure_evidence(status, stderr_text, vct_launcher_core::process::StderrKeep::Whole),
+        hint
+    )
 }
 
 async fn read_stderr_capped(
@@ -617,5 +654,67 @@ mod tests {
         let r = report.expect("parsed");
         assert!(!r.prune_stale);
         assert_eq!(r.files_analyzed, 0);
+    }
+
+    // ─── v0.2.103: walk single-flight claim ──────────────────────────────
+
+    #[test]
+    fn reanalysis_command_routes_through_the_walk_claim() {
+        let python = std::path::Path::new("/venv/bin/python");
+        let script = std::path::Path::new("/x/.claude/scripts/analyze_code_graph.py");
+        let folder = std::path::Path::new("/repo");
+        let cmd = build_reanalysis_command(python, script, folder, "Acme", Some("rust"));
+        let std_cmd = cmd.as_std();
+        assert_eq!(
+            std_cmd.get_program(),
+            std::ffi::OsStr::new("/venv/bin/python")
+        );
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args[0], "-m", "the claim module hop comes first: {args:?}");
+        assert_eq!(args[1], "vco_lib.codegraph_walk");
+        assert_eq!(args[2], script.to_string_lossy());
+        for expected in ["--project", "Acme", "--prune-stale", "--json-progress", "--language", "rust"] {
+            assert!(args.iter().any(|a| a == expected), "missing {expected} in {args:?}");
+        }
+        // The repo positional follows the script (the analyzer's argv shape).
+        assert_eq!(args[3], "/repo");
+    }
+
+    #[test]
+    fn reanalysis_command_omits_an_empty_language() {
+        let cmd = build_reanalysis_command(
+            std::path::Path::new("/venv/bin/python"),
+            std::path::Path::new("/x/analyze_code_graph.py"),
+            std::path::Path::new("/repo"),
+            "Acme",
+            Some(""),
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(!args.iter().any(|a| a == "--language"), "{args:?}");
+    }
+
+    /// Exit 75 (the vco_lib walk-claim refusal) renders as the "already
+    /// running" sentence — never as a red analyzer failure.
+    #[cfg(unix)]
+    #[test]
+    fn claim_refusal_exit_maps_to_the_already_running_message() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(75 << 8);
+        let msg = analyzer_failure_message(&status, "[codegraph-walk] Acme: ...");
+        assert!(msg.contains("already running"), "{msg}");
+        assert!(!msg.contains("analyzer exit"), "{msg}");
+        // Other exits keep the failure shape.
+        let failure = analyzer_failure_message(
+            &std::process::ExitStatus::from_raw(3 << 8),
+            "",
+        );
+        assert!(failure.contains("no files indexed"), "{failure}");
     }
 }

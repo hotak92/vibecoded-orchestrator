@@ -3444,13 +3444,17 @@ def _driver_claim_lock_path(project_name: str) -> Path:
     prefix cannot be resolved), under the same VCT state dir the machine slots
     use. flock semantics — the claim dies with the holder process, so a
     crashed driver leaves nothing to clean up.
+
+    v0.2.103: the key derivation re-points at
+    ``vco_lib.codegraph_walk.claim_key`` — the ONE home both per-project
+    claims (this DRIVER claim and the per-project WALK claim
+    ``codegraph_walk.walk_claim_lock_path``) derive from, so the two can
+    never drift on what "same project" means. Byte-identical output to the
+    inline derivation it replaces.
     """
-    key = _collection_prefix(project_name)
-    if not key:
-        key = re.sub(
-            r"[^A-Za-z0-9_.-]+", "_", (project_name or "").strip()
-        ) or "project"
-    return _driver_slot_dir().parent / "resync-driver-claims" / f"{key}.lock"
+    from vco_lib.codegraph_walk import claim_key
+
+    return _driver_slot_dir().parent / "resync-driver-claims" / f"{claim_key(project_name)}.lock"
 
 
 def run_resync_and_verify(
@@ -3476,9 +3480,9 @@ def run_resync_and_verify(
     exit 0 as resolved, so a skipped run clears the retry entry while the
     audits remain owed — acceptable, the bundle-update audit step re-spawns on
     the next update. Ordering is always project-claim THEN machine slot
-    (uniform across drivers, so no deadlock). On Windows / filesystems without
-    flock the claim degrades to no exclusion (both drivers run), exactly like
-    the slots themselves.
+    (uniform across drivers, so no deadlock). The claim locks on POSIX
+    (``flock``) and Windows (``msvcrt``, v0.2.103); only a platform with
+    neither degrades to no exclusion.
     """
     from vco_lib.atomic import LockTimeout, exclusive_file_lock, machine_slot
 
@@ -3565,7 +3569,10 @@ def _run_resync_and_verify_slotted(
        keep their own owed entries and heal on their own next resync —
        one heal PER exposed project, never one per machine.
     1. Runs the analyzer as a blocking subprocess (NO timeout — project
-       rule; the analyzer self-guards per embed request). ``--prune-stale``
+       rule; the analyzer self-guards per embed request) UNDER the
+       per-project walk claim (``vco_lib.codegraph_walk.walk_claim``,
+       v0.2.103 — the single-flight every walk spawner takes; a held claim
+       skips this run with a log line, never a twin). ``--prune-stale``
        is forwarded only when the spawn confirmed it safe (no extra paths).
     2. Posts the TERMINAL build status to the hub (v0.2.91 #31 — the
        completion half of the R-4 spawn registration; without it the
@@ -3697,8 +3704,33 @@ def _run_resync_and_verify_slotted(
     print(f"[resync-driver] running: {' '.join(argv)}", flush=True)
     analyzer_started = time.monotonic()
     start_error: Optional[str] = None
+    # v0.2.103: the walk itself goes through the ONE per-project walk claim
+    # (vco_lib.codegraph_walk) — the driver claim above serialises DRIVERS,
+    # but launcher-spawned walks never take it, and a driver walk racing a
+    # launcher ``--prune-stale`` walk of the same project was the 2026-10-14
+    # field defect (double GPU load + prune racing inserts). A held claim
+    # means another walk (launcher build / Re-analyze / extras sync / CLI) is
+    # running RIGHT NOW: skip this run — never queue, never kill, never wait
+    # on a walk that may legitimately run for hours. The ledger stays as it
+    # is; the concurrent walk's own completion converges it, exactly the
+    # driver-claim skip's accepted posture above. Deliberately NO terminal
+    # hub report: the running walk owns the build row (its own finalization
+    # lands last), and this refusal is not the walk's failure. Scoped
+    # --only-file(s) runs never reach this function — the driver only ever
+    # requests full walks.
+    from vco_lib.codegraph_walk import WalkAlreadyRunning, walk_claim
+
     try:
-        rc = subprocess.run(argv, cwd=str(repo_root)).returncode  # noqa: S603
+        with walk_claim(project_name):
+            rc = subprocess.run(argv, cwd=str(repo_root)).returncode  # noqa: S603
+    except WalkAlreadyRunning:
+        print(
+            f"[resync-driver] {project_name}: another code-graph walk is "
+            f"already running for this project — skipping this run (no twin "
+            f"walks); the running walk's own completion converges the ledger",
+            flush=True,
+        )
+        return 0
     except Exception as exc:  # noqa: BLE001
         print(f"[resync-driver] analyzer failed to start: {exc}", flush=True)
         start_error = f"could not start the analyzer: {exc}"

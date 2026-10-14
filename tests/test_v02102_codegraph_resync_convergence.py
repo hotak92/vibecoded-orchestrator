@@ -21,6 +21,14 @@ S16-5  search_code_graph reported ``schema_missing: <prefix>_CodeInteraction``
        property. Now the class has the property, and the MCP's degraded note
        tells a missing PROPERTY (``property_missing``) from a missing class.
 
+v0.2.103 adds the per-project WALK single-flight claim block (the
+``test_*walk_claim*`` / ``test_*_goes_through_the_walk_claim`` tests below the
+driver-claim tests): one claim in ``vco_lib.codegraph_walk`` taken by every
+spawner of a full/pruning walk (driver, deferral-retry, extras refresh, the
+``code-graph-analyze`` wrapper and the launcher's ``-m vco_lib.codegraph_walk``
+spawns); a second walk of a project already walking exits 75 ("already
+running") instead of twinning — the 2026-10-14 field defect.
+
 No live Weaviate anywhere: in-memory fakes; the suite pins WEAVIATE_URL at the
 unroutable sentinel.
 """
@@ -1784,6 +1792,380 @@ def test_the_claim_is_freed_when_the_holder_dies(monkeypatch, tmp_path):
     assert cr.run_resync_and_verify(
         "Acme Projects", tmp_path, tmp_path / "a.py") == 17
     assert ran, "a crashed holder never keeps its project claim"
+
+
+# ── v0.2.103: per-project WALK single-flight claim (vco_lib.codegraph_walk) ──
+#
+# The 2026-10-14 field defect: two code-graph walks of the SAME project ran
+# concurrently (a launcher ``--prune-stale`` walk vs a resync driver's
+# ``--force-rewalk`` 15 s later; two analyzers 15 min apart on another
+# project) because the driver claim serialises only drivers. The walk claim
+# (``vco_lib.codegraph_walk``) is taken by EVERY spawner of a full/pruning
+# walk; these tests pin the claim itself and one test per spawner proves the
+# spawner goes through it (mutating the spawner to bypass the claim turns
+# that spawner's test red — the red-proof is in the lane report).
+
+
+def test_a_second_walk_claim_for_the_same_project_is_refused(tmp_path):
+    """While a holder process keeps the claim, walk_claim raises
+    WalkAlreadyRunning immediately (non-blocking — never a wait that could
+    stall behind a multi-hour walk)."""
+    from vco_lib import codegraph_walk
+
+    proc, line = _claim_holder(
+        tmp_path, codegraph_walk.walk_claim_lock_path("Acme Projects"), "30")
+    assert line == "held"
+    try:
+        with pytest.raises(codegraph_walk.WalkAlreadyRunning):
+            with codegraph_walk.walk_claim("Acme Projects"):
+                pass
+    finally:
+        proc.kill()
+        proc.wait(10)
+
+
+def test_a_walk_claim_for_a_different_project_is_not_blocked(tmp_path):
+    from vco_lib import codegraph_walk
+
+    proc, line = _claim_holder(
+        tmp_path, codegraph_walk.walk_claim_lock_path("Acme Projects"), "30")
+    assert line == "held"
+    try:
+        with codegraph_walk.walk_claim("Beta Corp"):
+            pass  # no raise — the claim is per project
+    finally:
+        proc.kill()
+        proc.wait(10)
+
+
+def test_the_walk_claim_is_freed_when_the_holder_dies(tmp_path):
+    """flock semantics: a crashed walk's claim is freed by the OS — nothing
+    stale to clean up, the next walk starts."""
+    from vco_lib import codegraph_walk
+
+    proc, line = _claim_holder(
+        tmp_path, codegraph_walk.walk_claim_lock_path("Acme Projects"), "crash")
+    assert line == "held"
+    assert proc.wait(10) == 3
+    with codegraph_walk.walk_claim("Acme Projects"):
+        pass  # no raise — the dead holder's claim is gone
+
+
+def test_walk_claim_key_matches_the_driver_claim_key():
+    """Both per-project claims derive "same project" from the ONE home
+    (``codegraph_walk.claim_key``) — a driver and a walk can never disagree
+    on a project's identity."""
+    from vco_lib import codegraph_resync as cr
+    from vco_lib import codegraph_walk
+
+    for name in ("Acme Projects", "beta-corp", "Weird Name! v2", ""):
+        assert codegraph_walk.claim_key(name) == cr._driver_claim_lock_path(name).stem
+
+
+def test_walk_claim_windows_branch_locks_via_msvcrt(monkeypatch, tmp_path):
+    """The claim must exclude on Windows too. ``exclusive_file_lock`` gained
+    an msvcrt branch in v0.2.103; simulate the Windows shape (no fcntl, a
+    msvcrt offering LK_NBLCK/LK_UNLCK) and pin: lock taken via msvcrt, a
+    second take times out while held, and the release is the symmetric
+    LK_UNLCK."""
+    import builtins
+    import errno
+
+    from vco_lib import atomic
+    from vco_lib.atomic import LockTimeout
+
+    calls: list = []
+    held = {"v": False}
+    fake = types.SimpleNamespace(LK_NBLCK=1, LK_UNLCK=3)
+
+    def _locking(fd, mode, nbytes):
+        calls.append(mode)
+        if mode == fake.LK_NBLCK:
+            if held["v"]:
+                raise OSError(errno.EACCES, "region locked")
+            held["v"] = True
+        elif mode == fake.LK_UNLCK:
+            held["v"] = False
+
+    fake.locking = _locking
+    real_import = builtins.__import__
+
+    def _import(name, *a, **k):
+        if name == "fcntl":
+            raise ImportError("simulated: no fcntl on Windows")
+        if name == "msvcrt":
+            return fake
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    lock = tmp_path / "w.lock"
+    with atomic.exclusive_file_lock(lock, timeout_s=0):
+        assert held["v"] is True
+        with pytest.raises(LockTimeout):
+            with atomic.exclusive_file_lock(lock, timeout_s=0.2):
+                pass
+    assert calls.count(fake.LK_NBLCK) >= 2 and calls[-1] == fake.LK_UNLCK
+    assert held["v"] is False, "the msvcrt region is unlocked on exit"
+
+
+# ── v0.2.103: the claim CLI (`python -m vco_lib.codegraph_walk`) ──────────
+
+_WALK_STUB_ANALYZER = r"""
+import os, sys
+marker = os.environ.get("WALK_STUB_MARKER")
+if marker:
+    with open(marker, "w") as fh:
+        fh.write(" ".join(sys.argv[1:]))
+sys.exit(int(os.environ.get("WALK_STUB_RC", "3")))
+"""
+
+
+def _run_walk_cli(tmp_path, analyzer_args, **env_over):
+    import subprocess
+
+    stub = tmp_path / "stub_analyzer.py"
+    stub.write_text(_WALK_STUB_ANALYZER)
+    return subprocess.run(
+        [sys.executable, "-m", "vco_lib.codegraph_walk", str(stub), *analyzer_args],
+        env=child_env(**env_over), capture_output=True, text=True, timeout=60,
+    )
+
+
+def test_walk_cli_refuses_a_twin_and_spawns_nothing(tmp_path):
+    """A second full walk of a project already walking exits 75
+    (EX_TEMPFAIL — the code the launcher maps to "already running"), names
+    the refusal on stderr, and NEVER starts the analyzer."""
+    from vco_lib import codegraph_walk
+
+    marker = tmp_path / "marker.txt"
+    proc, line = _claim_holder(
+        tmp_path, codegraph_walk.walk_claim_lock_path("ProjA"), "30")
+    assert line == "held"
+    try:
+        out = _run_walk_cli(
+            tmp_path, [str(tmp_path), "--project", "ProjA"],
+            WALK_STUB_MARKER=str(marker))
+    finally:
+        proc.kill()
+        proc.wait(10)
+    assert out.returncode == codegraph_walk.WALK_ALREADY_RUNNING_RC == 75
+    assert "already running" in out.stderr
+    assert not marker.exists(), "the twin walk's analyzer must never start"
+
+
+def test_walk_cli_runs_the_walk_propagates_rc_and_frees_the_claim(tmp_path):
+    from vco_lib import codegraph_walk
+
+    marker = tmp_path / "marker.txt"
+    out = _run_walk_cli(
+        tmp_path, [str(tmp_path), "--project", "ProjA"],
+        WALK_STUB_MARKER=str(marker))
+    assert out.returncode == 3, f"the analyzer's rc must propagate: {out.stderr!r}"
+    assert "--project ProjA" in marker.read_text()
+    # The claim died with the finished walk — the next walk may start.
+    with codegraph_walk.walk_claim("ProjA"):
+        pass
+
+
+def test_walk_cli_scoped_incremental_bypasses_the_claim(tmp_path):
+    """--only-files-from (the Stop-hook drain batches) never claims — a
+    scoped run beside a full walk is allowed (see the module docstring for
+    the prune-safety evidence), so the drain's consumed queue is never lost
+    to a refusal it cannot see (its analyzer is spawned detached)."""
+    from vco_lib import codegraph_walk
+
+    marker = tmp_path / "marker.txt"
+    list_file = tmp_path / "files.txt"
+    list_file.write_text("a.py\n")
+    proc, line = _claim_holder(
+        tmp_path, codegraph_walk.walk_claim_lock_path("ProjA"), "30")
+    assert line == "held"
+    try:
+        out = _run_walk_cli(
+            tmp_path,
+            [str(tmp_path), "--project", "ProjA", "--only-files-from", str(list_file)],
+            WALK_STUB_MARKER=str(marker))
+    finally:
+        proc.kill()
+        proc.wait(10)
+    assert out.returncode == 3, f"scoped runs bypass the claim: {out.stderr!r}"
+    assert marker.exists()
+
+
+def test_project_from_argv_defaults_to_the_repo_dir_name():
+    """No --project → the analyzer's own default (repo directory name) keys
+    the claim; value-flag values are never mistaken for the repo path."""
+    from vco_lib import codegraph_walk
+
+    assert codegraph_walk.project_from_argv(["/srv/repo", "--project", "Acme"]) == "Acme"
+    assert codegraph_walk.project_from_argv(["--project=Acme", "/srv/repo"]) == "Acme"
+    assert codegraph_walk.project_from_argv(
+        ["/srv/repo", "--language", "python", "--since-commit", "abc"]) == "repo"
+    assert codegraph_walk.project_from_argv(["--language", "python"]) is None
+
+
+# ── v0.2.103: per-spawner claim coverage ──────────────────────────────────
+
+
+def _stub_driver_walk_gates(monkeypatch):
+    """Neutralise every pre/post-walk gate of the driver's slotted body so
+    the walk-claim seam is what the test exercises (no Weaviate, no hub, no
+    spawn). Returns the recorder dicts."""
+    import subprocess
+    from types import SimpleNamespace
+
+    from vco_lib import codegraph_resync as cr
+
+    monkeypatch.setattr(cr, "walk_uses_container", lambda *_a, **_k: False)
+    monkeypatch.setattr(cr, "_maybe_run_exposure_heal", lambda *_a, **_k: False)
+    monkeypatch.setattr(cr, "_maybe_run_vectorless_audit", lambda *_a, **_k: None)
+    monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *_a, **_k: None)
+
+    def _probe_down(*_a, **_k):
+        raise RuntimeError("probe unavailable in this test")
+
+    monkeypatch.setattr(cr, "count_stale_rows", _probe_down)
+    monkeypatch.setattr(cr, "spawn_code_summary_after_walk", lambda *_a, **_k: None)
+    monkeypatch.setattr(cr, "_collect_terminal_stats", lambda *_a, **_k: ({}, None))
+    monkeypatch.setattr(cr, "_report_terminal_to_hub", lambda *_a, **_k: None)
+    seen = {"runs": [], "deferrals": []}
+    monkeypatch.setattr(
+        cr, "_record_unconverged_deferral",
+        lambda *a, **k: seen["deferrals"].append(a))
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: seen["runs"].append(a) or SimpleNamespace(returncode=0))
+    return seen
+
+
+def test_resync_driver_walk_goes_through_the_walk_claim(monkeypatch, tmp_path, capsys):
+    """The driver's blocking analyzer run (``_run_resync_and_verify_slotted``)
+    must hold the walk claim: while another walk holds it the driver skips —
+    no analyzer subprocess, no unconverged deferral (the running walk's own
+    completion converges the ledger). RED-PROOF TARGET: dropping the
+    ``walk_claim`` wrap turns the held-claim assertion red (the analyzer
+    subprocess spawns)."""
+    from vco_lib import codegraph_resync as cr
+    from vco_lib import codegraph_walk
+
+    seen = _stub_driver_walk_gates(monkeypatch)
+    proc, line = _claim_holder(
+        tmp_path, codegraph_walk.walk_claim_lock_path("Acme Projects"), "30")
+    assert line == "held"
+    try:
+        rc = cr._run_resync_and_verify_slotted(
+            "Acme Projects", tmp_path, tmp_path / "a.py")
+    finally:
+        proc.kill()
+        proc.wait(10)
+    assert rc == 0
+    assert seen["runs"] == [], "a held walk claim must stop the driver's analyzer run"
+    assert "already running" in capsys.readouterr().out
+    assert seen["deferrals"] == [], "a refused walk records no unconverged deferral"
+
+    # Control: with the claim free the SAME call reaches the analyzer.
+    assert cr._run_resync_and_verify_slotted(
+        "Acme Projects", tmp_path, tmp_path / "a.py") == 0
+    assert len(seen["runs"]) == 1
+
+
+def test_retry_code_graph_walk_goes_through_the_walk_claim(monkeypatch, tmp_path):
+    """The deferral-retry full-tree incremental walk must claim too: a held
+    claim SKIPs the attempt (the entry stays owed for a later retry) and the
+    analyzer never spawns. RED-PROOF TARGET: dropping the ``walk_claim``
+    wrap runs the child even while the claim is held."""
+    from vco_lib import codegraph_walk, deferral_retry
+    from vco_lib.atomic import exclusive_file_lock
+
+    folder = tmp_path / "ProjA"
+    scripts = folder / ".claude" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "analyze_code_graph.py").write_text("# stub")
+    monkeypatch.setattr(deferral_retry, "_project_name", lambda _f: "ProjA")
+    calls: list = []
+
+    def _runner(argv, cwd):
+        calls.append(list(argv))
+        return 0
+
+    ctx = deferral_retry.RetryContext(
+        folder=folder, condition_id="codegraph_analysis_pending",
+        runner=_runner, python="/py")
+    with exclusive_file_lock(
+            codegraph_walk.walk_claim_lock_path("ProjA"), timeout_s=0):
+        res = deferral_retry.retry_code_graph_walk(ctx)
+    assert res.status == deferral_retry.SKIPPED
+    assert "already running" in res.detail
+    assert calls == [], "a held walk claim must stop the retry's analyzer run"
+
+    # Control: with the claim free the SAME handler runs the child.
+    res = deferral_retry.retry_code_graph_walk(ctx)
+    assert res.status == deferral_retry.RETRIED
+    assert len(calls) == 1 and "--incremental" in calls[0]
+
+
+def test_extras_refresh_reindex_goes_through_the_walk_claim(tmp_path):
+    """The extras commit-stamp re-index (a full/since-commit walk of an
+    extra path under the project's OWN prefix) must claim: while another
+    walk of the project holds it the outcome is "busy", the analyzer never
+    runs, and the throttle stamp is NOT written (the next eligible refresh
+    retries instead of waiting out the interval for a walk that never ran).
+    RED-PROOF TARGET: dropping the ``walk_claim`` wrap runs the analyzer
+    under a held claim."""
+    import time
+    from dataclasses import dataclass
+    from typing import Optional
+
+    from vco_lib import codegraph_extras_refresh as cer
+    from vco_lib import codegraph_walk
+    from vco_lib.atomic import exclusive_file_lock
+
+    @dataclass(frozen=True)
+    class _Extra:
+        path: str
+        enabled: bool
+        last_indexed_commit: Optional[str]
+
+    @dataclass(frozen=True)
+    class _Cfg:
+        project_id: str
+        code_graph_collection_prefix: str
+        code_graph_extra_paths: tuple
+
+    runs: list = []
+
+    def _run_analyzer(python, analyzer, argv, timeout):
+        runs.append(list(argv))
+        return cer.AnalyzerResult(True, "ok", 3, 7, 11)
+
+    def _record(project_id, path, commit, res):
+        return (True, "recorded")
+
+    cfg = _Cfg("pid-1", "Acme", (_Extra("/srv/clone", True, "a" * 40),))
+    deps = cer.Deps(
+        resolve=lambda _root: cfg,
+        git_head=lambda _p: "b" * 40,
+        run_analyzer=_run_analyzer,
+        record=_record,
+        now=time.time,
+    )
+    state = tmp_path / "state"
+    with exclusive_file_lock(codegraph_walk.walk_claim_lock_path("Acme"), timeout_s=0):
+        out = cer.refresh_extras(
+            str(tmp_path), "/x/analyze.py", "/x/python", state, lambda _m: None,
+            deps=deps)
+    assert out == {"/srv/clone": "busy"}
+    assert runs == [], "a held walk claim must stop the extras re-index"
+    assert not list(state.glob("codegraph_extra_refresh_*.ts")), \
+        "a refused run must not consume the throttle stamp"
+
+    # Control: with the claim free the SAME refresh runs the analyzer.
+    out = cer.refresh_extras(
+        str(tmp_path), "/x/analyze.py", "/x/python", state, lambda _m: None,
+        deps=deps)
+    assert out == {"/srv/clone": "recorded"}
+    assert len(runs) == 1
+    assert "--project" in runs[0] and "Acme" in runs[0]
 
 
 def test_bundle_audit_step_logs_and_emits_the_deferral(monkeypatch, tmp_path):

@@ -580,9 +580,114 @@ pub fn failure_evidence(status: &std::process::ExitStatus, stderr: &str, keep: S
     }
 }
 
+// ─── Code-graph walk single-flight (v0.2.103) ────────────────────────────
+//
+// The claim ITSELF lives in the Python SSOT (`vco_lib/codegraph_walk.py`,
+// taken via `python -m vco_lib.codegraph_walk <analyzer> [args...]`); Rust
+// NEVER mirrors the lock logic — it routes analyzer spawns through the
+// module ([`claimed_walk_args`]) and interprets the refusal exit code.
+
+/// Exit code the vco_lib walk-claim wrapper returns when it refuses to
+/// start a twin walk of a project that is already walking (EX_TEMPFAIL:
+/// transient — retry after the running walk finishes).
+/// MUST MATCH `vco_lib/codegraph_walk.py::WALK_ALREADY_RUNNING_RC`.
+pub const WALK_ALREADY_RUNNING_EXIT_CODE: i32 = 75;
+
+/// True when a finished analyzer(-wrapper) child reported "another walk is
+/// already running" — a refusal, not a failure: nothing was spawned.
+pub fn is_walk_already_running(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(WALK_ALREADY_RUNNING_EXIT_CODE)
+}
+
+/// The ONE user-facing sentence for the refusal (build toast, Re-analyze
+/// modal, extra-path Sync error alike).
+pub fn walk_already_running_message() -> String {
+    "a code-graph walk is already running for this project — not starting a \
+     second one; re-run after it finishes"
+        .to_string()
+}
+
+/// The argv prefix that routes an analyzer spawn through the vco_lib walk
+/// claim: `-m vco_lib.codegraph_walk <script>` (the analyzer args follow).
+/// The interpreter running the module is the analyzer's interpreter — the
+/// module re-spawns the script under `sys.executable` and inherits stdio, so
+/// `--json-progress` streaming is unaffected. Callers MUST pass a python
+/// that can import vco_lib (the RT-4 `resolve_python_for_vco_lib` ladder).
+pub fn claimed_walk_args(script: &std::path::Path) -> Vec<std::ffi::OsString> {
+    vec![
+        std::ffi::OsString::from("-m"),
+        std::ffi::OsString::from("vco_lib.codegraph_walk"),
+        script.as_os_str().to_os_string(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── walk single-flight claim surface (v0.2.103) ─────────────────────
+
+    /// Cross-language pin: the refusal code IS EX_TEMPFAIL and matches the
+    /// Python SSOT `vco_lib/codegraph_walk.py::WALK_ALREADY_RUNNING_RC`
+    /// (its own test pins the same literal on the Python side).
+    #[test]
+    fn walk_already_running_code_is_pinned_to_extempfail() {
+        assert_eq!(WALK_ALREADY_RUNNING_EXIT_CODE, 75);
+    }
+
+    #[test]
+    fn is_walk_already_running_matches_only_the_refusal_code() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(is_walk_already_running(
+                &std::process::ExitStatus::from_raw(75 << 8)
+            ));
+            assert!(!is_walk_already_running(
+                &std::process::ExitStatus::from_raw(1 << 8)
+            ));
+            // A signal kill has NO code — never mistaken for a refusal.
+            assert!(!is_walk_already_running(
+                &std::process::ExitStatus::from_raw(9)
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            assert!(is_walk_already_running(
+                &std::process::ExitStatus::from_raw(75)
+            ));
+            assert!(!is_walk_already_running(
+                &std::process::ExitStatus::from_raw(1)
+            ));
+        }
+    }
+
+    #[test]
+    fn walk_already_running_message_names_the_twin_refusal() {
+        let msg = walk_already_running_message();
+        assert!(msg.contains("already running"), "{msg}");
+        assert!(msg.contains("not starting a second one"), "{msg}");
+    }
+
+    #[test]
+    fn claimed_walk_args_route_through_the_vco_lib_claim_module() {
+        let script = std::path::Path::new("/x/.claude/scripts/analyze_code_graph.py");
+        let args = claimed_walk_args(script);
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "-m".to_string(),
+                "vco_lib.codegraph_walk".to_string(),
+                script.to_string_lossy().to_string()
+            ],
+            "the analyzer spawn must go through the Python claim SSOT"
+        );
+    }
 
     #[test]
     fn pid_zero_is_not_alive() {

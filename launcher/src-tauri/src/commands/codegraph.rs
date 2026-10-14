@@ -1020,6 +1020,23 @@ async fn run_build_task(
                     false, // joern_used: v0.2.73 CG-3 removed Joern CFG/PDG (zero readers)
                     prov,
                 )
+            } else if vct_launcher_core::process::is_walk_already_running(&out.status) {
+                // v0.2.103: the walk wrapper (`code-graph-analyze` →
+                // `python -m vco_lib.codegraph_walk`) REFUSED a twin — another
+                // walk of this project holds the single-flight claim. Nothing
+                // ran, so this is a SKIPPED outcome with an explanation the
+                // toast can show, never a FAILED one (a red "failed" for a
+                // healthy running walk is exactly what made users click the
+                // button twice). The already-running walk's own terminal
+                // write carries the real result when it finishes.
+                (
+                    build_status::SKIPPED.to_string(),
+                    0,
+                    Some(vct_launcher_core::process::walk_already_running_message()),
+                    Some(tail),
+                    false, // joern_used: v0.2.73 CG-3 removed Joern CFG/PDG (zero readers)
+                    None,
+                )
             } else {
                 (
                     build_status::FAILED.to_string(),

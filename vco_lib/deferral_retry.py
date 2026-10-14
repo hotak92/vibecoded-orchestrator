@@ -710,7 +710,25 @@ def retry_code_graph_walk(ctx: RetryContext) -> RetryResult:
     project = _project_name(ctx.folder)
     if project:
         argv += ["--project", project]
-    rc = ctx.run(argv)
+    # v0.2.103: this is a FULL-TREE (revision-gated) walk — it goes through
+    # the ONE per-project walk claim (vco_lib.codegraph_walk), so a retry
+    # never starts a twin beside a launcher/driver walk of the same project.
+    # A held claim SKIPs the attempt (the entry stays owed for a later
+    # retry — the same posture as "another retry driver is already running");
+    # the walk is never killed and never waited on. The claim key falls back
+    # to the folder name when no project name resolves — the same default the
+    # analyzer itself applies to --project.
+    from vco_lib.codegraph_walk import WalkAlreadyRunning, walk_claim
+
+    try:
+        with walk_claim(project or ctx.folder.name):
+            rc = ctx.run(argv)
+    except WalkAlreadyRunning:
+        return RetryResult(
+            ctx.condition_id, SKIPPED,
+            "another code-graph walk is already running for this project — "
+            "left owed for a later retry",
+        )
     if rc == 0:
         return RetryResult(ctx.condition_id, RETRIED, "code-graph walk completed")
     return RetryResult(ctx.condition_id, FAILED, f"code-graph walk exited {rc}")

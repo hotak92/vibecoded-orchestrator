@@ -237,3 +237,110 @@ def test_ps1_sibling_mirrors_tiers_and_has_bom() -> None:
     assert "import weaviate" in text, (
         ".ps1 must validate analyzer deps like the .sh sibling"
     )
+
+
+# ─── v0.2.103: the shim routes through the walk single-flight claim ───────
+#
+# The launcher build task (`codegraph.rs::run_build_task`) and the user CLI
+# spawn THIS wrapper, so the wrapper is where their walks take the
+# per-project claim (`vco_lib.codegraph_walk`, exit 75 on refusal). These
+# tests run the staged shim end-to-end with the REAL interpreter
+# ($VCT_VENV=sys.executable) and a stub analyzer, with the claim held by the
+# test process (a flock conflicts across open file descriptions regardless
+# of process, so an in-process hold is a real contention stand-in).
+# RED-PROOF TARGET: a shim that execs the analyzer directly (dropping the
+# `-m vco_lib.codegraph_walk` hop) runs the stub under the held claim → red.
+
+_WALK_STUB_ANALYZER = (
+    "import os, sys\n"
+    "marker = os.environ.get('WALK_STUB_MARKER')\n"
+    "if marker:\n"
+    "    with open(marker, 'w') as fh:\n"
+    "        fh.write(' '.join(sys.argv[1:]))\n"
+    "sys.exit(int(os.environ.get('WALK_STUB_RC', '3')))\n"
+)
+
+
+def _stage_shim_with_stub_analyzer(tmp_path: Path) -> Path:
+    proj = tmp_path / "ProjA"
+    scripts = proj / ".claude" / "scripts"
+    shim = _install_shim(scripts)
+    (scripts / "analyze_code_graph.py").write_text(_WALK_STUB_ANALYZER)
+    return shim
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_shim_refuses_a_twin_walk_with_exit_75(tmp_path: Path) -> None:
+    import sys as _sys
+
+    from tests.common.child_env import child_env
+    from vco_lib import codegraph_walk
+    from vco_lib.atomic import exclusive_file_lock
+
+    shim = _stage_shim_with_stub_analyzer(tmp_path)
+    marker = tmp_path / "ran.txt"
+    env = child_env(VCT_VENV=_sys.executable, WALK_STUB_MARKER=str(marker))
+
+    with exclusive_file_lock(
+        codegraph_walk.walk_claim_lock_path("ProjA"), timeout_s=0
+    ):
+        out = subprocess.run(
+            ["bash", str(shim), str(tmp_path), "--project", "ProjA"],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+    assert out.returncode == 75, (
+        f"a walk of a project already walking must exit 75, got "
+        f"{out.returncode}: {out.stdout!r} {out.stderr!r}"
+    )
+    assert "already running" in out.stderr
+    assert not marker.exists(), "the twin walk's analyzer must never start"
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_shim_runs_the_walk_and_propagates_its_exit_code(tmp_path: Path) -> None:
+    import sys as _sys
+
+    from tests.common.child_env import child_env
+
+    shim = _stage_shim_with_stub_analyzer(tmp_path)
+    marker = tmp_path / "ran.txt"
+    env = child_env(VCT_VENV=_sys.executable, WALK_STUB_MARKER=str(marker))
+
+    out = subprocess.run(
+        ["bash", str(shim), str(tmp_path), "--project", "ProjA"],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert out.returncode == 3, (
+        f"the analyzer's exit code must propagate through the claim hop: "
+        f"{out.returncode}: {out.stdout!r} {out.stderr!r}"
+    )
+    assert "--project ProjA" in marker.read_text()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_shim_scoped_incremental_bypasses_the_claim(tmp_path: Path) -> None:
+    """--only-files-from (drain-hook batches) runs unclaimed even while a
+    full walk holds the claim — the drain's own per-root lock serializes
+    those (see vco_lib/codegraph_walk.py's module docstring)."""
+    import sys as _sys
+
+    from tests.common.child_env import child_env
+    from vco_lib import codegraph_walk
+    from vco_lib.atomic import exclusive_file_lock
+
+    shim = _stage_shim_with_stub_analyzer(tmp_path)
+    marker = tmp_path / "ran.txt"
+    env = child_env(VCT_VENV=_sys.executable, WALK_STUB_MARKER=str(marker))
+    list_file = tmp_path / "files.txt"
+    list_file.write_text("a.py\n")
+
+    with exclusive_file_lock(
+        codegraph_walk.walk_claim_lock_path("ProjA"), timeout_s=0
+    ):
+        out = subprocess.run(
+            ["bash", str(shim), str(tmp_path), "--project", "ProjA",
+             "--only-files-from", str(list_file)],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+    assert out.returncode == 3, f"scoped runs bypass the claim: {out.stderr!r}"
+    assert marker.exists()
