@@ -1178,7 +1178,10 @@
   ];
   const KG_SUMMARY_DEFAULT_MODEL = 'gpt-4o-mini';
 
-  type KgSummaryOverride = '' | 'cli' | 'ollama' | 'openai' | 'skip';
+  // v0.2.103: 'zai' / 'qwen' — the cloud vendor tiers the summary ladder
+  // tries between the CLI and local Ollama. Same names as the Python
+  // VALID_BACKENDS (templates/scripts/summary_backends.py).
+  type KgSummaryOverride = '' | 'cli' | 'zai' | 'qwen' | 'ollama' | 'openai' | 'skip';
 
   // Result of the `recheck_summary_backend` Tauri command. Count fields are
   // null when the CLI's summary line did not parse.
@@ -1257,7 +1260,7 @@
         ? modelRes.value
         : KG_SUMMARY_DEFAULT_MODEL;
       const ov = (overrideRes.is_set ? (overrideRes.value ?? '') : '') as KgSummaryOverride;
-      kgSummaryOverride = (['', 'cli', 'ollama', 'openai', 'skip'].includes(ov) ? ov : '') as KgSummaryOverride;
+      kgSummaryOverride = (['', 'cli', 'zai', 'qwen', 'ollama', 'openai', 'skip'].includes(ov) ? ov : '') as KgSummaryOverride;
       kgSummaryOllamaModel = (ollamaRes.is_set && ollamaRes.value) ? ollamaRes.value : '';
     } catch (e) {
       kgSummaryError = String(e);
@@ -2497,7 +2500,7 @@
               onchange={() => void saveKgSummaryOverride('')}
               disabled={kgSummarySaving}
             />
-            <span>Auto (claude CLI &gt; local Ollama &gt; OpenAI w/ consent)</span>
+            <span>Auto (claude CLI &gt; cloud vendor &gt; local Ollama &gt; OpenAI w/ consent)</span>
           </label>
           <label class="pr-kgsum-radio">
             <input
@@ -2509,6 +2512,28 @@
               disabled={kgSummarySaving}
             />
             <span>Claude CLI (best quality; uses your subscription)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="kg-summary-override"
+              value="zai"
+              checked={kgSummaryOverride === 'zai'}
+              onchange={() => void saveKgSummaryOverride('zai')}
+              disabled={kgSummarySaving}
+            />
+            <span>Z.ai GLM (flash model; uses your subscription key)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="kg-summary-override"
+              value="qwen"
+              checked={kgSummaryOverride === 'qwen'}
+              onchange={() => void saveKgSummaryOverride('qwen')}
+              disabled={kgSummarySaving}
+            />
+            <span>QwenCloud (flash model; uses your subscription key)</span>
           </label>
           <label class="pr-kgsum-radio">
             <input

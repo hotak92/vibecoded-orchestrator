@@ -319,6 +319,11 @@ def test_summary_ollama_tier_needs_the_model_present_and_never_pulls(monkeypatch
     # qwen3.5:0.8b floor — the very model this test holds as "not the tier
     # model". ollama_available() reads the module constant, so pin that.
     monkeypatch.setattr(sb, "OLLAMA_DEFAULT_MODEL", "qwen3.5:9b")
+    # v0.2.103 8c: pin the VRAM/walk guard OFF — this test is about the
+    # model-present check, and the guard's probes would both hit the fake
+    # urlopen below (the /health leg) and read the machine's real GPU.
+    monkeypatch.setattr(sb, "_codegraph_walk_active", lambda: False)
+    monkeypatch.setattr(sb, "_free_vram_mb", lambda: None)
     urls = []
 
     def tags(held):

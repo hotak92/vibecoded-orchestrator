@@ -92,9 +92,11 @@ def sb(state_dir: Path):
     return mod
 
 
-def _pin_probes(monkeypatch, mod, *, cli=False, ollama=False,
-                openai=False, api=False) -> None:
+def _pin_probes(monkeypatch, mod, *, cli=False, zai=False, qwen=False,
+                ollama=False, openai=False, api=False) -> None:
     monkeypatch.setattr(mod, "cli_available", lambda: cli)
+    monkeypatch.setattr(mod, "zai_available", lambda: zai)
+    monkeypatch.setattr(mod, "qwen_available", lambda: qwen)
     monkeypatch.setattr(mod, "ollama_available", lambda: ollama)
     monkeypatch.setattr(mod, "openai_available", lambda: openai)
     monkeypatch.setattr(mod, "api_available", lambda: api)
@@ -270,6 +272,8 @@ class TestCrossProcessLatch:
         probed = []
         monkeypatch.setattr(second, "cli_available",
                             lambda: (probed.append(1), True)[1])
+        monkeypatch.setattr(second, "zai_available", lambda: False)
+        monkeypatch.setattr(second, "qwen_available", lambda: False)
         monkeypatch.setattr(second, "ollama_available", lambda: True)
         assert second.select_backend() == "ollama"
         assert probed == [], "cli_available() ran despite an open breaker"
@@ -504,7 +508,7 @@ class TestLadderDescends:
         _pin_probes(monkeypatch, sb)
         assert sb.select_backend() == "skip"
         joined = "\n".join(sb.log_lines)
-        assert "no backend available (no claude CLI, no Ollama at" in joined
+        assert "no backend available (no claude CLI, no cloud-vendor" in joined
 
     def test_a_success_clears_the_persisted_latch(self, sb, monkeypatch):
         _pin_probes(monkeypatch, sb, ollama=True)

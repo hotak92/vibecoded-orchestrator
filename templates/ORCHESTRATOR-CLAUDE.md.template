@@ -337,7 +337,7 @@ If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on
   - `qwen3-embedding:0.6b` — text embeddings (1024 dim, primary; `num_ctx` 10 240,
     resolved from the chunk-sizing table so window and chunks cannot drift)
   - KG-summary generation models (fallback only): `gemma4:e4b` (low-VRAM/CPU), `qwen3.5:9b` (16 GB+ VRAM).
-- **KG-summary generation** (`generate-kg-summary.py`) uses a three-tier fallback: (1) `claude` CLI on PATH (best quality, uses your Claude subscription / API key), (2) the local Ollama models above, (3) Anthropic API direct (if `ANTHROPIC_API_KEY` is set). Force a tier via `KG_SUMMARY_BACKEND=cli|ollama|api|openai|skip` (`api` = Anthropic API, `openai` = OpenAI, consent-gated).
+- **KG-summary generation** (`generate-kg-summary.py`) walks a backend ladder: (1) `claude` CLI on PATH (best quality, uses your Claude subscription / API key), (2) the z.ai GLM cloud tier, then (3) the QwenCloud cloud tier — each only when that vendor's key resolves on the machine, on the vendor's flash model, (4) the local Ollama models above (deferred while a code-graph embedding walk runs or free VRAM is low), (5) OpenAI (consent-gated), then Anthropic API direct (if `ANTHROPIC_API_KEY` is set). Force a tier via `KG_SUMMARY_BACKEND=cli|zai|qwen|ollama|api|openai|skip` (`api` = Anthropic API, `openai` = OpenAI, consent-gated).
 
 ### Code Embedding Service
 - **URL**: `{{CODE_EMBED_URL}}` (default `http://localhost:11440`)

@@ -38,11 +38,18 @@ from typing import Any, Mapping, Optional
 
 from vco_lib.embedding_providers.ollama import _with_keep_alive
 
-#: The context window every VCO generation request asks for. 32768 is the
-#: value the KG-summary ladder already loaded its models with (~3 × 8k input
-#: chunks + system prompt + output), so the resident runner it created is the
-#: one every other caller now reuses.
-GENERATE_NUM_CTX_DEFAULT = 32768
+#: The context window every VCO generation request asks for. v0.2.103 (8c):
+#: ONE shared value is required (a per-caller window reloads the model — the
+#: exact divergence this module exists to prevent), so this is the SMALLEST
+#: that fits every generation prompt VCO sends: the largest is a single body
+#: truncated at 4 000 characters (~1.3k tokens; batched prompts go to the
+#: CLI tier, never Ollama) + the system prompt + the 1 024 ``num_predict``
+#: output budget ≈ 3k tokens, and 8 192 leaves 2× headroom over that worst
+#: case. 32768 — the historical value — loaded a KV cache 4× larger than any
+#: prompt needs, which is what filled a 16 GB GPU beside the code-embedding
+#: re-index in the field (2026-10-14). ``$VCO_OLLAMA_GENERATE_NUM_CTX``
+#: still overrides for every caller at once.
+GENERATE_NUM_CTX_DEFAULT = 8192
 
 #: Machine-wide override of :data:`GENERATE_NUM_CTX_DEFAULT` (a positive int).
 #: It applies to EVERY generation caller at once, so it can never split a
