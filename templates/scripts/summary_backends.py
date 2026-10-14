@@ -1151,26 +1151,98 @@ def _cli_help_text(claude_path: str) -> str:
     return best
 
 
+#: v0.2.103 R2 (L-5): the isolation verdict is cached ACROSS processes in
+#: the VCT state dir (the same home as the breaker latch), keyed by the CLI
+#: binary's path + mtime + size — a CLI upgrade changes the stat, so the
+#: verdict is re-derived exactly when the binary changed. Without this, a
+#: one-process-per-node caller (the launcher's summary walk) re-ran
+#: ``claude --help`` 2-4 times per node: 2-4 Node.js startups of ~1 s each
+#: per summarised node.
+CLI_ISOLATION_CACHE_FILENAME = "summary-cli-isolation-cache.json"
+
+
+def _cli_isolation_cache_path() -> Path:
+    return _vct_state_dir() / CLI_ISOLATION_CACHE_FILENAME
+
+
+def _load_isolation_cache() -> dict:
+    try:
+        data = json.loads(_cli_isolation_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_isolation_cache(data: dict) -> None:
+    """Persist the cache (tmp + replace). Soft-fails like the breaker file."""
+    try:
+        path = _cli_isolation_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a read-only state dir must not break summary runs
+
+
+def _cli_binary_fingerprint(claude_path: str) -> "str | None":
+    try:
+        st = os.stat(claude_path)
+    except OSError:
+        return None
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
 def cli_isolation_args(claude_path: str) -> list[str]:
     """The argv that starts a headless call with no MCP server and no hook.
 
     Each flag is added only when the installed CLI lists it in ``--help``
     (verified once per process per binary); a missing flag is logged once
     and the call runs without it — never refused, never guessed.
+
+    v0.2.103 R2 (L-5): the FLAG VERDICT is cached on disk (path + mtime +
+    size key) beside the breaker latch, so the launcher's
+    one-process-per-node summary walk stops paying 2-4 ``claude --help``
+    spawns per node. Only the verdict is cached — never the argv, whose
+    isolation-file paths point into THIS process's temp dir. A binary
+    whose stat cannot be read is never cached (the key would be
+    meaningless) — it simply re-probes, as before.
     """
     if claude_path in _CLI_ISOLATION:
         return list(_CLI_ISOLATION[claude_path])
-    help_text = _cli_help_text(claude_path)
+    fingerprint = _cli_binary_fingerprint(claude_path)
+    verdict: "dict[str, bool] | None" = None
+    if fingerprint is not None:
+        entry = _load_isolation_cache().get(claude_path)
+        if (isinstance(entry, dict)
+                and entry.get("fingerprint") == fingerprint
+                and isinstance(entry.get("verdict"), dict)):
+            verdict = {
+                str(k): bool(v)
+                for k, v in entry["verdict"].items() if k in ("strict_mcp", "settings")
+            }
+            if len(verdict) != 2:
+                verdict = None
+    if verdict is None:
+        help_text = _cli_help_text(claude_path)
+        verdict = {
+            "strict_mcp": (_cli_lists_flag(help_text, "--strict-mcp-config")
+                           and _cli_lists_flag(help_text, "--mcp-config")),
+            "settings": _cli_lists_flag(help_text, "--settings"),
+        }
+        if fingerprint is not None:
+            cache = _load_isolation_cache()
+            cache[claude_path] = {"fingerprint": fingerprint, "verdict": verdict}
+            _save_isolation_cache(cache)
     args: list[str] = []
     missing: list[str] = []
     try:
-        if (_cli_lists_flag(help_text, "--strict-mcp-config")
-                and _cli_lists_flag(help_text, "--mcp-config")):
+        if verdict["strict_mcp"]:
             args += ["--strict-mcp-config", "--mcp-config",
                      str(_isolation_dir() / "empty-mcp.json")]
         else:
             missing.append("--strict-mcp-config/--mcp-config (MCP servers will start)")
-        if _cli_lists_flag(help_text, "--settings"):
+        if verdict["settings"]:
             args += ["--settings", str(_isolation_dir() / "no-hooks-settings.json")]
         else:
             missing.append("--settings (hooks will run)")
@@ -1558,10 +1630,14 @@ def _codegraph_walk_active() -> bool:
     Two read-only signals, either sufficient (v0.2.103 8c):
 
     * the launcher's ``code_graph_builds`` ledger carries a row in
-      ``pending``/``running`` for ANY project — the GPU is machine-wide, so
-      another project's walk competes just as hard (the same status filter
-      ``vco_lib.collection_rename._refuse_if_in_flight`` reads, minus the
-      per-project narrowing);
+      ``running`` for ANY project — the GPU is machine-wide, so another
+      project's walk competes just as hard. ``running`` only (v0.2.103 R2,
+      L-5): a merely ``pending`` row is a queued build that has not started
+      (launcher closed, ``resume_pending_builds`` not yet run) — deferring
+      on it blocked local summaries while nothing used the GPU;
+      ``vco_lib.collection_rename._refuse_if_in_flight`` keeps the stricter
+      pending+running filter because a RENAME must not race a queued build's
+      later spawn — the two guards answer different questions;
     * the code-embed service's ``/health`` reports ``in_flight`` requests
       or ``inference_busy`` (its own liveness fields, v0.2.102 r2).
 
@@ -1577,7 +1653,7 @@ def _codegraph_walk_active() -> bool:
             try:
                 row = conn.execute(
                     "SELECT 1 FROM code_graph_builds "
-                    "WHERE status IN ('pending','running') LIMIT 1"
+                    "WHERE status = 'running' LIMIT 1"
                 ).fetchone()
             finally:
                 conn.close()
@@ -1598,27 +1674,43 @@ def _codegraph_walk_active() -> bool:
     return False
 
 
-#: Free-VRAM floor for the local tier (MB). v0.2.103 8c: conservative — it
-#: must cover the LARGEST default generation tier (qwen3.5:9b ≈ 5.5 GB of
-#: weights at Q4 plus a KV cache at the shared 8 192-token window ≈ 2 GB),
-#: because the tier table resolves ONE model per machine and this guard
-#: runs before that model loads. A machine whose free VRAM is below the
-#: floor defers the node (owed work) rather than risk the OOM the field
-#: saw; ``KG_SUMMARY_MIN_FREE_VRAM_MB`` retunes it.
+#: Free-VRAM floor for the local tier (MB). v0.2.103 R2 (H-4): sized from
+#: the RESOLVED model's own need — its on-disk weights size (Ollama
+#: ``/api/tags`` ``size``) plus a KV-cache/activation margin — NOT one flat
+#: constant for every tier. The old flat 8 192 MB floor (sized for
+#: ``qwen3.5:9b``) disabled the local tier FOREVER on every 6-8 GB GPU,
+#: whose resolved model is ``gemma4:e4b`` (~3 GB), even with no cloud key
+#: and no walk active. A machine whose free VRAM is below the derived floor
+#: defers the node (owed work) rather than risk the OOM the field saw.
+#: ``KG_SUMMARY_MIN_FREE_VRAM_MB`` overrides the derived floor.
 ENV_MIN_FREE_VRAM_MB = "KG_SUMMARY_MIN_FREE_VRAM_MB"
+#: Fallback floor when the model's size cannot be read (Ollama unreachable
+#: while deriving it): conservative, sized for the largest default tier.
 DEFAULT_MIN_FREE_VRAM_MB = 8192
+#: KV cache at the shared generate window + activations + headroom, as a
+#: fraction of the weights size (Q4 GGUF rule of thumb: the KV cache for an
+#: 8k-token window lands at roughly a third of the weights) — with an
+#: absolute minimum so the floor never drops to "weights alone" for the
+#: sub-1 GB floor model.
+VRAM_MARGIN_FRACTION = 0.4
+VRAM_MARGIN_MIN_MB = 1024
 
 VRAM_PROBE_TIMEOUT_S = 5
+OLLAMA_PROBE_TIMEOUT_S = 3
 
 
 def _free_vram_mb() -> "int | None":
-    """Free VRAM in MB, or ``None`` when unknown.
+    """Free VRAM in MB (the BEST card), or ``None`` when unknown.
 
     ``nvidia-smi`` is the only probe — it ships with the NVIDIA driver on
     every OS VCO supports. Absent (non-NVIDIA machine), failing or slow →
     unknown, and the caller then proceeds only when no walk is active
     (the brief's cross-OS rule: a failed probe must not block the tier on
     its own).
+
+    v0.2.103 R2 (L-5): the MAXIMUM across cards, not GPU 0's line — Ollama
+    places the model where the VRAM is, so a machine whose GPU 0 is busy
+    but GPU 1 is empty must not read as VRAM-starved.
     """
     import subprocess as _sub
 
@@ -1636,19 +1728,63 @@ def _free_vram_mb() -> "int | None":
     if result.returncode != 0:
         return None
     lines = [ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()]
-    if not lines:
-        return None
+    values: list[int] = []
+    for ln in lines:
+        try:
+            values.append(int(float(ln.split()[0])))
+        except (IndexError, ValueError):
+            continue
+    return max(values) if values else None
+
+
+def _required_free_vram_mb(weights_mb: "int | None") -> int:
+    """The floor for a model whose on-disk size is *weights_mb* MB.
+
+    ``weights_mb=None`` (size unknown) → the conservative default sized for
+    the largest tier — an unknown model must not lower the bar silently.
+    """
+    if weights_mb is None:
+        return DEFAULT_MIN_FREE_VRAM_MB
+    margin = max(VRAM_MARGIN_MIN_MB, int(weights_mb * VRAM_MARGIN_FRACTION))
+    return weights_mb + margin
+
+
+def _min_free_vram_mb(weights_mb: "int | None" = None) -> int:
+    """The effective floor: ``KG_SUMMARY_MIN_FREE_VRAM_MB`` when set,
+    else the model-derived one."""
+    override = _int_env(ENV_MIN_FREE_VRAM_MB, 0)
+    if override >= 1:
+        return override
+    return _required_free_vram_mb(weights_mb)
+
+
+def _ollama_model_resident(model: str) -> bool:
+    """True when Ollama's ``/api/ps`` shows *model* already loaded.
+
+    A resident model needs NO new VRAM allocation, so the free-VRAM floor
+    must not count it against itself (H-4: a 16 GB GPU with the generation
+    model idle-resident read as "below floor" forever). Any probe failure
+    reads "not resident" — the caller then applies the ordinary floor.
+    """
+    want = model if ":" in model else f"{model}:latest"
     try:
-        return int(float(lines[0].split()[0]))
-    except (IndexError, ValueError):
-        return None
+        with urllib.request.urlopen(
+            f"{OLLAMA_URL}/api/ps", timeout=OLLAMA_PROBE_TIMEOUT_S
+        ) as resp:
+            if resp.status != 200:
+                return False
+            body = json.loads(resp.read().decode("utf-8") or "{}")
+    except Exception:  # noqa: BLE001 — a failed probe is not residency
+        return False
+    models = body.get("models") if isinstance(body, dict) else None
+    names = {
+        str(m.get(key)) for m in (models if isinstance(models, list) else [])
+        if isinstance(m, dict) for key in ("name", "model") if m.get(key)
+    }
+    return want in names
 
 
-def _min_free_vram_mb() -> int:
-    return _int_env(ENV_MIN_FREE_VRAM_MB, DEFAULT_MIN_FREE_VRAM_MB)
-
-
-def _ollama_local_deferred() -> "str | None":
+def _ollama_local_deferred(weights_mb: "int | None" = None) -> "str | None":
     """Why the local tier must NOT load right now, or ``None``.
 
     v0.2.103 8c (field 2026-10-14: a local 32K-ctx generation model filled
@@ -1658,14 +1794,22 @@ def _ollama_local_deferred() -> "str | None":
     records the node as owed work for the next run. A FORCED
     ``KG_SUMMARY_BACKEND=ollama`` bypasses this guard by design — the
     forced path never probes availability (see ``select_backend``).
+
+    v0.2.103 R2 (H-4): the free-VRAM floor is sized from the model's own
+    need (``weights_mb``, from ``/api/tags``), and the check is SKIPPED
+    entirely when ``/api/ps`` shows the model already resident — nothing
+    new would be allocated.
     """
     if _codegraph_walk_active():
         return ("a code-graph embedding walk is active — the local model "
                 "would compete with it for VRAM")
+    if _ollama_model_resident(OLLAMA_DEFAULT_MODEL):
+        return None  # already loaded: no new allocation to make room for
     free = _free_vram_mb()
-    if free is not None and free < _min_free_vram_mb():
+    floor = _min_free_vram_mb(weights_mb)
+    if free is not None and free < floor:
         return (f"only {free} MB VRAM free "
-                f"(< {_min_free_vram_mb()} MB floor)")
+                f"(< {floor} MB floor the resolved model needs)")
     return None
 
 
@@ -1680,36 +1824,53 @@ def ollama_available() -> bool:
     ``/api/generate`` for an absent model is a 404, and a pull is multi-GB).
 
     v0.2.103 8c: the local tier is additionally DEFERRED while a code-graph
-    embedding walk is active or free VRAM is below the floor — see
-    :func:`_ollama_local_deferred`.
+    embedding walk is active or free VRAM is below the model-derived floor —
+    see :func:`_ollama_local_deferred`.
+
+    v0.2.103 R2 (L-5): ``/api/tags`` is checked BEFORE the deferral
+    reasons — a machine that simply lacks the model must log "does not hold
+    <model> — not pulling it", not "deferred — low VRAM", and the model's
+    on-disk size from the same ``/api/tags`` reply is what sizes the floor.
     """
     if not OLLAMA_DEFAULT_MODEL:
         _log("  Ollama summary tier unavailable: no generation model resolved "
              "(vco_lib not importable — see the stderr line above)")
         return False
-    defer_reason = _ollama_local_deferred()
-    if defer_reason is not None:
-        _log(f"  Ollama summary tier deferred — {defer_reason}; "
-             "the node stays owed for the next run")
-        return False
     want = OLLAMA_DEFAULT_MODEL if ":" in OLLAMA_DEFAULT_MODEL else f"{OLLAMA_DEFAULT_MODEL}:latest"
     try:
-        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as resp:
+        with urllib.request.urlopen(
+            f"{OLLAMA_URL}/api/tags", timeout=OLLAMA_PROBE_TIMEOUT_S
+        ) as resp:
             if resp.status != 200:
                 return False
             body = json.loads(resp.read().decode("utf-8") or "{}")
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
         return False
     models = body.get("models") if isinstance(body, dict) else None
-    names = {
-        str(m.get(key)) for m in (models if isinstance(models, list) else [])
-        if isinstance(m, dict) for key in ("name", "model") if m.get(key)
-    }
-    if want in names:
-        return True
-    _log(f"  Ollama answers but does not hold `{want}` — not pulling it at runtime; "
-         "trying the next summary backend")
-    return False
+    size_mb: "int | None" = None
+    held = False
+    for m in (models if isinstance(models, list) else []):
+        if not isinstance(m, dict):
+            continue
+        for key in ("name", "model"):
+            if m.get(key) and str(m.get(key)) == want:
+                held = True
+                raw_size = m.get("size")
+                if isinstance(raw_size, (int, float)) and raw_size > 0:
+                    size_mb = int(raw_size) // (1024 * 1024)
+                break
+        if held:
+            break
+    if not held:
+        _log(f"  Ollama answers but does not hold `{want}` — not pulling it at runtime; "
+             "trying the next summary backend")
+        return False
+    defer_reason = _ollama_local_deferred(size_mb)
+    if defer_reason is not None:
+        _log(f"  Ollama summary tier deferred — {defer_reason}; "
+             "the node stays owed for the next run")
+        return False
+    return True
 
 
 def call_ollama(prompt: str, model: str = OLLAMA_DEFAULT_MODEL) -> str:
@@ -2161,6 +2322,7 @@ def call_llm(
     force_api: bool = False,
     env_keys: tuple[str, ...] = ("KG_SUMMARY_BACKEND",),
     label: str = "KG-summary",
+    forbid: "tuple[str, ...] | frozenset[str]" = (),
 ) -> str:
     """Summarise *prompt*, descending the ladder when a tier stops serving.
 
@@ -2173,6 +2335,16 @@ def call_llm(
     so substituting another model silently would be exactly the kind of
     unannounced behaviour change this release exists to remove. The
     failure is raised (and logged) instead.
+
+    ``forbid`` (v0.2.103 R2, M-1): tier ids this PROMPT must not descend
+    to, whatever the ladder's health. A batch envelope up to
+    ``BATCH_CHAR_BUDGET`` (~48k chars ≈ 12-16k tokens) does not fit the
+    shared Ollama ``num_ctx`` (8 192) — sending it there would silently
+    truncate the front of the prompt, lose the envelope instructions, fail
+    the parse and re-run every entity. A caller holding such a prompt
+    passes ``forbid=("ollama",)`` and handles the raise by SPLITTING to
+    per-item calls (whose prompts fit the window); the tier itself is
+    healthy and its breaker is NOT tripped.
     """
     forced = _forced_backend(env_keys) in VALID_BACKENDS
     tried: set = set()
@@ -2181,6 +2353,12 @@ def call_llm(
                                  label=label)
         if backend == "skip" or backend in tried:
             raise RuntimeError("no backend available")
+        if backend in forbid:
+            raise RuntimeError(
+                f"{label}: backend '{backend}' is excluded for this prompt "
+                "(its context window cannot hold it); the caller splits "
+                "the work instead"
+            )
         tried.add(backend)
         try:
             text = _dispatch(backend, prompt)

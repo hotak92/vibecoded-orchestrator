@@ -42,13 +42,19 @@ from vco_lib.embedding_providers.ollama import _with_keep_alive
 #: ONE shared value is required (a per-caller window reloads the model — the
 #: exact divergence this module exists to prevent), so this is the SMALLEST
 #: that fits every generation prompt VCO sends: the largest is a single body
-#: truncated at 4 000 characters (~1.3k tokens; batched prompts go to the
-#: CLI tier, never Ollama) + the system prompt + the 1 024 ``num_predict``
-#: output budget ≈ 3k tokens, and 8 192 leaves 2× headroom over that worst
-#: case. 32768 — the historical value — loaded a KV cache 4× larger than any
-#: prompt needs, which is what filled a 16 GB GPU beside the code-embedding
-#: re-index in the field (2026-10-14). ``$VCO_OLLAMA_GENERATE_NUM_CTX``
-#: still overrides for every caller at once.
+#: truncated at 4 000 characters (~1.3k tokens) + the system prompt + the
+#: 1 024 ``num_predict`` output budget ≈ 3k tokens, and 8 192 leaves 2×
+#: headroom over that worst case. The one prompt that does NOT fit — the
+#: code-summary batch envelope, up to 48 000 chars — is kept off this tier
+#: BY CONSTRUCTION: ``summary_backends.call_llm(..., forbid=("ollama",))``
+#: raises instead of descending to Ollama for it, and the caller splits to
+#: per-entity prompts that fit (v0.2.103 R2, M-1 — before that, a CLI
+#: usage-limit demotion mid-batch could land the 48k envelope here and
+#: silently truncate its front). 32768 — the historical value — loaded a
+#: KV cache 4× larger than any prompt needs, which is what filled a 16 GB
+#: GPU beside the code-embedding re-index in the field (2026-10-14).
+#: ``$VCO_OLLAMA_GENERATE_NUM_CTX`` still overrides for every caller at
+#: once.
 GENERATE_NUM_CTX_DEFAULT = 8192
 
 #: Machine-wide override of :data:`GENERATE_NUM_CTX_DEFAULT` (a positive int).

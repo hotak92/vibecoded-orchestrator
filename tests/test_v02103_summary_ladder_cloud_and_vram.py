@@ -10,10 +10,13 @@ skipped silently, never an error. A model REFUSAL stays FINAL (no tier
 descent); only tier-level failures demote via the existing breaker.
 
 8c — the local tier must not compete with the code-embedding re-index for
-VRAM: a code-graph walk (launcher ledger row pending/running, or the
-code-embed service's /health in-flight fields) or free VRAM below the floor
-defers the node (owed work) instead of loading the model. VRAM probing
-soft-fails to unknown → proceed only when no walk is active.
+VRAM: a code-graph walk (launcher ledger row running — pending alone is a
+queued build nobody started, R2/L-5 — or the code-embed service's /health
+in-flight fields) or free VRAM below the MODEL-DERIVED floor (R2/H-4: the
+resolved model's /api/tags size + margin, skipped entirely when /api/ps
+shows the model resident) defers the node (owed work) instead of loading
+the model. VRAM probing soft-fails to unknown → proceed only when no walk
+is active.
 
 8g — ``cli_isolation_args`` wrongly decided the installed claude CLI lacks
 ``--strict-mcp-config``: the CLI's own help writer intermittently truncates
@@ -295,16 +298,24 @@ def test_qwen_is_served_by_the_shared_dispatch(sb, monkeypatch):
 
 # ─── 8c: the local tier's VRAM / walk guard ────────────────────────────────
 
-def _tags_ok(sb, monkeypatch):
-    """Ollama answers /api/tags and holds the model (the pre-8c checks),
-    and the REAL ollama_available runs (the fixture pins it off)."""
+def _tags_ok(sb, monkeypatch, *, size=None, resident=False, held=True):
+    """Ollama answers /api/tags (holding the model, optionally with its
+    on-disk size), /api/ps (residency), and the REAL ollama_available runs
+    (the fixture pins it off)."""
     monkeypatch.setattr(sb, "ollama_available", sb.real_ollama_available)
     monkeypatch.setattr(sb, "OLLAMA_DEFAULT_MODEL", "qwen3.5:9b",
                         raising=False)
+    entry = {"name": "qwen3.5:9b"}
+    if size is not None:
+        entry["size"] = size
 
     def _fake_urlopen(url, timeout=None):
         if str(url).endswith("/api/tags"):
-            return _FakeResponse({"models": [{"name": "qwen3.5:9b"}]})
+            return _FakeResponse(
+                {"models": [entry] if held else []})
+        if str(url).endswith("/api/ps"):
+            models = [{"name": "qwen3.5:9b"}] if resident else []
+            return _FakeResponse({"models": models})
         raise AssertionError(f"unexpected url {url}")
 
     monkeypatch.setattr(sb.urllib.request, "urlopen", _fake_urlopen)
@@ -349,6 +360,53 @@ def test_unknown_vram_proceeds_when_no_walk_is_active(sb, monkeypatch):
     assert sb.ollama_available() is True
 
 
+# ─── H-4 (R2): the floor is sized from the RESOLVED model ──────────────────
+
+_GB = 1024 * 1024 * 1024
+
+
+def test_small_model_on_a_small_gpu_uses_the_local_tier(sb, monkeypatch):
+    """The flat 8 192 MB floor disabled the local tier FOREVER on every
+    6-8 GB GPU (resolved model gemma4:e4b ≈ 3 GB, no cloud keys, no CLI).
+    Sized from the model's own /api/tags size + margin, 4 500 MB free is
+    enough."""
+    _tags_ok(sb, monkeypatch, size=3 * _GB)
+    monkeypatch.setattr(sb, "_codegraph_walk_active", lambda: False)
+    monkeypatch.setattr(sb, "_free_vram_mb", lambda: 4500)
+    assert sb.ollama_available() is True
+
+
+def test_large_model_still_defers_on_a_small_gpu(sb, monkeypatch):
+    """The leave-alone half: qwen3.5:9b's ~5.5 GB weights + margin need
+    more than 4 500 MB — the OOM the guard exists to prevent."""
+    _tags_ok(sb, monkeypatch, size=int(5.5 * _GB))
+    monkeypatch.setattr(sb, "_codegraph_walk_active", lambda: False)
+    monkeypatch.setattr(sb, "_free_vram_mb", lambda: 4500)
+    assert sb.ollama_available() is False
+    assert any("VRAM" in ln for ln in sb.log_lines), sb.log_lines
+
+
+def test_a_resident_model_skips_the_vram_check(sb, monkeypatch):
+    """A model already loaded (/api/ps) needs NO new allocation — the old
+    guard counted it against itself and deferred forever."""
+    _tags_ok(sb, monkeypatch, resident=True)
+    monkeypatch.setattr(sb, "_codegraph_walk_active", lambda: False)
+    monkeypatch.setattr(sb, "_free_vram_mb", lambda: 100)
+    assert sb.ollama_available() is True
+
+
+def test_a_missing_model_logs_not_pulled_even_at_low_vram(sb, monkeypatch):
+    """L-5: /api/tags is checked BEFORE the deferral reasons, so a machine
+    that simply lacks the model says "does not hold" instead of a
+    misleading "deferred — low VRAM"."""
+    _tags_ok(sb, monkeypatch, held=False)
+    monkeypatch.setattr(sb, "_codegraph_walk_active", lambda: False)
+    monkeypatch.setattr(sb, "_free_vram_mb", lambda: 100)
+    assert sb.ollama_available() is False
+    assert any("does not hold" in ln for ln in sb.log_lines), sb.log_lines
+    assert not any("deferred" in ln for ln in sb.log_lines), sb.log_lines
+
+
 def test_deferred_local_descends_to_the_cloud_tier(sb, monkeypatch):
     """The point of 8b+8c together: with a vendor key on the machine, the
     cloud tier serves even while a walk runs — selection reaches the local
@@ -379,6 +437,18 @@ def test_walk_signal_reads_the_launcher_ledger(sb, tmp_path, monkeypatch):
     monkeypatch.setattr(sb, "_vct_state_dir", lambda: state)
     assert sb._codegraph_walk_active() is True
     _make_builds_db(state, ["success", "failed", "partial", "skipped"])
+    assert sb._codegraph_walk_active() is False
+
+
+def test_a_pending_build_alone_does_not_defer(sb, tmp_path, monkeypatch):
+    """v0.2.103 R2 (L-5): `pending` is a QUEUED build that has not started
+    (launcher closed, resume_pending_builds not yet run) — deferring on it
+    blocked local summaries while nothing used the GPU. Only `running`
+    counts."""
+    monkeypatch.setenv("CODE_EMBED_SERVICE_URL", "http://127.0.0.1:9")
+    state = tmp_path / "vct-state"
+    _make_builds_db(state, ["pending", "pending"])
+    monkeypatch.setattr(sb, "_vct_state_dir", lambda: state)
     assert sb._codegraph_walk_active() is False
 
 
@@ -418,7 +488,9 @@ def test_free_vram_probe_parses_nvidia_smi(sb, monkeypatch):
 
     monkeypatch.setattr(sb.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    assert sb._free_vram_mb() == 5327
+    # v0.2.103 R2 (L-5): the MAXIMUM across cards, not GPU 0's line —
+    # Ollama places the model where the VRAM is.
+    assert sb._free_vram_mb() == 12000
 
 
 # ─── 8c: the shared num_ctx is sized to the prompts, not the old 32k ───────
@@ -427,13 +499,50 @@ def test_generate_num_ctx_is_the_smallest_shared_window():
     """v0.2.103 8c: ONE shared value is required (a per-caller window
     reloads the model), so it is the smallest that fits every generation
     prompt VCO sends — the largest Ollama-bound prompt is a 4 000-char
-    body (~1.3k tokens; batched prompts go to the CLI tier) + system +
-    the 1 024 num_predict budget ≈ 3k tokens. 32 768 loaded a KV cache 4×
-    larger than any prompt needs (the field GPU OOM, 2026-10-14)."""
+    body (~1.3k tokens; the one larger prompt, the code-summary batch
+    envelope, is kept off the Ollama tier BY CONSTRUCTION via
+    ``call_llm(..., forbid=("ollama",))`` — see the M-1 test below) +
+    system + the 1 024 num_predict budget ≈ 3k tokens. 32 768 loaded a KV
+    cache 4× larger than any prompt needs (the field GPU OOM,
+    2026-10-14)."""
     from vco_lib import ollama_generate
 
     assert ollama_generate.GENERATE_NUM_CTX_DEFAULT == 8192
     assert ollama_generate.generate_num_ctx() == 8192
+
+
+def test_a_batch_prompt_never_descends_to_the_ollama_tier(sb, monkeypatch):
+    """M-1 (R2): a CLI usage-limit demotion mid-batch used to land the
+    ~48k-char batch envelope on Ollama, whose shared num_ctx (8 192)
+    silently truncated its front — the parse failed and every entity
+    re-ran. ``forbid=("ollama",)`` raises instead (no breaker trip: the
+    tier is healthy, the prompt is the wrong shape) and the caller splits
+    to per-entity prompts that fit."""
+    _pin_tiers(monkeypatch, sb, cli=True, ollama=True)
+    sb._BACKEND_CACHE["choice"] = "cli"
+    ollama_calls: list[str] = []
+
+    def _rate_limited(prompt):
+        raise urllib.error.HTTPError(
+            "https://api.anthropic.com/x", 429,
+            "Too Many Requests", Message(), None)
+
+    monkeypatch.setattr(sb, "call_cli", _rate_limited)
+    monkeypatch.setattr(sb, "call_ollama",
+                        lambda p, **kw: ollama_calls.append(p) or "z" * 40)
+    with pytest.raises(RuntimeError) as ei:
+        sb.call_llm("x" * 48_000, label="code-summary", forbid=("ollama",))
+    assert "excluded" in str(ei.value), ei.value
+    assert ollama_calls == [], "the batch envelope must never reach Ollama"
+    assert sb.breaker_state("ollama") is None, (
+        "a prompt-shape exclusion is not a tier failure — the breaker "
+        "must stay closed"
+    )
+    # The control: WITHOUT the forbid, the same descent does reach Ollama
+    # for an ordinary (window-fitting) prompt — the ladder itself is
+    # unchanged.
+    assert sb.call_llm("short prompt", label="code-summary") == "z" * 40
+    assert ollama_calls == ["short prompt"]
 
 
 # ─── 8g: the CLI isolation-flag probe on real help output ──────────────────
@@ -512,3 +621,77 @@ def test_isolation_args_still_log_once_when_help_really_lacks_flags(
     args = sb.cli_isolation_args("/usr/bin/claude")
     assert args == []
     assert any("does not offer" in ln for ln in sb.log_lines), sb.log_lines
+
+
+def test_isolation_verdict_is_cached_across_processes(sb, monkeypatch,
+                                                      real_help, tmp_path):
+    """L-5 (R2): the launcher spawns ONE summary process per node; without
+    the disk cache each paid 2-4 ``claude --help`` spawns (~1 s each). A
+    fresh module (new process) with the SAME state dir and an UNCHANGED
+    binary stat must answer from the cache — and a binary whose mtime
+    changed must re-probe."""
+    claude_bin = tmp_path / "claude"
+    claude_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    reads = {"n": 0}
+
+    def _fake_run(argv, **kwargs):
+        assert "--help" in argv
+        reads["n"] += 1
+        return _FakeProc(real_help)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    first = sb.cli_isolation_args(str(claude_bin))
+    assert "--strict-mcp-config" in first
+    assert reads["n"] >= 2, "the probing path must have run"
+    after = reads["n"]
+
+    # A NEW process: same state dir (VCT_STATE_DIR from the fixture), fresh
+    # module (empty in-process cache), binary untouched.
+    fresh = _load("_v02103_sb_fresh")
+    fresh.set_logger(lambda _ln: None)
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    cached = fresh.cli_isolation_args(str(claude_bin))
+    assert cached, "the cached verdict must rebuild the argv"
+    assert reads["n"] == after, "no new --help spawn on a cache hit"
+
+    # The argv is REBUILT from the verdict, never replayed verbatim: its
+    # isolation files must point at THIS process's temp dir (which exists),
+    # not the first process's (already deleted) one.
+    flags = [a for a in cached if a.startswith("--")]
+    assert flags == [a for a in first if a.startswith("--")]
+    file_args = [a for a in cached if not a.startswith("--")]
+    assert file_args and all(Path(a).is_file() for a in file_args)
+
+    # An upgraded binary (mtime changes) re-probes.
+    import os
+    st = claude_bin.stat()
+    os.utime(claude_bin, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    fresh2 = _load("_v02103_sb_fresh2")
+    fresh2.set_logger(lambda _ln: None)
+    fresh2.cli_isolation_args(str(claude_bin))
+    assert reads["n"] > after, "a changed binary must re-derive the verdict"
+
+
+# ─── L-5 (R2): document summaries respect the local-tier guard ─────────────
+
+def test_document_summaries_respect_the_vram_guard(monkeypatch):
+    """process_documents' direct Ollama post used to bypass the VRAM /
+    code-graph-walk guard entirely — the same OOM path the guard exists to
+    close. Deferred → the generic fallback summary, no Ollama request."""
+    _p = str(_REPO_ROOT / "templates" / "scripts")
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+    import process_documents as pd
+    import summary_backends as sb_mod
+
+    monkeypatch.setattr(sb_mod, "_ollama_local_deferred",
+                        lambda *a, **k: "only 100 MB VRAM free")
+    posts: list = []
+    import requests
+    monkeypatch.setattr(requests, "post",
+                        lambda *a, **k: posts.append(a) or _FakeResponse({}))
+    out = pd.generate_document_summary(None, "Title", "content")
+    assert out == "Document about Title"
+    assert posts == [], "a deferred local model must not be called"

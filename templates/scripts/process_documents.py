@@ -424,6 +424,19 @@ def generate_document_summary(server: WeaviateMCPServer, title: str, content: st
     import summary_backends as _sb  # pyright: ignore[reportMissingImports]
     from vco_lib.ollama_generate import generate_request_body
 
+    # v0.2.103 R2 (L-5): this direct Ollama post used to bypass the local
+    # tier's VRAM / code-graph-walk guard entirely — the same OOM path the
+    # guard exists to close. Deferred (walk active, model not resident and
+    # free VRAM below the model-derived floor) → the generic fallback
+    # summary, same as any other generation failure here.
+    try:
+        if _sb._ollama_local_deferred() is not None:
+            print("  ⚠️  Local model deferred (VRAM / code-graph walk) — "
+                  "using the default summary")
+            return f"Document about {title}"
+    except Exception:
+        pass  # a failed guard probe must not break document processing
+
     try:
         import requests
 

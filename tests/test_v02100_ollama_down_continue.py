@@ -336,4 +336,6 @@ def test_summary_ollama_tier_needs_the_model_present_and_never_pulls(monkeypatch
     assert sb.ollama_available() is False                 # the tier model is absent → degrade
     monkeypatch.setattr(sb.urllib.request, "urlopen", tags([sb.OLLAMA_DEFAULT_MODEL]))
     assert sb.ollama_available() is True
-    assert all(u.endswith("/api/tags") for u in urls)     # a probe, never /api/pull
+    # Read-only probes only — /api/tags (presence) and /api/ps (residency,
+    # v0.2.103 R2's already-loaded check) — never /api/pull.
+    assert all(u.endswith(("/api/tags", "/api/ps")) for u in urls)
