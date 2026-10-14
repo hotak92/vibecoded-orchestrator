@@ -42,9 +42,12 @@
 //! for hours, and killing a slow-but-working walk makes it look like a
 //! failure, so the user clicks again. The read loop below waits for the
 //! child however long it takes; the streamed per-file progress events
-//! ARE the liveness signal (a wedged child eventually dies on its own
-//! pipe errors). The modal's Cancel button is disabled with a "re-run is
-//! idempotent" tooltip (mirrors the enrichment modal pattern).
+//! ARE the liveness signal. With no timeout as a backstop, BOTH pipes
+//! are drained concurrently for as long as the child lives (see
+//! [`await_analyzer`]): a child whose stderr nobody reads would block
+//! forever on a full pipe buffer — an unkillable hang, not a slow walk.
+//! The modal's Cancel button is disabled with a "re-run is idempotent"
+//! tooltip (mirrors the enrichment modal pattern).
 
 use std::path::PathBuf;
 
@@ -286,21 +289,24 @@ async fn run_reanalysis_with_stream(
         }
     };
 
+    // v0.2.103 (review HIGH-2): stderr is drained CONCURRENTLY with the
+    // stdout read, not after the child exits. A piped stderr nobody
+    // reads fills its ~64 KiB kernel buffer and the child blocks on
+    // write(2) forever — with the 30-minute timeout gone that became an
+    // endless hang. Only the tail is kept (failure evidence).
+    let stderr_drain = async {
+        match stderr {
+            Some(stream) => drain_stderr_capped(stream, STDERR_EVIDENCE_BYTES).await,
+            None => String::new(),
+        }
+    };
+
     // No wall-clock deadline (see the module doc): the wait is a bare
     // await, however long the walk takes. The per-file progress events
     // above are the liveness signal.
-    read_fut.await;
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("wait analyzer: {}", e))?;
+    let (status, stderr_text) = await_analyzer(read_fut, stderr_drain, child.wait()).await?;
 
     if !status.success() {
-        let stderr_text = if let Some(err_stream) = stderr {
-            read_stderr_capped(err_stream, 2048).await
-        } else {
-            String::new()
-        };
         // Map the analyzer's documented exit codes to actionable text.
         let hint = match status.code() {
             Some(2) => " (schema case collision — see stderr)",
@@ -325,15 +331,66 @@ async fn run_reanalysis_with_stream(
     })
 }
 
-async fn read_stderr_capped(
-    stderr: tokio::process::ChildStderr,
+/// Cap on the analyzer stderr tail kept as failure evidence (the end of
+/// the stream is where the actual error is). Streaming drain — see
+/// [`drain_stderr_capped`].
+const STDERR_EVIDENCE_BYTES: usize = 2048;
+
+/// Drain a child's stderr while the child runs, keeping only the LAST
+/// `max_bytes` as failure evidence.
+///
+/// This MUST run concurrently with the child (and with the stdout
+/// read): a piped stderr nobody reads fills the kernel's pipe buffer
+/// (~64 KiB) and the child then blocks on every `write(2)` to it,
+/// forever — with the wall-clock timeout removed there is nothing left
+/// to break that deadlock, so the drain is what prevents it (v0.2.103
+/// review HIGH-2). The cap bounds memory: >1 MiB of analyzer warnings
+/// still leaves a 2 KiB tail.
+async fn drain_stderr_capped(
+    mut stderr: tokio::process::ChildStderr,
     max_bytes: usize,
 ) -> String {
-    let mut buf = Vec::with_capacity(max_bytes.min(4096));
-    let mut reader = BufReader::new(stderr);
-    let mut limited = (&mut reader).take(max_bytes as u64);
-    let _ = limited.read_to_end(&mut buf).await;
-    String::from_utf8_lossy(&buf).into_owned()
+    let mut chunk = [0u8; 4096];
+    let mut tail: Vec<u8> = Vec::with_capacity(max_bytes);
+    loop {
+        match stderr.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > max_bytes {
+                    let excess = tail.len() - max_bytes;
+                    tail.drain(..excess);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
+}
+
+/// Await the analyzer: consume both pipes concurrently, then reap the
+/// child — with NO wall-clock deadline (owner rule 2026-10-14).
+///
+/// Both stream futures are joined first so neither pipe can fill its
+/// kernel buffer and wedge the child; only then does the bare `wait`
+/// run, however long the walk takes. The per-file progress events
+/// emitted through `read` are the liveness signal. Returns the exit
+/// status plus the capped stderr tail (failure evidence for the
+/// non-zero-exit branch).
+async fn await_analyzer<R, S, W>(
+    read: R,
+    drain_stderr: S,
+    wait: W,
+) -> Result<(std::process::ExitStatus, String), String>
+where
+    R: std::future::Future<Output = ()>,
+    S: std::future::Future<Output = String>,
+    W: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+{
+    let ((), stderr_tail) = tokio::join!(read, drain_stderr);
+    let status = wait
+        .await
+        .map_err(|e| format!("wait analyzer: {}", e))?;
+    Ok((status, stderr_tail))
 }
 
 /// Discriminate progress vs final-report lines and dispatch each.
@@ -608,29 +665,104 @@ mod tests {
     /// of large projects (owner rule: never kill slow-but-working jobs; a
     /// killed walk looks like a failure and the user clicks again).
     ///
-    /// Pins the absence structurally (same house pattern as
-    /// `lib.rs`/`secrets_cmd.rs` self-source tests): the wait is a bare
-    /// await, so this file must contain neither the old deadline constant,
-    /// a tokio wall-clock wrapper around the wait, nor a forced kill of
-    /// the child. Split literals below so this test's own source does not
-    /// satisfy the scan.
-    #[test]
-    fn reanalysis_wait_has_no_wall_clock_kill() {
-        let src = include_str!("codegraph_reanalyze.rs");
-        let banned: [&str; 3] = [
-            // the old deadline constant name
-            concat!("REANALYSIS_", "TIMEOUT_SECS"),
-            // the tokio wrapper CALL shape (name + open paren)
-            concat!("time", "out", "("),
-            // the timeout branch's child kill
-            concat!("start_", "kill"),
-        ];
-        for needle in banned {
-            assert!(
-                !src.contains(needle),
-                "reanalyze_code_graph must not contain {:?} — no wall-clock kill on the analyzer wait",
-                needle
-            );
-        }
+    /// BEHAVIOURAL (review MEDIUM-1 replaced the old `include_str!`
+    /// self-source scan, which a deadline hidden in a helper or a
+    /// `select!`+`sleep` would pass): under paused tokio time, six hours
+    /// of virtual wall-clock advance must leave the wait PENDING — any
+    /// re-added deadline (a `timeout` wrapper, a `select!` on a `sleep`)
+    /// fires when time advances and this test goes red. Only the child's
+    /// own completion (the oneshots here) resolves the wait.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn reanalysis_wait_has_no_wall_clock_kill() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel::<()>();
+        let (wait_tx, wait_rx) = tokio::sync::oneshot::channel::<()>();
+        let read_fut = async {
+            let _ = read_rx.await;
+        };
+        let wait_fut = async {
+            let _ = wait_rx.await;
+            Ok::<_, std::io::Error>(std::process::ExitStatus::from_raw(0))
+        };
+        let drain_fut = async { String::new() };
+
+        let fut = await_analyzer(read_fut, drain_fut, wait_fut);
+        let mut fut = std::pin::pin!(fut);
+
+        // Pending before anything fires...
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, fut.as_mut())
+                .await
+                .is_err(),
+            "wait must stay pending while the child runs"
+        );
+        // ...and still pending after 6 h of virtual wall-clock — a
+        // re-added deadline would fire here and fail the assert below.
+        tokio::time::advance(std::time::Duration::from_secs(6 * 3600)).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, fut.as_mut())
+                .await
+                .is_err(),
+            "wait must survive 6 h of wall-clock with no deadline firing"
+        );
+
+        // The child's own completion resolves it.
+        let _ = read_tx.send(());
+        let _ = wait_tx.send(());
+        let (status, tail) = fut.await.expect("wait completes when the child does");
+        assert!(status.success());
+        assert_eq!(tail, "");
+    }
+
+    /// v0.2.103 (review HIGH-2): a child writing MORE than the kernel
+    /// pipe buffer (~64 KiB) to stderr and then exiting must complete —
+    /// not hang. Pre-fix, stderr was read only after `child.wait()`, so
+    /// the child blocked on its full stderr pipe forever (and with the
+    /// 30-minute timeout gone, nothing ever broke the deadlock). The
+    /// real-time watchdog turns that hang into a clean test failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn huge_stderr_child_completes_rather_than_deadlocking() {
+        // ~2 MiB of stderr (32x a 64 KiB pipe buffer), then exit 0.
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("yes 'EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE' | head -c 2200000 >&2; echo done");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .expect("spawn fake analyzer");
+        let stdout = child.stdout.take().expect("stdout pipe");
+        let stderr = child.stderr.take();
+
+        let mut reader = BufReader::new(stdout).lines();
+        let read_fut = async {
+            while let Ok(Some(_line)) = reader.next_line().await {}
+        };
+        let stderr_drain = async {
+            match stderr {
+                Some(stream) => drain_stderr_capped(stream, STDERR_EVIDENCE_BYTES).await,
+                None => String::new(),
+            }
+        };
+
+        // Watchdog is TEST-ONLY: production (await_analyzer) has no
+        // deadline; here it converts a deadlock into a red test.
+        let (status, tail) = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            await_analyzer(read_fut, stderr_drain, child.wait()),
+        )
+        .await
+        .expect("no stderr-pipe deadlock: child completed within the watchdog")
+        .expect("wait ok");
+
+        assert!(status.success());
+        // Evidence tail is capped at STDERR_EVIDENCE_BYTES despite >2 MiB.
+        assert_eq!(tail.len(), STDERR_EVIDENCE_BYTES);
+        assert!(tail.chars().all(|c| c == 'E' || c == '\n'));
     }
 }

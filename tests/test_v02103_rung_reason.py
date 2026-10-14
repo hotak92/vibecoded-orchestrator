@@ -30,34 +30,48 @@ class _LaunchedSpawn:
     message = ""
 
 
-def _drive_bundle_update(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
-                         prev_version: str, running_version: str) -> list[str]:
+def _drive_bundle_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prev_version: str,
+    running_version: str,
+) -> list[str]:
     """Run the ONE bundle-update shim end-to-end (real decision + real
     trigger wiring, fake graph probe + fake spawn) and return its warnings."""
     import vco_lib.codegraph_resync as _resync
 
     monkeypatch.setattr(ceg, "code_graph_exists", lambda *a, **k: True)
     monkeypatch.setattr(_resync, "spawn_background_resync", _LaunchedSpawn())
-    monkeypatch.setattr(project_init, "_resolve_codegraph_project_name",
-                        lambda _f: "DemoProj")
+    monkeypatch.setattr(
+        project_init, "_resolve_codegraph_project_name", lambda _f: "DemoProj"
+    )
     result: dict = {"warnings": []}
 
     def log(_step, _phase, _detail="", *, data=None):  # noqa: ARG001
         pass
 
     project_init._trigger_extractor_generation_reindex(
-        tmp_path, prev_version=prev_version, running_version=running_version,
-        is_root_target=False, result=result, log=log)
+        tmp_path,
+        prev_version=prev_version,
+        running_version=running_version,
+        is_root_target=False,
+        result=result,
+        log=log,
+    )
     return [w for w in result["warnings"] if "re-index started" in w]
 
 
-def test_two_rungs_two_different_messages(tmp_path: Path,
-                                          monkeypatch: pytest.MonkeyPatch):
+def test_two_rungs_two_different_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """The warning names the rung that crossed, not a fixed release."""
-    v92 = _drive_bundle_update(tmp_path, monkeypatch,
-                               prev_version="0.2.91", running_version="0.2.92")
-    v102 = _drive_bundle_update(tmp_path, monkeypatch,
-                                prev_version="0.2.101", running_version="0.2.102")
+    v92 = _drive_bundle_update(
+        tmp_path, monkeypatch, prev_version="0.2.91", running_version="0.2.92"
+    )
+    v102 = _drive_bundle_update(
+        tmp_path, monkeypatch, prev_version="0.2.101", running_version="0.2.102"
+    )
 
     assert len(v92) == 1 and len(v102) == 1
     assert "v0.2.92" in v92[0]
@@ -68,22 +82,25 @@ def test_two_rungs_two_different_messages(tmp_path: Path,
 
 
 def test_unknown_generation_falls_back_to_generic_wording(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """No known rung (no recorded version) → generic wording, never a
     specific release's reason presented as the trigger."""
-    warns = _drive_bundle_update(tmp_path, monkeypatch,
-                                 prev_version="", running_version="0.2.102")
+    warns = _drive_bundle_update(
+        tmp_path, monkeypatch, prev_version="", running_version="0.2.102"
+    )
     assert len(warns) == 1
     assert "v0.2.92" not in warns[0]
-    assert "v0.2.102 added" not in warns[0]      # no rung claimed as trigger
-    assert "extractor generation" in warns[0]     # generic fallback shown
+    assert "v0.2.102 added" not in warns[0]  # no rung claimed as trigger
+    assert "extractor generation" in warns[0]  # generic fallback shown
 
 
 def test_every_rung_has_a_user_facing_reason():
     """A ladder append without its reason text would silently regress every
     future message to the generic fallback — keep them in lockstep."""
     assert set(ceg.EXTRACTOR_GENERATION_RUNG_REASONS) == set(
-        ceg.EXTRACTOR_GENERATION_BUMPS)
+        ceg.EXTRACTOR_GENERATION_BUMPS
+    )
     for bump, text in ceg.EXTRACTOR_GENERATION_RUNG_REASONS.items():
         assert text.strip(), f"rung {bump} has an empty reason"
 
@@ -91,17 +108,68 @@ def test_every_rung_has_a_user_facing_reason():
 def test_describe_rung_shapes_and_fallbacks():
     described = ceg.describe_rung("0.2.92")
     assert described is not None and described.startswith("v0.2.92 ")
-    assert ceg.describe_rung("9.9.9") is None        # unknown rung
-    assert ceg.describe_rung(None) is None           # unknown generation
+    assert ceg.describe_rung("9.9.9") is None  # unknown rung
+    assert ceg.describe_rung(None) is None  # unknown generation
 
 
 def test_verdict_carries_the_crossed_bump():
-    verdict = ceg.decide(prev_version="0.2.101", running_version="0.2.102",
-                         stamp_generation=None, graph_exists=True)
+    verdict = ceg.decide(
+        prev_version="0.2.101",
+        running_version="0.2.102",
+        stamp_generation=None,
+        graph_exists=True,
+    )
     assert verdict.reason == ceg.REASON_CROSSES_BUMP
-    assert verdict.bump == "0.2.102"
+    assert verdict.bumps == ("0.2.102",)
     # Unknown-generation verdicts name no rung.
-    unknown = ceg.decide(prev_version="", running_version="0.2.102",
-                         stamp_generation=None, graph_exists=True)
+    unknown = ceg.decide(
+        prev_version="",
+        running_version="0.2.102",
+        stamp_generation=None,
+        graph_exists=True,
+    )
     assert unknown.reason == ceg.REASON_UNKNOWN_GENERATION
-    assert unknown.bump is None
+    assert unknown.bumps == ()
+
+
+def test_multi_rung_upgrade_names_the_newest_rung(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """v0.2.103 fix-round (review MEDIUM-3): a 0.2.91 → 0.2.103 upgrade
+    crosses FOUR rungs — the warning must lead with v0.2.102 (the
+    tree-sitter rewrite the walk delivers), not v0.2.92 alone, and must
+    say earlier rungs were crossed too."""
+    warns = _drive_bundle_update(
+        tmp_path, monkeypatch, prev_version="0.2.91", running_version="0.2.103"
+    )
+    assert len(warns) == 1
+    w = warns[0]
+    # The NEWEST rung's reason is the headline…
+    assert "v0.2.102" in w and "tree-sitter" in w
+    # …and the older crossed rungs are acknowledged, not hidden.
+    assert "and 3 earlier extractor changes" in w
+    # The old defect: the OLDEST crossed rung's reason shown alone.
+    assert "v0.2.92" not in w
+
+
+def test_verdict_carries_every_crossed_rung_oldest_first():
+    verdict = ceg.decide(
+        prev_version="0.2.91",
+        running_version="0.2.103",
+        stamp_generation=None,
+        graph_exists=True,
+    )
+    assert verdict.bumps == ("0.2.92", "0.2.93", "0.2.94", "0.2.102")
+
+
+def test_describe_rung_multi_rung_renders_newest_plus_count():
+    text = ceg.describe_rung(("0.2.92", "0.2.93", "0.2.94", "0.2.102"))
+    assert text is not None
+    assert text.startswith("v0.2.102 ")
+    assert text.endswith(" (and 3 earlier extractor changes)")
+    # Unordered input still picks the newest.
+    newest_first = ceg.describe_rung(("0.2.102", "0.2.92"))
+    assert newest_first is not None and newest_first.startswith("v0.2.102 ")
+    # A single rung keeps the old shape (no count suffix).
+    single = ceg.describe_rung(("0.2.92",))
+    assert single == ceg.describe_rung("0.2.92")

@@ -63,9 +63,12 @@ use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
-/// Hard ceiling on analyzer subprocess lifetime. Mirrors the
-/// `REANALYSIS_TIMEOUT_SECS` in `codegraph_reanalyze.rs` — 30 minutes
-/// for the worst-case full re-walk of a large polyglot repo + extras.
+/// Hard ceiling on analyzer subprocess lifetime for the EXTRAS sync —
+/// 30 minutes for the worst-case full re-walk of a large polyglot repo
+/// + extras. (This surface keeps its deadline; the Re-analyze modal's
+/// wait is deliberately unbounded — v0.2.103 removed
+/// `REANALYSIS_TIMEOUT_SECS` from `codegraph_reanalyze.rs`, so this no
+/// longer mirrors anything there.)
 const ANALYZE_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Tauri event name for progress lines emitted during sync / reindex.

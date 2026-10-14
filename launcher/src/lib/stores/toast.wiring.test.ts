@@ -6,15 +6,19 @@
 // outcome toast vanished before it could be read, so a walk that HAD
 // started looked like a failure and was clicked again. The dwell policy
 // now lives in ONE place (`stores/toast.ts::toastDwellMs`), so the thing
-// to guard is the WIRING, in both directions:
+// to guard is the WIRING:
 //
-//   (a) the code-graph update action's outcome goes THROUGH the toast
-//       store (`toast.success` / `toast.error`, no bespoke timer) — every
-//       `toast.*` call site inherits the policy for free, and a call site
-//       growing its own `setTimeout` would silently leave it;
-//   (b) the renderer (`Toast.svelte`) feeds the store the hover signal
-//       (`toast.setHovered` on pointerenter/pointerleave) — without it
-//       the pause half of the policy is dead code.
+//   the code-graph update action's outcome goes THROUGH the toast store
+//   (`toast.success` / `toast.error`, no bespoke timer) — every `toast.*`
+//   call site inherits the policy for free, and a call site growing its
+//   own `setTimeout` would silently leave it.
+//
+// The RENDERER half (pointerenter/leave + focusin/out feeding
+// `toast.setHovered`, the × button dismissing through the store) is now
+// guarded BEHAVIOURALLY by `src/lib/components/Toast.test.ts`, which
+// mounts the real component under jsdom (v0.2.103 fix-round, review
+// MEDIUM-2 — this file's former Svelte-AST scan of Toast.svelte was
+// still a source scan).
 //
 // AST-walked (not grepped) per the established pattern — comments satisfy
 // a grep. See projects-page-affordances.wiring.test.ts.
@@ -87,25 +91,5 @@ describe('code-graph update action outcome uses the ONE toast policy', () => {
 
   it('keeps no bespoke auto-dismiss timer of its own', () => {
     expect(bare).not.toContain('setTimeout');
-  });
-});
-
-describe('the renderer feeds the store the hover signal', () => {
-  const comp = readFileSync(
-    resolve(here, '../components/Toast.svelte'),
-    'utf8',
-  );
-  const parsed = parse(comp, { modern: true }) as unknown as Node;
-
-  it('wires pointerenter/pointerleave to toast.setHovered', () => {
-    const calls = memberCalls(parsed.fragment as Node);
-    expect(calls).toContain('toast.setHovered');
-    expect(comp).toContain('onpointerenter');
-    expect(comp).toContain('onpointerleave');
-  });
-
-  it('still wires manual dismiss through the store', () => {
-    const calls = memberCalls(parsed.fragment as Node);
-    expect(calls).toContain('toast.dismiss');
   });
 });
