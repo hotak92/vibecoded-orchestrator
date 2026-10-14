@@ -219,11 +219,14 @@ fn probe_bare_commands(install_root: &str, names: &[String]) -> Option<NpxProbeP
         return None;
     }
     let root = PathBuf::from(install_root);
-    // `resolve_venv_python`'s leg 2 probes the folder itself, so the `script`
-    // argument only needs to be a plausible in-tree path; the synthetic name
-    // below never has to exist.
-    let script = root.join(".claude").join("scripts").join("doctor-probe.py");
-    let py = crate::commands::kg_summary::resolve_venv_python(&root, &script)?;
+    // The orchestrator install root is known here, so resolve its venv with
+    // the canonical install-root resolver (`mcp_registration` — the same one
+    // MCP registration uses). v0.2.103: this used the kg_summary resolver,
+    // whose script-path-derived "install root" could pick a USER PROJECT's
+    // own `.venv`; with the orchestrator root passed explicitly the outcome
+    // was already correct, but the duplicate home was the trap the KG
+    // summariser fell into.
+    let py = crate::mcp_registration::resolve_venv_python(&root)?;
     // `.silent()` suppresses the Windows console flash (CREATE_NO_WINDOW).
     let mut cmd = std::process::Command::new(py).silent();
     cmd.arg("-m").arg("vco_lib.npx_resolver").arg("--json");

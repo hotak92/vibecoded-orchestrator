@@ -877,10 +877,15 @@ async fn run_summary_task(
         }
     };
 
-    // 4. Resolve the venv python (the summariser is `.py`, invoked
-    //    directly as `<venv-python> <script> <file>` — same as the
-    //    PostToolUse hook does it, see templates/hooks/kg-summary-generator.sh).
-    let venv_python = match resolve_venv_python(folder, &script) {
+    // 4. Resolve the interpreter (the summariser is `.py`, invoked
+    //    directly as `<python> <script> <file>`). It is a VCO script and
+    //    must run under the ORCHESTRATOR's venv — the one install.py
+    //    editable-installs vco_lib into — NEVER the user project's own
+    //    `.venv`, which has none of VCO's dependencies (the v0.2.103
+    //    defect: a project-local `.venv` was preferred and every node
+    //    printed "vco_lib is not importable"). Same RT-4 ladder as
+    //    `recheck_summary_backend` above, so both spawns agree.
+    let venv_python = match summariser_python() {
         Some(p) => p,
         None => {
             if !project_still_exists(&app, &project_id) {
@@ -891,10 +896,11 @@ async fn run_summary_task(
                 &project_id,
                 started_at,
                 nodes_total,
-                "Python venv not found (looked at <install>/.venv and \
-                 <install>/claude_mcp_servers/.venv on both POSIX and Windows \
-                 layouts). The orchestrator install may be incomplete — run \
-                 the launcher's first-install script."
+                "no orchestrator Python venv found for the KG summariser \
+                 (checked $VCT_VENV, $VCT_INSTALL_ROOT/.venv, \
+                 $VCT_ORCHESTRATOR_ROOT/.venv and the launcher binary's \
+                 ancestors). The orchestrator install may be incomplete — \
+                 run the launcher's first-install script."
                     .to_string(),
                 None,
             );
@@ -1296,17 +1302,8 @@ async fn invoke_summariser_once(
         }
         Ok(s) => {
             let exit_code = s.code().unwrap_or(-1);
-            // Snip a tight error message — prefer the last stderr line,
-            // fall back to last stdout line.
-            let snippet = stderr_buf
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .or_else(|| stdout_buf.lines().rev().find(|l| !l.trim().is_empty()))
-                .unwrap_or("")
-                .chars()
-                .take(200)
-                .collect::<String>();
+            // Snip a tight error message via the shared preference below.
+            let snippet = failure_snippet(&stdout_buf, &stderr_buf);
             NodeOutcome::Failed {
                 log,
                 error: format!(
@@ -1321,6 +1318,45 @@ async fn invoke_summariser_once(
             error: format!("wait failed: {}", e),
         },
     }
+}
+
+/// The per-node error snippet for a non-zero exit (v0.2.103 preference).
+///
+/// The generator's own failure diagnostics go to STDOUT —
+/// `generate-kg-summary.py` logs `… returned a non-answer (…)` and
+/// `… summary generation failed — …` via its `log()`. Import-time noise
+/// (and Python tracebacks) go to STDERR. Preferring the LAST stderr line
+/// (the pre-v0.2.103 behaviour) let one recurring stderr line — the
+/// "vco_lib is not importable" notice — mask the real reason for EVERY
+/// failing node. Preference order:
+///
+///   1. the last stdout line that names a failure (contains
+///      `non-answer` or `failed`) — the generator's diagnosis;
+///   2. the last non-empty stderr line (tracebacks, spawn errors);
+///   3. the last non-empty stdout line.
+///
+/// Capped at 200 chars, like the banner it feeds.
+fn failure_snippet(stdout: &str, stderr: &str) -> String {
+    let stdout_failure = stdout.lines().rev().find(|l| {
+        !l.trim().is_empty() && (l.contains("non-answer") || l.contains("failed"))
+    });
+    stdout_failure
+        .or_else(|| {
+            stderr
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+        })
+        .or_else(|| {
+            stdout
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+        })
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect::<String>()
 }
 
 /// Parse the summariser's "KG-summary backend: cli|ollama|api|skip (…)"
@@ -1609,81 +1645,24 @@ pub(crate) fn resolve_summary_script(
     )
 }
 
-/// Find a venv python that has the orchestrator's dependencies installed.
-/// Probes (in order):
+/// The interpreter for the per-node summariser spawn (v0.2.103).
 ///
-///   1. The script's grandparent + venv layouts (the install root the
-///      bundle-install dropped scripts under).
-///   2. `<project>/.venv` (project-local OSS layout).
-///   3. `<project>/claude_mcp_servers/.venv` (legacy private-orch layout).
-///   4. The launcher binary's own ancestors walked up 3-5 hops (for
-///      bundled launcher installs).
+/// The summariser is a VCO script: it must run under the ORCHESTRATOR's
+/// venv — the one install.py editable-installs `vco_lib` into — never the
+/// user project's own `.venv`, which has none of VCO's dependencies. The
+/// pre-v0.2.103 resolver here derived an "install root" from the SCRIPT
+/// path, which for `<project>/.claude/scripts/generate-kg-summary.py` IS
+/// the user project, so a project-local `.venv` won and every node died
+/// on `import vco_lib`.
 ///
-/// Matches `codegraph.rs::looks_like_install_root` cross-platform venv
-/// shapes (POSIX `.venv/bin/python(3)` + Windows `.venv/Scripts/python.exe`).
-/// Also mirrors `templates/scripts/kg-sync` / `kg-sync.ps1` which probe
-/// the same two candidate layouts.
-pub(crate) fn resolve_venv_python(
-    project_folder: &std::path::Path,
-    script: &std::path::Path,
-) -> Option<std::path::PathBuf> {
-    fn venv_python_in(root: &std::path::Path) -> Option<std::path::PathBuf> {
-        for layout in [
-            root.join(".venv"),
-            root.join("claude_mcp_servers").join(".venv"),
-        ] {
-            // POSIX
-            let posix1 = layout.join("bin").join("python");
-            if posix1.is_file() {
-                return Some(posix1);
-            }
-            let posix2 = layout.join("bin").join("python3");
-            if posix2.is_file() {
-                return Some(posix2);
-            }
-            // Windows
-            let win = layout.join("Scripts").join("python.exe");
-            if win.is_file() {
-                return Some(win);
-            }
-        }
-        None
-    }
-
-    // 1. The install root the script lives under (script -> .claude/scripts
-    //    -> .claude -> install root).
-    if let Some(install_root) = script
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-    {
-        if let Some(py) = venv_python_in(install_root) {
-            return Some(py);
-        }
-    }
-
-    // 2-3. The project folder itself (in case the bundle picked a
-    //    sibling-of-exe script but the project DOES have its own venv).
-    if let Some(py) = venv_python_in(project_folder) {
-        return Some(py);
-    }
-
-    // 4. Walk up from the launcher binary.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let mut cur = parent.to_path_buf();
-            for _ in 0..6 {
-                if let Some(py) = venv_python_in(&cur) {
-                    return Some(py);
-                }
-                match cur.parent() {
-                    Some(p) => cur = p.to_path_buf(),
-                    None => break,
-                }
-            }
-        }
-    }
-    None
+/// Delegates to the canonical RT-4 ladder
+/// (`vct_launcher_core::python_resolve::resolve_python_for_vco_lib` —
+/// `$VCT_VENV` → install/orchestrator root → exe-walk, cross-OS layouts),
+/// the same resolver `recheck_summary_backend` / `configure_vco_lib_command`
+/// use, so this spawn cannot drift from every other `vco_lib`-importing
+/// spawn. Kept as a named seam for the regression test below.
+fn summariser_python() -> Option<std::path::PathBuf> {
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
 }
 
 #[cfg(test)]
@@ -1793,75 +1772,94 @@ mod tests {
         fs::remove_dir_all(&d).ok();
     }
 
+    /// v0.2.103 regression pin: a project with its OWN `.venv` must NOT
+    /// win the summariser spawn — the orchestrator's interpreter does.
+    /// Pre-fix, `resolve_venv_python(project, script)` derived the install
+    /// root from the script path (= the user project for
+    /// `<project>/.claude/scripts/generate-kg-summary.py`) and returned
+    /// `<project>/.venv/bin/python`, killing every node on
+    /// `import vco_lib`.
     #[test]
     #[cfg(unix)]
-    fn resolve_venv_python_finds_posix_layout() {
-        use std::os::unix::fs::PermissionsExt;
-        let d = tmpdir("venv-posix");
-        let scripts = d.join(".claude").join("scripts");
+    fn summariser_python_prefers_orchestrator_venv_over_project_venv() {
+        let _g = vct_launcher_core::test_env::env_lock();
+        let project = tmpdir("sumvenv-project");
+        let orchestrator = tmpdir("sumvenv-orch");
+
+        // The project-side bundle layout, WITH the project's own app venv.
+        let scripts = project.join(".claude").join("scripts");
         fs::create_dir_all(&scripts).unwrap();
-        let script = scripts.join("generate-kg-summary.py");
-        fs::write(&script, b"#!/usr/bin/env python3\n").unwrap();
+        fs::write(
+            scripts.join("generate-kg-summary.py"),
+            b"#!/usr/bin/env python3\n",
+        )
+        .unwrap();
+        let project_bin = project.join(".venv").join("bin");
+        fs::create_dir_all(&project_bin).unwrap();
+        let project_py = project_bin.join("python");
+        fs::write(&project_py, b"#!/bin/sh\necho project app venv\n").unwrap();
 
-        let venv_bin = d.join(".venv").join("bin");
-        fs::create_dir_all(&venv_bin).unwrap();
-        let py = venv_bin.join("python");
-        fs::write(&py, b"#!/bin/sh\necho fake\n").unwrap();
-        let mut perms = fs::metadata(&py).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&py, perms).unwrap();
+        // The orchestrator venv ($VCT_VENV tier of the RT-4 ladder — a real
+        // install exports it or the exe-walk finds the same layout).
+        let orch_bin = orchestrator.join(".venv").join("bin");
+        fs::create_dir_all(&orch_bin).unwrap();
+        let orch_py = orch_bin.join("python");
+        fs::write(&orch_py, b"#!/bin/sh\necho orchestrator venv\n").unwrap();
 
-        let resolved = resolve_venv_python(&d, &script).expect("must resolve");
-        assert_eq!(resolved, py);
-        fs::remove_dir_all(&d).ok();
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn resolve_venv_python_finds_legacy_mcp_servers_layout() {
-        use std::os::unix::fs::PermissionsExt;
-        let d = tmpdir("venv-legacy");
-        let scripts = d.join(".claude").join("scripts");
-        fs::create_dir_all(&scripts).unwrap();
-        let script = scripts.join("generate-kg-summary.py");
-        fs::write(&script, b"#!/usr/bin/env python3\n").unwrap();
-
-        let venv_bin = d
-            .join("claude_mcp_servers")
-            .join(".venv")
-            .join("bin");
-        fs::create_dir_all(&venv_bin).unwrap();
-        let py = venv_bin.join("python3");
-        fs::write(&py, b"#!/bin/sh\necho fake\n").unwrap();
-        let mut perms = fs::metadata(&py).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&py, perms).unwrap();
-
-        let resolved = resolve_venv_python(&d, &script).expect("must resolve");
-        assert_eq!(resolved, py);
-        fs::remove_dir_all(&d).ok();
-    }
-
-    #[test]
-    fn resolve_venv_python_returns_none_when_missing() {
-        let d = tmpdir("venv-miss");
-        let scripts = d.join(".claude").join("scripts");
-        fs::create_dir_all(&scripts).unwrap();
-        let script = scripts.join("generate-kg-summary.py");
-        fs::write(&script, b"#!/usr/bin/env python3\n").unwrap();
-        // No venv anywhere reachable from this dir. The walk-up from the
-        // launcher exe might still find one on the dev machine — we
-        // tolerate that and only assert "if Some, it's at least a venv-
-        // looking path".
-        if let Some(py) = resolve_venv_python(&d, &script) {
-            let s = py.to_string_lossy();
-            assert!(
-                s.contains(".venv"),
-                "fallback resolution must still be a .venv path, got {}",
-                s,
-            );
+        let saved = std::env::var_os("VCT_VENV");
+        std::env::set_var("VCT_VENV", orchestrator.join(".venv"));
+        let resolved = summariser_python();
+        match saved {
+            Some(v) => std::env::set_var("VCT_VENV", v),
+            None => std::env::remove_var("VCT_VENV"),
         }
-        fs::remove_dir_all(&d).ok();
+
+        let py = resolved.expect("must resolve an interpreter");
+        assert_eq!(
+            py, orch_py,
+            "the summariser must run under the ORCHESTRATOR venv, not the project's own"
+        );
+        assert_ne!(py, project_py);
+        fs::remove_dir_all(&project).ok();
+        fs::remove_dir_all(&orchestrator).ok();
+    }
+
+    #[test]
+    fn failure_snippet_prefers_the_generators_stdout_diagnosis() {
+        // The v0.2.103 field shape: the real reason (a model non-answer)
+        // is on stdout, while the LAST stderr line is import-time noise
+        // that used to mask it.
+        let stdout = "  Generating summaries for: Node\n  description: backend 'cli' returned a non-answer (419 chars) — not cached\n";
+        let stderr = "[summary_backends] broken install: vco_lib is not importable\n";
+        assert_eq!(
+            failure_snippet(stdout, stderr),
+            "  description: backend 'cli' returned a non-answer (419 chars) — not cached"
+        );
+    }
+
+    #[test]
+    fn failure_snippet_accepts_the_failed_marker_and_falls_back_to_stderr() {
+        let stdout = "  Some Node: summary generation failed — ollama connection refused\n";
+        assert_eq!(
+            failure_snippet(stdout, "Traceback (most recent call last):\nboom"),
+            "  Some Node: summary generation failed — ollama connection refused"
+        );
+        // No stdout failure line → the traceback tail wins.
+        assert_eq!(
+            failure_snippet("  plain progress line\n", "Traceback …\nboom"),
+            "boom"
+        );
+        // Nothing at all but plain stdout → last stdout line.
+        assert_eq!(failure_snippet("a\nb\n", ""), "b");
+        // Empty → empty (caller renders "no output").
+        assert_eq!(failure_snippet("", "\n \n"), "");
+    }
+
+    #[test]
+    fn failure_snippet_is_capped_at_200_chars() {
+        let long = format!("x: summary generation failed — {}", "y".repeat(400));
+        let got = failure_snippet(&long, "");
+        assert_eq!(got.chars().count(), 200);
     }
 
     #[test]

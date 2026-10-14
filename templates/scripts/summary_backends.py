@@ -206,8 +206,10 @@ def _resolve_ollama_model() -> str:
     ``KG_SUMMARY_OLLAMA_MODEL`` wins without touching vco_lib; otherwise the
     ONE resolver, :func:`vco_lib.summary_model.resolve_model` (Preferences
     pick → install record → hardware tier, the same table install's pull list
-    comes from). A ``vco_lib`` that cannot be imported is a BROKEN install
-    (``call_ollama`` needs it too): said once on stderr, and the empty model
+    comes from). A ``vco_lib`` that cannot be imported means this interpreter
+    is NOT the orchestrator's venv (whose ``pip install -e .`` puts vco_lib on
+    ``sys.path``) — no install ever puts vco_lib into a user project's own
+    venv. Said once on stderr naming the interpreter, and the empty model
     makes :func:`ollama_available` report the tier unavailable."""
     override = os.getenv("KG_SUMMARY_OLLAMA_MODEL", "").strip()
     if override:
@@ -216,14 +218,41 @@ def _resolve_ollama_model() -> str:
         from vco_lib.summary_model import resolve_model
     except ImportError as exc:
         sys.stderr.write(
-            f"[summary_backends] broken install: vco_lib is not importable ({exc}); "
-            "the local Ollama summary tier is unavailable until the orchestrator's "
-            "install / update is re-run\n")
+            f"[summary_backends] vco_lib is not importable from this interpreter "
+            f"({sys.executable}): {exc}. VCO scripts must run under the "
+            "orchestrator's own venv (the one install.py builds) — the local "
+            "Ollama summary tier is unavailable\n")
         return ""
     return resolve_model()
 
 
-OLLAMA_DEFAULT_MODEL = _resolve_ollama_model()
+def ollama_default_model() -> str:
+    """``OLLAMA_DEFAULT_MODEL``, resolved on FIRST USE (v0.2.103).
+
+    v0.2.102 resolved it at import time, so every per-node child printed the
+    "vco_lib is not importable" stderr line even when the Ollama tier was
+    never used — and, run under a user project's own venv, that line claimed a
+    broken install whose remediation could never apply. Resolution (and the
+    stderr line, when it genuinely applies) now happens only when the tier is
+    actually consulted. Honours a test/runtime monkeypatch of the
+    ``OLLAMA_DEFAULT_MODEL`` module attribute first."""
+    override = globals().get("OLLAMA_DEFAULT_MODEL")
+    if override is not None:
+        return override
+    model = _resolve_ollama_model()
+    globals()["OLLAMA_DEFAULT_MODEL"] = model
+    return model
+
+
+def __getattr__(name: str):
+    # PEP 562: `summary_backends.OLLAMA_DEFAULT_MODEL` stays a readable
+    # module attribute for every importer (generate-kg-summary,
+    # generate_node_formats, process_documents, tests) without eager
+    # resolution — normal lookup lands here only until
+    # `ollama_default_model()` (or a monkeypatch) materialises the global.
+    if name == "OLLAMA_DEFAULT_MODEL":
+        return ollama_default_model()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 OLLAMA_URL = os.getenv("KG_SUMMARY_OLLAMA_URL", "http://localhost:11435").rstrip("/")
 TIMEOUT = int(os.getenv("KG_SUMMARY_TIMEOUT", "180"))
 
@@ -1330,11 +1359,13 @@ def ollama_available() -> bool:
     (OpenAI / Anthropic API / skip); nothing is ever pulled at runtime (an
     ``/api/generate`` for an absent model is a 404, and a pull is multi-GB).
     """
-    if not OLLAMA_DEFAULT_MODEL:
+    model = ollama_default_model()
+    if not model:
         _log("  Ollama summary tier unavailable: no generation model resolved "
-             "(vco_lib not importable — see the stderr line above)")
+             "(vco_lib not importable from this interpreter — see the stderr "
+             "line above)")
         return False
-    want = OLLAMA_DEFAULT_MODEL if ":" in OLLAMA_DEFAULT_MODEL else f"{OLLAMA_DEFAULT_MODEL}:latest"
+    want = model if ":" in model else f"{model}:latest"
     try:
         with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as resp:
             if resp.status != 200:
@@ -1354,13 +1385,15 @@ def ollama_available() -> bool:
     return False
 
 
-def call_ollama(prompt: str, model: str = OLLAMA_DEFAULT_MODEL) -> str:
+def call_ollama(prompt: str, model: str = "") -> str:
     # v0.2.102 W4-G: the body comes from the ONE generate-body builder
     # (`vco_lib.ollama_generate`) — shared load-time options (num_ctx) so the
     # model stays one resident copy across every VCO caller, plus the shared
     # keep_alive policy. Deliberately unguarded: a missing vco_lib is a broken
     # install, and this tier must fail (the ladder moves on and logs it)
     # rather than load a second runner with divergent options.
+    if not model:
+        model = ollama_default_model()
     from vco_lib.ollama_generate import generate_request_body
 
     family = model.split(":", 1)[0].lower()
@@ -1709,7 +1742,7 @@ def select_backend(
         return "cli"
     if _tier_selectable("ollama", label) and ollama_available():
         _BACKEND_CACHE["choice"] = "ollama"
-        _log(f"  {label} backend: ollama ({OLLAMA_DEFAULT_MODEL})")
+        _log(f"  {label} backend: ollama ({ollama_default_model()})")
         return "ollama"
     # OpenAI tier: key present AND (consent granted OR --force-api).
     if _tier_selectable("openai", label) and openai_available():

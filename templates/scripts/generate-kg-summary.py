@@ -77,7 +77,6 @@ import summary_backends as _sb  # noqa: E402
 # module's namespace (e.g. tests/test_kg_summary_openai_consent.py sets
 # mod._FORCE_API and calls mod.select_backend()); keep every name reachable.
 ANTHROPIC_MODEL = _sb.ANTHROPIC_MODEL
-OLLAMA_DEFAULT_MODEL = _sb.OLLAMA_DEFAULT_MODEL
 OLLAMA_URL = _sb.OLLAMA_URL
 TIMEOUT = _sb.TIMEOUT
 OPENAI_DEFAULT_MODEL = _sb.OPENAI_DEFAULT_MODEL
@@ -104,6 +103,18 @@ call_openai = _sb.call_openai
 is_non_answer = _sb.is_non_answer
 BackendUnavailable = _sb.BackendUnavailable
 NonAnswerResponse = _sb.NonAnswerResponse
+
+
+def __getattr__(name: str):
+    # v0.2.103: `OLLAMA_DEFAULT_MODEL` stays reachable through THIS
+    # namespace (the "keep every name reachable" contract above) but is
+    # resolved LAZILY on first access — summary_backends resolves the
+    # machine's generation model (and, when vco_lib is missing from the
+    # interpreter, prints its stderr line) only when the Ollama tier is
+    # actually consulted, not on every per-node import.
+    if name == "OLLAMA_DEFAULT_MODEL":
+        return getattr(_sb, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # SAME dict object as the shared module's cache (main() reads
 # _BACKEND_CACHE["choice"] for the sidecar entry's `backend` field).
