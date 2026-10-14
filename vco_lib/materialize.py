@@ -339,8 +339,9 @@ _KEYS: Tuple[Key, ...] = (
         "time", _hub_port),
     # ── model selection (vco_lib/model_selection.py) ─────────────────────
     Key("MODEL_SELECTION_GRID", "The per-task model-selection table, rendered "
-        "with only the rows for the model providers reachable on this machine "
-        "at render time (a snapshot; no monitoring afterwards)",
+        "with only the rows for the model providers whose key resolves on this "
+        "machine; refreshed automatically at launcher startup, on key changes, "
+        "and at every install/update (vco_lib.model_guidance)",
         _model_selection_grid),
     # ── boot units: declared here, valued by the spec ────────────────────
     Key("INSTALLED_AT_PATH", _BOOT_DOC),

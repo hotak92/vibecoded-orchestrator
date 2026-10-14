@@ -86,12 +86,11 @@ EXPECTED_NOTES = [
                 "strong long-context retrieval, but the slowest and most verbose "
                 "lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about "
                 "twice the median output tokens), so queue its work and review it "
-                "later. Its measured subscription budget is ≈ one substantial lane "
-                "per 5h window and ≈1–2% of the month per lane, so give it small, "
-                "bounded lanes or audits. It always reasons; it can repeat the same "
-                "tool call or stop on reasoning with no answer, and it guesses "
-                "confidently when unsure (51% hallucination rate on uncertain "
-                "questions), so demand quoted evidence in its reviews."),
+                "later. Give it small, bounded lanes or audits. It always reasons; "
+                "it can repeat the same tool call or stop on reasoning with no "
+                "answer, and it guesses confidently when unsure (51% hallucination "
+                "rate on uncertain questions), so demand quoted evidence in its "
+                "reviews."),
     ("glm-5.3-flash", "**GLM-5.3-Flash** suits bulk / first-pass work behind a "
                       "verifier — tests, a diff review or a stronger second pass; "
                       "retries help it, more effort does not (longer runs helped "
@@ -184,14 +183,21 @@ class TestProviderFilter:
 
 
 class TestSoftFail:
-    def test_key_probe_exception_leaves_claude_rows_and_never_crashes(self, capsys):
+    def test_key_probe_exception_leaves_claude_rows_and_never_crashes(
+            self, tmp_path, capsys):
         def boom(_vendor_id: str) -> bool:
             raise RuntimeError("hub exploded")
 
-        providers = model_selection.reachable_providers(key_probe=boom)
+        providers = model_selection.reachable_providers(
+            key_probe=boom, state_path=tmp_path / "no-record.json",
+            sleeper=lambda _s: None)
         assert providers == model_selection.ALWAYS_PROVIDERS
         err = capsys.readouterr().err
-        assert "RuntimeError" in err and err.count("\n") == 3  # one line per vendor
+        # v0.2.103: a raising probe is UNAVAILABLE (tri-state) — retried,
+        # then, with no last-known record, absent. One failure line + one
+        # no-record line per vendor.
+        assert err.count("RuntimeError") == 3
+        assert err.count("no last-known record") == 3
         # The warning names only the exception TYPE: an exception message could
         # one day carry a resolved key value, which must never reach a message.
         assert "hub exploded" not in err

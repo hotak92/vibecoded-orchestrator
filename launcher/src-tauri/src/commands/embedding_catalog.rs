@@ -234,13 +234,15 @@ async fn run_discover(
 
 /// Run `python -m <args…>` with the vco_lib interpreter and return stdout —
 /// the ONE subprocess shape this module's commands share (v0.2.102 W6-B2
-/// extracted it from `run_discover` for `get_code_embed_model_status`).
+/// extracted it from `run_discover` for `get_code_embed_model_status`;
+/// v0.2.103 made it `pub(crate)` for `model_guidance`'s status transport —
+/// one home, no second spawn shape).
 ///
 /// cwd MUST be the orchestrator clone root so `python -m vco_lib.…` finds
 /// the in-tree namespace package (v0.2.24.1); with no root discoverable it
 /// runs without a cwd and fails with ModuleNotFoundError rather than
 /// crashing the launcher. Null stdin, piped output, CREATE_NO_WINDOW.
-async fn run_vco_lib_cli(
+pub(crate) async fn run_vco_lib_cli(
     args: &[std::ffi::OsString],
     install_root: Option<PathBuf>,
     timeout_secs: u64,
@@ -283,7 +285,7 @@ async fn run_vco_lib_cli(
 
 /// The status CLI prints ONE JSON object line; take the last non-empty line
 /// so a stray log line above it cannot break the parse.
-fn parse_last_json_line(stdout: &str, label: &str) -> Result<serde_json::Value, String> {
+pub(crate) fn parse_last_json_line(stdout: &str, label: &str) -> Result<serde_json::Value, String> {
     let line = stdout
         .lines()
         .map(str::trim)
