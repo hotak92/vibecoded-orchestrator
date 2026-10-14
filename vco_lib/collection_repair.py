@@ -111,8 +111,11 @@ def _classify_file_path(fp: str) -> str:
 def _enumerate_rows(
     weaviate_url: str,
     collection: str,
-) -> Optional[tuple[list[tuple[str, str]], bool]]:
-    """Fetch ``(uuid, file_path)`` pairs for every row in *collection*.
+) -> Optional[tuple[list[tuple[str, str, "str | None"]], bool]]:
+    """Fetch ``(uuid, file_path, title)`` triples for every row in
+    *collection* (v0.2.103: ``title`` joined so prune callers can log every
+    removed row by path AND title; rows whose stored title is absent report
+    ``None``).
 
     Returns ``(rows, saturated)`` or ``None`` on any transport / GraphQL
     failure (the caller skips the leg — no destructive action without an
@@ -123,7 +126,7 @@ def _enumerate_rows(
     gql = {
         "query": (
             f"{{ Get {{ {collection}(limit: {QUERY_MAX_LIMIT}) "
-            f"{{ _additional {{ id }} file_path }} }} }}"
+            f"{{ _additional {{ id }} file_path title }} }} }}"
         ),
     }
     try:
@@ -146,12 +149,17 @@ def _enumerate_rows(
     objects = (
         payload.get("data", {}).get("Get", {}).get(collection, [])
     ) or []
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple[str, str, "str | None"]] = []
     for obj in objects:
         uid = ((obj or {}).get("_additional") or {}).get("id") or ""
         fp = (obj or {}).get("file_path")
+        title = (obj or {}).get("title")
         if uid:
-            rows.append((str(uid), fp if isinstance(fp, str) else ""))
+            rows.append((
+                str(uid),
+                fp if isinstance(fp, str) else "",
+                title if isinstance(title, str) else None,
+            ))
     return rows, len(objects) >= QUERY_MAX_LIMIT
 
 
@@ -222,6 +230,9 @@ def prune_foreign_rows(
           "rows": int,                 # rows enumerated
           "defensive_skipped": int,    # absolute / ``..`` / empty paths
           "stale_paths": [<fp>...],    # distinct foreign paths found
+          "stale_rows": [              # v0.2.103: per-ROW detail for logging
+            {"path": <fp>, "title": <title | None>}, ...
+          ],
           "deleted": int,              # rows actually deleted (0 in dry-run)
           "saturated": bool,
           "dry_run": bool,
@@ -235,6 +246,7 @@ def prune_foreign_rows(
         "rows": 0,
         "defensive_skipped": 0,
         "stale_paths": [],
+        "stale_rows": [],
         "deleted": 0,
         "saturated": False,
         "dry_run": bool(dry_run),
@@ -287,9 +299,10 @@ def prune_foreign_rows(
              "remaining rows are caught on a later run")
 
     stale_uuids: list[str] = []
+    stale_rows: list[dict] = []
     stale_paths: set = set()
     defensive = 0
-    for uid, fp in rows:
+    for uid, fp, title in rows:
         kind = _classify_file_path(fp)
         if kind == "defensive":
             defensive += 1
@@ -299,8 +312,12 @@ def prune_foreign_rows(
             continue  # file exists ⇒ NEVER touched
         stale_uuids.append(uid)
         stale_paths.add(norm)
+        stale_rows.append({"path": norm, "title": title})
     result["defensive_skipped"] = defensive
     result["stale_paths"] = sorted(stale_paths)
+    result["stale_rows"] = sorted(
+        stale_rows, key=lambda r: (r["path"], r["title"] or "")
+    )
 
     if not stale_uuids:
         _log("ok", f"{collection!r}: no foreign rows "
@@ -382,7 +399,8 @@ def prune_foreign_rows_for_project(
         if skip:
             leg = {
                 "collection": coll, "skipped": reason, "rows": 0,
-                "defensive_skipped": 0, "stale_paths": [], "deleted": 0,
+                "defensive_skipped": 0, "stale_paths": [], "stale_rows": [],
+                "deleted": 0,
                 "saturated": False, "dry_run": bool(dry_run), "errors": [],
             }
             result["legs"].append(leg)
