@@ -143,14 +143,14 @@ def _run_hook(
     """Run the hook through its production entry point.
 
     stdout/stderr go to FILES rather than pipes, deliberately. A detached
-    child INHERITS the parent's stdio handles, so with ``capture_output=True``
-    ``subprocess.run`` would block until the grandchild exits — the pipe stays
-    open even though the hook process is long gone. That confound would make
-    the timing assertion below measure the child instead of the hook.
-    (The inheritance itself is a real .sh/.ps1 parity gap — the POSIX siblings
-    detach with ``>/dev/null 2>&1 &`` and hold nothing — but it is a separate
-    concern from whether the child survives at all, which is what these tests
-    are for.)
+    child that inherits the parent's stdio handles would make
+    ``capture_output=True`` block until the grandchild exits — a confound
+    that would make the timing assertions below measure the child instead
+    of the hook. (v0.2.103 closed the underlying .sh/.ps1 parity gap —
+    ``Start-VcoDetachedProcess`` now defaults un-redirected streams to
+    /dev/null on POSIX, pinned by
+    ``test_unredirected_detached_child_does_not_hold_the_hooks_pipes`` —
+    but measuring the HOOK through files stays the right isolation.)
     """
     env = os.environ.copy()
     env["CLAUDE_PROJECT_DIR"] = str(project)
@@ -454,6 +454,77 @@ Write-Output ("emitted=" + $out.Count)
     )
     assert "detached spawn FAILED" not in res.stderr, (
         f"a successful spawn emitted a failure diagnostic: {res.stderr!r}"
+    )
+
+
+def test_unredirected_detached_child_does_not_hold_the_hooks_pipes(tmp_path):
+    """QUIRK 4 (v0.2.103): an un-redirected detached child must not inherit
+    the hook's stdout/stderr pipes on POSIX.
+
+    The harness reads a hook's output to EOF. A detached child that
+    inherits the write end of those pipes keeps them open for its whole
+    lifetime, so a hook that detaches a multi-second job blocks its caller
+    for that whole job even though the hook process itself exited in
+    milliseconds — empirically: a 5-second `Start-Sleep` grandchild held a
+    piped hook's output hostage until it exited. The POSIX .sh siblings
+    always detach with ``>/dev/null 2>&1 < /dev/null``
+    (stop-drain-citations.sh, kg-sync-debounce.sh, verify-container-ports.sh);
+    ``Start-VcoDetachedProcess`` must hold no pipes either.
+
+    Driven, not asserted: the "hook" really runs, its output really goes
+    through a pipe, and the grandchild really outlives it — the marker
+    lands only AFTER the pipe has been proven closed, so a helper that
+    reaped the child (instead of detaching it) cannot pass either.
+    """
+    exe = _require_pwsh()
+    if os.name == "nt":
+        pytest.skip("the pipe-inheritance hazard is POSIX-specific; Windows behaviour is unchanged")
+    #: Comfortably above a cold pwsh start (~1-2 s) and the hook body, and
+    #: comfortably below the child's lifetime — pre-fix, ``communicate``
+    #: raises TimeoutExpired at this bound; post-fix it returns in ~1-2 s.
+    pipe_close_budget_s = 6.0
+    child_sleep_s = 12.0
+    marker = tmp_path / "child-ran.txt"
+    child = _stage_child_script(
+        tmp_path,
+        "pipechild.sh",
+        f"sleep {child_sleep_s}\nprintf ran > '{marker}'\n",
+    )
+    script = f"""
+. '{PS_LIB}'
+Write-Output hook-start
+Start-VcoDetachedProcess -FilePath '{child}'
+Write-Output hook-end
+"""
+    path = tmp_path / "drive-pipes.ps1"
+    path.write_text(script, encoding="utf-8")
+    proc = subprocess.Popen(
+        [exe, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        out, err = proc.communicate(timeout=pipe_close_budget_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        pytest.fail(
+            "the hook's output pipes were still open after "
+            f"{pipe_close_budget_s}s — an un-redirected detached child is "
+            "holding them (it must outlive the hook without inheriting its "
+            "stdio)"
+        )
+    assert b"hook-start" in out and b"hook-end" in out, (
+        f"the hook did not run to completion: {out!r} {err!r}"
+    )
+    # The child must still have RUN — detached, not dropped: it writes its
+    # marker only after outliving the pipe-close budget above.
+    deadline = time.monotonic() + MARKER_TIMEOUT_S
+    while time.monotonic() < deadline and not marker.is_file():
+        time.sleep(0.2)
+    assert marker.is_file(), (
+        "the detached child never ran — the spawn itself is broken"
     )
 
 

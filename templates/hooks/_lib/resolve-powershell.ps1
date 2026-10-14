@@ -75,6 +75,20 @@ $PsExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { '
 # seconds. Start-Process spawns an independent OS process that survives, which
 # is what the POSIX siblings get from `( ... ) &` / setsid. Same reasoning as
 # `_lib/kg-sync-debounce.ps1`'s flusher.
+#
+# QUIRK 4 (v0.2.103): on POSIX, a child spawned with NO stream redirects
+# INHERITS the hook's own stdout/stderr pipes. The harness reads a hook's
+# output to EOF, and the write end of those pipes stays open in the
+# detached child for as long as IT lives - so a hook that detaches a
+# 30-second job blocks its caller for those 30 seconds even though the
+# hook process itself exited in milliseconds. The POSIX siblings always
+# detach with `>/dev/null 2>&1 < /dev/null` (see stop-drain-citations.sh,
+# kg-sync-debounce.sh, verify-container-ports.sh); the wrapper mirrors
+# that by defaulting every UN-redirected stream on non-Windows editions
+# (Windows behaviour is unchanged: hidden window, caller-provided
+# redirects honoured exactly as before). stderr cannot share /dev/null
+# with stdout (QUIRK 2), so it lands in a small per-hook log under the
+# temp dir instead - overwritten per spawn, one file per hook process.
 
 # True when this edition accepts `-WindowStyle`. $IsWindows is undefined on
 # PowerShell 5.1 (which only exists on Windows), so "unset" means Windows.
@@ -97,6 +111,20 @@ function Start-VcoDetachedProcess {
     $spawn = @{
         FilePath    = $FilePath
         ErrorAction = 'SilentlyContinue'
+    }
+    # QUIRK 4 above: on POSIX, default every stream the caller did NOT
+    # redirect so the child holds none of the hook's pipes. Must run BEFORE
+    # the caller-provided redirects are applied below so an explicit
+    # -RedirectStandard* always wins, and the two defaults are distinct
+    # paths by construction (QUIRK 2 rejects identical ones).
+    if ($null -ne $IsWindows -and -not $IsWindows) {
+        if (-not $RedirectStandardOutput) {
+            $spawn['RedirectStandardOutput'] = '/dev/null'
+        }
+        if (-not $RedirectStandardError) {
+            $tmpBase = if ($env:TMPDIR) { $env:TMPDIR } else { '/tmp' }
+            $spawn['RedirectStandardError'] = Join-Path $tmpBase ("vco-detached-{0}.err" -f $PID)
+        }
     }
     # PowerShell 5.1 rejects an EMPTY -ArgumentList (ValidateNotNullOrEmpty),
     # so omit the parameter entirely rather than passing @().

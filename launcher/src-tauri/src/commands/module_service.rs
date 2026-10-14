@@ -4140,11 +4140,41 @@ mod tests {
             .iter()
             .position(|a| a == "ghcr.io/hotak92/vct-rl-reranker:0.1.0")
             .expect("image arg present");
-        let cmd_idx = args
+        // v0.2.103 (Fix 5): the manifest's `command` is now passed via
+        // `--entrypoint` (BEFORE the image) instead of being appended
+        // after it as CMD — podman appends CMD to the image's ENTRYPOINT,
+        // which doubled the invocation on ENTRYPOINT-bearing images.
+        let entrypoint_idx = args
             .iter()
-            .position(|a| a == "python")
-            .expect("command arg present");
-        assert!(img_idx < cmd_idx, "image must precede command");
+            .position(|a| a == "--entrypoint")
+            .expect("--entrypoint flag present");
+        assert!(
+            entrypoint_idx < img_idx,
+            "--entrypoint must precede the image; got {:?}",
+            args
+        );
+        assert_eq!(
+            args.get(entrypoint_idx + 1).map(String::as_str),
+            Some("python"),
+            "the --entrypoint value is the manifest command's first word"
+        );
+        // After the image: the manifest's `args` as the CMD (the command
+        // word is NOT repeated after the image).
+        assert_eq!(
+            args[img_idx + 1..],
+            [
+                "-m",
+                "rl_server.rl_server",
+                "--port",
+                "11438",
+                "--project-root",
+                "/data",
+                "--log-path",
+                "/data/logs/rl_events_acme-corp.jsonl",
+            ],
+            "CMD after the image must be exactly runtime.args; got {:?}",
+            args
+        );
     }
 
     #[test]

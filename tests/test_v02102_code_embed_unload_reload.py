@@ -679,8 +679,21 @@ def test_queue_wait_bound_exceeded_returns_503_with_retry_after():
 def test_queue_wait_zero_refuses_when_saturated_but_serves_a_free_slot():
     """``CODE_EMBED_QUEUE_WAIT_SECS=0`` keeps the old shed semantics for a
     saturated service (immediate 503 — but now WITH Retry-After), while a
-    request that finds a free slot is still served (the ~1 ms grace lets an
-    uncontended acquire complete)."""
+    request that finds a free slot is still served.
+
+    v0.2.103 de-flake: the serve half used to rely on an UNCONTENDED
+    ``sem.acquire()`` beating the shipped 1 ms zero-grace timer
+    (``_QUEUE_ZERO_GRACE_SECS = 0.001``). That is a wall-clock margin
+    against OS scheduling: under heavy machine load the test process can
+    be descheduled between the acquire task's first scheduling and its
+    completion, the monotonic grace timer matures meanwhile, and
+    ``wait_for`` sheds the request with a 503 — observed once in a full
+    run. The race is removed by widening ONLY the serve half's grace to
+    5 s (the shed half keeps the shipped value, so "saturated + wait=0 →
+    503 with Retry-After" still exercises the real 1 ms path); the grace
+    magnitude is an internal tuning constant no test pins, and the
+    property under test — a request that finds a free slot is SERVED, not
+    shed — is unchanged."""
     _queue_env()
     es.QUEUE_WAIT_SECS = 0.0
 
@@ -694,8 +707,13 @@ def test_queue_wait_zero_refuses_when_saturated_but_serves_a_free_slot():
             assert "Retry-After" in (exc_info.value.headers or {})
         finally:
             sem.release()
-        with patch.object(es, "embed", return_value=[[1.0]]):
-            return await es.embed_endpoint(es.EmbedRequest(texts=["x"]))
+        real_grace = es._QUEUE_ZERO_GRACE_SECS
+        es._QUEUE_ZERO_GRACE_SECS = 5.0
+        try:
+            with patch.object(es, "embed", return_value=[[1.0]]):
+                return await es.embed_endpoint(es.EmbedRequest(texts=["x"]))
+        finally:
+            es._QUEUE_ZERO_GRACE_SECS = real_grace
 
     resp = asyncio.run(_run())
     assert resp.embeddings == [[1.0]]

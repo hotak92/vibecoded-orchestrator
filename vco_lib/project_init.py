@@ -5817,35 +5817,6 @@ def _parse_semver(version: str) -> "tuple[int, int, int] | None":
     return parse_semver(version)
 
 
-def _crosses_chunker_boundary(prev_version: str, running_version: str) -> bool:
-    """True iff this upgrade crosses the v0.2.46 chunker-preset boundary.
-
-    v0.2.92: the ``prev < bump <= running`` rule itself lives in
-    :func:`vco_lib.codegraph_extractor_generation.crosses_version_boundary`,
-    which the extractor-generation detector also uses. This function is now
-    just the chunker boundary's binding of that shared rule, so the two
-    "was this built by an older version of us" questions cannot drift apart.
-
-    **SUPERSEDED in v0.2.92 (WP-D) — no longer called by the bundle flow.**
-    As wired from v0.2.47 to v0.2.91 this gate compared the manifest's
-    ``vco_version`` (a git short SHA on every clone install, never semver)
-    against the semver constant ``_CHUNKER_BUMP_VERSION``, so it was
-    structurally inert: it has never fired for a real user, no matter how
-    they updated. The live replacement is :func:`vco_lib.chunker_revision.gate` —
-    state-keyed on the ``_CHUNKER_REVISION`` sentinel (R26/R27), firing on
-    all four install/update surfaces. This function survives only because
-    ``tests/test_v0247_chunker_deferral_python.py`` pins its boundary
-    arithmetic as the shared-rule binding; deleting it (and
-    ``_emit_chunker_resync_deferral`` below, which shares the supersession)
-    is pending the user's R28 removal ruling (wave-3 ASK batch).
-    """
-    from vco_lib.codegraph_extractor_generation import crosses_version_boundary
-
-    return crosses_version_boundary(
-        prev_version, running_version, _CHUNKER_BUMP_VERSION,
-    )
-
-
 def _emit_chunker_resync_deferral(
     folder: Path,
     prev_version: str,
@@ -5854,14 +5825,20 @@ def _emit_chunker_resync_deferral(
     """Emit `chunker_preset_overhaul_pending`: KG + codegraph need re-syncing
     after an upgrade across the v0.2.46 chunker-preset boundary.
 
-    **SUPERSEDED in v0.2.92 (WP-D) — no longer called by the bundle flow.**
-    The live emitter is :func:`_emit_chunker_revision_resync_deferral`
+    **SUPERSEDED for the bundle flow in v0.2.92 (WP-D)** — the live
+    per-project emitter is :func:`_emit_chunker_revision_resync_deferral`
     (same condition_id, same commands, keyed on the state-keyed
-    ``_CHUNKER_REVISION`` sentinel instead of a semver boundary this
-    emitter's inputs could never satisfy — see
-    :func:`_crosses_chunker_boundary`'s supersession note). Retained for
-    the same reason + the argparse-sweep test that drives it; removal
-    pending the user's R28 ruling (wave-3 ASK batch).
+    ``_CHUNKER_REVISION`` sentinel instead of a semver boundary). Retained
+    because the LAUNCHER's Rust-side semver hook still routes here:
+    ``launcher/src-tauri/src/commands/chunker_revision_deferral.rs::
+    write_deferral_for_project`` spawns this emitter via ``python -c``
+    when the launcher binary itself crosses the v0.2.46 boundary
+    (``lib.rs::setup`` → ``write_chunker_deferral_if_crossing_boundary``).
+    Its gating twin ``_crosses_chunker_boundary`` was deleted in v0.2.103
+    (owner removal ruling #26: superseded by
+    :func:`vco_lib.chunker_revision.gate`, zero production callers); the
+    boundary arithmetic it bound lives on in
+    :func:`vco_lib.codegraph_extractor_generation.crosses_version_boundary`.
 
     Post-v0.2.46 the chunker uses MUCH larger chunks for qwen3-embedding
     (target_tokens 9500 vs. legacy 1000) and a five-tier preset routing
