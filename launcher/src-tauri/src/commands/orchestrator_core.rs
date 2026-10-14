@@ -433,6 +433,34 @@ pub async fn kg_check_duplicates(
     })
 }
 
+/// v0.2.103 (review R1-1): map a finished `code-graph-analyze` wrapper run
+/// to its `CodeGraphResult`. The wrapper routes through the per-project
+/// walk single-flight claim (`vco_lib.codegraph_walk`), so it can refuse a
+/// twin with exit 75 — a refusal is NOT a red failure: nothing ran, and a
+/// "failed" outcome for a healthy running walk is exactly what made users
+/// click the button twice. Shared by both spawn commands below so the
+/// mapping cannot drift between them; the predicate + user-facing sentence
+/// are the ONE shared home (`vct_launcher_core::process`), same as the
+/// build-task / Re-analyze / extras-sync arms.
+fn codegraph_spawn_result(
+    status: &std::process::ExitStatus,
+    combined: &str,
+    duration_ms: u64,
+) -> CodeGraphResult {
+    if vct_launcher_core::process::is_walk_already_running(status) {
+        return CodeGraphResult {
+            ok: true,
+            duration_ms,
+            log_tail: vct_launcher_core::process::walk_already_running_message(),
+        };
+    }
+    CodeGraphResult {
+        ok: status.success(),
+        duration_ms,
+        log_tail: tail_1kb(combined),
+    }
+}
+
 /// Re-analyze the project's code with `--incremental` (default) — only
 /// changed files are re-walked. Always pairs with `--prune-stale` so
 /// rows for deleted files don't accumulate.
@@ -477,21 +505,19 @@ pub async fn code_graph_reanalyze_current(
         String::from_utf8_lossy(&output.stderr)
     );
 
+    let result = codegraph_spawn_result(&output.status, &combined, duration_ms);
+
     db.audit(
         "orchestrator_core_codegraph_reanalyze",
         Some(&project_id),
         None,
         &serde_json::json!({
-            "ok": output.status.success(),
+            "ok": result.ok,
             "duration_ms": duration_ms,
         }),
     )?;
 
-    Ok(CodeGraphResult {
-        ok: output.status.success(),
-        duration_ms,
-        log_tail: tail_1kb(&combined),
-    })
+    Ok(result)
 }
 
 /// Prune code-graph rows whose source files no longer exist on disk.
@@ -537,21 +563,19 @@ pub async fn code_graph_prune_stale(
         String::from_utf8_lossy(&output.stderr)
     );
 
+    let result = codegraph_spawn_result(&output.status, &combined, duration_ms);
+
     db.audit(
         "orchestrator_core_codegraph_prune",
         Some(&project_id),
         None,
         &serde_json::json!({
-            "ok": output.status.success(),
+            "ok": result.ok,
             "duration_ms": duration_ms,
         }),
     )?;
 
-    Ok(CodeGraphResult {
-        ok: output.status.success(),
-        duration_ms,
-        log_tail: tail_1kb(&combined),
-    })
+    Ok(result)
 }
 
 /// The project's own hook-log folder: `<project>/.claude/logs`. Pure path
@@ -768,6 +792,42 @@ pub async fn validate_clone_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.2.103 (review R1-1): the two project-local wrapper spawns
+    /// (`code_graph_reanalyze_current` / `code_graph_prune_stale`) map the
+    /// walk-claim refusal (exit 75) to an informational ok result carrying
+    /// the shared sentence — never a red failure for a healthy running walk.
+    #[cfg(unix)]
+    #[test]
+    fn codegraph_spawn_result_maps_the_walk_refusal_to_ok() {
+        use std::os::unix::process::ExitStatusExt;
+        let refused = std::process::ExitStatus::from_raw(75 << 8);
+        let r = codegraph_spawn_result(&refused, "wrapper stderr noise", 12);
+        assert!(r.ok, "a twin refusal is not a failure — nothing ran");
+        assert_eq!(r.duration_ms, 12);
+        assert!(
+            r.log_tail.contains("already running"),
+            "log_tail must carry the shared refusal sentence: {}",
+            r.log_tail
+        );
+    }
+
+    /// Every other exit keeps the plain success/failure semantics with the
+    /// combined-output tail — only the refusal code is special-cased.
+    #[cfg(unix)]
+    #[test]
+    fn codegraph_spawn_result_passes_through_other_exits() {
+        use std::os::unix::process::ExitStatusExt;
+        let ok = std::process::ExitStatus::from_raw(0);
+        let r = codegraph_spawn_result(&ok, "all good", 5);
+        assert!(r.ok);
+        assert_eq!(r.log_tail, "all good");
+
+        let failed = std::process::ExitStatus::from_raw(1 << 8);
+        let r = codegraph_spawn_result(&failed, "boom", 7);
+        assert!(!r.ok);
+        assert_eq!(r.log_tail, "boom");
+    }
 
     /// v0.2.102 W6-I: the scan's `objects_missing_vector` list (W6-H's
     /// `--json` key) reaches the GUI — title, path and the slots each object

@@ -56,6 +56,14 @@ Stop-hook drain batches) deliberately do NOT claim, with evidence:
     writes are deterministic-UUID upserts the full walk would make anyway.
     The remaining overlap cost is one small batch's embed load, not the
     twin-full-walk GPU storm this claim exists to stop.
+    Residual window (accepted by design, review R1-3): a file CREATED after
+    the pruning walk's tree enumeration is not in ITS ``visited_uuids``; if a
+    concurrent drain batch upserts that file's rows in the gap, the walk's
+    end-of-run prune deletes them as stale, and nothing re-queues the file
+    until its next edit — one file's rows, self-healing, the pre-existing
+    semantics of ``--prune-stale`` (the alternative, claiming scoped runs,
+    would silently drop drain batches whose list file is deleted
+    unconditionally).
 
 Cross-OS: the lock is ``vco_lib.atomic.exclusive_file_lock``, which locks for
 real on POSIX (``flock``) and Windows (``msvcrt.locking``, v0.2.103).

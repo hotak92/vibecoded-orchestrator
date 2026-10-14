@@ -621,6 +621,75 @@ pub fn claimed_walk_args(script: &std::path::Path) -> Vec<std::ffi::OsString> {
     ]
 }
 
+// ─── Analyzer child: concurrent pipe drain, no wall-clock deadline ───────
+//
+// v0.2.103 (owner rule "no timeout may cut valid long work"): analyzer
+// waits have NO deadline — a code-graph walk may legitimately run for
+// hours, and killing a slow-but-working walk makes it look like a
+// failure so the user clicks again. With the deadline gone, an
+// undrained pipe became the only way to hang forever: a piped stdout /
+// stderr nobody reads fills its ~64 KiB kernel buffer and the child
+// blocks on every write(2) — an unkillable deadlock, not a slow walk.
+// These helpers are the ONE home for the composition every analyzer
+// streaming site uses (codegraph_reanalyze.rs,
+// project_codegraph_extras.rs): drain BOTH pipes concurrently for as
+// long as the child lives, then reap it.
+
+/// Drain a child's stderr while the child runs, keeping only the LAST
+/// `max_bytes` as failure evidence (the end of the stream is where the
+/// actual error is).
+///
+/// This MUST run concurrently with the child (and with the stdout
+/// read): a piped stderr nobody reads fills the kernel's pipe buffer
+/// (~64 KiB) and the child then blocks on every `write(2)` to it,
+/// forever — with no wall-clock timeout there is nothing left to break
+/// that deadlock, so the drain is what prevents it. The cap bounds
+/// memory: >1 MiB of analyzer warnings still leaves a `max_bytes` tail.
+pub async fn drain_child_stderr_capped(
+    mut stderr: tokio::process::ChildStderr,
+    max_bytes: usize,
+) -> String {
+    use tokio::io::AsyncReadExt as _;
+    let mut chunk = [0u8; 4096];
+    let mut tail: Vec<u8> = Vec::with_capacity(max_bytes);
+    loop {
+        match stderr.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > max_bytes {
+                    let excess = tail.len() - max_bytes;
+                    tail.drain(..excess);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
+}
+
+/// Await an analyzer child with NO wall-clock deadline: consume both
+/// stream futures concurrently (neither pipe can fill its kernel buffer
+/// and wedge the child), then reap the child — however long it takes.
+/// The streamed per-file progress events the caller emits through
+/// `read` are the liveness signal. Returns the exit status plus the
+/// capped stderr tail (failure evidence for the non-zero-exit branch).
+pub async fn await_child_no_deadline<R, S, W>(
+    read: R,
+    drain_stderr: S,
+    wait: W,
+) -> Result<(std::process::ExitStatus, String), String>
+where
+    R: std::future::Future<Output = ()>,
+    S: std::future::Future<Output = String>,
+    W: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+{
+    let ((), stderr_tail) = tokio::join!(read, drain_stderr);
+    let status = wait
+        .await
+        .map_err(|e| format!("wait analyzer: {}", e))?;
+    Ok((status, stderr_tail))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

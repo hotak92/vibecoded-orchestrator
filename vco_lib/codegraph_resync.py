@@ -3713,11 +3713,9 @@ def _run_resync_and_verify_slotted(
     # running RIGHT NOW: skip this run — never queue, never kill, never wait
     # on a walk that may legitimately run for hours. The ledger stays as it
     # is; the concurrent walk's own completion converges it, exactly the
-    # driver-claim skip's accepted posture above. Deliberately NO terminal
-    # hub report: the running walk owns the build row (its own finalization
-    # lands last), and this refusal is not the walk's failure. Scoped
-    # --only-file(s) runs never reach this function — the driver only ever
-    # requests full walks.
+    # driver-claim skip's accepted posture above. Scoped --only-file(s)
+    # runs never reach this function — the driver only ever requests full
+    # walks.
     from vco_lib.codegraph_walk import WalkAlreadyRunning, walk_claim
 
     try:
@@ -3730,6 +3728,31 @@ def _run_resync_and_verify_slotted(
             f"walks); the running walk's own completion converges the ledger",
             flush=True,
         )
+        # v0.2.103 (review R1-2), the #31 discipline the stale-image refusal
+        # ~100 lines above already follows: when THIS driver was spawned by a
+        # REGISTERING path (``_register_spawn_with_hub``), the build row
+        # carries this pid, and without a terminal write the pid-aliveness
+        # reconciler would later false-fail it ("a success-exit and a
+        # mid-run death are indistinguishable from pid-gone alone"). When the
+        # running walk re-registered the row under its own pid, the hub's pid
+        # guard makes this report a no-op — it finalizes ONLY a still-running
+        # row with this exact pid. Soft-fail as everywhere: observability
+        # never gates the exit.
+        try:
+            _report_terminal_to_hub(
+                project_name,
+                "failed",
+                repo_root=repo_root,
+                files_analyzed=0,
+                duration_ms=0,
+                error_message=(
+                    "refused: another code-graph walk is already running "
+                    "(this run was skipped, not failed — the running walk's "
+                    "own completion reports the build's real outcome)"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — observability, never a gate
+            logger.debug("resync driver: walk-refusal report raised: %s", exc)
         return 0
     except Exception as exc:  # noqa: BLE001
         print(f"[resync-driver] analyzer failed to start: {exc}", flush=True)

@@ -2004,6 +2004,50 @@ def test_project_from_argv_defaults_to_the_repo_dir_name():
     assert codegraph_walk.project_from_argv(["--language", "python"]) is None
 
 
+def test_value_flags_mirror_the_analyzer_argparse_value_options():
+    """v0.2.103 review R1-4: ``codegraph_walk._VALUE_FLAGS`` is a mirror of
+    the analyzer's argparse surface, locked by this parity test against the
+    REAL ``add_argument`` calls in ``templates/scripts/analyze_code_graph.py``
+    (not by the "MUST MATCH" comment alone). Drift is not cosmetic: a future
+    value flag missing here makes ``project_from_argv`` mistake the flag's
+    VALUE for the repo path → a different claim key → twins undetected."""
+    import ast
+
+    from vco_lib import codegraph_walk
+
+    source = _ANALYZER_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    # Actions that consume NO separate argv token — a flag with one of
+    # these never has a value the scanner could mistake for the repo path.
+    flag_only_actions = {"store_true", "store_false", "store_const", "count"}
+
+    value_flags: set = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "add_argument"):
+            continue
+        options = [
+            a.value for a in node.args
+            if isinstance(a, ast.Constant) and isinstance(a.value, str)
+            and a.value.startswith("-")
+        ]
+        action = None
+        for kw in node.keywords:
+            if kw.arg == "action" and isinstance(kw.value, ast.Constant):
+                action = kw.value.value
+        if action in flag_only_actions or action in ("help", "version"):
+            continue
+        value_flags.update(options)
+
+    assert value_flags == set(codegraph_walk._VALUE_FLAGS), (
+        f"codegraph_walk._VALUE_FLAGS drifted from the analyzer argparse "
+        f"value options — missing: {sorted(value_flags - set(codegraph_walk._VALUE_FLAGS))}, "
+        f"extra: {sorted(set(codegraph_walk._VALUE_FLAGS) - value_flags)}")
+
+
 # ── v0.2.103: per-spawner claim coverage ──────────────────────────────────
 
 
@@ -2027,8 +2071,13 @@ def _stub_driver_walk_gates(monkeypatch):
     monkeypatch.setattr(cr, "count_stale_rows", _probe_down)
     monkeypatch.setattr(cr, "spawn_code_summary_after_walk", lambda *_a, **_k: None)
     monkeypatch.setattr(cr, "_collect_terminal_stats", lambda *_a, **_k: ({}, None))
-    monkeypatch.setattr(cr, "_report_terminal_to_hub", lambda *_a, **_k: None)
-    seen = {"runs": [], "deferrals": []}
+    seen = {"runs": [], "deferrals": [], "terminal": []}
+
+    def _record_terminal(*args, **kwargs):
+        seen["terminal"].append((args, kwargs))
+        return None
+
+    monkeypatch.setattr(cr, "_report_terminal_to_hub", _record_terminal)
     monkeypatch.setattr(
         cr, "_record_unconverged_deferral",
         lambda *a, **k: seen["deferrals"].append(a))
@@ -2067,6 +2116,58 @@ def test_resync_driver_walk_goes_through_the_walk_claim(monkeypatch, tmp_path, c
     assert cr._run_resync_and_verify_slotted(
         "Acme Projects", tmp_path, tmp_path / "a.py") == 0
     assert len(seen["runs"]) == 1
+
+
+def test_resync_driver_walk_refusal_posts_a_terminal_hub_report(
+        monkeypatch, tmp_path, capsys):
+    """v0.2.103 review R1-2: on ``WalkAlreadyRunning`` the driver must post
+    the terminal hub report (mirroring the stale-image refusal ~100 lines
+    above) BEFORE returning 0. When THIS driver was spawned by a
+    REGISTERING path the build row carries the driver's pid; without a
+    terminal write the pid-aliveness reconciler later mislabels the row
+    "failed" anyway — but as an unexplained death instead of the honest
+    refusal. The hub's pid guard makes the report a no-op when the running
+    walk re-registered the row under its own pid. RED-PROOF TARGET:
+    deleting the ``_report_terminal_to_hub`` call in the refusal branch
+    turns the terminal-report assertion red."""
+    from vco_lib import codegraph_resync as cr
+    from vco_lib import codegraph_walk
+
+    seen = _stub_driver_walk_gates(monkeypatch)
+    proc, line = _claim_holder(
+        tmp_path, codegraph_walk.walk_claim_lock_path("Acme Projects"), "30")
+    assert line == "held"
+    try:
+        rc = cr._run_resync_and_verify_slotted(
+            "Acme Projects", tmp_path, tmp_path / "a.py")
+    finally:
+        proc.kill()
+        proc.wait(10)
+    assert rc == 0
+    assert "already running" in capsys.readouterr().out
+
+    # Exactly ONE terminal report, posted by the refusal branch: status
+    # "failed" (the only honest terminal vocabulary the hub's /terminal
+    # route accepts for a run that did not complete) with the refusal as
+    # its error message, so the row does not read as a silent death.
+    assert len(seen["terminal"]) == 1, (
+        f"the walk-refusal branch must post exactly one terminal report, "
+        f"got {seen['terminal']!r}")
+    args, kwargs = seen["terminal"][0]
+    assert args[0] == "Acme Projects"
+    assert args[1] == "failed"
+    assert "already running" in (kwargs.get("error_message") or "")
+    assert kwargs.get("files_analyzed") == 0
+
+    # Control: with the claim free the SAME call takes the ordinary
+    # completion path (its own terminal report for the analyzer run).
+    assert cr._run_resync_and_verify_slotted(
+        "Acme Projects", tmp_path, tmp_path / "a.py") == 0
+    assert len(seen["runs"]) == 1
+    assert len(seen["terminal"]) == 2, (
+        "the ordinary path still posts its own terminal report")
+    _args2, kwargs2 = seen["terminal"][1]
+    assert "already running" not in (kwargs2.get("error_message") or "")
 
 
 def test_retry_code_graph_walk_goes_through_the_walk_claim(monkeypatch, tmp_path):
