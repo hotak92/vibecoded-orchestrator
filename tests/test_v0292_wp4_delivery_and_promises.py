@@ -486,11 +486,17 @@ class DeliveryAuditTests(unittest.TestCase):
         ``compose_override_filename_conflict`` emitter was retired as superseded
         by ``compose_override_pair_diverged``, whose one reading lives in
         ``vco_lib/compose_override_pair.py``.
+
+        v0.2.103 (review L-1) — LOWERED 15_136 -> 15_066: the resolved-
+        interpreter rendering of the formats-migration recovery commands
+        landed here and tripped this gate (the gate working); the three
+        emitters moved to ``vco_lib/formats_migration_deferral.py`` with
+        same-name aliases, per the settings_merge precedent.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_136,
+            n, 15_066,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

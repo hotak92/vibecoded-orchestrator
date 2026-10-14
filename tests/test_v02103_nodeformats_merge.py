@@ -19,8 +19,13 @@ Pinned here:
 * bulk mode writes the SAME entry shape as the per-node mode;
 * unchanged nodes are skipped by content hash on a re-run;
 * every LLM call in bulk mode goes through ``summary_backends.call_llm``;
-* bulk mode exits non-zero when no backend is available (the bulk callers
-  record owed work off the exit code);
+* bulk mode saves the sidecar INCREMENTALLY (after each generated node —
+  a killed run keeps everything finished so far) and has NO whole-run cap;
+* bulk exit codes distinguish "done" (0 — permanent refusals are final, not
+  owed), "a node errored" (1 — retryable) and "no backend" (3 — owed but
+  environmental: kg-sync must NOT arm the full-sync auto-retry for it);
+* the printed recovery commands name a WORKING interpreter (L-1) — proved
+  by executing the parsed argv's interpreter, not by grepping the source;
 * BOTH callers (kg-sync's post-sync refresh, the schema-migration regen)
   spawn the merged generator with an argv its REAL argparse accepts —
   argv-shape-only assertions are not enough.
@@ -143,10 +148,17 @@ def test_no_shipped_code_references_the_retired_script():
 
 def test_the_printed_recovery_command_names_the_merged_generator():
     """A printed command is shipped code: it must name the merged generator
-    and actually work (its argv is parse-tested further below)."""
+    and actually work (its argv is parse-tested further below). The
+    bare-`python` / placeholder half of the promise is executed, not
+    grepped, in ``test_the_printed_recovery_command_runs_as_printed``."""
     src = SYNC_SCRIPT.read_text(encoding="utf-8")
-    assert "generate-kg-summary.py --all --knowledge-dir" in src, (
-        "the deferral's command_to_apply must run the merged generator"
+    assert "--all --knowledge-dir" in src, (
+        "the deferral's command_to_apply must run the merged generator's "
+        "bulk mode"
+    )
+    # Both node-formats deferrals print the ONE resolved recovery command.
+    assert src.count("command_to_apply=_node_formats_recovery_command(") == 2, (
+        "both node-formats deferral emitters must print the resolved command"
     )
     assert "generate_node_formats" not in src, (
         "no reference to the retired generator may remain in kg-sync"
@@ -243,11 +255,13 @@ def test_every_bulk_llm_call_goes_through_the_shared_ladder(
     assert all(p != "" for p in prompts)
 
 
-def test_bulk_mode_exits_non_zero_when_no_backend_is_available(
+def test_bulk_mode_exits_a_distinct_code_when_no_backend_is_available(
     tmp_path, monkeypatch, capsys
 ):
-    """The bulk callers (kg-sync refresh, schema-migration regen) turn the
-    exit code into owed work; a silent exit-0 would mask stale summaries."""
+    """No backend is "owed, retry later", NOT a node error: kg-sync maps this
+    distinct exit code to the environmental condition instead of the
+    auto-retryable refresh-failed one (a full-sync retry cannot conjure a
+    backend and would compete with the code-graph walk)."""
     kdir = _seed_project(tmp_path / "proj", n=1)
     mod = _load_generator()
     _stub_ladder(monkeypatch, mod, backend="skip")
@@ -257,8 +271,85 @@ def test_bulk_mode_exits_non_zero_when_no_backend_is_available(
     )
     with pytest.raises(SystemExit) as ei:
         mod.main()
-    assert ei.value.code == 1
+    assert ei.value.code == mod.BULK_EXIT_NO_BACKEND == 3
     assert not (kdir / ".node_formats.json").exists()
+
+
+def test_a_run_killed_midway_keeps_the_nodes_finished_so_far(
+    tmp_path, monkeypatch, capsys
+):
+    """H-3: the sidecar is saved (atomically) after EACH generated node — a
+    bulk run killed mid-way must leave every node already paid for on disk,
+    not discard the whole run."""
+    kdir = _seed_project(tmp_path / "proj", n=3)
+    mod = _load_generator()
+    mod._sb.reset_backend_cache()
+    mod._sb._BACKEND_CACHE["choice"] = "cli"
+    calls = {"n": 0}
+
+    def _boom(prompt, **_kw):
+        calls["n"] += 1
+        if calls["n"] > 4:  # node-0 and node-1 complete; node-2 dies mid-call
+            raise KeyboardInterrupt("simulated kill mid-run")
+        return FAKE_SUMMARY
+
+    monkeypatch.setattr(mod._sb, "select_backend", lambda **_k: "cli")
+    monkeypatch.setattr(mod._sb, "call_llm", _boom)
+    monkeypatch.setattr(mod, "get_chunks_from_weaviate", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        sys, "argv", ["generate-kg-summary.py", "--all",
+                      "--knowledge-dir", str(kdir)]
+    )
+    with pytest.raises(KeyboardInterrupt):
+        mod.main()
+    sidecar = json.loads((kdir / ".node_formats.json").read_text(encoding="utf-8"))
+    assert "knowledge/concepts/node-0.md" in sidecar
+    assert "knowledge/concepts/node-1.md" in sidecar
+    assert "knowledge/concepts/node-2.md" not in sidecar
+
+
+def test_a_permanent_refusal_completes_the_run(
+    tmp_path, monkeypatch, capsys
+):
+    """M-2: a model refusal is FINAL (owner ruling 2026-10-14) — the node is
+    skipped, the run still counts as completed (exit 0), and no never-clearing
+    deferral is armed over content no backend will ever answer."""
+    kdir = _seed_project(tmp_path / "proj", n=2)
+    mod = _load_generator()
+    mod._sb.reset_backend_cache()
+    mod._sb._BACKEND_CACHE["choice"] = "cli"
+    seen: list[str] = []
+
+    def _maybe_refuse(prompt, **_kw):
+        seen.append(prompt)
+        if len(seen) > 2:  # node-0 answers; node-1 refuses its description
+            raise mod._sb.NonAnswerResponse("refused: cannot summarise this")
+        return FAKE_SUMMARY
+
+    monkeypatch.setattr(mod._sb, "select_backend", lambda **_k: "cli")
+    monkeypatch.setattr(mod._sb, "call_llm", _maybe_refuse)
+    monkeypatch.setattr(mod, "get_chunks_from_weaviate", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        sys, "argv", ["generate-kg-summary.py", "--all",
+                      "--knowledge-dir", str(kdir)]
+    )
+    with pytest.raises(SystemExit) as ei:
+        mod.main()
+    assert ei.value.code == 0, capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "non-answer: 1" in out, out
+    sidecar = json.loads((kdir / ".node_formats.json").read_text(encoding="utf-8"))
+    assert "knowledge/concepts/node-0.md" in sidecar
+    assert "knowledge/concepts/node-1.md" not in sidecar
+
+
+def test_the_no_backend_exit_code_pin_matches_the_generator_constant():
+    """Cross-file pin: kg-sync's `_NODE_FORMATS_EXIT_NO_BACKEND` must equal
+    the generator's `BULK_EXIT_NO_BACKEND` — the code crosses a process
+    boundary with no shared import."""
+    mod = _load_generator()
+    sync_src = SYNC_SCRIPT.read_text(encoding="utf-8")
+    assert f"_NODE_FORMATS_EXIT_NO_BACKEND = {mod.BULK_EXIT_NO_BACKEND}" in sync_src
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -354,6 +445,129 @@ def test_project_init_spawns_the_merged_generator_with_a_parseable_argv(
     assert parsed.all is True and parsed.force is True
     # The exit was 0 but the cache never changed → B1 defer (not a success).
     assert ok is False, detail
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Exit-code mapping in kg-sync (M-2) + printed recovery commands (L-1)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _drive_regen_with_stub(tmp_path, monkeypatch, exit_code):
+    """Run the REAL ``_regen_node_formats_after_full_sync`` against a stub
+    clone whose generator exits ``exit_code``; returns the project root."""
+    root = tmp_path / "proj"
+    _seed_project(root, 1)
+    mod = _load_sync(root)
+    install_root = tmp_path / "orchestrator-clone"
+    gen = install_root / "templates" / "scripts" / "generate-kg-summary.py"
+    gen.parent.mkdir(parents=True, exist_ok=True)
+    gen.write_text(
+        f"#!/usr/bin/env python3\nimport sys\nsys.exit({exit_code})\n",
+        encoding="utf-8",
+    )
+    import vco_lib.python_exe as pex
+
+    # *a: python_exe calls resolve_install_root(explicit) internally too.
+    monkeypatch.setattr(pex, "resolve_install_root", lambda *a, **k: install_root)
+    mod._regen_node_formats_after_full_sync()
+    return root
+
+
+def _deferred_entries(root: Path) -> list[dict]:
+    p = root / ".claude" / "context" / "UPDATE_DEFERRED.json"
+    if not p.exists():
+        return []
+    return json.loads(p.read_text(encoding="utf-8"))["entries"]
+
+
+def test_kg_sync_maps_the_no_backend_exit_to_the_environmental_condition(
+    tmp_path, monkeypatch
+):
+    """M-2: exit ``BULK_EXIT_NO_BACKEND`` must NOT arm the auto-retryable
+    refresh-failed condition (its retry re-runs a FULL `--all` sync, which
+    cannot conjure a backend and competes with the code-graph walk)."""
+    root = _drive_regen_with_stub(tmp_path, monkeypatch, exit_code=3)
+    cids = [e["condition_id"] for e in _deferred_entries(root)]
+    assert cids == ["kg_node_formats_backend_unavailable"], cids
+
+
+def test_kg_sync_maps_a_node_error_exit_to_the_retryable_condition(
+    tmp_path, monkeypatch
+):
+    """The leave-the-distinction-alone half: a genuine per-node error exit
+    still records the auto-retryable owed-work entry."""
+    root = _drive_regen_with_stub(tmp_path, monkeypatch, exit_code=1)
+    cids = [e["condition_id"] for e in _deferred_entries(root)]
+    assert cids == ["kg_node_formats_refresh_failed"], cids
+
+
+def test_a_successful_refresh_clears_both_conditions(tmp_path, monkeypatch):
+    """Paired resolution: an exit-0 refresh clears the error entry AND the
+    environmental no-backend sibling."""
+    root = _drive_regen_with_stub(tmp_path, monkeypatch, exit_code=3)
+    assert [e["condition_id"] for e in _deferred_entries(root)] == \
+        ["kg_node_formats_backend_unavailable"]
+    root2 = _drive_regen_with_stub(tmp_path, monkeypatch, exit_code=0)
+    # Both drives use the same tmp project root (tmp_path/"proj").
+    assert root2 == root
+    assert _deferred_entries(root) == [], "exit 0 must clear the entry"
+
+
+def test_the_printed_recovery_command_runs_as_printed(tmp_path, monkeypatch):
+    """L-1: a printed command is shipped code. The interpreter named in the
+    deferral's command_to_apply must be an existing executable that can
+    import vco_lib — not a bare `python` and not a `<orchestrator-root>`
+    placeholder."""
+    import shlex
+    import subprocess
+
+    root = _drive_regen_with_stub(tmp_path, monkeypatch, exit_code=1)
+    entries = _deferred_entries(root)
+    command = entries[0]["command_to_apply"]
+    assert "<orchestrator-root>" not in command, command
+    cmd_line = next(
+        ln for ln in command.splitlines()
+        if "generate-kg-summary.py" in ln and not ln.lstrip().startswith("#")
+    )
+    argv = shlex.split(cmd_line)
+    assert Path(argv[0]).is_file(), f"interpreter {argv[0]} does not exist"
+    assert argv[1].endswith("generate-kg-summary.py"), argv
+    probe = subprocess.run(
+        [argv[0], "-c", "import vco_lib"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert probe.returncode == 0, probe.stderr
+
+
+def test_the_project_init_migration_recovery_command_runs_as_printed(tmp_path):
+    """L-1 (project_init half): the schema-migration deferral's recovery
+    command names a working interpreter for BOTH printed commands (the
+    generator invocation and the dismiss call)."""
+    import shlex
+    import subprocess
+    from vco_lib import project_init
+
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    project_init._write_node_formats_migration_deferral(
+        folder, canonical=2, detail="test detail"
+    )
+    entries = _deferred_entries(folder)
+    assert [e["condition_id"] for e in entries] == \
+        ["regenerated_data_schema_migration_pending"]
+    command = entries[0]["command_to_apply"]
+    for keyword in ("generate-kg-summary.py", "dismiss-deferral"):
+        cmd_line = next(
+            ln for ln in command.splitlines()
+            if keyword in ln and not ln.lstrip().startswith("#")
+        )
+        argv = shlex.split(cmd_line)
+        assert Path(argv[0]).is_file(), f"interpreter {argv[0]} does not exist"
+        assert argv[0] not in ("python", "python3"), argv
+        probe = subprocess.run(
+            [argv[0], "-c", "import vco_lib"],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert probe.returncode == 0, probe.stderr
 
 
 # ═══════════════════════════════════════════════════════════════════════════

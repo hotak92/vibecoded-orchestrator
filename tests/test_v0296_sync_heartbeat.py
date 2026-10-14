@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-import types
 import uuid
 from pathlib import Path
 
@@ -259,9 +258,11 @@ class TestTheGuiParseContract:
 class TestTheFinalizeBeat:
     def test_regen_announces_itself_before_its_captured_silence(
             self, tmp_path, capsys, monkeypatch):
-        """The post-summary regen runs capture_output=True for up to 600 s —
-        without a beat right before it, that silence lands on the update
-        watchdog's clock with the modal showing nothing new."""
+        """The post-summary regen runs with piped output and NO whole-run
+        cap (v0.2.103 review H-3) — without a beat right before it, that
+        silence lands on the update watchdog's clock with the modal showing
+        nothing new. The spawn is a Popen polled with a heartbeat every
+        120 s, so the beat keeps firing WHILE it runs too."""
         root = tmp_path / "proj"
         _seed_tree(root, 1)
         mod = _load(root)
@@ -273,16 +274,23 @@ class TestTheFinalizeBeat:
 
         import vco_lib.python_exe as pex
         monkeypatch.setattr(pex, "resolve_install_root", lambda: tmp_path)
-        ran: list[tuple] = []
-        monkeypatch.setattr(
-            "subprocess.run",
-            lambda *a, **k: ran.append(a)
-            or types.SimpleNamespace(returncode=0, stdout="", stderr=""),
-        )
+        spawned: list[tuple] = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "", ""
+
+        def _fake_popen(*a, **k):
+            spawned.append(a)
+            return _FakeProc()
+
+        monkeypatch.setattr("subprocess.Popen", _fake_popen)
 
         mod._regen_node_formats_after_full_sync()
 
-        assert len(ran) == 1, "the regen must actually have been spawned"
+        assert len(spawned) == 1, "the regen must actually have been spawned"
         assert any(
             "refreshing KG summaries" in ln for ln in _event_lines(capsys)), (
             "the regen must announce itself BEFORE its captured silence"

@@ -560,12 +560,15 @@ def _process_node_bulk(
     """Process one node in ``--all`` mode. Returns a status string.
 
     Status values: ``"skipped"``, ``"generated"``, ``"dry_run"``,
-    ``"archived"``, ``"archived_dropped"``, ``"error:<msg>"`` (the first four
-    keep the retired bulk generator's contract, so the progress/tally lines
-    callers parse are unchanged). Every LLM call goes through the shared
-    ladder; a non-answer raises
+    ``"archived"``, ``"archived_dropped"``, ``"nonanswer:<msg>"``,
+    ``"error:<msg>"`` (the first four keep the retired bulk generator's
+    contract, so the progress/tally lines callers parse are unchanged). Every
+    LLM call goes through the shared ladder; a non-answer raises
     :class:`summary_backends.NonAnswerResponse` there and is reported
-    as an error here, never cached.
+    as a ``nonanswer:`` status here, never cached — and, per the owner
+    ruling of 2026-10-14 (a model refusal is FINAL), it is not an error
+    either: retrying or deferring it would only build a never-clearing
+    owed loop over content no backend will ever answer.
     """
     title, full_text, body = read_node(file_path)
     if not title:
@@ -600,7 +603,10 @@ def _process_node_bulk(
         description = generate_description(title, body)
         summary = generate_summary(title, body)
     except _sb.NonAnswerResponse as exc:
-        return f"error:{exc}"
+        # A refusal is FINAL (owner ruling 2026-10-14) — done-with-this-node-
+        # skipped, not owed: nothing is cached (the hash gate must not freeze
+        # a non-answer) and the status is NOT an error for the exit code.
+        return f"nonanswer:{exc}"
     except RuntimeError as exc:
         return f"error:{exc}"
 
@@ -636,15 +642,46 @@ def _process_node_bulk(
     return "generated"
 
 
+#: Bulk exit code: NO summary backend was selectable this run (the ladder
+#: returned ``skip`` — VRAM/code-graph-walk guard, or no CLI and no keys).
+#: "Owed, retry later": nothing was generated, so the nodes stay owed for a
+#: run when a backend IS available. Distinct from 1 (per-node errors) so the
+#: bulk callers can record it WITHOUT arming the auto-retry that re-runs a
+#: full ``--all`` sync (review v0.2.103 M-2). ``2`` is argparse's; pinned
+#: across the process boundary by
+#: ``tests/test_v02103_nodeformats_merge.py``.
+BULK_EXIT_NO_BACKEND = 3
+
+
 def _run_bulk(args: argparse.Namespace) -> int:
     """The ``--all`` pass over every node under KNOWLEDGE_DIR.
 
-    Returns the process exit code: 0 when the pass completed (nodes may have
-    been skipped — that IS success), 1 when any node errored or no summary
-    backend was available. The bulk callers (kg-sync's post-sync refresh,
-    the schema-migration regeneration) treat a non-zero exit as owed work
-    and record a deferral; the single-file mode above exits 0 in the
-    no-backend case instead because the launcher parses its stdout marker.
+    Returns the process exit code:
+
+    * ``0`` — the pass COMPLETED. Nodes may have been skipped (unchanged,
+      archived) or permanently refused (``nonanswer:`` — a model refusal is
+      final, owner ruling 2026-10-14): that IS success; the tally line names
+      the counts so nothing is invisible.
+    * ``1`` — a node errored for a non-refusal reason (a tier's transport
+      failed, a parse broke). Potentially transient → the bulk callers
+      (kg-sync's post-sync refresh, the schema-migration regeneration)
+      treat it as owed work and record a deferral. Incremental persistence
+      (below) keeps a re-run cheap: only the failed nodes regenerate.
+    * :data:`BULK_EXIT_NO_BACKEND` — no summary backend was selectable at
+      all. "Owed, retry later" — kg-sync records the environmental
+      ``kg_node_formats_backend_unavailable`` condition for it, NOT the
+      auto-retryable refresh-failed one (a deferral must not raise a
+      never-clearing retry that re-runs a full sync).
+
+    The sidecar is saved ATOMICALLY after EACH generated node (and each
+    dropped archived entry) — never only at the end: a bulk run over a
+    fresh install can spend hours on the ladder's CLI tier, and an
+    all-or-nothing save meant a kill mid-run discarded every node already
+    paid for (review v0.2.103 H-3). There is deliberately NO whole-run
+    wall-clock cap: per-LLM-call timeouts
+      (``summary_backends.TIMEOUT``, default 180 s) already bound a hung
+      backend, and a cap would cut valid long work (owner rule: shipped
+      timeouts are very long by design).
     """
     files = sorted(KNOWLEDGE_DIR.rglob("*.md")) if KNOWLEDGE_DIR.is_dir() else []
     if not files:
@@ -665,11 +702,16 @@ def _run_bulk(args: argparse.Namespace) -> int:
         )
 
     if select_backend() == "skip":
-        return 1
+        print(
+            "No summary backend available (deferred or unconfigured) — "
+            "nodes stay owed for a run when one is; nothing written.",
+            file=sys.stderr,
+        )
+        return BULK_EXIT_NO_BACKEND
 
     total = len(files)
     skipped = generated = errors = dry_count = archived_count = 0
-    statuses: list[str] = []
+    nonanswers = 0
     started = time.time()
     for i, file_path in enumerate(files, 1):
         node_start = time.time()
@@ -680,7 +722,6 @@ def _run_bulk(args: argparse.Namespace) -> int:
         status = _process_node_bulk(
             file_path, force=args.force, dry_run=args.dry_run, formats=formats
         )
-        statuses.append(status)
         elapsed = time.time() - node_start
         if status == "skipped":
             skipped += 1
@@ -696,20 +737,31 @@ def _run_bulk(args: argparse.Namespace) -> int:
         elif status == "generated":
             generated += 1
             print(f"[{i}/{total}] OK    {rel}  ({elapsed:.1f}s)")
+        elif status.startswith("nonanswer:"):
+            nonanswers += 1
+            print(
+                f"[{i}/{total}] REFUSED {rel}: "
+                f"{status.removeprefix('nonanswer:')} (final — not retried, "
+                f"not deferred)"
+            )
         else:
             errors += 1
             print(f"[{i}/{total}] ERROR {rel}: {status.removeprefix('error:')}")
-
-    if (generated > 0 or n_rekeyed > 0 or "archived_dropped" in statuses) \
-            and not args.dry_run:
-        save_formats(formats)
-        print(f"Saved formats to {FORMATS_PATH}")
+        # Incremental persistence (H-3): every node that CHANGED the sidecar
+        # is on disk before the next one starts. Atomic (shared home), so a
+        # kill mid-run leaves a valid sidecar holding everything finished so
+        # far. Dry-run writes nothing; unchanged runs rewrite nothing.
+        if not args.dry_run and status in ("generated", "archived_dropped"):
+            save_formats(formats)
 
     print(
         f"\nDone in {time.time() - started:.1f}s — "
         f"generated: {generated}, skipped: {skipped}, "
+        f"non-answer: {nonanswers}, "
         f"dry-run: {dry_count}, errors: {errors}, archived: {archived_count}"
     )
+    if not args.dry_run and (generated or archived_count):
+        print(f"Sidecar saved incrementally to {FORMATS_PATH}")
     return 1 if errors else 0
 
 

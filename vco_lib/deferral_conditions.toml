@@ -1441,12 +1441,40 @@ sidecar refreshed after a bulk sync, and the only trace was one stderr line \
 `(node-format refresh exited 2; summaries left as-is — non-fatal)`. The fix \
 runs the ROOT generator with `--knowledge-dir <project>/knowledge` — one \
 component, identical for root and non-root — and this condition is what stops \
-the remaining failure modes (no clone reachable, generator non-zero, 600 s \
-cap) from being invisible again. `retry_action` reuses the EXISTING \
+the remaining failure modes (no clone reachable, generator non-zero) from \
+being invisible again. v0.2.103 (review M-2) narrowed the trigger: the \
+generator's bulk mode now distinguishes exit 1 (a node ERRORED for a \
+non-refusal, potentially transient reason — retry-worthy, so this \
+auto-retryable entry is right) from `BULK_EXIT_NO_BACKEND` (3 — no backend \
+selectable at all, mapped to the sibling environmental condition \
+`kg_node_formats_backend_unavailable` instead, because a full-sync retry \
+cannot fix a missing backend and would compete with the code-graph walk). \
+A permanent model refusal is FINAL (owner ruling 2026-10-14) and exits 0 — \
+it never arms this retry. There is no whole-run wall-clock cap any more \
+(review H-3): per-LLM-call timeouts bound a hung backend and the sidecar is \
+saved incrementally after each node. `retry_action` reuses the EXISTING \
 `retry:py:kg_seed` handler rather than declaring a new one: that handler \
 re-runs `sync_knowledge_graph.py --all`, which re-runs this refresh — the \
 retry is real and already wired, so no HANDLERS edit is claimed. Cleared by \
 the paired `_clear_node_formats_deferral` on a refresh that exits 0."""
+
+[conditions.kg_node_formats_backend_unavailable]
+class = "environmental"
+owner = "templates/scripts/sync_knowledge_graph.py"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (batch review R2, M-2): the post-sync summary refresh \
+found NO selectable backend (local tier deferred by the free-VRAM / \
+code-graph-walk guard, no `claude` CLI, no cloud key) and exited \
+`BULK_EXIT_NO_BACKEND`. Environmental on purpose: while the machine has no \
+backend, retrying cannot succeed, and the pre-103 behaviour (exit 1 → the \
+auto-retryable `kg_node_formats_refresh_failed` → `retry:py:kg_seed` re-runs \
+a FULL `--all` sync) re-walked and re-pruned the tree to maybe find one — \
+competing with the very code-graph walk the deferral guard protects, and on \
+a permanently-backend-less machine it never cleared. The nodes stay owed \
+for the next organic sync or per-edit run; the paired \
+`_clear_node_formats_deferral` resolves this entry on the first refresh \
+that actually runs (exit 0)."""
 
 [conditions.kg_binding_missing]
 class = "action_required"

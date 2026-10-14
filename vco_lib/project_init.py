@@ -80,6 +80,10 @@ from vco_lib import jsonc_edit as _jsonc_edit
 from vco_lib import manifest_paths as _manifest_paths
 from vco_lib import shipped_artifact as _shipped
 from vco_lib import bundle_skip_deferral as _bsd
+# v0.2.103 (review L-1): the formats-migration deferral emitters (whose
+# printed recovery commands name the RESOLVED interpreter) — same-name
+# aliases are bound near their old call-sites below.
+from vco_lib import formats_migration_deferral
 from vco_lib import bundle_preserve as _bundle_preserve
 from vco_lib import weaviate_helpers as _wh
 # v0.2.82 L4: the ONE home for named-vector round-trip cleaning (dropping
@@ -14470,88 +14474,18 @@ def _subprocess_run_quiet(argv: list[str], cwd: Path) -> int:
     ).returncode
 
 
-def _write_formats_migration_deferral(
-    folder: Path,
-    canonical: int,
-    detail: str,
-    *,
-    condition_id: str,
-    title: str,
-    sidecar_desc: str,
-    derived_from: str,
-    regen_cmd: str,
-    log_tag: str,
-) -> None:
-    """INFO deferral: a regenerated-sidecar schema bumped but the migration
-    action couldn't run inline. The existing cache is untouched; this tells
-    the project's Claude how to regenerate manually. Generic home (v0.2.73
-    M2) — per-artifact wrappers below supply the artifact-specific text."""
-    try:
-        from vco_lib.deferral_report import DeferralEntry
-        from vco_lib import deferral_emit as _de
-        # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
-        _de.emit(folder, DeferralEntry(
-            condition_id=condition_id,
-            severity="info",
-            title=title,
-            detected=(
-                f"`{sidecar_desc}` is at an older schema than "
-                f"this orchestrator's canonical v{canonical}. It is a "
-                f"regenerated cache (derived from {derived_from}), so it was "
-                f"NOT overwritten. Inline regeneration did not run: {detail}."
-            ),
-            why_deferred=(
-                "Regenerated-data files are re-derived, never blind-overwritten. "
-                "When the generator backend is available, re-running it rewrites "
-                "the cache in the new schema with no data loss."
-            ),
-            command_to_apply=(
-                f"{regen_cmd}\n"
-                f"# Then dismiss:\n"
-                f"python -m vco_lib.project_init dismiss-deferral --folder {str(folder)!r} "
-                f"--condition-id {condition_id}"
-            ),
-        ))
-    except Exception as exc:  # never block the update flow
-        print(f"[{log_tag}] deferral write failed (non-fatal): {exc}", file=sys.stderr)
-
-
-def _write_node_formats_migration_deferral(folder: Path, canonical: int, detail: str) -> None:
-    """INFO deferral `regenerated_data_schema_migration_pending`: the
-    .node_formats schema bumped but regeneration couldn't run inline. Thin
-    wrapper over the generic writer (v0.2.73 M2) — text unchanged."""
-    _write_formats_migration_deferral(
-        folder, canonical, detail,
-        condition_id="regenerated_data_schema_migration_pending",
-        title="KG-summary cache schema bumped — regeneration pending",
-        sidecar_desc="knowledge/.node_formats.json",
-        derived_from="your KG nodes",
-        regen_cmd=(
-            "# Regenerate every node summary in the new schema:\n"
-            "for f in knowledge/**/*.md; do "
-            "python .claude/scripts/generate-kg-summary.py \"$f\" --force; done"
-        ),
-        log_tag="node-formats",
-    )
-
-
-def _write_code_formats_migration_deferral(folder: Path, canonical: int, detail: str) -> None:
-    """INFO deferral `code_formats_schema_migration_pending`: the
-    .code_formats schema bumped but the keep-regenerated action (delete +
-    let the generator rebuild) couldn't complete."""
-    _write_formats_migration_deferral(
-        folder, canonical, detail,
-        condition_id="code_formats_schema_migration_pending",
-        title="Code-summary sidecar schema bumped — regeneration pending",
-        sidecar_desc=".claude/.code_formats.json",
-        derived_from="your project's code-graph rows",
-        regen_cmd=(
-            "# Delete the old-schema sidecar and regenerate:\n"
-            "rm .claude/.code_formats.json\n"
-            "python .claude/scripts/generate-code-summary.py --project <name> --force"
-        ),
-        log_tag="code-formats",
-    )
+# v0.2.103 (review L-1): the formats-migration deferral emitters moved to
+# ``vco_lib/formats_migration_deferral.py`` (the delivery ratchet forbids
+# growing this file). Same-name aliases keep every call-site working on the
+# SAME objects, per the settings_merge precedent — and their printed
+# recovery commands now name the RESOLVED orchestrator-venv interpreter
+# instead of a bare `python` a system shell cannot use to import vco_lib.
+_write_formats_migration_deferral = (
+    formats_migration_deferral.write_formats_migration_deferral)
+_write_node_formats_migration_deferral = (
+    formats_migration_deferral.write_node_formats_migration_deferral)
+_write_code_formats_migration_deferral = (
+    formats_migration_deferral.write_code_formats_migration_deferral)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

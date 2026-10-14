@@ -269,7 +269,10 @@ def test_bulk_refuses_to_cache_a_generated_non_answer(
     monkeypatch.setattr(gks, "call_llm", _raising_call_llm)
     db: dict = {}
     status = gks._process_node_bulk(node_file, force=False, dry_run=False, formats=db)
-    assert status.startswith("error:"), status
+    # v0.2.103 (review M-2 / owner ruling 2026-10-14): a refusal is FINAL —
+    # its own status bucket, never an "error:" (which would arm the
+    # auto-retry over content no backend will ever answer) and never cached.
+    assert status.startswith("nonanswer:"), status
     assert "non-answer" in status
     assert db == {}, "a non-answer must never reach the sidecar"
 
