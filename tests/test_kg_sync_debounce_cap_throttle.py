@@ -359,7 +359,10 @@ def test_singleflight_different_paths_stay_independent(proj: Path, tmp_path: Pat
 def test_singleflight_reaper_leaves_a_followup_whose_sync_runs(proj: Path, tmp_path: Path):
     """A follow-up ".lock" older than grace whose key has a LIVE claim is
     NOT an orphan: reaping it would start a second concurrent sync. The
-    reaper must skip it (the running sync's runner serves it at sync end)."""
+    reaper must skip it (the running sync's runner serves it at sync end).
+    The claim must be GENUINELY live: its stamp post-dates the owner
+    process's start (a backdated claim under a live pid is the recycled
+    case, covered by the pid-reuse tests below)."""
     pend = _pending_dir(proj)
     pend.mkdir(parents=True)
     reaplog = tmp_path / "reap.log"
@@ -374,11 +377,14 @@ def test_singleflight_reaper_leaves_a_followup_whose_sync_runs(proj: Path, tmp_p
         base="kg_deadbeef.lock"
         mkdir -p "{pend}/$base"
         printf '%s\\t%s\\n' "{proj}" "echo REAPED >> {reaplog}" > "{pend}/$base/cmd"
-        # A LIVE in-flight claim for the same key (sync running now).
+        # A LIVE in-flight claim for the same key (sync running now): the
+        # sleep process started BEFORE the claim was stamped, so the
+        # pid-reuse guard sees it as the claim's live owner.
         mkdir -p "{pend}/$base.claimed.$LIVE_PID"
-        # Backdate both well past grace: age alone would trip Sweep A.
-        touch -d '2000-01-01' "{pend}/$base" "{pend}/$base.claimed.$LIVE_PID" 2>/dev/null \\
-            || touch -t 200001010000 "{pend}/$base" "{pend}/$base.claimed.$LIVE_PID"
+        # Backdate only the LOCK well past grace: age alone would trip
+        # Sweep A. The claim stays fresh (age < grace → Sweep B skips it).
+        touch -d '2000-01-01' "{pend}/$base" 2>/dev/null \\
+            || touch -t 200001010000 "{pend}/$base"
         _kg_debounce_reap_stale "{proj}"
         if [ -d "{pend}/$base" ]; then echo LOCK_PRESENT; else echo LOCK_GONE; fi
         kill "$LIVE_PID" 2>/dev/null
@@ -393,6 +399,136 @@ def test_singleflight_reaper_leaves_a_followup_whose_sync_runs(proj: Path, tmp_p
     )
     time.sleep(1.0)  # catch any erroneously-spawned reaper runner
     assert not reaplog.exists(), "no second sync may be started by the reaper"
+
+
+# ─── v0.2.103 PID-reuse guard (HIGH-3, review R3 2026-10-14) ────────────────
+#
+# A claim left by a DEAD sync whose pid the OS later handed to an unrelated
+# live process used to look "alive" forever (kill -0 / Get-Process -Id only
+# answer "does SOME process have this pid?"): every later edit of that file
+# was parked as a follow-up nothing served, and the reaper skipped it. The
+# guard: a pid is the claim's live owner only if the process ALSO started
+# at/before the claim's stamp.
+
+
+def test_pid_reuse_recycled_claim_is_not_inflight(proj: Path, tmp_path: Path):
+    """Unit-level, deterministic: a claim stamped long ago whose pid now
+    belongs to a process that started AFTER the stamp (recycled) is NOT in
+    flight; the same pid with a FRESH stamp (genuine owner) IS in flight."""
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    script = textwrap.dedent(
+        f"""
+        set -u
+        . "{LIB}"
+        sleep 60 &
+        LIVE_PID=$!
+        base="kg_deadbeef.lock"
+        claim="{pend}/$base.claimed.$LIVE_PID"
+        # RECYCLED: pid answers kill -0, but the process started ~now while
+        # the claim says the sync began years ago.
+        mkdir -p "$claim"
+        touch -d '2000-01-01' "$claim" 2>/dev/null || touch -t 200001010000 "$claim"
+        if _kg_debounce_inflight "{pend}" "$base"; then echo RECYCLED_INFLIGHT; else echo RECYCLED_CLEAR; fi
+        rm -rf "$claim"
+        # GENUINE: claim stamped now → the pre-dating process owns it.
+        mkdir -p "$claim"
+        if _kg_debounce_inflight "{pend}" "$base"; then echo LIVE_INFLIGHT; else echo LIVE_CLEAR; fi
+        kill "$LIVE_PID" 2>/dev/null
+        wait "$LIVE_PID" 2>/dev/null
+        exit 0
+        """
+    )
+    res = _run(script, cwd=proj)
+    assert res.returncode == 0, res.stderr
+    assert "RECYCLED_CLEAR" in res.stdout, (
+        "a claim whose pid was recycled by a later-starting process must "
+        "not be treated as an in-flight sync"
+    )
+    assert "LIVE_INFLIGHT" in res.stdout, (
+        "a claim stamped after its owner process started is genuinely live"
+    )
+
+
+def test_pid_reuse_recycled_claim_does_not_freeze_later_edits(proj: Path, tmp_path: Path):
+    """THE freeze repro (behavioral): with a recycled-pid claim parked in
+    the state dir, a fresh edit of that file must still be SERVED — the
+    ordinary schedule path, or Sweep B recovery + follow-up serve — never
+    parked forever behind the bogus claim."""
+    import hashlib
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    out = tmp_path / "reuse.log"
+    fpath = f"{proj}/docs/reuse.md"
+    key = hashlib.md5(fpath.encode()).hexdigest()
+    script = textwrap.dedent(
+        f"""
+        set -u
+        . "{LIB}"
+        sleep 60 &
+        LIVE_PID=$!
+        base="kg_{key}.lock"
+        claim="{pend}/$base.claimed.$LIVE_PID"
+        mkdir -p "$claim"
+        printf '%s\\t%s\\n' "{proj}" "echo PARKED >> {out}" > "$claim/cmd"
+        touch -d '2000-01-01' "$claim" 2>/dev/null || touch -t 200001010000 "$claim"
+        VCO_KG_SYNC_DEBOUNCE_SECONDS=1 _kg_debounce_schedule \\
+            "{proj}" "{fpath}" "$(command -v python3)" \\
+            "{proj}" "echo FRESH >> {out}" "kg"
+        kill "$LIVE_PID" 2>/dev/null
+        wait "$LIVE_PID" 2>/dev/null
+        exit 0
+        """
+    )
+    res = _run(script, cwd=proj)
+    assert res.returncode == 0, res.stderr
+    assert _wait_for_line(out, "FRESH", timeout=20.0), (
+        "a recycled-pid claim must not freeze the file: the edit is served"
+    )
+
+
+def test_pid_reuse_genuinely_live_claim_still_parks(proj: Path, tmp_path: Path):
+    """Counterweight: a claim whose owner process genuinely pre-dates the
+    stamp (a real running sync) must still park the edit as a follow-up —
+    the pid-reuse guard must not loosen genuine single-flight."""
+    import hashlib
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    out = tmp_path / "park.log"
+    fpath = f"{proj}/docs/park.md"
+    key = hashlib.md5(fpath.encode()).hexdigest()
+    script = textwrap.dedent(
+        f"""
+        set -u
+        . "{LIB}"
+        sleep 60 &
+        LIVE_PID=$!
+        base="kg_{key}.lock"
+        claim="{pend}/$base.claimed.$LIVE_PID"
+        # GENUINE live claim: the sleep started BEFORE this stamp.
+        mkdir -p "$claim"
+        printf '%s\\t%s\\n' "{proj}" "echo STALE >> {out}" > "$claim/cmd"
+        VCO_KG_SYNC_DEBOUNCE_SECONDS=1 _kg_debounce_schedule \\
+            "{proj}" "{fpath}" "$(command -v python3)" \\
+            "{proj}" "echo FRESH >> {out}" "kg"
+        sleep 3
+        if [ -d "{pend}/$base" ]; then echo FOLLOWUP_PARKED; else echo FOLLOWUP_ABSENT; fi
+        kill "$LIVE_PID" 2>/dev/null
+        wait "$LIVE_PID" 2>/dev/null
+        exit 0
+        """
+    )
+    res = _run(script, cwd=proj)
+    assert res.returncode == 0, res.stderr
+    # Window is 1s, so an ordinary schedule would have flushed by ~1-2s;
+    # 3s of silence + the follow-up lock present = parked behind the live
+    # claim (the running sync's runner serves it at sync end).
+    assert "FOLLOWUP_PARKED" in res.stdout, (
+        "a genuinely live claim must park the edit as a follow-up lock"
+    )
+    assert not out.exists() or "FRESH" not in out.read_text(), (
+        "no sync may start while the genuine claim is live"
+    )
 
 
 # ─── v0.2.103 single-flight — .ps1 sibling end-to-end ──────────────────────
@@ -464,4 +600,159 @@ def test_ps1_singleflight_reedit_during_sync_never_runs_concurrently(proj: Path,
     )
     assert peak == 1, (
         f"[ps1] at most one in-flight sync per path — observed {peak} concurrent"
+    )
+
+
+def _ps1_run(script: str, cwd: Path) -> subprocess.CompletedProcess:
+    exe = shutil.which("pwsh")
+    assert exe is not None  # guaranteed by the callers' skipif; narrows for pyright
+    from tests.common.pwsh import PWSH_BASE_FLAGS
+    return subprocess.run(
+        [exe, *PWSH_BASE_FLAGS, "-Command", script],
+        cwd=str(cwd),
+        capture_output=True, text=True, timeout=120,
+    )
+
+
+@pytest.mark.skipif(not _has_pwsh(), reason="pwsh not on PATH")
+def test_ps1_pid_reuse_recycled_claim_is_not_inflight(proj: Path, tmp_path: Path):
+    """[ps1] PID-reuse guard (HIGH-3): a claim stamped long ago whose pid
+    now belongs to a process that started AFTER the stamp (recycled) is
+    NOT in flight; the same pid under a FRESH stamp (genuine owner) IS."""
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    script = (
+        f". '{LIB_PS1}'\n"
+        f"$live = Start-Process -FilePath 'sleep' -ArgumentList '60' -PassThru\n"
+        f"$dir = '{pend}'\n"
+        f"$base = 'kg_deadbeef.lock'\n"
+        f"$c = Join-Path $dir ($base + '.claimed.' + $live.Id)\n"
+        f"New-Item -ItemType Directory -Path $c -Force | Out-Null\n"
+        f"(Get-Item -LiteralPath $c).LastWriteTime = (Get-Date).AddYears(-10)\n"
+        f"if (Test-KgDebounceInflight -StateDir $dir -Base $base) {{ 'RECYCLED_INFLIGHT' }} "
+        f"else {{ 'RECYCLED_CLEAR' }}\n"
+        f"Remove-Item -LiteralPath $c -Recurse -Force\n"
+        f"New-Item -ItemType Directory -Path $c -Force | Out-Null\n"
+        f"if (Test-KgDebounceInflight -StateDir $dir -Base $base) {{ 'LIVE_INFLIGHT' }} "
+        f"else {{ 'LIVE_CLEAR' }}\n"
+        f"Stop-Process -Id $live.Id -ErrorAction SilentlyContinue\n"
+        f"exit 0\n"
+    )
+    res = _ps1_run(script, cwd=proj)
+    assert res.returncode == 0, res.stderr
+    assert "RECYCLED_CLEAR" in res.stdout, (
+        "[ps1] a recycled pid (started after the claim stamp) must not "
+        "be treated as an in-flight sync"
+    )
+    assert "LIVE_INFLIGHT" in res.stdout, (
+        "[ps1] a claim stamped after its owner process started is live"
+    )
+
+
+@pytest.mark.skipif(not _has_pwsh(), reason="pwsh not on PATH")
+def test_ps1_pid_reuse_recycled_claim_does_not_freeze_later_edits(proj: Path, tmp_path: Path):
+    """[ps1] THE freeze repro: with a recycled-pid claim parked in the
+    state dir, a fresh edit must still be SERVED, never parked forever."""
+    import hashlib
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    out = tmp_path / "reuseps.log"
+    fpath = f"{proj}/docs/reuseps.md"
+    key = hashlib.md5(fpath.encode()).hexdigest()
+    script = (
+        f". '{LIB_PS1}'\n"
+        f"$live = Start-Process -FilePath 'sleep' -ArgumentList '60' -PassThru\n"
+        f"$dir = '{pend}'\n"
+        f"$base = 'kg_{key}.lock'\n"
+        f"$c = Join-Path $dir ($base + '.claimed.' + $live.Id)\n"
+        f"New-Item -ItemType Directory -Path $c -Force | Out-Null\n"
+        f"Set-Content -LiteralPath (Join-Path $c 'cmd') "
+        f"-Value (\"{proj}`t\" + \"echo PARKED >> '{out}'\")\n"
+        f"(Get-Item -LiteralPath $c).LastWriteTime = (Get-Date).AddYears(-10)\n"
+        f"$env:VCO_KG_SYNC_DEBOUNCE_SECONDS = '1'\n"
+        f"Invoke-KgDebounceSchedule -ProjectRoot '{proj}' -FilePath '{fpath}' "
+        f"-WorkingDir '{proj}' -Command \"echo FRESH >> '{out}'\" -Channel 'kg'\n"
+        f"Stop-Process -Id $live.Id -ErrorAction SilentlyContinue\n"
+        f"exit 0\n"
+    )
+    res = _ps1_run(script, cwd=proj)
+    assert res.returncode == 0, res.stderr
+    assert _wait_for_line(out, "FRESH", timeout=30.0), (
+        "[ps1] a recycled-pid claim must not freeze the file"
+    )
+
+
+@pytest.mark.skipif(not _has_pwsh(), reason="pwsh not on PATH")
+def test_ps1_pid_reuse_genuinely_live_claim_still_parks(proj: Path, tmp_path: Path):
+    """[ps1] Counterweight: a genuinely live claim (owner pre-dates the
+    stamp) must still park the edit as a follow-up — single-flight must
+    not be loosened by the pid-reuse guard."""
+    import hashlib
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    out = tmp_path / "parkps.log"
+    fpath = f"{proj}/docs/parkps.md"
+    key = hashlib.md5(fpath.encode()).hexdigest()
+    script = (
+        f". '{LIB_PS1}'\n"
+        f"$live = Start-Process -FilePath 'sleep' -ArgumentList '60' -PassThru\n"
+        f"$dir = '{pend}'\n"
+        f"$base = 'kg_{key}.lock'\n"
+        f"$c = Join-Path $dir ($base + '.claimed.' + $live.Id)\n"
+        f"# GENUINE live claim: the sleep started BEFORE this stamp.\n"
+        f"New-Item -ItemType Directory -Path $c -Force | Out-Null\n"
+        f"$env:VCO_KG_SYNC_DEBOUNCE_SECONDS = '1'\n"
+        f"Invoke-KgDebounceSchedule -ProjectRoot '{proj}' -FilePath '{fpath}' "
+        f"-WorkingDir '{proj}' -Command \"echo FRESH >> '{out}'\" -Channel 'kg'\n"
+        f"Start-Sleep -Seconds 3\n"
+        f"if (Test-Path -LiteralPath (Join-Path $dir $base) -PathType Container) "
+        f"{{ 'FOLLOWUP_PARKED' }} else {{ 'FOLLOWUP_ABSENT' }}\n"
+        f"Stop-Process -Id $live.Id -ErrorAction SilentlyContinue\n"
+        f"exit 0\n"
+    )
+    res = _ps1_run(script, cwd=proj)
+    assert res.returncode == 0, res.stderr
+    assert "FOLLOWUP_PARKED" in res.stdout, (
+        "[ps1] a genuinely live claim must park the edit as a follow-up lock"
+    )
+    assert not out.exists() or "FRESH" not in out.read_text(), (
+        "[ps1] no sync may start while the genuine claim is live"
+    )
+
+
+@pytest.mark.skipif(not _has_pwsh(), reason="pwsh not on PATH")
+def test_ps1_run_won_serves_followup_when_lib_unreadable(proj: Path, tmp_path: Path):
+    """[ps1] LOW-3 (review R3): the follow-up serve at sync end must not
+    depend on the lib file being readable — the .sh sibling falls back to
+    an in-process flusher, and so must the generated run-won child. We
+    generate the REAL fragment, rewrite its embedded lib path to a
+    nonexistent file (simulating an unreadable lib at child runtime) and
+    execute it: the won dir's cmd runs, and the parked follow-up lock is
+    then served by the self-contained fallback flusher."""
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    out = tmp_path / "fb.log"
+    base = "kg_fb.lock"
+    won = pend / f"{base}.reaping.123.456"
+    won.mkdir()
+    (won / "cmd").write_text(f"{proj}\techo FIRST >> '{out}'")
+    followup = pend / base
+    followup.mkdir()
+    (followup / "cmd").write_text(f"{proj}\techo SECOND >> '{out}'")
+
+    script = (
+        f". '{LIB_PS1}'\n"
+        f"$frag = Get-KgDebounceRunWonFragment -WonExpr \"'{won}'\" "
+        f"-StateExpr \"'{pend}'\" -BaseExpr \"'{base}'\"\n"
+        f"$frag = $frag.Replace('{LIB_PS1}', '/nonexistent/kg-sync-debounce.ps1')\n"
+        f"$env:VCO_KG_SYNC_DEBOUNCE_SECONDS = '1'\n"
+        f"Invoke-Expression $frag\n"
+        f"exit 0\n"
+    )
+    res = _ps1_run(script, cwd=proj)
+    assert res.returncode == 0, res.stderr
+    lines = [ln.strip() for ln in out.read_text().splitlines() if ln.strip()]
+    assert lines == ["FIRST", "SECOND"], (
+        f"[ps1] lib-unreadable run-won child must run the won cmd AND serve "
+        f"the follow-up, got {lines}"
     )

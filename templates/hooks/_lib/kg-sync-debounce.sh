@@ -101,12 +101,13 @@
 #   violating coalesce-NEVER-DROP if left forever. The reaper therefore
 #   ALSO sweeps stale ".claimed.<pid>" dirs: if the owning <pid> is no
 #   longer alive (kill -0 fails) the claim is dead → re-claim it (rename
-#   to ".claimed.<our-pid>") and run it. (A pid that IS still alive is a
-#   claim in flight by a live process — leave it; it will run or, if that
-#   process later dies, a future pass re-orphans it. PID reuse is a
-#   theoretical false-"alive": worst case the dead claim waits until the
-#   reused pid also exits, then is recovered — still never dropped, only
-#   delayed, matching the feature's eventually-consistent contract.)
+#   to ".claimed.<our-pid>") and run it. (A pid that IS still alive AND
+#   pre-dates the claim's stamp — see `_kg_debounce_pid_live` — is a
+#   claim in flight by a live process: leave it; it will run or, if that
+#   process later dies, a future pass re-orphans it. A RECYCLED pid — the
+#   stamping process died and the OS handed its pid to a process that
+#   started after the stamp — is NOT live; the claim is recovered here,
+#   so a dead claim never freezes the file's later edits.)
 #
 # WHY sleep+background rather than a watcher daemon: zero new processes
 # at rest, zero new deps, no IPC, and it degrades to "sync slightly
@@ -258,13 +259,103 @@ _kg_debounce_realpid() {
     fi
 }
 
+# v0.2.103 PID-REUSE GUARD (HIGH-3, review R3 2026-10-14). `kill -0` alone
+# answers "does SOME process have this pid?" — but Linux pid space is small
+# and wraps, Windows recycles pids fast in a narrow range, so a claim left
+# by a DEAD sync whose pid was later handed to an unrelated long-lived
+# process used to look "alive" FOREVER: every later edit of that file was
+# parked as a follow-up that nothing served (and the reaper skipped it).
+# A pid now counts as the claim's live owner only if the process ALSO
+# started at/before the claim's stamp (the re-stamp `touch` — see
+# `_kg_debounce_run_claimed` — happens AFTER the runner process started, so
+# a genuine owner always satisfies this; a recycled pid never does, because
+# it started after the stamping process died).
+# Read-only, never kills anything. Soft-fail policy, decided on evidence:
+# when the process exists but its START TIME cannot be read we keep the
+# pre-guard semantics (treat as live). Every supported platform can read a
+# start time (Linux /proc/<pid>/stat, macOS/BSD `ps`, Windows Get-Process in
+# the .ps1 sibling), so the unreadable branch is a broken-install residual;
+# and mis-reporting a LIVE claim as dead would resurrect the duplicate-sync
+# field defect this whole single-flight pass exists to fix — the worse
+# failure. (A dead-looking-but-live claim only costs a bounded extra sync;
+# the freeze this guard removes cost EVERY later edit of the file.)
+# MUST MATCH Test-KgDebouncePidLive in _lib/kg-sync-debounce.ps1.
+#   $1 = pid, $2 = claim stamp epoch (mtime of the claim dir)
+_KG_DEBOUNCE_PID_SLACK_SECS=5
+# Tolerance for mtime coarseness / scheduling jitter between the stamping
+# `touch` and the process-start reading. A genuine owner's start is within
+# milliseconds of the stamp; a recycled pid is seconds-to-years later — 5s
+# separates the two by orders of magnitude. MUST MATCH the .ps1 sibling.
+_kg_debounce_pid_live() {
+    local pid="$1" before="$2"
+    local limit btime hz start start_epoch et now t v d
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    case "$before" in ''|*[!0-9]*) return 0 ;; esac   # no stamp → old semantics
+    kill -0 "$pid" 2>/dev/null || return 1
+    limit=$(( before + _KG_DEBOUNCE_PID_SLACK_SECS ))
+    # Linux fast path: /proc/<pid>/stat field 22 (starttime, clock ticks
+    # since boot) + /proc/stat btime → absolute epoch of the process start.
+    # No external process spawn, and readable for every user's processes.
+    if [ -r "/proc/$pid/stat" ]; then
+        btime=$(sed -n 's/^btime //p' /proc/stat 2>/dev/null)
+        hz=$(getconf CLK_TCK 2>/dev/null || printf '100')
+        case "$btime$hz" in ''|*[!0-9]*) return 0 ;; esac
+        # comm may contain spaces/parens; field 2 is "(...)" — strip through
+        # the last ')' so field N of the remainder is stat field N+2
+        # (starttime is field 22 → remainder field 20).
+        start=$(awk '{ i = index($0, ")"); n = split(substr($0, i + 2), f, " "); if (n >= 20) print f[20] }' "/proc/$pid/stat" 2>/dev/null)
+        case "$start" in ''|*[!0-9]*) return 0 ;; esac
+        start_epoch=$(( btime + start / hz ))
+        [ "$start_epoch" -le "$limit" ] && return 0
+        return 1
+    fi
+    # ps fallback (macOS / BSD): elapsed seconds. procps-style `ps -o etimes=`
+    # prints seconds directly; macOS ps has no etimes but does have `etime`
+    # ("[[dd-]hh:]mm:ss"), parsed below. Process start = now - elapsed.
+    et=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    case "$et" in
+        *[!0-9]*|'') ;;
+        *)
+            now=$(date +%s 2>/dev/null || printf '0')
+            case "$now" in *[!0-9]*) return 0 ;; esac
+            [ $(( now - et )) -le "$limit" ] && return 0
+            return 1
+            ;;
+    esac
+    t=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    v=0
+    case "$t" in
+        *[!0-9:-]*) return 0 ;;                 # unparseable → soft-fail live
+        '')
+            return 0
+            ;;
+    esac
+    d=0
+    case "$t" in
+        *-*) d=$(( ${t%%-*} * 86400 )); t="${t#*-}" ;;
+    esac
+    while :; do
+        case "$t" in
+            *:*) v=$(( v * 60 + ${t%%:*} )); t="${t#*:}" ;;
+            *)  v=$(( v * 60 + t )); break ;;
+        esac
+    done
+    v=$(( v + d ))
+    now=$(date +%s 2>/dev/null || printf '0')
+    case "$now" in *[!0-9]*) return 0 ;; esac
+    [ $(( now - v )) -le "$limit" ] && return 0
+    return 1
+}
+
 # v0.2.103 SINGLE-FLIGHT PROBE: is a sync for this lock key IN FLIGHT right
-# now? A claim dir "<base>.claimed.<pid>" whose pid is ALIVE is a sync in
-# progress (the runner subshell stamped its own real pid and lives for the
-# whole eval — `_kg_debounce_run_claimed`). A "<base>.reaping.<token>" dir
-# is the microsecond claim transition — treat any as in flight. A claim
-# whose pid is DEAD is NOT in flight (crash residual; Sweep B recovers it
-# separately), so a dead claim never blocks a fresh schedule.
+# now? A claim dir "<base>.claimed.<pid>" whose pid is ALIVE AND PRE-DATES
+# the claim's stamp (see `_kg_debounce_pid_live` — guards against pid
+# REUSE) is a sync in progress (the runner subshell stamped its own real
+# pid and lives for the whole eval — `_kg_debounce_run_claimed`). A
+# "<base>.reaping.<token>" dir is the microsecond claim transition — treat
+# any as in flight. A claim whose pid is DEAD (or whose pid was recycled by
+# a process that started after the stamp) is NOT in flight (crash residual;
+# Sweep B recovers it separately), so it never blocks a fresh schedule.
 # MUST MATCH Test-KgDebounceInflight in _lib/kg-sync-debounce.ps1.
 #   $1 = state dir, $2 = lock base name ("kg_<md5>.lock")
 _kg_debounce_inflight() {
@@ -274,7 +365,8 @@ _kg_debounce_inflight() {
         pid="${d##*.claimed.}"
         case "$pid" in
             ''|*[!0-9]*) ;;                    # malformed → no liveness info
-            *) kill -0 "$pid" 2>/dev/null && return 0 ;;
+            *) _kg_debounce_pid_live "$pid" "$(_kg_debounce_mtime "$d" "$(date +%s 2>/dev/null || printf '0')")" \
+                   && return 0 ;;
         esac
     done
     for d in "$dir/$base.reaping."*; do
@@ -747,8 +839,9 @@ _kg_debounce_reap_stale() {
     # pid). If <pid> is no longer alive the work was claimed-but-not-run →
     # recover it (re-claim, run). A still-alive <pid> is an in-flight claim
     # → leave it. We only sweep claims at least `grace` old so we never
-    # race a just-created claim; combined with the kill -0 liveness check
-    # this makes a false recovery require BOTH pid-reuse AND age —
+    # race a just-created claim; combined with the `_kg_debounce_pid_live`
+    # check (alive AND pre-dates the stamp) this makes a false recovery of
+    # a genuinely-running claim require an unreadable start time —
     # vanishingly rare, and even then the result is at-most-one extra run,
     # never a drop.
     for claimed in "$dir"/*.claimed.*; do
@@ -759,8 +852,10 @@ _kg_debounce_reap_stale() {
         mtime=$(_kg_debounce_mtime "$claimed" "$now")
         age=$(( now - mtime ))
         [ "$age" -ge "$grace" ] || continue   # too fresh → leave in flight
-        # If the owning pid is still alive, the claim is in flight → leave.
-        if kill -0 "$cpid" 2>/dev/null; then
+        # If the owning pid is still alive AND started before the stamp
+        # (a recycled pid started later — see `_kg_debounce_pid_live`),
+        # the claim is in flight → leave.
+        if _kg_debounce_pid_live "$cpid" "$mtime"; then
             continue
         fi
         # Dead owner → re-claim atomically and run. Rename to a fresh
