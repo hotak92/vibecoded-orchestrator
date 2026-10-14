@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rust tests no longer start a real module container on the developer's machine.** Two launcher tests ran an ordinary `podman run` under the PRODUCTION global name `vct-rl-reranker` (restart=unless-stopped, the user's real `~/.claude/retrieval_rl_data` bind-mounted rw): the auto-migration tests (`module_service.rs`, `auto_migrate_per_project_to_global` really started the global container) and the hub's global-row resume test (`module_supervisor.rs`, the resume sweep's global branch called `start_global_container_supervisor` directly). Each run replaced the user's own global reranker container with a fixture container that crash-looped (its fixture command repeated the image ENTRYPOINT). The migration's container side effects are now one injected seam (`MigrationContainerOps`), and the hub resume sweep takes a `StartGlobal` starter beside its per-project `StartAfterInstall`; production passes the real podman calls, every test passes recording fakes and asserts the start requests (exactly one global start; none on an idempotent re-run). Found in the v0.2.102 dogfood by the container's ownership label (the clone's install-root id, not the install's).
+
 ## [0.2.102] - 2026-10-13
 
 ### Added
