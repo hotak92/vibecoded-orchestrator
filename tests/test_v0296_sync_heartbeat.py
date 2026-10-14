@@ -266,8 +266,8 @@ class TestTheFinalizeBeat:
         _seed_tree(root, 1)
         mod = _load(root)
         monkeypatch.setenv("VCO_PROGRESS_STREAM", "1")
-        gen = (tmp_path / "claude_mcp_servers" / "scripts"
-               / "generate_node_formats.py")
+        gen = (tmp_path / "templates" / "scripts"
+               / "generate-kg-summary.py")
         gen.parent.mkdir(parents=True)
         gen.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
 

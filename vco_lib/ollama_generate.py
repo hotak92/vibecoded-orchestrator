@@ -16,8 +16,8 @@ resident twice.
 Every ``/api/generate`` caller builds its body here:
 
 * ``templates/scripts/summary_backends.py::call_ollama`` (KG-summary ladder,
-  also the code-summary generator through it);
-* ``claude_mcp_servers/scripts/generate_node_formats.py::call_ollama``;
+  also the code-summary generator and ``generate-kg-summary.py``'s per-node
+  and bulk modes through it);
 * ``templates/scripts/process_documents.py::generate_document_summary``.
 
 Sampling options (temperature, top_p, num_predict, …) never trigger a

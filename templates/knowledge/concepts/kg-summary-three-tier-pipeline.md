@@ -58,8 +58,7 @@ The generator extracts the node title from the YAML frontmatter `title:` field. 
 ## Files
 
 - `templates/scripts/summary_backends.py` — the shared ladder: backend selection, circuit breaker, `is_non_answer`. ONE implementation; every other file here calls it rather than copying it.
-- `templates/scripts/generate-kg-summary.py` — per-node runtime generator (canonical; rendered into `<project>/.claude/scripts/` at install time)
-- `claude_mcp_servers/scripts/generate_node_formats.py` — the **second writer of the same sidecar**: the manual `--all` backfill, also spawned by `sync_knowledge_graph._regen_node_formats_after_full_sync()` on the orchestrator-root layout. It imports the ladder's `is_non_answer` for exactly this reason — a validity gate on only one of two writers means one path heals a row and the other re-poisons it.
+- `templates/scripts/generate-kg-summary.py` — the ONE writer of the same sidecar: the per-node runtime generator (canonical; rendered into `<project>/.claude/scripts/` at install time) and, since v0.2.103, the manual `--all` bulk backfill (merged in from the retired `claude_mcp_servers/scripts/generate_node_formats.py`) also spawned by `sync_knowledge_graph._regen_node_formats_after_full_sync()`. One writer means the non-answer validity gate has exactly one home — no second writer can re-poison a row the first healed.
 - `templates/hooks/kg-summary-generator.sh` — PostToolUse hook source (rendered into `<project>/.claude/hooks/` at install time, background, debounced)
 - `launcher/src-tauri/src/commands/kg_summary.rs` — the launcher's walk over the same generator; parses the backend line and the no-backend/cooling-down lines out of its stdout
 - `knowledge/.node_formats.json` — output destination (per-project)

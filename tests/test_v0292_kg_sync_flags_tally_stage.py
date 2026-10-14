@@ -696,12 +696,13 @@ class FinalizeStageMarkerTests(_SyncTestBase):
 
         v0.2.94: the refresh no longer looks inside the SYNCED project — that
         was the bug (``claude_mcp_servers/scripts/`` exists only in the clone,
-        so every user project fell through to the per-edit generator, which
-        exits 2 on ``--all``). It resolves the clone through
-        ``vco_lib.python_exe.resolve_install_root`` and runs the clone's
-        ``generate_node_formats.py`` with ``--knowledge-dir``. The fake clone
-        here is a NON-ROOT layout: it is a different directory from the project
-        being synced, which is the case that never worked.
+        so every user project fell through to the then per-edit-only
+        generator, which exited 2 on ``--all``). It resolves the clone
+        through ``vco_lib.python_exe.resolve_install_root`` and runs the
+        clone's ``templates/scripts/generate-kg-summary.py`` (the ONE writer,
+        per-node and bulk, since v0.2.103) with ``--knowledge-dir``. The
+        fake clone here is a NON-ROOT layout: it is a different directory
+        from the project being synced, which is the case that never worked.
 
         Returns ``(argv_record, install_root)``. The stub writes its own argv to
         ``argv_record`` so the test can prove WHICH generator ran and with what.
@@ -710,7 +711,8 @@ class FinalizeStageMarkerTests(_SyncTestBase):
         # `looks_like_orchestrator_root` wants vco_lib/ + .claude/.
         (install_root / "vco_lib").mkdir(parents=True, exist_ok=True)
         (install_root / ".claude").mkdir(parents=True, exist_ok=True)
-        gen = install_root / "claude_mcp_servers" / "scripts" / "generate_node_formats.py"
+        gen = (install_root / "templates" / "scripts"
+               / "generate-kg-summary.py")
         gen.parent.mkdir(parents=True, exist_ok=True)
         argv_record = self.root / "regen-argv.json"
         gen.write_text(
@@ -744,7 +746,7 @@ class FinalizeStageMarkerTests(_SyncTestBase):
         self.assertTrue(argv_record.exists(), "the ROOT generator was invoked")
         argv = json.loads(argv_record.read_text(encoding="utf-8"))
         self.assertTrue(
-            argv[0].endswith("generate_node_formats.py"),
+            argv[0].endswith("generate-kg-summary.py"),
             f"the CLONE's generator must be the one that runs, got {argv[0]!r}",
         )
         self.assertIn(str(install_root), argv[0],

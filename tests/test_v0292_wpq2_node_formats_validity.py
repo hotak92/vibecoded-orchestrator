@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""v0.2.92 WP-Q2: the SECOND writer of `knowledge/.node_formats.json`.
+"""v0.2.92 WP-Q2: non-answer validity on the `.node_formats.json` writer.
 
 WHAT THIS CLOSES
 ----------------
@@ -12,13 +12,12 @@ summarized?"*). It fixed the transport (prompt over stdin) and taught the
 RUNTIME generator two things: never cache a non-answer, and never treat a
 STORED one as satisfied — so poisoned rows heal on the next ordinary run.
 
-`claude_mcp_servers/scripts/generate_node_formats.py` writes THE SAME FILE,
-through its own Ollama/Haiku router, and on the orchestrator-root layout
-`kg-sync --all` reaches it via
-`sync_knowledge_graph._regen_node_formats_after_full_sync()`. Without the
-same gate on both sides the healing is real and defeatable: one path repairs
-a row, the other reports it satisfied (read side) or writes a fresh refusal
-into it (write side).
+v0.2.103 merged the second writer
+(``claude_mcp_servers/scripts/generate_node_formats.py``, retired) INTO
+``templates/scripts/generate-kg-summary.py`` — there is now ONE writer of the
+sidecar, in both its per-node and bulk ``--all`` modes. This suite pins the
+validity gate on that ONE writer (the bulk half; the per-node half shares
+``stored_entry_is_usable`` and the ladder).
 
 WHAT IS PINNED HERE
 -------------------
@@ -31,8 +30,10 @@ WHAT IS PINNED HERE
   does not invalidate anything (absent is not poisoned);
 * the predicate stays PREFIX-ANCHORED: a real summary may *mention* a
   refusal, it just must not *begin* with one;
-* WRITE side: a freshly generated non-answer is reported as an error and
-  never stored; a non-answer chunk summary is dropped while its healthy
+* WRITE side (through the shared ladder, which is the mandatory path for
+  every LLM call in BOTH modes): a non-answer RAISES
+  ``NonAnswerResponse``, which the bulk processor reports as an error and
+  never stores; a non-answer chunk summary is dropped while its healthy
   siblings are kept;
 * the `auth` cooldown is SHORTER than the rate-limit one (coordinator
   ruling: the user is the fix for an auth failure and expects the next node
@@ -42,9 +43,9 @@ WHAT IS PINNED HERE
 
 RED-PROOF
 ---------
-Every assertion here was run against `/tmp/wpq2/pre/generate_node_formats.py`
-(the pre-fix file) and FAILED there before passing against the tree. A test
-that is green both ways proves nothing.
+The original assertions were run against the pre-fix generator and FAILED
+there before passing against the tree. A test that is green both ways
+proves nothing.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-GENERATOR = REPO_ROOT / "claude_mcp_servers" / "scripts" / "generate_node_formats.py"
+GENERATOR = REPO_ROOT / "templates" / "scripts" / "generate-kg-summary.py"
 LADDER_DIR = REPO_ROOT / "templates" / "scripts"
 CONFIG_DOC = REPO_ROOT / "docs" / "CONFIGURATION.md"
 
@@ -67,16 +68,17 @@ def _load_generator():
     if str(LADDER_DIR) not in sys.path:
         sys.path.insert(0, str(LADDER_DIR))
     spec = importlib.util.spec_from_file_location(
-        "_wpq2_generate_node_formats", GENERATOR
+        "_wpq2_generate_kg_summary", GENERATOR
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules["_wpq2_generate_kg_summary"] = module
     spec.loader.exec_module(module)
     return module
 
 
 @pytest.fixture(scope="module")
-def gnf():
+def gks():
     return _load_generator()
 
 
@@ -93,7 +95,7 @@ def ladder():
 # ONE implementation, not a mirror
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_the_predicate_is_the_ladders_own_function_not_a_copy(gnf, ladder):
+def test_the_predicate_is_the_ladders_own_function_not_a_copy(gks, ladder):
     """A > B > C: shared CODE, not a duplicated predicate with a parity test.
 
     Identity, not equality of behaviour: a copy that happens to agree today
@@ -101,7 +103,7 @@ def test_the_predicate_is_the_ladders_own_function_not_a_copy(gnf, ladder):
     predicate here, this fails immediately rather than three releases later
     when the two lists diverge.
     """
-    assert gnf.is_non_answer is ladder.is_non_answer
+    assert gks.is_non_answer is ladder.is_non_answer
 
 
 def test_the_ladder_import_is_hard_so_a_broken_checkout_cannot_degrade_quietly():
@@ -111,7 +113,7 @@ def test_the_ladder_import_is_hard_so_a_broken_checkout_cannot_degrade_quietly()
     closes — the failure mode VCO's no-silent-fallback rule exists for.
     """
     source = GENERATOR.read_text(encoding="utf-8")
-    head = source.split("def has_formats", 1)[0]
+    head = source.split("def stored_entry_is_usable", 1)[0]
     assert "import summary_backends" in head
     assert not re.search(
         r"except\s+(ImportError|ModuleNotFoundError|Exception)[^\n]*:\s*\n"
@@ -136,87 +138,102 @@ POISON = [
 
 
 @pytest.mark.parametrize("bad", POISON)
-def test_a_stored_non_answer_description_is_not_satisfied(gnf, bad):
-    db = {"knowledge/a.md": {
-        "description": bad, "summary": GOOD_SUMMARY, "content_hash": "h",
-    }}
-    assert gnf.has_formats("knowledge/a.md", db, "h") is False
+def test_a_stored_non_answer_description_is_not_satisfied(gks, bad):
+    entry = {"description": bad, "summary": GOOD_SUMMARY, "content_hash": "h"}
+    assert gks.stored_entry_is_usable(entry) is False
 
 
 @pytest.mark.parametrize("bad", POISON)
-def test_a_stored_non_answer_summary_is_not_satisfied(gnf, bad):
-    db = {"knowledge/a.md": {
-        "description": GOOD_DESC, "summary": bad, "content_hash": "h",
-    }}
-    assert gnf.has_formats("knowledge/a.md", db, "h") is False
+def test_a_stored_non_answer_summary_is_not_satisfied(gks, bad):
+    entry = {"description": GOOD_DESC, "summary": bad, "content_hash": "h"}
+    assert gks.stored_entry_is_usable(entry) is False
 
 
-def test_a_stored_non_answer_chunk_summary_invalidates_the_entry(gnf):
-    db = {"knowledge/a.md": {
+def test_a_stored_non_answer_chunk_summary_invalidates_the_entry(gks):
+    entry = {
         "description": GOOD_DESC,
         "summary": GOOD_SUMMARY,
         "content_hash": "h",
         "chunk_summaries": {"1": "Covers the breaker.", "2": "I cannot help with that."},
         "total_chunks": 2,
-    }}
-    assert gnf.has_formats("knowledge/a.md", db, "h") is False
+    }
+    assert gks.stored_entry_is_usable(entry) is False
 
 
 # ── the LEAVE-ALONE half: this must not become churn ──────────────────────
 
-def test_a_missing_chunk_summary_does_not_invalidate_the_entry(gnf):
+def test_a_missing_chunk_summary_does_not_invalidate_the_entry(gks):
     """Absent is not poisoned (coordinator ruling, CONFIRMED).
 
     Treating a missing chunk summary as poisoned would re-run the two
     whole-node LLM calls on every sync for any node whose Weaviate chunk
     fetch keeps failing — churn bought for a retrieval-tier nicety.
     """
-    db = {"knowledge/a.md": {
+    entry = {
         "description": GOOD_DESC, "summary": GOOD_SUMMARY,
         "content_hash": "h", "total_chunks": 3,
-    }}
-    assert gnf.has_formats("knowledge/a.md", db, "h") is True
+    }
+    assert gks.stored_entry_is_usable(entry) is True
 
-    db["knowledge/a.md"]["chunk_summaries"] = {}
-    assert gnf.has_formats("knowledge/a.md", db, "h") is True
+    entry["chunk_summaries"] = {}
+    assert gks.stored_entry_is_usable(entry) is True
 
 
-def test_a_healthy_entry_with_a_matching_hash_is_still_skipped(gnf):
+def test_a_healthy_entry_with_a_matching_hash_is_still_skipped(gks, tmp_path):
     """The content-hash gate is why an unchanged node costs 0 s. It stays."""
-    db = {"knowledge/a.md": {
-        "description": GOOD_DESC, "summary": GOOD_SUMMARY, "content_hash": "h",
-    }}
-    assert gnf.has_formats("knowledge/a.md", db, "h") is True
+    node = tmp_path / "a.md"
+    node.write_text(
+        "---\ntitle: Some Node\ntype: concept\n---\n\nBody text of the node.\n",
+        encoding="utf-8",
+    )
+    _title, full, _body = gks.read_node(node)
+    c_hash = gks.content_hash(full)
+    db = {
+        str(node): {
+            "description": GOOD_DESC, "summary": GOOD_SUMMARY,
+            "content_hash": c_hash,
+        }
+    }
+    assert gks._process_node_bulk(node, force=False, dry_run=True, formats=db) \
+        == "skipped"
 
 
-def test_a_changed_node_still_regenerates(gnf):
-    db = {"knowledge/a.md": {
-        "description": GOOD_DESC, "summary": GOOD_SUMMARY, "content_hash": "old",
-    }}
-    assert gnf.has_formats("knowledge/a.md", db, "new") is False
+def test_a_changed_node_still_regenerates(gks, tmp_path):
+    node = tmp_path / "a.md"
+    node.write_text(
+        "---\ntitle: Some Node\ntype: concept\n---\n\nBody text of the node.\n",
+        encoding="utf-8",
+    )
+    db = {
+        str(node): {
+            "description": GOOD_DESC, "summary": GOOD_SUMMARY,
+            "content_hash": "old",
+        }
+    }
+    assert gks._process_node_bulk(node, force=False, dry_run=True, formats=db) \
+        == "dry_run"
 
 
-def test_a_summary_that_MENTIONS_a_refusal_is_still_a_summary(gnf):
+def test_a_summary_that_MENTIONS_a_refusal_is_still_a_summary(gks):
     """Prefix-anchored, deliberately — preserve that.
 
     A false positive costs one regeneration; a false negative freezes a
     poisoned row forever. But a predicate that fired on any occurrence
     would reject real summaries of the refusal-handling code itself.
     """
-    db = {"knowledge/a.md": {
+    entry = {
         "description": GOOD_DESC,
         "summary": (
             "The ladder rejects replies that begin with 'I cannot' or "
             "'Ready. What do you need summarized?' and never caches them."
         ),
         "content_hash": "h",
-    }}
-    assert gnf.has_formats("knowledge/a.md", db, "h") is True
+    }
+    assert gks.stored_entry_is_usable(entry) is True
 
 
-def test_a_non_dict_entry_is_not_satisfied(gnf):
-    assert gnf.has_formats("knowledge/a.md", {"knowledge/a.md": "junk"}, None) is False
-    assert gnf.has_formats("knowledge/missing.md", {}, None) is False
+def test_a_non_dict_entry_is_not_satisfied(gks):
+    assert gks.stored_entry_is_usable("junk") is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -237,78 +254,61 @@ def node_file(tmp_path):
     return p
 
 
-def _stub_generation(monkeypatch, gnf, *, description, summary, chunks=None,
-                     chunk_summary=None):
-    monkeypatch.setattr(gnf, "generate_description", lambda *a, **k: description)
-    monkeypatch.setattr(gnf, "generate_summary", lambda *a, **k: summary)
-    # W7: mirrors the REAL signature (title, file_path) — the production
-    # caller now scopes the chunk fetch by the node's relative path, and a
-    # 1-arg stub turns that wiring change into a TypeError three frames away.
-    monkeypatch.setattr(
-        gnf, "get_chunks_from_weaviate", lambda _t, _fp="": chunks or [])
-    if chunk_summary is not None:
-        monkeypatch.setattr(
-            gnf, "generate_chunk_summary",
-            lambda _t, cn, _total, _c: chunk_summary(cn),
+@pytest.mark.parametrize("bad", POISON)
+def test_bulk_refuses_to_cache_a_generated_non_answer(
+    gks, ladder, monkeypatch, node_file, bad
+):
+    """Every LLM call goes through the shared ladder, whose ``call_llm``
+    RAISES :class:`NonAnswerResponse` on a non-answer — the merged writer
+    has no router of its own that could bypass that gate."""
+    def _raising_call_llm(prompt, **_kw):
+        raise ladder.NonAnswerResponse(
+            f"backend returned a non-answer ({bad!r}) — not cached"
         )
 
-
-@pytest.mark.parametrize("bad", POISON)
-def test_process_node_refuses_to_cache_a_generated_non_answer(
-    gnf, monkeypatch, node_file, bad
-):
-    """The re-poisoning vector: this script's `call_llm` is its OWN router,
-    so unlike the shared ladder's it does not raise on a non-answer."""
-    _stub_generation(monkeypatch, gnf, description=bad, summary=GOOD_SUMMARY)
+    monkeypatch.setattr(gks, "call_llm", _raising_call_llm)
     db: dict = {}
-    status = gnf.process_node(node_file, "m", False, False, db)
+    status = gks._process_node_bulk(node_file, force=False, dry_run=False, formats=db)
     assert status.startswith("error:"), status
     assert "non-answer" in status
     assert db == {}, "a non-answer must never reach the sidecar"
 
 
-def test_process_node_refuses_a_non_answer_summary_too(
-    gnf, monkeypatch, node_file
-):
-    _stub_generation(
-        monkeypatch, gnf, description=GOOD_DESC,
-        summary="Ready. What do you need summarized?",
-    )
-    db: dict = {}
-    assert gnf.process_node(node_file, "m", False, False, db).startswith("error:")
-    assert db == {}
-
-
-def test_process_node_stores_a_good_pair(gnf, monkeypatch, node_file):
+def test_bulk_stores_a_good_pair(gks, monkeypatch, node_file):
     """The ACT side: nothing above may block a healthy generation."""
-    _stub_generation(monkeypatch, gnf, description=GOOD_DESC, summary=GOOD_SUMMARY)
+    monkeypatch.setattr(gks, "call_llm", lambda prompt, **_kw: GOOD_DESC)
+    monkeypatch.setattr(gks, "get_chunks_from_weaviate", lambda *_a, **_k: [])
     db: dict = {}
-    assert gnf.process_node(node_file, "m", False, False, db) == "generated"
+    assert gks._process_node_bulk(
+        node_file, force=False, dry_run=False, formats=db) == "generated"
     (entry,) = db.values()
-    assert entry["summary"] == GOOD_SUMMARY
+    assert entry["summary"] == GOOD_DESC
+    # And the stored entry must itself be satisfied — otherwise the write
+    # merely moved the churn one run later.
+    assert gks.stored_entry_is_usable(entry) is True
 
 
-def test_process_node_drops_a_non_answer_chunk_but_keeps_its_siblings(
-    gnf, monkeypatch, node_file
+def test_bulk_drops_a_non_answer_chunk_but_keeps_its_siblings(
+    gks, ladder, monkeypatch, node_file
 ):
-    """Dropped, not stored — because `has_formats` treats a STORED
-    non-answer chunk as invalid and a MISSING one as fine. Storing it would
-    invalidate the whole entry on the very next pass."""
-    _stub_generation(
-        monkeypatch, gnf, description=GOOD_DESC, summary=GOOD_SUMMARY,
-        chunks=[(1, "c1"), (2, "c2")],
-        chunk_summary=lambda cn: (
-            "I cannot summarize this." if cn == 2 else "Covers the ladder."
-        ),
+    """Dropped, not stored — because ``stored_entry_is_usable`` treats a
+    STORED non-answer chunk as invalid and a MISSING one as fine. Storing it
+    would invalidate the whole entry on the very next pass."""
+    def _call_llm(prompt, **_kw):
+        if "chunk 2/2" in prompt:
+            raise ladder.NonAnswerResponse("non-answer chunk — not cached")
+        return "Covers the ladder."
+
+    monkeypatch.setattr(gks, "call_llm", _call_llm)
+    monkeypatch.setattr(
+        gks, "get_chunks_from_weaviate", lambda *_a, **_k: [(1, "c1"), (2, "c2")]
     )
     db: dict = {}
-    assert gnf.process_node(node_file, "m", False, False, db) == "generated"
+    assert gks._process_node_bulk(
+        node_file, force=False, dry_run=False, formats=db) == "generated"
     (entry,) = db.values()
     assert entry["chunk_summaries"] == {"1": "Covers the ladder."}
-    # And the surviving entry must itself be satisfied — otherwise the drop
-    # merely moved the churn one run later.
-    rel = next(iter(db))
-    assert gnf.has_formats(rel, db, entry["content_hash"]) is True
+    assert gks.stored_entry_is_usable(entry) is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════

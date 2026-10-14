@@ -14395,16 +14395,17 @@ def _regenerate_node_formats(folder: Path) -> tuple[bool, str]:
     KG-summary generator over every node. Returns (ok, detail).
 
     Returns ``ok=True`` ONLY when regeneration ACTUALLY happened — i.e.
-    every node's generator run exited 0 AND the cache file's content
+    the generator's bulk run exited 0 AND the cache file's content
     changed. Otherwise ``(False, <reason>)`` so the caller DEFERS and
     leaves the cache intact (no data loss, no false "migrated" registry
     row).
 
-    Why the content-change check (review B1): `generate-kg-summary.py`
-    exits 0 WITHOUT writing when no summary backend is available
+    Why the content-change check (review B1): the generator's bulk mode
+    exits non-zero when no summary backend is available
     (`select_backend() == "skip"` — the normal headless-update state: no
-    `claude` CLI, no Ollama, no API key). A per-node exit-code check alone
-    would then report success while nothing was regenerated, registering
+    `claude` CLI, no Ollama, no API key), but an exit-code check alone
+    cannot prove a WRITE happened — any future exit-0-without-writing path
+    would report success while nothing was regenerated, registering
     the artifact at the new schema version with a stale cache + no
     deferral — silently masking the migration. Hashing the cache
     before/after the `--force` pass detects this: a real regeneration
@@ -14414,7 +14415,7 @@ def _regenerate_node_formats(folder: Path) -> tuple[bool, str]:
     Why all-or-defer (review C2): a PARTIAL regen (some nodes succeed,
     some genuinely error) would leave a MIXED-schema cache that the
     registry would then mark fully-migrated, so the stale entries never
-    self-heal. Any per-node failure → defer; the registry stays at the old
+    self-heal. Any failed node → defer; the registry stays at the old
     version and the next update retries until it fully converges.
     """
     gen = folder / ".claude" / "scripts" / "generate-kg-summary.py"
@@ -14433,19 +14434,20 @@ def _regenerate_node_formats(folder: Path) -> tuple[bool, str]:
     from vco_lib.python_exe import resolve_or_current
 
     py = resolve_or_current()
-    failures = 0
-    for node in nodes:
-        try:
-            proc = _subprocess_run_quiet(
-                [py, str(gen), str(node), "--force"], cwd=folder
-            )
-            if proc != 0:
-                failures += 1
-        except Exception:
-            failures += 1
+    # v0.2.103: ONE bulk invocation (`--all --force`) instead of one process
+    # per node — the generator's merged bulk mode (absorbed from the retired
+    # Ollama-only bulk generator) skips/fails per node internally and exits
+    # non-zero when any node errored, which the check below turns into the
+    # same all-or-defer outcome as the old per-node loop.
+    try:
+        code = _subprocess_run_quiet(
+            [py, str(gen), "--all", "--force"], cwd=folder
+        )
+    except Exception as exc:  # noqa: BLE001 — spawn failure defers like a node failure
+        return (False, f"generator spawn failed ({type(exc).__name__}: {exc}) — deferring")
     # C2: any failure → defer (never register a half-migrated cache).
-    if failures:
-        return (False, f"{failures}/{len(nodes)} node regenerations failed — deferring")
+    if code != 0:
+        return (False, f"bulk regeneration exited {code} — deferring")
     # B1: all exited 0, but did anything actually get written? If the cache
     # is byte-identical, the backend was unavailable (exit-0-no-write) →
     # treat as NOT regenerated and defer.

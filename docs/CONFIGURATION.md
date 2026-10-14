@@ -912,8 +912,8 @@ The summary generator depends on the required frontmatter fields (`title`, `type
 
 ## Manual operator scripts
 
-Two helper scripts under `claude_mcp_servers/scripts/` are not wired into the
-default workflow but are kept available for operators upgrading older
+One helper script under `claude_mcp_servers/scripts/` is not wired into the
+default workflow but is kept available for operators upgrading older
 installations:
 
 - **`migrate_to_new_embeddings.py`** — One-shot migration that adds new named
@@ -923,11 +923,13 @@ installations:
   slots and backfills them. Run manually after upgrading the embedding
   models referenced in the MCP configuration.
 
-- **`generate_node_formats.py`** — Manual `--all` backfill that regenerates
-  per-node descriptions / summaries in `knowledge/.node_formats.json`.
-  Normally produced incrementally by the kg-summary-generator hook on edit;
-  use this script when you want to rebuild the cache from scratch (for
-  example after a bulk import or a node-format schema change).
+The manual `--all` backfill that regenerates per-node descriptions /
+summaries in `knowledge/.node_formats.json` lives in the ONE sidecar writer,
+`templates/scripts/generate-kg-summary.py` (also rendered into each project's
+`.claude/scripts/`). It runs incrementally via the kg-summary-generator hook
+on edit; run it with `--all [--knowledge-dir DIR] [--force] [--dry-run]` when
+you want to rebuild the cache from scratch (for example after a bulk import
+or a node-format schema change).
 
 ## `vco` CLI — verify commands
 

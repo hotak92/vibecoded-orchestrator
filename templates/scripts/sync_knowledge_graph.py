@@ -5132,10 +5132,11 @@ def _regen_node_formats_after_full_sync() -> None:
     stale until the next install/per-edit fire.
 
     The sidecar (descriptions + summaries surfaced by auto-tier retrieval) is
-    written by `generate_node_formats.py` at install time and by the
-    per-edit `generate-kg-summary.py` hook — but a bare `kg-sync --all` never
-    touched it (grep 0), so a bulk resync left every node's summary stale.
-    This calls the SAME install-time machinery as a capped, soft-fail
+    written by `generate-kg-summary.py` — the per-edit hook and the `--all`
+    bulk mode (v0.2.103 merged the retired Ollama-only bulk generator into
+    it) — but a bare `kg-sync --all` never touched it
+    (grep 0), so a bulk resync left every node's summary stale.
+    This calls the SAME generator as a capped, soft-fail
     post-sync step: any error (no generator, no summary backend, timeout) is
     swallowed with a log line — a summary refresh must never fail the sync.
     """
@@ -5146,20 +5147,23 @@ def _regen_node_formats_after_full_sync() -> None:
     # This used to look for the generator under the SYNCED PROJECT's own
     # `claude_mcp_servers/scripts/` — a directory that exists ONLY in the
     # orchestrator clone. Every user project therefore fell through to
-    # `.claude/scripts/generate-kg-summary.py --all`, which is the PER-EDIT
-    # generator: its argparse takes a FILE, so `--all` is a usage error and it
-    # exits 2. Observed live after a user project's `kg-sync --all`:
-    # `(node-format refresh exited 2; summaries left as-is — non-fatal)`. Net
-    # effect: after ANY bulk sync, no non-root project has EVER had its
-    # `.node_formats.json` refreshed, and the only trace was one stderr line.
+    # `.claude/scripts/generate-kg-summary.py --all`, which at the time was
+    # the PER-EDIT generator: its argparse took a FILE, so `--all` was a
+    # usage error and it exited 2. Observed live after a user project's
+    # `kg-sync --all`: `(node-format refresh exited 2; summaries left as-is
+    # — non-fatal)`. Net effect: after ANY bulk sync, no non-root project
+    # has EVER had its `.node_formats.json` refreshed, and the only trace
+    # was one stderr line.
     #
     # The fix is the user's standing rule — ONE component for root and non-root.
-    # `generate_node_formats.py` already accepts `--knowledge-dir`, and sets
-    # `PROJECT_ROOT = KNOWLEDGE_DIR.parent` from it, so pointing the ROOT
-    # generator at this project's `knowledge/` is the identical invocation in
-    # both cases (for the root, install_root == PROJECT_ROOT and nothing
-    # changes). `sys.executable` is right here: the kg-sync wrapper already
-    # activated the orchestrator venv, which is why `vco_lib` imports below.
+    # `generate-kg-summary.py` accepts `--knowledge-dir` (its bulk `--all`
+    # mode arrived in v0.2.103 with the merge of the retired Ollama-only
+    # bulk generator), and sets its project root from it, so
+    # pointing the clone's generator at this project's `knowledge/` is the
+    # identical invocation in both cases (for the root,
+    # install_root == PROJECT_ROOT and nothing changes). `sys.executable` is
+    # right here: the kg-sync wrapper already activated the orchestrator
+    # venv, which is why `vco_lib` imports below.
     gen = None
     install_root = None
     try:
@@ -5171,20 +5175,19 @@ def _regen_node_formats_after_full_sync() -> None:
               file=sys.stderr)
     if install_root is not None:
         candidate = (
-            Path(install_root) / "claude_mcp_servers" / "scripts"
-            / "generate_node_formats.py"
+            Path(install_root) / "templates" / "scripts"
+            / "generate-kg-summary.py"
         )
         if candidate.is_file():
             gen = candidate
     if gen is None:
         # No orchestrator clone reachable from here. NOT a silent skip any more:
-        # the summaries genuinely stay stale, and the old fallback (the per-edit
-        # generator with `--all`) never worked. Record it as owed work.
+        # the summaries genuinely stay stale. Record it as owed work.
         _emit_node_formats_deferral(
             PROJECT_ROOT,
             reason=(
                 "the orchestrator clone's "
-                "`claude_mcp_servers/scripts/generate_node_formats.py` could "
+                "`templates/scripts/generate-kg-summary.py` could "
                 "not be located from this project "
                 f"(install root: {install_root or 'unresolved'})"
             ),
@@ -5413,8 +5416,8 @@ def _emit_node_formats_deferral(project_root: Path, reason: str) -> None:
             command_to_apply=(
                 "# Refresh the summary sidecar for this project "
                 "(existing summaries are skipped):\n"
-                "python <orchestrator-root>/claude_mcp_servers/scripts/"
-                "generate_node_formats.py --all --knowledge-dir "
+                "python <orchestrator-root>/templates/scripts/"
+                "generate-kg-summary.py --all --knowledge-dir "
                 f"{project_root / 'knowledge'}"
             ),
             severity="warning",

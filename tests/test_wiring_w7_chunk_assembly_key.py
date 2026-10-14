@@ -379,15 +379,17 @@ def test_shipped_summary_generator_fetches_only_this_nodes_chunks(monkeypatch):
     assert [c for _n, c in chunks] == ["A-CHUNK-1", "A-CHUNK-2", "A-CHUNK-3"]
 
 
-def test_internal_formats_generator_reads_the_real_chunk_property(monkeypatch):
-    """`generate_node_formats.py` read ``chunk_number``; the SCHEMA property
-    is ``chunk_num`` (that is what every writer stores — ``chunk_number`` is
-    only the MCP result formatter's name for it), so its `cn is not None`
-    guard rejected every row and per-chunk summaries were never generated
-    for ANY node."""
+def test_bulk_generator_reads_the_real_chunk_property(monkeypatch):
+    """The merged generator's chunk fetch reads ``chunk_num`` — the SCHEMA
+    property every writer stores (``chunk_number`` is only the MCP result
+    formatter's name for it). The retired
+    ``claude_mcp_servers/scripts/generate_node_formats.py`` read
+    ``chunk_number``, so its `cn is not None` guard rejected every row and
+    per-chunk summaries were never generated for ANY node; this pin keeps
+    the merged bulk writer (v0.2.103) from regressing the same way."""
     monkeypatch.setenv("KG_COLLECTION", "VCODev_Development")
     _install_fake_weaviate(monkeypatch, _rows())
-    mod = _load_by_path("_w7_nodeformats", "claude_mcp_servers/scripts/generate_node_formats.py")
+    mod = _load_by_path("_w7_kgsummary_bulk", "templates/scripts/generate-kg-summary.py")
 
     chunks = mod.get_chunks_from_weaviate(COLLIDING_TITLE, NODE_B_FP)
 

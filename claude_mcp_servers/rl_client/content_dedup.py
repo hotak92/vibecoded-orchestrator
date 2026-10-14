@@ -49,7 +49,7 @@ HASH CONVENTION (cross-layer consistency):
 
 Storage-layer content hashes (``sync_knowledge_graph._content_signature_
 excluding_updated``, ``analyze_code_graph._content_hash_for_object``,
-``generate_node_formats.content_hash``) are a DIFFERENT layer — they answer
+``generate-kg-summary.content_hash``) are a DIFFERENT layer — they answer
 "is the STORED object unchanged so I can skip a re-embed/re-write", carry
 deliberate per-site nuances (excluding the ``updated:`` line; field-selective
 hashing), and are intentionally NOT routed through here. See the triage in the

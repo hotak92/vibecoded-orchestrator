@@ -24,7 +24,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -104,14 +103,6 @@ def _summary_backends_body(monkeypatch):
     return seen[0]
 
 
-def _node_formats_body(monkeypatch):
-    gnf = importlib.import_module("claude_mcp_servers.scripts.generate_node_formats")
-    seen: list = []
-    monkeypatch.setattr(gnf.requests, "post", _capture_requests_post(seen))
-    gnf.call_ollama(MODEL, "prompt", 64)
-    return seen[0]["json"]
-
-
 def _process_documents_body(monkeypatch, model=MODEL):
     pd = importlib.import_module("process_documents")
     sb = importlib.import_module("summary_backends")
@@ -127,7 +118,6 @@ def _process_documents_body(monkeypatch, model=MODEL):
 
 CALLERS = {
     "summary_backends.call_ollama": _summary_backends_body,
-    "generate_node_formats.call_ollama": _node_formats_body,
     "process_documents.generate_document_summary": _process_documents_body,
 }
 
@@ -169,12 +159,25 @@ def test_process_documents_uses_the_machines_generation_model(monkeypatch):
     assert body["model"] == "gemma4:e4b"
 
 
-def test_node_formats_prefers_the_ladder_model(monkeypatch):
-    gnf = importlib.import_module("claude_mcp_servers.scripts.generate_node_formats")
-    monkeypatch.setattr(gnf._sb, "OLLAMA_DEFAULT_MODEL", "gemma4:e4b")
-    assert gnf._generation_candidates()[0] == "gemma4:e4b"
-    assert gnf.pick_model(gnf._generation_candidates(),
-                          ["qwen3.5:9b", "gemma4:e4b"]) == "gemma4:e4b"
+def test_kg_summary_generator_delegates_every_llm_call_to_the_ladder(monkeypatch):
+    """v0.2.103: the retired node-formats generator (with its OWN
+    Ollama-model pick) is merged into ``generate-kg-summary.py``; its every
+    LLM call — per-node AND bulk ``--all`` — must go through
+    ``summary_backends.call_llm``, so the machine's ONE resolved generation
+    model answers and no second model gets loaded beside it (the GPU-OOM
+    field report behind the merge)."""
+    import importlib.util
+
+    gen_path = REPO_ROOT / "templates" / "scripts" / "generate-kg-summary.py"
+    spec = importlib.util.spec_from_file_location("_gks_onecopy", gen_path)
+    gks = importlib.util.module_from_spec(spec)
+    sys.modules["_gks_onecopy"] = gks
+    spec.loader.exec_module(gks)
+
+    seen: list = []
+    monkeypatch.setattr(gks._sb, "call_llm", lambda p, **kw: seen.append(p) or "ok")
+    assert gks.call_llm("prompt") == "ok"
+    assert seen == ["prompt"], "the wrapper must delegate, not answer itself"
 
 
 # ─── item 2: code-graph CLI raw CodeEmbed fallback — SUPERSEDED ──────────
@@ -214,17 +217,31 @@ def test_static_catalogue_lists_opus_and_sonnet_5_5():
 
 
 def test_haiku_api_call_sends_no_temperature(monkeypatch):
-    gnf = importlib.import_module("claude_mcp_servers.scripts.generate_node_formats")
+    """The retired generator's ``--provider haiku`` path sent no temperature
+    (Claude 5.5 rejects non-default sampling params); the merged generator
+    reaches Anthropic ONLY through the ladder's API tier, so the pin moves
+    there (same file shape as test_v02102_haiku_5_5_defaults, which also
+    asserts it)."""
+    sb = importlib.import_module("summary_backends")
     captured: dict = {}
 
-    def _post(url, **kw):
-        captured.update(kw["json"])
-        return SimpleNamespace(raise_for_status=lambda: None,
-                               json=lambda: {"content": [{"text": "ok"}]})
+    class _Resp:
+        def read(self):
+            return b'{"content": [{"type": "text", "text": "ok"}]}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _urlopen(req, timeout=None):
+        captured.update(json.loads(req.data.decode("utf-8")))
+        return _Resp()
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-not-a-key")
-    monkeypatch.setattr(gnf.requests, "post", _post)
-    assert gnf.call_haiku("p", 64) == "ok"
+    monkeypatch.setattr(sb.urllib.request, "urlopen", _urlopen)
+    assert sb.call_api("p") == "ok"
     assert "temperature" not in captured
     assert os.environ.get("ANTHROPIC_API_KEY") == "test-not-a-key"
 
