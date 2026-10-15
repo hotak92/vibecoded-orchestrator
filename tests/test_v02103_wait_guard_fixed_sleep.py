@@ -1181,3 +1181,73 @@ class TestR14ConditionRefreshPoll:
     )
     def test_allowed(self, tmp_path, command):
         _allow(tmp_path, command)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# R16 review fixes (Opus part A; 2026-10-15): assignments ride on the
+# segment, so multi-line bodies judge like single-line ones; the spaced
+# arithmetic for header is one segment again.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestR16MultiLineBodies:
+    """A-N1/A-N2: the walker carries a statement's assignment prefix on
+    the segment, so a multi-line `r=$(curl -s u)` body line is a fetch
+    (poll denied) and a counted loop's `i=$((i+1))` line is work (loop
+    allowed) — exactly like their single-line twins."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'until [ "$r" = 200 ]; do\n  r=$(curl -s u)\ndone',
+            'until [ "$r" = 200 ]\ndo\n  r=$(curl -s u)\ndone',
+            'while [ "$r" != 200 ]; do\n'
+            '  r=$(curl -s -o /dev/null -w "%{http_code}" u)\ndone',
+            "until [ -n \"$out\" ]; do\n  out=`cat f`\ndone",
+            'until [ "$r" = 200 ]; do echo .; r=$(curl -s u); done',
+        ],
+    )
+    def test_multi_line_polls_denied(self, tmp_path, command):
+        reason = _deny(tmp_path, command)
+        assert "condition-refresh poll" in reason
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "i=0; while [ $i -lt 5 ]; do\n  i=$((i+1))\ndone",
+            "while [ $n -gt 0 ]; do\n  n=$((n-1))\ndone",
+        ],
+    )
+    def test_multi_line_counted_loops_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
+
+    def test_walker_carries_assignments(self):
+        from vco_lib.bash_command_walk import walk_command, walk_segments
+
+        # Opt-in: an assignment-only statement is emitted with EMPTY
+        # tokens and its re-joined assignment.
+        opted = walk_segments("r=$(curl -s u)", _with_assignments=True)
+        assert [(s.tokens, s.assignments) for s in opted] == [
+            ([], ("r=$(curl -s u)",))]
+        multi = walk_segments("until c; do\n  r=$(curl -s u)\ndone",
+                              _with_assignments=True)
+        assert any(s.tokens == [] and s.assignments == ("r=$(curl -s u)",)
+                   for s in multi)
+        # A value spanning tokens stays ONE assignment.
+        x = walk_segments("x=$(sleep 5) cmd", _with_assignments=True)
+        assert x[0].assignments == ("x=$(sleep 5)",) and x[0].tokens == ["cmd"]
+        # walk_command's collector contract is unchanged: without the
+        # opt-in, the emission is exactly the pre-R16 one (the torn tail
+        # for a value-spanning assignment — the shape the field fixes for
+        # the guard), and a plain env prefix still peels.
+        one = lambda toks: ["|".join(toks)]  # noqa: E731
+        assert walk_command("r=$(curl -s u)", one) == ["-s|u)"]
+        assert walk_command("FOO=1 make", one) == ["make"]
+
+    def test_spaced_arithmetic_for_header(self, tmp_path):
+        # A-N3: the header's inner `;` no longer tears the segment.
+        assert "busy-wait loop" in _deny(tmp_path, "for (( ; ; )); do :; done")
+        assert "busy-wait loop" in _deny(
+            tmp_path, "for (( i=0 ; ; i++ )); do :; done")
+        _allow(tmp_path, "for (( i=0 ; i<3 ; i++ )); do :; done")
+        _allow(tmp_path, "for ((i=0; i<3; i++)); do :; done")

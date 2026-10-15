@@ -238,6 +238,15 @@ class ChainSegment(NamedTuple):
                    is in-loop.
     ``depth``    — the ``bash -c`` recursion depth this chain level sits
                    at (0 = the top-level command).
+    ``assignments`` — the statement's leading assignment prefix, each
+                   assignment RE-JOINED to the end of its ``$(…)`` /
+                   backtick value (``r=$(curl -s u)`` stays ONE string,
+                   v0.2.103 R16) — including an assignment-ONLY statement,
+                   whose emitted ``tokens`` are then empty. The field is
+                   populated for every caller; the assignment-only
+                   EMISSION is opt-in (:func:`walk_segments`'
+                   ``_with_assignments``) so :func:`walk_command`
+                   collectors keep their byte-identical contract.
     """
 
     tokens: List[str]
@@ -245,6 +254,7 @@ class ChainSegment(NamedTuple):
     chain_size: int
     in_loop: bool
     depth: int
+    assignments: Tuple[str, ...] = ()
 
 # A collector receives ONE peeled segment (tokens) and returns whatever
 # path-ish strings it found in it.
@@ -285,6 +295,13 @@ def split_chain(tokens: List[str]) -> List[List[str]]:
     left alone everywhere: the piped shapes real commands use put spaces
     around them.
 
+    A ``((``-opened arithmetic header is NOT split at its inner ``;``:
+    ``for (( i=0 ; i<3 ; i++ ))`` is ONE segment, exactly as the glued
+    ``for ((i=0; i<3; i++))`` always was (v0.2.103 R16 A-N3 — before, the
+    header's clauses were torn apart and the empty middle of
+    ``for (( ; ; ))`` became invisible). The span runs until the paren
+    depth opened by ``((`` closes.
+
     Sub-commands inside `bash -c "..."` survive as ONE string token
     (because the quotes preserved them), so they are NOT split here --
     they're re-parsed by `parse_dash_c` when the walker recognises a
@@ -295,16 +312,56 @@ def split_chain(tokens: List[str]) -> List[List[str]]:
     """
     segments: List[List[str]] = []
     current: List[str] = []
+    arith_depth = 0
     for tok in tokens:
+        if arith_depth > 0:
+            current.append(tok)
+            arith_depth += tok.count("(") - tok.count(")")
+            continue
         if tok in CHAIN_SEPARATORS:
             if current:
                 segments.append(current)
                 current = []
             continue
         current.append(tok)
+        if tok.startswith("((") and tok.count("(") > tok.count(")"):
+            arith_depth = tok.count("(") - tok.count(")")
     if current:
         segments.append(current)
     return segments
+
+
+def _substitution_depth(text: str) -> int:
+    """The open ``$(``/``(``/backtick depth of ``text`` — how much more
+    closing is needed before the value is complete. Backticks count in
+    pairs (``\\`cat`` opens, ``f\\``` closes)."""
+    depth = text.count("(") - text.count(")")
+    if text.count("`") % 2 == 1:
+        depth += 1
+    return depth
+
+
+def split_assignment_prefix(tokens: List[str]) -> Tuple[List[str], List[str]]:
+    """``(assignments, rest)``: the statement's leading assignment prefix,
+    each assignment RE-JOINED to the end of its own value. shlex splits
+    ``r=$(curl -s u)`` into ``r=$(curl`` + ``-s`` + ``u)``; the prefix
+    token alone is not the assignment, so tokens keep being consumed
+    while the value's ``$(``/backtick depth is open. An unterminated
+    value swallows the rest of the statement (it is still one
+    assignment). The ONE home for this shape (v0.2.103 R16): the wait
+    guard's poll/work classifiers read the re-joined assignment
+    directly instead of guessing from a torn token."""
+    assignments: List[str] = []
+    rest = list(tokens)
+    while rest and is_env_assignment(rest[0]):
+        text = rest[0]
+        i = 1
+        while _substitution_depth(text) > 0 and i < len(rest):
+            text += " " + rest[i]
+            i += 1
+        assignments.append(text)
+        rest = rest[i:]
+    return assignments, rest
 
 
 #: A token with a glued trailing ``;`` / ``&`` run (``log;``, ``foo&&``).
@@ -861,7 +918,8 @@ def walk_segments(command: str, depth: int = 0, *,
                   _in_loop: bool = False,
                   _position_override: Optional[tuple] = None,
                   _with_substitutions: bool = False,
-                  _with_function_bodies: bool = False) -> List[ChainSegment]:
+                  _with_function_bodies: bool = False,
+                  _with_assignments: bool = False) -> List[ChainSegment]:
     """Parse `command` like :func:`walk_command` but hand out
     :data:`ChainSegment` records — peeled tokens PLUS the structural
     context (position within the chain level, loop membership, recursion
@@ -900,6 +958,15 @@ def walk_segments(command: str, depth: int = 0, *,
     level is re-positioned WITHIN the body, and its header segment is
     emitted as the tail after ``{`` (``f() { sleep 1; }; f`` emits
     ``sleep 1`` as the body's sole segment).
+
+    ``_with_assignments`` (opt-in, v0.2.103 R16; :func:`walk_command`
+    callers are unchanged): an assignment-ONLY statement — whose tokens
+    the env-prefix strip used to swallow whole, so a multi-line
+    ``r=$(curl -s u)`` body statement reached classifiers as its torn
+    tail and ``i=$((i+1))`` vanished — is EMITTED with empty ``tokens``
+    and its re-joined :data:`ChainSegment.assignments`, so classifiers
+    read it directly. Collectors skip empty token lists, and without the
+    flag such statements are not emitted at all — the pre-R16 contract.
     """
     if depth > MAX_NESTING_DEPTH:
         return []
@@ -928,7 +995,11 @@ def walk_segments(command: str, depth: int = 0, *,
     for segment, pos, size, in_loop in rows:
         if not segment:
             continue
-        stripped = strip_env_assignments(segment)
+        seg_assignments, rest = split_assignment_prefix(segment)
+        # Without the opt-in the peeled tokens come from the ORIGINAL
+        # env-prefix strip, byte-identical to the pre-R16 walk; with it,
+        # a value-spanning assignment consumes its whole tail.
+        stripped = rest if _with_assignments else strip_env_assignments(segment)
         peeled = peel_wrapper_verbs(stripped) if stripped else []
         # The env-assignment / wrapper prefix the command word sits behind:
         # never emitted, but its substitutions still run (`x=$(sleep 5)`).
@@ -960,19 +1031,27 @@ def walk_segments(command: str, depth: int = 0, *,
                         sub_cmd, depth + 1, _in_loop=in_loop,
                         _position_override=(pos, size),
                         _with_substitutions=_with_substitutions,
-                        _with_function_bodies=_with_function_bodies))
+                        _with_function_bodies=_with_function_bodies,
+                        _with_assignments=_with_assignments))
                 # Consumed either way: no sub-command (`bash script.sh`)
                 # or over budget → nothing emitted, exactly as parse_dash_c
                 # has always done.
             else:
-                out.append(ChainSegment(peeled, pos, size, in_loop, depth))
+                out.append(ChainSegment(peeled, pos, size, in_loop, depth,
+                                        tuple(seg_assignments)))
                 subst_src = segment
+        elif _with_assignments and seg_assignments:
+            # An assignment-only statement: emitted with EMPTY tokens
+            # (collectors skip those) and its re-joined assignments.
+            out.append(ChainSegment([], pos, size, in_loop, depth,
+                                    tuple(seg_assignments)))
         if _with_substitutions and sub_budget:
             for sub_body in substitution_bodies(subst_src):
                 out.extend(walk_segments(
                     sub_body, depth + 1, _in_loop=in_loop,
                     _with_substitutions=True,
-                    _with_function_bodies=_with_function_bodies))
+                    _with_function_bodies=_with_function_bodies,
+                    _with_assignments=_with_assignments))
     return out
 
 

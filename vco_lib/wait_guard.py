@@ -76,12 +76,12 @@ no-work or a FETCH assignment to one of those variables (a command
 substitution — arithmetic ``i=$((i+1))`` and literals are NOT fetches,
 so counted loops stay allowed), with at least one fetch. A body doing
 anything else — real work, an assignment to a different variable — is
-ordinary work and the loop passes. Known limit: the fetch is recognised
-where the walker keeps its assignment head — glued to the ``do``
-(``do r=$(curl u)``, every specified shape). A fetch statement later in
-the body (``do echo .; x=$(curl u)``) has its head consumed by the
-walker's env-prefix strip, reads as its tail only, and the loop is
-judged as ordinary work.
+ordinary work and the loop passes. The walker carries each statement's
+assignment prefix on the segment (re-joined to the end of its value), so
+the rule reads multi-line bodies exactly like single-line ones (R16
+A-N1/A-N2: a multi-line ``r=$(curl -s u)`` body line used to reach the
+classifier as its torn tail, and a counted loop's ``i=$((i+1))`` line
+vanished — a false busy-wait).
 Position and loop membership come from the ONE chain walker
 (:func:`vco_lib.bash_command_walk.walk_segments`); the PowerShell side
 applies the SAME rule through
@@ -532,14 +532,18 @@ def _real_output_tokens(tokens: List[str]) -> List[str]:
     return out
 
 
-def _segment_does_real_work(tokens: List[str]) -> bool:
-    """The busy-wait rule's work test for ONE loop-body segment: empty,
+def _segment_does_real_work(seg: ChainSegment) -> bool:
+    """The busy-wait rule's work test for ONE loop-body statement: empty,
     ``:``, ``true``, the ``done`` terminator, or a bare ``echo``/``printf``
     (no OUTPUT redirection, no pipe — fd duplications and ``/dev/null``
     sinks dropped first, R10 F2) do no work; anything else — a real
-    command, a ``read``, a redirected echo, an embedded loop opener —
-    does."""
-    body = tokens
+    command, a ``read``, a redirected echo, an embedded loop opener, or
+    an ASSIGNMENT statement (:attr:`ChainSegment.assignments` — a counted
+    loop's ``i=$((i+1))`` body line used to vanish into the env-prefix
+    strip and wrongly read as a no-work body, R16 A-N2) — does."""
+    if seg.assignments:
+        return True  # an assignment statement is work
+    body = seg.tokens
     while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
         body = body[1:]
     body = strip_subshell_parens(body)
@@ -558,10 +562,11 @@ def _segment_does_real_work(tokens: List[str]) -> bool:
 def _infinite_for_header(tokens: List[str], start: int) -> bool:
     """True when ``tokens[start:]`` opens an arithmetic ``for`` whose
     MIDDLE clause is empty — ``for ((;;))``, ``for ((i=0;;))``,
-    ``for (( ; ; ))`` — the arithmetic infinite loop (R10 F3, A5).
-    ``for ((i=0; i<n; i++))`` has a bound and is finite. Known limit: a
-    SPACED header with a non-empty clause (``for (( i=0 ; ; ))``) loses
-    its ``;`` separators to the chain split and reads as bounded."""
+    ``for (( ; ; ))``, ``for (( i=0 ; ; i++ ))`` — the arithmetic
+    infinite loop (R10 F3, A5; the spaced forms since R16 A-N3, where
+    :func:`vco_lib.bash_command_walk.split_chain` stopped tearing the
+    header at its inner ``;``). ``for ((i=0; i<n; i++))`` has a bound
+    and is finite."""
     header = " ".join(tokens[start + 1:])
     s = header.strip()
     if not (s.startswith("(") and s.endswith(")")):
@@ -616,13 +621,30 @@ def _condition_reads_input(opener_word: str, opener_tokens: List[str]) -> bool:
     return True
 
 
-def _condition_refresh_fetch(tokens: List[str], cond_vars: set) -> bool:
-    """True when ONE body segment is a FETCH assignment: it assigns a
+def _is_fetch_value(value: str) -> bool:
+    """True when an assignment's VALUE comes from outside the shell: a
+    command substitution (``$(curl -s u)``, ``\\`cat f\\```) — as opposed
+    to arithmetic (``$((i+1))``, a counted loop's step) or a literal
+    (which satisfies the condition and lets the loop exit)."""
+    if "$((" in value:
+        value = value.replace("$((", "")  # arithmetic is not a fetch
+    return "$(" in value or "`" in value
+
+
+def _condition_refresh_fetch(seg: ChainSegment, cond_vars: set) -> bool:
+    """True when ONE body statement is a FETCH assignment: it assigns a
     variable the condition reads, and the value comes from OUTSIDE the
-    shell — a command substitution (``r=$(curl -s u)``, ``x=`cat f```)
-    — as opposed to arithmetic (``i=$((i+1))``, a counted loop's step)
-    or a literal (which satisfies the condition and exits)."""
-    body = list(tokens)
+    shell. Two shapes (R16): the re-joined :attr:`ChainSegment.assignments`
+    of an assignment-only statement (a multi-line ``r=$(curl -s u)``
+    body line — the walker's env-prefix strip used to tear it), and the
+    glued ``do r=$(curl -s u)`` form, whose assignment rides in the
+    emitted tokens."""
+    for assignment in seg.assignments:
+        m = _ASSIGN_RE.match(assignment)
+        if (m is not None and m.group(1) in cond_vars
+                and _is_fetch_value(assignment[m.end():])):
+            return True
+    body = list(seg.tokens)
     while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
         body = body[1:]
     if not body:
@@ -630,35 +652,34 @@ def _condition_refresh_fetch(tokens: List[str], cond_vars: set) -> bool:
     m = _ASSIGN_RE.match(body[0])
     if m is None or m.group(1) not in cond_vars:
         return False
-    text = " ".join(body)
-    if "$((" in text:
-        text = text.replace("$((", "")  # arithmetic is not a fetch
-    return "$(" in text or "`" in text
+    return _is_fetch_value(" ".join(body))
 
 
 def _condition_refresh_poll(cond_tokens: List[str],
-                            body_segments: List[List[str]]) -> Optional[tuple]:
+                            body_segments: List[ChainSegment]) -> Optional[tuple]:
     """The condition-refresh poll rule (coordinator ruling 2026-10-15,
     both shells): a loop whose ONLY work is re-fetching the value its own
     condition tests is a poll — it re-issues the fetch as fast as the
     shell allows, exactly the shape the wait guard exists to stop.
     Precisely: the condition reads at least one variable, and EVERY body
-    segment is either no-work (empty, ``:``, ``true``, a bare
+    statement is either no-work (empty, ``:``, ``true``, a bare
     ``echo``/``printf``) or a FETCH assignment to one of those variables
     (see :func:`_condition_refresh_fetch`), with at least one fetch.
     A body statement doing anything else — real work, an assignment to a
     DIFFERENT variable, arithmetic on the condition variable (a counted
-    loop) — makes the loop ordinary work and it stays allowed."""
+    loop) — makes the loop ordinary work and it stays allowed. Works for
+    the single-line and multi-line forms alike: the walker carries the
+    assignment on the segment either way (R16 A-N1)."""
     cond_vars = set()
     for tok in cond_tokens:
         cond_vars.update(_COND_VAR_RE.findall(tok))
     if not cond_vars:
         return None
     saw_fetch = False
-    for tokens in body_segments:
-        if not _segment_does_real_work(tokens):
+    for seg in body_segments:
+        if not _segment_does_real_work(seg):
             continue  # a no-work statement never rescues a poll
-        if _condition_refresh_fetch(tokens, cond_vars):
+        if _condition_refresh_fetch(seg, cond_vars):
             saw_fetch = True
             continue
         return None  # real work that is not a condition refresh
@@ -728,17 +749,17 @@ def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
     if not (j < len(segments) and segments[j].in_loop
             and segments[j].tokens and segments[j].tokens[0] == "do"):
         return None  # no `do`: malformed, not our business
-    body_all: List[List[str]] = []
-    body_stmts: List[List[str]] = []
+    body_all: List[ChainSegment] = []
+    body_stmts: List[ChainSegment] = []
     while j < len(segments) and segments[j].in_loop:
-        body_all.append(segments[j].tokens)
+        body_all.append(segments[j])
         # Substitution / bash -c bodies (depth > the opener's) are part of
         # their parent STATEMENT's value, not statements of their own —
         # the poll rule classifies statements only.
         if segments[j].depth == seg.depth:
-            body_stmts.append(segments[j].tokens)
+            body_stmts.append(segments[j])
         j += 1
-    if all(not _segment_does_real_work(t) for t in body_all):
+    if all(not _segment_does_real_work(s) for s in body_all):
         return ("busy-wait loop", " ".join(toks[:6])[:80])
     return _condition_refresh_poll(cond_toks, body_stmts)
 
@@ -771,7 +792,8 @@ def static_pattern(command: str, depth: int = 0, *,
     segments = walk_segments(command, _in_loop=_in_loop,
                              _position_override=_position_override,
                              _with_substitutions=True,
-                             _with_function_bodies=True)
+                             _with_function_bodies=True,
+                             _with_assignments=True)
     for i, seg in enumerate(segments):
         found = _pattern_of_segment(seg, depth)
         if found is not None:
